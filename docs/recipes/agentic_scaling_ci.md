@@ -19,14 +19,15 @@ The full prefix is `glm-52-mxfp4-1p1d-`. Each allocation is exclusive:
 - 2P2D: **two 8-GPU nodes**, each with P on GPUs 0–3 (PP4/TP1,
   layer partition `20,20,20,18`) and D on GPUs 4–7 (TP4/DCP4).
 - One router and AIPerf run on node 0. The router registers both P endpoints and
-  both D endpoints; the random policy can transfer between nodes. Results include
+  both D endpoints; P/D pairs can transfer between nodes. Results include
   the cost of these network transfers.
 
-Both sides use the existing `random` router policy. Cache routing observation is
-disabled for this comparison. There is no measured PP4→TP4/DCP4 calibration yet,
-so this suite does not run or claim benefits from `kv_cache_aware`. Enabling that
-comparison later requires measured costs and verified transfer paths as described
-in [the cache routing recipe](kv_cache_routing.md); example curves are unsuitable.
+1P1D retains its existing `random` policy: there is only one P/D pair to choose.
+2P2D explicitly sets **both** `--prefill-policy kv_cache_aware` and
+`--decode-policy kv_cache_aware`, as well as `--policy kv_cache_aware`.
+`kv_cache_aware` is the new HBM+CPU policy; the older `cache_aware` name refers to
+a different policy. Ratios in this experiment include both the resource increase
+and the policy change; they do not isolate the contribution of each.
 
 The inherited settings include the AgentX `inferencex-agentx-mvp` scenario,
 `semianalysis_cc_traces_weka_062126`, 393 entries, 1M context, seed 42, 3,600-second
@@ -47,6 +48,7 @@ gh workflow run atomesh-benchmark.yaml \
   --ref Jasen/kv-routing-agentic-ci \
   -f suite=agentic_scaling \
   -f atomesh_image=rocm/atom-dev:latest \
+  -f cache_routing_bundle=/shared/calibration/glm-pp4-dcp4.json \
   -f run_model_benchmark=true \
   -f publish_dashboard=false
 ```
@@ -60,6 +62,12 @@ runner/account/node-pool inputs still apply; the candidate pool must contain at
 least two available 8-GPU nodes. Jobs run sequentially (`max-parallel: 1`) and
 may queue for resources; the full suite takes over eight hours including startup
 and warmup. It does not cancel other Slurm jobs or stop unrelated containers.
+
+Use `run_model_benchmark=false` to validate the matrix, build the reviewed Mesh
+and run its HTTP routing test in the image without allocating GPUs. This does
+not require calibration. A performance run fails its calibration preflight
+before allocating GPUs if `cache_routing_bundle` is missing. A policy name alone
+would otherwise silently exercise load fallback.
 
 The workflow resolves the latest nightly once and pins its digest for all eight
 jobs. Each job **builds Mesh from the checked-out stack source** using the release
@@ -77,6 +85,39 @@ The catalog's `aiperf_commit` is recorded for reference, but the preinstalled
 version is used for **both freshly rerun sides**. Historical results produced by
 a different AIPerf revision are not used as this experiment's baseline.
 
+## Measured routing bundle
+
+`cache_routing_bundle` is a JSON file readable on the submit runner. Its outer
+fields are:
+
+| Field | Required value |
+| --- | --- |
+| `schema_version` | `1` |
+| `image` | The measured ATOM image including its immutable `@sha256:...` digest |
+| `nodes` | Two distinct measured Slurm node names, in slot order (short hostnames) |
+| `measurement_artifact_sha256` | SHA256 of the raw measurement artifact |
+| `namespace_manifest` | All seven immutable semantic identity fields from the [routing recipe](kv_cache_routing.md) |
+| `calibration.executions` | Measured entries for `p0`, `d0`, `p1`, `d1`, using that recipe's cost/path schema |
+
+Slot 0 runs on `nodes[0]`, slot 1 on `nodes[1]`. Prefill slots use GPUs 0–3 and
+decode slots GPUs 4–7. Each P needs context-dependent prefill and H2D curves and
+both verified Mooncake transfer paths (to `d0` and `d1`); each D needs a measured
+decode-step cost. Curves must cover the 1M trace range. Do not populate these
+fields with example costs or mark an untested link verified. The preflight
+validates the supplied metadata; recording an artifact hash does not itself
+perform the measurements.
+
+The matrix pins the allocation to these measured nodes. Overrides/runners that
+cannot honor that placement are rejected. Every P/D process receives a unique
+job/slot execution ID and a reachable Catalog URL (P port 18610, D port 18611,
+plus the service port offset). Before launching the router, the script queries
+all live catalogs and checks namespace, physical layout, exact-prefix support
+and PP/TP/DCP geometry. Only then does it bind the slot calibration to the fresh
+execution IDs. Changed layouts, images or placements require new measurements.
+
+No production PP4→TP4/DCP4 calibration is checked into this PR. The synthetic
+curves in protocol tests are never passed to GPU benchmarks.
+
 ## Read the result
 
 The `atomesh-agentic-scaling` artifact contains Markdown and JSON reports for
@@ -88,10 +129,15 @@ C32→64, C40→80, C48→96 and C56→112. It reports:
 - TTFT, ITL and end-to-end p95/p99, failure rate and API-reported cache-hit rate.
   Latencies describe successful profiling requests; cache-hit rate does not
   distinguish CPU from HBM reuse.
+- Actual calibrated selection fraction and fallback attempts for 2P2D, from
+  `atomesh_kv_cache_routing_decisions_total{outcome="selected|fallback"}`.
+  Counters span the AIPerf invocation, including warmup and retries. An entirely
+  fallback run is invalid; mixed runs report their coverage explicitly.
 
 Missing/duplicate results, failed jobs, missing failure counts/rates, mismatched
 workloads, image digests, Mesh source commits or AIPerf sources leave a pair
 **INCOMPLETE** and fail the comparison step. Failure rates above the baseline's
-10% threshold also prevent a valid comparison. The raw artifacts are retained.
+10% threshold, absent routing evidence or zero calibrated selections also prevent
+a valid comparison. The raw artifacts are retained.
 An otherwise valid run reports measured ratios without assuming that doubling
 concurrency improves GPU efficiency or tail latency.

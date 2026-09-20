@@ -119,6 +119,22 @@ def read_run(cell, results):
         raise ValueError("missing preinstalled AIPerf provenance")
     if "@sha256:" not in cell["image"] or version.get("image") != cell["image"]:
         raise ValueError("run image is not the matrix's pinned digest")
+    routing = None
+    if cell["service"]["router"]["policy"] == "kv_cache_aware":
+        preflight = only_json(root, "cache-routing-preflight.json")
+        routing = only_json(root, "routing-decisions.json")
+        if (
+            preflight.get("policy") != "kv_cache_aware"
+            or routing.get("policy") != "kv_cache_aware"
+            or not finite(routing.get("selected"))
+            or routing["selected"] <= 0
+            or not finite(routing.get("fallback"))
+            or routing["fallback"] < 0
+        ):
+            raise ValueError("no verified calibrated kv_cache_aware selections")
+        routing["selected_fraction"] = routing["selected"] / (
+            routing["selected"] + routing["fallback"]
+        )
     return {
         "metrics": metrics,
         "failure_rate": failure,
@@ -127,6 +143,7 @@ def read_run(cell, results):
         "active_gpus": cell["scaling"]["active_gpus"],
         "allocated_gpus": cell["scaling"]["allocated_gpus"],
         "settings": comparable_config(submitted),
+        "routing": routing,
     }
 
 
@@ -146,6 +163,7 @@ def comparable_config(cell):
         "service": {
             role: {k: v for k, v in cfg.items() if k != "workers"}
             for role, cfg in cell["service"].items()
+            if role != "router"
         },
     }
 
@@ -212,9 +230,11 @@ def markdown(report):
     lines = [
         "# GLM agentic scaling: 1P1D C → 2P2D 2C",
         "",
-        "Each node runs PP4/TP1 prefill and TP4/DCP4 decode. Both use random routing.",
+        "Each node runs PP4/TP1 prefill and TP4/DCP4 decode.",
+        "1P1D retains its baseline policy. 2P2D uses kv_cache_aware for BOTH P and D.",
         "The existing fixed MTP acceptance rate is retained. This is trace replay performance,",
-        "not agent task correctness or measured cache-aware routing benefit.",
+        "not agent task correctness. Ratios include both scaling and policy changes.",
+        "Calibrated selection coverage includes warmup and retry attempts; any fallback is reported.",
         "",
         "Per-GPU efficiency is throughput speedup / GPU-count ratio (1.0 = linear scaling).",
         "Latency percentiles describe successful profiling requests; failure rates are shown separately.",
@@ -247,6 +267,12 @@ def markdown(report):
             "|---|---:|---:|",
         ]
         a, b = pair["runs"]
+        if b.get("routing"):
+            decisions = b["routing"]
+            lines.append(
+                f"| Calibrated selection fraction | N/A (one pair) | {decisions['selected_fraction']:.2%} |"
+            )
+            lines.append(f"| Fallback attempts | N/A | {decisions['fallback']:.0f} |")
         for key in ("active_gpus", "allocated_gpus", "failure_rate"):
             lines.append(f"| {key} | {a[key]:.4g} | {b[key]:.4g} |")
         for key in (

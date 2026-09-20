@@ -691,6 +691,17 @@ write_metadata() {
 EOF
 }
 
+configure_cache_catalog() {
+  local role="$1"
+  [[ "${ROUTER_POLICY}" == "kv_cache_aware" ]] || return 0
+  local catalog_port=$((18610 + ATOMESH_SERVICE_PORT_OFFSET))
+  [[ "${role}" == "prefill" ]] || catalog_port=$((catalog_port + 1))
+  ATOM_CACHE_ROUTING_CONFIG="$(python3 "${ATOMESH_SCRIPT_DIR}/agentic_routing.py" role \
+    --role "${role}" --rank "${NODE_RANK}" --host "${host_name}" \
+    --ip "${host_ip}" --port "${catalog_port}")"
+  export ATOM_CACHE_ROUTING_CONFIG
+}
+
 start_prefill() {
   local log_name="$1"
   local server_port="${2:-${PREFILL_PORT}}"
@@ -698,6 +709,7 @@ start_prefill() {
   local dp_master_port="${4:-${PREFILL_DP_MASTER_PORT}}"
   local dp_base_port="${5:-${PREFILL_DP_BASE_PORT}}"
   apply_role_env "ATOMESH_PREFILL_ENV_" "${host_ip}" "${handshake_port}"
+  configure_cache_catalog prefill
   reset_lmcache_disk
   local -a prefill_cache_env=()
   build_server_cache_env "prefill" "${server_port}" prefill_cache_env
@@ -736,6 +748,7 @@ start_decode() {
   local dp_master_port="${4:-${DECODE_DP_MASTER_PORT}}"
   local dp_base_port="${5:-${DECODE_DP_BASE_PORT}}"
   apply_role_env "ATOMESH_DECODE_ENV_" "${host_ip}" "${handshake_port}"
+  configure_cache_catalog decode
   local max_conc
   max_conc="$(echo "${BENCH_MAX_CONCURRENCY}" | tr 'x,' '\n' | sort -n | tail -1)"
   local decode_max_num_seqs="${MAX_NUM_SEQS}"
@@ -803,6 +816,20 @@ start_router() {
     )
   fi
   local -a router_dp_aware_args=()
+  local -a router_role_policy_args=()
+  if [[ -n "${ROUTER_PREFILL_POLICY:-}" ]]; then
+    router_role_policy_args+=(--prefill-policy "${ROUTER_PREFILL_POLICY}")
+  fi
+  if [[ -n "${ROUTER_DECODE_POLICY:-}" ]]; then
+    router_role_policy_args+=(--decode-policy "${ROUTER_DECODE_POLICY}")
+  fi
+  if [[ "${router_policy}" == "kv_cache_aware" ]]; then
+    ATOM_CACHE_ROUTING_CALIBRATION="${RUNTIME_LOG_DIR}/cache-routing-calibration.json"
+    python3 "${ATOMESH_SCRIPT_DIR}/agentic_routing.py" router \
+      "${prefill_args[@]}" "${decode_args[@]}" \
+      --output "${ATOM_CACHE_ROUTING_CALIBRATION}"
+    export ATOM_CACHE_ROUTING_CALIBRATION
+  fi
   if is_agentic_dpa; then
     router_policy="dp_sticky"
     router_dp_aware_args=(--dp-aware)
@@ -817,6 +844,7 @@ start_router() {
     "${prefill_args[@]}"
     "${decode_args[@]}"
     --policy "${router_policy}"
+    "${router_role_policy_args[@]}"
     "${router_rank_mapping_args[@]}"
     "${router_dp_aware_args[@]}"
     --backend atom
@@ -1093,6 +1121,11 @@ run_aiperf_agentic_benchmark() {
 
     echo "[aiperf] ${result_file}"
     mkdir -p "${out_dir}"
+    if [[ "${ROUTER_POLICY}" == "kv_cache_aware" ]]; then
+      python3 "${ATOMESH_SCRIPT_DIR}/agentic_routing.py" decisions \
+        --url "http://127.0.0.1:${PROMETHEUS_PORT}/metrics" \
+        --output "${out_dir}/routing-before.json"
+    fi
     AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT="${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT}" \
     AIPERF_HTTP_TCP_USER_TIMEOUT="${AIPERF_HTTP_TCP_USER_TIMEOUT}" \
     AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES="${AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES}" \
@@ -1138,6 +1171,11 @@ run_aiperf_agentic_benchmark() {
     fi
     write_aiperf_dashboard_json "${aiperf_json}" "${dashboard_json}" "${conc}"
     write_aiperf_chrome_trace "${out_dir}"
+    if [[ "${ROUTER_POLICY}" == "kv_cache_aware" ]]; then
+      python3 "${ATOMESH_SCRIPT_DIR}/agentic_routing.py" decisions \
+        --url "http://127.0.0.1:${PROMETHEUS_PORT}/metrics" \
+        --before "${out_dir}/routing-before.json" --output "${out_dir}/routing-decisions.json"
+    fi
   done
 }
 

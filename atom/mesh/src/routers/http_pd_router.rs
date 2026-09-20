@@ -209,6 +209,10 @@ impl PDRouter {
                 || policy_registry.get_decode_policy().name() == "kv_cache_aware")
         {
             crate::cache_index::CACHE_INDEX.start(&worker_registry, client.clone());
+            for outcome in ["selected", "fallback"] {
+                metrics::counter!("atomesh_kv_cache_routing_decisions_total", "outcome" => outcome)
+                    .increment(0);
+            }
         }
 
         Ok(PDRouter {
@@ -978,6 +982,14 @@ impl PDRouter {
                                 )
                             },
                         );
+                        if self.policy_registry.get_prefill_policy().name() == "kv_cache_aware"
+                            || self.policy_registry.get_decode_policy().name() == "kv_cache_aware"
+                        {
+                            metrics::counter!(
+                                "atomesh_kv_cache_routing_decisions_total",
+                                "outcome" => if selection.is_some() { "selected" } else { "fallback" }
+                            ).increment(1);
+                        }
                         let (prefill, decode, ctx) = if let Some(selected) = &selection {
                             let ctx = match self
                                 .adapter

@@ -110,6 +110,11 @@ on:
         required: false
         default: rocm/atom-dev:latest
         type: string
+      cache_routing_bundle:
+        description: 'agentic_scaling: shared path on the submit runner to measured PP4/DCP4 calibration + namespace JSON; required for the 2P2D performance stage'
+        required: false
+        default: ''
+        type: string
       atomesh_slurm_submit_runner:
         description: 'GitHub runner label used to submit Slurm jobs: atomesh-cicd = TW MI355X, atomesh-cicd-mi350 = Spur MI350X, atomesh-cicd-mi355-crusoe = Crusoe MI355X'
         required: false
@@ -345,12 +350,18 @@ jobs:
           EVENT_SCHEDULE: ${{ github.event_name == 'schedule' && github.event.schedule || '' }}
           ATOMESH_IMAGE: ${{ steps.image.outputs.image }}
           ATOMESH_PYTHON_IMAGE: ${{ steps.image.outputs.image }}
+          INPUT_CACHE_ROUTING_BUNDLE: ${{ inputs.cache_routing_bundle }}
           ATOMESH_BENCHMARK_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark_concurrency || '' }}
           ATOMESH_EVAL_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.eval_concurrency || '' }}
         run: |
           set -euo pipefail
           if [[ "${ATOMESH_SCALING_RUN}" == "1" ]]; then
             source .github/scripts/atomesh/image_python.sh
+            unset ATOMESH_ROUTING_BUNDLE_FILE
+            if [[ -n "${INPUT_CACHE_ROUTING_BUNDLE}" ]]; then
+              cp -- "${INPUT_CACHE_ROUTING_BUNDLE}" .git/atomesh-routing-bundle.json
+              export ATOMESH_ROUTING_BUNDLE_FILE=.git/atomesh-routing-bundle.json
+            fi
           fi
           MODEL_NAME=""
           CASE_NAME=""
@@ -480,7 +491,42 @@ jobs:
         run: |
           set -euo pipefail
           source .github/scripts/atomesh/image_python.sh
-          python3 -m pytest -q tests/test_atomesh_agentic_scaling.py tests/test_atomesh_pd_matrix.py tests/test_atomesh_spur_dispatch.py tests/test_atomesh_lmcache_disk.py tests/test_atomesh_job_result.py
+          python3 -m pytest -q tests/test_atomesh_agentic_scaling.py tests/test_atomesh_agentic_routing.py tests/test_atomesh_pd_matrix.py tests/test_atomesh_spur_dispatch.py tests/test_atomesh_lmcache_disk.py tests/test_atomesh_job_result.py
+          python3 .github/scripts/atomesh/agentic_scaling.py preflight --aiperf aiperf --output .git/aiperf-preflight.json
+
+      - name: Build reviewed Mesh and verify both cache-aware policies in the image
+        if: ${{ inputs.suite == 'agentic_scaling' }}
+        env:
+          ATOMESH_PYTHON_IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          set -euo pipefail
+          mkdir -p atomesh-build-validation
+          printf 'ATOMESH_PREINSTALLED_ONLY=1\nATOMESH_MESH_BUILD_PROFILE=release\nCARGO_BUILD_JOBS=8\n' > atomesh-build-validation/build.env
+          ATOMESH_BUILD_MESH=true ATOMESH_PREINSTALLED_ONLY=1 \
+            bash .github/scripts/atomesh/setup_mesh.sh "$PWD" "$PWD/atomesh-build-validation" \
+            "$ATOMESH_PYTHON_IMAGE" "$PWD/atomesh-build-validation/build.env" "gha-${GITHUB_RUN_ID}"
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$PWD:/workspace/ATOM:ro" -v "$PWD/atomesh-build-validation/mesh-build:/mesh-build:ro" \
+            -e HIP_VISIBLE_DEVICES= -e PYTHONPATH=/workspace/ATOM:/workspace/ATOM/tests \
+            -e ATOMESH_BINARY=/mesh-build/atomesh "$ATOMESH_PYTHON_IMAGE" \
+            python3 -m pytest -q /workspace/ATOM/tests/entrypoints/test_kv_cache_routing_relay.py
+
+      - name: Upload Mesh build and routing validation artifacts
+        if: ${{ always() && inputs.suite == 'agentic_scaling' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: atomesh-mesh-source-validation
+          path: atomesh-build-validation/mesh-build/
+          if-no-files-found: ignore
+
+      - name: Require measured calibration before allocating benchmark GPUs
+        if: ${{ inputs.suite == 'agentic_scaling' && inputs.run_model_benchmark }}
+        env:
+          ATOMESH_PYTHON_IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/atomesh/image_python.sh
+          python3 .github/scripts/atomesh/agentic_routing.py validate-matrix --matrix atomesh-matrix.json
 
       - name: Upload expanded matrix
         uses: actions/upload-artifact@v7

@@ -83,6 +83,8 @@ def test_matrix_preserves_the_four_existing_baselines(cells):
         assert a["benchmark"]["benchmark_duration"] == 3600
         assert a["benchmark"]["aiperf_use_preinstalled"] is True
         assert a["service"]["router"]["policy"] == "random"
+        for key in ("policy", "prefill_policy", "decode_policy"):
+            assert b["service"]["router"][key] == "kv_cache_aware"
         assert a["env"]["prefill"]["LMCACHE_MAX_LOCAL_CPU_SIZE"] == "256"
         assert a["env"]["prefill"]["VLLM_PP_LAYER_PARTITION"] == "20,20,20,18"
         assert a["env"]["decode"]["HIP_VISIBLE_DEVICES"] == "4,5,6,7"
@@ -125,6 +127,8 @@ def test_submission_exports_pp_geometry_and_no_install_mode(cells, tmp_path):
     assert "export DECODE_PP_SIZE=1\n" in result.stdout
     assert "export ATOMESH_PREINSTALLED_ONLY=1\n" in result.stdout
     assert "export AIPERF_USE_PREINSTALLED=true\n" in result.stdout
+    assert "export ROUTER_PREFILL_POLICY=kv_cache_aware\n" in result.stdout
+    assert "export ROUTER_DECODE_POLICY=kv_cache_aware\n" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -145,6 +149,13 @@ cleanup_processes() { :; }
 wait_http() { :; }
 wait_router_closed() { :; }
 run_benchmark_and_eval() { touch "$TEST_BENCHMARK"; }
+configure_cache_catalog() { :; }
+python3() {
+  # Catalog HTTP/identity validation is exercised separately; stub this I/O
+  # boundary while retaining the router's actual policy argument construction.
+  [[ "$1" != */agentic_routing.py ]] || return 0
+  command python3 "$@"
+}
 start_logged_process() {
   printf -v "$1" '%s' 424242
   python3 - "$@" <<'PY'
@@ -174,6 +185,9 @@ PY
         "ATOMESH_PREINSTALLED_ONLY": "0",
         "PREFILL_EXTRA_SERVER_ARGS": "--pipeline-parallel-size 4 --enforce-eager",
         "DECODE_EXTRA_SERVER_ARGS": "--decode-context-parallel-size 4",
+        "ROUTER_POLICY": "kv_cache_aware" if workers == 2 else "random",
+        "ROUTER_PREFILL_POLICY": "kv_cache_aware" if workers == 2 else "",
+        "ROUTER_DECODE_POLICY": "kv_cache_aware" if workers == 2 else "",
         "ATOMESH_PREFILL_ENV_HIP_VISIBLE_DEVICES": "0,1,2,3",
         "ATOMESH_PREFILL_ENV_VLLM_PP_LAYER_PARTITION": "20,20,20,18",
         "ATOMESH_DECODE_ENV_HIP_VISIBLE_DEVICES": "4,5,6,7",
@@ -206,6 +220,10 @@ PY
     if rank == 0:
         assert records[2]["args"].count("--prefill") == workers
         assert records[2]["args"].count("--decode") == workers
+        if workers == 2:
+            args = records[2]["args"]
+            for flag in ("--policy", "--prefill-policy", "--decode-policy"):
+                assert args[args.index(flag) + 1] == "kv_cache_aware"
     else:
         assert len(records) == 2
 
@@ -241,6 +259,13 @@ def write_run(cell, root, speedup=1):
             "image": cell["image"],
         },
     }
+    if cell["scaling"]["scale"] == 2:
+        files["cache-routing-preflight.json"] = {"policy": "kv_cache_aware"}
+        files["routing-decisions.json"] = {
+            "policy": "kv_cache_aware",
+            "selected": 95,
+            "fallback": 5,
+        }
     for name, payload in files.items():
         (root / name).write_text(json.dumps(payload))
     return root

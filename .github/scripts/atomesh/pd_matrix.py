@@ -513,6 +513,8 @@ def build_agentic_scaling_cells(
         raise ValueError("agentic_scaling requires aiperf_agentic")
     model_cfg = cfg["models"][model]
     baselines = {c["name"]: c for c in model_cfg["suites"]["nightly"]}
+    bundle_path = os.environ.get("ATOMESH_ROUTING_BUNDLE_FILE")
+    bundle = json.loads(Path(bundle_path).read_text()) if bundle_path else {}
     cells = []
     for name in names:
         if case_filter and name not in case_filter:
@@ -527,14 +529,24 @@ def build_agentic_scaling_cells(
             case["decode"]["workers"] = scale
             case["pd_worker_layout"] = "single_node" if scale == 1 else "paired_nodes"
             case["concurrency"] = [concurrency[0] * scale]
-            case["router"] = {"policy": "random"}
+            case["router"] = (
+                {"policy": "random"}
+                if scale == 1
+                else {
+                    "policy": "kv_cache_aware",
+                    "prefill_policy": "kv_cache_aware",
+                    "decode_policy": "kv_cache_aware",
+                }
+            )
             case["run_eval"] = False
             case["benchmark"]["aiperf_use_preinstalled"] = True
+            case["benchmark"]["cache_routing_bundle"] = bundle
+            if bundle:
+                case["nodes"] = bundle["nodes"][:scale]
             case["env"].setdefault("common", {}).update(
                 ATOMESH_PREINSTALLED_ONLY="1",
-                # This experiment measures scaling with the existing policy.
-                # Missing calibration must not turn it into a mislabeled
-                # cache-aware benchmark through an inherited environment.
+                # Each process gets its validated execution-specific config
+                # at launch; never inherit another job's routing identity.
                 ATOM_CACHE_ROUTING_CONFIG="",
                 ATOM_CACHE_ROUTING_CALIBRATION="",
             )
@@ -555,13 +567,17 @@ def build_agentic_scaling_cells(
             )
             # Candidate pools must never inflate the requested allocation.
             cell["num_nodes"] = scale
+            if bundle and cell["nodes"] != bundle["nodes"][:scale]:
+                raise ValueError(
+                    "scaling must allocate the calibrated nodes in slot order; check runner/node overrides"
+                )
             cell["scaling"] = {
                 "baseline_case": name,
                 "baseline_concurrency": concurrency[0],
                 "scale": scale,
                 "active_gpus": 8 * scale,
                 "allocated_gpus": int(cell["runner"].get("gpus_per_node", 8)) * scale,
-                "routing_policy": "random",
+                "routing_policy": case["router"]["policy"],
             }
             cells.append(cell)
     return cells
