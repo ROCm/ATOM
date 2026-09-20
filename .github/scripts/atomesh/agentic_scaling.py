@@ -112,8 +112,11 @@ def read_run(cell, results):
         "false",
     ):
         raise ValueError("missing clean release Mesh build provenance")
-    if not build.get("commit") or not build.get("binary_sha256"):
-        raise ValueError("missing Mesh commit/binary digest")
+    if any(
+        not build.get(key)
+        for key in ("commit", "binary_sha256", "lockfile_sha256", "cargo")
+    ):
+        raise ValueError("missing Mesh source/binary/dependency provenance")
     version = only_json(root, "aiperf-version.json")
     if not version.get("source_sha256") or version.get("mode") != "preinstalled":
         raise ValueError("missing preinstalled AIPerf provenance")
@@ -195,6 +198,10 @@ def compare(matrix, results):
                 raise ValueError("submitted worker settings/model paths differ")
             if a["mesh"]["commit"] != b["mesh"]["commit"]:
                 raise ValueError("paired Mesh source commits differ")
+            if any(
+                a["mesh"][key] != b["mesh"][key] for key in ("lockfile_sha256", "cargo")
+            ):
+                raise ValueError("paired Mesh dependency locks/toolchains differ")
             if a["aiperf"]["source_sha256"] != b["aiperf"]["source_sha256"]:
                 raise ValueError("paired AIPerf source differs")
             if any(

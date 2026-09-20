@@ -251,6 +251,8 @@ def write_run(cell, root, speedup=1):
             "source_dirty": False,
             "commit": "reviewed-sha",
             "binary_sha256": "binary-digest",
+            "lockfile_sha256": "lockfile-digest",
+            "cargo": "test-cargo",
         },
         "aiperf-version.json": {
             "version": "0.12.0",

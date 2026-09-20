@@ -507,6 +507,8 @@ jobs:
             "$ATOMESH_PYTHON_IMAGE" "$PWD/atomesh-build-validation/build.env" "gha-${GITHUB_RUN_ID}"
           docker run --rm --user "$(id -u):$(id -g)" \
             -v "$PWD:/workspace/ATOM:ro" -v "$PWD/atomesh-build-validation/mesh-build:/mesh-build:ro" \
+            -e USER="$(id -un)" -e TORCHINDUCTOR_CACHE_DIR=/tmp/atomesh-ci-inductor \
+            -e XDG_CACHE_HOME=/tmp/atomesh-ci-cache \
             -e HIP_VISIBLE_DEVICES= -e PYTHONPATH=/workspace/ATOM:/workspace/ATOM/tests \
             -e ATOMESH_BINARY=/mesh-build/atomesh "$ATOMESH_PYTHON_IMAGE" \
             python3 -m pytest -q /workspace/ATOM/tests/entrypoints/test_kv_cache_routing_relay.py
@@ -1556,6 +1558,17 @@ jobs:
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
+
+      - name: Download the validated Mesh dependency lock
+        if: ${{ matrix.suite == 'agentic_scaling' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: atomesh-mesh-source-validation
+          path: atomesh-validated-mesh
+
+      - name: Pin Mesh dependencies for every scaling job
+        if: ${{ matrix.suite == 'agentic_scaling' }}
+        run: cp atomesh-validated-mesh/mesh-Cargo.lock atom/mesh/Cargo.lock
 
       - name: Cancel existing jobs on benchmark nodes
         if: ${{ github.event_name == 'schedule' && matrix.runner.slurm_submit_runner != 'atomesh-cicd' }}

@@ -74,7 +74,9 @@ jobs. Each job **builds Mesh from the checked-out stack source** using the relea
 profile in a separate container, then passes that artifact to the router's
 `ATOMESH_MESH_BINARY`. Supplying a prebuilt binary or disabling the build is an
 error. Build artifacts include source commit, dirty state, Cargo version, lockfile
-hash and binary SHA256. The build container uses root to access the image's Rust
+hash and binary SHA256. GPU jobs reuse the lockfile from the initial validated
+build and compile with `--locked`, preventing dependency drift between pairs.
+The build container uses root to access the image's Rust
 toolchain under `/root`; model containers retain the Slurm UID.
 
 No venv, pip installation or Rust installation is performed in this suite.
