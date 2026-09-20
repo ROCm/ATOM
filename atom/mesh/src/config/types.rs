@@ -219,6 +219,8 @@ impl RoutingMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum PolicyConfig {
+    #[serde(rename = "kv_cache_aware")]
+    KvCacheAware,
     #[serde(rename = "random")]
     Random,
 
@@ -270,6 +272,7 @@ fn default_load_factor() -> f64 {
 impl PolicyConfig {
     pub fn name(&self) -> &'static str {
         match self {
+            PolicyConfig::KvCacheAware => "kv_cache_aware",
             PolicyConfig::Random => "random",
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::DpSticky => "dp_sticky",

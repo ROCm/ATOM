@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, DpStickyPolicy, LoadBalancingPolicy, PowerOfTwoPolicy,
-    PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    CacheAwareConfig, CacheAwarePolicy, DpStickyPolicy, KvCacheAwarePolicy, LoadBalancingPolicy,
+    PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -15,6 +15,7 @@ impl PolicyFactory {
     /// Create a policy from configuration
     pub fn create_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
         match config {
+            PolicyConfig::KvCacheAware => Arc::new(KvCacheAwarePolicy),
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
             PolicyConfig::DpSticky => Arc::new(DpStickyPolicy::new()),
@@ -51,6 +52,7 @@ impl PolicyFactory {
     /// Create a policy by name (for dynamic loading)
     pub fn create_by_name(name: &str) -> Option<Arc<dyn LoadBalancingPolicy>> {
         match name.to_lowercase().as_str() {
+            "kv_cache_aware" => Some(Arc::new(KvCacheAwarePolicy)),
             "random" => Some(Arc::new(RandomPolicy::new())),
             "round_robin" | "roundrobin" => Some(Arc::new(RoundRobinPolicy::new())),
             "dp_sticky" | "dpsticky" => Some(Arc::new(DpStickyPolicy::new())),

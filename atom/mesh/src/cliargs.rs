@@ -217,7 +217,7 @@ pub struct CliArgs {
     #[arg(
         long,
         default_value = "cache_aware",
-        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash"],
+        value_parser = ["random", "round_robin", "dp_sticky", "kv_cache_aware", "cache_aware", "power_of_two", "prefix_hash"],
         help_heading = "Routing Policy"
     )]
     pub policy: String,
@@ -266,7 +266,7 @@ pub struct CliArgs {
     /// Specific policy for prefill nodes in PD mode
     #[arg(
         long,
-        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash"],
+        value_parser = ["random", "round_robin", "dp_sticky", "kv_cache_aware", "cache_aware", "power_of_two", "prefix_hash"],
         help_heading = "PD Disaggregation"
     )]
     pub prefill_policy: Option<String>,
@@ -274,7 +274,7 @@ pub struct CliArgs {
     /// Specific policy for decode nodes in PD mode
     #[arg(
         long,
-        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash"],
+        value_parser = ["random", "round_robin", "dp_sticky", "kv_cache_aware", "cache_aware", "power_of_two", "prefix_hash"],
         help_heading = "PD Disaggregation"
     )]
     pub decode_policy: Option<String>,
@@ -516,6 +516,7 @@ impl CliArgs {
             "random" => PolicyConfig::Random,
             "round_robin" => PolicyConfig::RoundRobin,
             "dp_sticky" => PolicyConfig::DpSticky,
+            "kv_cache_aware" => PolicyConfig::KvCacheAware,
             "cache_aware" => PolicyConfig::CacheAware {
                 cache_threshold: self.cache_threshold,
                 balance_abs_threshold: self.balance_abs_threshold,

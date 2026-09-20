@@ -113,7 +113,10 @@ async fn render_chat(State(state): State<Arc<AppState>>, Json(body): Json<Value>
     state.router.render_tokens(true, &body).await
 }
 
-async fn render_completion(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+async fn render_completion(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
     state.router.render_tokens(false, &body).await
 }
 

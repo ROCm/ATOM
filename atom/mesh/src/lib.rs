@@ -1,4 +1,5 @@
 pub mod app_context;
+pub mod cache_index;
 pub mod cliargs;
 pub mod config;
 pub mod core;
