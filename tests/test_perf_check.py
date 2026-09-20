@@ -41,8 +41,13 @@ sys.path.insert(0, str(SCRIPTS))
 
 import perf_judge as pj
 
-JUDGING = [64, 128, 256]
-REFERENCE = [4, 32]
+JUDGING = [32, 256]
+REFERENCE = []
+# The drift criterion is the nightly monitor's, ported with its constants
+# intact (DRIFT_MIN_CONC=64, DRIFT_FAM_MIN_CONFIGS=3). It reads dashboard
+# history, not this run's levels, so its fixtures are its own -- reusing
+# JUDGING here coupled two things that only looked alike.
+DRIFT_LEVELS = [64, 128, 256]
 ALL_CONCS = REFERENCE + JUDGING
 
 BASE_TPUT = {
@@ -274,7 +279,7 @@ def test_families_outside_drift_coverage_are_listed(tmp_path):
     day = 86400000
     series = {}
     # Enough history to be judged.
-    for c in JUDGING:
+    for c in DRIFT_LEVELS:
         series[("M", "8192/1024", c)] = [
             {"date": now - i * day, "tput": 1000.0 - i, "tpot": 30.0 + i}
             for i in range(pj.DRIFT_MIN_RUNS + 2)
@@ -364,30 +369,25 @@ def test_positive_finding_survives_missing_coverage(tmp_path):
 
 
 # ------------------------------------------------ judging vs reference levels ---
-def test_low_concurrency_never_reaches_the_verdict(tmp_path):
-    """Small-c levels pollute a verdict in both directions, so they are
-    measured and shown but excluded from every computation."""
+def test_c32_now_reaches_the_verdict(tmp_path):
+    """c=32 is judged, not shown. Its own run-to-run spread is 2.2% for a
+    tp>=4 MoE against 0.5-1.2% at c=256, and DOWN_EPS_PCT is -2.0% -- so this
+    level can cross the "down" line without any code having changed. The
+    matrix runs it anyway, because two jobs per entry is the budget."""
     spec = flat(tput=-0.4, tpot=-0.1)
-    spec["Kimi-K3"] = {
-        "per_conc": {4: -19.8, 32: -9.0, 64: -0.3, 128: 0.2, 256: -0.1},
-        "tpot": 0.1,
-    }
+    spec["Kimi-K3"] = {"per_conc": {32: -9.0, 256: -0.1}, "tpot": 0.1}
     report = run_judge(tmp_path, spec)
 
-    assert report["verdict"] == "clean"
     kimi = next(f for f in report["families"] if f["model"] == "Kimi-K3")
     assert [m["conc"] for m in kimi["judging"]] == JUDGING
-    assert [m["conc"] for m in kimi["reference"]] == REFERENCE
-    assert kimi["median_tput_pct"] == pytest.approx(-0.1, abs=0.05)
+    assert kimi["reference"] == []
+    # Averaged, not discarded: -9.0 and -0.1 reach the verdict as -4.55.
+    assert kimi["median_tput_pct"] == pytest.approx(-4.55, abs=0.2)
 
-    # Excluded from the verdict, but not hidden -- that is the whole point.
+    # No level is italicised any more, because none is excluded.
     body = pj.render(report, "")
-    assert "-19.8%" in body
-    # Shown, and marked as excluded -- italic rather than a parenthetical: the
-    # audience already knows small batches are noisy.
-    assert "| *4* |" in body
-    assert "Italic levels are measured but not judged" in body
-    assert "median of judged" in body
+    assert "-9.0%" in body
+    assert "| *32* |" not in body
 
 
 def test_reference_only_entry_is_insufficient(tmp_path):
@@ -396,22 +396,19 @@ def test_reference_only_entry_is_insufficient(tmp_path):
 
 
 # ------------------------------------------------------------- shape flags ---
-def test_nonmonotonic_shape_is_not_asserted_either_way(tmp_path):
-    """c=64 -8.6%, c=128 -0.3%, c=256 -7.8% medians to -7.8% and would read as
-    a two-sided drop; the real signal is that one level behaves unlike its
-    neighbours. Median and count both stop describing the data here."""
+def test_shape_detection_is_off_below_three_levels(tmp_path):
+    """The other thing the two-level matrix gave up. `_nonmonotonic` needs an
+    interior level to compare against its neighbours, so with a pair there is
+    nothing to detect -- a family whose levels disagree is averaged and
+    reported as a number, with no `unclear` to flag that the average is not
+    describing the data. Three levels used to catch exactly this."""
     spec = flat(tput=-0.4, tpot=-0.1)
-    spec["GLM-5.2-FP8"] = {
-        "per_conc": {4: -3.0, 32: -5.0, 64: -8.6, 128: -0.3, 256: -7.8},
-        "tpot": 5.0,
-    }
+    spec["GLM-5.2-FP8"] = {"per_conc": {32: -8.6, 256: -7.8}, "tpot": 5.0}
     report = run_judge(tmp_path, spec)
 
-    assert report["verdict"] == "unclear"
     glm = next(f for f in report["families"] if f["model"] == "GLM-5.2-FP8")
-    assert glm["nonmonotonic"]
-    assert glm["nonmonotonic"][0]["conc"] == 128
-    assert "does not follow its neighbours" in pj.render(report, "")
+    assert glm["nonmonotonic"] is None
+    assert report["verdict"] == "regression"
 
 
 def test_uniform_drop_is_not_flagged_as_nonmonotonic(tmp_path):
@@ -421,12 +418,25 @@ def test_uniform_drop_is_not_flagged_as_nonmonotonic(tmp_path):
     assert all(not f.get("nonmonotonic") for f in report["families"])
 
 
-def test_two_judging_levels_cannot_express_shape(tmp_path):
-    """Below three judging levels the family is not judged at all, which is
-    also why the matrix runs three rather than two."""
-    report = run_judge(tmp_path, flat(tput=-6.0, tpot=5.0), concs=[128, 256])
+def test_one_judging_level_is_not_enough(tmp_path):
+    """A pair is the floor. One level is a single measurement, and the spread
+    between levels on identical code reached 2.58 points on mi355-gpu-41, so a
+    lone number cannot carry a verdict."""
+    report = run_judge(tmp_path, flat(tput=-6.0, tpot=5.0), concs=[256])
     assert all(f["status"] == "insufficient" for f in report["families"])
     assert report["verdict"] == "inconclusive"
+
+
+def test_a_pair_is_a_mean_and_one_level_moves_it_by_half(tmp_path):
+    """What the two-level matrix gave up. With three levels the median ignores
+    one aberrant level; with two it carries half of it, so the effective
+    resolution is coarser than FAMILY_MEDIAN_PCT reads."""
+    spec = flat(tput=-0.4, tpot=-0.1)
+    spec["Kimi-K3"] = {"per_conc": {32: -8.0, 256: 0.0}, "tpot": 4.0}
+    report = run_judge(tmp_path, spec)
+    kimi = next(f for f in report["families"] if f["model"] == "Kimi-K3")
+    # -8.0 and 0.0 average to -4.0: half of the outlier reaches the verdict.
+    assert kimi["median_tput_pct"] == pytest.approx(-4.0, abs=0.2)
 
 
 # ------------------------------------------------------- history / sigma ---
@@ -437,7 +447,7 @@ def _data_js(points):
             "commit": {"id": f"c{i}"},
             "benches": [
                 {
-                    "name": "ATOM::M 8192/1024 c=128 Total Tput (tok/s)",
+                    "name": "ATOM::M 8192/1024 c=256 Total Tput (tok/s)",
                     "unit": "tok/s",
                     "value": value,
                     "extra": f"Run: https://github.com/x/y/actions/runs/{run_id}",
@@ -583,12 +593,14 @@ def _series(model, concs, days, start, end, tpot_start=30.0, tpot_end=30.0):
 def test_main_side_drift_is_reported_apart_from_the_verdict(tmp_path):
     """A slide on main leaves the paired delta honest and the absolute level
     wrong. Reporting only "no change" would read as "fine"."""
-    series = _series("M", JUDGING, 14, 10000.0, 9000.0, 30.0, 33.0)  # -10%, TPOT +10%
+    series = _series(
+        "M", DRIFT_LEVELS, 14, 10000.0, 9000.0, 30.0, 33.0
+    )  # -10%, TPOT +10%
     result = pj.main_drift(series, {"M"})
     drift = result["rows"]
     assert len(drift) == 1
     assert drift[0]["median_pct"] < pj.DRIFT_MEDIAN_TH
-    assert drift[0]["n_down"] == len(JUDGING)
+    assert drift[0]["n_down"] == len(DRIFT_LEVELS)
 
     base = [_result("M", c, 9000.0, 33.0) for c in JUDGING]
     head = [_result("M", c, 8995.0, 33.0) for c in JUDGING]
@@ -603,14 +615,14 @@ def test_main_side_drift_is_reported_apart_from_the_verdict(tmp_path):
 
 def test_drift_needs_tpot_to_mirror(tmp_path):
     """Throughput sliding with TPOT flat is measurement wobble, not a slowdown."""
-    series = _series("M", JUDGING, 14, 10000.0, 9000.0, 30.0, 30.0)
+    series = _series("M", DRIFT_LEVELS, 14, 10000.0, 9000.0, 30.0, 30.0)
     assert pj.main_drift(series, {"M"})["rows"] == []
 
 
 def test_drift_is_scoped_to_the_models_measured(tmp_path):
     """Listing every drifting family in the repository would bury the one the
     reader came for."""
-    series = _series("Other", JUDGING, 14, 10000.0, 9000.0, 30.0, 33.0)
+    series = _series("Other", DRIFT_LEVELS, 14, 10000.0, 9000.0, 30.0, 33.0)
     assert pj.main_drift(series, {"M"})["rows"] == []
     assert pj.main_drift(series, {"Other"})["rows"] != []
 
@@ -632,8 +644,11 @@ def test_thresholds_report_the_measured_residual_bias(tmp_path):
 
 
 def test_judging_levels_start_at_the_documented_boundary():
-    assert pj.JUDGE_MIN_CONC == 64
-    assert pj.FAMILY_MIN_CONFIGS == 3
+    assert pj.JUDGE_MIN_CONC == 32
+    assert pj.FAMILY_MIN_CONFIGS == 2
+    # Asking for more levels down than a family can have means nothing ever
+    # trips, and it fails silently: every run reads clean.
+    assert pj.FAMILY_MIN_DOWN <= pj.FAMILY_MIN_CONFIGS
     assert pj.FAMILY_MIN_DOWN == pj.FAMILY_MIN_CONFIGS
 
 
@@ -973,7 +988,7 @@ def test_repeated_base_reading_yields_a_drift_figure(tmp_path):
     head = [_result("M", c, 10100.0, 30.0) for c in JUDGING]
 
     pairs = pj.pair_results(base, head, base2)
-    assert len(pairs) == 3
+    assert len(pairs) == len(JUDGING)
     for p in pairs:
         assert p["drift_pct"] == pytest.approx(2.0, abs=0.01)
         # Naively head/base reads +1%; against the mean of the two it is flat,

@@ -52,9 +52,21 @@ from summarize import (  # the sys.path shim above must run first
 )
 
 # --- Family linkage (primary criterion; independent of sigma) ---------------
-JUDGE_MIN_CONC = 64  # below this, a level is reference-only and never judged
-FAMILY_MIN_CONFIGS = 3  # judging levels needed before a family is judged
-FAMILY_MIN_DOWN = 3  # of those, how many must be down
+# These three move together, and a mismatch is silent. FAMILY_MIN_DOWN above
+# FAMILY_MIN_CONFIGS asks for more levels down than a family can have, so
+# nothing ever trips; FAMILY_MIN_CONFIGS above the number of levels at or over
+# JUDGE_MIN_CONC leaves every family `insufficient`. Changing the matrix's
+# levels means changing these.
+JUDGE_MIN_CONC = 32  # below this, a level is reference-only and never judged
+# Two levels, not three: the verdict is now the mean of a pair rather than a
+# median. A median of three ignores one aberrant level; a mean of two carries
+# half of it. Measured on mi355-gpu-41 under dummy weights, identical code gave
+# +1.35 / -1.23 / -0.13% at c=64/128/256 -- a 2.58-point spread that the median
+# reduced to -0.13%. With a pair, a level that far out moves the verdict by
+# half its distance, so the effective resolution is coarser than
+# FAMILY_MEDIAN_PCT suggests.
+FAMILY_MIN_CONFIGS = 2  # judging levels needed before a family is judged
+FAMILY_MIN_DOWN = 2  # of those, how many must be down
 FAMILY_MEDIAN_PCT = -3.0  # family median throughput delta that trips the gate
 DOWN_EPS_PCT = -2.0  # a level counts as "down" past this
 TPOT_MIRROR_RATIO = 0.6  # |median TPOT delta / median tput delta| for mirroring
@@ -1144,7 +1156,10 @@ def _history_note(report):
                 "Baseline checked against nightly history for "
                 "{} of {} judged configurations.".format(
                     report.get("history_matched", 0),
-                    len(report.get("families", [])) * 3,
+                    # Levels per family, counted rather than assumed: this was
+                    # a literal 3 and silently misreported the denominator the
+                    # first time the matrix ran a different number of levels.
+                    sum(len(f.get("judging") or []) for f in report["families"]),
                 )
             ),
             "",
