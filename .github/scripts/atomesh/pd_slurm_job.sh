@@ -5,6 +5,14 @@
 
 set -euo pipefail
 
+# Default RCCL to IPv4 (GID 1 on TW). Allow overrides for other fabrics.
+export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-1}"
+if [[ ! "${NCCL_IB_GID_INDEX}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: NCCL_IB_GID_INDEX must be a non-negative integer" >&2
+  exit 2
+fi
+echo "RCCL RDMA GID index: ${NCCL_IB_GID_INDEX}"
+
 REPO_ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
 SCRIPT_PATH="${REPO_ROOT}/.github/scripts/atomesh/pd_server_atom.sh"
 JOB_ID="${SLURM_JOB_ID:-${SPUR_JOB_ID:-local}}"
@@ -58,6 +66,13 @@ publish_rank_rc() {
   mv "${rc_file}.tmp" "${rc_file}" 2>/dev/null || true
 }
 
+publish_workload_status() {
+  python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_job_result.py" publish \
+    --run-dir "${RUN_DIR}" --job-id "${JOB_ID}" \
+    --run-token "${ATOMESH_RUN_TOKEN:-}" --num-ranks "${NUM_NODES}" \
+    --rank "$1" --status "$2"
+}
+
 write_env_file() {
   local env_file="$1"
   python3 - <<'PY' > "${env_file}"
@@ -105,6 +120,7 @@ allow = (
     "RUN_EVAL",
     "EVAL_",
     "SWEBENCH_",
+    "NCCL_IB_GID_INDEX",
 )
 for key, value in sorted(os.environ.items()):
     if key.startswith(allow):
@@ -144,6 +160,7 @@ run_container_rank() {
   local rank_dir="${RUN_DIR}/rank-${rank}"
   local bin_dir="${RUN_DIR}/bin"
   local video_gid render_gid host_ionic nccl_socket_ifname
+  local mori_socket_ifname socket_ifname
   local docker_socket_gid docker_cli docker_root
 
   mkdir -p "${rank_dir}"
@@ -166,9 +183,26 @@ EOF
   render_gid="$(getent group render 2>/dev/null | cut -d: -f3 || true)"
   host_ionic="$(readlink -f /usr/lib/x86_64-linux-gnu/libionic.so.1 2>/dev/null || true)"
   nccl_socket_ifname="${NCCL_SOCKET_IFNAME:-}"
-  if [[ -z "${nccl_socket_ifname}" && -d /sys/class/net/eth1 ]]; then
-    nccl_socket_ifname="eth1"
+  mori_socket_ifname="${MORI_SOCKET_IFNAME:-}"
+  local node_ip="${IPS[rank]}"
+  if [[ -z "${nccl_socket_ifname}" || -z "${mori_socket_ifname}" ]]; then
+    # Use the interface owning this worker's Spur address (10.19.x.x on
+    # TensorWave). Both NCCL and MORI bootstrap independently autodetect an
+    # interface; either can select a network that blocks local TCP traffic.
+    if ! socket_ifname="$(ip -o -4 addr show | awk -v node_ip="${node_ip}" '
+      { split($4, address, "/") }
+      address[1] == node_ip { sub(/@.*/, "", $2); print $2; exit }
+    ')" || [[ -z "${socket_ifname}" ]]; then
+      echo "ERROR: cannot find a local IPv4 interface for Spur address ${node_ip}; set NCCL_SOCKET_IFNAME and MORI_SOCKET_IFNAME explicitly" >&2
+      return 2
+    fi
+    # NCCL uses '=' for an exact match; MORI requires a plain interface name.
+    # Keep explicit overrides independent: NCCL also accepts lists/patterns
+    # that cannot be passed to MORI as interface names.
+    nccl_socket_ifname="${nccl_socket_ifname:-=${socket_ifname}}"
+    mori_socket_ifname="${mori_socket_ifname:-${socket_ifname}}"
   fi
+  echo "[network] rank=${rank} ip=${node_ip} NCCL_SOCKET_IFNAME=${nccl_socket_ifname} MORI_SOCKET_IFNAME=${mori_socket_ifname}"
 
   bounded_docker_rm "${container}"
   if [[ "${execution_phase}" != "eval" ]]; then
@@ -215,7 +249,6 @@ EOF
     -e FLYDSL_RUNTIME_CACHE_DIR="/tmp/atomesh-cache-${JOB_ID}-${rank}/flydsl"
     -e NCCL_NET_PLUGIN=none
     -e NCCL_IB_HCA=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
-    -e NCCL_IB_GID_INDEX=1
     -e NCCL_CROSS_NIC=0
     -e NCCL_PXN_DISABLE=0
     -e NCCL_NET_DISABLE_INTRA=1
@@ -274,6 +307,7 @@ EOF
   [[ -n "${video_gid}" ]] && docker_args+=(--group-add "${video_gid}")
   [[ -n "${render_gid}" ]] && docker_args+=(--group-add "${render_gid}")
   [[ -n "${nccl_socket_ifname}" ]] && docker_args+=(-e NCCL_SOCKET_IFNAME="${nccl_socket_ifname}")
+  [[ -n "${mori_socket_ifname}" ]] && docker_args+=(-e MORI_SOCKET_IFNAME="${mori_socket_ifname}")
   [[ -n "${host_ionic}" && -e "${host_ionic}" ]] && docker_args+=(-v "${host_ionic}:/usr/lib/x86_64-linux-gnu/libionic.so.1:ro")
   [[ -e /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so ]] && docker_args+=(-v /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:ro)
   [[ -e /etc/libibverbs.d/ionic.driver ]] && docker_args+=(-v /etc/libibverbs.d/ionic.driver:/etc/libibverbs.d/ionic.driver:ro)
@@ -295,10 +329,16 @@ EOF
 
 run_spur_job() {
   if [[ -z "${SPUR_TASK_OFFSET:-}" || -z "${SPUR_PEER_NODES:-}" ]]; then
-    return 1
+    echo "ERROR: Spur worker requires SPUR_TASK_OFFSET and SPUR_PEER_NODES" >&2
+    return 2
   fi
 
   local node_rank="${SPUR_TASK_OFFSET}"
+  if [[ ! "${node_rank}" =~ ^[0-9]+$ || "${node_rank}" -ge "${NUM_NODES}" ]]; then
+    echo "ERROR: invalid Spur worker rank ${node_rank} for ${NUM_NODES} nodes" >&2
+    return 2
+  fi
+  publish_workload_status "${node_rank}" running
   local env_file="${RUN_DIR}/docker-rank-${node_rank}.env"
   local peers=()
   IFS=',' read -r -a peers <<< "${SPUR_PEER_NODES}"
@@ -392,12 +432,29 @@ EOF
 
   echo "=== Spur rank ${node_rank} completed ==="
   find "${RUN_DIR}" -maxdepth 3 -type f | sort
+  # Separate completed work from EXIT-trap/agent cleanup. An EXIT trap alone
+  # can publish rc=0 without proving that all requested phases were executed.
+  publish_workload_status "${node_rank}" completed
   return 0
 }
 
-if [[ -n "${SPUR_TASK_OFFSET:-}" || -n "${SPUR_PEER_NODES:-}" ]]; then
+if [[ "${1:-}" == "--spur-worker" ]]; then
   run_spur_job
   exit $?
+fi
+
+if [[ -n "${SPUR_JOB_ID:-}" || -n "${SPUR_TASK_OFFSET:-}" || -n "${SPUR_PEER_NODES:-}" ]]; then
+  # Spur sbatch runs the batch script only on the first allocated node; the
+  # other nodes run placeholders until an srun step dispatches their workers.
+  # Use an explicit worker argument because the batch shell also has rank 0
+  # in SPUR_TASK_OFFSET. srun assigns each worker's rank and inherits the batch
+  # environment, including SPUR_PEER_NODES in allocation order.
+  echo "=== Spur job ${JOB_ID}: dispatching ${NUM_NODES} node workers ==="
+  exec srun \
+    --nodes="${NUM_NODES}" \
+    --ntasks="${NUM_NODES}" \
+    --ntasks-per-node=1 \
+    bash "${REPO_ROOT}/.github/scripts/atomesh/pd_slurm_job.sh" --spur-worker
 fi
 
 mapfile -t ALLOC_NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")

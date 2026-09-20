@@ -475,11 +475,9 @@ def split_zmq_path(path: str) -> tuple[str, str, str]:
 
     scheme = parsed.scheme
     host = parsed.hostname or ""
-    # Port 0 is a request for the kernel to assign one, not a missing port, so
-    # it has to survive the emptiness check below.
-    port = "" if parsed.port is None else str(parsed.port)
+    port = str(parsed.port or "")
 
-    if scheme == "tcp" and not (host and port):
+    if scheme == "tcp" and not all((host, port)):
         # The host and port fields are required for tcp
         raise ValueError(f"Invalid zmq path: {path}")
 

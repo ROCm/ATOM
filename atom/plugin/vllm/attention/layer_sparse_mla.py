@@ -304,7 +304,10 @@ def sparse_attn_indexer_plugin_mode(
             "Sparse MLA metadata not found for indexer cache "
             f"{k_cache_prefix!r}. The indexer cannot populate paged_kv_indices."
         )
-    slot_mapping = indexer_meta.slot_mapping
+    # V2 may pad metadata to the graph width while the tensors above contain
+    # only live tokens. Cache kernels launch once per slot and index those
+    # tensors directly, so the mapping must have the same live-token extent.
+    slot_mapping = indexer_meta.slot_mapping[: q_input.shape[0]]
     has_decode = indexer_meta.num_decodes > 0
     has_prefill = indexer_meta.num_prefills > 0
     num_decode_tokens = indexer_meta.num_decode_tokens

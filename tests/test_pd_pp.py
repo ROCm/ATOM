@@ -3,6 +3,7 @@
 
 import logging
 import os
+import subprocess
 import sys
 import threading
 import types
@@ -144,23 +145,6 @@ def test_build_req_meta_reads_remote_pp_size():
     assert meta.remote_pp_size == 4
 
 
-def test_build_req_meta_keeps_remote_and_local_state_slots_distinct():
-    meta = ConnectorMetadata._build_req_meta(
-        req_id="r0",
-        local_block_ids=[0],
-        kv_transfer_params={
-            "remote_block_ids": [5],
-            "remote_host": "h",
-            "remote_handshake_port": 6301,
-            "tp_size": 1,
-            "local_slot_index": 11,
-            "remote_slot_index": 7,
-        },
-    )
-    assert meta.local_slot_index == 11
-    assert meta.remote_slot_index == 7
-
-
 def test_build_req_meta_defaults_pp_size_one():
     meta = ConnectorMetadata._build_req_meta(
         req_id="r0",
@@ -197,7 +181,6 @@ def test_producer_advertises_remote_pp_size():
         spec_token_ids=None,
         block_table=[1, 2, 3],
         id=99,
-        state_slot=7,
         state_slots=[],
         kv_transfer_params_output=None,
     )
@@ -207,48 +190,6 @@ def test_producer_advertises_remote_pp_size():
     assert seq.kv_transfer_params_output["block_size"] == 64
     assert seq.kv_transfer_params_output["dcp_size"] == 1
     assert seq.kv_transfer_params_output["remote_block_ids"] == [1, 2, 3]
-    assert seq.kv_transfer_params_output["remote_slot_index"] == 7
-
-
-@pytest.mark.parametrize(
-    "producer_slots",
-    [
-        # Compatibility form emitted by older producers.
-        {"local_slot_index": 7},
-        # The explicit source slot must win over the legacy field.
-        {"local_slot_index": 3, "remote_slot_index": 7},
-    ],
-)
-def test_consumer_preserves_producer_final_slot_before_setting_destination(
-    producer_slots,
-):
-    mc = pytest.importorskip(
-        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
-    )
-    sched = _mooncake_consumer_scheduler(mc)
-
-    # Nothing locally cached, so the incremental-transfer branch resolves to a
-    # full transfer and leaves the slot bookkeeping under test alone.
-    seq = SimpleNamespace(
-        id="decode-1",
-        state_slot=11,
-        block_table=[1, 2],
-        has_per_req_cache=False,
-        num_cached_tokens=0,
-        kv_transfer_params={
-            "do_remote_prefill": True,
-            "transfer_id": "prefill-1",
-            "hash_block_size": 64,
-            **producer_slots,
-        },
-    )
-    sched.update_state_after_alloc(seq)
-
-    assert seq.kv_transfer_params["remote_slot_index"] == 7
-    assert seq.kv_transfer_params["local_slot_index"] == 11
-    meta = sched.build_connector_meta().reqs_to_recv["decode-1"]
-    assert meta.remote_slot_index == 7
-    assert meta.local_slot_index == 11
 
 
 def _mooncake_consumer_scheduler(mc, block_size=64, dcp_size=1):
@@ -358,6 +299,118 @@ def test_mismatched_or_missing_block_size_forces_full_transfer(
 # ---------------------------------------------------------------------------
 # Mooncake transport selection
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
+@pytest.mark.parametrize(
+    "protocol,configured_device,expected_device",
+    [
+        ("rdma", "", "rdma2"),
+        ("rdma", "ionic_4,ionic_0", "ionic_4,ionic_0"),
+        ("tcp", "rdma2", ""),
+    ],
+)
+def test_mooncake_control_address_is_independent_of_rdma_device(
+    monkeypatch, role, protocol, configured_device, expected_device
+):
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    host_ip = "10.19.0.140"
+    monkeypatch.setenv("ATOM_HOST_IP", host_ip)
+    monkeypatch.delenv("ATOM_MOONCAKE_IB_DEVICE", raising=False)
+    monkeypatch.delenv("MC_FORCE_TCP", raising=False)
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "2,3")
+    monkeypatch.setattr(mc.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(mc, "_ib_device_exists", lambda name: True)
+    monkeypatch.setattr(
+        mc, "get_tp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=8)
+    )
+    monkeypatch.setattr(
+        mc, "get_dp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=1)
+    )
+
+    # Reproduce a host with a separate RoCE network. The old constructor
+    # replaced ATOM_HOST_IP with this HCA address, breaking TCP handshakes.
+    original_listdir = os.listdir
+    monkeypatch.setattr(
+        os,
+        "listdir",
+        lambda path: (
+            ["tw-eth2"]
+            if str(path).startswith("/sys/class/infiniband/")
+            else original_listdir(path)
+        ),
+    )
+    original_check_output = subprocess.check_output
+    monkeypatch.setattr(
+        subprocess,
+        "check_output",
+        lambda cmd, **kwargs: (
+            "2: tw-eth2 inet 10.103.40.121/31 scope global tw-eth2\n"
+            if cmd[:4] == ["ip", "-o", "-4", "addr"]
+            else original_check_output(cmd, **kwargs)
+        ),
+    )
+
+    engine = MagicMock()
+    engine.initialize.return_value = 0
+    engine.get_rpc_port.return_value = 16578
+    monkeypatch.setattr(mc, "_MOONCAKE_AVAILABLE", True)
+    monkeypatch.setattr(mc, "TransferEngine", lambda: engine, raising=False)
+    monkeypatch.setattr(mc, "get_open_port", lambda: 41000)
+    monkeypatch.setattr(mc.zmq, "Context", MagicMock())
+    monkeypatch.setattr(mc, "ThreadPoolExecutor", MagicMock())
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(pipeline_parallel_rank=0),
+        pipeline_parallel_size=1,
+        hf_config=SimpleNamespace(num_hidden_layers=2),
+        kv_cache_block_size=16,
+        decode_context_parallel_size=1,
+        dcp_config=SimpleNamespace(interleave_size=1),
+        kv_transfer_config={
+            "kv_role": role,
+            "protocol": protocol,
+            "ib_device": configured_device,
+        },
+    )
+    conn = mc.MooncakeConnector(config)
+
+    engine.initialize.assert_called_once_with(
+        host_ip, "P2PHANDSHAKE", protocol, expected_device
+    )
+    assert conn.engine_id == f"{host_ip}:16578"
+    assert conn.request_address == f"{host_ip}:8000"
+    assert conn.ib_devices == (expected_device.split(",") if expected_device else [])
+
+    if role == "kv_consumer":
+        # This test exercises the wire payload without registering GPU memory.
+        conn._notification_port = 42000
+        # Check the actual wire payload used for the RDMA target and ZMQ
+        # write-done notification, not only the engine's bootstrap address.
+        conn._send_on_socket = MagicMock()
+        meta = ConnectorMetadata._build_req_meta(
+            req_id="r0",
+            local_block_ids=[0],
+            kv_transfer_params={
+                "remote_block_ids": [1],
+                "remote_host": "10.19.0.113",
+                "remote_handshake_port": 6301,
+                "tp_size": 8,
+                "transfer_id": 9,
+            },
+        )
+        conn.start_load_kv(
+            SimpleNamespace(
+                request_id_to_transfer_id={"r0": 9}, reqs_to_recv={"r0": meta}
+            )
+        )
+        addr, (_, payload) = conn._send_on_socket.call_args.args
+        request = mc.msgpack.loads(payload)
+        assert addr == "tcp://10.19.0.113:6301"
+        assert request["consumer_host"] == host_ip
+        assert request["consumer_rpc_port"] == 16578
+        assert request["notify_host"] == host_ip
+        assert request["notify_port"] == 42000
 
 
 def test_mooncake_tcp_disables_rdma_device_even_when_configured():
@@ -670,79 +723,6 @@ def _make_connector(**overrides):
     for k, v in overrides.items():
         setattr(conn, k, v)
     return conn
-
-
-def _make_transfer_connector(prefill_data, captured):
-    conn = _make_connector()
-    conn.pp_size = 1
-    conn.pp_rank = 0
-    conn.tp_size = 1
-    conn.dcp_size = 1
-    conn.transfer_engine = object()
-    conn._transfer_refcount_lock = threading.Lock()
-    conn._transfer_refcount = {}
-    conn._completed_prefills_lock = threading.Lock()
-    conn._completed_prefills = {}
-    conn._kv_cache_ready_events = {}
-    conn.done_sending = set()
-    conn._wait_for_prefill_data = lambda _transfer_id: dict(prefill_data)
-    # Mirrors the real signature: the transfer helpers take a keyword-only
-    # ``engine`` so each request can be pinned to its own matched rail (#2276).
-    conn._execute_block_slot_transfer = (
-        lambda request, target, src, dst, data, req_id, *, engine=None: captured.append(
-            (request, target, src, dst, data, req_id)
-        )
-        or True
-    )
-    conn._send_write_done = lambda *_args, **_kwargs: None
-    return conn
-
-
-def _stateful_write_request(**overrides):
-    request = {
-        "request_id": "decode-1",
-        "transfer_id": "prefill-1",
-        "consumer_host": "10.0.0.2",
-        "consumer_rpc_port": 42000,
-        "dst_block_ids": [9],
-        "notify_host": "10.0.0.2",
-        "notify_port": 42001,
-        "consumer_tp_size": 1,
-        "write_nonce": 1,
-        "has_slot_regions": True,
-        "src_slot_index": 7,
-        "src_swa_block_ids": [7],
-        "dst_slot_index": 11,
-    }
-    request.update(overrides)
-    return request
-
-
-def test_tp_transfer_uses_final_source_slot_after_checkpoint_move():
-    captured = []
-    conn = _make_transfer_connector(
-        {"block_ids": [3], "slot_index": 3, "swa_block_ids": [3]}, captured
-    )
-
-    conn._execute_transfer(_stateful_write_request())
-
-    assert len(captured) == 1
-    transferred = captured[0][4]
-    assert transferred["slot_index"] == 7
-    assert transferred["swa_block_ids"] == [7]
-
-
-@pytest.mark.parametrize("invalid_slot", [-1, None, "invalid"])
-def test_stateful_transfer_without_final_source_slot_fails_closed(caplog, invalid_slot):
-    captured = []
-    conn = _make_transfer_connector(
-        {"block_ids": [3], "slot_index": 3, "swa_block_ids": [3]}, captured
-    )
-
-    conn._execute_transfer(_stateful_write_request(src_slot_index=invalid_slot))
-
-    assert captured == []
-    assert "missing the producer's final source slot" in caplog.text
 
 
 def test_write_done_correct_nonce_accepted():

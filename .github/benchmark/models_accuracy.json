@@ -267,6 +267,7 @@
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "pr",
     "accuracy_threshold": 0.94,
+    "accuracy_timeout_minutes": 45,
     "accuracy_baseline": 0.95,
     "accuracy_baseline_model": "moonshotai/Kimi-K3",
     "_baseline_note": "Kimi-K3 (kimi_linear KDA+MLA, MXFP4 MoE) native ATOM FP8 kv-cache, TP8 (GSM8K 3-shot flexible-extract). Baseline 0.95; threshold 0.94 leaves ~1pp headroom. Refresh after the first CI run."
@@ -279,6 +280,7 @@
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "pr",
     "accuracy_threshold": 0.94,
+    "accuracy_timeout_minutes": 45,
     "accuracy_baseline": 0.95,
     "accuracy_baseline_model": "moonshotai/Kimi-K3 + Inferact/Kimi-K3-DSpark",
     "_baseline_note": "Kimi-K3 DSpark block spec-decode (7 tokens) on the Kimi-K3 target with the Inferact/Kimi-K3-DSpark draft. Spec-decode is lossless w.r.t. the target, so baseline reuses the Kimi-K3 FP8 base (0.95); threshold 0.94 matches the target. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate -- add it once measured."

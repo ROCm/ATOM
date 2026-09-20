@@ -46,7 +46,7 @@ backends:
 models:
   DeepSeek-V4-Pro:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/DeepSeek-V4-Pro/"
+    model_path: "${ATOMESH_MODEL_ROOT}/deepseek-ai/DeepSeek-V4-Pro/"
     precision: FP4
     env:
       common:
@@ -179,7 +179,7 @@ models:
 
   GLM-5.2-MXFP4:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/GLM-5.2-MXFP4"
+    model_path: "${ATOMESH_MODEL_ROOT}/amd/GLM-5.2-MXFP4"
     precision: MXFP4
     env:
       common:
@@ -378,18 +378,15 @@ models:
               LMCACHE_LOCAL_CPU: "True"
               LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
               LMCACHE_CHUNK_SIZE: "256"
-              # NVMe (L3) tier under the CPU hot cache. Both variables are
-              # required together; LMCACHE_MAX_LOCAL_CPU_SIZE must stay > 0
+              # Disk/NVMe (L3) tier is disabled by default. To enable it, uncomment
+              # both variables below; LMCACHE_MAX_LOCAL_CPU_SIZE must stay > 0
               # because LocalDiskBackend stages through the host allocator.
               # scale_cpu_size_for_pp splits only the CPU budget across PP
               # stages, so this size is per rank: 4 x 500GiB on a pp4 prefill.
               # pd_server_atom.sh empties the directory around the run.
-              # The path follows the default atomesh-cicd fleet, where /mnt is
-              # local and already holds ATOMESH_MODEL_ROOT. The mi350 and crusoe
-              # fleets keep their models on /data and /shared_nfs instead, so a
-              # dispatch onto those needs this pointed at their own local disk.
-              LMCACHE_LOCAL_DISK: "/mnt/lmcache-job"
-              LMCACHE_MAX_LOCAL_DISK_SIZE: "500"
+              # Relative to this job's runtime log directory, under rank-N.
+              # LMCACHE_LOCAL_DISK: "./lmcache-job"
+              # LMCACHE_MAX_LOCAL_DISK_SIZE: "500"
               OFFLOAD_PROFILE: "1"
               OFFLOAD_MIN_LOAD_TOKENS: "0"
               PREFILL_KV_TRANSFER_CONFIG: >-
@@ -462,7 +459,7 @@ models:
 
   Kimi-K3-MXFP4:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/Kimi-K3"
+    model_path: "${ATOMESH_MODEL_ROOT}/moonshotai/Kimi-K3"
     precision: MXFP4
     env:
       common:
@@ -471,13 +468,9 @@ models:
         AITER_SITUV2_A4W4: "1"
         AITER_QUICK_REDUCE_QUANTIZATION: INT4
         AITER_FLYDSL_STAGE2_FP8: "1"
-        # AgentX enables comm-group reuse from CONC 56 up (C56/C64/C72/C80).
+        # AgentX enables comm-group reuse only on C56/C64.
         AITER_REUSE_IDENTICAL_COMM_GROUPS: "0"
         ATOM_MLA_MAX_SPLIT_PER_BATCH: "256"
-        ATOM_GDN_SSM_DTYPE: "fp16"
-        # Already the ATOM default; pinned so a default flip cannot silently
-        # move the published numbers.
-        ATOM_USE_FLYDSL_GATHER_KV_B_PROJ: "1"
         ATOM_STATE_CHECKPOINT_DEMAND: "0"
         # AgentX band default: ReplaySSM off on CONC 1/2/4, on for the mid band
         # (CONC 8-16), off again from CONC 32. Cases that declare their own env
@@ -507,11 +500,11 @@ models:
             osl: 1024
             server:
               common_args: &kimi_k3_agentic_dspark7_args
-                gpu_memory_utilization: 0.90
+                gpu_memory_utilization: 0.88
                 max_num_seqs: 32
                 max_num_batched_tokens: 8192
                 method: dspark
-                draft_model: "${ATOMESH_MODEL_ROOT}/Kimi-K3-DSpark"
+                draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark"
                 num_speculative_tokens: 7
                 spec_decode_acceptance_length: 3.84
             prefill:
@@ -549,11 +542,11 @@ models:
           concurrency: [8]
           server:
             common_args: &kimi_k3_agentic_dspark3_args
-              gpu_memory_utilization: 0.90
+              gpu_memory_utilization: 0.88
               max_num_seqs: 32
-              max_num_batched_tokens: 8192
+              max_num_batched_tokens: 4096
               method: dspark
-              draft_model: "${ATOMESH_MODEL_ROOT}/Kimi-K3-DSpark"
+              draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark"
               num_speculative_tokens: 3
               spec_decode_acceptance_length: 3.00
           prefill:
@@ -595,13 +588,33 @@ models:
               <<: *kimi_k3_agentic_dspark3_args
               max_num_seqs: 24
 
+        # C14 runs the C16 server verbatim and only moves the client, so it also
+        # keeps C16's CUDA-graph width: deriving it from 2*CONC gives 28 and the
+        # server dies during graph warmup. cudagraph_max_num_seqs pins the window
+        # back to 32, which lands the same graph_max 128 as C16.
         - <<: *kimi_k3_agentic_dcp8_lmcache
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c14
           concurrency: [14]
+          server:
+            common_args: &kimi_k3_agentic_dspark3_8192_args
+              <<: *kimi_k3_agentic_dspark3_args
+              max_num_seqs: 32
+              max_num_batched_tokens: 8192
+              gpu_memory_utilization: 0.86
+          decode:
+            workers: 1
+            tp: 8
+            dcp: 8
+            cudagraph: auto
+            cudagraph_max_num_seqs: 32
+            cudagraph_mode: FULL
+            compilation_level: 3
 
         - <<: *kimi_k3_agentic_dcp8_lmcache
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c16
           concurrency: [16]
+          server:
+            common_args: *kimi_k3_agentic_dspark3_8192_args
 
         - &kimi_k3_agentic_no_dspark
           <<: *kimi_k3_agentic_dcp8_lmcache
@@ -610,7 +623,7 @@ models:
           concurrency: [32]
           server:
             common_args: &kimi_k3_agentic_no_dspark_args
-              gpu_memory_utilization: 0.90
+              gpu_memory_utilization: 0.86
               max_num_seqs: 64
               max_num_batched_tokens: 8192
           env:
@@ -630,23 +643,13 @@ models:
               max_num_seqs: 80
 
         - <<: *kimi_k3_agentic_no_dspark
-          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c48
-          concurrency: [48]
-          server:
-            common_args:
-              <<: *kimi_k3_agentic_no_dspark_args
-              max_num_seqs: 96
-
-        # From CONC 56 up the CPU tier grows to 192 GiB and AITER reuses
-        # identical comm groups; everything else still tracks 2 * CONC.
-        - <<: *kimi_k3_agentic_no_dspark
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c56
           concurrency: [56]
           server:
             common_args:
               <<: *kimi_k3_agentic_no_dspark_args
               max_num_seqs: 112
-          env: &kimi_k3_agentic_lmcache192_env
+          env:
             common:
               ATOM_ENABLE_REPLAYSSM: "0"
               AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
@@ -661,25 +664,13 @@ models:
             common_args:
               <<: *kimi_k3_agentic_no_dspark_args
               max_num_seqs: 128
-          env: *kimi_k3_agentic_lmcache192_env
-
-        - <<: *kimi_k3_agentic_no_dspark
-          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c72
-          concurrency: [72]
-          server:
-            common_args:
-              <<: *kimi_k3_agentic_no_dspark_args
-              max_num_seqs: 144
-          env: *kimi_k3_agentic_lmcache192_env
-
-        - <<: *kimi_k3_agentic_no_dspark
-          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c80
-          concurrency: [80]
-          server:
-            common_args:
-              <<: *kimi_k3_agentic_no_dspark_args
-              max_num_seqs: 160
-          env: *kimi_k3_agentic_lmcache192_env
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "0"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            prefill:
+              <<: *kimi_k3_agentic_lmcache128_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
 
     accuracy:
       task: gsm8k
@@ -693,7 +684,7 @@ models:
 
   Kimi-K2.5-MXFP4:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/Kimi-K2.5-MXFP4/"
+    model_path: "${ATOMESH_MODEL_ROOT}/amd/Kimi-K2.5-MXFP4/"
     precision: MXFP4
     env:
       common:
@@ -827,7 +818,7 @@ models:
 
   MiniMax-M3-MXFP4:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-MXFP4"
+    model_path: "${ATOMESH_MODEL_ROOT}/amd/MiniMax-M3-MXFP4"
     precision: MXFP4
     env:
       common:
@@ -972,7 +963,7 @@ models:
 
   MiniMax-M3-MXFP8:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-MXFP8"
+    model_path: "${ATOMESH_MODEL_ROOT}/MiniMaxAI/MiniMax-M3-MXFP8"
     precision: MXFP8
     env:
       common:
