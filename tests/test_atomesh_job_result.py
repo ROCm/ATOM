@@ -8,8 +8,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
-SCRIPT = Path(__file__).resolve().parents[1] / ".github/scripts/atomesh/pd_job_result.py"
+SCRIPT = (
+    Path(__file__).resolve().parents[1] / ".github/scripts/atomesh/pd_job_result.py"
+)
 SPEC = importlib.util.spec_from_file_location("pd_job_result", SCRIPT)
 RESULT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RESULT)
@@ -25,26 +26,36 @@ class JobResultTest(unittest.TestCase):
             (self.root / f"rank-rc-{rank}").write_text("0\n")
 
     def resolve(self, state="FAILED", exit_code="1:0", rc=1, spur=True):
-        return RESULT.resolve(self.root, "3619", "this-run", 2, state, exit_code, rc, spur)
+        return RESULT.resolve(
+            self.root, "3619", "this-run", 2, state, exit_code, rc, spur
+        )
 
     def test_completed_workload_overrides_generic_spur_failure(self):
         result = self.resolve()
         self.assertEqual(
-            result["result"], {"state": "COMPLETED", "return_code": 0, "source": "workload"}
+            result["result"],
+            {"state": "COMPLETED", "return_code": 0, "source": "workload"},
         )
         self.assertEqual(
-            result["scheduler"], {"state": "FAILED", "exit_code": "1:0", "return_code": 1}
+            result["scheduler"],
+            {"state": "FAILED", "exit_code": "1:0", "return_code": 1},
         )
         self.assertTrue(result["scheduler_workload_mismatch"])
 
     def test_explicit_scheduler_failures_and_active_states_are_preserved(self):
         for state, code, rc in [
-            ("CANCELLED", "1:0", 1), ("TIMEOUT", "1:0", 1),
-            ("OUT_OF_MEMORY", "1:0", 1), ("NODE_FAIL", "1:0", 1),
-            ("PREEMPTED", "1:0", 1), ("FAILED", "7:0", 7),
-            ("FAILED", "0:15", 143), ("FAILED", "0:0", 1),
-            ("COMPLETING", "0:0", 75), ("RUNNING", "0:0", 75),
-            ("unknown", "unknown", 75), ("COMPLETED", "0:0", 0),
+            ("CANCELLED", "1:0", 1),
+            ("TIMEOUT", "1:0", 1),
+            ("OUT_OF_MEMORY", "1:0", 1),
+            ("NODE_FAIL", "1:0", 1),
+            ("PREEMPTED", "1:0", 1),
+            ("FAILED", "7:0", 7),
+            ("FAILED", "0:15", 143),
+            ("FAILED", "0:0", 1),
+            ("COMPLETING", "0:0", 75),
+            ("RUNNING", "0:0", 75),
+            ("unknown", "unknown", 75),
+            ("COMPLETED", "0:0", 0),
         ]:
             with self.subTest(state=state, code=code):
                 result = self.resolve(state, code, rc)
@@ -59,8 +70,11 @@ class JobResultTest(unittest.TestCase):
         marker = self.root / "rank-workload-1.json"
         original = json.loads(marker.read_text())
         for change in [
-            {"status": "running"}, {"run_token": "previous-run"},
-            {"job_id": "3618"}, {"rank": 0}, {"num_ranks": 3},
+            {"status": "running"},
+            {"run_token": "previous-run"},
+            {"job_id": "3618"},
+            {"rank": 0},
+            {"num_ranks": 3},
             {"schema_version": 2},
         ]:
             with self.subTest(change=change):
@@ -86,10 +100,25 @@ class JobResultTest(unittest.TestCase):
 
     def test_cli_exits_with_effective_result_and_retains_raw_failure(self):
         args = [
-            sys.executable, str(SCRIPT), "resolve", "--run-dir", str(self.root),
-            "--job-id", "3619", "--run-token", "this-run", "--num-ranks", "2",
-            "--scheduler-state", "FAILED", "--scheduler-exit-code", "1:0",
-            "--scheduler-rc", "1", "--spur", "1",
+            sys.executable,
+            str(SCRIPT),
+            "resolve",
+            "--run-dir",
+            str(self.root),
+            "--job-id",
+            "3619",
+            "--run-token",
+            "this-run",
+            "--num-ranks",
+            "2",
+            "--scheduler-state",
+            "FAILED",
+            "--scheduler-exit-code",
+            "1:0",
+            "--scheduler-rc",
+            "1",
+            "--spur",
+            "1",
         ]
         process = subprocess.run(args, capture_output=True, text=True, check=False)
         self.assertEqual(process.returncode, 0, process.stderr)

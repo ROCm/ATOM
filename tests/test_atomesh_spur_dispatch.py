@@ -26,7 +26,9 @@ class SpurDispatchTest(unittest.TestCase):
         scripts.mkdir(parents=True)
         self.script = scripts / JOB_SCRIPT.name
         shutil.copyfile(JOB_SCRIPT, self.script)
-        shutil.copyfile(JOB_SCRIPT.with_name("pd_job_result.py"), scripts / "pd_job_result.py")
+        shutil.copyfile(
+            JOB_SCRIPT.with_name("pd_job_result.py"), scripts / "pd_job_result.py"
+        )
         (scripts / "setup_mesh.sh").write_text("echo /fake/atomesh\n")
         self.bin_dir = self.root / "bin"
         self.bin_dir.mkdir()
@@ -153,7 +155,9 @@ class SpurDispatchTest(unittest.TestCase):
             self.assertIn(f"MORI_SOCKET_IFNAME={interface}", runs[0])
             self.assertIn(["rm", "-f", f"atomesh-test-cell-42-{rank}"], calls)
             self.assertEqual((self.run_dir / f"rank-rc-{rank}").read_text(), "0\n")
-            result = json.loads((self.run_dir / f"rank-workload-{rank}.json").read_text())
+            result = json.loads(
+                (self.run_dir / f"rank-workload-{rank}.json").read_text()
+            )
             self.assertEqual(result["status"], "completed")
             self.assertEqual(result["run_token"], "test-submission")
 
@@ -244,13 +248,18 @@ class SpurDispatchTest(unittest.TestCase):
 
     def test_eval_failure_after_benchmark_does_not_publish_completion(self):
         self.run_job(
-            BENCHMARK_KIND="aiperf_agentic", RUN_EVAL="true", EVAL_TASK="gsm8k",
-            FAIL_PHASE="eval", expected_rc=8,
+            BENCHMARK_KIND="aiperf_agentic",
+            RUN_EVAL="true",
+            EVAL_TASK="gsm8k",
+            FAIL_PHASE="eval",
+            expected_rc=8,
         )
         for rank in range(2):
             runs = [call for call in self.docker_calls(rank) if call[0] == "run"]
             self.assertEqual(len(runs), 2)
-            result = json.loads((self.run_dir / f"rank-workload-{rank}.json").read_text())
+            result = json.loads(
+                (self.run_dir / f"rank-workload-{rank}.json").read_text()
+            )
             self.assertEqual(result["status"], "running")
             self.assertEqual((self.run_dir / f"rank-rc-{rank}").read_text(), "8\n")
 

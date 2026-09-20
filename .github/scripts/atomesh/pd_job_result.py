@@ -84,13 +84,30 @@ def main():
     if args.action == "publish":
         if args.rank is None or not 0 <= args.rank < args.num_ranks or not args.status:
             parser.error("publish requires a valid --rank and --status")
-        publish(args.run_dir, args.job_id, args.run_token, args.rank, args.num_ranks, args.status)
+        publish(
+            args.run_dir,
+            args.job_id,
+            args.run_token,
+            args.rank,
+            args.num_ranks,
+            args.status,
+        )
         return 0
-    if not args.scheduler_state or not args.scheduler_exit_code or args.scheduler_rc is None:
+    if (
+        not args.scheduler_state
+        or not args.scheduler_exit_code
+        or args.scheduler_rc is None
+    ):
         parser.error("resolve requires the scheduler state, exit code and return code")
     result = resolve(
-        args.run_dir, args.job_id, args.run_token, args.num_ranks,
-        args.scheduler_state, args.scheduler_exit_code, args.scheduler_rc, args.spur == "1",
+        args.run_dir,
+        args.job_id,
+        args.run_token,
+        args.num_ranks,
+        args.scheduler_state,
+        args.scheduler_exit_code,
+        args.scheduler_rc,
+        args.spur == "1",
     )
     write_json(args.run_dir / "job-result.json", result)
     if result["scheduler_workload_mismatch"]:
