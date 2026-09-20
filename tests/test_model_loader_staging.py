@@ -21,6 +21,7 @@ the tests keep their teeth.
 """
 
 import builtins
+import json
 import os
 import tempfile
 import threading
@@ -805,6 +806,39 @@ class RealSafetensorsIteratorTest(unittest.TestCase):
                     name for name, _ in safetensors_weights_iterator(root, disable_mmap)
                 }
                 self.assertEqual(len(names), 5)
+
+    def test_index_is_authoritative_for_overlay_replacements(self):
+        with tempfile.TemporaryDirectory() as root:
+            first = "model-00001-of-00002.safetensors"
+            second = "model-00002-of-00002.safetensors"
+            safetensors.torch.save_file(
+                {
+                    "model.keep": torch.tensor([1.0]),
+                    "model.replaced": torch.tensor([-1.0]),
+                },
+                os.path.join(root, first),
+            )
+            safetensors.torch.save_file(
+                {"model.replaced": torch.tensor([2.0])},
+                os.path.join(root, second),
+            )
+            with open(os.path.join(root, "model.safetensors.index.json"), "w") as f:
+                json.dump(
+                    {
+                        "metadata": {},
+                        "weight_map": {
+                            "model.keep": first,
+                            "model.replaced": second,
+                        },
+                    },
+                    f,
+                )
+
+            for disable_mmap in (True, False):
+                tensors = dict(safetensors_weights_iterator(root, disable_mmap))
+                self.assertEqual(set(tensors), {"model.keep", "model.replaced"})
+                self.assertEqual(tensors["model.keep"].item(), 1.0)
+                self.assertEqual(tensors["model.replaced"].item(), 2.0)
 
     def test_unreadable_header_falls_back_to_loading_the_shard(self):
         with tempfile.TemporaryDirectory() as root:
