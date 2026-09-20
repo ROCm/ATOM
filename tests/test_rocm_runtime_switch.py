@@ -1,9 +1,10 @@
 """CPU-only checks for paired runtime installation and rollback."""
+
 import importlib.util
 import json
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / "docker/rocm-runtime/switch_runtime.py"
 SPEC = importlib.util.spec_from_file_location("switch_runtime", SCRIPT)
@@ -43,14 +44,19 @@ class RuntimeSwitchTest(unittest.TestCase):
         for _ in range(2):
             self.select("patched")
             for name, soname in zip(runtime.FAMILIES, runtime.SONAMES):
-                aliases = [p for p in runtime.libraries(self.lib) if p.name.startswith(name)]
-                self.assertTrue(all(p.read_bytes() == ("patched " + name).encode()
-                                    for p in aliases))
+                aliases = [
+                    p for p in runtime.libraries(self.lib) if p.name.startswith(name)
+                ]
+                self.assertTrue(
+                    all(p.read_bytes() == ("patched " + name).encode() for p in aliases)
+                )
                 self.assertEqual(len({p.stat().st_ino for p in aliases}), 1)
                 self.assertTrue((self.lib / (soname + ".original")).exists())
             self.select("stock")
-            self.assertEqual({p.name: p.read_bytes() for p in runtime.libraries(self.lib)},
-                             self.original)
+            self.assertEqual(
+                {p.name: p.read_bytes() for p in runtime.libraries(self.lib)},
+                self.original,
+            )
         self.assertEqual((self.lib / "librccl.so").read_bytes(), b"leave RCCL alone")
         self.assertEqual((self.root / "active").read_text().strip(), "stock")
 
@@ -58,8 +64,9 @@ class RuntimeSwitchTest(unittest.TestCase):
         (self.patched / runtime.SONAMES[1]).unlink()
         with self.assertRaises(RuntimeError):
             self.select("patched")
-        self.assertEqual({p.name: p.read_bytes() for p in runtime.libraries(self.lib)},
-                         self.original)
+        self.assertEqual(
+            {p.name: p.read_bytes() for p in runtime.libraries(self.lib)}, self.original
+        )
         self.assertFalse((self.root / "stock").exists())
 
     def test_corrupt_backup_is_rejected_before_switch(self):
@@ -68,21 +75,27 @@ class RuntimeSwitchTest(unittest.TestCase):
         (self.root / "stock/lib" / runtime.SONAMES[0]).write_bytes(b"corrupt")
         with self.assertRaisesRegex(RuntimeError, "checksum mismatch"):
             self.select("stock")
-        self.assertEqual({p.name: p.read_bytes() for p in runtime.libraries(self.lib)}, before)
+        self.assertEqual(
+            {p.name: p.read_bytes() for p in runtime.libraries(self.lib)}, before
+        )
 
     def test_stock_rollback_does_not_require_intact_patched_pair(self):
         self.select("patched")
         (self.patched / runtime.SONAMES[1]).unlink()
         self.select("stock")
-        self.assertEqual({p.name: p.read_bytes() for p in runtime.libraries(self.lib)},
-                         self.original)
+        self.assertEqual(
+            {p.name: p.read_bytes() for p in runtime.libraries(self.lib)}, self.original
+        )
 
     def test_disabled_rebuild_restores_inherited_stock_backup(self):
         self.select("patched")
-        (self.root / "build-info.json").write_text('{"enabled": false, "restore_stock": true}')
+        (self.root / "build-info.json").write_text(
+            '{"enabled": false, "restore_stock": true}'
+        )
         self.select("patched")
-        self.assertEqual({p.name: p.read_bytes() for p in runtime.libraries(self.lib)},
-                         self.original)
+        self.assertEqual(
+            {p.name: p.read_bytes() for p in runtime.libraries(self.lib)}, self.original
+        )
         self.assertEqual((self.root / "active").read_text().strip(), "stock")
 
     def test_stock_without_backup_is_rejected(self):
@@ -90,10 +103,11 @@ class RuntimeSwitchTest(unittest.TestCase):
             self.select("stock")
 
     def test_disabled_build_preserves_original(self):
-        (self.root / "build-info.json").write_text(json.dumps(dict(enabled=False)))
+        (self.root / "build-info.json").write_text(json.dumps({"enabled": False}))
         self.select("patched")
-        self.assertEqual({p.name: p.read_bytes() for p in runtime.libraries(self.lib)},
-                         self.original)
+        self.assertEqual(
+            {p.name: p.read_bytes() for p in runtime.libraries(self.lib)}, self.original
+        )
         self.assertFalse((self.root / "stock").exists())
 
 

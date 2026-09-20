@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """Select the image's HIP/HSA pair. Stop GPU applications before switching."""
+
 import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import shutil
 import tempfile
+from pathlib import Path
 
 FAMILIES = ("libamdhip64.so", "libhsa-runtime64.so")
 SONAMES = ("libamdhip64.so.7", "libhsa-runtime64.so.1")
 
 
 def libraries(directory):
-    return sorted(p for p in directory.iterdir()
-                  if any(p.name == f or p.name.startswith(f + ".") for f in FAMILIES))
+    return sorted(
+        p
+        for p in directory.iterdir()
+        if any(p.name == f or p.name.startswith(f + ".") for f in FAMILIES)
+    )
 
 
 def copy_aliases(sources, destination):
@@ -44,7 +48,9 @@ def select_runtime(root, rocm, mode):
             mode = "stock"
     lib = (rocm / "lib").resolve()
     if mode == "status":
-        print(json.dumps(dict(build=info, active=(root / "active").read_text().strip())))
+        print(
+            json.dumps({"build": info, "active": (root / "active").read_text().strip()})
+        )
         return
     patched = root / "patched/lib"
     # Check both components before touching either library.
@@ -63,8 +69,10 @@ def select_runtime(root, rocm, mode):
             backup = Path(temporary) / "stock"
             (backup / "lib").mkdir(parents=True)
             copy_aliases(originals, backup / "lib")
-            hashes = {name: hashlib.sha256(p.read_bytes()).hexdigest()
-                      for name, p in originals.items()}
+            hashes = {
+                name: hashlib.sha256(p.read_bytes()).hexdigest()
+                for name, p in originals.items()
+            }
             (backup / "sha256.json").write_text(json.dumps(hashes, indent=2))
             backup.rename(stock)
     hashes = json.loads((stock / "sha256.json").read_text())
@@ -78,7 +86,9 @@ def select_runtime(root, rocm, mode):
         names = set(hashes) | {p.name for p in libraries(patched)}
         sources = {}
         for name in sorted(names):
-            family = next(i for i, prefix in enumerate(FAMILIES) if name.startswith(prefix))
+            family = next(
+                i for i, prefix in enumerate(FAMILIES) if name.startswith(prefix)
+            )
             sources[name] = patched / SONAMES[family]
     # Stage complete copies before replacing the live names. Hard links also cover
     # consumers using an absolute path to an old versioned filename (RTLD_NOLOAD).
