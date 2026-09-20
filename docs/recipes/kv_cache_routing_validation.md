@@ -1,14 +1,14 @@
 # Native cache routing validation
 
-The first milestone is delivered as four draft PRs:
+The native HBM+CPU routing milestone is delivered through three ATOM draft PRs:
 [layout](https://github.com/ROCm/ATOM/pull/2306),
-[LMCache residency](https://github.com/LMCache/LMCache/pull/5267),
 [catalog/render/planner](https://github.com/ROCm/ATOM/pull/2307), and
 [pair policy](https://github.com/ROCm/ATOM/pull/2308).
 The ATOM branches are managed with `gh stack` in the order
-layout → catalog/render/planner → pair policy. The LMCache fork branch
-is independently tracked by `gh stack`; cross-repository dependencies are linked
-in the PR descriptions.
+layout → catalog/render/planner → pair policy. CPU observation uses stock LMCache's
+public `get_keys()` API through connector-supplied callbacks. The separate
+[LMCache residency proposal](https://github.com/LMCache/LMCache/pull/5267) is an
+independent draft and is not required to build, test, or deploy these ATOM changes.
 
 ## Environment and checks
 
@@ -21,11 +21,33 @@ available at the start of the work:
 - Python 3.12, Torch `2.10.0+rocm7.2.4.git3d3aa833`, eight gfx950 GPUs,
   approximately 288 GiB per GPU.
 
-LMCache's two changed Python modules were overlaid on the image's installed
-package, retaining its native extension ABI. Cargo used an external build-cache
-volume. Formatting used the prebuilt Ruff, Black and Rust development images.
-The GLM run used an immutable checkout mounted read-only, so stack rebases could
-not change code during initialization or inference.
+The final CPU adapter was validated in a fresh container from this image with its
+unmodified LMCache `0.5.5rc3+rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1` package.
+Inspection confirmed that `LocalCPUBackend.residency_snapshot` is absent. No
+LMCache Python modules or extensions were overlaid for this compatibility run.
+
+| Final stock-LMCache validation | Result |
+|---|---|
+| Catalog, CPU observer, dense/offload connector and early-release regression | 395 passed |
+| Real GPU/native CPU/disk round trips, including HTTP catalog and eviction | 3 passed |
+| Built Rust router against HTTP catalogs and controlled P/D endpoints | 1 passed |
+| Changed Python files, Black and Ruff in prebuilt formatter images | Passed |
+
+These checks cover sampled membership, late token bindings, bounded publication,
+failed observations and stale removal, lost report acknowledgments and recovery,
+CPU sample age, native codec byte sizes and byte-identical GPU cache restoration.
+The reporter consumes callbacks without importing LMCache or its object types.
+The stock-LMCache GLM 2P2D performance matrix has not been rerun.
+
+## Earlier integration validation
+
+The broader suites and GLM smoke below predate the switch to sampled CPU
+observation. Those runs overlaid the two proposed LMCache Python modules while
+retaining the image's native extension ABI. They validate the broader routing
+implementation but are not stock-LMCache GLM acceptance. Cargo used an external
+build-cache volume. Formatting used the prebuilt Ruff, Black and Rust development
+images. The GLM run used an immutable checkout mounted read-only, so stack rebases
+could not change code during initialization or inference.
 
 | Validation | Result |
 |---|---|

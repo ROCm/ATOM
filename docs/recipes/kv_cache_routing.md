@@ -45,11 +45,20 @@ endpoints, recurrent-state models, sliding-window state, multimodal identities,
 LoRA and cache salt do not supply exact reuse in this version. Unsupported
 sources or failed observation use the existing load policy.
 
-Use a runtime containing the LMCache native `residency_snapshot` and
-`residency_events` APIs. HBM observation does not require CPU offload. CPU
-observation uses the existing non-MP `lmcache_offload` connector and requires
-all workers' CPU objects to be readable. It never calls lookup, pins objects or
-creates another KV data store.
+CPU observation works with stock LMCache through the existing non-MP
+`lmcache_offload` connector. No LMCache patch or residency extension is required.
+The connector supplies the public `LocalCPUBackend.get_keys()` method and native
+token-key mapping to an ATOM-owned reporter. The reporter depends on read-only
+callbacks and codec geometry; the Catalog and router consume ATOM's protocol.
+Another backend can supply the same key-snapshot contract without changing routing.
+
+The backend snapshots its CPU key set under its own lock. ATOM diffs successive
+samples and publishes changes only for known, full native chunks; byte sizes
+come from ATOM's codec. Binding tokens or submitting a store does not establish
+residency. Observation never calls lookup, pins objects, changes LRU order or
+retains KV allocations. CPU READY still requires every PP/TP worker. A backend
+without the public key-snapshot API disables CPU observation while HBM observation
+remains available.
 
 Each execution needs a unique ID and Catalog listen address. The same JSON must
 reach its scheduler and every PP/TP worker. Use immutable weight, tokenizer and
@@ -71,7 +80,8 @@ export ATOM_CACHE_ROUTING_CONFIG='{
   "canonical_block_size": 16,
   "max_entries": 200000,
   "max_log_bytes": 16777216,
-  "stale_seconds": 3.0
+  "stale_seconds": 3.0,
+  "cpu_poll_interval_seconds": 0.5
 }'
 export LMCACHE_LOCAL_CPU=True
 export LMCACHE_MAX_LOCAL_CPU_SIZE=2
@@ -110,6 +120,21 @@ source revokes the affected CPU benefit independently of HBM residency.
 This first delivery uses HTTP polling with versioned replay and snapshot
 recovery. It does not add the design's optional ZMQ transport or llm-d exporter.
 Existing ATOM KV event publication continues to work independently.
+
+CPU membership is sampled, not a replay of every backend mutation. Each worker
+waits `cpu_poll_interval_seconds` (default 0.5 seconds) between scans; the interval
+must be positive and below `stale_seconds`. Each scan copies the backend's entire
+CPU key set, so its time and temporary memory scale with resident object count.
+Scanning happens off the request path but holds the backend lock while copying
+keys. Tune the interval using the deployed cache size; no 1% overhead target is
+claimed. Only changed known chunks cross the network after initialization.
+
+An eviction can remain visible until the next sample reaches the Catalog.
+CPU reports include sampling age so slow scans or multipart publication cannot
+renew already-old observations. Failed scans send no heartbeat, and expired
+worker observations lose CPU credit. Native lookup/retrieve rechecks availability
+at execution time; routing observations do not reserve cache objects or guarantee
+that a selected hit survives dispatch. A reporter restart starts a new epoch.
 
 A source has a boot epoch and monotonically increasing decimal-string cursor.
 Snapshot pages share one immutable cut and must be followed by replay from
