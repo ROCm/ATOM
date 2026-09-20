@@ -426,11 +426,24 @@ class MinimaxM3SparsePrefillMetadata:
     max_seq_len: int
 
 
+# What MiniMax-M3 sparse attention names its key-only index cache layer, from
+# `MiniMaxM3SparseAttentionForVllm.__init__`. Both of the model's kv cache
+# groups run the builder below; this suffix is how the index group's instance
+# recognises itself.
+MINIMAX_M3_INDEX_CACHE_SUFFIX = ".index_cache"
+
+
 @dataclass
 class MinimaxM3SparseDecodeMetadata:
     seq_lens: torch.Tensor
     block_table: torch.Tensor
     max_query_len: int = 1
+    # The index-score kernel's packed dispatch order, built once per step by the
+    # builder. None means the scorer builds its own -- correct, but ~120 us of
+    # launch floor per sparse layer, which is what hoisting it here buys back.
+    # The bound below then stays 0 and the score tensor keeps its natural width.
+    index_score_work_map: torch.Tensor | None = None
+    index_score_max_block: int = 0
 
 
 @dataclass
@@ -458,6 +471,11 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
     # variable query lengths and CPU-side max reduction are allowed.
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     reorder_batch_threshold = 1
+    # Replaced on the instance by _init_index_score_work_map, which only the
+    # index cache group's builder runs.
+    _index_score_work_map = None
+    _index_score_max_block = 0
+    _num_idx_heads = 0
 
     def __init__(
         self,
@@ -489,6 +507,85 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
             max_num_batched_tokens + 1, dtype=torch.int32, device=device
         )
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        if any(
+            name.endswith(MINIMAX_M3_INDEX_CACHE_SUFFIX) for name in layer_names or ()
+        ):
+            self._init_index_score_work_map(device)
+
+    def _init_index_score_work_map(self, device):
+        """Size the persistent buffer the flydsl index scorer dispatches from.
+
+        Only the index cache group allocates one. Both kv cache groups run this
+        builder and the map depends on nothing but the lengths, so the two would
+        be identical; `_decode_topk` reads the index group's, which is the
+        metadata it already takes the lengths from.
+
+        Persistent because the map is refilled every step outside the graph
+        while the captured scorer reads the pointer baked in at capture. For the
+        same reason the bound is the model length and never the batch's longest
+        request: the map's row count IS that kernel's grid, so a bound that
+        moves between capture and replay is a grid that moves.
+        """
+        from atom.model_ops.minimax_m3.index_topk import (
+            SPARSE_BLOCK_SIZE,
+            index_score_work_map_size,
+        )
+
+        self._num_idx_heads = self.model_config.get_num_kv_heads(
+            self.vllm_config.parallel_config
+        )
+        self._index_score_max_block = -(
+            -self.model_config.max_model_len // SPARSE_BLOCK_SIZE
+        )
+        max_bs = self.scheduler_config.max_num_seqs
+        # The query length picks the kernel config, which sets how many blocks a
+        # chunk covers, so in principle it moves the row count. Today every
+        # decode length resolves the same chunk and this max is a no-op; it is
+        # here so a future config table cannot silently outgrow the buffer.
+        rows = max(
+            index_score_work_map_size(
+                max_bs, self._index_score_max_block, max_query_len, self._num_idx_heads
+            )
+            for max_query_len in range(1, max(1, int(self.reorder_batch_threshold)) + 1)
+        )
+        self._index_score_work_map = (
+            torch.empty((rows, 2), dtype=torch.int32, device=device) if rows else None
+        )
+
+    def _decode_metadata(self, seq_lens, block_table, max_query_len):
+        """Decode metadata, including this step's index-score work map.
+
+        The map is built here rather than in the sparse layer's forward because
+        every sparse layer shares it: it is ~15 tiny device ops costing ~120us
+        of launch floor whatever the shape, against a score kernel of 17-250us,
+        so a per-layer rebuild would turn the substitution into a net loss.
+        """
+        work_map = None
+        if self._index_score_work_map is not None:
+            from atom.model_ops.minimax_m3.index_topk import (
+                build_index_score_work_map,
+            )
+
+            work_map = build_index_score_work_map(
+                seq_lens,
+                max_block=self._index_score_max_block,
+                max_query_len=max_query_len,
+                num_idx_heads=self._num_idx_heads,
+                out=self._index_score_work_map,
+            )
+        return MinimaxM3SparseDecodeMetadata(
+            seq_lens=seq_lens,
+            block_table=block_table,
+            max_query_len=max_query_len,
+            index_score_work_map=work_map,
+            # Left at 0 when there is no map -- the two travel together, and a
+            # bound without the map it was built against is the one mismatch
+            # `decode_index_score` cannot detect, because it would size a map
+            # built on the spot rather than contradict one already in hand.
+            index_score_max_block=(
+                self._index_score_max_block if work_map is not None else 0
+            ),
+        )
 
     def build(
         self,
@@ -564,10 +661,10 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
 
         decode_metadata: MinimaxM3SparseDecodeMetadata | None = None
         if num_decodes > 0:
-            decode_metadata = MinimaxM3SparseDecodeMetadata(
-                seq_lens=seq_lens[:num_decodes],
-                block_table=block_table[:num_decodes],
-                max_query_len=self.reorder_batch_threshold,
+            decode_metadata = self._decode_metadata(
+                seq_lens[:num_decodes],
+                block_table[:num_decodes],
+                self.reorder_batch_threshold,
             )
 
         return MinimaxM3SparseMetadata(
@@ -594,10 +691,8 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
         seq_lens = common_attn_metadata.seq_lens
         block_table = common_attn_metadata.block_table_tensor
 
-        decode_metadata = MinimaxM3SparseDecodeMetadata(
-            seq_lens=seq_lens[:num_reqs],
-            block_table=block_table[:num_reqs],
-            max_query_len=max_query_len,
+        decode_metadata = self._decode_metadata(
+            seq_lens[:num_reqs], block_table[:num_reqs], max_query_len
         )
         return MinimaxM3SparseMetadata(
             seq_lens=seq_lens,

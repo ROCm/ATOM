@@ -564,6 +564,13 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
                 num_idx_heads=self.num_idx_heads,
                 decode_max_q=max_query_len,
             ),
+            # Built once per step by the index group's metadata builder, never
+            # here: `make_work_map` is ~120us of launch floor, so every sparse
+            # layer would pay it. `getattr` because metadata from some other
+            # builder has no such field; None then means the scorer builds its
+            # own, which is correct but pays that floor once per sparse layer.
+            index_score_work_map=getattr(index_decode_md, "index_score_work_map", None),
+            index_score_max_block=getattr(index_decode_md, "index_score_max_block", 0),
         )
         self._store_cached_topk(key, topk_idx)
         return topk_idx

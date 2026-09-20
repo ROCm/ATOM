@@ -294,6 +294,48 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 num_head_k * self.max_bs * max_qlen,
                 **i32_kwargs,
             )
+            from atom.distributed.indexer_cp import (
+                get_indexer_cp_rank,
+                get_indexer_cp_world_size,
+                indexer_cp_enabled,
+            )
+
+            # The flydsl index-score kernel's dispatch map, same persistence
+            # argument. Its row count is that kernel's grid, so the bound has to
+            # be one that does not move between capture and replay -- the model
+            # length, never the batch's longest request.
+            from atom.model_ops.minimax_m3.index_topk import (
+                SPARSE_BLOCK_SIZE as _M3_SPARSE_BLOCK_SIZE,
+            )
+            from atom.model_ops.minimax_m3.index_topk import index_score_work_map_size
+
+            # Indexer CP shards the context round-robin, so a rank scores
+            # ceil(blocks / world) of it and every bound below is that local one.
+            # Resolved here rather than per step for the same reason the sparse
+            # layer resolves it in __init__: no per-forward branch in the model.
+            self._index_score_cp_world = 1
+            self._index_score_cp_rank = 0
+            if indexer_cp_enabled():
+                self._index_score_cp_world = get_indexer_cp_world_size()
+                self._index_score_cp_rank = get_indexer_cp_rank()
+            self._index_score_max_block = triton.cdiv(
+                triton.cdiv(config.max_model_len, _M3_SPARSE_BLOCK_SIZE),
+                self._index_score_cp_world,
+            )
+            rows = index_score_work_map_size(
+                self.max_bs,
+                self._index_score_max_block,
+                max_qlen,
+                num_head_k,
+                self._index_score_cp_world,
+                self._index_score_cp_rank,
+            )
+            self.model_runner.forward_vars["sparse_attention_index_score_work_map"] = (
+                torch.empty((rows, 2), **i32_kwargs) if rows else None
+            )
+        else:
+            self._index_score_max_block = 0
+            self._index_score_cp_world, self._index_score_cp_rank = 1, 0
         self._pa_decode_bf16_asm_enabled = (
             use_pa_decode_bf16_asm() and model_runner.block_size == 256
         )
@@ -401,6 +443,19 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 # would have the second overwrite the first.
                 var[f"{p}sparse_attention_n_valid_column_per_row"] = torch.empty(
                     self._num_idx_heads * ub_max_bs * max_seqlen_qo, **i32_kwargs
+                )
+                from atom.model_ops.minimax_m3.index_topk import (
+                    index_score_work_map_size,
+                )
+
+                rows = index_score_work_map_size(
+                    ub_max_bs,
+                    self._index_score_max_block,
+                    max_seqlen_qo,
+                    self._num_idx_heads,
+                )
+                var[f"{p}sparse_attention_index_score_work_map"] = (
+                    torch.empty((rows, 2), **i32_kwargs) if rows else None
                 )
 
             # PA work buffers per ubatch (GPU only)
@@ -727,6 +782,18 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             f"{prefix}sparse_attention_n_valid_column_per_row"
         ]
 
+    def _index_score_work_map_buffer(self, prefix: str = "") -> torch.Tensor | None:
+        """The decode work-map buffer, on the same terms as its sibling above.
+
+        None when this model never allocated one -- a non-sparse model, or a
+        prefix whose buffers were not registered. The metadata builder reads
+        the same absence and leaves the map empty, which costs correctness
+        nothing: the scorer then builds its own, at ~120 us per sparse layer.
+        """
+        return self.model_runner.forward_vars.get(
+            f"{prefix}sparse_attention_index_score_work_map"
+        )
+
     def _get_sparse_attention_block_tables(
         self,
         block_tables: torch.Tensor,
@@ -866,6 +933,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=1,
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
+                index_score_work_map_out=self._index_score_work_map_buffer(),
+                index_score_max_block=self._index_score_max_block,
+                index_score_cp_world=self._index_score_cp_world,
+                index_score_cp_rank=self._index_score_cp_rank,
             )
         return workinfos
 
@@ -1176,6 +1247,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=int(max_seqlen_q),
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
+                index_score_work_map_out=self._index_score_work_map_buffer(),
+                index_score_max_block=self._index_score_max_block,
+                index_score_cp_world=self._index_score_cp_world,
+                index_score_cp_rank=self._index_score_cp_rank,
             )
         mrope_positions = self._build_mrope_decode_positions(
             batch, context_lens, max_seqlen_q
@@ -1369,6 +1444,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_seq_len=attn.max_seqlen_k,
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(p),
+                index_score_work_map_out=self._index_score_work_map_buffer(p),
+                index_score_max_block=self._index_score_max_block,
+                index_score_cp_world=self._index_score_cp_world,
+                index_score_cp_rank=self._index_score_cp_rank,
             )
         return attn
 
@@ -1415,6 +1494,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=max_q_len,
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
+                index_score_work_map_out=self._index_score_work_map_buffer(),
+                index_score_max_block=self._index_score_max_block,
+                index_score_cp_world=self._index_score_cp_world,
+                index_score_cp_rank=self._index_score_cp_rank,
             )
 
         positions = var["positions"].copy_to_gpu(scheduled_tokens)
