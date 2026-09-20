@@ -49,8 +49,7 @@ class LMCacheDiskTest(unittest.TestCase):
         other_cache = logs / "rank-1/lmcache-job"
         other_cache.mkdir(parents=True)
         (other_cache / "kv").write_text("keep")
-        self.run_shell(
-            """
+        self.run_shell("""
 reset_lmcache_disk
 test "$LMCACHE_LOCAL_DISK" = "$RUNTIME_LOG_DIR/rank-0/lmcache-job"
 bash -c 'test -d "$LMCACHE_LOCAL_DISK"'
@@ -61,8 +60,7 @@ reset_lmcache_disk
 test -f "$LMCACHE_LOCAL_DISK/kv"
 purge_lmcache_disk
 test ! -e "$LMCACHE_LOCAL_DISK"
-"""
-        )
+""")
         self.assertEqual((logs / "prefill.log").read_text(), "keep")
         self.assertEqual((other_cache / "kv").read_text(), "keep")
         self.assertFalse((self.root / "lmcache-job").exists())
