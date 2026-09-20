@@ -48,16 +48,6 @@ on:
         options:
           - '1'
           - '2'
-      mooncake_gid_index:
-        description: 'Mooncake RDMA GID index for smoke and model tests (0 selects IPv6 link-local on TW; verify cross-node reachability)'
-        required: false
-        default: '0'
-        type: string
-      rccl_gid_index:
-        description: 'RCCL RDMA GID index for model tests (0 selects IPv6 link-local on TW)'
-        required: false
-        default: '0'
-        type: string
       run_all_models:
         description: 'Run all models from models_atomesh.yaml'
         required: false
@@ -206,8 +196,8 @@ on:
 
 env:
   ATOMESH_NODE_POOL: pit2-p03-g01,pit2-p03-g03,pit2-p03-g07,pit2-p03-g08,pit2-p03-g09,pit2-p03-g10,pit2-p03-g12,pit2-p03-g13,pit2-p03-g15,pit2-p03-g17,pit2-p03-g19,pit2-p03-g20,pit2-p03-g23,pit2-p03-g24,pit2-p03-g25,pit2-p03-g27,pit2-p03-g42
-  MC_GID_INDEX: ${{ inputs.mooncake_gid_index || '0' }}
-  NCCL_IB_GID_INDEX: ${{ inputs.rccl_gid_index || '0' }}
+  # GID 1 selects IPv4 on TW; GID 0 is IPv6 link-local.
+  NCCL_IB_GID_INDEX: '1'
   ATOMESH_SINGLE_NODE: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_single_node || 'auto' }}
   ATOMESH_SLURM_ACCOUNT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_account != 'auto' && inputs.atomesh_slurm_account || '' }}
   ATOMESH_SLURM_PARTITION: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_partition != 'auto' && inputs.atomesh_slurm_partition || (((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-crusoe-mi355' || (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi355-crusoe') && 'amd-spur' || '') }}
@@ -474,6 +464,7 @@ jobs:
     runs-on: ${{ inputs.atomesh_slurm_submit_runner }}
     timeout-minutes: 75
     env:
+      MC_GID_INDEX: '1'
       RDMA_SMOKE_IMAGE: ${{ needs.load-config.outputs.image }}
       RDMA_SMOKE_NODES: ${{ inputs.rdma_smoke_nodes }}
       RDMA_SMOKE_NODE_COUNT: ${{ inputs.rdma_smoke_node_count }}
@@ -647,7 +638,7 @@ jobs:
             --group-add=video
             --cap-add=IPC_LOCK
             --ulimit memlock=-1:-1
-            -e MC_GID_INDEX="${MC_GID_INDEX:-0}"
+            -e MC_GID_INDEX="${MC_GID_INDEX:-1}"
             -e MC_ENABLE_DEST_DEVICE_AFFINITY=1
             -e SMOKE_RANK="${rank}"
             -e SMOKE_NODE_COUNT="${RDMA_SMOKE_NODE_COUNT}"

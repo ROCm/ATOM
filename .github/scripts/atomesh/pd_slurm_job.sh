@@ -5,17 +5,13 @@
 
 set -euo pipefail
 
-# GID 0 is IPv6 link-local on TW. Keep Mooncake and RCCL independently
-# configurable because GID tables and cross-node reachability vary by fabric.
-export MC_GID_INDEX="${MC_GID_INDEX:-0}"
-export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-0}"
-for gid_var in MC_GID_INDEX NCCL_IB_GID_INDEX; do
-  if [[ ! "${!gid_var}" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: ${gid_var} must be a non-negative integer" >&2
-    exit 2
-  fi
-done
-echo "RDMA GID indices: Mooncake=${MC_GID_INDEX}, RCCL=${NCCL_IB_GID_INDEX}"
+# Default RCCL to IPv4 (GID 1 on TW). Allow overrides for other fabrics.
+export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-1}"
+if [[ ! "${NCCL_IB_GID_INDEX}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: NCCL_IB_GID_INDEX must be a non-negative integer" >&2
+  exit 2
+fi
+echo "RCCL RDMA GID index: ${NCCL_IB_GID_INDEX}"
 
 REPO_ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
 SCRIPT_PATH="${REPO_ROOT}/.github/scripts/atomesh/pd_server_atom.sh"
@@ -117,7 +113,6 @@ allow = (
     "RUN_EVAL",
     "EVAL_",
     "SWEBENCH_",
-    "MC_GID_INDEX",
     "NCCL_IB_GID_INDEX",
 )
 for key, value in sorted(os.environ.items()):
