@@ -287,6 +287,51 @@ RUN if [ "${ATOM_BASE_IMAGE}" != "rocm10-base" ] && [ -n "${TRITON_PIN_VERSION}"
         python -c "import importlib.metadata as m; print('triton pinned ->', m.version('triton'))"; \
     fi
 
+# ROCm 7.2.4 runtime backport used by vllm-project/vllm#55099.
+# Drop this stage once the official base image includes ordering-edge signals.
+FROM base AS build_rocm_runtime
+ARG ROCM_SYSTEMS_REPO="https://github.com/ROCm/rocm-systems.git"
+ARG ROCM_RUNTIME_COMMIT="b539bf7eebfd99ad0a69668caa1f4037034d501f"
+
+RUN mkdir -p /staging/lib && \
+    if ! grep -Eq '^7\.2\.4([+-]|$)' /opt/rocm/.info/version; then \
+        echo "Keeping the stock runtime for this non-7.2.4 base image"; exit 0; \
+    fi && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        git cmake ninja-build g++ pkg-config \
+        libelf-dev libdrm-dev libnuma-dev libdw-dev xxd && \
+    pip install --no-cache-dir CppHeaderParser==2.7.4 ply==3.11 && \
+    git init -q /src && cd /src && \
+    git remote add origin "${ROCM_SYSTEMS_REPO}" && \
+    git config remote.origin.promisor true && \
+    git config remote.origin.partialclonefilter blob:none && \
+    git sparse-checkout init --cone && \
+    git sparse-checkout set projects/rocr-runtime projects/clr projects/hip shared cmake && \
+    git fetch --filter=blob:none --depth 1 origin "${ROCM_RUNTIME_COMMIT}" && \
+    git checkout -q FETCH_HEAD && \
+    mkdir -p /opt/rocm-cmake-shim && \
+    printf 'if(NOT TARGET clang)\n  add_executable(clang IMPORTED GLOBAL)\n  set_target_properties(clang PROPERTIES IMPORTED_LOCATION "/opt/rocm/llvm/bin/clang")\nendif()\nset(Clang_PACKAGE_VERSION "rocm-image-shim")\n' > /opt/rocm-cmake-shim/ClangConfig.cmake && \
+    printf 'if(NOT TARGET llvm-objcopy)\n  add_executable(llvm-objcopy IMPORTED GLOBAL)\n  set_target_properties(llvm-objcopy PROPERTIES IMPORTED_LOCATION "/opt/rocm/llvm/bin/llvm-objcopy")\nendif()\nset(LLVM_FOUND TRUE)\nset(LLVM_PACKAGE_VERSION "rocm-image-shim")\n' > /opt/rocm-cmake-shim/LLVMConfig.cmake && \
+    cmake -S /src/projects/rocr-runtime -B /src/build-rocr -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/rocm \
+        -DCMAKE_INSTALL_PREFIX=/opt/rocm \
+        -DClang_DIR=/opt/rocm-cmake-shim -DLLVM_DIR=/opt/rocm-cmake-shim && \
+    cmake --build /src/build-rocr --parallel 16 && \
+    cmake --install /src/build-rocr && \
+    cmake --install /src/build-rocr --prefix /rocr-install --strip && \
+    cmake -S /src/projects/clr -B /src/build-clr -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DCLR_BUILD_HIP=ON -DCLR_BUILD_OCL=OFF \
+        -DHIP_COMMON_DIR=/src/projects/hip -DROCM_PATH=/opt/rocm \
+        -DCMAKE_PREFIX_PATH=/opt/rocm -DCMAKE_INSTALL_PREFIX=/opt/rocm \
+        -DLLVM_DIR=/opt/rocm-cmake-shim -DHIP_LLVM_ROOT=/opt/rocm/llvm && \
+    cmake --build /src/build-clr --parallel 16 && \
+    cmake --install /src/build-clr --prefix /clr-install --strip && \
+    cp -P /rocr-install/lib/libhsa-runtime64.so* /staging/lib/ && \
+    cp -P /clr-install/lib/libamdhip64.so* /staging/lib/ && \
+    mkdir -p /staging/.info && \
+    git rev-parse HEAD > /staging/.info/atom-rocm-runtime-commit
+
 # --------------------------------------------------------------------
 # Stage 1: RCCL — parallel
 # --------------------------------------------------------------------
@@ -775,5 +820,23 @@ RUN if [ "${ATOM_BASE_IMAGE}" != "rocm10-base" ] && [ -n "${TRITON_PIN_VERSION}"
         fi; \
         "${VENV_PYTHON}" -c "import importlib.metadata as m; v=m.version('triton'); assert v == '${TRITON_PIN_VERSION}', 'Triton dist is '+v+', expected ${TRITON_PIN_VERSION}'; print('[atom_image] final triton', v)"; \
     fi
+
+# Install the paired runtime after dependency installation. Preserve old image
+# tags for rollback; changing ROCM_RUNTIME_COMMIT selects a different backport.
+COPY --from=build_rocm_runtime /staging/ /opt/rocm/
+# Cover absolute paths to the old versioned filenames as well as SONAME lookups,
+# following vLLM's replacement method. ldconfig cannot redirect a hard link.
+RUN set -eux; \
+    if ! grep -Eq '^7\.2\.4([+-]|$)' /opt/rocm/.info/version; then exit 0; fi; \
+    cd /opt/rocm/lib; \
+    ours_hsa="$(readlink -f libhsa-runtime64.so.1)"; \
+    ours_hip="$(readlink -f libamdhip64.so.7)"; \
+    touch "$ours_hsa" "$ours_hip"; \
+    for f in libhsa-runtime64.so.1.* libamdhip64.so.7.*; do \
+        [ -f "$f" ] && [ ! -L "$f" ] || continue; \
+        case "$f" in libhsa*) ours="$ours_hsa";; *) ours="$ours_hip";; esac; \
+        [ "$f" -ef "$ours" ] || ln -f "$ours" "$f"; \
+    done; \
+    ldconfig
 
 CMD ["/bin/bash"]
