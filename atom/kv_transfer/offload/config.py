@@ -23,10 +23,9 @@ from typing import Any
 
 import torch
 
-# Version 3 adds the effective index-cache dtype to the PAGE identity. FP4 and
-# FP8 DSV4 indexers have different region counts and byte layouts, so they must
-# never reuse one another's objects even when the HF model config is identical.
-PAGE_LAYOUT_VERSION = 3
+# Version 4 isolates PP partitions, TP replicas and DCP token placement. Old
+# native objects cannot be migrated by changing their keys: their bytes differ.
+PAGE_LAYOUT_VERSION = 4
 _PAGE_FINGERPRINT_BYTES = 16
 _OFFLOAD_LAYOUT_ALIASES = {
     "hybrid": "hybrid",
@@ -318,7 +317,8 @@ def build_page_namespace(
             cfg.chunk_size,
             minimum=1,
         ),
-        "tp_size": _strict_integer("PAGE TP size", world_size, minimum=1),
+        "replica_world_size": _strict_integer("PAGE world size", world_size, minimum=1),
+        "parallel_layout": page_parallel_layout(config),
         "dcp_size": _strict_integer(
             "PAGE DCP size",
             (
@@ -342,9 +342,57 @@ def build_page_namespace(
     digest = hashlib.blake2b(
         canonical,
         digest_size=_PAGE_FINGERPRINT_BYTES,
-        person=b"ATOM-PAGE-CFG-v3",
+        person=b"ATOM-PAGE-CFG-v4",
     ).hexdigest()
     return f"{base_model_name}::atom-page-v{layout_version}-{digest}"
+
+
+def page_parallel_layout(config) -> dict[str, Any]:
+    """Describe native rank pieces using the same partitioner as the model.
+
+    The complete PP partition is included on every worker, so scheduler and
+    workers derive the same namespace. A TP replica is distinct from a DCP
+    shard, and the LMCache worker id continues to identify PP x TP pieces.
+    Host placement deliberately does not affect byte compatibility.
+    """
+    from atom.models.utils import get_pp_indices
+
+    def dimension(name: str) -> int:
+        for owner in (config, getattr(config, "parallel_config", None)):
+            value = getattr(owner, name, None)
+            if value is not None:
+                return _strict_integer(name, value, minimum=1)
+        return 1
+
+    pp = dimension("pipeline_parallel_size")
+    tp = dimension("tensor_parallel_size")
+    dcp = dimension("decode_context_parallel_size")
+    if tp % dcp:
+        raise ValueError("PAGE DCP size must divide TP size")
+    layers = _strict_integer(
+        "PAGE layer count", config.hf_config.num_hidden_layers, minimum=1
+    )
+    partition = [list(get_pp_indices(layers, rank, pp)) for rank in range(pp)]
+    if any(start >= end for start, end in partition):
+        raise ValueError("PAGE PP stages must each own at least one layer")
+    interleave = _strict_integer(
+        "PAGE DCP interleave",
+        getattr(getattr(config, "dcp_config", None), "interleave_size", 1),
+        minimum=1,
+    )
+    block_size = _strict_integer(
+        "PAGE block size", config.kv_cache_block_size, minimum=1
+    )
+    if interleave > block_size or block_size % interleave:
+        raise ValueError("PAGE DCP interleave must divide the physical block size")
+    return {
+        "pp_size": pp,
+        "tp_size": tp,
+        "dcp_size": dcp,
+        "dcp_interleave_size": interleave,
+        "pp_layer_ranges": partition,
+        "tp_token_shards": [rank % dcp for rank in range(tp)],
+    }
 
 
 def build_lmcache_config(

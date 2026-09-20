@@ -498,7 +498,8 @@ pub fn build_app(
         .get(app_state.clone())
         .route("/v1/models", get(v1_models))
         .route("/get_model_info", get(get_model_info))
-        .route("/get_server_info", get(get_server_info));
+        .route("/get_server_info", get(get_server_info))
+        .route("/server_info", get(get_server_info));
 
     // Build admin routes with control plane auth if configured, otherwise use simple API key auth
     let admin_routes = Router::new()
