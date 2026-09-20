@@ -44,7 +44,7 @@ name: ATOM Perf Check (PR)
 # and caveats live next to the append point in perf_check_half.sh.
 #
 # Concurrency levels split into two roles. Levels at or above 64 decide the
-# verdict; 4 and 32 are measured and displayed but never judged, because low
+# verdict; c=4 is measured and displayed but never judged, because low
 # concurrency pollutes a verdict in both directions -- it manufactures false
 # positives and dilutes real ones -- while hiding it altogether removes the
 # evidence a reader needs to tell a small-batch path problem from noise.
