@@ -9,6 +9,7 @@ from atom.model_ops.attentions.deepseek_v41.packed_rows import (
     pack_rows,
     write_packed_window,
 )
+from atom.model_ops.deepseek_v41.dspark import gather_window_rows
 from atom.model_ops.attentions.pool_layout.entry_arena import EntryMajorArena
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     MQA_LOGITS_PRESHUFFLE_ROWS,
@@ -551,7 +552,9 @@ class PagedAttentionCache:
             return torch.stack(
                 [self.read_window(int(layer), slots) for layer in layers]
             )
-        return self.state.view("window")[layers[:, None], slots.long()[None, :]]
+        # No `.long()`: the slot table is int32 and the kernel widens each
+        # index itself, so casting the whole tensor first was a copy of it.
+        return gather_window_rows(self.state.view("window"), layers, slots)
 
     def write_window(self, layer, kv, step):
         if step.width:

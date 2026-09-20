@@ -63,6 +63,86 @@ def draft_attention(query, context_kv, draft_kv, sink, step, scale):
     return sparse_attn(query, keys, sink, step.indices, scale)
 
 
+# ---------------------------------------------------------------------------
+# The stages' rolling windows, gathered in one coalesced pass.
+#
+# The stages read the same rows of the same tensor at different layers, so the
+# read is `window[layers[:, None], slots[None, :]]` -- one broadcast index. Torch
+# serves that through its generic advanced-indexing path, which walks the index
+# arithmetic per element as an opaque 2-byte type: measured on MI355X at a decode
+# batch it spends 13.2us moving 6.3MB, against the ~1.6us the bytes themselves
+# cost at HBM speed.
+#
+# Nothing about the read needs that generality. A row is `head_dim` wide and
+# contiguous at both ends, so one program per output row makes it a single
+# coalesced load and store.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _gather_window_kernel(
+    window_ptr,  # [L_all, S, R, D]
+    layers_ptr,  # [L]
+    slots_ptr,  # [B]
+    out_ptr,  # [L, B, R, D]
+    stride_layer,
+    stride_slot,
+    batch,
+    span,  # ring * D, the contiguous run one (layer, slot) owns
+    BLOCK: tl.constexpr,
+):
+    pair = tl.program_id(0)  # flat (stage, request)
+    stage = pair // batch
+    request = pair % batch
+    layer = tl.load(layers_ptr + stage).to(tl.int64)
+    slot = tl.load(slots_ptr + request).to(tl.int64)
+
+    # A request's whole window is one contiguous run in both tensors -- the
+    # ring is the last axis but one and `D` the last -- so the copy is a run
+    # of `ring * D`, not `ring` separate rows. Moving it a row at a time left
+    # each program with 1KB and the gather at a quarter of a plain copy's
+    # speed.
+    src = window_ptr + layer * stride_layer + slot * stride_slot
+    dst = out_ptr + pair.to(tl.int64) * span
+    for start in tl.range(0, span, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        mask = offs < span
+        tl.store(dst + offs, tl.load(src + offs, mask=mask), mask=mask)
+
+
+def gather_window_rows(window, layers, slots):
+    """`window[layers[:, None], slots[None, :]]`, as a run copy per request.
+
+    Args:
+        window: ``[L_all, S, ring, D]`` the pool's window view.
+        layers: ``[L]`` int64 layer ids, on device.
+        slots: ``[B]`` int64 slot per request.
+
+    Returns:
+        ``[L, B, ring, D]``, contiguous.
+    """
+    ring, dim = window.shape[-2], window.shape[-1]
+    stages, batch = layers.numel(), slots.numel()
+    out = window.new_empty((stages, batch, ring, dim))
+    if not (stages and batch and ring):
+        return out
+    if window.stride(-1) != 1 or window.stride(-2) != dim:
+        raise ValueError("Window gather needs each request's window contiguous")
+    _gather_window_kernel[(stages * batch,)](
+        window,
+        layers,
+        slots,
+        out,
+        window.stride(0),
+        window.stride(1),
+        batch,
+        ring * dim,
+        BLOCK=4096,
+        num_warps=8,
+    )
+    return out
+
+
 @triton.jit
 def _draft_step_kernel(
     positions_ptr,  # [B] anchor position per request
