@@ -5,8 +5,8 @@ The first milestone is delivered as four draft PRs:
 [LMCache residency](https://github.com/LMCache/LMCache/pull/5267),
 [catalog/render/planner](https://github.com/ROCm/ATOM/pull/2307), and
 [pair policy](https://github.com/ROCm/ATOM/pull/2308).
-The ATOM branches are managed with `gh stack` in
-[stack #2309](https://github.com/ROCm/ATOM/pull/2309). The LMCache fork branch
+The ATOM branches are managed with `gh stack` in the order
+layout → catalog/render/planner → pair policy. The LMCache fork branch
 is independently tracked by `gh stack`; cross-repository dependencies are linked
 in the PR descriptions.
 
