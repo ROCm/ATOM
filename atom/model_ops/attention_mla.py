@@ -62,7 +62,10 @@ from atom.distributed.pcp_utils import (
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import use_triton_gemm
 from atom.model_ops.triton_fused_mla_ctx_kv import fused_mla_ctx_norm_rope_cache
-from atom.model_ops.triton_fused_qkv_quant import fused_qkv_per_tensor_quant
+from atom.model_ops.triton_fused_qkv_quant import (
+    fused_kv_per_tensor_quant,
+    fused_qkv_per_tensor_quant,
+)
 from atom.model_ops.utils import (
     dynamic_per_batched_tensor_quant,
     get_and_maybe_dequant_weights,
@@ -988,6 +991,15 @@ class MLAAttention(nn.Module):
         out = tuple(t[..., : self.qk_nope_head_dim] for t in tensors)
         return out if len(out) > 1 else out[0]
 
+    def _prepare_prefill_k(self, k_nope, k_rope):
+        """Keep K split for FP8 quantization; materialize it for BF16 attention."""
+        if self.use_flydsl_fp8_prefill_attn:
+            return k_nope, None if self.rope_is_zero_pad else k_rope
+        return (
+            torch.cat((k_nope, k_rope.expand((*k_nope.shape[:-1], -1))), dim=-1),
+            None,
+        )
+
     def _flash_attn_prefill(
         self,
         q: torch.Tensor,
@@ -1006,6 +1018,7 @@ class MLAAttention(nn.Module):
         kv_fp8: (
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
         ) = None,
+        k_rope: torch.Tensor | None = None,
     ):
         """Dispatch MLA prefill to FP8 FlyDSL or AITER varlen attention.
 
@@ -1016,19 +1029,25 @@ class MLAAttention(nn.Module):
         ``q_fp8`` reuses ``(q8, q_descale)`` across cached chunks. ``kv_fp8``
         supplies ``(k8, v8, k_descale, v_descale)`` from FP8 gather and skips
         K/V quantization. These outputs can alias the BF16 workspaces.
+        ``k_rope`` supplies the separate RoPE columns when K has not been
+        concatenated yet; the fused QKV quantizer joins them directly in FP8.
         """
         if self.use_flydsl_fp8_prefill_attn:
             # The direct AITER FP8 API has no dropout argument.
             if dropout_p != 0.0:
                 raise ValueError("FlyDSL FP8 prefill attention requires dropout_p=0")
             if q_fp8 is None and kv_fp8 is None:
-                q8, k8, v8, qs, ks, vs, _, _ = fused_qkv_per_tensor_quant(q, k, v)
+                q8, k8, v8, qs, ks, vs, _, _ = fused_qkv_per_tensor_quant(
+                    q, k, v, k_rope=k_rope
+                )
                 q_fp8 = (q8, qs)
                 kv_fp8 = (k8, v8, ks, vs)
             q8, q_descale = q_fp8 or quant_fp8_per_tensor(q)
             if kv_fp8 is None:
-                k8, k_descale = quant_fp8_per_tensor(k)
-                v8, v_descale = quant_fp8_per_tensor(v)
+                # Gather workspaces are contiguous; normalize other views once.
+                k8, v8, k_descale, v_descale = fused_kv_per_tensor_quant(
+                    k.contiguous(), v.contiguous()
+                )
             else:
                 k8, v8, k_descale, v_descale = kv_fp8
             # Empty per-sequence cached chunks require the FMHA kernel's
@@ -1693,9 +1712,7 @@ class MLAAttention(nn.Module):
         k_nope_new, v_new = kv_nope_new.split(
             [self.qk_nope_head_dim, self.v_head_dim], dim=-1
         )
-        k_new = torch.cat(
-            (k_nope_new, k_rope_new.expand((*k_nope_new.shape[:-1], -1))), dim=-1
-        )
+        k_new, quant_k_rope = self._prepare_prefill_k(k_nope_new, k_rope_new)
         prefill_q, k_new = self._drop_rope_pad(prefill_q, k_new)
         # Quantize Q once and reuse it across the new tokens and cached chunks.
         q_fp8 = None
@@ -1703,7 +1720,7 @@ class MLAAttention(nn.Module):
         kv_out_scales = None
         if self.use_flydsl_fp8_prefill_attn:
             q8, k8, v8, qs, ks, vs, gather_ks, gather_vs = fused_qkv_per_tensor_quant(
-                prefill_q, k_new, v_new
+                prefill_q, k_new, v_new, k_rope=quant_k_rope
             )
             q_fp8 = (q8, qs)
             new_kv_fp8 = (k8, v8, ks, vs)
@@ -1966,6 +1983,7 @@ class MLAAttention(nn.Module):
         if k_rope.dim() == 2:
             k_rope = k_rope.unsqueeze(1)
 
+        quant_k_rope = None
         if use_triton_gemm():
             weight = self.kv_b_proj.weight
             weight_scale = self.kv_b_proj.weight_scale
@@ -2041,14 +2059,14 @@ class MLAAttention(nn.Module):
                     [self.qk_nope_head_dim, self.v_head_dim], dim=-1
                 )
 
-                k = torch.cat((k_nope, k_rope.expand((*k_nope.shape[:-1], -1))), dim=-1)
+                k, quant_k_rope = self._prepare_prefill_k(k_nope, k_rope)
         else:
             kv_nope = self.kv_b_proj(kv_c_normed).view(
                 -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
-            k = torch.cat((k_nope, k_rope.expand((*k_nope.shape[:-1], -1))), dim=-1)
+            k, quant_k_rope = self._prepare_prefill_k(k_nope, k_rope)
 
         q, k = self._drop_rope_pad(q, k)
         output = self._flash_attn_prefill(
@@ -2062,6 +2080,7 @@ class MLAAttention(nn.Module):
             min_seqlen_q=attn_metadata.min_seqlen_q,
             dropout_p=attn_metadata.dropout_p,
             causal=True,
+            k_rope=quant_k_rope,
         )
 
         return self.o_proj(output.flatten(start_dim=-2))
