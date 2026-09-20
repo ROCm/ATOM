@@ -65,7 +65,7 @@ permissions:
   contents: read
   pull-requests: write
 
-# The agreed set: five entries across five concurrency levels, 25 jobs. It was
+# The agreed set: five entries across four concurrency levels, 20 jobs. It was
 # a single-entry smoke until d76360456; the matrix step now fails on a short
 # matrix rather than letting a typo surface at the judge as `partial`.
 # Narrowing for an experiment is a change to this block and nothing else.
@@ -78,7 +78,14 @@ env:
   PERF_OSL: 1024
   PERF_RATIO: "0.8"
   PERF_JUDGING_CONCS: 64,128,256
-  PERF_REFERENCE_CONCS: 4,32        # measured and shown, never judged
+  # Measured and shown, never judged. c=32 was here too and was dropped: it is
+  # the one level that earns neither keep. It is not judged, so it contributes
+  # no detection; and it is not small enough for small-batch work to dominate
+  # it, so a small-batch-only regression is already diluted there -- which is
+  # the only reason to carry a reference level at all. c=4 is where such a
+  # regression still shows. The judging levels cannot absorb the cut instead:
+  # FAMILY_MIN_CONFIGS is 3 and {64,128,256} is exactly 3, so none is spare.
+  PERF_REFERENCE_CONCS: 4
   PERF_EXPECTED_ENTRIES: 5
   # Warmup length as a multiple of the concurrency level, matching the
   # measurement at 10. Set to 1 to reproduce the short warmup the residual
