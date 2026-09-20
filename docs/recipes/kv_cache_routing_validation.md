@@ -4,8 +4,11 @@ The native HBM+CPU routing milestone is delivered through three ATOM draft PRs:
 [layout](https://github.com/ROCm/ATOM/pull/2306),
 [catalog/render/planner](https://github.com/ROCm/ATOM/pull/2307), and
 [pair policy](https://github.com/ROCm/ATOM/pull/2308).
+They build on the [P/D completion and source-block retention fix](https://github.com/ROCm/ATOM/pull/2167).
 The ATOM branches are managed with `gh stack` in the order
-layout → catalog/render/planner → pair policy. CPU observation uses stock LMCache's
+completion/retention → layout → catalog/render/planner → pair policy.
+The top branch, `Jasen/kv-routing-policy`, contains all four PRs.
+CPU observation uses stock LMCache's
 public `get_keys()` API through connector-supplied callbacks. The separate
 [LMCache residency proposal](https://github.com/LMCache/LMCache/pull/5267) is an
 independent draft and is not required to build, test, or deploy these ATOM changes.
@@ -28,7 +31,7 @@ LMCache Python modules or extensions were overlaid for this compatibility run.
 
 | Final stock-LMCache validation | Result |
 |---|---|
-| Catalog, CPU observer, dense/offload connector and early-release regression | 395 passed |
+| Combined stack on #2167: scheduler, P/D completion/retention, PP, offload and routing regression | 870 passed, 3 skipped |
 | Real GPU/native CPU/disk round trips, including HTTP catalog and eviction | 3 passed |
 | Built Rust router against HTTP catalogs and controlled P/D endpoints | 1 passed |
 | Changed Python files, Black and Ruff in prebuilt formatter images | Passed |
@@ -36,6 +39,10 @@ LMCache Python modules or extensions were overlaid for this compatibility run.
 These checks cover sampled membership, late token bindings, bounded publication,
 failed observations and stale removal, lost report acknowledgments and recovery,
 CPU sample age, native codec byte sizes and byte-identical GPU cache restoration.
+The combined-stack tests also cover send/save retention, cancellation, deferred
+release, PP completion quorum and idle save dispatch. The stack rebase preserved
+the routing changes; its only textual conflict was a scheduler log message, for
+which the all-KV-owner retention wording from #2167 was retained.
 The reporter consumes callbacks without importing LMCache or its object types.
 The stock-LMCache GLM 2P2D performance matrix has not been rerun.
 
