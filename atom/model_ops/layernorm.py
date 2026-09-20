@@ -19,6 +19,7 @@ from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
+from aiter.ops.triton.quant.fused_mxfp8_quant import fused_dual_rmsnorm_mxfp8_quant
 from torch import Tensor, nn
 from torch.overrides import handle_torch_function, has_torch_function_unary
 
@@ -1170,6 +1171,49 @@ class DualRMSNorm:
             q.view(-1, self.num_q_heads * self.head_dim),
             k.view(-1, self.num_kv_heads * self.head_dim),
         )
+
+
+class DualRMSNormMXFP8:
+    """Two RMSNorms in one launch, Q landing in MXFP8 and K in its own dtype.
+
+    Not an nn.Module; it reads the weights off the two norms it is handed, as
+    `DualRMSNorm` does. Unlike that one the widths are independent and only
+    the token count is shared, which is what a Q latent normed beside a KV
+    latent needs. Q comes back as the ``(e4m3, e8m0 group-32)`` pair a
+    native-quant GEMM reads without quantizing again. RoPE is the caller's.
+    """
+
+    def __init__(self, q_norm: nn.Module, k_norm: nn.Module, prefix: str) -> None:
+        assert _is_mxfp8(q_norm.quant_type.value, q_norm.params_dtype), (
+            f"{prefix}: Q emits MXFP8, not "
+            f"{q_norm.quant_type}/{q_norm.params_dtype}"
+        )
+        self.q_norm = q_norm
+        self.k_norm = k_norm
+        self.prefix = prefix
+
+    @mark_trace
+    def __call__(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # The kernel takes matrices; fold the leading dims away and give them
+        # back, as the RMSNorm branches do, so a caller does not.
+        lead = q.shape[:-1]
+        q_fp8, q_scale, k_out = fused_dual_rmsnorm_mxfp8_quant(
+            q.reshape(-1, q.shape[-1]),
+            k.reshape(-1, k.shape[-1]),
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.q_norm.eps,
+            eps_k=self.k_norm.eps,
+        )
+        # The kernel types the scale by its bytes; its readers read e8m0.
+        q_scale = q_scale.view(torch.float8_e8m0fnu)
+        if len(lead) > 1:
+            q_fp8 = q_fp8.view(*lead, -1)
+            q_scale = q_scale.view(*lead, -1)
+            k_out = k_out.view(*lead, -1)
+        return q_fp8, q_scale, k_out
 
 
 # ---------------------------------------------------------------------------

@@ -10,7 +10,9 @@ def _ceil_pow2_code(value):
 
 
 @triton.jit
-def quantize_fp8_kernel(X, Y, S, SIZE: tl.constexpr, DEQUANT: tl.constexpr):
+def quantize_fp8_kernel(X, Y, S, SIZE, DEQUANT: tl.constexpr):
+    # SIZE is the token count. A `tl.constexpr` here builds one kernel per
+    # prefill chunk length and per batch size, and it only bounds the tiles.
     groups = tl.program_id(0) * 32 + tl.arange(0, 32)
     offsets = groups[:, None] * 32 + tl.arange(0, 32)[None, :]
     x = tl.load(X + offsets, offsets < SIZE, other=0).to(tl.float32)
@@ -30,7 +32,7 @@ def quantize_fp4_kernel(
     X,
     Y,
     S,
-    SIZE: tl.constexpr,
+    SIZE,  # runtime: see `quantize_fp8_kernel`
     GROUP: tl.constexpr,
     E4M3_SCALE: tl.constexpr,
     DEQUANT: tl.constexpr,

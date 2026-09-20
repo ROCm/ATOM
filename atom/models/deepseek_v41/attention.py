@@ -4,6 +4,8 @@
 import torch
 from aiter import QuantType
 from aiter.dist.parallel_state import get_tp_group
+from torch import nn
+
 from atom.model_ops.attentions.deepseek_v41.packed_attention import (
     packed_decode,
     packed_prefill,
@@ -15,9 +17,7 @@ from atom.model_ops.blockscale import (
 from atom.model_ops.deepseek_v41.compressor import Compressor
 from atom.model_ops.deepseek_v41.paged_scoring import score_topk_paged
 from atom.model_ops.deepseek_v41.projections import grouped_output_projection
-from torch import nn
-
-from atom.model_ops.layernorm import RMSNorm
+from atom.model_ops.layernorm import DualRMSNormMXFP8, RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
     MergedReplicatedLinear,
@@ -111,6 +111,11 @@ class Attention(nn.Module):
             quant_config=native_quant_config(),
         )
         self.kv_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
+        # Both latents are slices of the one `wqkv_a` output and neither norm
+        # reads the other's result, so they are one launch rather than two.
+        self.qk_norm = DualRMSNormMXFP8(
+            self.q_norm, self.kv_norm, f"layers.{spec.layer_id}.qk_norm"
+        )
         # wo_a: grouped LoRA. FP8 + e8m0 block scale on disk, BF16 in the
         # grouped einsum. Allocated as a quantized ColumnParallelLinear so both
         # tensors load through the standard FP8 path, then dequantized in
@@ -228,12 +233,12 @@ class Attention(nn.Module):
     def forward(self, hidden, cache, step, rope):
         positions = cache.rope_positions(step)
         q_lora, kv_pre = self.project_qkv(hidden)
-        qr, qr_scale = self.q_norm(q_lora)
-        query = rope(
+        qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
+        query, raw_kv = rope.pair(
             self.wq_b(qr, x_scale=qr_scale).unflatten(-1, (self.heads, self.head_dim)),
+            kv_normed,
             positions,
         )
-        raw_kv = rope(self.kv_norm(kv_pre), positions)
         # Decode consumes only the stored window; do not materialize an unused
         # BF16 copy when the persistent cache is packed.
         kv = (

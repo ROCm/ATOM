@@ -5,12 +5,15 @@ import logging
 from copy import copy
 
 import torch
+from torch import nn
+
+from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.blockscale import native_quant_linear, quantize_fp8
 from atom.model_ops.deepseek_v41.dspark import (
     DraftStep,
+    build_block_state,
     draft_attention,
     draft_step,
-    build_block_state,
     draft_step_indices,
     fused_draft_kv_tail,
     rotate_rows,
@@ -18,9 +21,6 @@ from atom.model_ops.deepseek_v41.dspark import (
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.deepseek_v41.projections import grouped_output_projection
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
-from torch import nn
-
-from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
@@ -41,8 +41,10 @@ logger = logging.getLogger("atom")
 
 
 class DraftAttention(Attention):
-    def context_keys(self, kv_pre, positions, rope, *, packed=False):
-        keys = rotate_rows(rope, self.kv_norm(kv_pre), positions)
+    def context_keys(self, kv_normed, positions, rope, *, packed=False):
+        """Takes the latent already normed: `forward` gets it beside the query
+        out of one launch, and the standalone caller norms it itself."""
+        keys = rotate_rows(rope, kv_normed, positions)
         # Unlike V4's mixed NoPE/RoPE layout, V4.1 QAT covers all head lanes.
         return quantize_fp8(keys, dequantize=not packed)
 
@@ -61,16 +63,16 @@ class DraftAttention(Attention):
         fuse, `write_context_kv` reads `wkv_shard` and no query is projected.
         """
         _, kv_pre = self.project_qkv(hidden)
-        return self.context_keys(kv_pre, positions, rope, packed=packed)
+        return self.context_keys(self.kv_norm(kv_pre), positions, rope, packed=packed)
 
     def forward(self, hidden, context_kv, step, rope):
         q_lora, kv_pre = self.project_qkv(hidden)
-        qr, qr_scale = self.q_norm(q_lora)
+        qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )
         query = rotate_rows(rope, query, step.positions)
-        keys = self.context_keys(kv_pre, step.positions, rope)
+        keys = self.context_keys(kv_normed, step.positions, rope)
         output = draft_attention(
             query,
             context_kv[self.spec.layer_id],

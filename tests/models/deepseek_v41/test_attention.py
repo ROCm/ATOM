@@ -3,6 +3,7 @@
 
 import pytest
 import torch
+
 from atom.model_ops.deepseek_v41.compressor import Compressor
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 
@@ -29,6 +30,25 @@ def test_rope_matches_reference_interleaved_and_inverse(
             )
             actual = target(source.clone(), positions, inverse=inverse)
             assert torch.equal(actual, expected)
+
+
+def test_rope_pair_rotates_both_as_two_separate_calls_would():
+    """The two-channel entry is a launch count, not a different rotation.
+
+    On CPU this takes the fallback, so what it pins is the contract every
+    caller depends on: both tensors rotated, in place, in argument order.
+    """
+    torch.manual_seed(724)
+    target = RotaryEmbedding(64, 1024, base=10000)
+    positions = torch.tensor([0, 1, 97, 511, 1023])
+    query = torch.randn((2, 5, 8, 512), dtype=torch.bfloat16)
+    latent = torch.randn((2, 5, 512), dtype=torch.bfloat16)
+    expected = target(query.clone(), positions), target(latent.clone(), positions)
+
+    actual = target.pair(query, latent, positions)
+
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected, strict=True))
+    assert actual[0] is query and actual[1] is latent
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")

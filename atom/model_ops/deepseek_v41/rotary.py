@@ -4,7 +4,10 @@
 import math
 
 import torch
-from aiter import rope_cached_positions_fwd_inplace
+from aiter import (
+    rope_cached_positions_2c_fwd_inplace,
+    rope_cached_positions_fwd_inplace,
+)
 from torch import nn
 
 from atom.model_ops.v4_kernels.inverse_rope import inverse_rope_inplace
@@ -73,12 +76,34 @@ class RotaryEmbedding(nn.Module):
         tail.copy_(torch.view_as_real(pairs * freqs.view(shape)).flatten(-2))
         return x
 
-    def _rotate_cuda(self, x, positions, *, inverse):
-        if x.numel() == 0:
-            return x
-        # Contiguous model outputs use a view. Copy back only for strided callers
-        # so the public rotation remains in place for batched chunk views.
-        values = x.contiguous()
+    def pair(self, x, y, positions):
+        """Rotate two tensors that share a position line, in one launch.
+
+        Their head counts may differ, which is what the two-channel entry is
+        for. Forward only: `inverse` has one channel.
+        """
+        if not (x.is_cuda and y.is_cuda) or not x.numel() or not y.numel():
+            return self.forward(x, positions), self.forward(y, positions)
+        values_x, values_y = x.contiguous(), y.contiguous()
+        flat_positions, cos, sin, dim, rows = self._cached_args(x, positions)
+        rope_cached_positions_2c_fwd_inplace(
+            values_x[..., -dim:].view(1, rows, -1, dim),
+            values_y[..., -dim:].view(1, rows, -1, dim),
+            cos,
+            sin,
+            flat_positions.to(torch.int64).view(1, -1),
+            1,  # GPT-J interleaved pairs, as in V4.
+            reuse_freqs_front_part=True,
+            nope_first=False,
+        )
+        if values_x is not x:
+            x.copy_(values_x)
+        if values_y is not y:
+            y.copy_(values_y)
+        return x, y
+
+    def _cached_args(self, x, positions):
+        """Position line, frequency views, rotate width and folded row count."""
         batch, length = x.shape[:2]
         flat_positions = (
             positions.repeat(batch) if batch > 1 else positions.contiguous()
@@ -87,12 +112,24 @@ class RotaryEmbedding(nn.Module):
         # RoPE ABI still requires a literal unit position stride.
         if flat_positions.stride(0) != 1:
             flat_positions = flat_positions.clone(memory_format=torch.contiguous_format)
-        cos = self.cos_cache[:, None, None, :]
-        sin = self.sin_cache[:, None, None, :]
-        dim = self.cos_cache.shape[-1] * 2
+        return (
+            flat_positions,
+            self.cos_cache[:, None, None, :],
+            self.sin_cache[:, None, None, :],
+            self.cos_cache.shape[-1] * 2,
+            batch * length,
+        )
+
+    def _rotate_cuda(self, x, positions, *, inverse):
+        if x.numel() == 0:
+            return x
+        # Contiguous model outputs use a view. Copy back only for strided callers
+        # so the public rotation remains in place for batched chunk views.
+        values = x.contiguous()
+        flat_positions, cos, sin, dim, rows = self._cached_args(x, positions)
         if inverse:
             inverse_rope_inplace(
-                values.view(batch * length, -1, x.shape[-1]),
+                values.view(rows, -1, x.shape[-1]),
                 cos,
                 sin,
                 flat_positions,
@@ -100,7 +137,7 @@ class RotaryEmbedding(nn.Module):
             )
         else:
             rope_cached_positions_fwd_inplace(
-                values[..., -dim:].view(1, batch * length, -1, dim),
+                values[..., -dim:].view(1, rows, -1, dim),
                 cos,
                 sin,
                 flat_positions.to(torch.int64).view(1, -1),
