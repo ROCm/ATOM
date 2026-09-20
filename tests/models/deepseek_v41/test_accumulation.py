@@ -14,8 +14,12 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("splits", [1, 3])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_scaled_block_cancellation_preserves_small_term(fp4, splits, dtype):
-    # Three groups contribute 2**24, 1, -2**24. Rounding either the block
+    # Three groups contribute 2**23, 1, -2**23. Rounding either the block
     # accumulation or the split reduction prematurely loses the answer, 1.
+    #
+    # 2**23 is the widest spread an FP32 accumulator carries exactly: the
+    # significand is 24 bits, so 2**23 + 1 is representable and 2**24 + 1 is
+    # not. The spread was 2**24 while the sums were kept in FP64.
     activation = torch.zeros(3, 96, device="cuda")
     activation[:, ::32] = 1
     activation = activation.to(torch.float8_e4m3fn)
@@ -31,7 +35,7 @@ def test_scaled_block_cancellation_preserves_small_term(fp4, splits, dtype):
         weight = weight.to(torch.float8_e4m3fn)
         group_rows = 32
     weight_scale = (
-        torch.tensor([2**24, 1, 2**24], device="cuda", dtype=torch.float32)
+        torch.tensor([2**23, 1, 2**23], device="cuda", dtype=torch.float32)
         .expand(32 // group_rows, -1)
         .contiguous()
         .to(torch.float8_e8m0fnu)

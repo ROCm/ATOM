@@ -373,7 +373,13 @@ def test_w4a8_expert_against_reference(reference, projection_factory):
         )[:, None]
         expected = ref(x, weights)
         actual = target(x.cuda(), weights.cuda()).cpu()
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    # BF16 output of the native microscaling MFMA: its block accumulator
+    # carries ~15 bits against the block's largest term, so the bound is a
+    # few BF16 ulps of the output magnitude rather than exact equality.
+    # See test_quant_gpu.
+    torch.testing.assert_close(
+        actual, expected, rtol=2**-7, atol=2**-7 * expected.abs().max().item()
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
@@ -411,7 +417,13 @@ def test_native_engram_projection_and_gpu_gate(reference, native_quant):
         )
         expected = ref(hidden, embeddings, mask)
         actual = target(hidden.cuda(), embeddings.flatten(-2).cuda(), mask.cuda()).cpu()
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    # BF16 output of the native microscaling MFMA: its block accumulator
+    # carries ~15 bits against the block's largest term, so the bound is a
+    # few BF16 ulps of the output magnitude rather than exact equality.
+    # See test_quant_gpu.
+    torch.testing.assert_close(
+        actual, expected, rtol=2**-7, atol=2**-7 * expected.abs().max().item()
+    )
     assert target.wkv.weight.dtype == torch.float8_e4m3fn
     assert target.gate_weight.dtype == torch.float32
 
@@ -460,7 +472,10 @@ def test_real_engram_weights_and_native_table_rows(reference, native_quant):
         actual = target(hidden.cuda(), embeddings.flatten(-2).cuda()).cpu()
         # At BF16 output precision, tolerate at most one ulp away from zero;
         # FP32 reduction order differs across the CPU and GPU implementations.
-        torch.testing.assert_close(actual, expected, rtol=1 / 128, atol=2**-10)
+        # Widened for the native microscaling MFMA; see test_quant_gpu.
+        torch.testing.assert_close(
+            actual, expected, rtol=1 / 128, atol=2**-7 * expected.abs().max().item()
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")

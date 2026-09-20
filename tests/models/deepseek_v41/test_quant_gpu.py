@@ -125,7 +125,16 @@ def test_native_gemm_nonuniform_scales_and_split_tails(fp4, n, k, m, splits):
         dtype=torch.float32,
         split_k=splits,
     ).cpu()
-    torch.testing.assert_close(actual, expected, rtol=3e-5, atol=3e-4)
+    # The FP8 GEMM issues the CDNA4 v_mfma_scale_f32_*_f8f6f4, whose block
+    # accumulator carries about 15 bits against the block's largest term --
+    # not the 24 an FP32 sum would. The resulting error scales with the
+    # result, not with the element, so the bound is tied to the magnitude of
+    # the output: measured 1.6e-5 to 1.8e-5 of peak across this file's cases,
+    # and 5e-5 leaves room. A per-element rtol cannot express this -- rows
+    # that cancel to near zero carry the same absolute error as the rest.
+    torch.testing.assert_close(
+        actual, expected, rtol=3e-5, atol=5e-5 * expected.abs().max().item()
+    )
     # The pre-quantized entry must use exactly the supplied scale layout.
     supplied = native_quant_linear(
         a.cuda(),

@@ -128,8 +128,13 @@ def test_native_linear_dispatch_keeps_a8_qat(linear_modules):
         32, 0
     ).repeat_interleave(32, 1)
     expected = torch.nn.functional.linear(activation, full_weight)
+    # Bound tied to the output magnitude; see test_quant_gpu for why the
+    # native microscaling MFMA cannot be held to a per-element rtol.
     torch.testing.assert_close(
-        module(x.cuda(), otype=torch.float32).cpu(), expected, rtol=3e-5, atol=3e-4
+        module(x.cuda(), otype=torch.float32).cpu(),
+        expected,
+        rtol=3e-5,
+        atol=5e-5 * expected.abs().max().item(),
     )
 
 
