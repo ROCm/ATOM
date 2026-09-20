@@ -163,6 +163,12 @@ RUN echo "========== [vLLM-ATOM] Final transformers version ==========" && \
     "${VENV_PYTHON}" -c "import transformers; print(f'transformers.__version__ = {transformers.__version__}')" && \
     "${VENV_PYTHON}" -m pip show transformers || true
 
+# apt/pip layers in derived images can restore SDK files; reselect the pair
+# after all dependency installation (older external bases may lack the tool).
+RUN if command -v atom-rocm-runtime >/dev/null 2>&1; then \
+        atom-rocm-runtime patched && ldconfig; \
+    fi
+
 CMD ["/bin/bash"]
 
 # SGLang image extends an ATOM base image and layers on an sglang checkout.
@@ -282,6 +288,12 @@ RUN echo "========== [SGLANG-ATOM 5.5/6] Pin smg-grpc-servicer ==========" && \
 RUN echo "========== [SGLANG-ATOM 6/6] Check Aiter/FlyDSL versions after SGLang build ==========" && \
     "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl sglang triton triton-kernels || true
 
+# apt/pip layers in derived images can restore SDK files; reselect the pair
+# after all dependency installation (older external bases may lack the tool).
+RUN if command -v atom-rocm-runtime >/dev/null 2>&1; then \
+        atom-rocm-runtime patched && ldconfig; \
+    fi
+
 CMD ["/bin/bash"]
 
 # ====================================================================
@@ -300,7 +312,7 @@ CMD ["/bin/bash"]
 # --------------------------------------------------------------------
 # Stage 0: Common base (apt + pip foundations, shared by all builders)
 # --------------------------------------------------------------------
-FROM ${BASE_IMAGE} AS base
+FROM ${BASE_IMAGE} AS base_deps
 
 ARG GPU_ARCH
 ENV GPU_ARCH_LIST=$GPU_ARCH
@@ -313,6 +325,22 @@ RUN pip install --upgrade pip && \
         git cython3 ibverbs-utils openmpi-bin libopenmpi-dev \
         libpci-dev cmake libdw1 locales && \
     rm -rf /var/lib/apt/lists/*
+
+# ROCm 7.2.4 ordering-edge backport (vllm-project/vllm#55099).
+# auto preserves other SDK versions, including the ROCm 10 release image.
+FROM base_deps AS build_rocm_runtime
+ARG ROCM_ORDERING_EDGE=auto
+ARG ROCM_SYSTEMS_REPO="https://github.com/ROCm/rocm-systems.git"
+ARG ROCM_RUNTIME_COMMIT="b539bf7eebfd99ad0a69668caa1f4037034d501f"
+ARG ROCM_RUNTIME_JOBS=16
+COPY docker/rocm-runtime/build.sh /tmp/build-rocm-runtime.sh
+RUN bash /tmp/build-rocm-runtime.sh
+
+FROM base_deps AS base
+COPY --from=build_rocm_runtime /opt/atom-rocm-runtime /opt/atom-rocm-runtime
+COPY docker/rocm-runtime/switch_runtime.py /usr/local/bin/atom-rocm-runtime
+RUN chmod +x /usr/local/bin/atom-rocm-runtime && \
+    atom-rocm-runtime patched && ldconfig
 
 # --------------------------------------------------------------------
 # Stage 1: RCCL — parallel
@@ -564,6 +592,12 @@ RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
         command -v aiperf && aiperf --help >/dev/null; \
     else \
         echo "========== Skipped SemiAnalysis aiperf (INSTALL_SA_AIPERF=0) =========="; \
+    fi
+
+# apt/pip layers in derived images can restore SDK files; reselect the pair
+# after all dependency installation (older external bases may lack the tool).
+RUN if command -v atom-rocm-runtime >/dev/null 2>&1; then \
+        atom-rocm-runtime patched && ldconfig; \
     fi
 
 CMD ["/bin/bash"]
