@@ -154,6 +154,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._load_lifecycles[sid] = seq
 
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
+        if getattr(seq, "cache_load_policy", "auto") == "skip":
+            return 0, False
         if not self._do_load or self._lookup_client is None:
             return 0, False
         self._begin_load_lifecycle(seq)
@@ -277,14 +279,12 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         ls.hbm_cached_tokens = hbm
         chunk = int(self.chunk_size or 256)
         need = lmc - hbm
-        if lmc <= hbm:
-            return False, "hbm_satisfies_after_alloc", hbm, lmc, need, chunk
-        if hbm % chunk != 0:
-            return False, "unaligned_hbm_prefill", hbm, lmc, need, chunk
-        min_load = int(getattr(self, "_min_load_tokens", 8192))
-        if need < min_load:
-            return False, "too_small", hbm, lmc, need, chunk
-        return True, "aligned_large_hit", hbm, lmc, need, chunk
+        from atom.cache_routing.planner import load_decision
+
+        eligible, reason = load_decision(
+            hbm, lmc, chunk, int(getattr(self, "_min_load_tokens", 8192))
+        )
+        return eligible, reason, hbm, lmc, need, chunk
 
     def adjust_prefill_chunk_after_alloc(self, seq, chunk: int) -> int:
         sid = str(seq.id)

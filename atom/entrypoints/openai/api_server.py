@@ -103,11 +103,8 @@ from .serving_anthropic import (
 from .serving_chat import (
     build_chat_response,
     build_chat_response_multi,
-    normalize_chat_tools,
-    resolve_thinking,
     stream_chat_response,
     stream_chat_response_fanout,
-    validate_chat_request,
     validate_tool_list,
 )
 from .serving_completion import (
@@ -530,8 +527,13 @@ def _build_sampling_params(
     top_k: int = -1,
     top_p: float = 1.0,
     n: int = 1,
+    routing_hints: dict | None = None,
 ) -> SamplingParams:
+    from atom.cache_routing.planner import cache_load_policy
+
     return SamplingParams(
+        cache_load_policy=cache_load_policy(routing_hints),
+        routing_dispatch_id=(routing_hints or {}).get("dispatch_id"),
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
@@ -1542,6 +1544,46 @@ async def general_error_handler(request: Request, exc: Exception):
 # ---- Endpoints ----
 
 
+@app.post("/v1/completions/render")
+async def render_completions(request: CompletionRequest):
+    validate_model(request.model)
+    prompts = [request.prompt] if isinstance(request.prompt, str) else request.prompt
+    return [{"token_ids": tokenizer.encode(prompt)} for prompt in prompts]
+
+
+@app.post("/v1/chat/completions/render")
+async def render_chat_completions(request: ChatCompletionRequest):
+    from atom.entrypoints.openai.render import prepare_text_chat
+
+    validate_model(request.model)
+    prompt, _ = prepare_text_chat(
+        request,
+        tokenizer,
+        custom_message_encoder,
+        default_chat_template_kwargs,
+        reasoning_toggle,
+    )
+    return {"token_ids": tokenizer.encode(prompt)}
+
+
+@app.get("/v1/cache/{operation}")
+async def cache_control(operation: str, request: Request):
+    from atom.cache_routing.server import read_catalog
+
+    if operation not in ("snapshot", "events", "load", "info"):
+        raise HTTPException(status_code=404, detail="unknown catalog operation")
+    path = f"/v1/cache/{operation}"
+    if request.url.query:
+        path += "?" + request.url.query
+    try:
+        return await asyncio.to_thread(read_catalog, path)
+    except Exception as exc:
+        from urllib.error import HTTPError
+
+        code = exc.code if isinstance(exc, HTTPError) else 503
+        raise HTTPException(status_code=code, detail=str(exc)) from exc
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """Handle chat completion requests (OpenAI-compatible)."""
@@ -1549,37 +1591,11 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
     validate_model(request.model)
 
     try:
-        request.tools = normalize_chat_tools(request.tools)
-        validate_chat_request(request)
-        messages = request.get_messages()
+        from atom.entrypoints.openai.render import prepare_chat_fields
 
-        merged_kwargs = dict(default_chat_template_kwargs)
-        if request.chat_template_kwargs:
-            merged_kwargs.update(request.chat_template_kwargs)
-        # Forward K3 template controls the chat template needs but that pydantic
-        # does not otherwise thread through: structured-output response_format,
-        # a string tool_choice ("auto"/"none"/"required"), and thinking/effort.
-        if request.response_format is not None:
-            merged_kwargs["response_format"] = request.response_format
-        if isinstance(request.tool_choice, str):
-            merged_kwargs["tool_choice"] = request.tool_choice
-        _th_enabled, _th_effort = resolve_thinking(request)
-        if request.thinking is not None or request.reasoning_effort is not None:
-            # By the name this template actually reads. `thinking` was
-            # hardcoded, which is right for Kimi-K3 and a silent no-op for the
-            # whole Qwen family, whose templates read `enable_thinking` --
-            # measured, `thinking=False` left the `<think>` prefill in place.
-            # A template ignores a kwarg it does not know, so the failure was
-            # invisible: the model reasoned anyway.
-            # Only when the request said something about it. An effort is
-            # not an opt-in, and this is merged after the server defaults and
-            # after the client's own `chat_template_kwargs` -- so writing it
-            # unconditionally overrode both.
-            if reasoning_toggle is not None and _th_enabled is not None:
-                name, off_value, on_value = reasoning_toggle
-                merged_kwargs[name] = on_value if _th_enabled else off_value
-            if _th_effort is not None:
-                merged_kwargs["thinking_effort"] = _th_effort
+        messages, merged_kwargs = prepare_chat_fields(
+            request, default_chat_template_kwargs, reasoning_toggle
+        )
 
         effective_n = _coerce_n(request.n, request.temperature)
         sampling_params = _build_sampling_params(
@@ -1590,6 +1606,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             top_k=request.top_k,
             top_p=request.top_p,
             n=effective_n,
+            routing_hints=request.routing_hints,
         )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -1643,15 +1660,17 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             stream_input = token_ids if is_multimodal else prompt
             stream_multimodal_data = multimodal_data if is_multimodal else None
             if effective_n > 1:
-                seq_ids, stream_collector, num_prompt_tokens = (
-                    await setup_streaming_request_fanout(
-                        stream_input,
-                        sampling_params,
-                        request_id,
-                        multimodal_data=stream_multimodal_data,
-                        kv_transfer_params=request.kv_transfer_params,
-                        **dp_routing,
-                    )
+                (
+                    seq_ids,
+                    stream_collector,
+                    num_prompt_tokens,
+                ) = await setup_streaming_request_fanout(
+                    stream_input,
+                    sampling_params,
+                    request_id,
+                    multimodal_data=stream_multimodal_data,
+                    kv_transfer_params=request.kv_transfer_params,
+                    **dp_routing,
                 )
                 gen = stream_chat_response_fanout(
                     request_id,
@@ -1667,15 +1686,17 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     tool_parser_cls=tool_call_parser_cls,
                 )
             else:
-                seq_id, stream_collector, num_prompt_tokens = (
-                    await setup_streaming_request(
-                        stream_input,
-                        sampling_params,
-                        request_id,
-                        multimodal_data=stream_multimodal_data,
-                        kv_transfer_params=request.kv_transfer_params,
-                        **dp_routing,
-                    )
+                (
+                    seq_id,
+                    stream_collector,
+                    num_prompt_tokens,
+                ) = await setup_streaming_request(
+                    stream_input,
+                    sampling_params,
+                    request_id,
+                    multimodal_data=stream_multimodal_data,
+                    kv_transfer_params=request.kv_transfer_params,
+                    **dp_routing,
                 )
                 gen = stream_chat_response(
                     request_id,
@@ -1821,6 +1842,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
             top_k=request.top_k,
             top_p=request.top_p,
             n=effective_n,
+            routing_hints=request.routing_hints,
         )
 
         request_id = f"cmpl-{uuid.uuid4().hex}"
@@ -1836,14 +1858,16 @@ async def completions(request: CompletionRequest, raw_request: Request):
         # Streaming
         if request.stream:
             if effective_n > 1:
-                seq_ids, stream_collector, num_prompt_tokens = (
-                    await setup_streaming_request_fanout(
-                        request.prompt,
-                        sampling_params,
-                        request_id,
-                        kv_transfer_params=request.kv_transfer_params,
-                        **dp_routing,
-                    )
+                (
+                    seq_ids,
+                    stream_collector,
+                    num_prompt_tokens,
+                ) = await setup_streaming_request_fanout(
+                    request.prompt,
+                    sampling_params,
+                    request_id,
+                    kv_transfer_params=request.kv_transfer_params,
+                    **dp_routing,
                 )
                 gen = stream_completion_response_fanout(
                     request_id,
@@ -1855,14 +1879,16 @@ async def completions(request: CompletionRequest, raw_request: Request):
                     cleanup_request,
                 )
             else:
-                seq_id, stream_collector, num_prompt_tokens = (
-                    await setup_streaming_request(
-                        request.prompt,
-                        sampling_params,
-                        request_id,
-                        kv_transfer_params=request.kv_transfer_params,
-                        **dp_routing,
-                    )
+                (
+                    seq_id,
+                    stream_collector,
+                    num_prompt_tokens,
+                ) = await setup_streaming_request(
+                    request.prompt,
+                    sampling_params,
+                    request_id,
+                    kv_transfer_params=request.kv_transfer_params,
+                    **dp_routing,
                 )
                 gen = stream_completion_response(
                     request_id,
@@ -2041,9 +2067,11 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
         if request.stream:
             # Streaming response
-            seq_id, stream_collector, _num_prompt_tokens = (
-                await setup_streaming_request(prompt, sampling_params, request_id)
-            )
+            (
+                seq_id,
+                stream_collector,
+                _num_prompt_tokens,
+            ) = await setup_streaming_request(prompt, sampling_params, request_id)
 
             async def generate_anthropic_stream():
                 # Unconditional, like the chat path and like both upstreams:
@@ -2425,9 +2453,11 @@ async def responses_create(raw_request: Request):
 
         created_at = int(time.time())
         if request.stream:
-            seq_id, stream_collector, _num_prompt_tokens = (
-                await setup_streaming_request(prompt, sampling_params, request_id)
-            )
+            (
+                seq_id,
+                stream_collector,
+                _num_prompt_tokens,
+            ) = await setup_streaming_request(prompt, sampling_params, request_id)
 
             async def generate_responses_stream():
                 reasoning_filter = reasoning_channel(

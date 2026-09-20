@@ -96,8 +96,23 @@ def transfer_info(config) -> dict[str, Any]:
 
 def server_info(config, model_name: str) -> dict[str, Any]:
     """Return the same engine identity from either serving frontend."""
+    from atom.cache_routing.config import CacheRoutingConfig
+
+    routing = CacheRoutingConfig.from_env()
+    extra = (
+        {}
+        if routing is None
+        else {
+            "cache_routing": {
+                "catalog_http": routing.catalog_url.rstrip("/") + "/v1/cache",
+                "execution_id": routing.execution_id,
+                "content_namespace": routing.content_namespace,
+            }
+        }
+    )
     return {
         "model_id": model_name,
         "served_model_name": model_name,
         **transfer_info(config),
+        **extra,
     }

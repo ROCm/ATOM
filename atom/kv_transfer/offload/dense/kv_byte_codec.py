@@ -102,7 +102,8 @@ class DenseKVByteCodec:
         the dense path, which is where the pre-PR divisibility ``ValueError``
         left them."""
         self._segments: list[torch.Tensor] = []
-        for kvt in kv_caches.values():
+        self._segment_names: list[tuple[str, str]] = []
+        for layer_name, kvt in kv_caches.items():
             # A hybrid registers its per-request recurrent state in the same
             # dict, because the linear-attention forward reads it from
             # `kv_cache_data`. It is indexed by request slot, not by block, so
@@ -123,24 +124,35 @@ class DenseKVByteCodec:
                         "permit_per_request_state=True."
                     )
                 continue
-            for t in (
-                getattr(kvt, "k_cache", None),
-                getattr(kvt, "v_cache", None),
-                getattr(kvt, "k_scale", None),
-                getattr(kvt, "v_scale", None),
-                # DSA indexer cache (GLM-5.2 / DeepSeek-V3.2 sparse layers).
-                getattr(kvt, "index_cache", None),
-                # Its e8m0 exponents under `--index_cache_dtype fp4`, None
-                # otherwise. Appended after the keys rather than beside them
-                # because this order IS the stored byte layout: `bytes_per_block`
-                # sums these in sequence and a chunk is read back by offset.
-                # Reordering reinterprets every chunk already in a tier, and
-                # `build_page_namespace` has no segment order in it to notice --
-                # so a reorder has to bump `PAGE_LAYOUT_VERSION`.
-                getattr(kvt, "index_scale", None),
+            for plane, t in zip(
+                (
+                    "k_cache",
+                    "v_cache",
+                    "k_scale",
+                    "v_scale",
+                    "index_cache",
+                    "index_scale",
+                ),
+                (
+                    getattr(kvt, "k_cache", None),
+                    getattr(kvt, "v_cache", None),
+                    getattr(kvt, "k_scale", None),
+                    getattr(kvt, "v_scale", None),
+                    # DSA indexer cache (GLM-5.2 / DeepSeek-V3.2 sparse layers).
+                    getattr(kvt, "index_cache", None),
+                    # Its e8m0 exponents under `--index_cache_dtype fp4`, None
+                    # otherwise. Appended after the keys rather than beside them
+                    # because this order IS the stored byte layout: `bytes_per_block`
+                    # sums these in sequence and a chunk is read back by offset.
+                    # Reordering reinterprets every chunk already in a tier, and
+                    # `build_page_namespace` has no segment order in it to notice --
+                    # so a reorder has to bump `PAGE_LAYOUT_VERSION`.
+                    getattr(kvt, "index_scale", None),
+                ),
             ):
                 if t is not None and isinstance(t, torch.Tensor) and t.numel() > 0:
                     self._segments.append(t)
+                    self._segment_names.append((str(layer_name), plane))
 
         if not self._segments:
             raise ValueError("DenseKVByteCodec: no movable KV tensors registered")
@@ -195,6 +207,24 @@ class DenseKVByteCodec:
     @property
     def device(self) -> torch.device:
         return self._device
+
+    def layout_manifest(self) -> list[dict]:
+        """Describe the actual ordered native planes, including index and MTP.
+
+        Only metadata is returned. Capacity and device addresses are excluded
+        so independently allocated caches have the same physical contract.
+        """
+        return [
+            {
+                "layer": layer,
+                "plane": plane,
+                "dtype": str(tensor.dtype),
+                "bytes_per_block": block_bytes,
+            }
+            for (layer, plane), tensor, block_bytes in zip(
+                self._segment_names, self._segments, self._seg_block_bytes
+            )
+        ]
 
     @property
     def has_fused_chunk_major_staging(self) -> bool:

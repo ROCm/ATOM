@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Optional, Union
 
 
 @dataclass
@@ -12,16 +11,21 @@ class SamplingParams:
     top_p: float = 1.0  # 1.0 means disabled (keep all tokens)
     max_tokens: int = 64
     ignore_eos: bool = False
-    stop_strings: Optional[list[str]] = None
+    stop_strings: list[str] | None = None
     # Number of independently sampled completions to return for a single
     # prompt. n == 1 preserves the historical single-sequence behavior.
     # n > 1 causes the engine to fan out N sibling sequences sharing the
     # same prompt; each uses independent random noise at the sampler so
     # outputs diverge when temperature > 0.
     n: int = 1
-    logprobs: Optional[Union[bool, int]] = None
+    logprobs: bool | int | None = None
+
+    cache_load_policy: str = "auto"
+    routing_dispatch_id: str | None = None
 
     def __post_init__(self):
+        if self.cache_load_policy not in ("auto", "skip"):
+            raise ValueError("cache_load_policy must be auto or skip")
         if self.top_k != -1 and self.top_k < 1:
             raise ValueError("top_k must be -1 (disabled) or >= 1")
         if not (0.0 < self.top_p <= 1.0):

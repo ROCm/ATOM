@@ -222,6 +222,7 @@ class ChatCompletionRequest(BaseModel):
     frequency_penalty: float | None = 0.0
     n: int | None = 1
     # Optional KV-transfer metadata for P/D disaggregation.
+    routing_hints: dict[str, Any] | None = None
     kv_transfer_params: dict[str, Any] | None = None
     data_parallel_rank: int | None = None
 
@@ -259,6 +260,7 @@ class CompletionRequest(BaseModel):
     ignore_eos: bool | None = False
     stream: bool | None = False
     # Optional KV-transfer metadata for P/D disaggregation.
+    routing_hints: dict[str, Any] | None = None
     kv_transfer_params: dict[str, Any] | None = None
     # Optional DPA routing hint inserted by atomesh for DP-aware workers.
     data_parallel_rank: int | None = None

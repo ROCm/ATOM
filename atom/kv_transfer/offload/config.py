@@ -301,6 +301,7 @@ def build_page_namespace(
         "schema": "atom-page-namespace",
         "layout_version": layout_version,
         "model": base_model_name,
+        "model_revision": getattr(hf, "_commit_hash", None),
         "page_mode": {
             "hybrid": "dsv4-page-regions",
             "m3": "m3-page-regions",
@@ -333,6 +334,14 @@ def build_page_namespace(
             getattr(config, "speculative_config", None)
         ),
     }
+    # An explicit immutable revision is also required for local weight paths,
+    # where Hugging Face has no commit hash. Keep native CPU keys isolated by
+    # the exact semantic namespace used by the routing catalog.
+    from atom.cache_routing.config import CacheRoutingConfig
+
+    routing = CacheRoutingConfig.from_env()
+    if routing is not None:
+        document["content_namespace"] = routing.content_namespace
     canonical = json.dumps(
         document,
         sort_keys=True,
@@ -470,7 +479,13 @@ def lmcache_engine_id(config) -> str:
         )
         or 0
     )
-    return f"atom-offload-dp{dp_rank}"
+    from atom.cache_routing.config import CacheRoutingConfig
+
+    routing = CacheRoutingConfig.from_env()
+    identity = ""
+    if routing is not None:
+        identity = "-" + hashlib.sha256(routing.execution_id.encode()).hexdigest()[:16]
+    return f"atom-offload{identity}-dp{dp_rank}"
 
 
 def lmcache_replica_world_size(config) -> int:

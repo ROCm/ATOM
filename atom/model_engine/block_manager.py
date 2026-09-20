@@ -3,6 +3,7 @@
 
 import array
 import logging
+import os
 from dataclasses import dataclass
 from math import inf, isinf
 from time import monotonic
@@ -134,7 +135,10 @@ class BlockManager:
         self.total_evicted_blocks: int = 0
 
         kv_events = getattr(config, "kv_events_config", None)
-        self._events_enabled: bool = bool(kv_events and kv_events.enable)
+        self._events_enabled: bool = bool(
+            (kv_events and kv_events.enable)
+            or os.environ.get("ATOM_CACHE_ROUTING_CONFIG")
+        )
         self._event_log: list[KVCacheEvent] | None = (
             [] if self._events_enabled else None
         )
@@ -2454,12 +2458,23 @@ class BlockManager:
 
         for i in range(start, num_full):
             token_ids = self._hash_block_tokens(seq, i)
+            parent_hash = h
             h = self.compute_hash(token_ids, h)
             block_id = seq.block_table[i]
             block = self.kv.block(block_id)
             indexed_block_id = self.kv.lookup(h)
             if indexed_block_id == -1:
                 self.kv.publish(block_id, h, token_ids)
+                if self._event_log is not None:
+                    self._event_log.append(
+                        _make_block_stored(
+                            [h],
+                            list(token_ids),
+                            parent_hash if parent_hash != -1 else None,
+                            hbs,
+                            token_offset=i * hbs,
+                        )
+                    )
             else:
                 indexed_block = self.kv.block(indexed_block_id)
                 if indexed_block.token_ids != token_ids:

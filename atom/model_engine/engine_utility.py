@@ -427,4 +427,14 @@ class EngineUtilityHandler:
                     "waiting_kv": external,
                 }
 
+        catalog_server = getattr(self.scheduler, "cache_catalog_server", None)
+        if catalog_server is not None:
+            from atom.cache_routing.runtime import update_load
+
+            pending = sum(
+                max(0, seq.num_prompt_tokens - seq.num_cached_tokens)
+                for seq in self.scheduler.waiting
+            )
+            update_load(catalog_server.catalog, result, pending)
+
         return result

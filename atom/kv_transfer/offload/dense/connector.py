@@ -91,6 +91,9 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         self._early_release = bool(self._supports_early_block_release)
 
     def close(self) -> None:
+        reporter = getattr(self, "_cpu_reporter", None)
+        if reporter is not None:
+            reporter.close()
         super().close()
         gpu_connector = getattr(getattr(self, "_engine", None), "gpu_connector", None)
         close = getattr(gpu_connector, "close", None)
@@ -136,6 +139,21 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             rank=rank,
         )
         self.chunk_size = int(cfg.chunk_size)
+        from atom.cache_routing.config import CacheRoutingConfig
+        from atom.cache_routing.native import NativeCPUReporter
+
+        routing_config = CacheRoutingConfig.from_env()
+        self._cpu_reporter = (
+            NativeCPUReporter(
+                self._engine,
+                meta,
+                routing_config,
+                self.chunk_size,
+                self._codec.layout_manifest(),
+            )
+            if routing_config is not None
+            else None
+        )
 
         # ZMQ lookup server so the scheduler process can query our hit counts.
         try:
@@ -331,6 +349,9 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         mask = torch.ones(len(toks), dtype=torch.bool)
         mask[:skip] = False
 
+        reporter = getattr(self, "_cpu_reporter", None)
+        if reporter is not None:
+            reporter.bind(toks)
         tok_tensor = tokens_to_tensor(toks)
         t_store0 = time.perf_counter()
         self._reset_gpu_connector_transfer_stats()

@@ -337,17 +337,6 @@ impl AtomStandaloneRouter {
         Self::py_to_json(&item)
     }
 
-    fn python_type_name(&self) -> String {
-        Python::attach(|py| {
-            self.service
-                .bind(py)
-                .get_type()
-                .name()
-                .map(|name| name.to_string())
-                .unwrap_or_else(|_| "unknown".to_string())
-        })
-    }
-
     fn close_service(&self, reason: &'static str) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
@@ -398,6 +387,22 @@ impl RouterTrait for AtomStandaloneRouter {
 
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
         match self.call_service("server_info", &json!({}), "server info") {
+            Ok(value) => Json(value).into_response(),
+            Err(response) => response,
+        }
+    }
+
+    async fn render_tokens(&self, chat: bool, body: &Value) -> Response {
+        let method = if chat { "render_chat_completions" } else { "render_completions" };
+        match self.call_service(method, body, "exact render") {
+            Ok(value) => Json(value).into_response(),
+            Err(response) => response,
+        }
+    }
+
+    async fn cache_control(&self, req: Request<Body>) -> Response {
+        let path = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("");
+        match self.call_service("cache_control", &json!({"path": path}), "cache catalog") {
             Ok(value) => Json(value).into_response(),
             Err(response) => response,
         }

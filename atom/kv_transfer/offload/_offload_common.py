@@ -681,10 +681,9 @@ class OffloadSchedulerMixin(ABC):
           can never load, only fail.
         """
 
-        hit = int(hit)
-        if hit == int(num_prompt):
-            hit -= 1
-        return self._chunk_floor(hit)
+        from atom.cache_routing.planner import loadable_prefix
+
+        return loadable_prefix(int(hit), int(num_prompt), int(self.chunk_size or 256))
 
     def _repeat_load_suppressed(self, seq, sid: str) -> bool:
         """True once this request has spent its one external-tier attempt.
