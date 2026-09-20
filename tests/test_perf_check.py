@@ -1178,3 +1178,91 @@ def test_every_job_below_the_gate_reads_the_gate_decision():
             f"{name} lists the gate in `needs` but never reads its decision, "
             "so it runs on unlabelled PRs"
         )
+
+
+# --- matrix builder -------------------------------------------------------
+# The matrix is built by a script rather than inline in the workflow so these
+# can exist at all; `minimax-m3-mxfp8` (the catalog calls it `m3-mxfp8`) is the
+# mistake that motivated it, and it cost a full GPU run to find.
+
+MATRIX_PY = SCRIPTS / "build_perf_check_matrix.py"
+
+MATRIX_ENV = {
+    "PERF_MODELS": "deepseek-v4-pro,kimi-k3,m3-mxfp8,glm-5-2-fp8",
+    "PERF_ISL": "8192",
+    "PERF_OSL": "1024",
+    "PERF_RATIO": "0.8",
+    "PERF_JUDGING_CONCS": "64,128,256",
+    "PERF_REFERENCE_CONCS": "4",
+}
+
+
+def _run_matrix(**overrides):
+    env = {**os.environ, **MATRIX_ENV, **overrides}
+    env.pop("GITHUB_OUTPUT", None)  # emit to stdout instead
+    return subprocess.run(
+        [sys.executable, str(MATRIX_PY)],
+        cwd=REPO,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_matrix_is_the_agreed_set():
+    """Five entries across four levels, and the MTP3 pair alongside its base."""
+    proc = _run_matrix()
+    assert proc.returncode == 0, proc.stderr
+    cells = json.loads(proc.stdout)
+    assert len(cells) == 20
+    by_entry = {}
+    for c in cells:
+        by_entry.setdefault(c["prefix"] + c["suffix"], []).append(c["conc"])
+    assert set(by_entry) == {
+        "deepseek-v4-pro",
+        "deepseek-v4-pro-mtp3",
+        "kimi-k3",
+        "m3-mxfp8",
+        "glm-5-2-fp8",
+    }
+    for entry, concs in by_entry.items():
+        assert sorted(concs) == [4, 64, 128, 256], entry
+
+
+def test_matrix_names_an_unknown_prefix():
+    """A typo must say which name is wrong, not just that a count is short."""
+    proc = _run_matrix(PERF_MODELS="deepseek-v4-pro,minimax-m3-mxfp8")
+    assert proc.returncode == 1
+    assert "minimax-m3-mxfp8" in proc.stderr
+    assert "not a catalog prefix" in proc.stderr
+
+
+def test_matrix_names_the_level_a_variant_cannot_reach():
+    """A band that excludes a level is not a missing variant, and says so.
+
+    Every DPA/TBO variant has `conc_min` at 64 or above, so adding one while a
+    reference level below that is configured builds a short matrix. The message
+    has to point at the band rather than at the entry, which is present.
+    """
+    proc = _run_matrix(PERF_MODELS="deepseek-v4-pro", PERF_REFERENCE_CONCS="4")
+    assert proc.returncode == 0, proc.stderr  # base and MTP3 both reach c=4
+
+    import build_perf_check_matrix as bpm
+
+    keep = bpm.selected_variants({"deepseek-v4-pro"})
+    assert keep == {("deepseek-v4-pro", ""), ("deepseek-v4-pro", "-mtp3")}
+    assert bpm.selected_variants({"kimi-k3"}) == {("kimi-k3", "")}
+
+
+def test_matrix_rejects_a_renamed_pair_variant():
+    """Half a pair silently vanishing is the failure the pair exists to catch."""
+    import build_perf_check_matrix as bpm
+
+    problems = bpm.check_against_catalog(
+        str(REPO / ".github" / "benchmark" / "models.json"),
+        {"deepseek-v4-pro"},
+        {("deepseek-v4-pro", ""), ("deepseek-v4-pro", "-no-such-variant")},
+    )
+    assert len(problems) == 1
+    assert "-no-such-variant" in problems[0]

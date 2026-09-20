@@ -148,56 +148,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Server args, env vars, model paths and result filenames all come from
+      # models.json via catalog.py -- the same source the nightly matrix uses.
+      # The nightly calls build_benchmark_matrix.py for this; the perf check
+      # calls its sibling. Neither builds a matrix inline: workflow YAML is not
+      # testable, and `minimax-m3-mxfp8` (the catalog calls it `m3-mxfp8`) is
+      # what a matrix that silently builds too few cells looks like -- every GPU
+      # job still runs, and the shortfall surfaces at the judge, as `partial`.
       - name: Derive cells from the benchmark catalog
         id: build
-        run: |
-          set -euo pipefail
-          # Server args, env vars, model paths and result filenames all come
-          # from models.json via catalog.py -- the same source the nightly
-          # matrix uses. Hard-coding them here would fork the definition of what
-          # each model *is* and drift the moment someone tunes a flag.
-          python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json, os, sys
-          sys.path.insert(0, ".github/scripts")
-          import catalog
-
-          raw = os.environ["PERF_JUDGING_CONCS"] + "," + \
-                os.environ.get("PERF_REFERENCE_CONCS", "")
-          concs = [c for c in (x.strip() for x in raw.split(",")) if c]
-          isl, osl = os.environ["PERF_ISL"], os.environ["PERF_OSL"]
-          ratio = os.environ["PERF_RATIO"]
-          param_lists = ";".join(f"{isl},{osl},{c},{ratio}" for c in concs)
-
-          wanted = set(os.environ["PERF_MODELS"].split(","))
-          cells = catalog.build_cells(
-              ".github/benchmark/models.json",
-              param_lists=param_lists,
-              model_filter=wanted,
-          )
-          # Base variant for every selected model, plus DeepSeek-V4-Pro MTP3
-          # when that model is in play: base and MTP3 as a pair separate a
-          # speculative-decoding regression from a model-wide one.
-          keep = {(p, "") for p in wanted}
-          if "deepseek-v4-pro" in wanted:
-              keep.add(("deepseek-v4-pro", "-mtp3"))
-          cells = [c for c in cells if (c["prefix"], c["suffix"]) in keep]
-          if len(cells) != len(concs) * len(keep):
-              # Fail here rather than warn. A name that is not in the catalog
-              # builds fewer cells, and every GPU job still runs; the shortfall
-              # only surfaces at the judge, as `partial`, which reads like a job
-              # died rather than like a typo. `minimax-m3-mxfp8` did exactly
-              # that -- the catalog calls it `m3-mxfp8`. This step is free.
-              built = sorted({c["prefix"] + c["suffix"] for c in cells})
-              missing = sorted({p + s for p, s in keep} - set(built))
-              print(
-                  f"::error::expected {len(concs) * len(keep)} cells, built "
-                  f"{len(cells)}; missing entries: {missing or 'none'} "
-                  f"(check PERF_MODELS against catalog prefixes)",
-                  file=sys.stderr,
-              )
-              sys.exit(1)
-          print(f"cells={json.dumps(cells)}")
-          PY
+        run: python3 .github/scripts/build_perf_check_matrix.py
         env:
           PERF_MODELS: ${{ env.PERF_MODELS }}
           PERF_ISL: ${{ env.PERF_ISL }}
