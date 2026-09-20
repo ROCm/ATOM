@@ -120,6 +120,35 @@ def test_resolve_backend_falls_back_to_forward_batch(monkeypatch):
     assert SGLangGDNForwardContext._resolve_attn_backend(forward_batch) is batch_backend
 
 
+def test_decode_fallback_marks_num_padding_rows_as_zero_length():
+    pool = _MambaPool()
+    forward_batch = SimpleNamespace(
+        forward_mode=_DecodeMode(),
+        batch_size=4,
+        req_pool_indices=torch.tensor([-6, -2, -10, 99], dtype=torch.int32),
+        req_to_token_pool=pool,
+        num_padding=1,
+    )
+    linear_backend = SimpleNamespace(
+        forward_metadata=None,
+        req_to_token_pool=pool,
+    )
+
+    metadata = SGLangGDNForwardContext._build_gdn_metadata(
+        forward_batch, linear_backend
+    )
+
+    assert metadata is not None
+    assert torch.equal(
+        metadata.non_spec_query_start_loc,
+        torch.tensor([0, 1, 2, 3, 3], dtype=torch.int32),
+    )
+    assert torch.equal(
+        metadata.non_spec_state_indices_tensor,
+        torch.tensor([4, 8, 0, -1], dtype=torch.int32),
+    )
+
+
 def test_decode_fallback_marks_cuda_graph_padding_as_zero_length():
     pool = _MambaPool()
     forward_batch = SimpleNamespace(

@@ -441,6 +441,7 @@ class Qwen4ExpLinearAttention(nn.Module):
             activation=self.activation,
             layer_num=extract_layer_index(prefix),
             prefix=prefix,
+            allow_aiter_flydsl=True,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

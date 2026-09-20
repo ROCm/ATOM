@@ -45,6 +45,8 @@ def _positive_float_env(name: str, default: str) -> float:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
+    "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
@@ -232,7 +234,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # max_num_batched_tokens, so a fixed row count would not adapt to total_kv
     # (see GLM-5.2 OOM #1376) — a memory budget does. Each chunk still scores
     # the full KV, so every row's top-k is exact (no cross-chunk merge). Set to
-    # 0 to disable chunking (always single-shot).
+    # 0 to disable this soft budget; chunking still enforces aiter's hard 2 GiB
+    # buffer-descriptor cap, above which the kernel fails to compile and aborts
+    # the process (see atom/model_ops/sparse_indexer_chunk.py).
     "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB": lambda: int(
         os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "2048")
     ),
@@ -497,6 +501,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FORCE_V4_PREFILL_OPUS": lambda: (
         os.getenv("ATOM_FORCE_V4_PREFILL_OPUS", "0") == "1"
     ),
+    # Reuse the gfx1250 H=128 sparse-prefill ASM kernel for DeepSeek-V4 fp8
+    # decode. Ineligible shapes keep the dedicated decode ASM path.
+    "ATOM_USE_V4_PREFILL_ASM_FOR_DECODE": lambda: (
+        os.getenv("ATOM_USE_V4_PREFILL_ASM_FOR_DECODE", "0") == "1"
+    ),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
@@ -628,6 +637,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_KV_EVENTS_ENDPOINT", "tcp://127.0.0.1:5557"
     ),
     "ATOM_KV_EVENTS_TOPIC": lambda: os.getenv("ATOM_KV_EVENTS_TOPIC", ""),
+    # ROUTER endpoint for the replay socket; empty string disables replay.
+    "ATOM_KV_EVENTS_REPLAY_ENDPOINT": lambda: os.getenv(
+        "ATOM_KV_EVENTS_REPLAY_ENDPOINT", ""
+    ),
+    # Size of the replay ring buffer (distinct from the send queue depth).
+    "ATOM_KV_EVENTS_REPLAY_BUFFER_STEPS": lambda: int(
+        os.getenv("ATOM_KV_EVENTS_REPLAY_BUFFER_STEPS", "10000") or "10000"
+    ),
     "ATOM_KV_EVENTS_HWM": lambda: int(os.getenv("ATOM_KV_EVENTS_HWM", "0") or "0"),
     "ATOM_KV_EVENTS_BUFFER_STEPS": lambda: int(
         os.getenv("ATOM_KV_EVENTS_BUFFER_STEPS", "10000") or "10000"

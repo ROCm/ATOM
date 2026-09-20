@@ -49,6 +49,49 @@ PA_GLUON_MAX_QUERY_LEN = 4
 PA_GLUON_MAX_QUERY_GROUP_SIZE = 64
 PA_ASM_MAX_QUERY_GROUP_SIZE = 16
 
+# Both are fits on a 256-CU gfx950 and do not scale with the machine, unlike the
+# heuristic they bound. TARGET_WG: past it the extra splits only add reduce work.
+# MAX is two separate bounds that happen to agree on a number no larger than 32:
+# temporary_output is bf16, so each split adds a round trip through the PS
+# combine, and the worst shape measured drifts 20pp further from an fp32
+# reference at 64 than at 8; and 64 is where the C++ PS reduce stops being built
+# at all, with no working fallback under it (see the test that pins this).
+PA_DENSE_SPLIT_TARGET_WG = 128
+PA_DENSE_SPLIT_MAX = 32
+
+
+def dense_decode_splits(num_seqs: int, num_kv_heads: int) -> int:
+    """KV splits for the dense paged decode.
+
+    aiter's heuristic ends in a flat min(..., 8): at batch 1 it computes 512 and
+    returns 8, leaving a call that reads the whole context on 3% of the machine.
+
+    A function of the grid alone, deliberately not of the context length: decode
+    runs under a cuda graph, where max_seqlen_k is the model limit rather than the
+    real length, so a context term is inert in production and would only over-split
+    short requests (+114% measured on a 2K one).
+
+    Only the dense path is routed here. The two MiniMax-M3 sparse call sites are
+    excluded on purpose -- their context is a fixed topk window and their num_seqs
+    already folds the query tokens in -- as is the vLLM bridge's own copy of this
+    dispatch, which is untested against this.
+    """
+    from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
+
+    n = max(1, int(num_seqs) * int(num_kv_heads))
+    # Power of two, and only the term added here: the PS reduce compiles one
+    # variant per distinct count, and a continuous cdiv adds 11 of them that no
+    # sweep ever measured. Rounding the RESULT would drop below the heuristic
+    # wherever it returns 3, 5, 6 or 7.
+    boost = min(PA_DENSE_SPLIT_MAX, triton.cdiv(PA_DENSE_SPLIT_TARGET_WG, n))
+    boost = 1 << (boost.bit_length() - 1)
+    # The ceiling clamps the result as well. Staying at or above the heuristic is
+    # a preference; staying inside what the reduce was built for is not.
+    return min(
+        PA_DENSE_SPLIT_MAX,
+        max(get_recommended_splits(num_seqs, num_kv_heads), boost),
+    )
+
 
 def gluon_decode_over_limit(max_qlen: int, num_heads: int, num_kv_heads: int) -> bool:
     """Whether decode is past what the gluon kernel takes.
