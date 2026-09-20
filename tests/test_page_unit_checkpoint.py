@@ -380,3 +380,323 @@ def test_a_store_refuses_when_the_policy_leaves_the_loop_short():
 
     assert store._next_checkpoint_id == before, "a refused store took an identity"
     assert len(store.records) == 100
+
+
+# ── offloading a checkpoint to the CPU tier ───────────────────────────────
+
+
+def offload_store(**kw):
+    pool, store = make_store(**kw)
+    store._offload_sink = True
+    return pool, store
+
+
+class TestOffloadNomination:
+    """READY nominates; `take_offload_stores` is what pins.
+
+    Splitting the two is the whole design. A pin lives in the engine process
+    while the D2H runs in the worker, so it spans several scheduler passes;
+    pinning at READY would make EVERY checkpoint un-evictable for that window
+    and break the one thing #2045's admission argument rests on -- that a READY
+    unpinned checkpoint counts as available to live KV.
+    """
+
+    def test_reaching_ready_nominates_without_pinning(self):
+        _pool, store = offload_store()
+        cid, _op = ready(store, 11)
+        assert store.records[cid].pin_count == 0
+        assert store._is_evictable(cid), "a nominee must still be spendable"
+
+    def test_handing_it_over_is_what_pins(self):
+        _pool, store = offload_store()
+        cid, _op = ready(store, 11)
+        stores = store.take_offload_stores(max_inflight=4)
+        [(op, unit_ids)] = stores
+        assert (op.prefix_hash, unit_ids) == (11, store.records[cid].unit_ids)
+        assert store.records[cid].pin_count == 1
+        assert not store._is_evictable(cid)
+
+    def test_a_nominee_the_pool_needed_more_is_simply_gone(self):
+        """Nomination deliberately leaves it spendable, so `_next_victim` may
+        take it. Losing a CPU copy is the right price for never making the
+        pool wait on the tier."""
+        _pool, store = offload_store()
+        cid, _op = ready(store, 11)
+        store._evict(cid)
+        assert store.take_offload_stores(max_inflight=4) == []
+
+    def test_no_sink_nominates_nothing(self):
+        """A pin nobody can release holds a whole image out of the pool
+        forever, so a deployment with no tier must take none."""
+        _pool, store = make_store()  # _offload_sink defaults False
+        ready(store, 11)
+        assert store.take_offload_stores(max_inflight=4) == []
+
+    def test_it_is_offered_once(self):
+        _pool, store = offload_store()
+        ready(store, 11)
+        assert len(store.take_offload_stores(max_inflight=4)) == 1
+        assert store.take_offload_stores(max_inflight=4) == []
+
+
+class TestOffloadInflightCap:
+    """The cap is what bounds how much of the pool a slow backend can hold."""
+
+    def test_over_the_cap_the_rest_wait_rather_than_drop(self):
+        _pool, store = offload_store(num_units=40)
+        for h in (11, 12, 13):
+            ready(store, h)
+        first = store.take_offload_stores(max_inflight=2)
+        assert len(first) == 2
+        # The third is still nominated, unpinned, and offered again next pass.
+        assert store.take_offload_stores(max_inflight=2) == []
+        store.settle_offload_store(first[0][0])
+        assert len(store.take_offload_stores(max_inflight=2)) == 1
+
+    def test_a_waiting_nominee_stays_evictable(self):
+        _pool, store = offload_store(num_units=40)
+        for h in (11, 12):
+            ready(store, h)
+        store.take_offload_stores(max_inflight=1)
+        waiting = store.lookup(12)
+        assert store._is_evictable(waiting)
+
+
+class TestOffloadPinRelease:
+    def test_success_and_failure_release_identically(self):
+        """The pin keeps the bytes still during the copy, and the copy is over
+        either way. Whether the hash becomes reachable is the index's business."""
+        for _ in range(2):
+            _pool, store = offload_store()
+            cid, _op = ready(store, 11)
+            [(sent, _units)] = store.take_offload_stores(max_inflight=4)
+            store.settle_offload_store(sent)
+            assert store.records[cid].pin_count == 0
+
+    def test_a_report_for_a_hash_never_sent_is_a_no_op(self):
+        from atom.kv_transfer.disaggregation.types import StateStoreOperationId
+
+        _pool, store = offload_store()
+        cid, _op = ready(store, 11)
+        store.settle_offload_store(StateStoreOperationId(11, 1))
+        assert store.records[cid].pin_count == 0
+
+    def test_source_release_frees_units_but_keeps_the_pin(self):
+        """Phase one: the gather drained, so the units go back -- but the store
+        is still dispatched-but-unreported, so the engine must keep polling for
+        its report. Retiring the pin here (as it once did) let liveness read
+        idle while the report still sat undrained, so it was never votable."""
+        _pool, store = offload_store()
+        cid, _op = ready(store, 11)
+        [(sent, _u)] = store.take_offload_stores(max_inflight=4)
+
+        store.release_offload_store_source(sent)
+        assert store.records[cid].pin_count == 0, "no longer pinned for the copy"
+        assert store._is_evictable(cid), "the units are the pool's again"
+        assert store.has_offload_pins(), "still unreported: keep polling"
+        assert store._hash_in_flight(11), "no second store of 11 yet"
+
+        store.settle_offload_store(sent)
+        assert not store.has_offload_pins()
+        assert not store._hash_in_flight(11)
+
+    def test_source_release_is_idempotent_and_does_not_double_free(self):
+        """A second release -- or a release after the report -- must not
+        decrement the record a second time and underflow the pin count."""
+        _pool, store = offload_store()
+        cid, _op = ready(store, 11)
+        [(sent, _u)] = store.take_offload_stores(max_inflight=4)
+        store.release_offload_store_source(sent)
+        store.release_offload_store_source(sent)  # idempotent
+        store.settle_offload_store(sent)
+        store.release_offload_store_source(sent)  # after the report: no pin left
+        assert store.records[cid].pin_count == 0
+
+    def test_a_source_released_store_that_never_reports_is_reclaimed_but_kept(self):
+        """Its units are already back and the reader provably stopped, so a lost
+        report is not the taken-back-source case: nothing is released again (no
+        underflow) and the image is NOT forfeited -- a late report may index."""
+        _pool, store = offload_store()
+        cid, _op = ready(store, 11)
+        [(sent, _u)] = store.take_offload_stores(max_inflight=4)
+        store.release_offload_store_source(sent)
+        assert store.records[cid].pin_count == 0
+
+        assert store.reclaim_stale_offload_pins(timeout_s=1e-9) == 1
+        assert store.records[cid].pin_count == 0, "not released twice"
+        assert not store.was_reclaimed(sent), "source-released bytes are trusted"
+        assert store.offload_pins_reclaimed == 1
+
+    def test_unindex_during_the_copy_holds_the_units_to_the_end(self):
+        """The tier's whole point: the CPU copy outliving the HBM one. So
+        `unindex` must not pull the source out from under a running D2H."""
+        pool, store = offload_store()
+        cid, _op = ready(store, 11)
+        units = store.records[cid].unit_ids
+        [(sent, _units)] = store.take_offload_stores(max_inflight=4)
+
+        store.unindex(11)
+        assert cid in store.records, "the units are still being read"
+        assert all(pool.is_used(u) for u in units)
+
+        store.settle_offload_store(sent)
+        assert cid not in store.records
+        assert not any(pool.is_used(u) for u in units)
+
+    def test_two_generations_of_one_hash_each_settle_their_own_pin(self):
+        """The same prefix is stored again after an eviction or a load miss.
+
+        Keyed by bare hash, the aggregator tombstoned the first store and the
+        second was dropped before quorum -- its pin waited for the stale
+        reclaimer and its bytes were never re-indexed. Each hand-out gets its
+        own generation, so both attempts settle.
+        """
+        _pool, store = offload_store()
+        cid1, _op = ready(store, 11)
+        [(first, _u)] = store.take_offload_stores(max_inflight=4)
+        store.settle_offload_store(first)
+        assert store.records[cid1].pin_count == 0
+
+        store.unindex(11)
+        cid2, _op = ready(store, 11)
+        [(second, _u)] = store.take_offload_stores(max_inflight=4)
+        assert second != first, "a re-store is its own operation"
+        assert second.prefix_hash == first.prefix_hash
+        store.settle_offload_store(second)
+        assert store.records[cid2].pin_count == 0
+
+    def test_a_late_report_from_a_superseded_attempt_settles_nothing(self):
+        """A reclaimed pin's report can still be in flight. It must not release
+        the pin a newer attempt at the same hash is holding."""
+        _pool, store = offload_store()
+        cid, _op = ready(store, 11)
+        [(first, _u)] = store.take_offload_stores(max_inflight=4)
+        assert store.reclaim_stale_offload_pins(timeout_s=1e-9) == 1
+
+        [(second, _u)] = store.take_offload_stores(max_inflight=4) or [(None, None)]
+        if second is None:  # the nomination was drained by the first hand-out
+            store._queue_offload_store(cid, store.records[cid])
+            [(second, _u)] = store.take_offload_stores(max_inflight=4)
+        assert store.records[cid].pin_count == 1
+
+        store.settle_offload_store(first)  # the late one
+        assert store.records[cid].pin_count == 1, "the newer pin still stands"
+        store.settle_offload_store(second)
+        assert store.records[cid].pin_count == 0
+
+    def test_one_hash_may_not_have_two_stores_in_flight(self):
+        """The generation tells sequential attempts apart; it does not license
+        concurrent ones, which would copy the same bytes twice and have the
+        first report unpin what the second is holding."""
+        _pool, store = offload_store()
+        cid, _op = ready(store, 11)
+        assert len(store.take_offload_stores(max_inflight=4)) == 1
+        store._queue_offload_store(cid, store.records[cid])
+        assert store.take_offload_stores(max_inflight=4) == []
+
+    def test_a_reclaimed_store_is_remembered_so_it_cannot_be_indexed(self):
+        """The reclaimer cannot tell a lost report from a worker still inside
+        the gather, so the units come back but the image is forfeited."""
+        _pool, store = offload_store()
+        _cid, _op = ready(store, 11)
+        [(op, _u)] = store.take_offload_stores(max_inflight=4)
+        assert not store.was_reclaimed(op)
+        assert store.reclaim_stale_offload_pins(timeout_s=1e-9) == 1
+        assert store.was_reclaimed(op)
+
+    def test_a_store_that_reported_in_time_is_not_marked_reclaimed(self):
+        _pool, store = offload_store()
+        _cid, _op = ready(store, 11)
+        [(op, _u)] = store.take_offload_stores(max_inflight=4)
+        store.settle_offload_store(op)
+        assert store.reclaim_stale_offload_pins(timeout_s=1e-9) == 0
+        assert not store.was_reclaimed(op)
+
+    def test_a_lost_report_is_reclaimed_and_counted(self):
+        """The pin is in this process and the copy is in the worker, so a
+        crashed worker would otherwise hold an image out of the pool forever."""
+        _pool, store = offload_store()
+        cid, _op = ready(store, 11)
+        store.take_offload_stores(max_inflight=4)
+
+        assert store.reclaim_stale_offload_pins(timeout_s=3600) == 0
+        assert store.reclaim_stale_offload_pins(timeout_s=-1) == 0, "disabled"
+        assert store.reclaim_stale_offload_pins(timeout_s=0.0) == 0, "disabled"
+
+        assert store.reclaim_stale_offload_pins(timeout_s=1e-9) == 1
+        assert store.records[cid].pin_count == 0
+        assert store.offload_pins_reclaimed == 1
+        # And recovery is total: the record is spendable again, unbroken.
+        assert store._is_evictable(cid)
+        assert store.lookup(11) == cid
+
+
+class TestTheTierVotes:
+    """`resumable_hit` accepts a boundary the CPU tier holds, not just HBM.
+
+    This is what makes the whole tier reachable: without it a hash whose image
+    went to LMCache is invisible to `can_allocate`, and the bytes are written
+    and never read.
+    """
+
+    class _Index:
+        def __init__(self, *hashes):
+            self.hashes = set(hashes)
+
+        def could_serve(self, h):
+            return h in self.hashes
+
+    @staticmethod
+    def coordinator(num_units=40, offload=None):
+        from atom.model_engine.page_unit_checkpoint import (
+            PagedStateCheckpointCoordinator,
+            PagedStateCheckpointSpec,
+        )
+
+        c = PagedStateCheckpointCoordinator(
+            BlockPool(num_units),
+            PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25),
+            enabled=True,
+        )
+        if offload is not None:
+            c.attach_offload(offload)
+        return c
+
+    @staticmethod
+    def seq():
+        from types import SimpleNamespace
+
+        return SimpleNamespace(has_per_req_cache=True)
+
+    def test_a_hash_only_the_tier_holds_is_accepted(self):
+        c = self.coordinator(offload=self._Index(77))
+        assert c.resumable_hit(self.seq(), 3, [11, 77, 99]) == 2
+
+    def test_without_a_tier_it_is_not(self):
+        c = self.coordinator()
+        assert c.resumable_hit(self.seq(), 3, [11, 77, 99]) == 0
+
+    def test_the_scan_still_takes_the_rightmost_boundary(self):
+        """Both tiers are keyed by the same content hash, so no preference rule
+        is needed -- and `_attach_state_slots` tries HBM first regardless."""
+        c = self.coordinator(offload=self._Index(11, 99))
+        assert c.resumable_hit(self.seq(), 3, [11, 77, 99]) == 3
+
+    def test_attaching_turns_on_the_vote_and_the_sink_together(self):
+        """Half-attached is worse than off: a vote with no sink accepts hashes
+        nothing ever stores; a sink with no vote pins units nothing reads."""
+        c = self.coordinator()
+        assert c.offload is None and c.store._offload_sink is False
+        c.attach_offload(self._Index())
+        assert c.offload is not None and c.store._offload_sink is True
+
+    def test_the_tier_half_is_optimistic_on_purpose(self):
+        """`hashes` means "was stored once", never "is still there" -- LMCache's
+        own LRU can drop bytes under it. A false positive costs one park plus a
+        recompute and retracts itself; being certain would cost a synchronous
+        cross-process lookup on the admission path."""
+        index = self._Index(77)
+        c = self.coordinator(offload=index)
+        assert c.resumable_hit(self.seq(), 3, [11, 77, 99]) == 2
+        index.hashes.discard(77)  # what `fail_load` -> `forget` does
+        assert c.resumable_hit(self.seq(), 3, [11, 77, 99]) == 0

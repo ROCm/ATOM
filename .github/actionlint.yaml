@@ -5,6 +5,7 @@ self-hosted-runner:
     - atom-mi355-8gpu.predownload
     - atom-mi355-8gpu-aac-runner
     - atom-mi355-8gpu-vllm-sgl-ci
+    - spur-runner-mi355x-8gpu
     - atom-mi308-8gpu-plugins-accuracy
     - atom-mi308-8gpu-plugins-benchmark
     - atom-mi308-8gpu-vllm-sgl-ci

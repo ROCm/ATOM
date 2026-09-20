@@ -69,6 +69,22 @@ def normalize_chat_tools(tools: Any) -> Any:
     return normalized
 
 
+def _tool_parser_for_request(parser_cls, tools):
+    """Return the parser this request actually needs.
+
+    A no-tools request cannot produce a dispatchable tool call. Disable parsers
+    whose markers only open tool-call regions so an unclosed marker remains
+    ordinary content instead of withholding the stream until EOS. Parsers that
+    consume model-wide channel framing must remain active without tools.
+    """
+    if parser_cls is None or tools:
+        return parser_cls
+    consumes_channel_framing = any(
+        not parser_cls.opens_region(marker) for marker in parser_cls.START_MARKERS
+    )
+    return parser_cls if consumes_channel_framing else None
+
+
 def resolve_thinking(request: ChatCompletionRequest) -> tuple[bool | None, str | None]:
     """Resolve (enabled, effort) from the request's thinking / reasoning_effort.
 
@@ -256,7 +272,7 @@ async def stream_chat_response(
     reasoning_filter = reasoning.stream()
     tool_parser = ToolCallStreamParser(
         tools=tools,
-        parser_cls=tool_parser_cls,
+        parser_cls=_tool_parser_for_request(tool_parser_cls, tools),
         suppress_calls=forbids_tool_calls(tool_choice),
     )
     has_tool_calls = False
@@ -394,7 +410,7 @@ def _build_chat_choice(
     content, tool_calls = parse_tool_calls(
         content_with_tools,
         tools,
-        parser_cls=tool_parser_cls,
+        parser_cls=_tool_parser_for_request(tool_parser_cls, tools),
         suppress_calls=forbids_tool_calls(tool_choice),
     )
 
@@ -558,7 +574,7 @@ async def stream_chat_response_fanout(
     tool_parsers = [
         ToolCallStreamParser(
             tools=tools,
-            parser_cls=tool_parser_cls,
+            parser_cls=_tool_parser_for_request(tool_parser_cls, tools),
             suppress_calls=forbids_tool_calls(tool_choice),
         )
         for _ in range(n)

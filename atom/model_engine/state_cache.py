@@ -60,8 +60,58 @@ class StateCache(Protocol):
     #:         a `StateTransfer` rather than a bare token count.
     successor_room: float
 
+    #: Whether this class can snapshot a boundary *inside* a forward instead of
+    #: only at the forward's last token.
+    #:
+    #: True changes where the ladder's cost is paid, not what a checkpoint is
+    #: worth. A class that answers false forces the scheduler to end a forward
+    #: exactly on each rung (`BlockManager.checkpoint_cut`), so a prompt with N
+    #: rungs on it is N shortened prefill chunks; one that answers true reads
+    #: each rung out of intermediates its kernel already materialized, so the
+    #: same N rungs are N copies inside one full-length forward.
+    #:
+    #: Independent of `successor_room`. That says what the forward *after* a
+    #: checkpoint owes it; this says where within *this* forward it can be taken
+    #: at all. A rolling class can be either — GDN forks and is readable — and so
+    #: can a copying one, so neither implies the other.
+    readable_midstep: bool
+
     def applies(self, seq: Sequence) -> bool:
         """Whether this class gates or checkpoints anything for `seq`."""
+        ...
+
+    def reserve_midstep(
+        self, seq: Sequence, positions: list[tuple[int, int]]
+    ) -> list[tuple]:
+        """Take a destination for each `(position, hash)` the next forward covers.
+
+        Returns `(destination, position, hash)` per reservation made, for the
+        runner to write into and `publish_midstep` to file. Empty — not an
+        error — for a class that is not `readable_midstep`, so the call site
+        needs no branch.
+
+        Best-effort and order-preserving: reservations stop at the first one
+        capacity cannot fill, so the earliest position survives a shortage.
+        """
+        ...
+
+    def publish_midstep(self, reservations: list[tuple], seq: Sequence = None) -> None:
+        """File reservations whose bytes the completed forward has now written.
+
+        The other half of `reserve_midstep`, and the split is the point:
+        publishing before the forward would index a boundary over bytes nobody
+        had written, and a request resuming there would read the destination's
+        previous tenant.
+
+        `seq` lets an implementation tell this prompt's own end — the position
+        the next turn actually resumes at — from the ladder and demand rungs,
+        which only guess. Optional: a class that ranks its checkpoints equally
+        ignores it.
+        """
+        ...
+
+    def cancel_midstep(self, reservations: list[tuple]) -> None:
+        """Release reservations whose forward never ran, holding nothing."""
         ...
 
     def resumable_hit(

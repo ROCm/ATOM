@@ -37,11 +37,21 @@ def merge_attn_states(
         prefill_tokens_with_context = num_tokens
 
     # TODO(woosuk): Use CUDA kernel instead of Triton to minimize CPU overhead.
-    # num_warps=1: one program owns a single [HEAD_SIZE] row, so the default
-    # num_warps=4 spreads 128 elements over 256 lanes -- half idle, 2 B each.
-    # aiter hit the same shape in its stage-2 MLA merge and measured 1.7-1.9x
-    # from num_warps=1 on gfx950 (op_tests/test_mla_stage2_merge.py header).
-    merge_attn_states_kernel[(num_tokens, num_query_heads)](
+    #
+    # BLOCK_H heads per program instead of one. With one head per program a
+    # program owns a single [HEAD_SIZE] row -- 256 B for the MLA shape -- which
+    # is 4 B/lane over a 64-lane wave, a quarter of what a dwordx4 load wants,
+    # and it launches num_tokens*num_query_heads (385k at bs=4/MNBT=3072)
+    # single-wave workgroups. Both cost the same thing: measured 39.3% of HBM
+    # peak. BLOCK_H=8 widens the access to 32 B/lane and cuts the launch count
+    # 8x, reaching 76.7% of peak -- 1.95x, against a 2.25x pure-traffic ceiling
+    # (benchmark/merge_headroom.py in the perf log repo).
+    #
+    # num_warps=1 stays: with BLOCK_H*HEAD_SIZE = 1024 elements a single wave
+    # already issues wide loads, and more warps only split the row again
+    # (BLOCK_H=2 with num_warps=4 measured 0.72x, i.e. slower than before).
+    BLOCK_H = min(8, triton.next_power_of_2(num_query_heads))
+    merge_attn_states_kernel[(num_tokens, triton.cdiv(num_query_heads, BLOCK_H))](
         output,
         output_lse,
         prefix_output,
@@ -51,8 +61,11 @@ def merge_attn_states(
         prefix_head_stride,
         output_head_stride,
         output_scale,
+        num_tokens,
+        num_query_heads,
         head_size,
         padded_head_size,
+        BLOCK_H,
         output_lse is not None,
         prefill_tokens_with_context,
         output_scale is not None,
@@ -71,8 +84,11 @@ def merge_attn_states_kernel(
     prefix_head_stride,
     output_head_stride,
     output_scale,  # scale tensor or None
+    num_tokens,
+    num_heads,
     HEAD_SIZE: tl.constexpr,
     PADDED_HEAD_SIZE: tl.constexpr,
+    BLOCK_H: tl.constexpr,
     OUTPUT_LSE: tl.constexpr,
     prefill_tokens_with_context: tl.constexpr,
     USE_FP8: tl.constexpr,
@@ -80,57 +96,67 @@ def merge_attn_states_kernel(
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
     token_idx = tl.program_id(0)
-    num_tokens = tl.num_programs(0)
-    head_idx = tl.program_id(1)
-    num_heads = tl.num_programs(1)
+    head_idx = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    # num_heads need not divide BLOCK_H (TP can leave an odd count), and the
+    # tail programs must not touch the next token's rows.
+    head_valid = head_idx < num_heads
 
     prefix_mask = token_idx < prefill_tokens_with_context
 
     head_arange = tl.arange(0, PADDED_HEAD_SIZE)
-    head_mask = head_arange < HEAD_SIZE
+    # [BLOCK_H, PADDED_HEAD_SIZE] -- guards the head tail and the head_size
+    # padding at once.
+    head_mask = head_valid[:, None] & (head_arange < HEAD_SIZE)[None, :]
+
+    # 64-bit offsets. token_idx*num_heads*head_stride walks the whole output
+    # tensor, so it reaches num_tokens*num_heads*head_size -- 2.15e9 at
+    # MBT=131072 with 128 heads of 128, just past int32. program_id and the
+    # strides are all int32, so the product used to wrap there; widening the two
+    # indices once promotes every offset below and costs only address VALU.
+    t64 = token_idx.to(tl.int64)
+    h64 = head_idx.to(tl.int64)
+
+    lse_off = h64 * num_tokens + t64
+    suf_off = (
+        t64 * num_heads * prefix_head_stride
+        + h64[:, None] * prefix_head_stride
+        + head_arange[None, :]
+    )
+    out_off = (
+        t64 * num_heads * output_head_stride
+        + h64[:, None] * output_head_stride
+        + head_arange[None, :]
+    )
 
     # For tokens without context (token_idx >= prefill_tokens_with_context),
     # directly copy from suffix_output
     if not prefix_mask:
-        s_lse = tl.load(suffix_lse + head_idx * num_tokens + token_idx)
+        s_lse = tl.load(suffix_lse + lse_off, mask=head_valid)
         if OUTPUT_LSE:
-            tl.store(output_lse + head_idx * num_tokens + token_idx, s_lse)
+            tl.store(output_lse + lse_off, s_lse, mask=head_valid)
 
-        s_out = tl.load(
-            suffix_output
-            + token_idx * num_heads * prefix_head_stride
-            + head_idx * prefix_head_stride
-            + head_arange,
-            mask=head_mask,
-        )
+        s_out = tl.load(suffix_output + suf_off, mask=head_mask)
 
         if USE_FP8:
             s_out = s_out * (1.0 / tl.load(output_scale))
             s_out = tl.clamp(s_out, FP8_MIN, FP8_MAX)
             s_out = s_out.to(output.dtype.element_ty)
 
-        tl.store(
-            output
-            + token_idx * num_heads * output_head_stride
-            + head_idx * output_head_stride
-            + head_arange,
-            s_out,
-            mask=head_mask,
-        )
+        tl.store(output + out_off, s_out, mask=head_mask)
         return
 
     # For tokens with context (token_idx < prefill_tokens_with_context),
     # perform normal merge operation
-    p_lse = tl.load(prefix_lse + head_idx * num_tokens + token_idx)
-    s_lse = tl.load(suffix_lse + head_idx * num_tokens + token_idx)
+    p_lse = tl.load(prefix_lse + lse_off, mask=head_valid)
+    s_lse = tl.load(suffix_lse + lse_off, mask=head_valid)
 
     # FA2 and FA3 have different behavior for when the sum-exp is 0, this namely
     # arises with 0 len seqlens. FA3 returns -inf here while FA2 returns inf.
     # If we see an inf assume FA2 and convert inf to -inf for consistency
     # and correctness. Inf generally doesn't make sense in this context outside
     # of undefined-behavior/FA2-case, so I think this a safe assumption.
-    p_lse = float("-inf") if p_lse == float("inf") else p_lse
-    s_lse = float("-inf") if s_lse == float("inf") else s_lse
+    p_lse = tl.where(p_lse == float("inf"), float("-inf"), p_lse)
+    s_lse = tl.where(s_lse == float("inf"), float("-inf"), s_lse)
 
     max_lse = tl.maximum(p_lse, s_lse)
     # Both prefix AND suffix are empty for this token (no KV on either side) ->
@@ -152,22 +178,10 @@ def merge_attn_states_kernel(
 
     if OUTPUT_LSE:
         out_lse = tl.where(both_empty, float("-inf"), tl.log(out_se) + safe_max)
-        tl.store(output_lse + head_idx * num_tokens + token_idx, out_lse)
+        tl.store(output_lse + lse_off, out_lse, mask=head_valid)
 
-    p_out = tl.load(
-        prefix_output
-        + token_idx * num_heads * prefix_head_stride
-        + head_idx * prefix_head_stride
-        + head_arange,
-        mask=head_mask,
-    )
-    s_out = tl.load(
-        suffix_output
-        + token_idx * num_heads * prefix_head_stride
-        + head_idx * prefix_head_stride
-        + head_arange,
-        mask=head_mask,
-    )
+    p_out = tl.load(prefix_output + suf_off, mask=head_mask)
+    s_out = tl.load(suffix_output + suf_off, mask=head_mask)
 
     # NOTE(woosuk): Be careful with the numerical stability.
     # We should compute the scale first, and then multiply it with the output.
@@ -175,8 +189,9 @@ def merge_attn_states_kernel(
     # both_empty -> out_se == 0; guard the denominator so the scale is 0/1=0
     # (not 0/0=NaN). p_out/s_out are 0 for empty attention, so out stays 0.
     safe_out_se = tl.where(both_empty, 1.0, out_se)
-    p_scale = p_se / safe_out_se
-    s_scale = s_se / safe_out_se
+    # scales are per (head,) -- broadcast over the head_size axis.
+    p_scale = (p_se / safe_out_se)[:, None]
+    s_scale = (s_se / safe_out_se)[:, None]
     out = p_out * p_scale + s_out * s_scale
 
     if USE_FP8:
@@ -184,11 +199,4 @@ def merge_attn_states_kernel(
         out = tl.clamp(out, FP8_MIN, FP8_MAX)
         out = out.to(output.dtype.element_ty)
 
-    tl.store(
-        output
-        + token_idx * num_heads * output_head_stride
-        + head_idx * output_head_stride
-        + head_arange,
-        out,
-        mask=head_mask,
-    )
+    tl.store(output + out_off, out, mask=head_mask)

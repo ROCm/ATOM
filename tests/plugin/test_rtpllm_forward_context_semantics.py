@@ -14,35 +14,62 @@ class _KwargsObject:
 
 
 def _install_forward_context_stubs():
-    sys.modules["atom.config"].get_current_atom_config = lambda: sys.modules[
-        "atom.config"
-    ].Config()
+    """Stub the heavy deps `atom.plugin.rtpllm...forward_context` imports.
 
-    attention_gdn = types.ModuleType("atom.model_ops.attention_gdn")
+    Returns the `sys.modules` entries it displaced so the caller can put them
+    back. Restoring matters: these are real modules other test files import,
+    and a stub left in `sys.modules` makes the genuine one unreachable for the
+    rest of the session. `from atom.model_ops.attentions.gdn_attn import
+    GDNStateMixin` then fails with "unknown location" -- an import error whose
+    text points at the imported module and says nothing about this file.
+    """
+    displaced = {}
+
+    def stub(name, module):
+        displaced[name] = sys.modules.get(name)
+        sys.modules[name] = module
+        return module
+
+    config = sys.modules["atom.config"]
+    config_attr = getattr(config, "get_current_atom_config", None)
+    config.get_current_atom_config = lambda: config.Config()
+
+    attention_gdn = stub(
+        "atom.model_ops.attention_gdn",
+        types.ModuleType("atom.model_ops.attention_gdn"),
+    )
     attention_gdn.GatedDeltaNet = type("GatedDeltaNet", (), {})
-    sys.modules["atom.model_ops.attention_gdn"] = attention_gdn
 
-    paged_attention = types.ModuleType("atom.model_ops.paged_attention")
+    paged_attention = stub(
+        "atom.model_ops.paged_attention",
+        types.ModuleType("atom.model_ops.paged_attention"),
+    )
     paged_attention.PagedAttention = type("PagedAttention", (), {})
-    sys.modules["atom.model_ops.paged_attention"] = paged_attention
 
-    gdn_attn = types.ModuleType("atom.model_ops.attentions.gdn_attn")
+    gdn_attn = stub(
+        "atom.model_ops.attentions.gdn_attn",
+        types.ModuleType("atom.model_ops.attentions.gdn_attn"),
+    )
     gdn_attn.GDNAttentionMetadata = _KwargsObject
     gdn_attn.compute_causal_conv1d_metadata = lambda query_start_loc: (None, None, None)
-    sys.modules["atom.model_ops.attentions.gdn_attn"] = gdn_attn
 
-    plugin_attention = types.ModuleType("atom.plugin.attention")
+    plugin_attention = stub(
+        "atom.plugin.attention", types.ModuleType("atom.plugin.attention")
+    )
     plugin_attention.AiterFlashAttentionDecodeMetadata = _KwargsObject
     plugin_attention.AiterFlashAttentionMetadataForPluginMode = _KwargsObject
     plugin_attention.AiterFlashAttentionPrefillMetadata = _KwargsObject
-    sys.modules["atom.plugin.attention"] = plugin_attention
 
     # The one real symbol: `running_tokens_from_bs` is pure arithmetic and
     # imports standalone, and it is exactly the rule under test here -- a
     # hand-copied stub would pass while the bridge converted rows wrongly.
+    # Imported before `stub` displaces the module, or this would find the stub.
     from atom.utils.forward_context import running_tokens_from_bs
 
-    utils_forward_context = types.ModuleType("atom.utils.forward_context")
+    utils_forward_context = stub(
+        "atom.utils.forward_context",
+        types.ModuleType("atom.utils.forward_context"),
+    )
     utils_forward_context.running_tokens_from_bs = running_tokens_from_bs
     utils_forward_context.AttentionMetaData = _KwargsObject
     utils_forward_context.Context = _KwargsObject
@@ -57,16 +84,34 @@ def _install_forward_context_stubs():
         utils_forward_context._forward_kv_cache_context.kv_cache_data = value
 
     utils_forward_context.set_kv_cache_data = _set_kv_cache_data
-    sys.modules["atom.utils.forward_context"] = utils_forward_context
+
+    def restore():
+        for name, previous in displaced.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+        if config_attr is None:
+            delattr(config, "get_current_atom_config")
+        else:
+            config.get_current_atom_config = config_attr
+
+    return restore
 
 
-_install_forward_context_stubs()
+# The module under test binds these names at import time, so the stubs only
+# have to be in place across the import below -- and are put back immediately
+# after, because `sys.modules` is process-wide and the rest of the suite wants
+# the real ones.
+_restore_forward_context_stubs = _install_forward_context_stubs()
 
 from atom.plugin.rtpllm.utils.forward_context import (
     RTPForwardContext,
     RTPForwardMLAContext,
     RTPForwardQwen35HybridContext,
 )
+
+_restore_forward_context_stubs()
 
 
 def _make_attn_inputs(
@@ -288,7 +333,7 @@ def test_base_context_capture_recovers_physical_table_with_prewarmed_buffer():
     assert block_table.cpu().tolist() == [[56]]
 
 
-def test_plugin_attention_metadata_builds_req_id_per_token():
+def test_plugin_attention_metadata_builds_batch_id_per_q_token():
     attn_inputs = _make_attn_inputs(
         input_lengths=torch.tensor([2, 1], dtype=torch.int32),
         prefix_lengths=torch.tensor([0, 0], dtype=torch.int32),
@@ -304,7 +349,7 @@ def test_plugin_attention_metadata_builds_req_id_per_token():
         seq_size_per_block=1024,
     )
 
-    assert md.plugin_metadata.req_id_per_token.cpu().tolist() == [0, 0, 1]
+    assert md.plugin_metadata.batch_id_per_q_token.cpu().tolist() == [0, 0, 1]
     assert md.plugin_metadata.sparse_block_size == 1024
     assert md.cu_seqlens_q.cpu().tolist() == [0, 2, 3]
     assert md.cu_seqlens_k.cpu().tolist() == [0, 2, 3]
@@ -313,13 +358,13 @@ def test_plugin_attention_metadata_builds_req_id_per_token():
     assert md.total_kv == 3
 
 
-def test_build_req_id_per_token_prefers_prewarmed_i32_buffer(monkeypatch):
+def test_build_batch_id_per_q_token_prefers_prewarmed_i32_buffer(monkeypatch):
     query_start_loc = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
     seq_id_i32 = torch.arange(8, dtype=torch.int32)
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
 
-    req_id = RTPForwardContext._build_req_id_per_token(
+    req_id = RTPForwardContext._build_batch_id_per_q_token(
         query_start_loc=query_start_loc,
         num_tokens=3,
         device=query_start_loc.device,
@@ -334,13 +379,15 @@ def test_build_req_id_per_token_prefers_prewarmed_i32_buffer(monkeypatch):
     assert req_id.cpu().tolist() == [0, 1, 2]
 
 
-def test_build_req_id_per_token_requires_prewarmed_i32_buffer_in_capture(monkeypatch):
+def test_build_batch_id_per_q_token_requires_prewarmed_i32_buffer_in_capture(
+    monkeypatch,
+):
     query_start_loc = torch.tensor([0, 1], dtype=torch.int32)
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
 
     try:
-        RTPForwardContext._build_req_id_per_token(
+        RTPForwardContext._build_batch_id_per_q_token(
             query_start_loc=query_start_loc,
             num_tokens=1,
             device=query_start_loc.device,

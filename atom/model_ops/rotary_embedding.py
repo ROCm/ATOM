@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from functools import lru_cache
-import torch
-from torch import nn
+
 import aiter
+import torch
 from aiter import dtypes
-from typing import Union, Optional
+from torch import nn
 
 from atom.utils.decorators import mark_trace
 
@@ -33,7 +33,7 @@ class RotaryEmbedding(nn.Module):
         max_position_embeddings: int,
         base: float,
         is_neox_style: bool = True,
-        dtype: Optional[torch.dtype] = None,
+        dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         if dtype is None:
@@ -55,7 +55,7 @@ class RotaryEmbedding(nn.Module):
 
         assert rotary_dim == head_size
 
-    def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
+    def _compute_inv_freq(self, base: float) -> torch.Tensor:
         """Compute the inverse frequency."""
         # NOTE(woosuk): To exactly match the HF implementation, we need to
         # use CPU to compute the cache and then move it to GPU. However, we
@@ -125,6 +125,30 @@ class RotaryEmbedding(nn.Module):
 
         key = key.view(key_shape)
 
+        return query, key
+
+
+class NoPositionalRotaryEmbedding(RotaryEmbedding):
+    """Identity rotary module for NoPE models using shared MLA interfaces."""
+
+    def _compute_cos_sin_cache(self) -> tuple[torch.Tensor, torch.Tensor]:
+        cache_shape = (
+            self.max_position_embeddings,
+            1,
+            1,
+            self.rotary_dim // 2,
+        )
+        return (
+            torch.ones(cache_shape, dtype=torch.float32),
+            torch.zeros(cache_shape, dtype=torch.float32),
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         return query, key
 
 

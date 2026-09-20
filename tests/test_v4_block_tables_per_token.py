@@ -3,14 +3,14 @@
 """Expanding `block_tables[bs]` into the per-query-row table the MQA kernel reads.
 
 `_attach_v4_paged_decode_meta` used to build this on the host -- zero the whole
-buffer, mask the rows whose `mqa_row_to_batch` is not -1, gather those from
+buffer, mask the rows whose `mqa_batch_id_per_q_token` is not -1, gather those from
 `block_tables`, ship the result -- and now gathers it on the device from
 tensors that are already there.
 
 That swap rests on one property of the row -> seq map: **the rows it marks
 invalid are a contiguous tail**. If they were interior, `index_select` over a
 prefix would fill the wrong rows and only the padding rows -- which the kernel
-skips because their `n_committed_per_token` is 0 -- would hide it. So the tail
+skips because their `csa_n_committed_per_token` is 0 -- would hide it. So the tail
 property is asserted directly, for both row layouts, before the gather is
 compared against the host expansion it replaces.
 
@@ -37,7 +37,7 @@ def _block_tables(bs: int) -> np.ndarray:
 
 
 def _per_token_layout(bs: int, tokens_per_seq: int, t_pad: int):
-    """One row per query token: the map is `batch_id_per_token`, padded with -1."""
+    """One row per query token: the map is `batch_id_per_q_token`, padded with -1."""
     t = bs * tokens_per_seq
     old = np.full(t_pad, -1, dtype=np.int32)
     old[:t] = np.repeat(np.arange(bs, dtype=np.int32), tokens_per_seq)

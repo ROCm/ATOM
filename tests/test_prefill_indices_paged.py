@@ -18,12 +18,14 @@ if not torch.cuda.is_available():
         allow_module_level=True,
     )
 
-from atom.model_ops.attentions.v4_pool_geometry import (
+from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
     CSA_RATIO,
     DENSE_RATIO,
     UnifiedPoolGeometry,
 )
-from atom.model_ops.attentions.v4_pool_geometry import HCA_RATIO as HCA_POOL_RATIO
+from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
+    HCA_RATIO as HCA_POOL_RATIO,
+)
 from atom.model_ops.v4_kernels.paged_prefill_indices import (
     write_v4_paged_prefill_indices,
     write_v4_paged_prefill_indices_reference,
@@ -57,7 +59,6 @@ def build(geometry):
     )
     chunk_start = torch.tensor([0, 16], dtype=torch.int32, device=DEV)
     state_slot = torch.tensor([3, 0], dtype=torch.int32, device=DEV)
-    n_hca_per_seq = torch.tensor([0, 2], dtype=torch.int32, device=DEV)
     block_tables = torch.randint(1, 40, (2, 8), dtype=torch.int32, device=DEV)
     total = positions.shape[0]
 
@@ -67,7 +68,7 @@ def build(geometry):
     cs_pt = chunk_start.cpu().numpy()[bid]
     extend_count = np.minimum(pos - cs_pt + 1, WIN)
     prefix_swa_count = np.maximum(cs_pt - np.maximum(pos - WIN + 1, 0), 0)
-    n_hca = np.minimum((pos + 1) // HCA_RATIO, n_hca_per_seq.cpu().numpy()[bid])
+    n_hca = (pos + 1) // HCA_RATIO
     csa_head = np.array([2, 1, 0, 3, 2, 1, 0, 2, 1])  # arbitrary; not written here
 
     ptrs = {
@@ -90,7 +91,6 @@ def build(geometry):
             chunk_start_per_seq=chunk_start,
             cu_seqlens_q_per_seq=torch.tensor([0, 5], dtype=torch.int32, device=DEV),
             state_slot_per_seq=state_slot,
-            n_committed_hca_per_seq=n_hca_per_seq,
             block_tables=block_tables,
             T=total,
             win=WIN,
@@ -195,7 +195,6 @@ def _run_k2(fn, out_hca):
         chunk_start_per_seq=one(0),
         cu_seqlens_q_per_seq=one(0),
         state_slot_per_seq=one(0),
-        n_committed_hca_per_seq=one(4),
         block_tables=torch.tensor([_BT_K2], dtype=torch.int32, device=DEV),
         extend_indptr=torch.tensor([0, WIN], dtype=torch.int32, device=DEV),
         prefix_swa_indptr=zero_ptr,

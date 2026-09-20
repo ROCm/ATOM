@@ -233,7 +233,7 @@ class TestAfterItRecovers:
 
 
 class TestTheEndpointUsesIt:
-    """Three streaming responses, and the watchdog has to wrap all three.
+    """Four streaming responses, and the watchdog has to wrap all four.
 
     It wrapped two: `_logged_stream` was a logging helper the Anthropic
     endpoint never called. A gauge with an endpoint-shaped hole is worse than
@@ -247,7 +247,7 @@ class TestTheEndpointUsesIt:
         src = pathlib.Path(api_server.__file__).read_text()
         total = src.count("StreamingResponse(")
         wrapped = len(re.findall(r"StreamingResponse\(\s*_client_stream\(", src))
-        assert total == 3, f"the endpoint count changed ({total}); check this test"
+        assert total == 4, f"the endpoint count changed ({total}); check this test"
         assert wrapped == total, (
             f"{total - wrapped} of {total} StreamingResponse calls are served "
             "from an unwrapped generator"
@@ -391,7 +391,7 @@ class TestRequestLoggingCannotBreakTheStream:
 
     @staticmethod
     def _logged(chunk):
-        """What `_log_sse` writes, without touching the module's real logger."""
+        """Exercise logging at the real client stream boundary."""
         written = []
 
         class Recorder:
@@ -402,7 +402,14 @@ class TestRequestLoggingCannotBreakTheStream:
         original = api_server._request_logger
         api_server._request_logger = Recorder
         try:
-            api_server._log_sse(chunk, "req-1")
+
+            async def source():
+                yield chunk
+
+            async def collect():
+                return [c async for c in frames(source(), "req-1")]
+
+            assert asyncio.run(collect()) == [chunk]
         finally:
             api_server._request_logger = original
         return written
@@ -429,7 +436,14 @@ class TestRequestLoggingCannotBreakTheStream:
         original = api_server._request_logger
         api_server._request_logger = None
         try:
-            api_server._log_sse(self.COALESCED, "req-1")
+
+            async def source():
+                yield self.COALESCED
+
+            async def collect():
+                return [c async for c in frames(source(), "req-1")]
+
+            assert asyncio.run(collect()) == [self.COALESCED]
         finally:
             api_server._request_logger = original
 

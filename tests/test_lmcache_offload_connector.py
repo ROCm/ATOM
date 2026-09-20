@@ -13,10 +13,25 @@ from types import SimpleNamespace
 
 import pytest
 
+_torch_stub = None
 try:
     import torch
 except ModuleNotFoundError:
-    sys.modules["torch"] = types.ModuleType("torch")
+    # Import-time only. The atom modules imported below do `import torch` at
+    # their own module scope, so `torch` has to be resolvable while this file is
+    # collected; a bare stub satisfies that. The torch-*using* tests here still
+    # need real torch (CI runs on CPU torch) and error without it -- the stub
+    # only keeps collection from aborting. Keep a handle so it can be removed the
+    # moment those imports have bound their references (see below): left in
+    # place, this empty module becomes *the* `torch` for every module collected
+    # afterwards, and since `run_unit_tests.sh` collects all of `tests/` in one
+    # process with unpinned order, a later module's `import torch` then finds a
+    # namespace with no `uint8`/`Tensor`/`cuda` and fails at collection -- which
+    # aborts the whole ~4100-test run rather than one file. This is the manual
+    # equivalent of the `monkeypatch.setitem` restore every other stub in this
+    # file uses; `monkeypatch` is unavailable at import scope.
+    _torch_stub = types.ModuleType("torch")
+    sys.modules["torch"] = _torch_stub
 
 from conftest import MockConfig
 
@@ -29,11 +44,16 @@ from atom.kv_transfer.disaggregation.types import (
     KVTransferRegion,
     LoadOperationId,
     SaveOperationId,
+    StateStoreOperationId,
 )
+from atom.kv_transfer.offload import _block_gpu_connector
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
-from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
+from atom.kv_transfer.offload.dense.connector import (
+    DenseOffloadConnector,
+    DenseOffloadScheduler,
+)
 from atom.kv_transfer.offload.dense.kv_byte_codec import (
     DenseKVByteCodec,
 )
@@ -41,6 +61,7 @@ from atom.kv_transfer.offload.hybrid.dsv4 import policy as connector_module
 from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
 from atom.kv_transfer.offload.hybrid.dsv4.connector import (
     DSV4_CHECKPOINT_SAVE_CHANNEL,
+    DSV4_PAGE_SAVE_CHANNEL,
 )
 from atom.kv_transfer.offload.hybrid.dsv4.connector import (
     DSV4OffloadConnector as LMCacheOffloadConnector,
@@ -51,6 +72,13 @@ from atom.kv_transfer.offload.hybrid.dsv4.connector import (
 from atom.kv_transfer.offload.hybrid.dsv4.policy import (
     _chained_prefix_hashes,
 )
+from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
+    STATE_INDEX_CHANNEL,
+    KimiK3OffloadConnector,
+    KimiK3OffloadScheduler,
+    save_stall_seconds,
+)
+from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import _JointPark
 from atom.kv_transfer.offload.metadata import (
     ATOMRawBytesLMCacheMetadata,
     LMCacheOffloadMetadata,
@@ -60,7 +88,15 @@ from atom.kv_transfer.offload.metadata import (
 )
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import Scheduler
-from atom.model_engine.sequence import SequenceStatus
+from atom.model_engine.sequence import OffloadJointRecord, SequenceStatus
+
+if _torch_stub is not None and sys.modules.get("torch") is _torch_stub:
+    # The torch-dependent atom imports above have bound their `torch` references,
+    # so the import-time stub has done its job. Restore the prior absent state --
+    # only if our exact stub is still installed -- so a later-collected module
+    # re-resolves `torch` itself (real on CI, its own guard otherwise) rather
+    # than inheriting an empty namespace from this file. See the install site.
+    del sys.modules["torch"]
 
 
 class _LookupClient:
@@ -78,6 +114,32 @@ class _LookupClient:
 class _FailingLookupClient(_LookupClient):
     def lookup(self, token_ids, lookup_id):
         raise RuntimeError("lookup failed")
+
+
+class _OffloadMixinStub(OffloadSchedulerMixin):
+    """Concrete `OffloadSchedulerMixin` for tests that exercise only frontier and
+    completion mechanics, not a real save/load lifecycle.
+
+    The mixin now declares the six save/load methods abstract (a missing
+    forwarder is a construction-time TypeError, not a silent no-op behind the
+    shell). Test doubles must therefore satisfy the contract; this base fills it
+    with harmless defaults so the ABC constructs, and each local `_Connector`
+    overrides the one or two methods it asserts on.
+    """
+
+    is_producer = False
+    is_offload = True
+
+    def save_finished(self, req_id) -> None: ...
+    def abandon_save(self, req_id) -> None: ...
+    def release_stalled_save(self, seq) -> None: ...
+    def load_failed(self, req_id) -> bool:
+        return False
+
+    def load_finished(self, req_id) -> bool:
+        return True
+
+    def cancel_pending_load(self, seq) -> None: ...
 
 
 def _scheduler() -> LMCacheOffloadConnectorScheduler:
@@ -99,6 +161,7 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._load_lifecycles = {}
     sched._active_load_operations = {}
     sched._save_inflight = {}
+    sched._save_watermark_rollback = {}
     sched._lookup_in_step = []
     sched._handoff_loads = set()
     sched.hash_block_size = 4
@@ -112,6 +175,8 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._sidecar_hash_cache = {}
     sched._load_inflight_tokens = {}
     sched._save_inflight_tokens = {}
+    sched._load_failed_seqs = {}
+    sched.total_suppressed_load_retries = 0
     sched.total_load_requests = 0
     sched.total_loaded_tokens = 0
     sched.total_load_failures = 0
@@ -148,9 +213,10 @@ def _stateful_seq(
         num_cached_tokens=num_cached_tokens,
         block_table=list(range((num_prompt_tokens + 255) // 256)),
         has_per_req_cache=True,
-        per_req_cache_group=group,
+        state_slot=group,
         prefix_hashes_published=True,
         _state_initialized_after_alloc=True,
+        offload_joint=OffloadJointRecord(),
     )
 
 
@@ -278,9 +344,56 @@ def _install_fake_fused_chunk_major(codec: DenseKVByteCodec) -> None:
                 seg.index_copy_(0, idx, src)
                 offset += count * nbytes
 
+    prepared_groups = []
+    prepared_pack_indices = []
+    prepared_unpack_indices = []
+
+    def _prepare(segments, seg_block_bytes, groups, device):
+        normalized = tuple(
+            (tuple(chunk_block_counts), tuple(flat_block_ids))
+            for chunk_block_counts, flat_block_ids in groups
+        )
+        prepared_groups.append(normalized)
+        return SimpleNamespace(
+            segments=segments,
+            seg_block_bytes=seg_block_bytes,
+            groups=normalized,
+            device=device,
+            group_count=len(normalized),
+            upload_count=int(any(ids for _counts, ids in normalized)),
+        )
+
+    def _pack_prepared(prepared, group_index, device_buf):
+        prepared_pack_indices.append(group_index)
+        counts, ids = prepared.groups[group_index]
+        _pack(
+            prepared.segments,
+            prepared.seg_block_bytes,
+            counts,
+            ids,
+            device_buf,
+        )
+
+    def _unpack_prepared(prepared, group_index, device_buf):
+        prepared_unpack_indices.append(group_index)
+        counts, ids = prepared.groups[group_index]
+        _unpack(
+            device_buf,
+            prepared.segments,
+            prepared.seg_block_bytes,
+            counts,
+            ids,
+        )
+
     codec._fused_kv_staging = SimpleNamespace(
         fused_pack_chunk_major=_pack,
         fused_unpack_chunk_major=_unpack,
+        prepare_chunk_major_groups=_prepare,
+        fused_pack_chunk_major_prepared=_pack_prepared,
+        fused_unpack_chunk_major_prepared=_unpack_prepared,
+        prepared_groups=prepared_groups,
+        prepared_pack_indices=prepared_pack_indices,
+        prepared_unpack_indices=prepared_unpack_indices,
     )
 
 
@@ -315,6 +428,10 @@ def _dense_registration_connector() -> DenseOffloadConnector:
     connector._engine = None
     connector._codec = None
     connector._lookup_server = None
+    # `register_kv_caches` logs the pool widths, which a real worker sets in
+    # `__init__`; this connector is built through `__new__`.
+    connector.save_workers = 1
+    connector.load_workers = 1
     return connector
 
 
@@ -802,7 +919,7 @@ def test_build_lmcache_config_validates_extras_and_keeps_gds_disabled(monkeypatc
     assert cfg.local_disk == "/nvme/lmcache"
     assert cfg.max_local_disk_size == 10
     assert cfg.use_gds is False
-    assert cfg.lookup_server_worker_ids == [0]
+    assert cfg.lookup_server_worker_ids == []
 
 
 def test_lmcache_disk_startup_fails_if_backend_was_not_created():
@@ -886,6 +1003,189 @@ def test_lmcache_connector_maps_token_ranges_to_block_ids():
             [8],
             block_ids=[0, 1, 2, 3, 4, 5],
         )
+
+
+def test_dense_codec_rejects_per_request_state_by_default():
+    """A GDN model registered on the plain dense path drops its slot-indexed
+    recurrent state into kv_caches. The dense path cannot keep a restored KV
+    prefix aligned with that state, so the codec must fail closed rather than
+    skip it (which would register successfully and produce silent wrong
+    output). kimi_k3 opts in via permit_per_request_state=True to skip it,
+    because it owns a state tier that moves the state separately."""
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
+            v_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
+            k_scale=None,
+            v_scale=None,
+        ),
+        "state": SimpleNamespace(
+            per_request_state=True,
+            state=torch.arange(4 * 5, dtype=torch.uint8).reshape(4, 5),
+        ),
+    }
+
+    with pytest.raises(ValueError, match="per-request recurrent state"):
+        DenseKVByteCodec(kv_caches)
+
+    # Opt in (kimi_k3): the state tensor is skipped, only the KV layer is moved.
+    codec = DenseKVByteCodec(kv_caches, permit_per_request_state=True)
+    assert len(codec._segments) == 2  # k_cache + v_cache, state excluded
+    assert codec.num_blocks == 6
+
+
+# --- FP4 sparse indexer: the index region is two planes -------------------
+#
+# `--index_cache_dtype fp4` stores the indexer keys as packed E2M1 plus a
+# separate e8m0 exponent plane (`mla_kv_pool.py` declares both). A codec that
+# moves the keys without the exponents restores a prefix whose every index is
+# still in bounds and whose scoring is wrong -- so these pin that both planes
+# are in the moved bytes, not just that registration succeeded.
+
+_FP4_ROWS = 64  # FP4_KV_BLOCK_SIZE
+_FP4_K_TILES = 1  # index_head_dim 128 // _K_TILE 128
+_FP4_NTPW = 4
+
+
+def _fp4_index_kv_caches(torch, num_blocks, *, with_scale=True):
+    """One DSA layer shaped like the FP4 pool's two index planes.
+
+    Shapes follow `fp4_index_block_shapes(64, 128)`: data
+    `(k_tiles, 4, rows, 16)` and scale `(k_tiles, 4, rows)`, both uint8, with
+    the pool's block axis outermost.
+    """
+    gen = torch.arange
+    kv = (gen(num_blocks * _FP4_ROWS * 16, dtype=torch.uint8) % 251).reshape(
+        num_blocks, _FP4_ROWS, 16
+    )
+    index = (
+        gen(num_blocks * _FP4_K_TILES * _FP4_NTPW * _FP4_ROWS * 16, dtype=torch.uint8)
+        % 241
+    ).reshape(num_blocks, _FP4_K_TILES, _FP4_NTPW, _FP4_ROWS, 16)
+    scale = (
+        gen(num_blocks * _FP4_K_TILES * _FP4_NTPW * _FP4_ROWS, dtype=torch.uint8) % 239
+        + 3
+    ).reshape(num_blocks, _FP4_K_TILES, _FP4_NTPW, _FP4_ROWS)
+    return {
+        "l0": SimpleNamespace(
+            k_cache=kv,
+            v_cache=None,
+            k_scale=None,
+            v_scale=None,
+            index_cache=index,
+            index_scale=scale if with_scale else None,
+        )
+    }
+
+
+def test_dense_codec_moves_the_fp4_index_scale_plane():
+    """A store/restore cycle must bring the e8m0 plane back with the keys.
+
+    The planes are zeroed between pack and unpack because that is what the
+    cycle this codec serves actually does to them -- the blocks are freed and
+    handed to another request before the restore. Asserting round-trip
+    equality without the zeroing would pass on a codec that never moved the
+    scale plane at all: it would simply still be holding its original bytes.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    num_blocks = 4
+    original = _fp4_index_kv_caches(torch, num_blocks)
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=original["l0"].k_cache.clone(),
+            v_cache=None,
+            k_scale=None,
+            v_scale=None,
+            index_cache=original["l0"].index_cache.clone(),
+            index_scale=original["l0"].index_scale.clone(),
+        )
+    }
+
+    codec = DenseKVByteCodec(kv_caches)
+
+    # Three planes move, not two, and the block price counts all three.
+    assert len(codec._segments) == 3
+    assert codec.num_blocks == num_blocks
+    assert codec.bytes_per_block == sum(
+        t.numel() // num_blocks
+        for t in (
+            kv_caches["l0"].k_cache,
+            kv_caches["l0"].index_cache,
+            kv_caches["l0"].index_scale,
+        )
+    )
+
+    _install_fake_fused_chunk_major(codec)
+    block_ids = list(range(num_blocks))
+    device_buf = torch.empty(
+        codec.bytes_per_block * num_blocks, dtype=torch.uint8, device=codec.device
+    )
+    codec.gpu_to_chunk_major_device_buffer(device_buf, [block_ids])
+
+    # The blocks are reused by someone else before the restore.
+    for plane in ("k_cache", "index_cache", "index_scale"):
+        getattr(kv_caches["l0"], plane).zero_()
+
+    codec.chunk_major_device_buffer_to_gpu(device_buf, [block_ids])
+
+    for plane in ("k_cache", "index_cache", "index_scale"):
+        assert torch.equal(
+            getattr(kv_caches["l0"], plane), getattr(original["l0"], plane)
+        ), f"{plane} did not survive the store/restore cycle"
+
+
+def test_dense_codec_orders_the_fp4_scale_plane_after_its_keys():
+    """Segment order is the on-disk byte layout, so it is part of the contract.
+
+    Reordering these silently reinterprets every chunk already in a tier that
+    `build_page_namespace` still considers the same domain -- the namespace
+    document has no segment order in it. A reorder has to bump
+    `PAGE_LAYOUT_VERSION`, and this is what makes that deliberate.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    kv_caches = _fp4_index_kv_caches(torch, 4)
+    codec = DenseKVByteCodec(kv_caches)
+
+    layer = kv_caches["l0"]
+    assert [s.data_ptr() for s in codec._segments] == [
+        layer.k_cache.data_ptr(),
+        layer.index_cache.data_ptr(),
+        layer.index_scale.data_ptr(),
+    ]
+
+
+def test_dense_codec_fp8_indexer_layout_is_unchanged():
+    """FP8 has one index plane and must keep the byte layout it already has.
+
+    `index_scale` is None on every non-FP4 layer, and the FP8 caches already
+    written to a tier have to stay readable.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    kv_caches = _fp4_index_kv_caches(torch, 4, with_scale=False)
+    codec = DenseKVByteCodec(kv_caches)
+
+    layer = kv_caches["l0"]
+    assert len(codec._segments) == 2
+    assert codec.bytes_per_block == (
+        layer.k_cache.numel() // 4 + layer.index_cache.numel() // 4
+    )
 
 
 def test_lmcache_connector_maps_dcp_ranges_on_virtual_block_grid():
@@ -1014,6 +1314,88 @@ def test_staged_pipeline_allocates_on_first_consumer_stream(
         ("run", "a", first_stream_name),
     ]
     assert ("run", "b", second_stream_name) in trace
+
+
+@pytest.mark.parametrize("shared_stream", [True, False])
+def test_staged_pipeline_skips_the_handshake_on_a_shared_stream(shared_stream):
+    """One stream orders the stages itself, so it must issue no event calls.
+
+    Not a cosmetic saving: every one of those calls enters the GPU runtime and
+    releases the GIL, and it is charged once per staging group.
+    """
+    from atom.kv_transfer.offload.atom_lmcache_staging import (
+        _PipelineStage,
+        run_staged_pipeline,
+    )
+
+    calls = []
+
+    class _FakeStream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_event(self, event):
+            calls.append(("wait", event.name))
+
+        def synchronize(self):
+            pass
+
+    class _FakeEvent:
+        def __init__(self, name):
+            self.name = name
+
+        def record(self, stream):
+            calls.append(("record", self.name))
+
+    class _FakeState:
+        def __init__(self):
+            self.staging_buffer = SimpleNamespace(
+                tensor=None,
+                ready_event=_FakeEvent("ready"),
+                free_event=_FakeEvent("free"),
+                free_event_valid=False,
+            )
+
+        def stream_ctx(self, stream):
+            return nullcontext()
+
+    state = _FakeState()
+    pack = _FakeStream("pack")
+    copy = pack if shared_stream else _FakeStream("copy")
+    ran = []
+
+    # Three groups: the free-event wait only appears from the second onwards,
+    # so a single group would not distinguish the two modes.
+    run_staged_pipeline(
+        state,
+        [SimpleNamespace(nbytes=8) for _ in range(3)],
+        stage_a=_PipelineStage(pack, lambda group, buf: ran.append("a")),
+        stage_b=_PipelineStage(copy, lambda group, buf: ran.append("b")),
+        ensure_buffer=lambda _buffer, _nbytes: object(),
+        group_nbytes=lambda group: group.nbytes,
+    )
+
+    assert ran == ["a", "b"] * 3
+    if shared_stream:
+        assert calls == []
+        # A recorded-event flag that outlived its event would gate a later
+        # transfer on something that was never recorded.
+        assert state.staging_buffer.free_event_valid is False
+    else:
+        assert calls == [
+            ("record", "ready"),
+            ("wait", "ready"),
+            ("record", "free"),
+            ("wait", "free"),
+            ("record", "ready"),
+            ("wait", "ready"),
+            ("record", "free"),
+            ("wait", "free"),
+            ("record", "ready"),
+            ("wait", "ready"),
+            ("record", "free"),
+        ]
+        assert state.staging_buffer.free_event_valid is True
 
 
 def _exception_pipeline(monkeypatch, direction: str, *, failed_stream: str | None):
@@ -1191,7 +1573,9 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
     if not hasattr(torch, "arange"):
         pytest.skip("real torch is unavailable")
 
-    monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "2")
+    # Force two physical pipeline groups so Dense must prepare all groups in
+    # one metadata upload and launch each group by index.
+    monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "1")
     original = {
         "l0": SimpleNamespace(
             k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
@@ -1211,32 +1595,10 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
     codec = DenseKVByteCodec(kv_caches)
     connector = BlockGPUConnector(codec, block_size=4, chunk_size=8)
     _install_fake_fused_chunk_major(codec)
+    fused = codec._fused_kv_staging
     monkeypatch.setattr(connector, "_assert_fused_chunk_major_available", lambda: None)
 
-    pack_groups = []
-    unpack_groups = []
     buffer_requests = []
-
-    monkeypatch.setattr(
-        codec,
-        "gpu_to_chunk_major_device_buffer",
-        lambda device_buf, block_id_groups, stream=None: (
-            pack_groups.append([list(group) for group in block_id_groups]),
-            DenseKVByteCodec.gpu_to_chunk_major_device_buffer(
-                codec, device_buf, block_id_groups, stream=None
-            ),
-        )[-1],
-    )
-    monkeypatch.setattr(
-        codec,
-        "chunk_major_device_buffer_to_gpu",
-        lambda device_buf, block_id_groups, stream=None: (
-            unpack_groups.append([list(group) for group in block_id_groups]),
-            DenseKVByteCodec.chunk_major_device_buffer_to_gpu(
-                codec, device_buf, block_id_groups, stream=None
-            ),
-        )[-1],
-    )
     orig_ensure_staging_buffer = connector._ensure_staging_buffer
 
     def _ensure_staging_buffer(staging_buffer, nbytes):
@@ -1301,9 +1663,12 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
             original["l0"].v_cache[[3]].reshape(-1),
         ]
     )
-    assert pack_groups == [[[1, 2], [3]]]
-    assert all(nbytes <= 4 * codec.bytes_per_block for nbytes, _ in buffer_requests)
-    assert all(capacity == 4 * codec.bytes_per_block for _, capacity in buffer_requests)
+    # Save staging is tail-to-head, but every MemoryObj still receives the
+    # bytes for its original exact range.
+    assert fused.prepared_groups == [(((1,), (3,)), ((2,), (1, 2)))]
+    assert fused.prepared_pack_indices == [0, 1]
+    assert all(nbytes <= 2 * codec.bytes_per_block for nbytes, _ in buffer_requests)
+    assert all(capacity == 2 * codec.bytes_per_block for _, capacity in buffer_requests)
     assert torch.equal(memory_objs[0].tensor, expected0)
     assert torch.equal(memory_objs[1].tensor, expected1)
 
@@ -1316,12 +1681,21 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
         block_ids=[0, 1, 2, 3, 4, 5],
     )
 
-    assert unpack_groups == [[[1, 2], [3]]]
+    # Load/retrieve remains in ordinary head-to-tail order.
+    assert fused.prepared_groups == [
+        (((1,), (3,)), ((2,), (1, 2))),
+        (((2,), (1, 2)), ((1,), (3,))),
+    ]
+    assert fused.prepared_unpack_indices == [0, 1]
     for bid in [1, 2, 3]:
         assert torch.equal(kv_caches["l0"].k_cache[bid], original["l0"].k_cache[bid])
         assert torch.equal(kv_caches["l0"].v_cache[bid], original["l0"].v_cache[bid])
     assert torch.count_nonzero(kv_caches["l0"].k_cache[0]) == 0
     assert torch.count_nonzero(kv_caches["l0"].v_cache[0]) == 0
+    stats = connector.last_transfer_stats()
+    assert stats["batch_block_ids_enabled"] == 1
+    assert stats["batch_id_groups"] == 2
+    assert stats["batch_id_uploads"] == 1
 
 
 def test_lmcache_connector_requires_fused_chunk_major_staging():
@@ -1407,14 +1781,10 @@ def test_lmcache_connector_respects_staging_buffer_chunks_env(monkeypatch):
     assert connector._thread_state().staging_buffer.tensor is None
 
 
-def test_lmcache_connector_default_staging_buffer_chunks_is_two(monkeypatch):
+def _tiny_staging_codec():
+    """A codec with one block per LMCache chunk and a very small chunk."""
     import torch
 
-    if not hasattr(torch, "arange"):
-        pytest.skip("real torch is unavailable")
-
-    monkeypatch.delenv("OFFLOAD_GPU_STAGING_CHUNKS", raising=False)
-    monkeypatch.delenv("OFFLOAD_GPU_STAGING_MAX_BYTES", raising=False)
     kv_caches = {
         "l0": SimpleNamespace(
             k_cache=torch.arange(2 * 2, dtype=torch.uint8).reshape(2, 2),
@@ -1423,11 +1793,85 @@ def test_lmcache_connector_default_staging_buffer_chunks_is_two(monkeypatch):
             v_scale=None,
         )
     }
-    codec = DenseKVByteCodec(kv_caches)
+    return DenseKVByteCodec(kv_caches)
+
+
+def _clear_staging_env(monkeypatch):
+    monkeypatch.delenv("OFFLOAD_GPU_STAGING_CHUNKS", raising=False)
+    monkeypatch.delenv("OFFLOAD_GPU_STAGING_MAX_BYTES", raising=False)
+
+
+def test_default_staging_buffer_is_sized_in_bytes_not_chunks(monkeypatch):
+    """The default buys a fixed number of bytes, whatever a chunk happens to be.
+
+    This is the whole point of the byte-denominated default: two KV geometries
+    with different bytes-per-chunk must end up with the same buffer size, not
+    the same chunk count.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    _clear_staging_env(monkeypatch)
+    codec = _tiny_staging_codec()
+    chunk_bytes = codec.bytes_per_block  # block_size == chunk_size below
+    monkeypatch.setattr(
+        _block_gpu_connector, "_DEFAULT_GPU_STAGING_BYTES", 4 * chunk_bytes
+    )
+
+    connector = BlockGPUConnector(codec, block_size=4, chunk_size=4)
+
+    assert connector.gpu_staging_chunk_bytes == chunk_bytes
+    assert connector.gpu_staging_buffer_chunks == 4
+    assert connector.gpu_staging_buffer_bytes == 4 * chunk_bytes
+
+
+def test_default_staging_buffer_never_drops_below_two_chunks(monkeypatch):
+    """A geometry whose single chunk already exceeds the target keeps two.
+
+    The byte target raises the floor for small-chunk models; it must not cut
+    large-chunk models down to a single chunk, which would be worse than the
+    chunk-denominated default they have today.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    _clear_staging_env(monkeypatch)
+    codec = _tiny_staging_codec()
+    monkeypatch.setattr(
+        _block_gpu_connector, "_DEFAULT_GPU_STAGING_BYTES", codec.bytes_per_block // 2
+    )
+
     connector = BlockGPUConnector(codec, block_size=4, chunk_size=4)
 
     assert connector.gpu_staging_buffer_chunks == 2
-    assert connector.gpu_staging_buffer_bytes == 2 * connector.gpu_staging_chunk_bytes
+
+
+def test_default_staging_buffer_chunk_count_is_capped(monkeypatch):
+    """A tiny chunk must not turn the byte target into an unbounded count.
+
+    The buffer is allocated at its full size, so the chunk count is what bounds
+    per-group work; without a cap a geometry with a very small chunk would ask
+    for millions of them.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    _clear_staging_env(monkeypatch)
+    codec = _tiny_staging_codec()
+    monkeypatch.setattr(_block_gpu_connector, "_DEFAULT_GPU_STAGING_BYTES", 1 << 30)
+
+    connector = BlockGPUConnector(codec, block_size=4, chunk_size=4)
+
+    assert (
+        connector.gpu_staging_buffer_chunks
+        == _block_gpu_connector._MAX_DEFAULT_GPU_STAGING_CHUNKS
+    )
 
 
 def test_codec_chunk_major_device_buffer_layout():
@@ -1555,6 +1999,41 @@ def test_codec_chunk_major_rejects_duplicate_block_ids():
 
     with pytest.raises(ValueError, match="duplicate block ids"):
         codec.gpu_to_chunk_major_device_buffer(device_buf, [[0, 1], [1]])
+
+
+def test_dense_prepared_ids_preserve_per_pipeline_group_validation():
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
+            v_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
+            k_scale=None,
+            v_scale=None,
+        )
+    }
+    codec = DenseKVByteCodec(kv_caches)
+    _install_fake_fused_chunk_major(codec)
+    stream = object()
+
+    # A physical block may recur after the preceding pipeline group has been
+    # fenced/reused, matching the legacy per-group validation contract.
+    owner = codec.prepare_block_id_groups(
+        [[[0, 1]], [[1, 2]]], device=codec.device, stream=stream
+    )
+    assert owner.group_count == 2
+    assert owner.upload_count == 1
+    assert codec._fused_kv_staging.prepared_groups == [(((2,), (0, 1)), ((2,), (1, 2)))]
+
+    # Repetition inside one pipeline group is still rejected before upload.
+    with pytest.raises(ValueError, match="duplicate block ids"):
+        codec.prepare_block_id_groups(
+            [[[0, 1], [1]]], device=codec.device, stream=stream
+        )
+    assert len(codec._fused_kv_staging.prepared_groups) == 1
 
 
 def test_scheduler_alignment_uses_dcp_hash_blocks_and_lmcache_chunks(monkeypatch):
@@ -2008,7 +2487,7 @@ def test_stateful_load_metadata_includes_slot_destination_group():
     seq = _stateful_seq(req_id=704, num_prompt_tokens=24_576)
     boundary_hash = _commit_sidecar(sched, seq, 8192)
     sched.get_num_new_matched_tokens(seq)
-    seq.per_req_cache_group = 3
+    seq.state_slot = 3
 
     sched.update_state_after_alloc(seq)
     assert sched.should_park_for_load_after_alloc(seq) is True
@@ -2115,7 +2594,7 @@ def test_stateful_load_rejects_nonzero_post_alloc_hbm_floor():
     seq = _stateful_seq(req_id=721, num_prompt_tokens=24_576)
     _commit_sidecar(sched, seq, 8192)
     sched.get_num_new_matched_tokens(seq)
-    seq.per_req_cache_group = 3
+    seq.state_slot = 3
     # Faithfully models BlockManager's post-allocation state-copy/prefix hit:
     # a group is assigned and the HBM frontier advances before offload decides.
     seq.num_cached_tokens = 256
@@ -2457,6 +2936,149 @@ def test_save_callbacks_clear_only_matching_operation_generation():
     assert sched.should_defer_free(seq) is False
 
 
+def _page_completion(operation, *, succeeded: bool) -> ConnectorCompletion:
+    return ConnectorCompletion(DSV4_PAGE_SAVE_CHANNEL, operation, succeeded)
+
+
+def test_failed_page_save_rolls_the_watermark_back_and_re_emits():
+    """A PAGE save that never lands must not leave its range skipped forever.
+
+    The watermark is advanced where the save is *emitted*, so a save dropped on
+    admission takes a range of the prefix with it: every later incremental save
+    skips it, the PAGE boundary can never become visible, and SLOT publication
+    times out for the rest of the sequence's life. The scheduler only learns
+    this from the PAGE channel -- `finished_saving` reports the drop and the
+    success identically.
+    """
+    sched = _scheduler()
+    seq = SimpleNamespace(
+        id=730,
+        token_ids=list(range(16)),
+        block_table=[1, 2, 3, 4],
+        num_prompt_tokens=16,
+        num_cached_tokens=8,
+        has_per_req_cache=False,
+    )
+    sched._save_tracker["730"] = [seq, 0]
+
+    first = sched.build_connector_meta().requests[0]
+    assert first.save_spec.skip_leading_tokens == 0
+    assert sched._save_tracker["730"][1] == 8
+
+    # The worker dropped it (max_pending_saves). Nothing was persisted.
+    assert (
+        sched.connector_completion(
+            _page_completion(first.save_operation, succeeded=False)
+        )
+        is True
+    )
+    assert sched._save_tracker["730"][1] == 0
+    # Failure must not be counted as saved bytes.
+    assert sched.total_saved_tokens == 0
+
+    # `save_finished` still arrives, and clears the operation so the next step
+    # is free to re-emit the range the drop left behind.
+    sched.save_finished(first.save_operation)
+    assert sched._save_inflight == {}
+    assert sched.total_saved_tokens == 0
+
+    retry = sched.build_connector_meta().requests[0]
+    assert retry.save_operation != first.save_operation
+    assert retry.save_spec.skip_leading_tokens == 0
+    assert retry.token_ids == list(range(8))
+
+    # This one lands: the advance stands and the record is retired.
+    assert (
+        sched.connector_completion(
+            _page_completion(retry.save_operation, succeeded=True)
+        )
+        is True
+    )
+    assert sched._save_tracker["730"][1] == 8
+    assert sched._save_watermark_rollback == {}
+
+    sched.save_finished(retry.save_operation)
+    assert sched.total_saved_tokens == 8
+
+    seq.num_cached_tokens = 16
+    tail = sched.build_connector_meta().requests[0]
+    assert tail.save_spec.skip_leading_tokens == 8
+
+
+def test_page_watermark_records_do_not_outlive_their_request():
+    """Records are keyed by operation, so they must be dropped with the request."""
+    sched = _scheduler()
+    seq = SimpleNamespace(
+        id=731,
+        token_ids=list(range(16)),
+        block_table=[1, 2, 3, 4],
+        num_prompt_tokens=16,
+        num_cached_tokens=8,
+        has_per_req_cache=False,
+    )
+    sched._save_tracker["731"] = [seq, 0]
+    sched.build_connector_meta()
+    assert sched._save_watermark_rollback["731"]
+
+    sched.abandon_save(seq.id)
+    assert sched._save_watermark_rollback == {}
+
+    sched._save_tracker["731"] = [seq, 0]
+    sched.build_connector_meta()
+    assert sched._save_watermark_rollback["731"]
+
+    sched._save_inflight.clear()
+    sched.request_finished(seq)
+    assert sched._save_watermark_rollback == {}
+
+
+def test_worker_reports_a_page_verdict_on_every_terminal_path():
+    """A missing report strands the operation in the TP aggregator forever."""
+    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn._lock = threading.Lock()
+    conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
+    conn._done_sidecar_save = set()
+    conn._failed_sidecar_save = set()
+    conn._pending_save_ops = {}
+    conn._pending_legacy_save_ops = {}
+    conn._max_pending_saves = 4
+
+    operation = SaveOperationId(732, 0)
+    req = SimpleNamespace(
+        req_id=732,
+        token_ids=list(range(8)),
+        block_ids=[1, 2],
+        save_spec=SimpleNamespace(skip_leading_tokens=0, can_save=True),
+        slot_save_spec=None,
+        save_operation=operation,
+    )
+
+    conn._finish_unadmitted_save(req)
+
+    assert conn._failed_page_save == {operation}
+    assert conn._done_page_save == set()
+    # It is still reported as terminal on the plain saving path, so the
+    # scheduler's inflight bookkeeping still clears.
+    assert conn._done_save == {operation}
+
+    # A SLOT-only save moved no watermark and must not claim a PAGE verdict.
+    conn._failed_page_save.clear()
+    conn._done_save.clear()
+    slot_only = SimpleNamespace(
+        req_id=733,
+        token_ids=list(range(8)),
+        block_ids=[1, 2],
+        save_spec=None,
+        slot_save_spec=SimpleNamespace(boundary_tokens=8, boundary_block_hash=7),
+        save_operation=SaveOperationId(733, 0),
+    )
+    conn._finish_unadmitted_save(slot_only)
+    assert conn._failed_page_save == set()
+    assert conn._done_page_save == set()
+
+
 def test_raw_callbacks_cannot_retire_exact_active_operations():
     page_sched = _scheduler()
     page_seq = SimpleNamespace(
@@ -2709,7 +3331,7 @@ def test_collapsed_sidecar_and_save_completion_clears_page_inflight():
 def test_offload_completion_processing_calls_load_terminal_once(field, callback):
     calls = []
 
-    class _Connector(OffloadSchedulerMixin):
+    class _Connector(_OffloadMixinStub):
         is_producer = False
         is_offload = True
 
@@ -2742,11 +3364,11 @@ def test_aborted_parked_load_defers_owned_resources_until_terminal(
         status=SequenceStatus.ABORTED,
         block_table=[10, 11],
         has_per_req_cache=True,
-        per_req_cache_group=3,
+        state_slot=3,
         _counted_as_inflight_load=True,
     )
 
-    class _Connector(OffloadSchedulerMixin):
+    class _Connector(_OffloadMixinStub):
         is_producer = False
         is_offload = True
 
@@ -2762,7 +3384,7 @@ def test_aborted_parked_load_defers_owned_resources_until_terminal(
     def deallocate(value):
         events.append(("deallocate", value.id))
         value.block_table.clear()
-        value.per_req_cache_group = -1
+        value.state_slot = -1
 
     host = Scheduler.__new__(Scheduler)
     host.kv_connector = _Connector()
@@ -2779,7 +3401,7 @@ def test_aborted_parked_load_defers_owned_resources_until_terminal(
     assert host.deferred_free_blocks[seq.id] is seq
     assert seq._awaiting_aborted_load_cleanup is True
     assert seq.block_table == [10, 11]
-    assert seq.per_req_cache_group == 3
+    assert seq.state_slot == 3
     assert host._num_parked_remote_kv == 1
 
     host._update_from_kv_xfer_finished(KVConnectorOutput(**{field: {seq.id}}))
@@ -2792,7 +3414,7 @@ def test_aborted_parked_load_defers_owned_resources_until_terminal(
     assert host.deferred_free_blocks == {}
     assert host._num_parked_remote_kv == 0
     assert seq.block_table == []
-    assert seq.per_req_cache_group == -1
+    assert seq.state_slot == -1
     assert host.finished_recving_kv_req_ids == []
     assert host.failed_recving_kv_req_ids == []
 
@@ -2808,11 +3430,11 @@ def test_aborted_parked_load_consumes_already_queued_terminal(queued_field):
         status=SequenceStatus.ABORTED,
         block_table=[12, 13],
         has_per_req_cache=True,
-        per_req_cache_group=4,
+        state_slot=4,
         _counted_as_inflight_load=True,
     )
 
-    class _Connector(OffloadSchedulerMixin):
+    class _Connector(_OffloadMixinStub):
         is_producer = False
         is_offload = True
 
@@ -2828,7 +3450,7 @@ def test_aborted_parked_load_consumes_already_queued_terminal(queued_field):
     def deallocate(value):
         events.append(("deallocate", value.id))
         value.block_table.clear()
-        value.per_req_cache_group = -1
+        value.state_slot = -1
 
     host = Scheduler.__new__(Scheduler)
     host.kv_connector = _Connector()
@@ -2852,7 +3474,7 @@ def test_aborted_parked_load_consumes_already_queued_terminal(queued_field):
     assert host.failed_recving_kv_req_ids == []
     assert host._num_parked_remote_kv == 0
     assert seq.block_table == []
-    assert seq.per_req_cache_group == -1
+    assert seq.state_slot == -1
     assert not hasattr(seq, "_awaiting_aborted_load_cleanup")
 
 
@@ -2874,15 +3496,16 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
         status=SequenceStatus.WAITING_FOR_REMOTE_KVS,
         block_table=[14, 15],
         has_per_req_cache=True,
-        per_req_cache_group=5,
+        state_slot=5,
         _counted_as_inflight_load=True,
         num_cached_tokens=4,
         num_tokens=8,
         offload_loaded_tokens=4,
         offload_load_start_tokens=4,
+        offload_joint=OffloadJointRecord(),
     )
 
-    class _Connector(OffloadSchedulerMixin):
+    class _Connector(_OffloadMixinStub):
         is_producer = False
         is_offload = True
 
@@ -2900,7 +3523,7 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
     def deallocate(value):
         events.append(("deallocate", value.id))
         value.block_table.clear()
-        value.per_req_cache_group = -1
+        value.state_slot = -1
 
     host = Scheduler.__new__(Scheduler)
     host.kv_connector = _Connector()
@@ -2931,7 +3554,7 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
     assert host.deferred_free_blocks == {}
     assert host._num_parked_remote_kv == 0
     assert seq.block_table == []
-    assert seq.per_req_cache_group == -1
+    assert seq.state_slot == -1
     assert not hasattr(seq, "_awaiting_aborted_load_cleanup")
 
 
@@ -2941,6 +3564,7 @@ def test_consume_failed_remote_kv_does_not_repeat_terminal_callback():
         id=730,
         status=SequenceStatus.WAITING_FOR_REMOTE_KVS,
         num_cached_tokens=4,
+        offload_joint=OffloadJointRecord(),
     )
 
     class _Connector:
@@ -3326,7 +3950,14 @@ def test_sidecar_chunk_cut_preserves_earlier_load_handoff_cap():
     assert sched.adjust_prefill_chunk_after_alloc(seq, 16_000) == 4096
 
 
-def test_full_prompt_hit_is_clamped_before_load_spec():
+def test_full_prompt_hit_is_clamped_and_floored_before_load_spec():
+    # A full-prompt hit is decremented so something is left to compute, and
+    # then floored back onto a chunk boundary. Both steps are load-bearing:
+    # LMCache resolves at chunk granularity, so the bare decrement (7 here,
+    # 32767 on GLM-5.2 with chunk 64) names tokens the tier does not hold and
+    # the load can only ever fail -- which parks the request in
+    # WAITING_FOR_REMOTE_KVS and, since a failed load used to leave no record,
+    # forever. chunk_size is 4, so 8 -> 7 -> 4.
     sched = _scheduler()
     sched._lookup_client = _LookupClient(hit=8)
     seq = SimpleNamespace(
@@ -3338,9 +3969,39 @@ def test_full_prompt_hit_is_clamped_before_load_spec():
 
     need, should_park = sched.get_num_new_matched_tokens(seq)
 
-    assert need == 7
+    assert need == 4
     assert should_park is True
-    assert sched._load_specs[str(seq.id)].lmcache_cached_tokens == 7
+    assert sched._load_specs[str(seq.id)].lmcache_cached_tokens == 4
+
+
+def test_dsv4_failed_load_is_not_retried_for_the_same_request():
+    # Same one-attempt rule as the dense layout: without it, `load_failed`
+    # clears the pending load and the lookup memo, so the next scheduler pass
+    # hits, parks, and fails again -- holding the request's KV blocks and its
+    # concurrency slot for the life of the benchmark.
+    sched = _scheduler()
+    sched._lookup_client = _LookupClient(hit=6)
+    seq = SimpleNamespace(
+        id=125,
+        num_prompt_tokens=8,
+        token_ids=list(range(8)),
+        num_cached_tokens=0,
+        has_per_req_cache=False,
+    )
+
+    assert sched.get_num_new_matched_tokens(seq) == (4, True)
+    assert sched.load_failed("125") is True
+    assert sched._load_failed_seqs == {"125": seq}
+
+    assert sched.get_num_new_matched_tokens(seq) == (0, False)
+    assert sched.total_suppressed_load_retries == 1
+    # Reported, not just counted: a suppressed retry is a silent hit-rate loss
+    # -- the request serves correctly, from HBM, having skipped the tier -- so
+    # the only way to see it in a running server is through the statistics dict.
+    assert sched.get_statistics()["suppressed_load_retries"] == 1
+
+    sched.request_finished(seq)
+    assert sched._load_failed_seqs == {}
 
 
 def test_lookup_miss_is_forwarded_for_worker_unpin():
@@ -3640,6 +4301,8 @@ def test_worker_completes_noop_load_when_hbm_satisfies():
     conn._done_load = set()
     conn._failed_load = set()
     conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
     conn._engine = SimpleNamespace(unpinned=[])
     conn._engine.lookup_unpin = lambda lookup_id: conn._engine.unpinned.append(
         lookup_id
@@ -3665,6 +4328,8 @@ def test_worker_load_terminal_paths_report_exact_operation_once():
     conn._done_load = set()
     conn._failed_load = set()
     conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
     conn._done_sidecar_save = set()
     conn._failed_sidecar_save = set()
     conn._pending_save_ops = {}
@@ -3737,6 +4402,8 @@ def test_worker_reports_unaligned_hbm_load_as_failed_without_exception():
     conn._done_load = set()
     conn._failed_load = set()
     conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
     conn.chunk_size = 4
     conn._engine = SimpleNamespace(unpinned=[])
     conn._engine.lookup_unpin = lambda lookup_id: conn._engine.unpinned.append(
@@ -3773,6 +4440,8 @@ def test_worker_save_uses_lmcache_engine_store():
     conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
     conn._lock = threading.Lock()
     conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
     conn._pending_save_ops = {}
     conn._pending_legacy_save_ops = {}
     conn._save_req_locks = {}
@@ -3818,6 +4487,8 @@ def test_worker_save_waits_for_forward_event_before_store():
     conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
     conn._lock = threading.Lock()
     conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
     conn._pending_save_ops = {}
     conn._pending_legacy_save_ops = {}
     conn._save_req_locks = {}
@@ -3862,6 +4533,8 @@ def test_worker_load_uses_lmcache_engine_retrieve_and_marks_done():
     conn._done_load = set()
     conn._failed_load = set()
     conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
     conn.chunk_size = 4
     conn._engine = _Engine()
 
@@ -3905,6 +4578,8 @@ def test_worker_load_partial_retrieve_marks_failed():
     conn._done_load = set()
     conn._failed_load = set()
     conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
     conn.chunk_size = 4
     conn._engine = _Engine()
 
@@ -3927,6 +4602,8 @@ def test_load_exception_is_reported_as_failed_recving():
     conn._lock = threading.Lock()
     conn._done_load = set()
     conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
     conn._failed_load = set()
     req = SimpleNamespace(req_id=42)
 
@@ -4050,7 +4727,7 @@ def test_finished_saving_releases_deferred_free_with_string_req_id():
         def deallocate(self, seq) -> None:
             self.deallocated.append(seq.id)
 
-    class _Connector(OffloadSchedulerMixin):
+    class _Connector(_OffloadMixinStub):
         is_producer = False
         is_offload = True
 
@@ -4073,6 +4750,36 @@ def test_finished_saving_releases_deferred_free_with_string_req_id():
 
     assert sched.block_manager.deallocated == [9]
     assert sched.deferred_free_blocks == {}
+
+
+@pytest.mark.parametrize("send_first", [False, True])
+def test_producer_waits_for_send_and_final_save(send_first):
+    class Connector(_OffloadMixinStub):
+        is_producer = True
+        is_offload = True
+        pending = True  # Also represents a final save not yet dispatched.
+
+        def save_finished(self, req_id):
+            self.pending = False
+
+        def should_defer_free(self, seq):
+            return self.pending
+
+    host = Scheduler.__new__(Scheduler)
+    host.kv_connector = Connector()
+    freed = []
+    host.block_manager = SimpleNamespace(deallocate=lambda seq: freed.append(seq.id))
+    seq = SimpleNamespace(id=9)
+    host.deferred_free_blocks = {9: seq}
+    send = KVConnectorOutput(finished_sending={9})
+    save = KVConnectorOutput(finished_saving={"9"})
+    first, last = (send, save) if send_first else (save, send)
+    host._update_from_kv_xfer_finished(first)
+    assert freed == []
+    assert host.deferred_free_blocks == {9: seq}
+    host._update_from_kv_xfer_finished(last)
+    assert freed == [9]
+    assert host.deferred_free_blocks == {}
 
 
 def test_finished_recv_matches_string_req_id():
@@ -4134,9 +4841,46 @@ def _install_byte_addressing_fused(codec: DenseKVByteCodec) -> None:
                     )
                     offset += nbytes
 
+    def _prepare(segments, seg_block_bytes, groups, device):
+        normalized = tuple(
+            (tuple(chunk_block_counts), tuple(flat_block_ids))
+            for chunk_block_counts, flat_block_ids in groups
+        )
+        return SimpleNamespace(
+            segments=segments,
+            seg_block_bytes=seg_block_bytes,
+            groups=normalized,
+            device=device,
+            group_count=len(normalized),
+            upload_count=int(any(ids for _counts, ids in normalized)),
+        )
+
+    def _pack_prepared(prepared, group_index, device_buf):
+        counts, ids = prepared.groups[group_index]
+        _pack(
+            prepared.segments,
+            prepared.seg_block_bytes,
+            counts,
+            ids,
+            device_buf,
+        )
+
+    def _unpack_prepared(prepared, group_index, device_buf):
+        counts, ids = prepared.groups[group_index]
+        _unpack(
+            device_buf,
+            prepared.segments,
+            prepared.seg_block_bytes,
+            counts,
+            ids,
+        )
+
     codec._fused_kv_staging = SimpleNamespace(
         fused_pack_chunk_major=_pack,
         fused_unpack_chunk_major=_unpack,
+        prepare_chunk_major_groups=_prepare,
+        fused_pack_chunk_major_prepared=_pack_prepared,
+        fused_unpack_chunk_major_prepared=_unpack_prepared,
     )
 
 
@@ -4377,6 +5121,7 @@ def test_scheduler_offload_statistics_are_cumulative():
         "saved_tokens": 4096,
         "loads_pending": 0,
         "saves_pending": 0,
+        "suppressed_load_retries": 0,
     }
 
 
@@ -4525,6 +5270,34 @@ def test_replica_world_size_counts_pp_and_tp_but_not_dp():
     assert offcfg.lmcache_replica_world_size(SimpleNamespace()) == 1
 
 
+def test_replica_world_size_reads_vllm_parallel_config():
+    # On the plugin path `config` is a VllmConfig, which keeps the parallel
+    # sizes under `parallel_config` and carries nothing at the top level.
+    # Reading only the top level returned world=1 for a TP4 replica, so the
+    # all-rank lookup_server_worker_ids=[0,1,2,3] went out of range and the
+    # lookup client silently failed to build -- leaving the offload tier
+    # written but never read.
+    vllm_shaped = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            tensor_parallel_size=4,
+        )
+    )
+    assert offcfg.lmcache_replica_world_size(vllm_shaped) == 4
+
+    vllm_shaped_pp = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=2,
+            tensor_parallel_size=4,
+        )
+    )
+    assert offcfg.lmcache_replica_world_size(vllm_shaped_pp) == 8
+
+    # A parallel_config that only carries ranks (ATOM's own shape) must not
+    # shadow the top-level sizes.
+    assert offcfg.lmcache_replica_world_size(_dp_config(5, pp_size=4, tp_size=8)) == 32
+
+
 class _RecordingRunnerMgr:
     def __init__(self) -> None:
         self.calls: list[tuple[str, object]] = []
@@ -4624,3 +5397,1518 @@ def test_multi_metadata_exposes_sub_meta_unpins():
     assert not connector_metadata_has_work(
         MultiConnectorMetadata(metas=[LMCacheOffloadMetadata()])
     )
+
+
+# ── kimi_k3: joint boundary, save stall, state channels ───────────────────
+
+
+def _k3_scheduler() -> KimiK3OffloadScheduler:
+    """Only the fields the K3 overrides touch; everything else is dense's."""
+    s = KimiK3OffloadScheduler.__new__(KimiK3OffloadScheduler)
+    s.chunk_size = 256
+    s._save_inflight = {}
+    s._save_tracker = {}
+    s._save_rr_last = None
+    s._pending_state_loads = []
+    s._pending_state_stores = []
+    s._save_inflight_since = {}
+    s._save_stalled = False
+    s._warned_save_stalled = False
+    s._state_indexed = set()
+    s._state_index_failed = set()
+    s._active_load_operations = {}
+    s._do_save = True
+    s._max_pending_saves = 4
+    return s
+
+
+def _k3_seq(*, hbm: int, joint: int = 0, kv: int = 0, claimed: int = 0):
+    return SimpleNamespace(
+        id=1,
+        has_per_req_cache=True,
+        num_cached_tokens=hbm,
+        offload_joint=OffloadJointRecord(
+            boundary_tokens=joint,
+            kv_tokens=kv,
+            claim_tokens=claimed,
+        ),
+    )
+
+
+def test_bounded_saves_are_shared_round_robin_not_head_first():
+    """With a bounded ``_may_emit_save`` (kimi_k3 caps outstanding saves), the
+    save scan must rotate over ``_save_tracker`` so a long multi-chunk request
+    at the insertion-ordered head cannot re-win the freed slot every step and
+    starve later requests -- whose blocks stay pinned by ``should_defer_free``
+    until their save drains. Without the round-robin cursor the emission order
+    would be [100, 100, 100]; with it, each request gets a turn."""
+
+    class _Cap1(DenseOffloadScheduler):
+        def _may_emit_save(self):  # one save outstanding at a time
+            return len(self._save_inflight) < 1
+
+        def _track_save_statistics(self, *a, **k):
+            pass
+
+    s = _Cap1.__new__(_Cap1)
+    s.chunk_size = 256
+    s.block_size = 256
+    s._do_save = True
+    s._do_load = False
+    s._reqs_need_recv = {}
+    s._lookup_in_step = []
+    s._save_tracker = {}
+    s._save_inflight = {}
+    s._save_nonce = 0
+    s._save_rr_last = None
+
+    seqs = {}
+    for i in range(3):
+        sid = str(100 + i)
+        seq = SimpleNamespace(
+            id=100 + i,
+            num_prompt_tokens=4096,
+            token_ids=list(range(4096)),
+            num_cached_tokens=0,
+            block_table=list(range(16)),
+        )
+        s._save_tracker[sid] = [seq, 0]
+        seqs[sid] = seq
+
+    emitted = []
+    for _ in range(3):
+        for seq in seqs.values():  # every request computes one more chunk
+            seq.num_cached_tokens += 256
+        meta = s.build_connector_meta()
+        saves = [r for r in meta.requests if r.save_spec is not None]
+        assert len(saves) == 1  # the cap admits exactly one per step
+        emitted.append(str(saves[0].req_id))
+        s._save_inflight.clear()  # that save completes, freeing the one slot
+
+    assert emitted == ["100", "101", "102"]
+
+
+def test_layout_selection_picks_kimi_k3_for_a_kda_config():
+    """K3's paged KV is ordinary dense MLA, so the layout cannot be read off
+    the KV shape -- the KDA state is what makes it its own family."""
+    cfg = SimpleNamespace(
+        hf_config=SimpleNamespace(model_type="kimi_linear"), kv_transfer_config={}
+    )
+    assert offcfg.select_offload_layout(cfg) == "kimi_k3"
+
+
+@pytest.mark.parametrize(
+    "seq,reason",
+    [
+        (_k3_seq(hbm=512, joint=0), "per_req_cache_state_boundary"),
+        (_k3_seq(hbm=512, joint=256), "per_req_cache_state_boundary"),
+        (_k3_seq(hbm=300, joint=1024), "joint_unaligned_hbm_prefill"),
+        (_k3_seq(hbm=512, joint=9000), "joint_boundary_above_lookup"),
+    ],
+)
+def test_a_hybrid_load_is_refused_unless_both_legs_reach_one_boundary(seq, reason):
+    """A hybrid's state is the compressed history of exactly `[0, hbm)`. Every
+    refusal here is a case where raising the KV-loaded length would have the
+    forward skip tokens the recurrence never saw -- wrong output, no
+    exception."""
+    ls = SimpleNamespace(lmcache_cached_tokens=8192)
+    ok, got, *_ = _k3_scheduler()._decide_load_after_alloc(seq, ls)
+    assert ok is False
+    assert got == reason
+
+
+def test_a_joint_load_clamps_the_kv_leg_to_the_covering_chunk():
+    """The two grids do not line up: the boundary is a hash-block position, the
+    KV leg moves whole chunks. The leg is aimed at the chunk that covers it."""
+    seq = _k3_seq(hbm=512, joint=1000, kv=1024)
+    ls = SimpleNamespace(lmcache_cached_tokens=8192)
+    ok, reason, hbm, lmc, need, _ = _k3_scheduler()._decide_load_after_alloc(seq, ls)
+    assert (ok, reason) == (True, "joint_state_and_kv")
+    assert (hbm, lmc, need) == (512, 1024, 512)
+    assert ls.lmcache_cached_tokens == 1024
+
+
+def test_the_kv_leg_starts_where_the_claim_ended_not_where_the_hit_did():
+    """`allocate` claims every block the prefix walk matched, which is past the
+    gated hit. Starting the transfer at the hit would fetch back what the pool
+    already holds, and land a second copy of it in HBM."""
+    seq = _k3_seq(hbm=0, joint=5120, kv=5120, claimed=4096)
+    ls = SimpleNamespace(hbm_cached_tokens=0, lmcache_cached_tokens=7168)
+    ok, reason, start, lmc, need, _ = _k3_scheduler()._decide_load_after_alloc(seq, ls)
+    assert (ok, reason) == (True, "joint_state_and_kv")
+    assert (start, lmc, need) == (4096, 5120, 1024)
+    # Both ends land on the spec: the worker reads the pair, and a start left
+    # at the value the lookup recorded fetches from token 0 every time.
+    assert ls.hbm_cached_tokens == 4096
+    assert ls.lmcache_cached_tokens == 5120
+
+
+def test_without_a_widened_claim_the_leg_still_starts_at_the_hit():
+    seq = _k3_seq(hbm=512, joint=1024, kv=1024)
+    ls = SimpleNamespace(hbm_cached_tokens=0, lmcache_cached_tokens=8192)
+    ok, _, start, _, need, _ = _k3_scheduler()._decide_load_after_alloc(seq, ls)
+    assert (ok, start, need) == (True, 512, 512)
+    assert ls.hbm_cached_tokens == 512
+
+
+def test_a_boundary_already_fully_resident_emits_no_kv_leg():
+    """Unreachable while `_gated_hit` returns the rightmost rung, but a state
+    leg paired with an empty KV leg must not be emitted silently."""
+    seq = _k3_seq(hbm=0, joint=4096, kv=4096, claimed=4096)
+    ls = SimpleNamespace(hbm_cached_tokens=0, lmcache_cached_tokens=7168)
+    ok, reason, *_ = _k3_scheduler()._decide_load_after_alloc(seq, ls)
+    assert (ok, reason) == (False, "joint_kv_already_resident")
+
+
+def test_the_claim_stops_at_the_boundary_when_the_chunk_overshoots_it():
+    """chunk != hash_block_size aims the transfer past the state boundary. The
+    claim must not follow it there: the forward would start inside a range the
+    recurrence never saw, and nothing raises."""
+    sched = _k3_scheduler()
+    sched.chunk_size = 256
+    # boundary 5120 (a hash-block position), covering chunk ends at 5376
+    seq = _k3_seq(hbm=0, joint=5120, kv=5376, claimed=4096)
+    assert sched._claim_after_load(seq, 4096, 5376) == 5120
+
+
+def test_a_layout_whose_claim_and_transfer_share_a_boundary_claims_the_end():
+    """The base seam: claim as far as the transfer reached, never below HBM.
+
+    Correct for every layout that aims its claim and its transfer at the same
+    place, which is dense and dsv4. A layout that aims them apart overrides it;
+    the seam exists because getting it wrong is silent -- the request simply
+    starts further along than its state supports.
+    """
+    from atom.kv_transfer.offload.dense.connector import DenseOffloadScheduler
+
+    sched = object.__new__(DenseOffloadScheduler)
+    seq = SimpleNamespace(id=1)
+    assert sched._claim_after_load(seq, 4096, 8192) == 8192
+    # Never below the HBM floor, whatever the transfer reported.
+    assert sched._claim_after_load(seq, 4096, 0) == 4096
+
+
+def test_the_claim_never_exceeds_the_state_boundary():
+    """Overshooting the transfer is one wasted chunk; overshooting the *claim*
+    would have the forward skip tokens the state does not cover."""
+    sched = _k3_scheduler()
+    seq = _k3_seq(hbm=512, joint=1000, kv=1024)
+    assert sched._claim_after_load(seq, 512, 1024) == 1000
+    # No joint boundary: dense's own answer.
+    assert sched._claim_after_load(_k3_seq(hbm=512), 512, 1024) == 1024
+
+
+def test_a_stalled_save_releases_blocks_it_never_handed_out(monkeypatch):
+    """The deadlock this exists for: with the backend stopped, holding blocks
+    for a save nobody is reading turns a stopped backend into a stopped
+    engine. A save already handed out still holds -- something is reading it."""
+    s = _k3_scheduler()
+    seq = SimpleNamespace(id=7)
+    s._save_inflight["9"] = object()  # a different request, stuck
+    s._save_tracker["7"] = [seq, 0]
+    monkeypatch.setattr(
+        KimiK3OffloadScheduler, "_has_pending_save", lambda self, q: True
+    )
+    s._refresh_save_stall()
+    assert s._save_stalled is False
+
+    # Age the outstanding save rather than the process clock: `time.monotonic`
+    # is the stdlib's, and patching it reaches every other test in the run.
+    s._save_inflight_since[s._save_inflight["9"]] -= 2 * save_stall_seconds()
+    s._refresh_save_stall()
+    assert s._save_stalled is True
+    # Never handed out -> the blocks may go free. `should_defer_free` is a pure
+    # query now: it answers False but does NOT drop the tracker (probed by
+    # `_is_preemptable`, so it must not mutate). It can be asked twice, safely.
+    assert s.should_defer_free(seq) is False
+    assert s.should_defer_free(seq) is False
+    assert "7" in s._save_tracker
+    # The scheduler drops the tracker at the actual free, via the mutator half.
+    s.release_stalled_save(seq)
+    assert "7" not in s._save_tracker
+    # Idempotent: dropping an already-dropped save is a no-op.
+    s.release_stalled_save(seq)
+    # Handed out -> still held, whatever the stall says, and never dropped.
+    handed_out = SimpleNamespace(id=9)
+    assert s.should_defer_free(handed_out) is True
+    s.release_stalled_save(handed_out)
+    assert "9" in s._save_inflight
+
+
+def test_dsv4_abandon_save_drops_page_set_sidecar_and_tracker():
+    """A DSV4 save the backend never reported must be droppable in full.
+
+    `_reconcile_stalled_deferred_saves` frees the blocks and calls
+    `abandon_save(sid)` with only the raw request id. DSV4 tracks a *set* of
+    page save operations plus a SLOT sidecar (dense tracks one save per
+    request), so the dense single-pop would strand the rest: `has_pending_work`
+    would never clear and the engine would busy-loop with every GPU idle -- the
+    DSV4 twin of the dense stall. Before this method DSV4 had no `abandon_save`
+    at all, so the shell's guarded forward silently no-op'd and nothing was
+    dropped. Prove every channel clears and the pending gauge does not leak.
+    """
+    sched = _scheduler()
+    sid = "7"
+    op_a = SaveOperationId(7, 0)
+    op_b = SaveOperationId(7, 1)  # shared by the page set and the sidecar
+    sched._save_inflight[sid] = {op_a, op_b}
+    sched._sidecar_save_inflight[sid] = (op_b, 8, 0x1234)
+    sched._save_tracker[sid] = [SimpleNamespace(id=7), 0]
+    sched._track_save_statistics(op_a, 16)
+    sched._track_save_statistics(op_b, 24)
+    assert sched.has_pending_work() is True
+
+    sched.abandon_save(sid)
+
+    assert sid not in sched._save_inflight
+    assert sid not in sched._sidecar_save_inflight
+    assert sid not in sched._save_tracker
+    # Cancelled, not finished: the bytes never persisted, so neither the request
+    # count nor the inflight-token gauge may bump.
+    assert sched.get_statistics()["save_requests"] == 0
+    assert sched.get_statistics()["saves_pending"] == 0
+    assert sched.has_pending_work() is False
+    # Idempotent: abandoning an already-dropped save is a no-op.
+    sched.abandon_save(sid)
+    assert sched.has_pending_work() is False
+
+
+def test_dsv4_release_stalled_save_is_a_declared_no_op():
+    """DSV4's `should_defer_free` has no stall escape, so a request with a
+    pending save always defers and `release_stalled_save` has nothing to drop.
+    It exists (not inherited, not guarded away) so the abstract lifecycle
+    contract is satisfied and the shell can forward it unconditionally."""
+    sched = _scheduler()
+    seq = SimpleNamespace(id=7)
+    sched._save_tracker["7"] = [seq, 0]
+    sched.release_stalled_save(seq)
+    # A no-op: it must not touch tracker state the way K3's override does.
+    assert "7" in sched._save_tracker
+
+
+def test_state_loads_are_drained_into_the_metadata_exactly_once(monkeypatch):
+    """A second submission would write the same entry into a group the first
+    transfer is already filling."""
+    s = _k3_scheduler()
+    monkeypatch.setattr(
+        DenseOffloadScheduler,
+        "build_connector_meta",
+        lambda self: LMCacheOffloadMetadata(),
+    )
+    assert s.enqueue_state_loads([]) is False
+    assert s.enqueue_state_loads([("1", 111, 0)]) is True
+
+    assert s.build_connector_meta().state_loads == [("1", 111, 0)]
+    assert s.build_connector_meta().state_loads == []
+
+
+def test_the_two_state_channels_are_routed_and_drained():
+    """The tier reports over the generic completion channel rather than extra
+    `KVConnectorOutput` fields, so TP quorum is the aggregator's job. Failure
+    is its own channel value, not a missing report: quorum over
+    `indexed | failed` is failure-dominant, so a partial store resolves in the
+    same step instead of pinning the key forever."""
+    s = _k3_scheduler()
+    for channel, op, ok in (
+        (STATE_INDEX_CHANNEL, 111, True),
+        (STATE_INDEX_CHANNEL, 222, False),
+    ):
+        assert s.connector_completion(
+            SimpleNamespace(channel=channel, operation_id=op, succeeded=ok)
+        )
+
+    indexed, failed = s.take_state_reports()
+    assert (indexed, failed) == ({111}, {222})
+    assert s.take_state_reports() == (set(), set())
+
+
+def test_no_more_saves_go_out_than_the_pool_can_afford_to_pin():
+    """A queued save pins its request's blocks until it drains, so the queue
+    depth is also how much of the pool a slow backend can hold. Dense has no
+    such bound because it does not pin; K3 does."""
+    s = _k3_scheduler()
+    s._max_pending_saves = 2
+    assert s._may_emit_save() is True
+
+    s._save_inflight = {"1": object(), "2": object()}
+    assert s._may_emit_save() is False
+
+    s._save_inflight = {"1": object()}
+    assert s._may_emit_save() is True
+    s._save_stalled = True
+    assert s._may_emit_save() is False
+
+
+# ── the state key: build safety and namespace separation ──────────────────
+
+
+class _FakeStorage:
+    """The two `storage_manager` calls the codec makes, over a plain dict."""
+
+    def __init__(self) -> None:
+        self.objects: dict = {}
+
+    def batched_put(self, keys, objs) -> None:
+        for k, o in zip(keys, objs, strict=True):
+            self.objects[k] = o
+
+    def get(self, key):
+        return self.objects.get(key)
+
+    def contains(self, key):
+        return key in self.objects
+
+
+@pytest.fixture
+def lmcache_key(monkeypatch):
+    """`CacheEngineKey` alone -- the whole `lmcache` stub is more than these need.
+
+    A dataclass rather than a stub with identity semantics: the tests below are
+    about two keys being equal or not, which is exactly what the real class
+    answers by value.
+    """
+    import dataclasses
+
+    @dataclasses.dataclass(frozen=True)
+    class CacheEngineKey:
+        model_name: str
+        world_size: int
+        worker_id: int
+        chunk_hash: int
+        dtype: object
+
+    utils_module = types.ModuleType("lmcache.utils")
+    utils_module.CacheEngineKey = CacheEngineKey
+    lmcache_module = types.ModuleType("lmcache")
+    lmcache_module.__path__ = []
+    lmcache_module.utils = utils_module
+    monkeypatch.setitem(sys.modules, "lmcache", lmcache_module)
+    monkeypatch.setitem(sys.modules, "lmcache.utils", utils_module)
+    return CacheEngineKey
+
+
+def _codec(layout_id: str, storage=None):
+    from atom.kv_transfer.offload.hybrid.kimi_k3.state_object import StateByteCodec
+
+    codec = StateByteCodec(
+        backend=None,
+        staged=None,
+        entry_bytes=1024,
+        model_name="k3",
+        world_size=8,
+        worker_id=0,
+        layout_id=layout_id,
+    )
+    codec.bind_storage_manager(storage if storage is not None else _FakeStorage())
+    return codec
+
+
+def test_the_same_hash_under_a_different_layout_is_a_different_key(lmcache_key):
+    """A build that changed the state geometry must not read another's images.
+
+    The failure this prevents is silent: same size, different order or meaning,
+    unpacked over a request's live state with nothing raised anywhere.
+    """
+    a = _codec("layers=69;spec=1;tp=8")
+    b = _codec("layers=69;spec=2;tp=8")  # one speculated token more
+    assert a.key(12345) != b.key(12345)
+    # And the layout alone does not collapse distinct hashes.
+    assert a.key(12345) != a.key(12346)
+
+
+def test_the_key_survives_a_process_restart(lmcache_key):
+    """`hash()` of a str is salted per process, so using it would orphan every
+    entry the previous run wrote -- a cache that silently starts cold."""
+    assert _codec("L").key(7) == _codec("L").key(7)
+
+
+def test_completed_save_generation_does_not_age_its_successor():
+    s = _k3_scheduler()
+    op = SaveOperationId(9, 1)
+    s._save_inflight = {"9": op}
+    s._refresh_save_stall()
+    s._save_inflight_since[op] -= 1000
+    # No intervening idle metadata build: the same request has a new save.
+    new_op = SaveOperationId(9, 2)
+    s._save_inflight["9"] = new_op
+    s._refresh_save_stall()
+    assert not s._save_stalled
+    assert set(s._save_inflight_since) == {new_op}
+
+
+def test_state_budget_evicts_cold_state_without_removing_kv(lmcache_key, monkeypatch):
+    storage = _FakeStorage()
+    storage.remove = lambda key: storage.objects.pop(key, None)
+    codec = _codec("L", storage)
+    codec._max_entries = 2
+    codec._backend = SimpleNamespace(state_entry_views=lambda slot: [])
+    codec._staged = SimpleNamespace(unpack=lambda obj, views: None)
+    storage.objects["KV"] = object()
+
+    def put(h, units, callback):
+        storage.objects[codec.key(h)] = SimpleNamespace(
+            get_size=lambda: 1024, ref_count_down=lambda: None
+        )
+        return True
+
+    monkeypatch.setattr(codec, "_put", put)
+    assert codec.put(1, [])
+    assert codec.put(2, [])
+    assert codec.get(1, 0)  # Keep the recently loaded checkpoint.
+    assert codec.put(3, [])
+    assert set(storage.objects) == {"KV", codec.key(1), codec.key(3)}
+    assert len(codec._cache_keys) == 2
+    assert codec.put(3, [])  # Re-store does not evict an unrelated state.
+    assert set(storage.objects) == {"KV", codec.key(1), codec.key(3)}
+
+
+def test_a_state_key_cannot_collide_with_a_kv_chunk_key(lmcache_key):
+    """Since one pool holds both (Phase 3a), the key is the only separation.
+
+    `CacheEngineKey` has no field saying what an entry is: KV keys carry
+    `ChunkedTokenDatabase`'s chunk hash and state keys ATOM's block hash, both
+    plain integers. Folding the layout in is what makes them disjoint -- no KV
+    key can carry a K3 layout id -- rather than merely unlikely to coincide.
+    """
+    codec = _codec("kimi_k3;layers=69")
+    # A KV chunk key is the raw hash; the state key for the same hash is not.
+    assert codec.key(999).chunk_hash != 999
+
+
+def test_a_hit_of_the_wrong_size_is_a_miss_not_garbage(lmcache_key, caplog):
+    """Unreachable while the layout is in the key, which is the point.
+
+    A hit of the wrong size means two things collided in the shared pool, and
+    unpacking it would write another entry's bytes over a request's live state.
+    """
+    import logging
+
+    storage = _FakeStorage()
+    codec = _codec("L", storage)
+    released = []
+    storage.objects[codec.key(5)] = SimpleNamespace(
+        get_size=lambda: 64,  # not the 1024 entry_bytes
+        ref_count_down=lambda: released.append(True),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        assert codec.get(5, 0) is False
+    assert released == [True], "the misfit object's reference must be discharged"
+    assert codec._misfit_reads == 1
+    assert any("expected 1024" in r.getMessage() for r in caplog.records)
+
+
+def test_an_object_that_will_not_report_its_size_is_still_loaded():
+    """None means "cannot check", never "size 0". Refusing what we cannot
+    measure would turn an unknown into a guaranteed miss."""
+    from atom.kv_transfer.offload.hybrid.kimi_k3.state_object import StateByteCodec
+
+    assert StateByteCodec._object_bytes(SimpleNamespace()) is None
+    assert StateByteCodec._object_bytes(SimpleNamespace(get_size=lambda: 32)) == 32
+
+
+def test_state_stores_are_drained_into_the_metadata_exactly_once(monkeypatch):
+    """A second submission would store the same image twice, and the second
+    report would unpin a record the first already released."""
+    s = _k3_scheduler()
+    monkeypatch.setattr(
+        DenseOffloadScheduler,
+        "build_connector_meta",
+        lambda self: LMCacheOffloadMetadata(),
+    )
+    assert s.enqueue_state_stores([]) is False
+    assert s.enqueue_state_stores([(111, (1, 2, 3))]) is True
+
+    assert s.build_connector_meta().state_stores == [(111, (1, 2, 3))]
+    assert s.build_connector_meta().state_stores == []
+
+
+def test_a_step_whose_only_work_is_a_state_store_reaches_the_worker():
+    """Same shape as the `state_loads` bug: a store carries no `LMCacheReqMeta`,
+    so a work test that only counts requests drops the step -- and here the cost
+    is 127 blocks pinned against a report nobody was asked to produce."""
+    from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
+
+    meta = LMCacheOffloadMetadata()
+    meta.state_stores = [(111, (1, 2))]
+    assert connector_metadata_has_work(meta)
+
+
+# ── the delegating shells must expose everything their driver reads ────────
+#
+# There are two forwarding axes, not one, and every round of review has found
+# the same defect on whichever axis the last patch did not cover: the scheduler
+# reads members off `self.kv_connector` (the scheduler-side shell), the worker
+# reads members off `connector` (the worker-side shell), and BOTH axes have a
+# plain `LMCacheOffloadConnector*` shell AND a `Multi*` composite. A member
+# added to an `_impl` but not hand-forwarded on one of these four classes is a
+# silent fallthrough -- `close` (worker shells), `save_abandon_timeout_s` /
+# `release_stalled_save` / `get_statistics` (the multi scheduler composite) are
+# the most recent instances. The two sweeps below iterate both shells on each
+# axis so a fifth instance fails a test instead of shipping.
+
+
+def _shell_exposes(cls, name: str) -> bool:
+    """Whether `name` resolves on `cls`, counting attributes the constructor
+    sets on the instance (`self.<name> = ...`).
+
+    `hasattr(cls, name)` alone is not enough: `is_offload` / `is_producer` are
+    class attributes on the `LMCacheOffload*` shells but instance attributes on
+    the `Multi*` composites (assigned in `__init__` from the sub-connectors), so
+    a class-level `hasattr` would false-flag them as missing on the composite.
+    Parse the class source for `self.<name> =` to cover that case without
+    constructing the class (which needs a live config and a worker build).
+    """
+    import inspect
+    import re
+
+    if hasattr(cls, name):
+        return True
+    try:
+        src = inspect.getsource(cls)
+    except (OSError, TypeError):
+        return False
+    return bool(re.search(rf"\bself\.{re.escape(name)}\s*=", src))
+
+
+def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
+    """The shell forwards by hand, so a new method is a silent no-op until
+    someone remembers to add it here too.
+
+    `Scheduler` holds the SHELL in `self.kv_connector`, never the
+    implementation. Most of those reads are `getattr(..., default)`, which does
+    not raise on a missing member -- it takes the default, forever. That is how
+    `enqueue_state_stores` refused every state store from the day it was
+    written: the method existed on `KimiK3OffloadScheduler`, the probe ran
+    against the shell, and the store path took its "nothing will carry these"
+    branch on every pass with one warning line to show for it.
+
+    So sweep for it. This reads the scheduler's source rather than a
+    hand-kept list, because a hand-kept list is the same failure one level up.
+    """
+    import inspect
+    import re
+
+    import atom.model_engine.scheduler as sched_mod
+    from atom.kv_transfer.disaggregation.multi.multi_connector import (
+        MultiConnectorScheduler,
+    )
+    from atom.kv_transfer.offload.connector import LMCacheOffloadConnectorScheduler
+
+    src = inspect.getsource(sched_mod)
+
+    # The Scheduler reads the shell two ways: directly (`self.kv_connector.x`)
+    # and through a local alias it hoists first (`conn = self.kv_connector; ...
+    # getattr(conn, "x")`). A scan that only matched `self.kv_connector` would
+    # silently drop every aliased read -- which is exactly how `max_pending_saves`
+    # escaped coverage before: `_state_store_pending_cap` reads it off a `conn`
+    # alias. So collect the alias names too -- any `<name> = self.kv_connector`
+    # that binds the connector itself, not a `.method()` result (those end in a
+    # call, so the `\s*$` anchor excludes them) -- and sweep reads through each.
+    readers = [r"self\.kv_connector"]
+    readers += [
+        re.escape(a)
+        for a in re.findall(
+            r"^\s*([A-Za-z_]\w*)\s*=\s*self\.kv_connector\s*$", src, re.MULTILINE
+        )
+    ]
+    probed: set[str] = set()
+    for r in readers:
+        probed |= set(re.findall(rf'getattr\(\s*{r},\s*"([a-z_]+)"', src))
+        probed |= set(re.findall(rf"{r}\.([a-z_]+)\(", src))
+        probed |= set(re.findall(rf"{r}\.([a-z_]+)\b", src))
+    # `_connector_flag(name)` is the same read one indirection along.
+    probed |= set(re.findall(r'_connector_flag\(\s*"([a-z_]+)"', src))
+    # `_impl` and `_state_tier_sub` are internal delegation helpers, not members
+    # of the forwarded face every shell must expose: `_impl` is the shell's own
+    # wrapped connector, and `_state_tier_sub` is the `multi` composite's private
+    # route to the state-tier sub, read only when the public `max_pending_saves`
+    # is None (so never on the plain shell, which always answers it).
+    probed.discard("_impl")
+    probed.discard("_state_tier_sub")
+    assert probed, "the scan found nothing -- it has stopped matching the source"
+
+    # A regex sweep degrades silently: hoist one `getattr(self.kv_connector,
+    # "x")` into a local alias and that read simply stops matching, shrinking
+    # `probed` without emptying it, so `assert probed` above still passes and
+    # `x` is quietly no longer covered. Anchor on members we know are read
+    # through the shell today -- the past incidents plus the flags -- so a
+    # rewrite that hides one of them fails here loudly instead of vacuously.
+    # Each name below is currently matched by one of the four patterns; if the
+    # scheduler stops reading it (a real removal), delete it from this set in
+    # the same change, deliberately.
+    must_be_seen = {
+        "should_defer_free",
+        "abandon_save",
+        "save_abandon_timeout_s",
+        "release_stalled_save",
+        "request_finished",
+        "build_connector_meta",
+        "process_completions",
+        "enqueue_state_stores",
+        "take_state_reports",
+        "take_state_source_releases",
+        "is_offload",
+        # Read through the `conn` alias in `_state_store_pending_cap`; only the
+        # alias-aware sweep above sees it, so anchor it so a regression to a
+        # `self.kv_connector`-only scan fails here loudly.
+        "max_pending_saves",
+    }
+    lost = sorted(must_be_seen - probed)
+    assert not lost, (
+        "the scan no longer sees these known reads -- the scheduler now reaches "
+        f"them in a form the regex does not match, so coverage silently dropped: "
+        f"{lost}. Update the patterns (or this anchor set) intentionally."
+    )
+
+    # Both scheduler-side shells must expose every probed member: the plain
+    # `LMCacheOffloadConnectorScheduler` AND the `MultiConnectorScheduler`
+    # composite the engine holds under `kv_transfer_config: multi`. The
+    # composite's misses are the same silent default -- `Scheduler` reads it off
+    # `self.kv_connector`, which under `multi` IS the composite.
+    #
+    # `max_pending_saves` is the one deliberate exception. The plain shell
+    # answers it as a public property; the composite bounds nothing of its own
+    # and routes the read through its state-tier sub (`_state_tier_sub`), so it
+    # does not expose the member directly. That routing is intentional -- it is
+    # listed here. Anything ELSE the composite fails to expose is NOT routed and
+    # lands as a failure below, forcing a deliberate decision rather than a
+    # silent default; add it here only with the routing that covers it.
+    multi_routes_via_sub: set[str] = {"max_pending_saves"}
+    for shell in (LMCacheOffloadConnectorScheduler, MultiConnectorScheduler):
+        allow = multi_routes_via_sub if shell is MultiConnectorScheduler else set()
+        missing = sorted(
+            n for n in probed if n not in allow and not _shell_exposes(shell, n)
+        )
+        assert not missing, (
+            f"Scheduler reads these off `kv_connector`, but {shell.__name__} does "
+            f"not expose them, so each silently takes its default: {missing}"
+        )
+
+
+def test_every_member_the_worker_reads_is_reachable_through_the_shell():
+    """The worker forwarding axis, swept the same way as the scheduler axis.
+
+    `ModelRunner` / `forward_context` hold the WORKER shell in `connector`, and
+    read members off it by hand exactly as the scheduler does off
+    `self.kv_connector`. This axis has its own two shells --
+    `LMCacheOffloadConnector` and the `MultiConnector` composite -- and the same
+    silent-fallthrough failure: `close` was added to every `_impl` and to the
+    scheduler shell but not to either worker shell, so `getattr(connector,
+    "close", None)` resolved to None and worker teardown never ran (use-after-
+    free on the KV pool at `destroy_dist_env`, or the interpreter-shutdown hang
+    `close` exists to prevent). Read the driver's source, not a hand-kept list,
+    for the same reason the scheduler sweep does.
+    """
+    import pathlib
+    import re
+
+    import atom
+    from atom.kv_transfer.disaggregation.multi.multi_connector import MultiConnector
+    from atom.kv_transfer.offload.connector import LMCacheOffloadConnector
+
+    # Read the driver sources off disk rather than importing them.
+    # `model_runner` imports aiter at module load, which is absent on the
+    # non-GPU CI runner -- importing it here would turn this sweep into a
+    # collection error on exactly the machine that runs it. The sweep only ever
+    # wanted the text.
+    root = pathlib.Path(atom.__file__).parent
+    sources = (
+        root / "model_engine" / "model_runner.py",
+        root / "utils" / "forward_context.py",
+    )
+    probed: set[str] = set()
+    for path in sources:
+        assert path.is_file(), f"driver source moved: {path}"
+        src = path.read_text()
+        probed |= set(re.findall(r'getattr\(\s*connector,\s*"([a-z_]+)"', src))
+        probed |= set(re.findall(r"\bconnector\.([a-z_]+)\(", src))
+        probed |= set(re.findall(r"\bconnector\.([a-z_]+)\b", src))
+    probed.discard("_impl")
+    assert probed, "the scan found nothing -- it has stopped matching the source"
+
+    # Same regex-rot guard as the scheduler sweep: anchor on reads we know the
+    # worker driver makes today, so a pattern that stops matching fails loudly
+    # here rather than shrinking `probed` in silence. `close` is the whole point
+    # of this sweep -- the member whose absence this test was written to catch.
+    must_be_seen = {"close", "register_kv_caches", "start_load_kv", "get_finished"}
+    lost = sorted(must_be_seen - probed)
+    assert not lost, (
+        "the scan no longer sees these known worker reads -- coverage silently "
+        f"dropped: {lost}. Update the patterns (or this anchor set) intentionally."
+    )
+
+    for shell in (LMCacheOffloadConnector, MultiConnector):
+        missing = sorted(n for n in probed if not _shell_exposes(shell, n))
+        assert not missing, (
+            f"The worker reads these off `connector`, but {shell.__name__} does "
+            f"not expose them, so each silently takes its default: {missing}"
+        )
+
+
+def test_the_shells_no_impl_fallbacks_match_what_the_caller_unpacks():
+    """Existence is not enough -- a fallback of the wrong SHAPE is worse.
+
+    The sweep above catches a member the shell never defines. It does not catch
+    a member the shell defines with a fallback the caller cannot consume, which
+    is how `take_state_reports` returned three empty sets to
+    `indexed, failed = take()` and took the engine worker down mid-run: every
+    surviving TP rank then blocked forever in the next collective, so the server
+    accepted requests and returned nothing.
+
+    Drive the shell with an `_impl` that defines nothing, and hold each
+    remaining fallback against the contract its caller relies on. The set is
+    exactly the tier/policy methods that are OPTIONAL on an impl: the state face
+    (`take_state_reports`, `enqueue_state_*`), `chunk_size`, and the two prefill
+    hints. The save/load lifecycle is no longer here -- it is declared abstract
+    on `OffloadSchedulerMixin`, so those forwards are unconditional and every
+    real impl defines them (proven by the two sibling sweeps); a no-`_impl`
+    stub is not a valid impl for them.
+    """
+    from types import SimpleNamespace
+
+    from atom.kv_transfer.offload.connector import LMCacheOffloadConnectorScheduler
+
+    shell = object.__new__(LMCacheOffloadConnectorScheduler)
+    shell._impl = SimpleNamespace()
+
+    indexed, failed = shell.take_state_reports()  # `indexed, failed = take()`
+    assert (indexed, failed) == (set(), set())
+
+    assert shell.enqueue_state_stores([]) is False  # `bool(enqueue(stores))`
+    assert shell.enqueue_state_loads([]) is False
+    assert shell.should_park_partial_prefill_for_load(None) is False
+    # Unchanged, so a connector with no opinion does not shrink the chunk.
+    assert shell.adjust_prefill_chunk_after_alloc(None, 7) == 7
+
+
+def test_every_unconditional_shell_forward_exists_on_every_impl():
+    """The other half of the shell contract: a forward that does NOT guard.
+
+    Two tests above cover the members the scheduler reads off the shell, and the
+    getattr-guarded fallbacks the shell defines. Neither covers the third shape:
+    a shell method whose body is a bare `return self._impl.NAME(...)`. When the
+    variant `_impl` chosen for a layout does not define `NAME`, that forward
+    raises AttributeError inside a scheduler step -- and because the step runs on
+    every TP rank, one rank dies and the survivors block forever in the next
+    collective. The shell has three `_impl` types (dense / kimi_k3 / dsv4), so an
+    unconditional forward is only safe if the method resolves on all three.
+
+    Scan the shell's own source for those bare forwards -- reading the source,
+    not a hand-kept list, for the same reason the sweep above does -- and hold
+    each forwarded name against every concrete impl through its full MRO.
+    """
+    import ast
+    import inspect
+
+    from atom.kv_transfer.offload.connector import LMCacheOffloadConnectorScheduler
+    from atom.kv_transfer.offload.hybrid.dsv4.connector import DSV4OffloadScheduler
+
+    shell_src = inspect.getsource(LMCacheOffloadConnectorScheduler)
+    shell_ast = ast.parse(shell_src)
+    (shell_cls,) = [n for n in shell_ast.body if isinstance(n, ast.ClassDef)]
+
+    def _is_unconditional_forward(fn):
+        """A method whose ONLY statement (past a docstring) forwards straight to
+        `self._impl.<name>(...)` -- either `return self._impl.<name>(...)` or the
+        bare void call `self._impl.<name>(...)`. No getattr, no `if callable`: if
+        the impl lacks `<name>`, this raises AttributeError at call time."""
+        body = [
+            s
+            for s in fn.body
+            if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))
+        ]
+        if len(body) != 1:
+            return None
+        stmt = body[0]
+        # `ast.Expr` is a void forward, which returns None implicitly.
+        if not isinstance(stmt, (ast.Return, ast.Expr)):
+            return None
+        call = stmt.value
+        if not isinstance(call, ast.Call):
+            return None
+        target = call.func  # self._impl.<name>
+        if (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Attribute)
+            and target.value.attr == "_impl"
+            and isinstance(target.value.value, ast.Name)
+            and target.value.value.id == "self"
+        ):
+            return target.attr
+        return None
+
+    forwards = sorted(
+        {
+            name
+            for fn in shell_cls.body
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+            for name in [_is_unconditional_forward(fn)]
+            if name
+        }
+    )
+    assert forwards, "found no unconditional forwards -- the scan stopped matching"
+
+    impls = {
+        "dense": DenseOffloadScheduler,
+        "kimi_k3": KimiK3OffloadScheduler,
+        "dsv4": DSV4OffloadScheduler,
+    }
+    broken = {
+        layout: [name for name in forwards if not hasattr(cls, name)]
+        for layout, cls in impls.items()
+    }
+    broken = {layout: names for layout, names in broken.items() if names}
+    assert not broken, (
+        "the shell forwards these unconditionally, but the named `_impl` does "
+        "not define them, so the forward raises AttributeError mid-step and "
+        f"wedges the TP group for that layout: {broken}"
+    )
+
+
+def test_offload_mixin_lifecycle_is_enforced_at_construction():
+    """The abstract lifecycle contract is enforcement, not documentation.
+
+    `OffloadSchedulerMixin` inherits `ABC`, so ABCMeta refuses to instantiate a
+    subclass that leaves any of the six save/load methods unimplemented. This is
+    the mechanism that turns a missing forwarder into a construction-time
+    TypeError instead of a silent no-op behind the delegating shell -- the
+    failure mode that let DSV4 ship without `abandon_save`. (On a *plain* class
+    `@abstractmethod` is collected but never enforced; this test would pass
+    vacuously, so it also guards the `ABC` base itself.)
+    """
+    from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
+
+    class MissingAbandon(OffloadSchedulerMixin):
+        def save_finished(self, req_id): ...
+
+        def release_stalled_save(self, seq): ...
+
+        def load_failed(self, req_id):
+            return False
+
+        def load_finished(self, req_id):
+            return True
+
+        def cancel_pending_load(self, seq): ...
+
+        # abandon_save deliberately left unimplemented.
+
+    with pytest.raises(TypeError, match="abandon_save"):
+        MissingAbandon()
+
+    class AllPresent(MissingAbandon):
+        def abandon_save(self, req_id): ...
+
+    AllPresent()  # the full contract constructs cleanly
+
+
+def test_only_kimi_k3_wears_the_state_offload_face():
+    """`has_state_tier` routes state stores and loads, so it must key on a
+    property only the tier-hosting layout has. The shell defines every state
+    forward, so forward presence cannot be that key -- the face type can. Only
+    kimi_k3 hosts the state tier; dense and dsv4-page do not."""
+    from atom.kv_transfer.offload._offload_common import StateOffloadFace
+    from atom.kv_transfer.offload.hybrid.dsv4.connector import DSV4OffloadScheduler
+
+    assert issubclass(KimiK3OffloadScheduler, StateOffloadFace)
+    assert not issubclass(DenseOffloadScheduler, StateOffloadFace)
+    assert not issubclass(DSV4OffloadScheduler, StateOffloadFace)
+
+
+def test_state_offload_face_is_enforced_at_construction():
+    """Like the lifecycle contract: an impl that claims the face but leaves a
+    tier method unimplemented is a construction-time TypeError, not a shell
+    forward that silently returns the no-tier default."""
+    from atom.kv_transfer.offload._offload_common import StateOffloadFace
+
+    class MissingReports(StateOffloadFace):
+        def enqueue_state_loads(self, loads):
+            return True
+
+        def enqueue_state_stores(self, stores):
+            return True
+
+        def take_state_source_releases(self):
+            return set()
+
+        # take_state_reports deliberately left unimplemented.
+
+    with pytest.raises(TypeError, match="take_state_reports"):
+        MissingReports()
+
+
+def test_shell_has_state_tier_tracks_the_face_not_forward_presence():
+    """The regression `StateOffloadFace` closes: an `_impl` that merely *exposes*
+    `enqueue_state_stores` (as any shell forward would) but is not a real state
+    host must NOT read as tier-hosting. The old presence check said True here and
+    routed state calls to a no-tier impl; the isinstance check says False."""
+    from types import SimpleNamespace
+
+    from atom.kv_transfer.offload.connector import (
+        LMCacheOffloadConnectorScheduler as Shell,
+    )
+
+    shell = object.__new__(Shell)
+    shell._impl = SimpleNamespace(enqueue_state_stores=lambda stores: False)
+    assert shell.has_state_tier is False
+
+
+# ── kimi_k3: the two joint legs report different identities ───────────────
+
+
+def _k3_worker(*, tier: bool = True) -> KimiK3OffloadConnector:
+    """Only what the joint overrides touch.
+
+    `_state_tier` is a truthy sentinel by default and never called: these tests
+    drive `_arm_joint_loads`/`_settle_joint` directly. A joint load is armed
+    with or without a tier -- with no tier the state leg is failed for recompute
+    (`_fail_state_loads`) and the park settles the pair into `failed_loading`
+    once the KV leg lands, rather than letting the KV leg pass through as a
+    phantom state-restore success. `tier=False` exercises that path.
+    """
+    c = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
+    c._joint_park = _JointPark()
+    c._state_tier = object() if tier else None
+    c._do_load = True
+    return c
+
+
+def _k3_load_req(req_id: str, generation: int = 0):
+    """A load request shaped like `build_connector_meta`'s: it always attaches a
+    `load_operation`, which is what makes the KV leg report the typed id."""
+    return SimpleNamespace(
+        req_id=req_id,
+        load_spec=object(),
+        load_operation=LoadOperationId(req_id, generation),
+    )
+
+
+class TestJointLegsShareOneCompletionIdentity:
+    """The KV leg reports `LoadOperationId`, the state tier reports the bare id.
+
+    Arming under the bare id parked nothing the KV leg could settle: the KV
+    completion passed straight through and the engine could resume the suffix
+    prefill while the state H2D was still writing the Active Slot. These pin
+    the identity down with a real `LoadOperationId`, not two raw ids.
+    """
+
+    def test_a_park_armed_with_a_kv_id_answers_to_both_legs(self):
+        park = _JointPark()
+        kv_id = LoadOperationId("r1", 3)
+        park.arm("r1", needs_kv=True, needs_state=True, kv_id=kv_id)
+        assert park.waits_for(kv_id)
+        assert park.waits_for("r1")
+
+    def test_the_kv_leg_alone_does_not_wake_the_request(self):
+        worker = _k3_worker()
+        req = _k3_load_req("r1")
+        meta = SimpleNamespace(state_loads=[("r1", 99, 0)], requests=[req])
+        worker._arm_joint_loads(meta)
+
+        # Exactly what the dense worker puts on the wire for this load.
+        kv_report = {req.load_operation}
+        done, failed = worker._settle_joint(kv_report, set(), set(), set())
+        assert done == set(), "KV must not pass through while state is in flight"
+        assert failed == set()
+
+    def test_both_legs_wake_it_once_under_the_kv_identity(self):
+        worker = _k3_worker()
+        req = _k3_load_req("r1")
+        worker._arm_joint_loads(
+            SimpleNamespace(state_loads=[("r1", 99, 0)], requests=[req])
+        )
+        worker._settle_joint({req.load_operation}, set(), set(), set())
+        done, failed = worker._settle_joint(set(), set(), {"r1"}, set())
+        # The engine matches `finished_loading` against the operation it issued,
+        # so the wake has to carry that identity, not the bare id.
+        assert done == {req.load_operation}
+        assert failed == set()
+        assert not worker._joint_park.waits_for("r1")
+
+    def test_either_leg_failing_fails_the_pair(self):
+        worker = _k3_worker()
+        req = _k3_load_req("r1")
+        worker._arm_joint_loads(
+            SimpleNamespace(state_loads=[("r1", 99, 0)], requests=[req])
+        )
+        worker._settle_joint({req.load_operation}, set(), set(), set())
+        done, failed = worker._settle_joint(set(), set(), set(), {"r1"})
+        assert done == set()
+        assert failed == {req.load_operation}
+
+
+class TestJointParkExpiry:
+    """`_JointPark`'s abort/expiry/eviction exit (finding #3).
+
+    A joint park is released only by both legs reporting. Three cases leave one
+    leg forever unreported: the request is aborted mid-load (the KV leg is
+    cancelled scheduler-side and never reports, while the state tier's leg still
+    lands -- half a report cannot release the pair), a worker thread is killed
+    mid-transfer, or a completion is dropped. Without an exit the key -- with its
+    `_alias`/`_alias_of` -- sat in `_need` for the process's life, and worse,
+    `_settle_joint` swallowed every later KV completion reusing the stale
+    `kv_id`. The abort signal is scheduler-side and cannot reach this worker-side
+    park, so `reclaim_stale_parks` (swept from `get_finished`, on LMCache's
+    save-abandon window) is the exit; re-admission is handled by `arm`'s purge.
+    """
+
+    def test_reclaim_evicts_parks_past_the_window_and_spares_fresh_ones(
+        self, monkeypatch
+    ):
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(
+            "atom.kv_transfer.offload.hybrid.kimi_k3.state_tier.monotonic",
+            lambda: clock["t"],
+        )
+        park = _JointPark()
+        old = LoadOperationId("old", 0)
+        park.arm("old", needs_kv=True, needs_state=True, kv_id=old)
+        clock["t"] = 1100.0  # 100s later
+        fresh = LoadOperationId("fresh", 0)
+        park.arm("fresh", needs_kv=True, needs_state=True, kv_id=fresh)
+
+        clock["t"] = 1100.0 + 30.0  # 130s: old is 130s stale, fresh 30s
+        evicted = park.reclaim_stale_parks(60.0)
+
+        assert evicted == 1
+        assert not park.waits_for(old)
+        assert park.waits_for(fresh)
+        # Eviction, not settlement: no ready/failed manufactured for `old`.
+        assert park.take_ready() == (set(), set())
+        assert "old" not in park._alias and old not in park._alias_of
+
+    def test_a_report_after_reclaim_passes_through_instead_of_wedging(
+        self, monkeypatch
+    ):
+        clock = {"t": 500.0}
+        monkeypatch.setattr(
+            "atom.kv_transfer.offload.hybrid.kimi_k3.state_tier.monotonic",
+            lambda: clock["t"],
+        )
+        park = _JointPark()
+        kv_id = LoadOperationId("r1", 0)
+        park.arm("r1", needs_kv=True, needs_state=True, kv_id=kv_id)
+        clock["t"] = 500.0 + 120.0
+        assert park.reclaim_stale_parks(60.0) == 1
+
+        # The lost report finally lands: the key is gone, so it is not held.
+        assert not park.waits_for("r1")
+
+    def test_reclaim_lets_a_reused_kv_id_wake_a_new_load(self, monkeypatch):
+        """The wedge finding #3 names: a stranded park swallowing later loads.
+
+        Age a park past the window and reclaim it, then let a fresh load reuse
+        the same `LoadOperationId`. Its KV completion must pass through as a real
+        wake, not be absorbed by a surviving `waits_for` from the lost load.
+        """
+        clock = {"t": 0.0}
+        monkeypatch.setattr(
+            "atom.kv_transfer.offload.hybrid.kimi_k3.state_tier.monotonic",
+            lambda: clock["t"],
+        )
+        worker = _k3_worker()
+        req = _k3_load_req("r1")
+        worker._arm_joint_loads(
+            SimpleNamespace(state_loads=[("r1", 99, 0)], requests=[req])
+        )
+        assert worker._joint_park.waits_for(req.load_operation)
+
+        clock["t"] = 999.0  # long past any window
+        assert worker._joint_park.reclaim_stale_parks(60.0) == 1
+        assert not worker._joint_park.waits_for(req.load_operation)
+
+        # A later load reuses the same operation id (id reuse across admissions).
+        done, failed = worker._settle_joint({req.load_operation}, set(), set(), set())
+        assert done == {req.load_operation}, "reused kv_id must not be swallowed"
+        assert failed == set()
+
+    def test_worker_reclaim_uses_the_save_abandon_window(self, monkeypatch):
+        """`get_finished`'s sweep derives its window from LMCache's own
+        save-abandon timeout, not a hardcoded constant."""
+        clock = {"t": 0.0}
+        monkeypatch.setattr(
+            "atom.kv_transfer.offload.hybrid.kimi_k3.state_tier.monotonic",
+            lambda: clock["t"],
+        )
+        monkeypatch.setattr(
+            "atom.kv_transfer.offload.hybrid.kimi_k3.connector."
+            "offload_save_abandon_timeout_s",
+            lambda: 60.0,
+        )
+        worker = _k3_worker()
+        req = _k3_load_req("r1")
+        worker._arm_joint_loads(
+            SimpleNamespace(state_loads=[("r1", 99, 0)], requests=[req])
+        )
+
+        clock["t"] = 30.0  # inside the window: spared
+        worker._reclaim_stale_parks()
+        assert worker._joint_park.waits_for(req.load_operation)
+
+        clock["t"] = 90.0  # past the 60s window: evicted
+        worker._reclaim_stale_parks()
+        assert not worker._joint_park.waits_for(req.load_operation)
+
+    def test_worker_reclaim_is_disabled_when_the_window_is_nonpositive(
+        self, monkeypatch
+    ):
+        """`<= 0` means the operator turned the pin timeout off; matching the
+        engine's pin/orphan-slot reconcilers, the sweep then does nothing."""
+        clock = {"t": 0.0}
+        monkeypatch.setattr(
+            "atom.kv_transfer.offload.hybrid.kimi_k3.state_tier.monotonic",
+            lambda: clock["t"],
+        )
+        monkeypatch.setattr(
+            "atom.kv_transfer.offload.hybrid.kimi_k3.connector."
+            "offload_save_abandon_timeout_s",
+            lambda: 0.0,
+        )
+        worker = _k3_worker()
+        req = _k3_load_req("r1")
+        worker._arm_joint_loads(
+            SimpleNamespace(state_loads=[("r1", 99, 0)], requests=[req])
+        )
+        clock["t"] = 10_000.0  # arbitrarily old
+        worker._reclaim_stale_parks()
+        assert worker._joint_park.waits_for(req.load_operation)
+
+
+class _RecordingExecutor:
+    def __init__(self, log: list, name: str) -> None:
+        self._log = log
+        self._name = name
+
+    def shutdown(self, wait: bool = True) -> None:
+        self._log.append((self._name, "shutdown", wait))
+
+
+class _RecordingTier:
+    def __init__(self, log: list) -> None:
+        self._log = log
+
+    def drain(self) -> None:
+        self._log.append(("tier", "drain"))
+
+    def shutdown(self) -> None:
+        self._log.append(("tier", "shutdown"))
+
+
+def test_worker_close_drains_tier_then_joins_all_executors():
+    """Teardown order is load-bearing: the state tier drains (an in-flight copy
+    finishes against a still-mapped KV pool) and joins its own threads before
+    the base save/load pools go, and all of it before the pool is dropped."""
+    log: list = []
+    c = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
+    c._state_tier = _RecordingTier(log)
+    c._save_executor = _RecordingExecutor(log, "save")
+    c._load_executor = _RecordingExecutor(log, "load")
+
+    c.close()
+
+    assert log == [
+        ("tier", "drain"),
+        ("tier", "shutdown"),
+        ("save", "shutdown", True),
+        ("load", "shutdown", True),
+    ]
+
+
+def test_worker_close_is_a_noop_when_no_tier_was_built():
+    """Under PP or a non-owning layout the tier is never built; close must still
+    join the base executors and not crash on the missing tier."""
+    log: list = []
+    c = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
+    c._state_tier = None
+    c._save_executor = _RecordingExecutor(log, "save")
+    c._load_executor = _RecordingExecutor(log, "load")
+
+    c.close()
+
+    assert log == [("save", "shutdown", True), ("load", "shutdown", True)]
+    # Idempotent: executors already shut down, no tier -> nothing more recorded.
+    c.close()
+    assert log == [
+        ("save", "shutdown", True),
+        ("load", "shutdown", True),
+        ("save", "shutdown", True),
+        ("load", "shutdown", True),
+    ]
+
+
+def test_the_park_does_not_leak_an_entry_per_joint_load():
+    worker = _k3_worker()
+    for i in range(4):
+        req = _k3_load_req(f"r{i}")
+        worker._arm_joint_loads(
+            SimpleNamespace(state_loads=[(req.req_id, 99, 0)], requests=[req])
+        )
+        worker._settle_joint({req.load_operation}, set(), {req.req_id}, set())
+    park = worker._joint_park
+    assert park._need == {}
+    assert park._alias == {}
+    assert park._alias_of == {}
+
+
+def test_with_no_tier_the_joint_load_fails_for_recompute():
+    """No tier means the state leg cannot be served, so the pair must reach
+    the engine as `failed_loading` (recompute), never as a phantom success.
+
+    Arming a joint load with no tier and then failing its state leg
+    (`_fail_state_loads`) leaves the park owing only the KV leg; when the KV
+    completion lands, `_settle_joint` releases the pair into `failed_loading`
+    -- and the park does not leak the entry, because that same KV completion
+    is what releases it. Skipping the arm instead let the KV leg pass through
+    as `finished_loading`, which `Scheduler._settle_state_load(ok=True)`
+    miscounts as a state restore that never happened."""
+    worker = _k3_worker(tier=False)
+    req = _k3_load_req("r1")
+    meta = SimpleNamespace(state_loads=[("r1", 99, 0)], requests=[req])
+    worker._arm_joint_loads(meta)
+    assert worker._joint_park.waits_for(req.load_operation)
+
+    # `_start_state_loads` on the no-tier path fails the state leg.
+    worker._start_state_loads(meta)
+    # The KV leg has not landed yet: the pair is still held, not passed.
+    done, failed = worker._settle_joint(set(), set(), set(), set())
+    assert done == set()
+    assert failed == set()
+    assert worker._joint_park.waits_for(req.load_operation)
+
+    # KV completion lands -> the pair resolves to failed, and nothing leaks.
+    done, failed = worker._settle_joint({req.load_operation}, set(), set(), set())
+    assert done == set(), "no phantom finished_loading with no tier"
+    assert failed == {req.load_operation}
+    assert not worker._joint_park.waits_for(req.load_operation)
+    assert worker._joint_park._need == {}
+    assert worker._joint_park._alias == {}
+    assert worker._joint_park._alias_of == {}
+
+
+def test_a_single_leg_request_still_passes_straight_through():
+    """Nothing armed it, so neither channel may be held back."""
+    worker = _k3_worker()
+    kv_only = LoadOperationId("r9", 0)
+    done, _failed = worker._settle_joint({kv_only}, set(), set(), set())
+    assert done == {kv_only}
+    done, _failed = worker._settle_joint(set(), set(), {"r8"}, set())
+    assert done == {"r8"}
+
+
+# ── kimi_k3: a re-stored prefix must survive the aggregator's tombstone ────
+
+
+class TestStateStoreCompletionsCarryAGeneration:
+    """`KVOutputAggregator` tombstones every `(channel, operation_id)` it has
+    taken quorum on -- `should_tombstone` for the connector channel is
+    `lambda _key: True`. Under a bare hash the second store of a re-evicted
+    prefix was therefore dropped before quorum: its pin waited for stale
+    reclamation and the CPU index never learned the bytes were back."""
+
+    @staticmethod
+    def _report(agg, op):
+        out = KVConnectorOutput()
+        out.connector_completions.add(
+            ConnectorCompletion(STATE_INDEX_CHANNEL, op, True)
+        )
+        return agg.aggregate([out]).connector_completions
+
+    def test_a_bare_hash_would_be_dropped_the_second_time(self):
+        """Pins the aggregator behaviour this fix works around, so a change to
+        it does not silently make the generation look unnecessary."""
+        agg = KVOutputAggregator(world_size=1)
+        assert self._report(agg, 4242) != set()
+        assert self._report(agg, 4242) == set()
+
+    def test_two_generations_of_one_hash_both_reach_the_engine(self):
+        agg = KVOutputAggregator(world_size=1)
+        first = StateStoreOperationId(4242, 1)
+        second = StateStoreOperationId(4242, 2)
+        assert self._report(agg, first) == {
+            ConnectorCompletion(STATE_INDEX_CHANNEL, first, True)
+        }
+        assert self._report(agg, second) == {
+            ConnectorCompletion(STATE_INDEX_CHANNEL, second, True)
+        }
+
+    def test_the_scheduler_half_keeps_the_operation_whole(self):
+        """`connector_completion` used to narrow the id to `int`, which would
+        undo the generation on the way to `settle_state_store`."""
+        s = _k3_scheduler()
+        op = StateStoreOperationId(4242, 7)
+        assert s.connector_completion(
+            ConnectorCompletion(STATE_INDEX_CHANNEL, op, True)
+        )
+        indexed, failed = s.take_state_reports()
+        assert indexed == {op}
+        assert failed == set()
+
+
+# ── kimi_k3: loads must not queue behind a backlog of stores ───────────────
+
+
+class TestStateLoadsAndStoresRunInSeparateLanes:
+    """A load is on the TTFT critical path and a store is not, but one serial
+    executor made that ordering unenforceable: a load submitted in a later step
+    sat behind every store already queued, and a stuck store blocked all of
+    them. Putting same-step loads first cannot overtake queued work."""
+
+    class _BlockingCodec:
+        """A codec whose stores hang until released; loads always land."""
+
+        def __init__(self):
+            self.gate = threading.Event()
+            self.loaded = threading.Event()
+
+        def put(self, h, unit_ids, on_source_released=None):
+            self.gate.wait(timeout=5)
+            if on_source_released is not None:
+                on_source_released()
+            return True
+
+        def get(self, h, slot):
+            self.loaded.set()
+            return True
+
+    def _tier(self, codec, **kw):
+        from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import (
+            StateOffloadTier,
+        )
+
+        return StateOffloadTier(codec, **kw)
+
+    def test_a_load_lands_while_a_store_is_still_stuck(self):
+        codec = self._BlockingCodec()
+        tier = self._tier(codec)
+        try:
+            for gen in range(4):
+                tier.submit_store(StateStoreOperationId(gen, gen + 1), (0,))
+            tier.submit_load("r1", 77, 0)
+            assert codec.loaded.wait(
+                timeout=5
+            ), "the load waited behind the store backlog"
+            done, failed = tier.get_finished()
+            assert done == {"r1"}
+            assert failed == set()
+        finally:
+            codec.gate.set()
+            tier.shutdown()
+
+    def test_one_lane_serialises_the_load_behind_the_inflight_store(self):
+        """`staging_lanes=1` serialises the two lanes: a load waits out the
+        single in-flight store, but still not the backlog behind it. It does
+        *not* change standing HBM -- the staging buffer is per-thread and both
+        executors are `max_workers=1`, so HBM is two buffers either way; this
+        knob only gates load/store concurrency, which is what this asserts."""
+        codec = self._BlockingCodec()
+        tier = self._tier(codec, staging_lanes=1)
+        try:
+            for gen in range(3):
+                tier.submit_store(StateStoreOperationId(gen, gen + 1), (0,))
+            tier.submit_load("r1", 77, 0)
+            assert not codec.loaded.wait(timeout=0.2), "held by the in-flight store"
+            codec.gate.set()
+            assert codec.loaded.wait(timeout=5)
+        finally:
+            codec.gate.set()
+            tier.shutdown()
+
+    def test_the_oldest_store_age_is_visible_while_it_hangs(self):
+        codec = self._BlockingCodec()
+        tier = self._tier(codec)
+        try:
+            assert tier.oldest_store_age_s() == 0.0
+            tier.submit_store(StateStoreOperationId(1, 1), (0,))
+            assert tier.oldest_store_age_s() >= 0.0
+            assert len(tier._store_submitted_at) == 1
+        finally:
+            codec.gate.set()
+            tier.drain()
+            assert tier.oldest_store_age_s() == 0.0
+            tier.shutdown()
+
+    class _EarlyReleaseCodec:
+        """`put` releases the source (D2H drained) and then stalls in the CPU
+        `batched_put`, so a drain can observe the early release *before* the
+        store completes -- exactly the window the source/store split exists
+        for."""
+
+        def __init__(self):
+            self.released = threading.Event()
+            self.gate = threading.Event()
+
+        def put(self, h, unit_ids, on_source_released=None):
+            if on_source_released is not None:
+                on_source_released()  # D2H is done here, CPU put is not
+            self.released.set()
+            self.gate.wait(timeout=5)
+            return True
+
+        def get(self, h, slot):
+            return True
+
+    def test_source_release_is_emitted_once_early_not_again_at_store_end(self):
+        """The release must land the instant the D2H drains (before the CPU
+        put), and must not be re-emitted when `_do_store` returns. A second
+        emission across two engine drains double-unpins the same record."""
+        codec = self._EarlyReleaseCodec()
+        tier = self._tier(codec)
+        op = StateStoreOperationId(1, 1)
+        try:
+            tier.submit_store(op, (0,))
+            assert codec.released.wait(timeout=5), "the D2H callback never fired"
+            # Early: units handed back while the CPU put is still running.
+            assert tier.take_source_releases() == {op}
+            # Finish the store; the end-of-store backstop must stay silent.
+            codec.gate.set()
+            tier.drain()
+            assert tier.take_source_releases() == set(), "source release re-emitted"
+            assert tier.take_store_reports() == ({op}, set())
+        finally:
+            codec.gate.set()
+            tier.shutdown()
+
+    def test_a_refused_store_still_releases_its_units(self):
+        """A refused allocation never fires the D2H callback and never read the
+        units, so the backstop must release them -- withholding it would hold an
+        image out of the KV pool until the stale reclaimer noticed."""
+
+        class _RefuseCodec:
+            def put(self, h, unit_ids, on_source_released=None):
+                return False  # allocation refused; callback never reached
+
+            def get(self, h, slot):
+                return True
+
+        tier = self._tier(_RefuseCodec())
+        op = StateStoreOperationId(2, 1)
+        try:
+            tier.submit_store(op, (0,))
+            tier.drain()
+            assert tier.take_source_releases() == {op}
+            assert tier.take_store_reports() == (set(), {op})
+        finally:
+            tier.shutdown()
+
+    def test_a_throwing_store_still_releases_its_units(self):
+        """A throwing `pack` drains the device before it propagates, so the GPU
+        has stopped reading the units by the time control returns -- the backstop
+        releases them and the store is reported failed, not lost."""
+
+        class _ThrowCodec:
+            def put(self, h, unit_ids, on_source_released=None):
+                raise RuntimeError("pack blew up")
+
+            def get(self, h, slot):
+                return True
+
+        tier = self._tier(_ThrowCodec())
+        op = StateStoreOperationId(3, 1)
+        try:
+            tier.submit_store(op, (0,))
+            tier.drain()
+            assert tier.take_source_releases() == {op}
+            assert tier.take_store_reports() == (set(), {op})
+        finally:
+            tier.shutdown()

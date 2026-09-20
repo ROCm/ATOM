@@ -27,6 +27,7 @@ from aiter import (
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
+from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
 from atom.plugin.prepare import is_vllm
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
@@ -39,7 +40,8 @@ logger = logging.getLogger("atom")
 # co-scheduled prefill contexts) is unbounded by max_num_batched_tokens, so a
 # burst of long-context requests can push a single allocation to tens of GiB
 # and OOM the engine. Chunking along the Q-row dimension keeps the buffer within
-# this budget. 0 disables chunking (always single-shot).
+# this budget. 0 disables the soft budget; the hard 2 GiB buffer-descriptor cap
+# in sparse_indexer_row_chunk still applies.
 _SPARSE_INDEXER_LOGITS_BUDGET_MB = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
 
 
@@ -273,6 +275,8 @@ def sparse_attn_indexer_plugin_mode(
     try:
         from vllm.forward_context import (
             get_forward_context as get_vllm_forward_context,
+        )
+        from vllm.forward_context import (
             is_forward_context_available as is_vllm_ctx_available,
         )
 
@@ -349,7 +353,6 @@ def sparse_attn_indexer_plugin_mode(
     if has_prefill:
         prefill_metadata = indexer_meta.prefill
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
-        budget_bytes = _SPARSE_INDEXER_LOGITS_BUDGET_MB * 1024 * 1024
         for chunk in prefill_metadata.chunks:
             k_fp8 = torch.empty(
                 [chunk.total_seq_lens, head_dim],
@@ -375,31 +378,17 @@ def sparse_attn_indexer_plugin_mode(
             # total_committed (the column dim = sum of co-scheduled prefill
             # contexts) is unbounded by max_num_batched_tokens, so a burst of
             # long-context requests can push a single allocation to tens of GiB
-            # (#1376). Chunk along the Q (row) dimension so [row_chunk,
-            # total_committed] fp32 stays within budget_bytes — row_chunk shrinks
-            # as total_committed grows. Each row chunk still scores the FULL KV,
-            # so every row's top-k is exact with no cross-chunk merge and the
+            # (#1376) — and landing on exactly 2 GiB aborts every rank in the
+            # Triton backend. Chunk along the Q (row) dimension so [row_chunk,
+            # total_committed] fp32 stays within budget — row_chunk shrinks as
+            # total_committed grows. Each row chunk still scores the FULL KV, so
+            # every row's top-k is exact with no cross-chunk merge and the
             # kernel's per-row column indices need no remapping.
             total_committed = int(chunk.total_seq_lens)
             total_rows = chunk.token_end - chunk.token_start
-            if (
-                budget_bytes > 0
-                and total_committed > 0
-                and budget_bytes // (total_committed * 4) < total_rows
-            ):
-                # 4 bytes per fp32 logit; total_committed * 4 is one row's
-                # footprint. Round the budget-derived row count DOWN to a
-                # multiple of 128 (aligned to the kernel's row tiling); when the
-                # budget affords < 128 rows (extreme total_committed), fall back
-                # to a power-of-2 floor so it degrades 64/32/.../1 instead of
-                # collapsing straight to 1.
-                budget_rows = budget_bytes // (total_committed * 4)
-                if budget_rows >= 128:
-                    row_chunk = (budget_rows // 128) * 128
-                else:
-                    row_chunk = 1 << (max(1, budget_rows).bit_length() - 1)
-            else:
-                row_chunk = total_rows
+            row_chunk = sparse_indexer_row_chunk(
+                total_rows, total_committed, _SPARSE_INDEXER_LOGITS_BUDGET_MB
+            )
 
             for row_start in range(0, total_rows, row_chunk):
                 row_end = min(row_start + row_chunk, total_rows)
@@ -457,14 +446,27 @@ def sparse_attn_indexer_plugin_mode(
         batch_size = padded_q_fp8_decode_tokens.shape[0]
         next_n = padded_q_fp8_decode_tokens.shape[1]
         assert batch_size == decode_metadata.seq_lens.shape[0]
-        num_padded_tokens = batch_size * next_n
+        # deepgemm_fp8_paged_mqa_logits grids over `batch_size * next_n`, so that
+        # is the height its `logits` must have. Sizing off num_decode_tokens is
+        # only equivalent while the query rows are unpadded -- pack_seq_triton
+        # above pads to a rectangle, and the kernel would then write past the
+        # end. requires_padding is hardcoded False at the one construction site
+        # (attention/metadata.py), so this is unreachable today. Raised rather
+        # than asserted because `python -O` strips asserts, which would restore
+        # the overrun silently exactly when someone turns padding on.
+        if decode_metadata.requires_padding:
+            raise NotImplementedError(
+                "padded decode rows need logits sized [batch_size * next_n, "
+                f"{max_model_len}], got [{num_decode_tokens}, {max_model_len}]; "
+                "see deepgemm_fp8_paged_mqa_logits' grid"
+            )
         logits = torch.empty(
-            [batch_size * next_n, max_model_len], dtype=torch.float32, device="cuda"
+            [num_decode_tokens, max_model_len], dtype=torch.float32, device="cuda"
         )
         deepgemm_fp8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
             kv_cache,
-            weights[:num_padded_tokens],
+            weights[:num_decode_tokens],
             logits,
             decode_metadata.seq_lens,
             decode_metadata.block_table,
@@ -475,7 +477,6 @@ def sparse_attn_indexer_plugin_mode(
             WavePerEU=2,
         )
 
-        num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
         top_k_per_row_decode(
@@ -483,7 +484,7 @@ def sparse_attn_indexer_plugin_mode(
             next_n,
             decode_metadata.seq_lens,
             topk_indices_decode,
-            num_rows,
+            num_decode_tokens,
             logits.stride(0),
             logits.stride(1),
             stable=stable_topk,
@@ -505,7 +506,7 @@ def sparse_attn_indexer_plugin_mode(
             )
 
     triton_convert_req_index_to_global_index(
-        sparse_meta.req_id_per_token.to(dtype=torch.int32),
+        sparse_meta.batch_id_per_q_token.to(dtype=torch.int32),
         sparse_meta.block_table.to(dtype=torch.int32),
         topk_indices[: sparse_meta.num_actual_tokens].to(dtype=torch.int32),
         sparse_meta.paged_kv_indptr,

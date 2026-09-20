@@ -13,9 +13,21 @@ A DSV4 boundary is reusable only when both PAGE and SLOT restore successfully.
 Missing, incompatible, or corrupt sidecar data fails closed to recomputation.
 
 The public configuration remains `kv_connector: "lmcache_offload"`. The thin
-top-level shell selects `hybrid` when `hf_config.compress_ratios` is present and
-`dense` otherwise; `kv_transfer_config.offload_layout` can override that choice
-without giving scheduler and worker different connector names.
+top-level shell resolves one of four layouts: `m3` for MiniMax-M3 PAGE regions
+(including its NSA index cache), `kimi_k3` when the text config has
+`model_type == "kimi_linear"` (dense paged MLA KV plus a KDA per-request state
+tier), `hybrid` when `hf_config.compress_ratios` is present (DSV4 PAGE+SLOT),
+and `dense` otherwise. `kv_transfer_config.offload_layout` can override
+compatible choices without giving scheduler and worker different connector
+names. MiniMax-M3 cannot be overridden away from `m3`, because the other codecs
+do not preserve its NSA index cache.
+
+GDN/linear-attention models (`qwen3_next`, `qwen3_5_*`; e.g. Qwen3-Next,
+Qwen3.5) are the one family the resolver does **not** map to a layout: they carry
+a per-request recurrent state that no offload layout owns a tier for, so
+restoring their KV prefix while that state stays stale is silent wrong output.
+`select_offload_layout` refuses them at startup with a `ValueError` that names
+the cause, rather than falling through to `dense`.
 
 It is the **ATOM-native, in-engine** offload path: the connector plugs straight
 into ATOM's scheduler/worker via the shared
@@ -67,7 +79,7 @@ Four rules carry the module:
 | File | Role |
 |------|------|
 | `__init__.py` | Registers the `lmcache_offload` backend with `KVConnectorFactory`. |
-| `connector.py` | Public config-only `dense`/`hybrid` selector and thin worker/scheduler delegation shells. |
+| `connector.py` | Public config-only `dense`/`hybrid`/`kimi_k3` selector and thin worker/scheduler delegation shells. |
 | `_offload_common.py` | Shared LMCache engine construction, role validation, executors, and completion plumbing. |
 | `_block_gpu_connector.py` | Family-neutral raw-block LMCache `GPUConnectorInterface`; DCP-aware bounded staging and two-stage copies. |
 | `config.py` | Builds the per-rank `LMCacheEngineConfig` + `LMCacheMetadata` from `LMCACHE_*` env and `kv_transfer_config` extras. |
@@ -79,7 +91,16 @@ Four rules carry the module:
 | `hybrid/dsv4/policy.py` | DSV4 geometry/profile, PAGE/SLOT cadence, prefix hashes, fingerprint, committed-checkpoint policy, and bounded staging-row admission. |
 | `hybrid/dsv4/codec.py` | `DSV4PageSlotCodec`, `DSV4CheckpointCodec`, and `DSV4CheckpointStore`: unified GPU layout plans plus AOS1 framing/storage. |
 | `hybrid/dsv4/triton_page_slot.py` | Raw-`uint8` PAGE/SLOT gather/scatter kernels; PAGE is forward-indexed and SLOT is reverse-indexed. |
+| `hybrid/kimi_k3/connector.py` | Kimi-K3 worker and scheduler: the dense paged-KV path plus one extra leg for the KDA per-request state tier. |
+| `hybrid/kimi_k3/staging.py` | Single-entry bounded GPU staging buffer, D2H/H2D copy stream, and producer event for one flat state entry per transfer. |
+| `hybrid/kimi_k3/state_object.py` | One state checkpoint as a single opaque object keyed by ATOM's own hash, bypassing LMCache's `ChunkedTokenDatabase` (state bytes are not token-sliceable). |
+| `hybrid/kimi_k3/state_tier.py` | Worker-side store/load driver for the state tier on its own executor; reports store/finished/failed hash sets for the engine-side `StateOffloadIndex` to apply. |
 | `atom_lmcache_staging.py` | Per-thread CUDA streams, staging buffer, ready/free events, env helpers. |
+
+The engine-side counterpart of the state tier lives outside this directory:
+`atom/model_engine/state_offload.py` holds `StateOffloadIndex`, which applies the
+store/finished/failed hash sets that `hybrid/kimi_k3/state_tier.py` reports back,
+so a later prefix hit knows which checkpoints the CPU tier can actually serve.
 
 ## Architecture
 
@@ -388,11 +409,22 @@ copy has completed and the CPU frame owns the bytes. CRC/header finalization,
 PAGE visibility polling, and `DSV4CheckpointStore.put()` continue from that CPU
 frame.
 
-The GPU connector uses a **bounded** staging buffer
-(`OFFLOAD_GPU_STAGING_CHUNKS` chunks, default 2) and a two-stage pipeline: while
+The GPU connector uses a **bounded** staging buffer (sized in bytes by
+default, see below; `OFFLOAD_GPU_STAGING_CHUNKS` overrides) and a two-stage
+pipeline: while
 one group copies host↔staging, the next packs/unpacks on a separate CUDA stream,
 handed off via ready/free events. Transfers larger than the buffer are split into
 groups, so HBM staging cost is capped regardless of prefix length.
+
+SAVE chunk staging is scheduled strictly tail-to-head by token range. For B1–B8
+with two-block LMCache chunks, GPU source reads and source-safe notifications are
+B7–B8, B5–B6, B3–B4, B1–B2. Each assembled transfer record keeps its original
+MemoryObj, token range, and block-ID slice together, so reversing scheduling
+cannot cross-wire payloads. LOAD remains head-to-tail. LMCache's current
+`CacheEngine.store` API retains the cache-key list internally and exposes only
+MemoryObjs/ranges to the GPU connector; therefore ATOM cannot safely reorder the
+later `StorageManager.batched_put` batch. Backend submission remains one opaque
+batch in LMCache's original key/object order, after tail-to-head GPU staging.
 
 **`OFFLOAD_GPU_STAGING_CHUNKS` sizes *each* staging buffer, and there is more than
 one.** The buffer is thread-local (`threading.local`), and load and save run on
@@ -403,12 +435,51 @@ staging HBM is therefore:
 ```
 staging_chunk_bytes = (LMCACHE_CHUNK_SIZE / block_size) * bytes_per_block
 per_buffer_bytes    = OFFLOAD_GPU_STAGING_CHUNKS * staging_chunk_bytes
-resident_HBM        ≈ (1 load + OFFLOAD_COPY_WORKERS save) * per_buffer_bytes
+resident_HBM        ≈ (OFFLOAD_LOAD_WORKERS load + OFFLOAD_COPY_WORKERS save) * per_buffer_bytes
 ```
 
 For the chunk2 run that is `2 * 16.76 MiB ≈ 33.5 MiB` per buffer × (1 load + 1
 save) ≈ **67 MiB** total. Raising `OFFLOAD_GPU_STAGING_CHUNKS` speeds up transfers
 but multiplies *both* buffers.
+
+**A chunk is not a fixed size, so the default is denominated in bytes.**
+`staging_chunk_bytes` scales with `LMCACHE_CHUNK_SIZE / block_size`, which is 8
+for the reference config above and **1** for GLM-5.2 (`LMCACHE_CHUNK_SIZE=64`,
+`--block-size 64`). A fixed chunk count therefore hands the two models buffers
+~6x apart -- 33.5 MiB vs 5.8 MiB -- and the model on the small end pays the
+difference in per-group overhead. Unset, the connector instead asks for
+`_DEFAULT_GPU_STAGING_BYTES` (48 MiB) worth of chunks, clamped to
+`[2, 64]`: geometries whose chunk already exceeds the target keep the two
+chunks they have always had, and a geometry with a very small chunk cannot turn
+the byte target into an unbounded count. Setting
+`OFFLOAD_GPU_STAGING_CHUNKS` explicitly bypasses all of this;
+`OFFLOAD_GPU_STAGING_MAX_BYTES` still caps whatever comes out.
+
+Measured on GLM-5.2 (TP4, 28K prefix, pool 64, 600 s, seed 71502, paired arms):
+
+| `OFFLOAD_GPU_STAGING_CHUNKS` | per buffer | tok/s | vs 2 chunks |
+|---|---|---|---|
+| 2 (old default) | 5.8 MB | 378.73 | -- |
+| 11 | 33.6 MB | 403.24 | +6.47% |
+| 16 | 48.8 MB | 403.98 | +6.67% |
+| 32 | 97.7 MB | 403.23 | +6.47% |
+| unset (new default) | 48.8 MB | 398.42 | +5.20% |
+
+The last row is the byte rule running for real, not a forced chunk count: on
+this model it resolves to 16 chunks and a byte-identical 48,844,800-byte
+buffer, so it and the `16` arm are a **same-config repeat**. They differ by
+1.38%, which is therefore the measured run-to-run floor for this grid and is
+what the other rows have to clear. The three large forced arms span 0.19% --
+below that floor, i.e. indistinguishable -- so the plateau starts at or before
+11 chunks and 48 MiB sits inside it rather than on its edge. Taking the
+pessimistic member of the repeat pair, the byte default is worth **+5.20%**
+over the old fixed 2. External hit rate is 81.0-81.2% in every arm above 2
+(79.7% at 2), so the gain is not "reads less, therefore faster".
+
+GLM-5.2 is hybrid KV -- 78 sparse-MLA layers at 576 B/token plus 21 DSA
+indexer layers at 132 B/token -- but the DSV4 codec reports one fused
+`bytes_per_block` covering both (47,700 B/token x 64 = 2.91 MiB), so the byte
+rule resolves once per rank, not once per layer group.
 
 Stateful DSV4 reserves an additional persistent full-SLOT staging allocation:
 
@@ -845,16 +916,23 @@ Connector-specific tuning (env):
 | Env | Default | Purpose |
 |-----|:-------:|---------|
 | `OFFLOAD_MIN_LOAD_TOKENS` | 8192 | Don't reload a hit smaller than this; recompute is cheaper. |
-| `OFFLOAD_COPY_WORKERS` | 1 | SAVE daemon threads. LOAD is always a single thread (TTFT-critical). |
+| `OFFLOAD_COPY_WORKERS` | 1 | SAVE daemon threads. |
+| `OFFLOAD_LOAD_WORKERS` | 1 | LOAD daemon threads. One is enough until the CPU tier serves real traffic; past that, requests park inside `retrieve` and the scheduler admits fewer of them. Each thread costs one more `gpu_staging_buffer_bytes` per rank. |
 | `OFFLOAD_MAX_PENDING_SAVES` | `max(2, 2 × OFFLOAD_COPY_WORKERS)` | Positive integer bound on total admitted worker saves (running + queued), acquired before SLOT snapshot or executor submission. |
-| `OFFLOAD_GPU_STAGING_CHUNKS` | 2 | Chunks per bounded GPU staging buffer. Sizes **each** buffer — load and save own separate ones, so resident HBM ≈ `(1 + OFFLOAD_COPY_WORKERS) × chunks × chunk_bytes`. |
+| `OFFLOAD_GPU_STAGING_CHUNKS` | 48 MiB worth, clamped to `[2, 64]` | Chunks per bounded GPU staging buffer. Unset, the count is derived from a byte target so geometries with different bytes-per-chunk get the same buffer size. Sizes **each** buffer — load and save own separate ones, so resident HBM ≈ `(OFFLOAD_LOAD_WORKERS + OFFLOAD_COPY_WORKERS) × chunks × chunk_bytes`. |
 | `OFFLOAD_GPU_STAGING_MAX_BYTES` | — | Hard cap on staging bytes (clamps the chunk count). |
 | `OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER` | 0 | Free the staging buffer after each transfer (lower idle HBM, higher churn). |
 | `OFFLOAD_SLOT_STAGING_SLOTS` | 1 | DSV4 only: number of persistent full-SLOT GPU staging rows. Must be at least 1; HBM cost is this value × `slot_bytes`. |
 | `OFFLOAD_PUBLICATION_TIMEOUT_S` | 5.0 | Finite, nonnegative maximum wait after PAGE or AOS1 submission for session visibility. `0` performs exactly one immediate probe. |
 | `OFFLOAD_PUBLICATION_POLL_INTERVAL_S` | 0.01 | Finite, positive sleep interval between visibility probes; prevents busy-spinning. |
 | `OFFLOAD_COMMITTED_SIDECAR_CAPACITY` | 65536 | Positive integer bound for scheduler-session AOS1 commit discovery. Oldest commits are evicted first. |
-| `OFFLOAD_PROFILE` | 0 | Emit `[OFFLOAD-LOAD-PROF]` / `[OFFLOAD-SAVE-PROF]` per-transfer timing. |
+| `OFFLOAD_PROFILE` | 0 | Emit `[OFFLOAD-SAVE-PROF]` / `[OFFLOAD-LOAD-PROF]` records with transfer counts, fast-path evidence, and outer store/retrieve wall time. |
+
+Pinned-host asynchronous copies and one batched PAGE block-ID upload per
+transfer are the built-in `BlockGPUConnector` fast path; there are no feature
+flags for these two pieces. Both the Dense codec and the DSV4/M3 PAGE codec
+implement the prepared-ID API. A future codec or direction without that API
+still falls back safely to per-group ID preparation and blocking host copies.
 
 `kv_transfer_config` may also override any LMCache field via a
 `"lmcache.<field>": value` extra. The actual connector extra
@@ -1039,9 +1117,11 @@ terminal message distinguishing `SLOT sidecar save published` from
 `SLOT sidecar save failed`, and `SLOT sidecar load restored` from
 `SLOT sidecar load failed`. “Published” means the submitted object became
 visible through LMCache `contains` within the bounded policy; it does not claim
-a durable backend flush. PAGE transfer timing remains opt-in with
-`OFFLOAD_PROFILE=1` via
-`[OFFLOAD-SAVE-PROF]` and `[OFFLOAD-LOAD-PROF]`.
+a durable backend flush. PAGE transfer diagnostics remain opt-in with
+`OFFLOAD_PROFILE=1` via `[OFFLOAD-SAVE-PROF]` and `[OFFLOAD-LOAD-PROF]`.
+These records report payload/group counts, whether batched IDs and asynchronous
+host copies actually ran, and outer store/retrieve wall time. Connector phase
+and GPU-event timings are not collected.
 
 Common diagnostics:
 
@@ -1163,7 +1243,7 @@ Exact run configuration (so the numbers reproduce):
 | `--gpu-memory-utilization` | 0.95 | tight HBM → forces eviction → exercises reload |
 | `LMCACHE_MAX_LOCAL_CPU_SIZE` | 312.5 | GiB per rank |
 | `OFFLOAD_MIN_LOAD_TOKENS` | 8192 | |
-| `OFFLOAD_GPU_STAGING_CHUNKS` | **2** | sanity config; raise for throughput |
+| `OFFLOAD_GPU_STAGING_CHUNKS` | **2** | pinned; equals the byte-derived default for this geometry |
 | prefix cache | on | |
 
 The LMBenchmark CxS runs use the same `LMCACHE_CHUNK_SIZE=256` / `block-size=32`;

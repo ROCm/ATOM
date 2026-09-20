@@ -56,7 +56,7 @@ class SGLangPluginUBatchWrapper(UBatchWrapper):
             running_bs=running_bs,
             running_tokens=running_tokens,
             is_draft=ctx.context.is_draft,
-            dp_uniform_decode=ctx.context.dp_uniform_decode,
+            running_tokens_are_unified=ctx.context.running_tokens_are_unified,
             forward_mode=ctx.context.forward_mode,
             input_ids=input_ids,
             ubatch_token_offset=ub_slice.token_slice.start,

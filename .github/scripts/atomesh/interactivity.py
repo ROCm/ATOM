@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""p90 end-to-end normalized interactivity for ATOMesh agentic (AIPerf) runs.
+"""Per-request interactivity metrics for ATOMesh agentic (AIPerf) runs.
 
 Mirrors ``compute_p90_e2e_normalized_interactivity.py`` from
-seungrokj/agentx_skills so the ATOMesh dashboard's x-axis matches the definition
-InferenceX publishes:
+seungrokj/agentx_skills, extended to also produce the plain definition, so the
+ATOMesh dashboard can offer the same two x-axis choices InferenceX publishes:
 
-    eff_i = TPOT_i + TTFT_i / OSL_i        # effective seconds per output token
-    interactivity = 1 / p90(eff)
+    itl_i = ITL_i                          # seconds per output token, decode only
+    eff_i = ITL_i + TTFT_i / OSL_i         # effective seconds per output token
+
+    Interactivity                = 1 / p90(itl)
+    E2E Normalized Interactivity = 1 / p90(eff)
 
 Percentile the latency first, then invert -- the same convention as
-``p90_intvty = 1/p90_itl``. Because eff is a nonlinear function of three
-correlated per-request quantities, it cannot be rebuilt from the aggregate
-columns of ``profile_export_aiperf.json``; it has to be computed row by row from
-``profile_export.jsonl``.
+``p90_intvty = 1/p90_itl``, which is what InferenceX's own API returns. The
+normalized variant amortizes prefill over the turn's output tokens; because eff
+is a nonlinear function of three correlated per-request quantities, it cannot be
+rebuilt from the aggregate columns of ``profile_export_aiperf.json``; it has to
+be computed row by row from ``profile_export.jsonl``. Both percentiles are taken
+over the same filtered record set, so the two numbers describe the same requests.
 
 Stdlib only, on purpose: this is imported by ``process_result.py``, which runs on
 ``ubuntu-latest`` where numpy is not guaranteed to be installed.
@@ -30,6 +35,9 @@ from typing import Any
 
 # Values for the ``interactivity_method`` field carried on every dashboard point,
 # so a chart can tell which definition produced a given number.
+# No constant for the plain 1/p90(ITL) metric: it is only ever written from
+# per-request records, so the presence of ``interactivity_p90_itl`` on a point is
+# its own definition and no point ever names it in ``interactivity_method``.
 METHOD_P90_E2E = "p90_e2e_normalized"
 METHOD_MEDIAN_TPOT = "median_tpot"
 
@@ -97,16 +105,18 @@ def iter_records(path: Path) -> Iterator[tuple[dict[str, Any] | None, str]]:
             yield (record if isinstance(record, dict) else None), line
 
 
-def effective_per_token_latencies(
+def per_request_latencies(
     path: Path, include_warmup: bool = False
-) -> tuple[list[float], int]:
-    """Per-request eff_i in seconds, plus the count of unparseable lines.
+) -> tuple[list[tuple[float, float]], int]:
+    """Per-request ``(itl_i, eff_i)`` in seconds, plus the count of unparseable lines.
 
     Keeps only successful profiling records with a positive output length -- the
     same filter the reference implementation applies, which drops AIPerf's warmup
-    requests and anything cancelled during grace-period draining.
+    requests and anything cancelled during grace-period draining. One filter
+    serves both metrics on purpose: they are plotted as alternative x-axes for
+    the same point, so they have to describe the same set of requests.
     """
-    latencies: list[float] = []
+    latencies: list[tuple[float, float]] = []
     skipped_lines = 0
     for record, _raw in iter_records(path):
         if record is None:
@@ -126,33 +136,43 @@ def effective_per_token_latencies(
         osl = _metric(record, OSL_KEY)
         if tpot_ms is None or ttft_ms is None or not osl or osl <= 0:
             continue
-        latencies.append(tpot_ms / 1000.0 + (ttft_ms / 1000.0) / osl)
+        itl_s = tpot_ms / 1000.0
+        latencies.append((itl_s, itl_s + (ttft_ms / 1000.0) / osl))
     return latencies, skipped_lines
 
 
-def p90_e2e_normalized_interactivity(
+def agentic_interactivity(
     jsonl_path: Path | str,
     percentile: float = DEFAULT_PERCENTILE,
     include_warmup: bool = False,
 ) -> dict[str, Any]:
-    """Compute the metric for one ``profile_export.jsonl``.
+    """Compute both interactivity definitions for one ``profile_export.jsonl``.
 
     Raises ValueError when no record survives the filter, rather than returning a
     number derived from nothing.
     """
     path = Path(jsonl_path)
-    latencies, skipped_lines = effective_per_token_latencies(
+    latencies, skipped_lines = per_request_latencies(
         path, include_warmup=include_warmup
     )
     if not latencies:
         raise ValueError(f"no valid profiling records in {path}")
-    effective_latency_s = percentile_linear(latencies, percentile)
-    if effective_latency_s <= 0:
-        raise ValueError(f"non-positive p{percentile} effective latency in {path}")
+    itl_latency_s = percentile_linear([itl for itl, _eff in latencies], percentile)
+    effective_latency_s = percentile_linear(
+        [eff for _itl, eff in latencies], percentile
+    )
+    if itl_latency_s <= 0 or effective_latency_s <= 0:
+        raise ValueError(f"non-positive p{percentile} latency in {path}")
     return {
         "path": str(path),
+        # E2E normalized interactivity. Keyed "value" rather than something more
+        # descriptive because it is the dashboard's primary axis and callers have
+        # read it under that name since #1925.
         "value": 1.0 / effective_latency_s,
         "effective_latency_s": effective_latency_s,
+        # Plain interactivity -- InferenceX's p90_intvty.
+        "itl_value": 1.0 / itl_latency_s,
+        "itl_latency_s": itl_latency_s,
         "n_requests": len(latencies),
         "percentile": percentile,
         "skipped_lines": skipped_lines,
@@ -218,7 +238,7 @@ def main() -> None:
     args = parser.parse_args()
 
     results = [
-        p90_e2e_normalized_interactivity(path, args.percentile, args.include_warmup)
+        agentic_interactivity(path, args.percentile, args.include_warmup)
         for path in _find_jsonl(Path(args.path))
     ]
 
@@ -230,12 +250,15 @@ def main() -> None:
         f"p{int(args.percentile) if args.percentile.is_integer() else args.percentile}"
     )
     print(
-        f"| n | {label}_eff_latency (s/token) | {label}_e2e_normalized_interactivity | source |"
+        f"| n | {label}_itl (s/token) | {label}_interactivity "
+        f"| {label}_eff_latency (s/token) | {label}_e2e_normalized_interactivity "
+        f"| source |"
     )
-    print("|---|---|---|---|")
+    print("|---|---|---|---|---|---|")
     for result in results:
         print(
-            f"| {result['n_requests']} | {result['effective_latency_s']:.6f} "
+            f"| {result['n_requests']} | {result['itl_latency_s']:.6f} "
+            f"| {result['itl_value']:.3f} | {result['effective_latency_s']:.6f} "
             f"| {result['value']:.3f} | {result['path']} |"
         )
 

@@ -19,6 +19,7 @@ support_model_arch_dict = {
     "GptOssForCausalLM": "atom.models.gpt_oss.GptOssForCausalLM",
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2.GlmMoeDsaForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
+    "Glm5NextForConditionalGeneration": "atom.models.glm5_next.Glm5NextForConditionalGeneration",
     "Qwen3NextForCausalLM": "atom.models.qwen3_next.Qwen3NextForCausalLM",
 }
 ```
@@ -40,6 +41,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 | `GptOssForCausalLM` | `atom.models.gpt_oss` | `GptOssForCausalLM` | Yes | No | GQA, RoPE, sliding window attention (every other layer), attention sinks, bias in QKV and MoE |
 | `GlmMoeDsaForCausalLM` | `atom.models.deepseek_v2` | `GlmMoeDsaForCausalLM` | Yes | Yes | Reuses `DeepseekV2ForCausalLM` — GLM-5 is structurally similar to DeepSeek V3.2 |
 | `Glm4MoeForCausalLM` | `atom.models.glm4_moe` | `Glm4MoeForCausalLM` | Yes | No | GQA, partial RoPE (0.5 factor), QK norm, shared+routed experts, sigmoid scoring, grouped top-k |
+| `Glm5NextForConditionalGeneration` | `atom.models.glm5_next` | `Glm5NextForConditionalGeneration` | Yes | Yes | Text-only GLM-5.3-Flash: hybrid KDA + pooled sparse MLA, mHC, NoPE zero padding; PCP/DCP/MTP/TBO not yet supported |
 | `Qwen3NextForCausalLM` | `atom.models.qwen3_next` | `Qwen3NextForCausalLM` | Yes | No | Hybrid architecture: full attention + Gated DeltaNet linear attention, GQA, QK norm, FusedMoE |
 | `KimiK3ForConditionalGeneration` | `atom.models.kimi_k3` | `KimiK3ForConditionalGeneration` | Yes | Yes | Hybrid architecture: MLA full attention + KDA linear attention, SiTU activation, MXFP4 latent MoE, MoonViT3d vision tower |
 
@@ -130,7 +132,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 - **Architecture:** Hybrid MoE transformer with two attention types: full attention (`Qwen3NextAttention`) and Gated DeltaNet linear attention (`Qwen3NextGatedDeltaNet`). Layer type is determined by `config.layer_types`.
 - **Layer structure:** `Qwen3NextDecoderLayer` containing either full attention or linear attention, plus either `Qwen3NextSparseMoeBlock` (MoE layers) or `Qwen3NextMLP` (dense layers).
 - **Attention:** Full attention layers use `QKVParallelLinear` with QK norm, RoPE, GQA. Linear attention layers use `QKVZBAParallelLinear` for fused QKVZ+BA projections with Gated DeltaNet recurrence.
-- **GDN Recurrent State:** The Gated DeltaNet linear attention layers maintain per-request recurrent state. ATOM manages this state via the generic per-request slot pool (separate from KV cache blocks). Each sequence is assigned a `per_req_cache_group` index during allocation, and the state memory is accounted for dynamically as block equivalents within the unified KV pool. The state tensor itself is allocated by `GDNAttentionMetadataBuilder.allocate_per_req_cache()`.
+- **GDN Recurrent State:** The Gated DeltaNet linear attention layers maintain per-request recurrent state. ATOM manages this state via the generic per-request slot pool (separate from KV cache blocks). Each sequence is assigned `state_slots_per_req` slot indices during allocation — one committed state plus a rollback slot per speculated token — reachable as `seq.state_slots`, with `seq.state_slot` the committed one. The pool's bytes are reserved before the paged class is sized, so admission needs only a free index. The state tensor itself is allocated by `GDNAttentionMetadataBuilder.allocate_per_req_cache()`.
 - **MoE:** `Qwen3NextSparseMoeBlock` with `FusedMoE`, shared expert fusion support.
 - **Normalization:** Uses `GemmaRMSNorm` (aliased as `Qwen3NextRMSNorm`).
 - **MTP:** Separate draft model in `atom/models/qwen3_next_mtp.py` (`Qwen3NextMTP`).
@@ -152,7 +154,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 - **KDA Recurrent State:** The KDA layers keep per-request recurrent state in the generic per-request slot pool, like Qwen3-Next's Gated DeltaNet.
 - **MoE:** MXFP4 latent MoE (`KimiSparseMoeBlock`) with SiTU activation and optional dual-stream shared/routed overlap (`ATOM_K3_SHARED_EXPERT_OVERLAP`).
 - **Vision:** `atom/models/kimi_k3_vl.py` implements MoonViT3d — patch embed with a bilinearly resampled learnable position grid, 27 blocks with packed `wqkv` and complex 2D RoPE over non-causal varlen attention, then an `sd2_tpool` 2x2 merge and a `patchmergerv2` projector into the 7168-wide text space. Replicated per TP rank (~0.9 GB bf16), built only on the first pipeline rank.
-- **Image tokens:** The HF processor emits one `<|media_pad|>` per image and expands it inside the model. ATOM instead expands it during input processing (`atom/model_engine/multimodal.py`) so the scheduler, KV blocks and positions see the true prompt length. Multimodal prefills are consequently never chunked.
+- **Image tokens:** The HF processor emits one `<|media_pad|>` per image and expands it inside the model. ATOM instead expands it during input processing (`build_kimi_k3_inputs` in `atom/models/kimi_k3.py`, using the shared helper in `atom/multimodal/processing.py`) so the scheduler, KV blocks and positions see the true prompt length. Multimodal prefills are consequently never chunked.
 
 ### Qwen3.5 MTP (`Qwen3_5MTP`)
 

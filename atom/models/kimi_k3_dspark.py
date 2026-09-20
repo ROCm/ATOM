@@ -561,14 +561,19 @@ class K3DSparkDecoderLayer(nn.Module):
         self.self_attn.write_context_kv(ctx_hidden, positions, slot_mapping)
 
     def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = residual + self.self_attn(positions, hidden_states)
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        return residual + self.mlp(hidden_states)
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        return self.mlp(hidden_states), residual
 
 
 class KimiK3DSpark(DSparkDraftModel):
@@ -644,6 +649,9 @@ class KimiK3DSpark(DSparkDraftModel):
         # Bound by share_with_target(); both are skipped at load.
         self.embed_tokens = None
         self.lm_head = None
+        # vLLM 0.28 probes this attribute before enabling adaptive verification.
+        # This checkpoint deliberately skips the training-only head.
+        self.confidence_head = None
 
     # ---- weight-loading hooks ---------------------------------------------
 
@@ -699,6 +707,29 @@ class KimiK3DSpark(DSparkDraftModel):
         always ``None`` here -- this checkpoint's confidence head is
         training-only (see ``skip_weight_prefixes``). The proposer already
         handles ``None`` by leaving the verify length fixed.
+
+        The two halves below are also callable separately, which is how the
+        proposer declares this block as a capturable pass: the backbone is the
+        recorded forward and the head is its epilogue. Kept as the composition
+        so the whole block still has one name, and so nothing that only wants a
+        block has to know it is made of two pieces.
+        """
+        return self.head_and_sample(
+            self.block_backbone(input_ids, positions, num_draft),
+            input_ids,
+            num_draft,
+        )
+
+    def block_backbone(
+        self,
+        input_ids: torch.Tensor,  # [B]   verified anchor token per request
+        positions: torch.Tensor,  # [B*T] block absolute positions
+        num_draft: int,
+    ) -> torch.Tensor:
+        """The parallel half: embed the block, run the layers, norm.
+
+        Returns the post-final-norm hidden states, ``[B*T, hidden]`` -- flat,
+        because that is what the LM head takes and what the layers produced.
         """
         bs = input_ids.shape[0]
         T = num_draft
@@ -712,12 +743,25 @@ class KimiK3DSpark(DSparkDraftModel):
         draft_ids[:, 0] = input_ids
         hidden = self.embed_tokens(draft_ids.view(-1))
 
+        residual = None
         for layer in self.layers:
-            hidden = layer(positions, hidden)
-        hidden = self.final_norm(hidden)
+            hidden, residual = layer(positions, hidden, residual)
+        hidden, _ = self.final_norm(hidden, residual)
+        return hidden
 
-        base_logits = self.lm_head(hidden).view(bs, T, -1)
-        return self._sample_block(base_logits, input_ids), None
+    def head_and_sample(
+        self,
+        hidden: torch.Tensor,  # [B*T, hidden] post-final-norm
+        anchor_ids: torch.Tensor,  # [B]
+        num_draft: int,
+    ):
+        """The sequential half: LM head, then Markov sampling over the block.
+
+        Batch comes from ``anchor_ids`` rather than from ``hidden``, which is
+        flat over ``B*T`` and so cannot say which of the two axes it holds.
+        """
+        base_logits = self.lm_head(hidden).view(anchor_ids.shape[0], num_draft, -1)
+        return self._sample_block(base_logits, anchor_ids), None
 
     def _sample_block(
         self,

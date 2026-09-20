@@ -2,6 +2,8 @@
 # Tests for atom/model_engine/scheduler.py — public API only
 
 
+import logging
+import time
 from collections import deque
 from types import SimpleNamespace
 from unittest import mock
@@ -15,34 +17,378 @@ from atom.kv_transfer.disaggregation.types import (
     SaveOperationId,
 )
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
+from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.scheduler import (
     ScheduledBatch,
     ScheduledBatchOutput,
     Scheduler,
-    SpecStats,
 )
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.sampling_params import SamplingParams
 
-# ── SpecStats ──────────────────────────────────────────────────────────────
+
+class _OffloadMixinStub(OffloadSchedulerMixin):
+    """Concrete `OffloadSchedulerMixin` for scheduler tests.
+
+    `OffloadSchedulerMixin` declares the six save/load lifecycle methods abstract
+    so a missing forwarder is a construction-time TypeError. These test doubles
+    exercise only the scheduler's deferred-free / preemption paths, so this base
+    fills the contract with harmless defaults and each local `_Connector`
+    overrides the methods it drives.
+    """
+
+    is_producer = False
+    is_offload = True
+
+    def save_finished(self, req_id) -> None: ...
+    def abandon_save(self, req_id) -> None: ...
+    def release_stalled_save(self, seq) -> None: ...
+    def load_failed(self, req_id) -> bool:
+        return False
+
+    def load_finished(self, req_id) -> bool:
+        return True
+
+    def cancel_pending_load(self, seq) -> None: ...
 
 
-class TestSpecStats:
+# ── EngineStats: spec section ────────────────────────────────────────────────
+
+
+class TestSpecSection:
     def test_no_division_by_zero_with_valid_mtp_k(self):
-        """SpecStats with mtp_k >= 1 must not raise on update()."""
-        stats = SpecStats(mtp_k=1)
+        """EngineStats spec section with mtp_k >= 1 must not raise on update."""
+        stats = EngineStats(use_spec=True, mtp_k=1)
         # Should not raise ZeroDivisionError
-        stats.update(num_accepted_tokens=1)
-        stats.update(num_accepted_tokens=2)
+        stats.update_spec(num_accepted_tokens=1)
+        stats.update_spec(num_accepted_tokens=2)
 
     def test_update_accumulates_draft_tokens(self):
-        stats = SpecStats(mtp_k=2)
-        stats.update(num_accepted_tokens=1)
+        stats = EngineStats(use_spec=True, mtp_k=2)
+        stats.update_spec(num_accepted_tokens=1)
         assert stats.total_draft_tokens == 2
 
     def test_acceptance_rate_zero_when_no_updates(self):
-        stats = SpecStats(mtp_k=3)
+        stats = EngineStats(use_spec=True, mtp_k=3)
         assert stats.acceptance_rate == 0.0
+
+
+# ── EngineStats: cache section ───────────────────────────────────────────────
+
+
+class TestCacheSection:
+    def test_update_accumulates_tokens(self):
+        stats = EngineStats(enable_prefix_caching=True)
+        # update_cache(cached, full, compressed, wanted, reusable)
+        stats.update_cache(4, 10, 8, 6, 9)
+        assert stats.total_requests == 1
+        assert stats.total_cached_tokens == 4
+        assert stats.total_full_tokens == 10
+        assert stats.total_compressed_tokens == 8
+        assert stats.total_wanted_tokens == 6
+        assert stats.total_reusable_tokens == 9
+
+    def test_hit_rate_zero_when_no_updates(self):
+        stats = EngineStats(enable_prefix_caching=True)
+        assert stats.cache_hit_rate == 0.0
+
+    def test_hit_rate_is_over_reusable_not_full(self):
+        """`full` includes the trailing block no cache may serve, so the rate is
+        denominated in `reusable` — 4/8, not 4/10."""
+        stats = EngineStats(enable_prefix_caching=True)
+        stats.update_cache(4, 10, 8, 6, 8)
+        assert stats.cache_hit_rate == 0.5
+
+    def test_recent_hit_rate_tracks_the_window_not_all_history(self):
+        """The reviewer's scenario: a long run whose early traffic reused a lot
+        and whose later traffic reuses nothing. The lifetime figure stays high
+        and barely moves; the windowed one follows the current workload."""
+        stats = EngineStats(enable_prefix_caching=True, cache_hit_rate_window=100)
+        for _ in range(100):  # early: 80% reuse
+            stats.update_cache(80, 100, 80, 80, 100)
+        assert stats.recent_cache_hit_rate == pytest.approx(0.8)
+
+        for _ in range(100):  # later: none at all, filling the window
+            stats.update_cache(0, 100, 0, 0, 100)
+        assert stats.recent_cache_hit_rate == pytest.approx(0.0)
+        # Lifetime still reports the average of both halves, as it should.
+        assert stats.cache_hit_rate == pytest.approx(0.4)
+
+    def test_recent_hit_rate_is_none_before_any_observation(self):
+        stats = EngineStats(enable_prefix_caching=True)
+        assert stats.recent_cache_hit_rate is None
+
+    def test_window_is_bounded(self):
+        """The deque must not grow with the run — it is a fixed-size window."""
+        stats = EngineStats(enable_prefix_caching=True, cache_hit_rate_window=10)
+        for _ in range(500):
+            stats.update_cache(1, 10, 1, 1, 10)
+        assert len(stats._recent_hits) == 10
+        assert stats._recent_reusable_tokens == 100  # 10 requests x 10 tokens
+        assert stats.total_requests == 500, "lifetime counters keep counting"
+
+    def test_update_is_noop_when_cache_disabled(self):
+        """The cache section gates internally, so a disabled EngineStats
+        ignores update_cache rather than the caller having to guard it."""
+        stats = EngineStats(enable_prefix_caching=False)
+        stats.update_cache(4, 10, 8, 6, 9)
+        assert stats.total_requests == 0
+        assert stats.total_cached_tokens == 0
+
+
+# ── EngineStats: throughput section ──────────────────────────────────────────
+
+
+class TestThroughputSection:
+    def test_update_accumulates_tokens(self):
+        stats = EngineStats(enable_log_stats=True)
+        stats.update_throughput(num_prompt_tokens=10, num_generation_tokens=5)
+        assert stats.num_prompt_tokens == 10
+        assert stats.num_generation_tokens == 5
+
+    def test_maybe_log_below_interval_keeps_counters(self):
+        """Time-based pace: below the wall-clock interval nothing is logged or
+        reset, so the accumulated counts survive to the next tick."""
+        stats = EngineStats(enable_log_stats=True, throughput_log_interval_s=1e6)
+        stats.update_throughput(num_prompt_tokens=10, num_generation_tokens=5)
+        stats.maybe_log_throughput(num_running_reqs=1, num_waiting_reqs=0, kv_usage=0.0)
+        assert stats.num_prompt_tokens == 10
+        assert stats.num_generation_tokens == 5
+
+    def test_update_is_noop_when_log_stats_disabled(self):
+        stats = EngineStats(enable_log_stats=False)
+        stats.update_throughput(num_prompt_tokens=10, num_generation_tokens=5)
+        assert stats.num_prompt_tokens == 0
+        assert stats.num_generation_tokens == 0
+
+    def test_an_all_quiet_window_closes_without_logging(self, caplog):
+        """A quiet engine must not fill the log with 0.0 lines — but the
+        window still has to close, because a stale start is what made the
+        first line after a lull divide its tokens by the whole lull."""
+        stats = EngineStats(enable_log_stats=True)
+        stats._throughput_last_log_time -= 43.0
+        with caplog.at_level(logging.INFO, logger="atom"):
+            stats.maybe_log_throughput(
+                num_running_reqs=0, num_waiting_reqs=0, kv_usage=0.0
+            )
+        assert "Engine" not in caplog.text, "all-quiet window must stay silent"
+        # Closed anyway: the start is fresh, so the next window measures its
+        # own interval rather than the 43s that preceded it.
+        assert time.monotonic() - stats._throughput_last_log_time < 1.0
+
+    def test_a_burst_then_idle_is_still_reported(self, caplog):
+        """Silence is gated on zero tokens *as well as* an empty engine, so a
+        window still holding a finished burst's tokens prints even though
+        nothing is running by the time it closes."""
+        stats = EngineStats(enable_log_stats=True)
+        stats.update_throughput(num_prompt_tokens=30000)
+        stats._throughput_last_log_time -= 43.0
+        with caplog.at_level(logging.INFO, logger="atom"):
+            stats.maybe_log_throughput(
+                num_running_reqs=0, num_waiting_reqs=0, kv_usage=0.0
+            )
+        assert "Engine 000" in caplog.text, "a burst must not be swallowed"
+        assert stats.num_prompt_tokens == 0, "reported tokens must be cleared"
+
+    def test_running_requests_keep_the_zero_line(self, caplog):
+        """Zero tokens with requests in flight means the engine is stuck —
+        exactly when the 0.0 line is worth printing. Only a window with
+        nothing running *and* nothing queued is suppressed."""
+        stats = EngineStats(enable_log_stats=True)
+        stats._throughput_last_log_time -= 43.0
+        with caplog.at_level(logging.INFO, logger="atom"):
+            stats.maybe_log_throughput(
+                num_running_reqs=8, num_waiting_reqs=0, kv_usage=0.5
+            )
+        assert "Avg prompt throughput: 0.0 tokens/s" in caplog.text
+        assert "Running: 8 reqs" in caplog.text
+
+    def test_idle_does_not_leave_the_window_start_stale(self, caplog):
+        """The regression this fixes: after a lull, the next active window
+        must measure its own interval, not lull-plus-interval.
+
+        Both stretches are moved on the clock rather than slept through. A
+        `sleep` here would put the assertion on a wall-time budget that a GC
+        pause or a contended runner can blow, turning an unrelated hiccup into
+        a red build pointing at a regression that never happened.
+        """
+        interval = 10.0
+        stats = EngineStats(enable_log_stats=True, throughput_log_interval_s=interval)
+        # 43s of idleness, closed silently by the heartbeat — that close is
+        # what keeps the window start fresh.
+        stats._throughput_last_log_time -= 43.0
+        stats.maybe_log_throughput(num_running_reqs=0, num_waiting_reqs=0, kv_usage=0.0)
+        # Work arrives, then exactly one interval goes by.
+        stats.update_throughput(num_prompt_tokens=7700)
+        stats._throughput_last_log_time -= interval
+        caplog.clear()  # only the line under test, so the parse below is exact
+        with caplog.at_level(logging.INFO, logger="atom"):
+            stats.maybe_log_throughput(
+                num_running_reqs=1, num_waiting_reqs=0, kv_usage=0.1
+            )
+        assert caplog.text.count("Avg prompt throughput: ") == 1
+        rate = float(caplog.text.split("Avg prompt throughput: ")[1].split(" ")[0])
+        # 7700 over the 10s window it belongs to (770/s). Without the silent
+        # close the window would still span the lull as well — 53s, ~145/s.
+        assert 700 < rate < 800, f"window does not match its own interval: {rate}"
+
+    def test_non_positive_interval_is_refused(self):
+        """A `ValueError`, not an `assert`: `python -O` strips asserts, and
+        this check is all that stands between the interval and a
+        ZeroDivisionError raised inside the scheduler loop."""
+        for bad in (0, -1, -0.5):
+            with pytest.raises(ValueError, match="throughput_log_interval_s"):
+                EngineStats(enable_log_stats=True, throughput_log_interval_s=bad)
+
+    def test_zero_elapsed_cannot_divide(self):
+        """The division is guarded at its own site too, so reaching it with a
+        window that has not advanced returns instead of raising."""
+        stats = EngineStats(enable_log_stats=True, throughput_log_interval_s=10.0)
+        stats.update_throughput(num_prompt_tokens=100)
+        # Interval tampered with after construction, window not advanced.
+        stats.throughput_log_interval_s = 0.0
+        stats._throughput_last_log_time = time.monotonic() + 5.0
+        stats.maybe_log_throughput(num_running_reqs=1, num_waiting_reqs=0, kv_usage=0.0)
+        assert stats.num_prompt_tokens == 100, "nothing should have been reported"
+
+    def test_interval_comes_from_config(self):
+        """`--throughput-log-interval` has to reach EngineStats, not just sit
+        on Config — the cadence was a hard-coded keyword default before."""
+        sched = Scheduler(
+            MockConfig(enable_log_stats=True, throughput_log_interval=2.5)
+        )
+        assert sched.engine_stats.throughput_log_interval_s == 2.5
+
+    def test_hit_rate_window_comes_from_config(self):
+        """Same wiring as the interval above: `--cache-hit-rate-window` has to
+        reach EngineStats rather than stop at Config."""
+        sched = Scheduler(MockConfig(cache_hit_rate_window=250))
+        assert sched.engine_stats._recent_window == 250
+
+    def test_non_positive_hit_rate_window_is_rejected(self):
+        """0 would evict each request as it arrives and read `n/a` forever;
+        a negative window never evicts, turning the "recent" rate into a
+        lifetime one. Neither should fail silently — and a bare assert would,
+        under `python -O`."""
+        with pytest.raises(ValueError, match="cache_hit_rate_window"):
+            EngineStats(enable_prefix_caching=True, cache_hit_rate_window=0)
+
+    def test_window_expired_gates_the_heartbeat(self):
+        stats = EngineStats(enable_log_stats=True, throughput_log_interval_s=10.0)
+        assert stats.window_expired(time.monotonic()) is False
+        assert stats.window_expired(time.monotonic() + 11.0) is True
+
+    def test_window_expired_is_false_when_log_stats_disabled(self):
+        stats = EngineStats(enable_log_stats=False)
+        assert stats.window_expired(time.monotonic() + 1e6) is False
+
+    def test_hit_rate_is_na_until_something_is_measured(self, caplog):
+        """Prefix caching enabled but nothing observed yet — "0.0%" would be a
+        claim about reuse made without ever having looked. This is the shape
+        a scheduler is in before its first local prefill or completed remote
+        prefill admission."""
+        stats = EngineStats(
+            enable_log_stats=True,
+            enable_prefix_caching=True,
+            throughput_log_interval_s=1e-6,
+        )
+        with caplog.at_level(logging.INFO, logger="atom"):
+            stats.update_throughput(num_generation_tokens=100)
+            stats.maybe_log_throughput(
+                num_running_reqs=8, num_waiting_reqs=0, kv_usage=0.5
+            )
+        assert "Prefix cache hit rate: n/a" in caplog.text
+
+    def test_hit_rate_appears_once_measured(self, caplog):
+        stats = EngineStats(
+            enable_log_stats=True,
+            enable_prefix_caching=True,
+            throughput_log_interval_s=1e-6,
+        )
+        stats.update_cache(4, 10, 8, 6, 8)  # cached=4 of reusable=8
+        with caplog.at_level(logging.INFO, logger="atom"):
+            stats.update_throughput(num_prompt_tokens=10)
+            stats.maybe_log_throughput(
+                num_running_reqs=1, num_waiting_reqs=0, kv_usage=0.1
+            )
+        assert "Prefix cache hit rate: 50.0%" in caplog.text
+
+    def test_label_defaults_to_empty_so_the_line_is_unchanged(self):
+        assert EngineStats(enable_log_stats=True).label == ""
+
+    def test_absent_kv_pool_logs_na_not_zero(self, caplog):
+        """`kv_usage=None` means "this scheduler owns no KV pool" (P/D prefill),
+        which must not read as a real, empty pool."""
+        stats = EngineStats(
+            enable_log_stats=True, label="Prefill ", throughput_log_interval_s=1e-6
+        )
+        with caplog.at_level(logging.INFO, logger="atom"):
+            stats.update_throughput(num_prompt_tokens=100)
+            stats.maybe_log_throughput(
+                num_running_reqs=2, num_waiting_reqs=1, kv_usage=None
+            )
+        line = caplog.text
+        assert "Prefill Engine 000" in line
+        assert "GPU KV cache usage: n/a" in line
+        # Prefix caching is off here too, so that one is n/a as well.
+        assert "Prefix cache hit rate: n/a" in line
+
+
+# ── schedule() closes the throughput window ────────────────────────────────
+
+
+class TestScheduleTicksTheWindow:
+    """`schedule()` is the single tick for the scheduling side.
+
+    These pin the property the tick was moved there for: no return path inside
+    `_schedule` can stall the 10s cadence. Written to fail under the two
+    mutations that previously stayed green — dropping the prompt-token
+    argument, and making the tick a no-op.
+    """
+
+    def test_prompt_tokens_reach_the_window(self, seq_factory):
+        """Catches a dropped `num_prompt_tokens`: the headline number of this
+        feature would otherwise read 0.0 forever with the suite still green."""
+        sched = Scheduler(MockConfig(enable_log_stats=True))
+        sched.add(seq_factory([1, 2, 3, 4]))
+        batch, _ = sched.schedule()
+        assert batch.total_tokens_num_prefill == 4
+        assert sched.engine_stats.num_prompt_tokens == 4
+
+    def test_empty_return_path_still_closes_the_window(self):
+        """`_schedule` bails out early with nothing running or waiting. The
+        window must still close, or an idle stretch lands in the denominator
+        of the next line."""
+        sched = Scheduler(MockConfig(enable_log_stats=True))
+        stats = sched.engine_stats
+        stats._throughput_last_log_time -= 43.0
+        assert sched.schedule() is None
+        assert time.monotonic() - stats._throughput_last_log_time < 1.0
+
+    def test_decode_override_inherits_the_tick(self, seq_factory):
+        """DecodeScheduler overrides `_schedule`, not `schedule()`, so it gets
+        the tick for free — the three hand-placed ones it used to carry could
+        all be deleted with its own test still passing."""
+        from atom.model_engine.scheduler import DecodeScheduler
+
+        sched = DecodeScheduler(
+            MockConfig(enable_log_stats=True), disagg_cu_shm_name=""
+        )
+        stats = sched.engine_stats
+        stats._throughput_last_log_time -= 43.0
+        assert sched.schedule() is None  # nothing running: early return
+        assert time.monotonic() - stats._throughput_last_log_time < 1.0
+
+    def test_prefill_scheduler_reports_its_prompt_tokens(self, seq_factory):
+        from atom.model_engine.scheduler import PrefillScheduler
+
+        sched = PrefillScheduler(MockConfig(enable_log_stats=True))
+        seq = seq_factory([10, 20, 30, 40])
+        seq.block_table = [0, 1]
+        seq.num_cached_tokens = 0
+        sched.add(seq)
+        sched.schedule()
+        assert sched.engine_stats.num_prompt_tokens == 4
 
 
 # ── add / extend / query ───────────────────────────────────────────────────
@@ -117,7 +463,7 @@ class TestSchedule:
         )
         events = []
 
-        class _Connector(OffloadSchedulerMixin):
+        class _Connector(_OffloadMixinStub):
             is_offload = True
             is_producer = False
 
@@ -313,6 +659,110 @@ class TestSchedule:
         assert list(batch2.scheduled_tokens) == list(range(6, 10))
         assert list(batch2.num_cached_tokens) == [6]
 
+    def test_multimodal_prefill_shortened_after_alloc_is_requeued_whole(
+        self, seq_factory
+    ):
+        # A multimodal prompt must forward in one chunk (its vision embeddings
+        # are scattered onto placeholder positions for the whole prompt). The
+        # pre-allocation atomic guard enforces that, but a post-allocation
+        # adjuster -- offload chunk deferral or state-checkpoint alignment --
+        # can shorten the chunk *after* that guard passed. When it does, the
+        # prompt must be requeued whole, not split into a partial chunk that
+        # would scatter the embeddings against the wrong positions.
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                enable_chunked_prefill=True,
+            )
+        )
+        # Whole 8-token prompt clears the pre-alloc guard (budget 64 >= 8);
+        # only the post-alloc adjuster shortens it.
+        sched._adjust_prefill_chunk_after_alloc = lambda seq, chunk: 4
+        seq = seq_factory(list(range(8)), multimodal_data={"pixel_values": object()})
+        sched.add(seq)
+
+        batch, _ = sched.schedule()
+
+        # Not split into a 4-token partial chunk -- deferred whole.
+        assert batch.total_seqs_num_prefill == 0
+        assert seq.is_partial_prefill is False
+        assert seq in sched.waiting
+
+    def test_text_prefill_shortened_after_alloc_still_splits(self, seq_factory):
+        # Control for the guard above: a non-multimodal prompt shortened by the
+        # same post-alloc adjuster is chunked as usual -- the requeue is
+        # multimodal-only.
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                enable_chunked_prefill=True,
+            )
+        )
+        sched._adjust_prefill_chunk_after_alloc = lambda seq, chunk: 4
+        seq = seq_factory(list(range(8)))
+        sched.add(seq)
+
+        batch, _ = sched.schedule()
+
+        assert batch.total_seqs_num_prefill == 1
+        assert list(batch.num_scheduled_tokens) == [4]
+
+    def test_multimodal_prefill_spanning_checkpoint_rung_admits_whole(
+        self, seq_factory
+    ):
+        # The requeue test above forces the shortening through the *offload*
+        # adjuster, whose real-world shortening goes away once the load lands --
+        # so a single pass is enough to prove the requeue. The state-checkpoint
+        # rung cut in `_finalize_prefill_chunk` is different: it is deterministic,
+        # so a multimodal prompt spanning one interval is shortened the *same* way
+        # every pass, and requeue-whole then loops forever (idle GPUs, head-of-
+        # line blocking). A one-pass test cannot see that. Drive two passes with a
+        # fixed rung cut in place and assert the prompt is admitted whole and
+        # prefill actually completes -- the cut must be suppressed for multimodal.
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                enable_chunked_prefill=True,
+            )
+        )
+        # A rung that always lands 4 tokens short of the chunk end -- the same
+        # shortening on every pass, exactly as a real ladder cuts a prompt that
+        # spans an interval. If the cut were honoured for multimodal, the atomic
+        # re-assert would requeue whole and this seq would never make progress.
+        sched.block_manager.checkpoint_cut = lambda seq, start, end: end - 4
+        seq = seq_factory(list(range(8)), multimodal_data={"pixel_values": object()})
+        sched.add(seq)
+
+        # Pass 1: admitted whole, not shortened to a 4-token partial, not requeued.
+        batch1, _ = sched.schedule()
+        assert batch1.total_seqs_num_prefill == 1
+        assert list(batch1.num_scheduled_tokens) == [8]
+        assert seq.is_partial_prefill is False
+        assert seq not in sched.waiting
+
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[],
+                token_ids=[],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=batch1,
+        )
+
+        # Pass 2: prefill is done, so the seq is not bounced back to waiting to
+        # be re-shortened -- the livelock would show here as the seq reappearing
+        # in `waiting` with no forward progress.
+        assert seq not in sched.waiting
+
     def test_prefill_respects_block_availability(self, seq_factory):
         sched = Scheduler(MockConfig(num_kvcache_blocks=1, kv_cache_block_size=4))
         sched.add(seq_factory([1, 2, 3, 4]))  # 1 block
@@ -358,7 +808,7 @@ class TestSchedule:
         pinned_victim.append_token(10)
         operation = SaveOperationId(pinned_victim.id, 50)
 
-        class _Connector(OffloadSchedulerMixin):
+        class _Connector(_OffloadMixinStub):
             is_producer = False
             is_offload = True
             _do_load = False
@@ -396,7 +846,7 @@ class TestSchedule:
         pinned.append_token(9)
         operation = SaveOperationId(pinned.id, 51)
 
-        class _Connector(OffloadSchedulerMixin):
+        class _Connector(_OffloadMixinStub):
             is_producer = False
             is_offload = True
             _do_load = False
@@ -495,7 +945,51 @@ class TestSchedule:
 
         assert failed.offload_load_failed is True
         assert failed in sched.running
+        assert failed.block_table == [0]
         assert sched._num_parked_remote_kv == 0
+
+    def test_a_resumed_offload_prefill_reports_the_hit_the_load_gave_it(
+        self, seq_factory
+    ):
+        """`cached_tokens` must count the tokens LMCache brought back.
+
+        The load is the entire point of parking: `_mark_offload_load_ready`
+        raises `num_cached_tokens` from the pre-park HBM-only hit to the
+        post-load one. But the resume branch `continue`s before either
+        `prefix_cache_hit_tokens` assignment, so the field keeps the pre-park
+        value while `CacheStats` is fed the fresh `num_cached_tokens` in
+        `_schedule_prefill_seq`. The two then disagree about the same request,
+        and the one the user sees is the one that undercounts -- making the
+        offload tier look like it did nothing.
+        """
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=2,
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+            )
+        )
+        sched.kv_connector = SimpleNamespace(
+            is_offload=True,
+            build_connector_meta=lambda: None,
+        )
+
+        seq = seq_factory(list(range(8)))
+        seq.num_cached_tokens = 2  # the HBM-only hit, before the load
+        seq.prefix_cache_hit_tokens = 2
+        seq.block_table = [0]
+        seq.offload_loaded_tokens = 6  # LMCache returned four more
+        sched._park_for_remote_load(seq, deque())
+        sched._count_inflight_load(seq)
+        sched.finished_recving_kv_req_ids.append(seq.id)
+        assert sched._resolve_waiting_remote_kv(seq, deque()) is False
+        sched.waiting.append(seq)
+
+        sched.schedule()
+
+        assert seq in sched.running, "precondition: the resume must be admitted"
+        assert seq.num_cached_tokens == 6, "precondition: the load was applied"
+        assert seq.prefix_cache_hit_tokens == 6
 
     def test_partial_prefill_ready_for_offload_load_moves_to_waiting(self):
         class _Connector:
@@ -1088,8 +1582,276 @@ class TestPreempt:
         assert seq.status == SequenceStatus.WAITING
         assert len(seq.block_table) == 0
 
+    def test_preempt_releases_stalled_save_before_freeing_blocks(
+        self, scheduler, seq_factory
+    ):
+        """A stall-escaped save is preemptable, and the free runs no
+        `request_finished`; the connector must be told to drop its save tracker
+        at the free, and told BEFORE the blocks are deallocated so its save loop
+        can never race in and read them."""
+        seq = seq_factory([1, 2, 3, 4])
+        scheduler.add(seq)
+        scheduler.schedule()
+        events: list[str] = []
+        block_table_at_release: list = []
+
+        class _Connector:
+            def should_defer_free(self, s):
+                return False  # stall-escaped -> preemptable
+
+            def release_stalled_save(self, s):
+                events.append("release")
+                block_table_at_release[:] = list(s.block_table)
+
+        scheduler.kv_connector = _Connector()
+        original_deallocate = scheduler.block_manager.deallocate
+
+        def _recording_deallocate(s):
+            events.append("deallocate")
+            return original_deallocate(s)
+
+        scheduler.block_manager.deallocate = _recording_deallocate
+
+        assert scheduler.preempt(seq) is True
+        # Released, and released first -- the blocks were still held then.
+        assert events == ["release", "deallocate"]
+        assert block_table_at_release  # non-empty at the moment of release
+        assert seq.status == SequenceStatus.WAITING
+        assert len(seq.block_table) == 0
+
+
+def _spec_config(mtp_k):
+    """Stand-in for SpeculativeConfig, carrying the two members the scheduler
+    reads: the draft width and whether the drafter consumes the target's token
+    stream."""
+    return SimpleNamespace(
+        num_speculative_tokens=mtp_k,
+        use_dspark=lambda: False,
+    )
+
+
+class TestPreemptStripsExactlyThePlaceholders:
+    """`preempt()` and `postprocess()` have to agree on the placeholder width.
+
+    postprocess appends `mtp_k + is_deferred_out - num_rejected` trailing
+    `eos_token_id` slots and records the count on the sequence. preempt has to
+    delete that many and no more. Leave one behind and it stops being a
+    placeholder: the recompute prefills a context ending in `<|endoftext|>`, so
+    the model starts a new document and the placeholder is also handed back as
+    generated output. Delete one too many and a real token goes with it, along
+    with its logprob.
+    """
+
+    def _sched(self, mtp_k):
+        return Scheduler(
+            MockConfig(
+                num_kvcache_blocks=64,
+                kv_cache_block_size=4,
+                max_model_len=256,
+                max_num_batched_tokens=256,
+                speculative_config=_spec_config(mtp_k) if mtp_k else None,
+            )
+        )
+
+    @staticmethod
+    def _deferred_prefill_output():
+        """A deferred-output forward whose sampled token is still in flight: no
+        row for the sequence, so postprocess only appends placeholders."""
+        return ScheduledBatchOutput(
+            req_ids=[],
+            token_ids=[],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+            is_deferred_out=True,
+        )
+
+    @pytest.mark.parametrize("mtp_k", [0, 1, 3])
+    def test_no_placeholder_survives_into_the_recompute(self, mtp_k, seq_factory):
+        """`is_deferred_out` is `pipeline_parallel_size == 1`, so a TP-only
+        engine -- the normal MTP deployment -- carries `mtp_k + 1`
+        placeholders. A `mtp_k`-wide strip leaves exactly one EOS."""
+        sched = self._sched(mtp_k)
+        prompt = [5, 6, 7, 8]
+        seq = seq_factory(prompt)
+        sched.add(seq)
+        sched.schedule()
+        sched.postprocess(list(sched.running), self._deferred_prefill_output())
+
+        assert seq.num_placeholder_tokens == mtp_k + 1
+        assert list(seq.token_ids) == prompt + [sched.eos_token_id] * (mtp_k + 1)
+
+        assert sched.preempt(seq) is True
+
+        assert sched.eos_token_id not in list(seq.token_ids)
+        assert list(seq.token_ids) == prompt
+        assert list(seq.output_tokens) == []
+        assert seq.num_tokens == seq.num_prompt_tokens
+        assert seq.num_completion_tokens == 0
+        assert seq.num_placeholder_tokens == 0
+
+    @pytest.mark.parametrize("num_rejected", [0, 1, 2, 3])
+    def test_rejected_drafts_narrow_the_strip(self, num_rejected, seq_factory):
+        """postprocess appends *fewer* placeholders as more drafts are
+        rejected. Re-deriving the width as `mtp_k + num_rejected` moves it the
+        other way, so the strip eats `2 * num_rejected - 1` real tokens."""
+        mtp_k = 3
+        sched = self._sched(mtp_k)
+        prompt = [5, 6, 7, 8]
+        seq = seq_factory(prompt)
+        sched.add(seq)
+        sched.schedule()
+        real = [41, 42, 43]
+        for token in real:
+            seq.append_token(token)
+        # What a verify step leaves behind: this many of the seq's drafts did
+        # not survive, so the placeholder run appends a narrower block.
+        seq.num_rejected = num_rejected
+        sched.postprocess(list(sched.running), self._deferred_prefill_output())
+
+        appended = mtp_k + 1 - num_rejected
+        assert seq.num_placeholder_tokens == appended
+        assert list(seq.token_ids) == prompt + real + [sched.eos_token_id] * appended
+
+        assert sched.preempt(seq) is True
+
+        assert list(seq.token_ids) == prompt + real
+        assert list(seq.output_tokens) == real
+        assert seq.num_tokens == len(prompt) + len(real)
+        assert seq.num_completion_tokens == len(real)
+
+    def test_strip_is_bounded_by_what_is_there(self, seq_factory):
+        """A truncating stop moves `num_tokens` back over the placeholders
+        without shortening the arrays. An unbounded `del token_ids[-strip:]`
+        then clears the whole list and drives the completion count negative."""
+        sched = self._sched(mtp_k=3)
+        prompt = [5, 6, 7, 8]
+        seq = seq_factory(prompt)
+        sched.add(seq)
+        sched.schedule()
+        sched.postprocess(list(sched.running), self._deferred_prefill_output())
+        # Wider than the sequence has to give, in either direction.
+        seq.num_placeholder_tokens = seq.num_tokens + 10
+
+        assert sched.preempt(seq) is True
+
+        assert list(seq.token_ids) == prompt
+        assert seq.num_tokens == seq.num_prompt_tokens
+        assert seq.num_completion_tokens == 0
+
+    @staticmethod
+    def _verify_output(seq_id, tokens, num_rejected, mtp_k):
+        """A step that actually verified drafts.
+
+        The row is what the other cases in this class do not have. Without one,
+        postprocess skips the in-place overwrite entirely and only appends, so
+        the two widths coincide and nothing here is under test.
+
+        `num_new + num_rejected == drafts + 1` is a law of the verify step -- the
+        model is given one anchor plus `drafts` drafts and hands back the
+        accepted prefix plus one -- so a pair that breaks it describes a step no
+        engine runs.
+        """
+        return ScheduledBatchOutput(
+            req_ids=[seq_id],
+            token_ids=[tuple(tokens)],
+            num_rejected=np.array([num_rejected], dtype=np.int32),
+            num_bonus=np.array([0], dtype=np.int32),
+            draft_token_ids=np.array([[900 + i for i in range(mtp_k)]], dtype=np.int32),
+            is_deferred_out=True,
+        )
+
+    @staticmethod
+    def _trailing_eos(seq, eos):
+        tokens = list(seq.token_ids)
+        count = 0
+        while count < len(tokens) and tokens[-1 - count] == eos:
+            count += 1
+        return count
+
+    @pytest.mark.parametrize(
+        "mtp_k,accepted", [(1, 0), (1, 1), (2, 0), (2, 2), (3, 0), (3, 1), (3, 3)]
+    )
+    def test_a_verify_step_widens_the_run_and_the_strip_follows(
+        self, mtp_k, accepted, seq_factory
+    ):
+        """The overwrite consumes only part of the window it is given.
+
+        The window is `num_placeholder + mtp_k` wide on a verify step, and the
+        step hands back `mtp_k - num_rejected + 1` tokens for it, so
+        `mtp_k + num_rejected` slots of it are still `eos_token_id` when the run
+        for the NEXT step is appended behind them. The trailing run settles at
+        `2 * mtp_k + 1`, whatever the acceptance rate, and the width recorded for
+        `preempt` used to name only the appended part of it -- leaving that many
+        EOS in the recomputed context, which is the fault this class is about.
+        """
+        sched = self._sched(mtp_k)
+        prompt = [5, 6, 7, 8]
+        seq = seq_factory(prompt)
+        sched.add(seq)
+        sched.schedule()
+        sched.postprocess(list(sched.running), self._deferred_prefill_output())
+
+        # Three steps, so the tail reaches its steady state rather than the
+        # narrower run the prefill step alone leaves.
+        real = []
+        for step in range(3):
+            sched.schedule()
+            rows = [200 + 10 * step + i for i in range(accepted + 1)]
+            real += rows
+            sched.postprocess(
+                list(sched.running),
+                self._verify_output(seq.id, rows, mtp_k - accepted, mtp_k),
+            )
+
+        eos = sched.eos_token_id
+        assert self._trailing_eos(seq, eos) == 2 * mtp_k + 1
+        assert seq.num_placeholder_tokens == 2 * mtp_k + 1
+
+        assert sched.preempt(seq) is True
+
+        assert eos not in list(seq.token_ids)
+        assert list(seq.token_ids) == prompt + real
+        assert list(seq.output_tokens) == real
+        assert seq.num_completion_tokens == len(real)
+
+    def test_transferred_drafts_are_stripped_but_t0_is_kept(self, seq_factory):
+        """The P/D first-decode path appends the remote's T0 -- a real
+        generated token -- followed by its drafts, which are placeholders in
+        the same sense. A remote that sent fewer than `mtp_k` drafts has the
+        verify window padded out with `eos_token_id`, so the recorded width is
+        the whole window: the padding is a placeholder too, and leaving it
+        behind would put an EOS in the recomputed context."""
+        mtp_k = 3
+        sched = self._sched(mtp_k)
+        prompt = [5, 6, 7, 8]
+        seq = seq_factory(prompt)
+        sched.add(seq)
+        sched.schedule()
+        t0, drafts = 77, [101, 102]  # fewer drafts than mtp_k
+        seq.kv_transfer_params = {"first_token_id": t0, "draft_token_ids": drafts}
+        sched._schedule_first_decode_after_remote_kv(seq)
+
+        assert seq.num_placeholder_tokens == mtp_k
+        assert sched.eos_token_id in list(seq.token_ids)[-mtp_k:]
+
+        assert sched.preempt(seq) is True
+
+        assert list(seq.token_ids) == prompt + [t0]
+        assert seq.num_completion_tokens == 1
+
 
 # ── postprocess ────────────────────────────────────────────────────────────
+
+
+class _DSparkSpecConfig:
+    """The two fields Scheduler reads off speculative_config, DSpark-shaped."""
+
+    def __init__(self, num_speculative_tokens: int):
+        self.num_speculative_tokens = num_speculative_tokens
+
+    def use_dspark(self) -> bool:
+        return True
 
 
 class TestPostprocess:
@@ -1114,6 +1876,104 @@ class TestPostprocess:
         )
         assert 10 in seq.token_ids
         assert finished == []
+
+    def test_generation_counted_from_committed_not_scheduled(self, seq_factory):
+        """Throughput's generation count comes from postprocess (the tokens
+        actually committed), not from schedule()'s scheduled draft count —
+        aligning with vLLM's `len(output.new_token_ids)`."""
+        sched = Scheduler(MockConfig(enable_log_stats=True))
+        sp = SamplingParams(ignore_eos=True, max_tokens=100)
+        seq = seq_factory([1, 2, 3, 4], sampling_params=sp)
+        sched.add(seq)
+        sched.schedule()
+        # schedule() does not feed generation tokens anymore.
+        assert sched.engine_stats.num_generation_tokens == 0
+        # Two committed tokens this step → generation count bumps by exactly 2.
+        sched.postprocess(list(sched.running), self._output(seq.id, [10, 11]))
+        assert sched.engine_stats.num_generation_tokens == 2
+
+    def test_generation_excludes_tokens_dropped_past_eos(self, seq_factory):
+        """Counted from what the client receives, not from the forward output.
+
+        The sampler does not inspect EOS, so on a spec-decode step it can emit
+        accepted drafts after it; postprocess trims them off `new_tokens`
+        before they reach RequestOutput. Counting the untrimmed output made the
+        status line claim tokens nobody was sent, and disagree with the
+        `total_generation_tokens` the same call derives from the trimmed length.
+        """
+        sched = Scheduler(MockConfig(enable_log_stats=True))
+        seq = seq_factory([1, 2, 3, 4])
+        sched.add(seq)
+        sched.schedule()
+        # EOS (2) lands second, so the trailing 99 never reaches the client.
+        finished = sched.postprocess(
+            list(sched.running), self._output(seq.id, [10, 2, 99])
+        )
+        assert len(finished) == 1 and finished[0].leave_reason == "eos"
+        assert (
+            sched.engine_stats.num_generation_tokens == 2
+        ), "the post-EOS token must not be counted"
+
+    @staticmethod
+    def _sched_with_kv_role(kv_config):
+        """Scheduler carrying a kv_transfer_config, without standing up a real
+        connector (Mooncake's needs a distributed config and open ports)."""
+        cfg = MockConfig(
+            speculative_config=_DSparkSpecConfig(3), kv_transfer_config=kv_config
+        )
+        with mock.patch(
+            "atom.utils.forward_context.get_kvconnector", return_value=None
+        ):
+            return Scheduler(cfg)
+
+    def test_a_pd_producer_does_not_speculate(self):
+        """The producer hands off after T0 and never proposes, so speculation
+        must be off: with it on, postprocess pads mtp_k placeholders that hold
+        num_tokens short of max_tokens and the handoff never fires."""
+        for kv_config in (
+            {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+            {
+                "kv_connector": "multi",
+                "connectors": [
+                    {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+                    {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+                ],
+            },
+        ):
+            sched = self._sched_with_kv_role(kv_config)
+            assert sched.use_spec is False
+            assert sched.mtp_k == 0
+
+    def test_a_pd_consumer_still_speculates(self):
+        sched = self._sched_with_kv_role(
+            {"kv_connector": "mooncake", "kv_role": "kv_consumer"}
+        )
+        assert sched.use_spec is True
+        assert sched.mtp_k == 3
+
+    def test_absent_drafts_leave_spec_token_ids_empty(self, seq_factory):
+        """A P/D producer runs with mtp_k set but never calls propose(): it
+        disables deferred output so the consumer consumes T0 once, and the
+        runner only drafts on the deferred path. postprocess used to index the
+        resulting None and take the prefill engine down on the first request."""
+        sched = Scheduler(MockConfig(speculative_config=_DSparkSpecConfig(3)))
+        assert sched.mtp_k == 3
+        seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
+
+        # What the runner emits with propose() skipped: counts are still real
+        # zero-filled arrays, only the drafts are absent.
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[seq.id],
+                token_ids=[(10,)],
+                num_rejected=np.zeros(1, dtype=np.int32),
+                num_bonus=np.zeros(1, dtype=np.int32),
+                draft_token_ids=None,
+            ),
+        )
+
+        assert list(seq.spec_token_ids) == []
 
     def test_eos_finishes(self, scheduler, seq_factory):
         seq = self._prefill(scheduler, seq_factory([1, 2, 3, 4]))
@@ -1177,6 +2037,264 @@ class TestPostprocess:
         assert scheduler.get_request_counts() == (0, 0)
 
 
+# ── chunked-prefill finality ───────────────────────────────────────────────
+
+
+class TestChunkedPrefillFinality:
+    """A prefill ends at the admitted length, not at the prompt boundary.
+
+    A sequence re-admitted after `preempt` has to recompute prompt *plus*
+    every token it had already generated, so `num_cached_tokens >=
+    num_prompt_tokens` is the normal state of one of its middle chunks. Ending
+    the prefill there leaves the rest of the context with no KV, and the
+    sequence then decodes against blocks still holding whatever the previous
+    owner wrote into them.
+    """
+
+    PROMPT = tuple(range(10, 18))  # 8 tokens
+    GENERATED = tuple(range(100, 112))  # 12 more to recompute -> 20 admitted
+
+    def _sched(self, max_num_batched_tokens=16):
+        return Scheduler(
+            MockConfig(
+                num_kvcache_blocks=64,
+                kv_cache_block_size=4,
+                max_model_len=256,
+                max_num_batched_tokens=max_num_batched_tokens,
+                max_num_seqs=4,
+            )
+        )
+
+    def _readmitted(self, sched, seq_factory):
+        """A sequence as `preempt` leaves it: back in `waiting`, owing a
+        prefill over prompt + everything it had generated."""
+        seq = seq_factory(self.PROMPT)
+        for token in self.GENERATED:
+            seq.append_token(token)
+        assert seq.num_tokens > seq.num_prompt_tokens
+        sched.add(seq)
+        return seq
+
+    @staticmethod
+    def _output(seq_id, tokens):
+        return ScheduledBatchOutput(
+            req_ids=[seq_id],
+            token_ids=[tuple(tokens)],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+        )
+
+    def _batch(self, seq, chunk, cached, is_final):
+        return ScheduledBatch(
+            seqs={seq.id: seq},
+            num_scheduled_tokens=[chunk],
+            total_tokens_num=chunk,
+            total_tokens_num_prefill=chunk,
+            total_seqs_num=1,
+            total_seqs_num_prefill=1,
+            num_cached_tokens=[cached],
+            is_final_chunk=is_final,
+        )
+
+    def test_schedule_measures_finality_against_the_admitted_length(self, seq_factory):
+        """The 337-token recompute split into 256 + 81 was declared complete
+        after the first chunk, because `256 >= 128` held against the prompt."""
+        sched = self._sched()
+        seq = self._readmitted(sched, seq_factory)
+
+        batch, _ = sched.schedule()
+        first = int(batch.num_scheduled_tokens[0])
+
+        assert first < seq.num_tokens
+        assert first >= seq.num_prompt_tokens, "the interesting case: past the prompt"
+        assert batch.is_final_chunk == [False]
+        # A batch of middle chunks yields no token for the head to consume.
+        assert batch.produces_output() is False
+
+        sched.postprocess(list(sched.running), self._output(seq.id, [99]), batch=batch)
+        batch2, _ = sched.schedule()
+
+        assert int(batch2.num_scheduled_tokens[0]) == seq.num_tokens - first
+        assert batch2.is_final_chunk == [True]
+
+    def test_postprocess_takes_finality_from_the_batch(self, seq_factory):
+        """`num_cached_tokens < num_prompt_tokens` is not a usable predicate
+        here: it calls this middle chunk final, and by the time postprocess
+        runs `num_tokens` may have grown by the sampled token, so neither
+        length is a valid bound."""
+        sched = self._sched()
+        seq = self._readmitted(sched, seq_factory)
+        chunk = 16
+        batch, _ = sched.schedule()
+        assert int(batch.num_scheduled_tokens[0]) == chunk
+
+        sched.postprocess(list(sched.running), self._output(seq.id, [99]), batch=batch)
+
+        assert seq.num_cached_tokens == chunk
+        assert seq.num_cached_tokens >= seq.num_prompt_tokens  # the length trap
+        assert seq.is_partial_prefill is True
+        assert sched._partial_prefill_count == 1
+        # A middle chunk's sampled token is not real output.
+        assert 99 not in list(seq.token_ids)
+
+    def test_postprocess_clears_partial_on_the_final_chunk(self, seq_factory):
+        sched = self._sched()
+        seq = self._readmitted(sched, seq_factory)
+        sched.schedule()  # first chunk: 16 of the 20 admitted tokens
+        seq.num_cached_tokens = 16
+        seq.is_partial_prefill = True
+        sched._partial_prefill_count = 1
+        batch = self._batch(seq, chunk=4, cached=16, is_final=[True])
+
+        sched.postprocess(list(sched.running), self._output(seq.id, [99]), batch=batch)
+
+        assert seq.num_cached_tokens == 20
+        assert seq.is_partial_prefill is False
+        assert sched._partial_prefill_count == 0
+
+    def test_postprocess_falls_back_to_lengths_without_the_field(self, seq_factory):
+        """The fallback is for callers that hand a batch without the field; the
+        scheduler itself always sets it."""
+        sched = self._sched()
+        seq = self._readmitted(sched, seq_factory)
+        sched.schedule()
+        seq.num_cached_tokens = 0
+        batch = self._batch(seq, chunk=4, cached=0, is_final=None)
+        assert batch.is_final_chunk is None
+
+        sched.postprocess(list(sched.running), self._output(seq.id, [99]), batch=batch)
+
+        # 4 < 8 prompt tokens, so the length comparison still says partial.
+        assert seq.is_partial_prefill is True
+
+
+# ── offload-resume admission ───────────────────────────────────────────────
+
+
+class TestOffloadResumeAdmission:
+    """An offload resume is sized by what it owes, not by its prompt.
+
+    A sequence re-admitted after `preempt` has to recompute prompt *plus* the
+    tokens it had already generated, and `_mark_offload_load_ready` sets
+    `num_cached_tokens` to whatever the tier returned, which is not bounded by
+    the prompt. Sized against `num_prompt_tokens` that width is non-positive:
+    `_prefill_chunk_for_budget` answers None and the sequence goes back to the
+    head of `waiting` with the loop broken -- every tick, forever.
+    """
+
+    PROMPT = tuple(range(8))
+    GENERATED = tuple(range(100, 112))  # owes 20 positions in total
+
+    def _sched(self, **overrides):
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=4,
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_model_len=256,
+                **overrides,
+            )
+        )
+        sched.kv_connector = SimpleNamespace(
+            is_offload=True,
+            build_connector_meta=lambda: None,
+            # Reached only by a sequence that is not resuming: nothing on the
+            # tier for it, so nothing to park for and nothing to arm.
+            get_num_new_matched_tokens=lambda seq: (0, False),
+            update_state_after_alloc=lambda seq: None,
+        )
+        return sched
+
+    def _parked(self, sched, seq_factory, cached):
+        """A sequence as the offload connector leaves it: blocks still held
+        from the pre-park allocate, load reported, ready to resume."""
+        seq = seq_factory(self.PROMPT)
+        for token in self.GENERATED:
+            seq.append_token(token)
+        seq.block_table = [0, 1, 2, 3, 4]
+        seq.offload_loaded = True
+        seq.num_cached_tokens = cached
+        sched.waiting.append(seq)
+        return seq
+
+    def test_a_resume_past_the_prompt_boundary_is_admitted(self, seq_factory):
+        sched = self._sched()
+        # The tier came back with the prompt and four of the generated tokens.
+        seq = self._parked(sched, seq_factory, cached=12)
+        assert seq.num_cached_tokens > seq.num_prompt_tokens, "the failing case"
+
+        batch, scheduled = sched.schedule()
+
+        assert batch is not None, "nothing scheduled: the resume was requeued"
+        assert seq.id in scheduled
+        assert int(batch.num_scheduled_tokens[0]) == seq.num_tokens - 12
+        assert not sched.waiting
+
+    def test_a_resume_at_exactly_the_prompt_boundary_is_admitted(self, seq_factory):
+        """The two failure modes differ by one token, and both are reachable
+        with chunked prefill on: a `num_prompt_tokens`-sized width is negative
+        above the boundary, which trips `_assert_positive_prefill_chunk`, and
+        exactly zero on it, which `_prefill_chunk_for_budget` reports as None
+        -- the silent requeue-and-break."""
+        sched = self._sched()
+        seq = self._parked(sched, seq_factory, cached=len(self.PROMPT))
+
+        batch, scheduled = sched.schedule()
+
+        assert batch is not None, "the silent starvation case"
+        assert seq.id in scheduled
+        assert int(batch.num_scheduled_tokens[0]) == len(self.GENERATED)
+
+    def test_a_resume_the_tier_covered_entirely_is_admitted(self, seq_factory):
+        """The tier's lookup runs over the whole prompt and is not bounded
+        below it, unlike the HBM match whose loop stops one hash block short
+        precisely so a prefill always has something to forward. A first
+        admission whose prompt is wholly resident therefore arrives with
+        `num_cached_tokens == num_tokens`, and a width of zero is the silent
+        requeue-and-break again -- this time with nothing left to size."""
+        sched = self._sched()
+        seq = seq_factory(list(self.PROMPT))
+        seq.block_table = [0, 1, 2, 3, 4]
+        seq.offload_loaded = True
+        seq.num_cached_tokens = seq.num_tokens
+        sched.waiting.append(seq)
+
+        batch, scheduled = sched.schedule()
+
+        assert batch is not None, "nothing scheduled: the resume was requeued"
+        assert seq.id in scheduled
+        # One token still has to be forwarded: the first decode samples from
+        # the logits this prefill produces.
+        assert int(batch.num_scheduled_tokens[0]) >= 1
+        assert not sched.waiting
+
+    def test_a_resume_short_of_the_prompt_boundary_still_works(self, seq_factory):
+        """The same arithmetic on a first admission, where the two lengths
+        agree up to the generated tail."""
+        sched = self._sched()
+        seq = self._parked(sched, seq_factory, cached=4)
+
+        batch, scheduled = sched.schedule()
+
+        assert seq.id in scheduled
+        assert int(batch.num_scheduled_tokens[0]) == seq.num_tokens - 4
+
+    def test_it_does_not_starve_the_queue_behind_it(self, seq_factory):
+        """The symptom an operator sees: one resume at the head of `waiting`
+        holds up every request queued behind it, because the admission loop
+        `break`s rather than skipping."""
+        sched = self._sched()
+        self._parked(sched, seq_factory, cached=12)
+        behind = seq_factory([7, 7, 7, 7])
+        sched.add(behind)
+
+        _, scheduled = sched.schedule()
+
+        assert behind.id in scheduled, "starved behind the offload resume"
+
+
 # ── get_next_batch_info ────────────────────────────────────────────────────
 
 
@@ -1229,6 +2347,33 @@ class TestScheduledBatchPDFirstDecodeMTP:
         )
 
         assert list(batch.scheduled_tokens) == [t0, *drafts]
+
+    def test_window_starts_at_t0_when_the_producer_sent_no_drafts(self):
+        """The producer does not speculate, so the handoff carries T0 alone.
+        The window must still open at T0: unpadded, the trailing mtp_k+1 slice
+        reaches back into the prompt and verifies prompt tokens as drafts."""
+        mtp_k = 3
+        prompt = [11, 22, 33, 44, 55, 66]
+        t0 = 14
+        sched = Scheduler(MockConfig(speculative_config=_DSparkSpecConfig(mtp_k)))
+        seq = Sequence(prompt, block_size=16)
+        seq.kv_transfer_params = {"first_token_id": t0}
+
+        sched._schedule_first_decode_after_remote_kv(seq)
+        seq.type = SequenceType.DECODE
+
+        batch = ScheduledBatch(
+            seqs={seq.id: seq},
+            num_scheduled_tokens=[mtp_k + 1],
+            total_tokens_num=mtp_k + 1,
+            total_tokens_num_decode=mtp_k + 1,
+            total_seqs_num=1,
+            total_seqs_num_decode=1,
+            num_spec_step=mtp_k,
+        )
+
+        assert next(iter(batch.scheduled_tokens)) == t0
+        assert not set(batch.scheduled_tokens) & set(prompt)
 
     def test_normal_decode_window_unchanged(self):
         """offset >= 0 path is byte-for-byte the trailing mtp_k+1 slice."""
@@ -1367,3 +2512,250 @@ class TestComputeDetailedAggregates:
         assert batch.detailed_sqsq == 9  # 3^2
         assert batch.detailed_sqsk == 300  # 3 * 100
         assert batch.detailed_sk == 100
+
+
+class TestStalledOffloadSaveReclaim:
+    """`_reconcile_stalled_deferred_saves`: the way out for a save nobody answers.
+
+    LMCache's pin monitor force-unpins a stalled transfer without emitting a
+    completion, so `should_defer_free` stays True forever, `has_pending_kv_work()`
+    never clears, and the engine busy-loops with every GPU idle. Reproduced on
+    the k3-dev line as a hard hang under a tight pool.
+    """
+
+    @staticmethod
+    def _sched(monkeypatch, deferred, connector=None):
+        import atom.model_engine.scheduler as sched_mod
+
+        s = object.__new__(sched_mod.Scheduler)
+        s.deferred_free_blocks = {seq.id: seq for seq in deferred}
+        s._abandoned_saves = 0
+        s._next_save_reconcile_at = 0.0
+        # The window is now sourced from the connector, not a scheduler constant:
+        # the scheduler asks `kv_connector.save_abandon_timeout_s()` for it (the
+        # value is LMCache knowledge). Tests choose their own via the stub.
+        if connector is None:
+            connector = SimpleNamespace(save_abandon_timeout_s=lambda: 100.0)
+        s.kv_connector = connector
+        freed: list[int] = []
+        s.block_manager = SimpleNamespace(deallocate=lambda q: freed.append(q.id))
+        return s, freed
+
+    def test_a_save_past_the_window_gets_its_blocks_back(self, monkeypatch):
+        import time as _time
+
+        now = _time.monotonic()
+        stale = SimpleNamespace(id=1, _deferred_save_at=now - 500.0)
+        fresh = SimpleNamespace(id=2, _deferred_save_at=now)
+        s, freed = self._sched(monkeypatch, [stale, fresh])
+
+        assert s._reconcile_stalled_deferred_saves() == 1
+        assert freed == [1], "only the stalled save is reclaimed"
+        assert 2 in s.deferred_free_blocks, "a save still inside its window is kept"
+        assert s._abandoned_saves == 1
+
+    def test_reclaim_notifies_the_connector_to_drop_the_save(self, monkeypatch):
+        """Freeing blocks is not enough: without `abandon_save` the connector's
+        `_save_inflight` keeps the request, `has_pending_kv_work()` never clears,
+        and the engine busy-loops (review finding #4)."""
+        import time as _time
+
+        now = _time.monotonic()
+        stale = SimpleNamespace(id=1, _deferred_save_at=now - 500.0)
+        abandoned: list = []
+        connector = SimpleNamespace(
+            save_abandon_timeout_s=lambda: 100.0,
+            abandon_save=lambda sid: abandoned.append(sid),
+        )
+        s, freed = self._sched(monkeypatch, [stale], connector=connector)
+
+        assert s._reconcile_stalled_deferred_saves() == 1
+        assert freed == [1]
+        # Notified with the string request id, matching the connector's sid keys.
+        assert abandoned == ["1"]
+
+    def test_it_self_throttles_so_a_1ms_poll_is_cheap(self, monkeypatch):
+        import time as _time
+
+        stale = SimpleNamespace(id=1, _deferred_save_at=_time.monotonic() - 500.0)
+        s, freed = self._sched(monkeypatch, [stale])
+
+        assert s._reconcile_stalled_deferred_saves() == 1
+        # Second call inside the throttle interval must not rescan.
+        s.deferred_free_blocks = {
+            9: SimpleNamespace(id=9, _deferred_save_at=_time.monotonic() - 500.0)
+        }
+        assert s._reconcile_stalled_deferred_saves() == 0
+        assert freed == [1]
+
+    def test_a_non_positive_window_restores_wait_forever(self, monkeypatch):
+        import time as _time
+
+        import atom.model_engine.scheduler as sched_mod
+
+        s = object.__new__(sched_mod.Scheduler)
+        s.deferred_free_blocks = {
+            1: SimpleNamespace(id=1, _deferred_save_at=_time.monotonic() - 1e6)
+        }
+        s._abandoned_saves = 0
+        s._next_save_reconcile_at = 0.0
+        # A connector reporting a non-positive window disables reclamation.
+        s.kv_connector = SimpleNamespace(save_abandon_timeout_s=lambda: 0.0)
+        s.block_manager = SimpleNamespace(deallocate=lambda q: pytest.fail("reclaimed"))
+
+        assert s._reconcile_stalled_deferred_saves() == 0
+
+    def test_the_window_sits_above_lmcaches_own_pin_timeout(self, monkeypatch):
+        """Deriving it from LMCache's knob IS the safety argument.
+
+        Two independent env vars would let ours be set below the timeout it has
+        to exceed, and nothing would say so. The derivation now lives on the
+        offload connector (`offload_save_abandon_timeout_s`), since the pin
+        timeout is LMCache knowledge; the scheduler only asks for the result.
+        """
+        import atom.kv_transfer.offload._offload_common as offload_common
+
+        monkeypatch.setattr(offload_common, "_save_abandon_timeout_s", None)
+        monkeypatch.setenv("LMCACHE_EC_PIN_TIMEOUT_SEC", "900")
+        assert offload_common.offload_save_abandon_timeout_s() == 930.0
+
+        monkeypatch.setattr(offload_common, "_save_abandon_timeout_s", None)
+        monkeypatch.delenv("LMCACHE_EC_PIN_TIMEOUT_SEC", raising=False)
+        assert offload_common.offload_save_abandon_timeout_s() == 330.0
+
+    def test_no_offload_connector_disables_reclamation(self):
+        """`_save_abandon_timeout_s` returns 0 when nothing offloads.
+
+        A non-offload connector (or none at all) has no save to reclaim, so the
+        scheduler must read a non-positive window and skip the scan rather than
+        raise reaching for a method that is not there.
+        """
+        import atom.model_engine.scheduler as sched_mod
+
+        s = object.__new__(sched_mod.Scheduler)
+        s.kv_connector = None
+        assert s._save_abandon_timeout_s() == 0.0
+        s.kv_connector = SimpleNamespace()  # a connector without the offload face
+        assert s._save_abandon_timeout_s() == 0.0
+
+
+class TestStateStorePendingCap:
+    """`_state_store_pending_cap`: the state leg reads the KV leg's save bound.
+
+    It must share the connector's real `max_pending_saves` so both legs pin the
+    same slice of the pool -- and read it off the *public* accessor, never by
+    reaching through the delegating shell's `_impl` (review finding §2b).
+    """
+
+    @staticmethod
+    def _sched(connector):
+        import atom.model_engine.scheduler as sched_mod
+
+        s = object.__new__(sched_mod.Scheduler)
+        s.kv_connector = connector
+        return s
+
+    def test_reads_the_public_bound_off_the_connector(self):
+        s = self._sched(SimpleNamespace(max_pending_saves=5))
+        assert s._state_store_pending_cap() == 5
+
+    def test_falls_back_to_env_when_the_connector_does_not_bound(self, monkeypatch):
+        """dense reports None (its save queue is unbounded); use the env reader."""
+        import atom.model_engine.scheduler as sched_mod
+
+        monkeypatch.setattr(sched_mod, "_MAX_PENDING_OFFLOAD", None)
+        monkeypatch.setenv("OFFLOAD_MAX_PENDING_SAVES", "3")
+        s = self._sched(SimpleNamespace(max_pending_saves=None))
+        assert s._state_store_pending_cap() == 3
+
+    def test_under_multi_reaches_the_bound_on_the_state_tier_sub(self):
+        """The composite bounds nothing of its own; the sub carries the bound."""
+        sub = SimpleNamespace(max_pending_saves=7)
+        conn = SimpleNamespace(max_pending_saves=None, _state_tier_sub=lambda: sub)
+        s = self._sched(conn)
+        assert s._state_store_pending_cap() == 7
+
+
+class TestTheTierSplitPartitionsServedReuse:
+    """`[Cache Tiers]` exists to answer "what does the CPU tier buy", so its two
+    halves have to be two halves of one thing.
+
+    `cached` and `offload` are that: `cached` is what the HBM walk actually
+    handed over, `offload` is what the tier added on top, and they sum to
+    `num_cached`. `compressed` is NOT -- it is how far the walk reached before
+    the state gates cut it, so it counts reuse nobody got.
+    """
+
+    @staticmethod
+    def stats(**kw):
+        from atom.model_engine.engine_stats import EngineStats
+
+        s = EngineStats(enable_prefix_caching=True)
+        s.update_cache(**kw)
+        return s
+
+    def test_the_two_halves_sum_to_the_end_to_end_rate(self):
+        s = self.stats(
+            num_cached_tokens=300,
+            num_full_tokens=1200,
+            num_compressed_tokens=800,
+            num_wanted_tokens=300,
+            num_reusable_tokens=1000,
+            num_offload_tokens=700,
+        )
+        assert s.cache_hit_rate + s.lmcache_hit_rate == pytest.approx(1.0)
+
+    def test_the_halves_never_exceed_the_denominator(self):
+        """K3's ordinary anchor-only shape: the walk reaches 8 blocks, the only
+        resumable rung is at 3, the joint boundary lands at 10. Pairing
+        `compressed` against `offload` prints 80% + 70% here -- 150% of a
+        denominator that is the ceiling."""
+        s = self.stats(
+            num_cached_tokens=300,  # the gate cut the walk from 800 to 300
+            num_full_tokens=1200,
+            num_compressed_tokens=800,
+            num_wanted_tokens=300,
+            num_reusable_tokens=1000,
+            num_offload_tokens=700,
+        )
+        assert s.paged_hit_rate + s.lmcache_hit_rate > 1.0, (
+            "precondition: this is the shape that makes the wrong pairing "
+            "exceed 100%, so the assertion below is not vacuous"
+        )
+        assert s.cache_hit_rate + s.lmcache_hit_rate <= 1.0
+
+    def test_the_line_reports_cached_not_compressed(self, caplog):
+        """Reads the emitted text: swapping `hit_rate` back for
+        `paged_hit_rate` has to be what fails here."""
+        import logging
+
+        s = self.stats(
+            num_cached_tokens=300,
+            num_full_tokens=1200,
+            num_compressed_tokens=800,
+            num_wanted_tokens=300,
+            num_reusable_tokens=1000,
+            num_offload_tokens=700,
+        )
+        with caplog.at_level(logging.INFO, logger="atom"):
+            s._log_pools()
+        line = next(
+            r.getMessage() for r in caplog.records if "[Cache Tiers]" in r.getMessage()
+        )
+        assert "300/1000" in line, f"HBM half must be `cached`, got: {line}"
+        assert "800/1000" not in line, f"`compressed` is reach, not served: {line}"
+        assert "700/1000" in line
+
+    def test_no_tier_attached_emits_no_tier_line(self, caplog):
+        import logging
+
+        s = self.stats(
+            num_cached_tokens=300,
+            num_full_tokens=1200,
+            num_compressed_tokens=800,
+            num_wanted_tokens=300,
+            num_reusable_tokens=1000,
+        )
+        with caplog.at_level(logging.INFO, logger="atom"):
+            s._log_pools()
+        assert not any("[Cache Tiers]" in r.getMessage() for r in caplog.records)

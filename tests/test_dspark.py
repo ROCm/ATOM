@@ -9,10 +9,19 @@ import types
 
 import pytest
 
-pytest.importorskip("aiter", reason="the compiled draft imports aiter at module load")
+# Named on the module, not on "aiter": a test collected after one that stubs
+# `sys.modules["aiter"]` (tests/test_pd_pp.py does) sees the name import fine
+# and dies on a symbol, which is a collection error and takes the suite with
+# it. `exc_type` is what turns that ImportError into a skip.
+pytest.importorskip(
+    "atom.spec_decode.drafter",
+    reason="the compiled draft imports aiter at module load",
+    exc_type=ImportError,
+)
 
 import torch
 
+import atom.spec_decode.drafter as mod_drafter
 from atom.model_ops.v4_kernels.dspark_fp8_indices import DSparkIndexBuffers
 from atom.models.deepseek_v4_dspark import (
     DSparkConfidenceHead,
@@ -162,6 +171,33 @@ def test_speculative_config_mtp_not_misrouted_to_dspark():
     SpeculativeConfig.hf_config_override(hf, model_path=None)
     assert hf.model_type == "deepseek_v4_mtp"
     assert hf.architectures == ["DeepseekV4MTPModel"]
+
+
+def test_the_stage_count_still_comes_off_a_checkpoint_directory(tmp_path):
+    import json
+
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {f"mtp.{i}.attn.wo.weight": "s" for i in (0, 1, 2)}})
+    )
+    from atom.models.deepseek_v4_dspark import _count_dspark_stages
+
+    assert _count_dspark_stages(str(tmp_path), default=0) == 3
+
+
+def test_an_unreachable_checkpoint_falls_back_instead_of_raising(tmp_path, monkeypatch):
+    """The probe stays a probe: nothing on disk, nothing cached, no exception."""
+    from huggingface_hub import constants
+
+    from atom.models.deepseek_v4_dspark import _count_dspark_stages
+
+    # Patched on the module, not in the environment: the env var is read once
+    # at import, so setting it here would leave the probe reading whatever real
+    # cache this machine has and reaching the hub for what it misses.
+    monkeypatch.setattr(constants, "HF_HUB_CACHE", str(tmp_path))
+    monkeypatch.setattr(constants, "HF_HUB_OFFLINE", True)
+
+    assert _count_dspark_stages("atom-test/nothing-cached-here", default=7) == 7
+    assert _count_dspark_stages(None, default=7) == 7
 
 
 def test_block_sparse_attention_is_bidirectional_within_block():
@@ -970,7 +1006,7 @@ def test_forward_spec_passes_the_batch_through_unpadded(is_dummy, B):
 _GRAPH_BS = [1, 2, 4, 8, 16, 32, 48, 64, 128, 256]
 
 
-def _stub_forward_context(*, scheduled_bs, target_bs, use_cudagraph=True):
+def _stub_forward_context(*, scheduled_bs, target_bs):
     context = types.SimpleNamespace(
         scheduled_bs=scheduled_bs,
         running_bs=target_bs,
@@ -980,10 +1016,8 @@ def _stub_forward_context(*, scheduled_bs, target_bs, use_cudagraph=True):
         running_tokens=target_bs * 337,
         is_dummy_run=False,
         is_draft=False,
+        is_prefill=False,
         positions=None,
-        forward_mode=types.SimpleNamespace(
-            use_cudagraph=use_cudagraph, running_bs=target_bs
-        ),
     )
     # `prepare_decode` publishes the ring slots at the PADDED batch, so the stub
     # does too -- the block slices to that length and nothing stages it.
@@ -994,19 +1028,30 @@ def _stub_forward_context(*, scheduled_bs, target_bs, use_cudagraph=True):
     return types.SimpleNamespace(context=context, attn_metadata=attn_metadata)
 
 
-def _proposer_with_graph_bs(monkeypatch, *, eplb=False, mtp_k=5, window=128):
-    """A DSparkProposer carrying only what the block pass reads."""
+def _proposer_with_graph_bs(
+    monkeypatch, *, eplb=False, mtp_k=5, window=128, captured=True
+):
+    """A DSparkProposer carrying only what the block pass reads.
+
+    ``captured`` is the fixture keeping its own name's promise: the startup
+    sweep records every capture size, and `propose` widens only for a batch
+    that has a recording. Answered through `is_captured` rather than by filling
+    `_cuda_graphs`, so `run` still reaches the backbone -- the only place these
+    tests can watch the width. `captured=False` is the no-recording case, where
+    widening would hand the variable-length MoE gather rows nothing replays.
+    """
+    from atom.spec_decode.draft_graph import DraftGraph
     from atom.spec_decode.dspark_proposer import DSparkProposer
+
+    monkeypatch.setattr(
+        DraftGraph,
+        "is_captured",
+        lambda self, running_bs: captured and running_bs in _GRAPH_BS,
+    )
 
     monkeypatch.setattr(DSparkProposer, "_with_draft", False, raising=False)
     monkeypatch.setattr(
         DSparkProposer, "aux_for", lambda self, h: [torch.zeros(1)], raising=False
-    )
-    monkeypatch.setattr(
-        DSparkProposer,
-        "_refresh_dp_metadata",
-        lambda self, fc, n: None,
-        raising=False,
     )
     monkeypatch.setattr(DSparkProposer, "verify_scheduler", None, raising=False)
 
@@ -1031,7 +1076,20 @@ def _proposer_with_graph_bs(monkeypatch, *, eplb=False, mtp_k=5, window=128):
     return p
 
 
-def _run_propose(p, fc, real_bs, monkeypatch, seen):
+def _install_block_halves(p, inner):
+    """Give a stub draft model the two halves ``DSparkDraftModel`` declares.
+
+    V4 keeps its backbone and head on an inner compiled module and the real
+    ``DeepseekV4DSpark`` forwards to them exactly like this, so the double
+    stays on the surface the proposer actually uses.
+    """
+    p.model.model = inner
+    p.model.block_backbone = lambda ids, pos, num_draft: inner(ids, pos, num_draft)
+    p.model.head_and_sample = lambda out, ids, _: inner.head_and_sample(*out, ids)
+    return p
+
+
+def _run_propose(p, fc, scheduled_bs, monkeypatch, seen):
     import atom.spec_decode.dspark_proposer as mod
 
     def _backbone(ids, pos, num_draft):
@@ -1063,22 +1121,22 @@ def _run_propose(p, fc, real_bs, monkeypatch, seen):
                 torch.zeros(hc_hidden, p.mtp_k),
             )
 
-    p.model.model = _Inner()
+    _install_block_halves(p, _Inner())
     monkeypatch.setattr(mod, "get_forward_context", lambda: fc)
     return p.propose(
         target_token_ids=None,
-        target_positions=torch.arange(real_bs, dtype=torch.int64) * 7 + 3,
-        target_hidden_states=torch.zeros(real_bs, 4),
+        target_positions=torch.arange(scheduled_bs, dtype=torch.int64) * 7 + 3,
+        target_hidden_states=torch.zeros(scheduled_bs, 4),
         num_reject_tokens=None,
-        next_token_ids=torch.full((real_bs,), 5, dtype=torch.int32),
-        last_token_indices=torch.arange(real_bs, dtype=torch.int64),
+        next_token_ids=torch.full((scheduled_bs,), 5, dtype=torch.int32),
+        last_token_indices=torch.arange(scheduled_bs, dtype=torch.int64),
     )
 
 
 @pytest.mark.parametrize(
-    "real_bs,expect_B", [(44, 48), (50, 64), (1, 1), (64, 64), (35, 48)]
+    "scheduled_bs,expect_B", [(44, 48), (50, 64), (1, 1), (64, 64), (35, 48)]
 )
-def test_propose_drafts_at_the_captured_graph_bs(monkeypatch, real_bs, expect_B):
+def test_propose_drafts_at_the_captured_graph_bs(monkeypatch, scheduled_bs, expect_B):
     """The block runs at the target's running_bs, not the live batch size.
 
     Without this the drafter hands aiter a fresh width on every distinct decode
@@ -1087,42 +1145,257 @@ def test_propose_drafts_at_the_captured_graph_bs(monkeypatch, real_bs, expect_B)
     """
     seen = {}
     p = _proposer_with_graph_bs(monkeypatch)
-    fc = _stub_forward_context(scheduled_bs=real_bs, target_bs=expect_B)
-    out = _run_propose(p, fc, real_bs, monkeypatch, seen)
+    fc = _stub_forward_context(scheduled_bs=scheduled_bs, target_bs=expect_B)
+    out = _run_propose(p, fc, scheduled_bs, monkeypatch, seen)
 
     assert seen["B"] == expect_B
     assert seen["positions_B"] == expect_B
     # The block does not touch the target's ring slots: they arrive already at
     # the padded length, so there is nothing to install and nothing to restore.
     assert seen["slots"].shape[0] >= expect_B
-    assert seen["slots"][:real_bs].tolist() == list(range(100, 100 + real_bs))
-    assert out.shape[0] == real_bs
+    assert seen["slots"][:scheduled_bs].tolist() == list(range(100, 100 + scheduled_bs))
+    assert out.shape[0] == scheduled_bs
 
     # ...but the rows it fabricated must scatter no draft KV. Their ring slot is
     # the 0 `prepare_decode` fills that tail with, and 0 is a real position, so
     # an unmasked pad row writes into another request's window.
     t = p.mtp_k
     ids = seen["batch_ids"]
-    assert ids[: real_bs * t].tolist() == [i // t for i in range(real_bs * t)]
-    assert ids[real_bs * t : expect_B * t].tolist() == [-1] * (expect_B - real_bs) * t
+    assert ids[: scheduled_bs * t].tolist() == [i // t for i in range(scheduled_bs * t)]
+    assert (
+        ids[scheduled_bs * t : expect_B * t].tolist()
+        == [-1] * (expect_B - scheduled_bs) * t
+    )
 
 
-@pytest.mark.parametrize(
-    "cudagraph,eplb,why",
-    [
-        (False, False, "eager: the target pinned no wider batch to follow"),
-        (True, True, "pad rows would poison the expert-load histogram"),
-    ],
-)
-def test_propose_leaves_the_batch_alone_when_nothing_pins_a_wider_one(
-    monkeypatch, cudagraph, eplb, why
-):
+def test_propose_states_both_units_of_its_own_pass(monkeypatch):
+    """The draft's shape, and it is the pass's own, not the target's.
+
+    `scheduled_tokens` is how many rows carry a real request, `running_tokens`
+    how many the pass runs, and they DIFFER exactly when the batch was widened.
+    Pinned 44 against 48 so a version that reports one number twice cannot pass.
+    """
     seen = {}
-    p = _proposer_with_graph_bs(monkeypatch, eplb=eplb)
-    fc = _stub_forward_context(scheduled_bs=44, target_bs=48, use_cudagraph=cudagraph)
+    p = _proposer_with_graph_bs(monkeypatch, captured=False)
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
     out = _run_propose(p, fc, 44, monkeypatch, seen)
-    assert seen["B"] == 44, why
-    assert out.shape[0] == 44
+
+    t = p.mtp_k
+    assert seen["B"] == 48, "the pass runs the agreed batch, recording or not"
+    assert fc.context.scheduled_tokens == 44 * t
+    assert fc.context.running_tokens == 48 * t
+    assert out.shape[0] == 44, "sliced back to the real requests on the way out"
+    # ...and the fabricated rows still scatter no draft KV.
+    ids = seen["batch_ids"]
+    assert ids[44 * t : 48 * t].tolist() == [-1] * (4 * t)
+
+
+def test_propose_sizes_the_draft_gather_without_asking_the_group(monkeypatch):
+    """No collective here. The step already ran its one.
+
+    Every rank's draft height is the same number by construction --
+    `running_bs` came out of that reduction and the draft width is config -- so
+    each can write the whole table itself. `DPMetadata.make` all_reduces it
+    when the table is not supplied, which cost one CPU collective per draft
+    pass: `mtp_k` of them per step for the serial drafters.
+
+    Watched by making the ask itself fail, not by counting calls: a version
+    that asks would otherwise pass here on a stub that answers.
+    """
+    seen = {}
+    p = _proposer_with_graph_bs(monkeypatch)
+    p.config.parallel_config = types.SimpleNamespace(
+        data_parallel_size=2, data_parallel_rank=0
+    )
+
+    def _must_not_ask(*a, **k):
+        raise AssertionError("draft asked the group for a height it already knows")
+
+    monkeypatch.setattr(
+        mod_drafter.DPMetadata, "num_tokens_across_dp", staticmethod(_must_not_ask)
+    )
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
+    fc.dp_metadata = None
+    _run_propose(p, fc, 44, monkeypatch, seen)
+
+    t = p.mtp_k
+    assert fc.dp_metadata.get_sizes_across_dp() == [48 * t, 48 * t]
+
+
+def test_propose_puts_the_pass_on_the_path_its_own_shape_is_on(monkeypatch):
+    """The block pass is uniform across DP and is not a prefill.
+
+    Its height is `running_bs * draft width`, and both factors are the step's
+    own reduction or config -- so every rank runs the same number of rows,
+    whatever `decide` said about the TARGET's counts. That is what lets the
+    table below be declared rather than asked for.
+
+    `is_prefill` is a SEPARATE write by this same caller, not a consequence of
+    publishing a shape -- the padded gather reads it to choose which of the two
+    heights to check the rows against. Asserted here rather than one seam down
+    because the drafter reusing the target's prefill layout needs the opposite.
+    """
+    seen = {}
+    p = _proposer_with_graph_bs(monkeypatch)
+    p.config.parallel_config = types.SimpleNamespace(
+        data_parallel_size=2, data_parallel_rank=0
+    )
+    monkeypatch.setattr(
+        mod_drafter.DPMetadata, "make", staticmethod(lambda *a, **k: "dp_meta")
+    )
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
+    fc.context.is_prefill = True
+    fc.dp_metadata = None
+    _run_propose(p, fc, 44, monkeypatch, seen)
+
+    assert fc.context.running_tokens_are_unified is True
+    assert fc.context.is_prefill is False
+    assert fc.dp_metadata == "dp_meta"
+
+
+class _BareFlavor(mod_drafter.Drafter):
+    """The abstract methods, stubbed. `_publish_draft_shape` reads neither."""
+
+    _resolve_mtp_k = propose = staticmethod(lambda *a, **k: None)
+
+
+def _bare_drafter(dp_size):
+    """A Drafter carrying only what `_publish_draft_shape` reads.
+
+    Not a DSparkProposer: the tests below are about the seam every flavor goes
+    through, and the one that gets it wrong is the one with no fixture.
+    """
+    drafter = object.__new__(_BareFlavor)
+    drafter.config = types.SimpleNamespace(
+        parallel_config=types.SimpleNamespace(
+            data_parallel_size=dp_size, data_parallel_rank=0
+        )
+    )
+    return drafter
+
+
+def test_a_height_the_group_did_not_agree_on_is_asked_for_not_declared(monkeypatch):
+    """A draft pass sized off this rank alone still costs the collective.
+
+    `running_bs * width` is the same number everywhere; a pass carrying this
+    rank's own token stream is not, and declaring it uniform states an equality
+    no reduction ever checked.
+
+    What travels is the answer, not the table it implies -- how `make` then
+    builds one is tested against the real thing in tests/test_dp_metadata.py.
+    The two counts are pinned apart so forwarding the wrong one fails here.
+    """
+    seen = {}
+
+    def _make(cfg, batchsize, num_tokens_across_dp=None, *, unified=False):
+        seen["batchsize"] = batchsize
+        seen["table"] = num_tokens_across_dp
+        seen["unified"] = unified
+        return "dp_meta"
+
+    monkeypatch.setattr(mod_drafter.DPMetadata, "make", staticmethod(_make))
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
+
+    _bare_drafter(2)._publish_draft_shape(
+        fc,
+        scheduled_tokens=308,
+        running_tokens=336,
+        running_tokens_are_unified=False,
+    )
+    assert fc.context.running_tokens_are_unified is False
+    assert seen["unified"] is False, "a ragged height has to be discovered"
+
+    _bare_drafter(2)._publish_draft_shape(
+        fc,
+        scheduled_tokens=308,
+        running_tokens=336,
+        running_tokens_are_unified=True,
+    )
+    assert fc.context.running_tokens_are_unified is True
+    assert seen["batchsize"] == 336, "the group is told what the pass RUNS"
+    assert seen["unified"] is True, "an agreed height is worth no ask"
+    assert seen["table"] is None, "the answer travels, not a table built here"
+
+
+def test_publishing_a_shape_does_not_decide_whether_it_is_a_prefill():
+    """Two different questions, and one drafter answers them differently.
+
+    A draft step that reuses the target's own prefill layout -- Eagle's first
+    -- runs the target's ragged token stream through metadata that still
+    describes a prefill, so clearing the flag here would send every MLA layer,
+    the indexer and PCP down the decode branch on a pass that is not one.
+    """
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
+    fc.context.is_prefill = True
+
+    # dp_size 1: no metadata to build, so nothing but the flag is under test.
+    _bare_drafter(1)._publish_draft_shape(
+        fc,
+        scheduled_tokens=337,
+        running_tokens=337,
+        running_tokens_are_unified=False,
+    )
+
+    assert fc.context.is_prefill is True
+
+
+def test_propose_pads_under_eplb_exactly_as_it_does_without_it(monkeypatch):
+    """EPLB is not a reason to decline the padding, though it used to be.
+
+    The stated reason was the expert-load histogram: a pad row routes through
+    the draft's MoE and `select_experts_with_record` counts it. But the TARGET
+    pads on every cudagraph decode step and its rows reach the same recorder
+    (`eplb_map_and_record_fused` masks nothing), in far greater volume -- so
+    declining here protected nothing and only cost the draft its warmed shape.
+
+    Asserting the two are EQUAL, not that either is 48: a future term that
+    reads the config back into the width fails here whichever way it leans.
+    """
+    seen_on, seen_off = {}, {}
+    _run_propose(
+        _proposer_with_graph_bs(monkeypatch, eplb=True),
+        _stub_forward_context(scheduled_bs=44, target_bs=48),
+        44,
+        monkeypatch,
+        seen_on,
+    )
+    _run_propose(
+        _proposer_with_graph_bs(monkeypatch, eplb=False),
+        _stub_forward_context(scheduled_bs=44, target_bs=48),
+        44,
+        monkeypatch,
+        seen_off,
+    )
+    assert seen_on["B"] == seen_off["B"] == 48
+
+
+def test_propose_replays_at_the_agreed_batch_even_when_it_had_to_pad(monkeypatch):
+    """The seam, end to end through `propose`.
+
+    A step whose real batch is 44 runs the block at the agreed 48 and stands in
+    for the recording there. Watched through the recording being returned and
+    the backbone never running -- asserting the label alone would pass on a
+    `run` that replays nothing.
+
+    """
+    seen = {}
+    p = _proposer_with_graph_bs(monkeypatch)
+    recorded = (
+        torch.full((48, p.mtp_k), 9, dtype=torch.int32),
+        torch.zeros(48, p.mtp_k),
+    )
+    replays = []
+    p.block._cuda_graphs[48] = (
+        types.SimpleNamespace(replay=lambda: replays.append(1)),
+        recorded,
+    )
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
+    out = _run_propose(p, fc, 44, monkeypatch, seen)
+    assert replays == [1], "must replay the recording at the agreed batch"
+    assert "B" not in seen, "the backbone must not run when the recording stands in"
+    # Sliced back to the real batch: the 4 fabricated rows are the recording's
+    # to compute and nobody's to return.
+    assert out.tolist() == recorded[0][:44, : p.mtp_k].tolist()
 
 
 def test_propose_pads_a_dp_sync_dummy_exactly_like_the_rank_with_work(monkeypatch):
@@ -1176,7 +1449,7 @@ def test_the_warm_marks_its_context_as_a_draft(monkeypatch):
         def head_and_sample(normed, hc_hidden, anchor_ids):
             return None, None
 
-    p.model.model = _Inner()
+    _install_block_halves(p, _Inner())
     import atom.spec_decode.dspark_proposer as mod
 
     monkeypatch.setattr(mod, "get_forward_context", lambda: fc)
@@ -1244,7 +1517,7 @@ def test_the_block_wires_both_its_backbone_and_its_head_into_the_pass(monkeypatc
             ran.append("head")
             return None, None
 
-    p.model.model = _Inner()
+    _install_block_halves(p, _Inner())
     fc = _stub_forward_context(scheduled_bs=8, target_bs=8)
     import atom.spec_decode.dspark_proposer as mod
 
@@ -1290,7 +1563,7 @@ def test_the_block_warms_where_the_whole_rolling_window_is_valid(monkeypatch, wi
         def head_and_sample(normed, hc_hidden, anchor_ids):
             return None, None
 
-    p.model.model = _Inner()
+    _install_block_halves(p, _Inner())
     fc = _stub_forward_context(scheduled_bs=8, target_bs=8)
     import atom.spec_decode.dspark_proposer as mod
 
@@ -1325,7 +1598,7 @@ def test_warming_the_block_on_a_dummy_context_is_refused(monkeypatch):
         def head_and_sample(normed, hc_hidden, anchor_ids):
             return None, None
 
-    p.model.model = _Inner()
+    _install_block_halves(p, _Inner())
     fc = _stub_forward_context(scheduled_bs=8, target_bs=8)
     import atom.spec_decode.dspark_proposer as mod
 
@@ -1341,26 +1614,47 @@ def test_warming_the_block_on_a_dummy_context_is_refused(monkeypatch):
     assert reached == ["backbone"]
 
 
-def test_the_separate_draft_model_path_declares_no_draft_graph(monkeypatch):
-    """Kimi-K3 must declare NO pass, not merely an unpaddable one.
+def test_both_flavors_declare_one_block_pass_bound_to_the_same_halves(monkeypatch):
+    """One block pass with one set of bindings, whichever flavor this is.
 
-    Its draft carries neither `window_size` nor `model.head_and_sample`, which
-    the warmup and epilogue reach for -- and `warmup` runs both BEFORE it
-    consults the pad/capture gates. So an unpaddable-but-declared pass still
-    takes the startup sweep through `_block_warmup_inputs` and dies with an
-    AttributeError, which is what leaving this at `pads = False` used to do.
+    The bindings used to be chosen per flavor; the halves they name now live on
+    the draft model, so the declaration no longer knows which drafter it serves.
     """
     from atom.spec_decode.dspark_proposer import DSparkProposer
 
     p = _proposer_with_graph_bs(monkeypatch)
-    assert p.draft_graphs and p.block.pads
+    assert p.draft_graphs == (p.block,)
+    assert p.block.forward == p._block_backbone
+    assert p.block.epilogue == p._block_head
 
     monkeypatch.setattr(DSparkProposer, "_with_draft", True, raising=False)
     p._build_draft_graphs()
-    assert p.draft_graphs == ()
-    # None, not absent and not the pass a previous build left behind: rebuilding
-    # is what the flavor probes in these tests do, and `propose` reads this.
-    assert p.block is None
+    assert p.draft_graphs == (p.block,)
+    assert p.block.forward == p._block_backbone
+    assert p.block.epilogue == p._block_head
+
+
+def test_the_backbone_gets_the_positions_the_slot_mapping_was_built_from(monkeypatch):
+    """The paged flavor hands over `_blk_positions`, not the staged anchors.
+
+    The slot mapping and the positions the layers see have to be one tensor.
+    The window flavor has no such buffer and passes the anchors straight
+    through -- the whole of the difference left after the halves moved onto
+    the model.
+    """
+    from atom.spec_decode.dspark_proposer import DSparkProposer
+
+    p = _proposer_with_graph_bs(monkeypatch)
+    anchors = torch.arange(4, dtype=torch.int64)
+    assert p._block_positions(4, anchors) is anchors
+
+    t = p.draft_tokens_per_seq
+    monkeypatch.setattr(DSparkProposer, "_with_draft", True, raising=False)
+    p._blk_positions = torch.arange(8 * t, dtype=torch.int64).view(8, t)
+    got = p._block_positions(4, anchors)
+    assert got.data_ptr() == p._blk_positions.data_ptr()
+    assert got.shape == (4 * t,)
+    assert torch.equal(got, p._blk_positions[:4].reshape(-1))
 
 
 def test_qk_norm_rope_short_circuits_dummy_run():
@@ -1666,9 +1960,9 @@ def test_every_op_fake_agrees_with_its_body():
                 [t.shape for t in v4._v4_qk_norm_rope_fake(q, kv_pre, positions, "L")],
                 [
                     t.shape
-                    for t in v4._qkn_to_list(
-                        A._qk_norm_rope(layer, q, kv_pre, positions), layer.kv_fp8
-                    )
+                    for t in A._qk_norm_rope(
+                        layer, q, kv_pre, positions
+                    ).custom_op_return()
                 ],
             ),
             (
@@ -1814,8 +2108,8 @@ def test_qk_norm_rope_shapes_match_what_the_paged_kernel_asserts():
     assert bf16.q_packed is None and bf16.q_rope is None
 
     # And the op's return list has to carry the active layout's four / two.
-    assert len(v4._qkn_to_list(fp8, True)) == 4
-    assert len(v4._qkn_to_list(bf16, False)) == 2
+    assert len(fp8.custom_op_return()) == 4
+    assert len(bf16.custom_op_return()) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -2065,3 +2359,326 @@ def test_sparse_attention_sizes_on_the_q_not_positions():
 
     assert body.shape == (T_Q, H * D), f"body followed positions: {body.shape}"
     assert fake.shape == (T_Q, H * D), f"fake followed positions: {fake.shape}"
+
+
+# ---- the paged block's metadata build (Kimi-K3) ------------------------------
+
+
+def _paged_proposer(monkeypatch, *, max_model_len, block_size, bound_pool=True):
+    """A DSparkProposer carrying only what `_build_paged_block_metadata` reads.
+
+    The two calls in it that need a GPU are replaced: the Triton index
+    generator by a recorder, and the aiter work planner by a no-op. Everything
+    the tests below look at -- slots, context lengths, the borrowed column -- is
+    decided before either runs.
+    """
+    import atom.model_ops.attentions.aiter_mla as mod_mla
+    import atom.spec_decode.dspark_proposer as mod
+    from atom.spec_decode.dspark_proposer import DSparkProposer
+
+    p = DSparkProposer.__new__(DSparkProposer)
+    p.device = torch.device("cpu")
+    p.mtp_k = 7
+    p.dcp_world_size = 1
+    p.dcp_rank = 0
+    p.config = types.SimpleNamespace(
+        max_num_seqs=8,
+        max_model_len=max_model_len,
+        kv_cache_dtype="auto",
+    )
+    p.dtype = torch.bfloat16
+    p.model = types.SimpleNamespace(window_size=None)
+    n_cols = max_model_len // block_size
+    block_tables = torch.zeros(p.config.max_num_seqs, n_cols, dtype=torch.int32)
+    p.runner = types.SimpleNamespace(
+        block_size=block_size,
+        forward_vars={"block_tables": types.SimpleNamespace(gpu=block_tables)},
+    )
+    p._init_draft_block_buffers()
+
+    # The pool predicate reads a bound k_cache off the draft's first layer.
+    k_cache = torch.zeros(4) if bound_pool else torch.zeros(0)
+    monkeypatch.setattr(
+        DSparkProposer,
+        "_bound_draft_k_cache",
+        lambda self, fc: k_cache if k_cache.numel() else None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        DSparkProposer,
+        "_init_block_persistent_buffers",
+        lambda self, dq, dkv: {
+            k: torch.zeros(64, dtype=torch.int32)
+            for k in (
+                "work_meta_data",
+                "work_info_set",
+                "work_indptr",
+                "reduce_indptr",
+                "reduce_final_map",
+                "reduce_partial_map",
+            )
+        },
+        raising=False,
+    )
+    p._blk_padded_heads = 16
+    p._blk_split_kwargs = {}
+    p._blk_dtype_q = torch.bfloat16
+
+    calls = []
+    monkeypatch.setattr(
+        mod,
+        "kv_indices_generate_triton",
+        lambda tables, out, indptr, ratio, max_k: calls.append(
+            {"col0": tables[:, 0].clone(), "indptr": indptr.clone()}
+        ),
+    )
+    monkeypatch.setattr(mod_mla, "get_mla_metadata_v1", lambda *a, **k: None)
+    return p, block_tables, calls
+
+
+def _paged_fc(*, is_dummy_run=False, max_seqlen_k=64):
+    return types.SimpleNamespace(
+        context=types.SimpleNamespace(is_dummy_run=is_dummy_run),
+        attn_metadata=types.SimpleNamespace(max_seqlen_k=max_seqlen_k),
+    )
+
+
+def test_a_block_position_past_the_block_table_is_dropped_not_clamped():
+    """The clamp keeps the gather in bounds; it must not decide the WRITE.
+
+    An anchor in its final page drafts T positions past the table's last
+    column. Clamping names that last column -- an id this request may never
+    have been given -- and the slot keeps the original position's in-page
+    offset, so the block would scatter its KV into whatever request owns that
+    page. These rows want the pad tail's `-1`.
+    """
+    from atom.spec_decode.dspark_proposer import DSparkProposer
+
+    block_tables = torch.zeros(1, 4, dtype=torch.int32)
+    # Columns 0..3 exist; positions 254..258 straddle the end at block_size=64.
+    positions = torch.tensor([[254, 255, 256, 257, 258]])
+    page_idx, in_table = DSparkProposer._block_page_idx(positions, 64, block_tables)
+
+    assert page_idx.max().item() <= 3, "the gather index must stay in bounds"
+    assert in_table.tolist() == [[True, True, False, False, False]]
+
+
+def test_the_pad_row_and_an_unaddressable_row_are_dropped_the_same_way(monkeypatch):
+    """Both kinds of "aimed at nowhere" have to reach the cache-store as -1."""
+    p, block_tables, _ = _paged_proposer(monkeypatch, max_model_len=256, block_size=64)
+    block_tables.fill_(9)  # every column holds a plausible page id
+    T = p.draft_tokens_per_seq
+    # Row 0's anchor sits in the final page, so anchor+1.. leave the table.
+    anchor_positions = torch.tensor([255, 10], dtype=torch.int64)
+
+    p._build_paged_block_metadata(
+        _paged_fc(),
+        types.SimpleNamespace(max_seqlen_k=256),
+        anchor_positions,
+        scheduled_bs=2,
+        max_seqlen_k=256 + T,
+    )
+
+    slots = p._blk_slots[: 2 * T].view(2, T)
+    assert (slots[0] == -1).all(), f"row 0 escaped the table: {slots[0].tolist()}"
+    assert (slots[1] >= 0).all(), f"row 1 is addressable: {slots[1].tolist()}"
+
+
+def test_the_kv_length_never_promises_indices_the_table_cannot_address(monkeypatch):
+    """`kv_indptr` is a cumsum of `ctx_lens`, and the generator skips entries
+    past `n_cols`. A length past the table's coverage would promise indices
+    nobody wrote, and the decode would read the previous step's leftovers.
+    """
+    p, _, _ = _paged_proposer(monkeypatch, max_model_len=256, block_size=64)
+    T = p.draft_tokens_per_seq
+
+    p._build_paged_block_metadata(
+        _paged_fc(),
+        types.SimpleNamespace(max_seqlen_k=256),
+        torch.tensor([255], dtype=torch.int64),
+        scheduled_bs=1,
+        max_seqlen_k=256 + T,
+    )
+
+    # Unclamped this would be 255 + 1 + T = 263, past the table's 4*64 = 256.
+    assert p._blk_ctx_lens[0].item() == 256
+    assert p._blk_kv_indptr[1].item() == 256
+
+
+def test_the_borrowed_page_is_given_back_even_when_the_generator_raises(monkeypatch):
+    """The borrowed column is the TARGET's live state.
+
+    A raise between the borrow and the give-back would leave those rows
+    pointing at page 0 for good, and the request that lands on one next step
+    would read page 0 as its own first page -- cross-request KV, no error.
+    """
+    import atom.spec_decode.dspark_proposer as mod
+
+    p, block_tables, _ = _paged_proposer(monkeypatch, max_model_len=256, block_size=64)
+    block_tables.fill_(9)
+    monkeypatch.setattr(
+        mod,
+        "kv_indices_generate_triton",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("grid failed to JIT")),
+    )
+
+    with pytest.raises(RuntimeError, match="grid failed to JIT"):
+        p._build_paged_block_metadata(
+            _paged_fc(),
+            types.SimpleNamespace(max_seqlen_k=64),
+            torch.tensor([10, 10, 10, 10], dtype=torch.int64),
+            scheduled_bs=2,
+            max_seqlen_k=64 + p.draft_tokens_per_seq,
+        )
+
+    assert block_tables[2:4, 0].tolist() == [9, 9], "the pad tail kept page 0"
+
+
+def test_the_metadata_build_is_gated_on_the_pool_not_on_the_dummy_flag(monkeypatch):
+    """`is_dummy_run` covers two passes and only one of them lacks a pool.
+
+    `warmup_model()` runs before `allocate_kv_cache()`; `dummy_execution()`'s
+    DP-alignment step is a dummy whose pool is fully bound. Returning early on
+    the flag leaves a replay writing through the last real step's slots.
+    """
+    T = 7
+    for bound, expect_written in ((False, False), (True, True)):
+        p, _, _ = _paged_proposer(
+            monkeypatch, max_model_len=256, block_size=64, bound_pool=bound
+        )
+        p._blk_slots.fill_(1234)  # a previous step's mapping
+        p._build_paged_block_metadata(
+            _paged_fc(is_dummy_run=True),
+            types.SimpleNamespace(max_seqlen_k=64),
+            torch.tensor([10], dtype=torch.int64),
+            scheduled_bs=1,
+            max_seqlen_k=64 + T,
+        )
+        stale = bool((p._blk_slots[:T] == 1234).all())
+        assert stale is not expect_written, f"pool bound={bound}: slots stale={stale}"
+
+
+def test_a_dp_sync_dummy_describes_every_row_of_the_block_as_pad(monkeypatch):
+    """The dummy has to RUN -- the peers mirror its collectives -- but its one
+    sequence is fabricated and its block table is [0], so no row of it owns a
+    page. Describing it as pad is what makes the pass write nothing, and the
+    width must not shrink: `scheduled_bs` still slices the ids the caller gets.
+    """
+    p, _, _ = _paged_proposer(monkeypatch, max_model_len=256, block_size=64)
+    T = p.draft_tokens_per_seq
+    seen = {}
+    monkeypatch.setattr(
+        type(p),
+        "_build_paged_block_metadata",
+        lambda self, fc, md, pos, *, scheduled_bs, max_seqlen_k: seen.update(
+            described_bs=scheduled_bs, rows=pos.shape[0]
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        type(p), "_publish_draft_shape", lambda self, *a, **k: None, raising=False
+    )
+    monkeypatch.setattr(type(p), "verify_scheduler", None, raising=False)
+    p.block = types.SimpleNamespace(
+        stage=lambda bs, srcs: {"anchor_positions": torch.zeros(bs, dtype=torch.int64)},
+        label=lambda s, r: f"bs={s}/{r}",
+        run=lambda bs, **staged: (torch.zeros(bs, T, dtype=torch.int32), None),
+    )
+
+    for dummy, expect in ((False, 1), (True, 0)):
+        fc = _paged_fc(is_dummy_run=dummy)
+        fc.context.running_bs = 4
+        out = p._propose_with_draft(
+            fc,
+            fc.attn_metadata,
+            torch.zeros(1, dtype=torch.int32),
+            torch.zeros(1, dtype=torch.int64),
+        )
+        assert seen["described_bs"] == expect, f"is_dummy_run={dummy}"
+        assert seen["rows"] == 4, "the width is the agreed batch either way"
+        assert out.shape == (1, T), "the ids are still sliced to the real rows"
+
+
+def _persistent_probe(monkeypatch, *, page_size, dcp_world_size, dcp_persistent):
+    """Call the real `_init_block_persistent_buffers` with a stubbed draft impl.
+
+    The buffer sizing itself is aiter's, and irrelevant here -- what is under
+    test is the premise checked just before it.
+    """
+    import sys
+
+    import atom.model_ops.attentions.aiter_mla as mod_mla
+    from atom.spec_decode.dspark_proposer import DSparkProposer
+    from atom.utils import envs
+
+    # `aiter.dist` is aliased to `torch.distributed`, so `import
+    # aiter.dist.parallel_state` does not resolve even though the module is
+    # registered -- which is why the code under test uses a `from` import.
+    mod_ps = sys.modules["aiter.dist.parallel_state"]
+
+    p = DSparkProposer.__new__(DSparkProposer)
+    p.device = torch.device("cpu")
+    p.mtp_k = 7
+    p.dcp_world_size = dcp_world_size
+    p.config = types.SimpleNamespace(max_num_seqs=8)
+    p._blk_ps_bufs = None
+    impl = types.SimpleNamespace(
+        _dpa_persistent_supported=True,
+        dcp_world_size=dcp_world_size,
+        dcp_persistent_supported=dcp_persistent,
+        padded_num_heads=16,
+        dcp_kernel_num_heads=16,
+    )
+    p.model = types.SimpleNamespace(
+        layers=[
+            types.SimpleNamespace(
+                self_attn=types.SimpleNamespace(
+                    mla_attn=types.SimpleNamespace(impl=impl)
+                )
+            )
+        ]
+    )
+    monkeypatch.setattr(envs, "ATOM_MLA_PAGE_SIZE", page_size, raising=False)
+    monkeypatch.setattr(
+        mod_ps, "get_dp_group", lambda: types.SimpleNamespace(world_size=1)
+    )
+    monkeypatch.setattr(
+        mod_mla,
+        "get_mla_metadata_info_v1",
+        lambda *a, **k: tuple(((8, torch.int32),) * 6),
+    )
+    return p._init_block_persistent_buffers(torch.bfloat16, torch.bfloat16)
+
+
+def test_the_capture_refuses_a_config_the_split_kv_fallback_would_serve(monkeypatch):
+    """The warmup records at a `1 + T` context, which only the persistent
+    kernel makes safe: it takes the length from descriptors re-planned every
+    step, while the split-KV fallback decides its split count host-side, where
+    a capture freezes it. The premise was documented but never checked.
+    """
+    for page_size, dcp, dcp_ps in (
+        (64, 1, True),  # seg MLA
+        (1, 2, False),  # DCP on anything but gfx950
+    ):
+        with pytest.raises(AssertionError, match="split-KV fallback"):
+            _persistent_probe(
+                monkeypatch,
+                page_size=page_size,
+                dcp_world_size=dcp,
+                dcp_persistent=dcp_ps,
+            )
+
+
+def test_the_premise_check_passes_the_configuration_k3_actually_ships(monkeypatch):
+    """`recipes/Kimi-K3.md`: gfx950, `-tp 8`, no DCP, default page size."""
+    bufs = _persistent_probe(
+        monkeypatch, page_size=1, dcp_world_size=1, dcp_persistent=True
+    )
+    assert set(bufs) == {
+        "work_meta_data",
+        "work_indptr",
+        "work_info_set",
+        "reduce_indptr",
+        "reduce_final_map",
+        "reduce_partial_map",
+    }

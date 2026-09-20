@@ -1,5 +1,12 @@
 # DeepSeek-V4 Agentic Benchmark (MI355X)
 
+> **The ATOM commands below are from an earlier configuration.** They predate
+> MTP, the FP4 index cache and `--cudagraph-mode FULL`, and one row was
+> produced with an `ATOM_SWA_FULL_RETAIN` mode that has since been removed.
+> For the current CI-verified server and AIPerf commands see
+> [`DeepSeek-V4-Agentic-InferenceX.md`](DeepSeek-V4-Agentic-InferenceX.md).
+> The cross-engine comparison here (vLLM / SGLang / B200) still stands.
+
 This recipe documents the **agentic-replay** performance of DeepSeek-V4-Pro on
 8×MI355X and how to reproduce ATOM's numbers. The workload is the SemiAnalysis
 InferenceX™ *agentic traces* scenario (AIPerf `inferencex-agentx-mvp`, public

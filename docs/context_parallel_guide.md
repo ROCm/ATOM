@@ -520,30 +520,38 @@ hit it.
 DeepSeek-R1 never needed this: 128 heads at `-tp 8` is 16 per rank, and the dcp8
 gather lands on 128 exactly.
 
-### The gqa=64 exception (non-persistent fp8 decode)
+### Sparse DCP persistent attention and gqa=64
 
-One of those four native widths is not always available: with an **fp8 Q and an
-fp8 KV cache**, aiter serves gqa=64 only from the **persistent** decode kernel
-and aborts the process otherwise (`asm_mla.cu`: *"fp8/fp8 with gqa_ratio=64 only
-supports persistent mode"*). A DCP decode that cannot be persistent therefore
-rounds a gathered 64 up to **128** instead of taking 64. Two situations force
-non-persistent:
+With an **fp8 Q and an fp8 KV cache**, aiter serves gqa=64 only from the
+**persistent** decode kernel and aborts the process otherwise (`asm_mla.cu`:
+*"fp8/fp8 with gqa_ratio=64 only supports persistent mode"*).
 
-- **sparse MLA / DSA under DCP** — the per-rank top-k compaction makes the sparse
-  region length depend on the layer, which work metadata built once per step
-  cannot describe (see `_forward_decode`);
-- **gfx942**, which ships no lse-emitting persistent kernel at all.
+Native sparse MLA / DSA attention under DCP handles this on gfx950 by rebuilding
+the persistent work/reduce metadata after every **full IndexShare layer**
+compacts its rank-local top-k. The rebuild consumes that layer's
+`dcp_sparse_kv_indptr`; following shared layers reuse the same indices, compact
+indptr, and work plan. This makes the persistent descriptors and the actual
+sparse regions agree without rebuilding metadata on shared layers.
 
-`mla_dcp_decode_is_persistent` decides this once at construction, so the width
-the module pads to and the width the persistent descriptors are planned for
-cannot disagree.
+The implementation is scoped to native, non-speculative serving on gfx950 with
+page size 1: decode is q_len=1, while sparse prefill is represented as per-token
+virtual q_len=1 rows. Unsupported paths (including gfx942 and plugin or
+speculative sparse DCP paths without the per-layer rebuild) remain
+non-persistent and round a gathered 64 up to **128**.
 
-**GLM-5.2 is the model that lands on it**: 64 query heads at `-tp 8` is 8 per
-rank, so `-dcp 8` gathers exactly 64 — sparse, hence non-persistent, hence padded
-to 128. Half the kernel's heads are padding in that configuration; making it 64
-means giving sparse + DCP a persistent path first.
+**GLM-5.2 is the model that benefits**: 64 query heads at `-tp 8` is 8 per
+rank, so `-dcp 8` gathers exactly 64 and now dispatches the native persistent
+gqa64 kernel instead of padding to 128. `-tp 4 -dcp 4` has the same gathered
+width and uses the same persistent gqa64 path.
 
-**Validated** (ATOM server, 8×MI355 gfx950, `-tp 8 -dcp 8`, fp8 KV, full 1319
+**Validated** (native ATOM, MI355 gfx950, GLM-5.2-MXFP4, fp8 KV, no
+speculative decode): both `-tp 8 -dcp 8` and `-tp 4 -dcp 4` complete CUDA graph
+capture, short decode, 7.7k-token sparse prefill/decode, and the full 1319
+GSM8K 5-shot set. Both topologies score **flexible-extract 0.9689 /
+strict-match 0.9666**. The TP8/DCP8 run also completes a 32-concurrent graph
+smoke with no traceback, HIP error, or engine failure.
+
+**Kimi-K3 validated** (ATOM server, 8×MI355 gfx950, `-tp 8 -dcp 8`, fp8 KV, full 1319
 GSM8K 5-shot at 64 concurrency): **flexible-extract 0.9553 / strict-match
 0.9553**, inside the [Kimi-K3 recipe](../recipes/Kimi-K3.md)'s
 0.9538–0.9591 band. Prefix caching was **off** for that run, matching the
@@ -644,7 +652,7 @@ contributing under DCP rather than collapsing back to single-token decode.
 | prefix caching / chunked prefill | Supported (dense and sparse / DSA). On **Kimi-K3** the validated configuration has prefix caching **off**, per its recipe |
 | Kimi-K3 KDA layers | Not sharded — the KDA recurrent state is per-request, not paged, so DCP frees only the MLA share of attention memory |
 | Kimi-K3 gathered head width | Padded to a natively dispatched MLA width (16 / 32 / 64 / 128); past 128 it falls back to the folded kernel with a warning — lower `-dcp` or raise `-tp` |
-| gathered head width 64 + fp8 KV | Only the persistent kernel serves gqa=64 on fp8 Q/KV, so a non-persistent DCP decode (sparse / DSA, or any DCP decode on gfx942) pads to 128 instead — see [the gqa=64 exception](#the-gqa64-exception-non-persistent-fp8-decode) |
+| gathered head width 64 + fp8 KV | Native sparse / DSA prefill and q_len=1 decode on gfx950 rebuild persistent metadata per full IndexShare layer and run gqa64 directly; unsupported non-persistent paths still pad to 128 — see [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64) |
 | speculative decode (MTP), dense MLA | Supported on **gfx950 only** (bf16/fp8, `num_speculative_tokens` 1–3); raises at startup on gfx942 |
 | speculative decode (DSpark), Kimi-K3 | Supported on gfx950; validated at `tp8 -dcp 8` with `num_speculative_tokens 2` |
 | speculative decode (MTP), sparse / DSA | **Not supported** — sparse decode with `q > 1` under DCP is rejected by an assert |

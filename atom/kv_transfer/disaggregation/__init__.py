@@ -21,6 +21,9 @@ from atom.kv_transfer.disaggregation.types import (
     LoadOperationId,
     ReqMeta,
     SaveOperationId,
+    SaveSourceGroupId,
+    StateStoreOperationId,
+    kv_config_has_producer,
 )
 
 __all__ = [
@@ -34,4 +37,7 @@ __all__ = [
     "LoadOperationId",
     "ReqMeta",
     "SaveOperationId",
+    "SaveSourceGroupId",
+    "StateStoreOperationId",
+    "kv_config_has_producer",
 ]

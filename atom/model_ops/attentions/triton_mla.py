@@ -64,9 +64,13 @@ class TritonMLAMetadataBuilder(AiterMLAMetadataBuilder):
         self.model_runner.forward_vars.update(triton_mla_buffers)
 
     def set_mla_persistent_worker_buffers(
-        self, bs, max_q_len, only_update=False, num_reject_tokens=None
+        self, bs, max_q_len, only_update=False, num_reject_tokens=None, **kwargs
     ):
-        # Triton MLA does not use aiter persistent worker buffers
+        # Triton MLA does not use aiter persistent worker buffers.
+        # `**kwargs` absorbs arguments the aiter caller grows over time (e.g.
+        # `is_cp_round_robin`); this override returns nothing, so ignoring them
+        # is correct, and pinning the exact signature only breaks the Triton
+        # path whenever the aiter side adds a keyword.
         return {}
 
     def _cut_decode_buffers(
@@ -93,8 +97,16 @@ class TritonMLAMetadataBuilder(AiterMLAMetadataBuilder):
             "triton_lse": var["triton_lse"][:rows],
         }
 
-    def prepare_decode(self, batch: ScheduledBatch, bs: int):
-        attn_metadata, positions = super().prepare_decode(batch, bs)
+    def prepare_decode(
+        self,
+        batch: ScheduledBatch,
+        running_bs: int,
+        running_tokens: int,
+        max_seqlen_q: int,
+    ):
+        attn_metadata, positions = super().prepare_decode(
+            batch, running_bs, running_tokens, max_seqlen_q
+        )
         for name, buf in self._cut_decode_buffers(
             batch.total_seqs_num_decode,
             attn_metadata.max_seqlen_k,
@@ -139,8 +151,8 @@ class TritonMLAMetadataBuilder(AiterMLAMetadataBuilder):
             var["kv_indptr"].gpu[: running_bs + 1],
         )
 
-    def prepare_prefill(self, batch: ScheduledBatch):
-        attn_metadata, positions = super().prepare_prefill(batch)
+    def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
+        attn_metadata, positions = super().prepare_prefill(batch, running_bs)
 
         if envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV and attn_metadata.has_cached:
             # The shuffled cached-prefix gather (gather_kv_b_proj with

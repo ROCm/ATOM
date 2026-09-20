@@ -37,6 +37,7 @@ export PYTHONUNBUFFERED=1
 export AITER_LOG_LEVEL=WARNING
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
+export MC_ENABLE_DEST_DEVICE_AFFINITY=1
 export ATOM_HOST_IP=${NODE_IP}
 export LD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
 rm -rf /root/.cache/atom/* 2>/dev/null || true
@@ -115,12 +116,14 @@ python3 -m atom.entrypoints.openai_server \
     --kv_cache_dtype fp8 \
     --gpu-memory-utilization 0.85 \
     --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate", "*expert*"]}' \
-    --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","handshake_port":6301,"proxy_ip":"127.0.0.1"}' \
+    --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","handshake_port":6301,"proxy_ip":"127.0.0.1","ib_enable_alternate_hca":true,"ib_hca_count":8}' \
     2>&1 | tee decode.log
 ```
 
 Key differences from prefill:
 - `kv_role: kv_consumer`
+- `ib_enable_alternate_hca` registers decode KV buffers on up to eight
+  available HCAs so prefill GPUs 0-3 can reach decode GPUs 4-7 across rails
 - `--tensor-parallel-size 4` — TP4 for low-latency decode
 - `--cudagraph-mode FULL` — full CUDAGraph capture for decode batches
 - No `--pipeline-parallel-size` or `--enforce-eager`

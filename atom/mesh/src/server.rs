@@ -538,6 +538,10 @@ pub fn build_app(
             max_payload_size,
         ))
         .layer(middleware::create_logging_layer())
+        .layer(axum::middleware::from_fn_with_state(
+            crate::observability::ttft::http_backend_type(&app_state.context.router_config),
+            crate::observability::ttft::track_http_ttft,
+        ))
         .layer(middleware::HttpMetricsLayer::new(
             app_state.context.inflight_tracker.clone(),
         ))
