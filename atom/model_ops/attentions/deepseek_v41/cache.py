@@ -100,6 +100,24 @@ class PagedAttentionCache:
         self.tentative_limits = CpuGpuBuffer(
             slots, dtype=self.cursor.dtype, device=device, pin_memory=pinned
         )
+        # One H2D for every slot a forward recycles, so the two resets below are
+        # two launches rather than two per fresh request. int64 because
+        # `index_fill_` takes no other width, unlike the `index_select` above.
+        self._reset_slots = CpuGpuBuffer(
+            slots, dtype=torch.int64, device=device, pin_memory=pinned
+        )
+        # Where a caller that wants no history lands its cursor rows: the copy
+        # is issued and judged a step later, so nothing waits for it. See
+        # `prepare_state`.
+        self._probe = torch.zeros(
+            slots,
+            self.cursor.shape[1],
+            dtype=self.cursor.dtype,
+            device="cpu",
+            pin_memory=pinned,
+        )
+        self._probe_done = torch.cuda.Event() if pinned else None
+        self._probe_claim = None
         self.pool = (
             self.backing.view(-1, 1)
             if geometry.packed
@@ -286,20 +304,86 @@ class PagedAttentionCache:
             extra_write=self.geometry.speculative_tokens if tentative else 0,
         )
 
-    def prepare_state(self, step):
-        """Read restored cursors once; reset recycled slots before any layer writes."""
+    def _report_stale_state(self, cursors, starts, requests):
+        """Raise on the first request whose state is not where it is wanted.
+
+        Fresh requests are excluded by their own position: the slot they are
+        about to reuse holds whatever the last tenant left, and the reset below
+        is what makes it theirs.
+        """
+        wrong = np.flatnonzero((starts != 0) & (cursors[:, 0] != starts))
+        if not wrong.size:
+            return
+        first = int(wrong[0])
+        raise ValueError(
+            f"Request {requests[first]} needs state at {starts[first]}, "
+            f"found {int(cursors[first, 0])}; replay from a recoverable boundary"
+        )
+
+    def _judge_previous_probe(self):
+        """Check the rows the last deferred `prepare_state` shipped, if they landed.
+
+        Not ready yet means the verdict waits another step rather than blocking
+        for it -- which is the whole point of having deferred it.
+        """
+        if self._probe_claim is None:
+            return
+        if self._probe_done is not None and not self._probe_done.query():
+            return
+        starts, requests = self._probe_claim
+        self._probe_claim = None
+        self._report_stale_state(self._probe[: starts.size].numpy(), starts, requests)
+
+    def prepare_state(self, step, *, histories=True):
+        """Read restored cursors; reset recycled slots before any layer writes.
+
+        `histories=False` says the caller does not need this step's committed
+        history -- the device path works it out of the cursor itself -- and so
+        does not need this step's verdict either. The rows are then shipped
+        into pinned memory without waiting and judged on the next call, which
+        takes the one blocking D2H a decode step still had off the critical
+        path. What it gives up is that a stale slot is named one step late; it
+        is still a hard failure, and it is a "should never happen" bound, not
+        an expected outcome.
+
+        Whether a request is fresh and whether its state is where the scheduler
+        thinks are both decided over the whole batch at once -- the per-request
+        walk this replaced was 58 us of every decode step, spent branching on
+        `span.position` one Python attribute at a time.
+        """
         self.require_committed()
-        cursors = self.cursor[step.slots[: step.scheduled_bs].long()].cpu().numpy()
-        for i, span in enumerate(step.requests):
-            if span.position == 0:
-                self.state_bytes[span.slot].zero_()
-                self.cursor[span.slot, 1:].fill_(-1)
-                cursors[i, 0], cursors[i, 1:] = 0, -1
-            elif cursors[i, 0] != span.position:
-                raise ValueError(
-                    f"Request {span.request_id} needs state at {span.position}, "
-                    f"found {cursors[i, 0]}; replay from a recoverable boundary"
-                )
+        self._judge_previous_probe()
+        count = step.scheduled_bs
+        starts = step.request_positions[:count]
+        ids = [span.request_id for span in step.requests]
+        if histories:
+            cursors = self.cursor[step.slots[:count].long()].cpu().numpy()
+        else:
+            # Issued before the reset below, so a recycled slot is captured as
+            # its old tenant left it -- which is why the judge skips position 0.
+            self._probe[:count].copy_(
+                self.cursor[step.slots[:count].long()], non_blocking=True
+            )
+            if self._probe_done is not None:
+                self._probe_done.record()
+            self._probe_claim = (starts.copy(), ids)
+            cursors = None
+        fresh = starts == 0
+        if fresh.any():
+            # Both resets take the same index, so the slots cross once.
+            slots = self._reset_slots.np[: int(fresh.sum())]
+            slots[:] = [span.slot for span, new in zip(step.requests, fresh) if new]
+            index = self._reset_slots.copy_to_gpu(slots.size)
+            self.state_bytes.index_fill_(0, index, 0)
+            self.cursor[:, 1:].index_fill_(0, index, -1)
+            if cursors is not None:
+                cursors[fresh, 0] = 0
+                cursors[fresh, 1:] = -1
+        if cursors is None:
+            if step.tentative:
+                self.pending = TentativeState(self, step)
+            return None
+        self._report_stale_state(cursors, starts, ids)
         if step.tentative:
             self.pending = TentativeState(self, step, cursors[:, 1:])
         return cursors[:, 1:]

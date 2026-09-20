@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from atom.model_engine.engram_runtime import EngramInputPreparer
+from atom.model_engine.engram_runtime import EngramBatch, EngramInputPreparer
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attentions.backends import AttentionBackend, CommonAttentionBuilder
@@ -15,6 +15,7 @@ from atom.model_ops.attentions.deepseek_v4_attn import (
 )
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import page_pool, state_pool
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+from atom.model_ops.engram_hash import engram_compress, engram_cursor_rows
 from atom.models.deepseek_v41.config import AttentionMode, build_attention_topology
 from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import AttentionMetaData, AttnState, Context
@@ -376,20 +377,72 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             start_positions=starts,
         )
 
+    def _engram_batch(self, step, cache, metadata, tokens):
+        """This forward on the device, for the Engram kernels.
+
+        `None` whenever the hashing has to stay on the host: a synthetic batch,
+        whose cursor belongs to whoever owns those slots, or a build without
+        the UVA lookup, where the gather reads the tables on the host and so
+        wants the rows there too.
+
+        `image_mask` goes in as it stands -- true where a token carries no id
+        of its own, which is the DEAD sense `engram_compress` takes.
+        """
+        if metadata.dummy or self.engram is None or not self.engram.host.uva:
+            return None
+        tables = self.engram.host.hash_tables
+        dead = metadata.image_mask
+        return EngramBatch(
+            compressed=engram_compress(
+                tables, tokens, None if dead is None else dead[0, : step.scheduled]
+            ),
+            batch_ids=step.batch_ids[: step.scheduled],
+            cu_seqlens=step.cu_seqlens_q,
+            history=cache.cursor[:, 1:],
+            history_index=step.slots[: step.scheduled_bs],
+        )
+
+    def _write_engram_cursor(self, step, cache, batch):
+        """Advance the cursor, or stage every prefix a verify step may accept.
+
+        A verify step's cursor is the sampler's, so its candidates wait in the
+        plane `commit_tentative` selects from; anything else commits outright.
+        """
+        tentative = step.tentative
+        engram_cursor_rows(
+            self.engram.host.hash_tables,
+            batch.compressed,
+            batch.cu_seqlens,
+            step.positions,
+            cache.cursor[:, 1:],
+            batch.history_index,
+            (
+                cache.tentative_staging.gpu[: step.scheduled_bs]
+                if tentative
+                else cache.cursor
+            ),
+            candidates=step.max_q_len if tentative else 0,
+        )
+        if tentative:
+            cache.pending.staged_on_device = True
+
     def prepare_model_inputs(self, input_ids, metadata):
         step, cache = metadata.step, metadata.cache
-        # A synthetic batch stages addresses only. The committed cursor belongs
-        # to whoever owns these slots, and the position-0 reset inside
-        # `prepare_state` would zero a serving request's state to build a graph.
-        histories = (
-            np.full((step.scheduled_bs, self.geometry.history_size), -1, np.int64)
-            if metadata.dummy
-            else cache.prepare_state(step)
-        )
         # The rows the requests own, not the rows the forward runs: the padding
         # tail is zeroed inside `run_model`, after this, so what stands there
         # now is the previous step's ids. The width goes separately.
         tokens = input_ids[: step.scheduled]
+        # Before `prepare_state`, because it decides what that waits for: with
+        # a device batch nothing on the host reads this step's history, so the
+        # readback carrying it becomes a deferred probe. A synthetic batch
+        # stages addresses only -- the slots are somebody else's, and
+        # `prepare_state`'s position-0 reset would zero their state.
+        batch = self._engram_batch(step, cache, metadata, tokens)
+        histories = (
+            np.full((step.scheduled_bs, self.geometry.history_size), -1, np.int64)
+            if metadata.dummy
+            else cache.prepare_state(step, histories=batch is None)
+        )
         if self.engram is not None:
             prepared = self.engram.prepare(
                 step.requests,
@@ -398,9 +451,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 dummy=metadata.dummy,
                 token_mask=metadata.token_mask,
                 padded_rows=step.width,
+                batch=batch,
             )
             embeddings, histories = prepared.embeddings, prepared.histories
-            if cache.pending is not None:
+            if batch is None and cache.pending is not None:
                 for span, compressed in zip(step.requests, prepared.compressed_rows):
                     cache.pending.stage_history(span, compressed)
         else:
@@ -420,9 +474,13 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                     cache.pending.stage_history(span, [-1] * span.length)
         metadata.engram_embeddings = embeddings
         # Last, and here rather than in the model: the forward is a graph whose
-        # replay runs no Python, and `stage_history` above reads the cursor this
-        # would overwrite. A tentative step's cursor is the sampler's to write.
-        if not metadata.dummy and not step.tentative:
+        # replay runs no Python, and everything reading the cursor this
+        # overwrites -- the hash kernel, the staging above -- has already run.
+        # A tentative step's cursor is the sampler's to write, so the device
+        # path stages its candidates here and commits them there.
+        if batch is not None:
+            self._write_engram_cursor(step, cache, batch)
+        elif not metadata.dummy and not step.tentative:
             cache.advance_cursor(step, histories)
 
     def commit_speculative_state(self, metadata, last_token_indices):

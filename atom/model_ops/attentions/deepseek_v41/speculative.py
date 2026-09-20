@@ -20,7 +20,7 @@ import torch
 
 
 class TentativeState:
-    def __init__(self, cache, step, histories):
+    def __init__(self, cache, step, histories=None):
         self.cache, self.step = cache, step
         self.request_indices = {span.slot: i for i, span in enumerate(step.requests)}
         self.staging = cache.tentative_staging
@@ -28,12 +28,21 @@ class TentativeState:
         self.width = step.max_q_len
         self.histories = histories
         self.written = set()
+        # Set instead of `written` when a kernel filled the plane: one launch
+        # over every request rather than a staged row per request, and nothing
+        # for the host to have forgotten.
+        self.staged_on_device = False
 
     def stage_history(self, span, compressed_ids):
         ids = np.asarray(compressed_ids, dtype=np.int64)
         if ids.shape != (span.length,):
             raise ValueError(
                 "Tentative Engram history requires one compressed ID per token"
+            )
+        if self.histories is None:
+            raise RuntimeError(
+                "Host Engram staging needs the committed history; this step was "
+                "prepared without it, so its candidates belong to the kernel"
             )
         i = self.request_indices[span.slot]
         rows = self.staging.np[i, : span.length]
@@ -50,7 +59,7 @@ class TentativeState:
 
     def commit(self, accepted_lengths):
         """Lengths include the guaranteed target input: zero drafts means one."""
-        if self.written != set(self.request_indices):
+        if not self.staged_on_device and self.written != set(self.request_indices):
             raise RuntimeError("Tentative state is missing an Engram prefix")
 
         count = self.step.scheduled_bs
@@ -59,7 +68,11 @@ class TentativeState:
         )
         if lengths.shape != (count,):
             raise ValueError("Accepted lengths must match the scheduled requests")
-        cursors = self.staging.copy_to_gpu(count)[:, : self.width]
+        cursors = (
+            self.staging.gpu[:count]
+            if self.staged_on_device
+            else self.staging.copy_to_gpu(count)
+        )[:, : self.width]
         # Four launches and a copy every step, and the only thing `self.limits`
         # is staged for. Uncomment when a wrong accepted length is the suspect:
         # neither end faults, so it is silent -- 0 indexes row -1, and a length

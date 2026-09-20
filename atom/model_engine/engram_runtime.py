@@ -3,17 +3,17 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
-import logging
-
 import numpy as np
 import torch
-from atom.model_ops.engram_lookup import HostEmbeddingTable
 
+from atom.model_ops.engram_hash import EngramHashTables, engram_row_indices
+from atom.model_ops.engram_lookup import HostEmbeddingTable
 from atom.utils import CpuGpuBuffer, envs
 
 logger = logging.getLogger(__name__)
@@ -249,18 +249,33 @@ class EngramHost:
         self.uva = False
         self._tp_group = None
         self._ids_staging = None
+        self.hash_tables = None
+        self._row_ids = None
         if device.type == "cuda" and envs.ATOM_ENGRAM_UVA:
             self.uva = self._enable_uva(prefetcher, num_hash_heads)
+        if self.uva:
+            # The row indices the UVA gather takes, produced where the tokens
+            # are. One buffer for every layer: a layer's rows are consumed by
+            # its own gather before the next layer is hashed.
+            self.hash_tables = EngramHashTables.from_mapping(
+                prefetcher._hash_mapping, device
+            )
+            self._row_ids = torch.empty(
+                max_num_tokens, num_hash_heads, dtype=torch.int64, device=device
+            )
         self.max_num_tokens = max_num_tokens
         self.embed_width = num_hash_heads * head_dim
         self.device = device
+        # Not pinned under UVA: nothing writes the host half there, and page
+        # -locked memory is the scarce kind on a rank already holding tens of
+        # GiB of table. It is still allocated -- `CpuGpuBuffer` owns both.
         self.buffers = {
             layer: CpuGpuBuffer(
                 max_num_tokens,
                 self.embed_width,
                 dtype=dtype,
                 device=device,
-                pin_memory=device.type == "cuda",
+                pin_memory=device.type == "cuda" and not self.uva,
                 with_numpy=False,
             )
             for layer in prefetcher.layer_ids
@@ -301,10 +316,21 @@ class EngramHost:
         self._staged_rows = rows
         return rows
 
-    def stage_embeddings(self, requests, padded_rows=None):
+    def stage_embeddings(self, requests, padded_rows=None, batch=None):
         requests = tuple(requests)
-        rows = sum(len(request.token_ids) for request in requests)
+        # With a device batch the requests are not built at all, so the row
+        # count comes off the batch itself rather than off their token tuples.
+        rows = (
+            batch.batch_ids.numel()
+            if batch is not None
+            else sum(len(request.token_ids) for request in requests)
+        )
         staged = self._prepare_staging(rows, padded_rows)
+        # Before the prefetch cache, not after: what that cache holds is
+        # embedding rows, which the UVA path never stages from the host. Taking
+        # them here only threw them away -- and evicted them on the way.
+        if self.uva:
+            return self._stage_uva(requests, rows, staged, batch)
         values = {}
         missing = []
         for request in requests:
@@ -318,8 +344,6 @@ class EngramHost:
                 values.update(
                     ((request, layer), value) for layer, value in cached.items()
                 )
-        if self.uva:
-            return self._stage_uva(requests, rows, staged)
         values.update(self.prefetcher.compute(missing))
         for layer, buffer in self.buffers.items():
             offset = 0
@@ -388,22 +412,13 @@ class EngramHost:
         )
         return True
 
-    def _stage_uva(self, requests, rows, staged):
-        """Device lookup: hash on the host, gather and dequantize on the GPU.
+    def _rows_from_host(self, requests, rows):
+        """Hash on the host and stage the indices through pinned memory.
 
-        Only the row INDICES cross to the device (a few KB); the kernel reads the
-        table rows out of page-locked host memory and dequantizes them there, so
-        neither the gather nor the fp8 decode runs on the host and there is no
-        embedding H2D.
-
-        Each rank owns a slice of the hash heads and writes zeros for the rest, so
-        the all-gather that reassembles the full width is a concatenation. The
-        projection that consumes this is replicated, so every rank needs it whole.
+        `from_numpy(...).to(device)` would copy from PAGEABLE memory, where
+        `non_blocking` is ignored and the driver stages through its own bounce
+        buffer every step.
         """
-        per_layer = self.prefetcher.row_indices(requests)
-        # Stage the indices through pinned memory: `from_numpy(...).to(device)`
-        # copies from PAGEABLE memory, where `non_blocking` is silently ignored
-        # and the driver stages through its own bounce buffer every step.
         if self._ids_staging is None:
             self._ids_staging = CpuGpuBuffer(
                 self.max_num_tokens,
@@ -412,9 +427,49 @@ class EngramHost:
                 device=self.device,
                 pin_memory=True,
             )
-        for layer, buffer in self.buffers.items():
+        per_layer = self.prefetcher.row_indices(requests)
+
+        def upload(layer):
             self._ids_staging.np[:rows] = per_layer[layer]
-            ids = self._ids_staging.copy_to_gpu(rows)
+            return self._ids_staging.copy_to_gpu(rows)
+
+        return upload
+
+    def _rows_from_device(self, batch, rows):
+        """Hash where the ids are, from the very tensor the model embeds."""
+
+        def hashed(layer):
+            return engram_row_indices(
+                self.hash_tables,
+                layer,
+                batch.compressed,
+                batch.batch_ids,
+                batch.cu_seqlens,
+                batch.history,
+                batch.history_index,
+                self._row_ids[:rows],
+            )
+
+        return hashed
+
+    def _stage_uva(self, requests, rows, staged, batch=None):
+        """Device lookup: only the row INDICES reach the gather.
+
+        The gather kernel reads the table rows out of page-locked host memory
+        and dequantizes them there, so neither it nor the fp8 decode runs on
+        the host and there is no embedding H2D.
+
+        Each rank owns a slice of the hash heads and writes zeros for the rest,
+        so the all-gather that reassembles the full width is a concatenation;
+        the projection that consumes it is replicated.
+        """
+        indices = (
+            self._rows_from_device(batch, rows)
+            if batch is not None
+            else self._rows_from_host(requests, rows)
+        )
+        for layer, buffer in self.buffers.items():
+            ids = indices(layer)
             table = self.prefetcher._tables[layer]
             if ids.shape != (rows, self.total_heads):
                 raise RuntimeError(
@@ -460,7 +515,24 @@ class EngramHost:
         return staged
 
     def stage_dummy(self, num_rows):
+        """Zeros over the rows a synthetic forward will read.
+
+        The UVA path zeroes where the rows are read instead of zeroing a host
+        copy and shipping it: same bytes, no H2D, and it leaves the host half
+        of these buffers untouched -- which is what lets them go unpinned.
+
+        On the device for the same reason `_stage_uva` is: `prepare_model_inputs`
+        runs before the capture region opens (`build_for_cudagraph_capture` is
+        called, and only then is the graph captured), so this memset is issued
+        outside it and is not recorded into any graph.
+        """
         rows = self._prepare_staging(num_rows, None)
+        if self.uva:
+            for buffer in self.buffers.values():
+                buffer.gpu[:rows].zero_()
+            self._staged_rows = rows
+            self._copy_pending = False
+            return rows
         for buffer in self.buffers.values():
             buffer.cpu[:rows].zero_()
         return self._copy_to_device(rows)
@@ -485,6 +557,24 @@ class EngramHost:
 
 
 @dataclass(frozen=True)
+class EngramBatch:
+    """One forward as the kernels see it: every field already on device.
+
+    `compressed` is derived from the very tensor the model embeds, so the rows
+    Engram looks up and the tokens the model runs cannot disagree. `history` is
+    any `[n, max_ngram_size - 1]` int64 plane with `history_index` naming a row
+    per request, which is how the committed cursor is read where it lies rather
+    than gathered out first.
+    """
+
+    compressed: torch.Tensor
+    batch_ids: torch.Tensor
+    cu_seqlens: torch.Tensor
+    history: torch.Tensor
+    history_index: torch.Tensor
+
+
+@dataclass(frozen=True)
 class EngramInputs:
     embeddings: dict[int, torch.Tensor]
     histories: np.ndarray
@@ -505,13 +595,14 @@ class EngramInputPreparer:
     def from_checkpoint(cls, directory, config, max_tokens, device):
         from contextlib import ExitStack
 
+        from transformers import AutoTokenizer
+
         from atom.model_loader.deepseek_v41 import engram_tables
         from atom.model_ops.engram import (
             CompressedTokenizer,
             EngramConfig,
             NgramHashMapping,
         )
-        from transformers import AutoTokenizer
 
         resources = ExitStack()
         try:
@@ -546,6 +637,7 @@ class EngramInputPreparer:
         dummy=False,
         token_mask=None,
         padded_rows=None,
+        batch=None,
     ):
         """Stage one embedding row per row the forward will run.
 
@@ -554,16 +646,30 @@ class EngramInputPreparer:
         captured shape -- the tail belongs to no request, so it is staged as
         zeros rather than looked up, and it cannot be read off `token_ids`
         because the padding is applied to the model's input after this.
+
+        `batch` moves the n-gram hashing to the device (`EngramBatch`). The
+        readback below stays: `compressed_rows` and the advanced history are
+        still worked out here, and both want the ids on the host. What goes is
+        the per-layer, per-request hashing -- measured at 4.4 ms of every 48 ms
+        decode step, with the device idle for all of it.
         """
         compressed_rows = []
         rows = token_ids.numel() if padded_rows is None else padded_rows
         if dummy:
             self.host.stage_dummy(rows)
             next_histories = histories
+        elif batch is not None:
+            # Nothing left for the host to read the ids for: the rows are
+            # hashed from them on the device and the advanced history is
+            # written there too, so the readback below goes with the work it
+            # was feeding. `histories` passes through because the caller still
+            # holds the committed one; the next one now lives in the cursor.
+            self.host.stage_embeddings((), padded_rows=rows, batch=batch)
+            next_histories = histories
         else:
             # These are the final GPU IDs, including deferred decode tokens.
-            # One D2H per batch is the eager host-lookup contract; a subsequent
-            # HBM provider can replace it without changing the model or scheduler.
+            # One D2H per batch is the eager host-lookup contract; the device
+            # path above is the one that retires it.
             ids = token_ids.detach().cpu().numpy()
             requests, next_histories = [], []
             for span, history in zip(spans, histories):

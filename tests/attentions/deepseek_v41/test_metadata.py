@@ -149,6 +149,9 @@ def test_engram_rows_are_staged_for_the_width_not_for_the_tokens(engram):
             "padded_rows": step.width,
             "dummy": True,
             "token_mask": None,
+            # A synthetic batch hashes on the host: the cursor the device path
+            # would read belongs to whoever owns these slots, not to this one.
+            "batch": None,
         }
 
 

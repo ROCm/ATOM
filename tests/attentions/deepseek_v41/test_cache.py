@@ -256,3 +256,50 @@ def test_key_rope_positions_span_the_grid_and_carry_its_sentinels():
     assert plan.key_rope_positions_gpu[plan.num_compress] == -2
     # A caller that declares no buffer pays nothing and is handed nothing.
     assert build(False).key_rope_positions_gpu is None
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_a_deferred_prepare_state_names_the_stale_slot_one_step_later(
+    small_config, device
+):
+    """`histories=False` ships the rows without waiting; the verdict follows.
+
+    The caller that asks for no history is the one whose Engram rows and
+    advanced cursor are both worked out on the device, so nothing on the host
+    reads this step's committed history -- and nothing needs this step's
+    verdict either. What must not happen is the verdict going missing: a slot
+    holding the wrong position has to be named, late but named, and by the
+    request that wanted it.
+    """
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required")
+    geo = replace(geometry(small_config), window_size=32)
+    cache = PagedAttentionCache(geo, 8, 4, device)
+    cache.cursor[0] = torch.tensor([3, 19, -1, 27], device=device)
+
+    good = RequestSpan(27, 3, 0, 1, 0, (0, 1))
+    step = cache.begin_step([good])
+    assert cache.prepare_state(step, histories=False) is None
+
+    # Same slot, but the scheduler believes it is four tokens further on than
+    # the cursor says. Deferred, so this call is the one that ships the rows.
+    stale = RequestSpan(28, 7, 0, 1, 0, (0, 1))
+    later = cache.begin_step([stale])
+    assert cache.prepare_state(later, histories=False) is None
+    with pytest.raises(ValueError, match="Request 28 needs state at 7"):
+        cache.prepare_state(cache.begin_step([good]), histories=False)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_a_deferred_probe_skips_the_slot_its_own_step_resets(small_config, device):
+    """A fresh request reuses whatever the last tenant left; that is not stale."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required")
+    geo = replace(geometry(small_config), window_size=32)
+    cache = PagedAttentionCache(geo, 8, 4, device)
+    cache.cursor[0] = torch.tensor([91, 19, -1, 27], device=device)
+    fresh = RequestSpan(31, 0, 0, 1, 0, (0, 1))
+    cache.prepare_state(cache.begin_step([fresh]), histories=False)
+    assert cache.cursor[0, 0] == 0
+    # The probe carries slot 0's pre-reset row; position 0 is what excludes it.
+    cache.prepare_state(cache.begin_step([replace(fresh, request_id=32)]))

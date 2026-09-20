@@ -71,6 +71,12 @@ class BatchStep:
     # built once per forward and read by every owner that shares that ratio.
     plans: dict[int, object] = field(default_factory=dict)
     tentative: bool = False
+    # Where each request starts, on the host. Built for `prefill_positions`
+    # anyway, and published so the state lifecycle compares against the same
+    # array rather than walking the spans again per forward.
+    request_positions: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.int32)
+    )
 
     def begin_forward(self):
         """Drop what the last forward over this step worked out.
@@ -165,9 +171,10 @@ def prepare_batch_step(
     np.cumsum(lengths, out=cu.np[1 : scheduled_bs + 1])
     cu.np[scheduled_bs + 1 : running_bs + 1] = scheduled_tokens
     positions = buffers["positions"]
+    starts = np.asarray([span.position for span in requests], dtype=positions.np.dtype)
     prefill_positions(
         np.arange(scheduled_tokens, dtype=positions.np.dtype),
-        np.asarray([span.position for span in requests], dtype=positions.np.dtype),
+        starts,
         cu.np[: scheduled_bs + 1],
         lengths,
         out=positions.np[:scheduled_tokens],
@@ -217,4 +224,5 @@ def prepare_batch_step(
         ),
         tentative=tentative,
         visible={ratio: published[visible_buffer_name(ratio)] for ratio in ratios},
+        request_positions=starts,
     )
