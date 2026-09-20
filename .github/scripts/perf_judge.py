@@ -1041,25 +1041,22 @@ def _entry_rows(family, show_drift=False):
     return rows
 
 
-def render(report, context):
-    """Render the PR comment body."""
-    lines = [_HEADLINE[report["verdict"]], ""]
-    if context:
-        lines += [context, ""]
-
+def _summary_table(report):
+    """One row per entry: a reader takes five rows in where thirty per-level rows do not land."""
+    out = []
     # One row per entry first: five rows a reader can take in, against thirty
     # in the per-level table. The breakdown is one click away and carries the
     # shape the criterion actually rests on.
-    lines += [
+    out += [
         f"| Model | Levels &le; {DOWN_EPS_PCT}% | Total Tput | TPOT | TTFT |",
         "|---|---|---|---|---|",
     ]
     for family in report["families"]:
         tripped = family["status"] == "triggered"
         if family["status"] == "insufficient":
-            lines.append("| {} | insufficient | | | |".format(family["model"]))
+            out.append("| {} | insufficient | | | |".format(family["model"]))
             continue
-        lines.append(
+        out.append(
             "| {model} | {down} of {tot} | {tput} | {tpot} | {ttft} |".format(
                 model=(
                     "**{}**".format(family["model"]) if tripped else family["model"]
@@ -1071,12 +1068,17 @@ def render(report, context):
                 ttft=_pct(family.get("median_ttft_pct")),
             )
         )
-    lines.append("")
+    out.append("")
+    return out
 
+
+def _breakdown_block(report):
+    """The per-level table, folded away. It carries the shape the criterion rests on."""
+    out = []
     show_drift = any(
         m.get("drift_pct") is not None for f in report["families"] for m in f["members"]
     )
-    lines += [
+    out += [
         "<details>",
         "<summary>Per-level breakdown</summary>",
         "",
@@ -1088,10 +1090,15 @@ def render(report, context):
         "|---|---|---|---|---|" + ("---|" if show_drift else ""),
     ]
     for family in report["families"]:
-        lines += _entry_rows(family, show_drift)
-    lines += ["", "</details>", ""]
+        out += _entry_rows(family, show_drift)
+    out += ["", "</details>", ""]
+    return out
 
-    lines += [
+
+def _residual_note():
+    """Why the verdict is a median, stated next to the table rather than only in the step summary."""
+    out = []
+    out += [
         "",
         # The paired measurement carries a systematic bias toward whichever
         # half ran second, and it is large enough that a reader who takes a
@@ -1105,7 +1112,12 @@ def render(report, context):
         ),
         "",
     ]
+    return out
 
+
+def _history_note(report):
+    """Whether the nightly baseline could be read at all."""
+    out = []
     status = report.get("history_status")
     if status in ("unavailable", "unmatched"):
         why = (
@@ -1117,7 +1129,7 @@ def render(report, context):
                 "looks like"
             )
         )
-        lines += [
+        out += [
             "> [!WARNING]",
             f"> **The baseline check did not run.** The nightly history {why}.",
             (
@@ -1127,7 +1139,7 @@ def render(report, context):
             "",
         ]
     elif status == "ok":
-        lines += [
+        out += [
             (
                 "Baseline checked against nightly history for "
                 "{} of {} judged configurations.".format(
@@ -1137,7 +1149,12 @@ def render(report, context):
             ),
             "",
         ]
+    return out
 
+
+def _baseline_sanity_block(report):
+    """The loudest thing on the page when it fires."""
+    out = []
     # --- baseline sanity: loudest thing on the page when it fires ----------
     for family in report["families"]:
         flags = family.get("baseline_sanity") or []
@@ -1148,7 +1165,7 @@ def render(report, context):
             f"c={f['conc']} {f['base_tput']:.0f} vs {f['history_median']:.0f}"
             for f in flags
         )
-        lines += [
+        out += [
             (
                 f"**{family['model']}: the base commit measured "
                 f"{abs(worst['pct']):.0f}% under main's recent level on "
@@ -1167,14 +1184,18 @@ def render(report, context):
             ),
             "",
         ]
+    return out
 
+
+def _drift_block(report):
+    """Base against main, plus main's own trend. Built here, appended last by `render`."""
     # Held back and appended below the verdict. It is context, and printing
     # it between the table and the reason for the verdict puts other
     # models' problems ahead of this PR's on the way down the page.
     # A "---" directly under a line of text is a setext heading in Markdown,
     # not a rule: the sentence above it renders as a full-width H2. The blank
     # line is load-bearing.
-    drift_lines = [""]
+    out = [""]
 
     # Cross-check for the paired table. A paired delta cannot distinguish a
     # base at main's usual level from one well under it, so the base is read
@@ -1196,10 +1217,10 @@ def render(report, context):
     orphaned = [d for k, d in drift_by_key.items() if k in measured] if not rows else []
 
     if rows or report.get("main_drift") or report.get("drift_waiting"):
-        drift_lines += ["<details>", "<summary>Base against main</summary>", ""]
+        out += ["<details>", "<summary>Base against main</summary>", ""]
 
     if rows:
-        drift_lines += [
+        out += [
             "| Model | isl/osl | c | vs main median | vs main peak | Main trend |",
             "|---|---|---|---|---|---|",
         ]
@@ -1222,7 +1243,7 @@ def render(report, context):
                 trend = "steady"
             first = True
             for lvl in v["per_conc"]:
-                drift_lines.append(
+                out.append(
                     "| {} | {} | {} | {:+.1f}% | {} | {} |".format(
                         family["model"] if first else "",
                         family["isl_osl"] if first else "",
@@ -1237,7 +1258,7 @@ def render(report, context):
                     )
                 )
                 first = False
-        drift_lines += [
+        out += [
             "",
             (
                 "**median** is main's level now: the median of its last 3 "
@@ -1255,7 +1276,7 @@ def render(report, context):
         elsewhere = [d for k, d in drift_by_key.items() if k not in measured]
 
     if orphaned:
-        drift_lines += [
+        out += [
             "",
             "Sliding on main: "
             + "; ".join(
@@ -1270,7 +1291,7 @@ def render(report, context):
         ]
 
     if elsewhere:
-        drift_lines += [
+        out += [
             "",
             "Also sliding on main, at input/output lengths this run does not "
             "measure: "
@@ -1281,21 +1302,26 @@ def render(report, context):
         ]
 
     if report.get("drift_waiting"):
-        drift_lines += [
+        out += [
             "",
             "Not checked for drift: "
             + "; ".join(f"{m} {sh} ({why})" for m, sh, why in report["drift_waiting"]),
         ]
 
     if rows or report.get("main_drift") or report.get("drift_waiting"):
-        drift_lines += ["", "</details>", ""]
+        out += ["", "</details>", ""]
+    return out
 
+
+def _shape_flag_lines(report):
+    """Levels a median cannot describe."""
+    out = []
     # --- shape flags -------------------------------------------------------
     for family in report["families"]:
         for flag in family.get("nonmonotonic") or []:
             lo, hi = flag["neighbour_pcts"]
             a, b = flag["neighbours"]
-            lines += [
+            out += [
                 (
                     f"**{family['model']}: c={flag['conc']} at {flag['pct']:+.1f}% "
                     f"does not follow its neighbours** (c={a} {lo:+.1f}%, "
@@ -1305,9 +1331,14 @@ def render(report, context):
                 ),
                 "",
             ]
+    return out
 
+
+def _verdict_reasons(report):
+    """The sentence under the table that says why this verdict and not another."""
+    out = []
     if report["verdict"] == "inconclusive":
-        lines.append(
+        out.append(
             "No model reported enough judged levels. "
             "This is **not** a pass -- treat it as no signal."
         )
@@ -1325,13 +1356,13 @@ def render(report, context):
         tripped = [f for f in report["families"] if f["status"] == "triggered"]
         if tripped:
             names = ", ".join(f["model"] for f in tripped)
-            lines.append(
+            out.append(
                 f"{names} tripped the criterion, but the verdict above takes "
                 "precedence: the comparison it rests on cannot be trusted "
                 "yet."
             )
         else:
-            lines.append(
+            out.append(
                 "No judged entry tripped (family median <= {}% and >= {} "
                 "judging levels down, with TPOT or TTFT confirming).".format(
                     thresholds["family_median_pct"],
@@ -1339,7 +1370,7 @@ def render(report, context):
                 )
             )
         if report["verdict"] == "untrustworthy":
-            lines.append(
+            out.append(
                 f"The base commit was measured twice, before and after head, and "
                 f"the two readings differ by {_fmt(report['median_drift_pct'])} -- "
                 f"more than the {thresholds['family_median_pct']}% the criterion "
@@ -1348,13 +1379,13 @@ def render(report, context):
                 f"attributed to the change."
             )
         if report["verdict"] == "unclear":
-            lines.append(
+            out.append(
                 "The linkage criterion (median + count) assumes the judging "
                 "levels move alike. At least one entry above does not, so no "
                 "verdict is claimed either way -- read the per-level numbers."
             )
         if report["verdict"] == "partial":
-            lines.append(
+            out.append(
                 f"**{report['n_judged']} of "
                 f"{report['expected_entries'] or 'an unknown number of'} entries "
                 f"were judged.** The rest did not report enough data, so this is "
@@ -1371,7 +1402,7 @@ def render(report, context):
                 if via == "TTFT"
                 else family.get("mirror_ratio")
             )
-            lines.append(
+            out.append(
                 f"- **{family['model']}**: {family['n_down']} of "
                 f"{family['n_total']} levels at or past {DOWN_EPS_PCT}%, median "
                 f"{_fmt(family['median_tput_pct'])}, "
@@ -1388,14 +1419,19 @@ def render(report, context):
                 if "sigma" in w
             ]
             if sigmas:
-                lines.append(
+                out.append(
                     "  - "
                     + ", ".join(f"c={c} at {w.split(' the')[0]}" for c, w in sigmas)
                     + " of that level's own history"
                 )
         if report["scope"]:
-            lines += ["", _SCOPE_NOTE[report["scope"]]]
+            out += ["", _SCOPE_NOTE[report["scope"]]]
+    return out
 
+
+def _unjudged_but_down(report):
+    """An entry too thin to judge can still have reported levels that dropped hard."""
+    out = []
     # An entry that could not be judged may still have reported levels that
     # dropped hard. Burying that under "no regression found" is the same
     # failure as passing on incomplete data, one step removed -- so say it.
@@ -1406,7 +1442,7 @@ def render(report, context):
         if not bad:
             continue
         levels = ", ".join(f"c={m['conc']} {m['tput_pct']:+.1f}%" for m in bad)
-        lines += [
+        out += [
             "",
             (
                 f"**{family['model']} could not be judged, but the judging "
@@ -1416,7 +1452,12 @@ def render(report, context):
                 f"result as a pass."
             ),
         ]
+    return out
 
+
+def _coverage_gaps(report):
+    """What was not measured, named."""
+    out = []
     gaps = []
     if report["n_insufficient"]:
         gaps.append(
@@ -1425,9 +1466,28 @@ def render(report, context):
     if report.get("n_missing"):
         gaps.append(f"{report['n_missing']} model(s) reported nothing at all")
     if gaps:
-        lines += ["", "Coverage gaps: " + "; ".join(gaps) + "."]
+        out += ["", "Coverage gaps: " + "; ".join(gaps) + "."]
+    return out
 
-    lines += drift_lines
+
+def render(report, context):
+    """Render the PR comment body."""
+    lines = [_HEADLINE[report["verdict"]], ""]
+    if context:
+        lines += [context, ""]
+    lines += _summary_table(report)
+    lines += _breakdown_block(report)
+    lines += _residual_note()
+    lines += _history_note(report)
+    lines += _baseline_sanity_block(report)
+    lines += _shape_flag_lines(report)
+    lines += _verdict_reasons(report)
+    lines += _unjudged_but_down(report)
+    lines += _coverage_gaps(report)
+    # Base-against-main is context, and printing it between the table and the
+    # reason for the verdict puts other models' problems ahead of this PR's on
+    # the way down the page. It goes last.
+    lines += _drift_block(report)
     lines += ["", "Advisory. This check does not block merge."]
     return "\n".join(lines)
 
