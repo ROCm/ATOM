@@ -24,10 +24,34 @@ forced, not chosen:
   superseded state block is freed and nulled, and speculative blocks relocate in
   place -- so indexing it by ``token // block_size`` can land on a null, freed,
   or live speculative block and persist those bytes under a valid prefix hash.
-  The only safe source is vLLM's explicit hand-off --
-  ``SchedulerOutput.partial_tail_offloads`` on 0.28, the same payload under
-  ``kv_connector_block_state.boundary_state_offloads`` on 0.29 -- which names
-  the exact block holding a committed boundary state.
+
+  Two sources name a boundary block without indexing that table, and both are
+  used because neither covers the other:
+
+  1. vLLM's explicit hand-off -- ``SchedulerOutput.partial_tail_offloads`` on
+     0.28, the same payload under ``kv_connector_block_state`` on 0.29. It
+     names the block holding a committed boundary state exactly. But it is, by
+     its own definition, the *partial tail*: ``_cache_partial_tail_block``
+     emits nothing when ``num_tokens % block_size == 0`` and nothing at all
+     when ``block_size == hash_block_size``. On Kimi-K3 both mamba and hash
+     block size are 1536 (vLLM raises the attention block size to satisfy
+     "attention page >= mamba page", and ``hash_block_size`` is then their
+     gcd), so this source is **empty** -- and every boundary it could ever
+     name is a non-multiple of the chunk size, which :meth:`cap_hit` can never
+     select. Measured: 3.96M external queries, exactly 0 hits, over 900s.
+  2. The block pool's own content-addressed cache, ``get_cached_block(hash,
+     group_ids)``. This is the map vLLM itself uses to serve a local mamba
+     prefix hit, so a whole-block boundary is in it precisely when that
+     boundary's state is committed and intact. Looking a boundary up by hash
+     rather than by row is what makes it safe: a freed, nulled or relocated
+     block is not in the map under that hash, so the failure mode the
+     positional read has -- wrong bytes under a valid key -- cannot occur. It
+     is also all-or-nothing across the mamba groups in one call, which is the
+     atomicity this leg needs anyway.
+
+  (1) feeds :meth:`collect_stores`, (2) feeds
+  :meth:`collect_cached_boundary_stores`. The second is what actually produces
+  chunk-aligned boundaries, hence what makes a joint hit possible at all.
 
 So a KDA boundary is stored as one whole opaque image under the prefix hash at
 that boundary -- one key, one block per mamba group -- through
@@ -46,6 +70,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
@@ -501,6 +526,28 @@ class KdaBoundaryPlanner:
         # read by `cap_hit` -- ATOM's scheduler hands the hook a SeqView, which
         # carries no block hashes of its own.
         self._lookup_ctx: tuple[str, Any] | None = None
+        # How far the content-addressed sweep has already offered boundaries
+        # for each live request, so a boundary is offered once rather than on
+        # every step it remains resident.
+        self._swept: dict[str, int] = {}
+        # Why this leg has nothing to show, when it has nothing to show. Until
+        # these existed the whole leg was `logger.debug`, and a run that
+        # produced exactly zero joint hits produced exactly zero lines saying
+        # so -- 900 seconds of a by-construction null that read as a quiet
+        # success. Every rejection below increments one of these, and
+        # :meth:`log_stats` prints them at INFO.
+        self._counters: dict[str, int] = {
+            "handoff_entries": 0,
+            "handoff_stores": 0,
+            "sweep_offered": 0,
+            "sweep_stores": 0,
+            "sweep_no_hash": 0,
+            "sweep_uncached": 0,
+            "sweep_known": 0,
+            "cap_kept": 0,
+            "cap_declined": 0,
+        }
+        self._last_stats_log = 0.0
         if self.chunk_size % self.mamba_block_size != 0:
             raise ValueError(
                 f"KDA state offload: LMCache chunk size {self.chunk_size} is not "
@@ -553,11 +600,14 @@ class KdaBoundaryPlanner:
         boundary = (hit // self.chunk_size) * self.chunk_size
         for _ in range(_MAX_CAP_DESCENT):
             if boundary <= 0:
+                self._counters["cap_declined"] += 1
                 return 0
             h = self.boundary_hash(block_hashes, boundary)
             if h is not None and self._index.could_serve(h):
+                self._counters["cap_kept"] += 1
                 return min(hit, boundary)
             boundary -= self.chunk_size
+        self._counters["cap_declined"] += 1
         logger.debug(
             "KDA state offload: no stored boundary within %d chunks of hit %d "
             "for %s; declining the external hit",
@@ -718,7 +768,6 @@ class KdaBoundaryPlanner:
           :meth:`cap_hit` would then accept.
         """
         accepted: list[KdaStore] = []
-        pool = self._pool
         for req_id, entries in (offloads or {}).items():
             req_id = str(req_id)
             if req_id in skip_req_ids:
@@ -734,6 +783,7 @@ class KdaBoundaryPlanner:
             block_hashes = getattr(request, "block_hashes", None) or ()
             by_boundary: dict[int, dict[int, int]] = {}
             for group_id, block_id, boundary_tokens in entries:
+                self._counters["handoff_entries"] += 1
                 group_id = int(group_id)
                 if group_id not in self.group_ids:
                     continue
@@ -760,16 +810,123 @@ class KdaBoundaryPlanner:
                 h = self.boundary_hash(block_hashes, boundary_tokens)
                 if h is None:
                     continue
-                self._next_op_id += 1
                 block_ids = tuple(blocks[group_id] for group_id in self.group_ids)
-                store = KdaStore(self._next_op_id, h, block_ids)
-                self._pending_stores[store.op_id] = _PendingStore(
-                    block_ids, store.prefix_hash
-                )
-                if pool is not None:
-                    pool.touch([pool.blocks[block_id] for block_id in block_ids])
-                accepted.append(store)
+                accepted.append(self._issue_store(h, block_ids))
+                self._counters["handoff_stores"] += 1
         return accepted
+
+    def _issue_store(self, prefix_hash: int, block_ids: tuple[int, ...]) -> KdaStore:
+        """Pin a boundary's blocks and queue the job that copies them out.
+
+        The pin is taken here, at submission, and released in
+        :meth:`absorb_reports` once every rank has reported. Nothing else keeps
+        the block alive: vLLM is free to evict it the moment the request that
+        produced it stops referencing it, and the D2H runs asynchronously on
+        the worker, so an unpinned source is a race whose loser writes another
+        prefix's state under this hash.
+        """
+        self._next_op_id += 1
+        store = KdaStore(self._next_op_id, prefix_hash, block_ids)
+        self._pending_stores[store.op_id] = _PendingStore(block_ids, prefix_hash)
+        pool = self._pool
+        if pool is not None:
+            pool.touch([pool.blocks[block_id] for block_id in block_ids])
+        return store
+
+    def collect_cached_boundary_stores(
+        self, frontiers, requests_by_id, skip_req_ids=()
+    ) -> list[KdaStore]:
+        """Offer every chunk-aligned boundary vLLM has committed and cached.
+
+        This is the source that actually produces joint hits; the hand-off
+        (:meth:`collect_stores`) produces none on a model whose mamba block
+        size equals its hash block size, because vLLM emits a *partial tail*
+        only when the boundary is **not** a whole block -- and a boundary that
+        is not a whole block is never chunk-aligned either, so :meth:`cap_hit`
+        could not select it even if it arrived. The two acceptance domains are
+        disjoint by construction. See the module docstring.
+
+        The block ids come from ``BlockPool.get_cached_block``, keyed by the
+        same ``BlockHash`` vLLM uses to serve a local mamba hit, never by
+        indexing a block table. That is the whole safety argument: an
+        align-mode mamba block that was superseded, freed, nulled or relocated
+        is not registered under that hash any more, so a stale row cannot be
+        mistaken for a live boundary. The call spans every mamba group at once
+        and returns ``None`` unless all of them are present, which is exactly
+        the all-or-nothing this state needs -- a boundary stored for some of
+        its groups is an image that cannot be restored, sitting under a hash
+        :meth:`cap_hit` would accept.
+
+        *frontiers* is ``{req_id: num_computed_tokens}`` for the requests this
+        step scheduled. A boundary is offered only once per request (the
+        ``_swept`` cursor) and only after the frontier has passed it, which is
+        also when vLLM has had a chance to register it.
+        """
+        accepted: list[KdaStore] = []
+        if self._pool is None or not self._index.can_store:
+            return accepted
+        for req_id, frontier in (frontiers or {}).items():
+            req_id = str(req_id)
+            if req_id in skip_req_ids:
+                continue
+            request = requests_by_id.get(req_id)
+            if request is None:
+                continue
+            block_hashes = getattr(request, "block_hashes", None) or ()
+            frontier = int(frontier)
+            cursor = self._swept.get(req_id, 0)
+            boundary = ((cursor // self.chunk_size) + 1) * self.chunk_size
+            while boundary <= frontier:
+                self._counters["sweep_offered"] += 1
+                store = self._store_for_cached_boundary(block_hashes, boundary)
+                if store is not None:
+                    accepted.append(store)
+                    self._counters["sweep_stores"] += 1
+                boundary += self.chunk_size
+            self._swept[req_id] = max(cursor, frontier)
+        return accepted
+
+    def _store_for_cached_boundary(
+        self, block_hashes, boundary_tokens: int
+    ) -> KdaStore | None:
+        """The store job for one chunk-aligned boundary, or None.
+
+        None is returned -- and counted -- rather than raised for all three of
+        the ordinary reasons: vLLM has not hashed that far, the mamba groups do
+        not hold that boundary any more, or this index already claims it.
+        """
+        h = self.boundary_hash(block_hashes, boundary_tokens)
+        if h is None:
+            self._counters["sweep_no_hash"] += 1
+            return None
+        if h in self._index.hashes:
+            # Already stored once. Re-storing would move the same bytes under
+            # the same key and buy nothing; the optimistic index treats a later
+            # eviction as a failed load, which forgets the hash and lets the
+            # next sweep past this boundary offer it again.
+            self._counters["sweep_known"] += 1
+            return None
+        blocks = self._pool.get_cached_block(
+            block_hashes[boundary_tokens // self.hash_block_size - 1],
+            list(self.group_ids),
+        )
+        if not blocks:
+            self._counters["sweep_uncached"] += 1
+            return None
+        block_ids = tuple(int(block.block_id) for block in blocks)
+        if any(block_id <= NULL_BLOCK_ID for block_id in block_ids):
+            self._counters["sweep_uncached"] += 1
+            return None
+        return self._issue_store(h, block_ids)
+
+    def forget_request(self, req_id: str) -> None:
+        """Drop a finished or preempted request's sweep cursor.
+
+        A preempted request comes back with its blocks reallocated and its
+        frontier rewound; keeping the cursor would skip every boundary it
+        recomputes. Dropping it is also what keeps the dict bounded.
+        """
+        self._swept.pop(str(req_id), None)
 
     def absorb_reports(self, stored, failed) -> None:
         """Unpin a boundary's blocks once every rank has reported on them.
@@ -815,7 +972,28 @@ class KdaBoundaryPlanner:
     def stats(self) -> dict[str, int]:
         out = dict(self._index.stats())
         out["pinned_stores"] = len(self._pending_stores)
+        out.update(self._counters)
         return out
+
+    def log_stats(self, *, interval_s: float = 60.0, force: bool = False) -> None:
+        """Print this leg's counters at INFO, at most once per *interval_s*.
+
+        It is printed unconditionally rather than only on trouble, because the
+        failure this leg actually had was indistinguishable from health at
+        every level a reader can see: the hit counter was a flat zero, the tier
+        logged stores, and the one line that would have explained it was
+        ``logger.debug``. A leg that reports nothing cannot be shown to be
+        working either, so the numbers ship at INFO -- one line a minute.
+        """
+        now = time.monotonic()
+        if not force and now - self._last_stats_log < interval_s:
+            return
+        self._last_stats_log = now
+        stats = self.stats()
+        logger.info(
+            "ATOM LMCache offload: recurrent leg %s",
+            " ".join(f"{k}={v}" for k, v in sorted(stats.items())),
+        )
 
 
 def summarize_layout_id(layout_id: str) -> str:

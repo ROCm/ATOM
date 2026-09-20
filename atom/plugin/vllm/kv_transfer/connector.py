@@ -879,7 +879,15 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             groups = _group_block_ids(new_blocks)
             grown = list(groups[self._attn_group_id]) if groups else []
             seq.set_block_table(grown if replaces else seq.block_table + grown)
+        frontiers: dict[str, int] = {}
         for req_id, num_tokens in _scheduled_frontiers(scheduler_output):
+            # Unclamped, unlike the SeqView's copy below: that clamp exists to
+            # keep the dense codec from striding past the *attention* block
+            # table it was handed, and the recurrent leg does not index that
+            # table at all -- it resolves its blocks by hash. Clamping here too
+            # would drop the tail boundaries of exactly the long prompts this
+            # leg is for.
+            frontiers[str(req_id)] = int(num_tokens)
             seq = self._seqs.get(req_id)
             if seq is not None:
                 covered = len(seq.block_table) * block_size
@@ -889,7 +897,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # Before `_collect_releases`, so a save abandoned on this step turns
         # into a release on this step rather than on the next one.
         self._reconcile_stale_saves()
-        kda_stores = self._collect_kda_stores(scheduler_output, preempted)
+        kda_stores = self._collect_kda_stores(scheduler_output, preempted, frontiers)
         kda_loads = (
             self._kda_planner.take_loads() if self._kda_planner is not None else []
         )
@@ -901,25 +909,38 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             kda_loads,
         )
 
-    def _collect_kda_stores(self, scheduler_output, preempted) -> list:
-        """Take this step's boundary hand-offs, in the step they exist.
+    def _collect_kda_stores(self, scheduler_output, preempted, frontiers) -> list:
+        """This step's recurrent boundary stores, from both sources.
 
-        The hand-off is taken off the KV cache manager when the step is built
-        and is not shipped to the workers, so there is no later step in which to
-        read it. A hand-off that is not consumed here is a boundary that is
-        never stored, which the lookup cap then turns into a shorter hit --
-        quiet, and only visible as a hit rate that will not climb.
+        The hand-off has to be taken in the step it exists: the KV cache
+        manager hands the pending offloads over while the step is being built
+        and is not shipped to the workers, so there is no later step to read it
+        in. It is also, on its own, empty on any model whose mamba block size
+        equals its hash block size -- Kimi-K3 among them -- which is why the
+        content-addressed sweep runs beside it rather than as a fallback. See
+        ``kda_state``'s module docstring for why the two sources do not overlap.
         """
         if self._kda_planner is None:
-            return []
-        offloads = step_boundary_offloads(scheduler_output)
-        if not offloads:
             return []
         skip = set(preempted)
         skip.update(
             str(r) for r in getattr(scheduler_output, "finished_req_ids", None) or ()
         )
-        return self._kda_planner.collect_stores(offloads, self._requests, skip)
+        for req_id in skip:
+            self._kda_planner.forget_request(req_id)
+        stores: list = []
+        offloads = step_boundary_offloads(scheduler_output)
+        if offloads:
+            stores.extend(
+                self._kda_planner.collect_stores(offloads, self._requests, skip)
+            )
+        stores.extend(
+            self._kda_planner.collect_cached_boundary_stores(
+                frontiers, self._requests, skip
+            )
+        )
+        self._kda_planner.log_stats()
+        return stores
 
     def _handle_preempted(self, scheduler_output) -> list[str]:
         """Forget the block table of every request vLLM just preempted.
@@ -955,6 +976,10 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 # leaving the claim pending would keep the index from ever
                 # deciding whether that boundary is still there.
                 self._kda_planner.forget_pending(req_id)
+                # And the sweep cursor: the request comes back with its
+                # frontier rewound, and a cursor left at the old high-water
+                # mark would skip every boundary it recomputes.
+                self._kda_planner.forget_request(req_id)
             seq = self._seqs.get(req_id)
             if seq is None:
                 continue
@@ -1340,6 +1365,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self._requests.pop(str(req_id), None)
         if self._kda_planner is not None:
             self._kda_planner.forget_pending(str(req_id))
+            self._kda_planner.forget_request(str(req_id))
         seq = self._seqs.get(req_id)
         if seq is not None:
             self._scheduler.request_finished(seq)

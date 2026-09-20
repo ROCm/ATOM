@@ -73,13 +73,39 @@ class FakeSeq:
         self.id = sid
 
 
+class FakeBlock:
+    """A ``KVCacheBlock`` as far as ``get_cached_block``'s caller is concerned."""
+
+    def __init__(self, block_id):
+        self.block_id = block_id
+
+
 class FakePool:
-    """vLLM's ``BlockPool``, reduced to the pin surface the planner uses."""
+    """vLLM's ``BlockPool``, reduced to the surface the planner uses: the pin
+    pair, and the content-addressed lookup the boundary sweep resolves through.
+    """
 
     def __init__(self, num_blocks=64):
         self.blocks = [f"blk{i}" for i in range(num_blocks)]
         self.touched = []
         self.freed = []
+        # {block_hash: {group_id: block_id}}, mirroring
+        # ``cached_block_hash_to_block`` keyed by (hash, group).
+        self.cached: dict = {}
+
+    def publish(self, block_hash, group_blocks):
+        self.cached[block_hash] = dict(group_blocks)
+
+    def get_cached_block(self, block_hash, kv_cache_group_ids):
+        entry = self.cached.get(block_hash)
+        if entry is None:
+            return None
+        out = []
+        for group_id in kv_cache_group_ids:
+            if group_id not in entry:
+                return None
+            out.append(FakeBlock(entry[group_id]))
+        return out
 
     def touch(self, blocks):
         self.touched.extend(blocks)
@@ -886,3 +912,193 @@ def test_the_summary_is_not_what_the_key_folds_in():
     full = build_layout_id([spec], tensors)
     assert summarize_layout_id(full) != full
     assert full.endswith("(1, 1, 884736):torch.int8;(1, 1, 884736):torch.int8")
+
+
+# --------------------------------------------------------------------------
+# collect_cached_boundary_stores -- the source that makes a joint hit possible
+#
+# The hand-off alone produced exactly zero joint hits on Kimi-K3 over 900s and
+# 3.96M external queries, because vLLM emits a boundary only when it is *not* a
+# whole block while this planner can only use one that *is* (cap_hit descends in
+# chunk steps). The two acceptance domains are disjoint, so the tests below are
+# about the second source: boundaries resolved by hash out of the block pool.
+# --------------------------------------------------------------------------
+def publish_boundary(pool, request, boundary, group_blocks):
+    """Register *boundary*'s block in each group, as vLLM's own caching does."""
+    pool.publish(request.block_hashes[boundary // HASH_BLOCK - 1], group_blocks)
+
+
+def test_whole_block_boundary_is_stored_although_no_handoff_names_it():
+    planner = make_planner()
+    pool = FakePool()
+    planner.bind_gpu_block_pool(pool)
+    request = FakeRequest("r1")
+    publish_boundary(pool, request, CHUNK, {MAMBA_GROUP: 11})
+
+    # No hand-off at all -- exactly the K3 shape.
+    assert planner.collect_stores({}, {"r1": request}) == []
+    stores = planner.collect_cached_boundary_stores({"r1": CHUNK}, {"r1": request})
+
+    assert [store.block_ids for store in stores] == [(11,)]
+    assert pool.touched == ["blk11"]
+    assert stores[0].prefix_hash == planner.boundary_hash(request.block_hashes, CHUNK)
+
+
+def test_sweep_offers_every_chunk_aligned_boundary_below_the_frontier():
+    planner = make_planner()
+    pool = FakePool()
+    planner.bind_gpu_block_pool(pool)
+    request = FakeRequest("r1")
+    for n in (1, 2, 3):
+        publish_boundary(pool, request, n * CHUNK, {MAMBA_GROUP: 20 + n})
+
+    stores = planner.collect_cached_boundary_stores(
+        {"r1": 3 * CHUNK + 5}, {"r1": request}
+    )
+
+    assert [store.block_ids for store in stores] == [(21,), (22,), (23,)]
+
+
+def test_a_boundary_is_offered_once_across_steps():
+    planner = make_planner()
+    pool = FakePool()
+    planner.bind_gpu_block_pool(pool)
+    request = FakeRequest("r1")
+    publish_boundary(pool, request, CHUNK, {MAMBA_GROUP: 11})
+
+    first = planner.collect_cached_boundary_stores({"r1": CHUNK}, {"r1": request})
+    second = planner.collect_cached_boundary_stores({"r1": CHUNK}, {"r1": request})
+
+    assert len(first) == 1
+    assert second == []
+
+
+def test_a_boundary_the_pool_no_longer_holds_is_counted_not_guessed():
+    """The whole safety argument: a superseded, freed or relocated state block
+    is not in the pool under that hash, so the sweep declines rather than
+    persisting whatever now occupies the row it would have indexed."""
+    planner = make_planner()
+    pool = FakePool()
+    planner.bind_gpu_block_pool(pool)
+    request = FakeRequest("r1")
+
+    stores = planner.collect_cached_boundary_stores({"r1": CHUNK}, {"r1": request})
+
+    assert stores == []
+    assert pool.touched == []
+    assert planner.stats()["sweep_uncached"] == 1
+
+
+def test_a_boundary_missing_one_mamba_group_is_not_stored_at_all():
+    planner = make_two_group_planner()
+    pool = FakePool()
+    planner.bind_gpu_block_pool(pool)
+    request = FakeRequest("r1")
+    publish_boundary(pool, request, CHUNK, {MAMBA_GROUP: 11})  # group 2 absent
+
+    stores = planner.collect_cached_boundary_stores({"r1": CHUNK}, {"r1": request})
+
+    assert stores == []
+    assert pool.touched == []
+
+
+def test_both_mamba_groups_travel_as_one_boundary():
+    planner = make_two_group_planner()
+    pool = FakePool()
+    planner.bind_gpu_block_pool(pool)
+    request = FakeRequest("r1")
+    publish_boundary(pool, request, CHUNK, {MAMBA_GROUP: 11, MAMBA_GROUP_2: 12})
+
+    stores = planner.collect_cached_boundary_stores({"r1": CHUNK}, {"r1": request})
+
+    assert [store.block_ids for store in stores] == [(11, 12)]
+
+
+def test_swept_boundary_makes_the_hit_cap_pass():
+    """End to end over the gate that reported zero: store by sweep, then ask
+    ``cap_hit`` the question the scheduler asks."""
+    planner = make_planner()
+    pool = FakePool()
+    planner.bind_gpu_block_pool(pool)
+    request = FakeRequest("r1")
+    publish_boundary(pool, request, CHUNK, {MAMBA_GROUP: 11})
+
+    for store in planner.collect_cached_boundary_stores({"r1": CHUNK}, {"r1": request}):
+        planner.absorb_reports({store.op_id: WORLD}, {})
+
+    planner.begin_lookup(request)
+    assert planner.cap_hit(FakeSeq("r1"), CHUNK) == CHUNK
+
+
+def test_an_already_stored_boundary_is_not_stored_again():
+    planner = make_planner()
+    pool = FakePool()
+    planner.bind_gpu_block_pool(pool)
+    request = FakeRequest("r1")
+    publish_boundary(pool, request, CHUNK, {MAMBA_GROUP: 11})
+    for store in planner.collect_cached_boundary_stores({"r1": CHUNK}, {"r1": request}):
+        planner.absorb_reports({store.op_id: WORLD}, {})
+
+    planner.forget_request("r1")  # as a preemption or a second request would
+    stores = planner.collect_cached_boundary_stores({"r1": CHUNK}, {"r1": request})
+
+    assert stores == []
+    assert planner.stats()["sweep_known"] == 1
+
+
+def test_preemption_rewinds_the_sweep_cursor():
+    planner = make_planner()
+    pool = FakePool()
+    planner.bind_gpu_block_pool(pool)
+    request = FakeRequest("r1")
+    publish_boundary(pool, request, CHUNK, {MAMBA_GROUP: 11})
+    planner.collect_cached_boundary_stores({"r1": CHUNK}, {"r1": request})
+
+    planner.forget_request("r1")
+    stores = planner.collect_cached_boundary_stores({"r1": CHUNK}, {"r1": request})
+
+    # Offered again (the index has not indexed it -- no rank reported yet), so
+    # a request that comes back from preemption does not silently lose the
+    # boundaries it is about to recompute.
+    assert [store.block_ids for store in stores] == [(11,)]
+
+
+def test_finished_and_preempted_requests_are_skipped_by_the_sweep():
+    planner = make_planner()
+    pool = FakePool()
+    planner.bind_gpu_block_pool(pool)
+    request = FakeRequest("r1")
+    publish_boundary(pool, request, CHUNK, {MAMBA_GROUP: 11})
+
+    stores = planner.collect_cached_boundary_stores(
+        {"r1": CHUNK}, {"r1": request}, skip_req_ids={"r1"}
+    )
+
+    assert stores == []
+
+
+def test_sweep_is_inert_until_the_pool_is_bound():
+    planner = make_planner()
+    request = FakeRequest("r1")
+
+    assert planner.collect_cached_boundary_stores({"r1": CHUNK}, {"r1": request}) == []
+
+
+def test_stats_name_every_reason_a_boundary_was_not_stored():
+    """The run this fixes was silent because every explanation was ``debug``.
+    Whatever else changes, the counters have to keep saying why."""
+    planner = make_planner()
+    planner.bind_gpu_block_pool(FakePool())
+    stats = planner.stats()
+
+    for name in (
+        "handoff_entries",
+        "sweep_offered",
+        "sweep_stores",
+        "sweep_uncached",
+        "sweep_no_hash",
+        "sweep_known",
+        "cap_kept",
+        "cap_declined",
+    ):
+        assert name in stats
