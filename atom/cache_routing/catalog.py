@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import threading
 import time
 import uuid
@@ -182,6 +183,7 @@ class CacheCatalog:
         """Apply an ordered worker report, with snapshot recovery after a gap."""
         rank, epoch = update["rank"], update["source_epoch"]
         seq, after = int(update["seq"]), int(update["after_seq"])
+        sample_age = float(update.get("sample_age_seconds", 0))
         if (
             type(rank) is not int
             or not 0 <= rank < self.world
@@ -193,6 +195,8 @@ class CacheCatalog:
             or update["chunk_size"] <= 0
             or not isinstance(update["layout_id"], str)
             or not update["layout_id"]
+            or not math.isfinite(sample_age)
+            or sample_age < 0
         ):
             raise ValueError("invalid CPU source identity/cursor")
         with self.lock:
@@ -205,7 +209,7 @@ class CacheCatalog:
                 and seq == old["seq"]
                 and not update.get("snapshot")
             ):
-                old["seen"] = time.monotonic()
+                old["seen"] = time.monotonic() - sample_age
                 self._refresh_cpu()
                 return
             retired = self.retired_epochs.setdefault(rank, set())
@@ -261,7 +265,7 @@ class CacheCatalog:
                 "epoch": epoch,
                 "seq": seq,
                 "entries": entries,
-                "seen": time.monotonic(),
+                "seen": time.monotonic() - sample_age,
                 "layout_id": update["layout_id"],
                 "chunk_size": update["chunk_size"],
                 "piece_manifest": update.get("piece_manifest")

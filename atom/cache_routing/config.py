@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass
 from urllib.parse import urlparse
@@ -21,6 +22,7 @@ class CacheRoutingConfig:
     max_entries: int = 200000
     max_log_bytes: int = 16777216
     stale_seconds: float = 3.0
+    cpu_poll_interval_seconds: float = 0.5
 
     @classmethod
     def from_env(cls) -> CacheRoutingConfig | None:
@@ -49,8 +51,15 @@ class CacheRoutingConfig:
                 cfg.max_entries,
                 cfg.max_log_bytes,
                 cfg.stale_seconds,
+                cfg.cpu_poll_interval_seconds,
             )
             <= 0
         ):
             raise ValueError("cache routing geometry and budgets must be positive")
+        if (
+            not math.isfinite(cfg.cpu_poll_interval_seconds)
+            or not math.isfinite(cfg.stale_seconds)
+            or cfg.cpu_poll_interval_seconds >= cfg.stale_seconds
+        ):
+            raise ValueError("CPU poll interval must be finite and below stale_seconds")
         return cfg

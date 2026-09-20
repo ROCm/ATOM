@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
-"""Map actual LMCache native keys to content, then consume public CPU facts."""
+"""Publish sampled CPU residency through connector-supplied read-only APIs."""
 
 from __future__ import annotations
 
 import json
 import logging
 import threading
+import time
 import uuid
+from collections.abc import Callable, Hashable, Iterable
 
 from atom.cache_routing.config import CacheRoutingConfig
 from atom.cache_routing.keys import content_keys, root_key
@@ -16,39 +18,44 @@ logger = logging.getLogger(__name__)
 
 
 class NativeCPUReporter:
+    """Map native keys to content without depending on a storage implementation.
+
+    The connector supplies a point-in-time key snapshot and its native token
+    mapping. Full immutable chunks have a fixed byte size in the codec. Sampling
+    can miss intermediate mutations; native lookup/retrieve remain authoritative.
+    """
+
     def __init__(
         self,
-        engine,
-        metadata,
         config: CacheRoutingConfig,
+        *,
+        rank: int,
+        layout_id: str,
         chunk_size: int,
+        chunk_size_bytes: int,
+        get_keys: Callable[[], Iterable[Hashable]],
+        process_tokens: Callable[[list[int]], Iterable[tuple[int, int, Hashable]]],
         piece_manifest: list[dict] | None = None,
     ):
-        # Public backend collection: never read hot_cache or allocator internals.
-        backends = engine.storage_manager.storage_backends
-        self.backend = backends.get("LocalCPUBackend")
-        if self.backend is None or not callable(
-            getattr(self.backend, "residency_snapshot", None)
-        ):
-            raise ValueError("CPU catalog requires LMCache native residency v1 hooks")
-        if chunk_size % config.canonical_block_size:
+        if chunk_size <= 0 or chunk_size % config.canonical_block_size:
             raise ValueError(
-                "LMCache chunk size must be divisible by canonical block size"
+                "native chunk size must be positive and divisible by canonical block size"
             )
-        self.engine = engine
-        self.metadata = metadata
+        if chunk_size_bytes <= 0:
+            raise ValueError("native chunk byte size must be positive")
+        self.get_keys = get_keys
+        self.process_tokens = process_tokens
+        self.rank = rank
+        self.layout_id = layout_id
         self.config = config
         self.chunk_size = chunk_size
+        self.chunk_size_bytes = chunk_size_bytes
         self.piece_manifest = piece_manifest or []
         self.bindings = {}
-        self.pending = set()
-        self.readable = {}
         self.sent = {}
         self.lock = threading.Lock()
         self.stop = threading.Event()
-        self.epoch = None
         self.report_epoch = uuid.uuid4().hex
-        self.backend_seq = 0
         self.seq = 0
         self.force_snapshot = True
         self.thread = threading.Thread(
@@ -59,8 +66,8 @@ class NativeCPUReporter:
     def bind(self, token_ids) -> None:
         """Register identities using the engine's token database, before store.
 
-        Registration grants no residency. A later public backend snapshot/event
-        must independently establish that the native object is readable.
+        Registration grants no residency. A later key snapshot must independently
+        establish that the native object is readable.
         """
         tokens = [int(token) for token in token_ids]
         keys = content_keys(
@@ -70,7 +77,7 @@ class NativeCPUReporter:
             self.config.content_namespace, self.config.canonical_block_size
         ).hex()
         with self.lock:
-            for start, end, key in self.engine.token_database.process_tokens(tokens):
+            for start, end, key in self.process_tokens(tokens):
                 if end - start != self.chunk_size:
                     continue
                 if (
@@ -91,76 +98,69 @@ class NativeCPUReporter:
                     "content_keys": keys[lo:hi],
                     "parent_key": keys[lo - 1] if lo else root,
                 }
-                self.pending.add(key)
 
     def poll(self) -> None:
-        """Reconcile new bindings and mutations without rescanning resident KV.
+        """Diff a fresh key snapshot and publish only changed known chunks.
 
-        The transport cursor is independent of the backend cursor: binding an
-        already readable object is itself a catalog change. Recovery first
-        clears this worker's scope, then rebuilds it in bounded pages. Partial
-        recovery can only omit chunks, never preserve an obsolete READY.
+        A snapshot reads metadata only. Failed reads do not renew CPU freshness.
+        Recovery clears the worker scope before bounded replay; the ATOM-owned
+        transport cursor describes sampled state, not backend mutation history.
         """
+        self.sample_started = time.monotonic()
         with self.lock:
+            bindings = dict(self.bindings)
+        # get_keys owns storage synchronization; never hold the binding lock
+        # while reading the backend or retain unknown keys between samples.
+        readable = set(self.get_keys()).intersection(bindings)
+        try:
             snapshot = self.force_snapshot
-            pending, self.pending = self.pending, set()
-            self.force_snapshot = False
-        if snapshot:
-            page = self.backend.residency_snapshot()
-            self.readable = {event.key: event for event in page.entries}
-            pending.update(self.readable)
-            self.epoch = page.source_epoch
-            self._send([], snapshot=True)
-            self.sent.clear()
-        else:
-            page = self.backend.residency_events(self.epoch, self.backend_seq)
-            for event in page.events:
-                pending.add(event.key)
-                if event.readable:
-                    self.readable[event.key] = event
-                else:
-                    self.readable.pop(event.key, None)
-        with self.lock:
-            bindings = {
-                key: self.bindings[key] for key in pending if key in self.bindings
-            }
-        report = []
-        for key in pending:
-            event = self.readable.get(key)
-            binding = bindings.get(key)
-            if event is not None and binding is not None:
+            if snapshot:
+                self._send([], snapshot=True)
+                self.sent.clear()
+            # Remove first so catalog capacity is available for new chunks.
+            report = [
+                {"chunk_id": self.sent.pop(key), "readable": False}
+                for key in self.sent.keys() - readable
+            ]
+            for key in readable - self.sent.keys():
                 report.append(
-                    {**binding, "readable": True, "size_bytes": event.size_bytes}
+                    {
+                        **bindings[key],
+                        "readable": True,
+                        "size_bytes": self.chunk_size_bytes,
+                    }
                 )
-                self.sent[key] = binding["chunk_id"]
-            elif key in self.sent:
-                report.append({"chunk_id": self.sent.pop(key), "readable": False})
-        # Bound bytes as well as object count, including large chunk geometry.
-        batch, size = [], 0
-        for event in report:
-            event_size = len(json.dumps(event))
-            if event_size > 1024 * 1024:
-                continue  # Unknown identity loses a benefit; never split a chunk.
-            if size + event_size > 1024 * 1024 or len(batch) >= 256:
-                self._send(batch)
-                batch, size = [], 0
-            batch.append(event)
-            size += event_size
-        self._send(batch)  # An empty page is a source heartbeat.
-        self.backend_seq = page.cut_seq
+                self.sent[key] = bindings[key]["chunk_id"]
+            # Bound bytes as well as object count, including large chunk geometry.
+            batch, size = [], 0
+            for event in report:
+                event_size = len(json.dumps(event))
+                if event_size > 1024 * 1024:
+                    continue  # Unknown identity loses a benefit; never split a chunk.
+                if size + event_size > 1024 * 1024 or len(batch) >= 256:
+                    self._send(batch)
+                    batch, size = [], 0
+                batch.append(event)
+                size += event_size
+            self._send(batch)  # Even an idle heartbeat requires a fresh sample.
+            self.force_snapshot = False
+        except Exception:
+            self.force_snapshot = True
+            raise
 
     def _send(self, events, *, snapshot=False):
         post_cpu_report(
             self.config.catalog_url,
             {
-                "rank": self.metadata.worker_id,
-                "source_epoch": f"{self.report_epoch}:{self.epoch}",
+                "rank": self.rank,
+                "source_epoch": self.report_epoch,
                 "seq": str(self.seq + 1),
                 "after_seq": str(self.seq),
                 "snapshot": snapshot,
                 "content_namespace": self.config.content_namespace,
-                "layout_id": self.metadata.model_name,
+                "layout_id": self.layout_id,
                 "chunk_size": self.chunk_size,
+                "sample_age_seconds": time.monotonic() - self.sample_started,
                 "piece_manifest": self.piece_manifest if snapshot else None,
                 "events": events,
             },
@@ -173,10 +173,8 @@ class NativeCPUReporter:
                 self.poll()
             # Observation is optional; any backend failure requires resync.
             except Exception as exc:  # noqa: BLE001
-                with self.lock:
-                    self.force_snapshot = True
                 logger.debug("CPU catalog observation will resync: %s", exc)
-            self.stop.wait(0.1)
+            self.stop.wait(self.config.cpu_poll_interval_seconds)
 
     def close(self):
         self.stop.set()

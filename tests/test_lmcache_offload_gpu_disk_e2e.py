@@ -524,11 +524,18 @@ def test_native_cpu_catalog_follows_readable_gpu_round_trip():
         engine.fmt = MemoryFormat.KV_2LTD
         engine.post_init()
         backend = engine.storage_manager.storage_backends["LocalCPUBackend"]
-        if not hasattr(backend, "residency_snapshot"):
-            pytest.skip("requires LMCache native CPU residency v1 PR")
         routing = SimpleNamespace(**vars(routing))
         routing.catalog_url = f"http://127.0.0.1:{server.server.server_port}"
-        reporter = NativeCPUReporter(engine, metadata, routing, chunk_size)
+        reporter = NativeCPUReporter(
+            routing,
+            rank=metadata.worker_id,
+            layout_id=metadata.model_name,
+            chunk_size=chunk_size,
+            chunk_size_bytes=(chunk_size // block_size) * codec.bytes_per_block,
+            get_keys=backend.get_keys,
+            process_tokens=engine.token_database.process_tokens,
+            piece_manifest=codec.layout_manifest(),
+        )
         reporter.bind(tokens)
         assert catalog.snapshot()["entries"] == ()
         _synchronize_producer_stream()
@@ -537,6 +544,10 @@ def test_native_cpu_catalog_follows_readable_gpu_round_trip():
         while len(catalog.entries) != 2 and time.monotonic() < deadline:
             time.sleep(0.01)
         assert len(catalog.entries) == 2
+        assert all(
+            entry["size_bytes"] == (chunk_size // block_size) * codec.bytes_per_block
+            for entry in catalog.entries.values()
+        )
         for cache in caches.values():
             for field in ("k_cache", "v_cache", "k_scale", "v_scale"):
                 getattr(cache, field).zero_()

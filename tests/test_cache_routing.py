@@ -245,28 +245,11 @@ def test_native_reporter_incremental_binding_and_bounded_recovery(monkeypatch):
     from atom.cache_routing.native import NativeCPUReporter
 
     # Public backend contract: metadata exists before ATOM learns its tokens.
-    state = SimpleNamespace(seq=1, readable=True, snapshots=0)
-    event = SimpleNamespace(key="native", readable=True, size_bytes=4096)
+    state = SimpleNamespace(readable=True, snapshots=0)
 
-    class Backend:
-        def residency_snapshot(self):
-            state.snapshots += 1
-            return SimpleNamespace(
-                source_epoch="boot",
-                cut_seq=state.seq,
-                entries=[event] if state.readable else [],
-            )
-
-        def residency_events(self, epoch, after):
-            return SimpleNamespace(
-                source_epoch="boot",
-                cut_seq=state.seq,
-                events=(
-                    []
-                    if after == state.seq
-                    else [SimpleNamespace(key="native", readable=False)]
-                ),
-            )
+    def get_keys():
+        state.snapshots += 1
+        return ["native", "unknown"] if state.readable else []
 
     cat = catalog()
     reports = []
@@ -279,16 +262,14 @@ def test_native_reporter_incremental_binding_and_bounded_recovery(monkeypatch):
     monkeypatch.setattr(
         "atom.cache_routing.native.threading.Thread.start", lambda _: None
     )
-    engine = SimpleNamespace(
-        storage_manager=SimpleNamespace(
-            storage_backends={"LocalCPUBackend": Backend()}
-        ),
-        token_database=SimpleNamespace(
-            process_tokens=lambda tokens: [(0, 256, "native")]
-        ),
-    )
     reporter = NativeCPUReporter(
-        engine, SimpleNamespace(worker_id=0, model_name="layout"), cat.config, 256
+        cat.config,
+        rank=0,
+        layout_id="layout",
+        chunk_size=256,
+        chunk_size_bytes=4096,
+        get_keys=get_keys,
+        process_tokens=lambda tokens: [(0, 256, "native")],
     )
     reporter.poll()
     assert not cat.snapshot()["entries"]
@@ -299,35 +280,20 @@ def test_native_reporter_incremental_binding_and_bounded_recovery(monkeypatch):
         reporter.bind(range(256))
         reporter.poll()
         assert reports[-1]["events"] == []
-    assert state.snapshots == 1
-    state.seq, state.readable = 2, False
+    assert state.snapshots == 5  # Every heartbeat requires a fresh observation.
+    state.readable = False
     reporter.poll()
     assert not cat.snapshot()["entries"]
+    state.readable = True
+    reporter.poll()
+    assert cat.snapshot()["entries"][0]["size_bytes"] == 4096
     assert all(len(report["events"]) <= 256 for report in reports)
 
 
 def test_native_recovery_splits_large_readable_set(monkeypatch):
-    from types import SimpleNamespace
-
     from atom.cache_routing.native import NativeCPUReporter
 
     count = 600
-    events = [
-        SimpleNamespace(key=i, readable=True, size_bytes=4096) for i in range(count)
-    ]
-    backend = SimpleNamespace(
-        residency_snapshot=lambda: SimpleNamespace(
-            source_epoch="boot", cut_seq=count, entries=events
-        )
-    )
-    engine = SimpleNamespace(
-        storage_manager=SimpleNamespace(storage_backends={"LocalCPUBackend": backend}),
-        token_database=SimpleNamespace(
-            process_tokens=lambda tokens: (
-                (i * 256, (i + 1) * 256, i) for i in range(count)
-            )
-        ),
-    )
     cat = catalog()
     reports = []
 
@@ -340,13 +306,156 @@ def test_native_recovery_splits_large_readable_set(monkeypatch):
         "atom.cache_routing.native.threading.Thread.start", lambda _: None
     )
     reporter = NativeCPUReporter(
-        engine, SimpleNamespace(worker_id=0, model_name="layout"), cat.config, 256
+        cat.config,
+        rank=0,
+        layout_id="layout",
+        chunk_size=256,
+        chunk_size_bytes=4096,
+        get_keys=lambda: range(count),
+        process_tokens=lambda tokens: (
+            (i * 256, (i + 1) * 256, i) for i in range(count)
+        ),
     )
     reporter.bind(range(count * 256))
     reporter.poll()
     assert reports[0]["snapshot"] and reports[0]["events"] == []
     assert max(len(report["events"]) for report in reports) <= 256
     assert len(cat.snapshot()["entries"]) == count
+
+
+def test_native_failed_samples_expire_and_recover_without_phantom_hits(monkeypatch):
+    from atom.cache_routing.native import NativeCPUReporter
+
+    now = [100.0]
+    monkeypatch.setattr("atom.cache_routing.native.time.monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        "atom.cache_routing.native.threading.Thread.start", lambda _: None
+    )
+    cat = catalog()
+    keys = []
+    failed = False
+
+    def get_keys():
+        if failed:
+            raise RuntimeError("backend unavailable")
+        return list(keys)
+
+    monkeypatch.setattr(
+        "atom.cache_routing.native.post_cpu_report",
+        lambda url, page: cat.cpu_update(page),
+    )
+    reporter = NativeCPUReporter(
+        cat.config,
+        rank=0,
+        layout_id="layout",
+        chunk_size=256,
+        chunk_size_bytes=4096,
+        get_keys=get_keys,
+        process_tokens=lambda tokens: [(0, 256, "native")],
+    )
+    reporter.bind(range(256))
+    reporter.poll()
+    assert not cat.snapshot()["entries"]  # A submitted/bound key is not resident.
+    keys.append("native")
+    reporter.poll()
+    assert len(cat.snapshot()["entries"]) == 1
+    failed = True
+    now[0] += cat.config.stale_seconds + 1
+    with pytest.raises(RuntimeError, match="backend unavailable"):
+        reporter.poll()
+    assert not cat.snapshot()["entries"]
+    failed = False
+    keys.clear()  # Eviction or backend replacement while observations failed.
+    reporter.poll()
+    assert not cat.snapshot()["entries"]
+    keys.append("native")
+    reporter.poll()
+    assert len(cat.snapshot()["entries"]) == 1
+
+
+def test_native_failed_transport_rebuilds_from_current_sample(monkeypatch):
+    from atom.cache_routing.native import NativeCPUReporter
+
+    monkeypatch.setattr(
+        "atom.cache_routing.native.threading.Thread.start", lambda _: None
+    )
+    cat = catalog()
+    keys = ["native"]
+    failed = True
+    reports = []
+
+    def send(url, page):
+        reports.append(page)
+        cat.cpu_update(page)
+        if failed and page["events"]:
+            raise OSError("reply lost after commit")
+
+    monkeypatch.setattr("atom.cache_routing.native.post_cpu_report", send)
+    reporter = NativeCPUReporter(
+        cat.config,
+        rank=0,
+        layout_id="layout",
+        chunk_size=256,
+        chunk_size_bytes=4096,
+        get_keys=lambda: list(keys),
+        process_tokens=lambda tokens: [(0, 256, "native")],
+    )
+    reporter.bind(range(256))
+    with pytest.raises(OSError):
+        reporter.poll()
+    assert len(cat.snapshot()["entries"]) == 1
+    failed = False
+    keys.clear()
+    reports.clear()
+    reporter.poll()
+    assert reports[0]["snapshot"] and reports[0]["events"] == []
+    assert not cat.snapshot()["entries"]
+
+
+def test_cpu_sampling_age_does_not_renew_stale_state(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr("atom.cache_routing.catalog.time.monotonic", lambda: now[0])
+    cat = catalog()
+    cat.hbm_events([stored()])
+    page = cpu_report(cat, 0, 1)
+    page["sample_age_seconds"] = cat.config.stale_seconds + 1
+    cat.cpu_update(page)
+    assert {e["tier"] for e in cat.snapshot()["entries"]} == {"HBM"}
+    page = cpu_report(cat, 0, 2, after=1, snapshot=False)
+    cat.cpu_update(page)
+    assert {e["tier"] for e in cat.snapshot()["entries"]} == {"HBM", "CPU"}
+    now[0] += cat.config.stale_seconds + 1
+    page["sample_age_seconds"] = cat.config.stale_seconds + 1
+    cat.cpu_update(page)  # Retrying the same page cannot extend old observations.
+    assert {e["tier"] for e in cat.snapshot()["entries"]} == {"HBM"}
+
+
+@pytest.mark.parametrize("age", [-1, float("inf"), float("nan")])
+def test_cpu_rejects_invalid_sample_age(age):
+    cat = catalog()
+    page = cpu_report(cat, 0, 1)
+    page["sample_age_seconds"] = age
+    with pytest.raises(ValueError):
+        cat.cpu_update(page)
+
+
+@pytest.mark.parametrize("interval", [0, -1, 3, float("inf"), float("nan")])
+def test_cpu_poll_interval_must_fit_freshness_window(monkeypatch, interval):
+    import json
+
+    monkeypatch.setenv(
+        "ATOM_CACHE_ROUTING_CONFIG",
+        json.dumps(
+            {
+                "execution_id": "exec",
+                "catalog_url": "http://localhost:9999",
+                "namespace_manifest": MANIFEST,
+                "cpu_poll_interval_seconds": interval,
+            }
+        ),
+    )
+    with pytest.raises(ValueError):
+        CacheRoutingConfig.from_env()
 
 
 @pytest.mark.parametrize(

@@ -143,17 +143,30 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         from atom.cache_routing.native import NativeCPUReporter
 
         routing_config = CacheRoutingConfig.from_env()
-        self._cpu_reporter = (
-            NativeCPUReporter(
-                self._engine,
-                meta,
-                routing_config,
-                self.chunk_size,
-                self._codec.layout_manifest(),
+        # Keep backend integration here: the reporter consumes only callbacks
+        # and codec geometry, with no LMCache types or patched residency APIs.
+        self._cpu_reporter = None
+        if routing_config is not None:
+            cpu_backend = self._engine.storage_manager.storage_backends.get(
+                "LocalCPUBackend"
             )
-            if routing_config is not None
-            else None
-        )
+            get_cpu_keys = getattr(cpu_backend, "get_keys", None)
+            if callable(get_cpu_keys):
+                self._cpu_reporter = NativeCPUReporter(
+                    routing_config,
+                    rank=rank,
+                    layout_id=meta.model_name,
+                    chunk_size=self.chunk_size,
+                    chunk_size_bytes=(self.chunk_size // self.virtual_block_size)
+                    * self._codec.bytes_per_block,
+                    get_keys=get_cpu_keys,
+                    process_tokens=self._engine.token_database.process_tokens,
+                    piece_manifest=self._codec.layout_manifest(),
+                )
+            else:
+                logger.warning(
+                    "CPU catalog disabled: backend has no public get_keys API"
+                )
 
         # ZMQ lookup server so the scheduler process can query our hit counts.
         try:
