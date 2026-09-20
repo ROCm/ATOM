@@ -556,10 +556,11 @@ jobs:
           fi
       
       - name: Run ATOM accuracy test
-        timeout-minutes: 30
+        timeout-minutes: ${{ matrix.accuracy_timeout_minutes || 30 }}
         env:
           MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
           CLIENT_COMMAND: ${{ matrix.client_command || '' }}
+          ACCURACY_TIMEOUT_MINUTES: ${{ matrix.accuracy_timeout_minutes || 30 }}
           ATOM_DEBUG_DEVICE_MAPPING: ${{ matrix.runner == 'linux-atom-do-mi350x-8' && '1' || '0' }}
         run: |
           set -euo pipefail
@@ -580,6 +581,7 @@ jobs:
           echo "========== Running accuracy test =========="
           docker exec \
             -e CLIENT_COMMAND="${CLIENT_COMMAND}" \
+            -e ACCURACY_TIMEOUT_MINUTES="${ACCURACY_TIMEOUT_MINUTES}" \
             -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
             -e GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
             -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \

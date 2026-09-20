@@ -134,6 +134,9 @@ The flat accuracy catalogs — `models_accuracy.json`, `oot_models_accuracy.json
   field to the schema first if it is intentional.
 - **Pass bar (semantic rule)**: each entry must have exactly one of
   `accuracy_threshold` / `accuracy_test_threshold`.
+- **Accuracy timeout**: set optional `accuracy_timeout_minutes` on a
+  `models_accuracy.json` entry to override the native ATOM/atomesh accuracy
+  step timeout. If omitted, the timeout is 30 minutes.
 - **Known drift (tolerated for now)**: `extraArgs` vs `extra_args` and
   `accuracy_threshold` vs `accuracy_test_threshold` are both accepted; the schema
   documents the current reality. Normalizing these (and their consumers) is a
