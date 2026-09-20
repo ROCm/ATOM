@@ -65,7 +65,14 @@ permissions:
   contents: read
   pull-requests: write
 
-# Five entries across two concurrency levels, 10 jobs. It was a single-entry
+# TEMPORARY -- smoke run, revert before review. One entry, one level, one job:
+# Kimi-K3 at c=256. This exercises the flow on CI hardware, which the dummy
+# path has never completed; it cannot exercise the criterion, because one
+# judging level is below FAMILY_MIN_CONFIGS and the family will read
+# `insufficient` with a verdict of `inconclusive`. That is the expected
+# outcome here, not a failure.
+#
+# The agreed set is: five entries across two concurrency levels, 10 jobs. It was a single-entry
 # smoke until d76360456; the matrix step now fails on a short matrix rather
 # than letting a typo surface at the judge as `partial`.
 # Narrowing for an experiment is a change to this block and nothing else.
@@ -77,16 +84,16 @@ env:
   # Catalog prefixes, not display names -- MiniMax-M3-MXFP8 is `m3-mxfp8` here.
   # DeepSeek-V4-Pro MTP3 is added automatically alongside its base by the matrix
   # step, so four names produce five entries.
-  PERF_MODELS: deepseek-v4-pro,kimi-k3,m3-mxfp8,glm-5-2-fp8
+  PERF_MODELS: kimi-k3
   PERF_ISL: 8192
   PERF_OSL: 1024
   PERF_RATIO: "0.8"
-  PERF_JUDGING_CONCS: 32,256
+  PERF_JUDGING_CONCS: 256
   # Empty: every level this line runs is judged. c=4 was the reference level
   # and went with the rest -- at two jobs per entry there is no room for a
   # level that contributes no detection.
   PERF_REFERENCE_CONCS: ""
-  PERF_EXPECTED_ENTRIES: 5
+  PERF_EXPECTED_ENTRIES: 1
   # Warmup length as a multiple of the concurrency level, matching the
   # measurement at 10. Set to 1 to reproduce the short warmup the residual
   # was first measured under -- the only single-variable way to separate
