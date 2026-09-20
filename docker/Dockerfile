@@ -163,12 +163,6 @@ RUN echo "========== [vLLM-ATOM] Final transformers version ==========" && \
     "${VENV_PYTHON}" -c "import transformers; print(f'transformers.__version__ = {transformers.__version__}')" && \
     "${VENV_PYTHON}" -m pip show transformers || true
 
-# apt/pip layers in derived images can restore SDK files; reselect the pair
-# after all dependency installation (older external bases may lack the tool).
-RUN if command -v atom-rocm-runtime >/dev/null 2>&1; then \
-        atom-rocm-runtime patched && ldconfig; \
-    fi
-
 CMD ["/bin/bash"]
 
 # SGLang image extends an ATOM base image and layers on an sglang checkout.
@@ -288,12 +282,6 @@ RUN echo "========== [SGLANG-ATOM 5.5/6] Pin smg-grpc-servicer ==========" && \
 RUN echo "========== [SGLANG-ATOM 6/6] Check Aiter/FlyDSL versions after SGLang build ==========" && \
     "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl sglang triton triton-kernels || true
 
-# apt/pip layers in derived images can restore SDK files; reselect the pair
-# after all dependency installation (older external bases may lack the tool).
-RUN if command -v atom-rocm-runtime >/dev/null 2>&1; then \
-        atom-rocm-runtime patched && ldconfig; \
-    fi
-
 CMD ["/bin/bash"]
 
 # ====================================================================
@@ -312,7 +300,7 @@ CMD ["/bin/bash"]
 # --------------------------------------------------------------------
 # Stage 0: Common base (apt + pip foundations, shared by all builders)
 # --------------------------------------------------------------------
-FROM ${BASE_IMAGE} AS base_deps
+FROM ${BASE_IMAGE} AS base
 
 ARG GPU_ARCH
 ENV GPU_ARCH_LIST=$GPU_ARCH
@@ -326,21 +314,50 @@ RUN pip install --upgrade pip && \
         libpci-dev cmake libdw1 locales && \
     rm -rf /var/lib/apt/lists/*
 
-# ROCm 7.2.4 ordering-edge backport (vllm-project/vllm#55099).
-# auto preserves other SDK versions, including the ROCm 10 release image.
-FROM base_deps AS build_rocm_runtime
-ARG ROCM_ORDERING_EDGE=auto
+# ROCm 7.2.4 runtime backport used by vllm-project/vllm#55099.
+# Drop this stage once the official base image includes ordering-edge signals.
+FROM base AS build_rocm_runtime
 ARG ROCM_SYSTEMS_REPO="https://github.com/ROCm/rocm-systems.git"
 ARG ROCM_RUNTIME_COMMIT="b539bf7eebfd99ad0a69668caa1f4037034d501f"
-ARG ROCM_RUNTIME_JOBS=16
-COPY docker/rocm-runtime/build.sh /tmp/build-rocm-runtime.sh
-RUN bash /tmp/build-rocm-runtime.sh
 
-FROM base_deps AS base
-COPY --from=build_rocm_runtime /opt/atom-rocm-runtime /opt/atom-rocm-runtime
-COPY docker/rocm-runtime/switch_runtime.py /usr/local/bin/atom-rocm-runtime
-RUN chmod +x /usr/local/bin/atom-rocm-runtime && \
-    atom-rocm-runtime patched && ldconfig
+RUN mkdir -p /staging/lib && \
+    if ! grep -Eq '^7\.2\.4([+-]|$)' /opt/rocm/.info/version; then \
+        echo "Keeping the stock runtime for this non-7.2.4 base image"; exit 0; \
+    fi && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        git cmake ninja-build g++ pkg-config \
+        libelf-dev libdrm-dev libnuma-dev libdw-dev xxd && \
+    pip install --no-cache-dir CppHeaderParser==2.7.4 ply==3.11 && \
+    git init -q /src && cd /src && \
+    git remote add origin "${ROCM_SYSTEMS_REPO}" && \
+    git config remote.origin.promisor true && \
+    git config remote.origin.partialclonefilter blob:none && \
+    git sparse-checkout init --cone && \
+    git sparse-checkout set projects/rocr-runtime projects/clr projects/hip shared cmake && \
+    git fetch --filter=blob:none --depth 1 origin "${ROCM_RUNTIME_COMMIT}" && \
+    git checkout -q FETCH_HEAD && \
+    mkdir -p /opt/rocm-cmake-shim && \
+    printf 'if(NOT TARGET clang)\n  add_executable(clang IMPORTED GLOBAL)\n  set_target_properties(clang PROPERTIES IMPORTED_LOCATION "/opt/rocm/llvm/bin/clang")\nendif()\nset(Clang_PACKAGE_VERSION "rocm-image-shim")\n' > /opt/rocm-cmake-shim/ClangConfig.cmake && \
+    printf 'if(NOT TARGET llvm-objcopy)\n  add_executable(llvm-objcopy IMPORTED GLOBAL)\n  set_target_properties(llvm-objcopy PROPERTIES IMPORTED_LOCATION "/opt/rocm/llvm/bin/llvm-objcopy")\nendif()\nset(LLVM_FOUND TRUE)\nset(LLVM_PACKAGE_VERSION "rocm-image-shim")\n' > /opt/rocm-cmake-shim/LLVMConfig.cmake && \
+    cmake -S /src/projects/rocr-runtime -B /src/build-rocr -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/rocm \
+        -DCMAKE_INSTALL_PREFIX=/opt/rocm \
+        -DClang_DIR=/opt/rocm-cmake-shim -DLLVM_DIR=/opt/rocm-cmake-shim && \
+    cmake --build /src/build-rocr --parallel 16 && \
+    cmake --install /src/build-rocr && \
+    cmake --install /src/build-rocr --prefix /rocr-install --strip && \
+    cmake -S /src/projects/clr -B /src/build-clr -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DCLR_BUILD_HIP=ON -DCLR_BUILD_OCL=OFF \
+        -DHIP_COMMON_DIR=/src/projects/hip -DROCM_PATH=/opt/rocm \
+        -DCMAKE_PREFIX_PATH=/opt/rocm -DCMAKE_INSTALL_PREFIX=/opt/rocm \
+        -DLLVM_DIR=/opt/rocm-cmake-shim -DHIP_LLVM_ROOT=/opt/rocm/llvm && \
+    cmake --build /src/build-clr --parallel 16 && \
+    cmake --install /src/build-clr --prefix /clr-install --strip && \
+    cp -P /rocr-install/lib/libhsa-runtime64.so* /staging/lib/ && \
+    cp -P /clr-install/lib/libamdhip64.so* /staging/lib/ && \
+    mkdir -p /staging/.info && \
+    git rev-parse HEAD > /staging/.info/atom-rocm-runtime-commit
 
 # --------------------------------------------------------------------
 # Stage 1: RCCL — parallel
@@ -594,10 +611,22 @@ RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
         echo "========== Skipped SemiAnalysis aiperf (INSTALL_SA_AIPERF=0) =========="; \
     fi
 
-# apt/pip layers in derived images can restore SDK files; reselect the pair
-# after all dependency installation (older external bases may lack the tool).
-RUN if command -v atom-rocm-runtime >/dev/null 2>&1; then \
-        atom-rocm-runtime patched && ldconfig; \
-    fi
+# Install the paired runtime after dependency installation. Preserve old image
+# tags for rollback; changing ROCM_RUNTIME_COMMIT selects a different backport.
+COPY --from=build_rocm_runtime /staging/ /opt/rocm/
+# Cover absolute paths to the old versioned filenames as well as SONAME lookups,
+# following vLLM's replacement method. ldconfig cannot redirect a hard link.
+RUN set -eux; \
+    if ! grep -Eq '^7\.2\.4([+-]|$)' /opt/rocm/.info/version; then exit 0; fi; \
+    cd /opt/rocm/lib; \
+    ours_hsa="$(readlink -f libhsa-runtime64.so.1)"; \
+    ours_hip="$(readlink -f libamdhip64.so.7)"; \
+    touch "$ours_hsa" "$ours_hip"; \
+    for f in libhsa-runtime64.so.1.* libamdhip64.so.7.*; do \
+        [ -f "$f" ] && [ ! -L "$f" ] || continue; \
+        case "$f" in libhsa*) ours="$ours_hsa";; *) ours="$ours_hip";; esac; \
+        [ "$f" -ef "$ours" ] || ln -f "$ours" "$f"; \
+    done; \
+    ldconfig
 
 CMD ["/bin/bash"]
