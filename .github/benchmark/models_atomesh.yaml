@@ -1,3 +1,13 @@
+# Manual-only paired expansion of these existing nightly cases. The matrix
+# derives 2P2D at 2C from each baseline, so workload settings cannot drift.
+agentic_scaling:
+  model: GLM-5.2-MXFP4
+  baseline_cases:
+    - glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c32
+    - glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c40
+    - glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c48
+    - glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c56
+
 defaults:
   runner:
     slurm_account: "${ATOMESH_SLURM_ACCOUNT}"

@@ -29,6 +29,10 @@ flock 9
 # Some CI images install Rust below /root, inaccessible to Spur's service UID.
 # Keep a pinned fallback toolchain in the writable build cache for those jobs.
 if ! cargo --version >/dev/null 2>&1; then
+  if [[ "${ATOMESH_PREINSTALLED_ONLY:-0}" == "1" ]]; then
+    echo "ERROR: the benchmark image must contain an accessible Rust toolchain; installing one is disabled" >&2
+    exit 1
+  fi
   export CARGO_HOME="${target_dir}/cargo-home"
   export RUSTUP_HOME="${target_dir}/rustup-home"
   export PATH="${CARGO_HOME}/bin:${PATH}"

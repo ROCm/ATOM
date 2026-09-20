@@ -129,6 +129,9 @@ PY
 }
 
 pre_cleanup_local() {
+  # Scaling jobs use exclusive allocations and clean up only their own named
+  # containers. Do not stop unrelated work through this legacy cleanup path.
+  [[ "${ATOMESH_PREINSTALLED_ONLY:-0}" != "1" ]] || return 0
   echo "=== pre-cleanup: stop running containers on $(hostname) ==="
   set +e
   running=()
@@ -479,6 +482,7 @@ SELECTED_NODES=("${ALLOC_NODES[@]:0:${NUM_NODES}}")
 SELECTED_NODELIST="$(IFS=,; echo "${SELECTED_NODES[*]}")"
 
 pre_cleanup_nodes() {
+  [[ "${ATOMESH_PREINSTALLED_ONLY:-0}" != "1" ]] || return 0
   echo "=== pre-cleanup: stop all running containers ==="
   for node in "${SELECTED_NODES[@]}"; do
     echo "[pre-cleanup] node=${node}"
