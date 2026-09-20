@@ -11,10 +11,147 @@ SLURM_LOG_POLL_INTERVAL="${SLURM_LOG_POLL_INTERVAL:-30}"
 USES_SPUR_CONTROLLER="${USES_SPUR_CONTROLLER:-0}"
 SPUR_CONTROLLER_ADDR="${SPUR_CONTROLLER_ADDR:-}"
 SPUR_ACCOUNTING_ADDR="${SPUR_ACCOUNTING_ADDR:-}"
+# EX_TEMPFAIL describes an unknown scheduler outcome, not a failed batch job.
+SLURM_STATUS_UNAVAILABLE_RC=75
+
+detect_slurm_backend() {
+  local help
+  if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
+    return 0
+  fi
+  # Runner labels and inherited Spur addresses also exist on native Slurm
+  # runners. Inspect the installed client before adding Spur-only arguments.
+  help="$(run_slurm_query scontrol --help 2>&1 || true)"
+  if [[ "${help}" == *Spur* ]]; then
+    USES_SPUR_CONTROLLER=1
+  fi
+}
+
+run_slurm_query() {
+  # Leave stderr visible, including unsupported arguments and transport errors.
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${SLURM_QUERY_TIMEOUT_SECONDS:-20}" "$@"
+  else
+    "$@"
+  fi
+}
+
+slurm_node_selection_args() {
+  local candidates="$1" count="$2" all_nodes excluded
+  local -a candidate_nodes
+  SLURM_NODE_SELECTION_ARGS=()
+  [[ -n "${candidates}" ]] || return 0
+  IFS=',' read -r -a candidate_nodes <<< "${candidates}"
+  if [[ "${USES_SPUR_CONTROLLER}" == "1" || "${#candidate_nodes[@]}" -le "${count}" ]]; then
+    SLURM_NODE_SELECTION_ARGS=(-w "${candidates}")
+    return 0
+  fi
+  # Native Slurm requires every host in -w. Exclude the complement
+  # instead, so the scheduler can choose only the requested number of nodes.
+  if ! all_nodes="$(run_slurm_query sinfo -N -h -o '%N')" || [[ -z "${all_nodes}" ]]; then
+    echo "ERROR: Cannot query cluster nodes to restrict the candidate pool." >&2
+    return 1
+  fi
+  excluded="$(python3 - "${candidates}" "${count}" "${all_nodes}" <<'PY'
+import sys
+
+candidates = set(sys.argv[1].split(","))
+cluster = set(sys.argv[3].split())
+missing = candidates - cluster
+if missing:
+    raise SystemExit("Unknown candidate nodes: " + ",".join(sorted(missing)))
+if len(candidates) < int(sys.argv[2]):
+    raise SystemExit("Not enough distinct candidate nodes")
+print(",".join(sorted(cluster - candidates)))
+PY
+  )" || return 1
+  if [[ -n "${excluded}" ]]; then
+    SLURM_NODE_SELECTION_ARGS=(--exclude "${excluded}")
+  fi
+}
+
+slurm_state_is_terminal() {
+  case "${1%%+*}" in
+    COMPLETE|COMPLETED|FAILED|CANCELLED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|PREEMPTED|BOOT_FAIL|DEADLINE)
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+slurm_state_is_active() {
+  case "${1%%+*}" in
+    PENDING|RUNNING|COMPLETING|SUSPENDED|CONFIGURING|RESIZING|REQUEUED|REQUEUE_FED|REQUEUE_HOLD|RESV_DEL_HOLD|SIGNALING|STAGE_OUT|STOPPED)
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+query_slurm_controller_job() {
+  local job_id="$1" output
+  local -a cmd=(scontrol)
+  if [[ "${USES_SPUR_CONTROLLER}" == "1" && -n "${SPUR_CONTROLLER_ADDR}" ]]; then
+    cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
+  fi
+  if ! output="$(run_slurm_query "${cmd[@]}" show job "${job_id}")"; then
+    echo "ERROR: scontrol query failed for job ${job_id}" >&2
+    return 2
+  fi
+  awk -v id="${job_id}" '
+    /JobId=/ { selected = 0 }
+    {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "JobId=" id) selected = 1
+        if (selected && $i ~ /^JobState=/) { split($i, a, "="); state = a[2] }
+        if (selected && $i ~ /^ExitCode=/) { split($i, a, "="); code = a[2] }
+      }
+    }
+    END { if (state != "") print state "|" code }
+  ' <<< "${output}"
+}
+
+query_slurm_accounting_job() {
+  local job_id="$1" output
+  local -a cmd=(sacct)
+  if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
+    if [[ -n "${SPUR_CONTROLLER_ADDR}" ]]; then
+      cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
+    fi
+    # Spur serves accounting on the controller port. Avoid native-only -X/-P
+    # and fixed-width --brief output, which truncates CANCELLED to CANCELLE.
+    cmd+=(-j "${job_id}" --noheader --format 'JobID%30,State%30,ExitCode%20')
+    if [[ -n "${SLURM_ACCOUNT:-}" ]]; then
+      cmd+=(--account "${SLURM_ACCOUNT}")
+    fi
+  else
+    cmd+=(-j "${job_id}" -X -n -P -o JobIDRaw,State,ExitCode)
+  fi
+  if ! output="$(run_slurm_query "${cmd[@]}")"; then
+    echo "ERROR: sacct query failed for job ${job_id}" >&2
+    return 2
+  fi
+  if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
+    output="$(awk -v id="${job_id}" '$1 == id { print $1 "|" $2 "|" $3; exit }' <<< "${output}")"
+  fi
+  # Some Spur versions ignore -j. Always select the exact job ourselves.
+  awk -F'|' -v id="${job_id}" '
+    { for (i = 1; i <= 3; i++) gsub(/^[[:space:]]+|[[:space:]]+$/, "", $i) }
+    $1 == id { split($2, state, " "); print state[1] "|" $3; exit }
+  ' <<< "${output}"
+}
+
+query_slurm_result() {
+  local job_id="$1" result
+  if result="$(query_slurm_controller_job "${job_id}")" && [[ -n "${result}" ]]; then
+    # Live PENDING/RUNNING/COMPLETING takes precedence over accounting.
+    printf '%s\n' "${result}"
+    return 0
+  fi
+  query_slurm_accounting_job "${job_id}"
+}
 
 run_scancel() {
   local -a scancel_cmd=(scancel)
-  if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
+  if [[ "${USES_SPUR_CONTROLLER}" == "1" && -n "${SPUR_CONTROLLER_ADDR}" ]]; then
     scancel_cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
   fi
   scancel_cmd+=("$@")
@@ -40,11 +177,11 @@ query_slurm_job() {
   local -a squeue_cmd=(squeue)
   local output
 
-  if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
+  if [[ "${USES_SPUR_CONTROLLER}" == "1" && -n "${SPUR_CONTROLLER_ADDR}" ]]; then
     squeue_cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
   fi
 
-  if ! output="$("${squeue_cmd[@]}" --noheader --format="%A|%T|%M|%D|%R" 2>&1)"; then
+  if ! output="$(run_slurm_query "${squeue_cmd[@]}" --noheader --format="%A|%T|%M|%D|%R")"; then
     echo "ERROR: unable to query Slurm job ${job_id}: ${output}" >&2
     return 2
   fi
@@ -160,7 +297,12 @@ on_slurm_cancel() {
 
 on_slurm_exit() {
   local rc=$?
-  if [[ "${rc}" -ne 0 && "${SLURM_JOB_ACTIVE}" == "1" ]]; then
+  if [[ "${rc}" -eq "${SLURM_STATUS_UNAVAILABLE_RC}" && "${SLURM_STATE:-unknown}" == "unknown" ]]; then
+    echo "WARNING: scheduler status is unavailable; preserving job ${JOB_ID:-unknown} for later inspection" >&2
+    if [[ -n "${SLURM_CANCEL_HELPER:-}" ]]; then
+      printf '%s\n' "${JOB_ID:-unknown}" > "${SLURM_CANCEL_HELPER}.status-unknown"
+    fi
+  elif [[ "${rc}" -ne 0 && "${SLURM_JOB_ACTIVE}" == "1" ]]; then
     scancel_slurm_job "exiting rc=${rc}"
   fi
 }
@@ -186,6 +328,9 @@ write_slurm_cancel_helper() {
   local helper="${SLURM_CANCEL_HELPER:?SLURM_CANCEL_HELPER must be set}"
 
   mkdir -p "$(dirname "${helper}")"
+  # The wrapper uses this marker to distinguish monitoring failure from a real
+  # batch exit code of 75. Reset it when submitting a new job with this helper.
+  : > "${helper}.status-unknown"
   {
     cat <<'EOF'
 #!/usr/bin/env bash
@@ -201,7 +346,7 @@ EOF
 run_scancel() {
   command -v scancel >/dev/null 2>&1 || return 0
   local -a cmd=(scancel)
-  if [[ "${uses_spur}" == "1" ]]; then
+  if [[ "${uses_spur}" == "1" && -n "${controller}" ]]; then
     cmd+=(--controller "${controller}")
   fi
   cmd+=("$@")
@@ -217,7 +362,7 @@ job_id_in_queue() {
   command -v squeue >/dev/null 2>&1 || return 1
   local -a cmd=(squeue)
   local output
-  if [[ "${uses_spur}" == "1" ]]; then
+  if [[ "${uses_spur}" == "1" && -n "${controller}" ]]; then
     cmd+=(--controller "${controller}")
   fi
   if ! output="$("${cmd[@]}" --noheader --format="%A" 2>&1)"; then
@@ -282,125 +427,113 @@ stream_slurm_logs_once() {
 
 monitor_slurm_job() {
   local job_id="$1"
-  local job_line query_rc query_failures=0
-  local job_seen=0 initial_empty_queries=0
-  local current_job_id state elapsed nodes reason
+  local job_line result state current_job_id elapsed nodes reason
+  local missing_queries=0 unknown_since=0 now
+  SLURM_CONFIRMED_RESULT=""
   OUT_LINE=0
   ERR_LINE=0
 
   echo "=== monitoring Slurm job ${job_id} ==="
   while true; do
-    if job_line="$(query_slurm_job "${job_id}")"; then
-      query_failures=0
-      if [[ -z "${job_line}" ]]; then
-        if [[ "${job_seen}" -eq 1 ]]; then
-          break
-        fi
-        initial_empty_queries=$((initial_empty_queries + 1))
-        if [[ "${initial_empty_queries}" -ge "${SLURM_SQUEUE_INITIAL_ATTEMPTS:-6}" ]]; then
-          echo "WARNING: Slurm job ${job_id} did not appear in squeue" >&2
-          break
-        fi
-        sleep "${SLURM_SQUEUE_RETRY_INTERVAL:-5}"
-        continue
-      fi
-      job_seen=1
+    state=""
+    result=""
+    missing_queries=$((missing_queries + 1))
+    if job_line="$(query_slurm_job "${job_id}")" && [[ -n "${job_line}" ]]; then
+      IFS='|' read -r current_job_id state elapsed nodes reason <<< "${job_line}"
+      echo "[slurm] job=${current_job_id} state=${state} elapsed=${elapsed} nodes=${nodes} reason=${reason}"
     else
-      query_rc=$?
-      query_failures=$((query_failures + 1))
-      if [[ "${query_failures}" -ge "${SLURM_SQUEUE_MAX_FAILURES:-3}" ]]; then
-        echo "ERROR: failed to query Slurm job ${job_id} ${query_failures} consecutive times" >&2
-        return "${query_rc}"
+      echo "WARNING: job ${job_id} absent from queue or queue query failed (${missing_queries}); verifying controller/accounting" >&2
+      if result="$(query_slurm_result "${job_id}")" && [[ -n "${result}" ]]; then
+        state="${result%%|*}"
+        echo "[slurm] job=${job_id} verified_state=${state}"
       fi
-      sleep "${SLURM_SQUEUE_RETRY_INTERVAL:-5}"
-      continue
     fi
 
-    IFS='|' read -r current_job_id state elapsed nodes reason <<< "${job_line}"
-    echo "[slurm] job=${current_job_id} state=${state} elapsed=${elapsed} nodes=${nodes} reason=${reason}"
     stream_slurm_logs_once
     if [[ -n "${SLURM_EXTRA_LOG_STREAMER:-}" ]]; then
       "${SLURM_EXTRA_LOG_STREAMER}" "${job_id}"
     fi
-    sleep "${SLURM_LOG_POLL_INTERVAL}"
-  done
 
-  stream_slurm_logs_once
-  if [[ -n "${SLURM_EXTRA_LOG_STREAMER:-}" ]]; then
-    "${SLURM_EXTRA_LOG_STREAMER}" "${job_id}"
-  fi
+    if slurm_state_is_terminal "${state}"; then
+      # A missing queue entry alone is never evidence of completion.
+      SLURM_CONFIRMED_RESULT="${result}"
+      return 0
+    elif slurm_state_is_active "${state}"; then
+      # Includes PENDING, RUNNING, COMPLETING, SUSPENDED and requeue states.
+      unknown_since=0
+      missing_queries=0
+    else
+      now="$(date +%s)"
+      if [[ "${unknown_since}" -eq 0 ]]; then
+        unknown_since="${now}"
+      fi
+      if [[ "${missing_queries}" -ge "${SLURM_SQUEUE_INITIAL_ATTEMPTS:-6}" &&
+            $((now - unknown_since)) -ge "${SLURM_STATUS_UNKNOWN_TIMEOUT:-300}" ]]; then
+        # Published batch/rank results can outlive the controller's job record.
+        SLURM_STATE=unknown
+        SLURM_EXIT_CODE=unknown
+        SLURM_JOB_RC="${SLURM_STATUS_UNAVAILABLE_RC}"
+        if [[ -n "${SLURM_STATUS_DIR:-}" ]]; then
+          read_slurm_status_files "${SLURM_STATUS_DIR}" "${SLURM_STATUS_RANKS:-1}"
+          if slurm_state_is_terminal "${SLURM_STATE}"; then
+            SLURM_CONFIRMED_RESULT="${SLURM_STATE}|${SLURM_EXIT_CODE}"
+            return 0
+          fi
+        fi
+        echo "ERROR: unable to determine state of Slurm job ${job_id}; monitoring failed, job execution outcome is unknown. Job has NOT been cancelled. Logs: ${SLURM_JOB_OUTPUT}" >&2
+        return "${SLURM_STATUS_UNAVAILABLE_RC}"
+      fi
+    fi
+
+    if [[ "${missing_queries}" -gt 0 ]]; then
+      sleep "${SLURM_SQUEUE_RETRY_INTERVAL:-5}"
+    else
+      sleep "${SLURM_LOG_POLL_INTERVAL}"
+    fi
+  done
 }
 
 read_slurm_exit_code() {
   local job_id="$1"
-  local sacct_line exit_status exit_signal deadline
-  local state=""
+  local result exit_status exit_signal deadline state=""
+  SLURM_STATE=unknown
+  SLURM_EXIT_CODE=unknown
+  SLURM_JOB_RC="${SLURM_STATUS_UNAVAILABLE_RC}"
+  deadline=$(( $(date +%s) + ${SLURM_ACCOUNTING_TIMEOUT:-30} ))
 
-  SLURM_STATE="unknown"
-  SLURM_EXIT_CODE="unknown"
-  SLURM_JOB_RC=2
-
-  SLURM_ACCOUNTING_TIMEOUT="${SLURM_ACCOUNTING_TIMEOUT:-30}"
-  SLURM_ACCOUNTING_POLL_INTERVAL="${SLURM_ACCOUNTING_POLL_INTERVAL:-2}"
-
-  if ! command -v sacct >/dev/null 2>&1; then
-    echo "WARNING: sacct not found; unable to read Slurm job exit code" >&2
-    return 0
-  fi
-
-  deadline=$(( $(date +%s) + SLURM_ACCOUNTING_TIMEOUT ))
   while true; do
-    if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
-      if [[ -n "${SLURM_ACCOUNT:-}" ]]; then
-        sacct_line="$(sacct --account "${SLURM_ACCOUNT}" --brief --noheader 2>/dev/null | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }' || true)"
-      elif [[ -n "${SPUR_ACCOUNTING_ADDR:-}" ]]; then
-        sacct_line="$(sacct --accounting "${SPUR_ACCOUNTING_ADDR}" --brief --noheader 2>/dev/null | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }' || true)"
-      else
-        sacct_line="$(sacct -j "${job_id}" -X -n -P -o State,ExitCode 2>/dev/null | awk -F'|' 'NF { print; exit }' || true)"
-      fi
-    else
-      sacct_line="$(sacct -j "${job_id}" -X -n -P -o State,ExitCode 2>/dev/null | awk -F'|' 'NF { print; exit }' || true)"
+    result="${SLURM_CONFIRMED_RESULT:-}"
+    if [[ -z "${result}" ]]; then
+      result="$(query_slurm_result "${job_id}")" || result=""
     fi
-    if [[ -n "${sacct_line}" ]]; then
-      state="${sacct_line%%|*}"
-      state="${state%%+*}"
-      case "${state}" in
-        COMPLETE|COMPLETED|FAILED|CANCELLED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|PREEMPTED|BOOT_FAIL|DEADLINE)
-          break
-          ;;
-      esac
+    state="${result%%|*}"
+    state="${state%%+*}"
+    if slurm_state_is_terminal "${state}" && [[ "${result##*|}" =~ ^-?[0-9]+:[0-9]+$ ]]; then
+      break
     fi
-
     if [[ "$(date +%s)" -ge "${deadline}" ]]; then
-      if [[ -z "${sacct_line}" ]]; then
-        echo "ERROR: unable to read final Slurm state for job ${job_id} after ${SLURM_ACCOUNTING_TIMEOUT}s" >&2
-        return 0
-      fi
-      # COMPLETING (and similar) is not a final state on Spur; let callers
-      # fall back to rank-rc / batch-script status instead of treating 0:0 as fail.
-      echo "WARNING: Slurm job ${job_id} still in ${state:-unknown} after ${SLURM_ACCOUNTING_TIMEOUT}s; treating accounting as unavailable" >&2
-      SLURM_STATE="unknown"
-      SLURM_EXIT_CODE="unknown"
-      SLURM_JOB_RC=2
+      echo "ERROR: unable to read final Slurm state/exit code for job ${job_id}; last state=${state:-unknown}. This is a status query failure, not a batch failure." >&2
       return 0
     fi
-    sleep "${SLURM_ACCOUNTING_POLL_INTERVAL}"
+    # A terminal state without an exit code can be completed by accounting.
+    SLURM_CONFIRMED_RESULT=""
+    if slurm_state_is_terminal "${state}"; then
+      SLURM_CONFIRMED_RESULT="$(query_slurm_accounting_job "${job_id}")" || SLURM_CONFIRMED_RESULT=""
+    fi
+    sleep "${SLURM_ACCOUNTING_POLL_INTERVAL:-2}"
   done
 
-  SLURM_STATE="${sacct_line%%|*}"
-  SLURM_STATE="${SLURM_STATE%%+*}"
-  SLURM_EXIT_CODE="${sacct_line##*|}"
+  SLURM_STATE="${state}"
+  SLURM_EXIT_CODE="${result##*|}"
   exit_status="${SLURM_EXIT_CODE%%:*}"
   exit_signal="${SLURM_EXIT_CODE##*:}"
-
   if ! [[ "${exit_status}" =~ ^[0-9]+$ ]]; then
     SLURM_JOB_RC=1
-  elif [[ "${exit_signal}" =~ ^[0-9]+$ && "${exit_status}" -eq 0 && "${exit_signal}" -ne 0 ]]; then
+  elif [[ "${exit_status}" -eq 0 && "${exit_signal}" -ne 0 ]]; then
     SLURM_JOB_RC=$((128 + exit_signal))
   else
     SLURM_JOB_RC="${exit_status}"
   fi
-
   if [[ "${SLURM_STATE}" != COMPLETE && "${SLURM_STATE}" != COMPLETED && "${SLURM_JOB_RC}" -eq 0 ]]; then
     SLURM_JOB_RC=1
   fi

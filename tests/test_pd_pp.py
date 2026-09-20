@@ -3,6 +3,7 @@
 
 import logging
 import os
+import subprocess
 import sys
 import threading
 import types
@@ -341,6 +342,127 @@ def test_mismatched_or_missing_block_size_forces_full_transfer(
 # ---------------------------------------------------------------------------
 # Mooncake transport selection
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
+@pytest.mark.parametrize(
+    "protocol,configured_device,expected_device",
+    [
+        ("rdma", "", "rdma2"),
+        ("rdma", "ionic_4,ionic_0", "ionic_4,ionic_0"),
+        ("tcp", "rdma2", ""),
+    ],
+)
+def test_mooncake_control_address_is_independent_of_rdma_device(
+    monkeypatch, role, protocol, configured_device, expected_device
+):
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    host_ip = "10.19.0.140"
+    monkeypatch.setenv("ATOM_HOST_IP", host_ip)
+    monkeypatch.delenv("ATOM_MOONCAKE_IB_DEVICE", raising=False)
+    monkeypatch.delenv("MC_FORCE_TCP", raising=False)
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "2,3")
+    monkeypatch.setattr(mc.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(mc, "_ib_device_exists", lambda name: True)
+    monkeypatch.setattr(
+        mc, "get_tp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=8)
+    )
+    monkeypatch.setattr(
+        mc, "get_dp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=1)
+    )
+
+    # Reproduce a host with a separate RoCE network. The old constructor
+    # replaced ATOM_HOST_IP with this HCA address, breaking TCP handshakes.
+    original_listdir = os.listdir
+    monkeypatch.setattr(
+        os,
+        "listdir",
+        lambda path: (
+            ["tw-eth2"]
+            if str(path).startswith("/sys/class/infiniband/")
+            else original_listdir(path)
+        ),
+    )
+    original_check_output = subprocess.check_output
+    monkeypatch.setattr(
+        subprocess,
+        "check_output",
+        lambda cmd, **kwargs: (
+            "2: tw-eth2 inet 10.103.40.121/31 scope global tw-eth2\n"
+            if cmd[:4] == ["ip", "-o", "-4", "addr"]
+            else original_check_output(cmd, **kwargs)
+        ),
+    )
+
+    engine = MagicMock()
+    engine.initialize.return_value = 0
+    engine.get_rpc_port.return_value = 16578
+    monkeypatch.setattr(mc, "_MOONCAKE_AVAILABLE", True)
+    monkeypatch.setattr(mc, "TransferEngine", lambda: engine, raising=False)
+    monkeypatch.setattr(mc, "get_open_port", lambda: 41000)
+    monkeypatch.setattr(mc.zmq, "Context", MagicMock())
+    monkeypatch.setattr(mc, "ThreadPoolExecutor", MagicMock())
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(pipeline_parallel_rank=0),
+        pipeline_parallel_size=1,
+        hf_config=SimpleNamespace(num_hidden_layers=2),
+        kv_cache_block_size=16,
+        decode_context_parallel_size=1,
+        dcp_config=SimpleNamespace(interleave_size=1),
+        kv_transfer_config={
+            "kv_role": role,
+            "protocol": protocol,
+            "ib_device": configured_device,
+        },
+    )
+    conn = mc.MooncakeConnector(config)
+
+    engine.initialize.assert_called_once_with(
+        host_ip, "P2PHANDSHAKE", protocol, expected_device
+    )
+    assert conn.engine_id == f"{host_ip}:16578"
+    assert conn.request_address == f"{host_ip}:8000"
+    assert conn.ib_devices == (expected_device.split(",") if expected_device else [])
+
+    if role == "kv_consumer":
+        # This test exercises the wire payload without registering GPU memory.
+        # Model the listener's successful bind, which register_kv_caches waits
+        # for before production can call start_load_kv. The notification port
+        # now comes from the bound socket, not a speculative get_open_port().
+        with pytest.raises(
+            RuntimeError, match="notification listener is not bound yet"
+        ):
+            _ = conn.notification_port
+        conn._notification_port = 42000
+        conn._publish_listener_state()
+        conn._await_listener(timeout=0)
+        # Check the actual wire payload used for the RDMA target and ZMQ
+        # write-done notification, not only the engine's bootstrap address.
+        conn._send_on_socket = MagicMock()
+        meta = ConnectorMetadata._build_req_meta(
+            req_id="r0",
+            local_block_ids=[0],
+            kv_transfer_params={
+                "remote_block_ids": [1],
+                "remote_host": "10.19.0.113",
+                "remote_handshake_port": 6301,
+                "tp_size": 8,
+                "transfer_id": 9,
+            },
+        )
+        conn.start_load_kv(
+            SimpleNamespace(
+                request_id_to_transfer_id={"r0": 9}, reqs_to_recv={"r0": meta}
+            )
+        )
+        addr, (_, payload) = conn._send_on_socket.call_args.args
+        request = mc.msgpack.loads(payload)
+        assert addr == "tcp://10.19.0.113:6301"
+        assert request["consumer_host"] == host_ip
+        assert request["consumer_rpc_port"] == 16578
+        assert request["notify_host"] == host_ip
+        assert request["notify_port"] == 42000
 
 
 def test_mooncake_tcp_disables_rdma_device_even_when_configured():

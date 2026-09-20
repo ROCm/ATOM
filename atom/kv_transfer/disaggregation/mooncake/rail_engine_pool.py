@@ -17,7 +17,8 @@ class RailEnginePool:
     Memory belongs to the connector and must outlive this pool. All engines
     register exactly the same MR ranges, but own separate lkeys and metadata.
     Additional engines are created once, under a lock, on the first request,
-    using the selected HCA's address from local_ip_for_device.
+    using the RPC address supplied by local_ip_for_device. Multiple rails can
+    share a reachable host address while retaining separate HCA filters.
     A failed rail stays failed until restart rather than retrying registration
     on every request or silently falling back to an unreachable rail.
     """
@@ -69,8 +70,8 @@ class RailEnginePool:
             registered = []
             started = time.monotonic()
             try:
-                # A matched rail can have a different RDMA-local address than
-                # the primary HCA. Resolve it before creating the engine.
+                # Resolve the control-plane RPC address independently of the
+                # HCA filter used for RDMA transfers.
                 local_ip = self._local_ip_for_device(device)
                 if not isinstance(local_ip, str) or not local_ip:
                     raise ValueError(f"No local address resolved for rail {device}")
