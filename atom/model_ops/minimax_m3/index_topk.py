@@ -297,9 +297,7 @@ def index_score_config(cp_world=1, cp_rank=0):
     and the score call identically -- they re-derive the same per-request local
     block count from it -- so it is built here rather than at each site.
     """
-    return MiniMaxM3IndexScoreConfig(
-        shuffled=False, cp_world=cp_world, cp_rank=cp_rank
-    )
+    return MiniMaxM3IndexScoreConfig(shuffled=False, cp_world=cp_world, cp_rank=cp_rank)
 
 
 def build_index_score_work_map(

@@ -299,6 +299,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 num_head_k * self.max_bs * max_qlen,
                 **i32_kwargs,
             )
+            from atom.distributed.indexer_cp import (
+                get_indexer_cp_rank,
+                get_indexer_cp_world_size,
+                indexer_cp_enabled,
+            )
+
             # The flydsl index-score kernel's dispatch map, same persistence
             # argument. Its row count is that kernel's grid, so the bound has to
             # be one that does not move between capture and replay -- the model
@@ -312,12 +318,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # ceil(blocks / world) of it and every bound below is that local one.
             # Resolved here rather than per step for the same reason the sparse
             # layer resolves it in __init__: no per-forward branch in the model.
-            from atom.distributed.indexer_cp import (
-                get_indexer_cp_rank,
-                get_indexer_cp_world_size,
-                indexer_cp_enabled,
-            )
-
             self._index_score_cp_world = 1
             self._index_score_cp_rank = 0
             if indexer_cp_enabled():

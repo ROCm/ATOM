@@ -96,9 +96,9 @@ def _local_topk(
         local_valid = off < LOCAL_BLOCKS
         block = off * WORLD + RANK
         valid = local_valid & (block < GLOBAL_BLOCKS) & (block < causal_blocks)
-        score = tl.load(
-            s_row + off * S_BLOCK, mask=local_valid, other=-1e30
-        ).to(tl.float32)
+        score = tl.load(s_row + off * S_BLOCK, mask=local_valid, other=-1e30).to(
+            tl.float32
+        )
         score = _force(score, block, valid, local_start, INIT_BLOCKS)
         tile = tl.topk(_pack_score_key(score, block + 1, valid), BLOCK_SIZE_T)
         winners = tl.topk(tl.cat(winners, tile, can_reorder=True), BLOCK_SIZE_T)

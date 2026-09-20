@@ -102,9 +102,7 @@ def indexer_context_scores(
         raise ValueError("all score inputs must be on the same GPU")
     local = triton.cdiv(blocks, world_size)
     if not tokens:
-        return torch.empty(
-            (heads, 0, local), dtype=torch.float32, device=idx_q.device
-        )
+        return torch.empty((heads, 0, local), dtype=torch.float32, device=idx_q.device)
     # A LOCAL bound, never the global `blocks`: under CP the kernel is given
     # this rank's own block count and stores at the compacted local index. It
     # must be the bound the map was built against -- a disagreement is caught
