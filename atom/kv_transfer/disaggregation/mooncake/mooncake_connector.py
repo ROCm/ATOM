@@ -13,7 +13,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -687,17 +686,16 @@ class MooncakeConnector(KVConnectorBase):
         )
 
         if matched_rails and self.is_producer:
+            # _resolve_matched_rails requires exactly one primary HCA.
+            primary_ib_device = ib_devices[0]
             self._rail_pool = RailEnginePool(
                 TransferEngine,
                 self.transfer_engine,
                 primary_ib_device,
                 matched_rails,
-                # This address is the P2P RPC endpoint, not the RDMA GID.
-                # IPv6-only rails may share a reachable host IPv4 for RPC;
-                # the engine's device filter still selects the matched HCA.
-                local_ip_for_device=lambda device: _ip_for_ib_device(
-                    device, default_local_ip
-                ),
+                # Every engine uses the reachable control address. Each
+                # engine's device filter independently selects its RDMA rail.
+                local_ip_for_device=lambda _device: self.local_ip,
             )
             logger.info(
                 "Mooncake matched rails enabled: primary=%s rails=%s",

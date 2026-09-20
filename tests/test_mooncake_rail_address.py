@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Exercise address fallback through the real Mooncake connector constructor."""
+"""Keep matched-rail control addresses independent of the selected HCA."""
 
 import subprocess
 from types import SimpleNamespace
@@ -9,18 +9,13 @@ import pytest
 
 
 @pytest.mark.parametrize(
-    "netdev_ip,gid_ip",
-    [
-        (None, None),
-        ("192.0.2.6", None),
-        (None, "192.0.2.6"),
-        # Several HCAs may legitimately resolve to the same host address.
-        ("192.0.2.2", None),
-    ],
-    ids=["no-rail-ipv4", "netdev", "gid", "shared-address"],
+    "netdev_ip",
+    [None, "192.0.2.6", "192.0.2.2"],
+    ids=["no-rail-ipv4", "separate-roce-address", "shared-address"],
 )
-def test_matched_rail_rpc_fallback_preserves_hca_selection(
-    monkeypatch, netdev_ip, gid_ip
+@pytest.mark.parametrize("primary_device", ["ionic_2", "ionic_6"])
+def test_matched_rail_rpc_uses_host_address_and_preserves_hca_selection(
+    monkeypatch, netdev_ip, primary_device
 ):
     from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
 
@@ -35,6 +30,8 @@ def test_matched_rail_rpc_fallback_preserves_hca_selection(
     monkeypatch.setattr(mc, "ThreadPoolExecutor", Mock())
     monkeypatch.setattr(mc.zmq, "Context", Mock())
     monkeypatch.setenv("ATOM_MOONCAKE_MATCHED_RAILS", "ionic_2,ionic_6")
+    monkeypatch.delenv("ATOM_MOONCAKE_IB_DEVICE", raising=False)
+    monkeypatch.delenv("MC_FORCE_TCP", raising=False)
 
     listdir = mc.os.listdir
 
@@ -63,12 +60,8 @@ def test_matched_rail_rpc_fallback_preserves_hca_selection(
             raise subprocess.CalledProcessError(1, args)
         return f"6: rail6 inet {netdev_ip}/24 scope global rail6\n"
 
-    monkeypatch.setattr(mc.subprocess, "check_output", read_address)
-    monkeypatch.setattr(
-        mc,
-        "_ip_for_ib_device_from_gid",
-        lambda device: gid_ip if device == "ionic_6" else None,
-    )
+    address_lookup = Mock(side_effect=read_address)
+    monkeypatch.setattr(subprocess, "check_output", address_lookup)
     engines = []
 
     def make_engine():
@@ -90,28 +83,30 @@ def test_matched_rail_rpc_fallback_preserves_hca_selection(
         kv_transfer_config={
             "kv_role": "kv_producer",
             "protocol": "rdma",
-            "ib_device": "ionic_2",
+            "ib_device": primary_device,
         },
     )
     connector = mc.MooncakeConnector(config)
     pool = connector._rail_pool
     pool.set_regions([1024], [64])
 
-    # The primary keeps its existing fallback and is reused by the pool.
+    # Reuse the configured primary, even when it is not first in the rail list.
     assert len(engines) == 1
     engines[0].initialize.assert_called_once_with(
-        "192.0.2.2", "P2PHANDSHAKE", "rdma", "ionic_2"
+        "192.0.2.2", "P2PHANDSHAKE", "rdma", primary_device
     )
-    assert pool.get("ionic_2") is engines[0]
+    assert pool.get(primary_device) is engines[0]
 
-    # A rail with only an IPv6 GID can share the reachable host IPv4
-    # for P2P RPC. The RDMA device filter must still be the selected rail.
-    extra = pool.get("ionic_6")
+    # RoCE addresses (or their absence) must not change the RPC endpoint.
+    # The RDMA device filter must still be the selected rail.
+    extra_device = "ionic_6" if primary_device == "ionic_2" else "ionic_2"
+    extra = pool.get(extra_device)
     extra.initialize.assert_called_once_with(
-        netdev_ip or gid_ip or "192.0.2.2", "P2PHANDSHAKE", "rdma", "ionic_6"
+        "192.0.2.2", "P2PHANDSHAKE", "rdma", extra_device
     )
     extra.register_memory.assert_called_once_with(1024, 64)
-    assert pool.get("ionic_6") is extra
+    assert pool.get(extra_device) is extra
     assert len(engines) == 2
     assert extra is not engines[0]
-    assert pool.get("ionic_2") is engines[0]
+    assert pool.get(primary_device) is engines[0]
+    address_lookup.assert_not_called()

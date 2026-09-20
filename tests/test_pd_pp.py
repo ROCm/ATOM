@@ -400,8 +400,7 @@ def test_mooncake_control_address_is_independent_of_rdma_device(
     engine.get_rpc_port.return_value = 16578
     monkeypatch.setattr(mc, "_MOONCAKE_AVAILABLE", True)
     monkeypatch.setattr(mc, "TransferEngine", lambda: engine, raising=False)
-    ports = iter([41000, 42000])
-    monkeypatch.setattr(mc, "get_open_port", lambda: next(ports))
+    monkeypatch.setattr(mc, "get_open_port", lambda: 41000)
     monkeypatch.setattr(mc.zmq, "Context", MagicMock())
     monkeypatch.setattr(mc, "ThreadPoolExecutor", MagicMock())
     config = SimpleNamespace(
@@ -427,6 +426,17 @@ def test_mooncake_control_address_is_independent_of_rdma_device(
     assert conn.ib_devices == (expected_device.split(",") if expected_device else [])
 
     if role == "kv_consumer":
+        # This test exercises the wire payload without registering GPU memory.
+        # Model the listener's successful bind, which register_kv_caches waits
+        # for before production can call start_load_kv. The notification port
+        # now comes from the bound socket, not a speculative get_open_port().
+        with pytest.raises(
+            RuntimeError, match="notification listener is not bound yet"
+        ):
+            _ = conn.notification_port
+        conn._notification_port = 42000
+        conn._publish_listener_state()
+        conn._await_listener(timeout=0)
         # Check the actual wire payload used for the RDMA target and ZMQ
         # write-done notification, not only the engine's bootstrap address.
         conn._send_on_socket = MagicMock()
