@@ -249,8 +249,8 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${ATOMESH_SCALING_RUN}" == "1" ]]; then
-            docker pull "${ATOMESH_PYTHON_IMAGE}"
             source .github/scripts/atomesh/image_python.sh
+            docker pull "${ATOMESH_PYTHON_IMAGE}"
           fi
           python3 - <<'PY'
           import json
@@ -500,6 +500,7 @@ jobs:
           ATOMESH_PYTHON_IMAGE: ${{ steps.image.outputs.image }}
         run: |
           set -euo pipefail
+          source .github/scripts/atomesh/image_python.sh
           mkdir -p atomesh-build-validation
           printf 'ATOMESH_PREINSTALLED_ONLY=1\nATOMESH_MESH_BUILD_PROFILE=release\nCARGO_BUILD_JOBS=8\n' > atomesh-build-validation/build.env
           ATOMESH_BUILD_MESH=true ATOMESH_PREINSTALLED_ONLY=1 \
