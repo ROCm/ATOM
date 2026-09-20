@@ -9,7 +9,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 SERVER_SCRIPT = (
     Path(__file__).resolve().parents[1] / ".github/scripts/atomesh/pd_server_atom.sh"
 )
@@ -39,6 +38,7 @@ class LMCacheDiskTest(unittest.TestCase):
             capture_output=True,
             text=True,
             timeout=10,
+            check=False,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
