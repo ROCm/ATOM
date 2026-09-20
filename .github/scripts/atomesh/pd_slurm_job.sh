@@ -66,6 +66,13 @@ publish_rank_rc() {
   mv "${rc_file}.tmp" "${rc_file}" 2>/dev/null || true
 }
 
+publish_workload_status() {
+  python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_job_result.py" publish \
+    --run-dir "${RUN_DIR}" --job-id "${JOB_ID}" \
+    --run-token "${ATOMESH_RUN_TOKEN:-}" --num-ranks "${NUM_NODES}" \
+    --rank "$1" --status "$2"
+}
+
 write_env_file() {
   local env_file="$1"
   python3 - <<'PY' > "${env_file}"
@@ -331,6 +338,7 @@ run_spur_job() {
     echo "ERROR: invalid Spur worker rank ${node_rank} for ${NUM_NODES} nodes" >&2
     return 2
   fi
+  publish_workload_status "${node_rank}" running
   local env_file="${RUN_DIR}/docker-rank-${node_rank}.env"
   local peers=()
   IFS=',' read -r -a peers <<< "${SPUR_PEER_NODES}"
@@ -424,6 +432,9 @@ EOF
 
   echo "=== Spur rank ${node_rank} completed ==="
   find "${RUN_DIR}" -maxdepth 3 -type f | sort
+  # Separate completed work from EXIT-trap/agent cleanup. An EXIT trap alone
+  # can publish rc=0 without proving that all requested phases were executed.
+  publish_workload_status "${node_rank}" completed
   return 0
 }
 

@@ -453,6 +453,8 @@ else
 fi
 
 echo "=== submitting Slurm job ==="
+# Bind completion evidence to this submission, including job-ID reuse.
+export ATOMESH_RUN_TOKEN="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
 printf ' %q' "${SBATCH_CMD[@]}"
 echo
 write_slurm_cancel_helper ""
@@ -486,6 +488,19 @@ SBATCH_RC="${SLURM_JOB_RC}"
 echo "slurm_state=${SLURM_STATE}"
 echo "slurm_exit_code=${SLURM_EXIT_CODE}"
 echo "slurm job exit code: ${SBATCH_RC}"
+
+# Preserve the raw scheduler result and reconcile only a fully completed Spur
+# workload. monitor_slurm_job above must still wait for scheduler termination.
+if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
+  set +e
+  python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_job_result.py" resolve \
+    --run-dir "${SLURM_STATUS_DIR}" --job-id "${JOB_ID}" \
+    --run-token "${ATOMESH_RUN_TOKEN}" --num-ranks "${NUM_NODES}" \
+    --scheduler-state "${SLURM_STATE}" --scheduler-exit-code "${SLURM_EXIT_CODE}" \
+    --scheduler-rc "${SLURM_JOB_RC}" --spur 1
+  SBATCH_RC=$?
+  set -e
+fi
 
 if [[ -d "${LOG_ROOT}" ]]; then
   mkdir -p "${RESULT_DIR}/${ATOMESH_CELL_ID}"

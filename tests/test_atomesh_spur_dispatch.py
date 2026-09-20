@@ -26,6 +26,7 @@ class SpurDispatchTest(unittest.TestCase):
         scripts.mkdir(parents=True)
         self.script = scripts / JOB_SCRIPT.name
         shutil.copyfile(JOB_SCRIPT, self.script)
+        shutil.copyfile(JOB_SCRIPT.with_name("pd_job_result.py"), scripts / "pd_job_result.py")
         (scripts / "setup_mesh.sh").write_text("echo /fake/atomesh\n")
         self.bin_dir = self.root / "bin"
         self.bin_dir.mkdir()
@@ -82,6 +83,9 @@ class SpurDispatchTest(unittest.TestCase):
                 stream.write(json.dumps(sys.argv[1:]) + "\\n")
             if sys.argv[1] == "run" and rank == os.environ.get("FAIL_RANK"):
                 sys.exit(7)
+            phase = os.environ.get("FAIL_PHASE")
+            if sys.argv[1] == "run" and phase and f"ATOMESH_EXECUTION_PHASE={phase}" in sys.argv:
+                sys.exit(8)
             """,
         )
         self.env = {
@@ -91,6 +95,7 @@ class SpurDispatchTest(unittest.TestCase):
             "LOG_ROOT": str(self.root / "logs"),
             "SLURM_JOB_ID": "42",
             "SPUR_JOB_ID": "42",
+            "ATOMESH_RUN_TOKEN": "test-submission",
             "SPUR_TASK_OFFSET": "0",
             "SPUR_PEER_NODES": "10.19.0.1:6818,10.19.0.2:6818",
             "SPUR_NODELIST": "prefill-node,decode-node",
@@ -148,6 +153,9 @@ class SpurDispatchTest(unittest.TestCase):
             self.assertIn(f"MORI_SOCKET_IFNAME={interface}", runs[0])
             self.assertIn(["rm", "-f", f"atomesh-test-cell-42-{rank}"], calls)
             self.assertEqual((self.run_dir / f"rank-rc-{rank}").read_text(), "0\n")
+            result = json.loads((self.run_dir / f"rank-workload-{rank}.json").read_text())
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["run_token"], "test-submission")
 
     def test_worker_does_not_dispatch_again(self):
         self.run_job("--spur-worker", SPUR_TASK_OFFSET="1")
@@ -158,6 +166,8 @@ class SpurDispatchTest(unittest.TestCase):
     def test_decode_failure_reaches_batch_exit_and_rank_status(self):
         self.run_job(expected_rc=7, FAIL_RANK="1")
         self.assertEqual((self.run_dir / "rank-rc-1").read_text(), "7\n")
+        result = json.loads((self.run_dir / "rank-workload-1.json").read_text())
+        self.assertEqual(result["status"], "running")
         self.assertIn(["rm", "-f", "atomesh-test-cell-42-1"], self.docker_calls(1))
 
     def test_dispatch_failure_is_not_reported_as_success(self):
@@ -231,6 +241,18 @@ class SpurDispatchTest(unittest.TestCase):
             interface = "eno0" if rank == 0 else "enp5s0"
             for run in runs:
                 self.assertIn(f"MORI_SOCKET_IFNAME={interface}", run)
+
+    def test_eval_failure_after_benchmark_does_not_publish_completion(self):
+        self.run_job(
+            BENCHMARK_KIND="aiperf_agentic", RUN_EVAL="true", EVAL_TASK="gsm8k",
+            FAIL_PHASE="eval", expected_rc=8,
+        )
+        for rank in range(2):
+            runs = [call for call in self.docker_calls(rank) if call[0] == "run"]
+            self.assertEqual(len(runs), 2)
+            result = json.loads((self.run_dir / f"rank-workload-{rank}.json").read_text())
+            self.assertEqual(result["status"], "running")
+            self.assertEqual((self.run_dir / f"rank-rc-{rank}").read_text(), "8\n")
 
 
 if __name__ == "__main__":
