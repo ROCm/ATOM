@@ -378,15 +378,15 @@ models:
               LMCACHE_LOCAL_CPU: "True"
               LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
               LMCACHE_CHUNK_SIZE: "256"
-              # Disk (L3) tier under the CPU hot cache. Both variables are
-              # required together; LMCACHE_MAX_LOCAL_CPU_SIZE must stay > 0
+              # Disk/NVMe (L3) tier is disabled by default. To enable it, uncomment
+              # both variables below; LMCACHE_MAX_LOCAL_CPU_SIZE must stay > 0
               # because LocalDiskBackend stages through the host allocator.
               # scale_cpu_size_for_pp splits only the CPU budget across PP
               # stages, so this size is per rank: 4 x 500GiB on a pp4 prefill.
               # pd_server_atom.sh empties the directory around the run.
               # Relative to this job's runtime log directory, under rank-N.
-              LMCACHE_LOCAL_DISK: "./lmcache-job"
-              LMCACHE_MAX_LOCAL_DISK_SIZE: "500"
+              # LMCACHE_LOCAL_DISK: "./lmcache-job"
+              # LMCACHE_MAX_LOCAL_DISK_SIZE: "500"
               OFFLOAD_PROFILE: "1"
               OFFLOAD_MIN_LOAD_TOKENS: "0"
               PREFILL_KV_TRANSFER_CONFIG: >-
