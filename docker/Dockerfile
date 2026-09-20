@@ -344,7 +344,7 @@ RUN mkdir -p /staging/lib && \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/rocm \
         -DCMAKE_INSTALL_PREFIX=/opt/rocm \
         -DClang_DIR=/opt/rocm-cmake-shim -DLLVM_DIR=/opt/rocm-cmake-shim && \
-    cmake --build /src/build-rocr --parallel 16 && \
+    cmake --build /src/build-rocr --parallel ${MAX_JOBS:-$(nproc)} && \
     cmake --install /src/build-rocr && \
     cmake --install /src/build-rocr --prefix /rocr-install --strip && \
     cmake -S /src/projects/clr -B /src/build-clr -G Ninja \
@@ -352,12 +352,20 @@ RUN mkdir -p /staging/lib && \
         -DHIP_COMMON_DIR=/src/projects/hip -DROCM_PATH=/opt/rocm \
         -DCMAKE_PREFIX_PATH=/opt/rocm -DCMAKE_INSTALL_PREFIX=/opt/rocm \
         -DLLVM_DIR=/opt/rocm-cmake-shim -DHIP_LLVM_ROOT=/opt/rocm/llvm && \
-    cmake --build /src/build-clr --parallel 16 && \
+    cmake --build /src/build-clr --parallel ${MAX_JOBS:-$(nproc)} && \
     cmake --install /src/build-clr --prefix /clr-install --strip && \
     cp -P /rocr-install/lib/libhsa-runtime64.so* /staging/lib/ && \
     cp -P /clr-install/lib/libamdhip64.so* /staging/lib/ && \
     mkdir -p /staging/.info && \
-    git rev-parse HEAD > /staging/.info/atom-rocm-runtime-commit
+    git rev-parse HEAD > /staging/.info/atom-rocm-runtime-commit && \
+    # Record the sonames this commit actually produced. The install step must
+    # not assume .so.1/.so.7: if a future ROCM_RUNTIME_COMMIT bumps a major the
+    # cp above succeeds under the new name while a hardcoded readlink resolves
+    # to the still-present stock symlink, and the fixup then hard-links stock
+    # onto stock and reports success.
+    ( cd /staging/lib && ls -1 libhsa-runtime64.so.* libamdhip64.so.* \
+        | grep -E '\.so\.[0-9]+$' ) > /staging/.info/atom-rocm-runtime-sonames && \
+    test -s /staging/.info/atom-rocm-runtime-sonames
 
 # --------------------------------------------------------------------
 # Stage 1: RCCL — parallel
@@ -614,19 +622,38 @@ RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
 # Install the paired runtime after dependency installation. Preserve old image
 # tags for rollback; changing ROCM_RUNTIME_COMMIT selects a different backport.
 COPY --from=build_rocm_runtime /staging/ /opt/rocm/
-# Cover absolute paths to the old versioned filenames as well as SONAME lookups,
-# following vLLM's replacement method. ldconfig cannot redirect a hard link.
+# Hard links rather than symlinks: ldconfig rewrites SONAME symlinks but cannot
+# re-point an inode, so absolute-path loads of the old versioned filenames have
+# to land on the new inode. This is upstream vLLM's replacement method.
 RUN set -eux; \
     if ! grep -Eq '^7\.2\.4([+-]|$)' /opt/rocm/.info/version; then exit 0; fi; \
+    # The builder ran for this flavor, so its outputs have to be here. Failing
+    # closed is the point: publishing an image that silently carries the stock
+    # runtime is the failure this stage exists to prevent.
+    test -s /opt/rocm/.info/atom-rocm-runtime-commit; \
+    test -s /opt/rocm/.info/atom-rocm-runtime-sonames; \
     cd /opt/rocm/lib; \
-    ours_hsa="$(readlink -f libhsa-runtime64.so.1)"; \
-    ours_hip="$(readlink -f libamdhip64.so.7)"; \
-    touch "$ours_hsa" "$ours_hip"; \
-    for f in libhsa-runtime64.so.1.* libamdhip64.so.7.*; do \
-        [ -f "$f" ] && [ ! -L "$f" ] || continue; \
-        case "$f" in libhsa*) ours="$ours_hsa";; *) ours="$ours_hip";; esac; \
-        [ "$f" -ef "$ours" ] || ln -f "$ours" "$f"; \
-    done; \
-    ldconfig
+    while read -r soname; do \
+        [ -n "$soname" ] || continue; \
+        # readlink -f exits 0 and prints the would-be path for a DANGLING link.
+        # Without this guard a COPY that did not deliver the target makes the
+        # touch below CREATE a 0-byte file, which the loop then hard-links over
+        # the real runtime. set -eux cannot see any of that.
+        if [ -L "$soname" ]; then [ -e "$soname" ]; fi; \
+        ours="$(readlink -f "$soname")"; \
+        [ -s "$ours" ]; \
+        # touch forces the overlayfs copy-up that lets the layer tar record the
+        # hard links below as aliases instead of as separate copies.
+        touch "$ours"; \
+        for f in "$soname".*; do \
+            [ -f "$f" ] && [ ! -L "$f" ] || continue; \
+            [ "$f" -ef "$ours" ] || ln -f "$ours" "$f"; \
+        done; \
+    done < /opt/rocm/.info/atom-rocm-runtime-sonames; \
+    ldconfig; \
+    # Prove the swap landed. Until this exists every failure path above ends in
+    # a successfully published image carrying the stock runtime.
+    hsa="$(grep -m1 '^libhsa-runtime64\.so\.' /opt/rocm/.info/atom-rocm-runtime-sonames)"; \
+    nm -D "/opt/rocm/lib/$hsa" | grep -q hsa_amd_signal_create_v2
 
 CMD ["/bin/bash"]
