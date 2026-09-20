@@ -595,3 +595,166 @@ def test_staging_rejects_padding_that_truncates_or_exceeds_capacity():
         with pytest.raises(ValueError, match="staging capacity"):
             rt.stage_embeddings([request(7, (1, 2, 3))], padded_rows=padded)
     rt.shutdown()
+
+
+class FakeCudart:
+    """Page-lock accounting, and a scripted refusal.
+
+    `cudaHostUnregister` removes from the same list registration appends to, so
+    giving back a pointer that was never taken raises here rather than being
+    counted as a release.
+    """
+
+    def __init__(self, refuse_call=None):
+        self.refuse_call = refuse_call
+        self.registered = []
+        self.calls = 0
+
+    def cudaHostRegister(self, ptr, size, flags):
+        self.calls += 1
+        if self.calls == self.refuse_call:
+            return 1
+        self.registered.append(ptr)
+        return 0
+
+    def cudaHostUnregister(self, ptr):
+        self.registered.remove(ptr)
+        return 0
+
+
+def scaled_table() -> HostEmbeddingTable:
+    """A table whose values and scales are two separate registrations."""
+    scale = torch.ones(4, 2, dtype=torch.float8_e8m0fnu)
+    return HostEmbeddingTable(torch.ones(4, 8), num_rows=4, head_dim=8, scale=scale)
+
+
+def test_refused_scale_registration_gives_back_the_values_it_pinned(monkeypatch):
+    """The failing half must not leave the succeeding half locked.
+
+    Values and scales are registered in turn; without the rollback the first
+    call's pages stay unswappable for the life of the process, and
+    `disable_uva` cannot find them because the range was never recorded.
+    """
+    cudart = FakeCudart(refuse_call=2)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    table = scaled_table()
+    assert table.enable_uva(0, 4) is False
+    assert cudart.registered == []
+    assert table._uva is None
+
+
+def test_disable_uva_returns_every_registration(monkeypatch):
+    cudart = FakeCudart()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    table = scaled_table()
+    assert table.enable_uva(0, 4) is True
+    assert len(cudart.registered) == 2
+    table.disable_uva()
+    assert cudart.registered == []
+    assert table._uva is None
+    # Idempotent: a second release has nothing to give back and must not try.
+    table.disable_uva()
+    assert cudart.registered == []
+
+
+def test_enabling_the_same_range_twice_registers_once(monkeypatch):
+    cudart = FakeCudart()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    table = scaled_table()
+    assert table.enable_uva(0, 4) is True
+    assert table.enable_uva(0, 4) is True
+    assert cudart.calls == 2
+
+
+class FakeGroup:
+    def __init__(self, world_size, rank_in_group=0):
+        self.world_size = world_size
+        self.rank_in_group = rank_in_group
+        self.cpu_group = object()
+
+
+def patch_tp_group(monkeypatch, group):
+    """Serve `from aiter.dist.parallel_state import get_tp_group` a stub.
+
+    Undone at teardown by `monkeypatch.setitem`, which matters: an `aiter` left
+    in `sys.modules` makes every later `importorskip("aiter")` succeed.
+    """
+    import sys
+    from types import ModuleType
+
+    parallel_state = ModuleType("aiter.dist.parallel_state")
+    parallel_state.get_tp_group = lambda: group
+    for name, module in (
+        ("aiter", ModuleType("aiter")),
+        ("aiter.dist", ModuleType("aiter.dist")),
+        ("aiter.dist.parallel_state", parallel_state),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+
+
+def test_uva_is_the_groups_decision_not_this_ranks(monkeypatch):
+    """A rank outvoted after registering falls back AND releases.
+
+    `_stage_uva` ends in an all-gather. A rank that kept the UVA path while a
+    peer took the host path would enter a collective the peer never joins, so
+    one refusal has to turn the whole group around.
+    """
+    from atom.model_engine import engram_runtime
+
+    cudart = FakeCudart()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    patch_tp_group(monkeypatch, FakeGroup(world_size=2))
+
+    def refused(tensor, op=None, group=None):
+        tensor.fill_(0)
+
+    monkeypatch.setattr(engram_runtime.dist, "all_reduce", refused)
+    rt = make_runtime()
+    assert (
+        rt._enable_uva(rt.prefetcher, rt.prefetcher._hash_mapping.config.num_hash_heads)
+        is False
+    )
+    assert cudart.registered == []
+    assert rt._pinned_tables == []
+    rt.shutdown()
+
+
+def test_an_empty_shard_registers_nothing(monkeypatch):
+    """Heads that do not divide leave a tail rank with none of them.
+
+    That rank is as unable to take the UVA path as one whose registration was
+    refused, and for the collective downstream the two are the same event.
+    """
+    from atom.model_engine import engram_runtime
+
+    cudart = FakeCudart()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    # Every peer registered, so this rank's own answer is the only thing that
+    # can turn the group around.
+    monkeypatch.setattr(engram_runtime.dist, "all_reduce", lambda *a, **k: None)
+    rt = make_runtime()
+    heads = rt.prefetcher._hash_mapping.config.num_hash_heads
+    patch_tp_group(
+        monkeypatch, FakeGroup(world_size=heads - 1, rank_in_group=heads - 2)
+    )
+    assert rt._enable_uva(rt.prefetcher, heads) is False
+    assert rt.local_heads == 0
+    assert cudart.registered == []
+    rt.shutdown()
+
+
+def test_uva_survives_a_group_that_agrees(monkeypatch):
+    from atom.model_engine import engram_runtime
+
+    cudart = FakeCudart()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    patch_tp_group(monkeypatch, FakeGroup(world_size=2))
+    monkeypatch.setattr(engram_runtime.dist, "all_reduce", lambda *a, **k: None)
+    rt = make_runtime()
+    heads = rt.prefetcher._hash_mapping.config.num_hash_heads
+    assert rt._enable_uva(rt.prefetcher, heads) is True
+    assert len(cudart.registered) == len(rt._pinned_tables)
+    # Shutdown is the other place these pages can leak: the mapping they belong
+    # to is closed right after it.
+    rt.shutdown()
+    assert cudart.registered == []

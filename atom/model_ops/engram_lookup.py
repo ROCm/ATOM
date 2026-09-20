@@ -97,6 +97,10 @@ class HostEmbeddingTable:
         self.head_dim = head_dim
         self._scale = scale
         self.block_size = 0
+        # The registered row range, and the page-aligned base of each
+        # registration made for it.
+        self._uva: tuple[int, int] | None = None
+        self._pinned: tuple[int, ...] = ()
         if scale is not None:
             # gather() does `scale.to(float32)`; that decodes 2**(code-127) only
             # for a float8 E8M0 dtype. A raw uint8 exponent-code table would be
@@ -180,48 +184,41 @@ class HostEmbeddingTable:
                 f"engram shard rows [{row_start}, {row_end}) outside "
                 f"[0, {self.num_rows})"
             )
-        if getattr(self, "_uva", None) == (row_start, row_end):
+        if self._uva == (row_start, row_end):
             return True
         rt = torch.cuda.cudart()
-        for tensor, width in (
-            (self._tensor, self.head_dim),
-            (self._scale, None if self._scale is None else self._scale.shape[1]),
-        ):
-            if tensor is None:
-                continue
+        regions = [(self._tensor, self.head_dim)]
+        if self._scale is not None:
+            regions.append((self._scale, self._scale.shape[1]))
+        pinned = []
+        for tensor, width in regions:
             item = tensor.element_size()
             base = tensor.data_ptr() + row_start * width * item
             nbytes = (row_end - row_start) * width * item
             lo = base - (base % self._PAGE)
             size = -(-(base + nbytes - lo) // self._PAGE) * self._PAGE
             if int(rt.cudaHostRegister(lo, size, 0)) != 0:
+                # This object is about to report that it holds neither region.
+                for done in pinned:
+                    rt.cudaHostUnregister(done)
                 return False
+            pinned.append(lo)
+        self._pinned = tuple(pinned)
         self._uva = (row_start, row_end)
         return True
 
     def disable_uva(self) -> None:
         """Release this table's page-locked range, if it holds one.
 
-        Registration is per table, so a set that fails partway has to give back
-        what it already took: those pages are unswappable, and the caller is
-        about to fall back to the host path that does not want them.
+        What comes back is what went in, rather than the same offsets derived a
+        second time -- two copies of that arithmetic would have to agree.
         """
-        state = getattr(self, "_uva", None)
-        if state is None:
+        if self._uva is None:
             return
-        # `cudaHostUnregister` takes the base pointer alone, so the range's end
-        # is not needed to give the pages back.
-        row_start, _ = state
         rt = torch.cuda.cudart()
-        for tensor, width in (
-            (self._tensor, self.head_dim),
-            (self._scale, None if self._scale is None else self._scale.shape[1]),
-        ):
-            if tensor is None:
-                continue
-            item = tensor.element_size()
-            base = tensor.data_ptr() + row_start * width * item
-            rt.cudaHostUnregister(base - (base % self._PAGE))
+        for base in self._pinned:
+            rt.cudaHostUnregister(base)
+        self._pinned = ()
         self._uva = None
 
     def gather_into(
@@ -240,7 +237,7 @@ class HostEmbeddingTable:
         needed. Heads this rank does not own are left as zeros for the caller's
         all-gather. Requires `enable_uva`.
         """
-        if getattr(self, "_uva", None) is None:
+        if self._uva is None:
             raise RuntimeError("engram UVA lookup needs enable_uva() first")
         row_start, row_end = self._uva
         tokens = ids.shape[0]

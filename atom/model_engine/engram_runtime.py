@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from atom.model_ops.engram_hash import EngramHashTables, engram_row_indices
 from atom.model_ops.engram_lookup import HostEmbeddingTable
@@ -248,6 +249,8 @@ class EngramHost:
         # layers, which is the confusing half-state to avoid.
         self.uva = False
         self._tp_group = None
+        # Every table this rank page-locked, for the fallback and the shutdown.
+        self._pinned_tables = []
         self._ids_staging = None
         self.hash_tables = None
         self._row_ids = None
@@ -363,6 +366,10 @@ class EngramHost:
         (the mapping's head offsets are their running sum), so a whole number of
         heads is a contiguous row -- and byte -- range. A rank registers only that
         range: the full table on every rank is what a TP job cannot afford.
+
+        The answer is the GROUP's. An empty shard and a refused registration are
+        both per-rank outcomes, and `_stage_uva` ends in an all-gather: a rank
+        that fell back alone would strand every other rank in that collective.
         """
         from aiter.dist.parallel_state import get_tp_group
 
@@ -381,36 +388,57 @@ class EngramHost:
         self.head_start = group.rank_in_group * per
         self.local_heads = min(per, max(0, num_hash_heads - self.head_start))
         self.total_heads = num_hash_heads
-        if self.local_heads <= 0:
-            logger.info("engram: UVA shard is empty on this rank; using the host path")
+        pinned = self._register_shard(prefetcher)
+        if shards > 1:
+            # Gloo, once, at load. MIN: one refusal is the group's answer.
+            vote = torch.tensor([bool(pinned)], dtype=torch.int32)
+            dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=group.cpu_group)
+            if not int(vote):
+                if pinned:
+                    logger.info("engram: a peer has no UVA shard")
+                pinned = 0
+        if not pinned:
+            logger.info("engram: using the host path")
+            self._release_shard()
             return False
-        mapping = prefetcher._hash_mapping
-        registered = 0
-        done = []
-        for layer_id, table in prefetcher._tables.items():
-            offsets = mapping.head_offsets[layer_id]
-            sizes = mapping.head_vocab_sizes[layer_id]
-            end_head = self.head_start + self.local_heads
-            row_start = int(offsets[self.head_start])
-            row_end = int(offsets[end_head - 1]) + int(sizes[end_head - 1])
-            if not table.enable_uva(row_start, row_end):
-                # Give back what the earlier tables already pinned: these pages
-                # are unswappable and the host path has no use for them.
-                for pinned in done:
-                    pinned.disable_uva()
-                logger.info("engram: UVA registration failed; using the host path")
-                return False
-            done.append(table)
-            registered += (row_end - row_start) * table.head_dim
         logger.info(
             "engram: UVA device lookup active -- heads [%d, %d) of %d, "
             "%.1f GiB page-locked on this rank",
             self.head_start,
             self.head_start + self.local_heads,
             num_hash_heads,
-            registered / 1024**3,
+            pinned / 1024**3,
         )
         return True
+
+    def _register_shard(self, prefetcher):
+        """Bytes page-locked for this rank's head range, or 0 if any table said no.
+
+        A partial set is left for `_enable_uva` to release: it releases on every
+        other falsy outcome too, so there is one site that gives pages back.
+        """
+        if self.local_heads <= 0:
+            logger.info("engram: UVA shard is empty on this rank")
+            return 0
+        mapping = prefetcher._hash_mapping
+        last = self.head_start + self.local_heads - 1
+        pinned = 0
+        for layer_id, table in prefetcher._tables.items():
+            offsets = mapping.head_offsets[layer_id]
+            row_start = int(offsets[self.head_start])
+            row_end = int(offsets[last]) + int(mapping.head_vocab_sizes[layer_id][last])
+            if not table.enable_uva(row_start, row_end):
+                logger.info("engram: UVA registration refused on layer %d", layer_id)
+                return 0
+            self._pinned_tables.append(table)
+            pinned += (row_end - row_start) * table.head_dim
+        return pinned
+
+    def _release_shard(self):
+        """Unregister every table this rank pinned; these pages are unswappable."""
+        for table in self._pinned_tables:
+            table.disable_uva()
+        self._pinned_tables = []
 
     def _rows_from_host(self, requests, rows):
         """Hash on the host and stage the indices through pinned memory.
@@ -507,7 +535,7 @@ class EngramHost:
                 # columns are the padding an indivisible head count leaves.
                 out = self._tp_group.all_gather(out, use_custom=True, dim=1)
                 out = out[:, : self.embed_width]
-            buffer.gpu[:rows].copy_(out.reshape(rows, self.embed_width))
+            buffer.gpu[:rows].copy_(out)
             if staged > rows:
                 buffer.gpu[rows:staged].zero_()
         self._staged_rows = staged
@@ -553,6 +581,9 @@ class EngramHost:
     def shutdown(self):
         if self._copy_pending:
             self.copy_done.synchronize()
+        # Ahead of the mappings these pages belong to, which is the order
+        # `from_checkpoint`'s ExitStack unwinds in.
+        self._release_shard()
         self.prefetcher.shutdown()
 
 
