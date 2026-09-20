@@ -344,9 +344,11 @@ offload tier; decode uses plain Mooncake without TBO or CPU offload.
 Decode captures every per-rank batch size from 1 through `CONC / 4`
 (1–64 at concurrency 256); prefill uses default graph sizes.
 
-`lmcache.max_local_cpu_size` is **per worker**: 8 workers × 128 GiB = 1024 GiB of
-host memory. Refuse to start unless `psutil.virtual_memory().available` clears
-`8 × size + 256` GiB.
+`lmcache.max_local_cpu_size` is **per worker**: 8 workers × 128 GiB = 1,024 GiB
+for the CPU cache. Ensure at least **1,280 GiB of available host memory** before
+startup, including 256 GiB of headroom. Check `psutil.virtual_memory().available`
+against `(8 * size + 256) * 1024**3` bytes, where `size` is the per-worker cache
+size in GiB.
 
 ### Prefill node
 
@@ -524,8 +526,9 @@ aiperf profile --scenario inferencex-agentx-mvp \
   --public-dataset semianalysis_cc_traces_weka_062126
 ```
 
-Host memory: `lmcache.max_local_cpu_size` is per worker, so the prefill node
-needs 8 × 128 GiB = 1024 GiB free before the server starts.
+Host memory: the eight workers use 1,024 GiB for the CPU cache. The prefill
+node needs at least **1,280 GiB of available host memory** before startup,
+including 256 GiB of headroom.
 
 ## The offload settings that matter
 
