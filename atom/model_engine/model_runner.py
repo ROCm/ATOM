@@ -3855,6 +3855,8 @@ class ModelRunner:
                 full_q_len,
             )
 
+        self.attn_metadata_builder.blank_cache_write_targets()
+
         # Whether this backend's capture builder supports a dynamic (per-bucket)
         build_capture = self.attn_metadata_builder.build_for_cudagraph_capture
         _build_params = inspect.signature(build_capture).parameters

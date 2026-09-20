@@ -44,6 +44,10 @@ from atom.utils.tbo.ubatching import tbo_enabled
 logger = logging.getLogger("atom")
 T = TypeVar("T", bound="BroadcastableModelInput")
 
+# "Written nowhere" -- see `_write_prefill_slots`. Same value the cache kernels
+# and `fla_ops.replayssm` skip on.
+PAD_SLOT_ID = -1
+
 
 class BroadcastableModelInput(ABC):
 
@@ -182,6 +186,29 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
     @abstractmethod
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         raise NotImplementedError
+
+    def cache_write_targets(self) -> list[CpuGpuBuffer]:
+        """Index buffers a CUDA graph capture would write cache through.
+
+        Declared here rather than matched on `forward_vars` key names, because a
+        backend can aim cache writes with a buffer that is named differently or
+        not registered there at all. The default is the paged slot mapping, by
+        suffix so TBO's per-ubatch mirrors come along; a backend with other write
+        targets overrides this, and must accept `PAD_SLOT_ID` in each of them as
+        "skip this row".
+        """
+        var = self.model_runner.forward_vars
+        return [buf for name, buf in var.items() if name.endswith("slot_mapping")]
+
+    def blank_cache_write_targets(self) -> None:
+        """Point the capture's cache writes at nothing.
+
+        A capture runs the model for real, so it writes through these; replay
+        overwrites them with real rows.
+        """
+        for buf in self.cache_write_targets():
+            buf.np[:] = PAD_SLOT_ID
+            buf.copy_to_gpu()
 
     # ------------------------------------------------------------------ #
     # Cache sizing — one byte currency for every cache class.             #
