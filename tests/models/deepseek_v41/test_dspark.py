@@ -3,9 +3,25 @@
 
 import pytest
 import torch
+
 from atom.model_ops.deepseek_v41.dspark import draft_attention, draft_step, rotate_rows
-from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
-from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
+
+
+def _rope():
+    """The cached RoPE is an AITER kernel; the block mask above is not."""
+    pytest.importorskip("aiter", reason="the cached RoPE is an AITER kernel")
+    from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
+
+    return RotaryEmbedding
+
+
+def _draft_model():
+    """The draft model builds ATOM layers, which reach AITER."""
+    pytest.importorskip("aiter", reason="the draft model builds AITER-backed layers")
+    from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
+
+    return DeepseekV41DSpark
+
 
 from atom.models.deepseek_v4_dspark import DSparkConfidenceHead, DSparkMarkovHead
 
@@ -32,7 +48,7 @@ def test_rope_ragged_request_positions(device, inverse):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("ROCm GPU required")
     torch.manual_seed(711)
-    rope = RotaryEmbedding(64, 256, base=10000).to(device)
+    rope = _rope()(64, 256, base=10000).to(device)
     positions = torch.tensor(
         [[2, 3, 4, 5, 6], [126, 127, 128, 129, 130]], device=device
     )
@@ -86,7 +102,7 @@ def test_draft_head_names_and_width_match_the_v41_checkpoint():
     V4's and is covered by `tests/test_dspark.py`.
     """
     hidden, rank, vocab = 64, 32, 128
-    renamed = DeepseekV41DSpark.weights_mapper.apply_list(
+    renamed = _draft_model().weights_mapper.apply_list(
         [f"mtp.2.markov_head.{name}.weight" for name in ("embed", "head")]
     )
     assert renamed == [

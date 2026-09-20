@@ -22,10 +22,13 @@ def reference():
 
 @pytest.fixture
 def single_rank(monkeypatch):
-    from atom.models.deepseek_v41 import attention, model
-
+    # Every module patched here reaches AITER, so a test that asks for this
+    # fixture cannot run without it; say so as a skip rather than letting the
+    # import fail during setup.
+    pytest.importorskip("aiter", reason="the patched layers are AITER-backed")
     from atom.model_ops import embed_head, layernorm, linear
     from atom.model_ops import moe as fused_moe
+    from atom.models.deepseek_v41 import attention, model
 
     group = SimpleNamespace(rank_in_group=0, world_size=1)
     # `fused_moe`, not the V4.1 `moe` module: the routed experts are V4's
@@ -58,11 +61,11 @@ def unallocated_moe(monkeypatch):
     what the V4.1 layer passes down to V4 is readable as plain attributes.
     A test that wants a constructor exercised for real must not find it here.
     """
-    from atom.models.deepseek_v41 import dspark, model, multimodal
     from torch import nn
 
     from atom.config import get_hf_config
     from atom.models.deepseek_v4 import MoE as V4MoE
+    from atom.models.deepseek_v41 import dspark, model, multimodal
 
     from .reference import FIXTURES
 
@@ -105,6 +108,7 @@ def build_v41(unallocated_moe):
     about what another does.
     """
     import torch
+
     from atom.models.deepseek_v41 import dspark, model, runtime
 
     hf = unallocated_moe
@@ -175,6 +179,7 @@ def attention_contract(monkeypatch, reference):
     composition. This is not an end-to-end numerical acceptance test.
     """
     import torch
+
     from atom.models.deepseek_v41 import attention
 
     captured = []

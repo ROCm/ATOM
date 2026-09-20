@@ -3,7 +3,6 @@
 
 import numpy as np
 import torch
-
 import triton
 import triton.language as tl
 
@@ -210,7 +209,9 @@ class HostEmbeddingTable:
         state = getattr(self, "_uva", None)
         if state is None:
             return
-        row_start, row_end = state
+        # `cudaHostUnregister` takes the base pointer alone, so the range's end
+        # is not needed to give the pages back.
+        row_start, _ = state
         rt = torch.cuda.cudart()
         for tensor, width in (
             (self._tensor, self.head_dim),

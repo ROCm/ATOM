@@ -5,17 +5,17 @@ from typing import ClassVar
 
 import torch
 from aiter.dist.parallel_state import get_tp_group
+from torch import nn
+
+from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.deepseek_v41.mhc import (
     SinglePassHCState,
     expand_residual,
 )
 from atom.model_ops.deepseek_v41.mhc_pre_delayed import pre_delayed
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
-from atom.model_ops.engram_layer import EngramOp
-from torch import nn
-
-from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.embed_head import VocabParallelEmbedding
+from atom.model_ops.engram_layer import EngramOp
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.utils import atom_parameter

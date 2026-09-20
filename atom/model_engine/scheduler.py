@@ -28,13 +28,13 @@ from collections import deque
 from collections.abc import Iterable
 
 import numpy as np
-from atom.model_engine.multimodal_runtime import prefill_media_payload
 
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.engine_stats import EngineStats
+from atom.model_engine.multimodal_runtime import prefill_media_payload
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import (
     Sequence,

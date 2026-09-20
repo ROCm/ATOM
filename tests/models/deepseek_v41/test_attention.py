@@ -4,6 +4,8 @@
 import pytest
 import torch
 
+pytest.importorskip("aiter", reason="the compressor and cached RoPE are AITER kernels")
+
 from atom.model_ops.deepseek_v41.compressor import Compressor
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 

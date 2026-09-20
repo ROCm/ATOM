@@ -22,8 +22,8 @@ import torch
 pytest.importorskip("aiter")
 
 from aiter import QuantType
-from atom.model_ops.blockscale import quantize_fp8
 
+from atom.model_ops.blockscale import quantize_fp8
 from atom.model_ops.layernorm import (
     _aiter_rms_quant,
     _is_mxfp8,

@@ -9,6 +9,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from PIL import Image
+from transformers import AutoTokenizer
+
+from atom.config import get_hf_config
+from atom.entrypoints.openai.chat_encoders import load_custom_message_encoder
 from atom.model_engine.multimodal_runtime import (
     embedding_indices,
     multimodal_cache_seed,
@@ -18,18 +23,11 @@ from atom.models.deepseek_v41.image_processing import (
     image_token_types,
     preprocess_image,
 )
-from atom.models.deepseek_v41.multimodal import DeepseekV41MultimodalModel
-from atom.models.deepseek_v41.vision import Aligner, ViT
 from atom.models.deepseek_v41.weights import (
     CheckpointReader,
     build_weight_manifest,
     checkpoint_schema,
 )
-from PIL import Image
-from transformers import AutoTokenizer
-
-from atom.config import get_hf_config
-from atom.entrypoints.openai.chat_encoders import load_custom_message_encoder
 
 from .reference import FIXTURES
 
@@ -134,6 +132,12 @@ def test_image_identity_survives_equal_placeholder_tokens(reference):
 def test_real_vision_checkpoint_matches_reference(reference, single_rank):
     # `single_rank` because the tower's layers are ATOM's now, and those read
     # the process group at construction where `nn.Linear` read nothing.
+    # The tower's layers are ATOM's, which reach AITER; everything above this
+    # test is host-side preprocessing and span arithmetic that a CPU-only
+    # runner can still check, so the imports live here.
+    from atom.models.deepseek_v41.multimodal import DeepseekV41MultimodalModel
+    from atom.models.deepseek_v41.vision import Aligner, ViT
+
     config, vision_config, args = configs()
     official = sys.modules[reference.__package__ + ".vision"]
     # Only the 1.1 GB vision scope: no text model or Engram allocation.

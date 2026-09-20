@@ -4,7 +4,11 @@
 from unittest.mock import Mock
 
 import pytest
+
+pytest.importorskip("aiter", reason="the quant types are AITER enums")
+
 from aiter import QuantType
+
 from atom.models.deepseek_v41 import dspark, model
 
 

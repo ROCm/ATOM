@@ -138,9 +138,8 @@ class DeepseekV41ImageProcessor:
         self.vision_config = root.vision_config
 
     def prepare(self, messages, images, template_kwargs, tools=None):
-        from atom.model_engine.multimodal_runtime import multimodal_cache_seed
-
         from atom.entrypoints.openai.chat_encoders import apply_chat_template
+        from atom.model_engine.multimodal_runtime import multimodal_cache_seed
 
         # The encoder renders placeholders without opening media. The serving
         # layer has already loaded these PIL images in exactly this order.

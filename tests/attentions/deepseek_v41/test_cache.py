@@ -7,6 +7,8 @@ import numpy as np
 import pytest
 import torch
 
+pytest.importorskip("aiter", reason="the paged cache and V4 kernels reach AITER")
+
 from atom.model_engine.page_unit_checkpoint import (
     CheckpointRestoreOp,
     CheckpointStoreOp,

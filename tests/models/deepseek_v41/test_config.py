@@ -5,7 +5,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from atom.config import get_hf_config
+from atom.config import SpeculativeConfig, get_hf_config
 from atom.models.deepseek_v41.config import (
     AttentionMode,
     build_attention_topology,
@@ -49,6 +49,11 @@ def test_hf_config_preserves_text_vision_quantization_and_root_tokens(raw_config
 
 def test_the_published_quantization_block_is_accepted(raw_config):
     validate_native_quantization(raw_config["quantization_config"])
+
+
+def test_the_published_block_parses_to_the_group32_spec(raw_config):
+    """The parser resolves AITER quant types, so it needs the runtime."""
+    pytest.importorskip("aiter", reason="the FP8 parser resolves AITER quant types")
     parsed = get_quant_parser("fp8").parse(raw_config["quantization_config"])
     assert parsed.global_spec.quant_type.name == "per_1x32"
     assert parsed.global_spec.weight_block_size == (32, 32)
@@ -150,3 +155,14 @@ def test_v41_never_falls_through_to_v4_backend(raw_config):
     )
     with pytest.raises(NotImplementedError, match="native ATOM"):
         get_attn_backend_cls(Family.CSA2, True, False)
+
+
+def test_native_draft_config_preserves_v41_architecture():
+    config = get_hf_config(str(FIXTURES))
+    SpeculativeConfig.hf_config_override(config, model_path=None)
+    assert config.architectures == ["DeepseekV41DSparkModel"]
+    assert config.model_type == "deepseek_v41_dspark"
+    assert config.num_nextn_predict_layers == 3
+    assert config.head_dim == 512 and config.qk_rope_head_dim == 64
+    assert config.dspark_n_routed_experts == 128
+    assert config.n_routed_experts == 384

@@ -15,6 +15,8 @@ hand back then is a copy, so a returned id tensor could not be trusted.
 import pytest
 import torch
 
+pytest.importorskip("aiter", reason="the Markov sampler is a Triton/AITER op")
+
 from atom.model_ops.dspark_markov_sample import (
     _torch_dspark_markov_argmax,
     dspark_markov_argmax,

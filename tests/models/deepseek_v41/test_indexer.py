@@ -67,7 +67,9 @@ def test_unit_table_expands_the_page_table_in_place(units):
     sits. Padding rows come back zeroed: the load is masked, which is what
     lets the kernel read no PAGE table for a request that is not there.
     """
-    from atom.model_ops.deepseek_v41.unit_table import unit_table, unit_table_reference
+    from atom.model_ops.deepseek_v41.unit_table import unit_table
+
+    from .reference_unit_table import unit_table_reference
 
     torch.manual_seed(1409)
     bs, columns = 5, 7

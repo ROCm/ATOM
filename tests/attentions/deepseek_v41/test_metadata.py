@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+pytest.importorskip("aiter", reason="the V4.1 backend and cache reach AITER")
+
 from atom.model_ops.attentions.deepseek_v41.backend import DeepseekV41MetadataBuilder
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.deepseek_v41.metadata import (

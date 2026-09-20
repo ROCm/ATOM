@@ -7,6 +7,7 @@ import pytest
 import torch
 import triton
 import triton.language as tl
+
 from atom.model_ops.attentions.deepseek_v41.packed_rows import (
     load_mixed_rows,
     pack_rows,
@@ -89,7 +90,6 @@ def test_native_main_window_rows_restore_exact_qat(magnitude):
 def test_packed_decode_reuses_v4_with_ragged_rows(batch):
     from atom.model_ops.attentions.deepseek_v41.packed_attention import packed_decode
     from atom.model_ops.attentions.deepseek_v41.packed_rows import gather_prefix_rows
-
     from atom.model_ops.v4_kernels import sparse_attn_v4_paged_decode
 
     torch.manual_seed(71)

@@ -2,12 +2,12 @@
 from types import SimpleNamespace
 
 import pytest
+
+from atom.config import DSparkConfig
 from atom.models.deepseek_v41.config import (
     DeepseekV41TextConfig,
     validate_speculative_config,
 )
-
-from atom.config import DSparkConfig
 
 
 def config():

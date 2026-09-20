@@ -6,27 +6,16 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
-from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
-from tests.attentions.deepseek_v41.helpers import metadata_buffers
+
+pytest.importorskip("aiter", reason="the draft stack builds AITER-backed layers")
+
 from torch import nn
 
-from atom.config import SpeculativeConfig, get_hf_config
+from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
+from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
 from atom.spec_decode.drafter import AuxCaptureSpec
 from atom.spec_decode.dspark_proposer import DSparkProposer
-
-from .reference import FIXTURES
-
-
-def test_native_draft_config_preserves_v41_architecture():
-    config = get_hf_config(str(FIXTURES))
-    SpeculativeConfig.hf_config_override(config, model_path=None)
-    assert config.architectures == ["DeepseekV41DSparkModel"]
-    assert config.model_type == "deepseek_v41_dspark"
-    assert config.num_nextn_predict_layers == 3
-    assert config.head_dim == 512 and config.qk_rope_head_dim == 64
-    assert config.dspark_n_routed_experts == 128
-    assert config.n_routed_experts == 384
+from tests.attentions.deepseek_v41.helpers import metadata_buffers
 
 
 def test_v41_draft_uses_shared_block_capture():
@@ -253,7 +242,6 @@ def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch):
     )
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
     from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
-
     from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 
     monkeypatch.setenv("ATOM_DRAFT_CUDAGRAPH", "1")

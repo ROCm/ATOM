@@ -62,8 +62,14 @@ torchrun --standalone --nproc_per_node=4 \
 
 ## Current execution scope
 
-Use whole-expert EP (`enable_expert_parallel=True`) for TP greater than one and
-an even cache block size. The architecture is `DeepseekV41ForCausalLM`.
+The architecture is `DeepseekV41ForCausalLM` and the cache block size must be
+even. Routed experts take either arrangement: `enable_expert_parallel=True`
+gives each rank whole experts, and leaving it off shards every expert's
+intermediate dimension across TP instead, which is the path `FusedMoE` takes on
+its own. Whole-expert EP is the more heavily exercised of the two — most of the
+validation below was run that way — but TP-only is not refused: at TP4 it scores
+0.9204 on the 1,319-question GSM8K set, inside the band six same-code EP runs
+span. Their relative throughput has not been measured.
 
 `index_cache_dtype="fp8"` is the only index plane, and the runtime refuses any
 other before loading weights. The main pool is independent of it and takes

@@ -119,7 +119,7 @@ def _real_hf_config_override():
     saved = sys.modules.get("atom.config")
     try:
         spec.loader.exec_module(mod)
-    except Exception:
+    except Exception:  # noqa: BLE001 - a partial checkout has no SpeculativeConfig
         return None
     finally:
         if saved is not None:

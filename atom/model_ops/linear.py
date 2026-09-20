@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import itertools
 import logging
 from collections.abc import Callable
 from functools import partial as functools_partial
@@ -178,7 +179,7 @@ def gemm_a4w4_quant(
         and not use_fp4_non_shuffle_triton_gemm()
         and gemm_afp4wfp4_preshuffle is not None
     ):
-        m, k = x.view(-1, x.size(-1)).shape
+        m, _ = x.view(-1, x.size(-1)).shape
 
         y = torch.empty(
             (
@@ -918,9 +919,12 @@ class LinearBase(nn.Module):
             loaded_weight_scale_parts = getattr(
                 self, "_loaded_weight_scale_for_requant_parts", None
             )
-            if loaded_weight_scale is None and loaded_weight_scale_parts is not None:
-                if all(part is not None for part in loaded_weight_scale_parts):
-                    loaded_weight_scale = torch.cat(loaded_weight_scale_parts, dim=0)
+            if (
+                loaded_weight_scale is None
+                and loaded_weight_scale_parts is not None
+                and all(part is not None for part in loaded_weight_scale_parts)
+            ):
+                loaded_weight_scale = torch.cat(loaded_weight_scale_parts, dim=0)
             weight_scale_for_requant = (
                 loaded_weight_scale
                 if loaded_weight_scale is not None
@@ -1409,7 +1413,7 @@ class MergedColumnParallelLinear(LinearBase):
                     f"valid range is [0, {len(self.output_sizes) - 1}]"
                 )
             if len(loaded_shard_id) > 1 and any(
-                b - a != 1 for a, b in zip(loaded_shard_id[:-1], loaded_shard_id[1:])
+                b - a != 1 for a, b in itertools.pairwise(loaded_shard_id)
             ):
                 raise ValueError(
                     "Shard id with multiple indices should be consecutive. "

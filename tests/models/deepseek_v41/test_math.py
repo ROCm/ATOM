@@ -9,15 +9,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from atom.model_ops.deepseek_v41.mhc import (
-    SinglePassHCState,
-    apply_sublayer,
-    predict_mixes,
-)
-from atom.model_ops.deepseek_v41.moe import Expert, Router, weighted_swiglu
-from atom.model_ops.engram import CompressedTokenizer, EngramConfig, NgramHashMapping
-from atom.model_ops.engram_layer import EngramOp
 from torch import nn
+
+from atom.model_ops.engram import CompressedTokenizer, EngramConfig, NgramHashMapping
 
 
 @contextmanager
@@ -28,6 +22,14 @@ def bf16_default():
         yield
     finally:
         torch.set_default_dtype(previous)
+
+
+def _mhc():
+    """Single-Pass mHC reaches AITER; the tokenizer and router checks do not."""
+    pytest.importorskip("aiter", reason="Single-Pass mHC calls AITER kernels")
+    from atom.model_ops.deepseek_v41 import mhc
+
+    return mhc
 
 
 def test_single_pass_mhc_uses_incoming_mix_and_final_ffn_mix(reference):
@@ -54,10 +56,11 @@ def test_single_pass_mhc_uses_incoming_mix_and_final_ffn_mix(reference):
     residual = torch.randn(2, 5, 4, 32, dtype=torch.bfloat16)
     incoming = torch.rand(2, 5, 4)
     expected, expected_mix = ref(residual, 0, incoming, None)
-    state = SinglePassHCState(residual, incoming)
+    mhc = _mhc()
+    state = mhc.SinglePassHCState(residual, incoming)
     for name in ("attn", "ffn"):
         operation, norm = getattr(ref, name), getattr(ref, name + "_norm")
-        state = apply_sublayer(
+        state = mhc.apply_sublayer(
             state,
             nn.Sequential(norm, operation),
             getattr(ref, f"hc_{name}_fn"),
@@ -67,7 +70,7 @@ def test_single_pass_mhc_uses_incoming_mix_and_final_ffn_mix(reference):
     assert torch.equal(state.residual, expected)
     torch.testing.assert_close(state.pre_mix, expected_mix, rtol=1e-6, atol=1e-7)
     assert torch.equal(state.collapse(), ref.hc_pre(expected, expected_mix))
-    initial = SinglePassHCState.from_embeddings(residual[:, :, 0], 4)
+    initial = mhc.SinglePassHCState.from_embeddings(residual[:, :, 0], 4)
     assert torch.equal(initial.collapse(), residual[:, :, 0])
     assert torch.equal(initial.pre_mix[..., 0], torch.ones(2, 5))
 
@@ -78,11 +81,12 @@ def test_mhc_coefficient_norm_epsilon_is_not_sinkhorn_epsilon(reference):
     fn, scale, base = torch.randn(24, 128), torch.ones(3), torch.zeros(24)
     stub = SimpleNamespace(norm_eps=1e-20, hc_mult=4, hc_sinkhorn_iters=20, hc_eps=1e-6)
     expected = reference.Block.hc_mixes(stub, x, fn, scale, base)
-    actual = predict_mixes(x, fn, scale, base)
+    mhc = _mhc()
+    actual = mhc.predict_mixes(x, fn, scale, base)
     for a, e in zip(actual, expected):
         torch.testing.assert_close(a, e, rtol=1e-6, atol=1e-7)
     with pytest.raises(ValueError, match="FP32"):
-        predict_mixes(x, fn.bfloat16(), scale, base)
+        mhc.predict_mixes(x, fn.bfloat16(), scale, base)
 
 
 def test_router_image_bias_only_changes_selection(reference):
@@ -96,6 +100,8 @@ def test_router_image_bias_only_changes_selection(reference):
     )
     with bf16_default():
         expected_router = reference.Gate(0, args)
+    from .reference_moe import Router
+
     target = Router(32, 8, 3)
     for name, parameter in target.named_parameters():
         data = torch.randn_like(parameter)
@@ -116,6 +122,8 @@ def test_router_image_bias_only_changes_selection(reference):
 
 
 def test_weighted_swiglu_reference_order_and_asymmetric_clamp(reference):
+    from .reference_moe import Expert, weighted_swiglu
+
     class FixedProjection(nn.Module):
         def __init__(self, output):
             super().__init__()
@@ -163,6 +171,8 @@ def _reference_engram(reference, target):
 def test_engram_fp32_gate_residual_and_image_mask(reference, single_rank):
     torch.manual_seed(192)
     with bf16_default():
+        from atom.model_ops.engram_layer import EngramOp
+
         target = EngramOp(1, hidden_size=32, engram_hidden_size=64, hc_mult=4).cuda()
     # ATOM layers allocate uninitialized -- weights arrive from a checkpoint.
     target.wkv.weight.data.normal_(std=0.1)
@@ -186,6 +196,8 @@ def test_engram_fp32_gate_residual_and_image_mask(reference, single_rank):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 def test_zero_engram_dot_preserves_signed_sqrt_contract(reference, single_rank):
+    from atom.model_ops.engram_layer import EngramOp
+
     target = EngramOp(1, hidden_size=32, engram_hidden_size=32, hc_mult=4).cuda()
     target.wkv.weight.data.zero_()
     target.wkv.weight.data[-32:] = 1
@@ -347,6 +359,7 @@ def projection_factory(native_quant):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 def test_w4a8_expert_against_reference(reference, projection_factory):
     from .oracle_kernels import fp4_act_quant
+    from .reference_moe import Expert
 
     torch.manual_seed(193)
     with bf16_default():
@@ -384,6 +397,8 @@ def test_w4a8_expert_against_reference(reference, projection_factory):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 def test_native_engram_projection_and_gpu_gate(reference, native_quant):
+    from atom.model_ops.engram_layer import EngramOp
+
     torch.manual_seed(114)
     with bf16_default():
         target = EngramOp(
@@ -430,13 +445,13 @@ def test_native_engram_projection_and_gpu_gate(reference, native_quant):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 def test_real_engram_weights_and_native_table_rows(reference, native_quant):
+    from atom.config import get_hf_config
+    from atom.model_ops.engram_layer import EngramOp
     from atom.models.deepseek_v41.weights import (
         CheckpointReader,
         build_weight_manifest,
         checkpoint_schema,
     )
-
-    from atom.config import get_hf_config
 
     directory = os.environ["ATOM_DSV41_REFERENCE"]
     config = get_hf_config(directory)
@@ -485,10 +500,11 @@ def test_collapse_matches_the_torch_body_it_replaced():
     `collapse_streams` keeps its multiply and its sum apart for exactly this
     reason, so equality is the contract here rather than a tolerance.
     """
+    mhc = _mhc()
     torch.manual_seed(7)
     hidden = torch.randn(1, 5, 256, dtype=torch.bfloat16, device="cuda")
-    state = SinglePassHCState.from_embeddings(hidden, 4)
-    state = SinglePassHCState(state.residual, torch.randn_like(state.pre_mix))
+    state = mhc.SinglePassHCState.from_embeddings(hidden, 4)
+    state = mhc.SinglePassHCState(state.residual, torch.randn_like(state.pre_mix))
     # Armed: the one-hot pre-mix a fresh state carries would agree with any
     # weighting at all, so it cannot tell the two bodies apart.
     assert (state.pre_mix.abs() > 1e-3).all()

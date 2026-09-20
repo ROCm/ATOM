@@ -551,10 +551,11 @@ class QuantizationConfig:
         self,
         hf_config: PretrainedConfig,
         packed_modules_mapping: dict | None = None,
-        weights_mapper={},
+        weights_mapper: dict | None = None,
         quant_exclude_name_mapping: dict[str, str] | None = None,
     ):
         model_type = hf_config.model_type
+        weights_mapper = weights_mapper or {}
         self.packed_modules_mapping = (
             packed_modules_mapping if packed_modules_mapping is not None else {}
         )
@@ -572,9 +573,10 @@ class QuantizationConfig:
                     "gate_proj": ("gate_up_proj", 0),
                     "up_proj": ("gate_up_proj", 1),
                 }
-        elif model_type == "qwen3_moe" or model_type == "qwen3_next":
-            if getattr(hf_config, "mlp_only_layers", []):
-                self.packed_modules_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
+        elif model_type in ("qwen3_moe", "qwen3_next") and getattr(
+            hf_config, "mlp_only_layers", []
+        ):
+            self.packed_modules_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
 
         if weights_mapper:
             self.exclude_layers = [
@@ -799,7 +801,7 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
         hf_config = AutoConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code
         )
-    except ValueError as e:
+    except ValueError:
         # For the unsupported model in current transformers, try vllm if in plugin mode
         if is_vllm():
             from vllm.transformers_utils.config import get_config
@@ -810,7 +812,7 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
             hf_config = get_config(model, trust_remote_code=trust_remote_code)
             hf_config = maybe_patch_hf_config_from_gguf(model, hf_config)
         else:
-            raise e
+            raise
     return hf_config
 
 
@@ -847,9 +849,11 @@ def _normalize_minimax_m3_text_config(hf_config: PretrainedConfig) -> None:
     if text_config is None or text_config is hf_config:
         return
 
-    if getattr(text_config, "hidden_act", None) == "swigluoai":
-        if getattr(text_config, "swiglu_beta", None) is None:
-            text_config.swiglu_beta = 1.0
+    if (
+        getattr(text_config, "hidden_act", None) == "swigluoai"
+        and getattr(text_config, "swiglu_beta", None) is None
+    ):
+        text_config.swiglu_beta = 1.0
 
     for attr_name in (
         "use_index_cache",
@@ -2101,11 +2105,11 @@ class Config:
             self.hf_config.rope_parameters = rope_params
 
         self.generation_config = get_generation_config(self.model)
-        if self.generation_config is not None:
-            if (
-                eos_ids := getattr(self.generation_config, "eos_token_id", None)
-            ) is not None:
-                self.stop_token_ids = [eos_ids] if isinstance(eos_ids, int) else eos_ids
+        if self.generation_config is not None and (
+            (eos_ids := getattr(self.generation_config, "eos_token_id", None))
+            is not None
+        ):
+            self.stop_token_ids = [eos_ids] if isinstance(eos_ids, int) else eos_ids
         self.quant_config = QuantizationConfig(
             self.hf_config,
             self.online_quant_config,

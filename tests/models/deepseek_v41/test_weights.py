@@ -7,15 +7,15 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from safetensors.torch import save_file
+
+from atom.config import get_hf_config
 from atom.models.deepseek_v41.weights import (
     CheckpointReader,
     WeightSpec,
     build_weight_manifest,
     checkpoint_schema,
 )
-from safetensors.torch import save_file
-
-from atom.config import get_hf_config
 
 from .reference import FIXTURES
 
@@ -188,6 +188,7 @@ def test_packed_rules_claim_exactly_their_own_checkpoint_tensors(schema):
     stops looking, so a rule that reaches one tensor too far does not fail --
     it loads that tensor into the wrong half of a fused parameter.
     """
+    pytest.importorskip("aiter", reason="the model module builds AITER-backed layers")
     from atom.models.deepseek_v41.model import DeepseekV41ForCausalLM
 
     rules = DeepseekV41ForCausalLM.packed_modules_mapping

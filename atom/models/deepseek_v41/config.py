@@ -365,8 +365,4 @@ def validate_runtime_config(config):
         )
     if config.kv_cache_block_size % 2:
         raise ValueError("DeepSeek-V4.1 PAGE token count must be even")
-    if config.tensor_parallel_size > 1 and not config.enable_expert_parallel:
-        raise ValueError(
-            "DeepSeek-V4.1 uses whole-expert EP; set enable_expert_parallel=True"
-        )
     validate_speculative_config(config)

@@ -33,9 +33,9 @@ if not torch.cuda.is_available():
     )
 
 from atom.model_ops.blockscale import quantize_fp8
+from atom.model_ops.deepseek_v41.dspark import fused_draft_kv_tail
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 from atom.model_ops.layernorm import rmsnorm2d_fwd_
-from atom.model_ops.deepseek_v41.dspark import fused_draft_kv_tail
 
 DEV = "cuda"
 DIM = 512  # config.head_dim

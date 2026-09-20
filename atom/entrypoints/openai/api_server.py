@@ -1077,7 +1077,7 @@ async def generate_async_fanout(
                 try:
                     engine.core_mgr.abort_request(_seq.id)
                 except Exception:
-                    pass
+                    logger.debug("abort_request failed on teardown", exc_info=True)
             engine.io_processor.requests.pop(_seq.id, None)
 
     finished_at = time.time()
@@ -1216,7 +1216,7 @@ def cleanup_stream(seq_id: int, aborted: bool = False) -> None:
         try:
             engine.core_mgr.abort_request(seq_id)
         except Exception:
-            pass
+            logger.debug("abort_request failed on teardown", exc_info=True)
     engine.io_processor.requests.pop(seq_id, None)
 
 
@@ -1526,7 +1526,7 @@ async def value_error_handler(request: Request, exc: ValueError):
 
 @app.exception_handler(Exception)
 async def general_error_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled error: {exc}", exc_info=True)
+    logger.error("Unhandled error: %s", exc, exc_info=exc)
     return JSONResponse(
         status_code=500,
         content={
@@ -1801,8 +1801,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         logger.error(f"Validation error in chat_completions: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Error in chat_completions: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Error in chat_completions")
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/v1/completions")
@@ -1921,8 +1921,8 @@ async def completions(request: CompletionRequest, raw_request: Request):
         logger.error(f"Validation error in completions: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Error in completions: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Error in completions")
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/v1/messages")
@@ -2024,6 +2024,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                     max_ctx = int(_v)
                     break
             except Exception:
+                logger.debug("max_ctx candidate rejected", exc_info=True)
                 continue
         if not max_ctx:
             max_ctx = 30720

@@ -4,6 +4,9 @@
 import pytest
 import torch
 import torch.nn.functional as F
+
+pytest.importorskip("aiter", reason="the projections call AITER GEMMs")
+
 from atom.model_ops.deepseek_v41.projections import (
     grouped_output_projection,
     hc_projection,

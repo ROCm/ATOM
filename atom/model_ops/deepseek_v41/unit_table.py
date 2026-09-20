@@ -80,13 +80,3 @@ def unit_table(block_tables, batch_ids, units_per_page):
         BLOCK=block,
     )
     return out
-
-
-def unit_table_reference(block_tables, batch_ids, units_per_page):
-    """Pure-torch equivalent of :func:`unit_table`, padding rows included."""
-    pages = block_tables[batch_ids.clamp_min(0).long()]
-    tiles = torch.arange(
-        units_per_page, dtype=block_tables.dtype, device=block_tables.device
-    )
-    table = (pages[..., None] * units_per_page + tiles).flatten(-2)
-    return table.masked_fill((batch_ids < 0)[:, None], 0).int()

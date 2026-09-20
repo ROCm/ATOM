@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+pytest.importorskip("aiter", reason="the V4 kernels import the AITER runtime")
+
 from atom.model_ops.v4_kernels import (
     sparse_attn_v4_paged_decode,
     sparse_attn_v4_paged_prefill,

@@ -8,11 +8,24 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+
 from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 from atom.models.deepseek_v41.config import normalize_hf_config, validate_runtime_config
-from atom.models.deepseek_v41.runtime import DeepseekV41RuntimeModel
+
+
+def _runtime_pieces():
+    """The cache and the runtime model, which reach AITER through their ops.
+
+    Everything else in this module is admission and geometry arithmetic, which
+    a CPU-only runner can and should still check -- so these two come in here
+    rather than at module scope.
+    """
+    pytest.importorskip("aiter", reason="the paged cache and runtime reach AITER")
+    from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+    from atom.models.deepseek_v41.runtime import DeepseekV41RuntimeModel
+
+    return PagedAttentionCache, DeepseekV41RuntimeModel
 
 
 def test_production_geometry_has_only_four_global_owners():
@@ -96,7 +109,6 @@ def runtime_config(**overrides):
         {"kv_cache_dtype": "fp8"},
         {"index_cache_dtype": "bf16"},
         {"kv_cache_block_size": 3},
-        {"enable_expert_parallel": False},
     ],
 )
 def test_unimplemented_modes_fail_before_loading(override):
@@ -106,6 +118,7 @@ def test_unimplemented_modes_fail_before_loading(override):
 
 
 def test_empty_rank_padding_has_no_cache_writes(monkeypatch):
+    PagedAttentionCache, DeepseekV41RuntimeModel = _runtime_pieces()
     from atom.models.deepseek_v41 import runtime
 
     geo = V41PoolGeometry(2, ((1, 2),), 32, 4, 512, 32)
@@ -139,6 +152,7 @@ def test_a_forward_reads_nothing_the_forward_before_it_selected(monkeypatch):
     dereferences, so this is a fault, not a drift. `tiles` and `indptrs` are
     not in here because no layer fills them -- `begin_step` does, once.
     """
+    PagedAttentionCache, DeepseekV41RuntimeModel = _runtime_pieces()
     from atom.models.deepseek_v41 import runtime
 
     geo = V41PoolGeometry(2, ((1, 2),), 32, 4, 512, 32)

@@ -12,10 +12,18 @@ import torch
 
 @pytest.fixture(autouse=True)
 def _single_rank(monkeypatch):
-    """`EngramOp` builds an ATOM layer, and those read the process group."""
+    """`EngramOp` builds an ATOM layer, and those read the process group.
+
+    `linear` reaches AITER, which a CPU-only runner does not have. Nothing that
+    needs this patch can construct there either -- `make_op` skips first -- so
+    the absence is a no-op rather than a failure for the host-path tests.
+    """
     from types import SimpleNamespace
 
-    from atom.model_ops import linear
+    try:
+        from atom.model_ops import linear
+    except ModuleNotFoundError:
+        return
 
     monkeypatch.setattr(
         linear, "get_tp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=1)
@@ -34,7 +42,6 @@ from atom.model_ops.engram import (
     _is_prime,
     _next_prime,
 )
-from atom.model_ops.engram_layer import EngramOp
 from atom.model_ops.engram_lookup import HostEmbeddingTable
 
 # The engram block of deepseek-ai/DeepSeek-V4.1-Flash config.json -> text_config.
@@ -324,9 +331,17 @@ def test_wait_without_submit_is_a_noop():
 # --- device-side modules and the staging runtime ---
 
 
-def make_op(hidden=16, engram_hidden=24, hc=2) -> EngramOp:
+def make_op(hidden=16, engram_hidden=24, hc=2):
     """Unquantized, so the projection is BF16 -- the dtype `EngramHost` gathers
-    its rows into, and therefore what the embeddings below are."""
+    its rows into, and therefore what the embeddings below are.
+
+    The op is an ATOM layer and reaches AITER through it, so it is imported
+    here rather than at module scope: everything above this line is host
+    arithmetic that a CPU-only runner can and should still check.
+    """
+    pytest.importorskip("aiter", reason="EngramOp builds an AITER-backed layer")
+    from atom.model_ops.engram_layer import EngramOp
+
     op = EngramOp(
         layer_id=1, hidden_size=hidden, engram_hidden_size=engram_hidden, hc_mult=hc
     )

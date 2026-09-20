@@ -5,6 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
+pytest.importorskip("aiter", reason="the paged cache reaches AITER")
+
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.deepseek_v41.checkpoints import StateCopies
 from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
@@ -299,7 +302,6 @@ def test_verify_decode_kernel_is_causal_after_writing_the_whole_block(packed):
     from atom.model_ops.attentions.deepseek_v41.packed_attention import packed_decode
     from atom.model_ops.attentions.deepseek_v41.packed_rows import pack_rows
     from atom.model_ops.blockscale import quantize_fp8
-
     from atom.model_ops.v4_kernels import sparse_attn_v4_paged_decode
 
     torch.manual_seed(863)

@@ -13,7 +13,9 @@ from unittest.mock import MagicMock
 import pytest
 
 # Ensure aiter.dist.parallel_state exposes symbols mooncake_connector needs.
+# The top-level name is taken back down below.
 _ps = sys.modules.get("aiter.dist.parallel_state")
+_stubbed: list[str] = []
 if _ps is not None:
     for _fn in ("get_dp_group", "get_tp_group"):
         if not hasattr(_ps, _fn):
@@ -21,20 +23,35 @@ if _ps is not None:
 else:
     _aiter_pkg = types.ModuleType("aiter")
     _aiter_pkg.__path__ = []
-    sys.modules.setdefault("aiter", _aiter_pkg)
     _dist = types.ModuleType("aiter.dist")
     _dist.__path__ = []
-    sys.modules.setdefault("aiter.dist", _dist)
     _ps_stub = types.ModuleType("aiter.dist.parallel_state")
     for _fn in ("get_dp_group", "get_tp_group"):
         setattr(_ps_stub, _fn, MagicMock())
-    sys.modules.setdefault("aiter.dist.parallel_state", _ps_stub)
+    for _name, _mod in (
+        ("aiter", _aiter_pkg),
+        ("aiter.dist", _dist),
+        ("aiter.dist.parallel_state", _ps_stub),
+    ):
+        if _name not in sys.modules:
+            sys.modules[_name] = _mod
+            _stubbed.append(_name)
 
 from atom.kv_transfer.disaggregation.port_offset import (
     consumer_region_indices,
     side_channel_port_offset,
 )
 from atom.kv_transfer.disaggregation.types import ConnectorMetadata
+
+# Drop the top-level name now that the imports above are bound. The submodules
+# stay -- the connectors reach for them lazily, at call time -- but `aiter`
+# itself has no reader here, and leaving it is what made
+# `pytest.importorskip("aiter")` succeed in every module collected after this
+# one: the skip did not fire, and the real `from aiter import ...` inside the
+# module under test then raised ImportError during collection, which takes the
+# whole run down instead of skipping one file.
+if "aiter" in _stubbed:
+    del sys.modules["aiter"]
 
 # ---------------------------------------------------------------------------
 # pp-aware side-channel port offset

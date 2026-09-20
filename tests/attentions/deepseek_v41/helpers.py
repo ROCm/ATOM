@@ -35,12 +35,12 @@ def metadata_buffers(batch_size, tokens, blocks, device="cpu", geometry=None):
     no forward looks up, and `begin_step` asks for the ratios ITS geometry has.
     """
     import torch
-    from atom.model_ops.attentions.deepseek_v41.backend import (
-        DeepseekV41MetadataBuilder,
-    )
 
     from atom.model_ops.attentions.deepseek_v4_attn import (
         DeepseekV4AttentionMetadataBuilder,
+    )
+    from atom.model_ops.attentions.deepseek_v41.backend import (
+        DeepseekV41MetadataBuilder,
     )
     from atom.utils import CpuGpuBuffer
 

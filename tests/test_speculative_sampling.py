@@ -4,6 +4,8 @@
 import pytest
 import torch
 
+pytest.importorskip("aiter", reason="the sampler and rejection sampler are AITER ops")
+
 from atom.model_ops.rejection_sampler import rejection_sample
 from atom.model_ops.sampler import Sampler
 

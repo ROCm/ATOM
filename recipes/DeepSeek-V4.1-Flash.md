@@ -26,7 +26,8 @@ TP4 with whole-expert EP.
 | Candidate-only indexing, Engram residency and fusion | Not started |
 | Optional CED decoder replay | Not started |
 | Optional encoder replay with a persistent global cache | Not started |
-| Distributed and deployment combinations beyond TP4 + EP | Not validated |
+| TP4 with routed experts sharded across TP instead of whole-expert EP | GSM8K 0.9204 over 1,319 questions, inside the EP band; throughput not compared |
+| Distributed and deployment combinations beyond TP4 | Not validated |
 
 The full-layer path remains the numerical and performance baseline. CED and
 bounded replay are approximate modes with separate quality gates and cache
@@ -62,8 +63,9 @@ Weights remain native FP8 32x32 or FP4 group32. Dense projections use BF16 MFMA
 for group32 dot products and FP64 scaled accumulation; the routed experts use
 AITER's native A8W4 GEMMs, with the accepted numerical change documented in that
 same report. A native FP8 MFMA replacement has not passed the precision gate,
-and packed storage does not imply it has been enabled. Routed experts use
-whole-expert EP; shared experts reduce FP32 partials before rounding. V4.1
+and packed storage does not imply it has been enabled. Routed experts run under
+whole-expert EP or shard across TP, whichever the launch asks for; shared
+experts reduce FP32 partials before rounding. V4.1
 initializes the same distributed environment as every other model and has no
 collective policy of its own.
 

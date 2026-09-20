@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: MIT
 """V4.1 router and expert arithmetic, independent of dispatch/communication.
 
-Reference only: serving routes through V4's `FusedMoE`, and nothing in `atom`
-imports this. It is the readable statement of the math those kernels compute,
-pinned against the published model by `tests/models/deepseek_v41/test_math.py`.
+The oracle for `test_math.py`, and only that: serving routes through V4's
+`FusedMoE`. It is the readable statement of the math those kernels compute,
+pinned against the published model. It lived under `atom/model_ops/` while it
+was written, which read like a second expert implementation a caller might
+select; there is no such caller.
 """
 
 import torch

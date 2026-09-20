@@ -288,18 +288,6 @@ def load_model(
     `is_plugin_mode` is unused and kept for call-site compatibility.
     """
 
-    native_loader = getattr(model, "checkpoint_loader", None)
-    if native_loader is not None:
-        if spec_decode or prefix or is_plugin_mode or weights_mapper is not None:
-            raise ValueError(
-                "Native checkpoint loader requires an unprefixed target model"
-            )
-        from atom.utils import resolve_obj_by_qualname
-
-        return resolve_obj_by_qualname(native_loader)(
-            model, model_name_or_path, hf_config, load_dummy
-        )
-
     def _fuse_shared_expert(
         shared_expert_prefix: str, routed_expert_prefix: str
     ) -> bool:
