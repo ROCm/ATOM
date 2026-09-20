@@ -3,6 +3,7 @@
 
 import pytest
 import torch
+
 from atom.model_ops.blockscale import native_quant_linear
 
 pytestmark = pytest.mark.skipif(
@@ -52,12 +53,24 @@ def test_scaled_block_cancellation_preserves_small_term(fp4, splits, dtype):
     torch.testing.assert_close(actual, torch.ones_like(actual), rtol=0, atol=0)
 
 
+# Decoding an E8M0 code happens before the split reduction and before the
+# output cast, so the boundary codes sweep on their own; the balanced code
+# carries the split/dtype cross for the paths behind it.
 @pytest.mark.parametrize("fp4", [False, True])
-@pytest.mark.parametrize("splits", [1, 4])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(
-    "activation_code,weight_code",
-    [(127, 127), (0, 254), (254, 0), (128, 0), (0, 128), (255, 127), (127, 255)],
+    "splits,dtype,activation_code,weight_code",
+    [
+        (1, torch.bfloat16, 127, 127),
+        (4, torch.bfloat16, 127, 127),
+        (1, torch.float32, 127, 127),
+        (4, torch.float32, 127, 127),
+        (1, torch.bfloat16, 0, 254),
+        (1, torch.bfloat16, 254, 0),
+        (1, torch.bfloat16, 128, 0),
+        (1, torch.bfloat16, 0, 128),
+        (1, torch.bfloat16, 255, 127),
+        (1, torch.bfloat16, 127, 255),
+    ],
 )
 def test_e8m0_scale_boundaries(fp4, splits, dtype, activation_code, weight_code):
     # E8M0 has no zero: code 0 is 2**-127 and code 255 is NaN. Balancing

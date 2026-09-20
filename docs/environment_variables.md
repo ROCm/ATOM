@@ -170,6 +170,25 @@ that ever changes, so a fusion left inert by an unrecognised layout says so.
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_DSPARK_FUSED_CTX_KV** | bool | 1 (true) | Write the context rows with one Triton kernel (RMSNorm + RoPE + concat + paged store) instead of four launches plus a throwaway `empty_like` for the RoPE's query side. Falls back per call when the cache layout or the RoPE is not the plain one the kernel understands (seg / shuffled-KV layouts keep their own write kernels), and until the RoPE's cos/sin cache has reached the device. Measured on Kimi-K3 (MI355X, TP8, fp8 KV): one 4.65 µs kernel replaces a 14 µs three-kernel chain, saving ~39 µs per drafting step at B=1 and ~36 µs at B=64. Set to `0` to force the per-op chain; that chain is the fallback above rather than debug code, so it stays reachable either way (it runs the first write of every layer). |
+| **ATOM_DSPARK_DISABLE_COMPILE** | bool | 0 (false) | Run the DSpark draft eager while the target stays compiled. Prefer it over `--level 0`, which drops compilation for both models; `--enforce-eager` does not reach it, because `support_torch_compile` keys off `compilation_config.level` alone. Flips the decorator's own bypass rather than handing the draft a cloned config, so the shared `static_forward_context` registry stays one object. |
+
+### Speculative acceptance
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_ENABLE_RELAXED_MTP** | bool | 0 (false) | Accept a draft token when it lands in the target's top 10 within 0.6 of the top logit, instead of requiring the argmax. Intended for quantized MTP heads, whose drafts are right about the region and wrong about the exact winner often enough that strict acceptance throws away usable tokens. Read once at `rejection_sampler` import, so it must be set before the server starts. |
+
+## Engram (DeepSeek-V4.1)
+
+The n-gram tables are per-layer and large enough that where they live, and
+whether they are rebuilt, both show up at startup. Both switches below are
+all-or-nothing on purpose: a half-registered set would keep the host path for
+some layers and the device path for others, which is the confusing state.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_ENGRAM_UVA** | bool | 1 (true) | Page-lock this rank's shard of the hash tables in place and let a device kernel read the rows it needs across the bus, dequantizing there. No copy and no HBM for the table. `0` falls back to gathering the rows on the host, which returns the same rows but costs ~50 ms of CPU per decode step with the GPU idle behind it. Anything that would make the device path unsafe — no CUDA, more TP ranks than hash heads, a registration that will not fit — falls back on its own, so the switch is for taking the host path deliberately. |
+| **ATOM_ENGRAM_CACHE_DIR** | path | `~/.cache/atom/engram` | Where the compressed-vocab table is cached between runs. The table is reproducible from the tokenizer, so this only trades startup time for disk; point it at shared storage to let several servers build it once. A truncated or stale cache is rebuilt rather than raised. |
 
 ## V4 attention backend (Migration)
 

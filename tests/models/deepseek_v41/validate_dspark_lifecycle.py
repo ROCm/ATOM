@@ -2,6 +2,7 @@
 """Real TP scheduler lifecycle checks for native DSpark verification."""
 
 import argparse
+import copy
 import json
 import os
 from collections import Counter, deque
@@ -10,7 +11,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 import torch
-from tests.models.deepseek_v41.validate_dspark_runtime import diagnostic_config
 from transformers import AutoTokenizer
 
 from atom.config import (
@@ -23,7 +23,22 @@ from atom.config import (
 from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus
+from atom.models.deepseek_v41.config import validate_runtime_config
 from atom.sampling_params import SamplingParams
+
+
+def diagnostic_config(config):
+    """Validate the runtime as if the draft were absent.
+
+    `validate_runtime_config` rejects the combinations the engine cannot serve;
+    a DSpark-5 config has to clear that bar on its target alone, so the draft is
+    taken off the copy before the check rather than special-cased inside it.
+    """
+    speculative = config.speculative_config
+    assert speculative.method == "dspark" and speculative.num_speculative_tokens == 5
+    checked = copy.copy(config)
+    checked.speculative_config = None
+    validate_runtime_config(checked)
 
 
 def run_scenarios(

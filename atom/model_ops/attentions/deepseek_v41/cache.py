@@ -9,7 +9,6 @@ from atom.model_ops.attentions.deepseek_v41.packed_rows import (
     pack_rows,
     write_packed_window,
 )
-from atom.model_ops.deepseek_v41.dspark import gather_window_rows
 from atom.model_ops.attentions.pool_layout.entry_arena import EntryMajorArena
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     MQA_LOGITS_PRESHUFFLE_ROWS,
@@ -20,6 +19,7 @@ from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
 )
 from atom.model_ops.blockscale import quantize_fp4
 from atom.model_ops.deepseek_v41.compressor import compress_batch
+from atom.model_ops.deepseek_v41.dspark import gather_window_rows
 from atom.model_ops.deepseek_v41.index_write import write_index_rows
 from atom.model_ops.deepseek_v41.unit_table import unit_table
 from atom.model_ops.v4_kernels import make_compress_plans
@@ -89,7 +89,7 @@ class PagedAttentionCache:
             pin_memory=pinned,
         )
         # The same, for a verify step's candidate cursors: one row per prefix
-        # a request could have accepted, plus the length that bounds it.
+        # a request could have accepted.
         self.tentative_staging = CpuGpuBuffer(
             slots,
             geometry.speculative_tokens + 1,
@@ -97,9 +97,6 @@ class PagedAttentionCache:
             dtype=self.cursor.dtype,
             device=device,
             pin_memory=pinned,
-        )
-        self.tentative_limits = CpuGpuBuffer(
-            slots, dtype=self.cursor.dtype, device=device, pin_memory=pinned
         )
         # One H2D for every slot a forward recycles, so the two resets below are
         # two launches rather than two per fresh request. int64 because

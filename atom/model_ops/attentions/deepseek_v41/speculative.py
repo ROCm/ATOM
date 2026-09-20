@@ -24,7 +24,6 @@ class TentativeState:
         self.cache, self.step = cache, step
         self.request_indices = {span.slot: i for i, span in enumerate(step.requests)}
         self.staging = cache.tentative_staging
-        self.limits = cache.tentative_limits
         self.width = step.max_q_len
         self.histories = histories
         self.written = set()
@@ -54,7 +53,6 @@ class TentativeState:
         rows[:, 1:] = np.lib.stride_tricks.sliding_window_view(
             np.concatenate((history, ids)), history.size
         )[1:]
-        self.limits.np[i] = span.length
         self.written.add(span.slot)
 
     def commit(self, accepted_lengths):
@@ -73,14 +71,9 @@ class TentativeState:
             if self.staged_on_device
             else self.staging.copy_to_gpu(count)
         )[:, : self.width]
-        # Four launches and a copy every step, and the only thing `self.limits`
-        # is staged for. Uncomment when a wrong accepted length is the suspect:
-        # neither end faults, so it is silent -- 0 indexes row -1, and a length
-        # past the staged span reads an earlier round's row.
-        # torch._assert_async(
-        #     ((lengths >= 1) & (lengths <= self.limits.copy_to_gpu(count))).all(),
-        #     "Accepted prefix is outside the verification span",
-        # )
+        # An accepted length outside `[1, staged span]` is silent here -- 0
+        # indexes row -1 and an over-long one reads an earlier round's row --
+        # so a wrong length shows up as wrong tokens, not as a fault.
         batch = torch.arange(count, device=lengths.device)
         # The scheduled prefix, not the forward's width: a padding request owns
         # no slot, and the 0 standing in for one is a live request's.

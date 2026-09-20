@@ -16,40 +16,44 @@ E4M3 versus E8M0 scale rules, 20-iteration Sinkhorn, and the attention kernel's
 64-row online softmax with BF16 probability rounding. They deliberately
 materialize/dequantize small tensors and must not enter a serving path.
 
-The harness cache regression and paired-statistics tests use optional evaluation
-packages. The recorded complete run uses lm-eval 0.4.11, sqlitedict 2.1.0 and
-SciPy 1.16.3. Tests needing those packages skip when unavailable; pure cache
-identity checks still run. Install the evaluation packages for the full suite:
+## Running
 
 ```bash
-python -m pip install 'lm-eval==0.4.11' 'scipy==1.16.3'
 python -m pytest -q tests/models/deepseek_v41
 ATOM_DSV41_REFERENCE=/path/to/DeepSeek-V4.1-Flash \
   python -m pytest -q tests/models/deepseek_v41
 ```
 
-With evaluation dependencies installed but no reference path, the
-local-checkpoint and official-model tests skip. The checkpoint check validates
-all 48 headers, the complete 96085-tensor index, contiguous offsets, exact file
-sizes, readable final pages, and available
-download revision metadata. It does not checksum the 475 GiB tensor payload.
-commands and results are in `docs/deepseek_v41_validation.md`.
+Without a reference path, the local-checkpoint and official-model tests skip.
+The checkpoint check validates all 48 headers, the complete 96,085-tensor index,
+contiguous offsets, exact file sizes, readable final pages, and available
+download revision metadata; it does not checksum the 475 GiB tensor payload.
 
-P03 compares Single-Pass mHC, router, weighted SwiGLU, and Engram residual math
-with the pinned upstream methods. Tests cover native GPU W4A8 experts and FP8
-Engram projection, actual layer-1 table rows/projection weights, and official
-tokenizer hashes across chunks, image boundaries and accepted prefix lengths.
-Prefetch and fallback row IDs both match that official history oracle. Request
-snapshot identity, ragged staging, padding, and cancellation are covered in
-`tests/model_ops/test_engram.py`. This remains module-level validation.
+## What is covered here
 
-Index selection tests live in `test_indexer.py`. They cover compact candidate
-blocks, candidate-only Reindex, causal visibility, short/empty prefixes, and the
-smaller-position score-tie rule on CPU and ROCm.
-Selection is stable across key tile boundaries; higher scores always win, the
-newest visible block is retained, and returned position IDs remain ascending.
-The pinned upstream top-k does not define a deterministic position tie rule, so
-exact ties use explicit position-based expectations in addition to dense
-reference checks on untied scores. `test_indexer_long.py` also exercises the
-published 512-token / 2,048-block limits with 32 heads, D=128 and 32,771 keys.
-Indexer checks alone do not establish model accuracy or throughput.
+`test_math.py` compares Single-Pass mHC, the router, weighted SwiGLU and the
+Engram residual against the pinned upstream methods, including native GPU W4A8
+experts, FP8 Engram projection, and actual layer-1 table rows and projection
+weights. Official tokenizer hashes are checked across chunks, image boundaries
+and accepted prefix lengths, and prefetch and fallback row IDs both match that
+history oracle. Request snapshot identity, ragged staging, padding and
+cancellation live in `tests/model_ops/test_engram.py`. This is module-level
+validation, not model accuracy.
+
+`test_indexer.py` covers compact candidate blocks, candidate-only Reindex,
+causal visibility, short and empty prefixes, and the smaller-position score-tie
+rule on both CPU and ROCm. Selection is stable across key tile boundaries,
+higher scores always win, the newest visible block is retained, and returned
+position IDs stay ascending. Because the pinned upstream top-k defines no
+deterministic position tie rule, exact ties are asserted against explicit
+position-based expectations in addition to dense reference checks on untied
+scores. Indexer checks alone establish neither model accuracy nor throughput.
+
+## Manual GPU gates
+
+`validate_dspark_lifecycle.py` here, and `validate_runtime.py` under
+`tests/attentions/deepseek_v41/`, are `torchrun` entry points rather than pytest
+modules — they need four GPUs and the real checkpoint, so pytest never collects
+them. Their invocations are in
+[the DSpark guide](../../../docs/deepseek_v41_dspark.md#validation) and
+[the runtime guide](../../../docs/deepseek_v41_runtime.md#scheduler-acceptance).

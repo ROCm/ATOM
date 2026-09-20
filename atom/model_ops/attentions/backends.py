@@ -75,7 +75,6 @@ class AttentionBackend(ABC):
     # For some attention backends, we allocate an output tensor before
     # calling the custom op. When piecewise cudagraph is enabled, this
     # makes sure the output tensor is allocated inside the cudagraph.
-    use_custom_all_reduce: ClassVar[bool] = True
     accept_output_buffer: bool = False
 
     #: Whether a *draft* of this flavor caches into a pool of its own. False

@@ -16,6 +16,8 @@ from pathlib import Path
 
 import numpy as np
 
+from atom.utils import envs
+
 logger = logging.getLogger(__name__)
 
 # Matches the reference: layer seeds are spaced by this prime so two layers
@@ -65,7 +67,6 @@ class EngramConfig:
     pad_token_id: int
     compressed_vocab_size: int
     seed: int = 0
-    kernel_size: int = 4
 
     @classmethod
     def from_hf(cls, text_config: dict) -> EngramConfig | None:
@@ -82,7 +83,6 @@ class EngramConfig:
             pad_token_id=int(text_config["engram_pad_token_id"]),
             compressed_vocab_size=int(text_config["engram_compressed_vocab_size"]),
             seed=int(text_config.get("engram_seed", 0)),
-            kernel_size=int(text_config.get("engram_kernel_size", 4)),
         )
 
     @property
@@ -135,10 +135,10 @@ class CompressedTokenizer:
         return h.hexdigest()[:16]
 
     def _load_or_build(self, cache_dir: str | None) -> tuple[np.ndarray, int]:
-        cache_dir = cache_dir or os.environ.get(
-            "ATOM_ENGRAM_CACHE_DIR", str(Path.home() / ".cache" / "atom" / "engram")
+        path = (
+            Path(cache_dir or envs.ATOM_ENGRAM_CACHE_DIR)
+            / f"compressed_vocab_{self._cache_key()}.npz"
         )
-        path = Path(cache_dir) / f"compressed_vocab_{self._cache_key()}.npz"
         if path.is_file():
             try:
                 blob = np.load(path)

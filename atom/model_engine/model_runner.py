@@ -975,12 +975,7 @@ class ModelRunner:
         else:
             # The group spans the devices that exist; apply_simulated_tp then
             # makes it *report* the logical width so layers shard that many ways.
-            initialize = init_dist_env
-            if not self.attn_backend.use_custom_all_reduce:
-                from atom.distributed.rccl import init_rccl_dist_env
-
-                initialize = init_rccl_dist_env
-            initialize(
+            init_dist_env(
                 config.tp_world_size,
                 rankID=rank,
                 backend="nccl",
@@ -3129,16 +3124,6 @@ class ModelRunner:
                 bonus_token_ids,
                 target_token_ids=target_token_ids,
             )
-            # DIAGNOSTIC175: force every draft to be rejected. Drafts are still
-            # proposed, still written to the window and the compressed rows, and
-            # still rolled back -- only the accepted prefix is pinned to the
-            # anchor. Divergence from baseline under this clamp cannot come from
-            # an accepted draft token, so it isolates what survives the rollback.
-            # Revert before any acceptance run: grep -rn DIAGNOSTIC175 atom/
-            if os.environ.get("ATOM_DSPARK_FORCE_REJECT") == "1" and torch.is_tensor(
-                num_bonus_tokens
-            ):
-                num_bonus_tokens = torch.zeros_like(num_bonus_tokens)
             # PCP ranks decode redundantly and are consistent only while their
             # kernels agree bit-for-bit -- they don't (hidden differs by ~1 bf16
             # ULP, flipping ~24% of the near-tie verify argmaxes). Accept counts

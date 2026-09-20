@@ -11,7 +11,8 @@ published model and end-to-end `lm_eval` scores instead.
 
 - `models/deepseek_v41/model.py` and `attention.py` own model arithmetic.
   `runtime.py` adapts its input/output contract to ModelRunner. Q/KV and output
-  projections run over the flat token batch; compression and index selection
+  projections run over the flat token batch, and compression and index selection
+  take every boundary in that batch in one call rather than looping per request.
 - `model_ops/attentions/deepseek_v41/` owns metadata, addresses, PAGE/STATE views
   and checkpoint copies. Geometry is declared separately in
   `pool_layout/v41_pool_geometry.py` without model or scheduler imports.
@@ -34,10 +35,10 @@ of the historical main KV.
 With BF16 production geometry and block size 16, one PAGE costs 51,200 bytes
 and one STATE entry costs 5,256,192 bytes. The complete image occupies 103 PAGE
 units. The optional packed layout uses 15,104 bytes per PAGE and 2,715,904 bytes
-per STATE (180 smaller PAGE units). Allocation and checkpoints use these same declarations. Positions and
-Engram history advance after the model forward; checkpoints carry every state
-field and padding byte. Images are versioned by geometry, the index plane's
-format included.
+per STATE (180 smaller PAGE units). Allocation and checkpoints use these same
+declarations. Positions and Engram history advance after the model forward;
+checkpoints carry every state field and padding byte. Images are versioned by
+geometry, the index plane's format included.
 
 An exact prefix hit restores the entire state before preparing Engram inputs.
 Without a matching image, the generic scheduler replays from a recoverable
@@ -68,15 +69,14 @@ an even cache block size. The architecture is `DeepseekV41ForCausalLM`.
 other before loading weights. The main pool is independent of it and takes
 `kv_cache_dtype="bf16"` or `"fp4"`; under FP4, main rows use their own format
 and SWA uses FP8. Both use the original V4 BF16 attention kernels and inverse
-RoPE; the V4 files have no P09 modifications.
+RoPE; no V4 file is modified to serve V4.1.
 
 One plane means one scorer, for every shape. It reads the plane in place and
 gives each query row its own bound and its own tile list, so a prefill token, a
 decode token and a drafted token are one shape to it and a ragged batch is not
 a case. DeepSeek-V4 scores its own prefill by concatenating the batch's keys
 instead; both arrangements were measured on the production geometry, and the
-paged one holds `1/batch` of the logits at equal speed
-(`/app/logs_claude/v41_index_scorer_record.md`).
+paged one holds `1/batch` of the logits at equal speed.
 
 Because a block id names 16 index rows and a ratio-2 owner halves the PAGE
 before that count is taken, the PAGE token count has a floor of 32; production
@@ -105,20 +105,20 @@ turns out to be. The padding carries V4's own sentinels: a padding token's
 batch id is `-1` and a padding request is zero-length in `cu_seqlens_q`, and
 every scatter bails on one or the other, so those rows read and write nothing.
 
-The FFN and its RCCL reductions are captured with the rest: the routed experts
+The FFN and its collective reductions are captured with the rest: the routed experts
 are V4's `FusedMoE`, which is capturable at every shape, so there is no expert
 backend to select and no capture exclusion.
 
-See [the P09 report](deepseek_v41_performance.md) for cache formats, graph
-ownership, comparison commands and measured limits. Native five-token DSpark
-supports TP4 text requests with BF16 caches; target graphs are optional. Its
-draft windows, accepted-prefix state, calibration and validated scope are
-documented in [the DSpark guide](deepseek_v41_dspark.md).
-Packed speculative caches and multimodal speculation are rejected.
-torch.compile, PP/CP/DP, TBO, KV transfer, plugin execution and EPLB also
-remain rejected before loading.
+See [cache format and graph execution](deepseek_v41_performance.md) for cache
+formats, graph ownership and measured limits. Native five-token DSpark supports
+TP4 text requests with BF16 caches and optional target graphs; its draft
+windows, accepted-prefix state, calibration profile, validated scope and **open
+quality regression** are in [the DSpark guide](deepseek_v41_dspark.md). Packed
+speculative caches and multimodal speculation are rejected, as are
+torch.compile, PP/CP/DP, TBO, KV transfer, plugin execution and EPLB — all
+before loading.
 
-The [V4.1 chat/tool protocol](deepseek_v41_protocol.md) is enabled by P06.
-[Vision and multimodal chunking](deepseek_v41_vision.md) are enabled independently
-of speculation. Host Engram lookup still reads final GPU IDs on the CPU; HBM
-lookup and further fusion belong to P11.
+The [chat and tool protocol](deepseek_v41_protocol.md) and
+[vision and multimodal chunking](deepseek_v41_vision.md) are enabled
+independently of speculation. Host Engram lookup still reads final GPU IDs on
+the CPU; moving the lookup to HBM and fusing it further is future work.

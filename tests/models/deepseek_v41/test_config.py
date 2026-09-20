@@ -4,14 +4,14 @@ from copy import deepcopy
 from dataclasses import FrozenInstanceError
 
 import pytest
-from atom.models.deepseek_v41.config import (
-    AttentionMode,
-    NativeQuantization,
-    build_attention_topology,
-    normalize_hf_config,
-)
 
 from atom.config import get_hf_config
+from atom.models.deepseek_v41.config import (
+    AttentionMode,
+    build_attention_topology,
+    normalize_hf_config,
+    validate_native_quantization,
+)
 from atom.quant_spec import get_quant_parser
 from atom.utils.selector import Family, attn_family, get_attn_backend_cls
 
@@ -47,9 +47,8 @@ def test_hf_config_preserves_text_vision_quantization_and_root_tokens(raw_config
     config.validate_parallelism(8, 8)
 
 
-def test_native_quantization_retains_source_blocks(raw_config):
-    native = NativeQuantization.from_dict(raw_config["quantization_config"])
-    assert native.weight_block_size == (32, 32) and native.activation_block_size == 32
+def test_the_published_quantization_block_is_accepted(raw_config):
+    validate_native_quantization(raw_config["quantization_config"])
     parsed = get_quant_parser("fp8").parse(raw_config["quantization_config"])
     assert parsed.global_spec.quant_type.name == "per_1x32"
     assert parsed.global_spec.weight_block_size == (32, 32)
@@ -62,6 +61,30 @@ def test_native_quantization_retains_source_blocks(raw_config):
         assert (
             get_quant_parser("fp8").parse(cfg).global_spec.quant_type.name == expected
         )
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    [
+        ("quant_method", "awq", "native FP8 checkpoint format"),
+        ("weight_block_size", [128, 128], "weight_block_size must be"),
+        ("scale_fmt", "e8m0", "dense scales must be ue8m0"),
+        ("activation_scheme", "static", "dynamic per-32 FP8 activations"),
+        ("expert_dtype", "fp8", "routed experts must use native fp4"),
+    ],
+)
+def test_every_unsupported_quantization_field_is_refused(
+    raw_config, field, value, message
+):
+    """Each of the five is a separate refusal, not one collapsed check.
+
+    The kernels read exactly one format, so a checkpoint declaring another has
+    no slower path to fall back to -- and a refusal that named only the first
+    wrong field would send the next one back for a second round trip.
+    """
+    cfg = {**raw_config["quantization_config"], field: value}
+    with pytest.raises(ValueError, match=message):
+        validate_native_quantization(cfg)
 
 
 def test_topology_resolves_four_physical_owners(raw_config):

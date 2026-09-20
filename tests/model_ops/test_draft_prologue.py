@@ -49,10 +49,21 @@ def _torch_index_chain(positions, ring, window, width):
     return draft_step(context_positions, positions, width, window), context_positions
 
 
-@pytest.mark.parametrize("width", [5, 1, 8])
-@pytest.mark.parametrize("window", [128, 64])
-@pytest.mark.parametrize("ring", [128, 64, 256])
-@pytest.mark.parametrize("batch", [1, 4, 16, 64])
+# The kernel is one program per row, so the batch axis only varies how many
+# rows there are; what the index math turns on is how `ring` sits against
+# `window` and how wide the draft is.
+@pytest.mark.parametrize("batch", [1, 64])
+@pytest.mark.parametrize(
+    "ring,window,width",
+    [
+        (128, 64, 5),  # ring wider than the window, production width
+        (128, 128, 5),  # ring exactly the window
+        (64, 128, 5),  # ring narrower than the window
+        (256, 64, 1),  # single-column draft
+        (64, 64, 8),  # widest draft on the tightest ring
+        (256, 128, 8),
+    ],
+)
 def test_index_build_is_bit_exact(batch, ring, window, width):
     gen = torch.Generator(device=DEV).manual_seed(batch * ring + window + width)
     positions = torch.randint(
@@ -88,9 +99,11 @@ def test_partly_filled_ring_wraps_the_way_torch_does(ring):
     assert torch.equal(fused_indices[0, 0], fused_indices[0, -1])
 
 
-@pytest.mark.parametrize("hidden", [5120, 1024])
-@pytest.mark.parametrize("width", [5, 1, 8])
-@pytest.mark.parametrize("batch", [1, 4, 16, 64])
+# `hidden` only sets the tile-loop count; width and batch set the broadcast.
+@pytest.mark.parametrize(
+    "batch,width,hidden",
+    [(1, 5, 5120), (64, 5, 5120), (1, 1, 1024), (64, 8, 1024), (64, 1, 5120)],
+)
 def test_block_state_matches_embed_then_broadcast(batch, width, hidden):
     gen = torch.Generator(device=DEV).manual_seed(batch * width + hidden)
     anchor = torch.randn(batch, hidden, generator=gen, device=DEV, dtype=torch.bfloat16)

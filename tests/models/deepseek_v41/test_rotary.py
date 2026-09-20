@@ -3,36 +3,11 @@
 
 import pytest
 import torch
+
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-@pytest.mark.parametrize("yarn", [False, True])
-@pytest.mark.parametrize("inverse", [False, True])
-@pytest.mark.parametrize(
-    "batch,length,heads,head_dim,strided",
-    [
-        (1, 0, 16, 512, False),
-        (2, 0, None, 128, False),
-        (0, 5, 8, 512, False),
-        (1, 1, 16, 512, False),
-        (2, 5, 8, 512, True),
-        (2, 5, None, 128, True),
-        (2, 33, 4, 128, False),
-        (1, 257, 16, 512, False),
-    ],
-)
-def test_rotation_batch_positions_and_aliasing(
-    inverse, yarn, batch, length, heads, head_dim, strided
-):
-    torch.manual_seed(433)
-    rope = RotaryEmbedding(
-        64,
-        8192,
-        base=160000 if yarn else 10000,
-        original_length=65536 if yarn else 0,
-        factor=16,
-    ).cuda()
+def _rotate_and_check(rope, inverse, batch, length, heads, head_dim, strided):
     tail_shape = (head_dim,) if heads is None else (heads, head_dim)
     storage = torch.randn(
         batch,
@@ -62,6 +37,48 @@ def test_rotation_batch_positions_and_aliasing(
         assert torch.equal(storage[:, 1::2], untouched)
     # Operator rounding tolerance; full-model quality is evaluated separately.
     torch.testing.assert_close(result[..., -64:], expected, rtol=1 / 128, atol=2**-16)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("inverse", [False, True])
+@pytest.mark.parametrize(
+    "batch,length,heads,head_dim,strided",
+    [
+        (1, 0, 16, 512, False),
+        (2, 0, None, 128, False),
+        (0, 5, 8, 512, False),
+        (1, 1, 16, 512, False),
+        (2, 5, 8, 512, True),
+        (2, 5, None, 128, True),
+        (2, 33, 4, 128, False),
+        (1, 257, 16, 512, False),
+    ],
+)
+def test_rotation_batch_positions_and_aliasing(
+    inverse, batch, length, heads, head_dim, strided
+):
+    torch.manual_seed(433)
+    rope = RotaryEmbedding(64, 8192, base=10000, original_length=0, factor=16).cuda()
+    _rotate_and_check(rope, inverse, batch, length, heads, head_dim, strided)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("inverse", [False, True])
+def test_yarn_frequencies_are_the_table_the_kernel_applies(inverse):
+    """YaRN only rebuilds the frequency table.
+
+    The expectation above reads that table back out of `rope.frequencies`, so
+    the claim the extended table makes is the same one at every shape: the
+    kernel rotates by what the table holds. One shape settles it; sweeping YaRN
+    across the layout cases doubles the grid and re-asserts this sentence.
+    """
+    torch.manual_seed(433)
+    rope = RotaryEmbedding(
+        64, 8192, base=160000, original_length=65536, factor=16
+    ).cuda()
+    plain = RotaryEmbedding(64, 8192, base=10000, original_length=0, factor=16).cuda()
+    assert not torch.equal(rope.frequencies, plain.frequencies)
+    _rotate_and_check(rope, inverse, 2, 33, 4, 128, False)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")

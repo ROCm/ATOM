@@ -1,10 +1,10 @@
 # DeepSeek-V4.1 chat, tools and reasoning
 
-P06 enables the native V4.1 text protocol on the Python OpenAI-compatible
-entrypoints and the Rust mesh tool parser. ATOM loads the checkpoint's standalone encoding/encoding.py when
-config.json declares model_type="deepseek_v41". Keep that directory alongside
-the tokenizer and weights. An ambiguous encoder directory is rejected by the
-existing discovery policy.
+The native V4.1 text protocol runs on the Python OpenAI-compatible entrypoints
+and the Rust mesh tool parser. ATOM loads the checkpoint's standalone
+`encoding/encoding.py` when `config.json` declares `model_type="deepseek_v41"`;
+keep that directory alongside the tokenizer and weights. An ambiguous encoder
+directory is rejected by the existing discovery policy.
 
 Prompt construction uses the official encoder from revision
 dba1be0a40aa45a94ad051997016db3960a90277, SHA256
@@ -89,56 +89,34 @@ decoding in this phase.
 
 ## Validation
 
-On ljin_dev with the local pinned checkpoint:
-
-- Rust mesh tool-parser regression: 107 passed, including the existing V4
-  parser and V4.1 shared fixtures at every UTF-8 boundary and character stream.
-  The same fixture file passes the Python streaming/complete parser checks.
-
-- 2,282 entrypoint tests passed; 56 skipped and 3 expected failures. The skips
-  are 21 opt-in HTTP server integration tests and 35 inapplicable combinations
-  in the generic parser properties. All 69 V4.1 protocol tests ran.
+- The Rust mesh tool-parser regression and the Python streaming/complete parser
+  checks consume the **same fixture file**, at every UTF-8 boundary and
+  character stream, so the two implementations cannot drift apart silently.
 - Differential tests check official prompts, numeric budgets, old reasoning,
   mid-conversation system updates, structured text and reversed tool results.
-  Typed namespace calls match the official non-streaming parser and every
+  Typed namespace calls match the official non-streaming parser at every
   possible two-chunk boundary.
 - The actual chat handler's argument merge is tested, including defaults,
   explicit on/off, numeric effort, and HTTP 400 before generation for invalid
   numeric budgets and invalid native effort controls.
-- A real TP4 ModelRunner/Scheduler run used P09 AITER MoE, packed KV/index
-  storage and PIECEWISE graphs. Chinese chat returned "中国的首都是北京。";
-  thinking returned reasoning plus final answer "4"; the model called
-  math::add with a=17, b=25, then answered "17 + 25 = 42。" after the tool result.
-  All ranks generated identical tokens. Character-by-character reasoning/tool
-  parsing matched whole-output parsing for all four replies.
-- Black and git diff --check pass. Ruff reports no new findings; the nine
-  existing api_server.py findings match the parent commit.
+- A real TP4 ModelRunner/Scheduler run with packed KV/index storage and
+  PIECEWISE graphs: Chinese chat returned `中国的首都是北京。`; thinking returned
+  reasoning plus the final answer `4`; the model called `math::add` with
+  `a=17, b=25` and answered `17 + 25 = 42。` after the tool result. All ranks
+  generated identical tokens, and character-by-character reasoning/tool parsing
+  matched whole-output parsing for all four replies.
 
-The TP4 harness runs through ModelRunner/Scheduler, not a listening HTTP
-server. The HTTP route's control handling is tested with a synthetic generation
-source. These are protocol acceptance checks, not a tool-use benchmark or a
-new general-quality score. P09's accepted arithmetic and its 12/16 GSM8K
-sample result are unchanged.
+That TP4 run goes through ModelRunner/Scheduler, not a listening HTTP server;
+the HTTP route's control handling is tested against a synthetic generation
+source instead. These are protocol acceptance checks, not a tool-use benchmark
+or a general-quality score.
 
-Reproduce the CPU/reference checks:
+Reproduce the CPU and reference checks:
 
 ```bash
 ATOM_DSV41_MODEL=/mnt/DeepSeek-V4.1-Flash \
 pytest -q -rs tests/entrypoints
 ```
-
-Reproduce the real checkpoint check with the pinned AITER environment from the
-runtime guide:
-
-```bash
-HIP_VISIBLE_DEVICES=0,1,2,3 \
-torchrun --standalone --nproc_per_node=4 \
-  -m tests.attentions.deepseek_v41.validate_chat \
-  --model /mnt/DeepSeek-V4.1-Flash --output /tmp/p06-chat-smoke.json
-```
-
-The harness uses a bounded PAGE allocation. Its fixed generation budgets are
-only test limits; replies are parsed up to their first EOS.
 
 ## CPU overhead and boundaries
 
@@ -155,12 +133,10 @@ The difference in the tools row is measurement noise. The adapter adds about
 65.54/65.76 us for a 64-character argument and 6.23/6.15 ms for a 128 KiB
 argument. These are CPU microbenchmarks, not end-to-end latency improvements.
 
-Encoder discovery belongs to chat_encoders.py. Request translation belongs to
-deepseek_v41_encoder.py. DSML syntax belongs to deepseekv41_tool_parser.py;
-the common stream engine owns buffering and dispatch. This phase changes no
-model, attention, MoE, scheduler or graph kernels.
-
-Image execution and multimodal embedding lifetime remain P07/P08. P06 does not
+Encoder discovery belongs to `chat_encoders.py`, request translation to
+`deepseek_v41_encoder.py`, and DSML syntax to `deepseekv41_tool_parser.py`; the
+common stream engine owns buffering and dispatch. The protocol changes no
+model, attention, MoE, scheduler or graph kernel, and it does not by itself
 enable image requests, constrained decoding, speculative decoding or new
-distributed configurations. Evidence and benchmark scripts are retained in
-/app/logs_claude/atom_dsv41_flash_impl_20260912/p06_protocol/.
+distributed configurations. Image execution and multimodal embedding lifetime
+are covered in [image requests](deepseek_v41_vision.md).

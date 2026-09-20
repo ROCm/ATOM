@@ -22,6 +22,7 @@ import logging
 import math
 import os
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("atom")
@@ -783,6 +784,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ranks than hash heads, a registration that will not fit -- falls back on
     # its own, so the switch is for taking the host path deliberately.
     "ATOM_ENGRAM_UVA": lambda: os.getenv("ATOM_ENGRAM_UVA", "1") == "1",
+    # Where the compressed-vocab table is cached between runs. The table is
+    # reproducible from the tokenizer, so this only trades startup time for
+    # disk; point it at shared storage to let several servers build it once.
+    "ATOM_ENGRAM_CACHE_DIR": lambda: os.getenv(
+        "ATOM_ENGRAM_CACHE_DIR", str(Path.home() / ".cache" / "atom" / "engram")
+    ),
 }
 
 

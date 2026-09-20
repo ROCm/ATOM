@@ -21,7 +21,6 @@ class LayerAttentionSpec:
     ratio: int
     mode: AttentionMode
     kv_owner: int | None = None
-    index_key_owner: int | None = None
     topk_owner: int | None = None
     candidate_owner: int | None = None
 
@@ -40,26 +39,23 @@ class LayerAttentionSpec:
         return None if self.produces_candidates else self.candidate_owner
 
 
-@dataclass(frozen=True)
-class NativeQuantization:
-    weight_block_size: tuple[int, int]
-    activation_block_size: int
-    scale_format: str
-    expert_dtype: str
+def validate_native_quantization(config):
+    """Reject a checkpoint whose quantization is not the one V4.1 reads.
 
-    @classmethod
-    def from_dict(cls, config):
-        if config.get("quant_method") != "fp8":
-            raise ValueError("DeepSeek-V4.1 requires the native FP8 checkpoint format")
-        if config.get("weight_block_size") not in ([32, 32], (32, 32)):
-            raise ValueError("DeepSeek-V4.1 weight_block_size must be [32, 32]")
-        if config.get("scale_fmt") != "ue8m0":
-            raise ValueError("DeepSeek-V4.1 dense scales must be ue8m0")
-        if config.get("activation_scheme") != "dynamic":
-            raise ValueError("DeepSeek-V4.1 requires dynamic per-32 FP8 activations")
-        if config.get("expert_dtype") != "fp4":
-            raise ValueError("DeepSeek-V4.1 routed experts must use native fp4 weights")
-        return cls((32, 32), 32, "ue8m0", "fp4")
+    There is no second format to select between, so this returns nothing: the
+    five shapes below are the only ones the kernels accept, and a checkpoint
+    that declares anything else has no reader to fall back to.
+    """
+    if config.get("quant_method") != "fp8":
+        raise ValueError("DeepSeek-V4.1 requires the native FP8 checkpoint format")
+    if config.get("weight_block_size") not in ([32, 32], (32, 32)):
+        raise ValueError("DeepSeek-V4.1 weight_block_size must be [32, 32]")
+    if config.get("scale_fmt") != "ue8m0":
+        raise ValueError("DeepSeek-V4.1 dense scales must be ue8m0")
+    if config.get("activation_scheme") != "dynamic":
+        raise ValueError("DeepSeek-V4.1 requires dynamic per-32 FP8 activations")
+    if config.get("expert_dtype") != "fp4":
+        raise ValueError("DeepSeek-V4.1 routed experts must use native fp4 weights")
 
 
 def _layer_ids(config, field, stop):
@@ -141,7 +137,6 @@ def build_attention_topology(config) -> tuple[LayerAttentionSpec, ...]:
                 layer_id,
                 ratio,
                 mode,
-                kv_owner,
                 kv_owner,
                 topk_owner,
                 candidate if uses_candidates else None,
@@ -230,7 +225,7 @@ def normalize_hf_config(raw: dict) -> DeepseekV41TextConfig:
     ):
         if field in raw:
             text.setdefault(field, deepcopy(raw[field]))
-    NativeQuantization.from_dict(text["quantization_config"])
+    validate_native_quantization(text["quantization_config"])
     text.pop("model_type")
     config = DeepseekV41TextConfig(**text)
     required_positive = (
