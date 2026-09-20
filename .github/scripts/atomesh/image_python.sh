@@ -29,10 +29,13 @@ python3() {
   local -a args=(run --rm -i --user "$(id -u):$(id -g)"
     -v "${PWD}:${PWD}" -w "${PWD}"
     -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPATH="${PWD}:${PWD}/tests"
+    -e USER="$(id -un 2>/dev/null || id -u)"
+    -e TORCHINDUCTOR_CACHE_DIR=/tmp/atomesh-ci-inductor
+    -e XDG_CACHE_HOME=/tmp/atomesh-ci-cache
     -e HIP_VISIBLE_DEVICES=)
   for name in $(compgen -e); do
     case "${name}" in
-      ATOMESH_*|RESULT_DIR|MODEL_NAME|CASE_NAME|SUITE|INPUT_ATOMESH_IMAGE|USER)
+      ATOMESH_*|RESULT_DIR|MODEL_NAME|CASE_NAME|SUITE|INPUT_ATOMESH_IMAGE)
         args+=(-e "${name}=${!name}") ;;
     esac
   done
