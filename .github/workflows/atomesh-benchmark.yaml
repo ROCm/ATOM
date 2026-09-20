@@ -225,10 +225,36 @@ permissions:
   contents: write
 
 jobs:
+  stage-routing-bundle:
+    name: Stage measured routing calibration
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.suite == 'agentic_scaling' && inputs.cache_routing_bundle != '' }}
+    runs-on: ${{ inputs.atomesh_slurm_submit_runner }}
+    steps:
+      - name: Read calibration from the Slurm submit host
+        env:
+          INPUT_CACHE_ROUTING_BUNDLE: ${{ inputs.cache_routing_bundle }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/atomesh-routing-input"
+          cp -- "${INPUT_CACHE_ROUTING_BUNDLE}" "${RUNNER_TEMP}/atomesh-routing-input/bundle.json"
+
+      - name: Upload calibration for image validation
+        uses: actions/upload-artifact@v7
+        with:
+          name: atomesh-routing-input
+          path: ${{ runner.temp }}/atomesh-routing-input/bundle.json
+          if-no-files-found: error
+
   load-config:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    needs: [stage-routing-bundle]
+    if: >-
+      always() && !cancelled()
+      && (!github.event.pull_request || github.event.pull_request.draft == false)
+      && (needs.stage-routing-bundle.result == 'success' || needs.stage-routing-bundle.result == 'skipped')
     name: Load ATOMesh benchmark config
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.suite == 'agentic_scaling' && inputs.atomesh_slurm_submit_runner || 'ubuntu-latest' }}
+    # The Slurm submit host has no Docker access. Use the existing image-build
+    # runner for container validation; GPU allocations still use Slurm below.
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.suite == 'agentic_scaling' && 'linux-atom-mi35x-1' || 'ubuntu-latest' }}
     outputs:
       matrix_json: ${{ steps.matrix.outputs.matrix_json }}
       has_matrix: ${{ steps.matrix.outputs.has_matrix }}
@@ -236,6 +262,13 @@ jobs:
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
+
+      - name: Download measured routing calibration
+        if: ${{ needs.stage-routing-bundle.result == 'success' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: atomesh-routing-input
+          path: .git/atomesh-routing-input
 
       - name: Install YAML parser
         if: ${{ inputs.suite != 'agentic_scaling' }}
@@ -359,8 +392,7 @@ jobs:
             source .github/scripts/atomesh/image_python.sh
             unset ATOMESH_ROUTING_BUNDLE_FILE
             if [[ -n "${INPUT_CACHE_ROUTING_BUNDLE}" ]]; then
-              cp -- "${INPUT_CACHE_ROUTING_BUNDLE}" .git/atomesh-routing-bundle.json
-              export ATOMESH_ROUTING_BUNDLE_FILE=.git/atomesh-routing-bundle.json
+              export ATOMESH_ROUTING_BUNDLE_FILE=.git/atomesh-routing-input/bundle.json
             fi
           fi
           MODEL_NAME=""
@@ -1907,7 +1939,7 @@ jobs:
     name: Summarize ATOMesh benchmark results
     needs: [run-model-benchmark, load-config]
     if: ${{ always() && !cancelled() && needs.run-model-benchmark.result != 'skipped' }}
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.suite == 'agentic_scaling' && inputs.atomesh_slurm_submit_runner || 'ubuntu-latest' }}
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.suite == 'agentic_scaling' && 'linux-atom-mi35x-1' || 'ubuntu-latest' }}
     outputs:
       has_results: ${{ steps.summary.outputs.has_results }}
     steps:

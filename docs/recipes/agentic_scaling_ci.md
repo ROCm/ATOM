@@ -69,6 +69,12 @@ not require calibration. A performance run fails its calibration preflight
 before allocating GPUs if `cache_routing_bundle` is missing. A policy name alone
 would otherwise silently exercise load fallback.
 
+Image validation, the initial Mesh build and paired reporting use the existing
+`linux-atom-mi35x-1` Docker build runner. The selected Slurm submit runner stages
+the calibration file as a workflow artifact and submits the GPU jobs; it does
+not need Docker access. The GPU jobs build and run in containers on their
+allocated compute nodes.
+
 The workflow resolves the latest nightly once and pins its digest for all eight
 jobs. Each job **builds Mesh from the checked-out stack source** using the release
 profile in a separate container, then passes that artifact to the router's
