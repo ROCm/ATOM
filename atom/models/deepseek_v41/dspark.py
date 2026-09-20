@@ -7,8 +7,11 @@ from copy import copy
 import torch
 from atom.model_ops.blockscale import native_quant_linear, quantize_fp8
 from atom.model_ops.deepseek_v41.dspark import (
+    DraftStep,
     draft_attention,
     draft_step,
+    build_block_state,
+    draft_step_indices,
     fused_draft_kv_tail,
     rotate_rows,
 )
@@ -402,6 +405,45 @@ class DeepseekV41DSpark(DSparkDraftModel):
         self._draft_kv_tail = tail
         return tail
 
+    def _context_layer_ids(self, device):
+        """The stages' layer ids as one device tensor, built once.
+
+        It indexes the batched window read and never changes, so rebuilding it
+        per step would put a host-to-device copy on the drafting path for
+        three integers.
+        """
+        ids = self.__dict__.get("_context_ids")
+        if ids is None or ids.device != device:
+            ids = torch.tensor(
+                [layer.spec.layer_id for layer in self.context_layers],
+                dtype=torch.long,
+                device=device,
+            )
+            self._context_ids = ids
+        return ids
+
+    def _noise_embedding(self):
+        """The noise token's embedding row, embedded once and kept.
+
+        Every draft column past the anchor carries `dspark_noise_token_id`, and
+        the embedding is a TP all-reduce: embedding it per step per column put
+        `width` identical rows through the collective for no reason. The table
+        is fixed once the checkpoint is loaded, so the row is too -- resolved on
+        the first drafting step rather than at construction, which is when the
+        shared target embedding has actually been attached.
+        """
+        row = self.__dict__.get("_noise_row")
+        if row is None:
+            ids = torch.full(
+                (1,),
+                self.config.dspark_noise_token_id,
+                dtype=torch.long,
+                device=self.embed.weight.device,
+            )
+            row = self.embed(ids).flatten()
+            self._noise_row = row
+        return row
+
     def block_backbone(self, input_ids, positions, num_draft):
         from atom.utils.forward_context import get_forward_context
 
@@ -410,15 +452,31 @@ class DeepseekV41DSpark(DSparkDraftModel):
         # Published at running_bs, the width DraftGraph stages anchors at, so
         # window addressing holds no captured Python object.
         slots = metadata.state_slot_out[: input_ids.numel()]
+        width = self.block_size if num_draft is None else num_draft
+        # One gather for every stage: they read the same rows and differ only
+        # in the layer, so indexing them one at a time spent a gather and a
+        # `.long()` cast apiece. The slices below are views.
+        layer_ids = self._context_layer_ids(slots.device)
+        windows = cache.read_windows(layer_ids, slots)
         context = {
-            layer.spec.layer_id: cache.read_window(layer.spec.layer_id, slots)
-            for layer in self.context_layers
+            layer.spec.layer_id: windows[i]
+            for i, layer in enumerate(self.context_layers)
         }
-        ring = cache.geometry.ring_slots
-        physical = torch.arange(ring, device=positions.device)
-        context_positions = positions[:, None] - (positions[:, None] - physical) % ring
+        # The slot -> position map and the block's index list are one closed
+        # form over (positions, ring, window, width), so they come from a
+        # single launch rather than the ~16 torch ops that spelled them out --
+        # launch-floor work on [B, ring] rows, four of them an `arange`
+        # rebuilding a constant.
+        step_positions, indices, context_positions = draft_step_indices(
+            positions, cache.geometry.ring_slots, self.window_size, width
+        )
         return self.draft_hidden(
-            input_ids, positions, context, context_positions, num_draft=num_draft
+            input_ids,
+            positions,
+            context,
+            context_positions,
+            num_draft=num_draft,
+            step=DraftStep(step_positions, indices),
         )
 
     def forward_spec(self, input_ids, positions, num_draft=None):
@@ -428,23 +486,40 @@ class DeepseekV41DSpark(DSparkDraftModel):
         )
 
     def draft_hidden(
-        self, anchor_ids, anchors, context_kv, context_positions, *, num_draft=None
+        self,
+        anchor_ids,
+        anchors,
+        context_kv,
+        context_positions,
+        *,
+        num_draft=None,
+        step=None,
     ):
-        """Pure block math; the caller supplies a committed per-request window."""
+        """Pure block math; the caller supplies a committed per-request window.
+
+        `step` lets a caller that already built the block's positions and
+        indices hand them over -- `block_backbone` does, from one kernel.
+        """
         if self.embed is None or self.head is None:
             raise RuntimeError("DSpark must share the loaded target embedding and head")
         width = self.block_size if num_draft is None else num_draft
         if not 1 <= width <= self.block_size:
             raise ValueError("Draft width must fit the published DSpark block")
-        tokens = anchor_ids.new_full(
-            (anchor_ids.numel(), width), self.config.dspark_noise_token_id
+        # Only the anchors are embedded: every other column of the block is the
+        # same noise token, whose row never changes, so it is embedded once and
+        # kept. That takes `width` out of the embedding's TP all-reduce, and
+        # the block state is then written straight out rather than broadcast
+        # and copied. See `build_block_state`.
+        state = SinglePassHCState(
+            *build_block_state(
+                self.embed(anchor_ids),
+                self._noise_embedding(),
+                width,
+                self.config.hc_mult,
+            )
         )
-        tokens[:, 0] = anchor_ids
-        hidden = self.embed(tokens.flatten()).view(
-            *tokens.shape, self.config.hidden_size
-        )
-        state = SinglePassHCState.from_embeddings(hidden, self.config.hc_mult)
-        step = draft_step(context_positions, anchors, width, self.window_size)
+        if step is None:
+            step = draft_step(context_positions, anchors, width, self.window_size)
         for layer in self.mtp:
             state = layer(state, context_kv, step, self.rope)
         hidden = state.collapse()

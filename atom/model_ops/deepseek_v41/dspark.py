@@ -52,9 +52,198 @@ def rotate_rows(rope, hidden, positions, *, inverse=False):
 
 
 def draft_attention(query, context_kv, draft_kv, sink, step, scale):
-    """All draft rows attend to the whole draft block, plus valid target rows."""
+    """All draft rows attend to the whole draft block, plus valid target rows.
+
+    Joins the two by concatenating and does not touch `context_kv`. A caller
+    whose window already reserves room for the block writes into that tail and
+    calls `sparse_attn` itself -- see `DraftAttention.forward` -- which is what
+    keeps this one free of that assumption.
+    """
     keys = torch.cat((context_kv, draft_kv), dim=1)
     return sparse_attn(query, keys, sink, step.indices, scale)
+
+
+@triton.jit
+def _draft_step_kernel(
+    positions_ptr,  # [B] anchor position per request
+    out_positions_ptr,  # [B, width]
+    out_indices_ptr,  # [B, width, ring + width] int32
+    out_context_ptr,  # [B, ring] slot -> absolute position
+    ring,
+    window,
+    width,
+    WIDTH_BLOCK: tl.constexpr,  # next_pow2(width)
+    ENTRIES: tl.constexpr,  # next_pow2(ring + width)
+):
+    batch = tl.program_id(0)
+    row = tl.program_id(1)  # the draft position this index row belongs to
+    anchor = tl.load(positions_ptr + batch).to(tl.int64)
+
+    if row == 0:
+        # Anchors locate the last processed target token, so the block starts
+        # at +1. One row of the grid writes these; the rest only do indices.
+        steps = tl.arange(0, WIDTH_BLOCK)
+        tl.store(
+            out_positions_ptr + batch.to(tl.int64) * width + steps,
+            anchor + 1 + steps,
+            mask=steps < width,
+        )
+
+    slot = tl.arange(0, ENTRIES)
+    total = ring + width
+    is_history = slot < ring
+
+    # The absolute position a ring slot currently holds. Normalized because
+    # Triton's remainder carries the DIVIDEND's sign where torch's follows the
+    # divisor, and `anchor - slot` is negative over most of a partly-filled
+    # ring. Getting this wrong does not fail -- it points the draft at the
+    # wrong rows.
+    residue = (anchor - slot) % ring
+    residue = tl.where(residue < 0, residue + ring, residue)
+    context = anchor - residue
+    if row == 0:
+        tl.store(
+            out_context_ptr + batch.to(tl.int64) * ring + slot,
+            context,
+            mask=is_history,
+        )
+
+    valid = (
+        is_history & (context >= 0) & (context <= anchor) & (context > anchor - window)
+    )
+    index = tl.where(valid, slot, -1)
+    # Past the ring the block's own rows index themselves.
+    index = tl.where(is_history, index, slot)
+    tl.store(
+        out_indices_ptr + (batch.to(tl.int64) * width + row) * total + slot,
+        index.to(tl.int32),
+        mask=slot < total,
+    )
+
+
+def draft_step_indices(positions: torch.Tensor, ring: int, window: int, width: int):
+    """The draft block's positions, attention indices and slot map, in one launch.
+
+    `block_backbone` derived the ring-slot -> position map and `draft_step`
+    turned it into the block's bidirectional index list. Between them that was
+    ~16 torch launches over `[B, ring]` and `[B, width]` tensors -- at the
+    batches a draft runs, every one of them costs the ~4us launch floor rather
+    than any arithmetic, and four of them were `arange` rebuilding a constant.
+    It is all a closed form over `(positions, ring, window, width)`.
+
+    The precedent is `v4_kernels/dspark_fp8_indices.DSparkIndexBuffers.build`,
+    which does this for V4 DSpark's FP8 path: one launch, shapes statically
+    known, no `.item()` and no data-dependent allocation, so a captured graph
+    replays it.
+
+    The slot map is returned rather than kept internal: it is only an
+    intermediate for the indices, but `block_backbone` publishes it to
+    `draft_hidden` and a test pins that contract, and writing it is one store
+    of a row the kernel already holds in registers.
+    """
+    batch = positions.shape[0]
+    out_positions = torch.empty(
+        batch, width, device=positions.device, dtype=positions.dtype
+    )
+    out_indices = torch.empty(
+        batch, width, ring + width, device=positions.device, dtype=torch.int32
+    )
+    out_context = torch.empty(
+        batch, ring, device=positions.device, dtype=positions.dtype
+    )
+    if batch:
+        _draft_step_kernel[(batch, width)](
+            positions,
+            out_positions,
+            out_indices,
+            out_context,
+            ring,
+            window,
+            width,
+            WIDTH_BLOCK=triton.next_power_of_2(width),
+            ENTRIES=triton.next_power_of_2(ring + width),
+            num_warps=4,
+        )
+    return out_positions, out_indices, out_context
+
+
+@triton.jit
+def _block_state_kernel(
+    anchor_ptr,  # [B, H] the anchor token's embedding
+    noise_ptr,  # [H] the noise token's, identical for every step
+    residual_ptr,  # [B, T, M, H]
+    pre_mix_ptr,  # [B, T, M] fp32
+    hidden,
+    width,
+    M: tl.constexpr,  # hc_mult
+    BLOCK_H: tl.constexpr,
+):
+    row = tl.program_id(0)  # flat (batch, draft position)
+    batch = row // width
+    pos = row % width
+    offs = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offs < hidden
+
+    # Position 0 carries the anchor; the rest carry the same noise row, which
+    # is why only the anchors are embedded per step.
+    src = tl.where(pos == 0, anchor_ptr + batch.to(tl.int64) * hidden, noise_ptr)
+    value = tl.load(src + offs, mask=mask)
+
+    # The mHC state starts as `hc_mult` copies of the embedding. Writing them
+    # here is the same bytes the `expand().contiguous()` wrote, minus reading
+    # the row back out of HBM to do it.
+    dst = residual_ptr + row.to(tl.int64) * M * hidden
+    for stream in tl.static_range(M):
+        tl.store(dst + stream * hidden + offs, value, mask=mask)
+
+    if tl.program_id(1) == 0:
+        streams = tl.arange(0, M)
+        tl.store(
+            pre_mix_ptr + row.to(tl.int64) * M + streams,
+            tl.where(streams == 0, 1.0, 0.0).to(tl.float32),
+        )
+
+
+def build_block_state(anchor_embed, noise_embed, width, hc_mult):
+    """The draft block's `(residual, pre_mix)`, from the anchors alone.
+
+    `draft_hidden` used to build a `[B, width]` id block -- anchor in column
+    zero, a noise token everywhere else -- embed all of it, broadcast the
+    result over the `hc_mult` streams and zero a pre-mix beside it. Five
+    launches, and an embedding that is a TP all-reduce over `B * width` rows of
+    which only `B` differ: the noise row is the same every step, so it is
+    embedded once and cached, and the collective shrinks by `width`.
+
+    Returns what `SinglePassHCState.from_embeddings` returned, in one launch:
+    `residual [B, width, hc_mult, H]` and `pre_mix [B, width, hc_mult]`.
+    """
+    batch, hidden = anchor_embed.shape
+    residual = torch.empty(
+        batch,
+        width,
+        hc_mult,
+        hidden,
+        device=anchor_embed.device,
+        dtype=anchor_embed.dtype,
+    )
+    pre_mix = torch.empty(
+        batch, width, hc_mult, device=anchor_embed.device, dtype=torch.float32
+    )
+    rows = batch * width
+    if rows:
+        block = 1024
+        _block_state_kernel[(rows, triton.cdiv(hidden, block))](
+            anchor_embed,
+            noise_embed,
+            residual,
+            pre_mix,
+            hidden,
+            width,
+            M=hc_mult,
+            BLOCK_H=block,
+            num_warps=4,
+        )
+    return residual, pre_mix
 
 
 _GROUP = 32  # quantize_fp8's group, fixed by the V4.1 QAT the cache stores

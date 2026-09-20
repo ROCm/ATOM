@@ -533,6 +533,26 @@ class PagedAttentionCache:
         gather_prefix_rows(self.backing, tagged, ptr, output, 0, 1)
         return output.view(slots.numel(), window.ring_slots, self.geometry.head_dim)
 
+    def read_windows(self, layers, slots):
+        """Every stage's window for these requests, in one gather.
+
+        The draft's stages read the same rows of the same tensor and differ
+        only in which layer they read, so indexing them one at a time spent a
+        gather and a `.long()` cast per stage on work that broadcasts. The
+        packed pool keeps the per-layer path: its rows are addressed through
+        the ring geometry rather than indexed, and each layer's `ring_start`
+        is its own.
+
+        `layers` is a device tensor so it can be built once and kept; the
+        result is `[len(layers), len(slots), ring_slots, head_dim]`.
+        """
+        self.require_committed()
+        if self.packed:
+            return torch.stack(
+                [self.read_window(int(layer), slots) for layer in layers]
+            )
+        return self.state.view("window")[layers[:, None], slots.long()[None, :]]
+
     def write_window(self, layer, kv, step):
         if step.width:
             window = self.geometry.window(layer, self.num_pages)
