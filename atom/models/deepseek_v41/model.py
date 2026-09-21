@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Full-layer eager text backbone. Checkpoint I/O and request preparation live outside."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -9,10 +10,7 @@ from aiter.dist.parallel_state import get_tp_group
 from torch import nn
 
 from atom.model_loader.weight_names import WeightsMapper
-from atom.model_ops.deepseek_v41.mhc import (
-    SinglePassHCState,
-    expand_residual,
-)
+from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.deepseek_v41.mhc_pre_delayed import pre_delayed
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 from atom.model_ops.embed_head import VocabParallelEmbedding
@@ -105,16 +103,26 @@ class Block(nn.Module):
             residual, embeddings, None if image_mask is None else ~image_mask
         )
 
-    def prepare_attention(self, residual, pre_mix, embeddings, image_mask):
+    def prepare_attention(self, state, embeddings, image_mask):
         if self.engram is not None:
-            residual = self.engram_forward(residual, embeddings, image_mask)
+            # Engram reads the residual between the post and the pre, so this
+            # is the one seam that cannot fold: settling leaves nothing owed
+            # and the projection below runs plain.
+            state = state.settle()
+            state = replace(
+                state,
+                residual=self.engram_forward(state.residual, embeddings, image_mask),
+            )
         residual, hidden, pre, post, comb = pre_delayed(
-            residual,
-            pre_mix,
+            state.residual,
+            state.pre_mix,
             self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
             **self.hc_options,
+            sublayer_output=state.pending,
+            post_mix=state.post_mix,
+            combination=state.combination,
         )
         return self.attn_norm(hidden), residual, pre, post, comb
 
@@ -136,18 +144,20 @@ class Block(nn.Module):
         return self.ffn_norm(hidden), residual, pre, post, comb
 
     def finish_ffn(self, output, residual, pre, post, comb):
-        return expand_residual(output, residual, post, comb), pre
+        # Owed, not applied: the next block's pre folds this post into its own
+        # projection.
+        return SinglePassHCState(residual, pre, output, post, comb)
 
     def forward(self, state, cache, step, rope, embeddings=None, image_mask=None):
         hidden, residual, pre, post, comb = self.prepare_attention(
-            state.residual, state.pre_mix, embeddings, image_mask
+            state, embeddings, image_mask
         )
         output = self.attention_forward(hidden, cache, step, rope)
         hidden, residual, pre, post, comb = self.prepare_ffn(
             output, residual, pre, post, comb
         )
         output = self.ffn(hidden)
-        return SinglePassHCState(*self.finish_ffn(output, residual, pre, post, comb))
+        return self.finish_ffn(output, residual, pre, post, comb)
 
 
 class DeepseekV41ForCausalLM(nn.Module):

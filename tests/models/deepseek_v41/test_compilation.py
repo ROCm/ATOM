@@ -12,6 +12,7 @@ if not torch.cuda.is_available():
     pytest.skip("ROCm GPU required", allow_module_level=True)
 
 from atom.config import CompilationConfig, CUDAGraphMode
+from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.models.deepseek_v41.multimodal import DeepseekV41MultimodalModel
 from atom.models.deepseek_v41.runtime import DeepseekV41RuntimeModel, RuntimeBlock
 from atom.spec_decode.drafter import Drafter
@@ -75,16 +76,21 @@ class TinyBlock(RuntimeBlock):
         self.ffn = FFN()
         self.engram = None
 
-    def prepare_attention(self, residual, pre_mix, embeddings, image_mask):
+    def prepare_attention(self, state, embeddings, image_mask):
+        residual = state.settle().residual
         if self.engram is not None:
             residual = self.engram_forward(residual, embeddings, image_mask)
-        return residual.mean(-2), residual, pre_mix, pre_mix, pre_mix
+        return residual.mean(-2), residual, state.pre_mix, state.pre_mix, state.pre_mix
 
     def prepare_ffn(self, output, residual, pre, post, comb):
         return output, residual, pre, post, comb
 
     def finish_ffn(self, output, residual, pre, post, comb):
-        return output.unsqueeze(-2).expand_as(residual).contiguous(), pre
+        # Settled, not owed: this stub's post is a broadcast, not the mHC
+        # expansion `settle` applies.
+        return SinglePassHCState(
+            output.unsqueeze(-2).expand_as(residual).contiguous(), pre
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm compiler")
