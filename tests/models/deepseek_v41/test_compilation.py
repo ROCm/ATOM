@@ -171,7 +171,7 @@ def test_mhc_guard_outputs_and_input_alias(monkeypatch, mode):
     fn = torch.randn(hc * (hc + 2), hc * hidden, device=device) * 0.01
     scale = torch.ones(3, device=device)
     base = torch.zeros(hc * (hc + 2), device=device)
-    kwargs = dict(rms_eps=1e-6, hc_eps=1e-6, sinkhorn_iters=20, post_mult=2.0)
+    kwargs = {"rms_eps": 1e-6, "hc_eps": 1e-6, "sinkhorn_iters": 20, "post_mult": 2.0}
     if mode != "pre":
         kwargs.update(
             sublayer_output=torch.randn(
