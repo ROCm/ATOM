@@ -7,6 +7,7 @@ import torch
 
 try:
     import aiter.iq2r_moe as aiter_iq2r_moe
+
     import atom.model_ops.moe as moe_mod
     from atom.quant_spec import get_quant_parser
 except Exception as exc:  # noqa: BLE001
@@ -29,6 +30,28 @@ def test_iq2r_quant_parser_is_explicit_and_preserves_exclusions():
     assert parsed.global_spec.quant_type == moe_mod.QuantType.iq2r_2bit
     assert parsed.global_spec.quant_type != moe_mod.QuantType.per_1x32
     assert parsed.exclude_layers == ["model.layers.*.self_attn", "lm_head"]
+
+
+def test_iq2r_v2_parser_preserves_base_quant_and_targets_routed_experts():
+    parsed = get_quant_parser("iq2r").parse(
+        {
+            "quant_method": "iq2r",
+            "schema": "aiter-iq2r-overlay",
+            "schema_version": 2,
+            "iq2r_modules": ["model.layers.*.mlp.experts"],
+            "base_quantization_config": {
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128],
+                "activation_scheme": "dynamic",
+                "modules_to_not_convert": ["model.layers.*.mlp.gate"],
+            },
+        }
+    )
+    assert parsed.global_spec.quant_dtype == moe_mod.dtypes.fp8
+    assert parsed.global_spec.quant_type == moe_mod.QuantType.per_1x128
+    assert parsed.layer_pattern_specs[0][0] == "model.layers.*.mlp.experts"
+    assert parsed.layer_pattern_specs[0][1].quant_method == "iq2r"
+    assert parsed.exclude_layers == ["model.layers.*.mlp.gate"]
 
 
 @pytest.mark.parametrize(
@@ -73,6 +96,7 @@ def test_iq2r_create_weights_exposes_exact_overlay_contract():
         experts_per_token=4,
     )
     layer = torch.nn.Module()
+    layer.has_bias = True
     with torch.device("meta"):
         method.create_weights(
             layer,
@@ -96,6 +120,37 @@ def test_iq2r_create_weights_exposes_exact_overlay_contract():
         assert parameter.dtype == dtype
         assert tuple(parameter.shape) == shape
         assert parameter.iq2r_name == name
+
+
+def test_iq2r_create_weights_accepts_glm53_geometry_without_bias():
+    from aiter.ops.iq2r_format import IQ2RMetadata
+
+    method = object.__new__(moe_mod.Iq2rMoEMethod)
+    method.moe = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(tp_size=1, ep_size=1),
+        experts_per_token=8,
+    )
+    layer = torch.nn.Module()
+    layer.has_bias = False
+    with torch.device("meta"):
+        method.create_weights(
+            layer,
+            num_experts=288,
+            hidden_size=4096,
+            intermediate_size_per_partition=2048,
+            params_dtype=torch.bfloat16,
+        )
+
+    gate = IQ2RMetadata(logical_n=4096, logical_k=4096)
+    down = IQ2RMetadata(logical_n=4096, logical_k=2048)
+    assert tuple(layer.w13_weight.shape) == (288, gate.data_bytes)
+    assert tuple(layer.w13_weight_scale.shape) == (288, gate.auxiliary_bytes)
+    assert tuple(layer.w2_weight.shape) == (288, down.data_bytes)
+    assert tuple(layer.w2_weight_scale.shape) == (288, down.auxiliary_bytes)
+    assert layer.w13_bias is None
+    assert layer.w2_bias is None
+    assert layer.iq2r_gate_up_tile_n == 128
+    assert layer.iq2r_down_tile_n == 128
 
 
 def test_iq2r_moe_fake_propagates_logical_hidden_width(monkeypatch):
@@ -123,6 +178,9 @@ def test_iq2r_apply_only_routes_and_delegates_to_aiter(monkeypatch):
         moe_parallel_config=SimpleNamespace(use_ep=False),
         max_num_tokens=8,
     )
+    method.num_experts = 128
+    method.hidden_size = 2
+    method.intermediate_size = 2
     method._workspaces = {}
     layer = SimpleNamespace(
         num_fused_shared_experts=0,
@@ -133,8 +191,8 @@ def test_iq2r_apply_only_routes_and_delegates_to_aiter(monkeypatch):
         w2_weight_scale=torch.empty((128, 7), dtype=torch.uint8),
         w13_bias=torch.empty((128, 4), dtype=torch.bfloat16),
         w2_bias=torch.empty((128, 2), dtype=torch.bfloat16),
-        iq2r_gate_up_metadata=object(),
-        iq2r_down_metadata=object(),
+        iq2r_gate_up_metadata=SimpleNamespace(logical_n=4),
+        iq2r_down_metadata=SimpleNamespace(logical_n=2),
         iq2r_gate_up_tile_n=128,
         iq2r_down_tile_n=64,
     )
@@ -155,7 +213,7 @@ def test_iq2r_apply_only_routes_and_delegates_to_aiter(monkeypatch):
 
     class FakeWorkspace:
         @classmethod
-        def allocate(cls, tokens, topk, *, device):
+        def allocate(cls, tokens, topk, *, device, **kwargs):
             value = (tokens, topk, device)
             allocated.append(value)
             return value
@@ -207,12 +265,104 @@ def test_iq2r_apply_only_routes_and_delegates_to_aiter(monkeypatch):
     assert kwargs["iq2r_workspace"] == (8, 4, hidden.device)
     assert kwargs["iq2r_router_logits"] is None
     assert kwargs["iq2r_router_bias"] is None
+
+
+def test_iq2r_glm53_uses_grouped_sigmoid_router_and_glm_swiglu(monkeypatch):
+    method = object.__new__(moe_mod.Iq2rMoEMethod)
+    method.moe = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(use_ep=False),
+        max_num_tokens=8,
+    )
+    method.num_experts = 288
+    method.hidden_size = 4
+    method.intermediate_size = 2
+    method._workspaces = {}
+    layer = SimpleNamespace(
+        num_fused_shared_experts=0,
+        routed_scaling_factor=2.5,
+        w13_weight=torch.empty((288, 3), dtype=torch.uint8),
+        w13_weight_scale=torch.empty((288, 5), dtype=torch.uint8),
+        w2_weight=torch.empty((288, 2), dtype=torch.uint8),
+        w2_weight_scale=torch.empty((288, 7), dtype=torch.uint8),
+        w13_bias=None,
+        w2_bias=None,
+        iq2r_gate_up_metadata=SimpleNamespace(logical_n=4),
+        iq2r_down_metadata=SimpleNamespace(logical_n=4),
+        iq2r_gate_up_tile_n=128,
+        iq2r_down_tile_n=128,
+        swiglu_limit=10.0,
+        swiglu_alpha=1.0,
+        swiglu_up_offset=0.0,
+    )
+    hidden = torch.randn(2, 4, dtype=torch.bfloat16)
+    logits = torch.randn(2, 288)
+    correction = torch.randn(288)
+    topk_weights = torch.full((2, 8), 0.125, dtype=torch.float32)
+    topk_ids = torch.arange(16, dtype=torch.int32).reshape(2, 8)
+    selections = []
+
+    def fake_select(**kwargs):
+        selections.append(kwargs)
+        return topk_weights, topk_ids
+
+    class FakeWorkspace:
+        @classmethod
+        def allocate(cls, tokens, topk, *, device, **kwargs):
+            return (tokens, topk, device, kwargs)
+
+    calls = []
+
+    monkeypatch.setattr(moe_mod.FusedMoE, "select_experts", staticmethod(fake_select))
+    monkeypatch.setattr(aiter_iq2r_moe, "IQ2RMoeWorkspace", FakeWorkspace)
+    monkeypatch.setattr(
+        moe_mod,
+        "fused_moe",
+        lambda **kwargs: calls.append(kwargs) or torch.empty_like(hidden),
+    )
+
+    method.apply(
+        layer=layer,
+        x=hidden,
+        router_logits=logits,
+        top_k=8,
+        renormalize=True,
+        use_grouped_topk=True,
+        topk_group=1,
+        num_expert_group=1,
+        global_num_experts=288,
+        scoring_func="sigmoid",
+        e_score_correction_bias=correction,
+        activation=moe_mod.ActivationType.Swiglu,
+    )
+
+    assert len(selections) == 1
+    assert selections[0]["use_grouped_topk"] is True
+    assert selections[0]["scoring_func"] == "sigmoid"
+    assert selections[0]["e_score_correction_bias"] is correction
+    assert len(calls) == 1
+    assert calls[0]["bias1"] is None
+    assert calls[0]["bias2"] is None
+    assert calls[0]["swiglu_limit"] == 10.0
+    assert calls[0]["beta"] == 1.0
+    assert calls[0]["linear_beta"] == 0.0
+    assert calls[0]["iq2r_router_logits"] is None
+    workspace = calls[0]["iq2r_workspace"]
+    assert workspace[3] == {
+        "max_experts": 288,
+        "hidden_size": 4,
+        "intermediate_size": 2,
+    }
+
+
 def test_iq2r_apply_folds_router_bias_only_in_fused_frontend(monkeypatch):
     method = object.__new__(moe_mod.Iq2rMoEMethod)
     method.moe = SimpleNamespace(
         moe_parallel_config=SimpleNamespace(use_ep=False),
         max_num_tokens=8,
     )
+    method.num_experts = 128
+    method.hidden_size = 2
+    method.intermediate_size = 2
     method._workspaces = {}
     layer = SimpleNamespace(
         num_fused_shared_experts=0,
@@ -223,8 +373,8 @@ def test_iq2r_apply_folds_router_bias_only_in_fused_frontend(monkeypatch):
         w2_weight_scale=torch.empty((128, 7), dtype=torch.uint8),
         w13_bias=torch.empty((128, 4), dtype=torch.bfloat16),
         w2_bias=torch.empty((128, 2), dtype=torch.bfloat16),
-        iq2r_gate_up_metadata=object(),
-        iq2r_down_metadata=object(),
+        iq2r_gate_up_metadata=SimpleNamespace(logical_n=4),
+        iq2r_down_metadata=SimpleNamespace(logical_n=2),
         iq2r_gate_up_tile_n=128,
         iq2r_down_tile_n=64,
     )
@@ -238,7 +388,7 @@ def test_iq2r_apply_folds_router_bias_only_in_fused_frontend(monkeypatch):
             self.topk_ids = torch.empty(tokens, topk, dtype=torch.int32)
 
         @classmethod
-        def allocate(cls, tokens, topk, *, device):
+        def allocate(cls, tokens, topk, *, device, **kwargs):
             del device
             return cls(tokens, topk)
 
@@ -278,6 +428,9 @@ def test_iq2r_router_bias_fallback_restores_bf16_logits(monkeypatch):
         moe_parallel_config=SimpleNamespace(use_ep=False),
         max_num_tokens=8,
     )
+    method.num_experts = 128
+    method.hidden_size = 2
+    method.intermediate_size = 2
     method._workspaces = {}
     layer = SimpleNamespace(
         num_fused_shared_experts=0,
@@ -288,8 +441,8 @@ def test_iq2r_router_bias_fallback_restores_bf16_logits(monkeypatch):
         w2_weight_scale=torch.empty((128, 7), dtype=torch.uint8),
         w13_bias=torch.empty((128, 4), dtype=torch.bfloat16),
         w2_bias=torch.empty((128, 2), dtype=torch.bfloat16),
-        iq2r_gate_up_metadata=object(),
-        iq2r_down_metadata=object(),
+        iq2r_gate_up_metadata=SimpleNamespace(logical_n=4),
+        iq2r_down_metadata=SimpleNamespace(logical_n=2),
         iq2r_gate_up_tile_n=128,
         iq2r_down_tile_n=64,
     )
@@ -300,7 +453,7 @@ def test_iq2r_router_bias_fallback_restores_bf16_logits(monkeypatch):
 
     class FakeWorkspace:
         @classmethod
-        def allocate(cls, tokens, topk, *, device):
+        def allocate(cls, tokens, topk, *, device, **kwargs):
             return (tokens, topk, device)
 
     def fake_select(**kwargs):
@@ -388,11 +541,14 @@ def test_iq2r_expert_ablation_retains_topk_and_skips_experts(monkeypatch):
         moe_parallel_config=SimpleNamespace(use_ep=False),
         max_num_tokens=8,
     )
+    method.num_experts = 128
+    method.hidden_size = 2
+    method.intermediate_size = 2
     method._workspaces = {}
     layer = SimpleNamespace(
         num_fused_shared_experts=0,
         routed_scaling_factor=1.0,
-        w2_bias=torch.empty((128, 2), dtype=torch.bfloat16),
+        iq2r_down_metadata=SimpleNamespace(logical_n=2),
     )
     hidden = torch.randn(3, 4, dtype=torch.bfloat16)
     logits = torch.randn(3, 128)

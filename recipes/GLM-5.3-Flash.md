@@ -384,7 +384,68 @@ Three things about scoring this model that will otherwise waste a run:
   questions in each direction. Judge changes on the 1319-question aggregate, or
   better on a per-question paired comparison; never on sample text.
 
-## 8. Remaining work
+## 8. IQ2R 2-bit routed experts
+
+This tree can replace the routed FP8 experts in transformer layers 3–44 with
+AITER's native-basis IQ2R format. Attention, dense MLPs, the shared experts,
+and checkpoint layer 45 (MTP) retain the base model's block-FP8 configuration.
+The current runtime is TP1/EP1 only.
+
+The compiler consumes the original block-FP8 checkpoint and a Redline-style
+diagonal second-moment calibration artifact:
+
+```bash
+python -m aiter.iq2r_glm5_compile \
+    --model-dir /models/zai-org/GLM-5.3-Flash \
+    --output-dir /models/zai-org/GLM-5.3-Flash-IQ2R-compiled \
+    --calibration-cache /path/to/glm53-iq2r-calibration.pt \
+    --resume
+
+python -m aiter.iq2r_overlay \
+    --model-dir /models/zai-org/GLM-5.3-Flash \
+    --compiled-iq2r-dir /models/zai-org/GLM-5.3-Flash-IQ2R-compiled \
+    --output-dir /models/zai-org/GLM-5.3-Flash-IQ2R
+```
+
+The overlay uses symlinks for immutable base-model files, preserves the source
+FP8 quantization config, removes the per-expert FP8 tensors from the active
+weight index, and adds four fused IQ2R tensors per routed layer. Compilation is
+resumable and validates existing shard keys, shapes, dtypes, metadata, and
+kernel tile size before accepting them.
+
+Redline `main` does not currently register
+`Glm5NextForConditionalGeneration` or provide a GLM-5.3 calibration adapter.
+Its existing whole-Hugging-Face-model calibration runner is also not sufficient
+here: the source checkpoint is about 306 GB, and correct IQ2R importance needs
+both the gate/up inputs and the activated inputs to the down projection. Do not
+label a GLM overlay O0/production quality until those observations have been
+captured in a valid calibration artifact.
+
+For kernel and checkpoint-pipeline bring-up only, one layer can be compiled
+with uniform importance:
+
+```bash
+python -m aiter.iq2r_glm5_compile \
+    --model-dir /models/zai-org/GLM-5.3-Flash \
+    --output-dir /run/$USER/glm53-iq2r-layer3-diagnostic \
+    --diagnostic-uniform-importance \
+    --layers 3 \
+    --iterations 1 \
+    --sample-vectors 1024 \
+    --resume
+```
+
+That output is stamped `diagnostic-uniform-not-o0-quality`; it proves encoding,
+loading, and runtime compatibility, not model accuracy. A full overlay requires
+compiled shards for every routed layer.
+
+At ATOM's default `max_num_batched_tokens=16384`, GLM top-k=8 needs capacity
+for 131072 routes. AITER supports that capacity, but the fixed capture-safe
+workspace is about 2.8 GiB per routed layer at GLM's 4096/2048 dimensions. Plan
+the model and KV-cache memory budget accordingly, or lower
+`max_num_batched_tokens` for smaller deployments.
+
+## 9. Remaining work
 
 1. ~~**Contexts beyond 2048.**~~ Done —
    `model_ops/glm5_next/{indexer,kpool}.py` implements the paged/ragged pooled
