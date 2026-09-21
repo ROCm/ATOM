@@ -14,19 +14,26 @@ This document describes the environment variables used in the ATOM project.
 | **ATOM_DP_LB_REQ_EQUIV** | int | 512 | Token-equivalent decode pressure assigned to each in-flight request by `least_tokens` routing. |
 | **ATOM_DP_SESSION_AFFINITY** | bool | false | Load-place each new session, then keep later turns on the same prefix-cache owner. Reads `X-Dynamo-Session-ID`, falling back to `X-Correlation-ID`. |
 
-## Prefill delayer (DP attention)
+## Prefill delayer (TP/DCP and DP attention)
 
-Prefill **coalescer** for DP-attention + EP-MoE serving. Holds back prefill
-admission until the accumulated prefill (fresh waiting tokens + resumable
-partials' remaining tokens) fills a worthwhile forward, so fragmented
-short-input prefills / small partial tail chunks batch into one forward instead
-of firing many tiny ones. Releases when the fill target is reached, when a
-must-fire bound trips (no decode to hide behind, KV pressure/starvation, TTFT
-deadline, partial deadline), or when the queue stops growing. Preserves
-cross-rank phase alignment (releases only when every rank is prefill-ready,
-unless a bound forces it). All timing is tick-based (deterministic across ranks —
-no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only when
-`data_parallel_size > 1`.
+Coalesces waiting prefills while decode continues. DP attention enables it by
+default through `ATOM_ENABLE_PREFILL_DELAYER`. For a single scheduler (DP=1,
+PP=1), including TP/DCP, it is opt-in: set `ATOM_PREFILL_DECODE_INTERVAL` above
+zero and keep the master switch enabled. Interval 0 leaves TP scheduling
+unchanged; setting only the master switch does not enable TP coalescing.
+On TP, the interval and coalescer are enabled together.
+
+After each executed prefill, the decode interval runs before all coalescing
+bounds. Once it expires, fill, queue age, KV pressure, partial-prefill and stall
+bounds decide when to release. `MAX_QUEUE_MS` stops extra coalescing after that
+interval; it does not guarantee end-to-end TTFT. DP decisions reduce local
+signals across ranks to keep their phases aligned.
+
+Local hybrid models with state checkpointing also wait briefly for an in-flight
+producer's reusable prompt-end checkpoint. This preserves queue order, bypasses
+requests with remote KV matches, and expires after `TTFT_MAX_TICKS` scheduler
+passes or `MAX_QUEUE_MS` since arrival, whichever applies first. Pure-attention
+models use the coalescer without this checkpoint wait.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
@@ -37,8 +44,8 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 | **ATOM_PREFILL_DELAYER_STALL_TICKS** | int | 10 | After this many consecutive non-growing ticks, release (burst ended, more won't come). Values `< 1` clamped to 1. |
 | **ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK** | float | 0.9 | At/above this KV usage a prefillable rank force-releases (can't accumulate a bigger batch anyway). |
 | **ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK** | float\|"" | "" (None) | If set, a prefillable rank below this KV usage force-releases (GPU starving). |
-| **ATOM_PREFILL_DELAYER_MAX_QUEUE_MS** | float\|"" | "" (None) | TTFT SLA guard: if any rank's oldest schedulable waiting prefill has queued (since arrival) ≥ this many ms, force-release regardless of the fill target. Measures true end-to-end wait (backlog + coalescer holds), unlike the tick-based TTFT bound which only caps one hold episode. Empty = disabled; set to your TTFT budget (a small value under heavy backlog fires every tick and defeats coalescing). |
-| **ATOM_PREFILL_DECODE_INTERVAL** | int | 0 | After an executed prefill forward, protect this many scheduler passes for decode before admitting another prefill. `0` disables the interval. |
+| **ATOM_PREFILL_DELAYER_MAX_QUEUE_MS** | float\|"" | "" (None) | After decode protection, release coalescing when the oldest schedulable waiting prefill reaches this age since arrival. Also bounds local checkpoint waits. Empty disables the age guard. This is not a hard TTFT limit. |
+| **ATOM_PREFILL_DECODE_INTERVAL** | int | 0 | Protect this many scheduler passes after an executed prefill. On DP=1, PP=1, a positive value also enables local coalescing when the master switch is on; `0` leaves TP scheduling unchanged. On DP>1, `0` disables only the interval. |
 | **ATOM_PREFILL_DELAYER_DEBUG** | bool | false | Per-tick FIRE/HOLD debug logging. |
 | **ATOM_PREFILL_DELAYER_LOG_EVERY** | int | 1000 | Emit aggregate stats (per-exit fire counts + hold rate) every N decisions (0 disables). |
 

@@ -861,17 +861,20 @@ class BlockManager:
             chain.append(h)
         return chain
 
-    def can_allocate(self, seq: Sequence, record: bool = True) -> int:
+    def can_allocate(
+        self,
+        seq: Sequence,
+        record: bool = True,
+        *,
+        block_hashes: list[int] | None = None,
+    ) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
-        `record=False` marks a fit probe -- asking only whether the seq *could*
-        be admitted. The fit answer is identical, but the probe is not
-        side-effect-free: the instrumentation and checkpoint-demand/-end writes
-        below run before the `record` gate. That is safe -- the sole probe caller
-        reads only the `>= 0` return, and the next real `can_allocate` overwrites
-        those fields first. `record` gates only the joint-boundary commit (seq
-        joint fields + funnel counters), so a probe cannot inflate the
-        operator-visible funnel (see `_commit_joint_boundary`).
+        `record=False` returns the same fit and HBM hit without committing
+        joint-load fields or funnel counters. It still refreshes checkpoint
+        demand/end and hit instrumentation. An optional `block_hashes` output
+        lets the scheduler defer `record_allocation` until after its wait and
+        token-budget checks, reusing this probe's chain without another walk.
 
         The hit count is the contiguous run of cache hits starting at the
         prompt's first block. On the first miss we break: subsequent blocks
@@ -888,6 +891,10 @@ class BlockManager:
         # The full per-request width, because that is what `allocate` will take:
         # gating on one slot would admit a request the pool cannot give a
         # rollback set to.
+        if block_hashes is None:
+            block_hashes = []
+        else:
+            block_hashes.clear()
         if seq.has_per_req_cache and not self.state.has_free(self.state_slots_per_req):
             return -1
         if not self.enable_prefix_caching:
@@ -899,7 +906,6 @@ class BlockManager:
         # match). Record each block's hash for the SWA scan below.
         h = seq.cache_seed
         compressed_hit = 0
-        block_hashes: list[int] = []
         for i in range(self._n_hash_blocks(seq) - 1):
             token_ids = self._hash_block_tokens(seq, i)
             h = self.compute_hash(token_ids, h)
@@ -966,8 +972,7 @@ class BlockManager:
         # is: a refused admission would discard it, and nothing between here and
         # the refusal reads the seq's joint fields -- this is that move's twin.
         if record:
-            decision = self._joint_kv_boundary(seq, num_cached_blocks, block_hashes)
-            self._commit_joint_boundary(seq, decision)
+            self.record_allocation(seq, num_cached_blocks, block_hashes)
         # After the refusal, not before it. The chain is O(prompt) xxhash plus
         # two temporaries per block, and a refused admission discards it — a
         # 128k prompt queued behind a full pool paid ~2000 rounds per waiting
@@ -982,6 +987,14 @@ class BlockManager:
         # place, because that is a policy decision and this is not.
         self._extend_hash_chain(seq, block_hashes)
         return num_cached_blocks
+
+    def record_allocation(
+        self, seq: Sequence, num_cached_blocks: int, block_hashes: list[int]
+    ) -> None:
+        """Commit the fit probe before any allocation changes the pool."""
+        if self.enable_prefix_caching:
+            decision = self._joint_kv_boundary(seq, num_cached_blocks, block_hashes)
+            self._commit_joint_boundary(seq, decision)
 
     def allocate(self, seq: Sequence, num_cached_blocks: int = 0) -> bool:
         """Allocate blocks for `seq`. `num_cached_blocks` is the hit count
