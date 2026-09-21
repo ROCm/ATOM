@@ -65,26 +65,9 @@ permissions:
   contents: read
   pull-requests: write
 
-# TEMPORARY -- smoke run, revert before review. One entry, one level, one job:
-# gpt-oss-120b at c=32, chosen to be the cheapest thing that still exercises
-# the whole flow -- tp=1, so no NCCL group to fail; 36.6s real load, the
-# shortest in the catalog; 60.8 GiB on disk, so the predownload is far more
-# likely to be there. Roughly ten minutes for three phases.
-#
-# Kimi-K3 at c=256 was tried twice and failed twice, differently each time:
-# once the server never came up inside 45 minutes with nothing recorded, once
-# NCCL init failed on 7 of 8 ranks two minutes in, with the model streaming
-# from HuggingFace because the predownload had failed. Two failures with two
-# causes and a changed variable between them are not one result; this run
-# isolates the flow from the model.
-#
-# It cannot exercise the criterion either way: one judging level is below
-# FAMILY_MIN_CONFIGS, so the family reads `insufficient` and the verdict is
-# `inconclusive`. That is the expected outcome, not a failure.
-#
-# The agreed set is five entries across two concurrency levels, 10 jobs. It
-# was a single-entry smoke until d76360456; the matrix step now fails on a
-# short matrix rather than letting a typo surface at the judge as `partial`.
+# Five entries across two concurrency levels, 10 jobs. It was a single-entry
+# smoke until d76360456; the matrix step now fails on a short matrix rather
+# than letting a typo surface at the judge as `partial`.
 # Narrowing for an experiment is a change to this block and nothing else.
 #
 # Two levels is the floor: FAMILY_MIN_CONFIGS in perf_judge.py is 2, and a
@@ -94,16 +77,16 @@ env:
   # Catalog prefixes, not display names -- MiniMax-M3-MXFP8 is `m3-mxfp8` here.
   # DeepSeek-V4-Pro MTP3 is added automatically alongside its base by the matrix
   # step, so four names produce five entries.
-  PERF_MODELS: gpt-oss-120b
+  PERF_MODELS: deepseek-v4-pro,kimi-k3,m3-mxfp8,glm-5-2-fp8
   PERF_ISL: 8192
   PERF_OSL: 1024
   PERF_RATIO: "0.8"
-  PERF_JUDGING_CONCS: 32
+  PERF_JUDGING_CONCS: 32,256
   # Empty: every level this line runs is judged. c=4 was the reference level
   # and went with the rest -- at two jobs per entry there is no room for a
   # level that contributes no detection.
   PERF_REFERENCE_CONCS: ""
-  PERF_EXPECTED_ENTRIES: 1
+  PERF_EXPECTED_ENTRIES: 5
   # Warmup length as a multiple of the concurrency level, matching the
   # measurement at 10. Set to 1 to reproduce the short warmup the residual
   # was first measured under -- the only single-variable way to separate
