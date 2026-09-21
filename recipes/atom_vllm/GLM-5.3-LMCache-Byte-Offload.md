@@ -260,7 +260,7 @@ against. **No repeat of this field was measured on GLM-5.3**, so the 1/8-vs-4/8
 gap is unexplained, not shown to be noise. Marker recall is the criterion, and
 it is 8/8 everywhere — measured here, on both arms.
 
-### Throughput, measured on GLM-5.3
+### Throughput at a pinned HBM pool (override 8192), tier 90 GiB/rank
 
 A matched ON/OFF pair, back to back in the same slot, same tree
 (`b6e22c4792ab5202063089b28b4d4197750c3186`, `atom_dirty_lines=0`), same model
@@ -326,6 +326,198 @@ quoted and the OFF range must not be borrowed for it. Throughput is quantised at
 the OFF arm — it ran second, on a warmer page cache, and started with 624.6 GiB
 free against the ON arm's 154.7 — so they cannot manufacture the gain, but they
 are not quantified either.
+
+### Throughput at the default HBM pool, tier 256 GiB/rank
+
+The pair above pins the pool with `--num-gpu-blocks-override 8192`. That is
+what makes its KV comparison apples-to-apples, but it is not the pool a user
+gets, and it is a 524,288-token pool — small enough that almost any reuse
+distance falls outside it. This second pair drops the override and lets vLLM
+size the pool instead. At the Launch block's `--gpu-memory-utilization 0.9`
+that is the 48,709 blocks (3,117,376 tokens) already in the table above; this
+pair also raises utilisation to 0.95 and measured **3,440,832 tokens**, 6.6x
+the pinned pool. Every other knob that moved with it is listed next, because a
+pool change on its own would not be worth a second table.
+
+Same tree (`b6e22c4792ab5202063089b28b4d4197750c3186`, `atom_dirty_lines=0`),
+same model (`amd/GLM-5.3-MXFP4`), TP=4 on GPUs 0-3, block size 64, fp8 KV, both
+arms back to back in the same slot. Differences from the pair above:
+
+| | pair above | this pair |
+|---|---|---|
+| HBM pool | `--num-gpu-blocks-override 8192` = 524,288 tok | **no override**; vLLM sized **3,440,832 tok** (152.98 GiB/rank), byte-identical on both arms |
+| `--gpu-memory-utilization` | 0.90 | **0.95** |
+| `--max-model-len` | 131072 | **1048576** (the checkpoint's own `max_position_embeddings`) |
+| `LMCACHE_MAX_LOCAL_CPU_SIZE` | 90 | **256** GiB/rank |
+| `LMCACHE_CHUNK_SIZE` | 64 | **256** (= 4 KV blocks; prefix 28,672 = 112 chunks and tail 4,096 = 16, so no chunk straddles the seam) |
+| `LMCACHE_CACHE_POLICY` | LMCache default (LRU) | **ATOM_SLRU** |
+| prefix pool / dataset entries | 64 / 128 | **128 / 256** |
+| duration | 600 s | **1800 s** |
+
+`LMCACHE_LOOKUP_SERVER_WORKER_IDS` is left unset, so ATOM's own default applies
+(`config.py:376-377` forces `[0]`). All four ranks' `Creating LMCacheEngine with
+config:` dumps were parsed before any traffic was sent, and all four read
+`chunk_size=256, max_local_cpu_size=256.0, cache_policy='ATOM_SLRU',
+lookup_server_worker_ids=[0]` — every row in the table above is a checked fact,
+not an exported variable.
+
+**The load.** Both arms, identical except for the connector:
+
+```bash
+PYTHONHASHSEED=0 aiperf profile \
+  --model amd/GLM-5.3-MXFP4 \
+  --url "http://127.0.0.1:8330" --endpoint-type chat --streaming \
+  --tokenizer /data/amd_int/models/GLM-5.3-MXFP4 --tokenizer-trust-remote-code \
+  --isl 4096 --isl-stddev 0 --osl 512 --osl-stddev 0 \
+  --prompt-prefix-length 28672 --prompt-prefix-pool-size 128 \
+  --num-dataset-entries 256 --concurrency 8 \
+  --benchmark-duration 1800 --benchmark-grace-period 60 \
+  --extra-inputs ignore_eos:true --use-server-token-count \
+  --cache-bust first-turn-suffix --random-seed 530419 \
+  --request-timeout-seconds 3600 --no-gpu-telemetry --artifact-dir "$OUT"
+```
+
+Three of those flags are load-bearing for comparability and none of them is
+optional. `--random-seed` fixes the dataset, so both arms replay the same
+prompts. `PYTHONHASHSEED=0` is needed on the **client** as well as the server:
+aiperf builds the prompts locally, and an unseeded hash makes the "shared"
+prefix differ per process. `--use-server-token-count` makes every hit rate
+below a ratio of two server-side counters rather than of a client-side estimate,
+so the denominator cannot drift between arms. Measured ISL came out
+32,768.88 on both arms and OSL 512 on both, which is the check that it worked.
+
+**Why pool size 128.** A chunk is only fetchable from the CPU tier once it has
+fallen *out* of HBM, so the tier can only hit on reuse distances inside
+
+    [ hbm_pool_tokens , tier_tokens )  =  [ 3,440,832 , 5,762,639 )
+
+and this workload's reuse distance is `(pool_size - 1) x ISL` with ISL = 32,768.
+Pool 64 gives 2,064,384 — **below** the HBM pool, so the tier's hit rate is zero
+by construction and raising the tier cannot help, because that only moves the
+top of the band. Pool 128 gives 4,161,536: 20.9% above the floor and 27.8%
+below the ceiling. This is the arithmetic that has to be done *before* the run,
+not the result of one.
+
+| | Conc | tput/GPU | TTFT p50 / p90 | ITL p50 | ITL p90 | prefix hit | ceiling |
+|---|---|---|---|---|---|---|---|
+| **full window, 1800 s** | | | | | | | |
+| OFF | 8 | 86.03 tok/s/GPU | 2279 / 4301 ms | 18.11 ms | 21.80 ms | 61.13% | 90.79% |
+| ON | 8 | **90.28 tok/s/GPU** | 1314 / 2927 ms | 16.11 ms | 18.74 ms | **82.55%** | 91.20% |
+| | | **+4.94%** | −42.3 / −32.0% | −11.0% | −14.0% | +21.4 pp | |
+| **steady state, t >= 600 s** | | | | | | | |
+| OFF | 8 | 88.32 tok/s/GPU | 2239 / 3649 ms | 18.10 ms | 21.73 ms | 64.37% | n/a |
+| ON | 8 | **108.23 tok/s/GPU** | 1257 / 1696 ms | 15.96 ms | 17.67 ms | **90.73%** | n/a |
+| | | **+22.54%** | −43.9 / −53.5% | −11.8% | −18.7% | +26.4 pp | |
+
+`tput/GPU` is `output_token_throughput / 4`. OSL is fixed at 512, so it is
+`request_throughput x 128` by construction and carries no information the
+request rate does not.
+
+**The headline number is a function of the window, and the second row is not
+cherry-picking.** The tier starts empty and is filled at ~0.287 GiB/s/rank,
+while this workload's rotating working set is 128 prefixes plus the 128 tails
+in flight with them, `128 x (1.2737 + 0.182) = 186.3 GiB/rank`, so **~650 s
+pass before steady-state reuse is possible at all**. A 600 s run at this pool
+size would measure the fill, not the cache — which is why this pair runs 1800
+s. The same start-cut is applied to **both** arms, and the OFF arm is the
+control that licenses it: it is flat across every cut (0.6721 / 0.6889 /
+0.6888 / 0.6900 req/s at t >= 0 / 200 / 300 / 600 s), so cutting the window
+does not itself manufacture throughput.
+
+**There is no warmup phase.** Neither `--warmup-request-count` nor
+`--warmup-duration` is set, and aiperf's own rule is that absent both, no warmup
+runs (`profile_export.jsonl` contains 1272 / 1216 records and all are
+`benchmark_phase: profiling`). `--benchmark-grace-period 60` drains in-flight
+requests at the *end* and is not a warmup. Adding one would not remove the ramp
+anyway: it would have to run ~650 s itself to cover the fill.
+
+Per 120 s window, `n` requests started / `cold` = requests that cached nothing:
+
+| t (s) | ON n / cold / hit% | OFF n / cold / hit% |
+|---|---|---|
+| 0 | 29 / 26 / 9.05% | 64 / 51 / 17.77% |
+| 120 | 59 / 34 / 37.08% | 80 / 30 / 54.69% |
+| 240 | 80 / 27 / 57.97% | 80 / 20 / 65.08% |
+| 360 | 48 / 11 / 67.45% | 72 / 26 / 55.90% |
+| 480 | 40 / 11 / 62.36% | 88 / 19 / 68.61% |
+| 600 | 104 / **0** / 90.47% | 88 / 20 / 66.88% |
+| 720-1680 | 96-104 / **0** / 89.7-91.9% | 72-88 / 16-28 / 54.3-70.0% |
+
+Two different things are visible here and they should not be conflated. The ON
+arm's ramp is transient: cold requests stop entirely at t = 579 s and the hit
+rate locks at 90-92%. The OFF arm's scatter is **not** a ramp — it is still
+producing 16-28 cold requests per window at t = 1680 s, because the 186.3
+GiB/rank working set does not fit the 152.98 GiB/rank HBM pool and evicted
+prefixes have nothing underneath them. It is not slow to warm up; it never
+warms up.
+
+Cold requests are also spread across the first 600 s rather than bunched at
+t = 0, and that is coupon collection, not a defect: each request draws a prefix
+uniformly from 128, so the last distinct prefix first appears around request
+`128 x ln(128) ~ 621`.
+
+**Where the prompt tokens went.** `vllm:prompt_tokens_by_source_total`, whose
+three components sum to `vllm:prompt_tokens_total` exactly on both arms:
+
+| source | OFF | ON |
+|---|---|---|
+| `local_compute` | 15,488,497 (38.87%) | **7,274,722 (17.45%)** |
+| `local_cache_hit` | 24,358,464 (61.13%) | 25,067,392 (60.14%) |
+| `external_kv_transfer` | 0 | **9,339,904 (22.41%)** |
+| total | 39,846,961 | 41,682,018 |
+
+Prefill recompute fell from 8,561 to 4,034 tok/s (−52.9%) while the server
+delivered 4.9% more requests over the full window. As in the pair above, the
+tier only feeds prefill, so TTFT moves most (−42.3% at p50) and ITL follows
+second-hand (−11.0%) as prefill stops competing with decode.
+
+Note that the HBM hit rate is **not** what improved — it is 61.13% OFF against
+60.14% ON, i.e. very slightly *lower* with the tier on. On the plugin path vLLM
+asks the connector only about what the HBM pool missed (`queries = num_tokens -
+local_computed`), so the tier's 22.41% is carved out of the miss tail
+(16,614,626 tokens, 39.86% of prompt tokens) and the two percentages have
+different denominators. Within the tail the tier answered **56.21%**.
+
+That number has an independent witness. LMCache's own `Retrieved X out of Y
+required tokens` lines across all four ranks sum to 37,359,616; divided by TP=4
+that is 9,339,904, which equals `vllm:external_prefix_cache_hits` bit for bit.
+The two instruments share no code path, so this is corroboration rather than a
+restatement.
+
+**The ceiling column, and a correction.** aiperf does **not** export a
+theoretical hit rate; its `overall_usage_prompt_cache_read_pct` (82.547% /
+61.130%) is the *measured* combined rate, equal by construction to
+`(hbm_hits + tier_hits) / prompt_tokens`. The ceiling above is computed here as
+
+    ceiling = (Q - pool_size x 28,672) / Q
+
+on the reasoning that only the first load of each of the 128 distinct prefixes
+is unavoidable. The tempting stricter form — "the 4,096-token tail is
+cache-busted and therefore never reusable", giving `(R - 128) x 28,672 / Q =
+78.69%` — **is wrong, and the measurement is what shows it**, because ON
+measured 82.55%, above that supposed ceiling. The per-request histogram says
+why: `--cache-bust first-turn-suffix` does not make every tail unique.
+
+| cached tokens in a request | ON requests |
+|---|---|
+| 32,768 (the whole prompt) | 252 |
+| 28,672 (prefix only) | 878 |
+| 0 (cold prefix) | 109 |
+| other (partial) | 33 |
+
+So 91.20% is a loose but genuine upper bound, and the steady-state row is
+deliberately left `n/a`: with zero cold requests after t = 600 s the cold term
+vanishes and the formula degenerates to 100%, while the real limit there is how
+often tails repeat — which this workload does not pin down. What can be said is
+that ON's steady 90.73% sits within half a point of the full-window bound.
+
+**Limits.** Each arm is **n=1 in runs**. No dispersion is quoted, and the OFF
+arm's flatness across window cuts bounds within-run drift, not run-to-run
+variance — it is what licenses the start-cut, not an error bar on +22.54%.
+Throughput is quantised at 1/1272 = 0.08% (ON) and 1/1216 = 0.08% (OFF), which
+is far below the effect but says nothing about the effect's repeatability. The
++4.94% full-window figure in particular is a mixture of a 600 s transient and a
+1200 s steady state, and should be quoted as such or not at all.
 
 ### Host memory and tier residency
 
