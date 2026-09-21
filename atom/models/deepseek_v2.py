@@ -1189,6 +1189,13 @@ class DeepseekV2MoE(nn.Module):
             e_score_correction_bias=self.gate.e_score_correction_bias,
             config=config,
         )
+        if getattr(config, "model_type", None) == "glm_moe_dsa":
+            # Plain GLM-5.3 uses ordinary, unclamped SwiGLU. Keep these values
+            # explicit because IQ2R also serves GPT-OSS and GLM-5.3-Flash,
+            # whose expert activations have different formulas.
+            self.experts.swiglu_limit = 0.0
+            self.experts.swiglu_alpha = 1.0
+            self.experts.swiglu_up_offset = 0.0
 
         # Dual-stream support: parallelize shared expert and routed expert
         # computation using a separate CUDA stream. Registered as a custom op
@@ -1357,12 +1364,12 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        assert (
-            hidden_states.dim() == 2
-        ), f"Expected hidden_states to be 2D (seq_len, hidden_dim), but got {hidden_states.dim()}D, with shape {hidden_states.shape}"
-        assert (
-            hidden_states.shape[1] == self.experts.hidden_size
-        ), f"Hidden states dimension {hidden_states.shape[1]} does not match expected {self.experts.hidden_size}"
+        assert hidden_states.dim() == 2, (
+            f"Expected hidden_states to be 2D (seq_len, hidden_dim), but got {hidden_states.dim()}D, with shape {hidden_states.shape}"
+        )
+        assert hidden_states.shape[1] == self.experts.hidden_size, (
+            f"Hidden states dimension {hidden_states.shape[1]} does not match expected {self.experts.hidden_size}"
+        )
 
         if self._pcp_moe_merge_enabled:
             return torch.ops.aiter.deepseek_v2_moe_pcp_merge_forward(
@@ -3599,4 +3606,14 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
         # HF quant config uses "indexers_proj" but the ATOM module path is
         # "indexer.weights_proj".  str.replace translates each exclude entry.
         "indexers_proj": "indexer.weights_proj",
+    }
+    weights_mapping: ClassVar[dict[str, str]] = {
+        ".experts.iq2r_gate_up_data": ".experts.w13_weight",
+        ".experts.iq2r_gate_up_auxiliary": ".experts.w13_weight_scale",
+        ".experts.iq2r_down_data": ".experts.w2_weight",
+        ".experts.iq2r_down_auxiliary": ".experts.w2_weight_scale",
+        ".mlp.up_gate_proj.0.iq2r_data": ".mlp.experts.w13_weight",
+        ".mlp.up_gate_proj.0.iq2r_auxiliary": ".mlp.experts.w13_weight_scale",
+        ".mlp.down_proj.0.iq2r_data": ".mlp.experts.w2_weight",
+        ".mlp.down_proj.0.iq2r_auxiliary": ".mlp.experts.w2_weight_scale",
     }

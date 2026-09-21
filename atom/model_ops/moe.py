@@ -121,6 +121,10 @@ def _capture_iq2r_routes(
     output_dir = Path(_IQ2R_ROUTE_CAPTURE_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
     safe_prefix = prefix.replace(".", "_").replace("/", "_") or "unknown"
+    device_index = topk_ids.device.index
+    if device_index is None and topk_ids.is_cuda:
+        device_index = torch.cuda.current_device()
+    device_suffix = f"-device{device_index}" if device_index is not None else ""
     torch.save(
         {
             "prefix": prefix,
@@ -128,7 +132,7 @@ def _capture_iq2r_routes(
             "topk_ids": topk_ids.detach().cpu(),
             "topk_weights": topk_weights.detach().cpu(),
         },
-        output_dir / f"{safe_prefix}-m{topk_ids.shape[0]}-{sequence}.pt",
+        output_dir / f"{safe_prefix}{device_suffix}-m{topk_ids.shape[0]}-{sequence}.pt",
     )
 
 
@@ -1018,7 +1022,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
 
 
 class Iq2rMoEMethod(FusedMoEMethodBase):
-    """TP1 adapter for AITER-owned native-basis IQ2R experts."""
+    """Adapter for AITER-owned native-basis IQ2R experts.
+
+    IQ2R checkpoints store complete expert matrices, so tensor-parallel MoE
+    sharding is unsupported. Expert parallelism is supported: every rank owns
+    complete matrices for a contiguous subset of experts and remaps the global
+    router ids to its local expert slots before entering AITER.
+    """
 
     # GPT-OSS uses this existing capability flag only to skip its MXFP4-specific
     # gate/up rewrite. IQ2R itself executes through AITER HIP kernels.
@@ -1026,11 +1036,28 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
     supports_router_bias_deferral = True
     supports_fused_next_rmsnorm = True
 
-    def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
+    def __init__(
+        self,
+        quant_config: LayerQuantConfig,
+        moe: FusedMoEConfig,
+        workspace_owner: object | None = None,
+    ):
         super().__init__(moe)
         self.quant_config = quant_config
         self.output_hidden_size = moe.hidden_dim
-        self._workspaces: dict[tuple[torch.device, int, int, int, int], object] = {}
+        if workspace_owner is None:
+            workspace_owner = self
+        workspaces = getattr(workspace_owner, "_iq2r_workspaces", None)
+        if workspaces is None:
+            workspaces = {}
+            workspace_owner._iq2r_workspaces = workspaces
+        # Every transformer layer executes serially on a rank, so one fixed
+        # workspace per shape/device is sufficient and remains graph-safe.
+        # Keeping this cache on the model-wide quantization config avoids
+        # allocating the multi-GiB GLM workspace once per MoE layer.
+        self._workspaces: dict[tuple[torch.device, int, int, int, int, int], object] = (
+            workspaces
+        )
 
     def create_weights(
         self,
@@ -1043,10 +1070,47 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
     ) -> None:
         del params_dtype
         parallel = self.moe.moe_parallel_config
-        if parallel.tp_size != 1 or parallel.ep_size != 1:
-            raise NotImplementedError("IQ2R currently supports TP1/EP1 only")
+        if parallel.tp_size != 1:
+            raise NotImplementedError(
+                "IQ2R requires complete expert matrices; enable expert parallelism "
+                "for multi-rank execution"
+            )
         if num_experts <= 0 or num_experts > 512:
             raise ValueError("IQ2R requires between 1 and 512 routed experts")
+
+        expert_layout = getattr(self.moe, "expert_layout", None)
+        if getattr(expert_layout, "num_redundant", 0):
+            raise NotImplementedError(
+                "IQ2R does not yet support redundant EPLB experts"
+            )
+        if getattr(expert_layout, "num_fused_shared_experts", 0):
+            raise NotImplementedError(
+                "IQ2R does not fuse shared experts into routed weights"
+            )
+
+        global_num_experts = int(
+            getattr(expert_layout, "num_routed", 0)
+            or getattr(self.moe, "num_experts", 0)
+            or num_experts
+        )
+        if global_num_experts <= 0 or global_num_experts > 512:
+            raise ValueError("IQ2R requires between 1 and 512 global routed experts")
+        ep_size = int(getattr(parallel, "ep_size", 1))
+        ep_rank = int(getattr(parallel, "ep_rank", 0))
+        if ep_size <= 0 or not 0 <= ep_rank < ep_size:
+            raise ValueError(f"invalid IQ2R expert-parallel rank {ep_rank}/{ep_size}")
+        expert_start = ep_rank * (global_num_experts // ep_size)
+        expected_local_experts = (
+            global_num_experts - expert_start
+            if ep_rank == ep_size - 1
+            else global_num_experts // ep_size
+        )
+        if num_experts != expected_local_experts:
+            raise ValueError(
+                "IQ2R local expert count does not match the EP topology: "
+                f"got {num_experts}, expected {expected_local_experts} for "
+                f"rank {ep_rank}/{ep_size} with {global_num_experts} global experts"
+            )
 
         from aiter.ops.iq2r_format import IQ2RMetadata
 
@@ -1059,6 +1123,8 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
             logical_k=intermediate_size_per_partition,
         )
         self.num_experts = num_experts
+        self.global_num_experts = global_num_experts
+        self.expert_start = expert_start
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size_per_partition
         layer.iq2r_gate_up_metadata = gate_metadata
@@ -1140,12 +1206,25 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
         name = getattr(param, "iq2r_name", None)
         if name is None:
             raise ValueError("IQ2R loader received an unrecognized parameter")
-        if tuple(param.shape) != tuple(loaded_weight.shape):
+        global_num_experts = getattr(self, "global_num_experts", param.shape[0])
+        expert_start = getattr(self, "expert_start", 0)
+        local_num_experts = getattr(self, "num_experts", param.shape[0])
+        if tuple(param.shape) == tuple(loaded_weight.shape):
+            local_weight = loaded_weight
+        elif (
+            loaded_weight.ndim == param.ndim
+            and loaded_weight.shape[0] == global_num_experts
+            and tuple(loaded_weight.shape[1:]) == tuple(param.shape[1:])
+        ):
+            local_weight = loaded_weight.narrow(0, expert_start, local_num_experts)
+        else:
             raise ValueError(
                 f"IQ2R {name} shape mismatch: target={tuple(param.shape)}, "
-                f"checkpoint={tuple(loaded_weight.shape)}"
+                f"checkpoint={tuple(loaded_weight.shape)}; expected either a local "
+                f"{local_num_experts}-expert payload or the full "
+                f"{global_num_experts}-expert payload"
             )
-        param.data.copy_(loaded_weight.to(device=param.device, dtype=param.dtype))
+        param.data.copy_(local_weight.to(device=param.device, dtype=param.dtype))
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         from aiter.iq2r_moe import IQ2RMoeWorkspace
@@ -1180,6 +1259,7 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
 
         key = (
             layer.w13_weight.device,
+            self.moe.max_num_tokens,
             self.moe.experts_per_token,
             self.num_experts,
             self.hidden_size,
@@ -1226,26 +1306,29 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
         norm_weight: torch.Tensor | None = None,
         norm_epsilon: float = 1e-5,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if activation != ActivationType.Swiglu:
-            raise ValueError("IQ2R requires SwiGLU activation")
-        if expert_map is not None or self.moe.moe_parallel_config.use_ep:
-            raise NotImplementedError("IQ2R does not yet support expert parallelism")
+        if activation not in (ActivationType.Silu, ActivationType.Swiglu):
+            raise ValueError("IQ2R requires a SiLU-gated activation")
+        use_ep = self.moe.moe_parallel_config.use_ep
+        if use_ep and expert_map is None:
+            raise ValueError("IQ2R expert parallelism requires a global-to-local map")
         if apply_router_weight_on_input:
             raise NotImplementedError(
                 "IQ2R applies router weights after the down projection"
             )
-        if top_k <= 0 or global_num_experts != self.num_experts:
+        expected_global_experts = getattr(self, "global_num_experts", self.num_experts)
+        if top_k <= 0 or global_num_experts != expected_global_experts:
             raise ValueError(
-                f"IQ2R expected {self.num_experts} experts and a positive top-k"
+                f"IQ2R expected {expected_global_experts} global experts and a "
+                "positive top-k"
             )
         if router_bias is not None and (
             router_bias.dtype != torch.bfloat16
-            or tuple(router_bias.shape) != (self.num_experts,)
+            or tuple(router_bias.shape) != (expected_global_experts,)
             or router_bias.device != router_logits.device
             or not router_bias.is_contiguous()
         ):
             raise ValueError(
-                f"IQ2R router bias must be contiguous BF16 [{self.num_experts}]"
+                f"IQ2R router bias must be contiguous BF16 [{expected_global_experts}]"
             )
 
         logical_hidden_size = layer.iq2r_down_metadata.logical_n
@@ -1264,6 +1347,7 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
 
         key = (
             x.device,
+            self.moe.max_num_tokens,
             top_k,
             self.num_experts,
             self.hidden_size,
@@ -1346,6 +1430,23 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
                 hidden_size=logical_hidden_size,
             )
 
+        expert_start = 0
+        if expert_map is not None:
+            if expert_map.device != topk_ids.device:
+                raise ValueError("IQ2R expert_map must be on the routing device")
+            if (
+                expert_map.dtype != torch.int32
+                or expert_map.numel() < global_num_experts
+            ):
+                raise ValueError(
+                    "IQ2R expert_map must be int32 and cover every global expert"
+                )
+            # IQ2R rejects redundant EPLB experts above, and ATOM's ordinary
+            # EP layout assigns each rank one contiguous global expert range.
+            # AITER subtracts this offset while its existing route kernel builds
+            # local tasks, avoiding four eager tensor launches per MoE layer.
+            expert_start = self.expert_start
+
         workspace = get_workspace()
 
         if residual is not None:
@@ -1370,6 +1471,7 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
                 gate_up_bias=layer.w13_bias,
                 down_bias=layer.w2_bias,
                 workspace=workspace,
+                expert_start=expert_start,
                 router_logits=router_logits if use_fused_router else None,
                 router_bias=router_bias if use_fused_router else None,
                 renormalize=renormalize,
@@ -1400,6 +1502,7 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
             iq2r_w1_tile_n=layer.iq2r_gate_up_tile_n,
             iq2r_w2_tile_n=layer.iq2r_down_tile_n,
             iq2r_workspace=workspace,
+            iq2r_expert_start=expert_start,
             iq2r_router_logits=router_logits if use_fused_router else None,
             iq2r_router_bias=router_bias if use_fused_router else None,
             iq2r_router_renormalize=renormalize,
@@ -3939,7 +4042,11 @@ class FusedMoE(torch.nn.Module):
                 moe
             )
         elif quant_method_str == "iq2r":
-            self.quant_method = Iq2rMoEMethod(layer_quant_config, moe)
+            self.quant_method = Iq2rMoEMethod(
+                layer_quant_config,
+                moe,
+                workspace_owner=quant_config,
+            )
         elif (
             quant_method_str == "compressed-tensors"
             and layer_quant_config.quant_dtype == dtypes.fp8

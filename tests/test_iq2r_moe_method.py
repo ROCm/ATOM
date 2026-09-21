@@ -54,6 +54,20 @@ def test_iq2r_v2_parser_preserves_base_quant_and_targets_routed_experts():
     assert parsed.exclude_layers == ["model.layers.*.mlp.gate"]
 
 
+def test_iq2r_methods_share_one_model_scoped_workspace_cache():
+    owner = SimpleNamespace()
+    moe = SimpleNamespace(hidden_dim=6144)
+    first = moe_mod.Iq2rMoEMethod(SimpleNamespace(), moe, workspace_owner=owner)
+    second = moe_mod.Iq2rMoEMethod(SimpleNamespace(), moe, workspace_owner=owner)
+    other = moe_mod.Iq2rMoEMethod(
+        SimpleNamespace(), moe, workspace_owner=SimpleNamespace()
+    )
+
+    assert first._workspaces is second._workspaces
+    assert first._workspaces is owner._iq2r_workspaces
+    assert other._workspaces is not first._workspaces
+
+
 @pytest.mark.parametrize(
     "config",
     [
@@ -122,7 +136,7 @@ def test_iq2r_create_weights_exposes_exact_overlay_contract():
         assert parameter.iq2r_name == name
 
 
-def test_iq2r_create_weights_accepts_glm53_geometry_without_bias():
+def test_iq2r_create_weights_accepts_glm53_flash_geometry_without_bias():
     from aiter.ops.iq2r_format import IQ2RMetadata
 
     method = object.__new__(moe_mod.Iq2rMoEMethod)
@@ -151,6 +165,61 @@ def test_iq2r_create_weights_accepts_glm53_geometry_without_bias():
     assert layer.w2_bias is None
     assert layer.iq2r_gate_up_tile_n == 128
     assert layer.iq2r_down_tile_n == 128
+
+
+def test_iq2r_create_weights_accepts_plain_glm53_ep4_geometry_without_bias():
+    from aiter.ops.iq2r_format import IQ2RMetadata
+
+    method = object.__new__(moe_mod.Iq2rMoEMethod)
+    method.moe = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(
+            tp_size=1, ep_size=4, ep_rank=2, use_ep=True
+        ),
+        expert_layout=SimpleNamespace(
+            num_routed=256,
+            num_redundant=0,
+            num_fused_shared_experts=0,
+        ),
+        experts_per_token=8,
+    )
+    layer = torch.nn.Module()
+    layer.has_bias = False
+    with torch.device("meta"):
+        method.create_weights(
+            layer,
+            num_experts=64,
+            hidden_size=6144,
+            intermediate_size_per_partition=2048,
+            params_dtype=torch.bfloat16,
+        )
+
+    gate = IQ2RMetadata(logical_n=4096, logical_k=6144)
+    down = IQ2RMetadata(logical_n=6144, logical_k=2048)
+    assert method.global_num_experts == 256
+    assert method.num_experts == 64
+    assert method.expert_start == 128
+    assert tuple(layer.w13_weight.shape) == (64, gate.data_bytes)
+    assert tuple(layer.w13_weight_scale.shape) == (64, gate.auxiliary_bytes)
+    assert tuple(layer.w2_weight.shape) == (64, down.data_bytes)
+    assert tuple(layer.w2_weight_scale.shape) == (64, down.auxiliary_bytes)
+    assert layer.w13_bias is None
+    assert layer.w2_bias is None
+
+
+def test_iq2r_ep_loader_slices_full_overlay_on_expert_axis():
+    method = object.__new__(moe_mod.Iq2rMoEMethod)
+    method.num_experts = 2
+    method.global_num_experts = 8
+    method.expert_start = 4
+    parameter = torch.nn.Parameter(
+        torch.empty((2, 3), dtype=torch.uint8), requires_grad=False
+    )
+    parameter.iq2r_name = "w13_weight"
+    loaded = torch.arange(24, dtype=torch.uint8).reshape(8, 3)
+
+    method.load_weight(parameter, loaded)
+
+    assert torch.equal(parameter, loaded[4:6])
 
 
 def test_iq2r_moe_fake_propagates_logical_hidden_width(monkeypatch):
@@ -351,6 +420,100 @@ def test_iq2r_glm53_uses_grouped_sigmoid_router_and_glm_swiglu(monkeypatch):
         "max_experts": 288,
         "hidden_size": 4,
         "intermediate_size": 2,
+    }
+
+
+def test_iq2r_plain_glm53_ep4_remaps_global_routes_and_skips_nonlocal(
+    monkeypatch,
+):
+    method = object.__new__(moe_mod.Iq2rMoEMethod)
+    method.moe = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(use_ep=True),
+        max_num_tokens=8,
+    )
+    method.num_experts = 2
+    method.global_num_experts = 8
+    method.expert_start = 4
+    method.hidden_size = 4
+    method.intermediate_size = 2
+    method._workspaces = {}
+    layer = SimpleNamespace(
+        num_fused_shared_experts=0,
+        routed_scaling_factor=2.5,
+        w13_weight=torch.empty((2, 3), dtype=torch.uint8),
+        w13_weight_scale=torch.empty((2, 5), dtype=torch.uint8),
+        w2_weight=torch.empty((2, 2), dtype=torch.uint8),
+        w2_weight_scale=torch.empty((2, 7), dtype=torch.uint8),
+        w13_bias=None,
+        w2_bias=None,
+        iq2r_gate_up_metadata=SimpleNamespace(logical_n=4),
+        iq2r_down_metadata=SimpleNamespace(logical_n=4),
+        iq2r_gate_up_tile_n=128,
+        iq2r_down_tile_n=128,
+        swiglu_limit=0.0,
+        swiglu_alpha=1.0,
+        swiglu_up_offset=0.0,
+    )
+    hidden = torch.randn(1, 4, dtype=torch.bfloat16)
+    logits = torch.randn(1, 8)
+    topk_weights = torch.full((1, 4), 0.25, dtype=torch.float32)
+    global_topk_ids = torch.tensor([[0, 4, 5, 7]], dtype=torch.int32)
+    expert_map = torch.tensor([-1, -1, -1, -1, 0, 1, -1, -1], dtype=torch.int32)
+
+    monkeypatch.setattr(
+        moe_mod.FusedMoE,
+        "select_experts",
+        staticmethod(lambda **_kwargs: (topk_weights, global_topk_ids)),
+    )
+
+    class FakeWorkspace:
+        @classmethod
+        def allocate(cls, tokens, topk, *, device, **kwargs):
+            return (tokens, topk, device, kwargs)
+
+    calls = []
+    monkeypatch.setattr(aiter_iq2r_moe, "IQ2RMoeWorkspace", FakeWorkspace)
+    monkeypatch.setattr(
+        moe_mod,
+        "fused_moe",
+        lambda **kwargs: calls.append(kwargs) or torch.empty_like(hidden),
+    )
+
+    method.apply(
+        layer=layer,
+        x=hidden,
+        router_logits=logits,
+        top_k=4,
+        renormalize=True,
+        global_num_experts=8,
+        expert_map=expert_map,
+        scoring_func="sigmoid",
+        # Conventional DeepSeek/GLM MoE calls this fused SiLU-gate operation
+        # `Silu`; GPT-OSS uses the explicit `Swiglu` enum for its clamped form.
+        activation=moe_mod.ActivationType.Silu,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["topk_ids"] is global_topk_ids
+    assert calls[0]["iq2r_expert_start"] == 4
+    assert calls[0]["swiglu_limit"] == 0.0
+    assert calls[0]["beta"] == 1.0
+    assert calls[0]["linear_beta"] == 0.0
+    assert calls[0]["iq2r_workspace"][3]["max_experts"] == 2
+
+
+def test_plain_glm53_maps_fused_iq2r_overlay_weights():
+    from atom.models.deepseek_v2 import GlmMoeDsaForCausalLM
+
+    assert GlmMoeDsaForCausalLM.weights_mapping == {
+        ".experts.iq2r_gate_up_data": ".experts.w13_weight",
+        ".experts.iq2r_gate_up_auxiliary": ".experts.w13_weight_scale",
+        ".experts.iq2r_down_data": ".experts.w2_weight",
+        ".experts.iq2r_down_auxiliary": ".experts.w2_weight_scale",
+        ".mlp.up_gate_proj.0.iq2r_data": ".mlp.experts.w13_weight",
+        ".mlp.up_gate_proj.0.iq2r_auxiliary": ".mlp.experts.w13_weight_scale",
+        ".mlp.down_proj.0.iq2r_data": ".mlp.experts.w2_weight",
+        ".mlp.down_proj.0.iq2r_auxiliary": ".mlp.experts.w2_weight_scale",
     }
 
 
