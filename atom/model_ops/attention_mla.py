@@ -294,27 +294,16 @@ def mla_dcp_sparse_prefill_is_persistent(
 ) -> bool:
     """Whether a DCP sparse prefill reaches ``mla_decode_fwd`` in persistent mode.
 
-    Mirrors the gate ``_forward_prefill_mla`` applies per forward, and is the
+    Mirrors the gate ``_forward_prefill_mla`` applies per forward and is the
     single source the gathered pad width is derived from -- the two must move
-    together. gqa=64 computes correctly only in persistent mode, so a path that
-    runs one way while its width came from the other silently miscomputes; the
-    assertion at that gate keeps them tied.
+    together, or a path runs one way while its width was padded for the other.
 
-    Not gated on KV cache dtype: an earlier version restricted this to fp8, but
-    that restriction traced back to a single commit ("Fix DSA DCP accuracy",
-    2026-08-05) that bundled it with two other, genuinely-necessary fp8-only
-    guards (the q/kv quantization scales) while first extending this call path
-    from fp8-only to bf16 -- nothing ties the *work metadata* itself to dtype.
-    The work-metadata buffers are already allocated and filled for the layer's
-    real dtype regardless (`get_mla_metadata_info_v1`/`get_mla_metadata_v1`
-    take `self.dtype_q`/`self.dtype_kv` unconditionally), aiter-side synthetic
-    sweeps (1080 configs) show persistent and non-persistent agree to bf16
-    rounding, and an e2e GLM-5.2-FP8 bf16-KV gsm8k run with this enabled came
-    back within noise of the previous (fp8-only) behavior. See
-    DCP_Further_Optimization2.md §2.8 for the full trail. The non-DCP
-    (`dcp_world_size <= 1`) call site lost persistent mode for bf16 in the same
-    commit; `_forward_prefill_mla`'s `use_work_meta` closes that gap too, since
-    it has no width table to keep in sync with (unlike this DCP predicate).
+    Not gated on KV cache dtype: the work-metadata buffers are allocated and
+    filled for the layer's real dtype regardless
+    (`get_mla_metadata_info_v1`/`get_mla_metadata_v1` take `dtype_q`/`dtype_kv`
+    unconditionally), and persistent vs non-persistent agree to bf16 rounding.
+    The non-DCP (`dcp_world_size <= 1`) call site is fixed the same way in
+    `_forward_prefill_mla`'s `use_work_meta`.
     """
     if dcp_world_size <= 1 or not sparse_metadata_rebuild:
         return False
@@ -764,15 +753,10 @@ class MLAAttention(nn.Module):
             self._cp_triton_ctx = None
 
         # DCP Query Replication (QREP): q_proj is sharded on effective TP =
-        # tp/dcp, so each rank produces the whole DCP-group head set and decode
-        # can skip the per-step AllGather Q. W_K is gathered to match, at load.
-        # Only layers built with `qrep_tp_override` actually have a q_proj this
-        # wide -- eagle3 / DSpark draft models and GLM-5.3's `_ZeroRopePad`
-        # wrapper build their own q_proj independently of the target model and
-        # never apply the override. Checking the per-layer intent (config flag)
-        # is not enough: gating on the actual weight width also catches a layer
-        # silently reinterpreting a narrow q as a wide one instead of either
-        # working correctly or raising.
+        # tp/dcp so decode can skip the per-step AllGather Q; W_K is gathered
+        # to match, at load. Gate on actual q_proj width, not just the config
+        # flag -- eagle3/DSpark drafts and GLM-5.3's _ZeroRopePad build their
+        # own q_proj without the override, so the flag alone can't tell.
         self.qrep_num_heads = self.num_heads * self.dcp_world_size
         wants_qrep = (
             self.dcp_world_size > 1
@@ -2072,12 +2056,9 @@ class MLAAttention(nn.Module):
                         kv_last_page_lens,
                         work_prefix="sparse_prefill_",
                     )
-                # Not gated on is_fp8 for either call site: the non-DCP branch
-                # lost persistent mode for bf16 in the same commit that added
-                # the DCP dtype gate (see mla_dcp_sparse_prefill_is_persistent's
-                # docstring), and the sparse_prefill_work_* buffers are
-                # allocated and filled for the layer's real dtype regardless of
-                # DCP world size -- there is nothing fp8-specific in them.
+                # Not gated on is_fp8: sparse_prefill_work_* buffers are
+                # allocated/filled for the layer's real dtype regardless of
+                # DCP world size, so bf16 works the same as fp8 here.
                 use_work_meta = self.dcp_world_size <= 1 or sparse_dcp_persistent
                 _, final_lse = mla_decode_fwd(
                     q,

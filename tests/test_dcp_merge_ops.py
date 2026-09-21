@@ -933,19 +933,11 @@ def test_gate_reason_is_human_readable():
 
 
 def test_gate_does_not_look_at_speculative_config():
-    """Gated off in the first cut on the suspicion that QREP's full-group-head
-    q_out conflicted with the qlen>1 verify path (the `cprr` kernel for dense
-    MLA, or the sparse indexer's per-token candidate exchange). Auditing both
-    showed no coupling: q_out's provenance (AllGather vs QREP) is invisible to
-    either consumer. GLM-5.2-FP8 sparse dcp8 fp8 MTP=3 ran clean end-to-end
-    (gsm8k nshot=20, QREP-on 0.9469/0.9477 vs QREP-off 0.9492/0.9492) -- though
-    that arm never selects `cprr` (sparse MTP verify flattens to qlen=1 per
-    token), so it covers the sparse indexer side of this claim, not `cprr`.
-
-    A value assertion on the old 3-arg signature would pass again if
-    `speculative_config` were re-added as an optional keyword with a default,
-    which is the likeliest recurrence. Pin the decoupling at the signature
-    instead, same as `test_gate_takes_no_interleave_input` above.
+    """QREP's provenance of q_out is invisible to both verify-path consumers
+    (`cprr` and the sparse indexer's candidate exchange), so speculative decode
+    never needed this gate. Pin it at the signature, not a value assertion --
+    a re-added `speculative_config` keyword-with-default would pass a value
+    check again but not this one, same as `test_gate_takes_no_interleave_input`.
     """
     import inspect
 
@@ -957,16 +949,11 @@ def test_gate_does_not_look_at_speculative_config():
 
 # ─────────────────────────────────────── per-layer QREP eligibility (CPU) ──
 #
-# `enable_query_replication` is a config-wide intent, but only layers built
-# with `qrep_tp_override` actually have a q_proj that wide: eagle3 / DSpark
-# draft models build their own q_proj independently of the target model, and
-# some models (e.g. GLM-5.3's `_ZeroRopePad`-wrapped q_proj) have not wired
-# the override at all. `q_proj_is_qrep_widened` is the runtime check that
-# keeps those layers on the AllGather path instead of misreading a narrow q as
-# the wide QREP layout. Both it and `qrep_enabled_for_layer` live in
-# atom.config (not atom.model_ops.attention_mla, which needs triton/aiter at
-# import time) specifically so these tests run on the CPU-only CI gate
-# instead of being silently skipped there.
+# `q_proj_is_qrep_widened` keeps layers that never opted into QREP (eagle3 /
+# DSpark drafts, GLM-5.3's `_ZeroRopePad`) on the AllGather path instead of
+# misreading a narrow q as the wide QREP layout. It and `qrep_enabled_for_layer`
+# live in atom.config, not atom.model_ops.attention_mla, so these tests run on
+# the CPU-only CI gate instead of being silently skipped there.
 
 
 class _FakeLinear:
@@ -1001,14 +988,9 @@ def test_q_proj_is_qrep_widened_false_when_no_weight_attr():
 
 
 def test_qrep_enabled_for_layer_is_the_and_not_just_the_helper():
-    """Pins the actual per-layer decision, not only the helper it calls.
-
-    A test that only asserts `q_proj_is_qrep_widened`'s behavior would not
-    notice `MLAAttention.__init__`'s `wants_qrep and
-    q_proj_is_qrep_widened(...)` being weakened to always return `wants_qrep`
-    (or the `and` being dropped entirely) -- both would leave every existing
-    `q_proj_is_qrep_widened` test green while re-enabling QREP for unwired
-    layers. Assert the combination directly, for both operands.
+    """Pins the `and`, not just `q_proj_is_qrep_widened` -- a weakened or
+    dropped `and` at the call site would leave every helper test green while
+    re-enabling QREP for unwired layers.
     """
     widened = _FakeLinear(out_features=64 * 128)
     narrow = _FakeLinear(out_features=8 * 128)

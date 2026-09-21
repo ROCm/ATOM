@@ -1618,19 +1618,13 @@ def qrep_unsupported_reason(dcp_size: int, mxfp4_bmm: bool) -> str | None:
 def q_proj_is_qrep_widened(q_proj, qrep_num_heads: int, qk_head_dim: int) -> bool:
     """Whether `q_proj` was actually built with `qrep_tp_override`.
 
-    A layer built without the override (an eagle3 / DSpark draft's own q_proj,
-    or a model that has not wired QREP support) still produces `q_proj.weight`
-    at the plain per-rank width. Reinterpreting that as the wide QREP layout
-    would either silently fold the wrong rows into one head group or raise
-    downstream depending on shape divisibility -- checking the actual width
-    here means such a layer falls back to AllGather instead.
+    A layer that never opted in (e.g. an eagle3 / DSpark draft's own q_proj)
+    still has `q_proj.weight` at the plain per-rank width; reinterpreting that
+    as the wide QREP layout would corrupt or crash downstream, so this must be
+    checked before enabling QREP for the layer.
 
-    Module-level and dependency-free (only `getattr`/`.shape`) on purpose: it
-    used to live in ``atom.model_ops.attention_mla``, which imports triton/aiter
-    at module scope, so its tests were skipped on the CPU-only CI runner along
-    with everything else gated behind that import. Kept here, next to
-    ``qrep_unsupported_reason``, for the same reason that one is here --
-    ``atom.config`` imports cleanly without triton/aiter.
+    Dependency-free (only `getattr`/`.shape`) so it stays importable, and
+    testable, without triton/aiter.
     """
     weight = getattr(q_proj, "weight", None)
     return weight is not None and weight.shape[0] == qrep_num_heads * qk_head_dim
@@ -1639,15 +1633,9 @@ def q_proj_is_qrep_widened(q_proj, qrep_num_heads: int, qk_head_dim: int) -> boo
 def qrep_enabled_for_layer(
     wants_qrep: bool, q_proj, qrep_num_heads: int, qk_head_dim: int
 ) -> bool:
-    """The actual per-layer QREP decision, as a testable pure function.
-
-    ``MLAAttention.__init__`` used to inline this as
-    ``wants_qrep and q_proj_is_qrep_widened(...)`` directly in the assignment
-    to ``self.qrep_enabled``. A test asserting only `q_proj_is_qrep_widened`'s
-    behavior cannot catch that `and` clause being dropped (or silently
-    replaced with something that always returns `wants_qrep`) at the call
-    site -- the decision itself needs its own test, not just the helper it
-    happens to call today.
+    """The per-layer QREP decision, kept testable on its own: asserting only
+    `q_proj_is_qrep_widened`'s behavior can't catch the `and` being dropped
+    (or weakened) at the call site.
     """
     return wants_qrep and q_proj_is_qrep_widened(q_proj, qrep_num_heads, qk_head_dim)
 

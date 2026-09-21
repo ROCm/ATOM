@@ -83,11 +83,8 @@ class Eagle3DeepseekMLAAttention(nn.Module):
 
         self.scaling = self.qk_head_dim**-0.5
 
-        # DCP Query Replication: {} unless QREP is on -- see qrep_tp_override.
-        # The draft shares the target's DCP group, so the same override makes
-        # this q_b_proj widen to the DCP-group head set exactly like the
-        # target's, and MLAAttention.qrep_enabled (gated on the actual weight
-        # width, not just the config flag) picks it up with no further wiring.
+        # No-op unless QREP is on (see qrep_tp_override); the draft shares the
+        # target's DCP group, so this is all the wiring QREP needs here.
         q_qrep_override = qrep_tp_override(tp_size)
 
         attn_input_size = self.hidden_size * 2  # dual input: cat(embed, fc_out)
