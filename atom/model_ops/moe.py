@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -2196,6 +2197,34 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
                 "falling back to mega-only."
             )
             self._hybrid_enabled = False
+        if self._hybrid_enabled and "MORI_SHMEM_HEAP_SIZE" not in os.environ:
+            # mori's static shmem heap is one process-wide pool shared by
+            # every caller (a single hipMalloc(MORI_SHMEM_HEAP_SIZE),
+            # sub-allocated via a VA manager -- see
+            # mori/src/shmem/init.cpp:InitializeStaticHeap). Standard's
+            # EpDispatchCombineOp and mega's own transport both draw from
+            # that same shared pool. Standalone mega or standard only ever
+            # need their own share of it, but hybrid needs both resident
+            # simultaneously (it routes to either per step), so it needs the
+            # shared ceiling raised to fit the union of both -- not just one.
+            # Measured on DeepSeek-V4-Pro TP1/DP8/EP8
+            # (--max-num-batched-tokens 16384): standalone mega and standard
+            # both fit comfortably at 8G; hybrid fails there
+            # (mori_shmem.shmem_malloc: "Out of static heap memory!") but
+            # works at 12G. Default to 20G (margin above that floor) rather
+            # than requiring every hybrid deployment to remember a separate
+            # env var -- never override an explicit operator choice.
+            os.environ["MORI_SHMEM_HEAP_SIZE"] = "20G"
+            logger.info(
+                "ATOM_MEGA_HYBRID_ENABLE=1: defaulting "
+                "MORI_SHMEM_HEAP_SIZE=20G (was unset). Hybrid needs both "
+                "mega's and standard's EP transport buffers resident in the "
+                "same shared mori shmem heap, which needs more room than "
+                "either backend alone -- mori's own unset-env-var default "
+                "(4G Static / 16G VMM, sized for a single backend) can OOM "
+                "the heap under hybrid. Set MORI_SHMEM_HEAP_SIZE explicitly "
+                "to override."
+            )
 
     def _process_weight_layout_after_loading(self, layer) -> None:
         from atom.model_ops.fused_moe.flydsl_mega_experts import build_mega_weights
