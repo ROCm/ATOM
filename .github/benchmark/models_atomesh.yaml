@@ -275,6 +275,8 @@ models:
               tp: 4
               cudagraph: none
             env:
+              common:
+                MC_DISABLE_HIP: "1"
               prefill:
                 HIP_VISIBLE_DEVICES: "0,1,2,3"
               decode:
