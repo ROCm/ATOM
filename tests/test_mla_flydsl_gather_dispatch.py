@@ -99,7 +99,6 @@ def test_fp8_gather_checks_output_capability_once(monkeypatch, supported):
     predicate = Mock(return_value=supported)
     launch = Mock()
     monkeypatch.setattr(mla, "_FLYDSL_GATHER_AVAILABLE", True)
-    monkeypatch.setattr(mla, "_FLYDSL_GATHER_FP8_AVAILABLE", True)
     monkeypatch.setattr(mla, "gather_kv_b_proj_flydsl_supported", lambda *a: True)
     monkeypatch.setattr(
         mla, "gather_kv_b_proj_flydsl_fp8_supported", predicate, raising=False

@@ -503,6 +503,7 @@ if is_rocm_aiter_fp4bmm_enabled():
 try:
     from aiter.ops.flydsl import (
         gather_kv_b_proj_flydsl,
+        gather_kv_b_proj_flydsl_fp8_supported,
         gather_kv_b_proj_flydsl_supported,
     )
 
@@ -520,14 +521,6 @@ try:
     _FLYDSL_FP8_MHA_AVAILABLE = True
 except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
     _FLYDSL_FP8_MHA_AVAILABLE = False
-
-# Older AITER versions may have BF16 gather without the FP8 capability API.
-try:
-    from aiter.ops.flydsl import gather_kv_b_proj_flydsl_fp8_supported
-
-    _FLYDSL_GATHER_FP8_AVAILABLE = _FLYDSL_GATHER_AVAILABLE
-except Exception:  # noqa: BLE001 -- optional kernel capability
-    _FLYDSL_GATHER_FP8_AVAILABLE = False
 
 
 # MLA Specific Arguments
@@ -1652,8 +1645,7 @@ class MLAAttention(nn.Module):
                 )
             if self._flydsl_gather_ok:
                 fp8_outputs = (
-                    _FLYDSL_GATHER_FP8_AVAILABLE
-                    and self._flydsl_gather_fp8_ok is not False
+                    self._flydsl_gather_fp8_ok is not False
                     and kv_out_scales is not None
                     and all(
                         t.dtype == torch.bfloat16 and t.is_contiguous()
