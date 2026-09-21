@@ -428,6 +428,58 @@ def _a8w8_preshuffle_output_padding(output_size: int) -> int:
     return 0 if remainder == 0 else 128 - remainder
 
 
+def weight_is_stored_preshuffled(
+    quant_type: QuantType,
+    params_dtype: torch.dtype,
+    *,
+    needs_preshuffled_weight: bool = False,
+) -> bool:
+    """Whether a quantized 2D GEMM weight of this kind is held preshuffled.
+
+    One answer for both sides of a weight's life: the initial load
+    (``LinearBase.process_weights_after_loading``) and an online weight update
+    (``WeightUpdaterMixin._post_process_fp8_weight``). Deciding it twice is how
+    a synced weight ends up in a layout the loaded one would never have had,
+    which the kernel then reads through the wrong permutation.
+
+    ``needs_preshuffled_weight`` is the module's own override: a fused forward
+    that calls the *preshuffle* blockscale GEMM directly (DeepSeek's fused
+    qkv_a_proj) needs the 16x16-shuffled weight even when the global
+    preshuffle path is off, so it is shuffled once at load rather than per
+    forward.
+
+    Says nothing about rank. Only 2D weights are shuffled -- Qwen3-Next's GDN
+    conv1d expands its weight to 3D and must stay row-major -- so the caller
+    that holds the tensor checks that.
+
+    Compared by ``.value``, like every comparison in this file that runs after
+    the load (``_is_quantized``, ``_is_blockscale``, ``forward``) and like the
+    whole of ``weight_updater``. ``QuantType`` is a pybind enum out of the
+    compiled ``aiter.jit.module_aiter_core``, so a module whose ``quant_type``
+    came from a differently-identified aiter import -- a plugin process, a
+    re-import, ``atom.quant_spec``'s lazy proxy -- does not compare equal to
+    these members under ``==``. Every branch would then fall through to
+    ``return False``: the sync writes the FP8 weight and never re-shuffles it,
+    and the preshuffle GEMM reads a row-major weight. Silent, and only after
+    the first weight update. The load side reached here from ``==`` and the
+    sync side from ``.value``; unifying on ``==`` would have taken the sync
+    side backwards.
+    """
+    quant_value = quant_type.value
+    if quant_value == QuantType.per_Token.value:
+        # The triton a8w8 per_Token GEMM consumes the unshuffled (N, K)
+        # weight; only the AITER bpreshuffle fallback needs the shuffle.
+        return params_dtype == dtypes.fp8 and not (
+            use_triton_gemm() and gemm_a8w8_triton is not None
+        )
+    if quant_value == QuantType.per_1x32.value:
+        is_fp4_blockscale = params_dtype == dtypes.fp4x2
+        return not is_fp4_blockscale or not use_fp4_non_shuffle_triton_gemm()
+    if quant_value == QuantType.per_1x128.value:
+        return envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE or needs_preshuffled_weight
+    return False
+
+
 class LinearBase(nn.Module):
     def __init__(
         self,
@@ -769,6 +821,12 @@ class LinearBase(nn.Module):
             )
         self.weight = nn.Parameter(q_weight, requires_grad=False)
         self.weight_scale = nn.Parameter(weight_scale, requires_grad=False)
+        # Both are fresh Parameters, so they carry none of the attributes
+        # __init__ hung on the originals. weight_loader() reads
+        # weight_loader_process off the parameter it is handed, so a later
+        # weight update -- an RLHF rollout sync -- would fail on it.
+        self.weight.weight_loader_process = self.weight_loader_process
+        self.weight_scale.weight_loader_process = self.weight_loader_process
 
         # Update quant state
         self.quant_type = online_quant_type
@@ -794,12 +852,24 @@ class LinearBase(nn.Module):
         }
 
     def process_weights_after_loading(self):
+        """Settle the layout this weight is stored in, once.
+
+        Every `quant_type` test below compares by `.value`, like
+        `weight_is_stored_preshuffled` and everything downstream of the load.
+        They have to be the SAME comparison: this function asks that helper
+        whether to shuffle and then asks itself whether to pad, and a `==` on
+        either side answers False for a module whose `quant_type` came from a
+        differently-identified aiter import (see that helper's docstring), so
+        the two halves of one decision came out inconsistent -- the weight
+        shuffled and its N left unpadded, with the RuntimeError that exists to
+        catch exactly that skipped along with the padding.
+        """
         if self.weight.numel() == 0:
             return
         # Re-quantize before process_weights if online quantization is enabled
         if self.quant_config is not None and self.quant_config.online_quant:
             self.online_quantize_weight()
-        if self.quant_type == QuantType.per_Tensor and (
+        if self.quant_type.value == QuantType.per_Tensor.value and (
             len(self.output_partition_sizes) > 1
             or hasattr(self, "_loaded_weight_scale_for_requant")
             or hasattr(self, "_loaded_weight_scale_for_requant_parts")
@@ -838,7 +908,7 @@ class LinearBase(nn.Module):
             )
         if (
             self.source_quant_dtype == torch.bfloat16
-            and self.quant_type == QuantType.per_1x32
+            and self.quant_type.value == QuantType.per_1x32.value
             and self.params_dtype == torch.float4_e2m1fn_x2
         ):
             w_q, w_s = self.quant_func(
@@ -855,45 +925,30 @@ class LinearBase(nn.Module):
                 shuffle_weights(self.weight)
             # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         else:
-            is_fp4_blockscale = (
-                self.quant_type == QuantType.per_1x32
-                and self.params_dtype == dtypes.fp4x2
-            )
-            need_shuffle = (
-                self.quant_type == QuantType.per_Token
-                and self.params_dtype == dtypes.fp8
-                # The triton a8w8 per_Token GEMM consumes the unshuffled (N, K)
-                # weight; only the AITER bpreshuffle fallback needs the shuffle.
-                and not (use_triton_gemm() and gemm_a8w8_triton is not None)
-            ) or (
-                self.quant_type == QuantType.per_1x32
-                and (not is_fp4_blockscale or not use_fp4_non_shuffle_triton_gemm())
-            )
-            # per_1x128 only needs shuffle when using the preshuffle GEMM path
-            if not need_shuffle and self.quant_type == QuantType.per_1x128:
-                need_shuffle = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
-                # Modules whose fused forward calls a *preshuffle* blockscale GEMM
-                # directly (e.g. DeepSeek fused qkv_a_proj) need the 16x16-shuffled
-                # weight even under the non-preshuffle path
-                # (ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0). Shuffle once here at
-                # load time instead of per-forward.
-                if not envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE and getattr(
+            need_shuffle = weight_is_stored_preshuffled(
+                self.quant_type,
+                self.params_dtype,
+                needs_preshuffled_weight=getattr(
                     self, "needs_preshuffled_weight", False
-                ):
-                    need_shuffle = True
+                ),
+            )
             if need_shuffle and self.weight.dim() == 2:
                 self.is_output_padded = self._maybe_pad_a8w8_preshuffle_output()
                 shuffle_weights(self.weight)
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         # shuffle weight scale once so no reshuffling for every gemm
-        if self.quant_type == QuantType.per_1x32 and (
+        if self.quant_type.value == QuantType.per_1x32.value and (
             self.params_dtype != dtypes.fp4x2 or not use_fp4_non_shuffle_triton_gemm()
         ):
             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
 
     def _maybe_pad_a8w8_preshuffle_output(self) -> bool:
+        # The other half of the shuffle decision `process_weights_after_loading`
+        # takes, so it answers on the same terms `weight_is_stored_preshuffled`
+        # does -- by value.
         if not (
-            self.quant_type == QuantType.per_Token and self.params_dtype == dtypes.fp8
+            self.quant_type.value == QuantType.per_Token.value
+            and self.params_dtype == dtypes.fp8
         ):
             return False
         if self.weight.dim() != 2:
@@ -1198,7 +1253,13 @@ class ColumnParallelLinear(LinearBase):
 
         view = copy.copy(self)
         # nn.Module bookkeeping is shared by the shallow copy; give the view its
-        # own parameter dict so rebinding weight/scale cannot disturb `self`.
+        # own parameter dict so binding weight/scale on the view cannot disturb
+        # `self`. It does NOT isolate the bytes and is not meant to: the view
+        # narrows `self.weight.data`, so an in-place write to the parent -- a
+        # weight sync, or `shuffle_weights`, which no longer rebinds -- is seen
+        # through it. `_local_q_proj` is the only caller and rebuilds the view on
+        # every call anyway (its `is not` guard compares two `param.data`
+        # objects, and that attribute hands back a fresh one each access).
         view._parameters = dict(self._parameters)
         view.weight = nn.Parameter(
             self.weight.data.narrow(0, start, length), requires_grad=False
@@ -1997,7 +2058,16 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
         else:
             self.num_kv_heads = 1
             self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
-        self.num_index_heads = self.num_kv_heads
+        # Indexer-only CP scores every index head on every rank, so index_q is
+        # replicated at full width instead of following the KV-head sharding --
+        # the same treatment index_k already gets. index_k, q, k and v are
+        # untouched, so this widens the GEMM by 3 head-columns and nothing else.
+        from atom.distributed.indexer_cp import indexer_cp_enabled
+
+        self.indexer_cp = indexer_cp_enabled()
+        self.num_index_heads = (
+            self.total_num_index_heads if self.indexer_cp else self.num_kv_heads
+        )
 
         output_sizes = [
             self.num_heads * self.head_size * tp_size,
@@ -2061,7 +2131,11 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
 
         if loaded_shard_id == "q":
             shard_rank = self.tp_rank
-        elif loaded_shard_id == "index_k":
+        elif loaded_shard_id == "index_k" or (
+            loaded_shard_id == "index_q" and self.indexer_cp
+        ):
+            # Replicated: shard_size already spans every index head, so there is
+            # only one shard to take.
             shard_rank = 0
         else:
             shard_rank = self.tp_rank // self.num_kv_head_replicas

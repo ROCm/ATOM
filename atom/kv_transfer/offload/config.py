@@ -436,9 +436,27 @@ def lmcache_replica_world_size(config) -> int:
     "shard i of the model", which holds the same bytes in every replica, so
     replicas sharing a disk/remote backend share entries instead of
     duplicating them.
+
+    Read the sizes from the top level first and fall back to
+    ``config.parallel_config``: ATOM's own config carries them directly, while
+    the vLLM plugin path hands us a ``VllmConfig`` that keeps both under
+    ``parallel_config``. Looking only at the top level made both lookups fall
+    back to 1 there, so a TP4 replica reported world=1 -- which puts the
+    recipe's all-rank ``lookup_server_worker_ids=[0,1,2,3]`` out of range, and
+    the lookup client then fails to build.
     """
-    pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
-    tp_size = int(getattr(config, "tensor_parallel_size", 1) or 1)
+
+    def _dim(name: str) -> int:
+        for src in (config, getattr(config, "parallel_config", None)):
+            if src is None:
+                continue
+            val = getattr(src, name, None)
+            if val:
+                return int(val)
+        return 1
+
+    pp_size = _dim("pipeline_parallel_size")
+    tp_size = _dim("tensor_parallel_size")
     return max(1, pp_size * tp_size)
 
 

@@ -1,11 +1,11 @@
-from typing import Optional
-
 import torch
 import triton
 import triton.language as tl
+from aiter import topk_select
+from torch import nn
+
 from atom.utils import envs
 from atom.utils.forward_context import SpecDecodeMetadata
-from torch import nn
 
 ATOM_ENABLE_RELAXED_MTP = envs.ATOM_ENABLE_RELAXED_MTP
 if ATOM_ENABLE_RELAXED_MTP:
@@ -158,7 +158,7 @@ def rejection_sample(
     # [batch_size]
     cu_num_draft_tokens: torch.Tensor,
     # [num_tokens, vocab_size]
-    draft_probs: Optional[torch.Tensor],
+    draft_probs: torch.Tensor | None,
     # [num_tokens, vocab_size]
     target_probs: torch.Tensor,
     # [batch_size, 1]
@@ -184,6 +184,14 @@ def rejection_sample(
     assert bonus_token_ids.is_contiguous()
     assert target_probs.shape == (num_tokens, vocab_size)
 
+    # Every `topk_select` below passes `tie="low"`, which is the whole reason
+    # its answer is the same pick `torch.argmax`/`torch.topk` made. The default
+    # promises no direction among equal scores, so a near-tie would resolve
+    # differently from one TP rank to the next -- and the accept/reject pattern
+    # these feed has to agree across ranks or `num_bonus_tokens` desyncs. It is
+    # free at k=1: the reduction that serves k=1 can keep the promise anyway.
+    # Indices come back int32, which is what the kernels here load.
+
     # Create output buffer. Each kernel program writes positions
     # [0 .. num_draft_tokens] for its request and fills the unwritten tail
     # [num_draft_tokens+1 .. num_spec_steps] with the -1 truncation sentinel
@@ -202,7 +210,8 @@ def rejection_sample(
         # target argmax as the correction token and stop (same output layout /
         # num_bonus_tokens semantics as the greedy path).
         cond_rates = _get_synthetic_cond_rates(synthetic_acceptance_rates, device)
-        target_argmax = target_probs.argmax(dim=-1)
+        _, target_argmax = topk_select(target_probs, 1, tie="low")
+        target_argmax = target_argmax.view(-1)
         # Rank-consistent uniforms: a dedicated device generator re-seeded from the
         # step counter draws the same Philox stream on every TP rank / GPU, so the
         # accept/reject pattern — and hence num_bonus_tokens — matches the
@@ -234,7 +243,8 @@ def rejection_sample(
         )
     elif RELAXED_TOP_N <= 1:
         # Strict greedy path: draft must exactly match target argmax
-        target_argmax = target_probs.argmax(dim=-1)
+        _, target_argmax = topk_select(target_probs, 1, tie="low")
+        target_argmax = target_argmax.view(-1)
         rejection_greedy_sample_kernel[(batch_size,)](
             output_token_ids,
             num_bonus_tokens,
@@ -249,12 +259,24 @@ def rejection_sample(
         # Relaxed acceptance path: accept if draft is among top-N
         # candidates with prob >= (top1_prob - delta)
         probs = target_probs.softmax(dim=-1, dtype=torch.float32)
-        topn_probs, topn_ids = torch.topk(probs, RELAXED_TOP_N, dim=-1)
+        # `sorted` is what puts the top-1 in slot 0 for `top1_probs` below.
+        #
+        # Among EQUAL probabilities the slot order is unspecified, here as it
+        # was under `torch.topk` -- neither promises one. Measured over
+        # 64-256 rows of three vocabularies: the id set per row is identical
+        # every time and the values are bitwise equal, so `valid_mask` and the
+        # kernel's membership test are unaffected; slot 0, which the kernel
+        # emits as the correction token, moved on 2 rows of 256 and in both the
+        # two ids held the same probability. Rank-consistent either way, since
+        # `tie="low"` leaves only backends whose answer is a function of the row.
+        topn_probs, topn_ids = topk_select(
+            probs, RELAXED_TOP_N, sorted=True, tie="low", return_value=True
+        )
 
         top1_probs = topn_probs[:, 0:1]
         valid_mask = topn_probs >= (top1_probs - RELAXED_DELTA)
         topn_ids[~valid_mask] = -1
-        topn_ids = topn_ids.to(torch.int32).contiguous()
+        topn_ids = topn_ids.contiguous()
 
         rejection_relaxed_sample_kernel[(batch_size,)](
             output_token_ids,

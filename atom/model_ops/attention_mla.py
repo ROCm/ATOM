@@ -95,8 +95,27 @@ def indexer_qk_rope_quant_and_cache(
     weights_scale: float,
     preshuffle: bool = False,
     is_neox: bool = True,
+    q_scale_out: torch.Tensor | None = None,
+    kv_cache_scale: torch.Tensor | None = None,
 ) -> None:
-    """Run the fused indexer cache op with ATOM's DCP query semantics."""
+    """Run the fused indexer cache op with ATOM's DCP query semantics.
+
+    The two scale buffers together switch the op to packed E2M1 + e8m0 outputs,
+    and are forwarded only when given so that an aiter predating them still
+    accepts the FP8 call -- the same version tolerance the seg-variant import
+    above keeps. One without the other would fall back to FP8 and write that
+    layout into FP4-shaped buffers, so it is refused here rather than passed on.
+    """
+    if (q_scale_out is None) != (kv_cache_scale is None):
+        raise ValueError(
+            "FP4 output needs both q_scale_out and kv_cache_scale, got only "
+            + ("q_scale_out" if q_scale_out is not None else "kv_cache_scale")
+        )
+    fp4_out = (
+        {"q_scale_out": q_scale_out, "kv_cache_scale": kv_cache_scale}
+        if q_scale_out is not None
+        else {}
+    )
     _indexer_qk_rope_quant_and_cache(
         q,
         q_out,
@@ -117,6 +136,7 @@ def indexer_qk_rope_quant_and_cache(
         preshuffle=preshuffle,
         is_neox=is_neox,
         compute_all_q_rope=get_dcp_world_size() > 1,
+        **fp4_out,
     )
 
 
@@ -891,6 +911,12 @@ class MLAAttention(nn.Module):
         """Undo `_pad_sparse_prefill_query_heads` on an output or per-head LSE."""
         if x.shape[1] == num_heads:
             return x
+        # Keep the `.contiguous()`. Returning the strided view instead was
+        # measured and does not help: output stays bit-identical, but
+        # aten::copy_ over the prefill is unchanged (59,717 -> 59,793 us across
+        # 154 -> 152 launches). The copy is not removed, only moved -- the PBM
+        # leg's reshape/bmm materialises it instead. Removing it for real means
+        # teaching that bmm to take a strided input, which is an aiter change.
         return x[:, :num_heads, ...].contiguous()
 
     def _pad_decode_query_heads(self, q: torch.Tensor) -> torch.Tensor:
@@ -1051,7 +1077,7 @@ class MLAAttention(nn.Module):
             self._qrep_local_src = w
         return self._qrep_local_proj
 
-    def _dcp_merge(self, o, lse, ctx=None, owned_counts=None):
+    def _dcp_merge(self, o, lse, ctx=None, owned_counts=None, quant_dtype=None):
         """Bind this layer's DCP group and backend to ``dcp_ops.dcp_lse_merge``."""
         from atom.model_ops.dcp_ops import dcp_lse_merge
 
@@ -1062,7 +1088,39 @@ class MLAAttention(nn.Module):
             self.dcp_comm_backend,
             ctx=ctx,
             owned_counts=owned_counts,
+            quant_dtype=quant_dtype,
         )
+
+    def _dcp_fused_quant_dtype(self):
+        """o_proj's activation dtype if the combine can emit it, else None.
+
+        The combine can only absorb the quant when o_proj reads its output
+        directly (PBM) and wants exactly a per-token FP8 activation. A static
+        input_scale is not a per-token scale, and the block schemes need a scale
+        per channel GROUP with a layout choice; all of those keep the standalone
+        quant kernel they have today.
+        """
+        if not self.pbm_enabled:
+            return None
+        if self.dcp_comm_backend != "a2a":
+            return None
+        op = getattr(self, "o_proj", None)
+        qt = getattr(op, "quant_type", None)
+        # QuantType is compared by .value throughout ATOM: the enum can be
+        # re-imported under a different module identity, breaking `is`/`==`.
+        if qt is None or getattr(qt, "value", None) != QuantType.per_Token.value:
+            return None
+        # Same set the sibling predicate in attention_residual.py accepts, and
+        # the layer's own spelling is what comes back: `dtypes.fp8` is e4m3fn
+        # here but e4m3fnuz on MI300, so matching one identity would skip the
+        # fusion for the other, and returning the constant rather than what the
+        # layer holds would quantize to the wrong FP8 format.
+        params_dtype = getattr(op, "params_dtype", None)
+        if params_dtype not in (dtypes.fp8, torch.float8_e4m3fn):
+            return None
+        if getattr(op, "input_scale", None) is not None:
+            return None
+        return params_dtype
 
     @mark_trace(prefix="dcp_project_merge_out", torch_compile=False)
     def _dcp_project_merge_out(
@@ -1078,13 +1136,27 @@ class MLAAttention(nn.Module):
             o = self._v_up_proj(
                 o, self.W_V_dcp, self.W_V_dcp_scale, num_heads=o.shape[1]
             )
+        # Only PBM hands the merge output straight to o_proj, so it is the only
+        # path whose activation quant the combine can absorb. The fp32 merge is
+        # a prefill-accuracy path and keeps its bf16 store.
+        fused_quant = None if merge_in_fp32 else self._dcp_fused_quant_dtype()
         if merge_in_fp32:
             dtype = o.dtype
             o = self._dcp_merge(o.float(), lse, ctx=ctx, owned_counts=owned_counts).to(
                 dtype
             )
         else:
-            o = self._dcp_merge(o, lse, ctx=ctx, owned_counts=owned_counts)
+            o = self._dcp_merge(
+                o, lse, ctx=ctx, owned_counts=owned_counts, quant_dtype=fused_quant
+            )
+        if fused_quant is not None:
+            o, o_scale = o
+            if o_scale is not None:
+                return self.o_proj(
+                    o.reshape(-1, self.num_heads * self.v_head_dim), o_scale
+                )
+            # Single-rank DCP: there was no combine to fold into, so the tensor
+            # came back unquantized and o_proj quantizes it as it always has.
         if self.pbm_enabled:
             return self.o_proj(o.reshape(-1, self.num_heads * self.v_head_dim))
         return self._v_up_proj_and_o_proj(o)
@@ -2046,11 +2118,26 @@ class MLAAttention(nn.Module):
                 "(empty KV cache?)"
             )
             if self.is_sparse_mla and self.dcp_world_size > 1:
-                o = torch.where(
-                    torch.isfinite(final_lse).unsqueeze(-1), o, torch.zeros_like(o)
-                )
+                # One kernel for what torch spelled in five.
+                #
+                # `torch.where(torch.isfinite(lse).unsqueeze(-1), o, 0.0)` costs
+                # four launches to build the mask -- torch decomposes isfinite
+                # into abs/ne/eq/mul -- plus one to apply it. The mask is a few
+                # KB, so those four are pure launch overhead: 5.5 us each,
+                # 22.3 us per layer, measured.
+                #
+                # The fifth is the expensive one and the reason for the kernel:
+                # `where` reads and rewrites every byte of `o` even though a
+                # non-finite LSE is an edge case and nearly every row survives
+                # untouched. The Triton version returns before touching `o` for
+                # a finite row.
+                from atom.model_ops.dcp_ops import zero_nonfinite_rows
+
+                zero_nonfinite_rows(o, final_lse)
             # These feed a cross-rank combine, not the bmm, so the head slice
-            # has to be materialised rather than left as a view.
+            # has to be materialised rather than left as a view. (Handing the
+            # view down instead was measured: same tokens, same copy cost --
+            # see `_restore_sparse_prefill_query_heads`.)
             return o.contiguous(), final_lse.contiguous()
 
         return self._v_up_proj_and_o_proj(o)
@@ -3011,6 +3098,9 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     MAX_NUM_BLOCKS_PER_REQ: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tile width along columns
+    # The FP8 indexer scores one concatenated KV plane, so a request's own
+    # position is `indice - cu_seqlens_q[req]`; the paged FP4 scorer emits it.
+    SEQ_LOCAL: tl.constexpr,
     # strides (in elements)
     ti_stride0: tl.int64,  # topk_indices stride 0
     ti_stride1: tl.constexpr,  # topk_indices stride 1
@@ -3037,7 +3127,7 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     req_kv_end = tl.load(cu_seqlens_q + req_id + 1, mask=valid_req, other=0)
     req_kv_len = req_kv_end - pre_seqlens_q
 
-    seq_token_idx = indice - pre_seqlens_q
+    seq_token_idx = indice if SEQ_LOCAL else indice - pre_seqlens_q
     block_id = seq_token_idx // PAGE_SIZE
     inblock_offset = seq_token_idx % PAGE_SIZE
 
@@ -3087,6 +3177,7 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 1024,  # tile width along columns
     out: torch.Tensor | None = None,
+    seq_local: bool = False,
 ):
 
     assert topk_indices.shape[1] == NUM_TOPK_TOKENS
@@ -3138,6 +3229,7 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
         max_num_blocks_per_req,
         PAGE_SIZE,
         BLOCK_N,
+        seq_local,
         # strides
         ti_stride0,
         ti_stride1,

@@ -138,10 +138,15 @@ class EagleProposer(Drafter):
             self._reuse_step_buffers = False
             return ()
         draft_hf = self.speculative_config.draft_model_hf_config
-        # DeepSeek-V4 carries the mHC residual, so its hidden is [N, hc, dim]
-        # rather than [N, dim]. `hc_mult` is absent on every architecture that
-        # does not, which is exactly the two-dimensional case.
-        hc = getattr(draft_hf, "hc_mult", None)
+        shape_fn = getattr(self.model, "draft_graph_hidden_state_shape", None)
+        if shape_fn is not None:
+            hidden_shape = shape_fn(draft_hf)
+        else:
+            # Other draft models retain the config-based mHC shape contract.
+            hc = getattr(draft_hf, "hc_mult", None)
+            hidden_shape = (draft_hf.hidden_size,)
+            if hc is not None:
+                hidden_shape = (hc, draft_hf.hidden_size)
         inputs = {
             # The same int32 the token buffer step 0 reads: the loop rebinds
             # `input_ids` from that buffer to this one, and `stage` asserts the
@@ -149,19 +154,15 @@ class EagleProposer(Drafter):
             "input_ids": StagedInput(dtype=torch.int32),
             "positions": StagedInput(dtype=torch.int64),
             "hidden_states": StagedInput(
-                shape=(
-                    (hc, draft_hf.hidden_size)
-                    if hc is not None
-                    else (draft_hf.hidden_size,)
-                ),
+                shape=hidden_shape,
                 dtype=self.dtype,
             ),
         }
-        # Keep this capability at the non-compiled call site. DeepSeekMTPModel
-        # has the two-dimensional hidden-state and shared-head contracts needed
-        # to feed its fixed graph inputs directly; other draft architectures
-        # remain on the owned-output path.
-        self._reuse_step_buffers = draft_hf.architectures[0] == "DeepSeekMTPModel"
+        # Only models with the fixed hidden-state and shared-head contracts
+        # can feed the staged buffers directly. Others own their output storage.
+        self._reuse_step_buffers = getattr(
+            self.model, "reuse_draft_graph_step_buffers", False
+        )
         self.step = DraftGraph(
             forward=self._step_forward,
             epilogue=self._step_head,
@@ -360,7 +361,7 @@ class EagleProposer(Drafter):
         input_ids.scatter_(0, last_token_indices, anchor_ids)
 
         d_input_ids = input_ids
-        d_positions = positions[:num_tokens] + 1
+        d_positions = positions[..., :num_tokens] + 1
         d_hidden = draft_hidden
         # Same split as propose()'s i==0 step: this pass reuses the same
         # 1/pcp-reindexed attn_metadata. Only q is sharded -- attention
@@ -479,6 +480,11 @@ class EagleProposer(Drafter):
             # itself; the verify step's has the right row count, wrong rows.
             attn_metadata.dcp_token_block_tables = attn_metadata.block_tables
         attn_metadata.context_lens = var["context_lens"].gpu[:running_bs]
+        # Unguarded because the base builder answers it: this runs for every
+        # target a draft can have, and only the MLA one has an FP4 indexer. The
+        # draft's rows are its own, and a replay addresses whatever row count
+        # the schedule buffer holds.
+        builder._publish_indexer_fp4_decode_schedule(attn_metadata, running_bs, 1)
         if "sparse_kv_indptr" in var:
             attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].gpu[
                 : running_bs + 1
@@ -757,6 +763,15 @@ class EagleProposer(Drafter):
                     )
                     for k, v in workinfos.items():
                         attn_metadata.__dict__[k] = v
+                    # Every step, and only after `prepare_mtp_decode`: that call
+                    # is what refreshes the DCP local lengths the schedule is
+                    # built from, and a replay reads the buffer's contents. The
+                    # publish in `_enter_decode_metadata` runs before the
+                    # refresh, and steps 1+ reached their forward with step 0's.
+                    builder = self.runner.attn_metadata_builder
+                    builder._publish_indexer_fp4_decode_schedule(
+                        attn_metadata, running_bs, 1
+                    )
                     if has_flat_kv and "slot_mapping" not in workinfos:
                         # MLA/MHA path: slot derived from flat kv_indices. Both,
                         # and the slot_mapping written below, are the ones
@@ -766,7 +781,6 @@ class EagleProposer(Drafter):
                         raw_slots = attn_metadata.kv_indices[
                             attn_metadata.kv_indptr[1 : running_bs + 1] - 1
                         ]
-                        builder = self.runner.attn_metadata_builder
                         if getattr(builder, "dcp_world_size", 1) > 1:
                             # DCP interleave-S: only rank ((ctx-1)//S) % W owns this
                             # draft token; other ranks' kv_indptr didn't grow, so

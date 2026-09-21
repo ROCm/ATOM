@@ -18,11 +18,35 @@ Third-party / dependency env vars (NCCL, torch, HuggingFace, AITER, FLA) are
 documented at the bottom of this file but NOT managed here.
 """
 
+import logging
+import math
 import os
 from collections.abc import Callable
 from typing import Any
 
+logger = logging.getLogger("atom")
+
+
+def _positive_float_env(name: str, default: str) -> float:
+    raw_value = os.getenv(name, default)
+    try:
+        value = float(raw_value)
+        if math.isfinite(value) and value > 0:
+            return value
+    except ValueError:
+        pass
+    logger.warning(
+        "Invalid %s=%r: expected a finite positive number; using default %s",
+        name,
+        raw_value,
+        default,
+    )
+    return float(default)
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
+    "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
@@ -59,6 +83,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ATOM remaps the SGLang world into internal TP x PCP groups.
     # 0 means unset.
     "ATOM_SGLANG_PCP_SIZE": lambda: int(os.getenv("ATOM_SGLANG_PCP_SIZE", "0") or "0"),
+    # Keep SGLang's tc_piecewise/Inductor compilation path for prefill, but
+    # bypass its per-bucket CUDA Graph capture, static-buffer staging, and token
+    # padding. This is an experimental ATOM SGLang-plugin-only mode.
+    "ATOM_SGLANG_PREFILL_COMPILE_ONLY": lambda: (
+        os.getenv("ATOM_SGLANG_PREFILL_COMPILE_ONLY", "0") == "1"
+    ),
+    # Broadcast EAGLE3 verification predictions and acceptance decisions from
+    # TP rank 0 so every tensor-parallel rank advances with identical results.
+    # SGLang lacks this broadcast path; the ATOM plugin adds it to match native
+    # ATOM's tensor-parallel verification semantics.
+    # Disabled by default because native SGLang normally keeps ranks in sync.
+    "ATOM_SGLANG_EAGLE3_TP_VERIFY_BROADCAST": lambda: (
+        os.getenv("ATOM_SGLANG_EAGLE3_TP_VERIFY_BROADCAST", "0") == "1"
+    ),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
@@ -75,9 +113,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MLA_SHUFFLE_KV": lambda: (
         os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
     ),
+    # Run the routed experts with the aiter Triton/gluon MoE kernels instead of
+    # FlyDSL fused_moe, on prefill and decode alike. For SiLU models on gfx1250
+    # this selects the a8w4 GUGU (gate/up-interleaved) kernel -- the default --
+    # which fuses SiLU into GEMM1's write-back and the MXFP8 requant into its
+    # epilogue. SwiGLU models (GPT-OSS) and CDNA archs keep the general
+    # moe_gemm_a16w4 / a4w4 / a8w4 path. Defaults to on for gfx94x, and for
+    # gfx95x when ATOM_USE_TRITON_GEMM is set.
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
-    "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0")
-    == "1",
+    # Split the routed experts by phase: FlyDSL fused_moe on prefill, the Triton
+    # /gluon GUGU kernel on decode. Needs ATOM_USE_TRITON_MOE=1 (it narrows that
+    # flag, it cannot enable Triton on its own) plus gfx1250 + ATOM_MOE_GU_ITLV=1
+    # + SiLU, because it keeps a single copy of the weights in the FlyDSL layout
+    # and hands Triton a zero-copy view of it -- which is only valid where the
+    # two preshuffles agree byte-for-byte -- which is what ATOM_MOE_GU_ITLV=1
+    # buys, and why the prep asserts it: only the interleaved layout is shared,
+    # so at ATOM_MOE_GU_ITLV=0 the FlyDSL prep and the Triton view disagree.
+    # tests/test_mxfp4_triton_moe_decode.py runs both real preps and compares.
+    #
+    # Arms under EP as well as TP, at both EP entry points -- the modular-kernel
+    # (transport) path and the local no-transport one build the same views.
+    "ATOM_USE_TRITON_MOE_DECODE": lambda: (
+        os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0") == "1"
+    ),
+    # Select the a4w4 Triton wrapper instead of the a8w4 default, on both the TP
+    # and EP paths. Only chooses *which* wrapper runs -- it cannot enable the
+    # Triton path on its own, and asserts if set without ATOM_USE_TRITON_MOE.
+    # The weights are identical (both are w4); only the activation quant
+    # differs, so no extra weight prep or memory is involved.
+    "ATOM_USE_TRITON_MOE_A4W4": lambda: (
+        os.getenv("ATOM_USE_TRITON_MOE_A4W4", "0") == "1"
+    ),
     # Force DP-attention + EP through the collective fallback even when mori is
     # installed. This is useful for controlled A/B tests and for deployments
     # where the mori shared-memory transport is unavailable or undesirable.
@@ -100,7 +166,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # own MEGA_DISPATCH=flydsl|mori), 0 binds mori's v2 op-layer running plain
     # gather, i.e. the untouched upstream baseline.
     "ATOM_MORI_V2_FUSED": lambda: os.getenv("ATOM_MORI_V2_FUSED", "0") == "1",
+    # Reuse a 128-token MegaMoEV2 instance for native DP-unified small decode/
+    # verify/draft forwards on the supported EP8, 48-experts-per-rank layout. Set to 0
+    # to keep the configured max_num_batched_tokens capacity for every graph.
+    "ATOM_MEGA_DECODE_FAST_PATH": lambda: (
+        os.getenv("ATOM_MEGA_DECODE_FAST_PATH", "1") == "1"
+    ),
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
+    # Match SGLang's gfx950 pure-prefill fast path: cast Q/K/V to FP8 and use
+    # AITER's head-dim-256 per-tensor FMHA kernel. Set to 0 for the BF16
+    # flash_attn_varlen_func fallback.
+    "ATOM_AITER_FP8_PREFILL_ATTN": lambda: (
+        os.getenv("ATOM_AITER_FP8_PREFILL_ATTN", "1") == "1"
+    ),
+    # Pack mHC fn weights once after loading and use BF16 hi/lo computation.
+    # Set to 0 before model loading to retain FP32 fn and FP32 mHC computation.
+    "ATOM_MHC_USE_BF16": lambda: os.getenv("ATOM_MHC_USE_BF16", "1") == "1",
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
     # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.
@@ -153,7 +234,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # max_num_batched_tokens, so a fixed row count would not adapt to total_kv
     # (see GLM-5.2 OOM #1376) — a memory budget does. Each chunk still scores
     # the full KV, so every row's top-k is exact (no cross-chunk merge). Set to
-    # 0 to disable chunking (always single-shot).
+    # 0 to disable this soft budget; chunking still enforces aiter's hard 2 GiB
+    # buffer-descriptor cap, above which the kernel fails to compile and aborts
+    # the process (see atom/model_ops/sparse_indexer_chunk.py).
     "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB": lambda: int(
         os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "2048")
     ),
@@ -175,6 +258,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_GLM5_DISABLE_FUSED_MHC": lambda: (
         os.getenv("ATOM_GLM5_DISABLE_FUSED_MHC", "0") == "1"
     ),
+    # MiniMax-M3 indexer-only context parallelism, as an ops override for
+    # dcp_config.indexer_dcp_only. Selection is bit-identical to the TP path, so
+    # this is an exact A/B: it trades a per-layer all-to-all for full MMA
+    # occupancy in the block scorer, winning above ~1M batch*context tokens and
+    # losing below. Unset leaves the config field alone.
+    "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
     # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
     # (K3DSparkMLAAttention.write_context_kv) into one Triton kernel --
     # RMSNorm(kv_c) + rope(k_pe) + concat + paged-cache store, versus today's
@@ -277,7 +366,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT", "1") == "1"
     ),
+    "ATOM_USE_MODEL_SENSITIVE_RMSNORM": lambda: (
+        os.getenv("ATOM_USE_MODEL_SENSITIVE_RMSNORM", "0") == "1"
+    ),
     # --- Profiling & Logging ---
+    "ATOM_METRICS_UPDATE_INTERVAL_S": lambda: _positive_float_env(
+        "ATOM_METRICS_UPDATE_INTERVAL_S", "1.0"
+    ),
+    "ATOM_ENABLE_METRICS_DEVICE_TIMER": lambda: os.getenv(
+        "ATOM_ENABLE_METRICS_DEVICE_TIMER", "0"
+    )
+    == "1",
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     # Move the startup heap (model, compiled graph, tokenizer, KV block pool)
     # into CPython's permanent generation once warmup is done, so collections
@@ -395,6 +494,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Force Triton attention fallbacks where available. Set to 1 to bypass
     # optional ASM/OPUS fast paths during debugging.
     "ATOM_FORCE_ATTN_TRITON": lambda: (os.getenv("ATOM_FORCE_ATTN_TRITON", "0") == "1"),
+    # Force the OPUS kernel for DeepSeek-V4 fp8 sparse prefill instead of the
+    # aiter asm kernel (`mla_sparse_prefill_fp8_asm`, the default). Escape hatch
+    # for the asm path; that kernel is gfx1250-only and hard-requires H == 128,
+    # so smaller local head counts fall back to OPUS regardless of this flag.
+    "ATOM_FORCE_V4_PREFILL_OPUS": lambda: (
+        os.getenv("ATOM_FORCE_V4_PREFILL_OPUS", "0") == "1"
+    ),
+    # Reuse the gfx1250 H=128 sparse-prefill ASM kernel for DeepSeek-V4 fp8
+    # decode. Ineligible shapes keep the dedicated decode ASM path.
+    "ATOM_USE_V4_PREFILL_ASM_FOR_DECODE": lambda: (
+        os.getenv("ATOM_USE_V4_PREFILL_ASM_FOR_DECODE", "0") == "1"
+    ),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
@@ -526,6 +637,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_KV_EVENTS_ENDPOINT", "tcp://127.0.0.1:5557"
     ),
     "ATOM_KV_EVENTS_TOPIC": lambda: os.getenv("ATOM_KV_EVENTS_TOPIC", ""),
+    # ROUTER endpoint for the replay socket; empty string disables replay.
+    "ATOM_KV_EVENTS_REPLAY_ENDPOINT": lambda: os.getenv(
+        "ATOM_KV_EVENTS_REPLAY_ENDPOINT", ""
+    ),
+    # Size of the replay ring buffer (distinct from the send queue depth).
+    "ATOM_KV_EVENTS_REPLAY_BUFFER_STEPS": lambda: int(
+        os.getenv("ATOM_KV_EVENTS_REPLAY_BUFFER_STEPS", "10000") or "10000"
+    ),
     "ATOM_KV_EVENTS_HWM": lambda: int(os.getenv("ATOM_KV_EVENTS_HWM", "0") or "0"),
     "ATOM_KV_EVENTS_BUFFER_STEPS": lambda: int(
         os.getenv("ATOM_KV_EVENTS_BUFFER_STEPS", "10000") or "10000"

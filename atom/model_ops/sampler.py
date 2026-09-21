@@ -4,7 +4,7 @@
 import warnings
 
 import torch
-from aiter import mixed_sample_outer_exponential
+from aiter import mixed_sample_outer_exponential, topk_select
 from aiter.ops.triton.softmax import softmax
 from aiter.ops.triton.topk import topk
 from torch import nn
@@ -29,6 +29,21 @@ _NATIVE_SAMPLING_WARNING_ISSUED = False
 
 # Epsilon value for numerical stability and to prevent division by 0
 SAMPLER_EPS = 1e-10
+
+
+def _greedy_tokens(probs: torch.Tensor, greedy_mask: torch.Tensor) -> torch.Tensor:
+    """Argmax token for the rows `greedy_mask` selects, as int32.
+
+    Reduces every row and keeps the selected answers. The obvious spelling,
+    `probs[greedy_mask].argmax(-1)`, gathers a `[greedy, vocab]` copy first, and
+    that copy costs more than reducing the rows it would have dropped: measured
+    at 256 rows of 200064 with three quarters greedy, 134.6us against 71.9.
+
+    `tie="low"` is what makes this the pick `torch.argmax` made -- the default
+    promises no direction among equal scores, so a near-tie would resolve
+    differently from one TP rank to the next.
+    """
+    return topk_select(probs, 1, tie="low")[1].view(-1)[greedy_mask]
 
 
 def get_per_token_exponential(vocab_size: int, device) -> torch.Tensor:
@@ -150,9 +165,15 @@ class Sampler(nn.Module):
         # Accepted but unused here; see docstring.
         del needs_independent_noise
         # Fast path: if ALL requests are greedy (temperature=0), just do argmax
-        # This avoids the overhead of softmax and top-k/top-p filtering
+        # This avoids the overhead of softmax and top-k/top-p filtering.
+        #
+        # `tie="low"` is what makes this the pick `torch.argmax` made: the
+        # default promises no direction among equal scores, so a near-tie would
+        # resolve differently from one TP rank to the next. It is free at k=1.
+        # `logits` is bf16 and stays bf16 -- the reduction widens each element
+        # as it reads it, so there is no `[rows, vocab]` cast in front of this.
         if all_greedy:
-            return logits.argmax(dim=-1).to(torch.int)
+            return topk_select(logits, 1, tie="low")[1].view(-1)
 
         # Apply temperature scaling
         # Temperatures are pre-clamped to eps in model_runner.prepare_sample()
@@ -223,7 +244,11 @@ class Sampler(nn.Module):
         # Handle greedy sampling (temperature=0)
         greedy_mask = temperatures == 0
         if greedy_mask.any():
-            next_tokens[greedy_mask] = probs[greedy_mask].argmax(dim=-1).unsqueeze(-1)
+            # Reduce the whole batch and keep the greedy rows, rather than
+            # `probs[greedy_mask]`, which first materializes a
+            # `[greedy, vocab]` copy -- the copy is most of what this used to
+            # cost, and the rows it drops are cheaper to reduce than to gather.
+            next_tokens[greedy_mask] = _greedy_tokens(probs, greedy_mask).unsqueeze(-1)
 
         return next_tokens.view(-1).to(torch.int)
 
@@ -251,7 +276,7 @@ class Sampler(nn.Module):
             )
             _NATIVE_SAMPLING_WARNING_ISSUED = True
 
-        batch_size, vocab_size = probs.shape
+        vocab_size = probs.shape[-1]
         device = probs.device
 
         # Sort probs descending
@@ -290,7 +315,7 @@ class Sampler(nn.Module):
         # Handle greedy (temperature=0)
         greedy_mask = temperatures == 0
         if greedy_mask.any():
-            next_tokens[greedy_mask] = probs[greedy_mask].argmax(dim=-1)
+            next_tokens[greedy_mask] = _greedy_tokens(probs, greedy_mask)
 
         return next_tokens.to(torch.int)
 

@@ -42,6 +42,7 @@ from atom.distributed.pp_comm import (
 )
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
 from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
@@ -116,6 +117,9 @@ support_model_arch_dict = {
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2.GlmMoeDsaForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
     "Qwen3NextForCausalLM": "atom.models.qwen3_next.Qwen3NextForCausalLM",
+    "Qwen4ExpForConditionalGeneration": (
+        "atom.models.qwen4_exp.Qwen4ExpForConditionalGeneration"
+    ),
     "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MultimodalModel",
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel",
     "Qwen3_5MoeForCausalLM": "atom.models.qwen3_5.Qwen3_5MoeForCausalLM",
@@ -811,6 +815,27 @@ class ModelRunner:
                 self.drafter.model = torch.compile(
                     self.drafter.model, fullgraph=True, backend="eager"
                 )
+
+        # Install after initialization warmup, which is not request traffic.
+        # Graph capture runs later via RPC and bypasses run_model, so its
+        # timing decorator does not run during capture.
+        self.gpu_forward_metrics = None
+        if envs.ATOM_ENABLE_METRICS_DEVICE_TIMER:
+            self.gpu_forward_metrics = GPUForwardMetrics(
+                lambda: torch.cuda.Event(enable_timing=True),
+                dp_rank=config.parallel_config.data_parallel_rank,
+                pp_rank=config.parallel_config.pipeline_parallel_rank,
+                tp_rank=self.rank,
+                engine_role=(
+                    ("decode" if config.disagg_is_decode else "prefill")
+                    if config.enable_rapidserve
+                    else "default"
+                ),
+            )
+
+    def poll_forward_metrics(self):
+        if self.gpu_forward_metrics is not None:
+            self.gpu_forward_metrics.poll()
 
     def _build_and_load_model(self, model_class):
         """Construct the model and load its weights from disk.
@@ -2726,6 +2751,7 @@ class ModelRunner:
                 self._pp_index_topk,
             )
 
+    @record_gpu_forward
     def run_model(
         self,
         input_ids: torch.Tensor,
@@ -3641,7 +3667,17 @@ class ModelRunner:
             fc.batch_descriptor = None
             self._piecewise_captured_tokens.add(num_tokens_dp)
 
+    @torch.inference_mode()
     def capture_cudagraph(self):
+        # M3 indexer-only CP puts an all-to-all in the captured decode path, and
+        # NCCL sets up peer connections on a group's FIRST collective -- doing
+        # that inside a capture hangs. warmup_model() does not cover it: its
+        # dummy batch is prefill-only, and prefill stays on the TP path with no
+        # all-to-all. No-op unless the flag is on.
+        from atom.distributed.indexer_cp import warmup_exchange
+
+        warmup_exchange(self.device)
+
         _piecewise = self._piecewise_cg_active()
         # AF_PIECEWISE: also capture the attn core (ragged combos below)
         cudagraph_mode = getattr(self.config.compilation_config, "cudagraph_mode", None)
@@ -3774,6 +3810,8 @@ class ModelRunner:
                 full_q_len,
                 full_q_len,
             )
+
+        self.attn_metadata_builder.blank_cache_write_targets()
 
         # Whether this backend's capture builder supports a dynamic (per-bucket)
         build_capture = self.attn_metadata_builder.build_for_cudagraph_capture

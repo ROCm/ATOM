@@ -7,11 +7,7 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-# ruff: noqa: E501
-
-
 import torch
-
 import triton
 import triton.language as tl
 
@@ -60,7 +56,10 @@ def chunk_fwd_kernel_o(
     BV: tl.constexpr,
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    HEAD_MAJOR_VK: tl.constexpr = False,
+    USE_EXP2: tl.constexpr = False,
 ):
+    T_FLAT = T
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
 
@@ -84,7 +83,10 @@ def chunk_fwd_kernel_o(
     # offset calculation
     q += (bos * Hg + i_h // (H // Hg)) * K
     k += (bos * Hg + i_h // (H // Hg)) * K
-    v += (bos * H + i_h) * V
+    if HEAD_MAJOR_VK:
+        v += (i_h.to(tl.int64) * T_FLAT + bos) * V
+    else:
+        v += (bos * H + i_h) * V
     o += (bos * H + i_h) * V
     h += (i_tg * H + i_h).to(tl.int64) * K * V
 
@@ -111,23 +113,36 @@ def chunk_fwd_kernel_o(
         # [BK, BV]
         _p_h_0 = (i_k * BK) + tl.arange(0, BK)
         _p_h_1 = (i_v * BV) + tl.arange(0, BV)
+        h_offsets = _p_h_0[:, None] * V + _p_h_1[None, :]
+        if HEAD_MAJOR_VK:
+            h_offsets = _p_h_0[:, None] + _p_h_1[None, :] * K
         b_h = tl.load(
-            h + _p_h_0[:, None] * (V) + _p_h_1[None, :] * (1),
+            h + h_offsets,
             mask=(_p_h_0[:, None] < (K)) & (_p_h_1[None, :] < (V)),
             other=0.0,
         )
 
         # [BT, BK] @ [BK, BV] -> [BT, BV]
+        if HEAD_MAJOR_VK:
+            b_h = b_h.to(b_q.dtype)
         b_o += tl.dot(b_q, b_h)
         # [BT, BK] @ [BK, BT] -> [BT, BT]
         b_A += tl.dot(b_q, b_k)
 
     if USE_G:
-        g += bos * H + i_h
+        if HEAD_MAJOR_VK:
+            g += i_h.to(tl.int64) * T_FLAT + bos
+        else:
+            g += bos * H + i_h
         _p_g_0 = (i_t * BT) + tl.arange(0, BT)
-        b_g = tl.load(g + _p_g_0 * (H), mask=(_p_g_0 < (T)), other=0.0)
-        b_o = b_o * exp(b_g)[:, None]
-        b_A = b_A * exp(b_g[:, None] - b_g[None, :])
+        g_stride = 1 if HEAD_MAJOR_VK else H
+        b_g = tl.load(g + _p_g_0 * g_stride, mask=(_p_g_0 < T), other=0.0)
+        if USE_EXP2:
+            b_o = b_o * tl.exp2(b_g)[:, None]
+            b_A = b_A * tl.exp2(b_g[:, None] - b_g[None, :])
+        else:
+            b_o = b_o * exp(b_g)[:, None]
+            b_A = b_A * exp(b_g[:, None] - b_g[None, :])
 
     o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < T
@@ -137,7 +152,7 @@ def chunk_fwd_kernel_o(
     _p_v_0 = (i_t * BT) + tl.arange(0, BT)
     _p_v_1 = (i_v * BV) + tl.arange(0, BV)
     b_v = tl.load(
-        v + _p_v_0[:, None] * (H * V) + _p_v_1[None, :] * (1),
+        v + _p_v_0[:, None] * (V if HEAD_MAJOR_VK else H * V) + _p_v_1[None, :],
         mask=(_p_v_0[:, None] < (T)) & (_p_v_1[None, :] < (V)),
         other=0.0,
     )
@@ -164,6 +179,9 @@ def chunk_fwd_o(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     o: torch.Tensor | None = None,
+    *,
+    head_major_vk: bool = False,
+    chunk_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Returns the attention output tensor.
 
@@ -176,25 +194,32 @@ def chunk_fwd_o(
     defense-in-depth backstop for any caller that bypasses the public API.
     """
     B, T, Hg, K, V = *q.shape, v.shape[-1]
-    H = v.shape[-2]
+    H = v.shape[1] if head_major_vk else v.shape[-2]
     BT = 64 if FLA_GDN_FIX_BT else min(chunk_size, max(16, triton.next_power_of_2(T)))
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
-    )
+    if head_major_vk:
+        if B != 1:
+            raise ValueError("head-major VK output currently requires B=1")
+        BT = chunk_size
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
     if o is None:
-        o = torch.empty_like(v)
+        o = (
+            torch.empty((B, T, H, V), dtype=v.dtype, device=v.device)
+            if head_major_vk
+            else torch.empty_like(v)
+        )
     else:
-        assert o.shape == v.shape, (
+        assert o.shape == (B, T, H, V), (
             f"chunk_fwd_o: caller-provided o.shape {tuple(o.shape)} != "
             f"v.shape {tuple(v.shape)}"
         )
-        assert o.dtype == v.dtype, (
-            f"chunk_fwd_o: caller-provided o.dtype {o.dtype} != v.dtype " f"{v.dtype}"
-        )
+        assert (
+            o.dtype == v.dtype
+        ), f"chunk_fwd_o: caller-provided o.dtype {o.dtype} != v.dtype {v.dtype}"
         assert o.is_contiguous(), (
             "chunk_fwd_o: caller-provided o must be contiguous (kernel "
             "assumes stride (H*V, 1) on the (T, V) plane)"
@@ -219,5 +244,7 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
+        HEAD_MAJOR_VK=head_major_vk,
+        USE_EXP2=head_major_vk,
     )
     return o

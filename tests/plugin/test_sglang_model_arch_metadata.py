@@ -2,7 +2,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from atom.plugin.sglang.runtime.model_arch import resolve_model_arch_spec
+from atom.plugin.sglang.runtime.model_arch import (
+    MODEL_ARCH_SPECS,
+    resolve_model_arch_spec,
+)
 
 
 @pytest.mark.parametrize(
@@ -20,6 +23,8 @@ from atom.plugin.sglang.runtime.model_arch import resolve_model_arch_spec
             "MiniMaxM3SparseForConditionalGeneration",
             "_build_minimax_m3_forward_metadata",
         ),
+        ("Qwen3_5ForCausalLM", "_build_qwen35_forward_metadata"),
+        ("Qwen3_5MoeForCausalLM", "_build_qwen35_forward_metadata"),
         ("LlamaForCausalLMEagle3", "_build_eagle3_llama_forward_metadata"),
     ),
 )
@@ -41,6 +46,7 @@ def test_resolve_model_arch_spec_selects_metadata_builder(
         "Qwen3ForCausalLM",
         "Qwen3NextForCausalLM",
         "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
         "UnknownForCausalLM",
     ),
 )
@@ -50,6 +56,63 @@ def test_resolve_model_arch_spec_uses_generic_metadata(model_arch: str):
     )
 
     assert resolved_arch == model_arch
+    assert model_spec.build_forward_metadata is None
+
+
+@pytest.mark.parametrize(
+    "model_arch",
+    ("Qwen3_5ForCausalLM", "Qwen3_5MoeForCausalLM"),
+)
+def test_qwen35_causal_lm_uses_native_attention_runtime(model_arch: str):
+    resolved_arch, model_spec = resolve_model_arch_spec(
+        SimpleNamespace(architectures=[model_arch])
+    )
+
+    assert resolved_arch == model_arch
+    assert model_arch in MODEL_ARCH_SPECS
+    assert not model_spec.wrapper_binds_gdn_context
+    assert model_spec.uses_context_only_forward
+    assert model_spec.build_forward_metadata is not None
+    assert model_spec.bind_cache_views is not None
+    assert model_spec.prepare_config is not None
+
+
+@pytest.mark.parametrize(
+    "model_arch",
+    ("Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration"),
+)
+def test_qwen35_conditional_generation_uses_sglang_attention_runtime(
+    model_arch: str,
+):
+    resolved_arch, model_spec = resolve_model_arch_spec(
+        SimpleNamespace(architectures=[model_arch])
+    )
+
+    assert resolved_arch == model_arch
+    assert model_spec.construction_context is None
+    assert model_spec.build_forward_metadata is None
+    assert model_spec.bind_cache_views is None
+    assert model_spec.prepare_config is not None
+
+
+def test_qwen4_exp_uses_custom_entryclass_and_gdn_context():
+    """Flash keeps its own EntryClass; a generated wrapper would duplicate it."""
+    resolved_arch, model_spec = resolve_model_arch_spec(
+        SimpleNamespace(architectures=["Qwen4ExpForConditionalGeneration"])
+    )
+
+    assert resolved_arch == "Qwen4ExpForConditionalGeneration"
+    assert "Qwen4ExpForConditionalGeneration" not in MODEL_ARCH_SPECS
+    assert model_spec.wrapper_binds_gdn_context
+    assert model_spec.prepare_config is not None
+    assert model_spec.prepare_config.__name__ == "_prepare_qwen4_exp_config"
+    assert model_spec.build_forward_metadata is None
+
+    assert resolved_arch == "Qwen4ExpForConditionalGeneration"
+    assert "Qwen4ExpForConditionalGeneration" not in MODEL_ARCH_SPECS
+    assert model_spec.wrapper_binds_gdn_context
+    assert model_spec.prepare_config is not None
+    assert model_spec.prepare_config.__name__ == "_prepare_qwen4_exp_config"
     assert model_spec.build_forward_metadata is None
 
 
@@ -114,6 +177,8 @@ def test_resolve_model_arch_spec_supports_family_version_architectures(
         ("qwen3_next", "Qwen3NextForCausalLM"),
         ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
         ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
+        ("qwen4_exp", "Qwen4ExpForConditionalGeneration"),
+        ("qwen4_exp_text", "Qwen4ExpForConditionalGeneration"),
     ),
 )
 def test_resolve_qwen_family_versions_use_their_own_adapter(
