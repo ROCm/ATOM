@@ -155,16 +155,13 @@ models:
           nodes: "${ATOMESH_2P1D_NODES}"
           isl: [8192]
           osl: 1024
-          concurrency: [256, 512, 768, 1024]
+          concurrency: [128, 256]
           prefill:
             workers: 2
             tp: 8
           decode:
             workers: 1
             tp: 8
-          server:
-            common_args:
-              decode_max_num_seqs: 1024
           benchmark:
             wait_server_timeout: 4500
           run_eval: true
@@ -203,7 +200,7 @@ models:
           nodes: "${ATOMESH_2P1D_NODES}"
           isl: [8192]
           osl: 1024
-          concurrency: [256, 512]
+          concurrency: [128, 256]
           prefill:
             workers: 2
             tp: 8
