@@ -18,14 +18,6 @@ The server and client lines this recipe extends live in
 [Kimi-K3.md](Kimi-K3.md) — this file adds the `--kv-transfer-config` leg to the
 DSpark launch there rather than restating it.
 
-Kimi-K3 offloads KV through `AtomLMCacheOffloadConnector`, the same connector
-MiniMax-M3 and GLM-5.2 use, plus a second leg for the KDA recurrent state. See
-[MiniMax-M3 — LMCache KV offload](MiniMax-M3-LMCache-Byte-Offload.md) for the
-LMCache build steps and the tier-sizing arithmetic; everything there applies
-here unchanged. What follows is only what K3 adds.
-
-## Why K3 needs more than the M3 path
-
 K3 is hybrid, so vLLM splits the cache into two *kinds* of group — MLA full
 attention and KDA recurrent state. It does not build one group per kind. vLLM
 builds **equal-sized** groups, sized by the largest layer family, so K3's 29 MLA
@@ -62,7 +54,7 @@ external hit is capped at the largest chunk boundary whose KDA state the index
 still claims. A KDA state that was never stored, or that LMCache evicted,
 shortens the prefix instead of corrupting it.
 
-## Launch
+## Server
 
 Add to the DSpark launch in
 [Kimi-K3.md](Kimi-K3.md#speculative-decoding-with-dspark) (prefix caching and
@@ -111,164 +103,7 @@ auto-disables for a connector that does not declare `SupportsHMA` — so without
 that declaration K3 plus `--kv-transfer-config` does not mis-save, it does not
 boot. The connector declares it; the check below confirms HMA stayed on.
 
-## Verify it is actually on
-
-On top of the four checks in the M3 recipe:
-
-```bash
-# the recurrent leg found its groups. These are TWO different lines from two
-# different processes, and each one alone leaves the other side unchecked:
-# the EngineCore prints the scheduler-side line, every worker prints its own.
-grep "ATOM LMCache offload: recurrent state leg on group" server.log  # EngineCore
-grep "ATOM LMCache offload: recurrent state tier up"      server.log  # 1 per worker
-
-# the dense leg strides by blocks, not tokens. `leading dim` is 1536x num_blocks
-# on K3 because the MLA backend asks for a kernel block size of 1; the two being
-# equal here would mean the codec is striding per token.
-grep "ATOM LMCache offload: registered" server.log  # 1 per worker
-
-# HMA must NOT have been turned off -- this line means the connector was not
-# recognised as SupportsHMA and the recurrent leg is not running
-grep "Turning off hybrid kv cache manager" server.log   # expect no match
-```
-
-## Status
-
-**Boot: validated** on 8xMI355 TP8 (2026-09-18). Three mamba groups on 0,1,2 and
-the attention group on 3, the hybrid memory allocator left on, and the
-deterministic smoke test from [Kimi-K3.md](Kimi-K3.md#smoke-test) answering 42. Measured geometry, for comparison
-against a future boot:
-
-```text
-Setting attention block size to 1536 tokens ...   # effective block size, not 128
-Available KV cache memory: 37.85 GiB              # per rank
-GPU KV cache size: 1,887,436 tokens, Maximum concurrency ... 28.80x
-registered 29 layers, num_blocks=1584 (leading dim 2433024, block_size=1536)
-recurrent state leg on group(s) 0,1,2 (mamba_block=1536, hash_block=1536, chunk=1536)
-recurrent state tier up, 69 layers, entry=58.22 MiB, ... groups=23,23,23
-bytes_per_block=25657344 chunk=1536
-```
-
-Two numbers there are worth checking rather than skimming, because both fail
-silently if they are wrong:
-
-- `bytes_per_block` must be `block_size x bytes_per_token`, here
-  `1536 x 16,704 = 25,657,344`. It is what the codec charges for one block-table
-  entry. If it comes back as the per-token figure instead, every entry is being
-  read as one token and the restored bytes come from the wrong rows — no error,
-  no log, just wrong output.
-- `leading dim` is `1536 x num_blocks`, not `num_blocks`. The MLA backend asks
-  vLLM for a kernel block size of 1, so the cache is allocated one row per token
-  while the block ids a connector receives stay manager ids. The two being equal
-  would mean this model is not on the kernel-block path and the check above is
-  the one that matters.
-
-**Accuracy: not yet run.** The accuracy requirements stated earlier in this
-recipe are requirements, not measurements. When they are run, use the two-pass method: a
-single SAVE-only pass measures nothing, so salt the prefixes to defeat the GPU
-prefix cache, size the HBM pool below the working set to force read-back, and
-take the noise floor from the OFF arm's own two-pass delta.
-
-## Measured
-
-A matched ON/OFF pair, back to back in the same slot, same tree
-(`0ad111463`, `atom_dirty=0` recorded at the start of each arm), same model,
-TP8 on MI355, 1800 s per arm, seed 1234. The arms differ in exactly one thing:
-whether the connector is loaded. That is checked rather than asserted — the
-pair check reads the effective tier out of each arm's **log** (`recurrent state
-tier up` / its absence) instead of off the launch environment, and diffs every
-other knob.
-
-Server as above with `LMCACHE_MAX_LOCAL_CPU_SIZE=40` and
-`--num-gpu-blocks-override 320`; both arms booted `GPU KV cache size: 381,300
-tokens`. Client is the agentic replay, not a synthetic prefix pool:
-
-```bash
-aiperf profile --scenario inferencex-agentx-mvp \
-  --public-dataset semianalysis_cc_traces_weka_062126 \
-  --url "http://127.0.0.1:8713" --endpoint /v1/chat/completions \
-  --endpoint-type chat --streaming --model "${MODEL}" \
-  --concurrency 16 --benchmark-duration 1800 --random-seed 1234 \
-  --num-dataset-entries 800 --max-context-length 65536 \
-  --warmup-requests-per-lane 10 --warmup-grace-period 1800 \
-  --trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75 \
-  --trace-idle-gap-cap-seconds 300 --use-server-token-count \
-  --tokenizer "${MODEL}" --tokenizer-trust-remote-code \
-  --server-metrics "http://127.0.0.1:8713/metrics" --no-gpu-telemetry
-```
-
-`--num-dataset-entries 800` is sized to the window, not copied from a shorter
-run: 900 s drew 416 records against 400 entries, already at the replay edge, so
-doubling the duration without doubling the pool would have replayed prompts and
-inflated the late window on both arms.
-
-| full window, 1800 s | req/s | out tok/s | TTFT p50 / p90 | ITL p50 / p90 | preempt |
-|---|---|---|---|---|---|
-| OFF | 0.2397 | 106.28 | 1367 / 5266 ms | 22.28 / 52.79 ms | 35 |
-| ON | **0.2656** | **120.35** | 559 / 1997 ms | 19.79 / 30.48 ms | 2 |
-| | **+10.81%** | **+13.24%** | −59.1% / −62.1% | −11.2% / −42.3% | |
-
-**Where the prompt tokens went.** `vllm:prompt_tokens_by_source_total`, whose
-three components sum to `vllm:prompt_tokens_total` exactly on both arms:
-
-| source | OFF | ON |
-|---|---|---|
-| `local_compute` | 16,134,428 (64.01%) | **4,428,242 (16.27%)** |
-| `local_cache_hit` | 9,071,616 (35.99%) | 10,781,184 (39.61%) |
-| `external_kv_transfer` | 0 | **12,006,912 (44.12%)** |
-| total | 25,206,044 | 27,216,338 |
-
-Prefill recompute fell by 47.7 pp of prompt tokens, which is where the whole
-result comes from: TTFT moves most, ITL follows second-hand as prefill stops
-competing with decode, and preemptions fall 35 → 2 because a preempted request
-resumes off the tier instead of re-prefilling.
-
-Unlike GLM-5.3, **the HBM hit rate also rose** (35.99% → 39.61% of prompt
-tokens) rather than falling slightly. The two percentages still have different
-denominators — on the plugin path vLLM asks the connector only about what the
-HBM pool missed — so they must not be summed as shares of one thing. Within the
-miss tail the tier answered **73.06%**.
-
-**Three instruments, two gaps.** They do not measure the same thing and the
-difference is informative rather than noise:
-
-| ruler | ON | meaning |
-|---|---|---|
-| `vllm:external_prefix_cache_hits` | 12,498,432 | what scheduler-side lookup **promised** |
-| LMCache `Retrieved` sum / TP=8 | 12,189,312 | what the ranks **delivered** |
-| `prompt_tokens_by_source` external | 12,006,912 | what the engine **counted** |
-
-The promised→delivered gap of 309,120 closes exactly against
-`Sum(required − retrieved)` over every rank line ÷ 8 — these are 10 KV load
-failures, i.e. chunks evicted between lookup and load, absorbed by
-`kv_load_failure_policy: recompute`. Compute that sum over **all** rank lines;
-the per-event shortcut `affected × failed_ranks / TP` silently misses partial
-retrievals (28 of the 2,568 retrieves here came back partial) and overstated the
-gap by 39% on this arm. The delivered→counted gap of 182,400 is **not**
-explained and is left open rather than papered over.
-
-**The validity control fails, so no steady-state row is quoted.** The start-cut
-sweep GLM-5.3 uses is only licensed when the OFF arm is flat across cuts. Here
-it is not: OFF drifts −17.1% from t ≥ 0 to t ≥ 1200 (ON −10.5%), because the
-replay's per-request work grows over the window on both arms. What can be said
-is that the **ratio** is stable and non-monotone in the cut — +9.86%, +11.47%,
-+12.86%, +11.44%, +13.56%, +14.68%, +10.54%, +18.57% at cuts 0/100/200/300/450/
-600/900/1200 s — so the drift is common-mode and the full-window +10.81% is not
-an artefact of where the window starts. It is **not** grounds for quoting the
-+14.68% at t ≥ 600 as a steady-state gain.
-
-**Limits.** Each arm is **n=1 in runs**; no dispersion is quoted and the cut
-sweep bounds within-run drift, not run-to-run variance. Two quantities were not
-held fixed and are stated rather than hidden: ISL differs by +1.24% and OSL by
-+2.20% between arms (the replay draws different trajectories once throughput
-differs), and host `MemFree` at launch was 804 GiB (OFF) against 1262 GiB (ON)
-because neighbours released memory in between — neither arm was near the
-ceiling, but the pair is not a controlled test of host pressure. The tier is
-**under-sized on purpose** at 40 GiB/rank: `Failed to allocate memory block`
-appears 8,847 times on the ON arm, so this is a working tier with eviction, not
-a tier that holds the working set.
-
-## Sizing the two ends before spending GPU time
+### Sizing the tier
 
 Per rank K3 costs **56,448 B/token** — `29 x 576 = 16,704` for attention plus
 `58.22 MiB / 1536 = 39,744` for the recurrent boundary state, so the recurrent
@@ -359,6 +194,191 @@ same window bracket it: at 792 blocks (tier/pool = 0.81) the tier cost **−3.59
 and shrinking the pool from 792 to 320 costs −12.35% without the tier but only
 −1.47% with it. **The sign of the tier's benefit follows `tier / pool`**, and
 that ratio is the number to compute first.
+
+### Verify it booted right
+
+On top of the four checks in the M3 recipe:
+
+```bash
+# the recurrent leg found its groups. These are TWO different lines from two
+# different processes, and each one alone leaves the other side unchecked:
+# the EngineCore prints the scheduler-side line, every worker prints its own.
+grep "ATOM LMCache offload: recurrent state leg on group" server.log  # EngineCore
+grep "ATOM LMCache offload: recurrent state tier up"      server.log  # 1 per worker
+
+# the dense leg strides by blocks, not tokens. `leading dim` is 1536x num_blocks
+# on K3 because the MLA backend asks for a kernel block size of 1; the two being
+# equal here would mean the codec is striding per token.
+grep "ATOM LMCache offload: registered" server.log  # 1 per worker
+
+# HMA must NOT have been turned off -- this line means the connector was not
+# recognised as SupportsHMA and the recurrent leg is not running
+grep "Turning off hybrid kv cache manager" server.log   # expect no match
+```
+
+**Boot: validated** on 8xMI355 TP8 (2026-09-18). Three mamba groups on 0,1,2 and
+the attention group on 3, the hybrid memory allocator left on, and the
+deterministic smoke test from [Kimi-K3.md](Kimi-K3.md#smoke-test) answering
+42. Measured geometry, for comparison against a future boot:
+
+```text
+Setting attention block size to 1536 tokens ...   # effective block size, not 128
+Available KV cache memory: 37.85 GiB              # per rank
+GPU KV cache size: 1,887,436 tokens, Maximum concurrency ... 28.80x
+registered 29 layers, num_blocks=1584 (leading dim 2433024, block_size=1536)
+recurrent state leg on group(s) 0,1,2 (mamba_block=1536, hash_block=1536, chunk=1536)
+recurrent state tier up, 69 layers, entry=58.22 MiB, ... groups=23,23,23
+bytes_per_block=25657344 chunk=1536
+```
+
+Two numbers there are worth checking rather than skimming, because both fail
+silently if they are wrong:
+
+- `bytes_per_block` must be `block_size x bytes_per_token`, here
+  `1536 x 16,704 = 25,657,344`. It is what the codec charges for one block-table
+  entry. If it comes back as the per-token figure instead, every entry is being
+  read as one token and the restored bytes come from the wrong rows — no error,
+  no log, just wrong output.
+- `leading dim` is `1536 x num_blocks`, not `num_blocks`. The MLA backend asks
+  vLLM for a kernel block size of 1, so the cache is allocated one row per token
+  while the block ids a connector receives stay manager ids. The two being equal
+  would mean this model is not on the kernel-block path and the check above is
+  the one that matters.
+
+## Client
+
+The workload is an **agentic trace replay**, not a synthetic prefix pool — there
+is no `--prompt-prefix-pool-size` to reason about, and reuse comes from the
+trace's own multi-turn structure. Identical on both arms:
+
+```bash
+aiperf profile --scenario inferencex-agentx-mvp \
+  --public-dataset semianalysis_cc_traces_weka_062126 \
+  --url "http://127.0.0.1:8713" --endpoint /v1/chat/completions \
+  --endpoint-type chat --streaming --model "${MODEL}" \
+  --concurrency 16 --benchmark-duration 1800 --random-seed 1234 \
+  --num-dataset-entries 800 --max-context-length 65536 \
+  --warmup-requests-per-lane 10 --warmup-grace-period 1800 \
+  --trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75 \
+  --trace-idle-gap-cap-seconds 300 --use-server-token-count \
+  --tokenizer "${MODEL}" --tokenizer-trust-remote-code \
+  --server-metrics "http://127.0.0.1:8713/metrics" --no-gpu-telemetry
+```
+
+
+`--num-dataset-entries 800` is sized to the window, not copied from a shorter
+run: 900 s drew 416 records against 400 entries, already at the replay edge, so
+doubling the duration without doubling the pool would have replayed prompts and
+inflated the late window on both arms.
+
+Four of these are load-bearing and none is cosmetic:
+
+* `--random-seed` fixes the replay, so both arms draw the same trajectories.
+  Pass it explicitly; a default would let the arms diverge silently.
+* `--use-server-token-count` makes every hit rate below a ratio of two
+  server-side counters rather than of a client-side estimate, so the
+  denominator cannot drift between arms.
+* `--max-context-length 65536` must equal the server's `--max-model-len`. This
+  trace's input sequences run past it (median ISL ~74k against a 65,536
+  window), so the two numbers disagreeing truncates the workload asymmetrically
+  rather than the pool.
+* `--warmup-requests-per-lane 10` is a **count** budget, not a time budget, and
+  `--warmup-grace-period` does not cap it. At this ISL warmup ran for minutes;
+  it is excluded from the exported records (`benchmark_phase`) and must not be
+  extrapolated into the measured window.
+
+One thing the base launch does **not** pass is `--enable-prompt-tokens-details`,
+so aiperf's own prompt-cache columns come back empty and it says so at the foot
+of its summary. That is why every hit rate in *Measured* is read from the
+server's `/metrics` instead. If you want aiperf to compute them too, add the
+flag on both arms — never on one.
+
+## Measured
+
+A matched ON/OFF pair, back to back in the same slot, same tree
+(`0ad111463`, `atom_dirty=0` recorded at the start of each arm), same model,
+TP8 on MI355, 1800 s per arm, seed 1234. The arms differ in exactly one thing:
+whether the connector is loaded. That is checked rather than asserted — the
+pair check reads the effective tier out of each arm's **log** (`recurrent state
+tier up` / its absence) instead of off the launch environment, and diffs every
+other knob.
+
+The server is the block in *Server* with `LMCACHE_MAX_LOCAL_CPU_SIZE=40` and
+`--num-gpu-blocks-override 320`; both arms booted `GPU KV cache size: 381,300
+tokens`. The client is the block in *Client*, identical on both arms.
+
+| full window, 1800 s | req/s | out tok/s | TTFT p50 / p90 | ITL p50 / p90 | preempt |
+|---|---|---|---|---|---|
+| OFF | 0.2397 | 106.28 | 1367 / 5266 ms | 22.28 / 52.79 ms | 35 |
+| ON | **0.2656** | **120.35** | 559 / 1997 ms | 19.79 / 30.48 ms | 2 |
+| | **+10.81%** | **+13.24%** | −59.1% / −62.1% | −11.2% / −42.3% | |
+
+**Where the prompt tokens went.** `vllm:prompt_tokens_by_source_total`, whose
+three components sum to `vllm:prompt_tokens_total` exactly on both arms:
+
+| source | OFF | ON |
+|---|---|---|
+| `local_compute` | 16,134,428 (64.01%) | **4,428,242 (16.27%)** |
+| `local_cache_hit` | 9,071,616 (35.99%) | 10,781,184 (39.61%) |
+| `external_kv_transfer` | 0 | **12,006,912 (44.12%)** |
+| total | 25,206,044 | 27,216,338 |
+
+Prefill recompute fell by 47.7 pp of prompt tokens, which is where the whole
+result comes from: TTFT moves most, ITL follows second-hand as prefill stops
+competing with decode, and preemptions fall 35 → 2 because a preempted request
+resumes off the tier instead of re-prefilling.
+
+Unlike GLM-5.3, **the HBM hit rate also rose** (35.99% → 39.61% of prompt
+tokens) rather than falling slightly. The two percentages still have different
+denominators — on the plugin path vLLM asks the connector only about what the
+HBM pool missed — so they must not be summed as shares of one thing. Within the
+miss tail the tier answered **73.06%**.
+
+**Three instruments, two gaps.** They do not measure the same thing and the
+difference is informative rather than noise:
+
+| ruler | ON | meaning |
+|---|---|---|
+| `vllm:external_prefix_cache_hits` | 12,498,432 | what scheduler-side lookup **promised** |
+| LMCache `Retrieved` sum / TP=8 | 12,189,312 | what the ranks **delivered** |
+| `prompt_tokens_by_source` external | 12,006,912 | what the engine **counted** |
+
+The promised→delivered gap of 309,120 closes exactly against
+`Sum(required − retrieved)` over every rank line ÷ 8 — these are 10 KV load
+failures, i.e. chunks evicted between lookup and load, absorbed by
+`kv_load_failure_policy: recompute`. Compute that sum over **all** rank lines;
+the per-event shortcut `affected × failed_ranks / TP` silently misses partial
+retrievals (28 of the 2,568 retrieves here came back partial) and overstated the
+gap by 39% on this arm. The delivered→counted gap of 182,400 is **not**
+explained and is left open rather than papered over.
+
+**The validity control fails, so no steady-state row is quoted.** The start-cut
+sweep GLM-5.3 uses is only licensed when the OFF arm is flat across cuts. Here
+it is not: OFF drifts −17.1% from t ≥ 0 to t ≥ 1200 (ON −10.5%), because the
+replay's per-request work grows over the window on both arms. What can be said
+is that the **ratio** is stable and non-monotone in the cut — +9.86%, +11.47%,
++12.86%, +11.44%, +13.56%, +14.68%, +10.54%, +18.57% at cuts 0/100/200/300/450/
+600/900/1200 s — so the drift is common-mode and the full-window +10.81% is not
+an artefact of where the window starts. It is **not** grounds for quoting the
++14.68% at t ≥ 600 as a steady-state gain.
+
+**Limits.** Each arm is **n=1 in runs**; no dispersion is quoted and the cut
+sweep bounds within-run drift, not run-to-run variance. Two quantities were not
+held fixed and are stated rather than hidden: ISL differs by +1.24% and OSL by
++2.20% between arms (the replay draws different trajectories once throughput
+differs), and host `MemFree` at launch was 804 GiB (OFF) against 1262 GiB (ON)
+because neighbours released memory in between — neither arm was near the
+ceiling, but the pair is not a controlled test of host pressure. The tier is
+**under-sized on purpose** at 40 GiB/rank: `Failed to allocate memory block`
+appears 8,847 times on the ON arm, so this is a working tier with eviction, not
+a tier that holds the working set.
+
+**Throughput is all that was measured; accuracy was not.** When it is run, use
+the two-pass method: a single SAVE-only pass measures nothing, so salt the
+prefixes to defeat the GPU prefix cache, size the HBM pool below the working
+set to force read-back, and take the noise floor from the OFF arm's own
+two-pass delta. The baseline to beat is the one in
+[Kimi-K3.md](Kimi-K3.md#accuracy-validation).
 
 ## Related
 
