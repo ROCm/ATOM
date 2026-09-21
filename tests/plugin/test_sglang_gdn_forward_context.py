@@ -281,18 +281,20 @@ def _qwen4_flydsl_atom_config():
         dt_bias=torch.zeros(1, dtype=torch.bfloat16),
         gdn_flydsl_policy=None,
     )
-    return SimpleNamespace(
-        compilation_config=SimpleNamespace(
-            static_forward_context={"Linear_0": SimpleNamespace(impl=impl)}
+    return (
+        SimpleNamespace(
+            compilation_config=SimpleNamespace(
+                static_forward_context={"Linear_0": SimpleNamespace(impl=impl)}
+            ),
+            enable_dp_attention=False,
         ),
-        enable_dp_attention=False,
-    ), impl
+        impl,
+    )
 
 
 class _TemporalPool:
-    mamba_map = {0: None}
-
     def __init__(self, temporal):
+        self.mamba_map = {0: None}
         self._cache = SimpleNamespace(
             conv=[torch.zeros(2, 4)],
             temporal=temporal,
