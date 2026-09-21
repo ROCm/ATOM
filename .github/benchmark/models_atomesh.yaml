@@ -149,28 +149,103 @@ models:
           benchmark:
             wait_server_timeout: 4500
 
-        # - name: ds-v4-2p1d-dpa-tp8
-        #   topology: 2p1d_dpa
-        #   pd_worker_layout: multi_node
-        #   nodes: "${ATOMESH_2P1D_NODES}"
-        #   env:
-        #     prefill:
-        #       GPU_MAX_HW_QUEUES: "5"
-        #       ATOM_NUMA_BIND: "1"
-        #   isl: [8192]
-        #   osl: 1024
-        #   concurrency: [256, 512, 1024, 2048]
-        #   prefill:
-        #     workers: 2
-        #     tp: 8
-        #     extra_args: "--enable-dp-attention --enable-tbo"
-        #   decode:
-        #     workers: 1
-        #     tp: 8
-        #     extra_args: "--enable-dp-attention"
-        #   benchmark:
-        #     wait_server_timeout: 4500
-        #   run_eval: true
+        - name: ds-v4-2p1d-tp8
+          topology: 2p1d
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512, 768, 1024]
+          prefill:
+            workers: 2
+            tp: 8
+          decode:
+            workers: 1
+            tp: 8
+          server:
+            common_args:
+              decode_max_num_seqs: 1024
+          benchmark:
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_concurrency: [128]
+
+        - name: ds-v4-2p1d-dpa-tp8
+          topology: 2p1d_dpa
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          env:
+            prefill:
+              GPU_MAX_HW_QUEUES: "5"
+              ATOM_NUMA_BIND: "1"
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512, 768, 1024]
+          prefill:
+            workers: 2
+            tp: 8
+            extra_args: "--enable-dp-attention --enable-tbo"
+          decode:
+            workers: 1
+            tp: 8
+            extra_args: "--enable-dp-attention"
+          server:
+            common_args:
+              decode_max_num_seqs: 1024
+          benchmark:
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_concurrency: [128, 768]
+
+        - name: ds-v4-2p1d-tp8-mtp3
+          topology: 2p1d_mtp3
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512]
+          prefill:
+            workers: 2
+            tp: 8
+            extra_args: "--method mtp --num-speculative-tokens 3"
+          decode:
+            workers: 1
+            tp: 8
+            extra_args: "--method mtp --num-speculative-tokens 3"
+          server:
+            common_args:
+              decode_max_num_seqs: 1024
+          benchmark:
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_concurrency: [128]
+
+        - name: ds-v4-2p1d-dpa-tp8-mtp1
+          topology: 2p1d_dpa_mtp1
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          env:
+            prefill:
+              GPU_MAX_HW_QUEUES: "5"
+              ATOM_NUMA_BIND: "1"
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512]
+          prefill:
+            workers: 2
+            tp: 8
+            extra_args: "--method mtp --num-speculative-tokens 1 --enable-dp-attention --enable-tbo"
+          decode:
+            workers: 1
+            tp: 8
+            extra_args: "--method mtp --num-speculative-tokens 1 --enable-dp-attention"
+          server:
+            common_args:
+              decode_max_num_seqs: 1024
+          benchmark:
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_concurrency: [128, 512]
 
     accuracy:
       task: gsm8k
