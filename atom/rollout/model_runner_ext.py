@@ -15,6 +15,7 @@ from aiter.dist.utils import get_distributed_init_method
 
 from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
+from atom.rollout.capabilities import CapabilityProviderMixin
 from atom.rollout.memory_manager import MemoryManagerMixin
 from atom.rollout.weight_updater import WeightUpdaterMixin
 from atom.utils.forward_context import get_forward_context
@@ -22,7 +23,9 @@ from atom.utils.forward_context import get_forward_context
 logger = logging.getLogger("atom")
 
 
-class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
+class RLHFModelRunner(
+    ModelRunner, WeightUpdaterMixin, MemoryManagerMixin, CapabilityProviderMixin
+):
     """ModelRunner with RLHF extensions (weight sync + memory lifecycle + DP isolation).
 
     Used when ATOM is driven by an external RLHF framework (veRL or TorchSpec).
