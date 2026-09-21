@@ -3201,7 +3201,7 @@ class ModelRunner:
         else:
             prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
             prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
-            # PP stages (is_deferred_out=False) still run the drafter.
+            # PP stages and P/D producers still run the drafter.
             if hasattr(self, "drafter"):
                 # Mid-prompt sequences get their anchor corrected inside
                 # propose_draft_token_ids, from `batch.next_token_ids`.
@@ -3365,12 +3365,15 @@ class ModelRunner:
 
         Only under DP attention -- `_publish_draft_shape` returns early at
         `data_parallel_size <= 1`, where an output-less batch legitimately
-        drafts nothing. PP is excluded via `is_deferred_out`.
+        drafts nothing. PP is excluded, and asked about directly:
+        `is_deferred_out` is also off on a P/D producer, a rank that keeps its
+        drafter loaded and still owes its peers the collectives propose()
+        carries.
         """
         return (
             hasattr(self, "drafter")
             and self.config.parallel_config.data_parallel_size > 1
-            and self.tokenID_processor.is_deferred_out
+            and not self.tokenID_processor.is_pipeline_parallel
         )
 
     @torch.inference_mode()

@@ -201,10 +201,6 @@ def test_deferred_decode_returns_the_flat_width_it_staged():
         gpu=np.zeros(16, dtype=np.int32),
         copy_to_gpu=mock.Mock(),
     )
-    processor.decode_cu = SimpleNamespace(
-        np=np.zeros(3, dtype=np.int32),
-        copy_to_gpu=mock.Mock(return_value=np.zeros(3, dtype=np.int32)),
-    )
     processor.decode_src = SimpleNamespace(
         np=np.zeros(2, dtype=np.int32),
         copy_to_gpu=mock.Mock(return_value=np.zeros(2, dtype=np.int32)),
@@ -217,7 +213,23 @@ def test_deferred_decode_returns_the_flat_width_it_staged():
     processor.pre_num_decode_token_per_seq = 1
     processor.prev_token_ids = np.zeros(2, dtype=np.int32)
     processor.draft_token_ids = None
-    processor.runner = SimpleNamespace(enforce_eager=True, capture_sizes=[])
+    cu_seqlens_q = np.array([0, 4, 8], dtype=np.int32)
+    forward_vars = {"cu_seqlens_q": SimpleNamespace(np=cu_seqlens_q, gpu=cu_seqlens_q)}
+    processor.runner = SimpleNamespace(
+        enforce_eager=True,
+        capture_sizes=[],
+        forward_vars=forward_vars,
+        # Mirrors AttentionMetadataBuilder.decode_spans: the lengths and the
+        # cumsum come off the batch and the published buffer, not off a second
+        # copy this path keeps.
+        attn_metadata_builder=SimpleNamespace(
+            decode_spans=lambda b: (
+                b.total_seqs_num_decode,
+                b.num_scheduled_tokens[: b.total_seqs_num_decode],
+                forward_vars["cu_seqlens_q"].np[: b.total_seqs_num_decode + 1],
+            )
+        ),
+    )
     processor.get_token_locations = mock.Mock(
         return_value=SimpleNamespace(
             deferred_curr=np.array([], dtype=np.int32),
@@ -228,12 +240,13 @@ def test_deferred_decode_returns_the_flat_width_it_staged():
 
     batch = SimpleNamespace(
         scheduled_tokens=np.arange(8, dtype=np.int32),
-        # Simulate a worker-side shape expansion after the scheduler total was
-        # captured: the deferred path stages two q=4 rows.
-        total_tokens_num=2,
+        # Two q=4 rows, so the flat width is 8 and the request count is 2.
+        total_tokens_num=8,
         total_tokens_num_prefill=0,
-        total_tokens_num_decode=2,
+        total_tokens_num_decode=8,
         total_seqs_num_prefill=0,
+        total_seqs_num_decode=2,
+        num_scheduled_tokens=np.array([4, 4], dtype=np.int32),
         req_ids=[10, 11],
         dynamic_spec_query_tokens_per_req=None,
         scheduled_spec_decode_tokens=np.arange(6, dtype=np.int32).reshape(2, 3),

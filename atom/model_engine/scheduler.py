@@ -2637,8 +2637,8 @@ class Scheduler:
         # restarts from real context only.
         #
         # Deferred output appends its placeholder on every decode step, not
-        # only under speculation: `is_deferred_out` is `pipeline_parallel_size
-        # == 1`, so a plain TP-only engine takes that path for every running
+        # only under speculation: it is on unless PP or a P/D handoff turns it
+        # off, so a plain TP-only engine takes that path for every running
         # sequence. The placeholder is `eos_token_id`, and postprocess
         # overwrites it in place one step later -- a step this sequence will
         # never reach, because it is being preempted now. Left in place it
