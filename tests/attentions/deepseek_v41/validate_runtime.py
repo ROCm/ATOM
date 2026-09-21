@@ -171,6 +171,7 @@ def main():
         enable_expert_parallel=True,
         enforce_eager=not args.graph,
         compilation_config=CompilationConfig(
+            level=0,
             cudagraph_mode=CUDAGraphMode.FULL if args.graph else None,
             cudagraph_capture_sizes=capture_sizes,
         ),
