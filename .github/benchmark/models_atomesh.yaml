@@ -212,9 +212,6 @@ models:
             workers: 1
             tp: 8
             extra_args: "--method mtp --num-speculative-tokens 3"
-          server:
-            common_args:
-              decode_max_num_seqs: 1024
           benchmark:
             wait_server_timeout: 4500
           run_eval: true
@@ -239,9 +236,6 @@ models:
             workers: 1
             tp: 8
             extra_args: "--method mtp --num-speculative-tokens 1 --enable-dp-attention"
-          server:
-            common_args:
-              decode_max_num_seqs: 1024
           benchmark:
             wait_server_timeout: 4500
           run_eval: true
