@@ -4,7 +4,6 @@
 import logging
 from dataclasses import dataclass
 from functools import partial as functools_partial
-from inspect import signature
 from typing import ClassVar, Protocol
 
 import torch
@@ -513,17 +512,22 @@ except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answe
 
 # Optional FP8 prefill backend, gated by ATOM_USE_FLYDSL_FP8_PREFILL_ATTN.
 try:
-    from aiter.ops.flydsl import flydsl_flash_attn_fp8_func
+    from aiter.ops.flydsl import (
+        flydsl_flash_attn_fp8_func,
+        flydsl_flash_attn_fp8_supported,
+    )
 
     _FLYDSL_FP8_MHA_AVAILABLE = True
 except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
     _FLYDSL_FP8_MHA_AVAILABLE = False
 
-# Import success and support for FP8 output are separate capabilities.
-_FLYDSL_GATHER_FP8_AVAILABLE = _FLYDSL_GATHER_AVAILABLE and {
-    "k_out_scale",
-    "v_out_scale",
-}.issubset(signature(gather_kv_b_proj_flydsl).parameters)
+# Older AITER versions may have BF16 gather without the FP8 capability API.
+try:
+    from aiter.ops.flydsl import gather_kv_b_proj_flydsl_fp8_supported
+
+    _FLYDSL_GATHER_FP8_AVAILABLE = _FLYDSL_GATHER_AVAILABLE
+except Exception:  # noqa: BLE001 -- optional kernel capability
+    _FLYDSL_GATHER_FP8_AVAILABLE = False
 
 
 # MLA Specific Arguments
@@ -620,11 +624,7 @@ class MLAAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.use_flydsl_fp8_prefill_attn = bool(envs.ATOM_USE_FLYDSL_FP8_PREFILL_ATTN)
-        if self.use_flydsl_fp8_prefill_attn and not _FLYDSL_FP8_MHA_AVAILABLE:
-            raise ImportError(
-                "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1 requires "
-                "aiter.ops.flydsl.flydsl_flash_attn_fp8_func"
-            )
+        self._flydsl_fp8_mha_ok: bool | None = None
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = float(scale)
@@ -716,6 +716,7 @@ class MLAAttention(nn.Module):
         # Resolved on the first gather, when the weights and cache exist; see
         # `_kv_b_proj_gather`. None = not asked yet.
         self._flydsl_gather_ok: bool | None = None
+        self._flydsl_gather_fp8_ok: bool | None = None
         if self.use_seg_mla:
             if envs.ATOM_MLA_PAGE_SIZE != _MLA_SEG_PAGE_SIZE:
                 raise RuntimeError(
@@ -991,9 +992,49 @@ class MLAAttention(nn.Module):
         out = tuple(t[..., : self.qk_nope_head_dim] for t in tensors)
         return out if len(out) > 1 else out[0]
 
+    def _check_flydsl_fp8_mha(self, q: torch.Tensor) -> None:
+        """Resolve fixed device/model support before any FP8 preparation.
+
+        Like `_flydsl_gather_ok`, this is cached per layer: projected Q's
+        device, dtype and head layout do not change with sequence lengths.
+        Choosing BF16 here also prevents cached gather from overwriting BF16
+        workspaces with FP8, so the fallback retains the original Q/K/V.
+        """
+        if self._flydsl_fp8_mha_ok is not None:
+            return
+        if not self.use_flydsl_fp8_prefill_attn:
+            self._flydsl_fp8_mha_ok = False
+            return
+        head_dim = self.qk_nope_head_dim if self.rope_is_zero_pad else q.shape[-1]
+        self._flydsl_fp8_mha_ok = (
+            _FLYDSL_FP8_MHA_AVAILABLE
+            and q.dtype == torch.bfloat16
+            # Cached FP8 gather currently retains the synthetic RoPE padding.
+            # Until that tuple is trimmed too, NoPE models use the BF16 path.
+            and not self.rope_is_zero_pad
+            and flydsl_flash_attn_fp8_supported(
+                q.device, q.shape[-2], self.num_heads, head_dim, self.v_head_dim
+            )
+        )
+        if not self._flydsl_fp8_mha_ok and not getattr(
+            MLAAttention, "_fp8_prefill_fallback_logged", False
+        ):
+            MLAAttention._fp8_prefill_fallback_logged = True
+            logger.warning(
+                "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1 requested, but FlyDSL FP8 "
+                "prefill attention is unavailable or unsupported for device=%s, "
+                "dtype=%s, heads=%d, qk_dim=%d, v_dim=%d. "
+                "Falling back to BF16 attention.",
+                q.device,
+                q.dtype,
+                q.shape[-2],
+                head_dim,
+                self.v_head_dim,
+            )
+
     def _prepare_prefill_k(self, k_nope, k_rope):
         """Keep K split for FP8 quantization; materialize it for BF16 attention."""
-        if self.use_flydsl_fp8_prefill_attn:
+        if self._flydsl_fp8_mha_ok:
             return k_nope, None if self.rope_is_zero_pad else k_rope
         return (
             torch.cat((k_nope, k_rope.expand((*k_nope.shape[:-1], -1))), dim=-1),
@@ -1023,8 +1064,9 @@ class MLAAttention(nn.Module):
         """Dispatch MLA prefill to FP8 FlyDSL or AITER varlen attention.
 
         FlyDSL uses bottom-right causal masking and returns natural-log FP32
-        LSE in [heads, total_q] layout. When enabled, invalid inputs and kernel
-        failures propagate to the caller. Otherwise use AITER varlen attention.
+        LSE in [heads, total_q] layout. Unsupported device/model configurations
+        select BF16 before quantization. Per-call validation and kernel
+        execution failures still propagate; there is no retry after launch.
 
         ``q_fp8`` reuses ``(q8, q_descale)`` across cached chunks. ``kv_fp8``
         supplies ``(k8, v8, k_descale, v_descale)`` from FP8 gather and skips
@@ -1032,7 +1074,7 @@ class MLAAttention(nn.Module):
         ``k_rope`` supplies the separate RoPE columns when K has not been
         concatenated yet; the fused QKV quantizer joins them directly in FP8.
         """
-        if self.use_flydsl_fp8_prefill_attn:
+        if self._flydsl_fp8_mha_ok:
             # The direct AITER FP8 API has no dropout argument.
             if dropout_p != 0.0:
                 raise ValueError("FlyDSL FP8 prefill attention requires dropout_p=0")
@@ -1072,7 +1114,7 @@ class MLAAttention(nn.Module):
             )
 
         if kv_fp8 is not None:
-            raise ValueError("FP8 K/V require ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1")
+            raise ValueError("FP8 K/V require a supported FlyDSL FP8 prefill backend")
         return flash_attn_varlen_func(
             q=q,
             k=k,
@@ -1487,6 +1529,7 @@ class MLAAttention(nn.Module):
         """Legacy single-pass path: gather the full cached+new context into
         k_full / v_full and run one flash_attn. OOMs on long contexts (peak
         ≈ total_kv × heads × (qk_dim + v_dim) × dtype)."""
+        self._check_flydsl_fp8_mha(prefill_q)
         k_full = torch.empty(
             (
                 attn_metadata.total_kv,
@@ -1610,6 +1653,7 @@ class MLAAttention(nn.Module):
             if self._flydsl_gather_ok:
                 fp8_outputs = (
                     _FLYDSL_GATHER_FP8_AVAILABLE
+                    and self._flydsl_gather_fp8_ok is not False
                     and kv_out_scales is not None
                     and all(
                         t.dtype == torch.bfloat16 and t.is_contiguous()
@@ -1619,14 +1663,29 @@ class MLAAttention(nn.Module):
                 k_gather, v_gather = k_out, v_out
                 out_kwargs = {}
                 if fp8_outputs:
-                    k_gather, v_gather = (
+                    k_fp8, v_fp8 = (
                         t.view(torch.float8_e4m3fn).view(-1)[: t.numel()].view(t.shape)
                         for t in (k_out, v_out)
                     )
-                    out_kwargs = {
-                        "k_out_scale": kv_out_scales[0],
-                        "v_out_scale": kv_out_scales[1],
-                    }
+                    if self._flydsl_gather_fp8_ok is None:
+                        self._flydsl_gather_fp8_ok = (
+                            gather_kv_b_proj_flydsl_fp8_supported(
+                                kv_buffer,
+                                gather_weight,
+                                weight_scale,
+                                k_fp8,
+                                v_fp8,
+                                k_out_scale=kv_out_scales[0],
+                                v_out_scale=kv_out_scales[1],
+                            )
+                        )
+                    fp8_outputs = self._flydsl_gather_fp8_ok
+                    if fp8_outputs:
+                        k_gather, v_gather = k_fp8, v_fp8
+                        out_kwargs = {
+                            "k_out_scale": kv_out_scales[0],
+                            "v_out_scale": kv_out_scales[1],
+                        }
                 gather_kv_b_proj_flydsl(
                     kv_buffer,
                     self._k_scale,
@@ -1685,6 +1744,8 @@ class MLAAttention(nn.Module):
         """
         from atom.model_ops.attentions.triton_merge_attn_states import merge_attn_states
 
+        self._check_flydsl_fp8_mha(prefill_q)
+
         # Trigger counter: log first hit + every 500th to confirm the chunked
         # path is actually exercised (not silently bypassed when
         # has_cached=True but cached prefix < CHUNK_TOKENS for every seq).
@@ -1718,7 +1779,7 @@ class MLAAttention(nn.Module):
         q_fp8 = None
         new_kv_fp8 = None
         kv_out_scales = None
-        if self.use_flydsl_fp8_prefill_attn:
+        if self._flydsl_fp8_mha_ok:
             q8, k8, v8, qs, ks, vs, gather_ks, gather_vs = fused_qkv_per_tensor_quant(
                 prefill_q, k_new, v_new, k_rope=quant_k_rope
             )
@@ -1979,6 +2040,7 @@ class MLAAttention(nn.Module):
         attn_metadata: AttentionMetaData,
     ) -> torch.Tensor:
         assert attn_metadata is not None
+        self._check_flydsl_fp8_mha(q)
 
         if k_rope.dim() == 2:
             k_rope = k_rope.unsqueeze(1)
