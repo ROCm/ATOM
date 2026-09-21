@@ -781,18 +781,26 @@ class MLAAttention(nn.Module):
         self.qrep_enabled = qrep_enabled_for_layer(
             wants_qrep, self.q_proj, self.qrep_num_heads, self.qk_head_dim
         )
-        if (
-            wants_qrep
-            and not self.qrep_enabled
-            and not getattr(MLAAttention, "_qrep_not_widened_logged", False)
-        ):
-            MLAAttention._qrep_not_widened_logged = True
-            logger.warning(
-                "dcp_config.enable_query_replication is on, but this layer's "
-                "q_proj was not built with qrep_tp_override (e.g. an eagle3 / "
-                "DSpark draft, or a model that has not wired QREP support) -- "
-                "falling back to AllGather Q for it."
-            )
+        # Dedup key is per layer_num, not a single once-flag: otherwise one
+        # draft layer's fallback would permanently mask a later target-layer
+        # fallback (a real regression) from ever being logged.
+        qrep_logged_layers = getattr(MLAAttention, "_qrep_logged_layers", frozenset())
+        if wants_qrep and self.layer_num not in qrep_logged_layers:
+            MLAAttention._qrep_logged_layers = qrep_logged_layers | {self.layer_num}
+            if self.qrep_enabled:
+                logger.info(
+                    "dcp_config.enable_query_replication is on and active for "
+                    "layer %d (q_proj built with qrep_tp_override).",
+                    self.layer_num,
+                )
+            else:
+                logger.warning(
+                    "dcp_config.enable_query_replication is on, but layer %d's "
+                    "q_proj was not built with qrep_tp_override (e.g. an "
+                    "eagle3 / DSpark draft, or a model that has not wired QREP "
+                    "support) -- falling back to AllGather Q for it.",
+                    self.layer_num,
+                )
         if self.qrep_enabled:
             assert self.qrep_num_heads >= _MLA_MIN_HEADS, (
                 "DCP query replication requires the DCP-group head set "
