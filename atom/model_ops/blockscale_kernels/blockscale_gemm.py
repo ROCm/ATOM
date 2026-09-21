@@ -2,10 +2,9 @@
 """Group32 GEMMs against native FP8 or packed FP4 weights.
 
 Both take E4M3 activations with E8M0 group scales, accumulate in FP32, and
-index the weight scale grid rather than expanding it. Two kernels rather
-than one: FP8 hands its codes to the microscaling MFMA and spans several
-scale groups per tile, FP4 has to unpack and scale a single group by hand,
-and folding both into one body duplicated the pointer bookkeeping.
+index the compact weight scale grid. FP8 uses microscaling MFMA; its small-M
+variant packs K panels into matrix rows/columns to avoid a split-K reduction.
+FP4 unpacks and scales one group at a time through a BF16 MFMA.
 """
 
 import triton
@@ -74,6 +73,80 @@ def blockscale_gemm_fp8_kernel(
         acc = tl.dot_scaled(a, a_code, "e4m3", b.T, b_code, "e4m3", acc=acc)
     tl.store(
         C + split * M * N + row[:, None] * N + col[None, :], acc, rows & cols[None, :]
+    )
+
+
+@triton.jit(do_not_specialize=["M"])
+def blockscale_gemm_fp8_packed_kernel(
+    A,
+    B,
+    AS,
+    BS,
+    C,
+    M,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    PACK: tl.constexpr,
+):
+    """Small-M group32 GEMM with K panels packed into MFMA rows/columns.
+
+    Each packed row/column retains its own E8M0 scales. Only matching panel
+    pairs contribute to the output; cross-panel products are discarded. One
+    CTA owns the full K reduction, so no partial buffer or second launch is
+    needed. BM is an unpacked token tile, independent of runtime M.
+    """
+    tl.static_assert(PACK == 1 or PACK == 2 or PACK == 4)
+    tl.static_assert(BM * PACK >= 16)
+    tl.static_assert(BK >= 128 and BK % 32 == 0)
+    rows = tl.program_id(0) * BM + tl.arange(0, BM * PACK) // PACK
+    a_panel = tl.arange(0, BM * PACK) % PACK
+    cols = tl.program_id(1) * BN + tl.arange(0, BN * PACK) // PACK
+    b_panel = tl.arange(0, BN * PACK) % PACK
+    ks = tl.arange(0, BK)
+    gs = tl.arange(0, BK // 32)
+    groups: tl.constexpr = K // 32
+    acc = tl.zeros((BM * PACK, BN * PACK), tl.float32)
+    for base in range(0, K, BK * PACK):
+        ak = base + a_panel[:, None] * BK + ks[None, :]
+        bk = base + b_panel[:, None] * BK + ks[None, :]
+        a = tl.load(
+            A + rows[:, None] * K + ak,
+            (rows[:, None] < M) & (ak < K),
+            other=0.0,
+        )
+        b = tl.load(
+            B + cols[:, None] * K + bk,
+            (cols[:, None] < N) & (bk < K),
+            other=0.0,
+        )
+        ag = base // 32 + a_panel[:, None] * (BK // 32) + gs[None, :]
+        bg = base // 32 + b_panel[:, None] * (BK // 32) + gs[None, :]
+        a_code = tl.load(
+            AS + rows[:, None] * groups + ag,
+            (rows[:, None] < M) & (ag < groups),
+            other=127,
+        )
+        b_code = tl.load(
+            BS + (cols[:, None] // 32) * groups + bg,
+            (cols[:, None] < N) & (bg < groups),
+            other=127,
+        )
+        acc = tl.dot_scaled(a, a_code, "e4m3", b.T, b_code, "e4m3", acc=acc)
+    panels = acc.reshape(BM, PACK, BN, PACK).trans(0, 2, 1, 3)
+    pair = tl.arange(0, PACK)
+    diagonal = tl.where(
+        pair[None, None, :, None] == pair[None, None, None, :], panels, 0.0
+    )
+    output = tl.sum(tl.sum(diagonal, 3), 2)
+    row = tl.program_id(0) * BM + tl.arange(0, BM)
+    col = tl.program_id(1) * BN + tl.arange(0, BN)
+    tl.store(
+        C + row[:, None] * N + col[None, :],
+        output,
+        (row[:, None] < M) & (col[None, :] < N),
     )
 
 

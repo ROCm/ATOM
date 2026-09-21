@@ -11,10 +11,12 @@ import functools
 
 import torch
 import triton
+from aiter.jit.utils.chip_info import get_gfx
 
 from .blockscale_kernels.blockscale_gemm import (
     blockscale_gemm_fp4_kernel,
     blockscale_gemm_fp8_kernel,
+    blockscale_gemm_fp8_packed_kernel,
 )
 from .blockscale_kernels.quantization import quantize_fp4_kernel, quantize_fp8_kernel
 
@@ -163,7 +165,9 @@ def _select_fp8_tile(m: int, n: int, k: int):
     the small tile, because a 128-wide one leaves 80 workgroups of 256.
     """
     if m <= 16:
-        return 16, 32, 512, 2, 2
+        # Deep, wide weights already fill the GPU without split-K; a shorter
+        # K tile reduces the live operand footprint.
+        return 16, 32, 256 if n * k >= 2**27 else 512, 2, 2
     if m <= 64:
         # A wide, deep weight has enough work per output tile to pay for a
         # square one this early; kv_a and wq_a at m=32 do not.
@@ -180,6 +184,31 @@ def _select_fp8_tile(m: int, n: int, k: int):
     return 128, 128, 256, 4, 1
 
 
+def _select_fp8_packed_tile(m: int, n: int, k: int):
+    """(BM, BN, BK, PACK) where a full-K CTA beats split-K on gfx950.
+
+    Narrow N still needs split-K to occupy the GPU. Large M or deep weights
+    need the original kernel's tiling; only short reductions pay for packing
+    beyond 16 tokens. These bands keep M a runtime argument in both kernels.
+    """
+    if m > 32 or n < 2048 or k > 6144 or n * k >= 2**27:
+        return None
+    if m > 16:
+        return (32, 32, 256, 1) if k <= 2048 and n <= 6144 else None
+    if k <= 1024:
+        return 16, 32, 256, 1
+    if k <= 2048:
+        if n >= 32768 and m > 4:
+            return None
+        pack = 4 if m <= 4 else 2
+        bn = 32 if m <= 4 and (n >= 8192 or k == 2048) else 16
+        return max(16 // pack, triton.next_power_of_2(m)), bn, 256, pack
+    if k > 4096 and m > 4:
+        return None
+    pack = 4 if m <= 4 else 2
+    return max(16 // pack, triton.next_power_of_2(m)), 16, 512, pack
+
+
 def native_quant_linear(
     x,
     weight,
@@ -193,8 +222,8 @@ def native_quant_linear(
     """FP8 32x32/1x32 or W4A8 1x32 GEMM; inputs and weights stay native.
 
     Weight scales remain compact. FP8 goes through the microscaling MFMA, W4A8
-    unpacks to BF16 for a plain one; both accumulate in FP32 through the
-    split-K reduction to the requested output conversion. A8 QAT and native
+    unpacks to BF16 for a plain one; both accumulate in FP32 before the
+    requested output conversion. A8 QAT and native
     weight storage are retained without materializing a dequantized weight.
     """
     if x.ndim < 2 or weight.ndim != 2 or dtype not in (torch.bfloat16, torch.float32):
@@ -236,6 +265,34 @@ def native_quant_linear(
     output = torch.empty((*x.shape[:-1], n), device=x.device, dtype=dtype)
     if m == 0:
         return output
+    packed_tile = (
+        _select_fp8_packed_tile(m, n, k)
+        if not fp4
+        and weight_group_rows == 32
+        and split_k is None
+        and get_gfx() == "gfx950"
+        else None
+    )
+    if packed_tile is not None:
+        bm, bn, bk, pack = packed_tile
+        blockscale_gemm_fp8_packed_kernel[(-(-m // bm), -(-n // bn))](
+            x,
+            weight,
+            x_scale.view(torch.uint8),
+            weight_scale.view(torch.uint8),
+            output,
+            m,
+            n,
+            k,
+            bm,
+            bn,
+            bk,
+            pack,
+            num_warps=2,
+            num_stages=2,
+            matrix_instr_nonkdim=16,
+        )
+        return output
     if fp4:
         bm, bn, bk, warps, stages = (16 if m <= 16 else 32), 64, 32, 4, 2
     else:
@@ -247,8 +304,8 @@ def native_quant_linear(
     slice_k = -(-k // splits)
     part_k = -(-slice_k // bk) * bk
     splits = -(-k // part_k)
-    # Folding the reduction into the kernel costs more than the extra launch:
-    # see the split-K note in the module docstring.
+    # Outside the packed path, split-K supplies enough independent work to
+    # offset the extra reduction launch.
     partial = (
         output
         if splits == 1
