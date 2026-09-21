@@ -455,6 +455,8 @@ class Glm5NextMoE(nn.Module):
         # GLM clamps gate/up inside the expert SwiGLU; aiter bakes the limit into
         # the GEMM1 kernel when the layer carries this attribute.
         self.experts.swiglu_limit = self.swiglu_limit
+        self.experts.swiglu_alpha = 1.0
+        self.experts.swiglu_up_offset = 0.0
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -546,7 +548,9 @@ class Glm5NextKDAAttention(KimiKDAAttention):
         assert g.shape == (
             lp,
             self.hidden_size,
-        ), f"folded KDA gate has shape {tuple(g.shape)}, expected {(lp, self.hidden_size)}"
+        ), (
+            f"folded KDA gate has shape {tuple(g.shape)}, expected {(lp, self.hidden_size)}"
+        )
         self.in_proj.weight.data[3 * lp : 4 * lp].copy_(g)
         # Release the factors; they are never used again.
         for m in (self.g_a_proj, self.g_b_proj):
@@ -1193,6 +1197,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
     # consuming VRAM with unreachable randomly-risky code.
     weights_mapping: ClassVar[dict[str, str]] = {
         "model.language_model.": "model.",
+        # Model-neutral IQ2R overlay v2 stores one fused data/auxiliary tensor
+        # per routed projection instead of thousands of per-expert FP8 tensors.
+        ".experts.iq2r_gate_up_data": ".experts.w13_weight",
+        ".experts.iq2r_gate_up_auxiliary": ".experts.w13_weight_scale",
+        ".experts.iq2r_down_data": ".experts.w2_weight",
+        ".experts.iq2r_down_auxiliary": ".experts.w2_weight_scale",
         # The checkpoint stores this projection as a bare matrix parameter.
         "index_kpool_compress_gate": "index_kpool_compress_gate.weight",
     }

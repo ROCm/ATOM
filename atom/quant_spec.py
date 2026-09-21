@@ -278,20 +278,51 @@ class Iq2rParser(QuantConfigParser):
     def parse(self, hf_quant_config: dict) -> ParsedQuantConfig:
         schema = hf_quant_config.get("schema")
         schema_version = hf_quant_config.get("schema_version")
-        if schema != "aiter-gpt-oss-iq2r-overlay" or schema_version != 1:
+        if schema == "aiter-gpt-oss-iq2r-overlay" and schema_version == 1:
+            return ParsedQuantConfig(
+                global_spec=LayerQuantConfig(
+                    quant_type=QuantType.iq2r_2bit,
+                    quant_dtype=torch.uint8,
+                    is_dynamic=False,
+                    quant_method="iq2r",
+                ),
+                exclude_layers=list(
+                    hf_quant_config.get("modules_to_not_convert") or []
+                ),
+            )
+        if schema != "aiter-iq2r-overlay" or schema_version != 2:
             raise ValueError(
                 "unsupported IQ2R overlay contract: expected "
-                "schema='aiter-gpt-oss-iq2r-overlay', schema_version=1; "
+                "the legacy GPT-OSS v1 schema or "
+                "schema='aiter-iq2r-overlay', schema_version=2; "
                 f"got schema={schema!r}, schema_version={schema_version!r}"
             )
+
+        base_config = hf_quant_config.get("base_quantization_config") or {}
+        if not isinstance(base_config, dict):
+            raise TypeError("base_quantization_config must be a JSON object")
+        base_method = str(base_config.get("quant_method") or "_generic")
+        if base_method == "iq2r":
+            raise ValueError("an IQ2R overlay cannot use IQ2R as its base format")
+        base = get_quant_parser(base_method).parse(base_config)
+        patterns = hf_quant_config.get("iq2r_modules") or ["model.layers.*.mlp.experts"]
+        if not isinstance(patterns, list) or not all(
+            isinstance(pattern, str) and pattern for pattern in patterns
+        ):
+            raise TypeError("iq2r_modules must be a list of non-empty patterns")
+        iq2r_spec = LayerQuantConfig(
+            quant_type=QuantType.iq2r_2bit,
+            quant_dtype=torch.uint8,
+            is_dynamic=False,
+            quant_method="iq2r",
+        )
         return ParsedQuantConfig(
-            global_spec=LayerQuantConfig(
-                quant_type=QuantType.iq2r_2bit,
-                quant_dtype=torch.uint8,
-                is_dynamic=False,
-                quant_method="iq2r",
-            ),
-            exclude_layers=list(hf_quant_config.get("modules_to_not_convert") or []),
+            global_spec=base.global_spec,
+            layer_pattern_specs=[
+                *((pattern, iq2r_spec) for pattern in patterns),
+                *base.layer_pattern_specs,
+            ],
+            exclude_layers=list(base.exclude_layers),
         )
 
 
@@ -443,7 +474,7 @@ class GenericParser(QuantConfigParser):
         # checkpoint, so the activation quant is NOT dynamic (load the scales);
         # `dynamic` (or unspecified) quantizes activations at runtime.
         act_scheme = (hf_quant_config.get("activation_scheme") or "").lower()
-        default_dynamic = False if act_scheme == "static" else True
+        default_dynamic = act_scheme != "static"
         is_dynamic = hf_quant_config.get("is_dynamic", default_dynamic)
         # Each quantizer uses a different key for excluded layers:
         # Quark -> "exclude", compressed-tensors -> "ignore",

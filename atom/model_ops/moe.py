@@ -3,12 +3,12 @@
 
 import logging
 import os
-from pathlib import Path
 from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
+from pathlib import Path
 
 import torch
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
@@ -1018,7 +1018,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
 
 
 class Iq2rMoEMethod(FusedMoEMethodBase):
-    """GPT-OSS TP1 adapter for AITER-owned native-basis IQ2R experts."""
+    """TP1 adapter for AITER-owned native-basis IQ2R experts."""
 
     # GPT-OSS uses this existing capability flag only to skip its MXFP4-specific
     # gate/up rewrite. IQ2R itself executes through AITER HIP kernels.
@@ -1030,7 +1030,7 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
         super().__init__(moe)
         self.quant_config = quant_config
         self.output_hidden_size = moe.hidden_dim
-        self._workspaces: dict[tuple[torch.device, int], object] = {}
+        self._workspaces: dict[tuple[torch.device, int, int, int, int], object] = {}
 
     def create_weights(
         self,
@@ -1044,23 +1044,28 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
         del params_dtype
         parallel = self.moe.moe_parallel_config
         if parallel.tp_size != 1 or parallel.ep_size != 1:
-            raise NotImplementedError("IQ2R currently supports GPT-OSS TP1/EP1 only")
-        if (
-            num_experts != 128
-            or hidden_size != 2880
-            or intermediate_size_per_partition != 2880
-            or self.moe.experts_per_token != 4
-        ):
-            raise ValueError(
-                "IQ2R requires GPT-OSS dimensions E=128, topk=4, "
-                "hidden=intermediate=2880"
-            )
+            raise NotImplementedError("IQ2R currently supports TP1/EP1 only")
+        if num_experts <= 0 or num_experts > 512:
+            raise ValueError("IQ2R requires between 1 and 512 routed experts")
 
-        from aiter.ops.iq2r_format import iq2r_gpt_oss_metadata
+        from aiter.ops.iq2r_format import IQ2RMetadata
 
-        gate_metadata = iq2r_gpt_oss_metadata("gate_up")
-        down_metadata = iq2r_gpt_oss_metadata("down")
-        parameters = (
+        gate_metadata = IQ2RMetadata(
+            logical_n=2 * intermediate_size_per_partition,
+            logical_k=hidden_size,
+        )
+        down_metadata = IQ2RMetadata(
+            logical_n=hidden_size,
+            logical_k=intermediate_size_per_partition,
+        )
+        self.num_experts = num_experts
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size_per_partition
+        layer.iq2r_gate_up_metadata = gate_metadata
+        layer.iq2r_down_metadata = down_metadata
+        layer.iq2r_gate_up_tile_n = 128 if gate_metadata.logical_n % 128 == 0 else 64
+        layer.iq2r_down_tile_n = 128 if down_metadata.logical_n % 128 == 0 else 64
+        parameters: list[tuple[str, torch.nn.Parameter]] = [
             (
                 "w13_weight",
                 atom_parameter(
@@ -1095,19 +1100,37 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
                     )
                 ),
             ),
-            (
-                "w13_bias",
-                atom_parameter(torch.empty((num_experts, 5760), dtype=torch.bfloat16)),
-            ),
-            (
-                "w2_bias",
-                atom_parameter(torch.empty((num_experts, 2880), dtype=torch.bfloat16)),
-            ),
-        )
+        ]
+        if layer.has_bias:
+            parameters.extend(
+                [
+                    (
+                        "w13_bias",
+                        atom_parameter(
+                            torch.empty(
+                                (num_experts, gate_metadata.logical_n),
+                                dtype=torch.bfloat16,
+                            )
+                        ),
+                    ),
+                    (
+                        "w2_bias",
+                        atom_parameter(
+                            torch.empty(
+                                (num_experts, down_metadata.logical_n),
+                                dtype=torch.bfloat16,
+                            )
+                        ),
+                    ),
+                ]
+            )
         for name, parameter in parameters:
             layer.register_parameter(name, parameter)
             set_weight_attrs(parameter, extra_weight_attrs)
             parameter.iq2r_name = name
+        if not layer.has_bias:
+            layer.register_parameter("w13_bias", None)
+            layer.register_parameter("w2_bias", None)
 
     def load_weight(
         self,
@@ -1127,43 +1150,49 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         from aiter.iq2r_moe import IQ2RMoeWorkspace
         from aiter.ops.iq2r_format import (
-            iq2r_gpt_oss_metadata,
             iq2r_validate_expert_weights,
         )
 
-        layer.iq2r_gate_up_metadata = iq2r_gpt_oss_metadata("gate_up")
-        layer.iq2r_down_metadata = iq2r_gpt_oss_metadata("down")
         iq2r_validate_expert_weights(
             layer.w13_weight,
             layer.w13_weight_scale,
             layer.iq2r_gate_up_metadata,
-            expert_count=128,
+            expert_count=self.num_experts,
         )
         iq2r_validate_expert_weights(
             layer.w2_weight,
             layer.w2_weight_scale,
             layer.iq2r_down_metadata,
-            expert_count=128,
+            expert_count=self.num_experts,
         )
-        if layer.w13_bias.dtype != torch.bfloat16 or tuple(layer.w13_bias.shape) != (
-            128,
-            5760,
+        if layer.w13_bias is not None and (
+            layer.w13_bias.dtype != torch.bfloat16
+            or tuple(layer.w13_bias.shape)
+            != (self.num_experts, layer.iq2r_gate_up_metadata.logical_n)
         ):
-            raise ValueError("IQ2R gate-up bias must be BF16 [128,5760]")
-        if layer.w2_bias.dtype != torch.bfloat16 or tuple(layer.w2_bias.shape) != (
-            128,
-            2880,
+            raise ValueError("IQ2R gate-up bias has an invalid dtype or shape")
+        if layer.w2_bias is not None and (
+            layer.w2_bias.dtype != torch.bfloat16
+            or tuple(layer.w2_bias.shape)
+            != (self.num_experts, layer.iq2r_down_metadata.logical_n)
         ):
-            raise ValueError("IQ2R down bias must be BF16 [128,2880]")
+            raise ValueError("IQ2R down bias has an invalid dtype or shape")
 
-        layer.iq2r_gate_up_tile_n = 128
-        layer.iq2r_down_tile_n = 64
-        key = (layer.w13_weight.device, self.moe.experts_per_token)
+        key = (
+            layer.w13_weight.device,
+            self.moe.experts_per_token,
+            self.num_experts,
+            self.hidden_size,
+            self.intermediate_size,
+        )
         if key not in self._workspaces:
             self._workspaces[key] = IQ2RMoeWorkspace.allocate(
                 self.moe.max_num_tokens,
                 self.moe.experts_per_token,
                 device=layer.w13_weight.device,
+                max_experts=self.num_experts,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
             )
 
     def get_fused_moe_quant_config(
@@ -1198,31 +1227,28 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
         norm_epsilon: float = 1e-5,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if activation != ActivationType.Swiglu:
-            raise ValueError("IQ2R GPT-OSS requires SwiGLU activation")
-        if use_grouped_topk or custom_routing_function is not None:
-            raise NotImplementedError("IQ2R GPT-OSS supports flat top-k routing only")
+            raise ValueError("IQ2R requires SwiGLU activation")
         if expert_map is not None or self.moe.moe_parallel_config.use_ep:
-            raise NotImplementedError(
-                "IQ2R GPT-OSS does not yet support expert parallelism"
-            )
+            raise NotImplementedError("IQ2R does not yet support expert parallelism")
         if apply_router_weight_on_input:
             raise NotImplementedError(
-                "IQ2R GPT-OSS applies router weights after the down projection"
+                "IQ2R applies router weights after the down projection"
             )
-        if top_k != 4 or global_num_experts != 128:
-            raise ValueError("IQ2R GPT-OSS requires 128 experts and top-k 4")
-        if router_bias is not None:
-            if x.shape[0] > 8:
-                raise ValueError("IQ2R router-bias deferral is available only for M<=8")
-            if (
-                router_bias.dtype != torch.bfloat16
-                or tuple(router_bias.shape) != (128,)
-                or router_bias.device != router_logits.device
-                or not router_bias.is_contiguous()
-            ):
-                raise ValueError("IQ2R router bias must be contiguous BF16 [128]")
+        if top_k <= 0 or global_num_experts != self.num_experts:
+            raise ValueError(
+                f"IQ2R expected {self.num_experts} experts and a positive top-k"
+            )
+        if router_bias is not None and (
+            router_bias.dtype != torch.bfloat16
+            or tuple(router_bias.shape) != (self.num_experts,)
+            or router_bias.device != router_logits.device
+            or not router_bias.is_contiguous()
+        ):
+            raise ValueError(
+                f"IQ2R router bias must be contiguous BF16 [{self.num_experts}]"
+            )
 
-        logical_hidden_size = layer.w2_bias.shape[-1]
+        logical_hidden_size = layer.iq2r_down_metadata.logical_n
         if x.shape[-1] < logical_hidden_size:
             raise ValueError(
                 "IQ2R hidden state is narrower than its checkpoint contract: "
@@ -1236,13 +1262,27 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
 
         from aiter.iq2r_moe import IQ2RMoeWorkspace
 
-        key = (x.device, top_k)
-        workspace = self._workspaces.get(key)
-        if workspace is None:
-            workspace = IQ2RMoeWorkspace.allocate(
-                self.moe.max_num_tokens, top_k, device=x.device
-            )
-            self._workspaces[key] = workspace
+        key = (
+            x.device,
+            top_k,
+            self.num_experts,
+            self.hidden_size,
+            self.intermediate_size,
+        )
+
+        def get_workspace() -> IQ2RMoeWorkspace:
+            workspace = self._workspaces.get(key)
+            if workspace is None:
+                workspace = IQ2RMoeWorkspace.allocate(
+                    self.moe.max_num_tokens,
+                    top_k,
+                    device=x.device,
+                    max_experts=self.num_experts,
+                    hidden_size=self.hidden_size,
+                    intermediate_size=self.intermediate_size,
+                )
+                self._workspaces[key] = workspace
+            return workspace
 
         # Decode is launch-bound at M<=16. Let AITER compute top-k, task
         # metadata, and input MXFP8 quantization in one launch. M<=4 uses direct
@@ -1251,6 +1291,10 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
         # observable routing tensors remain available before MoE runs.
         use_fused_router = (
             x.shape[0] <= 16
+            and self.num_experts == 128
+            and top_k == 4
+            and not use_grouped_topk
+            and custom_routing_function is None
             and scoring_func == "softmax"
             and renormalize
             and e_score_correction_bias is None
@@ -1261,6 +1305,7 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
             and _PROFILE_MOE_ABLATION != "experts"
         )
         if use_fused_router:
+            workspace = get_workspace()
             topk_weights = workspace.topk_weights[: x.shape[0]]
             topk_ids = workspace.topk_ids[: x.shape[0]]
         else:
@@ -1301,6 +1346,8 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
                 hidden_size=logical_hidden_size,
             )
 
+        workspace = get_workspace()
+
         if residual is not None:
             if norm_weight is None:
                 raise ValueError("norm_weight is required with IQ2R fused residual")
@@ -1328,6 +1375,9 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
                 renormalize=renormalize,
                 norm_epsilon=norm_epsilon,
                 norm_block_size=1024,
+                swiglu_limit=float(getattr(layer, "swiglu_limit", 7.0)),
+                swiglu_alpha=float(getattr(layer, "swiglu_alpha", 1.702)),
+                swiglu_up_offset=float(getattr(layer, "swiglu_up_offset", 1.0)),
             )
 
         return fused_moe(
@@ -1340,9 +1390,9 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
             quant_type=QuantType.iq2r_2bit,
             bias1=layer.w13_bias,
             bias2=layer.w2_bias,
-            swiglu_limit=7.0,
-            beta=1.702,
-            linear_beta=1.0,
+            swiglu_limit=float(getattr(layer, "swiglu_limit", 7.0)),
+            beta=float(getattr(layer, "swiglu_alpha", 1.702)),
+            linear_beta=float(getattr(layer, "swiglu_up_offset", 1.0)),
             iq2r_w1_auxiliary=layer.w13_weight_scale,
             iq2r_w2_auxiliary=layer.w2_weight_scale,
             iq2r_w1_metadata=layer.iq2r_gate_up_metadata,
@@ -5317,7 +5367,7 @@ class FusedMoE(torch.nn.Module):
             norm_epsilon=norm_epsilon,
         )
         if not isinstance(result, tuple):
-            raise RuntimeError("IQ2R fused add/RMSNorm did not return both outputs")
+            raise TypeError("IQ2R fused add/RMSNorm did not return both outputs")
         return result
 
     def forward_iq2r_impl(
@@ -5349,9 +5399,7 @@ class FusedMoE(torch.nn.Module):
             prefix=f"{self.prefix}.fused_moe",
         )
         if isinstance(result, tuple):
-            raise RuntimeError(
-                "ordinary IQ2R MoE unexpectedly returned fused norm output"
-            )
+            raise TypeError("ordinary IQ2R MoE unexpectedly returned fused norm output")
         return result
 
     def forward_iq2r_with_router(
