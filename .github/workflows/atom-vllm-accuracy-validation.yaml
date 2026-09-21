@@ -978,6 +978,8 @@ jobs:
             MODEL_CACHE_ROOT="/mnt/dcgpuval"
           elif [ -d "/shared/data/WRH/models" ]; then
             MODEL_CACHE_ROOT="/shared/data/WRH/models"
+          elif [ -d "/shared_nfs/models" ]; then
+            MODEL_CACHE_ROOT="/shared_nfs/models"
           elif [ -d "/it-share/models" ]; then
             MODEL_CACHE_ROOT="/it-share/models"
           elif [ -d "/models" ]; then

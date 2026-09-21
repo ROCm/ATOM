@@ -88,7 +88,7 @@ runs:
         fi
 
         MODEL_HOST_ROOT=""
-        for d in /shared_nfs/huggingface_models /models /data/models; do
+        for d in /shared_nfs/huggingface_models /shared_nfs/models /models /data/models; do
           if [ -d "$d" ]; then
             MODEL_HOST_ROOT="$d"
             break
