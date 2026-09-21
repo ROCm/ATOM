@@ -369,14 +369,17 @@ below), so this covers the sparse indexer side; dense MLA + `cprr` + QREP
 rests on the code-reading argument above and has not been independently
 re-run.
 
-Layers whose `q_proj` was not built with the QREP override — **eagle3** and
-**DSpark** draft models build their own `q_proj` independently of the target
-model and do not opt in — fall back to AllGather automatically per layer
-(logged once as `enable_query_replication is on, but this layer's q_proj was
-not built with qrep_tp_override`), regardless of the global flag.
+A layer whose `q_proj` was not built with the QREP override falls back to
+AllGather automatically instead of misreading a narrow q as the wide QREP
+layout, regardless of the global flag — target models, MTP, eagle3, and
+DSpark are all wired today, so this is a safety net for a future model that
+isn't. Each layer logs once, either
+`enable_query_replication is on and active for layer N` (wired) or
+`... but layer N's q_proj was not built with qrep_tp_override ... falling
+back to AllGather Q for it` (not wired).
 
-Check the server log for `query_replication disabled: ...` to see whether it
-actually took effect; the flag being `true` is not the same as QREP running.
+Check the server log for that per-layer message to see whether QREP actually
+took effect — the flag being `true` is not the same as QREP running.
 
 Note it costs KV budget: replicating the query heads shrinks the KV pool by
 roughly 5% (measured on DeepSeek-R1 tp8/dcp8: 235 016 → 221 020 blocks).

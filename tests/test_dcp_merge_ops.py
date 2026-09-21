@@ -45,6 +45,7 @@ import torch
 # run on the CPU gate.
 from atom.config import (
     DCPConfig,
+    mla_dcp_sparse_prefill_is_persistent,
     qrep_enabled_for_layer,
     qrep_unsupported_reason,
     q_proj_is_qrep_widened,
@@ -62,7 +63,6 @@ try:
         _MLA_DCP_SPARSE_PREFILL_WIDTHS,
         _MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT,
         mla_dcp_kernel_num_heads,
-        mla_dcp_sparse_prefill_is_persistent,
         mla_dcp_sparse_prefill_num_heads,
     )
     from atom.model_ops.dcp_ops import (
@@ -1260,11 +1260,10 @@ def test_sparse_prefill_width_matches_its_own_persistence_predicate(
 ):
     """The pairing this whole file exists for.
 
-    The width must come from the table for the mode ``_forward_prefill_mla``
-    will actually run in -- which is NOT decode's mode, because the two call
-    sites switch on different conditions. Reading decode's answer here is
-    exactly how a sparse prefill would get its width chosen for one mode and
-    then run in the other.
+    The width must come from this call site's own table
+    (``_MLA_DCP_SPARSE_PREFILL_WIDTHS*``), not decode's -- reading decode's
+    answer here is exactly how a sparse prefill would get its width chosen
+    from the wrong table.
     """
     persistent = mla_dcp_sparse_prefill_is_persistent(
         dcp, True, sparse_metadata_rebuild=rebuild
@@ -1285,16 +1284,12 @@ def test_sparse_prefill_width_matches_its_own_persistence_predicate(
         assert w != 64, "non-persistent sparse prefill must not dispatch gqa=64"
 
 
-@needs_dcp_ops
 def test_sparse_prefill_persistence_does_not_look_at_dtype():
-    """Was gated on KV cache dtype (fp8-only); traced back to a single commit
-    that bundled it with two other, genuinely fp8-only guards (the q/kv
-    quantization scales) while first extending this call path from fp8-only to
-    bf16 -- nothing ties the work metadata itself to dtype (see
-    mla_dcp_sparse_prefill_is_persistent's docstring, and
-    DCP_Further_Optimization2.md §2.8). A value assertion would not catch a
-    dtype parameter re-added as an optional keyword with a default; pin the
-    decoupling at the signature instead.
+    """Was gated on KV cache dtype (fp8-only); see
+    mla_dcp_sparse_prefill_is_persistent's docstring for why that gate was
+    wrong. A value assertion would not catch a dtype parameter re-added as an
+    optional keyword with a default; pin the decoupling at the signature
+    instead.
     """
     import inspect
 

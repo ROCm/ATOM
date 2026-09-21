@@ -45,7 +45,11 @@ from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 from aiter.ops.triton.kv_cache import cat_and_cache_mla as triton_cat_and_cache_mla
 from torch import nn
 
-from atom.config import get_current_atom_config, qrep_enabled_for_layer
+from atom.config import (
+    get_current_atom_config,
+    mla_dcp_sparse_prefill_is_persistent,
+    qrep_enabled_for_layer,
+)
 from atom.distributed.dcp_utils import (
     dcp_persistent_supported,
     dcp_prefill_merge_bf16_ok,
@@ -286,33 +290,6 @@ def mla_dcp_decode_is_persistent(
     return dcp_persistent_supported and envs.ATOM_MLA_PAGE_SIZE <= 1
 
 
-def mla_dcp_sparse_prefill_is_persistent(
-    dcp_world_size: int,
-    dcp_persistent_supported: bool,
-    *,
-    sparse_metadata_rebuild: bool = False,
-) -> bool:
-    """Whether a DCP sparse prefill reaches ``mla_decode_fwd`` in persistent mode.
-
-    Mirrors the gate ``_forward_prefill_mla`` applies per forward and is the
-    single source the gathered pad width is derived from -- the two must move
-    together, or a path runs one way while its width was padded for the other.
-
-    Not gated on KV cache dtype: the work-metadata buffers are allocated and
-    filled for the layer's real dtype regardless
-    (`get_mla_metadata_info_v1`/`get_mla_metadata_v1` take `dtype_q`/`dtype_kv`
-    unconditionally), and persistent vs non-persistent agree to bf16 rounding.
-    The non-DCP (`dcp_world_size <= 1`) call site is fixed the same way in
-    `_forward_prefill_mla`'s `use_work_meta`.
-    """
-    if dcp_world_size <= 1 or not sparse_metadata_rebuild:
-        return False
-    # Match _forward_prefill_mla's own None -> 1 handling rather than comparing
-    # the env directly, so the two cannot disagree on an unset page size.
-    page_size = envs.ATOM_MLA_PAGE_SIZE if envs.ATOM_MLA_PAGE_SIZE is not None else 1
-    return dcp_persistent_supported and page_size <= 1
-
-
 def mla_dcp_kernel_num_heads(
     num_heads: int,
     dcp_world_size: int,
@@ -375,11 +352,11 @@ def mla_dcp_sparse_prefill_num_heads(
     because the widths that compute correctly are not decode's; see
     ``_MLA_DCP_SPARSE_PREFILL_WIDTHS``.
 
-    ``persistent`` must come from ``mla_dcp_sparse_prefill_is_persistent`` --
-    passing decode's answer is wrong, because the two call sites do not switch
-    on the same conditions. It is False on every path today; the persistent row
-    is wired up so that enabling it later is one predicate, not a second look at
-    which widths are safe.
+    ``persistent`` must come from ``mla_dcp_sparse_prefill_is_persistent``, not
+    decode's predicate: the two agree today, but this call site's width table
+    (``_MLA_DCP_SPARSE_PREFILL_WIDTHS*``) is its own and kept separate so it
+    can't start silently reading a table sized for the other mode if the two
+    predicates ever diverge again.
     """
     gathered = max(num_heads * dcp_world_size, min_kernel_heads)
     widths = (
@@ -755,8 +732,10 @@ class MLAAttention(nn.Module):
         # DCP Query Replication (QREP): q_proj is sharded on effective TP =
         # tp/dcp so decode can skip the per-step AllGather Q; W_K is gathered
         # to match, at load. Gate on actual q_proj width, not just the config
-        # flag -- eagle3/DSpark drafts and GLM-5.3's _ZeroRopePad build their
-        # own q_proj without the override, so the flag alone can't tell.
+        # flag: a model that has not wired qrep_tp_override into its q_proj
+        # construction would otherwise silently reinterpret a narrow q as the
+        # wide QREP layout. Every wired model today (target + eagle3/DSpark
+        # drafts) passes this; it guards a future model that doesn't.
         self.qrep_num_heads = self.num_heads * self.dcp_world_size
         wants_qrep = (
             self.dcp_world_size > 1
@@ -765,26 +744,36 @@ class MLAAttention(nn.Module):
         self.qrep_enabled = qrep_enabled_for_layer(
             wants_qrep, self.q_proj, self.qrep_num_heads, self.qk_head_dim
         )
+        if (
+            wants_qrep
+            and self.qrep_enabled
+            and not getattr(MLAAttention, "_qrep_enabled_logged", False)
+        ):
+            MLAAttention._qrep_enabled_logged = True
+            logger.info(
+                "dcp_config.enable_query_replication is on and active "
+                "(q_proj built with qrep_tp_override)."
+            )
         # Dedup key is per layer_num, not a single once-flag: otherwise one
-        # draft layer's fallback would permanently mask a later target-layer
+        # layer's fallback would permanently mask a later, different layer's
         # fallback (a real regression) from ever being logged.
-        qrep_logged_layers = getattr(MLAAttention, "_qrep_logged_layers", frozenset())
-        if wants_qrep and self.layer_num not in qrep_logged_layers:
-            MLAAttention._qrep_logged_layers = qrep_logged_layers | {self.layer_num}
-            if self.qrep_enabled:
-                logger.info(
-                    "dcp_config.enable_query_replication is on and active for "
-                    "layer %d (q_proj built with qrep_tp_override).",
-                    self.layer_num,
-                )
-            else:
-                logger.warning(
-                    "dcp_config.enable_query_replication is on, but layer %d's "
-                    "q_proj was not built with qrep_tp_override (e.g. an "
-                    "eagle3 / DSpark draft, or a model that has not wired QREP "
-                    "support) -- falling back to AllGather Q for it.",
-                    self.layer_num,
-                )
+        qrep_fallback_logged_layers = getattr(
+            MLAAttention, "_qrep_fallback_logged_layers", frozenset()
+        )
+        if (
+            wants_qrep
+            and not self.qrep_enabled
+            and self.layer_num not in qrep_fallback_logged_layers
+        ):
+            MLAAttention._qrep_fallback_logged_layers = qrep_fallback_logged_layers | {
+                self.layer_num
+            }
+            logger.warning(
+                "dcp_config.enable_query_replication is on, but layer %d's "
+                "q_proj was not built with qrep_tp_override -- falling back "
+                "to AllGather Q for it.",
+                self.layer_num,
+            )
         if self.qrep_enabled:
             assert self.qrep_num_heads >= _MLA_MIN_HEADS, (
                 "DCP query replication requires the DCP-group head set "
@@ -885,11 +874,11 @@ class MLAAttention(nn.Module):
 
         # Sparse prefill gathers query heads too, and needs its own width (see
         # mla_dcp_sparse_prefill_num_heads). Sized here alongside decode's so
-        # the vllm plugin's re-init picks both up. Its persistence predicate is
-        # deliberately NOT decode's: the two call sites switch on different
-        # conditions, and the width has to follow the mode the kernel actually
-        # runs in -- borrowing decode's answer is how a bf16 sparse prefill would
-        # end up padded to gqa=64 while running non-persistent.
+        # the vllm plugin's re-init picks both up. Uses its own persistence
+        # predicate, not decode's, so this width always matches the mode this
+        # call site actually runs in -- even though the two predicates agree
+        # today, borrowing decode's answer directly would silently break if
+        # they ever diverge again.
         self.dcp_sparse_prefill_persistent = False
         self.dcp_sparse_prefill_num_heads = self.num_heads
         if dcp_world_size > 1 and self.is_sparse_mla:
@@ -1947,9 +1936,9 @@ class MLAAttention(nn.Module):
         B = q.shape[0]
 
         # Under DCP the sparse path has already gathered the group's query heads,
-        # so it pads to its own kernel width -- NOT decode's, whose persistence
-        # gate differs (see mla_dcp_sparse_prefill_is_persistent). Every other
-        # caller pads the per-rank count.
+        # so it pads to its own kernel width, from its own table -- not decode's
+        # (see mla_dcp_sparse_prefill_is_persistent). Every other caller pads
+        # the per-rank count.
         dcp_sparse = self.is_sparse_mla and self.dcp_world_size > 1
         if q_prepadded:
             # The fused q write already produced the padded width, so q.shape[1]
