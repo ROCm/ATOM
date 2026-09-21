@@ -577,6 +577,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
     ),
+    # Forced acceptance defaults to rejection sampling only. Opt in to one
+    # fixed fake token throughout target decode and draft feedback.
+    "ATOM_SPEC_DECODE_SYNTHETIC_FORWARD": lambda: (
+        os.getenv("ATOM_SPEC_DECODE_SYNTHETIC_FORWARD", "0") == "1"
+    ),
     # --- Atomesh ---
     # Build atomesh when installing ATOM from source.
     "ATOM_MESH_BUILD": lambda: os.getenv("ATOM_MESH_BUILD", "0") == "1",

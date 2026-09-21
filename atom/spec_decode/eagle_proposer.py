@@ -198,11 +198,16 @@ class EagleProposer(Drafter):
         if self._reuse_step_buffers:
             hidden_states.copy_(fwd_out[:running_bs])
             self.model.compute_draft_ids(hidden_states, out=input_ids)
+            if self.synthetic_token_id is not None:
+                input_ids.fill_(self.synthetic_token_id)
             return hidden_states, input_ids
         # No fixed storage on this flavor, so the ids land in the graph's own
         # pool -- where `argmax`'s result landed before.
         ids = empty_token_ids(fwd_out)
-        return fwd_out, self.model.compute_draft_ids(fwd_out, out=ids)
+        ids = self.model.compute_draft_ids(fwd_out, out=ids)
+        if self.synthetic_token_id is not None:
+            ids.fill_(self.synthetic_token_id)
+        return fwd_out, ids
 
     def _build_draft_model(self, model_class) -> nn.Module:
         draft_model_hf_config = self.speculative_config.draft_model_hf_config
@@ -700,6 +705,11 @@ class EagleProposer(Drafter):
                     next_input_ids = self.model.compute_draft_ids(
                         sample_hidden_states, out=exported
                     )
+                    if self.synthetic_token_id is not None:
+                        # Feed the same fake token to the next draft iteration
+                        # and export it for target verification. The graph path
+                        # performs this in _step_head, inside the recording.
+                        next_input_ids.fill_(self.synthetic_token_id)
 
                 if i < self.mtp_k - 1:
                     do_attn_metadata_update = (

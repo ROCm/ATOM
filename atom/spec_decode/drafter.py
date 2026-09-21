@@ -13,6 +13,7 @@ from torch import nn
 from atom.config import Config
 from atom.model_loader.loader import load_model
 from atom.spec_decode.draft_graph import DraftGraph
+from atom.spec_decode.synthetic import resolve_synthetic_token_id
 from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
 from atom.utils.forward_context import (
     DPMetadata,
@@ -148,6 +149,7 @@ class Drafter(abc.ABC):
     def __init__(self, atom_config: Config, device: torch.device, runner):
         self.config = atom_config
         self.speculative_config = self.config.speculative_config
+        self.synthetic_token_id = resolve_synthetic_token_id(self.config)
         self.runner = runner
         self.device = device
         self.dtype = self.config.torch_dtype

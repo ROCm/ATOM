@@ -57,6 +57,12 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 | **ATOM_ONLINE_QUANT_STREAMING_HOST_STAGING** | bool | `true` | Assemble streamed module weights in CPU storage before one H2D transfer. Keeps the checkpoint walk parallel; disabling it buffers loader calls and forces the checkpoint walk to one thread. |
 | **ATOM_ONLINE_QUANT_STREAMING_THREADS** | int | `4` | Tail workers for H2D, per-module quantization, and source release. More workers increase overlap and in-flight memory; `0` runs finalization inline. |
 
+## Forced speculative acceptance
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_SPEC_DECODE_SYNTHETIC_FORWARD** | bool | 0 (false) | Set to `1` before engine startup to use a single fixed fake token throughout target decode and draft feedback. Requires `--spec-decode-acceptance-length` or `--spec-decode-acceptance-rate`. Unset or `0` preserves the original rejection-sampling-only behavior with model token IDs in forwards. See [Forced acceptance length](forced_acceptance_length.md). |
+
 ## Plugin mode
 
 | Variable | Type | Default | Description |

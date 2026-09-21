@@ -128,7 +128,12 @@ class DSparkProposer(Drafter):
         builder, and leaving it out of the warm is exactly how
         `hipModuleLoadData` went 0 -> 4 on the reproducer once.
         """
-        return self.model.head_and_sample(out, anchor_ids, self.draft_tokens_per_seq)
+        token_ids, confidence = self.model.head_and_sample(
+            out, anchor_ids, self.draft_tokens_per_seq
+        )
+        if self.synthetic_token_id is not None:
+            token_ids.fill_(self.synthetic_token_id)
+        return token_ids, confidence
 
     def _block_backbone(self, running_bs, *, anchor_ids, anchor_positions):
         """The block's forward: the parallel backbone over the whole draft width.

@@ -1056,6 +1056,7 @@ def _proposer_with_graph_bs(
     monkeypatch.setattr(DSparkProposer, "verify_scheduler", None, raising=False)
 
     p = DSparkProposer.__new__(DSparkProposer)
+    p.synthetic_token_id = None
     p.config = types.SimpleNamespace(
         max_num_seqs=256,
         eplb_enable=eplb,

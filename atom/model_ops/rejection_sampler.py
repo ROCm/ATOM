@@ -19,8 +19,9 @@ else:
 # Enabled via --spec-decode-acceptance-length / --spec-decode-acceptance-rate
 # (SpeculativeConfig.synthetic_acceptance_rates, already resolved to per-position
 # rates by the config). When set, the rejection sampler ignores the real
-# draft/target comparison and force-accepts draft tokens so the measured mean
-# acceptance length converges to the configured value. Purely a benchmarking /
+# draft/target comparison so the measured mean acceptance length converges to the
+# configured value. By default it retains model token IDs; synthetic forward mode
+# supplies a fixed fake ID shared with target/draft execution. Purely a benchmarking /
 # bring-up knob (e.g. while an MTP/EAGLE head is still training, or to replay a
 # published acceptance-length curve). Mirrors vLLM's "synthetic"
 # rejection_sample_method. See ROCm/ATOM#555.
@@ -96,7 +97,11 @@ def _get_synthetic_cond_rates(
 
 
 class RejectionSampler(nn.Module):
-    def __init__(self, synthetic_acceptance_rates: list[float] | None = None):
+    def __init__(
+        self,
+        synthetic_acceptance_rates: list[float] | None = None,
+        synthetic_token_id: int | None = None,
+    ):
         super().__init__()
         # Debug/benchmark override: force an acceptance-length curve (see module
         # docstring). None => normal draft/target rejection sampling. The config
@@ -111,6 +116,7 @@ class RejectionSampler(nn.Module):
         # lockstep across TP ranks (SPMD), so the forced accept/reject pattern is
         # identical on every rank while still varying step to step.
         self._synthetic_step = 0
+        self.synthetic_token_id = synthetic_token_id
 
     def forward(
         self,
@@ -143,6 +149,7 @@ class RejectionSampler(nn.Module):
             bonus_token_ids,
             synthetic_acceptance_rates=self.synthetic_acceptance_rates,
             synthetic_step=self._synthetic_step,
+            synthetic_token_id=self.synthetic_token_id,
         )
         if self.synthetic_acceptance_rates is not None:
             self._synthetic_step += 1
@@ -168,6 +175,8 @@ def rejection_sample(
     synthetic_acceptance_rates: tuple[float, ...] | None = None,
     # Per-step seed for the (rank-consistent) synthetic RNG; ignored otherwise.
     synthetic_step: int = 0,
+    # None retains draft/correction/bonus IDs; otherwise use the fixed forward ID.
+    synthetic_token_id: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert draft_token_ids.ndim == 1
     assert draft_probs is None or draft_probs.ndim == 2
@@ -206,12 +215,14 @@ def rejection_sample(
     if synthetic_acceptance_rates is not None:
         # Synthetic path: force a target acceptance length independent of the
         # real draft/target agreement. Draft tokens are accepted with the
-        # configured per-position probability; on the first rejection we emit the
-        # target argmax as the correction token and stop (same output layout /
-        # num_bonus_tokens semantics as the greedy path).
+        # configured per-position probability. Rejection-only mode retains draft,
+        # target correction and bonus IDs. Synthetic forward mode emits the shared
+        # fake ID. Both modes use the same acceptance draws and output layout.
         cond_rates = _get_synthetic_cond_rates(synthetic_acceptance_rates, device)
-        _, target_argmax = topk_select(target_probs, 1, tie="low")
-        target_argmax = target_argmax.view(-1)
+        target_argmax = None
+        if synthetic_token_id is None:
+            _, target_argmax = topk_select(target_probs, 1, tie="low")
+            target_argmax = target_argmax.view(-1)
         # Rank-consistent uniforms: a dedicated device generator re-seeded from the
         # step counter draws the same Philox stream on every TP rank / GPU, so the
         # accept/reject pattern — and hence num_bonus_tokens — matches the
@@ -239,6 +250,7 @@ def rejection_sample(
             uniform,
             cond_rates,
             num_spec_steps,
+            synthetic_token_id,
             num_warps=1,
         )
     elif RELAXED_TOP_N <= 1:
@@ -358,11 +370,12 @@ def rejection_synthetic_sample_kernel(
     num_bonus_tokens_ptr,
     cu_num_draft_tokens_ptr,  # [batch_size]
     draft_token_ids_ptr,  # [num_tokens]
-    target_argmax_ptr,  # [num_tokens]
+    target_argmax_ptr,  # [num_tokens], None in synthetic forward mode
     bonus_token_ids_ptr,  # [batch_size]
     uniform_ptr,  # [num_tokens] — per-position U(0, 1) samples
     cond_rates_ptr,  # [num_spec_steps] — P(accept pos | accepted through pos-1)
     num_spec_steps,
+    synthetic_token_id: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
 
@@ -382,15 +395,20 @@ def rejection_synthetic_sample_kernel(
         else:
             u = tl.load(uniform_ptr + start_idx + pos)
             acceptance_rate = tl.load(cond_rates_ptr + pos)
-            if u < acceptance_rate:
-                # Force-accept: emit the draft's own proposed token.
-                output_id = tl.load(draft_token_ids_ptr + start_idx + pos)
-                output_id = tl.cast(output_id, tl.int32)
+            if synthetic_token_id is None:
+                if u < acceptance_rate:
+                    output_id = tl.load(draft_token_ids_ptr + start_idx + pos).to(
+                        tl.int32
+                    )
+                else:
+                    output_id = tl.load(target_argmax_ptr + start_idx + pos).to(
+                        tl.int32
+                    )
+                    rejected = True
             else:
-                # Reject: emit the target correction token and stop accepting.
-                output_id = tl.load(target_argmax_ptr + start_idx + pos)
-                output_id = tl.cast(output_id, tl.int32)
-                rejected = True
+                output_id = synthetic_token_id
+                if u >= acceptance_rate:
+                    rejected = True
             num_bonus_token += 1
         tl.store(
             output_token_ids_ptr + req_idx * (num_spec_steps + 1) + pos,
@@ -400,7 +418,10 @@ def rejection_synthetic_sample_kernel(
     if rejected:
         bonus_token_id = INVALID_TOKEN
     else:
-        bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx)
+        if synthetic_token_id is None:
+            bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx).to(tl.int32)
+        else:
+            bonus_token_id = synthetic_token_id
         num_bonus_token += 1
     tl.store(
         output_token_ids_ptr + req_idx * (num_spec_steps + 1) + num_draft_tokens,

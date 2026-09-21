@@ -40,6 +40,7 @@ def _batch(seqs):
 def _runner(seen):
     """A ModelRunner carrying only what the no-spec branch of postprocess reads."""
     runner = object.__new__(mod.ModelRunner)
+    runner.synthetic_token_id = None
 
     def _sampler(logits, temperatures, top_ks, top_ps, all_greedy, **kw):
         seen["logits_rows"] = logits.shape[0]
@@ -117,6 +118,34 @@ def test_a_step_that_padded_nothing_is_unaffected(monkeypatch):
     )
 
     assert seen["logits_rows"] == bs
+
+
+@pytest.mark.parametrize("fake_id", [None, 7])
+def test_first_generated_token_uses_synthetic_id_before_feedback(monkeypatch, fake_id):
+    monkeypatch.setattr(
+        mod,
+        "get_forward_context",
+        lambda: types.SimpleNamespace(spec_decode_metadata=None),
+    )
+    monkeypatch.setattr(
+        mod, "get_tp_group", lambda: types.SimpleNamespace(world_size=1)
+    )
+    runner = _runner({})
+    runner.synthetic_token_id = fake_id
+    captured = {}
+    runner.tokenID_processor.prepare_sampled_ids = lambda b, ids, ev, lp: (
+        captured.update(ids=ids.clone()) or ({}, {})
+    )
+    runner.postprocess(
+        batch=_batch(3),
+        logits=torch.zeros(4, 8),
+        temperatures=torch.ones(3),
+        top_ks=None,
+        top_ps=None,
+        all_greedy=True,
+        hidden_states=None,
+    )
+    assert captured["ids"].tolist() == [0 if fake_id is None else fake_id] * 3
 
 
 def test_the_logprob_gather_reads_the_cut_logits(monkeypatch):

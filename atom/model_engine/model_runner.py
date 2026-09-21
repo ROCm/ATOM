@@ -75,6 +75,7 @@ from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
+from atom.spec_decode.synthetic import resolve_synthetic_token_id
 from atom.utils import (
     CpuGpuBuffer,
     envs,
@@ -697,6 +698,22 @@ class ModelRunner:
         self.num_spec_tokens = (
             self.config.speculative_config.num_speculative_tokens if use_spec else 0
         )
+        self.synthetic_token_id = resolve_synthetic_token_id(self.config)
+        if self.synthetic_token_id is not None:
+            logger.info(
+                "Forced speculative acceptance uses token ID %d for target "
+                "decode and draft feedback.",
+                self.synthetic_token_id,
+            )
+        elif (
+            self.config.speculative_config is not None
+            and self.config.speculative_config.synthetic_acceptance_rates is not None
+        ):
+            logger.info(
+                "Forced speculative acceptance affects rejection sampling only; "
+                "target and draft forwards retain model token IDs. Set "
+                "ATOM_SPEC_DECODE_SYNTHETIC_FORWARD=1 to use a fixed fake token."
+            )
 
         self._pp_pending_send: list = []
         self.tokenID_processor = tokenIDProcessor(
@@ -749,7 +766,8 @@ class ModelRunner:
             self.rejection_sampler = RejectionSampler(
                 synthetic_acceptance_rates=(
                     self.config.speculative_config.synthetic_acceptance_rates
-                )
+                ),
+                synthetic_token_id=self.synthetic_token_id,
             )
             torch.set_default_device(None)
             logger.info("Loading drafter model...")
@@ -2517,6 +2535,13 @@ class ModelRunner:
         input_ids = self.tokenID_processor.prepare_input_ids(
             batch, forward_mode.max_seqlen_q
         )
+        if self.synthetic_token_id is not None and not batch.total_seqs_num_prefill:
+            # Rewrite before metadata gathers draft IDs and before either eager
+            # execution or graph replay. Include graph padding: MoE consumes it
+            # too. Prompt chunks keep their actual tokens and KV cache contents.
+            self.tokenID_processor.input_ids.gpu[: forward_mode.running_tokens].fill_(
+                self.synthetic_token_id
+            )
         self.prepare_inputs(batch, input_ids, forward_mode=forward_mode)
 
         # Stage the speculative inputs while this forward's normal staging
@@ -3012,6 +3037,10 @@ class ModelRunner:
                 all_greedy,
                 needs_independent_noise=needs_independent_noise,
             )
+            if self.synthetic_token_id is not None:
+                # The first generated token also seeds the drafter and the
+                # next target forward; it must use the same ID as verification.
+                sampled_tokens.fill_(self.synthetic_token_id)
             num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[:bs]
             next_token_locs = num_reject_tokens
             # No drafts scored -> no accept count; anchor on the segment's last

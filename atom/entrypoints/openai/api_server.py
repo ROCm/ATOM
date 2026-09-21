@@ -2863,11 +2863,8 @@ def main():
     )
 
     engine = engine_args.create_engine(tokenizer=tokenizer)
-    # Forced acceptance emits draft tokens that nothing verified, and once the
-    # context is long enough those degenerate into the dialect's own channel
-    # framing and nothing else -- read as structure, correctly, that leaves a
-    # response with no content at all. The mode already announces that its text is
-    # meaningless, so stand in for it rather than parse it.
+    # Both forced-acceptance modes present one placeholder per generated token.
+    # Engine token IDs remain real by default; synthetic forward is opt-in.
     synthetic_token_text = (
         SYNTHETIC_TOKEN_TEXT
         if (
