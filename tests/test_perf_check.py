@@ -1281,3 +1281,35 @@ def test_matrix_rejects_a_renamed_pair_variant():
     )
     assert len(problems) == 1
     assert "-no-such-variant" in problems[0]
+
+
+def test_the_server_log_survives_a_failed_run():
+    """The logs are dumped, and dumped whatever the outcome.
+
+    benchmark-tmpl.yml dumps both and this workflow did not. The cost was a
+    full job: Kimi-K3 under dummy weights reported `ATOM server did not start
+    after 2700 seconds` and the reason stayed inside a container that the
+    cleanup step then removed. A dump guarded by success would have been just
+    as useless, since the run that needs it is the one that failed.
+    """
+    import yaml
+
+    workflow = yaml.safe_load(
+        (REPO / ".github" / "workflows" / "atom-perf-check.yaml").read_text()
+    )
+    steps = workflow["jobs"]["paired-bench"]["steps"]
+    dumps = {
+        s["name"]: s
+        for s in steps
+        if isinstance(s.get("name"), str) and s["name"].startswith("Dump ")
+    }
+    assert "Dump server log" in dumps
+    assert "Dump client log" in dumps
+    for name, step in dumps.items():
+        assert step.get("if") == "always()", f"{name} must run on failure too"
+        assert "atom_server.log" in step["run"] or "atom_client.log" in step["run"]
+
+    # Before the cleanup that removes the container, or there is nothing left
+    # to read them out of.
+    order = [s.get("name") for s in steps]
+    assert order.index("Dump server log") < order.index("Clean up")

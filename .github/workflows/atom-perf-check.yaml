@@ -346,6 +346,18 @@ jobs:
       - name: Bench HEAD
         run: bash "$RUNNER_TEMP/perf_check_half.sh" "${{ steps.refs.outputs.head_sha }}" head
 
+      # benchmark-tmpl.yml dumps these and this workflow did not, which cost a
+      # whole job to learn nothing: Kimi-K3 under dummy weights timed out at
+      # `ATOM server did not start after 2700 seconds` after 45 minutes, and
+      # the only record of why sat inside a container the cleanup then removed.
+      # `if: always()` because the run that needs them is the failing one.
+      - name: Dump server log
+        if: always()
+        run: docker exec ${{ env.CONTAINER }} cat /tmp/atom_server.log 2>/dev/null || true
+
+      - name: Dump client log
+        if: always()
+        run: docker exec ${{ env.CONTAINER }} cat /tmp/atom_client.log 2>/dev/null || true
 
       - name: Record provenance
         if: always()
