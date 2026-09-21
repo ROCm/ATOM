@@ -169,3 +169,59 @@ def test_plugin_ple_metadata_is_native():
     )
     assert md.num_accepted_tokens is None
     assert hasattr(bridge.Qwen4ExpQSAMetadata, "for_tokens")
+
+
+class _ExtendMode:
+    @staticmethod
+    def is_decode_or_idle():
+        return False
+
+    @staticmethod
+    def is_extend():
+        return True
+
+
+def test_eager_prefill_max_seq_len_ignores_stale_decode_graph_flag(monkeypatch):
+    """Leftover `_DECODE_GRAPH.active` must not score a 4K prefill at context_length."""
+    from atom.plugin.sglang import qwen4_exp_bridge as bridge
+
+    monkeypatch.setattr(
+        bridge,
+        "_server_args",
+        lambda: SimpleNamespace(
+            context_length=131072, max_model_len=131072, page_size=64
+        ),
+    )
+    pool = _Pool()
+    device = torch.device("cpu")
+    bridge._DECODE_GRAPH.ensure(max_bs=1, max_tokens=8, max_pages=8, device=device)
+    bridge._DECODE_GRAPH.active = True
+    try:
+        fb = SimpleNamespace(
+            forward_mode=_ExtendMode(),
+            batch_size=1,
+            device=device,
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            seq_lens=torch.tensor([4096], dtype=torch.int32),
+            extend_start_loc=torch.tensor([0], dtype=torch.int32),
+            extend_seq_lens=torch.tensor([8], dtype=torch.int32),
+            req_to_token_pool=pool,
+            out_cache_loc=torch.arange(8, dtype=torch.int64),
+            page_size=64,
+        )
+        qsa = build_qsa_metadata(
+            SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    model_type="qwen4_exp",
+                    indexer_compress_ratio=4,
+                    indexer_budget=2048,
+                    page_size=64,
+                )
+            ),
+            fb,
+            torch.arange(8, dtype=torch.int64),
+        )
+        assert qsa is not None
+        assert qsa.max_seq_len == 4096
+    finally:
+        bridge._DECODE_GRAPH.active = False

@@ -28,6 +28,7 @@ from atom.plugin.sglang.attention_backend.backend_resolver import (
 from atom.plugin.sglang.patches.qwen4_exp_recognition_patch import (
     apply_gdn_pad_sentinels,
 )
+from atom.utils import envs
 from atom.utils.forward_context import (
     AttentionMetaData,
     Context,
@@ -39,6 +40,65 @@ from atom.utils.forward_context import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _flydsl_linear_impls() -> list[Any]:
+    """Qwen4 GDN layers that opted into AITER FlyDSL (`allow_aiter_flydsl`)."""
+    try:
+        ctx = get_current_atom_config().compilation_config.static_forward_context
+    except Exception:  # noqa: BLE001
+        return []
+    cached = getattr(_flydsl_linear_impls, "_cache", None)
+    if cached is not None and cached[0] is ctx:
+        return cached[1]
+    impls: list[Any] = []
+    for module in ctx.values():
+        impl = getattr(module, "impl", None)
+        if impl is not None and getattr(impl, "allow_aiter_flydsl", False):
+            impls.append(impl)
+    _flydsl_linear_impls._cache = (ctx, impls)
+    return impls
+
+
+def _ensure_flydsl_policy(state: torch.Tensor):
+    """Bind Native `select_policy` once, same as `_build_gdn_cache_tensor`."""
+    impls = _flydsl_linear_impls()
+    if not impls:
+        return None
+    policy = impls[0].gdn_flydsl_policy
+    if policy is not None:
+        return policy
+    from atom.model_ops.fla_ops.gdn_flydsl import select_policy
+
+    policy = select_policy(
+        allowed=True,
+        replayssm=False,
+        lossy_decode=bool(envs.ATOM_ENABLE_GDN_DECODE_LOSSY_FAST),
+        state=state,
+        activation_dtype=impls[0].dt_bias.dtype,
+    )
+    for impl in impls:
+        impl.gdn_flydsl_policy = policy
+    return policy
+
+
+def _flydsl_prefill_metadata(query_start_loc: torch.Tensor) -> object | None:
+    """One scheduler-step FlyDSL K1-K5 schedule, shared by every GDN layer."""
+    impls = _flydsl_linear_impls()
+    if not impls:
+        return None
+    policy = impls[0].gdn_flydsl_policy
+    # Metadata is sometimes built before the KV bind on this step. Native gates
+    # on `_flydsl_prefill_enabled`; if policy is still unset, still try — the
+    # helper returns None when the backend is Triton or AITER ops are missing.
+    if policy is not None and not policy.prefill:
+        return None
+    from atom.model_ops.fla_ops.gdn_flydsl import build_prefill_metadata
+
+    return build_prefill_metadata(
+        (query_start_loc[1:] - query_start_loc[:-1]).tolist(),
+        query_start_loc,
+    )
 
 
 class SGLangGatedDeltaNet(GatedDeltaNet):
@@ -424,14 +484,29 @@ class SGLangGDNForwardContext:
         if mamba_map is None:
             return {}
 
-        out: dict[str, KVCacheTensor] = {}
+        first_temporal = None
+        layer_caches: list[tuple[int, Any]] = []
         for layer_id in mamba_map:
             layer_cache = pool.mamba2_layer_cache(layer_id)
-            layer_name = f"layer_{layer_id}"
-            out[layer_name] = KVCacheTensor(
+            layer_caches.append((layer_id, layer_cache))
+            if first_temporal is None:
+                first_temporal = layer_cache.temporal
+        policy = (
+            _ensure_flydsl_policy(first_temporal)
+            if first_temporal is not None
+            else None
+        )
+        use_kv_view = bool(policy is not None and policy.decode)
+
+        out: dict[str, KVCacheTensor] = {}
+        for layer_id, layer_cache in layer_caches:
+            v_cache = layer_cache.temporal
+            if use_kv_view:
+                v_cache = v_cache.transpose(-1, -2)
+            out[f"layer_{layer_id}"] = KVCacheTensor(
                 layer_num=layer_id,
                 k_cache=layer_cache.conv[0],
-                v_cache=layer_cache.temporal,
+                v_cache=v_cache,
                 k_scale=None,
                 v_scale=None,
                 # Slot-addressed recurrent state, not paged KV -- see
@@ -559,6 +634,7 @@ class SGLangGDNForwardContext:
                 nums_dict=nums_dict,
                 batch_ptr=batch_ptr,
                 token_chunk_offset_ptr=token_chunk_offset_ptr,
+                flydsl_prefill_metadata=_flydsl_prefill_metadata(query_start_loc),
                 **common_kwargs,
             )
 
@@ -589,12 +665,12 @@ class SGLangGDNForwardContext:
 
         cls._patch_forward_batch_pools(forward_batch, attn_backend)
         linear_backend = cls._linear_attn_backend(attn_backend)
-        gdn_metadata = cls._build_gdn_metadata(forward_batch, linear_backend)
-        if gdn_metadata is None and not forward_batch.forward_mode.is_target_verify():
-            return None
-
         kv_cache_data = cls._build_kv_cache_tensors(forward_batch, linear_backend)
         if not kv_cache_data:
+            return None
+
+        gdn_metadata = cls._build_gdn_metadata(forward_batch, linear_backend)
+        if gdn_metadata is None and not forward_batch.forward_mode.is_target_verify():
             return None
 
         context, num_tokens = cls._build_context(forward_batch)
