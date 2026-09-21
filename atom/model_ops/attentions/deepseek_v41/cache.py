@@ -23,7 +23,11 @@ from atom.model_ops.deepseek_v41.dspark import gather_window_rows
 from atom.model_ops.deepseek_v41.index_write import write_index_rows
 from atom.model_ops.deepseek_v41.unit_table import unit_table
 from atom.model_ops.v4_kernels import make_compress_plans
-from atom.model_ops.v4_kernels.state_writes import swa_write
+from atom.model_ops.v4_kernels.state_writes import (
+    swa_scatter_rows,
+    swa_scatter_rows_reference,
+    swa_write,
+)
 from atom.utils import CpuGpuBuffer
 
 from .indices import build_indices, fill_step_indptrs
@@ -474,28 +478,25 @@ class PagedAttentionCache:
         return table
 
     def _scatter_rows(self, pages, step, value, ratio):
-        """One destination per plan row, resolved from that same plan.
+        """Scatter plan rows with V4's dtype-agnostic, sentinel-aware writer.
 
-        A pair is native value and scale bytes, which is what the caller has
-        when the plane it is writing is a quantized one -- the plane's own
-        dtype is not asked, because the value already answered it.
-
-        Page and offset stay apart rather than becoming one row index: a page
-        is a stride in the arena and not `rows * dim` of it, so flattening the
-        two would copy the plane and drop the write. `live` is what keeps a
-        plan's sentinel rows out, torch indexing having no `-1` to skip on --
-        the index plane's kernel reads the plan and needs none of this.
+        PAGE fields have gaps between pages. Give the existing row scatter a
+        zero-copy view whose row stride is one element, so destination indices
+        are element offsets into this field's span. This retains the real page
+        stride without flattening/copying the field or compacting live rows on
+        the host during CUDA graph capture.
         """
         per_page = pages.shape[1]
         plan = step.plans[ratio].compress_plan_gpu
         batch = plan[:, 1].long()
-        live = batch >= 0
-        # The compressed row the index kernel derives inline; here it has to
-        # be a tensor, because torch indexing is what does the scatter.
         rows = plan[:, 2].long() // ratio
         page = step.block_tables[batch.clamp_min(0), (rows // per_page).clamp_min(0)]
+        offsets = page.long() * pages.stride(0) + (rows % per_page) * pages.stride(1)
+        last = (pages.shape[0] - 1) * pages.stride(0) + (per_page - 1) * pages.stride(1)
+        pool = pages.as_strided((last + 1, pages.shape[-1]), (1, 1))
         rows_in = pack_rows(*value) if isinstance(value, tuple) else value
-        pages[page.long()[live], (rows % per_page)[live]] = rows_in[0][live]
+        scatter = swa_scatter_rows if pages.is_cuda else swa_scatter_rows_reference
+        scatter(rows_in[0], offsets, batch, pool)
 
     def compress_state(self, owner):
         """This owner's `(kv_state, score_state)`, each `[slots, ring, dim]`.

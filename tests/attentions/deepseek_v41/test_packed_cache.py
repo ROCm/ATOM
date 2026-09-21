@@ -147,3 +147,56 @@ def test_packed_decode_reuses_v4_with_ragged_rows(batch):
     scratch = torch.empty((indices.numel(), 512), device="cuda", dtype=torch.bfloat16)
     gather_prefix_rows(pool, indices, ptr, scratch, 0, batch)
     assert scratch[selected.numel() :].count_nonzero() == 0
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_packed_plan_scatter_graph_replay_preserves_other_fields(ratio):
+    from types import SimpleNamespace
+
+    from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+
+    geo = V41PoolGeometry(3, ((0, 2), (1, 1), (2, 2)), 32, 128, 512, 128, packed=True)
+    cache = PagedAttentionCache(geo, 6, 2, "cuda")
+    owner = 1 if ratio == 1 else 0
+    pages = cache.pages.view(f"main_{owner}")[0]
+    per_page = geo.rows_per_page(ratio)
+    tables = torch.tensor([[3, 1], [5, 2]], device="cuda", dtype=torch.int32)
+    plan = torch.full((4, 4), -1, device="cuda", dtype=torch.int32)
+    step = SimpleNamespace(
+        block_tables=tables,
+        plans={ratio: SimpleNamespace(compress_plan_gpu=plan)},
+    )
+    x = torch.randn(1, 4, 512, device="cuda", dtype=torch.bfloat16)
+    value = quantize_fp4(x, group_size=16, scale_dtype=torch.float8_e4m3fn)
+    packed = pack_rows(*value)[0]
+    # Compile and warm up before capture. All-sentinel capture must still
+    # produce writes when live rows arrive later at the same plan address.
+    cache._scatter_rows(pages, step, value, ratio)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        cache._scatter_rows(pages, step, value, ratio)
+    for rows in (
+        [(0, 0), (1, per_page), (-1, -1), (0, per_page + 1)],
+        [(-1, -1), (1, 3), (0, per_page - 1), (-1, -1)],
+        [(-1, -1)] * 4,
+    ):
+        cache.page_bytes.fill_(97)
+        before = cache.backing.clone()
+        expected = cache.page_bytes.clone()
+        plan_cpu = torch.full((4, 4), -1, dtype=torch.int32, device="cpu")
+        for i, (batch, row) in enumerate(rows):
+            plan_cpu[i, 1:3] = torch.tensor([batch, row * ratio])
+            if batch >= 0:
+                page = int(tables[batch, row // per_page])
+                offset = pages.storage_offset() + (row % per_page) * pages.stride(1)
+                expected[page, offset : offset + packed.shape[-1]] = packed[i]
+        plan.copy_(plan_cpu)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(cache.page_bytes, expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            cache.backing[cache.page_bytes.numel() :],
+            before[cache.page_bytes.numel() :],
+            rtol=0,
+            atol=0,
+        )

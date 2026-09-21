@@ -145,14 +145,11 @@ def test_a_rows_prefix_slice_is_exactly_as_long_as_what_gets_written(ratio, topk
     )
 
 
-def test_a_graph_sized_plans_sentinel_rows_land_on_the_page_nobody_owns():
-    """The rows a fixed grid adds beyond the batch address nothing live.
+def test_graph_plan_sentinel_rows_do_not_write_to_live_pages():
+    """Capacity padding is skipped without compacting the scatter's input.
 
-    A plan cut for a CUDAGraph is `running_bs * per-seq bound` rows whatever
-    the batch, and the tail is `-1` in both fields. The index and packed-main
-    scatters are torch advanced indexing, where `-1` is the LAST page and the
-    last row of it -- a live request's, at every shape this runs. The
-    destination is the one PAGE the scheduler cannot name instead.
+    Two owner fields make each plane noncontiguous across PAGE boundaries;
+    flattening that view would copy it and lose every intended write.
     """
     from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
     from atom.model_ops.v4_kernels import make_compress_plans
