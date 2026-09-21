@@ -45,7 +45,7 @@ from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 from aiter.ops.triton.kv_cache import cat_and_cache_mla as triton_cat_and_cache_mla
 from torch import nn
 
-from atom.config import get_current_atom_config
+from atom.config import get_current_atom_config, qrep_enabled_for_layer
 from atom.distributed.dcp_utils import (
     dcp_persistent_supported,
     dcp_prefill_merge_bf16_ok,
@@ -469,20 +469,6 @@ def qrep_tp_override(tp_size: int) -> dict:
     }
 
 
-def _q_proj_is_qrep_widened(q_proj, qrep_num_heads: int, qk_head_dim: int) -> bool:
-    """Whether `q_proj` was actually built with `qrep_tp_override`.
-
-    A layer built without the override (an eagle3 / DSpark draft's own q_proj,
-    or a model that has not wired QREP support) still produces `q_proj.weight`
-    at the plain per-rank width. Reinterpreting that as the wide QREP layout
-    would either silently fold the wrong rows into one head group or raise
-    downstream depending on shape divisibility -- checking the actual width
-    here means such a layer falls back to AllGather instead.
-    """
-    weight = getattr(q_proj, "weight", None)
-    return weight is not None and weight.shape[0] == qrep_num_heads * qk_head_dim
-
-
 def is_rocm_aiter_fp4bmm_enabled() -> bool:
     return envs.ATOM_USE_TRITON_MXFP4_BMM
 
@@ -792,8 +778,8 @@ class MLAAttention(nn.Module):
             self.dcp_world_size > 1
             and get_current_atom_config().dcp_config.enable_query_replication
         )
-        self.qrep_enabled = wants_qrep and _q_proj_is_qrep_widened(
-            self.q_proj, self.qrep_num_heads, self.qk_head_dim
+        self.qrep_enabled = qrep_enabled_for_layer(
+            wants_qrep, self.q_proj, self.qrep_num_heads, self.qk_head_dim
         )
         if (
             wants_qrep

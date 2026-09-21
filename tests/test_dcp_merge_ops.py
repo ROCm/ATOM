@@ -43,7 +43,12 @@ import torch
 
 # atom.config imports cleanly without triton/aiter, so the config tests below
 # run on the CPU gate.
-from atom.config import DCPConfig, qrep_unsupported_reason
+from atom.config import (
+    DCPConfig,
+    qrep_enabled_for_layer,
+    qrep_unsupported_reason,
+    q_proj_is_qrep_widened,
+)
 
 try:
     import triton
@@ -56,7 +61,6 @@ try:
         _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT_FP8,
         _MLA_DCP_SPARSE_PREFILL_WIDTHS,
         _MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT,
-        _q_proj_is_qrep_widened,
         mla_dcp_kernel_num_heads,
         mla_dcp_sparse_prefill_is_persistent,
         mla_dcp_sparse_prefill_num_heads,
@@ -957,9 +961,12 @@ def test_gate_does_not_look_at_speculative_config():
 # with `qrep_tp_override` actually have a q_proj that wide: eagle3 / DSpark
 # draft models build their own q_proj independently of the target model, and
 # some models (e.g. GLM-5.3's `_ZeroRopePad`-wrapped q_proj) have not wired
-# the override at all. `_q_proj_is_qrep_widened` is the runtime check that
+# the override at all. `q_proj_is_qrep_widened` is the runtime check that
 # keeps those layers on the AllGather path instead of misreading a narrow q as
-# the wide QREP layout.
+# the wide QREP layout. Both it and `qrep_enabled_for_layer` live in
+# atom.config (not atom.model_ops.attention_mla, which needs triton/aiter at
+# import time) specifically so these tests run on the CPU-only CI gate
+# instead of being silently skipped there.
 
 
 class _FakeLinear:
@@ -974,26 +981,44 @@ class _NoWeight:
         self.inner = inner
 
 
-@needs_dcp_ops
 def test_q_proj_is_qrep_widened_true_when_shard_matches():
     q_proj = _FakeLinear(out_features=64 * 128)  # qrep_num_heads * qk_head_dim
-    assert _q_proj_is_qrep_widened(q_proj, qrep_num_heads=64, qk_head_dim=128)
+    assert q_proj_is_qrep_widened(q_proj, qrep_num_heads=64, qk_head_dim=128)
 
 
-@needs_dcp_ops
 def test_q_proj_is_qrep_widened_false_for_plain_per_rank_shard():
     """The un-widened case: e.g. an eagle3 / DSpark draft's own q_proj, built
     without `qrep_tp_override`, still at the plain `num_heads/tp` width."""
     q_proj = _FakeLinear(out_features=8 * 128)  # num_local_heads * qk_head_dim
-    assert not _q_proj_is_qrep_widened(q_proj, qrep_num_heads=64, qk_head_dim=128)
+    assert not q_proj_is_qrep_widened(q_proj, qrep_num_heads=64, qk_head_dim=128)
 
 
-@needs_dcp_ops
 def test_q_proj_is_qrep_widened_false_when_no_weight_attr():
     """GLM-5.3's `_ZeroRopePad` wraps its inner Linear without exposing
     `.weight` on itself -- must fall back cleanly, not raise."""
     q_proj = _NoWeight(_FakeLinear(out_features=8 * 128))
-    assert not _q_proj_is_qrep_widened(q_proj, qrep_num_heads=64, qk_head_dim=128)
+    assert not q_proj_is_qrep_widened(q_proj, qrep_num_heads=64, qk_head_dim=128)
+
+
+def test_qrep_enabled_for_layer_is_the_and_not_just_the_helper():
+    """Pins the actual per-layer decision, not only the helper it calls.
+
+    A test that only asserts `q_proj_is_qrep_widened`'s behavior would not
+    notice `MLAAttention.__init__`'s `wants_qrep and
+    q_proj_is_qrep_widened(...)` being weakened to always return `wants_qrep`
+    (or the `and` being dropped entirely) -- both would leave every existing
+    `q_proj_is_qrep_widened` test green while re-enabling QREP for unwired
+    layers. Assert the combination directly, for both operands.
+    """
+    widened = _FakeLinear(out_features=64 * 128)
+    narrow = _FakeLinear(out_features=8 * 128)
+    assert qrep_enabled_for_layer(True, widened, qrep_num_heads=64, qk_head_dim=128)
+    assert not qrep_enabled_for_layer(
+        False, widened, qrep_num_heads=64, qk_head_dim=128
+    ), "must not enable QREP just because q_proj happens to be wide enough"
+    assert not qrep_enabled_for_layer(
+        True, narrow, qrep_num_heads=64, qk_head_dim=128
+    ), "must not enable QREP for a layer whose q_proj was never widened"
 
 
 # ═══════════════════════════════ ColumnParallelLinear.make_row_view (GPU) ══
