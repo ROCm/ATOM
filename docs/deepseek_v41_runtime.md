@@ -3,9 +3,8 @@
 Native ATOM text execution runs through ModelRunner and Scheduler with chunked
 prefill, ragged batches, continuous decode and complete request-state recovery.
 The existing V4 BF16 sparse attention and inverse RoPE kernels are unchanged.
-The engine is the only implementation: the offline eager cache it used to be
-compared against has been removed, and arithmetic is judged against the
-published model and end-to-end `lm_eval` scores instead.
+Arithmetic is validated against the published model and generation quality
+through end-to-end `lm_eval` evaluation.
 
 ## Ownership and execution boundaries
 
@@ -33,13 +32,12 @@ all queries have consumed their causal prefixes, including chunks wider than
 the ring. Index reads gather a tile or candidate positions, never a full copy
 of the historical main KV.
 
-With BF16 production geometry and block size 16, one PAGE costs 51,200 bytes
-and one STATE entry costs 5,256,192 bytes. The complete image occupies 103 PAGE
-units. The optional packed layout uses 15,104 bytes per PAGE and 2,715,904 bytes
-per STATE (180 smaller PAGE units). Allocation and checkpoints use these same
-declarations. Positions and Engram history advance after the model forward;
-checkpoints carry every state field and padding byte. Images are versioned by
-geometry, the index plane's format included.
+Allocation and checkpoints use the same `V41PoolGeometry` declarations.
+Positions and Engram history advance after the model forward; checkpoints
+carry every state field and padding byte. Images are versioned by geometry,
+including the index plane format. See
+[cache format and graph execution](deepseek_v41_performance.md#cache-format-and-attention-boundary)
+for the storage formats.
 
 An exact prefix hit restores the entire state before preparing Engram inputs.
 Without a matching image, the generic scheduler replays from a recoverable
@@ -67,10 +65,9 @@ The architecture is `DeepseekV41ForCausalLM` and the cache block size must be
 even. Routed experts take either arrangement: `enable_expert_parallel=True`
 gives each rank whole experts, and leaving it off shards every expert's
 intermediate dimension across TP instead, which is the path `FusedMoE` takes on
-its own. Whole-expert EP is the more heavily exercised of the two — most of the
-validation below was run that way — but TP-only is not refused: at TP4 it scores
-0.9204 on the 1,319-question GSM8K set, inside the band six same-code EP runs
-span. Their relative throughput has not been measured.
+its own. Both arrangements are supported at TP4; whole-expert EP is the primary
+deployment configuration. Validate quality and throughput for the selected
+arrangement and workload.
 
 `index_cache_dtype="fp8"` is the only index plane, and the runtime refuses any
 other before loading weights. The main pool is independent of it and takes
@@ -81,9 +78,8 @@ RoPE; no V4 file is modified to serve V4.1.
 One plane means one scorer, for every shape. It reads the plane in place and
 gives each query row its own bound and its own tile list, so a prefill token, a
 decode token and a drafted token are one shape to it and a ragged batch is not
-a case. DeepSeek-V4 scores its own prefill by concatenating the batch's keys
-instead; both arrangements were measured on the production geometry, and the
-paged one holds `1/batch` of the logits at equal speed.
+a case. The scorer consumes the existing paged index plane during prefill,
+decode and speculative verification.
 
 Because a block id names 16 index rows and a ratio-2 owner halves the PAGE
 before that count is taken, the PAGE token count has a floor of 32; production
@@ -117,10 +113,10 @@ are V4's `FusedMoE`, which is capturable at every shape, so there is no expert
 backend to select and no capture exclusion.
 
 See [cache format and graph execution](deepseek_v41_performance.md) for cache
-formats, graph ownership and measured limits. Native five-token DSpark supports
+formats, graph ownership and memory limits. Native five-token DSpark supports
 TP4 text requests with BF16 caches and optional target graphs; its draft
-windows, accepted-prefix state, calibration profile, validated scope and **open
-quality regression** are in [the DSpark guide](deepseek_v41_dspark.md). Packed
+windows, accepted-prefix state, calibration profile, supported scope and **quality
+limitations** are in [the DSpark guide](deepseek_v41_dspark.md). Packed
 speculative caches and multimodal speculation are rejected, as are
 torch.compile, PP/CP/DP, TBO, KV transfer, plugin execution and EPLB — all
 before loading.
