@@ -96,6 +96,21 @@ combine knob as a quality/throughput tradeoff.
 | **ATOM_MORI_FP4_DISPATCH** | bool | 0 (false) | If set to `1`, quantize activations to packed FP4 (E2M1, `per_1x32`) before the MoE all2all instead of sending bf16 — a quarter of the bytes on the dispatch wire — which selects `EpDispatchIntraNodeKernel_fp4`. MoRI picks its dispatch kernel from the dtype of the tensor handed to `dispatch()` but sizes its staging buffers from the config built at init, so this also switches `scale_dim` to `hidden_dim/32` and the scale type to e8m0. All three are resolved together by `mori_prepare_finalize.resolve_mori_dispatch()`; never set one without the others, as a mismatch strides the staging scale buffer wrong and faults on the first real batch instead of erroring cleanly. |
 | **ATOM_MORI_COMBINE_QUANT** | str | `none` | Combine-side codec passed into the MoRI config. `none` returns bf16; `fp8_blockwise` selects `EpCombineIntraNodeKernel_*_fp8bwq_*`; MoRI also accepts `fp8_direct_cast`. |
 
+### MoonEP planning policy
+
+The MoonEP policy is an opt-in planning layer over the existing MoRI transport.
+It uses MoRI v1 by default for the initial gfx950 closure and follows
+`ATOM_MORI_V2=1` when bringing the same policy to gfx1250. Prefill builds a
+global expert histogram, assigns a bounded set of remote experts to local cache
+slots, and dispatches virtual physical IDs through the selected transport.
+Decode remains owner-only and does not build or synchronize a histogram. Both
+phases run the standard fused MoE experts and use the normal MoRI combine.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_EP_BACKEND** | str | `mori` | Set to `moonep` to enable the MoonEP prefill/decode policies. Requires the matching AITER MoonEP planner kernels. `mori` preserves the existing backend. MoonEP uses standard `fused_moe` and is incompatible with `ATOM_MORI_V2_FUSED=1`. |
+| **MOONEP_PREFETCH_SLOTS** | int | `8` | Number of remote-expert cache slots per rank used by the MoonEP prefill policy. |
+
 ## Fusion passes
 
 ### RMSNorm

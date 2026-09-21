@@ -31,12 +31,19 @@ Two transports sit behind the same prepare/finalize pair:
 Shared experts are NOT fused in the mori EP+DP path (ATOM disables fusion there,
 see topK.is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config), so
 topk_ids carry only routed expert ids and mori routes them cleanly.
+
+``ATOM_EP_BACKEND=moonep`` adds a policy layer without replacing the transport:
+prefill remaps logical ids into ``EPR+B`` virtual slots and runs the resident and
+prefetched subsets through standard fused_moe, while decode keeps the owner-only
+``EPR`` geometry. The policy factory uses the existing MoRI v1 transport by
+default for gfx950 and selects v2 when ``ATOM_MORI_V2=1``.
 """
 
 import logging
 import os
 import sys
 from functools import lru_cache
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -552,6 +559,477 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         return out[:num_token]
 
 
+class _MoriV1PolicyTransport:
+    """Normalize the production MoRI v1 API to the v2 routing-handle contract."""
+
+    def __init__(self, prepare_finalize: Any, num_experts_per_rank: int) -> None:
+        self._prepare_finalize = prepare_finalize
+        native_cfg = getattr(prepare_finalize._sync_mori_op, "cfg", None)
+        self.cfg = SimpleNamespace(
+            num_experts_per_rank=num_experts_per_rank,
+            dispatch_block_num=getattr(native_cfg, "block_num", 1024),
+        )
+
+    def dispatch(
+        self,
+        hidden: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor | None,
+        indices: torch.Tensor,
+        *,
+        return_routing: bool,
+    ):
+        if scales is not None:
+            raise ValueError("MoonEP's gfx950 closure expects BF16 MoRI dispatch")
+        if not return_routing:
+            raise ValueError("MoonEP requires a routing handle for combine")
+        block_num, warp_per_block = self._prepare_finalize._get_dispatch_config(
+            hidden.shape[0]
+        )
+        recv_x, recv_w, recv_s, recv_idx, total_recv = (
+            self._prepare_finalize._sync_mori_op.dispatch(
+                hidden,
+                weights,
+                None,
+                indices,
+                block_num,
+                warp_per_block,
+            )
+        )
+        # MoRI v1 reconstructs combine routing from the dispatched physical IDs
+        # rather than returning an opaque handle as v2 does.
+        return recv_x, recv_w, recv_s, recv_idx, total_recv, indices
+
+    def combine(self, output: torch.Tensor, *, routing: torch.Tensor):
+        block_num, warp_per_block = self._prepare_finalize._get_dispatch_config(
+            routing.shape[0]
+        )
+        result = self._prepare_finalize._sync_mori_op.combine(
+            output,
+            None,
+            routing,
+            block_num,
+            warp_per_block,
+        )
+        return result[0], None
+
+
+def _make_virtual_expert_masks(
+    *,
+    rank: int,
+    world_size: int,
+    experts_per_rank: int,
+    prefetch_slots: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return masks mapping virtual global ids to home/prefetch weight rows."""
+
+    physical_per_rank = experts_per_rank + prefetch_slots
+    num_physical = world_size * physical_per_rank
+    home = torch.zeros(num_physical, dtype=torch.int32, device=device)
+    prefetched = torch.zeros_like(home)
+    begin = rank * physical_per_rank
+    home[begin : begin + experts_per_rank] = 1
+    prefetched[begin + experts_per_rank : begin + physical_per_rank] = 1
+    return home, prefetched
+
+
+class MoonEPPolicyMoriPrepareAndFinalize(MoriV2PrepareAndFinalize):
+    """MoonEP planning in front of normal MoRI dispatch + standard fused_moe.
+
+    Prefill uses ``EPR + B`` virtual slots per rank. Resident experts occupy
+    ``[0, EPR)`` and the selected remote experts occupy ``[EPR, EPR + B)``.
+    Decode keeps the ordinary owner-only ``EPR`` geometry and never creates a
+    histogram or calls the global planner.
+
+    The VMM weight pool keeps home and prefetched rows in separate views, so
+    prefill runs two ordinary fused_moe calls and adds their local partials.
+    This avoids a hot-path concatenation of expert weights and deliberately
+    does not depend on MoonEP's grouped-row dispatch/GEMM contract.
+    """
+
+    ADOPTED = (
+        "w13_weight",
+        "w2_weight",
+        "w13_weight_scale",
+        "w2_weight_scale",
+        "w13_bias",
+        "w2_bias",
+    )
+
+    def __init__(
+        self,
+        *,
+        prefill_op: Any,
+        decode_op: Any,
+        rank: int,
+        world_size: int,
+        num_experts: int,
+        prefetch_slots: int,
+        max_tokens_per_rank: int,
+        num_dispatchers: int,
+    ) -> None:
+        super().__init__(
+            decode_op,
+            max_tokens_per_rank=max_tokens_per_rank,
+            num_dispatchers=num_dispatchers,
+        )
+        from aiter.ops.flydsl.moonep import MoonEPDecodePolicy
+
+        if num_experts % world_size:
+            raise ValueError("MoonEP requires num_experts divisible by world_size")
+        if prefetch_slots <= 0:
+            raise ValueError("MoonEP prefetch_slots must be positive")
+
+        self._prefill_op = prefill_op
+        self._decode_op = decode_op
+        self._rank = rank
+        self._world_size = world_size
+        self._num_experts = num_experts
+        self._experts_per_rank = num_experts // world_size
+        self._prefetch_slots = prefetch_slots
+        self._decode_policy = MoonEPDecodePolicy(
+            world_size=world_size, num_experts=num_experts
+        )
+        self._prefill_policies: dict[tuple[int, int, str], Any] = {}
+        self._histogram_exchange = None
+        self._pools = None
+        self._virtual_masks: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._active_op = None
+        self._active_plan = None
+        self._active_is_prefill = False
+
+    def _is_prefill(self) -> bool:
+        """Resolve the phase without adding a decode-side collective.
+
+        This backend targets phase-disaggregated serving, where every rank in
+        an EP group is either prefill or decode for a forward.  Consequently
+        the forward context is sufficient and DecodePolicy remains completely
+        free of histogram/all-reduce synchronization.
+        """
+
+        context = get_forward_context().context
+        if context is None:
+            return True
+        return not bool(
+            getattr(
+                context,
+                "dp_uniform_decode",
+                not bool(getattr(context, "is_prefill", True)),
+            )
+        )
+
+    def _prefill_policy(self, topk_ids: torch.Tensor):
+        from aiter.ops.flydsl.moonep import (
+            MoonEPPlanConfig,
+            MoonEPPrefillPolicy,
+            MoonEPSymmetricHistogramExchange,
+        )
+
+        key = (topk_ids.shape[0], topk_ids.shape[1], str(topk_ids.device))
+        policy = self._prefill_policies.get(key)
+        if policy is not None:
+            return policy
+
+        if self._histogram_exchange is None:
+            self._histogram_exchange = MoonEPSymmetricHistogramExchange(
+                rank=self._rank,
+                world_size=self._world_size,
+                num_experts=self._num_experts,
+                device=topk_ids.device,
+            )
+        config = MoonEPPlanConfig(
+            rank=self._rank,
+            world_size=self._world_size,
+            num_tokens=topk_ids.shape[0],
+            top_k=topk_ids.shape[1],
+            num_experts=self._num_experts,
+            prefetch_slots=self._prefetch_slots,
+        )
+        policy = MoonEPPrefillPolicy(
+            config,
+            topk_ids.device,
+            histogram_exchange=self._histogram_exchange,
+        )
+        self._prefill_policies[key] = policy
+        return policy
+
+    def prepare(
+        self,
+        a1: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        num_experts: int,
+        expert_map: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        quant_config: FusedMoEQuantConfig,
+        quant_type: QuantType = QuantType.No,
+    ) -> mk.PrepareResultType:
+        del expert_map, quant_config, quant_type
+        assert (
+            not apply_router_weight_on_input
+        ), "MoonEP policy + MoRI does not support router weights on input."
+        if self._routing is not None:
+            raise RuntimeError("prepare() called before the previous finalize()")
+        if num_experts != self._num_experts:
+            raise ValueError(
+                f"routing width changed from {self._num_experts} to {num_experts}"
+            )
+
+        self._active_is_prefill = self._is_prefill()
+        if self._active_is_prefill:
+            plan = self._prefill_policy(topk_ids).plan(topk_ids)
+            op = self._prefill_op
+        else:
+            plan = self._decode_policy.plan(topk_ids)
+            op = self._decode_op
+
+        expected_epr = op.cfg.num_experts_per_rank
+        if plan.num_experts_per_rank != expected_epr:
+            raise RuntimeError(
+                "planner/dispatch geometry mismatch: "
+                f"plan={plan.num_experts_per_rank}, mori={expected_epr}"
+            )
+
+        planned_ids = plan.planned_topk_ids
+        recv_x, recv_w, _recv_s, recv_idx, total_recv, routing = op.dispatch(
+            a1,
+            # Preserve the router weights. They are consumed by fused_moe on
+            # the destination and folded exactly once before MoRI combine.
+            topk_weights.to(torch.float32),
+            None,
+            planned_ids,
+            return_routing=True,
+        )
+        self._active_op = op
+        self._active_plan = plan
+        self._routing = routing
+        return (
+            recv_x,
+            None,
+            mk.ExpertTokensMetadata(
+                expert_num_tokens=total_recv, expert_num_tokens_cpu=None
+            ),
+            recv_idx,
+            recv_w,
+        )
+
+    def finalize(
+        self,
+        output: torch.Tensor,
+        fused_expert_output: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        apply_router_weight_on_input: bool,
+    ) -> torch.Tensor:
+        del output, topk_weights, apply_router_weight_on_input
+        if self._routing is None or self._active_op is None:
+            raise RuntimeError("finalize() called before prepare()")
+        op = self._active_op
+        routing = self._routing
+        self._routing = None
+        self._active_op = None
+        self._active_plan = None
+        out, _ = op.combine(fused_expert_output, routing=routing)
+        return out[: topk_ids.shape[0]]
+
+    def adopt_weights(self, layer: torch.nn.Module) -> None:
+        """Move resident weights to P2P-readable storage and add B cache rows."""
+
+        if self._pools is not None:
+            return
+        pools = []
+        for name in self.ADOPTED:
+            param = getattr(layer, name, None)
+            entry = (None, False, False)
+            if param is not None and param.data is not None:
+                pool, flat = self._pool_for(param.data)
+                shuffled = bool(getattr(param, "is_shuffled", False))
+                param.data = pool.home.reshape(param.data.shape)
+                entry = (pool, flat, shuffled)
+            pools.append(entry)
+        self._pools = tuple(pools)
+
+    def _pool_for(self, tensor: torch.Tensor):
+        from aiter.ops.flydsl.kernels.moonep_weights import MoonEPWeightPool
+
+        epn = self._experts_per_rank
+        flat = tensor.shape[0] != epn
+        if flat:
+            if tensor.shape[0] % epn:
+                raise ValueError(
+                    f"cannot index {tuple(tensor.shape)} by expert: leading dim "
+                    f"is neither {epn} nor a multiple of it"
+                )
+            view = tensor.reshape(epn, tensor.shape[0] // epn, *tensor.shape[1:])
+        else:
+            view = tensor
+        pool = MoonEPWeightPool(
+            rank=self._rank,
+            world_size=self._world_size,
+            experts_per_rank=epn,
+            prefetch_slots=self._prefetch_slots,
+            weight_shape=tuple(view.shape[1:]),
+            dtype=tensor.dtype,
+            block_num=self._prefill_op.cfg.dispatch_block_num or 1024,
+        )
+        pool.stage_home(view.contiguous())
+        logger.info(
+            "MoonEP policy adopted %s%s: %d resident + %d prefetch slots",
+            tuple(tensor.shape),
+            tensor.dtype,
+            epn,
+            self._prefetch_slots,
+        )
+        return pool, flat
+
+    @staticmethod
+    def _pool_view(entry, *, prefetched: bool):
+        pool, flat, shuffled = entry
+        if pool is None:
+            return None
+        tensor = pool.prefetched if prefetched else pool.home
+        if flat:
+            tensor = tensor.reshape(-1, *tensor.shape[2:])
+        if shuffled:
+            tensor.is_shuffled = True
+        return tensor
+
+    def _masks(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        key = str(device)
+        masks = self._virtual_masks.get(key)
+        if masks is None:
+            masks = _make_virtual_expert_masks(
+                rank=self._rank,
+                world_size=self._world_size,
+                experts_per_rank=self._experts_per_rank,
+                prefetch_slots=self._prefetch_slots,
+                device=device,
+            )
+            self._virtual_masks[key] = masks
+        return masks
+
+    def run_dispatched_experts(
+        self,
+        rows: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        *,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        expert_mask: torch.Tensor | None,
+        num_local_tokens: torch.Tensor | None,
+        activation=None,
+        quant_type=None,
+        w1_scale: torch.Tensor | None = None,
+        w2_scale: torch.Tensor | None = None,
+        a1_scale: torch.Tensor | None = None,
+        a2_scale: torch.Tensor | None = None,
+        hidden_pad: int = 0,
+        intermediate_pad: int = 0,
+        bias1: torch.Tensor | None = None,
+        bias2: torch.Tensor | None = None,
+        dtype=None,
+        extra_kwargs: dict | None = None,
+    ) -> torch.Tensor:
+        from aiter import ActivationType, QuantType
+        from aiter.fused_moe import fused_moe
+
+        if self._pools is None:
+            raise RuntimeError("adopt_weights() must run before the first MoE call")
+        if w1.data_ptr() != self._pools[0][0].home.data_ptr():
+            raise RuntimeError("the layer weights no longer alias the MoonEP pool")
+        if self._active_plan is None:
+            raise RuntimeError("experts called before policy planning")
+
+        act = activation if activation is not None else ActivationType.Silu
+        qt = quant_type if quant_type is not None else QuantType.No
+        common = dict(
+            activation=act,
+            quant_type=qt,
+            num_local_tokens=num_local_tokens,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            hidden_pad=hidden_pad,
+            intermediate_pad=intermediate_pad,
+            dtype=dtype if dtype is not None else rows.dtype,
+            **(extra_kwargs or {}),
+        )
+
+        if not self._active_is_prefill:
+            return fused_moe(
+                rows,
+                self._pool_view(self._pools[0], prefetched=False),
+                self._pool_view(self._pools[1], prefetched=False),
+                topk_weights,
+                topk_ids,
+                expert_mask,
+                w1_scale=self._pool_view(self._pools[2], prefetched=False),
+                w2_scale=self._pool_view(self._pools[3], prefetched=False),
+                bias1=(
+                    self._pool_view(self._pools[4], prefetched=False)
+                    if self._pools[4][0] is not None
+                    else bias1
+                ),
+                bias2=(
+                    self._pool_view(self._pools[5], prefetched=False)
+                    if self._pools[5][0] is not None
+                    else bias2
+                ),
+                **common,
+            )
+
+        selected = self._active_plan.experts_to_copy[self._rank].contiguous()
+        for pool, _flat, _shuffled in self._pools:
+            if pool is not None:
+                pool.prefetch(selected)
+
+        home_mask, prefetch_mask = self._masks(rows.device)
+        home_out = fused_moe(
+            rows,
+            self._pool_view(self._pools[0], prefetched=False),
+            self._pool_view(self._pools[1], prefetched=False),
+            topk_weights,
+            topk_ids,
+            home_mask,
+            w1_scale=self._pool_view(self._pools[2], prefetched=False),
+            w2_scale=self._pool_view(self._pools[3], prefetched=False),
+            bias1=(
+                self._pool_view(self._pools[4], prefetched=False)
+                if self._pools[4][0] is not None
+                else bias1
+            ),
+            bias2=(
+                self._pool_view(self._pools[5], prefetched=False)
+                if self._pools[5][0] is not None
+                else bias2
+            ),
+            **common,
+        )
+        prefetch_out = fused_moe(
+            rows,
+            self._pool_view(self._pools[0], prefetched=True),
+            self._pool_view(self._pools[1], prefetched=True),
+            topk_weights,
+            topk_ids,
+            prefetch_mask,
+            w1_scale=self._pool_view(self._pools[2], prefetched=True),
+            w2_scale=self._pool_view(self._pools[3], prefetched=True),
+            bias1=(
+                self._pool_view(self._pools[4], prefetched=True)
+                if self._pools[4][0] is not None
+                else bias1
+            ),
+            bias2=(
+                self._pool_view(self._pools[5], prefetched=True)
+                if self._pools[5][0] is not None
+                else bias2
+            ),
+            **common,
+        )
+        return home_out.add_(prefetch_out)
+
+
 class MoriV2ModularKernel(mk.FusedMoEModularKernel):
     """Modular kernel for the v2 path.
 
@@ -799,3 +1277,134 @@ def make_mori_v2_prepare_finalize(moe, all2all_manager) -> MoriV2PrepareAndFinal
         max_tokens_per_rank=moe.max_num_tokens,
         num_dispatchers=ep_size,
     )
+
+
+def make_moonep_policy_prepare_finalize(
+    moe,
+    all2all_manager,
+    *,
+    prefetch_slots: int,
+    quant_config: FusedMoEQuantConfig | None,
+) -> MoonEPPolicyMoriPrepareAndFinalize:
+    """Build the two MoRI geometries used by the disaggregated MoonEP policy."""
+
+    from aiter.dist.parallel_state import get_ep_group
+
+    ep_group = get_ep_group()
+    ep_src_global_rank = ep_group.ranks[0]
+    ep_size = all2all_manager.world_size
+    experts_per_rank = moe.num_experts // ep_size
+
+    if envs.ATOM_MORI_V2_FUSED:
+        raise ValueError(
+            "ATOM_EP_BACKEND=moonep uses standard fused_moe and cannot be "
+            "combined with ATOM_MORI_V2_FUSED=1"
+        )
+
+    if envs.ATOM_MORI_V2:
+        common = {
+            "ep_rank": all2all_manager.rank,
+            "ep_size": ep_size,
+            "ep_src_global_rank": ep_src_global_rank,
+            "hidden_dim": moe.hidden_dim,
+            "max_num_inp_token_per_rank": moe.max_num_tokens,
+            "num_experts_per_token": moe.experts_per_token,
+            "data_type_itemsize": moe.in_dtype.itemsize,
+            "combine_mode": "gather",
+        }
+        decode_op = init_mori_v2_op(
+            num_local_experts=experts_per_rank,
+            **common,
+        )
+        prefill_op = init_mori_v2_op(
+            num_local_experts=experts_per_rank + prefetch_slots,
+            **common,
+        )
+        transport = "v2"
+    else:
+        decode_op = _make_mori_v1_policy_transport(
+            moe,
+            all2all_manager,
+            num_local_experts=experts_per_rank,
+            quant_config=quant_config,
+        )
+        prefill_op = _make_mori_v1_policy_transport(
+            moe,
+            all2all_manager,
+            num_local_experts=experts_per_rank + prefetch_slots,
+            quant_config=quant_config,
+        )
+        transport = "v1"
+    logger.info(
+        "MoonEP policy over MoRI %s: rank=%d world=%d home=%d prefetch=%d "
+        "decode_epr=%d prefill_epr=%d",
+        transport,
+        all2all_manager.rank,
+        ep_size,
+        experts_per_rank,
+        prefetch_slots,
+        experts_per_rank,
+        experts_per_rank + prefetch_slots,
+    )
+    return MoonEPPolicyMoriPrepareAndFinalize(
+        prefill_op=prefill_op,
+        decode_op=decode_op,
+        rank=all2all_manager.rank,
+        world_size=ep_size,
+        num_experts=moe.num_experts,
+        prefetch_slots=prefetch_slots,
+        max_tokens_per_rank=moe.max_num_tokens,
+        num_dispatchers=ep_size,
+    )
+
+
+def _make_mori_v1_policy_transport(
+    moe,
+    all2all_manager,
+    *,
+    num_local_experts: int,
+    quant_config: FusedMoEQuantConfig | None,
+) -> _MoriV1PolicyTransport:
+    """Create the existing gfx950 MoRI transport with a policy-specific EPR."""
+
+    from atom.model_ops.fused_moe.mori_prepare_finalize import (
+        MoriPrepareAndFinalize,
+        resolve_mori_dispatch,
+    )
+
+    dispatch_format = resolve_mori_dispatch(
+        in_dtype=moe.in_dtype,
+        hidden_dim=moe.hidden_dim,
+        quant_config=quant_config,
+    )
+    if dispatch_format.is_fp4 or dispatch_format.is_fp8:
+        raise ValueError(
+            "ATOM_EP_BACKEND=moonep currently requires BF16 MoRI dispatch; "
+            "disable ATOM_MORI_FP4_DISPATCH for the gfx950 closure"
+        )
+
+    all_to_all_args = {
+        "rank": all2all_manager.rank,
+        "num_ep_ranks": all2all_manager.world_size,
+        "quant_dtype": dispatch_format.dtype,
+        "token_hidden_size": moe.hidden_dim,
+        "scale_dim": dispatch_format.scale_dim,
+        "scale_type_size": dispatch_format.scale_type_size,
+        "max_num_tokens_per_dp_rank": moe.max_num_tokens,
+        "input_dtype": moe.in_dtype,
+        "num_local_experts": num_local_experts,
+        "num_experts_per_token": moe.experts_per_token,
+        "gpu_per_node": moe.moe_parallel_config.local_ep_size,
+    }
+    if envs.ATOM_MORI_COMBINE_QUANT != "none":
+        all_to_all_args["quant_type"] = envs.ATOM_MORI_COMBINE_QUANT
+
+    handle = all2all_manager.get_handle(all_to_all_args)
+    prepare_finalize = MoriPrepareAndFinalize(
+        handle,
+        max_tokens_per_rank=moe.max_num_tokens,
+        num_dispatchers=all2all_manager.world_size,
+        dispatch_format=dispatch_format,
+        is_async=False,
+    )
+    return _MoriV1PolicyTransport(prepare_finalize, num_local_experts)
