@@ -795,8 +795,10 @@ class MLAAttention(nn.Module):
         self.qrep_enabled = wants_qrep and _q_proj_is_qrep_widened(
             self.q_proj, self.qrep_num_heads, self.qk_head_dim
         )
-        if wants_qrep and not self.qrep_enabled and not getattr(
-            MLAAttention, "_qrep_not_widened_logged", False
+        if (
+            wants_qrep
+            and not self.qrep_enabled
+            and not getattr(MLAAttention, "_qrep_not_widened_logged", False)
         ):
             MLAAttention._qrep_not_widened_logged = True
             logger.warning(

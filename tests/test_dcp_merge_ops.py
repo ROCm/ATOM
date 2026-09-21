@@ -946,9 +946,9 @@ def test_gate_does_not_look_at_speculative_config():
     import inspect
 
     params = inspect.signature(qrep_unsupported_reason).parameters
-    assert not any("spec" in p for p in params), (
-        f"the QREP gate must not key off the speculative config; got {list(params)}"
-    )
+    assert not any(
+        "spec" in p for p in params
+    ), f"the QREP gate must not key off the speculative config; got {list(params)}"
 
 
 # ─────────────────────────────────────── per-layer QREP eligibility (CPU) ──
