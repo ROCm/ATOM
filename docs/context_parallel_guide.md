@@ -365,21 +365,34 @@ side, not off `q_out`'s provenance — the two are independent. Validated on
 GLM-5.2-FP8 sparse DCP8, fp8 KV, MTP=3 (gsm8k nshot=20): QREP on
 0.9469/0.9477 vs. QREP off 0.9492/0.9492, within combined stderr. That arm
 never selects `cprr` (sparse MTP verify flattens to `q_len=1` per token, see
-below), so this covers the sparse indexer side; dense MLA + `cprr` + QREP
-rests on the code-reading argument above and has not been independently
-re-run.
+below), so it covers the sparse indexer side only. The `cprr` side is covered
+separately by Kimi-K3 + DSpark, tp8/dcp8, fp8 KV, `num_speculative_tokens=7`
+with QREP on (gsm8k 0.98 over 200 questions, nshot=5): K3's MLA layers are
+dense (`is_sparse=False`), and the target's block verify is causal with
+`q_len > 1`, so that run dispatches the `cprr` kernel
+(`mla_a8w8_qh32_qseqlen4_gqaratio32_lse_cprr_ps` appears in the server log)
+while QREP is active for every layer -- i.e. `cprr` runs on a QREP-produced
+`q_out`, which is the combination the removed `speculative_config` gate used
+to block.
 
 A layer whose `q_proj` was not built with the QREP override falls back to
 AllGather automatically instead of misreading a narrow q as the wide QREP
 layout, regardless of the global flag — target models, MTP, eagle3, and
 DSpark are all wired today, so this is a safety net for a future model that
-isn't. Each layer logs once, either
-`enable_query_replication is on and active for layer N` (wired) or
-`... but layer N's q_proj was not built with qrep_tp_override ... falling
-back to AllGather Q for it` (not wired).
+isn't.
 
-Check the server log for that per-layer message to see whether QREP actually
-took effect — the flag being `true` is not the same as QREP running.
+The two log lines are deliberately asymmetric, so read them accordingly:
+
+| | When | Granularity |
+|---|---|---|
+| `enable_query_replication is on and active (q_proj built with qrep_tp_override).` | at least one layer is wired | **once per process** (so once per rank), no layer number |
+| `... but layer N's q_proj was not built with qrep_tp_override -- falling back to AllGather Q for it` | a layer is not wired | **once per layer**, names the layer |
+
+So the positive line only tells you QREP is on somewhere; it cannot tell you
+which layers use it. The check that QREP actually took effect on every layer
+is the **absence of any fallback line** — on a fully wired model you should
+see exactly one positive line per rank and no warnings at all. The flag being
+`true` is not the same as QREP running.
 
 Note it costs KV budget: replicating the query heads shrinks the KV pool by
 roughly 5% (measured on DeepSeek-R1 tp8/dcp8: 235 016 → 221 020 blocks).
