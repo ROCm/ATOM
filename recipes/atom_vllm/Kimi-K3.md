@@ -149,8 +149,12 @@ the HBM pool is sized:
 
 **[Kimi-K3 — LMCache KV offload on the vLLM plugin](Kimi-K3-LMCache-Byte-Offload.md)**
 
-Measured there: +10.81% req/s and TTFT p50 −59.1% at `tier / pool = 2.0`,
-against −3.59% for the same connector at `tier / pool = 0.81`.
+Measured there: at the **default, unpinned** HBM pool the tier supplies only
+0.30% of prompt tokens and the ON/OFF throughput difference is not measurable
+(two rulers straddle zero, n=1 per arm) — vLLM's own pool already answers
+85.05%, and on the plugin path the connector is only asked about what the pool
+missed. Pin the pool and the same tier turns on: +10.81% req/s and TTFT p50
+−59.1% at `tier / pool = 2.0`, against −3.59% at `tier / pool = 0.81`.
 
 ## Current scope
 

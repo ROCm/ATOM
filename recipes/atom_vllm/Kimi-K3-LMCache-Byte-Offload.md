@@ -56,25 +56,65 @@ shortens the prefix instead of corrupting it.
 
 ## Server
 
-Add to the DSpark launch in
-[Kimi-K3.md](Kimi-K3.md#speculative-decoding-with-dspark) (prefix caching and
-`--mamba-cache-mode align` are already there and are both **mandatory** for
-offload):
+TP=8 on gfx950 GPUs 0-7, vLLM 0.28 plugin backend with ATOM as an out-of-tree
+plugin, LMCache 0.5.5rc3. This is the complete launch the numbers in *Measured*
+came from — nothing is elided.
 
 ```bash
-export PYTHONHASHSEED=0              # mandatory, see Gotchas in the M3 recipe
+export AITER_LOG_LEVEL=WARNING
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export PYTHONHASHSEED=0                 # mandatory -- see below
 export LMCACHE_LOCAL_CPU=True
-export LMCACHE_MAX_LOCAL_CPU_SIZE=40 # GiB **per TP rank** -- TP8 x 40 = 320 GiB pinned
-export LMCACHE_CHUNK_SIZE=1536       # multiple of the *effective* block size,
-                                     # which vLLM raises to 1536 -- see below
-export OFFLOAD_MIN_LOAD_TOKENS=256   # default 8192 disables the tier for chat-sized prompts
+export LMCACHE_MAX_LOCAL_CPU_SIZE=64    # GiB **per TP rank**; see Sizing the tier
+export LMCACHE_CHUNK_SIZE=1536          # multiple of the *effective* block size
+export LMCACHE_CACHE_POLICY=ATOM_SLRU
+export OFFLOAD_MIN_LOAD_TOKENS=256      # default 8192 disables the tier for chat-sized prompts
+
+MODEL=/models/moonshotai/Kimi-K3
+DRAFT=/models/Inferact/Kimi-K3-DSpark
 
 vllm serve "${MODEL}" \
-    ... the DSpark flags from Kimi-K3.md ... \
+    --host 127.0.0.1 --port 8713 \
+    --tensor-parallel-size 8 \
+    --trust-remote-code \
+    --enable-prefix-caching \
+    --enable-prompt-tokens-details \
+    --mamba-cache-mode align \
+    --kv-cache-dtype fp8 \
+    --max-model-len 65536 \
+    --max-num-seqs 64 \
+    --max-num-batched-tokens 16384 \
+    --gpu-memory-utilization 0.85 \
+    --block-size 128 \
+    --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}' \
+    --speculative-config '{"method":"dspark","model":"'"${DRAFT}"'","num_speculative_tokens":2}' \
+    --additional-config '{"online_quant_config":{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}}' \
     --kv-transfer-config '{"kv_connector":"AtomLMCacheOffloadConnector","kv_connector_module_path":"atom.plugin.vllm.kv_transfer.connector","kv_role":"kv_both","kv_load_failure_policy":"recompute"}'
 ```
 
-Three settings are K3-specific and each one is a hard failure if wrong:
+Drop the final `--kv-transfer-config` line and the `LMCACHE_*` exports, and
+nothing else, to get the OFF arm.
+
+**No `--num-gpu-blocks-override`.** vLLM sizes the pool itself; at
+`--gpu-memory-utilization 0.85` it reports `GPU KV cache size: 1,887,436
+tokens` (1584 blocks), identical on both arms. If you do pin the pool you must
+also pass `--max-model-len`, which is already above.
+
+**`PYTHONHASHSEED=0` is not optional**, and it is needed on the client too.
+Without it each TP worker hashes the same prompt to a different key and the hit
+rate is 0.
+
+**`LMCACHE_CACHE_POLICY=ATOM_SLRU`.** `ATOM_SLRU` is not one of LMCache's own
+policies — LMCache ships fifo/lfu/lru/mru. ATOM registers it into LMCache's
+`POLICY_MAPPING` from `atom/kv_transfer/offload/config.py:build_lmcache_config`,
+which the plugin path reaches through `dense/connector.py`, so the name resolves
+on this path too. Leave the variable unset and you silently get plain `LRU`.
+Read the effective value back out of the rank-0 `Creating LMCacheEngine with
+config:` dump: the `Initializing LRUCachePolicy` line **cannot** tell the two
+apart, because SLRU subclasses LRU and that line is printed by the base
+constructor.
+
+Three further settings are K3-specific and each one is a hard failure if wrong:
 
 - **`--mamba-cache-mode align` is mandatory**, not just useful for DSpark. Any
   other mode keeps the recurrent state where this connector has no hand-off for
@@ -92,16 +132,22 @@ Three settings are K3-specific and each one is a hard failure if wrong:
   mamba page size` (`vllm/platforms/interface.py`). `--block-size 128` does not
   prevent this: it only fixes the *requested* size, and the hybrid alignment
   step overrides it afterwards. On K3 the effective size is **1536**, so read it
-  out of the log rather than assuming the flag won. Only
-  chunk-aligned boundaries are stored and only chunk-aligned boundaries are
-  probed on lookup, so a chunk that ends between two boundaries can never
-  produce a usable pair. The connector validates this at construction and names
-  both numbers if it does not hold.
+  out of the log rather than assuming the flag won. Only chunk-aligned
+  boundaries are stored and only chunk-aligned boundaries are probed on lookup,
+  so a chunk that ends between two boundaries can never produce a usable pair.
+  The connector validates this at construction and names both numbers if it does
+  not hold.
 
 Hybrid models also require vLLM's hybrid memory allocator, which vLLM
 auto-disables for a connector that does not declare `SupportsHMA` — so without
 that declaration K3 plus `--kv-transfer-config` does not mis-save, it does not
 boot. The connector declares it; the check below confirms HMA stayed on.
+
+`ATOM_PREFIX_CACHE_POLICY` and `ATOM_PREFIX_CACHE_PROTECTED_RATIO` are **inert
+here** and are deliberately absent. Their only readers are
+`atom/model_engine/block_manager.py`, the ATOM *native* engine's HBM prefix
+cache; on the plugin path the HBM cache is vLLM's, and nothing under
+`atom/plugin/` instantiates that block manager.
 
 ### Sizing the tier
 
@@ -111,11 +157,12 @@ leg is 2.4x the attention leg and dominates the tier.
 
 The tier can only do work for a turn whose reuse distance — the KV volume other
 requests write between the turn that produced a prefix and the turn that wants
-it back — lands in the half-open band `[HBM pool, tier)`. Shorter than the pool
-and HBM already had it; longer than the tier and both missed. So size the pool
-first, and count the population in the band before booting anything.
+it back — lands in the half-open band `[reusable HBM prefix, tier)`. Shorter
+than the HBM prefix and HBM already had it; longer than the tier and both
+missed. Count the population in that band before booting anything: it is one
+pass over a previous run's `profile_export.jsonl` and it costs no GPU.
 
-**The pool is not `GPU KV cache size`.** That log line is
+**The lower edge of the band is not `GPU KV cache size`.** That log line is
 `max_concurrency x max_model_len`, not a capacity. What caches a reusable prefix
 is the blocks left over once the live requests have taken theirs:
 
@@ -132,68 +179,81 @@ attention term. The `/ 4` is one attention block plus one retained boundary
 block in each of the three mamba groups. Check the whole formula against the
 boot: `num_blocks / Maximum concurrency` printed `1584 / 28.80 = 55`.
 
-At the defaults that leaves `(1584 - 16 x 55) / 4 x 1536 = 270,336` tokens of
-reusable prefix against a `20 GiB / 56,448 = 380,435`-token tier: a band barely
-one part wide. Measured against the reuse distances of this very workload
-(`inferencex-agentx-mvp` on `semianalysis_cc_traces_weka_062126`, two
-independent K3 runs, offline from each run's `profile_export.jsonl`), **2-3% of turns fall in it** —
-the arm can only return a null result, and would do so no matter how the
-connector behaved.
+At the launch above that is `(1584 - 16 x 55) / 4 x 1536 = 270,336` tokens. So
+the band is `[270,336, tier)`, and the only free parameter left is the tier.
+Measured against the reuse distances of this very workload
+(`inferencex-agentx-mvp` on `semianalysis_cc_traces_weka_062126`, offline from a
+previous run's `profile_export.jsonl` at the same 16 lanes, n=466):
 
-| `--num-gpu-blocks-override` | concurrency | reusable prefix | in band @4 lanes | @16 lanes |
-|---|---|---|---|---|
-| 1584 (default) | 28.8 | 270,336 tok | 2-3% | 8-16% |
-| 1300 | 23.6 | 161,280 tok | 16-22% | 18-35% |
-| **1100** | **20.0** | **84,480 tok** | **44-45%** | **36-46%** |
-| 1000 | 18.2 | 46,080 tok | 71-72% | 38-65% |
+| `LMCACHE_MAX_LOCAL_CPU_SIZE` | tier tokens | pinned across TP8 | in band |
+|---|---|---|---|
+| 20 GiB/rank | 380,435 | 160 GiB | 4.3% |
+| 40 GiB/rank | 760,871 | 320 GiB | 14.4% |
+| **64 GiB/rank** | **1,217,394** | **512 GiB** | **18.7%** |
+| 80 GiB/rank | 1,521,742 | 640 GiB | 19.7% |
+| 160 GiB/rank | 3,043,485 | 1280 GiB | 22.5% |
 
-The 4-lane column is measured directly on two independent runs. The 16-lane
-column extrapolates one doubling from a third, measured at 8 lanes in the same
-sweep, over the range that brackets its own 4-to-8 ratio.
+**64 GiB/rank is the knee.** The reuse-distance p90 is 1,100,136 tokens =
+57.8 GiB/rank, so 64 clears it with margin and captures 83% of the population
+the tier can ever reach; 80 buys one more point for another 128 GiB pinned, and
+everything past 160 buys nothing. Size to the *working set*, not to the pool.
 
-**Shrink the pool; do not grow the tier.** Making the tier merely exceed the
-*default* pool would want ~107 GiB/rank, i.e. ~853 GiB pinned across TP8 — the
-arithmetic runs into the host long before it runs into the cards. At 1100 blocks
-the default `20 GiB/rank` tier is already the larger end of the band, so the
-measurement needs no extra host memory at all.
+GLM-5.3's rule (`GLM-5.3-LMCache-Byte-Offload.md`, *Sizing the tier*) — tier
+~1.5x the **reusable** working set — lands in the same place from a different
+direction, and is the cheaper check of the two because it needs no percentiles:
 
-**Do not shorten `--max-model-len` to shrink the pool.** This trace's input
-sequences run past it already (median ISL ~74k tokens against a 65,536 window),
-so a shorter window truncates the workload rather than the pool.
+```
+reusable set = SUM over distinct conversations of (that conversation's largest ISL) x 56,448 B
+             = 580,727 tok x 56,448 B = 30.5 GiB/rank      # 20 conversations, 485 requests
+1.57x        = 47.9 GiB/rank                               # GLM-5.3's own multiplier
+```
+
+So 64 is 2.10x the reusable set — above the rule, not below it. Note the
+denominator: this agentic replay has only **20 distinct conversations** behind
+485 requests, so the reusable set is far smaller than the 1,030 GiB/rank of
+prompt bytes the run actually issues. Size to the former.
+
+**GLM-5.3's `LMCACHE_MAX_LOCAL_CPU_SIZE=256` is that workload's number, not a
+constant, and it cannot be copied here.** It is 1.57x *its* 163.0 GiB/rank
+reusable set, at TP4 (1024 GiB pinned). K3 is TP8, so 256/rank would pin
+2048 GiB against ~850 GiB of host `MemFree` minus a ~128 GiB engine floor —
+a per-rank ceiling of roughly 90 GiB on this machine. Carry the rule across;
+the number does not survive the change in TP.
+
+**The host, not the cards, is what runs out.** 512 GiB pinned plus the engine's
+own ~128 GiB resident floor at TP8 needs ~640 GiB of `MemFree`, against 838 GiB
+here. Check it before launching, and check it **per NUMA node** as well as in
+total: on this host node1 had 7.9 GiB free while node0 had 761 GiB, so a tier
+that fits the machine can still fail to bind locally. The arm script gates on
+`TP x LMC_CPU_GIB x 1.05` and prints both nodes.
 
 Every percentage above is an **upper bound**: landing in the band is necessary
 for the tier to help, not sufficient, because the turn still has to be looked up
-and hit. Only a zero is a hard result.
+and returned. Treat it as a filter that rules configurations out, not as a
+prediction. After the pair runs, recompute the band from its own
+`profile_export.jsonl` rather than carrying these numbers forward.
 
-Reuse distance grows close to **linearly** in lanes. Measured within one K3
-sweep, 4 to 8 lanes moved it x1.90 at p75 and x1.97 at p50, against prompt-length
-distributions 7% apart. Do not measure this across models: a cross-model pair
-varies block size, bytes per token and the prompt-length distribution at the same
-time as the lane count, and attributes the product to lanes alone — doing exactly
-that produced a "sub-linear x2.3" here that the within-model axis then refuted.
-The 1-lane point in the same sweep is no good for it either, for the same reason
-in miniature: its median input sequence is 1.8x the other two.
+The gap between the bound and reality was measured, and it is large: the 64
+GiB/rank row promises **18.7%** and the tier delivered **0.30%** of prompt
+tokens (*Measured*), a factor of 62. The band model asks whether the tier could
+hold the prefix; it does not model the fact that on the plugin path vLLM
+queries the connector only for what the HBM pool already missed. When the pool
+is unpinned and hits 85%, the tier is bidding for the leftover 15% no matter
+how it is sized.
 
-The choice of 1100 survives the whole range anyway — it holds 36-46% at 16 lanes
-where the default holds 8-16%. After the OFF arm runs, recompute the band from
-its own `profile_export.jsonl` at the concurrency actually used, rather than
-carrying any of these numbers forward.
+Set `LMC_CPU_GIB`, `MAX_MODEL_LEN`, `CONC` and any pool override identically on
+both arms: the band is defined by them, and an arm whose band is empty measures
+its own configuration, not the connector.
 
-Set `NUM_GPU_BLOCKS_OVERRIDE`, `MAX_MODEL_LEN`, `CONC` and `LMC_CPU_GIB`
-identically on both arms: the band is defined by the first and last of them, and
-an arm whose band is empty measures its own configuration, not the connector.
-
-**What was actually run was 320 blocks, not 1100.** The table above is an upper
-bound on the in-band population, and 1100 is where it first gets large; the pair
-in *Measured* went further down, to 320 blocks (`GPU KV cache size: 381,300
-tokens`) at 40 GiB/rank, which puts the tier at 2.0x the pool instead of roughly
-level with it. That was chosen from one line of arithmetic before booting
-anything, and it is the reason the result is a clear +10.81% rather than the
-null this measurement returns at the default pool. Two earlier pairs at this
-same window bracket it: at 792 blocks (tier/pool = 0.81) the tier cost **−3.59%**,
-and shrinking the pool from 792 to 320 costs −12.35% without the tier but only
-−1.47% with it. **The sign of the tier's benefit follows `tier / pool`**, and
-that ratio is the number to compute first.
+**Earlier pairs pinned the pool instead, and that is a different regime.** Three
+900s/1800s pairs were run with `--num-gpu-blocks-override`, which moves the
+band's *lower* edge rather than its upper one. There the sign of the tier's
+benefit followed `tier / GPU KV cache size`: at 792 blocks (ratio 0.81) the tier
+cost **−3.59%**; at 320 blocks (ratio 2.0, `GPU KV cache size: 381,300 tokens`,
+40 GiB/rank) it gained **+10.81%**; and shrinking the pool from 792 to 320 cost
+−12.35% without the tier but only −1.47% with it. Those runs also all ran plain
+`LRU`, because `LMCACHE_CACHE_POLICY` was unset. They are kept here as the
+record of how the ratio behaves, not as a configuration to copy.
 
 ### Verify it booted right
 
@@ -287,91 +347,97 @@ Four of these are load-bearing and none is cosmetic:
   it is excluded from the exported records (`benchmark_phase`) and must not be
   extrapolated into the measured window.
 
-One thing the base launch does **not** pass is `--enable-prompt-tokens-details`,
-so aiperf's own prompt-cache columns come back empty and it says so at the foot
-of its summary. That is why every hit rate in *Measured* is read from the
-server's `/metrics` instead. If you want aiperf to compute them too, add the
-flag on both arms — never on one.
+`--enable-prompt-tokens-details` is in the launch above. Without it
+`usage.prompt_tokens_details.cached_tokens` is absent from every exported
+record, aiperf's own prompt-cache columns come back empty, and it says so at the
+foot of its summary. The pair in *Measured* ran without it, which is why every
+hit rate there is read from the server's `/metrics` instead. Whichever way you
+go, set it on both arms — never on one.
 
 ## Measured
 
-A matched ON/OFF pair, back to back in the same slot, same tree
-(`0ad111463`, `atom_dirty=0` recorded at the start of each arm), same model,
-TP8 on MI355, 1800 s per arm, seed 1234. The arms differ in exactly one thing:
-whether the connector is loaded. That is checked rather than asserted — the
-pair check reads the effective tier out of each arm's **log** (`recurrent state
-tier up` / its absence) instead of off the launch environment, and diffs every
-other knob.
+A matched ON/OFF pair, back to back in the same slot, TP8 on MI355, 1800 s per
+arm, conc 16, seed 1234, 800 client entries. This pair **is** the launch in
+*Server*: no `--num-gpu-blocks-override`, `LMCACHE_MAX_LOCAL_CPU_SIZE=64`,
+`LMCACHE_CACHE_POLICY=ATOM_SLRU` (read back from the rank-0 config dump, not
+from the launch env), `--enable-prompt-tokens-details` on. The arms differ in
+exactly one thing: whether the connector is loaded. That is checked rather than
+asserted — the pair check reads the effective tier out of each arm's **log**
+and diffs every other knob.
 
-The server is the block in *Server* with `LMCACHE_MAX_LOCAL_CPU_SIZE=40` and
-`--num-gpu-blocks-override 320`; both arms booted `GPU KV cache size: 381,300
-tokens`. The client is the block in *Client*, identical on both arms.
+Both arms ran `atom_head=cd4c5153c`. One uncontrolled difference is recorded
+rather than hidden: `atom_dirty` was 0 on ON and 1 on OFF, because this recipe
+file itself was edited between the arms. The dirty path is
+`recipes/atom_vllm/Kimi-K3-LMCache-Byte-Offload.md` — documentation, no code.
 
-| full window, 1800 s | req/s | out tok/s | TTFT p50 / p90 | ITL p50 / p90 | preempt |
-|---|---|---|---|---|---|
-| OFF | 0.2397 | 106.28 | 1367 / 5266 ms | 22.28 / 52.79 ms | 35 |
-| ON | **0.2656** | **120.35** | 559 / 1997 ms | 19.79 / 30.48 ms | 2 |
-| | **+10.81%** | **+13.24%** | −59.1% / −62.1% | −11.2% / −42.3% | |
+### The result: no measurable difference
 
-**Where the prompt tokens went.** `vllm:prompt_tokens_by_source_total`, whose
-three components sum to `vllm:prompt_tokens_total` exactly on both arms:
+| full window, 1800 s | req/s | out tok/s | TTFT p50 / p90 | ITL p50 / p90 | preempt | n |
+|---|---|---|---|---|---|---|
+| OFF | 0.2645 | 116.26 | 519 / 1156 ms | 16.46 / 28.52 ms | 0 | 484 |
+| ON | 0.2650 | 119.84 | 543 / 1225 ms | 16.68 / 29.23 ms | 0 | 485 |
+| | +0.21% | +3.08% | +4.4% / +6.0% | +1.3% / +2.5% | | |
+
+**Do not read +3.08% as a gain.** Two rulers over the same two arms straddle
+zero: aiperf's own `req/s` gives **+0.21%**, and recomputing the rate over each
+arm's first-to-last record span gives **−3.73%** (the arms' record spans are
+not equal). With `n=1` per arm and no noise floor, the *sign* is undetermined.
+The honest reading is that the tier changed nothing measurable here.
+
+The validity control also fails, so no steady-state row is quoted either: the
+start-cut sweep is licensed only when the OFF arm is flat, and OFF drifts
+−6.58% across cuts (ON −9.11%). The ON/OFF ratio stays negative at every cut
+(−1.7% to −6.3%), which is at least consistent — it does not turn positive if
+you pick a later window.
+
+### Why the tier had nothing to do
+
+`vllm:prompt_tokens_by_source_total`, whose three components sum to
+`vllm:prompt_tokens_total` exactly on both arms:
 
 | source | OFF | ON |
 |---|---|---|
-| `local_compute` | 16,134,428 (64.01%) | **4,428,242 (16.27%)** |
-| `local_cache_hit` | 9,071,616 (35.99%) | 10,781,184 (39.61%) |
-| `external_kv_transfer` | 0 | **12,006,912 (44.12%)** |
-| total | 25,206,044 | 27,216,338 |
+| `local_compute` | 4,074,976 (14.89%) | 3,969,906 (14.65%) |
+| `local_cache_hit` | 23,288,832 (85.11%) | 23,049,216 (85.05%) |
+| `external_kv_transfer` | 0 | **81,408 (0.30%)** |
+| total | 27,363,808 | 27,100,530 |
 
-Prefill recompute fell by 47.7 pp of prompt tokens, which is where the whole
-result comes from: TTFT moves most, ITL follows second-hand as prefill stops
-competing with decode, and preemptions fall 35 → 2 because a preempted request
-resumes off the tier instead of re-prefilling.
+**The unpinned HBM pool already answers 85.05% of prompt tokens by itself.** On
+the plugin path vLLM asks the connector only about what the pool missed, so the
+tier's entire addressable market is the remaining 14.9% — and within that miss
+tail it answered **2.01%**. Prefill recompute moved 14.89% → 14.65%, i.e. by
+0.24 pp.
 
-Unlike GLM-5.3, **the HBM hit rate also rose** (35.99% → 39.61% of prompt
-tokens) rather than falling slightly. The two percentages still have different
-denominators — on the plugin path vLLM asks the connector only about what the
-HBM pool missed — so they must not be summed as shares of one thing. Within the
-miss tail the tier answered **73.06%**.
+This is the structural point of this configuration, and it is not a tier-sizing
+problem. Compare the pinned-pool pair at the end of *Sizing the tier*: with the
+pool cut to 320 blocks the same tier supplied **44.12%** of prompt tokens and
+bought +10.81% req/s. Same model, same client, same connector — the only
+difference is how much of the working set HBM was allowed to keep. **The tier's
+power is set by the HBM pool, not by `LMCACHE_MAX_LOCAL_CPU_SIZE`.**
 
-**Three instruments, two gaps.** They do not measure the same thing and the
-difference is informative rather than noise:
+### The instruments agreed, for once
 
 | ruler | ON | meaning |
 |---|---|---|
-| `vllm:external_prefix_cache_hits` | 12,498,432 | what scheduler-side lookup **promised** |
-| LMCache `Retrieved` sum / TP=8 | 12,189,312 | what the ranks **delivered** |
-| `prompt_tokens_by_source` external | 12,006,912 | what the engine **counted** |
+| `vllm:external_prefix_cache_hits` | 81,408 | what scheduler-side lookup **promised** |
+| LMCache `Retrieved` sum / TP=8 | 81,408 | what the ranks **delivered** |
+| `prompt_tokens_by_source` external | 81,408 | what the engine **counted** |
 
-The promised→delivered gap of 309,120 closes exactly against
-`Sum(required − retrieved)` over every rank line ÷ 8 — these are 10 KV load
-failures, i.e. chunks evicted between lookup and load, absorbed by
-`kv_load_failure_policy: recompute`. Compute that sum over **all** rank lines;
-the per-event shortcut `affected × failed_ranks / TP` silently misses partial
-retrievals (28 of the 2,568 retrieves here came back partial) and overstated the
-gap by 39% on this arm. The delivered→counted gap of 182,400 is **not**
-explained and is left open rather than papered over.
+Gap 0 on both hops: 392 retrieve lines, all full, no partials, and
+`Sum(required − retrieved)` is 0 — no chunk was evicted between lookup and
+load, so `kv_load_failure_policy: recompute` was never exercised. On the OFF
+arm every external counter is exactly 0, which is the control this pair needs.
 
-**The validity control fails, so no steady-state row is quoted.** The start-cut
-sweep GLM-5.3 uses is only licensed when the OFF arm is flat across cuts. Here
-it is not: OFF drifts −17.1% from t ≥ 0 to t ≥ 1200 (ON −10.5%), because the
-replay's per-request work grows over the window on both arms. What can be said
-is that the **ratio** is stable and non-monotone in the cut — +9.86%, +11.47%,
-+12.86%, +11.44%, +13.56%, +14.68%, +10.54%, +18.57% at cuts 0/100/200/300/450/
-600/900/1200 s — so the drift is common-mode and the full-window +10.81% is not
-an artefact of where the window starts. It is **not** grounds for quoting the
-+14.68% at t ≥ 600 as a steady-state gain.
+`Failed to allocate memory block ... no memory is available` appears 1,992
+times on the ON arm. Read it against *Sizing the tier* rather than as an
+under-size verdict: the per-request cache-bust tails are stored, never reused,
+and evicted, which is what the tier should do with them. The reusable set here
+is 30.5 GiB/rank and the tier was 64.
 
-**Limits.** Each arm is **n=1 in runs**; no dispersion is quoted and the cut
-sweep bounds within-run drift, not run-to-run variance. Two quantities were not
-held fixed and are stated rather than hidden: ISL differs by +1.24% and OSL by
-+2.20% between arms (the replay draws different trajectories once throughput
-differs), and host `MemFree` at launch was 804 GiB (OFF) against 1262 GiB (ON)
-because neighbours released memory in between — neither arm was near the
-ceiling, but the pair is not a controlled test of host pressure. The tier is
-**under-sized on purpose** at 40 GiB/rank: `Failed to allocate memory block`
-appears 8,847 times on the ON arm, so this is a working tier with eviction, not
-a tier that holds the working set.
+**Cost of this configuration.** Pre-allocating 8 x 64 GiB of pinned host memory
+took about 30 minutes, with host `MemFree` falling 838 → 191 GiB. That is the
+real gate at TP8, and it is why GLM-5.3's 256 GiB/rank cannot be copied across
+(see *Sizing the tier*).
 
 **Throughput is all that was measured; accuracy was not.** When it is run, use
 the two-pass method: a single SAVE-only pass measures nothing, so salt the
