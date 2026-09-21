@@ -280,6 +280,11 @@ class DeepseekV41ForCausalLM(nn.Module):
         )
         state = SinglePassHCState.from_embeddings(hidden, self.config.hc_mult)
         engram_embeddings = {} if engram_embeddings is None else engram_embeddings
+        # Fork immediately before layer 0, after embedding and its TP reduce.
+        # This also makes offline forwards obey the lazy staging contract.
+        stage = getattr(engram_embeddings, "stage", None)
+        if stage is not None:
+            stage()
         for spec, layer in zip(self.topology, self.layers):
             rope = self.global_rope if spec.ratio else self.window_rope
             state = layer(
@@ -290,6 +295,8 @@ class DeepseekV41ForCausalLM(nn.Module):
                 engram_embeddings.get(spec.layer_id),
                 image_mask=image_mask,
             )
+        if stage is not None:
+            engram_embeddings.join()
         hidden = state.collapse()
         return hidden
 

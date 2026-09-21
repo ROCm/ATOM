@@ -287,6 +287,11 @@ class EngramHost:
         self.copy_done = torch.cuda.Event() if self.copy_stream is not None else None
         self._copy_pending = False
         self._staged_rows = 0
+        self.overlap = None
+        if self.uva and envs.ATOM_ENGRAM_OVERLAP:
+            from atom.model_engine.engram_staging import EngramStaging
+
+            self.overlap = EngramStaging(self)
 
     @property
     def layer_ids(self):
@@ -686,6 +691,10 @@ class EngramInputPreparer:
         """
         compressed_rows = []
         rows = token_ids.numel() if padded_rows is None else padded_rows
+        if self.host.overlap is not None and (batch is not None or dummy):
+            return EngramInputs(
+                self.host.overlap.prepare(batch, rows), histories, ()
+            )
         if dummy:
             self.host.stage_dummy(rows)
             next_histories = histories

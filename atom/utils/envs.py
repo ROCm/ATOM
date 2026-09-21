@@ -790,6 +790,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENGRAM_CACHE_DIR": lambda: os.getenv(
         "ATOM_ENGRAM_CACHE_DIR", str(Path.home() / ".cache" / "atom" / "engram")
     ),
+    # Overlap hash/UVA lookup and TP reassembly with early layers, using private
+    # IPC state where supported. Requires UVA; set 0 to disable.
+    "ATOM_ENGRAM_OVERLAP": lambda: os.getenv("ATOM_ENGRAM_OVERLAP", "1") == "1",
     # Fuse FP32 post-wkv gating and residual addition; 0 selects the torch reference.
     "ATOM_ENGRAM_FUSED_GATE": lambda: os.getenv("ATOM_ENGRAM_FUSED_GATE", "1") == "1",
 }

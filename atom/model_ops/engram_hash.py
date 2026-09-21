@@ -60,6 +60,7 @@ def _engram_hash_kernel(
     NGRAM: tl.constexpr,
     NHEADS: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    SNAPSHOT: tl.constexpr = False,
 ):
     """One program per token; `NGRAM` lookbacks, `NHEADS` row ids per lookback.
 
@@ -70,9 +71,13 @@ def _engram_hash_kernel(
     substitute -- so the lookback that finds DEAD is itself `PAD`.
     """
     token = tl.program_id(0)
-    batch = tl.load(batch_ids + token)
-    local = token - tl.load(cu_seqlens + batch)
-    row = tl.load(history_index + batch)
+    if SNAPSHOT:
+        padded = tl.load(compressed + token * NGRAM) == -2
+    else:
+        batch = tl.load(batch_ids + token)
+        local = token - tl.load(cu_seqlens + batch)
+        row = tl.load(history_index + batch)
+        padded = False
 
     rolling = tl.zeros((), dtype=tl.int64)
     blocked = tl.zeros((), dtype=tl.int1)
@@ -82,17 +87,20 @@ def _engram_hash_kernel(
     live = heads < NHEADS
 
     for shift in tl.static_range(NGRAM):
-        back = local - shift
-        from_chunk = back >= 0
-        source = tl.where(
-            from_chunk,
-            tl.load(compressed + token - shift, mask=from_chunk, other=0),
-            tl.load(
-                history + row * history_stride + (NGRAM - 1 + back),
-                mask=back < 0,
-                other=-1,
-            ),
-        )
+        if SNAPSHOT:
+            source = tl.load(compressed + token * NGRAM + shift)
+        else:
+            back = local - shift
+            from_chunk = back >= 0
+            source = tl.where(
+                from_chunk,
+                tl.load(compressed + token - shift, mask=from_chunk, other=0),
+                tl.load(
+                    history + row * history_stride + (NGRAM - 1 + back),
+                    mask=back < 0,
+                    other=-1,
+                ),
+            )
         blocked = blocked | (source == -1)
         value = tl.where(blocked, PAD, source).to(tl.int64)
         rolling = rolling ^ (value * tl.load(multipliers + shift))
@@ -100,7 +108,105 @@ def _engram_hash_kernel(
             column = (shift - 1) * NHEADS + heads
             size = tl.load(head_sizes + column, mask=live, other=1)
             offset = tl.load(head_offsets + column, mask=live, other=0)
-            tl.store(out + token * out_stride + column, rolling % size + offset, live)
+            result = tl.where(padded, -1, rolling % size + offset)
+            tl.store(out + token * out_stride + column, result, live)
+
+
+@triton.jit
+def _engram_snapshot_kernel(
+    compressed,
+    batch_ids,
+    cu_seqlens,
+    history,
+    history_index,
+    out,
+    tokens,
+    padded_tokens,
+    history_stride,
+    NGRAM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    live = token < tokens
+    batch = tl.load(batch_ids + token, live, 0)
+    local = token - tl.load(cu_seqlens + batch, live, 0)
+    row = tl.load(history_index + batch, live, 0)
+    for shift in tl.static_range(NGRAM):
+        back = local - shift
+        source = tl.where(
+            back >= 0,
+            tl.load(compressed + token - shift, live & (back >= 0), -1),
+            tl.load(
+                history + row * history_stride + NGRAM - 1 + back,
+                live & (back < 0),
+                -1,
+            ),
+        )
+        # -1 is a real DEAD token; -2 marks padding with no table read.
+        tl.store(
+            out + token * NGRAM + shift,
+            tl.where(live, source, -2),
+            token < padded_tokens,
+        )
+
+
+def engram_snapshot(tables, batch, out):
+    """Freeze lookbacks before the runner advances the committed cursor.
+
+    The output has a stable address across graph buckets and replays. Only
+    this small input copy runs in prepare; per-layer hashing runs in forward.
+    """
+    _check_plane(batch.history, tables)
+    tokens = batch.batch_ids.numel()
+    if out.shape[1:] != (tables.ngram,) or out.shape[0] < tokens:
+        raise ValueError("Engram snapshot must cover all tokens and lookbacks")
+    if not out.is_contiguous():
+        raise ValueError("Engram snapshot must be contiguous")
+    if out.shape[0]:
+        _engram_snapshot_kernel[(triton.cdiv(out.shape[0], 128),)](
+            batch.compressed,
+            batch.batch_ids,
+            batch.cu_seqlens,
+            batch.history,
+            batch.history_index,
+            out,
+            tokens,
+            out.shape[0],
+            batch.history.stride(0),
+            NGRAM=tables.ngram,
+            BLOCK=128,
+        )
+    return out
+
+
+def engram_snapshot_indices(tables, layer_id, snapshot, out):
+    """Hash frozen lookbacks; padding produces -1 so UVA gathers zeros."""
+    tokens = snapshot.shape[0]
+    if snapshot.shape[1:] != (tables.ngram,) or not snapshot.is_contiguous():
+        raise ValueError("Invalid Engram snapshot layout")
+    if out.shape != (tokens, tables.heads) or out.stride(-1) != 1:
+        raise ValueError("Invalid Engram row buffer")
+    if tokens:
+        multipliers, sizes, offsets = tables.layers[layer_id]
+        _engram_hash_kernel[(tokens,)](
+            snapshot,
+            None,
+            None,
+            None,
+            None,
+            multipliers,
+            sizes,
+            offsets,
+            out,
+            0,
+            out.stride(0),
+            PAD=tables.pad_id,
+            NGRAM=tables.ngram,
+            NHEADS=tables.heads // tables.width,
+            BLOCK_H=triton.next_power_of_2(tables.heads // tables.width),
+            SNAPSHOT=True,
+        )
+    return out
 
 
 @triton.jit
