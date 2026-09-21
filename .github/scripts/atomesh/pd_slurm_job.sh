@@ -220,7 +220,8 @@ EOF
     --user "$(id -u):$(id -g)"
     --network host --ipc host
     --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband
-    --cap-add=IPC_LOCK --cap-add=NET_ADMIN
+    # Allow HIP's mbind through Docker's default seccomp for NUMA placement.
+    --cap-add=IPC_LOCK --cap-add=NET_ADMIN --cap-add=SYS_NICE
     --ulimit memlock=-1:-1 --ulimit stack=67108864 --ulimit nofile=65536:524288
     --shm-size=128G
     --env-file "${env_file}"
