@@ -23,9 +23,8 @@ MiniMax-M3, see
 
 **GLM-5.3 is the same architecture and needs nothing from this recipe changed
 but the model path** — see
-[GLM-5.3 LMCache Byte Offload](GLM-5.3-LMCache-Byte-Offload.md), which records
-what was measured to establish that and which of the numbers below do not
-transfer.
+[GLM-5.3 LMCache Byte Offload](GLM-5.3-LMCache-Byte-Offload.md), which carries
+its own launch line, client line and measured ON/OFF pair.
 
 ## Why a separate connector
 
@@ -186,8 +185,8 @@ working point — 64 prefixes, concurrency 8, 600 s — at
 **`LMCACHE_MAX_LOCAL_CPU_SIZE=90`** with **zero** `no memory is available`, so
 the tier does not have to hold the run's whole byte traffic; it evicts the
 cache-bust tails, which are never reused. See
-[GLM-5.3-LMCache-Byte-Offload.md](GLM-5.3-LMCache-Byte-Offload.md#sizing) for
-the construction to size by. Prefer it to 180: at TP=4, 180 is 720 GiB of
+[GLM-5.3-LMCache-Byte-Offload.md](GLM-5.3-LMCache-Byte-Offload.md#sizing-the-tier)
+for the construction to size by. Prefer it to 180: at TP=4, 180 is 720 GiB of
 pinned anon and can exceed what one NUMA node has free.
 
 ## Measured
