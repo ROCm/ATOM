@@ -61,6 +61,46 @@ class Sampler(nn.Module):
         super().__init__()
         self.eps = SAMPLER_EPS
 
+    def sample_verification_tokens(
+        self,
+        logits: torch.Tensor,
+        cu_num_draft_tokens: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor | None,
+        top_ps: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Sample each draft position using its request's sampling parameters.
+
+        Verification rows are ragged: a prefill request can contribute zero
+        drafts while adjacent decode requests contribute different counts.
+        Each position needs independent noise, including positions belonging
+        to the same request. Sharing one draw would correlate successive
+        tokens conditional on the earlier drafts being accepted.
+        """
+        if logits.shape[0] == 0:
+            return torch.empty(0, dtype=torch.int32, device=logits.device)
+        request_indices = torch.bucketize(
+            torch.arange(
+                logits.shape[0], device=logits.device, dtype=cu_num_draft_tokens.dtype
+            ),
+            cu_num_draft_tokens,
+            right=True,
+        )
+
+        def expand_parameter(value):
+            # prepare_sample compresses uniform top-k/top-p to one element.
+            if value is None or value.numel() == 1:
+                return value
+            return value.index_select(0, request_indices)
+
+        return self(
+            logits,
+            temperatures.index_select(0, request_indices),
+            expand_parameter(top_ks),
+            expand_parameter(top_ps),
+            needs_independent_noise=True,
+        )
+
     def forward(
         self,
         logits: torch.Tensor,  # (num_tokens, vocab_size)

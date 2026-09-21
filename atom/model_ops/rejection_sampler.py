@@ -119,6 +119,7 @@ class RejectionSampler(nn.Module):
         target_logits: torch.Tensor,
         # [batch_size, 1]
         bonus_token_ids: torch.Tensor,
+        target_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Ensure target_logits is contiguous. For greedy sampling, we can use
         # logits directly (argmax is the same for logits and probs), but we
@@ -143,6 +144,7 @@ class RejectionSampler(nn.Module):
             bonus_token_ids,
             synthetic_acceptance_rates=self.synthetic_acceptance_rates,
             synthetic_step=self._synthetic_step,
+            target_token_ids=target_token_ids,
         )
         if self.synthetic_acceptance_rates is not None:
             self._synthetic_step += 1
@@ -168,6 +170,7 @@ def rejection_sample(
     synthetic_acceptance_rates: tuple[float, ...] | None = None,
     # Per-step seed for the (rank-consistent) synthetic RNG; ignored otherwise.
     synthetic_step: int = 0,
+    target_token_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert draft_token_ids.ndim == 1
     assert draft_probs is None or draft_probs.ndim == 2
@@ -241,10 +244,17 @@ def rejection_sample(
             num_spec_steps,
             num_warps=1,
         )
-    elif RELAXED_TOP_N <= 1:
-        # Strict greedy path: draft must exactly match target argmax
-        _, target_argmax = topk_select(target_probs, 1, tie="low")
-        target_argmax = target_argmax.view(-1)
+    elif target_token_ids is not None or RELAXED_TOP_N <= 1:
+        # Stochastic verification compares against independent target samples.
+        # Emit the target sample at the first mismatch. This preserves the
+        # target distribution without needing draft probabilities, at the cost
+        # of lower acceptance than probability-ratio rejection sampling.
+        if target_token_ids is None:
+            _, target_argmax = topk_select(target_probs, 1, tie="low")
+            target_argmax = target_argmax.view(-1)
+        else:
+            assert target_token_ids.shape == draft_token_ids.shape
+            target_argmax = target_token_ids.contiguous()
         rejection_greedy_sample_kernel[(batch_size,)](
             output_token_ids,
             num_bonus_tokens,
@@ -294,7 +304,6 @@ def rejection_sample(
 
 
 @triton.jit(do_not_specialize=["num_spec_steps"])
-# TODO use the same sampler as main model
 def rejection_greedy_sample_kernel(
     output_token_ids_ptr,  # [batch_size, num_spec_steps + 1]
     num_bonus_tokens_ptr,

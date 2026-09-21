@@ -3041,10 +3041,29 @@ class ModelRunner:
                     f"logits.shape[0]={logits.shape[0]}"
                 )
 
+            target_token_ids = None
+            if (
+                not all_greedy
+                and self.rejection_sampler.synthetic_acceptance_rates is None
+            ):
+                target_token_ids = self.sampler.sample_verification_tokens(
+                    target_logits,
+                    spec_decode_metadata.cu_num_draft_tokens,
+                    temperatures,
+                    top_ks,
+                    top_ps,
+                )
+                # The accept count controls each rank's cache/state rollback.
+                # Synchronize the samples before computing that count, not
+                # just the emitted tokens after verification.
+                if target_token_ids.numel() and get_tp_group().world_size > 1:
+                    target_token_ids = get_tp_group().broadcast(target_token_ids, src=0)
+
             sampled_tokens, num_bonus_tokens = self.rejection_sampler.forward(
                 spec_decode_metadata,
                 target_logits,
                 bonus_token_ids,
+                target_token_ids=target_token_ids,
             )
             # PCP ranks decode redundantly and are consistent only while their
             # kernels agree bit-for-bit -- they don't (hidden differs by ~1 bf16
