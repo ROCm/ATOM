@@ -305,3 +305,90 @@ def test_a_deferred_probe_skips_the_slot_its_own_step_resets(small_config, devic
     assert cache.cursor[0, 0] == 0
     # The probe carries slot 0's pre-reset row; position 0 is what excludes it.
     cache.prepare_state(cache.begin_step([replace(fresh, request_id=32)]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("decode", [False, True])
+@pytest.mark.parametrize("width", [0, 96, 1025])
+@pytest.mark.parametrize(
+    "ratios", [(0,), (1,), (2,), (0, 1), (0, 2), (1, 2), (0, 1, 2)]
+)
+def test_shared_indptr_launch_matches_row_counts_and_replay(decode, width, ratios):
+    from types import SimpleNamespace
+    from atom.model_ops.attentions.deepseek_v41.indices import fill_step_indptrs
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+
+    geo = V41PoolGeometry(
+        len(ratios),
+        tuple((i, ratio) for i, ratio in enumerate(ratios) if ratio),
+        32,
+        128,
+        512,
+        32,
+        layer_ratios=ratios,
+        index_topk=64,
+    )
+    live = max(0, width - 7)
+    lengths = [live // 3, live // 3, live - 2 * (live // 3)]
+    cu = torch.tensor(
+        [0, lengths[0], sum(lengths[:2]), live], dtype=torch.int32, device="cuda"
+    )
+    batches = torch.cat(
+        [
+            torch.full((n,), b, device="cuda", dtype=torch.int32)
+            for b, n in enumerate(lengths)
+        ]
+        + [torch.full((width - live,), -1, device="cuda", dtype=torch.int32)]
+    )
+    positions = torch.zeros(width, device="cuda", dtype=torch.int32)
+    buffers = {
+        r: (
+            torch.full((width + 1,), -7, device="cuda", dtype=torch.int32),
+            torch.full((width + 1,), -9, device="cuda", dtype=torch.int32),
+        )
+        for r in geo.layer_ratios
+    }
+    step = SimpleNamespace(
+        width=width,
+        decode=decode,
+        positions=positions,
+        batch_ids=batches,
+        cu_seqlens_q=cu,
+    )
+    assert tuple(fill_step_indptrs(step, geo, buffers)) == ratios
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        built = fill_step_indptrs(step, geo, buffers)
+    for starts in [(0, 127, 300), (511, 3, 120)]:
+        pos = []
+        windows, reaches = [], []
+        for start, n in zip(starts, lengths):
+            for j in range(n):
+                absolute = start + j
+                pos.append(absolute)
+                windows.append(
+                    max(0, (absolute + 1 if decode else start) - max(absolute - 127, 0))
+                )
+                reaches.append(min(j + 1, 128))
+        positions.copy_(
+            torch.tensor(pos + [0] * (width - live), device="cuda", dtype=torch.int32)
+        )
+        graph.replay()
+        for ratio, (prefix, extend, topk) in built.items():
+            counts = [
+                w + (min((p + 1) // ratio, topk) if ratio else 0)
+                for w, p in zip(windows, pos)
+            ] + [0] * (width - live)
+            expected = torch.tensor(
+                [0] + list(np.cumsum(counts)), device="cuda", dtype=torch.int32
+            )
+            torch.testing.assert_close(prefix, expected, rtol=0, atol=0)
+            if decode:
+                assert extend.data_ptr() == prefix.data_ptr()
+            else:
+                expected = torch.tensor(
+                    [0] + list(np.cumsum(reaches + [0] * (width - live))),
+                    device="cuda",
+                    dtype=torch.int32,
+                )
+                torch.testing.assert_close(extend, expected, rtol=0, atol=0)

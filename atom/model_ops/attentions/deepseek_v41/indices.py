@@ -75,6 +75,40 @@ def _indptr_scan(
 
 
 @triton.jit
+def _indptr_scan_all(
+    batches,
+    positions,
+    cu,
+    prefixes,
+    extends,
+    tokens,
+    DECODE: tl.constexpr,
+    WINDOW: tl.constexpr,
+    RATIOS: tl.constexpr,
+    TOPKS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # Ratios have independent scans, but share one launch. Each program owns
+    # one output pair; no cross-program prefix or synchronization is needed.
+    for i in tl.static_range(len(RATIOS)):
+        if tl.program_id(0) == i:
+            _indptr_scan(
+                batches,
+                positions,
+                cu,
+                prefixes[i],
+                extends[i],
+                tokens,
+                DECODE,
+                WINDOW,
+                RATIOS[i] or 1,
+                TOPKS[i],
+                not DECODE,
+                BLOCK,
+            )
+
+
+@triton.jit
 def _indices(
     selected,
     pptr,
@@ -159,27 +193,27 @@ def fill_step_indptrs(step, geometry, buffers):
     pass skips, and a table at a fresh address each forward is one its replay
     reads at the capture's.
     """
+    ratios = geometry.layer_ratios
     built = {}
-    for ratio in geometry.layer_ratios:
+    for ratio in ratios:
         prefix, extend = buffers[ratio]
-        topk = geometry.batch_topk(ratio)
         pptr = prefix[: step.width + 1]
         eptr = pptr if step.decode else extend[: step.width + 1]
-        _indptr_scan[(1,)](
+        built[ratio] = (pptr, eptr, geometry.batch_topk(ratio))
+    if ratios:
+        _indptr_scan_all[(len(ratios),)](
             step.batch_ids,
             step.positions,
             step.cu_seqlens_q,
-            pptr,
-            eptr,
+            tuple(built[ratio][0] for ratio in ratios),
+            tuple(built[ratio][1] for ratio in ratios),
             step.width,
             DECODE=step.decode,
             WINDOW=geometry.window_size,
-            RATIO=ratio or 1,
-            TOPK=topk,
-            EXTEND=not step.decode,
-            BLOCK=1024,
+            RATIOS=ratios,
+            TOPKS=tuple(built[ratio][2] for ratio in ratios),
+            BLOCK=min(1024, triton.next_power_of_2(max(step.width, 1))),
         )
-        built[ratio] = (pptr, eptr, topk)
     return built
 
 

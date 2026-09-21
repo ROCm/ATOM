@@ -355,12 +355,15 @@ class PagedAttentionCache:
         starts = step.request_positions[:count]
         ids = [span.request_id for span in step.requests]
         if histories:
-            cursors = self.cursor[step.slots[:count].long()].cpu().numpy()
+            cursors = (
+                torch.index_select(self.cursor, 0, step.slots[:count]).cpu().numpy()
+            )
         else:
             # Issued before the reset below, so a recycled slot is captured as
             # its old tenant left it -- which is why the judge skips position 0.
             self._probe[:count].copy_(
-                self.cursor[step.slots[:count].long()], non_blocking=True
+                torch.index_select(self.cursor, 0, step.slots[:count]),
+                non_blocking=True,
             )
             if self._probe_done is not None:
                 self._probe_done.record()

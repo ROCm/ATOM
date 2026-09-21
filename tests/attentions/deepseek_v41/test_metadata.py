@@ -128,13 +128,13 @@ def test_engram_rows_are_staged_for_the_width_not_for_the_tokens(engram):
     staged = {}
     builder.engram = (
         SimpleNamespace(
-            prepare=lambda spans, tokens, histories, **kwargs: staged.update(
-                tokens=tokens.numel(), **kwargs
-            )
-            or SimpleNamespace(
-                embeddings={0: torch.zeros(1, kwargs["padded_rows"], 16)},
-                histories=histories,
-                compressed_rows=(),
+            prepare=lambda spans, tokens, histories, **kwargs: (
+                staged.update(tokens=tokens.numel(), **kwargs)
+                or SimpleNamespace(
+                    embeddings={0: torch.zeros(1, kwargs["padded_rows"], 16)},
+                    histories=histories,
+                    compressed_rows=(),
+                )
             )
         )
         if engram
@@ -259,3 +259,49 @@ def test_visible_rows_are_the_bound_every_indexer_layer_reads(ratio, positions_d
         step.visible[ratio].untyped_storage().data_ptr()
         == buffers[visible_buffer_name(ratio)].gpu.untyped_storage().data_ptr()
     )
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_block_table_upload_only_when_mapping_changes(device, monkeypatch):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required")
+    from dataclasses import replace
+    from atom.model_ops.attentions.deepseek_v41.metadata import _publish_block_tables
+
+    tables = CpuGpuBuffer(
+        4, 8, dtype=torch.int32, device=device, pin_memory=device != "cpu"
+    )
+    uploads = []
+    original_copy = tables.copy_to_gpu
+
+    def counted_copy(n=None):
+        uploads.append(n)
+        return original_copy(n)
+
+    monkeypatch.setattr(tables, "copy_to_gpu", counted_copy)
+    a = RequestSpan(1, 12, 0, 1, 0, (3, 5))
+    b = RequestSpan(2, 22, 1, 1, 1, (2, 6))
+    cases = [
+        ((a, b), 4, True),
+        ((replace(a, position=13), replace(b, position=23)), 4, False),
+        ((replace(a, block_ids=(3, 5, 7)), b), 4, True),
+        ((b, a), 4, True),
+        ((a,), 4, True),
+        ((a,), 2, True),
+        ((), 2, True),
+        ((), 2, False),
+        ((a, b), 4, True),
+    ]
+    for requests, running_bs, changed in cases:
+        before = len(uploads)
+        result = _publish_block_tables(tables, requests, running_bs)
+        assert len(uploads) - before == int(changed)
+        expected = [list(s.block_ids) + [0] * (8 - len(s.block_ids)) for s in requests]
+        expected += [[0] * 8 for _ in range(running_bs - len(requests))]
+        assert result.tolist() == expected
+        assert result.data_ptr() == tables.gpu.data_ptr()
+    # Replacing the device allocation invalidates reuse even for identical rows.
+    tables.gpu = torch.full_like(tables.gpu, -1)
+    _publish_block_tables(tables, (a, b), 4)
+    assert len(uploads) == sum(c[2] for c in cases) + 1
+    assert tables.gpu[0, :2].tolist() == [3, 5]
