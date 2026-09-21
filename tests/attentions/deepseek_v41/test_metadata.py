@@ -266,6 +266,7 @@ def test_block_table_upload_only_when_mapping_changes(device, monkeypatch):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("ROCm GPU required")
     from dataclasses import replace
+
     from atom.model_ops.attentions.deepseek_v41.metadata import _publish_block_tables
 
     tables = CpuGpuBuffer(

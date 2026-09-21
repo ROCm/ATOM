@@ -315,6 +315,7 @@ def test_a_deferred_probe_skips_the_slot_its_own_step_resets(small_config, devic
 )
 def test_shared_indptr_launch_matches_row_counts_and_replay(decode, width, ratios):
     from types import SimpleNamespace
+
     from atom.model_ops.attentions.deepseek_v41.indices import fill_step_indptrs
     from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 
