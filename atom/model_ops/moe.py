@@ -1022,6 +1022,7 @@ def rocm_aiter_fused_moe_impl(
     a2_scale: torch.Tensor | None = None,
     swiglu_limit: float = 0.0,
     gate_mode: str = GateMode.SEPARATED.value,
+    stage2_max_token_num: int | None = None,
 ) -> torch.Tensor:
     from aiter import ActivationType, QuantType
 
@@ -1044,6 +1045,7 @@ def rocm_aiter_fused_moe_impl(
         a2_scale,
         swiglu_limit=swiglu_limit,
         gate_mode=gate_mode,
+        stage2_max_token_num=stage2_max_token_num,
     )
 
 
@@ -1063,7 +1065,9 @@ def rocm_aiter_fused_moe_fake(
     a2_scale: torch.Tensor | None = None,
     swiglu_limit: float = 0.0,
     gate_mode: str = GateMode.SEPARATED.value,
+    stage2_max_token_num: int | None = None,
 ) -> torch.Tensor:
+    del stage2_max_token_num
     return torch.empty_like(hidden_states)
 
 
@@ -1880,6 +1884,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 else GateMode.SEPARATED.value
             ),
             "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
+            "stage2_max_token_num": self.moe.max_num_tokens,
         }
         if activation == ActivationType.Situv2:
             moe_extra_args["beta"] = getattr(layer, "activation_situ_beta", None)
@@ -3028,6 +3033,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         moe_extra_args = {
             "gate_mode": gate_mode,
             "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
+            "stage2_max_token_num": self.moe.max_num_tokens,
         }
         if self.quant_type == QuantType.per_Tensor or self.fused_experts is None:
             return torch.ops.aiter.rocm_aiter_fused_moe(
