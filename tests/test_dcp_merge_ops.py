@@ -1248,20 +1248,19 @@ def test_decode_width_comes_from_the_matching_table(num_heads, dcp, dtype):
 @needs_dcp_ops
 @pytest.mark.parametrize("rebuild", [False, True])
 @pytest.mark.parametrize("num_heads, dcp", HEAD_WIDTH_SHAPES)
-@pytest.mark.parametrize("dtype", ["bf16", "fp8"])
 def test_sparse_prefill_width_matches_its_own_persistence_predicate(
-    num_heads, dcp, dtype, rebuild
+    num_heads, dcp, rebuild
 ):
     """The pairing this whole file exists for.
 
     The width must come from the table for the mode ``_forward_prefill_mla``
-    will actually run in -- which is NOT decode's mode, because the prefill work
-    metadata is only built on the fp8 branch. Reading decode's answer here is
-    exactly how a bf16 sparse prefill would get padded to gqa=64 and then run
-    non-persistent.
+    will actually run in -- which is NOT decode's mode, because the two call
+    sites switch on different conditions. Reading decode's answer here is
+    exactly how a sparse prefill would get its width chosen for one mode and
+    then run in the other.
     """
     persistent = mla_dcp_sparse_prefill_is_persistent(
-        dtype, dcp, True, sparse_metadata_rebuild=rebuild
+        dcp, True, sparse_metadata_rebuild=rebuild
     )
     w = mla_dcp_sparse_prefill_num_heads(
         num_heads, dcp, HEAD_WIDTH_MIN, persistent=persistent
@@ -1277,6 +1276,26 @@ def test_sparse_prefill_width_matches_its_own_persistence_predicate(
         assert w >= gathered
     if not persistent:
         assert w != 64, "non-persistent sparse prefill must not dispatch gqa=64"
+
+
+@needs_dcp_ops
+def test_sparse_prefill_persistence_does_not_look_at_dtype():
+    """Was gated on KV cache dtype (fp8-only); traced back to a single commit
+    that bundled it with two other, genuinely fp8-only guards (the q/kv
+    quantization scales) while first extending this call path from fp8-only to
+    bf16 -- nothing ties the work metadata itself to dtype (see
+    mla_dcp_sparse_prefill_is_persistent's docstring, and
+    DCP_Further_Optimization2.md §2.8). A value assertion would not catch a
+    dtype parameter re-added as an optional keyword with a default; pin the
+    decoupling at the signature instead.
+    """
+    import inspect
+
+    params = inspect.signature(mla_dcp_sparse_prefill_is_persistent).parameters
+    assert not any("dtype" in p or "kv_cache" in p for p in params), (
+        "the DCP sparse-prefill persistence predicate must not key off KV "
+        f"cache dtype; got parameters {list(params)}"
+    )
 
 
 @needs_dcp_ops
