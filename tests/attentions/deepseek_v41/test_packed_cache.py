@@ -5,6 +5,16 @@ from dataclasses import replace
 
 import pytest
 import torch
+
+if not torch.cuda.is_available():
+    # Ahead of the imports below, not after them: every one of them reaches
+    # Triton, which a CPU runner does not have, and an import that raises
+    # during collection takes the whole session down rather than one file.
+    pytest.skip(
+        "reads a packed pool through a Triton kernel; needs a real GPU",
+        allow_module_level=True,
+    )
+
 import triton
 import triton.language as tl
 

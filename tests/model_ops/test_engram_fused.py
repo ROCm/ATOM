@@ -4,9 +4,12 @@
 import pytest
 import torch
 
-from atom.model_ops.engram_fused import engram_post_wkv, engram_post_wkv_reference
+if not torch.cuda.is_available():
+    # Before the import, which reaches Triton. As a `pytestmark` this ran
+    # after it, so a CPU runner failed collection instead of skipping.
+    pytest.skip("requires GPU", allow_module_level=True)
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+from atom.model_ops.engram_fused import engram_post_wkv, engram_post_wkv_reference
 
 
 def oracle(hidden, kv, weight, mask, eps):

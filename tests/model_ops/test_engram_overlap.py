@@ -12,18 +12,24 @@ import numpy as np
 import pytest
 import torch
 
+if not torch.cuda.is_available():
+    # Before the imports, which reach Triton through the hash kernels. As a
+    # `pytestmark` this ran after them, so a CPU runner failed collection
+    # instead of skipping.
+    pytest.skip("requires GPU", allow_module_level=True)
+
 from atom.model_engine.engram_runtime import EngramBatch
 from atom.model_engine.engram_staging import EngramStaging
+from atom.model_ops.engram import EngramConfig
 from atom.model_ops.engram_hash import (
     EngramHashTables,
+    engram_row_indices_reference,
     engram_snapshot,
     engram_snapshot_indices,
-    engram_row_indices_reference,
 )
 from atom.model_ops.engram_lookup import HostEmbeddingTable
 from tests.model_ops.test_engram_hash import case, compress
-from tests.model_ops.test_engram_hash_bounds import build, tiny_config, V41_FLASH
-from atom.model_ops.engram import EngramConfig
+from tests.model_ops.test_engram_hash_bounds import V41_FLASH, build, tiny_config
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 
@@ -138,10 +144,11 @@ def make_staging(mapping, group=None):
 
 def exercise_replay(group=None):
     from contextlib import nullcontext
+
     from aiter.dist.parallel_state import graph_capture
 
     mapping = build(tiny_config())
-    staging, backing = make_staging(mapping, group)
+    staging, _ = make_staging(mapping, group)
     if group is not None:
         assert staging.collective is not None
         assert staging.collective is not group.device_communicator.ca_comm
@@ -243,9 +250,9 @@ if __name__ == "__main__":
     import os
 
     from aiter.dist.parallel_state import (
-        get_tp_group,
-        destroy_model_parallel,
         destroy_distributed_environment,
+        destroy_model_parallel,
+        get_tp_group,
         init_distributed_environment,
         initialize_model_parallel,
     )

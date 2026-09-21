@@ -4,11 +4,13 @@
 import pytest
 import torch
 
-from atom.model_ops.blockscale import native_quant_linear
+if not torch.cuda.is_available():
+    # Before the import, which reaches Triton through `blockscale`. As a
+    # `pytestmark` this ran after it, so a CPU runner failed collection
+    # instead of skipping.
+    pytest.skip("ROCm GPU required", allow_module_level=True)
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="ROCm GPU required"
-)
+from atom.model_ops.blockscale import native_quant_linear
 
 
 @pytest.mark.parametrize("fp4", [False, True])
