@@ -22,7 +22,11 @@ would silently give the two implementations different rows fails here first.
 import numpy as np
 import pytest
 
-from atom.model_ops.engram import EngramConfig, NgramHashMapping, _next_prime
+from atom.model_ops.engram.mapping import (
+    EngramConfig,
+    NgramHashMapping,
+    _next_prime,
+)
 
 # deepseek-ai/DeepSeek-V4.1-Flash config.json -> text_config, engram block.
 V41_FLASH = {

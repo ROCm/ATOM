@@ -30,19 +30,19 @@ def _single_rank(monkeypatch):
     )
 
 
-from atom.model_engine.engram_runtime import (
+from atom.model_ops.engram.host import (
     EngramHost,
     EngramPrefetchCache,
     EngramPrefetcher,
     EngramRequest,
 )
-from atom.model_ops.engram import (
+from atom.model_ops.engram.mapping import (
     EngramConfig,
     NgramHashMapping,
     _is_prime,
     _next_prime,
 )
-from atom.model_ops.engram_lookup import HostEmbeddingTable
+from atom.model_ops.engram.tables import HostEmbeddingTable
 
 # The engram block of deepseek-ai/DeepSeek-V4.1-Flash config.json -> text_config.
 V41_FLASH = {
@@ -340,7 +340,7 @@ def make_op(hidden=16, engram_hidden=24, hc=2):
     arithmetic that a CPU-only runner can and should still check.
     """
     pytest.importorskip("aiter", reason="EngramOp builds an AITER-backed layer")
-    from atom.model_ops.engram_layer import EngramOp
+    from atom.model_ops.engram.device.layer import EngramOp
 
     op = EngramOp(
         layer_id=1, hidden_size=hidden, engram_hidden_size=engram_hidden, hc_mult=hc
@@ -695,11 +695,11 @@ def patch_tp_group(monkeypatch, group):
 def test_uva_is_the_groups_decision_not_this_ranks(monkeypatch):
     """A rank outvoted after registering falls back AND releases.
 
-    `_stage_uva` ends in an all-gather. A rank that kept the UVA path while a
-    peer took the host path would enter a collective the peer never joins, so
-    one refusal has to turn the whole group around.
+    The device lookup ends in an all-gather. A rank that kept the UVA path
+    while a peer took the host path would enter a collective the peer never
+    joins, so one refusal has to turn the whole group around.
     """
-    from atom.model_engine import engram_runtime
+    from atom.model_ops.engram import host as engram_host
 
     cudart = FakeCudart()
     monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
@@ -708,7 +708,7 @@ def test_uva_is_the_groups_decision_not_this_ranks(monkeypatch):
     def refused(tensor, op=None, group=None):
         tensor.fill_(0)
 
-    monkeypatch.setattr(engram_runtime.dist, "all_reduce", refused)
+    monkeypatch.setattr(engram_host.dist, "all_reduce", refused)
     rt = make_runtime()
     assert (
         rt._enable_uva(rt.prefetcher, rt.prefetcher._hash_mapping.config.num_hash_heads)
@@ -725,13 +725,13 @@ def test_an_empty_shard_registers_nothing(monkeypatch):
     That rank is as unable to take the UVA path as one whose registration was
     refused, and for the collective downstream the two are the same event.
     """
-    from atom.model_engine import engram_runtime
+    from atom.model_ops.engram import host as engram_host
 
     cudart = FakeCudart()
     monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
     # Every peer registered, so this rank's own answer is the only thing that
     # can turn the group around.
-    monkeypatch.setattr(engram_runtime.dist, "all_reduce", lambda *a, **k: None)
+    monkeypatch.setattr(engram_host.dist, "all_reduce", lambda *a, **k: None)
     rt = make_runtime()
     heads = rt.prefetcher._hash_mapping.config.num_hash_heads
     patch_tp_group(
@@ -744,12 +744,12 @@ def test_an_empty_shard_registers_nothing(monkeypatch):
 
 
 def test_uva_survives_a_group_that_agrees(monkeypatch):
-    from atom.model_engine import engram_runtime
+    from atom.model_ops.engram import host as engram_host
 
     cudart = FakeCudart()
     monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
     patch_tp_group(monkeypatch, FakeGroup(world_size=2))
-    monkeypatch.setattr(engram_runtime.dist, "all_reduce", lambda *a, **k: None)
+    monkeypatch.setattr(engram_host.dist, "all_reduce", lambda *a, **k: None)
     rt = make_runtime()
     heads = rt.prefetcher._hash_mapping.config.num_hash_heads
     assert rt._enable_uva(rt.prefetcher, heads) is True

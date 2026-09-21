@@ -7,7 +7,7 @@ token ids and each request's committed history -- one readback each.
 
 `rolling` never carries a sign bit, which is what lets these kernels use the
 hardware's `%` where the reference uses numpy's. It holds by construction and
-`test_engram_hash_bounds.py` pins it, on the host, where CI runs.
+`tests/model_ops/engram/test_hash_bounds.py` pins it, on the host, where CI runs.
 """
 
 from dataclasses import dataclass

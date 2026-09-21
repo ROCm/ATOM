@@ -37,7 +37,7 @@ experts, FP8 Engram projection, and actual layer-1 table rows and projection
 weights. Official tokenizer hashes are checked across chunks, image boundaries
 and accepted prefix lengths, and prefetch and fallback row IDs both match that
 history oracle. Request snapshot identity, ragged staging, padding and
-cancellation live in `tests/model_ops/test_engram.py`. This is module-level
+cancellation live in `tests/model_ops/engram/test_host_path.py`. This is module-level
 validation, not model accuracy.
 
 `test_indexer.py` covers compact candidate blocks, candidate-only Reindex,

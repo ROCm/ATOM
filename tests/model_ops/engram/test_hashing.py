@@ -10,7 +10,7 @@ whose chunk is shorter than the lookback, and the largest compressed id, which
 is where `token * multiplier` comes within 22771 of the sign bit.
 
 Needs triton and a GPU, so CI never runs it (see
-`test_engram_hash_bounds.py` for the part that does). Run it on the box and
+`test_hash_bounds.py` for the part that does). Run it on the box and
 put the result in the commit message.
 """
 
@@ -20,8 +20,7 @@ import torch
 
 pytest.importorskip("triton")
 
-from atom.model_ops.engram import EngramConfig
-from atom.model_ops.engram_hash import (
+from atom.model_ops.engram.device.hashing import (
     EngramHashTables,
     engram_compress,
     engram_cursor_rows,
@@ -29,7 +28,8 @@ from atom.model_ops.engram_hash import (
     engram_row_indices,
     engram_row_indices_reference,
 )
-from tests.model_ops.test_engram_hash_bounds import (
+from atom.model_ops.engram.mapping import EngramConfig
+from tests.model_ops.engram.test_hash_bounds import (
     V41_FLASH,
     build,
     tiny_config,

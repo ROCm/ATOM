@@ -328,7 +328,10 @@ def validate_runtime_config(config):
             not config.enforce_eager
             and graph_mode not in (CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE),
         ),
-        ("torch.compile level (use 0 or 3)", config.compilation_config.level not in (0, 3)),
+        (
+            "torch.compile level (use 0 or 3)",
+            config.compilation_config.level not in (0, 3),
+        ),
         (
             "level 3 CUDA Graph mode (use FULL or enforce_eager=True)",
             config.compilation_config.level == 3

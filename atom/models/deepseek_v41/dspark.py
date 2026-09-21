@@ -9,14 +9,12 @@ from torch import nn
 
 from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.blockscale import native_quant_linear, quantize_fp8
+from atom.model_ops.deepseek_v41.draft_block import DraftStep, draft_step, rotate_rows
 from atom.model_ops.deepseek_v41.dspark import (
-    DraftStep,
     build_block_state,
     draft_attention,
-    draft_step,
     draft_step_indices,
     fused_draft_kv_tail,
-    rotate_rows,
 )
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.deepseek_v41.projections import grouped_output_projection

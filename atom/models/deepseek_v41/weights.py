@@ -14,6 +14,8 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 
+from atom.model_ops.engram.tables import HostEmbeddingTable
+
 from .config import AttentionMode, build_attention_topology
 
 
@@ -389,8 +391,6 @@ class CheckpointReader:
 
     def engram_tables(self, config):
         # Reuse the table implementation from PR #2185, not a second lookup path.
-        from atom.model_ops.engram_lookup import HostEmbeddingTable
-
         tables = {}
         for layer, rows in zip(config.engram_layer_ids, config.engram_num_embeddings):
             name = f"layers.{layer}.engram.embed"

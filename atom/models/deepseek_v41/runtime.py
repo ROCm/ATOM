@@ -85,8 +85,8 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
     # renames, the packed projections and the expert mapping are declared once
     # as tables on `DeepseekV41ForCausalLM` and inherited here rather than
     # restated per model. Engram's mmap tables still come from
-    # `model_loader.deepseek_v41.engram_tables`, which `engram_runtime` imports
-    # directly and does not route through here.
+    # `model_loader.deepseek_v41.engram_tables`, which the Engram runtime
+    # imports directly and does not route through here.
 
     block_cls = RuntimeBlock
 

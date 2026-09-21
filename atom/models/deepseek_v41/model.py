@@ -15,7 +15,7 @@ from atom.model_ops.deepseek_v41.mhc import (
 from atom.model_ops.deepseek_v41.mhc_pre_delayed import pre_delayed
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 from atom.model_ops.embed_head import VocabParallelEmbedding
-from atom.model_ops.engram_layer import EngramOp
+from atom.model_ops.engram.device.layer import EngramOp
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.utils import atom_parameter
@@ -24,7 +24,6 @@ from atom.models.deepseek_v4 import (
     ParallelHead,
     make_v4_quant_config,
 )
-
 
 from .attention import Attention
 from .config import build_attention_topology

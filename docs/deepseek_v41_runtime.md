@@ -18,8 +18,9 @@ published model and end-to-end `lm_eval` scores instead.
   `pool_layout/v41_pool_geometry.py` without model or scheduler imports.
 - `model_loader/deepseek_v41.py` owns native checkpoint loading and mapped-table
   lifetime. Native post-load processing runs exactly once, preserving W4A8/QAT.
-- `model_engine/engram_runtime.py` prepares Engram rows after final GPU token IDs
-  and restored state are available. There is no separate committed history map.
+- `model_ops/engram/` prepares Engram rows after final GPU token IDs and restored
+  state are available. There is no separate committed history map. Its host half
+  (`mapping`, `tables`, `host`) imports without Triton; `device/` does not.
 - Scheduler consumes the existing generic `StateTransfer.copy` capability.
   The only scheduling change fixes cancellation of requests with no sampled
   output, including a middle prefill chunk and the first deferred step.

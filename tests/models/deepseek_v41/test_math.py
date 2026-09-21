@@ -11,7 +11,11 @@ import pytest
 import torch
 from torch import nn
 
-from atom.model_ops.engram import CompressedTokenizer, EngramConfig, NgramHashMapping
+from atom.model_ops.engram.mapping import (
+    CompressedTokenizer,
+    EngramConfig,
+    NgramHashMapping,
+)
 
 
 @contextmanager
@@ -171,7 +175,7 @@ def _reference_engram(reference, target):
 def test_engram_fp32_gate_residual_and_image_mask(reference, single_rank):
     torch.manual_seed(192)
     with bf16_default():
-        from atom.model_ops.engram_layer import EngramOp
+        from atom.model_ops.engram.device.layer import EngramOp
 
         target = EngramOp(1, hidden_size=32, engram_hidden_size=64, hc_mult=4).cuda()
     # ATOM layers allocate uninitialized -- weights arrive from a checkpoint.
@@ -196,7 +200,7 @@ def test_engram_fp32_gate_residual_and_image_mask(reference, single_rank):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 def test_zero_engram_dot_preserves_signed_sqrt_contract(reference, single_rank):
-    from atom.model_ops.engram_layer import EngramOp
+    from atom.model_ops.engram.device.layer import EngramOp
 
     target = EngramOp(1, hidden_size=32, engram_hidden_size=32, hc_mult=4).cuda()
     target.wkv.weight.data.zero_()
@@ -262,7 +266,7 @@ def test_real_tokenizer_history_images_and_accepted_prefix(reference, single_ran
     )
     mask = tokens != 129264
     expected = source(torch.from_numpy(tokens), 0, torch.from_numpy(mask)).numpy()
-    from atom.model_engine.engram_runtime import EngramPrefetcher, EngramRequest
+    from atom.model_ops.engram.host import EngramPrefetcher, EngramRequest
 
     class RowIds:
         def gather(self, rows):
@@ -397,7 +401,7 @@ def test_w4a8_expert_against_reference(reference, projection_factory):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 def test_native_engram_projection_and_gpu_gate(reference, native_quant):
-    from atom.model_ops.engram_layer import EngramOp
+    from atom.model_ops.engram.device.layer import EngramOp
 
     torch.manual_seed(114)
     with bf16_default():
@@ -446,7 +450,7 @@ def test_native_engram_projection_and_gpu_gate(reference, native_quant):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 def test_real_engram_weights_and_native_table_rows(reference, native_quant):
     from atom.config import get_hf_config
-    from atom.model_ops.engram_layer import EngramOp
+    from atom.model_ops.engram.device.layer import EngramOp
     from atom.models.deepseek_v41.weights import (
         CheckpointReader,
         build_weight_manifest,

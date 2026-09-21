@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: MIT
-"""Independent draft masks, ragged positions and the draft heads' checkpoint names."""
+"""Independent draft masks, ragged positions and the draft heads' checkpoint names.
+
+Every import here is plain torch, so a CPU-only runner checks all of it. The
+one case that needed a Triton kernel is `test_draft_attention.py`.
+"""
 
 import pytest
 import torch
 
-from atom.model_ops.deepseek_v41.dspark import draft_attention, draft_step, rotate_rows
+from atom.model_ops.deepseek_v41.draft_block import draft_step, rotate_rows
+from atom.models.deepseek_v4_dspark import DSparkConfidenceHead, DSparkMarkovHead
 
 
 def _rope():
@@ -21,9 +26,6 @@ def _draft_model():
     from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
 
     return DeepseekV41DSpark
-
-
-from atom.models.deepseek_v4_dspark import DSparkConfidenceHead, DSparkMarkovHead
 
 
 def test_block_mask_keeps_all_draft_rows_and_only_the_visible_window():
@@ -61,34 +63,6 @@ def test_rope_ragged_request_positions(device, inverse):
     )
     actual = rotate_rows(rope, hidden.clone(), positions, inverse=inverse)
     assert torch.equal(actual, expected)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-def test_draft_attention_against_dense_sink_oracle():
-    device = "cuda"
-    torch.manual_seed(901)
-    query = torch.randn(2, 5, 8, 512, dtype=torch.bfloat16, device=device)
-    context = torch.randn(2, 8, 512, dtype=torch.bfloat16, device=device)
-    keys = torch.randn(2, 5, 512, dtype=torch.bfloat16, device=device)
-    sink = torch.randn(8, device=device)
-    context_positions = torch.arange(8, device=device).expand(2, -1)
-    anchors = torch.tensor([3, 6], device=device)
-    step = draft_step(context_positions, anchors, 5, 4)
-    all_keys = torch.cat((context, keys), dim=1).float()
-    scores = torch.einsum("bthd,bsd->bhts", query.float(), all_keys) * 512**-0.5
-    mask = (context_positions <= anchors[:, None]) & (
-        context_positions > anchors[:, None] - 4
-    )
-    mask = torch.cat((mask, torch.ones(2, 5, dtype=torch.bool, device=device)), dim=1)
-    scores.masked_fill_(~mask[:, None, None], -torch.inf)
-    scores = torch.cat((scores, sink[None, :, None, None].expand(2, -1, 5, -1)), dim=-1)
-    probabilities = scores.softmax(-1)[..., :-1]
-    expected = torch.einsum("bhts,bsd->bthd", probabilities, all_keys).bfloat16()
-    original = context.clone()
-    actual = draft_attention(query, context, keys, sink, step, 512**-0.5)
-    assert torch.equal(context, original)
-    error = (actual.float() - expected.float()).norm() / expected.float().norm()
-    assert error < 0.004
 
 
 def test_draft_head_names_and_width_match_the_v41_checkpoint():

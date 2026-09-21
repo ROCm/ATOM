@@ -2,7 +2,7 @@
 """Engram configuration, tokenizer compression and n-gram hashing.
 
 Derived from ROCm/ATOM PR #2185. Table residency and asynchronous staging live
-in engram_lookup and model_engine.engram_runtime, respectively.
+in `tables` and `host`, respectively; every kernel is under `device/`.
 """
 
 from __future__ import annotations
