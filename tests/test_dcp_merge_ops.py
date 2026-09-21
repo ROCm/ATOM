@@ -35,6 +35,8 @@ module-level skip would take the config tests down with it on the CPU CI
 runner, and those are the only ones that gate actually runs.
 """
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -46,9 +48,9 @@ import torch
 from atom.config import (
     DCPConfig,
     mla_dcp_sparse_prefill_is_persistent,
+    q_proj_is_qrep_widened,
     qrep_enabled_for_layer,
     qrep_unsupported_reason,
-    q_proj_is_qrep_widened,
 )
 
 try:
@@ -1001,6 +1003,138 @@ def test_qrep_enabled_for_layer_is_the_and_not_just_the_helper():
     assert not qrep_enabled_for_layer(
         True, narrow, qrep_num_heads=64, qk_head_dim=128
     ), "must not enable QREP for a layer whose q_proj was never widened"
+
+
+# ──────────────── QREP wiring at the q_proj producers (CPU, source-level) ──
+#
+# `q_proj_is_qrep_widened` above is the safety net: a q_proj that was never
+# widened falls back to AllGather instead of being misread as the wide layout.
+# These pin the other half -- that the models which are SUPPOSED to get QREP do
+# pass `qrep_tp_override` into the query projection. Nothing else covers it:
+# dropping the override from a draft model leaves every other test in this file
+# green, and the only symptom is an AllGather saving silently lost.
+#
+# Read from source (ast) rather than by constructing a layer: a real K3DSpark /
+# Eagle3 attention needs a distributed env and a GPU, which would put this
+# behind @needs_gpu -- off the CPU gate where the rest of the QREP coverage
+# deliberately lives.
+
+_ATOM_MODELS = Path(__file__).resolve().parent.parent / "atom" / "models"
+
+# Query projections here must carry qrep_tp_override.
+_QREP_WIRED_MODELS = (
+    "deepseek_v2.py",  # DeepSeek V2/V3/V3.2 and GLM-5.2 (GlmMoeDsaForCausalLM)
+    "kimi_k3.py",  # Kimi-K3 target
+    "kimi_k3_dspark.py",  # DSpark draft for Kimi-K3
+    "eagle3_deepseek_mla.py",  # eagle3 MLA draft
+)
+
+# MLA models that deliberately do NOT wire QREP, with the reason. A newly added
+# MLA model has to land in one list or the other -- that is what the census
+# below forces, so "nobody remembered the override" cannot pass silently.
+_QREP_UNWIRED_MODELS = {
+    "glm5_next.py": (
+        "GLM-5.3-Flash wraps q_proj in _ZeroRopePad, which hardcodes the "
+        "per-rank head count and exposes no .weight for the width check to see "
+        "through; wiring it takes three coordinated changes, not the one-line "
+        "override."
+    ),
+}
+
+
+def _q_proj_linear_calls(path):
+    """Module tree plus every ``self.q_proj``/``self.q_b_proj = <Linear>(...)``."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+            continue
+        for target in node.targets:
+            if (
+                isinstance(target, ast.Attribute)
+                and target.attr in ("q_proj", "q_b_proj")
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+            ):
+                found.append((target.attr, node.value, node.lineno))
+    return tree, found
+
+
+def _qrep_override_names(tree):
+    """Local names bound to ``qrep_tp_override(...)`` anywhere in the module.
+
+    The four wired models spell it two ways -- `**qrep_tp_override(tp)` inline,
+    or `x = qrep_tp_override(tp)` once and `**x` at the call. Matching only the
+    inline form would pin the spelling instead of the property, and would have
+    passed exactly one of the four.
+    """
+    names = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "qrep_tp_override"
+        ):
+            names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+    return names
+
+
+def _passes_qrep_override(call, override_names):
+    """Whether the call gets `qrep_tp_override`'s kwargs, inline or via a name."""
+    for kw in call.keywords:
+        if kw.arg is not None:
+            continue
+        v = kw.value
+        if (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Name)
+            and v.func.id == "qrep_tp_override"
+        ):
+            return True
+        if isinstance(v, ast.Name) and v.id in override_names:
+            return True
+    return False
+
+
+@pytest.mark.parametrize("filename", _QREP_WIRED_MODELS)
+def test_q_proj_producers_pass_qrep_tp_override(filename):
+    """Both target models and both speculative drafts must widen q_proj.
+
+    The drafts are the ones with no other coverage at all: a draft builds its
+    own q_proj independently of the target, so forgetting the override there
+    costs the AllGather saving for those layers while every functional test
+    still passes.
+    """
+    path = _ATOM_MODELS / filename
+    tree, calls = _q_proj_linear_calls(path)
+    assert calls, f"{filename}: no self.q_proj/self.q_b_proj assignment found"
+    override_names = _qrep_override_names(tree)
+    missing = [
+        f"{filename}:{lineno} (self.{attr})"
+        for attr, call, lineno in calls
+        if not _passes_qrep_override(call, override_names)
+    ]
+    assert not missing, (
+        "query projections built without qrep_tp_override -- MLAAttention will "
+        "fall back to AllGather Q for their layers: " + ", ".join(missing)
+    )
+
+
+def test_every_mla_model_has_an_explicit_qrep_decision():
+    """A new MLA model must be classified, not silently left unwired."""
+    producers = {
+        path.name
+        for path in _ATOM_MODELS.glob("*.py")
+        if "MLAModules(" in path.read_text(encoding="utf-8")
+    }
+    undecided = producers - set(_QREP_WIRED_MODELS) - set(_QREP_UNWIRED_MODELS)
+    assert not undecided, (
+        "these models build an MLA q_proj but are in neither the QREP-wired "
+        f"list nor the documented-unwired list: {sorted(undecided)}. Add "
+        "qrep_tp_override to the query projection, or record why it cannot be "
+        "wired in _QREP_UNWIRED_MODELS."
+    )
 
 
 # ═══════════════════════════════ ColumnParallelLinear.make_row_view (GPU) ══
