@@ -568,9 +568,9 @@ class Scheduler:
 
         # Speculative decoding. A P/D producer is excluded for the same reason
         # `PrefillScheduler` is: it prefills, samples T0 and hands the request
-        # off, so it never proposes. ModelRunner disables deferred output on a
-        # producer (the consumer must consume T0 exactly once, or KDA state
-        # advances twice), and `propose()` only runs on the deferred path.
+        # off, so it never proposes. That holds for every producer, so this
+        # does not follow the runner's deferred-output decision, which
+        # additionally asks whether the model keeps recurrent state.
         # Leaving speculation on here would still pad every sequence with
         # `mtp_k` placeholders and size its decode window to `mtp_k + 1`, and
         # the padding holds `num_tokens` `mtp_k` short of `max_tokens` so the

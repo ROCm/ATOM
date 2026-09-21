@@ -197,15 +197,19 @@ class tokenIDProcessor:
     ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
         kv_cfg = getattr(runner.config, "kv_transfer_config", {}) or {}
-        is_remote_prefill_producer = _kv_config_has_producer(kv_cfg)
         self.is_pipeline_parallel = (
             getattr(runner.config, "pipeline_parallel_size", 1) > 1
         )
-        # P/D hands off prompt-end state plus the first sampled token.
-        # Disable deferred output on the producer so the consumer processes that
-        # token only once, avoiding duplicate state updates (e.g. Kimi-K3 KDA).
+        # P/D hands off prompt-end state plus the first sampled token. Deferred
+        # output makes the producer decode once more to surface that token, so
+        # the consumer applies T0 to a state that already has it. Only a
+        # recurrent state notices -- a paged write lands at T0's own position,
+        # so repeating it is idempotent.
+        hands_off_recurrent_state = (
+            _kv_config_has_producer(kv_cfg) and runner.attn_family.has_recurrent_state
+        )
         self.is_deferred_out = (
-            not self.is_pipeline_parallel and not is_remote_prefill_producer
+            not self.is_pipeline_parallel and not hands_off_recurrent_state
         )
 
         self.runner = runner
