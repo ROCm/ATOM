@@ -249,7 +249,7 @@ models:
 
         # Keep each AgentX concurrency in its own job so every measurement starts
         # from a fresh ATOM service instead of inheriting HBM prefix-cache state.
-        # Match the standalone TP4 recipe: MTP5, AL 3.61, and 2 * CONC sequences.
+        # Match the standalone TP4 recipe: MTP5 and AL 3.61.
         - <<: &glm52_agentic_tp4_tp4
             topology: 1p1d
             pd_worker_layout: single_node
@@ -262,9 +262,9 @@ models:
                 block_size: 16
                 gpu_memory_utilization: 0.95
                 max_model_len: ""
-                max_num_seqs: 2
+                max_num_seqs: 512
                 enable_prefix_caching: true
-                decode_max_num_seqs: 2
+                decode_max_num_seqs: 512
                 max_num_batched_tokens: 16384
                 decode_max_num_batched_tokens: 16384
                 online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*"]}'
@@ -279,12 +279,6 @@ models:
                 MC_DISABLE_HIP: "1"
                 PYTHONNOUSERSITE: "1"
                 PYTHONHASHSEED: "0"
-                # Keep the recipe's offload settings; the PD connector is Mooncake.
-                LMCACHE_LOCAL_CPU: "True"
-                LMCACHE_NUMA_MODE: auto
-                LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
-                LMCACHE_CHUNK_SIZE: "256"
-                OFFLOAD_MIN_LOAD_TOKENS: "8192"
               prefill:
                 HIP_VISIBLE_DEVICES: "0,1,2,3"
               decode:
@@ -319,11 +313,6 @@ models:
         - <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c2
           concurrency: [2]
-          server:
-            common_args:
-              <<: *glm52_agentic_args
-              max_num_seqs: 4
-              decode_max_num_seqs: 4
           prefill: &glm52_agentic_tp4_c2_worker
             <<: *glm52_agentic_tp4_worker
             cudagraph: "[1,2,4]"
@@ -332,11 +321,6 @@ models:
         - <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c4
           concurrency: [4]
-          server:
-            common_args:
-              <<: *glm52_agentic_args
-              max_num_seqs: 8
-              decode_max_num_seqs: 8
           prefill: &glm52_agentic_tp4_c4_worker
             <<: *glm52_agentic_tp4_worker
             cudagraph: "[1,2,4,8]"
@@ -345,11 +329,6 @@ models:
         - <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c8
           concurrency: [8]
-          server:
-            common_args:
-              <<: *glm52_agentic_args
-              max_num_seqs: 16
-              decode_max_num_seqs: 16
           prefill: &glm52_agentic_tp4_c8_worker
             <<: *glm52_agentic_tp4_worker
             cudagraph: "[1,2,4,8,12,16]"
