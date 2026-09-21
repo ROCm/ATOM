@@ -284,11 +284,110 @@ silently if they are wrong:
   would mean this model is not on the kernel-block path and the check above is
   the one that matters.
 
-**Accuracy and hit rate: not yet run.** The numbers earlier in this section are
+**Accuracy: not yet run.** The accuracy requirements earlier in this section are
 requirements, not measurements. When they are run, use the two-pass method: a
 single SAVE-only pass measures nothing, so salt the prefixes to defeat the GPU
 prefix cache, size the HBM pool below the working set to force read-back, and
 take the noise floor from the OFF arm's own two-pass delta.
+
+### Measured
+
+A matched ON/OFF pair, back to back in the same slot, same tree
+(`0ad111463`, `atom_dirty=0` recorded at the start of each arm), same model,
+TP8 on MI355, 1800 s per arm, seed 1234. The arms differ in exactly one thing:
+whether the connector is loaded. That is checked rather than asserted — the
+pair check reads the effective tier out of each arm's **log** (`recurrent state
+tier up` / its absence) instead of off the launch environment, and diffs every
+other knob.
+
+Server as above with `LMCACHE_MAX_LOCAL_CPU_SIZE=40` and
+`--num-gpu-blocks-override 320`; both arms booted `GPU KV cache size: 381,300
+tokens`. Client is the agentic replay, not a synthetic prefix pool:
+
+```bash
+aiperf profile --scenario inferencex-agentx-mvp \
+  --public-dataset semianalysis_cc_traces_weka_062126 \
+  --url "http://127.0.0.1:8713" --endpoint /v1/chat/completions \
+  --endpoint-type chat --streaming --model "${MODEL}" \
+  --concurrency 16 --benchmark-duration 1800 --random-seed 1234 \
+  --num-dataset-entries 800 --max-context-length 65536 \
+  --warmup-requests-per-lane 10 --warmup-grace-period 1800 \
+  --trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75 \
+  --trace-idle-gap-cap-seconds 300 --use-server-token-count \
+  --tokenizer "${MODEL}" --tokenizer-trust-remote-code \
+  --server-metrics "http://127.0.0.1:8713/metrics" --no-gpu-telemetry
+```
+
+`--num-dataset-entries 800` is sized to the window, not copied from a shorter
+run: 900 s drew 416 records against 400 entries, already at the replay edge, so
+doubling the duration without doubling the pool would have replayed prompts and
+inflated the late window on both arms.
+
+| full window, 1800 s | req/s | out tok/s | TTFT p50 / p90 | ITL p50 / p90 | preempt |
+|---|---|---|---|---|---|
+| OFF | 0.2397 | 106.28 | 1367 / 5266 ms | 22.28 / 52.79 ms | 35 |
+| ON | **0.2656** | **120.35** | 559 / 1997 ms | 19.79 / 30.48 ms | 2 |
+| | **+10.81%** | **+13.24%** | −59.1% / −62.1% | −11.2% / −42.3% | |
+
+**Where the prompt tokens went.** `vllm:prompt_tokens_by_source_total`, whose
+three components sum to `vllm:prompt_tokens_total` exactly on both arms:
+
+| source | OFF | ON |
+|---|---|---|
+| `local_compute` | 16,134,428 (64.01%) | **4,428,242 (16.27%)** |
+| `local_cache_hit` | 9,071,616 (35.99%) | 10,781,184 (39.61%) |
+| `external_kv_transfer` | 0 | **12,006,912 (44.12%)** |
+| total | 25,206,044 | 27,216,338 |
+
+Prefill recompute fell by 47.7 pp of prompt tokens, which is where the whole
+result comes from: TTFT moves most, ITL follows second-hand as prefill stops
+competing with decode, and preemptions fall 35 → 2 because a preempted request
+resumes off the tier instead of re-prefilling.
+
+Unlike GLM-5.3, **the HBM hit rate also rose** (35.99% → 39.61% of prompt
+tokens) rather than falling slightly. The two percentages still have different
+denominators — on the plugin path vLLM asks the connector only about what the
+HBM pool missed — so they must not be summed as shares of one thing. Within the
+miss tail the tier answered **73.06%**.
+
+**Three instruments, two gaps.** They do not measure the same thing and the
+difference is informative rather than noise:
+
+| ruler | ON | meaning |
+|---|---|---|
+| `vllm:external_prefix_cache_hits` | 12,498,432 | what scheduler-side lookup **promised** |
+| LMCache `Retrieved` sum / TP=8 | 12,189,312 | what the ranks **delivered** |
+| `prompt_tokens_by_source` external | 12,006,912 | what the engine **counted** |
+
+The promised→delivered gap of 309,120 closes exactly against
+`Sum(required − retrieved)` over every rank line ÷ 8 — these are 10 KV load
+failures, i.e. chunks evicted between lookup and load, absorbed by
+`kv_load_failure_policy: recompute`. Compute that sum over **all** rank lines;
+the per-event shortcut `affected × failed_ranks / TP` silently misses partial
+retrievals (28 of the 2,568 retrieves here came back partial) and overstated the
+gap by 39% on this arm. The delivered→counted gap of 182,400 is **not**
+explained and is left open rather than papered over.
+
+**The validity control fails, so no steady-state row is quoted.** The start-cut
+sweep GLM-5.3 uses is only licensed when the OFF arm is flat across cuts. Here
+it is not: OFF drifts −17.1% from t ≥ 0 to t ≥ 1200 (ON −10.5%), because the
+replay's per-request work grows over the window on both arms. What can be said
+is that the **ratio** is stable and non-monotone in the cut — +9.86%, +11.47%,
++12.86%, +11.44%, +13.56%, +14.68%, +10.54%, +18.57% at cuts 0/100/200/300/450/
+600/900/1200 s — so the drift is common-mode and the full-window +10.81% is not
+an artefact of where the window starts. It is **not** grounds for quoting the
++14.68% at t ≥ 600 as a steady-state gain.
+
+**Limits.** Each arm is **n=1 in runs**; no dispersion is quoted and the cut
+sweep bounds within-run drift, not run-to-run variance. Two quantities were not
+held fixed and are stated rather than hidden: ISL differs by +1.24% and OSL by
++2.20% between arms (the replay draws different trajectories once throughput
+differs), and host `MemFree` at launch was 804 GiB (OFF) against 1262 GiB (ON)
+because neighbours released memory in between — neither arm was near the
+ceiling, but the pair is not a controlled test of host pressure. The tier is
+**under-sized on purpose** at 40 GiB/rank: `Failed to allocate memory block`
+appears 8,847 times on the ON arm, so this is a working tier with eviction, not
+a tier that holds the working set.
 
 ### Sizing the two ends before spending GPU time
 
@@ -369,6 +468,18 @@ carrying any of these numbers forward.
 Set `NUM_GPU_BLOCKS_OVERRIDE`, `MAX_MODEL_LEN`, `CONC` and `LMC_CPU_GIB`
 identically on both arms: the band is defined by the first and last of them, and
 an arm whose band is empty measures its own configuration, not the connector.
+
+**What was actually run was 320 blocks, not 1100.** The table above is an upper
+bound on the in-band population, and 1100 is where it first gets large; the pair
+in *Measured* went further down, to 320 blocks (`GPU KV cache size: 381,300
+tokens`) at 40 GiB/rank, which puts the tier at 2.0x the pool instead of roughly
+level with it. That was chosen from one line of arithmetic before booting
+anything, and it is the reason the result is a clear +10.81% rather than the
+null this measurement returns at the default pool. Two earlier pairs at this
+same window bracket it: at 792 blocks (tier/pool = 0.81) the tier cost **−3.59%**,
+and shrinking the pool from 792 to 320 costs −12.35% without the tier but only
+−1.47% with it. **The sign of the tier's benefit follows `tier / pool`**, and
+that ratio is the number to compute first.
 
 ## Current scope
 
