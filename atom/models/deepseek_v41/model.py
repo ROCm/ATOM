@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Full-layer eager text backbone. Checkpoint I/O and request preparation live outside."""
 
+from types import SimpleNamespace
 from typing import ClassVar
 
 import torch
@@ -24,6 +25,7 @@ from atom.models.deepseek_v4 import (
     ParallelHead,
     make_v4_quant_config,
 )
+from atom.utils.forward_context import get_forward_context
 
 from .attention import Attention
 from .config import build_attention_topology
@@ -144,7 +146,7 @@ class Block(nn.Module):
         hidden, residual, pre, post, comb = self.prepare_ffn(
             output, residual, pre, post, comb
         )
-        output = self.ffn(hidden, image_mask)
+        output = self.ffn(hidden)
         return SinglePassHCState(*self.finish_ffn(output, residual, pre, post, comb))
 
 
@@ -333,14 +335,22 @@ class DeepseekV41ForCausalLM(nn.Module):
         ):
             raise ValueError("logits_start requires a valid full-logits suffix")
         step = cache.begin_step(cache.position, token_ids.shape[1], token_ids.shape[0])
-        hidden = self.forward_hidden(
-            token_ids,
-            cache,
-            step,
-            engram_embeddings,
-            inputs_embeds=inputs_embeds,
-            image_mask=image_mask,
-        )
+        # Serving publishes this metadata in the attention backend. The offline
+        # entry owns it for one call too, so every MoE uses the same fixed hook.
+        context = get_forward_context()
+        previous = context.attn_metadata
+        context.attn_metadata = SimpleNamespace(image_mask=image_mask)
+        try:
+            hidden = self.forward_hidden(
+                token_ids,
+                cache,
+                step,
+                engram_embeddings,
+                inputs_embeds=inputs_embeds,
+                image_mask=image_mask,
+            )
+        finally:
+            context.attn_metadata = previous
         hidden = hidden[:, logits_start:] if full_logits else hidden[:, -1]
         logits = self.head.get_logits(self.norm(hidden).flatten(0, -2)).unflatten(
             0, hidden.shape[:-1]
