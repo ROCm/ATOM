@@ -110,6 +110,52 @@ def _kpool_pool_counts(seq_lens_k: torch.Tensor, pool_size: int) -> torch.Tensor
     return seq_lens_k.to(torch.int64) // pool_size
 
 
+def _kpool_fill_dense_topk(
+    topk_indices: torch.Tensor,
+    positions: torch.Tensor,
+    attn_metadata,
+    block_size: int,
+    topk_out_width: int,
+    sparse_kv_indices_buffer: torch.Tensor,
+) -> None:
+    """Populate sparse_kv_indices_buffer for short sequences (dense attention).
+
+    When all sequences are shorter than index_topk, the kpool indexer skips the
+    pool scoring and top-k selection, but the MLA layer still needs
+    sparse_kv_indices_buffer filled with valid causal KV block addresses.
+
+    For each query token i at position pos = positions[i]:
+      topk_indices[i, j] = j   for j in [0, pos]
+      topk_indices[i, j] = -1  for j > pos
+
+    positions[i] + 1 is the number of KV tokens query i can attend to (causal).
+    """
+    n_tokens = topk_indices.shape[0]
+    device = topk_indices.device
+
+    causal_len = positions[:n_tokens].to(torch.int32) + 1  # [n_tokens]
+    col_ids = torch.arange(topk_out_width, dtype=torch.int32, device=device)
+    topk_indices.copy_(col_ids.unsqueeze(0).expand(n_tokens, -1))
+    mask = col_ids.unsqueeze(0) >= causal_len.unsqueeze(1)
+    topk_indices.masked_fill_(mask, -1)
+
+    # seq_local=True: topk_indices[i,j]=j is a local 0-based position within
+    # the request's KV, so no subtraction of the per-request KV base is needed.
+    triton_convert_req_index_to_global_index_dsa_prefill(
+        attn_metadata.sparse_cu_seqlens_q,
+        attn_metadata.sparse_kv_indptr,
+        attn_metadata.batch_id_per_q_token,
+        topk_indices,
+        attn_metadata.block_tables,
+        attn_metadata.cu_seqlens_k,
+        PAGE_SIZE=block_size,
+        NUM_TOPK_TOKENS=topk_out_width,
+        BLOCK_N=128,
+        out=sparse_kv_indices_buffer,
+        seq_local=True,
+    )
+
+
 def _sparse_attn_indexer_kpool(
     hidden_states: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -231,6 +277,21 @@ def _sparse_attn_indexer_kpool(
             slot_idx_in=state_slot_idx_in,
         )
         if attn_metadata.max_seqlen_k <= topk_tokens:
+            if getattr(attn_metadata, "kpool_plugin_mode", False):
+                # vLLM plugin mode: the MLA layer reads sparse_kv_indices_buffer
+                # which must be populated even for short (dense) sequences.
+                # Generate causal sequential indices and convert to global KV block
+                # addresses. For each query token at position p, indices 0..p are
+                # attended (dense causal), represented as arange(topk_out_width)
+                # clamped to valid positions and padded with -1.
+                _kpool_fill_dense_topk(
+                    topk_indices,
+                    positions,
+                    attn_metadata,
+                    block_size,
+                    topk_out_width,
+                    sparse_kv_indices_buffer,
+                )
             return result
 
         bs = cu_q.shape[0] - 1
@@ -382,15 +443,32 @@ def _sparse_attn_indexer_kpool(
         index_kpool,
         out=topk_indices[:bs],
     )
-    triton_convert_req_index_to_global_index(
-        attn_metadata.cu_seqlens_q,
-        attn_metadata.kv_indptr,
-        attn_metadata.sparse_kv_indptr,
-        attn_metadata.kv_indices,
-        topk_indices,
-        NUM_TOPK_TOKENS=topk_out_width,
-        out=sparse_kv_indices_buffer,
-    )
+    if getattr(attn_metadata, "kpool_plugin_mode", False):
+        # vLLM owns the paged block table and does not publish ATOM's expanded
+        # kv_indices plane. Convert the request-local token ids directly.
+        triton_convert_req_index_to_global_index_dsa_prefill(
+            attn_metadata.sparse_cu_seqlens_q,
+            attn_metadata.sparse_kv_indptr,
+            attn_metadata.batch_id_per_q_token,
+            topk_indices,
+            attn_metadata.block_tables,
+            attn_metadata.cu_seqlens_k,
+            PAGE_SIZE=get_current_atom_config().kv_cache_block_size,
+            NUM_TOPK_TOKENS=topk_out_width,
+            BLOCK_N=128,
+            out=sparse_kv_indices_buffer,
+            seq_local=True,
+        )
+    else:
+        triton_convert_req_index_to_global_index(
+            attn_metadata.cu_seqlens_q,
+            attn_metadata.kv_indptr,
+            attn_metadata.sparse_kv_indptr,
+            attn_metadata.kv_indices,
+            topk_indices,
+            NUM_TOPK_TOKENS=topk_out_width,
+            out=sparse_kv_indices_buffer,
+        )
     return result
 
 
