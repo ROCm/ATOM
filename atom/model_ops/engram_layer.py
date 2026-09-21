@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from atom.config import QuantizationConfig
+from atom.model_ops.engram_fused import engram_post_wkv
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.utils import atom_parameter
 
@@ -86,25 +87,9 @@ class EngramOp(nn.Module):
                 f"hidden states cover {tuple(hidden_states.shape[:-2])} tokens "
                 f"but embeddings cover {tuple(embeddings.shape[:-1])}"
             )
-        lead = hidden_states.shape[:-2]
-
         kv = self.wkv(embeddings)
-        keys = kv[..., : self.key_rows].view(*lead, self.hc_mult, self.hidden_size)
-        value = kv[..., self.key_rows :]
-
-        key, residual = keys.float(), hidden_states.float()
-        weight = self.gate_weight
-        rstd = torch.rsqrt(residual.square().mean(-1) + self.norm_eps) * torch.rsqrt(
-            key.square().mean(-1) + self.norm_eps
-        )
-        dot = (residual * weight * key).sum(-1) * rstd * self.hidden_size**-0.5
-        gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
-        if token_mask is not None:
-            if token_mask.shape != hidden_states.shape[:-2]:
-                raise ValueError("Engram token mask must match residual tokens")
-            gate = gate.masked_fill(~token_mask.unsqueeze(-1), 0)
-        return (residual + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(
-            hidden_states.dtype
+        return engram_post_wkv(
+            hidden_states, kv, self.gate_weight, token_mask, self.norm_eps
         )
 
     @torch.no_grad()

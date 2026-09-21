@@ -790,6 +790,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENGRAM_CACHE_DIR": lambda: os.getenv(
         "ATOM_ENGRAM_CACHE_DIR", str(Path.home() / ".cache" / "atom" / "engram")
     ),
+    # Fuse FP32 post-wkv gating and residual addition; 0 selects the torch reference.
+    "ATOM_ENGRAM_FUSED_GATE": lambda: os.getenv("ATOM_ENGRAM_FUSED_GATE", "1") == "1",
 }
 
 
