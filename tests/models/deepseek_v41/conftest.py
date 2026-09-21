@@ -118,6 +118,7 @@ def build_v41(unallocated_moe):
             hf_config=hf,
             max_model_len=32,
             enforce_eager=True,
+            compilation_config=SimpleNamespace(level=0, static_forward_context={}),
             online_quant_config=online,
         )
         with torch.device("meta"):

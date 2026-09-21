@@ -25,6 +25,7 @@ from atom.models.deepseek_v4 import (
     make_v4_quant_config,
 )
 
+
 from .attention import Attention
 from .config import build_attention_topology
 from .layers import native_quant_config
@@ -44,6 +45,7 @@ class Block(nn.Module):
         alt_stream: torch.cuda.Stream | None = None,
     ):
         super().__init__()
+        self.layer_name = f"v41.layers.{spec.layer_id}"
         self.attn = self.attention_cls(config, spec)
         # FusedMoE names its parameters from this prefix, so it has to match the
         # module layout used by the shared loader: `layers.N` / `mtp.N`.
@@ -92,15 +94,19 @@ class Block(nn.Module):
                 quant_config=native_quant_config(),
             )
 
+    def attention_forward(self, hidden, cache, step, rope):
+        return self.attn(hidden, cache, step, rope)
+
+    def engram_forward(self, residual, embeddings, image_mask):
+        if embeddings is None:
+            raise ValueError("Engram rows must be prepared before model execution")
+        return self.engram(
+            residual, embeddings, None if image_mask is None else ~image_mask
+        )
+
     def prepare_attention(self, residual, pre_mix, embeddings, image_mask):
         if self.engram is not None:
-            if embeddings is None:
-                raise ValueError("Engram rows must be prepared before model execution")
-            residual = self.engram(
-                residual,
-                embeddings,
-                None if image_mask is None else ~image_mask,
-            )
+            residual = self.engram_forward(residual, embeddings, image_mask)
         residual, hidden, pre, post, comb = pre_delayed(
             residual,
             pre_mix,
@@ -135,7 +141,7 @@ class Block(nn.Module):
         hidden, residual, pre, post, comb = self.prepare_attention(
             state.residual, state.pre_mix, embeddings, image_mask
         )
-        output = self.attn(hidden, cache, step, rope)
+        output = self.attention_forward(hidden, cache, step, rope)
         hidden, residual, pre, post, comb = self.prepare_ffn(
             output, residual, pre, post, comb
         )
@@ -149,6 +155,8 @@ class DeepseekV41ForCausalLM(nn.Module):
     RuntimeModel adapts this math to ModelRunner using prepared Engram values
     and a paged cache. The offline caller supplies its own private cache.
     """
+
+    block_cls = Block
 
     # Disk-name -> param-name rules for `atom.model_loader.loader.load_model`.
     # V4's two tables carry over as they are; V4.1 needs one rename V4's
@@ -197,7 +205,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         # `maybe_dual_stream_forward`, which declines above a token count.
         self.alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self.layers = nn.ModuleList(
-            Block(
+            self.block_cls(
                 config,
                 spec,
                 prefix=f"layers.{spec.layer_id}",
@@ -259,6 +267,15 @@ class DeepseekV41ForCausalLM(nn.Module):
             num_experts=self.config.n_routed_experts + shared,
         )
 
+    def begin_forward(self, hidden, engram_embeddings):
+        stage = getattr(engram_embeddings, "stage", None)
+        if stage is not None:
+            stage()
+
+    def end_forward(self, hidden, engram_embeddings):
+        if getattr(engram_embeddings, "stage", None) is not None:
+            engram_embeddings.join()
+
     def forward_hidden(
         self,
         token_ids,
@@ -278,13 +295,11 @@ class DeepseekV41ForCausalLM(nn.Module):
             if inputs_embeds is None
             else inputs_embeds
         )
-        state = SinglePassHCState.from_embeddings(hidden, self.config.hc_mult)
         engram_embeddings = {} if engram_embeddings is None else engram_embeddings
         # Fork immediately before layer 0, after embedding and its TP reduce.
         # This also makes offline forwards obey the lazy staging contract.
-        stage = getattr(engram_embeddings, "stage", None)
-        if stage is not None:
-            stage()
+        self.begin_forward(hidden, engram_embeddings)
+        state = SinglePassHCState.from_embeddings(hidden, self.config.hc_mult)
         for spec, layer in zip(self.topology, self.layers):
             rope = self.global_rope if spec.ratio else self.window_rope
             state = layer(
@@ -295,9 +310,8 @@ class DeepseekV41ForCausalLM(nn.Module):
                 engram_embeddings.get(spec.layer_id),
                 image_mask=image_mask,
             )
-        if stage is not None:
-            engram_embeddings.join()
         hidden = state.collapse()
+        self.end_forward(hidden, engram_embeddings)
         return hidden
 
     @torch.inference_mode()
