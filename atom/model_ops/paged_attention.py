@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 from atom.config import get_current_atom_config
+from atom.distributed.ulysses_sp import get_sp_world_size
 from atom.plugin.prepare import is_plugin_mode
 from atom.utils.selector import Family, get_attn_backend
 
@@ -42,6 +43,20 @@ class Attention(BaseAttention):
         assert (
             not is_plugin_mode()
         ), "ATOM native Attention is only supported for ATOM native/server mode"
+
+        # Under Ulysses SP the caller's counts are the projection's width --
+        # every head, since SP leaves the weights unsharded -- while attention
+        # itself runs on this rank's 1/sp slice of them after the all-to-all.
+        # The KV pool geometry is read back off these attributes, so dividing
+        # here is also what sizes the cache for the heads this rank caches.
+        sp_size = get_sp_world_size()
+        num_heads //= sp_size
+        num_kv_heads = max(1, num_kv_heads // sp_size)
+        # MiniMax-M3 carries one indexer query head per kv head, so its packed
+        # width follows the kv heads through the same all-to-all.
+        if kwargs.get("index_q_size"):
+            kwargs["index_q_size"] = max(1, kwargs["index_q_size"] // sp_size)
+
         super().__init__(
             num_heads=num_heads,
             head_dim=head_dim,

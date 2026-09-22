@@ -28,6 +28,12 @@ from atom.config import (
     QuantizationConfig,
     get_current_atom_config,
 )
+from atom.distributed.ulysses_sp import (
+    get_sp_world_size,
+    sp_is_enabled,
+    sp_moe_gather,
+    sp_moe_reduce_scatter,
+)
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.eplb import eplb_map_and_record_fused
@@ -270,7 +276,17 @@ class FusedMoEParallelConfig:
         # dp_logical, not dp_size_: with DP-attention simulated down to a single
         # rank the real product is 1, but the deployment being reproduced still
         # shards experts, so EP must stay on.
-        use_ep = dp_logical * tp_size_ > 1 and parallel_config.enable_expert_parallel
+        # Ulysses SP counts here too -- it contributes devices the experts are
+        # split over, so `-tp 1 -sp W` is as much an EP-capable topology as
+        # `-tp W`. SP does not turn EP on by itself, though: the fold below
+        # shards the MoE either way, and on MXFP4 weights the sliced-expert
+        # layout keeps aiter's fused a16w4 GEMMs, which measured faster than
+        # the whole-expert layout EP would pick.
+        sp_size = get_sp_world_size()
+        use_ep = (
+            dp_logical * tp_size_ * sp_size > 1
+            and parallel_config.enable_expert_parallel
+        )
 
         dp_size = dp_size_
         dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
@@ -295,12 +311,14 @@ class FusedMoEParallelConfig:
             get_prefill_context_model_parallel_world_size,
         )
 
-        pcp_merge = (
-            envs.ATOM_PCP_MOE_MERGE
-            and get_prefill_context_model_parallel_world_size() > 1
-        )
+        pcp_size = get_prefill_context_model_parallel_world_size()
+        # Ulysses SP rides the same rank dimension and always folds in: it
+        # replicates every other weight, so without this the MoE would be
+        # replicated too and a large one would not fit at all. Folded into
+        # tp_size it lands on exactly the layout plain TP would have produced.
+        # PCP proper keeps the fold behind an env switch.
+        pcp_merge = pcp_size > 1 and (envs.ATOM_PCP_MOE_MERGE or sp_is_enabled())
         if pcp_merge:
-            pcp_size = get_prefill_context_model_parallel_world_size()
             pcp_rank = get_prefill_context_model_parallel_rank()
             tp_rank = pcp_rank * tp_size + tp_rank
             tp_size = pcp_size * tp_size
@@ -339,7 +357,8 @@ class FusedMoEParallelConfig:
                 dp_logical // dp_size if flatten_tp_across_dp_for_moe else 1
             ),
             local_ep_size=atom_config.parallel_config.data_parallel_size_local
-            * tp_size_,
+            * tp_size_
+            * sp_size,
             requested_all2all_backend=requested_all2all_backend,
             low_latency=low_latency,
         )
@@ -3489,11 +3508,7 @@ class FusedMoE(torch.nn.Module):
                 top_k=self.top_k,
                 tp_rank=self.ep_rank if self.use_ep else self.tp_rank,
                 tp_size=self.ep_size if self.use_ep else self.tp_size,
-                shared_experts_score=(
-                    1.0
-                    if is_rocm_aiter_fuse_routed_scaling_factor()
-                    else 1 / self.routed_scaling_factor
-                ),
+                shared_experts_score=self.shared_expert_weight,
                 max_num_tokens=moe_token_capacity,
                 is_EP=self.use_ep,
             )
@@ -3651,9 +3666,14 @@ class FusedMoE(torch.nn.Module):
 
     @property
     def shared_expert_weight(self) -> float:
-        if is_rocm_aiter_fuse_routed_scaling_factor():
-            return 1.0
-        return 1.0 / self.routed_scaling_factor
+        # Unscaled by the SP width on purpose: the fused shared expert is not
+        # summed across EP ranks, so SP's reduce-scatter sees one copy of it
+        # just as TP's all-reduce does.
+        return (
+            1.0
+            if is_rocm_aiter_fuse_routed_scaling_factor()
+            else 1.0 / self.routed_scaling_factor
+        )
 
     @property
     def shared_dispatch_base(self) -> int:
@@ -5273,6 +5293,17 @@ class FusedMoE(torch.nn.Module):
             hidden_states = naive_multicast(hidden_states, cu_tokens_across_dp_cpu)
             router_logits = naive_multicast(router_logits, cu_tokens_across_dp_cpu)
 
+        # Ulysses SP gives every rank a different token shard, but the expert
+        # weights are sharded over that same dimension -- so this rank holds
+        # only a slice of the computation for EVERY token, not the whole
+        # computation for its own. Gather the sequence, contribute this rank's
+        # slice, and let the reduce-scatter hand back a finished token shard.
+        # Shapes are static, so both collectives are graph-safe.
+        sp_moe = sp_is_enabled()
+        if sp_moe:
+            hidden_states = sp_moe_gather(hidden_states)
+            router_logits = sp_moe_gather(router_logits)
+
         # Simulated DP with no peers to gather from: the absent ranks' token
         # shards are stood in for locally, same as after the gather in
         # forward_impl_graph. Dropped again below.
@@ -5305,6 +5336,9 @@ class FusedMoE(torch.nn.Module):
 
         if dp_repeat > 1:
             final_hidden_states = final_hidden_states[:local_rows]
+
+        if sp_moe:
+            final_hidden_states = sp_moe_reduce_scatter(final_hidden_states)
 
         dp_group = get_dp_group()
         if dp_group.world_size > 1:

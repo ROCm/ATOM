@@ -12,6 +12,7 @@ import triton.language as tl
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.config import _is_minimax_m3_config
+from atom.distributed.ulysses_sp import attn_head_shard_size
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
 from atom.utils import CpuGpuBuffer, envs, pack_rows, upload_numpy
@@ -258,7 +259,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         else:
             max_qlen = 1
 
-        num_head_k = max(1, hf_config.num_key_value_heads // get_tp_group().world_size)
+        num_head_k = max(1, hf_config.num_key_value_heads // attn_head_shard_size())
         # Kept flydsl work plan here and refreshed once per prepare_*.
         self._flydsl_kv_heads = num_head_k
         self._flydsl_plans: dict[tuple, object] = {}
@@ -460,7 +461,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         hf_config = config.hf_config
         num_query_heads = self.num_attention_heads
         num_kv_heads = max(
-            1, hf_config.num_key_value_heads // get_tp_group().world_size
+            1, hf_config.num_key_value_heads // attn_head_shard_size()
         )
         block_size = self.block_size
 
@@ -1409,7 +1410,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         hf_config = config.hf_config
         num_query_heads = self.num_attention_heads
         num_kv_heads = max(
-            1, hf_config.num_key_value_heads // get_tp_group().world_size
+            1, hf_config.num_key_value_heads // attn_head_shard_size()
         )
         p = f"ub{ubatch_idx}_"
         var = self.model_runner.forward_vars
