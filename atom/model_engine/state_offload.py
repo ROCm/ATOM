@@ -517,7 +517,11 @@ def _offload_subconfig(cfg: dict) -> tuple[dict | None, str]:
     still a soft no-tier (`None`), the legal `[producer]`-only shape.
     """
     subs = [s for s in (cfg.get("connectors") or ()) if isinstance(s, dict)]
-    offload = [s for s in subs if s.get("kv_connector") in _STATE_TIER_BACKENDS]
+    offload = [
+        s
+        for s in subs
+        if _canonical_connector(s.get("kv_connector")) in _OFFLOAD_BACKENDS
+    ]
     if not offload:
         return None, "multi lists no offload connector"
     if len(offload) > 1:
@@ -592,7 +596,7 @@ def state_tier_capability(config) -> StateTierCapability:
         # `offload_layout` override lives there, not on the composite. Model
         # fields still come from the real config.
         layout_config = _SubConnectorView(config, cfg)
-    if name not in _STATE_TIER_BACKENDS:
+    if _canonical_connector(name) not in _STATE_TIER_BACKENDS:
         return replace(none, reason=f"connector {name!r} hosts no state tier")
 
     # The worker refuses PP outright: `CacheEngineKey` has no PP component, so
@@ -662,4 +666,34 @@ def state_tier_chunk_tokens(config) -> int:
 
 #: The connector backends whose worker half can build a `StateOffloadTier`.
 #: `multi` qualifies when it lists exactly one.
+#: Backends that host a KV offload tier. Under `multi` at most one may appear --
+#: see `_offload_subconfig`. `lmcache_mp` is the standalone-server sibling of
+#: `lmcache_offload`; it was missing here, so `[lmcache_mp, lmcache_offload]`
+#: walked straight past the refusal.
+_OFFLOAD_BACKENDS = frozenset({"lmcache_offload", "lmcache_mp"})
+
+#: Of those, the ones that also host the Kimi-K3 recurrent-state tier. Narrower
+#: than `_OFFLOAD_BACKENDS` on purpose: `lmcache_mp` moves KV and no state.
 _STATE_TIER_BACKENDS = frozenset({"lmcache_offload"})
+
+
+def _canonical_connector(value: object) -> str:
+    """The registry's canonical name for `value`, or "" if it names nothing.
+
+    Both sets above are compared against THIS, not against the raw string.
+    Sub-connectors are built through `KVConnectorFactory.create_connector`,
+    which canonicalises -- strip, casefold, then resolve the registered aliases
+    -- so a raw-string membership test disagreed with what actually got built:
+    `LMCacheConnectorV1` and `  LMCache_Offload  ` both construct the offload
+    backend while matching neither set. That made the "two offload
+    sub-connectors are unrepresentable" guarantee -- which `multi_connector.py`
+    leans on in three separate comments -- false for any alias spelling.
+    """
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    try:
+        return KVConnectorFactory.canonical_name(value)
+    except Exception:  # noqa: BLE001 -- unknown name; construction reports it
+        # Not a name the registry knows. Construction will fail later with a
+        # better message than this probe could give.
+        return ""

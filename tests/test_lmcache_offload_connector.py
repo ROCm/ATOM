@@ -3791,6 +3791,60 @@ def test_consume_failed_remote_kv_does_not_repeat_terminal_callback():
     assert calls == []
 
 
+def test_a_failed_state_only_load_is_reset_to_a_full_recompute():
+    """A STATE-ONLY load moves no KV -- `lmcache_cached_tokens == hbm_cached_
+    tokens` -- so `_record_load_error_blocks` has an empty `[hbm, lmc)` range
+    and names no block. That is correct here and NOT a missing recompute: on
+    this path the reset is `_consume_failed_remote_kv`'s job, and it is total.
+
+    Worth pinning because the two mechanisms look interchangeable and are not.
+    `load_error_blocks` is the vLLM-plugin half, where an empty set makes vLLM
+    cache the whole external prefix as though it had arrived; that path builds
+    `DenseOffloadConnector` directly and never attaches a `state_load_spec`, so
+    no state-only shape reaches it. Marking a block there "to be safe" would
+    invalidate KV that is present and correct.
+    """
+    disowned = []
+    seq = SimpleNamespace(
+        id=731,
+        status=SequenceStatus.WAITING_FOR_REMOTE_KVS,
+        # The KV prefix IS resident -- that is what makes the load state-only.
+        num_cached_tokens=2048,
+        block_table=[1, 2, 3],
+        offload_joint=OffloadJointRecord(
+            load_hash=99, boundary_tokens=0, boundary_hash=-1
+        ),
+    )
+
+    class _Connector:
+        is_producer = False
+        is_offload = True
+
+        def load_failed(self, req_id):
+            pass
+
+    host = Scheduler.__new__(Scheduler)
+    host.kv_connector = _Connector()
+    host.failed_recving_kv_req_ids = [seq.id]
+    host._num_parked_remote_kv = 0
+    host.block_manager = SimpleNamespace(
+        disown_claimed_prefix=lambda s: disowned.append(s.id) or True
+    )
+
+    assert host._consume_failed_remote_kv(seq) is True
+
+    # The recurrence never arrived, so the resident prefix is not this
+    # request's history: `has_initial_state` would otherwise read a non-zero
+    # `num_cached_tokens` as "the recurrence continues" and the forward would
+    # run over a history it does not hold.
+    assert seq.num_cached_tokens == 0
+    assert seq.offload_joint.load_hash == -1
+    assert seq.offload_joint.boundary_tokens == 0
+    assert seq.offload_joint.boundary_hash == -1
+    assert disowned == [seq.id], "the claimed prefix must be privatised"
+    assert seq.status == SequenceStatus.WAITING
+
+
 def test_sidecar_save_waits_for_exact_completed_boundary():
     sched = _stateful_scheduler(hit=0)
     seq = _stateful_seq(

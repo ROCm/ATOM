@@ -367,3 +367,56 @@ class TestARefusedKvLegSettlesItsStateLoad:
         self._scheduler_with(index)._drop_state_load(self._seq(-1))
         assert index.dispatched == 0
         index.check_invariant()
+
+
+class TestTwoOffloadSubsAreUnrepresentable:
+    """`multi_connector.py` leans on this refusal in three separate comments --
+    the tier's bytes and completions ride one connector's worker half, so two
+    providers would each hold half an answer and a request parked on the wrong
+    one would never be reported.
+
+    The check compares canonical names, not raw strings. Sub-connectors are
+    built through `KVConnectorFactory.create_connector`, which strips,
+    casefolds and resolves aliases, so a raw-string test disagreed with what
+    actually got built and the guarantee was false for every alias spelling.
+    """
+
+    @staticmethod
+    def _cfg(*names):
+        return {
+            "kv_connector": "multi",
+            "connectors": [{"kv_connector": n} for n in names],
+        }
+
+    @pytest.mark.parametrize(
+        "names",
+        [
+            ("lmcache_offload", "lmcache_offload"),
+            # Registered aliases of the same backend.
+            ("lmcache_offload", "LMCacheConnectorV1"),
+            ("LMCacheOffloadConnector", "LMCacheConnectorV1"),
+            # Case and surrounding whitespace, both normalised by the factory.
+            ("  LMCache_Offload  ", "lmcache_offload"),
+            # The standalone-server sibling: a second KV offload tier.
+            ("lmcache_mp", "lmcache_offload"),
+        ],
+    )
+    def test_two_offload_subs_are_refused_however_they_are_spelled(self, names):
+        from atom.model_engine.state_offload import _offload_subconfig
+
+        with pytest.raises(ValueError, match="offload"):
+            _offload_subconfig(self._cfg(*names))
+
+    def test_a_producer_beside_one_offload_sub_is_the_legal_shape(self):
+        from atom.model_engine.state_offload import _offload_subconfig
+
+        sub, why = _offload_subconfig(self._cfg("moriio", "lmcache_offload"))
+        assert sub == {"kv_connector": "lmcache_offload"}
+        assert why == ""
+
+    def test_no_offload_sub_is_a_soft_no_tier_not_a_refusal(self):
+        from atom.model_engine.state_offload import _offload_subconfig
+
+        sub, why = _offload_subconfig(self._cfg("moriio"))
+        assert sub is None
+        assert "no offload connector" in why
