@@ -8,6 +8,10 @@ if not torch.cuda.is_available():
     pytest.skip("ROCm GPU required", allow_module_level=True)
 
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops import gemm_op_a8w8
+from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale_group32 import (
+    gemm_a8w8_blockscale_group32,
+)
 
 from atom.model_ops.blockscale import native_quant_linear
 
@@ -136,3 +140,69 @@ def test_row_scaled_fp8_projection_with_token_and_column_tails(dtype):
         rtol=0.016 if dtype == torch.bfloat16 else 3e-5,
         atol=5e-5 * expected.abs().max().item(),
     )
+
+
+@pytest.mark.parametrize("shape", [(3, 1280), (2, 3, 1280), (0, 1280)])
+@pytest.mark.parametrize("group_rows", [1, 32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_fp8_projection_uses_aiter_backend_config(
+    monkeypatch, shape, group_rows, dtype
+):
+    m = 1
+    for dim in shape[:-1]:
+        m *= dim
+    x, weight, xs, ws = _operands(m, 4096, shape[-1])
+    if group_rows == 1:
+        ws = ws.repeat_interleave(32, 0).contiguous()
+    expected = gemm_a8w8_blockscale_group32(
+        x, weight, xs, ws, dtype=dtype, weight_group_rows=group_rows
+    )
+    lookup = gemm_op_a8w8.get_CKGEMM_config
+    calls = []
+
+    def record_lookup(m, n, k, tuned_file):
+        config = lookup(m, n, k, tuned_file)
+        calls.append((m, n, k, tuned_file, config))
+        return config
+
+    monkeypatch.setattr(gemm_op_a8w8, "get_CKGEMM_config", record_lookup)
+    actual = native_quant_linear(
+        x.view(shape),
+        weight,
+        ws,
+        x_scale=xs.view(*shape[:-1], shape[-1] // 32),
+        weight_group_rows=group_rows,
+        dtype=dtype,
+    )
+    assert actual.shape == (*shape[:-1], weight.shape[0])
+    torch.testing.assert_close(actual, expected.view(actual.shape), rtol=0, atol=0)
+    assert len(calls) == 1
+    rows, n, k, tuned_file, config = calls[0]
+    assert (rows, n, k) == (m, 4096, 1280)
+    assert tuned_file.endswith("a8w8_blockscale_group32_tuned_gemm.csv")
+    assert config is not None and config["libtype"] == "triton"
+
+
+@pytest.mark.parametrize("declared_group_rows", [1, 32])
+def test_fp8_projection_rejects_mismatched_weight_scale_group(declared_group_rows):
+    x, weight, xs, ws = _operands(3, 65, 64)
+    if declared_group_rows == 32:
+        ws = ws.repeat_interleave(32, 0)[:65].contiguous()
+    with pytest.raises(ValueError, match="Weight scale shape"):
+        native_quant_linear(
+            x, weight, ws, x_scale=xs, weight_group_rows=declared_group_rows
+        )
+
+
+def test_fp8_projection_compile_dynamic_batched_rows():
+    def forward(x, weight, xs, ws):
+        return native_quant_linear(x, weight, ws, x_scale=xs)
+
+    compiled = torch.compile(forward, fullgraph=True, dynamic=True)
+    for rows in (3, 7, 33):
+        x, weight, xs, ws = _operands(2 * rows, 4096, 1280)
+        x = x.view(2, rows, 1280)
+        xs = xs.view(2, rows, 40)
+        torch.testing.assert_close(
+            compiled(x, weight, xs, ws), forward(x, weight, xs, ws), rtol=0, atol=0
+        )

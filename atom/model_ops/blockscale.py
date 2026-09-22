@@ -11,9 +11,7 @@ import functools
 
 import torch
 import triton
-from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale_group32 import (
-    gemm_a8w8_blockscale_group32,
-)
+from aiter import gemm_a8w8_blockscale
 
 from .blockscale_kernels.blockscale_gemm import (
     blockscale_gemm_fp4_kernel,
@@ -141,7 +139,7 @@ def native_quant_linear(
 ):
     """FP8 32x32/1x32 or W4A8 1x32 GEMM; inputs and weights stay native.
 
-    Weight scales remain compact. FP8 uses AITER's group32 backend; W4A8
+    Weight scales remain compact. FP8 uses AITER's configured GEMM interface; W4A8
     unpacks to BF16 for a plain one; both accumulate in FP32 before the
     requested output conversion. A8 QAT and native
     weight storage are retained without materializing a dequantized weight.
@@ -164,15 +162,16 @@ def native_quant_linear(
     m = x.numel() // k
     if split_k is not None and (not isinstance(split_k, int) or split_k < 1):
         raise ValueError("split_k must be a positive integer")
+    if weight_scale.shape != (-(-n // weight_group_rows), k // 32):
+        raise ValueError("Weight scale shape does not match the declared source blocks")
     if not fp4:
         batched = x.ndim > 2
-        output = gemm_a8w8_blockscale_group32(
+        output = gemm_a8w8_blockscale(
             x.view(m, k) if batched else x,
             weight,
             x_scale.view(m, k // 32) if batched else x_scale,
             weight_scale,
             dtype=dtype,
-            weight_group_rows=weight_group_rows,
             split_k=split_k,
         )
         return output.view(*x.shape[:-1], n) if batched else output
@@ -185,10 +184,7 @@ def native_quant_linear(
         raise ValueError(
             "Activations must be E4M3 with E8M0 activation and weight scales"
         )
-    if x_scale.shape != (*x.shape[:-1], k // 32) or weight_scale.shape != (
-        -(-n // weight_group_rows),
-        k // 32,
-    ):
+    if x_scale.shape != (*x.shape[:-1], k // 32):
         raise ValueError("Scale shape does not match the declared source blocks")
     tensors = (x, weight, x_scale, weight_scale)
     if any(
