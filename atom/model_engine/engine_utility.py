@@ -408,6 +408,7 @@ class EngineUtilityHandler:
                     "kv_blocks_free": kv_pool.num_free,
                     "kv_blocks_total": kv_pool.num_blocks,
                     "kv_blocks_indexed": kv_pool.num_indexed,
+                    "block_size": block_manager.block_size,
                     "kv_blocks_evictable": reusable,
                     "kv_blocks_vacant": kv_pool.num_free - reusable,
                 }

@@ -639,6 +639,10 @@ class LLMEngine:
                 for rank, stats in latest_metrics.items()
                 if stats.get("enabled") and "scheduler_metrics" in stats
             ],
+            # KV-owning ranks share the block size; prefill-only ranks omit it.
+            "block_size": next(
+                (int(s["block_size"]) for s in rank_stats if "block_size" in s), 0
+            ),
             "mtp": {
                 "enabled": bool(mtp_rank_stats),
                 "total_draft_tokens": mtp_draft,
