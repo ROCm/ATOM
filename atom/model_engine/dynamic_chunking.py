@@ -29,7 +29,12 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import numpy as np
 import torch
 
-from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+from atom.model_engine.sequence import (
+    Sequence,
+    SequenceStatus,
+    SequenceType,
+    new_block_table,
+)
 
 if TYPE_CHECKING:
     from atom.model_engine.model_runner import ModelRunner
@@ -705,7 +710,10 @@ class DynamicChunkingWorker:
         seq = Sequence(tokens, block_size=block_size, id=-2)
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.PREFILL
-        seq.block_table = list(range(math.ceil(chunk_size / block_size)))
+        # `new_block_table`, not a list: every forward marshals block tables
+        # into the int32 `block_tables` buffer through `pack_rows`, which needs
+        # a row that exports a buffer and raises TypeError on a list.
+        seq.block_table = new_block_table(range(math.ceil(chunk_size / block_size)))
         return ScheduledBatch(
             seqs={seq.id: seq},
             num_scheduled_tokens=[chunk_size],
