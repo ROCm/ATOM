@@ -86,9 +86,12 @@ def model_path_env_key(model_name: str) -> str:
     return f"ATOMESH_MODEL_PATH_{suffix}"
 
 
-def resolve_model_path(model_name: str, model_cfg: dict[str, Any]) -> str:
+def resolve_model_path(
+    model_name: str, model_cfg: dict[str, Any], slurm_submit_runner: str = ""
+) -> str:
     env_value = os.environ.get(model_path_env_key(model_name), "").strip()
-    model_path = env_value or str(model_cfg["model_path"])
+    runner_path = model_cfg.get("model_path_by_runner", {}).get(slurm_submit_runner)
+    model_path = env_value or str(runner_path or model_cfg["model_path"])
     return resolve_env_refs(model_path) if "${" in model_path else model_path
 
 
@@ -375,7 +378,7 @@ def build_cell(
         "model": model_name,
         "backend": backend_name,
         "image": image,
-        "model_path": resolve_model_path(model_name, model_cfg),
+        "model_path": resolve_model_path(model_name, model_cfg, slurm_submit_runner),
         "precision": str(model_cfg.get("precision", "")),
         "topology": topology,
         "display_topology": display_topology,
