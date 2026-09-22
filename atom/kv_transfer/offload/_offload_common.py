@@ -650,11 +650,10 @@ class OffloadSchedulerMixin(ABC):
         the process-wide `OFFLOAD_MAX_PENDING_SAVES` setting (or the default
         derived from `OFFLOAD_COPY_WORKERS`). The state leg
         (`Scheduler._state_store_pending_cap`) shares this exact number with the
-        KV leg's `_may_emit_save` so both legs pin the same slice of the pool.
-        None when the connector does not bound its save queue (`_may_emit_save`
-        always True, as on dense) -- the scheduler then falls back to the env
-        reader. Exposed so the scheduler never reaches through the delegating
-        shell's `_impl` for it.
+        KV leg's admission policy so both legs pin the same slice of the pool.
+        None only for connectors that do not expose a scheduler-side bound; the
+        scheduler then falls back to the environment reader. Exposed so the
+        scheduler never reaches through the delegating shell's `_impl` for it.
         """
         return getattr(self, "_max_pending_saves", None)
 

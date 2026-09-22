@@ -103,6 +103,7 @@ def make_scheduler(monkeypatch, *, capacity=2, budget=60, units=30, role="offloa
     manager = SimpleNamespace(
         paged_state_checkpoints=checkpoints,
         hash_block_size=4,
+        total_allocatable_kv_blocks=100,
         compute_hash=BlockManager.compute_hash,
     )
     scheduler.bind_block_manager(manager)
@@ -110,6 +111,13 @@ def make_scheduler(monkeypatch, *, capacity=2, budget=60, units=30, role="offloa
     assert connections == [checkpoints.store.spec]
     scheduler._min_load_tokens = 0
     return scheduler, checkpoints, adapter
+
+
+def test_native_scheduler_binds_parent_page_budget(monkeypatch):
+    scheduler, _, _ = make_scheduler(monkeypatch)
+
+    assert scheduler._save_pin_total_blocks == 100
+    assert scheduler._save_pin_budget_blocks == 20
 
 
 def sequence(request_id=1, *, count=24, computed=16, token_offset=0):

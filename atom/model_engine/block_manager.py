@@ -2522,7 +2522,7 @@ class BlockManager:
         seq: Sequence,
         start_tokens: int,
         end_tokens: int,
-    ) -> tuple[list[int], int, frozenset[int]]:
+    ) -> tuple[list[int], int, tuple[int, ...]]:
         """Claim the still-resident contiguous prefix used by a late save.
 
         A finished request no longer owns its old physical block table. Each
@@ -2563,7 +2563,10 @@ class BlockManager:
             claimed.append(block_id)
             block_ids[index] = block_id
             available_end = (index + 1) * hbs
-        return block_ids, available_end, frozenset(claimed)
+        # The caller may have to trim a partial LMCache chunk from the tail.
+        # Preserve token order until that trim is complete; a set is suitable
+        # only after the exact ordered prefix has been selected.
+        return block_ids, available_end, tuple(claimed)
 
     def free_leased_blocks(self, block_ids) -> None:
         """Return block IDs a `deallocate_partial` lease held back, to the pool.

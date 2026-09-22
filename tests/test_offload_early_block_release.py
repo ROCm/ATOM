@@ -312,6 +312,23 @@ class TestSourceSafeBoundary:
 
 
 class TestIncrementalLeaseRelease:
+    def test_dense_save_admission_bounds_running_plus_queued_work(self, monkeypatch):
+        monkeypatch.setenv("OFFLOAD_MAX_PENDING_SAVES", "1")
+        monkeypatch.setenv("OFFLOAD_SAVE_MIN_OBSERVED_COUNT", "0")
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        first = _seq(98, num_prompt_tokens=16, num_blocks=4)
+        second = _seq(99, num_prompt_tokens=16, num_blocks=4)
+        for seq in (first, second):
+            scheduler.update_state_after_alloc(seq)
+            seq.num_cached_tokens = 8
+
+        metadata = scheduler.build_connector_meta()
+
+        assert scheduler._max_pending_saves == 1
+        assert [request.req_id for request in metadata.requests] == [first.id]
+        assert set(scheduler._save_inflight) == {str(first.id)}
+        assert str(second.id) not in scheduler._save_tracker
+
     def test_b1_b2_release_while_b3_b8_remain_protected(self, monkeypatch):
         scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
         bm, seq, table = _resident_sequence(scheduler, 100, 48, 12)
@@ -372,6 +389,26 @@ class TestIncrementalLeaseRelease:
         assert request.block_ids[:4] == table[:4]
         assert request.save_spec.skip_leading_tokens == 0
         assert scheduler.protected_block_ids(seq) == frozenset(table[:4])
+
+    def test_late_acquire_trims_claims_in_token_order(self, monkeypatch):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        released = []
+        scheduler._block_manager = SimpleNamespace(
+            acquire_offload_prefix=lambda *_args: (
+                [1, 33, 65, -1],
+                12,
+                (1, 33, 65),
+            ),
+            free_leased_blocks=lambda blocks: released.append(tuple(blocks)),
+        )
+        seq = _seq(104, num_prompt_tokens=16, num_blocks=4)
+
+        target, block_ids, protected = scheduler._late_save_source(seq, 0, 16)
+
+        assert target == 8
+        assert block_ids[:2] == [1, 33]
+        assert protected == frozenset({1, 33})
+        assert released == [(65,)]
 
     def test_late_acquire_below_save_threshold_is_released_and_skipped(
         self, monkeypatch
