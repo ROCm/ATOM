@@ -72,7 +72,7 @@ def maybe_dual_stream_forward(
         and 0 < num_tokens <= threshold
         and not tbo_active()
         and not is_piecewise_cudagraph
-        and not atom_config.enable_rapidserve
+        #and not atom_config.enable_rapidserve
     ):
         return self.dual_stream_moe_forward(hidden_states)
     return self.single_stream_moe_forward(hidden_states)

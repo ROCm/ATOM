@@ -2438,7 +2438,7 @@ class DeepseekV4Attention(nn.Module):
             # CU-masked stream; side-stream Compressors would escape that
             # partition, so run them inline on the main stream instead (see
             # maybe_compressors_async).
-            and not get_current_atom_config().enable_rapidserve
+            #and not get_current_atom_config().enable_rapidserve
         )
 
         self.layer_name = prefix
