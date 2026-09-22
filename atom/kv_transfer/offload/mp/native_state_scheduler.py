@@ -238,9 +238,22 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             self._pinned_state_bytes -= self._image_reservation_bytes
             return None
         state_operation, unit_ids = source
-        request = super()._build_save_request(
-            seq, saved, aligned, operation, block_ids, is_last_prefill
-        )
+        try:
+            request = super()._build_save_request(
+                seq, saved, aligned, operation, block_ids, is_last_prefill
+            )
+        except Exception:
+            self._checkpoints.release_offload_store_source(state_operation)
+            self._checkpoints.settle_offload_store(state_operation)
+            self._pinned_state_bytes -= self._image_reservation_bytes
+            raise
+        if request is None:
+            # PAGE admission is MP-specific and runs after the native image is
+            # acquired. Roll the image lease back when the PAGE budget is busy.
+            self._checkpoints.release_offload_store_source(state_operation)
+            self._checkpoints.settle_offload_store(state_operation)
+            self._pinned_state_bytes -= self._image_reservation_bytes
+            return None
         request.native_state = NativeStateTransfer(unit_ids, aligned, prefix_hash)
         self._native_saves[operation] = _NativeSave(
             seq, state_operation, saved, aligned
