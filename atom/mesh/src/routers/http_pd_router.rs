@@ -16,7 +16,6 @@ use memchr::memmem;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -58,15 +57,7 @@ use crate::{
     },
 };
 
-/// Construct a full API URL from a base URL and path.
-fn api_path(url: &str, api_path: &str) -> String {
-    if api_path.starts_with('/') {
-        format!("{}{}", url, api_path)
-    } else {
-        format!("{}/{}", url, api_path)
-    }
-}
-
+#[derive(Clone)]
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
@@ -78,6 +69,7 @@ pub struct PDRouter {
     pub adapter: Arc<dyn BackendAdapter>,
     /// Set when backend == Atom. enrich_decode_kv is ATOM-specific and not on the trait.
     atom_adapter: Option<Arc<AtomAdapter>>,
+    external_placement: bool,
 }
 
 impl std::fmt::Debug for PDRouter {
@@ -92,6 +84,15 @@ impl std::fmt::Debug for PDRouter {
                 &self.atom_pd_rank_mapping_policy,
             )
             .finish()
+    }
+}
+
+/// The concurrent vLLM prefill must not outlive its decode request/response.
+struct PrefillTask(tokio::task::JoinHandle<()>);
+
+impl Drop for PrefillTask {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -214,7 +215,94 @@ impl PDRouter {
             planner,
             adapter,
             atom_adapter,
+            external_placement: false,
         })
+    }
+
+    /// Execute the caller's finalized placement and let its lease own load accounting.
+    pub(crate) fn with_external_placement(&self, planner: Arc<dyn PdPlanner>) -> Self {
+        Self {
+            planner,
+            external_placement: true,
+            ..self.clone()
+        }
+    }
+
+    /// Execute a validated raw JSON request without dropping backend extension fields.
+    /// Placement and request-text/token policy inputs have already been resolved.
+    pub(crate) async fn execute_external(
+        &self,
+        headers: &HeaderMap,
+        path: &str,
+        body: Value,
+    ) -> Response {
+        let (route, batch_size, return_logprob) = match path {
+            "/v1/chat/completions" => (
+                "/v1/chat/completions",
+                body.get("n")
+                    .and_then(Value::as_u64)
+                    .filter(|n| *n > 1)
+                    .map(|n| n as usize),
+                body.get("logprobs")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            ),
+            "/v1/completions" => (
+                "/v1/completions",
+                body.get("prompt")
+                    .and_then(Value::as_array)
+                    .filter(|a| !a.is_empty())
+                    .map(Vec::len),
+                body.get("logprobs").is_some_and(|v| !v.is_null()),
+            ),
+            "/generate" => (
+                "/generate",
+                body.get("input_ids")
+                    .and_then(Value::as_array)
+                    .filter(|a| a.first().is_some_and(Value::is_array))
+                    .map(Vec::len),
+                body.get("return_logprob")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            ),
+            _ => return error::bad_request("unsupported_path", "Unsupported PD API"),
+        };
+        let context = PDRequestContext {
+            route,
+            batch_size,
+            return_logprob,
+            is_stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
+            model_id: body.get("model").and_then(Value::as_str),
+            request_text: None,
+            headers: Some(Arc::new(headers.clone())),
+        };
+        self.dispatch_pd(Some(headers), &body, context).await
+    }
+
+    /// Finalize backend-specific rank mapping before the caller reserves worker load.
+    pub(crate) fn finalize_external_placement(&self, plan: PlacementPlan) -> PlacementPlan {
+        match plan {
+            PlacementPlan::Pair {
+                prefill,
+                decode,
+                prefill_policy,
+                decode_policy,
+            } if matches!(self.backend, BackendType::Atom) => PlacementPlan::Pair {
+                prefill: self.apply_atom_pd_rank_mapping_policy(prefill, &decode),
+                decode,
+                prefill_policy,
+                decode_policy,
+            },
+            other => other,
+        }
+    }
+
+    fn load_guard(
+        &self,
+        worker: Arc<dyn Worker>,
+        headers: Option<&HeaderMap>,
+    ) -> Option<WorkerLoadGuard> {
+        (!self.external_placement).then(|| WorkerLoadGuard::new(worker, headers))
     }
 
     fn apply_atom_pd_rank_mapping_policy(
@@ -546,7 +634,7 @@ impl PDRouter {
             decode_policy,
         );
 
-        if let BackendType::Atom = self.backend {
+        if matches!(self.backend, BackendType::Atom) && !self.external_placement {
             prefill = self.apply_atom_pd_rank_mapping_policy(prefill, &decode);
             info!(
                 "ATOM PD DP ranks selected: policy={} prefill={} prefill_dp_rank={:?} decode={} decode_dp_rank={:?}",
@@ -700,9 +788,8 @@ impl PDRouter {
     ) -> Response {
         // Load tracking: streaming uses guards inside create_streaming_response.
         let _prefill_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
-        let _decode_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
+            (!context.is_stream).then(|| self.load_guard(prefill.clone(), headers));
+        let _decode_guard = (!context.is_stream).then(|| self.load_guard(decode.clone(), headers));
 
         events::RequestPDSentEvent {
             prefill_url: prefill.url(),
@@ -729,7 +816,7 @@ impl PDRouter {
         let prefill_url_for_log = prefill.url().to_string();
         let prefill_for_outcome = prefill.clone();
         let correlation_for_log = correlation_id.unwrap_or_else(|| "unknown".to_string());
-        tokio::spawn(async move {
+        let prefill_task = PrefillTask(tokio::spawn(async move {
             match prefill_post.send().await {
                 Ok(res) => {
                     let status = res.status();
@@ -756,7 +843,7 @@ impl PDRouter {
                     prefill_for_outcome.record_outcome(false);
                 }
             }
-        });
+        }));
 
         // D request: client sees the streamed (or buffered) response from D.
         let decode_post = match self
@@ -816,7 +903,7 @@ impl PDRouter {
 
         if context.is_stream {
             let response_headers = header_utils::preserve_response_headers(res.headers());
-            self.create_streaming_response(
+            let response = self.create_streaming_response(
                 res.bytes_stream(),
                 status,
                 None,
@@ -825,7 +912,8 @@ impl PDRouter {
                 Some(response_headers),
                 prefill,
                 decode,
-            )
+            );
+            crate::core::AttachedBody::wrap_response(response, prefill_task)
         } else {
             let response_headers = header_utils::preserve_response_headers(res.headers());
             match res.bytes().await {
@@ -979,9 +1067,8 @@ impl PDRouter {
         correlation_id: Option<String>,
     ) -> Response {
         let _prefill_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
-        let _decode_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
+            (!context.is_stream).then(|| self.load_guard(prefill.clone(), headers));
+        let _decode_guard = (!context.is_stream).then(|| self.load_guard(decode.clone(), headers));
 
         events::RequestPDSentEvent {
             prefill_url: prefill.url(),
@@ -1429,27 +1516,37 @@ impl PDRouter {
         // For non-streaming: use guard for automatic load management
         // For streaming: load will be managed in create_streaming_response
         let _prefill_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
-        let _decode_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
+            (!context.is_stream).then(|| self.load_guard(prefill.clone(), headers));
+        let _decode_guard = (!context.is_stream).then(|| self.load_guard(decode.clone(), headers));
 
-        // Build both requests
-        let prefill_request = self.build_post_with_headers(
-            &self.client,
-            prefill.url(),
-            context.route,
-            &json_request,
-            headers,
-            false,
-        );
-        let decode_request = self.build_post_with_headers(
-            &self.client,
-            decode.url(),
-            context.route,
-            &json_request,
-            headers,
-            false,
-        );
+        let prefill_request = match self
+            .build_worker_post_with_headers(
+                &self.client,
+                prefill.as_ref(),
+                context.route,
+                json_request.clone(),
+                headers,
+                false,
+            )
+            .await
+        {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
+        let decode_request = match self
+            .build_worker_post_with_headers(
+                &self.client,
+                decode.as_ref(),
+                context.route,
+                json_request,
+                headers,
+                false,
+            )
+            .await
+        {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
 
         // Send both requests concurrently and wait for both
         // Note: Using borrowed references avoids heap allocation
@@ -1597,48 +1694,41 @@ impl PDRouter {
     ) -> Response {
         use crate::core::AttachedBody;
 
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-        tokio::spawn(async move {
-            futures_util::pin_mut!(stream);
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
+        // Poll the upstream only when the downstream asks for data. Dropping the
+        // response also drops the upstream, including while it is idle.
+        let stream = futures_util::stream::unfold(
+            (Box::pin(stream), false, prefill_logprobs, decode_url),
+            move |(mut stream, finished, prefill_logprobs, decode_url)| async move {
+                if finished {
+                    return None;
+                }
+                let result = stream.next().await?;
+                let (result, finished) = match result {
                     Ok(chunk) => {
-                        let is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
-
-                        let result = if return_logprob && prefill_logprobs.is_some() {
+                        let finished = memmem::find(&chunk, b"data: [DONE]").is_some();
+                        let chunk = if return_logprob && prefill_logprobs.is_some() {
                             Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
                                 .unwrap_or(chunk)
                         } else {
                             chunk
                         };
-
-                        if tx.send(Ok(result)).is_err() {
-                            break;
-                        }
-
-                        if is_done {
-                            break;
-                        }
+                        (Ok(chunk), finished)
                     }
-                    Err(e) => {
+                    Err(error) => {
                         if let Some(ref url) = decode_url {
-                            error!("Stream error from decode server {}: {}", url, e);
+                            error!("Stream error from decode server {}: {}", url, error);
                         }
-                        let _ = tx.send(Err(format!("Stream error: {}", e)));
-                        break;
+                        (Err(error), true)
                     }
-                }
-            }
-        });
-
-        let stream = UnboundedReceiverStream::new(rx);
+                };
+                Some((result, (stream, finished, prefill_logprobs, decode_url)))
+            },
+        );
         let body = Body::from_stream(stream);
-
-        let guards = vec![
-            WorkerLoadGuard::new(prefill, headers.as_ref()),
-            WorkerLoadGuard::new(decode, headers.as_ref()),
-        ];
+        let guards = (
+            self.load_guard(prefill, headers.as_ref()),
+            self.load_guard(decode, headers.as_ref()),
+        );
 
         let mut response = Response::new(body);
         *response.status_mut() = status;
@@ -1770,31 +1860,6 @@ impl PDRouter {
         Ok((prefill_status, prefill_body))
     }
 
-    fn build_post_with_headers(
-        &self,
-        client: &Client,
-        url: &str,
-        route: &'static str,
-        json_request: &Value,
-        headers: Option<&HeaderMap>,
-        connection_close: bool,
-    ) -> reqwest::RequestBuilder {
-        let mut request = client.post(api_path(url, route)).json(json_request);
-        if connection_close {
-            request = request.header("Connection", "close");
-        }
-        if let Some(headers) = headers {
-            for (name, value) in headers.iter() {
-                if header_utils::should_forward_request_header(name.as_str()) {
-                    if let Ok(val) = value.to_str() {
-                        request = request.header(name, val);
-                    }
-                }
-            }
-        }
-        request
-    }
-
     async fn build_worker_post_with_headers(
         &self,
         client: &Client,
@@ -1834,6 +1899,9 @@ impl PDRouter {
                     }
                 }
             }
+        }
+        if let Some(key) = worker.api_key() {
+            request = request.bearer_auth(key);
         }
         Ok(request)
     }
@@ -2164,6 +2232,7 @@ mod tests {
             planner,
             adapter,
             atom_adapter: None,
+            external_placement: false,
         }
     }
 
@@ -2307,7 +2376,7 @@ mod tests {
         assert_eq!(decode_ref.load(), 0);
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let stream = UnboundedReceiverStream::new(rx);
+        let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
 
         {
             let response = router.create_streaming_response(

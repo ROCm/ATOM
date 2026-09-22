@@ -456,21 +456,27 @@ pub fn build_app(
     max_payload_size: usize,
     request_id_headers: Vec<String>,
 ) -> Router {
-    let protected_routes = Router::new()
-        .route("/generate", post(generate))
-        .route("/v1/chat/completions", post(v1_chat_completions))
-        .route("/v1/completions", post(v1_completions))
-        .route("/v1/responses", post(v1_responses))
-        .route("/v1/responses/{response_id}", get(v1_responses_get))
-        .route(
-            "/v1/responses/{response_id}/cancel",
-            post(v1_responses_cancel),
-        )
-        .route("/v1/responses/{response_id}", delete(v1_responses_delete))
-        .route(
-            "/v1/responses/{response_id}/input_items",
-            get(v1_responses_list_input_items),
-        )
+    // In ext-proc mode Envoy is the only inference entrypoint.
+    let inference_routes = if app_state.context.router_config.ext_proc.enabled {
+        Router::new()
+    } else {
+        Router::new()
+            .route("/generate", post(generate))
+            .route("/v1/chat/completions", post(v1_chat_completions))
+            .route("/v1/completions", post(v1_completions))
+            .route("/v1/responses", post(v1_responses))
+            .route("/v1/responses/{response_id}", get(v1_responses_get))
+            .route(
+                "/v1/responses/{response_id}/cancel",
+                post(v1_responses_cancel),
+            )
+            .route("/v1/responses/{response_id}", delete(v1_responses_delete))
+            .route(
+                "/v1/responses/{response_id}/input_items",
+                get(v1_responses_list_input_items),
+            )
+    };
+    let protected_routes = inference_routes
         .route("/v1/conversations", post(v1_conversations_create))
         .route(
             "/v1/conversations/{conversation_id}",
@@ -806,16 +812,65 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .map_err(|e| format!("Invalid address: {}", e))?;
 
     let handle = axum_server::Handle::new();
+    let ext_proc = if config.router_config.ext_proc.enabled {
+        Some(
+            crate::ext_proc::ExtProcRuntime::start(app_context.clone())
+                .await
+                .map_err(|e| e as Box<dyn std::error::Error>)?,
+        )
+    } else {
+        None
+    };
+    let ext_proc_shutdown = ext_proc.as_ref().map(|runtime| runtime.shutdown_handle());
     let handle_clone = handle.clone();
     let app_state_clone = app_state.clone();
     let grace_period = Duration::from_secs(config.shutdown_grace_period_secs);
     spawn(async move {
         shutdown_signal().await;
+        if let Some(shutdown) = ext_proc_shutdown {
+            shutdown();
+        }
         handle_clone.graceful_shutdown(Some(grace_period));
         app_state_clone.router.shutdown().await;
     });
 
-    if let Some(tls) = config.tls.as_ref() {
+    let http = serve_http(addr, app, handle.clone(), config.tls.as_ref());
+    if let Some(mut runtime) = ext_proc {
+        // HTTP exposes management and health routes; inference goes through Envoy.
+        // Coordinate listener failures here, independently of the ext-proc runtime.
+        tokio::pin!(http);
+        tokio::select! {
+            result = &mut http => {
+                let grpc = runtime.shutdown().await;
+                result?;
+                grpc.map_err(|e| e as Box<dyn std::error::Error>)?;
+            }
+            result = runtime.wait() => {
+                if let Err(error) = result {
+                    handle.shutdown();
+                    return Err(error);
+                }
+                // SIGTERM also starts HTTP's graceful shutdown. Let it finish.
+                http.await?;
+            }
+        }
+    } else {
+        http.await?;
+    }
+
+    // HA handler shutdown is handled by the signal in mesh_run! macro
+    // No need to manually shutdown here
+
+    Ok(())
+}
+
+async fn serve_http(
+    addr: std::net::SocketAddr,
+    app: Router,
+    handle: axum_server::Handle<std::net::SocketAddr>,
+    tls: Option<&ServerTlsConfig>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(tls) = tls {
         let cert_metadata = tokio::fs::metadata(&tls.cert_path).await.map_err(|e| {
             Box::new(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -876,18 +931,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         axum_server::bind_rustls(addr, tls_config)
             .handle(handle)
             .serve(app.into_make_service())
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+            .await?;
     } else {
         axum_server::bind(addr)
             .handle(handle)
             .serve(app.into_make_service())
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+            .await?;
     }
-
-    // HA handler shutdown is handled by the signal in mesh_run! macro
-    // No need to manually shutdown here
 
     Ok(())
 }

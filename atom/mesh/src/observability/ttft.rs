@@ -130,7 +130,7 @@ impl http_body::Body for FirstOutputBody {
 }
 
 #[derive(Default)]
-struct SseFrames {
+pub(crate) struct SseFrames {
     pending: Vec<u8>,
     start: usize,
     search: usize,
@@ -138,9 +138,13 @@ struct SseFrames {
 }
 
 impl SseFrames {
-    const MAX_FRAME_BYTES: usize = 1024 * 1024;
+    pub(crate) const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
-    fn append(&mut self, chunk: &[u8]) {
+    pub(crate) fn exceeded_limit(&self) -> bool {
+        self.oversized
+    }
+
+    pub(crate) fn append(&mut self, chunk: &[u8]) {
         // Amortize compaction over the consumed bytes, not over frames.
         if self.start > 0 && self.start >= self.pending.len() / 2 {
             self.pending.drain(..self.start);
@@ -150,7 +154,7 @@ impl SseFrames {
         self.pending.extend_from_slice(chunk);
     }
 
-    fn next_frame(&mut self) -> Option<&[u8]> {
+    pub(crate) fn next_frame(&mut self) -> Option<&[u8]> {
         while let Some(offset) = memchr::memchr(b'\n', &self.pending[self.search..]) {
             let end = self.search + offset;
             self.search = end + 1;
@@ -180,14 +184,14 @@ impl SseFrames {
 }
 
 #[derive(Default)]
-struct FirstOutputSse {
+pub(crate) struct FirstOutputSse {
     frames: SseFrames,
     model: Option<String>,
     done: bool,
 }
 
 impl FirstOutputSse {
-    fn feed(&mut self, chunk: &[u8]) -> bool {
+    pub(crate) fn feed(&mut self, chunk: &[u8]) -> bool {
         if self.done {
             return false;
         }
