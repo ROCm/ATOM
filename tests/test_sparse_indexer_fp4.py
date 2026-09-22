@@ -398,6 +398,69 @@ def _assert_agrees(got, want, visible, topk):
     assert overlap > 0.99, overlap
 
 
+def test_fp4_index_slots_agrees_with_the_swizzle_at_every_tail(on_gfx950):
+    """The kernel's three outputs, against the formula, over a grid's edges.
+
+    Nothing else reaches it directly: the staging test reads it through two
+    planes of a DCP gather, so a wrong `page` and a wrong `row` that cancel
+    would still pass there. Here each output is compared on its own.
+
+    The sizes are chosen for the tail. TILE is 1024, so 1023/1025/4097/100001
+    leave a partial last block where the mask is what keeps the extra lanes from
+    storing; 64 and 1024 leave none; 0 launches no grid at all. A kernel that
+    ignored the mask would pass on the exact multiples and corrupt the rest.
+    """
+    from atom.model_ops.sparse_indexer_fp4 import fp4_index_slots
+
+    def expect(rows, block):
+        return (rows % 16) * (block // 16) + rows // 16
+
+    for n in (0, 1, 63, 64, 1023, 1024, 1025, 4097, 100001):
+        want = torch.arange(n, device="cuda")
+        # Both ways in: the slot list itself, and the length that stands for it.
+        from_slots = fp4_index_slots(_BLOCK, want)
+        from_count = fp4_index_slots(_BLOCK, total_kv=n, device=want.device)
+
+        for got, how in ((from_slots, "slots"), (from_count, "total_kv")):
+            page, row, scale_row = got
+            assert page.shape == (n,), (how, n, page.shape)
+            assert page.dtype == torch.int64, how  # used as an advanced index
+            assert torch.equal(page, want // _BLOCK), (how, n)
+            assert torch.equal(row, want % _BLOCK), (how, n)
+            assert torch.equal(scale_row, expect(want % _BLOCK, _BLOCK)), (how, n)
+
+    # A slot list is not required to be 1-D; the outputs follow its shape.
+    slots = torch.randint(0, 4096 * _BLOCK, (3, 17), device="cuda")
+    page, row, scale_row = fp4_index_slots(_BLOCK, slots)
+    assert page.shape == slots.shape
+    assert torch.equal(scale_row, expect(slots % _BLOCK, _BLOCK))
+
+
+def test_fp4_index_slots_refuses_what_it_cannot_serve(on_gfx950):
+    """Each guard, because every one of them covers a silent wrong answer.
+
+    A wrong `block_size` still indexes in bounds, on another row's exponents.
+    Both arguments or neither would leave the caller guessing which slots it
+    got. A host tensor would reach Triton, which refuses pointers it cannot
+    read -- the other `model_ops` kernels raise there too rather than fall back.
+    """
+    from atom.model_ops.sparse_indexer_fp4 import fp4_index_slots
+
+    dev = torch.device("cuda")
+    slots = torch.arange(8, device=dev)
+
+    with pytest.raises(ValueError, match="exactly one"):
+        fp4_index_slots(_BLOCK, slots, total_kv=8, device=dev)
+    with pytest.raises(ValueError, match="exactly one"):
+        fp4_index_slots(_BLOCK)
+    with pytest.raises(ValueError, match="64-row blocks"):
+        fp4_index_slots(16, total_kv=8, device=dev)
+    with pytest.raises(ValueError, match="needs `device`"):
+        fp4_index_slots(_BLOCK, total_kv=8)
+    with pytest.raises(RuntimeError, match="AMD GPU"):
+        fp4_index_slots(_BLOCK, torch.arange(8))
+
+
 def test_decode_scores_the_cache_the_fused_writer_wrote(on_gfx950):
     """The rectangular kernel at a speculation width: one row per (seq, step),
     each seeing one token less than the step after it. `next_n=1` is the DCP
