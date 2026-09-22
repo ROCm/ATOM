@@ -15,8 +15,14 @@ import logging
 from typing import Any
 
 import torch
-import triton
-import triton.language as tl
+
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except ImportError:  # pragma: no cover - CPU-only builds
+    _HAS_TRITON = False
 
 logger = logging.getLogger("atom")
 
@@ -243,36 +249,43 @@ def fp4_decode_schedule(
     )
 
 
-@triton.jit
-def _fp4_index_slots_kernel(
-    slots_ptr,  # None when HAS_SLOTS is False
-    page_ptr,
-    row_ptr,
-    scale_row_ptr,
-    n_slots: tl.int64,
-    BLOCK_SIZE: tl.constexpr,  # KV page size, 64 for the FP4 indexer
-    MFMA_M: tl.constexpr,  # e8m0 plane's transpose width
-    HAS_SLOTS: tl.constexpr,  # False: no pointer, the lane index is the slot
-    TILE: tl.constexpr,
-):
-    offs = (tl.program_id(0) * TILE + tl.arange(0, TILE)).to(tl.int64)
-    mask = offs < n_slots
-    if HAS_SLOTS:
-        slot = tl.load(slots_ptr + offs, mask=mask, other=0).to(tl.int64)
-    else:
-        # The staging half addresses [0, total_kv), where the slot IS its own
-        # index. Materialising that as a tensor only to read it back costs an
-        # arange launch, an allocation of 8 bytes per slot, and the traffic to
-        # write it and load it again -- all to learn what the lane already knows.
-        slot = offs
+if _HAS_TRITON:
 
-    page = slot // BLOCK_SIZE
-    row = slot % BLOCK_SIZE
-    scale_row = (row % MFMA_M) * (BLOCK_SIZE // MFMA_M) + row // MFMA_M
+    @triton.jit
+    def _fp4_index_slots_kernel(
+        slots_ptr,  # None when HAS_SLOTS is False
+        page_ptr,
+        row_ptr,
+        scale_row_ptr,
+        n_slots: tl.int64,
+        BLOCK_SIZE: tl.constexpr,  # KV page size, 64 for the FP4 indexer
+        MFMA_M: tl.constexpr,  # e8m0 plane's transpose width
+        HAS_SLOTS: tl.constexpr,  # False: no pointer, the lane index is the slot
+        TILE: tl.constexpr,
+    ):
+        offs = (tl.program_id(0) * TILE + tl.arange(0, TILE)).to(tl.int64)
+        mask = offs < n_slots
+        # Masked lanes are not accessed, but they still take part in forming the
+        # address vector. Pinning them to 0 keeps every pointer this kernel
+        # builds inside its own buffers, so the tail cannot depend on a backend
+        # honouring the mask before the arithmetic.
+        safe = tl.where(mask, offs, 0)
+        if HAS_SLOTS:
+            slot = tl.load(slots_ptr + safe, mask=mask, other=0).to(tl.int64)
+        else:
+            # The staging half addresses [0, total_kv), where the slot IS its own
+            # index. Materialising that as a tensor only to read it back costs an
+            # arange launch, an allocation of 8 bytes per slot, and the traffic to
+            # write it and load it again -- all to learn what the lane already knows.
+            slot = offs
 
-    tl.store(page_ptr + offs, page, mask=mask)
-    tl.store(row_ptr + offs, row, mask=mask)
-    tl.store(scale_row_ptr + offs, scale_row, mask=mask)
+        page = slot // BLOCK_SIZE
+        row = slot % BLOCK_SIZE
+        scale_row = (row % MFMA_M) * (BLOCK_SIZE // MFMA_M) + row // MFMA_M
+
+        tl.store(page_ptr + safe, page, mask=mask)
+        tl.store(row_ptr + safe, row, mask=mask)
+        tl.store(scale_row_ptr + safe, scale_row, mask=mask)
 
 
 def fp4_index_slots(
@@ -324,6 +337,12 @@ def fp4_index_slots(
 
     if dev.type != "cuda":
         raise RuntimeError("fp4_index_slots requires AMD GPU tensors.")
+    if not _HAS_TRITON:
+        # This module is imported by CPU-only test runs, where triton is not
+        # installed -- it is not a declared dependency. The import stays optional
+        # so importing the module keeps working there; only calling the kernel
+        # cannot. Same shape as eplb.py and shared_expert_dispatch.py.
+        raise RuntimeError("fp4_index_slots requires triton.")
 
     page = torch.empty(shape, dtype=torch.int64, device=dev)
     row = torch.empty(shape, dtype=torch.int64, device=dev)
