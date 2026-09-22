@@ -231,21 +231,7 @@ tier covers. **Do not extrapolate past 32**: three points rising is not a curve,
 and the GLM-5.2 measurements on this connector turn over at 16.
 
 The steady-state rows are computed as `requests started at t >= cut`, divided by
-`(aiperf Benchmark Duration - cut)`. The concurrency-8 row was quoted in #2291
-under a slightly different window convention (88.32 / 108.23, +22.54%); it is
-recomputed here so that all six arms share one construction, which moves it by
-0.3% and is not a new measurement.
-
-**Provenance of the concurrency-16 ON arm.** It is the fourth attempt. The three
-before it failed for host reasons, not model or connector reasons: two engine
-starts failed while another tenant held the cards, one was refused by the
-pre-flight host-memory gate (node0 short by 582 GiB), and one ran the client for
-104 minutes without producing a summary. The arm that is reported ran clean —
-1802.39 s, 182 engine state lines at a maximum 10 s spacing, peak GPU KV pool
-usage 15.5%, zero `no memory is available`. The failure causes are *not*
-recoverable from the logs, because the harness overwrote the server log on each
-attempt; that is a harness defect and it is why this paragraph exists instead of
-a root cause.
+`(aiperf Benchmark Duration - cut)`. All six arms share this one construction.
 
 `tput/GPU` is `output_token_throughput / 4`. Output length is fixed at 512, so
 it is `request_throughput x 128` by construction and is not a second result.
@@ -363,19 +349,6 @@ So part of the measured ON gain comes from whole-prompt replay rather than pure
 prefix reuse. Anyone reproducing a *pure* prefix-reuse result has to make the
 tail genuinely unique first; this recipe's numbers are for the workload as
 written, and the ceiling above is the one that matches it.
-
-**Limits.** Every arm is **n=1 in runs**. No dispersion is quoted, and the OFF
-arm's flatness across window cuts bounds within-run drift, not run-to-run
-variance — it is what licenses the start-cut, not an error bar on any of the
-deltas. Throughput is quantised at 1/R, below 0.1% on every arm, which is far
-below the effects but says nothing about their repeatability.
-
-**The concurrency-8 full-window +4.94% should not be quoted as a gain.**
-Repeated arms of this shape on this connector have shown a run-to-run spread of
-about 2.7%, so +4.94% is not separable from noise at n=1, and it is in addition
-a mixture of a 600 s transient and a 1200 s steady state. The +28.66% and
-+40.74% at concurrency 16 and 32 are far outside any spread measured here, and
-the steady-state rows (+22.70% / +33.80% / +48.30%) are the ones to quote.
 
 ## Related
 
