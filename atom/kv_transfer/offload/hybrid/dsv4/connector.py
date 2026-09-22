@@ -1898,18 +1898,6 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         # prefix is stored to LMCache once prefill computes it
         # (seq.prefix_hashes_published flips True), chunk by chunk.
         self._save_tracker: dict[str, list] = {}
-        # The worker has the same bound as a last-resort guard, but admission
-        # belongs here: rejecting after dispatch lets TP ranks make different
-        # decisions and forces the scheduler to roll the PAGE watermark back.
-        # Keep one shared limit for PAGE-only, SLOT-only, and PAGE+SLOT saves.
-        self._max_pending_saves = max_pending_saves(
-            kvc,
-            int(os.environ.get("OFFLOAD_COPY_WORKERS", "1") or 1),
-        )
-        # Resume after the last admitted request when capacity becomes free so
-        # a long request at the head of the insertion-ordered tracker cannot
-        # monopolize the bounded save queue.
-        self._save_rr_last: str | None = None
         # Scheduler-lifetime completion generation: every emitted save gets a
         # distinct SaveOperationId, so late TP notifications cannot complete a
         # later PAGE/SLOT save after request cleanup or request-ID reuse.
@@ -2204,25 +2192,6 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self._save_nonce += 1
         return operation
 
-    def _may_emit_save(self) -> bool:
-        """Return whether the scheduler may dispatch one more save operation.
-
-        A PAGE+SLOT request is one worker operation even though both completion
-        channels retain its identity. Counting distinct operation IDs keeps the
-        scheduler's view equal to the worker semaphore while old multi-inflight
-        state, if any, drains safely.
-        """
-
-        operations = {
-            operation
-            for inflight in self._save_inflight.values()
-            for operation in inflight
-        }
-        operations.update(
-            inflight[0] for inflight in self._sidecar_save_inflight.values()
-        )
-        return len(operations) < self._max_pending_saves
-
     def _clear_lookup_status(self, sid: str) -> None:
         if self._lookup_client is None:
             return
@@ -2417,23 +2386,12 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         # chunked prefill, seq.num_cached_tokens advances after each prefill
         # chunk's forward has completed; use it as the D2H-safe frontier.
         chunk = self.chunk_size or 256
-        tracker_sids = list(self._save_tracker.keys())
-        if tracker_sids and self._save_rr_last in self._save_tracker:
-            start = (tracker_sids.index(self._save_rr_last) + 1) % len(tracker_sids)
-            tracker_sids = tracker_sids[start:] + tracker_sids[:start]
-        for sid in tracker_sids:
+        for sid, entry in self._save_tracker.items():
             if not self._do_save or self._save_retries_expired(sid):
                 continue
-            if not self._may_emit_save():
-                break
-            entry = self._save_tracker[sid]
             seq, saved = entry
             if sid in self._reqs_need_recv or sid in loading_sids:
                 continue  # loading this step; defer its save
-            if sid in self._save_inflight or sid in self._sidecar_save_inflight:
-                # A request's PAGE and SLOT describe one ordered checkpoint
-                # stream. Do not let a later boundary overtake an earlier save.
-                continue
             computed = min(
                 int(getattr(seq, "num_cached_tokens", 0)),
                 int(seq.num_prompt_tokens),
@@ -2441,7 +2399,12 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             is_last_prefill = computed >= int(seq.num_prompt_tokens)
             aligned = (computed // chunk) * chunk
             sidecar_candidate = self._sidecar_save_candidate(seq, computed)
-            page_save_due = aligned > saved
+            boundary_needs_page = (
+                sidecar_candidate is not None and sidecar_candidate[0] > saved
+            )
+            page_save_due = aligned > saved and (
+                sid not in self._save_inflight or boundary_needs_page
+            )
             if not page_save_due and sidecar_candidate is None:
                 continue
             slot_save_spec = None
@@ -2499,7 +2462,6 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                     sidecar_candidate[0],
                     sidecar_candidate[1],
                 )
-            self._save_rr_last = sid
         dispatched = set(meta.lookup_requests_in_step)
         self._lookup_in_step = [
             sid for sid in self._lookup_in_step if sid not in dispatched

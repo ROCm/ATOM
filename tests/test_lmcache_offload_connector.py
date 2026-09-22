@@ -158,8 +158,6 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._load_save_floors = {}
     sched._hit_save_floors = {}
     sched._save_tracker = {}
-    sched._max_pending_saves = 4
-    sched._save_rr_last = None
     sched._save_nonce = 0
     sched._load_nonce = 0
     sched._load_lifecycles = {}
@@ -2795,14 +2793,6 @@ def test_slot_save_waits_until_post_allocation_state_copy_forward_completes():
     destination_slot["value"] = "initialized-from-checkpoint"
     seq._state_initialized_after_alloc = True
 
-    # The state is now eligible, but its SLOT-only publication must wait for
-    # the earlier PAGE operation for this request to retire.
-    assert sched.build_connector_meta().requests == []
-    assert sched.connector_completion(
-        _page_completion(before_request.save_operation, succeeded=True)
-    )
-    sched.save_finished(before_request.save_operation)
-
     after_forward = sched.build_connector_meta()
     after_request = after_forward.requests[0]
     if after_request.slot_save_spec is not None:
@@ -2871,7 +2861,7 @@ def test_sidecar_only_save_emits_when_page_boundary_is_already_stored():
     assert request.slot_save_spec == SlotSaveSpec(8192, boundary_hash, 2)
 
 
-def test_page_save_inflight_cuts_but_defers_exact_sidecar_boundary():
+def test_page_save_inflight_still_cuts_and_emits_exact_sidecar_boundary():
     sched = _stateful_scheduler(hit=0)
     seq = _stateful_seq(
         req_id=721,
@@ -2889,20 +2879,16 @@ def test_page_save_inflight_cuts_but_defers_exact_sidecar_boundary():
     seq.num_cached_tokens = 8192
     meta = sched.build_connector_meta()
 
-    # Stop exactly at the state boundary, but do not let the PAGE+SLOT save
-    # overtake the earlier PAGE save for the same request.
-    assert meta.requests == []
-    assert sched._save_tracker["721"][1] == 4096
-    assert sched._save_inflight["721"] == {prior_operation}
-    assert "721" not in sched._sidecar_save_inflight
-
-    sched.save_finished(prior_operation)
-    request = sched.build_connector_meta().requests[0]
+    assert len(meta.requests) == 1
+    request = meta.requests[0]
     assert request.save_spec.skip_leading_tokens == 4096
     assert request.token_ids == seq.token_ids[:8192]
     assert request.slot_save_spec.boundary_tokens == 8192
     assert sched._save_tracker["721"][1] == 8192
-    assert sched._save_inflight["721"] == {request.save_operation}
+    assert sched._save_inflight["721"] == {
+        prior_operation,
+        request.save_operation,
+    }
     assert sched._sidecar_save_inflight["721"][:2] == (
         request.save_operation,
         8192,
@@ -2926,19 +2912,18 @@ def test_save_callbacks_clear_only_matching_operation_generation():
     assert page.save_operation == SaveOperationId(seq.id, 0)
 
     seq.num_cached_tokens = 8192
-    assert sched.build_connector_meta().requests == []
-    sched.save_finished(page.save_operation)
-
     boundary = sched.build_connector_meta().requests[0]
     assert boundary.save_operation == SaveOperationId(seq.id, 1)
-    assert sched._save_inflight["725"] == {SaveOperationId(seq.id, 1)}
+    assert sched._save_inflight["725"] == {
+        SaveOperationId(seq.id, 0),
+        SaveOperationId(seq.id, 1),
+    }
     assert sched._sidecar_save_inflight["725"][0] == SaveOperationId(seq.id, 1)
 
     sched.sidecar_save_finished(page.save_operation)
     assert "725" in sched._sidecar_save_inflight
     assert sched._committed_sidecar_hashes == set()
 
-    # A duplicate late callback for generation 0 cannot retire generation 1.
     sched.save_finished(page.save_operation)
     assert sched._save_inflight["725"] == {SaveOperationId(seq.id, 1)}
 
@@ -3413,8 +3398,6 @@ def test_tp_cross_generation_reports_do_not_clear_or_commit_until_matched():
     sched._save_tracker["726"] = [seq, 0]
     page = sched.build_connector_meta().requests[0]
     seq.num_cached_tokens = 8192
-    assert sched.build_connector_meta().requests == []
-    sched.save_finished(page.save_operation)
     boundary = sched.build_connector_meta().requests[0]
     boundary_hash = boundary.slot_save_spec.boundary_block_hash
     aggregator = KVOutputAggregator(world_size=2)
@@ -3441,7 +3424,10 @@ def test_tp_cross_generation_reports_do_not_clear_or_commit_until_matched():
     )
     host._update_from_kv_xfer_finished(mixed)
 
-    assert sched._save_inflight["726"] == {boundary.save_operation}
+    assert sched._save_inflight["726"] == {
+        page.save_operation,
+        boundary.save_operation,
+    }
     assert boundary_hash not in sched._committed_sidecar_hashes
 
     matched = aggregator.aggregate(
@@ -3480,19 +3466,11 @@ def test_earlier_save_completion_clears_only_its_page_generation():
     sched._save_nonce = 1
     sched._save_inflight["722"] = {prior_operation}
     meta = sched.build_connector_meta()
-    assert meta.requests == []
+    assert meta.requests[0].save_spec.skip_leading_tokens == 4096
+    boundary_operation = meta.requests[0].save_operation
 
     sched.save_finished(prior_operation)
-    boundary = sched.build_connector_meta().requests[0]
-    assert boundary.save_spec.skip_leading_tokens == 4096
-    boundary_operation = boundary.save_operation
 
-    assert sched._save_inflight["722"] == {boundary_operation}
-    assert "722" in sched._sidecar_save_inflight
-
-    # Replaying the earlier generation after the next one was armed must not
-    # clear either half of the new PAGE+SLOT operation.
-    sched.save_finished(prior_operation)
     assert sched._save_inflight["722"] == {boundary_operation}
     assert "722" in sched._sidecar_save_inflight
 
@@ -3515,16 +3493,8 @@ def test_collapsed_sidecar_and_save_completion_clears_page_inflight():
     sched._save_tracker["723"] = [seq, 4096]
     prior_operation = SaveOperationId(seq.id, 0)
     sched._save_nonce = 1
-    boundary_operation = SaveOperationId(seq.id, 1)
-    # Exercise cleanup of state left by an older scheduler that allowed two
-    # generations for one request to overlap. New emissions never create this.
-    sched._save_inflight["723"] = {prior_operation, boundary_operation}
-    boundary_hash = _chained_prefix_hashes(seq.token_ids, 256)[8192]
-    sched._sidecar_save_inflight["723"] = (
-        boundary_operation,
-        8192,
-        boundary_hash,
-    )
+    sched._save_inflight["723"] = {prior_operation}
+    boundary_operation = sched.build_connector_meta().requests[0].save_operation
     host = Scheduler.__new__(Scheduler)
     host.kv_connector = sched
     host.deferred_free_blocks = {}
@@ -3870,10 +3840,12 @@ def test_terminal_sidecar_is_emitted_after_earlier_inflight_boundary_completes()
     seq.num_cached_tokens = 16_384
     sched.request_finished(seq)
     assert sched.should_defer_free(seq) is True
-    assert sched.build_connector_meta().requests == []
+    page_only = sched.build_connector_meta()
+    assert len(page_only.requests) == 1
+    assert page_only.requests[0].slot_save_spec is None
+    sched.save_finished(page_only.requests[0].save_operation)
 
     sched.sidecar_save_finished(first_operation)
-    sched.save_finished(first_operation)
     assert sched.should_defer_free(seq) is True
 
     terminal = sched.build_connector_meta()
@@ -5022,52 +4994,6 @@ def test_each_dispatched_save_gets_a_full_source_retention_window():
     # A request still in `running` has no clock; arming one here would hand the
     # reclaimer a sequence it must not touch.
     sched._refresh_save_reclaim_clock(SimpleNamespace(id=12))
-
-
-def test_dsv4_save_admission_is_bounded_and_round_robin():
-    sched = _scheduler()
-    sched._max_pending_saves = 2
-    for req_id in (100, 101, 102):
-        seq = SimpleNamespace(
-            id=req_id,
-            token_ids=list(range(8)),
-            block_table=[3, 4],
-            num_prompt_tokens=8,
-            num_cached_tokens=8,
-            has_per_req_cache=False,
-        )
-        sched._save_tracker[str(req_id)] = [seq, 0]
-
-    first = sched.build_connector_meta()
-    assert [request.req_id for request in first.requests] == [100, 101]
-    assert sched._may_emit_save() is False
-
-    # The worker has one slot again. Resume after the last admitted request,
-    # rather than letting request 100 win the queue repeatedly.
-    sched.save_finished(first.requests[0].save_operation)
-    second = sched.build_connector_meta()
-    assert [request.req_id for request in second.requests] == [102]
-    assert sched._may_emit_save() is False
-
-
-def test_dsv4_page_and_sidecar_share_one_admission_slot():
-    sched = _stateful_scheduler(hit=0)
-    sched._max_pending_saves = 1
-    seq = _stateful_seq(
-        req_id=103,
-        num_prompt_tokens=8192,
-        num_cached_tokens=8192,
-        group=2,
-    )
-    sched._save_tracker["103"] = [seq, 0]
-
-    request = sched.build_connector_meta().requests[0]
-    assert request.save_spec is not None
-    assert request.slot_save_spec is not None
-    assert sched._save_inflight["103"] == {request.save_operation}
-    assert sched._sidecar_save_inflight["103"][0] == request.save_operation
-    # PAGE+SLOT is one worker task, not two units of scheduler capacity.
-    assert sched._may_emit_save() is False
 
 
 def test_finished_saving_releases_deferred_free_with_string_req_id():
