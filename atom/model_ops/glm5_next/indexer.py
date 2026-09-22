@@ -201,6 +201,7 @@ def _sparse_attn_indexer_kpool(
     if is_speculative_verify:
         from .speculative import run_speculative_kpool_indexer
 
+        block_size_spec = get_current_atom_config().kv_cache_block_size
         run_speculative_kpool_indexer(
             attn_metadata,
             kv_cache,
@@ -217,10 +218,29 @@ def _sparse_attn_indexer_kpool(
             index_kpool,
             topk_tokens,
             topk_out_width,
-            get_current_atom_config().kv_cache_block_size,
+            block_size_spec,
             scale_fmt,
             stable_topk,
         )
+        # If the spec indexer was skipped (ragged batch) and all sequences are
+        # short enough for dense attention, fill sparse_kv_indices_buffer with
+        # valid causal indices so the MLA does not read stale / -1 entries.
+        if (
+            attn_metadata.max_seqlen_k <= topk_tokens
+            and getattr(attn_metadata, "kpool_plugin_mode", False)
+        ):
+            device = hidden_states.device
+            topk_indices = torch.full(
+                (n_tokens, topk_out_width), -1, dtype=torch.int32, device=device
+            )
+            _kpool_fill_dense_topk(
+                topk_indices,
+                positions,
+                attn_metadata,
+                block_size_spec,
+                topk_out_width,
+                sparse_kv_indices_buffer,
+            )
         return result
 
     device = hidden_states.device
@@ -404,8 +424,16 @@ def _sparse_attn_indexer_kpool(
     # so n_tokens % bs != 0 when at least one such request is present.
     # Skip the entire kpool decode update for this step; the next normal decode
     # step will pick up the tail stash correctly.
+    # Note: this check applies to both the target model and the MTP draft.
     if n_tokens % bs != 0 and getattr(attn_metadata, "kpool_plugin_mode", False):
         return result
+
+    # Also skip when is_prefill is False but n_tokens > bs (abnormal decode):
+    # the spec-accept step has one request with 12 tokens, so n_tokens = 264
+    # while bs = 64. The kpool decode path uses pool_bt which may be racing.
+    if not context.is_prefill and n_tokens > bs and getattr(attn_metadata, "kpool_plugin_mode", False):
+        if n_tokens % bs != 0:
+            return result
 
     pos = positions[:bs].to(torch.int64)
     pooled = kpool.kpool_decode_stash_and_pool(

@@ -664,7 +664,23 @@ def _patch_vllm_glm5_mtp_propose() -> None:
         return
 
     @functools.wraps(original_propose)
-    def wrapped_propose(self, *args, **kwargs):
+    def wrapped_propose(
+        self,
+        num_speculative_tokens,
+        target_token_ids,
+        target_positions,
+        target_hidden_states,
+        target_logprobs,
+        next_token_ids,
+        token_indices_to_sample,
+        common_attn_metadata,
+        sampling_metadata,
+        mm_embed_inputs=None,
+        num_rejected_tokens_gpu=None,
+        slot_mappings=None,
+    ):
+        import torch
+
         # Identify GLM-5.3 MTP by checking the draft model type.
         draft_model = getattr(self, "model", None)
         inner = getattr(draft_model, "model", None)
@@ -672,27 +688,37 @@ def _patch_vllm_glm5_mtp_propose() -> None:
             "Glm5NextMTP", "Glm5NextMultiTokenPredictor"
         )
         if not is_glm5_mtp:
-            return original_propose(self, *args, **kwargs)
+            return original_propose(
+                self, num_speculative_tokens, target_token_ids, target_positions,
+                target_hidden_states, target_logprobs, next_token_ids,
+                token_indices_to_sample, common_attn_metadata, sampling_metadata,
+                mm_embed_inputs, num_rejected_tokens_gpu, slot_mappings,
+            )
 
-        # Wrap set_inputs_first_pass to clamp token_indices_to_sample
-        original_sifp = self.set_inputs_first_pass
+        # When a request accepted many speculative tokens in the previous step,
+        # it gets extra tokens (e.g., 12 instead of 4), making n_tokens not
+        # divisible by batch_size. The MTP draft MoE routing allocates buffers
+        # based on a different token count and crashes with an OOB GPU access.
+        # Skip the draft forward entirely for this step and return empty tokens.
+        # The MTP draft will run normally in the next step once the abnormal
+        # request is back to the normal 4-token size.
+        batch_size = common_attn_metadata.batch_size()
+        n_tokens = int(target_token_ids.shape[0])
+        if batch_size > 0 and n_tokens % batch_size != 0:
+            device = target_token_ids.device
+            return torch.full(
+                (batch_size, num_speculative_tokens),
+                fill_value=-1,
+                dtype=torch.long,
+                device=device,
+            )
 
-        def patched_sifp(*a, **kw):
-            num_tokens, token_indices_to_sample, cad = original_sifp(*a, **kw)
-            # Clamp: drop any sample index that falls outside the draft's
-            # output token range. These correspond to requests with extra
-            # tokens (high spec acceptance) that the draft skips.
-            import torch
-            valid_mask = token_indices_to_sample < num_tokens
-            if not valid_mask.all():
-                token_indices_to_sample = token_indices_to_sample[valid_mask]
-            return num_tokens, token_indices_to_sample, cad
-
-        self.set_inputs_first_pass = patched_sifp
-        try:
-            return original_propose(self, *args, **kwargs)
-        finally:
-            self.set_inputs_first_pass = original_sifp
+        return original_propose(
+            self, num_speculative_tokens, target_token_ids, target_positions,
+            target_hidden_states, target_logprobs, next_token_ids,
+            token_indices_to_sample, common_attn_metadata, sampling_metadata,
+            mm_embed_inputs, num_rejected_tokens_gpu, slot_mappings,
+        )
 
     setattr(wrapped_propose, "_atom_glm5_mtp_propose_patched", True)
     SpecDecodeBaseProposer.propose = wrapped_propose
