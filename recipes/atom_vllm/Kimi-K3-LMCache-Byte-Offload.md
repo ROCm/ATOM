@@ -57,15 +57,19 @@ shortens the prefix instead of corrupting it.
 ## Server
 
 TP=8 on gfx950 GPUs 0-7, vLLM 0.28 plugin backend with ATOM as an out-of-tree
-plugin, LMCache 0.5.5rc3. This is the complete launch the numbers in *Measured*
-came from — nothing is elided.
+plugin, LMCache 0.5.5rc3. This is the complete launch — nothing is elided.
+
+One value here is **not** the one the first pair in *Measured* ran at: the tier
+is 90 GiB/rank, and that pair ran at 64. 90 is what the second working point
+(*A controlled-prefix client*) used and what is recommended; 64 is recorded with
+its own numbers in that section so the older pair stays reproducible.
 
 ```bash
 export AITER_LOG_LEVEL=WARNING
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export PYTHONHASHSEED=0                 # mandatory -- see below
 export LMCACHE_LOCAL_CPU=True
-export LMCACHE_MAX_LOCAL_CPU_SIZE=64    # GiB **per TP rank**; see Sizing the tier
+export LMCACHE_MAX_LOCAL_CPU_SIZE=90    # GiB **per TP rank**; see Sizing the tier
 export LMCACHE_CHUNK_SIZE=1536          # multiple of the *effective* block size
 export LMCACHE_CACHE_POLICY=ATOM_SLRU
 export OFFLOAD_MIN_LOAD_TOKENS=256      # default 8192 disables the tier for chat-sized prompts
@@ -198,6 +202,11 @@ previous run's `profile_export.jsonl` at the same 16 lanes, n=466):
 the tier can ever reach; 80 buys one more point for another 128 GiB pinned, and
 everything past 160 buys nothing. Size to the *working set*, not to the pool.
 
+**64 is this workload's knee; the launch above uses 90.** 90 GiB/rank is the
+per-rank ceiling this host allows at TP8 (see below) and is what the second
+working point ran at. Re-derive the knee for your own traces rather than taking
+either number as a constant.
+
 GLM-5.3's rule (`GLM-5.3-LMCache-Byte-Offload.md`, *Sizing the tier*) — tier
 ~1.5x the **reusable** working set — lands in the same place from a different
 direction, and is the cheaper check of the two because it needs no percentiles:
@@ -240,6 +249,13 @@ hold the prefix; it does not model the fact that on the plugin path vLLM
 queries the connector only for what the HBM pool already missed. When the pool
 is unpinned and hits 85%, the tier is bidding for the leftover 15% no matter
 how it is sized.
+
+**That factor of 62 is a property of that client, not of an unpinned pool.** At
+the same unpinned pool, a client whose reuse distance sits above the reusable
+prefix leaves HBM at ~11% and the tier delivers ~82% (*A controlled-prefix
+client*). So the sentence above should be read as: the bound is loose exactly
+when the pool already holds the working set. Check which regime a workload is
+in with the band arithmetic before concluding the tier is oversized.
 
 Set `LMC_CPU_GIB`, `MAX_MODEL_LEN`, `CONC` and any pool override identically on
 both arms: the band is defined by them, and an arm whose band is empty measures
@@ -325,6 +341,38 @@ aiperf profile --scenario inferencex-agentx-mvp \
   --server-metrics "http://127.0.0.1:8713/metrics" --no-gpu-telemetry
 ```
 
+
+### The second client: a controlled-prefix synthetic pool
+
+*A controlled-prefix client* under *Measured* used this instead. It exists
+because the trace replay above puts its reuse **inside** HBM, so it cannot
+measure the tier; here the reuse distance is a chosen number.
+
+```bash
+aiperf profile --url "http://127.0.0.1:8713" \
+  --endpoint /v1/chat/completions --endpoint-type chat --streaming --model "${MODEL}" \
+  --tokenizer "${MODEL}" --tokenizer-trust-remote-code \
+  --isl 4608 --isl-stddev 0 --osl 512 --osl-stddev 0 \
+  --prompt-prefix-length 27648 --prompt-prefix-pool-size 16 \
+  --num-dataset-entries 256 --concurrency 16 \
+  --benchmark-duration 1800 --benchmark-grace-period 60 --stats-interval 30 \
+  --extra-inputs ignore_eos:true --use-server-token-count \
+  --cache-bust first-turn-suffix --random-seed 530419 \
+  --request-timeout-seconds 3600 --no-gpu-telemetry \
+  --server-metrics "http://127.0.0.1:8713/metrics"
+```
+
+The geometry is chosen, not inherited. `--prompt-prefix-pool-size 16` with
+`27648 + 4608` tokens per request puts the reuse distance at
+`d = (16 - 1) x 32,256 = 483,840` tokens, which is above the reusable prefix
+(270,336 at conc 16) and below the tier (1,711,961 at 90 GiB/rank) — i.e. inside
+the band *Sizing the tier* defines. `--cache-bust first-turn-suffix` keeps each
+request's tail unique so the prefix is the only thing that can be reused;
+`--prompt-prefix-length` must be a multiple of the 1536-token chunk or the chunk
+ends do not land on prefix boundaries.
+
+`--max-context-length` is deliberately **not** passed: aiperf implements it only
+for trace datasets and rejects it on a synthetic one.
 
 `--num-dataset-entries 800` is sized to the window, not copied from a shorter
 run: 900 s drew 416 records against 400 entries, already at the replay edge, so
@@ -445,6 +493,87 @@ prefixes to defeat the GPU prefix cache, size the HBM pool below the working
 set to force read-back, and take the noise floor from the OFF arm's own
 two-pass delta. The baseline to beat is the one in
 [Kimi-K3.md](Kimi-K3.md#accuracy-validation).
+
+### A second working point: a controlled-prefix client (2026-09-22)
+
+The null above is a property of that **client**, not of the tier. Re-measured at
+the same natural 0.85 pool with a controlled-prefix synthetic workload, the tier
+goes from supplying 0.30% of prompt tokens to supplying **~82%**, and throughput
+moves with it. Each row is 1800 s, TP8, seed 530419, `PREFIX_POOL=16`,
+`--prompt-prefix-length 27648`, `--num-dataset-entries 256`, tier **90 GiB/rank**,
+n=1.
+
+| conc | arm | requests | req/s | out tok/s | ITL p50 (ms) | TTFT mean (ms) | tier % of prompt tok | HBM hit % |
+|---|---|---|---|---|---|---|---|---|
+| 16 | ON  | 2226 | 1.23 | 630.12 | 23.17 |  836.08 | 81.62 | 11.08 |
+| 16 | OFF | 1847 | 1.02 | 522.66 | 28.55 |  953.84 |  0    | 79.83 |
+| 20 | ON  | 2320 | 1.28 | 655.98 | 27.99 |  780.81 | 82.01 | 10.82 |
+| 20 | OFF | 1895 | 1.05 | 536.43 | 35.07 | 1018.62 |  0    | 79.86 |
+| 24 | ON  | 2707 | 1.50 | 766.07 | 28.59 |  909.09 | 82.65 | 10.42 |
+| 24 | OFF | 2118 | 1.17 | 599.62 | 37.74 | 1105.80 |  0    | 79.93 |
+| 32 | OFF | 2283 | 1.26 | 646.09 | 47.00 | 1288.97 |  0    | 80.04 |
+
+Deltas are taken from **request counts** over identical 1800 s windows, not from
+the reported `req/s`: aiperf prints that to two decimals, which at ~1.1 req/s is
+already +/-0.5%.
+
+- conc 16: **+20.5%**  (2226 vs 1847)
+- conc 20: **+22.4%**  (2320 vs 1895)
+- conc 24: **+27.8%**  (2707 vs 2118)
+
+Recompute (`1 - local_HBM_hit - tier_supplied`) is what moves: ON
+7.29 / 7.17 / 6.93% against OFF 20.17 / 20.14 / 20.07%, i.e. **2.8x** less work
+recomputed at every concurrency. The conc-32 ON arm was never run -- the sweep's
+host-memory gate never cleared -- so conc 32 has an OFF arm only and no delta.
+
+**What differs from the pair above, and what does not.** The HBM pool is *not*
+the difference: both working points ran with no `--num-gpu-blocks-override`, and
+the engine reports the same pool to within 0.06% (1,887,436 vs 1,886,245 tokens;
+`Maximum concurrency ... 28.80x` vs `28.78x`). What differs is the **client**
+(seed 1234 / 800 generic dataset entries / mean ISL 40,403, versus seed 530419 /
+16 controlled prefixes of 27,648 tokens / 256 entries / mean ISL 32,334), the
+tier (64 -> 90 GiB/rank), and `atom_head` (`cd4c5153c` -> `6f66121b7d`). Three
+knobs moved, so nothing here is isolated to one of them.
+
+The reading that survives all three is the one *Sizing the tier* already argues
+from the pinned-pool pair: what the tier can do is set by **how much of the
+working set HBM keeps**, and the client decides that as much as the pool size
+does. The earlier client's reuse fell inside HBM (85.1% local hit, leaving the
+connector a 14.9% miss tail); this client's does not (10.4-11.1% local hit), and
+the tier collects the difference.
+
+**The band arithmetic from *Sizing the tier* predicts this, including the
+trend.** The client's reuse distance is `d = 15 x (27648 + 4608) = 483,840`
+tokens. The lower band edge is *not* the 1.886M-token `GPU KV cache size` line
+but the reusable prefix left after the live requests take theirs, and it falls
+as lanes are added:
+
+| conc | blocks left | reusable prefix | `d` in band? |
+|---|---|---|---|
+| 16 | 704 | 270,336 tok | yes |
+| 20 | 484 | 185,856 tok | yes |
+| 24 | 264 | 101,376 tok | yes |
+
+The upper edge is the tier: 90 GiB/rank at 56,448 B/token is 1,711,961 tokens,
+well above `d`. So `d` sits inside `[reusable prefix, tier)` at all three
+concurrencies -- which is why HBM answers only ~11% and the tier collects ~82%
+-- and the band's lower edge drops as concurrency rises, which is the direction
+the gain moves (+20.5% -> +27.8%). At conc 32 the formula goes negative
+(`1584 - 32 x 55 = -176`): there is no reusable prefix left at all, so the ON
+arm that was never run would have been the most tier-dependent of the set.
+
+Comparability *within* this table was checked rather than asserted. Mean input
+length is identical to the digit across all six arms (32,333.87 tokens); a
+per-pair `run.env` diff shows only `arm=` differing (plus 1 GiB of host
+`MemFree` on the conc-16 pair); `atom_head` is `6f66121b7d` in every arm.
+`atom_dirty` is 2 on the conc-16 pair and 3 on the later ones -- the extra file
+is an untracked `scheduler.py` that no arm imported, so every arm ran the same
+code.
+
+Every arm is **n=1**. There is no repetition at any single working point, so no
+noise floor: the +20.5/22.4/27.8% figures carry no error bar. They are reported
+because the direction is the same at three concurrencies and the recompute
+identity moves with them, not because a single pair would be conclusive.
 
 ## Related
 
