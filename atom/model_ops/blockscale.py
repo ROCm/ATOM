@@ -11,12 +11,12 @@ import functools
 
 import torch
 import triton
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale_group32 import (
+    gemm_a8w8_blockscale_group32,
+)
 
 from .blockscale_kernels.blockscale_gemm import (
     blockscale_gemm_fp4_kernel,
-    blockscale_gemm_fp8_kernel,
-    blockscale_gemm_fp8_packed_kernel,
 )
 from .blockscale_kernels.quantization import quantize_fp4_kernel, quantize_fp8_kernel
 
@@ -99,20 +99,12 @@ def quantize_fp4(
     return output if dequantize else (output.view(torch.float4_e2m1fn_x2), scales)
 
 
-_TARGET_WAVES = 2
-
-
 @functools.lru_cache(maxsize=8)
 def _units(index: int | None = None) -> int:
-    """Compute units on the current device; both tile and split gates use it."""
+    """Compute units used to size the W4A8 split-K grid."""
     return torch.cuda.get_device_properties(
         torch.cuda.current_device() if index is None else index
     ).multi_processor_count
-
-
-def _auto_split_k(m: int, n: int, k: int, device, fp4: bool = True) -> int:
-    """How many ways to split K, so the launch grid fills the device."""
-    return _fp4_split_k(m, n, k, device) if fp4 else _fp8_split_k(m, n, k, device)
 
 
 def _fp4_split_k(m: int, n: int, k: int, device) -> int:
@@ -133,100 +125,6 @@ def _fp4_split_k(m: int, n: int, k: int, device) -> int:
     return max(1, min(16, k // 1024, -(-units // blocks)))
 
 
-def _fp8_split_k(m: int, n: int, k: int, device) -> int:
-    """Splits for the FP8 path, from the tile the same shape will run.
-
-    The grid against the CU count is the whole gate: a 16-workgroup kv_a at
-    m=1 more than halves, a 288-workgroup shared w1 at m=128 loses 1.3x. Two
-    waves rather than one, because shorter splits also even out the tail.
-    Asking for more than K/BK is harmless -- the caller re-derives the count
-    from ``part_k``.
-    """
-    bm, bn, bk, _, _, _ = _select_fp8_tile(m, n, k)
-    blocks = -(-m // bm) * -(-n // bn)
-    units = _units(device.index)
-    if blocks >= units:
-        return 1
-    return max(1, min(16, k // bk, -(-(_TARGET_WAVES * units) // blocks)))
-
-
-def _select_fp8_tile(m: int, n: int, k: int):
-    """(BM, BN, BK, num_warps, num_stages, N_FIRST) for the FP8 kernel.
-
-    Swept through ``native_quant_linear`` so each candidate ran with its real
-    split count, and with the inputs rotated -- a sweep on pinned tensors reads
-    a third of the decode time and picks differently. The M bands are also the
-    JIT variant count per projection; N and K are constexpr there, so branching
-    on them is free.
-
-    Small M is weight-bandwidth bound on a grid too small to fill the CUs, so
-    BM drops to the MFMA minimum and BK widens. The tile squares up on the grid
-    it would leave rather than on N: a narrow projection at m=1024 still wants
-    the small tile, because a 128-wide one leaves 80 workgroups of 256.
-    """
-    # Short reductions benefit from reusing A across adjacent N tiles. Keep
-    # the grid large enough to fill the CUs before moving to a 128-wide tile.
-    if 32 < m <= 2048 and k <= 2048 and n >= 4096 and get_gfx() == "gfx950":
-        if m <= 64:
-            if 8192 <= n < 32768:
-                return (
-                    (32, 32, 256, 2, 2, True)
-                    if n < 16384
-                    else (64, 64, 256, 4, 2, True)
-                )
-        elif m <= 128 or -(-m // 128) * -(-n // 128) < _units():
-            if -(-m // 64) * -(-n // 64) >= _units():
-                # Wide weights at small M benefit more from reusing B.
-                return 64, 64, 256, 4, 2, m > 128 or n < 32768
-        else:
-            return 128, 128, 256, 4, 2 if m * n <= 2**22 else 1, True
-    if m <= 16:
-        # Deep, wide weights already fill the GPU without split-K; a shorter
-        # K tile reduces the live operand footprint.
-        return 16, 32, 256 if n * k >= 2**27 else 512, 2, 2, False
-    if m <= 64:
-        # A wide, deep weight has enough work per output tile to pay for a
-        # square one this early; kv_a and wq_a at m=32 do not.
-        return (
-            (64, 64, 256, 4, 2, False) if n * k >= 2**25 else (32, 32, 512, 2, 2, False)
-        )
-    if m <= 256:
-        # A narrow projection cannot make enough 64-wide tiles to fill the CUs
-        # here -- kv_a at m=128 leaves 16 workgroups -- and split-K only lifts
-        # that to 160. Halving the tile is what fills it. Picked on the sum
-        # over N in {512, 768, 1024} x m in {128, 256}, not on kv_a alone: the
-        # 16x16x1024 tile that wins kv_a at m=128 is 30% slower at N=768.
-        return (32, 32, 512, 2, 2, False) if n <= 1024 else (64, 64, 256, 4, 2, False)
-    if n <= 1024 or -(-m // 128) * -(-n // 128) < _units() // 2:
-        return 64, 64, 256, 4, 2, False
-    return 128, 128, 256, 4, 1, False
-
-
-def _select_fp8_packed_tile(m: int, n: int, k: int):
-    """(BM, BN, BK, PACK) where a full-K CTA beats split-K on gfx950.
-
-    Narrow N still needs split-K to occupy the GPU. Large M or deep weights
-    need the original kernel's tiling; only short reductions pay for packing
-    beyond 16 tokens. These bands keep M a runtime argument in both kernels.
-    """
-    if m > 32 or n < 2048 or k > 6144 or n * k >= 2**27:
-        return None
-    if m > 16:
-        return (32, 32, 256, 1) if k <= 2048 and n <= 6144 else None
-    if k <= 1024:
-        return 16, 32, 256, 1
-    if k <= 2048:
-        if n >= 32768 and m > 4:
-            return None
-        pack = 4 if m <= 4 else 2
-        bn = 32 if m <= 4 and (n >= 8192 or k == 2048) else 16
-        return max(16 // pack, triton.next_power_of_2(m)), bn, 256, pack
-    if k > 4096 and m > 4:
-        return None
-    pack = 4 if m <= 4 else 2
-    return max(16 // pack, triton.next_power_of_2(m)), 16, 512, pack
-
-
 def native_quant_linear(
     x,
     weight,
@@ -239,7 +137,7 @@ def native_quant_linear(
 ):
     """FP8 32x32/1x32 or W4A8 1x32 GEMM; inputs and weights stay native.
 
-    Weight scales remain compact. FP8 goes through the microscaling MFMA, W4A8
+    Weight scales remain compact. FP8 uses AITER's group32 backend; W4A8
     unpacks to BF16 for a plain one; both accumulate in FP32 before the
     requested output conversion. A8 QAT and native
     weight storage are retained without materializing a dequantized weight.
@@ -260,6 +158,21 @@ def native_quant_linear(
     if x_scale is None:
         x, x_scale = quantize_fp8(x)
     m = x.numel() // k
+    if split_k is not None and (not isinstance(split_k, int) or split_k < 1):
+        raise ValueError("split_k must be a positive integer")
+    if not fp4:
+        batched = x.ndim > 2
+        output = gemm_a8w8_blockscale_group32(
+            x.view(m, k) if batched else x,
+            weight,
+            x_scale.view(m, k // 32) if batched else x_scale,
+            weight_scale,
+            dtype=dtype,
+            weight_group_rows=weight_group_rows,
+            split_k=split_k,
+        )
+        return output.view(*x.shape[:-1], n) if batched else output
+
     if (
         x.dtype != torch.float8_e4m3fn
         or x_scale.dtype != torch.float8_e8m0fnu
@@ -283,96 +196,33 @@ def native_quant_linear(
     output = torch.empty((*x.shape[:-1], n), device=x.device, dtype=dtype)
     if m == 0:
         return output
-    packed_tile = (
-        _select_fp8_packed_tile(m, n, k)
-        if not fp4
-        and weight_group_rows == 32
-        and split_k is None
-        and get_gfx() == "gfx950"
-        else None
-    )
-    if packed_tile is not None:
-        bm, bn, bk, pack = packed_tile
-        blockscale_gemm_fp8_packed_kernel[(-(-m // bm), -(-n // bn))](
-            x,
-            weight,
-            x_scale.view(torch.uint8),
-            weight_scale.view(torch.uint8),
-            output,
-            m,
-            n,
-            k,
-            bm,
-            bn,
-            bk,
-            pack,
-            num_warps=2,
-            num_stages=2,
-            matrix_instr_nonkdim=16,
-        )
-        return output
-    if fp4:
-        bm, bn, bk, warps, stages = (16 if m <= 16 else 32), 64, 32, 4, 2
-    else:
-        bm, bn, bk, warps, stages, n_first = _select_fp8_tile(m, n, k)
-    splits = split_k if split_k is not None else _auto_split_k(m, n, k, x.device, fp4)
-    if not isinstance(splits, int) or splits < 1:
-        raise ValueError("split_k must be a positive integer")
-    # Round each slice up to the tile, then re-derive how many slices that is.
+    bm, bn, bk = (16 if m <= 16 else 32), 64, 32
+    splits = split_k if split_k is not None else _fp4_split_k(m, n, k, x.device)
     slice_k = -(-k // splits)
     part_k = -(-slice_k // bk) * bk
     splits = -(-k // part_k)
-    # Outside the packed path, split-K supplies enough independent work to
-    # offset the extra reduction launch.
     partial = (
         output
         if splits == 1
         else torch.empty((splits, m, n), device=x.device, dtype=torch.float32)
     )
-    # Integer ceildivs rather than triton.cdiv: at decode this launch path
-    # costs more than the kernel it launches. The E8M0 grids go in as uint8
-    # because Triton has no dtype for them; E4M3 goes in as itself.
-    grid = (-(-m // bm), -(-n // bn), splits)
-    scales = (x_scale.view(torch.uint8), weight_scale.view(torch.uint8))
-    if fp4:
-        blockscale_gemm_fp4_kernel[grid](
-            x,
-            weight.view(torch.uint8),
-            *scales,
-            partial,
-            m,
-            n,
-            k,
-            part_k,
-            bm,
-            bn,
-            bk,
-            num_warps=warps,
-            num_stages=stages,
-            # Pins the BF16 MFMA shape this path was tuned against.
-            matrix_instr_nonkdim=16,
-        )
-    else:
-        if n_first:
-            grid = (grid[1], grid[0], grid[2])
-        blockscale_gemm_fp8_kernel[grid](
-            x,
-            weight,
-            *scales,
-            partial,
-            m,
-            n,
-            k,
-            weight_group_rows,
-            part_k,
-            bm,
-            bn,
-            bk,
-            N_FIRST=n_first,
-            num_warps=warps,
-            num_stages=stages,
-            matrix_instr_nonkdim=16 if n_first and bm == 32 else 0,
-        )
+    blockscale_gemm_fp4_kernel[(-(-m // bm), -(-n // bn), splits)](
+        x,
+        weight.view(torch.uint8),
+        x_scale.view(torch.uint8),
+        weight_scale.view(torch.uint8),
+        partial,
+        m,
+        n,
+        k,
+        part_k,
+        bm,
+        bn,
+        bk,
+        num_warps=4,
+        num_stages=2,
+        matrix_instr_nonkdim=16,
+    )
     if splits > 1:
         from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
             _gemm_splitk_reduce_kernel,
