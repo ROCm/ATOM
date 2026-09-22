@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Numerical and replay contracts for native group32 decode projections."""
+"""Numerical and replay contracts for native group32 FP8 projections."""
 
 import pytest
 import torch
@@ -49,6 +49,11 @@ def _reference(x, weight, xs, ws):
         (4, 5120, 4096),
         (3, 2304, 5120),
         (1, 5120, 8192),
+        # N-first scheduling: token/column tails and short K tails.
+        (63, 8193, 1280),
+        (129, 4097, 576),
+        (255, 16385, 1152),
+        (1023, 4097, 1280),
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -87,15 +92,20 @@ def test_group32_projection_extreme_scale_codes(a_code, b_code):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-def test_group32_projection_graph_reads_live_inputs_and_scales():
-    x, weight, xs, ws = _operands(6, 4096, 1280)
-    x = x.view(2, 3, 1280)
-    xs = xs.view(2, 3, 40)
-    native_quant_linear(x, weight, ws, x_scale=xs, dtype=torch.float32)
+@pytest.mark.parametrize(
+    "rows,n,k,split_k", [(3, 4096, 1280, None), (33, 8193, 576, 3)]
+)
+def test_group32_projection_graph_reads_live_inputs_and_scales(rows, n, k, split_k):
+    x, weight, xs, ws = _operands(2 * rows, n, k)
+    x = x.view(2, rows, k)
+    xs = xs.view(2, rows, k // 32)
+    native_quant_linear(x, weight, ws, x_scale=xs, dtype=torch.float32, split_k=split_k)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = native_quant_linear(x, weight, ws, x_scale=xs, dtype=torch.float32)
+        actual = native_quant_linear(
+            x, weight, ws, x_scale=xs, dtype=torch.float32, split_k=split_k
+        )
     for factor in (2, 0.5):
         x.copy_((x.float() * factor).to(x.dtype))
         xs.view(torch.uint8).add_(1)
@@ -107,3 +117,22 @@ def test_group32_projection_graph_reads_live_inputs_and_scales():
             rtol=3e-5,
             atol=5e-5 * expected.abs().max().item(),
         )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_row_scaled_fp8_projection_with_token_and_column_tails(dtype):
+    x, weight, xs, ws = _operands(97, 8193, 576)
+    # Per-row scales share the scheduling kernel but not the compact weight grid.
+    ws = ws.repeat_interleave(32, 0)[: weight.shape[0]].contiguous()
+    actual = native_quant_linear(
+        x, weight, ws, x_scale=xs, weight_group_rows=1, dtype=dtype, split_k=3
+    )
+    expected = (x.double() * xs.double().repeat_interleave(32, -1)) @ (
+        weight.double() * ws.double().repeat_interleave(32, -1)
+    ).T
+    torch.testing.assert_close(
+        actual.float(),
+        expected.to(dtype).float(),
+        rtol=0.016 if dtype == torch.bfloat16 else 3e-5,
+        atol=5e-5 * expected.abs().max().item(),
+    )

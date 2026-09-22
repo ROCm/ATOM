@@ -28,6 +28,7 @@ def blockscale_gemm_fp8_kernel(
     BM: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
+    N_FIRST: tl.constexpr = False,
 ):
     """E4M3 x E4M3 with E8M0 group scales, on the CDNA4 microscaling MFMA.
 
@@ -35,8 +36,10 @@ def blockscale_gemm_fp8_kernel(
     BF16 emulation instead, which is several times slower.
     """
     tl.static_assert(BK >= 64 and BK % 32 == 0)
-    row = tl.program_id(0) * BM + tl.arange(0, BM)
-    col = tl.program_id(1) * BN + tl.arange(0, BN)
+    # The first grid dimension advances fastest. N-first traversal reuses A;
+    # M-first traversal reuses B. The wrapper swaps the launch dimensions.
+    row = tl.program_id(1 if N_FIRST else 0) * BM + tl.arange(0, BM)
+    col = tl.program_id(0 if N_FIRST else 1) * BN + tl.arange(0, BN)
     split = tl.program_id(2)
     groups: tl.constexpr = K // 32
     ks = tl.arange(0, BK)

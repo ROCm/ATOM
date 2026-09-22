@@ -142,7 +142,7 @@ def _fp8_split_k(m: int, n: int, k: int, device) -> int:
     Asking for more than K/BK is harmless -- the caller re-derives the count
     from ``part_k``.
     """
-    bm, bn, bk, _, _ = _select_fp8_tile(m, n, k)
+    bm, bn, bk, _, _, _ = _select_fp8_tile(m, n, k)
     blocks = -(-m // bm) * -(-n // bn)
     units = _units(device.index)
     if blocks >= units:
@@ -151,7 +151,7 @@ def _fp8_split_k(m: int, n: int, k: int, device) -> int:
 
 
 def _select_fp8_tile(m: int, n: int, k: int):
-    """(BM, BN, BK, num_warps, num_stages) for the FP8 kernel.
+    """(BM, BN, BK, num_warps, num_stages, N_FIRST) for the FP8 kernel.
 
     Swept through ``native_quant_linear`` so each candidate ran with its real
     split count, and with the inputs rotated -- a sweep on pinned tensors reads
@@ -164,24 +164,42 @@ def _select_fp8_tile(m: int, n: int, k: int):
     it would leave rather than on N: a narrow projection at m=1024 still wants
     the small tile, because a 128-wide one leaves 80 workgroups of 256.
     """
+    # Short reductions benefit from reusing A across adjacent N tiles. Keep
+    # the grid large enough to fill the CUs before moving to a 128-wide tile.
+    if 32 < m <= 2048 and k <= 2048 and n >= 4096 and get_gfx() == "gfx950":
+        if m <= 64:
+            if 8192 <= n < 32768:
+                return (
+                    (32, 32, 256, 2, 2, True)
+                    if n < 16384
+                    else (64, 64, 256, 4, 2, True)
+                )
+        elif m <= 128 or -(-m // 128) * -(-n // 128) < _units():
+            if -(-m // 64) * -(-n // 64) >= _units():
+                # Wide weights at small M benefit more from reusing B.
+                return 64, 64, 256, 4, 2, m > 128 or n < 32768
+        else:
+            return 128, 128, 256, 4, 2 if m * n <= 2**22 else 1, True
     if m <= 16:
         # Deep, wide weights already fill the GPU without split-K; a shorter
         # K tile reduces the live operand footprint.
-        return 16, 32, 256 if n * k >= 2**27 else 512, 2, 2
+        return 16, 32, 256 if n * k >= 2**27 else 512, 2, 2, False
     if m <= 64:
         # A wide, deep weight has enough work per output tile to pay for a
         # square one this early; kv_a and wq_a at m=32 do not.
-        return (64, 64, 256, 4, 2) if n * k >= 2**25 else (32, 32, 512, 2, 2)
+        return (
+            (64, 64, 256, 4, 2, False) if n * k >= 2**25 else (32, 32, 512, 2, 2, False)
+        )
     if m <= 256:
         # A narrow projection cannot make enough 64-wide tiles to fill the CUs
         # here -- kv_a at m=128 leaves 16 workgroups -- and split-K only lifts
         # that to 160. Halving the tile is what fills it. Picked on the sum
         # over N in {512, 768, 1024} x m in {128, 256}, not on kv_a alone: the
         # 16x16x1024 tile that wins kv_a at m=128 is 30% slower at N=768.
-        return (32, 32, 512, 2, 2) if n <= 1024 else (64, 64, 256, 4, 2)
+        return (32, 32, 512, 2, 2, False) if n <= 1024 else (64, 64, 256, 4, 2, False)
     if n <= 1024 or -(-m // 128) * -(-n // 128) < _units() // 2:
-        return 64, 64, 256, 4, 2
-    return 128, 128, 256, 4, 1
+        return 64, 64, 256, 4, 2, False
+    return 128, 128, 256, 4, 1, False
 
 
 def _select_fp8_packed_tile(m: int, n: int, k: int):
@@ -296,7 +314,7 @@ def native_quant_linear(
     if fp4:
         bm, bn, bk, warps, stages = (16 if m <= 16 else 32), 64, 32, 4, 2
     else:
-        bm, bn, bk, warps, stages = _select_fp8_tile(m, n, k)
+        bm, bn, bk, warps, stages, n_first = _select_fp8_tile(m, n, k)
     splits = split_k if split_k is not None else _auto_split_k(m, n, k, x.device, fp4)
     if not isinstance(splits, int) or splits < 1:
         raise ValueError("split_k must be a positive integer")
@@ -335,6 +353,8 @@ def native_quant_linear(
             matrix_instr_nonkdim=16,
         )
     else:
+        if n_first:
+            grid = (grid[1], grid[0], grid[2])
         blockscale_gemm_fp8_kernel[grid](
             x,
             weight,
@@ -348,8 +368,10 @@ def native_quant_linear(
             bm,
             bn,
             bk,
+            N_FIRST=n_first,
             num_warps=warps,
             num_stages=stages,
+            matrix_instr_nonkdim=16 if n_first and bm == 32 else 0,
         )
     if splits > 1:
         from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
