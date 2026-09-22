@@ -1082,9 +1082,7 @@ class LMCacheMPConnector(KVConnectorBase):
                                         (
                                             (
                                                 chunk_start,
-                                                min(
-                                                    chunk_start + self.chunk_size, end
-                                                ),
+                                                min(chunk_start + self.chunk_size, end),
                                             ),
                                         ),
                                     ),

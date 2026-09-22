@@ -220,7 +220,9 @@ def test_minimax_m3_builder_publishes_gqa_and_index_views_without_tp_collapse(
         region.semantic_role.startswith("mha.gqa4.")
         for region in transfer.block_regions
     )
-    assert all(view.shape[:2] == (num_blocks, 1) for view in transfer.block_tensor_views)
+    assert all(
+        view.shape[:2] == (num_blocks, 1) for view in transfer.block_tensor_views
+    )
     _assert_region_view_geometry(transfer)
     cache_views = _build_cache_views(transfer, num_blocks=num_blocks)
     assert len(cache_views.tensors) == len(transfer.block_regions)
