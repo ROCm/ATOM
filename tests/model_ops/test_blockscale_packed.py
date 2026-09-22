@@ -9,10 +9,8 @@ if not torch.cuda.is_available():
 
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops import gemm_op_a8w8
-from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale_group32 import (
-    gemm_a8w8_blockscale_group32,
-)
 
+from atom.model_ops import blockscale
 from atom.model_ops.blockscale import native_quant_linear
 
 pytestmark = pytest.mark.skipif(get_gfx() != "gfx950", reason="CDNA4 packed MFMA")
@@ -148,15 +146,18 @@ def test_row_scaled_fp8_projection_with_token_and_column_tails(dtype):
 def test_fp8_projection_uses_aiter_backend_config(
     monkeypatch, shape, group_rows, dtype
 ):
+    if blockscale._aiter_fp8_gemm is None:
+        pytest.skip("AITER native group32 public interface is unavailable")
+    backend = pytest.importorskip(
+        "aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale_group32"
+    ).gemm_a8w8_blockscale_group32
     m = 1
     for dim in shape[:-1]:
         m *= dim
     x, weight, xs, ws = _operands(m, 4096, shape[-1])
     if group_rows == 1:
         ws = ws.repeat_interleave(32, 0).contiguous()
-    expected = gemm_a8w8_blockscale_group32(
-        x, weight, xs, ws, dtype=dtype, weight_group_rows=group_rows
-    )
+    expected = backend(x, weight, xs, ws, dtype=dtype, weight_group_rows=group_rows)
     lookup = gemm_op_a8w8.get_CKGEMM_config
     calls = []
 

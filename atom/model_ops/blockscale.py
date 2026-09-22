@@ -11,7 +11,6 @@ import functools
 
 import torch
 import triton
-from aiter import gemm_a8w8_blockscale
 
 from .blockscale_kernels.blockscale_gemm import (
     blockscale_gemm_fp4_kernel,
@@ -21,6 +20,27 @@ from .blockscale_kernels.quantization import (
     quantize_fp4_kernel,
     quantize_fp8_kernel,
 )
+
+
+def _get_aiter_fp8_gemm():
+    try:
+        from aiter import gemm_a8w8_blockscale
+    except ImportError:
+        return None
+    # The older same-named interface only supports FP32 128x128 scales.
+    # The registered schema retains the signature hidden by torch_compile_guard.
+    try:
+        schema = torch.ops.aiter.gemm_a8w8_blockscale.default._schema
+    except AttributeError:
+        return None
+    return (
+        gemm_a8w8_blockscale
+        if any(arg.name == "split_k" for arg in schema.arguments)
+        else None
+    )
+
+
+_aiter_fp8_gemm = _get_aiter_fp8_gemm()
 
 
 def _check_quant_input(x, group):
@@ -103,7 +123,7 @@ def quantize_fp4(
 
 @functools.lru_cache(maxsize=8)
 def _units(index: int | None = None) -> int:
-    """Compute units used to size the W4A8 split-K grid."""
+    """Compute units used to size local split-K grids."""
     return torch.cuda.get_device_properties(
         torch.cuda.current_device() if index is None else index
     ).multi_processor_count
@@ -139,8 +159,9 @@ def native_quant_linear(
 ):
     """FP8 32x32/1x32 or W4A8 1x32 GEMM; inputs and weights stay native.
 
-    Weight scales remain compact. FP8 uses AITER's configured GEMM interface; W4A8
-    unpacks to BF16 for a plain one; both accumulate in FP32 before the
+    Weight scales remain compact. FP8 prefers AITER's configured GEMM interface
+    and falls back to local kernels on older AITER builds. W4A8 unpacks to
+    BF16 for a plain MFMA; both accumulate in FP32 before the
     requested output conversion. A8 QAT and native
     weight storage are retained without materializing a dequantized weight.
     """
@@ -164,9 +185,9 @@ def native_quant_linear(
         raise ValueError("split_k must be a positive integer")
     if weight_scale.shape != (-(-n // weight_group_rows), k // 32):
         raise ValueError("Weight scale shape does not match the declared source blocks")
-    if not fp4:
+    if not fp4 and _aiter_fp8_gemm is not None:
         batched = x.ndim > 2
-        output = gemm_a8w8_blockscale(
+        output = _aiter_fp8_gemm(
             x.view(m, k) if batched else x,
             weight,
             x_scale.view(m, k // 32) if batched else x_scale,
@@ -192,6 +213,19 @@ def native_quant_linear(
     ):
         raise ValueError(
             "GEMM operands must be contiguous on the same CUDA/ROCm device"
+        )
+    if not fp4:
+        from .blockscale_kernels.fp8 import gemm_fp8_local
+
+        return gemm_fp8_local(
+            x,
+            weight,
+            x_scale,
+            weight_scale,
+            dtype=dtype,
+            weight_group_rows=weight_group_rows,
+            split_k=split_k,
+            cu_num=_units(x.device.index),
         )
     output = torch.empty((*x.shape[:-1], n), device=x.device, dtype=dtype)
     if m == 0:
