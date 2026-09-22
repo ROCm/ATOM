@@ -795,9 +795,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         (see build_for_cudagraph_capture) and its tensors must never be
         reallocated afterwards -- hence one entry per batch, kept forever, and
         refreshed in place before each replay. The refresh is a GPU kernel with
-        no readback. None when the planner is off or the batch is out of range.
+        no readback. None when FlyDSL or the planner is off, or when the batch
+        is out of range.
         """
-        if not envs.ATOM_PA_FLYDSL_PLAN:
+        # The plan only feeds FlyDSL; building one with FlyDSL off is a
+        # refresh kernel per step that nothing reads.
+        if not (envs.ATOM_PA_FLYDSL and envs.ATOM_PA_FLYDSL_PLAN):
             return None
         # From base_attention, not duplicated: the op checks the same bound.
         from atom.model_ops.base_attention import _FLYDSL_PLAN_MAX_BATCH

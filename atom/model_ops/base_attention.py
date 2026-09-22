@@ -11,7 +11,7 @@ import triton.language as tl
 from torch import nn
 
 from atom.config import get_current_atom_config
-from atom.utils import mark_spliting_op
+from atom.utils import envs, mark_spliting_op
 from atom.utils.selector import Family, get_attn_backend
 
 from .attention_mla import MLAModules, _mla_output_width
@@ -305,12 +305,12 @@ def run_pa_decode_gluon(
 ):
     """Run the AITER paged-attention decode kernel.
 
-    FlyDSL (aiter PR #4332) where its domain covers the call, gluon otherwise.
-    The split is a capability check, not a switch: ``_flydsl_pa_decode_num_seqs``
-    mirrors the kernel's own validation so an unsupported shape falls back here
-    instead of raising from inside aiter.
+    gluon unless ``ATOM_PA_FLYDSL=1``, and then only where FlyDSL's domain
+    covers the call: ``_flydsl_pa_decode_num_seqs`` mirrors the kernel's own
+    validation so an unsupported shape falls back here instead of raising
+    inside aiter.
     """
-    flydsl_seqs = _flydsl_pa_decode_num_seqs(
+    flydsl_seqs = envs.ATOM_PA_FLYDSL and _flydsl_pa_decode_num_seqs(
         q=q,
         k_cache=k_cache,
         context_lens=context_lens,

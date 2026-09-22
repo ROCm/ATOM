@@ -387,6 +387,7 @@ class TestWorkPlanWiring:
         )
         builder._flydsl_kv_heads = 1
         builder._flydsl_plans = {}
+        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
 
         ctx = SimpleNamespace(shape=(8,), device=SimpleNamespace(index=0))
@@ -402,6 +403,7 @@ class TestWorkPlanWiring:
         )
         builder._flydsl_kv_heads = 1
         builder._flydsl_plans = {}
+        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", False)
         ctx = SimpleNamespace(shape=(8,), device=SimpleNamespace(index=0))
         assert builder.refresh_flydsl_plan(ctx) is None
@@ -421,6 +423,7 @@ class TestWorkPlanWiring:
         )
         builder._flydsl_kv_heads = 1
         builder._flydsl_plans = {}
+        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
         ctx = SimpleNamespace(
             shape=(_FLYDSL_PLAN_MAX_BATCH + 1,), device=SimpleNamespace(index=0)
@@ -506,6 +509,7 @@ class TestWorkPlanWiring:
         )
         builder._flydsl_kv_heads = 1
         builder._flydsl_plans = {}
+        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
 
         def ctx(n):
@@ -552,3 +556,108 @@ class TestWorkPlanWiring:
             aa.AiterAttentionMetadataBuilder.build_for_cudagraph_capture
         )
         assert "flydsl_work_plan" in src
+
+    def test_plan_is_built_for_the_row_count_the_op_derives(self):
+        """The row count the builder plans for must be the one the op passes.
+
+        The op derives ``num_seqs`` as ``q.shape[0] // max_seqlen_q`` -- that is
+        ``running_bs``, the batch rounded up to a cudagraph capture size -- and
+        aiter validates ``reduce_info.shape == (num_seqs, 2)``. A
+        ``scheduled_bs`` slice agrees only when the batch happens to land on a
+        ladder rung; at c20 (20 -> 32) it raises and kills the worker. This tree
+        shipped that slice once, and nothing else watches this seam: the shape
+        guard in the op downgrades a mismatch to the static path, so the defect
+        would come back as a silent slowdown instead of a crash.
+
+        AST rather than behaviour, because ``prepare_decode`` needs a model
+        runner to drive. It is exact about the one thing that went wrong -- the
+        expression handed to ``refresh_flydsl_plan`` -- and goes red on any
+        slice at the two target sites, or on a draft slice that stops naming
+        ``running_bs``.
+        """
+        import ast
+        import inspect
+
+        from atom.model_ops.attentions import aiter_attention as aa
+
+        tree = ast.parse(inspect.getsource(aa))
+        args = {}
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.FunctionDef):
+                continue
+            for node in ast.walk(fn):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "refresh_flydsl_plan"
+                ):
+                    args.setdefault(fn.name, []).append(node.args[0])
+
+        # Target passes: the whole buffer, which is already running_bs long
+        # with the padded tail zeroed. A zero-length row gets no work.
+        for name in ("prepare_decode", "build_for_cudagraph_capture"):
+            assert name in args, f"{name} no longer builds a plan"
+            for arg in args[name]:
+                assert isinstance(arg, ast.Attribute) and arg.attr == "context_lens", (
+                    f"{name} must hand refresh_flydsl_plan the whole "
+                    f"context_lens, got {ast.dump(arg)}"
+                )
+
+        # Draft pass: its own buffer, sliced to running_bs -- never scheduled_bs.
+        assert "prepare_mtp_decode" in args, "draft no longer refreshes the plan"
+        for arg in args["prepare_mtp_decode"]:
+            assert isinstance(arg, ast.Subscript), (
+                f"draft plan must be sliced to running_bs, got {ast.dump(arg)}"
+            )
+            upper = getattr(arg.slice, "upper", None)
+            assert isinstance(upper, ast.Name) and upper.id == "running_bs", (
+                f"draft plan must be sliced to running_bs, got {ast.dump(arg)}"
+            )
+
+    def test_gluon_is_the_default_and_the_env_short_circuits(self):
+        """The env is the first gate, and off is the default.
+
+        #4332 is unmerged and the kernel is not fully tested, so gluon ships and
+        FlyDSL is the opt-in. Two things regress independently: someone flips
+        the default, or someone drops the env from the dispatch -- which is how
+        this tree ran with FlyDSL as the only decode backend and no way back.
+
+        The second half is a source check: reaching the dispatch needs real
+        tensors on a GPU. It is exact about the one thing that matters, that the
+        env is consulted before the capability check and short-circuits it.
+        """
+        import inspect
+        import os
+
+        import atom.model_ops.base_attention as ba
+        from atom.utils import envs
+
+        os.environ.pop("ATOM_PA_FLYDSL", None)
+        assert envs.ATOM_PA_FLYDSL is False, "FlyDSL must be opt-in"
+
+        src = inspect.getsource(ba.run_pa_decode_gluon)
+        assert "envs.ATOM_PA_FLYDSL and _flydsl_pa_decode_num_seqs" in src, (
+            "the env gate is gone, or no longer short-circuits the capability check"
+        )
+
+    def test_planner_needs_flydsl(self, monkeypatch):
+        """With FlyDSL off the builder must not build a plan either.
+
+        The plan only feeds the FlyDSL kernel. Building one anyway is a refresh
+        kernel every step that nothing reads, and it would make the "flydsl work
+        plan" log line -- the evidence an A/B arm is checked with -- appear on a
+        run that is entirely gluon.
+        """
+        from atom.model_ops.attentions import aiter_attention as aa
+
+        builder = aa.AiterAttentionMetadataBuilder.__new__(
+            aa.AiterAttentionMetadataBuilder
+        )
+        builder._flydsl_kv_heads = 1
+        builder._flydsl_plans = {}
+        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", False)
+        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
+
+        ctx = SimpleNamespace(shape=(8,), device=SimpleNamespace(index=0))
+        assert builder.refresh_flydsl_plan(ctx) is None
+        assert not builder._flydsl_plans, "a plan was built with FlyDSL off"
