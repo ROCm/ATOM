@@ -15,6 +15,8 @@ import logging
 from typing import Any
 
 import torch
+import triton
+import triton.language as tl
 
 logger = logging.getLogger("atom")
 
@@ -165,29 +167,6 @@ def fp4_q_scale_shape(tokens: int, heads: int, head_dim: int) -> tuple:
     return (tokens, head_dim // _K_TILE, 4, _MFMA_M, -(-m_tiles // 4) * 4)
 
 
-def fp4_index_scale_rows(rows: torch.Tensor, block_size: int) -> torch.Tensor:
-    """Where logical block rows `rows` sit on the e8m0 plane's row axis.
-
-    `indexer_qk_rope_quant_and_cache` stores that axis as an `_MFMA_M`-wide
-    transpose of the packed plane's, which is flat. Everything else addresses
-    both planes by the same logical row, so any reader that moves the two
-    together has to bend exactly here or it mixes exponents across a block --
-    silently, since every index stays in bounds.
-
-    `block_size` is the caller's own page size, taken rather than assumed: the
-    lane count is a property of the plane the kernel wrote, and a caller paging
-    the cache differently would otherwise get a wrong mapping that is still
-    in-bounds. `fp4_index_block_shapes` is what holds the two equal.
-    """
-    if block_size != FP4_KV_BLOCK_SIZE:
-        raise ValueError(
-            f"the FP4 e8m0 row swizzle describes {FP4_KV_BLOCK_SIZE}-row blocks, "
-            f"got {block_size}"
-        )
-    lanes = FP4_KV_BLOCK_SIZE // _MFMA_M
-    return (rows % _MFMA_M) * lanes + rows // _MFMA_M
-
-
 def fp4_index_block_shapes(rows: int, head_dim: int) -> tuple[tuple, tuple]:
     """One block's packed-E2M1 and e8m0 shapes, for one indexer layer."""
     if rows != FP4_KV_BLOCK_SIZE:
@@ -262,3 +241,104 @@ def fp4_decode_schedule(
         next_n=next_n,
         cta_info_out=cta_info_out,
     )
+
+
+@triton.jit
+def _fp4_index_slots_kernel(
+    slots_ptr,  # None when HAS_SLOTS is False
+    page_ptr,
+    row_ptr,
+    scale_row_ptr,
+    n_slots: tl.int64,
+    BLOCK_SIZE: tl.constexpr,  # KV page size, 64 for the FP4 indexer
+    MFMA_M: tl.constexpr,  # e8m0 plane's transpose width
+    HAS_SLOTS: tl.constexpr,  # False: no pointer, the lane index is the slot
+    TILE: tl.constexpr,
+):
+    offs = (tl.program_id(0) * TILE + tl.arange(0, TILE)).to(tl.int64)
+    mask = offs < n_slots
+    if HAS_SLOTS:
+        slot = tl.load(slots_ptr + offs, mask=mask, other=0).to(tl.int64)
+    else:
+        # The staging half addresses [0, total_kv), where the slot IS its own
+        # index. Materialising that as a tensor only to read it back costs an
+        # arange launch, an allocation of 8 bytes per slot, and the traffic to
+        # write it and load it again -- all to learn what the lane already knows.
+        slot = offs
+
+    page = slot // BLOCK_SIZE
+    row = slot % BLOCK_SIZE
+    scale_row = (row % MFMA_M) * (BLOCK_SIZE // MFMA_M) + row // MFMA_M
+
+    tl.store(page_ptr + offs, page, mask=mask)
+    tl.store(row_ptr + offs, row, mask=mask)
+    tl.store(scale_row_ptr + offs, scale_row, mask=mask)
+
+
+def fp4_index_slots(
+    block_size: int,
+    slots: torch.Tensor | None = None,
+    total_kv: int | None = None,
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``(page, row, scale_row)`` for a slot list, in one launch.
+
+    Give it exactly one of ``slots``, the list itself as the DCP gather's read
+    half has it from the metadata, or ``total_kv``, the length of the contiguous
+    [0, n) its staging half writes. The second form needs no input tensor: the
+    kernel's own lane index is the slot, so an ``arange`` never has to be built,
+    written and read back to say so. Pass ``device`` with it.
+
+    ``scale_row`` is where logical block row ``row`` sits on the e8m0 plane's
+    row axis. `indexer_qk_rope_quant_and_cache` stores that axis as an
+    ``_MFMA_M``-wide transpose of the packed plane's, which is flat. Everything
+    else addresses both planes by the same logical row, so a reader moving the
+    two together has to bend exactly here or it mixes exponents across a block
+    -- silently, since every index stays in bounds. Deriving the row and its
+    swizzle in one launch is what makes that unreachable: the row comes from
+    ``slot % block_size`` two lines above its own use.
+
+    ``block_size`` is checked rather than assumed for the same reason. The lane
+    count is a property of the plane the store kernel wrote, so a caller paging
+    the cache differently would get a mapping that is wrong and still in bounds.
+    ``fp4_index_block_shapes`` is what holds the two equal.
+
+    Outputs are int64 because they are used directly as advanced indices, and a
+    narrower dtype would put a conversion launch back.
+    """
+    if (slots is None) == (total_kv is None):
+        raise ValueError("fp4_index_slots takes exactly one of `slots`, `total_kv`")
+    if block_size != FP4_KV_BLOCK_SIZE:
+        raise ValueError(
+            f"the FP4 e8m0 row swizzle describes {FP4_KV_BLOCK_SIZE}-row blocks, "
+            f"got {block_size}"
+        )
+
+    if slots is None:
+        n, dev, shape = int(total_kv), device, (int(total_kv),)
+        if dev is None:
+            raise ValueError("fp4_index_slots needs `device` with `total_kv`")
+    else:
+        slots = slots.contiguous()
+        n, dev, shape = slots.numel(), slots.device, slots.shape
+
+    if dev.type != "cuda":
+        raise RuntimeError("fp4_index_slots requires AMD GPU tensors.")
+
+    page = torch.empty(shape, dtype=torch.int64, device=dev)
+    row = torch.empty(shape, dtype=torch.int64, device=dev)
+    scale_row = torch.empty(shape, dtype=torch.int64, device=dev)
+    if n:
+        tile = 1024
+        _fp4_index_slots_kernel[(triton.cdiv(n, tile),)](
+            slots,
+            page,
+            row,
+            scale_row,
+            n,
+            BLOCK_SIZE=block_size,
+            MFMA_M=_MFMA_M,
+            HAS_SLOTS=slots is not None,
+            TILE=tile,
+        )
+    return page, row, scale_row

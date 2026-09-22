@@ -26,13 +26,24 @@ from atom.model_ops.sparse_indexer_fp4 import (
     assert_fp4_indexer_supported,
     fp4_decode_parallel_units,
     fp4_decode_schedule,
-    fp4_index_scale_rows,
     fp4_prefill_schedule,
     fp4_q_scale_shape,
     sparse_indexer_fp4_enabled,
 )
 
+
 # The DSA indexer geometry GLM-5.2 and DeepSeek-V3.2 share.
+def _expect_scale_row(rows, block):
+    """The e8m0 row swizzle, spelled out here rather than imported.
+
+    This is what the kernel's output is checked against, so it has to be
+    independent of it: a test that asks the implementation what to expect
+    passes just as happily when the implementation is wrong. fp4_index_slots
+    explains why the swizzle exists and what a wrong row costs.
+    """
+    return (rows % 16) * (block // 16) + rows // 16
+
+
 DSA = SimpleNamespace(index_topk=2048, index_n_heads=32, index_head_dim=128)
 
 HEADS, HEAD_DIM, _BLOCK = 32, 128, FP4_KV_BLOCK_SIZE
@@ -354,7 +365,7 @@ def _oracle(q_fp4, q_scale, kv_cache, kv_scale, table, ctx_len, weights, rows_of
     pos = (token % _BLOCK).expand(batch, ctx_len).unsqueeze(-1)
     group = torch.arange(4, device=kv_cache.device)
     packed = kv_cache[phys, 0, group, pos].reshape(batch, ctx_len, HEAD_DIM // 2)
-    keys = _dequant(packed, kv_scale[phys, 0, group, fp4_index_scale_rows(pos, _BLOCK)])
+    keys = _dequant(packed, kv_scale[phys, 0, group, _expect_scale_row(pos, _BLOCK)])
     # `[T, k_tiles, 4, 16, qs_pad]` -> the dense `[T, H, D // 32]` a reader sees.
     dense = (
         q_scale[..., : HEADS // 16]
@@ -491,7 +502,9 @@ def test_dcp_decode_scores_each_query_token_over_its_own_local_window(on_gfx950)
     _assert_agrees(logits, want, local_ctx, topk=512)
 
 
-def test_dcp_prefill_staging_keeps_every_key_with_its_own_exponent(monkeypatch):
+def test_dcp_prefill_staging_keeps_every_key_with_its_own_exponent(
+    on_gfx950, monkeypatch
+):
     """Staging moves two planes whose row axes disagree -- the packed one flat,
     the e8m0 one transposed -- so it cannot address them with a single index.
 
@@ -500,6 +513,10 @@ def test_dcp_prefill_staging_keeps_every_key_with_its_own_exponent(monkeypatch):
     inside a block because `k_norm` precedes the quantizer, which is why an
     end-to-end accuracy run can pass with this broken; the random planes here
     remove that cover.
+
+    On a chip rather than on CPU tensors: `fp4_index_slots` is a Triton kernel
+    and refuses host pointers, as every other kernel in `model_ops` does. The
+    planes are tiny, so this costs a GPU rather than any real time.
     """
     dsv2 = _import_or_skip("atom.models.deepseek_v2")
 
@@ -507,14 +524,14 @@ def test_dcp_prefill_staging_keeps_every_key_with_its_own_exponent(monkeypatch):
     block, world, src_pages = _BLOCK, 2, 4
     local = 64
     total_kv = world * local
-    shape = {"dtype": torch.uint8, "device": "cpu"}
+    shape = {"dtype": torch.uint8, "device": "cuda"}
     data_src = torch.randint(0, 256, (src_pages, 1, 4, block, 16), **shape)
     scale_src = torch.randint(0, 256, (src_pages, 1, 4, block), **shape)
 
     # This rank's slots, spread over pages and rows so no source row equals the
     # destination row it lands on; the gather then reorders them again.
-    slots = torch.randperm(src_pages * block)[:local].to(torch.int32)
-    gather_index = torch.randperm(total_kv).to(torch.int32)
+    slots = torch.randperm(src_pages * block, device="cuda")[:local].to(torch.int32)
+    gather_index = torch.randperm(total_kv, device="cuda").to(torch.int32)
     monkeypatch.setattr(
         dsv2,
         "get_dcp_group",
@@ -535,9 +552,9 @@ def test_dcp_prefill_staging_keeps_every_key_with_its_own_exponent(monkeypatch):
     )
 
     src = slots[gather_index.long() % local].long()
-    got_rows = torch.arange(total_kv)
-    q_dst = fp4_index_scale_rows(got_rows % block, block)
-    q_src = fp4_index_scale_rows(src % block, block)
+    got_rows = torch.arange(total_kv, device="cuda")
+    q_dst = _expect_scale_row(got_rows % block, block)
+    q_src = _expect_scale_row(src % block, block)
     assert torch.equal(
         staged[got_rows // block, 0, :, got_rows % block, :],
         data_src[src // block, 0, :, src % block, :],
