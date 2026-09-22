@@ -441,8 +441,14 @@ jobs:
           fi
           echo "Model path: ${MODEL_PATH}"
 
+          # pipefail inside the exec: without it the pipeline's status is
+          # grep's, and an inference that prints its prompts and completions
+          # and then dies (a crash in the final statistics or cleanup) would
+          # still read as success, skip the hub probe below and pass the
+          # nightly on a failed image.
           if ! docker exec "${CI_CONTAINER}" bash -c \
-            "rm -f ~/.cache/huggingface/token ~/.cache/huggingface/stored_tokens 2>/dev/null; \
+            "set -o pipefail; \
+             rm -f ~/.cache/huggingface/token ~/.cache/huggingface/stored_tokens 2>/dev/null; \
              python3 -m atom.examples.simple_inference \
                --model '${MODEL_PATH}' \
                --temperature 0 | grep -E '^Prompt: |^Completion:'" > atom_release_output.txt; then

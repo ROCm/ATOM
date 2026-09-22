@@ -243,8 +243,21 @@ except Exception as exc:
         file=sys.stderr,
     )
     status = getattr(getattr(exc, "response", None), "status_code", None)
-    permanent = (GatedRepoError, RepositoryNotFoundError, RevisionNotFoundError)
-    sys.exit(2 if isinstance(exc, permanent) or status in (401, 403, 404) else 1)
+    refusal = (GatedRepoError, RepositoryNotFoundError, RevisionNotFoundError)
+    if isinstance(exc, refusal) or status in (401, 403, 404):
+        sys.exit(2)  # a refusal: every attempt reaches the same answer
+    transport = (ConnectionError, TimeoutError)
+    try:
+        import httpx
+
+        transport = (httpx.TransportError,) + transport
+    except ImportError:
+        pass
+    if isinstance(exc, transport) or (
+        status is not None and (status in (408, 429) or status >= 500)
+    ):
+        sys.exit(3)  # the wire or the server blinked; another attempt can land
+    sys.exit(1)  # local and permanent: broken image, unwritable staging, full disk
 PY
   ) &
   DOWNLOAD_PID="$!"
@@ -253,8 +266,12 @@ PY
   return "${status}"
 }
 
-# 2 is a refusal every attempt reaches identically; 124 is a timeout that
-# already spent its whole budget. Everything else is transport.
+# 3 is transport: the wire or the server blinked, and another attempt can
+# land. Everything else is not retryable -- 2 is a refusal every attempt
+# reaches identically, 124 is a timeout that already spent its whole budget,
+# and 1 is local and permanent (a broken image, an unwritable staging
+# directory, a full filesystem): repeating those spends three attempts and
+# their sleeps on a diagnosis that cannot change.
 download_with_retries() {
   local attempt status delay
 
@@ -266,7 +283,7 @@ download_with_retries() {
       return 0
     fi
 
-    if [ "${status}" -eq 2 ] || [ "${status}" -eq 124 ]; then
+    if [ "${status}" -ne 3 ]; then
       log "Download failed with status ${status}; not retryable."
       return "${status}"
     fi
