@@ -40,6 +40,8 @@ if is_sglang():
     from atom.models.eagle3_llama import Eagle3LlamaModel
     from atom.models.kimi_k3 import KimiK3ForCausalLM
     from atom.models.kimi_k25 import KimiK25ForCausalLM
+    from atom.models.mimo_v2 import MiMoV2ForCausalLM
+    from atom.models.mimo_v2_mtp import MiMoV2MTP
     from atom.models.qwen3_5 import (
         Qwen3_5ForCausalLM,
         Qwen3_5MoeForCausalLM,
@@ -50,6 +52,7 @@ if is_sglang():
     _ATOM_SUPPORTED_MODELS.update(
         {
             "DeepseekV4ForCausalLM": DeepseekV4ForCausalLM,
+            "MiMoV2ForCausalLM": MiMoV2ForCausalLM,
             "Qwen3NextForCausalLM": Qwen3NextForCausalLM,
             "Qwen3_5ForCausalLM": Qwen3_5ForCausalLM,
             "Qwen3_5MoeForCausalLM": Qwen3_5MoeForCausalLM,
@@ -69,6 +72,7 @@ if is_sglang():
     )
     _ATOM_SUPPORTED_DRAFT_MODELS = {
         "LlamaForCausalLMEagle3": Eagle3LlamaModel,
+        "MiMoV2MTP": MiMoV2MTP,
     }
     _ATOM_SUPPORTED_MODELS.update(_ATOM_SUPPORTED_DRAFT_MODELS)
 

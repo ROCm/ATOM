@@ -115,6 +115,7 @@ def load_model_in_plugin_mode(
     spec_decode: bool = False,
     hf_config_override: AutoConfig | None = None,
     model_name_or_path_override: str | None = None,
+    weights_iterator_override=None,
 ) -> set[str]:
 
     # during loading model, the outplace operation may consume more
@@ -161,6 +162,7 @@ def load_model_in_plugin_mode(
         is_plugin_mode=True,
         weights_mapper=weights_mapper,
         load_fused_expert_weights_fn=load_fused_expert_weights_fn,
+        weights_iterator_override=weights_iterator_override,
     )
     _empty_cache()
     return loaded_weights_record
@@ -276,6 +278,7 @@ def load_model(
     is_plugin_mode: bool = False,
     weights_mapper: WeightsMapper | None = None,
     load_fused_expert_weights_fn=None,
+    weights_iterator_override=None,
 ):
     """Load a checkpoint into `model` and run post-load weight processing.
 
@@ -339,8 +342,12 @@ def load_model(
         default_weight_loader=default_weight_loader,
         fuse_shared_expert=_fuse_shared_expert,
         is_rank0=_is_rank0,
-        weights_iterator=safetensors_weights_iterator,
+        weights_iterator=weights_iterator_override or safetensors_weights_iterator,
         online_quant_streamer=online_quant_streamer,
+        # SGLang's MiMo iterator can read shards substantially faster than
+        # ATOM stages them to the device. Bound that plugin-only pipeline while
+        # preserving the mainline loader behavior for every existing caller.
+        limit_pending_futures=weights_iterator_override is not None,
     )
 
     # Dummy modes other than "empty" fill the skipped-load params with finite

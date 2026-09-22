@@ -127,7 +127,10 @@ class MiMoV2MTPPredictorLayer(nn.Module):
 
         self.mtp_block = MiMoV2MTPLayer(
             atom_config=atom_config,
-            layer_num=layer_idx,
+            # SGLang gives the standalone draft a one-layer KV pool indexed at
+            # zero, while checkpoint/module names keep the logical target
+            # offset (70+). Keep those two namespaces separate.
+            layer_num=getattr(atom_config, "sglang_mtp_attention_layer_num", layer_idx),
             prefix=f"{prefix}.mtp_block",
         )
 

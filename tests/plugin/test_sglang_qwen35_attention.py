@@ -500,6 +500,8 @@ def test_qwen35_decode_padding_rows_do_not_write_kv(monkeypatch):
 
 def test_decode_graph_replay_clears_padding_kv_lens(monkeypatch):
     backend = ATOMAttnBackendForSgl.__new__(ATOMAttnBackendForSgl)
+    backend._is_mimo_v2_family = False
+    backend._is_mimo_mtp = False
 
     def replay_metadata(*_args):
         backend.forward_metadata = SimpleNamespace(
