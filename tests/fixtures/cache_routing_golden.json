@@ -1,0 +1,256 @@
+{
+  "hashes": [
+    {
+      "namespace": "0101010101010101010101010101010101010101010101010101010101010101",
+      "block_size": 1,
+      "tokens": [
+        0,
+        1,
+        4294967295
+      ],
+      "keys": [
+        "057169add3de54d37bd4392ac22aba2954fd8724ec991fed96e27db6a40d5397",
+        "c54ea6ccff75a5f440295ceefc8f0898d12b24f6154637d333b571dbc4727b37",
+        "b9a869ab34c49293b71a0c252c665d822164a944310935adb1d3aa36a6e001ab"
+      ]
+    },
+    {
+      "namespace": "0101010101010101010101010101010101010101010101010101010101010101",
+      "block_size": 16,
+      "tokens": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        62,
+        63,
+        64
+      ],
+      "keys": [
+        "3926b99c5f0fcb1059db1994838c7e24419e275c062d2b4543f3b64c9e9a417c",
+        "95f22351d04b27283cd5e68b3a5ac055376d0a1cfd78cf17f25f7dbb603f3626",
+        "b498de3b523be9d26d99d06300fbfd2cae31550d3916066f24fcb8bb068b2d3d",
+        "cf130bbe9319f01f771cd83eeb550192458032d82a36f761df429df03b3a42c3"
+      ]
+    },
+    {
+      "namespace": "0101010101010101010101010101010101010101010101010101010101010101",
+      "block_size": 4,
+      "tokens": [
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7
+      ],
+      "keys": [
+        "339d552562f0d8bc275c8b8f3c4302b11e068451ea0b350fd60a3f4d8afa5e2e",
+        "3a9ba456284d5fced919c0b96ddc93a05ad0d9c0c76953fbe7957c1999c30afb",
+        "a290897f7e3619cb8471b5108794042eceb85e5355fa75f8ea0c82e899513536",
+        "64840b48045626f77361e219cd18158f28885cde37f7a8390b8f1bc1de06ab88",
+        "5c879143e2f7accc73fe0a8a9961cd9a2f2d6186fd52c8d3e7c53542f6d3bc47"
+      ]
+    }
+  ],
+  "plans": [
+    {
+      "prompt_tokens": 16384,
+      "hbm_prefix": 0,
+      "cpu_prefix": 16384,
+      "chunk": 256,
+      "min_load": 0,
+      "plan": {
+        "kind": "cpu",
+        "precompute_start": 0,
+        "precompute_end": 0,
+        "load_start": 0,
+        "transfer_end": 16128,
+        "reuse_end": 16128,
+        "eligible": true,
+        "reject_reason": "",
+        "planner_version": "page-reuse-v1"
+      }
+    },
+    {
+      "prompt_tokens": 16384,
+      "hbm_prefix": 4112,
+      "cpu_prefix": 16384,
+      "chunk": 256,
+      "min_load": 8192,
+      "plan": {
+        "kind": "precompute_cpu",
+        "precompute_start": 4112,
+        "precompute_end": 4352,
+        "load_start": 4352,
+        "transfer_end": 16128,
+        "reuse_end": 16128,
+        "eligible": true,
+        "reject_reason": "",
+        "planner_version": "page-reuse-v1"
+      }
+    },
+    {
+      "prompt_tokens": 16384,
+      "hbm_prefix": 8192,
+      "cpu_prefix": 8448,
+      "chunk": 256,
+      "min_load": 8192,
+      "plan": {
+        "kind": "hbm",
+        "precompute_start": 8192,
+        "precompute_end": 8192,
+        "load_start": 8192,
+        "transfer_end": 8192,
+        "reuse_end": 8192,
+        "eligible": false,
+        "reject_reason": "too_small",
+        "planner_version": "page-reuse-v1"
+      }
+    },
+    {
+      "prompt_tokens": 256,
+      "hbm_prefix": 0,
+      "cpu_prefix": 256,
+      "chunk": 256,
+      "min_load": 0,
+      "plan": {
+        "kind": "hbm",
+        "precompute_start": 0,
+        "precompute_end": 0,
+        "load_start": 0,
+        "transfer_end": 0,
+        "reuse_end": 0,
+        "eligible": false,
+        "reject_reason": "no_loadable_suffix",
+        "planner_version": "page-reuse-v1"
+      }
+    },
+    {
+      "prompt_tokens": 257,
+      "hbm_prefix": 0,
+      "cpu_prefix": 256,
+      "chunk": 256,
+      "min_load": 0,
+      "plan": {
+        "kind": "cpu",
+        "precompute_start": 0,
+        "precompute_end": 0,
+        "load_start": 0,
+        "transfer_end": 256,
+        "reuse_end": 256,
+        "eligible": true,
+        "reject_reason": "",
+        "planner_version": "page-reuse-v1"
+      }
+    },
+    {
+      "prompt_tokens": 0,
+      "hbm_prefix": 0,
+      "cpu_prefix": 0,
+      "chunk": 256,
+      "min_load": 0,
+      "plan": {
+        "kind": "hbm",
+        "precompute_start": 0,
+        "precompute_end": 0,
+        "load_start": 0,
+        "transfer_end": 0,
+        "reuse_end": 0,
+        "eligible": false,
+        "reject_reason": "no_loadable_suffix",
+        "planner_version": "page-reuse-v1"
+      }
+    },
+    {
+      "prompt_tokens": 16384,
+      "hbm_prefix": 4096,
+      "cpu_prefix": 0,
+      "chunk": 256,
+      "min_load": 0,
+      "plan": {
+        "kind": "hbm",
+        "precompute_start": 4096,
+        "precompute_end": 4096,
+        "load_start": 4096,
+        "transfer_end": 4096,
+        "reuse_end": 4096,
+        "eligible": false,
+        "reject_reason": "no_loadable_suffix",
+        "planner_version": "page-reuse-v1"
+      }
+    }
+  ]
+}

@@ -101,6 +101,17 @@ class PPEngineCoreProc(EngineCore):
             self.scheduler.shutdown_kv_events()
 
     def _pp_head_step(self):
+        try:
+            return PPEngineCoreProc._pp_head_step_inner(self)
+        finally:
+            # PP bypasses EngineCore's ordinary step wrapper. Publish only
+            # after stage-quorum postprocess has committed reusable prefixes.
+            try:
+                self.scheduler.publish_kv_events()
+            except Exception:
+                logger.exception("KV event publish in PP head step failed")
+
+    def _pp_head_step_inner(self):
         launched = 0
         while len(self._in_flight) < self.pp_size:
             result = self.scheduler.schedule()

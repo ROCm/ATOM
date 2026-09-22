@@ -1211,3 +1211,23 @@ class TestReplayEndpointWiring:
             assert pub.stats["sent"] == 0
         finally:
             pub.shutdown()
+
+
+def test_received_dcp_prefix_publishes_local_gpu_facts(seq_factory, monkeypatch):
+    bm = _dcp_bm_with_events(monkeypatch)
+    seq = seq_factory(list(range(20)))
+    bm.allocate(seq)
+    assert bm.take_events() == []
+    assert bm.register_received_prefix(seq) == 2
+    events = bm.take_events()
+    assert len(events) == 2
+    assert all(
+        isinstance(event, BlockStored) and event.medium == MEDIUM_GPU
+        for event in events
+    )
+    assert [event.token_offset for event in events] == [0, 8]
+    assert all(event.block_size == 8 for event in events)
+    assert events[0].parent_block_hash is None
+    assert events[1].parent_block_hash == events[0].block_hashes[-1]
+    bm.register_received_prefix(seq)
+    assert bm.take_events() == []  # Existing canonical objects are not new replicas.

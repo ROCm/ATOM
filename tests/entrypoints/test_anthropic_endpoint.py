@@ -950,25 +950,25 @@ class TestAnEffortIsNotAnOptIn:
         assert resolve_thinking(req)[0] is expected
 
     def test_the_toggle_is_written_only_when_stated(self):
-        """Read off the syntax tree, not grepped: the guard has to be on the
-        resolved value, not on the toggle merely existing."""
-        tree = ast.parse(pathlib.Path(api_server.__file__).read_text())
-        writes = [
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.Subscript)
-            and isinstance(n.ctx, ast.Store)
-            and getattr(n.value, "id", None) == "merged_kwargs"
-            and isinstance(n.slice, ast.Name)
-        ]
-        assert writes, "no name-keyed write to merged_kwargs; matcher is stale"
-        guarded = [
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.If)
-            and "_th_enabled is not None" in ast.unparse(n.test)
-        ]
-        assert guarded, "the toggle is written without asking whether it was stated"
+        """Shared render/inference preparation preserves an operator's default."""
+        from atom.entrypoints.openai.protocol import ChatCompletionRequest
+        from atom.entrypoints.openai.render import prepare_chat_fields
+
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "Hi"}],
+            reasoning_effort="high",
+        )
+        defaults = {"enable_thinking": False}
+        toggle = ("enable_thinking", False, True)
+        _, kwargs = prepare_chat_fields(request, defaults, toggle)
+        assert kwargs["enable_thinking"] is False
+        request.thinking = {"type": "enabled"}
+        _, kwargs = prepare_chat_fields(request, defaults, toggle)
+        assert kwargs["enable_thinking"] is True
+        request.thinking = {"type": "disabled"}
+        _, kwargs = prepare_chat_fields(request, defaults, toggle)
+        assert kwargs["enable_thinking"] is False
 
 
 class TestTheEndpointAsksForTheOrder:

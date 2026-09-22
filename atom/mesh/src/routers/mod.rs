@@ -59,6 +59,14 @@ pub trait RouterTrait: Send + Sync + Debug {
         (StatusCode::NOT_IMPLEMENTED, "Server info not implemented").into_response()
     }
 
+    async fn render_tokens(&self, _chat: bool, _body: &serde_json::Value) -> Response {
+        (StatusCode::NOT_IMPLEMENTED, "Exact render not available").into_response()
+    }
+
+    async fn cache_control(&self, _req: Request<Body>) -> Response {
+        (StatusCode::NOT_IMPLEMENTED, "Cache catalog not available").into_response()
+    }
+
     /// Get available models
     async fn get_models(&self, _req: Request<Body>) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Get models not implemented").into_response()

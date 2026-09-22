@@ -416,3 +416,32 @@ def test_execution_topology_accepts_arbitrary_hosts_and_rejects_missing_rank():
     cfg.kv_transfer_config["routing_topology"]["ranks"].pop()
     with pytest.raises(ValueError, match="every PP x TP"):
         execution_topology(cfg)
+
+
+def test_routing_revision_isolates_native_keys_and_execution_isolates_ipc(monkeypatch):
+    import json
+
+    manifest = {
+        "model_revision": "weights-a",
+        "tokenizer_revision": "tok-a",
+        "template_revision": "template-a",
+        "kv_semantics": "fp8-v1",
+        "adapter_revision": None,
+        "cache_salt": None,
+        "multimodal_identity": None,
+    }
+    routing = {
+        "execution_id": "p1",
+        "catalog_url": "http://127.0.0.1:18610",
+        "namespace_manifest": manifest,
+    }
+    monkeypatch.setenv("ATOM_CACHE_ROUTING_CONFIG", json.dumps(routing))
+    first = offcfg.build_page_namespace(_config(), _lmcache_config(), 4)
+    first_ipc = offcfg.lmcache_engine_id(_config())
+    routing["execution_id"] = "p2"
+    monkeypatch.setenv("ATOM_CACHE_ROUTING_CONFIG", json.dumps(routing))
+    assert offcfg.lmcache_engine_id(_config()) != first_ipc
+    assert offcfg.build_page_namespace(_config(), _lmcache_config(), 4) == first
+    manifest["model_revision"] = "weights-b"
+    monkeypatch.setenv("ATOM_CACHE_ROUTING_CONFIG", json.dumps(routing))
+    assert offcfg.build_page_namespace(_config(), _lmcache_config(), 4) != first

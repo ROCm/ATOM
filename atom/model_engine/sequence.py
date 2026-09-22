@@ -288,6 +288,8 @@ class Sequence:
         # move together through admission and load. Grouped so a joint reset
         # cannot forget a field; see `OffloadJointRecord`.
         self.offload_joint = OffloadJointRecord()
+        self.routing_dispatch_id = sampling_params.routing_dispatch_id
+        self.cache_load_policy = sampling_params.cache_load_policy
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p

@@ -20,7 +20,6 @@ from typing import Any
 from atom import SamplingParams
 from atom.entrypoints.openai.api_server import _build_sampling_params, _coerce_n
 from atom.entrypoints.openai.chat_encoders import (
-    apply_chat_template,
     chat_template_source,
     load_custom_message_encoder,
     render_probe_prompt,
@@ -1159,6 +1158,31 @@ class CompletionStreamState:
 
 
 class AtomStandaloneService:
+    def cache_control(self, request: dict) -> dict:
+        from atom.cache_routing.server import read_catalog
+
+        return read_catalog(request["path"])
+
+    def render_completions(self, request: dict) -> list[dict]:
+        self._validate_model_name(request.get("model"))
+        return [
+            {"token_ids": self.tokenizer.encode(prompt)}
+            for prompt in self._get_completion_prompts(request)
+        ]
+
+    def render_chat_completions(self, request: dict) -> dict:
+        from atom.entrypoints.openai.render import prepare_text_chat
+
+        self._validate_model_name(request.get("model"))
+        prompt, _ = prepare_text_chat(
+            request,
+            self.tokenizer,
+            self.custom_message_encoder,
+            self.default_chat_template_kwargs,
+            self.reasoning_toggle,
+        )
+        return {"token_ids": self.tokenizer.encode(prompt)}
+
     def server_info(self, _request=None) -> dict[str, Any]:
         """Expose the shared engine discovery contract to the Rust frontend."""
         from atom.kv_transfer.topology import server_info
@@ -1250,19 +1274,14 @@ class AtomStandaloneService:
                     "Streaming chat completions are not implemented for ATOM standalone yet"
                 )
 
-            template_kwargs = dict(self.default_chat_template_kwargs)
-            if request_data.get("chat_template_kwargs"):
-                template_kwargs.update(request_data["chat_template_kwargs"])
+            from atom.entrypoints.openai.render import prepare_text_chat
 
-            prompt = apply_chat_template(
+            prompt, template_kwargs = prepare_text_chat(
+                request_data,
                 self.tokenizer,
                 self.custom_message_encoder,
-                [
-                    self._chat_message_to_template_dict(msg)
-                    for msg in self._get_chat_messages(request_data)
-                ],
-                tools=request_data.get("tools"),
-                **template_kwargs,
+                self.default_chat_template_kwargs,
+                self.reasoning_toggle,
             )
 
             effective_n = _coerce_n(
@@ -1467,19 +1486,14 @@ class AtomStandaloneService:
             request_data = self._normalize_chat_request(request_data)
             self._validate_model_name(request_data.get("model"))
 
-            template_kwargs = dict(self.default_chat_template_kwargs)
-            if request_data.get("chat_template_kwargs"):
-                template_kwargs.update(request_data["chat_template_kwargs"])
+            from atom.entrypoints.openai.render import prepare_text_chat
 
-            prompt = apply_chat_template(
+            prompt, template_kwargs = prepare_text_chat(
+                request_data,
                 self.tokenizer,
                 self.custom_message_encoder,
-                [
-                    self._chat_message_to_template_dict(msg)
-                    for msg in self._get_chat_messages(request_data)
-                ],
-                tools=request_data.get("tools"),
-                **template_kwargs,
+                self.default_chat_template_kwargs,
+                self.reasoning_toggle,
             )
 
             effective_n = _coerce_n(
@@ -1689,6 +1703,7 @@ class AtomStandaloneService:
             top_k=self._request_field(request, "top_k", DEFAULT_TOP_K),
             top_p=self._request_field(request, "top_p", DEFAULT_TOP_P),
             n=effective_n,
+            routing_hints=self._request_field(request, "routing_hints"),
         )
 
     @staticmethod

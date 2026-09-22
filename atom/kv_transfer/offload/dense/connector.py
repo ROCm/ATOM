@@ -91,6 +91,9 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         self._early_release = bool(self._supports_early_block_release)
 
     def close(self) -> None:
+        reporter = getattr(self, "_cpu_reporter", None)
+        if reporter is not None:
+            reporter.close()
         super().close()
         gpu_connector = getattr(getattr(self, "_engine", None), "gpu_connector", None)
         close = getattr(gpu_connector, "close", None)
@@ -136,6 +139,34 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             rank=rank,
         )
         self.chunk_size = int(cfg.chunk_size)
+        from atom.cache_routing.config import CacheRoutingConfig
+        from atom.cache_routing.native import NativeCPUReporter
+
+        routing_config = CacheRoutingConfig.from_env()
+        # Keep backend integration here: the reporter consumes only callbacks
+        # and codec geometry, with no LMCache types or patched residency APIs.
+        self._cpu_reporter = None
+        if routing_config is not None:
+            cpu_backend = self._engine.storage_manager.storage_backends.get(
+                "LocalCPUBackend"
+            )
+            get_cpu_keys = getattr(cpu_backend, "get_keys", None)
+            if callable(get_cpu_keys):
+                self._cpu_reporter = NativeCPUReporter(
+                    routing_config,
+                    rank=rank,
+                    layout_id=meta.model_name,
+                    chunk_size=self.chunk_size,
+                    chunk_size_bytes=(self.chunk_size // self.virtual_block_size)
+                    * self._codec.bytes_per_block,
+                    get_keys=get_cpu_keys,
+                    process_tokens=self._engine.token_database.process_tokens,
+                    piece_manifest=self._codec.layout_manifest(),
+                )
+            else:
+                logger.warning(
+                    "CPU catalog disabled: backend has no public get_keys API"
+                )
 
         # ZMQ lookup server so the scheduler process can query our hit counts.
         try:
@@ -331,6 +362,9 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         mask = torch.ones(len(toks), dtype=torch.bool)
         mask[:skip] = False
 
+        reporter = getattr(self, "_cpu_reporter", None)
+        if reporter is not None:
+            reporter.bind(toks)
         tok_tensor = tokens_to_tensor(toks)
         t_store0 = time.perf_counter()
         self._reset_gpu_connector_transfer_stats()

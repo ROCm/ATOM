@@ -698,6 +698,10 @@ class Scheduler:
                 endpoint="",
             )
 
+        from atom.cache_routing.runtime import start_catalog
+
+        self.cache_catalog_server = start_catalog(config)
+
         # Cross-DP prefill alignment. Set by DPEngineCoreProc after
         # dp_group is available. See `prefill_delayer.py` for rationale.
         from atom.model_engine.prefill_delayer import PrefillDelayer
@@ -893,11 +897,17 @@ class Scheduler:
         disabled (NullEventPublisher swallows the publish call)."""
         events = self.block_manager.take_events()
         if events:
+            catalog_server = getattr(self, "cache_catalog_server", None)
+            if catalog_server is not None:
+                catalog_server.catalog.hbm_events(events)
             self.kv_event_publisher.publish(events)
 
     def shutdown_kv_events(self) -> None:
         """Tear down the publisher background thread and ZMQ socket. Called
         by EngineCore on engine shutdown."""
+        catalog_server = getattr(self, "cache_catalog_server", None)
+        if catalog_server is not None:
+            catalog_server.close()
         try:
             self.kv_event_publisher.shutdown()
         except Exception:
@@ -917,15 +927,25 @@ class Scheduler:
             and not self.deferred_free_blocks
         )
 
+    def _record_cache_dispatch(self, seq: Sequence) -> None:
+        server = getattr(self, "cache_catalog_server", None)
+        dispatch = getattr(seq, "routing_dispatch_id", None)
+        if server is not None and isinstance(dispatch, str) and len(dispatch) <= 128:
+            with server.catalog.lock:
+                server.catalog.accepted_dispatches.append(dispatch)
+
     def add(self, seq: Sequence):
         self.metrics.enqueue(seq)
         self._warn_if_unschedulable(seq)
+        self._record_cache_dispatch(seq)
         self.waiting.append(seq)
 
     def extend(self, seqs: list[Sequence]):
         for seq in seqs:
             self.metrics.enqueue(seq)
             self._warn_if_unschedulable(seq)
+        for seq in seqs:
+            self._record_cache_dispatch(seq)
         self.waiting.extend(seqs)
 
     def _deferred_sequence(self, req_id) -> Sequence | None:
@@ -2122,8 +2142,7 @@ class Scheduler:
                     end_token=loaded,
                 )
                 logger.info(
-                    "[OFFLOAD-PROMOTE] seq=%s loaded_range=%d:%d "
-                    "gpu_indexed_tokens=%d",
+                    "[OFFLOAD-PROMOTE] seq=%s loaded_range=%d:%d gpu_indexed_tokens=%d",
                     seq.id,
                     load_start,
                     loaded,
@@ -2331,10 +2350,9 @@ class Scheduler:
     def _assert_positive_prefill_chunk(
         chunk: int, num_new_tokens: int, budget_remaining: int
     ) -> None:
-        assert chunk > 0, (
-            f"chunk must be positive: {chunk=}, "
-            f"{num_new_tokens=}, {budget_remaining=}"
-        )
+        assert (
+            chunk > 0
+        ), f"chunk must be positive: {chunk=}, {num_new_tokens=}, {budget_remaining=}"
 
     def _record_cache_reuse(self, seq: Sequence) -> None:
         """Account local prefix reuse at prefill or first PD decode admission."""

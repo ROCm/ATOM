@@ -468,3 +468,104 @@ def test_page_major_page_and_full_slot_round_trip_through_local_disk_backend(
         )
     finally:
         LMCacheEngineBuilder.destroy(instance_id)
+
+
+def test_native_cpu_catalog_follows_readable_gpu_round_trip():
+    """Real GPU copies, native keys and CPU evictions reach the HTTP catalog."""
+    from atom.cache_routing.catalog import CacheCatalog
+    from atom.cache_routing.config import CacheRoutingConfig
+    from atom.cache_routing.native import NativeCPUReporter
+    from atom.cache_routing.server import CatalogServer
+
+    num_blocks, block_size, chunk_size = 4, 4, 8
+    tokens = list(range(num_blocks * block_size))
+    caches = _make_aiter_kv_caches(num_blocks=num_blocks, block_size=block_size)
+    expected = _clone_segments(caches)
+    codec = DenseKVByteCodec(caches, num_blocks=num_blocks)
+    gpu = BlockGPUConnector(codec, block_size=block_size, chunk_size=chunk_size)
+    engine_id = f"atom-cpu-catalog-{uuid.uuid4().hex}"
+    cfg = LMCacheEngineConfig.from_defaults(
+        chunk_size=chunk_size,
+        local_cpu=True,
+        max_local_cpu_size=0.01,
+        store_location="LocalCPUBackend",
+        retrieve_locations=["LocalCPUBackend"],
+        use_gds=False,
+    )
+    base = LMCacheMetadata(
+        model_name="atom-cpu-catalog",
+        world_size=1,
+        local_world_size=1,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=torch.uint8,
+        kv_shape=(2, 2, chunk_size, 2, 16),
+        chunk_size=chunk_size,
+        engine_id=engine_id,
+    )
+    metadata = ATOMRawBytesLMCacheMetadata(
+        base, atom_block_size=block_size, bytes_per_block=codec.bytes_per_block
+    )
+    engine = LMCacheEngineBuilder.get_or_create(
+        engine_id,
+        cfg,
+        metadata,
+        gpu,
+        lambda tensor, source: None,
+        lambda obj, source: obj,
+    )
+    routing = CacheRoutingConfig(
+        "gpu-test", "http://127.0.0.1:0", "01" * 32, canonical_block_size=2
+    )
+    catalog = CacheCatalog(routing, "gpu-layout", block_size, 1)
+    server = CatalogServer(catalog)
+    reporter = None
+    try:
+        engine.fmt = MemoryFormat.KV_2LTD
+        engine.post_init()
+        backend = engine.storage_manager.storage_backends["LocalCPUBackend"]
+        routing = SimpleNamespace(**vars(routing))
+        routing.catalog_url = f"http://127.0.0.1:{server.server.server_port}"
+        reporter = NativeCPUReporter(
+            routing,
+            rank=metadata.worker_id,
+            layout_id=metadata.model_name,
+            chunk_size=chunk_size,
+            chunk_size_bytes=(chunk_size // block_size) * codec.bytes_per_block,
+            get_keys=backend.get_keys,
+            process_tokens=engine.token_database.process_tokens,
+            piece_manifest=codec.layout_manifest(),
+        )
+        reporter.bind(tokens)
+        assert catalog.snapshot()["entries"] == ()
+        _synchronize_producer_stream()
+        engine.store(tokens, block_ids=list(range(num_blocks)))
+        deadline = time.monotonic() + 5
+        while len(catalog.entries) != 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(catalog.entries) == 2
+        assert all(
+            entry["size_bytes"] == (chunk_size // block_size) * codec.bytes_per_block
+            for entry in catalog.entries.values()
+        )
+        for cache in caches.values():
+            for field in ("k_cache", "v_cache", "k_scale", "v_scale"):
+                getattr(cache, field).zero_()
+        restored = engine.retrieve(tokens, block_ids=list(range(num_blocks)))
+        torch.cuda.synchronize()
+        assert bool(restored.all())
+        for layer, fields in expected.items():
+            for field, tensor in fields.items():
+                assert torch.equal(getattr(caches[layer], field), tensor)
+        for _, _, key in engine.token_database.process_tokens(tokens):
+            backend.remove(key)
+        deadline = time.monotonic() + 5
+        while catalog.entries and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not catalog.entries
+    finally:
+        if reporter is not None:
+            reporter.close()
+        server.close()
+        gpu.close()
+        LMCacheEngineBuilder.destroy(engine_id)

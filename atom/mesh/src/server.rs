@@ -109,6 +109,18 @@ async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Re
     state.router.get_server_info(req).await
 }
 
+async fn render_chat(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+    state.router.render_tokens(true, &body).await
+}
+
+async fn render_completion(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+    state.router.render_tokens(false, &body).await
+}
+
+async fn cache_control(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    state.router.cache_control(req).await
+}
+
 async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response {
     state.router.get_models(req).await
 }
@@ -486,6 +498,9 @@ pub fn build_app(
             "/v1/conversations/{conversation_id}/items/{item_id}",
             get(v1_conversations_get_item).delete(v1_conversations_delete_item),
         )
+        .route("/v1/completions/render", post(render_completion))
+        .route("/v1/chat/completions/render", post(render_chat))
+        .route("/v1/cache/{operation}", get(cache_control))
         // Tokenize / Detokenize endpoints
         .route("/v1/tokenize", post(v1_tokenize))
         .route("/v1/detokenize", post(v1_detokenize))
