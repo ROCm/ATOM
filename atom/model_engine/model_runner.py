@@ -3332,8 +3332,23 @@ class ModelRunner:
                 prev_rejected_num = np.zeros(0, dtype=np.int32)
                 prev_bonus_num = np.zeros(0, dtype=np.int32)
         else:
-            prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
-            prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
+            # Nothing is deferred on this path, so the counts that belong with
+            # the tokens `prepare_sampled_ids` just emitted are THIS step's --
+            # not, as on the deferred path, the previous step's. Zeroes here
+            # read as "every draft was accepted": the scheduler stages the next
+            # step's window at `seq.num_tokens - num_rejected - num`
+            # (`ScheduledBatch.__init__`), so the anchor lands `num_rejected`
+            # slots late, on the trailing `eos_token_id` placeholders, and the
+            # request degenerates into fluent noise.
+            #
+            # A step that scored no drafts (`spec_decode_metadata is None`)
+            # rejected nothing, and the zeros are right.
+            if spec_decode_metadata is not None:
+                prev_rejected_num = num_reject_tokens.cpu().numpy().astype(np.int32)
+                prev_bonus_num = num_bonus_tokens.cpu().numpy().astype(np.int32)
+            else:
+                prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
+                prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
             # PP stages and P/D producers still run the drafter.
             if hasattr(self, "drafter"):
                 # Mid-prompt sequences get their anchor corrected inside
