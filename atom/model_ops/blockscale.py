@@ -18,7 +18,11 @@ from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale_group32 import (
 from .blockscale_kernels.blockscale_gemm import (
     blockscale_gemm_fp4_kernel,
 )
-from .blockscale_kernels.quantization import quantize_fp4_kernel, quantize_fp8_kernel
+from .blockscale_kernels.quantization import (
+    FP8_DTYPE,
+    quantize_fp4_kernel,
+    quantize_fp8_kernel,
+)
 
 
 def _check_quant_input(x, group):
@@ -32,7 +36,7 @@ def _check_quant_input(x, group):
 def quantize_fp8(x: torch.Tensor, *, dequantize: bool = False):
     """E4M3, group32 E8M0 ceil scales; optionally return QAT values in x.dtype."""
     x = _check_quant_input(x, 32)
-    output = torch.empty_like(x, dtype=x.dtype if dequantize else torch.float8_e4m3fn)
+    output = torch.empty_like(x, dtype=x.dtype if dequantize else FP8_DTYPE)
     scales = (
         None
         if dequantize
