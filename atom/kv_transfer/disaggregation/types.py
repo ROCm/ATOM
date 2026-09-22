@@ -287,6 +287,10 @@ class KVTransferTensors:
     # those are ordinary PAGE KV, never part of the state image. None means
     # every region. Appended for positional compatibility.
     paged_state_region_count: int | None = None
+    # Optional token-contiguous MLA gather using the same registered staging
+    # pool and prepared DCP indices as the index-page callback. The pool must
+    # hold the larger of an MLA page and an index page for every chunk slot.
+    gather_sharded_mla: Callable[..., tuple[int, int]] | None = None
     # Scheduler blocks the PAGE regions are addressed in. `init=False` because
     # a backend cannot answer it: `req.block_ids` is the scheduler's id space,
     # and a backend counts in its own page -- a different unit even where it is

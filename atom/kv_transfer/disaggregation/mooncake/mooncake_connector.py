@@ -759,6 +759,7 @@ class MooncakeConnector(KVConnectorBase):
         self._index_staging_lock = threading.Lock()
         self._prepare_sharded_index = None
         self._gather_sharded_index = None
+        self._gather_sharded_mla = None
         self._index_staging_stream = None
 
         # --- Producer: completed prefill block_ids cache ---
@@ -910,6 +911,7 @@ class MooncakeConnector(KVConnectorBase):
             self._index_staging_free = list(range(tt.index_staging_pool_size))
             self._prepare_sharded_index = tt.prepare_sharded_index
             self._gather_sharded_index = tt.gather_sharded_index
+            self._gather_sharded_mla = tt.gather_sharded_mla
             self._index_staging_stream = torch.cuda.Stream(device=self._cuda_device)
 
         # Populate block/slot region lists for transfer offset computation
@@ -1839,7 +1841,11 @@ class MooncakeConnector(KVConnectorBase):
                     f"region {region_idx} has {bpb}, consumer region "
                     f"{cmap[region_idx]} has {consumer_bpb[cmap[region_idx]]}"
                 )
-            if stages_sharded_index and role == INDEX_CACHE_ROLE:
+            stage_mla = (
+                role == MLA_KV_ROLE
+                and getattr(self, "_gather_sharded_mla", None) is not None
+            )
+            if stages_sharded_index and (role == INDEX_CACHE_ROLE or stage_mla):
                 staged_regions.append((region_idx, dst_base, bpb))
                 continue
             if sharded_runs is None:
@@ -1958,7 +1964,7 @@ class MooncakeConnector(KVConnectorBase):
         *,
         engine=None,
     ) -> bool:
-        """GPU-repack one index layer/chunk, then RDMA its local pages."""
+        """GPU-pack one index or MLA layer/chunk, then RDMA complete pages."""
 
         pool_idx = self._acquire_index_staging_slot()
         try:
@@ -1968,7 +1974,13 @@ class MooncakeConnector(KVConnectorBase):
                 else torch.cuda.current_stream()
             )
             with torch.cuda.stream(stream):
-                staging_base, staged_pages = self._gather_sharded_index(
+                gather = self._gather_sharded_index
+                if (
+                    getattr(self, "_gather_sharded_mla", None) is not None
+                    and self._block_region_roles[region_idx] == MLA_KV_ROLE
+                ):
+                    gather = self._gather_sharded_mla
+                staging_base, staged_pages = gather(
                     region_idx,
                     gather_indices,
                     pool_idx,

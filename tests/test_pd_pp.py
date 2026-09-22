@@ -9,7 +9,7 @@ import threading
 import types
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -1077,7 +1077,8 @@ def test_dcp_block_descriptors_are_streamed_in_bounded_batches():
     assert transferred_bytes == 2 * descriptors_per_region * 576
 
 
-def test_dcp_index_staging_waits_for_request_ready_event():
+@pytest.mark.parametrize("stage_mla", [False, True])
+def test_dcp_index_staging_waits_for_request_ready_event(stage_mla):
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
@@ -1097,6 +1098,7 @@ def test_dcp_index_staging_waits_for_request_ready_event():
     gather_indices = object()
     connector._prepare_sharded_index = MagicMock(return_value=gather_indices)
     connector._gather_sharded_index = MagicMock()
+    connector._gather_sharded_mla = MagicMock() if stage_mla else None
     connector._index_staging_stream = MagicMock()
     connector._execute_staged_index_layer_chunk = MagicMock(return_value=True)
     connector._rdma_write_with_retry = MagicMock(return_value=True)
@@ -1122,16 +1124,34 @@ def test_dcp_index_staging_waits_for_request_ready_event():
         engine=ready_event,
     )
     connector._index_staging_stream.wait_event.assert_called_once_with(ready_event)
-    connector._execute_staged_index_layer_chunk.assert_called_once_with(
-        "consumer:1234",
-        1,
-        4_000_000,
-        index_block_bytes,
-        [10],
-        "req-1",
-        gather_indices,
-        engine=ready_event,
+    expected = []
+    if stage_mla:
+        expected.append(
+            call(
+                "consumer:1234",
+                0,
+                3_000_000,
+                mla_block_bytes,
+                [10],
+                "req-1",
+                gather_indices,
+                engine=ready_event,
+            )
+        )
+        connector._rdma_write_with_retry.assert_not_called()
+    expected.append(
+        call(
+            "consumer:1234",
+            1,
+            4_000_000,
+            index_block_bytes,
+            [10],
+            "req-1",
+            gather_indices,
+            engine=ready_event,
+        )
     )
+    assert connector._execute_staged_index_layer_chunk.call_args_list == expected
     assert all(
         call.kwargs["engine"] is ready_event
         for call in connector._rdma_write_with_retry.call_args_list

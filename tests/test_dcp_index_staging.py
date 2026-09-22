@@ -5,10 +5,51 @@ import pytest
 import torch
 
 from atom.kv_transfer.disaggregation.index_staging import (
+    gather_dcp_mla_pages,
     gather_dcp_preshuffled_index_pages,
     prepare_dcp_index_gather_indices,
 )
 from atom.kv_transfer.disaggregation.sharded_transfer import build_dcp_shard_plan
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
+def test_mla_gather_preserves_sharded_bytes_and_partial_page(device, dcp_size, dtype):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("GPU required")
+    block_size, width = 16, 48
+    # Permuted source blocks and a partial final page exercise physical block
+    # addressing, every DCP rank, and padding without depending on the planner.
+    src_ids = [4, 0, 6, 2, 5]
+    raw = torch.arange(7 * block_size * width, dtype=torch.int64).remainder(251)
+    source_bytes = raw.to(torch.uint8).reshape(7, block_size, width)
+    source = source_bytes.to(device).view(dtype)
+    for rank in range(dcp_size):
+        plan = build_dcp_shard_plan(
+            src_ids, block_size=block_size, dcp_size=dcp_size, dcp_rank=rank
+        )
+        indices = prepare_dcp_index_gather_indices(plan, torch.device(device))
+        staging = torch.full(
+            (plan.dst_pages + 1, block_size * width),
+            253,
+            dtype=torch.uint8,
+            device=device,
+        )
+        pages = gather_dcp_mla_pages(source, staging, indices, block_size)
+        assert pages == plan.dst_pages
+        expected = torch.zeros(plan.dst_pages * block_size, width, dtype=torch.uint8)
+        for local_token in range(expected.shape[0]):
+            global_token = local_token * dcp_size + rank
+            block, token = divmod(global_token, block_size)
+            if block < len(src_ids):
+                expected[local_token] = source_bytes[src_ids[block], token]
+        torch.testing.assert_close(
+            staging[: plan.dst_pages].cpu(), expected.reshape(plan.dst_pages, -1)
+        )
+        assert torch.all(
+            staging[-1] == 253
+        ), "gather overwrote a neighboring pool region"
 
 
 @pytest.mark.parametrize("index_head_dim", [128, 256])
