@@ -352,6 +352,14 @@ def validate_runtime_config(config):
 
     unsupported = []
     graph_mode = getattr(config.compilation_config, "cudagraph_mode", None)
+    plugin = config.plugin_config
+    # The vLLM plugin path is text-only and runs the backbone alone: vLLM owns
+    # scheduling and block allocation, and the bridge in
+    # `atom.plugin.vllm.deepseek_v41_bridge` maps its block tables onto CSA2's
+    # PAGE/STATE pool. Everything V4.1 layers on top of that backbone --
+    # DSpark drafting, the vision tower, prefix reuse across the compressed
+    # pool -- still has no plugin-side counterpart, so each is named below.
+    on_vllm_plugin = plugin is not None and bool(getattr(plugin, "is_vllm", False))
     for name, enabled in (
         (
             "CUDAGraph mode (use FULL, PIECEWISE or enforce_eager=True)",
@@ -381,7 +389,21 @@ def validate_runtime_config(config):
         ),
         ("TBO", config.enable_tbo or config.enable_tbo_decode),
         ("KV transfer", bool(config.kv_transfer_config) or config.enable_rapidserve),
-        ("plugin mode", config.plugin_config is not None),
+        ("plugin mode outside vLLM", plugin is not None and not on_vllm_plugin),
+        # TODO: DSpark under the vLLM plugin needs vLLM's proposer to drive
+        # ATOM's tentative staging; the proxy bridge drives a single
+        # target-only step today.
+        (
+            "speculative decoding on the vLLM plugin",
+            on_vllm_plugin and config.speculative_config is not None,
+        ),
+        # TODO: CSA2 blocks are only reusable at whole-PAGE boundaries after
+        # the compressor has run; vLLM's hash-based reuse would hand back
+        # blocks whose STATE side was never replayed.
+        (
+            "prefix caching on the vLLM plugin",
+            on_vllm_plugin and config.enable_prefix_caching,
+        ),
         ("online quantization", config.online_quant_config is not None),
         ("EPLB", config.eplb_enable),
         (

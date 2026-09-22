@@ -27,6 +27,7 @@ on MI355X GPUs.
 | Optional CED decoder replay | Not started |
 | Optional encoder replay with a persistent global cache | Not started |
 | TP4 with routed experts sharded across TP instead of whole-expert EP | Supported; relative throughput is workload-dependent |
+| vLLM plugin backend (`atom/plugin/vllm`) | Text backbone only; vision, DSpark and prefix caching refused, graphs forced off -- see the [vLLM plugin recipe](atom_vllm/DeepSeek-V4.1-Flash.md) |
 | Distributed and deployment combinations beyond TP4 | Not validated |
 
 The full-layer path remains the numerical and performance baseline. CED and
