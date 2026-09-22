@@ -32,6 +32,8 @@ fixed acceptance length 3.51.
 | TP4 with routed experts sharded across TP instead of whole-expert EP | Supported; relative throughput is workload-dependent |
 | TP2 no EP | GPU benchmark completed at level 3 FULL; see the [AgentX recipe](DeepSeek-V4.1-Flash-Agentic.md) for commands and measured points |
 | Other TP sizes | Configuration tests cover TP1/2/4/8 and dimension divisibility; this does not establish GPU or quality validation for TP1/8. TP8 does not start: AITER's FP8 blockscale GEMM runs no K = 288 (the shared expert's down projection) |
+| vLLM plugin backend (`atom/plugin/vllm`) | Text backbone only; vision, DSpark and prefix caching refused, graphs forced off -- see the [vLLM plugin recipe](atom_vllm/DeepSeek-V4.1-Flash.md) |
+| Distributed and deployment combinations beyond TP4 | Not validated |
 
 The full-layer path remains the numerical and performance baseline. CED and
 bounded replay are approximate modes with separate quality gates and cache
