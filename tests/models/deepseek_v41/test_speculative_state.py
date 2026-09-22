@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: MIT
 """Every accepted prefix must recover history, window rows and compressor state."""
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
@@ -12,6 +10,7 @@ from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.deepseek_v41.checkpoints import StateCopies
 from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+from atom.models.deepseek_v41.config import AttentionMode, LayerAttentionSpec
 
 
 def encoded_rows(positions, layer, geometry, device):
@@ -123,7 +122,7 @@ def test_every_prefix_survives_ring_wrap_and_ragged_request_order(
     cache.prepare_state(next_step)
     if device == "cuda":
         for layer in range(2):
-            spec = SimpleNamespace(layer_id=layer, ratio=0, kv_owner=None)
+            spec = LayerAttentionSpec(layer, 0, AttentionMode.WINDOW)
             prefix, ptr, extend, eptr = cache.attention_indices(spec, next_step)
             prefix, ptr, extend, eptr = [x.cpu() for x in (prefix, ptr, extend, eptr)]
             for span in next_spans:
@@ -331,7 +330,7 @@ def test_verify_decode_kernel_is_causal_after_writing_the_whole_block(packed):
         tuple(v[7:].contiguous() for v in quantized) if packed else keys[None, 7:],
         step,
     )
-    spec = SimpleNamespace(layer_id=0, ratio=0, kv_owner=None)
+    spec = LayerAttentionSpec(0, 0, AttentionMode.WINDOW)
     indices, ptr, _, _ = cache.attention_indices(spec, step)
     query = torch.randn(6, 8, 512, device="cuda", dtype=torch.bfloat16)
     sink = torch.randn(8, device="cuda")

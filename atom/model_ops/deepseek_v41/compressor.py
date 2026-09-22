@@ -73,7 +73,7 @@ def compress_batch(cache, owner, compressor, values, scores, step, rope, *, scat
             overlap=False,
             ratio=ratio,
             head_dim=head_dim,
-            rope_head_dim=rope.cos_cache.shape[-1] * 2,
+            rope_head_dim=rope.rope_dim,
             quant_mode="none",
             latent_out=latent,
             rotated_out=rotated,

@@ -55,7 +55,19 @@ class Block(nn.Module):
             quant_config=moe_quant_config,
             alt_stream=alt_stream,
         )
-        self.attn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        # Where `wqkv_a` is the norm's only reader, the norm emits the
+        # `(e4m3, e8m0 group-32)` pair that GEMM would otherwise have made for
+        # itself -- one launch instead of two. A layer whose compressor or
+        # indexer also projects this tensor keeps the BF16 it needs.
+        self.attn_norm = RMSNorm(
+            config.hidden_size,
+            config.rms_norm_eps,
+            **(
+                {}
+                if spec.shares_attention_input
+                else {"fused_quant": True, "quant_config": native_quant_config()}
+            ),
+        )
         self.ffn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         # `post_mult` is the 2.0 in the post gate's `2 * sigmoid(...)`, which
         # the AITER stages take as a parameter where the torch body has it
@@ -94,7 +106,17 @@ class Block(nn.Module):
             )
 
     def attention_forward(self, hidden, cache, step, rope):
-        return self.attn(hidden, cache, step, rope)
+        """Norm this sublayer's input, then run it.
+
+        The norm stays on this side of the guarded op rather than in
+        `prepare_attention` so its quantized pair never has to cross one: the
+        op is declared over a single BF16 tensor, and what leaves it is the
+        attention output rather than anything shaped like its input.
+        """
+        normed = self.attn_norm(hidden)
+        if isinstance(normed, tuple):
+            return self.attn(*normed, cache, step, rope)
+        return self.attn(normed, None, cache, step, rope)
 
     def engram_forward(self, residual, embeddings, image_mask):
         if embeddings is None:
@@ -124,7 +146,7 @@ class Block(nn.Module):
             post_mix=state.post_mix,
             combination=state.combination,
         )
-        return self.attn_norm(hidden), residual, pre, post, comb
+        return hidden, residual, pre, post, comb
 
     def prepare_ffn(self, output, residual, pre, post, comb):
         # The attention post folds into this pre, which is the shape the seam

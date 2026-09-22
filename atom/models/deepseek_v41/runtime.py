@@ -49,7 +49,9 @@ def v41_attention(hidden: torch.Tensor, layer_name: str) -> torch.Tensor:
     if not metadata.step.requests:
         return torch.zeros_like(hidden)
     layer, rope = context.no_compile_layers[layer_name]
-    return layer.attn(hidden, metadata.cache, metadata.step, rope)
+    # Through the block's own body, so the input norm and the quantized pair it
+    # may hand the first GEMM stay on one side of this boundary.
+    return Block.attention_forward(layer, hidden, metadata.cache, metadata.step, rope)
 
 
 @torch_compile_guard(mutates_args=[], gen_fake=_fake_layer_output)

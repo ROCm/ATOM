@@ -12,7 +12,6 @@ from atom.model_ops.attentions.deepseek_v41.packed_attention import (
 )
 from atom.model_ops.blockscale import (
     dequantize_fp8_weight,
-    quantize_fp8,
 )
 from atom.model_ops.deepseek_v41.compressor import Compressor
 from atom.model_ops.deepseek_v41.paged_scoring import score_topk_paged
@@ -74,6 +73,46 @@ class Indexer(nn.Module):
             self.wq_b(qr, x_scale=qr_scale).unflatten(-1, (self.heads, self.head_dim)),
             positions,
         )
+
+    def project(self, hidden, qr, qr_scale, cache, step, rope):
+        """Everything `score` needs that the index plane does not hold.
+
+        Apart from `score` so that a compressor's join has somewhere to sit
+        that is neither before this nor after the plane is read.
+        """
+        positions = cache.rope_positions(step)
+        return (
+            self.project_query(qr, qr_scale, rope, positions)[0],
+            self.weights_proj(hidden)[0],
+        )
+
+    def score(self, query, weights, cache, step):
+        """This layer's top-k rows, out of the paged plane, into `step`.
+
+        Every query row carries its own bound and its own tile list, so a
+        prefill token, a decode token and a drafted token are one shape to the
+        scorer and a ragged batch is not a case to it.
+
+        First reader of the index plane, into which a boundary crossed in this
+        same forward writes a row that `visible` already counts.
+        """
+        spec = self.spec
+        source = spec.candidate_source
+        selected, chosen = score_topk_paged(
+            query,
+            weights,
+            cache.index_units[spec.kv_owner],
+            cache.unit_tiles(step, spec.ratio),
+            step.visible[spec.ratio],
+            topk=self.topk,
+            weights_scale=self.weights_scale,
+            candidates=None if source is None else step.candidates[source],
+            block_size=self.block_size,
+            candidate_count=self.topk_blocks if spec.produces_candidates else 0,
+        )
+        step.selected[spec.layer_id] = selected.unsqueeze(0)
+        if chosen is not None:
+            step.candidates[spec.layer_id] = chosen
 
 
 class Attention(nn.Module):
@@ -162,32 +201,6 @@ class Attention(nn.Module):
             )
             cache.write_index(owner, step, index, self.spec.ratio)
 
-    def _select_indices(self, hidden, qr, qr_scale, cache, step, rope):
-        """This layer's top-k index rows, out of the paged plane.
-
-        Every query row carries its own bound and its own tile list, so a
-        prefill token, a decode token and a drafted token are one shape to the
-        scorer and a ragged batch is not a case to it.
-        """
-        indexer, spec = self.indexer, self.spec
-        positions = cache.rope_positions(step)
-        source = spec.candidate_source
-        selected, chosen = score_topk_paged(
-            indexer.project_query(qr, qr_scale, rope, positions)[0],
-            indexer.weights_proj(hidden)[0],
-            cache.index_units[spec.kv_owner],
-            cache.unit_tiles(step, spec.ratio),
-            step.visible[spec.ratio],
-            topk=indexer.topk,
-            weights_scale=indexer.weights_scale,
-            candidates=None if source is None else step.candidates[source],
-            block_size=indexer.block_size,
-            candidate_count=indexer.topk_blocks if spec.produces_candidates else 0,
-        )
-        step.selected[spec.layer_id] = selected.unsqueeze(0)
-        if chosen is not None:
-            step.candidates[spec.layer_id] = chosen
-
     def process_weights_after_loading(self) -> None:
         """Dequantize wo_a to BF16 for the grouped LoRA einsum.
 
@@ -226,30 +239,49 @@ class Attention(nn.Module):
         self.wo_a.quant_type = QuantType.No
         self.wo_a.need_normalize_e4m3fn_to_e4m3fnuz = False
 
-    def project_qkv(self, hidden):
-        """The one GEMM the query and the KV latent both come out of."""
-        return torch.split(self.wqkv_a(hidden), self.wqkv_a.output_sizes, dim=-1)
+    def project_qkv(self, hidden, hidden_scale=None):
+        """The one GEMM the query and the KV latent both come out of.
 
-    def forward(self, hidden, cache, step, rope):
-        positions = cache.rope_positions(step)
-        q_lora, kv_pre = self.project_qkv(hidden)
+        `hidden_scale` is the norm's when it quantized for this GEMM, which is
+        every layer whose norm has no other reader; `None` leaves the GEMM to
+        quantize its own input, as it does for a layer that shares one.
+        """
+        return torch.split(
+            self.wqkv_a(hidden, x_scale=hidden_scale),
+            self.wqkv_a.output_sizes,
+            dim=-1,
+        )
+
+    def _project_out(self, output):
+        """The grouped output LoRA, taking an already un-rotated attention out.
+
+        Un-rotating is the caller's because the two callers reach their rows
+        differently -- one batch line against a ragged one -- while everything
+        after it is the same weights in the same order.
+        """
+        output = output.unflatten(-2, (self.groups, -1)).flatten(-2)
+        grouped = self.wo_a.weight.view(self.groups, self.o_rank, -1)
+        return self.wo_b(grouped_output_projection(output, grouped).flatten(-2))
+
+    def forward(self, hidden, hidden_scale, cache, step, rope):
+        q_lora, kv_pre = self.project_qkv(hidden, hidden_scale)
         qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
-        query, raw_kv = rope.pair(
-            self.wq_b(qr, x_scale=qr_scale).unflatten(-1, (self.heads, self.head_dim)),
-            kv_normed,
-            positions,
+        query = self.wq_b(qr, x_scale=qr_scale).unflatten(
+            -1, (self.heads, self.head_dim)
         )
-        # Decode consumes only the stored window; do not materialize an unused
-        # BF16 copy when the persistent cache is packed.
-        kv = (
-            None
-            if cache.packed and step.decode
-            else quantize_fp8(raw_kv, dequantize=True)
+        # One launch for both rotations, the KV row's FP8 bytes and, where a
+        # decode allows it, the window write. `window_kv` is what is left for
+        # `write_window` below, which is nothing when that fold happened.
+        kv, window_kv = cache.rope_quant_window(
+            self.spec.layer_id, query, kv_normed, rope, step
         )
-        window_kv = quantize_fp8(raw_kv) if cache.packed else kv
         self._compress_batch(hidden, cache, step, rope)
         if self.indexer is not None:
-            self._select_indices(hidden, qr, qr_scale, cache, step, rope)
+            self.indexer.score(
+                *self.indexer.project(hidden, qr, qr_scale, cache, step, rope),
+                cache,
+                step,
+            )
         prefix, prefix_indptr, extend, extend_indptr = cache.attention_indices(
             self.spec, step
         )
@@ -281,12 +313,6 @@ class Attention(nn.Module):
             )
             # Preserve the prior ring until every query has consumed its prefix.
             cache.write_window(self.spec.layer_id, window_kv, step)
-        output = output.view_as(query)
-        output = (
-            rope(output, positions, inverse=True)
-            .unflatten(-2, (self.groups, -1))
-            .flatten(-2)
+        return self._project_out(
+            rope(output.view_as(query), cache.rope_positions(step), inverse=True)
         )
-        grouped_weight = self.wo_a.weight.view(self.groups, self.o_rank, -1)
-        output = grouped_output_projection(output, grouped_weight)
-        return self.wo_b(output.flatten(-2))

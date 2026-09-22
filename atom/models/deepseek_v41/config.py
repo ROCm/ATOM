@@ -2,8 +2,9 @@
 """HF normalization and immutable CSA2 topology, without GPU dependencies."""
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
+from itertools import groupby
 
 from transformers import PretrainedConfig
 
@@ -23,6 +24,21 @@ class LayerAttentionSpec:
     kv_owner: int | None = None
     topk_owner: int | None = None
     candidate_owner: int | None = None
+    # The contiguous run of layers whose attention indices one launch writes.
+    # `indices.py` owns why it has to be contiguous.
+    index_group_start: int = 0
+    index_group_size: int = 1
+
+    @property
+    def shares_attention_input(self):
+        """Whether anything but `wqkv_a` reads this layer's normed input.
+
+        A compressor and an indexer both project the same tensor in BF16, and
+        only a FULL layer builds the first or a FULL/REINDEX layer the second
+        -- so everywhere else the norm has exactly one reader and can hand it
+        the quantized pair instead of a tensor to quantize again.
+        """
+        return self.mode in (AttentionMode.FULL, AttentionMode.REINDEX)
 
     @property
     def produces_candidates(self):
@@ -142,7 +158,21 @@ def build_attention_topology(config) -> tuple[LayerAttentionSpec, ...]:
                 candidate if uses_candidates else None,
             )
         )
-    return tuple(result)
+    # Backbone and draft are grouped apart. A run straddling the boundary would
+    # hand a backbone layer a size counting draft layers the model never builds.
+    return _tag_index_groups(result[:layers]) + _tag_index_groups(result[layers:])
+
+
+def _tag_index_groups(specs):
+    """Number each maximal run of layers that share an index build."""
+    tagged = []
+    for _, members in groupby(specs, key=lambda s: (s.ratio, s.kv_owner, s.topk_owner)):
+        run = tuple(members)
+        tagged += [
+            replace(spec, index_group_start=run[0].layer_id, index_group_size=len(run))
+            for spec in run
+        ]
+    return tuple(tagged)
 
 
 class DeepseekV41TextConfig(PretrainedConfig):

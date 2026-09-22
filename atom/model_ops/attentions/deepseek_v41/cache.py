@@ -18,9 +18,11 @@ from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
     MAIN_FP4,
 )
 from atom.model_ops.blockscale import quantize_fp4
+from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
 from atom.model_ops.deepseek_v41.compressor import compress_batch
 from atom.model_ops.deepseek_v41.dspark import gather_window_rows
 from atom.model_ops.deepseek_v41.index_write import write_index_rows
+from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.deepseek_v41.unit_table import unit_table
 from atom.model_ops.v4_kernels import make_compress_plans
 from atom.model_ops.v4_kernels.state_writes import (
@@ -557,8 +559,64 @@ class PagedAttentionCache:
         # index itself, so casting the whole tensor first was a copy of it.
         return gather_window_rows(self.state.view("window"), layers, slots)
 
+    def rope_quant_window(self, layer, query, kv, rope, step):
+        """Rotate the query, quantize the KV row, and store it where it can be.
+
+        A decode stores the row and produces nothing: no query of a decode
+        attends to it, so the window write folds in here. A prefill produces
+        the row and stores nothing, because the queries in this very chunk have
+        yet to read the rows a store would overwrite -- that write stays behind
+        attention, in `write_window`. The cache layout only decides the
+        payload, so both halves of that read the same either way.
+
+        Returns the BF16 row an extend pass attends to and whatever the window
+        still owes, `None` for each the caller has no use for.
+        """
+        dim, packed = self.geometry.head_dim, self.packed
+        if not step.width:
+            return (None, None) if step.decode else (torch.empty_like(kv), None)
+        seam = (
+            query.view(step.width, -1, dim),
+            kv.view(step.width, dim),
+            rope.cos_cache,
+            rope.sin_cache,
+            step.positions,
+        )
+        if step.decode:
+            rope_quant_window(
+                *seam,
+                rope_dim=rope.rope_dim,
+                # The packed pool is byte-addressed and the BF16 one is a
+                # `[rows, head_dim]` view, which is the whole difference.
+                ring=(
+                    self.backing if packed else self.pool,
+                    step,
+                    self.geometry.window(layer, self.num_pages),
+                    packed,
+                ),
+            )
+            return None, None
+        qat = torch.empty_like(kv)
+        values = torch.empty_like(kv, dtype=FP8_DTYPE) if packed else None
+        scales = (
+            torch.empty(
+                (*kv.shape[:-1], dim // 32),
+                device=kv.device,
+                dtype=torch.float8_e8m0fnu,
+            )
+            if packed
+            else None
+        )
+        rope_quant_window(
+            *seam, rope_dim=rope.rope_dim, qat=qat, values=values, scales=scales
+        )
+        return qat, (values, scales) if packed else qat
+
     def write_window(self, layer, kv, step):
-        if step.width:
+        # `None` is `rope_quant_window` reporting that it already stored the
+        # row, not an empty batch: those two differ in whether `step.width` is
+        # zero, and only this one can reach here after a real forward.
+        if kv is not None and step.width:
             window = self.geometry.window(layer, self.num_pages)
             if self.packed:
                 write_packed_window(
@@ -580,12 +638,47 @@ class PagedAttentionCache:
             )
 
     def attention_indices(self, spec, step):
-        selected = step.selected[spec.topk_owner] if spec.ratio else None
+        """This layer's prefix rows, built with its whole group's on a decode.
+
+        The group's first layer is also the layer that owns its selection, so
+        by the time anyone asks, every input the run shares already exists.
+        Later layers find theirs written and launch nothing.
+        """
+        first = spec.index_group_start
+        if not step.decode or spec.index_group_size == 1:
+            # A run of one, anchored on this layer's own ring, so a spec that
+            # declares no group never has to name a start. A prefill takes this
+            # too: it pays work rather than dispatch, and its `extend` plane is
+            # this layer's alone.
+            prefix, pptr, extend, eptr = self._index_group(spec, step, spec.layer_id, 1)
+            return prefix[0], pptr, extend, eptr
+        built = step.group_indices.get(first)
+        if built is None:
+            built = self._index_group(spec, step, first, spec.index_group_size)
+            step.group_indices[first] = built
+        prefix, pptr, extend, eptr = built
+        return prefix[spec.layer_id - first], pptr, extend, eptr
+
+    def _index_group(self, spec, step, first, layers):
+        """One build covering `layers` consecutive layers from `first`.
+
+        The per-layer ring offset is read off the geometry rather than
+        rebuilt here, so the kernel's stride and `window()` cannot drift.
+        """
+        window = self.geometry.window(first, self.num_pages)
+        stride = (
+            0
+            if layers == 1
+            else self.geometry.window(first + 1, self.num_pages).ring_start
+            - window.ring_start
+        )
         return build_indices(
-            selected,
+            step.selected[spec.topk_owner] if spec.ratio else None,
             step,
             self.geometry,
-            self.geometry.window(spec.layer_id, self.num_pages),
+            window,
             spec.kv_owner,
             spec.ratio,
+            layers,
+            stride,
         )

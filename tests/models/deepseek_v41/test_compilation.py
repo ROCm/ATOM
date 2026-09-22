@@ -44,7 +44,7 @@ class Rows(dict):
 
 
 class Attention(nn.Module):
-    def forward(self, hidden, cache, step, rope):
+    def forward(self, hidden, hidden_scale, cache, step, rope):
         assert not step.selected
         return hidden + step.shift
 
@@ -72,6 +72,8 @@ class TinyBlock(RuntimeBlock):
     def __init__(self):
         nn.Module.__init__(self)
         self.layer_name = "v41.layers.0"
+        # The block norms its own input now; this stub's is already normed.
+        self.attn_norm = nn.Identity()
         self.attn = Attention()
         self.ffn = FFN()
         self.engram = None
