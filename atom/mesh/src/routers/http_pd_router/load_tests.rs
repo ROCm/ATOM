@@ -402,3 +402,45 @@ async fn dual_dispatch_error_cancels_the_pending_peer() {
         assert_eq!(d.worker.load(), 0);
     }
 }
+
+async fn check_stalled_dual_dispatch_error(fail_prefill: bool) {
+    for streaming in [true, false] {
+        let (mut p, mut d) = servers().await;
+        let task = dispatch(DispatchKind::Sglang, &p, &d, streaming);
+        p.wait_entered().await;
+        d.wait_entered().await;
+        let (failed, peer) = if fail_prefill {
+            (&mut p, &d)
+        } else {
+            (&mut d, &p)
+        };
+        let (response, tx) = stream_response(StatusCode::SERVICE_UNAVAILABLE);
+        failed.respond(response);
+
+        // Keep the error body open: the peer must be cancelled on headers,
+        // without waiting for the failing worker's error payload to arrive.
+        wait_load(&peer.worker, 0).await;
+        assert_eq!(failed.worker.load(), 1);
+        assert!(!task.is_finished());
+        tx.send(Ok(Bytes::from_static(b"upstream unavailable")))
+            .unwrap();
+        drop(tx);
+
+        let response = result(task).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&bytes).contains("upstream unavailable"));
+        assert_eq!(p.worker.load(), 0);
+        assert_eq!(d.worker.load(), 0);
+    }
+}
+
+#[tokio::test]
+async fn stalled_prefill_error_body_cancels_pending_decode() {
+    check_stalled_dual_dispatch_error(true).await;
+}
+
+#[tokio::test]
+async fn stalled_decode_error_body_cancels_pending_prefill() {
+    check_stalled_dual_dispatch_error(false).await;
+}

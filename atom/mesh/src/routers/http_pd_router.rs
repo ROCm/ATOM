@@ -1461,26 +1461,41 @@ impl PDRouter {
         }
         .emit();
 
-        // Drain P independently of D's response headers. If either side fails,
-        // cancel the other pending future so its reservation is also released.
+        enum DispatchError {
+            Prefill(reqwest::Response, WorkerLoadGuard),
+            Decode(reqwest::Response, WorkerLoadGuard),
+            Response(Response),
+        }
+
+        // Drain successful P responses independently of D's headers. Return
+        // HTTP errors on headers so try_join! drops the peer and its reservation
+        // before we await a potentially stalled error body below.
         let results = tokio::try_join!(
             async {
                 let result = prefill_request.send().await;
+                let result = match result {
+                    Ok(res) if !res.status().is_success() => {
+                        return Err(DispatchError::Prefill(res, prefill_guard));
+                    }
+                    result => result,
+                };
                 let result = self
                     .process_prefill_response(result, prefill.url(), context.return_logprob)
-                    .await;
+                    .await
+                    .map_err(DispatchError::Response);
                 drop(prefill_guard);
                 result
             },
             async {
                 let res = decode_request.send().await.map_err(|e| {
                     error!(decode_url = %decode.url(), error = %e, "Decode request failed");
-                    error::bad_gateway("decode_server_error", format!("Decode server error: {}", e))
+                    DispatchError::Response(error::bad_gateway(
+                        "decode_server_error",
+                        format!("Decode server error: {}", e),
+                    ))
                 })?;
                 if !res.status().is_success() {
-                    return Err(self
-                        .handle_decode_error_response(res, &context, decode_guard, decode)
-                        .await);
+                    return Err(DispatchError::Decode(res, decode_guard));
                 }
                 Ok((res, decode_guard))
             }
@@ -1489,7 +1504,16 @@ impl PDRouter {
         events::RequestReceivedEvent {}.emit();
         let ((_, prefill_body), (res, decode_guard)) = match results {
             Ok(results) => results,
-            Err(response) => return response,
+            Err(DispatchError::Response(response)) => return response,
+            Err(DispatchError::Prefill(res, _prefill_guard)) => {
+                // Keep only the failing worker reserved while reading its body.
+                return self.handle_prefill_error_response(res, prefill.url()).await;
+            }
+            Err(DispatchError::Decode(res, decode_guard)) => {
+                return self
+                    .handle_decode_error_response(res, &context, decode_guard, decode)
+                    .await;
+            }
         };
         let status = res.status();
 
@@ -1646,6 +1670,27 @@ impl PDRouter {
         }
     }
 
+    async fn handle_prefill_error_response(
+        &self,
+        response: reqwest::Response,
+        prefill_url: &str,
+    ) -> Response {
+        let status = response.status();
+        let error_msg = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown prefill error".to_string());
+        error!(
+            "Prefill server returned error status prefill_url={} status={} body={}",
+            prefill_url, status, error_msg
+        );
+        error::create_error(
+            status,
+            "prefill_error",
+            format!("Prefill server error ({}): {}", status, error_msg),
+        )
+    }
+
     // Helper to process prefill response and extract body if needed for logprobs
     async fn process_prefill_response(
         &self,
@@ -1679,23 +1724,9 @@ impl PDRouter {
 
         // Check if prefill succeeded
         if !prefill_status.is_success() {
-            // Get error body from prefill
-            let error_msg = prefill_response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown prefill error".to_string());
-
-            error!(
-                "Prefill server returned error status prefill_url={} status={} body={}",
-                prefill_url, prefill_status, error_msg
-            );
-
-            let error_response = error::create_error(
-                prefill_status,
-                "prefill_error",
-                format!("Prefill server error ({}): {}", prefill_status, error_msg),
-            );
-            return Err(error_response);
+            return Err(self
+                .handle_prefill_error_response(prefill_response, prefill_url)
+                .await);
         }
 
         // Read prefill body if needed for logprob merging
