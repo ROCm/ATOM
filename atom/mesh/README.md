@@ -39,6 +39,13 @@ Atomesh can also run in an **ATOM standalone** mode. In this mode, Python owns t
   source "$HOME/.cargo/env"
   ```
 
+- **Protocol Buffers compiler (`protoc`)** for the vendored Envoy protocol bindings:
+  ```bash
+  sudo apt-get install protobuf-compiler
+  ```
+- **Python development libraries** for the existing PyO3 bridge; select the interpreter
+  with `PYO3_PYTHON` when needed.
+
 ### Build from source
 
 ```bash
@@ -106,6 +113,16 @@ USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only \
   --worker-urls http://worker1:8000 http://worker2:8000 \
   --policy cache_aware
 ```
+
+### Envoy external processing
+
+Add `--ext-proc` to use the tonic ext-proc gRPC listener for inference. The Axum
+HTTP port retains management, health and auxiliary APIs; direct HTTP inference
+routes are disabled. Envoy forwards Regular requests directly to selected HTTP
+workers; Prefill/Decode mode uses a separate execution listener for the selected
+pair. See [the ext-proc smoke test guide](scripts/ext-proc/README.md) for image
+build and integration test instructions, and the
+[complete Envoy configuration](tests/fixtures/ext-proc/envoy.yaml).
 
 ### Prefill / decode disaggregation
 

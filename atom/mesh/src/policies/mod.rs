@@ -65,6 +65,10 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         false // Default: most policies don't need request text
     }
 
+    fn needs_tokens(&self) -> bool {
+        false
+    }
+
     /// Update worker load information
     ///
     /// This is called periodically with current load information for load-aware policies.

@@ -71,7 +71,7 @@ arc-swap = "1.7.1"
 
 # gRPC and Protobuf dependencies
 mesh_grpc = { package = "smg-grpc-client", version = "=1.0.0" }
-tonic = { version = "0.14.2", features = ["gzip", "transport"] }
+tonic = { version = "0.14.2", features = ["gzip", "transport", "tls-ring"] }
 prost = "0.14.1"
 prost-types = "0.14.1"
 tonic-prost = "0.14.2"
@@ -81,6 +81,7 @@ portpicker = "0.1"
 
 
 [build-dependencies]
+tonic-prost-build = "0.14"
 chrono = { version = "0.4", features = ["clock"] }
 toml = "0.9"
 

@@ -11,6 +11,16 @@ macro_rules! set_env {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tonic_prost_build::configure()
+        .include_file("ext_proc.rs")
+        .compile_protos(
+            &[
+                "proto/envoy/service/ext_proc/v3/external_processor.proto",
+                "proto/grpc/health/v1/health.proto",
+            ],
+            &["proto"],
+        )?;
+    println!("cargo:rerun-if-changed=proto");
     // Rebuild triggers
     println!("cargo:rerun-if-changed=Cargo.toml");
 
