@@ -586,17 +586,6 @@ class BlockManager:
         return int((local_len + self.block_size - 1) // self.block_size)
 
     @property
-    def total_allocatable_kv_blocks(self) -> int:
-        """Physical KV blocks owned by this scheduler-local allocation pool.
-
-        This value is already local to one EngineCore/DP scheduler. Tensor
-        parallel ranks shard the contents of these logical blocks, so callers
-        must neither aggregate another DP pool nor multiply by TP world size.
-        """
-
-        return int(self.kv.num_blocks)
-
-    @property
     def max_pool_tokens(self) -> int:
         """Longest prompt, in global tokens, whose KV fits an entirely empty pool.
 

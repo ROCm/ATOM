@@ -1747,13 +1747,6 @@ def test_slot_load_executor_stays_serial_regardless_of_env(monkeypatch, caplog):
     )
 
 
-@pytest.mark.parametrize("value", ["", "0", "-1", "1.5", "true", "false", "bad"])
-def test_max_pending_saves_rejects_invalid_env(monkeypatch, value):
-    monkeypatch.setenv("OFFLOAD_MAX_PENDING_SAVES", value)
-    with pytest.raises(ValueError, match="max pending saves"):
-        connector_module.max_pending_saves({}, 2)
-
-
 @pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "1.5", "bad"])
 def test_max_pending_saves_rejects_invalid_connector_extra(value):
     with pytest.raises(ValueError, match="max pending saves"):

@@ -599,49 +599,11 @@ class LLMEngine:
             "saved_tokens",
             "loads_pending",
             "saves_pending",
-            "early_released_blocks",
-            "leased_source_blocks",
-            "source_safe_released_blocks",
-            "blocks_waiting_for_store",
-            "abnormal_lease_reclaims",
-            "save_candidates",
-            "save_candidates_finished",
-            "save_committed",
-            "save_admitted",
-            "save_pin_budget_blocks",
-            "save_reserved_blocks",
-            "save_pinned_blocks",
-            "save_pinned_tokens",
-            "save_budget_available_blocks",
-            "save_budget_rejected",
-            "save_budget_rejected_blocks",
-            "save_budget_evicted",
-            "save_budget_evicted_blocks",
-            "save_oversized",
-            "deferred_free_requests",
-            "save_dropped_capacity",
-            "save_dropped_low_value",
-            "save_dropped_terminal_failure",
-            "save_dropped_stale",
-            "save_dropped_tokens_capacity",
-            "save_dropped_tokens_low_value",
-            "save_dropped_tokens_terminal_failure",
-            "save_dropped_tokens_stale",
         )
         offload_totals = {
             key: sum(int(stats.get(key, 0)) for stats in offload_rank_stats)
             for key in offload_keys
         }
-        for key in (
-            "save_candidate_wait_seconds",
-            "save_priority_score",
-            "save_inflight_wait_seconds",
-            "save_pinned_ratio",
-        ):
-            offload_totals[key] = max(
-                (float(stats.get(key, 0.0)) for stats in offload_rank_stats),
-                default=0.0,
-            )
 
         return {
             "enabled": bool(rank_stats),

@@ -115,15 +115,12 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
                 ),
                 minimum=self._image_reservation_bytes,
             )
-            # The parent constructor only initializes the PAGE budget fields.
-            # Bind through the parent as well so ratio/absolute PAGE limits are
-            # enforced for native PAGE+STATE saves.
-            super().bind_block_manager(block_manager)
         except Exception:
             shutdown = getattr(self._mp_adapter, "shutdown", None)
             if callable(shutdown):
                 shutdown()
             raise
+        self._block_manager = block_manager
         self._checkpoints = coordinator
         self._pinned_state_bytes = 0
         self._native_saves: dict[SaveOperationId, _NativeSave] = {}

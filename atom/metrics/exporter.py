@@ -344,81 +344,10 @@ class _AtomMetricsCollector:
                 "Number of tokens saved to LMCache.",
                 offload.get("saved_tokens", 0),
             ),
-            (
-                "atom:lmcache_save_admitted",
-                "Number of LMCache save operations admitted by the scheduler.",
-                offload.get("save_admitted", 0),
-            ),
-            (
-                "atom:lmcache_early_released_blocks",
-                "Number of GPU KV blocks released before save terminal.",
-                offload.get("early_released_blocks", 0),
-            ),
-            (
-                "atom:lmcache_leased_source_blocks",
-                "Number of GPU KV source blocks ever leased to saves.",
-                offload.get("leased_source_blocks", 0),
-            ),
-            (
-                "atom:lmcache_source_safe_released_blocks",
-                "Number of leased GPU KV blocks released at source-safe.",
-                offload.get("source_safe_released_blocks", 0),
-            ),
-            (
-                "atom:lmcache_abnormal_lease_reclaims",
-                "Number of source leases reclaimed after an abnormal timeout.",
-                offload.get("abnormal_lease_reclaims", 0),
-            ),
-            (
-                "atom:lmcache_save_budget_rejected_total",
-                "Number of LMCache save admissions rejected by a hard budget.",
-                offload.get("save_budget_rejected", 0),
-            ),
-            (
-                "atom:lmcache_save_budget_rejected_blocks_total",
-                "Requested PAGE blocks in budget-rejected LMCache saves.",
-                offload.get("save_budget_rejected_blocks", 0),
-            ),
-            (
-                "atom:lmcache_save_budget_evicted_total",
-                "Committed LMCache saves evicted for higher-priority admissions.",
-                offload.get("save_budget_evicted", 0),
-            ),
-            (
-                "atom:lmcache_save_budget_evicted_blocks_total",
-                "Reserved PAGE blocks evicted for higher-priority admissions.",
-                offload.get("save_budget_evicted_blocks", 0),
-            ),
-            (
-                "atom:lmcache_save_oversized_total",
-                "LMCache saves whose source alone exceeded the PAGE budget.",
-                offload.get("save_oversized", 0),
-            ),
         ):
             metric = CounterMetricFamily(name, documentation)
             metric.add_metric([], float(value))
             yield metric
-
-        metric = CounterMetricFamily(
-            "atom:lmcache_save_dropped",
-            "Number of unadmitted LMCache saves dropped by reason.",
-            labels=["reason"],
-        )
-        for reason in ("capacity", "low_value", "terminal_failure", "stale"):
-            metric.add_metric([reason], float(offload.get(f"save_dropped_{reason}", 0)))
-        yield metric
-
-        metric = CounterMetricFamily(
-            "atom:lmcache_save_dropped_tokens",
-            "Number of dirty LMCache save tokens dropped by reason.",
-            labels=["reason"],
-        )
-        for reason in ("capacity", "low_value", "terminal_failure", "stale"):
-            metric.add_metric(
-                [reason],
-                float(offload.get(f"save_dropped_tokens_{reason}", 0)),
-            )
-        yield metric
 
         for name, documentation, value in (
             (
@@ -430,76 +359,6 @@ class _AtomMetricsCollector:
                 "atom:lmcache_saves_pending",
                 "Number of LMCache saves currently in flight.",
                 offload.get("saves_pending", 0),
-            ),
-            (
-                "atom:lmcache_save_candidates",
-                "Number of uncommitted LMCache save candidates.",
-                offload.get("save_candidates", 0),
-            ),
-            (
-                "atom:lmcache_save_candidates_finished",
-                "Number of finished requests still present as save candidates.",
-                offload.get("save_candidates_finished", 0),
-            ),
-            (
-                "atom:lmcache_save_committed",
-                "Number of LMCache saves reserved but not yet dispatched.",
-                offload.get("save_committed", 0),
-            ),
-            (
-                "atom:lmcache_save_candidate_wait_seconds",
-                "Oldest current LMCache save candidate age in seconds.",
-                offload.get("save_candidate_wait_seconds", 0),
-            ),
-            (
-                "atom:lmcache_save_priority_score",
-                "Highest current LMCache save admission score.",
-                offload.get("save_priority_score", 0),
-            ),
-            (
-                "atom:lmcache_save_inflight_wait_seconds",
-                "Oldest current LMCache save operation age in seconds.",
-                offload.get("save_inflight_wait_seconds", 0),
-            ),
-            (
-                "atom:lmcache_save_pin_budget_blocks",
-                "Scheduler-local PAGE block budget for admitted LMCache saves.",
-                offload.get("save_pin_budget_blocks", 0),
-            ),
-            (
-                "atom:lmcache_save_reserved_blocks",
-                "PAGE blocks reserved by committed or active LMCache saves.",
-                offload.get("save_reserved_blocks", 0),
-            ),
-            (
-                "atom:lmcache_save_pinned_blocks",
-                "Unique physical GPU KV blocks held by finished admitted saves.",
-                offload.get("save_pinned_blocks", 0),
-            ),
-            (
-                "atom:lmcache_save_pinned_ratio",
-                "Fraction of the local KV pool reserved or pinned by saves.",
-                offload.get("save_pinned_ratio", 0),
-            ),
-            (
-                "atom:lmcache_save_budget_available_blocks",
-                "Unused scheduler-local LMCache save PAGE budget.",
-                offload.get("save_budget_available_blocks", 0),
-            ),
-            (
-                "atom:lmcache_save_pinned_tokens",
-                "GPU KV token capacity held by finished admitted saves.",
-                offload.get("save_pinned_tokens", 0),
-            ),
-            (
-                "atom:lmcache_deferred_free_requests",
-                "Finished requests awaiting an admitted LMCache save.",
-                offload.get("deferred_free_requests", 0),
-            ),
-            (
-                "atom:lmcache_blocks_waiting_for_store",
-                "Source-safe GPU KV blocks awaiting store terminal.",
-                offload.get("blocks_waiting_for_store", 0),
             ),
         ):
             metric = GaugeMetricFamily(name, documentation)

@@ -8,8 +8,6 @@ from __future__ import annotations
 import logging
 import os
 import time
-from dataclasses import replace
-from math import ceil
 
 from atom.kv_transfer.disaggregation.base import KVConnectorSchedulerBase
 from atom.kv_transfer.disaggregation.types import (
@@ -22,7 +20,6 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._offload_common import (
     OffloadSchedulerMixin,
-    max_pending_saves,
     validated_kv_role,
 )
 from atom.kv_transfer.offload.metadata import (
@@ -31,11 +28,6 @@ from atom.kv_transfer.offload.metadata import (
     LoadSpec,
     SaveSpec,
 )
-from atom.kv_transfer.offload.save_admission import (
-    SaveAdmissionMixin,
-    SaveBlockReservation,
-    SaveCandidate,
-)
 
 logger = logging.getLogger("atom")
 
@@ -43,9 +35,7 @@ DENSE_PAGE_SOURCE_SAFE_CHANNEL = "dense.page.source_safe"
 DENSE_PAGE_STORE_CHANNEL = "dense.page.store"
 
 
-class ChunkedOffloadSchedulerBase(
-    SaveAdmissionMixin, OffloadSchedulerMixin, KVConnectorSchedulerBase
-):
+class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBase):
     """Transport- and layout-neutral policy for chunk-aligned KV offload."""
 
     # Consumer semantics: finished_recving wakes parked seqs (the engine asserts
@@ -108,12 +98,10 @@ class ChunkedOffloadSchedulerBase(
         # prefix is stored to LMCache once prefill computes it
         # (seq.prefix_hashes_published flips True), chunk by chunk.
         self._save_tracker: dict[str, list] = {}
-        self._init_save_admission_state(
-            max_pending_saves=max_pending_saves(
-                kvc,
-                int(os.environ.get("OFFLOAD_COPY_WORKERS", "1") or 1),
-            )
-        )
+        # Round-robin cursor over `_save_tracker`: the last sid that emitted a
+        # save. Subclasses may bound the number of outstanding saves through
+        # `_may_emit_save`; resuming after this sid prevents starvation.
+        self._save_rr_last: str | None = None
         # sid -> exact save generation.  Exact matching prevents a delayed TP
         # notification for an older request lifecycle from releasing the
         # current request's deferred blocks.
@@ -139,6 +127,7 @@ class ChunkedOffloadSchedulerBase(
         self._lookup_in_step: list[str] = []
         self._lookup_results: dict[str, tuple[object, int]] = {}
         self._handoff_loads: set[str] = set()
+        self._block_manager = None
         # Unaligned handoff is always on: when the HBM prefix-cache hit is not
         # chunk-aligned, recompute the misaligned head up to the next chunk
         # boundary, then load the aligned remainder from CPU. (Previously gated
@@ -165,6 +154,11 @@ class ChunkedOffloadSchedulerBase(
                 os.environ.get("OFFLOAD_MIN_SAVE_TOKENS"),
             )
             self._min_save_tokens = 8192
+
+    def bind_block_manager(self, block_manager) -> None:
+        if self._block_manager is not None and self._block_manager is not block_manager:
+            raise RuntimeError("offload scheduler is already bound to a block manager")
+        self._block_manager = block_manager
 
     # -- match: how many extra tokens can come from CPU/NVMe -------------
     def _begin_load_lifecycle(self, seq) -> None:
@@ -277,23 +271,6 @@ class ChunkedOffloadSchedulerBase(
             entry = self._save_tracker.get(sid)
             if entry is None or entry[0] is not seq:
                 self._save_tracker[sid] = [seq, initial_saved]
-                now = time.monotonic()
-                demand_keys = self._prefix_demand.observe(
-                    seq.token_ids,
-                    int(seq.num_prompt_tokens),
-                    now,
-                )
-                self._save_demand_keys[sid] = (seq, demand_keys)
-                self._save_candidate_generation[sid] = (
-                    seq,
-                    self._save_candidate_nonce,
-                )
-                self._save_candidate_nonce += 1
-                previous_committed = self._save_committed.pop(sid, None)
-                if previous_committed is not None:
-                    self._release_save_reservation(sid, owner=previous_committed)
-                self._finished_save_requests.pop(sid, None)
-                self._finished_save_failed.discard(sid)
             else:
                 entry[1] = max(int(entry[1]), initial_saved)
 
@@ -350,119 +327,6 @@ class ChunkedOffloadSchedulerBase(
         """Return whether another save may be emitted this scheduler step."""
         return True
 
-    def _save_count_allows(self, committed_after: int) -> bool:
-        limit = getattr(self, "_max_pending_saves", None)
-        return limit is None or len(self._save_inflight) + committed_after <= limit
-
-    def _save_candidate_is_busy_for_stats(self, sid: str, seq: object) -> bool:
-        operation = self._save_inflight.get(sid)
-        return self._save_operation_owner.get(operation) is seq or (
-            self._save_committed.get(sid) is seq
-        )
-
-    def _deferred_free_save_count(self) -> int:
-        return sum(bool(blocks) for blocks in self._save_lease_blocks.values())
-
-    def _pinned_save_block_ids(self) -> set[int]:
-        pinned: set[int] = set()
-        for blocks in self._save_lease_blocks.values():
-            pinned.update(blocks)
-        return pinned
-
-    def _save_block_usage(
-        self,
-        reservations: dict[str | SaveOperationId, SaveBlockReservation] | None = None,
-    ) -> tuple[int, int, int]:
-        """Return ``(reserved, pinned, total_budget_usage)`` without double count."""
-
-        current = (
-            self._save_block_reservations if reservations is None else reservations
-        )
-        pinned_ids = self._pinned_save_block_ids()
-        reserved_ids: set[int] = set()
-        estimated = 0
-        for reservation in current.values():
-            reserved_ids.update(reservation.block_ids)
-            estimated += int(reservation.estimated_blocks)
-        reserved = len(reserved_ids - pinned_ids) + estimated
-        return reserved, len(pinned_ids), len(pinned_ids | reserved_ids) + estimated
-
-    def _candidate_block_reservation(
-        self,
-        candidate: SaveCandidate,
-        *,
-        priority_score: float,
-    ) -> SaveBlockReservation:
-        source_block_size = int(getattr(self, "virtual_block_size", self.block_size))
-        start_block = candidate.saved // source_block_size
-        end_block = ceil(candidate.aligned / source_block_size)
-        required = max(0, end_block - start_block)
-        table = list(getattr(candidate.seq, "block_table", ()))
-        # A frozen table records old identities only. Once early deallocation
-        # clears the live table those IDs may already belong to another request,
-        # so retain a conservative count rather than a false exact reservation.
-        if candidate.finished and not table:
-            block_ids = frozenset()
-            estimated = required
-        else:
-            available = table[start_block : min(end_block, len(table))]
-            block_ids = frozenset(
-                physical_id
-                for block_id in available
-                if (physical_id := int(block_id)) >= 0
-            )
-            estimated = max(0, required - len(available))
-        return SaveBlockReservation(
-            sid=candidate.sid,
-            seq=candidate.seq,
-            generation=candidate.generation,
-            block_ids=block_ids,
-            estimated_blocks=estimated,
-            priority_score=float(priority_score),
-            committed=True,
-        )
-
-    def _build_save_candidate(
-        self, sid: str, *, now: float | None = None
-    ) -> SaveCandidate | None:
-        entry = self._save_tracker.get(sid)
-        if entry is None:
-            return None
-        seq, saved = entry
-        aligned = self._save_frontier(seq)
-        if aligned <= int(saved):
-            return None
-        candidate_now = time.monotonic() if now is None else float(now)
-        observed_count, reusable_tokens = self._candidate_demand(
-            sid,
-            seq,
-            aligned=aligned,
-            now=candidate_now,
-        )
-        finished = self._finished_save_requests.get(sid) is seq
-        return SaveCandidate(
-            sid=sid,
-            seq=seq,
-            generation=self._candidate_generation_for(sid, seq),
-            saved=int(saved),
-            aligned=aligned,
-            observed_count=observed_count,
-            reusable_tokens=reusable_tokens,
-            enqueued_at=self._candidate_since_for(sid, seq, candidate_now),
-            finished=finished,
-            held_blocks=(
-                len(
-                    getattr(
-                        seq,
-                        "_offload_finished_block_ids",
-                        getattr(seq, "block_table", ()),
-                    )
-                )
-                if finished
-                else 0
-            ),
-        )
-
     def _new_load_operation(self, seq) -> LoadOperationId:
         operation = LoadOperationId(seq.id, self._load_nonce)
         self._load_nonce += 1
@@ -513,125 +377,6 @@ class ChunkedOffloadSchedulerBase(
                 self._block_manager.free_leased_blocks(keep)
             return None
         return target, block_ids, keep
-
-    def _emit_save_candidate(
-        self,
-        meta: LMCacheOffloadMetadata,
-        candidate: SaveCandidate,
-    ) -> bool:
-        sid = candidate.sid
-        seq = candidate.seq
-        entry = self._save_tracker.get(sid)
-        if entry is None or entry[0] is not seq:
-            return False
-        committed_reservation = self._save_block_reservations.get(sid)
-        if (
-            committed_reservation is None
-            or committed_reservation.seq is not seq
-            or committed_reservation.generation != candidate.generation
-            or not committed_reservation.committed
-        ):
-            return False
-        computed = min(
-            int(
-                getattr(
-                    seq,
-                    "_offload_finished_cached_tokens",
-                    getattr(seq, "num_cached_tokens", 0),
-                )
-            ),
-            int(seq.num_prompt_tokens),
-        )
-        is_last_prefill = computed >= int(seq.num_prompt_tokens)
-        aligned = candidate.aligned
-        save_operation = SaveOperationId(seq.id, self._save_nonce)
-        self._save_nonce += 1
-        late_acquired = frozenset()
-        if hasattr(seq, "_offload_finished_block_ids") and not seq.block_table:
-            late_source = self._late_save_source(seq, candidate.saved, aligned)
-            if late_source is None:
-                if candidate.finished:
-                    self.drop_unadmitted_save(seq, reason="stale")
-                else:
-                    self._save_committed.pop(sid, None)
-                    self._release_save_reservation(sid, owner=seq)
-                    self._save_tracker.pop(sid, None)
-                    self._forget_save_candidate(sid, seq)
-                return False
-            aligned, block_ids, late_acquired = late_source
-        else:
-            block_ids = list(seq.block_table)
-        try:
-            request = self._build_save_request(
-                seq,
-                candidate.saved,
-                aligned,
-                save_operation,
-                block_ids,
-                is_last_prefill,
-            )
-        except Exception:
-            if late_acquired:
-                self._block_manager.free_leased_blocks(late_acquired)
-            raise
-        if request is None:
-            if late_acquired:
-                self._block_manager.free_leased_blocks(late_acquired)
-            self._save_committed.pop(sid, None)
-            self._release_save_reservation(sid, owner=seq)
-            if candidate.finished:
-                self.drop_unadmitted_save(seq, reason="capacity")
-            return False
-
-        logger.debug(
-            "[OFFLOAD-SAVE-EMIT] seq=%s computed=%d num_prompt=%d "
-            "aligned=%d saved=%d observed=%d",
-            seq.id,
-            computed,
-            int(seq.num_prompt_tokens),
-            aligned,
-            candidate.saved,
-            candidate.observed_count,
-        )
-        self._track_save_statistics(save_operation, aligned - candidate.saved)
-        self._save_inflight_since[save_operation] = time.monotonic()
-        meta.add_request(request)
-        entry[1] = aligned
-        self._save_committed.pop(sid, None)
-        self._release_save_reservation(sid, owner=seq)
-        self._save_inflight[sid] = save_operation
-        self._refresh_save_reclaim_clock(seq)
-        if getattr(self, "_early_release", False):
-            # Freeze the exact token-index -> block-id mapping before a
-            # finished request clears its block table. The lease itself is
-            # activated only by `activate_block_leases` at teardown.
-            source_block_size = getattr(self, "virtual_block_size", self.block_size)
-            start_block = candidate.saved // source_block_size
-            end_block = -(-aligned // source_block_size)  # ceil div
-            block_map = {
-                index: block_ids[index]
-                for index in range(start_block, min(end_block, len(block_ids)))
-            }
-            self._save_operation_blocks[save_operation] = block_map
-            self._save_operation_safe[save_operation] = set()
-            self._save_operation_owner[save_operation] = seq
-            self._save_block_reservations[save_operation] = replace(
-                committed_reservation,
-                block_ids=frozenset(
-                    int(block_id)
-                    for block_id in block_map.values()
-                    if int(block_id) >= 0
-                ),
-                estimated_blocks=max(0, end_block - start_block - len(block_map)),
-                committed=False,
-            )
-            if late_acquired:
-                self.activate_block_leases(seq, late_acquired)
-        else:
-            self._save_block_reservations[save_operation] = replace(
-                committed_reservation, committed=False
-            )
-        return True
 
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         meta = LMCacheOffloadMetadata()
@@ -703,7 +448,90 @@ class ChunkedOffloadSchedulerBase(
             for sid in self._lookup_in_step
             if sid in loading_sids or sid not in self._load_specs
         ]
-        self._admit_and_emit_save_candidates(meta, loading_sids)
+        # Saves: store fully computed prompt chunks. Under scheduler-side
+        # chunked prefill, seq.num_cached_tokens advances after each prefill
+        # chunk's forward has completed; use it as the D2H-safe frontier.
+        tracker_sids = list(self._save_tracker.keys())
+        if tracker_sids and self._save_rr_last in self._save_tracker:
+            start = (tracker_sids.index(self._save_rr_last) + 1) % len(tracker_sids)
+            tracker_sids = tracker_sids[start:] + tracker_sids[:start]
+        for sid in tracker_sids:
+            entry = self._save_tracker[sid]
+            if not self._do_save:
+                continue
+            if not self._may_emit_save():
+                break
+            seq, saved = entry
+            if sid in self._reqs_need_recv or sid in loading_sids:
+                continue  # loading this step; defer its save
+            if sid in self._save_inflight:
+                continue  # keep at most one save per request in flight
+            computed = min(
+                int(
+                    getattr(
+                        seq,
+                        "_offload_finished_cached_tokens",
+                        getattr(seq, "num_cached_tokens", 0),
+                    )
+                ),
+                int(seq.num_prompt_tokens),
+            )
+            is_last_prefill = computed >= int(seq.num_prompt_tokens)
+            aligned = self._save_frontier(seq)
+            if aligned <= saved:
+                continue
+            logger.debug(
+                "[OFFLOAD-SAVE-EMIT] seq=%s computed=%d num_prompt=%d aligned=%d saved=%d",
+                seq.id,
+                computed,
+                int(seq.num_prompt_tokens),
+                aligned,
+                saved,
+            )
+            save_operation = SaveOperationId(seq.id, self._save_nonce)
+            self._save_nonce += 1
+            late_acquired = frozenset()
+            if hasattr(seq, "_offload_finished_block_ids") and not seq.block_table:
+                late_source = self._late_save_source(seq, saved, aligned)
+                if late_source is None:
+                    self._save_tracker.pop(sid, None)
+                    continue
+                aligned, block_ids, late_acquired = late_source
+            else:
+                block_ids = list(seq.block_table)
+            try:
+                request = self._build_save_request(
+                    seq, saved, aligned, save_operation, block_ids, is_last_prefill
+                )
+            except Exception:
+                if late_acquired:
+                    self._block_manager.free_leased_blocks(late_acquired)
+                raise
+            if request is None:
+                if late_acquired:
+                    self._block_manager.free_leased_blocks(late_acquired)
+                continue
+            self._track_save_statistics(save_operation, aligned - saved)
+            meta.add_request(request)
+            entry[1] = aligned
+            self._save_inflight[sid] = save_operation
+            self._refresh_save_reclaim_clock(seq)
+            self._save_rr_last = sid
+            if getattr(self, "_early_release", False):
+                # Freeze the exact token-index -> block-id mapping before a
+                # finished request clears its block table. The lease itself is
+                # activated only by `activate_block_leases` at teardown.
+                source_block_size = getattr(self, "virtual_block_size", self.block_size)
+                start_block = saved // source_block_size
+                end_block = -(-aligned // source_block_size)  # ceil div
+                self._save_operation_blocks[save_operation] = {
+                    index: block_ids[index]
+                    for index in range(start_block, min(end_block, len(block_ids)))
+                }
+                self._save_operation_safe[save_operation] = set()
+                self._save_operation_owner[save_operation] = seq
+                if late_acquired:
+                    self.activate_block_leases(seq, late_acquired)
         dispatched = set(meta.lookup_requests_in_step)
         for sid in dispatched:
             self._lookup_results.pop(sid, None)
@@ -722,16 +550,6 @@ class ChunkedOffloadSchedulerBase(
         operation_blocks = getattr(self, "_save_operation_blocks", {})
         operation_safe = getattr(self, "_save_operation_safe", {})
         operation_owner = getattr(self, "_save_operation_owner", {})
-        active_operation = self._save_inflight.get(sid)
-        active_owner = operation_owner.get(active_operation)
-        active_entry = self._save_tracker.get(sid)
-        active_save = active_operation is not None and (
-            active_owner is seq
-            or (
-                active_owner is None
-                and (active_entry is None or active_entry[0] is seq)
-            )
-        )
         unsafe_retired_operation = any(
             owner is seq
             and not set(operation_blocks.get(operation, {}).values()).issubset(
@@ -740,8 +558,7 @@ class ChunkedOffloadSchedulerBase(
             for operation, owner in operation_owner.items()
         )
         return (
-            active_save
-            or self._save_committed.get(sid) is seq
+            sid in self._save_inflight
             or self._has_pending_save(seq)
             or unsafe_retired_operation
         )
@@ -781,30 +598,7 @@ class ChunkedOffloadSchedulerBase(
     def activate_block_leases(self, seq, block_ids: frozenset[int]) -> None:
         """Record the refcount shares transferred at request deallocation."""
 
-        if not self._early_release:
-            return
-        sid = str(seq.id)
-        committed = self._save_block_reservations.get(sid)
-        if committed is not None and committed.seq is seq and committed.committed:
-            # The scheduler is about to clear the request's live block table.
-            # Its old physical IDs can be reused, so a not-yet-dispatched save
-            # keeps only a conservative count reservation from this point on.
-            self._save_block_reservations[sid] = replace(
-                committed,
-                block_ids=frozenset(),
-                estimated_blocks=self._reservation_footprint(committed),
-            )
-        for operation, reservation in list(self._save_block_reservations.items()):
-            if (
-                isinstance(operation, SaveOperationId)
-                and reservation.seq is seq
-                and not reservation.committed
-            ):
-                # The future reservation becomes an actual save-owned physical
-                # lease. Removing it before adding the lease avoids double
-                # charging the same IDs during the ownership transition.
-                self._save_block_reservations.pop(operation, None)
-        if not block_ids:
+        if not self._early_release or not block_ids:
             return
         lease_key = id(seq)
         leased = self._save_lease_blocks.setdefault(lease_key, set())
@@ -845,7 +639,6 @@ class ChunkedOffloadSchedulerBase(
             operation = self._save_inflight.get(sid) if sid is not None else None
             if operation in owned_operations:
                 self._save_inflight.pop(sid, None)
-                self._save_inflight_since.pop(operation, None)
                 self._cancel_save_statistics(operation)
             for candidate in [
                 op for op in self._save_operation_blocks if op in owned_operations
@@ -854,19 +647,10 @@ class ChunkedOffloadSchedulerBase(
                 self._save_operation_safe.pop(candidate, None)
                 self._save_operation_owner.pop(candidate, None)
                 self._source_safe_waiting_for_store.pop(candidate, None)
-                self._release_save_reservation(candidate, owner=owner)
             if sid is not None:
                 entry = self._save_tracker.get(sid)
                 if entry is not None and entry[0] is owner:
                     self._save_tracker.pop(sid, None)
-                if self._save_committed.get(sid) is owner:
-                    self._save_committed.pop(sid, None)
-                    self._release_save_reservation(sid, owner=owner)
-                if self._finished_save_requests.get(sid) is owner:
-                    self._finished_save_requests.pop(sid, None)
-                self._finished_save_failed.discard(sid)
-                if owner is not None:
-                    self._forget_save_candidate(sid, owner)
             if blocks:
                 released.append(frozenset(blocks))
                 self.total_abnormal_lease_reclaims += len(blocks)
@@ -897,7 +681,6 @@ class ChunkedOffloadSchedulerBase(
         )
         return (
             bool(self._reqs_need_recv)
-            or bool(self._save_committed)
             or bool(self._save_inflight)
             or bool(getattr(self, "_save_lease_blocks", {}))
             or pending_finished_save
@@ -1003,12 +786,6 @@ class ChunkedOffloadSchedulerBase(
         safe.update(newly_safe)
         if not newly_safe:
             return
-        reservation = self._save_block_reservations.get(operation)
-        if reservation is not None:
-            remaining = reservation.block_ids - newly_safe
-            self._save_block_reservations[operation] = replace(
-                reservation, block_ids=frozenset(remaining)
-            )
         sid = str(operation.req_id)
         owner = self._save_operation_owner.get(operation)
         lease_key = id(owner) if owner is not None else None
@@ -1030,12 +807,10 @@ class ChunkedOffloadSchedulerBase(
             self._save_operation_blocks.pop(operation, None)
             self._save_operation_safe.pop(operation, None)
             self._save_operation_owner.pop(operation, None)
-            self._release_save_reservation(operation)
 
     def _store_finished(self, operation: SaveOperationId, *, succeeded: bool) -> None:
         sid = str(operation.req_id)
         active = self._save_inflight.get(sid)
-        owner = self._save_operation_owner.get(operation)
         if (
             active != operation
             and operation not in self._save_operation_blocks
@@ -1052,23 +827,11 @@ class ChunkedOffloadSchedulerBase(
         else:
             self._cancel_save_statistics(operation)
             # Failed stores keep unsafe ranges leased until abandon timeout.
-            block_map = self._save_operation_blocks.get(operation, {})
-            safe = self._save_operation_safe.get(operation, set())
-            if set(block_map.values()).issubset(safe):
-                # A terminal failure can arrive after every source range became
-                # safe. Retire that exact operation now; otherwise native MP,
-                # whose terminal is also its final source fence, leaks owner and
-                # block-map bookkeeping forever.
-                self._release_operation_lease(operation)
-        self._save_inflight_since.pop(operation, None)
-        if owner is not None and self._finished_save_requests.get(sid) is owner:
-            self._settle_finished_save(sid, failed=not succeeded)
         self._finish_retired_request(sid)
 
     def _release_operation_lease(self, operation) -> None:
         if not isinstance(operation, SaveOperationId):
             return
-        self._release_save_reservation(operation)
         block_map = self._save_operation_blocks.pop(operation, {})
         self._save_operation_safe.pop(operation, None)
         owner = self._save_operation_owner.pop(operation, None)
@@ -1093,13 +856,6 @@ class ChunkedOffloadSchedulerBase(
             seq
         ):
             self._save_tracker.pop(sid, None)
-            if self._save_committed.get(sid) is seq:
-                self._save_committed.pop(sid, None)
-            self._release_save_reservation(sid, owner=seq)
-            if self._finished_save_requests.get(sid) is seq:
-                self._finished_save_requests.pop(sid, None)
-            self._finished_save_failed.discard(sid)
-            self._forget_save_candidate(sid, seq)
 
     def blocks_waiting_for_store(self) -> int:
         return sum(
@@ -1111,9 +867,8 @@ class ChunkedOffloadSchedulerBase(
         sid = str(req_id.req_id if isinstance(req_id, SaveOperationId) else req_id)
         operation = self._save_inflight.pop(sid, None)
         if operation is not None:
-            self._save_inflight_since.pop(operation, None)
             self._cancel_save_statistics(operation)
-        tracker = self._save_tracker.pop(sid, None)
+        self._save_tracker.pop(sid, None)
         owner = self._save_operation_owner.pop(operation, None)
         lease_key = id(owner) if owner is not None else None
         self._save_lease_at.pop(lease_key, None)
@@ -1123,17 +878,6 @@ class ChunkedOffloadSchedulerBase(
             self._save_operation_blocks.pop(operation, None)
             self._save_operation_safe.pop(operation, None)
             self._source_safe_waiting_for_store.pop(operation, None)
-            self._release_save_reservation(operation, owner=owner)
-        committed = self._save_committed.pop(sid, None)
-        if committed is not None:
-            self._release_save_reservation(sid, owner=committed)
-        finished = self._finished_save_requests.pop(sid, None)
-        seq = finished if finished is not None else committed
-        if seq is None and tracker is not None:
-            seq = tracker[0]
-        self._finished_save_failed.discard(sid)
-        if seq is not None:
-            self._forget_save_candidate(sid, seq)
         if blocks:
             self._pending_source_safe_releases.append(frozenset(blocks))
             self.total_abnormal_lease_reclaims += len(blocks)
@@ -1212,25 +956,18 @@ class ChunkedOffloadSchedulerBase(
         self._release_failed_load_attempt(sid, seq)
         entry = self._save_tracker.get(sid)
         if entry is not None and entry[0] is seq:
-            self._finished_save_requests[sid] = seq
-            # Freeze the final source identity before request teardown. A
-            # reservation dispatches on a later metadata build and reacquires
-            # only the still-canonical prefix blocks.
             if self._early_release:
+                # Freeze the final computed frontier before BlockManager
+                # clears it during partial deallocation. Keep the tracker when
+                # a final chunk still needs emission; a later metadata build
+                # uses the frozen block table recorded by
+                # `protected_block_ids`.
                 seq._offload_finished_cached_tokens = min(
                     int(getattr(seq, "num_cached_tokens", 0)),
                     int(seq.num_prompt_tokens),
                 )
-            if sid in self._save_inflight or self._save_committed.get(sid) is seq:
-                pass
-            else:
-                candidate = self._build_save_candidate(sid)
-                if candidate is None:
-                    self._settle_finished_save(sid)
-                elif not self._meets_save_value_threshold(candidate):
-                    self.drop_unadmitted_save(seq, reason="low_value")
-                elif not self._commit_finished_save(candidate):
-                    self.drop_unadmitted_save(seq, reason="capacity")
+            if not self.should_defer_free(seq):
+                self._drop_finished_save_state(sid, seq)
         if hasattr(seq, "_load_operation"):
             delattr(seq, "_load_operation")
 

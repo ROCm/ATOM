@@ -31,8 +31,8 @@ import os
 import threading
 import time
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
-from math import ceil, isfinite
+from dataclasses import dataclass
+from math import isfinite
 from numbers import Integral
 
 import torch
@@ -86,11 +86,6 @@ from atom.kv_transfer.offload.metadata import (
     SaveSpec,
     SlotLoadSpec,
     SlotSaveSpec,
-)
-from atom.kv_transfer.offload.save_admission import (
-    SaveAdmissionMixin,
-    SaveBlockReservation,
-    SaveCandidate,
 )
 
 logger = logging.getLogger("atom")
@@ -155,16 +150,6 @@ def _env_positive_float(name: str, default: float) -> float:
 
 
 @dataclass(frozen=True)
-class _SaveCandidate(SaveCandidate):
-    computed: int
-    sidecar_candidate: tuple[int, int] | None
-
-    @property
-    def page_save_due(self) -> bool:
-        return self.aligned > self.saved
-
-
-@dataclass(frozen=True)
 class _SlotSaveSnapshot:
     """RPC-thread result carried to one background sidecar save."""
 
@@ -172,28 +157,6 @@ class _SlotSaveSnapshot:
     ready_event: object | None
     snapshot_ok: bool
     source_completion_uncertain: bool = False
-
-
-@dataclass
-class _SlotSavePreparation:
-    """Worker-local SLOT preparation state carried through final cleanup."""
-
-    blob: torch.Tensor | None = None
-    snapshot_synchronized: bool = False
-    staging_reusable: bool = True
-    staging_terminalized: bool = False
-    error: Exception | None = None
-    failure_reason: str = "operation"
-
-
-@dataclass(frozen=True)
-class _PageSaveAttempt:
-    """PAGE store measurements used by completion logging."""
-
-    tokens: list[int]
-    skip: int
-    store_ms: float
-    transfer_stats: dict[str, int | float]
 
 
 class _SlotStagingSyncError(RuntimeError):
@@ -1532,263 +1495,6 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             sleep=self._publication_sleep,
         )
 
-    @staticmethod
-    def _synchronize_save_producer(
-        producer_event,
-        slot_snapshot: _SlotSaveSnapshot | None,
-    ) -> bool:
-        """Fence PAGE/SLOT producers and report whether SLOT is covered."""
-
-        if producer_event is None:
-            return False
-        try:
-            producer_event.synchronize()
-        except Exception as exc:
-            if (
-                slot_snapshot is not None
-                and slot_snapshot.staging_id is not None
-                and producer_event is slot_snapshot.ready_event
-            ):
-                raise _SlotStagingSyncError(
-                    "SLOT snapshot completion was not confirmed"
-                ) from exc
-            raise
-        return slot_snapshot is not None and producer_event is slot_snapshot.ready_event
-
-    def _prepare_slot_save(
-        self,
-        req: LMCacheReqMeta,
-        slot_snapshot: _SlotSaveSnapshot | None,
-        *,
-        snapshot_synchronized: bool,
-    ) -> _SlotSavePreparation:
-        """Copy one SLOT snapshot to CPU without preventing the PAGE save."""
-
-        preparation = _SlotSavePreparation(snapshot_synchronized=snapshot_synchronized)
-        try:
-            if (
-                slot_snapshot is None
-                or slot_snapshot.staging_id is None
-                or not slot_snapshot.snapshot_ok
-            ):
-                raise RuntimeError("SLOT snapshot was not acquired successfully")
-
-            if (
-                not preparation.snapshot_synchronized
-                and slot_snapshot.ready_event is not None
-            ):
-                try:
-                    slot_snapshot.ready_event.synchronize()
-                except Exception as exc:
-                    preparation.staging_reusable = False
-                    raise _SlotStagingSyncError(
-                        "SLOT snapshot completion was not confirmed"
-                    ) from exc
-                preparation.snapshot_synchronized = True
-
-            preparation.blob = self._copy_slot_staging_to_cpu(slot_snapshot.staging_id)
-            # D2H completion makes the CPU frame ownership-independent. Release
-            # scarce GPU staging before PAGE publication and sidecar storage.
-            if self._release_slot_staging(
-                req.req_id,
-                slot_snapshot.staging_id,
-                operation="save",
-            ):
-                preparation.staging_terminalized = True
-            else:
-                preparation.staging_reusable = False
-                preparation.staging_terminalized = self._quarantine_slot_staging(
-                    req.req_id,
-                    slot_snapshot.staging_id,
-                    operation="save release failure",
-                )
-                preparation.failure_reason = "staging_cleanup"
-                raise RuntimeError("SLOT staging release failed after D2H")
-        except Exception as exc:  # noqa: BLE001
-            if isinstance(exc, _SlotStagingSyncError):
-                preparation.staging_reusable = False
-            preparation.error = exc
-        return preparation
-
-    def _store_page(
-        self,
-        req: LMCacheReqMeta,
-        page_plan: tuple[list[int], int] | None,
-    ) -> _PageSaveAttempt | None:
-        if page_plan is None:
-            return None
-        tokens, skip = page_plan
-        mask = torch.ones(len(tokens), dtype=torch.bool)
-        mask[:skip] = False
-        started = time.perf_counter()
-        self._reset_gpu_connector_transfer_stats()
-        self._engine.store(
-            tokens_to_tensor(tokens),
-            mask=mask,
-            block_ids=req.block_ids,
-            req_id=str(req.req_id),
-        )
-        return _PageSaveAttempt(
-            tokens=tokens,
-            skip=skip,
-            store_ms=(time.perf_counter() - started) * 1000,
-            transfer_stats=self._last_gpu_connector_transfer_stats(),
-        )
-
-    def _finalize_slot_save_staging(
-        self,
-        req: LMCacheReqMeta,
-        slot_snapshot: _SlotSaveSnapshot | None,
-        preparation: _SlotSavePreparation,
-        *,
-        sidecar_published: bool,
-        failure_reason: str,
-        error_type: str,
-    ) -> tuple[bool, str, str]:
-        """Release or quarantine the SLOT staging row exactly once."""
-
-        if (
-            slot_snapshot is None
-            or slot_snapshot.staging_id is None
-            or preparation.staging_terminalized
-        ):
-            return sidecar_published, failure_reason, error_type
-
-        if (
-            not preparation.snapshot_synchronized
-            and slot_snapshot.ready_event is not None
-        ):
-            try:
-                slot_snapshot.ready_event.synchronize()
-                preparation.snapshot_synchronized = True
-            except Exception:  # noqa: BLE001
-                preparation.staging_reusable = False
-                sidecar_published = False
-                failure_reason = "snapshot_fence"
-                error_type = "SlotSnapshotFenceError"
-
-        if preparation.staging_reusable:
-            released = self._release_slot_staging(
-                req.req_id,
-                slot_snapshot.staging_id,
-                operation="save",
-            )
-            if released:
-                preparation.staging_terminalized = True
-            else:
-                preparation.staging_reusable = False
-                preparation.staging_terminalized = self._quarantine_slot_staging(
-                    req.req_id,
-                    slot_snapshot.staging_id,
-                    operation="save release failure",
-                )
-        else:
-            preparation.staging_terminalized = self._quarantine_slot_staging(
-                req.req_id,
-                slot_snapshot.staging_id,
-                operation="save",
-            )
-            released = False
-
-        if not released:
-            sidecar_published = False
-            failure_reason = "staging_cleanup"
-        return sidecar_published, failure_reason, error_type
-
-    def _report_save_outcome(
-        self,
-        req: LMCacheReqMeta,
-        *,
-        slot_spec: SlotSaveSpec | None,
-        page_stored: bool,
-        sidecar_published: bool,
-        skip: int,
-        failure_reason: str,
-        error_type: str,
-    ) -> None:
-        with self._lock:
-            self._report_page_save_locked(req, succeeded=page_stored)
-            if slot_spec is not None:
-                completed = (
-                    self._done_sidecar_save
-                    if sidecar_published
-                    else self._failed_sidecar_save
-                )
-                completed.add(self._save_completion_id(req))
-
-        if not page_stored and getattr(req, "save_spec", None) is not None:
-            logger.warning(
-                "LMCache offload: PAGE save did not land rank=%s req=%s "
-                "skip=%d reason=%s error_type=%s",
-                getattr(self, "_rank", "?"),
-                req.req_id,
-                skip,
-                failure_reason,
-                error_type,
-            )
-        if slot_spec is None:
-            return
-        if sidecar_published:
-            logger.info(
-                "LMCache offload: SLOT sidecar save published rank=%s "
-                "req=%s boundary=%d",
-                getattr(self, "_rank", "?"),
-                req.req_id,
-                slot_spec.boundary_tokens,
-            )
-        else:
-            logger.warning(
-                "LMCache offload: SLOT sidecar save failed rank=%s "
-                "req=%s boundary=%d reason=%s error_type=%s",
-                getattr(self, "_rank", "?"),
-                req.req_id,
-                slot_spec.boundary_tokens,
-                failure_reason,
-                error_type,
-            )
-
-    def _log_page_save_profile(
-        self,
-        req: LMCacheReqMeta,
-        page_plan: tuple[list[int], int] | None,
-        attempt: _PageSaveAttempt | None,
-        *,
-        started: float,
-    ) -> None:
-        if page_plan is None or not self._profile_enabled():
-            return
-        tokens, skip = page_plan
-        store_ms = 0.0 if attempt is None else attempt.store_ms
-        stats = {} if attempt is None else attempt.transfer_stats
-        logger.info(
-            "[OFFLOAD-SAVE-PROF] rank=%s req=%s toks=%d skip=%d "
-            "chunks=%d groups=%d max_chunk_bytes=%d max_group_bytes=%d "
-            "gpu_staging_chunk_bytes=%d "
-            "gpu_staging_buffer_chunks=%d gpu_staging_buffer_bytes=%d "
-            "total_bytes=%d pack_ms=%.2f copy_ms=%.2f sync_ms=%.2f "
-            "transfer_ms=%.2f effective_gbps=%.2f "
-            "store_ms=%.2f total_ms=%.2f",
-            getattr(self, "_rank", "?"),
-            req.req_id,
-            len(tokens),
-            skip,
-            int(stats.get("chunks", 0)),
-            int(stats.get("groups", 0)),
-            int(stats.get("max_chunk_bytes", 0)),
-            int(stats.get("max_group_bytes", 0)),
-            int(stats.get("gpu_staging_chunk_bytes", 0)),
-            int(stats.get("gpu_staging_buffer_chunks", 0)),
-            int(stats.get("gpu_staging_buffer_bytes", 0)),
-            int(stats.get("total_bytes", 0)),
-            float(stats.get("pack_ms", 0.0)),
-            float(stats.get("copy_ms", 0.0)),
-            float(stats.get("sync_ms", 0.0)),
-            float(stats.get("transfer_ms", 0.0)),
-            float(stats.get("effective_gbps", 0.0)),
-            store_ms,
-            (time.perf_counter() - started) * 1000,
-        )
-
     def _do_save_req(
         self,
         req: LMCacheReqMeta,
@@ -1796,32 +1502,112 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         slot_snapshot: _SlotSaveSnapshot | None = None,
     ) -> None:
         slot_spec = getattr(req, "slot_save_spec", None)
-        preparation = _SlotSavePreparation()
         sidecar_published = False
         save_failure_reason = "operation"
         save_error_type = "none"
+        snapshot_synchronized = False
+        staging_reusable = True
+        staging_terminalized = False
+        slot_blob = None
+        slot_preparation_error: Exception | None = None
         page_plan = None
-        page_attempt = None
         page_stored = False
         t_total0 = time.perf_counter()
+        store_ms = 0.0
+        transfer_stats: dict[str, int | float] = {}
+        toks: list[int] = []
+        skip = 0
         try:
             # For composite saves this is the event recorded after the RPC
             # stream's SLOT snapshot; waiting it also covers PAGE producers.
-            preparation.snapshot_synchronized = self._synchronize_save_producer(
-                producer_event,
-                slot_snapshot,
-            )
+            if producer_event is not None:
+                try:
+                    producer_event.synchronize()
+                except Exception as exc:
+                    if (
+                        slot_snapshot is not None
+                        and slot_snapshot.staging_id is not None
+                        and producer_event is slot_snapshot.ready_event
+                    ):
+                        staging_reusable = False
+                        raise _SlotStagingSyncError(
+                            "SLOT snapshot completion was not confirmed"
+                        ) from exc
+                    raise
+                snapshot_synchronized = (
+                    slot_snapshot is not None
+                    and producer_event is slot_snapshot.ready_event
+                )
 
             if slot_spec is not None:
-                preparation = self._prepare_slot_save(
-                    req,
-                    slot_snapshot,
-                    snapshot_synchronized=preparation.snapshot_synchronized,
-                )
-                save_failure_reason = preparation.failure_reason
+                try:
+                    if (
+                        slot_snapshot is None
+                        or slot_snapshot.staging_id is None
+                        or not slot_snapshot.snapshot_ok
+                    ):
+                        raise RuntimeError(
+                            "SLOT snapshot was not acquired successfully"
+                        )
+
+                    # A caller may supply a PAGE producer event distinct from
+                    # the SLOT-ready event. Fence SLOT explicitly before D2H.
+                    if (
+                        not snapshot_synchronized
+                        and slot_snapshot.ready_event is not None
+                    ):
+                        try:
+                            slot_snapshot.ready_event.synchronize()
+                        except Exception as exc:
+                            staging_reusable = False
+                            raise _SlotStagingSyncError(
+                                "SLOT snapshot completion was not confirmed"
+                            ) from exc
+                        snapshot_synchronized = True
+
+                    slot_blob = self._copy_slot_staging_to_cpu(slot_snapshot.staging_id)
+                    # D2H completion makes the CPU frame ownership-independent.
+                    # Do not hold scarce GPU temp capacity while PAGE/store waits.
+                    released = self._release_slot_staging(
+                        req.req_id,
+                        slot_snapshot.staging_id,
+                        operation="save",
+                    )
+                    if released:
+                        staging_terminalized = True
+                    else:
+                        # Ownership is uncertain after a failed admission
+                        # transition. Keep the row out of circulation.
+                        staging_reusable = False
+                        staging_terminalized = self._quarantine_slot_staging(
+                            req.req_id,
+                            slot_snapshot.staging_id,
+                            operation="save release failure",
+                        )
+                        save_failure_reason = "staging_cleanup"
+                        raise RuntimeError("SLOT staging release failed after D2H")
+                except Exception as exc:  # noqa: BLE001
+                    # PAGE storage is independent and must still run when SLOT
+                    # admission, gather, D2H, or cleanup fails.
+                    if isinstance(exc, _SlotStagingSyncError):
+                        staging_reusable = False
+                    slot_preparation_error = exc
 
             page_plan = self._page_save_plan(req)
-            page_attempt = self._store_page(req, page_plan)
+            if page_plan is not None:
+                toks, skip = page_plan
+                mask = torch.ones(len(toks), dtype=torch.bool)
+                mask[:skip] = False
+                t_store0 = time.perf_counter()
+                self._reset_gpu_connector_transfer_stats()
+                self._engine.store(
+                    tokens_to_tensor(toks),
+                    mask=mask,
+                    block_ids=req.block_ids,
+                    req_id=str(req.req_id),
+                )
+                store_ms = (time.perf_counter() - t_store0) * 1000
+                transfer_stats = self._last_gpu_connector_transfer_stats()
             if slot_spec is None:
                 # PAGE-only save. `store` returning is the only durability
                 # signal that exists here, so it is the verdict; a raise above
@@ -1857,19 +1643,19 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 # and not at the end of the block.
                 page_stored = True
 
-                if preparation.error is not None:
-                    raise preparation.error
+                if slot_preparation_error is not None:
+                    raise slot_preparation_error
                 _, slot_store, _ = self._require_slot_components()
                 checkpoint_codec = self._require_checkpoint_codec()
-                if preparation.blob is None:
+                if slot_blob is None:
                     raise RuntimeError("SLOT CPU frame is unavailable after D2H")
                 checkpoint_codec.finalize_tensor_(
-                    preparation.blob,
+                    slot_blob,
                     boundary_tokens=slot_spec.boundary_tokens,
                     boundary_block_hash=slot_spec.boundary_block_hash,
                 )
                 key = self._slot_key(slot_spec.boundary_block_hash)
-                if not slot_store.put(key, preparation.blob):
+                if not slot_store.put(key, slot_blob):
                     save_failure_reason = "sidecar_submission"
                     raise RuntimeError("SLOT sidecar store rejected put")
                 if not self._wait_for_session_publication(
@@ -1882,7 +1668,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                     )
                 sidecar_published = True
         except _SlotStagingSyncError as exc:
-            preparation.staging_reusable = False
+            staging_reusable = False
             save_failure_reason = "gpu_completion"
             save_error_type = type(exc).__name__
         except Exception as exc:  # noqa: BLE001
@@ -1894,32 +1680,112 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                     save_error_type,
                 )
         finally:
-            sidecar_published, save_failure_reason, save_error_type = (
-                self._finalize_slot_save_staging(
-                    req,
-                    slot_snapshot,
-                    preparation,
-                    sidecar_published=sidecar_published,
-                    failure_reason=save_failure_reason,
-                    error_type=save_error_type,
-                )
-            )
-            self._report_save_outcome(
-                req,
-                slot_spec=slot_spec,
-                page_stored=page_stored,
-                sidecar_published=sidecar_published,
-                skip=0 if page_plan is None else page_plan[1],
-                failure_reason=save_failure_reason,
-                error_type=save_error_type,
-            )
+            if (
+                slot_snapshot is not None
+                and slot_snapshot.staging_id is not None
+                and not staging_terminalized
+            ):
+                if not snapshot_synchronized and slot_snapshot.ready_event is not None:
+                    try:
+                        slot_snapshot.ready_event.synchronize()
+                    except Exception:  # noqa: BLE001
+                        staging_reusable = False
+                        sidecar_published = False
+                        save_failure_reason = "snapshot_fence"
+                        save_error_type = "SlotSnapshotFenceError"
+                if staging_reusable:
+                    released = self._release_slot_staging(
+                        req.req_id,
+                        slot_snapshot.staging_id,
+                        operation="save",
+                    )
+                    if released:
+                        staging_terminalized = True
+                    else:
+                        staging_reusable = False
+                        staging_terminalized = self._quarantine_slot_staging(
+                            req.req_id,
+                            slot_snapshot.staging_id,
+                            operation="save release failure",
+                        )
+                else:
+                    staging_terminalized = self._quarantine_slot_staging(
+                        req.req_id,
+                        slot_snapshot.staging_id,
+                        operation="save",
+                    )
+                    released = False
+                if not released:
+                    sidecar_published = False
+                    save_failure_reason = "staging_cleanup"
 
-        self._log_page_save_profile(
-            req,
-            page_plan,
-            page_attempt,
-            started=t_total0,
-        )
+            with self._lock:
+                self._report_page_save_locked(req, succeeded=page_stored)
+                if slot_spec is not None:
+                    if sidecar_published:
+                        self._done_sidecar_save.add(self._save_completion_id(req))
+                    else:
+                        self._failed_sidecar_save.add(self._save_completion_id(req))
+            if not page_stored and getattr(req, "save_spec", None) is not None:
+                logger.warning(
+                    "LMCache offload: PAGE save did not land rank=%s req=%s "
+                    "skip=%d reason=%s error_type=%s",
+                    getattr(self, "_rank", "?"),
+                    req.req_id,
+                    skip,
+                    save_failure_reason,
+                    save_error_type,
+                )
+            if slot_spec is not None:
+                if sidecar_published:
+                    logger.info(
+                        "LMCache offload: SLOT sidecar save published rank=%s "
+                        "req=%s boundary=%d",
+                        getattr(self, "_rank", "?"),
+                        req.req_id,
+                        slot_spec.boundary_tokens,
+                    )
+                else:
+                    logger.warning(
+                        "LMCache offload: SLOT sidecar save failed rank=%s "
+                        "req=%s boundary=%d reason=%s error_type=%s",
+                        getattr(self, "_rank", "?"),
+                        req.req_id,
+                        slot_spec.boundary_tokens,
+                        save_failure_reason,
+                        save_error_type,
+                    )
+
+        if page_plan is not None and self._profile_enabled():
+            total_ms = (time.perf_counter() - t_total0) * 1000
+            logger.info(
+                "[OFFLOAD-SAVE-PROF] rank=%s req=%s toks=%d skip=%d "
+                "chunks=%d groups=%d max_chunk_bytes=%d max_group_bytes=%d "
+                "gpu_staging_chunk_bytes=%d "
+                "gpu_staging_buffer_chunks=%d gpu_staging_buffer_bytes=%d "
+                "total_bytes=%d pack_ms=%.2f copy_ms=%.2f sync_ms=%.2f "
+                "transfer_ms=%.2f effective_gbps=%.2f "
+                "store_ms=%.2f total_ms=%.2f",
+                getattr(self, "_rank", "?"),
+                req.req_id,
+                len(toks),
+                skip,
+                int(transfer_stats.get("chunks", 0)),
+                int(transfer_stats.get("groups", 0)),
+                int(transfer_stats.get("max_chunk_bytes", 0)),
+                int(transfer_stats.get("max_group_bytes", 0)),
+                int(transfer_stats.get("gpu_staging_chunk_bytes", 0)),
+                int(transfer_stats.get("gpu_staging_buffer_chunks", 0)),
+                int(transfer_stats.get("gpu_staging_buffer_bytes", 0)),
+                int(transfer_stats.get("total_bytes", 0)),
+                float(transfer_stats.get("pack_ms", 0.0)),
+                float(transfer_stats.get("copy_ms", 0.0)),
+                float(transfer_stats.get("sync_ms", 0.0)),
+                float(transfer_stats.get("transfer_ms", 0.0)),
+                float(transfer_stats.get("effective_gbps", 0.0)),
+                store_ms,
+                total_ms,
+            )
 
     # -- per-step (RPC thread, post-forward): poll completions ------------
     def get_finished(self) -> KVConnectorOutput:
@@ -1986,9 +1852,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
 # =====================================================================
 # Scheduler side
 # =====================================================================
-class DSV4OffloadScheduler(
-    SaveAdmissionMixin, OffloadSchedulerMixin, KVConnectorSchedulerBase
-):
+class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
     # Consumer semantics: finished_recving wakes parked seqs (the engine asserts
     # `not is_producer` on that path). Offload never uses finished_sending.
     is_producer = False
@@ -2038,13 +1902,14 @@ class DSV4OffloadScheduler(
         # belongs here: rejecting after dispatch lets TP ranks make different
         # decisions and forces the scheduler to roll the PAGE watermark back.
         # Keep one shared limit for PAGE-only, SLOT-only, and PAGE+SLOT saves.
-        self._init_save_admission_state(
-            max_pending_saves=max_pending_saves(
-                kvc,
-                int(os.environ.get("OFFLOAD_COPY_WORKERS", "1") or 1),
-            )
+        self._max_pending_saves = max_pending_saves(
+            kvc,
+            int(os.environ.get("OFFLOAD_COPY_WORKERS", "1") or 1),
         )
-        self._save_operation_owners: dict[SaveOperationId, object] = {}
+        # Resume after the last admitted request when capacity becomes free so
+        # a long request at the head of the insertion-ordered tracker cannot
+        # monopolize the bounded save queue.
+        self._save_rr_last: str | None = None
         # Scheduler-lifetime completion generation: every emitted save gets a
         # distinct SaveOperationId, so late TP notifications cannot complete a
         # later PAGE/SLOT save after request cleanup or request-ID reuse.
@@ -2057,9 +1922,7 @@ class DSV4OffloadScheduler(
         # ``build_connector_meta`` advances the saved watermark where it *emits*
         # a save, so the advance is a prediction, not a fact. Keep what each one
         # was contingent on so a save that never lands can take its advance back.
-        self._save_watermark_rollback: dict[
-            str, dict[SaveOperationId, tuple[object, int]]
-        ] = {}
+        self._save_watermark_rollback: dict[str, dict[SaveOperationId, int]] = {}
         # Finished requests get a bounded window without successful PAGE saves.
         # Dispatch refreshes the copy-retention clock, not this progress clock.
         self._finished_save_progress_at: dict[str, float] = {}
@@ -2241,23 +2104,6 @@ class DSV4OffloadScheduler(
             entry = self._save_tracker.get(sid)
             if entry is None or entry[0] is not seq:
                 self._save_tracker[sid] = [seq, initial_saved]
-                now = time.monotonic()
-                demand_keys = self._prefix_demand.observe(
-                    seq.token_ids,
-                    int(seq.num_prompt_tokens),
-                    now,
-                )
-                self._save_demand_keys[sid] = (seq, demand_keys)
-                self._save_candidate_generation[sid] = (
-                    seq,
-                    self._save_candidate_nonce,
-                )
-                self._save_candidate_nonce += 1
-                previous_committed = self._save_committed.pop(sid, None)
-                if previous_committed is not None:
-                    self._release_save_reservation(sid, owner=previous_committed)
-                self._finished_save_requests.pop(sid, None)
-                self._finished_save_failed.discard(sid)
                 self._finished_save_progress_at.pop(sid, None)
                 self._sidecar_hash_cache.pop(sid, None)
                 self._failed_sidecar_saves.pop(sid, None)
@@ -2358,7 +2204,15 @@ class DSV4OffloadScheduler(
         self._save_nonce += 1
         return operation
 
-    def _inflight_save_operations(self) -> set[SaveOperationId]:
+    def _may_emit_save(self) -> bool:
+        """Return whether the scheduler may dispatch one more save operation.
+
+        A PAGE+SLOT request is one worker operation even though both completion
+        channels retain its identity. Counting distinct operation IDs keeps the
+        scheduler's view equal to the worker semaphore while old multi-inflight
+        state, if any, drains safely.
+        """
+
         operations = {
             operation
             for inflight in self._save_inflight.values()
@@ -2367,259 +2221,7 @@ class DSV4OffloadScheduler(
         operations.update(
             inflight[0] for inflight in self._sidecar_save_inflight.values()
         )
-        return operations
-
-    def _retire_save_operation_owner(self, operation: SaveOperationId) -> None:
-        if any(operation in inflight for inflight in self._save_inflight.values()):
-            return
-        if any(
-            inflight[0] == operation
-            for inflight in self._sidecar_save_inflight.values()
-        ):
-            return
-        self._save_inflight_since.pop(operation, None)
-        owner = self._save_operation_owners.pop(operation, None)
-        self._release_save_reservation(operation, owner=owner)
-
-    def _may_emit_save(self) -> bool:
-        """Return whether the scheduler may dispatch one more save operation.
-
-        A PAGE+SLOT request is one worker operation even though both completion
-        channels retain its identity. Counting distinct operation IDs keeps the
-        scheduler's view equal to the worker semaphore while old multi-inflight
-        state, if any, drains safely. A committed finished save also consumes a
-        slot: it is guaranteed dispatch on the next metadata build and must not
-        be overbooked by an active request in the meantime.
-        """
-
-        return (
-            len(self._inflight_save_operations()) + len(self._save_committed)
-            < self._max_pending_saves
-        )
-
-    def _save_count_allows(self, committed_after: int) -> bool:
-        return (
-            len(self._inflight_save_operations()) + committed_after
-            <= self._max_pending_saves
-        )
-
-    def _save_candidate_is_inflight(self, sid: str) -> bool:
-        return sid in self._save_inflight or sid in self._sidecar_save_inflight
-
-    def _pinned_save_block_ids(
-        self,
-        reservations: dict[str | SaveOperationId, SaveBlockReservation],
-    ) -> set[int]:
-        pinned: set[int] = set()
-        for reservation in reservations.values():
-            if self._finished_save_requests.get(reservation.sid) is reservation.seq:
-                pinned.update(reservation.block_ids)
-        return pinned
-
-    def _save_block_usage(
-        self,
-        reservations: dict[str | SaveOperationId, SaveBlockReservation] | None = None,
-    ) -> tuple[int, int, int]:
-        """Return ``(reserved, pinned, total_budget_usage)`` without double count."""
-
-        current = (
-            self._save_block_reservations if reservations is None else reservations
-        )
-        pinned_ids = self._pinned_save_block_ids(current)
-        reserved_ids: set[int] = set()
-        pinned_estimated = 0
-        reserved_estimated = 0
-        for reservation in current.values():
-            if self._finished_save_requests.get(reservation.sid) is reservation.seq:
-                pinned_estimated += int(reservation.estimated_blocks)
-            else:
-                reserved_ids.update(reservation.block_ids)
-                reserved_estimated += int(reservation.estimated_blocks)
-        reserved = len(reserved_ids - pinned_ids) + reserved_estimated
-        pinned = len(pinned_ids) + pinned_estimated
-        total = len(pinned_ids | reserved_ids) + pinned_estimated + reserved_estimated
-        return reserved, pinned, total
-
-    def _candidate_block_reservation(
-        self,
-        candidate: _SaveCandidate,
-        *,
-        priority_score: float,
-    ) -> SaveBlockReservation:
-        # DSV4 in this branch cannot release PAGE source ranges independently.
-        # If the request finishes while its PAGE or SLOT save is outstanding,
-        # teardown retains the complete block table. Reserve that exact local
-        # physical footprint up front so admission cannot pretend only the
-        # dirty PAGE interval is pinned.
-        table = list(getattr(candidate.seq, "block_table", ()))
-        physical_ids = [int(block_id) for block_id in table if int(block_id) >= 0]
-        block_ids = frozenset(physical_ids)
-        required_tokens = max(
-            candidate.aligned if candidate.page_save_due else 0,
-            (
-                candidate.sidecar_candidate[0]
-                if candidate.sidecar_candidate is not None
-                else 0
-            ),
-        )
-        required_blocks = ceil(required_tokens / max(1, int(self.block_size)))
-        estimated = max(0, required_blocks - len(physical_ids))
-        return SaveBlockReservation(
-            sid=candidate.sid,
-            seq=candidate.seq,
-            generation=candidate.generation,
-            block_ids=block_ids,
-            estimated_blocks=estimated,
-            priority_score=float(priority_score),
-            committed=True,
-        )
-
-    def _refresh_finished_save_reservations(self, seq) -> None:
-        """Charge every physical block retained by a now-finished request."""
-
-        block_ids = frozenset(
-            physical_id
-            for block_id in getattr(seq, "block_table", ())
-            if (physical_id := int(block_id)) >= 0
-        )
-        for key, reservation in list(self._save_block_reservations.items()):
-            if reservation.seq is seq:
-                self._save_block_reservations[key] = replace(
-                    reservation,
-                    block_ids=block_ids,
-                    estimated_blocks=0,
-                )
-
-    def _build_save_candidate(
-        self, sid: str, *, now: float | None = None
-    ) -> _SaveCandidate | None:
-        entry = self._save_tracker.get(sid)
-        if entry is None:
-            return None
-        seq, saved = entry
-        computed = min(
-            int(getattr(seq, "num_cached_tokens", 0)),
-            int(getattr(seq, "num_prompt_tokens", 0)),
-        )
-        chunk = int(self.chunk_size or 256)
-        aligned = (computed // chunk) * chunk
-        sidecar_candidate = self._sidecar_save_candidate(seq, computed)
-        if aligned <= int(saved) and sidecar_candidate is None:
-            return None
-        candidate_now = time.monotonic() if now is None else float(now)
-        observed_count, reusable_tokens = self._candidate_demand(
-            sid,
-            seq,
-            aligned=aligned,
-            now=candidate_now,
-        )
-        finished = self._finished_save_requests.get(sid) is seq
-        return _SaveCandidate(
-            sid=sid,
-            seq=seq,
-            generation=self._candidate_generation_for(sid, seq),
-            saved=int(saved),
-            computed=computed,
-            aligned=aligned,
-            sidecar_candidate=sidecar_candidate,
-            observed_count=observed_count,
-            reusable_tokens=reusable_tokens,
-            enqueued_at=self._candidate_since_for(sid, seq, candidate_now),
-            finished=finished,
-            held_blocks=len(getattr(seq, "block_table", ())) if finished else 0,
-        )
-
-    def _drop_layout_save_candidate(self, sid: str, seq: object) -> None:
-        """Discard DSV4 PAGE/SLOT state for work that never dispatched."""
-
-        self._failed_sidecar_saves.pop(sid, None)
-        self._save_watermark_rollback.pop(sid, None)
-        cached = self._sidecar_hash_cache.get(sid)
-        if cached is not None and cached[0] is seq:
-            self._sidecar_hash_cache.pop(sid, None)
-
-    def _emit_save_candidate(
-        self,
-        meta: LMCacheOffloadMetadata,
-        candidate: _SaveCandidate,
-    ) -> None:
-        sid = candidate.sid
-        seq = candidate.seq
-        slot_save_spec = None
-        if candidate.sidecar_candidate is not None:
-            boundary, boundary_hash = candidate.sidecar_candidate
-            slot_save_spec = SlotSaveSpec(
-                boundary_tokens=boundary,
-                boundary_block_hash=boundary_hash,
-                source_group=int(seq.state_slot),
-            )
-        token_end = max(
-            candidate.aligned if candidate.page_save_due else 0,
-            (
-                candidate.sidecar_candidate[0]
-                if candidate.sidecar_candidate is not None
-                else 0
-            ),
-        )
-        logger.debug(
-            "[OFFLOAD-SAVE-EMIT] seq=%s computed=%d num_prompt=%d "
-            "aligned=%d saved=%d sidecar=%s observed=%d",
-            seq.id,
-            candidate.computed,
-            int(seq.num_prompt_tokens),
-            candidate.aligned,
-            candidate.saved,
-            candidate.sidecar_candidate,
-            candidate.observed_count,
-        )
-        save_operation = self._next_save_operation(seq)
-        committed_reservation = self._save_block_reservations.get(sid)
-        if (
-            committed_reservation is None
-            or committed_reservation.seq is not seq
-            or committed_reservation.generation != candidate.generation
-            or not committed_reservation.committed
-        ):
-            return
-        self._track_save_statistics(save_operation, candidate.dirty_tokens)
-        self._refresh_save_reclaim_clock(seq)
-        self._save_inflight_since[save_operation] = time.monotonic()
-        self._save_operation_owners[save_operation] = seq
-        meta.add_request(
-            LMCacheReqMeta(
-                req_id=seq.id,
-                token_ids=list(seq.token_ids[:token_end]),
-                block_ids=list(seq.block_table),
-                save_spec=(
-                    SaveSpec(skip_leading_tokens=candidate.saved, can_save=True)
-                    if candidate.page_save_due
-                    else None
-                ),
-                is_last_prefill=(candidate.computed >= int(seq.num_prompt_tokens)),
-                slot_save_spec=slot_save_spec,
-                save_operation=save_operation,
-            )
-        )
-        entry = self._save_tracker.get(sid)
-        if candidate.page_save_due and entry is not None and entry[0] is seq:
-            self._save_watermark_rollback.setdefault(sid, {})[save_operation] = (
-                seq,
-                int(entry[1]),
-            )
-            entry[1] = candidate.aligned
-            self._save_inflight.setdefault(sid, set()).add(save_operation)
-        if candidate.sidecar_candidate is not None:
-            self._sidecar_save_inflight[sid] = (
-                save_operation,
-                candidate.sidecar_candidate[0],
-                candidate.sidecar_candidate[1],
-            )
-        self._save_committed.pop(sid, None)
-        self._release_save_reservation(sid, owner=seq)
-        self._save_block_reservations[save_operation] = replace(
-            committed_reservation,
-            committed=False,
-        )
+        return len(operations) < self._max_pending_saves
 
     def _clear_lookup_status(self, sid: str) -> None:
         if self._lookup_client is None:
@@ -2811,7 +2413,93 @@ class DSV4OffloadScheduler(
         meta.lookup_requests_in_step = [
             sid for sid in self._lookup_in_step if sid not in self._handoff_loads
         ]
-        self._admit_and_emit_save_candidates(meta, loading_sids)
+        # Saves: store fully computed prompt chunks. Under scheduler-side
+        # chunked prefill, seq.num_cached_tokens advances after each prefill
+        # chunk's forward has completed; use it as the D2H-safe frontier.
+        chunk = self.chunk_size or 256
+        tracker_sids = list(self._save_tracker.keys())
+        if tracker_sids and self._save_rr_last in self._save_tracker:
+            start = (tracker_sids.index(self._save_rr_last) + 1) % len(tracker_sids)
+            tracker_sids = tracker_sids[start:] + tracker_sids[:start]
+        for sid in tracker_sids:
+            if not self._do_save or self._save_retries_expired(sid):
+                continue
+            if not self._may_emit_save():
+                break
+            entry = self._save_tracker[sid]
+            seq, saved = entry
+            if sid in self._reqs_need_recv or sid in loading_sids:
+                continue  # loading this step; defer its save
+            if sid in self._save_inflight or sid in self._sidecar_save_inflight:
+                # A request's PAGE and SLOT describe one ordered checkpoint
+                # stream. Do not let a later boundary overtake an earlier save.
+                continue
+            computed = min(
+                int(getattr(seq, "num_cached_tokens", 0)),
+                int(seq.num_prompt_tokens),
+            )
+            is_last_prefill = computed >= int(seq.num_prompt_tokens)
+            aligned = (computed // chunk) * chunk
+            sidecar_candidate = self._sidecar_save_candidate(seq, computed)
+            page_save_due = aligned > saved
+            if not page_save_due and sidecar_candidate is None:
+                continue
+            slot_save_spec = None
+            if sidecar_candidate is not None:
+                boundary, boundary_hash = sidecar_candidate
+                slot_save_spec = SlotSaveSpec(
+                    boundary_tokens=boundary,
+                    boundary_block_hash=boundary_hash,
+                    source_group=int(seq.state_slot),
+                )
+            token_end = max(
+                aligned if page_save_due else 0,
+                sidecar_candidate[0] if sidecar_candidate is not None else 0,
+            )
+            logger.debug(
+                "[OFFLOAD-SAVE-EMIT] seq=%s computed=%d num_prompt=%d "
+                "aligned=%d saved=%d sidecar=%s",
+                seq.id,
+                computed,
+                int(seq.num_prompt_tokens),
+                aligned,
+                saved,
+                sidecar_candidate,
+            )
+            save_operation = self._next_save_operation(seq)
+            self._track_save_statistics(
+                save_operation,
+                aligned - saved if page_save_due else 0,
+            )
+            self._refresh_save_reclaim_clock(seq)
+            meta.add_request(
+                LMCacheReqMeta(
+                    req_id=seq.id,
+                    token_ids=list(seq.token_ids[:token_end]),
+                    block_ids=list(seq.block_table),
+                    save_spec=(
+                        SaveSpec(skip_leading_tokens=saved, can_save=True)
+                        if page_save_due
+                        else None
+                    ),
+                    is_last_prefill=is_last_prefill,
+                    slot_save_spec=slot_save_spec,
+                    save_operation=save_operation,
+                )
+            )
+            if page_save_due:
+                self._save_watermark_rollback.setdefault(sid, {})[save_operation] = int(
+                    entry[1]
+                )
+                entry[1] = aligned
+                self._save_inflight.setdefault(sid, set()).add(save_operation)
+            if sidecar_candidate is not None:
+                self._sidecar_save_inflight[sid] = (
+                    save_operation,
+                    sidecar_candidate[0],
+                    sidecar_candidate[1],
+                )
+            self._save_rr_last = sid
         dispatched = set(meta.lookup_requests_in_step)
         self._lookup_in_step = [
             sid for sid in self._lookup_in_step if sid not in dispatched
@@ -2851,7 +2539,6 @@ class DSV4OffloadScheduler(
         return (
             sid in self._save_inflight
             or sid in self._sidecar_save_inflight
-            or self._save_committed.get(sid) is seq
             or (
                 not self._save_retries_expired(sid)
                 and (self._has_pending_save(seq) or self._has_pending_sidecar_save(seq))
@@ -2864,22 +2551,19 @@ class DSV4OffloadScheduler(
         Feeds ``EngineCore.has_pending_kv_work()``, so it reads only state
         that clears itself: ``_reqs_need_recv`` is emptied by every
         ``build_connector_meta`` and ``_save_inflight`` by ``save_finished``.
-        A priority save committed after its request finished is included even
-        before its next-step dispatch, so an idle engine keeps producing
-        connector metadata until that reservation becomes an operation.
+        Saves that are queued but not yet dispatched are covered there by the
+        scheduler's ``deferred_free_blocks``, which ``should_defer_free``
+        keeps populated for exactly those requests.
         """
         return bool(
-            self._reqs_need_recv
-            or self._save_committed
-            or self._save_inflight
-            or self._sidecar_save_inflight
+            self._reqs_need_recv or self._save_inflight or self._sidecar_save_inflight
         )
 
     @staticmethod
     def _watermark_sid(operation) -> str:
         return str(getattr(operation, "req_id", operation))
 
-    def _forget_save_watermark(self, operation) -> tuple[object, int] | None:
+    def _forget_save_watermark(self, operation) -> int | None:
         """Drop one operation's contingency record, returning what it held."""
         sid = self._watermark_sid(operation)
         pending = self._save_watermark_rollback.get(sid)
@@ -2911,13 +2595,12 @@ class DSV4OffloadScheduler(
         prefix has to be contiguous anyway, so everything beyond the hole was
         unusable regardless.
         """
-        rollback = self._forget_save_watermark(operation)
-        if rollback is None:
+        previous = self._forget_save_watermark(operation)
+        if previous is None:
             return
-        seq, previous = rollback
         sid = self._watermark_sid(operation)
         entry = self._save_tracker.get(sid)
-        if entry is None or entry[0] is not seq:
+        if entry is None:
             return
         current = int(entry[1])
         if current <= previous:
@@ -2934,17 +2617,12 @@ class DSV4OffloadScheduler(
     def save_finished(self, req_id) -> None:
         if isinstance(req_id, SaveOperationId):
             sid = str(req_id.req_id)
-            owner = self._save_operation_owners.get(req_id)
             inflight = self._save_inflight.get(sid)
             if inflight is not None:
                 inflight.discard(req_id)
                 if not inflight:
                     self._save_inflight.pop(sid, None)
-            self._save_inflight_since.pop(req_id, None)
             self._finish_save_statistics(req_id)
-            self._retire_save_operation_owner(req_id)
-            if owner is not None and self._finished_save_requests.get(sid) is owner:
-                self._settle_finished_save(sid)
             return
 
         sid = str(req_id)
@@ -2955,13 +2633,8 @@ class DSV4OffloadScheduler(
             return
         if sid in self._sidecar_save_inflight:
             return
-        retired = self._save_inflight.pop(sid, None)
-        if retired is not None:
-            for operation in retired:
-                self._save_inflight_since.pop(operation, None)
-                self._retire_save_operation_owner(operation)
+        self._save_inflight.pop(sid, None)
         self._finish_save_statistics(req_id)
-        self._settle_finished_save(sid)
 
     def abandon_save(self, req_id) -> None:
         """Force-drop a save the scheduler reclaimed after it stalled.
@@ -2979,34 +2652,14 @@ class DSV4OffloadScheduler(
         entry is dropped so the save loop cannot re-emit against freed blocks.
         """
         sid = str(req_id.req_id if isinstance(req_id, SaveOperationId) else req_id)
-        retired_operations: set[SaveOperationId] = set()
         inflight = self._save_inflight.pop(sid, None)
         if inflight is not None:
             for operation in inflight:
-                retired_operations.add(operation)
-                self._save_inflight_since.pop(operation, None)
-                self._save_operation_owners.pop(operation, None)
                 self._cancel_save_statistics(operation)
         sidecar = self._sidecar_save_inflight.pop(sid, None)
         if sidecar is not None:
-            retired_operations.add(sidecar[0])
-            self._save_inflight_since.pop(sidecar[0], None)
-            self._save_operation_owners.pop(sidecar[0], None)
             self._cancel_save_statistics(sidecar[0])
-        for operation in retired_operations:
-            self._release_save_reservation(operation)
-        committed = self._save_committed.pop(sid, None)
-        if committed is not None:
-            self._release_save_reservation(sid, owner=committed)
-        finished = self._finished_save_requests.pop(sid, None)
-        seq = finished if finished is not None else committed
-        if seq is None:
-            entry = self._save_tracker.get(sid)
-            seq = None if entry is None else entry[0]
         self._save_tracker.pop(sid, None)
-        self._finished_save_failed.discard(sid)
-        if seq is not None:
-            self._forget_save_candidate(sid, seq)
         self._finished_save_progress_at.pop(sid, None)
         # The tracker entry is gone, so there is no longer a watermark to take
         # back; keeping the records would only leak.
@@ -3032,19 +2685,6 @@ class DSV4OffloadScheduler(
             if completion.succeeded:
                 self._release_save_watermark(completion.operation_id)
             else:
-                sid = self._watermark_sid(completion.operation_id)
-                inflight = self._save_inflight.get(sid, set())
-                sidecar = self._sidecar_save_inflight.get(sid)
-                owns_operation = completion.operation_id in inflight or (
-                    sidecar is not None and sidecar[0] == completion.operation_id
-                )
-                owner = self._save_operation_owners.get(completion.operation_id)
-                if (
-                    owns_operation
-                    and owner is not None
-                    and self._finished_save_requests.get(sid) is owner
-                ):
-                    self._finished_save_failed.add(sid)
                 self._rollback_save_watermark(completion.operation_id)
                 # Nothing was persisted, so these bytes must not land in
                 # `total_saved_tokens`; cancelling first makes the
@@ -3070,8 +2710,6 @@ class DSV4OffloadScheduler(
             inflight[0], SaveOperationId
         ):
             return
-        operation = inflight[0]
-        owner = self._save_operation_owners.get(operation)
         self._sidecar_save_inflight.pop(sid, None)
         identity = (inflight[1], inflight[2])
         self._committed_sidecar_hashes.add(identity[1])
@@ -3080,9 +2718,6 @@ class DSV4OffloadScheduler(
             failed.discard(identity)
             if not failed:
                 self._failed_sidecar_saves.pop(sid, None)
-        self._retire_save_operation_owner(operation)
-        if owner is not None and self._finished_save_requests.get(sid) is owner:
-            self._settle_finished_save(sid)
 
     def sidecar_save_failed(self, req_id) -> None:
         sid = str(req_id.req_id if isinstance(req_id, SaveOperationId) else req_id)
@@ -3095,16 +2730,9 @@ class DSV4OffloadScheduler(
             inflight[0], SaveOperationId
         ):
             return
-        operation = inflight[0]
-        owner = self._save_operation_owners.get(operation)
-        if owner is not None and self._finished_save_requests.get(sid) is owner:
-            self._finished_save_failed.add(sid)
         self._sidecar_save_inflight.pop(sid, None)
         identity = (inflight[1], inflight[2])
         self._failed_sidecar_saves.setdefault(sid, set()).add(identity)
-        self._retire_save_operation_owner(operation)
-        if owner is not None and self._finished_save_requests.get(sid) is owner:
-            self._settle_finished_save(sid)
 
     def load_failed(self, req_id) -> bool:
         sid = str(req_id.req_id if isinstance(req_id, LoadOperationId) else req_id)
@@ -3163,14 +2791,6 @@ class DSV4OffloadScheduler(
         self._finished_save_progress_at.pop(sid, None)
         self._failed_sidecar_saves.pop(sid, None)
         self._save_watermark_rollback.pop(sid, None)
-        if self._finished_save_requests.get(sid) is seq:
-            self._finished_save_requests.pop(sid, None)
-        self._finished_save_failed.discard(sid)
-        committed = self._save_committed.get(sid)
-        if committed is seq:
-            self._save_committed.pop(sid, None)
-            self._release_save_reservation(sid, owner=seq)
-        self._forget_save_candidate(sid, seq)
 
     def request_finished(self, seq) -> None:
         sid = str(seq.id)
@@ -3189,24 +2809,6 @@ class DSV4OffloadScheduler(
         entry = self._save_tracker.get(sid)
         if entry is not None and entry[0] is seq:
             self._finished_save_progress_at.setdefault(sid, time.monotonic())
-            self._finished_save_requests[sid] = seq
-            self._refresh_finished_save_reservations(seq)
-            if (
-                sid in self._save_inflight
-                or sid in self._sidecar_save_inflight
-                or self._save_committed.get(sid) is seq
-            ):
-                # Already committed/dispatched. Its terminal callbacks will
-                # either reserve one residual tail or drop it.
-                pass
-            else:
-                candidate = self._build_save_candidate(sid)
-                if candidate is None:
-                    self._settle_finished_save(sid)
-                elif not self._meets_save_value_threshold(candidate):
-                    self.drop_unadmitted_save(seq, reason="low_value")
-                elif not self._commit_finished_save(candidate):
-                    self.drop_unadmitted_save(seq, reason="capacity")
         if not self.should_defer_free(seq):
             self._drop_finished_save_state(sid, seq)
         if hasattr(seq, "_load_operation"):

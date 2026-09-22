@@ -312,23 +312,6 @@ class TestSourceSafeBoundary:
 
 
 class TestIncrementalLeaseRelease:
-    def test_dense_save_admission_bounds_running_plus_queued_work(self, monkeypatch):
-        monkeypatch.setenv("OFFLOAD_MAX_PENDING_SAVES", "1")
-        monkeypatch.setenv("OFFLOAD_SAVE_MIN_OBSERVED_COUNT", "0")
-        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
-        first = _seq(98, num_prompt_tokens=16, num_blocks=4)
-        second = _seq(99, num_prompt_tokens=16, num_blocks=4)
-        for seq in (first, second):
-            scheduler.update_state_after_alloc(seq)
-            seq.num_cached_tokens = 8
-
-        metadata = scheduler.build_connector_meta()
-
-        assert scheduler._max_pending_saves == 1
-        assert [request.req_id for request in metadata.requests] == [first.id]
-        assert set(scheduler._save_inflight) == {str(first.id)}
-        assert str(second.id) not in scheduler._save_tracker
-
     def test_b1_b2_release_while_b3_b8_remain_protected(self, monkeypatch):
         scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
         bm, seq, table = _resident_sequence(scheduler, 100, 48, 12)

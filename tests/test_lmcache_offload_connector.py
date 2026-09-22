@@ -6,7 +6,6 @@ from __future__ import annotations
 import logging
 import sys
 import threading
-import time
 import types
 from collections import deque
 from contextlib import nullcontext
@@ -87,10 +86,6 @@ from atom.kv_transfer.offload.metadata import (
     SlotLoadSpec,
     SlotSaveSpec,
 )
-from atom.kv_transfer.offload.save_admission import (
-    PrefixDemandTracker,
-    load_save_admission_config,
-)
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import OffloadJointRecord, SequenceStatus
@@ -164,41 +159,7 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._hit_save_floors = {}
     sched._save_tracker = {}
     sched._max_pending_saves = 4
-    # Most lifecycle tests below insert tracker entries directly instead of
-    # exercising demand observation. Keep their threshold open; focused
-    # priority-admission tests restore the production default of two.
-    sched._save_min_observed_count = 0
-    sched._save_aging_weight = 0.01
-    sched._save_release_weight = 1.0
-    sched._save_max_pinned_ratio = 0.20
-    sched._save_max_pinned_blocks = None
-    sched._block_manager = None
-    sched._save_pin_total_blocks = 0
-    sched._save_pin_budget_blocks = None
-    sched._save_block_reservations = {}
-    sched._prefix_demand = PrefixDemandTracker(block_tokens=4)
-    sched._save_demand_keys = {}
-    sched._save_candidate_since = {}
-    sched._save_candidate_generation = {}
-    sched._save_candidate_nonce = 0
-    sched._save_committed = {}
-    sched._finished_save_requests = {}
-    sched._finished_save_failed = set()
-    sched._save_inflight_since = {}
-    sched._save_operation_owners = {}
-    sched.total_save_admitted = 0
-    sched.total_save_budget_rejected = 0
-    sched.total_save_budget_rejected_blocks = 0
-    sched.total_save_budget_evicted = 0
-    sched.total_save_budget_evicted_blocks = 0
-    sched.total_save_oversized = 0
-    sched._save_drop_totals = {
-        "capacity": 0,
-        "low_value": 0,
-        "terminal_failure": 0,
-        "stale": 0,
-    }
-    sched._save_drop_token_totals = dict.fromkeys(sched._save_drop_totals, 0)
+    sched._save_rr_last = None
     sched._save_nonce = 0
     sched._load_nonce = 0
     sched._load_lifecycles = {}
@@ -241,56 +202,6 @@ def _stateful_scheduler(hit: int) -> LMCacheOffloadConnectorScheduler:
     sched.sidecar_interval = 8192
     sched._lookup_client = _LookupClient(hit=hit)
     return sched
-
-
-def _priority_scheduler(*, capacity: int = 2) -> LMCacheOffloadConnectorScheduler:
-    sched = _scheduler()
-    sched._max_pending_saves = capacity
-    sched._save_min_observed_count = 2
-    return sched
-
-
-def _priority_seq(
-    sched: LMCacheOffloadConnectorScheduler,
-    *,
-    req_id: int,
-    token_ids: list[int],
-    computed: int | None = None,
-) -> SimpleNamespace:
-    seq = SimpleNamespace(
-        id=req_id,
-        token_ids=token_ids,
-        block_table=list(
-            range((len(token_ids) + sched.block_size - 1) // sched.block_size)
-        ),
-        num_prompt_tokens=len(token_ids),
-        num_cached_tokens=len(token_ids) if computed is None else computed,
-        has_per_req_cache=False,
-    )
-    sched.update_state_after_alloc(seq)
-    return seq
-
-
-def _set_save_budget(
-    sched: LMCacheOffloadConnectorScheduler,
-    *,
-    total_blocks: int,
-    ratio: float = 0.30,
-    absolute: int | None = None,
-) -> None:
-    sched._save_max_pinned_ratio = ratio
-    sched._save_max_pinned_blocks = absolute
-    sched.bind_block_manager(SimpleNamespace(total_allocatable_kv_blocks=total_blocks))
-
-
-def _observe_priority(
-    sched: LMCacheOffloadConnectorScheduler,
-    seq: SimpleNamespace,
-    count: int,
-) -> None:
-    # update_state_after_alloc records the first observation.
-    for _ in range(max(0, count - 1)):
-        sched._prefix_demand.observe(seq.token_ids, seq.num_prompt_tokens)
 
 
 def _stateful_seq(
@@ -352,23 +263,6 @@ def test_bounded_commit_index_touching_duplicate_refreshes_recency():
 
     assert set(index) == {1, 3}
     assert len(index) == 2
-
-
-def test_prefix_demand_tracker_counts_without_publishing_route_ownership():
-    now = [10.0]
-    tracker = PrefixDemandTracker(
-        block_tokens=4,
-        ttl_seconds=5,
-        clock=lambda: now[0],
-    )
-    tokens = list(range(8))
-
-    keys = tracker.observe(tokens, len(tokens))
-    tracker.observe(tokens, len(tokens))
-
-    assert tracker.heat(keys, max_tokens=8) == (2, 8)
-    now[0] = 16.0
-    assert tracker.heat(keys, max_tokens=8) == (0, 0)
 
 
 @pytest.mark.parametrize(
@@ -5130,7 +5024,7 @@ def test_each_dispatched_save_gets_a_full_source_retention_window():
     sched._refresh_save_reclaim_clock(SimpleNamespace(id=12))
 
 
-def test_dsv4_save_admission_is_bounded_and_drops_unadmitted_work():
+def test_dsv4_save_admission_is_bounded_and_round_robin():
     sched = _scheduler()
     sched._max_pending_saves = 2
     for req_id in (100, 101, 102):
@@ -5148,449 +5042,12 @@ def test_dsv4_save_admission_is_bounded_and_drops_unadmitted_work():
     assert [request.req_id for request in first.requests] == [100, 101]
     assert sched._may_emit_save() is False
 
-    # A candidate that could not reserve capacity was rejected rather than
-    # retained behind the admitted work.
-    assert "102" not in sched._save_tracker
+    # The worker has one slot again. Resume after the last admitted request,
+    # rather than letting request 100 win the queue repeatedly.
     sched.save_finished(first.requests[0].save_operation)
     second = sched.build_connector_meta()
-    assert second.requests == []
-
-
-def test_dsv4_priority_save_admits_hotter_prefix_first():
-    sched = _priority_scheduler(capacity=1)
-    hot = _priority_seq(sched, req_id=200, token_ids=list(range(8)))
-    _priority_seq(sched, req_id=201, token_ids=list(range(20, 28)))
-    sched._prefix_demand.observe(hot.token_ids, hot.num_prompt_tokens)
-
-    meta = sched.build_connector_meta()
-
-    assert [request.req_id for request in meta.requests] == [200]
-    assert sched.total_save_admitted == 1
-
-
-def test_dsv4_priority_save_prefers_less_dirty_work_at_equal_value():
-    sched = _priority_scheduler(capacity=1)
-    short = _priority_seq(sched, req_id=202, token_ids=list(range(4)))
-    long = _priority_seq(sched, req_id=203, token_ids=list(range(20, 28)))
-    sched._prefix_demand.observe(short.token_ids, short.num_prompt_tokens)
-    sched._prefix_demand.observe(long.token_ids, long.num_prompt_tokens)
-
-    meta = sched.build_connector_meta()
-
-    assert [request.req_id for request in meta.requests] == [202]
-
-
-def test_dsv4_priority_save_order_is_stable_for_equal_candidates():
-    sched = _priority_scheduler(capacity=1)
-    later_id = _priority_seq(sched, req_id=205, token_ids=list(range(8)))
-    earlier_id = _priority_seq(sched, req_id=204, token_ids=list(range(20, 28)))
-    sched._prefix_demand.observe(later_id.token_ids, later_id.num_prompt_tokens)
-    sched._prefix_demand.observe(earlier_id.token_ids, earlier_id.num_prompt_tokens)
-    # Remove enqueue time as a tie-break so the stable request/generation key
-    # is the deciding order regardless of tracker insertion order.
-    same_time = time.monotonic()
-    sched._save_candidate_since["205"] = (later_id, same_time)
-    sched._save_candidate_since["204"] = (earlier_id, same_time)
-
-    meta = sched.build_connector_meta()
-
-    assert [request.req_id for request in meta.requests] == [204]
-
-
-def test_dsv4_priority_aging_can_break_a_value_tie_without_bypassing_floor():
-    sched = _priority_scheduler(capacity=1)
-    sched._save_aging_weight = 100
-    old = _priority_seq(sched, req_id=212, token_ids=list(range(8)))
-    newer = _priority_seq(sched, req_id=213, token_ids=list(range(20, 28)))
-    sched._prefix_demand.observe(old.token_ids, old.num_prompt_tokens)
-    sched._prefix_demand.observe(newer.token_ids, newer.num_prompt_tokens)
-    sched._prefix_demand.observe(newer.token_ids, newer.num_prompt_tokens)
-    now = time.monotonic()
-    sched._save_candidate_since["212"] = (old, now - 1)
-    sched._save_candidate_since["213"] = (newer, now)
-
-    meta = sched.build_connector_meta()
-
-    assert [request.req_id for request in meta.requests] == [212]
-
-
-def test_save_pin_ratio_is_validated_and_capped_at_thirty_percent(monkeypatch):
-    monkeypatch.setenv("OFFLOAD_SAVE_MAX_PINNED_RATIO", "0.30")
-    assert load_save_admission_config().max_pinned_ratio == pytest.approx(0.30)
-
-    monkeypatch.setenv("OFFLOAD_SAVE_MAX_PINNED_RATIO", "0.300001")
-    with pytest.raises(ValueError, match="at most 0.30"):
-        load_save_admission_config()
-
-
-def test_dsv4_save_budget_uses_dp_local_pool_and_absolute_clamp():
-    sched = _priority_scheduler(capacity=8)
-    sched._save_max_pinned_ratio = 0.30
-    sched._save_max_pinned_blocks = 17
-    manager = SimpleNamespace(
-        total_allocatable_kv_blocks=100,
-        tensor_parallel_world_size=8,
-    )
-
-    sched.bind_block_manager(manager)
-
-    assert sched._save_pin_total_blocks == 100
-    assert sched._save_pin_budget_blocks == 17
-
-
-def test_dsv4_zero_save_budget_rejects_without_deferring_free():
-    sched = _priority_scheduler(capacity=2)
-    _set_save_budget(sched, total_blocks=10, absolute=0)
-    seq = _priority_seq(sched, req_id=220, token_ids=list(range(8)))
-    _observe_priority(sched, seq, 2)
-
-    sched.request_finished(seq)
-
-    assert "220" not in sched._save_tracker
-    assert "220" not in sched._save_committed
-    assert sched.should_defer_free(seq) is False
-    stats = sched.get_statistics()
-    assert stats["save_budget_rejected"] == 1
-    assert stats["save_budget_rejected_blocks"] == 2
-    assert stats["save_oversized"] == 1
-
-
-def test_dsv4_finished_budget_rejection_stops_deferring_free():
-    sched = _scheduler()
-    _set_save_budget(sched, total_blocks=10, absolute=0)
-    seq = _priority_seq(sched, req_id=238, token_ids=list(range(8)))
-    sched.request_finished(seq)
-
-    assert sched.should_defer_free(seq) is False
-    assert "238" not in sched._save_tracker
-    assert sched.total_save_budget_rejected == 1
-
-
-def test_dsv4_save_budget_counts_shared_physical_ids_once():
-    sched = _priority_scheduler(capacity=2)
-    _set_save_budget(sched, total_blocks=10, absolute=3)
-    first = _priority_seq(sched, req_id=221, token_ids=list(range(8)))
-    first.block_table = [1, 2]
-    second = _priority_seq(sched, req_id=222, token_ids=list(range(20, 28)))
-    second.block_table = [2, 3]
-    _observe_priority(sched, first, 2)
-    _observe_priority(sched, second, 2)
-
-    sched.request_finished(first)
-    sched.request_finished(second)
-
-    assert set(sched._save_committed) == {"221", "222"}
-    stats = sched.get_statistics()
-    assert stats["save_pinned_blocks"] == 3
-    assert stats["save_budget_available_blocks"] == 0
-
-
-def test_dsv4_higher_priority_candidate_replaces_lower_committed_save():
-    sched = _priority_scheduler(capacity=2)
-    sched._save_aging_weight = 0
-    _set_save_budget(sched, total_blocks=10, absolute=2)
-    low = _priority_seq(sched, req_id=223, token_ids=list(range(8)))
-    low.block_table = [1, 2]
-    _observe_priority(sched, low, 2)
-    sched.request_finished(low)
-
-    high = _priority_seq(sched, req_id=224, token_ids=list(range(20, 28)))
-    high.block_table = [3, 4]
-    _observe_priority(sched, high, 3)
-    sched.request_finished(high)
-
-    assert sched._save_committed == {"224": high}
-    assert "223" not in sched._save_tracker
-    assert sched.should_defer_free(low) is False
-    assert sched.total_save_budget_evicted == 1
-    assert sched.total_save_budget_evicted_blocks == 2
-
-
-def test_dsv4_priority_replacement_can_evict_multiple_committed_saves():
-    sched = _priority_scheduler(capacity=3)
-    sched._save_aging_weight = 0
-    _set_save_budget(sched, total_blocks=20, absolute=4)
-    low_a = _priority_seq(sched, req_id=225, token_ids=list(range(8)))
-    low_a.block_table = [1, 2]
-    low_b = _priority_seq(sched, req_id=226, token_ids=list(range(20, 28)))
-    low_b.block_table = [3, 4]
-    for seq in (low_a, low_b):
-        _observe_priority(sched, seq, 2)
-        sched.request_finished(seq)
-
-    high = _priority_seq(sched, req_id=227, token_ids=list(range(40, 52)))
-    high.block_table = [5, 6, 7]
-    _observe_priority(sched, high, 4)
-    sched.request_finished(high)
-
-    assert sched._save_committed == {"227": high}
-    assert "225" not in sched._save_tracker
-    assert "226" not in sched._save_tracker
-    assert sched.total_save_budget_evicted == 2
-    assert sched.total_save_budget_evicted_blocks == 4
-
-
-def test_dsv4_failed_replacement_simulation_evicts_nothing():
-    sched = _priority_scheduler(capacity=3)
-    sched._save_aging_weight = 0
-    _set_save_budget(sched, total_blocks=20, absolute=4)
-    low_a = _priority_seq(sched, req_id=228, token_ids=list(range(8)))
-    low_a.block_table = [1, 2]
-    low_b = _priority_seq(sched, req_id=229, token_ids=list(range(20, 28)))
-    low_b.block_table = [3, 4]
-    for seq in (low_a, low_b):
-        _observe_priority(sched, seq, 2)
-        sched.request_finished(seq)
-
-    oversized = _priority_seq(sched, req_id=230, token_ids=list(range(40, 60)))
-    oversized.block_table = [5, 6, 7, 8, 9]
-    _observe_priority(sched, oversized, 5)
-    sched.request_finished(oversized)
-
-    assert set(sched._save_committed) == {"228", "229"}
-    assert "230" not in sched._save_tracker
-    assert sched.total_save_budget_evicted == 0
-    assert sched.total_save_budget_rejected == 1
-    assert sched.total_save_oversized == 1
-
-
-def test_dsv4_equal_priority_candidate_cannot_replace_committed_save():
-    sched = _priority_scheduler(capacity=2)
-    sched._save_aging_weight = 0
-    _set_save_budget(sched, total_blocks=10, absolute=2)
-    first = _priority_seq(sched, req_id=231, token_ids=list(range(8)))
-    first.block_table = [1, 2]
-    _observe_priority(sched, first, 2)
-    sched.request_finished(first)
-
-    equal = _priority_seq(sched, req_id=232, token_ids=list(range(20, 28)))
-    equal.block_table = [3, 4]
-    _observe_priority(sched, equal, 2)
-    sched.request_finished(equal)
-
-    assert sched._save_committed == {"231": first}
-    assert "232" not in sched._save_tracker
-    assert sched.total_save_budget_evicted == 0
-
-
-def test_dsv4_inflight_page_slot_save_is_never_an_eviction_victim():
-    sched = _stateful_scheduler(hit=0)
-    sched._save_min_observed_count = 2
-    sched._save_aging_weight = 0
-    sched._max_pending_saves = 2
-    _set_save_budget(sched, total_blocks=200, absolute=32)
-    low = _stateful_seq(
-        req_id=233,
-        num_prompt_tokens=8192,
-        num_cached_tokens=8192,
-        group=2,
-    )
-    low.block_table = list(range(32))
-    sched.update_state_after_alloc(low)
-    _observe_priority(sched, low, 2)
-    request = sched.build_connector_meta().requests[0]
-    assert request.save_spec is not None
-    assert request.slot_save_spec is not None
-
-    high = _stateful_seq(
-        req_id=234,
-        num_prompt_tokens=8192,
-        num_cached_tokens=8192,
-        group=3,
-    )
-    high.token_ids = list(range(10000, 18192))
-    high.block_table = list(range(32, 64))
-    sched.update_state_after_alloc(high)
-    _observe_priority(sched, high, 4)
-    sched.request_finished(high)
-
-    assert request.save_operation in sched._save_inflight["233"]
-    assert sched._sidecar_save_inflight["233"][0] == request.save_operation
-    assert request.save_operation in sched._save_block_reservations
-    assert "234" not in sched._save_tracker
-    assert sched.total_save_budget_evicted == 0
-
-
-def test_dsv4_request_id_reuse_releases_old_committed_reservation():
-    sched = _priority_scheduler(capacity=2)
-    _set_save_budget(sched, total_blocks=10, absolute=2)
-    old = _priority_seq(sched, req_id=235, token_ids=list(range(8)))
-    _observe_priority(sched, old, 2)
-    sched.request_finished(old)
-    assert "235" in sched._save_block_reservations
-
-    new = _priority_seq(sched, req_id=235, token_ids=list(range(20, 28)))
-
-    assert sched._save_tracker["235"][0] is new
-    assert "235" not in sched._save_committed
-    assert "235" not in sched._save_block_reservations
-    assert sched.should_defer_free(old) is False
-
-
-def test_dsv4_page_slot_replacement_is_atomic():
-    sched = _stateful_scheduler(hit=0)
-    sched._save_min_observed_count = 2
-    sched._save_aging_weight = 0
-    sched._max_pending_saves = 2
-    _set_save_budget(sched, total_blocks=200, absolute=32)
-    low = _stateful_seq(
-        req_id=236,
-        num_prompt_tokens=8192,
-        num_cached_tokens=8192,
-        group=2,
-    )
-    low.block_table = list(range(32))
-    sched.update_state_after_alloc(low)
-    _observe_priority(sched, low, 2)
-    assert sched._build_save_candidate("236").sidecar_candidate is not None
-    sched.request_finished(low)
-
-    high = _stateful_seq(
-        req_id=237,
-        num_prompt_tokens=8192,
-        num_cached_tokens=8192,
-        group=3,
-    )
-    high.token_ids = list(range(10000, 18192))
-    high.block_table = list(range(32, 64))
-    sched.update_state_after_alloc(high)
-    _observe_priority(sched, high, 4)
-    sched.request_finished(high)
-
-    assert sched._save_committed == {"237": high}
-    assert "236" not in sched._save_tracker
-    assert "236" not in sched._sidecar_save_inflight
-    assert set(sched._save_block_reservations) == {"237"}
-
-
-def test_dsv4_priority_finished_candidate_commits_then_dispatches():
-    sched = _priority_scheduler(capacity=1)
-    seq = _priority_seq(sched, req_id=206, token_ids=list(range(8)))
-    sched._prefix_demand.observe(seq.token_ids, seq.num_prompt_tokens)
-
-    sched.request_finished(seq)
-
-    assert sched._save_committed == {"206": seq}
-    assert sched.should_defer_free(seq) is True
-    stats = sched.get_statistics()
-    assert stats["save_admitted"] == 1
-    assert stats["save_committed"] == 1
-    assert stats["save_pinned_blocks"] == 2
-    assert stats["deferred_free_requests"] == 1
-    request = sched.build_connector_meta().requests[0]
-    assert request.req_id == 206
-    assert "206" not in sched._save_committed
-    assert request.save_operation in sched._save_inflight["206"]
-
-
-def test_dsv4_priority_finished_candidate_drops_when_capacity_is_full():
-    sched = _priority_scheduler(capacity=1)
-    busy = _priority_seq(sched, req_id=207, token_ids=list(range(8)))
-    sched._prefix_demand.observe(busy.token_ids, busy.num_prompt_tokens)
-    assert sched.build_connector_meta().requests[0].req_id == 207
-
-    seq = _priority_seq(sched, req_id=208, token_ids=list(range(20, 28)))
-    sched._prefix_demand.observe(seq.token_ids, seq.num_prompt_tokens)
-    sched.request_finished(seq)
-
-    assert "208" not in sched._save_tracker
-    assert sched.should_defer_free(seq) is False
-    stats = sched.get_statistics()
-    assert stats["save_dropped_capacity"] == 1
-    assert stats["save_dropped_tokens_capacity"] == 8
-
-
-def test_dsv4_priority_finished_inflight_residual_is_committed_once():
-    sched = _priority_scheduler(capacity=1)
-    seq = _priority_seq(
-        sched,
-        req_id=209,
-        token_ids=list(range(8)),
-        computed=4,
-    )
-    sched._prefix_demand.observe(seq.token_ids, seq.num_prompt_tokens)
-    first = sched.build_connector_meta().requests[0]
-
-    seq.num_cached_tokens = 8
-    sched.request_finished(seq)
-    assert sched.should_defer_free(seq) is True
-
-    sched.connector_completion(
-        ConnectorCompletion(DSV4_PAGE_SAVE_CHANNEL, first.save_operation, True)
-    )
-    sched.save_finished(first.save_operation)
-
-    assert sched._save_committed == {"209": seq}
-    second = sched.build_connector_meta().requests[0]
-    assert second.save_spec.skip_leading_tokens == 4
-    assert sched.total_save_admitted == 2
-
-
-def test_dsv4_priority_failed_finished_save_drops_residual_instead_of_retrying():
-    sched = _priority_scheduler(capacity=1)
-    seq = _priority_seq(
-        sched,
-        req_id=210,
-        token_ids=list(range(8)),
-        computed=4,
-    )
-    sched._prefix_demand.observe(seq.token_ids, seq.num_prompt_tokens)
-    first = sched.build_connector_meta().requests[0]
-    seq.num_cached_tokens = 8
-    sched.request_finished(seq)
-
-    sched.connector_completion(
-        ConnectorCompletion(DSV4_PAGE_SAVE_CHANNEL, first.save_operation, False)
-    )
-    sched.save_finished(first.save_operation)
-
-    assert "210" not in sched._save_tracker
-    assert "210" not in sched._save_committed
-    assert sched.should_defer_free(seq) is False
-    assert sched.get_statistics()["save_dropped_terminal_failure"] == 1
-
-
-def test_dsv4_priority_late_failure_does_not_touch_reused_request_id():
-    sched = _priority_scheduler(capacity=1)
-    old = _priority_seq(sched, req_id=211, token_ids=list(range(8)), computed=4)
-    sched._prefix_demand.observe(old.token_ids, old.num_prompt_tokens)
-    operation = sched.build_connector_meta().requests[0].save_operation
-    old.num_cached_tokens = 8
-    sched.request_finished(old)
-
-    new = _priority_seq(
-        sched,
-        req_id=211,
-        token_ids=list(range(20, 28)),
-        computed=8,
-    )
-    sched.connector_completion(
-        ConnectorCompletion(DSV4_PAGE_SAVE_CHANNEL, operation, False)
-    )
-    sched.save_finished(operation)
-
-    assert sched._save_tracker["211"] == [new, 0]
-    assert "211" not in sched._finished_save_failed
-
-
-def test_dsv4_priority_drop_removes_page_and_sidecar_candidate_together():
-    sched = _stateful_scheduler(hit=0)
-    sched._save_min_observed_count = 2
-    seq = _stateful_seq(
-        req_id=214,
-        num_prompt_tokens=8192,
-        num_cached_tokens=8192,
-        group=2,
-    )
-    sched.update_state_after_alloc(seq)
-
-    sched.request_finished(seq)
-
-    assert "214" not in sched._save_tracker
-    assert "214" not in sched._save_committed
-    assert "214" not in sched._sidecar_save_inflight
-    assert sched._committed_sidecar_hashes == set()
-    assert sched.should_defer_free(seq) is False
+    assert [request.req_id for request in second.requests] == [102]
+    assert sched._may_emit_save() is False
 
 
 def test_dsv4_page_and_sidecar_share_one_admission_slot():
@@ -6011,19 +5468,7 @@ def test_scheduler_offload_statistics_are_cumulative():
     sched.load_finished("1")
     sched.save_finished("2")
 
-    stats = sched.get_statistics()
-    assert {
-        key: stats[key]
-        for key in (
-            "load_requests",
-            "loaded_tokens",
-            "load_failures",
-            "save_requests",
-            "saved_tokens",
-            "loads_pending",
-            "saves_pending",
-        )
-    } == {
+    assert sched.get_statistics() == {
         "load_requests": 1,
         "loaded_tokens": 8192,
         "load_failures": 0,
@@ -6317,8 +5762,8 @@ def _k3_scheduler() -> KimiK3OffloadScheduler:
     s = KimiK3OffloadScheduler.__new__(KimiK3OffloadScheduler)
     s.chunk_size = 256
     s._save_inflight = {}
-    s._save_committed = {}
     s._save_tracker = {}
+    s._save_rr_last = None
     s._pending_state_loads = []
     s._pending_state_stores = []
     s._save_inflight_since = {}
@@ -6343,6 +5788,59 @@ def _k3_seq(*, hbm: int, joint: int = 0, kv: int = 0, claimed: int = 0):
             claim_tokens=claimed,
         ),
     )
+
+
+def test_bounded_saves_are_shared_round_robin_not_head_first():
+    """With a bounded ``_may_emit_save`` (kimi_k3 caps outstanding saves), the
+    save scan must rotate over ``_save_tracker`` so a long multi-chunk request
+    at the insertion-ordered head cannot re-win the freed slot every step and
+    starve later requests -- whose blocks stay pinned by ``should_defer_free``
+    until their save drains. Without the round-robin cursor the emission order
+    would be [100, 100, 100]; with it, each request gets a turn."""
+
+    class _Cap1(DenseOffloadScheduler):
+        def _may_emit_save(self):  # one save outstanding at a time
+            return len(self._save_inflight) < 1
+
+        def _track_save_statistics(self, *a, **k):
+            pass
+
+    s = _Cap1.__new__(_Cap1)
+    s.chunk_size = 256
+    s.block_size = 256
+    s._do_save = True
+    s._do_load = False
+    s._reqs_need_recv = {}
+    s._lookup_in_step = []
+    s._save_tracker = {}
+    s._save_inflight = {}
+    s._save_nonce = 0
+    s._save_rr_last = None
+
+    seqs = {}
+    for i in range(3):
+        sid = str(100 + i)
+        seq = SimpleNamespace(
+            id=100 + i,
+            num_prompt_tokens=4096,
+            token_ids=list(range(4096)),
+            num_cached_tokens=0,
+            block_table=list(range(16)),
+        )
+        s._save_tracker[sid] = [seq, 0]
+        seqs[sid] = seq
+
+    emitted = []
+    for _ in range(3):
+        for seq in seqs.values():  # every request computes one more chunk
+            seq.num_cached_tokens += 256
+        meta = s.build_connector_meta()
+        saves = [r for r in meta.requests if r.save_spec is not None]
+        assert len(saves) == 1  # the cap admits exactly one per step
+        emitted.append(str(saves[0].req_id))
+        s._save_inflight.clear()  # that save completes, freeing the one slot
+
+    assert emitted == ["100", "101", "102"]
 
 
 def test_layout_selection_picks_kimi_k3_for_a_kda_config():
@@ -6592,9 +6090,6 @@ def test_no_more_saves_go_out_than_the_pool_can_afford_to_pin():
 
     s._save_inflight = {"1": object()}
     assert s._may_emit_save() is True
-    s._save_committed = {"2": object()}
-    assert s._may_emit_save() is False
-    s._save_committed = {}
     s._save_stalled = True
     assert s._may_emit_save() is False
 
