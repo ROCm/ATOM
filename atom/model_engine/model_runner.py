@@ -41,6 +41,16 @@ from atom.distributed.pp_comm import (
     recv_intermediate_tensors,
 )
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
+from atom.distributed.ulysses_sp import (
+    attn_head_shard_size,
+    get_sp_world_size,
+    set_sp_world_size,
+    sp_gather_tokens,
+    sp_is_enabled,
+    sp_local_slice,
+    sp_pad_len,
+    sp_split_tokens,
+)
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
@@ -631,11 +641,17 @@ class ModelRunner:
         self.block_size = config.kv_cache_block_size
         self.kv_cache_dtype = config.kv_cache_dtype
         self.enforce_eager = config.enforce_eager
-        # world_size: the logical TP width, i.e. how many shards each weight is
-        # cut into -- what the KV-head math below divides by.
-        # tp_world_size: how many of those shards have a process.
-        # They differ only under simulated TP.
-        self.world_size = config.tensor_parallel_size
+        # world_size: how many ways the attention heads are split -- what the
+        # KV-head math below divides by. TP splits them once; Ulysses SP splits
+        # them again after its all-to-all, so a rank owning 1/(tp*sp) of the
+        # heads must size its KV cache for exactly that share. It also keeps
+        # `logits_in_graph` off under SP, where the hidden states need a
+        # cross-rank gather before the LM head can run.
+        # tp_world_size: how many TP shards have a process.
+        # They differ under simulated TP and under SP.
+        self.world_size = (
+            config.tensor_parallel_size * config.sequence_parallel_size
+        )
         self.tp_world_size = config.tp_world_size
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.tp_world_size}"
@@ -873,6 +889,10 @@ class ModelRunner:
         return 0
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
+        # Publish the SP width before anything sizes itself by head count: the
+        # attention layers, the KV pool and the metadata builder all divide by
+        # it during model construction, which happens right after this.
+        set_sp_world_size(config.sequence_parallel_size)
         # Calculate local device rank considering DP, PP and PCP.
         # On a single node the physical GPU index equals the global distributed
         # rank in the DPxPPxPCPxTP layout: each EngineCore (one per (dp,pp)
@@ -1270,6 +1290,15 @@ class ModelRunner:
                 dtype=hidden_type,
             ),
         }
+        if sp_is_enabled():
+            # Ulysses feeds the model this rank's token chunk, so a graph has to
+            # be captured against a buffer of that width rather than a slice of
+            # the global one. `positions` needs no twin: it is passed whole.
+            self.forward_vars["sp_input_ids"] = torch.empty(
+                sp_pad_len(self.max_num_batched_tokens) // get_sp_world_size(),
+                dtype=self.tokenID_processor.input_ids.gpu.dtype,
+                device=self.device,
+            )
         if self.use_mrope:
             self.forward_vars["mrope_positions"] = CpuGpuBuffer(
                 3, self.max_num_batched_tokens, **i64_kwargs
@@ -1407,6 +1436,29 @@ class ModelRunner:
         if len(self._fv_ring) == 1:
             return
         self._fv_slot_events[self._fv_idx].record()
+
+    def sp_local_tokens(self, num_tokens: int) -> int:
+        """Rows of the model input this rank owns for a step of `num_tokens`."""
+        if not sp_is_enabled():
+            return num_tokens
+        return sp_pad_len(num_tokens) // get_sp_world_size()
+
+    def sp_graph_input_ids(self, num_tokens: int) -> torch.Tensor:
+        """This rank's token chunk, staged into its own fixed-address buffer.
+
+        A captured graph reads one address, so the shard cannot be a fresh
+        slice each step; it is copied into `sp_input_ids` instead. The tail
+        past the real tokens is zeroed rather than left stale so a padded
+        decode never feeds the LM head an id from a previous step.
+        """
+        local = self.sp_local_tokens(num_tokens)
+        buf = self.forward_vars["sp_input_ids"]
+        src = self.forward_vars["input_ids"].gpu
+        padded = sp_pad_len(num_tokens)
+        if padded > num_tokens:
+            src[num_tokens:padded].zero_()
+        buf[:local].copy_(src[sp_local_slice(num_tokens)])
+        return buf[:local]
 
     def _get_num_kv_heads(self):
         """Return the per-rank number of KV heads."""
@@ -2814,6 +2866,14 @@ class ModelRunner:
                 input_ids, positions, _pcp_bal_groups, _pcp_size, forward_context
             )
 
+        # Ulysses SP: hand the model only this rank's token chunk. `positions`
+        # stays whole -- it is consumed inside the attention op, which by then
+        # has all-to-all'd its way back to the full sequence, and its length is
+        # how that op tells the real tokens from the divisibility pad.
+        sp_total_tokens = input_ids.shape[0]
+        if sp_is_enabled():
+            input_ids = sp_split_tokens(input_ids)
+
         if not forward_mode.use_cudagraph:
             # prefill, or decode forced eager (enforce_eager / DP peer
             # prefill / bs above the largest captured graph).
@@ -2912,6 +2972,7 @@ class ModelRunner:
                         model_output = self._restore_pcp_balanced_output(
                             model_output, _pcp_bal_groups, _pcp_size
                         )
+                    model_output = sp_gather_tokens(model_output, sp_total_tokens)
                     # Middle chunk: no logits, but drafter needs hidden states.
                     hidden_states = model_output
                     logits = None
@@ -2920,6 +2981,10 @@ class ModelRunner:
                         model_output = self._restore_pcp_balanced_output(
                             model_output, _pcp_bal_groups, _pcp_size
                         )
+                    # The LM head picks each request's last row out of the whole
+                    # sequence (cu_seqlens_q), so the token shards have to be
+                    # back together before logits.
+                    model_output = sp_gather_tokens(model_output, sp_total_tokens)
                     hidden_states = model_output
                     logits = self.model.compute_logits(hidden_states)
         else:
@@ -2956,9 +3021,13 @@ class ModelRunner:
                     forward_context.batch_descriptor = BatchDescriptor(
                         num_tokens=running_tokens
                     )
-                    model_output = self.model(
-                        self.forward_vars["input_ids"].gpu[:running_tokens], _pos
+                    _ids = (
+                        self.sp_graph_input_ids(running_tokens)
+                        if sp_is_enabled()
+                        else self.forward_vars["input_ids"].gpu[:running_tokens]
                     )
+                    model_output = self.model(_ids, _pos)
+                    model_output = sp_gather_tokens(model_output, running_tokens)
                     forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE
                     forward_context.batch_descriptor = None
                     # model_output is always a plain Tensor; drafter aux capture
@@ -2978,6 +3047,17 @@ class ModelRunner:
                     return logits, hidden_states
 
                 graph_key = (running_bs, forward_context.attn_metadata.max_seqlen_q)
+                if sp_is_enabled():
+                    # Stage this rank's chunk into the address the graph
+                    # captured, then put the shards back together after replay:
+                    # the graph produced only 1/sp of the rows.
+                    self.sp_graph_input_ids(running_tokens)
+                    self.graphs[graph_key].replay()
+                    local = self.sp_local_tokens(running_tokens)
+                    hidden_states = sp_gather_tokens(
+                        self.forward_vars["outputs"][:local], running_tokens
+                    )[:scheduled_tokens]
+                    return self.model.compute_logits(hidden_states), hidden_states
                 self.graphs[graph_key].replay()
                 hidden_states = self.forward_vars["outputs"][:scheduled_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
@@ -3941,10 +4021,19 @@ class ModelRunner:
                         if self.use_mrope
                         else positions[:num_tokens]
                     )
-                    model_output = self.model(input_ids[:num_tokens], model_positions)
-                    outputs[:num_tokens] = model_output
+                    # Ulysses runs the model on this rank's token chunk while
+                    # positions stay whole, so the graph is captured at the
+                    # local width and writes that many output rows.
+                    local_tokens = self.sp_local_tokens(num_tokens)
+                    model_ids = (
+                        self.sp_graph_input_ids(num_tokens)
+                        if sp_is_enabled()
+                        else input_ids[:num_tokens]
+                    )
+                    model_output = self.model(model_ids, model_positions)
+                    outputs[:local_tokens] = model_output
                     if self.logits_in_graph:
-                        self.model.compute_logits(outputs[:num_tokens])
+                        self.model.compute_logits(outputs[:local_tokens])
 
                     if _piecewise:
                         # PIECEWISE: no manual whole-forward graph; the compiled
@@ -3952,7 +4041,7 @@ class ModelRunner:
                         fc = get_forward_context()
                         fc.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
                         fc.batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
-                        self.model(input_ids[:num_tokens], model_positions)
+                        self.model(model_ids, model_positions)
                         fc.cudagraph_runtime_mode = CUDAGraphMode.NONE
                         fc.batch_descriptor = None
                         self._piecewise_captured_tokens.add(num_tokens)
@@ -4001,12 +4090,12 @@ class ModelRunner:
                                 graph, self.graph_pool, stream=capture_ctx.stream
                             ):
                                 model_output = self.model(
-                                    input_ids[:num_tokens], model_positions
+                                    model_ids, model_positions
                                 )
-                                outputs[:num_tokens] = model_output
+                                outputs[:local_tokens] = model_output
                                 if self.logits_in_graph:
                                     graph_logits = self.model.compute_logits(
-                                        outputs[:num_tokens]
+                                        outputs[:local_tokens]
                                     )
                     if self.graph_pool is None:
                         self.graph_pool = graph.pool()

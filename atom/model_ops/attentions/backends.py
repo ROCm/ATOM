@@ -16,6 +16,7 @@ from torch import nn
 
 from atom.config import DCPConfig
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
+from atom.distributed.ulysses_sp import attn_head_shard_size
 from atom.model_engine.page_unit_checkpoint import (
     CheckpointRestoreOp,
     CheckpointStoreOp,
@@ -487,7 +488,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         # need a kernel-minimum-padded count set `self.padded_num_attention_heads`
         # separately (it does NOT replace this attribute).
         self.num_attention_heads = (
-            hf_config.num_attention_heads // get_tp_group().world_size
+            hf_config.num_attention_heads // attn_head_shard_size()
         )
 
         i64_kwargs = {"dtype": torch.int64, "device": self.device}

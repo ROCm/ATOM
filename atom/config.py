@@ -1921,6 +1921,12 @@ class Config:
     dcp_config: DCPConfig = field(default_factory=DCPConfig)
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
+    # Ulysses sequence parallel width. Shards tokens across the group for every
+    # layer but attention, which instead trades sequence for heads through two
+    # all-to-alls (atom/distributed/ulysses_sp.py). Rides on the PCP rank
+    # dimension, so `__post_init__` mirrors it into
+    # `prefill_context_parallel_size`; read the SP width from this field.
+    sequence_parallel_size: int = 1
     enforce_eager: bool = False
     # Number of vocabulary positions that carry a real token. A checkpoint
     # whose embedding matrix is padded up to a friendlier width -- Qwen3 rounds
@@ -2086,6 +2092,42 @@ class Config:
         if len(sizes) == 1:
             return [1, 2, 4, 8] + list(range(16, sizes[0] + 1, 16))
         return list(sizes)
+
+    def _init_sequence_parallel(self) -> None:
+        """Validate Ulysses SP and lay it onto the PCP rank dimension.
+
+        SP replaces TP rather than composing with it: TP shards the attention
+        heads, and Ulysses needs every head present on every rank before the
+        all-to-all can redistribute them. The MoE is the exception -- its
+        weights are far too large to replicate -- so the SP dimension is folded
+        back into the expert layer's sharding (``FusedMoEParallelConfig.make``).
+        """
+        sp = self.sequence_parallel_size
+        if self.tensor_parallel_size != 1:
+            raise ValueError(
+                f"--sequence-parallel-size {sp} requires --tensor-parallel-size 1: "
+                "Ulysses SP replaces TP (it needs unsharded heads to redistribute "
+                "and unsharded weights to run on its token shard). Use "
+                f"-tp 1 -sp {sp} on the same {sp} GPUs."
+            )
+        if self.prefill_context_parallel_size not in (1, sp):
+            raise ValueError(
+                "--sequence-parallel-size and --prefill-context-parallel-size "
+                "both claim the same rank dimension; set only one."
+            )
+        # Local import: atom.utils pulls in atom.config at module scope.
+        from atom.utils import get_hf_text_config
+
+        hf_text = get_hf_text_config(self.hf_config)
+        for name in ("num_attention_heads", "num_key_value_heads"):
+            heads = getattr(hf_text, name, None)
+            if heads is not None and heads % sp:
+                raise ValueError(
+                    f"--sequence-parallel-size {sp} must divide {name} ({heads}): "
+                    "Ulysses splits attention by head, so a rank cannot own a "
+                    "fraction of one."
+                )
+        self.prefill_context_parallel_size = sp
 
     def __post_init__(self):
         self.moe_all2all_backend = (
@@ -2263,6 +2305,10 @@ class Config:
         # Multimodal config (full config with vision_config) for vision encoder init
         self.multimodal_config = getattr(self.hf_config, "_multimodal_config", None)
         _normalize_moe_config_fields(self.hf_config, self.model)
+        # After the config normalizers, so the head counts SP divides by are
+        # the final ones.
+        if self.sequence_parallel_size > 1:
+            self._init_sequence_parallel()
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
         # Synthesize when missing or None so GPT-OSS YaRN (rope_type in rope_scaling) is preserved.
         if getattr(self.hf_config, "rope_parameters", None) is None:
@@ -2603,6 +2649,10 @@ class Config:
         # runtime — the same stale-artifact hazard documented for the vocab-embed
         # flag below.
         factors.append(self.prefill_context_parallel_size)
+        # Ulysses SP shares the pcp width above but compiles to a different
+        # graph: the attention op carries two extra all-to-alls and the per-rank
+        # head counts shrink, so an sp run must not reuse a pcp artifact.
+        factors.append(self.sequence_parallel_size)
         # MiniMax-M3 indexer-only CP changes the FUSED QKV OUTPUT WIDTH: index_q
         # is this rank's one head under TP and all `sparse_num_index_heads` of
         # them under CP (minimax_m3.py, linear.py), so the traced graph and the
