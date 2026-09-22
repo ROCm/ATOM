@@ -214,8 +214,12 @@ Serving follows the no-offload DPA settings in
 [`DeepSeek-V4-Agentic-PD-Max.md`](../../recipes/DeepSeek-V4-Agentic-PD-Max.md):
 FP8 KV, FP4 index cache, DSpark K3 with benchmark-only AL 3.01, and TBO on
 prefill only. P/D `max-num-seqs` is 256 / 384 / 512; decode captures dense
-per-rank sizes 1..32 / 1..48 / 1..64. Routing uses the same DP-aware
-`dp_sticky` path as the existing GLM DPA CI. Both KV connectors are plain
-Mooncake; there is no LMCache CPU/NVMe pool or THP/HIP/HSA override. Evals are
+per-rank sizes 1..32 / 1..48 / 1..64. All three V4 DPA cases explicitly use
+DP-aware `cache_aware` routing on both P and D. The launch script preserves this
+selection instead of replacing it with the GLM Agentic+DPA `dp_sticky` default.
+Cache threshold is 0.8, absolute/relative load thresholds are 20/2.0, and the
+eviction interval is 300 seconds, matching the InferenceX V4 baseline. TW uses
+P/D rank mapping `none`. Both KV connectors are plain Mooncake; there is no
+LMCache CPU/NVMe pool or THP/HIP/HSA override. Evals are
 disabled for these diagnostic throughput cases. GPU CI must still establish
 startup and throughput behavior.
