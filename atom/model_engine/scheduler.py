@@ -703,12 +703,12 @@ class Scheduler:
 
         self.prefill_delayer: PrefillDelayer | None = None
         self._local_prefill_coalescing = False
-        self._inflight_prefix_wait: tuple[int, int] | None = None
+        self._inflight_prefix_wait: dict[int, int] = {}
 
     def set_prefill_delayer(self, delayer) -> None:
         self.prefill_delayer = delayer
         self._local_prefill_coalescing = delayer is not None and delayer.is_local
-        self._inflight_prefix_wait = None
+        self._inflight_prefix_wait = {}
 
     def _wait_for_inflight_prefix(self, seq: Sequence, cached_tokens: int) -> bool:
         """Bounded wait for a hybrid producer's planned prompt-end checkpoint."""
@@ -722,14 +722,8 @@ class Scheduler:
             or seq.multimodal_data is not None
         ):
             return False
-        if self._inflight_prefix_wait is not None:
-            waiting_id, deadline = self._inflight_prefix_wait
-            if waiting_id == seq.id and self._schedule_tick >= deadline:
-                return False
-        if (
-            delayer.max_queue_ms is not None
-            and (time.time() - seq.arrive_time) * 1000 >= delayer.max_queue_ms
-        ):
+        deadline = self._inflight_prefix_wait.get(seq.id)
+        if deadline is not None and self._schedule_tick >= deadline:
             return False
         for producer in self.running:
             anchor = producer.checkpoint_end_pos
@@ -762,14 +756,9 @@ class Scheduler:
                 np.frombuffer(seq.token_ids, dtype=np.int32, count=anchor),
                 np.frombuffer(producer.token_ids, dtype=np.int32, count=anchor),
             ):
-                if (
-                    self._inflight_prefix_wait is None
-                    or self._inflight_prefix_wait[0] != seq.id
-                ):
-                    self._inflight_prefix_wait = (
-                        seq.id,
-                        self._schedule_tick + delayer.ttft_max_ticks,
-                    )
+                self._inflight_prefix_wait.setdefault(
+                    seq.id, self._schedule_tick + delayer.ttft_max_ticks
+                )
                 return True
         return False
 
@@ -1558,6 +1547,8 @@ class Scheduler:
                 num_scheduled_tokens.append(chunk)
 
         # ---- Phase 2: new requests from waiting ----
+        prefix_waiters: deque[Sequence] = deque()
+        prefix_bypass_left = min(16, self.max_num_seqs)
         while (
             delayer_allows
             and (self.delay_factor <= 0 or self._passed_delay(time.time()))
@@ -1565,6 +1556,10 @@ class Scheduler:
             and num_seqs_prefill < self.max_num_seqs
             and num_batched_tokens < self.max_num_batched_tokens
         ):
+            if prefix_waiters:
+                if prefix_bypass_left == 0:
+                    break
+                prefix_bypass_left -= 1
             seq = self.waiting.popleft()
 
             # Client disconnected before this seq ever ran: it holds no KV yet
@@ -1595,6 +1590,7 @@ class Scheduler:
             # Re-check here (not just at submit) since pool state may change.
             unschedulable = self._unschedulable_reason(seq)
             if unschedulable is not None:
+                self._inflight_prefix_wait.pop(seq.id, None)
                 seq.status = SequenceStatus.FINISHED
                 seq.leave_reason = f"unschedulable: {unschedulable}"
                 seq.multimodal_data = None
@@ -1717,14 +1713,17 @@ class Scheduler:
             )
             if (
                 self._local_prefill_coalescing
-                and not needs_remote_load
-                and not seq.offload_joint.kv_prefix_tokens
+                and (not needs_remote_load or self._connector_flag("is_offload"))
                 and self._wait_for_inflight_prefix(
-                    seq, num_cached_blocks * self.block_manager.hash_block_size
+                    seq,
+                    max(
+                        num_cached_blocks * self.block_manager.hash_block_size,
+                        seq.offload_joint.kv_prefix_tokens,
+                    ),
                 )
             ):
-                self.waiting.appendleft(seq)
-                break
+                prefix_waiters.append(seq)
+                continue
             atomic_prefill = self._requires_atomic_prefill(seq)
             if (
                 not atomic_prefill
@@ -1787,6 +1786,7 @@ class Scheduler:
                         self.waiting.appendleft(seq)
                         break
                 self._park_for_remote_load(seq, skipped_waiting_requests)
+                self._inflight_prefix_wait.pop(seq.id, None)
                 continue
 
             if seq.offload_joint.boundary_tokens:
@@ -1823,6 +1823,7 @@ class Scheduler:
                 # same wake-up -- because to the scheduler both are one event:
                 # a transfer into blocks this request already holds.
                 self._park_for_remote_load(seq, skipped_waiting_requests)
+                self._inflight_prefix_wait.pop(seq.id, None)
                 continue
 
             # Refresh, not a duplicate of the set above: that one is guarded
@@ -1863,6 +1864,7 @@ class Scheduler:
                 num_seqs_prefill,
                 num_batched_tokens,
             )
+            self._inflight_prefix_wait.pop(seq.id, None)
 
         if skipped_waiting_requests:
             logger.debug(
@@ -1870,6 +1872,10 @@ class Scheduler:
                 len(skipped_waiting_requests),
             )
             self.waiting.extend(skipped_waiting_requests)
+        if prefix_waiters:
+            # Keep deferred requests in arrival order while bounded lookahead
+            # admits independent work without extending their deadlines.
+            self.waiting.extendleft(reversed(prefix_waiters))
 
         if self._num_parked_remote_kv > 0 and self._schedule_tick % 1000 == 0:
             logger.info(
@@ -2209,6 +2215,7 @@ class Scheduler:
         return True
 
     def _reject_aborted_waiting(self, seq: Sequence) -> None:
+        self._inflight_prefix_wait.pop(seq.id, None)
         has_inflight_load = bool(getattr(seq, "_counted_as_inflight_load", False))
         seq.status = SequenceStatus.FINISHED
         seq.leave_reason = "aborted"

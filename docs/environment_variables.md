@@ -29,11 +29,16 @@ bounds decide when to release. `MAX_QUEUE_MS` stops extra coalescing after that
 interval; it does not guarantee end-to-end TTFT. DP decisions reduce local
 signals across ranks to keep their phases aligned.
 
-Local hybrid models with state checkpointing also wait briefly for an in-flight
-producer's reusable prompt-end checkpoint. This preserves queue order, bypasses
-requests with remote KV matches, and expires after `TTFT_MAX_TICKS` scheduler
-passes or `MAX_QUEUE_MS` since arrival, whichever applies first. Pure-attention
-models use the coalescer without this checkpoint wait.
+Local hybrid models with state checkpointing can wait for an in-flight
+producer's reusable prompt-end checkpoint. The expected prefix must exceed both
+the HBM hit and any offload match by at least one prefill budget. P/D transfers
+and already-started offload loads keep their own progress paths. Deferred
+requests retain their relative order, while at most 16 later queue entries are
+examined for independent work each pass. Each request's wait expires after
+`TTFT_MAX_TICKS` scheduler passes from its first dependency wait; bypassing it
+does not restart that deadline. `MAX_QUEUE_MS` bounds coalescing, not this
+dependency wait: time spent queued before a producer becomes runnable does not
+make duplicate prefill useful. Pure-attention models do not use checkpoint waits.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
@@ -44,7 +49,7 @@ models use the coalescer without this checkpoint wait.
 | **ATOM_PREFILL_DELAYER_STALL_TICKS** | int | 10 | After this many consecutive non-growing ticks, release (burst ended, more won't come). Values `< 1` clamped to 1. |
 | **ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK** | float | 0.9 | At/above this KV usage a prefillable rank force-releases (can't accumulate a bigger batch anyway). |
 | **ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK** | float\|"" | "" (None) | If set, a prefillable rank below this KV usage force-releases (GPU starving). |
-| **ATOM_PREFILL_DELAYER_MAX_QUEUE_MS** | float\|"" | "" (None) | After decode protection, release coalescing when the oldest schedulable waiting prefill reaches this age since arrival. Also bounds local checkpoint waits. Empty disables the age guard. This is not a hard TTFT limit. |
+| **ATOM_PREFILL_DELAYER_MAX_QUEUE_MS** | float\|"" | "" (None) | After decode protection, release coalescing when the oldest schedulable waiting prefill reaches this age since arrival. Empty disables the age guard. Checkpoint dependency waits use `TTFT_MAX_TICKS`. This is not a hard TTFT limit. |
 | **ATOM_PREFILL_DECODE_INTERVAL** | int | 0 | Protect this many scheduler passes after an executed prefill. On DP=1, PP=1, a positive value also enables local coalescing when the master switch is on; `0` leaves TP scheduling unchanged. On DP>1, `0` disables only the interval. |
 | **ATOM_PREFILL_DELAYER_DEBUG** | bool | false | Per-tick FIRE/HOLD debug logging. |
 | **ATOM_PREFILL_DELAYER_LOG_EVERY** | int | 1000 | Emit aggregate stats (per-exit fire counts + hold rate) every N decisions (0 disables). |

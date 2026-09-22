@@ -721,11 +721,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK", "") == ""
         else float(os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK"))
     ),
-    # TTFT SLA guard: if any rank's oldest schedulable waiting prefill has queued
-    # (since arrival) >= this many ms, force-release regardless of the fill
-    # target. Bounds worst-case TTFT. Empty string => None => disabled (set this
-    # to your TTFT budget in ms to activate; a small value under heavy backlog
-    # will fire every tick and defeat coalescing, so size it to the SLA).
+    # After decode protection, bound extra coalescing by queue age. Checkpoint
+    # dependency waits use TTFT_MAX_TICKS; this is not an end-to-end TTFT bound.
+    # Empty string => None => disabled.
     "ATOM_PREFILL_DELAYER_MAX_QUEUE_MS": lambda: (
         None
         if os.getenv("ATOM_PREFILL_DELAYER_MAX_QUEUE_MS", "") == ""

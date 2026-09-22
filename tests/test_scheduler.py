@@ -436,6 +436,7 @@ class TestSchedule:
         )
         sched = Scheduler.__new__(Scheduler)
         sched._rejected = []
+        sched._inflight_prefix_wait = {}
         sched.deferred_free_blocks = {}
         sched.finished_recving_kv_req_ids = []
         sched.failed_recving_kv_req_ids = []
@@ -508,6 +509,7 @@ class TestSchedule:
         sched.waiting = deque()
         sched.running = deque()
         sched._rejected = []
+        sched._inflight_prefix_wait = {}
         sched.deferred_free_blocks = {}
         sched.finished_recving_kv_req_ids = []
         sched.failed_recving_kv_req_ids = []
