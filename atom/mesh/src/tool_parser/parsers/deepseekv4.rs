@@ -1,4 +1,4 @@
-//! DeepSeek-V4 DSML tool-call parser (`tool_calls` outer block).
+//! DeepSeek V4 / V4.1 DSML tool-call parser with dialect-specific markers.
 //!
 //! Adapted from `smg/crates/tool_parser/src/parsers/deepseek_dsml.rs` (V4 path).
 //! ATOM keeps `DsmlParser` / `DsmlParser::new` as the public V4 constructor and
@@ -26,14 +26,6 @@ use crate::tool_parser::{
     types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
 };
 
-/// Outer V4 block token.
-const BLOCK_OPEN: &str = "<｜DSML｜tool_calls>";
-const BLOCK_CLOSE: &str = "</｜DSML｜tool_calls>";
-
-/// Full DSML closing tags for suffix-based stripping during streaming.
-const DSML_PARAMETER_END_TAG: &str = "</｜DSML｜parameter>";
-const DSML_INVOKE_END_TAG: &str = "</｜DSML｜invoke>";
-
 /// DeepSeek end-of-sentence marker. Some engines emit this as raw text at the
 /// end of a truncated turn; it must never bleed into tool-call argument bytes.
 const EOS_TOKEN: &str = "<｜end▁of▁sentence｜>";
@@ -54,6 +46,10 @@ fn strip_dsml_trailing(s: &str, closing_tag: &str) -> String {
 }
 
 pub struct DsmlParser {
+    block_open: String,
+    block_close: String,
+    parameter_end_tag: String,
+    invoke_end_tag: String,
     /// Regex for extracting full outer-block content
     tool_call_complete_regex: Regex,
     /// Regex for extracting complete invoke blocks (name + body)
@@ -80,33 +76,39 @@ pub struct DsmlParser {
 impl DsmlParser {
     /// Create a DeepSeek V4 parser (outer block token `tool_calls`).
     pub fn new() -> Self {
-        let tool_call_complete_regex =
-            Regex::new(r"(?s)<｜DSML｜tool_calls>(.*?)</｜DSML｜tool_calls>")
-                .expect("Valid regex pattern");
+        Self::for_dialect("｜DSML｜", "tool_calls")
+    }
 
-        let invoke_complete_regex =
-            Regex::new(r#"(?s)<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)</｜DSML｜invoke>"#)
-                .expect("Valid regex pattern");
+    /// The released V4.1 dialect has a space after the sentinel and calls.
+    pub fn v41() -> Self {
+        Self::for_dialect("｜DSML｜ ", "calls")
+    }
 
-        let parameter_complete_regex = Regex::new(
-            r#"(?s)<｜DSML｜parameter\s+name="([^"]+)"\s+string="(true|false)"\s*>(.*?)</｜DSML｜parameter>"#,
-        )
-        .expect("Valid regex pattern");
-
-        let partial_parameter_regex = Regex::new(
-            r#"(?s)<｜DSML｜parameter\s+name="([^"]+)"\s+string="(true|false)"\s*>(.*)$"#,
-        )
-        .expect("Valid regex pattern");
-
-        // `[^"]*` (not `+`) so a malformed `name=""` still matches and can be
-        // advanced past by the empty/invalid-name handling in `parse_incremental`.
-        // Without this, a bad `name=""` invoke would stall the buffer forever
-        // and suppress every subsequent delta in the same stream.
-        let invoke_regex =
-            Regex::new(r#"(?s)<｜DSML｜invoke\s+name="([^"]*)"\s*>(.*?)(</｜DSML｜invoke>|$)"#)
-                .expect("Valid regex pattern");
+    fn for_dialect(prefix: &str, section: &str) -> Self {
+        let block_open = format!("<{prefix}{section}>");
+        let block_close = format!("</{prefix}{section}>");
+        let parameter_end_tag = format!("</{prefix}parameter>");
+        let invoke_end_tag = format!("</{prefix}invoke>");
+        let compile = |pattern: String| Regex::new(&pattern).expect("Valid DSML regex");
+        let tool_call_complete_regex = compile(format!("(?s){block_open}(.*?){block_close}"));
+        let invoke_complete_regex = compile(format!(
+            r#"(?s)<{prefix}invoke\s+name="([^"]+)"\s*>(.*?){invoke_end_tag}"#
+        ));
+        let parameter_complete_regex = compile(format!(
+            r#"(?s)<{prefix}parameter\s+name="([^"]+)"\s+string="(true|false)"\s*>(.*?){parameter_end_tag}"#
+        ));
+        let partial_parameter_regex = compile(format!(
+            r#"(?s)<{prefix}parameter\s+name="([^"]+)"\s+string="(true|false)"\s*>(.*)$"#
+        ));
+        let invoke_regex = compile(format!(
+            r#"(?s)<{prefix}invoke\s+name="([^"]*)"\s*>(.*?)({invoke_end_tag}|$)"#
+        ));
 
         Self {
+            block_open,
+            block_close,
+            parameter_end_tag,
+            invoke_end_tag,
             tool_call_complete_regex,
             invoke_complete_regex,
             parameter_complete_regex,
@@ -137,7 +139,7 @@ impl DsmlParser {
                 // `strip_dsml_trailing` handles partial `</｜DSML｜invoke>` prefixes
                 // but can't match the EOS sentinel (different prefix). Strip it
                 // unconditionally so a truncated turn doesn't leak EOS into args.
-                return strip_dsml_trailing(trimmed, DSML_INVOKE_END_TAG).replace(EOS_TOKEN, "");
+                return strip_dsml_trailing(trimmed, &self.invoke_end_tag).replace(EOS_TOKEN, "");
             } else if trimmed.ends_with('}') {
                 return trimmed.to_string();
             }
@@ -176,26 +178,20 @@ impl DsmlParser {
                 .unwrap_or(0);
 
             let remaining = &invoke_content[last_match_end..];
-            let cleaned = strip_dsml_trailing(remaining, DSML_PARAMETER_END_TAG);
+            let cleaned = strip_dsml_trailing(remaining, &self.parameter_end_tag);
 
             if let Some(cap) = self.partial_parameter_regex.captures(&cleaned) {
                 let name = cap.get(1).map_or("", |m| m.as_str());
                 let is_string = cap.get(2).map_or("true", |m| m.as_str());
-                // Strip EOS before trimming — `strip_dsml_trailing` above only
+                // Strip EOS without trimming string values — `strip_dsml_trailing` above only
                 // handles `</｜DSML｜parameter>` prefixes, so a truncated turn
                 // with `value<EOS>` would otherwise stream EOS as arg bytes.
                 let value = cap.get(3).map_or("", |m| m.as_str()).replace(EOS_TOKEN, "");
-                let value = value.trim();
+                let value = value.as_str();
 
                 // Only add if we have actual content and this param isn't already complete
-                if !value.is_empty() && !params.contains_key(name) {
-                    let json_value = if is_string == "true" {
-                        Value::String(value.to_string())
-                    } else {
-                        serde_json::from_str(value)
-                            .unwrap_or_else(|_| Value::String(value.to_string()))
-                    };
-                    params.insert(name.to_string(), json_value);
+                if is_string == "true" && !value.is_empty() && !params.contains_key(name) {
+                    params.insert(name.to_string(), Value::String(value.to_string()));
                 }
             }
         }
@@ -230,7 +226,7 @@ impl ToolParser for DsmlParser {
         }
 
         let idx = text
-            .find(BLOCK_OPEN)
+            .find(self.block_open.as_str())
             .ok_or_else(|| ParserError::ParsingFailed("DSML marker not found".to_string()))?;
         let normal_text = text[..idx].trim_end().to_string();
 
@@ -274,17 +270,24 @@ impl ToolParser for DsmlParser {
         // path and lose the sentinel, turning every subsequent chunk into plain
         // text.
         let has_dsml = current_text.contains("<｜DSML｜");
-        let has_partial_prefix = current_text.ends_with('<')
-            || current_text.ends_with("<｜")
-            || current_text.ends_with("</")
-            || current_text.ends_with("</｜");
+        let has_partial_prefix = current_text.char_indices().any(|(i, _)| {
+            [
+                "<｜DSML｜",
+                "</｜DSML｜",
+                self.block_close.as_str(),
+                self.parameter_end_tag.as_str(),
+                self.invoke_end_tag.as_str(),
+            ]
+            .iter()
+            .any(|tag| tag.starts_with(&current_text[i..]))
+        });
 
         if !has_dsml && !has_partial_prefix {
             let mut normal_text = std::mem::take(&mut self.buffer);
             for end_token in [
-                BLOCK_CLOSE,
-                DSML_INVOKE_END_TAG,
-                DSML_PARAMETER_END_TAG,
+                self.block_close.as_str(),
+                &self.invoke_end_tag,
+                &self.parameter_end_tag,
                 EOS_TOKEN,
             ] {
                 normal_text = normal_text.replace(end_token, "");
@@ -300,6 +303,13 @@ impl ToolParser for DsmlParser {
             return Ok(StreamingParseResult::default());
         }
 
+        let mut normal_text = String::new();
+        if self.current_tool_id < 0 {
+            if let Some(start) = self.buffer.find("<｜DSML｜") {
+                normal_text.push_str(&self.buffer[..start]);
+                self.buffer.drain(..start);
+            }
+        }
         let tool_indices = helpers::get_tool_indices(tools);
         let mut all_calls: Vec<ToolCallItem> = Vec::new();
 
@@ -321,7 +331,7 @@ impl ToolParser for DsmlParser {
                 .map_or(String::new(), |m| m.as_str().to_string());
             let is_complete = captures
                 .get(3)
-                .is_some_and(|m| m.as_str().contains("</｜DSML｜invoke>"));
+                .is_some_and(|m| m.as_str().contains(self.invoke_end_tag.as_str()));
             let match_end = captures.get(0).map(|m| m.end());
             drop(captures);
 
@@ -350,7 +360,7 @@ impl ToolParser for DsmlParser {
                         &self.prev_tool_call_arr,
                     );
                     return Ok(StreamingParseResult {
-                        normal_text: String::new(),
+                        normal_text,
                         calls: all_calls,
                     });
                 }
@@ -426,11 +436,6 @@ impl ToolParser for DsmlParser {
                         None
                     }
                 }
-            } else if sent_len < current_args.len() && current_args != "{}" {
-                // First partial chunk — no prev_args yet, emit from sent_len.
-                // Skip empty "{}" to avoid corrupting the delta stream when the
-                // buffer ends right after <invoke> with no parameter content yet.
-                Some(current_args[sent_len..].to_string())
             } else {
                 None
             };
@@ -471,14 +476,19 @@ impl ToolParser for DsmlParser {
             }
         }
 
+        if let Some(end) = self.buffer.find(self.block_close.as_str()) {
+            let tail = end + self.block_close.len();
+            normal_text.push_str(&self.buffer[tail..]);
+            self.buffer.clear();
+        }
         Ok(StreamingParseResult {
-            normal_text: String::new(),
+            normal_text,
             calls: all_calls,
         })
     }
 
     fn has_tool_markers(&self, text: &str) -> bool {
-        text.contains(BLOCK_OPEN)
+        text.contains(self.block_open.as_str())
     }
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
@@ -798,5 +808,70 @@ mod tests {
         }
         assert_eq!(tool_names, vec!["get_weather"]);
         assert!(collected_args.contains("Oslo"));
+    }
+    #[tokio::test]
+    async fn v41_shared_fixtures_at_every_utf8_boundary() {
+        let fixtures: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../tests/entrypoints/fixtures/deepseek_v41_dsml.json"
+        ))
+        .unwrap();
+        for fixture in fixtures.as_array().unwrap() {
+            let text = fixture["text"].as_str().unwrap();
+            let expected = fixture["calls"].as_array().unwrap();
+            let tools: Vec<Tool> = expected
+                .iter()
+                .map(|call| Tool {
+                    tool_type: "function".to_owned(),
+                    function: Function {
+                        name: call["name"].as_str().unwrap().to_owned(),
+                        description: None,
+                        parameters: json!({"type": "object"}),
+                        strict: None,
+                    },
+                })
+                .collect();
+            let (content, calls) = DsmlParser::v41().parse_complete(text).await.unwrap();
+            assert_eq!(content, fixture["content"].as_str().unwrap());
+            assert_eq!(calls.len(), expected.len());
+            for (actual, expected) in calls.iter().zip(expected) {
+                assert_eq!(actual.function.name, expected["name"].as_str().unwrap());
+                let args: serde_json::Value =
+                    serde_json::from_str(&actual.function.arguments).unwrap();
+                assert_eq!(args, expected["arguments"]);
+            }
+            let mut partitions: Vec<Vec<&str>> = text
+                .char_indices()
+                .map(|(i, _)| vec![&text[..i], &text[i..]])
+                .collect();
+            partitions.push(
+                text.char_indices()
+                    .map(|(i, c)| &text[i..i + c.len_utf8()])
+                    .collect(),
+            );
+            for chunks in partitions {
+                let mut parser = DsmlParser::v41();
+                let mut content = String::new();
+                let mut names: Vec<String> = Vec::new();
+                let mut arguments: Vec<String> = Vec::new();
+                for chunk in chunks {
+                    let parsed = parser.parse_incremental(chunk, &tools).await.unwrap();
+                    content.push_str(&parsed.normal_text);
+                    for call in parsed.calls {
+                        if let Some(name) = call.name {
+                            names.push(name);
+                            arguments.push(String::new());
+                        }
+                        arguments[call.tool_index].push_str(&call.parameters);
+                    }
+                }
+                assert_eq!(content, fixture["content"].as_str().unwrap());
+                assert_eq!(names.len(), expected.len());
+                for (i, call) in expected.iter().enumerate() {
+                    assert_eq!(names[i], call["name"].as_str().unwrap());
+                    let actual: serde_json::Value = serde_json::from_str(&arguments[i]).unwrap();
+                    assert_eq!(actual, call["arguments"]);
+                }
+            }
+        }
     }
 }

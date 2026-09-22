@@ -31,6 +31,11 @@ def _tensor(values, *, dtype=torch.int64):
     return torch.tensor(values, dtype=dtype).as_subclass(_CudaTensor)
 
 
+def _cuda_cat(tensors, *args, **kwargs):
+    """Concatenate on the CPU but report CUDA, as the staged metadata does."""
+    return torch.cat(tensors, *args, **kwargs).as_subclass(_CudaTensor)
+
+
 @pytest.fixture
 def staging(monkeypatch):
     fake_triton = ModuleType("triton")
@@ -70,10 +75,20 @@ def staging(monkeypatch):
 
             return launch
 
+    # Only ``tensor`` is instrumented: it is the metadata upload under test.
+    # The tile table is built with ordinary CPU tensor ops, which are real here
+    # so the table's contents can be asserted rather than mocked.
     module.torch = SimpleNamespace(
         Tensor=torch.Tensor,
+        arange=torch.arange,
+        as_tensor=torch.as_tensor,
+        cat=_cuda_cat,
+        cumsum=torch.cumsum,
         device=torch.device,
+        empty=torch.empty,
+        int32=torch.int32,
         int64=torch.int64,
+        repeat_interleave=torch.repeat_interleave,
         uint8=torch.uint8,
         tensor=upload,
     )
@@ -125,9 +140,13 @@ def test_dense_metadata_is_uploaded_once_and_sliced_per_pipeline_group(staging):
     module.fused_pack_chunk_major_prepared(prepared, 0, device_buf)
     module.fused_unpack_chunk_major_prepared(prepared, 1, device_buf)
 
+    # One program per tile with bytes to move, not a rectangle sized by the
+    # widest segment. Group 0 stages 2 blocks of segment 0 and 1 of segment 1,
+    # so 4 jobs; group 1 stages 1 block of each, so 2. Every job here is under
+    # one 1024-byte tile.
     assert [call[:2] for call in staging.launches] == [
-        ("pack", (4, 1)),
-        ("unpack", (2, 1)),
+        ("pack", (4,)),
+        ("unpack", (2,)),
     ]
     pack_args = staging.launches[0][2]
     unpack_args = staging.launches[1][2]
@@ -137,16 +156,27 @@ def test_dense_metadata_is_uploaded_once_and_sliced_per_pipeline_group(staging):
     assert pack_args[7].tolist() == [2, 0, 1]
     assert unpack_args[4].tolist() == [1]
     assert unpack_args[7].tolist() == [1]
+    assert pack_args[8].tolist() == [0, 1, 2, 3]
+    assert pack_args[9].tolist() == [0, 0, 0, 0]
+    assert unpack_args[8].tolist() == [0, 1]
+    assert unpack_args[9].tolist() == [0, 0]
     for _direction, _grid, args, kwargs in staging.launches:
         for metadata_view in args[1:8]:
             assert (
                 metadata_view.untyped_storage().data_ptr()
                 == prepared.metadata.untyped_storage().data_ptr()
             )
+        # The tile table is the transfer's second and last upload; each group's
+        # job and pos are views into it, not tensors of their own.
+        for tile_view in args[8:10]:
+            assert (
+                tile_view.untyped_storage().data_ptr()
+                == prepared.tile_table.untyped_storage().data_ptr()
+            )
         assert kwargs == {
             "NUM_SEGMENTS": 2,
             "BLOCK_BYTES": 1024,
-            "num_warps": 8,
+            "num_warps": 2,
         }
 
 

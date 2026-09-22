@@ -55,6 +55,8 @@ def _plans(extend, context):
         np.asarray(context, dtype=np.int32),
         RATIOS_OVERLAP,
         plan_buffers=_buffers(),
+        # No ring slack: these cases are about composition, not rollback.
+        extra_write=0,
     )
 
 

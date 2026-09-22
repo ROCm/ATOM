@@ -13,6 +13,17 @@ Why the split matters (MiniMax-M3, the model that forced this):
     sparse layers (nb, 2, bs, nh, hd)     K and V in two SEPARATE regions
     index caches  (nb, bs, hd)            DSA indexer keys, one per sparse layer
 
+GLM-5.2 (``GlmMoeDsaForCausalLM``) is the simpler shape of the same idea and
+needs no splitting at all:
+
+    MLA layers    (nb, bs, 576)           one latent cache, K and V fused
+    index caches  (nb, bs, hd+4)          uint8, fp8 keys with their scale
+                                          packed INTO the row
+
+Both of its tensors are block-major and contiguous, so each travels whole. Its
+indexer also needs no scale hook: unlike M3, its quantisation state is inside
+the bytes being moved.
+
 A sparse layer's tensor is NOT contiguous as a whole: its ``stride(1)`` jumps
 across the entire K region (measured on M3-MXFP4: shape ``(59454, 2, 128, 1,
 128)``, stride ``(16384, 974094336, 128, 128, 1)``). ``DenseKVByteCodec``
@@ -40,6 +51,33 @@ import torch
 from atom.config import KVCacheTensor
 
 INDEX_CACHE_SUFFIX = ".index_cache"
+
+# A DSA indexer's key cache is registered by vLLM as its own KV-cache entry, but
+# it is part of the owning attention layer's movable bytes, not a layer of its
+# own. Two spellings exist in-tree and neither side is free to change:
+#
+#   MiniMax-M3   ``<layer>.index_cache``          -> owner ``<layer>``
+#   GLM-5.2 /    ``<p>.indexer.k_cache``          -> owner ``<p>.attn``
+#   DeepSeek-V3.2
+#
+# The GLM pairing is the one ``AiterMlaSparseIndexerMetadataBuilder`` itself
+# uses (``attention_prefix = layer_name.removesuffix(".attn")``), so it is the
+# model's own convention rather than a guess made here.
+_GLM_INDEXER_SUFFIX = ".indexer.k_cache"
+
+
+def index_cache_owner(name: str) -> str | None:
+    """Return the layer this entry's bytes belong to, or None if it is a layer.
+
+    Folding is deliberately never inferred from shape: an entry that merely
+    looks indexer-shaped but is a real layer would be attached to a neighbour
+    and restored under the wrong key.
+    """
+    if name.endswith(INDEX_CACHE_SUFFIX):
+        return name[: -len(INDEX_CACHE_SUFFIX)]
+    if name.endswith(_GLM_INDEXER_SUFFIX):
+        return name[: -len(_GLM_INDEXER_SUFFIX)] + ".attn"
+    return None
 
 
 def _layer_sort_key(layer_name: str) -> tuple:
@@ -105,10 +143,10 @@ def build_kv_cache_tensors(
 ) -> list[KVCacheTensor]:
     """Translate vLLM's ``{layer_name: tensor}`` into ATOM ``KVCacheTensor``s.
 
-    Layers named ``<layer><INDEX_CACHE_SUFFIX>`` are folded into the owning
-    layer's ``index_cache`` rather than becoming layers of their own -- vLLM
-    registers M3's DSA indexer keys as separate entries, but they are part of
-    the same layer's movable bytes.
+    Entries ``index_cache_owner`` recognises as indexer caches are folded into
+    the owning layer's ``index_cache`` rather than becoming layers of their own
+    -- vLLM registers DSA indexer keys (M3, GLM-5.2, DeepSeek-V3.2) as separate
+    entries, but they are part of the same layer's movable bytes.
 
     Args:
         kv_caches: vLLM's registration dict.
@@ -124,8 +162,9 @@ def build_kv_cache_tensors(
     index_caches: dict[str, torch.Tensor] = {}
     main: dict[str, torch.Tensor] = {}
     for name, tensor in kv_caches.items():
-        if name.endswith(INDEX_CACHE_SUFFIX):
-            index_caches[name[: -len(INDEX_CACHE_SUFFIX)]] = tensor
+        owner = index_cache_owner(name)
+        if owner is not None:
+            index_caches[owner] = tensor
         else:
             main[name] = tensor
 
@@ -176,5 +215,30 @@ def build_kv_cache_tensors(
                 v_scale=v_scale,
                 index_cache=index_cache,
             )
+        )
+
+    # The codec is handed ONE num_blocks and derives every segment's per-block
+    # byte stride as ``numel // num_blocks``. That is only meaningful while all
+    # segments are paged against the same block table, which in vLLM means one
+    # KV cache group. Two groups (different block counts) would still divide
+    # evenly often enough to pass the codec's own check and then slice the
+    # smaller tensor at the wrong granularity -- bytes restored into the wrong
+    # blocks, no error anywhere. Name it here, where the shapes are visible.
+    block_counts: dict[int, list[str]] = {}
+    for kvt, name in zip(out, sorted(main, key=_layer_sort_key)):
+        for role, seg in (("k_cache", kvt.k_cache), ("index_cache", kvt.index_cache)):
+            if seg is None or seg.numel() == 0:
+                continue
+            block_counts.setdefault(int(seg.shape[0]), []).append(f"{name}.{role}")
+    if len(block_counts) > 1:
+        detail = "; ".join(
+            f"{n}: {names[0]}{f' (+{len(names) - 1} more)' if len(names) > 1 else ''}"
+            for n, names in sorted(block_counts.items())
+        )
+        raise ValueError(
+            "ATOM offload connector: registered KV tensors do not share a block "
+            f"count ({detail}); the byte codec addresses every segment with one "
+            "block table. This means vLLM put them in separate KV cache groups, "
+            "which this connector does not support."
         )
     return out

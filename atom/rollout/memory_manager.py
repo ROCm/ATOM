@@ -402,19 +402,23 @@ class MemoryManagerMixin:
             logger.warning(f"{self.label}: No KV cache num_blocks to resume from")
             return
         saved_blocks = self._kv_cache_num_blocks
-        self._kv_cache_num_blocks = None
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        available_blocks = self.get_num_blocks()["num_kvcache_blocks"]
-        num_blocks = min(saved_blocks, available_blocks)
-        if num_blocks < saved_blocks:
-            logger.warning(
-                f"{self.label}: KV cache blocks reduced from {saved_blocks} to "
-                f"{num_blocks} due to changed GPU memory availability"
-            )
-        self.allocate_kv_cache(num_blocks)
+        # The size the pool slept at, not a fresh reading: `BlockManager`'s
+        # `BlockPool` is sized in the engine process from the startup count and
+        # nothing carries a wake-time one back, and the decode graphs were
+        # captured against the original pool.
+        free, total = torch.cuda.mem_get_info()
         logger.info(
-            f"{self.label}: KV cache re-allocated and bound ({num_blocks} blocks)"
+            f"{self.label}: re-allocating {saved_blocks} KV blocks "
+            f"({free / (1 << 30):.2f}GB free of {total / (1 << 30):.2f}GB)"
+        )
+        # After the allocation, which can now OOM: clearing it first would lose
+        # the only record of the size, and the next wake would then take the
+        # guard above and report success with no pool.
+        self.allocate_kv_cache(saved_blocks)
+        self._kv_cache_num_blocks = None
+        logger.info(
+            f"{self.label}: KV cache re-allocated and bound ({saved_blocks} blocks)"
         )
 
     def _recapture_cudagraphs_if_needed(self) -> None:

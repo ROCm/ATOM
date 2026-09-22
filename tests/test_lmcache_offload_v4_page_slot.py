@@ -1713,6 +1713,40 @@ def test_connector_init_rejects_nonfinite_config_before_starting_executors(
         LMCacheOffloadConnector(config)
 
 
+def test_slot_load_executor_stays_serial_regardless_of_env(monkeypatch, caplog):
+    """OFFLOAD_LOAD_WORKERS must not widen the DSV4 load pool.
+
+    `start_load_kv` hands every SLOT load in a worker batch the *same*
+    `_SlotLoadBatchReservation` -- one staging row, shared -- and that is only
+    sound because the load executor runs them in submission order. A second
+    load thread would drive two loads through one staging row at once and
+    corrupt both. The knob is honoured on the dense path, where each load thread
+    owns its own thread-local staging state; here it must be refused, and
+    loudly, since a silently-ignored tuning knob reads as "measured, no effect".
+    """
+
+    config = SimpleNamespace(kv_transfer_config={}, kv_cache_block_size=64)
+
+    connector = LMCacheOffloadConnector(config)
+    try:
+        assert connector.load_workers == 1
+        assert connector._load_executor._max_workers == 1
+    finally:
+        connector.close()
+
+    monkeypatch.setenv("OFFLOAD_LOAD_WORKERS", "4")
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        connector = LMCacheOffloadConnector(config)
+    try:
+        assert connector.load_workers == 1
+        assert connector._load_executor._max_workers == 1
+    finally:
+        connector.close()
+    assert any(
+        "OFFLOAD_LOAD_WORKERS=4" in record.getMessage() for record in caplog.records
+    )
+
+
 @pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "1.5", "bad"])
 def test_max_pending_saves_rejects_invalid_connector_extra(value):
     with pytest.raises(ValueError, match="max pending saves"):

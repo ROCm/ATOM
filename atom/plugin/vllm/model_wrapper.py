@@ -156,7 +156,7 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "Qwen3_5ForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5ForConditionalGeneration_",
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration_",
     "KimiK3ForConditionalGeneration": (
-        "atom.plugin.vllm.models.kimi_k3:KimiK3ForCausalLM"
+        "atom.plugin.vllm.models.kimi_k3:KimiK3ForConditionalGeneration_"
     ),
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2:MiniMaxM2ForCausalLM",
     "DeepseekV4ForCausalLM": "atom.plugin.vllm.models.deepseek_v4:DeepseekV4ForCausalLM",
@@ -507,7 +507,16 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 else:
                     self.model = model_cls(self.atom_config)
         else:
-            self.model = model_cls(self.atom_config)
+            if model_arch == "KimiK3ForConditionalGeneration":
+                # Kimi-K3's inner class inherits vLLM SupportsQuant. Passing
+                # VllmConfig lets that protocol apply its quant mapper and
+                # packed-module mappings before the vision modules are built.
+                self.model = model_cls(
+                    self.atom_config,
+                    vllm_config=vllm_config,
+                )
+            else:
+                self.model = model_cls(self.atom_config)
 
         num_patched_post_load_hooks = _patch_required_act_dtype_post_load_hooks(
             self.model,

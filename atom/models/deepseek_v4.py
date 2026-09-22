@@ -95,6 +95,7 @@ from atom.model_ops.quant_v4 import act_quant_inplace
 from atom.model_ops.sparse_attn_v4 import (
     hc_split_sinkhorn,
 )
+from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
 from atom.model_ops.triton_hash_topk import hash_topk_triton
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.utils import atom_parameter, shuffle_weights
@@ -1774,33 +1775,17 @@ class Indexer(nn.Module):
         ``_max_model_len_idx`` for FP4) is unbounded by ``max_num_batched_tokens``,
         so a burst of long-context requests can push a single un-chunked
         allocation to tens of GiB (#1376). ``chunk_tokens`` shrinks as
-        ``row_width`` grows. When the budget is disabled (0) or a single chunk
-        already fits, the loop runs once (``chunk_start==0`` and
-        ``chunk_end==total_tokens``) and matches the single-shot path — callers
-        can detect that to reuse a schedule precomputed outside the fwd.
+        ``row_width`` grows. When a single chunk already fits, the loop runs
+        once (``chunk_start==0`` and ``chunk_end==total_tokens``) and matches the
+        single-shot path — callers can detect that to reuse a schedule
+        precomputed outside the fwd.
 
         Returns ``[total_tokens, topk]`` int32 (raw kernel output; caller remaps).
         """
         topk_out = torch.empty((total_tokens, topk), dtype=torch.int32, device=device)
-        budget_bytes = SPARSE_INDEXER_LOGITS_BUDGET_MB * 1024 * 1024
-        if (
-            budget_bytes > 0
-            and row_width > 0
-            and budget_bytes // (row_width * 4) < total_tokens
-        ):
-            # 4 bytes per fp32 logit; row_width * 4 is one row's footprint. Round
-            # the budget-derived row count DOWN: a multiple of 128 (aligned to the
-            # kernel's row tiling) in the normal regime, avoiding coarse power-of-2
-            # doubling. Below 128 rows (extreme row_width), fall back to a
-            # power-of-2 floor so it degrades 64/32/.../1 instead of collapsing to 1.
-            budget_rows = budget_bytes // (row_width * 4)
-            if budget_rows >= 128:
-                chunk_tokens = (budget_rows // 128) * 128
-            else:
-                chunk_tokens = 1 << (max(1, budget_rows).bit_length() - 1)
-        else:
-            # Budget disabled, or a single chunk already fits all rows.
-            chunk_tokens = total_tokens
+        chunk_tokens = sparse_indexer_row_chunk(
+            total_tokens, row_width, SPARSE_INDEXER_LOGITS_BUDGET_MB
+        )
         for chunk_start in range(0, total_tokens, chunk_tokens):
             chunk_end = min(chunk_start + chunk_tokens, total_tokens)
             rs = row_starts[chunk_start:chunk_end]
@@ -3143,8 +3128,9 @@ class DeepseekV4Attention(nn.Module):
                 kv_indices = attn_md.kv_indices_hca
                 kv_indptr = attn_md.kv_indptr_hca
             # Dispatch on kv-cache layout inside the wrapper: fp8 2buff
-            # (unified_kv_rope set) → aiter asm op5 with pre-packed fp8 Q + the
-            # 2buff fp8/bf16 pools read with no requant; bf16 (unified_kv_rope
+            # (unified_kv_rope set) → aiter ASM with pre-packed fp8 Q + the
+            # 2buff fp8/bf16 pools read with no requant. The optional H=128
+            # prefill-ASM decode route also consumes the shared empty CSR.
             o = sparse_attn_v4_paged_decode(
                 qkn.q_sa,
                 self.unified_kv,
@@ -3156,6 +3142,7 @@ class DeepseekV4Attention(nn.Module):
                 q_packed_in=qkn.q_packed,
                 q_rope_in=qkn.q_rope,
                 qo_indptr=attn_md.qo_indptr,
+                empty_kv_indptr=attn_md.empty_kv_indptr,
                 prefix=f"{self.layer_name}.sparse_attn_decode",
             )  # [S, H, head_dim]
         else:

@@ -15,6 +15,7 @@ _ATOM_ENV_VARS = [
     "ATOM_DP_BASE_PORT",
     "ATOM_USE_TRITON_GEMM",
     "ATOM_USE_TRITON_MXFP4_BMM",
+    "ATOM_USE_V4_PREFILL_ASM_FOR_DECODE",
     "ATOM_MHC_USE_BF16",
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION",
     "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION",
@@ -36,6 +37,7 @@ _ATOM_ENV_VARS = [
     "ATOM_USE_CUSTOM_ALL_GATHER",
     "ATOM_ENABLE_RELAXED_MTP",
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ",
+    "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN",
 ]
 
 
@@ -80,6 +82,9 @@ class TestEnvsDefaults:
     def test_use_triton_gemm_default(self):
         assert _get_envs().ATOM_USE_TRITON_GEMM is False
 
+    def test_use_v4_prefill_asm_for_decode_default_disabled(self):
+        assert _get_envs().ATOM_USE_V4_PREFILL_ASM_FOR_DECODE is False
+
     def test_ds_input_rmsnorm_quant_fusion_default_enabled(self):
         assert _get_envs().ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is True
 
@@ -123,6 +128,9 @@ class TestEnvsDefaults:
     def test_use_flydsl_gather_kv_b_proj_default(self):
         assert _get_envs().ATOM_USE_FLYDSL_GATHER_KV_B_PROJ is True
 
+    def test_use_flydsl_fp8_prefill_attn_default(self):
+        assert _get_envs().ATOM_USE_FLYDSL_FP8_PREFILL_ATTN is False
+
     def test_unknown_attr_raises(self):
         with pytest.raises(AttributeError):
             _ = _get_envs().ATOM_NONEXISTENT_VAR
@@ -149,6 +157,10 @@ class TestEnvsOverrides:
         monkeypatch.setenv("ATOM_DP_BASE_PORT", "29800")
         assert _get_envs().ATOM_DP_MASTER_PORT == 29700
         assert _get_envs().ATOM_DP_BASE_PORT == 29800
+
+    def test_use_v4_prefill_asm_for_decode_enabled(self, monkeypatch):
+        monkeypatch.setenv("ATOM_USE_V4_PREFILL_ASM_FOR_DECODE", "1")
+        assert _get_envs().ATOM_USE_V4_PREFILL_ASM_FOR_DECODE is True
 
     def test_torch_profiler_dir_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", "/tmp/prof")
@@ -257,3 +269,11 @@ def test_parallel_config_applies_explicit_dp_endpoint_env(monkeypatch):
     assert config.data_parallel_master_ip == "127.0.0.2"
     assert config.data_parallel_master_port == 29700
     assert config.data_parallel_base_port == 29800
+
+
+def test_mla_fp8_prefill_flag(monkeypatch):
+    name = "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN"
+    assert getattr(_get_envs(), name) is False
+    for value, expected in [("0", False), ("1", True), ("true", False)]:
+        monkeypatch.setenv(name, value)
+        assert getattr(_get_envs(), name) is expected

@@ -388,6 +388,7 @@ def test_sglang_plugin_registration_does_not_require_kimi_k3_pool_modules():
     apply_load_config_patch = MagicMock()
 
     with (
+        patch.object(register, "apply_qwen4_exp_recognition_patch"),
         patch.object(register, "_install_model_config_quant_patch"),
         patch.object(register, "_install_loader_quant_patch"),
         patch.object(register, "_register_tc_piecewise_attention_split_ops"),

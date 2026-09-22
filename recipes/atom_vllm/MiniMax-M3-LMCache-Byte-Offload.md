@@ -202,6 +202,10 @@ counts do not.
 
 ## Related
 
+- [GLM-5.2](GLM-5.2-LMCache-Byte-Offload.md) and
+  [GLM-5.3](GLM-5.3-LMCache-Byte-Offload.md) LMCache Byte Offload — the same
+  connector on GLM's DSA registration, which spells its indexer
+  `<p>.indexer.k_cache` rather than M3's `<p>.index_cache`
 - [LMCache KV Cache Offload](LMCache-KV-Cache-Offload.md) — generic plugin path
   (`LMCacheConnectorV1`), does not support M3's layouts
 - [MiniMax-M3](MiniMax-M3.md) — base serving recipe

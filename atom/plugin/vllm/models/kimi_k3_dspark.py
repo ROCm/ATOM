@@ -111,8 +111,16 @@ class KimiK3DSparkVllm(ATOMForCausalLM):
 
         Collapses the pair above plus the add and the argmax. Only reachable once
         ``spec_decode_patch._patch_dspark_fused_markov_sample`` installed itself.
+
+        The ids come back through a destination rather than a return value: the
+        native loop writes one column of its own block, and vLLM's spelling
+        wants a tensor, so it allocates the one column's worth.
         """
-        return self.model.markov_head.sample_next(token_ids, base_logits)[0]
+        ids = torch.empty(
+            base_logits.shape[0], dtype=torch.int64, device=base_logits.device
+        )
+        self.model.markov_head.sample_next(token_ids, base_logits, ids)
+        return ids
 
     def map_draft_to_target(self, draft_token_ids: torch.Tensor) -> torch.Tensor:
         return draft_token_ids
