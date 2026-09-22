@@ -127,7 +127,10 @@ def test_empty_rank_padding_has_no_cache_writes(monkeypatch):
     before = cache.backing.clone()
     step = cache.begin_step([])
     metadata = SimpleNamespace(
-        step=step, cache=cache, next_histories=np.empty((0, 3), dtype=np.int64)
+        step=step,
+        cache=cache,
+        next_histories=np.empty((0, 3), dtype=np.int64),
+        image_mask=None,
     )
     monkeypatch.setattr(
         runtime, "get_forward_context", lambda: SimpleNamespace(attn_metadata=metadata)
