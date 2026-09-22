@@ -255,6 +255,7 @@ def test_exact_cpu_hbm_pair_and_eviction_through_rust_relay(tmp_path):
     sampler = threading.Thread(target=samples, daemon=True)
     sampler.start()
     port = _port()
+    metrics_port = _port()
     command = [
         BINARY,
         "--host",
@@ -266,6 +267,12 @@ def test_exact_cpu_hbm_pair_and_eviction_through_rust_relay(tmp_path):
         "--pd-disaggregation",
         "--policy",
         "kv_cache_aware",
+        "--prefill-policy",
+        "kv_cache_aware",
+        "--decode-policy",
+        "kv_cache_aware",
+        "--prometheus-port",
+        str(metrics_port),
         "--prefill",
         p1.url,
         "--prefill",
@@ -329,6 +336,26 @@ def test_exact_cpu_hbm_pair_and_eviction_through_rust_relay(tmp_path):
             and p1.requests[0]["routing_hints"]["cache_load_policy"] == "skip"
         )
         assert d1.requests[0]["kv_transfer_params"]["remote_engine_id"] == "p1"
+        # CI distinguishes actual calibrated selections from the new policy's
+        # load fallback. Check the real exported counters, including fallback.
+        with urlopen(f"http://127.0.0.1:{metrics_port}/metrics", timeout=5) as response:
+            metrics = response.read().decode()
+        assert (
+            'atomesh_kv_cache_routing_decisions_total{outcome="selected"} 2' in metrics
+        )
+        for execution in (p1, p2):
+            with execution.catalog.lock:
+                execution.catalog.info["costs"] = {}
+        time.sleep(0.4)
+        _request(
+            f"http://127.0.0.1:{port}/v1/completions",
+            {"model": "harness", "prompt": "test", "max_tokens": 1},
+        )
+        with urlopen(f"http://127.0.0.1:{metrics_port}/metrics", timeout=5) as response:
+            metrics = response.read().decode()
+        assert (
+            'atomesh_kv_cache_routing_decisions_total{outcome="fallback"} 1' in metrics
+        )
     finally:
         process.terminate()
         try:

@@ -35,6 +35,7 @@ on:
         options:
           - smoke
           - nightly
+          - agentic_scaling
       rdma_smoke_nodes:
         description: 'Comma-separated Slurm candidate nodes for the Mooncake RDMA smoke test; Slurm selects two when multiple nodes are listed'
         required: false
@@ -61,6 +62,8 @@ on:
       case_names:
         description: |
           Overrides model_names. Enter comma-separated case names.
+          For agentic_scaling, select the CPP4/DCP4 1P1D baselines below;
+          each automatically runs 1P1D C and two-node 2P2D 2C. Empty selects all four.
           DeepSeek:
             ds-v4-1p1d-tp8-smoke,ds-v4-1p1d-tp8,ds-v4-1p1d-dpa-tp8,
             ds-v4-1p1d-tp8-mtp3,ds-v4-1p1d-dpa-tp8-mtp1
@@ -106,6 +109,11 @@ on:
         description: 'Override ATOM docker image'
         required: false
         default: rocm/atom-dev:latest
+        type: string
+      cache_routing_bundle:
+        description: 'agentic_scaling: shared path on the submit runner to measured PP4/DCP4 calibration + namespace JSON; required for the 2P2D performance stage'
+        required: false
+        default: ''
         type: string
       atomesh_slurm_submit_runner:
         description: 'GitHub runner label used to submit Slurm jobs: atomesh-cicd = TW MI355X, atomesh-cicd-mi350 = Spur MI350X, atomesh-cicd-mi355-crusoe = Crusoe MI355X'
@@ -192,6 +200,7 @@ on:
         type: boolean
 
 env:
+  ATOMESH_SCALING_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.suite == 'agentic_scaling' && '1' || '0' }}
   ATOMESH_NODE_POOL: pit2-p03-g01,pit2-p03-g03,pit2-p03-g07,pit2-p03-g08,pit2-p03-g09,pit2-p03-g10,pit2-p03-g12,pit2-p03-g13,pit2-p03-g15,pit2-p03-g17,pit2-p03-g19,pit2-p03-g20,pit2-p03-g23,pit2-p03-g24,pit2-p03-g25,pit2-p03-g27,pit2-p03-g42
   # GID 1 selects IPv4 on TW; GID 0 is IPv6 link-local.
   NCCL_IB_GID_INDEX: '1'
@@ -216,10 +225,36 @@ permissions:
   contents: write
 
 jobs:
+  stage-routing-bundle:
+    name: Stage measured routing calibration
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.suite == 'agentic_scaling' && inputs.cache_routing_bundle != '' }}
+    runs-on: ${{ inputs.atomesh_slurm_submit_runner }}
+    steps:
+      - name: Read calibration from the Slurm submit host
+        env:
+          INPUT_CACHE_ROUTING_BUNDLE: ${{ inputs.cache_routing_bundle }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/atomesh-routing-input"
+          cp -- "${INPUT_CACHE_ROUTING_BUNDLE}" "${RUNNER_TEMP}/atomesh-routing-input/bundle.json"
+
+      - name: Upload calibration for image validation
+        uses: actions/upload-artifact@v7
+        with:
+          name: atomesh-routing-input
+          path: ${{ runner.temp }}/atomesh-routing-input/bundle.json
+          if-no-files-found: error
+
   load-config:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    needs: [stage-routing-bundle]
+    if: >-
+      always() && !cancelled()
+      && (!github.event.pull_request || github.event.pull_request.draft == false)
+      && (needs.stage-routing-bundle.result == 'success' || needs.stage-routing-bundle.result == 'skipped')
     name: Load ATOMesh benchmark config
-    runs-on: ubuntu-latest
+    # The Slurm submit host has no Docker access. Use the existing image-build
+    # runner for container validation; GPU allocations still use Slurm below.
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.suite == 'agentic_scaling' && 'linux-atom-mi35x-1' || 'ubuntu-latest' }}
     outputs:
       matrix_json: ${{ steps.matrix.outputs.matrix_json }}
       has_matrix: ${{ steps.matrix.outputs.has_matrix }}
@@ -228,15 +263,28 @@ jobs:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
 
+      - name: Download measured routing calibration
+        if: ${{ needs.stage-routing-bundle.result == 'success' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: atomesh-routing-input
+          path: .git/atomesh-routing-input
+
       - name: Install YAML parser
+        if: ${{ inputs.suite != 'agentic_scaling' }}
         run: python3 -m pip install pyyaml
 
       - name: Find ATOMesh latest nightly image
         id: image
         env:
           INPUT_ATOMESH_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_image || '' }}
+          ATOMESH_PYTHON_IMAGE: ${{ inputs.atomesh_image || 'rocm/atom-dev:latest' }}
         run: |
           set -euo pipefail
+          if [[ "${ATOMESH_SCALING_RUN}" == "1" ]]; then
+            source .github/scripts/atomesh/image_python.sh
+            docker pull "${ATOMESH_PYTHON_IMAGE}"
+          fi
           python3 - <<'PY'
           import json
           import os
@@ -301,6 +349,13 @@ jobs:
                   resolved_image = image
 
           image_digest = ""
+          if os.environ.get("ATOMESH_SCALING_RUN") == "1" and "@sha256:" not in resolved_image:
+              if not resolved_image.startswith("rocm/atom-dev:"):
+                  raise ValueError("Scaling image overrides must use an immutable @sha256 digest")
+              image_digest = docker_tag_digest(resolved_image.split(":", 1)[1])
+              if not image_digest:
+                  raise ValueError("Cannot pin scaling image digest")
+              resolved_image += "@" + image_digest
           if resolved_image == "rocm/atom-dev:latest":
               image_digest = docker_tag_digest("latest")
               if image_digest:
@@ -327,17 +382,26 @@ jobs:
           CASE_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.case_names || '' }}
           EVENT_SCHEDULE: ${{ github.event_name == 'schedule' && github.event.schedule || '' }}
           ATOMESH_IMAGE: ${{ steps.image.outputs.image }}
+          ATOMESH_PYTHON_IMAGE: ${{ steps.image.outputs.image }}
+          INPUT_CACHE_ROUTING_BUNDLE: ${{ inputs.cache_routing_bundle }}
           ATOMESH_BENCHMARK_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark_concurrency || '' }}
           ATOMESH_EVAL_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.eval_concurrency || '' }}
         run: |
           set -euo pipefail
+          if [[ "${ATOMESH_SCALING_RUN}" == "1" ]]; then
+            source .github/scripts/atomesh/image_python.sh
+            unset ATOMESH_ROUTING_BUNDLE_FILE
+            if [[ -n "${INPUT_CACHE_ROUTING_BUNDLE}" ]]; then
+              export ATOMESH_ROUTING_BUNDLE_FILE=.git/atomesh-routing-input/bundle.json
+            fi
+          fi
           MODEL_NAME=""
           CASE_NAME=""
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             if [[ -n "${CASE_NAMES}" ]]; then
               CASE_NAME="${CASE_NAMES}"
             elif [[ "${RUN_ALL_MODELS}" != "true" ]]; then
-              if [[ -z "${MODEL_NAMES}" && "${SUITE}" != "smoke" ]]; then
+              if [[ -z "${MODEL_NAMES}" && "${SUITE}" != "smoke" && "${SUITE}" != "agentic_scaling" ]]; then
                 echo "::error::Set run_all_models=true, provide model_names, or provide case_names."
                 exit 1
               fi
@@ -422,8 +486,12 @@ jobs:
         if: ${{ steps.matrix.outputs.has_matrix == 'true' }}
         env:
           RESULT_DIR: atomesh-dry-run-results
+          ATOMESH_PYTHON_IMAGE: ${{ steps.image.outputs.image }}
         run: |
           set -euo pipefail
+          if [[ "${ATOMESH_SCALING_RUN}" == "1" ]]; then
+            source .github/scripts/atomesh/image_python.sh
+          fi
           chmod +x .github/scripts/atomesh/*.sh .github/scripts/atomesh/*.py
           python3 - <<'PY'
           import json
@@ -447,6 +515,53 @@ jobs:
                   check=True,
               )
           PY
+
+      - name: Test scaling orchestration in the benchmark image
+        if: ${{ inputs.suite == 'agentic_scaling' }}
+        env:
+          ATOMESH_PYTHON_IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/atomesh/image_python.sh
+          python3 -m pytest -q tests/test_atomesh_agentic_scaling.py tests/test_atomesh_agentic_routing.py tests/test_atomesh_pd_matrix.py tests/test_atomesh_spur_dispatch.py tests/test_atomesh_lmcache_disk.py tests/test_atomesh_job_result.py
+          python3 .github/scripts/atomesh/agentic_scaling.py preflight --aiperf aiperf --output .git/aiperf-preflight.json
+
+      - name: Build reviewed Mesh and verify both cache-aware policies in the image
+        if: ${{ inputs.suite == 'agentic_scaling' }}
+        env:
+          ATOMESH_PYTHON_IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/atomesh/image_python.sh
+          mkdir -p atomesh-build-validation
+          printf 'ATOMESH_PREINSTALLED_ONLY=1\nATOMESH_MESH_BUILD_PROFILE=release\nCARGO_BUILD_JOBS=8\n' > atomesh-build-validation/build.env
+          ATOMESH_BUILD_MESH=true ATOMESH_PREINSTALLED_ONLY=1 \
+            bash .github/scripts/atomesh/setup_mesh.sh "$PWD" "$PWD/atomesh-build-validation" \
+            "$ATOMESH_PYTHON_IMAGE" "$PWD/atomesh-build-validation/build.env" "gha-${GITHUB_RUN_ID}"
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$PWD:/workspace/ATOM:ro" -v "$PWD/atomesh-build-validation/mesh-build:/mesh-build:ro" \
+            -e USER="$(id -un)" -e TORCHINDUCTOR_CACHE_DIR=/tmp/atomesh-ci-inductor \
+            -e XDG_CACHE_HOME=/tmp/atomesh-ci-cache \
+            -e HIP_VISIBLE_DEVICES= -e PYTHONPATH=/workspace/ATOM:/workspace/ATOM/tests \
+            -e ATOMESH_BINARY=/mesh-build/atomesh "$ATOMESH_PYTHON_IMAGE" \
+            python3 -m pytest -q /workspace/ATOM/tests/entrypoints/test_kv_cache_routing_relay.py
+
+      - name: Upload Mesh build and routing validation artifacts
+        if: ${{ always() && inputs.suite == 'agentic_scaling' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: atomesh-mesh-source-validation
+          path: atomesh-build-validation/mesh-build/
+          if-no-files-found: ignore
+
+      - name: Require measured calibration before allocating benchmark GPUs
+        if: ${{ inputs.suite == 'agentic_scaling' && inputs.run_model_benchmark }}
+        env:
+          ATOMESH_PYTHON_IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/atomesh/image_python.sh
+          python3 .github/scripts/atomesh/agentic_routing.py validate-matrix --matrix atomesh-matrix.json
 
       - name: Upload expanded matrix
         uses: actions/upload-artifact@v7
@@ -1477,6 +1592,17 @@ jobs:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
 
+      - name: Download the validated Mesh dependency lock
+        if: ${{ matrix.suite == 'agentic_scaling' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: atomesh-mesh-source-validation
+          path: atomesh-validated-mesh
+
+      - name: Pin Mesh dependencies for every scaling job
+        if: ${{ matrix.suite == 'agentic_scaling' }}
+        run: cp atomesh-validated-mesh/mesh-Cargo.lock atom/mesh/Cargo.lock
+
       - name: Cancel existing jobs on benchmark nodes
         if: ${{ github.event_name == 'schedule' && matrix.runner.slurm_submit_runner != 'atomesh-cicd' }}
         env:
@@ -1811,9 +1937,9 @@ jobs:
 
   summarize-results:
     name: Summarize ATOMesh benchmark results
-    needs: [run-model-benchmark]
+    needs: [run-model-benchmark, load-config]
     if: ${{ always() && !cancelled() && needs.run-model-benchmark.result != 'skipped' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.suite == 'agentic_scaling' && 'linux-atom-mi35x-1' || 'ubuntu-latest' }}
     outputs:
       has_results: ${{ steps.summary.outputs.has_results }}
     steps:
@@ -1826,6 +1952,35 @@ jobs:
           pattern: atomesh-model-benchmark-*
           merge-multiple: true
           path: atomesh-results
+
+      - name: Download paired experiment matrix
+        if: ${{ inputs.suite == 'agentic_scaling' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: atomesh-benchmark-matrix
+
+      - name: Compare 1P1D C with 2P2D 2C
+        if: ${{ inputs.suite == 'agentic_scaling' }}
+        env:
+          ATOMESH_PYTHON_IMAGE: ${{ needs.load-config.outputs.image }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/atomesh/image_python.sh
+          rc=0
+          python3 .github/scripts/atomesh/agentic_scaling.py report \
+            --matrix atomesh-matrix.json --results atomesh-results \
+            --output atomesh-scaling.json --summary atomesh-scaling.md || rc=$?
+          cat atomesh-scaling.md >> "$GITHUB_STEP_SUMMARY"
+          exit "${rc}"
+
+      - name: Upload paired scaling report
+        if: ${{ always() && inputs.suite == 'agentic_scaling' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: atomesh-agentic-scaling
+          path: |
+            atomesh-scaling.json
+            atomesh-scaling.md
 
       - name: Build benchmark summary
         id: summary

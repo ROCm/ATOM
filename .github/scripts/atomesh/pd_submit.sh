@@ -74,6 +74,16 @@ benchmark = cell.get("benchmark", {})
 accuracy = cell.get("accuracy", {})
 
 
+def pipeline_size(role):
+    args = shlex.split(str(role.get("extra_args", "")))
+    for i, arg in enumerate(args):
+        if arg == "--pipeline-parallel-size":
+            return int(args[i + 1])
+        if arg.startswith("--pipeline-parallel-size="):
+            return int(arg.split("=", 1)[1])
+    return 1
+
+
 class TrackedArgs(dict):
     """Remembers which keys the export mapping below actually reads."""
 
@@ -130,6 +140,9 @@ exports = {
     "TOPOLOGY": cell["topology"],
     "DISPLAY_TOPOLOGY": cell.get("display_topology", cell["topology"]),
     "ATOMESH_PD_WORKER_LAYOUT": cell.get("pd_worker_layout", "multi_node"),
+    "ATOMESH_SCALING_JSON": cell.get("scaling", {}),
+    "ATOMESH_PREINSTALLED_ONLY": "1" if cell.get("scaling") else "0",
+    "ATOMESH_CACHE_ROUTING_BUNDLE_JSON": benchmark.get("cache_routing_bundle", {}),
     "NODE_LIST": ",".join(cell["nodes"]),
     "NUM_NODES": cell["num_nodes"],
     "ISL_LIST": ",".join(str(v) for v in cell["isl"]),
@@ -142,6 +155,7 @@ exports = {
     "BENCHMARK_KIND": benchmark.get("kind", "random"),
     "AIPERF_DIR": benchmark.get("aiperf_dir", ""),
     "AIPERF_VENV": benchmark.get("aiperf_venv", ""),
+    "AIPERF_USE_PREINSTALLED": str(benchmark.get("aiperf_use_preinstalled", False)).lower(),
     "AIPERF_COMMIT": benchmark.get("aiperf_commit", ""),
     "AIPERF_SCENARIO": benchmark.get("scenario", ""),
     "AIPERF_PUBLIC_DATASET": benchmark.get("public_dataset", ""),
@@ -186,6 +200,8 @@ exports = {
     "DECODE_WORKERS": decode.get("workers", 1),
     "PREFILL_TP": prefill.get("tp", 8),
     "DECODE_TP": decode.get("tp", 8),
+    "PREFILL_PP_SIZE": pipeline_size(prefill),
+    "DECODE_PP_SIZE": pipeline_size(decode),
     "PREFILL_DCP_SIZE": prefill.get("dcp", 1),
     "DECODE_DCP_SIZE": decode.get("dcp", 1),
     "PREFILL_ENABLE_DP": str(prefill.get("enable_dp_attention", False)).lower(),
@@ -202,6 +218,8 @@ exports = {
     "DECODE_PORT": decode.get("port", 8020),
     "ROUTER_PORT": router.get("port", 8000),
     "ROUTER_POLICY": router.get("policy", "random"),
+    "ROUTER_PREFILL_POLICY": router.get("prefill_policy", ""),
+    "ROUTER_DECODE_POLICY": router.get("decode_policy", ""),
     "PROMETHEUS_PORT": router.get("prometheus_port", 29100),
     "KV_CACHE_DTYPE": server_args.get("kv_cache_dtype", "fp8"),
     "BLOCK_SIZE": server_args.get("block_size", 16),
@@ -329,6 +347,8 @@ if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
 fi
 
 mkdir -p "${RESULT_DIR}"
+
+printf '%s\n' "${CELL_JSON}" > "${RESULT_DIR}/${ATOMESH_CELL_ID}.cell.json"
 
 if [[ "${DRY_RUN}" -eq 1 ]]; then
   echo "=== dry-run only; sbatch is not invoked ==="

@@ -149,6 +149,11 @@ def required_node_count(
 ) -> int:
     if pd_worker_layout == "single_node":
         return 1
+    if pd_worker_layout == "paired_nodes":
+        prefill = int(prefill_cfg.get("workers", 1))
+        if prefill != int(decode_cfg.get("workers", 1)):
+            raise ValueError("paired_nodes requires equal P and D worker counts")
+        return prefill
     if pd_worker_layout == "prefill_single_node":
         return 1 + int(decode_cfg.get("workers", 1))
     if pd_worker_layout == "decode_single_node":
@@ -442,6 +447,16 @@ def build_cells(
     override_benchmark_concurrency: list[int] | None,
     override_eval_concurrency: list[int] | None,
 ) -> list[dict[str, Any]]:
+    if suite == "agentic_scaling":
+        return build_agentic_scaling_cells(
+            cfg,
+            model_filter=model_filter,
+            case_filter=case_filter,
+            benchmark_kind_filter=benchmark_kind_filter,
+            override_image=override_image,
+            override_benchmark_concurrency=override_benchmark_concurrency,
+            override_eval_concurrency=override_eval_concurrency,
+        )
     cells = []
     for model_name, model_cfg in (cfg.get("models") or {}).items():
         if model_filter and model_name not in model_filter:
@@ -469,6 +484,102 @@ def build_cells(
                     override_eval_concurrency=override_eval_concurrency,
                 )
             )
+    return cells
+
+
+def build_agentic_scaling_cells(
+    cfg: dict[str, Any],
+    *,
+    model_filter: set[str] | None,
+    case_filter: set[str] | None,
+    benchmark_kind_filter: set[str] | None,
+    override_image: str | None,
+    override_benchmark_concurrency: list[int] | None,
+    override_eval_concurrency: list[int] | None,
+) -> list[dict[str, Any]]:
+    """Pair the requested nightly baselines with twice the workers and lanes."""
+    if override_benchmark_concurrency or override_eval_concurrency:
+        raise ValueError(
+            "agentic_scaling uses fixed C/2C pairs; select baseline case names"
+        )
+    experiment = cfg["agentic_scaling"]
+    model = experiment["model"]
+    names = experiment["baseline_cases"]
+    if model_filter and model_filter != {model}:
+        raise ValueError(f"agentic_scaling supports only {model}")
+    if case_filter and not case_filter <= set(names):
+        raise ValueError("agentic_scaling --case accepts only its 1P1D baseline names")
+    if benchmark_kind_filter and benchmark_kind_filter != {"aiperf_agentic"}:
+        raise ValueError("agentic_scaling requires aiperf_agentic")
+    model_cfg = cfg["models"][model]
+    baselines = {c["name"]: c for c in model_cfg["suites"]["nightly"]}
+    bundle_path = os.environ.get("ATOMESH_ROUTING_BUNDLE_FILE")
+    bundle = json.loads(Path(bundle_path).read_text()) if bundle_path else {}
+    cells = []
+    for name in names:
+        if case_filter and name not in case_filter:
+            continue
+        baseline = baselines[name]
+        concurrency = parse_int_list(baseline["concurrency"], "concurrency")
+        if len(concurrency) != 1 or concurrency[0] <= 0:
+            raise ValueError(f"{name} must have one positive baseline concurrency")
+        for scale in (1, 2):
+            case = copy.deepcopy(baseline)
+            case["prefill"]["workers"] = scale
+            case["decode"]["workers"] = scale
+            case["pd_worker_layout"] = "single_node" if scale == 1 else "paired_nodes"
+            case["concurrency"] = [concurrency[0] * scale]
+            case["router"] = (
+                {"policy": "random"}
+                if scale == 1
+                else {
+                    "policy": "kv_cache_aware",
+                    "prefill_policy": "kv_cache_aware",
+                    "decode_policy": "kv_cache_aware",
+                }
+            )
+            case["run_eval"] = False
+            case["benchmark"]["aiperf_use_preinstalled"] = True
+            case["benchmark"]["cache_routing_bundle"] = bundle
+            if bundle:
+                case["nodes"] = bundle["nodes"][:scale]
+            case["env"].setdefault("common", {}).update(
+                ATOMESH_PREINSTALLED_ONLY="1",
+                # Each process gets its validated execution-specific config
+                # at launch; never inherit another job's routing identity.
+                ATOM_CACHE_ROUTING_CONFIG="",
+                ATOM_CACHE_ROUTING_CALIBRATION="",
+            )
+            if scale == 2:
+                case["name"] = name.replace("1p1d", "2p2d").rsplit("-c", 1)[0]
+                case["name"] += f"-c{concurrency[0] * 2}"
+                case["topology"] = "2p2d_cpp4_dcp4"
+            case["display_topology"] = f"{scale}P{scale}D-CPP4-DCP4"
+            cell = build_cell(
+                cfg=cfg,
+                model_name=model,
+                model_cfg=model_cfg,
+                suite_name="agentic_scaling",
+                suite_cfg=case,
+                override_image=override_image,
+                override_benchmark_concurrency=None,
+                override_eval_concurrency=None,
+            )
+            # Candidate pools must never inflate the requested allocation.
+            cell["num_nodes"] = scale
+            if bundle and cell["nodes"] != bundle["nodes"][:scale]:
+                raise ValueError(
+                    "scaling must allocate the calibrated nodes in slot order; check runner/node overrides"
+                )
+            cell["scaling"] = {
+                "baseline_case": name,
+                "baseline_concurrency": concurrency[0],
+                "scale": scale,
+                "active_gpus": 8 * scale,
+                "allocated_gpus": int(cell["runner"].get("gpus_per_node", 8)) * scale,
+                "routing_policy": case["router"]["policy"],
+            }
+            cells.append(cell)
     return cells
 
 

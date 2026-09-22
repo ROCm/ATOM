@@ -16,6 +16,7 @@ ATOMESH_PD_WORKER_LAYOUT="${ATOMESH_PD_WORKER_LAYOUT:-multi_node}"
 SINGLE_NODE_PD=0
 PREFILL_SINGLE_NODE_PD=0
 DECODE_SINGLE_NODE_PD=0
+PAIRED_NODES_PD=0
 case "${ATOMESH_PD_WORKER_LAYOUT}" in
   single_node)
     SINGLE_NODE_PD=1
@@ -26,12 +27,17 @@ case "${ATOMESH_PD_WORKER_LAYOUT}" in
   decode_single_node)
     DECODE_SINGLE_NODE_PD=1
     ;;
+  paired_nodes)
+    PAIRED_NODES_PD=1
+    ;;
 esac
 
 xP="${xP:-1}"
 yD="${yD:-1}"
 PREFILL_TP_SIZE="${PREFILL_TP_SIZE:-8}"
 DECODE_TP_SIZE="${DECODE_TP_SIZE:-8}"
+PREFILL_PP_SIZE="${PREFILL_PP_SIZE:-1}"
+DECODE_PP_SIZE="${DECODE_PP_SIZE:-1}"
 PREFILL_DCP_SIZE="${PREFILL_DCP_SIZE:-1}"
 DECODE_DCP_SIZE="${DECODE_DCP_SIZE:-1}"
 PREFILL_ENABLE_DP="${PREFILL_ENABLE_DP:-false}"
@@ -93,7 +99,7 @@ done
 unset shifted_port_name
 unset -f validate_shifted_port
 USE_EXPLICIT_DP_PORTS=0
-if [[ "${SINGLE_NODE_PD}" == "1" || "${PREFILL_SINGLE_NODE_PD}" == "1" || "${DECODE_SINGLE_NODE_PD}" == "1" ]]; then
+if [[ "${SINGLE_NODE_PD}" == "1" || "${PREFILL_SINGLE_NODE_PD}" == "1" || "${DECODE_SINGLE_NODE_PD}" == "1" || "${PAIRED_NODES_PD}" == "1" ]]; then
   USE_EXPLICIT_DP_PORTS=1
 fi
 
@@ -247,11 +253,12 @@ dump_launch_info() {
 apply_prefixed_env() {
   local prefix="$1"
   local role_ip="$2"
+  local role_handshake_port="${3:-${HANDSHAKE_PORT}}"
   local name raw value
   while IFS='=' read -r name raw; do
     [[ "${name}" == "${prefix}"* ]] || continue
     value="${raw//\$\{ROLE_IP\}/${role_ip}}"
-    value="${value//\$\{HANDSHAKE_PORT\}/${HANDSHAKE_PORT}}"
+    value="${value//\$\{HANDSHAKE_PORT\}/${role_handshake_port}}"
     export "${name#${prefix}}=${value}"
   done < <(env)
 }
@@ -268,6 +275,7 @@ ROLE_ENV_NAMES=()
 apply_role_env() {
   local prefix="$1"
   local role_ip="$2"
+  local role_handshake_port="${3:-${HANDSHAKE_PORT}}"
   local name
   for name in ${ROLE_ENV_NAMES[@]+"${ROLE_ENV_NAMES[@]}"}; do
     unset "${name}"
@@ -279,8 +287,8 @@ apply_role_env() {
   done < <(env)
   # A name the common block also sets was just unset with the previous role's,
   # so put the common value back before the role overrides it.
-  apply_prefixed_env "ATOMESH_ENV_" "${role_ip}"
-  apply_prefixed_env "${prefix}" "${role_ip}"
+  apply_prefixed_env "ATOMESH_ENV_" "${role_ip}" "${role_handshake_port}"
+  apply_prefixed_env "${prefix}" "${role_ip}" "${role_handshake_port}"
 }
 
 host_ip="$(echo "${IPADDRS}" | tr ',' '\n' | sed -n "$((NODE_RANK + 1))p")"
@@ -316,6 +324,19 @@ if [[ "${SINGLE_NODE_PD}" == "1" ]]; then
   decode_ips+=("${IP_ARRAY[0]}")
   decode_ports+=("${DECODE_PORT}")
   decode_args+=(--decode "http://${IP_ARRAY[0]}:${DECODE_PORT}")
+elif [[ "${PAIRED_NODES_PD}" == "1" ]]; then
+  if (( xP != yD || ${#IP_ARRAY[@]} != xP || PREFILL_PP_SIZE * PREFILL_TP_SIZE + DECODE_PP_SIZE * DECODE_TP_SIZE > 8 )); then
+    echo "ERROR: paired_nodes needs one P/D pair per 8-GPU node" >&2
+    exit 2
+  fi
+  for idx in "${!IP_ARRAY[@]}"; do
+    prefill_ips+=("${IP_ARRAY[$idx]}")
+    prefill_ports+=("${PREFILL_PORT}")
+    prefill_args+=(--prefill "http://${IP_ARRAY[$idx]}:${PREFILL_PORT}")
+    decode_ips+=("${IP_ARRAY[$idx]}")
+    decode_ports+=("${DECODE_PORT}")
+    decode_args+=(--decode "http://${IP_ARRAY[$idx]}:${DECODE_PORT}")
+  done
 elif [[ "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   for idx in $(seq 0 $((xP - 1))); do
     prefill_port=$((PREFILL_PORT + idx))
@@ -670,13 +691,25 @@ write_metadata() {
 EOF
 }
 
+configure_cache_catalog() {
+  local role="$1"
+  [[ "${ROUTER_POLICY}" == "kv_cache_aware" ]] || return 0
+  local catalog_port=$((18610 + ATOMESH_SERVICE_PORT_OFFSET))
+  [[ "${role}" == "prefill" ]] || catalog_port=$((catalog_port + 1))
+  ATOM_CACHE_ROUTING_CONFIG="$(python3 "${ATOMESH_SCRIPT_DIR}/agentic_routing.py" role \
+    --role "${role}" --rank "${NODE_RANK}" --host "${host_name}" \
+    --ip "${host_ip}" --port "${catalog_port}")"
+  export ATOM_CACHE_ROUTING_CONFIG
+}
+
 start_prefill() {
   local log_name="$1"
   local server_port="${2:-${PREFILL_PORT}}"
   local handshake_port="${3:-${HANDSHAKE_PORT}}"
   local dp_master_port="${4:-${PREFILL_DP_MASTER_PORT}}"
   local dp_base_port="${5:-${PREFILL_DP_BASE_PORT}}"
-  apply_role_env "ATOMESH_PREFILL_ENV_" "${host_ip}"
+  apply_role_env "ATOMESH_PREFILL_ENV_" "${host_ip}" "${handshake_port}"
+  configure_cache_catalog prefill
   reset_lmcache_disk
   local -a prefill_cache_env=()
   build_server_cache_env "prefill" "${server_port}" prefill_cache_env
@@ -714,7 +747,8 @@ start_decode() {
   local handshake_port="${3:-${HANDSHAKE_PORT}}"
   local dp_master_port="${4:-${DECODE_DP_MASTER_PORT}}"
   local dp_base_port="${5:-${DECODE_DP_BASE_PORT}}"
-  apply_role_env "ATOMESH_DECODE_ENV_" "${host_ip}"
+  apply_role_env "ATOMESH_DECODE_ENV_" "${host_ip}" "${handshake_port}"
+  configure_cache_catalog decode
   local max_conc
   max_conc="$(echo "${BENCH_MAX_CONCURRENCY}" | tr 'x,' '\n' | sort -n | tail -1)"
   local decode_max_num_seqs="${MAX_NUM_SEQS}"
@@ -782,6 +816,20 @@ start_router() {
     )
   fi
   local -a router_dp_aware_args=()
+  local -a router_role_policy_args=()
+  if [[ -n "${ROUTER_PREFILL_POLICY:-}" ]]; then
+    router_role_policy_args+=(--prefill-policy "${ROUTER_PREFILL_POLICY}")
+  fi
+  if [[ -n "${ROUTER_DECODE_POLICY:-}" ]]; then
+    router_role_policy_args+=(--decode-policy "${ROUTER_DECODE_POLICY}")
+  fi
+  if [[ "${router_policy}" == "kv_cache_aware" ]]; then
+    ATOM_CACHE_ROUTING_CALIBRATION="${RUNTIME_LOG_DIR}/cache-routing-calibration.json"
+    python3 "${ATOMESH_SCRIPT_DIR}/agentic_routing.py" router \
+      "${prefill_args[@]}" "${decode_args[@]}" \
+      --output "${ATOM_CACHE_ROUTING_CALIBRATION}"
+    export ATOM_CACHE_ROUTING_CALIBRATION
+  fi
   if is_agentic_dpa; then
     router_policy="dp_sticky"
     router_dp_aware_args=(--dp-aware)
@@ -796,6 +844,7 @@ start_router() {
     "${prefill_args[@]}"
     "${decode_args[@]}"
     --policy "${router_policy}"
+    "${router_role_policy_args[@]}"
     "${router_rank_mapping_args[@]}"
     "${router_dp_aware_args[@]}"
     --backend atom
@@ -857,6 +906,16 @@ run_benchmark() {
 }
 
 ensure_aiperf() {
+  if [[ "${AIPERF_USE_PREINSTALLED:-false}" == "true" || "${ATOMESH_PREINSTALLED_ONLY:-0}" == "1" ]]; then
+    AIPERF_BIN="$(command -v aiperf)" || {
+      echo "ERROR: this experiment requires AIPerf preinstalled in the image" >&2
+      return 1
+    }
+    python3 "${ATOMESH_SCRIPT_DIR}/agentic_scaling.py" preflight \
+      --aiperf "${AIPERF_BIN}" --output "${RUN_DIR}/aiperf-version.json"
+    return
+  fi
+  AIPERF_BIN="${AIPERF_VENV}/bin/aiperf"
   local current_commit=""
   if [[ -d "${AIPERF_DIR}/.git" ]]; then
     current_commit="$(git -C "${AIPERF_DIR}" rev-parse HEAD 2>/dev/null || true)"
@@ -950,19 +1009,24 @@ payload = {
     "mean_ttft_ms": avg("time_to_first_token"),
     "median_ttft_ms": pct("time_to_first_token", "p50"),
     "p90_ttft_ms": pct("time_to_first_token", "p90"),
+    "p95_ttft_ms": pct("time_to_first_token", "p95"),
     "p99_ttft_ms": pct("time_to_first_token", "p99"),
     "mean_itl_ms": avg("inter_token_latency"),
     "median_itl_ms": pct("inter_token_latency", "p50"),
     "p90_itl_ms": pct("inter_token_latency", "p90"),
+    "p95_itl_ms": pct("inter_token_latency", "p95"),
     "p99_itl_ms": pct("inter_token_latency", "p99"),
     "mean_e2el_ms": avg("request_latency"),
     "median_e2el_ms": pct("request_latency", "p50"),
     "p90_e2el_ms": pct("request_latency", "p90"),
+    "p95_e2el_ms": pct("request_latency", "p95"),
     "p99_e2el_ms": pct("request_latency", "p99"),
     "input_throughput": avg("input_token_throughput"),
     "output_throughput": avg("output_token_throughput"),
     "total_token_throughput": avg("total_token_throughput"),
     "successful_requests": avg("request_count"),
+    "failed_requests": avg("error_request_count"),
+    "request_error_rate_pct": avg("request_error_rate"),
     "completed": avg("request_count"),
     "benchmark_duration_s": avg("benchmark_duration")
     or data.get("benchmark_duration_s"),
@@ -1057,6 +1121,11 @@ run_aiperf_agentic_benchmark() {
 
     echo "[aiperf] ${result_file}"
     mkdir -p "${out_dir}"
+    if [[ "${ROUTER_POLICY}" == "kv_cache_aware" ]]; then
+      python3 "${ATOMESH_SCRIPT_DIR}/agentic_routing.py" decisions \
+        --url "http://127.0.0.1:${PROMETHEUS_PORT}/metrics" \
+        --output "${out_dir}/routing-before.json"
+    fi
     AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT="${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT}" \
     AIPERF_HTTP_TCP_USER_TIMEOUT="${AIPERF_HTTP_TCP_USER_TIMEOUT}" \
     AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES="${AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES}" \
@@ -1065,7 +1134,7 @@ run_aiperf_agentic_benchmark() {
     AIPERF_UI_REALTIME_METRICS_ENABLED=true \
       python3 "${ATOMESH_SCRIPT_DIR}/observability/collect_metrics.py" \
       --output "${out_dir}/metrics" "${report_args[@]}" -- \
-      "${AIPERF_VENV}/bin/aiperf" profile \
+      "${AIPERF_BIN}" profile \
       "${unsafe_args[@]}" \
       --scenario "${AIPERF_SCENARIO}" \
       --url "http://127.0.0.1:${ROUTER_PORT}" \
@@ -1102,6 +1171,11 @@ run_aiperf_agentic_benchmark() {
     fi
     write_aiperf_dashboard_json "${aiperf_json}" "${dashboard_json}" "${conc}"
     write_aiperf_chrome_trace "${out_dir}"
+    if [[ "${ROUTER_POLICY}" == "kv_cache_aware" ]]; then
+      python3 "${ATOMESH_SCRIPT_DIR}/agentic_routing.py" decisions \
+        --url "http://127.0.0.1:${PROMETHEUS_PORT}/metrics" \
+        --before "${out_dir}/routing-before.json" --output "${out_dir}/routing-decisions.json"
+    fi
   done
 }
 
@@ -1315,23 +1389,33 @@ run_benchmark_and_eval() {
 
 write_metadata
 
-if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
-  start_prefill "prefill-rank-0"
+if [[ "${NODE_RANK}" -eq 0 && "${ATOMESH_PREINSTALLED_ONLY:-0}" == "1" ]]; then
+  ensure_aiperf
+fi
+
+if [[ "${PAIRED_NODES_PD}" == "1" || ( "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ) ]]; then
+  start_prefill "prefill-rank-${NODE_RANK}"
   prefill_pid="${server_pid}"
-  decode_handshake_port=$((HANDSHAKE_PORT + PREFILL_TP_SIZE))
-  start_decode "decode-rank-0" "${DECODE_PORT}" "${decode_handshake_port}"
+  # Mooncake assigns a side-channel port to every PP x TP rank.
+  decode_handshake_port=$((HANDSHAKE_PORT + PREFILL_PP_SIZE * PREFILL_TP_SIZE))
+  start_decode "decode-rank-${NODE_RANK}" "${DECODE_PORT}" "${decode_handshake_port}"
   decode_pid="${server_pid}"
   trap 'cleanup_processes ${router_pid:-} ${prefill_pid:-} ${decode_pid:-}' EXIT
-  for ip in "${prefill_ips[@]}"; do
-    wait_http "http://${ip}:${PREFILL_PORT}/health" "prefill-${ip}" "${WAIT_SERVER_TIMEOUT}" "${prefill_pid}"
-  done
-  for ip in "${decode_ips[@]}"; do
-    wait_http "http://${ip}:${DECODE_PORT}/health" "decode-${ip}" "${WAIT_SERVER_TIMEOUT}" "${decode_pid}"
-  done
-  start_router
-  wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
-  run_benchmark_and_eval
-  cleanup_processes "${router_pid}" "${prefill_pid}" "${decode_pid}"
+  if [[ "${NODE_RANK}" -eq 0 ]]; then
+    for ip in "${prefill_ips[@]}"; do
+      wait_http "http://${ip}:${PREFILL_PORT}/health" "prefill-${ip}" "${WAIT_SERVER_TIMEOUT}" "${prefill_pid}"
+    done
+    for ip in "${decode_ips[@]}"; do
+      wait_http "http://${ip}:${DECODE_PORT}/health" "decode-${ip}" "${WAIT_SERVER_TIMEOUT}" "${decode_pid}"
+    done
+    start_router
+    wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
+    run_benchmark_and_eval
+  else
+    wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}"
+    wait_router_closed
+  fi
+  cleanup_processes "${router_pid:-}" "${prefill_pid}" "${decode_pid}"
 elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   prefill_pids=()
   for idx in $(seq 0 $((xP - 1))); do
