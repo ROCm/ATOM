@@ -204,6 +204,13 @@ impl PDRouter {
             Arc::new(PolicyRegistryAdapter::new(policy_registry.clone())),
         ));
 
+        if matches!(backend, BackendType::Atom)
+            && (policy_registry.get_prefill_policy().name() == "kv_cache_aware"
+                || policy_registry.get_decode_policy().name() == "kv_cache_aware")
+        {
+            crate::cache_index::CACHE_INDEX.start(&worker_registry, client.clone());
+        }
+
         Ok(PDRouter {
             worker_registry,
             policy_registry,
@@ -505,11 +512,19 @@ impl PDRouter {
         &self,
         context: &PDRequestContext<'_>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>, PairCtx), Response> {
+        self.plan_pd_pair_tokens(context, None).await
+    }
+
+    async fn plan_pd_pair_tokens(
+        &self,
+        context: &PDRequestContext<'_>,
+        tokens: Option<&[u32]>,
+    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>, PairCtx), Response> {
         let descriptor = RequestDescriptor {
             model_id: context.model_id,
             protocol: Some(Protocol::Http),
             text: context.request_text.as_deref(),
-            tokens: None,
+            tokens,
             headers: context.headers.as_deref(),
             stream: context.is_stream,
         };
@@ -843,6 +858,75 @@ impl PDRouter {
         }
     }
 
+    async fn render_for_cache<T: Serialize>(
+        &self,
+        request: &T,
+        context: &PDRequestContext<'_>,
+    ) -> Option<(Vec<u32>, String, usize, usize)> {
+        if self.policy_registry.get_prefill_policy().name() != "kv_cache_aware"
+            && self.policy_registry.get_decode_policy().name() != "kv_cache_aware"
+        {
+            return None;
+        }
+        if !matches!(context.route, "/v1/chat/completions" | "/v1/completions") {
+            return None;
+        }
+        let worker = self
+            .worker_registry
+            .get_prefill_workers()
+            .into_iter()
+            .find(|w| {
+                w.is_healthy()
+                    && context
+                        .model_id
+                        .is_none_or(|m| w.model_id() == m || w.model_id() == UNKNOWN_MODEL_ID)
+            })?;
+        let (namespace, block) = {
+            let sources = crate::cache_index::CACHE_INDEX.sources.read();
+            let source = sources.get(worker.url())?;
+            if !source.ready {
+                return None;
+            }
+            (
+                source.info["content_namespace"].as_str()?.to_string(),
+                source.info["canonical_block_size_tokens"].as_u64()? as usize,
+            )
+        };
+        let body = serde_json::to_value(request).ok()?;
+        let reserve = body["max_completion_tokens"]
+            .as_u64()
+            .or_else(|| body["max_tokens"].as_u64())
+            .unwrap_or(64) as usize;
+        let mut request = self
+            .client
+            .post(format!("{}{}/render", worker.base_url(), context.route))
+            .timeout(std::time::Duration::from_secs(1))
+            .json(&body);
+        if let Some(key) = worker.api_key() {
+            request = request.bearer_auth(key);
+        }
+        let rendered: Value = request
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let row = if context.route == "/v1/completions" {
+            let rows = rendered.as_array()?;
+            if rows.len() != 1 {
+                return None;
+            }
+            &rows[0]
+        } else {
+            &rendered
+        };
+        let tokens: Vec<u32> = serde_json::from_value(row["token_ids"].clone()).ok()?;
+        Some((tokens, namespace, block, reserve))
+    }
+
     /// ATOM Mooncake mode: P must run first and return kv_transfer_params; mesh
     /// enriches them with remote_dp_size/remote_tp_size, then forwards to D.
     /// Decode's response is streamed (or buffered) back to the client.
@@ -867,6 +951,7 @@ impl PDRouter {
             bool_to_static_str(context.is_stream),
         );
 
+        let rendered = Arc::new(self.render_for_cache(original_request, &context).await);
         let shared_request = Arc::new(original_request.clone());
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -874,10 +959,45 @@ impl PDRouter {
                 move |attempt: u32| {
                     let shared_request = Arc::clone(&shared_request);
                     let context = context.clone();
+                    let rendered = Arc::clone(&rendered);
                     async move {
-                        let (prefill, decode, ctx) = match self.plan_pd_pair(&context).await {
-                            Ok(t) => t,
-                            Err(resp) => return resp,
+                        let selection = rendered.as_ref().as_ref().and_then(
+                            |(tokens, namespace, block, reserve)| {
+                                crate::cache_index::CACHE_INDEX.select_pair(
+                                    &self.worker_registry.get_prefill_workers(),
+                                    &self.worker_registry.get_decode_workers(),
+                                    tokens,
+                                    namespace,
+                                    *block,
+                                    context.model_id,
+                                    matches!(
+                                        self.atom_pd_rank_mapping_policy,
+                                        AtomPdRankMappingPolicy::Idx2Idx
+                                    ),
+                                    *reserve,
+                                )
+                            },
+                        );
+                        let (prefill, decode, ctx) = if let Some(selected) = &selection {
+                            let ctx = match self
+                                .adapter
+                                .prepare_pair(selected.prefill.as_ref(), selected.decode.as_ref())
+                            {
+                                Ok(ctx) => ctx,
+                                Err(error) => return Self::handle_serialization_error(error),
+                            };
+                            (selected.prefill.clone(), selected.decode.clone(), ctx)
+                        } else {
+                            match self
+                                .plan_pd_pair_tokens(
+                                    &context,
+                                    rendered.as_ref().as_ref().map(|r| r.0.as_slice()),
+                                )
+                                .await
+                            {
+                                Ok(t) => t,
+                                Err(resp) => return resp,
+                            }
                         };
 
                         debug!(
@@ -893,6 +1013,18 @@ impl PDRouter {
                                 Err(e) => return Self::handle_serialization_error(e),
                             };
                         let mut decode_request_json = prefill_request_json.clone();
+                        if let Some(selected) = &selection {
+                            prefill_request_json["routing_hints"] = json!({
+                                "cache_load_policy": selected.load_policy,
+                                "planner_version": crate::cache_index::protocol::PLANNER_VERSION,
+                                "dispatch_id": selected.reservation.id,
+                            });
+                            decode_request_json["routing_hints"] = json!({
+                                "cache_load_policy": "skip",
+                                "planner_version": crate::cache_index::protocol::PLANNER_VERSION,
+                                "dispatch_id": selected.reservation.id,
+                            });
+                        }
                         if let Err(e) = self
                             .adapter
                             .inject_prefill_fields(&mut prefill_request_json, &ctx)
@@ -907,18 +1039,30 @@ impl PDRouter {
                         }
                         let correlation_id = self.adapter.correlation_id(&ctx);
 
-                        self.dispatch_atom_relay_internal(
-                            headers,
-                            prefill_request_json,
-                            decode_request_json,
-                            context,
-                            Arc::clone(&prefill),
-                            Arc::clone(&decode),
-                            ctx,
-                            start_time,
-                            correlation_id,
-                        )
-                        .await
+                        let response = self
+                            .dispatch_atom_relay_internal(
+                                headers,
+                                prefill_request_json,
+                                decode_request_json,
+                                context,
+                                Arc::clone(&prefill),
+                                Arc::clone(&decode),
+                                ctx,
+                                start_time,
+                                correlation_id,
+                            )
+                            .await;
+                        if let Some(selected) = selection {
+                            let reservation = selected.reservation;
+                            let (parts, body) = response.into_parts();
+                            let stream = body.into_data_stream().map(move |chunk| {
+                                let _keep_reservation = &reservation;
+                                chunk
+                            });
+                            Response::from_parts(parts, Body::from_stream(stream))
+                        } else {
+                            response
+                        }
                     }
                 }
             },

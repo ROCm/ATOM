@@ -38,6 +38,7 @@ futures-util = "0.3"
 futures = "0.3"
 dashmap = "6.1.0"
 blake3 = "1.5"
+sha2 = "0.10"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 bytemuck = { version = "1.21", features = ["derive"] }
 http = "1.1.0"

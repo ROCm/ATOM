@@ -75,7 +75,10 @@ impl ConfigValidator {
 
     fn validate_policy(policy: &PolicyConfig) -> ConfigResult<()> {
         match policy {
-            PolicyConfig::Random | PolicyConfig::RoundRobin | PolicyConfig::DpSticky => {}
+            PolicyConfig::Random
+            | PolicyConfig::RoundRobin
+            | PolicyConfig::DpSticky
+            | PolicyConfig::KvCacheAware => {}
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold: _,

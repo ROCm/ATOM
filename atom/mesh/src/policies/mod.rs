@@ -10,6 +10,8 @@ use async_trait::async_trait;
 use crate::core::{HashRing, Worker};
 
 mod cache_aware;
+mod kv_cache_aware;
+pub use kv_cache_aware::KvCacheAwarePolicy;
 mod dp_sticky;
 mod factory;
 mod power_of_two;

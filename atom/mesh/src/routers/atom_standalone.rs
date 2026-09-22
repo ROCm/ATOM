@@ -393,7 +393,11 @@ impl RouterTrait for AtomStandaloneRouter {
     }
 
     async fn render_tokens(&self, chat: bool, body: &Value) -> Response {
-        let method = if chat { "render_chat_completions" } else { "render_completions" };
+        let method = if chat {
+            "render_chat_completions"
+        } else {
+            "render_completions"
+        };
         match self.call_service(method, body, "exact render") {
             Ok(value) => Json(value).into_response(),
             Err(response) => response,
