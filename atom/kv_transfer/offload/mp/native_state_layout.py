@@ -28,7 +28,6 @@ class NativeStateMPKernelGroup:
     tokens_per_block: int
     sw_size_tokens: int = -1
     recurrent_state: bool = False
-    null_block_id: int | None = None
     extra_object_group_tag: int = 0
 
 
@@ -84,7 +83,6 @@ class NativeStateMPLayout:
                 tokens_per_block=group.tokens_per_block,
                 sw_size_tokens=group.sw_size_tokens,
                 recurrent_state=group.recurrent_state,
-                null_block_id=group.null_block_id,
                 extra_object_group_tag=group.extra_object_group_tag,
             )
             for group in self.kernel_groups
@@ -133,10 +131,11 @@ def build_native_state_mp_layout(
 ) -> NativeStateMPLayout:
     """Validate and alias PAGE plus compact native STATE for LMCache MP.
 
-    PAGE uses engine group zero with no null ID. STATE ordinal ``j`` uses
-    group ``1+j``, one logical chunk per block, and null ID ``-1``. The final
-    ordinal's final region ends exactly at ``image_bytes``; its dim-0 stride
-    continues to address the original full PAGE region.
+    PAGE uses engine group zero. STATE ordinal ``j`` uses group ``1+j`` and one
+    logical chunk per block. The MP server's global null block ID must be
+    configured as ``-1``. The final ordinal's final region ends exactly at
+    ``image_bytes``; its dim-0 stride continues to address the original full
+    PAGE region.
     """
     block_size = _positive_int("native PAGE block size", block_size)
     chunk_size = _positive_int("native checkpoint chunk size", chunk_size)
@@ -261,7 +260,6 @@ def build_native_state_mp_layout(
             tokens_per_block=chunk_size if identity[2] else block_size,
             sw_size_tokens=chunk_size if identity[2] else -1,
             recurrent_state=bool(identity[2]),
-            null_block_id=-1 if identity[2] else None,
         )
         for identity, indices in by_identity.items()
     )

@@ -123,13 +123,11 @@ def test_layout_coalesces_equal_shapes_inside_ordinal_and_preserves_trim_stride(
         if group.engine_group_id:
             assert group.tokens_per_block == group.sw_size_tokens == 16
             assert group.recurrent_state is True
-            assert group.null_block_id == -1
             assert group.extra_object_group_tag == 0
         else:
             assert group.tokens_per_block == 4
             assert group.sw_size_tokens == -1
             assert group.recurrent_state is False
-            assert group.null_block_id is None
     assert [
         (r.unit_ordinal, r.region_index, r.image_offset, r.nbytes)
         for r in layout.state_regions
@@ -299,7 +297,13 @@ def test_actual_lmcache_registration_preserves_native_aliases_and_stride():
     normalized, formats = normalize_and_discover_per_layer_formats(
         list(layout.tensors), layout.layer_groups, EngineType.ATOM
     )
-    manager = KVLayerGroupsManager(normalized, formats, groups, 16)
+    manager = KVLayerGroupsManager(
+        normalized,
+        formats,
+        groups,
+        16,
+        separate_object_groups=True,
+    )
     assert [tuple(group.layer_indices) for group in manager.kernel_groups] == list(
         layout.layer_groups
     )

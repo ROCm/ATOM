@@ -23,13 +23,13 @@ release save-source PAGE blocks before the remote store becomes terminal.
 ## Run
 
 Install the matching ATOM and LMCache changes. The LMCache build must include
-per-group `null_block_id`, automatic object grouping for non-default null
-policies, and sparse null handling. Run the MP server on the same host, with GPU
-IPC access to the ATOM worker allocations:
+the global `--null-block-id` option and sparse null handling. Run the MP server
+on the same host, with GPU IPC access to the ATOM worker allocations:
 
 ```bash
 lmcache server --host 127.0.0.1 --port 5555 \
   --chunk-size 256 \
+  --null-block-id -1 --separate-object-groups \
   --supported-transfer-mode lmcache_driven --l1-size-gb 64
 ```
 
@@ -81,14 +81,14 @@ alone cannot identify changed weight contents.
 
 ## Lifetime and representation
 
-Engine group 0 contains PAGE views and declares `null_block_id=None`, so PAGE 0
-is ordinary data. Native image ordinal `j` uses engine group `1+j`, aliases the
-same PAGE allocation, and declares a one-chunk recurrent window with null ID
-`-1`. Every ordinal is present at the checkpoint endpoint; earlier chunks use
-all-null STATE groups. The non-default null policies make LMCache automatically
-separate PAGE from STATE and group all STATE ordinals into one object.
-The final image region is trimmed at `image_bytes`, preserving the original
-physical PAGE stride.
+Engine group 0 contains PAGE views, and PAGE block `0` is ordinary data. Native
+image ordinal `j` uses engine group `1+j`, aliases the same PAGE allocation,
+and declares a one-chunk recurrent window. Every ordinal is present at the
+checkpoint endpoint; earlier chunks use `-1` in all STATE groups. The MP server
+uses that server-wide sentinel to distinguish absent chunks. Explicit
+`--separate-object-groups` separates PAGE from STATE and groups all STATE
+ordinals into one object. The final image region is trimmed at `image_bytes`,
+preserving the original physical PAGE stride.
 
 The scheduler dispatches one combined PAGE/STATE save generation at a time per
 request, with round-robin admission and count/byte bounds. It acquires the exact
