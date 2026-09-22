@@ -119,6 +119,22 @@ def test_scheduler_selects_native_state_from_block_manager(monkeypatch):
     assert scheduler._impl.manager is manager
 
 
+def test_scheduler_shell_forwards_block_lifecycle_hooks():
+    calls = []
+    scheduler = LMCacheMPConnectorScheduler(_config())
+    scheduler._impl = SimpleNamespace(
+        should_defer_free=lambda seq: seq == "held",
+        send_finished=lambda req_id: calls.append(("sent", req_id)),
+        source_blocks_released=lambda seq: calls.append(("released", seq)),
+    )
+
+    assert scheduler.should_defer_free("held") is True
+    assert scheduler.should_defer_free("free") is False
+    scheduler.send_finished("request-1")
+    scheduler.source_blocks_released("request-2")
+    assert calls == [("sent", "request-1"), ("released", "request-2")]
+
+
 def test_plain_page_layout_uses_generic_implementations(monkeypatch):
     selected = []
 

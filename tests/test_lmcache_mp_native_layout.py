@@ -266,6 +266,7 @@ def test_attention_export_retains_page_owners_native_spec_and_restore_callback(
         execute_paged_state_copies=restore,
     )
     export_method.__globals__["_uses_pd_staging"] = lambda config: False
+    export_method.__globals__["_validate_fp4_indexer_transfer"] = lambda config: None
     transfer = export_method(builder)
     transfer.set_block_count(num_blocks)
     assert transfer.paged_state_checkpoint_spec is spec

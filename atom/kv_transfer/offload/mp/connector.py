@@ -151,6 +151,15 @@ class LMCacheMPConnectorScheduler(KVConnectorSchedulerBase):
     def request_finished(self, seq: Any) -> None:
         self._require_impl().request_finished(seq)
 
+    def should_defer_free(self, seq: Any) -> bool:
+        return self._require_impl().should_defer_free(seq)
+
+    def send_finished(self, req_id: Any) -> None:
+        self._require_impl().send_finished(req_id)
+
+    def source_blocks_released(self, seq: Any) -> None:
+        self._require_impl().source_blocks_released(seq)
+
     def __getattr__(self, name: str) -> Any:
         impl = self.__dict__.get("_impl")
         if impl is None:

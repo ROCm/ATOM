@@ -1902,7 +1902,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         elem_fp32 = 4
 
         block_regions: list[KVTransferRegion] = []
-        block_tensor_views: list[torch.Tensor] = []
+        block_tensor_sources: list[torch.Tensor] = []
         swa_block_regions: list[KVTransferRegion] = []
         slot_regions: list[KVTransferRegion] = []
 
@@ -1930,16 +1930,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         for plane, row_bytes, role in planes:
             if not plane.is_contiguous():
                 raise RuntimeError("a KV plane must be contiguous to be transferred")
-            # Retain the real allocation owner, excluding the reverse-indexed
-            # SLOT tail. One opaque physical slot represents one scheduler
-            # PAGE; envelope rows span multiple layers, not logical tokens.
-            block_tensor_views.append(
-                plane[: self.num_blocks * geo.envelope_rows].view(
-                    self.num_blocks,
-                    1,
-                    geo.block_bytes(row_bytes) // plane.element_size(),
-                )
-            )
+            block_tensor_sources.append(plane)
             block_regions.append(
                 KVTransferRegion(
                     plane.data_ptr(),
@@ -1960,7 +1951,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     raise RuntimeError(
                         "a CSA indexer layer must be contiguous to be transferred"
                     )
-                block_tensor_views.append(view.view(self.num_blocks, 1, view.stride(0)))
+                block_tensor_sources.append(view)
                 block_regions.append(
                     KVTransferRegion(
                         view.data_ptr(),
@@ -1979,6 +1970,30 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 "DSV4 PAGE transfer regions do not cover the sized PAGE unit: "
                 f"regions={transfer_page_bytes}, "
                 f"checkpoint={checkpoint_spec.page_unit_bytes}"
+            )
+
+        # LMCache MP needs one block-major tensor for every PAGE region. Build
+        # byte views only after validating the declared checkpoint geometry so
+        # malformed layouts fail with the useful region-size error above. The
+        # source tensors are not guaranteed to expose rows as dimension zero;
+        # flattening their byte representation also handles the one-dimensional
+        # allocation owners used by the transfer-geometry tests.
+        block_tensor_views: list[torch.Tensor] = []
+        for source, region in zip(block_tensor_sources, block_regions, strict=True):
+            byte_view = source.view(torch.uint8).reshape(-1)
+            required_bytes = self.num_blocks * region.unit_bytes
+            if byte_view.numel() < required_bytes:
+                raise RuntimeError(
+                    f"DSV4 PAGE tensor for {region.semantic_role!r} has "
+                    f"{byte_view.numel()} bytes, fewer than the "
+                    f"{required_bytes} bytes declared by its region"
+                )
+            block_tensor_views.append(
+                byte_view[:required_bytes].view(
+                    self.num_blocks,
+                    1,
+                    region.unit_bytes,
+                )
             )
 
         # Full per-request SLOT (legacy field name: `swa_block_regions`) is one
