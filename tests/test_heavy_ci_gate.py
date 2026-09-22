@@ -1,10 +1,21 @@
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GATE_SCRIPT = REPO_ROOT / ".github" / "scripts" / "check_heavy_ci_gate.sh"
+
+# `gh` is faked below, `jq` is not: the gate parses the event JSON with it. A
+# GitHub runner ships jq, which is also the only place this script runs for
+# real, so skipping here costs nothing there. Worth knowing that it costs
+# everything on a box without jq -- these become silently unrun rather than red.
+pytestmark = pytest.mark.skipif(
+    shutil.which("jq") is None, reason="the CI gate script parses its event with jq"
+)
 
 
 def _run_gate(

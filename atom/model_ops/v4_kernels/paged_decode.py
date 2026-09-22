@@ -60,6 +60,7 @@ from aiter.ops.triton.utils.device_info import get_num_sms
 
 from atom.model_ops.sparse_attn_v4 import _sparse_attn_ragged_torch
 from atom.model_ops.v4_kernels.pool_index import row_offset
+from atom.utils import envs
 from atom.utils.decorators import mark_trace
 
 LOG2E = 1.4426950408889634  # log2(e); folded into qk_scale so softmax can use exp2.
@@ -911,6 +912,50 @@ def sparse_attn_v4_paged_decode_reference(
     return _sparse_attn_ragged_torch(q, unified_kv, attn_sink, topk_idxs, softmax_scale)
 
 
+def _sparse_attn_v4_paged_decode_prefill_asm(
+    unified_kv: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    empty_kv_indptr: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    unified_kv_rope: torch.Tensor,
+    q_packed_in: torch.Tensor,
+    q_rope_in: torch.Tensor,
+) -> torch.Tensor:
+    """Run H=128 fp8 decode through the sparse-prefill ASM kernel.
+
+    Decode has no flat extend source: its current token has already been
+    written to ``unified_kv`` and included in ``kv_indices``. Feed the decode
+    CSR as the prefill kernel's prefix stream and an empty CSR as its extend
+    stream. The KV tensors for that unused stream alias the unified pools so
+    the launch needs no per-layer dummy allocation.
+    """
+    from aiter.ops.mla_sparse_prefill import mla_sparse_prefill_fp8_asm
+
+    n = q_packed_in.shape[0]
+    if empty_kv_indptr.numel() < n + 1:
+        raise ValueError(
+            "V4 prefill-ASM decode needs an all-zero empty_kv_indptr with at "
+            f"least N+1={n + 1} entries, got {empty_kv_indptr.numel()}"
+        )
+
+    return mla_sparse_prefill_fp8_asm(
+        q_nope=q_packed_in,
+        q_rope=q_rope_in,
+        unified_kv_nope=unified_kv,
+        unified_kv_rope=unified_kv_rope,
+        kv_indices_prefix=kv_indices,
+        kv_indptr_prefix=kv_indptr[: n + 1],
+        kv_nope=unified_kv,
+        kv_rope=unified_kv_rope,
+        kv_indices_extend=kv_indices[:0],
+        kv_indptr_extend=empty_kv_indptr[: n + 1],
+        attn_sink=attn_sink,
+        softmax_scale=softmax_scale,
+    )
+
+
 def _sparse_attn_v4_paged_decode_asm(
     unified_kv: torch.Tensor,
     kv_indices: torch.Tensor,
@@ -1065,13 +1110,16 @@ def sparse_attn_v4_paged_decode(
     q_rope_in: torch.Tensor | None = None,
     qo_indptr: torch.Tensor | None = None,
     kv_last_page_lens: torch.Tensor | None = None,
+    empty_kv_indptr: torch.Tensor | None = None,
     prefix: str = "",
 ) -> torch.Tensor:
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
-    Native 2buff fp8 (``unified_kv_rope`` provided): routes to the aiter asm
-    kernel (op5) with pre-packed fp8 Q (``q_packed_in``/``q_rope_in``); the
-    fp8 NoPE pool + bf16 RoPE pool are read with no requant.
+    Native 2buff fp8 (``unified_kv_rope`` provided): normally routes to the
+    aiter decode ASM kernel (op5). With
+    ``ATOM_USE_V4_PREFILL_ASM_FOR_DECODE=1``, gfx1250 H=128 instead reuses the
+    sparse-prefill ASM kernel with an empty extend stream. Both paths consume
+    pre-packed fp8 Q and the fp8 NoPE + bf16 RoPE pools with no requant.
 
     Otherwise (bf16): the existing Triton / reference path. When ``kv_scales``
     is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and is dequantized
@@ -1079,6 +1127,24 @@ def sparse_attn_v4_paged_decode(
     unreachable from the model).
     """
     if unified_kv_rope is not None:
+        if (
+            envs.ATOM_USE_V4_PREFILL_ASM_FOR_DECODE
+            and q_packed_in is not None
+            and q_packed_in.shape[1] == 128
+            and empty_kv_indptr is not None
+            and get_gfx() == "gfx1250"
+        ):
+            return _sparse_attn_v4_paged_decode_prefill_asm(
+                unified_kv,
+                kv_indices,
+                kv_indptr,
+                empty_kv_indptr,
+                attn_sink,
+                softmax_scale,
+                unified_kv_rope,
+                q_packed_in,
+                q_rope_in,
+            )
         return _sparse_attn_v4_paged_decode_asm(
             unified_kv,
             kv_indices,

@@ -44,9 +44,9 @@ Three decisions worth knowing about, each exact rather than approximate:
    ``KimiKDAAttention`` -- and all of its state-cache, TP and CUDA-graph
    integration -- reusable unchanged.
 
-Not yet wired: the MTP draft layer (checkpoint layer 45) or multimodal input.
-The checkpoint's unreachable vision tower is skipped on the text-only path.
-See ``recipes/GLM-5.3-Flash.md``.
+The checkpoint's layer 45 is wired separately as the reusable NextN draft block
+in ``glm5_next_mtp.py``. Multimodal input remains outside this text-only path,
+which skips the checkpoint's vision tower. See ``recipes/GLM-5.3-Flash.md``.
 """
 
 from itertools import islice
@@ -393,6 +393,7 @@ class Glm5NextMoE(nn.Module):
         config,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         self.tp_size = get_tp_group().world_size
@@ -400,6 +401,7 @@ class Glm5NextMoE(nn.Module):
         self.n_routed_experts = int(config.n_routed_experts)
         self.n_shared_experts = int(config.n_shared_experts or 0)
         self.swiglu_limit = float(getattr(config, "swiglu_limit", 10.0))
+        self.reduce_results = reduce_results
 
         ep_group = get_ep_group().device_group
         self.ep_size = ep_group.size()
@@ -468,7 +470,7 @@ class Glm5NextMoE(nn.Module):
             out = out * self.routed_scaling_factor
         if shared_output is not None:
             out = out + shared_output
-        if self.tp_size > 1:
+        if self.tp_size > 1 and self.reduce_results:
             out = tensor_model_parallel_all_reduce(out)
         return out.view(num_tokens, hidden_dim)
 
@@ -581,6 +583,7 @@ class Glm5NextIndexer(Indexer):
         cache_config,
         use_wk_weights_proj_fusion: bool = False,
         prefix: str = "",
+        is_mtp: bool = False,
     ) -> None:
         super().__init__(
             atom_config,
@@ -593,6 +596,7 @@ class Glm5NextIndexer(Indexer):
             prefix,
         )
         self.index_kpool = int(getattr(config, "index_kpool", 1) or 1)
+        self.is_mtp = is_mtp
         always_select_tail = bool(
             getattr(config, "index_kpool_always_select_tail", True)
         )
@@ -692,6 +696,11 @@ class Glm5NextIndexer(Indexer):
             state_slot_idx_in = (
                 None if gdn is None else gdn.non_spec_state_indices_in_tensor
             )
+            if state_slot_idx is None and gdn is not None:
+                # ReplaySSM retains one committed request slot during verify.
+                state_slot_idx = gdn.slot_idx
+                if state_slot_idx is None and gdn.spec_state_indices_tensor is not None:
+                    state_slot_idx = gdn.spec_state_indices_tensor[:, 0]
             if state_slot_idx is None:
                 # The profile/warmup forward carries no block tables, so the
                 # builder leaves gdn_metadata unset. That forward is a dummy
@@ -724,7 +733,7 @@ class Glm5NextIndexer(Indexer):
                 tail_cache,
                 state_slot_idx_in,
                 state_slot_idx,
-                positions,
+                positions - int(self.is_mtp),
                 self.sparse_kv_indices_buffer,
                 self.topk_tokens,
                 self.index_kpool,
@@ -813,6 +822,7 @@ class Glm5NextMLAAttention(nn.Module):
         layer_num: int,
         rotary_emb: nn.Module,
         prefix: str = "",
+        is_mtp: bool = False,
     ) -> None:
         super().__init__()
         config = _text_config(atom_config.hf_config)
@@ -894,6 +904,7 @@ class Glm5NextMLAAttention(nn.Module):
             atom_config.kv_cache_dtype,
             False,  # GLM-5.3 ships wk / weights_proj unfused
             f"{prefix}.indexer",
+            is_mtp=is_mtp,
         )
 
         self.rotary_emb = rotary_emb
@@ -909,6 +920,9 @@ class Glm5NextMLAAttention(nn.Module):
         # that `is_sparse=True` then makes MLA read, so leaving it uncalled
         # gives the sparse path an empty selection buffer rather than an error.
         self.run_indexer = not force_dense
+        # NextN step 0 populates the draft layer's sparse selection; later
+        # speculative steps reuse it when index_share_for_mtp_iteration=true.
+        self.skip_topk = False
 
         mla_modules = MLAModules(
             q_lora_rank=self.q_lora_rank,
@@ -960,7 +974,7 @@ class Glm5NextMLAAttention(nn.Module):
         )
         # Drive the indexer before MLA: it writes this layer's pooled index
         # keys and the selected KV slots that the sparse MLA path then reads.
-        if self.run_indexer:
+        if self.run_indexer and not self.skip_topk:
             self.indexer(hidden_states, q_c, None, positions, self.rotary_emb)
         return self.mla_attn(q_c, kv_c, k_pe, positions)
 

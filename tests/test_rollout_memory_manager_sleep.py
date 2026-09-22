@@ -40,7 +40,9 @@ from atom.utils.graph_holders import register_graph_holder
 class _Runner(MemoryManagerMixin):
     """The surface `MemoryManagerMixin` documents, and nothing else."""
 
-    def __init__(self, *, enforce_eager, keep_resident, with_graphs=True):
+    def __init__(
+        self, *, enforce_eager, keep_resident, with_graphs=True, available_blocks=7
+    ):
         self.device = torch.device("cpu")
         self.label = "test"
         self.enforce_eager = enforce_eager
@@ -56,12 +58,18 @@ class _Runner(MemoryManagerMixin):
         self.tokenID_processor = SimpleNamespace(clean=lambda: None)
         self.allocated_blocks = []
         self.captures = 0
+        # What a fresh sizing would come back with, and how often one is asked
+        # for. Default equals the startup count so a re-derivation is invisible;
+        # pass less to stand in for a peer holding memory at wake time.
+        self._available_blocks = available_blocks
+        self.sizings = 0
 
     def _get_models_with_kv(self):
         return [self.model]
 
     def get_num_blocks(self):
-        return {"num_kvcache_blocks": 7}
+        self.sizings += 1
+        return {"num_kvcache_blocks": self._available_blocks}
 
     def allocate_kv_cache(self, num_blocks):
         self.allocated_blocks.append(num_blocks)
@@ -77,6 +85,8 @@ def _no_gpu_calls(monkeypatch):
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda *a, **k: None)
+    # `_resume_kv_cache` logs the headroom it is about to allocate into.
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *a, **k: (1 << 30, 2 << 30))
     monkeypatch.setattr(memory_manager, "set_kv_cache_data", lambda _value: None)
 
 
@@ -180,6 +190,70 @@ def test_default_wake_recaptures_the_graphs_it_released():
 
     assert runner.captures == 1
     assert not hasattr(runner, "_graphs_backup_keys")
+
+
+def test_a_wake_allocates_the_size_it_slept_at_however_little_is_free():
+    """The regression: a peer holding memory at wake time must not resize us.
+
+    A wake used to re-derive the count and `min()` it with the saved one, which
+    silently handed back a smaller pool. Two things outside this process are
+    built against the startup count and neither hears about the new one: the
+    decode graphs captured against the original pool, and -- the one that
+    corrupts -- `BlockManager`'s `BlockPool`, sized in the *engine* process from
+    the count `EngineCore.__init__` copied out of the startup reply. The
+    scheduler went on issuing block ids past the end of the reallocated pool.
+
+    Measured on Qwen3-30B-A3B: 33562 blocks at startup, 8316 on the first wake
+    with 176GB still free, then `Memory access fault by GPU node-N` on all eight
+    replicas.
+    """
+    runner = _Runner(enforce_eager=False, keep_resident=False, available_blocks=3)
+
+    runner.release_memory(tags=["kv_cache"])
+    _report_weights_on_device(runner)
+    runner.resume_memory(tags=["kv_cache"])
+
+    assert runner.allocated_blocks == [7]
+
+
+def test_a_wake_that_cannot_allocate_keeps_the_size_for_the_next_one():
+    """Dropping the clamp made `allocate_kv_cache` the thing that raises.
+
+    `_kv_cache_num_blocks` is the only record of how big the pool was, so
+    clearing it before the allocation loses that record on the way out. The next
+    wake then takes the "No KV cache num_blocks to resume from" guard, returns,
+    and `resume_memory` reports success for an engine that has no pool at all --
+    which faults on the first forward instead of at the point of failure.
+    """
+    runner = _Runner(enforce_eager=False, keep_resident=False)
+    runner.release_memory(tags=["kv_cache"])
+
+    def _oom(num_blocks):
+        raise torch.cuda.OutOfMemoryError("out of memory")
+
+    runner.allocate_kv_cache = _oom
+    with pytest.raises(torch.cuda.OutOfMemoryError):
+        runner._resume_kv_cache()
+
+    assert runner._kv_cache_num_blocks == 7
+    assert runner.kv_cache is None
+
+
+def test_a_wake_does_not_size_the_pool_at_all():
+    """Not just the same answer -- the question is not asked.
+
+    `resume_memory` broadcasts the command rather than a count, so every TP rank
+    ran its own sizing against its own `mem_get_info()`. Ranks could therefore
+    disagree with each other, and a block id valid on rank 0 be out of bounds on
+    rank 3. One `get_num_blocks` at startup is what makes them agree.
+    """
+    runner = _Runner(enforce_eager=False, keep_resident=False)
+
+    runner.release_memory(tags=["kv_cache"])
+    _report_weights_on_device(runner)
+    runner.resume_memory(tags=["kv_cache"])
+
+    assert runner.sizings == 0
 
 
 def test_releasing_only_the_kv_pool_still_invalidates_the_graphs():

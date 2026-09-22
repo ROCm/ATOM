@@ -119,7 +119,7 @@ def _real_hf_config_override():
     saved = sys.modules.get("atom.config")
     try:
         spec.loader.exec_module(mod)
-    except Exception:
+    except Exception:  # noqa: BLE001 - a partial checkout has no SpeculativeConfig
         return None
     finally:
         if saved is not None:
@@ -1065,7 +1065,9 @@ def _proposer_with_graph_bs(
     )
     p.device = torch.device("cpu")
     p.mtp_k = mtp_k
-    p.model = types.SimpleNamespace(vocab_size=1024, window_size=window)
+    p.model = types.SimpleNamespace(
+        vocab_size=1024, window_size=window, supports_block_graph=True
+    )
     p.runner = types.SimpleNamespace(
         capture_sizes=list(_GRAPH_BS),
         attn_metadata_builder=types.SimpleNamespace(
@@ -1083,7 +1085,10 @@ def _install_block_halves(p, inner):
     ``DeepseekV4DSpark`` forwards to them exactly like this, so the double
     stays on the surface the proposer actually uses.
     """
+    from atom.models.deepseek_v4_dspark import DeepseekV4DSpark
+
     p.model.model = inner
+    p.model.prepare_block = types.MethodType(DeepseekV4DSpark.prepare_block, p.model)
     p.model.block_backbone = lambda ids, pos, num_draft: inner(ids, pos, num_draft)
     p.model.head_and_sample = lambda out, ids, _: inner.head_and_sample(*out, ids)
     return p

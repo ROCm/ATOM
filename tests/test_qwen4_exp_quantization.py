@@ -35,6 +35,14 @@ def ptpc_config():
     return config
 
 
+# A `test_sglang_plugin_ptpc_remap_keeps_gdn_shards` used to sit here. It
+# imported `atom.plugin.sglang`, so it needed sglang installed -- which this
+# suite deliberately does not have, and which is why plugin tests live under
+# `tests/plugin/` and are ignored by the CI script. Sitting in the ordinary
+# suite it was red everywhere rather than skipped. The view it checked is
+# covered below without the plugin; what went with it is the assertion that
+# `apply_prepare_qwen4_exp_adaptations` leaves `in_proj_qkvzba` out of
+# `exclude_layers`, which belongs in `tests/plugin/` if it is to come back.
 def test_ptpc_exclusions_do_not_hide_quantized_children():
     config = ptpc_config()
     view = qwen4_exp._Qwen4ExpQuantizationConfig(config)

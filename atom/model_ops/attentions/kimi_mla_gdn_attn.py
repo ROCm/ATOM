@@ -5,14 +5,17 @@ import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
-from atom.config import _MQA_LOGITS_PRESHUFFLE_ROWS
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAAttention
+from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+    MQA_LOGITS_PRESHUFFLE_ROWS,
+)
 from atom.model_ops.glm5_next.geometry import (
     effective_kpool_size,
     pooled_path_enabled,
+    speculative_kpool_history_size,
 )
 from atom.utils import envs
 
@@ -188,14 +191,21 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 f"index_kpool={kpool}; Config sets the block size for exactly this"
             )
         rows = runner.block_size // kpool
-        if rows % _MQA_LOGITS_PRESHUFFLE_ROWS:
+        if rows % MQA_LOGITS_PRESHUFFLE_ROWS:
             raise ValueError(
                 f"{rows} pooled rows per block is not a multiple of "
-                f"{_MQA_LOGITS_PRESHUFFLE_ROWS}, so deepgemm_fp8_paged_mqa_logits "
+                f"{MQA_LOGITS_PRESHUFFLE_ROWS}, so deepgemm_fp8_paged_mqa_logits "
                 "cannot stay in the preshuffled layout -- the only one it computes "
                 "correctly. Raise kv_cache_block_size."
             )
         return rows
+
+    def _kpool_history_size(self) -> int:
+        """Return the documented ring bound for speculative rejection."""
+        pool = self._kpool_size()
+        spec = self.model_runner.config.speculative_config
+        num_speculative_tokens = None if spec is None else spec.num_speculative_tokens
+        return speculative_kpool_history_size(pool, num_speculative_tokens)
 
     def _kpool_tail_bytes(self) -> int:
         """Per-request tail bytes across every indexer-owning layer."""
@@ -204,7 +214,9 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             return 0
         hf = self.model_runner.config.hf_config
         index_cache_layer_ids, _ = self._index_cache_layout()
-        per_layer = 2 * kpool * hf.index_head_dim * torch.bfloat16.itemsize
+        per_layer = (
+            2 * self._kpool_history_size() * hf.index_head_dim * torch.bfloat16.itemsize
+        )
         return len(index_cache_layer_ids) * per_layer
 
     def _kpool_tail_plane_shape(self) -> tuple[int, int] | None:
@@ -263,7 +275,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 len(index_cache_layer_ids),
                 entries.get(STATE_SLOT_CLASS, 0),
                 2,  # 0 = K, 1 = gate score
-                self._kpool_size(),
+                self._kpool_history_size(),
                 hf.index_head_dim,
             ),
             dtype=torch.bfloat16,
