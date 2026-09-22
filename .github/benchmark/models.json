@@ -116,6 +116,28 @@
       ]
     },
     {
+      "display": "DeepSeek-V4.1-Flash",
+      "path": "deepseek-ai/DeepSeek-V4.1-Flash",
+      "prefix": "deepseek-v41-flash",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "",
+      "config": {
+        "tp": 4,
+        "kv_cache_dtype": "bf16",
+        "extra_args": "--index_cache_dtype fp8"
+      },
+      "variants": [
+        {
+          "label": "DSpark",
+          "suffix": "-dspark",
+          "extra_args": "--method dspark --num-speculative-tokens 5",
+          "bench_args": "--use-chat-template",
+          "conc_min": 4,
+          "conc_max": 256
+        }
+      ]
+    },
+    {
       "display": "DeepSeek-R1-0528-MXFP4",
       "path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
       "prefix": "deepseek-r1-0528-mxfp4",
