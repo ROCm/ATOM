@@ -73,6 +73,13 @@ _DEEPSEEK_V4_ARCHES: set[str] = {
     "DeepseekV4MTPModel",
 }
 _DEEPSEEK_V4_MTP_ARCHES: set[str] = _DEEPSEEK_V4_ARCHES - {_DEEPSEEK_V4_ARCH}
+# DeepSeek-V4.1 (CSA2) is likewise native ATOM, but its pool holds a per-request
+# STATE region alongside the paged history and it binds no per-layer cache --
+# so it gets its own bridge (`deepseek_v41_bridge`) rather than sharing V4's.
+# Text-only: vision, DSpark drafting and MTP are refused in
+# `atom.models.deepseek_v41.config.validate_runtime_config`.
+_DEEPSEEK_V41_ARCH = "DeepseekV41ForCausalLM"
+_DEEPSEEK_V41_ARCHES: set[str] = {_DEEPSEEK_V41_ARCH}
 
 
 def _probe_v4_routed_expert_dtype(model_path) -> str | None:
@@ -160,6 +167,7 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     ),
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2:MiniMaxM2ForCausalLM",
     "DeepseekV4ForCausalLM": "atom.plugin.vllm.models.deepseek_v4:DeepseekV4ForCausalLM",
+    "DeepseekV41ForCausalLM": "atom.models.deepseek_v41.runtime:DeepseekV41RuntimeModel",
     "MiniMaxM3SparseForCausalLM": "atom.models.minimax_m3:MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration": "atom.models.minimax_m3:MiniMaxM3SparseForConditionalGeneration",
     "Eagle3LlamaModel": "atom.models.eagle3_llama:Eagle3LlamaModel",
@@ -437,9 +445,17 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             )
         else:
             self.atom_config = generate_atom_config_for_plugin_mode(vllm_config)
-            # root HF config so --hf-overrides survive without losing multimodal
-            # sub-configs such as Kimi-K2.5's vision_config/text_config.
-            self.atom_config.hf_config = self.config
+            # V4.1 keeps the hf_config it was built with: `normalize_hf_config`
+            # is what produces the flat text schema the runtime model, the pool
+            # geometry and the attention topology are all written against, and
+            # `Config.__post_init__` already ran the V4.1 runtime gate on it.
+            # vLLM's root config here is the AutoConfig shim registered in
+            # `atom.plugin.vllm.register`, which carries none of that.
+            if model_arch not in _DEEPSEEK_V41_ARCHES:
+                # root HF config so --hf-overrides survive without losing
+                # multimodal sub-configs such as Kimi-K2.5's
+                # vision_config/text_config.
+                self.atom_config.hf_config = self.config
         self.vllm_model_arch = selected_model_arch
         self.model_arch = model_arch
         logger.info(
@@ -582,6 +598,32 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             register_deepseek_v4_proxy_layer(
                 vllm_config,
                 self._deepseek_v4_proxy_layer_name,
+            )
+
+        # DeepSeek-V4.1 is bridged the same way, with one extra piece: ATOM's
+        # own metadata builder owns the fixed-address staging buffers every
+        # step writes into, so it is constructed once here (it also loads the
+        # Engram tables) and reused by every forward.
+        self._is_deepseek_v41 = self.model_arch in _DEEPSEEK_V41_ARCHES
+        if self._is_deepseek_v41:
+            from atom.plugin.vllm.deepseek_v41_bridge import (
+                make_deepseek_v41_metadata_builder,
+                register_deepseek_v41_proxy_layer,
+            )
+            from atom.plugin.vllm.platform import (
+                enforce_deepseek_v41_constraints,
+            )
+
+            # The config-time site for these is ``ATOMPlatform``, which vLLM
+            # does not always activate. Here the worker holds the config it
+            # will actually run, and this still precedes both cudagraph
+            # capture and the first forward.
+            enforce_deepseek_v41_constraints(vllm_config)
+            register_deepseek_v41_proxy_layer(vllm_config)
+            self._deepseek_v41_builder = make_deepseek_v41_metadata_builder(
+                self.atom_config,
+                vllm_config,
+                self.device_config.device,
             )
 
     # Attributes whose writes on the outer model must propagate to the
@@ -1007,6 +1049,36 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 else:
                     hidden_states = self.model(input_ids=input_ids, positions=positions)
                     self._mtp_target_hidden_states = hidden_states
+        elif self._is_deepseek_v41:
+            # DeepSeek-V4.1, like V4, is a native ATOM model reading ATOM's own
+            # forward context. Bind the proxy pool (a no-op after the first
+            # real forward), then drive one CSA2 step -- Engram rows, state
+            # reset, cursor advance and attention metadata -- and run the
+            # backbone against the positions that step staged. Those positions,
+            # not vLLM's, span the forward's padded width.
+            from atom.plugin.vllm.deepseek_v41_bridge import (
+                atom_deepseek_v41_forward_context,
+                bind_deepseek_v41_proxy_cache,
+            )
+
+            builder = self._deepseek_v41_builder
+            ready = bind_deepseek_v41_proxy_cache(self.model, builder, self.vllm_config)
+            slot_allocator = (
+                getattr(self.model, "_atom_v41_slot_allocator", None) if ready else None
+            )
+            with atom_deepseek_v41_forward_context(
+                atom_config=self.atom_config,
+                builder=builder,
+                input_ids=input_ids,
+                positions=positions,
+                slot_allocator=slot_allocator,
+                force_dummy=not ready,
+            ) as atom_positions:
+                hidden_states = self.model(
+                    input_ids=input_ids,
+                    positions=atom_positions,
+                    inputs_embeds=inputs_embeds,
+                )
         else:
             if (
                 self.model_arch in {"Qwen3NextMTP", "DeepSeekMTPModel"}

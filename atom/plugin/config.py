@@ -329,6 +329,38 @@ def _build_atom_speculative_config_from_sglang(server_args: Any, hf_config: Any)
     )
 
 
+def _vllm_kv_transfer_config(config: Any) -> dict:
+    """vLLM's ``KVTransferConfig`` as the plain dict ATOM's Config holds.
+
+    ATOM spells this field as a dict (``atom.config.Config.kv_transfer_config``)
+    and vLLM spells it as a pydantic model, so the two only meet here. Returns
+    an empty dict when vLLM configured no transport, which is what every reader
+    already treats as "off".
+    """
+    kv_transfer_config = getattr(config, "kv_transfer_config", None)
+    if kv_transfer_config is None:
+        return {}
+    if isinstance(kv_transfer_config, dict):
+        return dict(kv_transfer_config)
+    model_dump = getattr(kv_transfer_config, "model_dump", None)
+    if callable(model_dump):
+        return model_dump()
+    # Older pydantic / a plain namespace: name the fields ATOM's gates read
+    # rather than reflecting over everything, so an unexpected shape is an
+    # empty dict here instead of a surprise key downstream.
+    return {
+        field: getattr(kv_transfer_config, field)
+        for field in (
+            "kv_connector",
+            "kv_role",
+            "kv_connector_module_path",
+            "kv_load_failure_policy",
+            "kv_connector_extra_config",
+        )
+        if getattr(kv_transfer_config, field, None) is not None
+    }
+
+
 def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
     from atom.config import CompilationConfig, Config
 
@@ -395,6 +427,19 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
 
     vllm_enable_dbo = getattr(vllm_parallel_config, "enable_dbo", False)
 
+    # DeepSeek-V4.1's pool is either unpacked bf16 or ATOM's packed fp4; it has
+    # no fp8 variant and no "auto". The chosen dtype fixes the proxy layer's
+    # page size, so it has to be resolved here -- before Config.__post_init__
+    # runs the V4.1 runtime gate on it -- rather than left as vLLM's spelling.
+    kv_cache_dtype = vllm_cache_config.cache_dtype
+    from atom.plugin.vllm.deepseek_v41_bridge import (
+        is_deepseek_v41_vllm_config,
+        v41_kv_cache_dtype,
+    )
+
+    if is_deepseek_v41_vllm_config(config):
+        kv_cache_dtype = v41_kv_cache_dtype(config)
+
     return Config(
         model=vllm_model_config.model,
         trust_remote_code=getattr(vllm_model_config, "trust_remote_code", False),
@@ -407,8 +452,13 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         parallel_config=vllm_parallel_config,
         kv_cache_block_size=vllm_cache_config.block_size,
         num_kvcache_blocks=vllm_cache_config.num_gpu_blocks,
-        kv_cache_dtype=vllm_cache_config.cache_dtype,
+        kv_cache_dtype=kv_cache_dtype,
         enable_prefix_caching=vllm_cache_config.enable_prefix_caching,
+        # vLLM's KV transport, carried across so a model's own
+        # `validate_runtime_config` can gate on it. Without this the gate reads
+        # an empty dict in plugin mode and admits every connector silently --
+        # the check passes because it was never asked the question.
+        kv_transfer_config=_vllm_kv_transfer_config(config),
         port=None,
         torch_profiler_dir=None,
         compilation_config=vllm_compilation_config,
