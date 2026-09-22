@@ -150,6 +150,22 @@ def test_store_transmits_page_zero_as_real_native_unit(worker):
     assert not finished.finished_saving  # one quorum channel for the entire pair
 
 
+def test_native_state_groups_share_one_presence_mask(worker):
+    req = replace(
+        request(),
+        token_ids=list(range(32)),
+        block_ids=list(range(1, 9)),
+        native_state=NativeStateTransfer((0, 25, 31), 32, 998, None),
+    )
+
+    block_groups = worker._native_block_ids(req, 0, 32, loading=False)
+    state_presence = [
+        [block_id != -1 for block_id in group] for group in block_groups[1:]
+    ]
+
+    assert state_presence == [[False, False, False, True]] * 3
+
+
 @pytest.mark.parametrize(
     "units", [(0, -1, 31), (0, 31), (0, 0, 31), (0, 25, 32), (0, 2, 31)]
 )
