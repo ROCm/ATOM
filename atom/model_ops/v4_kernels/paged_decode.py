@@ -325,10 +325,9 @@ def _paged_decode_fused_kernel(
     alpha_sink = tl.exp2(sink - m_final)
     l_final = l_i * alpha_kv + alpha_sink
 
-    denom = tl.maximum(l_final, 1.0e-30)
-    out = tl.where(
-        l_final[:, None] > 0.0, (acc * alpha_kv[:, None]) / denom[:, None], 0.0
-    )
+    # Normalize once per head before broadcasting across the value channels.
+    scale = alpha_kv / tl.maximum(l_final, 1.0e-30)
+    out = tl.where(l_final[:, None] > 0.0, acc * scale[:, None], 0.0)
     tl.store(
         out_ptr
         + t * out_stride_t
@@ -762,6 +761,8 @@ def _sparse_attn_v4_paged_decode_triton(
             NUM_GROUPS=num_groups_arg,
             num_warps=num_warps,
             num_stages=num_stages,
+            # Buffer-load lowering for 32-head tiles can cross 256 VGPRs.
+            waves_per_eu=2 if block_h == 32 and D == 512 and not quant_kv else 0,
         )
         return out
 
