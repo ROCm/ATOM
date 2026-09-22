@@ -860,7 +860,9 @@ def side_stream(stream: torch.cuda.Stream | None):
     allocation made during capture.
 
     The gate lives here rather than at each caller so that two branches of one
-    layer cannot drift into disagreeing about when forking is allowed.
+    layer cannot drift into disagreeing about when forking is allowed. A caller
+    whose feature is switched off hands `None` and takes the same path, so the
+    switch needs no second branch anywhere.
     """
     context = get_forward_context()
     if stream is None or not context.in_hipgraph:

@@ -15,6 +15,8 @@ the stream unplumbed.
 import pytest
 import torch
 
+from atom.utils import envs
+
 
 class FakeStream:
     """Stands in for `torch.cuda.Stream`; identity is all these tests read."""
@@ -34,21 +36,34 @@ def created_streams(monkeypatch):
 
 
 @pytest.mark.parametrize("entrypoint", ["runtime", "offline"])
+@pytest.mark.parametrize("level", [0, 1, 2])
 def test_backbone_gives_every_moe_the_one_stream_it_made(
-    single_rank, unallocated_moe, build_v41, created_streams, entrypoint
+    single_rank,
+    unallocated_moe,
+    build_v41,
+    created_streams,
+    monkeypatch,
+    entrypoint,
+    level,
 ):
+    """The shared expert has a stream at every level of the attention's flag.
+
+    `ATOM_DSV41_SIDE_STREAMS` says how much of the attention leaves the main
+    stream; it never takes this one away, because the shared expert cannot be
+    folded into a routed slot on any V4/V4.1 checkpoint and the overlap with
+    the routed pass is what the stream is for. Where the attention forks a
+    compressor it borrows this stream rather than making one, at both levels
+    that fork it -- the two never want it at once -- so the identity is a
+    claim of its own, not an accident of construction.
+    """
+    monkeypatch.setattr(envs, "ATOM_DSV41_SIDE_STREAMS", level, raising=False)
     instance = build_v41(entrypoint)
 
-    # One per model rather than per layer, because layers do not overlap. The
-    # model makes three, one per branch that runs beside another; the other
-    # two are the attention's and must not be this one, because a stream
-    # serializes what it carries and none of the three depend on each other.
-    # That half is pinned in `test_attention_streams`.
-    assert len(created_streams) == 3
-    assert instance.alt_stream not in (instance.compress_stream, instance.index_stream)
+    assert instance.alt_stream is not None
     assert instance.layers
     for block in instance.layers:
         assert block.ffn.alt_stream is instance.alt_stream
+    assert instance.compress_stream is (instance.alt_stream if level else None)
 
 
 @pytest.mark.parametrize("entrypoint", ["draft", "draft_offline"])

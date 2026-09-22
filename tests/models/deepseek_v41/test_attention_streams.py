@@ -1,20 +1,16 @@
 # SPDX-License-Identifier: MIT
-"""The two side streams the attention forks, and where each one rejoins.
+"""Which branches of a layer leave the main stream, and where each rejoins.
 
-One stream per branch of the layer's dependency graph. The compressor reads
-the hidden row and its own arena state, so it is issued before the
-projections; what it writes is an index row whose first reader is the scorer,
-so it rejoins there. The indexer is the critical path and moving it buys
-nothing by itself -- what it buys is the Q/KV chain no longer sitting in front
-of it on the main stream, which is why it gets a stream of its own and rejoins
-before `_indices`.
-
-Two positions and two join points are the whole feature: issue either later
-and it overlaps nothing, join either later and something waits for no reason.
-A fork that never happens and a join that never happens both leave a model
-that still answers -- the first is the feature silently absent, the second a
-read racing a write the captured graph then replays forever. So the edges are
-what is pinned here, not the result.
+`ATOM_DSV41_SIDE_STREAMS` picks between three arrangements, and every one of
+them answers correctly, so nothing about the output says which one ran. What
+distinguishes them is edges: the compressor is issued before the projections
+and waited at the scorer, its first reader; the indexer, where it is forked at
+all, is waited before the attention reads what it selected. A fork that never
+happens and a join that never happens both leave a model that still answers --
+the first is the feature silently absent, the second a read racing a write
+that a captured graph then replays forever. So the edges are what is pinned
+here, and the streams' identities with them, since a borrowed handle and a
+handle of its own are the same object graph to everything downstream.
 
 `torch.cuda` is forced available: CI has no GPU, and a test comparing `None`
 to `None` would pass just as well with the streams unplumbed.
@@ -29,7 +25,7 @@ import torch
 pytest.importorskip("aiter", reason="the attention module is built on AITER kernels")
 
 from atom.models.deepseek_v41.attention import Attention
-from atom.utils import forward_context
+from atom.utils import envs, forward_context
 
 
 class FakeStream:
@@ -110,32 +106,68 @@ def stub(log, *, compress=None, index=None, indexer=True):
     )
 
 
+class RecordingAttention(torch.nn.Module):
+    """Takes the two handles and keeps them, so the plumbing is readable."""
+
+    def __init__(self, config, spec, *, compress_stream=None, index_stream=None):
+        super().__init__()
+        self.given = (compress_stream, index_stream)
+
+
 @pytest.mark.parametrize("entrypoint", ["runtime", "offline"])
-def test_the_backbone_makes_three_distinct_streams_and_hands_two_down(
-    monkeypatch, single_rank, unallocated_moe, build_v41, created_streams, entrypoint
+@pytest.mark.parametrize("level", [0, 1, 2])
+def test_each_level_hands_every_attention_the_streams_it_declares(
+    monkeypatch,
+    single_rank,
+    unallocated_moe,
+    build_v41,
+    created_streams,
+    entrypoint,
+    level,
 ):
-    """Distinct, because a stream serializes what it carries.
+    """What the model makes, and which of them reach the layer.
 
-    The MoE's shared expert has the third; sharing any of them would make one
-    branch queue behind another it has no dependency on.
+    0 forks nothing, and that has to reach the layer too: `side_stream`
+    declines when it is handed nothing, so an attention that kept a handle
+    anyway would fork on a stream the backbone never waits for. 1 and 2 both
+    lend the MoE's stream to the compressor, whose live range ends a sublayer
+    before the shared expert is issued -- identity is the whole claim there,
+    since a handle of its own would be a hardware queue bought for an overlap
+    that cannot happen. Only the indexer is a third concurrent branch, so only
+    2 makes a stream, and it must not be either of the other two.
     """
-
-    class RecordingAttention(torch.nn.Module):
-        def __init__(self, config, spec, *, compress_stream=None, index_stream=None):
-            super().__init__()
-            self.given = (compress_stream, index_stream)
-
     from atom.models.deepseek_v41 import model as model_module
 
+    monkeypatch.setattr(envs, "ATOM_DSV41_SIDE_STREAMS", level, raising=False)
     monkeypatch.setattr(model_module.Block, "attention_cls", RecordingAttention)
     instance = build_v41(entrypoint)
 
-    # Three for the model, one per concurrent pair, not three per layer.
-    assert len(created_streams) == 3
-    assert len({id(s) for s in created_streams}) == 3
+    # One per branch that needs a queue of its own, for the model and not per
+    # layer. The MoE's shared expert owns the one that is there at every level.
+    assert len(created_streams) == (2 if level == 2 else 1)
+    assert len({id(s) for s in created_streams}) == len(created_streams)
+    expected = {
+        0: (None, None),
+        1: (instance.alt_stream, None),
+        2: (instance.alt_stream, instance.index_stream),
+    }[level]
+    assert (instance.compress_stream, instance.index_stream) == expected
+    if level == 2:
+        assert instance.index_stream is not None
+        assert instance.index_stream is not instance.alt_stream
     assert instance.layers
     for block in instance.layers:
-        assert block.attn.given == (instance.compress_stream, instance.index_stream)
+        assert block.attn.given == expected
+
+
+def test_an_unknown_level_is_refused_rather_than_rounded(
+    monkeypatch, single_rank, unallocated_moe, build_v41, created_streams
+):
+    """Every arrangement answers, so a typo would only show up as throughput."""
+    monkeypatch.setattr(envs, "ATOM_DSV41_SIDE_STREAMS", 3, raising=False)
+
+    with pytest.raises(ValueError, match="0, 1 or 2"):
+        build_v41("runtime")
 
 
 def test_compressor_forks_before_the_projections(monkeypatch, recorded):
@@ -216,3 +248,15 @@ def test_neither_forks_when_it_may_not(
     assert log == ["compress", "project", "score"], reason
     assert forked is False, reason
     assert joined is None, reason
+
+
+def test_the_shipped_level_is_the_one_that_measured_fastest(monkeypatch):
+    """0 is a measurement, not a preference (periods in the environment doc).
+
+    Throughput is too coarse to see the effect that chose it, so a default
+    flipped back on the strength of a benchmark would look justified and still
+    be a regression.
+    """
+    monkeypatch.delenv("ATOM_DSV41_SIDE_STREAMS", raising=False)
+
+    assert envs.ATOM_DSV41_SIDE_STREAMS == 0

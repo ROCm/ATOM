@@ -267,11 +267,13 @@ class Attention(nn.Module):
         return self.wo_b(grouped_output_projection(output, grouped).flatten(-2))
 
     def _fork_compress(self, hidden, cache, step, rope):
-        """The compressor, issued before the projections, on its own stream.
+        """The compressor, issued before the projections, beside them.
 
         It reads the hidden row and its own arena state, so the top of the
         layer is the earliest it can start. `_fork_select` joins it, since the
-        scorer is the first to read what it writes.
+        scorer is the first to read what it writes -- and it always has one to
+        be joined at, because a layer only has a compressor in the mode that
+        also gives it an indexer.
 
         Reports whether it forked, which is all `_fork_select` needs to know.
         """
@@ -280,11 +282,13 @@ class Attention(nn.Module):
         return joins is not None
 
     def _fork_select(self, hidden, qr, qr_scale, cache, step, rope, *, compressed):
-        """The indexer, on its own stream, so the Q/KV chain runs beside it.
+        """The scorer, and the compressor's join, wherever those two run.
 
-        Moving the critical path buys nothing by itself; what it buys is the
-        other side, where the query projection and the fused rope/window
-        launch stop being in front of it.
+        Moving the indexer off the main stream buys nothing by itself; what it
+        buys is the other side, where the query projection and the fused
+        rope/window launch stop being in front of it. Where it is not forked,
+        `scorer` is the main stream and the wait below is that stream's join
+        with the compressor -- the same edge, drawn on one stream fewer.
 
         Returns the stream to join on, `None` when nothing was forked. Both
         waits are lines here: the projections cannot precede `qk_norm`, the
@@ -315,9 +319,9 @@ class Attention(nn.Module):
         kv, window_kv = cache.rope_quant_window(
             self.spec.layer_id, query, kv_normed, rope, step
         )
-        # The main stream's only join; a forked compressor is already inside
-        # it, and always has a scorer to have been waited at, because only the
-        # mode that gives a layer a compressor gives it an indexer.
+        # A forked compressor is already inside this join, having been waited
+        # at the scorer; where the scorer itself was not forked it waited on
+        # the main stream instead and there is nothing left to join here.
         if selecting is not None:
             selecting.wait_stream(self.index_stream)
         prefix, prefix_indptr, extend, extend_indptr = cache.attention_indices(

@@ -191,6 +191,37 @@ some layers and the device path for others, which is the confusing state.
 | **ATOM_ENGRAM_UVA** | bool | 1 (true) | Page-lock this rank's shard of the hash tables in place and let a device kernel read the rows it needs across the bus, dequantizing there. No copy and no HBM for the table. `0` falls back to gathering the rows on the host, which returns the same rows but costs ~50 ms of CPU per decode step with the GPU idle behind it. Anything that would make the device path unsafe — no CUDA, more TP ranks than hash heads, a registration that will not fit — falls back on its own, so the switch is for taking the host path deliberately. The fallback is the whole TP group's: the lookup ends in an all-gather, so one rank that cannot register turns every rank around rather than leaving the others in a collective it never enters. |
 | **ATOM_ENGRAM_CACHE_DIR** | path | `~/.cache/atom/engram` | Where the compressed-vocab table is cached between runs. The table is reproducible from the tokenizer, so this only trades startup time for disk; point it at shared storage to let several servers build it once. A truncated or stale cache is rebuilt rather than raised. |
 
+## Attention side streams (DeepSeek-V4.1)
+
+A layer's compressor reads the hidden row and its own arena state, and its
+indexer reads the normed query latent; neither reads what the query projection
+and the fused rope/window launch produce, so the three are branches of one
+dependency graph that a single stream serializes.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_DSV41_SIDE_STREAMS** | int (0/1/2) | 0 | How many of a layer's branches leave the main stream. **0** — none. **1** — the compressor, on the MoE's `alt_stream`, waited at the scorer rather than at attention, because `visible` counts the index row a boundary crossed in this same forward writes, so the scorer is its first reader a whole top-k chain earlier. It borrows that stream because the MoE joins it inside its own forward, a sublayer after the compressor was joined, so the two are never live at once. **2** — the same, plus the indexer on a stream of its own; it is the only branch live beside both others, so it is the only one worth a queue. A value outside 0–2 raises rather than rounding. |
+
+**Level 0 is the default because forking measured slower, not faster.** Median
+steady-state layer period, MI355X TP4 bf16 KV DSpark-5, 1024/1024 at
+concurrency 64, ~10k sampled layers per trace:
+
+| level | layer period | vs 0 |
+|-------|--------------|------|
+| 0 | 636.40 µs (repeat: 636.72) | — |
+| 1 | 645.76 µs | +1.47% |
+| 2 | 640.32 µs | +0.62% |
+
+The anchor is the gap between consecutive `topk_gating` launches, so a branch
+that moves to another stream cannot drop out of the sample. The two level-0
+traces were taken either side of the other two, which puts the floor — session
+drift included — at 0.05%, making those deltas 12× and 29× the noise; the
+unfiltered medians (604.0/605.9 against 618.8 and 607.6) order the levels the
+same way. End-to-end throughput cannot resolve this: one wall-clock number per
+run carries 2–6% spread, which is why an earlier A/B called the same
+arrangement a wash. Whoever revisits it should start from these numbers and
+from `GPU_MAX_HW_QUEUES`, not from where the forks sit.
+
 ## V4 attention backend (Migration)
 
 Selects between the legacy per-seq Python dispatch path in `atom/models/deepseek_v4.py`

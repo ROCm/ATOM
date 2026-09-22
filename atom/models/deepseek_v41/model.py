@@ -23,6 +23,7 @@ from atom.models.deepseek_v4 import (
     ParallelHead,
     make_v4_quant_config,
 )
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 from .attention import Attention
@@ -235,15 +236,25 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.moe_quant_config = make_v4_quant_config(
             config, online_quant_config=online_quant_config
         )
-        # A stream serializes what it carries, so one per pair that runs at
-        # once: shared expert beside the routed pass, compressor beside the
-        # projections, indexer beside the Q/KV chain. One each for the model
+        # A stream earns a hardware queue only where two branches are live at
+        # once -- overlapping lifetimes, not independent data. One per model
         # rather than per layer, because layers do not overlap.
-        self.alt_stream, self.compress_stream, self.index_stream = (
-            tuple(torch.cuda.Stream() for _ in range(3))
-            if torch.cuda.is_available()
-            else (None, None, None)
-        )
+        # `ATOM_DSV41_SIDE_STREAMS` picks the level and the environment doc
+        # carries what each one measured.
+        #
+        # The compressor borrows the MoE's wherever it forks: its lifetime ends
+        # at the scorer, a sublayer before the shared expert is issued, and the
+        # MoE joins this stream inside its own forward. Only the indexer is
+        # ever live beside both, so only it costs a queue.
+        on_device = torch.cuda.is_available()
+        level = envs.ATOM_DSV41_SIDE_STREAMS
+        if level not in (0, 1, 2):
+            raise ValueError(f"ATOM_DSV41_SIDE_STREAMS must be 0, 1 or 2, not {level}")
+        if not on_device:
+            level = 0
+        self.alt_stream = torch.cuda.Stream() if on_device else None
+        self.compress_stream = self.alt_stream if level >= 1 else None
+        self.index_stream = torch.cuda.Stream() if level == 2 else None
         self.layers = nn.ModuleList(
             self.block_cls(
                 config,
