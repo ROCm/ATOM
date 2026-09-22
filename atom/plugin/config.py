@@ -334,6 +334,19 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
 
     vllm_enable_dbo = getattr(vllm_parallel_config, "enable_dbo", False)
 
+    # DeepSeek-V4.1's pool is either unpacked bf16 or ATOM's packed fp4; it has
+    # no fp8 variant and no "auto". The chosen dtype fixes the proxy layer's
+    # page size, so it has to be resolved here -- before Config.__post_init__
+    # runs the V4.1 runtime gate on it -- rather than left as vLLM's spelling.
+    kv_cache_dtype = vllm_cache_config.cache_dtype
+    from atom.plugin.vllm.deepseek_v41_bridge import (
+        is_deepseek_v41_vllm_config,
+        v41_kv_cache_dtype,
+    )
+
+    if is_deepseek_v41_vllm_config(config):
+        kv_cache_dtype = v41_kv_cache_dtype(config)
+
     return Config(
         model=vllm_model_config.model,
         trust_remote_code=getattr(vllm_model_config, "trust_remote_code", False),
@@ -346,7 +359,7 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         parallel_config=vllm_parallel_config,
         kv_cache_block_size=vllm_cache_config.block_size,
         num_kvcache_blocks=vllm_cache_config.num_gpu_blocks,
-        kv_cache_dtype=vllm_cache_config.cache_dtype,
+        kv_cache_dtype=kv_cache_dtype,
         enable_prefix_caching=vllm_cache_config.enable_prefix_caching,
         port=None,
         torch_profiler_dir=None,

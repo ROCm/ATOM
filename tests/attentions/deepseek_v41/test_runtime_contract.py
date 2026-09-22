@@ -117,6 +117,55 @@ def test_unimplemented_modes_fail_before_loading(override):
         validate_runtime_config(runtime_config(**override))
 
 
+def vllm_plugin_config(**overrides):
+    """A config the way the vLLM plugin builds one for V4.1.
+
+    `plugin_config.is_vllm` is what distinguishes it from the other plugin
+    backends, which still have no V4.1 bridge; `kv_cache_block_size` is 256
+    because that is the PAGE size `atom.config` forces for this model and the
+    proxy layer's block size on the vLLM side.
+    """
+    fields = {
+        "plugin_config": SimpleNamespace(is_vllm=True),
+        "enable_prefix_caching": False,
+        "kv_cache_block_size": 256,
+    }
+    fields.update(overrides)
+    return runtime_config(**fields)
+
+
+def test_vllm_plugin_text_path_is_admitted():
+    validate_runtime_config(vllm_plugin_config())
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        # vLLM's proposer would have to drive ATOM's tentative staging; the
+        # proxy bridge drives a single target-only step.
+        {
+            "speculative_config": SimpleNamespace(
+                method="dspark", num_speculative_tokens=5
+            )
+        },
+        # CSA2 blocks are reusable only at whole-PAGE boundaries after the
+        # compressor has run, so vLLM's hash-based reuse would hand back
+        # blocks whose STATE side was never replayed.
+        {"enable_prefix_caching": True},
+    ],
+)
+def test_vllm_plugin_refuses_what_the_bridge_cannot_drive(override):
+    with pytest.raises(ValueError):
+        validate_runtime_config(vllm_plugin_config(**override))
+
+
+def test_other_plugin_backends_are_still_refused_outright():
+    with pytest.raises(ValueError, match="plugin mode outside vLLM"):
+        validate_runtime_config(
+            runtime_config(plugin_config=SimpleNamespace(is_vllm=False))
+        )
+
+
 def test_empty_rank_padding_has_no_cache_writes(monkeypatch):
     PagedAttentionCache, DeepseekV41RuntimeModel = _runtime_pieces()
     from atom.models.deepseek_v41 import runtime
