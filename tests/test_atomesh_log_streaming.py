@@ -90,9 +90,10 @@ class SharedLogStreamingTest(unittest.TestCase):
         # Execute the actual submitter hook setup without submitting a job.
         submit = (SCRIPTS / "pd_submit.sh").read_text()
         setup = submit.split("stream_spur_shared_logs_once() {", 1)[1]
-        setup = "stream_spur_shared_logs_once() {" + setup.split(
-            "install_slurm_cancel_traps", 1
-        )[0]
+        setup = (
+            "stream_spur_shared_logs_once() {"
+            + setup.split("install_slurm_cancel_traps", 1)[0]
+        )
         for runner, spur in (
             ("atomesh-cicd", "1"),
             ("atomesh-cicd-mi350", "1"),
@@ -124,6 +125,7 @@ class SharedLogStreamingTest(unittest.TestCase):
                     capture_output=True,
                     text=True,
                     timeout=10,
+                    check=False,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 if spur == "1":
