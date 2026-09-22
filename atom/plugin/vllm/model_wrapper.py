@@ -51,6 +51,7 @@ _MTP_DRAFT_MODEL_ARCHES: set[str] = {
     "DeepseekV4MTPModel",
     "Qwen3NextMTP",
     "Glm4MoeMTPModel",
+    "Glm5NextMTPModel",
 }
 _EAGLE3_DRAFT_ARCH_TO_ATOM_ARCH: dict[str, str] = {
     # vLLM/HF draft arch name: ATOM server-mode draft class
@@ -1022,6 +1023,8 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
+            if self.is_mtp:
+                self._mtp_target_hidden_states = hidden_states
         else:
             if (
                 self.model_arch in {"Qwen3NextMTP", "DeepSeekMTPModel"}

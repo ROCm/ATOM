@@ -35,6 +35,7 @@ from atom.models.glm5_next import (
     _normalize_glm5_next_config,
     _text_config,
 )
+from atom.models.glm5_next_mtp import Glm5NextMTP as Glm5NextMTPBase
 from atom.plugin.vllm.model_wrapper import ATOMMoEForCausalLM
 from atom.plugin.vllm.models.kimi_k3 import KimiKDAAttentionVllm
 
@@ -120,3 +121,30 @@ class Glm5NextForConditionalGenerationVllm(ATOMMoEForCausalLM, IsHybrid):
         cls,
     ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
         return MambaStateCopyFuncCalculator.kda_state_copy_func()
+
+
+class Glm5NextMTPVllm(Glm5NextMTPBase):
+    """Build GLM-5.3-Flash NextN MTP blocks with the vLLM-backed KDA layer."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        from atom.plugin.vllm.model_wrapper import _generate_atom_config_from_vllm_config
+        self.atom_config = _generate_atom_config_from_vllm_config(vllm_config)
+        self.vllm_config = vllm_config
+        original_kda_cls = glm5_next_base.Glm5NextKDAAttention
+        glm5_next_base.Glm5NextKDAAttention = Glm5NextKDAAttentionVllm
+        try:
+            super().__init__(atom_config=self.atom_config, prefix=prefix)
+        finally:
+            glm5_next_base.Glm5NextKDAAttention = original_kda_cls
+
+    def load_weights(self, weights):
+        from atom.model_loader.loader import load_model_in_plugin_mode
+        from atom.plugin.vllm.model_wrapper import _MTP_DRAFT_MODEL_ARCHES
+        return load_model_in_plugin_mode(
+            model=self,
+            config=self.atom_config,
+            prefix="model.",
+            spec_decode="Glm5NextMTPModel" in _MTP_DRAFT_MODEL_ARCHES,
+            hf_config_override=None,
+            model_name_or_path_override=None,
+        )

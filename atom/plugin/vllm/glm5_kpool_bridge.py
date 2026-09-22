@@ -124,7 +124,7 @@ def _bind_tail_caches(model, vllm_context, kda_layer_name: str | None, capturing
 
 
 def _build_metadata(
-    indexer, sparse, kda, workspaces, *, index_kpool: int = 4
+    indexer, sparse, kda, workspaces, *, index_kpool: int = 4, capturing: bool = False
 ) -> tuple[AttentionMetaData, bool, int]:
     num_prefills = int(indexer.num_prefills)
     num_decodes = int(indexer.num_decodes)
@@ -170,16 +170,20 @@ def _build_metadata(
     if is_prefill:
         if is_mixed:
             # Sum complete pools from prefill chunks + decode requests.
+            # Skip the D2H .item() during CUDA graph capture: mixed batches are
+            # never replayed from a captured graph (graphs capture decode-only
+            # batches), so kpool_total_pools=None is safe for the warm-up pass.
             prefill_pools = 0
             if indexer.prefill is not None:
                 prefill_pools = sum(
                     int(chunk.kpool_total_pools) for chunk in indexer.prefill.chunks
                 )
-            # Decode requests: each contributes seq_len // index_kpool complete pools.
-            decode_pools = int(
-                (seq_lens[:num_decodes].to(torch.int64) // index_kpool).sum().item()
-            )
-            kpool_total_pools = prefill_pools + decode_pools
+            if not capturing:
+                # Decode requests: each contributes seq_len // index_kpool complete pools.
+                decode_pools = int(
+                    (seq_lens[:num_decodes].to(torch.int64) // index_kpool).sum().item()
+                )
+                kpool_total_pools = prefill_pools + decode_pools
         elif indexer.prefill is not None:
             kpool_total_pools = sum(
                 int(chunk.kpool_total_pools) for chunk in indexer.prefill.chunks
@@ -254,7 +258,8 @@ def atom_glm5_kpool_forward_context(
         _index_kpool = int(getattr(hf_config, "index_kpool", 4) or 4)
         try:
             metadata, is_prefill, scheduled_bs = _build_metadata(
-                indexer, sparse, kda, workspaces, index_kpool=_index_kpool
+                indexer, sparse, kda, workspaces, index_kpool=_index_kpool,
+                capturing=capturing,
             )
         except NotImplementedError:
             metadata = AttentionMetaData()

@@ -238,6 +238,23 @@ def _sparse_attn_indexer_kpool(
         device=device,
     )
 
+    # In a mixed prefill+decode batch the MTP draft's kpool indexer sees all
+    # tokens including the chunked-prefill request. The prefill tokens have long
+    # context histories that cause paged_kv_indptr to overflow
+    # sparse_kv_indices_buffer (capacity: max_num_batched_tokens * topk_tokens),
+    # producing an HSA hardware exception. The prefill request does not need MTP
+    # speculative tokens during prefill, so skipping its kpool update is correct.
+    # Detect this: kpool_plugin_mode (vLLM MTP draft) + is_prefill + mixed batch
+    # (n_tokens > scheduled_bs means prefill tokens are present). Return early
+    # so neither the kpool cache update nor the triton index conversion runs.
+    if (
+        context.is_prefill
+        and getattr(attn_metadata, "kpool_plugin_mode", False)
+        and context.scheduled_bs > 0
+        and n_tokens > context.scheduled_bs
+    ):
+        return result
+
     if context.is_prefill:
         cu_q = attn_metadata.cu_seqlens_q
         req_idx = _kpool_request_index(cu_q, n_tokens)
@@ -378,6 +395,18 @@ def _sparse_attn_indexer_kpool(
         return result
 
     bs = context.scheduled_bs
+
+    # When kv_cache_block_copies are in flight (a request had high speculative
+    # acceptance and its blocks are being COW-copied), the block table for that
+    # request is being written by a concurrent copy while the kpool paged
+    # attention reads it, causing a race condition → HSA hardware exception.
+    # The anomalous request contributes extra tokens (e.g., 12 instead of 4),
+    # so n_tokens % bs != 0 when at least one such request is present.
+    # Skip the entire kpool decode update for this step; the next normal decode
+    # step will pick up the tail stash correctly.
+    if n_tokens % bs != 0 and getattr(attn_metadata, "kpool_plugin_mode", False):
+        return result
+
     pos = positions[:bs].to(torch.int64)
     pooled = kpool.kpool_decode_stash_and_pool(
         tail_cache,

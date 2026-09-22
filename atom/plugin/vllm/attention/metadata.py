@@ -2594,8 +2594,19 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
                 seq_lens = self.expanded_seq_lens_buffer[:num_decode_tokens]
 
                 # Give each of the flattened entries the same block table row as the
-                # original request.
-                self.expanded_block_table_buffer[:actual_expanded] = (
+                # original request. The block table may be wider than the pre-allocated
+                # buffer (mamba/kpool alignment can add blocks); use the actual width.
+                bt_cols = block_table.shape[1]
+                expanded_bt = self.expanded_block_table_buffer
+                if bt_cols != expanded_bt.shape[1]:
+                    # Re-allocate to match the actual block table width.
+                    expanded_bt = torch.zeros(
+                        (expanded_bt.shape[0], bt_cols),
+                        dtype=expanded_bt.dtype,
+                        device=expanded_bt.device,
+                    )
+                    self.expanded_block_table_buffer = expanded_bt
+                expanded_bt[:actual_expanded] = (
                     torch.repeat_interleave(
                         block_table, decode_lens, dim=0, output_size=actual_expanded
                     )

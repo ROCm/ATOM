@@ -710,7 +710,7 @@ class Glm5NextIndexer(Indexer):
             )
             if state_slot_idx is None and gdn is not None:
                 # ReplaySSM retains one committed request slot during verify.
-                state_slot_idx = gdn.slot_idx
+                state_slot_idx = getattr(gdn, "slot_idx", None)
                 if state_slot_idx is None and gdn.spec_state_indices_tensor is not None:
                     state_slot_idx = gdn.spec_state_indices_tensor[:, 0]
             if state_slot_idx is None:
