@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: MIT
 
+from types import SimpleNamespace
+
+import numpy as np
 import pytest
 
 from atom.model_engine.dynamic_chunking import (
@@ -8,9 +11,11 @@ from atom.model_engine.dynamic_chunking import (
     MAX_PREFIX_OVERHEAD_FRACTION,
     ChunkLatencyCalibrator,
     ChunkSizePredictor,
+    DynamicChunkingWorker,
     fit_chunk_overhead,
     has_sole_prefill,
 )
+from atom.utils import pack_rows
 
 A, B, C, GAMMA = 2.5e-5, 0.015, 3.0, 0.002
 
@@ -442,3 +447,43 @@ def test_sole_prefill_ignores_a_momentary_lull():
 def test_coefficients_are_validated(coefficients, match):
     with pytest.raises(ValueError, match=match):
         ChunkSizePredictor.from_coefficients(coefficients)
+
+
+def _profiling_worker(block_size=64, vocab_size=1024):
+    """A worker over the only runner attributes `_dummy_batch` reads."""
+    runner = SimpleNamespace(
+        block_size=block_size,
+        config=SimpleNamespace(hf_config=SimpleNamespace(vocab_size=vocab_size)),
+    )
+    return DynamicChunkingWorker(runner)
+
+
+def test_startup_profiling_batch_block_table_is_marshallable():
+    """The startup sweep's dummy batch has to survive `pack_rows`.
+
+    Every forward marshals `block_tables` into the int32 `block_tables` buffer
+    through a `memoryview` cast, which raises TypeError on a plain list. A list
+    here would take down the worker on the first profiling forward -- on every
+    PP stage, before the engine's ready signal -- and warmup cannot catch it
+    because it leaves `block_table` empty.
+    """
+    batch = _profiling_worker(block_size=64)._dummy_batch(256)
+
+    assert len(batch.block_tables) == 1
+    dst = np.zeros((1, 8), dtype=np.int32)
+    pack_rows(dst, batch.block_tables)
+    assert dst[0].tolist() == [0, 1, 2, 3, 0, 0, 0, 0]
+
+
+def test_startup_profiling_batch_covers_the_chunk_it_times():
+    """One prefill sequence, no cached prefix: the shape the sweep fits on."""
+    chunk_size = 192
+    batch = _profiling_worker(block_size=64)._dummy_batch(chunk_size)
+
+    assert batch.is_dummy_run
+    assert batch.total_seqs_num == batch.total_seqs_num_prefill == 1
+    assert batch.total_tokens_num == batch.total_tokens_num_prefill == chunk_size
+    assert list(batch.num_scheduled_tokens) == [chunk_size]
+    assert list(batch.num_cached_tokens) == [0]
+    # Enough blocks for the whole chunk: attention reads its own tokens back.
+    assert len(batch.block_tables[0]) == chunk_size // 64
