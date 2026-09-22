@@ -174,7 +174,7 @@ def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
     return getattr(hf_config, "kv_lora_rank", None) is not None
 
 
-def _tp_replication_factor(config: Any, *, native_state: bool = False) -> int:
+def _tp_replication_factor(config: Any) -> int:
     """Return the PAGE rank-collapse factor selected before workers start.
 
     ``auto`` uses only structural cache information available in the shared
@@ -282,9 +282,7 @@ def _model_namespace(config: Any, *, checkpoint_spec: Any = None) -> str:
     return namespace
 
 
-def _parallel_strategy(
-    config: Any, worker_id: int, *, native_state: bool = False
-) -> Any:
+def _parallel_strategy(config: Any, worker_id: int) -> Any:
     from lmcache.integration.atom import AtomMPParallelConfig
 
     tp_size, pp_size = _validate_mp_config(config)
@@ -292,7 +290,7 @@ def _parallel_strategy(
         raise ValueError(
             f"LMCache MP worker rank {worker_id} is outside [0, {tp_size})"
         )
-    replication_factor = _tp_replication_factor(config, native_state=native_state)
+    replication_factor = _tp_replication_factor(config)
     return AtomMPParallelConfig(
         world_size=tp_size * pp_size // replication_factor,
         worker_id=worker_id // replication_factor,
@@ -304,8 +302,7 @@ def _make_scheduler_adapter(config: Any, *, checkpoint_spec: Any = None) -> Any:
     import zmq
     from lmcache.integration.atom import AtomMPSchedulerAdapter
 
-    native_state = checkpoint_spec is not None
-    num_kv_readers = _tp_replication_factor(config, native_state=native_state)
+    num_kv_readers = _tp_replication_factor(config)
 
     class _ReaderAwareSchedulerAdapter(AtomMPSchedulerAdapter):
         """Reserve one LMCache read lock for every collapsed TP consumer."""
@@ -324,7 +321,7 @@ def _make_scheduler_adapter(config: Any, *, checkpoint_spec: Any = None) -> Any:
             else _model_namespace(config, checkpoint_spec=checkpoint_spec)
         ),
         block_size=int(config.kv_cache_block_size),
-        parallel_config=_parallel_strategy(config, 0, native_state=native_state),
+        parallel_config=_parallel_strategy(config, 0),
         mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
     )
 
@@ -343,9 +340,7 @@ def _make_worker_adapter(config: Any, rank: int, *, checkpoint_spec: Any = None)
             else _model_namespace(config, checkpoint_spec=checkpoint_spec)
         ),
         block_size=int(config.kv_cache_block_size),
-        parallel_config=_parallel_strategy(
-            config, rank, native_state=checkpoint_spec is not None
-        ),
+        parallel_config=_parallel_strategy(config, rank),
         mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
         heartbeat_interval=float(extra.get("lmcache.mp.heartbeat_interval", 10.0)),
         transfer_mode=_transfer_mode(config),

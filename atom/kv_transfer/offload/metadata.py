@@ -127,7 +127,7 @@ class SlotLoadSpec:
     destination_group: int
 
 
-@dataclass
+@dataclass(frozen=True)
 class NativeStateTransfer:
     """One immutable native checkpoint image sharing a PAGE transfer operation."""
 

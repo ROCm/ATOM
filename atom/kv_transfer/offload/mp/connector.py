@@ -131,8 +131,7 @@ class LMCacheMPConnectorScheduler(KVConnectorSchedulerBase):
                 NativeStateLMCacheMPConnectorScheduler,
             )
 
-            native_impl = NativeStateLMCacheMPConnectorScheduler(self._config)
-            impl = native_impl
+            impl = NativeStateLMCacheMPConnectorScheduler(self._config)
         bind = getattr(impl, "bind_block_manager", None)
         if callable(bind):
             bind(block_manager)

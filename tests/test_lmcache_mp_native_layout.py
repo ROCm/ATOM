@@ -57,20 +57,34 @@ def _layout(transfer):
     return build_native_state_mp_layout(transfer, block_size=4, chunk_size=16)
 
 
-def _gather(layout, ids):
-    image = torch.empty(layout.checkpoint_spec.image_bytes, dtype=torch.uint8)
-    for span in layout.image_plan(ids):
-        image[span.image_offset : span.image_offset + span.nbytes].copy_(
-            layout.tensors[span.tensor_index][span.block_id].flatten()
-        )
-    return image
+def _state_alias_targets(layout, transfer, ids):
+    ids = layout.validate_unit_ids(ids)
+    page_count = len(transfer.block_tensor_views)
+    engine_group_by_tensor = {
+        tensor_index: group.engine_group_id
+        for group in layout.kernel_groups
+        for tensor_index in group.tensor_indices
+    }
+    return [
+        (layout.tensors[tensor_index], ids[engine_group_by_tensor[tensor_index] - 1])
+        for tensor_index in range(page_count, len(layout.tensors))
+    ]
+
+
+def _gather(layout, transfer, ids):
+    return torch.cat(
+        [
+            tensor[block_id].flatten()
+            for tensor, block_id in _state_alias_targets(layout, transfer, ids)
+        ]
+    )
 
 
 def test_native_image_round_trip_uses_arbitrary_unit_ids_and_valid_page_zero():
     source = _transfer()
     source_layout = _layout(source)
     source_ids = [4, 0, 3]
-    actual = _gather(source_layout, source_ids)
+    actual = _gather(source_layout, source, source_ids)
     expected = torch.cat(
         [
             view[unit_id].view(torch.uint8).flatten()
@@ -85,11 +99,17 @@ def test_native_image_round_trip_uses_arbitrary_unit_ids_and_valid_page_zero():
         view.view(torch.uint8).fill_(0xCD)
     destination_layout = _layout(destination)
     destination_ids = [1, 5, 2]
-    for span in destination_layout.image_plan(destination_ids):
-        destination_layout.tensors[span.tensor_index][span.block_id].flatten().copy_(
-            actual[span.image_offset : span.image_offset + span.nbytes]
-        )
-    assert torch.equal(_gather(destination_layout, destination_ids), expected)
+    offset = 0
+    for tensor, block_id in _state_alias_targets(
+        destination_layout, destination, destination_ids
+    ):
+        target = tensor[block_id].flatten()
+        target.copy_(actual[offset : offset + target.numel()])
+        offset += target.numel()
+    assert offset == actual.numel()
+    assert torch.equal(
+        _gather(destination_layout, destination, destination_ids), expected
+    )
     # The partial final unit owns only the first three bytes of region zero.
     assert torch.all(
         destination.block_tensor_views[0][2].view(torch.uint8).flatten()[3:] == 0xCD
@@ -103,12 +123,20 @@ def test_native_image_round_trip_uses_arbitrary_unit_ids_and_valid_page_zero():
 def test_layout_coalesces_equal_shapes_inside_ordinal_and_preserves_trim_stride():
     transfer = _transfer()
     layout = _layout(transfer)
-    assert layout.units_per_checkpoint == 3
-    assert layout.bytes_per_block == 18
-    assert layout.page_region_count == 3
+    assert layout.checkpoint_spec.units_per_checkpoint == 3
+    assert layout.checkpoint_spec.page_unit_bytes == 18
     assert len(layout.tensors) == 10
     assert len(layout.kernel_groups) == 8
-    assert layout.layer_groups == ((0,), (1,), (2,), (3, 4), (5,), (6, 7), (8,), (9,))
+    assert tuple(group.tensor_indices for group in layout.kernel_groups) == (
+        (0,),
+        (1,),
+        (2,),
+        (3, 4),
+        (5,),
+        (6, 7),
+        (8,),
+        (9,),
+    )
     assert [group.engine_group_id for group in layout.kernel_groups] == [
         0,
         0,
@@ -128,25 +156,18 @@ def test_layout_coalesces_equal_shapes_inside_ordinal_and_preserves_trim_stride(
             assert group.tokens_per_block == 4
             assert group.sw_size_tokens == -1
             assert group.recurrent_state is False
-    assert [
-        (r.unit_ordinal, r.region_index, r.image_offset, r.nbytes)
-        for r in layout.state_regions
-    ] == [
-        (0, 0, 0, 8),
-        (0, 1, 8, 8),
-        (0, 2, 16, 2),
-        (1, 0, 18, 8),
-        (1, 1, 26, 8),
-        (1, 2, 34, 2),
-        (2, 0, 36, 3),
-    ]
+    expected_aliases = [(0, 8), (1, 8), (2, 2), (0, 8), (1, 8), (2, 2), (0, 3)]
     tail = layout.tensors[-1]
     assert tuple(tail.shape) == (7, 1, 3)
     assert tail.stride(0) == 8
     assert not tail.is_contiguous()
-    for region in layout.state_regions:
-        tensor = layout.tensors[region.tensor_index]
-        owner = transfer.block_tensor_views[region.region_index]
+    for tensor, (region_index, nbytes) in zip(
+        layout.tensors[len(transfer.block_tensor_views) :],
+        expected_aliases,
+        strict=True,
+    ):
+        owner = transfer.block_tensor_views[region_index]
+        assert tensor.shape[-1] == nbytes
         assert tensor.untyped_storage().data_ptr() == owner.untyped_storage().data_ptr()
         assert tensor.data_ptr() == owner.data_ptr()
         assert tensor.storage_offset() == owner.storage_offset() * owner.element_size()
@@ -155,19 +176,19 @@ def test_layout_coalesces_equal_shapes_inside_ordinal_and_preserves_trim_stride(
 
 @pytest.mark.parametrize("image_bytes", [1, 8, 16, 18, 19, 36, 39, 54])
 def test_image_trims_at_region_and_unit_boundaries(image_bytes):
-    layout = _layout(_transfer(image_bytes=image_bytes))
-    assert sum(region.nbytes for region in layout.state_regions) == image_bytes
-    tail = layout.state_regions[-1]
-    assert tail.image_offset + tail.nbytes == image_bytes
-    assert {region.unit_ordinal for region in layout.state_regions} == set(
-        range(layout.units_per_checkpoint)
-    )
+    transfer = _transfer(image_bytes=image_bytes)
+    layout = _layout(transfer)
+    state_tensors = layout.tensors[len(transfer.block_tensor_views) :]
+    assert sum(tensor.shape[-1] for tensor in state_tensors) == image_bytes
+    assert {
+        group.engine_group_id for group in layout.kernel_groups if group.recurrent_state
+    } == set(range(1, layout.checkpoint_spec.units_per_checkpoint + 1))
 
 
 @pytest.mark.parametrize("ids", [[1], [0, -1, 2], [0, 7, 2], [0, 0, 2], [True, 2, 3]])
-def test_image_plan_rejects_missing_null_out_of_range_and_duplicate_units(ids):
+def test_unit_validation_rejects_missing_null_out_of_range_and_duplicate_units(ids):
     with pytest.raises(ValueError, match="unit ID"):
-        _layout(_transfer()).image_plan(ids)
+        _layout(_transfer()).validate_unit_ids(ids)
 
 
 def test_equal_shape_unequal_stride_is_rejected_before_registration():
@@ -240,7 +261,10 @@ def test_attention_export_retains_page_owners_native_spec_and_restore_callback(
         pools.append((index_scale, "dsv4.indexer.scale"))
     page_bytes = 24 + 16 + (4 if indexer_fp4 else 0)
     spec = PagedStateCheckpointSpec(page_bytes, 128, "dsv4-paged-state-v3:test", 45)
-    restore = lambda stores, restores: None
+
+    def restore(stores, restores):
+        return None
+
     geo = SimpleNamespace(
         envelope_rows=envelope_rows,
         block_bytes=lambda row_bytes: envelope_rows * row_bytes,
@@ -295,8 +319,9 @@ def test_actual_lmcache_registration_preserves_native_aliases_and_stride():
 
     layout = _layout(_transfer())
     groups = layout.engine_group_infos()
+    layer_groups = tuple(group.tensor_indices for group in layout.kernel_groups)
     normalized, formats = normalize_and_discover_per_layer_formats(
-        list(layout.tensors), layout.layer_groups, EngineType.ATOM
+        list(layout.tensors), layer_groups, EngineType.ATOM
     )
     manager = KVLayerGroupsManager(
         normalized,
@@ -306,7 +331,7 @@ def test_actual_lmcache_registration_preserves_native_aliases_and_stride():
         separate_object_groups=True,
     )
     assert [tuple(group.layer_indices) for group in manager.kernel_groups] == list(
-        layout.layer_groups
+        layer_groups
     )
     assert manager.kernel_groups[-1].shape_desc.block_stride_elems == 8
     assert manager.kernel_groups[-1].shape_desc.hs == 3

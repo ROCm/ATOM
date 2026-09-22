@@ -284,13 +284,7 @@ def test_exact_completed_generation_cannot_replay(worker):
 
 def test_native_state_uses_same_tp_rank_collapse_as_page():
     assert _tp_replication_factor(config()) == 2
-    assert _tp_replication_factor(config(), native_state=True) == 2
-    assert (
-        _tp_replication_factor(
-            config(**{"lmcache.mp.tp_rank_collapse": True}), native_state=True
-        )
-        == 2
-    )
+    assert _tp_replication_factor(config(**{"lmcache.mp.tp_rank_collapse": True})) == 2
 
 
 def test_incremental_load_transfers_only_page_suffix_but_full_native_image(worker):

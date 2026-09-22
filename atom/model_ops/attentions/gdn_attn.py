@@ -775,21 +775,19 @@ class GDNStateMixin(PoolRowsMixin):
             self._checkpoint_restore_descriptors = restore_descriptors
         if descriptor_slot and descriptor_slot in restore_descriptors:
             return restore_descriptors[descriptor_slot]
-        if descriptor_slot == 0 or descriptor_slot not in restore_descriptors:
-            plan = self._checkpoint_copy_plan()
-            max_ops = 2 * int(self.model_runner.config.max_num_seqs)
-            descriptor = CpuGpuBuffer(
-                max_ops * plan.num_spans,
-                3,
-                dtype=torch.int64,
-                device=self.model_runner.mamba_k_cache.device,
-            )
-            if descriptor_slot == 0:
-                self._checkpoint_descriptor = descriptor
-            else:
-                restore_descriptors[descriptor_slot] = descriptor
-            return descriptor
-        raise AssertionError("unreachable checkpoint descriptor allocation")
+        plan = self._checkpoint_copy_plan()
+        max_ops = 2 * int(self.model_runner.config.max_num_seqs)
+        descriptor = CpuGpuBuffer(
+            max_ops * plan.num_spans,
+            3,
+            dtype=torch.int64,
+            device=self.model_runner.mamba_k_cache.device,
+        )
+        if descriptor_slot == 0:
+            self._checkpoint_descriptor = descriptor
+        else:
+            restore_descriptors[descriptor_slot] = descriptor
+        return descriptor
 
     def _validate_paged_state_op(self, op) -> None:
         """Refuse an op this worker cannot honour, before it addresses memory.

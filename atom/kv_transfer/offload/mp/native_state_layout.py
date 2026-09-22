@@ -32,45 +32,10 @@ class NativeStateMPKernelGroup:
 
 
 @dataclass(frozen=True)
-class NativeStateMPStateRegion:
-    """One region of the native image, before physical-kernel coalescing."""
-
-    tensor_index: int
-    unit_ordinal: int
-    region_index: int
-    image_offset: int
-    nbytes: int
-
-
-@dataclass(frozen=True)
-class NativeStateMPImageSpan:
-    """A validated image copy span into an owned registered tensor."""
-
-    tensor_index: int
-    block_id: int
-    image_offset: int
-    nbytes: int
-
-
-@dataclass(frozen=True)
 class NativeStateMPLayout:
     tensors: tuple[torch.Tensor, ...]
     kernel_groups: tuple[NativeStateMPKernelGroup, ...]
     checkpoint_spec: Any
-    page_region_count: int
-    state_regions: tuple[NativeStateMPStateRegion, ...]
-
-    @property
-    def bytes_per_block(self) -> int:
-        return self.checkpoint_spec.page_unit_bytes
-
-    @property
-    def units_per_checkpoint(self) -> int:
-        return self.checkpoint_spec.units_per_checkpoint
-
-    @property
-    def layer_groups(self) -> tuple[tuple[int, ...], ...]:
-        return tuple(group.tensor_indices for group in self.kernel_groups)
 
     def engine_group_infos(self) -> list[Any]:
         """Convert the neutral plan at the actual LMCache registration boundary."""
@@ -88,32 +53,21 @@ class NativeStateMPLayout:
             for group in self.kernel_groups
         ]
 
-    def image_plan(self, unit_ids: Sequence[int]) -> tuple[NativeStateMPImageSpan, ...]:
-        """Describe exact native image bytes for arbitrary PAGE unit IDs.
-
-        Null placeholders are invalid here: a checkpoint endpoint must supply
-        every ordinal before any gather/scatter can address device memory.
-        """
-        if len(unit_ids) != self.units_per_checkpoint:
+    def validate_unit_ids(self, unit_ids: Sequence[int]) -> tuple[int, ...]:
+        """Validate the PAGE IDs addressed by one native checkpoint image."""
+        ids = tuple(unit_ids)
+        units_per_checkpoint = int(self.checkpoint_spec.units_per_checkpoint)
+        if len(ids) != units_per_checkpoint:
             raise ValueError(
-                f"native image needs {self.units_per_checkpoint} unit IDs, "
-                f"got {len(unit_ids)}"
+                f"native image needs {units_per_checkpoint} unit IDs, got {len(ids)}"
             )
         num_blocks = self.tensors[0].shape[0]
-        for unit_id in unit_ids:
+        for unit_id in ids:
             if type(unit_id) is not int or not 0 <= unit_id < num_blocks:
                 raise ValueError(f"invalid native checkpoint unit ID: {unit_id!r}")
-        if len(set(unit_ids)) != len(unit_ids):
+        if len(set(ids)) != len(ids):
             raise ValueError("native checkpoint unit IDs must be distinct")
-        return tuple(
-            NativeStateMPImageSpan(
-                tensor_index=region.tensor_index,
-                block_id=unit_ids[region.unit_ordinal],
-                image_offset=region.image_offset,
-                nbytes=region.nbytes,
-            )
-            for region in self.state_regions
-        )
+        return ids
 
 
 def _positive_int(name: str, value: Any) -> int:
@@ -207,12 +161,9 @@ def build_native_state_mp_layout(
 
     tensors = list(page_views)
     engine_ids = [0] * len(tensors)
-    state_regions = []
     image_offset = 0
     for ordinal in range(units):
-        for region_index, (page_view, region) in enumerate(
-            zip(page_views, regions, strict=True)
-        ):
+        for page_view, region in zip(page_views, regions, strict=True):
             nbytes = min(region.unit_bytes, image_bytes - image_offset)
             if not nbytes:
                 break
@@ -227,14 +178,8 @@ def build_native_state_mp_layout(
             alias = byte_view.as_strided(
                 (num_blocks, 1, nbytes), (byte_view.stride(0), nbytes, 1)
             )
-            tensor_index = len(tensors)
             tensors.append(alias)
             engine_ids.append(1 + ordinal)
-            state_regions.append(
-                NativeStateMPStateRegion(
-                    tensor_index, ordinal, region_index, image_offset, nbytes
-                )
-            )
             image_offset += nbytes
     if image_offset != image_bytes:
         raise ValueError("PAGE aliases do not cover the native image")
@@ -267,15 +212,11 @@ def build_native_state_mp_layout(
         tensors=tuple(tensors),
         kernel_groups=groups,
         checkpoint_spec=spec,
-        page_region_count=len(page_views),
-        state_regions=tuple(state_regions),
     )
 
 
 __all__ = [
-    "NativeStateMPImageSpan",
     "NativeStateMPKernelGroup",
     "NativeStateMPLayout",
-    "NativeStateMPStateRegion",
     "build_native_state_mp_layout",
 ]

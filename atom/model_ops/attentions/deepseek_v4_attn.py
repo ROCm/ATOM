@@ -1159,21 +1159,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         restore_descriptors = self._checkpoint_restore_descriptors
         if descriptor_slot and descriptor_slot in restore_descriptors:
             return restore_descriptors[descriptor_slot]
-        if descriptor_slot == 0 or descriptor_slot not in restore_descriptors:
-            plan = self._checkpoint_copy_plan()
-            max_ops = 2 * int(self.model_runner.config.max_num_seqs)
-            descriptor = CpuGpuBuffer(
-                max_ops * plan.num_spans,
-                3,
-                dtype=torch.int64,
-                device=self._kv_planes()[0].device,
-            )
-            if descriptor_slot == 0:
-                self._checkpoint_descriptor = descriptor
-            else:
-                restore_descriptors[descriptor_slot] = descriptor
-            return descriptor
-        raise AssertionError("unreachable checkpoint descriptor allocation")
+        plan = self._checkpoint_copy_plan()
+        max_ops = 2 * int(self.model_runner.config.max_num_seqs)
+        descriptor = CpuGpuBuffer(
+            max_ops * plan.num_spans,
+            3,
+            dtype=torch.int64,
+            device=self._kv_planes()[0].device,
+        )
+        if descriptor_slot == 0:
+            self._checkpoint_descriptor = descriptor
+        else:
+            restore_descriptors[descriptor_slot] = descriptor
+        return descriptor
 
     def _checkpoint_copy_plan(self) -> SegmentedCopyPlan:
         """Where a slot's checkpoint ranges meet a whole image's PAGE regions.

@@ -45,18 +45,16 @@ NATIVE_STATE_MP_STORE_CHANNEL = "native_state_mp_store"
 NATIVE_STATE_MP_SOURCE_SAFE_CHANNEL = "native_state_mp_state_source_safe"
 
 
-def require_native_state_server(adapter: Any, config: Any = None) -> None:
+def require_native_state_server(adapter: Any, config: Any) -> None:
     """Validate native transfer geometry shared with the LMCache server."""
-    if config is not None:
-        configured_chunk = int(
-            offcfg.build_lmcache_config(_storage_kv_transfer_config(config)).chunk_size
+    configured_chunk = int(
+        offcfg.build_lmcache_config(_storage_kv_transfer_config(config)).chunk_size
+    )
+    if configured_chunk != int(adapter.lmcache_tokens_per_chunk):
+        raise ValueError(
+            "Native-state LMCache configured chunk size must match the MP server: "
+            f"configured={configured_chunk}, server={adapter.lmcache_tokens_per_chunk}"
         )
-        if configured_chunk != int(adapter.lmcache_tokens_per_chunk):
-            raise ValueError(
-                "Native-state LMCache configured chunk size must match the MP "
-                "server: "
-                f"configured={configured_chunk}, server={adapter.lmcache_tokens_per_chunk}"
-            )
 
 
 class _UncertainSubmission:
@@ -109,7 +107,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             )
         tp_size, _ = _validate_mp_config(self._config)
         rank = int(get_tp_group().rank_in_group)
-        requested_replication = _tp_replication_factor(self._config, native_state=True)
+        requested_replication = _tp_replication_factor(self._config)
         published_page_replication = _published_tp_replication_factor(
             transfer_tensors, tp_size=tp_size
         )
@@ -186,14 +184,14 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             raise ValueError("native-state restore requires a destination SLOT")
         if not loading and state.destination_slot is not None:
             raise ValueError("native-state save must refer to immutable PAGE units")
-        self._native_layout.image_plan(state.unit_ids)
+        unit_ids = self._native_layout.validate_unit_ids(state.unit_ids)
         pages = self._block_slice(req, start, end)
-        if set(pages) & set(state.unit_ids):
+        if set(pages) & set(unit_ids):
             raise ValueError("checkpoint PAGE units must not overlap KV PAGE blocks")
         count = (end - start) // self.chunk_size
         # Earlier chunks have PAGE only. A boundary image is indivisible: all
         # its ordinal groups are present at exactly the same final chunk.
-        return [pages] + [[-1] * (count - 1) + [unit] for unit in state.unit_ids]
+        return [pages] + [[-1] * (count - 1) + [unit] for unit in unit_ids]
 
     def _submit_native(self, req: LMCacheReqMeta, event: Any, *, loading: bool) -> None:
         from lmcache.integration.atom import AtomMPTransferSpec
