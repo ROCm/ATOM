@@ -112,6 +112,7 @@ support_model_arch_dict = {
     "MixtralForCausalLM": "atom.models.mixtral.MixtralForCausalLM",
     "DeepseekV3ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
     "DeepseekV32ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
+    "DeepseekV41ForCausalLM": "atom.models.deepseek_v41.runtime.DeepseekV41RuntimeModel",
     "DeepseekV4ForCausalLM": "atom.models.deepseek_v4.DeepseekV4ForCausalLM",
     "GptOssForCausalLM": "atom.models.gpt_oss.GptOssForCausalLM",
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2.GlmMoeDsaForCausalLM",
@@ -625,6 +626,9 @@ class ModelRunner:
 
     def __init__(self, rank: int, config: Config):
         self.config = config
+        from atom.model_engine.multimodal_runtime import VisionEmbeddingCache
+
+        self.vision_embeddings = VisionEmbeddingCache()
         self.mark_trace = getattr(config, "mark_trace", False)
         from atom.utils.graph_marker import set_graph_marker_enabled
 
@@ -674,6 +678,7 @@ class ModelRunner:
             self.profiler_dir = os.path.join(config.torch_profiler_dir, rank_name)
             os.makedirs(self.profiler_dir, exist_ok=True)
 
+        self.attn_backend = get_attn_backend(self.attn_family)
         self._setup_device_and_distributed(rank, config)
 
         self.capture_sizes = [0]  # for eager fallback
@@ -692,7 +697,6 @@ class ModelRunner:
         default_dtype = self.config.torch_dtype
         torch.set_default_dtype(default_dtype)
         torch.set_default_device(self.device)
-        self.attn_backend = get_attn_backend(self.attn_family)
         use_spec = bool(self.config.speculative_config) and get_pp_group().is_last_rank
         self.num_spec_tokens = (
             self.config.speculative_config.num_speculative_tokens if use_spec else 0
@@ -981,10 +985,14 @@ class ModelRunner:
 
         return cu_num_tokens, arange
 
+    def release_multimodal_requests(self, request_ids):
+        self.vision_embeddings.release(request_ids)
+
     def exit(self):
         if not self.still_running:
             return
         self.still_running = False
+        self.vision_embeddings.clear()
         # 0. Join any offload connector's copy threads. Its ThreadPoolExecutors
         #    are non-daemon, so leaving them running wedges interpreter shutdown
         #    or races an in-flight copy against atexit. Must run BEFORE the KV
@@ -994,6 +1002,9 @@ class ModelRunner:
         close = getattr(connector, "close", None) if connector is not None else None
         if callable(close):
             close()
+        builder = getattr(self, "attn_metadata_builder", None)
+        if builder is not None:
+            builder.close()
         # 1. Destroy distributed env (NCCL + CustomAllreduce + process groups)
         #    Must happen while ops module is still alive for CustomAllreduce cleanup.
         destroy_dist_env()
@@ -2371,6 +2382,7 @@ class ModelRunner:
             running_tokens=running_tokens,
             max_seqlen_q=forward_mode.max_seqlen_q,
         )
+        self.attn_metadata_builder.prepare_model_inputs(input_ids, attn_metadata)
         context = Context(
             positions=positions,
             is_prefill=is_prefill,
@@ -2813,15 +2825,7 @@ class ModelRunner:
             # prefill, or decode forced eager (enforce_eager / DP peer
             # prefill / bs above the largest captured graph).
             with record_function(label):
-                # Handle multimodal prefill: compute vision embeddings and merge.
-                #
-                # This assumes `input_ids` spans the whole prompt: the encoder
-                # runs over every image and the result is scattered onto all
-                # placeholder positions found in the batch. The scheduler
-                # therefore refuses to chunk a multimodal prefill.
-                # TODO: support chunked multimodal prefill — cache the encoder
-                # output per request and scatter only the slice belonging to
-                # this chunk, keyed by its token offset into the prompt.
+                # The multimodal runtime owns request leases and span scatter.
                 inputs_embeds = None
                 if (
                     is_prefill
@@ -2830,21 +2834,39 @@ class ModelRunner:
                     and hasattr(batch, "multimodal_data")
                     and batch.multimodal_data
                 ):
-                    mm_data_values = list(batch.multimodal_data.values())
-                    pixel_values = torch.cat(
-                        [mm_data["pixel_values"] for mm_data in mm_data_values], dim=0
-                    ).to(device=self.device, dtype=self.config.torch_dtype)
-                    grid_thw = torch.cat(
-                        [mm_data["image_grid_thw"] for mm_data in mm_data_values],
-                        dim=0,
-                    ).to(device=self.device)
-                    vision_embeds = self.model.get_vision_embeddings(
-                        pixel_values, grid_thw
-                    )
-                    text_embeds = self.model.embed_input_ids(input_ids)
-                    inputs_embeds = self.model.merge_multimodal_embeddings(
-                        input_ids, text_embeds, vision_embeds
-                    )
+                    if all(
+                        "embedding_spans" in data
+                        for data in batch.multimodal_data.values()
+                    ):
+                        from atom.model_engine.multimodal_runtime import (
+                            embed_multimodal_batch,
+                        )
+
+                        inputs_embeds = embed_multimodal_batch(
+                            self.model,
+                            self.vision_embeddings,
+                            input_ids,
+                            batch,
+                            self.device,
+                            self.config.torch_dtype,
+                        )
+                    else:
+                        mm_data_values = list(batch.multimodal_data.values())
+                        pixel_values = torch.cat(
+                            [mm_data["pixel_values"] for mm_data in mm_data_values],
+                            dim=0,
+                        ).to(device=self.device, dtype=self.config.torch_dtype)
+                        grid_thw = torch.cat(
+                            [mm_data["image_grid_thw"] for mm_data in mm_data_values],
+                            dim=0,
+                        ).to(device=self.device)
+                        vision_embeds = self.model.get_vision_embeddings(
+                            pixel_values, grid_thw
+                        )
+                        text_embeds = self.model.embed_input_ids(input_ids)
+                        inputs_embeds = self.model.merge_multimodal_embeddings(
+                            input_ids, text_embeds, vision_embeds
+                        )
 
                 pp_group = get_pp_group()
                 pp_enabled = pp_group.world_size > 1
@@ -3024,13 +3046,24 @@ class ModelRunner:
 
             bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
             target_logits = torch.index_select(logits, 0, target_logits_indices)
+            target_token_ids = None
+            if not all_greedy:
+                target_token_ids = self.sampler.sample_verification_tokens(
+                    target_logits,
+                    spec_decode_metadata.cu_num_draft_tokens,
+                    temperatures,
+                    top_ks,
+                    top_ps,
+                )
+                if target_token_ids.numel() and get_tp_group().world_size > 1:
+                    target_token_ids = get_tp_group().broadcast(target_token_ids, src=0)
             bonus_token_ids = self.sampler(
                 logits=bonus_logits,
                 temperatures=temperatures,
                 top_ks=top_ks,
                 top_ps=top_ps,
                 all_greedy=all_greedy,
-                needs_independent_noise=needs_independent_noise,
+                needs_independent_noise=needs_independent_noise or not all_greedy,
             )
             # Validate shapes match expectations
             if target_logits.shape[0] != len(spec_decode_metadata.draft_token_ids):
@@ -3045,6 +3078,7 @@ class ModelRunner:
                 spec_decode_metadata,
                 target_logits,
                 bonus_token_ids,
+                target_token_ids=target_token_ids,
             )
             # PCP ranks decode redundantly and are consistent only while their
             # kernels agree bit-for-bit -- they don't (hidden differs by ~1 bf16
@@ -3376,6 +3410,9 @@ class ModelRunner:
         # complement, and is a zero buffer on a step that scored no drafts.
         last_token_indices = self.drafter.prepare_inputs(
             batch.total_seqs_num, anchor_in_seq=num_bonus_tokens
+        )
+        self.attn_metadata_builder.commit_speculative_state(
+            forward_context.attn_metadata, last_token_indices
         )
 
         draft_token = self.drafter.propose(
@@ -3753,7 +3790,8 @@ class ModelRunner:
         # uncaptured shapes.
         self._piecewise_captured_tokens = set()
 
-        self.forward_vars["kv_indptr"].gpu.zero_()
+        if "kv_indptr" in self.forward_vars:
+            self.forward_vars["kv_indptr"].gpu.zero_()
         # Present exactly when the model has an indexer -- the builder makes it
         # under the same answer -- so the buffer's own existence is the test.
         if "sparse_kv_indptr" in self.forward_vars:
@@ -4074,6 +4112,8 @@ class ModelRunner:
         verify_scheduler = getattr(drafter, "verify_scheduler", None)
         if verify_scheduler is None:
             return
+        if verify_scheduler.calibration_profile is not None:
+            return  # Explicit offline measurements must not be overwritten.
         if not getattr(self, "graphs", None):
             return
         if self.config.dspark.disable_sps_calib:

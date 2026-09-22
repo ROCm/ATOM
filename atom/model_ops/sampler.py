@@ -61,6 +61,43 @@ class Sampler(nn.Module):
         super().__init__()
         self.eps = SAMPLER_EPS
 
+    def sample_verification_tokens(
+        self,
+        logits: torch.Tensor,
+        cu_num_draft_tokens: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor | None,
+        top_ps: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Sample each draft-conditioned target row with independent noise.
+
+        Accepting a draft when it matches this draw and stopping at the first
+        mismatch preserves the target distribution. Sharing noise across rows
+        would condition later draws on earlier acceptance decisions.
+        """
+        rows = logits.shape[0]
+        if rows == 0:
+            return torch.empty(0, device=logits.device, dtype=torch.int32)
+        request_indices = torch.searchsorted(
+            cu_num_draft_tokens,
+            torch.arange(rows, device=logits.device, dtype=cu_num_draft_tokens.dtype),
+            right=True,
+        )
+
+        def expand(values):
+            if values is None or values.numel() == 1:
+                return values
+            return values[request_indices]
+
+        return self(
+            logits,
+            temperatures[request_indices],
+            expand(top_ks),
+            expand(top_ps),
+            all_greedy=False,
+            needs_independent_noise=True,
+        )
+
     def forward(
         self,
         logits: torch.Tensor,  # (num_tokens, vocab_size)

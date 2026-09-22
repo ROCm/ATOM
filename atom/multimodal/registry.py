@@ -28,13 +28,36 @@ _MULTIMODAL_ARCH_TO_MODEL: dict[str, str] = {
 }
 
 _MULTIMODAL_ARCH_TO_INPUT_BUILDER: dict[str, str] = {
+    "DeepseekV41ForCausalLM": (
+        "atom.models.deepseek_v41.image_processing.build_inputs"
+    ),
     "KimiK3ForConditionalGeneration": "atom.models.kimi_k3_vl.build_kimi_k3_inputs",
+}
+
+# Architectures whose checkpoint ships its own processor rather than one
+# `AutoProcessor` can build. Selected before that fallback, so a model listed
+# here never reaches it.
+_MULTIMODAL_ARCH_TO_PROCESSOR: dict[str, str] = {
+    "DeepseekV41ForCausalLM": (
+        "atom.models.deepseek_v41.image_processing.DeepseekV41ImageProcessor"
+    ),
 }
 
 
 def _resolve(qualname: str) -> Any:
     module, _, name = qualname.rpartition(".")
     return getattr(import_module(module), name)
+
+
+def get_native_multimodal_processor(atom_config, tokenizer, encoder):
+    """The checkpoint's own processor, or None to fall back to `AutoProcessor`."""
+    architectures = getattr(atom_config.hf_config, "architectures", None) or []
+    factory = (
+        _MULTIMODAL_ARCH_TO_PROCESSOR.get(architectures[0]) if architectures else None
+    )
+    return (
+        None if factory is None else _resolve(factory)(atom_config, tokenizer, encoder)
+    )
 
 
 def get_multimodal_input_builder(

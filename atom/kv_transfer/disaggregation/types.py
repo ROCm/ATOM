@@ -495,16 +495,6 @@ class ConnectorMetadata:
         )
 
 
-def completion_req_key(completion: ConnectorCompletionId) -> str:
-    """Request identity shared by every shape a completion can take.
-
-    Offload reports ``SaveOperationId``/``LoadOperationId`` or a bare request
-    id; the send side and the scheduler only know requests. Pairing the two
-    means collapsing onto the request id first, or the lookup never hits.
-    """
-    return str(getattr(completion, "req_id", completion))
-
-
 #: Fallback for objects that are not `ConnectorMetadata` -- test doubles and
 #: duck-typed sub-metas. Real metadata answers through `has_work`; this list is
 #: deliberately not the place to register a new field.

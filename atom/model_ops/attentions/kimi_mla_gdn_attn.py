@@ -5,11 +5,13 @@ import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
-from atom.config import _MQA_LOGITS_PRESHUFFLE_ROWS
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAAttention
+from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+    MQA_LOGITS_PRESHUFFLE_ROWS,
+)
 from atom.model_ops.glm5_next.geometry import (
     effective_kpool_size,
     pooled_path_enabled,
@@ -189,10 +191,10 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 f"index_kpool={kpool}; Config sets the block size for exactly this"
             )
         rows = runner.block_size // kpool
-        if rows % _MQA_LOGITS_PRESHUFFLE_ROWS:
+        if rows % MQA_LOGITS_PRESHUFFLE_ROWS:
             raise ValueError(
                 f"{rows} pooled rows per block is not a multiple of "
-                f"{_MQA_LOGITS_PRESHUFFLE_ROWS}, so deepgemm_fp8_paged_mqa_logits "
+                f"{MQA_LOGITS_PRESHUFFLE_ROWS}, so deepgemm_fp8_paged_mqa_logits "
                 "cannot stay in the preshuffled layout -- the only one it computes "
                 "correctly. Raise kv_cache_block_size."
             )

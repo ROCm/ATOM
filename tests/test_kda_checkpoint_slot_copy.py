@@ -226,7 +226,11 @@ def hybrid_with_kpool_tail(num_slots: int = 4):
         draft_shares_kv_pool=lambda: False,
         has_mla_indexer=True,
         config=SimpleNamespace(
-            hf_config=SimpleNamespace(index_kpool=4, index_head_dim=2)
+            hf_config=SimpleNamespace(index_kpool=4, index_head_dim=2),
+            # No speculation: `_kpool_history_size` sizes the ring for one
+            # verification's rejection window, and the tail shape below is the
+            # non-speculative bound.
+            speculative_config=None,
         ),
         mamba_k_cache=torch.zeros((N_LAYERS, num_slots) + SHAPE_K, dtype=DT_K),
         mamba_v_cache=torch.zeros((N_LAYERS, num_slots) + SHAPE_V, dtype=DT_V),

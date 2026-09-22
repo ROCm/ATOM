@@ -255,7 +255,10 @@ class EngineCore:
         try:
             self.runner_mgr.call_func("exit")
         except Exception:
-            pass  # shared memory may already be freed
+            logger.debug(
+                "runner exit call failed; shared memory may already be freed",
+                exc_info=True,
+            )
         for proc in self.runner_mgr.procs:
             try:
                 alive = proc.is_alive()
@@ -315,9 +318,9 @@ class EngineCore:
             else:
                 engine = EngineCore(config, input_address, output_address)
             engine.busy_loop()
-        except Exception as e:
-            logger.error(f"run_engine: exception: {e}", exc_info=True)
-            raise e
+        except Exception:
+            logger.exception("run_engine failed")
+            raise
         finally:
             if engine is not None:
                 engine.exit()
@@ -376,6 +379,15 @@ class EngineCore:
             except Exception:
                 logger.exception("KV event publish in engine-step finally failed")
 
+    def _release_multimodal_requests(self, sequences):
+        request_ids = [
+            seq.id for seq in sequences if getattr(seq, "cache_seed", -1) != -1
+        ]
+        if request_ids:
+            # Ordered after the completed forward on every worker, including
+            # final/aborted requests when there will be no subsequent batch.
+            self.runner_mgr.call_func("release_multimodal_requests", request_ids)
+
     def _process_engine_step_inner(self):
         result = self.scheduler.schedule()
 
@@ -385,6 +397,7 @@ class EngineCore:
         # the rejected seq will never produce.
         rejected = self.scheduler.take_rejected()
         if rejected:
+            self._release_multimodal_requests(rejected)
             self.output_queue.put_nowait(rejected)
 
         if result is None:
@@ -449,6 +462,7 @@ class EngineCore:
             pass
 
         if finished_seqs:
+            self._release_multimodal_requests(finished_seqs)
             self.output_queue.put_nowait(finished_seqs)
 
         return True
@@ -1109,8 +1123,8 @@ class PrefillEngineCore(EngineCore):
             engine = PrefillEngineCore(config, input_address, output_address)
             engine._init_disagg()
             engine.busy_loop()
-        except Exception as e:
-            logger.error(f"PrefillEngineCore.run_engine: exception: {e}", exc_info=True)
+        except Exception:
+            logger.exception("PrefillEngineCore.run_engine failed")
             raise
         finally:
             if engine is not None:
@@ -1122,11 +1136,11 @@ class PrefillEngineCore(EngineCore):
             if hasattr(self, "_bootstrap_push_sock"):
                 self._bootstrap_push_sock.close(linger=0)
         except Exception:
-            pass
+            logger.debug("bootstrap socket close failed", exc_info=True)
         try:
             self._disagg_ctx.destroy(linger=0)
         except Exception:
-            pass
+            logger.debug("disagg context destroy failed", exc_info=True)
 
 
 class DecodeEngineCore(EngineCore):
@@ -1185,7 +1199,7 @@ class DecodeEngineCore(EngineCore):
         config.num_kvcache_blocks = num_kvcache_blocks
 
         if not config.enforce_eager:
-            cap_cost, bs, pool_bytes = self.runner_mgr.call_func(
+            cap_cost, bs, _ = self.runner_mgr.call_func(
                 "capture_cudagraph", wait_out=True
             )
             logger.info(
@@ -1373,8 +1387,8 @@ class DecodeEngineCore(EngineCore):
             engine = DecodeEngineCore(config, input_address, output_address)
             engine._init_disagg()
             engine.busy_loop()
-        except Exception as e:
-            logger.error(f"DecodeEngineCore.run_engine: exception: {e}", exc_info=True)
+        except Exception:
+            logger.exception("DecodeEngineCore.run_engine failed")
             raise
         finally:
             if engine is not None:
@@ -1385,4 +1399,4 @@ class DecodeEngineCore(EngineCore):
         try:
             self._disagg_ctx.destroy(linger=0)
         except Exception:
-            pass
+            logger.debug("disagg context destroy failed", exc_info=True)

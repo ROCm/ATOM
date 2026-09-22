@@ -275,6 +275,8 @@ models:
               tp: 4
               cudagraph: none
             env:
+              common:
+                MC_DISABLE_HIP: "1"
               prefill:
                 HIP_VISIBLE_DEVICES: "0,1,2,3"
               decode:
@@ -365,6 +367,8 @@ models:
             extra_args: "--decode-context-parallel-size 4 --cudagraph-mode FULL"
           env:
             common:
+              # Force RDMA to avoid HIP IPC shared-pool address corruption.
+              MC_DISABLE_HIP: "1"
               ATOM_MLA_PAGE_SIZE: "1"
               ATOM_ONLINE_QUANT_STREAMING: "0"
               ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB: "2047"

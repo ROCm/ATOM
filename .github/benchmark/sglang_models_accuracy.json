@@ -474,32 +474,6 @@
     "_baseline_note": "Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k."
   },
   {
-    "model_name": "MI308 Qwen3-32B-FP8 TP1",
-    "model_path": "Qwen/Qwen3-32B-FP8",
-    "extraArgs": "--tensor-parallel-size 1 --page-size 16 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
-    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
-    "runner": "atom-mi308-8gpu-plugins-accuracy",
-    "test_level": "nightly",
-    "lm_eval_extra_model_args": "max_gen_toks=1024",
-    "accuracy_threshold": 0.8,
-    "accuracy_baseline": null,
-    "accuracy_baseline_model": "Qwen/Qwen3-32B-FP8",
-    "_baseline_note": "Adds max_gen_toks=1024 for the MI308 CI gsm8k path to avoid truncating Qwen3-32B reasoning output."
-  },
-  {
-    "model_name": "MI308 Qwen3-32B-FP8 TP8",
-    "model_path": "Qwen/Qwen3-32B-FP8",
-    "extraArgs": "--tensor-parallel-size 8 --page-size 16 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
-    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
-    "runner": "atom-mi308-8gpu-plugins-accuracy",
-    "test_level": "nightly",
-    "lm_eval_extra_model_args": "max_gen_toks=1024",
-    "accuracy_threshold": 0.8,
-    "accuracy_baseline": null,
-    "accuracy_baseline_model": "Qwen/Qwen3-32B-FP8",
-    "_baseline_note": "Adds max_gen_toks=1024 for the MI308 CI gsm8k path to avoid truncating Qwen3-32B reasoning output."
-  },
-  {
     "model_name": "MI308 GLM-5.1-FP8 TP8",
     "model_path": "zai-org/GLM-5.1-FP8",
     "extraArgs": "--trust-remote-code --tensor-parallel-size 8 --nsa-prefill-backend tilelang --nsa-decode-backend tilelang --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.8 --page-size 1 --disable-radix-cache",
@@ -512,20 +486,6 @@
     "accuracy_baseline": null,
     "accuracy_baseline_model": "zai-org/GLM-5.1-FP8",
     "_baseline_note": "Threshold aligned with the SGLANG accuracy validation workflow target for GLM-5.1-FP8 TP8 on MI308."
-  },
-  {
-    "model_name": "MI308 GLM-5.2-FP8 TP8",
-    "model_path": "zai-org/GLM-5.2-FP8",
-    "extraArgs": "--trust-remote-code --tp-size 8 --mem-fraction-static 0.8 --disable-radix-cache --max-prefill-tokens 65536 --kv-cache-dtype fp8_e4m3",
-    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_ENABLE_TORCH_COMPILE=1\nSGLANG_USE_AITER=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nTORCHINDUCTOR_COMPILE_THREADS=128",
-    "runner": "atom-mi308-8gpu-plugins-accuracy",
-    "test_level": "nightly",
-    "lm_eval_num_fewshot": 5,
-    "lm_eval_num_concurrent": 65,
-    "accuracy_threshold": 0.93,
-    "accuracy_baseline": null,
-    "accuracy_baseline_model": "zai-org/GLM-5.2-FP8",
-    "_baseline_note": "5-shot GSM8K local-completions coverage for GLM-5.2-FP8 IndexShare on MI308 using the SGLang-ATOM recipe server command."
   },
   {
     "model_name": "MI308 Qwen3.8-Flash-Next-FP8 TP2",
@@ -560,3 +520,4 @@
     "_baseline_note": "MI308 SGLang DeepSeek-V4-Flash uses the FP8 weight checkpoint with a BF16 KV cache because AITER DSV4 FP8 KV decode kernels are unavailable on gfx942; refresh baseline after nightly measurements land."
   }
 ]
+

@@ -855,7 +855,7 @@ class BlockManager:
         caller's loop variable holds a hash that is not in the chain.
         """
         chain = list(block_hashes)
-        h = chain[-1] if chain else -1
+        h = chain[-1] if chain else seq.cache_seed
         for i in range(len(chain), blocks):
             h = self.compute_hash(self._hash_block_tokens(seq, i), h)
             chain.append(h)
@@ -897,7 +897,7 @@ class BlockManager:
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
         # read the WHOLE history, so this stays a full front-to-back chained
         # match). Record each block's hash for the SWA scan below.
-        h = -1
+        h = seq.cache_seed
         compressed_hit = 0
         block_hashes: list[int] = []
         for i in range(self._n_hash_blocks(seq) - 1):
@@ -1015,7 +1015,7 @@ class BlockManager:
             num_cached_blocks,
             int(seq.offload_joint.claim_tokens or 0) // hbs,
         )
-        h = -1
+        h = seq.cache_seed
         hit_hash = -1
         for i in range(claim_blocks):
             token_ids = self._hash_block_tokens(seq, i)
@@ -1561,7 +1561,7 @@ class BlockManager:
         source-level bug; callers skip the range rather than mint false hashes.
         """
         if start <= 0:
-            return -1
+            return seq.cache_seed
         h = self.kv.block(seq.block_table[start - 1]).hash
         if h != -1:
             return h

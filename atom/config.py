@@ -16,6 +16,9 @@ from torch.distributed import ProcessGroup, ReduceOp
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
 # plugin-related utilities
+from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+    MQA_LOGITS_PRESHUFFLE_ROWS,
+)
 from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
 from atom.quant_spec import (
@@ -548,10 +551,11 @@ class QuantizationConfig:
         self,
         hf_config: PretrainedConfig,
         packed_modules_mapping: dict | None = None,
-        weights_mapper={},
+        weights_mapper: dict | None = None,
         quant_exclude_name_mapping: dict[str, str] | None = None,
     ):
         model_type = hf_config.model_type
+        weights_mapper = weights_mapper or {}
         self.packed_modules_mapping = (
             packed_modules_mapping if packed_modules_mapping is not None else {}
         )
@@ -569,9 +573,10 @@ class QuantizationConfig:
                     "gate_proj": ("gate_up_proj", 0),
                     "up_proj": ("gate_up_proj", 1),
                 }
-        elif model_type == "qwen3_moe" or model_type == "qwen3_next":
-            if getattr(hf_config, "mlp_only_layers", []):
-                self.packed_modules_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
+        elif model_type in ("qwen3_moe", "qwen3_next") and getattr(
+            hf_config, "mlp_only_layers", []
+        ):
+            self.packed_modules_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
 
         if weights_mapper:
             self.exclude_layers = [
@@ -627,27 +632,17 @@ class QuantizationConfig:
             self.apply_exclude_name_mapping(quant_exclude_name_mapping)
 
 
-# Rows per block that `deepgemm_fp8_paged_mqa_logits` requires to stay in its
-# preshuffled layout, which is the only layout it computes correctly -- with
-# `Preshuffle=False` it disagrees with the flat `fp8_mqa_logits` kernel by ~100%
-# at every block size, and aiter's assert guards only the preshuffle side. Any
-# cache that kernel pages over must therefore hold a multiple of this many rows
-# per block. Sizing constants belong to whoever enforces them, and the block
-# size is set here.
-_MQA_LOGITS_PRESHUFFLE_ROWS = 16
-
-
 def glm5_kpool_block_size(index_kpool: int) -> int:
     """Tokens per KV block that lets GLM-5.3's pooled index cache be exact.
 
     A block of B tokens needs ``B // index_kpool`` index rows, and that count
-    must be a multiple of `_MQA_LOGITS_PRESHUFFLE_ROWS`. The smallest B that
+    must be a multiple of `MQA_LOGITS_PRESHUFFLE_ROWS`. The smallest B that
     satisfies it is the product, and the smallest is what we want: a larger
     block only adds paging waste, while a smaller one forces the cache to be
     padded back up to one row per token -- which is the whole cost being
     removed here.
     """
-    return index_kpool * _MQA_LOGITS_PRESHUFFLE_ROWS
+    return index_kpool * MQA_LOGITS_PRESHUFFLE_ROWS
 
 
 def _glm5_next_unsupported_features(config: "Config") -> list[str]:
@@ -710,6 +705,10 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
         model,
     )
     model_type = config_dict.get("model_type")
+    if model_type == "deepseek_v41":
+        from atom.models.deepseek_v41.config import normalize_hf_config
+
+        return normalize_hf_config(config_dict)
 
     def _get_hf_token() -> str | None:
         token = os.getenv("HF_TOKEN")
@@ -803,7 +802,7 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
         hf_config = AutoConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code
         )
-    except ValueError as e:
+    except ValueError:
         # For the unsupported model in current transformers, try vllm if in plugin mode
         if is_vllm():
             from vllm.transformers_utils.config import get_config
@@ -814,7 +813,7 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
             hf_config = get_config(model, trust_remote_code=trust_remote_code)
             hf_config = maybe_patch_hf_config_from_gguf(model, hf_config)
         else:
-            raise e
+            raise
     return hf_config
 
 
@@ -851,9 +850,11 @@ def _normalize_minimax_m3_text_config(hf_config: PretrainedConfig) -> None:
     if text_config is None or text_config is hf_config:
         return
 
-    if getattr(text_config, "hidden_act", None) == "swigluoai":
-        if getattr(text_config, "swiglu_beta", None) is None:
-            text_config.swiglu_beta = 1.0
+    if (
+        getattr(text_config, "hidden_act", None) == "swigluoai"
+        and getattr(text_config, "swiglu_beta", None) is None
+    ):
+        text_config.swiglu_beta = 1.0
 
     for attr_name in (
         "use_index_cache",
@@ -1340,6 +1341,10 @@ class SpeculativeConfig:
         # config fields. Route it to the DSpark draft model and skip the MTP
         # n_predict=1 rewrite (DSpark uses dspark_block_size, not n_predict).
         if getattr(hf_config, "dspark_block_size", None):
+            if hf_config.model_type in ("deepseek_v41", "deepseek_v41_text"):
+                hf_config.model_type = "deepseek_v41_dspark"
+                hf_config.architectures = ["DeepseekV41DSparkModel"]
+                return
             hf_config.model_type = "deepseek_v4_dspark"
             hf_config.architectures = ["DeepseekV4DSparkModel"]
             logger.info(
@@ -1457,8 +1462,10 @@ class DSparkConfig:
         buckets to capture for the ragged path (e.g. "1,3,6" or "8").
       - q_buckets: CUDA-graph query-length buckets for the (older) batch-uniform
         q-bucket verify path (independent of the ragged path).
-      - disable_sps_calib: skip SPS calibration (replays captured graphs at
-        warmup); fall back to the synthetic SPS stub.
+      - disable_sps_calib: skip automatic SPS calibration (replays captured
+        graphs at warmup). Without an explicit profile, use the synthetic stub.
+      - calibration_profile: JSON file containing model/runtime-bound SPS and
+        STS measurements. Takes precedence over automatic calibration.
     """
 
     confidence_schedule: bool = False
@@ -1466,6 +1473,18 @@ class DSparkConfig:
     ragged_graph_sizes: str = ""
     q_buckets: str = ""
     disable_sps_calib: bool = False
+    # Explicit offline measurements; compatibility is checked before use.
+    calibration_profile: str | None = None
+
+    def __post_init__(self):
+        if self.calibration_profile is not None and (
+            not isinstance(self.calibration_profile, str)
+            or not self.calibration_profile
+            or not self.confidence_schedule
+        ):
+            raise ValueError(
+                "DSpark calibration_profile requires a path and confidence_schedule=True"
+            )
 
     @classmethod
     def from_dict(cls, cfg: dict | None) -> "DSparkConfig":
@@ -2087,11 +2106,11 @@ class Config:
             self.hf_config.rope_parameters = rope_params
 
         self.generation_config = get_generation_config(self.model)
-        if self.generation_config is not None:
-            if (
-                eos_ids := getattr(self.generation_config, "eos_token_id", None)
-            ) is not None:
-                self.stop_token_ids = [eos_ids] if isinstance(eos_ids, int) else eos_ids
+        if self.generation_config is not None and (
+            (eos_ids := getattr(self.generation_config, "eos_token_id", None))
+            is not None
+        ):
+            self.stop_token_ids = [eos_ids] if isinstance(eos_ids, int) else eos_ids
         self.quant_config = QuantizationConfig(
             self.hf_config,
             self.online_quant_config,
@@ -2145,11 +2164,15 @@ class Config:
             or (self.plugin_config is not None and self.plugin_config.is_vllm)
         ) and self.compilation_config.level == CompilationLevel.PIECEWISE:
             self.compilation_config.set_splitting_ops_for_v1()
-            # Keep an explicit cudagraph_mode (e.g. FULL); default to
-            # PIECEWISE only when unset. splitting_ops/sizes are set either
-            # way so the model is still piece-split-compiled at level 3.
+            # Default to PIECEWISE, except V4.1 whose Engram stream fork/join
+            # currently requires a FULL graph. Explicit choices are preserved.
+            # splitting_ops/sizes still configure the level-3 backend.
             if self.compilation_config.cudagraph_mode is None:
-                self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+                self.compilation_config.cudagraph_mode = (
+                    CUDAGraphMode.FULL
+                    if self.hf_config.model_type == "deepseek_v41_text"
+                    else CUDAGraphMode.PIECEWISE
+                )
             self.compilation_config.init_with_cudagraph_sizes()
 
         self.torch_dtype = (
@@ -2231,7 +2254,10 @@ class Config:
         # Use the preserved `architectures` field (re-injected by get_hf_config,
         # line 567) which keeps the original "DeepseekV4ForCausalLM[NextN]" name.
         arches = getattr(self.hf_config, "architectures", None) or []
-        is_deepseek_v4 = any("DeepseekV4" in str(a) for a in arches)
+        is_deepseek_v4 = any(
+            str(a).startswith(("DeepseekV4For", "DeepseekV4MTP", "DeepseekV4DSpark"))
+            for a in arches
+        )
         if is_deepseek_v4:
             v4_block_size = 256
             if self.kv_cache_block_size != v4_block_size:
@@ -2331,15 +2357,39 @@ class Config:
         # not yet describe the separate FP4 scale pool, so those integrations
         # retain FP8 until their layouts support it. Every other model keeps
         # the historical KV-cache-dtype default.
-        if self.index_cache_dtype is None and is_deepseek_v4:
-            if self.plugin_config is None and not self.kv_transfer_config:
-                from aiter.jit.utils.chip_info import get_gfx
+        if self.index_cache_dtype is None:
+            if is_deepseek_v4:
+                if self.plugin_config is None and not self.kv_transfer_config:
+                    from aiter.jit.utils.chip_info import get_gfx
 
-                self.index_cache_dtype = "fp8" if get_gfx() == "gfx942" else "fp4"
-            else:
+                    self.index_cache_dtype = "fp8" if get_gfx() == "gfx942" else "fp4"
+                else:
+                    self.index_cache_dtype = "fp8"
+            elif self.hf_config.model_type == "deepseek_v41_text":
+                # CSA2 reads its index plane with the paged scorer and has no
+                # other, so the plane's format does not follow the main pool's.
+                # Only the default: an explicit value is carried through to the
+                # V4.1 runtime gate, which refuses anything else before weights
+                # load. Overriding it here would accept the flag and ignore it.
                 self.index_cache_dtype = "fp8"
-        elif self.index_cache_dtype is None:
-            self.index_cache_dtype = self.kv_cache_dtype
+            else:
+                self.index_cache_dtype = self.kv_cache_dtype
+
+        if self.hf_config.model_type == "deepseek_v41_text":
+            # CSA2's index plane is paged by the same scorer GLM's is, so a
+            # PAGE again has to hold a whole number of `MQA_LOGITS_PRESHUFFLE_ROWS`
+            # tiles -- and its ratio-2 owners halve the PAGE before that count
+            # is taken, which makes the floor twice the tile. 256 rather than
+            # that floor, and for the reason DeepSeek-V4 takes it: the block
+            # table is `[max_num_seqs, max_model_len / block_size]` int32 held
+            # twice and copied to the device every forward, 8 MB here against
+            # 134 MB at the 16 this field defaults to. What it costs is prefix
+            # reuse shorter than a PAGE, which stops matching at all.
+            self.kv_cache_block_size = 256
+
+            from atom.models.deepseek_v41.config import validate_runtime_config
+
+            validate_runtime_config(self)
 
     def compute_hash(self) -> str:
         """
