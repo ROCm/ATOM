@@ -27,6 +27,16 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     "DeepseekV32ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Glm4MoeForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "GlmMoeDsaForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    # GLM-5.3-Flash (glm5_next). Native ATOM already has this class; without
+    # this entry `vllm serve` never sees Glm5NextForConditionalGeneration on
+    # vLLM 0.28.x and the plugin never wraps ATOM kernels.
+    "Glm5NextForConditionalGeneration": (
+        "atom.plugin.vllm.models.glm5_next:Glm5NextForConditionalGenerationVllm"
+    ),
+    # GLM-5.3-Flash MTP draft (checkpoint layer 45 through ATOM's NextN runtime).
+    "Glm5NextMTPModel": (
+        "atom.plugin.vllm.models.glm5_next:Glm5NextMTPVllm"
+    ),
     "DeepSeekMTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "DeepSeekV4MTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Glm4MoeMTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
@@ -140,6 +150,48 @@ def _register_mxfp8_quantization_config() -> None:
             return None
 
 
+def _register_glm5_archs_early() -> None:
+    """Register Glm5Next{,MTP} archs in the main process ModelRegistry.
+
+    register_model() registers all ATOM archs, but runs inside worker processes
+    after the main process has already validated speculative-config (which builds
+    a draft ModelConfig and checks its architecture against the registry).
+    Call this from register_platform() so the two GLM-5.3 archs are available
+    before EngineArgs.create_engine_config() runs.
+    """
+    try:
+        from vllm.model_executor.models import registry as vllm_model_registry
+    except Exception:
+        return
+
+    _guard = "_atom_glm5_archs_registered"
+    if getattr(vllm_model_registry, _guard, False):
+        return
+
+    glm5_archs = {
+        k: v for k, v in _VLLM_MODEL_REGISTRY_OVERRIDES.items()
+        if k.startswith("Glm5Next")
+    }
+    for arch, qual in glm5_archs.items():
+        module_name, class_name = qual.split(":", 1)
+        existing = vllm_model_registry.ModelRegistry.models.get(arch)
+        if existing is not None and (
+            getattr(existing, "module_name", None) == module_name
+            and getattr(existing, "class_name", None) == class_name
+        ):
+            continue
+        vllm_model_registry.ModelRegistry.register_model(arch, qual)
+        logger.info("ATOM plugin (early): registered %s for MTP config validation", arch)
+
+    try:
+        vllm_model_registry._try_load_model_cls.cache_clear()
+        vllm_model_registry._try_inspect_model_cls.cache_clear()
+    except Exception:
+        pass
+
+    setattr(vllm_model_registry, _guard, True)
+
+
 def register_platform() -> str | None:
 
     if disable_vllm_plugin:
@@ -177,6 +229,18 @@ def register_platform() -> str | None:
     apply_vllm_v4_block_reuse_patch()
 
     _register_kv_connectors()
+
+    # Patch SpeculativeConfig early (before EngineArgs validates --speculative-config)
+    # so that method=mtp resolves correctly for glm5_next. register_model() also
+    # calls this, but that runs in worker processes after arg validation has already
+    # raised NotImplementedError for unknown MTP model types.
+    _patch_vllm_glm5_next_mtp_speculative_config()
+
+    # Register GLM-5.3-Flash archs early so ModelConfig (called during
+    # create_speculative_config) can resolve Glm5NextMTPModel. register_model()
+    # registers all archs but runs in worker processes; the draft ModelConfig
+    # validation happens in the main process before any workers start.
+    _register_glm5_archs_early()
 
     # return the ATOM platform to vllm
     return "atom.plugin.vllm.platform.ATOMPlatform"
@@ -288,12 +352,75 @@ def _patch_vllm_harmony_parser_manager() -> None:
     ParserManager.get_parser = classmethod(get_parser)
 
 
+def _patch_vllm_glm5_next_mtp_speculative_config() -> None:
+    """Teach vLLM's SpeculativeConfig to resolve method=mtp for glm5_next.
+
+    vLLM's hf_config_override() rewrites the target's hf_config so the MTP
+    draft model config gets the right arch and model_type. GLM-5.3-Flash
+    (model_type='glm5_next') is not in the upstream dispatch table; patch it in
+    here without touching the installed vLLM wheel.
+
+    The num_nextn_predict_layers field lives in text_config on this checkpoint.
+    """
+    try:
+        import vllm.config.speculative as vllm_spec_cfg
+        from vllm.config.speculative import SpeculativeConfig
+    except Exception:
+        logger.warning("ATOM plugin: could not import vllm.config.speculative; GLM-5.3 MTP skipped")
+        return
+
+    if getattr(vllm_spec_cfg, "_atom_glm5_mtp_patched", False):
+        return
+
+    # 1. Widen MTPModelTypes so the draft model_type passes the isinstance gate.
+    import typing
+    orig_literal = vllm_spec_cfg.MTPModelTypes
+    orig_args = set(typing.get_args(orig_literal))
+    if "glm5_next_mtp" not in orig_args:
+        new_args = tuple(orig_args | {"glm5_next_mtp"})
+        vllm_spec_cfg.MTPModelTypes = typing.Literal[new_args]  # type: ignore[assignment]
+
+    # 2. Wrap hf_config_override to insert the GLM-5.3-Flash → MTP rewrite.
+    original_override = staticmethod(SpeculativeConfig.__dict__["hf_config_override"])
+
+    def _glm5_hf_config_override(hf_config):
+        # GLM-5.3-Flash top-level model_type is "glm5_next"; the MTP layer
+        # count is in text_config.num_nextn_predict_layers.
+        if getattr(hf_config, "model_type", None) in ("glm5_next", "glm5_next_text"):
+            text_config = getattr(hf_config, "text_config", hf_config)
+            n_predict = int(getattr(text_config, "num_nextn_predict_layers", 1) or 1)
+            hf_config.model_type = "glm5_next_mtp"
+            hf_config.update({
+                "n_predict": n_predict,
+                "architectures": ["Glm5NextMTPModel"],
+            })
+            logger.info(
+                "ATOM plugin: rewrote glm5_next hf_config to Glm5NextMTPModel "
+                "(n_predict=%d).", n_predict
+            )
+            return hf_config
+        return original_override.__func__(hf_config)
+
+    SpeculativeConfig.hf_config_override = staticmethod(_glm5_hf_config_override)
+    vllm_spec_cfg._atom_glm5_mtp_patched = True
+    logger.info("ATOM plugin: patched SpeculativeConfig.hf_config_override for glm5_next MTP.")
+
+
 def register_model() -> None:
     if disable_vllm_plugin:
         logger.info("Disable ATOM model register")
         return
 
     _set_plugin_mode()
+
+    # Install the GLM-5.3-Flash MLA/mamba KV page-alignment fix. register_model
+    # runs in each worker before its KV-cache setup calls
+    # `_align_hybrid_block_size`, and (unlike register_platform) reliably runs in
+    # the worker process, so patch the base Platform method from here.
+    from atom.plugin.vllm.platform import _install_glm5_align_patch
+
+    _install_glm5_align_patch()
+
     # The general-plugin hook runs in the EngineCore process that owns the
     # scheduler/KVCacheManager; install this here as well as in the platform hook.
     from atom.plugin.vllm.deepseek_v4_prefix_patch import (
@@ -388,3 +515,5 @@ def register_model() -> None:
     )
 
     apply_vllm_req_id_passthrough_patch()
+
+    _patch_vllm_glm5_next_mtp_speculative_config()

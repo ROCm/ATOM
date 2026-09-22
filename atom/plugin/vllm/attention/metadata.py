@@ -18,6 +18,7 @@ from vllm.v1.attention.backend import (
 from atom.config import get_current_atom_config
 from atom.distributed.dcp_utils import dcp_persistent_supported
 from atom.model_ops.attention_mla import _MLA_MIN_HEADS, mla_dcp_kernel_num_heads
+from atom.model_ops.glm5_next import geometry as glm5_kpool_geometry
 from atom.plugin.vllm.attention.layer_mla import (
     disabled_mla_persistent_metadata,
     mla_fold_kv_metadata_triton,
@@ -33,6 +34,14 @@ _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 # aiter's persistent MLA work plan, matching ATOM's native decode settings.
 _MLA_FAST_MODE = True
 _MLA_MAX_SPLIT_PER_BATCH = 16
+
+
+def hf_text_config(model_config):
+    """The text sub-config when the checkpoint nests one (e.g. GLM-5.3-Flash).
+
+    `index_topk` and `num_hidden_layers` live there, not on the outer config.
+    """
+    return getattr(model_config, "hf_text_config", None) or model_config.hf_config
 
 
 def get_aiter_kv_cache_dtype(config) -> torch.dtype:
@@ -261,6 +270,7 @@ class AiterMlaSparseIndexerPrefillChunkMetadataForVllm:
     token_start: int
     token_end: int
     num_reqs: int
+    kpool_total_pools: int = 0
 
 
 @dataclass
@@ -2070,7 +2080,12 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
         self.padded_num_heads = max(self.num_heads, _MLA_MIN_HEADS)
         self.mla_dims = get_mla_dims(self.model_config)
-        self.topk_tokens = config.model_config.hf_config.index_topk
+        hf_config = hf_text_config(config.model_config)
+        self.index_topk = int(hf_config.index_topk)
+        self.index_kpool = int(getattr(hf_config, "index_kpool", 1) or 1)
+        self.topk_tokens = glm5_kpool_geometry.topk_output_width(
+            self.index_topk, self.index_kpool
+        )
         self.max_model_len_tensor = torch.tensor(
             [self.model_config.max_model_len], device=device, dtype=torch.int32
         )
@@ -2274,9 +2289,12 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
             query_lens,
             seq_lens,
             common_attn_metadata.query_start_loc,
-            self.topk_tokens,
+            self.index_topk,
             num_tokens,
             common_attn_metadata.max_query_len,
+            index_kpool=glm5_kpool_geometry.effective_kpool_size(
+                self.index_kpool
+            ),
         )
         torch.cumsum(
             sparse_seqlen,
@@ -2461,6 +2479,10 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
         self.model_config = config.model_config
         self.kv_cache_spec = kv_cache_spec
         self.device = device
+        hf_config = hf_text_config(config.model_config)
+        self.index_kpool = glm5_kpool_geometry.effective_kpool_size(
+            int(getattr(hf_config, "index_kpool", 1) or 1)
+        )
         max_num_batched_tokens = config.scheduler_config.max_num_batched_tokens
 
         self.max_prefill_buffer_size = get_max_prefill_buffer_size(
@@ -2474,7 +2496,7 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
         # num_speculative_tokens should be 0 for its builders.
         is_draft_layer = False
         if layer_names:
-            num_hidden_layers = config.model_config.hf_config.num_hidden_layers
+            num_hidden_layers = hf_text_config(config.model_config).num_hidden_layers
             layer_indices = [
                 extract_layer_index(layer_name) for layer_name in layer_names
             ]
@@ -2572,6 +2594,11 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
             token_start=token_start,
             token_end=token_end,
             num_reqs=reqs_end - reqs_start,
+            kpool_total_pools=int(
+                (
+                    seq_lens_cpu[reqs_start:reqs_end] // self.index_kpool
+                ).sum()
+            ),
         )
 
     def _build_indexer(
@@ -2705,8 +2732,19 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
                 seq_lens = self.expanded_seq_lens_buffer[:num_decode_tokens]
 
                 # Give each of the flattened entries the same block table row as the
-                # original request.
-                self.expanded_block_table_buffer[:actual_expanded] = (
+                # original request. The block table may be wider than the pre-allocated
+                # buffer (mamba/kpool alignment can add blocks); use the actual width.
+                bt_cols = block_table.shape[1]
+                expanded_bt = self.expanded_block_table_buffer
+                if bt_cols != expanded_bt.shape[1]:
+                    # Re-allocate to match the actual block table width.
+                    expanded_bt = torch.zeros(
+                        (expanded_bt.shape[0], bt_cols),
+                        dtype=expanded_bt.dtype,
+                        device=expanded_bt.device,
+                    )
+                    self.expanded_block_table_buffer = expanded_bt
+                expanded_bt[:actual_expanded] = (
                     torch.repeat_interleave(
                         block_table, decode_lens, dim=0, output_size=actual_expanded
                     )

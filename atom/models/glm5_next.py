@@ -49,7 +49,6 @@ in ``glm5_next_mtp.py``. Multimodal input remains outside this text-only path,
 which skips the checkpoint's vision tower. See ``recipes/GLM-5.3-Flash.md``.
 """
 
-from itertools import islice
 from typing import Any, ClassVar
 
 import aiter
@@ -554,6 +553,19 @@ class Glm5NextKDAAttention(KimiKDAAttention):
         super().process_weights_after_loading()
 
 
+def _is_dummy_forward(forward_context) -> bool:
+    """True when this forward carries no real batch.
+
+    Under `vllm serve` the vLLM plugin owns the forward context and never fills
+    in ATOM's `Context`, so `context is None` there on every forward, including
+    the profiling one. Reading `.is_dummy_run` off that None raises inside
+    Dynamo, which breaks the graph in the middle of the layer loop and trips
+    the compile backend's one-graph-per-instance assertion.
+    """
+    context = getattr(forward_context, "context", None)
+    return context is None or bool(getattr(context, "is_dummy_run", False))
+
+
 class Glm5NextIndexer(Indexer):
     """Sparse-attention indexer for GLM-5.3-Flash.
 
@@ -681,7 +693,7 @@ class Glm5NextIndexer(Indexer):
             # allocated the buffer, which must not be papered over.
             tail_cache = self.kpool_tail_cache
             if tail_cache is None:
-                if not forward_context.context.is_dummy_run:
+                if not _is_dummy_forward(forward_context):
                     raise RuntimeError("kpool tail cache is unbound on a real forward")
                 tail_cache = torch.zeros(
                     1,
@@ -698,7 +710,7 @@ class Glm5NextIndexer(Indexer):
             )
             if state_slot_idx is None and gdn is not None:
                 # ReplaySSM retains one committed request slot during verify.
-                state_slot_idx = gdn.slot_idx
+                state_slot_idx = getattr(gdn, "slot_idx", None)
                 if state_slot_idx is None and gdn.spec_state_indices_tensor is not None:
                     state_slot_idx = gdn.spec_state_indices_tensor[:, 0]
             if state_slot_idx is None:
@@ -709,7 +721,7 @@ class Glm5NextIndexer(Indexer):
                 # real slots (`_build_gdn_capture_metadata`), and it must --
                 # capture bakes this pointer in, so a zeros stand-in there
                 # would send every request's tail to slot 0 on replay.
-                if not forward_context.context.is_dummy_run:
+                if not _is_dummy_forward(forward_context):
                     raise RuntimeError(
                         "kpool state-slot metadata is missing on a real forward"
                     )
@@ -1160,7 +1172,9 @@ class Glm5NextModel(nn.Module):
             assert intermediate_tensors is not None
             residual = intermediate_tensors["residual"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        # Plain slicing, not islice: Dynamo cannot rebuild an islice iterator,
+        # so any graph break inside the loop makes it skip the whole frame.
+        for layer in self.layers[self.start_layer : self.end_layer]:
             residual = layer(residual, positions)
 
         if not get_pp_group().is_last_rank:

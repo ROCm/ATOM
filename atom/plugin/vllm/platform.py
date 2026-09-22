@@ -94,6 +94,144 @@ def _enforce_deepseek_v4_constraints(vllm_config) -> None:
         raise ValueError(msg)
 
 
+# GLM-5.3-Flash widens its NoPE MLA rope block to this many zero-padded lanes so
+# the ROCm MLA kernels see the DeepSeek geometry. It must match
+# `atom.models.glm5_next._ROPE_PAD`; the MLA latent/KV entry is
+# ``kv_lora_rank + _GLM5_ROPE_PAD``.
+_GLM5_ROPE_PAD = 64
+
+
+def _fix_glm5_hybrid_page_alignment(vllm_config) -> None:
+    """Re-align the KDA(mamba)+sparse-MLA KV page for GLM-5.3-Flash.
+
+    GLM-5.3-Flash is a hybrid of KDA (mamba) layers, sparse-MLA attention layers
+    (per-token page ``(kv_lora_rank + _GLM5_ROPE_PAD) * dtype`` = 1152 B) and a
+    sparse indexer cache (per-token page ``(index_head_dim + 4)`` uint8 = 132 B).
+    vLLM's ``_align_hybrid_block_size`` sizes the manager block / mamba page from
+    a generic ``MLAAttentionSpec(head_size=model_config.get_head_size())`` that
+    over-estimates the attention page, so the mamba page ends up larger than the
+    real MLA page at every block size.
+
+    vLLM's hybrid KV manager requires one physical page size across all groups.
+    Any attention layer whose natural page is *smaller* than that common page is
+    reconciled one of two ways in ``unify_kv_cache_spec_page_size``:
+      * block-size increase, when the common page is an exact multiple of the
+        layer's natural page -> ``page_size_padded`` stays None -> the cache
+        reshapes via the *contiguous* path (works even when the manager block is
+        split into 64-token kernel blocks); or
+      * physical-page padding otherwise -> ``page_size_padded`` is set -> the
+        cache reshapes via a strided view that this vLLM build cannot express
+        once the block is split into kernel blocks (it overflows storage).
+
+    So the common page must be an exact multiple of *every* split attention
+    layer's per-token page. Set it to ``block * lcm(mla_per_token,
+    idx_per_token)`` (the smallest that also covers the block-independent KDA
+    state). Then MLA and indexer both take the block-increase/contiguous path and
+    no cache is padded+split.
+    """
+    import math
+
+    import torch
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    model_config = vllm_config.model_config
+    cache_config = vllm_config.cache_config
+
+    arches = getattr(model_config, "architectures", None) or []
+    if not any("Glm5Next" in str(a) for a in arches):
+        return
+    if getattr(cache_config, "mamba_page_size_padded", None) is None:
+        # No hybrid mamba page to align (e.g. plugin disabled or non-hybrid).
+        return
+
+    hf_config = model_config.hf_config
+    text_config = getattr(hf_config, "text_config", hf_config)
+    kv_lora_rank = int(getattr(text_config, "kv_lora_rank", 0) or 0)
+    if kv_lora_rank <= 0:
+        logger.warning(
+            "ATOM GLM5 page-align: no kv_lora_rank on config; leaving vLLM's "
+            "hybrid block sizing unchanged."
+        )
+        return
+
+    if cache_config.cache_dtype == "auto":
+        kv_dtype = model_config.dtype
+    else:
+        from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+
+        kv_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+    kv_dtype_size = torch.empty((), dtype=kv_dtype).element_size()
+
+    # Sparse-MLA latent page per token (single latent, not K+V).
+    mla_per_token = (kv_lora_rank + _GLM5_ROPE_PAD) * kv_dtype_size
+    # Sparse indexer K-cache page per token: index_head_dim + 4 scale bytes,
+    # stored as uint8 (1 byte/element). See atom.models.deepseek_v2.Indexer.
+    index_head_dim = int(getattr(text_config, "index_head_dim", 128) or 128)
+    idx_per_token = index_head_dim + 4
+
+    from vllm.model_executor.models.registry import ModelRegistry
+
+    model_cls, _ = ModelRegistry.resolve_model_cls(
+        model_config.architecture, model_config=model_config
+    )
+    mamba_state_page = MambaSpec(
+        shapes=model_cls.get_mamba_state_shape_from_config(vllm_config),
+        dtypes=model_cls.get_mamba_state_dtype_from_config(vllm_config),
+        block_size=-1,
+    ).page_size_bytes
+
+    kernel_align = 64
+    block_size = kernel_align
+    # Per-token common page that both attention caches divide exactly.
+    common_per_token = math.lcm(mla_per_token, idx_per_token)
+    page_unit = block_size * common_per_token
+    # Smallest multiple of page_unit that also covers the KDA state page.
+    common_page = page_unit * max(1, math.ceil(mamba_state_page / page_unit))
+
+    logger.warning(
+        "ATOM GLM5 page-align: mla_per_token=%d idx_per_token=%d "
+        "mamba_state_page=%d block_size %s -> %d, "
+        "mamba_page_size_padded %s -> %d",
+        mla_per_token,
+        idx_per_token,
+        mamba_state_page,
+        cache_config.block_size,
+        block_size,
+        cache_config.mamba_page_size_padded,
+        common_page,
+    )
+    cache_config.block_size = block_size
+    if cache_config.mamba_cache_mode == "align":
+        cache_config.mamba_block_size = block_size
+    cache_config.mamba_page_size_padded = common_page
+
+
+def _install_glm5_align_patch() -> None:
+    """Wrap ``Platform._align_hybrid_block_size`` so the GLM-5.3-Flash page fix
+    runs regardless of which concrete platform class vLLM dispatches through.
+
+    vLLM invokes ``_align_hybrid_block_size`` from a platform object that is not
+    necessarily ``ATOMPlatform`` (and it runs in each worker's KV-cache setup),
+    so a subclass override is not reliably hit. Patch the base method instead.
+    """
+    from vllm.platforms.interface import Platform
+
+    if getattr(Platform, "_atom_glm5_align_patched", False):
+        return
+
+    _orig = Platform._align_hybrid_block_size.__func__
+
+    def _wrapped(cls, vllm_config, backend_cls):
+        _orig(cls, vllm_config, backend_cls)
+        try:
+            _fix_glm5_hybrid_page_alignment(vllm_config)
+        except Exception:  # pragma: no cover - never break startup on the fix
+            logger.exception("ATOM GLM5 page-align fix failed; using vLLM sizing")
+
+    Platform._align_hybrid_block_size = classmethod(_wrapped)
+    Platform._atom_glm5_align_patched = True
+
+
 if not disable_vllm_plugin:
     from vllm.platforms.rocm import RocmPlatform
 
@@ -110,6 +248,8 @@ if not disable_vllm_plugin:
         def check_and_update_config(cls, vllm_config) -> None:
             super().check_and_update_config(vllm_config)
             _enforce_deepseek_v4_constraints(vllm_config)
+
+    _install_glm5_align_patch()
 
 else:
     ATOMPlatform = None

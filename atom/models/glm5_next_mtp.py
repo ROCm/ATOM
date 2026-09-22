@@ -172,3 +172,22 @@ class Glm5NextMTP(DeepSeekMTP):
     def remap_mtp_weight_name(self, name: str) -> str | None:
         name = name.replace("model.language_model.", "model.")
         return super().remap_mtp_weight_name(name)
+
+    def compact_topk_indices(self, slot_ids: torch.Tensor) -> None:
+        """No-op for GLM-5.3 kpool MTP.
+
+        The base class gathers sparse top-k rows from ``slot_ids`` (token
+        positions within the full draft batch) to the front of the 1D
+        ``sparse_kv_indices_buffer``. For DeepSeek-style indexers the buffer
+        is written at token positions, so gathering by token position is
+        correct.
+
+        For GLM-5.3 the kpool decode path writes one entry per *request*
+        (rows 0..scheduled_bs-1) regardless of the token layout, so the
+        buffer is already compact and no gathering is needed.  The base-class
+        scalar gather would read random elements within the first few rows
+        (position 3, 7, … 263 in the 1D array of width 2176) instead of the
+        actual per-request rows, producing garbage block addresses that crash
+        the MLA attention kernel.
+        """
+        return

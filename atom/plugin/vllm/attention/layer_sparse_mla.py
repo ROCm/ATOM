@@ -137,6 +137,7 @@ def generate_sparse_seqlen_kernel(
     cu_query_lens_ptr,
     out_ptr,
     topk_token: tl.constexpr,
+    index_kpool: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
@@ -152,9 +153,14 @@ def generate_sparse_seqlen_kernel(
         return
     context_start_point = seq_len - query_len
     sparse_seqlen = context_start_point + query_offset
-    sparse_seqlen_masked = tl.where(
-        sparse_seqlen + 1 < topk_token, sparse_seqlen + 1, topk_token
-    )
+    causal_len = sparse_seqlen + 1
+    if index_kpool > 1:
+        pool_history = tl.minimum(
+            causal_len // index_kpool, topk_token // index_kpool
+        ) * index_kpool
+        sparse_seqlen_masked = pool_history + causal_len % index_kpool
+    else:
+        sparse_seqlen_masked = tl.minimum(causal_len, topk_token)
     tl.store(
         out_ptr + query_start + query_offset,
         sparse_seqlen_masked,
@@ -169,6 +175,7 @@ def generate_sparse_seqlen_triton(
     topk_token: int,
     num_tokens: int,
     max_query_len: int,
+    index_kpool: int = 1,
 ):
     num_seqs = query_lens.size(0)
     out = torch.zeros([num_tokens], dtype=torch.int32, device=query_lens.device)
@@ -180,6 +187,7 @@ def generate_sparse_seqlen_triton(
         cu_query_lens,
         out,
         topk_token,
+        index_kpool,
         block_size,
     )
     return out

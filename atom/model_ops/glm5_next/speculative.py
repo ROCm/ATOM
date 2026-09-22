@@ -223,7 +223,19 @@ def run_speculative_kpool_indexer(
     scale_fmt: str,
     stable_topk: bool,
 ) -> None:
-    """Run the pooled indexer for a speculative verification batch."""
+    """Run the pooled indexer for a speculative verification batch.
+
+    Guard: when kv_cache_block_copies are in flight the speculative batch
+    contains one request with extra tokens (e.g., 12 instead of 4), making
+    num_query_tokens not divisible by the number of requests.  The paged MQA
+    logits kernel crashes when it accesses COW-in-flight blocks.  Skip the
+    full speculative path for this step; the stale sparse_kv_indices from the
+    previous step give approximate (not crash-inducing) attention scores.
+    """
+    num_reqs = int(metadata.cu_seqlens_q.shape[0]) - 1
+    num_query_tokens = int(queries.shape[0])
+    if num_reqs > 0 and num_query_tokens % num_reqs != 0:
+        return
     from aiter.ops.cache import indexer_k_quant_and_cache
     from aiter.ops.topk import top_k_per_row_decode
     from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits

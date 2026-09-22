@@ -636,6 +636,98 @@ def _patch_vllm_dspark_dcp_inputs() -> None:
     apply_vllm_dspark_dcp_input_patch()
 
 
+def _patch_vllm_glm5_mtp_propose() -> None:
+    """Guard against OOB indexing when a high-acceptance spec-decode request
+    contributes more tokens than the MTP draft processes.
+
+    Under vLLM's async scheduling, a request that accepted many speculative
+    tokens in the previous step can appear in the next batch with
+    ``num_scheduled_tokens > 4`` (e.g., 12 instead of the usual 4 for
+    ``num_speculative_tokens=3``).  The MTP draft forward processes a subset
+    of the full token batch (e.g., 252 of 264 tokens), so its ``last_hidden_
+    states`` has fewer rows than the full batch.  ``token_indices_to_sample``
+    contains the last-token index of each request in the *full* batch, so it
+    can contain indices that are >= ``num_tokens`` (the draft's output size),
+    causing an out-of-bounds GPU access when sampling
+    ``last_hidden_states[token_indices_to_sample]``.
+
+    This wrapper clamps ``token_indices_to_sample`` to ``[0, num_tokens)``
+    after ``set_inputs_first_pass`` for the GLM-5.3 MTP draft, which is the
+    only ATOM model affected (GLM5 uses kpool + Mamba, and its MTP draft
+    skips long-acceptance requests that already have their KV cache COW-
+    copied).
+    """
+    from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
+
+    original_propose = SpecDecodeBaseProposer.propose
+    if getattr(original_propose, "_atom_glm5_mtp_propose_patched", False):
+        return
+
+    @functools.wraps(original_propose)
+    def wrapped_propose(
+        self,
+        num_speculative_tokens,
+        target_token_ids,
+        target_positions,
+        target_hidden_states,
+        target_logprobs,
+        next_token_ids,
+        token_indices_to_sample,
+        common_attn_metadata,
+        sampling_metadata,
+        mm_embed_inputs=None,
+        num_rejected_tokens_gpu=None,
+        slot_mappings=None,
+    ):
+        import torch
+
+        # Identify GLM-5.3 MTP by checking the draft model type.
+        draft_model = getattr(self, "model", None)
+        inner = getattr(draft_model, "model", None)
+        is_glm5_mtp = type(inner).__name__ in (
+            "Glm5NextMTP", "Glm5NextMultiTokenPredictor"
+        )
+        if not is_glm5_mtp:
+            return original_propose(
+                self, num_speculative_tokens, target_token_ids, target_positions,
+                target_hidden_states, target_logprobs, next_token_ids,
+                token_indices_to_sample, common_attn_metadata, sampling_metadata,
+                mm_embed_inputs, num_rejected_tokens_gpu, slot_mappings,
+            )
+
+        # When a request accepted many speculative tokens in the previous step,
+        # it gets extra tokens (e.g., 12 instead of 4), making n_tokens not
+        # divisible by batch_size. The MTP draft MoE routing allocates buffers
+        # based on a different token count and crashes with an OOB GPU access.
+        # Skip the draft forward entirely for this step and return empty tokens.
+        # The MTP draft will run normally in the next step once the abnormal
+        # request is back to the normal 4-token size.
+        batch_size = common_attn_metadata.batch_size()
+        n_tokens = int(target_token_ids.shape[0])
+        if batch_size > 0 and n_tokens % batch_size != 0:
+            device = target_token_ids.device
+            return torch.full(
+                (batch_size, num_speculative_tokens),
+                fill_value=-1,
+                dtype=torch.long,
+                device=device,
+            )
+
+        return original_propose(
+            self, num_speculative_tokens, target_token_ids, target_positions,
+            target_hidden_states, target_logprobs, next_token_ids,
+            token_indices_to_sample, common_attn_metadata, sampling_metadata,
+            mm_embed_inputs, num_rejected_tokens_gpu, slot_mappings,
+        )
+
+    setattr(wrapped_propose, "_atom_glm5_mtp_propose_patched", True)
+    SpecDecodeBaseProposer.propose = wrapped_propose
+    logger.info(
+        "ATOM plugin: patched vLLM MTP proposer to clamp token_indices_to_sample "
+        "for GLM-5.3 kpool MTP draft."
+    )
+
+
 def apply_vllm_spec_decode_patch() -> None:
     """Patch vLLM speculative decoding for ATOM metadata compatibility."""
     _patch_dspark_fused_markov_sample()
@@ -644,6 +736,7 @@ def apply_vllm_spec_decode_patch() -> None:
     _patch_vllm_draft_kv_group_validation()
     _patch_vllm_draft_positions_on_metadata()
     _patch_vllm_deepseek_v4_mtp_first_pass_inputs()
+    _patch_vllm_glm5_mtp_propose()
 
     from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 
