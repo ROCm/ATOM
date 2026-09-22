@@ -36,6 +36,7 @@ from atom.distributed.pcp_utils import (
     pcp_round_robin_split,
 )
 from atom.distributed.pp_comm import (
+    PP_AUX_KEY,
     async_send_intermediate_tensors,
     commit_pp_send_work,
     recv_intermediate_tensors,
@@ -817,6 +818,7 @@ class ModelRunner:
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
         if getattr(self, "drafter", None) is not None:
             self.drafter.arm_aux_capture(self.model)
+        self._build_pp_aux_relay()
         self._init_forward_vars_ring()
         self.forward_done_event = torch.cuda.Event()
         initialize_eplb_runtime(self)
@@ -2693,6 +2695,41 @@ class ModelRunner:
             off += local_len
         return torch.cat(outs)
 
+    def _build_pp_aux_relay(self):
+        """Stand up the aux-hidden-state relay when a drafter taps target layers
+        this stage's pipeline neighbours own. See `spec_decode/pp_aux_relay.py`.
+
+        Runs on EVERY stage, including the ones with no drafter: those are the
+        stages that have to capture and forward. The spec is derived from the
+        speculative config rather than the drafter object for the same reason --
+        only the last stage has one.
+        """
+        self.pp_aux_relay = None
+        self._pp_recv_aux = None
+        if get_pp_group().world_size <= 1 or self.config.speculative_config is None:
+            return
+        from atom.spec_decode.dspark_proposer import build_aux_capture_spec
+        from atom.spec_decode.pp_aux_relay import PPAuxRelay
+
+        drafter = getattr(self, "drafter", None)
+        if drafter is not None:
+            spec = drafter._aux_capture_spec(self.model)
+        else:
+            spec = build_aux_capture_spec(self.config)
+        if spec is None:
+            return
+        relay = PPAuxRelay(
+            spec,
+            self.model,
+            self.config.max_num_batched_tokens,
+            self.device,
+            self.config.torch_dtype,
+        )
+        if not relay.incoming_ids and not relay.outgoing_ids:
+            return
+        relay.arm(self.model, lambda: get_forward_context().context.is_draft)
+        self.pp_aux_relay = relay
+
     def _setup_pp_shared_indexer(self):
         """Cache per-rank predicates for GLM-5.2 DSA IndexShare PP-boundary
         top-k transfer. Computed once.
@@ -2896,6 +2933,15 @@ class ModelRunner:
                     if recv_sparse is not None and self._pp_recv_needs_sparse:
                         tgt = self.attn_metadata_builder._sparse_kv_indices_gpu
                         tgt[: recv_sparse.numel()].copy_(recv_sparse)
+                    # DSpark aux hidden states from target layers on earlier
+                    # stages. Popped for the same reason as the top-k above.
+                    self._pp_recv_aux = intermediate_tensors.tensors.pop(
+                        PP_AUX_KEY, None
+                    )
+                    if self.pp_aux_relay is not None and pp_group.is_last_rank:
+                        self.pp_aux_relay.absorb(
+                            self._pp_recv_aux, self.drafter._aux_buffers
+                        )
 
                 if pp_enabled:
                     model_output = self.model(
@@ -2919,6 +2965,13 @@ class ModelRunner:
                         model_output.tensors["sparse_kv_indices"] = (
                             self.attn_metadata_builder._sparse_kv_indices_gpu[:n]
                         )
+                    if self.pp_aux_relay is not None:
+                        aux = self.pp_aux_relay.pack(
+                            self._pp_recv_aux,
+                            model_output.tensors["hidden_states"].shape[0],
+                        )
+                        if aux is not None:
+                            model_output.tensors[PP_AUX_KEY] = aux
                     if self._pp_pending_send:
                         commit_pp_send_work(self._pp_pending_send)
                     self._pp_pending_send = async_send_intermediate_tensors(
