@@ -4,9 +4,10 @@
 import importlib.util
 from types import SimpleNamespace
 
-import aiter
 import pytest
 import torch
+
+aiter = pytest.importorskip("aiter", reason="the dispatch under test is AITER's")
 
 from atom.model_ops import blockscale
 

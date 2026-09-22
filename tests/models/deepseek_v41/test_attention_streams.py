@@ -26,6 +26,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+pytest.importorskip("aiter", reason="the attention module is built on AITER kernels")
+
 from atom.models.deepseek_v41.attention import Attention
 from atom.utils import forward_context
 
