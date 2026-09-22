@@ -481,21 +481,33 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
     @staticmethod
     def combine_quant_for_step() -> str:
-        """This step's combine wire, named outright.
+        """This step's combine wire, named outright -- and DP-agreed.
 
         The quantized wire is prefill-only: the quant/dequant pair is a fixed
         per-token cost against a saving that scales with the tokens on the
-        wire, so it only pays off once the wire is busy. Prefill asks for
-        $MEGA_COMBINE_WIRE, decode asks for bf16.
+        wire, so it only pays off once the wire is busy.
+
+        Every rank has to name the SAME wire, and that is why `is_prefill`
+        cannot gate this on its own. Combine is P2P: gemm2's epilogue writes
+        this rank's rows into every PEER's arena in the format this rank
+        picked, and the peer's reduce reads them back in the format IT picked.
+        `is_prefill` is the local batch's (`ForwardMode.decide` never reduces
+        it), so on a ragged step a prefilling rank would scatter fp4 rows into
+        a decoding peer that reduces them as bf16 -- the same rank-local trap
+        select_mega documents. `running_tokens_are_unified` IS the group's
+        answer to "is anybody prefilling", so it is what opens the wire;
+        `is_prefill` then only speaks for dp_size==1, where it is the group.
 
         No context (warmup, profile runs) counts as prefill -- that is the
         shape those run at, and it exercises the quantized reduce before a
         capture rather than first reaching it mid-serve.
         """
         context = get_forward_context().context
-        if context is not None and not context.is_prefill:
-            return "none"
-        return _MEGA_COMBINE_QUANT
+        if context is None:
+            return _MEGA_COMBINE_QUANT
+        if context.is_prefill or not context.running_tokens_are_unified:
+            return _MEGA_COMBINE_QUANT
+        return "none"
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
