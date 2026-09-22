@@ -253,7 +253,7 @@ if _HAS_TRITON:
 
     @triton.jit
     def _fp4_index_slots_kernel(
-        slots_ptr,  # None when HAS_SLOTS is False
+        slots_ptr,  # unread when HAS_SLOTS is False
         page_ptr,
         row_ptr,
         scale_row_ptr,
@@ -350,7 +350,12 @@ def fp4_index_slots(
     if n:
         tile = 1024
         _fp4_index_slots_kernel[(triton.cdiv(n, tile),)](
-            slots,
+            # HAS_SLOTS removes the load at compile time, so this pointer is
+            # never read in the total_kv form. It still gets a live tensor
+            # rather than None: dcp_ops.py does the same for its optional
+            # owned_counts, and it keeps the launch off whatever a given Triton
+            # decides about null pointer arguments.
+            page if slots is None else slots,
             page,
             row,
             scale_row,
