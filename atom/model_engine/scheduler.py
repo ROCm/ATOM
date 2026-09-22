@@ -957,6 +957,16 @@ class Scheduler:
             return None
         return callback(seq)
 
+    def _connector_can_partially_deallocate_state(self, seq: Sequence) -> bool:
+        """Require an explicit connector guarantee before releasing state.
+
+        A PAGE block lease alone says nothing about a recurrent-state source.
+        Connectors without this capability therefore remain on the original
+        whole-request deferred-free path.
+        """
+        callback = getattr(self.kv_connector, "can_partially_deallocate_state", None)
+        return callable(callback) and callback(seq) is True
+
     def _drain_source_safe_releases(self) -> None:
         """Free block IDs the offload connector reports as newly source-safe.
 
@@ -3210,14 +3220,22 @@ class Scheduler:
                 # it takes is a side effect.
                 if self._connector_should_defer_free(seq):
                     protected = self._connector_protected_block_ids(seq)
-                    if protected is not None:
+                    state_safe = (
+                        not seq.has_per_req_cache
+                        or self._connector_can_partially_deallocate_state(seq)
+                    )
+                    if protected is not None and state_safe:
                         # Early block release: only the save's exact source
                         # blocks stay pinned; everything else in this
                         # finished request's block_table -- decode blocks, an
                         # unaligned prompt tail, already-saved ranges -- frees
                         # now instead of waiting behind `deferred_free_blocks`.
                         before = len(seq.block_table)
-                        self.block_manager.deallocate_partial(seq, protected)
+                        self.block_manager.deallocate_partial(
+                            seq,
+                            protected,
+                            per_request_state_safe=state_safe,
+                        )
                         activate = getattr(
                             self.kv_connector, "activate_block_leases", None
                         )

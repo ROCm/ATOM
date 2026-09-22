@@ -228,6 +228,10 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         callback = getattr(self._impl, "protected_block_ids", None)
         return callback(seq) if callback is not None else None
 
+    def can_partially_deallocate_state(self, seq) -> bool:
+        callback = getattr(self._impl, "can_partially_deallocate_state", None)
+        return callable(callback) and callback(seq) is True
+
     def activate_block_leases(self, seq, block_ids) -> None:
         callback = getattr(self._impl, "activate_block_leases", None)
         if callback is not None:

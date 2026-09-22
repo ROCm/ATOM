@@ -2488,7 +2488,11 @@ class BlockManager:
         return num_full - start
 
     def deallocate_partial(
-        self, seq: Sequence, protected_block_ids: frozenset[int]
+        self,
+        seq: Sequence,
+        protected_block_ids: frozenset[int],
+        *,
+        per_request_state_safe: bool = False,
     ) -> None:
         """Deallocate `seq` now, except block IDs a pending offload save reads.
 
@@ -2506,7 +2510,16 @@ class BlockManager:
         request is deallocated normally. This makes ownership explicit: shared
         prefix blocks retain their other owners, while the save owns exactly
         one refcount share until ``free_leased_blocks`` releases it.
+
+        Per-request recurrent state is fail-closed: its active slots may be
+        released here only when the connector explicitly confirms that every
+        state source needed after request teardown has an independent lease.
         """
+        if seq.has_per_req_cache and not per_request_state_safe:
+            raise RuntimeError(
+                "partial PAGE deallocation is unsupported for per-request "
+                "state without an explicit connector safety capability"
+            )
         table = set(seq.block_table)
         unknown = set(protected_block_ids) - table
         if unknown:

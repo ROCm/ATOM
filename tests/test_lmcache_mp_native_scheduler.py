@@ -120,6 +120,15 @@ def test_native_scheduler_binds_parent_page_budget(monkeypatch):
     assert scheduler._save_pin_budget_blocks == 20
 
 
+def test_native_scheduler_explicitly_guarantees_partial_state_deallocation(
+    monkeypatch,
+):
+    scheduler, _, _ = make_scheduler(monkeypatch)
+    seq = Sequence(list(range(24)), 4, has_per_req_cache=True)
+
+    assert scheduler.can_partially_deallocate_state(seq) is True
+
+
 def sequence(request_id=1, *, count=24, computed=16, token_offset=0):
     seq = Sequence(
         list(range(token_offset, token_offset + count)),

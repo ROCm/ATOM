@@ -267,6 +267,30 @@ def _save_operation_meta(*operations):
     return meta
 
 
+def test_partial_state_deallocation_requires_an_explicit_capable_subconnector():
+    seq = SimpleNamespace(has_per_req_cache=True)
+    unsupported = SimpleNamespace(should_defer_free=lambda _seq: True)
+    declined = SimpleNamespace(
+        should_defer_free=lambda _seq: True,
+        can_partially_deallocate_state=lambda _seq: False,
+    )
+    inactive_capable = SimpleNamespace(
+        should_defer_free=lambda _seq: False,
+        can_partially_deallocate_state=lambda _seq: True,
+    )
+    capable = SimpleNamespace(
+        should_defer_free=lambda _seq: True,
+        can_partially_deallocate_state=lambda _seq: True,
+    )
+
+    assert _sched([unsupported, declined]).can_partially_deallocate_state(seq) is False
+    assert (
+        _sched([unsupported, inactive_capable]).can_partially_deallocate_state(seq)
+        is False
+    )
+    assert _sched([unsupported, capable]).can_partially_deallocate_state(seq) is True
+
+
 # ---------------------------------------------------------------------------
 # Scheduler-side
 # ---------------------------------------------------------------------------

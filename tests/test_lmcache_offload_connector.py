@@ -6859,6 +6859,7 @@ def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
     # the same change, deliberately.
     must_be_seen = {
         "should_defer_free",
+        "can_partially_deallocate_state",
         "abandon_save",
         "save_abandon_timeout_s",
         "release_stalled_save",

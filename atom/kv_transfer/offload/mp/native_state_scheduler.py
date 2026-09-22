@@ -135,6 +135,21 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         self._save_failures: dict[str, tuple[Any, int, int]] = {}
         self._retired_requests: dict[str, Any] = {}
 
+    def can_partially_deallocate_state(self, seq: Any) -> bool:
+        """The checkpoint coordinator owns state sources past request free.
+
+        Native-state saves never read the request's active state slot after
+        admission: ``acquire_checkpoint_source`` gives each emitted save an
+        independent checkpoint PAGE lease. Waiting candidates likewise refer
+        to READY checkpoint content and acquire that lease only when admitted.
+        """
+        return (
+            bool(getattr(seq, "has_per_req_cache", False))
+            and self._block_manager is not None
+            and getattr(self, "_checkpoints", None)
+            is getattr(self._block_manager, "paged_state_checkpoints", None)
+        )
+
     def _boundary_hash(self, seq: Any, boundary: int) -> int:
         count = boundary // self._hash_block_size
         if boundary <= 0 or boundary % self._hash_block_size:
