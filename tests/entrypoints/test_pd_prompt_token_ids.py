@@ -4,7 +4,6 @@
 """Test prefill prompt-ID responses and decode reuse without tokenizing."""
 
 import asyncio
-import json
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -20,20 +19,8 @@ from atom.entrypoints.openai.protocol import (
     ChatMessage,
     CompletionRequest,
 )
-from atom.entrypoints.openai.serving_chat import build_chat_response_multi
-from atom.entrypoints.openai.serving_completion import build_completion_response_multi
 
 PROMPT_IDS = [101, 102, 103, 104]
-
-
-class _FakeSequence:
-    """Only what the API process reads off a ``Sequence`` it just built."""
-
-    def __init__(self, token_ids: list[int]) -> None:
-        self.id = 7
-        self.prompt_token_ids = list(token_ids)
-        self.num_prompt_tokens = len(token_ids)
-        self.max_tokens = 16
 
 
 @pytest.fixture
@@ -76,60 +63,40 @@ def server(monkeypatch):
     return calls
 
 
-def _chat(**kwargs) -> ChatCompletionRequest:
-    return ChatCompletionRequest(
-        model="m",
-        messages=[ChatMessage(role="user", content="hi")],
-        temperature=0.0,
-        **kwargs,
+def _request(endpoint, **kwargs):
+    if endpoint == "chat":
+        return (
+            ChatCompletionRequest(
+                model="m",
+                messages=[ChatMessage(role="user", content="hi")],
+                temperature=1.0,
+                **kwargs,
+            ),
+            api_server.chat_completions,
+        )
+    return (
+        CompletionRequest(model="m", temperature=1.0, **kwargs),
+        api_server.completions,
     )
 
 
-class TestDecodeSkipsTheWorkPrefillAlreadyDid:
-    def test_ids_in_kv_transfer_params_skip_template_and_tokenizer(self, server):
-        # The shape a vLLM-style proxy (and atomesh's ATOM relay) sends.
-        request = _chat(
-            kv_transfer_params={
-                "do_remote_prefill": True,
-                "prompt_token_ids": PROMPT_IDS,
-            }
-        )
-        asyncio.run(api_server.chat_completions(request, None))
+class TestPromptTokenIdRequests:
+    @pytest.mark.parametrize("endpoint", ["chat", "completion"])
+    @pytest.mark.parametrize("use_ids", [False, True])
+    def test_top_level_ids_or_text_reach_generation(self, server, endpoint, use_ids):
+        kwargs = {}
+        if use_ids:
+            kwargs["prompt_token_ids"] = PROMPT_IDS
+        elif endpoint == "completion":
+            kwargs["prompt"] = "hi"
+        request, handler = _request(endpoint, **kwargs)
 
-        assert server.templates == 0, "decode rendered the chat template again"
-        sent, _ = server.generate[0]
-        assert sent == PROMPT_IDS, "the prefill's ids did not reach the engine"
+        asyncio.run(handler(request, None))
 
-    def test_ids_at_top_level_skip_template_and_tokenizer(self, server):
-        asyncio.run(
-            api_server.chat_completions(_chat(prompt_token_ids=PROMPT_IDS), None)
-        )
+        text = "<rendered prompt>" if endpoint == "chat" else "hi"
+        assert server.generate[0][0] == (PROMPT_IDS if use_ids else text)
+        assert server.templates == int(endpoint == "chat" and not use_ids)
 
-        assert server.templates == 0
-        assert server.generate[0][0] == PROMPT_IDS
-
-    def test_without_ids_the_template_still_runs(self, server):
-        # Requests without IDs still render and tokenize their messages.
-        asyncio.run(api_server.chat_completions(_chat(), None))
-
-        assert server.templates == 1
-        assert server.generate[0][0] == "<rendered prompt>"
-
-    def test_completions_endpoint_accepts_ids_instead_of_prompt(self, server):
-        request = CompletionRequest(model="m", prompt_token_ids=PROMPT_IDS)
-        asyncio.run(api_server.completions(request, None))
-
-        assert server.generate[0][0] == PROMPT_IDS
-
-    def test_completions_endpoint_still_accepts_text(self, server):
-        asyncio.run(
-            api_server.completions(CompletionRequest(model="m", prompt="hi"), None)
-        )
-
-        assert server.generate[0][0] == "hi"
-
-
-class TestDecodeDoesNotForwardDuplicateIdsToTheEngine:
     @pytest.mark.parametrize("endpoint", ["chat", "completion"])
     @pytest.mark.parametrize("stream", [False, True])
     @pytest.mark.parametrize("n", [1, 2])
@@ -161,18 +128,14 @@ class TestDecodeDoesNotForwardDuplicateIdsToTheEngine:
             "remote_block_ids": [10, 11],
             "connector_metadata": {"transfer_id": "transfer-1"},
         }
-        kwargs = {
-            "kv_transfer_params": {**metadata, "prompt_token_ids": PROMPT_IDS},
-            "stream": stream,
-            "n": n,
-        }
-        if endpoint == "chat":
-            request = _chat(**kwargs)
-            request.temperature = 1.0
-            handler = api_server.chat_completions
-        else:
-            request = CompletionRequest(model="m", temperature=1.0, **kwargs)
-            handler = api_server.completions
+        request, handler = _request(
+            endpoint,
+            kv_transfer_params={**metadata, "prompt_token_ids": PROMPT_IDS},
+            stream=stream,
+            n=n,
+            # Both default and explicit opt-out allow streaming.
+            return_token_ids=None if n == 1 else False,
+        )
         original = request.kv_transfer_params
 
         asyncio.run(handler(request, None))
@@ -191,51 +154,34 @@ class TestDecodeDoesNotForwardDuplicateIdsToTheEngine:
         assert server.templates == 0
 
     @pytest.mark.parametrize("endpoint", ["chat", "completion"])
-    @pytest.mark.parametrize("nested_ids", [[], [-1], [999]])
-    def test_bad_or_conflicting_ids_are_rejected_before_cleanup(
-        self, server, endpoint, nested_ids
-    ):
-        kwargs = {
-            "prompt_token_ids": PROMPT_IDS,
-            "kv_transfer_params": {"prompt_token_ids": nested_ids},
-        }
-        if endpoint == "chat":
-            request, handler = _chat(**kwargs), api_server.chat_completions
-        else:
-            request = CompletionRequest(model="m", **kwargs)
-            handler = api_server.completions
+    def test_conflicting_ids_are_rejected_before_cleanup(self, server, endpoint):
+        # Invalid ID values are covered by test_protocol.py.
+        request, handler = _request(
+            endpoint,
+            prompt_token_ids=PROMPT_IDS,
+            kv_transfer_params={"prompt_token_ids": [999]},
+        )
 
         with pytest.raises(api_server.HTTPException) as excinfo:
             asyncio.run(handler(request, None))
 
         assert excinfo.value.status_code == 400
         assert server.generate == []
-        assert request.kv_transfer_params["prompt_token_ids"] == nested_ids
+        assert request.kv_transfer_params["prompt_token_ids"] == [999]
 
-
-class TestPrefillEchoesItsTokenIds:
-    def test_chat_response_carries_the_ids(self, server):
-        response = asyncio.run(
-            api_server.chat_completions(_chat(return_token_ids=True), None)
+    @pytest.mark.parametrize("endpoint", ["chat", "completion"])
+    def test_streaming_cannot_return_prompt_ids(self, server, endpoint):
+        kwargs = {"prompt": "hi"} if endpoint == "completion" else {}
+        request, handler = _request(
+            endpoint, return_token_ids=True, stream=True, **kwargs
         )
 
-        assert server.generate[0][1]["return_token_ids"] is True
-        assert json.loads(response.body)["prompt_token_ids"] == PROMPT_IDS
+        with pytest.raises(api_server.HTTPException) as excinfo:
+            asyncio.run(handler(request, None))
 
-    def test_completion_response_carries_the_ids(self, server):
-        response = asyncio.run(
-            api_server.completions(
-                CompletionRequest(model="m", prompt="hi", return_token_ids=True), None
-            )
-        )
-
-        assert json.loads(response.body)["prompt_token_ids"] == PROMPT_IDS
-
-    def test_not_asked_means_not_returned(self, server):
-        response = asyncio.run(api_server.chat_completions(_chat(), None))
-
-        assert server.generate[0][1]["return_token_ids"] is False
-        assert json.loads(response.body)["prompt_token_ids"] is None
+        assert excinfo.value.status_code == 400
+        assert "stream" in excinfo.value.detail
+        assert server.generate == []
 
 
 class TestHttpResponseSerialization:
@@ -264,14 +210,18 @@ class TestHttpResponseSerialization:
             "num_cached_tokens": 256,
             "kv_transfer_output_meta_info": metadata,
         }
+        outputs = [dict(output) for _ in range(n)]
         if return_ids:
-            output["prompt_token_ids"] = ids
+            # Fanout returns shared prompt IDs only on its first output.
+            outputs[0]["prompt_token_ids"] = ids
 
-        async def generate(*_args, **_kwargs):
-            yield output
+        async def generate(*_args, **kwargs):
+            assert kwargs["return_token_ids"] is return_ids
+            yield outputs[0]
 
-        async def fanout(*_args, **_kwargs):
-            return [output] * n
+        async def fanout(*_args, **kwargs):
+            assert kwargs["return_token_ids"] is return_ids
+            return outputs
 
         def build(*args, **kwargs):
             response = original_builder(*args, **kwargs)
@@ -353,151 +303,51 @@ class TestHttpResponseSerialization:
         assert server.templates == (1 if endpoint == "chat" else 0)
 
 
-class TestUnanswerableRequestsForTokenIdsAreRejected:
-    """Streaming responses cannot return prompt token IDs."""
+@pytest.mark.parametrize("return_ids", [False, True])
+def test_generate_async_reads_prompt_ids_from_local_sequence(monkeypatch, return_ids):
+    seq = SimpleNamespace(
+        id=7,
+        prompt_token_ids=list(PROMPT_IDS),
+        num_prompt_tokens=len(PROMPT_IDS),
+        max_tokens=16,
+    )
 
-    def test_streaming_is_rejected(self, server):
-        with pytest.raises(Exception, match="stream") as excinfo:
-            asyncio.run(
-                api_server.chat_completions(
-                    _chat(return_token_ids=True, stream=True), None
-                )
+    def preprocess(_prompt, _sampling, stream_callback=None, **_kwargs):
+        # Run the completion callback from the preprocessing executor thread.
+        stream_callback(
+            SimpleNamespace(
+                output_tokens=[5],
+                finished=True,
+                finish_reason="eos",
+                num_cached_tokens=0,
             )
-        assert getattr(excinfo.value, "status_code", 400) == 400
-
-    def test_guard_allows_the_answerable_shape(self):
-        api_server._validate_return_token_ids(True, False)
-
-    def test_guard_ignores_requests_that_did_not_ask(self):
-        api_server._validate_return_token_ids(None, True)
-        api_server._validate_return_token_ids(False, True)
-
-
-class TestFanoutIsAnsweredRatherThanRefused:
-    """Sibling outputs share one prompt token ID list."""
-
-    @staticmethod
-    def _fanout_request() -> ChatCompletionRequest:
-        request = _chat(return_token_ids=True, n=4)
-        # Greedy collapses n back to 1, so this needs real sampling.
-        request.temperature = 1.0
-        return request
-
-    def test_fanout_returns_the_shared_prompt_ids(self, monkeypatch, server):
-        async def fake_fanout(prompt_or_tokens, _sampling, _rid, **kwargs):
-            server.generate.append((prompt_or_tokens, kwargs))
-            outputs = [
-                {
-                    "text": f"s{i}",
-                    "finish_reason": "eos",
-                    "num_tokens_input": 4,
-                    "num_tokens_output": 1,
-                }
-                for i in range(4)
-            ]
-            if kwargs.get("return_token_ids"):
-                # On the first only: one prompt, one list.
-                outputs[0]["prompt_token_ids"] = list(PROMPT_IDS)
-            return outputs
-
-        monkeypatch.setattr(api_server, "generate_async_fanout", fake_fanout)
-        response = asyncio.run(
-            api_server.chat_completions(self._fanout_request(), None)
         )
+        return seq
 
-        assert server.generate[0][1]["return_token_ids"] is True
-        assert json.loads(response.body)["prompt_token_ids"] == PROMPT_IDS
-        assert len(json.loads(response.body)["choices"]) == 4
+    engine = SimpleNamespace(
+        io_processor=SimpleNamespace(preprocess=preprocess, requests={}),
+        core_mgr=SimpleNamespace(add_request=lambda _seqs: None),
+    )
+    monkeypatch.setattr(api_server, "engine", engine)
+    monkeypatch.setattr(
+        api_server, "_validate_sequence_context_length", lambda _s: None
+    )
+    monkeypatch.setattr(api_server, "delivered_text", lambda _ids: "hello")
+    monkeypatch.setattr(api_server, "record_nonstream_first_token", lambda: None)
 
-    def test_fanout_builder_reads_the_first_output(self):
-        outputs = [
-            {
-                "text": "a",
-                "finish_reason": "eos",
-                "num_tokens_input": 4,
-                "num_tokens_output": 1,
-                "prompt_token_ids": PROMPT_IDS,
-            },
-            {
-                "text": "b",
-                "finish_reason": "eos",
-                "num_tokens_input": 4,
-                "num_tokens_output": 1,
-            },
-        ]
-        chat = build_chat_response_multi("chatcmpl-1", "m", outputs)
-        completion = build_completion_response_multi("cmpl-1", "m", outputs)
-
-        assert chat.prompt_token_ids == PROMPT_IDS
-        assert completion.prompt_token_ids == PROMPT_IDS
-
-    def test_fanout_builder_omits_ids_nobody_asked_for(self):
-        outputs = [
-            {
-                "text": "a",
-                "finish_reason": "eos",
-                "num_tokens_input": 4,
-                "num_tokens_output": 1,
-            }
-        ]
-        assert build_chat_response_multi("c", "m", outputs).prompt_token_ids is None
-        assert (
-            build_completion_response_multi("c", "m", outputs).prompt_token_ids is None
-        )
-
-
-class TestGenerateAsyncReadsTheIdsOffTheLocalSequence:
-    """Read echoed prompt IDs from the API's local Sequence."""
-
-    @staticmethod
-    def _engine_that_finishes_immediately(seq: _FakeSequence):
-        def preprocess(_prompt, _sampling, stream_callback=None, **_kwargs):
-            # Run the completion callback from the preprocessing executor thread.
-            stream_callback(
-                SimpleNamespace(
-                    output_tokens=[5],
-                    finished=True,
-                    finish_reason="eos",
-                    num_cached_tokens=0,
-                )
-            )
-            return seq
-
-        return SimpleNamespace(
-            io_processor=SimpleNamespace(preprocess=preprocess, requests={}),
-            core_mgr=SimpleNamespace(add_request=lambda _seqs: None),
-        )
-
-    def _run(self, monkeypatch, *, return_token_ids: bool) -> dict:
-        seq = _FakeSequence(PROMPT_IDS)
-        monkeypatch.setattr(
-            api_server, "engine", self._engine_that_finishes_immediately(seq)
-        )
-        monkeypatch.setattr(
-            api_server, "_validate_sequence_context_length", lambda _s: None
-        )
-        monkeypatch.setattr(api_server, "delivered_text", lambda _ids: "hello")
-        monkeypatch.setattr(api_server, "record_nonstream_first_token", lambda: None)
-
-        async def collect() -> dict:
-            final = None
+    async def collect():
+        return [
+            output
             async for output in api_server.generate_async(
-                PROMPT_IDS, object(), "req-1", return_token_ids=return_token_ids
-            ):
-                final = output
-            return final
+                PROMPT_IDS, object(), "req-1", return_token_ids=return_ids
+            )
+        ]
 
-        return asyncio.run(collect())
-
-    def test_ids_are_echoed_when_asked(self, monkeypatch):
-        assert self._run(monkeypatch, return_token_ids=True)["prompt_token_ids"] == (
-            PROMPT_IDS
-        )
-
-    def test_ids_are_absent_when_not_asked(self, monkeypatch):
-        assert "prompt_token_ids" not in self._run(monkeypatch, return_token_ids=False)
-
-    def test_prompt_length_does_not_retokenize_a_token_id_input(self, monkeypatch):
-        # Counting pre-tokenized input must not call tokenizer.encode.
-        output = self._run(monkeypatch, return_token_ids=False)
-        assert output["num_tokens_input"] == len(PROMPT_IDS)
+    outputs = asyncio.run(collect())
+    assert len(outputs) == 1
+    output = outputs[0]
+    assert output["num_tokens_input"] == len(PROMPT_IDS)
+    if return_ids:
+        assert output["prompt_token_ids"] == PROMPT_IDS
+    else:
+        assert "prompt_token_ids" not in output
