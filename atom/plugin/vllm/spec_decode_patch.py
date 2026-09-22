@@ -159,13 +159,45 @@ def _spec_has_heterogeneous_mla_mha_backend(kv_cache_spec) -> bool:
     except Exception:
         return False
 
+    # SlidingWindowMLASpec derives from SlidingWindowSpec, NOT MLAAttentionSpec,
+    # so testing only isinstance(MLAAttentionSpec) counts it as "non-MLA
+    # attention" and misreads an all-MLA model as an MLA-target/MHA-draft pair.
+    # DeepSeek-V4.1-Flash is exactly that: the pool then sorts its
+    # SlidingWindowMLASpec layers into the MHA bucket and merge() asserts
+    # "All attention layers in the same KV cache group must be
+    # SlidingWindowMLASpec."
+    mla_spec_types: list[type] = [MLAAttentionSpec]
+    try:
+        from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+        mla_spec_types.append(SlidingWindowMLASpec)
+    except ImportError:
+        pass
+    mla_types = tuple(mla_spec_types)
+
     has_mla = False
     has_non_mla_attn = False
     for spec in kv_cache_spec.values():
-        if isinstance(spec, MLAAttentionSpec):
+        if isinstance(spec, mla_types):
             has_mla = True
-        elif isinstance(spec, AttentionSpec):
+            continue
+        if isinstance(spec, AttentionSpec):
+            # Builder-managed scratch caches (CircularBufferSpec on
+            # DeepSeek-V4.1-Flash, KpoolTailSpec on GLM-5.3-Flash) hold one
+            # circular block per request and compute their own slot mapping in
+            # their metadata builder. They are not MHA draft layers: an EAGLE3
+            # draft is position-indexed and uses the generic slot mapping, so
+            # uses_slot_mapping separates the two cleanly.
+            if not getattr(spec, "uses_slot_mapping", True):
+                continue
             has_non_mla_attn = True
+            continue
+        # Hybrid models (GLM-5.3-Flash KDA, Qwen3-Next, Kimi-K3) carry
+        # MambaSpec state layers this pool cannot express --
+        # _split_mla_and_mha_layers raises on them. Their MLA plus
+        # indexer/kpool specs otherwise look like an EAGLE3 target/draft
+        # pair, so decline here and leave them on vLLM's own grouping.
+        return False
     return has_mla and has_non_mla_attn
 
 
@@ -360,9 +392,16 @@ def _patch_heterogeneous_eagle3_kv_cache() -> None:
 
     @functools.wraps(orig_get_groups)
     def patched_get_kv_cache_groups(vllm_config, kv_cache_spec):
-        if getattr(
-            vllm_config.model_config, "use_mla", False
-        ) and _spec_has_heterogeneous_mla_mha_backend(kv_cache_spec):
+        # This pool only means anything when an EAGLE3 draft actually exists:
+        # without a speculative config there is no MHA draft layer to pair the
+        # MLA target with. Requiring it here stops the pool engaging on plain
+        # serving runs of MLA models that merely happen to carry a second
+        # attention-like spec.
+        if (
+            getattr(vllm_config, "speculative_config", None) is not None
+            and getattr(vllm_config.model_config, "use_mla", False)
+            and _spec_has_heterogeneous_mla_mha_backend(kv_cache_spec)
+        ):
             logger.info(
                 "ATOM plugin: using heterogeneous KV cache layout - MLA target "
                 "and MHA EAGLE3 draft - with separate per-group pools."
