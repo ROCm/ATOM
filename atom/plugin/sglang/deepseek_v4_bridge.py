@@ -162,9 +162,9 @@ def _layer_counts(compress_ratios) -> tuple[list[int], int, int, int]:
 
 def _resolve_sglang_spec_steps() -> int:
     try:
-        from sglang.srt.server_args import get_global_server_args
+        from atom.plugin.config import get_sglang_server_args
 
-        server_args = get_global_server_args()
+        server_args = get_sglang_server_args()
         value = getattr(server_args, "speculative_num_steps", None)
         if value is not None:
             return max(0, int(value))

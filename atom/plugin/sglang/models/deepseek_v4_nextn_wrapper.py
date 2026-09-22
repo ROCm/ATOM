@@ -14,14 +14,16 @@ from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.server_args import get_global_server_args
 from torch import nn
 
 from atom.config import QuantizationConfig as AtomQuantizationConfig
 from atom.config import SpeculativeConfig
 from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.models.deepseek_v4 import DeepseekV4Attention, ParallelHead
-from atom.plugin.config import generate_atom_config_for_plugin_mode
+from atom.plugin.config import (
+    generate_atom_config_for_plugin_mode,
+    get_sglang_server_args,
+)
 from atom.plugin.sglang.runtime import (
     SGLangForwardBatchMetadata,
     SGLangPluginRuntime,
@@ -124,7 +126,7 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
         with plugin_runtime_scope(framework="sglang"):
             self.atom_config = generate_atom_config_for_plugin_mode(config)
 
-        server_args = get_global_server_args()
+        server_args = get_sglang_server_args()
         draft_model_path = (
             server_args.speculative_draft_model_path or server_args.model_path
         )
@@ -303,7 +305,7 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
         del weights
         from atom.model_loader.loader import load_model
 
-        server_args = get_global_server_args()
+        server_args = get_sglang_server_args()
         draft_model_path = (
             server_args.speculative_draft_model_path or server_args.model_path
         )

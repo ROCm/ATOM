@@ -48,9 +48,9 @@ _NO_WRITE = -1
 
 def _server_args() -> Any | None:
     try:
-        from sglang.srt.server_args import get_global_server_args
+        from atom.plugin.config import get_sglang_server_args
 
-        return get_global_server_args()
+        return get_sglang_server_args()
     except Exception:  # noqa: BLE001
         return None
 

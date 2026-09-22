@@ -16,6 +16,23 @@ logger = logging.getLogger("atom")
 VLLM_MORI_LAUNCH_CONFIG_TOKEN_THRESHOLD = 4096
 
 
+def get_sglang_server_args():
+    """Read SGLang operator ServerArgs across 0.5.19 and 0.5.20.
+
+    0.5.20 retired ``get_global_server_args()`` (it now raises). The live
+    record is ``sglang.srt.runtime_context.get_server_args()``. Fall back to
+    the legacy shim so unit tests and 0.5.19 still work.
+    """
+    try:
+        from sglang.srt.runtime_context import get_server_args
+
+        return get_server_args()
+    except Exception:  # noqa: BLE001 - missing module or unpublished context
+        from sglang.srt.server_args import get_global_server_args
+
+        return get_global_server_args()
+
+
 def _get_sglang_tbo_flags(enable_two_batch_overlap: bool) -> tuple[bool, bool]:
     """Translate SGLang's TBO switch and ATOM mode into ATOM config flags."""
     if not enable_two_batch_overlap:
@@ -389,7 +406,6 @@ def _generate_atom_config_from_sglang_config(config: Any):
     from sglang.srt.server_args import (
         ZMQ_TCP_PORT_DELTA,
         PortArgs,
-        get_global_server_args,
     )
 
     from atom.config import CompilationConfig, Config, ParallelConfig
@@ -397,7 +413,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
     # sglang's ModelRunner already parsed and stored ServerArgs globally
     # before OOT model loading, so we can retrieve it directly.
     try:
-        server_args = get_global_server_args()
+        server_args = get_sglang_server_args()
     except Exception as exc:
         raise RuntimeError(
             "Failed to retrieve SGLang global ServerArgs. Ensure this "

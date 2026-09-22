@@ -101,7 +101,7 @@ python3 -m sglang.launch_server \
     --mem-fraction-static 0.85 \
     --page-size 1 \
     --max-running-requests 128 \
-    --cuda-graph-bs $(seq 1 64) \
+    --cuda-graph-bs-decode $(seq 1 64) \
     --disable-radix-cache \
     --log-level info \
     --watchdog-timeout 3600 \
@@ -115,7 +115,7 @@ python3 -m sglang.launch_server \
 Key differences from prefill:
 - `HIP_VISIBLE_DEVICES=4,5,6,7` — separate GPU set
 - `--disaggregation-mode decode` — marks this as KV consumer
-- `--cuda-graph-bs` — CUDA Graph batch sizes for decode optimization
+- `--cuda-graph-bs-decode` — CUDA Graph batch sizes for decode optimization
 - Different `--disaggregation-bootstrap-port` (9098 vs 8998)
 
 ## Step 5: Start Mesh Router
