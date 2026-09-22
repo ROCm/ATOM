@@ -62,25 +62,29 @@ The scheduler maintains two deques — `waiting` (pending prefill) and `running`
 
 ### Schedule flow
 
-`Scheduler.schedule()` proceeds in two phases:
+`Scheduler.schedule()` first promotes completed transfers and asks the prefill
+delayer whether this tick allows prefill. It then selects work in three phases:
 
-**Phase 1 — Prefill scheduling:**
+1. Resume partial prefills from `running`, subject to the token budget,
+   `long_prefill_token_threshold` and state-checkpoint chunk boundaries.
+2. Admit fresh or offload-resumed prefills from `waiting`. A fresh request calls
+   `can_allocate(seq, record=False, block_hashes=hashes)` to obtain its HBM hit
+   and check capacity (`-1` means refusal; `0` is a valid cold admission).
+   After dependency-wait and token-budget checks, `record_allocation` commits
+   the joint boundary and `allocate` claims resources. Remote loads park until
+   their completion; ready offload resumes retain their existing allocations.
+   Local checkpoint waiters permit a bounded scan for independent work and
+   retain their relative FIFO order. See the [delayer settings](environment_variables.md#prefill-delayer-tpdcp-and-dp-attention).
+3. If no prefill was selected, schedule decode from `running`. `can_append`
+   checks extension capacity; pressure can preempt a running request back to
+   `waiting`. `may_append` reserves the selected tokens, including speculative
+   tokens when enabled. Partial prefills skipped by the delayer return to the
+   tail of `running`.
 
-1. While the delay gate passes (`_passed_delay`), the waiting queue is non-empty, and `num_seqs_prefill < max_num_seqs`:
-   - Peek the first waiting sequence.
-   - Compute `num_new_tokens = seq.num_tokens - seq.num_cached_tokens` (prefix cache hits reduce new tokens).
-   - If `num_batched_tokens + num_new_tokens > max_num_batched_tokens` or `block_manager.can_allocate(seq)` returns `False`, break.
-   - Otherwise: allocate blocks, set `seq.status = RUNNING`, `seq.type = PREFILL`, move from `waiting` to `running`.
-2. If any prefill sequences were scheduled, return the batch immediately (no decode mixing).
-
-**Phase 2 — Decode scheduling (only when zero prefills were scheduled):**
-
-1. Pop sequences from `running` up to `max_num_seqs`.
-2. For each sequence, check `block_manager.can_append(seq)`.
-3. If a block cannot be appended, **preempt** the last running sequence (move it back to `waiting` with status `WAITING` and deallocate its blocks).
-4. If the sequence has speculative draft tokens (`seq.spec_token_ids`), record them in `scheduled_spec_decode_tokens`.
-5. Call `block_manager.may_append(seq, num_new_tokens)` where `num_new_tokens = mtp_k + 1`.
-6. Re-insert all scheduled sequences back into `running` (preserving order).
+Prefill batches return without decode mixing. A waiting cancellation is removed
+on the abort event rather than waiting for admission to reach it. In-flight
+transfers retain their resources until their terminal notification; running
+cancellations finish through postprocess.
 
 ### Delay factor
 
@@ -404,30 +408,29 @@ A checkpoint the seq resumed from is not released here — it went back to the f
 ### Can-allocate and can-append checks
 
 ```python
-def can_allocate(self, seq: Sequence) -> int:
-    """Return the number of cache-hit blocks (>=0) if seq fits, else -1."""
-    # State cache has its own reservation; admission only needs a free slot
-    # index, not extra paged blocks.
-    if seq.has_per_req_cache and not self.state.has_free():
-        return -1
-    if not self.enable_prefix_caching:
-        if not self.kv.has_free(self.num_pool_blocks(len(seq))):
-            return -1
-    # ... (prefix caching dry-run returns the contiguous hit-block count)
+def can_allocate(self, seq: Sequence, record: bool = True, *,
+                 block_hashes: list[int] | None = None,
+                 reuse_hashes: bool = False) -> int:
+    """Return cache-hit hash blocks (>=0) if seq fits, else -1."""
+
+def record_allocation(self, seq: Sequence, num_cached_blocks: int,
+                      block_hashes: list[int]) -> None:
+    """Commit the joint boundary after the scheduler accepts the fit probe."""
 
 def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
-    seq_len = len(seq)
-    current_blocks = len(seq.block_table)
-    needed_blocks = (seq_len + num_new_tokens + self.block_size - 1) // self.block_size
-    new_blocks_needed = max(0, needed_blocks - current_blocks)
-    return self.kv.has_free(new_blocks_needed)
+    """Check capacity for the selected decode extension."""
 ```
 
-- `can_allocate` checks that:
-  - Enough free KV blocks exist for the full sequence. A windowed architecture adds nothing here: its window is a ring inside the per-request state slot, so the slot check below covers it.
-  - At least one per-request cache slot group is available if the sequence has `has_per_req_cache=True`. Per-request state costs no paged blocks — its bytes were reserved ahead of the paged pool at sizing time.
-  
-- `can_append` checks whether a decode step needs a new block. Calculates the required block count given `num_new_tokens` (typically `mtp_k + 1` for speculative decode) and returns whether enough free blocks remain.
+`can_allocate` checks the full per-request state-slot reservation and PAGE-unit
+capacity. Its cache hit incorporates KV, SWA and state-checkpoint availability.
+With `record=False`, it leaves joint-load fields and joint-boundary counters
+uncommitted; checkpoint demand/end and hit instrumentation still refresh.
+Checkpoint demand counters deduplicate per request. With `reuse_hashes=True`,
+immutable prompt hashes are memoized, but pool lookup, token equality and fit
+are checked on every call. Mutable completion tokens are never memoized.
+
+`can_append` checks whether the next decode extension needs additional blocks,
+including speculative tokens and the active cache layout.
 
 ### May-append (decode extension)
 

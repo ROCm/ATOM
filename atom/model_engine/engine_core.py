@@ -195,7 +195,11 @@ class EngineCore:
         logger.info(f"{self.label}: EngineCore fully initialized and ready")
 
     def _init_prefill_delayer(self, config: Config, cpu_group=None):
-        if not envs.ATOM_ENABLE_PREFILL_DELAYER:
+        if (
+            not envs.ATOM_ENABLE_PREFILL_DELAYER
+            or config.enable_rapidserve
+            or self.scheduler is None
+        ):
             return
         from atom.model_engine.prefill_delayer import PrefillDelayer
 

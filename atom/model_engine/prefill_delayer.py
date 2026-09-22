@@ -294,11 +294,14 @@ class PrefillDelayer:
         Args:
             prefillable: this rank has admittable prefill work (fresh head that
                 can allocate, or a resumable partial). Only prefillable ranks
-                count toward the fill target and the alignment gate.
+                count toward the fill target and the alignment gate. During
+                local decode protection, the caller uses work existence alone:
+                fit cannot change the hard interval decision.
             pending_tokens: this rank's accumulated prefill tokens — fresh
                 waiting new-tokens PLUS the remaining tokens of resumable
                 partials — already capped at max_num_batched_tokens by the
-                caller. The coalescer's fill signal.
+                caller. The local scheduler bounds its scan and uses chunk
+                limits, so this signal can omit work beyond that scan.
             running_decode_batch: decode seqs running on this rank (NOT counting
                 mid-chunked-prefill seqs). If no rank has decode, holding wastes
                 GPU → fire.
@@ -306,7 +309,8 @@ class PrefillDelayer:
                 KV-high (can't accumulate more) and KV-low (GPU starving) bounds.
             has_partial: this rank has a mid-chunked-prefill seq in flight. Its
                 remaining tokens are in pending_tokens; a partial only forces
-                release once held for partial_max_ticks (it holds KV).
+                release once held for partial_max_ticks (it holds KV), counted
+                after the decode-protection interval.
             oldest_waiting_age_ms: age (ms since arrival) of this rank's oldest
                 schedulable waiting prefill. If it reaches max_queue_ms, this
                 rank flags the age guard; all ranks release after decode

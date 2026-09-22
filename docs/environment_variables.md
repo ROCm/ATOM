@@ -22,12 +22,27 @@ PP=1), including TP/DCP, it is opt-in: set `ATOM_PREFILL_DECODE_INTERVAL` above
 zero and keep the master switch enabled. Interval 0 leaves TP scheduling
 unchanged; setting only the master switch does not enable TP coalescing.
 On TP, the interval and coalescer are enabled together.
+This applies to the standard scheduler, including connector-based P/D roles.
+RapidServe's dedicated `PrefillScheduler`/`DecodeScheduler` do not use the delayer.
 
 After each executed prefill, the decode interval runs before all coalescing
 bounds. Once it expires, fill, queue age, KV pressure, partial-prefill and stall
 bounds decide when to release. `MAX_QUEUE_MS` stops extra coalescing after that
 interval; it does not guarantee end-to-end TTFT. DP decisions reduce local
 signals across ranks to keep their phases aligned.
+
+The local fill signal discounts HBM cache hits and uses the admission path's
+chunk limits. To bound CPU work, it stops probing fresh requests after their
+total prompt length reaches one batch budget. It reports only work found so
+far; it does not treat unseen requests as a full batch. A deep, cache-heavy
+queue can therefore release through the stall or hold bounds before reaching
+the fill target. If parked transfers exhaust the unreserved slots, a fresh
+request may signal possible work with zero estimated tokens until admission
+resolves its connector match. This is an estimate, not a reservation: checkpoint dependencies,
+connector results and resource changes during admission can still reduce a batch.
+Repeated probes reuse immutable prompt hashes while rechecking pool contents
+and resource fit. During decode protection, only the existence of queued or
+partial work is checked; partial-prefill hold bounds start after the interval.
 
 Local hybrid models with state checkpointing can wait for an in-flight
 producer's reusable prompt-end checkpoint. The expected prefix must exceed both

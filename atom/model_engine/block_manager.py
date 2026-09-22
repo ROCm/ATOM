@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 from math import inf, isinf
 from time import monotonic
+from weakref import WeakKeyDictionary
 
 import numpy as np
 import xxhash
@@ -131,6 +132,11 @@ class BlockManager:
         # tokens (see _hash_block_size). == block_size when DCP is off.
         self.hash_block_size = self.block_size * self.dcp_world_size
         self.enable_prefix_caching = config.enable_prefix_caching
+        # Content hashes only: pool hits and resource fit are always rechecked.
+        # Weak keys keep this scheduler-side cache out of request serialization.
+        self._prefill_probe_hashes: WeakKeyDictionary[
+            Sequence, tuple[int, list[int]]
+        ] = WeakKeyDictionary()
         self.total_evicted_blocks: int = 0
 
         kv_events = getattr(config, "kv_events_config", None)
@@ -867,12 +873,14 @@ class BlockManager:
         record: bool = True,
         *,
         block_hashes: list[int] | None = None,
+        reuse_hashes: bool = False,
     ) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
         `record=False` returns the same fit and HBM hit without committing
-        joint-load fields or funnel counters. It still refreshes checkpoint
-        demand/end and hit instrumentation. An optional `block_hashes` output
+        joint-load fields or joint-boundary counters. Checkpoint demand/end
+        and hit instrumentation still refresh; demand counters deduplicate per
+        request. An optional `block_hashes` output
         lets the scheduler defer `record_allocation` until after its wait and
         token-budget checks, reusing this probe's chain without another walk.
 
@@ -906,9 +914,21 @@ class BlockManager:
         # match). Record each block's hash for the SWA scan below.
         h = seq.cache_seed
         compressed_hit = 0
+        cached_hashes = None
+        if reuse_hashes:
+            seed, cached_hashes = self._prefill_probe_hashes.get(seq, (h, []))
+            if seed != h:
+                cached_hashes = []
+            self._prefill_probe_hashes[seq] = (h, cached_hashes)
+        immutable_blocks = seq.num_prompt_tokens // self.hash_block_size
         for i in range(self._n_hash_blocks(seq) - 1):
             token_ids = self._hash_block_tokens(seq, i)
-            h = self.compute_hash(token_ids, h)
+            if cached_hashes is not None and i < len(cached_hashes):
+                h = cached_hashes[i]
+            else:
+                h = self.compute_hash(token_ids, h)
+                if cached_hashes is not None and i < immutable_blocks:
+                    cached_hashes.append(h)
             block_id = self.kv.lookup(h)
             if block_id == -1 or self.kv.block(block_id).token_ids != token_ids:
                 break
@@ -955,22 +975,9 @@ class BlockManager:
         self._record_checkpoint_end(seq)
         if not self._has_page_units(num_new_blocks, protected_hash):
             return -1
-        # A boundary LMCache and the tier can jointly reach, above this hit.
-        # Committed to the seq rather than returned: what `allocate` claims from
-        # HBM is still `num_cached_blocks`, and the joint boundary only decides
-        # where the two loads are aimed. `record` is the probe/admission split:
-        # a real admission computes the boundary and commits it (seq fields +
-        # funnel counters); a fit probe skips it entirely. The `num_cached_blocks`
-        # returned below does not depend on the decision, so gating the
-        # computation -- not just the commit -- spares a probe the O(prompt) work
-        # for a value it would only discard: `_joint_kv_boundary` walks a chained
-        # xxhash up to the LMCache-only cap (`_chain_to`) plus a `_gated_hit`
-        # rescan. A 128k prompt at the front of a KV-pressured queue paid that
-        # full chain on every scheduling pass (`is_mixed_batch` peeks up to four
-        # waiting seqs with `record=False`) for a decision nothing read. Placed
-        # below the refusal, not above it, for the same reason `_extend_hash_chain`
-        # is: a refused admission would discard it, and nothing between here and
-        # the refusal reads the seq's joint fields -- this is that move's twin.
+        # A direct admission commits its joint boundary here. The scheduler
+        # probes first and calls record_allocation only after dependency and
+        # budget checks; refused probes avoid the extra LMCache hash walk.
         if record:
             self.record_allocation(seq, num_cached_blocks, block_hashes)
         # After the refusal, not before it. The chain is O(prompt) xxhash plus
@@ -2073,7 +2080,9 @@ class BlockManager:
         self.state.cancel_midstep(seq.midstep_reservations)
         seq.midstep_reservations = []
 
-    def checkpoint_cut(self, seq: Sequence, start: int, end: int) -> int:
+    def checkpoint_cut(
+        self, seq: Sequence, start: int, end: int, *, record: bool = True
+    ) -> int:
         """Earliest ladder position in `(start, end]`, or 0 if there is none.
 
         What a prefill chunk is cut at so its forward lands exactly on a rung.
@@ -2146,7 +2155,7 @@ class BlockManager:
         # `chunks_cut_for_demand` would swamp the convergence signal that
         # counter exists to expose. The demand is checked first because when
         # the two coincide it is the demand that evidenced the position.
-        if target != rung and target < end:
+        if record and target != rung and target < end:
             if target == demand:
                 self.chunks_cut_for_demand += 1
             else:
@@ -2620,6 +2629,7 @@ class BlockManager:
             seq.state_fork_src = -1
 
         seq.offload_joint.load_hash = -1
+        seq.offload_joint.reset_joint()
 
     def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
         seq_len = len(seq)
