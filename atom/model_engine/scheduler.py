@@ -3514,9 +3514,9 @@ class Scheduler:
         # is one-directional and never self-corrects: `forget` never ran and the
         # index kept advertising a hash whose bytes LMCache had dropped.
         #
-        # A miss is evidence about the HASH; `forget` needs no request id. The
-        # `missing=` flag below stays, because `fail_load` uses it to decide
-        # whether the slot is reusable -- that one IS per-request.
+        # A miss is evidence about the HASH; `forget` needs no request id, so
+        # the retraction no longer rides the per-request failure report at all.
+        # The loop below only counts the failure and unparks the request.
         if offload is not None:
             for h in missed:
                 offload.forget(int(h))

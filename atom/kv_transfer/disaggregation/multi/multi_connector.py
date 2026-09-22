@@ -232,7 +232,6 @@ class MultiConnector(KVConnectorBase):
             getattr(c, "is_producer", False) for c in self._connectors
         )
 
-
     def register_kv_caches(
         self,
         kv_caches: dict[str, Any],
