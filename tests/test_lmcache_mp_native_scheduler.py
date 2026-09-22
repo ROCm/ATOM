@@ -73,7 +73,15 @@ class Adapter:
         self.closed = True
 
 
-def make_scheduler(monkeypatch, *, capacity=2, budget=60, units=30, role="offload"):
+def make_scheduler(
+    monkeypatch,
+    *,
+    capacity=2,
+    budget=60,
+    units=30,
+    role="offload",
+    page_budget=None,
+):
     monkeypatch.setenv("OFFLOAD_MAX_PENDING_SAVES", str(capacity))
     adapter = Adapter()
     connections = []
@@ -83,14 +91,17 @@ def make_scheduler(monkeypatch, *, capacity=2, budget=60, units=30, role="offloa
         return adapter
 
     monkeypatch.setattr(backend, "_make_scheduler_adapter", connect)
+    extra = {
+        "lmcache.mp.max_pinned_state_bytes": budget,
+        "lmcache.chunk_size": 8,
+    }
+    if page_budget is not None:
+        extra["lmcache.mp.max_pinned_save_blocks"] = page_budget
     config = SimpleNamespace(
         kv_cache_block_size=4,
         kv_transfer_config={
             "kv_role": role,
-            "kv_connector_extra_config": {
-                "lmcache.mp.max_pinned_state_bytes": budget,
-                "lmcache.chunk_size": 8,
-            },
+            "kv_connector_extra_config": extra,
         },
     )
     scheduler = NativeStateLMCacheMPConnectorScheduler(config)
@@ -210,6 +221,31 @@ def test_save_credit_and_bytes_are_reserved_before_native_pin(
     [second] = scheduler.build_connector_meta().requests
     assert second.req_id == 2
     assert second.native_state.unit_ids != first.native_state.unit_ids
+
+
+def test_mp_page_budget_waits_without_pinning_a_native_image(monkeypatch):
+    scheduler, checkpoints, _ = make_scheduler(
+        monkeypatch,
+        capacity=2,
+        budget=60,
+        page_budget=4,
+    )
+    seqs = [sequence(1), sequence(2, token_offset=100)]
+    for seq in seqs:
+        checkpoint(scheduler, checkpoints, seq, 16)
+        scheduler.update_state_after_alloc(seq)
+
+    [first] = scheduler.build_connector_meta().requests
+    assert first.req_id == 1
+    assert scheduler._mp_save_admission.reserved_blocks == 4
+    # The second candidate does not consume a STATE image while its PAGE
+    # reservation is waiting behind the first MP operation.
+    assert scheduler.build_connector_meta().requests == []
+    assert scheduler._pinned_state_bytes == 30
+
+    terminal(scheduler, first.save_operation)
+    [second] = scheduler.build_connector_meta().requests
+    assert second.req_id == 2
 
 
 def test_save_frontier_selects_existing_checkpoint_below_computed_tokens(monkeypatch):

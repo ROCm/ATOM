@@ -66,6 +66,15 @@ complete STATE checkpoint both exist on all TP ranks.
 and temporary restore images together. Its default is
 `OFFLOAD_MAX_PENDING_SAVES * units_per_checkpoint * page_unit_bytes`, per TP
 worker's geometry. PAGE KV sources continue to use normal request ownership.
+`lmcache.mp.max_pinned_save_blocks` optionally adds an MP-only bound on PAGE
+blocks retained by dispatched saves. It is disabled when omitted, preserving
+the existing MP behavior. When enabled, the MP scheduler considers finished
+requests first, then requests retaining more PAGEs and larger unsaved prefixes;
+an operation waits if admitting it would exceed the configured bound. A single
+save larger than the bound is serialized by itself so request cleanup cannot
+deadlock. This policy is not installed in the standalone Dense, Kimi, or DSv4
+LMCache connectors.
+
 Candidates consume no PAGE or image pin until admission. If a request finishes
 while waiting, admission resolves the original token/hash chain back through
 the live prefix index and stores only its still-resident contiguous prefix.

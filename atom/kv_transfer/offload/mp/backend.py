@@ -34,13 +34,17 @@ from atom.kv_transfer.disaggregation.types import (
     SaveSourceGroupId,
 )
 from atom.kv_transfer.offload import config as offcfg
-from atom.kv_transfer.offload._offload_common import validated_kv_role
+from atom.kv_transfer.offload._offload_common import (
+    max_pending_saves,
+    validated_kv_role,
+)
 from atom.kv_transfer.offload.chunked_scheduler import (
     DENSE_PAGE_SOURCE_SAFE_CHANNEL,
     DENSE_PAGE_STORE_CHANNEL,
     ChunkedOffloadSchedulerBase,
 )
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReqMeta
+from atom.kv_transfer.offload.mp.save_admission import MPSaveAdmission
 
 logger = logging.getLogger("atom")
 
@@ -1145,11 +1149,49 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                 chunk_size=int(adapter.lmcache_tokens_per_chunk),
                 lookup_client=lookup_client,
             )
+            self._max_pending_saves = max_pending_saves(
+                kvc,
+                int(os.environ.get("OFFLOAD_COPY_WORKERS", "1") or 1),
+            )
+            self._mp_save_admission = MPSaveAdmission.from_extra_config(extra)
         except Exception:
             shutdown = getattr(adapter, "shutdown", None)
             if callable(shutdown):
                 shutdown()
             raise
+
+    def _may_emit_save(self) -> bool:
+        return len(self._save_inflight) < self._max_pending_saves
+
+    def _build_save_request(
+        self,
+        seq: Any,
+        saved: int,
+        aligned: int,
+        operation: SaveOperationId,
+        block_ids: list[int],
+        is_last_prefill: bool,
+    ) -> LMCacheReqMeta | None:
+        admission = self._mp_save_admission.reserve(
+            operation,
+            block_ids,
+            saved=saved,
+            aligned=aligned,
+            block_size=self.virtual_block_size,
+        )
+        if admission == "busy":
+            return None
+        request = super()._build_save_request(
+            seq,
+            saved,
+            aligned,
+            operation,
+            block_ids,
+            is_last_prefill,
+        )
+        if request is None:
+            self._mp_save_admission.release(operation)
+        return request
 
     def save_abandon_timeout_s(self) -> float:
         """A timeout cannot prove that a remote MP DMA stopped reading HBM."""
@@ -1177,6 +1219,16 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         return matched
 
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
+        ordered_sids = self._mp_save_admission.ordered_sids(
+            self._save_tracker,
+            self._save_frontier,
+        )
+        if ordered_sids != list(self._save_tracker):
+            self._save_tracker = {sid: self._save_tracker[sid] for sid in ordered_sids}
+        if self._mp_save_admission.enabled:
+            # The parent cursor implements FIFO fairness. MP admission has
+            # already ordered this pass by release value, so do not rotate it.
+            self._save_rr_last = None
         metadata = super().build_connector_meta()
         for req in metadata.requests:
             if req.load_spec is not None:
@@ -1189,6 +1241,30 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                     int(end),
                 )
         return metadata
+
+    def _source_group_finished(self, identity: SaveSourceGroupId) -> None:
+        super()._source_group_finished(identity)
+        operation = identity.save_operation
+        block_map = self._save_operation_blocks.get(operation, {})
+        safe = self._save_operation_safe.get(operation, set())
+        self._mp_save_admission.source_safe(
+            operation,
+            set(block_map.values()) - set(safe),
+        )
+
+    def _release_operation_lease(self, operation: Any) -> None:
+        try:
+            super()._release_operation_lease(operation)
+        finally:
+            if isinstance(operation, SaveOperationId):
+                self._mp_save_admission.release(operation)
+
+    def abandon_save(self, req_id: Any) -> None:
+        sid = str(req_id.req_id if isinstance(req_id, SaveOperationId) else req_id)
+        operation = self._save_inflight.get(sid)
+        super().abandon_save(req_id)
+        if isinstance(operation, SaveOperationId):
+            self._mp_save_admission.release(operation)
 
     def load_finished(self, req_id: Any) -> bool:
         finished = super().load_finished(req_id)
@@ -1230,6 +1306,10 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
 
     def request_finished(self, seq: Any) -> None:
         super().request_finished(seq)
+        sid = str(seq.id)
+        entry = self._save_tracker.get(sid)
+        if entry is None or entry[0] is not seq:
+            self._mp_save_admission.forget_candidate(sid, seq)
         try:
             self._mp_adapter.end_session(_mp_session_id(self._config, seq.id))
         except Exception:
