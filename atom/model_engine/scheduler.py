@@ -575,14 +575,18 @@ class Scheduler:
         self.drafter_needs_next_token = self.use_spec and not (
             config.speculative_config.use_dspark()
         )
-        # True when this engine both drafts and verifies; False under PP
-        # (which only drafts for handoff to the decode node).
+        # True when this engine both drafts and verifies. Under PP the drafter
+        # runs on the last stage (`_build_output`'s non-deferred branch) and its
+        # rows come back on `ScheduledBatchOutput.draft_token_ids`, so the head
+        # can schedule them for verification like any other engine —
+        # `prepare_input_ids` stages the draft columns for every decode row
+        # because there is no GPU-side carry to rewrite them.
         pp_size = getattr(config, "pipeline_parallel_size", 1)
-        self.spec_decode_local = self.use_spec and pp_size == 1
-        if self.use_spec and not self.spec_decode_local:
+        self.spec_decode_local = self.use_spec
+        if self.use_spec and pp_size > 1:
             logger.info(
-                "Speculative decoding: drafting only (pipeline_parallel_size=%d). "
-                "Drafts are produced for handoff; this engine verifies none.",
+                "Speculative decoding: verifying locally under pipeline "
+                "parallelism (pipeline_parallel_size=%d).",
                 pp_size,
             )
         # `engine_stats` (spec / cache / throughput sections) is constructed

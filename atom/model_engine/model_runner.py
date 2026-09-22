@@ -495,12 +495,24 @@ class tokenIDProcessor:
             token_ids = scheduled_tokens[
                 total_tokens_prefill : total_tokens_prefill + total_tokens_decode
             ]
-            if self.use_spec:
-                # Reached only under pipeline parallel, which no spec path
-                # supports yet; wants the deferred branch's per-request staging.
-                raise NotImplementedError("pipeline parallel + speculative decode")
-
             self.input_ids.np[:total_tokens_decode] = token_ids
+            if self.use_spec:
+                # Every row's draft columns, not just the newly admitted ones
+                # the deferred branch stages. There the anchor of a carried-over
+                # request is still on the GPU and `fill_deferred_decode_ids`
+                # rewrites its whole row from `prev_token_ids`; here (PP) the
+                # host already holds the real anchor -- postprocess wrote it
+                # back before this batch was built -- so `scheduled_tokens`
+                # above is correct at column 0 and only the drafts are missing.
+                _, lens, cu_np = self.runner.attn_metadata_builder.decode_spans(
+                    batch
+                )
+                spec = batch.scheduled_spec_decode_tokens
+                for i in range(len(lens)):
+                    n_draft = int(lens[i]) - 1
+                    if n_draft > 0:
+                        s = int(cu_np[i]) + 1
+                        self.input_ids.np[s : s + n_draft] = spec[i, :n_draft]
             return self.input_ids.copy_to_gpu(total_tokens_decode)
 
         # PD consumer first decode: no prior prefill step initialized
