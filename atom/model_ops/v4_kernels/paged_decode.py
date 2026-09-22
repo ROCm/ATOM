@@ -59,6 +59,9 @@ from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 from aiter.ops.triton.utils.device_info import get_num_sms
 
 from atom.model_ops.sparse_attn_v4 import _sparse_attn_ragged_torch
+from atom.model_ops.v4_kernels.paged_decode_gfx950 import (
+    _paged_decode_fused_gfx950_kernel,
+)
 from atom.model_ops.v4_kernels.pool_index import row_offset
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
@@ -706,12 +709,25 @@ def _sparse_attn_v4_paged_decode_triton(
 
     qk_scale = float(softmax_scale) * LOG2E
     _bk, num_warps, num_stages = _kernel_config(block_h)
+    use_gfx950_fused = (
+        kv_splits == 1
+        and not quant_kv
+        and q.dtype == torch.bfloat16
+        and D == 512
+        and block_h in (16, 32)
+        and block_k is None
+        and get_gfx() == "gfx950"
+    )
     if block_k is None:
-        # fp8 dequant inflates per-tile ALU work ~4×; a wider K tile amortizes
-        # the per-tile dequant cost (scale load + cast + multiply) over more
-        # MFMA work. Empirically BLOCK_K=32 wins ~20% over BLOCK_K=16 on fp8
-        # (bs=512 ctx=4096: 3000µs → 2300µs) without hurting bf16.
-        block_k = 32 if quant_kv else _bk
+        if use_gfx950_fused:
+            # Keep the score tile at 1024 elements: H16/K64 or H32/K32.
+            block_k = 1024 // block_h
+        else:
+            # fp8 dequant inflates per-tile ALU work ~4×; a wider K tile amortizes
+            # the per-tile dequant cost (scale load + cast + multiply) over more
+            # MFMA work. Empirically BLOCK_K=32 wins ~20% over BLOCK_K=16 on fp8
+            # (bs=512 ctx=4096: 3000µs → 2300µs) without hurting bf16.
+            block_k = 32 if quant_kv else _bk
 
     # Kernel reads (kv_scales_ptr, ks_stride_n) only when QUANT_KV — supply a
     # dummy 1-element fp32 tensor on the bf16 path so the launch signature
@@ -732,7 +748,12 @@ def _sparse_attn_v4_paged_decode_triton(
     # skipping the partial-buffer alloc and the second kernel launch.
     if kv_splits == 1:
         grid_fused = (T, n_head_blocks)
-        _paged_decode_fused_kernel[grid_fused](
+        kernel = (
+            _paged_decode_fused_gfx950_kernel
+            if use_gfx950_fused
+            else _paged_decode_fused_kernel
+        )
+        kernel[grid_fused](
             q,
             unified_kv,
             kv_scales_arg,
@@ -762,7 +783,11 @@ def _sparse_attn_v4_paged_decode_triton(
             num_warps=num_warps,
             num_stages=num_stages,
             # Buffer-load lowering for 32-head tiles can cross 256 VGPRs.
-            waves_per_eu=2 if block_h == 32 and D == 512 and not quant_kv else 0,
+            waves_per_eu=(
+                2
+                if not use_gfx950_fused and block_h == 32 and D == 512 and not quant_kv
+                else 0
+            ),
         )
         return out
 

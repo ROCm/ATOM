@@ -20,8 +20,10 @@ def _inputs(heads, dim, dtype, quantized=False):
     torch.manual_seed(20260922)
     tokens = 512
     lengths = torch.tensor(
-        [0, 1, 15, 16, 17, 63, 128, 129, 640], device="cuda", dtype=torch.int32
-    ).repeat(57)[:tokens]
+        [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 640, 1152],
+        device="cuda",
+        dtype=torch.int32,
+    ).repeat(tokens // 16)
     ptr = torch.cat((lengths.new_zeros(1), lengths.cumsum(0).to(torch.int32)))
     indices = torch.randint(4096, (int(ptr[-1]),), device="cuda", dtype=torch.int32)
     # Exercise strides independently of the contiguous production layout.
@@ -92,8 +94,9 @@ def test_fused_decode_matches_fp64_with_ragged_rows(heads, dim, dtype, quantized
     _check(actual, expected, ptr)
 
 
-def test_fused_decode_graph_reads_changed_csr_and_sink():
-    query, cache, indices, ptr, sink, scales = _inputs(32, 512, torch.bfloat16)
+@pytest.mark.parametrize("heads", [16, 32])
+def test_fused_decode_graph_reads_changed_csr_and_sink(heads):
+    query, cache, indices, ptr, sink, scales = _inputs(heads, 512, torch.bfloat16)
 
     def forward():
         return _sparse_attn_v4_paged_decode_triton(
@@ -115,3 +118,24 @@ def test_fused_decode_graph_reads_changed_csr_and_sink():
         graph.replay()
         expected = _reference(query, cache, indices, ptr, sink, scales)
         _check(actual, expected, ptr)
+
+
+@pytest.mark.parametrize("heads", [16, 32])
+def test_fused_decode_addresses_past_int32_element_offsets(heads):
+    torch.manual_seed(20260922)
+    tokens, dim = 512, 512
+    first_slot = 1 << 22
+    # Only these two rows are read; their element offsets exceed int32.
+    cache = torch.empty(first_slot + 2, dim, device="cuda", dtype=torch.bfloat16)
+    cache[-2:].normal_()
+    query = torch.randn(tokens, heads, dim, device="cuda", dtype=cache.dtype)
+    indices = torch.tensor(
+        [first_slot, first_slot + 1], device="cuda", dtype=torch.int32
+    ).repeat(tokens)
+    ptr = torch.arange(tokens + 1, device="cuda", dtype=torch.int32) * 2
+    sink = torch.randn(heads, device="cuda")
+    actual = _sparse_attn_v4_paged_decode_triton(
+        query, cache, indices, ptr, sink, dim**-0.5, kv_splits=1
+    )
+    expected = _reference(query, cache, indices, ptr, sink, None)
+    _check(actual, expected, ptr)
