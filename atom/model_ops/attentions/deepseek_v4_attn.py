@@ -137,6 +137,21 @@ def _uses_pd_staging(kv_transfer_config: dict | None) -> bool:
     return KVConnectorFactory.topology_uses_pd_staging(kv_transfer_config)
 
 
+def _validate_fp4_indexer_transfer(kv_transfer_config: dict) -> None:
+    """FP4 PAGE pools require a connector that consumes transfer regions."""
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    name = KVConnectorFactory.canonical_name(kv_transfer_config.get("kv_connector"))
+    if name == "multi":
+        for child in kv_transfer_config.get("connectors", []):
+            _validate_fp4_indexer_transfer(child)
+    elif name != "mooncake" and _uses_pd_staging(kv_transfer_config):
+        raise NotImplementedError(
+            "DeepSeek-V4 FP4 index PD transfer requires Mooncake; "
+            f"{name} does not consume the V4 PAGE/SLOT transfer regions"
+        )
+
+
 # AF_PIECEWISE: attn-core capture/replay (keyed layer, bucket_bs, q_eff, nt_pad).
 # Owns its isolated graph pool + per-key graph cache + output buffers.
 # State field carrying the windows of layers whose KV dtype is not the pool's.
@@ -296,6 +311,10 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     kv_last_page_lens: torch.Tensor | None = None
     """[padded_T] int32 GPU — per-token last-page length `ones(N)` (page_size=1
     → every page is full)."""
+    empty_kv_indptr: torch.Tensor | None = None
+    """[padded_T+1] all-zero int32 GPU — empty extend-stream CSR used when
+    `ATOM_USE_V4_PREFILL_ASM_FOR_DECODE=1` reuses the H=128 prefill ASM kernel
+    for decode. Backed by one immutable buffer shared by every layer."""
 
     # ----- Indexer / sparse-layout side metadata -----
     indexer_meta: dict[str, Any] | None = None
@@ -397,6 +416,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
     # Number of micro-batches for Two-Batch Overlap (TBO).
     _NUM_TBO_UBATCHES = 2
+
+    # Set by a subclass that rotates an index key at its compression group's
+    # first token instead of at its own. V4's rotate at their own, so its
+    # plans carry no such positions and it declares no buffer for them.
+    _publishes_key_rope = False
 
     def __init__(self, model_runner):
         super().__init__(model_runner)
@@ -1856,18 +1880,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         # `get_kv_transfer_tensors` is called unconditionally on every
         # `allocate_kv_cache`; returning None means "no transfer region."
-        # Standalone LMCache offload can carry both FP4 indexer pools, but PD
-        # connectors have a separate producer/consumer region contract which
-        # has not been extended to the FP4 scale pool yet.
+        # Mooncake and standalone offload consume the same PAGE description,
+        # including the separate packed FP4 data and e8m0 scale pools.
         transfer_config = getattr(runner.config, "kv_transfer_config", None)
         transfer_active = bool(transfer_config)
-        if self._indexer_fp4 and transfer_active and _uses_pd_staging(transfer_config):
-            raise NotImplementedError(
-                "DeepSeek-V4 PD transfer with --index_cache_dtype fp4 is "
-                "unsupported; standalone LMCache offload supports FP4, but "
-                "Mooncake/Moriio producer-consumer staging does not yet map "
-                "the separate FP4 indexer scale pool."
-            )
+        if self._indexer_fp4 and transfer_active:
+            _validate_fp4_indexer_transfer(transfer_config)
         if transfer_active and getattr(runner.config, "pipeline_parallel_size", 1) > 1:
             raise NotImplementedError(
                 "DeepSeek-V4 KV transfer/PD and sidecar offload with pipeline "
@@ -2447,6 +2465,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.qo_indptr = self._stage(
                 "v4_qo_indptr", self._v4_qo_indptr_np[: running_bs + 1]
             )
+            attn_metadata.empty_kv_indptr = self.model_runner.forward_vars[
+                "v4_empty_kv_indptr"
+            ][: running_bs + 1]
 
         # NOT rebuilt (unused by SWA-only MTP layer; would block a future
         # CSA/HCA MTP layer — assert at top guards):
@@ -2580,6 +2601,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             plan_context_lens_np,
             running_bs=running_bs,
             max_q_len=max_seqlen_q,
+            extra_write=self.max_spec_steps,
         )
 
         # ---- sync, build attn_metadata, per-fwd meta ----
@@ -2773,6 +2795,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 running_bs=ub_running_bs,
                 max_q_len=max_seqlen_q,
                 buf_prefix_ubatch=p,
+                extra_write=self.max_spec_steps,
             )
 
             attn_metadata = AttentionMetaData_DSV4(
@@ -2885,7 +2908,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             var["context_lens"].np[:scheduled_bs], dtype=np.int32
         )
         attn_metadata.compress_plans = self._build_compress_plans(
-            extend_lens_np, context_lens_np
+            # Prefill: no slack. Nothing rejects a prefill chunk, so the next
+            # fwd only ever reads back `K_pool`, and the chunk is wider than
+            # the ring anyway.
+            extend_lens_np,
+            context_lens_np,
+            extra_write=0,
         )
         # Prefill is eager (no CG), so it runs exactly what it scheduled and
         # omits `running_tokens` to say so. Must still run BEFORE
@@ -3136,6 +3164,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 np.ascontiguousarray(context_lens_np, dtype=np.int32),
                 self._unique_compress_ratios_overlap,
                 plan_buffers=ub_plan_buffers,
+                extra_write=0,  # TBO prefill is eager-only; nothing rejects it.
             )
         else:
             ub_attn.compress_plans = {}
@@ -3318,6 +3347,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 self._unique_compress_ratios_overlap,
                 plan_buffers=plan_bufs,
                 decode_capacity_per_ratio=None,
+                extra_write=self.max_spec_steps,
             )
         else:
             ub.compress_plans = {}
@@ -3695,6 +3725,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             qo_buf.np[: T + 1] = self._v4_qo_indptr_np[: T + 1]
             qo_buf.np[T + 1 : T_pad + 1] = T
             attn_metadata.qo_indptr = qo_buf.copy_to_gpu(T_pad + 1)
+            attn_metadata.empty_kv_indptr = self.model_runner.forward_vars[
+                "v4_empty_kv_indptr"
+            ][: T_pad + 1]
 
     def _build_paged_prefill_meta(
         self,
@@ -3913,6 +3946,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         running_bs: int | None = None,
         max_q_len: int | None = None,
         buf_prefix_ubatch: str = "",
+        extra_write: int,
     ):
         """Build per-ratio CompressPlan dict consumed by batched compressor.
 
@@ -3948,13 +3982,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "— passing torch.Tensor here would trigger a hidden D2H sync"
         )
         var = self.model_runner.forward_vars
-        plan_buffers = {
-            ratio: {
+        plan_buffers = {}
+        for ratio, _ in self._unique_compress_ratios_overlap:
+            ratio_buffers = {
                 "compress": var[f"{buf_prefix_ubatch}v4_compress_plan_{ratio}"],
                 "write": var[f"{buf_prefix_ubatch}v4_write_plan_{ratio}"],
             }
-            for ratio, _ in self._unique_compress_ratios_overlap
-        }
+            if self._publishes_key_rope:
+                ratio_buffers["key_rope"] = var[
+                    f"{buf_prefix_ubatch}v41_key_rope_positions_{ratio}"
+                ]
+            plan_buffers[ratio] = ratio_buffers
         return make_compress_plans(
             extend_lens_np,
             context_lens_np,
@@ -3962,6 +4000,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             plan_buffers=plan_buffers,
             running_bs=running_bs,
             max_q_len=max_q_len,
+            extra_write=extra_write,
         )
 
     def _populate_state_slot_mappings(
@@ -4207,6 +4246,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             context_lens_np,
             running_bs=bs,
             max_q_len=max_q_len,
+            extra_write=self.max_spec_steps,
         )
         # Capture: running_bs == scheduled_bs == bs (synthetic batch is full).
         # Must run BEFORE `_attach_v4_indexer_meta` so the indexer-side meta
@@ -4254,6 +4294,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     # Helpers.                                                           #
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _state_slot_buffers(max_bs, device, *, prefix="", read_side=True):
+        """Allocate the persistent slot maps used by V4 attention consumers."""
+        directions = ("out", "in") if read_side else ("out",)
+        return {
+            f"{prefix}v4_meta_state_slot_{direction}": CpuGpuBuffer(
+                max_bs,
+                dtype=torch.int32,
+                device=device,
+                pin_memory=torch.device(device).type != "cpu",
+            )
+            for direction in directions
+        }
+
     def _alloc_v4_metadata_buffers(self) -> None:
         """Pre-allocate every buffer the V4 metadata builder writes into.
 
@@ -4293,11 +4347,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # `_populate_state_slot_mappings`); attn_metadata.state_slot_out
         # exposes that GPU view to all downstream consumers (no second
         # H2D-staged copy).
-        bufs["v4_meta_state_slot_out"] = CpuGpuBuffer(bs, **i32)
         # Read side of the compressor ring (`_populate_state_slot_in`). Its own
         # buffer on every path, forked or not, so the captured decode graph sees
         # a stable address.
-        bufs["v4_meta_state_slot_in"] = CpuGpuBuffer(bs, **i32)
+        bufs.update(self._state_slot_buffers(bs, self.device))
 
         # Phase B: paged-decode index buffers (consumed by Phase C/E).
         # Sized to worst-case decode shape `T = max_bs * (1 + max_spec_steps)`
@@ -4351,6 +4404,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # the per-fwd cost is a slice + H2D.
         bufs["v4_qo_indptr"] = CpuGpuBuffer(T_dec + 1, **i32)
         self._v4_qo_indptr_np = np.arange(T_dec + 1, dtype=np.int32)
+        # Immutable, device-only empty CSR for reusing the H=128 sparse-prefill
+        # ASM kernel in decode. Shared read-only across layers and TBO ubatches.
+        bufs["v4_empty_kv_indptr"] = torch.zeros(T_dec + 1, **i32)
         # Per-seq `ctx_len // 4` (raw, no clamp). Consumed by the indexer's
         # `cu_committed` cumsum — per-SEQUENCE, host-side, prefill only.
         # Single per-token mapping shared across ALL V4 consumers:
@@ -4480,8 +4536,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             bufs[f"{p}cu_seqlens_q"] = CpuGpuBuffer(bs + 1, **i32)
 
             # V4 decode metadata buffers.
-            bufs[f"{p}v4_meta_state_slot_out"] = CpuGpuBuffer(bs, **i32)
-            bufs[f"{p}v4_meta_state_slot_in"] = CpuGpuBuffer(bs, **i32)
+            bufs.update(self._state_slot_buffers(bs, self.device, prefix=p))
             bufs[f"{p}v4_kv_indices_swa"] = torch.zeros(T_dec * win, **i32)
             bufs[f"{p}v4_kv_indices_csa"] = torch.zeros(
                 T_dec * (win + self.index_topk), **i32
@@ -4539,9 +4594,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """
         buf = self.model_runner.forward_vars[name]
         n = arr.shape[0] if arr.ndim > 0 else 1
-        assert (
-            n > 0
-        ), f"Cannot stage empty array for {name!r} — ensure the input array has at least one element."
         cap = buf.np.shape[0]
         assert n <= cap, (
             f"V4 buffer {name!r} too small: need {n}, have {cap}. "

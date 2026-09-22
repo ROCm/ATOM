@@ -24,6 +24,10 @@ KVConnectorFactory.register(
     scheduler_class="LMCacheOffloadConnectorScheduler",
     aliases=("LMCacheOffloadConnector", "LMCacheConnectorV1"),
     requires_pd_staging=False,
+    # The dense codec builds from `KVCacheTensor`s and ignores the region map;
+    # the hybrid, m3 and kimi_k3 layouts do read it, and which one applies comes
+    # from the model, so `topology_reads_block_regions` refines this by layout.
+    reads_block_regions=False,
 )
 
 KVConnectorFactory.register(

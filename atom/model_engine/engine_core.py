@@ -14,6 +14,7 @@ import zmq
 from atom.config import Config, ParallelConfig
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
+from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
@@ -43,11 +44,6 @@ from atom.utils.gc_utils import (
 )
 
 logger = logging.getLogger("atom")
-
-# How often each EngineCore publishes its metrics snapshot. Kept at the API
-# server's scrape interval: the exporter reads a cache, so this bounds how
-# stale a Prometheus sample can be.
-METRICS_PUSH_INTERVAL_S = 5.0
 
 # Pace of the idle KV drain. The busy loops never block, so an unpaced drain
 # would fire one worker RPC round per spin; 1ms matches the PP head's existing
@@ -259,7 +255,10 @@ class EngineCore:
         try:
             self.runner_mgr.call_func("exit")
         except Exception:
-            pass  # shared memory may already be freed
+            logger.debug(
+                "runner exit call failed; shared memory may already be freed",
+                exc_info=True,
+            )
         for proc in self.runner_mgr.procs:
             try:
                 alive = proc.is_alive()
@@ -319,9 +318,9 @@ class EngineCore:
             else:
                 engine = EngineCore(config, input_address, output_address)
             engine.busy_loop()
-        except Exception as e:
-            logger.error(f"run_engine: exception: {e}", exc_info=True)
-            raise e
+        except Exception:
+            logger.exception("run_engine failed")
+            raise
         finally:
             if engine is not None:
                 engine.exit()
@@ -339,13 +338,14 @@ class EngineCore:
 
     def busy_loop(self):
         shutdown = False
+        metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
         next_metrics_push = 0.0
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
                 now = time.monotonic()
                 if now >= next_metrics_push:
-                    next_metrics_push = now + METRICS_PUSH_INTERVAL_S
+                    next_metrics_push = now + metrics_interval
                     self.utility_handler.push_metrics()
                 self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
@@ -379,6 +379,15 @@ class EngineCore:
             except Exception:
                 logger.exception("KV event publish in engine-step finally failed")
 
+    def _release_multimodal_requests(self, sequences):
+        request_ids = [
+            seq.id for seq in sequences if getattr(seq, "cache_seed", -1) != -1
+        ]
+        if request_ids:
+            # Ordered after the completed forward on every worker, including
+            # final/aborted requests when there will be no subsequent batch.
+            self.runner_mgr.call_func("release_multimodal_requests", request_ids)
+
     def _process_engine_step_inner(self):
         result = self.scheduler.schedule()
 
@@ -388,6 +397,7 @@ class EngineCore:
         # the rejected seq will never produce.
         rejected = self.scheduler.take_rejected()
         if rejected:
+            self._release_multimodal_requests(rejected)
             self.output_queue.put_nowait(rejected)
 
         if result is None:
@@ -413,6 +423,7 @@ class EngineCore:
         has_seqs = len(scheduled_batch.req_ids) > 0
         if has_seqs:
             self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
+            self.scheduler.metrics.record_forward(scheduled_batch, seqs)
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
@@ -451,6 +462,7 @@ class EngineCore:
             pass
 
         if finished_seqs:
+            self._release_multimodal_requests(finished_seqs)
             self.output_queue.put_nowait(finished_seqs)
 
         return True
@@ -613,6 +625,7 @@ class EngineCore:
                 for sock, _ in poller.poll():
                     # (RequestType, RequestData)
                     obj = sock.recv(copy=False)
+                    received_at = time.perf_counter()
                     try:
                         request_type, reqs = pickle.loads(obj)
                     except Exception:
@@ -628,6 +641,8 @@ class EngineCore:
                         )
                         continue
                     if request_type == EngineCoreRequestType.ADD:
+                        for req in reqs:
+                            SchedulerMetrics.enqueue(req, received_at=received_at)
                         req_ids = [req.id for req in reqs]
                         logger.debug(
                             f"{self.label}: input get {request_type} {req_ids}"
@@ -760,13 +775,14 @@ class DPEngineCoreProc(EngineCore):
 
     def busy_loop(self):
         shutdown = False
+        metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
         next_metrics_push = 0.0
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
                 now = time.monotonic()
                 if now >= next_metrics_push:
-                    next_metrics_push = now + METRICS_PUSH_INTERVAL_S
+                    next_metrics_push = now + metrics_interval
                     self.utility_handler.push_metrics()
                 self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
@@ -924,7 +940,12 @@ class PrefillEngineCore(EngineCore):
         super().__init__(config, input_address, output_address)
         # Replace the base Scheduler created by EngineCore.__init__ with
         # PrefillScheduler, which has no BlockManager and only schedules
-        # sequences that already have a block_table from decode.
+        # sequences that already have a block_table from decode. The base
+        # Scheduler may have started a KV event publisher with bound sockets;
+        # prefill never publishes, so release it instead of leaking a thread
+        # and an endpoint for the life of the process.
+        if self.scheduler is not None:
+            self.scheduler.shutdown_kv_events()
         self.scheduler = PrefillScheduler(
             config, disagg_cu_shm_name=config.disagg_cu_shm_name
         )
@@ -1059,6 +1080,7 @@ class PrefillEngineCore(EngineCore):
             return False
 
         # Run on the dedicated prefill stream; returns sampled token IDs (one per seq).
+        self.scheduler.metrics.record_forward(scheduled_batch, seqs)
         t0 = time.perf_counter()
         sampled_token_ids = self.runner_mgr.call_func(
             "prefill_forward", scheduled_batch, wait_out=True
@@ -1101,8 +1123,8 @@ class PrefillEngineCore(EngineCore):
             engine = PrefillEngineCore(config, input_address, output_address)
             engine._init_disagg()
             engine.busy_loop()
-        except Exception as e:
-            logger.error(f"PrefillEngineCore.run_engine: exception: {e}", exc_info=True)
+        except Exception:
+            logger.exception("PrefillEngineCore.run_engine failed")
             raise
         finally:
             if engine is not None:
@@ -1114,11 +1136,11 @@ class PrefillEngineCore(EngineCore):
             if hasattr(self, "_bootstrap_push_sock"):
                 self._bootstrap_push_sock.close(linger=0)
         except Exception:
-            pass
+            logger.debug("bootstrap socket close failed", exc_info=True)
         try:
             self._disagg_ctx.destroy(linger=0)
         except Exception:
-            pass
+            logger.debug("disagg context destroy failed", exc_info=True)
 
 
 class DecodeEngineCore(EngineCore):
@@ -1177,7 +1199,7 @@ class DecodeEngineCore(EngineCore):
         config.num_kvcache_blocks = num_kvcache_blocks
 
         if not config.enforce_eager:
-            cap_cost, bs, pool_bytes = self.runner_mgr.call_func(
+            cap_cost, bs, _ = self.runner_mgr.call_func(
                 "capture_cudagraph", wait_out=True
             )
             logger.info(
@@ -1331,6 +1353,7 @@ class DecodeEngineCore(EngineCore):
         scheduled_batch, seqs = result
         if scheduled_batch is None:
             return False
+        self.scheduler.metrics.record_forward(scheduled_batch, seqs)
         t0 = time.perf_counter()
         fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
         iter_ms = (time.perf_counter() - t0) * 1000
@@ -1364,8 +1387,8 @@ class DecodeEngineCore(EngineCore):
             engine = DecodeEngineCore(config, input_address, output_address)
             engine._init_disagg()
             engine.busy_loop()
-        except Exception as e:
-            logger.error(f"DecodeEngineCore.run_engine: exception: {e}", exc_info=True)
+        except Exception:
+            logger.exception("DecodeEngineCore.run_engine failed")
             raise
         finally:
             if engine is not None:
@@ -1376,4 +1399,4 @@ class DecodeEngineCore(EngineCore):
         try:
             self._disagg_ctx.destroy(linger=0)
         except Exception:
-            pass
+            logger.debug("disagg context destroy failed", exc_info=True)

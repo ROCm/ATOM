@@ -155,6 +155,11 @@ class ConnectorCompletion:
 # token-contiguous, while producer preshuffled DSA index bytes require staging.
 MLA_KV_ROLE = "mla.kv"
 INDEX_CACHE_ROLE = "dsa.index_cache"
+# FP4 splits the DSv4 CSA indexer into two PAGE regions -- packed data and
+# e8m0 scales -- whose roles share this prefix. The names themselves are minted
+# by DeepseekV4AttentionMetadataBuilder._indexer_page_pools; a transport only
+# needs the prefix to tell the layout apart from the single-region FP8 one.
+INDEX_CACHE_FP4_PREFIX = "dsv4.csa_indexer.fp4_"
 # Producer gather callbacks need one staging slot per concurrent send worker.
 # Mooncake and attention-pool allocation share this fallback so their defaults
 # cannot drift independently.
@@ -500,16 +505,6 @@ class ConnectorMetadata:
         self.reqs_to_recv[request_id] = self._build_req_meta(
             request_id, local_block_ids, kv_transfer_params, local_swa_block_ids
         )
-
-
-def completion_req_key(completion: ConnectorCompletionId) -> str:
-    """Request identity shared by every shape a completion can take.
-
-    Offload reports ``SaveOperationId``/``LoadOperationId`` or a bare request
-    id; the send side and the scheduler only know requests. Pairing the two
-    means collapsing onto the request id first, or the lookup never hits.
-    """
-    return str(getattr(completion, "req_id", completion))
 
 
 #: Fallback for objects that are not `ConnectorMetadata` -- test doubles and

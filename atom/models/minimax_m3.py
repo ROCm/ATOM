@@ -12,27 +12,31 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from aiter.rotary_embedding import get_rope
+from torch import nn
+from transformers import PretrainedConfig
+
 from atom.config import Config, QuantizationConfig
-from atom.model_ops.base_attention import Attention
+from atom.distributed.indexer_cp import indexer_cp_enabled
+from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
+from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import (
     GemmaRMSNorm,
     fused_allreduce_gemma_rms_norm,
     fused_allreduce_gemma_rms_norm_quant,
 )
-from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.linear import (
-    MinimaxM3QKVParallelLinearWithIndexer,
     MergedColumnParallelLinear,
+    MinimaxM3QKVParallelLinearWithIndexer,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
-from atom.model_ops.moe import FusedMoE
 from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
+from atom.model_ops.moe import FusedMoE
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
 from atom.models.utils import (
@@ -43,8 +47,6 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.utils.decorators import support_torch_compile
-from torch import nn
-from transformers import PretrainedConfig
 
 
 def _get_text_config(config: PretrainedConfig) -> PretrainedConfig:
@@ -443,7 +445,18 @@ class MiniMaxM3SparseAttention(nn.Module):
                 f"{SPARSE_BLOCK_SIZE}, got {sparse_block_size}."
             )
         self.total_idx_heads = sparse_cfg["sparse_num_index_heads"]
-        self.num_idx_heads = self.num_kv_heads
+        # Indexer-only CP projects EVERY index head on every rank and shards the
+        # context instead, so the width is the full head count rather than this
+        # rank's kv-head share. `index_q_size` and the fused-qkv split in
+        # `forward` are both derived from this, so they follow with no edit --
+        # and they must: `aiter.fused_qknorm_idxrqknorm` finds index_q by offset
+        # inside `qkv`, so the wide tensor has to reach it intact.
+        #
+        # This is an __init__-time value, not a traced branch: `forward` closes
+        # over the resulting int exactly as it already does for TP2 vs TP4.
+        self.num_idx_heads = (
+            self.total_idx_heads if indexer_cp_enabled() else self.num_kv_heads
+        )
         self.idx_head_dim = sparse_cfg["sparse_index_dim"]
         self.index_q_size = self.num_idx_heads * self.idx_head_dim
         self.topk_blocks = sparse_cfg["sparse_topk_blocks"]

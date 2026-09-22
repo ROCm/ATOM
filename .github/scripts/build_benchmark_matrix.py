@@ -44,6 +44,7 @@ RESERVED_INPUTS = {
     "enable_rtl",
     "param_lists",
     "atom_commit",
+    "aiter_commit",
     "publish_to_dashboard",
 }
 

@@ -102,6 +102,8 @@ class GDNAttentionMetadata:
     # mapping the chunk kernel builds internally. Only computed when there are
     # checkpoints to place against it.
     ssm_chunk_offsets: torch.Tensor | None = None
+    # Qwen4Exp-only optional AITER schedule, built once outside the layer loop.
+    flydsl_prefill_metadata: object | None = None
     # --- ReplaySSM ---------------------------------------------------------
     # When enabled the recurrent state is NOT snapshotted per speculative
     # token, so `spec_state_indices_tensor` collapses to a single slot per
@@ -1421,7 +1423,6 @@ class GDNStateMixin(PoolRowsMixin):
 
 
 class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
-
     BACKEND: ClassVar[type[AiterBackend]] = GDNAttentionBackend
     reorder_batch_threshold: int = 1
     # `prepare_mtp_decode` below regenerates kv_indices and nothing else, so it

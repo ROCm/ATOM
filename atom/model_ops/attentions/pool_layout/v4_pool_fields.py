@@ -22,6 +22,17 @@ from atom.model_ops.attentions.pool_layout.entry_arena import EntryField
 MAIN_KV_NOPE = "dsv4.main_kv.nope"
 MAIN_KV_ROPE = "dsv4.main_kv.rope"
 
+# Rows per block that `deepgemm_fp8_paged_mqa_logits` requires to stay in its
+# preshuffled layout, which is the only layout it computes correctly -- with
+# `Preshuffle=False` it disagrees with the flat `fp8_mqa_logits` kernel by ~100%
+# at every block size, and aiter's assert guards only the preshuffle side. Any
+# cache that kernel pages over must therefore hold a multiple of this many rows
+# per block. Here rather than beside one of its enforcers, because there are
+# now several: a block size (`atom.config`), a pooled row count (Kimi/GLM) and
+# a CSA2 index plane all have to agree with it, and a layout declaration is
+# what all three can reach.
+MQA_LOGITS_PRESHUFFLE_ROWS = 16
+
 # Internal: FP8 keeps both regions in one pool and so has fewer PD roles than
 # it has regions, which is why those are spelled out where the pools are.
 CSA_INDEXER_DATA = "csa_indexer_data"

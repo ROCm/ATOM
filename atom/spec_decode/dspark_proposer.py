@@ -71,6 +71,7 @@ class DSparkProposer(Drafter):
             forward=self._block_backbone,
             epilogue=self._block_head,
             capture_epilogue=True,
+            capture_supported=self.model.supports_block_graph,
             inputs={
                 "anchor_ids": StagedInput(dtype=torch.int32),
                 "anchor_positions": StagedInput(dtype=torch.int64),
@@ -94,7 +95,7 @@ class DSparkProposer(Drafter):
         argued, and asserted, in `_init_block_persistent_buffers`.
         """
         fc = get_forward_context()
-        assert not fc.context.is_dummy_run, (
+        assert not fc.context.is_dummy_run or not self.model.supports_block_graph, (
             "warmup needs a real forward context; a dummy one has neither a "
             "populated rolling window nor any paged state"
         )
@@ -309,7 +310,12 @@ class DSparkProposer(Drafter):
             # V4: the draft is part of the target checkpoint and shares its
             # config wholesale, so it inherits the target's compilation level
             # and its `_DSparkInner` is compiled (see deepseek_v4_dspark.py).
-            model = model_class(self.config)
+            # The backbone's side stream, not one of the draft's own: the two
+            # never run at once, so a second handle would buy nothing. A draft
+            # whose layers do not fork simply ignores it.
+            model = model_class(
+                self.config, alt_stream=getattr(self.runner.model, "alt_stream", None)
+            )
             if envs.ATOM_DSPARK_DISABLE_COMPILE:
                 # Flip the decorator's own bypass rather than handing the draft a
                 # cloned config with NO_COMPILATION (what the with-draft branch
@@ -318,7 +324,7 @@ class DSparkProposer(Drafter):
                 # static_forward_context registry. This flag is read at the top of
                 # the decorator's __call__ (decorators.py:505), so it degrades to
                 # a plain self.forward(...) with no other side effects.
-                model.model.do_not_compile = True
+                getattr(model, "model", model).do_not_compile = True
                 logger.info("DSpark draft: torch.compile disabled by env.")
             return model
 
@@ -425,6 +431,7 @@ class DSparkProposer(Drafter):
             # for `final` so the caller does not cache a warmup-time guess.
             return from_config, False
         if bound.dtype != from_config:
+            layer_num = self.model.layers[0].self_attn.mla_attn.layer_num
             logger.warning(
                 "DSpark draft layer_%d is bound to a %s KV cache, but "
                 "--kv_cache_dtype=%s implies %s. Using the bound tensor's dtype "
@@ -455,8 +462,7 @@ class DSparkProposer(Drafter):
 
     # ---- aux-hidden-state ownership (declarative; base owns the hook machinery) ----
     def _aux_capture_spec(self, target_model: nn.Module) -> AuxCaptureSpec:
-        """DSpark taps the configured target layers and reconstructs each one's
-        post-layer hidden state. The base registers the forward hooks."""
+        """Resolve the draft's feature contract; the base owns capture buffers."""
         draft_cfg = self.speculative_config.draft_model_hf_config
         layer_ids = tuple(
             int(i) for i in getattr(draft_cfg, "dspark_target_layer_ids", ())
@@ -465,6 +471,9 @@ class DSparkProposer(Drafter):
             raise ValueError(
                 "DSpark requires dspark_target_layer_ids on the draft config."
             )
+        own = getattr(self.model, "target_aux_capture_spec", None)
+        if own is not None:
+            return own(layer_ids, self.config.hf_config.hidden_size)
         return AuxCaptureSpec(
             layer_ids=layer_ids,
             hidden_size=self.config.hf_config.hidden_size,
@@ -475,7 +484,7 @@ class DSparkProposer(Drafter):
     def _extract_layer_hidden(output, block: nn.Module):
         """Reconstruct a target layer's post-layer hidden state ``[N, dim]``.
 
-        Every DSpark draft is trained on the reference HF model's
+        Drafters using output capture are trained on the reference HF model's
         ``output.hidden_states[layer_id + 1]`` -- the plain residual stream after
         layer ``layer_id``. ATOM's targets do not hand that tensor back directly:
         each optimizes its residual bookkeeping differently, so the layer's
@@ -632,7 +641,6 @@ class DSparkProposer(Drafter):
         # Width-agnostic in the WEIGHTS, not in the OUTPUT: block attention is
         # bidirectional, so every draft token depends on T. Acceptance rates and
         # confidence calibration are not comparable across K.
-        window = int(self.model.window_size)
         num_draft = self.draft_tokens_per_seq
         # forward_spec sizes the block off anchor_ids. context.scheduled_bs counts
         # only one half of a mixed prefill+decode step, so it is not that B.
@@ -662,8 +670,8 @@ class DSparkProposer(Drafter):
         # position, so the write would land in another request's window. Here
         # and not inside the block: `run` may REPLAY, and then nothing in the
         # block's Python runs at all.
-        self.model.model.index_buffers(num_draft, window, self.device).mask_pad_tail(
-            self.runner.attn_metadata_builder.row_ids, scheduled_bs, running_bs
+        self.model.prepare_block(
+            self.runner.attn_metadata_builder, num_draft, scheduled_bs, running_bs
         )
         # The block pass is `[bs, T]` however the target ran, and
         # `pad_for_all_gather` reads `is_prefill` to pick which count below to

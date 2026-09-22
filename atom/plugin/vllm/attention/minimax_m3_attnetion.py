@@ -10,8 +10,6 @@ runtime below; dense layers use vLLM's Triton custom-op backend after applying
 MiniMax-M3's q/k norm + RoPE transform.
 """
 
-from typing import Optional
-
 import aiter
 import torch
 from aiter import dtypes
@@ -73,6 +71,40 @@ def minimax_m3_sparse_attention(
     layer._sparse_attn_run(qkv, positions, output)
 
 
+def _index_cache_torch_dtype(kv_cache_dtype: str, model_config) -> torch.dtype:
+    """Torch dtype for the MiniMax-M3 index cache.
+
+    Everything except fp8 is vLLM's own mapping. fp8 is the exception, and it
+    belongs here rather than in ``kv_cache_dtype_str_to_dtype``: that table is
+    vLLM's, it is shared by every layer of every model, and its ``fp8 ->
+    torch.uint8`` entry is deliberate -- vLLM's kernels take an fp8 KV cache as
+    a byte buffer and reinterpret it, and so do the aiter paged kernels behind
+    ATOM's main sparse and dense caches (see
+    ``_page16_shuffle_cache_for_sparse_kernel``, which does the ``.view()``
+    itself). Relabelling fp8 globally would change those caches too.
+
+    The index cache is read by a kernel that dispatches on the tensor instead:
+    ``_index_block_score_kernel`` branches on ``k.dtype.is_fp8()``, so a
+    uint8-labelled cache goes down the bf16 branch and dots bf16 against uint8
+    (a Triton compile error on the first request). The bytes there are already
+    fp8 -- aiter's ``fused_qknorm_idxrqknorm`` writes them under
+    ``kv_cache_dtype="fp8"`` -- so only the label was wrong. ``dtypes.d_dtypes``
+    is the same handle the native server resolves this cache through
+    (``atom.model_ops.attentions.aiter_attention._resolve_index_cache_dtype``),
+    which keeps the two paths on one arch-correct fp8 dtype instead of a
+    hard-coded ``torch.float8_e4m3fn``.
+
+    The element stays one byte either way, so vLLM's page-size accounting is
+    unchanged, and vLLM already allows a real fp8 dtype in this position -- its
+    own ``fp8_inc`` entry maps to ``torch.float8_e4m3fn``.
+    """
+    from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+
+    if str(kv_cache_dtype).startswith("fp8"):
+        return dtypes.d_dtypes["fp8"]
+    return kv_cache_dtype_str_to_dtype(kv_cache_dtype, model_config)
+
+
 class MiniMaxM3SparseIndexerCache(nn.Module, AttentionLayerBase):
     """Key-only index cache owned by MiniMax-M3 sparse attention."""
 
@@ -83,7 +115,6 @@ class MiniMaxM3SparseIndexerCache(nn.Module, AttentionLayerBase):
         head_dim: int,
         kv_cache_dtype: str,
     ) -> None:
-        from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
         from vllm.v1.attention.backend import AttentionType
 
         super().__init__()
@@ -94,7 +125,7 @@ class MiniMaxM3SparseIndexerCache(nn.Module, AttentionLayerBase):
         self.attn_type = AttentionType.DECODER
         self.attn_backend = SparseMHAIndexerBackend
         self.kv_cache_dtype = kv_cache_dtype
-        self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
+        self.kv_cache_torch_dtype = _index_cache_torch_dtype(
             kv_cache_dtype, vllm_config.model_config
         )
         self.num_kv_heads = 1
@@ -148,19 +179,19 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         head_dim: int,
         scale: float,
         num_kv_heads: int,
-        alibi_slopes: Optional[list[float]] = None,
+        alibi_slopes: list[float] | None = None,
         kv_cache_dtype: str = "bf16",
         layer_num: int = 0,
         use_mla: bool = False,
-        rotary_emb: Optional[nn.Module] = None,
-        prefix: Optional[str] = None,
-        q_norm: Optional[nn.Module] = None,
-        k_norm: Optional[nn.Module] = None,
+        rotary_emb: nn.Module | None = None,
+        prefix: str | None = None,
+        q_norm: nn.Module | None = None,
+        k_norm: nn.Module | None = None,
         cache_config=None,
         quant_config=None,
-        index_q_norm: Optional[nn.Module] = None,
-        index_k_norm: Optional[nn.Module] = None,
-        index_rotary_emb: Optional[nn.Module] = None,
+        index_q_norm: nn.Module | None = None,
+        index_k_norm: nn.Module | None = None,
+        index_rotary_emb: nn.Module | None = None,
         index_q_size: int = 0,
         index_head_dim: int = 0,
         topk: int = 0,
@@ -461,14 +492,14 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             self.index_q_norm.weight,
             self.index_k_norm.weight,
             self.num_idx_heads,
-            slot_mapping=main_metadata.slot_mapping,
+            slot_mapping=main_metadata.slot_mapping[:num_tokens],
             kv_cache_k=k_cache,
             kv_cache_v=v_cache,
             index_cache=self.index_cache_layer.kv_cache,
             block_size=k_cache.shape[3],
             q_out=q_out,
             index_q_out=index_q,
-            index_slot_mapping=index_metadata.slot_mapping,
+            index_slot_mapping=index_metadata.slot_mapping[:num_tokens],
             kv_cache_dtype=kv_cache_dtype,
             k_scale=k_scale if self.kv_cache_dtype == "fp8" else None,
             v_scale=v_scale if self.kv_cache_dtype == "fp8" else None,
@@ -746,8 +777,8 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
     def _forward_with_output(
         self,
         qkv: torch.Tensor,
-        positions: Optional[torch.Tensor] = None,
-        output: Optional[torch.Tensor] = None,
+        positions: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         main_metadata, index_metadata = self._metadata_for_layer()
         num_tokens = qkv.shape[0]
@@ -823,9 +854,9 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        positions: Optional[torch.Tensor] = None,
-        q_scale: Optional[torch.Tensor] = None,
-        qkv: Optional[torch.Tensor] = None,
+        positions: torch.Tensor | None = None,
+        q_scale: torch.Tensor | None = None,
+        qkv: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         del query, key, value, q_scale, kwargs
@@ -852,14 +883,14 @@ class MiniMaxM3DenseAttentionForVllm(nn.Module, AttentionLayerBase):
         head_dim: int,
         scale: float,
         num_kv_heads: int,
-        alibi_slopes: Optional[list[float]] = None,
+        alibi_slopes: list[float] | None = None,
         kv_cache_dtype: str = "bf16",
         layer_num: int = 0,
         use_mla: bool = False,
-        rotary_emb: Optional[nn.Module] = None,
-        prefix: Optional[str] = None,
-        q_norm: Optional[nn.Module] = None,
-        k_norm: Optional[nn.Module] = None,
+        rotary_emb: nn.Module | None = None,
+        prefix: str | None = None,
+        q_norm: nn.Module | None = None,
+        k_norm: nn.Module | None = None,
         cache_config=None,
         quant_config=None,
         **kwargs,
@@ -989,9 +1020,9 @@ class MiniMaxM3DenseAttentionForVllm(nn.Module, AttentionLayerBase):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        positions: Optional[torch.Tensor] = None,
-        q_scale: Optional[torch.Tensor] = None,
-        qkv: Optional[torch.Tensor] = None,
+        positions: torch.Tensor | None = None,
+        q_scale: torch.Tensor | None = None,
+        qkv: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         del query, key, value, q_scale, kwargs

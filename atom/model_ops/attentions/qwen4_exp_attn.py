@@ -23,14 +23,17 @@ The physical block size matches the scheduler's (`block_ratio == 1`), so each
 block table entry directly addresses a page in both main and index-key caches.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_ops.qwen4_exp.ops.qsa import qsa_compressed_slots
+from atom.model_ops.qwen4_exp.ops.qsa import (
+    qsa_compressed_slots,
+    qsa_draft_decode_metadata,
+)
 from atom.utils import CpuGpuBuffer
 
 from .gdn_attn import GDNAttentionBackend, GDNAttentionMetadataBuilder
@@ -63,27 +66,41 @@ class Qwen4ExpQSAMetadata:
     # so a short request does not pay for the whole engine context.
     max_seq_len: int
 
+    def for_tokens(self, num_tokens: int) -> "Qwen4ExpQSAMetadata":
+        """Draft step zero uses real rows, without the target graph's padding."""
+        if self.slot_mapping.numel() == num_tokens:
+            return self
+        return replace(
+            self,
+            slot_mapping=self.slot_mapping[:num_tokens],
+            compressed_slot_mapping=self.compressed_slot_mapping[:num_tokens],
+            token_to_req=self.token_to_req[:num_tokens],
+            logical_positions=self.logical_positions[:num_tokens],
+        )
+
 
 @dataclass
 class Qwen4ExpPLEMetadata:
     """Per-forward inputs for the single PLE layer."""
 
     query_start_loc: torch.Tensor  # [reqs + 1] int32
-    ngram_state: torch.Tensor  # [slots, ngram_size - 1] int64
+    ngram_state: torch.Tensor  # [slots, ngram_size - 1 + num_spec] int64
     state_indices_in: torch.Tensor  # [reqs] int32, slot the state is read from
     state_indices_out: torch.Tensor  # [reqs] int32, slot it is written to
     has_initial_state: torch.Tensor  # [reqs] bool
     conv_state: torch.Tensor  # [slots, channels, state_len] short-conv pool
+    num_accepted_tokens: torch.Tensor | None = None
 
 
 class Qwen4ExpBackend(GDNAttentionBackend):
     @staticmethod
     def validate_config(config) -> None:
         """Check the metadata and state layouts implemented by this backend."""
-        if config.speculative_config is not None:
-            # PLE updates one committed convolution state per request; it has
-            # no speculative-token rollback metadata.
-            raise ValueError("Qwen PLE state does not support speculative decoding")
+        if (
+            config.speculative_config is not None
+            and config.speculative_config.method != "mtp"
+        ):
+            raise ValueError("Qwen3.8-Flash-Next supports native MTP speculation only")
         if (
             config.enable_dp_attention
             or config.prefill_context_parallel_size > 1
@@ -129,6 +146,31 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
     """GDN hybrid plus the QSA side caches and the PLE state."""
 
     BACKEND = Qwen4ExpBackend
+
+    def _build_gdn_cache_tensor(self, module):
+        cache = super().build_kv_cache_tensor(module)
+        if hasattr(module, "base_linear_attention"):
+            from atom.model_ops.fla_ops.gdn_flydsl import select_policy
+            from atom.utils import envs
+
+            attention = module.impl
+            policy = select_policy(
+                allowed=attention.allow_aiter_flydsl,
+                replayssm=self.replayssm,
+                lossy_decode=envs.ATOM_ENABLE_GDN_DECODE_LOSSY_FAST,
+                state=cache.v_cache,
+                activation_dtype=attention.dt_bias.dtype,
+            )
+            attention.gdn_flydsl_policy = policy
+            self._flydsl_prefill_enabled = (
+                getattr(self, "_flydsl_prefill_enabled", False) or policy.prefill
+            )
+            if policy.decode:
+                # Physical VK storage, exposed as a logical KV view. This is
+                # zero-copy and preserves all gather/scatter/fork interfaces.
+                # Triton fallback and checkpoint stores honor the inner strides.
+                cache.v_cache = cache.v_cache.transpose(-1, -2)
+        return cache
 
     def __init__(self, model_runner, **kwargs):
         super().__init__(model_runner=model_runner, **kwargs)
@@ -246,9 +288,9 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             return None
         state_len, channels = self._ple_state_shape()
         entry = state_len * channels * self.model_runner.config.torch_dtype.itemsize
-        entry += (int(hf.ngram_size) - 1) * torch.int64.itemsize
+        entry += (int(hf.ngram_size) - 1 + self.num_spec) * torch.int64.itemsize
         return state_pool(
-            PLE_STATE_SLOT_CLASS, entry, entries_per_req=1 + self.num_spec
+            PLE_STATE_SLOT_CLASS, entry, entries_per_req=self.slots_per_req()
         )
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
@@ -328,7 +370,10 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             device="cuda",
         )
         caches["ple_ngram_state"] = torch.full(
-            (entries.get(PLE_STATE_SLOT_CLASS, 0), self.ngram_context_len),
+            (
+                entries.get(PLE_STATE_SLOT_CLASS, 0),
+                self.ngram_context_len + self.num_spec,
+            ),
             self.eos_token_id,
             dtype=torch.int64,
             device="cuda",
@@ -351,7 +396,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
     def build_kv_cache_tensor(self, module):
         """Bind the three caches a QSA layer owns; defer everything else."""
         if not getattr(module, "is_qsa_attention", False):
-            return super().build_kv_cache_tensor(module)
+            return self._build_gdn_cache_tensor(module)
 
         from atom.config import KVCacheTensor
 
@@ -444,7 +489,14 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         Metadata without a separate read-side tensor denotes an in-place
         update; otherwise PLE must preserve the supplied fork source.
         """
-        if gdn is None or gdn.non_spec_state_indices_tensor is None:
+        if gdn is None:
+            return None
+        if gdn.spec_state_indices_tensor is not None:
+            # Like GDN's convolution, PLE retains the candidate tail in slot 0
+            # and selects the accepted window on the next verification pass.
+            slots = gdn.spec_state_indices_tensor[:, 0]
+            return slots, slots
+        if gdn.non_spec_state_indices_tensor is None:
             return None
         source = gdn.non_spec_state_indices_in_tensor
         if source is None:
@@ -488,6 +540,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
                 "ple_has_initial_state"
             ].copy_to_gpu(num_reqs),
             conv_state=conv_state,
+            num_accepted_tokens=attn_metadata.gdn_metadata.num_accepted_tokens,
         )
 
     def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
@@ -507,6 +560,16 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             return attn_metadata, positions
 
         query_lens = np.asarray(batch.num_scheduled_tokens[:num_reqs], dtype=np.int64)
+        if (
+            attn_metadata.gdn_metadata is not None
+            and getattr(self, "_flydsl_prefill_enabled", False)
+            and not self.replayssm
+        ):
+            from atom.model_ops.fla_ops.gdn_flydsl import build_prefill_metadata
+
+            attn_metadata.gdn_metadata.flydsl_prefill_metadata = build_prefill_metadata(
+                query_lens, attn_metadata.gdn_metadata.non_spec_query_start_loc
+            )
         attn_metadata.qsa_metadata = self._build_qsa_metadata(
             attn_metadata, num_reqs, num_tokens, query_lens, num_tokens
         )
@@ -528,6 +591,15 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         attn_metadata, positions = super().prepare_decode(
             batch, running_bs, running_tokens, max_seqlen_q
         )
+        if positions.ndim == 2 and positions.shape[-1] < running_tokens:
+            # A captured mRoPE view uses the padded token count as its axis
+            # stride. Preserve that layout even when fewer rows are scheduled.
+            real_tokens = positions.shape[-1]
+            real_positions = self._mrope_cpu_view(real_tokens).copy()
+            padded_positions = self._mrope_cpu_view(running_tokens)
+            padded_positions.fill(0)
+            padded_positions[:, :real_tokens] = real_positions
+            positions = self._copy_mrope_to_gpu(running_tokens)[:, :real_tokens]
         bs = running_bs
         query_len = attn_metadata.max_seqlen_q
         num_tokens = running_tokens
@@ -544,11 +616,6 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             # replay; prefill still narrows it to the batch it actually sees.
             max_seq_len=self.model_runner.config.max_model_len,
         )
-        if query_len != 1:
-            raise NotImplementedError(
-                "Qwen3.8-Flash-Next PLE decode assumes one token per request; "
-                "speculative decode is not wired up yet"
-            )
         attn_metadata.ple_metadata = self._build_ple_metadata(
             batch,
             attn_metadata,
@@ -556,6 +623,52 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             is_prefill=False,
         )
         return attn_metadata, positions
+
+    def prepare_mtp_decode(
+        self,
+        bs: int,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        positions: torch.Tensor,
+        only_update: bool = False,
+        num_reject_tokens: torch.Tensor | None = None,
+    ) -> dict:
+        """Move the draft's paged QSA view to the accepted sequence tail."""
+        running_bs = positions.shape[-1]
+        var = self.model_runner.forward_vars
+        slots = var["slot_mapping"].gpu[:running_bs]
+        if getattr(self, "qsa_arena", None) is None:
+            # Allocation profiling runs all draft steps before the pools exist.
+            return {"slot_mapping": slots, "qsa_metadata": None}
+        logical = var["qsa_logical_positions"].gpu[:running_bs]
+        req_ids = var["qsa_token_to_req"].gpu[:running_bs]
+        compressed = var["qsa_compressed_slots"][:running_bs]
+        lengths = var["context_lens"].gpu[:running_bs]
+        tables = var["block_tables"].gpu[:running_bs]
+        qsa_draft_decode_metadata(
+            lengths,
+            tables,
+            num_reject_tokens,
+            slots,
+            logical,
+            req_ids,
+            compressed,
+            bs,
+            self.block_size,
+            self._compress_ratio,
+        )
+        return {
+            "slot_mapping": slots,
+            "qsa_metadata": Qwen4ExpQSAMetadata(
+                tables,
+                slots,
+                compressed,
+                req_ids,
+                logical,
+                lengths,
+                self.model_runner.config.max_model_len,
+            ),
+        }
 
     def build_for_cudagraph_capture(self, bs: int):
         """Decode-graph metadata pointing at the same buffers replay writes.
@@ -574,9 +687,19 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         ):
             indices.np[:bs] = np.arange(bs, dtype=np.int32)
             indices.copy_to_gpu(bs)
+        if self.use_spec_decode:
+            slots = self.spec_state_indices_tensor
+            slots.np[:bs] = np.arange(bs * slots.np.shape[1]).reshape(bs, -1)
+            if self.replayssm:
+                slots.np[:bs] = np.arange(bs)[:, None]
+            slots.copy_to_gpu(bs)
         attn_metadata, context = super().build_for_cudagraph_capture(bs)
         runner = self.model_runner
         num_tokens = bs * int(attn_metadata.max_seqlen_q)
+        attn_metadata.slot_mapping = runner.forward_vars["slot_mapping"].gpu[
+            :num_tokens
+        ]
+        context.positions = runner.forward_vars["positions"].copy_to_gpu(num_tokens)
 
         attn_metadata.qsa_metadata = self._build_qsa_metadata(
             attn_metadata,
@@ -603,5 +726,6 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
                 "ple_has_initial_state"
             ].copy_to_gpu(bs),
             conv_state=conv_state,
+            num_accepted_tokens=attn_metadata.gdn_metadata.num_accepted_tokens,
         )
         return attn_metadata, context

@@ -88,8 +88,10 @@ Key entry points:
 | Serving & benchmarking | `docs/serving_benchmarking_guide.md` |
 | Configuration | `docs/configuration_guide.md` |
 | Distributed | `docs/distributed_guide.md` |
+| Metrics & observability | `docs/metrics_guide.md` |
 | CI/PR workflow | `/ci-pr-guide` |
 | Performance benchmark | `/benchmark-guide` |
 | Debugging | `/debug-guide` |
 | Adding a model | `/add-model` |
 | MiniMax-H3 (video+audio diffusion) | `recipes/MiniMax-H3.md` |
+| DeepSeek-V4.1-Flash | `recipes/DeepSeek-V4.1-Flash.md` |

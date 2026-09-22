@@ -26,7 +26,132 @@ Source provenance:
 import torch
 import triton
 import triton.language as tl
+from aiter.jit.utils.chip_info import get_cu_num
 from aiter.ops.topk import top_k_per_row_prefill
+
+
+def _prev_pow2(n: int) -> int:
+    if n < 1:
+        return 1
+    return 1 << (n.bit_length() - 1)
+
+
+def _kv_splits_heuristic(
+    T: int,
+    kv_heads: int,
+    topk: int,
+    num_cu: int | None = None,
+    target_wg_per_cu: float = 4.0,
+    max_kv_splits: int = 64,
+) -> int:
+    if topk < 512:
+        return 1
+    if num_cu is None:
+        num_cu = get_cu_num()
+    target_wg = max(1, int(target_wg_per_cu * num_cu))
+    base_ctas = max(1, T * kv_heads)
+    if base_ctas >= target_wg:
+        return 1
+    return _prev_pow2(min(target_wg // base_ctas, max_kv_splits))
+
+
+def _kernel_config(
+    T: int,
+    kv_heads: int,
+    kv_splits: int,
+    group_size: int,
+    num_cu: int | None = None,
+) -> tuple[int, int, int, int, int]:
+    """Pick (BLOCK_N, num_warps, num_stages, waves_per_eu, sub_group).
+
+    When ``group_size`` exceeds 16, large grids split Q heads into
+    sub-groups of 8 to shrink the per-CTA accumulator.  Small grids keep
+    the full group for maximum per-CTA throughput.
+
+    ``waves_per_eu`` hints the register allocator to keep VGPR usage low
+    enough for the target occupancy.
+    """
+    if num_cu is None:
+        num_cu = get_cu_num()
+    sub_group = group_size
+    if group_size > 16:
+        sub_group = 8
+    num_head_groups = (group_size + sub_group - 1) // sub_group
+    grid_size = T * kv_heads * num_head_groups * kv_splits
+    if grid_size <= num_cu:
+        return 64, 4, 1, 0, group_size
+    if grid_size >= num_cu * 8:
+        return 32, 2, 1, 0, sub_group
+    return 32, 4, 1, 3, sub_group
+
+
+@triton.jit
+def _draft_decode_metadata(
+    Lengths,
+    Tables,
+    Reject,
+    Slots,
+    Positions,
+    Requests,
+    Compressed,
+    N: tl.constexpr,
+    REAL: tl.constexpr,
+    TS: tl.constexpr,
+    PAGE: tl.constexpr,
+    RATIO: tl.constexpr,
+    HAS_REJECT: tl.constexpr,
+    B: tl.constexpr,
+):
+    req = tl.program_id(0) * B + tl.arange(0, B)
+    live = req < REAL
+    length = tl.load(Lengths + req, req < N, 0)
+    if HAS_REJECT:
+        length -= tl.load(Reject + req, live, 0)
+    length = tl.where(live, length, 0)
+    pos = length - 1
+    valid = live & (pos >= 0)
+    page = tl.load(Tables + req * TS + pos // PAGE, valid, 0)
+    slot = tl.where(valid, page.to(tl.int64) * PAGE + pos % PAGE, -1)
+    tl.store(Lengths + req, length, req < N)
+    tl.store(Positions + req, pos, req < N)
+    tl.store(Requests + req, tl.where(live, req, -1), req < N)
+    tl.store(Slots + req, slot, req < N)
+    tl.store(
+        Compressed + req,
+        tl.where(valid & (length % RATIO == 0), slot // RATIO, -1),
+        req < N,
+    )
+
+
+def qsa_draft_decode_metadata(
+    lengths: torch.Tensor,
+    tables: torch.Tensor,
+    rejected: torch.Tensor | None,
+    slots: torch.Tensor,
+    positions: torch.Tensor,
+    requests: torch.Tensor,
+    compressed: torch.Tensor,
+    real_requests: int,
+    block_size: int,
+    compress_ratio: int,
+) -> None:
+    """Update draft lengths and physical write slots after verification."""
+    _draft_decode_metadata[(triton.cdiv(lengths.numel(), 128),)](
+        lengths,
+        tables,
+        rejected,
+        slots,
+        positions,
+        requests,
+        compressed,
+        lengths.numel(),
+        real_requests,
+        tables.stride(0),
+        block_size,
+        compress_ratio,
+        rejected is not None,
+        128,
+    )
 
 
 @triton.jit
@@ -334,6 +459,7 @@ def _qsa_compress_groups_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
     LOAD_POSITIONS: tl.constexpr,
+    ROPE_POSITION_OFFSET: tl.constexpr,
 ) -> None:
     """Mean-pool the group that ends at each token, reading the paged raw cache."""
     row = tl.program_id(0)
@@ -413,7 +539,7 @@ def _qsa_compress_groups_kernel(
             mask=(row < num_rows) & (axes < 3),
         )
     else:
-        first_position = tl.where(valid_row, first_position, 0)
+        first_position = tl.where(valid_row, first_position + ROPE_POSITION_OFFSET, 0)
         tl.store(
             first_positions_ptr + row * stride_first_row + axes * stride_first_axis,
             first_position,
@@ -429,6 +555,7 @@ def qsa_compress_groups(
     compressed_slots: torch.Tensor,
     compress_ratio: int,
     position_cache: torch.Tensor | None = None,
+    rope_position_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pool the group closed by each token; return `(pooled, first_positions)`.
 
@@ -437,6 +564,8 @@ def qsa_compress_groups(
     the same mapping, so junk rows are never written. `first_positions` is
     `[rows, 3]` int64 -- three identical linear positions for a text model, the
     cached mRoPE axes when `position_cache` is supplied.
+    Without that cache, `rope_position_offset` shifts only RoPE coordinates,
+    not the logical positions used to address and group keys.
     """
     if raw_key_cache.ndim != 4 or raw_key_cache.shape[2] != 1:
         raise ValueError("raw_key_cache must be [pages, page_size, 1, head_dim]")
@@ -492,6 +621,7 @@ def qsa_compress_groups(
         HEAD_DIM=head_dim,
         BLOCK_D=triton.next_power_of_2(head_dim),
         LOAD_POSITIONS=load_positions,
+        ROPE_POSITION_OFFSET=0 if load_positions else rope_position_offset,
         num_warps=4,
     )
     return pooled, first_positions
@@ -918,6 +1048,9 @@ def qsa_select_paged_tokens(
             logits.stride(0),
             logits.stride(1),
             block_topk,
+            # Equal index scores must choose the same keys and ordering in
+            # single-token decode and multi-token verification.
+            stable=True,
         )
         qsa_expand_block_indices(
             selected_groups,
@@ -976,15 +1109,17 @@ def _qsa_sparse_paged_gqa_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     KV_SPLITS: tl.constexpr = 1,
+    SUB_GROUP: tl.constexpr = 0,
 ) -> None:
     """Apply GQA over arbitrary logical tokens in separate paged BF16 K/V."""
     token = tl.program_id(0)
-    kv_head = tl.program_id(1)
     part = tl.program_id(2)
+    ACTIVE_SUB: tl.constexpr = SUB_GROUP if SUB_GROUP > 0 else GROUP_SIZE
+    NUM_HEAD_GROUPS: tl.constexpr = (GROUP_SIZE + ACTIVE_SUB - 1) // ACTIVE_SUB
+    kv_head = tl.program_id(1) // NUM_HEAD_GROUPS
+    head_group = tl.program_id(1) % NUM_HEAD_GROUPS
     if KV_SPLITS > 1:  # noqa: SIM102 -- compile-time guard for widths_ptr=None
-        if kv_head == 0 and part == 0:
-            # Reduction needs each query's selection width. Write it alongside
-            # the partial results to avoid a separate initialization kernel.
+        if tl.program_id(1) == 0 and part == 0:
             tl.store(widths_ptr + token, TOPK)
     request = tl.load(token_to_request_ptr + token)
     request_valid = (request >= 0) & (request < num_requests)
@@ -992,13 +1127,13 @@ def _qsa_sparse_paged_gqa_kernel(
 
     head_offsets = tl.arange(0, BLOCK_M)
     dim_offsets = tl.arange(0, BLOCK_D)
-    first_q_head = kv_head * GROUP_SIZE
+    first_q_head = kv_head * GROUP_SIZE + head_group * ACTIVE_SUB
     query = tl.load(
         q_ptr
         + token * stride_q_token
         + (first_q_head + head_offsets[:, None]) * stride_q_head
         + dim_offsets[None, :] * stride_q_dim,
-        mask=(head_offsets[:, None] < GROUP_SIZE) & (dim_offsets[None, :] < HEAD_DIM),
+        mask=(head_offsets[:, None] < ACTIVE_SUB) & (dim_offsets[None, :] < HEAD_DIM),
         other=0.0,
     )
     query = (query * softmax_scale * 1.4426950408889634).to(query.dtype)
@@ -1009,6 +1144,8 @@ def _qsa_sparse_paged_gqa_kernel(
     column_offsets = tl.arange(0, BLOCK_N)
 
     partition_size = tl.cdiv(TOPK, KV_SPLITS * BLOCK_N) * BLOCK_N
+    if part * partition_size >= TOPK:
+        return
     for start in tl.range(
         part * partition_size, tl.minimum((part + 1) * partition_size, TOPK), BLOCK_N
     ):
@@ -1047,6 +1184,7 @@ def _qsa_sparse_paged_gqa_kernel(
             + dim_offsets[:, None] * stride_k_dim,
             mask=(dim_offsets[:, None] < HEAD_DIM) & valid[None, :],
             other=0.0,
+            cache_modifier=".cg",
         )
         values = tl.load(
             v_cache_ptr
@@ -1056,6 +1194,7 @@ def _qsa_sparse_paged_gqa_kernel(
             + dim_offsets[None, :] * stride_v_dim,
             mask=valid[:, None] & (dim_offsets[None, :] < HEAD_DIM),
             other=0.0,
+            cache_modifier=".cg",
         )
 
         scores = tl.where(valid[None, :], tl.dot(query, keys), -1.0e20)
@@ -1081,10 +1220,10 @@ def _qsa_sparse_paged_gqa_kernel(
             token * NUM_KV_HEADS * GROUP_SIZE + first_q_head + head_offsets
         ) * KV_SPLITS + part
         tl.store(
-            partial_max_ptr + partial_offset, running_max, head_offsets < GROUP_SIZE
+            partial_max_ptr + partial_offset, running_max, head_offsets < ACTIVE_SUB
         )
         tl.store(
-            partial_sum_ptr + partial_offset, running_sum, head_offsets < GROUP_SIZE
+            partial_sum_ptr + partial_offset, running_sum, head_offsets < ACTIVE_SUB
         )
         output_ptr += part * HEAD_DIM
         output = accumulator
@@ -1101,7 +1240,7 @@ def _qsa_sparse_paged_gqa_kernel(
         + dim_offsets[None, :] * stride_output_dim,
         output,
         mask=(token < num_tokens)
-        & (head_offsets[:, None] < GROUP_SIZE)
+        & (head_offsets[:, None] < ACTIVE_SUB)
         & (dim_offsets[None, :] < HEAD_DIM),
     )
 
@@ -1115,6 +1254,7 @@ def qsa_sparse_paged_gqa(
     token_to_request: torch.Tensor,
     softmax_scale: float | None = None,
     kv_splits: int | None = None,
+    num_decode_requests: int | None = None,
 ) -> torch.Tensor:
     """Grouped-query attention restricted to `logical_indices` (-1 = padding)."""
     if q.ndim != 3:
@@ -1147,21 +1287,21 @@ def qsa_sparse_paged_gqa(
         return out
 
     group_size = q.shape[1] // k_cache.shape[2]
-    block_m = max(16, triton.next_power_of_2(group_size))
     block_d = max(16, triton.next_power_of_2(q.shape[2]))
-    block_n = 32
     if kv_splits is None:
-        # Small decode batches otherwise expose as little as one CTA/layer.
-        kv_splits = (
-            min(
-                16,
-                triton.next_power_of_2(triton.cdiv(512, q.shape[0] * k_cache.shape[2])),
-            )
-            if logical_indices.shape[1] >= 512
-            else 1
+        split_rows = q.shape[0]
+        if split_rows <= 0:
+            raise ValueError("num_decode_requests must be positive")
+        kv_splits = _kv_splits_heuristic(
+            split_rows, k_cache.shape[2], logical_indices.shape[1]
         )
     if kv_splits < 1 or kv_splits & (kv_splits - 1):
         raise ValueError("kv_splits must be a positive power of two")
+    block_n, num_warps, num_stages, waves_per_eu, sub_group = _kernel_config(
+        q.shape[0], k_cache.shape[2], kv_splits, group_size
+    )
+    num_head_groups = (group_size + sub_group - 1) // sub_group
+    block_m = max(16, triton.next_power_of_2(sub_group))
     if logical_indices.shape[1] == 0:
         # Empty selections produce zero attention output; skip split reduction.
         return out.zero_()
@@ -1174,7 +1314,8 @@ def qsa_sparse_paged_gqa(
         partial_sum = torch.empty_like(partial_max)
         target = torch.empty((*shape, q.shape[2]), device=q.device, dtype=torch.float32)
         widths = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
-    _qsa_sparse_paged_gqa_kernel[(q.shape[0], k_cache.shape[2], kv_splits)](
+    grid_y = k_cache.shape[2] * num_head_groups
+    _qsa_sparse_paged_gqa_kernel[(q.shape[0], grid_y, kv_splits)](
         q,
         k_cache,
         v_cache,
@@ -1217,8 +1358,10 @@ def qsa_sparse_paged_gqa(
         BLOCK_N=block_n,
         BLOCK_D=block_d,
         KV_SPLITS=kv_splits,
-        num_warps=4,
-        num_stages=2,
+        SUB_GROUP=sub_group if sub_group < group_size else 0,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        waves_per_eu=waves_per_eu,
     )
     if kv_splits > 1:
         from aiter.ops.triton._triton_kernels.attention.mla import (

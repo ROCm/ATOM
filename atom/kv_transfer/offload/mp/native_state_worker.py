@@ -89,6 +89,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         self._restore_stream = None
         self._restore_descriptor_slots: list[int] = []
         self._max_pending_saves = max_pending_saves(
+            getattr(config, "kv_transfer_config", {}) or {},
             int(os.environ.get("OFFLOAD_COPY_WORKERS", "1"))
         )
 

@@ -100,6 +100,7 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
                     "hash blocks"
                 )
             self._max_pending_saves = max_pending_saves(
+                getattr(self._config, "kv_transfer_config", {}) or {},
                 int(os.environ.get("OFFLOAD_COPY_WORKERS", "1") or 1)
             )
             self._image_reservation_bytes = (

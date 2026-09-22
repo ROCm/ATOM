@@ -42,8 +42,17 @@ def _make_block_stored(
     parent: int | None,
     block_size: int,
     medium: str = MEDIUM_GPU,
+    token_offset: int | None = None,
 ) -> BlockStored:
-    """Construct a BlockStored event from a coalesced run of new blocks."""
+    """Construct a BlockStored event from a coalesced run of new blocks.
+
+    `token_offset` is the sequence position of the first token of the run's
+    first block, so consumers can map block i to
+    `[token_offset + i*block_size, token_offset + (i+1)*block_size)`.
+    `block_size` here is the hash block size (block_size * dcp_world_size),
+    the span of one block-table entry in global tokens, so the offset must be
+    computed in the same unit.
+    """
     # A list, not the `array("i")` the publish paths carry: the event is
     # msgpack-encoded and msgspec has no encoding for an array. The publisher
     # counts encode failures rather than raising, so an array here takes the
@@ -57,6 +66,7 @@ def _make_block_stored(
         token_ids=tokens,
         block_size=block_size,
         medium=medium,
+        token_offset=token_offset,
     )
 
 
@@ -856,7 +866,7 @@ class BlockManager:
         caller's loop variable holds a hash that is not in the chain.
         """
         chain = list(block_hashes)
-        h = chain[-1] if chain else -1
+        h = chain[-1] if chain else seq.cache_seed
         for i in range(len(chain), blocks):
             h = self.compute_hash(self._hash_block_tokens(seq, i), h)
             chain.append(h)
@@ -898,7 +908,7 @@ class BlockManager:
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
         # read the WHOLE history, so this stays a full front-to-back chained
         # match). Record each block's hash for the SWA scan below.
-        h = -1
+        h = seq.cache_seed
         compressed_hit = 0
         block_hashes: list[int] = []
         for i in range(self._n_hash_blocks(seq) - 1):
@@ -1016,7 +1026,7 @@ class BlockManager:
             num_cached_blocks,
             int(seq.offload_joint.claim_tokens or 0) // hbs,
         )
-        h = -1
+        h = seq.cache_seed
         hit_hash = -1
         for i in range(claim_blocks):
             token_ids = self._hash_block_tokens(seq, i)
@@ -1562,7 +1572,7 @@ class BlockManager:
         source-level bug; callers skip the range rather than mint false hashes.
         """
         if start <= 0:
-            return -1
+            return seq.cache_seed
         h = self.kv.block(seq.block_table[start - 1]).hash
         if h != -1:
             return h
@@ -1635,7 +1645,8 @@ class BlockManager:
                     store_run_hashes,
                     store_run_tokens,
                     store_run_parent,
-                    self.hash_block_size,
+                    hbs,
+                    token_offset=start * hbs,
                 )
             )
         pos = base + num_new_tokens
@@ -2413,7 +2424,8 @@ class BlockManager:
                             # into a list already. See `_make_block_stored`.
                             list(token_ids),
                             parent_hash if parent_hash != -1 else None,
-                            self.hash_block_size,
+                            hbs,
+                            token_offset=i * hbs,
                         )
                     )
 
@@ -2696,11 +2708,14 @@ class BlockManager:
         block_hashes: list[int],
         token_ids: list[int],
         parent_block_hash: int | None = None,
+        token_offset: int | None = None,
     ) -> None:
         """Emit a BlockStored(medium=REMOTE) for blocks received from a remote
         KV transfer producer (Mooncake/MoriIO decode side). Called by the
         KVConnector worker once the transfer completes so external KV-cache
-        consumers (LMCache, etc.) can track remote-resident blocks."""
+        consumers (LMCache, etc.) can track remote-resident blocks.
+
+        `token_offset` is the sequence position of the first remote block."""
         if self._event_log is None or not block_hashes:
             return
         self._event_log.append(
@@ -2710,5 +2725,6 @@ class BlockManager:
                 parent_block_hash,
                 self.hash_block_size,
                 medium=MEDIUM_REMOTE,
+                token_offset=token_offset,
             )
         )

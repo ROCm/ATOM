@@ -78,6 +78,7 @@ class DraftGraph:
     forward: Callable[..., Any]  # (running_bs, **staged) -> Any
     epilogue: Callable[..., Any] | None = None  # (fwd_out, running_bs, **staged)
     capture_epilogue: bool = False
+    capture_supported: bool = True
     inputs: "Mapping[str, StagedInput]" = field(default_factory=dict)
     warmup_inputs: Callable[..., None] | None = None
 
@@ -118,9 +119,8 @@ class DraftGraph:
 
     @property
     def will_capture(self) -> bool:
-        """Whether warmup also captures. The name `envs.ATOM_DRAFT_CUDAGRAPH`
-        points at, and the only thing that decides it."""
-        return envs.ATOM_DRAFT_CUDAGRAPH
+        """Capture only a supported pass when the deployment enables it."""
+        return self.capture_supported and envs.ATOM_DRAFT_CUDAGRAPH
 
     def label(self, scheduled_bs: int, running_bs: int) -> str:
         """``bs=<scheduled>/<running>``, plus ``graph`` when this step replays.
@@ -225,6 +225,25 @@ class DraftGraph:
         context, and this pass is that shape whatever the target just did.
         """
         return running_bs in self._cuda_graphs
+
+    def release_graphs(self) -> int:
+        """Drop every recording, so what it captured can be freed.
+
+        A draft pass WRITES the KV it attends, so its recording holds the base
+        of the pool exactly the way a decode graph does: a sleep that frees the
+        pool has to drop these too, or the first replay after the wake reads a
+        pool that has since been reallocated. `is_captured` answers False
+        afterwards, so `run` calls the pass directly until the next warmup
+        records it again -- which `capture_cudagraph` ends in on both the manual
+        and the piecewise path.
+
+        The staged `_buffers` stay: they are ordinary allocations, sized once at
+        `bind` for the very reason that a capture must not be the thing that
+        allocates them.
+        """
+        dropped = len(self._cuda_graphs)
+        self._cuda_graphs.clear()
+        return dropped
 
     @property
     def _to_capture(self) -> Callable[..., Any]:

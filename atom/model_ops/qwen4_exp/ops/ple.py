@@ -18,11 +18,16 @@ def _advance_ngram_state_kernel(
     Out,
     Has,
     Context,
+    Accepted,
     stride_ids,
     stride_starts,
     stride_state_slot,
     stride_state_col,
+    stride_in,
+    stride_out,
     WIDTH: tl.constexpr,
+    CAPACITY: tl.constexpr,
+    SPEC: tl.constexpr,
     EOS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -30,24 +35,32 @@ def _advance_ngram_state_kernel(
     j = tl.arange(0, BLOCK)
     start = tl.load(Starts + req * stride_starts)
     end = tl.load(Starts + (req + 1) * stride_starts)
-    src, dst = tl.load(In + req), tl.load(Out + req)
-    valid = (dst >= 0) & (end > start) & (j < WIDTH)
+    src = tl.load(In + req * stride_in)
+    dst = tl.load(Out + req * stride_out)
+    valid = (dst >= 0) & (end > start)
     has = tl.load(Has + req) & (src >= 0)
+    offset = tl.load(Accepted + req) - 1 if SPEC else 0
     past = tl.load(
-        State + src * stride_state_slot + j * stride_state_col,
-        valid & has,
+        State + src * stride_state_slot + (offset + j) * stride_state_col,
+        valid & has & (j < WIDTH),
         EOS,
     )
     tl.store(Context + req * WIDTH + j, past, j < WIDTH)
-    position = end - WIDTH + j
-    token = tl.load(Ids + position * stride_ids, valid & (position >= start), EOS)
+    # After verification, retain the history after the anchor plus every
+    # candidate. The next call selects the accepted prefix's window in-place.
+    position = (start + 1 if SPEC else end) - WIDTH + j
+    token = tl.load(
+        Ids + position * stride_ids,
+        valid & (j < CAPACITY) & (position >= start) & (position < end),
+        EOS,
+    )
     # Snapshot the whole old window before updating an in-place slot. A short
     # chunk carries its oldest surviving tokens; a long one replaces it all.
-    carried = tl.gather(past, tl.minimum(end - start + j, WIDTH - 1), axis=0)
+    carried = tl.gather(past, tl.minimum(WIDTH + position - start, WIDTH - 1), axis=0)
     tl.store(
         State + dst * stride_state_slot + j * stride_state_col,
         tl.where(position >= start, token, carried),
-        valid,
+        valid & (j < CAPACITY),
     )
 
 
@@ -59,6 +72,8 @@ def advance_ngram_state(
     state_indices_out: torch.Tensor,
     has_initial_state: torch.Tensor,
     eos_token_id: int,
+    history_width: int | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Read each request's context and commit its actual input tokens on GPU.
 
@@ -68,7 +83,8 @@ def advance_ngram_state(
     one-token chunk writes a complete destination window.
     """
     requests = state_indices_out.numel()
-    width = state.shape[1]
+    width = state.shape[1] if history_width is None else history_width
+    capacity = state.shape[1] if num_accepted_tokens is not None else width
     context = state.new_empty((requests, width))
     if requests and width:
         _advance_ngram_state_kernel[(requests,)](
@@ -79,13 +95,18 @@ def advance_ngram_state(
             state_indices_out,
             has_initial_state,
             context,
+            num_accepted_tokens,
             input_ids.stride(0),
             query_start_loc.stride(0),
             state.stride(0),
             state.stride(1),
+            state_indices_in.stride(0),
+            state_indices_out.stride(0),
             width,
+            capacity,
+            num_accepted_tokens is not None,
             eos_token_id,
-            triton.next_power_of_2(width),
+            triton.next_power_of_2(capacity),
             num_warps=1,
         )
     return context
@@ -362,11 +383,15 @@ def _conv(
     Out,
     Has,
     Y,
+    Accepted,
     C: tl.constexpr,
     K: tl.constexpr,
     D: tl.constexpr,
     SS0: tl.constexpr,
     SS1: tl.constexpr,
+    IS: tl.constexpr,
+    OS: tl.constexpr,
+    SPEC: tl.constexpr,
     R: tl.constexpr,
     B: tl.constexpr,
 ):
@@ -383,8 +408,9 @@ def _conv(
     req = lo
     valid_req = req < R
     start = tl.load(Starts + req, valid_req, 0)
-    src = tl.load(In + req, valid_req, -1)
-    dst = tl.load(Out + req, valid_req, -1)
+    src = tl.load(In + req * IS, valid_req, -1)
+    dst = tl.load(Out + req * OS, valid_req, -1)
+    offset = tl.load(Accepted + req, valid_req, 1) - 1 if SPEC else 0
     has = tl.load(Has + req, valid_req, False) & (src >= 0)
     valid = valid_req & (dst >= 0) & (c < C)
     value = tl.full((B,), 0, tl.float32)
@@ -393,7 +419,7 @@ def _conv(
         x = tl.load(X + pos * C + c, valid & (pos >= start), 0).to(tl.float32)
         s_pos = (K - 1) * D + pos - start
         s = tl.load(
-            S + src * SS0 + c * SS1 + s_pos,
+            S + src * SS0 + c * SS1 + offset + s_pos,
             valid & has & (pos < start) & (s_pos >= 0),
             0,
         ).to(tl.float32)
@@ -413,10 +439,15 @@ def _update(
     In,
     Out,
     Has,
+    Accepted,
     C: tl.constexpr,
     L: tl.constexpr,
+    CAPACITY: tl.constexpr,
     SS0: tl.constexpr,
     SS1: tl.constexpr,
+    IS: tl.constexpr,
+    OS: tl.constexpr,
+    SPEC: tl.constexpr,
     B: tl.constexpr,
     BL: tl.constexpr,
 ):
@@ -424,14 +455,15 @@ def _update(
     c = tl.program_id(1) * B + tl.arange(0, B)
     j = tl.arange(0, BL)
     start, end = tl.load(Starts + req), tl.load(Starts + req + 1)
-    src, dst = tl.load(In + req), tl.load(Out + req)
+    src, dst = tl.load(In + req * IS), tl.load(Out + req * OS)
+    offset = tl.load(Accepted + req) - 1 if SPEC else 0
     has = tl.load(Has + req) & (src >= 0)
-    valid = (dst >= 0) & (end > start) & (c[:, None] < C) & (j[None, :] < L)
-    pos = end - L + j[None, :]
-    x = tl.load(X + pos * C + c[:, None], valid & (pos >= start), 0)
+    valid = (dst >= 0) & (end > start) & (c[:, None] < C) & (j[None, :] < CAPACITY)
+    pos = (start + 1 if SPEC else end) - L + j[None, :]
+    x = tl.load(X + pos * C + c[:, None], valid & (pos >= start) & (pos < end), 0)
     old_pos = L + pos - start
     old = tl.load(
-        S + src * SS0 + c[:, None] * SS1 + old_pos,
+        S + src * SS0 + c[:, None] * SS1 + offset + old_pos,
         valid & has & (pos < start) & (old_pos >= 0),
         0,
     )
@@ -450,6 +482,7 @@ def dilated_causal_conv1d(
     state_indices_out: torch.Tensor,
     has_initial_state: torch.Tensor,
     dilation: int,
+    num_accepted_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """SiLU(conv(inputs)), updating only valid, nonempty destination slots.
 
@@ -462,6 +495,7 @@ def dilated_causal_conv1d(
     """
     channels, kernel = weight.shape
     history = (kernel - 1) * dilation
+    capacity = state.shape[2] if num_accepted_tokens is not None else history
     requests = state_indices_out.numel()
     if inputs.ndim != 2 or inputs.shape[1] != channels or dilation < 1:
         raise ValueError("invalid dilated convolution input geometry")
@@ -482,11 +516,15 @@ def dilated_causal_conv1d(
         state_indices_out,
         has_initial_state,
         output,
+        num_accepted_tokens,
         channels,
         kernel,
         dilation,
         state.stride(0),
         state.stride(1),
+        state_indices_in.stride(0),
+        state_indices_out.stride(0),
+        num_accepted_tokens is not None,
         requests,
         128,
         enable_fp_fusion=False,
@@ -499,11 +537,16 @@ def dilated_causal_conv1d(
             state_indices_in,
             state_indices_out,
             has_initial_state,
+            num_accepted_tokens,
             channels,
             history,
+            capacity,
             state.stride(0),
             state.stride(1),
+            state_indices_in.stride(0),
+            state_indices_out.stride(0),
+            num_accepted_tokens is not None,
             32,
-            triton.next_power_of_2(history),
+            triton.next_power_of_2(capacity),
         )
     return output

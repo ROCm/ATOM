@@ -610,6 +610,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         # a slow backend can hold. Same knob and default the DSV4 layout bounds
         # its worker queue with, read from the other end.
         self._max_pending_saves = max_pending_saves(
+            getattr(config, "kv_transfer_config", {}) or {},
             int(os.environ.get("OFFLOAD_COPY_WORKERS", "1") or 1)
         )
         self._save_inflight_since: dict[str, float] = {}

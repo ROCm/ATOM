@@ -146,11 +146,19 @@ def run_staged_pipeline(
     """
 
     staging_buffer = state.staging_buffer
+    # One stream orders the two stages by itself, so the handshake around them
+    # is a no-op -- but only semantically. Each of the four calls still enters
+    # the GPU runtime, and each of those releases the GIL and has to take it
+    # back; with a model co-resident that is about an interpreter switch
+    # interval apiece, charged per staging group. Skipping them is what makes
+    # the single-stream mode cheaper than the two-stream one, rather than
+    # merely differently ordered.
+    fenced = stage_a.stream is not stage_b.stream
     used_buffer = False
     buffer_safe_to_release = True
     try:
         for group in groups:
-            if staging_buffer.free_event_valid:
+            if fenced and staging_buffer.free_event_valid:
                 stage_a.stream.wait_event(staging_buffer.free_event)
             with state.stream_ctx(stage_a.stream):
                 # ``ensure_buffer`` may allocate device storage. Allocate it on
@@ -160,12 +168,16 @@ def run_staged_pipeline(
                 device_buf = ensure_buffer(staging_buffer, group_nbytes(group))
                 used_buffer = True
                 stage_a.run(group, device_buf)
-            staging_buffer.ready_event.record(stage_a.stream)
-            stage_b.stream.wait_event(staging_buffer.ready_event)
+            if fenced:
+                staging_buffer.ready_event.record(stage_a.stream)
+                stage_b.stream.wait_event(staging_buffer.ready_event)
             with state.stream_ctx(stage_b.stream):
                 stage_b.run(group, device_buf)
-            staging_buffer.free_event.record(stage_b.stream)
-            staging_buffer.free_event_valid = True
+            if fenced:
+                staging_buffer.free_event.record(stage_b.stream)
+                # Only ever true when an event was actually recorded: a stale
+                # event must never gate a later transfer.
+                staging_buffer.free_event_valid = True
             if stage_b_enqueued is not None:
                 stage_b_enqueued(group, stage_b.stream)
         stage_b.stream.synchronize()
