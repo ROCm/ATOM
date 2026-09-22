@@ -1177,6 +1177,20 @@ def _validate_return_token_ids(
         )
 
 
+def _engine_kv_transfer_params(
+    kv_transfer_params: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Drop the wire-only prompt copy after resolving and validating its IDs.
+
+    The engine receives these IDs as its prompt and stores them on Sequence.
+    Keeping them in KV metadata would pickle the same prompt again for IPC.
+    Copy only the metadata mapping so the original request stays intact.
+    """
+    if kv_transfer_params is None or "prompt_token_ids" not in kv_transfer_params:
+        return kv_transfer_params
+    return {k: v for k, v in kv_transfer_params.items() if k != "prompt_token_ids"}
+
+
 async def setup_streaming_request(
     prompt_or_tokens: str | list[int],
     sampling_params: SamplingParams,
@@ -1656,6 +1670,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
 
         is_multimodal = _has_multimodal_content(messages)
         multimodal_data = None
+        kv_transfer_params = request.kv_transfer_params
         if is_multimodal:
             # Media loading (blocking network I/O, up to a 30s urlopen) plus
             # processor preprocessing are heavy and would stall the event loop;
@@ -1677,6 +1692,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             # again would cost the largest single slice of decode TTFT to
             # arrive at the same list -- see docs/ttft_breakdown_guide.md.
             prompt_or_tokens = pretokenized
+            kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
         else:
             prompt_or_tokens = apply_chat_template(
                 tokenizer,
@@ -1712,7 +1728,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                         sampling_params,
                         request_id,
                         multimodal_data=stream_multimodal_data,
-                        kv_transfer_params=request.kv_transfer_params,
+                        kv_transfer_params=kv_transfer_params,
                         **dp_routing,
                     )
                 )
@@ -1736,7 +1752,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                         sampling_params,
                         request_id,
                         multimodal_data=stream_multimodal_data,
-                        kv_transfer_params=request.kv_transfer_params,
+                        kv_transfer_params=kv_transfer_params,
                         **dp_routing,
                     )
                 )
@@ -1766,7 +1782,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     sampling_params,
                     request_id,
                     multimodal_data=multimodal_data,
-                    kv_transfer_params=request.kv_transfer_params,
+                    kv_transfer_params=kv_transfer_params,
                     return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),
@@ -1814,7 +1830,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     prompt_or_tokens,
                     sampling_params,
                     request_id,
-                    kv_transfer_params=request.kv_transfer_params,
+                    kv_transfer_params=kv_transfer_params,
                     return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),
@@ -1838,7 +1854,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     prompt_or_tokens,
                     sampling_params,
                     request_id,
-                    kv_transfer_params=request.kv_transfer_params,
+                    kv_transfer_params=kv_transfer_params,
                     return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),
@@ -1858,7 +1874,9 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_parser_cls=tool_call_parser_cls,
             )
         _log_request_model("response", request_id, resp)
-        return resp
+        # A Response bypasses FastAPI's recursive jsonable_encoder walk over
+        # every prompt token ID. JSON mode preserves the existing wire values.
+        return JSONResponse(content=resp.model_dump(mode="json"))
 
     except _ClientDisconnected:
         # Client hung up; seq already aborted + popped. Nothing to return.
@@ -1892,6 +1910,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
         # Either the text or an already-tokenized prompt, whichever the client
         # sent. `preprocess` takes both, so nothing downstream branches on it.
         prompt_or_tokens = request.get_prompt_or_tokens()
+        kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
 
         request_id = f"cmpl-{uuid.uuid4().hex}"
         dp_session_id, dp_parent_session_id = _get_dp_session_affinity_ids(raw_request)
@@ -1911,7 +1930,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
                         prompt_or_tokens,
                         sampling_params,
                         request_id,
-                        kv_transfer_params=request.kv_transfer_params,
+                        kv_transfer_params=kv_transfer_params,
                         **dp_routing,
                     )
                 )
@@ -1930,7 +1949,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
                         prompt_or_tokens,
                         sampling_params,
                         request_id,
-                        kv_transfer_params=request.kv_transfer_params,
+                        kv_transfer_params=kv_transfer_params,
                         **dp_routing,
                     )
                 )
@@ -1955,7 +1974,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
                     prompt_or_tokens,
                     sampling_params,
                     request_id,
-                    kv_transfer_params=request.kv_transfer_params,
+                    kv_transfer_params=kv_transfer_params,
                     return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),
@@ -1971,7 +1990,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
                     prompt_or_tokens,
                     sampling_params,
                     request_id,
-                    kv_transfer_params=request.kv_transfer_params,
+                    kv_transfer_params=kv_transfer_params,
                     return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),
@@ -1984,7 +2003,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
 
             resp = build_completion_response(request_id, model_name, final_output)
         _log_request_model("response", request_id, resp)
-        return resp
+        return JSONResponse(content=resp.model_dump(mode="json"))
 
     except _ClientDisconnected:
         # Client hung up; seq already aborted + popped. Nothing to return.

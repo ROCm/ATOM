@@ -14,9 +14,15 @@ not. See ``docs/ttft_breakdown_guide.md`` for what the duplication costs.
 """
 
 import asyncio
+import json
 from types import SimpleNamespace
+from uuid import UUID
 
+import fastapi.routing
+import httpx
 import pytest
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.protocol import (
@@ -139,6 +145,90 @@ class TestDecodeSkipsTheWorkPrefillAlreadyDid:
         assert server.generate[0][0] == "hi"
 
 
+class TestDecodeDoesNotForwardDuplicateIdsToTheEngine:
+    @pytest.mark.parametrize("endpoint", ["chat", "completion"])
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("n", [1, 2])
+    def test_handoff_preserves_kv_metadata_and_original_request(
+        self, monkeypatch, server, endpoint, stream, n
+    ):
+        async def fake_fanout(prompt, _sampling, _rid, **kwargs):
+            server.generate.append((prompt, kwargs))
+            return [
+                {
+                    "text": "hello",
+                    "finish_reason": "eos",
+                    "num_tokens_input": len(PROMPT_IDS),
+                    "num_tokens_output": 1,
+                }
+                for _ in range(n)
+            ]
+
+        async def fake_setup(prompt, _sampling, _rid, **kwargs):
+            server.generate.append((prompt, kwargs))
+            return ([7, 8] if n > 1 else 7), object(), len(PROMPT_IDS)
+
+        monkeypatch.setattr(api_server, "generate_async_fanout", fake_fanout)
+        monkeypatch.setattr(api_server, "setup_streaming_request", fake_setup)
+        monkeypatch.setattr(api_server, "setup_streaming_request_fanout", fake_setup)
+        metadata = {
+            "do_remote_prefill": True,
+            "remote_engine_id": "prefill-0",
+            "remote_block_ids": [10, 11],
+            "connector_metadata": {"transfer_id": "transfer-1"},
+        }
+        kwargs = {
+            "kv_transfer_params": {**metadata, "prompt_token_ids": PROMPT_IDS},
+            "stream": stream,
+            "n": n,
+        }
+        if endpoint == "chat":
+            request = _chat(**kwargs)
+            request.temperature = 1.0
+            handler = api_server.chat_completions
+        else:
+            request = CompletionRequest(model="m", temperature=1.0, **kwargs)
+            handler = api_server.completions
+        original = request.kv_transfer_params
+
+        asyncio.run(handler(request, None))
+
+        assert len(server.generate) == 1
+        sent, options = server.generate[0]
+        assert sent == PROMPT_IDS
+        assert options["kv_transfer_params"] == metadata
+        assert options["kv_transfer_params"] is not original
+        assert (
+            options["kv_transfer_params"]["remote_block_ids"]
+            is original["remote_block_ids"]
+        )
+        assert request.kv_transfer_params is original
+        assert original == {**metadata, "prompt_token_ids": PROMPT_IDS}
+        assert server.templates == 0
+
+    @pytest.mark.parametrize("endpoint", ["chat", "completion"])
+    @pytest.mark.parametrize("nested_ids", [[], [-1], [999]])
+    def test_bad_or_conflicting_ids_are_rejected_before_cleanup(
+        self, server, endpoint, nested_ids
+    ):
+        kwargs = {
+            "prompt_token_ids": PROMPT_IDS,
+            "kv_transfer_params": {"prompt_token_ids": nested_ids},
+        }
+        if endpoint == "chat":
+            request, handler = _chat(**kwargs), api_server.chat_completions
+        else:
+            request = CompletionRequest(model="m", **kwargs)
+            handler = api_server.completions
+
+        with pytest.raises(api_server.HTTPException) as excinfo:
+            asyncio.run(handler(request, None))
+
+        assert excinfo.value.status_code == 400
+        assert server.generate == []
+        assert request.kv_transfer_params["prompt_token_ids"] == nested_ids
+
+
 class TestPrefillEchoesItsTokenIds:
     def test_chat_response_carries_the_ids(self, server):
         response = asyncio.run(
@@ -146,7 +236,7 @@ class TestPrefillEchoesItsTokenIds:
         )
 
         assert server.generate[0][1]["return_token_ids"] is True
-        assert response.prompt_token_ids == PROMPT_IDS
+        assert json.loads(response.body)["prompt_token_ids"] == PROMPT_IDS
 
     def test_completion_response_carries_the_ids(self, server):
         response = asyncio.run(
@@ -155,13 +245,130 @@ class TestPrefillEchoesItsTokenIds:
             )
         )
 
-        assert response.prompt_token_ids == PROMPT_IDS
+        assert json.loads(response.body)["prompt_token_ids"] == PROMPT_IDS
 
     def test_not_asked_means_not_returned(self, server):
         response = asyncio.run(api_server.chat_completions(_chat(), None))
 
         assert server.generate[0][1]["return_token_ids"] is False
-        assert response.prompt_token_ids is None
+        assert json.loads(response.body)["prompt_token_ids"] is None
+
+
+class TestHttpResponseSerialization:
+    @pytest.mark.parametrize("endpoint", ["chat", "completion"])
+    @pytest.mark.parametrize("return_ids", [False, True])
+    @pytest.mark.parametrize("n", [1, 2])
+    def test_wire_response_is_preserved_without_fastapi_recursive_conversion(
+        self, monkeypatch, server, endpoint, return_ids, n
+    ):
+        # Exercise the real ASGI response boundary: returning a BaseModel here
+        # would silently reintroduce a Python visit to every prompt token ID.
+        suffix = "chat/completions" if endpoint == "chat" else "completions"
+        builder = f"build_{endpoint}_response" + ("_multi" if n > 1 else "")
+        original_builder = getattr(api_server, builder)
+        expected_bodies = []
+        ids = list(range(1000, 5096))
+        metadata = {
+            "do_remote_prefill": True,
+            "remote_engine_id": UUID("b1382773-c171-4e07-b42d-e7ff18a825ab"),
+            "remote_block_ids": (7, 8),
+        }
+        output = {
+            "text": '你好，世界 🌍\n"quoted"',
+            "finish_reason": "eos",
+            "num_tokens_input": len(ids),
+            "num_tokens_output": 1,
+            "num_cached_tokens": 256,
+            "kv_transfer_output_meta_info": metadata,
+        }
+        if return_ids:
+            output["prompt_token_ids"] = ids
+
+        async def generate(*_args, **_kwargs):
+            yield output
+
+        async def fanout(*_args, **_kwargs):
+            return [output] * n
+
+        def build(*args, **kwargs):
+            response = original_builder(*args, **kwargs)
+            # The previous HTTP path defines the compatibility contract,
+            # including nulls, Unicode, and JSON conversion of extension data.
+            expected_bodies.append(JSONResponse(jsonable_encoder(response)).body)
+            return response
+
+        def reject_automatic_conversion(*_args, **_kwargs):
+            pytest.fail("FastAPI recursively converted the completed response")
+
+        monkeypatch.setattr(api_server, "generate_async", generate)
+        monkeypatch.setattr(api_server, "generate_async_fanout", fanout)
+        monkeypatch.setattr(api_server, builder, build)
+        monkeypatch.setattr(
+            fastapi.routing, "jsonable_encoder", reject_automatic_conversion
+        )
+        payload = {
+            "model": "m",
+            "temperature": 1.0,
+            "n": n,
+            "return_token_ids": return_ids,
+        }
+        payload.update(
+            {"messages": [{"role": "user", "content": "hi"}]}
+            if endpoint == "chat"
+            else {"prompt": "hi"}
+        )
+
+        async def post():
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=api_server.app),
+                base_url="http://test",
+            ) as client:
+                return await client.post(f"/v1/{suffix}", json=payload)
+
+        response = asyncio.run(post())
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "application/json"
+        assert response.content == expected_bodies[0]
+        body = response.json()
+        assert body["prompt_token_ids"] == (ids if return_ids else None)
+        if n == 1:
+            assert body["kv_transfer_params"]["remote_block_ids"] == [7, 8]
+        else:
+            # Existing multi-choice builders do not return KV transfer metadata.
+            assert body["kv_transfer_params"] is None
+        assert len(body["choices"]) == n
+
+    @pytest.mark.parametrize("endpoint", ["chat", "completion"])
+    def test_http_prefill_ids_can_be_reused_by_decode(self, server, endpoint):
+        suffix = "chat/completions" if endpoint == "chat" else "completions"
+        payload = {"model": "m", "return_token_ids": True}
+        payload.update(
+            {"messages": [{"role": "user", "content": "hi"}]}
+            if endpoint == "chat"
+            else {"prompt": "hi"}
+        )
+
+        async def round_trip():
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=api_server.app),
+                base_url="http://test",
+            ) as client:
+                prefill = await client.post(f"/v1/{suffix}", json=payload)
+                assert prefill.status_code == 200
+                payload["return_token_ids"] = False
+                payload["kv_transfer_params"] = {
+                    "do_remote_prefill": True,
+                    "prompt_token_ids": prefill.json()["prompt_token_ids"],
+                }
+                return await client.post(f"/v1/{suffix}", json=payload)
+
+        response = asyncio.run(round_trip())
+        assert response.status_code == 200
+        assert server.generate[1][0] == PROMPT_IDS
+        assert server.generate[1][1]["kv_transfer_params"] == {
+            "do_remote_prefill": True
+        }
+        assert server.templates == (1 if endpoint == "chat" else 0)
 
 
 class TestUnanswerableRequestsForTokenIdsAreRejected:
@@ -229,8 +436,8 @@ class TestFanoutIsAnsweredRatherThanRefused:
         )
 
         assert server.generate[0][1]["return_token_ids"] is True
-        assert response.prompt_token_ids == PROMPT_IDS
-        assert len(response.choices) == 4
+        assert json.loads(response.body)["prompt_token_ids"] == PROMPT_IDS
+        assert len(json.loads(response.body)["choices"]) == 4
 
     def test_fanout_builder_reads_the_first_output(self):
         outputs = [
