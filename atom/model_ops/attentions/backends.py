@@ -338,8 +338,12 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         restore_ops: Sequence[CheckpointRestoreOp],
         descriptor_slot: int = 0,
     ) -> None:
-        """Copy checkpoints between Active Slots and arbitrary PAGEs."""
-        del descriptor_slot
+        """Copy checkpoints between Active Slots and arbitrary PAGEs.
+
+        Stateful backends use ``descriptor_slot`` to isolate concurrent copy
+        descriptors. The default implementation only handles the empty no-op
+        case, so it intentionally leaves that interface argument unused.
+        """
         if store_ops or restore_ops:
             raise NotImplementedError(
                 f"{type(self).__name__} does not implement PAGE-backed state copy"
