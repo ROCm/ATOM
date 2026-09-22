@@ -190,3 +190,32 @@ empty to keep the version already baked into the selected Docker image.
 python -m pytest tests/test_benchmark_catalog.py
 python .github/scripts/catalog.py --cells .github/benchmark/models.json   # preview cells
 ```
+
+## V4 AgentX P/D without offload
+
+Use **Atomesh Benchmark** (`atomesh-benchmark.yaml`) with `suite=nightly`,
+`model_names=DeepSeek-V4-Pro-0813`, and `run_model_benchmark=true`.
+Leave `benchmark_concurrency` empty to keep the three independent cases at
+128, 192, and 256. Alternatively, select an individual case in `case_names`:
+
+- `ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c128`
+- `ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c192`
+- `ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c256`
+
+Each case allocates two eight-GPU nodes (1P1D, TP8 with DPA), reuses the GLM
+AgentX AIPerf workload, and starts fresh services. Use the corresponding Slurm
+submit runner for the target cluster. The checkpoint is expected at
+`${ATOMESH_MODEL_ROOT}/deepseek-ai/DeepSeek-V4-Pro-0813/`. Crusoe uses the
+`model_path_by_runner` setting to select
+`/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro-0813`.
+The workflow's existing image selection and `atomesh_image` override apply.
+
+Serving follows the no-offload DPA settings in
+[`DeepSeek-V4-Agentic-PD-Max.md`](../../recipes/DeepSeek-V4-Agentic-PD-Max.md):
+FP8 KV, FP4 index cache, DSpark K3 with benchmark-only AL 3.01, and TBO on
+prefill only. P/D `max-num-seqs` is 256 / 384 / 512; decode captures dense
+per-rank sizes 1..32 / 1..48 / 1..64. Routing uses the same DP-aware
+`dp_sticky` path as the existing GLM DPA CI. Both KV connectors are plain
+Mooncake; there is no LMCache CPU/NVMe pool or THP/HIP/HSA override. Evals are
+disabled for these diagnostic throughput cases. GPU CI must still establish
+startup and throughput behavior.
