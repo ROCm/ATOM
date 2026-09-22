@@ -18,6 +18,7 @@ from vllm.v1.attention.backend import (
 from atom.config import get_current_atom_config
 from atom.distributed.dcp_utils import dcp_persistent_supported
 from atom.model_ops.attention_mla import _MLA_MIN_HEADS, mla_dcp_kernel_num_heads
+from atom.model_ops.glm5_next import geometry as glm5_kpool_geometry
 from atom.plugin.vllm.attention.layer_mla import (
     disabled_mla_persistent_metadata,
     mla_fold_kv_metadata_triton,
@@ -269,6 +270,7 @@ class AiterMlaSparseIndexerPrefillChunkMetadataForVllm:
     token_start: int
     token_end: int
     num_reqs: int
+    kpool_total_pools: int = 0
 
 
 @dataclass
@@ -1940,7 +1942,12 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
         self.padded_num_heads = max(self.num_heads, _MLA_MIN_HEADS)
         self.mla_dims = get_mla_dims(self.model_config)
-        self.topk_tokens = hf_text_config(config.model_config).index_topk
+        hf_config = hf_text_config(config.model_config)
+        self.index_topk = int(hf_config.index_topk)
+        self.index_kpool = int(getattr(hf_config, "index_kpool", 1) or 1)
+        self.topk_tokens = glm5_kpool_geometry.topk_output_width(
+            self.index_topk, self.index_kpool
+        )
         self.max_model_len_tensor = torch.tensor(
             [self.model_config.max_model_len], device=device, dtype=torch.int32
         )
@@ -2144,9 +2151,12 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
             query_lens,
             seq_lens,
             common_attn_metadata.query_start_loc,
-            self.topk_tokens,
+            self.index_topk,
             num_tokens,
             common_attn_metadata.max_query_len,
+            index_kpool=glm5_kpool_geometry.effective_kpool_size(
+                self.index_kpool
+            ),
         )
         torch.cumsum(
             sparse_seqlen,
@@ -2331,6 +2341,10 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
         self.model_config = config.model_config
         self.kv_cache_spec = kv_cache_spec
         self.device = device
+        hf_config = hf_text_config(config.model_config)
+        self.index_kpool = glm5_kpool_geometry.effective_kpool_size(
+            int(getattr(hf_config, "index_kpool", 1) or 1)
+        )
         max_num_batched_tokens = config.scheduler_config.max_num_batched_tokens
 
         self.max_prefill_buffer_size = get_max_prefill_buffer_size(
@@ -2442,6 +2456,11 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
             token_start=token_start,
             token_end=token_end,
             num_reqs=reqs_end - reqs_start,
+            kpool_total_pools=int(
+                (
+                    seq_lens_cpu[reqs_start:reqs_end] // self.index_kpool
+                ).sum()
+            ),
         )
 
     def _build_indexer(

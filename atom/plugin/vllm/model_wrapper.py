@@ -561,6 +561,9 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         # (see `forward`). Other ATOM models follow vLLM's contract directly.
         self._is_deepseek_v4 = self.model_arch in _DEEPSEEK_V4_ARCHES
         self._is_deepseek_v4_mtp = self.model_arch in _DEEPSEEK_V4_MTP_ARCHES
+        self._is_glm5_next = (
+            self.vllm_model_arch == "Glm5NextForConditionalGeneration"
+        )
         if self._is_deepseek_v4:
             from atom.plugin.vllm.deepseek_v4_bridge import (
                 ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
@@ -1001,6 +1004,24 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 else:
                     hidden_states = self.model(input_ids=input_ids, positions=positions)
                     self._mtp_target_hidden_states = hidden_states
+        elif self._is_glm5_next:
+            from atom.plugin.vllm.glm5_kpool_bridge import (
+                atom_glm5_kpool_forward_context,
+            )
+
+            with atom_glm5_kpool_forward_context(
+                model=self.model,
+                atom_config=self.atom_config,
+                input_ids=input_ids,
+                positions=positions,
+            ):
+                hidden_states = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
         else:
             if (
                 self.model_arch in {"Qwen3NextMTP", "DeepSeekMTPModel"}
