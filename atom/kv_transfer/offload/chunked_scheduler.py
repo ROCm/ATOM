@@ -847,6 +847,16 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         sid = str(seq.id)
         if self._load_lifecycles.get(sid) is not seq:
             return
+        # Marked on the SEQUENCE, not in a scheduler-side set. Under
+        # `kv_connector: multi` the composite cancels every sub that did not win
+        # `get_num_new_matched_tokens`, and a losing sub must not re-arm from a
+        # source the cancel cannot reach (`seq.offload_joint`, which the engine
+        # owns). The flag lives exactly as long as the request does, so nothing
+        # has to clean it up, and `request_finished` keeps the attribute set a
+        # duck-typed stub must carry -- the vLLM plugin drives that method with
+        # a `SeqView` namespace. Same pattern as `seq.kv_async_tagged` and
+        # `seq._load_operation`.
+        seq.offload_load_cancelled = True
         self._clear_pending_load(sid)
         active = self._active_load_operations.get(sid)
         if active is not None and active[0] is seq:

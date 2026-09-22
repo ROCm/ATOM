@@ -179,6 +179,53 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         for lookup_id in metadata.lookup_requests_in_step:
             if str(lookup_id) not in loading_lookup_ids:
                 self._lookup_unpin(lookup_id)
+        # Producer fence for this step's KV saves. The save gathers KV pages on
+        # a private `pack_stream` with no ordering against the forward's compute
+        # stream, so without this the gather reads torn latent that is then
+        # faithfully reloaded -- silent, reload-count-scaling accuracy
+        # corruption.
+        #
+        # ONE event for the step, not one per saving request: every save in the
+        # loop below records against the same stream at the same point, so N
+        # events carried no more ordering than one. Gated on whether this step
+        # actually dispatches a save, NOT on `self._do_save` -- that is a role
+        # flag fixed at construction, true on every step a producer turns, while
+        # zero-save steps are the common case (steady-state decode, a save
+        # already in flight, a chunk not yet aligned). Gating on the role
+        # recorded and dropped an unconsumed event every one of those steps.
+        # `hybrid/dsv4/connector.py` reaches the same shape lazily, from inside
+        # its loop.
+        #
+        # Guarded, because `ModelRunner.process_kvconnector_output` has no
+        # handler -- a raise here escaped and dropped every load AND save
+        # dispatched this step. `blocking=True` because the consumer is a worker
+        # thread that `synchronize()`s it for the whole fenced forward; the
+        # default spins a core for that entire window.
+        producer_event = None
+        saving = self._do_save and any(
+            req.save_spec is not None for req in metadata.requests
+        )
+        if saving and torch.cuda.is_available():
+            try:
+                producer_event = torch.cuda.Event(blocking=True)
+                producer_event.record(torch.cuda.current_stream())
+            except Exception:
+                producer_event = None
+                logger.exception(
+                    "offload: could not record the producer fence; falling back "
+                    "to a full device synchronize for this step's saves."
+                )
+                try:
+                    # Strictly stronger than the event, so dropping to it is
+                    # safe: an unfenced gather reads torn latent that is then
+                    # faithfully reloaded -- silent accuracy corruption, which
+                    # is the whole reason the fence exists.
+                    torch.cuda.synchronize()
+                except Exception:  # noqa: BLE001 -- last resort; see the log
+                    logger.error(
+                        "offload: no producer fence and no device synchronize; "
+                        "this step's saves may gather partially-written KV."
+                    )
         for req in metadata.requests:
             # The futures are tracked, not discarded: `wait_for_requests` fences
             # them when vLLM preempts a request and reuses its blocks.
@@ -190,6 +237,19 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                     ),
                 )
             if req.save_spec is not None and self._do_save:
+                # Producer fence for the async KV save. The save gathers KV
+                # pages on a private `pack_stream` (kv_byte_codec.gpu_to_chunk_
+                # major_device_buffer) with no ordering against the forward's
+                # compute stream. The shared staging class documents that the KV
+                # caller -- this connector -- must record this fence
+                # (hybrid/kimi_k3/staging.py:43-59; hybrid/dsv4/connector.py is
+                # the only other caller that does). Record it here on the RPC
+                # thread, BEFORE this step's forward, so the event captures the
+                # prior forwards that wrote this prefix's [0, boundary) KV; the
+                # save worker waits it before the gather. Without it the gather
+                # reads torn/partially-written latent that is then faithfully
+                # reloaded -- silent, reload-count-scaling accuracy corruption.
+                req.producer_event = producer_event
                 self._track_job(
                     req.req_id,
                     self._save_executor.submit(
@@ -235,6 +295,20 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         self._record_store_terminal(req, False)
 
     def _do_load_req(self, req: LMCacheReqMeta) -> None:
+        """Fetch this request's KV, then report it. Composition only.
+
+        Split so a hybrid layout can put a second leg between the two halves
+        and still emit exactly ONE completion for the pair. Behaviour for dense
+        is unchanged: same completion ids, same sets, same profiling record.
+        """
+        self._finish_load(req, self._load_kv_bytes(req))
+
+    def _load_kv_bytes(self, req: LMCacheReqMeta) -> bool:
+        """Move the KV bytes. Reports nothing -- that is `_finish_load`.
+
+        Returns True when the request's KV is where it should be, including
+        the no-op case where HBM already covers the lookup.
+        """
         ls = req.load_spec
         assert ls is not None
         hbm = int(ls.hbm_cached_tokens)
@@ -242,10 +316,9 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         toks = req.token_ids[:lmc]
         t_total0 = time.perf_counter()
         if lmc <= hbm:
-            self._lookup_unpin(req.req_id)
-            with self._lock:
-                self._done_load.add(self._load_completion_id(req))
-            return
+            # Nothing to fetch: HBM already covers the lookup. Still a
+            # success -- the request has the KV it asked for.
+            return True
         chunk_size = int(self.chunk_size or 256)
         if hbm % chunk_size != 0:
             logger.warning(
@@ -255,11 +328,10 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 hbm,
                 chunk_size,
             )
-            self._lookup_unpin(req.req_id)
-            with self._lock:
-                self._failed_load.add(self._load_completion_id(req))
-                self._record_load_error_blocks(req)
-            return
+            # Report via `_finish_load`, which owns the lookup unpin, the
+            # completion AND `_record_load_error_blocks` -- this function only
+            # moves bytes and says whether they landed.
+            return False
 
         mask = torch.ones(len(toks), dtype=torch.bool)
         mask[:hbm] = False
@@ -274,14 +346,8 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         )
         retrieve_ms = (time.perf_counter() - t_retrieve0) * 1000
         transfer_stats = self._last_gpu_connector_transfer_stats()
-        self._lookup_unpin(req.req_id)
         loaded = bool(ret_mask[hbm:lmc].all().item())
-        with self._lock:
-            if loaded:
-                self._done_load.add(self._load_completion_id(req))
-            else:
-                self._failed_load.add(self._load_completion_id(req))
-                self._record_load_error_blocks(req)
+
         total_ms = (time.perf_counter() - t_total0) * 1000
         if self._profile_enabled():
             logger.info(
@@ -315,6 +381,25 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 retrieve_ms,
                 total_ms,
             )
+        return loaded
+
+    def _finish_load(self, req: LMCacheReqMeta, ok: bool) -> None:
+        """Release the lookup pin and emit this request's ONE load completion.
+
+        Every path through `_do_load_req` ends here, including a raise in a
+        subclass's second leg, so one dispatch produces exactly one report.
+        """
+        self._lookup_unpin(req.req_id)
+        with self._lock:
+            if ok:
+                self._done_load.add(self._load_completion_id(req))
+            else:
+                self._failed_load.add(self._load_completion_id(req))
+                # Moved here with the reporting it belongs to: both failure
+                # paths used to record it inline, and splitting the byte-mover
+                # out left this the one place a load can be declared failed.
+                # `_record_load_error_blocks` requires `self._lock`, held here.
+                self._record_load_error_blocks(req)
 
     def _do_save_req(self, req: LMCacheReqMeta) -> None:
         ss = req.save_spec
@@ -332,6 +417,15 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         mask[:skip] = False
 
         tok_tensor = tokens_to_tensor(toks)
+        # Wait for the forward that produced these KV pages before the async
+        # gather reads them (fence recorded in `start_load_kv`). This runs on the
+        # off-TTFT save worker, so the host sync costs no serving latency; it is
+        # what makes the gather's source quiescent, the guarantee the staging
+        # class relies on but does not itself provide.
+        producer_event = getattr(req, "producer_event", None)
+        if producer_event is not None:
+            producer_event.synchronize()
+
         t_store0 = time.perf_counter()
         self._reset_gpu_connector_transfer_stats()
         gpu_connector = self._engine.gpu_connector
