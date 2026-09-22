@@ -535,25 +535,36 @@ class tokenIDProcessor:
             token_ids = scheduled_tokens[
                 total_tokens_prefill : total_tokens_prefill + total_tokens_decode
             ]
-            # No spec path supports pipeline parallel yet; it wants the deferred
-            # branch's per-request staging. Gate on PP itself rather than on
-            # `use_spec`: a P/D producer also reaches this branch, and the flag
-            # is still set there (the runner keeps the drafter loaded to write
-            # the draft's context KV at prefill) even though the scheduler
-            # turned speculation off for it.
-            if self.use_spec and self.is_pipeline_parallel:
-                raise NotImplementedError("pipeline parallel + speculative decode")
-            # PP verifies nothing locally and a P/D producer never speculates
-            # (its DP dummy included), so no row here carries drafts. One that
-            # did would need the deferred branch's per-request staging: under
-            # DP a block drafter's `max_seqlen_q` is the group's maximum, not
-            # this batch's row width.
-            assert batch.num_spec_step == 0, (
-                "non-deferred decode got a speculative batch "
-                f"(num_spec_step={batch.num_spec_step})"
-            )
-
             self.input_ids.np[:total_tokens_decode] = token_ids
+            if not self.is_pipeline_parallel:
+                # A P/D producer never speculates (its DP dummy included), so
+                # no row here carries drafts. One that did would need the
+                # deferred branch's per-request staging: under DP a block
+                # drafter's `max_seqlen_q` is the group's maximum, not this
+                # batch's row width.
+                assert batch.num_spec_step == 0, (
+                    "non-deferred decode got a speculative batch "
+                    f"(num_spec_step={batch.num_spec_step})"
+                )
+                return (
+                    self._publish_input_ids(total_tokens_decode, publication_group),
+                    None,
+                )
+            if self.use_spec:
+                # Every row's draft columns, not just the newly admitted ones
+                # the deferred branch stages. There the anchor of a carried-over
+                # request is still on the GPU and `fill_deferred_decode_ids`
+                # rewrites its whole row from `prev_token_ids`; here (PP) the
+                # host already holds the real anchor -- postprocess wrote it
+                # back before this batch was built -- so `scheduled_tokens`
+                # above is correct at column 0 and only the drafts are missing.
+                _, lens, cu_np = self.runner.attn_metadata_builder.decode_spans(batch)
+                spec = batch.scheduled_spec_decode_tokens
+                for i in range(len(lens)):
+                    n_draft = int(lens[i]) - 1
+                    if n_draft > 0:
+                        s = int(cu_np[i]) + 1
+                        self.input_ids.np[s : s + n_draft] = spec[i, :n_draft]
             return (
                 self._publish_input_ids(total_tokens_decode, publication_group),
                 None,
