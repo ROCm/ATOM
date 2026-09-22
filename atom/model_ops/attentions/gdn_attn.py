@@ -174,8 +174,24 @@ class GDNStateMixin(PoolRowsMixin):
             )
 
         self.num_spec = 0
+        spec_config = getattr(model_runner.config, "speculative_config", None)
         if hasattr(model_runner, "drafter"):
             self.num_spec = model_runner.drafter.mtp_k
+        elif spec_config is not None:
+            # Under PP only the last stage holds a drafter, but EVERY stage runs
+            # the verify window: the scheduler schedules anchor + drafts for the
+            # whole batch and each stage owns the recurrent state of its own
+            # layers. Sized for one token per request, this stage would advance
+            # that state across the rejected draft rows with no way to roll
+            # back, and K3 -- 69 of whose 93 layers are KDA -- decodes fluent
+            # noise from the step after the first rejection.
+            self.num_spec = int(spec_config.num_speculative_tokens or 0)
+            if self.num_spec == 0:
+                raise ValueError(
+                    "Speculative decoding is configured but "
+                    "num_speculative_tokens is unset, so a pipeline stage with "
+                    "no drafter cannot size its verify window."
+                )
         self.use_spec_decode = self.num_spec > 0
 
         # --- ReplaySSM ------------------------------------------------------
