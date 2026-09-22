@@ -12,6 +12,10 @@ pub struct RouterConfigBuilder {
 }
 
 impl RouterConfigBuilder {
+    pub fn ext_proc(mut self, config: crate::ext_proc::ExtProcConfig) -> Self {
+        self.config.ext_proc = config;
+        self
+    }
     pub fn new() -> Self {
         Self::default()
     }

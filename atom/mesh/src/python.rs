@@ -264,3 +264,28 @@ pub fn atomesh_runner(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version_verbose_string, m)?)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod ext_proc_tests {
+    use super::*;
+
+    #[test]
+    fn python_parser_preserves_ext_proc_server_configuration() {
+        Python::attach(|py| {
+            let parsed = parse_from(
+                py,
+                vec![
+                    "--ext-proc".into(),
+                    "--ext-proc-listen".into(),
+                    "127.0.0.1:9012".into(),
+                ],
+            )
+            .unwrap();
+            let object = parsed.bind(py).get_item("server_config").unwrap().unwrap();
+            let config: PyRef<'_, PyServerConfig> = object.extract().unwrap();
+            let ext_proc = &config.inner.as_ref().unwrap().router_config.ext_proc;
+            assert!(ext_proc.enabled);
+            assert_eq!(ext_proc.listen.port(), 9012);
+        });
+    }
+}

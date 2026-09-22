@@ -2,6 +2,7 @@ pub mod app_context;
 pub mod cliargs;
 pub mod config;
 pub mod core;
+pub mod ext_proc;
 pub mod middleware;
 pub mod observability;
 pub mod policies;

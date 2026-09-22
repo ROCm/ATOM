@@ -1,0 +1,62 @@
+static_resources:
+  listeners:
+    - name: inference
+      address:
+        socket_address: {address: 127.0.0.1, port_value: 8080}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: inference
+                stream_idle_timeout: 300s
+                route_config:
+                  name: inference
+                  virtual_hosts:
+                    - name: models
+                      domains: ["*"]
+                      routes:
+                        - match: {prefix: "/"}
+                          route: {cluster: inference_workers, timeout: 1800s}
+                http_filters:
+                  - name: envoy.filters.http.ext_proc
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                      failure_mode_allow: false
+                      grpc_service:
+                        envoy_grpc: {cluster_name: mesh_ext_proc}
+                      message_timeout: 65s
+                      processing_mode:
+                        request_header_mode: SEND
+                        response_header_mode: SEND
+                        request_body_mode: FULL_DUPLEX_STREAMED
+                        response_body_mode: FULL_DUPLEX_STREAMED
+                        request_trailer_mode: SEND
+                        response_trailer_mode: SEND
+                      metadata_options:
+                        receiving_namespaces:
+                          untyped: [envoy.lb]
+                        forwarding_namespaces:
+                          untyped: [envoy.lb.subset_hint]
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: mesh_ext_proc
+      type: STATIC
+      connect_timeout: 1s
+      http2_protocol_options: {}
+      load_assignment:
+        cluster_name: mesh_ext_proc
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {address: 127.0.0.1, port_value: 9002}
+    - name: inference_workers
+      type: ORIGINAL_DST
+      connect_timeout: 1s
+      lb_policy: CLUSTER_PROVIDED
+      original_dst_lb_config:
+        use_http_header: true
+        http_header_name: x-gateway-destination-endpoint
