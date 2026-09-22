@@ -234,7 +234,11 @@ class DeepseekV41DSpark(DSparkDraftModel):
 
     @staticmethod
     def _target_layer_input(inputs, block):
-        residual = inputs[0].residual
+        # Settled, because a pre-hook runs before the fold: the block ahead of
+        # this one leaves its FFN post owed, and `residual` is by definition
+        # the value before it. The block pays the same post again into its own
+        # pre, which is the one seam where the draft costs the target a kernel.
+        residual = inputs[0].settle().residual
         return residual.mean(dim=-2).reshape(-1, residual.shape[-1])
 
     def project_context(self, aux_concat):
