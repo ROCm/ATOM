@@ -120,7 +120,7 @@ RUN echo "========== [SGLANG-ATOM 4/6] Restore base image Triton ==========" && 
     "${VENV_PYTHON}" -m pip show triton
 
 RUN echo "========== [SGLANG-ATOM 5/6] Validate vision/audio wheels ==========" && \
-    "${VENV_PYTHON}" -m sglang.launch_server --help >/dev/null && \
+    "${VENV_PYTHON}" -c "import runpy, sys; import atom.plugin.sglang.patches.qwen4_exp_recognition_patch; sys.argv=['sglang.launch_server', '--help']; runpy.run_module('sglang.launch_server', run_name='__main__')" >/dev/null && \
     "${VENV_PYTHON}" -c "import os, torch, torchvision, torchaudio, sglang, triton, transformers; from torchvision.io import decode_jpeg; assert torch.version.hip is not None, 'Torch is not ROCm build (torch.version.hip is None).'; print(f'torch: {torch.__version__}'); print(f'triton: {triton.__version__}'); print(f'transformers: {transformers.__version__}'); print(f'torchvision: {torchvision.__version__}'); print(f'torchaudio: {torchaudio.__version__}'); print(f'decode_jpeg: {decode_jpeg.__name__}'); print(f'sglang imported from: {sglang.__file__}'); print(f'PYTHONPATH={os.environ.get(\"PYTHONPATH\", \"\")}')" && \
     echo "Validated sglang launch_server entrypoint"
 
