@@ -660,7 +660,8 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         than `OFFLOAD_MAX_PENDING_SAVES` requests pinned at once."""
         return (
             not self._save_stalled
-            and len(self._save_inflight) < self._max_pending_saves
+            and len(self._save_inflight) + len(self._save_committed)
+            < self._max_pending_saves
         )
 
     def has_pending_work(self) -> bool:

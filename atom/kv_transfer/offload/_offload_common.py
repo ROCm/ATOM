@@ -743,7 +743,7 @@ class OffloadSchedulerMixin(ABC):
     def _has_pending_save(self, seq) -> bool:
         sid = str(seq.id)
         entry = self._save_tracker.get(sid)
-        if entry is None:
+        if entry is None or entry[0] is not seq:
             return False
         return self._save_frontier(seq) > int(entry[1])
 

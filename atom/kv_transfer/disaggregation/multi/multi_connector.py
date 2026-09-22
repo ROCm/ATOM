@@ -446,6 +446,12 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         # hosts the state tier -- see `_load_owner` (review round 5, finding 1).
         self._load_winner: dict = {}
 
+    def bind_block_manager(self, block_manager) -> None:
+        for connector in self._connectors:
+            callback = getattr(connector, "bind_block_manager", None)
+            if callable(callback):
+                callback(block_manager)
+
     def _load_owner(self, seq: Any):
         """The sub that armed this request's KV load, or None.
 

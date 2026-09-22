@@ -878,6 +878,14 @@ Connector-specific tuning (env):
 | `OFFLOAD_MIN_LOAD_TOKENS` | 8192 | Don't reload a hit smaller than this; recompute is cheaper. |
 | `OFFLOAD_COPY_WORKERS` | 1 | SAVE daemon threads. LOAD is always a single thread (TTFT-critical). |
 | `OFFLOAD_MAX_PENDING_SAVES` | `max(2, 2 × OFFLOAD_COPY_WORKERS)` | Positive integer bound on total admitted worker saves (running + queued), acquired before SLOT snapshot or executor submission. |
+| `OFFLOAD_SAVE_MIN_OBSERVED_COUNT` | 2 | Hard minimum rank-local prefix observations for save admission. |
+| `OFFLOAD_SAVE_MAX_PINNED_RATIO` | 0.20 | Maximum fraction of this scheduler's physical KV block pool that committed reservations plus unsafe save leases may occupy. Valid range: 0.0–0.30. It is local per DP scheduler and is never multiplied by TP size. |
+| `OFFLOAD_SAVE_MAX_PINNED_BLOCKS` | — | Optional absolute PAGE-block clamp. The effective local budget is `min(floor(total_blocks × ratio), absolute)`. |
+| `OFFLOAD_SAVE_AGING_WEIGHT` | 0.01 | Priority score added per candidate wait-second. It cannot bypass the minimum observation count. |
+| `OFFLOAD_SAVE_RELEASE_WEIGHT` | 1.0 | Priority weight for blocks released by a finished save. |
+| `OFFLOAD_SAVE_DEMAND_BLOCK_TOKENS` | 8192 | Coarse cumulative-prefix size for the independent rank-local demand tracker. |
+| `OFFLOAD_SAVE_DEMAND_MAX_ENTRIES` | 65536 | Per-rank bound for save-demand history. |
+| `OFFLOAD_SAVE_DEMAND_TTL_SECONDS` | 600 | Quiet-time expiry for save-demand history. |
 | `OFFLOAD_GPU_STAGING_CHUNKS` | 2 | Chunks per bounded GPU staging buffer. Sizes **each** buffer — load and save own separate ones, so resident HBM ≈ `(1 + OFFLOAD_COPY_WORKERS) × chunks × chunk_bytes`. |
 | `OFFLOAD_GPU_STAGING_MAX_BYTES` | — | Hard cap on staging bytes (clamps the chunk count). |
 | `OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER` | 0 | Free the staging buffer after each transfer (lower idle HBM, higher churn). |
@@ -900,6 +908,23 @@ still falls back safely to per-group ID preparation and blocking host copies.
 `OFFLOAD_COMMITTED_SIDECAR_CAPACITY`. These apply only to that connector.
 `max_pending_saves` is intentionally process-wide and is configured only with
 `OFFLOAD_MAX_PENDING_SAVES`, so the scheduler and every worker use one bound.
+
+The chunked and DSV4 save lifecycle is explicitly
+`candidate -> committed -> inflight`. A finished candidate must reserve one of
+the pending-save slots immediately or be dropped atomically (PAGE and SLOT
+together); only committed/inflight saves may keep its source blocks alive. An
+inflight save that finishes with a residual tail gets one more admission
+decision, and a failed finished save is dropped rather than retried forever.
+The demand counter is intentionally separate from DP prefix-routing ownership:
+it observes requests at allocation time and does not publish an HBM owner.
+
+Admission also reserves physical block IDs from the scheduler-local
+`BlockManager` against the effective ratio/absolute budget. Shared IDs are
+counted once. Admission may replace one or more lower-scored,
+undispatched committed saves, but it simulates the complete victim set before
+mutating state and never evicts an inflight PAGE or SLOT operation. DSV4 counts
+the full retained request block table because this branch does not yet release
+individual PAGE source ranges before terminal completion.
 
 AOS1 follows the engine's location policy exactly. Submission passes
 `store_location` to `StorageManager.batched_put`; discovery searches only

@@ -204,6 +204,14 @@ discoverable from the central env reference despite bypassing the registry.
 |----------|------|---------|-------------|
 | **LMCACHE_EC_PIN_TIMEOUT_SEC** | float | LMCache's own (300) | LMCache's source-pin timeout. ATOM reads it only to derive the engine's save-abandon window (`pin + 30s`), so the two stay ordered — a lost store report is reclaimed only after LMCache would already have force-unpinned its source. Non-positive disables ATOM's reclamation. ATOM sets no default of its own; when unset it assumes LMCache's. |
 | **OFFLOAD_MAX_PENDING_SAVES** | int | **2**, flat, for the engine-side/state-tier reader (`scheduler.py`); `max(2, 2 × OFFLOAD_COPY_WORKERS)` for the KV-leg reader (`_offload_common.py`) | Bound on total in-flight offload transfers (running + queued) held before a SLOT snapshot or executor submission. A KV save and a state store both pin bytes out of the same pool while they run, so the KV leg and the K3 state tier share this one number rather than each carrying its own. Two readers compute it, though: the KV leg's canonical `_offload_common.max_pending_saves` derives the shown default from `OFFLOAD_COPY_WORKERS` and **raises** on an unparseable value, while the scheduler's state-tier reader (`_offload_max_pending_saves`) has a simpler fallback — a flat default of **2** (no `OFFLOAD_COPY_WORKERS` scaling) that **warns and uses 2** on an unparseable value rather than raising. Set the env to an explicit integer to pin both. |
+| **OFFLOAD_SAVE_MIN_OBSERVED_COUNT** | int | `2` | Hard reuse-demand floor for priority-ranked save admission. Aging and finished-request release benefit do not bypass it. |
+| **OFFLOAD_SAVE_MAX_PINNED_RATIO** | float | `0.20` | Maximum fraction of this scheduler-local physical KV pool reserved or pinned by admitted saves. Valid range is `0.0`–`0.30`; the pool is local to one DP scheduler and is not multiplied by TP size. |
+| **OFFLOAD_SAVE_MAX_PINNED_BLOCKS** | int | unset | Optional nonnegative absolute PAGE-block clamp. The effective local budget is `min(floor(total_blocks × ratio), absolute)`. |
+| **OFFLOAD_SAVE_AGING_WEIGHT** | float | `0.01` | Nonnegative per-second aging term in the priority score. |
+| **OFFLOAD_SAVE_RELEASE_WEIGHT** | float | `1.0` | Nonnegative weight for GPU blocks released by completing a finished request's save. |
+| **OFFLOAD_SAVE_DEMAND_BLOCK_TOKENS** | int | `8192` | Coarse cumulative-prefix boundary used by the independent rank-local demand tracker. |
+| **OFFLOAD_SAVE_DEMAND_MAX_ENTRIES** | int | `65536` | Maximum number of coarse prefix-demand entries per rank. |
+| **OFFLOAD_SAVE_DEMAND_TTL_SECONDS** | float | `600` | Positive quiet-time TTL for rank-local prefix-demand entries. |
 
 ## Profiling & debugging
 

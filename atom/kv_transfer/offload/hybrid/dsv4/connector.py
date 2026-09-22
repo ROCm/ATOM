@@ -31,8 +31,8 @@ import os
 import threading
 import time
 from contextlib import nullcontext
-from dataclasses import dataclass
-from math import isfinite
+from dataclasses import dataclass, replace
+from math import ceil, isfinite
 from numbers import Integral
 
 import torch
@@ -85,6 +85,12 @@ from atom.kv_transfer.offload.metadata import (
     SaveSpec,
     SlotLoadSpec,
     SlotSaveSpec,
+)
+from atom.kv_transfer.offload.save_admission import (
+    PrefixDemandKey,
+    PrefixDemandTracker,
+    SaveBlockReservation,
+    load_save_admission_config,
 )
 
 logger = logging.getLogger("atom")
@@ -146,6 +152,30 @@ def _env_positive_float(name: str, default: float) -> float:
     if value <= 0:
         raise ValueError(f"{name} must be positive")
     return value
+
+
+@dataclass(frozen=True)
+class _SaveCandidate:
+    sid: str
+    seq: object
+    generation: int
+    saved: int
+    computed: int
+    aligned: int
+    sidecar_candidate: tuple[int, int] | None
+    observed_count: int
+    reusable_tokens: int
+    enqueued_at: float
+    finished: bool
+    held_blocks: int
+
+    @property
+    def dirty_tokens(self) -> int:
+        return max(0, self.aligned - self.saved)
+
+    @property
+    def page_save_due(self) -> bool:
+        return self.aligned > self.saved
 
 
 @dataclass(frozen=True)
@@ -1888,10 +1918,52 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self._max_pending_saves = max_pending_saves(
             int(os.environ.get("OFFLOAD_COPY_WORKERS", "1") or 1)
         )
-        # Resume after the last admitted request when capacity becomes free so
-        # a long request at the head of the insertion-ordered tracker cannot
-        # monopolize the bounded save queue.
-        self._save_rr_last: str | None = None
+        # Save admission separates a lightweight candidate from a capacity-
+        # holding reservation.  This matters at request finish: connector
+        # metadata for the current step has already been built, so the request
+        # cannot be dispatched immediately.  A committed entry reserves one
+        # worker slot until the next metadata build emits it.
+        save_admission = load_save_admission_config()
+        self._save_max_pinned_ratio = save_admission.max_pinned_ratio
+        self._save_max_pinned_blocks = save_admission.max_pinned_blocks
+        self._block_manager = None
+        self._save_pin_total_blocks = 0
+        self._save_pin_budget_blocks: int | None = None
+        self._save_block_reservations: dict[
+            str | SaveOperationId, SaveBlockReservation
+        ] = {}
+        self._save_min_observed_count = save_admission.min_observed_count
+        self._save_aging_weight = save_admission.aging_weight
+        self._save_release_weight = save_admission.release_weight
+        self._prefix_demand = PrefixDemandTracker(
+            block_tokens=save_admission.demand_block_tokens,
+            max_entries=save_admission.demand_max_entries,
+            ttl_seconds=save_admission.demand_ttl_seconds,
+        )
+        self._save_demand_keys: dict[
+            str, tuple[object, tuple[PrefixDemandKey, ...]]
+        ] = {}
+        self._save_candidate_since: dict[str, tuple[object, float]] = {}
+        self._save_candidate_generation: dict[str, tuple[object, int]] = {}
+        self._save_candidate_nonce = 0
+        self._save_committed: dict[str, object] = {}
+        self._finished_save_requests: dict[str, object] = {}
+        self._finished_save_failed: set[str] = set()
+        self._save_inflight_since: dict[SaveOperationId, float] = {}
+        self._save_operation_owners: dict[SaveOperationId, object] = {}
+        self.total_save_admitted = 0
+        self.total_save_budget_rejected = 0
+        self.total_save_budget_rejected_blocks = 0
+        self.total_save_budget_evicted = 0
+        self.total_save_budget_evicted_blocks = 0
+        self.total_save_oversized = 0
+        self._save_drop_totals = {
+            "capacity": 0,
+            "low_value": 0,
+            "terminal_failure": 0,
+            "stale": 0,
+        }
+        self._save_drop_token_totals = dict.fromkeys(self._save_drop_totals, 0)
         # Scheduler-lifetime completion generation: every emitted save gets a
         # distinct SaveOperationId, so late TP notifications cannot complete a
         # later PAGE/SLOT save after request cleanup or request-ID reuse.
@@ -1904,7 +1976,9 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         # ``build_connector_meta`` advances the saved watermark where it *emits*
         # a save, so the advance is a prediction, not a fact. Keep what each one
         # was contingent on so a save that never lands can take its advance back.
-        self._save_watermark_rollback: dict[str, dict[SaveOperationId, int]] = {}
+        self._save_watermark_rollback: dict[
+            str, dict[SaveOperationId, tuple[object, int]]
+        ] = {}
         # Stateful PAGE/SLOT protocol. Sidecar commits are session-local because
         # worker-side sidecar storage is not queried by the scheduler.
         self._committed_sidecar_hashes = _BoundedLRUSet(
@@ -1952,6 +2026,20 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             logger.warning(
                 "LMCache offload scheduler: lookup client unavailable: %s", e
             )
+
+    def bind_block_manager(self, block_manager) -> None:
+        if self._block_manager is not None and self._block_manager is not block_manager:
+            raise RuntimeError("offload scheduler is already bound to a block manager")
+        self._block_manager = block_manager
+        total_blocks = int(block_manager.total_allocatable_kv_blocks)
+        if total_blocks <= 0:
+            raise ValueError("BlockManager must expose a positive KV block capacity")
+        ratio_budget = int(total_blocks * self._save_max_pinned_ratio)
+        absolute = self._save_max_pinned_blocks
+        self._save_pin_total_blocks = total_blocks
+        self._save_pin_budget_blocks = (
+            ratio_budget if absolute is None else min(ratio_budget, absolute)
+        )
 
     # -- match: how many extra tokens can come from CPU/NVMe -------------
     def _begin_load_lifecycle(self, seq) -> None:
@@ -2082,6 +2170,23 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             entry = self._save_tracker.get(sid)
             if entry is None or entry[0] is not seq:
                 self._save_tracker[sid] = [seq, initial_saved]
+                now = time.monotonic()
+                demand_keys = self._prefix_demand.observe(
+                    seq.token_ids,
+                    int(seq.num_prompt_tokens),
+                    now,
+                )
+                self._save_demand_keys[sid] = (seq, demand_keys)
+                self._save_candidate_generation[sid] = (
+                    seq,
+                    self._save_candidate_nonce,
+                )
+                self._save_candidate_nonce += 1
+                previous_committed = self._save_committed.pop(sid, None)
+                if previous_committed is not None:
+                    self._release_save_reservation(sid, owner=previous_committed)
+                self._finished_save_requests.pop(sid, None)
+                self._finished_save_failed.discard(sid)
                 self._sidecar_hash_cache.pop(sid, None)
                 self._failed_sidecar_saves.pop(sid, None)
             else:
@@ -2181,15 +2286,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self._save_nonce += 1
         return operation
 
-    def _may_emit_save(self) -> bool:
-        """Return whether the scheduler may dispatch one more save operation.
-
-        A PAGE+SLOT request is one worker operation even though both completion
-        channels retain its identity. Counting distinct operation IDs keeps the
-        scheduler's view equal to the worker semaphore while old multi-inflight
-        state, if any, drains safely.
-        """
-
+    def _inflight_save_operations(self) -> set[SaveOperationId]:
         operations = {
             operation
             for inflight in self._save_inflight.values()
@@ -2198,7 +2295,506 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         operations.update(
             inflight[0] for inflight in self._sidecar_save_inflight.values()
         )
-        return len(operations) < self._max_pending_saves
+        return operations
+
+    def _retire_save_operation_owner(self, operation: SaveOperationId) -> None:
+        if any(operation in inflight for inflight in self._save_inflight.values()):
+            return
+        if any(
+            inflight[0] == operation
+            for inflight in self._sidecar_save_inflight.values()
+        ):
+            return
+        self._save_inflight_since.pop(operation, None)
+        owner = self._save_operation_owners.pop(operation, None)
+        self._release_save_reservation(operation, owner=owner)
+
+    def _may_emit_save(self) -> bool:
+        """Return whether the scheduler may dispatch one more save operation.
+
+        A PAGE+SLOT request is one worker operation even though both completion
+        channels retain its identity. Counting distinct operation IDs keeps the
+        scheduler's view equal to the worker semaphore while old multi-inflight
+        state, if any, drains safely. A committed finished save also consumes a
+        slot: it is guaranteed dispatch on the next metadata build and must not
+        be overbooked by an active request in the meantime.
+        """
+
+        return (
+            len(self._inflight_save_operations()) + len(self._save_committed)
+            < self._max_pending_saves
+        )
+
+    def _save_count_allows(self, committed_after: int) -> bool:
+        return (
+            len(self._inflight_save_operations()) + committed_after
+            <= self._max_pending_saves
+        )
+
+    def _pinned_save_block_ids(
+        self,
+        reservations: dict[str | SaveOperationId, SaveBlockReservation],
+    ) -> set[int]:
+        pinned: set[int] = set()
+        for reservation in reservations.values():
+            if self._finished_save_requests.get(reservation.sid) is reservation.seq:
+                pinned.update(reservation.block_ids)
+        return pinned
+
+    def _save_block_usage(
+        self,
+        reservations: dict[str | SaveOperationId, SaveBlockReservation] | None = None,
+    ) -> tuple[int, int, int]:
+        """Return ``(reserved, pinned, total_budget_usage)`` without double count."""
+
+        current = (
+            self._save_block_reservations if reservations is None else reservations
+        )
+        pinned_ids = self._pinned_save_block_ids(current)
+        reserved_ids: set[int] = set()
+        pinned_estimated = 0
+        reserved_estimated = 0
+        for reservation in current.values():
+            if self._finished_save_requests.get(reservation.sid) is reservation.seq:
+                pinned_estimated += int(reservation.estimated_blocks)
+            else:
+                reserved_ids.update(reservation.block_ids)
+                reserved_estimated += int(reservation.estimated_blocks)
+        reserved = len(reserved_ids - pinned_ids) + reserved_estimated
+        pinned = len(pinned_ids) + pinned_estimated
+        total = len(pinned_ids | reserved_ids) + pinned_estimated + reserved_estimated
+        return reserved, pinned, total
+
+    def _candidate_block_reservation(
+        self,
+        candidate: _SaveCandidate,
+        *,
+        priority_score: float,
+    ) -> SaveBlockReservation:
+        # DSV4 in this branch cannot release PAGE source ranges independently.
+        # If the request finishes while its PAGE or SLOT save is outstanding,
+        # teardown retains the complete block table. Reserve that exact local
+        # physical footprint up front so admission cannot pretend only the
+        # dirty PAGE interval is pinned.
+        table = list(getattr(candidate.seq, "block_table", ()))
+        physical_ids = [int(block_id) for block_id in table if int(block_id) >= 0]
+        block_ids = frozenset(physical_ids)
+        required_tokens = max(
+            candidate.aligned if candidate.page_save_due else 0,
+            (
+                candidate.sidecar_candidate[0]
+                if candidate.sidecar_candidate is not None
+                else 0
+            ),
+        )
+        required_blocks = ceil(required_tokens / max(1, int(self.block_size)))
+        estimated = max(0, required_blocks - len(physical_ids))
+        return SaveBlockReservation(
+            sid=candidate.sid,
+            seq=candidate.seq,
+            generation=candidate.generation,
+            block_ids=block_ids,
+            estimated_blocks=estimated,
+            priority_score=float(priority_score),
+            committed=True,
+        )
+
+    @staticmethod
+    def _reservation_footprint(reservation: SaveBlockReservation) -> int:
+        return len(reservation.block_ids) + int(reservation.estimated_blocks)
+
+    def _reservation_fits(
+        self,
+        reservation: SaveBlockReservation,
+        *,
+        victim_keys: tuple[str, ...] = (),
+    ) -> bool:
+        projected = dict(self._save_block_reservations)
+        for key in victim_keys:
+            projected.pop(key, None)
+        projected[reservation.sid] = reservation
+        committed_after = sum(item.committed for item in projected.values())
+        if not self._save_count_allows(committed_after):
+            return False
+        budget = self._save_pin_budget_blocks
+        return budget is None or self._save_block_usage(projected)[2] <= budget
+
+    def _try_reserve_save_candidate(
+        self,
+        candidate: _SaveCandidate,
+        *,
+        allow_eviction: bool,
+        now: float | None = None,
+    ) -> bool:
+        """Atomically reserve one DSV4 PAGE+SLOT save operation."""
+
+        existing = self._save_block_reservations.get(candidate.sid)
+        if (
+            existing is not None
+            and existing.seq is candidate.seq
+            and existing.generation == candidate.generation
+            and existing.committed
+        ):
+            return True
+
+        score = self._candidate_priority(
+            candidate,
+            time.monotonic() if now is None else now,
+        )
+        reservation = self._candidate_block_reservation(candidate, priority_score=score)
+        victims: list[SaveBlockReservation] = []
+        if not self._reservation_fits(reservation):
+            if allow_eviction:
+                eligible = sorted(
+                    (
+                        item
+                        for key, item in self._save_block_reservations.items()
+                        if isinstance(key, str)
+                        and item.committed
+                        and item.priority_score < reservation.priority_score
+                        and self._save_committed.get(key) is item.seq
+                        and key not in self._save_inflight
+                        and key not in self._sidecar_save_inflight
+                        and (entry := self._save_tracker.get(key)) is not None
+                        and entry[0] is item.seq
+                    ),
+                    key=lambda item: (
+                        item.priority_score,
+                        item.sid,
+                        item.generation,
+                    ),
+                )
+                for victim in eligible:
+                    victims.append(victim)
+                    if self._reservation_fits(
+                        reservation,
+                        victim_keys=tuple(item.sid for item in victims),
+                    ):
+                        break
+                else:
+                    victims = []
+            if not victims and not self._reservation_fits(reservation):
+                footprint = self._reservation_footprint(reservation)
+                self.total_save_budget_rejected += 1
+                self.total_save_budget_rejected_blocks += footprint
+                budget = self._save_pin_budget_blocks
+                if budget is not None and footprint > budget:
+                    self.total_save_oversized += 1
+                return False
+
+        # Simulate the whole victim set before mutating anything. PAGE and SLOT
+        # share one reservation and therefore can only be replaced together.
+        for victim in victims:
+            self.total_save_budget_evicted += 1
+            self.total_save_budget_evicted_blocks += self._reservation_footprint(victim)
+            self.drop_unadmitted_save(victim.seq, reason="capacity")
+        self._save_committed[candidate.sid] = candidate.seq
+        self._save_block_reservations[candidate.sid] = reservation
+        self.total_save_admitted += 1
+        return True
+
+    def _release_save_reservation(
+        self,
+        key: str | SaveOperationId,
+        *,
+        owner=None,
+    ) -> SaveBlockReservation | None:
+        reservation = self._save_block_reservations.get(key)
+        if reservation is None or (owner is not None and reservation.seq is not owner):
+            return None
+        return self._save_block_reservations.pop(key)
+
+    def _refresh_finished_save_reservations(self, seq) -> None:
+        """Charge every physical block retained by a now-finished request."""
+
+        block_ids = frozenset(
+            physical_id
+            for block_id in getattr(seq, "block_table", ())
+            if (physical_id := int(block_id)) >= 0
+        )
+        for key, reservation in list(self._save_block_reservations.items()):
+            if reservation.seq is seq:
+                self._save_block_reservations[key] = replace(
+                    reservation,
+                    block_ids=block_ids,
+                    estimated_blocks=0,
+                )
+
+    def _candidate_generation_for(self, sid: str, seq) -> int:
+        record = self._save_candidate_generation.get(sid)
+        if record is not None and record[0] is seq:
+            return record[1]
+        generation = self._save_candidate_nonce
+        self._save_candidate_nonce += 1
+        self._save_candidate_generation[sid] = (seq, generation)
+        return generation
+
+    def _candidate_since_for(self, sid: str, seq, now: float) -> float:
+        record = self._save_candidate_since.get(sid)
+        if record is not None and record[0] is seq:
+            return record[1]
+        self._save_candidate_since[sid] = (seq, now)
+        return now
+
+    def _candidate_demand(
+        self,
+        sid: str,
+        seq,
+        *,
+        aligned: int,
+        now: float,
+    ) -> tuple[int, int]:
+        record = self._save_demand_keys.get(sid)
+        if record is None or record[0] is not seq:
+            return 0, 0
+        return self._prefix_demand.heat(
+            record[1],
+            max_tokens=aligned,
+            now=now,
+        )
+
+    def _build_save_candidate(
+        self, sid: str, *, now: float | None = None
+    ) -> _SaveCandidate | None:
+        entry = self._save_tracker.get(sid)
+        if entry is None:
+            return None
+        seq, saved = entry
+        computed = min(
+            int(getattr(seq, "num_cached_tokens", 0)),
+            int(getattr(seq, "num_prompt_tokens", 0)),
+        )
+        chunk = int(self.chunk_size or 256)
+        aligned = (computed // chunk) * chunk
+        sidecar_candidate = self._sidecar_save_candidate(seq, computed)
+        if aligned <= int(saved) and sidecar_candidate is None:
+            return None
+        candidate_now = time.monotonic() if now is None else float(now)
+        observed_count, reusable_tokens = self._candidate_demand(
+            sid,
+            seq,
+            aligned=aligned,
+            now=candidate_now,
+        )
+        finished = self._finished_save_requests.get(sid) is seq
+        return _SaveCandidate(
+            sid=sid,
+            seq=seq,
+            generation=self._candidate_generation_for(sid, seq),
+            saved=int(saved),
+            computed=computed,
+            aligned=aligned,
+            sidecar_candidate=sidecar_candidate,
+            observed_count=observed_count,
+            reusable_tokens=reusable_tokens,
+            enqueued_at=self._candidate_since_for(sid, seq, candidate_now),
+            finished=finished,
+            held_blocks=len(getattr(seq, "block_table", ())) if finished else 0,
+        )
+
+    def _candidate_priority(self, candidate: _SaveCandidate, now: float) -> float:
+        chunk = max(1, int(self.chunk_size or 256))
+        cost_units = max(1, ceil(candidate.dirty_tokens / chunk))
+        reusable = max(candidate.reusable_tokens, chunk)
+        benefit = candidate.observed_count * reusable
+        release_bonus = (
+            self._save_release_weight
+            * candidate.held_blocks
+            * max(1, int(self.block_size))
+        )
+        age = max(0.0, now - candidate.enqueued_at)
+        return (benefit + release_bonus) / cost_units + self._save_aging_weight * age
+
+    def _candidate_sort_key(
+        self, candidate: _SaveCandidate, now: float
+    ) -> tuple[float, int, float, str, int]:
+        return (
+            -self._candidate_priority(candidate, now),
+            candidate.dirty_tokens,
+            candidate.enqueued_at,
+            candidate.sid,
+            candidate.generation,
+        )
+
+    def _meets_save_value_threshold(self, candidate: _SaveCandidate) -> bool:
+        return candidate.observed_count >= self._save_min_observed_count
+
+    def _commit_finished_save(self, candidate: _SaveCandidate) -> bool:
+        if not candidate.finished or not self._meets_save_value_threshold(candidate):
+            return False
+        entry = self._save_tracker.get(candidate.sid)
+        if entry is None or entry[0] is not candidate.seq:
+            return False
+        return self._try_reserve_save_candidate(
+            candidate,
+            allow_eviction=True,
+        )
+
+    def _forget_save_candidate(self, sid: str, seq) -> None:
+        for mapping in (
+            self._save_demand_keys,
+            self._save_candidate_since,
+            self._save_candidate_generation,
+        ):
+            record = mapping.get(sid)
+            if record is not None and record[0] is seq:
+                mapping.pop(sid, None)
+
+    def drop_unadmitted_save(self, seq, *, reason: str) -> bool:
+        """Drop save work that has never been handed to a worker.
+
+        PAGE and SLOT form one checkpoint operation, so cleanup is all-or-none.
+        An inflight operation is never cancelled here; its source may already
+        be in use by a worker.
+        """
+
+        sid = str(seq.id)
+        if sid in self._save_inflight or sid in self._sidecar_save_inflight:
+            return False
+        entry = self._save_tracker.get(sid)
+        if entry is None or entry[0] is not seq:
+            return False
+        candidate = self._build_save_candidate(sid)
+        dropped_tokens = 0 if candidate is None else candidate.dirty_tokens
+        self._save_tracker.pop(sid, None)
+        if self._save_committed.get(sid) is seq:
+            self._save_committed.pop(sid, None)
+        self._release_save_reservation(sid, owner=seq)
+        if self._finished_save_requests.get(sid) is seq:
+            self._finished_save_requests.pop(sid, None)
+        self._finished_save_failed.discard(sid)
+        self._failed_sidecar_saves.pop(sid, None)
+        self._save_watermark_rollback.pop(sid, None)
+        cached = self._sidecar_hash_cache.get(sid)
+        if cached is not None and cached[0] is seq:
+            self._sidecar_hash_cache.pop(sid, None)
+        self._forget_save_candidate(sid, seq)
+        if reason not in self._save_drop_totals:
+            reason = "stale"
+        self._save_drop_totals[reason] += 1
+        self._save_drop_token_totals[reason] += dropped_tokens
+        logger.info(
+            "LMCache offload: dropped unadmitted save req=%s reason=%s tokens=%d",
+            sid,
+            reason,
+            dropped_tokens,
+        )
+        return True
+
+    def _settle_finished_save(self, sid: str) -> None:
+        seq = self._finished_save_requests.get(sid)
+        if seq is None:
+            return
+        if (
+            sid in self._save_inflight
+            or sid in self._sidecar_save_inflight
+            or sid in self._save_committed
+        ):
+            return
+        if sid in self._finished_save_failed:
+            self.drop_unadmitted_save(seq, reason="terminal_failure")
+            return
+        candidate = self._build_save_candidate(sid)
+        if candidate is None:
+            entry = self._save_tracker.get(sid)
+            if entry is not None and entry[0] is seq:
+                self._save_tracker.pop(sid, None)
+            self._finished_save_requests.pop(sid, None)
+            self._finished_save_failed.discard(sid)
+            self._failed_sidecar_saves.pop(sid, None)
+            self._save_watermark_rollback.pop(sid, None)
+            self._forget_save_candidate(sid, seq)
+            return
+        if self._commit_finished_save(candidate):
+            return
+        reason = (
+            "low_value"
+            if not self._meets_save_value_threshold(candidate)
+            else "capacity"
+        )
+        self.drop_unadmitted_save(seq, reason=reason)
+
+    def _emit_save_candidate(
+        self,
+        meta: LMCacheOffloadMetadata,
+        candidate: _SaveCandidate,
+    ) -> None:
+        sid = candidate.sid
+        seq = candidate.seq
+        slot_save_spec = None
+        if candidate.sidecar_candidate is not None:
+            boundary, boundary_hash = candidate.sidecar_candidate
+            slot_save_spec = SlotSaveSpec(
+                boundary_tokens=boundary,
+                boundary_block_hash=boundary_hash,
+                source_group=int(seq.state_slot),
+            )
+        token_end = max(
+            candidate.aligned if candidate.page_save_due else 0,
+            (
+                candidate.sidecar_candidate[0]
+                if candidate.sidecar_candidate is not None
+                else 0
+            ),
+        )
+        logger.debug(
+            "[OFFLOAD-SAVE-EMIT] seq=%s computed=%d num_prompt=%d "
+            "aligned=%d saved=%d sidecar=%s observed=%d",
+            seq.id,
+            candidate.computed,
+            int(seq.num_prompt_tokens),
+            candidate.aligned,
+            candidate.saved,
+            candidate.sidecar_candidate,
+            candidate.observed_count,
+        )
+        save_operation = self._next_save_operation(seq)
+        committed_reservation = self._save_block_reservations.get(sid)
+        if (
+            committed_reservation is None
+            or committed_reservation.seq is not seq
+            or committed_reservation.generation != candidate.generation
+            or not committed_reservation.committed
+        ):
+            return
+        self._track_save_statistics(save_operation, candidate.dirty_tokens)
+        self._save_inflight_since[save_operation] = time.monotonic()
+        self._save_operation_owners[save_operation] = seq
+        meta.add_request(
+            LMCacheReqMeta(
+                req_id=seq.id,
+                token_ids=list(seq.token_ids[:token_end]),
+                block_ids=list(seq.block_table),
+                save_spec=(
+                    SaveSpec(skip_leading_tokens=candidate.saved, can_save=True)
+                    if candidate.page_save_due
+                    else None
+                ),
+                is_last_prefill=(candidate.computed >= int(seq.num_prompt_tokens)),
+                slot_save_spec=slot_save_spec,
+                save_operation=save_operation,
+            )
+        )
+        entry = self._save_tracker.get(sid)
+        if candidate.page_save_due and entry is not None and entry[0] is seq:
+            self._save_watermark_rollback.setdefault(sid, {})[save_operation] = (
+                seq,
+                int(entry[1]),
+            )
+            entry[1] = candidate.aligned
+            self._save_inflight.setdefault(sid, set()).add(save_operation)
+        if candidate.sidecar_candidate is not None:
+            self._sidecar_save_inflight[sid] = (
+                save_operation,
+                candidate.sidecar_candidate[0],
+                candidate.sidecar_candidate[1],
+            )
+        self._save_committed.pop(sid, None)
+        self._release_save_reservation(sid, owner=seq)
+        self._save_block_reservations[save_operation] = replace(
+            committed_reservation,
+            committed=False,
+        )
 
     def _clear_lookup_status(self, sid: str) -> None:
         if self._lookup_client is None:
@@ -2390,92 +2986,67 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         meta.lookup_requests_in_step = [
             sid for sid in self._lookup_in_step if sid not in self._handoff_loads
         ]
-        # Saves: store fully computed prompt chunks. Under scheduler-side
-        # chunked prefill, seq.num_cached_tokens advances after each prefill
-        # chunk's forward has completed; use it as the D2H-safe frontier.
-        chunk = self.chunk_size or 256
-        tracker_sids = list(self._save_tracker.keys())
-        if tracker_sids and self._save_rr_last in self._save_tracker:
-            start = (tracker_sids.index(self._save_rr_last) + 1) % len(tracker_sids)
-            tracker_sids = tracker_sids[start:] + tracker_sids[:start]
-        for sid in tracker_sids:
-            if not self._do_save:
-                continue
-            if not self._may_emit_save():
-                break
-            entry = self._save_tracker[sid]
-            seq, saved = entry
-            if sid in self._reqs_need_recv or sid in loading_sids:
-                continue  # loading this step; defer its save
-            if sid in self._save_inflight or sid in self._sidecar_save_inflight:
-                # A request's PAGE and SLOT describe one ordered checkpoint
-                # stream. Do not let a later boundary overtake an earlier save.
-                continue
-            computed = min(
-                int(getattr(seq, "num_cached_tokens", 0)),
-                int(seq.num_prompt_tokens),
+        # Saves. Admit/replace the complete candidate set before
+        # dispatch so a newly hotter candidate can still evict lower-value
+        # committed work. Dispatching first would make that work inflight and
+        # therefore correctly, but prematurely, non-evictable.
+        if self._do_save:
+            now = time.monotonic()
+            for sid, seq in list(self._save_committed.items()):
+                entry = self._save_tracker.get(sid)
+                if entry is None or entry[0] is not seq:
+                    self._save_committed.pop(sid, None)
+                    self._release_save_reservation(sid, owner=seq)
+                    continue
+                candidate = self._build_save_candidate(sid, now=now)
+                if candidate is None:
+                    self._save_committed.pop(sid, None)
+                    self._release_save_reservation(sid, owner=seq)
+                    self._settle_finished_save(sid)
+
+            candidates = [
+                candidate
+                for sid in self._save_tracker
+                if (candidate := self._build_save_candidate(sid, now=now)) is not None
+                and self._meets_save_value_threshold(candidate)
+            ]
+            candidates.sort(
+                key=lambda candidate: self._candidate_sort_key(candidate, now)
             )
-            is_last_prefill = computed >= int(seq.num_prompt_tokens)
-            aligned = (computed // chunk) * chunk
-            sidecar_candidate = self._sidecar_save_candidate(seq, computed)
-            page_save_due = aligned > saved
-            if not page_save_due and sidecar_candidate is None:
-                continue
-            slot_save_spec = None
-            if sidecar_candidate is not None:
-                boundary, boundary_hash = sidecar_candidate
-                slot_save_spec = SlotSaveSpec(
-                    boundary_tokens=boundary,
-                    boundary_block_hash=boundary_hash,
-                    source_group=int(seq.state_slot),
-                )
-            token_end = max(
-                aligned if page_save_due else 0,
-                sidecar_candidate[0] if sidecar_candidate is not None else 0,
+
+            for candidate in candidates:
+                sid = candidate.sid
+                if sid in self._save_committed:
+                    continue
+                if sid in self._reqs_need_recv or sid in loading_sids:
+                    continue
+                if sid in self._save_inflight or sid in self._sidecar_save_inflight:
+                    continue
+                if not self._try_reserve_save_candidate(
+                    candidate,
+                    allow_eviction=True,
+                    now=now,
+                ):
+                    self.drop_unadmitted_save(candidate.seq, reason="capacity")
+
+            committed = []
+            for sid, seq in list(self._save_committed.items()):
+                candidate = self._build_save_candidate(sid, now=now)
+                if candidate is None or candidate.seq is not seq:
+                    self._save_committed.pop(sid, None)
+                    self._release_save_reservation(sid, owner=seq)
+                    continue
+                committed.append(candidate)
+            committed.sort(
+                key=lambda candidate: self._candidate_sort_key(candidate, now)
             )
-            logger.debug(
-                "[OFFLOAD-SAVE-EMIT] seq=%s computed=%d num_prompt=%d "
-                "aligned=%d saved=%d sidecar=%s",
-                seq.id,
-                computed,
-                int(seq.num_prompt_tokens),
-                aligned,
-                saved,
-                sidecar_candidate,
-            )
-            save_operation = self._next_save_operation(seq)
-            self._track_save_statistics(
-                save_operation,
-                aligned - saved if page_save_due else 0,
-            )
-            meta.add_request(
-                LMCacheReqMeta(
-                    req_id=seq.id,
-                    token_ids=list(seq.token_ids[:token_end]),
-                    block_ids=list(seq.block_table),
-                    save_spec=(
-                        SaveSpec(skip_leading_tokens=saved, can_save=True)
-                        if page_save_due
-                        else None
-                    ),
-                    is_last_prefill=is_last_prefill,
-                    slot_save_spec=slot_save_spec,
-                    save_operation=save_operation,
-                )
-            )
-            if page_save_due:
-                self._save_watermark_rollback.setdefault(sid, {})[save_operation] = int(
-                    entry[1]
-                )
-                entry[1] = aligned
-                self._save_inflight.setdefault(sid, set()).add(save_operation)
-            if sidecar_candidate is not None:
-                self._sidecar_save_inflight[sid] = (
-                    save_operation,
-                    sidecar_candidate[0],
-                    sidecar_candidate[1],
-                )
-            self._save_rr_last = sid
+            for candidate in committed:
+                sid = candidate.sid
+                if sid in self._reqs_need_recv or sid in loading_sids:
+                    continue
+                if sid in self._save_inflight or sid in self._sidecar_save_inflight:
+                    continue
+                self._emit_save_candidate(meta, candidate)
         dispatched = set(meta.lookup_requests_in_step)
         self._lookup_in_step = [
             sid for sid in self._lookup_in_step if sid not in dispatched
@@ -2502,6 +3073,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         return (
             sid in self._save_inflight
             or sid in self._sidecar_save_inflight
+            or self._save_committed.get(sid) is seq
             or self._has_pending_save(seq)
             or self._has_pending_sidecar_save(seq)
         )
@@ -2512,19 +3084,22 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         Feeds ``EngineCore.has_pending_kv_work()``, so it reads only state
         that clears itself: ``_reqs_need_recv`` is emptied by every
         ``build_connector_meta`` and ``_save_inflight`` by ``save_finished``.
-        Saves that are queued but not yet dispatched are covered there by the
-        scheduler's ``deferred_free_blocks``, which ``should_defer_free``
-        keeps populated for exactly those requests.
+        A priority save committed after its request finished is included even
+        before its next-step dispatch, so an idle engine keeps producing
+        connector metadata until that reservation becomes an operation.
         """
         return bool(
-            self._reqs_need_recv or self._save_inflight or self._sidecar_save_inflight
+            self._reqs_need_recv
+            or self._save_committed
+            or self._save_inflight
+            or self._sidecar_save_inflight
         )
 
     @staticmethod
     def _watermark_sid(operation) -> str:
         return str(getattr(operation, "req_id", operation))
 
-    def _forget_save_watermark(self, operation) -> int | None:
+    def _forget_save_watermark(self, operation) -> tuple[object, int] | None:
         """Drop one operation's contingency record, returning what it held."""
         sid = self._watermark_sid(operation)
         pending = self._save_watermark_rollback.get(sid)
@@ -2553,12 +3128,13 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         prefix has to be contiguous anyway, so everything beyond the hole was
         unusable regardless.
         """
-        previous = self._forget_save_watermark(operation)
-        if previous is None:
+        rollback = self._forget_save_watermark(operation)
+        if rollback is None:
             return
+        seq, previous = rollback
         sid = self._watermark_sid(operation)
         entry = self._save_tracker.get(sid)
-        if entry is None:
+        if entry is None or entry[0] is not seq:
             return
         current = int(entry[1])
         if current <= previous:
@@ -2575,12 +3151,17 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
     def save_finished(self, req_id) -> None:
         if isinstance(req_id, SaveOperationId):
             sid = str(req_id.req_id)
+            owner = self._save_operation_owners.get(req_id)
             inflight = self._save_inflight.get(sid)
             if inflight is not None:
                 inflight.discard(req_id)
                 if not inflight:
                     self._save_inflight.pop(sid, None)
+            self._save_inflight_since.pop(req_id, None)
             self._finish_save_statistics(req_id)
+            self._retire_save_operation_owner(req_id)
+            if owner is not None and self._finished_save_requests.get(sid) is owner:
+                self._settle_finished_save(sid)
             return
 
         sid = str(req_id)
@@ -2591,8 +3172,13 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             return
         if sid in self._sidecar_save_inflight:
             return
-        self._save_inflight.pop(sid, None)
+        retired = self._save_inflight.pop(sid, None)
+        if retired is not None:
+            for operation in retired:
+                self._save_inflight_since.pop(operation, None)
+                self._retire_save_operation_owner(operation)
         self._finish_save_statistics(req_id)
+        self._settle_finished_save(sid)
 
     def abandon_save(self, req_id) -> None:
         """Force-drop a save the scheduler reclaimed after it stalled.
@@ -2610,14 +3196,34 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         entry is dropped so the save loop cannot re-emit against freed blocks.
         """
         sid = str(req_id.req_id if isinstance(req_id, SaveOperationId) else req_id)
+        retired_operations: set[SaveOperationId] = set()
         inflight = self._save_inflight.pop(sid, None)
         if inflight is not None:
             for operation in inflight:
+                retired_operations.add(operation)
+                self._save_inflight_since.pop(operation, None)
+                self._save_operation_owners.pop(operation, None)
                 self._cancel_save_statistics(operation)
         sidecar = self._sidecar_save_inflight.pop(sid, None)
         if sidecar is not None:
+            retired_operations.add(sidecar[0])
+            self._save_inflight_since.pop(sidecar[0], None)
+            self._save_operation_owners.pop(sidecar[0], None)
             self._cancel_save_statistics(sidecar[0])
+        for operation in retired_operations:
+            self._release_save_reservation(operation)
+        committed = self._save_committed.pop(sid, None)
+        if committed is not None:
+            self._release_save_reservation(sid, owner=committed)
+        finished = self._finished_save_requests.pop(sid, None)
+        seq = finished if finished is not None else committed
+        if seq is None:
+            entry = self._save_tracker.get(sid)
+            seq = None if entry is None else entry[0]
         self._save_tracker.pop(sid, None)
+        self._finished_save_failed.discard(sid)
+        if seq is not None:
+            self._forget_save_candidate(sid, seq)
         # The tracker entry is gone, so there is no longer a watermark to take
         # back; keeping the records would only leak.
         self._save_watermark_rollback.pop(sid, None)
@@ -2642,6 +3248,19 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             if completion.succeeded:
                 self._release_save_watermark(completion.operation_id)
             else:
+                sid = self._watermark_sid(completion.operation_id)
+                inflight = self._save_inflight.get(sid, set())
+                sidecar = self._sidecar_save_inflight.get(sid)
+                owns_operation = completion.operation_id in inflight or (
+                    sidecar is not None and sidecar[0] == completion.operation_id
+                )
+                owner = self._save_operation_owners.get(completion.operation_id)
+                if (
+                    owns_operation
+                    and owner is not None
+                    and self._finished_save_requests.get(sid) is owner
+                ):
+                    self._finished_save_failed.add(sid)
                 self._rollback_save_watermark(completion.operation_id)
                 # Nothing was persisted, so these bytes must not land in
                 # `total_saved_tokens`; cancelling first makes the
@@ -2667,6 +3286,8 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             inflight[0], SaveOperationId
         ):
             return
+        operation = inflight[0]
+        owner = self._save_operation_owners.get(operation)
         self._sidecar_save_inflight.pop(sid, None)
         identity = (inflight[1], inflight[2])
         self._committed_sidecar_hashes.add(identity[1])
@@ -2675,6 +3296,9 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             failed.discard(identity)
             if not failed:
                 self._failed_sidecar_saves.pop(sid, None)
+        self._retire_save_operation_owner(operation)
+        if owner is not None and self._finished_save_requests.get(sid) is owner:
+            self._settle_finished_save(sid)
 
     def sidecar_save_failed(self, req_id) -> None:
         sid = str(req_id.req_id if isinstance(req_id, SaveOperationId) else req_id)
@@ -2687,9 +3311,16 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             inflight[0], SaveOperationId
         ):
             return
+        operation = inflight[0]
+        owner = self._save_operation_owners.get(operation)
+        if owner is not None and self._finished_save_requests.get(sid) is owner:
+            self._finished_save_failed.add(sid)
         self._sidecar_save_inflight.pop(sid, None)
         identity = (inflight[1], inflight[2])
         self._failed_sidecar_saves.setdefault(sid, set()).add(identity)
+        self._retire_save_operation_owner(operation)
+        if owner is not None and self._finished_save_requests.get(sid) is owner:
+            self._settle_finished_save(sid)
 
     def load_failed(self, req_id) -> bool:
         sid = str(req_id.req_id if isinstance(req_id, LoadOperationId) else req_id)
@@ -2728,6 +3359,78 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self._load_save_floors.pop(sid, None)
         return True
 
+    def get_statistics(self) -> dict[str, int | float]:
+        statistics = super().get_statistics()
+        now = time.monotonic()
+        candidates = []
+        for sid in self._save_tracker:
+            if (
+                sid in self._save_inflight
+                or sid in self._sidecar_save_inflight
+                or sid in self._save_committed
+            ):
+                continue
+            candidate = self._build_save_candidate(sid, now=now)
+            if candidate is not None:
+                candidates.append(candidate)
+
+        finished = [
+            candidate
+            for candidate in candidates
+            if self._finished_save_requests.get(candidate.sid) is candidate.seq
+        ]
+        candidate_scores = [
+            self._candidate_priority(candidate, now) for candidate in candidates
+        ]
+        reserved_blocks, pinned_blocks, budget_used = self._save_block_usage()
+        budget = self._save_pin_budget_blocks
+        total_blocks = self._save_pin_total_blocks
+        statistics.update(
+            save_candidates=len(candidates),
+            save_candidates_finished=len(finished),
+            save_committed=len(self._save_committed),
+            save_admitted=self.total_save_admitted,
+            save_candidate_wait_seconds=max(
+                (max(0.0, now - candidate.enqueued_at) for candidate in candidates),
+                default=0.0,
+            ),
+            save_priority_score=max(candidate_scores, default=0.0),
+            save_inflight_wait_seconds=max(
+                (
+                    max(0.0, now - started)
+                    for started in self._save_inflight_since.values()
+                ),
+                default=0.0,
+            ),
+            save_pinned_blocks=pinned_blocks,
+            save_pinned_tokens=pinned_blocks * int(self.block_size),
+            save_pin_budget_blocks=0 if budget is None else budget,
+            save_reserved_blocks=reserved_blocks,
+            save_pinned_ratio=(budget_used / total_blocks if total_blocks > 0 else 0.0),
+            save_budget_available_blocks=(
+                0 if budget is None else max(0, budget - budget_used)
+            ),
+            save_budget_rejected=self.total_save_budget_rejected,
+            save_budget_rejected_blocks=self.total_save_budget_rejected_blocks,
+            save_budget_evicted=self.total_save_budget_evicted,
+            save_budget_evicted_blocks=self.total_save_budget_evicted_blocks,
+            save_oversized=self.total_save_oversized,
+            deferred_free_requests=len(
+                {
+                    reservation.sid
+                    for reservation in self._save_block_reservations.values()
+                    if self._finished_save_requests.get(reservation.sid)
+                    is reservation.seq
+                }
+            ),
+        )
+        for reason, total in self._save_drop_totals.items():
+            statistics[f"save_dropped_{reason}"] = total
+            statistics[f"save_dropped_tokens_{reason}"] = self._save_drop_token_totals[
+                reason
+            ]
+        return statistics
+
     def request_finished(self, seq) -> None:
         sid = str(seq.id)
         if self._load_lifecycles.get(sid) is seq:
@@ -2742,10 +3445,25 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         if cached is not None and cached[0] is seq:
             self._sidecar_hash_cache.pop(sid, None)
         entry = self._save_tracker.get(sid)
-        if entry is not None and entry[0] is seq and not self.should_defer_free(seq):
-            self._save_tracker.pop(sid, None)
-            self._failed_sidecar_saves.pop(sid, None)
-            self._save_watermark_rollback.pop(sid, None)
+        if entry is not None and entry[0] is seq:
+            self._finished_save_requests[sid] = seq
+            self._refresh_finished_save_reservations(seq)
+            if (
+                sid in self._save_inflight
+                or sid in self._sidecar_save_inflight
+                or self._save_committed.get(sid) is seq
+            ):
+                # Already committed/dispatched. Its terminal callbacks will
+                # either reserve one residual tail or drop it.
+                pass
+            else:
+                candidate = self._build_save_candidate(sid)
+                if candidate is None:
+                    self._settle_finished_save(sid)
+                elif not self._meets_save_value_threshold(candidate):
+                    self.drop_unadmitted_save(seq, reason="low_value")
+                elif not self._commit_finished_save(candidate):
+                    self.drop_unadmitted_save(seq, reason="capacity")
         if hasattr(seq, "_load_operation"):
             delattr(seq, "_load_operation")
 
