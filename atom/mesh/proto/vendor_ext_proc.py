@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Vendor the official Envoy ext-proc import closure at fixed upstream revisions."""
 
-from pathlib import Path
 import re
 import urllib.request
+from pathlib import Path
 
 
 class ProtoVendor:
@@ -36,12 +36,17 @@ class ProtoVendor:
         else:
             raise ValueError("Unknown proto dependency: " + name)
         content = self.fetch(name, base + name)
-        for dependency in re.findall(r'^import\s+(?:public\s+)?"([^"]+)";', content, re.M):
+        for dependency in re.findall(
+            r'^import\s+(?:public\s+)?"([^"]+)";', content, re.MULTILINE
+        ):
             self.proto(dependency)
 
     def run(self):
         self.proto("envoy/service/ext_proc/v3/external_processor.proto")
-        self.fetch("grpc/health/v1/health.proto", self.GRPC + "src/proto/grpc/health/v1/health.proto")
+        self.fetch(
+            "grpc/health/v1/health.proto",
+            self.GRPC + "src/proto/grpc/health/v1/health.proto",
+        )
         self.fetch("licenses/grpc.txt", self.GRPC + "LICENSE")
         for name, base in (("envoy", self.ENVOY), ("xds", self.XDS), ("pgv", self.PGV)):
             self.fetch("licenses/" + name + ".txt", base + "LICENSE")
