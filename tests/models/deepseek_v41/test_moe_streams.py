@@ -39,10 +39,13 @@ def test_backbone_gives_every_moe_the_one_stream_it_made(
 ):
     instance = build_v41(entrypoint)
 
-    # One per model, not one per layer: a layer's attention is done before its
-    # MoE starts and layers do not overlap, so the layers cannot contend.
-    assert len(created_streams) == 1
-    assert instance.alt_stream is created_streams[0]
+    # One per model rather than per layer, because layers do not overlap. The
+    # model makes three, one per branch that runs beside another; the other
+    # two are the attention's and must not be this one, because a stream
+    # serializes what it carries and none of the three depend on each other.
+    # That half is pinned in `test_attention_streams`.
+    assert len(created_streams) == 3
+    assert instance.alt_stream not in (instance.compress_stream, instance.index_stream)
     assert instance.layers
     for block in instance.layers:
         assert block.ffn.alt_stream is instance.alt_stream

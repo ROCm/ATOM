@@ -28,6 +28,7 @@ from atom.model_ops.v4_kernels import (
     sparse_attn_v4_paged_decode,
     sparse_attn_v4_paged_prefill,
 )
+from atom.utils.forward_context import side_stream
 
 from .config import AttentionMode
 from .layers import native_quant_config
@@ -116,9 +117,11 @@ class Indexer(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, config, spec):
+    def __init__(self, config, spec, *, compress_stream=None, index_stream=None):
         super().__init__()
         self.spec = spec
+        self.compress_stream = compress_stream
+        self.index_stream = index_stream
         self.head_dim, self.o_rank = config.head_dim, config.o_lora_rank
         tp_size = get_tp_group().world_size
         self.heads, self.groups = (
@@ -263,9 +266,46 @@ class Attention(nn.Module):
         grouped = self.wo_a.weight.view(self.groups, self.o_rank, -1)
         return self.wo_b(grouped_output_projection(output, grouped).flatten(-2))
 
+    def _fork_compress(self, hidden, cache, step, rope):
+        """The compressor, issued before the projections, on its own stream.
+
+        It reads the hidden row and its own arena state, so the top of the
+        layer is the earliest it can start. `_fork_select` joins it, since the
+        scorer is the first to read what it writes.
+
+        Reports whether it forked, which is all `_fork_select` needs to know.
+        """
+        with side_stream(self.compress_stream) as (_, joins):
+            self._compress_batch(hidden, cache, step, rope)
+        return joins is not None
+
+    def _fork_select(self, hidden, qr, qr_scale, cache, step, rope, *, compressed):
+        """The indexer, on its own stream, so the Q/KV chain runs beside it.
+
+        Moving the critical path buys nothing by itself; what it buys is the
+        other side, where the query projection and the fused rope/window
+        launch stop being in front of it.
+
+        Returns the stream to join on, `None` when nothing was forked. Both
+        waits are lines here: the projections cannot precede `qk_norm`, the
+        scorer cannot precede the compressor's index row.
+        """
+        if self.indexer is None:
+            return None
+        with side_stream(self.index_stream) as (scorer, joins):
+            projected = self.indexer.project(hidden, qr, qr_scale, cache, step, rope)
+            if compressed:
+                scorer.wait_stream(self.compress_stream)
+            self.indexer.score(*projected, cache, step)
+        return joins
+
     def forward(self, hidden, hidden_scale, cache, step, rope):
+        compressed = self._fork_compress(hidden, cache, step, rope)
         q_lora, kv_pre = self.project_qkv(hidden, hidden_scale)
         qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
+        selecting = self._fork_select(
+            hidden, qr, qr_scale, cache, step, rope, compressed=compressed
+        )
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )
@@ -275,13 +315,11 @@ class Attention(nn.Module):
         kv, window_kv = cache.rope_quant_window(
             self.spec.layer_id, query, kv_normed, rope, step
         )
-        self._compress_batch(hidden, cache, step, rope)
-        if self.indexer is not None:
-            self.indexer.score(
-                *self.indexer.project(hidden, qr, qr_scale, cache, step, rope),
-                cache,
-                step,
-            )
+        # The main stream's only join; a forked compressor is already inside
+        # it, and always has a scorer to have been waited at, because only the
+        # mode that gives a layer a compressor gives it an indexer.
+        if selecting is not None:
+            selecting.wait_stream(self.index_stream)
         prefix, prefix_indptr, extend, extend_indptr = cache.attention_indices(
             self.spec, step
         )

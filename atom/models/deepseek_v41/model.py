@@ -42,10 +42,14 @@ class Block(nn.Module):
         *,
         moe_quant_config,
         alt_stream: torch.cuda.Stream | None = None,
+        compress_stream: torch.cuda.Stream | None = None,
+        index_stream: torch.cuda.Stream | None = None,
     ):
         super().__init__()
         self.layer_name = f"v41.layers.{spec.layer_id}"
-        self.attn = self.attention_cls(config, spec)
+        self.attn = self.attention_cls(
+            config, spec, compress_stream=compress_stream, index_stream=index_stream
+        )
         # FusedMoE names its parameters from this prefix, so it has to match the
         # module layout used by the shared loader: `layers.N` / `mtp.N`.
         self.ffn = MoE(
@@ -231,12 +235,15 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.moe_quant_config = make_v4_quant_config(
             config, online_quant_config=online_quant_config
         )
-        # The shared expert runs here, beside the routed pass rather than after
-        # it. One stream for the whole model and not one per layer: a layer's
-        # attention is done before its MoE starts and layers do not overlap, so
-        # they cannot contend. Forking is decided per call by
-        # `maybe_dual_stream_forward`, which declines above a token count.
-        self.alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        # A stream serializes what it carries, so one per pair that runs at
+        # once: shared expert beside the routed pass, compressor beside the
+        # projections, indexer beside the Q/KV chain. One each for the model
+        # rather than per layer, because layers do not overlap.
+        self.alt_stream, self.compress_stream, self.index_stream = (
+            tuple(torch.cuda.Stream() for _ in range(3))
+            if torch.cuda.is_available()
+            else (None, None, None)
+        )
         self.layers = nn.ModuleList(
             self.block_cls(
                 config,
@@ -244,6 +251,8 @@ class DeepseekV41ForCausalLM(nn.Module):
                 prefix=f"layers.{spec.layer_id}",
                 moe_quant_config=self.moe_quant_config,
                 alt_stream=self.alt_stream,
+                compress_stream=self.compress_stream,
+                index_stream=self.index_stream,
             )
             for spec in self.topology
         )
