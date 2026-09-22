@@ -783,10 +783,24 @@ start_router() {
   fi
   local -a router_dp_aware_args=()
   if is_agentic_dpa; then
-    router_policy="dp_sticky"
+    # Respect explicit cache-aware routing for DPA workloads.
+    if [[ "${router_policy}" != "cache_aware" ]]; then
+      router_policy="dp_sticky"
+    fi
     router_dp_aware_args=(--dp-aware)
   elif [[ "${#router_rank_mapping_args[@]}" -gt 0 ]]; then
     router_dp_aware_args=(--dp-aware)
+  fi
+  local -a router_policy_args=(--policy "${router_policy}")
+  if [[ "${router_policy}" == "cache_aware" ]]; then
+    # Match the original InferenceX V4 P/D cache-aware routing parameters.
+    router_policy_args+=(
+      --prefill-policy cache_aware --decode-policy cache_aware
+      --cache-threshold 0.8
+      --balance-abs-threshold 20 --balance-rel-threshold 2.0
+      --eviction-interval 300
+    )
+    router_rank_mapping_args=(--atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}")
   fi
   local -a router_cmd=(
     "${mesh_binary}" launch
@@ -795,7 +809,7 @@ start_router() {
     --pd-disaggregation
     "${prefill_args[@]}"
     "${decode_args[@]}"
-    --policy "${router_policy}"
+    "${router_policy_args[@]}"
     "${router_rank_mapping_args[@]}"
     "${router_dp_aware_args[@]}"
     --backend atom
