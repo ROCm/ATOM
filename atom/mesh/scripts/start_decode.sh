@@ -63,7 +63,7 @@ TORCHINDUCTOR_COMPILE_THREADS=128 python3 -m sglang.launch_server \
     --mem-fraction-static "${MEM_FRACTION}" \
     --page-size 1 \
     --max-running-requests "${MAX_RUNNING_REQUESTS}" \
-    --cuda-graph-bs-decode $(seq "${CUDA_GRAPH_BS_START}" "${CUDA_GRAPH_BS_END}") \
+    --cuda-graph-bs $(seq "${CUDA_GRAPH_BS_START}" "${CUDA_GRAPH_BS_END}") \
     --disable-radix-cache \
     --log-level info \
     --watchdog-timeout 3600 \

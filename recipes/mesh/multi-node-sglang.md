@@ -116,7 +116,7 @@ python3 -m sglang.launch_server \
     --mem-fraction-static 0.85 \
     --page-size 1 \
     --max-running-requests 128 \
-    --cuda-graph-bs-decode $(seq 1 256) \
+    --cuda-graph-bs $(seq 1 256) \
     --disable-radix-cache \
     --log-level info \
     --watchdog-timeout 3600 \
@@ -129,7 +129,7 @@ python3 -m sglang.launch_server \
 
 Key differences from prefill:
 - `--disaggregation-mode decode` — KV consumer
-- `--cuda-graph-bs-decode $(seq 1 256)` — CUDA Graph batch sizes for decode optimization
+- `--cuda-graph-bs $(seq 1 256)` — CUDA Graph batch sizes for decode optimization
 - `TORCHINDUCTOR_COMPILE_THREADS=128` — speeds up TorchInductor compilation
 
 ## Step 5: Start Mesh Router (on Prefill Node)

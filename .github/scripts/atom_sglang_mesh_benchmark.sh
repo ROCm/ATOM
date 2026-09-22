@@ -172,7 +172,7 @@ if [[ "${SPEC_MODE}" == "mtp" ]]; then
     server_args+=(--max-running-requests 256)
   fi
   if [[ "${SERVER_EXTRA_ARGS}" != *"--cuda-graph-bs"* ]]; then
-    server_args+=(--cuda-graph-bs-decode)
+    server_args+=(--cuda-graph-bs)
     for bs in $(seq 1 128) 160 192 224 256; do
       server_args+=("${bs}")
     done
