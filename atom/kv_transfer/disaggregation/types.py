@@ -257,6 +257,10 @@ class KVTransferTensors:
     gather_sharded_index: Callable[..., tuple[int, int]] | None = None
     # Appended after the original staging fields for positional compatibility.
     prepare_sharded_index: Callable[..., Any] | None = None
+    # Optional token-contiguous MLA gather using the same registered staging
+    # pool and prepared DCP indices as the index-page callback. The pool must
+    # hold the larger of an MLA page and an index page for every chunk slot.
+    gather_sharded_mla: Callable[..., tuple[int, int]] | None = None
     # Scheduler blocks the PAGE regions are addressed in. `init=False` because
     # a backend cannot answer it: `req.block_ids` is the scheduler's id space,
     # and a backend counts in its own page -- a different unit even where it is

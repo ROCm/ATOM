@@ -30,6 +30,7 @@ from atom.distributed.pcp_utils import (
     pcp_round_robin_query_indices,
 )
 from atom.kv_transfer.disaggregation.index_staging import (
+    gather_dcp_mla_pages,
     gather_dcp_preshuffled_index_pages,
     prepare_dcp_index_gather_indices,
 )
@@ -1551,6 +1552,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         index_staging_chunk_pages = 0
         prepare_sharded_index = None
         gather_sharded_index = None
+        gather_sharded_mla = None
         if (
             index_tensors
             and getattr(self, "dcp_world_size", None) == 1
@@ -1559,8 +1561,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         ):
             # A Mooncake P/D producer can receive requests from a DCP
             # consumer whose index cache is sharded below one MFMA tile. Keep a
-            # small per-send-thread pool that repacks one index layer at a time;
-            # latent MLA pages continue to transfer directly.
+            # per-send-thread pool that packs one layer at a time. Packing MLA
+            # pages too avoids one RDMA descriptor per token for interleave=1.
             scheduler_block_size = runner.config.kv_cache_block_size
             if scheduler_block_size % 16:
                 raise RuntimeError(
@@ -1572,12 +1574,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             index_staging_chunk_pages = 256
             first_index_page = index_tensors[0]
             index_head_dim = getattr(runner.config.hf_config, "index_head_dim", None)
-            page_bytes = first_index_page.stride(0) * first_index_page.element_size()
+            max_page_bytes = max(region.unit_bytes for region in block_regions)
             staging = torch.empty(
                 (
                     index_staging_pool_size,
                     index_staging_chunk_pages,
-                    page_bytes,
+                    max_page_bytes,
                 ),
                 dtype=torch.uint8,
                 device=first_index_page.device,
@@ -1585,12 +1587,31 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             index_staging_region = KVTransferRegion(
                 base_addr=staging.data_ptr(),
                 total_bytes=staging.numel() * staging.element_size(),
-                unit_bytes=index_staging_chunk_pages * page_bytes,
+                unit_bytes=index_staging_chunk_pages * max_page_bytes,
                 semantic_role="dsa.index_staging",
             )
 
             def prepare_sharded_index(plan: DCPShardPlan):
                 return prepare_dcp_index_gather_indices(plan, first_index_page.device)
+
+            def staging_slot(region_idx, pool_idx):
+                # Both page formats share one pool, but each transfer requires
+                # packed pages; slicing columns would retain the larger stride.
+                width = block_regions[region_idx].unit_bytes
+                return (
+                    staging[pool_idx]
+                    .view(-1)[: index_staging_chunk_pages * width]
+                    .view(index_staging_chunk_pages, width)
+                )
+
+            def gather_sharded_mla(region_idx, indices, pool_idx):
+                if block_regions[region_idx].semantic_role != MLA_KV_ROLE:
+                    raise ValueError(f"Region {region_idx} is not token-contiguous MLA")
+                slot = staging_slot(region_idx, pool_idx)
+                pages = gather_dcp_mla_pages(
+                    block_tensor_views[region_idx], slot, indices, scheduler_block_size
+                )
+                return slot.data_ptr(), pages
 
             def gather_sharded_index(
                 region_idx,
@@ -1603,7 +1624,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                         f"Index region {region_idx} maps to invalid cache row "
                         f"{index_region_idx}"
                     )
-                slot = staging[pool_idx]
+                slot = staging_slot(region_idx, pool_idx)
                 pages = gather_dcp_preshuffled_index_pages(
                     index_tensors[index_region_idx],
                     slot,
@@ -1624,6 +1645,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             index_staging_chunk_pages=index_staging_chunk_pages,
             prepare_sharded_index=prepare_sharded_index,
             gather_sharded_index=gather_sharded_index,
+            gather_sharded_mla=gather_sharded_mla,
             # MLA's latent projection is replicated across TP. Sparse MLA's
             # index-key projection/cache is replicated as well; only the query
             # heads and absorbed KV-B/output projections are TP-sharded.

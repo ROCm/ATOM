@@ -47,6 +47,47 @@ def prepare_dcp_index_gather_indices(
     )
 
 
+def gather_dcp_mla_pages(
+    source: torch.Tensor,
+    staging: torch.Tensor,
+    indices: DCPIndexGatherIndices,
+    scheduler_block_size: int,
+) -> int:
+    """Pack token-contiguous MLA bytes into complete DCP destination pages.
+
+    The direct interleave=1 path issues one RDMA descriptor per token. Gathering
+    the same bytes first lets the transport send pages, coalescing consecutive
+    destination blocks. Quantized values, scales and padding are copied as bytes.
+    """
+    if not source.is_contiguous():
+        raise ValueError("MLA staging requires contiguous source pages")
+    if source.shape[0] == 0 or scheduler_block_size <= 0:
+        raise ValueError("MLA staging requires source pages and a positive block size")
+    page_bytes = source.stride(0) * source.element_size()
+    if page_bytes % scheduler_block_size:
+        raise ValueError("MLA page bytes must be divisible by the scheduler block size")
+    dst_pages = indices.dst_pages
+    if (
+        staging.ndim != 2
+        or staging.shape[0] < dst_pages
+        or staging.shape[1] != page_bytes
+    ):
+        raise ValueError(
+            "MLA staging must hold compact destination pages of the source byte width"
+        )
+    if not staging.is_contiguous():
+        raise ValueError("MLA staging pages must be contiguous")
+    if not dst_pages:
+        return 0
+    source_tokens = source.view(torch.uint8).reshape(
+        source.shape[0], scheduler_block_size, page_bytes // scheduler_block_size
+    )
+    gathered = source_tokens[indices.src_block_id_per_token, indices.src_token]
+    gathered.masked_fill_(~indices.valid[:, None], 0)
+    staging[:dst_pages].copy_(gathered.reshape(dst_pages, page_bytes))
+    return dst_pages
+
+
 def gather_dcp_preshuffled_index_pages(
     source: torch.Tensor,
     staging: torch.Tensor,
