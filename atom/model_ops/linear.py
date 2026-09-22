@@ -37,6 +37,7 @@ from atom.quant_spec import (
     LayerQuantConfig,
     should_skip_online_quant,
     should_stream_online_quant,
+    will_online_requant,
 )
 from atom.quantization.quark.utils import (
     dequant_weight_online,
@@ -573,21 +574,34 @@ class LinearBase(nn.Module):
         self.quant_type = quant_type
         self.params_dtype = params_dtype
         self.native_a8_group_rows = None
-        native_fp8 = (
-            params_dtype == torch.float8_e4m3fn
-            and layer_quant_config.weight_block_size in ((1, 32), (32, 32))
+        source_block = layer_quant_config.weight_block_size
+        native_fp8 = params_dtype == torch.float8_e4m3fn and source_block in (
+            (1, 32),
+            (32, 32),
         )
         native_w4a8 = (
             params_dtype == torch.float4_e2m1fn_x2
             and layer_quant_config.activation_dtype == torch.float8_e4m3fn
-            and layer_quant_config.weight_block_size == (1, 32)
+            and source_block == (1, 32)
         )
-        if native_fp8 or native_w4a8:
+        # A weight that online quant is about to overwrite is not a native
+        # source: the checkpoint bytes this path reads survive only until
+        # `online_quantize_weight` replaces them with the online target's
+        # format, which has its own quant_type and its own scale geometry.
+        # Only (1, 32) steps aside instead of raising -- its per-row scales are
+        # shaped exactly like the generic per_1x32 path's, so dropping the
+        # native layout lands on parameters this loader already knows how to
+        # fill. A (32, 32) source has no such twin and keeps the error.
+        requantized_online = will_online_requant(
+            quant_config, prefix, quant_type, params_dtype
+        )
+        falls_back_to_generic_1x32 = requantized_online and source_block == (1, 32)
+        if (native_fp8 or native_w4a8) and not falls_back_to_generic_1x32:
             if (
                 quant_type != QuantType.per_1x32
                 or self.source_quant_dtype is not None
                 or not layer_quant_config.is_dynamic
-                or getattr(quant_config, "online_quant", False)
+                or requantized_online
             ):
                 raise ValueError(
                     "Native group32 A8 requires dynamic activations and native weights"
