@@ -164,7 +164,8 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 - **MoE:** V4's `FusedMoE`, subclassed only to flatten the offline caller's batch dimension and declare `bias_vl`. There is no second expert backend.
 - **Graphs:** `CUDAGraphMode.FULL` captures the whole decode forward, one graph per `(batch size, query bucket)`; `PIECEWISE` records the dense pieces with attention eager between them. `torch.compile` is not supported.
 - **Speculation:** Native DSpark proposes five tokens from the checkpoint's three draft stages. Implemented and tested, with quality acceptance still open — see [the DSpark guide](deepseek_v41_dspark.md).
-- **Guides:** [runtime](deepseek_v41_runtime.md), [cache format and graphs](deepseek_v41_performance.md), [protocol](deepseek_v41_protocol.md), [image requests](deepseek_v41_vision.md), [DSpark](deepseek_v41_dspark.md), [recipe](../recipes/DeepSeek-V4.1-Flash.md).
+- **vLLM plugin:** Text backbone only, through the proxy KV cache in `atom/plugin/vllm/deepseek_v41_bridge.py`. One fake attention layer is declared whose block is exactly one 256-token PAGE, so a vLLM block id is a V4.1 page id; the per-request STATE region (window ring, compressor rings, Engram cursor) is bought as a reserved tail of that same allocation. Vision, DSpark and prefix caching are refused at startup, and CUDA graphs are forced off.
+- **Guides:** [runtime](deepseek_v41_runtime.md), [cache format and graphs](deepseek_v41_performance.md), [protocol](deepseek_v41_protocol.md), [image requests](deepseek_v41_vision.md), [DSpark](deepseek_v41_dspark.md), [recipe](../recipes/DeepSeek-V4.1-Flash.md), [vLLM plugin recipe](../recipes/atom_vllm/DeepSeek-V4.1-Flash.md).
 
 ### Qwen3.5 MTP (`Qwen3_5MTP`)
 

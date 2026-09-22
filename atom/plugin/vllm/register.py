@@ -42,6 +42,7 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     "K3DSparkModel": "atom.plugin.vllm.models.kimi_k3_dspark:KimiK3DSparkVllm",
     "MiniMaxM2ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "DeepseekV4ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    "DeepseekV41ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "MiniMaxM3SparseForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "MiniMaxM3SparseForConditionalGeneration": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Eagle3LlamaForCausalLM": ATOM_CAUSAL_LM_MODEL_WRAPPER,
@@ -86,16 +87,69 @@ class MiniMaxM3Config(PretrainedConfig):
             setattr(text_config, name, value)
 
 
+def _text_config_from_dict(values: dict) -> PretrainedConfig:
+    """Build a text config out of a checkpoint's nested ``text_config`` block.
+
+    Assigned after construction rather than passed as keyword arguments:
+    ``PretrainedConfig.__post_init__`` standardizes RoPE parameters, and that
+    reads ``max_position_embeddings`` off the instance before the base
+    initializer has assigned the keywords it was handed. A checkpoint that
+    declares both -- DeepSeek-V4.1 declares ``rope_scaling`` with a YaRN factor
+    -- therefore raises out of `transformers` before vLLM ever builds its
+    ``ModelConfig``. Setting the fields afterwards standardizes RoPE off a
+    fully populated object.
+    """
+    config = PretrainedConfig()
+    for name, value in values.items():
+        setattr(config, name, value)
+    return config
+
+
+class DeepseekV41Config(PretrainedConfig):
+    """Minimal local config shim for DeepSeek-V4.1 checkpoints.
+
+    ``transformers`` does not know the ``deepseek_v41`` model type, so vLLM's
+    ``AutoConfig.from_pretrained`` on the checkpoint raises before the ATOM
+    platform is ever consulted. Registering this shim lets vLLM build its
+    ``ModelConfig``; ATOM itself never reads it -- the plugin's V4.1 bridge
+    goes back to ``atom.config.get_hf_config`` for the normalized
+    ``DeepseekV41TextConfig`` the runtime model expects.
+
+    The checkpoint nests every text hyperparameter under ``text_config``, so
+    expose it under the attribute name ``PretrainedConfig.get_text_config``
+    looks for; that is how vLLM finds ``hidden_size``, ``num_hidden_layers``
+    and friends.
+    """
+
+    model_type = "deepseek_v41"
+
+    def __init__(
+        self,
+        text_config: dict | PretrainedConfig | None = None,
+        vision_config: dict | None = None,
+        **kwargs,
+    ):
+        if isinstance(text_config, dict):
+            text_config = _text_config_from_dict(text_config)
+
+        self.text_config = text_config
+        self.vision_config = vision_config
+        self.hidden_size = getattr(text_config, "hidden_size", None)
+
+        super().__init__(**kwargs)
+
+
 def _set_plugin_mode() -> None:
     _set_framework_backbone("vllm")
 
 
 def _register_hf_configs() -> None:
-    try:
-        AutoConfig.register(MiniMaxM3Config.model_type, MiniMaxM3Config)
-    except ValueError as exc:
-        if "already used by a Transformers config" not in str(exc):
-            raise
+    for config_cls in (MiniMaxM3Config, DeepseekV41Config):
+        try:
+            AutoConfig.register(config_cls.model_type, config_cls)
+        except ValueError as exc:
+            if "already used by a Transformers config" not in str(exc):
+                raise
 
 
 def _register_mxfp8_quantization_config() -> None:
@@ -301,6 +355,21 @@ def register_model() -> None:
     )
 
     apply_vllm_v4_block_reuse_patch()
+
+    # DeepSeek-V4.1 needs its CSA2 STATE tail withheld from the block pool
+    # before EngineCore sizes the KV cache. This hook is the only one that is
+    # reliably reached: vLLM resolves the platform class from inside its own
+    # ``import vllm``, so ``register_platform`` -- and with it
+    # ``ATOMPlatform.check_and_update_config`` -- can fail on a partially
+    # initialized ``vllm`` package and be swallowed, leaving the stock ROCm
+    # platform in place. Installing is a no-op for every other model:
+    # ``deepseek_v41_state_reserve_blocks`` returns 0 unless the config it is
+    # handed is V4.1's.
+    from atom.plugin.vllm.deepseek_v41_state_reserve_patch import (
+        apply_vllm_v41_state_reserve_patch,
+    )
+
+    apply_vllm_v41_state_reserve_patch()
 
     from atom.plugin.vllm.gdn_backend import register_gdn_attention_backend
 
