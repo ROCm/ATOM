@@ -762,13 +762,7 @@ async def generate_async(
     dp_parent_session_id: str | None = None,
     return_token_ids: bool = False,
 ) -> AsyncGenerator[dict[str, Any], None]:
-    """Generate text asynchronously for non-streaming requests.
-
-    ``return_token_ids`` adds the prompt's token ids to the yielded dict under
-    ``prompt_token_ids``. They are read off the local ``Sequence`` that
-    ``preprocess`` just built, so this costs one list copy and no IPC -- the
-    engine is never asked for something the API process already has.
-    """
+    """Generate non-streaming output, optionally echoing local prompt token IDs."""
     token_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
@@ -891,7 +885,7 @@ async def generate_async(
     if kv_transfer_output_meta_info is not None:
         response["kv_transfer_output_meta_info"] = kv_transfer_output_meta_info
     if return_token_ids and seq is not None:
-        # `list`, not the array itself: this leaves the API process as JSON.
+        # Convert the token array to a JSON-serializable list.
         response["prompt_token_ids"] = list(seq.prompt_token_ids)
     yield response
 
@@ -1013,10 +1007,7 @@ async def generate_async_fanout(
     :func:`generate_async` yields for n==1, so response builders can treat
     each entry the same way.
 
-    ``return_token_ids`` puts ``prompt_token_ids`` on the *first* output only.
-    The siblings answer one prompt that ``preprocess_fanout`` tokenized once,
-    so there is one list to report; it rides where ``num_tokens_input``'s
-    shared value is already read from.
+    Shared prompt token IDs are returned only in the first output.
     """
 
     n = int(sampling_params.n)
@@ -1153,21 +1144,7 @@ def validate_model(requested_model: str | None) -> None:
 def _validate_return_token_ids(
     return_token_ids: bool | None, stream: bool | None
 ) -> None:
-    """``return_token_ids`` is answerable on the non-streaming paths only.
-
-    Rejected where it cannot be answered rather than ignored. The caller asking
-    for these ids is a PD proxy that will hand them to a decode node so it can
-    skip rendering and tokenizing; dropping them silently puts that cost back
-    and leaves no signal anywhere that it happened, which is precisely the
-    failure mode this path exists to remove.
-
-    ``n > 1`` is fine and deliberately not rejected here: the siblings share one
-    prompt, which ``preprocess_fanout`` tokenizes once, so there is exactly one
-    answer. Rejecting it would also have been a trap rather than a guard --
-    atomesh injects this field itself and forwards the client's ``n``
-    untouched, so a client that asked for four samples through a PD pair would
-    have been handed a 400 naming a field it never sent.
-    """
+    """Prompt token IDs can be returned only in non-streaming responses."""
     if not return_token_ids:
         return
     if stream:
@@ -1180,12 +1157,7 @@ def _validate_return_token_ids(
 def _engine_kv_transfer_params(
     kv_transfer_params: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """Drop the wire-only prompt copy after resolving and validating its IDs.
-
-    The engine receives these IDs as its prompt and stores them on Sequence.
-    Keeping them in KV metadata would pickle the same prompt again for IPC.
-    Copy only the metadata mapping so the original request stays intact.
-    """
+    """Copy KV metadata without IDs already passed as the engine prompt."""
     if kv_transfer_params is None or "prompt_token_ids" not in kv_transfer_params:
         return kv_transfer_params
     return {k: v for k, v in kv_transfer_params.items() if k != "prompt_token_ids"}
@@ -1686,11 +1658,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 request.tools,
             )
         elif (pretokenized := request.get_prompt_token_ids()) is not None:
-            # A PD decode node: the prefill node already rendered this exact
-            # template and tokenized the result, and its ids are what the KV
-            # blocks in flight were computed from. Rendering and tokenizing
-            # again would cost the largest single slice of decode TTFT to
-            # arrive at the same list -- see docs/ttft_breakdown_guide.md.
+            # Reuse prefill IDs to skip template rendering and tokenization.
             prompt_or_tokens = pretokenized
             kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
         else:
@@ -1702,10 +1670,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 **merged_kwargs,
             )
 
-        # The K3 template may inject the opening reasoning marker into the prompt
-        # itself; if so the stream begins mid-thought and the ReasoningFilter must
-        # start in the thinking state. Keyed on the input's own type rather than
-        # on `is_multimodal`, because pre-tokenized prompts arrive as ids too.
+        # The K3 template may open the reasoning channel in text or token IDs.
         _reasoning = reasoning_channel(
             (
                 prompt_starts_in_reasoning(prompt_or_tokens)
@@ -1874,8 +1839,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_parser_cls=tool_call_parser_cls,
             )
         _log_request_model("response", request_id, resp)
-        # A Response bypasses FastAPI's recursive jsonable_encoder walk over
-        # every prompt token ID. JSON mode preserves the existing wire values.
+        # Bypass FastAPI's recursive conversion of the token ID list.
         return JSONResponse(content=resp.model_dump(mode="json"))
 
     except _ClientDisconnected:
@@ -1907,8 +1871,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
             top_p=request.top_p,
             n=effective_n,
         )
-        # Either the text or an already-tokenized prompt, whichever the client
-        # sent. `preprocess` takes both, so nothing downstream branches on it.
+        # Prefer pre-tokenized IDs; otherwise pass text to preprocessing.
         prompt_or_tokens = request.get_prompt_or_tokens()
         kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
 

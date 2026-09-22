@@ -1,17 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""A PD decode node must not re-render and re-tokenize the prefill's prompt.
-
-Both halves of the handoff are covered here: the producer echoing the ids it
-already computed (``return_token_ids``), and the consumer using them instead of
-calling the chat template and the tokenizer again.
-
-The assertions are on *whether the work happened*, not on how long it took.
-The defect these tests protect against is a duplicated computation, and
-"``apply_chat_template`` was called" is exactly observable where a timing is
-not. See ``docs/ttft_breakdown_guide.md`` for what the duplication costs.
-"""
+"""Test prefill prompt-ID responses and decode reuse without tokenizing."""
 
 import asyncio
 import json
@@ -48,12 +38,7 @@ class _FakeSequence:
 
 @pytest.fixture
 def server(monkeypatch):
-    """A chat/completions handler wired to fakes, recording what it called.
-
-    ``generate_async`` is replaced rather than the engine beneath it: these
-    tests are about which input the handler hands down, and the real generator
-    needs an engine to hand it to.
-    """
+    """Stub generation and record the handler's inputs."""
     calls = SimpleNamespace(templates=0, generate=[])
 
     def record_template(*_args, **_kwargs):
@@ -124,8 +109,7 @@ class TestDecodeSkipsTheWorkPrefillAlreadyDid:
         assert server.generate[0][0] == PROMPT_IDS
 
     def test_without_ids_the_template_still_runs(self, server):
-        # The fast path must not become the only path: a direct client sends
-        # messages and nothing else, and still has to get a rendered prompt.
+        # Requests without IDs still render and tokenize their messages.
         asyncio.run(api_server.chat_completions(_chat(), None))
 
         assert server.templates == 1
@@ -261,8 +245,7 @@ class TestHttpResponseSerialization:
     def test_wire_response_is_preserved_without_fastapi_recursive_conversion(
         self, monkeypatch, server, endpoint, return_ids, n
     ):
-        # Exercise the real ASGI response boundary: returning a BaseModel here
-        # would silently reintroduce a Python visit to every prompt token ID.
+        # Check the HTTP path bypasses FastAPI's recursive ID conversion.
         suffix = "chat/completions" if endpoint == "chat" else "completions"
         builder = f"build_{endpoint}_response" + ("_multi" if n > 1 else "")
         original_builder = getattr(api_server, builder)
@@ -292,8 +275,7 @@ class TestHttpResponseSerialization:
 
         def build(*args, **kwargs):
             response = original_builder(*args, **kwargs)
-            # The previous HTTP path defines the compatibility contract,
-            # including nulls, Unicode, and JSON conversion of extension data.
+            # Preserve the previous JSON encoding, including Unicode and metadata.
             expected_bodies.append(JSONResponse(jsonable_encoder(response)).body)
             return response
 
@@ -372,13 +354,7 @@ class TestHttpResponseSerialization:
 
 
 class TestUnanswerableRequestsForTokenIdsAreRejected:
-    """Silently ignoring `return_token_ids` re-hides the cost it removes.
-
-    A proxy that asks for ids and receives none falls back to sending text, so
-    the decode node tokenizes again -- the original defect, restored, with no
-    error anywhere to attribute it to. So a stream, which has no response body
-    to put them on, is refused rather than answered with nothing.
-    """
+    """Streaming responses cannot return prompt token IDs."""
 
     def test_streaming_is_rejected(self, server):
         with pytest.raises(Exception, match="stream") as excinfo:
@@ -398,13 +374,7 @@ class TestUnanswerableRequestsForTokenIdsAreRejected:
 
 
 class TestFanoutIsAnsweredRatherThanRefused:
-    """`n > 1` has one prompt, so it has one answer.
-
-    And refusing it would have been a trap, not a guard: atomesh injects
-    `return_token_ids` itself and forwards the client's `n` untouched, so a
-    client asking a PD pair for four samples would have received a 400 naming
-    a field it never sent.
-    """
+    """Sibling outputs share one prompt token ID list."""
 
     @staticmethod
     def _fanout_request() -> ChatCompletionRequest:
@@ -477,20 +447,12 @@ class TestFanoutIsAnsweredRatherThanRefused:
 
 
 class TestGenerateAsyncReadsTheIdsOffTheLocalSequence:
-    """The echoed ids come from the API process, not from the engine.
-
-    ``preprocess`` runs here and returns the ``Sequence`` it tokenized, so the
-    ids are already in this process. Asking the engine for them instead would
-    put a list of tens of thousands of ints on the per-request ZMQ reply for
-    the benefit of nobody.
-    """
+    """Read echoed prompt IDs from the API's local Sequence."""
 
     @staticmethod
     def _engine_that_finishes_immediately(seq: _FakeSequence):
         def preprocess(_prompt, _sampling, stream_callback=None, **_kwargs):
-            # The engine calls the callback from its own thread; `preprocess`
-            # itself runs in an executor thread here, which is the same
-            # arrangement from the event loop's point of view.
+            # Run the completion callback from the preprocessing executor thread.
             stream_callback(
                 SimpleNamespace(
                     output_tokens=[5],
@@ -536,7 +498,6 @@ class TestGenerateAsyncReadsTheIdsOffTheLocalSequence:
         assert "prompt_token_ids" not in self._run(monkeypatch, return_token_ids=False)
 
     def test_prompt_length_does_not_retokenize_a_token_id_input(self, monkeypatch):
-        # `num_tokens_input` used to fall back to `tokenizer.encode(prompt)`,
-        # which a list of ids cannot be passed to.
+        # Counting pre-tokenized input must not call tokenizer.encode.
         output = self._run(monkeypatch, return_token_ids=False)
         assert output["num_tokens_input"] == len(PROMPT_IDS)

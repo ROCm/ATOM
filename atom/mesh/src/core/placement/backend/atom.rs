@@ -59,21 +59,8 @@ impl AtomAdapter {
         Ok(())
     }
 
-    /// Carry the prefill node's prompt token ids across to decode, so decode
-    /// reuses them instead of rendering the chat template and tokenizing the
-    /// prompt a second time. Returns how many ids were carried.
-    ///
-    /// Not a `kv_transfer_params` field by rights -- these are not transfer
-    /// parameters -- but that is where vLLM's disaggregated-prefill protocol
-    /// puts them, and matching it is what lets a vLLM-shaped proxy drive an
-    /// ATOM decode node and vice versa. The prefill *response* carries them
-    /// top-level, which is also vLLM's shape; the two differ, hence the move.
-    ///
-    /// An absent key is not an error. A prefill node predating this, or one
-    /// that declined `return_token_ids`, leaves decode to tokenize exactly as
-    /// it did before -- slower, still correct. A key that is present but not
-    /// an array is a prefill bug worth a log line, and skipping it keeps the
-    /// request answerable.
+    /// Copy prompt IDs into decode KV metadata using vLLM's PD format.
+    /// Return the number copied, or zero when no usable IDs are available.
     pub fn carry_prompt_token_ids(prefill_body: &Value, kv: &mut Value) -> usize {
         let Some(ids) = prefill_body.get("prompt_token_ids") else {
             return 0;
@@ -142,10 +129,7 @@ impl BackendAdapter for AtomAdapter {
             obj.insert("max_completion_tokens".to_string(), json!(1));
         }
         obj.remove("stream_options");
-        // Prefill has to render the chat template and tokenize anyway; asking
-        // for the result back is what lets decode skip doing both again. Safe
-        // to ask unconditionally: a node that does not know the field ignores
-        // it, and `carry_prompt_token_ids` then finds nothing to carry.
+        // Request prompt IDs for decode reuse; older servers may omit them.
         obj.insert("return_token_ids".to_string(), Value::Bool(true));
         Ok(())
     }

@@ -1581,14 +1581,13 @@ mod f_atom_adapter {
         let carried = AtomAdapter::carry_prompt_token_ids(&prefill_body, &mut kv);
         assert_eq!(carried, 3);
         assert_eq!(kv["prompt_token_ids"], json!([5, 6, 7]));
-        // The transfer fields it travels beside must survive untouched.
+        // Preserve the existing transfer metadata.
         assert_eq!(kv["do_remote_prefill"], json!(true));
     }
 
     #[test]
     fn test_carry_prompt_token_ids_absent_is_not_an_error() {
-        // A prefill node predating `return_token_ids`. Decode must be left to
-        // tokenize rather than handed an empty prompt.
+        // Older prefill servers omit IDs; decode falls back to tokenization.
         let prefill_body = json!({"kv_transfer_params": {"do_remote_prefill": true}});
         let mut kv = json!({"do_remote_prefill": true});
         let carried = AtomAdapter::carry_prompt_token_ids(&prefill_body, &mut kv);

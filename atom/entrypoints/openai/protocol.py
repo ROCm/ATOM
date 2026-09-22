@@ -42,9 +42,7 @@ def validate_max_tokens(max_tokens: int) -> int:
     return max_tokens
 
 
-#: An already-tokenized prompt. Validated by pydantic-core rather than a Python
-#: loop: the prompts this exists for run to tens of thousands of tokens, and
-#: the whole point is to be cheaper than tokenizing them.
+#: Validate token IDs with pydantic-core, avoiding a Python loop.
 PromptTokenIds = list[NonNegativeInt]
 _PROMPT_TOKEN_IDS_ADAPTER = TypeAdapter(PromptTokenIds)
 
@@ -53,19 +51,9 @@ def resolve_prompt_token_ids(
     prompt_token_ids: PromptTokenIds | None,
     kv_transfer_params: dict[str, Any] | None,
 ) -> PromptTokenIds | None:
-    """The request's pre-tokenized prompt, from either wire location.
+    """Resolve IDs from the top-level field or vLLM-compatible PD metadata.
 
-    Two locations because two kinds of caller put it in different places. The
-    top-level ``prompt_token_ids`` is the general form, for any client that has
-    already tokenized and wants the server not to do it again.
-    ``kv_transfer_params["prompt_token_ids"]`` is where vLLM's disaggregated
-    prefill protocol carries it, so a vLLM-shaped proxy can drive an ATOM
-    decode node without knowing it is not talking to vLLM.
-
-    Both present and disagreeing is rejected rather than settled by precedence.
-    These ids decide which KV blocks the P->D transfer is expected to fill, so
-    choosing one of two different prompts does not degrade the request, it
-    silently answers a question nobody asked.
+    Reject empty lists and conflicting IDs between the two locations.
     """
     from_kv = (kv_transfer_params or {}).get("prompt_token_ids")
     if prompt_token_ids is None and from_kv is None:
@@ -280,14 +268,9 @@ class ChatCompletionRequest(BaseModel):
     # Optional KV-transfer metadata for P/D disaggregation.
     kv_transfer_params: dict[str, Any] | None = None
     data_parallel_rank: int | None = None
-    # An already-rendered, already-tokenized prompt. When present, `messages`
-    # is still required (and still validated) but is not rendered or tokenized
-    # -- see `resolve_prompt_token_ids`. This is how a PD decode node avoids
-    # repeating the template render and tokenize the prefill node already did.
+    # Pre-tokenized text prompt; messages are still required and validated.
     prompt_token_ids: PromptTokenIds | None = None
-    # Ask for this request's prompt token ids back on the response, so the
-    # caller can hand them to a second node. Non-streaming only; n > 1 is
-    # fine because siblings share one prompt.
+    # Echo prompt IDs in non-streaming responses, including n > 1.
     return_token_ids: bool | None = None
 
     def get_prompt_token_ids(self) -> PromptTokenIds | None:
@@ -318,9 +301,7 @@ class CompletionRequest(BaseModel):
     model_config = {"extra": "ignore"}
 
     model: str | None = None
-    # Optional only because `prompt_token_ids` is the other way to supply the
-    # prompt; exactly one of the two is required, enforced by
-    # `get_prompt_or_tokens`.
+    # Required when no prompt_token_ids are supplied.
     prompt: str | None = None
     temperature: float | None = DEFAULT_TEMPERATURE
     top_k: int | None = DEFAULT_TOP_K
@@ -344,12 +325,7 @@ class CompletionRequest(BaseModel):
         return resolve_prompt_token_ids(self.prompt_token_ids, self.kv_transfer_params)
 
     def get_prompt_or_tokens(self) -> "str | PromptTokenIds":
-        """The prompt in whichever form the client supplied it.
-
-        Token ids win when both are present: a caller that went to the trouble
-        of sending ids sent them to be used, and `resolve_prompt_token_ids` has
-        already rejected the case where they contradict a sibling copy.
-        """
+        """Return pre-tokenized IDs when supplied, otherwise require text."""
         ids = self.get_prompt_token_ids()
         if ids is not None:
             return ids

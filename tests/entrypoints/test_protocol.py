@@ -422,8 +422,7 @@ class TestPromptTokenIds:
         ]
 
     def test_kv_transfer_params_location(self):
-        # vLLM's disaggregated-prefill shape: a proxy written against vLLM must
-        # be able to drive an ATOM decode node unchanged.
+        # Accept the vLLM-compatible PD metadata format.
         request = self._chat(
             kv_transfer_params={"do_remote_prefill": True, "prompt_token_ids": [4, 5]}
         )
@@ -451,8 +450,7 @@ class TestPromptTokenIds:
 
     @pytest.mark.parametrize("bad", ["5,6", 7, [-1], ["a"], [None], {"a": 1}])
     def test_unvalidated_kv_location_rejects_non_token_ids(self, bad):
-        # The top-level field is typed, so pydantic guards it. This location is
-        # inside an untyped dict and has to be checked here.
+        # IDs inside the untyped KV metadata need explicit validation.
         request = self._chat(kv_transfer_params={"prompt_token_ids": bad})
         with pytest.raises(ValueError, match="non-negative integers"):
             request.get_prompt_token_ids()

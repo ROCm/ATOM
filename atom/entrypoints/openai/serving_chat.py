@@ -537,8 +537,7 @@ def build_chat_response_multi(
             "num_choices": len(final_outputs),
         },
     )
-    # Shared across siblings, so reported from the first -- same convention as
-    # `prompt_tokens` above.
+    # Sibling outputs share the first output's prompt IDs.
     if "prompt_token_ids" in final_outputs[0]:
         response = response.model_copy(
             update={"prompt_token_ids": final_outputs[0]["prompt_token_ids"]}
