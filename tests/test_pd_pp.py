@@ -3,6 +3,7 @@
 
 import logging
 import os
+import subprocess
 import sys
 import threading
 import types
@@ -13,7 +14,9 @@ from unittest.mock import MagicMock
 import pytest
 
 # Ensure aiter.dist.parallel_state exposes symbols mooncake_connector needs.
+# The top-level name is taken back down below.
 _ps = sys.modules.get("aiter.dist.parallel_state")
+_stubbed: list[str] = []
 if _ps is not None:
     for _fn in ("get_dp_group", "get_tp_group"):
         if not hasattr(_ps, _fn):
@@ -21,20 +24,35 @@ if _ps is not None:
 else:
     _aiter_pkg = types.ModuleType("aiter")
     _aiter_pkg.__path__ = []
-    sys.modules.setdefault("aiter", _aiter_pkg)
     _dist = types.ModuleType("aiter.dist")
     _dist.__path__ = []
-    sys.modules.setdefault("aiter.dist", _dist)
     _ps_stub = types.ModuleType("aiter.dist.parallel_state")
     for _fn in ("get_dp_group", "get_tp_group"):
         setattr(_ps_stub, _fn, MagicMock())
-    sys.modules.setdefault("aiter.dist.parallel_state", _ps_stub)
+    for _name, _mod in (
+        ("aiter", _aiter_pkg),
+        ("aiter.dist", _dist),
+        ("aiter.dist.parallel_state", _ps_stub),
+    ):
+        if _name not in sys.modules:
+            sys.modules[_name] = _mod
+            _stubbed.append(_name)
 
 from atom.kv_transfer.disaggregation.port_offset import (
     consumer_region_indices,
     side_channel_port_offset,
 )
 from atom.kv_transfer.disaggregation.types import ConnectorMetadata
+
+# Drop the top-level name now that the imports above are bound. The submodules
+# stay -- the connectors reach for them lazily, at call time -- but `aiter`
+# itself has no reader here, and leaving it is what made
+# `pytest.importorskip("aiter")` succeed in every module collected after this
+# one: the skip did not fire, and the real `from aiter import ...` inside the
+# module under test then raised ImportError during collection, which takes the
+# whole run down instead of skipping one file.
+if "aiter" in _stubbed:
+    del sys.modules["aiter"]
 
 # ---------------------------------------------------------------------------
 # pp-aware side-channel port offset
@@ -281,6 +299,118 @@ def test_mismatched_or_missing_block_size_forces_full_transfer(
 # ---------------------------------------------------------------------------
 # Mooncake transport selection
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
+@pytest.mark.parametrize(
+    "protocol,configured_device,expected_device",
+    [
+        ("rdma", "", "rdma2"),
+        ("rdma", "ionic_4,ionic_0", "ionic_4,ionic_0"),
+        ("tcp", "rdma2", ""),
+    ],
+)
+def test_mooncake_control_address_is_independent_of_rdma_device(
+    monkeypatch, role, protocol, configured_device, expected_device
+):
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    host_ip = "10.19.0.140"
+    monkeypatch.setenv("ATOM_HOST_IP", host_ip)
+    monkeypatch.delenv("ATOM_MOONCAKE_IB_DEVICE", raising=False)
+    monkeypatch.delenv("MC_FORCE_TCP", raising=False)
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "2,3")
+    monkeypatch.setattr(mc.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(mc, "_ib_device_exists", lambda name: True)
+    monkeypatch.setattr(
+        mc, "get_tp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=8)
+    )
+    monkeypatch.setattr(
+        mc, "get_dp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=1)
+    )
+
+    # Reproduce a host with a separate RoCE network. The old constructor
+    # replaced ATOM_HOST_IP with this HCA address, breaking TCP handshakes.
+    original_listdir = os.listdir
+    monkeypatch.setattr(
+        os,
+        "listdir",
+        lambda path: (
+            ["tw-eth2"]
+            if str(path).startswith("/sys/class/infiniband/")
+            else original_listdir(path)
+        ),
+    )
+    original_check_output = subprocess.check_output
+    monkeypatch.setattr(
+        subprocess,
+        "check_output",
+        lambda cmd, **kwargs: (
+            "2: tw-eth2 inet 10.103.40.121/31 scope global tw-eth2\n"
+            if cmd[:4] == ["ip", "-o", "-4", "addr"]
+            else original_check_output(cmd, **kwargs)
+        ),
+    )
+
+    engine = MagicMock()
+    engine.initialize.return_value = 0
+    engine.get_rpc_port.return_value = 16578
+    monkeypatch.setattr(mc, "_MOONCAKE_AVAILABLE", True)
+    monkeypatch.setattr(mc, "TransferEngine", lambda: engine, raising=False)
+    monkeypatch.setattr(mc, "get_open_port", lambda: 41000)
+    monkeypatch.setattr(mc.zmq, "Context", MagicMock())
+    monkeypatch.setattr(mc, "ThreadPoolExecutor", MagicMock())
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(pipeline_parallel_rank=0),
+        pipeline_parallel_size=1,
+        hf_config=SimpleNamespace(num_hidden_layers=2),
+        kv_cache_block_size=16,
+        decode_context_parallel_size=1,
+        dcp_config=SimpleNamespace(interleave_size=1),
+        kv_transfer_config={
+            "kv_role": role,
+            "protocol": protocol,
+            "ib_device": configured_device,
+        },
+    )
+    conn = mc.MooncakeConnector(config)
+
+    engine.initialize.assert_called_once_with(
+        host_ip, "P2PHANDSHAKE", protocol, expected_device
+    )
+    assert conn.engine_id == f"{host_ip}:16578"
+    assert conn.request_address == f"{host_ip}:8000"
+    assert conn.ib_devices == (expected_device.split(",") if expected_device else [])
+
+    if role == "kv_consumer":
+        # This test exercises the wire payload without registering GPU memory.
+        conn._notification_port = 42000
+        # Check the actual wire payload used for the RDMA target and ZMQ
+        # write-done notification, not only the engine's bootstrap address.
+        conn._send_on_socket = MagicMock()
+        meta = ConnectorMetadata._build_req_meta(
+            req_id="r0",
+            local_block_ids=[0],
+            kv_transfer_params={
+                "remote_block_ids": [1],
+                "remote_host": "10.19.0.113",
+                "remote_handshake_port": 6301,
+                "tp_size": 8,
+                "transfer_id": 9,
+            },
+        )
+        conn.start_load_kv(
+            SimpleNamespace(
+                request_id_to_transfer_id={"r0": 9}, reqs_to_recv={"r0": meta}
+            )
+        )
+        addr, (_, payload) = conn._send_on_socket.call_args.args
+        request = mc.msgpack.loads(payload)
+        assert addr == "tcp://10.19.0.113:6301"
+        assert request["consumer_host"] == host_ip
+        assert request["consumer_rpc_port"] == 16578
+        assert request["notify_host"] == host_ip
+        assert request["notify_port"] == 42000
 
 
 def test_mooncake_tcp_disables_rdma_device_even_when_configured():
@@ -766,9 +896,16 @@ def _fake_head(batch):
         pp_transport=MagicMock(),
         scheduler=MagicMock(),
         _poll_kv_transfer_progress=MagicMock(),
+        _dispatch_idle_offload_work=MagicMock(),
+        # Real throttle, mocked dispatch: `_pp_head_step` runs on a loop that
+        # never sleeps, so it must go through `_advance_idle_kv_transfer`.
+        _next_idle_kv_drain=0.0,
     )
     head.scheduler.schedule.side_effect = [(batch, {}), None]
     head.scheduler.take_rejected.return_value = None
+    head._advance_idle_kv_transfer = PPEngineCoreProc._advance_idle_kv_transfer.__get__(
+        head
+    )
     head._dispatch_connector_only_batch = (
         PPEngineCoreProc._dispatch_connector_only_batch.__get__(head)
     )
@@ -804,6 +941,42 @@ def test_pp_head_skips_empty_meta_of_request_less_batch():
         head.pp_transport.send_metadata.assert_not_called()
 
 
+def test_pp_head_dispatches_idle_offload_without_a_batch():
+    """`Scheduler.is_finished()` stays false while blocks are deferred, so the
+    loop re-enters `_pp_head_step` and never reaches its own idle-drain branch.
+    The leftover suffix saves must be dispatched here or never at all."""
+    head = _fake_head(None)
+    head._dispatch_idle_offload_work.assert_called_once()
+
+
+def test_pp_head_idle_dispatch_shares_the_drain_throttle(monkeypatch):
+    """The loop has no sleep; a direct dispatch would rebuild connector
+    metadata on every turn."""
+    PPEngineCoreProc = _pp_engine_core_cls()
+    from atom.model_engine import engine_core
+
+    # CI can spend longer than the 1 ms drain interval between calls. Control
+    # the clock so this tests the throttle rather than the runner's speed.
+    now = 100.0
+    monkeypatch.setattr(engine_core, "time", SimpleNamespace(monotonic=lambda: now))
+    head = _fake_head(None)
+    head._dispatch_idle_offload_work.assert_called_once()
+    assert head._next_idle_kv_drain == now + engine_core.KV_IDLE_DRAIN_INTERVAL_S
+
+    now += engine_core.KV_IDLE_DRAIN_INTERVAL_S / 2
+    head.scheduler.schedule.side_effect = [None]
+    PPEngineCoreProc._pp_head_step(head)
+
+    head._dispatch_idle_offload_work.assert_called_once()  # still once: throttled
+
+    now = head._next_idle_kv_drain
+    head.scheduler.schedule.side_effect = [None]
+    PPEngineCoreProc._pp_head_step(head)
+
+    assert head._dispatch_idle_offload_work.call_count == 2
+    assert head._next_idle_kv_drain == now + engine_core.KV_IDLE_DRAIN_INTERVAL_S
+
+
 def test_pp_head_forwards_normal_batch_with_meta():
     """A batch with requests keeps the original path: dispatch, send, forward."""
     meta = _FakeMeta(["load-r1"])
@@ -814,6 +987,7 @@ def test_pp_head_forwards_normal_batch_with_meta():
     assert _dispatched_metas(head) == [meta]
     head.pp_transport.send_metadata.assert_called_once_with(batch)
     head.runner_mgr.call_func.assert_any_call("forward", batch, wait_out=True)
+    head._dispatch_idle_offload_work.assert_called_once()  # Next schedule is None.
 
 
 def test_pp_downstream_skips_forward_for_request_less_batch():
@@ -865,7 +1039,10 @@ def test_dcp_block_descriptors_are_streamed_in_bounded_batches():
     batch_sizes = []
     transferred_bytes = 0
 
-    def record_batch(_target, src_addrs, dst_addrs, sizes, _req_id, _label):
+    def record_batch(
+        _target, src_addrs, dst_addrs, sizes, _req_id, _label, *, engine=None
+    ):
+        assert engine is None
         nonlocal transferred_bytes
         assert len(src_addrs) == len(dst_addrs) == len(sizes)
         assert len(src_addrs) <= connector._MAX_RDMA_ENTRIES_PER_BATCH
@@ -942,6 +1119,7 @@ def test_dcp_index_staging_waits_for_request_ready_event():
         [10],
         "req-1",
         ready_event,
+        engine=ready_event,
     )
     connector._index_staging_stream.wait_event.assert_called_once_with(ready_event)
     connector._execute_staged_index_layer_chunk.assert_called_once_with(
@@ -952,6 +1130,11 @@ def test_dcp_index_staging_waits_for_request_ready_event():
         [10],
         "req-1",
         gather_indices,
+        engine=ready_event,
+    )
+    assert all(
+        call.kwargs["engine"] is ready_event
+        for call in connector._rdma_write_with_retry.call_args_list
     )
 
 
@@ -1018,3 +1201,323 @@ def test_mooncake_records_one_ready_event_for_a_prefill_batch(monkeypatch):
 
     ready_event.record.assert_called_once_with(producer_stream)
     assert connector._kv_cache_ready_events == {11: ready_event, 12: ready_event}
+
+
+# ---------------------------------------------------------------------------
+# Matched-rail engines for independent P/D GPU ranks
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "protocol,devices,rails,message",
+    [
+        ("tcp", [], ["ionic_0"], "protocol=rdma"),
+        ("rdma", ["ionic_0", "ionic_1"], ["ionic_0", "ionic_1"], "single primary"),
+        ("rdma", ["ionic_0"], ["ionic_1"], "including the primary"),
+        ("rdma", ["ionic_0"], ["ionic_0", "missing"], "existing local HCAs"),
+    ],
+)
+def test_matched_rails_reject_invalid_transport_configuration(
+    monkeypatch, protocol, devices, rails, message
+):
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    monkeypatch.setattr(mc, "_ib_device_exists", lambda name: name.startswith("ionic_"))
+    with pytest.raises(ValueError, match=message):
+        mc._validate_matched_rails(protocol, devices, rails)
+
+
+def test_matched_rails_disabled_preserves_tcp_and_multi_hca(monkeypatch):
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    mc._validate_matched_rails("tcp", [], [])
+    mc._validate_matched_rails("rdma", ["ionic_0", "ionic_1"], [])
+    monkeypatch.setattr(mc, "_ib_device_exists", lambda _: True)
+    mc._validate_matched_rails("rdma", ["ionic_2"], ["ionic_2", "ionic_6"])
+
+
+@pytest.fixture
+def matched_rail_sysfs(tmp_path, monkeypatch):
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    monkeypatch.setattr(mc, "_IB_SYSFS_ROOT", tmp_path)
+
+    def add(name, *states):
+        device = tmp_path / name
+        device.mkdir(exist_ok=True)
+        for index, state in enumerate(states, 1):
+            port = device / "ports" / str(index)
+            port.mkdir(parents=True)
+            if state is not None:
+                (port / "state").write_text(state)
+        return device
+
+    return mc, add
+
+
+@pytest.mark.parametrize("prefix", ["ionic_", "rdma", "mlx5_"])
+@pytest.mark.parametrize("value", ["auto", " AUTO "])
+def test_matched_rails_auto_discovers_only_active_primary_family(
+    matched_rail_sysfs, prefix, value
+):
+    mc, add = matched_rail_sysfs
+    for suffix in (10, 2, 0):
+        add(f"{prefix}{suffix}", "4: ACTIVE\n")
+    add(f"{prefix}3", "1: DOWN\n")
+    add(f"{prefix}4", None)  # A missing state file is not an active port.
+    add(f"{prefix}5")  # No ports exposed.
+    add(f"{prefix}6", "2: INIT\n", "4: ACTIVE\n")
+    add(f"{prefix}7", "4: ACTIVE\n", "4: ACTIVE\n")  # Include a device once.
+    add(f"{prefix}8_extra", "4: ACTIVE\n")
+    add("other_0", "4: ACTIVE\n")
+
+    assert mc._resolve_matched_rails("rdma", [f"{prefix}2"], value) == [
+        f"{prefix}{i}" for i in (0, 2, 6, 7, 10)
+    ]
+
+
+def test_matched_rails_auto_excludes_unrelated_active_nic(matched_rail_sysfs):
+    mc, add = matched_rail_sysfs
+    for i in range(8):
+        add(f"ionic_{i}", "4: ACTIVE\n")
+    add("mlx5_0", "4: ACTIVE\n")
+    assert mc._resolve_matched_rails("rdma", ["ionic_2"], "auto") == [
+        f"ionic_{i}" for i in range(8)
+    ]
+
+
+@pytest.mark.parametrize("state", [None, "1: DOWN\n", "invalid"])
+def test_matched_rails_auto_rejects_inactive_primary(matched_rail_sysfs, state):
+    mc, add = matched_rail_sysfs
+    add("ionic_2", state)
+    add("ionic_6", "4: ACTIVE\n")
+    with pytest.raises(ValueError, match="Primary HCA.*no readable ACTIVE"):
+        mc._resolve_matched_rails("rdma", ["ionic_2"], "auto")
+
+
+def test_matched_rails_auto_rejects_missing_primary(matched_rail_sysfs):
+    mc, add = matched_rail_sysfs
+    add("ionic_6", "4: ACTIVE\n")
+    with pytest.raises(ValueError, match="Primary HCA.*no readable ACTIVE"):
+        mc._resolve_matched_rails("rdma", ["ionic_2"], "auto")
+
+
+def test_matched_rails_auto_reports_hidden_sysfs(matched_rail_sysfs, tmp_path):
+    mc, _ = matched_rail_sysfs
+    mc._IB_SYSFS_ROOT = tmp_path / "not-mounted"
+    with pytest.raises(ValueError, match="Cannot discover RDMA HCAs"):
+        mc._resolve_matched_rails("rdma", ["ionic_2"], "auto")
+
+
+def test_matched_rails_auto_requires_numbered_names(matched_rail_sysfs):
+    mc, add = matched_rail_sysfs
+    add("custom_hca", "4: ACTIVE\n")
+    with pytest.raises(ValueError, match="explicit HCA list"):
+        mc._resolve_matched_rails("rdma", ["custom_hca"], "auto")
+    assert mc._resolve_matched_rails("rdma", ["custom_hca"], "custom_hca") == [
+        "custom_hca"
+    ]
+
+
+@pytest.mark.parametrize(
+    "protocol,devices,message",
+    [
+        ("tcp", [], "protocol=rdma"),
+        ("rdma", [], "single primary"),
+        ("rdma", ["ionic_0", "ionic_1"], "single primary"),
+    ],
+)
+def test_matched_rails_auto_validates_before_discovery(
+    monkeypatch, protocol, devices, message
+):
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    discovery = MagicMock(side_effect=AssertionError("must not discover"))
+    monkeypatch.setattr(mc, "_discover_active_matched_rails", discovery)
+    with pytest.raises(ValueError, match=message):
+        mc._resolve_matched_rails(protocol, devices, "auto")
+    discovery.assert_not_called()
+
+
+def test_matched_rails_explicit_list_and_unset_do_not_discover(matched_rail_sysfs):
+    mc, add = matched_rail_sysfs
+    add("ionic_2", "4: ACTIVE\n")
+    add("ionic_6", "1: DOWN\n")
+    # Preserve explicit-list behavior; only auto filters link state.
+    assert mc._resolve_matched_rails(
+        "rdma", ["ionic_2"], " ionic_6, ionic_2,ionic_6, "
+    ) == ["ionic_6", "ionic_2"]
+    mc._IB_SYSFS_ROOT = mc._IB_SYSFS_ROOT / "not-mounted"
+    assert mc._resolve_matched_rails("tcp", [], " ") == []
+    assert mc._resolve_matched_rails("rdma", ["ionic_2", "ionic_6"], "") == []
+
+
+def _matched_rail_producer():
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    conn = object.__new__(mc.MooncakeConnector)
+    conn.dp_rank = 2
+    conn.pp_rank = 0
+    conn.pp_size = conn.tp_size = 1
+    conn._completed_prefills = {}
+    conn._kv_cache_ready_events = {}
+    conn._completed_prefills_lock = threading.Lock()
+    conn._transfer_refcount_lock = threading.Lock()
+    conn._completion_lock = threading.Lock()
+    conn._transfer_refcount = {}
+    conn.done_sending = set()
+    conn._wait_for_prefill_data = lambda _: {"block_ids": [1], "slot_index": -1}
+    conn._get_kv_cache_ready_event = lambda _: None
+    conn._notify_transfer_result = MagicMock()
+    conn.transfer_engine = MagicMock()
+    conn.transfer_engine.batch_transfer_sync_write.return_value = 0
+    conn.transfer_engine.get_first_buffer_address.return_value = 1
+    conn._rail_pool = None
+    return conn
+
+
+def _matched_rail_request(name, device):
+    return {
+        "request_id": name,
+        "transfer_id": name,
+        "consumer_host": device,
+        "consumer_rpc_port": 1234,
+        "consumer_ib_device": device,
+        "consumer_dp_rank": 6,
+        "dst_block_ids": [2],
+    }
+
+
+@pytest.mark.parametrize("has_slot_data", [False, True])
+@pytest.mark.parametrize("matched", [False, True])
+def test_concurrent_pd_requests_keep_their_selected_engine(has_slot_data, matched):
+    from concurrent.futures import ThreadPoolExecutor
+
+    conn = _matched_rail_producer()
+    extra = MagicMock()
+    extra.batch_transfer_sync_write.return_value = 0
+    extra.get_first_buffer_address.return_value = 1
+    engines = {"ionic_2": conn.transfer_engine, "ionic_6": extra}
+    if matched:
+        conn._rail_pool = SimpleNamespace(get=engines.__getitem__)
+    barrier = threading.Barrier(2)
+
+    def transfer(data, target, *_args, engine=None):
+        # Both selections must finish before either write. Mutating the
+        # connector's shared engine here would send a request on the wrong rail.
+        barrier.wait(timeout=10)
+        return conn._rdma_write_with_retry(
+            target, [100], [200], [64], data["request_id"], "test", engine=engine
+        )
+
+    conn._execute_block_transfer = transfer
+    conn._execute_block_slot_transfer = transfer
+    requests = [_matched_rail_request(f"req-{device}", device) for device in engines]
+    for request in requests:
+        request["has_slot_regions"] = has_slot_data
+        if has_slot_data:
+            # A stateful transfer must carry the producer's final source slot
+            # (#2154); _execute_transfer rejects the request before it ever
+            # reaches the rail selection this test exercises.
+            request["src_slot_index"] = 5
+            request["dst_slot_index"] = 6
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(conn._execute_transfer, requests))
+
+    assert conn.done_sending == {request["request_id"] for request in requests}
+    assert all(
+        call.kwargs["success"] for call in conn._notify_transfer_result.call_args_list
+    )
+    assert conn.transfer_engine is engines["ionic_2"]
+    for device, engine in engines.items():
+        calls = engine.batch_transfer_sync_write.call_args_list
+        expected = (
+            [f"{device}:1234"]
+            if matched
+            else (["ionic_2:1234", "ionic_6:1234"] if device == "ionic_2" else [])
+        )
+        assert sorted(call.args[0] for call in calls) == expected
+
+
+def test_missing_consumer_rail_notifies_failure_without_writing():
+    from atom.kv_transfer.disaggregation.mooncake.rail_engine_pool import RailEnginePool
+
+    conn = _matched_rail_producer()
+    factory = MagicMock()
+    conn._rail_pool = RailEnginePool(
+        factory,
+        conn.transfer_engine,
+        "ionic_2",
+        ["ionic_2"],
+        lambda device: "127.0.0.1",
+    )
+    conn._rail_pool.set_regions([100], [64])
+    conn._execute_block_transfer = MagicMock()
+    request = _matched_rail_request("old-consumer", None)
+    request.pop("consumer_ib_device")
+    conn._execute_transfer(request)
+    conn._notify_transfer_result.assert_called_once_with(request, success=False)
+    conn._execute_block_transfer.assert_not_called()
+    conn.transfer_engine.batch_transfer_sync_write.assert_not_called()
+    factory.assert_not_called()
+    assert not conn.done_sending
+
+
+@pytest.mark.parametrize("succeeds", [False, True])
+def test_rdma_chunks_and_retries_use_selected_engine(monkeypatch, succeeds):
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    monkeypatch.setattr(mc.time, "sleep", lambda _: None)
+    conn = _matched_rail_producer()
+    conn._MAX_RDMA_ENTRIES_PER_BATCH = 2
+    selected = MagicMock()
+    selected.batch_transfer_sync_write.side_effect = (
+        [-1, 0, 0] if succeeds else [-1, -1, -1]
+    )
+    assert (
+        conn._rdma_write_with_retry(
+            "consumer:1234",
+            [1, 2, 3],
+            [4, 5, 6],
+            [64, 64, 64],
+            "request",
+            "block",
+            engine=selected,
+        )
+        is succeeds
+    )
+    calls = selected.batch_transfer_sync_write.call_args_list
+    assert len(calls) == 3
+    assert calls[0].args == calls[1].args
+    if succeeds:
+        assert calls[-1].args == ("consumer:1234", [3], [6], [64])
+    conn.transfer_engine.batch_transfer_sync_write.assert_not_called()
+
+
+def test_staged_index_write_preserves_selected_engine(monkeypatch):
+    from contextlib import nullcontext
+
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    conn = _matched_rail_producer()
+    conn._acquire_index_staging_slot = lambda: 3
+    conn._release_index_staging_slot = MagicMock()
+    conn._index_staging_stream = SimpleNamespace(synchronize=MagicMock())
+    conn._gather_sharded_index = lambda *_args: (10000, 2)
+    conn._rdma_write_with_retry = MagicMock(return_value=True)
+    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _: nullcontext())
+    selected = object()
+    assert conn._execute_staged_index_layer_chunk(
+        "consumer:1234", 0, 20000, 64, [4, 5], "request", object(), engine=selected
+    )
+    conn._rdma_write_with_retry.assert_called_once_with(
+        "consumer:1234",
+        [10000],
+        [20256],
+        [128],
+        "request",
+        "staged-index",
+        engine=selected,
+    )
+    conn._index_staging_stream.synchronize.assert_called_once()
+    conn._release_index_staging_slot.assert_called_once_with(3)

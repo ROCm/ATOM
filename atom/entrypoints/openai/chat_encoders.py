@@ -12,6 +12,7 @@ when one was found, or to ``tokenizer.apply_chat_template`` otherwise.
 
 import glob
 import importlib.util
+import json
 import logging
 import os
 import pathlib
@@ -24,6 +25,7 @@ from .chat_encoder_adapters import (
     MessageEncoderAdapter,
     build_message_encoder_adapter,
 )
+from .protocol import ChatMessage
 
 logger = logging.getLogger("atom")
 
@@ -33,7 +35,7 @@ def _resolve_model_path(model: str) -> str:
         return model
     try:
         return snapshot_download(model, local_files_only=True, allow_patterns=[])
-    except Exception:
+    except Exception:  # noqa: BLE001
         return model
 
 
@@ -50,11 +52,14 @@ def _load_encoder_from_dir(model_path: str) -> MessageEncoderAdapter | None:
         return None
 
     candidates = sorted(glob.glob(os.path.join(enc_dir, "encoding_*.py")))
+    standalone = os.path.join(enc_dir, "encoding.py")
+    if os.path.isfile(standalone):
+        candidates.append(standalone)
     if not candidates:
         return None
     if len(candidates) > 1:
         logger.warning(
-            f"Multiple encoding_*.py found in {enc_dir}, refusing to guess: "
+            f"Multiple message encoders found in {enc_dir}, refusing to guess: "
             f"{[os.path.basename(p) for p in candidates]}"
         )
         return None
@@ -75,10 +80,15 @@ def _load_encoder_from_dir(model_path: str) -> MessageEncoderAdapter | None:
         logger.warning(f"Failed to load encoder from {enc_path}", exc_info=True)
         return None
 
+    model_type = None
+    if module_name == "encoding":
+        try:
+            with open(os.path.join(model_path, "config.json")) as config_file:
+                model_type = json.load(config_file).get("model_type")
+        except (OSError, ValueError, AttributeError):
+            logger.debug("No model_type for encoder %s", enc_path, exc_info=True)
+
     logger.info(f"Loaded message encoder from {enc_path}")
-    # also valid is "chat" (non-thinking short-form). May need to add as an option.
-    # Revisit when a second model ships an encode_*.py — the default may need to be per-model.
-    #
     # Handed to the adapter rather than applied in a wrapper here. A wrapper
     # runs *after* the adapter has filtered kwargs against the encoder's
     # signature, so the one kwarg it adds is the one the filter cannot remove:
@@ -87,7 +97,11 @@ def _load_encoder_from_dir(model_path: str) -> MessageEncoderAdapter | None:
     # as a refusal -- reported only "tool calls will be delivered as plain
     # text". Silent at startup, 500 on every chat.
     return build_message_encoder_adapter(
-        module_name, raw, enc_path, defaults={"thinking_mode": "thinking"}
+        module_name,
+        raw,
+        enc_path,
+        defaults={"thinking_mode": "thinking"},
+        model_type=model_type,
     )
 
 
@@ -267,7 +281,7 @@ def render_probe_prompt(
 def apply_chat_template(
     tokenizer: Any,
     custom_encoder: MessageEncoderAdapter | None,
-    messages: list[dict],
+    messages: list[dict] | list[ChatMessage],
     *,
     tools: list[dict] | None = None,
     **kwargs: Any,
@@ -280,6 +294,14 @@ def apply_chat_template(
     Model-scoped adapters prepare tools for custom encoders that support them;
     the generic path does not apply DeepSeek-V4-specific message rewriting.
     """
+    if messages and isinstance(messages[0], ChatMessage):
+        preserve_content = (
+            custom_encoder is not None and custom_encoder.preserve_content
+        )
+        messages = [
+            message.to_template_dict(preserve_content=preserve_content)
+            for message in messages
+        ]
     if custom_encoder is not None:
         for k in ("tokenize", "add_generation_prompt"):
             kwargs.pop(k, None)

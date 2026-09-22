@@ -314,6 +314,59 @@ RUN pip install --upgrade pip && \
         libpci-dev cmake libdw1 locales && \
     rm -rf /var/lib/apt/lists/*
 
+# ROCm 7.2.4 runtime backport used by vllm-project/vllm#55099.
+# Drop this stage once the official base image includes ordering-edge signals.
+FROM base AS build_rocm_runtime
+ARG ROCM_SYSTEMS_REPO="https://github.com/ROCm/rocm-systems.git"
+ARG ROCM_RUNTIME_COMMIT="b539bf7eebfd99ad0a69668caa1f4037034d501f"
+
+RUN mkdir -p /staging/lib && \
+    if ! grep -Eq '^7\.2\.4([+-]|$)' /opt/rocm/.info/version; then \
+        echo "Keeping the stock runtime for this non-7.2.4 base image"; exit 0; \
+    fi && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        git cmake ninja-build g++ pkg-config \
+        libelf-dev libdrm-dev libnuma-dev libdw-dev xxd && \
+    pip install --no-cache-dir CppHeaderParser==2.7.4 ply==3.11 && \
+    git init -q /src && cd /src && \
+    git remote add origin "${ROCM_SYSTEMS_REPO}" && \
+    git config remote.origin.promisor true && \
+    git config remote.origin.partialclonefilter blob:none && \
+    git sparse-checkout init --cone && \
+    git sparse-checkout set projects/rocr-runtime projects/clr projects/hip shared cmake && \
+    git fetch --filter=blob:none --depth 1 origin "${ROCM_RUNTIME_COMMIT}" && \
+    git checkout -q FETCH_HEAD && \
+    mkdir -p /opt/rocm-cmake-shim && \
+    printf 'if(NOT TARGET clang)\n  add_executable(clang IMPORTED GLOBAL)\n  set_target_properties(clang PROPERTIES IMPORTED_LOCATION "/opt/rocm/llvm/bin/clang")\nendif()\nset(Clang_PACKAGE_VERSION "rocm-image-shim")\n' > /opt/rocm-cmake-shim/ClangConfig.cmake && \
+    printf 'if(NOT TARGET llvm-objcopy)\n  add_executable(llvm-objcopy IMPORTED GLOBAL)\n  set_target_properties(llvm-objcopy PROPERTIES IMPORTED_LOCATION "/opt/rocm/llvm/bin/llvm-objcopy")\nendif()\nset(LLVM_FOUND TRUE)\nset(LLVM_PACKAGE_VERSION "rocm-image-shim")\n' > /opt/rocm-cmake-shim/LLVMConfig.cmake && \
+    cmake -S /src/projects/rocr-runtime -B /src/build-rocr -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/rocm \
+        -DCMAKE_INSTALL_PREFIX=/opt/rocm \
+        -DClang_DIR=/opt/rocm-cmake-shim -DLLVM_DIR=/opt/rocm-cmake-shim && \
+    cmake --build /src/build-rocr --parallel ${MAX_JOBS:-$(nproc)} && \
+    cmake --install /src/build-rocr && \
+    cmake --install /src/build-rocr --prefix /rocr-install --strip && \
+    cmake -S /src/projects/clr -B /src/build-clr -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DCLR_BUILD_HIP=ON -DCLR_BUILD_OCL=OFF \
+        -DHIP_COMMON_DIR=/src/projects/hip -DROCM_PATH=/opt/rocm \
+        -DCMAKE_PREFIX_PATH=/opt/rocm -DCMAKE_INSTALL_PREFIX=/opt/rocm \
+        -DLLVM_DIR=/opt/rocm-cmake-shim -DHIP_LLVM_ROOT=/opt/rocm/llvm && \
+    cmake --build /src/build-clr --parallel ${MAX_JOBS:-$(nproc)} && \
+    cmake --install /src/build-clr --prefix /clr-install --strip && \
+    cp -P /rocr-install/lib/libhsa-runtime64.so* /staging/lib/ && \
+    cp -P /clr-install/lib/libamdhip64.so* /staging/lib/ && \
+    mkdir -p /staging/.info && \
+    git rev-parse HEAD > /staging/.info/atom-rocm-runtime-commit && \
+    # Record the sonames this commit actually produced. The install step must
+    # not assume .so.1/.so.7: if a future ROCM_RUNTIME_COMMIT bumps a major the
+    # cp above succeeds under the new name while a hardcoded readlink resolves
+    # to the still-present stock symlink, and the fixup then hard-links stock
+    # onto stock and reports success.
+    ( cd /staging/lib && ls -1 libhsa-runtime64.so.* libamdhip64.so.* \
+        | grep -E '\.so\.[0-9]+$' ) > /staging/.info/atom-rocm-runtime-sonames && \
+    test -s /staging/.info/atom-rocm-runtime-sonames
+
 # --------------------------------------------------------------------
 # Stage 1: RCCL — parallel
 # --------------------------------------------------------------------
@@ -565,5 +618,42 @@ RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
     else \
         echo "========== Skipped SemiAnalysis aiperf (INSTALL_SA_AIPERF=0) =========="; \
     fi
+
+# Install the paired runtime after dependency installation. Preserve old image
+# tags for rollback; changing ROCM_RUNTIME_COMMIT selects a different backport.
+COPY --from=build_rocm_runtime /staging/ /opt/rocm/
+# Hard links rather than symlinks: ldconfig rewrites SONAME symlinks but cannot
+# re-point an inode, so absolute-path loads of the old versioned filenames have
+# to land on the new inode. This is upstream vLLM's replacement method.
+RUN set -eux; \
+    if ! grep -Eq '^7\.2\.4([+-]|$)' /opt/rocm/.info/version; then exit 0; fi; \
+    # The builder ran for this flavor, so its outputs have to be here. Failing
+    # closed is the point: publishing an image that silently carries the stock
+    # runtime is the failure this stage exists to prevent.
+    test -s /opt/rocm/.info/atom-rocm-runtime-commit; \
+    test -s /opt/rocm/.info/atom-rocm-runtime-sonames; \
+    cd /opt/rocm/lib; \
+    while read -r soname; do \
+        [ -n "$soname" ] || continue; \
+        # readlink -f exits 0 and prints the would-be path for a DANGLING link.
+        # Without this guard a COPY that did not deliver the target makes the
+        # touch below CREATE a 0-byte file, which the loop then hard-links over
+        # the real runtime. set -eux cannot see any of that.
+        if [ -L "$soname" ]; then [ -e "$soname" ]; fi; \
+        ours="$(readlink -f "$soname")"; \
+        [ -s "$ours" ]; \
+        # touch forces the overlayfs copy-up that lets the layer tar record the
+        # hard links below as aliases instead of as separate copies.
+        touch "$ours"; \
+        for f in "$soname".*; do \
+            [ -f "$f" ] && [ ! -L "$f" ] || continue; \
+            [ "$f" -ef "$ours" ] || ln -f "$ours" "$f"; \
+        done; \
+    done < /opt/rocm/.info/atom-rocm-runtime-sonames; \
+    ldconfig; \
+    # Prove the swap landed. Until this exists every failure path above ends in
+    # a successfully published image carrying the stock runtime.
+    hsa="$(grep -m1 '^libhsa-runtime64\.so\.' /opt/rocm/.info/atom-rocm-runtime-sonames)"; \
+    nm -D "/opt/rocm/lib/$hsa" | grep -q hsa_amd_signal_create_v2
 
 CMD ["/bin/bash"]

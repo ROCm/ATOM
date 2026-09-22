@@ -1189,6 +1189,11 @@ def _make_compress_plans(
         context_lens_cpu,
         ratios,
         plan_buffers=plan_buffers,
+        # V4's K_pool (8 CSA / 128 HCA) is already wider than any draft span
+        # this bridge runs, so its ring needs no extra retention and 0 keeps
+        # the plan byte-identical. A bridge that ever narrows K_pool below
+        # `1 + spec steps` has to pass its ring slack here instead.
+        extra_write=0,
     )
     # Eager path (running_bs unset): make_compress_plans returns a full-buffer
     # write slice (sentinel-padded). The eager bridge launches
@@ -1658,6 +1663,7 @@ def _make_decode_compress_plans(extend_lens_cpu, context_lens_cpu, bufs):
         plan_buffers=bufs.plan_buffers,
         running_bs=bufs.decode_running_bs,
         max_q_len=bufs.decode_q_len,
+        extra_write=0,  # See `_make_compress_plans`: K_pool already covers it.
     )
 
 
@@ -2102,6 +2108,9 @@ def atom_deepseek_v4_forward_context(
     if attn_metadata is None:
         # Fallback (profiling / dummy / standalone, before the proxy cache is
         # bound): build inline with fresh tensors. Never captured.
+        # No metadata attached means vLLM never ran the builder, so this is a
+        # warmup/dummy forward with no request identity: throwaway slots.
+        slot_allocator = None
         if common_attn_metadata is not None:
             common_attn_metadata.positions = positions
         _spec_cfg = getattr(atom_config, "speculative_config", None)

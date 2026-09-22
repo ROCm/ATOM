@@ -2051,8 +2051,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 a1_scale=a1_scale,
                 a2_scale=a2_scale,
                 doweight_stage1=apply_router_weight_on_input,
-                hidden_pad=self.hidden_pad,
-                intermediate_pad=self.intermediate_pad,
                 bias1=layer.w13_bias,
                 bias2=layer.w2_bias,
                 **moe_extra_args,

@@ -7,6 +7,13 @@ from atom.plugin.sglang.models.kimi_k3_processor import (
 from atom.plugin.sglang.patches.prefill_compile_only_patch import (
     apply_prefill_compile_only_patch,
 )
+
+# Temporary: SGLang 0.5.17 / 0.5.19 cannot recognize qwen4_exp / Flash.
+# Drop this import and the apply() call after upgrading SGLang to a release
+# that ships configs/qwen4_exp.py (expected v0.5.20 / PR #37500).
+from atom.plugin.sglang.patches.qwen4_exp_recognition_patch import (
+    apply_qwen4_exp_recognition_patch,
+)
 from atom.plugin.sglang.patches.triton_kernel_retention_patch import (
     apply_triton_kernel_retention_patch,
 )
@@ -156,6 +163,9 @@ def register_plugin() -> None:
     """Install ATOM patches that must run before SGLang parses server args."""
 
     _ensure_aiter_gpu_archs_env()
+    # SGLang is too old to recognize Flash. After upgrading to a release that
+    # recognizes qwen4_exp, drop this call and qwen4_exp_recognition_patch.py.
+    apply_qwen4_exp_recognition_patch()
     _install_model_config_quant_patch()
     _install_loader_quant_patch()
     _register_tc_piecewise_attention_split_ops()

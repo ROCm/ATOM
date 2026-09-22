@@ -25,6 +25,13 @@ class _FakeScheduler:
     """Records the resolver calls; those are the contract under test."""
 
     def __init__(self, defer=()) -> None:
+        # Lease half. `protected` is what `protected_block_ids` answers: None
+        # is ATOM's "cannot narrow this one".
+        self.protected: frozenset | None = None
+        self.leases: list[tuple[str, frozenset]] = []
+        self.source_safe: list[frozenset] = []
+        self.stale: list[frozenset] = []
+        self.reclaim_windows: list[float] = []
         self.saves: list[str] = []
         self.loads: list[str] = []
         self.failed_loads: list[str] = []
@@ -52,6 +59,36 @@ class _FakeScheduler:
     def cancel_pending_load(self, seq) -> None:
         self.cancelled.append(str(seq.id))
 
+    def protected_block_ids(self, seq):
+        return self.protected
+
+    def activate_block_leases(self, seq, block_ids) -> None:
+        self.leases.append((str(seq.id), frozenset(block_ids)))
+
+    def take_source_safe_releases(self) -> list:
+        out, self.source_safe = self.source_safe, []
+        return out
+
+    def reclaim_stale_leases(self, timeout_s: float) -> list:
+        self.reclaim_windows.append(timeout_s)
+        out, self.stale = self.stale, []
+        return out
+
+
+class _FakeBlockPool:
+    """Just enough of vLLM's `BlockPool` to see which shares were taken."""
+
+    def __init__(self, n: int = 8) -> None:
+        self.blocks = [SimpleNamespace(block_id=i) for i in range(n)]
+        self.touched: list[list[int]] = []
+        self.freed: list[list[int]] = []
+
+    def touch(self, blocks) -> None:
+        self.touched.append([b.block_id for b in blocks])
+
+    def free_blocks(self, blocks) -> None:
+        self.freed.append([b.block_id for b in blocks])
+
 
 def _adapter(world_size: int = 1, defer=()) -> tuple[object, _FakeScheduler]:
     # Built without __init__: constructing it for real needs a VllmConfig and
@@ -69,6 +106,7 @@ def _adapter(world_size: int = 1, defer=()) -> tuple[object, _FakeScheduler]:
     adapter._load_failure_reports = {}
     adapter._completion_reports = {}
     adapter._world_size = world_size
+    adapter._gpu_block_pool = None
     return adapter, scheduler
 
 
@@ -424,3 +462,101 @@ def test_a_dispatched_load_is_not_reported():
     )
 
     assert adapter._promised_loads == {}
+
+
+# -- exact block leases --------------------------------------------------
+#
+# The whole-request deferral above is all-or-nothing: `request_finished`
+# returning True holds every block of a finished request until the save is
+# reported. The native engine never pays that -- it frees everything except the
+# exact blocks an in-flight save is still reading. These cover the plugin half
+# asking ATOM the same question.
+
+
+def _leasing_adapter(protected=None, pool_size: int = 8):
+    adapter, scheduler = _adapter(defer={"a"})
+    scheduler.protected = protected
+    pool = _FakeBlockPool(pool_size)
+    adapter.bind_gpu_block_pool(pool)
+    return adapter, scheduler, pool
+
+
+def test_a_finished_request_keeps_only_the_blocks_its_save_still_reads():
+    adapter, scheduler, pool = _leasing_adapter(protected=frozenset({2, 5}))
+
+    # False: vLLM frees the table on the spot. The refcounts taken here are
+    # what keeps the two blocks the save is reading alive.
+    assert _finish(adapter) == (False, None)
+    assert pool.touched == [[2, 5]]
+    assert scheduler.leases == [("a", frozenset({2, 5}))]
+    # Nothing is deferred, so nothing has to be echoed back through
+    # `finished_sending` for this request.
+    assert adapter._deferred_frees == set()
+    assert len(adapter._seqs) == 0
+
+
+def test_a_scheduler_that_cannot_narrow_still_defers_the_whole_request():
+    """None is ATOM's "no early release here, or a load is in flight"."""
+    adapter, scheduler, pool = _leasing_adapter(protected=None)
+
+    assert _finish(adapter) == (True, None)
+    assert pool.touched == [] and scheduler.leases == []
+    assert adapter._deferred_frees == {"a"}
+
+
+def test_without_a_block_pool_the_whole_request_is_still_deferred():
+    """The worker half is never given one, and neither is an older vLLM."""
+    adapter, scheduler = _adapter(defer={"a"})
+    scheduler.protected = frozenset({1})
+
+    assert _finish(adapter) == (True, None)
+    assert scheduler.leases == []
+    assert adapter._deferred_frees == {"a"}
+
+
+def test_an_empty_protection_set_takes_no_share_at_all():
+    """`touch([])` is not merely wasteful -- there is no share to give back."""
+    adapter, _scheduler, pool = _leasing_adapter(protected=frozenset())
+
+    assert _finish(adapter) == (False, None)
+    assert pool.touched == []
+    assert adapter._deferred_frees == set()
+
+
+def test_a_lease_is_handed_back_tail_first_once_its_save_is_source_safe():
+    """Tail-first is vLLM's own convention: the shared prefix evicts last."""
+    adapter, scheduler, pool = _leasing_adapter(protected=frozenset({2, 5}))
+    _finish(adapter)
+
+    scheduler.source_safe = [frozenset({2, 5})]
+    adapter.update_connector_output(_output())
+
+    assert pool.freed == [[5, 2]]
+
+
+def test_a_lease_whose_save_never_reports_is_force_released(caplog, monkeypatch):
+    monkeypatch.setattr(connector_mod, "offload_save_abandon_timeout_s", lambda: 330.0)
+    adapter, scheduler, pool = _leasing_adapter(protected=frozenset({3}))
+    _finish(adapter)
+
+    scheduler.stale = [frozenset({3})]
+    with caplog.at_level("WARNING"):
+        adapter.update_connector_output(_output())
+
+    assert pool.freed == [[3]]
+    # Same window `_reconcile_stale_saves` bounds the whole-request deferral
+    # against: a lease must not be able to outlive the deferral it replaced.
+    assert scheduler.reclaim_windows == [330.0]
+    assert "never reported" in caplog.text
+
+
+def test_leases_are_left_alone_when_there_is_no_pool_to_give_them_back_to():
+    adapter, scheduler = _adapter(defer={"a"})
+    scheduler.source_safe = [frozenset({1})]
+
+    adapter.update_connector_output(_output())
+
+    # Not drained: without the pool this half cannot drop a refcount, and
+    # dropping the record would lose the blocks instead of freeing them.
+    assert scheduler.source_safe == [frozenset({1})]
+    assert scheduler.reclaim_windows == []

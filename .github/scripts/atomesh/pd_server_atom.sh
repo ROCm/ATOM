@@ -236,7 +236,7 @@ dump_launch_info() {
   echo "  ${role} launch info"
   echo "========================================"
   echo "--- environment ---"
-  env | grep -E '^(HIP_|HSA_|AITER_|ATOM_|RCCL_|NCCL_|CUDA_|MOONCAKE_|UCX_)' | sort || true
+  env | grep -E '^(HIP_|HSA_|AITER_|ATOM_|RCCL_|NCCL_|CUDA_|MOONCAKE_|MORI_|UCX_)' | sort || true
   echo "--- command ---"
   printf '%q ' "$@"
   echo ""
@@ -604,7 +604,7 @@ terminate_process_group() {
   wait "${pid}" 2>/dev/null || true
 }
 
-# LMCache's NVMe tier lives on a host bind mount, so unlike the container's own
+# LMCache's disk tier lives on a host bind mount, so unlike the container's own
 # /tmp it survives `docker run --rm`. Every concurrency runs as its own job, and
 # a tier left behind would both serve the previous job's KV and hold its
 # LMCACHE_MAX_LOCAL_DISK_SIZE of disk per rank. Start empty, leave nothing.
@@ -613,19 +613,25 @@ lmcache_disk_dir=""
 reset_lmcache_disk() {
   local dir="${LMCACHE_LOCAL_DISK:-}"
   [[ -n "${dir}" && "${dir}" != "/" ]] || return 0
+  # The repository working directory is read-only in the container. Resolve
+  # relative paths under the writable logs, isolated by job, phase and node rank.
+  if [[ "${dir}" != /* ]]; then
+    dir="${RUNTIME_LOG_DIR}/rank-${NODE_RANK}/${dir#./}"
+  fi
+  export LMCACHE_LOCAL_DISK="${dir}"
   # Several prefill workers can share this shell, so only the first one empties
   # the tier; a later one would delete a running worker's cache underneath it.
   [[ "${lmcache_disk_dir}" != "${dir}" ]] || return 0
   lmcache_disk_dir="${dir}"
   rm -rf -- "${dir}"
   mkdir -p -- "${dir}"
-  echo "[lmcache] NVMe tier ${dir} reset (${LMCACHE_MAX_LOCAL_DISK_SIZE:-0}GiB per rank)"
+  echo "[lmcache] disk tier ${dir} reset (${LMCACHE_MAX_LOCAL_DISK_SIZE:-0}GiB per rank)"
 }
 
 purge_lmcache_disk() {
   [[ -n "${lmcache_disk_dir}" ]] || return 0
   rm -rf -- "${lmcache_disk_dir}"
-  echo "[lmcache] NVMe tier ${lmcache_disk_dir} removed"
+  echo "[lmcache] disk tier ${lmcache_disk_dir} removed"
   lmcache_disk_dir=""
 }
 

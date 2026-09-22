@@ -259,10 +259,16 @@ def build_cell(
     required_nodes = required_node_count(pd_worker_layout, prefill_cfg, decode_cfg)
     slurm_submit_runner = str(runner_cfg.get("slurm_submit_runner", ""))
     allow_auto_nodes = slurm_submit_runner in {
+        "atomesh-cicd",
         "atomesh-cicd-mi350",
         "atomesh-cicd-mi355-crusoe",
     }
     requires_explicit_candidate_nodes = slurm_submit_runner == "atomesh-cicd-mi350"
+    node_pool = (
+        resolve_nodes(os.environ.get("ATOMESH_NODE_POOL", ""))
+        if slurm_submit_runner == "atomesh-cicd"
+        else []
+    )
 
     single_node_override = os.environ.get("ATOMESH_SINGLE_NODE", "").strip()
     if single_node_pd and single_node_override not in ("", "auto"):
@@ -271,9 +277,22 @@ def build_cell(
             raise ValueError("ATOMESH_SINGLE_NODE must specify exactly one node")
     else:
         nodes = resolve_nodes(suite_cfg.get("nodes"))
-        if allow_auto_nodes and not requires_explicit_candidate_nodes:
+        if slurm_submit_runner == "atomesh-cicd-mi355-crusoe":
             nodes = []
-    if allow_auto_nodes and requires_explicit_candidate_nodes:
+    if node_pool:
+        outside_pool = set(nodes) - set(node_pool)
+        if outside_pool:
+            raise ValueError(
+                "Nodes outside the atomesh-cicd candidate pool: "
+                + ",".join(sorted(outside_pool))
+            )
+        nodes = list(dict.fromkeys(nodes or node_pool))
+        if len(nodes) < required_nodes:
+            raise ValueError(
+                f"{suite_cfg.get('name', model_name)} needs at least "
+                f"{required_nodes} node(s)"
+            )
+    elif allow_auto_nodes and requires_explicit_candidate_nodes:
         if not nodes:
             raise ValueError(
                 f"{suite_cfg.get('name', model_name)} needs a non-empty "
@@ -302,17 +321,16 @@ def build_cell(
                 f"{required_nodes} node(s)"
             )
         nodes = nodes[:required_nodes]
-    elif nodes and len(nodes) < required_nodes:
+    elif nodes and len(nodes) < required_nodes or not nodes and not allow_auto_nodes:
         raise ValueError(
             f"{suite_cfg.get('name', model_name)} needs at least "
             f"{required_nodes} node(s)"
         )
-    elif not nodes and not allow_auto_nodes:
-        raise ValueError(
-            f"{suite_cfg.get('name', model_name)} needs at least "
-            f"{required_nodes} node(s)"
-        )
-    num_nodes = required_nodes if allow_auto_nodes else len(nodes)
+    num_nodes = (
+        required_nodes
+        if not nodes or requires_explicit_candidate_nodes or node_pool
+        else len(nodes)
+    )
 
     server_args = deep_merge(
         model_cfg.get("server", {}).get("common_args", {}),

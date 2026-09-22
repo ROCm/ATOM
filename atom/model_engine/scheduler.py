@@ -34,6 +34,7 @@ from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.engine_stats import EngineStats
+from atom.model_engine.multimodal_runtime import prefill_media_payload
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import (
     Sequence,
@@ -55,6 +56,14 @@ logger = logging.getLogger("atom")
 # engine polls KV progress every millisecond (KV_IDLE_DRAIN_INTERVAL_S), so the
 # reconciler no-ops until this interval has passed.
 _SAVE_RECONCILE_INTERVAL_S = 5.0
+
+# Release attempts a deferred request may fail after its save was abandoned
+# before `_reconcile_stalled_deferred_saves` calls it wedged. The reclaimer
+# retries rather than force-freeing (a claimed source may be under a live RDMA
+# read), so a claim nobody will ever retire no longer has a way out -- it has
+# to be visible instead. Deliberately well past the abandon timeout: a P/D send
+# that is merely slow must not trip it.
+_RELEASE_WEDGE_ATTEMPTS = 12
 
 # Memoised result of `_offload_max_pending_saves`, a process constant likewise.
 _MAX_PENDING_OFFLOAD: int | None = None
@@ -365,12 +374,19 @@ class ScheduledBatch:
         # Key into ModelRunner's stream pool for CU-masked disagg streams.
         # None means full-CU fallback (no mask).
         self.cu_stream_fraction = cu_stream_fraction
-        # Collect multimodal data from prefill sequences
+        # Explicit spans support arbitrary chunks. Retain the CPU payload on
+        # the request for retry, and omit pixels after workers acknowledge it.
         self.multimodal_data = {}
         for seq in seqs.values():
-            if getattr(seq, "multimodal_data", None) is not None:
-                self.multimodal_data[seq.id] = seq.multimodal_data
-                # Clear after first use to avoid re-sending on decode steps
+            data = getattr(seq, "multimodal_data", None)
+            if data is None or seq.type != SequenceType.PREFILL:
+                continue
+            if "embedding_spans" in data:
+                self.multimodal_data[seq.id] = prefill_media_payload(
+                    data, seq.cache_seed, cache_ready=seq.multimodal_cache_ready
+                )
+            else:
+                self.multimodal_data[seq.id] = data
                 seq.multimodal_data = None
         self.external_request_ids = [seq.external_request_id for seq in seqs.values()]
 
@@ -535,6 +551,11 @@ class Scheduler:
         # Reclamation bookkeeping for offload saves whose completion is never
         # reported (see `_reconcile_stalled_deferred_saves`).
         self._abandoned_saves: int = 0
+        # Set by the PP head: a lost stage report leaves a partial quorum in
+        # its `PPKVAggregator`, which the scheduler owns no handle on. A direct
+        # callback rather than a buffer -- under `pp_size == 1` nobody sets it,
+        # and an unread buffer is its own slow leak.
+        self.on_save_abandoned = None
         self._next_save_reconcile_at: float = 0.0
 
         # Scheduling delay for batching efficiency
@@ -627,7 +648,24 @@ class Scheduler:
         )
         if config.enable_prefix_caching:
             self.engine_stats.block_manager = self.block_manager
-        if kv_events_cfg is not None and kv_events_cfg.enable:
+        # Under pipeline parallelism every stage builds a Scheduler, but only
+        # the head stage schedules and hashes blocks; the others never produce
+        # events. Give them the null publisher so they neither bind the
+        # per-DP-rank endpoints (a downstream stage on the same host would
+        # collide with the head) nor emit duplicate streams.
+        pp_rank = (
+            getattr(parallel_cfg, "pipeline_parallel_rank", 0)
+            if parallel_cfg is not None
+            else 0
+        )
+        kv_events_on = kv_events_cfg is not None and kv_events_cfg.enable
+        if kv_events_on and pp_rank:
+            logger.info(
+                "KV event publisher disabled on PP stage %s: only the head "
+                "stage publishes",
+                pp_rank,
+            )
+        if kv_events_on and not pp_rank:
             self.kv_event_publisher: _EventPublisher = _make_publisher(
                 enabled=True,
                 publisher_kind=kv_events_cfg.publisher,
@@ -635,12 +673,22 @@ class Scheduler:
                 topic=kv_events_cfg.topic,
                 hwm=kv_events_cfg.hwm,
                 buffer_steps=kv_events_cfg.buffer_steps,
+                replay_endpoint=kv_events_cfg.replay_endpoint,
+                replay_buffer_steps=kv_events_cfg.replay_buffer_steps,
                 data_parallel_rank=dp_rank,
             )
             logger.info(
-                "KV event publisher enabled: kind=%s endpoint=%s dp_rank=%s",
+                "KV event publisher enabled: kind=%s endpoint=%s "
+                "replay_endpoint=%s dp_rank=%s",
                 kv_events_cfg.publisher,
-                kv_events_cfg.endpoint,
+                # The zmq publisher offsets its bind addresses per DP rank;
+                # log what was actually bound, not the shared config value.
+                getattr(self.kv_event_publisher, "endpoint", kv_events_cfg.endpoint),
+                getattr(
+                    self.kv_event_publisher,
+                    "replay_endpoint",
+                    kv_events_cfg.replay_endpoint,
+                ),
                 dp_rank,
             )
         else:
@@ -948,7 +996,44 @@ class Scheduler:
         if callable(callback):
             callback(str(seq.id))
 
+    def _connector_send_finished(self, req_id) -> None:
+        """Drop the connector's send claim on a request's source blocks.
+
+        The mutator half of `should_defer_free` for the send leg, as
+        `_connector_abandon_save` is for the save leg. Guarded: only a producer
+        connector tracks sends.
+        """
+        callback = getattr(self.kv_connector, "send_finished", None)
+        if callable(callback):
+            callback(req_id)
+
+    def _connector_source_blocks_released(self, seq: Sequence) -> None:
+        """Tell the connector its source blocks are back in the pool.
+
+        The terminal half of `request_finished` for a connector that deferred
+        the free. Not `request_finished` a second time: that one also takes the
+        P/D send claim, so re-invoking it would re-arm the claim this release
+        just cleared. The base requires an explicit implementation; the guard
+        also supports an absent connector and minimal scheduler test doubles.
+        """
+        callback = getattr(self.kv_connector, "source_blocks_released", None)
+        if callable(callback):
+            callback(seq)
+
     def _maybe_release_deferred(self, seq: Sequence) -> None:
+        """Release once every connector has let go of the source blocks.
+
+        `should_defer_free` is the one predicate; `MultiConnector` ORs it across
+        its subs. It must stay a predicate rather than a tally of completion
+        reports, because offload also owns chunks it has computed but not yet
+        dispatched a save for.
+
+        Deliberately does not call `request_finished` -- callers arrive with the
+        request already finished, and a second call re-arms the P/D send claim
+        this check just cleared. The block-lifetime cleanup that the second call
+        used to carry is now its own hook, `source_blocks_released`, invoked
+        below once the free has actually happened.
+        """
         if (
             seq.id not in self.deferred_free_blocks
             or getattr(seq, "_awaiting_aborted_load_cleanup", False)
@@ -956,11 +1041,11 @@ class Scheduler:
         ):
             return
 
-        callback = getattr(self.kv_connector, "request_finished", None)
-        if callable(callback):
-            callback(seq)
         self.deferred_free_blocks.pop(seq.id, None)
         self.block_manager.deallocate(seq)
+        # After the free, not before: the connector may only forget the state
+        # keyed on these blocks once nothing can read them again.
+        self._connector_source_blocks_released(seq)
 
     def _save_abandon_timeout_s(self) -> float:
         """Seconds a deferred save may sit before reclamation, or 0 to disable.
@@ -983,25 +1068,31 @@ class Scheduler:
         the blocks were never released. Once the save has been deferred longer
         than `_save_abandon_timeout_s()` -- set above LMCache's pin
         timeout, so upstream has force-unpinned and released the source bytes --
-        the blocks are safe to return to the pool. Without this, a single
+        the save's own hold on the blocks can go. Without this, a single
         never-reported save keeps `has_pending_kv_work()` True forever and the
         engine busy-loops with every GPU idle.
 
-        Mirrors the producer `finished_sending` reclaim (pop + deallocate),
-        deliberately not re-invoking `request_finished`: it was already called
-        when the request finished, before the block free was deferred. It does
-        notify the connector via `abandon_save`, though -- freeing the blocks
-        here is not enough on its own: the connector still holds the save in
-        `_save_inflight` (and, on K3, in the stall latch), so `should_defer_free`
-        would stay True and `has_pending_kv_work()` would never clear without
-        that drop.
+        Abandoning the save is not the same as freeing the blocks: the release
+        still goes through `should_defer_free`, so an unreported P/D send keeps
+        its source alive and `finished_sending` frees it later -- which is why
+        the release attempt repeats every interval while the abandon happens
+        once (`_save_abandoned`). The flip side is that this is no longer an
+        unconditional escape: if `abandon_save` does not clear every claim (an
+        active load does not go through it), the retry never succeeds, so
+        `_RELEASE_WEDGE_ATTEMPTS` makes that state loud rather than silent.
+        Reclamation does not re-invoke `request_finished`: it was already called
+        when the request finished. It does notify the connector via
+        `abandon_save` -- freeing the blocks here is not enough on its own: the
+        connector holds the save in `_save_inflight` (and, on K3, in the stall
+        latch), so `should_defer_free` would stay True and
+        `has_pending_kv_work()` would never clear without that drop.
 
         The complement of the K3 connector's stall escape
         (`kimi_k3.connector.save_stall_seconds()`), not a duplicate of it: that
         one releases the blocks of a save the backend never took, on a shorter
         clock, and leaves a save already handed out alone -- precisely the case
         this reclaims once the report is not coming. Between them every deferred
-        save has a way out.
+        save has a way out -- as long as dropping the save drops the last claim.
         """
         timeout = self._save_abandon_timeout_s()
         if timeout <= 0:
@@ -1036,22 +1127,65 @@ class Scheduler:
             if getattr(seq, "_deferred_save_at", None) is not None
             and now - seq._deferred_save_at >= timeout
         ]
+        released = 0
+        abandoned = 0
+        wedged: list = []
         for seq in stalled:
-            self.deferred_free_blocks.pop(seq.id, None)
-            self._connector_abandon_save(seq)
-            self.block_manager.deallocate(seq)
-            self._abandoned_saves += 1
-        if stalled:
+            # The save is abandoned once; the release attempt is not. Whether
+            # the blocks come back is a separate question -- a send that has
+            # not reported still claims them -- and giving up on the first
+            # attempt (by clearing the stamp) was how an unanswerable claim,
+            # an abort's above all, lost its blocks for good. Retry each
+            # interval instead, so a late `finished_sending`, or an explicit
+            # retirement, is enough to collect them.
+            if not getattr(seq, "_save_abandoned", False):
+                self._connector_abandon_save(seq)
+                seq._save_abandoned = True
+                self._abandoned_saves += 1
+                observer = getattr(self, "on_save_abandoned", None)
+                if callable(observer):
+                    observer(seq.id)
+                abandoned += 1
+            self._maybe_release_deferred(seq)
+            if seq.id not in self.deferred_free_blocks:
+                seq._deferred_save_at = None
+                released += 1
+            else:
+                seq._release_attempts = getattr(seq, "_release_attempts", 0) + 1
+                if seq._release_attempts == _RELEASE_WEDGE_ATTEMPTS:
+                    wedged.append(seq.id)
+        if wedged:
+            # Once: `_release_attempts` only equals the threshold on one pass.
+            logger.error(
+                "Blocks for request(s) %s survived %d release attempts (%.0fs) "
+                "after their save was abandoned -- a connector still claims the "
+                "source and no completion report is coming to retire that "
+                "claim. These blocks will not return to the pool and "
+                "has_pending_kv_work() stays True. Check the P/D backend's "
+                "send completions.",
+                wedged,
+                _RELEASE_WEDGE_ATTEMPTS,
+                _RELEASE_WEDGE_ATTEMPTS * _SAVE_RECONCILE_INTERVAL_S,
+            )
+        if abandoned or released:
             logger.warning(
-                "Reclaimed %d offload save(s) still deferred after %.0fs with no "
+                "Abandoned %d offload save(s) still deferred after %.0fs with no "
                 "completion report (LMCache force-unpins a stalled save without "
-                "reporting it); freed their blocks so the engine does not stall. "
+                "reporting it); released %d of %d stalled allocation(s), retrying "
+                "the rest while a P/D send still owns the source. "
                 "total abandoned_saves=%d",
-                len(stalled),
+                abandoned,
                 timeout,
+                released,
+                len(stalled),
                 self._abandoned_saves,
             )
-        return len(stalled) + lease_reclaims
+        return released + lease_reclaims
+
+    @staticmethod
+    def _requires_atomic_prefill(seq):
+        data = getattr(seq, "multimodal_data", None)
+        return data is not None and "embedding_spans" not in data
 
     def _unschedulable_reason(self, seq: Sequence) -> str | None:
         """Return a human-readable reason if `seq` is permanently unschedulable.
@@ -1090,10 +1224,8 @@ class Scheduler:
                 f"input tokens={num_tokens} > max_model_len={self.max_model_len}. "
                 f"Increase --max-model-len or shorten the prompt."
             )
-        # Multimodal prefills are never chunked (the vision embeddings cover the
-        # whole prompt), so for them the batched-token budget is a hard cap even
-        # when chunked prefill is on.
-        is_multimodal = getattr(seq, "multimodal_data", None) is not None
+        # Only processors with explicit spans and request leases can chunk.
+        is_multimodal = self._requires_atomic_prefill(seq)
         if (
             not self.enable_chunked_prefill or is_multimodal
         ) and num_tokens > self.max_num_batched_tokens:
@@ -1317,6 +1449,7 @@ class Scheduler:
             if unschedulable is not None:
                 seq.status = SequenceStatus.FINISHED
                 seq.leave_reason = f"unschedulable: {unschedulable}"
+                seq.multimodal_data = None
                 self._rejected.append(seq)
                 continue
 
@@ -1431,22 +1564,7 @@ class Scheduler:
             num_new_tokens = (
                 seq.num_tokens - num_cached_blocks * self.block_manager.hash_block_size
             )
-            # Vision embeddings are computed for the whole prompt in one shot
-            # and scattered onto the placeholder positions of the tokens in the
-            # batch, so a multimodal prefill must not be split: a partial chunk
-            # would either miss the placeholders entirely or land them at the
-            # wrong offsets. Take the prompt whole or wait for a step with
-            # enough budget.
-            #
-            # TODO: support chunked multimodal prefill. Needs the vision
-            # embeddings computed once and cached per request, then sliced by
-            # the chunk's token offset at scatter time (see the merge site in
-            # ModelRunner.run_model). Today the scheduler also clears
-            # `seq.multimodal_data` after the first batch, so later chunks would
-            # silently embed raw `<|media_pad|>` tokens into the KV cache. Until
-            # that lands, `max_num_batched_tokens` caps multimodal prompt length
-            # even with chunked prefill enabled.
-            atomic_prefill = getattr(seq, "multimodal_data", None) is not None
+            atomic_prefill = self._requires_atomic_prefill(seq)
             if (
                 not atomic_prefill
                 and self.enable_chunked_prefill
@@ -1932,12 +2050,18 @@ class Scheduler:
         has_inflight_load = bool(getattr(seq, "_counted_as_inflight_load", False))
         seq.status = SequenceStatus.FINISHED
         seq.leave_reason = "aborted"
+        seq.multimodal_data = None
         self._rejected.append(seq)
-        if not has_inflight_load and self._connector_flag("is_offload"):
-            # A lookup can pin CPU KV before HBM allocation succeeds. No load
-            # is in flight yet, but the connector still owns cleanup work.
+        if not has_inflight_load and self.kv_connector is not None:
+            # This path bypasses postprocess: producers must discard queued
+            # saves, and offload may own CPU pins before HBM allocation.
             # Already-dispatched loads retain the completion-driven path below.
-            self.kv_connector.cancel_pending_load(seq)
+            if self._connector_flag("is_offload"):
+                self.kv_connector.cancel_pending_load(seq)
+            self.kv_connector.request_finished(seq)
+            # No send will ever be issued for an abort, so nothing would
+            # otherwise retire a claim taken above. See `postprocess`.
+            self._connector_send_finished(seq.id)
             self.deferred_free_blocks[seq.id] = seq
             self._maybe_release_deferred(seq)
         if not has_inflight_load or not self._connector_flag("is_offload"):
@@ -1961,6 +2085,14 @@ class Scheduler:
         if hasattr(seq, "_awaiting_aborted_load_cleanup"):
             delattr(seq, "_awaiting_aborted_load_cleanup")
         self._uncount_inflight_load(seq)
+        # The one path that never went through `postprocess`, so it finishes
+        # the request here rather than before the park.
+        callback = getattr(self.kv_connector, "request_finished", None)
+        if callable(callback):
+            callback(seq)
+        # As in `_reject_aborted_waiting`: an abort never sends, so the
+        # scheduler retires the send claim rather than waiting for a report.
+        self._connector_send_finished(seq.id)
         self._maybe_release_deferred(seq)
 
     def _finish_aborted_load_cleanup(self, req_id) -> bool:
@@ -2147,19 +2279,7 @@ class Scheduler:
         than one checkpoint interval.
         """
         bm = self.block_manager
-        # A multimodal prompt is prefilled whole -- chunked multimodal prefill is
-        # unsupported (see the `atomic_prefill` guard in `_schedule_prefills`), so
-        # it is either admitted entire or requeued entire. Landing it on a state
-        # checkpoint rung shortens it deterministically, and the post-alloc atomic
-        # re-assert then requeues it whole; the very next pass produces the same
-        # shortened chunk and requeues again -- a livelock with idle GPUs and
-        # head-of-line blocking. Skip the rung cut here: the checkpoint machinery
-        # keeps a checkpoint only where a forward ends exactly on a rung, so a
-        # whole prompt that ends off-grid simply keeps no mid-prompt checkpoint,
-        # which is correct for a single-shot prefill (there is no later chunk to
-        # resume from anyway). Forks do not arise on a fresh multimodal prompt
-        # (`state_fork_src < 0`), so the fork-vetting below is likewise moot.
-        if getattr(seq, "multimodal_data", None) is not None:
+        if self._requires_atomic_prefill(seq):
             return chunk
         target = bm.checkpoint_cut(seq, start, start + chunk)
         if target:
@@ -2649,7 +2769,13 @@ class Scheduler:
         # live seq.is_partial_prefill while this batch was in flight).
         pp_middle_chunk_ids: set[int] = set()
         running_by_id = {seq.id: seq for seq in self.running} if batch else {}
+        if batch is not None:
+            for request_id, data in getattr(batch, "multimodal_data", {}).items():
+                seq = running_by_id.get(request_id)
+                if seq is not None and "embedding_spans" in data:
+                    seq.multimodal_cache_ready = True
         num_prefill = int(getattr(batch, "total_seqs_num_prefill", 0))
+        prefill_ids = set(batch.req_ids[:num_prefill]) if num_prefill else set()
         if self._connector_flag("is_offload") and num_prefill:
             for req_id in batch.req_ids[:num_prefill]:
                 seq = running_by_id.get(req_id)
@@ -2726,9 +2852,23 @@ class Scheduler:
             num_placeholder += 1
 
         for seq in self.running:
+            # Cancellation does not require sampled output. Middle prefill
+            # chunks and the first deferred step may have none; waiting for
+            # one keeps an aborted request alive without advancing its tokens.
+            if seq.status == SequenceStatus.ABORTED:
+                self._mark_finished(
+                    seq, "aborted", seq.num_tokens - seq.num_placeholder_tokens
+                )
+                finished_seqs.append(seq)
+                continue
             # Update the running status
             idx = fwd_output.get_idx(seq.id)
             if idx is None:
+                continue
+            # An immediate preempt/resume can retain the same request ID in
+            # the runner's deferred output. That result belongs to execution
+            # before this prefill and must not advance the replayed request.
+            if is_deferred_out and seq.id in prefill_ids:
                 continue
             # Partial prefill: KV written but prefill not complete — discard
             # the sampled token. Prefix hashes are also deferred since
@@ -2883,11 +3023,6 @@ class Scheduler:
                 )
             num_tokens = seq.num_tokens - num_placeholder_width - num_rejected
             leave_reason = None
-            # Client disconnected -> finish now via the normal stop path (frees
-            # KV blocks, emits a finished RequestOutput). A natural stop below
-            # may still overwrite the reason; either way the seq terminates.
-            if seq.status == SequenceStatus.ABORTED:
-                leave_reason = "aborted"
             # MTP edge case: `rejection_sampler` does NOT inspect EOS — it
             # only compares draft vs target_argmax for acceptance. So when
             # the verified token is EOS the kernel still emits 1+ accepted
@@ -2975,6 +3110,7 @@ class Scheduler:
             # Record TTFT from the finalized retained length, after rejected
             # speculative tokens and cap/stop overflow have been removed. A
             # terminal response with no completion tokens must keep TTFT zero.
+            seq.num_finalized_tokens = num_tokens
             if num_tokens - seq.num_prompt_tokens >= 1 and seq.first_token_time == 0.0:
                 seq.first_token_time = time.time()
 
@@ -2998,6 +3134,11 @@ class Scheduler:
                 ),
             )
 
+            if leave_reason is not None:
+                # Publish transfer metadata before constructing the terminal
+                # output. Aborts without sampled output use the same helper.
+                self._mark_finished(seq, leave_reason, num_tokens)
+
             # Prepare stream output
             # A terminal event is required even when truncation leaves no
             # tokens (for example max_tokens <= 0). Async consumers wait for
@@ -3005,8 +3146,6 @@ class Scheduler:
             if stream_output_queue is not None and (
                 new_tokens or leave_reason is not None
             ):
-                if self.kv_connector is not None and leave_reason is not None:
-                    self.kv_connector.request_finished(seq)
                 output_tokens_list = (
                     list(new_tokens)
                     if isinstance(new_tokens, tuple)
@@ -3036,14 +3175,6 @@ class Scheduler:
                 # logger.info(
                 #     f"Sequence {seq.id} finished with reason: {leave_reason}, {seq.token_ids[-8:]=}"
                 # )
-                seq.num_tokens = num_tokens
-                seq.leave_reason = leave_reason
-                seq.status = SequenceStatus.FINISHED
-                self.total_finished_requests += 1
-                self.total_prompt_tokens += int(seq.num_prompt_tokens)
-                self.total_generation_tokens += max(
-                    0, int(num_tokens) - int(seq.num_prompt_tokens)
-                )
                 finished_seqs.append(seq)
 
         if stream_output_queue is not None and stream_outputs:
@@ -3073,15 +3204,10 @@ class Scheduler:
                 seq.is_partial_prefill = False
                 self._partial_prefill_count -= 1
             if self.kv_connector is not None:
-                if hasattr(self.kv_connector, "request_finished"):
-                    self.kv_connector.request_finished(seq)
-                if self._connector_flag("is_producer"):
-                    logger.debug(
-                        "Deferring block free for seq %s until KV send completes.",
-                        seq.id,
-                    )
-                    self.deferred_free_blocks[seq.id] = seq
-                elif self._connector_should_defer_free(seq):
+                # `request_finished` already ran once, above, while the reason
+                # was being settled -- it must not run again now that the claim
+                # it takes is a side effect.
+                if self._connector_should_defer_free(seq):
                     protected = self._connector_protected_block_ids(seq)
                     if protected is not None:
                         # Early block release: only the save's exact source
@@ -3112,8 +3238,8 @@ class Scheduler:
                         )
                     else:
                         logger.debug(
-                            "Deferring block free for seq %s until KV save "
-                            "completes.",
+                            "Deferring block free for seq %s until every KV "
+                            "owner releases it.",
                             seq.id,
                         )
                         # Stamp when the save was deferred so the reconciler
@@ -3131,6 +3257,27 @@ class Scheduler:
             num_generation_tokens=num_new_generation_tokens
         )
         return finished_seqs
+
+    def _mark_finished(self, seq, reason, num_tokens):
+        # Set the reason before the connector decides whether to claim the
+        # source blocks. This runs exactly once, including early cancellation
+        # without sampled output and requests without a stream queue.
+        seq.leave_reason = reason
+        if self.kv_connector is not None:
+            callback = getattr(self.kv_connector, "request_finished", None)
+            if callable(callback):
+                callback(seq)
+            if reason == "aborted":
+                # No peer will report a send for a cancelled request.
+                self._connector_send_finished(seq.id)
+        seq.num_tokens = num_tokens
+        seq.multimodal_data = None
+        seq.status = SequenceStatus.FINISHED
+        self.total_finished_requests += 1
+        self.total_prompt_tokens += int(seq.num_prompt_tokens)
+        self.total_generation_tokens += max(
+            0, int(num_tokens) - int(seq.num_prompt_tokens)
+        )
 
     def compute_detailed_aggregates(
         self,
@@ -3255,6 +3402,7 @@ class Scheduler:
             remote_tokens: list[int] = []
             parent_block_hash: int | None = None
             prev_hash: int | None = None
+            first_remote_index: int | None = None
             for i, block_id in enumerate(seq.block_table):
                 blk = bm.kv.block(block_id)
                 if blk.hash == -1:
@@ -3264,14 +3412,27 @@ class Scheduler:
                     continue
                 if not remote_hashes:
                     parent_block_hash = prev_hash
+                    # Derive the token offset from the first remote block's
+                    # actual block-table index, not num_cached_blocks: an
+                    # unhashed block skipped above can push the first remote
+                    # block past num_cached_blocks, which would otherwise
+                    # undercount the offset by whole blocks.
+                    first_remote_index = i
                 remote_hashes.append(blk.hash)
                 remote_tokens.extend(blk.token_ids)
                 prev_hash = blk.hash
             if remote_hashes:
+                # first_remote_index is always set when remote_hashes is
+                # non-empty; assert it so a future refactor can't silently
+                # regress into `None * hash_block_size`.
+                assert first_remote_index is not None
                 bm.record_remote_store(
                     block_hashes=remote_hashes,
                     token_ids=remote_tokens,
                     parent_block_hash=parent_block_hash,
+                    # Block-table index -> global token position: under DCP
+                    # each entry spans hash_block_size tokens, not block_size.
+                    token_offset=first_remote_index * bm.hash_block_size,
                 )
         return True
 
@@ -3337,8 +3498,8 @@ class Scheduler:
         """Reconcile scheduler state with completed KV transfers.
 
         * ``finished_recving``: marks requests as ready for decode scheduling.
-        * ``finished_sending``: releases deferred block allocations on the
-          producer side.
+        * ``finished_sending``: releases the producer's send ownership; blocks
+          remain deferred while the connector still has offload work.
         """
         if kv_connector_output is None:
             return
@@ -3416,19 +3577,19 @@ class Scheduler:
                 self.kv_connector.is_producer
             ), "Only producer should free blocks after sending KV"
             logger.debug("Finished sending KV transfer for request %s", req_id)
+            # Before asking, not after: the release below queries the connector.
+            self._connector_send_finished(req_id)
             seq = self._deferred_sequence(req_id)
             if seq is None:
                 # Already reclaimed by `_reconcile_stalled_deferred_saves` after
                 # a stall; a late completion report has nothing left to free.
                 continue
-            self.deferred_free_blocks.pop(seq.id, None)
-            self.block_manager.deallocate(seq)
+            self._maybe_release_deferred(seq)
 
-        if not is_producer:
-            for req_id in finished_saving:
-                seq = self._deferred_sequence(req_id)
-                if seq is not None:
-                    self._maybe_release_deferred(seq)
+        for req_id in finished_saving:
+            seq = self._deferred_sequence(req_id)
+            if seq is not None:
+                self._maybe_release_deferred(seq)
         # Early-release requests are never in `deferred_free_blocks` (they were
         # fully torn down, minus their lease, at finish time), so the loops
         # above have nothing to find for them. Drain independently of producer

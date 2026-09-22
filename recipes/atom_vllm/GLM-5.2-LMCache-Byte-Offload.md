@@ -21,6 +21,11 @@ work on GLM-5.2 — see *Why a separate connector* below. For the same connector
 MiniMax-M3, see
 [MiniMax-M3 LMCache Byte Offload](MiniMax-M3-LMCache-Byte-Offload.md).
 
+**GLM-5.3 is the same architecture and needs nothing from this recipe changed
+but the model path** — see
+[GLM-5.3 LMCache Byte Offload](GLM-5.3-LMCache-Byte-Offload.md), which carries
+its own launch line, client line and measured ON/OFF pair.
+
 ## Why a separate connector
 
 At TP=4 GLM-5.2 registers **99 KV entries in two physical layouts**:
@@ -172,6 +177,17 @@ unique cache-bust tail (~0.18 GiB), which over 600 s comes to ~84 GiB/rank. The
 full the tier logs `Failed to allocate memory block ... no memory is available`
 (27,695 times in one run) and starts resolving lookups to chunks that are gone
 by retrieve time. Size it for the run: `LMCACHE_MAX_LOCAL_CPU_SIZE=180`.
+
+180 has headroom over the ~84 GiB/rank this paragraph estimates, and that
+headroom was never tested against a smaller tier. It has since been: GLM-5.3
+has byte-identical KV geometry (the same 47,700 B/rank/token) and ran this exact
+working point — 64 prefixes, concurrency 8, 600 s — at
+**`LMCACHE_MAX_LOCAL_CPU_SIZE=90`** with **zero** `no memory is available`, so
+the tier does not have to hold the run's whole byte traffic; it evicts the
+cache-bust tails, which are never reused. See
+[GLM-5.3-LMCache-Byte-Offload.md](GLM-5.3-LMCache-Byte-Offload.md#sizing-the-tier)
+for the construction to size by. Prefer it to 180: at TP=4, 180 is 720 GiB of
+pinned anon and can exceed what one NUMA node has free.
 
 ## Measured
 
@@ -338,6 +354,8 @@ signal; marker recall is the criterion that does.
 
 ## Related
 
+- [GLM-5.3 LMCache Byte Offload](GLM-5.3-LMCache-Byte-Offload.md) — the same
+  architecture; same connector, same 78-layer fold, no code of its own
 - [MiniMax-M3 LMCache Byte Offload](MiniMax-M3-LMCache-Byte-Offload.md) — the
   same connector on M3's three-layout registration
 - [LMCache KV Cache Offload](LMCache-KV-Cache-Offload.md) — generic plugin path

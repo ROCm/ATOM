@@ -46,7 +46,7 @@ backends:
 models:
   DeepSeek-V4-Pro:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/DeepSeek-V4-Pro/"
+    model_path: "${ATOMESH_MODEL_ROOT}/deepseek-ai/DeepSeek-V4-Pro/"
     precision: FP4
     env:
       common:
@@ -179,7 +179,7 @@ models:
 
   GLM-5.2-MXFP4:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/GLM-5.2-MXFP4"
+    model_path: "${ATOMESH_MODEL_ROOT}/amd/GLM-5.2-MXFP4"
     precision: MXFP4
     env:
       common:
@@ -378,18 +378,15 @@ models:
               LMCACHE_LOCAL_CPU: "True"
               LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
               LMCACHE_CHUNK_SIZE: "256"
-              # NVMe (L3) tier under the CPU hot cache. Both variables are
-              # required together; LMCACHE_MAX_LOCAL_CPU_SIZE must stay > 0
+              # Disk/NVMe (L3) tier is disabled by default. To enable it, uncomment
+              # both variables below; LMCACHE_MAX_LOCAL_CPU_SIZE must stay > 0
               # because LocalDiskBackend stages through the host allocator.
               # scale_cpu_size_for_pp splits only the CPU budget across PP
               # stages, so this size is per rank: 4 x 500GiB on a pp4 prefill.
               # pd_server_atom.sh empties the directory around the run.
-              # The path follows the default atomesh-cicd fleet, where /mnt is
-              # local and already holds ATOMESH_MODEL_ROOT. The mi350 and crusoe
-              # fleets keep their models on /data and /shared_nfs instead, so a
-              # dispatch onto those needs this pointed at their own local disk.
-              LMCACHE_LOCAL_DISK: "/mnt/lmcache-job"
-              LMCACHE_MAX_LOCAL_DISK_SIZE: "500"
+              # Relative to this job's runtime log directory, under rank-N.
+              # LMCACHE_LOCAL_DISK: "./lmcache-job"
+              # LMCACHE_MAX_LOCAL_DISK_SIZE: "500"
               OFFLOAD_PROFILE: "1"
               OFFLOAD_MIN_LOAD_TOKENS: "0"
               PREFILL_KV_TRANSFER_CONFIG: >-
@@ -462,7 +459,7 @@ models:
 
   Kimi-K3-MXFP4:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/Kimi-K3"
+    model_path: "${ATOMESH_MODEL_ROOT}/moonshotai/Kimi-K3"
     precision: MXFP4
     env:
       common:
@@ -507,7 +504,7 @@ models:
                 max_num_seqs: 32
                 max_num_batched_tokens: 8192
                 method: dspark
-                draft_model: "${ATOMESH_MODEL_ROOT}/Kimi-K3-DSpark"
+                draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark"
                 num_speculative_tokens: 7
                 spec_decode_acceptance_length: 3.84
             prefill:
@@ -549,7 +546,7 @@ models:
               max_num_seqs: 32
               max_num_batched_tokens: 4096
               method: dspark
-              draft_model: "${ATOMESH_MODEL_ROOT}/Kimi-K3-DSpark"
+              draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark"
               num_speculative_tokens: 3
               spec_decode_acceptance_length: 3.00
           prefill:
@@ -687,7 +684,7 @@ models:
 
   Kimi-K2.5-MXFP4:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/Kimi-K2.5-MXFP4/"
+    model_path: "${ATOMESH_MODEL_ROOT}/amd/Kimi-K2.5-MXFP4/"
     precision: MXFP4
     env:
       common:
@@ -821,7 +818,7 @@ models:
 
   MiniMax-M3-MXFP4:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-MXFP4"
+    model_path: "${ATOMESH_MODEL_ROOT}/amd/MiniMax-M3-MXFP4"
     precision: MXFP4
     env:
       common:
@@ -966,7 +963,7 @@ models:
 
   MiniMax-M3-MXFP8:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-MXFP8"
+    model_path: "${ATOMESH_MODEL_ROOT}/MiniMaxAI/MiniMax-M3-MXFP8"
     precision: MXFP8
     env:
       common:

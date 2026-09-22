@@ -152,6 +152,10 @@ class Sequence:
         # every defaulting Sequence would be a mutable default in all but name.
         if sampling_params is None:
             sampling_params = SamplingParams()
+        if num_draft_tokens and sampling_params.logprobs:
+            raise ValueError(
+                "Token logprobs are not supported with speculative decoding"
+            )
         self.block_size = block_size
         self.id = id or next(Sequence.counter)
         self.external_request_id = request_id
@@ -167,10 +171,24 @@ class Sequence:
         # allocate() / free it in deallocate().
         self.has_per_req_cache = has_per_req_cache
         self.multimodal_data = multimodal_data
+        self.multimodal_cache_ready = False
+        # Immutable content identity survives payload release and preemption.
+        self.cache_seed = -1
+        if multimodal_data is not None:
+            from atom.model_engine.multimodal_runtime import multimodal_cache_seed
+
+            self.cache_seed = multimodal_data.get("cache_seed")
+            if self.cache_seed is None:
+                self.cache_seed = multimodal_cache_seed(multimodal_data)
         self.mrope_positions = mrope_positions
         self.mrope_position_delta = mrope_position_delta
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
+        # Host-known prefix, excluding deferred outputs and draft placeholders.
+        # Read by the DSpark state audit and the runtime benchmark; the width
+        # preemption strips is `num_placeholder_tokens`, which is recorded
+        # where the placeholders are appended.
+        self.num_finalized_tokens = len(token_ids)
         # Initial local prefill telemetry; kept across preemption/recomputation.
         self.prefill_gpu_chunks = 0
         self.prefill_gpu_complete = False

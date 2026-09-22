@@ -103,7 +103,6 @@ def fused_gdn_gating(
 
 
 class GatedDeltaNet(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -135,6 +134,10 @@ class GatedDeltaNet(nn.Module):
         self.num_v_heads = num_v_heads
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
+        self.allow_aiter_flydsl = kwargs.get("allow_aiter_flydsl", False)
+        # Opt-in is only eligibility. The standalone cache builder resolves the
+        # policy once with ReplaySSM, architecture and the actual state tensor.
+        self.gdn_flydsl_policy = None
 
     def rearrange_mixed_qkv(self, mixed_qkv):
         if mixed_qkv is None:
@@ -148,9 +151,8 @@ class GatedDeltaNet(nn.Module):
             ],
             dim=-1,
         )
-        query, key = map(
-            lambda x: rearrange(x, "l (h d) -> 1 l h d", d=self.head_k_dim),
-            (query, key),
+        query, key = (
+            rearrange(x, "l (h d) -> 1 l h d", d=self.head_k_dim) for x in (query, key)
         )
         value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
         return query.contiguous(), key.contiguous(), value.contiguous()
@@ -181,6 +183,7 @@ class GatedDeltaNet(nn.Module):
         # to hold are reconstructed from `replay_buf_*` on demand.
         ssm_state = layer_cache.v_cache
         use_replayssm = getattr(gdn_metadata, "replayssm", False)
+        flydsl_policy = self.gdn_flydsl_policy
 
         has_initial_state = gdn_metadata.has_initial_state
         spec_query_start_loc = gdn_metadata.spec_query_start_loc
@@ -321,7 +324,32 @@ class GatedDeltaNet(nn.Module):
                 1, num_tokens_nonspec, -1, self.head_v_dim
             )
 
-        if use_lossy_gdn_decode:
+        use_flydsl_decode = False
+        if (
+            flydsl_policy is not None
+            and flydsl_policy.decode
+            and not use_lossy_gdn_decode
+            and not use_replayssm
+            and spec_sequence_masks is None
+            and gdn_metadata.num_prefills == 0
+            and gdn_metadata.num_decodes > 0
+        ):
+            from atom.model_ops.fla_ops.gdn_flydsl import decode_supported
+
+            use_flydsl_decode = decode_supported(
+                query_non_spec,
+                key_non_spec,
+                value_non_spec,
+                a,
+                b,
+                ssm_state,
+                self.A_log,
+                self.dt_bias,
+                non_spec_state_indices_in_tensor,
+                non_spec_state_indices_tensor,
+            )
+
+        if use_lossy_gdn_decode or use_flydsl_decode:
             g_spec = None
             beta_spec = None
             g_non_spec = None
@@ -399,26 +427,58 @@ class GatedDeltaNet(nn.Module):
         # 2.2: Process the remaining part
         if gdn_metadata.num_prefills > 0:
             ckpt = gdn_metadata.ssm_checkpoints
-            initial_state = ssm_state[non_spec_state_indices_in_tensor].contiguous()
-            initial_state[~has_initial_state, ...] = 0
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = chunk_gated_delta_rule(
-                q=query_non_spec,
-                k=key_non_spec,
-                v=value_non_spec,
-                g=g_non_spec,
-                beta=beta_non_spec,
-                initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=non_spec_query_start_loc,
-                head_first=False,
-                use_qk_l2norm_in_kernel=True,
-                # Only when there is somewhere to put them; `h` is large and is
-                # dropped on return otherwise.
-                keep_intermediate_states=ckpt is not None,
-            )
+            flydsl_metadata = getattr(gdn_metadata, "flydsl_prefill_metadata", None)
+            use_flydsl_prefill = False
+            if (
+                flydsl_policy is not None
+                and flydsl_policy.prefill
+                and not use_replayssm
+            ):
+                from atom.model_ops.fla_ops.gdn_flydsl import (
+                    prefill,
+                    prefill_supported,
+                )
+
+                use_flydsl_prefill = prefill_supported(
+                    query_non_spec,
+                    key_non_spec,
+                    value_non_spec,
+                    g_non_spec,
+                    beta_non_spec,
+                    flydsl_metadata,
+                )
+            if use_flydsl_prefill:
+                core_attn_out_non_spec, last_recurrent_state, flydsl_h = prefill(
+                    query_non_spec,
+                    key_non_spec,
+                    value_non_spec,
+                    g_non_spec,
+                    beta_non_spec,
+                    ssm_state,
+                    non_spec_query_start_loc,
+                    flydsl_metadata,
+                    keep_intermediate_states=ckpt is not None,
+                    state_indices=non_spec_state_indices_in_tensor,
+                    has_initial_state=has_initial_state,
+                )
+            else:
+                initial_state = ssm_state[non_spec_state_indices_in_tensor].contiguous()
+                initial_state[~has_initial_state, ...] = 0
+                core_attn_out_non_spec, last_recurrent_state = chunk_gated_delta_rule(
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    g=g_non_spec,
+                    beta=beta_non_spec,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    cu_seqlens=non_spec_query_start_loc,
+                    head_first=False,
+                    use_qk_l2norm_in_kernel=True,
+                    # Only when there is somewhere to put them; `h` is large and is
+                    # dropped on return otherwise.
+                    keep_intermediate_states=ckpt is not None,
+                )
             # Init cache
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
                 ssm_state.dtype
@@ -450,7 +510,7 @@ class GatedDeltaNet(nn.Module):
                     write_state_checkpoints,
                 )
 
-                h = pop_last_intermediate_states()
+                h = flydsl_h if use_flydsl_prefill else pop_last_intermediate_states()
                 if h is not None:
                     # One launch for both halves. `conv_state` is
                     # [slot, conv_dim, state_len] by here (see the transpose
@@ -492,7 +552,22 @@ class GatedDeltaNet(nn.Module):
             )
             last_recurrent_state = None
         elif gdn_metadata.num_decodes > 0:
-            if use_lossy_gdn_decode:
+            if use_flydsl_decode:
+                from atom.model_ops.fla_ops.gdn_flydsl import decode
+
+                core_attn_out_non_spec, last_recurrent_state = decode(
+                    query_non_spec,
+                    key_non_spec,
+                    value_non_spec,
+                    a,
+                    b,
+                    ssm_state,
+                    self.A_log,
+                    self.dt_bias,
+                    non_spec_state_indices_in_tensor,
+                    non_spec_state_indices_tensor,
+                )
+            elif use_lossy_gdn_decode:
                 core_attn_out_non_spec, last_recurrent_state = (
                     gdn_decode_update_lossy_fast(
                         A_log=self.A_log,

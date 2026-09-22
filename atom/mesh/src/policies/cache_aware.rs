@@ -62,7 +62,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
+use rand::seq::IteratorRandom;
 use rand::Rng;
 use tracing::debug;
 
@@ -70,7 +71,30 @@ use super::{
     get_healthy_worker_indices, normalize_model_key, tree::Tree, utils::PeriodicTask,
     CacheAwareConfig, LoadBalancingPolicy, SelectWorkerInfo,
 };
-use crate::core::Worker;
+use crate::core::{Worker, WorkerType};
+
+/// Prefill and decode workers hold entirely different cache state for the same
+/// model: P owns the prompt prefix, D owns the generated suffix. Sharing one
+/// radix tree between them makes a P hit look like a D hit and routes on
+/// fiction, so each pool gets its own tree. Mirrors SGLang Model Gateway.
+fn pool_tag(worker_type: &WorkerType) -> &'static str {
+    match worker_type {
+        WorkerType::Regular => "regular",
+        WorkerType::Prefill { .. } => "prefill",
+        WorkerType::Decode => "decode",
+    }
+}
+
+fn make_tree_key(pool: &str, model: &str) -> String {
+    format!("{}::{}", pool, model)
+}
+
+fn tree_key_for_worker(worker: &dyn Worker) -> String {
+    make_tree_key(
+        pool_tag(worker.worker_type()),
+        normalize_model_key(worker.model_id()),
+    )
+}
 
 /// Cache-aware routing policy
 ///
@@ -81,6 +105,9 @@ use crate::core::Worker;
 pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
     trees: Arc<DashMap<String, Arc<Tree>>>,
+    /// Tree keys already reported as missing, so the request-path warning
+    /// fires once per key instead of once per request.
+    missing_tree_warned: Arc<DashSet<String>>,
     _eviction_task: Option<PeriodicTask>,
 }
 
@@ -120,6 +147,7 @@ impl CacheAwarePolicy {
         Self {
             config,
             trees,
+            missing_tree_warned: Arc::new(DashSet::new()),
             _eviction_task: eviction_task,
         }
     }
@@ -130,7 +158,7 @@ impl CacheAwarePolicy {
         let mut model_workers: std::collections::HashMap<String, Vec<&Arc<dyn Worker>>> =
             std::collections::HashMap::new();
         for worker in workers {
-            let tree_key = normalize_model_key(worker.model_id());
+            let tree_key = tree_key_for_worker(worker.as_ref());
             model_workers
                 .entry(tree_key.to_string())
                 .or_default()
@@ -151,7 +179,7 @@ impl CacheAwarePolicy {
 
     /// Add a single worker to the tree (incremental update)
     pub fn add_worker(&self, worker: &dyn Worker) {
-        let tree_key = normalize_model_key(worker.model_id());
+        let tree_key = tree_key_for_worker(worker);
         let tree = self
             .trees
             .entry(tree_key.to_string())
@@ -161,17 +189,24 @@ impl CacheAwarePolicy {
 
     /// Add a worker by URL and model (for backward compatibility)
     pub fn add_worker_by_url(&self, url: &str, model_id: &str) {
+        // This URL-only API has no WorkerType, so it seeds the regular pool.
+        // It must still use the namespaced key: a raw model_id would build a
+        // tree that select_worker never looks up, silently disabling affinity.
+        let tree_key = make_tree_key(
+            pool_tag(&WorkerType::Regular),
+            normalize_model_key(model_id),
+        );
         let tree = self
             .trees
-            .entry(model_id.to_string())
+            .entry(tree_key)
             .or_insert_with(|| Arc::new(Tree::new()));
         tree.insert("", url);
     }
 
     /// Remove a worker from the tree
     pub fn remove_worker(&self, worker: &dyn Worker) {
-        let tree_key = normalize_model_key(worker.model_id());
-        if let Some(tree) = self.trees.get(tree_key) {
+        let tree_key = tree_key_for_worker(worker);
+        if let Some(tree) = self.trees.get(&tree_key) {
             tree.remove_tenant(worker.url());
         }
     }
@@ -206,6 +241,12 @@ impl CacheAwarePolicy {
         max_load: usize,
         min_load: usize,
     ) -> Option<usize> {
+        // Every firing of this branch bypasses prefix affinity, so the rate is
+        // the signal for whether the thresholds fit the deployment's load scale.
+        debug!(
+            "cache_aware imbalance branch: max_load={} min_load={}",
+            max_load, min_load
+        );
         // Log load balancing trigger (only compute worker loads if debug enabled)
         if tracing::enabled!(tracing::Level::DEBUG) {
             let worker_loads: Vec<(&str, usize)> =
@@ -216,11 +257,23 @@ impl CacheAwarePolicy {
             );
         }
 
-        // Use shortest queue when imbalanced
-        let min_load_idx = healthy_indices
-            .iter()
-            .min_by_key(|&&idx| workers[idx].load())
-            .copied()?;
+        // Use shortest queue when imbalanced, breaking ties at random so a run
+        // of equally loaded ranks does not all collapse onto the lowest index.
+        // Snapshot load() first: it is a live atomic, so recomputing per
+        // comparison can leave no worker matching the min we just observed.
+        let min_load_idx = {
+            let loads: Vec<(usize, usize)> = healthy_indices
+                .iter()
+                .map(|&idx| (idx, workers[idx].load()))
+                .collect();
+            let m = loads.iter().map(|&(_, l)| l).min()?;
+            loads
+                .iter()
+                .copied()
+                .filter(|&(_, l)| l == m)
+                .map(|(idx, _)| idx)
+                .choose(&mut rand::rng())?
+        };
 
         // Even in imbalanced mode, update the tree to maintain cache state
         if let Some(text) = request_text {
@@ -261,9 +314,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             return None;
         }
 
-        // Determine the model for this set of workers (router pre-filters by model)
-        // All workers should be from the same model
-        let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
+        // The router pre-filters candidates by model and, in PD mode, by role,
+        // so the first healthy worker identifies both the model and the pool.
+        // Keying the tree by pool as well keeps prefill and decode caches
+        // separate -- see tree_key_for_worker.
+        let model_id = tree_key_for_worker(workers[healthy_indices[0]].as_ref());
 
         // Get current load statistics - compute min/max in single pass without allocation
         let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
@@ -281,7 +336,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 workers,
                 &request_text,
                 &healthy_indices,
-                model_id,
+                &model_id,
                 max_load,
                 min_load,
             );
@@ -292,7 +347,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
         // Get the tree reference without locking the entire HashMap
         // DashMap only locks the specific shard containing this key
-        let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
+        let tree = self.trees.get(&model_id).map(|entry| entry.value().clone());
 
         if let Some(tree) = tree {
             // Now we work with the tree without holding the HashMap lock
@@ -304,6 +359,19 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 result.matched_char_count as f32 / result.input_char_count as f32
             };
 
+            // The low-match branch places by load instead of affinity, so the
+            // match-rate distribution is what tells you whether cache_threshold
+            // suits the traffic. Kept at debug: this is one line per request.
+            debug!(
+                "cache_aware route: match_rate={:.3} threshold={:.3} path={}",
+                match_rate,
+                self.config.cache_threshold,
+                if match_rate > self.config.cache_threshold {
+                    "affinity"
+                } else {
+                    "relocate"
+                }
+            );
             // Select worker without String allocation
             let selected_idx = if match_rate > self.config.cache_threshold {
                 // Cache hit path: find worker by URL (compare &str directly, no allocation)
@@ -313,11 +381,22 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     .position(|w| w.url() == tenant_url)
                     .filter(|&idx| workers[idx].is_healthy())
             } else {
-                // Low cache match: use worker with minimum load
-                healthy_indices
+                // Low cache match: use the least loaded worker, breaking ties at
+                // random. Snapshot load() first -- it is a live atomic, so a
+                // concurrent update can otherwise leave no worker matching the
+                // min we just computed. Deterministic tie-breaking would pin
+                // every cold-start session onto the first index.
+                let loads: Vec<(usize, usize)> = healthy_indices
                     .iter()
-                    .min_by_key(|&&idx| workers[idx].load())
+                    .map(|&idx| (idx, workers[idx].load()))
+                    .collect();
+                let min_load = loads.iter().map(|&(_, load)| load).min()?;
+                loads
+                    .iter()
                     .copied()
+                    .filter(|&(_, load)| load == min_load)
+                    .map(|(idx, _)| idx)
+                    .choose(&mut rand::rng())
             };
 
             if let Some(idx) = selected_idx {
@@ -340,11 +419,22 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             // Fallback to first healthy worker
             healthy_indices.first().copied()
         } else {
-            // No tree for this model, log warning and use random selection
-            debug!(
-                "Warning: No tree found for model '{}', using random worker selection",
-                model_id
-            );
+            // No tree for this key: cache affinity is dead and every request is
+            // placed at random, which is indistinguishable from "cache_aware is
+            // enabled but useless". warn (not debug) so it is visible at the
+            // default log level instead of silently degrading throughput.
+            // Warn once per key: this fires on the request path, and a missing
+            // tree affects every request, so an unthrottled warn would flood
+            // the log with one line per request.
+            if self.missing_tree_warned.insert(model_id.clone()) {
+                tracing::warn!(
+                    "cache_aware: no tree for key '{}', falling back to random \
+                     placement — pool was not seeded \
+                     (init_pd_cache_aware_policies missed, or a race during \
+                     worker registration)",
+                    model_id
+                );
+            }
             // Return a random healthy worker
             let mut rng = rand::rng();
             let random_idx = rng.random_range(0..healthy_indices.len());
@@ -387,6 +477,68 @@ impl Default for CacheAwarePolicy {
 mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
+
+    #[tokio::test]
+    async fn seeded_prefill_pool_routes_a_repeated_prefix_to_one_worker() {
+        // End-to-end guard for the namespaced key: init_workers and
+        // select_worker must agree on `pool::model`. If they diverge the tree
+        // lookup misses, selection silently falls back to random placement,
+        // and affinity is lost -- which key-string comparisons alone cannot
+        // catch.
+        let workers: Vec<Arc<dyn Worker>> = (0..4)
+            .map(|i| {
+                Arc::new(
+                    BasicWorkerBuilder::new(format!("http://p{i}:8000"))
+                        .worker_type(WorkerType::Prefill {
+                            bootstrap_port: None,
+                        })
+                        .model_id("m")
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect();
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        policy.init_workers(&workers);
+
+        let text = "a shared conversation prefix that should pin one worker";
+        let info = SelectWorkerInfo {
+            request_text: Some(text),
+            ..Default::default()
+        };
+        let first = policy.select_worker(&workers, &info).await.unwrap();
+        for _ in 0..8 {
+            assert_eq!(
+                policy.select_worker(&workers, &info).await,
+                Some(first),
+                "a repeated prefix must keep landing on its cached worker"
+            );
+        }
+    }
+
+    #[test]
+    fn prefill_and_decode_get_separate_cache_pools() {
+        // The same model served by a P and a D worker must not share one radix
+        // tree: P caches the prompt prefix while D caches the generated suffix,
+        // so a shared tree would report a P hit for text only D has seen.
+        use crate::core::{BasicWorkerBuilder, WorkerType};
+        let p = BasicWorkerBuilder::new("http://p:8000")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: None,
+            })
+            .model_id("m")
+            .build();
+        let d = BasicWorkerBuilder::new("http://d:8000")
+            .worker_type(WorkerType::Decode)
+            .model_id("m")
+            .build();
+        let (kp, kd) = (tree_key_for_worker(&p), tree_key_for_worker(&d));
+        assert_ne!(kp, kd, "prefill and decode must key into different trees");
+        assert!(kp.starts_with("prefill::"), "got {kp}");
+        assert!(kd.starts_with("decode::"), "got {kd}");
+    }
 
     #[tokio::test]
     async fn test_cache_aware_with_balanced_load() {
