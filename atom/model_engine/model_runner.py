@@ -514,6 +514,17 @@ class tokenIDProcessor:
                     if n_draft > 0:
                         s = int(cu_np[i]) + 1
                         self.input_ids.np[s : s + n_draft] = spec[i, :n_draft]
+                # The deferred branch publishes these further down and the
+                # backends read them off the processor, not off the batch:
+                # `GDNAttentionMetadataBuilder.prepare_num_accepted_tokens`
+                # leaves `num_accepted_tokens` at its fill value of 1 when
+                # `num_bonus` is None. Left unset, every request looks like it
+                # accepted exactly its anchor, and the linear-attention state
+                # rolls back to the wrong position on any step that accepted
+                # more. They describe the PREVIOUS step, which is what a
+                # rollback at the head of this one wants.
+                self.num_rejected = batch.num_rejected
+                self.num_bonus = batch.num_bonus
             return self.input_ids.copy_to_gpu(total_tokens_decode)
 
         # PD consumer first decode: no prior prefill step initialized
