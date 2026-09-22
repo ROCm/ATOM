@@ -1159,6 +1159,12 @@ class CompletionStreamState:
 
 
 class AtomStandaloneService:
+    def server_info(self, _request=None) -> dict[str, Any]:
+        """Expose the shared engine discovery contract to the Rust frontend."""
+        from atom.kv_transfer.topology import server_info
+
+        return server_info(self.engine.config, self.model_name)
+
     def __init__(
         self,
         engine: Any,

@@ -2644,39 +2644,16 @@ async def get_gc_census(top: int = 30, types_per_owner: int = 2):
 
 
 def _resolve_kv_transfer_role(kv_cfg: dict) -> tuple[str | None, int]:
-    kv_role = kv_cfg.get("kv_role")
-    handshake_port = kv_cfg.get("handshake_port", 6301)
-    if kv_role is not None or kv_cfg.get("kv_connector") != "multi":
-        return kv_role, handshake_port
+    from atom.kv_transfer.topology import resolve_transfer_role
 
-    # MultiConnector wraps the real transfer connector. Surface the producer
-    # role so a P/D proxy can recognize multi[mooncake-producer + offload] as a
-    # prefill node.
-    fallback_role = None
-    fallback_port = handshake_port
-    for sub_cfg in kv_cfg.get("connectors", []):
-        sub_role = sub_cfg.get("kv_role")
-        if sub_role is None:
-            continue
-        if fallback_role is None:
-            fallback_role = sub_role
-            fallback_port = sub_cfg.get("handshake_port", handshake_port)
-        if sub_role == "kv_producer":
-            return sub_role, sub_cfg.get("handshake_port", handshake_port)
-    return fallback_role, fallback_port
+    return resolve_transfer_role(kv_cfg)
 
 
 @app.get("/kv_transfer_info")
 async def kv_transfer_info():
-    cfg = engine.config
-    kv_cfg = cfg.kv_transfer_config or {}
-    kv_role, handshake_port = _resolve_kv_transfer_role(kv_cfg)
-    return {
-        "tp_size": cfg.tensor_parallel_size,
-        "dp_size": cfg.parallel_config.data_parallel_size,
-        "kv_role": kv_role,
-        "handshake_port": handshake_port,
-    }
+    from atom.kv_transfer.topology import transfer_info
+
+    return transfer_info(engine.config)
 
 
 @app.get("/server_info")
@@ -2687,13 +2664,9 @@ async def server_info():
     per-DP-rank worker set and enable cache-aware routing to the rank that
     holds a request's prefix.
     """
-    cfg = engine.config
-    return {
-        "model_id": model_name,
-        "served_model_name": model_name,
-        "tp_size": cfg.tensor_parallel_size,
-        "dp_size": cfg.parallel_config.data_parallel_size,
-    }
+    from atom.kv_transfer.topology import server_info as build_server_info
+
+    return build_server_info(engine.config, model_name)
 
 
 @app.post("/start_profile")
