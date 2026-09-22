@@ -1155,6 +1155,8 @@ models:
         # Only plain Mooncake connectors; no LMCache CPU/NVMe offload pool.
         - &dsv4_0813_agentic_dpa_no_offload
           name: ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c128
+          router:
+            policy: cache_aware
           topology: 1p1d_dpa
           display_topology: 1P1D-DPA-TP8-DSPARK3
           pd_worker_layout: multi_node
