@@ -208,6 +208,28 @@ if os.environ.get("MEGA_WIRE") not in (None, os.environ.get("MEGA_DISPATCH_WIRE"
 _MEGA_DISPATCH_WIRE = os.environ.get("MEGA_DISPATCH_WIRE", "bf16")
 
 
+def _wire_is_quantized() -> bool:
+    """The wire carries an MX payload plus its e8m0 scale row, not bf16."""
+    return _MEGA_DISPATCH_WIRE in ("fp8", "fp4")
+
+
+def _dispatch_backend() -> str | None:
+    """Which kernel moves the payload, or None to leave it to $MEGA_DISPATCH.
+
+    Only mori and the FlyDSL TDM kernel carry the scale row, so a quantizing wire
+    has no other backend to run on. Named here rather than left to
+    $MEGA_DISPATCH, whose default is flydsl: otherwise asking for fp4 is rejected
+    at the first MoE layer for a reason the operator did not set.
+
+    This is the backend for the PREFILL-capacity transport. The decode one always
+    runs on TDM, because compaction is a TDM-only recv layout -- see
+    build_mega_transports.
+    """
+    if _wire_is_quantized():
+        return "tdm" if envs.ATOM_MEGA_DISPATCH_TDM else "mori"
+    return None
+
+
 def init_mega_transport(
     *,
     ep_rank: int,
@@ -227,14 +249,45 @@ def init_mega_transport(
     swiglu_limit: float,
     situ_beta: torch.Tensor | None = None,
     situ_linear_beta: torch.Tensor | None = None,
+    triton_experts: bool = False,
+    want_compact: bool = False,
+    backend: str | None = None,
+    vmm_token_per_rank: int | None = None,
 ) -> Any:
     """Create (and share) the MegaMoE that runs every MoE layer of this model.
 
     Everything here is per-model: the EP geometry, the cco arena, and the expert
     GEMM recipe. Only the weights differ per layer and those are forward()
     arguments, so one instance covers the whole model. Which dispatch kernel it
-    uses is aiter's own call (MEGA_DISPATCH=flydsl|mori).
+    uses is aiter's own call (MEGA_DISPATCH=flydsl|mori) unless the wire is
+    quantized, where this picks between mori and the TDM kernel.
+
+    ``triton_experts`` says our own Triton experts may run the middle of the
+    layer, which vetoes compacting the TDM dispatch's recv rows -- see the
+    dispatch_backend/compact_plan pair below.
+
+    A model builds this twice: once at the prefill token capacity with
+    token-major recv rows, and once at a small decode capacity with compact ones
+    (see ``build_mega_transports``). The two do not have to share a dispatch
+    kernel, so ``backend`` overrides the wire's default choice; the decode call
+    uses it to stay on TDM whatever prefill runs on. ``vmm_token_per_rank`` is
+    how that second call reuses the first's cco symmetric window instead of
+    opening another -- it sizes the window, while
+    ``max_num_inp_token_per_rank`` still sizes this transport's own arena
+    inside it.
     """
+    _backend = backend or _dispatch_backend()
+    # Compact recv rows are an aiter-internal layout: the TDM dispatch writes
+    # disp_out already grouped per expert and hands GEMM1 the matching masked_m
+    # and psum. triton_mega_moe drives the transport from OUR side -- it reads
+    # mega._dispatch()'s recv rows and builds its own EpScatterGeometry from
+    # recv_idx -- and knows nothing of that layout, so compaction has to be off
+    # whenever the Triton experts can run. They are published per forward (decode
+    # only under ATOM_USE_TRITON_MOE_DECODE), so the test is "can they run at
+    # all", not "are they running now": one transport cannot change its recv
+    # layout between two passes, which is why the decode-capacity transport is a
+    # separate instance rather than a mode of this one.
+    _compact = None if _backend != "tdm" else (want_compact and not triton_experts)
     key = (
         ep_rank,
         ep_size,
@@ -250,20 +303,29 @@ def init_mega_transport(
         intermediate_pad,
         swiglu_limit,
         # Keyed on: the wire sets the payload width and whether the scale
-        # region exists.
+        # region exists, and the backend/compact pair sets the recv layout.
         _MEGA_DISPATCH_WIRE,
+        _backend,
+        _compact,
     )
     cached = _MEGA_TRANSPORTS.get(key)
     if cached is not None:
         return cached
 
     MegaMoEGfx1250 = _import_mega()
+    # Sized from the PREFILL capacity even for the decode transport: _init_cco_comm
+    # is collective and caches one window, so asking for a smaller one here would
+    # open a second window on every rank instead of carving this arena out of the
+    # existing one. The budget has room -- see build_mega_transports.
     comm = _init_cco_comm(
         ep_size,
         ep_rank,
         ep_src_global_rank,
         _cco_per_rank_vmm(
-            ep_size, hidden_dim, max_num_inp_token_per_rank, data_type_itemsize
+            ep_size,
+            hidden_dim,
+            vmm_token_per_rank or max_num_inp_token_per_rank,
+            data_type_itemsize,
         ),
     )
     mega = MegaMoEGfx1250(
@@ -286,15 +348,8 @@ def init_mega_transport(
         # Passed, not left to aiter's own read of the env, so the key and the
         # transport cannot drift.
         dispatch_wire=_MEGA_DISPATCH_WIRE,
-        # Only mori's dispatch carries the scale row, so a quantizing wire has
-        # no other backend to run on. Named here rather than left to
-        # $MEGA_DISPATCH, whose default is flydsl: otherwise asking for fp4 is
-        # rejected at the first MoE layer for a reason the operator did not set.
-        **(
-            {"dispatch_backend": "mori"}
-            if _MEGA_DISPATCH_WIRE in ("fp8", "fp4")
-            else {}
-        ),
+        **({"dispatch_backend": _backend} if _backend else {}),
+        **({"compact_plan": _compact} if _compact is not None else {}),
     )
     # Peer-region stride in the flat symmetric VA. triton_mega_moe needs it to
     # address the combine staging window, and MegaMoE does not keep it.
@@ -310,7 +365,7 @@ def init_mega_transport(
     logger.info(
         "[MORI-V2] Created MegaMoE: ep_rank=%d ep_size=%d hidden=%d inter=%d "
         "experts=%d topk=%d M=%d act=%s gate=%s quant=%s pad=(%d,%d) "
-        "swiglu_limit=%s dispatch=%s wire=%s force_a8w4=%s",
+        "swiglu_limit=%s dispatch=%s wire=%s compact=%s force_a8w4=%s",
         ep_rank,
         ep_size,
         hidden_dim,
@@ -326,10 +381,127 @@ def init_mega_transport(
         swiglu_limit,
         mega._config.dispatch_backend,
         mega._config.dispatch_wire,
+        mega._config.compact_plan,
         # The other half of the pair: logged together so a mismatch is readable.
         os.environ.get("AITER_FORCE_A8W4", "0"),
     )
     return mega
+
+
+def _decode_token_capacity(prefill_capacity: int) -> int:
+    """Per-rank token capacity for the decode transport, or 0 for "do not build".
+
+    The widest decode step that can exist is the widest CAPTURED batch times the
+    speculative q length: ForwardMode only replays the rung that holds the batch,
+    and a decode batch above the ladder is rare enough that paying the prefill
+    transport for it beats sizing the arena for it. Steps that do exceed this
+    fall back to the prefill transport, so the number trades arena bytes against
+    how many decode steps keep the compact path -- it is not a correctness bound.
+    """
+    override = int(envs.ATOM_MEGA_DECODE_MTPR)
+    if override > 0:
+        capacity = min(override, prefill_capacity)
+        return capacity if capacity < prefill_capacity else 0
+    from atom.config import get_current_atom_config
+
+    config = get_current_atom_config()
+    sizes = config.capture_sizes
+    if not sizes:
+        return 0
+    capacity = max(int(s) for s in sizes) * _spec_q_len(config)
+    # Equal capacity is just the prefill transport with compaction turned on,
+    # which is the trade this exists to avoid.
+    return capacity if capacity < prefill_capacity else 0
+
+
+def _spec_q_len(config) -> int:
+    """Tokens each sequence forwards per decode step (1 without spec decode)."""
+    spec = getattr(config, "speculative_config", None)
+    if spec is None:
+        return 1
+    return int(getattr(spec, "num_speculative_tokens", 0) or 0) + 1
+
+
+def _warmup_decode_compact_plans(decode: Any, dp_size: int) -> None:
+    """Compile every captured decode bucket's compact plan while still eager.
+
+    The plan's tile alignment follows the recv bound's token bucket and aiter
+    refuses to JIT one inside a capture, so each rung of the ladder is run
+    through here first -- plus the unbounded case, which is what _recv_bound
+    returns when the bound would not shrink the arena.
+    """
+    warmup = getattr(decode, "warmup_compact_plan", None)
+    if warmup is None:
+        return
+    from atom.config import get_current_atom_config
+
+    q_len = _spec_q_len(get_current_atom_config())
+    bounds: set[int | None] = {None}
+    for bs in get_current_atom_config().capture_sizes or ():
+        bounds.add(int(bs) * q_len * dp_size)
+    for bound in bounds:
+        warmup(bound)
+
+
+def build_mega_transports(
+    *,
+    max_num_inp_token_per_rank: int,
+    triton_experts: bool = False,
+    **recipe: Any,
+) -> tuple[Any, Any | None]:
+    """The (prefill, decode) transport pair for one model.
+
+    Two instances rather than one switchable instance, because compaction is
+    fixed at construction: it changes the arena's recv layout and the dispatch
+    kernel's compile-time constants. And it cannot simply be left on, because
+    compact row capacity is derived from the transport's CAPACITY rather than
+    the step's token count -- on a prefill-capacity transport it plans ~6x the
+    rows any decode step can fill and hands the expert GEMM a contiguous_m and a
+    CSV token bucket sized for prefill.
+
+    So the phases get different-capacity transports. With
+    $ATOM_MEGA_DISPATCH_TDM=1, prefill also uses TDM compact rows for E2E
+    validation; setting it to 0 restores the mori token-major baseline. Decode
+    gets a separate small compact transport, always on TDM because compaction is
+    a TDM-only recv layout, and there the fused stage1 (no route-ksplit
+    preshuffle, no moe_route_g2l_lds) is worth the per-route copies.
+
+    The decode half is None when it would not differ from the first, when the
+    Triton experts can run (they read the recv rows themselves), or on a bf16
+    wire -- TDM only carries the scale row a quantizing wire needs.
+    """
+    prefill = init_mega_transport(
+        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+        triton_experts=triton_experts,
+        # Compact is a TDM-only layout; _dispatch_backend() selects TDM under
+        # the same switch. Keeping these together makes one env var a complete
+        # prefill A/B between TDM compact and the mori token-major baseline.
+        want_compact=envs.ATOM_MEGA_DISPATCH_TDM,
+        **recipe,
+    )
+    if triton_experts or not envs.ATOM_MEGA_DECODE_COMPACT or not _wire_is_quantized():
+        return prefill, None
+    decode_capacity = _decode_token_capacity(max_num_inp_token_per_rank)
+    if decode_capacity <= 0:
+        return prefill, None
+    decode = init_mega_transport(
+        max_num_inp_token_per_rank=decode_capacity,
+        triton_experts=triton_experts,
+        want_compact=True,
+        # Not whatever prefill chose: compaction only exists on TDM.
+        backend="tdm",
+        # Carve this arena out of the window the prefill capacity already sized,
+        # rather than opening a second one -- see init_mega_transport.
+        vmm_token_per_rank=max_num_inp_token_per_rank,
+        **recipe,
+    )
+    # Every MoE layer builds through here and all but the first hit the cache,
+    # so the (idempotent) warmup is marked on the transport rather than repeated
+    # once per layer.
+    if not getattr(decode, "_atom_compact_warmed", False):
+        _warmup_decode_compact_plans(decode, get_dp_group().world_size)
+        decode._atom_compact_warmed = True
+    return prefill, decode
 
 
 @lru_cache(maxsize=4)
@@ -408,6 +580,9 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # construction only shows up on the layer -- see bind_mega_transport().
         self._mega_geometry = mega_geometry
         self.mega: Any = None
+        # The small compact-layout transport decode steps run on, when one was
+        # built -- see build_mega_transports and select_mega().
+        self.mega_decode: Any = None
         self.is_fused = mega_geometry is not None
 
     def bind_mega_transport(self, layer: torch.nn.Module, quant_method: Any) -> None:
@@ -429,7 +604,7 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 f"got {inter_dim}; ATOM_MORI_V2_FUSED=1 requires the a8w4 "
                 "(Mxfp4MoEMethod) quant path."
             )
-        self.mega = init_mega_transport(
+        self.mega, self.mega_decode = build_mega_transports(
             **self._mega_geometry,
             inter_dim=inter_dim,
             activation=layer.activation,
@@ -444,7 +619,51 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             swiglu_limit=float(getattr(layer, "swiglu_limit", 0.0)),
             situ_beta=getattr(layer, "activation_situ_beta", None),
             situ_linear_beta=getattr(layer, "activation_situ_linear_beta", None),
+            # Read from the quant method rather than a forward's kwargs: the
+            # recv layout is fixed here, before the first forward reveals which
+            # experts that pass publishes.
+            triton_experts=bool(getattr(quant_method, "use_triton_ep", False)),
         )
+
+    def select_mega(self, num_tokens: int) -> Any:
+        """The transport this step runs on: the compact decode one when it fits.
+
+        Capture-safe: every term is a python int fixed per captured graph, so a
+        recording replays the transport it was captured on, and the choice never
+        reads device state.
+        """
+        decode = self.mega_decode
+        if decode is None:
+            return self.mega
+        context = get_forward_context().context
+        if context is None or context.is_prefill:
+            return self.mega
+        # A mixed step delivers some peer's prefill tokens into this rank's recv
+        # rows, so this rank being in decode does not bound what it receives.
+        if not getattr(context, "running_tokens_are_unified", True):
+            return self.mega
+        across_dp = context.running_tokens_across_dp
+        if across_dp is None:
+            return self.mega
+        # Per-rank against a per-rank capacity: dispatch dedups per destination
+        # rank, so each peer contributes at most its own token count.
+        capacity = decode.max_tokens_per_rank
+        if max(across_dp) > capacity:
+            return self.mega
+        # Every term above is DP-reduced, so all ranks reach the same transport.
+        # That is load-bearing, not tidiness: the compact dispatch and its plan
+        # barrier across ranks, so a rank that picked the other transport would
+        # leave the rest spinning. A rank-LOCAL row count must therefore never
+        # steer this -- a padded graph height can differ from the scheduled
+        # tokens -- which makes an overflowing local tensor a broken premise to
+        # report, not a reason to quietly switch protocol.
+        if num_tokens > capacity:
+            raise ValueError(
+                f"the decode transport's capacity={capacity} cannot hold this "
+                f"rank's {num_tokens} rows, while the DP group agreed on "
+                f"{tuple(across_dp)}"
+            )
+        return decode
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -623,7 +842,7 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         topk_ids: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        mega = self.prepare_finalize.mega
+        mega = self.prepare_finalize.select_mega(hidden_states.shape[0])
         triton_experts = (kwargs.get("moe_extra_args") or {}).get("triton_experts")
 
         # MegaMoE as transport, with OUR experts, driven from one place.

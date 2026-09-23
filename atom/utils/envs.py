@@ -167,6 +167,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # own MEGA_DISPATCH=flydsl|mori), 0 binds mori's v2 op-layer running plain
     # gather, i.e. the untouched upstream baseline.
     "ATOM_MORI_V2_FUSED": lambda: os.getenv("ATOM_MORI_V2_FUSED", "0") == "1",
+    # Run PREFILL on aiter's FlyDSL TDM dispatch with compact recv rows. Both the
+    # backend and compaction are selected together because compact layout is a
+    # TDM-only contract between dispatch and the grouped expert kernels. Disabled
+    # by default; set to 1 for E2E TDM compact, 0 for the mori token-major
+    # baseline. Only read on a quantizing wire under ATOM_MORI_V2_FUSED -- a bf16
+    # wire keeps whatever $MEGA_DISPATCH names. Decode has its own smaller compact
+    # transport and remains controlled by ATOM_MEGA_DECODE_COMPACT.
+    # Added 2026-09-20.
+    "ATOM_MEGA_DISPATCH_TDM": lambda: os.getenv("ATOM_MEGA_DISPATCH_TDM", "0") == "1",
+    # Give decode its own small-capacity TDM transport with compact recv rows,
+    # alongside the prefill-capacity one that keeps them token-major. Compaction
+    # trades payload traffic (one copy per route, where token-major dedups to one
+    # per destination rank) for a fused stage1 (no route-ksplit preshuffle, no
+    # moe_route_g2l_lds). That trade only pays when the payload is small, and its
+    # row capacity is sized from the transport's CAPACITY, not the step's tokens
+    # -- which is why it has to be a second, smaller transport rather than a flag
+    # on the prefill one. Disabled by default; set to 1 to enable, 0 to run every
+    # step on the prefill transport. Added 2026-09-20.
+    "ATOM_MEGA_DECODE_COMPACT": lambda: (
+        os.getenv("ATOM_MEGA_DECODE_COMPACT", "0") == "1"
+    ),
+    # Per-rank token capacity of that decode transport. 0 derives it from the
+    # cudagraph ladder (widest captured batch x the speculative q length), which
+    # is the largest decode step that can reach it; anything wider falls back to
+    # the prefill transport. Set it explicitly only to trade arena bytes against
+    # how many decode steps keep the compact path. Added 2026-09-20.
+    "ATOM_MEGA_DECODE_MTPR": lambda: int(os.getenv("ATOM_MEGA_DECODE_MTPR", "0")),
     # Reuse a 128-token MegaMoEV2 instance for native DP-unified small decode/
     # verify/draft forwards on the supported EP8, 48-experts-per-rank layout. Set to 0
     # to keep the configured max_num_batched_tokens capacity for every graph.
