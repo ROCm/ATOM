@@ -36,15 +36,14 @@ impl Mutation {
     pub fn request_headers(
         endpoint: &str,
         request_id: &str,
-        size: usize,
         authorization: Option<&str>,
         execution_id: Option<&str>,
     ) -> pb::ProcessingResponse {
-        let size = size.to_string();
+        // FULL_DUPLEX_STREAMED lets Envoy choose the HTTP framing. In
+        // particular, requests with trailers must not acquire Content-Length.
         let mut headers = Self::headers([
             (Self::DESTINATION, endpoint.as_bytes()),
             ("x-request-id", request_id.as_bytes()),
-            ("content-length", size.as_bytes()),
         ]);
         if let Some(value) = authorization {
             headers

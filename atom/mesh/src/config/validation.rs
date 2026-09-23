@@ -5,6 +5,7 @@ pub(crate) struct ConfigValidator;
 
 impl ConfigValidator {
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
+        #[cfg(feature = "ext-proc")]
         config.ext_proc.validate(config)?;
         Self::validate_mode(&config.mode)?;
         Self::validate_policy(&config.policy)?;

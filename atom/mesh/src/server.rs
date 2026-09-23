@@ -456,8 +456,13 @@ pub fn build_app(
     max_payload_size: usize,
     request_id_headers: Vec<String>,
 ) -> Router {
+    #[cfg(feature = "ext-proc")]
+    let ext_proc_enabled = app_state.context.router_config.ext_proc.enabled;
+    #[cfg(not(feature = "ext-proc"))]
+    let ext_proc_enabled = false;
+
     // In ext-proc mode Envoy is the only inference entrypoint.
-    let inference_routes = if app_state.context.router_config.ext_proc.enabled {
+    let inference_routes = if ext_proc_enabled {
         Router::new()
     } else {
         Router::new()
@@ -812,6 +817,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .map_err(|e| format!("Invalid address: {}", e))?;
 
     let handle = axum_server::Handle::new();
+    #[cfg(feature = "ext-proc")]
     let ext_proc = if config.router_config.ext_proc.enabled {
         Some(
             crate::ext_proc::ExtProcRuntime::start(app_context.clone())
@@ -821,12 +827,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     } else {
         None
     };
+    #[cfg(feature = "ext-proc")]
     let ext_proc_shutdown = ext_proc.as_ref().map(|runtime| runtime.shutdown_handle());
     let handle_clone = handle.clone();
     let app_state_clone = app_state.clone();
     let grace_period = Duration::from_secs(config.shutdown_grace_period_secs);
     spawn(async move {
         shutdown_signal().await;
+        #[cfg(feature = "ext-proc")]
         if let Some(shutdown) = ext_proc_shutdown {
             shutdown();
         }
@@ -835,6 +843,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     });
 
     let http = serve_http(addr, app, handle.clone(), config.tls.as_ref());
+    #[cfg(feature = "ext-proc")]
     if let Some(mut runtime) = ext_proc {
         // HTTP exposes management and health routes; inference goes through Envoy.
         // Coordinate listener failures here, independently of the ext-proc runtime.
@@ -857,6 +866,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     } else {
         http.await?;
     }
+
+    #[cfg(not(feature = "ext-proc"))]
+    http.await?;
 
     // HA handler shutdown is handled by the signal in mesh_run! macro
     // No need to manually shutdown here

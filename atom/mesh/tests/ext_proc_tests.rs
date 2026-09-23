@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use mesh::{
     app_context::AppContext,
@@ -58,7 +64,11 @@ impl Fixture {
             .await
             .unwrap()
             .into_inner();
-        Stream { sender, response }
+        Stream {
+            sender,
+            response,
+            first_message: AtomicBool::new(true),
+        }
     }
 
     async fn unloaded(&self) {
@@ -75,6 +85,7 @@ impl Fixture {
 struct Stream {
     sender: mpsc::Sender<pb::ProcessingRequest>,
     response: tonic::Streaming<pb::ProcessingResponse>,
+    first_message: AtomicBool,
 }
 
 impl Stream {
@@ -101,10 +112,23 @@ impl Stream {
         self.sender
             .send(pb::ProcessingRequest {
                 request: Some(request),
+                protocol_config: self
+                    .first_message
+                    .swap(false, Ordering::SeqCst)
+                    .then(Self::protocol),
                 ..Default::default()
             })
             .await
             .unwrap();
+    }
+
+    fn protocol() -> pb::ProtocolConfiguration {
+        use mesh::ext_proc::proto::envoy::extensions::filters::http::ext_proc::v3::processing_mode::BodySendMode;
+        pb::ProtocolConfiguration {
+            request_body_mode: BodySendMode::FullDuplexStreamed as i32,
+            response_body_mode: BodySendMode::FullDuplexStreamed as i32,
+            ..Default::default()
+        }
     }
 
     async fn recv(&mut self) -> Response {
@@ -194,9 +218,13 @@ async fn buffers_request_and_preserves_bytes_and_stream_lifetime() {
     };
     let response = headers.response.unwrap();
     assert!(response.clear_route_cache);
-    let destination = response
-        .header_mutation
-        .unwrap()
+    let mutation = response.header_mutation.unwrap();
+    assert!(mutation
+        .set_headers
+        .iter()
+        .filter_map(|v| v.header.as_ref())
+        .all(|header| header.key != "content-length"));
+    let destination = mutation
         .set_headers
         .into_iter()
         .filter_map(|v| v.header)
@@ -638,12 +666,341 @@ async fn protocol_modes_encoding_and_api_paths_are_explicitly_rejected() {
         })
         .await
         .unwrap();
-    stream.error(400).await;
+    stream.error(500).await;
     fixture.worker.set_healthy(false);
     let mut stream = fixture.open().await;
     stream.headers_only().await;
     stream.body(Stream::BODY, true).await;
     stream.error(503).await;
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn first_message_requires_compatible_protocol_before_waiting_for_body() {
+    let fixture = Fixture::new(RouterConfig::default()).await;
+    let valid = Stream::protocol();
+    for (config, code, detail) in [
+        (None, "protocol_config_missing", "first ProcessingRequest"),
+        (
+            Some(pb::ProtocolConfiguration {
+                request_body_mode: 0,
+                ..valid
+            }),
+            "unsupported_processing_mode",
+            "request_body_mode=NONE",
+        ),
+        (
+            Some(pb::ProtocolConfiguration {
+                request_body_mode: 2,
+                ..valid
+            }),
+            "unsupported_processing_mode",
+            "request_body_mode=BUFFERED",
+        ),
+        (
+            Some(pb::ProtocolConfiguration {
+                response_body_mode: 1,
+                ..valid
+            }),
+            "unsupported_processing_mode",
+            "response_body_mode=STREAMED",
+        ),
+        (
+            Some(pb::ProtocolConfiguration {
+                response_body_mode: 999,
+                ..valid
+            }),
+            "unsupported_processing_mode",
+            "response_body_mode=UNKNOWN(999)",
+        ),
+    ] {
+        let mut stream = fixture.open().await;
+        stream
+            .sender
+            .send(pb::ProcessingRequest {
+                request: Some(Request::RequestHeaders(Stream::headers(&[], false))),
+                protocol_config: config,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let Response::ImmediateResponse(error) =
+            tokio::time::timeout(Duration::from_secs(1), stream.recv())
+                .await
+                .unwrap()
+        else {
+            panic!("expected immediate configuration error");
+        };
+        assert_eq!(error.status.unwrap().code, 500);
+        assert_eq!(error.details, format!("mesh_ext_proc_{code}"));
+        assert!(String::from_utf8(error.body).unwrap().contains(detail));
+        assert_eq!(fixture.worker.load(), 0);
+    }
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn protocol_is_remembered_and_cannot_change_midstream() {
+    let fixture = Fixture::new(RouterConfig::default()).await;
+    for changed in [false, true] {
+        let mut stream = fixture.open().await;
+        stream.headers_only().await;
+        let mut protocol = Stream::protocol();
+        protocol.send_body_without_waiting_for_header_response = changed;
+        stream
+            .sender
+            .send(pb::ProcessingRequest {
+                request: Some(Request::RequestBody(pb::HttpBody {
+                    body: Stream::BODY.to_vec(),
+                    end_of_stream: true,
+                    ..Default::default()
+                })),
+                protocol_config: Some(protocol),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        if changed {
+            let Response::ImmediateResponse(error) = stream.recv().await else {
+                panic!()
+            };
+            assert_eq!(error.status.unwrap().code, 500);
+            assert_eq!(error.details, "mesh_ext_proc_protocol_config_changed");
+        } else {
+            assert!(matches!(stream.recv().await, Response::RequestHeaders(_)));
+            assert!(matches!(stream.recv().await, Response::RequestBody(_)));
+            // No protocol_config on subsequent response messages.
+            stream.response_headers(true).await;
+        }
+        fixture.unloaded().await;
+    }
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn observability_mode_closes_the_rpc_with_a_diagnostic() {
+    let fixture = Fixture::new(RouterConfig::default()).await;
+    let mut stream = fixture.open().await;
+    stream
+        .sender
+        .send(pb::ProcessingRequest {
+            request: Some(Request::RequestHeaders(Stream::headers(&[], false))),
+            protocol_config: Some(Stream::protocol()),
+            observability_mode: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(1), stream.response.message())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(error.message().contains("observability_mode must be false"));
+    assert_eq!(fixture.worker.load(), 0);
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn empty_messages_and_trailers_without_headers_are_protocol_errors() {
+    let fixture = Fixture::new(RouterConfig::default()).await;
+    for request in [
+        None,
+        Some(Request::RequestTrailers(pb::HttpTrailers::default())),
+        Some(Request::ResponseTrailers(pb::HttpTrailers::default())),
+    ] {
+        let mut stream = fixture.open().await;
+        stream
+            .sender
+            .send(pb::ProcessingRequest {
+                request,
+                protocol_config: Some(Stream::protocol()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let Response::ImmediateResponse(error) = stream.recv().await else {
+            panic!()
+        };
+        assert_eq!(error.status.unwrap().code, 400);
+        assert_eq!(error.details, "mesh_ext_proc_invalid_processing_sequence");
+        assert_eq!(fixture.worker.load(), 0);
+    }
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn headers_then_trailers_distinguish_empty_requests_from_empty_responses() {
+    let fixture = Fixture::new(RouterConfig::default()).await;
+    let mut stream = fixture.open().await;
+    stream.headers_only().await;
+    stream
+        .send(Request::RequestTrailers(pb::HttpTrailers::default()))
+        .await;
+    let Response::ImmediateResponse(error) = stream.recv().await else {
+        panic!()
+    };
+    assert_eq!(error.status.unwrap().code, 400);
+    assert_eq!(error.details, "mesh_ext_proc_invalid_request");
+    assert_eq!(fixture.worker.load(), 0);
+    let mut stream = fixture.open().await;
+    stream.routed().await;
+    stream.response_headers(false).await;
+    stream
+        .send(Request::ResponseTrailers(pb::HttpTrailers::default()))
+        .await;
+    assert!(matches!(stream.recv().await, Response::ResponseTrailers(_)));
+    fixture.unloaded().await;
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn early_local_replies_preserve_response_and_discard_inflight_request_data() {
+    let fixture = Fixture::new(RouterConfig::default()).await;
+    for (status, header_only, request_started) in [
+        ("413", false, true),
+        ("504", true, true),
+        ("403", false, false),
+    ] {
+        let mut stream = fixture.open().await;
+        if request_started {
+            stream.headers_only().await;
+            stream.body(&Stream::BODY[..17], false).await;
+        }
+        stream
+            .send(Request::ResponseHeaders(Stream::headers(
+                &[
+                    (":status", status),
+                    ("content-type", "text/plain"),
+                    ("x-local-reply", "original"),
+                ],
+                header_only,
+            )))
+            .await;
+        let Response::ResponseHeaders(headers) = stream.recv().await else {
+            panic!("local reply replaced")
+        };
+        assert!(headers.response.unwrap().header_mutation.is_none());
+        assert_eq!(fixture.worker.load(), 0);
+        if !header_only {
+            if request_started {
+                stream.body(&Stream::BODY[17..], false).await;
+                stream
+                    .send(Request::RequestTrailers(pb::HttpTrailers::default()))
+                    .await;
+            }
+            stream.response_body(b"original Envoy error", false).await;
+            stream
+                .send(Request::ResponseTrailers(pb::HttpTrailers::default()))
+                .await;
+            assert!(matches!(stream.recv().await, Response::ResponseTrailers(_)));
+        }
+        assert!(stream.response.message().await.unwrap().is_none());
+    }
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn early_reply_cancels_pending_admission_without_a_late_dispatch() {
+    let fixture = Fixture::new(RouterConfig {
+        max_concurrent_requests: 1,
+        queue_size: 1,
+        ..Default::default()
+    })
+    .await;
+    let mut first = fixture.open().await;
+    first.routed().await;
+    let mut second = fixture.open().await;
+    second.headers_only().await;
+    second.body(Stream::BODY, true).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), second.response.message())
+            .await
+            .is_err()
+    );
+    second
+        .send(Request::ResponseHeaders(Stream::headers(
+            &[(":status", "504")],
+            false,
+        )))
+        .await;
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), second.recv())
+            .await
+            .unwrap(),
+        Response::ResponseHeaders(_)
+    ));
+    // Free capacity while the early response is still streaming. Only the third
+    // request may use it; the canceled second request must never dispatch.
+    first.response_headers(true).await;
+    fixture.unloaded().await;
+    let mut third = fixture.open().await;
+    third.routed().await;
+    third.response_headers(true).await;
+    second
+        .response_body(b"original gateway timeout", true)
+        .await;
+    assert!(second.response.message().await.unwrap().is_none());
+    fixture.unloaded().await;
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn pending_decision_keeps_its_deadline_while_listening_for_envoy() {
+    let fixture = Fixture::new(RouterConfig {
+        max_concurrent_requests: 1,
+        ext_proc: ExtProcConfig {
+            decision_timeout_secs: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await;
+    let mut first = fixture.open().await;
+    first.routed().await;
+    let mut second = fixture.open().await;
+    second.headers_only().await;
+    second.body(Stream::BODY, true).await;
+    let Response::ImmediateResponse(error) = second.recv().await else {
+        panic!()
+    };
+    assert_eq!(error.status.unwrap().code, 504);
+    assert_eq!(error.details, "mesh_ext_proc_decision_timeout");
+    first.response_headers(true).await;
+    fixture.unloaded().await;
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn errors_after_response_headers_do_not_generate_an_immediate_response() {
+    let fixture = Fixture::new(RouterConfig::default()).await;
+    for missing_status in [true, false] {
+        let mut stream = fixture.open().await;
+        stream.headers_only().await;
+        if missing_status {
+            stream
+                .send(Request::ResponseHeaders(Stream::headers(&[], false)))
+                .await;
+        } else {
+            stream.response_headers(false).await;
+            stream
+                .sender
+                .send(pb::ProcessingRequest::default())
+                .await
+                .unwrap();
+        }
+        let error = tokio::time::timeout(Duration::from_secs(1), stream.response.message())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(error.message().contains(if missing_status {
+            "missing :status"
+        } else {
+            "request is missing"
+        }));
+        assert_eq!(fixture.worker.load(), 0);
+    }
     fixture.runtime.shutdown().await.unwrap();
 }
 

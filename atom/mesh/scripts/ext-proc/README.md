@@ -23,14 +23,62 @@ The script reuses
 adjusting the ports and inference timeouts while preserving the `FULL_DUPLEX_STREAMED` and
 `ORIGINAL_DST` configuration.
 
+## Envoy Protocol Contract
+
+The compatibility baseline is `envoyproxy/envoy:v1.37.0`. Mesh requires both
+`request_body_mode` and `response_body_mode` to be `FULL_DUPLEX_STREAMED`, both
+header modes and both trailer modes to be `SEND`, `observability_mode: false`,
+and `failure_mode_allow: false`. Keep these settings when customizing the fixture,
+including any per-route overrides. HTTP/1 trailer forwarding also requires
+`http_protocol_options: {enable_trailers: true}` on the listener's HTTP connection
+manager and on the upstream cluster, as shown in the fixture.
+HTTP/1 clients that need response trailers must also send `TE: trailers`.
+
+Mesh validates `protocol_config` on the first `ProcessingRequest` of each gRPC
+stream. Later messages normally omit it; any repeated configuration must agree
+with the first. Missing configuration returns HTTP 500 with
+`protocol_config_missing`; incompatible body modes return HTTP 500 with
+`unsupported_processing_mode` and the actual modes. These errors happen before
+waiting for the body. Observability mode closes the RPC with `FAILED_PRECONDITION`,
+since Envoy ignores processing responses in that mode. Mesh logs protocol errors
+and counts them under `mesh_ext_proc_errors_total{reason="..."}`.
+
+Mesh cannot inspect an external Envoy's configuration at startup, and the wire
+configuration does not report header/trailer modes or `failure_mode_allow`.
+The startup script validates the rendered file with the selected Envoy image's
+`--mode validate` before starting services. Its final HTTP 405 readiness check
+also exercises the first-message handshake. Envoy validation alone does not prove
+the Mesh contract: after changing filter order, routes, modes or Envoy versions,
+check the settings above and send the non-streaming completion below to verify
+placement and execution end to end.
+
+In full-duplex mode Mesh preserves body bytes and leaves Content-Length/chunked
+framing to Envoy. Changing chunk boundaries does not change the PD execution
+lease's body hash. A filter that actually changes the body between ext-proc and
+the executor invalidates that lease. Envoy local replies arriving before routing
+finishes cancel the pending decision and retain their status, headers and body.
+Do not rely on ext-proc's `message_timeout` to bound full-duplex processing;
+use Mesh's body/decision/idle deadlines and Envoy's HCM idle and route timeouts.
+Trailers finish a message without requiring a preceding final body chunk; an
+empty inference request still returns `400 invalid_request`.
+
+Run the protocol and real-Envoy regression suites locally from the repository
+root (Rust, `protoc`, a compatible Python development installation, and Docker
+are required; the Envoy tests use CPU mock workers):
+
+```bash
+cargo test --manifest-path atom/mesh/Cargo.toml --features ext-proc --test ext_proc_tests
+cargo test --manifest-path atom/mesh/Cargo.toml --features ext-proc --test ext_proc_envoy -- --ignored
+```
+
 ## Prerequisites
 
 - Install Docker, Python 3 and curl on the host, and make two AMD GPUs available.
 - Prepare a complete local Qwen3-0.6B model directory containing `config.json`,
   weights and tokenizer files. All files and symlink targets must be accessible
   inside the container after mounting.
-- `ATOM_IMAGE` must contain `/usr/local/bin/atomesh` with the current ext-proc
-  implementation and an ATOM Engine supporting `--data-parallel-size`,
+- `ATOM_IMAGE` must contain `/usr/local/bin/atomesh` compiled with the `ext-proc`
+  Cargo feature (`cargo build --release --features ext-proc`) and an ATOM Engine supporting `--data-parallel-size`,
   `--served-model-name` and `/server_info`. Before loading the model, the script
   checks that `atomesh launch --help` includes `--ext-proc`.
 
@@ -220,6 +268,13 @@ Changing these variables only requires rerunning the script; the image does not
 need to be rebuilt.
 
 ## Optional: Build an Image
+
+Ext-proc is excluded from default Atomesh builds. When building with the main
+`docker/Dockerfile` or `docker/atom_release.dockerfile`, add
+`--build-arg ATOM_MESH_FEATURES=ext-proc` to the Docker build command. For a
+package install inside an existing build image, use
+`ATOM_MESH_BUILD=1 ATOM_MESH_FEATURES=ext-proc python -m pip install -e .`.
+The build environment must provide `protoc`.
 
 Skip this section when you already have a compatible image. If you need to
 package the current Atomesh code, build a derived image once and reuse it on

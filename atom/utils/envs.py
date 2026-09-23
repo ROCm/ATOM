@@ -605,6 +605,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --- Atomesh ---
     # Build atomesh when installing ATOM from source.
     "ATOM_MESH_BUILD": lambda: os.getenv("ATOM_MESH_BUILD", "0") == "1",
+    # Optional Cargo features for the Atomesh package build (e.g. "ext-proc").
+    "ATOM_MESH_FEATURES": lambda: os.getenv("ATOM_MESH_FEATURES", "").strip(),
     # Route the OpenAI-compatible server entrypoint through Atomesh.
     "USE_ATOMESH_ENTRYPOINTS": lambda: (
         os.getenv("USE_ATOMESH_ENTRYPOINTS", "0") == "1"

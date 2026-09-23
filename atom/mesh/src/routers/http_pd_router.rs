@@ -8,7 +8,10 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
+    http::{
+        header::{AUTHORIZATION, CONTENT_TYPE},
+        HeaderMap, HeaderValue, StatusCode,
+    },
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
@@ -224,6 +227,7 @@ impl PDRouter {
     }
 
     /// Execute the caller's finalized placement and let its lease own load accounting.
+    #[cfg(feature = "ext-proc")]
     pub(crate) fn with_external_placement(&self, planner: Arc<dyn PdPlanner>) -> Self {
         Self {
             planner,
@@ -234,6 +238,7 @@ impl PDRouter {
 
     /// Execute a validated raw JSON request without dropping backend extension fields.
     /// Placement and request-text/token policy inputs have already been resolved.
+    #[cfg(feature = "ext-proc")]
     pub(crate) async fn execute_external(
         &self,
         headers: &HeaderMap,
@@ -284,6 +289,7 @@ impl PDRouter {
     }
 
     /// Finalize backend-specific rank mapping before the caller reserves worker load.
+    #[cfg(feature = "ext-proc")]
     pub(crate) fn finalize_external_placement(&self, plan: PlacementPlan) -> PlacementPlan {
         match plan {
             PlacementPlan::Pair {
@@ -1885,8 +1891,13 @@ impl PDRouter {
         if connection_close {
             request = request.header("Connection", "close");
         }
+        let api_key = worker.api_key();
         if let Some(headers) = headers {
             for (name, value) in headers.iter() {
+                // bearer_auth appends, so omit client credentials when the worker has its own.
+                if name == AUTHORIZATION && api_key.is_some() {
+                    continue;
+                }
                 if header_utils::should_forward_request_header(name.as_str()) {
                     if let Ok(val) = value.to_str() {
                         request = request.header(name, val);
@@ -1894,7 +1905,7 @@ impl PDRouter {
                 }
             }
         }
-        if let Some(key) = worker.api_key() {
+        if let Some(key) = api_key {
             request = request.bearer_auth(key);
         }
         Ok(request)
@@ -2254,6 +2265,106 @@ mod tests {
         .build();
         worker.set_healthy(healthy);
         Arc::new(worker)
+    }
+
+    #[tokio::test]
+    async fn test_worker_post_authorization_precedence() {
+        let router = create_test_pd_router();
+        let cases: &[(Option<&str>, &[&str], Option<&str>)] = &[
+            (
+                Some("prefill-key"),
+                &["Bearer client-token"],
+                Some("Bearer prefill-key"),
+            ),
+            (
+                Some("decode-key"),
+                &["Bearer client-token", "Bearer duplicate-token"],
+                Some("Bearer decode-key"),
+            ),
+            (Some("worker-key"), &[], Some("Bearer worker-key")),
+            (None, &["Bearer client-token"], Some("Bearer client-token")),
+            (None, &["Basic dXNlcjpwYXNz"], Some("Basic dXNlcjpwYXNz")),
+            (None, &[], None),
+        ];
+
+        for &(api_key, incoming_auth, expected_auth) in cases {
+            let mut worker = BasicWorkerBuilder::new("http://worker:8080");
+            if let Some(key) = api_key {
+                worker = worker.api_key(key);
+            }
+            let worker = worker.build();
+            let mut headers = HeaderMap::new();
+            for value in incoming_auth {
+                headers.append("Authorization", HeaderValue::from_str(value).unwrap());
+            }
+            headers.insert("x-request-id", HeaderValue::from_static("request-123"));
+            headers.insert("x-session-id", HeaderValue::from_static("session-123"));
+            headers.insert("content-type", HeaderValue::from_static("text/plain"));
+
+            let request = router
+                .build_worker_post_with_headers(
+                    &router.client,
+                    &worker,
+                    "/v1/completions",
+                    json!({"prompt": "hello"}),
+                    Some(&headers),
+                    false,
+                )
+                .await
+                .unwrap()
+                .build()
+                .unwrap();
+            let authorization: Vec<_> = request
+                .headers()
+                .get_all("authorization")
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect();
+            assert_eq!(authorization, expected_auth.into_iter().collect::<Vec<_>>());
+            if api_key.is_some() {
+                assert!(request.headers()["authorization"].is_sensitive());
+            }
+            assert_eq!(request.headers()["x-request-id"], "request-123");
+            assert_eq!(request.headers()["x-session-id"], "session-123");
+            assert_eq!(request.headers()["content-type"], "application/json");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_worker_post_authorization_without_incoming_headers() {
+        let router = create_test_pd_router();
+        for api_key in [None, Some("worker-key")] {
+            let mut worker = BasicWorkerBuilder::new("http://worker:8080");
+            if let Some(key) = api_key {
+                worker = worker.api_key(key);
+            }
+            let request = router
+                .build_worker_post_with_headers(
+                    &router.client,
+                    &worker.build(),
+                    "/v1/completions",
+                    json!({"prompt": "hello"}),
+                    None,
+                    false,
+                )
+                .await
+                .unwrap()
+                .build()
+                .unwrap();
+            let authorization: Vec<_> = request
+                .headers()
+                .get_all("authorization")
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect();
+            assert_eq!(
+                authorization,
+                api_key
+                    .map(|_| "Bearer worker-key")
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

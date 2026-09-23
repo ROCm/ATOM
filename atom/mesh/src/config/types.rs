@@ -53,6 +53,7 @@ impl std::str::FromStr for AtomPdRankMappingPolicy {
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
+    #[cfg(feature = "ext-proc")]
     #[serde(default)]
     pub ext_proc: crate::ext_proc::ExtProcConfig,
     pub mode: RoutingMode,
@@ -373,6 +374,7 @@ impl Default for MetricsConfig {
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "ext-proc")]
             ext_proc: Default::default(),
             mode: RoutingMode::Regular {
                 worker_urls: vec![],

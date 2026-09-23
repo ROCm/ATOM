@@ -2,6 +2,7 @@ pub mod app_context;
 pub mod cliargs;
 pub mod config;
 pub mod core;
+#[cfg(feature = "ext-proc")]
 pub mod ext_proc;
 pub mod middleware;
 pub mod observability;

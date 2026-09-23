@@ -12,6 +12,7 @@ pub struct RouterConfigBuilder {
 }
 
 impl RouterConfigBuilder {
+    #[cfg(feature = "ext-proc")]
     pub fn ext_proc(mut self, config: crate::ext_proc::ExtProcConfig) -> Self {
         self.config.ext_proc = config;
         self

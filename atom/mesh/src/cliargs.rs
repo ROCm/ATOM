@@ -199,6 +199,7 @@ pub enum Commands {
 
 #[derive(Parser, Debug, Clone)]
 pub struct CliArgs {
+    #[cfg(feature = "ext-proc")]
     #[command(flatten)]
     pub ext_proc: crate::ext_proc::ExtProcConfig,
     // ==================== Worker Configuration ====================
@@ -601,8 +602,11 @@ impl CliArgs {
         }
         let connection_mode = Self::determine_connection_mode(&all_urls);
 
-        RouterConfig::builder()
-            .ext_proc(self.ext_proc.clone())
+        let builder = RouterConfig::builder();
+        #[cfg(feature = "ext-proc")]
+        let builder = builder.ext_proc(self.ext_proc.clone());
+
+        builder
             .mode(mode)
             .backend(self.backend.into())
             .atom_pd_rank_mapping_policy(atom_pd_rank_mapping_policy)
@@ -775,6 +779,7 @@ mod tests {
 impl Default for CliArgs {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "ext-proc")]
             ext_proc: Default::default(),
             host: "0.0.0.0".to_string(),
             port: 30000,

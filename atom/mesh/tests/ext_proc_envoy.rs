@@ -25,7 +25,13 @@ use mesh::{
     ext_proc::ExtProcRuntime,
 };
 use serde_json::{json, Value};
-use tokio::net::TcpListener;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
+
+const ENVOY_IMAGE: &str = "envoyproxy/envoy:v1.37.0";
+const ENVOY_CONFIG: &str = include_str!("fixtures/ext-proc/envoy.yaml");
 
 struct Envoy {
     name: String,
@@ -36,6 +42,10 @@ struct Envoy {
 
 impl Envoy {
     async fn start(epp_port: u16) -> Self {
+        Self::with_config(epp_port, ENVOY_CONFIG).await
+    }
+
+    async fn with_config(epp_port: u16, template: &str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -43,11 +53,30 @@ impl Envoy {
         let path = config.path().join("envoy.yaml");
         std::fs::write(
             &path,
-            include_str!("fixtures/ext-proc/envoy.yaml")
-                .replace("port_value: 8080", &format!("port_value: {port}"))
-                .replace("port_value: 9002", &format!("port_value: {epp_port}")),
+            template
+                .replace("port_value: 8080", "port_value: CLIENT_PORT")
+                .replace("port_value: 9002", "port_value: PROCESSOR_PORT")
+                .replace("CLIENT_PORT", &port.to_string())
+                .replace("PROCESSOR_PORT", &epp_port.to_string()),
         )
         .unwrap();
+        let validation = Command::new("docker")
+            .args(["run", "--rm", "--network", "host", "--user", "0", "-v"])
+            .arg(format!("{}:/etc/envoy/envoy.yaml:ro", path.display()))
+            .args([
+                ENVOY_IMAGE,
+                "-c",
+                "/etc/envoy/envoy.yaml",
+                "--mode",
+                "validate",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            validation.status.success(),
+            "Envoy config rejected: {}",
+            String::from_utf8_lossy(&validation.stderr)
+        );
         let name = format!("atomesh-extproc-{}", uuid::Uuid::new_v4());
         let child = Command::new("docker")
             .args([
@@ -63,7 +92,7 @@ impl Envoy {
             ])
             .arg(format!("{}:/etc/envoy/envoy.yaml:ro", path.display()))
             .args([
-                "envoyproxy/envoy:v1.37.0",
+                ENVOY_IMAGE,
                 "-c",
                 "/etc/envoy/envoy.yaml",
                 "--disable-hot-restart",
@@ -88,10 +117,7 @@ impl Envoy {
                     envoy.child.try_wait().unwrap().is_none(),
                     "Envoy exited during startup"
                 );
-                if tokio::net::TcpStream::connect(("127.0.0.1", port))
-                    .await
-                    .is_ok()
-                {
+                if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -100,6 +126,35 @@ impl Envoy {
         .await
         .unwrap();
         envoy
+    }
+
+    async fn raw(&self, request: &[u8]) -> String {
+        let mut stream = TcpStream::connect(self.url.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        stream.write_all(request).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        String::from_utf8(response).unwrap()
+    }
+
+    async fn chunked(&self, path: &str, body: &[u8], trailers: bool) -> String {
+        let mut request = format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nTE: trailers\r\nConnection: close\r\n{}\r\n",
+            if trailers { "Trailer: x-request-checksum\r\n" } else { "" }).into_bytes();
+        for chunk in body.chunks(7) {
+            request.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            request.extend_from_slice(chunk);
+            request.extend_from_slice(b"\r\n");
+        }
+        request.extend_from_slice(if trailers {
+            b"0\r\nx-request-checksum: original\r\n\r\n"
+        } else {
+            b"0\r\n\r\n"
+        });
+        self.raw(&request).await
     }
 }
 
@@ -235,6 +290,198 @@ async fn real_envoy_routes_once_preserves_body_and_cleans_up_sse_cancel() {
     assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
     drop(envoy);
     runtime.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker and envoyproxy/envoy:v1.37.0"]
+async fn real_envoy_preserves_chunked_body_and_bidirectional_trailers() {
+    use http_body::Frame;
+    use http_body_util::{BodyExt, StreamBody};
+
+    type Captured = Arc<std::sync::Mutex<Vec<(HeaderMap, Vec<u8>, HeaderMap)>>>;
+    async fn handle(State(captured): State<Captured>, request: axum::extract::Request) -> Response {
+        let (headers, body) = request.into_parts();
+        let body = body.collect().await.unwrap();
+        let trailers = body.trailers().cloned().unwrap_or_default();
+        let bytes = body.to_bytes();
+        let empty_response =
+            serde_json::from_slice::<Value>(&bytes).unwrap()["empty_response"] == true;
+        captured
+            .lock()
+            .unwrap()
+            .push((headers.headers, bytes.to_vec(), trailers));
+        let mut frames = Vec::new();
+        if !empty_response {
+            frames.push(Ok::<_, std::convert::Infallible>(Frame::data(
+                bytes::Bytes::from_static(b"original response"),
+            )));
+        }
+        frames.push(Ok(Frame::trailers(HeaderMap::from_iter([(
+            http::HeaderName::from_static("x-response-checksum"),
+            http::HeaderValue::from_static("original"),
+        )]))));
+        (
+            [
+                ("content-type", "text/plain"),
+                ("trailer", "x-response-checksum"),
+            ],
+            Body::new(StreamBody::new(futures_util::stream::iter(frames))),
+        )
+            .into_response()
+    }
+    let captured: Captured = Default::default();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let worker_address = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route("/v1/chat/completions", post(handle))
+        .with_state(captured.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let mut config = RouterConfig::default();
+    config.ext_proc.enabled = true;
+    config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
+    let app = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(format!("http://{worker_address}"))
+            .model_id("test-model")
+            .build(),
+    );
+    app.worker_registry.register(worker.clone());
+    let runtime = ExtProcRuntime::start(app).await.unwrap();
+    let envoy = Envoy::start(runtime.address.port()).await;
+    for (index, (trailers, empty_response)) in [(false, false), (true, false), (true, true)]
+        .into_iter()
+        .enumerate()
+    {
+        // Larger than one outgoing mesh body chunk, with unchanged JSON bytes.
+        let body = serde_json::to_vec(&json!({"model":"test-model", "messages":[{"role":"user","content":"hello".repeat(13000)}], "empty_response":empty_response})).unwrap();
+        let response = envoy.chunked("/v1/chat/completions", &body, trailers).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(
+            response.contains("x-response-checksum: original"),
+            "{response}"
+        );
+        assert_eq!(response.contains("original response"), !empty_response);
+        let calls = captured.lock().unwrap();
+        let (headers, received, received_trailers) = &calls[index];
+        assert!(!headers.contains_key("content-length"));
+        assert_eq!(headers["transfer-encoding"], "chunked");
+        assert_eq!(received, &body);
+        assert_eq!(
+            received_trailers
+                .get("x-request-checksum")
+                .map(|v| v.to_str().unwrap()),
+            trailers.then_some("original")
+        );
+    }
+    drop(envoy);
+    runtime.shutdown().await.unwrap();
+    assert_eq!(worker.load(), 0);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker and envoyproxy/envoy:v1.37.0"]
+async fn real_envoy_rejects_incompatible_modes_without_waiting_for_body() {
+    let mut config = RouterConfig::default();
+    config.ext_proc.enabled = true;
+    config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
+    let app = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+    let runtime = ExtProcRuntime::start(app).await.unwrap();
+    for (field, mode) in [
+        ("request_body_mode", "BUFFERED"),
+        ("response_body_mode", "STREAMED"),
+    ] {
+        let template = ENVOY_CONFIG.replace(
+            &format!("{field}: FULL_DUPLEX_STREAMED"),
+            &format!("{field}: {mode}"),
+        );
+        let envoy = Envoy::with_config(runtime.address.port(), &template).await;
+        // Deliberately withhold the body. Configuration rejection must not wait
+        // for the upload or the normal 30-second mesh body timeout.
+        let response = envoy.raw(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n").await;
+        assert!(response.starts_with("HTTP/1.1 500"), "{response}");
+        assert!(
+            response.contains("unsupported_processing_mode"),
+            "{response}"
+        );
+        assert!(response.contains(&format!("{field}={mode}")), "{response}");
+    }
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker and envoyproxy/envoy:v1.37.0"]
+async fn real_envoy_local_errors_keep_the_original_status_and_body() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let backend_calls = calls.clone();
+    let backend = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let calls = backend_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                "late upstream response"
+            }
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, backend).await.unwrap();
+    });
+    let mut config = RouterConfig::default();
+    config.ext_proc.enabled = true;
+    config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
+    let app = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(format!("http://{address}"))
+            .model_id("test-model")
+            .build(),
+    );
+    app.worker_registry.register(worker.clone());
+    let runtime = ExtProcRuntime::start(app).await.unwrap();
+    let base = ENVOY_CONFIG.replace("stat_prefix: inference", "stat_prefix: inference\n                local_reply_config:\n                  body_format: {text_format: 'envoy-local:%RESPONSE_CODE%:%RESPONSE_CODE_DETAILS%'}");
+    let buffer = "                  - name: envoy.filters.http.buffer\n                    typed_config:\n                      \"@type\": type.googleapis.com/envoy.extensions.filters.http.buffer.v3.Buffer\n                      max_request_bytes: 1\n";
+    let template = base.replace(
+        "                http_filters:\n",
+        &format!("                http_filters:\n{buffer}"),
+    );
+    let envoy = Envoy::with_config(runtime.address.port(), &template).await;
+    let response = envoy.raw(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await;
+    assert!(response.starts_with("HTTP/1.1 413"), "{response}");
+    assert!(response.contains("envoy-local:413:"), "{response}");
+    assert!(!response.contains("invalid_processing_sequence"));
+    drop(envoy);
+    // FULL_DUPLEX_STREAMED does not use ext_proc's per-message timeout.
+    // Trigger an HCM idle timeout while Mesh is still collecting the upload.
+    let template = base.replace("stream_idle_timeout: 300s", "stream_idle_timeout: 0.2s");
+    let envoy = Envoy::with_config(runtime.address.port(), &template).await;
+    let response = envoy.raw(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{").await;
+    assert!(response.starts_with("HTTP/1.1 408"), "{response}");
+    assert!(response.contains("envoy-local:408:"), "{response}");
+    assert!(!response.contains("invalid_processing_sequence"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    drop(envoy);
+    let template = base.replace("timeout: 1800s", "timeout: 0.2s");
+    let envoy = Envoy::with_config(runtime.address.port(), &template).await;
+    let response = envoy
+        .chunked(
+            "/v1/chat/completions",
+            br#"{"model":"test-model","messages":[{"role":"user","content":"hi"}]}"#,
+            false,
+        )
+        .await;
+    assert!(response.starts_with("HTTP/1.1 504"), "{response}");
+    assert!(response.contains("envoy-local:504:"), "{response}");
+    assert!(!response.contains("invalid_processing_sequence"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    drop(envoy);
+    runtime.shutdown().await.unwrap();
+    assert_eq!(worker.load(), 0);
     server.abort();
 }
 
@@ -393,16 +640,27 @@ impl PdBackend {
                 json!({"model":"test-model","text":"hi","vendor_extension":42}),
             ),
         ];
-        for (path, body) in &requests {
-            let response = client
-                .post(format!("{}{path}", envoy.url))
-                .json(body)
-                .send()
-                .await
-                .unwrap();
-            let status = response.status();
-            let text = response.text().await.unwrap();
-            assert_eq!(status, StatusCode::OK, "{kind:?}: {text}");
+        for (index, (path, body)) in requests.iter().enumerate() {
+            let text = if index == 0 {
+                let response = client
+                    .post(format!("{}{path}", envoy.url))
+                    .json(body)
+                    .send()
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let text = response.text().await.unwrap();
+                assert_eq!(status, StatusCode::OK, "{kind:?}: {text}");
+                text
+            } else {
+                // The executor must accept the same decoded bytes regardless of
+                // chunk boundaries or request trailers, without weakening its hash.
+                let text = envoy
+                    .chunked(path, &serde_json::to_vec(body).unwrap(), index == 2)
+                    .await;
+                assert!(text.starts_with("HTTP/1.1 200"), "{kind:?}: {text}");
+                text
+            };
             assert!(text.contains("pd-result"));
         }
         let calls = backend.calls.lock().unwrap().clone();

@@ -147,13 +147,30 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-sed -e "s/port_value: 8080/port_value: $ENVOY_PORT/" \
-    -e "s/port_value: 9002/port_value: $EXT_PROC_PORT/" \
+sed -e 's/port_value: 8080/port_value: CLIENT_PORT/' \
+    -e 's/port_value: 9002/port_value: PROCESSOR_PORT/' \
+    -e "s/CLIENT_PORT/$ENVOY_PORT/" \
+    -e "s/PROCESSOR_PORT/$EXT_PROC_PORT/" \
     -e "s/stream_idle_timeout: 300s/stream_idle_timeout: ${proxy_idle_timeout}s/" \
     -e "s/timeout: 1800s/timeout: ${proxy_route_timeout}s/" \
     "$script_dir/../../tests/fixtures/ext-proc/envoy.yaml" >"$run_dir/envoy.yaml"
 chmod 755 "$run_dir"
 chmod 644 "$run_dir/envoy.yaml"
+
+# Validate with the actual Envoy image before starting any long-lived service.
+envoy_validate=(docker run --rm --network host --user 0
+    --mount "type=bind,src=$run_dir/envoy.yaml,dst=/etc/envoy/envoy.yaml,readonly"
+    --entrypoint envoy "$ENVOY_IMAGE" -c /etc/envoy/envoy.yaml --mode validate)
+if (( dry_run )); then
+    printf '%q ' "${envoy_validate[@]}"
+    printf '\n'
+else
+    "${envoy_validate[@]}" >"$run_dir/envoy-validation.log" 2>&1 || {
+        cat "$run_dir/envoy-validation.log" >&2
+        echo 'Envoy configuration validation failed; no services were started' >&2
+        exit 1
+    }
+fi
 
 start_container() {
     local name=$1

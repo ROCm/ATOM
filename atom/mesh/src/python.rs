@@ -265,7 +265,7 @@ pub fn atomesh_runner(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ext-proc"))]
 mod ext_proc_tests {
     use super::*;
 

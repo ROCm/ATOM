@@ -140,6 +140,7 @@ pub(crate) struct SseFrames {
 impl SseFrames {
     pub(crate) const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
+    #[cfg(feature = "ext-proc")]
     pub(crate) fn exceeded_limit(&self) -> bool {
         self.oversized
     }

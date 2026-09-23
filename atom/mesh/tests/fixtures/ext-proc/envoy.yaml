@@ -9,6 +9,7 @@ static_resources:
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: inference
+                http_protocol_options: {enable_trailers: true}
                 stream_idle_timeout: 300s
                 route_config:
                   name: inference
@@ -23,10 +24,13 @@ static_resources:
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
                       failure_mode_allow: false
+                      observability_mode: false
                       grpc_service:
                         envoy_grpc: {cluster_name: mesh_ext_proc}
                       message_timeout: 65s
                       processing_mode:
+                        # Mesh waits for the complete request before routing.
+                        # Both directions require full duplex and SEND trailers.
                         request_header_mode: SEND
                         response_header_mode: SEND
                         request_body_mode: FULL_DUPLEX_STREAMED
@@ -55,6 +59,11 @@ static_resources:
                     socket_address: {address: 127.0.0.1, port_value: 9002}
     - name: inference_workers
       type: ORIGINAL_DST
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http_protocol_options: {enable_trailers: true}
       connect_timeout: 1s
       lb_policy: CLUSTER_PROVIDED
       original_dst_lb_config:
