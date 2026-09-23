@@ -22,6 +22,11 @@ from pathlib import Path
 import torch
 
 from atom.model_ops.v4_kernels.paged_decode import _sparse_attn_v4_paged_decode_asm
+from atom.model_ops.v4_kernels.paged_decode_fp8_flydsl import (
+    sparse_attn_v4_paged_decode_fp8_flydsl_graphsafe,
+    sparse_attn_v4_paged_decode_fp8_flydsl_split1,
+    sparse_attn_v4_paged_decode_fp8_flydsl_splitk,
+)
 from atom.model_ops.v4_kernels.paged_decode_fp8_triton import (
     sparse_attn_v4_paged_decode_fp8_triton,
     sparse_attn_v4_paged_decode_fp8_triton_auto,
@@ -54,143 +59,70 @@ class Config:
     use_mxfp8_v: bool = False
     use_native_bf16_v: bool = False
     fused_query_group: int = 4
+    split_tiles: int = 0
+    waves_per_eu: int = 1
+    reduce_d_chunk: int = 512
+    reduce_num_warps: int = 1
+    reduce_head_group: int = 1
+    split_tiles_short: int = 0
+    split_short_max_tiles: int = 0
+    split_tiles_mid: int = 0
+    split_mid_max_tiles: int = 0
+    packed_query_group: int = 0
+    packed_uniform_splits: int = 0
+    sequential_reduce: bool = False
+    schedule_hint: str = "none"
 
 
 CONFIGS = (
-    Config("auto-hca-q7", "auto", 64, 32, 8, 2, 4, 16),
-    Config("fp8v-bh64-bk32-s8-st2-w4", "fused", 64, 32, 8, 2, 4, 16),
-    *(
-        Config(
-            f"native-bh64-bk32-s{splits}-st2-w4",
-            "fused",
-            64,
-            32,
-            splits,
-            2,
-            4,
-            16,
-            use_native_bf16_v=True,
-        )
-        for splits in (2, 3, 4, 5, 6, 7, 8, 10, 12, 16)
-    ),
-    *(
-        Config(
-            f"native-bh64-bk64-s{splits}-st1-w4",
-            "fused",
-            64,
-            64,
-            splits,
-            1,
-            4,
-            0,
-            use_native_bf16_v=True,
-        )
-        for splits in (2, 3, 4, 5, 6, 7, 8, 10, 12, 16)
-    ),
     Config(
-        "native-bh32-bk32-s8-st2-w4",
+        "native-adaptive-short7-long9-packed-q7",
         "fused",
-        32,
-        32,
-        8,
+        64,
+        64,
+        11,
         2,
         4,
         16,
         use_native_bf16_v=True,
+        split_tiles=9,
+        split_tiles_short=7,
+        split_short_max_tiles=32,
+        packed_query_group=VERIFY_WIDTH,
     ),
     Config(
-        "native-bh32-bk64-s8-st1-w4",
-        "fused",
-        32,
-        64,
-        8,
-        1,
-        4,
-        0,
-        use_native_bf16_v=True,
-    ),
-    Config(
-        "native-bh64-bk32-s8-st1-w4",
+        "native-adaptive-uniform3-cap11-sequential-rd512-packed-q7",
         "fused",
         64,
-        32,
-        8,
-        1,
+        64,
+        11,
+        2,
         4,
         16,
         use_native_bf16_v=True,
+        split_tiles=9,
+        split_tiles_short=7,
+        split_short_max_tiles=32,
+        packed_query_group=VERIFY_WIDTH,
+        packed_uniform_splits=3,
+        sequential_reduce=True,
     ),
     Config(
-        "native-bh64-bk32-s8-st3-w4",
+        "native-b9-adaptive-cap9-short2-mid3-long9-packed-q7",
         "fused",
         64,
-        32,
-        8,
-        3,
+        64,
+        9,
+        2,
         4,
         16,
         use_native_bf16_v=True,
-    ),
-    Config(
-        "native-bh64-bk32-s8-st2-w2",
-        "fused",
-        64,
-        32,
-        8,
-        2,
-        2,
-        16,
-        use_native_bf16_v=True,
-    ),
-    Config(
-        "native-bh64-bk32-s8-st2-w8",
-        "fused",
-        64,
-        32,
-        8,
-        2,
-        8,
-        16,
-        use_native_bf16_v=True,
-    ),
-    Config(
-        "native-bh64-bk32-s8-st2-w4-mi0",
-        "fused",
-        64,
-        32,
-        8,
-        2,
-        4,
-        0,
-        use_native_bf16_v=True,
-    ),
-    Config(
-        "native-bh64-bk32-s8-st2-w4-mi32",
-        "fused",
-        64,
-        32,
-        8,
-        2,
-        4,
-        32,
-        use_native_bf16_v=True,
-    ),
-    *(
-        Config(
-            f"group-{'native' if native else 'fp8'}-fq{fused_q}-bk{block_k}-s{splits}",
-            "group",
-            16,
-            block_k,
-            splits,
-            1,
-            4,
-            0,
-            use_native_bf16_v=native,
-            fused_query_group=fused_q,
-        )
-        for native in (False, True)
-        for fused_q in (2, 4)
-        for block_k, splits in ((32, 4), (32, 8), (64, 4), (64, 8), (64, 16))
+        split_tiles=9,
+        split_tiles_short=2,
+        split_short_max_tiles=3,
+        split_tiles_mid=3,
+        split_mid_max_tiles=6,
+        packed_query_group=VERIFY_WIDTH,
     ),
 )
 
@@ -246,6 +178,59 @@ def _make_heterogeneous_indices(
     indptr[0] = 0
     torch.cumsum(query_kv_lens, dim=0, out=indptr[1:])
     return indices, indptr
+
+
+def _make_flydsl_split_tasks(
+    kv_lens: Sequence[int],
+    device: torch.device,
+    *,
+    query_group: int,
+    max_splits: int,
+    block_k: int,
+    split_tiles: int,
+    split_tiles_short: int,
+    split_short_max_tiles: int,
+) -> tuple[torch.Tensor, ...]:
+    """Build the compact active-task map for the benchmark-only prototype."""
+    task_query: list[int] = []
+    task_start: list[int] = []
+    task_len: list[int] = []
+    task_row: list[int] = []
+    split_counts = [0] * (len(kv_lens) * query_group)
+    request_base = 0
+    for request, kv_len in enumerate(kv_lens):
+        num_tiles = (kv_len + block_k - 1) // block_k
+        segment_tiles = (
+            split_tiles_short
+            if split_tiles_short > 0 and num_tiles <= split_short_max_tiles
+            else split_tiles
+        )
+        active_splits = min(
+            (num_tiles + segment_tiles - 1) // segment_tiles,
+            max_splits,
+        )
+        segment_rows = segment_tiles * block_k
+        for split in range(active_splits):
+            local_start = split * segment_rows
+            local_end = (
+                kv_len
+                if split == max_splits - 1
+                else min(local_start + segment_rows, kv_len)
+            )
+            for query_in_request in range(query_group):
+                query = request * query_group + query_in_request
+                split_counts[query] = active_splits
+                task_query.append(query)
+                task_start.append(
+                    request_base + query_in_request * kv_len + local_start
+                )
+                task_len.append(local_end - local_start)
+                task_row.append(query * max_splits + split)
+        request_base += query_group * kv_len
+    return tuple(
+        torch.tensor(values, dtype=torch.int32, device=device)
+        for values in (task_query, task_start, task_len, task_row, split_counts)
+    )  # type: ignore[return-value]
 
 
 def _capture(fn: Callable[[], torch.Tensor]) -> Callable[[], torch.Tensor]:
@@ -305,8 +290,101 @@ def _make_runner(
     indices: torch.Tensor,
     indptr: torch.Tensor,
     sink: torch.Tensor,
+    empty_indices: torch.Tensor | None = None,
+    empty_indptr: torch.Tensor | None = None,
+    flydsl_out: torch.Tensor | None = None,
+    flydsl_split_resource: (
+        tuple[
+            tuple[torch.Tensor, ...],
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ]
+        | None
+    ) = None,
 ) -> Callable[[], torch.Tensor]:
     def run() -> torch.Tensor:
+        if config.mode == "flydsl_graphsafe":
+            if empty_indptr is None or flydsl_out is None:
+                raise RuntimeError("graph-safe FlyDSL buffers were not provided")
+            return sparse_attn_v4_paged_decode_fp8_flydsl_graphsafe(
+                q_packed,
+                q_rope,
+                kv_packed,
+                kv_rope,
+                indices,
+                indptr,
+                empty_indptr,
+                sink,
+                SOFTMAX_SCALE,
+                max_splits=config.kv_splits,
+                block_k=config.block_k,
+                split_tiles=config.split_tiles,
+                split_tiles_short=config.split_tiles_short,
+                split_short_max_tiles=config.split_short_max_tiles,
+                reduce_head_group=config.reduce_head_group,
+                waves_per_eu=config.waves_per_eu,
+                out=flydsl_out,
+            )
+        if config.mode in ("flydsl_splitk", "flydsl_splitk_flyreduce"):
+            if (
+                empty_indices is None
+                or empty_indptr is None
+                or flydsl_out is None
+                or flydsl_split_resource is None
+            ):
+                raise RuntimeError("FlyDSL split-K buffers were not provided")
+            (
+                flydsl_split_tasks,
+                flydsl_partial_m,
+                flydsl_partial_l,
+                flydsl_partial_acc,
+            ) = flydsl_split_resource
+            return sparse_attn_v4_paged_decode_fp8_flydsl_splitk(
+                q_packed,
+                q_rope,
+                kv_packed,
+                kv_rope,
+                indices,
+                indptr,
+                empty_indices,
+                empty_indptr,
+                sink,
+                SOFTMAX_SCALE,
+                *flydsl_split_tasks,
+                max_splits=config.kv_splits,
+                split_tiles=config.split_tiles,
+                split_tiles_short=config.split_tiles_short,
+                split_short_max_tiles=config.split_short_max_tiles,
+                block_k=config.block_k,
+                reduce_d_chunk=config.reduce_d_chunk,
+                reduce_num_warps=config.reduce_num_warps,
+                reduce_head_group=config.reduce_head_group,
+                sequential_reduce=config.sequential_reduce,
+                use_flydsl_reduce=config.mode == "flydsl_splitk_flyreduce",
+                partial_m=flydsl_partial_m,
+                partial_l=flydsl_partial_l,
+                partial_acc=flydsl_partial_acc,
+                out=flydsl_out,
+                waves_per_eu=config.waves_per_eu,
+            )
+        if config.mode == "flydsl":
+            if empty_indices is None or empty_indptr is None or flydsl_out is None:
+                raise RuntimeError("FlyDSL decode buffers were not provided")
+            return sparse_attn_v4_paged_decode_fp8_flydsl_split1(
+                q_packed,
+                q_rope,
+                kv_packed,
+                kv_rope,
+                indices,
+                indptr,
+                empty_indices,
+                empty_indptr,
+                sink,
+                SOFTMAX_SCALE,
+                out=flydsl_out,
+                assume_full_tiles=False,
+            )
         if config.mode == "auto":
             return sparse_attn_v4_paged_decode_fp8_triton_auto(
                 q_packed,
@@ -337,12 +415,12 @@ def _make_runner(
                 kv_splits=config.kv_splits,
                 num_stages=config.num_stages,
                 num_warps=config.num_warps,
-                waves_per_eu=1,
+                waves_per_eu=config.waves_per_eu,
                 matrix_instr_nonkdim=config.matrix_instr_nonkdim,
                 use_mxfp8_qk=config.use_mxfp8_qk,
                 use_native_bf16_v=config.use_native_bf16_v,
-                reduce_d_chunk=512,
-                reduce_num_warps=1,
+                reduce_d_chunk=config.reduce_d_chunk,
+                reduce_num_warps=config.reduce_num_warps,
                 fp16_partials=True,
             )
         return sparse_attn_v4_paged_decode_fp8_triton(
@@ -359,13 +437,22 @@ def _make_runner(
             kv_splits=config.kv_splits,
             num_stages=config.num_stages,
             num_warps=config.num_warps,
-            waves_per_eu=1,
+            waves_per_eu=config.waves_per_eu,
             matrix_instr_nonkdim=config.matrix_instr_nonkdim,
+            schedule_hint=config.schedule_hint,
             use_mxfp8_qk=config.use_mxfp8_qk,
             use_mxfp8_v=config.use_mxfp8_v,
             use_native_bf16_v=config.use_native_bf16_v,
-            reduce_d_chunk=512,
-            reduce_num_warps=1,
+            split_tiles=config.split_tiles,
+            split_tiles_short=config.split_tiles_short,
+            split_short_max_tiles=config.split_short_max_tiles,
+            split_tiles_mid=config.split_tiles_mid,
+            split_mid_max_tiles=config.split_mid_max_tiles,
+            packed_query_group=config.packed_query_group,
+            packed_uniform_splits=config.packed_uniform_splits,
+            sequential_reduce=config.sequential_reduce,
+            reduce_d_chunk=config.reduce_d_chunk,
+            reduce_num_warps=config.reduce_num_warps,
             fp16_partials=True,
         )
 
@@ -380,6 +467,7 @@ def benchmark_vector(
     l2_flush_mib: int,
     seed: int,
     device: torch.device,
+    include_flydsl: bool,
 ) -> dict[str, object]:
     kv_lens = [_hca_rows(context_len) for context_len in context_lens]
     requests = len(context_lens)
@@ -396,6 +484,11 @@ def benchmark_vector(
     kv_packed, kv_rope = quantize_bf16_to_v4_2buff_triton(kv.view(pages, 1, HEAD_DIM))
     kv_packed = kv_packed.view(pages, HEAD_DIM)
     kv_rope = kv_rope.view(pages, ROPE_HEAD_DIM)
+    empty_indices = indices[:0]
+    empty_indptr = torch.zeros_like(indptr)
+    flydsl_out = torch.empty(
+        (tokens, LOCAL_HEADS, HEAD_DIM), dtype=torch.bfloat16, device=device
+    )
     qo_indptr = torch.arange(tokens + 1, dtype=torch.int32, device=device)
     flush = torch.zeros(
         l2_flush_mib * 1024 * 1024 // 4, dtype=torch.float32, device=device
@@ -414,11 +507,118 @@ def benchmark_vector(
             qo_indptr=qo_indptr,
         )
 
+    configs = CONFIGS
+    if include_flydsl:
+        configs += (
+            Config(
+                "flydsl-split1-prefix-only",
+                "flydsl",
+                128,
+                32,
+                1,
+                2,
+                8,
+                0,
+                waves_per_eu=1,
+            ),
+            Config(
+                "flydsl-splitk-k32-cap16-short9-long14",
+                "flydsl_splitk",
+                128,
+                32,
+                16,
+                2,
+                8,
+                0,
+                split_tiles=14,
+                split_tiles_short=9,
+                split_short_max_tiles=64,
+                waves_per_eu=1,
+                reduce_d_chunk=256,
+                reduce_num_warps=1,
+                sequential_reduce=True,
+            ),
+            Config(
+                "flydsl-splitk-flyreduce-hg4-k32-cap16-short9-long14",
+                "flydsl_splitk_flyreduce",
+                128,
+                32,
+                16,
+                2,
+                8,
+                0,
+                split_tiles=14,
+                split_tiles_short=9,
+                split_short_max_tiles=64,
+                waves_per_eu=1,
+                reduce_d_chunk=256,
+                reduce_num_warps=1,
+                reduce_head_group=4,
+                sequential_reduce=True,
+            ),
+            Config(
+                "flydsl-graphsafe-hg4-k32-cap12-short9-long16",
+                "flydsl_graphsafe",
+                128,
+                32,
+                12,
+                2,
+                8,
+                0,
+                split_tiles=16,
+                split_tiles_short=9,
+                split_short_max_tiles=64,
+                waves_per_eu=1,
+                reduce_head_group=4,
+            ),
+        )
+    flydsl_split_resources = {}
+    for config in configs:
+        if config.mode not in ("flydsl_splitk", "flydsl_splitk_flyreduce"):
+            continue
+        split_tasks = _make_flydsl_split_tasks(
+            kv_lens,
+            device,
+            query_group=VERIFY_WIDTH,
+            max_splits=config.kv_splits,
+            block_k=config.block_k,
+            split_tiles=config.split_tiles,
+            split_tiles_short=config.split_tiles_short,
+            split_short_max_tiles=config.split_short_max_tiles,
+        )
+        partial_m = torch.empty(
+            (tokens, config.kv_splits, LOCAL_HEADS),
+            dtype=torch.float32,
+            device=device,
+        )
+        partial_l = torch.empty_like(partial_m)
+        partial_acc = torch.empty(
+            (tokens, config.kv_splits, LOCAL_HEADS, HEAD_DIM),
+            dtype=torch.float16,
+            device=device,
+        )
+        flydsl_split_resources[config.name] = (
+            split_tasks,
+            partial_m,
+            partial_l,
+            partial_acc,
+        )
     eager_runners = {
         config.name: _make_runner(
-            config, q_packed, q_rope, kv_packed, kv_rope, indices, indptr, sink
+            config,
+            q_packed,
+            q_rope,
+            kv_packed,
+            kv_rope,
+            indices,
+            indptr,
+            sink,
+            empty_indices,
+            empty_indptr,
+            flydsl_out,
+            flydsl_split_resources.get(config.name),
         )
-        for config in CONFIGS
+        for config in configs
     }
     reference = run_aiter().float()
     aiter_runner = _capture(run_aiter)
@@ -433,7 +633,7 @@ def benchmark_vector(
         f"p10/p90={aiter_p10_us:.2f}/{aiter_p90_us:.2f}",
         flush=True,
     )
-    for config in CONFIGS:
+    for config in configs:
         output = eager_runners[config.name]().float()
         cosine = torch.nn.functional.cosine_similarity(
             reference.flatten(), output.flatten(), dim=0
@@ -456,6 +656,8 @@ def benchmark_vector(
             "speedup_vs_aiter_pct": (aiter_us / median_us - 1.0) * 100.0,
             "cosine_vs_aiter": cosine,
             "relative_rmse_vs_aiter": relative_rmse,
+            "max_abs_vs_aiter": float((output - reference).abs().max().item()),
+            "nonfinite": int((~torch.isfinite(output)).sum().item()),
         }
         results.append(result)
         print(
@@ -492,6 +694,11 @@ def main() -> None:
     parser.add_argument("--l2-flush-mib", type=int, default=64)
     parser.add_argument("--seed", type=int, default=20260917)
     parser.add_argument(
+        "--include-flydsl",
+        action="store_true",
+        help="also benchmark the H=128 FlyDSL split1 decode candidate",
+    )
+    parser.add_argument(
         "--configs",
         help="comma-separated config names; default benchmarks every config",
     )
@@ -522,6 +729,7 @@ def main() -> None:
             "warmup": args.warmup,
             "iterations": args.iterations,
             "l2_flush_mib": args.l2_flush_mib,
+            "seed": args.seed,
             "cuda_graph": True,
         },
         "vectors": [],
@@ -539,6 +747,7 @@ def main() -> None:
             l2_flush_mib=args.l2_flush_mib,
             seed=args.seed,
             device=device,
+            include_flydsl=args.include_flydsl,
         )
         payload["vectors"].append(result)  # type: ignore[union-attr]
         torch.cuda.empty_cache()

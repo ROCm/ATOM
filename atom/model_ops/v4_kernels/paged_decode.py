@@ -94,6 +94,89 @@ def v4_decode_query_group(min_seqlen_q: int, max_seqlen_q: int) -> int:
     return 1
 
 
+@functools.lru_cache(maxsize=None)
+def _device_arch(device_index: int) -> str:
+    """Return the base GCN architecture name without feature suffixes."""
+    return getattr(
+        torch.cuda.get_device_properties(device_index), "gcnArchName", ""
+    ).split(":", 1)[0]
+
+
+def _use_triton_native_fp8_decode(
+    q_packed: torch.Tensor,
+    *,
+    query_group: int,
+    kv_kind: str,
+) -> bool:
+    """Select the native two-buffer FP8 decode backend at capture time.
+
+    On gfx950, the default hybrid policy keeps the Triton kernels only where
+    measurements beat the AITER assembly path. The native-V B6 HCA
+    specialization uses a GPU-side packed work map and remains on Triton;
+    other measured HCA shapes stay on AITER. DP CSA stays on Triton: the
+    gfx950 native-V path plus the attention scheduler now covers its former
+    B10+ crossover.
+
+    The decision uses only captured tensor shapes, device architecture, and
+    layer kind, so it is safe for CUDA Graph replay.
+    ``ATOM_V4_TRITON_HYBRID_DECODE=0`` restores the all-Triton policy, while
+    ``ATOM_USE_TRITON_ATTN=0`` still forces AITER for every native FP8 decode
+    shape.
+    """
+    if os.environ.get("ATOM_USE_TRITON_ATTN", "1") != "1":
+        return False
+    if os.environ.get("ATOM_V4_TRITON_HYBRID_DECODE", "1") != "1":
+        return True
+
+    device_index = q_packed.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    if _device_arch(device_index) != "gfx950":
+        return True
+
+    tokens, heads, _ = q_packed.shape
+    if heads == 128 and query_group == 7:
+        if kv_kind == "hca":
+            return (
+                tokens == 6 * query_group
+                and os.environ.get("ATOM_V4_TRITON_NATIVE_BF16_V", "0") == "1"
+            )
+        if kv_kind == "csa" and tokens % query_group == 0:
+            return True
+    return True
+
+
+def _use_flydsl_native_fp8_decode(
+    q_packed: torch.Tensor,
+    *,
+    query_group: int,
+    kv_kind: str,
+) -> bool:
+    """Select the qualified gfx950 HCA B6 FlyDSL specialization.
+
+    The environment switch is intentionally explicit while the mixed
+    Triton/FlyDSL policy is being validated end to end.  The master Triton
+    attention switch still provides one control that forces every native-FP8
+    attention call back to AITER for matched A/B runs.
+    """
+    if os.environ.get("ATOM_USE_TRITON_ATTN", "1") != "1":
+        return False
+    if os.environ.get("ATOM_V4_FLYDSL_FP8_DECODE", "0") != "1":
+        return False
+
+    device_index = q_packed.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    tokens, heads, _ = q_packed.shape
+    return (
+        _device_arch(device_index) == "gfx950"
+        and tokens == 6 * 7
+        and heads == 128
+        and query_group == 7
+        and kv_kind == "hca"
+    )
+
+
 @functools.lru_cache(maxsize=1)
 def _cu_count() -> int:
     """Compute-unit count of the active GPU, queried once via aiter.
@@ -526,6 +609,14 @@ def _paged_decode_reduce_kernel(
     BLOCK_D: tl.constexpr,
     D_CHUNK: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    SPLIT_TILES: tl.constexpr = 0,
+    SPLIT_TILES_SHORT: tl.constexpr = 0,
+    SPLIT_SHORT_MAX_TILES: tl.constexpr = 0,
+    SPLIT_TILES_MID: tl.constexpr = 0,
+    SPLIT_MID_MAX_TILES: tl.constexpr = 0,
+    PACKED_QUERY_GROUP: tl.constexpr = 0,
+    PACKED_UNIFORM_SPLITS: tl.constexpr = 0,
+    SEQUENTIAL_FALLBACK: tl.constexpr = False,
 ):
     """2D-tile reduce: combine KV_SPLITS partials, fold attn_sink, write
     final output. Grid: ``(T, H, ceil(D / D_CHUNK))`` — one CTA owns one
@@ -559,7 +650,6 @@ def _paged_decode_reduce_kernel(
     dc = tl.program_id(2)
 
     d_offs = dc * D_CHUNK + tl.arange(0, D_CHUNK)
-    k_offs = tl.arange(0, triton.next_power_of_2(KV_SPLITS))
     d_mask = d_offs < D
 
     neg_large = -3.4028234663852886e38
@@ -581,38 +671,176 @@ def _paged_decode_reduce_kernel(
             mask=d_mask,
         )
         return
-    tiles_per_segment = tl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
-    act_num_segments = tl.cdiv(kv_len, tl.maximum(tiles_per_segment, 1) * BLOCK_K)
-    segm_mask = k_offs < act_num_segments
+    if PACKED_UNIFORM_SPLITS > 0:
+        request = t // PACKED_QUERY_GROUP
+        act_num_segments = tl.load(
+            l_partial_ptr + request * lp_stride_t + KV_SPLITS * lp_stride_k
+        ).to(tl.int32)
+    elif SPLIT_TILES > 0:
+        num_tiles = tl.cdiv(kv_len, BLOCK_K)
+        segment_tiles = SPLIT_TILES
+        if SPLIT_TILES_SHORT > 0:
+            segment_tiles = tl.where(
+                num_tiles <= SPLIT_SHORT_MAX_TILES,
+                SPLIT_TILES_SHORT,
+                segment_tiles,
+            )
+        if SPLIT_TILES_MID > 0:
+            segment_tiles = tl.where(
+                (num_tiles > SPLIT_SHORT_MAX_TILES)
+                & (num_tiles <= SPLIT_MID_MAX_TILES),
+                SPLIT_TILES_MID,
+                segment_tiles,
+            )
+        act_num_segments = tl.minimum(tl.cdiv(num_tiles, segment_tiles), KV_SPLITS)
+    else:
+        tiles_per_segment = tl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
+        act_num_segments = tl.cdiv(kv_len, tl.maximum(tiles_per_segment, 1) * BLOCK_K)
 
-    # 1D loads for (m, l) along splits — single head h.
-    m_p = tl.load(
-        m_partial_ptr + t * mp_stride_t + k_offs * mp_stride_k + h * mp_stride_h,
-        mask=segm_mask,
-        other=neg_large,
-    )  # [KV_SPLITS]
-    l_p = tl.load(
-        l_partial_ptr + t * lp_stride_t + k_offs * lp_stride_k + h * lp_stride_h,
-        mask=segm_mask,
-        other=0.0,
-    )  # [KV_SPLITS]
-
-    # 2D-tile load for acc partials — the key change vs old 3D-strided load.
-    a_p = tl.load(
-        acc_partial_ptr
-        + t * ap_stride_t
-        + k_offs[:, None] * ap_stride_k
-        + h * ap_stride_h
-        + d_offs[None, :] * ap_stride_d,
-        mask=segm_mask[:, None] & d_mask[None, :],
-        other=0.0,
-    )  # [KV_SPLITS, D_CHUNK]
-
-    # Combine across splits.
-    m_max = tl.max(m_p, axis=0)  # scalar
-    alpha_split = tl.exp2(m_p - m_max)  # [KV_SPLITS]
-    l_combined = tl.sum(l_p * alpha_split, axis=0)  # scalar
-    acc_combined = tl.sum(a_p * alpha_split[:, None], axis=0)  # [D_CHUNK]
+    # Adaptive schedules reserve enough partial slots for the longest request
+    # in a CUDA graph, but common uniform requests often activate only two or
+    # three of them. Keep those hot paths scalar-unrolled; the ordinary
+    # fallback uses four lanes for other small reductions, while the optional
+    # low-register fallback streams larger reductions one D vector at a time.
+    if SPLIT_TILES > 0 and act_num_segments == 2:
+        m_base = t * mp_stride_t + h * mp_stride_h
+        l_base = t * lp_stride_t + h * lp_stride_h
+        a_base = t * ap_stride_t + h * ap_stride_h + d_offs * ap_stride_d
+        m0 = tl.load(m_partial_ptr + m_base)
+        m1 = tl.load(m_partial_ptr + m_base + mp_stride_k)
+        l0 = tl.load(l_partial_ptr + l_base)
+        l1 = tl.load(l_partial_ptr + l_base + lp_stride_k)
+        a0 = tl.load(acc_partial_ptr + a_base, mask=d_mask, other=0.0).to(tl.float32)
+        a1 = tl.load(acc_partial_ptr + a_base + ap_stride_k, mask=d_mask, other=0.0).to(
+            tl.float32
+        )
+        m_max = tl.maximum(m0, m1)
+        alpha0 = tl.exp2(m0 - m_max)
+        alpha1 = tl.exp2(m1 - m_max)
+        l_combined = l0 * alpha0 + l1 * alpha1
+        acc_combined = a0 * alpha0 + a1 * alpha1
+    elif SPLIT_TILES > 0 and act_num_segments == 3:
+        m_base = t * mp_stride_t + h * mp_stride_h
+        l_base = t * lp_stride_t + h * lp_stride_h
+        a_base = t * ap_stride_t + h * ap_stride_h + d_offs * ap_stride_d
+        m0 = tl.load(m_partial_ptr + m_base)
+        m1 = tl.load(m_partial_ptr + m_base + mp_stride_k)
+        m2 = tl.load(m_partial_ptr + m_base + 2 * mp_stride_k)
+        l0 = tl.load(l_partial_ptr + l_base)
+        l1 = tl.load(l_partial_ptr + l_base + lp_stride_k)
+        l2 = tl.load(l_partial_ptr + l_base + 2 * lp_stride_k)
+        a0 = tl.load(acc_partial_ptr + a_base, mask=d_mask, other=0.0).to(tl.float32)
+        a1 = tl.load(acc_partial_ptr + a_base + ap_stride_k, mask=d_mask, other=0.0).to(
+            tl.float32
+        )
+        a2 = tl.load(
+            acc_partial_ptr + a_base + 2 * ap_stride_k,
+            mask=d_mask,
+            other=0.0,
+        ).to(tl.float32)
+        m_max = tl.maximum(tl.maximum(m0, m1), m2)
+        alpha0 = tl.exp2(m0 - m_max)
+        alpha1 = tl.exp2(m1 - m_max)
+        alpha2 = tl.exp2(m2 - m_max)
+        l_combined = l0 * alpha0 + l1 * alpha1 + l2 * alpha2
+        acc_combined = a0 * alpha0 + a1 * alpha1 + a2 * alpha2
+    elif SPLIT_TILES > 0 and act_num_segments <= 4 and not SEQUENTIAL_FALLBACK:
+        small_offs = tl.arange(0, 4)
+        small_mask = small_offs < act_num_segments
+        partial_base = t * mp_stride_t + h * mp_stride_h
+        m_small = tl.load(
+            m_partial_ptr + partial_base + small_offs * mp_stride_k,
+            mask=small_mask,
+            other=neg_large,
+        )
+        l_small = tl.load(
+            l_partial_ptr
+            + t * lp_stride_t
+            + h * lp_stride_h
+            + small_offs * lp_stride_k,
+            mask=small_mask,
+            other=0.0,
+        )
+        a_small = tl.load(
+            acc_partial_ptr
+            + t * ap_stride_t
+            + small_offs[:, None] * ap_stride_k
+            + h * ap_stride_h
+            + d_offs[None, :] * ap_stride_d,
+            mask=small_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        m_max_small = tl.max(m_small, axis=0)
+        alpha_small = tl.exp2(m_small - m_max_small)
+        m_max = m_max_small
+        l_combined = tl.sum(l_small * alpha_small, axis=0)
+        acc_combined = tl.sum(a_small * alpha_small[:, None], axis=0)
+    elif SEQUENTIAL_FALLBACK:
+        # Reduce scalar softmax metadata first, then stream one D vector at a
+        # time through the accumulator. This preserves the low-register shape
+        # of the sequential fallback without rescaling the full accumulator
+        # after every split.
+        k_offs = tl.arange(0, triton.next_power_of_2(KV_SPLITS))
+        segm_mask = k_offs < act_num_segments
+        m_p = tl.load(
+            m_partial_ptr + t * mp_stride_t + k_offs * mp_stride_k + h * mp_stride_h,
+            mask=segm_mask,
+            other=neg_large,
+        )
+        l_p = tl.load(
+            l_partial_ptr + t * lp_stride_t + k_offs * lp_stride_k + h * lp_stride_h,
+            mask=segm_mask,
+            other=0.0,
+        )
+        m_max = tl.max(m_p, axis=0)
+        alpha_p = tl.exp2(m_p - m_max)
+        l_combined = tl.sum(l_p * alpha_p, axis=0)
+        acc_combined = tl.zeros((D_CHUNK,), tl.float32)
+        for split in tl.range(
+            0,
+            act_num_segments,
+            loop_unroll_factor=2,
+        ):
+            m_split = tl.load(
+                m_partial_ptr + t * mp_stride_t + split * mp_stride_k + h * mp_stride_h
+            )
+            a_split = tl.load(
+                acc_partial_ptr
+                + t * ap_stride_t
+                + split * ap_stride_k
+                + h * ap_stride_h
+                + d_offs * ap_stride_d,
+                mask=d_mask,
+                other=0.0,
+            ).to(tl.float32)
+            alpha_split = tl.exp2(m_split - m_max)
+            acc_combined += a_split * alpha_split
+    else:
+        k_offs = tl.arange(0, triton.next_power_of_2(KV_SPLITS))
+        segm_mask = k_offs < act_num_segments
+        m_p = tl.load(
+            m_partial_ptr + t * mp_stride_t + k_offs * mp_stride_k + h * mp_stride_h,
+            mask=segm_mask,
+            other=neg_large,
+        )
+        l_p = tl.load(
+            l_partial_ptr + t * lp_stride_t + k_offs * lp_stride_k + h * lp_stride_h,
+            mask=segm_mask,
+            other=0.0,
+        )
+        a_p = tl.load(
+            acc_partial_ptr
+            + t * ap_stride_t
+            + k_offs[:, None] * ap_stride_k
+            + h * ap_stride_h
+            + d_offs[None, :] * ap_stride_d,
+            mask=segm_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        m_max = tl.max(m_p, axis=0)
+        alpha_split = tl.exp2(m_p - m_max)
+        l_combined = tl.sum(l_p * alpha_split, axis=0)
+        acc_combined = tl.sum(a_p * alpha_split[:, None], axis=0)
 
     # Fold attn_sink (recomputed across dc — scalar work, negligible).
     sink_raw = tl.load(attn_sink_ptr + h).to(tl.float32)
@@ -1131,8 +1359,9 @@ def sparse_attn_v4_paged_decode(
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
     Native 2buff fp8 (``unified_kv_rope`` provided): routes to the native-cache
-    Triton dispatcher when ``ATOM_USE_TRITON_ATTN=1``. Otherwise, eligible
-    gfx1250 H=128 shapes may reuse the sparse-prefill ASM kernel when
+    Triton dispatcher when ``ATOM_USE_TRITON_ATTN=1``. With
+    ``ATOM_V4_TRITON_HYBRID_DECODE=1``, measured gfx950 losers route back to
+    AITER. Otherwise, eligible gfx1250 H=128 shapes may reuse the sparse-prefill ASM kernel when
     ``ATOM_USE_V4_PREFILL_ASM_FOR_DECODE=1``; remaining shapes use the aiter
     decode ASM kernel (op5). All paths consume pre-packed fp8 Q and the fp8
     NoPE + bf16 RoPE pools with no requant.
@@ -1143,11 +1372,42 @@ def sparse_attn_v4_paged_decode(
     unreachable from the model).
     """
     if unified_kv_rope is not None:
-        if os.environ.get("ATOM_USE_TRITON_ATTN", "1") == "1":
+        if empty_kv_indptr is not None and _use_flydsl_native_fp8_decode(
+            q_packed_in,
+            query_group=query_group,
+            kv_kind=kv_kind,
+        ):
+            from atom.model_ops.v4_kernels.paged_decode_fp8_flydsl import (
+                sparse_attn_v4_paged_decode_fp8_flydsl_graphsafe,
+            )
+
+            return sparse_attn_v4_paged_decode_fp8_flydsl_graphsafe(
+                q_packed_in,
+                q_rope_in,
+                unified_kv,
+                unified_kv_rope,
+                kv_indices,
+                kv_indptr,
+                empty_kv_indptr,
+                attn_sink,
+                softmax_scale,
+            )
+        if _use_triton_native_fp8_decode(
+            q_packed_in,
+            query_group=query_group,
+            kv_kind=kv_kind,
+        ):
             from atom.model_ops.v4_kernels.paged_decode_fp8_triton import (
                 sparse_attn_v4_paged_decode_fp8_triton_auto,
             )
 
+            device = getattr(q_packed_in, "device", None)
+            device_index = getattr(device, "index", None)
+            gfx950_native_v = False
+            if device is not None:
+                if device_index is None:
+                    device_index = torch.cuda.current_device()
+                gfx950_native_v = _device_arch(device_index) == "gfx950"
             return sparse_attn_v4_paged_decode_fp8_triton_auto(
                 q_packed_in,
                 q_rope_in,
@@ -1159,6 +1419,7 @@ def sparse_attn_v4_paged_decode(
                 softmax_scale,
                 query_group=query_group,
                 kv_kind=kv_kind,
+                gfx950_native_v=gfx950_native_v,
             )
         if (
             envs.ATOM_USE_V4_PREFILL_ASM_FOR_DECODE

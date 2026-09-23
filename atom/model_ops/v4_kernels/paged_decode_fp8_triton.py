@@ -198,6 +198,31 @@ def _fp8_v_group_dot(
 
 
 @triton.jit
+def _adaptive_segment_tiles(
+    num_tiles,
+    SPLIT_TILES: tl.constexpr,
+    SPLIT_TILES_SHORT: tl.constexpr,
+    SPLIT_SHORT_MAX_TILES: tl.constexpr,
+    SPLIT_TILES_MID: tl.constexpr,
+    SPLIT_MID_MAX_TILES: tl.constexpr,
+):
+    segment_tiles = tl.full(num_tiles.shape, SPLIT_TILES, tl.int32)
+    if SPLIT_TILES_SHORT > 0:
+        segment_tiles = tl.where(
+            num_tiles <= SPLIT_SHORT_MAX_TILES,
+            SPLIT_TILES_SHORT,
+            segment_tiles,
+        )
+    if SPLIT_TILES_MID > 0:
+        segment_tiles = tl.where(
+            (num_tiles > SPLIT_SHORT_MAX_TILES) & (num_tiles <= SPLIT_MID_MAX_TILES),
+            SPLIT_TILES_MID,
+            segment_tiles,
+        )
+    return segment_tiles
+
+
+@triton.jit
 def _paged_decode_fp8_2buff_fused_kernel(
     q_packed_ptr,  # [T,H,512] fp8
     q_packed_u8_ptr,  # same storage as uint8, for e8m0 scale bytes
@@ -246,11 +271,179 @@ def _paged_decode_fp8_2buff_fused_kernel(
     USE_MXFP8_V: tl.constexpr,
     USE_NATIVE_BF16_V: tl.constexpr,
     KV_SPLITS: tl.constexpr,
+    SPLIT_TILES: tl.constexpr,
+    SPLIT_TILES_SHORT: tl.constexpr,
+    SPLIT_SHORT_MAX_TILES: tl.constexpr,
+    SPLIT_TILES_MID: tl.constexpr,
+    SPLIT_MID_MAX_TILES: tl.constexpr,
+    PACKED_QUERY_GROUP: tl.constexpr,
+    PACKED_UNIFORM_SPLITS: tl.constexpr,
+    NUM_QUERY_GROUPS: tl.constexpr,
+    NUM_HEAD_BLOCKS: tl.constexpr,
 ):
     """Native 2buff attention stage-1; direct output or split-K partials."""
-    t = tl.program_id(0)
-    pid_h = tl.program_id(1)
-    pid_k = tl.program_id(2)
+    if PACKED_QUERY_GROUP > 0:
+        # q7 decode repeats one request's KV range for seven adjacent query
+        # rows. Compact the runtime-active split work to the front of a
+        # fixed CUDA-Graph-safe grid, instead of leaving partially occupied
+        # tail waves in every split plane of the ordinary 3D launch.
+        flat_pid = tl.program_id(0)
+        if SPLIT_TILES > 0:
+            request_offs = tl.arange(0, triton.next_power_of_2(NUM_QUERY_GROUPS))
+            request_mask = request_offs < NUM_QUERY_GROUPS
+            request_t = request_offs * PACKED_QUERY_GROUP
+            request_kv_start = tl.load(
+                kv_indptr_ptr + request_t, mask=request_mask, other=0
+            )
+            request_kv_end = tl.load(
+                kv_indptr_ptr + request_t + 1, mask=request_mask, other=0
+            )
+            request_num_tiles = tl.cdiv(request_kv_end - request_kv_start, BLOCK_K)
+            if PACKED_UNIFORM_SPLITS > 0:
+                first_num_tiles = tl.cdiv(
+                    tl.load(kv_indptr_ptr + 1) - tl.load(kv_indptr_ptr), BLOCK_K
+                )
+                num_mismatches = tl.sum(
+                    tl.where(
+                        request_mask & (request_num_tiles != first_num_tiles),
+                        1,
+                        0,
+                    ),
+                    axis=0,
+                )
+                if num_mismatches == 0:
+                    active_uniform_segments = tl.minimum(
+                        first_num_tiles, PACKED_UNIFORM_SPLITS
+                    )
+                    uniform_tasks = (
+                        NUM_QUERY_GROUPS
+                        * active_uniform_segments
+                        * PACKED_QUERY_GROUP
+                        * NUM_HEAD_BLOCKS
+                    )
+                    if flat_pid >= uniform_tasks:
+                        return
+            request_segment_tiles = _adaptive_segment_tiles(
+                request_num_tiles,
+                SPLIT_TILES,
+                SPLIT_TILES_SHORT,
+                SPLIT_SHORT_MAX_TILES,
+                SPLIT_TILES_MID,
+                SPLIT_MID_MAX_TILES,
+            )
+            request_segments = tl.minimum(
+                tl.cdiv(request_num_tiles, request_segment_tiles), KV_SPLITS
+            )
+            if PACKED_UNIFORM_SPLITS > 0:
+                if num_mismatches == 0:
+                    request_segments = tl.minimum(
+                        request_num_tiles, PACKED_UNIFORM_SPLITS
+                    )
+                    request_segment_tiles = tl.cdiv(
+                        request_num_tiles, tl.maximum(request_segments, 1)
+                    )
+                if flat_pid == 0:
+                    metadata_base = request_offs * lp_stride_t + KV_SPLITS * lp_stride_k
+                    tl.store(
+                        l_partial_ptr + metadata_base,
+                        request_segments.to(tl.float32),
+                        mask=request_mask,
+                    )
+            request_tasks = tl.where(
+                request_mask,
+                request_segments * PACKED_QUERY_GROUP * NUM_HEAD_BLOCKS,
+                0,
+            )
+            total_tasks = tl.sum(request_tasks, axis=0)
+            if flat_pid >= total_tasks:
+                return
+            min_request_segments = tl.min(
+                tl.where(request_mask, request_segments, KV_SPLITS + 1), axis=0
+            )
+            max_request_segments = tl.max(
+                tl.where(request_mask, request_segments, 0), axis=0
+            )
+            if min_request_segments == max_request_segments:
+                # Uniform batches are common in the standalone long-context
+                # sweep. Avoid the prefix scan and one-hot selection there.
+                tasks_per_request = (
+                    max_request_segments * PACKED_QUERY_GROUP * NUM_HEAD_BLOCKS
+                )
+                selected_request = flat_pid // tasks_per_request
+                selected_local = flat_pid % tasks_per_request
+            else:
+                task_ends = tl.cumsum(request_tasks, axis=0)
+                task_starts = task_ends - request_tasks
+                is_selected = (flat_pid >= task_starts) & (flat_pid < task_ends)
+                selected_request = tl.sum(
+                    tl.where(is_selected, request_offs, 0), axis=0
+                )
+                selected_local = tl.sum(
+                    tl.where(is_selected, flat_pid - task_starts, 0), axis=0
+                )
+        else:
+            tasks_per_request: tl.constexpr = (
+                KV_SPLITS * PACKED_QUERY_GROUP * NUM_HEAD_BLOCKS
+            )
+            selected_request = flat_pid // tasks_per_request
+            selected_local = flat_pid % tasks_per_request
+        pid_k = selected_local // (PACKED_QUERY_GROUP * NUM_HEAD_BLOCKS)
+        query_head_local = selected_local % (PACKED_QUERY_GROUP * NUM_HEAD_BLOCKS)
+        t = selected_request * PACKED_QUERY_GROUP + query_head_local // NUM_HEAD_BLOCKS
+        pid_h = query_head_local % NUM_HEAD_BLOCKS
+    else:
+        t = tl.program_id(0)
+        pid_h = tl.program_id(1)
+        pid_k = tl.program_id(2)
+
+    # Resolve split activity before loading the 512-wide query tile. Adaptive
+    # fixed grids deliberately contain inactive tail programs; returning here
+    # makes those slots cheap enough to preserve the uniform fast path.
+    kv_start = tl.load(kv_indptr_ptr + t)
+    kv_end = tl.load(kv_indptr_ptr + t + 1)
+    kv_len = kv_end - kv_start
+    num_tiles = tl.cdiv(kv_len, BLOCK_K)
+    if KV_SPLITS > 1:
+        if SPLIT_TILES > 0:
+            if PACKED_UNIFORM_SPLITS > 0:
+                segment_tiles = tl.sum(
+                    tl.where(
+                        request_offs == selected_request,
+                        request_segment_tiles,
+                        0,
+                    ),
+                    axis=0,
+                )
+            else:
+                segment_tiles = SPLIT_TILES
+                if SPLIT_TILES_SHORT > 0:
+                    segment_tiles = tl.where(
+                        num_tiles <= SPLIT_SHORT_MAX_TILES,
+                        SPLIT_TILES_SHORT,
+                        segment_tiles,
+                    )
+                if SPLIT_TILES_MID > 0:
+                    segment_tiles = tl.where(
+                        (num_tiles > SPLIT_SHORT_MAX_TILES)
+                        & (num_tiles <= SPLIT_MID_MAX_TILES),
+                        SPLIT_TILES_MID,
+                        segment_tiles,
+                    )
+            tile_start = pid_k * segment_tiles
+            tile_end = tl.minimum(tile_start + segment_tiles, num_tiles)
+            # Preserve correctness for inputs longer than the tuned range:
+            # the final split absorbs any remainder beyond the nominal cap.
+            if pid_k == KV_SPLITS - 1:
+                tile_end = num_tiles
+            if tile_start >= num_tiles:
+                return
+        else:
+            tiles_per_segment = tl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
+            tile_start = pid_k * tiles_per_segment
+            tile_end = tl.minimum((pid_k + 1) * tiles_per_segment, num_tiles)
+    else:
+        tile_start = 0
+        tile_end = num_tiles
 
     h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     d_offs = tl.arange(0, BLOCK_D)
@@ -316,18 +509,6 @@ def _paged_decode_fp8_2buff_fused_kernel(
         )
         q_nope = q_nope_raw.to(tl.float32) * q_scale_full
         q = tl.where(nope_mask[None, :], q_nope, q_rope).to(tl.bfloat16)
-
-    kv_start = tl.load(kv_indptr_ptr + t)
-    kv_end = tl.load(kv_indptr_ptr + t + 1)
-    kv_len = kv_end - kv_start
-    num_tiles = tl.cdiv(kv_len, BLOCK_K)
-    if KV_SPLITS > 1:
-        tiles_per_segment = tl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
-        tile_start = pid_k * tiles_per_segment
-        tile_end = tl.minimum((pid_k + 1) * tiles_per_segment, num_tiles)
-    else:
-        tile_start = 0
-        tile_end = num_tiles
 
     neg_large = -3.4028234663852886e38
     m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
@@ -964,6 +1145,113 @@ def _paged_decode_reduce2_kernel(
 
 
 @triton.jit
+def _paged_decode_reduce3_kernel(
+    m_partial_ptr,
+    l_partial_ptr,
+    acc_partial_ptr,
+    attn_sink_ptr,
+    kv_indptr_ptr,
+    out_ptr,
+    mp_stride_t: tl.constexpr,
+    mp_stride_k: tl.constexpr,
+    mp_stride_h: tl.constexpr,
+    lp_stride_t: tl.constexpr,
+    lp_stride_k: tl.constexpr,
+    lp_stride_h: tl.constexpr,
+    ap_stride_t: tl.constexpr,
+    ap_stride_k: tl.constexpr,
+    ap_stride_h: tl.constexpr,
+    ap_stride_d: tl.constexpr,
+    out_stride_t: tl.constexpr,
+    out_stride_h: tl.constexpr,
+    out_stride_d: tl.constexpr,
+    log2e,
+    D: tl.constexpr,
+    D_CHUNK: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Fully unrolled three-way split reduction for hot DP q7 batches."""
+    t = tl.program_id(0)
+    h = tl.program_id(1)
+    dc = tl.program_id(2)
+    d_offs = dc * D_CHUNK + tl.arange(0, D_CHUNK)
+    d_mask = d_offs < D
+    neg_large = -3.4028234663852886e38
+
+    kv_start = tl.load(kv_indptr_ptr + t)
+    kv_end = tl.load(kv_indptr_ptr + t + 1)
+    kv_len = kv_end - kv_start
+    if kv_len == 0:
+        tl.store(
+            out_ptr + t * out_stride_t + h * out_stride_h + d_offs * out_stride_d,
+            tl.zeros((D_CHUNK,), dtype=out_ptr.dtype.element_ty),
+            mask=d_mask,
+        )
+        return
+
+    tiles_per_segment = tl.cdiv(kv_len, 3 * BLOCK_K)
+    segment_rows = tiles_per_segment * BLOCK_K
+    has_second = kv_len > segment_rows
+    has_third = kv_len > 2 * segment_rows
+
+    m0 = tl.load(m_partial_ptr + t * mp_stride_t + h * mp_stride_h)
+    l0 = tl.load(l_partial_ptr + t * lp_stride_t + h * lp_stride_h)
+    m1 = tl.load(
+        m_partial_ptr + t * mp_stride_t + mp_stride_k + h * mp_stride_h,
+        mask=has_second,
+        other=neg_large,
+    )
+    l1 = tl.load(
+        l_partial_ptr + t * lp_stride_t + lp_stride_k + h * lp_stride_h,
+        mask=has_second,
+        other=0.0,
+    )
+    m2 = tl.load(
+        m_partial_ptr + t * mp_stride_t + 2 * mp_stride_k + h * mp_stride_h,
+        mask=has_third,
+        other=neg_large,
+    )
+    l2 = tl.load(
+        l_partial_ptr + t * lp_stride_t + 2 * lp_stride_k + h * lp_stride_h,
+        mask=has_third,
+        other=0.0,
+    )
+
+    a_base = t * ap_stride_t + h * ap_stride_h + d_offs * ap_stride_d
+    a0 = tl.load(acc_partial_ptr + a_base, mask=d_mask, other=0.0).to(tl.float32)
+    a1 = tl.load(
+        acc_partial_ptr + a_base + ap_stride_k,
+        mask=has_second & d_mask,
+        other=0.0,
+    ).to(tl.float32)
+    a2 = tl.load(
+        acc_partial_ptr + a_base + 2 * ap_stride_k,
+        mask=has_third & d_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    m_max = tl.maximum(tl.maximum(m0, m1), m2)
+    alpha0 = tl.exp2(m0 - m_max)
+    alpha1 = tl.exp2(m1 - m_max)
+    alpha2 = tl.exp2(m2 - m_max)
+    l_combined = l0 * alpha0 + l1 * alpha1 + l2 * alpha2
+    acc_combined = a0 * alpha0 + a1 * alpha1 + a2 * alpha2
+
+    sink = tl.load(attn_sink_ptr + h).to(tl.float32) * log2e
+    m_final = tl.maximum(m_max, sink)
+    alpha_kv = tl.exp2(m_max - m_final)
+    alpha_sink = tl.exp2(sink - m_final)
+    l_final = l_combined * alpha_kv + alpha_sink
+    denom = tl.maximum(l_final, 1.0e-30)
+    out = tl.where(l_final > 0.0, acc_combined * alpha_kv / denom, 0.0)
+    tl.store(
+        out_ptr + t * out_stride_t + h * out_stride_h + d_offs * out_stride_d,
+        out.to(out_ptr.dtype.element_ty),
+        mask=d_mask,
+    )
+
+
+@triton.jit
 def _paged_decode_fp8_query_group_kernel(
     q_packed_ptr,
     q_packed_u8_ptr,
@@ -1339,6 +1627,7 @@ def sparse_attn_v4_paged_decode_fp8_triton(
     num_stages: int = 2,
     waves_per_eu: int = 1,
     matrix_instr_nonkdim: int = 0,
+    schedule_hint: str = "none",
     reduce_d_chunk: int = 512,
     reduce_num_warps: int = 4,
     bf16_partials: bool = False,
@@ -1347,6 +1636,14 @@ def sparse_attn_v4_paged_decode_fp8_triton(
     use_mxfp8_v: bool = False,
     use_native_bf16_v: bool = False,
     kv_splits: int = 1,
+    split_tiles: int = 0,
+    split_tiles_short: int = 0,
+    split_short_max_tiles: int = 0,
+    split_tiles_mid: int = 0,
+    split_mid_max_tiles: int = 0,
+    packed_query_group: int = 0,
+    packed_uniform_splits: int = 0,
+    sequential_reduce: bool = False,
 ) -> torch.Tensor:
     """Run the experimental single-pass native-2buff FP8 Triton kernel."""
     if q_packed.dtype != dtypes.fp8 or kv_packed.dtype != dtypes.fp8:
@@ -1361,6 +1658,7 @@ def sparse_attn_v4_paged_decode_fp8_triton(
         raise ValueError(f"kv_packed must be [P,{V4_DIM_QK_PACKED}]")
     if kv_rope.shape != (kv_packed.shape[0], V4_DIM_ROPE):
         raise ValueError("kv_rope must be [P,64]")
+    T, H, _ = q_packed.shape
     if block_h not in (8, 16, 32, 64):
         raise ValueError("block_h must be 8, 16, 32, or 64")
     if block_k not in (8, 16, 32, 64):
@@ -1373,25 +1671,56 @@ def sparse_attn_v4_paged_decode_fp8_triton(
         raise ValueError("waves_per_eu must be in [1, 4]")
     if matrix_instr_nonkdim not in (0, 16, 32):
         raise ValueError("matrix_instr_nonkdim must be 0, 16, or 32")
+    if schedule_hint not in (
+        "none",
+        "attention",
+        "memory-bound-attention",
+        "attention,memory-bound-attention",
+    ):
+        raise ValueError("unsupported AMDGPU schedule hint")
     if reduce_d_chunk not in (64, 128, 256, 512):
         raise ValueError("reduce_d_chunk must be 64, 128, 256, or 512")
     if reduce_num_warps not in (1, 2, 4, 8):
         raise ValueError("reduce_num_warps must be 1, 2, 4, or 8")
     if not 1 <= kv_splits <= 16:
         raise ValueError("kv_splits must be in [1, 16]")
+    if split_tiles < 0 or (split_tiles > 0 and kv_splits == 1):
+        raise ValueError("split_tiles must be >= 0 and requires kv_splits > 1")
+    if (split_tiles_short > 0 or split_tiles_mid > 0) and split_tiles == 0:
+        raise ValueError("adaptive split tiers require split_tiles > 0")
+    if split_tiles_short < 0 or split_tiles_mid < 0:
+        raise ValueError("split tile sizes must be >= 0")
+    if split_short_max_tiles < 0 or split_mid_max_tiles < 0:
+        raise ValueError("adaptive split tile thresholds must be ordered")
+    if split_tiles_mid > 0 and split_mid_max_tiles < split_short_max_tiles:
+        raise ValueError("adaptive split tile thresholds must be ordered")
+    if packed_query_group < 0:
+        raise ValueError("packed_query_group must be >= 0")
+    if packed_query_group > 0 and T % packed_query_group != 0:
+        raise ValueError("packed_query_group must divide T")
+    if packed_uniform_splits < 0 or packed_uniform_splits > kv_splits:
+        raise ValueError("packed_uniform_splits must be in [0, kv_splits]")
+    if packed_uniform_splits > 0 and (packed_query_group == 0 or split_tiles == 0):
+        raise ValueError(
+            "packed_uniform_splits requires packed_query_group and split_tiles"
+        )
     if bf16_partials and fp16_partials:
         raise ValueError("at most one reduced-precision partial dtype may be selected")
     if use_native_bf16_v and not use_mxfp8_qk:
         raise ValueError("native BF16 V requires native MXFP8 QK")
-    T, H, _ = q_packed.shape
     if kv_indptr.numel() < T + 1:
         raise ValueError("kv_indptr must contain at least T+1 entries")
+    use_packed_metadata = packed_uniform_splits > 0
     out = torch.empty((T, H, V4_DIM_QK), dtype=torch.bfloat16, device=q_packed.device)
     if kv_splits > 1:
         m_partial = torch.empty(
             (T, kv_splits, H), dtype=torch.float32, device=q_packed.device
         )
-        l_partial = torch.empty_like(m_partial)
+        l_partial = torch.empty(
+            (T, kv_splits + int(use_packed_metadata), H),
+            dtype=torch.float32,
+            device=q_packed.device,
+        )
         acc_partial = torch.empty(
             (T, kv_splits, H, V4_DIM_QK),
             dtype=(
@@ -1406,66 +1735,92 @@ def sparse_attn_v4_paged_decode_fp8_triton(
         m_partial = torch.empty(1, dtype=torch.float32, device=q_packed.device)
         l_partial = m_partial
         acc_partial = m_partial
-    grid = (T, triton.cdiv(H, block_h), kv_splits)
-    _paged_decode_fp8_2buff_fused_kernel[grid](
-        q_packed,
-        q_packed.view(torch.uint8),
-        q_rope,
-        kv_packed,
-        kv_packed.view(torch.uint8),
-        kv_rope,
-        kv_indices,
-        kv_indptr,
-        attn_sink,
-        m_partial,
-        l_partial,
-        acc_partial,
-        out,
-        q_packed.stride(0),
-        q_packed.stride(1),
-        q_rope.stride(0),
-        q_rope.stride(1),
-        kv_packed.stride(0),
-        kv_rope.stride(0),
-        m_partial.stride(0) if kv_splits > 1 else 1,
-        m_partial.stride(1) if kv_splits > 1 else 1,
-        m_partial.stride(2) if kv_splits > 1 else 1,
-        l_partial.stride(0) if kv_splits > 1 else 1,
-        l_partial.stride(1) if kv_splits > 1 else 1,
-        l_partial.stride(2) if kv_splits > 1 else 1,
-        acc_partial.stride(0) if kv_splits > 1 else 1,
-        acc_partial.stride(1) if kv_splits > 1 else 1,
-        acc_partial.stride(2) if kv_splits > 1 else 1,
-        acc_partial.stride(3) if kv_splits > 1 else 1,
-        out.stride(0),
-        out.stride(1),
-        float(softmax_scale) * LOG2E,
-        LOG2E,
-        H=H,
-        BLOCK_H=block_h,
-        BLOCK_K=block_k,
-        BLOCK_D=V4_DIM_QK,
-        NOPE=V4_DIM_NOPE,
-        ROPE=V4_DIM_ROPE,
-        TILE=V4_TILE,
-        NUM_TILES=V4_NUM_TILES,
-        PACK_OFF_SCALE=V4_PACK_OFF_SCALE,
-        PIPE_STAGES=num_stages,
-        USE_MXFP8_QK=use_mxfp8_qk,
-        USE_MXFP8_V=use_mxfp8_v,
-        USE_NATIVE_BF16_V=use_native_bf16_v,
-        KV_SPLITS=kv_splits,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        waves_per_eu=waves_per_eu,
-        matrix_instr_nonkdim=matrix_instr_nonkdim,
+    num_head_blocks = triton.cdiv(H, block_h)
+    num_query_groups = T // packed_query_group if packed_query_group > 0 else 0
+
+    def launch_stage1(stage_grid: tuple[int, ...]) -> None:
+        _paged_decode_fp8_2buff_fused_kernel[stage_grid](
+            q_packed,
+            q_packed.view(torch.uint8),
+            q_rope,
+            kv_packed,
+            kv_packed.view(torch.uint8),
+            kv_rope,
+            kv_indices,
+            kv_indptr,
+            attn_sink,
+            m_partial,
+            l_partial,
+            acc_partial,
+            out,
+            q_packed.stride(0),
+            q_packed.stride(1),
+            q_rope.stride(0),
+            q_rope.stride(1),
+            kv_packed.stride(0),
+            kv_rope.stride(0),
+            m_partial.stride(0) if kv_splits > 1 else 1,
+            m_partial.stride(1) if kv_splits > 1 else 1,
+            m_partial.stride(2) if kv_splits > 1 else 1,
+            l_partial.stride(0) if kv_splits > 1 else 1,
+            l_partial.stride(1) if kv_splits > 1 else 1,
+            l_partial.stride(2) if kv_splits > 1 else 1,
+            acc_partial.stride(0) if kv_splits > 1 else 1,
+            acc_partial.stride(1) if kv_splits > 1 else 1,
+            acc_partial.stride(2) if kv_splits > 1 else 1,
+            acc_partial.stride(3) if kv_splits > 1 else 1,
+            out.stride(0),
+            out.stride(1),
+            float(softmax_scale) * LOG2E,
+            LOG2E,
+            H=H,
+            BLOCK_H=block_h,
+            BLOCK_K=block_k,
+            BLOCK_D=V4_DIM_QK,
+            NOPE=V4_DIM_NOPE,
+            ROPE=V4_DIM_ROPE,
+            TILE=V4_TILE,
+            NUM_TILES=V4_NUM_TILES,
+            PACK_OFF_SCALE=V4_PACK_OFF_SCALE,
+            PIPE_STAGES=num_stages,
+            USE_MXFP8_QK=use_mxfp8_qk,
+            USE_MXFP8_V=use_mxfp8_v,
+            USE_NATIVE_BF16_V=use_native_bf16_v,
+            KV_SPLITS=kv_splits,
+            SPLIT_TILES=split_tiles,
+            SPLIT_TILES_SHORT=split_tiles_short,
+            SPLIT_SHORT_MAX_TILES=split_short_max_tiles,
+            SPLIT_TILES_MID=split_tiles_mid,
+            SPLIT_MID_MAX_TILES=split_mid_max_tiles,
+            PACKED_QUERY_GROUP=packed_query_group,
+            PACKED_UNIFORM_SPLITS=packed_uniform_splits,
+            NUM_QUERY_GROUPS=num_query_groups,
+            NUM_HEAD_BLOCKS=num_head_blocks,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            waves_per_eu=waves_per_eu,
+            matrix_instr_nonkdim=matrix_instr_nonkdim,
+            schedule_hint=schedule_hint,
+        )
+
+    grid = (
+        (T * num_head_blocks * kv_splits,)
+        if packed_query_group > 0
+        else (T, num_head_blocks, kv_splits)
     )
+    launch_stage1(grid)
     if kv_splits > 1:
+        use_unrolled_reduce2 = kv_splits == 2 and split_tiles == 0
+        use_unrolled_reduce3 = kv_splits == 3 and split_tiles == 0
         reduce_grid = (T, H, triton.cdiv(V4_DIM_QK, reduce_d_chunk))
         reduce_kernel = (
             _paged_decode_reduce2_kernel
-            if kv_splits == 2
-            else _paged_decode_reduce_kernel
+            if use_unrolled_reduce2
+            else (
+                _paged_decode_reduce3_kernel
+                if use_unrolled_reduce3
+                else _paged_decode_reduce_kernel
+            )
         )
         reduce_args = (
             m_partial,
@@ -1489,7 +1844,7 @@ def sparse_attn_v4_paged_decode_fp8_triton(
             out.stride(2),
             LOG2E,
         )
-        if kv_splits == 2:
+        if use_unrolled_reduce2 or use_unrolled_reduce3:
             reduce_kernel[reduce_grid](
                 *reduce_args,
                 V4_DIM_QK,
@@ -1506,6 +1861,14 @@ def sparse_attn_v4_paged_decode_fp8_triton(
                 BLOCK_D=V4_DIM_QK,
                 D_CHUNK=reduce_d_chunk,
                 BLOCK_K=block_k,
+                SPLIT_TILES=split_tiles,
+                SPLIT_TILES_SHORT=split_tiles_short,
+                SPLIT_SHORT_MAX_TILES=split_short_max_tiles,
+                SPLIT_TILES_MID=split_tiles_mid,
+                SPLIT_MID_MAX_TILES=split_mid_max_tiles,
+                PACKED_QUERY_GROUP=packed_query_group,
+                PACKED_UNIFORM_SPLITS=packed_uniform_splits,
+                SEQUENTIAL_FALLBACK=sequential_reduce,
                 num_warps=reduce_num_warps,
             )
     return out
@@ -1719,7 +2082,9 @@ def _q7_dp_auto_config(T: int, kv_kind: str) -> tuple[int, int, int]:
     return 64, 4, 1
 
 
-def _q7_dp_csa_auto_config(T: int) -> tuple[int, int, int, int]:
+def _q7_dp_csa_auto_config(
+    T: int, *, gfx950_native_v: bool = False
+) -> tuple[int, int, int, int]:
     """Return (block_k, splits, stages, matrix_nonkdim) for DP q7 CSA.
 
     CSA has a fixed 1152-row gathered working set in the AgentX workload.  A
@@ -1729,6 +2094,12 @@ def _q7_dp_csa_auto_config(T: int) -> tuple[int, int, int, int]:
     scheduler; counts above the measured range use the stable no-split tile.
     """
     requests = T // 7
+    if gfx950_native_v:
+        if requests <= 12:
+            if requests >= 10:
+                return 64, 3, 2, 16
+        else:
+            return 64, 1, 2, 16
     configs = {
         1: (16, 16, 2, 16),
         2: (16, 8, 2, 16),
@@ -1820,6 +2191,7 @@ def sparse_attn_v4_paged_decode_fp8_triton_auto(
     *,
     query_group: int = 1,
     kv_kind: str = "",
+    gfx950_native_v: bool = False,
 ) -> torch.Tensor:
     """Dispatch tuned Triton specializations without falling back to ASM."""
     T, H, _ = q_packed.shape
@@ -1849,7 +2221,11 @@ def sparse_attn_v4_paged_decode_fp8_triton_auto(
     if query_group == 7:
         if H == 128:
             if kv_kind == "csa":
-                block_k, kv_splits, stages, matrix_nonkdim = _q7_dp_csa_auto_config(T)
+                requests = T // query_group
+                block_k, kv_splits, stages, matrix_nonkdim = _q7_dp_csa_auto_config(
+                    T, gfx950_native_v=gfx950_native_v
+                )
+                use_native_v = gfx950_native_v and requests >= 10
                 return sparse_attn_v4_paged_decode_fp8_triton(
                     q_packed,
                     q_rope,
@@ -1866,7 +2242,43 @@ def sparse_attn_v4_paged_decode_fp8_triton_auto(
                     num_warps=4,
                     waves_per_eu=1,
                     matrix_instr_nonkdim=matrix_nonkdim,
+                    schedule_hint="attention" if use_native_v else "none",
                     use_mxfp8_qk=True,
+                    use_native_bf16_v=use_native_v,
+                    reduce_d_chunk=512,
+                    reduce_num_warps=1,
+                    fp16_partials=True,
+                )
+            if kv_kind == "hca" and _ENABLE_NATIVE_BF16_V and T == 6 * 7:
+                # B6 is the heterogeneous AgentX hotspot. Select a per-token
+                # segment size from its GPU-resident kv_len: 7 tiles for <=2K
+                # rows and 9 above. Compact runtime-active
+                # (q, head-block, split) work to the front of the fixed
+                # graph-safe grid, avoiding sparse tail waves without a host
+                # sync. max11 covers the measured 5.9K-row tail; the final
+                # split absorbs any larger input exactly.
+                return sparse_attn_v4_paged_decode_fp8_triton(
+                    q_packed,
+                    q_rope,
+                    kv_packed,
+                    kv_rope,
+                    kv_indices,
+                    kv_indptr,
+                    attn_sink,
+                    softmax_scale,
+                    block_h=64,
+                    block_k=64,
+                    kv_splits=11,
+                    num_stages=2,
+                    num_warps=4,
+                    waves_per_eu=1,
+                    matrix_instr_nonkdim=16,
+                    use_mxfp8_qk=True,
+                    use_native_bf16_v=True,
+                    split_tiles=9,
+                    split_tiles_short=7,
+                    split_short_max_tiles=32,
+                    packed_query_group=query_group,
                     reduce_d_chunk=512,
                     reduce_num_warps=1,
                     fp16_partials=True,
@@ -1893,9 +2305,9 @@ def sparse_attn_v4_paged_decode_fp8_triton_auto(
                     waves_per_eu=1,
                     matrix_instr_nonkdim=matrix_nonkdim,
                     use_mxfp8_qk=True,
-                    # Keep native V opt-in while the gfx950-only instruction
-                    # and low-batch dispatch receive broader coverage.  The
-                    # combined path improves matched C64/C96 AgentX ITL.
+                    # Keep native V opt-in. A matched 900-second C96 run found
+                    # that the combined conversion and low-batch dispatch path
+                    # regressed ITL, despite favorable shorter measurements.
                     use_native_bf16_v=_ENABLE_NATIVE_BF16_V,
                     reduce_d_chunk=512,
                     reduce_num_warps=1,

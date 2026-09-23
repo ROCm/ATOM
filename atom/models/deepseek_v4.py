@@ -3255,6 +3255,9 @@ class DeepseekV4Attention(nn.Module):
                 k_packed=k_packed_full,
                 k_rope=k_rope_full,
                 prefix=f"{self.layer_name}.sparse_attn_prefill",
+                prefix_has_sentinel=(ratio == 4 and get_pcp_world_size() > 1),
+                max_seqlen_q=attn_md.max_seqlen_q,
+                max_seqlen_k=attn_md.max_seqlen_k,
             )  # [S, H, head_dim] bf16
             # swa_write AFTER attn so chunked-prefill prefix SWA reads see the
             # prior chunk's contents (not this chunk's just-computed tail).

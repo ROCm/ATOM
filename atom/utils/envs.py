@@ -486,6 +486,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         in ("1", "true")
     ),
     # --- Attention Backend ---
+    # Master switch for V4 Triton attention implementations.
+    "ATOM_USE_TRITON_ATTN": lambda: os.getenv("ATOM_USE_TRITON_ATTN", "1") == "1",
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.
     "ATOM_USE_UNIFIED_ATTN": lambda: os.getenv("ATOM_USE_UNIFIED_ATTN", "0") == "1",
@@ -498,6 +500,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # so smaller local head counts fall back to OPUS regardless of this flag.
     "ATOM_FORCE_V4_PREFILL_OPUS": lambda: (
         os.getenv("ATOM_FORCE_V4_PREFILL_OPUS", "0") == "1"
+    ),
+    # Experimental gfx950 Triton implementation of DeepSeek-V4 native 2-buffer
+    # FP8 sparse prefill.  Kept opt-in until the long-context matrix is at least
+    # parity with AITER OPUS.  ATOM_USE_TRITON_ATTN remains the master switch.
+    "ATOM_V4_TRITON_FP8_PREFILL": lambda: (
+        os.getenv("ATOM_V4_TRITON_FP8_PREFILL", "0") == "1"
+    ),
+    # Qualified gfx950 H=128 FlyDSL kernels. Decode currently covers the HCA
+    # B6/q7 graph shape; prefill covers sentinel-free max-Q <= 127 and
+    # max-K < 4096. Larger ranges stay on AITER OPUS.
+    "ATOM_V4_FLYDSL_FP8_DECODE": lambda: (
+        os.getenv("ATOM_V4_FLYDSL_FP8_DECODE", "0") == "1"
+    ),
+    "ATOM_V4_FLYDSL_FP8_PREFILL": lambda: (
+        os.getenv("ATOM_V4_FLYDSL_FP8_PREFILL", "0") == "1"
     ),
     # Reuse the gfx1250 H=128 sparse-prefill ASM kernel for DeepSeek-V4 fp8
     # decode. Ineligible shapes keep the dedicated decode ASM path.

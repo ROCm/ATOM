@@ -57,7 +57,8 @@ class Config:
     bf16_partials: bool = False
     fp16_partials: bool = False
     use_mxfp8_qk: bool = True
-    use_mxfp8_v: bool = False
+    use_native_bf16_v: bool = False
+    schedule_hint: str = "none"
 
 
 def _time(
@@ -127,11 +128,26 @@ def main() -> None:
     parser.add_argument(
         "--matrix-instr-nonkdim", type=_parse_matrix_instr_list, default=[0]
     )
+    parser.add_argument(
+        "--schedule-hint",
+        choices=(
+            "none",
+            "attention",
+            "memory-bound-attention",
+            "attention,memory-bound-attention",
+        ),
+        default="none",
+    )
     parser.add_argument("--reduce-d-chunk", type=_parse_int_list, default=[512])
     parser.add_argument("--reduce-num-warps", type=_parse_int_list, default=[4])
     parser.add_argument("--bf16-partials", action="store_true")
     parser.add_argument("--fp16-partials", action="store_true")
     parser.add_argument("--no-mxfp8-qk", action="store_true")
+    parser.add_argument(
+        "--native-bf16-v",
+        action="store_true",
+        help="use the gfx950 native FP8-to-BF16 conversion path for V",
+    )
     parser.add_argument("--two-pass", action="store_true")
     parser.add_argument(
         "--cuda-graph",
@@ -237,6 +253,7 @@ def main() -> None:
                     waves_per_eu=config.waves_per_eu,
                     matrix_instr_nonkdim=config.matrix_instr_nonkdim,
                     use_mxfp8_qk=config.use_mxfp8_qk,
+                    use_native_bf16_v=config.use_native_bf16_v,
                     reduce_d_chunk=config.reduce_d_chunk,
                     reduce_num_warps=config.reduce_num_warps,
                     bf16_partials=config.bf16_partials,
@@ -275,12 +292,13 @@ def main() -> None:
                 num_warps=config.num_warps,
                 waves_per_eu=config.waves_per_eu,
                 matrix_instr_nonkdim=config.matrix_instr_nonkdim,
+                schedule_hint=config.schedule_hint,
                 reduce_d_chunk=config.reduce_d_chunk,
                 reduce_num_warps=config.reduce_num_warps,
                 bf16_partials=config.bf16_partials,
                 fp16_partials=config.fp16_partials,
                 use_mxfp8_qk=config.use_mxfp8_qk,
-                use_mxfp8_v=config.use_mxfp8_v,
+                use_native_bf16_v=config.use_native_bf16_v,
             )
 
         return run
@@ -314,6 +332,8 @@ def main() -> None:
             bf16_partials=args.bf16_partials,
             fp16_partials=args.fp16_partials,
             use_mxfp8_qk=not args.no_mxfp8_qk,
+            use_native_bf16_v=args.native_bf16_v,
+            schedule_hint=args.schedule_hint,
         )
         for values in itertools.product(
             args.block_h,

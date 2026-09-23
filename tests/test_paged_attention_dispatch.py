@@ -17,6 +17,7 @@ bound -- a Triton compile error with nothing in it about speculative length.
 
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -359,6 +360,268 @@ def _call_v4_native_fp8_decode(paged_decode):
     )
 
 
+def _call_v4_native_fp8_prefill(
+    paged_prefill,
+    *,
+    heads=16,
+    tokens=4,
+    prefix_has_sentinel=False,
+    max_seqlen_q=127,
+    max_seqlen_k=1151,
+):
+    marker = object()
+    packed = SimpleNamespace(
+        shape=(tokens, heads, 512),
+        view=lambda *_shape: marker,
+    )
+    return paged_prefill.sparse_attn_v4_paged_prefill(
+        None,
+        marker,
+        marker,
+        marker,
+        None,
+        marker,
+        marker,
+        marker,
+        1.0,
+        unified_kv_rope=marker,
+        q_packed=packed,
+        q_rope=marker,
+        k_packed=packed,
+        k_rope=packed,
+        prefix_has_sentinel=prefix_has_sentinel,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+    )
+
+
+class TestV4NativeFp8PrefillRouting:
+    def _patch_backends(self, monkeypatch, arch="gfx950"):
+        from atom.model_ops.v4_kernels import paged_prefill, paged_prefill_fp8_triton
+
+        monkeypatch.setattr(paged_prefill, "get_gfx_runtime", lambda: arch)
+        monkeypatch.setattr(paged_prefill, "_HAS_PREFILL_ASM", False)
+        monkeypatch.setattr(
+            paged_prefill,
+            "pa_sparse_prefill_fp8_opus",
+            lambda *args, **kwargs: "opus",
+        )
+        monkeypatch.setattr(
+            paged_prefill_fp8_triton,
+            "sparse_attn_v4_paged_prefill_fp8_triton",
+            lambda *args, **kwargs: "triton",
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "atom.model_ops.v4_kernels.paged_prefill_fp8_flydsl",
+            SimpleNamespace(
+                sparse_attn_v4_paged_prefill_fp8_flydsl=(
+                    lambda *args, **kwargs: "flydsl"
+                )
+            ),
+        )
+        return paged_prefill
+
+    def test_qualified_short_context_routes_to_flydsl(self, monkeypatch):
+        paged_prefill = self._patch_backends(monkeypatch)
+        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
+        monkeypatch.setenv("ATOM_V4_FLYDSL_FP8_PREFILL", "1")
+        monkeypatch.setenv("ATOM_V4_TRITON_FP8_PREFILL", "1")
+        monkeypatch.delenv("ATOM_FORCE_V4_PREFILL_OPUS", raising=False)
+        assert (
+            _call_v4_native_fp8_prefill(
+                paged_prefill,
+                heads=128,
+                tokens=2048,
+                max_seqlen_q=127,
+                max_seqlen_k=1278,
+            )
+            == "flydsl"
+        )
+
+    @pytest.mark.parametrize(
+        "max_seqlen_q,max_seqlen_k",
+        [(128, 1278), (127, 4096)],
+    )
+    def test_unmeasured_prefill_ranges_stay_on_opus(
+        self, monkeypatch, max_seqlen_q, max_seqlen_k
+    ):
+        paged_prefill = self._patch_backends(monkeypatch)
+        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
+        monkeypatch.setenv("ATOM_V4_FLYDSL_FP8_PREFILL", "1")
+        monkeypatch.setenv("ATOM_V4_TRITON_FP8_PREFILL", "1")
+        monkeypatch.delenv("ATOM_FORCE_V4_PREFILL_OPUS", raising=False)
+        assert (
+            _call_v4_native_fp8_prefill(
+                paged_prefill,
+                heads=128,
+                tokens=2048,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+            )
+            == "opus"
+        )
+
+    def test_p8192_crossover_stays_on_opus(self, monkeypatch):
+        paged_prefill = self._patch_backends(monkeypatch)
+        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
+        monkeypatch.setenv("ATOM_V4_FLYDSL_FP8_PREFILL", "1")
+        monkeypatch.setenv("ATOM_V4_TRITON_FP8_PREFILL", "1")
+        monkeypatch.delenv("ATOM_FORCE_V4_PREFILL_OPUS", raising=False)
+        assert (
+            _call_v4_native_fp8_prefill(
+                paged_prefill,
+                heads=128,
+                tokens=2048,
+                max_seqlen_k=8192,
+            )
+            == "opus"
+        )
+
+    def test_flydsl_prefill_rejects_sentinel_prefix(self, monkeypatch):
+        paged_prefill = self._patch_backends(monkeypatch)
+        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
+        monkeypatch.setenv("ATOM_V4_FLYDSL_FP8_PREFILL", "1")
+        monkeypatch.delenv("ATOM_V4_TRITON_FP8_PREFILL", raising=False)
+        monkeypatch.delenv("ATOM_FORCE_V4_PREFILL_OPUS", raising=False)
+        assert (
+            _call_v4_native_fp8_prefill(
+                paged_prefill,
+                heads=128,
+                prefix_has_sentinel=True,
+            )
+            == "opus"
+        )
+
+    def test_explicit_candidate_routes_gfx950_fp8_prefill_to_triton(self, monkeypatch):
+        paged_prefill = self._patch_backends(monkeypatch)
+        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
+        monkeypatch.setenv("ATOM_V4_TRITON_FP8_PREFILL", "1")
+        monkeypatch.delenv("ATOM_FORCE_V4_PREFILL_OPUS", raising=False)
+        assert _call_v4_native_fp8_prefill(paged_prefill) == "triton"
+
+    @pytest.mark.parametrize(
+        "prefix_has_sentinel,expected_hot_loop",
+        [(False, True), (True, False)],
+    )
+    def test_large_head_candidate_uses_low_token_prefill_schedule(
+        self, monkeypatch, prefix_has_sentinel, expected_hot_loop
+    ):
+        paged_prefill = self._patch_backends(monkeypatch)
+        from atom.model_ops.v4_kernels import paged_prefill_fp8_triton
+
+        captured = {}
+
+        def candidate(*args, **kwargs):
+            captured.update(kwargs)
+            return "triton"
+
+        monkeypatch.setattr(
+            paged_prefill_fp8_triton,
+            "sparse_attn_v4_paged_prefill_fp8_triton",
+            candidate,
+        )
+        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
+        monkeypatch.setenv("ATOM_V4_TRITON_FP8_PREFILL", "1")
+        monkeypatch.delenv("ATOM_FORCE_V4_PREFILL_OPUS", raising=False)
+
+        assert (
+            _call_v4_native_fp8_prefill(
+                paged_prefill,
+                heads=128,
+                prefix_has_sentinel=prefix_has_sentinel,
+            )
+            == "triton"
+        )
+        assert captured["block_h"] == 64
+        assert captured["block_k"] == 32
+        assert captured["num_warps"] == 4
+        assert captured["waves_per_eu"] == 0
+        assert captured["tail_block_k"] == 32
+        assert captured["full_bf16_v"] is True
+        assert captured["no_sentinel_hot_loop"] is expected_hot_loop
+        assert captured["compiled_launch"] is True
+
+    def test_large_head_candidate_uses_large_token_prefill_schedule(self, monkeypatch):
+        paged_prefill = self._patch_backends(monkeypatch)
+        from atom.model_ops.v4_kernels import paged_prefill_fp8_triton
+
+        captured = {}
+
+        def candidate(*args, **kwargs):
+            captured.update(kwargs)
+            return "triton"
+
+        monkeypatch.setattr(
+            paged_prefill_fp8_triton,
+            "sparse_attn_v4_paged_prefill_fp8_triton",
+            candidate,
+        )
+        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
+        monkeypatch.setenv("ATOM_V4_TRITON_FP8_PREFILL", "1")
+        monkeypatch.delenv("ATOM_FORCE_V4_PREFILL_OPUS", raising=False)
+
+        assert (
+            _call_v4_native_fp8_prefill(paged_prefill, heads=128, tokens=256)
+            == "triton"
+        )
+        assert captured["block_h"] == 32
+        assert captured["block_k"] == 32
+        assert captured["num_warps"] == 2
+        assert captured["num_stages"] == 3
+        assert captured["extend_num_stages"] is None
+        assert captured["waves_per_eu"] == 0
+        assert captured["tail_block_k"] == 32
+        assert captured["full_bf16_v"] is True
+        assert captured["head_first_grid"] is False
+        assert captured["grid_group_tokens"] == 8
+        assert captured["compiled_launch"] is True
+
+    def test_very_large_token_candidate_uses_shallow_extend_pipeline(self, monkeypatch):
+        paged_prefill = self._patch_backends(monkeypatch)
+        from atom.model_ops.v4_kernels import paged_prefill_fp8_triton
+
+        captured = {}
+
+        def candidate(*args, **kwargs):
+            captured.update(kwargs)
+            return "triton"
+
+        monkeypatch.setattr(
+            paged_prefill_fp8_triton,
+            "sparse_attn_v4_paged_prefill_fp8_triton",
+            candidate,
+        )
+        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
+        monkeypatch.setenv("ATOM_V4_TRITON_FP8_PREFILL", "1")
+        monkeypatch.delenv("ATOM_FORCE_V4_PREFILL_OPUS", raising=False)
+
+        assert (
+            _call_v4_native_fp8_prefill(paged_prefill, heads=128, tokens=1024)
+            == "triton"
+        )
+        assert captured["num_stages"] == 3
+        assert captured["extend_num_stages"] == 1
+
+    @pytest.mark.parametrize(
+        "master,candidate,force_opus,arch",
+        [
+            ("1", "0", "0", "gfx950"),
+            ("0", "1", "0", "gfx950"),
+            ("1", "1", "1", "gfx950"),
+            ("1", "1", "0", "gfx1250"),
+        ],
+    )
+    def test_unqualified_fp8_prefill_keeps_aiter(
+        self, monkeypatch, master, candidate, force_opus, arch
+    ):
+        paged_prefill = self._patch_backends(monkeypatch, arch=arch)
+        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", master)
+        monkeypatch.setenv("ATOM_V4_TRITON_FP8_PREFILL", candidate)
+        monkeypatch.setenv("ATOM_FORCE_V4_PREFILL_OPUS", force_opus)
+        assert _call_v4_native_fp8_prefill(paged_prefill) == "opus"
+
+
 class TestV4NativeFp8Routing:
     @pytest.mark.parametrize(
         "min_q,max_q,expected",
@@ -381,6 +644,7 @@ class TestV4NativeFp8Routing:
         from atom.model_ops.v4_kernels import paged_decode, paged_decode_fp8_triton
 
         monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
+        monkeypatch.setenv("ATOM_V4_TRITON_HYBRID_DECODE", "0")
         monkeypatch.setattr(
             paged_decode_fp8_triton,
             "sparse_attn_v4_paged_decode_fp8_triton_auto",
@@ -408,6 +672,208 @@ class TestV4NativeFp8Routing:
             lambda *args, **kwargs: "aiter",
         )
         assert _call_v4_native_fp8_decode(paged_decode) == "aiter"
+
+    @pytest.mark.parametrize(
+        "tokens,heads,query_group,kv_kind,expected",
+        [
+            (7, 128, 7, "hca", "aiter"),
+            (63, 128, 7, "csa", "triton"),
+            (70, 128, 7, "csa", "triton"),
+            (84, 16, 7, "dspark", "triton"),
+            (64, 16, 4, "hca", "triton"),
+        ],
+    )
+    def test_hybrid_routes_only_measured_winners(
+        self,
+        monkeypatch,
+        tokens,
+        heads,
+        query_group,
+        kv_kind,
+        expected,
+    ):
+        from atom.model_ops.v4_kernels import paged_decode, paged_decode_fp8_triton
+
+        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
+        monkeypatch.setenv("ATOM_V4_TRITON_HYBRID_DECODE", "1")
+        monkeypatch.delenv("ATOM_V4_TRITON_NATIVE_BF16_V", raising=False)
+        monkeypatch.setattr(paged_decode, "_device_arch", lambda _index: "gfx950")
+        monkeypatch.setattr(
+            paged_decode_fp8_triton,
+            "sparse_attn_v4_paged_decode_fp8_triton_auto",
+            lambda *args, **kwargs: "triton",
+        )
+        monkeypatch.setattr(
+            paged_decode,
+            "_sparse_attn_v4_paged_decode_asm",
+            lambda *args, **kwargs: "aiter",
+        )
+        marker = object()
+        q_packed = SimpleNamespace(
+            shape=(tokens, heads, 512), device=SimpleNamespace(index=0)
+        )
+        result = paged_decode.sparse_attn_v4_paged_decode(
+            None,
+            marker,
+            marker,
+            marker,
+            marker,
+            1.0,
+            unified_kv_rope=marker,
+            q_packed_in=q_packed,
+            q_rope_in=marker,
+            qo_indptr=marker,
+            query_group=query_group,
+            kv_kind=kv_kind,
+        )
+        assert result == expected
+
+    def test_hybrid_routes_native_b6_hca_to_triton(self, monkeypatch):
+        from atom.model_ops.v4_kernels import paged_decode, paged_decode_fp8_triton
+
+        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
+        monkeypatch.setenv("ATOM_V4_TRITON_HYBRID_DECODE", "1")
+        monkeypatch.setenv("ATOM_V4_TRITON_NATIVE_BF16_V", "1")
+        monkeypatch.setattr(paged_decode, "_device_arch", lambda _index: "gfx950")
+        monkeypatch.setattr(
+            paged_decode_fp8_triton,
+            "sparse_attn_v4_paged_decode_fp8_triton_auto",
+            lambda *args, **kwargs: "triton",
+        )
+        monkeypatch.setattr(
+            paged_decode,
+            "_sparse_attn_v4_paged_decode_asm",
+            lambda *args, **kwargs: "aiter",
+        )
+        marker = object()
+        q_packed = SimpleNamespace(
+            shape=(6 * 7, 128, 512), device=SimpleNamespace(index=0)
+        )
+        result = paged_decode.sparse_attn_v4_paged_decode(
+            None,
+            marker,
+            marker,
+            marker,
+            marker,
+            1.0,
+            unified_kv_rope=marker,
+            q_packed_in=q_packed,
+            q_rope_in=marker,
+            qo_indptr=marker,
+            query_group=7,
+            kv_kind="hca",
+        )
+        assert result == "triton"
+
+    def test_opt_in_b6_hca_routes_to_graphsafe_flydsl(self, monkeypatch):
+        from atom.model_ops.v4_kernels import paged_decode
+
+        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
+        monkeypatch.setenv("ATOM_V4_FLYDSL_FP8_DECODE", "1")
+        monkeypatch.setenv("ATOM_V4_TRITON_HYBRID_DECODE", "1")
+        monkeypatch.setattr(paged_decode, "_device_arch", lambda _index: "gfx950")
+        monkeypatch.setitem(
+            sys.modules,
+            "atom.model_ops.v4_kernels.paged_decode_fp8_flydsl",
+            SimpleNamespace(
+                sparse_attn_v4_paged_decode_fp8_flydsl_graphsafe=(
+                    lambda *args, **kwargs: "flydsl"
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            paged_decode,
+            "_sparse_attn_v4_paged_decode_asm",
+            lambda *args, **kwargs: "aiter",
+        )
+        marker = object()
+        q_packed = SimpleNamespace(
+            shape=(6 * 7, 128, 512), device=SimpleNamespace(index=0)
+        )
+        result = paged_decode.sparse_attn_v4_paged_decode(
+            None,
+            marker,
+            marker,
+            marker,
+            marker,
+            1.0,
+            unified_kv_rope=marker,
+            q_packed_in=q_packed,
+            q_rope_in=marker,
+            qo_indptr=marker,
+            empty_kv_indptr=marker,
+            query_group=7,
+            kv_kind="hca",
+        )
+        assert result == "flydsl"
+
+    def test_flydsl_decode_master_zero_keeps_aiter(self, monkeypatch):
+        from atom.model_ops.v4_kernels import paged_decode
+
+        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "0")
+        monkeypatch.setenv("ATOM_V4_FLYDSL_FP8_DECODE", "1")
+        monkeypatch.setattr(paged_decode, "_device_arch", lambda _index: "gfx950")
+        monkeypatch.setattr(
+            paged_decode,
+            "_sparse_attn_v4_paged_decode_asm",
+            lambda *args, **kwargs: "aiter",
+        )
+        marker = object()
+        q_packed = SimpleNamespace(
+            shape=(6 * 7, 128, 512), device=SimpleNamespace(index=0)
+        )
+        result = paged_decode.sparse_attn_v4_paged_decode(
+            None,
+            marker,
+            marker,
+            marker,
+            marker,
+            1.0,
+            unified_kv_rope=marker,
+            q_packed_in=q_packed,
+            q_rope_in=marker,
+            qo_indptr=marker,
+            empty_kv_indptr=marker,
+            query_group=7,
+            kv_kind="hca",
+        )
+        assert result == "aiter"
+
+    def test_default_hybrid_does_not_route_other_architectures_to_aiter(
+        self, monkeypatch
+    ):
+        from atom.model_ops.v4_kernels import paged_decode, paged_decode_fp8_triton
+
+        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
+        monkeypatch.delenv("ATOM_V4_TRITON_HYBRID_DECODE", raising=False)
+        monkeypatch.setattr(paged_decode, "_device_arch", lambda _index: "gfx1250")
+        monkeypatch.setattr(
+            paged_decode_fp8_triton,
+            "sparse_attn_v4_paged_decode_fp8_triton_auto",
+            lambda *args, **kwargs: "triton",
+        )
+        monkeypatch.setattr(
+            paged_decode,
+            "_sparse_attn_v4_paged_decode_asm",
+            lambda *args, **kwargs: "aiter",
+        )
+        marker = object()
+        q_packed = SimpleNamespace(shape=(7, 128, 512), device=SimpleNamespace(index=0))
+        result = paged_decode.sparse_attn_v4_paged_decode(
+            None,
+            marker,
+            marker,
+            marker,
+            marker,
+            1.0,
+            unified_kv_rope=marker,
+            q_packed_in=q_packed,
+            q_rope_in=marker,
+            qo_indptr=marker,
+            query_group=7,
+            kv_kind="hca",
+        )
+        assert result == "triton"
 
     @pytest.mark.parametrize("query_group", [1, 2, 3])
     def test_only_supported_query_groups_use_query_fusion(
@@ -795,6 +1261,99 @@ class TestV4NativeFp8Routing:
         assert calls[0]["use_native_bf16_v"] is True
 
     @pytest.mark.parametrize(
+        "packed_uniform_splits,packed_query_group,split_tiles,error",
+        [
+            (-1, 7, 1, r"packed_uniform_splits must be in \[0, kv_splits\]"),
+            (5, 7, 1, r"packed_uniform_splits must be in \[0, kv_splits\]"),
+            (3, 0, 1, "requires packed_query_group and split_tiles"),
+            (3, 7, 0, "requires packed_query_group and split_tiles"),
+        ],
+    )
+    def test_packed_uniform_split_validation(
+        self,
+        packed_uniform_splits,
+        packed_query_group,
+        split_tiles,
+        error,
+    ):
+        from atom.model_ops.v4_kernels import paged_decode_fp8_triton as fp8
+
+        q_packed = SimpleNamespace(
+            dtype=fp8.dtypes.fp8,
+            shape=(7, 128, 512),
+            dim=lambda: 3,
+        )
+        q_rope = SimpleNamespace(dtype=fp8.torch.bfloat16, shape=(7, 128, 64))
+        kv_packed = SimpleNamespace(
+            dtype=fp8.dtypes.fp8,
+            shape=(16, 512),
+            dim=lambda: 2,
+        )
+        kv_rope = SimpleNamespace(dtype=fp8.torch.bfloat16, shape=(16, 64))
+
+        with pytest.raises(ValueError, match=error):
+            fp8.sparse_attn_v4_paged_decode_fp8_triton(
+                q_packed,
+                q_rope,
+                kv_packed,
+                kv_rope,
+                object(),
+                object(),
+                object(),
+                1.0,
+                kv_splits=4,
+                split_tiles=split_tiles,
+                packed_query_group=packed_query_group,
+                packed_uniform_splits=packed_uniform_splits,
+            )
+
+    def test_q7_dp_hca_native_bf16_v_b6_uses_packed_adaptive_split(self, monkeypatch):
+        from atom.model_ops.v4_kernels import paged_decode_fp8_triton as fp8
+
+        calls = []
+        monkeypatch.setattr(fp8, "_ENABLE_NATIVE_BF16_V", True)
+        monkeypatch.setattr(
+            fp8,
+            "sparse_attn_v4_paged_decode_fp8_triton",
+            lambda *args, **kwargs: calls.append(kwargs) or "regular",
+        )
+        q = SimpleNamespace(shape=(6 * 7, 128, 512))
+        result = fp8.sparse_attn_v4_paged_decode_fp8_triton_auto(
+            q,
+            object(),
+            object(),
+            object(),
+            object(),
+            object(),
+            object(),
+            1.0,
+            query_group=7,
+            kv_kind="hca",
+        )
+
+        assert result == "regular"
+        assert calls == [
+            {
+                "block_h": 64,
+                "block_k": 64,
+                "kv_splits": 11,
+                "num_stages": 2,
+                "num_warps": 4,
+                "waves_per_eu": 1,
+                "matrix_instr_nonkdim": 16,
+                "use_mxfp8_qk": True,
+                "use_native_bf16_v": True,
+                "split_tiles": 9,
+                "split_tiles_short": 7,
+                "split_short_max_tiles": 32,
+                "packed_query_group": 7,
+                "reduce_d_chunk": 512,
+                "reduce_num_warps": 1,
+                "fp16_partials": True,
+            }
+        ]
+
+    @pytest.mark.parametrize(
         "requests,expected",
         [
             (1, (16, 16, 2, 16)),
@@ -806,12 +1365,12 @@ class TestV4NativeFp8Routing:
             (7, (32, 2, 3, 16)),
             (8, (32, 2, 3, 16)),
             (9, (32, 2, 3, 16)),
-            (10, (32, 3, 2, 16)),
-            (11, (32, 3, 2, 16)),
-            (12, (32, 3, 2, 16)),
-            (13, (32, 4, 2, 16)),
-            (14, (32, 1, 2, 16)),
-            (16, (32, 1, 2, 16)),
+            (10, (64, 3, 2, 16)),
+            (11, (64, 3, 2, 16)),
+            (12, (64, 3, 2, 16)),
+            (13, (64, 1, 2, 16)),
+            (14, (64, 1, 2, 16)),
+            (16, (64, 1, 2, 16)),
         ],
     )
     def test_q7_dp_csa_uses_qh64_tuned_dispatch(self, monkeypatch, requests, expected):
@@ -842,6 +1401,7 @@ class TestV4NativeFp8Routing:
             1.0,
             query_group=7,
             kv_kind="csa",
+            gfx950_native_v=True,
         )
         assert result == "regular"
         _, kwargs = calls[0]
@@ -852,6 +1412,8 @@ class TestV4NativeFp8Routing:
         assert kwargs["num_stages"] == stages
         assert kwargs["matrix_instr_nonkdim"] == matrix_nonkdim
         assert kwargs["use_mxfp8_qk"] is True
+        assert kwargs["use_native_bf16_v"] is (requests >= 10)
+        assert kwargs["schedule_hint"] == ("attention" if requests >= 10 else "none")
         assert kwargs["fp16_partials"] is True
 
     def test_c16_csa_uses_tuned_q4_split16(self, monkeypatch):

@@ -55,10 +55,14 @@ from atom.utils import envs
 from atom.utils.decorators import mark_trace
 
 try:
-    from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_opus
+    from aiter.ops.pa_sparse_prefill_opus import (
+        pa_sparse_prefill_fp8_opus,
+        pa_sparse_prefill_opus,
+    )
 
     _HAS_OPUS = True
 except ImportError:
+    pa_sparse_prefill_fp8_opus = None
     pa_sparse_prefill_opus = None
     _HAS_OPUS = False
 
@@ -83,6 +87,41 @@ _BLOCK_K = 32
 _NUM_WARPS = 4
 _NUM_STAGES = 1
 _WAVES_PER_EU = 2
+
+
+def _use_triton_native_fp8_prefill() -> bool:
+    """Whether the experimental gfx950 native-FP8 prefill path is enabled."""
+    return (
+        envs.ATOM_USE_TRITON_ATTN
+        and envs.ATOM_V4_TRITON_FP8_PREFILL
+        and not envs.ATOM_FORCE_V4_PREFILL_OPUS
+        and get_gfx_runtime() == "gfx950"
+    )
+
+
+def _use_flydsl_native_fp8_prefill(
+    q_packed: torch.Tensor,
+    *,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    prefix_has_sentinel: bool,
+) -> bool:
+    """Select the qualified gfx950 H128 FlyDSL sparse-prefill kernel.
+
+    V4 prefill is eager, so both sequence bounds are scheduler-owned CPU
+    values rather than device readbacks. FlyDSL wins for short extend tails
+    through E127 and contexts below 4096; larger ranges stay on AITER OPUS.
+    """
+    return (
+        envs.ATOM_USE_TRITON_ATTN
+        and envs.ATOM_V4_FLYDSL_FP8_PREFILL
+        and not envs.ATOM_FORCE_V4_PREFILL_OPUS
+        and get_gfx_runtime() == "gfx950"
+        and q_packed.shape[1] == 128
+        and not prefix_has_sentinel
+        and 0 < max_seqlen_q <= 127
+        and 0 < max_seqlen_k < 4096
+    )
 
 
 @triton.jit
@@ -606,16 +645,21 @@ def sparse_attn_v4_paged_prefill(
     k_packed: torch.Tensor | None = None,
     k_rope: torch.Tensor | None = None,
     prefix: str = "",
+    prefix_has_sentinel: bool = False,
+    max_seqlen_q: int = 0,
+    max_seqlen_k: int = 0,
 ) -> torch.Tensor:
     """V4 prefill sparse attention over two KV sources (paged unified_kv +
     flat per-fwd kv), dispatching on the kv-cache layout.
 
-    Native 2buff fp8 (``unified_kv_rope`` provided): routes to aiter's
-    ``pa_sparse_prefill_fp8_opus`` (op4). ``unified_kv`` is the packed fp8 NoPE
-    prefix pool and ``unified_kv_rope`` the bf16 RoPE prefix pool; the
+    Native 2buff fp8 (``unified_kv_rope`` provided): routes to the experimental
+    gfx950 Triton kernel when ``ATOM_V4_TRITON_FP8_PREFILL=1``; otherwise it
+    uses aiter's ``pa_sparse_prefill_fp8_opus`` (op4), with the existing gfx1250
+    H=128 ASM specialization ahead of OPUS. ``unified_kv`` is the packed fp8
+    NoPE prefix pool and ``unified_kv_rope`` the bf16 RoPE prefix pool; the
     op-quantized fp8 Q (``q_packed`` / ``q_rope``) and extend K
-    (``k_packed`` / ``k_rope``) are fed directly, no dequant of the prefix and no
-    torch quant. gfx950/gfx1250.
+    (``k_packed`` / ``k_rope``) are fed directly, without materialising a BF16
+    prefix tensor.
 
     Otherwise (bf16): the existing OPUS / Triton / reference path over ``q`` and
     the bf16 extend ``kv``.
@@ -641,6 +685,14 @@ def sparse_attn_v4_paged_prefill(
       q_packed / q_rope: fp8 2buff Q ([T, H, 512] fp8 / [T, H, 64] bf16).
       k_packed / k_rope: fp8 2buff extend K ([T, 512] fp8 / [T, 64] bf16, or the
         [T, 1, *] views produced by the quant kernel — flattened here).
+      prefix_has_sentinel: whether the prefix CSR can contain -1 entries. The
+        native Triton path keeps its masked fallback when true; otherwise it
+        uses the faster sentinel-free full-tile main loop plus one tail tile.
+      max_seqlen_q: scheduler-known maximum extend length for this eager
+        prefill. FlyDSL is selected only through the measured E127 band.
+      max_seqlen_k: scheduler-known maximum context length for this eager
+        prefill. Used only for the conservative FlyDSL/OPUS crossover; no
+        device-to-host synchronization is performed.
 
     Returns:
       out: [T, H, D] bf16.
@@ -648,8 +700,6 @@ def sparse_attn_v4_paged_prefill(
     if unified_kv_rope is not None:
         # Native fp8 prefill (op4): 2buff fp8 prefix pool + op-quantized fp8 Q
         # and extend K fed directly. No dequant of the prefix, no torch quant.
-        from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_fp8_opus
-
         # aiter's asm kernel is signature-compatible with the OPUS one, so the
         # argument list below is shared. It is gfx1250-only and hard-requires
         # H == 128 (one workgroup serves one query token x all heads), which a
@@ -668,6 +718,77 @@ def sparse_attn_v4_paged_prefill(
             attn_sink,
             softmax_scale,
         )
+        if _use_flydsl_native_fp8_prefill(
+            q_packed,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            prefix_has_sentinel=prefix_has_sentinel,
+        ):
+            from atom.model_ops.v4_kernels.paged_prefill_fp8_flydsl import (
+                sparse_attn_v4_paged_prefill_fp8_flydsl,
+            )
+
+            return sparse_attn_v4_paged_prefill_fp8_flydsl(
+                *args,
+                out=out,
+                waves_per_eu=1,
+                pipeline_two=True,
+                wave_padded_k=True,
+                alpha_bpermute=True,
+                lds_padding=4,
+                fixed_softmax_ref=True,
+                transpose_v=True,
+                reuse_q_across_n=True,
+                no_sentinel=True,
+                full_tile_fastpath=True,
+                cache_all_q=True,
+                permute_k_scales=True,
+                pairwise_pv=True,
+                dynamic_full_prefix=True,
+            )
+        if envs.ATOM_V4_FLYDSL_FP8_PREFILL and _HAS_OPUS:
+            return pa_sparse_prefill_fp8_opus(*args, out=out)
+        if _use_triton_native_fp8_prefill():
+            from atom.model_ops.v4_kernels.paged_prefill_fp8_triton import (
+                sparse_attn_v4_paged_prefill_fp8_triton,
+            )
+
+            large_head_schedule = q_packed.shape[1] > 32
+            large_token_schedule = large_head_schedule and q_packed.shape[0] >= 256
+            shallow_extend_schedule = large_token_schedule and q_packed.shape[0] >= 1024
+            # For the BH32 long-token kernel, stage 3 overlaps the repeated
+            # FP8->BF16 prefix V stream materially better than stage 2.  The
+            # extend span is short, so stage 1 avoids over-pipelining it.
+            # Keeping each head block within an eight-token grid group also
+            # improves cache reuse without serialising all four head CTAs for
+            # one token.
+            grouped_grid = large_token_schedule and q_packed.shape[0] % 8 == 0
+            return sparse_attn_v4_paged_prefill_fp8_triton(
+                *args,
+                out=out,
+                block_h=(
+                    (32 if large_token_schedule else 64)
+                    if large_head_schedule
+                    else None
+                ),
+                block_k=32 if large_head_schedule else None,
+                num_warps=(
+                    (2 if large_token_schedule else 4) if large_head_schedule else None
+                ),
+                num_stages=(
+                    (3 if large_token_schedule else 2) if large_head_schedule else None
+                ),
+                extend_num_stages=1 if shallow_extend_schedule else None,
+                waves_per_eu=0 if large_head_schedule else None,
+                matrix_instr_nonkdim=16 if large_head_schedule else None,
+                schedule_hint="attention" if large_head_schedule else None,
+                no_sentinel_hot_loop=(large_head_schedule and not prefix_has_sentinel),
+                tail_block_k=32,
+                full_bf16_v=large_head_schedule,
+                head_first_grid=False,
+                grid_group_tokens=8 if grouped_grid else 0,
+                compiled_launch=True,
+            )
         if (
             _HAS_PREFILL_ASM
             and not envs.ATOM_FORCE_V4_PREFILL_OPUS
@@ -681,7 +802,7 @@ def sparse_attn_v4_paged_prefill(
                 # OPUS covers configurations it cannot serve.
                 pass
 
-        return pa_sparse_prefill_fp8_opus(*args)  # [S, H, head_dim] bf16
+        return pa_sparse_prefill_fp8_opus(*args, out=out)  # [S, H, head_dim] bf16
     # Backend selection: prefer OPUS when available; fall back to Triton on
     # import failure, env override, or runtime error (e.g. unsupported GPU).
     # OPUS covers both archs: gfx950 from source, gfx1250 from a prebuilt code
