@@ -188,6 +188,30 @@ def test_index_cache_follows_the_layer_that_owns_it():
     assert set(per_group[1]) == {"model.layers.1.kda"}
 
 
+def test_glm_indexer_follows_its_attention_layer_across_groups():
+    """GLM registers ``<p>.indexer.k_cache``, not ``<layer>.index_cache``.
+
+    Stripping only the M3 suffix leaves the GLM entry unmapped. On a
+    multi-group model that is either a boot failure or, if the entry were
+    guessed into a group, the indexer bytes stored under the wrong layer.
+    """
+    attn = "model.layers.0.self_attn.attn"
+    indexer = "model.layers.0.self_attn.indexer.k_cache"
+    kda = "model.layers.1.kda"
+    caches = {
+        attn: torch.zeros(4, 8),
+        indexer: torch.zeros(4, 132),
+        kda: torch.zeros(3, 8),
+    }
+    groups = [FakeGroup([attn]), FakeGroup([kda])]
+
+    per_group = split_kv_caches_by_group(caches, groups)
+
+    assert indexer in per_group[0]
+    assert attn in per_group[0]
+    assert set(per_group[1]) == {kda}
+
+
 def test_layer_belonging_to_no_group_is_an_error_not_a_guess():
     caches = {
         "model.layers.0.attn": torch.zeros(4, 8),

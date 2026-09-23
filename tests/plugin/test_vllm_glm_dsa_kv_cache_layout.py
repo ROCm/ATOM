@@ -89,15 +89,35 @@ def _indexer(nb: int = NB) -> torch.Tensor:
     return torch.zeros((nb, BS, IDX_DIM), dtype=torch.uint8)
 
 
+# GLM-5.3-MXFP4 ``indexer_types``: the first three layers are ``full``, then
+# one ``full`` every ``index_topk_freq`` (4) layers starting at layer 6.
+# That is 21 full indexers. The other 57 layers are ``shared`` and register
+# no indexer tensor. A fixture that puts the 21 indexers on layers 0..20
+# still folds by name, so it would not catch a mapping that assumed the
+# indexers were a contiguous prefix.
+GLM53_FULL_INDEXER_LAYERS = (0, 1, 2, *range(6, TOTAL_LAYERS, 4))
+
+
 def _glm_dsa_registration(
-    layers: int = TOTAL_LAYERS, indexers: int = INDEXER_LAYERS
+    layers: int = TOTAL_LAYERS,
+    indexers: int = INDEXER_LAYERS,
+    indexer_layers: tuple[int, ...] | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Every ``layers`` gets an MLA cache; the first ``indexers`` also own a DSA
-    indexer, which is how IndexShare presents itself to the connector."""
+    """Every ``layers`` gets an MLA cache.
+
+    Indexers land on ``indexer_layers`` when given, otherwise on the first
+    ``indexers`` layers. The contiguous prefix is the small fixture; the
+    checkpoint's own layer ids are ``GLM53_FULL_INDEXER_LAYERS``.
+    """
+    owned = (
+        set(indexer_layers)
+        if indexer_layers is not None
+        else set(range(indexers))
+    )
     kv: dict[str, torch.Tensor] = {}
     for i in range(layers):
         kv[f"model.layers.{i}.self_attn.attn"] = _mla()
-        if i < indexers:
+        if i in owned:
             kv[f"model.layers.{i}.self_attn.indexer.k_cache"] = _indexer()
     return kv
 
@@ -142,6 +162,121 @@ def test_index_cache_lands_on_its_own_layer_not_a_neighbour():
     tensors = build_kv_cache_tensors(kv)
 
     assert [int(t.index_cache.flatten()[0]) for t in tensors] == [1, 2, 3, 4]
+
+
+def test_checkpoint_indexer_layers_are_not_a_contiguous_prefix():
+    """The shipped ``indexer_types`` array, not ``range(21)``.
+
+    Layers 3, 4 and 5 are ``shared``. Folding those bytes onto layer 0's
+    neighbour would still produce 21 index caches and the same 47,700
+    B/token, and every contiguous-prefix fixture would stay green.
+    """
+    full = GLM53_FULL_INDEXER_LAYERS
+    assert len(full) == INDEXER_LAYERS
+    assert full[:3] == (0, 1, 2)
+    assert 3 not in full and 4 not in full and 5 not in full
+    assert full[3] == 6 and full[-1] == TOTAL_LAYERS - 4
+
+    tensors = build_kv_cache_tensors(
+        _glm_dsa_registration(indexer_layers=full)
+    )
+
+    assert [i for i, t in enumerate(tensors) if t.index_cache is not None] == list(
+        full
+    )
+    assert all(t.index_cache.shape[-1] == IDX_DIM for t in tensors if t.index_cache is not None)
+
+
+def test_packed_indexer_scale_round_trips_with_its_row():
+    """GLM packs the fp8 scale into the last 4 bytes of the 132-byte indexer row.
+
+    The codec must move that tail with the key bytes. A round trip that only
+    checked the DeepSeek 144-wide aligned row would stay green if this tail
+    were dropped or attached to the neighbouring shared layer.
+    """
+    codec_mod = pytest.importorskip(
+        "atom.kv_transfer.offload.dense.kv_byte_codec",
+        reason="offload codec pulls aiter",
+    )
+    nb, n_layers = 4, 8
+    full = (0, 6)
+    kv: dict[str, torch.Tensor] = {}
+    scales: dict[int, torch.Tensor] = {}
+    for i in range(n_layers):
+        mla = torch.arange(nb * BS * MLA_DIM, dtype=torch.uint8).reshape(nb, BS, MLA_DIM)
+        mla.add_(i)
+        kv[f"model.layers.{i}.self_attn.attn"] = mla
+        if i in full:
+            row = torch.zeros((nb, BS, IDX_DIM), dtype=torch.uint8)
+            row[..., :128] = i + 9
+            scale = torch.tensor([i + 1, 0xA5, 0x5A, i + 3], dtype=torch.uint8)
+            row[..., 128:] = scale
+            kv[f"model.layers.{i}.self_attn.indexer.k_cache"] = row
+            scales[i] = scale
+
+    tensors = build_kv_cache_tensors(kv)
+    assert [t.index_cache is not None for t in tensors] == [
+        i in full for i in range(n_layers)
+    ]
+
+    codec = codec_mod.DenseKVByteCodec(
+        {str(t.layer_num): t for t in tensors}, num_blocks=nb
+    )
+    per_token = n_layers * MLA_DIM + len(full) * IDX_DIM
+    assert codec.bytes_per_block == BS * per_token
+
+    saved = [
+        (t.k_cache.clone(), None if t.index_cache is None else t.index_cache.clone())
+        for t in tensors
+    ]
+    _cpu_round_trip(codec, [[0, 1], [2, 3]])
+
+    for i, (k_before, idx_before) in enumerate(saved):
+        assert torch.equal(tensors[i].k_cache, k_before)
+        if idx_before is None:
+            assert tensors[i].index_cache is None
+            continue
+        assert torch.equal(tensors[i].index_cache, idx_before)
+        assert torch.equal(tensors[i].index_cache[0, 0, 128:], scales[i])
+
+
+def _cpu_round_trip(codec, block_id_groups) -> None:
+    """Pack and unpack through the codec's own per-block byte strides.
+
+    Same layout the Triton kernel is required to implement: within a chunk,
+    each segment contributes ``nbytes`` from block ``b`` at ``[b*nbytes,
+    (b+1)*nbytes)`` of its flattened storage. Doing it on CPU is what makes
+    the 132-byte tail assertable without a GPU.
+    """
+    groups, flat, counts = codec._normalize_block_id_groups(
+        block_id_groups, reject_repeated=True
+    )
+    buf = torch.empty(len(flat) * codec.bytes_per_block, dtype=torch.uint8)
+    offset = 0
+    cursor = 0
+    segments = codec._segments
+    widths = codec._seg_block_bytes
+    for count in counts:
+        ids = flat[cursor : cursor + count]
+        cursor += count
+        for seg, nbytes in zip(segments, widths):
+            raw = seg.view(torch.uint8).reshape(-1)
+            for b in ids:
+                buf[offset : offset + nbytes].copy_(raw[b * nbytes : (b + 1) * nbytes])
+                offset += nbytes
+    for seg in segments:
+        seg.view(torch.uint8).zero_()
+    offset = 0
+    cursor = 0
+    for count in counts:
+        ids = flat[cursor : cursor + count]
+        cursor += count
+        for seg, nbytes in zip(segments, widths):
+            raw = seg.view(torch.uint8).reshape(-1)
+            for b in ids:
+                raw[b * nbytes : (b + 1) * nbytes].copy_(buf[offset : offset + nbytes])
+                offset += nbytes
+    assert groups  # the normalizer accepted the same groups the pack walked
 
 
 def test_shared_layers_carry_no_index_cache():
