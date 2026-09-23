@@ -186,8 +186,10 @@ def test_every_serving_frontend_applies_the_gc_policy():
     frontends = sorted(
         p
         for p in root.rglob("*.py")
-        # `examples/` are batch scripts: they exit, they do not serve.
-        if ".create_engine(" in p.read_text() and "examples/" not in p.as_posix()
+        # Examples and offline benchmarks exit after their batch; neither
+        # starts a serving frontend whose live heap needs to be frozen.
+        if p.relative_to(root).parts[0] not in {"examples", "benchmarks"}
+        and ".create_engine(" in p.read_text()
     )
     assert frontends, "no engine frontend found; this test has stopped checking"
     missing = [
