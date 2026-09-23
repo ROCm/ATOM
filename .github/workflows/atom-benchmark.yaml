@@ -84,9 +84,26 @@ on:
         description: "Benchmark Llama-3.3-70B-Instruct-MXFP4"
         type: boolean
         default: true
-      extra_args:
-        description: "Extra arguments to pass to the ATOM server"
+      agentic_deepseek_v41flash:
+        description: "Run ONLY DeepSeek-V4.1-Flash agentic TP4, no EP, DSpark5, AL3.51; c=1,2,8,16,32,64."
+        type: boolean
+        default: true
+      agentic_deepseek_v4pro:
+        description: "Run ONLY the DeepSeek-V4-Pro agentic AgentX trace replay (TP + DPA bands, ~1h GPU/cell). Independent of the model checkboxes above (those drive the random sweep). Set agentic_concurrency below for a subset. The nightly never runs it."
+        type: boolean
+        default: false
+      agentic_m3_mxfp4:
+        description: "Run ONLY the MiniMax-M3-MXFP4 agentic AgentX trace replay (EAGLE3-GQA, TP4, ~1h GPU/cell). Independent of the model checkboxes above. Set agentic_concurrency below for a subset. The nightly never runs it."
+        type: boolean
+        default: false
+      agentic_concurrency:
+        description: "Agentic concurrencies to run, comma-separated (e.g. 48,64). 'all' = the whole curve. Catalog has 1,2,8,16,24,30,32,48,64,96,128,256; each cell is ~1h GPU. Ignored unless an agentic model box is ticked."
         type: string
+        default: "all"
+      agentic_duration:
+        description: "Agentic replay seconds per cell. 3600 = official; under 900 forces --unsafe-override and stamps submission_valid=false."
+        type: string
+        default: "3600"
       image:
         description: "Image to use for the benchmark"
         type: string
@@ -97,10 +114,6 @@ on:
         default: ""
       enable_profiler:
         description: "Enable torch profiler to collect trace for performance debugging"
-        type: boolean
-        default: false
-      enable_rtl:
-        description: "Enable RTL (rocm-trace-lite) GPU kernel tracing for prefill/decode analysis"
         type: boolean
         default: false
       param_lists:
@@ -116,11 +129,6 @@ on:
         description: "ATOM commit SHA to checkout; leave empty to use the workflow ref"
         type: string
         default: ""
-      aiter_commit:
-        description: "ROCm/aiter commit SHA, tag, or branch to reinstall before benchmarking; leave empty to keep the image version"
-        type: string
-        default: ""
-
 permissions:
   actions: read
   contents: write
@@ -180,6 +188,8 @@ jobs:
       model_path: ${{ matrix.config.model_path }}
       server_args: ${{ matrix.config.server_args }}
       bench_args: ${{ matrix.config.bench_args }}
+      bench_kind: ${{ matrix.config.bench_kind }}
+      benchmark_duration: ${{ inputs.agentic_duration || '' }}
       env_vars: ${{ matrix.config.env_vars }}
       runner: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.config.runner }}
       isl: ${{ matrix.config.isl }}
@@ -189,10 +199,10 @@ jobs:
       concurrency: ${{ matrix.config.concurrency }}
       image: ${{ inputs.image || 'rocm/atom-dev:latest' }}
       enable_profiler: ${{ inputs.enable_profiler || false }}
-      enable_rtl: ${{ inputs.enable_rtl || false }}
-      extra_args: ${{ inputs.extra_args || '' }}
+      enable_rtl: ${{ false || false }}
+      extra_args: ${{ '' || '' }}
       atom_commit: ${{ inputs.atom_commit || '' }}
-      aiter_commit: ${{ inputs.aiter_commit || '' }}
+      aiter_commit: ${{ '' || '' }}
 
   summarize-benchmark-result:
     concurrency:
@@ -452,10 +462,10 @@ jobs:
           download-required: "false"
 
       - name: Reinstall AITER from requested ref
-        if: ${{ inputs.aiter_commit != '' }}
+        if: ${{ '' != '' }}
         env:
           CONTAINER_NAME: atom-regression
-          AITER_GIT_REF: ${{ inputs.aiter_commit }}
+          AITER_GIT_REF: ${{ '' }}
         run: bash .github/scripts/install_aiter_from_ref.sh
 
       - name: Launch server

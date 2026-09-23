@@ -16,6 +16,61 @@
   ],
   "models": [
     {
+      "display": "DeepSeek-V4.1-Flash",
+      "path": "deepseek-ai/DeepSeek-V4.1-Flash",
+      "prefix": "deepseek-v41-flash-agentic",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "HIP_VISIBLE_DEVICES=0,1,2,3\nOMP_NUM_THREADS=4\nATOM_NUMA_BIND=0\nAITER_LOG_LEVEL=WARNING\nATOM_DSV41_BENCHMARK_SYNTHETIC=1\nAIPERF_WARMUP_REQUESTS_PER_LANE=5",
+      "config": {
+        "tp": 4,
+        "kv_cache_dtype": "bf16",
+        "trust_remote_code": true,
+        "extra_args": "--host 0.0.0.0 --index-cache-dtype fp8 --gpu-memory-utilization 0.9 --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 --max-num-seqs 128 --level 3 --cudagraph-mode FULL --method dspark --num-speculative-tokens 5 --spec-decode-acceptance-length 3.51 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --tool-call-parser dsml_v41"
+      },
+      "variants": [
+        {
+          "label": "Agentic TP4 no EP DSpark5",
+          "suffix": "-tp4-noep-dspark5",
+          "bench_kind": "aiperf_agentic",
+          "extra_args": "--cudagraph-capture-sizes '[1,2,3,4,5,6,7,8,16,32,48,64,128]'",
+          "conc_min": 1,
+          "conc_max": 64,
+          "scenarios": [
+            {
+              "isl": 262144,
+              "osl": 1024,
+              "concurrency": [
+                1,
+                2,
+                8,
+                16,
+                64
+              ],
+              "random_range_ratio": 0.8
+            }
+          ]
+        },
+        {
+          "label": "Agentic TP4 no EP DSpark5 dense capture",
+          "suffix": "-tp4-noep-dspark5-dense-capture",
+          "bench_kind": "aiperf_agentic",
+          "extra_args": "--cudagraph-capture-sizes '[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,48,64,128]'",
+          "conc_min": 1,
+          "conc_max": 64,
+          "scenarios": [
+            {
+              "isl": 262144,
+              "osl": 1024,
+              "concurrency": [
+                32
+              ],
+              "random_range_ratio": 0.8
+            }
+          ]
+        }
+      ]
+    },
+    {
       "display": "DeepSeek-V4-Pro",
       "path": "deepseek-ai/DeepSeek-V4-Pro",
       "prefix": "deepseek-v4-pro",
@@ -75,6 +130,29 @@
           "bench_args": "--use-chat-template",
           "conc_min": 64,
           "conc_max": 512
+        },
+        {
+          "label": "Agentic MTP3",
+          "suffix": "-agentic-mtp3",
+          "bench_kind": "aiperf_agentic",
+          "extra_args": "--method mtp --num-speculative-tokens 3 --spec-decode-acceptance-length 2.49 --enable_prefix_caching --gpu-memory-utilization 0.9 --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL",
+          "conc_min": 1,
+          "conc_max": 16,
+          "scenarios": [
+            {"isl": 262144, "osl": 1024, "concurrency": [1, 2, 8, 16, 48, 64, 96, 128, 256], "random_range_ratio": 0.8}
+          ]
+        },
+        {
+          "label": "Agentic DPA MTP3",
+          "suffix": "-agentic-dpa-mtp3",
+          "bench_kind": "aiperf_agentic",
+          "env_vars": "GPU_MAX_HW_QUEUES=5\nATOM_NUMA_BIND=1\nATOM_DP_SESSION_AFFINITY=1\nATOM_DP_LB_REQ_EQUIV=512\nATOM_ENABLE_PREFILL_DELAYER=1\nATOM_PREFILL_DECODE_INTERVAL=10\nATOM_PREFILL_DELAYER_MAX_QUEUE_MS=15000",
+          "extra_args": "--method mtp --num-speculative-tokens 3 --spec-decode-acceptance-length 2.49 --enable_prefix_caching --gpu-memory-utilization 0.9 --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --enable-dp-attention --enable-tbo",
+          "conc_min": 48,
+          "conc_max": 256,
+          "scenarios": [
+            {"isl": 262144, "osl": 1024, "concurrency": [1, 2, 8, 16, 48, 64, 96, 128, 256], "random_range_ratio": 0.8}
+          ]
         }
       ]
     },
@@ -301,6 +379,44 @@
           "bench_args": "--use-chat-template",
           "conc_min": 4,
           "conc_max": 256
+        }
+      ]
+    },
+    {
+      "display": "MiniMax-M3-MXFP4 Agentic",
+      "path": "amd/MiniMax-M3-MXFP4",
+      "prefix": "m3-mxfp4-agentic",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_FORCE_ATTN_TRITON=1",
+      "config": {
+        "tp": 4,
+        "kv_cache_dtype": "fp8",
+        "trust_remote_code": true,
+        "extra_args": "--gpu-memory-utilization 0.9 --block-size 128 --max-num-batched-tokens 8192 --attn-prefill-chunk-size 16384 --state-checkpoint-interval-tokens 32768 --enable_prefix_caching --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"vision_tower\", \"multi_modal_projector\", \"patch_merge_mlp\", \"*block_sparse_moe\"]}' --default-chat-template-kwargs '{\"thinking_mode\": \"enabled\"}'"
+      },
+      "variants": [
+        {
+          "label": "EAGLE3 GQA",
+          "suffix": "-eagle3-gqa",
+          "bench_kind": "aiperf_agentic",
+          "extra_args": "--method eagle3 --draft-model Inferact/MiniMax-M3-EAGLE3-GQA --num-speculative-tokens 3 --spec-decode-acceptance-rate 0.5933",
+          "conc_min": 1,
+          "conc_max": 32,
+          "scenarios": [
+            {"isl": 262144, "osl": 1024, "concurrency": [1, 2, 8, 16, 24, 30, 32], "random_range_ratio": 0.8}
+          ]
+        },
+        {
+          "label": "EAGLE3 GQA Offload",
+          "suffix": "-eagle3-gqa-offload",
+          "bench_kind": "aiperf_agentic",
+          "env_vars": "PYTHONHASHSEED=0\nLMCACHE_LOCAL_CPU=True\nLMCACHE_MAX_LOCAL_CPU_SIZE=256\nLMCACHE_CHUNK_SIZE=256\nATOM_PREFIX_CACHE_POLICY=slru\nATOM_PREFIX_CACHE_PROTECTED_RATIO=0.5\nLMCACHE_CACHE_POLICY=ATOM_SLRU\nLMCACHE_LOOKUP_SERVER_WORKER_IDS=0,1,2,3",
+          "extra_args": "--method eagle3 --draft-model Inferact/MiniMax-M3-EAGLE3-GQA --num-speculative-tokens 3 --spec-decode-acceptance-rate 0.5933 --kv-transfer-config '{\"kv_connector\":\"lmcache_offload\",\"kv_role\":\"offload\"}'",
+          "conc_min": 48,
+          "conc_max": 64,
+          "scenarios": [
+            {"isl": 262144, "osl": 1024, "concurrency": [48, 64], "random_range_ratio": 0.8}
+          ]
         }
       ]
     },
