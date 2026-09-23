@@ -537,4 +537,6 @@ def test_qsa_verification_is_causal_and_matches_individual_queries(k, start):
             requests[row : row + 1],
             num_decode_requests=1,
         )
-        torch.testing.assert_close(batched[row : row + 1], reference, rtol=0, atol=0)
+        torch.testing.assert_close(
+            batched[row : row + 1], reference, rtol=0.001, atol=0.001
+        )

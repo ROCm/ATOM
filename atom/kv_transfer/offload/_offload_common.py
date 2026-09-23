@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 
@@ -452,7 +453,9 @@ class OffloadSchedulerMixin(ABC):
 
     # Save/load lifecycle contract. Declared abstract so a missing forwarder is
     # a construction-time TypeError, not a silent no-op behind the delegating
-    # shell -- the failure mode that let DSV4 ship without abandon_save. The
+    # shell -- the failure mode that let DSV4 ship without abandon_save, and
+    # later without the `source_blocks_released` terminal that is its only exit
+    # for a request whose save completed normally. The
     # bodies differ by layout (dense keeps one save per request; DSV4 keeps a
     # set plus a SLOT sidecar), so each impl supplies its own; the contract
     # detail lives on those concrete overrides.
@@ -463,11 +466,16 @@ class OffloadSchedulerMixin(ABC):
     @abstractmethod
     def release_stalled_save(self, seq) -> None: ...
     @abstractmethod
+    def source_blocks_released(self, seq) -> None: ...
+    @abstractmethod
     def load_failed(self, req_id) -> bool: ...
     @abstractmethod
     def load_finished(self, req_id) -> bool: ...
     @abstractmethod
     def cancel_pending_load(self, seq) -> None: ...
+
+    def send_finished(self, req_id) -> None:
+        """Offload backends own saves and loads, but no P/D send claims."""
 
     def _init_offload_statistics(self) -> None:
         """Initialize layout-independent scheduler counters."""
@@ -534,6 +542,22 @@ class OffloadSchedulerMixin(ABC):
 
     def _track_save_statistics(self, operation, tokens: int) -> None:
         self._save_inflight_tokens[operation] = max(0, int(tokens))
+
+    def _refresh_save_reclaim_clock(self, seq) -> None:
+        """Give every newly dispatched save a full source-retention window.
+
+        A finished, deferred request dispatches its chunks serially, but the
+        clock is stamped once at park time -- so generation k+1 would inherit
+        the remains of generation 1's window and be abandoned by
+        `_reconcile_stalled_deferred_saves` mid-copy. Restart it per dispatch;
+        holding older work longer is the safe direction.
+        """
+        now = time.monotonic()
+        if getattr(seq, "_deferred_save_at", None) is not None:
+            seq._deferred_save_at = now
+        lease_times = getattr(self, "_save_lease_at", {})
+        if id(seq) in lease_times:
+            lease_times[id(seq)] = now
 
     def _finish_load_statistics(self, operation, *, succeeded: bool) -> None:
         if operation not in self._load_inflight_tokens:

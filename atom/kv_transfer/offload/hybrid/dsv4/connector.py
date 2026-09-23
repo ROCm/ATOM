@@ -1911,6 +1911,9 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         # a save, so the advance is a prediction, not a fact. Keep what each one
         # was contingent on so a save that never lands can take its advance back.
         self._save_watermark_rollback: dict[str, dict[SaveOperationId, int]] = {}
+        # Finished requests get a bounded window without successful PAGE saves.
+        # Dispatch refreshes the copy-retention clock, not this progress clock.
+        self._finished_save_progress_at: dict[str, float] = {}
         # Stateful PAGE/SLOT protocol. Sidecar commits are session-local because
         # worker-side sidecar storage is not queried by the scheduler.
         self._committed_sidecar_hashes = _BoundedLRUSet(
@@ -2089,6 +2092,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             entry = self._save_tracker.get(sid)
             if entry is None or entry[0] is not seq:
                 self._save_tracker[sid] = [seq, initial_saved]
+                self._finished_save_progress_at.pop(sid, None)
                 self._sidecar_hash_cache.pop(sid, None)
                 self._failed_sidecar_saves.pop(sid, None)
             else:
@@ -2383,7 +2387,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         # chunk's forward has completed; use it as the D2H-safe frontier.
         chunk = self.chunk_size or 256
         for sid, entry in self._save_tracker.items():
-            if not self._do_save:
+            if not self._do_save or self._save_retries_expired(sid):
                 continue
             seq, saved = entry
             if sid in self._reqs_need_recv or sid in loading_sids:
@@ -2430,6 +2434,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 save_operation,
                 aligned - saved if page_save_due else 0,
             )
+            self._refresh_save_reclaim_clock(seq)
             meta.add_request(
                 LMCacheReqMeta(
                     req_id=seq.id,
@@ -2474,6 +2479,19 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         )
         return self._sidecar_save_candidate(seq, computed) is not None
 
+    def _save_retries_expired(self, sid: str) -> bool:
+        """Stop new work after a finished request makes no save progress.
+
+        Use the existing abandon window, independently of the per-dispatch
+        source-retention clock. In-flight PAGE/SLOT operations still own the
+        blocks until their completion or the normal stalled-copy reclaim.
+        """
+        progress_at = self._finished_save_progress_at.get(sid)
+        if progress_at is None:
+            return False
+        timeout = self.save_abandon_timeout_s()
+        return timeout > 0 and time.monotonic() - progress_at >= timeout
+
     def should_defer_free(self, seq) -> bool:
         if self._has_active_load(seq):
             return True
@@ -2483,8 +2501,10 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         return (
             sid in self._save_inflight
             or sid in self._sidecar_save_inflight
-            or self._has_pending_save(seq)
-            or self._has_pending_sidecar_save(seq)
+            or (
+                not self._save_retries_expired(sid)
+                and (self._has_pending_save(seq) or self._has_pending_sidecar_save(seq))
+            )
         )
 
     def has_pending_work(self) -> bool:
@@ -2518,7 +2538,10 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
 
     def _release_save_watermark(self, operation) -> None:
         """Retire the record of a save that landed; its advance was correct."""
-        self._forget_save_watermark(operation)
+        previous = self._forget_save_watermark(operation)
+        sid = self._watermark_sid(operation)
+        if previous is not None and sid in self._finished_save_progress_at:
+            self._finished_save_progress_at[sid] = time.monotonic()
 
     def _rollback_save_watermark(self, operation) -> None:
         """Take back the watermark advance of a save that never landed.
@@ -2599,6 +2622,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         if sidecar is not None:
             self._cancel_save_statistics(sidecar[0])
         self._save_tracker.pop(sid, None)
+        self._finished_save_progress_at.pop(sid, None)
         # The tracker entry is gone, so there is no longer a watermark to take
         # back; keeping the records would only leak.
         self._save_watermark_rollback.pop(sid, None)
@@ -2710,6 +2734,26 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self._load_save_floors.pop(sid, None)
         return True
 
+    def _drop_finished_save_state(self, sid: str, seq) -> None:
+        """Forget a finished request's save bookkeeping.
+
+        Keyed on the *blocks*, not the request: `_save_tracker` holds the
+        `Sequence` and is what `build_connector_meta`'s save loop iterates
+        (reading `seq.block_table` straight out of it), so it may only be
+        dropped once nothing can still read that block table. The sidecar
+        failure set and the watermark records are scoped to the same tracker
+        entry and go with it. Both terminals route here -- `request_finished`
+        when the free was not deferred at all, `source_blocks_released` when
+        it was.
+        """
+        entry = self._save_tracker.get(sid)
+        if entry is None or entry[0] is not seq:
+            return
+        self._save_tracker.pop(sid, None)
+        self._finished_save_progress_at.pop(sid, None)
+        self._failed_sidecar_saves.pop(sid, None)
+        self._save_watermark_rollback.pop(sid, None)
+
     def request_finished(self, seq) -> None:
         sid = str(seq.id)
         self._release_failed_load_attempt(sid, seq)
@@ -2725,12 +2769,25 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         if cached is not None and cached[0] is seq:
             self._sidecar_hash_cache.pop(sid, None)
         entry = self._save_tracker.get(sid)
-        if entry is not None and entry[0] is seq and not self.should_defer_free(seq):
-            self._save_tracker.pop(sid, None)
-            self._failed_sidecar_saves.pop(sid, None)
-            self._save_watermark_rollback.pop(sid, None)
+        if entry is not None and entry[0] is seq:
+            self._finished_save_progress_at.setdefault(sid, time.monotonic())
+        if not self.should_defer_free(seq):
+            self._drop_finished_save_state(sid, seq)
         if hasattr(seq, "_load_operation"):
             delattr(seq, "_load_operation")
+
+    def source_blocks_released(self, seq) -> None:
+        """Terminal for the deferred path: the blocks are back in the pool.
+
+        DSV4 always defers -- it has no early-release exit and so no
+        `_finish_retired_request` -- which makes this the *only* terminal its
+        normal completion path ever reaches. Without it every request leaks a
+        tracker entry (and the `Sequence` it pins), and a request whose
+        watermark was rolled back by a failed save keeps `page_save_due` True
+        forever, re-emitting a save against a freed, reusable block table on
+        every step.
+        """
+        self._drop_finished_save_state(str(seq.id), seq)
 
 
 __all__ = [

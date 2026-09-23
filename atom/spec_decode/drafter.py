@@ -3,7 +3,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -29,7 +29,7 @@ class AuxCaptureSpec:
     """Declarative spec for drafter-owned target aux-hidden-state capture.
 
     A drafter declares WHICH target decoder layers to tap and HOW to turn each
-    tapped layer's forward output into the ``[N, hidden_size]`` aux tensor it
+    tapped layer's output (or positional inputs) into the ``[N, hidden_size]`` aux tensor it
     consumes; the base ``Drafter`` owns the generic forward-hook + buffer
     machinery. This keeps the target model agnostic — a different drafter can be
     run against the same target with zero model-side changes.
@@ -39,6 +39,11 @@ class AuxCaptureSpec:
     hidden_size: int
     # (layer_output, layer_module) -> [N, hidden_size], or None to skip this call.
     extract: Callable[[Any, nn.Module], torch.Tensor | None]
+    capture: Literal["output", "input"] = "output"
+
+    def __post_init__(self):
+        if self.capture not in ("output", "input"):
+            raise ValueError("Aux capture must select layer input or output")
 
 
 # Descent bound for the `.model` wrapper chain below — big enough for every
@@ -116,6 +121,7 @@ support_draft_model_arch_dict = {
     "DeepSeekMTPModel": "atom.models.deepseek_mtp.DeepSeekMTP",
     "DeepseekV4MTPModel": "atom.models.deepseek_v4_mtp.DeepseekV4MTP",
     "DeepseekV4DSparkModel": "atom.models.deepseek_v4_dspark.DeepseekV4DSpark",
+    "DeepseekV41DSparkModel": "atom.models.deepseek_v41.dspark.DeepseekV41DSpark",
     "Qwen3NextMTPModel": "atom.models.qwen3_next_mtp.Qwen3NextMTP",
     "MiMoV2MTPModel": "atom.models.mimo_v2_mtp.MiMoV2MTP",
     "MiMoV2FlashMTPModel": "atom.models.mimo_v2_mtp.MiMoV2MTP",
@@ -377,7 +383,15 @@ class Drafter(abc.ABC):
                 if lid == -1
                 else (layers[lid], spec.extract)
             )
-            module.register_forward_hook(self._make_aux_hook(buf_idx, extract))
+            hook = self._make_aux_hook(buf_idx, extract)
+            if lid != -1 and spec.capture == "input":
+
+                def pre_hook(module, inputs, hook=hook):
+                    hook(module, (), inputs)
+
+                module.register_forward_pre_hook(pre_hook)
+            else:
+                module.register_forward_hook(hook)
         self._captures_aux = True
         logger.info(
             f"{type(self).__name__} aux capture on target layers: {spec.layer_ids}"

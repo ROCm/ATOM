@@ -22,6 +22,7 @@ import logging
 import math
 import os
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("atom")
@@ -197,6 +198,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ": lambda: (
         os.getenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "1") == "1"
     ),
+    # FlyDSL FP8 prefill with fused QKV quantization and direct FP8 gather output
+    # where supported. Unsupported attention inputs raise. Added 2026-09-10.
+    "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN": lambda: (
+        os.getenv("ATOM_USE_FLYDSL_FP8_PREFILL_ATTN", "0") == "1"
+    ),
     # QK-norm-rope-cache-quant fusion for Qwen3 dense and MoE; disabled by default.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
@@ -264,6 +270,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
+    # DeepSeek-V4.1: how many of an attention layer's branches leave the main
+    # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
+    # the scorer that first reads it; 2 the indexer as well, on one of its own.
+    # Default 0 because forking measured slower per layer, not faster -- the
+    # periods and the noise floor under them are in the environment doc, and
+    # end-to-end throughput is too coarse to see an effect that size.
+    "ATOM_DSV41_SIDE_STREAMS": lambda: int(os.getenv("ATOM_DSV41_SIDE_STREAMS", "0")),
     # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
     # (K3DSparkMLAAttention.write_context_kv) into one Triton kernel --
     # RMSNorm(kv_c) + rope(k_pe) + concat + paged-cache store, versus today's
@@ -715,11 +728,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK", "") == ""
         else float(os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK"))
     ),
-    # TTFT SLA guard: if any rank's oldest schedulable waiting prefill has queued
-    # (since arrival) >= this many ms, force-release regardless of the fill
-    # target. Bounds worst-case TTFT. Empty string => None => disabled (set this
-    # to your TTFT budget in ms to activate; a small value under heavy backlog
-    # will fire every tick and defeat coalescing, so size it to the SLA).
+    # After decode protection, bound extra coalescing by queue age. Checkpoint
+    # dependency waits use TTFT_MAX_TICKS; this is not an end-to-end TTFT bound.
+    # Empty string => None => disabled.
     "ATOM_PREFILL_DELAYER_MAX_QUEUE_MS": lambda: (
         None
         if os.getenv("ATOM_PREFILL_DELAYER_MAX_QUEUE_MS", "") == ""
@@ -728,6 +739,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # After a prefill forward, protect this many scheduler passes for decode
     # before allowing another prefill. Mirrors SGLang's
     # --prefill-decode-interval; 0 disables the hard interval.
+    # A nonzero interval also enables local coalescing on TP without PP.
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
     ),
@@ -774,6 +786,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sends only its 1/tp_size slice and the receiver all-gathers, cutting PP
     # link traffic by tp_size. Default on; set "0" for full-tensor sends.
     "ATOM_PP_SEND_ALLGATHER": lambda: os.getenv("ATOM_PP_SEND_ALLGATHER", "1") == "1",
+    # Engram: read the n-gram tables with a device kernel over UVA instead of
+    # gathering them on the host. The tables stay in host memory (page-locked in
+    # place, not copied to HBM); the GPU pulls only the rows a step names and
+    # dequantizes them there. On by default: the host gather gives the same rows
+    # but costs ~50 ms of CPU per decode step with the GPU idle behind it. Set
+    # to 0 to fall back. Anything that would make it unsafe -- no CUDA, more TP
+    # ranks than hash heads, a registration that will not fit -- falls back on
+    # its own, so the switch is for taking the host path deliberately.
+    "ATOM_ENGRAM_UVA": lambda: os.getenv("ATOM_ENGRAM_UVA", "1") == "1",
+    # Where the compressed-vocab table is cached between runs. The table is
+    # reproducible from the tokenizer, so this only trades startup time for
+    # disk; point it at shared storage to let several servers build it once.
+    "ATOM_ENGRAM_CACHE_DIR": lambda: os.getenv(
+        "ATOM_ENGRAM_CACHE_DIR", str(Path.home() / ".cache" / "atom" / "engram")
+    ),
+    # Overlap hash/UVA lookup and TP reassembly with early layers, using private
+    # IPC state where supported. Requires UVA; set 0 to disable.
+    "ATOM_ENGRAM_OVERLAP": lambda: os.getenv("ATOM_ENGRAM_OVERLAP", "1") == "1",
+    # Fuse FP32 post-wkv gating and residual addition; 0 selects the torch reference.
+    "ATOM_ENGRAM_FUSED_GATE": lambda: os.getenv("ATOM_ENGRAM_FUSED_GATE", "1") == "1",
 }
 
 

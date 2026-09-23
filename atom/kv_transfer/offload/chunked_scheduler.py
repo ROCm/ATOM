@@ -82,6 +82,14 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         )
         self._lookup_client = lookup_client
 
+        # Optional veto on how far a reported hit may reach, installed by a
+        # hybrid connector. A model whose recurrent state must be restored
+        # alongside the KV has a second condition this scheduler knows nothing
+        # about -- the state at the hit boundary has to exist too -- and the
+        # only safe answer to a missing state is a shorter hit. Called with
+        # ``(seq, hit)`` and returns the permitted hit.
+        self._hit_cap_hook = None
+
         # req_id -> LoadSpec (pending load decided at match time)
         self._load_specs: dict[str, LoadSpec] = {}
         # req_id -> Sequence (queued to recv this step)
@@ -153,6 +161,15 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._load_failed_seqs.pop(sid, None)
         self._load_lifecycles[sid] = seq
 
+    def install_hit_cap_hook(self, hook) -> None:
+        """Let a hybrid connector shorten every hit this scheduler reports.
+
+        One hook, not a list: the cap is a correctness constraint rather than a
+        policy, and two of them would raise the question of which wins for a
+        reader who has to be sure the answer is "the shortest".
+        """
+        self._hit_cap_hook = hook
+
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
         if not self._do_load or self._lookup_client is None:
             return 0, False
@@ -206,6 +223,27 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if not hit:
             return 0, False
         hit = self._loadable_hit(hit, num_prompt)
+        if self._hit_cap_hook is not None:
+            # After `_loadable_hit`, so the hook caps the hit that will
+            # actually be requested; before the save floor is recorded, so a
+            # capped hit does not leave a floor claiming the tier already holds
+            # the part that was just refused. The cap names a state boundary,
+            # which need not be a chunk multiple, so it is floored again --
+            # `_loadable_hit`'s own reason applies unchanged to the capped
+            # length.
+            capped = int(self._hit_cap_hook(seq, hit))
+            if capped < hit:
+                logger.debug(
+                    "[OFFLOAD-LOOKUP] seq=%s hit capped %d -> %d",
+                    seq.id,
+                    hit,
+                    capped,
+                )
+                hit = self._chunk_floor(capped)
+            if hit <= 0:
+                self._clear_pending_load(sid)
+                self._hit_save_floors.pop(sid, None)
+                return 0, False
         self._hit_save_floors[sid] = hit
         need = hit - int(seq.num_cached_tokens)
         if need <= 0:
@@ -434,6 +472,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             )
             entry[1] = aligned
             self._save_inflight[sid] = save_operation
+            self._refresh_save_reclaim_clock(seq)
             self._save_rr_last = sid
             if getattr(self, "_early_release", False):
                 # Freeze the exact token-index -> block-id mapping before a
@@ -624,8 +663,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return
         self._save_inflight.pop(sid, None)
         if getattr(self, "_early_release", False):
-            # The dedicated connector completion reports store success/failure.
-            # This legacy terminal remains for MultiConnector save pairing.
+            # Store success/failure and lease release travel on the dedicated
+            # connector channel. This terminal only clears the in-flight save.
             self._finish_retired_request(sid)
             return
         self._finish_save_statistics(req_id)
@@ -855,6 +894,19 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if getattr(seq, "_load_operation", None) == operation:
                 delattr(seq, "_load_operation")
 
+    def _drop_finished_save_state(self, sid: str, seq) -> None:
+        """Forget a finished request's save bookkeeping.
+
+        Keyed on the *blocks*, not the request: the tracker entry holds the
+        `Sequence` and is what `build_connector_meta`'s save loop iterates, so
+        it may only be dropped once nothing can still read that block table.
+        Both terminals route here -- `request_finished` when the free was not
+        deferred at all, `source_blocks_released` when it was.
+        """
+        entry = self._save_tracker.get(sid)
+        if entry is not None and entry[0] is seq:
+            self._save_tracker.pop(sid, None)
+
     def request_finished(self, seq) -> None:
         sid = str(seq.id)
         if self._load_lifecycles.get(sid) is seq:
@@ -877,12 +929,22 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                     int(getattr(seq, "num_cached_tokens", 0)),
                     int(seq.num_prompt_tokens),
                 )
-                if not self.should_defer_free(seq):
-                    self._save_tracker.pop(sid, None)
-            elif not self.should_defer_free(seq):
-                self._save_tracker.pop(sid, None)
+            if not self.should_defer_free(seq):
+                self._drop_finished_save_state(sid, seq)
         if hasattr(seq, "_load_operation"):
             delattr(seq, "_load_operation")
+
+    def source_blocks_released(self, seq) -> None:
+        """Terminal for the deferred path: the blocks are back in the pool.
+
+        `request_finished` ran while `should_defer_free` was still True, so it
+        left the tracker in place. Nothing else pops it on a save that
+        *completes* normally (`save_finished` clears only `_save_inflight`;
+        `abandon_save` and `release_stalled_save` cover the failure exits), so
+        without this the entry -- and the `Sequence` it pins -- lives forever,
+        and the save loop keeps visiting a freed, reusable block table.
+        """
+        self._drop_finished_save_state(str(seq.id), seq)
 
 
 __all__ = [
