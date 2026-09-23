@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790096793964,
+  "lastUpdate": 1790184594835,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -3251,6 +3251,57 @@ window.BENCHMARK_DATA = {
             "value": 0.8976,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35753291530 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609221508 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1956 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "PerryZhang01",
+            "username": "PerryZhang01",
+            "email": "Perry.Zhang@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "cfe2d38f5af44eb9c778869a10320ce0bb0da5d7",
+          "message": "fix(offload): one tier lookup per waiting request, not one per step (#2305)\n\n`get_num_new_matched_tokens` runs before allocation and is gated only on\n`num_computed_tokens == 0`, so a request that fails to allocate goes back\nto the head of the waiting queue and is asked the identical question next\nstep. On a full KV cache that turns one lookup into one lookup per\nscheduler step: a prompt copy, ~5k chunk hashes and a blocking round trip\nto the tier worker, all on the scheduler thread.\n\nMemoize the one expensive input -- the tier `hit` -- and re-derive the\nanswer from it on every call. The frontier is not part of the question:\nhow much of the prompt the tier holds is a property of the prompt, and the\nfrontier only decides how much of that hit is still worth transferring.\nNothing tells the connector when the tier's answer changes, so the memo is\na bounded optimisation rather than a cache: a hit is replayed at most\n`OFFLOAD_LOOKUP_MEMO_STEPS` times and a non-answer backs off for\n`OFFLOAD_LOOKUP_RETRY_STEPS` (both default 32).\n\nA memo-served answer carries no pin, and an answer needs none -- the\nrequest only waits. A transfer does. `build_connector_meta`'s load-emit\nloop is the single choke point where a retrieve reaches the worker on both\nthe native and the plugin path, so the pin is re-taken there, confirm-only:\nthe tier is asked again and the load is dropped as `tier_lost_prefix` if it\nno longer holds what the spec promised. That is one lookup per load\nactually dispatched.\n\nThe MP client's `lookup` now returns `None` on deadline expiry instead of\n0: \"the worker did not answer in time\" is not a hit of zero and must not be\nremembered as one.\n\nApplied to both `ChunkedOffloadSchedulerBase` and `DSV4OffloadScheduler`.\nThe latter releases its pins each step, so it always answers\n`_ensure_lookup_pin` with a fresh lookup.\n\nCo-authored-by: perzhang <perzhang@amd.com>\nCo-authored-by: Claude Opus 5 <noreply@anthropic.com>",
+          "timestamp": "2026-09-23T14:57:48Z",
+          "url": "https://github.com/ROCm/ATOM/commit/cfe2d38f5af44eb9c778869a10320ce0bb0da5d7"
+        },
+        "date": 1790184594189,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9447,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35888053644 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202609231534 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9424 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.956,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35888053644 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609231534 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9553 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 65.91,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35888053644 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609231534 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9553 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.98,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8878,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35888053644 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609231534 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.166 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
