@@ -179,17 +179,13 @@ def fp4_index_scale_rows(rows: torch.Tensor, block_size: int) -> torch.Tensor:
     the cache differently would otherwise get a wrong mapping that is still
     in-bounds. `fp4_index_block_shapes` is what holds the two equal.
     """
-    _check_block(block_size)
-    lanes = FP4_KV_BLOCK_SIZE // _MFMA_M
-    return (rows % _MFMA_M) * lanes + rows // _MFMA_M
-
-
-def _check_block(block_size: int) -> None:
     if block_size != FP4_KV_BLOCK_SIZE:
         raise ValueError(
             f"the FP4 e8m0 row swizzle describes {FP4_KV_BLOCK_SIZE}-row blocks, "
             f"got {block_size}"
         )
+    lanes = FP4_KV_BLOCK_SIZE // _MFMA_M
+    return (rows % _MFMA_M) * lanes + rows // _MFMA_M
 
 
 def fp4_index_block_shapes(rows: int, head_dim: int) -> tuple[tuple, tuple]:

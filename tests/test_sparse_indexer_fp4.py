@@ -27,6 +27,7 @@ from atom.model_ops.sparse_indexer_fp4 import (
     assert_fp4_indexer_supported,
     fp4_decode_parallel_units,
     fp4_decode_schedule,
+    fp4_index_scale_rows,
     fp4_prefill_schedule,
     fp4_q_scale_shape,
     sparse_indexer_fp4_enabled,
@@ -36,10 +37,11 @@ from atom.model_ops.sparse_indexer_fp4 import (
 def _expect_scale_row(rows, block):
     """The e8m0 row swizzle, spelled out here rather than imported.
 
-    This is what the kernel's output is checked against, so it has to be
-    independent of it: a test that asks the implementation what to expect
-    passes just as happily when the implementation is wrong. fp4_index_slots
-    explains why the swizzle exists and what a wrong row costs.
+    This is what `fp4_index_scale_rows` and the indices the metadata builder
+    publishes are checked against, so it has to be independent of them: a test
+    that asks the implementation what to expect passes just as happily when the
+    implementation is wrong. `fp4_index_scale_rows` explains why the swizzle
+    exists and what a wrong row costs.
     """
     return (rows % 16) * (block // 16) + rows // 16
 
@@ -407,8 +409,6 @@ def test_scale_row_swizzle_matches_its_oracle():
     while every index stays in bounds. No GPU -- this is integer arithmetic, and
     pinning it is the only coverage the swizzle gets on a CPU-only CI runner.
     """
-    from atom.model_ops.sparse_indexer_fp4 import fp4_index_scale_rows
-
     rows = torch.arange(_BLOCK)
     want = _expect_scale_row(rows, _BLOCK)
     assert torch.equal(fp4_index_scale_rows(rows, _BLOCK), want)
@@ -534,7 +534,6 @@ def test_dcp_prefill_staging_keeps_every_key_with_its_own_exponent(monkeypatch):
     inside a block because `k_norm` precedes the quantizer, which is why an
     end-to-end accuracy run can pass with this broken; the random planes here
     remove that cover.
-
     """
     dsv2 = _import_or_skip("atom.models.deepseek_v2")
 
@@ -656,6 +655,61 @@ def test_staged_page_table_spans_a_whole_batch_not_one_sequence():
         want = torch.arange(pages, dtype=torch.int32).expand(bs, pages)
         assert torch.equal(staged[:, :pages], want), pages
         assert not staged[:, pages:].any(), pages
+
+
+def test_builder_publishes_the_staging_indices_it_derives():
+    """The six index tensors the DCP FP4 gather reads, as the builder publishes
+    them.
+
+    The staging test above feeds those tensors in by hand, so it pins the
+    gather and says nothing about the builder: swap `page` and `row` in the
+    builder and it stays green. This runs the builder itself over block tables
+    whose pages are neither zero nor their own column, with sequences that end
+    mid-block, so a slot's page, its row and its swizzled row all differ and
+    each is checked against the written-out oracle on its own.
+    """
+    aiter_mla = _import_or_skip(
+        "atom.model_ops.attentions.aiter_mla",
+        reason="the MLA builder imports triton at module scope",
+    )
+
+    build = aiter_mla.AiterMLAMetadataBuilder._build_dcp_indexer_fp4_prefill_meta
+    block, bs, per_seq = 64, 2, 6
+    builder = SimpleNamespace(
+        model_runner=SimpleNamespace(block_size=block),
+        device=torch.device("cpu"),
+        max_bs=4,
+        block_table_cols=per_seq,
+    )
+    lpad = np.array([block + 5, 2 * block + 3], dtype=np.int64)
+    cu_pad = np.concatenate([[0], np.cumsum(lpad)]).astype(np.int64)
+    table = np.array([[7, 3, 0, 0], [11, 2, 9, 0]], dtype=np.int32)
+    var = {"block_tables": SimpleNamespace(np=table)}
+    total_kv = 3 * block + 7
+    meta = SimpleNamespace()
+    build(builder, meta, bs, lpad, cu_pad, total_kv, var)
+
+    want_slots = torch.tensor(
+        [7 * block + j for j in range(block)]
+        + [3 * block + j for j in range(5)]
+        + [11 * block + j for j in range(block)]
+        + [2 * block + j for j in range(block)]
+        + [9 * block + j for j in range(3)]
+    )
+    assert torch.equal(meta.dcp_indexer_fp4_local_slots.long(), want_slots)
+
+    tok = torch.arange(total_kv)
+    for side, src in (("read", want_slots), ("stage", tok)):
+        page = getattr(meta, f"dcp_indexer_fp4_{side}_page")
+        row = getattr(meta, f"dcp_indexer_fp4_{side}_row")
+        scale_row = getattr(meta, f"dcp_indexer_fp4_{side}_scale_row")
+        # The width main indexed with; nothing here needs to widen to int64.
+        assert page.dtype == row.dtype == scale_row.dtype == torch.int32, side
+        assert torch.equal(page.long(), src // block), side
+        assert torch.equal(row.long(), src % block), side
+        assert torch.equal(
+            scale_row.long(), _expect_scale_row(src % block, block)
+        ), side
 
 
 @pytest.mark.parametrize("whole_batch", [True, False])

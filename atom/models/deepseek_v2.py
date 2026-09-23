@@ -1482,8 +1482,9 @@ def _dcp_stage_indexer_fp4_prefill(
     `cu_seqlen_ks/ke` and the DCP prefill filter already speak.
 
     The two planes disagree on their row axis, so both the read and the write
-    take their rows from `fp4_index_slots`; see it for what a row that skipped
-    that bend costs, which is nothing visible until the numbers are wrong.
+    bend their e8m0 rows through `fp4_index_scale_rows`; see it for what a row
+    that skipped that bend costs, which is nothing visible until the numbers
+    are wrong.
     """
     # Both index sets come from the prefill metadata, which settles them once
     # per forward; this gather runs once per indexer layer and used to rebuild
