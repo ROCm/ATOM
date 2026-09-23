@@ -103,6 +103,7 @@ def load_weights_into_model(
     is_rank0: Callable[[], bool],
     weights_iterator: Callable[..., Iterable[tuple[str, torch.Tensor]]],
     online_quant_streamer: "OnlineQuantStreamer | None" = None,
+    limit_pending_futures: bool = False,
 ) -> set[str]:
     """Copy every checkpoint tensor into the model parameter it belongs to.
 
@@ -115,6 +116,8 @@ def load_weights_into_model(
     - ``weights_iterator``       ``(path, disable_mmap, wants) -> (name, tensor)``
 
     ``online_quant_streamer`` tracks module completion during loading.
+    ``limit_pending_futures`` bounds tensors retained by asynchronous copies
+    when an external checkpoint reader can run ahead of device staging.
     """
 
     def _n_routed_experts() -> int | None:
@@ -214,6 +217,18 @@ def load_weights_into_model(
             futures.append(executor.submit(fn, *args))
         else:
             fn(*args)
+
+        # Each future retains its arguments, including the checkpoint tensor,
+        # until the copy finishes.  An unbounded queue therefore keeps an
+        # entire large checkpoint resident on CPU for every TP process when
+        # the iterator outruns H2D/expert staging.  Apply backpressure while
+        # still leaving one full wave queued behind the workers.
+        if (
+            executor is not None
+            and limit_pending_futures
+            and len(futures) >= 2 * num_threads
+        ):
+            futures.pop(0).result()
 
     batching_excluded = None
     if online_quant_streamer is not None:

@@ -4,7 +4,7 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/mimo_v2_flash.py
 
-from typing import Optional, Union
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -14,6 +14,9 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from aiter.rotary_embedding import get_rope
+from torch import nn
+from transformers import PretrainedConfig
+
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.base_attention import Attention
@@ -34,8 +37,6 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from torch import nn
-from transformers import PretrainedConfig
 from atom.utils.decorators import support_torch_compile
 
 
@@ -494,7 +495,8 @@ class MiMoV2Model(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+        return_hidden_states_before_norm: bool = False,
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, torch.Tensor]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -513,8 +515,15 @@ class MiMoV2Model(nn.Module):
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
+        hidden_states_before_norm = None
+        if return_hidden_states_before_norm:
+            hidden_states_before_norm = (
+                hidden_states if residual is None else hidden_states + residual
+            )
         hidden_states, _ = self.norm(hidden_states, residual)
 
+        if return_hidden_states_before_norm:
+            return hidden_states, hidden_states_before_norm
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
@@ -580,12 +589,14 @@ class MiMoV2ForCausalLM(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+        return_hidden_states_before_norm: bool = False,
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, torch.Tensor]:
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
+            return_hidden_states_before_norm=return_hidden_states_before_norm,
         )
         return hidden_states
 

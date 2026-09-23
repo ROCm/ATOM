@@ -395,6 +395,7 @@ def test_sglang_plugin_registration_does_not_require_kimi_k3_pool_modules():
         patch.object(register, "_install_decode_graph_forward_context_patch"),
         patch.object(register, "apply_prefill_compile_only_patch"),
         patch.object(register, "apply_triton_kernel_retention_patch"),
+        patch.object(register, "_install_mimo_v2_pool_symmetry_patch"),
         patch.object(
             register,
             "register_kimi_k3_text_only_processor",

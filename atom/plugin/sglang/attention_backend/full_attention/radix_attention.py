@@ -88,8 +88,16 @@ class RadixAttention(BaseAttention):
                 num_kv_heads=num_kv_heads,
                 layer_id=layer_num,
                 v_head_dim=_v_head_dim,
+                sliding_window_size=(
+                    per_layer_sliding_window if per_layer_sliding_window else -1
+                ),
                 prefix=maybe_prefix(prefix, "attn"),
             )
+            # Expose per-layer attention sinks on the SGLang layer so the ATOM
+            # backend can forward them to the SWA prefill/decode kernels. Keep a
+            # reference (weights load after __init__, so a converted copy here
+            # would capture uninitialized data).
+            self.attn.sinks = sinks
             # sglang's RadixAttention expects k_scale/v_scale on device;
             # ensure they exist with identity scaling for non-quantised KV cache.
             # device="cuda" is safe here: this branch is guarded by is_sglang(),

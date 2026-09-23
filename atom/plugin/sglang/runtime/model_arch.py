@@ -15,6 +15,7 @@ MODEL_TYPE_ADAPTER_ARCHES = {
     "deepseek_v4": "DeepseekV4ForCausalLM",
     "deepseek_v4_mtp": "DeepseekV4ForCausalLM",
     "kimi_k3": "KimiK3ForConditionalGeneration",
+    "mimo_v2": "MiMoV2ForCausalLM",
     "minimax_m3": "MiniMaxM3SparseForCausalLM",
     "minimax_m3_vl": "MiniMaxM3SparseForConditionalGeneration",
     "qwen3": "Qwen3ForCausalLM",
@@ -156,6 +157,20 @@ def _prepare_minimax_m2_config(atom_config: Any, model_arch: str) -> None:
     quant_config.remap_layer_name(
         atom_config.hf_config,
         packed_modules_mapping=MiniMaxM2ForCausalLM.packed_modules_mapping,
+    )
+
+
+def _prepare_mimo_v2_config(atom_config: Any, model_arch: str) -> None:
+    del model_arch
+    quant_config = getattr(atom_config, "quant_config", None)
+    if quant_config is None:
+        return
+
+    from atom.models.mimo_v2 import MiMoV2ForCausalLM
+
+    quant_config.remap_layer_name(
+        atom_config.hf_config,
+        packed_modules_mapping=MiMoV2ForCausalLM.packed_modules_mapping,
     )
 
 
@@ -432,6 +447,48 @@ def _prepare_eagle3_llama_draft_model_config(
     )
 
 
+def _prepare_mimo_v2_mtp_draft_model_config(
+    atom_config: Any, draft_config: Any
+) -> None:
+    """Switch plugin construction to SGLang's MiMo MTP draft config."""
+    import copy
+
+    from atom.config import QuantizationConfig, SpeculativeConfig
+
+    # MiMo checkpoints omit this field. ATOM's standalone speculative config
+    # uses the three MTP layers present in the checkpoint as the default.
+    num_mtp_layers = int(getattr(draft_config, "num_nextn_predict_layers", 3) or 3)
+    draft_config.num_nextn_predict_layers = num_mtp_layers
+    draft_config.n_predict = num_mtp_layers
+
+    atom_config.hf_config = draft_config
+    model_path = getattr(draft_config, "_name_or_path", None) or getattr(
+        draft_config, "name_or_path", None
+    )
+    if model_path:
+        atom_config.model = model_path
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+        num_speculative_tokens = int(
+            getattr(server_args, "speculative_num_steps", 1) or 1
+        )
+    except (ImportError, RuntimeError):
+        num_speculative_tokens = 1
+    atom_config.speculative_config = SpeculativeConfig(
+        method="mtp",
+        model=model_path,
+        num_speculative_tokens=num_speculative_tokens,
+        draft_model_hf_config=copy.deepcopy(draft_config),
+    )
+    atom_config.sglang_mtp_attention_layer_num = 0
+    atom_config.quant_config = QuantizationConfig(
+        draft_config,
+        online_quant_config=getattr(atom_config, "online_quant_config", None),
+    )
+
+
 def _eagle3_llama_construction_context():
     from atom.plugin.sglang.eagle3_llama_bridge import (
         eagle3_llama_native_attention_construction,
@@ -488,6 +545,13 @@ MODEL_ADAPTER_SPECS = {
     ),
     "Qwen3ForCausalLM": SGLangModelAdapterSpec(),
     "Qwen3MoeForCausalLM": SGLangModelAdapterSpec(),
+    "MiMoV2ForCausalLM": SGLangModelAdapterSpec(
+        prepare_config=_prepare_mimo_v2_config,
+    ),
+    "MiMoV2MTP": SGLangModelAdapterSpec(
+        prepare_draft_model_config=_prepare_mimo_v2_mtp_draft_model_config,
+        prepare_config=_prepare_mimo_v2_config,
+    ),
     "Qwen3NextForCausalLM": SGLangModelAdapterSpec(
         wrapper_binds_gdn_context=True,
     ),
@@ -573,6 +637,8 @@ MODEL_ARCH_SPECS = {
         "Qwen3_5ForCausalLM",
         "Qwen3_5MoeForCausalLM",
         "MiniMaxM2ForCausalLM",
+        "MiMoV2ForCausalLM",
+        "MiMoV2MTP",
         "MiniMaxM3SparseForCausalLM",
         "MiniMaxM3SparseForConditionalGeneration",
         "LlamaForCausalLMEagle3",

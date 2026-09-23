@@ -37,3 +37,7 @@ class ForwardMetadata:
     pa_metadata_kv_indices: torch.Tensor | None = None
     pa_metadata_context_lens: torch.Tensor | None = None
     pa_metadata_max_qlen: int | None = None
+    # MiMo's SHUFFLE cache uses separate full-attention and SWA slot spaces.
+    swa_kv_indices: torch.Tensor | None = None
+    swa_page_table: torch.Tensor | None = None
+    swa_out_cache_loc: torch.Tensor | None = None

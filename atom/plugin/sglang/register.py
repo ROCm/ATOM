@@ -159,6 +159,38 @@ def _register_tc_piecewise_attention_split_ops() -> None:
             SPLIT_OPS.append(op_name)
 
 
+def _install_mimo_v2_pool_symmetry_patch() -> None:
+    # MiMoV2 attention is asymmetric: qk_head_dim=192, v_head_dim=128. ATOM's
+    # model zero-pads V to 192 before attention and the ATOM RadixAttention
+    # adapter registers the SGLang attention layer at v_head_dim=192, but
+    # SGLang sizes the KV pool from ModelConfig.v_head_dim/swa_v_head_dim=128,
+    # so it stores 128-wide V while ATOM writes 192-wide V -> HIP OOB. Bump the
+    # ModelConfig dims to symmetric 192 right before pool allocation, on the
+    # exact model_config the pool uses (hf_config untouched so the model still
+    # splits fused QKV at 128).
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
+    if getattr(ModelRunner, "_atom_mimo_v2_pool_symmetry_patch", False):
+        return
+
+    original_alloc_memory_pool = ModelRunner.alloc_memory_pool
+
+    def alloc_memory_pool_with_mimo_v2_symmetric_kv(self, *args, **kwargs):
+        mc = self.model_config
+        archs = getattr(mc.hf_config, "architectures", None) or []
+        if (
+            any(arch in {"MiMoV2ForCausalLM", "MiMoV2MTP"} for arch in archs)
+            and _is_atom_external_model_enabled()
+            and (mc.v_head_dim != mc.head_dim or mc.swa_v_head_dim != mc.swa_head_dim)
+        ):
+            mc.v_head_dim = mc.head_dim
+            mc.swa_v_head_dim = mc.swa_head_dim
+        return original_alloc_memory_pool(self, *args, **kwargs)
+
+    ModelRunner.alloc_memory_pool = alloc_memory_pool_with_mimo_v2_symmetric_kv
+    ModelRunner._atom_mimo_v2_pool_symmetry_patch = True
+
+
 def register_plugin() -> None:
     """Install ATOM patches that must run before SGLang parses server args."""
 
@@ -172,6 +204,7 @@ def register_plugin() -> None:
     _install_decode_graph_forward_context_patch()
     apply_prefill_compile_only_patch()
     apply_triton_kernel_retention_patch()
+    _install_mimo_v2_pool_symmetry_patch()
     register_kimi_k3_text_only_processor()
 
     try:

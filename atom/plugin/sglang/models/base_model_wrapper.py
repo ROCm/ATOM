@@ -359,6 +359,18 @@ class _AtomCausalLMBaseForSglang(nn.Module):
             hidden_states=hidden_states,
         )
 
+    def _forward_mimo_v2_mtp(self, input_ids, positions, forward_batch, inputs_embeds):
+        spec_info = getattr(forward_batch, "spec_info", None)
+        previous_hidden_states = getattr(spec_info, "hidden_states", None)
+        if previous_hidden_states is None:
+            raise RuntimeError("MiMoV2MTP forward requires spec_info.hidden_states")
+        return self.model(
+            input_ids=input_ids,
+            positions=positions,
+            hidden_states=previous_hidden_states,
+            inputs_embeds=inputs_embeds,
+        )
+
     @torch.no_grad()
     def forward(
         self,
@@ -406,6 +418,28 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                             runtime.positions,
                             runtime.forward_batch,
                         )
+                    elif self.model_arch == "MiMoV2MTP":
+                        hidden_states = self._forward_mimo_v2_mtp(
+                            runtime.input_ids,
+                            runtime.positions,
+                            runtime.forward_batch,
+                            runtime.input_embeds,
+                        )
+                    elif self.model_arch == "MiMoV2ForCausalLM":
+                        hidden_states = self.model(
+                            **self._filter_model_forward_kwargs(
+                                {
+                                    **model_inputs,
+                                    "return_hidden_states_before_norm": bool(
+                                        getattr(
+                                            runtime.forward_batch,
+                                            "return_hidden_states_before_norm",
+                                            False,
+                                        )
+                                    ),
+                                }
+                            )
+                        )
                     elif self.model_arch_spec.wrapper_binds_gdn_context:
                         from atom.plugin.sglang.attention_backend.attention_gdn import (
                             SGLangGDNForwardContext,
@@ -446,7 +480,15 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                 hidden_states, aux_hidden_states = self._split_aux_hidden_states(
                     hidden_states
                 )
+                hidden_states_before_norm = None
+                if self.model_arch == "MiMoV2ForCausalLM":
+                    hidden_states_before_norm = aux_hidden_states
+                    aux_hidden_states = None
                 hidden_states = runtime.trim_output(hidden_states)
+                if hidden_states_before_norm is not None:
+                    hidden_states_before_norm = self._trim_aux_hidden_states(
+                        runtime, hidden_states_before_norm
+                    )
                 aux_hidden_states = self._trim_aux_hidden_states(
                     runtime, aux_hidden_states
                 )
@@ -482,6 +524,15 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                             aux_hidden_states=aux_hidden_states,
                             hidden_states_before_norm=hidden_states,
                         )
+                    if self.model_arch == "MiMoV2ForCausalLM":
+                        return self.logits_processor(
+                            logits_input_ids,
+                            hidden_states,
+                            self.logits_head,
+                            forward_batch,
+                            aux_hidden_states=aux_hidden_states,
+                            hidden_states_before_norm=hidden_states_before_norm,
+                        )
                     return self.logits_processor(
                         logits_input_ids,
                         hidden_states,
@@ -492,10 +543,9 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                 return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        # The passed `weights` iterable from sglang is ignored because ATOM
-        # uses its own weight loading pipeline (handling AITER-specific quant
-        # formats, kv_b_proj splitting, etc.) that is incompatible with
-        # sglang's default weight iterator.
+        # ATOM owns name rewriting, quantization and expert staging. MiMo
+        # supplies SGLang's checkpoint iterator to that pipeline below; other
+        # models retain their existing ATOM checkpoint readers.
         if self.model_arch == "LlamaForCausalLMEagle3":
             from atom.model_loader.loader import load_model
 
@@ -531,9 +581,29 @@ class _AtomCausalLMBaseForSglang(nn.Module):
 
         from atom.model_loader.loader import load_model_in_plugin_mode
 
+        weights_iterator_override = None
+        if self.model_arch in {"MiMoV2ForCausalLM", "MiMoV2MTP"}:
+            # Honor SGLang's configured checkpoint iterator, including the
+            # multithreaded shard reader selected by model-loader-extra-config.
+            # ATOM still owns name rewriting, quantization and expert staging;
+            # only the source of the checkpoint tensors changes.
+            def weights_iterator_override(_path, _disable_mmap, wants):
+                for name, tensor in weights:
+                    if wants is None or wants(name):
+                        yield name, tensor
+
         with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
             return load_model_in_plugin_mode(
-                model=self.model, config=self.atom_config, prefix="model."
+                model=self.model,
+                config=self.atom_config,
+                prefix="model.",
+                # The MiMo checkpoint contains the target and all three MTP
+                # blocks in the same shard set.  Draft loading must enable the
+                # MTP-only name filter/remapper; otherwise every target tensor
+                # is offered to the one-layer draft while the actual
+                # ``model.mtp.layers.*`` tensors are left unmapped.
+                spec_decode=self.model_arch == "MiMoV2MTP",
+                weights_iterator_override=weights_iterator_override,
             )
 
 
