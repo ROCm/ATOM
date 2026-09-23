@@ -42,7 +42,7 @@ BUDGET = 256  # one prefill chunk: four blocks
 PROMPT = 1024  # four budgets, so three saves are hidden behind the first
 
 
-def _adapter(monkeypatch, dcp=1):
+def _adapter(monkeypatch, dcp=1, *, block_size=BLOCK, chunk_size=CHUNK):
     """The adapter wired to a real `DenseOffloadScheduler`.
 
     Built without `__init__` for the same reason the sibling files do it: a real
@@ -51,12 +51,14 @@ def _adapter(monkeypatch, dcp=1):
     monkeypatch.setattr(
         offcfg,
         "build_lmcache_config",
-        lambda _c=None: SimpleNamespace(chunk_size=CHUNK * dcp),
+        lambda _c=None, _chunk=chunk_size, _dcp=dcp: SimpleNamespace(
+            chunk_size=_chunk * _dcp
+        ),
     )
     monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_a: object())
     config = SimpleNamespace(
         kv_transfer_config={"kv_role": "kv_both"},
-        kv_cache_block_size=BLOCK,
+        kv_cache_block_size=block_size,
         decode_context_parallel_size=dcp,
         tensor_parallel_size=WORLD,
     )
@@ -64,6 +66,9 @@ def _adapter(monkeypatch, dcp=1):
     adapter._scheduler = dense_mod.DenseOffloadScheduler(config)
     adapter._config = config
     adapter._seqs = SeqViewRegistry()
+    adapter._requests = {}
+    adapter._attn_group_id = 0
+    adapter._kda_planner = None
     adapter._promised_loads = {}
     adapter._deferred_frees = set()
     adapter._deferred_free_at = {}
@@ -79,10 +84,12 @@ def _adapter(monkeypatch, dcp=1):
     return adapter, adapter._scheduler
 
 
-def _admit(adapter, req_id="r0", prompt=PROMPT, allocated=BUDGET):
+def _admit(
+    adapter, req_id="r0", prompt=PROMPT, allocated=BUDGET, block=BLOCK
+):
     """Admit a request whose block table covers only its first prefill chunk."""
     request = SimpleNamespace(request_id=req_id, prompt_token_ids=list(range(prompt)))
-    blocks = list(range(allocated // BLOCK))
+    blocks = list(range(allocated // block))
     adapter.update_state_after_alloc(request, (blocks,), 0)
     return request, adapter._seqs.get(req_id), len(blocks)
 
@@ -153,6 +160,35 @@ def test_a_chunked_prefill_saves_past_its_first_chunk(monkeypatch):
         "without the growth loop the frontier is pinned at the admitted table "
         "and only the first chunk is ever stored"
     )
+
+
+def test_glm53_recipe_stores_the_second_prefill_budget(monkeypatch):
+    """Recipe geometry: chunk 256, one prefill budget 16384, prompt 32768.
+
+    The failure this file exists for was measured as "stored exactly one
+    budget and every metric reported success". The scaled-down test above
+    uses a 256-token budget; this one uses the GLM-5.3 server's
+    ``--max-num-batched-tokens 16384`` and ``LMCACHE_CHUNK_SIZE=256``.
+    """
+    block, chunk, budget, prompt = 64, 256, 16384, 32768
+    adapter, scheduler = _adapter(monkeypatch, block_size=block, chunk_size=chunk)
+    assert scheduler.chunk_size == chunk
+    _request, seq, blocks = _admit(
+        adapter, prompt=prompt, allocated=budget, block=block
+    )
+    assert len(seq.block_table) == blocks == budget // block
+
+    stored = []
+    per_budget = budget // block
+    for step in range(1, prompt // budget + 1):
+        grown = range(step * per_budget, (step + 1) * per_budget)
+        requests = _step(adapter, "r0", step * budget, new_blocks=list(grown))
+        stored.extend(_saves(requests))
+        for req in requests:
+            if getattr(req, "save_operation", None) is not None:
+                _land(adapter, req.save_operation)
+
+    assert stored == [(0, budget), (budget, prompt)]
 
 
 def test_the_frontier_never_outruns_the_blocks_it_names(monkeypatch):
