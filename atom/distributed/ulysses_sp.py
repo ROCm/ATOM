@@ -29,15 +29,11 @@ into the EP group. Pure Ulysses therefore runs at ``-tp 1 -sp W``.
 from functools import partial
 
 import torch
-from aiter.dist.parallel_state import (
-    get_pcp_group,
-    get_prefill_context_model_parallel_rank,
-    get_tp_group,
-)
 
-from atom.distributed.sp_kernels import all_to_all_into, pack_fields
 from atom.utils import envs
 
+# Metadata helpers are also used by CPU-only forward-context consumers. Import
+# AITER and Triton only in the operations that need their GPU runtime.
 # Set by each ModelRunner before distributed/model construction.
 _SP_WORLD_SIZE: int = 1
 
@@ -59,10 +55,14 @@ def sp_is_enabled() -> bool:
 def get_sp_rank() -> int:
     if _SP_WORLD_SIZE <= 1:
         return 0
+    from aiter.dist.parallel_state import get_prefill_context_model_parallel_rank
+
     return get_prefill_context_model_parallel_rank()
 
 
 def get_sp_group():
+    from aiter.dist.parallel_state import get_pcp_group
+
     return get_pcp_group()
 
 
@@ -74,6 +74,8 @@ def attn_head_shard_size() -> int:
     TP size alone, or the KV cache will be sized for heads this rank never
     computes.
     """
+    from aiter.dist.parallel_state import get_tp_group
+
     return get_tp_group().world_size * _SP_WORLD_SIZE
 
 
@@ -218,6 +220,8 @@ def ulysses_gather_heads(x: torch.Tensor) -> torch.Tensor:
 
 def _swap_heads(x, s_local, width):
     """``[w*s_local, width] -> [s_local, w*width]`` by all-to-all."""
+    from atom.distributed.sp_kernels import all_to_all_into
+
     send = x.reshape(_SP_WORLD_SIZE, s_local, width).contiguous()
     recv = torch.empty_like(send)
     all_to_all_into(recv, send, get_sp_group())
@@ -270,6 +274,8 @@ _REPLICATE = 1  # one shard, replicated on every rank
 
 def _exchange(send):
     """All-to-all a ``[W, S/W, width]`` send buffer into global token order."""
+    from atom.distributed.sp_kernels import all_to_all_into
+
     recv = torch.empty_like(send)
     all_to_all_into(recv, send, get_sp_group())
     # recv[i] holds rank i's tokens for our slice; ranks own contiguous token
@@ -325,6 +331,8 @@ def _exchange_columns(source, spec, owner):
     w = _SP_WORLD_SIZE
     group = get_sp_group()
     if not _prefer_all_gather(source, group):
+        from atom.distributed.sp_kernels import pack_fields
+
         return _exchange(pack_fields(source, tuple(spec), w))
     columns = getattr(owner, "_sp_send_columns", None)
     if columns is None or columns.device != source.device:
