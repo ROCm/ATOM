@@ -167,6 +167,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # own MEGA_DISPATCH=flydsl|mori), 0 binds mori's v2 op-layer running plain
     # gather, i.e. the untouched upstream baseline.
     "ATOM_MORI_V2_FUSED": lambda: os.getenv("ATOM_MORI_V2_FUSED", "0") == "1",
+    # MegaMoE combine (return-trip) wire: bf16 | fp8 | fp4. Prefill-only; decode
+    # always combines in bf16. Ignored unless ATOM_MORI_V2_FUSED is on.
+    "ATOM_MEGA_COMBINE_WIRE": lambda: os.getenv("ATOM_MEGA_COMBINE_WIRE", "bf16"),
     # Reuse a 128-token MegaMoEV2 instance for native DP-unified small decode/
     # verify/draft forwards on the supported EP8, 48-experts-per-rank layout. Set to 0
     # to keep the configured max_num_batched_tokens capacity for every graph.

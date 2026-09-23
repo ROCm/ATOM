@@ -194,7 +194,7 @@ def _cco_per_rank_vmm(
 # are config-wide, so the first layer's are the model's.
 _MEGA_TRANSPORTS: dict = {}
 
-# $MEGA_COMBINE_WIRE, the return trip's counterpart to $MEGA_DISPATCH_WIRE
+# $ATOM_MEGA_COMBINE_WIRE, the return trip's counterpart to $MEGA_DISPATCH_WIRE
 # below, spelled the same bf16|fp8|fp4 way. Unlike the dispatch wire it is a
 # free choice: combine moves post-expert tokens, so nothing downstream demands
 # a particular width. aiter names the same formats after their MX block layout.
@@ -203,10 +203,10 @@ _MEGA_TRANSPORTS: dict = {}
 # saving that scales with the tokens on the wire, so decode asks for bf16 back.
 # See MoriV2PrepareAndFinalize.combine_quant_for_step.
 _COMBINE_WIRES = {"bf16": "none", "fp8": "mxfp8", "fp4": "mxfp4"}
-_MEGA_COMBINE_WIRE = os.environ.get("MEGA_COMBINE_WIRE", "bf16")
+_MEGA_COMBINE_WIRE = envs.ATOM_MEGA_COMBINE_WIRE
 if _MEGA_COMBINE_WIRE not in _COMBINE_WIRES:
     raise RuntimeError(
-        f"MEGA_COMBINE_WIRE must be one of {sorted(_COMBINE_WIRES)}, "
+        f"ATOM_MEGA_COMBINE_WIRE must be one of {sorted(_COMBINE_WIRES)}, "
         f"got {_MEGA_COMBINE_WIRE!r}"
     )
 # Read once, like the dispatch wire: this is consulted per layer per forward.
@@ -256,7 +256,7 @@ def init_mega_transport(
     uses is aiter's own call (MEGA_DISPATCH=flydsl|mori).
 
     ``combine_quant`` names the quantized return-trip format this transport is
-    to BUILD ($MEGA_COMBINE_WIRE, in aiter's spelling). It is a capability, not
+    to BUILD ($ATOM_MEGA_COMBINE_WIRE, in aiter's spelling). It is a capability, not
     the choice: MegaMoE compiles a combine reduce for it and for bf16, and
     every forward then names the one it wants -- bf16 unless it says otherwise.
     See combine_quant_for_step.
