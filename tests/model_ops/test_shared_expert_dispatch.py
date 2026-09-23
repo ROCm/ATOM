@@ -255,3 +255,37 @@ def test_rccl_backend_does_not_take_mori_shared_expert_gate(monkeypatch):
     )
 
     assert is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(None)
+
+
+@pytest.mark.parametrize("backend", ["none", "rccl", "mori"])
+@pytest.mark.parametrize("sp_size", [1, 4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float4_e2m1fn_x2])
+def test_sp_shared_mlp_fallback_matches_loader_decision(
+    monkeypatch, backend, sp_size, dtype
+):
+    spec = SimpleNamespace(quant_dtype=dtype, quant_type=None, is_dynamic=False)
+    quant = SimpleNamespace(
+        quant_dtype=dtype,
+        exclude_layers=[],
+        global_quant_config=spec,
+        get_layer_quant_config=lambda *args, **kwargs: spec,
+    )
+    config = atom_config_double(
+        quant_config=quant,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        sequence_parallel_size=sp_size,
+        enable_expert_parallel=True,
+        moe_all2all_backend=backend,
+    )
+    monkeypatch.setattr(topK_module, "get_current_atom_config", lambda: config)
+    monkeypatch.setattr(topK_module.envs, "ATOM_DISABLE_MORI_EP", False)
+    monkeypatch.setattr(topK_module, "_has_module", lambda name: True)
+    expected = not (sp_size > 1 and backend != "none" and dtype == torch.bfloat16)
+    # Module construction and checkpoint loading must choose the same layout.
+    assert is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(None) == expected
+    assert (
+        is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+            quant, shared_expert_prefix="shared", routed_expert_prefix="experts"
+        )
+        == expected
+    )
