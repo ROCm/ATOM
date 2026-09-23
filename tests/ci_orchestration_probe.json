@@ -1,0 +1,7 @@
+{
+  "revision": 1,
+  "smoke_delay_seconds": 180,
+  "smoke_exit_code": 1,
+  "matrix_delay_seconds": 15,
+  "matrix_fail_case": "failure-probe"
+}
