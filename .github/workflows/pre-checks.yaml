@@ -29,6 +29,6 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - run: python3 -m pip install pytest pyyaml
-    - run: pytest --noconftest -p no:cacheprovider -q tests/test_heavy_ci_gate.py
+    - run: pytest --noconftest -p no:cacheprovider -q tests/test_heavy_ci_gate.py tests/test_ci_orchestration_edges.py
       env:
         PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
