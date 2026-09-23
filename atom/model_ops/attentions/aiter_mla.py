@@ -437,20 +437,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self.persistent_num_heads = self.padded_num_attention_heads
 
         if self.sparse_dcp_metadata_rebuild:
-            # sparse_prefill_num_heads / sparse_mtp_num_heads below reuse
-            # persistent_num_heads (decode's width function/table) to size the
-            # sparse-prefill work buffers, instead of calling
-            # mla_dcp_sparse_prefill_num_heads (the function attention_mla.py
-            # actually uses to pad the runtime gathered Q). The two agree for
-            # every head count in production today (128- or 64-head models on
-            # power-of-two tp/dcp), but decode's persistent branch returns the
-            # unrounded multiple of 16 (e.g. 48) while sparse prefill's own
-            # table rounds up to its dispatchable set (16/32/64/128) -- so a
-            # future sparse model whose gathered width lands off that set
-            # would get work buffers sized for one width while the kernel
-            # dispatches at another. Assert it here, once at metadata-builder
-            # construction, rather than let it surface as a corrupted reduce
-            # write or an unrelated-looking crash deep in a later step.
+            # sparse_prefill_num_heads/sparse_mtp_num_heads below reuse
+            # persistent_num_heads (decode's width function), not
+            # mla_dcp_sparse_prefill_num_heads (what attention_mla.py actually
+            # pads the gathered Q to). They agree for every head count in
+            # production today, but decode's persistent branch returns an
+            # unrounded multiple of 16 while sparse prefill rounds up to
+            # 16/32/64/128 -- assert they still agree rather than let a
+            # future mismatch surface as a corrupted reduce write.
             expected_sparse_prefill_num_heads = mla_dcp_sparse_prefill_num_heads(
                 self.num_attention_heads,
                 self.dcp_world_size,
