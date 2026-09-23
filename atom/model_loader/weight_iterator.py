@@ -203,7 +203,9 @@ def _start_prefetch(files: list[str], num_threads: int, block_size: int) -> None
 
 
 def _shards_worth_reading(
-    files: list[str], wants: Callable[[str], bool] | None
+    files: list[str],
+    wants: Callable[[str], bool] | None,
+    indexed_names: dict[str, set[str]] | None = None,
 ) -> list[str]:
     """Drop shards holding nothing the caller wants, by header alone.
 
@@ -219,9 +221,44 @@ def _shards_worth_reading(
     kept = []
     for st_file in files:
         names = _shard_tensor_names(st_file)
-        if names is None or any(map(wants, names)):
+        allowed = (
+            None
+            if indexed_names is None
+            else indexed_names.get(os.path.basename(st_file))
+        )
+        if names is None or any(
+            (allowed is None or name in allowed) and wants(name) for name in names
+        ):
             kept.append(st_file)
     return kept
+
+
+def _indexed_names_by_shard(path: str) -> dict[str, set[str]] | None:
+    """Return the index-authorized tensor names for each shard, if indexed.
+
+    A Hugging Face overlay may deliberately remap a tensor to a replacement
+    shard while reusing the original shard for every other tensor. Reading
+    every key physically present in that original shard would load both the
+    stale and replacement copies. The index is therefore authoritative when
+    it exists, matching the logical checkpoint view exposed by Transformers.
+    """
+
+    index_path = os.path.join(path, SAFE_WEIGHTS_INDEX_NAME)
+    if not os.path.isfile(index_path):
+        return None
+    try:
+        with open(index_path, encoding="utf-8") as f:
+            index = json.load(f)
+        weight_map = index["weight_map"]
+        if not isinstance(weight_map, dict):
+            return None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    by_shard: dict[str, set[str]] = {}
+    for name, shard in weight_map.items():
+        if isinstance(name, str) and isinstance(shard, str):
+            by_shard.setdefault(os.path.basename(shard), set()).add(name)
+    return by_shard
 
 
 def safetensors_weights_iterator(
@@ -247,7 +284,9 @@ def safetensors_weights_iterator(
     hf_weights_files = filter_duplicate_safetensors_files(
         glob(os.path.join(path, "*.safetensors")), path, SAFE_WEIGHTS_INDEX_NAME
     )
-    hf_weights_files = _shards_worth_reading(hf_weights_files, wants)
+    indexed_names = _indexed_names_by_shard(path)
+    if wants is not None:
+        hf_weights_files = _shards_worth_reading(hf_weights_files, wants, indexed_names)
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
@@ -276,7 +315,7 @@ def safetensors_weights_iterator(
         disable=not enable_tqdm,
     )
     try:
-        yield from _iter_shards(iters, disable_mmap, prefetching, wants)
+        yield from _iter_shards(iters, disable_mmap, prefetching, wants, indexed_names)
     finally:
         # Whether the caller drained this or abandoned it, nothing is going to
         # read these files again, so stop warming the cache for them. Without
@@ -286,10 +325,25 @@ def safetensors_weights_iterator(
 
 
 def _iter_shards(
-    iters, disable_mmap: bool, prefetching: bool, wants: Callable[[str], bool] | None
+    iters,
+    disable_mmap: bool,
+    prefetching: bool,
+    wants: Callable[[str], bool] | None,
+    indexed_names: dict[str, set[str]] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Yield every wanted tensor of each shard, in the order given."""
     for st_file in iters:
+        allowed = (
+            None
+            if indexed_names is None
+            else indexed_names.get(os.path.basename(st_file))
+        )
+
+        def selected(name: str) -> bool:
+            return (allowed is None or name in allowed) and (
+                wants is None or wants(name)
+            )
+
         # Advise kernel for sequential read-ahead (mmap optimization)
         if (
             not prefetching
@@ -316,12 +370,12 @@ def _iter_shards(
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
                 for name, param in result.items():
-                    if wants is None or wants(name):
+                    if selected(name):
                         yield name, param
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 # `.keys()` is not redundant here: `safe_open` is a Rust object
                 # with no `__iter__`, so iterating it directly raises TypeError.
                 for name in f.keys():  # noqa: SIM118
-                    if wants is None or wants(name):
+                    if selected(name):
                         yield name, f.get_tensor(name)
