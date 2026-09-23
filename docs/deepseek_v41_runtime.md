@@ -120,7 +120,7 @@ windows, accepted-prefix state, calibration profile, supported scope and **quali
 limitations** are in [the DSpark guide](deepseek_v41_dspark.md). Packed
 speculative caches and multimodal speculation are rejected, as are
 PP/CP, DP without DP attention, decode TBO, KV transfer, plugin execution and
-EPLB — all before loading. Four-rank DPA supports text requests and prefill TBO.
+EPLB — all before loading. DP attention supports text requests and prefill TBO.
 Compilation level 3 is admitted with FULL graphs or eager execution; the
 [AgentX recipe](../recipes/DeepSeek-V4.1-Flash-Agentic.md) records TP2/TP4
 no-EP GPU benchmark results with fixed acceptance length 3.51.

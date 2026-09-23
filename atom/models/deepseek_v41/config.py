@@ -328,12 +328,6 @@ def validate_speculative_config(config):
 
         if Path(speculative.model).resolve() != Path(config.model).resolve():
             raise ValueError("DeepSeek-V4.1 DSpark must use the target checkpoint")
-    if config.enable_dp_attention:
-        # CoreManager normalizes -tp 4 DPA into TP1/DP4. Keep main's TP
-        # dimension-based admission while limiting this new DPA deployment.
-        width = config.tensor_parallel_size * config.parallel_config.data_parallel_size
-        if width != 4:
-            raise ValueError("DeepSeek-V4.1 DSpark requires four DPA ranks")
     if config.kv_cache_dtype != "bf16":
         raise ValueError("DeepSeek-V4.1 DSpark requires a BF16 KV cache")
     from atom.utils import envs

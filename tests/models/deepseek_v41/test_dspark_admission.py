@@ -105,20 +105,12 @@ def test_native_and_fixed_acceptance_schedules_are_admitted(tp_size, rates):
     validate_speculative_config(cfg)
 
 
-@pytest.mark.parametrize("tp,dp", [(4, 1), (1, 4)])
-def test_dpa_dspark_before_and_after_engine_normalization(tp, dp):
+@pytest.mark.parametrize(
+    "tp,dp", [(1, 1), (2, 1), (4, 1), (8, 1), (1, 2), (1, 4), (1, 8), (2, 2), (4, 2)]
+)
+def test_dpa_dspark_admission_does_not_fix_parallel_width(tp, dp):
     value = config()
     value.enable_dp_attention = True
     value.tensor_parallel_size = tp
     value.parallel_config.data_parallel_size = dp
     validate_speculative_config(value)
-
-
-@pytest.mark.parametrize("tp,dp", [(1, 1), (1, 2), (1, 8), (4, 2)])
-def test_dspark_rejects_unvalidated_dpa_width(tp, dp):
-    value = config()
-    value.enable_dp_attention = True
-    value.tensor_parallel_size = tp
-    value.parallel_config.data_parallel_size = dp
-    with pytest.raises(ValueError, match="four DPA ranks"):
-        validate_speculative_config(value)
