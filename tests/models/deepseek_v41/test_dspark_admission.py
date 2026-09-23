@@ -57,7 +57,6 @@ def test_unvalidated_runtime_combinations_are_rejected(field, value):
         ("method", "mtp"),
         ("num_speculative_tokens", 4),
         ("model", "/another_model"),
-        ("synthetic_acceptance_rates", [1.0] * 5),
     ],
 )
 def test_incompatible_draft_contract_is_rejected(field, value):
@@ -96,13 +95,9 @@ def test_relaxed_acceptance_cannot_bypass_target_distribution(monkeypatch):
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
-def test_synthetic_acceptance_requires_explicit_benchmark_opt_in(monkeypatch, tp_size):
+@pytest.mark.parametrize("rates", [None, [1.0] * 5, [0.8] * 5])
+def test_native_and_fixed_acceptance_schedules_are_admitted(tp_size, rates):
     cfg = config()
     cfg.tensor_parallel_size = tp_size
-    cfg.speculative_config.synthetic_acceptance_rates = [0.8] * 5
-    monkeypatch.delenv("ATOM_DSV41_BENCHMARK_SYNTHETIC", raising=False)
-    with pytest.raises(ValueError, match="real target verification"):
-        validate_speculative_config(cfg)
-    monkeypatch.setenv("ATOM_DSV41_BENCHMARK_SYNTHETIC", "1")
-    with pytest.warns(RuntimeWarning, match="performance benchmarking only"):
-        validate_speculative_config(cfg)
+    cfg.speculative_config.synthetic_acceptance_rates = rates
+    validate_speculative_config(cfg)

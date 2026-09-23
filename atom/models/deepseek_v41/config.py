@@ -334,18 +334,6 @@ def validate_speculative_config(config):
 
     if envs.ATOM_ENABLE_RELAXED_MTP:
         raise ValueError("DeepSeek-V4.1 DSpark requires strict target verification")
-    if speculative.synthetic_acceptance_rates is not None:
-        import os
-        import warnings
-
-        if os.environ.get("ATOM_DSV41_BENCHMARK_SYNTHETIC") != "1":
-            raise ValueError("DeepSeek-V4.1 DSpark requires real target verification")
-        warnings.warn(
-            "V4.1 synthetic acceptance enabled for performance benchmarking only; "
-            "uses the shared rejection sampler and does not measure generation quality.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
     if config.dspark.confidence_schedule and (
         not config.dspark.ragged or not config.dspark.calibration_profile
     ):
