@@ -428,7 +428,10 @@ MoE 重复诊断使用 `MOE_REPEAT_RESULT=/tmp/moe-repeat.jsonl`，运行
 
 ## PCP 比较范围
 
-当前原生 PCP 的完整集成面向 MLA/DeepSeek-V4。Qwen3 和 M3 的 GQA 路径没有
-完整的 PCP KV 通信与对应 MoE token 流程，直接打开 PCP 参数并不是有效的正确性
-基线。本轮证据支持上述配置下的 TP/SP 比较，**不支持“已胜过 PCP”或
+当前原生 PCP 的受支持模型仅为 DeepSeek-V4，见
+[PCP 模型支持说明](context_parallel_guide.md#prefill-context-parallel-pcp-guide)。
+Qwen3 和 M3 的 GQA 路径没有完整的 PCP token 切分、KV 通信与对应 MoE 流程，
+直接打开 PCP 参数并不是有效的正确性基线。Ulysses SP 虽然复用 PCP 的进程组
+维度，但执行的是独立的 token/head all-to-all 路径；SP 可用不代表原生 PCP 已适配。
+本轮证据支持上述配置下的 TP/SP 比较，**不支持“已胜过 PCP”或
 “所有模型、输入、批量下最优”这一结论**。
