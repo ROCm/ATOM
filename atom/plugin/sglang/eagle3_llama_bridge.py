@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import inspect
 import logging
-import os
 from contextlib import contextmanager
 from typing import Any
 
 import torch
 
 from atom.plugin.sglang.models.minimax_m3 import SGLangATOMMiniMaxM3Attention
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -571,6 +572,11 @@ def _patch_sglang_eagle3_state_lifecycle() -> None:
     state_attr = "_atom_sglang_eagle3_num_reject_tokens"
     original_filter_batch = EagleDraftInput.filter_batch
     original_merge_batch = EagleDraftInput.merge_batch
+    try:
+        filter_signature = inspect.signature(original_filter_batch)
+        filter_has_legacy_flag = "has_been_filtered" in filter_signature.parameters
+    except (TypeError, ValueError):
+        filter_has_legacy_flag = False
     uses_pool_indexed_future_map = all(
         hasattr(FutureMap, name) for name in ("stash", "_resolve_spec_extras")
     )
@@ -619,18 +625,21 @@ def _patch_sglang_eagle3_state_lifecycle() -> None:
             ]
         )
 
-    def filter_batch(self, new_indices, has_been_filtered: bool = True):
+    def filter_batch(self, new_indices, *args, **kwargs):
         # With overlap scheduling, ``future_indices`` is the only payload that
         # is ready on the scheduler stream.  The tensors attached to
         # ``EagleDraftInput`` are produced on the forward stream and are
         # intentionally resolved lazily by ``FutureMap.resolve_future``.
         # Reading/indexing our plugin-only state here would introduce the same
         # cross-stream race that SGLang's native early-return avoids.
+        has_been_filtered = bool(
+            kwargs.get("has_been_filtered", filter_has_legacy_flag)
+        )
+        if args and isinstance(args[0], bool):
+            has_been_filtered = args[0]
         state_is_deferred = getattr(self, "future_indices", None) is not None
         state_before = getattr(self, state_attr, None)
-        ret = original_filter_batch(
-            self, new_indices, has_been_filtered=has_been_filtered
-        )
+        ret = original_filter_batch(self, new_indices, *args, **kwargs)
 
         output_rows = _row_count(self)
         if state_is_deferred:
@@ -740,6 +749,12 @@ def _patch_sglang_eagle3_state_lifecycle() -> None:
 
     def pool_indexed_future_store(self, future_indices, payload):
         ret = original_future_store(self, future_indices, payload)
+        # FutureMap is shared by ordinary generation and speculative decoding.
+        # Do not create/copy EAGLE3-only state for non-EAGLE payloads: a tiny
+        # CPU-to-GPU copy here synchronizes the forward stream and defeats
+        # SGLang's overlap scheduler after every prefill.
+        if not hasattr(payload, state_attr):
+            return ret
         indices = future_indices
         if not torch.is_tensor(indices) or indices.numel() == 0:
             return ret
@@ -1020,15 +1035,13 @@ def _patch_sglang_eagle3_draft_extend_compat() -> None:
 def _patch_sglang_eagle3_tp_verify_broadcast() -> None:
     """Optionally broadcast SGLang EAGLE3 verify outputs across TP ranks."""
 
-    if os.getenv("ATOM_SGLANG_EAGLE3_TP_VERIFY_BROADCAST", "0") != "1":
+    if not envs.ATOM_SGLANG_EAGLE3_TP_VERIFY_BROADCAST:
         return
 
     try:
         from sglang.srt.distributed import get_tp_group
-        from sglang.srt.layers.dp_attention import (
-            get_attention_tp_group,
-            is_dp_attention_enabled,
-        )
+        from sglang.srt.distributed.parallel_state import get_attn_tp_group
+        from sglang.srt.layers.dp_attention import is_dp_attention_enabled
         from sglang.srt.speculative import eagle_worker_v2 as eagle_worker_module
         from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
@@ -1051,9 +1064,7 @@ def _patch_sglang_eagle3_tp_verify_broadcast() -> None:
 
     def _broadcast_sample_result(result):
         predict, accept_lens, accept_index = result
-        tp_group = (
-            get_attention_tp_group() if is_dp_attention_enabled() else get_tp_group()
-        )
+        tp_group = get_attn_tp_group() if is_dp_attention_enabled() else get_tp_group()
         if tp_group.world_size > 1:
             tp_group.broadcast(predict, src=0)
             tp_group.broadcast(accept_lens, src=0)

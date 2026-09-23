@@ -71,8 +71,9 @@ python -m atom.entrypoints.openai_server \
 ```
 
 Notes for Kimi-K3:
-- The draft is a standalone MLA model; its KV cache is allocated independently of
-  the target and is kept in **bf16** regardless of the target's `--kv_cache_dtype`.
+- The draft is a standalone MLA model. Its 576-wide latent is the same shape the
+  target's own full-attention layers cache, so the draft's 5 layers bind into
+  the target's KV pool as extra rows and inherit `--kv_cache_dtype`.
 - `--draft-model` accepts a local path or an HF repo id (downloaded on startup).
 - The confidence-scheduled ragged verify (`--dspark-config`) also applies here;
   omit it to run the plain batch-uniform verify.
@@ -104,6 +105,11 @@ Tips on server configuration:
   removed.
 - Do **not** pass `--enforce-eager` with the ragged CUDA-graph path — ragged
   replays captured `(bs, q_eff)` graphs. Eager also works for correctness checks.
+- `confidence_schedule` (and therefore `ragged`) cannot be combined with the
+  forced-acceptance knobs `--spec-decode-acceptance-length` /
+  `--spec-decode-acceptance-rate`: a runtime-chosen verify length can cap
+  acceptance below the requested length, so ATOM rejects the pair at startup.
+  See [Forced acceptance length](../docs/forced_acceptance_length.md).
 - Clear compile cache before restarting after code changes: `rm -rf /root/.cache/atom/*`
 
 ## Performance baseline (DeepSeek-V4-Pro)

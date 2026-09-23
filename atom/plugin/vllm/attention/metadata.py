@@ -1,6 +1,6 @@
 import logging
+import math
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
@@ -17,7 +17,7 @@ from vllm.v1.attention.backend import (
 
 from atom.config import get_current_atom_config
 from atom.distributed.dcp_utils import dcp_persistent_supported
-from atom.model_ops.attention_mla import _MLA_MIN_HEADS
+from atom.model_ops.attention_mla import _MLA_MIN_HEADS, mla_dcp_kernel_num_heads
 from atom.plugin.vllm.attention.layer_mla import (
     disabled_mla_persistent_metadata,
     mla_fold_kv_metadata_triton,
@@ -30,12 +30,14 @@ logger = logging.getLogger("atom")
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 
+# aiter's persistent MLA work plan, matching ATOM's native decode settings.
+_MLA_FAST_MODE = True
+_MLA_MAX_SPLIT_PER_BATCH = 16
+
 
 def get_aiter_kv_cache_dtype(config) -> torch.dtype:
     kv_cache_dtype = config.cache_config.cache_dtype
-    if kv_cache_dtype == "auto":
-        kv_cache_dtype = "bf16"
-    elif kv_cache_dtype == "bfloat16":
+    if kv_cache_dtype == "auto" or kv_cache_dtype == "bfloat16":
         kv_cache_dtype = "bf16"
     elif kv_cache_dtype == "float16":
         kv_cache_dtype = "fp16"
@@ -54,7 +56,7 @@ class AiterChunkSlidingWindowMetadata:
     swa_seqlens: torch.Tensor
     swa_cu_seqlens: torch.Tensor
     swa_seq_starts: torch.Tensor
-    swa_token_to_batch: torch.Tensor
+    swa_batch_id_per_k_token: torch.Tensor
     swa_max_seqlens: int
     swa_total_tokens: int
     swa_workspace: torch.Tensor
@@ -65,13 +67,13 @@ class AiterChunkContextMetadata:
     workspace: torch.Tensor
     cu_seq_lens_chunk: torch.Tensor
     chunk_starts: torch.Tensor
-    token_to_batch: torch.Tensor
+    batch_id_per_k_token: torch.Tensor
     seq_tot: list[int]
     max_seq_lens: list[int]
     seq_lens: torch.Tensor
     num_chunks: int
     total_token_per_batch: list[int]
-    swa_metadata: Optional[AiterChunkSlidingWindowMetadata] = None
+    swa_metadata: AiterChunkSlidingWindowMetadata | None = None
 
 
 @dataclass
@@ -110,9 +112,9 @@ class AiterMhaMetadataForVllm:
     num_extend_tokens: int
     dropout_p: float = 0.0
 
-    decode_metadata: Optional[AiterMhaPhaseMetadata] = None
-    prefill_metadata: Optional[AiterMhaPhaseMetadata] = None
-    extend_metadata: Optional[AiterChunkPrefillMetadata] = None
+    decode_metadata: AiterMhaPhaseMetadata | None = None
+    prefill_metadata: AiterMhaPhaseMetadata | None = None
+    extend_metadata: AiterChunkPrefillMetadata | None = None
 
     use_cascade: bool = False
     common_prefix_len: int = 0
@@ -140,6 +142,15 @@ class AiterMlaDecodeMetadataForVllm:
     max_qo_len: int | None = None
     # Whether dense MLA persistent metadata was built for this decode batch.
     use_persistent_metadata: bool = False
+    # False only for a bidirectional draft block, where every position attends
+    # to the whole block. The asm kernel picks a different .co by this and the
+    # persistent work descriptors are planned for it, so the two have to agree.
+    causal: bool = True
+    # Global (pre-DCP-shard) cumulative KV lengths, shape [num_decode + 1].
+    # Only built for a causal multi-token decode under DCP, where the kernel
+    # needs them to place the intra-block mask on global positions; None
+    # otherwise, which is what selects the plain (non-cprr) kernel.
+    g_kv_indptr: torch.Tensor | None = None
     # The fold factor for handling mqa_ratio=64 in non-persistent mode
     fold_factor: int | None = None
     # Fold buffers for the MLA nhead-fold workaround. These are populated by
@@ -176,7 +187,7 @@ class AiterMlaPrefillMetadataForVllm:
         max_seq_lens: list[int]
         seq_lens: torch.Tensor
         workspace: torch.Tensor
-        token_to_seq: torch.Tensor
+        batch_id_per_k_token: torch.Tensor
         chunk_total_token: list[int]
         prefill_tokens_with_context: int | None = None
 
@@ -187,9 +198,9 @@ class AiterMlaPrefillMetadataForVllm:
         cu_seq_lens_lst: list[list[int]] | None = None
         chunk_size: int | None = None
         # Per-chunk local token->seq map for gather_and_maybe_dequant_cache under
-        # fp8 DCP (mirrors token_to_seq but over the padded local per-rank
+        # fp8 DCP (mirrors batch_id_per_k_token but over the padded local per-rank
         # chunk layout). [num_chunks, max_local_toks].
-        padded_local_token_to_seq: torch.Tensor | None = None
+        padded_local_batch_id_per_k_token: torch.Tensor | None = None
 
     block_table: torch.Tensor
     query_start_loc: torch.Tensor
@@ -245,7 +256,7 @@ class AiterMlaSparseIndexerPrefillChunkMetadataForVllm:
     cu_seqlen_ks: torch.Tensor
     cu_seqlen_ke: torch.Tensor
     cu_seq_lens: torch.Tensor
-    token_to_seq: torch.Tensor
+    batch_id_per_k_token: torch.Tensor
     total_seq_lens: int
     token_start: int
     token_end: int
@@ -385,7 +396,7 @@ class AiterMlaSparseMetadataForVllm:
     slot_mapping: torch.Tensor
 
     block_table: torch.Tensor
-    req_id_per_token: torch.Tensor
+    batch_id_per_q_token: torch.Tensor
 
     qo_indptr: torch.Tensor
     paged_kv_last_page_len: torch.Tensor
@@ -438,6 +449,37 @@ class MinimaxM3SparseMetadata:
     decode: MinimaxM3SparseDecodeMetadata | None = None
 
 
+def _uniform_decode_query_len(
+    query_start_loc_cpu: torch.Tensor | None, num_decodes: int
+) -> int | None:
+    """Query length shared by every decode request, or None if they differ.
+
+    ATOM's decode kernels recover a request from a flat query row by dividing:
+    the M3 index-topk kernels use ``row // max_query_len`` (and the causal
+    cutoff ``seq_len - max_query_len + tok + 1``), and aiter's gluon paged
+    decode reshapes ``q`` to ``[q.shape[0] // max_query_len, max_query_len,
+    ...]``. Both only hold when every decode request contributes exactly
+    ``max_query_len`` rows.
+
+    Speculative decode breaks that on both sides. On the target model a request
+    that joins without draft tokens contributes one row next to requests
+    verifying ``num_spec + 1``; on the EAGLE/MTP draft a request contributes
+    however many tokens the last step accepted. vLLM keeps all of them in the
+    decode segment because each query length is still within the reorder
+    threshold, so the builders have to check the lengths themselves.
+    """
+    if num_decodes <= 0 or query_start_loc_cpu is None:
+        return None
+    starts = query_start_loc_cpu[: num_decodes + 1]
+    if starts.numel() != num_decodes + 1:
+        return None
+    query_lens = starts[1:] - starts[:-1]
+    first = int(query_lens[0])
+    if not bool(torch.all(query_lens == first)):
+        return None
+    return first
+
+
 class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
     # Uniform decode batches are safe to capture, including spec-decode verify
     # (query_len == num_spec + 1): the decode index-topk and sparse-attn kernels
@@ -459,8 +501,9 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
         del model_runner
         super().__init__(kv_cache_spec, layer_names, config, device)
         logger.info("init MinimaxM3SparseAttentionMetadataBuilder")
-        from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
         from vllm.config import VllmConfig
+
+        from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
 
         assert isinstance(config, VllmConfig)
         self.vllm_config = config
@@ -507,9 +550,34 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
 
         # Plain decode has max_query_len == 1, while MTP/spec decode verifies
         # num_spec+1 tokens per request. Both should use the decode path, but only
-        # when the split says there are no prefill/extend requests in the batch.
-        if num_decodes > 0 and num_extends == 0 and num_prefills == 0:
-            return self._build_uniform_decode_metadata(common_attn_metadata)
+        # when the split says there are no prefill/extend requests in the batch
+        # AND every decode request carries the same number of query tokens -- the
+        # decode kernels index a request as `row // max_query_len`, so a ragged
+        # decode segment would read the wrong request and the wrong causal
+        # cutoff. Spec decode produces such a segment whenever a request without
+        # draft tokens sits next to requests verifying num_spec+1 tokens.
+        decode_query_len = _uniform_decode_query_len(
+            common_attn_metadata.query_start_loc_cpu, num_decodes
+        )
+        if (
+            num_decodes > 0
+            and num_extends == 0
+            and num_prefills == 0
+            and decode_query_len is not None
+        ):
+            return self._build_uniform_decode_metadata(
+                common_attn_metadata, decode_query_len
+            )
+
+        if num_decodes > 0 and decode_query_len is None:
+            # Ragged decode segment: hand those requests to the prefill kernel,
+            # which derives causality from cu_seqlens_q/context_lens and so
+            # accepts variable query lengths. The prefill slice below starts at
+            # num_decodes/num_decode_tokens, so zeroing both widens it to the
+            # whole batch.
+            num_prefills += num_decodes
+            num_decodes = 0
+            num_decode_tokens = 0
 
         num_tokens = common_attn_metadata.num_actual_tokens
         num_prefills_total = num_extends + num_prefills
@@ -552,10 +620,14 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
 
         decode_metadata: MinimaxM3SparseDecodeMetadata | None = None
         if num_decodes > 0:
+            # decode_query_len is the measured length, not the reorder
+            # threshold: a mixed batch whose decode segment is plain decode has
+            # query_len == 1 even when the threshold is num_spec + 1, and
+            # feeding the threshold to the kernels would mis-map every row.
             decode_metadata = MinimaxM3SparseDecodeMetadata(
                 seq_lens=seq_lens[:num_decodes],
                 block_table=block_table[:num_decodes],
-                max_query_len=self.reorder_batch_threshold,
+                max_query_len=decode_query_len,
             )
 
         return MinimaxM3SparseMetadata(
@@ -573,12 +645,21 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
             decode=decode_metadata,
         )
 
-    def _build_uniform_decode_metadata(self, common_attn_metadata):
+    def _build_uniform_decode_metadata(
+        self, common_attn_metadata, decode_query_len: int | None = None
+    ):
         assert common_attn_metadata is not None
 
         num_reqs = common_attn_metadata.num_reqs
         num_tokens = common_attn_metadata.num_actual_tokens
-        max_query_len = common_attn_metadata.max_query_len
+        # Callers that already measured the per-request query length pass it in;
+        # cudagraph capture builds a uniform batch by construction, so falling
+        # back to the batch maximum is exact there.
+        max_query_len = (
+            decode_query_len
+            if decode_query_len is not None
+            else common_attn_metadata.max_query_len
+        )
         seq_lens = common_attn_metadata.seq_lens
         block_table = common_attn_metadata.block_table_tensor
 
@@ -725,6 +806,23 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             num_prefill_tokens,
         ) = split_ret
 
+        # aiter's gluon decode kernel derives the batch as
+        # `q.shape[0] // max_query_len`, so a decode segment whose requests
+        # disagree on query length cannot go through it. EAGLE/MTP propose steps
+        # produce exactly that: a request's query length there is however many
+        # draft tokens the previous step accepted. Send such a segment to the
+        # extend path instead, which is varlen (driven by cu_seqlens_q). Decode
+        # requests sort before extends, so widening the extend segment covers
+        # them without reordering.
+        decode_query_len = _uniform_decode_query_len(
+            common_attn_metadata.query_start_loc_cpu, num_decodes
+        )
+        if num_decodes > 0 and decode_query_len is None:
+            num_extends += num_decodes
+            num_extend_tokens += num_decode_tokens
+            num_decodes = 0
+            num_decode_tokens = 0
+
         prefill_only = num_decodes == 0 and num_extends == 0 and num_prefills > 0
         decode_only = num_decodes > 0 and num_extends == 0 and num_prefills == 0
         mixed = not (prefill_only or decode_only)
@@ -755,7 +853,7 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
                     - prefill_query_start_loc[prefill_start]
                 )
             if num_decodes > 0:
-                decode_max_query_len = query_lens_cpu[:num_decodes].max().item()
+                decode_max_query_len = decode_query_len
                 decode_max_seq_len = seq_lens[:num_decodes].max().item()
                 decode_query_start_loc = decode_query_start_loc[: num_decodes + 1]
 
@@ -804,14 +902,14 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
                     dtype=cu_seq_lens.dtype,
                     out=cu_seq_lens[1:],
                 )
-                token_to_seq = torch.arange(
+                batch_id_per_k_token = torch.arange(
                     0,
                     num_extends,
                     dtype=torch.int32,
                     device=seq_lens_extend.device,
                 )
-                token_to_seq = torch.repeat_interleave(
-                    token_to_seq, swa_seqlen_for_extend
+                batch_id_per_k_token = torch.repeat_interleave(
+                    batch_id_per_k_token, swa_seqlen_for_extend
                 )
                 fetched_shape = cu_seq_lens[-1].item()
                 swa_workspace = torch.empty(
@@ -830,7 +928,9 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
                     ),
                     swa_cu_seqlens=cu_seq_lens.to(self.device, non_blocking=True),
                     swa_seq_starts=seq_starts.to(self.device, non_blocking=True),
-                    swa_token_to_batch=token_to_seq.to(self.device, non_blocking=True),
+                    swa_batch_id_per_k_token=batch_id_per_k_token.to(
+                        self.device, non_blocking=True
+                    ),
                     swa_max_seqlens=max_seqlen_k,
                     swa_total_tokens=total_tokens,
                     swa_workspace=swa_workspace,
@@ -864,7 +964,7 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             max_cum_tokens = cu_seq_lens_cpu[:, -1].max().item()
 
             # Build token->batch mapping robustly, even with zero-length batches.
-            token_to_batch_tensor = torch.zeros(
+            batch_id_per_k_token_tensor = torch.zeros(
                 (num_chunks, max_cum_tokens), dtype=torch.int32, pin_memory=True
             )
             batch_ids = torch.arange(num_extends, dtype=torch.int32)
@@ -872,10 +972,12 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
                 total_tokens = cu_seq_lens_cpu[chunk_idx, -1].item()
                 if total_tokens == 0:
                     continue
-                token_to_batch = torch.repeat_interleave(
+                batch_id_per_k_token = torch.repeat_interleave(
                     batch_ids, chunk_seq_lens[chunk_idx].to(torch.int64)
                 )
-                token_to_batch_tensor[chunk_idx, :total_tokens] = token_to_batch
+                batch_id_per_k_token_tensor[chunk_idx, :total_tokens] = (
+                    batch_id_per_k_token
+                )
 
             chunk_context_metadata = AiterChunkContextMetadata(
                 workspace=self.extend_workspace,
@@ -884,7 +986,9 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
                 seq_tot=chunk_seq_lens.sum(dim=1).tolist(),
                 max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
                 seq_lens=chunk_seq_lens,
-                token_to_batch=token_to_batch_tensor.to(self.device, non_blocking=True),
+                batch_id_per_k_token=batch_id_per_k_token_tensor.to(
+                    self.device, non_blocking=True
+                ),
                 num_chunks=num_chunks,
                 total_token_per_batch=cu_seq_lens_cpu[:, -1].tolist(),
                 swa_metadata=swa_metadata,
@@ -947,30 +1051,38 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
         """
         Build attention metadata for draft model without CPU-GPU sync.
 
-        During EAGLE/MTP drafting all requests are uniform decodes, so we can
-        skip split_decodes_prefills_and_extends() and avoid all .cpu() /
-        .item() calls that would otherwise break CUDA graph capture.
+        Drafting is usually a uniform decode, and then we can skip
+        split_decodes_prefills_and_extends() and avoid all .cpu() / .item()
+        calls that would otherwise break CUDA graph capture.
+
+        It is not always uniform, though: a request's query length here is
+        however many draft tokens the previous step accepted, so one request
+        can bring fewer rows than its neighbours. The gluon decode kernel
+        reshapes q to [q.shape[0] // max_query_len, max_query_len, ...] and
+        would fail on such a batch, so fall back to the full build(), which
+        routes a ragged segment to the varlen extend path.
         """
         query_start_loc = common_attn_metadata.query_start_loc_cpu
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
         is_prefill = query_lens > self.reorder_batch_threshold
 
-        if torch.any(is_prefill):
+        num_reqs = common_attn_metadata.num_reqs
+        decode_query_len = _uniform_decode_query_len(query_start_loc, num_reqs)
+        if torch.any(is_prefill) or decode_query_len is None:
             return self.build(
                 common_prefix_len=0, common_attn_metadata=common_attn_metadata
             )
 
-        num_reqs = common_attn_metadata.num_reqs
         num_tokens = common_attn_metadata.num_actual_tokens
         decode_metadata = AiterMhaPhaseMetadata(
-            max_query_len=common_attn_metadata.max_query_len,
+            max_query_len=decode_query_len,
             max_seq_len=common_attn_metadata.max_seq_len,
             query_start_loc=common_attn_metadata.query_start_loc,
         )
         return AiterMhaMetadataForVllm(
             num_actual_tokens=num_tokens,
             num_actual_kv_tokens=0,
-            max_query_len=common_attn_metadata.max_query_len,
+            max_query_len=decode_query_len,
             query_start_loc=common_attn_metadata.query_start_loc,
             max_seq_len=common_attn_metadata.max_seq_len,
             seq_lens=common_attn_metadata.seq_lens,
@@ -996,9 +1108,10 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
         self,
         common_attn_metadata=None,
     ):
-        self.total_tokens = (
-            self.model_config.max_model_len
-            * self.vllm_config.scheduler_config.max_num_partial_prefills
+        self.total_tokens = self.model_config.max_model_len * getattr(
+            self.vllm_config.scheduler_config,
+            "max_num_partial_prefills",
+            1,
         )
         attn_metadata = self.build(
             common_prefix_len=0, common_attn_metadata=common_attn_metadata
@@ -1010,6 +1123,10 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
 class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
     """vLLM-only dense MLA metadata builder."""
 
+    # Multi-token (speculative verify) decode batches are uniform in shape, so
+    # they replay from a full decode graph. vLLM takes the minimum support
+    # across every backend, so anything lower here downgrades the whole model --
+    # the target's verify included -- to piecewise.
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     reorder_batch_threshold = 1
     query_len_support = QueryLenSupport.UNIFORM
@@ -1022,7 +1139,22 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         device=None,
         model_runner=None,
     ):
-        super().__init__(kv_cache_spec, layer_names, config, device)
+        # supports_dcp_with_varlen: without it vLLM clamps
+        # reorder_batch_threshold to 1 under DCP, which sends every
+        # speculative q > 1 batch -- the target's verify pass and DSpark's
+        # draft block alike -- down the prefill path. That path is causal-only,
+        # so a bidirectional draft block would come out wrong, and no decode
+        # batch would ever reach a FULL cudagraph. This backend handles varlen
+        # DCP decode instead: causal batches through aiter's round-robin (cprr)
+        # kernel via g_kv_indptr, non-causal ones through the plain kernel,
+        # which needs no mask at all.
+        super().__init__(
+            kv_cache_spec,
+            layer_names,
+            config,
+            device,
+            supports_dcp_with_varlen=True,
+        )
         logger.info("init AiterMlaMetadataBuilderForVllm")
         from vllm.config import VllmConfig
 
@@ -1050,23 +1182,95 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         ), "num_attention_heads is not found in config"
 
         self.num_attention_heads = num_attention_heads // get_tp_group().world_size
-        self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
+        self.min_query_heads = _MLA_MIN_HEADS
+
+        # The layers handed to this builder are not necessarily the target's: a
+        # DSpark draft owns its own KV cache group, and therefore its own
+        # builder, while `model_config` keeps describing the target -- Kimi-K3
+        # has 96 query heads against its draft's 64. The persistent work
+        # descriptors planned below have to describe the kernel that actually
+        # runs, because planning one head width and dispatching another leaves
+        # the kernel indexing partials that were never planned. So read the
+        # width off the layers, the way ATOM native's DSparkProposer reads it
+        # off the draft's MLA module, and keep the config-derived value only as
+        # the fallback for builders constructed without layers. `min_query_heads`
+        # comes along because it is the other half of what the layer padded its
+        # queries to (see mla_min_query_heads).
+        from vllm.config import get_layers_from_vllm_config
+        from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+
+        mla_layers = [
+            layer
+            for layer in get_layers_from_vllm_config(
+                config, AttentionLayerBase, layer_names
+            ).values()
+            if getattr(layer, "num_heads", None) is not None
+        ]
+        layer_heads = {layer.num_heads for layer in mla_layers}
+        if len(layer_heads) == 1:
+            self.num_attention_heads = layer_heads.pop()
+            layer_min_heads = {
+                getattr(layer, "min_query_heads", _MLA_MIN_HEADS)
+                for layer in mla_layers
+            }
+            if len(layer_min_heads) == 1:
+                self.min_query_heads = layer_min_heads.pop()
+        elif layer_heads:
+            logger.warning(
+                "MLA metadata builder spans layers of differing query-head "
+                "counts %s; falling back to the model config (%d per rank).",
+                sorted(layer_heads),
+                self.num_attention_heads,
+            )
+
+        self.padded_num_attention_heads = max(
+            self.num_attention_heads, self.min_query_heads
+        )
         # Whether DCP decode can run in persistent mode on this GPU (gfx950 has
         # the lse persistent kernel, gfx942 does not — see dcp_utils). Cached
         # once to gate both the metadata sizing and the runtime persistent path.
         self.dcp_persistent_supported = dcp_persistent_supported()
         # DCP decode all-gathers Q across the DCP group on the head dim, so the
         # head count reaching mla_decode_fwd (and thus the persistent decode
-        # metadata) is padded_num_attention_heads * dcp_world_size. Sourced from
-        # the parallel config so it is available here in __init__. dcp=1 ->
-        # equals padded_num_attention_heads (zero regression for non-DCP). Only
-        # scale by dcp on gfx950 (DCP persistent); gfx942 stays non-persistent
-        # where this metadata is unused, so keep the original per-rank sizing.
-        self.persistent_num_heads = self.padded_num_attention_heads * (
-            self.parallel_config.decode_context_parallel_size
-            if self.dcp_persistent_supported
-            else 1
-        )
+        # metadata) is the gathered width padded up to a dispatchable kernel.
+        # dcp size is sourced from the parallel config so it is available here in
+        # __init__. dcp=1 -> equals padded_num_attention_heads (zero regression
+        # for non-DCP). Only scale by dcp on gfx950 (DCP persistent); gfx942
+        # stays non-persistent where this metadata is unused, so keep the
+        # original per-rank sizing.
+        dcp_size = self.parallel_config.decode_context_parallel_size
+        if dcp_size > 1 and self.dcp_persistent_supported:
+            self.persistent_num_heads = mla_dcp_kernel_num_heads(
+                self.num_attention_heads,
+                dcp_size,
+                self.min_query_heads,
+                kv_cache_dtype=config.cache_config.cache_dtype,
+                # These descriptors are only ever handed to the kernel on the
+                # persistent path (`if use_persistent_metadata` in
+                # build()), so the width they must describe is the persistent
+                # one whatever the step later decides.
+                persistent=True,
+            )
+        else:
+            self.persistent_num_heads = self.padded_num_attention_heads
+        # DCP rank + a persistent buffer for locally derived decode seq lens.
+        # Only the DSpark draft step needs the buffer (see build()); allocating
+        # it unconditionally under DCP keeps that branch allocation-free.
+        self.dcp_rank = 0
+        self._dcp_local_seq_lens_buf = None
+        self._g_kv_indptr_buf = None
+        if self.dcp_world_size > 1:
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            self.dcp_rank = get_dcp_group().rank_in_group
+            self._dcp_local_seq_lens_buf = torch.zeros(
+                max_num_reqs, dtype=torch.int32, device=device
+            )
+            # Global cumulative KV lengths for the cprr decode kernel. Persistent
+            # for the same reason: a captured decode graph re-reads it on replay.
+            self._g_kv_indptr_buf = torch.zeros(
+                max_num_reqs + 1, dtype=torch.int32, device=device
+            )
         self.block_size = kv_cache_spec.block_size
         self.max_bs = max_num_reqs
         self.dtype_kv = get_aiter_kv_cache_dtype(config)
@@ -1085,6 +1289,35 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         )
         self.qo_indptr = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
 
+        # reorder_batch_threshold is the widest query split_decodes_and_prefills
+        # can route to _build_decode, so it is what these work descriptors have to
+        # hold: sized for a 1-token decode, they overflow once
+        # _set_mla_persistent_worker_buffers fills them at the real width, and the
+        # persistent kernel spins on a work queue whose indptr disagrees with its
+        # work set. aiter's plan is not monotonic in the query length (bf16 wants
+        # the doubled one from 5 to 7 and the small one again at 8), so take the
+        # worst case over the range.
+        infos = [
+            get_mla_metadata_info_v1(
+                max_num_reqs,
+                qo_len,
+                self.persistent_num_heads,
+                self.dtype_q,
+                self.dtype_kv,
+                is_sparse=False,
+                fast_mode=_MLA_FAST_MODE,
+                max_split_per_batch=_MLA_MAX_SPLIT_PER_BATCH,
+            )
+            for qo_len in range(1, self.reorder_batch_threshold + 1)
+        ]
+
+        def _largest(slot: int):
+            # Each slot is (size, dtype); size is a length or a shape tuple.
+            def numel(size) -> int:
+                return size if isinstance(size, int) else math.prod(size)
+
+            return max((info[slot] for info in infos), key=lambda s: numel(s[0]))
+
         (
             (work_meta_data_size, work_meta_data_type),
             (work_indptr_size, work_indptr_type),
@@ -1092,14 +1325,13 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             (reduce_indptr_size, reduce_indptr_type),
             (reduce_final_map_size, reduce_final_map_type),
             (reduce_partial_map_size, reduce_partial_map_type),
-        ) = get_mla_metadata_info_v1(
-            max_num_reqs,
-            1,
-            self.persistent_num_heads,
-            self.dtype_q,
-            self.dtype_kv,
-            is_sparse=False,
-            fast_mode=True,
+        ) = (
+            _largest(0),
+            _largest(1),
+            _largest(2),
+            _largest(3),
+            _largest(4),
+            _largest(5),
         )
 
         self.mla_persistent_metadata = {
@@ -1166,14 +1398,19 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
 
     # TODO: support mtp and sparse
     def _set_mla_persistent_worker_buffers(
-        self, bs: int, cu_seqlens_q: torch.Tensor, max_q_len: int = 1
+        self,
+        bs: int,
+        cu_seqlens_q: torch.Tensor,
+        max_q_len: int = 1,
+        causal: bool = True,
+        is_cp_round_robin: bool = False,
     ):
         split_params = {
             "kv_granularity": max(self.block_size, 16),
             "max_seqlen_qo": max_q_len,
             "uni_seqlen_qo": max_q_len,
-            "fast_mode": 1,
-            "max_split_per_batch": 16,
+            "fast_mode": int(_MLA_FAST_MODE),
+            "max_split_per_batch": _MLA_MAX_SPLIT_PER_BATCH,
         }
         var = self.mla_persistent_metadata
         work_meta_data = var["work_meta_data"]
@@ -1182,22 +1419,32 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         reduce_indptr = var["reduce_indptr"]
         reduce_final_map = var["reduce_final_map"]
         reduce_partial_map = var["reduce_partial_map"]
+        # paged_kv_indices are generated at token granularity (block size 1),
+        # and mla_decode_fwd is handed the cache as page_size=1 to match. The
+        # page_size below only feeds the work partitioning, which is size-based,
+        # so the two have disagreed harmlessly. cprr is the exception: it
+        # reconstructs each work row's GLOBAL token position from this, and a
+        # page_size of block_size scales that mapping by block_size -- a causal
+        # mask placed at the wrong positions, silently. Tell it what the kernel
+        # actually gets.
+        page_size = 1 if is_cp_round_robin else self.block_size
         get_mla_metadata_v1(
             cu_seqlens_q,
             self.paged_kv_indptr[: bs + 1],  # TODO: support sparse
             self.paged_kv_last_page_len[:bs],
             self.persistent_num_heads,
             1,  # nhead_kv,
-            True,
+            causal,
             work_meta_data,
             work_info_set,
             work_indptr,
             reduce_indptr,
             reduce_final_map,
             reduce_partial_map,
-            page_size=self.block_size,
+            page_size=page_size,
             dtype_q=self.dtype_q,
             dtype_kv=self.dtype_kv,
+            is_cp_round_robin=is_cp_round_robin,
             **split_params,
         )
         return {
@@ -1218,23 +1465,43 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         query_start_loc_device: torch.Tensor,
         num_decode_tokens: int,
         dcp_tot_seq_lens_device: torch.Tensor | None,
+        causal: bool = True,
     ):
         # kernel block size is always 1, although the kv block size is not 1.
         device = self.device
         num_reqs = seq_lens_device.size(0)
 
+        # Slicing past the end silently truncates, which would hand the metadata
+        # kernel a bs it has no indptr entries for and wedge the persistent kernel.
+        assert num_reqs + 1 <= self.paged_kv_indptr.numel(), (
+            f"decode batch of {num_reqs} requests exceeds the MLA metadata "
+            f"capacity of {self.paged_kv_indptr.numel() - 1}"
+        )
+
         paged_kv_last_page_len = self.paged_kv_last_page_len[:num_reqs]
 
+        qo_len = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        max_qo_len = qo_len.max().item() if qo_len.numel() > 0 else 1
+
+        # A full decode graph replays at the request count it was captured on, so
+        # vLLM pads the batch with slots carrying no query rows and no sequence.
+        # The persistent work plan is laid out for a uniform query length, and
+        # those empty slots leave the kernel waiting on partials nothing produces.
+        # Give the padding one page of KV and its full share of query rows; what
+        # it computes lands in padded output slots nothing reads. Single-token
+        # decode already does this via the arange below.
+        num_padded_slots = int((qo_len == 0).sum()) if max_qo_len > 1 else 0
+        seq_lens_for_pages = (
+            seq_lens_device.clamp(min=1) if num_padded_slots else seq_lens_device
+        )
+
         torch.cumsum(
-            seq_lens_device,
+            seq_lens_for_pages,
             dim=0,
             dtype=torch.int32,
             out=self.paged_kv_indptr[1 : 1 + num_reqs],
         )
         paged_kv_indptr = self.paged_kv_indptr[: 1 + num_reqs]
-
-        qo_len = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-        max_qo_len = qo_len.max().item() if qo_len.numel() > 0 else 1
 
         kv_indices_generate_triton(
             block_table_tensor,
@@ -1263,6 +1530,18 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                     self.qo_indptr[num_reqs + 1 :] = num_reqs
                 self._qo_indptr_arange_ready = True
                 self._qo_indptr_arange_n = num_reqs
+        elif num_padded_slots:
+            self._qo_indptr_arange_ready = False
+            torch.arange(
+                0,
+                (num_reqs + 1) * max_qo_len,
+                max_qo_len,
+                dtype=torch.int32,
+                device=device,
+                out=self.qo_indptr[: num_reqs + 1],
+            )
+            if 1 + num_reqs < self.qo_indptr.shape[0]:
+                self.qo_indptr[1 + num_reqs :] = num_reqs * max_qo_len
         else:
             self._qo_indptr_arange_ready = False
             self.qo_indptr[: 1 + num_reqs].copy_(
@@ -1283,11 +1562,32 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             and not self.dcp_persistent_supported
         ):
             use_persistent_metadata = False
+        # Fail loudly rather than wedge the persistent kernel in a spin no timeout
+        # recovers from. Falling back to the non-persistent kernel is not an
+        # option: asm_mla.cu rejects gqa_ratio=16 fp8 decode with qo_len > 4.
+        assert (
+            not use_persistent_metadata or max_qo_len <= self.reorder_batch_threshold
+        ), (
+            f"decode query length {max_qo_len} exceeds the persistent MLA "
+            f"work-descriptor capacity {self.reorder_batch_threshold}"
+        )
+        # DCP shards KV round-robin, so a causal multi-token decode cannot read
+        # its mask off the rank-local row order: local position j is global
+        # position j * world + rank. aiter's cprr variant reconstructs that, but
+        # only if BOTH halves agree -- the work descriptors are planned for it
+        # here and the global cumulative lengths are handed over below. Planning
+        # one way and dispatching the other leaves the persistent kernel
+        # spinning on a work queue whose indptr disagrees with its work set.
+        # A single-token decode sees all of its local KV and a bidirectional
+        # block masks nothing, so both keep the plain kernel.
+        cp_round_robin = self.dcp_world_size > 1 and max_qo_len > 1 and causal
         if use_persistent_metadata:
             ctx_mla_ps = self._set_mla_persistent_worker_buffers(
                 num_reqs,
                 qo_indptr,
                 max_qo_len,
+                causal=causal,
+                is_cp_round_robin=cp_round_robin,
             )
             self.mla_persistent_metadata.update(ctx_mla_ps)
 
@@ -1329,6 +1629,21 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                 num_reqs=num_reqs,
             )
 
+        g_kv_indptr = None
+        if cp_round_robin:
+            # cprr ships only as a persistent kernel; the non-persistent decode
+            # would ignore g_kv_indptr and mask on local row order instead --
+            # wrong output, no error. Refuse the batch rather than serve it.
+            assert use_persistent_metadata and dcp_tot_seq_lens_device is not None, (
+                f"causal decode of query length {max_qo_len} under DCP"
+                f"{self.dcp_world_size} needs the persistent round-robin kernel, "
+                "which is unavailable here (non-gfx950, or DP > 1)"
+            )
+            g_kv_indptr = self._g_kv_indptr_buf[: num_reqs + 1]
+            # [0] stays 0 (zero-init, never written). cumsum promotes to int64,
+            # so land it through copy_ rather than out=.
+            g_kv_indptr[1:].copy_(torch.cumsum(dcp_tot_seq_lens_device, dim=0))
+
         attn_metadata = AiterMlaDecodeMetadataForVllm(
             block_table=block_table_tensor,
             seq_lens=seq_lens_device,
@@ -1340,6 +1655,8 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             max_qo_len=max_qo_len,
             attn_out_dtype=self.decode_attn_out_dtype,
             use_persistent_metadata=use_persistent_metadata,
+            causal=causal,
+            g_kv_indptr=g_kv_indptr,
             fold_factor=fold_factor,
             fold_kv_indptr=fold_kv_indptr,
             fold_kv_indices=fold_kv_indices,
@@ -1362,13 +1679,14 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         fast_build: bool = False,
     ):
 
-        from vllm.v1.attention.backends.utils import split_decodes_and_prefills
         from vllm.model_executor.layers.attention.mla_attention import (
             QueryLenSupport,
         )
-
         from vllm.utils.math_utils import cdiv, round_down
-        from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+        from vllm.v1.attention.backends.utils import (
+            get_dcp_local_seq_lens,
+            split_decodes_and_prefills,
+        )
 
         num_reqs = common_attn_metadata.num_reqs
         num_tokens = common_attn_metadata.num_actual_tokens
@@ -1380,12 +1698,34 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         # it blocks on all previous kernels.
         device = self.device
         block_table_tensor = common_attn_metadata.block_table_tensor
-        slot_mapping = common_attn_metadata.slot_mapping
+        # vLLM pads the slot mapping to the CUDA Graph bucket while counting
+        # query rows unpadded, and leaves the trim to its consumers. The MLA
+        # cache-store kernels take their token count from this tensor, so an
+        # untrimmed one makes them walk past the queries they were given.
+        slot_mapping = common_attn_metadata.slot_mapping[:num_tokens]
 
         query_start_loc = common_attn_metadata.query_start_loc
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         seq_lens = common_attn_metadata.seq_lens
         dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
+        if self.dcp_world_size > 1 and dcp_local_seq_lens is None:
+            # DSpark's draft step builds its own attention metadata inside
+            # vLLM's DFlash speculator, which never fills this in -- the target
+            # model runner is its only producer. The local lengths are a pure
+            # function of the global ones, so derive them here rather than
+            # teaching that path about DCP. It lands in a persistent buffer
+            # because the draft's FULL graph captures whatever tensor the decode
+            # metadata carries and re-reads it on every replay.
+            assert self._dcp_local_seq_lens_buf is not None
+            dcp_local_seq_lens = self._dcp_local_seq_lens_buf[:num_reqs]
+            dcp_local_seq_lens.copy_(
+                get_dcp_local_seq_lens(
+                    seq_lens,
+                    self.dcp_world_size,
+                    self.dcp_rank,
+                    self.cp_kv_cache_interleave_size,
+                )
+            )
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
@@ -1490,16 +1830,16 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                 chunk_total_token = cu_seq_lens_cpu[:, -1]
 
                 max_token_num_over_chunk = chunk_total_token.max().item()
-                token_to_seq_tensor_cpu = torch.zeros(
+                batch_id_per_k_token_cpu = torch.zeros(
                     [num_chunks, max_token_num_over_chunk], dtype=torch.int32
                 )
                 range_idx = torch.arange(num_prefills, dtype=torch.int32)
                 for i in range(num_chunks):
-                    chunk_token_to_seq_tensor = torch.repeat_interleave(
+                    chunk_batch_id_per_k_token = torch.repeat_interleave(
                         range_idx, chunk_seq_lens[i]
                     )
-                    chunk_len = chunk_token_to_seq_tensor.shape[0]
-                    token_to_seq_tensor_cpu[i, :chunk_len] = chunk_token_to_seq_tensor
+                    chunk_len = chunk_batch_id_per_k_token.shape[0]
+                    batch_id_per_k_token_cpu[i, :chunk_len] = chunk_batch_id_per_k_token
 
                 if self.dcp_world_size > 1:
                     local_context_lens_allranks = get_dcp_local_seq_lens(
@@ -1559,19 +1899,21 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                     )
 
                     # Local token->seq map for gather_and_maybe_dequant_cache
-                    # (fp8 DCP): mirrors token_to_seq but over the padded local
+                    # (fp8 DCP): mirrors batch_id_per_k_token but over the padded local
                     # per-rank chunk layout. Length per chunk == seq_tot[i].
                     max_local_toks = int(
                         padded_local_chunk_seq_lens.sum(dim=1).max().item()
                     )
-                    padded_local_token_to_seq_cpu = torch.zeros(
+                    padded_local_batch_id_per_k_token_cpu = torch.zeros(
                         [num_chunks, max_local_toks], dtype=torch.int32
                     )
                     for _c in range(num_chunks):
-                        _t2s = torch.repeat_interleave(
+                        _bid = torch.repeat_interleave(
                             range_idx, padded_local_chunk_seq_lens[_c]
                         )
-                        padded_local_token_to_seq_cpu[_c, : _t2s.shape[0]] = _t2s
+                        padded_local_batch_id_per_k_token_cpu[_c, : _bid.shape[0]] = (
+                            _bid
+                        )
 
                 chunked_context_metadata_cls = (
                     AiterMlaPrefillMetadataForVllm.AiterMlaChunkedContextMetadataForVllm
@@ -1588,7 +1930,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                         seq_tot=padded_local_chunk_seq_lens.sum(dim=1).tolist(),
                         max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
                         seq_lens=chunk_seq_lens,
-                        token_to_seq=token_to_seq_tensor_cpu.to(
+                        batch_id_per_k_token=batch_id_per_k_token_cpu.to(
                             device, non_blocking=True
                         ),
                         chunk_total_token=chunk_total_token.tolist(),
@@ -1600,7 +1942,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                         ),
                         cu_seq_lens_lst=cu_seq_lens_cpu.tolist(),
                         chunk_size=padded_local_max_context_chunk_across_ranks,
-                        padded_local_token_to_seq=padded_local_token_to_seq_cpu.to(
+                        padded_local_batch_id_per_k_token=padded_local_batch_id_per_k_token_cpu.to(
                             device, non_blocking=True
                         ),
                         prefill_tokens_with_context=prefill_tokens_with_context,
@@ -1612,7 +1954,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                         seq_tot=chunk_seq_lens.sum(dim=1).tolist(),
                         max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
                         seq_lens=chunk_seq_lens,
-                        token_to_seq=token_to_seq_tensor_cpu.to(
+                        batch_id_per_k_token=batch_id_per_k_token_cpu.to(
                             device, non_blocking=True
                         ),
                         chunk_total_token=chunk_total_token,
@@ -1657,6 +1999,8 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                 query_start_loc_device=query_start_loc[: num_decodes + 1],
                 num_decode_tokens=num_decode_tokens,
                 dcp_tot_seq_lens_device=dcp_tot_seq_lens_device,
+                # Resolved per KV cache group by vLLM.
+                causal=common_attn_metadata.causal,
             )
 
         attn_metadata = AiterMlaMetadataForVllm(
@@ -1737,7 +2081,7 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         # zeros (not empty) so the shrink-tail fast path in build() can assume
         # entries past the current extent are already 0 without a full-buffer
         # fill_(0) every step.
-        self.req_id_per_token_buffer = torch.zeros(
+        self.batch_id_per_q_token_buffer = torch.zeros(
             (max_num_batched_tokens,),
             dtype=torch.int32,
             device=device,
@@ -1818,11 +2162,7 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         vllm_sfc = getattr(config.compilation_config, "static_forward_context", {})
 
         def _resolve_indexer(layer_name):
-            attention_prefix = (
-                layer_name[: -len(".attn")]
-                if layer_name.endswith(".attn")
-                else layer_name
-            )
+            attention_prefix = layer_name.removesuffix(".attn")
             indexer_cache = vllm_sfc.get(f"{attention_prefix}.indexer.k_cache")
             owner_atom_config = getattr(indexer_cache, "atom_config", None)
             sfc = (
@@ -1879,24 +2219,24 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         common_attn_metadata,
         fast_build=False,
         *,
-        _req_id_per_token=None,
+        _batch_id_per_q_token=None,
         _drafting=False,
     ):
         num_tokens = common_attn_metadata.num_actual_tokens
-        if _req_id_per_token is not None:
-            # Draft path (see build_for_drafting): req_id_per_token was already
+        if _batch_id_per_q_token is not None:
+            # Draft path (see build_for_drafting): batch_id_per_q_token was already
             # produced on-GPU, so the copy_ below is device-to-device and the
             # per-step pageable H2D sync is avoided.
-            req_id_per_token = _req_id_per_token
+            batch_id_per_q_token = _batch_id_per_q_token
         else:
             starts = common_attn_metadata.query_start_loc_cpu.to(torch.int32)
             seg_lengths = torch.diff(starts)
-            req_id_per_token = torch.repeat_interleave(
+            batch_id_per_q_token = torch.repeat_interleave(
                 torch.arange(seg_lengths.shape[0], dtype=torch.int32), seg_lengths
             )
         # Shrink-tail-only zeroing instead of three full-buffer fill_(0) every
         # step (the buffers are persistent across decode steps and zeros-init):
-        #   - req_id_per_token_buffer / paged_kv_indices: the kernel only reads
+        #   - batch_id_per_q_token_buffer / paged_kv_indices: the kernel only reads
         #     the ranges defined by paged_kv_indptr / num_tokens, so entries
         #     past the new extent are never read; we only need to re-zero the
         #     tail left over from a previous, larger batch.
@@ -1904,20 +2244,20 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         #     below, which starts at index 1) and indices >= 1 are fully
         #     rewritten by the cumsum + scalar broadcast, so its fill_(0) is
         #     redundant and dropped entirely.
-        new_req_extent = int(req_id_per_token.shape[0])
+        new_req_extent = int(batch_id_per_q_token.shape[0])
         new_indices_extent = num_tokens * self.topk_tokens
         if self._prev_req_extent > new_req_extent:
-            self.req_id_per_token_buffer[new_req_extent : self._prev_req_extent].fill_(
-                0
-            )
+            self.batch_id_per_q_token_buffer[
+                new_req_extent : self._prev_req_extent
+            ].fill_(0)
         if self._prev_indices_extent > new_indices_extent:
             self.paged_kv_indices[new_indices_extent : self._prev_indices_extent].fill_(
                 0
             )
         self._prev_req_extent = new_req_extent
         self._prev_indices_extent = new_indices_extent
-        self.req_id_per_token_buffer[:new_req_extent].copy_(
-            req_id_per_token, non_blocking=True
+        self.batch_id_per_q_token_buffer[:new_req_extent].copy_(
+            batch_id_per_q_token, non_blocking=True
         )
 
         query_lens = (
@@ -1945,7 +2285,7 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         )
         self.paged_kv_indptr[num_tokens + 1 :].fill_(self.paged_kv_indptr[num_tokens])
 
-        req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
+        batch_id_per_q_token = self.batch_id_per_q_token_buffer[:num_tokens]
         qo_indptr = self.qo_indptr[: num_tokens + 1]
         paged_kv_last_page_len = self.paged_kv_last_page_len[:num_tokens]
         paged_kv_indices = self.paged_kv_indices[: num_tokens * self.topk_tokens]
@@ -2031,7 +2371,7 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
             query_start_loc=common_attn_metadata.query_start_loc,
             slot_mapping=common_attn_metadata.slot_mapping,
             block_table=common_attn_metadata.block_table_tensor,
-            req_id_per_token=req_id_per_token,
+            batch_id_per_q_token=batch_id_per_q_token,
             block_size=self.kv_cache_spec.block_size,
             attn_out_dtype=self.model_dtype,
             topk_tokens=self.topk_tokens,
@@ -2054,13 +2394,13 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
 
         vLLM's EagleProposer rebuilds attention metadata for every MTP draft
         step. The inherited build_for_drafting just calls build(), which
-        constructs ``req_id_per_token`` on the host and copies it into a GPU
+        constructs ``batch_id_per_q_token`` on the host and copies it into a GPU
         buffer -- a pageable, synchronous H2D copy that stalls the draft
         model's kernel dispatch right at the target->draft boundary (this is
         the H2D sync visible between the main and draft models in the trace).
 
         During MTP/EAGLE drafting every request contributes exactly one decode
-        token, so ``req_id_per_token`` is simply ``arange(num_reqs)`` and can be
+        token, so ``batch_id_per_q_token`` is simply ``arange(num_reqs)`` and can be
         built on-GPU (device-to-device copy, no sync). We also pass
         ``_drafting=True`` so build() skips the decode-only work-split
         fingerprint (whose ``seq_lens.cpu()`` fallback would be another sync and
@@ -2077,14 +2417,14 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
                 common_attn_metadata=common_attn_metadata,
                 fast_build=True,
             )
-        req_id_per_token = torch.arange(
+        batch_id_per_q_token = torch.arange(
             num_tokens, dtype=torch.int32, device=self.device
         )
         return self.build(
             common_prefix_len=0,
             common_attn_metadata=common_attn_metadata,
             fast_build=True,
-            _req_id_per_token=req_id_per_token,
+            _batch_id_per_q_token=batch_id_per_q_token,
             _drafting=True,
         )
 
@@ -2110,8 +2450,9 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
             from vllm.utils.platform_utils import num_compute_units
         except ImportError:
             from vllm.utils.platform_utils import get_cu_count as num_compute_units
-        from vllm.v1.worker.cp_utils import get_total_cp_world_size
         from vllm.utils.math_utils import cdiv
+        from vllm.v1.worker.cp_utils import get_kv_cache_shard_count
+
         from atom.models.utils import extract_layer_index
 
         assert isinstance(config, VllmConfig)
@@ -2179,7 +2520,7 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
         )
         max_num_blocks_per_req = cdiv(
             self.vllm_config.model_config.max_model_len,
-            self.kv_cache_spec.block_size * get_total_cp_world_size(),
+            self.kv_cache_spec.block_size * get_kv_cache_shard_count(),
         )
         self.expanded_block_table_buffer = torch.zeros(
             (
@@ -2207,7 +2548,7 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
         token_end = query_start_loc_cpu[reqs_end].item()
         total_seq_lens = seq_lens_cpu[reqs_start:reqs_end].sum()
         seq_idx = torch.arange(0, reqs_end - reqs_start, dtype=torch.int32)
-        token_to_seq = torch.repeat_interleave(
+        batch_id_per_k_token = torch.repeat_interleave(
             seq_idx, seq_lens_cpu[reqs_start:reqs_end]
         ).to(self.device)
         assert total_seq_lens <= self.max_prefill_buffer_size
@@ -2225,7 +2566,7 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
             cu_seqlen_ks=cu_seqlen_ks,
             cu_seqlen_ke=cu_seqlen_ke,
             cu_seq_lens=cu_seq_lens,
-            token_to_seq=token_to_seq,
+            batch_id_per_k_token=batch_id_per_k_token,
             total_seq_lens=total_seq_lens,
             block_table=block_table[reqs_start:reqs_end],
             token_start=token_start,
@@ -2239,14 +2580,14 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
         common_attn_metadata=None,
         fast_build: bool = False,
     ) -> AiterMlaSparseIndexerMetadataForVllm:
-        from vllm.v1.attention.backends.utils import (
-            split_decodes_and_prefills,
-            split_prefill_chunks,
-        )
         from vllm.platforms import current_platform
         from vllm.utils.deep_gemm import (
             get_paged_mqa_logits_metadata,
             is_deep_gemm_supported,
+        )
+        from vllm.v1.attention.backends.utils import (
+            split_decodes_and_prefills,
+            split_prefill_chunks,
         )
 
         num_reqs = common_attn_metadata.num_reqs
@@ -2264,8 +2605,13 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
 
         prefill_metadata = None
         if num_prefills > 0:
+            # vLLM 0.26 provides a host-resident upper bound that is exact for
+            # prefill rows. Avoid the deprecated seq_lens_cpu property, whose
+            # fallback performs an implicit device-to-host synchronization.
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+            assert seq_lens_cpu is not None
             chunk_seq_ids = split_prefill_chunks(
-                common_attn_metadata.seq_lens_cpu[num_decodes:],
+                seq_lens_cpu[num_decodes:],
                 self.max_prefill_buffer_size,
                 request_offset=num_decodes,
             )
@@ -2274,7 +2620,7 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
                     reqs_start,
                     reqs_end,
                     query_start_loc_cpu,
-                    common_attn_metadata.seq_lens_cpu,
+                    seq_lens_cpu,
                     common_attn_metadata.block_table_tensor,
                 )
                 for reqs_start, reqs_end in chunk_seq_ids

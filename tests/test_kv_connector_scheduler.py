@@ -22,12 +22,13 @@ pytest.importorskip(
 from atom.kv_transfer.disaggregation.kv_transfer_engine import (
     KVConnectorScheduler,
     Role,
+    _RoleManager,
     convert_virtual_to_physical_pages,
     get_port_offset,
     get_role,
     set_role,
-    _RoleManager,
 )
+
 from atom.kv_transfer.disaggregation.types import ConnectorMetadata
 from atom.model_engine.sequence import Sequence
 

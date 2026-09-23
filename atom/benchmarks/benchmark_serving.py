@@ -27,6 +27,7 @@ On the client side, run:
 
 import argparse
 import asyncio
+import collections
 import contextlib
 import functools
 import gc
@@ -35,9 +36,10 @@ import os
 import random
 import time
 import warnings
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any
 
 import aiohttp
 import numpy as np
@@ -74,22 +76,97 @@ class BenchmarkMetrics:
     mean_ttft_ms: float
     median_ttft_ms: float
     std_ttft_ms: float
-    percentiles_ttft_ms: List[Tuple[float, float]]
+    percentiles_ttft_ms: list[tuple[float, float]]
     mean_tpot_ms: float
     median_tpot_ms: float
     std_tpot_ms: float
-    percentiles_tpot_ms: List[Tuple[float, float]]
+    percentiles_tpot_ms: list[tuple[float, float]]
     mean_itl_ms: float
     median_itl_ms: float
     std_itl_ms: float
-    percentiles_itl_ms: List[Tuple[float, float]]
+    percentiles_itl_ms: list[tuple[float, float]]
     # E2EL stands for end-to-end latency per request.
     # It is the time taken on the client side from sending
     # a request to receiving a complete response.
     mean_e2el_ms: float
     median_e2el_ms: float
     std_e2el_ms: float
-    percentiles_e2el_ms: List[Tuple[float, float]]
+    percentiles_e2el_ms: list[tuple[float, float]]
+
+
+# Prompts per tokenizer call while generating the random dataset. Large enough
+# that the fast tokenizer's internal batching is what dominates, small enough
+# that a batch's encodings are not held for the whole dataset.
+_TOKENIZE_BATCH = 4096
+# How many decode/encode round trips a prompt gets to reach its target length
+# before the benchmark accepts whatever length it has.
+_LENGTH_FIX_ROUNDS = 10
+
+
+def _round_trip_prompts(
+    tokenizer: PreTrainedTokenizerBase,
+    rng: np.random.Generator,
+    token_id_lists: list[list[int]],
+    target_lens: list[int],
+) -> tuple[list[str], list[int]]:
+    """Decode ids to text, adjusting until each re-encodes to its target length.
+
+    Decoding is not injective: N consecutive ids can encode back to a different
+    number of tokens (for GPT2Tokenizer, [6880, 6881] -> 'Ġcallshere' ->
+    [1650, 939, 486]), so a prompt has to be re-encoded and padded or truncated
+    until it round-trips at the length the benchmark asked for. Measured on a
+    real tokenizer the first re-encode fails for essentially every prompt --
+    4022 encodes for 2000 prompts -- so the loop below runs at least twice.
+
+    Both directions are issued as whole batches. A fast tokenizer parallelises a
+    batch internally, and one call per prompt forfeits that plus a Python/Rust
+    crossing each time: 5.0x on 2000 prompts at input_len 1024.
+
+    Returns the prompts and the token length each one actually encodes to, which
+    equals its target unless a prompt ran out of rounds without converging.
+    """
+    prompts = tokenizer.batch_decode(token_id_lists)
+    token_lens = [0] * len(prompts)
+    pending = list(range(len(prompts)))
+
+    for _ in range(_LENGTH_FIX_ROUNDS):
+        if not pending:
+            break
+        encoded = tokenizer([prompts[i] for i in pending], add_special_tokens=False)[
+            "input_ids"
+        ]
+        unresolved: list[int] = []
+        adjusted: list[list[int]] = []
+        for slot, i in enumerate(pending):
+            ids, target = encoded[slot], target_lens[i]
+            if len(ids) == target:
+                token_lens[i] = target
+                continue
+            if len(ids) < target:
+                ids = (
+                    ids
+                    + rng.integers(
+                        0, tokenizer.vocab_size, size=target - len(ids)
+                    ).tolist()
+                )
+            else:
+                ids = ids[:target]
+            unresolved.append(i)
+            adjusted.append(ids)
+        for i, text in zip(unresolved, tokenizer.batch_decode(adjusted)):
+            prompts[i] = text
+        pending = unresolved
+
+    if pending:
+        # Out of rounds. Report the length these prompts have rather than the
+        # target they never reached, so the mismatch statistic stays honest.
+        encoded = tokenizer([prompts[i] for i in pending], add_special_tokens=False)[
+            "input_ids"
+        ]
+        for slot, i in enumerate(pending):
+            token_lens[i] = len(encoded[slot])
+
+    return prompts, token_lens
 
 
 def sample_random_requests(
@@ -101,10 +178,14 @@ def sample_random_requests(
     tokenizer: PreTrainedTokenizerBase,
     use_chat_template: bool = False,
     apply_chat_template_fn: Callable = lambda x: x,
-) -> List[Tuple[str, int, int]]:
-    prefix_token_ids = np.random.randint(
-        0, tokenizer.vocab_size, size=prefix_len
-    ).tolist()
+    seed: int = 0,
+) -> list[tuple[str, int, int]]:
+    # A private generator rather than the global numpy one: sharing that makes
+    # the dataset depend on whatever else drew from it first, so re-running the
+    # same command need not produce the same prompts.
+    rng = np.random.default_rng(seed)
+
+    prefix_token_ids = rng.integers(0, tokenizer.vocab_size, size=prefix_len).tolist()
 
     if use_chat_template:
         chat_template_dummy = apply_chat_template_fn(
@@ -119,44 +200,48 @@ def sample_random_requests(
     def sample_uniform(seq_len):
         lower = int(seq_len * range_ratio)
         upper = seq_len
-        seq_lens = np.random.randint(lower, upper + 1, size=num_prompts).tolist()
-        return seq_lens
+        return rng.integers(lower, upper + 1, size=num_prompts).tolist()
 
     input_lens = sample_uniform(input_len)
     output_lens = sample_uniform(output_len)
-    offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
+    offsets = rng.integers(0, tokenizer.vocab_size, size=num_prompts)
 
     input_requests = []
     mismatches = []
-    for i in range(num_prompts):
-        tgt_prompt_len = prefix_len + input_lens[i]
-        prompt_token_ids = prefix_token_ids + [
-            (offsets[i] + i + j) % tokenizer.vocab_size for j in range(input_lens[i])
+    # Generated a batch at a time so the tokenizer calls can be batched; the
+    # batch also bounds how many encodings are held at once.
+    for start in range(0, num_prompts, _TOKENIZE_BATCH):
+        stop = min(start + _TOKENIZE_BATCH, num_prompts)
+        token_id_lists = [
+            prefix_token_ids
+            + (
+                (offsets[i] + i + np.arange(input_lens[i])) % tokenizer.vocab_size
+            ).tolist()
+            for i in range(start, stop)
         ]
-        prompt = tokenizer.decode(prompt_token_ids)
+        target_lens = [prefix_len + input_lens[i] for i in range(start, stop)]
 
-        max_retries = 10
-        for _ in range(max_retries):
-            prompt_token_ids = tokenizer.encode(prompt, add_special_tokens=False)
-            if len(prompt_token_ids) < tgt_prompt_len:
-                num_extras = tgt_prompt_len - len(prompt_token_ids)
-                prompt_token_ids.extend(
-                    np.random.randint(0, tokenizer.vocab_size, size=num_extras).tolist()
-                )
-            elif len(prompt_token_ids) > tgt_prompt_len:
-                prompt_token_ids = prompt_token_ids[:tgt_prompt_len]
-            else:
-                break
-            prompt = tokenizer.decode(prompt_token_ids)
+        prompts, prompt_lens = _round_trip_prompts(
+            tokenizer, rng, token_id_lists, target_lens
+        )
 
         if use_chat_template:
-            prompt = apply_chat_template_fn(
-                [{"role": "user", "content": prompt}],
-            )
+            # The template rewrites every prompt, so the lengths measured above
+            # no longer describe what the server will receive.
+            prompts = [
+                apply_chat_template_fn([{"role": "user", "content": prompt}])
+                for prompt in prompts
+            ]
+            prompt_lens = [
+                len(ids)
+                for ids in tokenizer(prompts, add_special_tokens=False)["input_ids"]
+            ]
 
-        prompt_len = len(tokenizer.encode(prompt, add_special_tokens=False))
-        mismatches.append(prompt_len - tgt_prompt_len)
-        input_requests.append((prompt, prompt_len, output_lens[i], None))
+        for slot, i in enumerate(range(start, stop)):
+            mismatches.append(prompt_lens[slot] - target_lens[slot])
+            input_requests.append(
+                (prompts[slot], prompt_lens[slot], output_lens[i], None)
+            )
 
     header_str = f'{"-"*19}  Input/Output Length Statistics  {"-"*19}'
     print(header_str)
@@ -179,10 +264,10 @@ def sample_random_requests(
 
 
 async def get_request(
-    input_requests: List[Tuple[str, int, int]],
+    input_requests: list[tuple[str, int, int]],
     request_rate: float,
     burstiness: float = 1.0,
-) -> AsyncGenerator[Tuple[str, int, int], None]:
+) -> AsyncGenerator[tuple[str, int, int], None]:
     """
     Asynchronously generates requests at a specified rate
     with OPTIONAL burstiness.
@@ -223,24 +308,32 @@ async def get_request(
         await asyncio.sleep(interval)
 
 
+def _failure_reason(error: str) -> str:
+    """The last line of a traceback, which is the part that identifies it."""
+    lines = [
+        line.strip() for line in (error or "").strip().splitlines() if line.strip()
+    ]
+    return lines[-1][:110] if lines else "unknown (no error recorded)"
+
+
 def calculate_metrics(
-    input_requests: List[Tuple[str, int, int]],
-    outputs: List[RequestFuncOutput],
+    input_requests: list[tuple[str, int, int]],
+    outputs: list[RequestFuncOutput],
     dur_s: float,
     tokenizer: PreTrainedTokenizerBase,
-    selected_percentile_metrics: List[str],
-    selected_percentiles: List[float],
-    goodput_config_dict: Dict[str, float],
-) -> Tuple[BenchmarkMetrics, List[int]]:
-    actual_output_lens: List[int] = []
+    selected_percentile_metrics: list[str],
+    selected_percentiles: list[float],
+    goodput_config_dict: dict[str, float],
+) -> tuple[BenchmarkMetrics, list[int]]:
+    actual_output_lens: list[int] = []
     total_input = 0
     completed = 0
     good_completed = 0
-    itls: List[float] = []
-    tpots: List[float] = []
-    all_tpots: List[float] = []
-    ttfts: List[float] = []
-    e2els: List[float] = []
+    itls: list[float] = []
+    tpots: list[float] = []
+    all_tpots: list[float] = []
+    ttfts: list[float] = []
+    e2els: list[float] = []
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_tokens
@@ -344,7 +437,7 @@ def calculate_metrics(
     return metrics, actual_output_lens
 
 
-async def get_spec_stats(base_url: str) -> Optional[dict]:
+async def get_spec_stats(base_url: str) -> dict | None:
     """Fetch speculative-decoding statistics from the ATOM server.
 
     Returns the ``/debug/mtp_stats`` payload (which includes
@@ -374,20 +467,20 @@ async def benchmark(
     model_id: str,
     model_name: str,
     tokenizer: PreTrainedTokenizerBase,
-    input_requests: List[Tuple[str, int, int]],
-    logprobs: Optional[int],
+    input_requests: list[tuple[str, int, int]],
+    logprobs: int | None,
     best_of: int,
     request_rate: float,
     burstiness: float,
     disable_tqdm: bool,
     num_warmups: int,
     profile: bool,
-    selected_percentile_metrics: List[str],
-    selected_percentiles: List[str],
+    selected_percentile_metrics: list[str],
+    selected_percentiles: list[str],
     ignore_eos: bool,
-    goodput_config_dict: Dict[str, float],
-    max_concurrency: Optional[int],
-    lora_modules: Optional[List[str]],
+    goodput_config_dict: dict[str, float],
+    max_concurrency: int | None,
+    lora_modules: list[str] | None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -489,7 +582,7 @@ async def benchmark(
     print("Starting main benchmark run...")
 
     benchmark_start_time = time.perf_counter()
-    tasks: List[asyncio.Task] = []
+    tasks: list[asyncio.Task] = []
     async for request in get_request(input_requests, request_rate, burstiness):
         prompt, prompt_len, output_len, mm_content = request
         req_model_id, req_model_name = model_id, model_name
@@ -514,7 +607,7 @@ async def benchmark(
                 limited_request_func(request_func_input=request_func_input, pbar=pbar)
             )
         )
-    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+    outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
 
     if pbar is not None:
         pbar.close()
@@ -552,6 +645,15 @@ async def benchmark(
 
     print("{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
+    failures = collections.Counter(
+        _failure_reason(output.error) for output in outputs if not output.success
+    )
+    if failures:
+        # Every metric below is over the survivors, so a run that lost requests
+        # must not report its throughput as though it had not.
+        print("{:<40} {:<10}".format("FAILED requests:", sum(failures.values())))
+        for reason, count in failures.most_common(5):
+            print(f"{'':4}{count:<8} {reason}")
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
     print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
@@ -662,7 +764,7 @@ def check_goodput_args(args):
                 raise ValueError(
                     f"Invalid metric name found, {slo_name}: {slo_val}. "
                     "The service level objective name should be one of "
-                    f"{str(VALID_NAMES)}. "
+                    f"{VALID_NAMES!s}. "
                 )
             if slo_val < 0:
                 raise ValueError(
@@ -690,7 +792,7 @@ def parse_goodput(slo_pairs):
 
 
 def save_to_pytorch_benchmark_format(
-    args: argparse.Namespace, results: Dict[str, Any], file_name: str
+    args: argparse.Namespace, results: dict[str, Any], file_name: str
 ) -> None:
     metrics = [
         "median_ttft_ms",
@@ -771,6 +873,7 @@ def main(args: argparse.Namespace):
             tokenizer=tokenizer,
             apply_chat_template_fn=apply_chat_template_fn,
             use_chat_template=args.use_chat_template,
+            seed=args.seed,
         )
 
     else:
@@ -809,10 +912,13 @@ def main(args: argparse.Namespace):
 
     # Save config and results to json
     if args.save_result:
-        result_json: Dict[str, Any] = {}
+        result_json: dict[str, Any] = {}
 
         # Setup
-        current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+        # astimezone() keeps the stamp in the operator's own timezone, which is
+        # how a result file is read, while staying timezone-aware.
+        current_dt = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d-%H%M%S")
         result_json["date"] = current_dt
         result_json["backend"] = backend
         result_json["model_id"] = model_id
@@ -863,7 +969,7 @@ def main(args: argparse.Namespace):
             if args.max_concurrency is not None
             else ""
         )
-        file_name = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"  # noqa
+        file_name = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"
         if args.result_filename:
             file_name = args.result_filename
         if args.result_dir:
@@ -935,7 +1041,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tokenizer",
         type=str,
-        help="Name or path of the tokenizer, if not using the default tokenizer.",  # noqa: E501
+        help="Name or path of the tokenizer, if not using the default tokenizer.",
     )
     parser.add_argument(
         "--best-of",

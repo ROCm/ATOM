@@ -17,8 +17,6 @@ forward time (`RuntimeError: expected scalar type BFloat16 but found
 Float8_e4m3fnuz`). This test locks in that fix for both dialects.
 """
 
-import sys
-import types
 import unittest
 
 import pytest
@@ -27,26 +25,6 @@ import pytest
 # chain pulls atom.model_ops -> AITER (GPU-only). Skip on the non-GPU unit
 # gate; runs in GPU CI (and locally on the box) where AITER is present.
 pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
-
-# Loading the real atom source wipes the conftest.py stubs; snapshot and
-# restore sys.modules so this file's effect stays local to its own collection
-# (mirrors test_dummy_weight_init.py / test_mxfp4_moe_has_bias.py).
-_saved_atom_modules: dict[str, object] = {}
-
-
-def setUpModule():
-    global _saved_atom_modules
-    _saved_atom_modules = {
-        name: mod for name, mod in sys.modules.items() if name.startswith("atom")
-    }
-    for name in list(_saved_atom_modules):
-        del sys.modules[name]
-
-
-def tearDownModule():
-    for name in [n for n in sys.modules if n.startswith("atom")]:
-        del sys.modules[name]
-    sys.modules.update(_saved_atom_modules)
 
 
 def _make_wo_a(dtype, out_features=256, in_features=128, block=128):
@@ -72,11 +50,52 @@ def _make_wo_a(dtype, out_features=256, in_features=128, block=128):
     return FakeWoA()
 
 
+class _FakeAttention:
+    """The ``self`` that ``process_weights_after_loading`` runs against.
+
+    Refuses an attribute it does not model, by name. A plain
+    ``SimpleNamespace`` let a missing one surface as ``'types.SimpleNamespace'
+    object has no attribute 'n_local_groups'``, raised from inside the method
+    with nothing to say about where to fix it -- which is how all three tests
+    below sat red after production grew reads of ``n_local_groups`` and
+    ``o_lora_rank``, on every machine that can run them. That is only a
+    machine with aiter, because this module ``importorskip``s it and CI has
+    none, so nothing reported it.
+
+    Runtime, not a scan of the method's source. A source scan sees only the
+    literal ``self.X`` in that one body -- not a read through a helper, not
+    one through a base class -- and it re-breaks on a refactor that changed
+    nothing. This fails at the read, wherever the read is.
+
+    Values coherent with ``_make_wo_a``'s 256 x 128 weight: the gfx950
+    batched-GEMM path wants ``out_dim == n_local_groups * o_lora_rank``, so
+    2 x 128. ``_is_gfx950``, ``_is_gfx1250`` and ``_is_preshuffle`` are False
+    because this is the gfx942 dtype gate -- the BF16 fallback is the path
+    under test, and production takes the mxscale one on ``_is_gfx950 or
+    _is_gfx1250``.
+    """
+
+    def __init__(self, wo_a):
+        self.wo_a = wo_a
+        self.n_local_groups = 2
+        self.o_lora_rank = 128
+        self._is_gfx950 = False
+        self._is_gfx1250 = False
+        self._is_preshuffle = False
+
+    def __getattr__(self, name):
+        raise AttributeError(
+            f"process_weights_after_loading read self.{name}, which this "
+            f"double does not model -- add it to _FakeAttention with a value "
+            f"coherent with _make_wo_a's weight"
+        )
+
+
 class TestWoADequantFnFnuzGate(unittest.TestCase):
     def _run(self, dtype):
         from atom.models.deepseek_v4 import DeepseekV4Attention
 
-        fake_self = types.SimpleNamespace(wo_a=_make_wo_a(dtype))
+        fake_self = _FakeAttention(_make_wo_a(dtype))
         DeepseekV4Attention.process_weights_after_loading(fake_self)
         return fake_self.wo_a
 
@@ -104,7 +123,7 @@ class TestWoADequantFnFnuzGate(unittest.TestCase):
         weight_before = wo_a.weight
         from atom.models.deepseek_v4 import DeepseekV4Attention
 
-        fake_self = types.SimpleNamespace(wo_a=wo_a)
+        fake_self = _FakeAttention(wo_a)
         DeepseekV4Attention.process_weights_after_loading(fake_self)
         self.assertIs(wo_a.weight, weight_before)
 

@@ -73,6 +73,10 @@ class LayerQuantConfig:
     quant_dtype: Any = torch.bfloat16  # torch.dtype (use Any for forward compat)
     is_dynamic: bool = True
     quant_method: str | None = None
+    # Source weight blocks, distinct from the activation grouping in QuantType.
+    weight_block_size: tuple[int, int] | None = None
+    # An explicit activation contract, e.g. native W4A8 rather than W4A4.
+    activation_dtype: Any = None
 
     @property
     def is_quantized(self) -> bool:
@@ -94,6 +98,53 @@ def should_skip_online_quant(cur_type, cur_dtype, online_cfg) -> bool:
     """
     return online_cfg.quant_type == QuantType.No or (
         cur_type == online_cfg.quant_type and cur_dtype == online_cfg.quant_dtype
+    )
+
+
+def will_online_requant(
+    quant_config,
+    prefix: str,
+    source_quant_type,
+    source_quant_dtype,
+) -> bool:
+    """Whether *this* layer's weight gets replaced by online re-quantization.
+
+    ``quant_config.online_quant`` is a whole-model flag: it says the run was
+    launched with ``--online_quant_config``, not that any given layer is
+    affected. A layer named in the online ``exclude_layer`` list, or one whose
+    source already is the online target, keeps its checkpoint weight. Anything
+    that decides a layer's *format* -- which parameters to allocate, which GEMM
+    to dispatch -- has to ask per layer, because the two answers differ for
+    every model whose online config excludes part of the graph.
+    """
+    if quant_config is None or not getattr(quant_config, "online_quant", False):
+        return False
+    online_cfg = quant_config.get_layer_quant_config(prefix, use_online_quant=True)
+    return not should_skip_online_quant(
+        source_quant_type, source_quant_dtype, online_cfg
+    )
+
+
+def should_stream_online_quant(
+    quant_config,
+    prefix: str,
+    source_quant_type,
+    source_quant_dtype,
+) -> bool:
+    """Return whether this source can be streamed to a distinct online target."""
+    # Attention stays in the post-load pass because MLA post-processing reads
+    # an already-loaded and processed kv_b_proj.
+    # Imported lazily to avoid a module-load cycle (envs/quark pull in config
+    # which can pull in quant_spec).
+    from atom.quantization.quark.utils import can_dequant_weight_online
+    from atom.utils import envs
+
+    if not envs.ATOM_ONLINE_QUANT_STREAMING:
+        return False
+    if not can_dequant_weight_online(source_quant_type, source_quant_dtype):
+        return False
+    return will_online_requant(
+        quant_config, prefix, source_quant_type, source_quant_dtype
     )
 
 
@@ -381,19 +432,12 @@ class GenericParser(QuantConfigParser):
             QuantType.per_1x128,
         ):
             quant_type = QuantType.per_1x32
-        # Mxfp8 ``[1, K]`` block to per_1x32.
         weight_block_size = hf_quant_config.get("weight_block_size")
-        if (
-            isinstance(weight_block_size, (list, tuple))
-            and len(weight_block_size) == 2
-            and weight_block_size[0] == 1
-        ):
-            quant_type = QuantType.per_1x32
         # `activation_scheme: static` ships precomputed input_scales in the
         # checkpoint, so the activation quant is NOT dynamic (load the scales);
         # `dynamic` (or unspecified) quantizes activations at runtime.
         act_scheme = (hf_quant_config.get("activation_scheme") or "").lower()
-        default_dynamic = False if act_scheme == "static" else True
+        default_dynamic = act_scheme != "static"
         is_dynamic = hf_quant_config.get("is_dynamic", default_dynamic)
         # Each quantizer uses a different key for excluded layers:
         # Quark -> "exclude", compressed-tensors -> "ignore",
@@ -412,6 +456,12 @@ class GenericParser(QuantConfigParser):
             quant_dtype=quant_dtype,
             is_dynamic=is_dynamic,
             quant_method=quant_method or None,
+            weight_block_size=(
+                tuple(weight_block_size)
+                if isinstance(weight_block_size, (list, tuple))
+                and len(weight_block_size) == 2
+                else None
+            ),
         )
 
         return ParsedQuantConfig(global_spec=global_spec, exclude_layers=exclude)
@@ -464,7 +514,7 @@ class GenericParser(QuantConfigParser):
                     # the per_1x128 path already allocates a (out//128, in//128)
                     # scale grid which is exactly the (128, 128) block layout.
                     return QuantType.per_1x128
-                if (m, n) == (1, 32):
+                if (m, n) in ((1, 32), (32, 32)):
                     return QuantType.per_1x32
                 return QuantType.per_1x128
         # Check explicit fields

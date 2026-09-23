@@ -3,7 +3,6 @@
 
 # from flash_attn import flash_attn_with_kvcache
 from abc import ABC, abstractmethod
-from typing import Optional
 
 import torch
 import triton
@@ -12,7 +11,7 @@ from torch import nn
 
 from atom.config import get_current_atom_config
 from atom.utils import mark_spliting_op
-from atom.utils.selector import get_attn_backend
+from atom.utils.selector import Family, get_attn_backend
 
 from .attention_mla import MLAModules, _mla_output_width
 
@@ -41,6 +40,73 @@ class Attention:
         return AttentionForAtom(*args, **kwargs)
 
 
+# Envelopes of the two paged decode kernels wrapped below. Both are multiplied
+# by drafting: MiniMax-M3 sits exactly on the gluon group one today (16 x 4 draft
+# positions), a gqa=8 model reaches the gluon length one first, and ASM tops out
+# lower than either -- past its limit get_heuristic_kernel silently re-runs with
+# mtp=1, a kernel built for another query length.
+PA_GLUON_MAX_QUERY_LEN = 4
+PA_GLUON_MAX_QUERY_GROUP_SIZE = 64
+PA_ASM_MAX_QUERY_GROUP_SIZE = 16
+
+# Both are fits on a 256-CU gfx950 and do not scale with the machine, unlike the
+# heuristic they bound. TARGET_WG: past it the extra splits only add reduce work.
+# MAX is two separate bounds that happen to agree on a number no larger than 32:
+# temporary_output is bf16, so each split adds a round trip through the PS
+# combine, and the worst shape measured drifts 20pp further from an fp32
+# reference at 64 than at 8; and 64 is where the C++ PS reduce stops being built
+# at all, with no working fallback under it (see the test that pins this).
+PA_DENSE_SPLIT_TARGET_WG = 128
+PA_DENSE_SPLIT_MAX = 32
+
+
+def dense_decode_splits(num_seqs: int, num_kv_heads: int) -> int:
+    """KV splits for the dense paged decode.
+
+    aiter's heuristic ends in a flat min(..., 8): at batch 1 it computes 512 and
+    returns 8, leaving a call that reads the whole context on 3% of the machine.
+
+    A function of the grid alone, deliberately not of the context length: decode
+    runs under a cuda graph, where max_seqlen_k is the model limit rather than the
+    real length, so a context term is inert in production and would only over-split
+    short requests (+114% measured on a 2K one).
+
+    Only the dense path is routed here. The two MiniMax-M3 sparse call sites are
+    excluded on purpose -- their context is a fixed topk window and their num_seqs
+    already folds the query tokens in -- as is the vLLM bridge's own copy of this
+    dispatch, which is untested against this.
+    """
+    from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
+
+    n = max(1, int(num_seqs) * int(num_kv_heads))
+    # Power of two, and only the term added here: the PS reduce compiles one
+    # variant per distinct count, and a continuous cdiv adds 11 of them that no
+    # sweep ever measured. Rounding the RESULT would drop below the heuristic
+    # wherever it returns 3, 5, 6 or 7.
+    boost = min(PA_DENSE_SPLIT_MAX, triton.cdiv(PA_DENSE_SPLIT_TARGET_WG, n))
+    boost = 1 << (boost.bit_length() - 1)
+    # The ceiling clamps the result as well. Staying at or above the heuristic is
+    # a preference; staying inside what the reduce was built for is not.
+    return min(
+        PA_DENSE_SPLIT_MAX,
+        max(get_recommended_splits(num_seqs, num_kv_heads), boost),
+    )
+
+
+def gluon_decode_over_limit(max_qlen: int, num_heads: int, num_kv_heads: int) -> bool:
+    """Whether decode is past what the gluon kernel takes.
+
+    pow2, not the raw product: that is what the kernel indexes its layout table
+    with, and it rounds a small group up to fill 16.
+    """
+    max_qlen = max(1, int(max_qlen))
+    qlen_p2 = 1 << (max_qlen - 1).bit_length()
+    group_p2 = qlen_p2 * max(
+        16 // qlen_p2, 1 << (num_heads // num_kv_heads - 1).bit_length()
+    )
+    return max_qlen > PA_GLUON_MAX_QUERY_LEN or group_p2 > PA_GLUON_MAX_QUERY_GROUP_SIZE
+
+
 def run_pa_fwd_asm(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -50,12 +116,17 @@ def run_pa_fwd_asm(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
     *,
-    out: Optional[torch.Tensor] = None,
-    qo_indptr: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
     max_qlen: int = 1,
     high_precision: int = 0,
+    kernel_name: str | None = None,
 ):
-    """Run the AITER paged-attention ASM kernel with explicit metadata."""
+    """Run the AITER paged-attention ASM kernel with explicit metadata.
+
+    ``kernel_name`` bypasses aiter's kernel heuristic; a name absent from
+    pa_asm.csv aborts the process rather than raising.
+    """
 
     import aiter
 
@@ -72,6 +143,7 @@ def run_pa_fwd_asm(
         out_=out,
         qo_indptr=qo_indptr,
         high_precision=high_precision,
+        kernelName=kernel_name,
     )
 
 
@@ -87,15 +159,15 @@ def run_pa_decode_gluon(
     max_context_partition_num: int,
     context_partition_size: int,
     compute_type: torch.dtype,
-    q_scale: Optional[torch.Tensor],
-    k_scale: Optional[torch.Tensor],
-    v_scale: Optional[torch.Tensor],
+    q_scale: torch.Tensor | None,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
     *,
     exp_sums: torch.Tensor,
     max_logits: torch.Tensor,
     temporary_output: torch.Tensor,
-    alibi_slopes: Optional[torch.Tensor] = None,
-    sinks: Optional[torch.Tensor] = None,
+    alibi_slopes: torch.Tensor | None = None,
+    sinks: torch.Tensor | None = None,
     sliding_window: int = -1,
     ps: bool = True,
 ):
@@ -137,7 +209,7 @@ def cp_mha_gather_cache_kernel(
     value_ptr,  # [num_tokens, num_heads, head_size]
     block_table_ptr,  # [num_batches, max_block_num]
     cu_seqlens_kv_ptr,  # [num_batches + 1]
-    token_to_batch_ptr,  # [max_cum_tokens]
+    batch_id_per_k_token_ptr,  # [max_cum_tokens]
     seq_start_ptr,  # [num_batches]
     k_scale_ptr,  # [1] / [num_blocks, num_kv_heads, page_size]
     v_scale_ptr,
@@ -164,7 +236,7 @@ def cp_mha_gather_cache_kernel(
     value_ptr_offset = (
         value_ptr + token_id * head_size * num_heads + head_id * head_size
     )
-    batch_idx = tl.load(token_to_batch_ptr + token_id)
+    batch_idx = tl.load(batch_id_per_k_token_ptr + token_id)
     batch_start = tl.load(seq_start_ptr + batch_idx)
     token_start = tl.load(cu_seqlens_kv_ptr + batch_idx)
     batch_offset = token_id - token_start + batch_start
@@ -252,10 +324,10 @@ def cp_mha_gather_cache(
     key: torch.Tensor,
     value: torch.Tensor,
     block_tables: torch.Tensor,
-    k_scales: Optional[torch.Tensor],
-    v_scales: Optional[torch.Tensor],
+    k_scales: torch.Tensor | None,
+    v_scales: torch.Tensor | None,
     cu_seqlens_kv: torch.Tensor,
-    token_to_batch: torch.Tensor,
+    batch_id_per_k_token: torch.Tensor,
     seq_starts: torch.Tensor,
     dequant: bool,
     kv_cache_layout: str,
@@ -292,7 +364,7 @@ def cp_mha_gather_cache(
 
     k_cache_stride0 = key_cache.stride(0)
     v_cache_stride0 = value_cache.stride(0)
-    grid = lambda meta: (total_tokens, num_heads)  # noqa: E731
+    grid = lambda meta: (total_tokens, num_heads)
     cp_mha_gather_cache_kernel[grid](
         key_cache,
         value_cache,
@@ -300,7 +372,7 @@ def cp_mha_gather_cache(
         value,
         block_tables,
         cu_seqlens_kv,
-        token_to_batch,
+        batch_id_per_k_token,
         seq_starts,
         k_scales,
         v_scales,
@@ -320,7 +392,7 @@ def cp_mha_gather_cache(
 
 def fake_(
     q: torch.Tensor,
-    q_scale: Optional[torch.Tensor],
+    q_scale: torch.Tensor | None,
     k: torch.Tensor,
     v: torch.Tensor,
     positions: torch.Tensor,
@@ -347,7 +419,7 @@ def fake_(
 @mark_spliting_op(is_custom=True, gen_fake=fake_, mutates_args=[])
 def unified_attention_with_output_base(
     q: torch.Tensor,
-    q_scale: Optional[torch.Tensor],
+    q_scale: torch.Tensor | None,
     k: torch.Tensor,
     v: torch.Tensor,
     positions: torch.Tensor,
@@ -421,11 +493,11 @@ class BaseAttention(nn.Module, ABC):
         kv_cache_dtype="bf16",
         layer_num=0,
         use_mla: bool = False,
-        mla_modules: Optional[MLAModules] = None,
-        sinks: Optional[nn.Parameter] = None,
-        per_layer_sliding_window: Optional[int] = None,
-        rotary_emb: Optional[torch.nn.Module] = None,
-        prefix: Optional[str] = None,
+        mla_modules: MLAModules | None = None,
+        sinks: nn.Parameter | None = None,
+        per_layer_sliding_window: int | None = None,
+        rotary_emb: torch.nn.Module | None = None,
+        prefix: str | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -436,8 +508,8 @@ class BaseAttention(nn.Module, ABC):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        positions: Optional[torch.Tensor] = None,
-        q_scale: Optional[torch.Tensor] = None,
+        positions: torch.Tensor | None = None,
+        q_scale: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         raise NotImplementedError(
@@ -460,7 +532,7 @@ class LinearAttention(nn.Module):
         conv1d=None,
         activation=None,
         layer_num=0,
-        prefix: Optional[str] = None,
+        prefix: str | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -480,11 +552,7 @@ class LinearAttention(nn.Module):
         self.prefix = prefix
 
         atom_config = get_current_atom_config()
-        block_size = atom_config.kv_cache_block_size
-        self.attn_backend = get_attn_backend(
-            block_size,
-            use_gdn=True,
-        )
+        self.attn_backend = get_attn_backend(Family.GDN)
         impl_cls = self.attn_backend.get_impl_cls()
         self.impl = impl_cls(
             self.hidden_size,
@@ -506,7 +574,7 @@ class LinearAttention(nn.Module):
         default_name = f"Linear_{layer_num}"
         self.layer_name = prefix if prefix is not None else default_name
         if self.layer_name in compilation_config.static_forward_context:
-            raise ValueError("Duplicate layer: {}".format(self.layer_name))
+            raise ValueError(f"Duplicate layer: {self.layer_name}")
         compilation_config.static_forward_context[self.layer_name] = self
 
     def forward(

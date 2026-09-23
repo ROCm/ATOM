@@ -6,10 +6,8 @@
 # The original source code was licensed under the MIT license and included
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-# ruff: noqa: E501
 
 import torch
-
 import triton
 import triton.language as tl
 
@@ -36,6 +34,10 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     ht,
     cu_seqlens,
     ssm_state_indices,
+    # Read side. The same tensor as `ssm_state_indices` unless the caller forked
+    # the state — a request resuming from a checkpoint reads the published slot
+    # and writes a fresh one, for this forward only.
+    ssm_state_indices_in,
     num_accepted_tokens,
     scale,
     N: tl.int64,  # num of sequences
@@ -59,6 +61,8 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
     IS_KDA: tl.constexpr,
+    INIT_STATE_VK: tl.constexpr = False,
+    FINAL_STATE_VK: tl.constexpr = False,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -109,17 +113,20 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
                 i_t = 0
             p_h0 = (
                 h0
-                + tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
+                + tl.load(ssm_state_indices_in + i_n * stride_indices_seq + i_t).to(
                     tl.int64
                 )
                 * stride_init_state_token
             )
         else:
             p_h0 = h0 + bos * HV * K * V
-        p_h0 = p_h0 + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
+        if INIT_STATE_VK:
+            p_h0 = p_h0 + i_hv * K * V + o_k[:, None] + o_v[None, :] * K
+        else:
+            p_h0 = p_h0 + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
-    for i_t in range(0, T):
+    for i_t in range(T):
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
@@ -159,7 +166,10 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             )
         else:
             p_ht = ht + (bos + i_t) * stride_final_state_token
-        p_ht = p_ht + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
+        if FINAL_STATE_VK:
+            p_ht = p_ht + i_hv * K * V + o_k[:, None] + o_v[None, :] * K
+        else:
+            p_ht = p_ht + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
         tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
         p_q += H * K
@@ -184,6 +194,7 @@ def fused_recurrent_gated_delta_rule_fwd(
     inplace_final_state: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
     ssm_state_indices: torch.Tensor | None = None,
+    ssm_state_indices_in: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -212,6 +223,18 @@ def fused_recurrent_gated_delta_rule_fwd(
     else:
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
 
+    # One set of strides serves both index tensors, so the read side has to be
+    # laid out exactly like the write side. Callers build them from the same
+    # buffer shape; assert rather than silently index the fork source wrong.
+    if ssm_state_indices_in is None:
+        ssm_state_indices_in = ssm_state_indices
+    else:
+        assert (
+            ssm_state_indices is not None
+            and ssm_state_indices_in.shape == ssm_state_indices.shape
+            and ssm_state_indices_in.stride() == ssm_state_indices.stride()
+        ), "ssm_state_indices_in must match ssm_state_indices in shape and stride"
+
     grid = (NK, NV, N * HV)
     fused_recurrent_gated_delta_rule_fwd_kernel[grid](
         q=q,
@@ -224,6 +247,7 @@ def fused_recurrent_gated_delta_rule_fwd(
         ht=final_state,
         cu_seqlens=cu_seqlens,
         ssm_state_indices=ssm_state_indices,
+        ssm_state_indices_in=ssm_state_indices_in,
         num_accepted_tokens=num_accepted_tokens,
         scale=scale,
         N=N,
@@ -243,6 +267,8 @@ def fused_recurrent_gated_delta_rule_fwd(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         INPLACE_FINAL_STATE=inplace_final_state,
         IS_KDA=False,
+        INIT_STATE_VK=initial_state.stride(-2) == 1,
+        FINAL_STATE_VK=final_state.stride(-2) == 1,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -262,6 +288,8 @@ def gdn_decode_update_lossy_fast_fwd_kernel(
     out,
     state,
     state_indices,
+    # Read side; equals `state_indices` unless the caller forked the state.
+    state_indices_in,
     scale: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
@@ -285,6 +313,7 @@ def gdn_decode_update_lossy_fast_fwd_kernel(
     mask_h = mask_k[:, None] & mask_v[None, :]
 
     state_idx = tl.load(state_indices + i_n).to(tl.int64)
+    state_idx_in = tl.load(state_indices_in + i_n).to(tl.int64)
     if state_idx < 0:
         # Padded / idle slot (e.g. PAD_SLOT_ID = -1 from SGLang's
         # mamba_cache_indices). Skip the state load/store and write zeros so
@@ -298,10 +327,12 @@ def gdn_decode_update_lossy_fast_fwd_kernel(
         )
         return
 
-    state_base = ((state_idx * HV + i_hv) * K) * V
-    state_offsets = state_base + o_k[:, None] * V + o_v[None, :]
+    state_offsets = ((state_idx * HV + i_hv) * K) * V + o_k[:, None] * V + o_v[None, :]
+    state_offsets_in = (
+        ((state_idx_in * HV + i_hv) * K) * V + o_k[:, None] * V + o_v[None, :]
+    )
     h = tl.load(
-        state + state_offsets,
+        state + state_offsets_in,
         mask=mask_h,
         other=0.0,
         cache_modifier=".cg",
@@ -365,6 +396,7 @@ def gdn_decode_update_lossy_fast(
     v: torch.Tensor,
     initial_state: torch.Tensor,
     ssm_state_indices: torch.Tensor,
+    ssm_state_indices_in: torch.Tensor | None = None,
     scale: float | None = None,
     use_qk_l2norm_in_kernel: bool = True,
     beta: float = 1.0,
@@ -375,6 +407,11 @@ def gdn_decode_update_lossy_fast(
     This path updates ``initial_state`` in place and returns the same tensor as
     the final state. The kernel expects a contiguous state cache with layout
     ``[slot, value_head, key_dim, value_dim]``.
+
+    ``ssm_state_indices_in`` names the slot each sequence reads from; it differs
+    from the write side only for a request resuming a state checkpoint, which
+    reads the published slot and writes a fresh one for this forward. Defaults
+    to the write side, i.e. the ordinary in-place update.
     """
     if beta != 1.0 or threshold != 20.0:
         raise ValueError(
@@ -395,6 +432,14 @@ def gdn_decode_update_lossy_fast(
     b = b.contiguous()
     dt_bias = dt_bias.contiguous()
     ssm_state_indices = ssm_state_indices.contiguous()
+    ssm_state_indices_in = (
+        ssm_state_indices
+        if ssm_state_indices_in is None
+        else ssm_state_indices_in.contiguous()
+    )
+    assert (
+        ssm_state_indices_in.shape == ssm_state_indices.shape
+    ), "ssm_state_indices_in must match ssm_state_indices in shape"
 
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
@@ -407,8 +452,7 @@ def gdn_decode_update_lossy_fast(
         )
     if initial_state.ndim != 4 or initial_state.shape[1:] != (HV, K, V):
         raise ValueError(
-            "decode fast path expects initial_state shaped "
-            f"[num_slots, {HV}, {K}, {V}]"
+            f"decode fast path expects initial_state shaped [num_slots, {HV}, {K}, {V}]"
         )
     if not initial_state.is_contiguous():
         raise ValueError("decode fast path expects contiguous initial_state")
@@ -428,6 +472,7 @@ def gdn_decode_update_lossy_fast(
         out,
         initial_state,
         ssm_state_indices,
+        ssm_state_indices_in,
         scale,
         H,
         HV,
@@ -456,6 +501,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
         inplace_final_state: bool = True,
         cu_seqlens: torch.LongTensor | None = None,
         ssm_state_indices: torch.Tensor | None = None,
+        ssm_state_indices_in: torch.Tensor | None = None,
         num_accepted_tokens: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = False,
     ):
@@ -470,6 +516,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
             inplace_final_state=inplace_final_state,
             cu_seqlens=cu_seqlens,
             ssm_state_indices=ssm_state_indices,
+            ssm_state_indices_in=ssm_state_indices_in,
             num_accepted_tokens=num_accepted_tokens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         )
@@ -482,12 +529,13 @@ def fused_recurrent_gated_delta_rule(
     k: torch.Tensor,
     v: torch.Tensor,
     g: torch.Tensor,
-    beta: torch.Tensor = None,
-    scale: float = None,
-    initial_state: torch.Tensor = None,
+    beta: torch.Tensor | None = None,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
     inplace_final_state: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
     ssm_state_indices: torch.Tensor | None = None,
+    ssm_state_indices_in: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -519,6 +567,11 @@ def fused_recurrent_gated_delta_rule(
             consistent with the FlashAttention API.
         ssm_state_indices (Optional[torch.Tensor]):
             Indices to map the input sequences to the initial/final states.
+        ssm_state_indices_in (Optional[torch.Tensor]):
+            Read-side counterpart of `ssm_state_indices`, same shape and stride.
+            Differs from it only for a request resuming a state checkpoint,
+            which reads the published slot and writes a fresh one for this
+            forward. Defaults to `ssm_state_indices` (in-place update).
         num_accepted_tokens (Optional[torch.Tensor]):
             Number of accepted tokens for each sequence during decoding.
 
@@ -577,6 +630,7 @@ def fused_recurrent_gated_delta_rule(
         inplace_final_state,
         cu_seqlens,
         ssm_state_indices,
+        ssm_state_indices_in,
         num_accepted_tokens,
         use_qk_l2norm_in_kernel,
     )

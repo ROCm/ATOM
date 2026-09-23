@@ -4,12 +4,13 @@ Covers config translation, model dict selection, and framework mode status.
 All tests mock sglang dependencies so they run without sglang installed.
 """
 
-import pytest
 import sys
 from unittest.mock import MagicMock, patch
 
-from atom.plugin import prepare as plugin_prepare
+import pytest
+
 import atom.plugin.config as plugin_config
+from atom.plugin import prepare as plugin_prepare
 
 # ---------------------------------------------------------------------------
 # Helpers

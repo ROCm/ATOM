@@ -33,6 +33,22 @@ SCORE_WORKERS="${SWEBENCH_MAX_WORKERS:-4}"
 INSTANCE_TIMEOUT="${SWEBENCH_EVAL_TIMEOUT:-900}"
 NAMESPACE="${SWEBENCH_NAMESPACE:-swebench}"
 DOCKER_EXECUTABLE="${SWEBENCH_DOCKER_EXECUTABLE:-${MSWEA_DOCKER_EXECUTABLE:-docker}}"
+# A full 300-instance run pulls ~120 GiB of SWE-bench images onto the *host*
+# daemon, which outlives this job. Slurm allocations are --exclusive, so the
+# contention is sequential rather than concurrent: whatever this run leaves
+# behind is inherited by the next job scheduled onto the same node. Refuse to
+# start without headroom, and give the images back on exit. Set MIN_DISK_GB=0
+# to skip the preflight check, PRUNE_IMAGES=false to keep the images warm for
+# the next run on a dedicated node.
+# NOTE: every instance gets its own `sweb.eval.*` image; the `sweb.env.*` and
+# `sweb.base.*` layers underneath are shared by all instances of a project.
+# shared base layer
+#   └─ shared project env layer
+#        ├─ instance A eval layer
+#        ├─ instance B eval layer
+#        └─ instance C eval layer
+MIN_DISK_GB="${SWEBENCH_MIN_DISK_GB:-150}"
+PRUNE_IMAGES="${SWEBENCH_PRUNE_IMAGES:-true}"
 
 usage() {
   cat <<'EOF'
@@ -143,6 +159,17 @@ positive_integer "SWEBENCH_SCORE_TIMEOUT" "${SCORE_TIMEOUT}"
 positive_integer "SWEBENCH_MAX_WORKERS" "${SCORE_WORKERS}"
 positive_integer "SWEBENCH_EVAL_TIMEOUT" "${INSTANCE_TIMEOUT}"
 
+if [[ ! "${MIN_DISK_GB}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+  echo "ERROR: SWEBENCH_MIN_DISK_GB must be a non-negative integer," \
+    "got '${MIN_DISK_GB}'" >&2
+  exit 2
+fi
+if [[ "${PRUNE_IMAGES}" != "true" && "${PRUNE_IMAGES}" != "false" ]]; then
+  echo "ERROR: SWEBENCH_PRUNE_IMAGES must be 'true' or 'false'," \
+    "got '${PRUNE_IMAGES}'" >&2
+  exit 2
+fi
+
 case "${LIMIT}" in
   ""|full|FULL|0)
     LIMIT=""
@@ -183,6 +210,79 @@ echo "[swebench] Docker daemon is available"
 "${DOCKER_EXECUTABLE}" version --format \
   '[swebench] Docker client={{.Client.Version}} server={{.Server.Version}}'
 "${DOCKER_EXECUTABLE}" system df || true
+
+# Free space on the daemon's storage, not this container's filesystem. The
+# daemon reports its root as a path in the *host* namespace, so this only works
+# when pd_slurm_job.sh bind-mounted that path in at the same location. Returns
+# non-zero when it did not, in which case the caller degrades to a warning.
+docker_root_free_gb() {
+  local root avail root_fs self_fs
+  root="$("${DOCKER_EXECUTABLE}" info --format '{{.DockerRootDir}}' 2>/dev/null)" \
+    || return 1
+  [[ -n "${root}" && -d "${root}" ]] || return 1
+  # A same-named empty directory in this container's image would make df report
+  # the container rootfs -- a different disk entirely, wrong in both directions:
+  # too high lets the run fill the daemon anyway, too low aborts a node that had
+  # room. The bind mount always shows up as its own filesystem, so a root that
+  # reports the same one as `/` is the image directory, not the daemon storage.
+  # Compared by filesystem rather than by looking for `image/` and `containers/`
+  # inside: the daemon root is commonly 0710 root:root, and the Spur path runs
+  # the container as a normal user, which can df the path but not descend it.
+  root_fs="$(df --output=source "${root}" 2>/dev/null | tail -n 1)"
+  self_fs="$(df --output=source / 2>/dev/null | tail -n 1)"
+  [[ -n "${root_fs}" && "${root_fs}" != "${self_fs}" ]] || return 1
+  avail="$(df -BG --output=avail "${root}" 2>/dev/null | tail -n 1 | tr -dc '0-9')"
+  [[ -n "${avail}" ]] || return 1
+  printf '%s\n' "${avail}"
+}
+
+# Tags of the SWE-bench images the daemon holds, sorted for comm(1). Covers the
+# prebuilt eval images plus the env/base layers the harness builds on a miss.
+# Returns non-zero if the daemon could not be queried at all. That has to stay
+# distinguishable from "queried fine, holds no sweb images": both produce no
+# output, but the second is a legitimate empty set and the first is no answer,
+# and every caller here diffs the output against a baseline. Only grep is
+# allowed to fail quietly, because no matches is exactly the empty set.
+swebench_image_refs() {
+  local listing
+  listing="$(
+    "${DOCKER_EXECUTABLE}" images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null
+  )" || return 1
+  printf '%s\n' "${listing}" \
+    | grep -E '(^|/)sweb\.(eval|env|base)\.' \
+    | sort -u \
+    || true
+}
+
+if (( MIN_DISK_GB > 0 )); then
+  if free_gb="$(docker_root_free_gb)"; then
+    echo "[swebench] Docker root has ${free_gb} GiB free"
+    if (( free_gb < MIN_DISK_GB )); then
+      echo "ERROR: Docker root has ${free_gb} GiB free but this run needs about" \
+        "${MIN_DISK_GB} GiB for SWE-bench images" >&2
+      echo "       Reclaim space on the node, or lower/disable the check with" \
+        "SWEBENCH_MIN_DISK_GB." >&2
+      exit 2
+    fi
+  else
+    echo "WARN: the Docker root is not visible from this container, so free" \
+      "space cannot be measured; running without the preflight disk check." \
+      "The run needs about ${MIN_DISK_GB} GiB and will fail late if the node" \
+      "does not have it." >&2
+  fi
+fi
+
+# Baseline for the prune on exit. A failed query here would write an empty file,
+# which reads as "the node had no images" and would make the cleanup delete
+# every sweb image on the node, including ones this run never pulled. Drop the
+# file instead: the cleanup skips the prune when it is missing.
+PRE_EXISTING_IMAGES_FILE="${GENERATION_DIR}/pre_existing_images.txt"
+if ! swebench_image_refs > "${PRE_EXISTING_IMAGES_FILE}"; then
+  rm -f "${PRE_EXISTING_IMAGES_FILE}"
+  echo "WARN: could not list Docker images, so the pre-run image baseline is" \
+    "unknown; images pulled by this run will be left on the node instead of" \
+    "risking the removal of images that were already there." >&2
+fi
 
 if [[ ! -x "${VENV}/bin/python3" ]]; then
   rm -rf "${VENV}"
@@ -317,10 +417,13 @@ Path(output_path).write_text(
 )
 PY
 
-cleanup_nested_containers() {
+cleanup_nested_docker_resources() {
   local rc=$?
   set +e
   local -a container_ids=()
+  local -a new_images=()
+  local -a stuck_images=()
+  local current_images_file="${PRE_EXISTING_IMAGES_FILE}.now"
   if [[ -n "${mini_pid:-}" ]] && kill -0 "${mini_pid}" 2>/dev/null; then
     kill "${mini_pid}" 2>/dev/null || true
     sleep 2
@@ -330,16 +433,66 @@ cleanup_nested_containers() {
     find "${AGENT_OUTPUT_DIR}" -type f -name '*.traj*' -delete \
       2>/dev/null || true
   fi
+  # Two sources, because only the agent containers are ours to label: the label
+  # is injected into the mini-swe-agent environment config, while the official
+  # harness starts its own `sweb.eval.<instance>.<run_id>` scoring containers.
+  # A scoring run cut short by SWEBENCH_SCORE_TIMEOUT leaves those behind, and
+  # a leftover container pins the image the prune below tries to reclaim.
   mapfile -t container_ids < <(
-    "${DOCKER_EXECUTABLE}" ps -aq \
-      --filter "label=atomesh.swebench.run=${RUN_ID}" 2>/dev/null
+    {
+      "${DOCKER_EXECUTABLE}" ps -aq \
+        --filter "label=atomesh.swebench.run=${RUN_ID}"
+      "${DOCKER_EXECUTABLE}" ps -aq \
+        --filter "name=sweb\.eval\..*${RUN_ID}"
+    } 2>/dev/null | sort -u
   )
   if [[ "${#container_ids[@]}" -gt 0 ]]; then
     "${DOCKER_EXECUTABLE}" rm -f "${container_ids[@]}" >/dev/null 2>&1 || true
   fi
+  if [[ "${PRUNE_IMAGES}" == "true" && -f "${PRE_EXISTING_IMAGES_FILE}" ]]; then
+    # Into a file rather than <(swebench_image_refs): a process substitution
+    # hides the exit status, so a failed query would look like an empty image
+    # list and turn the whole baseline into "new" images to delete.
+    if ! swebench_image_refs > "${current_images_file}"; then
+      echo "WARN: could not list Docker images; skipping the prune. Images" \
+        "pulled by this run stay on the Docker root." >&2
+    else
+      mapfile -t new_images < <(
+        comm -13 "${PRE_EXISTING_IMAGES_FILE}" "${current_images_file}"
+      )
+      if [[ "${#new_images[@]}" -gt 0 ]]; then
+        echo "[swebench] reclaiming ${#new_images[@]} image(s) pulled by this run"
+        # Plain rmi, never rmi -f. If a container still references an image, rmi
+        # refuses and says so on stderr; rmi -f would strip the tag and leave the
+        # layers behind as a dangling image that nothing can reuse and only
+        # `docker image prune` can find. Only stdout (one "Untagged:" line per
+        # image) is dropped -- failures have to stay visible.
+        "${DOCKER_EXECUTABLE}" rmi "${new_images[@]}" >/dev/null || true
+        # Re-diff instead of trusting the rmi exit code: report what actually
+        # went away, so a fully failed prune cannot read as a successful one.
+        # A failed re-query is reported as unverified, never as success.
+        if ! swebench_image_refs > "${current_images_file}"; then
+          echo "WARN: could not list Docker images to confirm the prune;" \
+            "${#new_images[@]} image(s) may still occupy the Docker root" >&2
+        else
+          mapfile -t stuck_images < <(
+            comm -13 "${PRE_EXISTING_IMAGES_FILE}" "${current_images_file}"
+          )
+          if [[ "${#stuck_images[@]}" -gt 0 ]]; then
+            echo "WARN: ${#stuck_images[@]} of ${#new_images[@]} image(s) could" \
+              "not be reclaimed and still occupy the Docker root" >&2
+          else
+            echo "[swebench] reclaimed all ${#new_images[@]} image(s)"
+          fi
+        fi
+        "${DOCKER_EXECUTABLE}" system df || true
+      fi
+    fi
+    rm -f "${current_images_file}"
+  fi
   return "${rc}"
 }
-trap cleanup_nested_containers EXIT
+trap cleanup_nested_docker_resources EXIT
 
 slice_args=()
 if [[ -n "${LIMIT}" ]]; then

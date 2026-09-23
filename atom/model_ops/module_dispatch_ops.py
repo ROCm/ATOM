@@ -19,8 +19,9 @@ Caller contract (per op): the module registered at `layer_name` must expose
 the methods listed in each op's docstring.
 
 Currently registered:
-  - torch.ops.aiter.maybe_dual_stream_forward — V2/V3.2/V4/K3 MoE
-  - torch.ops.aiter.indexer_score_topk       — V4 sparse indexer
+  - torch.ops.aiter.maybe_dual_stream_forward  — V2/V3.2/V4 MoE (summed)
+  - torch.ops.aiter.maybe_dual_stream_split_forward — K3 MoE (routed/shared unsummed)
+  - torch.ops.aiter.indexer_score_topk         — V4 sparse indexer
 """
 
 import torch
@@ -43,37 +44,46 @@ from atom.utils.forward_context import get_current_cudagraph_runtime_mode
 # threshold from `envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD`.
 
 
+def _dual_stream_is_active(self, num_tokens: int) -> bool:
+    """Whether this call should fork the shared branch onto ``alt_stream``.
+
+    Shared by the single-tensor op and the split-return op below so the two
+    can never drift into disagreeing about when dual-stream engages.
+    """
+    # Under TBO the two micro-batches already overlap on separate threads
+    from atom.utils.tbo.ubatching import tbo_active
+
+    # Graph ownership belongs to the active frontend.  Eager NONE and
+    # whole-model FULL capture both support the fork/join topology; PIECEWISE
+    # capture holds it too, but is opt-in (ATOM_DUAL_STREAM_PIECEWISE).
+    piecewise_blocked = (
+        get_current_cudagraph_runtime_mode() == CUDAGraphMode.PIECEWISE
+        and not envs.ATOM_DUAL_STREAM_PIECEWISE
+    )
+    # Intra-GPU disagg (--enable-rapidserve) partitions CUs between the prefill
+    # and decode processes by masking their streams. `alt_stream` carries no
+    # mask, so a dual-stream fork escapes the partition and contends with the
+    # other process. The gate below was added for that and then deliberately
+    # switched off by the "overlap enabled" commit, which is measuring whether
+    # the contention is worth the overlap. Kept here, disabled, because the
+    # reasoning is not obvious from the code:
+    #     and not get_current_atom_config().enable_rapidserve
+    return (
+        self._use_dual_stream
+        and 0 < num_tokens <= envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
+        and not tbo_active()
+        and not piecewise_blocked
+    )
+
+
 def maybe_dual_stream_forward(
     hidden_states: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
-    atom_config = get_current_atom_config()
-    self = atom_config.compilation_config.static_forward_context[layer_name]
-    threshold = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
-    num_tokens = hidden_states.shape[0]
-    # Under TBO the two micro-batches already overlap on separate threads
-    from atom.utils.tbo.ubatching import tbo_active
-
-    # Graph ownership belongs to the active frontend.  Only a concrete
-    # PIECEWISE runtime decision is unsafe here: per-piece capture closes over
-    # the main stream while this forward forks work onto `alt_stream`.  Eager
-    # NONE and whole-model FULL capture both support the fork/join topology.
-    is_piecewise_cudagraph = (
-        get_current_cudagraph_runtime_mode() == CUDAGraphMode.PIECEWISE
-    )
-
-    # Intra-GPU disagg (--enable-rapidserve) partitions CUs between the prefill
-    # and decode processes by masking their streams. `alt_stream` carries no
-    # mask, so a dual-stream fork would escape the partition and contend with
-    # the other process. Overrides the threshold rather than replacing it — the
-    # env var stays the tuning knob for every non-rapidserve run.
-    if (
-        self._use_dual_stream
-        and 0 < num_tokens <= threshold
-        and not tbo_active()
-        and not is_piecewise_cudagraph
-        #and not atom_config.enable_rapidserve
-    ):
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    if _dual_stream_is_active(self, hidden_states.shape[0]):
         return self.dual_stream_moe_forward(hidden_states)
     return self.single_stream_moe_forward(hidden_states)
 
@@ -93,6 +103,61 @@ direct_register_custom_op(
     # functionalization pass into inserting defensive input clones.
     mutates_args=(),
     fake_impl=_maybe_dual_stream_forward_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+# ---------------------------------------------------------------------------
+# Dual-stream MoE dispatch, routed/shared returned UNSUMMED (K3)
+# ---------------------------------------------------------------------------
+#
+# Caller contract (the MoE module looked up by `layer_name`):
+#   - `_use_dual_stream: bool`
+#   - `single_stream_split_moe_forward(hidden_states) -> (Tensor, Tensor)`
+#   - `dual_stream_split_moe_forward(hidden_states) -> (Tensor, Tensor)`
+#
+# Same gating as `maybe_dual_stream_forward`; the only difference is the return.
+# The op above must sum internally because torch's schema inference has no
+# representation for an optional tensor in a tuple return -- so a model that can
+# legally defer the routed + shared add across the layer boundary (K3, whose
+# next attn_res folds both addends into its on-load) cannot use it without
+# paying the [T, H] elementwise kernel it is trying to skip.
+#
+# This op returns both branches instead. Both returns are always real tensors,
+# which the schema does allow; the caller decides whether deferring is legal
+# from its own static config, NOT from anything about these tensors. A model
+# whose branches must be summed before a collective keeps using the op above.
+#
+# Deliberately a separate op rather than a widened signature on
+# `maybe_dual_stream_forward`: that one is shared with DeepSeek V2/V3.2/V4,
+# none of which defer the add, and all of which live in @support_torch_compile
+# files.
+
+
+def maybe_dual_stream_split_forward(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    if _dual_stream_is_active(self, hidden_states.shape[0]):
+        return self.dual_stream_split_moe_forward(hidden_states)
+    return self.single_stream_split_moe_forward(hidden_states)
+
+
+def _maybe_dual_stream_split_forward_fake(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(hidden_states), torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="maybe_dual_stream_split_forward",
+    op_func=maybe_dual_stream_split_forward,
+    mutates_args=(),
+    fake_impl=_maybe_dual_stream_split_forward_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 

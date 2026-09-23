@@ -1,18 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Pipeline-parallel inter-stage CPU transport.
 #
-# Each PP stage runs as its own EngineCore process. Two control channels run
+# Each PP stage runs as its own EngineCore process. Three control channels run
 # over ZMQ (CPU); the hidden-state tensors themselves go GPU-to-GPU over NCCL
 # (see pp_comm.py), never here.
 #
-#   metadata  (head -> every downstream stage): the scheduled batch to run.
-#   tokens    (last stage -> head):             sampled ScheduledBatchOutput,
-#                                               fed back so the head owns the
-#                                               request lifecycle / next step.
+#   metadata   (head -> every downstream stage): the scheduled batch to run.
+#   tokens     (last stage -> head):             sampled ScheduledBatchOutput,
+#                                                fed back so the head owns the
+#                                                request lifecycle / next step.
+#   kv_status  (every downstream stage -> head): KV offload load/save completion
+#                                                status, so the head can
+#                                                aggregate across all PP stages.
 #
-# The objects moved here (ScheduledBatch, ScheduledBatchOutput) are the same
-# ones already pickled to broadcast to workers, so no bespoke wire format is
-# needed — pickle round-trips them verbatim.
+# The objects moved here (ScheduledBatch, ScheduledBatchOutput, KVConnectorOutput)
+# are the same ones already pickled to broadcast to workers, so no bespoke wire
+# format is needed — pickle round-trips them verbatim.
 #
 # Bind/connect convention: the RECEIVER binds, the SENDER connects (PUSH/PULL,
 # so connect-before-bind is fine; ZMQ queues at the sender).
@@ -27,7 +30,7 @@ logger = logging.getLogger("atom")
 
 
 class PPStageTransport:
-    """Per-stage ZMQ endpoints for the head<->downstream metadata/token channels.
+    """Per-stage ZMQ endpoints for the head<->downstream metadata/token/kv_status channels.
 
     Args:
         pp_rank: this stage's index (0 = head).
@@ -38,6 +41,9 @@ class PPStageTransport:
             stage binds a PULL socket to its own endpoint.
         token_addr: endpoint on which the head RECEIVES tokens from the last
             stage. The head binds a PULL socket; the last stage connects PUSH.
+        kv_status_addr: endpoint on which the head RECEIVES KV offload status
+            from ALL downstream stages. The head binds a PULL socket; every
+            downstream stage connects a PUSH socket. Empty string = disabled.
         ctx: optional shared zmq.Context (one is created if omitted).
     """
 
@@ -47,6 +53,7 @@ class PPStageTransport:
         pp_size: int,
         meta_addrs: list[str],
         token_addr: str,
+        kv_status_addr: str = "",
         ctx: zmq.Context | None = None,
     ):
         assert pp_size >= 2, "PPStageTransport is only used when pp_size >= 2"
@@ -62,6 +69,8 @@ class PPStageTransport:
         self._meta_recv: zmq.Socket | None = None
         self._token_recv: zmq.Socket | None = None
         self._token_send: zmq.Socket | None = None
+        self._kv_status_recv: zmq.Socket | None = None
+        self._kv_status_send: zmq.Socket | None = None
 
         if self.is_head:
             # One PUSH per downstream stage (metadata fan-out).
@@ -72,6 +81,10 @@ class PPStageTransport:
             # Receive sampled tokens back from the last stage.
             self._token_recv = self._ctx.socket(zmq.PULL)
             self._token_recv.bind(token_addr)
+            # Receive KV offload status from all downstream stages.
+            if kv_status_addr:
+                self._kv_status_recv = self._ctx.socket(zmq.PULL)
+                self._kv_status_recv.bind(kv_status_addr)
         else:
             # Receive the scheduled batch from the head.
             self._meta_recv = self._ctx.socket(zmq.PULL)
@@ -79,6 +92,10 @@ class PPStageTransport:
             if self.is_last:
                 self._token_send = self._ctx.socket(zmq.PUSH)
                 self._token_send.connect(token_addr)
+            # Send KV offload status back to the head.
+            if kv_status_addr:
+                self._kv_status_send = self._ctx.socket(zmq.PUSH)
+                self._kv_status_send.connect(kv_status_addr)
 
     # ---- head side ----------------------------------------------------------
     def send_metadata(self, batch: Any) -> None:
@@ -96,6 +113,21 @@ class PPStageTransport:
             return None
         return pickle.loads(self._token_recv.recv())
 
+    def recv_kv_status(self, timeout_ms: int = 0) -> list[tuple[int, Any]]:
+        """Head: drain all pending KV offload status messages.
+
+        Returns a (possibly empty) list of ``(pp_rank, KVConnectorOutput)``
+        tuples.  Non-blocking by default (``timeout_ms=0``).
+        """
+        if self._kv_status_recv is None:
+            return []
+        results: list[tuple[int, Any]] = []
+        while self._kv_status_recv.poll(timeout_ms):
+            pp_rank, output = pickle.loads(self._kv_status_recv.recv())
+            results.append((pp_rank, output))
+            timeout_ms = 0
+        return results
+
     # ---- downstream / last side --------------------------------------------
     def recv_metadata(self, timeout_ms: int | None = None) -> Any:
         """Downstream: block for the head's scheduled batch."""
@@ -108,10 +140,22 @@ class PPStageTransport:
         assert self._token_send is not None, "send_tokens only valid on last stage"
         self._token_send.send(pickle.dumps(out), copy=False)
 
+    def send_kv_status(self, output: Any) -> None:
+        """Downstream: send KV offload completion status to the head."""
+        if self._kv_status_send is None:
+            return
+        self._kv_status_send.send(pickle.dumps((self.pp_rank, output)), copy=False)
+
     def close(self) -> None:
         for sock in self._meta_send:
             sock.close(linger=0)
-        for sock in (self._meta_recv, self._token_recv, self._token_send):
+        for sock in (
+            self._meta_recv,
+            self._token_recv,
+            self._token_send,
+            self._kv_status_recv,
+            self._kv_status_send,
+        ):
             if sock is not None:
                 sock.close(linger=0)
         if self._owns_ctx:

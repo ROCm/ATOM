@@ -2,28 +2,30 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from functools import cache
-from typing import Optional
 
 import aiter
 import torch
 from aiter import fused_qk_norm_rope_cache_quant_shuffle
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.mha import _flash_attn_varlen_forward
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
-from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from aiter.ops.triton.unified_attention import unified_attention
-from atom.config import get_current_atom_config
-from atom.utils import envs
-from atom.utils.forward_context import ForwardContext, get_forward_context
 from torch import nn
 
-from .attention_mla import MLAModules
-
-from atom.utils.decorators import mark_trace
+from atom.config import get_current_atom_config
 from atom.model_ops.base_attention import (
+    PA_ASM_MAX_QUERY_GROUP_SIZE,
     cp_mha_gather_cache,
+    dense_decode_splits,
+    gluon_decode_over_limit,
     run_pa_decode_gluon,
     run_pa_fwd_asm,
 )
+from atom.utils import envs
+from atom.utils.decorators import mark_trace
+from atom.utils.forward_context import ForwardContext, get_forward_context
+
+from .attention_mla import MLAModules
 
 
 @cache
@@ -47,17 +49,17 @@ class PagedAttentionImpl(nn.Module):
         scale,
         num_kv_heads,
         alibi_slopes: list[float] | None,
-        sliding_window: Optional[int] = None,
+        sliding_window: int | None = None,
         kv_cache_dtype="bf16",
         logits_soft_cap: float | None = None,
         attn_type=None,
         kv_sharing_target_layer_name: int | None = None,
         layer_num=0,
-        mla_modules: Optional[MLAModules] = None,
-        sinks: Optional[nn.Parameter] = None,
-        rotary_emb: Optional[torch.nn.Module] = None,
-        q_norm: Optional[torch.nn.Module] = None,
-        k_norm: Optional[torch.nn.Module] = None,
+        mla_modules: MLAModules | None = None,
+        sinks: nn.Parameter | None = None,
+        rotary_emb: torch.nn.Module | None = None,
+        q_norm: torch.nn.Module | None = None,
+        k_norm: torch.nn.Module | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -70,6 +72,7 @@ class PagedAttentionImpl(nn.Module):
         self.alibi_slopes = alibi_slopes
         self.k_cache = self.v_cache = torch.tensor([])
         self.kv_cache_dtype = kv_cache_dtype
+        self.logits_soft_cap = logits_soft_cap
         self.max_model_len = 0
         self.k_scale = self.v_scale = None
         self.device = "cuda:" + str(torch.cuda.current_device())
@@ -79,13 +82,11 @@ class PagedAttentionImpl(nn.Module):
             if self.kv_cache_dtype == "fp8"
             else 1.0
         )
-        self.kv_scale = torch.tensor(self.kv_scale_float, dtype=torch.float32)
-        # Pre-allocated fp8 dequant scale for the pa_decode_bf16_asm path. Built
-        # here (outside CUDAGraph capture) and reused so the kernel wrapper never
-        # allocates a tensor mid-capture.
-        self._pa_decode_bf16_asm_scale = torch.full(
-            (1,), self.kv_scale_float, dtype=torch.float32, device=self.device
+        self.kv_scale = torch.tensor(
+            self.kv_scale_float, dtype=torch.float32, device=self.device
         )
+        # Reuse the KV scale as a 1-D view, created outside CUDA Graph capture.
+        self._pa_decode_bf16_asm_scale = self.kv_scale.view(1)
         self.per_token_quant = True
         self.sinks = sinks
         self.sliding_window = sliding_window if sliding_window is not None else -1
@@ -100,9 +101,26 @@ class PagedAttentionImpl(nn.Module):
         self.supports_quant_query_input = False
 
     def process_weights_after_loading(self):
-        if use_pa_decode_bf16_asm():
-            if self.sinks is not None and self.sinks.dtype != torch.float32:
-                self.sinks.data = self.sinks.data.to(torch.float32).contiguous()
+        if (
+            use_pa_decode_bf16_asm()
+            and self.sinks is not None
+            and self.sinks.dtype != torch.float32
+        ):
+            self.sinks.data = self.sinks.data.to(torch.float32).contiguous()
+
+    def _use_asm_cache_layout(
+        self,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        *,
+        use_triton_attn: bool,
+    ) -> bool:
+        """Select the native ATOM cache layout.
+
+        Native builders provide a pre-shuffled 5-D cache. A 4-D cache is only
+        used by the Triton path and must retain its standard layout.
+        """
+        return v_cache.dim() == 5 or not use_triton_attn
 
     def _can_attempt_prefill_sink_asm(self, fwd_ctx: ForwardContext) -> bool:
         if not fwd_ctx.context.is_prefill:
@@ -130,9 +148,10 @@ class PagedAttentionImpl(nn.Module):
         # sq != sk (chunked-prefill). cu_seqlens_q / cu_seqlens_k carry the
         # per-request new-token vs cached+new lengths, so we no longer require
         # max_seqlen_q == max_seqlen_k.
-        if attn_metadata.cu_seqlens_q is None or attn_metadata.cu_seqlens_k is None:
-            return False
-        return True
+        return (
+            attn_metadata.cu_seqlens_q is not None
+            and attn_metadata.cu_seqlens_k is not None
+        )
 
     def _can_use_prefill_sink_asm(
         self,
@@ -158,9 +177,22 @@ class PagedAttentionImpl(nn.Module):
             return False
         if q.shape[0] != k.shape[0] or k.shape[0] != v.shape[0]:
             return False
-        if q.shape[1] % k.shape[1] != 0:
-            return False
-        return True
+        return q.shape[1] % k.shape[1] == 0
+
+    def _reject_per_token_scales_on_unified(self, k_scale, v_scale, phase: str):
+        """unified_attention carries one descale for the whole tensor.
+
+        Feeding it a per-token cache is not an error downstream, just wrong
+        numbers, so it has to be refused here. Both phases route into unified on
+        the same conditions, so both check.
+        """
+        if (k_scale is not None and k_scale.numel() > 1) or (
+            v_scale is not None and v_scale.numel() > 1
+        ):
+            raise NotImplementedError(
+                f"layer {self.layer_num} takes unified_attention for {phase}, "
+                "which cannot carry its per-token KV scales"
+            )
 
     def forward_impl(
         self,
@@ -333,9 +365,9 @@ class PagedAttentionImpl(nn.Module):
             self._cache_format = "NHD"
         else:
             # for asm paged attention
-            asm_layout = True
-            if use_triton_attn and v_cache.dim() != 5:
-                asm_layout = False
+            asm_layout = self._use_asm_cache_layout(
+                k_cache, v_cache, use_triton_attn=use_triton_attn
+            )
             if self.rotary_emb is not None:
                 assert position is not None
                 q, k = self.rotary_emb(position, q, k)
@@ -393,14 +425,6 @@ class PagedAttentionImpl(nn.Module):
         """
         cu_seqlens_k = attn_metadata.cu_seqlens_k
         total_tokens = attn_metadata.total_kv
-        bs = attn_metadata.context_lens.shape[0]
-        token_to_batch = torch.repeat_interleave(
-            torch.arange(
-                bs, dtype=torch.int32, device=attn_metadata.context_lens.device
-            ),
-            attn_metadata.context_lens.long(),
-        )
-
         num_kv_heads = k.shape[1]
         head_dim = k.shape[2]
 
@@ -461,7 +485,9 @@ class PagedAttentionImpl(nn.Module):
             k_scales=k_scale,
             v_scales=v_scale,
             cu_seqlens_kv=cu_seqlens_k,
-            token_to_batch=token_to_batch,
+            # Built once per fwd by the prefill builder (same tensor for every
+            # layer); a ubatch gets its own by slicing in split_attn_metadata.
+            batch_id_per_k_token=attn_metadata.batch_id_per_k_token,
             seq_starts=attn_metadata.seq_starts,
             dequant=self.kv_cache_dtype.startswith("fp8"),
             kv_cache_layout="SHUFFLE" if use_shuffle else "NHD",
@@ -480,113 +506,125 @@ class PagedAttentionImpl(nn.Module):
         x = int(k_cache.shape[-1])
         return v_cache.view(n, nh, block_size // x, head_dim, x)
 
-    @mark_trace(prefix="paged_attention_triton", torch_compile=False)
-    def paged_attention_triton(
+    @mark_trace(prefix="paged_attention_unified", torch_compile=False)
+    def paged_attention_unified(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
+        """Decode through unified_attention: the widest envelope, no q-len cap.
 
+        _dispatch_decode sends every shape here that the paged kernels decline,
+        so the per-token check belongs to arriving here rather than to any one
+        of the reasons for it.
+        """
         attn_metadata = fwd_ctx.attn_metadata
+        self._reject_per_token_scales_on_unified(k_scale, v_scale, "decode")
 
         if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
             o = torch.empty(*q.shape, dtype=torch.bfloat16, device=q.device)
         else:
             o = torch.empty_like(q)
 
+        sliding_window = (
+            (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
+        )
+        unified_attention(
+            q,
+            k_cache,
+            v_cache,
+            o,
+            cu_seqlens_q=attn_metadata.cu_seqlens_q,
+            seqused_k=attn_metadata.context_lens,
+            max_seqlen_q=attn_metadata.max_seqlen_q,
+            max_seqlen_k=attn_metadata.max_seqlen_k,
+            softmax_scale=self.scale,
+            causal=True,
+            alibi_slopes=None,
+            window_size=sliding_window,
+            block_table=attn_metadata.block_tables,
+            softcap=0,
+            q_descale=None,
+            k_descale=self.kv_scale,
+            v_descale=self.kv_scale,
+            sinks=self.sinks,
+            shuffled_kv_cache=not self.use_flash_layout,
+        )
+        return o
+
+    @mark_trace(prefix="paged_attention_triton", torch_compile=False)
+    def paged_attention_triton(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+    ):
+        """Decode through the gluon paged kernel. Callers must have cleared
+        gluon_decode_over_limit -- _dispatch_decode is where that happens."""
+
+        attn_metadata = fwd_ctx.attn_metadata
+
+        o = torch.empty_like(q)
+
         num_seqs = attn_metadata.context_lens.shape[0]
 
-        if envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout:
-            # print(q.shape, k_cache.shape, v_cache.shape)
-            sliding_window = (
-                (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
-            )
+        _, num_q_heads_total, head_size = q.shape
+        _, num_kv_heads, _, _, _ = k_cache.shape
+        query_group_size = attn_metadata.max_seqlen_q * (
+            num_q_heads_total // num_kv_heads
+        )
+        assert num_q_heads_total % num_kv_heads == 0
 
-            shuffled_kv_cache = not self.use_flash_layout
+        max_context_partition_num = dense_decode_splits(num_seqs, num_kv_heads)
 
-            unified_attention(
-                q,
-                k_cache,
-                v_cache,
-                o,
-                cu_seqlens_q=attn_metadata.cu_seqlens_q,
-                seqused_k=attn_metadata.context_lens,
-                max_seqlen_q=attn_metadata.max_seqlen_q,
-                max_seqlen_k=attn_metadata.max_seqlen_k,
-                softmax_scale=self.scale,
-                causal=True,
-                alibi_slopes=None,
-                window_size=sliding_window,
-                block_table=attn_metadata.block_tables,
-                softcap=0,
-                q_descale=None,
-                k_descale=self.kv_scale,
-                v_descale=self.kv_scale,
-                sinks=self.sinks,
-                shuffled_kv_cache=shuffled_kv_cache,
-            )
-        else:
-            _, num_q_heads_total, head_size = q.shape
-            num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
-            query_group_size = attn_metadata.max_seqlen_q * (
-                num_q_heads_total // num_kv_heads
-            )
-            assert num_q_heads_total % num_kv_heads == 0
+        context_partition_size = 256
+        # Left after the split so a sliding-window layer still overrides both.
+        if self.sliding_window > 0:
+            max_context_partition_num = 1
+            context_partition_size = 128
 
-            max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
+        intermediate_shape = (
+            num_seqs,
+            num_kv_heads,
+            max_context_partition_num,
+            query_group_size,
+        )
+        exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
+        max_logits = torch.empty(
+            intermediate_shape, dtype=torch.float32, device=q.device
+        )
+        temporary_output = torch.empty(
+            *intermediate_shape,
+            head_size,
+            dtype=q.dtype,
+            device=q.device,
+        )
 
-            context_partition_size = 256
-            if self.sliding_window > 0:
-                max_context_partition_num = 1
-                context_partition_size = 128
+        if k_scale is not None and k_scale.numel() > 1:
+            k_scale = k_scale.unsqueeze(-1)
+            v_scale = v_scale.unsqueeze(-1)
 
-            intermediate_shape = (
-                num_seqs,
-                num_kv_heads,
-                max_context_partition_num,
-                query_group_size,
-            )
-            exp_sums = torch.empty(
-                intermediate_shape, dtype=torch.float32, device=q.device
-            )
-            max_logits = torch.empty(
-                intermediate_shape, dtype=torch.float32, device=q.device
-            )
-            temporary_output = torch.empty(
-                *intermediate_shape,
-                head_size,
-                dtype=q.dtype,
-                device=q.device,
-            )
-
-            if k_scale is not None and k_scale.numel() > 1:
-                k_scale = k_scale.unsqueeze(-1)
-                v_scale = v_scale.unsqueeze(-1)
-
-            compute_type = (
-                torch.bfloat16 if self.kv_cache_dtype == "bf16" else aiter.dtypes.fp8
-            )
-            run_pa_decode_gluon(
-                output=o,
-                q=q,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                context_lens=attn_metadata.context_lens,
-                block_tables=attn_metadata.block_tables,
-                softmax_scale=self.scale,
-                max_seqlen_q=attn_metadata.max_seqlen_q,
-                max_context_partition_num=max_context_partition_num,
-                context_partition_size=context_partition_size,
-                compute_type=compute_type,
-                q_scale=None,
-                k_scale=None if self.kv_cache_dtype == "bf16" else k_scale,
-                v_scale=None if self.kv_cache_dtype == "bf16" else v_scale,
-                exp_sums=exp_sums,
-                max_logits=max_logits,
-                temporary_output=temporary_output,
-                alibi_slopes=None,
-                sinks=self.sinks,
-                sliding_window=self.sliding_window,
-                ps=True,
-            )
+        compute_type = (
+            torch.bfloat16 if self.kv_cache_dtype == "bf16" else aiter.dtypes.fp8
+        )
+        run_pa_decode_gluon(
+            output=o,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            context_lens=attn_metadata.context_lens,
+            block_tables=attn_metadata.block_tables,
+            softmax_scale=self.scale,
+            max_seqlen_q=attn_metadata.max_seqlen_q,
+            max_context_partition_num=max_context_partition_num,
+            context_partition_size=context_partition_size,
+            compute_type=compute_type,
+            q_scale=None,
+            k_scale=None if self.kv_cache_dtype == "bf16" else k_scale,
+            v_scale=None if self.kv_cache_dtype == "bf16" else v_scale,
+            exp_sums=exp_sums,
+            max_logits=max_logits,
+            temporary_output=temporary_output,
+            alibi_slopes=None,
+            sinks=self.sinks,
+            sliding_window=self.sliding_window,
+            ps=True,
+        )
 
         return o
 
@@ -665,7 +703,7 @@ class PagedAttentionImpl(nn.Module):
             v_cache_5d = self._view_v_cache_for_pa_decode_bf16_asm(v_cache, k_cache)
 
             output = torch.empty(q_5d.shape, dtype=torch.bfloat16, device=q.device)
-            # CUDAGraph decode pads scheduled_bs up to graph_bs. PA ASM has no
+            # CUDAGraph decode pads scheduled_bs up to running_bs. PA ASM has no
             # work for padded rows (context_len == 0); zero output so padded rows
             # stay deterministic.
             split_rows = max(
@@ -726,6 +764,28 @@ class PagedAttentionImpl(nn.Module):
 
             return output.view(batch_size * max_seqlen_q, self.num_heads, self.head_dim)
 
+    def _can_use_fp8_prefill_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        fwd_ctx: ForwardContext,
+    ) -> bool:
+        attn_metadata = fwd_ctx.attn_metadata
+        return (
+            envs.ATOM_AITER_FP8_PREFILL_ATTN
+            and get_gfx() == "gfx950"
+            and self.head_dim == 256
+            and self.kv_cache_dtype.startswith("fp8")
+            and not attn_metadata.has_cached
+            and self.sliding_window == -1
+            and self.sinks is None
+            and (self.logits_soft_cap is None or self.logits_soft_cap == 0.0)
+            and getattr(attn_metadata, "dropout_p", 0.0) == 0.0
+            and q.shape[0] == k.shape[0] == v.shape[0]
+            and q.shape[-1] == k.shape[-1] == v.shape[-1] == 256
+        )
+
     @mark_trace(prefix="prefill_attention", torch_compile=False)
     def prefill_attention(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
@@ -745,6 +805,41 @@ class PagedAttentionImpl(nn.Module):
                     q, k, v, k_cache, v_cache, k_scale, v_scale, attn_metadata
                 )
             )
+        if self._can_use_fp8_prefill_attention(q, k, v, fwd_ctx):
+            output_dtype = q.dtype
+            # On gfx950, kv_scale is 1.0; FMHA requires a 1-D per-tensor scale.
+            scale = self.kv_scale.view(1)
+            # Use aiter's FMHA v3 varlen dispatcher (ROCm/aiter#4657) instead of
+            # flash_attn_varlen_fp8_pertensor_func, which hardcodes return_lse=False
+            # and can divert to Triton when ENABLE_CK=0.
+            o, _, _, _ = _flash_attn_varlen_forward(
+                q.contiguous().to(aiter.dtypes.fp8),
+                k.contiguous().to(aiter.dtypes.fp8),
+                v.contiguous().to(aiter.dtypes.fp8),
+                attn_metadata.cu_seqlens_q,
+                attn_metadata.cu_seqlens_k,
+                None,
+                None,
+                attn_metadata.max_seqlen_q,
+                attn_metadata.max_seqlen_k,
+                attn_metadata.min_seqlen_q,
+                0.0,
+                self.scale,
+                causal=True,
+                logits_soft_cap=0.0,
+                window_size_left=-1,
+                window_size_right=-1,
+                sink_size=0,
+                bias=None,
+                alibi_slopes=None,
+                q_descale=scale,
+                k_descale=scale,
+                v_descale=scale,
+                return_lse=False,
+                return_softmax=False,
+            )
+            return o if o.dtype == output_dtype else o.to(output_dtype)
+
         sliding_window = (
             (self.sliding_window, 0, 0) if self.sliding_window > 0 else (-1, -1, 0)
         )
@@ -768,7 +863,6 @@ class PagedAttentionImpl(nn.Module):
     def prefill_attention_triton(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
-
         # unified_attention supports both prefill and decode, over either the 4D
         # flash layout (shuffled_kv_cache=False) or the 5D SHUFFLE layout
         # (shuffled_kv_cache=True):
@@ -806,6 +900,9 @@ class PagedAttentionImpl(nn.Module):
         # are read straight from `k_cache`/`v_cache`, identical to the
         # prefix-cache-hit path.
         if envs.ATOM_USE_UNIFIED_ATTN or attn_metadata.has_cached:
+            # Only this branch reads the quantized cache; the else below passes
+            # raw bf16 K/V, where a per-token scale never reaches the kernel.
+            self._reject_per_token_scales_on_unified(k_scale, v_scale, "prefill")
             k_for_attn = k_cache
             v_for_attn = v_cache
             # Reads the paged KV cache, which is 5D SHUFFLE unless the (default)
@@ -819,13 +916,24 @@ class PagedAttentionImpl(nn.Module):
             # Raw K/V is fed as a block_size=1 flash-layout cache, never shuffled.
             shuffled_kv_cache = False
 
+        # Requests this step scheduled: the width prepare_prefill fills in
+        # cu_seqlens_q and context_lens before padding the tail to running_bs.
+        #
+        # context.scheduled_bs is batch.total_seqs_num, while the builder sized
+        # these arrays by total_seqs_num_prefill. The two differ only on a batch
+        # carrying decode rows, and such a batch leaves total_tokens_num_prefill
+        # at 0 -- hence is_prefill False, which is the branch this method is
+        # reached from. Every is_prefill batch sets the two counts equal.
+        n_seqs = fwd_ctx.context.scheduled_bs
         unified_attention(
             q,
             k_for_attn,
             v_for_attn,
             o,
-            cu_seqlens_q=attn_metadata.cu_seqlens_q,
-            seqused_k=attn_metadata.context_lens,
+            # Cut to the requests actually scheduled: the prefill builder pads
+            # both of these past them.
+            cu_seqlens_q=attn_metadata.cu_seqlens_q[: n_seqs + 1],
+            seqused_k=attn_metadata.context_lens[:n_seqs],
             max_seqlen_q=attn_metadata.max_seqlen_q,
             max_seqlen_k=attn_metadata.max_seqlen_k,
             softmax_scale=self.scale,
@@ -843,25 +951,65 @@ class PagedAttentionImpl(nn.Module):
 
         return o
 
-    def _dispatch_decode(self):
+    def _dispatch_decode(self, max_qlen: int = 1):
+        """The single place that answers which decode kernel runs.
+
+        The runners do not re-decide. The vLLM bridge shares the constants and
+        the predicate, not this order -- its arms differ (no unified fallback,
+        no sliding-window arm). Both
+        paged kernels stop short of unified, at different points, and drafting
+        multiplies the query group into both limits. ASM is the one that must be
+        checked here rather than inside its runner: past its envelope
+        get_heuristic_kernel silently re-runs with mtp=1, a kernel built for
+        another query length, and computes a wrong answer instead of refusing.
+        """
+        # Clamped once here so both gates see the same value; the predicate
+        # clamps internally too, and a sentinel would otherwise split them.
+        max_qlen = max(1, int(max_qlen))
+        over_gluon = gluon_decode_over_limit(
+            max_qlen, self.num_heads, self.num_kv_heads
+        )
+        over_asm = (
+            max_qlen * (self.num_heads // self.num_kv_heads)
+            > PA_ASM_MAX_QUERY_GROUP_SIZE
+        )
+
+        # unified takes any shape; the two paged kernels do not. Kept as one
+        # expression because a sliding-window layer needs the same answer, and
+        # it returns before the env checks below.
+        wants_unified = (
+            envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout or over_gluon
+        )
+
         # Sliding-window layers must use triton (ASM paths don't support it)
         if self.sliding_window != -1:
-            return self.paged_attention_triton
+            return (
+                self.paged_attention_unified
+                if wants_unified
+                else self.paged_attention_triton
+            )
 
         atom_config = get_current_atom_config()
 
         if envs.ATOM_USE_UNIFIED_ATTN:
             if envs.ATOM_FORCE_ATTN_TRITON:
-                return self.paged_attention_triton
+                return self.paged_attention_unified
             if atom_config.kv_cache_block_size == 256:
                 return self.paged_attention_persistent_asm
+            return self.paged_attention_unified
+
+        if wants_unified:
+            return self.paged_attention_unified
+        if self.use_triton_attn:
             return self.paged_attention_triton
 
-        if self.use_triton_attn or self.use_flash_layout:
+        # use_pa_decode_bf16_asm() requires ATOM_USE_UNIFIED_ATTN, which the
+        # block above has already returned on, so it cannot be reached here.
+        # Only run_pa_fwd_asm is bounded here. The persistent paths above call
+        # pa_persistent_fwd / pa_decode_bf16_asm, different kernels with their
+        # own tables, so this envelope does not describe them.
+        if over_asm:
             return self.paged_attention_triton
-
-        if use_pa_decode_bf16_asm():
-            return self.paged_attention_persistent_asm
         return self.paged_attention_asm
 
     def dispatch_backend(
@@ -880,7 +1028,9 @@ class PagedAttentionImpl(nn.Module):
             if envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout:
                 return self.prefill_attention_triton
             return self.prefill_attention
-        return self._dispatch_decode()
+        attn_metadata = fwd_ctx.attn_metadata
+        max_qlen = 1 if attn_metadata is None else attn_metadata.max_seqlen_q
+        return self._dispatch_decode(max_qlen)
 
     def forward(
         self,
@@ -890,7 +1040,7 @@ class PagedAttentionImpl(nn.Module):
         kv_cache: torch.Tensor = None,
         attn_metadata=None,
         position: torch.Tensor = None,
-        q_scale: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
         qkv: torch.Tensor = None,
         output: torch.Tensor = None,
         **kwargs,
@@ -936,21 +1086,21 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         scale,
         num_kv_heads,
         alibi_slopes: list[float] | None = None,
-        sliding_window: Optional[int] = None,
+        sliding_window: int | None = None,
         kv_cache_dtype="bf16",
         logits_soft_cap: float | None = None,
         attn_type=None,
         kv_sharing_target_layer_name: int | None = None,
         layer_num=0,
-        mla_modules: Optional[MLAModules] = None,
-        sinks: Optional[nn.Parameter] = None,
-        rotary_emb: Optional[torch.nn.Module] = None,
-        q_norm: Optional[torch.nn.Module] = None,
-        k_norm: Optional[torch.nn.Module] = None,
+        mla_modules: MLAModules | None = None,
+        sinks: nn.Parameter | None = None,
+        rotary_emb: torch.nn.Module | None = None,
+        q_norm: torch.nn.Module | None = None,
+        k_norm: torch.nn.Module | None = None,
         # --- MiniMax-M3 sparse-attention indexer kwargs (all impl-local) ---
-        index_q_norm: Optional[torch.nn.Module] = None,
-        index_k_norm: Optional[torch.nn.Module] = None,
-        index_rotary_emb: Optional[torch.nn.Module] = None,
+        index_q_norm: torch.nn.Module | None = None,
+        index_k_norm: torch.nn.Module | None = None,
+        index_rotary_emb: torch.nn.Module | None = None,
         index_q_size: int = 0,
         index_head_dim: int = 0,
         topk: int = 0,
@@ -987,10 +1137,33 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         self.index_rotary_emb = (
             index_rotary_emb if index_rotary_emb is not None else rotary_emb
         )
-        self.index_q_size = index_q_size
         self.index_head_dim = index_head_dim
-        # M3 has one index head per kv head (num_idx_heads == num_kv_heads).
-        self.num_idx_heads = num_kv_heads
+        # Under TP, M3 has one index head per kv head. Under indexer-only CP
+        # every rank projects ALL index heads and shards the CONTEXT instead, so
+        # the group's world size is the full index-head count. Resolved once
+        # here so no per-forward branch reaches the compiled model.
+        from atom.distributed.indexer_cp import (
+            get_indexer_cp_group,
+            get_indexer_cp_rank,
+            get_indexer_cp_world_size,
+            indexer_cp_enabled,
+        )
+
+        self.indexer_cp_group = None
+        self.indexer_cp_rank = 0
+        self.indexer_cp_world = 1
+        if indexer_cp_enabled():
+            self.indexer_cp_group = get_indexer_cp_group()
+            self.indexer_cp_rank = get_indexer_cp_rank()
+            self.indexer_cp_world = get_indexer_cp_world_size()
+        self.num_idx_heads = (
+            self.indexer_cp_world if self.indexer_cp_group is not None else num_kv_heads
+        )
+        self.index_q_size = (
+            self.num_idx_heads * index_head_dim
+            if self.indexer_cp_group is not None
+            else index_q_size
+        )
         self.topk = topk
         self.init_blocks = init_blocks
         self.local_blocks = local_blocks
@@ -1001,14 +1174,14 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         )
         # Bound by AiterAttentionMetadataBuilder.build_kv_cache_tensor (Task 6):
         # the page-128 indexer-key cache. None until the runner binds it.
-        self.index_cache: Optional[torch.Tensor] = None
+        self.index_cache: torch.Tensor | None = None
         # Optional shared dict bound by the metadata builder. It is scoped to the
         # current sparse metadata object and carries the last full layer top-k.
-        self.index_topk_cache_state: Optional[dict] = None
-        self._index_q_cache_key_info: Optional[tuple] = None
+        self.index_topk_cache_state: dict | None = None
+        self._index_q_cache_key_info: tuple | None = None
         # Rotated indexer query produced by rope_cache, consumed (and cleared) by
         # dispatch_backend within the same single-threaded layer forward.
-        self._index_q: Optional[torch.Tensor] = None
+        self._index_q: torch.Tensor | None = None
 
     @staticmethod
     def _to_page16_shuffle(k_cache, v_cache, k_scale, v_scale):
@@ -1219,7 +1392,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         state = getattr(sparse_metadata, "_index_topk_cache_state", None)
         if state is None:
             state = {}
-            setattr(sparse_metadata, "_index_topk_cache_state", state)
+            sparse_metadata._index_topk_cache_state = state
         return state
 
     def _topk_cache_key(
@@ -1255,6 +1428,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             self.num_kv_heads,
             max_query_len,
             max_seq_len,
+            # index_q_shape already separates CP (T,4,128) from TP (T,1,128),
+            # but the arm is what decides the value's meaning; keep it explicit.
+            self.indexer_cp_group is not None,
         )
 
     def _load_cached_topk(self, sparse_metadata, key: tuple):
@@ -1308,6 +1484,13 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         if cached_topk is None:
             if index_q is None:
                 raise RuntimeError("MiniMax-M3 index cache miss on a skip-index layer")
+            if self.indexer_cp_group is not None:
+                # Prefill stays TP: its scorer is causal-tiled over ragged
+                # chunks with per-token prefix_lens, which the decode-shaped CP
+                # kernels do not model. Head r of the replicated projection is
+                # exactly the head this rank would have projected alone, so the
+                # slice is an identity, not an approximation.
+                index_q = index_q[:, self.indexer_cp_rank : self.indexer_cp_rank + 1]
             topk_idx, sparse_bt, sparse_ctx = minimax_m3_index_topk(
                 index_q,
                 self.index_cache,
@@ -1323,6 +1506,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 self.num_kv_heads,
                 self.scale,
                 emit_sparse_block_table=True,
+                n_valid_column_per_row=sparse_metadata.n_valid_column_per_row,
             )
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)
@@ -1360,6 +1544,63 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             tbo_yield()
         return output
 
+    def _cp_index_topk_decode(
+        self, index_q, block_table, seq_lens, max_seq_len, max_query_len
+    ):
+        """Decode top-k with the context sharded across the indexer-CP group.
+
+        Score all index heads over this rank's 1/P of the blocks, reduce to this
+        shard's own top-k, exchange, then merge to the global top-k for the one
+        head this rank owns. The result is bit-identical to the TP path, so this
+        is an exact swap and not an approximation.
+
+        Only the shard's own top-k crosses the wire, so the payload is
+        world*topk keys per token at any context length.
+        """
+        from atom.distributed.indexer_cp import exchange_candidates
+        from atom.model_ops.minimax_m3.indexer_candidate_exchange import (
+            local_candidate_keys,
+            merge_candidate_keys,
+        )
+        from atom.model_ops.minimax_m3.indexer_context_parallel import (
+            indexer_context_scores,
+        )
+
+        global_blocks = block_table.shape[1]
+        scores = indexer_context_scores(
+            index_q,
+            self.index_cache,
+            block_table,
+            seq_lens,
+            max_seq_len,
+            self.indexer_cp_rank,
+            self.indexer_cp_world,
+            max_query_len,
+            self.scale,
+        )
+        # Forced blocks are pinned in BOTH passes on purpose: one that lost its
+        # owner shard's top-k would never arrive at the merge to be pinned.
+        keys = local_candidate_keys(
+            scores,
+            seq_lens,
+            self.topk,
+            self.indexer_cp_rank,
+            self.indexer_cp_world,
+            max_query_len,
+            global_blocks,
+            self.init_blocks,
+            self.local_blocks,
+        )
+        return merge_candidate_keys(
+            exchange_candidates(keys),
+            block_table,
+            seq_lens,
+            self.topk,
+            self.init_blocks,
+            self.local_blocks,
+            max_query_len,
+        )
+
     @mark_trace(prefix="sparse_attention_decode", torch_compile=False)
     def _sparse_decode(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
@@ -1387,20 +1628,30 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         if cached_topk is None:
             if index_q is None:
                 raise RuntimeError("MiniMax-M3 index cache miss on a skip-index layer")
-            topk_idx, sparse_bt, sparse_ctx = minimax_m3_index_topk_decode(
-                index_q,
-                self.index_cache,
-                decode_md.block_table,
-                decode_md.seq_lens,
-                sparse_metadata.max_seq_len,
-                self.topk,
-                self.init_blocks,
-                self.local_blocks,
-                self.num_kv_heads,
-                self.scale,
-                emit_sparse_block_table=True,
-                max_query_len=max_query_len,
-            )
+            if self.indexer_cp_group is not None:
+                topk_idx, sparse_bt, sparse_ctx = self._cp_index_topk_decode(
+                    index_q,
+                    decode_md.block_table,
+                    decode_md.seq_lens,
+                    sparse_metadata.max_seq_len,
+                    max_query_len,
+                )
+            else:
+                topk_idx, sparse_bt, sparse_ctx = minimax_m3_index_topk_decode(
+                    index_q,
+                    self.index_cache,
+                    decode_md.block_table,
+                    decode_md.seq_lens,
+                    sparse_metadata.max_seq_len,
+                    self.topk,
+                    self.init_blocks,
+                    self.local_blocks,
+                    self.num_kv_heads,
+                    self.scale,
+                    emit_sparse_block_table=True,
+                    max_query_len=max_query_len,
+                    n_valid_column_per_row=sparse_metadata.n_valid_column_per_row,
+                )
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)
             )

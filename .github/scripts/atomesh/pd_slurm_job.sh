@@ -5,6 +5,14 @@
 
 set -euo pipefail
 
+# Default RCCL to IPv4 (GID 1 on TW). Allow overrides for other fabrics.
+export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-1}"
+if [[ ! "${NCCL_IB_GID_INDEX}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: NCCL_IB_GID_INDEX must be a non-negative integer" >&2
+  exit 2
+fi
+echo "RCCL RDMA GID index: ${NCCL_IB_GID_INDEX}"
+
 REPO_ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
 SCRIPT_PATH="${REPO_ROOT}/.github/scripts/atomesh/pd_server_atom.sh"
 JOB_ID="${SLURM_JOB_ID:-${SPUR_JOB_ID:-local}}"
@@ -12,10 +20,13 @@ CURRENT_USER="$(id -un 2>/dev/null || id -u)"
 RUN_DIR="${LOG_ROOT}/slurm_job-${JOB_ID}"
 
 mkdir -p "${RUN_DIR}"
+# Shared NFS: every Spur rank writes rank-rc-* here for GHA accounting fallback.
+chmod 0777 "${RUN_DIR}" 2>/dev/null || true
 
 EXECUTION_PHASES=(combined)
 if [[ "${BENCHMARK_KIND:-random}" == "aiperf_agentic" \
-  && "${EVAL_TASK:-gsm8k}" == "swebench_lite" \
+  && ( "${EVAL_TASK:-gsm8k}" == "swebench_lite" \
+    || "${EVAL_TASK:-gsm8k}" == "gsm8k" ) \
   && ( "${RUN_EVAL:-false}" == "true" || "${RUN_EVAL:-false}" == "1" ) ]]; then
   EXECUTION_PHASES=(benchmark eval)
 fi
@@ -31,6 +42,35 @@ execution_phase_port_offset() {
   else
     printf '0\n'
   fi
+}
+
+# Do not wait on D-state RDMA leftovers: kill/rm with a bound so the Slurm
+# task can exit instead of sitting in COMPLETING (same as RDMA smoke).
+bounded_docker_rm() {
+  local container="$1"
+  [[ -n "${container}" ]] || return 0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 20 docker kill "${container}" >/dev/null 2>&1 || true
+    timeout 20 docker rm -f "${container}" >/dev/null 2>&1 || true
+  else
+    docker kill "${container}" >/dev/null 2>&1 || true
+    docker rm -f "${container}" >/dev/null 2>&1 || true
+  fi
+}
+
+publish_rank_rc() {
+  local rank="$1"
+  local rc="$2"
+  local rc_file="${RUN_DIR}/rank-rc-${rank}"
+  printf '%s\n' "${rc}" > "${rc_file}.tmp" 2>/dev/null || return 0
+  mv "${rc_file}.tmp" "${rc_file}" 2>/dev/null || true
+}
+
+publish_workload_status() {
+  python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_job_result.py" publish \
+    --run-dir "${RUN_DIR}" --job-id "${JOB_ID}" \
+    --run-token "${ATOMESH_RUN_TOKEN:-}" --num-ranks "${NUM_NODES}" \
+    --rank "$1" --status "$2"
 }
 
 write_env_file() {
@@ -73,12 +113,14 @@ allow = (
     # Preserve FlyDSL cache overrides for non-root Spur containers.
     "FLYDSL_",
     "SPEC_",
+    "STATE_CHECKPOINT_",
     "DRAFT_MODEL_PATH",
     "NUM_SPEC_TOKENS",
     "EXTRA_SERVER_ARGS",
     "RUN_EVAL",
     "EVAL_",
     "SWEBENCH_",
+    "NCCL_IB_GID_INDEX",
 )
 for key, value in sorted(os.environ.items()):
     if key.startswith(allow):
@@ -118,7 +160,8 @@ run_container_rank() {
   local rank_dir="${RUN_DIR}/rank-${rank}"
   local bin_dir="${RUN_DIR}/bin"
   local video_gid render_gid host_ionic nccl_socket_ifname
-  local docker_socket_gid docker_cli
+  local mori_socket_ifname socket_ifname
+  local docker_socket_gid docker_cli docker_root
 
   mkdir -p "${rank_dir}"
   mkdir -p "${bin_dir}"
@@ -140,26 +183,51 @@ EOF
   render_gid="$(getent group render 2>/dev/null | cut -d: -f3 || true)"
   host_ionic="$(readlink -f /usr/lib/x86_64-linux-gnu/libionic.so.1 2>/dev/null || true)"
   nccl_socket_ifname="${NCCL_SOCKET_IFNAME:-}"
-  if [[ -z "${nccl_socket_ifname}" && -d /sys/class/net/eth1 ]]; then
-    nccl_socket_ifname="eth1"
+  mori_socket_ifname="${MORI_SOCKET_IFNAME:-}"
+  local node_ip="${IPS[rank]}"
+  if [[ -z "${nccl_socket_ifname}" || -z "${mori_socket_ifname}" ]]; then
+    # Use the interface owning this worker's Spur address (10.19.x.x on
+    # TensorWave). Both NCCL and MORI bootstrap independently autodetect an
+    # interface; either can select a network that blocks local TCP traffic.
+    if ! socket_ifname="$(ip -o -4 addr show | awk -v node_ip="${node_ip}" '
+      { split($4, address, "/") }
+      address[1] == node_ip { sub(/@.*/, "", $2); print $2; exit }
+    ')" || [[ -z "${socket_ifname}" ]]; then
+      echo "ERROR: cannot find a local IPv4 interface for Spur address ${node_ip}; set NCCL_SOCKET_IFNAME and MORI_SOCKET_IFNAME explicitly" >&2
+      return 2
+    fi
+    # NCCL uses '=' for an exact match; MORI requires a plain interface name.
+    # Keep explicit overrides independent: NCCL also accepts lists/patterns
+    # that cannot be passed to MORI as interface names.
+    nccl_socket_ifname="${nccl_socket_ifname:-=${socket_ifname}}"
+    mori_socket_ifname="${mori_socket_ifname:-${socket_ifname}}"
   fi
+  echo "[network] rank=${rank} ip=${node_ip} NCCL_SOCKET_IFNAME=${nccl_socket_ifname} MORI_SOCKET_IFNAME=${mori_socket_ifname}"
 
-  docker rm -f "${container}" >/dev/null 2>&1 || true
+  bounded_docker_rm "${container}"
   if [[ "${execution_phase}" != "eval" ]]; then
     docker pull "${DOCKER_IMAGE}"
   fi
 
+  local mesh_binary="${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"
+  if [[ "${rank}" -eq 0 ]]; then
+    mesh_binary="$(bash "${REPO_ROOT}/.github/scripts/atomesh/setup_mesh.sh" \
+      "${REPO_ROOT}" "${RUN_DIR}" "${DOCKER_IMAGE}" "${env_file}" "${JOB_ID}")" || return $?
+  fi
+
   docker_args=(
-    run --rm --name "${container}"
+    run --name "${container}"
     --user "$(id -u):$(id -g)"
     --network host --ipc host
     --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband
-    --cap-add=IPC_LOCK --cap-add=NET_ADMIN
+    # Allow HIP's mbind through Docker's default seccomp for NUMA placement.
+    --cap-add=IPC_LOCK --cap-add=NET_ADMIN --cap-add=SYS_NICE
     --ulimit memlock=-1:-1 --ulimit stack=67108864 --ulimit nofile=65536:524288
     --shm-size=128G
     --env-file "${env_file}"
     -e ATOMESH_EXECUTION_PHASE="${execution_phase}"
     -e ATOMESH_SERVICE_PORT_OFFSET="${service_port_offset}"
+    -e ATOMESH_MESH_BINARY="${mesh_binary}"
     -e SLURM_JOB_ID="${JOB_ID}"
     -e SPUR_JOB_ID="${SPUR_JOB_ID:-${JOB_ID}}"
     -e NODE_RANK="${rank}"
@@ -182,7 +250,6 @@ EOF
     -e FLYDSL_RUNTIME_CACHE_DIR="/tmp/atomesh-cache-${JOB_ID}-${rank}/flydsl"
     -e NCCL_NET_PLUGIN=none
     -e NCCL_IB_HCA=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
-    -e NCCL_IB_GID_INDEX=1
     -e NCCL_CROSS_NIC=0
     -e NCCL_PXN_DISABLE=0
     -e NCCL_NET_DISABLE_INTRA=1
@@ -197,6 +264,12 @@ EOF
     -v /mnt:/mnt
     -v /data:/data
   )
+  if [[ -d /shared_nfs ]]; then
+    docker_args+=(-v /shared_nfs:/shared_nfs)
+  fi
+  if [[ -d /share_nfs/models ]]; then
+    docker_args+=(-v /share_nfs/models:/share_nfs/models)
+  fi
 
   if [[ "${rank}" -eq 0 \
     && "${EVAL_TASK:-}" == "swebench_lite" \
@@ -217,12 +290,25 @@ EOF
         -e SWEBENCH_DOCKER_EXECUTABLE=/usr/local/bin/docker-host
         --group-add "${docker_socket_gid}"
       )
+      # The SWE-bench disk preflight df(1)s the path the daemon reports as its
+      # root, but that path is in the *host* namespace. Bind it in at the same
+      # path so it resolves to the same filesystem inside rank 0; without it the
+      # check either finds nothing and skips, or measures the rootfs of the
+      # container and reports a number for the wrong disk.
+      docker_root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
+      if [[ -n "${docker_root}" && -d "${docker_root}" ]]; then
+        docker_args+=(-v "${docker_root}:${docker_root}:ro")
+      else
+        echo "WARN: could not resolve the Docker root on this host; the" \
+          "SWE-bench disk preflight check will be skipped" >&2
+      fi
     fi
   fi
 
   [[ -n "${video_gid}" ]] && docker_args+=(--group-add "${video_gid}")
   [[ -n "${render_gid}" ]] && docker_args+=(--group-add "${render_gid}")
   [[ -n "${nccl_socket_ifname}" ]] && docker_args+=(-e NCCL_SOCKET_IFNAME="${nccl_socket_ifname}")
+  [[ -n "${mori_socket_ifname}" ]] && docker_args+=(-e MORI_SOCKET_IFNAME="${mori_socket_ifname}")
   [[ -n "${host_ionic}" && -e "${host_ionic}" ]] && docker_args+=(-v "${host_ionic}:/usr/lib/x86_64-linux-gnu/libionic.so.1:ro")
   [[ -e /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so ]] && docker_args+=(-v /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:ro)
   [[ -e /etc/libibverbs.d/ionic.driver ]] && docker_args+=(-v /etc/libibverbs.d/ionic.driver:/etc/libibverbs.d/ionic.driver:ro)
@@ -234,15 +320,37 @@ EOF
     bash -lc "export PATH=/run_logs/slurm_job-${JOB_ID}/bin:\${PATH}; cd /workspace/ATOM && bash .github/scripts/atomesh/pd_server_atom.sh"
   )
 
-  docker "${docker_args[@]}" 2>&1 | tee "${rank_dir}/${container_log}"
+  local docker_rc
+  # Spur returns worker stdout/stderr in a size-limited RPC response. Keep
+  # unbounded container output on shared NFS, not in the scheduler response.
+  echo "[logs] rank=${rank} phase=${execution_phase} full log: ${rank_dir}/${container_log}"
+  set +e
+  docker "${docker_args[@]}" > "${rank_dir}/${container_log}" 2>&1
+  docker_rc=$?
+  set -e
+  echo "[logs] rank=${rank} phase=${execution_phase} exited rc=${docker_rc}"
+  if [[ "${docker_rc}" -ne 0 ]]; then
+    echo "[logs] last 16384 bytes of ${rank_dir}/${container_log}:" >&2
+    # Bound bytes rather than lines: benchmark progress and JSON can produce
+    # arbitrarily long lines. Diagnostics must not replace the Docker status.
+    tail -c 16384 -- "${rank_dir}/${container_log}" >&2 || true
+    printf '\n' >&2
+  fi
+  return "${docker_rc}"
 }
 
 run_spur_job() {
   if [[ -z "${SPUR_TASK_OFFSET:-}" || -z "${SPUR_PEER_NODES:-}" ]]; then
-    return 1
+    echo "ERROR: Spur worker requires SPUR_TASK_OFFSET and SPUR_PEER_NODES" >&2
+    return 2
   fi
 
   local node_rank="${SPUR_TASK_OFFSET}"
+  if [[ ! "${node_rank}" =~ ^[0-9]+$ || "${node_rank}" -ge "${NUM_NODES}" ]]; then
+    echo "ERROR: invalid Spur worker rank ${node_rank} for ${NUM_NODES} nodes" >&2
+    return 2
+  fi
+  publish_workload_status "${node_rank}" running
   local env_file="${RUN_DIR}/docker-rank-${node_rank}.env"
   local peers=()
   IFS=',' read -r -a peers <<< "${SPUR_PEER_NODES}"
@@ -304,10 +412,12 @@ EOF
     fi
     SPUR_CLEANUP_DONE=1
     echo "=== cleanup rank=${SPUR_NODE_RANK_FOR_CLEANUP} rc=${rc} ==="
+    # Publish before cleanup: Spur accounting is unreliable, so the workflow
+    # falls back to these per-rank codes.
+    publish_rank_rc "${SPUR_NODE_RANK_FOR_CLEANUP}" "${rc}"
     for suffix in "" "-benchmark" "-eval"; do
-      docker rm -f \
-        "atomesh-${ATOMESH_CELL_ID}-${JOB_ID}-${SPUR_NODE_RANK_FOR_CLEANUP}${suffix}" \
-        >/dev/null 2>&1 || true
+      bounded_docker_rm \
+        "atomesh-${ATOMESH_CELL_ID}-${JOB_ID}-${SPUR_NODE_RANK_FOR_CLEANUP}${suffix}"
     done
     return "${rc}"
   }
@@ -334,12 +444,29 @@ EOF
 
   echo "=== Spur rank ${node_rank} completed ==="
   find "${RUN_DIR}" -maxdepth 3 -type f | sort
+  # Separate completed work from EXIT-trap/agent cleanup. An EXIT trap alone
+  # can publish rc=0 without proving that all requested phases were executed.
+  publish_workload_status "${node_rank}" completed
   return 0
 }
 
-if [[ -n "${SPUR_TASK_OFFSET:-}" || -n "${SPUR_PEER_NODES:-}" ]]; then
+if [[ "${1:-}" == "--spur-worker" ]]; then
   run_spur_job
   exit $?
+fi
+
+if [[ -n "${SPUR_JOB_ID:-}" || -n "${SPUR_TASK_OFFSET:-}" || -n "${SPUR_PEER_NODES:-}" ]]; then
+  # Spur sbatch runs the batch script only on the first allocated node; the
+  # other nodes run placeholders until an srun step dispatches their workers.
+  # Use an explicit worker argument because the batch shell also has rank 0
+  # in SPUR_TASK_OFFSET. srun assigns each worker's rank and inherits the batch
+  # environment, including SPUR_PEER_NODES in allocation order.
+  echo "=== Spur job ${JOB_ID}: dispatching ${NUM_NODES} node workers ==="
+  exec srun \
+    --nodes="${NUM_NODES}" \
+    --ntasks="${NUM_NODES}" \
+    --ntasks-per-node=1 \
+    bash "${REPO_ROOT}/.github/scripts/atomesh/pd_slurm_job.sh" --spur-worker
 fi
 
 mapfile -t ALLOC_NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
@@ -427,12 +554,20 @@ cleanup() {
   fi
   CLEANUP_DONE=1
   echo "=== cleanup rc=${rc} ==="
+  printf '%s\n' "${rc}" > "${RUN_DIR}/slurm-job.rc.tmp" 2>/dev/null || true
+  mv "${RUN_DIR}/slurm-job.rc.tmp" "${RUN_DIR}/slurm-job.rc" 2>/dev/null || true
   for idx in "${!SELECTED_NODES[@]}"; do
     node="${SELECTED_NODES[$idx]}"
     for suffix in "" "-benchmark" "-eval"; do
       container="atomesh-${ATOMESH_CELL_ID}-${SLURM_JOB_ID}-${idx}${suffix}"
       srun --nodes=1 --ntasks=1 --nodelist="${node}" bash -lc "
-        docker rm -f '${container}' >/dev/null 2>&1 || true
+        if command -v timeout >/dev/null 2>&1; then
+          timeout 20 docker kill '${container}' >/dev/null 2>&1 || true
+          timeout 20 docker rm -f '${container}' >/dev/null 2>&1 || true
+        else
+          docker kill '${container}' >/dev/null 2>&1 || true
+          docker rm -f '${container}' >/dev/null 2>&1 || true
+        fi
       " || true
     done
   done
@@ -473,11 +608,25 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
       container="atomesh-'"${ATOMESH_CELL_ID}"'-'"${SLURM_JOB_ID}"'-${rank}${phase_suffix}"
       rank_dir="'"${RUN_DIR}"'/rank-${rank}"
       mkdir -p "${rank_dir}"
-      docker rm -f "${container}" >/dev/null 2>&1 || true
+      if command -v timeout >/dev/null 2>&1; then
+        timeout 20 docker kill "${container}" >/dev/null 2>&1 || true
+        timeout 20 docker rm -f "${container}" >/dev/null 2>&1 || true
+      else
+        docker kill "${container}" >/dev/null 2>&1 || true
+        docker rm -f "${container}" >/dev/null 2>&1 || true
+      fi
       if [[ "${execution_phase}" != "eval" ]]; then
         docker pull "'"${DOCKER_IMAGE}"'"
       fi
+      mesh_binary="${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"
+      if [[ "${rank}" -eq 0 ]]; then
+        mesh_binary="$(bash "'"${REPO_ROOT}"'/.github/scripts/atomesh/setup_mesh.sh" \
+          "'"${REPO_ROOT}"'" "'"${RUN_DIR}"'" "'"${DOCKER_IMAGE}"'" "'"${ENV_FILE}"'" "'"${SLURM_JOB_ID}"'")"
+      fi
       nested_docker_args=()
+      if [[ -d /shared_nfs ]]; then
+        nested_docker_args+=(-v /shared_nfs:/shared_nfs:ro)
+      fi
       if [[ "${rank}" -eq 0 \
         && "${EVAL_TASK:-}" == "swebench_lite" \
         && ( "${RUN_EVAL:-false}" == "true" || "${RUN_EVAL:-false}" == "1" ) ]]; then
@@ -494,9 +643,27 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
             -e SWEBENCH_DOCKER_EXECUTABLE=/usr/local/bin/docker-host
             --group-add "${docker_socket_gid}"
           )
+          # The SWE-bench disk preflight df(1)s the path the daemon reports as
+          # its root, but that path is in the *host* namespace. Bind it in at
+          # the same path so it resolves to the same filesystem inside rank 0;
+          # without it the check either finds nothing and skips, or measures the
+          # rootfs of the container and reports a number for the wrong disk.
+          # No apostrophes and no single quotes below: this whole block is one
+          # single-quoted remote command string, and either would end it early.
+          host_docker_root="$(docker info \
+            --format "{{.DockerRootDir}}" 2>/dev/null || true)"
+          if [[ -n "${host_docker_root}" && -d "${host_docker_root}" ]]; then
+            nested_docker_args+=(
+              -v "${host_docker_root}:${host_docker_root}:ro"
+            )
+          else
+            echo "WARN: could not resolve the Docker root on this host; the" \
+              "SWE-bench disk preflight check will be skipped" >&2
+          fi
         fi
       fi
-      docker run --rm --name "${container}" \
+      set +e
+      docker run --name "${container}" \
         --network host --ipc host --privileged \
         --device /dev/kfd --device /dev/dri --device /dev/infiniband \
         --group-add video --cap-add IPC_LOCK --cap-add NET_ADMIN \
@@ -505,6 +672,7 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
         --env-file "'"${ENV_FILE}"'" \
         -e ATOMESH_EXECUTION_PHASE="${execution_phase}" \
         -e ATOMESH_SERVICE_PORT_OFFSET="${service_port_offset}" \
+        -e ATOMESH_MESH_BINARY="${mesh_binary}" \
         -e SLURM_JOB_ID="'"${SLURM_JOB_ID}"'" \
         -e NODE_RANK="${rank}" \
         -e NODE0_ADDR="'"${NODE0_ADDR}"'" \
@@ -523,6 +691,16 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
         "'"${DOCKER_IMAGE}"'" \
         bash -lc "cd /workspace/ATOM && bash .github/scripts/atomesh/pd_server_atom.sh" \
         2>&1 | tee "${rank_dir}/${container_log}"
+      docker_rc="${PIPESTATUS[0]}"
+      set -e
+      if command -v timeout >/dev/null 2>&1; then
+        timeout 20 docker kill "${container}" >/dev/null 2>&1 || true
+        timeout 20 docker rm -f "${container}" >/dev/null 2>&1 || true
+      else
+        docker kill "${container}" >/dev/null 2>&1 || true
+        docker rm -f "${container}" >/dev/null 2>&1 || true
+      fi
+      exit "${docker_rc}"
     '
 done
 unset ATOMESH_EXECUTION_PHASE ATOMESH_SERVICE_PORT_OFFSET

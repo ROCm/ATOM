@@ -2,25 +2,26 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
-import logging
 import json
+import logging
 from dataclasses import dataclass, fields
-from typing import List, Optional
 
 from atom import LLMEngine
 from atom.config import (
     CompilationConfig,
     CUDAGraphMode,
+    DCPConfig,
     DSparkConfig,
-    SpeculativeConfig,
     EPLBConfig,
+    ParallelConfig,
+    SpeculativeConfig,
 )
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
 
 logger = logging.getLogger("atom")
 
 
-def parse_size_list(size_str: str) -> List[int]:
+def parse_size_list(size_str: str) -> list[int]:
     """Parse a string representation of a list into a Python list."""
     import ast
 
@@ -41,48 +42,59 @@ class EngineArgs:
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
     data_parallel_size: int = 1
+    data_parallel_size_local: int | None = None
+    data_parallel_rank: int = 0
+    data_parallel_master_ip: str = "127.0.0.1"
+    data_parallel_master_port: int = 29500
+    data_parallel_base_port: int | None = None
     enforce_eager: bool = False
     enable_prefix_caching: bool = True
     port: int = 8006
     kv_cache_dtype: str = "bf16"
-    index_cache_dtype: Optional[str] = None
+    index_cache_dtype: str | None = None
     block_size: int = 16
-    max_model_len: Optional[int] = None
+    max_model_len: int | None = None
     max_num_batched_tokens: int = 16384
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
+    state_checkpoint_interval_tokens: int = 8192
+    state_checkpoint_demand: bool = True
     enable_chunked_prefill: bool = True
+    enable_log_stats: bool = True
+    throughput_log_interval: float = 10.0
+    cache_hit_rate_window: int = 1000
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
     cudagraph_capture_sizes: str = "[1,2,4,8,16,32,48,64,128,256]"
     level: int = 3
     cudagraph_mode: str = "FULL"
-    load_dummy: Optional[str] = None
+    load_dummy: str | None = None
     enable_expert_parallel: bool = False
-    torch_profiler_dir: Optional[str] = None
+    fake_eplb: bool = False
+    torch_profiler_dir: str | None = None
     enable_dp_attention: bool = False
     dp_load_balance: str = DP_LB_DEFAULT
-    enable_tbo: Optional[str] = None
-    all2all_backend: Optional[str] = None
-    method: Optional[str] = None
+    enable_tbo: str | None = None
+    all2all_backend: str | None = None
+    moe_backend: str = "standard"
+    method: str | None = None
     num_speculative_tokens: int = 1
     kv_transfer_config: str = "{}"
-    draft_model: Optional[str] = None
+    draft_model: str | None = None
+    spec_decode_acceptance_rate: float | None = None
+    spec_decode_acceptance_length: float | None = None
     mark_trace: bool = False
     enable_rapidserve: bool = False
-    disagg_prefill_max_num_seqs: Optional[int] = None
+    disagg_prefill_max_num_seqs: int | None = None
     disagg_constrained: bool = False
-    online_quant_config: Optional[dict] = None
-    hf_overrides: Optional[dict] = None
-    dspark_config: Optional[dict] = None
-
-    def __post_init__(self) -> None:
-        if self.index_cache_dtype is None:
-            self.index_cache_dtype = self.kv_cache_dtype
+    online_quant_config: dict | None = None
+    hf_overrides: dict | None = None
+    dspark_config: dict | None = None
 
     eplb_enable: bool = False
-    eplb_config: Optional[dict] = None
+    eplb_config: dict | None = None
+    dcp_config: dict | None = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -134,6 +146,49 @@ class EngineArgs:
             help="Data parallel size.",
         )
         parser.add_argument(
+            "--data-parallel-size-local",
+            type=int,
+            default=None,
+            help=(
+                "Number of data-parallel ranks to run on THIS node. Defaults "
+                "to --data-parallel-size (single-node). Set it lower to give "
+                "this node one slice of a multi-node run."
+            ),
+        )
+        parser.add_argument(
+            "--data-parallel-rank",
+            type=int,
+            default=0,
+            help=(
+                "First GLOBAL data-parallel rank owned by this node. Node 0 "
+                "uses 0; the second node of a 2x4 run uses 4."
+            ),
+        )
+        parser.add_argument(
+            "--data-parallel-master-ip",
+            type=str,
+            default="127.0.0.1",
+            help="IP of the coordinator node (global DP rank 0).",
+        )
+        parser.add_argument(
+            "--data-parallel-master-port",
+            type=int,
+            default=29500,
+            help=(
+                "Rendezvous port for the DP process group. Engine sockets are "
+                "derived from it (base = port + 100, 3 ports per DP rank)."
+            ),
+        )
+        parser.add_argument(
+            "--data-parallel-base-port",
+            type=int,
+            default=None,
+            help=(
+                "Rendezvous port for model-runner distributed init. Set "
+                "explicitly for multi-node launches."
+            ),
+        )
+        parser.add_argument(
             "--decode-context-parallel-size",
             "-dcp",
             type=int,
@@ -171,9 +226,9 @@ class EngineArgs:
             choices=["bf16", "fp8", "fp4"],
             type=str,
             default=None,
-            help="Index cache type. Defaults to --kv_cache_dtype. 'fp4' selects "
-            "the DeepSeek-V4 FP4 CSA indexer (gfx950 only; falls back to fp8 "
-            "elsewhere).",
+            help="Index cache type. Native single-node DeepSeek-V4 defaults to "
+            "'fp4' except on gfx942, which defaults to 'fp8'; other models "
+            "default to --kv_cache_dtype.",
         )
         parser.add_argument(
             "--block-size", type=int, default=16, help="KV cache block size."
@@ -197,10 +252,12 @@ class EngineArgs:
             "--cudagraph-mode",
             type=str,
             default="FULL",
-            choices=["NONE", "PIECEWISE", "FULL", "FULL_AND_PIECEWISE"],
+            choices=["NONE", "PIECEWISE", "FULL", "FULL_AND_PIECEWISE", "AF_PIECEWISE"],
             help="CUDA graph runtime mode. FULL = manual whole-forward capture "
             "(default, existing behavior). PIECEWISE = per-piece cudagraph with "
-            "attention eager (requires --level 3).",
+            "attention eager (requires --level 3). AF_PIECEWISE = PIECEWISE where "
+            "the attention core is also captured into its own cudagraph with "
+            "zero-copy buffers (DeepSeek-V4 DSpark).",
         )
         parser.add_argument(
             "--load_dummy",
@@ -218,6 +275,13 @@ class EngineArgs:
             "--enable-expert-parallel",
             action="store_true",
             help="Enable expert parallel(EP MoE).",
+        )
+        parser.add_argument(
+            "--fake-eplb",
+            action="store_true",
+            help="Replace MoE router logits with a synthetic uniform "
+            "distribution so every expert is selected equally. For "
+            "benchmarking the balanced-load upper bound only.",
         )
         parser.add_argument(
             "--torch-profiler-dir",
@@ -259,10 +323,19 @@ class EngineArgs:
             nargs="?",
             const="high-throughput",
             default=None,
-            choices=["high-throughput", "low-latency"],
-            help="All2all backend mode for MORI. "
-            "Default is 'high-throughput'. "
-            "Use '--all2all-backend low-latency' for AsyncLL MORI kernel overlap.",
+            choices=["high-throughput", "low-latency", "rccl", "none"],
+            help="Routed MoE transport. 'high-throughput' and 'low-latency' "
+            "select MORI modes, 'rccl' selects ATOM's native RCCL MoE "
+            "transport, and 'none' forces the DP "
+            "AllGather/ReduceScatter fallback. Default is auto-detect MORI.",
+        )
+        parser.add_argument(
+            "--moe-backend",
+            type=str,
+            default="standard",
+            choices=["standard", "mega"],
+            help="MoE implementation. 'standard' uses the existing "
+            "prepare/GEMM/finalize path; 'mega' uses fused FlyDSL MegaMoE.",
         )
         parser.add_argument(
             "--method",
@@ -285,6 +358,29 @@ class EngineArgs:
             "--method eagle3; optional for --method dspark (needed for the "
             "DFlash-backbone drafts such as Kimi-K3-DSpark, omitted for "
             "V4-Pro-DSpark which ships inside the target checkpoint).",
+        )
+        parser.add_argument(
+            "--spec-decode-acceptance-length",
+            type=float,
+            default=None,
+            help="Debug/benchmark knob: force a fixed speculative-decoding mean "
+            "acceptance length (AL) in [1, num_speculative_tokens + 1]. When "
+            "set, the rejection sampler ignores the real draft/target agreement "
+            "and force-accepts draft tokens so the measured accept length "
+            "converges to this value. AL counts the target's own guaranteed "
+            "token, so it is the same unit as vLLM's synthetic_acceptance_length "
+            "and SGLang's SGLANG_SIMULATE_ACC_LEN and a published golden AL can "
+            "be passed through unchanged. Only meaningful with a speculative "
+            "method; leave unset to disable.",
+        )
+        parser.add_argument(
+            "--spec-decode-acceptance-rate",
+            type=float,
+            default=None,
+            help="The same knob as --spec-decode-acceptance-length, expressed as "
+            "a mean acceptance rate in [0, 1] (accepted_draft/total_draft), i.e. "
+            "(length - 1) / num_speculative_tokens. Mutually exclusive with "
+            "--spec-decode-acceptance-length.",
         )
         parser.add_argument(
             "--max-num-batched-tokens",
@@ -313,11 +409,75 @@ class EngineArgs:
             ),
         )
         parser.add_argument(
+            "--state-checkpoint-interval-tokens",
+            type=int,
+            default=8192,
+            help=(
+                "For models with per-request state (DeepSeek-V4 compressor "
+                "ring and sliding window, GDN recurrent state), keep a state "
+                "checkpoint every N tokens of context so a later prefix hit "
+                "can resume there. "
+                "A prompt shorter than N publishes nothing, which is what keeps "
+                "the feature free on workloads that never reuse a prefix. Must "
+                "be a multiple of the prefix-cache hash block size. Prefill "
+                "chunks are aligned to these positions, so this also quantizes "
+                "chunk boundaries. "
+                "0 disables state checkpointing entirely. -1 keeps it on but "
+                "places no interval rungs: checkpoints are then taken only "
+                "where a request is seen to want one and at each prompt's own "
+                "end, which is where agentic traffic actually resumes — every "
+                "rung costs the prompt that keeps it an extra prefill chunk, "
+                "and on measured traces the interval ladder is ~30x the writes "
+                "for reuse the other two placements already reach."
+            ),
+        )
+        parser.add_argument(
+            "--state-checkpoint-demand",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "Let a hit that was refused for want of a checkpoint place a "
+                "rung of its own. --no-state-checkpoint-demand leaves the "
+                "prompt-end anchor as the only placement. On measured traces a "
+                "demand is 47% of all checkpoint writes but reads back 2.8% of "
+                "the time, against 85.2% for an anchor, so the rung's write "
+                "traffic may cost more in evictions than its reuse is worth."
+            ),
+        )
+        parser.add_argument(
             "--enable_chunked_prefill",
             action=argparse.BooleanOptionalAction,
             default=True,
             help="Enable chunked prefill (default: enabled). "
             "Use --no-enable_chunked_prefill to disable.",
+        )
+        parser.add_argument(
+            "--enable-log-stats",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Log the periodic engine-status line (running/waiting reqs, "
+            "KV cache usage, prefix cache hit rate, prompt/generation "
+            "throughput; default: enabled). Use --no-enable-log-stats to "
+            "disable. Applies to offline LLM(...) as well as to the server. "
+            "Scoped to that line only: the [MTP Stats] and "
+            "[Cache Stats] lines have their own gates (--method mtp and "
+            "--enable-prefix-caching) and keep their own cadences.",
+        )
+        parser.add_argument(
+            "--throughput-log-interval",
+            type=float,
+            default=10.0,
+            help="Seconds between engine-status lines (default: 10, matching "
+            "vLLM). Must be > 0. Ignored when --no-enable-log-stats.",
+        )
+        parser.add_argument(
+            "--cache-hit-rate-window",
+            type=int,
+            default=1000,
+            help="Requests in the sliding window behind the engine-status "
+            "line's prefix cache hit rate (default: 1000, matching vLLM). "
+            "Must be > 0. Only the status line is windowed; /metrics and "
+            "[Cache Stats] stay cumulative.",
         )
         parser.add_argument(
             "--max-num-seqs",
@@ -427,6 +587,32 @@ class EngineArgs:
                 """"ragged_graph_sizes": "8"}'"""
             ),
         )
+        dcp_group = parser.add_argument_group("DCP options")
+        dcp_group.add_argument(
+            "--dcp-config",
+            type=json.loads,
+            default=None,
+            help=(
+                "DCP (Decode Context Parallel) knobs as one JSON dict, parsed "
+                "straight into DCPConfig (no per-field flags); unknown keys "
+                "raise. Details and constraints: "
+                "docs/context_parallel_guide.md.\n"
+                '  "interleave_size" (int, 1): KV interleave granularity S -- '
+                "token i lives on rank (i // S) %% W; 1 = round-robin.\n"
+                '  "enable_query_replication" (bool, TRUE): drop the per-step '
+                "decode AllGather Q by replicating q_proj at load time.\n"
+                '  "enable_project_before_merge" (bool, TRUE): project V '
+                "before the output merge, shrinking it by "
+                "kv_lora_rank/v_head_dim.\n"
+                "  \"comm_backend\" (str, a2a): 'a2a' = one all-to-all; "
+                "'ag_rs' = AllGather LSE + ReduceScatter output.\n"
+                "The last three default to the NEW behaviour (and the middle "
+                "two auto-disable where unsupported), so a control run must "
+                "pass the old values explicitly -- passing nothing re-runs the "
+                "new path.\n"
+                'Example: \'{"interleave_size": 16, "enable_query_replication": true}\''
+            ),
+        )
         eplb_group = parser.add_argument_group("EPLB options")
         eplb_group.add_argument(
             "--eplb-enable",
@@ -501,6 +687,8 @@ class EngineArgs:
             method = kwargs.pop("method")
             num_spec_tokens = kwargs.pop("num_speculative_tokens")
             draft_model = kwargs.pop("draft_model")
+            synthetic_acceptance_rate = kwargs.pop("spec_decode_acceptance_rate")
+            synthetic_acceptance_length = kwargs.pop("spec_decode_acceptance_length")
             if method == "eagle3" and not draft_model:
                 raise ValueError("--draft-model is required when --method eagle3.")
             if draft_model and method == "mtp":
@@ -512,11 +700,15 @@ class EngineArgs:
                 method=method,
                 model=draft_model or self.model,
                 num_speculative_tokens=num_spec_tokens,
+                synthetic_acceptance_rate=synthetic_acceptance_rate,
+                synthetic_acceptance_length=synthetic_acceptance_length,
             )
         else:
             kwargs.pop("method")
             kwargs.pop("num_speculative_tokens")
             kwargs.pop("draft_model")
+            kwargs.pop("spec_decode_acceptance_rate")
+            kwargs.pop("spec_decode_acceptance_length")
             kwargs["speculative_config"] = None
 
         # --enable-tbo [prefill|all] → enable_tbo + enable_tbo_decode
@@ -526,6 +718,13 @@ class EngineArgs:
 
         all2all_backend = kwargs.pop("all2all_backend", None)
         kwargs["enable_low_latency"] = all2all_backend == "low-latency"
+        kwargs["moe_all2all_backend"] = {
+            None: "auto",
+            "high-throughput": "mori",
+            "low-latency": "mori",
+            "rccl": "rccl",
+            "none": "none",
+        }[all2all_backend]
 
         # --dspark-config (JSON dict) → DSparkConfig object, passed through as
         # Config.dspark (no env vars).
@@ -533,6 +732,23 @@ class EngineArgs:
         # --eplb-config (JSON dict) → EPLBConfig object (--eplb-enable
         # is the master switch, --eplb-config only tunes it).
         kwargs["eplb_config"] = EPLBConfig.from_dict(kwargs.pop("eplb_config"))
+        # --dcp-config (JSON dict) → DCPConfig object, passed through as
+        # Config.dcp_config.
+        kwargs["dcp_config"] = DCPConfig.from_dict(kwargs.pop("dcp_config"))
+
+        # DP topology -> ParallelConfig. `data_parallel_size` stays in kwargs
+        # too: LLMEngine still reads the loose kwarg on the legacy path.
+        parallel_config_kwargs = {
+            "data_parallel_size": kwargs["data_parallel_size"],
+            "data_parallel_size_local": kwargs.pop("data_parallel_size_local"),
+            "data_parallel_rank": kwargs.pop("data_parallel_rank"),
+            "data_parallel_master_ip": kwargs.pop("data_parallel_master_ip"),
+            "data_parallel_master_port": kwargs.pop("data_parallel_master_port"),
+        }
+        base_port = kwargs.pop("data_parallel_base_port")
+        if base_port is not None:
+            parallel_config_kwargs["data_parallel_base_port"] = base_port
+        kwargs["parallel_config"] = ParallelConfig(**parallel_config_kwargs)
 
         logger.info(f"Engine kwargs: {kwargs}")
 

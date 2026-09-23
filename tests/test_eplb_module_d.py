@@ -2,8 +2,10 @@
 # Tests for atom/model_ops/eplb.py (Module-D migration planning/execution)
 
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
+from import_guard import skip_if_dependency_missing
 
 torch = pytest.importorskip("torch")
 
@@ -11,9 +13,9 @@ torch = pytest.importorskip("torch")
 # (aiter/triton) is unavailable.
 try:
     import atom.config  # noqa: F401
-    import atom.model_ops.eplb as eplb
-except Exception as _e:  # aiter/triton absent under bare non-GPU pytest
-    pytest.skip(f"requires full atom import env: {_e}", allow_module_level=True)
+    from atom.model_ops import eplb
+except ImportError as _e:  # aiter/triton absent under bare non-GPU pytest
+    skip_if_dependency_missing(_e, "requires full atom import env")
 
 
 def test_assign_sender_for_receiver_even_split():
@@ -182,3 +184,31 @@ def test_migrate_experts_chunk_reads_config_and_returns_plan(monkeypatch):
     )
     assert ret == {0: []}
     assert called["chunk"] == 17
+
+
+def test_collect_expert_weights_uses_quant_method_views():
+    live_weight = torch.arange(12, dtype=torch.float32).view(2, 6)
+
+    class _BackendAwareQuantMethod:
+        def get_eplb_weight_views(self, layer):
+            assert layer.quant_method is self
+            return [live_weight]
+
+    layer = SimpleNamespace(quant_method=_BackendAwareQuantMethod())
+    manager = object.__new__(eplb.EPLBManager)
+    manager.live_metadata = SimpleNamespace(num_local_physical_experts=2)
+
+    assert manager._collect_expert_weight_tensors(layer) == [live_weight]
+
+
+def test_collect_expert_weights_rejects_bad_backend_view_shape():
+    class _BadQuantMethod:
+        def get_eplb_weight_views(self, layer):
+            return [torch.zeros((3, 4))]
+
+    layer = SimpleNamespace(quant_method=_BadQuantMethod())
+    manager = object.__new__(eplb.EPLBManager)
+    manager.live_metadata = SimpleNamespace(num_local_physical_experts=2)
+
+    with pytest.raises(RuntimeError, match="expert-major"):
+        manager._collect_expert_weight_tensors(layer)

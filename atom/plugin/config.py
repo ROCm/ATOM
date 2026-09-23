@@ -1,6 +1,7 @@
 import copy
 import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,6 +14,20 @@ logger = logging.getLogger("atom")
 # vLLM does not expose a stable prefill/decode flag for MORI launch-config
 # selection, so use a plugin-scoped token-count threshold instead
 VLLM_MORI_LAUNCH_CONFIG_TOKEN_THRESHOLD = 4096
+
+
+def _get_sglang_tbo_flags(enable_two_batch_overlap: bool) -> tuple[bool, bool]:
+    """Translate SGLang's TBO switch and ATOM mode into ATOM config flags."""
+    if not enable_two_batch_overlap:
+        return False, False
+
+    mode = os.getenv("SGLANG_ATOM_TBO_MODE", "all").strip().lower()
+    if mode not in {"prefill", "all"}:
+        raise ValueError(
+            f"SGLANG_ATOM_TBO_MODE must be one of {{'prefill', 'all'}}, got {mode!r}"
+        )
+
+    return True, mode == "all"
 
 
 @dataclass
@@ -30,6 +45,7 @@ class PluginConfig:
     vllm_scheduler_config: Any = None
     vllm_cache_config: Any = None
     vllm_quant_config: Any = None
+    vllm_use_atom_attention: bool = True
 
     # sglang specific
     sglang_model_opt_config: Any = None
@@ -156,7 +172,7 @@ def _normalize_sglang_parallel_config(
 
         if attn_cp_size <= 1:
             raise ValueError(
-                "SGLang+ATOM PCP requires attn_cp_size > 1, got " f"{attn_cp_size}"
+                f"SGLang+ATOM PCP requires attn_cp_size > 1, got {attn_cp_size}"
             )
         if tp_size % attn_cp_size != 0:
             raise ValueError(
@@ -285,6 +301,9 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
     )
 
     vllm_quant_config = config.quant_config
+    vllm_use_atom_attention = os.getenv(
+        "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0"
+    ).lower() not in ("1", "true", "yes")
 
     plugin_config = PluginConfig(
         # common config
@@ -299,6 +318,7 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         vllm_scheduler_config=vllm_scheduler_config,
         vllm_cache_config=vllm_cache_config,
         vllm_quant_config=vllm_quant_config,
+        vllm_use_atom_attention=vllm_use_atom_attention,
     )
 
     # specific
@@ -354,11 +374,17 @@ def _generate_atom_config_from_sglang_config(config: Any):
     from sglang.srt.configs.model_config import ModelConfig as SglangModelConfig
     from sglang.srt.configs.modelopt_config import ModelOptConfig
     from sglang.srt.distributed import get_tensor_model_parallel_rank
-    from sglang.srt.layers.dp_attention import (
-        get_attention_cp_rank,
-        get_attention_cp_size,
-        get_attention_tp_rank,
-        get_attention_tp_size,
+    from sglang.srt.distributed.parallel_state import (
+        get_attn_context_model_parallel_rank as get_attention_cp_rank,
+    )
+    from sglang.srt.distributed.parallel_state import (
+        get_attn_context_model_parallel_world_size as get_attention_cp_size,
+    )
+    from sglang.srt.distributed.parallel_state import (
+        get_attn_tensor_model_parallel_rank as get_attention_tp_rank,
+    )
+    from sglang.srt.distributed.parallel_state import (
+        get_attn_tensor_model_parallel_world_size as get_attention_tp_size,
     )
     from sglang.srt.server_args import (
         ZMQ_TCP_PORT_DELTA,
@@ -392,7 +418,11 @@ def _generate_atom_config_from_sglang_config(config: Any):
     online_quant_config = sglang_model_loader_extra_config.pop(
         "online_quant_config", None
     )
-    server_args.model_loader_extra_config = json.dumps(sglang_model_loader_extra_config)
+    sanitized_model_loader_extra_config = json.dumps(sglang_model_loader_extra_config)
+    try:
+        server_args.model_loader_extra_config = sanitized_model_loader_extra_config
+    except AttributeError:
+        pass
     hf_overrides = json.loads(
         getattr(server_args, "json_model_override_args", None) or "{}"
     )
@@ -408,7 +438,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
     sgl_load_config = LoadConfig(
         load_format=server_args.load_format,
         download_dir=server_args.download_dir,
-        model_loader_extra_config=server_args.model_loader_extra_config,
+        model_loader_extra_config=sanitized_model_loader_extra_config,
         remote_instance_weight_loader_seed_instance_ip=server_args.remote_instance_weight_loader_seed_instance_ip,
         remote_instance_weight_loader_seed_instance_service_port=server_args.remote_instance_weight_loader_seed_instance_service_port,
         remote_instance_weight_loader_send_weights_group_ports=server_args.remote_instance_weight_loader_send_weights_group_ports,
@@ -537,6 +567,16 @@ def _generate_atom_config_from_sglang_config(config: Any):
     else:
         atom_enable_dp_attention = server_args.enable_dp_attention
 
+    atom_enable_tbo, atom_enable_tbo_decode = _get_sglang_tbo_flags(
+        server_args.enable_two_batch_overlap
+    )
+    if atom_enable_tbo:
+        logger.info(
+            "SGLang+ATOM TBO mode: prefill=%s, decode=%s",
+            atom_enable_tbo,
+            atom_enable_tbo_decode,
+        )
+
     max_num_batched_tokens = max(
         int(getattr(server_args, "max_prefill_tokens", 0) or 0),
         int(getattr(server_args, "chunked_prefill_size", 0) or 0),
@@ -572,6 +612,8 @@ def _generate_atom_config_from_sglang_config(config: Any):
         enable_expert_parallel=bool(server_args.ep_size > 1),
         master_addr=None,
         enable_dp_attention=atom_enable_dp_attention,
+        enable_tbo=atom_enable_tbo,
+        enable_tbo_decode=atom_enable_tbo_decode,
         plugin_config=plugin_config,
         online_quant_config=online_quant_config,
         hf_overrides=hf_overrides,

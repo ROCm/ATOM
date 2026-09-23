@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
+from aiter import QuantType, dtypes
 from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config, PretrainedConfig
 
@@ -10,6 +11,9 @@ from atom.model_ops.embed_head import (
     ParallelLMHead,
     ReplicatedEmbedding,
     VocabParallelEmbedding,
+)
+from atom.model_ops.fused_mtp_prologue import (
+    fused_mtp_embedding_dual_rmsnorm_fp8_quant,
 )
 from atom.model_ops.layernorm import RMSNorm, fused_dual_rmsnorm_cat
 from atom.model_ops.linear import ReplicatedLinear
@@ -23,7 +27,14 @@ from .deepseek_v2 import (
     _can_fuse_indexer_wk_weights_proj,
     use_replicated_vocab_embed,
 )
-from .utils import ckpt_has_tensor_suffix, maybe_prefix
+from .utils import ckpt_has_tensor_suffix, mask_pos0_inputs_embeds, maybe_prefix
+
+# Fed to the fused prologue in place of a real token id to drop that row's
+# embedding: the kernel's ``token_valid`` guard emits a zero embedding for any
+# id outside [0, vocab_size), and RMSNorm(0) is 0, so this reproduces the
+# unfused path's ``mask_pos0_inputs_embeds`` exactly -- without materializing
+# the [num_tokens, hidden] embedding the fusion exists to avoid.
+_UNEMBEDDED_TOKEN_ID = -1
 
 
 class SharedHead(nn.Module):
@@ -55,6 +66,23 @@ class SharedHead(nn.Module):
 
 
 class DeepSeekMultiTokenPredictorLayer(nn.Module):
+    @staticmethod
+    def build_mtp_block(
+        atom_config: Config,
+        prefix: str,
+        layer_idx: int,
+        alt_stream: torch.cuda.Stream | None,
+    ) -> nn.Module:
+        return DeepseekV2DecoderLayer(
+            prefix=prefix,
+            config=atom_config.hf_config,
+            cache_config=atom_config.kv_cache_dtype,
+            quant_config=atom_config.quant_config,
+            layer_num=layer_idx,
+            is_mtp_block=True,
+            alt_stream=alt_stream,
+        )
+
     def __init__(
         self,
         atom_config: Config,
@@ -81,16 +109,11 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             config=config, prefix=prefix, quant_config=atom_config.quant_config
         )
 
-        quant_config = atom_config.quant_config
-
-        self.mtp_block = DeepseekV2DecoderLayer(
-            prefix=prefix,
-            config=self.config,
-            cache_config=atom_config.kv_cache_dtype,
-            quant_config=quant_config,
-            layer_num=layer_idx,
-            is_mtp_block=True,
-            alt_stream=alt_stream,
+        self.mtp_block = self.build_mtp_block(
+            atom_config,
+            prefix,
+            layer_idx,
+            alt_stream,
         )
 
     def forward(
@@ -98,8 +121,9 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         previous_hidden_states: torch.Tensor,
-        inputs_embeds: torch.Tensor,
+        inputs_embeds: torch.Tensor | None,
         spec_step_index: int = 0,
+        eh_input_quant: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Returns the POST-final-norm hidden of this MTP layer.
 
@@ -109,18 +133,22 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         per-channel weight is not, so the draft would consume an input the layer
         was never trained on and the error would compound down the draft chain.
         """
-        assert inputs_embeds is not None
-        # Fused enorm(inputs_embeds) ++ hnorm(previous_hidden_states) in a single
-        # Triton launch (folds the two RMSNorms + the torch.cat; enorm and hnorm
-        # share eps=rms_norm_eps). bf16-identical to the separate path.
-        eh_input = fused_dual_rmsnorm_cat(
-            inputs_embeds,
-            self.enorm.weight,
-            previous_hidden_states,
-            self.hnorm.weight,
-            self.enorm.eps,
-        )
-        hidden_states = self.eh_proj(eh_input)
+        if eh_input_quant is not None:
+            assert inputs_embeds is None
+            eh_input, eh_input_scale = eh_input_quant
+            hidden_states = self.eh_proj(eh_input, x_scale=eh_input_scale)
+        else:
+            assert inputs_embeds is not None
+            # Fused enorm(inputs_embeds) ++ hnorm(previous_hidden_states) in a
+            # single Triton launch (folds the two RMSNorms + torch.cat).
+            eh_input = fused_dual_rmsnorm_cat(
+                inputs_embeds,
+                self.enorm.weight,
+                previous_hidden_states,
+                self.hnorm.weight,
+                self.enorm.eps,
+            )
+            hidden_states = self.eh_proj(eh_input)
 
         hidden_states, residual = self.mtp_block(
             positions=positions, hidden_states=hidden_states, residual=None
@@ -153,6 +181,9 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         *,
         atom_config: Config,
         prefix: str = "",
+        layer_cls: type[DeepSeekMultiTokenPredictorLayer] = (
+            DeepSeekMultiTokenPredictorLayer
+        ),
     ):
         super().__init__()
         config = atom_config.hf_config
@@ -167,7 +198,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         # to map the exact layer index from weights
         self.layers = torch.nn.ModuleDict(
             {
-                str(idx): DeepSeekMultiTokenPredictorLayer(
+                str(idx): layer_cls(
                     atom_config,
                     f"{prefix}.layers.{idx}",
                     layer_idx=idx,
@@ -191,6 +222,8 @@ class DeepSeekMultiTokenPredictor(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
             )
+        # Set by the vLLM plugin only; see mask_pos0_inputs_embeds.
+        self.mask_pos0_inputs_embeds = False
 
     def forward(
         self,
@@ -200,15 +233,49 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
         current_step_idx = spec_step_idx % self.num_mtp_layers
-        return self.layers[str(self.mtp_start_layer_idx + current_step_idx)](
+        layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+        eh_input_quant = None
+        can_fuse_prologue = (
+            inputs_embeds is None
+            and isinstance(self.embed_tokens, ReplicatedEmbedding)
+            and input_ids.ndim == 1
+            and previous_hidden_states.ndim == 2
+            and input_ids.shape[0] == previous_hidden_states.shape[0]
+            and previous_hidden_states.is_contiguous()
+            and self.embed_tokens.weight.ndim == 2
+            and self.embed_tokens.weight.shape[1] == previous_hidden_states.shape[1]
+            and self.embed_tokens.weight.dtype == previous_hidden_states.dtype
+            and layer.enorm.weight.shape == (previous_hidden_states.shape[1],)
+            and layer.hnorm.weight.shape == (previous_hidden_states.shape[1],)
+            and layer.eh_proj.quant_type.value == QuantType.per_Token.value
+            and layer.eh_proj.params_dtype == dtypes.fp8
+            and getattr(layer.eh_proj, "input_scale", None) is None
+        )
+        if can_fuse_prologue:
+            embed_ids = input_ids
+            if self.mask_pos0_inputs_embeds:
+                embed_ids = torch.where(positions == 0, _UNEMBEDDED_TOKEN_ID, input_ids)
+            eh_input_quant = fused_mtp_embedding_dual_rmsnorm_fp8_quant(
+                embed_ids,
+                self.embed_tokens.weight,
+                previous_hidden_states,
+                layer.enorm.weight,
+                layer.hnorm.weight,
+                layer.enorm.eps,
+            )
+        else:
+            if inputs_embeds is None:
+                inputs_embeds = self.embed_tokens(input_ids)
+            if self.mask_pos0_inputs_embeds:
+                inputs_embeds = mask_pos0_inputs_embeds(inputs_embeds, positions)
+        return layer(
             input_ids,
             positions,
             previous_hidden_states,
             inputs_embeds,
             current_step_idx,
+            eh_input_quant,
         )
 
     def compute_logits(
@@ -227,6 +294,8 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         self,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
+        *,
+        out: torch.Tensor,
     ) -> torch.Tensor:
         """Greedy draft token ids via distributed argmax over the TP-sharded vocab —
         avoids all-gathering the full [N, vocab] logits every draft step.
@@ -240,7 +309,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         """
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
-        return mtp_layer.shared_head.head.compute_argmax_token(hidden_states)
+        return mtp_layer.shared_head.head.compute_argmax_token(hidden_states, out=out)
 
     def set_skip_topk(self, skip: bool) -> None:
         """Toggle ``skip_topk`` on MTP sparse-attention layers.
@@ -280,6 +349,15 @@ class DeepSeekMultiTokenPredictor(nn.Module):
 
 @support_torch_compile
 class DeepSeekMTP(nn.Module):
+    predictor_layer_cls = DeepSeekMultiTokenPredictorLayer
+    packed_modules_mapping_override: dict[str, tuple[str, int]] | None = None
+    supports_indexer_projection_fusion = True
+    reuse_draft_graph_step_buffers = True
+
+    @staticmethod
+    def draft_graph_hidden_state_shape(draft_hf) -> tuple[int, ...]:
+        """NextN carries a two-dimensional residual, including for GLM."""
+        return (draft_hf.hidden_size,)
 
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
@@ -299,7 +377,11 @@ class DeepSeekMTP(nn.Module):
         ):
             atom_config.quant_config.apply_default_exclude_layers(["*.eh_proj"])
 
-        if hasattr(self.config, "q_lora_rank") and self.config.q_lora_rank is not None:
+        if self.packed_modules_mapping_override is not None:
+            self.packed_modules_mapping = dict(self.packed_modules_mapping_override)
+        elif (
+            hasattr(self.config, "q_lora_rank") and self.config.q_lora_rank is not None
+        ):
             self.packed_modules_mapping = {
                 "q_a_proj": ("fused_qkv_a_proj", 0),
                 "kv_a_proj_with_mqa": ("fused_qkv_a_proj", 1),
@@ -313,7 +395,9 @@ class DeepSeekMTP(nn.Module):
             }
 
         model_prefix = maybe_prefix(prefix, "model")
-        if hasattr(self.config, "index_topk"):
+        if self.supports_indexer_projection_fusion and hasattr(
+            self.config, "index_topk"
+        ):
             indexer_prefixes = [
                 f"{model_prefix}.layers.{idx}.self_attn.indexer"
                 for idx in range(
@@ -337,6 +421,7 @@ class DeepSeekMTP(nn.Module):
         self.model = DeepSeekMultiTokenPredictor(
             atom_config=atom_config,
             prefix=model_prefix,
+            layer_cls=self.predictor_layer_cls,
         )
 
     def remap_mtp_weight_name(self, name: str) -> str | None:
@@ -370,6 +455,8 @@ class DeepSeekMTP(nn.Module):
         self,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
+        *,
+        out: torch.Tensor,
     ) -> torch.Tensor:
         """Distributed greedy argmax for the MTP draft rollout (GLM-5.2).
 
@@ -379,7 +466,7 @@ class DeepSeekMTP(nn.Module):
         per-rank reductions. Token-identical either way. See
         DeepSeekMultiTokenPredictor.compute_draft_ids.
         """
-        return self.model.compute_draft_ids(hidden_states, spec_step_idx)
+        return self.model.compute_draft_ids(hidden_states, spec_step_idx, out=out)
 
     def set_skip_topk(self, skip: bool) -> None:
         self.model.set_skip_topk(skip)

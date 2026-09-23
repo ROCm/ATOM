@@ -12,11 +12,53 @@ from unittest.mock import patch
 
 import torch
 import torch._inductor.compile_fx
-import torch.fx as fx
+from torch import fx
+
 from atom.config import Config
 from atom.utils import compilation_counter, is_torch_equal_or_newer
 
 logger = logging.getLogger("atom")
+_non_saveable_artifact_warning_emitted = False
+
+
+def _log_non_saveable_artifact(key: str, reason: str) -> None:
+    """Warn once per process, then keep per-subgraph details at debug level."""
+    global _non_saveable_artifact_warning_emitted
+    log = logger.debug if _non_saveable_artifact_warning_emitted else logger.warning
+    log("Skipping standalone compiled graph save for %s: %s", key, reason)
+    _non_saveable_artifact_warning_emitted = True
+
+
+def _save_standalone_compiled_graph(
+    compiled_graph: Any, path: str, key: str
+) -> tuple[str, str] | None:
+    """Persist a Torch standalone artifact when the graph is serializable.
+
+    Torch 2.13 exposes ``CompiledArtifact.is_saveable()`` and raises a
+    ``RuntimeError`` (rather than the older ``AssertionError``) when an
+    Inductor graph has no AOT Autograd artifact. The compiled callable is still
+    valid in memory, so a cache miss must not abort model startup.
+    """
+    is_saveable = getattr(compiled_graph, "is_saveable", None)
+    if callable(is_saveable) and not is_saveable():
+        _log_non_saveable_artifact(key, "PyTorch did not emit a serializable artifact")
+        return None
+
+    try:
+        compiled_graph.save(path=path, format="unpacked")
+    except AssertionError:
+        _log_non_saveable_artifact(
+            key, "PyTorch did not emit a complete unpacked artifact"
+        )
+        return None
+    except RuntimeError as exc:
+        if "CompiledArtifact.save failed to save" not in str(exc):
+            raise
+        _log_non_saveable_artifact(key, str(exc))
+        return None
+
+    compilation_counter.num_compiled_artifacts_saved += 1
+    return key, path
 
 
 def _extend_metadata_with_cluster_dims(md):
@@ -670,17 +712,7 @@ class InductorStandaloneAdaptor(CompilerInterface):
         # Save the compiled artifact to disk in the specified path
         assert key is not None
         path = os.path.join(self.cache_dir, key)
-        handle = None
-        try:
-            compiled_graph.save(path=path, format="unpacked")
-            compilation_counter.num_compiled_artifacts_saved += 1
-            handle = (key, path)
-        except AssertionError:
-            logger.warning(
-                "Skipping standalone compiled graph save for %s because "
-                "PyTorch did not emit a complete unpacked artifact.",
-                key,
-            )
+        handle = _save_standalone_compiled_graph(compiled_graph, path, key)
 
         # Post-process generated wrapper Python files: wrap regions between
         # <prefix>_start / <prefix>_end graph markers with record_function("<prefix>").

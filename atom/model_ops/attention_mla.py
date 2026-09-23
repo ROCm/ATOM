@@ -4,7 +4,7 @@
 import logging
 from dataclasses import dataclass
 from functools import partial as functools_partial
-from typing import Optional, Protocol
+from typing import ClassVar, Protocol
 
 import torch
 import triton
@@ -16,6 +16,10 @@ from aiter import (
     flash_attn_varlen_func,
     fused_qk_rope_concat_and_cache_mla,
     get_hip_quant,
+    get_mla_metadata_v1,
+)
+from aiter import (
+    indexer_qk_rope_quant_and_cache as _indexer_qk_rope_quant_and_cache,
 )
 
 # The segmented (page_size>1) MLA cache kernels only exist in newer aiter
@@ -29,7 +33,7 @@ try:
 except ImportError:
     concat_and_cache_mla_seg = None
     fused_qk_rope_concat_and_cache_mla_seg = None
-from aiter.dist.parallel_state import get_dp_group
+from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.attention.mla import (
     mla_decode_fwd as triton_shuffle_mla_decode_fwd,
@@ -44,6 +48,7 @@ from torch import nn
 from atom.config import get_current_atom_config
 from atom.distributed.dcp_utils import (
     dcp_persistent_supported,
+    dcp_prefill_merge_bf16_ok,
     get_dcp_group,
     get_dcp_rank,
     get_dcp_world_size,
@@ -53,8 +58,18 @@ from atom.distributed.pcp_utils import (
     pcp_allgather_rerange,
     pcp_is_enabled,
 )
+from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import use_triton_gemm
-from atom.model_ops.utils import get_and_maybe_dequant_weights
+from atom.model_ops.triton_fused_mla_ctx_kv import fused_mla_ctx_norm_rope_cache
+from atom.model_ops.triton_fused_qkv_quant import (
+    fused_kv_per_tensor_quant,
+    fused_qkv_per_tensor_quant,
+)
+from atom.model_ops.utils import (
+    dynamic_per_batched_tensor_quant,
+    get_and_maybe_dequant_weights,
+    quant_fp8_per_tensor,
+)
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import (
@@ -62,6 +77,93 @@ from atom.utils.forward_context import (
     ForwardContext,
     get_forward_context,
 )
+
+# Cap on the KV-split budget: aiter cuts the KV walk into
+# `min(num_clusters, cap * batch_size)` parts, and a negative cap means uncapped
+# -- as many parts as the machine has clusters (v1_2_device.cuh:894).
+_MLA_SPLIT_BUDGET_AUTO = -1
+
+
+def indexer_qk_rope_quant_and_cache(
+    q: torch.Tensor,
+    q_out: torch.Tensor,
+    weights: torch.Tensor,
+    weights_out: torch.Tensor,
+    k: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_bias: torch.Tensor,
+    positions: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    epsilon: float,
+    quant_block_size: int,
+    scale_fmt: str | None,
+    weights_scale: float,
+    preshuffle: bool = False,
+    is_neox: bool = True,
+    q_scale_out: torch.Tensor | None = None,
+    kv_cache_scale: torch.Tensor | None = None,
+) -> None:
+    """Run the fused indexer cache op with ATOM's DCP query semantics.
+
+    The two scale buffers together switch the op to packed E2M1 + e8m0 outputs,
+    and are forwarded only when given so that an aiter predating them still
+    accepts the FP8 call -- the same version tolerance the seg-variant import
+    above keeps. One without the other would fall back to FP8 and write that
+    layout into FP4-shaped buffers, so it is refused here rather than passed on.
+    """
+    if (q_scale_out is None) != (kv_cache_scale is None):
+        raise ValueError(
+            "FP4 output needs both q_scale_out and kv_cache_scale, got only "
+            + ("q_scale_out" if q_scale_out is not None else "kv_cache_scale")
+        )
+    fp4_out = (
+        {"q_scale_out": q_scale_out, "kv_cache_scale": kv_cache_scale}
+        if q_scale_out is not None
+        else {}
+    )
+    _indexer_qk_rope_quant_and_cache(
+        q,
+        q_out,
+        weights,
+        weights_out,
+        k,
+        kv_cache,
+        slot_mapping,
+        norm_weight,
+        norm_bias,
+        positions,
+        cos_cache,
+        sin_cache,
+        epsilon,
+        quant_block_size,
+        scale_fmt,
+        weights_scale,
+        preshuffle=preshuffle,
+        is_neox=is_neox,
+        compute_all_q_rope=get_dcp_world_size() > 1,
+        **fp4_out,
+    )
+
+
+def _sparse_index_workspace(
+    out: torch.Tensor | None,
+    total_out: int,
+    *,
+    device: torch.device,
+    name: str,
+) -> torch.Tensor:
+    if out is None:
+        return torch.empty(total_out, dtype=torch.int32, device=device)
+    if out.numel() < total_out:
+        raise RuntimeError(
+            f"{name} requires {total_out} int32 sparse-index slots, "
+            f"but workspace has only {out.numel()}."
+        )
+    return out[:total_out]
+
 
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # isort: skip
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
@@ -108,6 +210,212 @@ logger = logging.getLogger("atom")
 
 _MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
 
+
+def mla_min_query_heads(kv_cache_dtype: str, block_width: int) -> int:
+    """Query-head padding that lets aiter dispatch a NON-causal MLA decode.
+
+    aiter picks its .co from (gqa, block width, causality), and on an fp8 cache
+    a 2-wide non-causal block has no kernel at gqa=16: the asm dispatch hits
+    AITER_CHECK and aborts the whole process. Padding to 32 instead reaches the
+    4-wide non-causal kernel through aiter's own (gqa=32, width 2) remap.
+
+    Only width 2 needs this. Widths 1, 3 and 4 have gqa=16 kernels, and aiter
+    remaps anything wider onto gqa=32 itself. Padding rather than remapping
+    width 2 to the 4-wide kernel at gqa=16 is deliberate: the persistent work
+    descriptors are sized from the block width, so a 2-wide plan driving a
+    4-wide kernel writes its partials past the reduce buffers (illegal access
+    at some batch sizes, a non-terminating kernel at others).
+    """
+    if block_width == 2 and kv_cache_dtype.startswith("fp8"):
+        return 32
+    return _MLA_MIN_HEADS
+
+
+def mla_kernel_num_heads(num_heads: int) -> int:
+    """Round a query-head count up to a width ``mla_decode_fwd`` will dispatch.
+
+    aiter accepts nhead 16, and above that only multiples of 16 up to 128 (it
+    folds those onto the 16-head kernel); any other value aborts the dispatch.
+    """
+    if num_heads <= _MLA_MIN_HEADS:
+        return _MLA_MIN_HEADS
+    return -(-num_heads // _MLA_MIN_HEADS) * _MLA_MIN_HEADS
+
+
+# Gathered widths aiter serves with a dedicated kernel.
+_MLA_DCP_KERNEL_WIDTHS = (16, 32, 64, 128)
+
+# Widest gathered query aiter has any MLA decode dispatch for; past it
+# mla_decode_fwd asserts rather than falling back to anything.
+#
+# A persistent decode reaches every multiple of 16 up to that: the widths
+# without a dedicated kernel (48, 80, 96, 112) fold onto the 16-head one, which
+# reinterprets head groups as extra sequence rows and rebuilds qo_indptr and the
+# kv indptrs to match, so the round-robin mask survives it. A NON-persistent one
+# does not -- aiter's fold is guarded on persistent mode -- so it stays on the
+# width sets below, which only hold widths that have their own kernel.
+_MLA_DCP_MAX_KERNEL_HEADS = 128
+
+_MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT = (16, 32, 128)
+_MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT_FP8 = (16, 128)
+_MLA_DCP_SPARSE_PREFILL_WIDTHS = (16, 128)
+_MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT = _MLA_DCP_KERNEL_WIDTHS
+
+_dcp_kernel_width_warned = False
+_dcp_sparse_prefill_width_warned = False
+
+
+def mla_dcp_decode_is_persistent(
+    is_sparse: bool,
+    dcp_world_size: int,
+    dcp_persistent_supported: bool,
+    *,
+    sparse_metadata_rebuild: bool = False,
+) -> bool:
+    """Whether a DCP decode will reach ``mla_decode_fwd`` in persistent mode.
+
+    The live decision is made per step in ``_forward_decode``; this mirrors the
+    parts of it that are already settled at construction time, because the
+    gathered head width has to be fixed there (it sizes the persistent work
+    descriptors as well as the kernel's nhead). Sparse MLA under DCP is
+    persistent only when the caller rebuilds work/reduce metadata after each
+    full indexer layer compacts its rank-local top-k. Only gfx950 ships the
+    lse-emitting persistent kernel DCP needs, and persistent mode wants page
+    size 1. The one remaining runtime gate, ``dpa_persistent_supported``, is
+    unconditionally true, so nothing here can claim persistent mode that the
+    step then refuses.
+
+    ``dcp_persistent_supported`` is taken as an argument rather than queried
+    here, the way ``should_use_persistent_mode`` takes it: callers already cache
+    it to keep ``get_gfx()`` off the per-forward path.
+    """
+    if dcp_world_size <= 1 or (is_sparse and not sparse_metadata_rebuild):
+        return False
+    return dcp_persistent_supported and envs.ATOM_MLA_PAGE_SIZE <= 1
+
+
+def mla_dcp_sparse_prefill_is_persistent(
+    kv_cache_dtype: str,
+    dcp_world_size: int,
+    dcp_persistent_supported: bool,
+    *,
+    sparse_metadata_rebuild: bool = False,
+) -> bool:
+    """Whether a DCP sparse prefill reaches ``mla_decode_fwd`` in persistent mode.
+
+    Mirrors the gate ``_forward_prefill_mla`` applies per forward, and is the
+    single source the gathered pad width is derived from -- the two must move
+    together. gqa=64 computes correctly only in persistent mode, so a path that
+    runs one way while its width came from the other silently miscomputes; the
+    assertion at that gate keeps them tied.
+
+    This is NOT decode's predicate. Prefill only builds work metadata on the fp8
+    branch (`use_work_meta = is_fp8 and ...`), so a bf16 KV cache stays
+    non-persistent here even where decode is persistent -- and borrowing decode's
+    answer would then pad a bf16 sparse prefill to gqa=64 and run it
+    non-persistent, which is precisely the wrong combination.
+    """
+    if not kv_cache_dtype.startswith("fp8"):
+        return False
+    if dcp_world_size <= 1 or not sparse_metadata_rebuild:
+        return False
+    # Match _forward_prefill_mla's own None -> 1 handling rather than comparing
+    # the env directly, so the two cannot disagree on an unset page size.
+    page_size = envs.ATOM_MLA_PAGE_SIZE if envs.ATOM_MLA_PAGE_SIZE is not None else 1
+    return dcp_persistent_supported and page_size <= 1
+
+
+def mla_dcp_kernel_num_heads(
+    num_heads: int,
+    dcp_world_size: int,
+    min_kernel_heads: int = _MLA_MIN_HEADS,
+    *,
+    kv_cache_dtype: str,
+    persistent: bool,
+) -> int:
+    """Width to gather the query heads to for a DCP decode.
+
+    DCP decode all-gathers Q on the head dim before calling the kernel, so what
+    gets dispatched on is ``num_heads * dcp_world_size``; a single rank's head
+    count is never seen and is the wrong thing to round. A persistent decode
+    takes that width as-is once it is a multiple of 16, dedicated kernel or
+    fold; a non-persistent one has no fold to fall back on and must be padded
+    onto a width that has its own kernel.
+
+    ``kv_cache_dtype`` only selects the non-persistent set: gqa=64 is excluded
+    for both dtypes there (fp8 aborts on it, bf16 silently miscomputes it), and
+    fp8 lacks a gqa=32 kernel on top of that while bf16 does not.
+    """
+    gathered = mla_kernel_num_heads(max(num_heads * dcp_world_size, min_kernel_heads))
+    if persistent:
+        if gathered <= _MLA_DCP_MAX_KERNEL_HEADS:
+            return gathered
+    else:
+        widths = (
+            _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT_FP8
+            if kv_cache_dtype.startswith("fp8")
+            else _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT
+        )
+        for width in widths:
+            if width >= gathered:
+                return width
+    global _dcp_kernel_width_warned
+    if not _dcp_kernel_width_warned:
+        _dcp_kernel_width_warned = True
+        logger.warning(
+            f"DCP decode gathers {gathered} query heads, past the widest MLA "
+            f"kernel aiter dispatches ({_MLA_DCP_MAX_KERNEL_HEADS}); it serves "
+            "neither a kernel nor a fold that wide and will abort in "
+            "mla_decode_fwd. Lower decode_context_parallel_size or raise tp."
+        )
+    return gathered
+
+
+def mla_dcp_sparse_prefill_num_heads(
+    num_heads: int,
+    dcp_world_size: int,
+    min_kernel_heads: int = _MLA_MIN_HEADS,
+    *,
+    persistent: bool = False,
+) -> int:
+    """Width to pad the GATHERED query heads to for a DCP sparse prefill.
+
+    The counterpart of ``mla_dcp_kernel_num_heads`` for the other DCP call site.
+    Sparse prefill all-gathers Q on the head dim as well, so what gets
+    dispatched on is ``num_heads * dcp_world_size`` there too -- the per-rank
+    count is never seen and is the wrong thing to pad. It needs its own table
+    because the widths that compute correctly are not decode's; see
+    ``_MLA_DCP_SPARSE_PREFILL_WIDTHS``.
+
+    ``persistent`` must come from ``mla_dcp_sparse_prefill_is_persistent`` --
+    passing decode's answer is wrong, because the two call sites do not switch
+    on the same conditions. It is False on every path today; the persistent row
+    is wired up so that enabling it later is one predicate, not a second look at
+    which widths are safe.
+    """
+    gathered = max(num_heads * dcp_world_size, min_kernel_heads)
+    widths = (
+        _MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT
+        if persistent
+        else _MLA_DCP_SPARSE_PREFILL_WIDTHS
+    )
+    for width in widths:
+        if width >= gathered:
+            return width
+    global _dcp_sparse_prefill_width_warned
+    if not _dcp_sparse_prefill_width_warned:
+        _dcp_sparse_prefill_width_warned = True
+        logger.warning(
+            f"DCP sparse prefill gathers {gathered} query heads, past the widest "
+            f"width measured correct for this path "
+            f"({widths[-1]}); falling back to the rounded "
+            "width, which is unverified here and has silently returned wrong "
+            "results at other widths. Lower decode_context_parallel_size or "
+            "raise tp."
+        )
+    return mla_kernel_num_heads(gathered)
+
+
 # The fused seg MLA kernels (fused_qk_rope_concat_and_cache_mla_seg +
 # concat_and_cache_mla_seg + the gfx1250 mla_decode_fwd asm) share a single
 # segmented KV cache layout (all tokens' nope packed first, then all tokens'
@@ -138,6 +446,30 @@ fused_gemm_afp4wfp4_preshuffle_split_cat = None
 fused_gemm_a8w8_blockscale_preshuffle_split_cat = None
 
 
+def qrep_tp_override(tp_size: int) -> dict:
+    """Effective-TP kwargs for the query projection under QREP, or ``{}`` if off.
+
+    QREP shards q_proj on ``tp/dcp`` so each rank materializes its whole DCP
+    group's query head set and decode can skip the per-step AllGather Q.
+
+    Lives here rather than in the model that builds the layer because
+    ``MLAAttention`` owns the rest of that contract: the W_K DCP gather, the
+    prefill row view, and the ``group=True`` decode path all assume q_proj was
+    sharded this way. Keeping the producer next to its consumers is what makes
+    the invariant visible.
+    """
+    if not get_current_atom_config().dcp_config.enable_query_replication:
+        return {}
+    dcp_size = get_dcp_world_size()
+    assert (
+        tp_size % dcp_size == 0
+    ), f"QREP needs tp ({tp_size}) divisible by dcp ({dcp_size})"
+    return {
+        "override_tp_size": tp_size // dcp_size,
+        "override_tp_rank": get_tensor_model_parallel_rank() // dcp_size,
+    }
+
+
 def is_rocm_aiter_fp4bmm_enabled() -> bool:
     return envs.ATOM_USE_TRITON_MXFP4_BMM
 
@@ -166,27 +498,59 @@ if is_rocm_aiter_fp4bmm_enabled():
     from atom.model_ops.utils import quark_post_load_weights
 
 
+# Optional flydsl backend for `_kv_b_proj_gather`, gated by
+# ATOM_USE_FLYDSL_GATHER_KV_B_PROJ.
+try:
+    from aiter.ops.flydsl import (
+        gather_kv_b_proj_flydsl,
+        gather_kv_b_proj_flydsl_fp8_supported,
+        gather_kv_b_proj_flydsl_supported,
+    )
+
+    _FLYDSL_GATHER_AVAILABLE = True
+except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
+    _FLYDSL_GATHER_AVAILABLE = False
+
+# Optional FP8 prefill backend, gated by ATOM_USE_FLYDSL_FP8_PREFILL_ATTN.
+try:
+    from aiter.ops.flydsl import (
+        flydsl_flash_attn_fp8_func,
+        flydsl_flash_attn_fp8_supported,
+    )
+
+    _FLYDSL_FP8_MHA_AVAILABLE = True
+except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
+    _FLYDSL_FP8_MHA_AVAILABLE = False
+
+
 # MLA Specific Arguments
 @dataclass
 class MLAModules:
     """Modules used in MLA."""
 
-    q_lora_rank: Optional[int]
+    q_lora_rank: int | None
     kv_lora_rank: int
     qk_nope_head_dim: int
     qk_rope_head_dim: int
     qk_head_dim: int
     v_head_dim: int
     rotary_emb: torch.nn.Module
-    q_proj: Optional[torch.nn.Module]
+    q_proj: torch.nn.Module | None
     kv_b_proj: torch.nn.Module
     o_proj: torch.nn.Module
-    indexer: Optional[torch.nn.Module]
+    indexer: torch.nn.Module | None
     # Model-level sparse flag. A v3.2 / GLM-5.2 model runs sparse MLA on ALL its
     # layers. GLM-5.2 IndexShare "shared" layers carry no indexer module yet must
     # still run sparse attention (reusing the prior "full" layer's top-k), so
     # sparsity must be derived from the model, not from whether this layer owns
     # an indexer. Defaults keep non-sparse models unchanged.
+    # True when `qk_rope_head_dim` lanes exist only as ZERO PADDING, i.e. a NoPE
+    # model widened so the latent/cache side matches what the MLA kernels
+    # hard-code (576). The padded lanes contribute `sum(0*0) == 0` to every QK
+    # dot product, so prefill may -- and must -- drop them: `qk_nope_head_dim`
+    # is already 256 for GLM-5.3 and CK's flash-attention caps head_dim at 256,
+    # so a padded 320-wide query is refused outright.
+    rope_is_zero_pad: bool = False
     is_sparse: bool = False
     topk_tokens: int | None = None
 
@@ -203,15 +567,39 @@ def _mla_output_width(impl: _MLAOutputShape, hidden_size: int) -> int:
     return hidden_size
 
 
-def dynamic_per_batched_tensor_quant(
-    x: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn
-):
-    DTYPE_MAX = torch.finfo(dtype).max
-    min_val, max_val = x.aminmax()
-    amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-10)
-    scale = DTYPE_MAX / amax
-    x_scl_sat = (x * scale).clamp(min=-DTYPE_MAX, max=DTYPE_MAX)
-    return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
+def supports_dpa_persistent_mode(
+    atom_config,
+    mla_modules: MLAModules,
+    *,
+    kv_cache_dtype: str,
+    num_heads: int,
+    num_kv_heads: int,
+) -> bool:
+    """Whether this model supports the persistent-mode exception under DPA.
+
+    AITER's FP8 Q/FP8 KV GQA64 kernel is available only in persistent mode.
+    Keep this gate exact so other DPA models retain the existing non-persistent
+    policy and all MLA variants continue to use the common 576-wide KV layout.
+    """
+    # Force-enabled for now: persistent mode is turned on for all MLA models
+    # under DPA. Re-introduce the per-model gate here if a model regresses.
+    return True
+
+
+def should_use_persistent_mode(
+    *,
+    dp_size: int,
+    dpa_persistent_supported: bool,
+    page_size: int,
+    dcp_world_size: int,
+    dcp_persistent_supported: bool,
+) -> bool:
+    """Apply the common persistent-mode policy and required exceptions."""
+    return (
+        (dp_size <= 1 or dpa_persistent_supported)
+        and page_size <= 1
+        and (dcp_world_size <= 1 or dcp_persistent_supported)
+    )
 
 
 class MLAAttention(nn.Module):
@@ -228,6 +616,8 @@ class MLAAttention(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
+        self.use_flydsl_fp8_prefill_attn = bool(envs.ATOM_USE_FLYDSL_FP8_PREFILL_ATTN)
+        self._flydsl_fp8_mha_ok: bool | None = None
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = float(scale)
@@ -235,20 +625,20 @@ class MLAAttention(nn.Module):
         self.kv_cache_dtype = "fp8" if kv_cache_dtype.startswith("fp8") else "auto"
         self.dtype = dtype
 
-        self.padded_num_heads = max(num_heads, _MLA_MIN_HEADS)
-        self.head_repeat_factor = 1
-        self.head_pad = 0
-        if self.padded_num_heads != num_heads:
-            if self.padded_num_heads % num_heads == 0:
-                self.head_repeat_factor = self.padded_num_heads // num_heads
-                if not getattr(MLAAttention, "_head_repeat_logged", False):
-                    MLAAttention._head_repeat_logged = True
-                    logger.info(
-                        f"MLA head repeat enabled: {num_heads} -> {self.padded_num_heads} "
-                        f"(repeat factor {self.head_repeat_factor})"
-                    )
-            else:
-                self.head_pad = self.padded_num_heads - num_heads
+        self.min_query_heads = kwargs.get("min_query_heads", _MLA_MIN_HEADS)
+        self.padded_num_heads = max(num_heads, self.min_query_heads)
+        # Heads past num_heads are dead lanes: the MLA kernels compute them and
+        # `_restore_query_heads` throws them away. They are zeros rather than
+        # repeats of the real heads because zeros are what a producer can write
+        # once, up front -- under `_fused_q_head_pad` the fused q writer fills a
+        # slice of an already-zeroed padded buffer, which a repeat could not do
+        # (no producer kernel writes a head twice).
+        self.head_pad = self.padded_num_heads - num_heads
+        if self.head_pad and not getattr(MLAAttention, "_head_pad_logged", False):
+            MLAAttention._head_pad_logged = True
+            logger.info(
+                f"MLA query-head padding: {num_heads} -> {self.padded_num_heads}"
+            )
 
         self.q_lora_rank = mla_modules.q_lora_rank
         self.kv_lora_rank = mla_modules.kv_lora_rank
@@ -256,6 +646,7 @@ class MLAAttention(nn.Module):
         self.qk_rope_head_dim = mla_modules.qk_rope_head_dim
         self.qk_head_dim = mla_modules.qk_head_dim
         self.v_head_dim = mla_modules.v_head_dim
+        self.rope_is_zero_pad = mla_modules.rope_is_zero_pad
         self.rotary_emb = mla_modules.rotary_emb
         self.q_proj = mla_modules.q_proj
         self.o_proj = mla_modules.o_proj
@@ -264,12 +655,32 @@ class MLAAttention(nn.Module):
         self.one_scale = torch.tensor(1.0, dtype=torch.float32)
         self._k_scale = self.one_scale
         self._q_scale = self.one_scale
+        # A device copy for write_context_kv_latent's fused store, which reads
+        # the scale from a Triton pointer. The scales above are host tensors --
+        # the aiter store kernels take them as host scalars -- and a host
+        # pointer is not addressable from the GPU. Made here so the fused path
+        # neither allocates nor synchronizes on the per-step path.
+        self._k_scale_device = self._k_scale.to(
+            torch.cuda.current_device(), non_blocking=True
+        )
+        atom_config = get_current_atom_config()
+        self._dpa_persistent_supported = supports_dpa_persistent_mode(
+            atom_config,
+            mla_modules,
+            kv_cache_dtype=self.kv_cache_dtype,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+        )
         # Derive sparsity from the model-level flag, not from whether THIS layer
         # owns an indexer: GLM-5.2 IndexShare "shared" layers have indexer=None
         # but must still run sparse MLA, reusing the prior "full" layer's top-k.
         # (`mla_modules.is_sparse` defaults False, so non-sparse models and the
         # `indexer is not None` fallback keep their previous behavior.)
         self.is_sparse_mla = mla_modules.is_sparse or (mla_modules.indexer is not None)
+        # A full IndexShare layer owns an indexer and therefore produces a new
+        # layer-local DCP compact indptr. Shared layers reuse both its indices
+        # and the persistent work plan rebuilt from that indptr.
+        self.owns_sparse_indexer = mla_modules.indexer is not None
         self.topk_tokens = (
             mla_modules.indexer.topk_tokens
             if mla_modules.indexer is not None
@@ -294,6 +705,11 @@ class MLAAttention(nn.Module):
         # ==1 falls back to the original interleaved per-token (page_size=1)
         # kernels with an unpadded 576-wide q_out. The triton path never uses seg.
         self.use_seg_mla = (not self.use_triton_mla) and envs.ATOM_MLA_PAGE_SIZE > 1
+        self.use_flydsl_gather_kv_b_proj = bool(envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ)
+        # Resolved on the first gather, when the weights and cache exist; see
+        # `_kv_b_proj_gather`. None = not asked yet.
+        self._flydsl_gather_ok: bool | None = None
+        self._flydsl_gather_fp8_ok: bool | None = None
         if self.use_seg_mla:
             if envs.ATOM_MLA_PAGE_SIZE != _MLA_SEG_PAGE_SIZE:
                 raise RuntimeError(
@@ -316,6 +732,27 @@ class MLAAttention(nn.Module):
                     "aiter or set ATOM_MLA_PAGE_SIZE=1."
                 )
 
+        # Context-row KV fusion (write_context_kv_latent). Resolved once here,
+        # like use_seg_mla above, so a drafter pays no env/attr lookup per layer
+        # per step. The seg and shuffled-KV layouts are excluded rather than
+        # supported: their store kernels own byte layouts the fused kernel does
+        # not reproduce, and guessing at them is worse than the per-op path.
+        # RoPE must be the plain single-position kind covering exactly the pe
+        # lane, with the half-width (reuse_freqs_front_part) cos/sin cache
+        # get_rope builds -- anything else (M-RoPE, partial rotary, full-width
+        # freqs) indexes the cache differently.
+        rope = self.rotary_emb
+        self._ctx_kv_fusion_enabled = (
+            envs.ATOM_DSPARK_FUSED_CTX_KV
+            and not self.use_seg_mla
+            and not (self.use_triton_mla and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV)
+            and rope is not None
+            and getattr(rope, "rotary_dim", None) == self.qk_rope_head_dim
+            and getattr(rope, "mrope_section", None) is None
+            and getattr(rope, "cos_cache", None) is not None
+            and rope.cos_cache.shape[-1] == self.qk_rope_head_dim // 2
+        )
+
         # Decode context parallel (DCP): KV cache is sharded across TP ranks, so
         # decode attention runs locally then combines via all-gather LSE +
         # reduce-scatter. Disabled (world_size==1) unless -dcp is set.
@@ -331,25 +768,372 @@ class MLAAttention(nn.Module):
             self.dcp_rank = 0
             self._cp_triton_ctx = None
 
-        # Whether DCP decode can run in persistent mode on this GPU (gfx950 has
-        # the lse persistent kernel, gfx942 does not — see dcp_utils). Cached
-        # once here to avoid a per-forward get_gfx() (graph-break).
+        # DCP Query Replication (QREP): q_proj is sharded on effective TP =
+        # tp/dcp, so each rank produces the whole DCP-group head set and decode
+        # can skip the per-step AllGather Q. W_K is gathered to match, at load.
+        self.qrep_enabled = (
+            self.dcp_world_size > 1
+            and get_current_atom_config().dcp_config.enable_query_replication
+        )
+        self.qrep_num_heads = self.num_heads * self.dcp_world_size
+        if self.qrep_enabled:
+            assert self.qrep_num_heads >= _MLA_MIN_HEADS, (
+                "DCP query replication requires the DCP-group head set "
+                f"(num_heads*dcp={self.qrep_num_heads}) >= {_MLA_MIN_HEADS}."
+            )
+        # Project-before-merge (PBM): apply W_V before the merge, so it
+        # exchanges v_head_dim per head instead of kv_lora_rank. Legal because
+        # the merge is a per-(token, head) scalar weighting plus a cross-rank
+        # sum and W_V is per-head linear -- they commute. fp4 is excluded: its
+        # W_V scale is block structured, so gather-then-requantize breaks.
+        self.pbm_enabled = (
+            self.dcp_world_size > 1
+            and get_current_atom_config().dcp_config.enable_project_before_merge
+            and not is_rocm_aiter_fp4bmm_enabled()
+        )
+        # Which collective pattern the output merge uses; see _dcp_merge.
+        self.dcp_comm_backend = get_current_atom_config().dcp_config.comm_backend
+
+        # Row view of q_proj used by prefill; see _local_q_proj. Initialized here
+        # rather than in process_weights_after_loading so it exists no matter
+        # which quantization branch that method takes.
+        self._qrep_local_proj = None
+        self._qrep_local_src = None
+
         self.dcp_persistent_supported = dcp_persistent_supported()
+        self.dcp_prefill_merge_bf16_ok = dcp_prefill_merge_bf16_ok()
+        # Every sparse DCP shape is per-token q_len=1 rows -- one per sequence
+        # in decode, one per query token in sparse prefill and MTP verify.
+        # Plugin DCP reconfigures its group after construction.
+        self.sparse_dcp_metadata_rebuild = (
+            self.is_sparse_mla and self.dcp_world_size > 1
+        )
+
+        # Compacted per-layer sparse offsets for DCP decode; rebound by the
+        # metadata builder to the shared buffer (see aiter_mla.py).
+        self.dcp_sparse_kv_indptr_buffer = None
+        self.dcp_owned_counts_buffer = None
+
+        self._configure_dcp_decode_head_padding(self.dcp_world_size)
+        if (
+            self.sparse_dcp_metadata_rebuild
+            and self.dcp_persistent_supported
+            and envs.ATOM_MLA_PAGE_SIZE <= 1
+            and not getattr(MLAAttention, "_sparse_dcp_persistent_logged", False)
+        ):
+            MLAAttention._sparse_dcp_persistent_logged = True
+            logger.info(
+                "Sparse DCP persistent attention enabled: rebuilding metadata "
+                "after each full indexer layer (kernel heads=%d).",
+                self.dcp_kernel_num_heads,
+            )
+
+        # Fold the query-head pad into the fused q write instead of paying a
+        # separate pad kernel per layer: allocate q_out at the padded width and
+        # hand the writer the real-head slice, which it fills through the
+        # runtime q_out strides it already takes. Restricted to the plain aiter
+        # write -- the seg and shuffled-KV kernels own byte layouts this has not
+        # been checked against, and under DCP q_out is all-gathered on the head
+        # dim, so the pad must go on after the gather, not before it.
+        self._fused_q_head_pad = (
+            self.head_pad > 0
+            and self.dcp_world_size <= 1
+            and not self.use_seg_mla
+            and not (self.use_triton_mla and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV)
+        )
+
+    def _configure_dcp_decode_head_padding(self, dcp_world_size: int) -> None:
+        """Configure the kernel width used after DCP gathers query heads.
+
+        The vLLM plugin initializes its process groups independently from the
+        native ATOM config, so it calls this again with vLLM's DCP size.
+        """
+        # DCP decode all-gathers Q on the head dim, so the width reaching
+        # mla_decode_fwd is the gathered num_heads * dcp rounded up to a
+        # dispatchable one. The pad sits entirely inside _forward_decode: it goes
+        # on after the gather and comes off before the cross-rank combine, so it
+        # never costs collective traffic.
+        self.dcp_kernel_num_heads = self.num_heads
+        self.dcp_head_pad = 0
+        if dcp_world_size > 1:
+            self.dcp_kernel_num_heads = mla_dcp_kernel_num_heads(
+                self.num_heads,
+                dcp_world_size,
+                self.min_query_heads,
+                kv_cache_dtype=self.kv_cache_dtype,
+                persistent=mla_dcp_decode_is_persistent(
+                    self.is_sparse_mla,
+                    dcp_world_size,
+                    self.dcp_persistent_supported,
+                    sparse_metadata_rebuild=getattr(
+                        self, "sparse_dcp_metadata_rebuild", False
+                    ),
+                ),
+            )
+            self.dcp_head_pad = (
+                self.dcp_kernel_num_heads - self.num_heads * dcp_world_size
+            )
+
+        # Sparse prefill gathers query heads too, and needs its own width (see
+        # mla_dcp_sparse_prefill_num_heads). Sized here alongside decode's so
+        # the vllm plugin's re-init picks both up. Its persistence predicate is
+        # deliberately NOT decode's: the two call sites switch on different
+        # conditions, and the width has to follow the mode the kernel actually
+        # runs in -- borrowing decode's answer is how a bf16 sparse prefill would
+        # end up padded to gqa=64 while running non-persistent.
+        self.dcp_sparse_prefill_persistent = False
+        self.dcp_sparse_prefill_num_heads = self.num_heads
+        if dcp_world_size > 1 and self.is_sparse_mla:
+            self.dcp_sparse_prefill_persistent = mla_dcp_sparse_prefill_is_persistent(
+                self.kv_cache_dtype,
+                dcp_world_size,
+                self.dcp_persistent_supported,
+                # getattr: the vllm plugin re-runs this with its own DCP size
+                # before/after the flag is set, same as decode's use below.
+                sparse_metadata_rebuild=getattr(
+                    self, "sparse_dcp_metadata_rebuild", False
+                ),
+            )
+            self.dcp_sparse_prefill_num_heads = mla_dcp_sparse_prefill_num_heads(
+                self.num_heads,
+                dcp_world_size,
+                self.min_query_heads,
+                persistent=self.dcp_sparse_prefill_persistent,
+            )
+
+    def _pad_sparse_prefill_query_heads(self, q: torch.Tensor) -> torch.Tensor:
+        """Head padding for a DCP sparse prefill.
+
+        q arrives already gathered across the DCP group, so it is that width --
+        not the per-rank one -- that has to reach a dispatchable kernel, and the
+        widths this call site computes correctly are not the decode ones.
+
+        Zero pad, never ``repeat_interleave``: duplicating heads is exactly how
+        the old per-rank padding put dcp2 on width 32 and dcp4 on 64, both of
+        which return silently wrong results here.
+        """
+        pad = self.dcp_sparse_prefill_num_heads - q.shape[1]
+        if pad > 0:
+            return torch.nn.functional.pad(q, (0, 0, 0, pad))
+        return q
+
+    def _restore_sparse_prefill_query_heads(
+        self, x: torch.Tensor, num_heads: int
+    ) -> torch.Tensor:
+        """Undo `_pad_sparse_prefill_query_heads` on an output or per-head LSE."""
+        if x.shape[1] == num_heads:
+            return x
+        # Keep the `.contiguous()`. Returning the strided view instead was
+        # measured and does not help: output stays bit-identical, but
+        # aten::copy_ over the prefill is unchanged (59,717 -> 59,793 us across
+        # 154 -> 152 launches). The copy is not removed, only moved -- the PBM
+        # leg's reshape/bmm materialises it instead. Removing it for real means
+        # teaching that bmm to take a strided input, which is an aiter change.
+        return x[:, :num_heads, ...].contiguous()
+
+    def _pad_decode_query_heads(self, q: torch.Tensor) -> torch.Tensor:
+        """Head padding for the decode kernel. Under DCP q arrives already
+        gathered across the DCP group, so it is that width -- not the per-rank
+        one -- that has to reach a dispatchable kernel."""
+        if self.dcp_world_size > 1:
+            if self.dcp_head_pad > 0:
+                return torch.nn.functional.pad(q, (0, 0, 0, self.dcp_head_pad))
+            return q
+        return self._pad_query_heads(q)
+
+    def _restore_decode_query_heads(
+        self, x: torch.Tensor, num_heads: int
+    ) -> torch.Tensor:
+        """Undo `_pad_decode_query_heads` on an output or per-head LSE."""
+        if self.dcp_world_size > 1:
+            if self.dcp_head_pad > 0:
+                return x[:, :num_heads, ...].contiguous()
+            return x
+        return self._restore_query_heads(x, num_heads)
 
     def _pad_query_heads(self, q: torch.Tensor) -> torch.Tensor:
-        if self.head_repeat_factor > 1:
-            return q.repeat_interleave(self.head_repeat_factor, dim=1)
         if self.head_pad > 0:
             return torch.nn.functional.pad(q, (0, 0, 0, self.head_pad))
         return q
 
+    def _drop_rope_pad(self, *tensors):
+        """Slice the zero rope-pad lanes off q/k before flash-attention.
+
+        A NoPE model widened to `kv_lora_rank + 64` for the MLA kernels also
+        widens the per-head q/k to `qk_nope_head_dim + 64`. For GLM-5.3 that is
+        320, and CK's flash-attention caps head_dim at 256. The trailing lanes
+        are identically zero, so dropping them is exact. Applied at EVERY
+        flash_attn_varlen_func site: prefill has several variants (plain,
+        cached-single-pass, chunked context/suffix) and fixing only the one that
+        a short-prompt smoke test happens to reach leaves the others to fail
+        later, under chunked prefill, as a head-dim error.
+
+        The slice is deliberately NOT made contiguous. It leaves
+        ``stride(-2) == qk_nope_head_dim + pad`` against ``size(-1) ==
+        qk_nope_head_dim``, and all five flash-attention sites take it as is.
+        Measured on gfx950 rather than assumed: against a ``.contiguous()``
+        copy of the same slice the output is bit-identical (max abs diff 0.0),
+        so the kernel takes its row pitch from the stride and not from
+        ``size(-1)``, and the call is ~1.5% slower at 4096 tokens -- far
+        cheaper than materializing K per chunk per layer.
+
+        Also idempotent, which is what makes the two sites that rebind
+        ``prefill_q`` inside a loop correct.
+        """
+        if not self.rope_is_zero_pad:
+            return tensors if len(tensors) > 1 else tensors[0]
+        out = tuple(t[..., : self.qk_nope_head_dim] for t in tensors)
+        return out if len(out) > 1 else out[0]
+
+    def _check_flydsl_fp8_mha(self, q: torch.Tensor) -> None:
+        """Resolve fixed device/model support before any FP8 preparation.
+
+        Like `_flydsl_gather_ok`, this is cached per layer: projected Q's
+        device, dtype and head layout do not change with sequence lengths.
+        Choosing BF16 here also prevents cached gather from overwriting BF16
+        workspaces with FP8, so the fallback retains the original Q/K/V.
+        """
+        if self._flydsl_fp8_mha_ok is not None:
+            return
+        if not self.use_flydsl_fp8_prefill_attn:
+            self._flydsl_fp8_mha_ok = False
+            return
+        head_dim = self.qk_nope_head_dim if self.rope_is_zero_pad else q.shape[-1]
+        self._flydsl_fp8_mha_ok = (
+            _FLYDSL_FP8_MHA_AVAILABLE
+            and q.dtype == torch.bfloat16
+            # Cached FP8 gather currently retains the synthetic RoPE padding.
+            # Until that tuple is trimmed too, NoPE models use the BF16 path.
+            and not self.rope_is_zero_pad
+            and flydsl_flash_attn_fp8_supported(
+                q.device, q.shape[-2], self.num_heads, head_dim, self.v_head_dim
+            )
+        )
+        if not self._flydsl_fp8_mha_ok and not getattr(
+            MLAAttention, "_fp8_prefill_fallback_logged", False
+        ):
+            MLAAttention._fp8_prefill_fallback_logged = True
+            logger.warning(
+                "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1 requested, but FlyDSL FP8 "
+                "prefill attention is unavailable or unsupported for device=%s, "
+                "dtype=%s, heads=%d, qk_dim=%d, v_dim=%d. "
+                "Falling back to BF16 attention.",
+                q.device,
+                q.dtype,
+                q.shape[-2],
+                head_dim,
+                self.v_head_dim,
+            )
+
+    def _prepare_prefill_k(self, k_nope, k_rope):
+        """Keep K split for FP8 quantization; materialize it for BF16 attention."""
+        if self._flydsl_fp8_mha_ok:
+            return k_nope, None if self.rope_is_zero_pad else k_rope
+        return (
+            torch.cat((k_nope, k_rope.expand((*k_nope.shape[:-1], -1))), dim=-1),
+            None,
+        )
+
+    def _flash_attn_prefill(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        min_seqlen_q: int,
+        dropout_p: float,
+        causal: bool,
+        return_lse: bool = False,
+        q_fp8: tuple[torch.Tensor, torch.Tensor] | None = None,
+        kv_fp8: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None,
+        k_rope: torch.Tensor | None = None,
+    ):
+        """Dispatch MLA prefill to FP8 FlyDSL or AITER varlen attention.
+
+        FlyDSL uses bottom-right causal masking and returns natural-log FP32
+        LSE in [heads, total_q] layout. Unsupported device/model configurations
+        select BF16 before quantization. Per-call validation and kernel
+        execution failures still propagate; there is no retry after launch.
+
+        ``q_fp8`` reuses ``(q8, q_descale)`` across cached chunks. ``kv_fp8``
+        supplies ``(k8, v8, k_descale, v_descale)`` from FP8 gather and skips
+        K/V quantization. These outputs can alias the BF16 workspaces.
+        ``k_rope`` supplies the separate RoPE columns when K has not been
+        concatenated yet; the fused QKV quantizer joins them directly in FP8.
+        """
+        if self._flydsl_fp8_mha_ok:
+            # The direct AITER FP8 API has no dropout argument.
+            if dropout_p != 0.0:
+                raise ValueError("FlyDSL FP8 prefill attention requires dropout_p=0")
+            if q_fp8 is None and kv_fp8 is None:
+                q8, k8, v8, qs, ks, vs, _, _ = fused_qkv_per_tensor_quant(
+                    q, k, v, k_rope=k_rope
+                )
+                q_fp8 = (q8, qs)
+                kv_fp8 = (k8, v8, ks, vs)
+            q8, q_descale = q_fp8 or quant_fp8_per_tensor(q)
+            if kv_fp8 is None:
+                # Gather workspaces are contiguous; normalize other views once.
+                k8, v8, k_descale, v_descale = fused_kv_per_tensor_quant(
+                    k.contiguous(), v.contiguous()
+                )
+            else:
+                k8, v8, k_descale, v_descale = kv_fp8
+            # Empty per-sequence cached chunks require the FMHA kernel's
+            # masked-row handling: zero output and -inf LSE for the merge.
+            return flydsl_flash_attn_fp8_func(
+                q8,
+                k8,
+                v8,
+                softmax_scale=self.scale,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=max_seqlen_k,
+                cross_seqlen=True,
+                causal=causal,
+                return_lse=return_lse,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                # Use the current stream for copies and launch, including graph capture.
+                stream=None,
+            )
+
+        if kv_fp8 is not None:
+            raise ValueError("FP8 K/V require a supported FlyDSL FP8 prefill backend")
+        return flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            min_seqlen_q=min_seqlen_q,
+            dropout_p=dropout_p,
+            softmax_scale=self.scale,
+            causal=causal,
+            return_lse=return_lse,
+        )
+
     def _restore_query_heads(
         self, output: torch.Tensor, num_heads: int | None = None
     ) -> torch.Tensor:
-        if self.head_repeat_factor > 1:
-            return output[:, :: self.head_repeat_factor, ...].contiguous()
+        """Drop the dead pad lanes off an MLA output or per-head LSE.
+
+        Returns a view, not a copy: the only consumer is the v-up bmm, which
+        takes its operand strides at runtime and reads the real heads in place.
+        Materialising them instead costs a full-output copy per layer.
+        """
         if self.head_pad > 0:
-            return output[:, : (num_heads or self.num_heads), ...].contiguous()
+            return output[:, : (num_heads or self.num_heads), ...]
         return output
 
     def _seg_kv_cache_view(self, kv_cache: torch.Tensor) -> torch.Tensor:
@@ -410,11 +1194,183 @@ class MLAAttention(nn.Module):
             self.W_V, self.W_V_scale = dynamic_per_batched_tensor_quant(
                 W_V, dtype=dtypes.fp8
             )
+            if self.qrep_enabled:
+                # Gather bf16 and quantize once: gathering fp8 would need the
+                # per-rank scalar scales stitched together. Head order already
+                # matches the effective-TP q_proj shard. self.W_K stays for prefill.
+                W_K_qrep = self.dcp_group.all_gather(W_K.contiguous(), dim=0)
+                self.W_K_qrep, self.W_K_qrep_scale = dynamic_per_batched_tensor_quant(
+                    W_K_qrep, dtype=dtypes.fp8
+                )
+            if self.pbm_enabled:
+                # PBM projects the head-gathered output, i.e. before the merge
+                # would have cut it back to this rank's heads -- so W_V must too.
+                W_V_dcp = self.dcp_group.all_gather(W_V.contiguous(), dim=0)
+                self.W_V_dcp, self.W_V_dcp_scale = dynamic_per_batched_tensor_quant(
+                    W_V_dcp, dtype=dtypes.fp8
+                )
 
-    @mark_trace(prefix="v_up_proj_and_o_proj", torch_compile=False)
-    def _v_up_proj_and_o_proj(self, x):
-        # Convert from (B, N, L) to (N, B, L)
-        x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
+    def _local_q_proj(self):
+        """This rank's rows of the QREP-widened q_proj, built on first use.
+
+        Prefill needs only its own heads, and slicing the OUTPUT still pays for
+        the whole group's GEMM -- so it projects through a zero-copy row view of
+        the weight. Decode keeps the full q_proj; that is what lets it skip the
+        AllGather Q. See ``ColumnParallelLinear.make_row_view``.
+        """
+        w = self.q_proj.weight.data
+        if self._qrep_local_src is not w:
+            rows = self.num_heads * self.qk_head_dim
+            self._qrep_local_proj = self.q_proj.make_row_view(
+                self.dcp_rank * rows, rows
+            )
+            self._qrep_local_src = w
+        return self._qrep_local_proj
+
+    def _dcp_merge(self, o, lse, ctx=None, owned_counts=None, quant_dtype=None):
+        """Bind this layer's DCP group and backend to ``dcp_ops.dcp_lse_merge``."""
+        from atom.model_ops.dcp_ops import dcp_lse_merge
+
+        return dcp_lse_merge(
+            o,
+            lse,
+            self.dcp_group,
+            self.dcp_comm_backend,
+            ctx=ctx,
+            owned_counts=owned_counts,
+            quant_dtype=quant_dtype,
+        )
+
+    def _dcp_fused_quant_dtype(self):
+        """o_proj's activation dtype if the combine can emit it, else None.
+
+        The combine can only absorb the quant when o_proj reads its output
+        directly (PBM) and wants exactly a per-token FP8 activation. A static
+        input_scale is not a per-token scale, and the block schemes need a scale
+        per channel GROUP with a layout choice; all of those keep the standalone
+        quant kernel they have today.
+        """
+        if not self.pbm_enabled:
+            return None
+        if self.dcp_comm_backend != "a2a":
+            return None
+        op = getattr(self, "o_proj", None)
+        qt = getattr(op, "quant_type", None)
+        # QuantType is compared by .value throughout ATOM: the enum can be
+        # re-imported under a different module identity, breaking `is`/`==`.
+        if qt is None or getattr(qt, "value", None) != QuantType.per_Token.value:
+            return None
+        # Same set the sibling predicate in attention_residual.py accepts, and
+        # the layer's own spelling is what comes back: `dtypes.fp8` is e4m3fn
+        # here but e4m3fnuz on MI300, so matching one identity would skip the
+        # fusion for the other, and returning the constant rather than what the
+        # layer holds would quantize to the wrong FP8 format.
+        params_dtype = getattr(op, "params_dtype", None)
+        if params_dtype not in (dtypes.fp8, torch.float8_e4m3fn):
+            return None
+        if getattr(op, "input_scale", None) is not None:
+            return None
+        return params_dtype
+
+    @mark_trace(prefix="dcp_project_merge_out", torch_compile=False)
+    def _dcp_project_merge_out(
+        self, o, lse, ctx=None, merge_in_fp32=False, owned_counts=None
+    ):
+        """Shared tail of both DCP paths: PBM projection, merge, o_proj.
+
+        With PBM the V up-projection runs on the whole group's head set BEFORE
+        the merge, so o_proj then takes an already-projected tensor. Without it
+        the merge carries the latent and ``_v_up_proj_and_o_proj`` does both.
+        """
+        if self.pbm_enabled:
+            o = self._v_up_proj(
+                o, self.W_V_dcp, self.W_V_dcp_scale, num_heads=o.shape[1]
+            )
+        # Only PBM hands the merge output straight to o_proj, so it is the only
+        # path whose activation quant the combine can absorb. The fp32 merge is
+        # a prefill-accuracy path and keeps its bf16 store.
+        fused_quant = None if merge_in_fp32 else self._dcp_fused_quant_dtype()
+        if merge_in_fp32:
+            dtype = o.dtype
+            o = self._dcp_merge(o.float(), lse, ctx=ctx, owned_counts=owned_counts).to(
+                dtype
+            )
+        else:
+            o = self._dcp_merge(
+                o, lse, ctx=ctx, owned_counts=owned_counts, quant_dtype=fused_quant
+            )
+        if fused_quant is not None:
+            o, o_scale = o
+            if o_scale is not None:
+                return self.o_proj(
+                    o.reshape(-1, self.num_heads * self.v_head_dim), o_scale
+                )
+            # Single-rank DCP: there was no combine to fold into, so the tensor
+            # came back unquantized and o_proj quantizes it as it always has.
+        if self.pbm_enabled:
+            return self.o_proj(o.reshape(-1, self.num_heads * self.v_head_dim))
+        return self._v_up_proj_and_o_proj(o)
+
+    @mark_trace(prefix="dcp_sparse_prefill", torch_compile=False)
+    def _dcp_sparse_prefill(self, q_out, kv_cache, attn_metadata):
+        """Sparse prefill under DCP: each rank holds a disjoint slice of the
+        global top-k, so its partial output must be merged like decode's.
+
+        Merge dtype is platform-dependent -- on gfx942 the bf16 ReduceScatter
+        sum costs ~3.5pp, on gfx950 it is free even at ctx~32k with fp8 KV.
+        See ``dcp_prefill_merge_bf16_ok``.
+        """
+        q_out = self.dcp_group.all_gather(q_out, dim=1)
+        o, lse = self._forward_prefill_mla(
+            q_out, kv_cache, attn_metadata, return_lse=True
+        )
+        return self._dcp_project_merge_out(
+            o,
+            lse,
+            merge_in_fp32=not self.dcp_prefill_merge_bf16_ok,
+            owned_counts=self.dcp_owned_counts_buffer[: q_out.shape[0]],
+        )
+
+    @mark_trace(prefix="dcp_decode", torch_compile=False)
+    def _dcp_decode(self, q_out, kv_cache, attn_metadata, use_qrep):
+        """Decode under DCP: gather the group's query heads, decode locally with
+        LSE, then merge the partials across ranks.
+
+        QREP skips the gather -- q_out already carries the full group head set
+        from the replicated q_proj + W_K_qrep. Only real heads cross the wire;
+        the pad the kernel width needs lives inside ``_forward_decode``.
+        """
+        from atom.model_ops.dcp_ops import dcp_all_gather_query_heads
+
+        if not use_qrep:
+            q_out = dcp_all_gather_query_heads(self.dcp_group, q_out)
+        o, lse = self._forward_decode(q_out, kv_cache, attn_metadata, return_lse=True)
+        owned_counts = (
+            self.dcp_owned_counts_buffer[: q_out.shape[0]]
+            if self.is_sparse_mla and self.dcp_owned_counts_buffer is not None
+            else None
+        )
+        return self._dcp_project_merge_out(
+            o,
+            lse,
+            ctx=self._cp_triton_ctx,
+            owned_counts=owned_counts,
+        )
+
+    def _v_up_proj(self, x, W_V=None, W_V_scale=None, num_heads=None):
+        """V up-projection only: ``[B, N, kv_lora_rank] -> [B, N, v_head_dim]``.
+
+        Split out so DCP decode can run it BEFORE the merge (project-before-
+        merge). Weight and head count are arguments because that path projects
+        the whole group with ``W_V_dcp``; every other caller uses ``self.W_V``.
+        """
+        W_V = self.W_V if W_V is None else W_V
+        W_V_scale = self.W_V_scale if W_V_scale is None else W_V_scale
+        num_heads = self.num_heads if num_heads is None else num_heads
+        # Convert from (B, N, L) to (N, B, L). reshape, not view: the PBM caller
+        # passes the raw decode output, which is not guaranteed contiguous the
+        # way the post-ReduceScatter tensor is.
+        x = x.reshape(-1, num_heads, self.kv_lora_rank).transpose(0, 1)
         # Multiply (N, B, L) x (N, L, V) -> (N, B, V), Convert from (N, B, V) to (B, N, V)
         # x = torch.bmm(x, self.W_UV).transpose(0, 1)
         # Convert from (B, N, L) to (N, B, L)
@@ -422,47 +1378,64 @@ class MLAAttention(nn.Module):
             output = torch.empty(
                 x.shape[1],
                 x.shape[0],
-                self.W_V.shape[1],
+                W_V.shape[1],
                 device=x.device,
                 dtype=torch.bfloat16,
             )
             output = batched_gemm_a16wfp4(
                 x,
-                self.W_V,
-                self.W_V_scale,
+                W_V,
+                W_V_scale,
                 y=output,
                 transpose_bm=True,
                 prequant=True,
                 y_scale=None,
             )
             # x = x.transpose(0, 1).flatten(1, 2)
-            output = output.view(-1, self.num_heads * self.v_head_dim)
             x = output
         else:
             x = _aiter_triton_fp8_bmm(
-                x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True
+                x, W_V, W_V_scale, group_size=128, transpose_bm=True
             )
-            # Convert from (B, N, V) to (B, N * V)
-            x = x.reshape(-1, self.num_heads * self.v_head_dim)
-        return self.o_proj(x)
+        return x.reshape(-1, num_heads, self.v_head_dim)
+
+    @mark_trace(prefix="v_up_proj_and_o_proj", torch_compile=False)
+    def _v_up_proj_and_o_proj(self, x):
+        x = self._v_up_proj(x)
+        # Convert from (B, N, V) to (B, N * V)
+        return self.o_proj(x.reshape(-1, self.num_heads * self.v_head_dim))
 
     @mark_trace(prefix="q_proj_and_k_up_proj", torch_compile=False)
-    def _q_proj_and_k_up_proj(self, x, x_scale=None):
-        q_nope, q_pe = (
-            self.q_proj(x, x_scale)
-            .view(-1, self.num_heads, self.qk_head_dim)
-            .split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        )
+    def _q_proj_and_k_up_proj(self, x, x_scale=None, group=False):
+        # QREP: q_proj emits the full DCP-group head set. group=True (decode)
+        # keeps them all and uses W_K_qrep, so the caller skips the AllGather Q;
+        # group=False (prefill / non-QREP) takes only this rank's heads.
+        if self.qrep_enabled and not group:
+            # Row-view weight: computes only this rank's heads, so the redundant
+            # group-wide GEMM never happens (the old code projected all group
+            # heads and then dropped 7/8 of the result).
+            q = self._local_q_proj()(x, x_scale).view(
+                -1, self.num_heads, self.qk_head_dim
+            )
+        else:
+            n_heads_out = self.qrep_num_heads if self.qrep_enabled else self.num_heads
+            q = self.q_proj(x, x_scale).view(-1, n_heads_out, self.qk_head_dim)
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         # Convert from (B, N, P) to (N, B, P)
         q_nope = q_nope.transpose(0, 1)
+
+        if self.qrep_enabled and group:
+            W_K, W_K_scale = self.W_K_qrep, self.W_K_qrep_scale
+        else:
+            W_K, W_K_scale = self.W_K, self.W_K_scale
 
         if is_rocm_aiter_fp4bmm_enabled():
             # FP4 BMM: (N, B, P) x (N, P, L) -> (N, B, L)
             ql_nope = batched_gemm_a16wfp4(
                 q_nope,
-                self.W_K,
-                self.W_K_scale,
+                W_K,
+                W_K_scale,
                 y=None,
                 transpose_bm=True,
                 prequant=True,
@@ -472,7 +1445,7 @@ class MLAAttention(nn.Module):
             # Multiply (N, B, P) x (N, P, L) -> (N, B, L), Convert from (N, B, L) to (B, N, L)
             # ql_nope = torch.bmm(q_nope, self.W_UK_T).transpose(0, 1)
             ql_nope = _aiter_triton_fp8_bmm(
-                q_nope, self.W_K, self.W_K_scale, group_size=128, transpose_bm=True
+                q_nope, W_K, W_K_scale, group_size=128, transpose_bm=True
             )
         return ql_nope, q_pe
 
@@ -549,6 +1522,7 @@ class MLAAttention(nn.Module):
         """Legacy single-pass path: gather the full cached+new context into
         k_full / v_full and run one flash_attn. OOMs on long contexts (peak
         ≈ total_kv × heads × (qk_dim + v_dim) × dtype)."""
+        self._check_flydsl_fp8_mha(prefill_q)
         k_full = torch.empty(
             (
                 attn_metadata.total_kv,
@@ -573,17 +1547,17 @@ class MLAAttention(nn.Module):
             getattr(attn_metadata, "shuffle_kv_block_indptr", None),
             getattr(attn_metadata, "shuffle_kv_block_indices", None),
         )
-        output = flash_attn_varlen_func(
-            q=prefill_q,
-            k=k_full,
-            v=v_full,
+        prefill_q, k_full = self._drop_rope_pad(prefill_q, k_full)
+        output = self._flash_attn_prefill(
+            prefill_q,
+            k_full,
+            v_full,
             cu_seqlens_q=attn_metadata.cu_seqlens_q,
             cu_seqlens_k=attn_metadata.cu_seqlens_k,
             max_seqlen_q=attn_metadata.max_seqlen_q,
             max_seqlen_k=attn_metadata.max_seqlen_k,
             min_seqlen_q=attn_metadata.min_seqlen_q,
             dropout_p=attn_metadata.dropout_p,
-            softmax_scale=self.scale,
             causal=True,
         )
         return self.o_proj(output.flatten(start_dim=-2))
@@ -596,9 +1570,10 @@ class MLAAttention(nn.Module):
         cu_seqlens_k: torch.Tensor,
         k_out: torch.Tensor,
         v_out: torch.Tensor,
-        shuffle_kv_block_indptr: Optional[torch.Tensor] = None,
-        shuffle_kv_block_indices: Optional[torch.Tensor] = None,
-    ) -> None:
+        shuffle_kv_block_indptr: torch.Tensor | None = None,
+        shuffle_kv_block_indices: torch.Tensor | None = None,
+        kv_out_scales: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ):
         weight = self.kv_b_proj.weight
         if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
             # Shuffled KV: read the block_size-shuffled cache with block-granular
@@ -619,18 +1594,119 @@ class MLAAttention(nn.Module):
                 shuffled_kv_cache=True,
             )
         else:
-            gather_kv_b_proj(
+            return self._kv_b_proj_gather(
                 kv_cache,
-                self._k_scale,
                 kv_indptr,
                 kv_indices,
                 cu_seqlens_k,
-                _maybe_view_mxfp4_weight_for_gather(self.kv_b_proj, weight),
-                getattr(self.kv_b_proj, "weight_scale", None),
                 k_out,
                 v_out,
-                weight_preshuffle=getattr(weight, "is_shuffled", False),
+                kv_out_scales=kv_out_scales,
             )
+
+    def _kv_b_proj_gather(
+        self,
+        kv_buffer: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        k_out: torch.Tensor,
+        v_out: torch.Tensor,
+        kv_out_scales: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ):
+        """Gather compressed KV rows and decompress them into k/v, in one pass.
+
+        One kernel for the whole chain: row gather, KV-cache dequant,
+        ``kv_b_proj``, the k_nope/v split and the k_pe concat. ``kv_buffer`` is
+        any ``[rows, block, kv_lora_rank + qk_rope_head_dim]`` compressed-KV
+        tensor -- the paged cache for the non-DCP path, the AllGather block for
+        DCP -- and ``kv_indices`` selects rows out of it.
+
+        With ``kv_out_scales`` the FlyDSL epilogue writes FP8 into the first
+        half of each contiguous BF16 workspace and returns the FP8 views and
+        descales. BF16 output returns None so the caller quantizes separately.
+        """
+        weight = self.kv_b_proj.weight
+        gather_weight = _maybe_view_mxfp4_weight_for_gather(self.kv_b_proj, weight)
+        weight_scale = getattr(self.kv_b_proj, "weight_scale", None)
+        preshuffled = getattr(weight, "is_shuffled", False)
+
+        # `_FLYDSL_GATHER_AVAILABLE` says the import worked, which is a different
+        # question from whether that backend serves THESE tensors: it is gfx950,
+        # page_size 1, fp8 cache and fp8 weight only. A bf16 cache (GLM-5.2), an
+        # unquantized weight (Kimi-K3) or an MXFP4 one make it raise, and that
+        # used to take the engine down rather than reach the Triton op below,
+        # which covers all of them. Every term is fixed by the weights and the
+        # cache, so ask once and keep the answer.
+        if self.use_flydsl_gather_kv_b_proj and _FLYDSL_GATHER_AVAILABLE:
+            if self._flydsl_gather_ok is None:
+                self._flydsl_gather_ok = gather_kv_b_proj_flydsl_supported(
+                    kv_buffer, gather_weight, weight_scale, k_out, v_out
+                )
+            if self._flydsl_gather_ok:
+                fp8_outputs = (
+                    self._flydsl_gather_fp8_ok is not False
+                    and kv_out_scales is not None
+                    and all(
+                        t.dtype == torch.bfloat16 and t.is_contiguous()
+                        for t in (k_out, v_out)
+                    )
+                )
+                k_gather, v_gather = k_out, v_out
+                out_kwargs = {}
+                if fp8_outputs:
+                    k_fp8, v_fp8 = (
+                        t.view(torch.float8_e4m3fn).view(-1)[: t.numel()].view(t.shape)
+                        for t in (k_out, v_out)
+                    )
+                    if self._flydsl_gather_fp8_ok is None:
+                        self._flydsl_gather_fp8_ok = (
+                            gather_kv_b_proj_flydsl_fp8_supported(
+                                kv_buffer,
+                                gather_weight,
+                                weight_scale,
+                                k_fp8,
+                                v_fp8,
+                                k_out_scale=kv_out_scales[0],
+                                v_out_scale=kv_out_scales[1],
+                            )
+                        )
+                    fp8_outputs = self._flydsl_gather_fp8_ok
+                    if fp8_outputs:
+                        k_gather, v_gather = k_fp8, v_fp8
+                        out_kwargs = {
+                            "k_out_scale": kv_out_scales[0],
+                            "v_out_scale": kv_out_scales[1],
+                        }
+                gather_kv_b_proj_flydsl(
+                    kv_buffer,
+                    self._k_scale,
+                    kv_indptr,
+                    kv_indices,
+                    cu_seqlens_k,
+                    gather_weight,
+                    weight_scale,
+                    k_gather,
+                    v_gather,
+                    weight_preshuffle=preshuffled,
+                    **out_kwargs,
+                )
+                if fp8_outputs:
+                    return k_gather, v_gather, *kv_out_scales
+                return None
+
+        gather_kv_b_proj(
+            kv_buffer,
+            self._k_scale,
+            kv_indptr,
+            kv_indices,
+            cu_seqlens_k,
+            gather_weight,
+            weight_scale,
+            k_out,
+            v_out,
+            weight_preshuffle=preshuffled,
+        )
 
     def _forward_prefill_cached_chunked(
         self,
@@ -660,6 +1736,8 @@ class MLAAttention(nn.Module):
         """
         from atom.model_ops.attentions.triton_merge_attn_states import merge_attn_states
 
+        self._check_flydsl_fp8_mha(prefill_q)
+
         # Trigger counter: log first hit + every 500th to confirm the chunked
         # path is actually exercised (not silently bypassed when
         # has_cached=True but cached prefix < CHUNK_TOKENS for every seq).
@@ -687,22 +1765,33 @@ class MLAAttention(nn.Module):
         k_nope_new, v_new = kv_nope_new.split(
             [self.qk_nope_head_dim, self.v_head_dim], dim=-1
         )
-        k_new = torch.cat(
-            (k_nope_new, k_rope_new.expand((*k_nope_new.shape[:-1], -1))), dim=-1
-        )
-        new_out, new_lse = flash_attn_varlen_func(
-            q=prefill_q,
-            k=k_new,
-            v=v_new,
+        k_new, quant_k_rope = self._prepare_prefill_k(k_nope_new, k_rope_new)
+        prefill_q, k_new = self._drop_rope_pad(prefill_q, k_new)
+        # Quantize Q once and reuse it across the new tokens and cached chunks.
+        q_fp8 = None
+        new_kv_fp8 = None
+        kv_out_scales = None
+        if self._flydsl_fp8_mha_ok:
+            q8, k8, v8, qs, ks, vs, gather_ks, gather_vs = fused_qkv_per_tensor_quant(
+                prefill_q, k_new, v_new, k_rope=quant_k_rope
+            )
+            q_fp8 = (q8, qs)
+            new_kv_fp8 = (k8, v8, ks, vs)
+            kv_out_scales = (gather_ks, gather_vs)
+        new_out, new_lse = self._flash_attn_prefill(
+            prefill_q,
+            k_new,
+            v_new,
             cu_seqlens_q=attn_metadata.cu_seqlens_q,
             cu_seqlens_k=attn_metadata.cu_seqlens_q,
             max_seqlen_q=attn_metadata.max_seqlen_q,
             max_seqlen_k=attn_metadata.max_seqlen_q,
             min_seqlen_q=attn_metadata.min_seqlen_q,
             dropout_p=attn_metadata.dropout_p,
-            softmax_scale=self.scale,
             causal=True,
             return_lse=True,
+            q_fp8=q_fp8,
+            kv_fp8=new_kv_fp8,
         )
 
         # Step 2: chunked cached-prefix attention.
@@ -714,7 +1803,12 @@ class MLAAttention(nn.Module):
             # reorg -> kv_b_proj. The rest of the merge logic below
             # is identical to the non-DCP path.
             chunked_out, chunked_lse = self._dcp_compute_prefill_context(
-                prefill_q, kv_cache, attn_metadata, chunk_meta
+                prefill_q,
+                kv_cache,
+                attn_metadata,
+                chunk_meta,
+                q_fp8=q_fp8,
+                kv_out_scales=kv_out_scales,
             )
         else:
             k_workspace = chunk_meta.k_workspace
@@ -725,13 +1819,14 @@ class MLAAttention(nn.Module):
                     continue
                 k_chunk = k_workspace[:n_tok]
                 v_chunk = v_workspace[:n_tok]
-                self._gather_cached_kv_b_proj(
+                kv_fp8 = self._gather_cached_kv_b_proj(
                     kv_cache,
                     chunk_meta.kv_indptr[c],
                     chunk_meta.kv_indices[c],
                     chunk_meta.cu_seqlens_k[c],
                     k_chunk,
                     v_chunk,
+                    kv_out_scales=kv_out_scales,
                     shuffle_kv_block_indptr=(
                         chunk_meta.shuffle_kv_block_indptr[c]
                         if chunk_meta.shuffle_kv_block_indptr is not None
@@ -743,19 +1838,25 @@ class MLAAttention(nn.Module):
                         else None
                     ),
                 )
-                suf_out, suf_lse = flash_attn_varlen_func(
-                    q=prefill_q,
-                    k=k_chunk,
-                    v=v_chunk,
-                    cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                prefill_q, k_chunk = self._drop_rope_pad(prefill_q, k_chunk)
+                suf_out, suf_lse = self._flash_attn_prefill(
+                    prefill_q,
+                    k_chunk,
+                    v_chunk,
+                    # As many q-cums as k-cums -- varlen takes its batch from
+                    # the q side, and the chunk's were built unpadded.
+                    cu_seqlens_q=attn_metadata.cu_seqlens_q[
+                        : chunk_meta.cu_seqlens_k[c].shape[0]
+                    ],
                     cu_seqlens_k=chunk_meta.cu_seqlens_k[c],
                     max_seqlen_q=attn_metadata.max_seqlen_q,
                     max_seqlen_k=chunk_meta.max_seqlen_k[c],
                     min_seqlen_q=attn_metadata.min_seqlen_q,
                     dropout_p=attn_metadata.dropout_p,
-                    softmax_scale=self.scale,
                     causal=False,
                     return_lse=True,
+                    q_fp8=q_fp8,
+                    kv_fp8=kv_fp8,
                 )
                 if chunked_out is None:
                     chunked_out = suf_out
@@ -797,43 +1898,44 @@ class MLAAttention(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetaData,
         chunk_meta,
+        q_fp8: tuple[torch.Tensor, torch.Tensor] | None = None,
+        kv_out_scales: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         """DCP chunked cached-prefix context attention.
 
         Per chunk: index_select this rank's local compressed KV, AllGather it
-        across the DCP group, ``reorg_kvcache`` back to per-sequence contiguous
-        layout, ``kv_b_proj``-decompress, run flash_attn(causal=False), and
-        LSE-merge across chunks. The context attention is unmasked, so the
-        rank-major token order produced by reorg does not affect the result.
+        across the DCP group, then one fused pass turns the rank-major
+        AllGather block into the k/v the attention kernel wants, run
+        flash_attn(causal=False), and LSE-merge across chunks. The context
+        attention is unmasked, so the rank-major token order within a sequence
+        does not affect the result.
+
+        Everything between the collective and the attention is a single kernel:
+        the reorg back to per-sequence order is the fused gather's index map, so
+        the fp8 dequant, the reorg copies, the ``kv_b_proj`` decompress and the
+        k_pe concat all ride along with it instead of costing a kernel (and, for
+        the reorg, a per-layer Python walk over every (seq, rank) segment) each.
         """
         from atom.model_ops.attentions.triton_merge_attn_states import merge_attn_states
-        from atom.model_ops.dcp_ops import dcp_gather_compressed_kv, reorg_kvcache
-
-        is_fp8_kv = self.kv_cache_dtype.startswith("fp8")
+        from atom.model_ops.dcp_ops import dcp_all_gather, dcp_gather_compressed_kv
 
         chunked_out: torch.Tensor | None = None
         chunked_lse: torch.Tensor | None = None
         for c in range(chunk_meta.num_chunks):
-            toks = chunk_meta.seq_tot[c]
-            if toks == 0:
+            if chunk_meta.seq_tot[c] == 0:
+                # No local tokens on any rank here. Rank-invariant (the padded
+                # local length is), so every rank skips the collective together.
                 continue
             # 1. gather this rank's local compressed KV for the chunk (keeps the
             #    cache dtype, so fp8 stays fp8 here).
             local_kv = dcp_gather_compressed_kv(kv_cache, chunk_meta.local_slot_ids[c])
-            # 2. AllGather across DCP ranks -> [toks * dcp_world_size, d]. This is
+            # 2. AllGather across DCP ranks -> [seq_tot * dcp_world_size, d]. It is
             #    a copy-only collective, so an fp8 payload is safe (no fp8
-            #    arithmetic, unlike an all-reduce).
-            ag_kv = self.dcp_group.all_gather(local_kv, dim=0)
-            if is_fp8_kv:
-                # Dequant the fp8 compressed KV -> model dtype before reorg /
-                # kv_b_proj (which expect a bf16 latent). dequant = stored *
-                # scale mirrors the write-side quant (value / scale); _k_scale
-                # is 1.0 for MLA today. AllGather-then-dequant keeps the wire
-                # payload at fp8 (half the bf16 traffic). Tensor arithmetic (not
-                # float()/.item()): _k_scale may be a GPU tensor and a host sync
-                # is illegal under cudagraph capture; a 0-dim scale broadcasts on
-                # device with no sync.
-                ag_kv = ag_kv.to(self.dtype) * self._k_scale
+            #    arithmetic, unlike an all-reduce) and keeps the wire at half the
+            #    bf16 traffic. fp8 has no entry in the custom collective's dtype
+            #    enum, so dcp_all_gather pairs the bytes into fp16 rather than
+            #    give the gather up to pynccl.
+            ag_kv = dcp_all_gather(self.dcp_group, local_kv, 0)
 
             sum_seq_len = chunk_meta.total_tokens[c]
             if sum_seq_len == 0:
@@ -841,49 +1943,46 @@ class MLAAttention(nn.Module):
                 # chunk); collective already ran, just skip the compute.
                 continue
 
-            # 3. reorg interleaved AllGather blocks -> per-seq contiguous.
-            ag_kv_c, ag_k_pe = ag_kv.unsqueeze(1).split(
-                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            # 3. reorg + dequant + kv_b_proj + k_pe concat, fused. block_size 1
+            #    on the AllGather buffer makes the row map a plain token index.
+            k_chunk, v_chunk = self._dcp_context_kv_buffers(chunk_meta, sum_seq_len)
+            kv_fp8 = self._kv_b_proj_gather(
+                ag_kv.unsqueeze(1),
+                chunk_meta.cu_seqlens_k[c],
+                chunk_meta.ag_row_indices[c],
+                chunk_meta.cu_seqlens_k[c],
+                k_chunk,
+                v_chunk,
+                kv_out_scales=kv_out_scales,
             )
-            kv_c_normed, k_pe = reorg_kvcache(
-                ag_kv_c,
-                ag_k_pe,
-                padded_local_chunk_seq_lens_lst=chunk_meta.padded_local_chunk_seq_lens[
-                    c
+
+            # 4. flash attention over the (unmasked) context chunk.
+            # main's fused `_kv_b_proj_gather` above replaces the hand-written
+            # decompress this branch used to do, so its `k`/`v` are gone -- but
+            # the pad still has to come off. `_dcp_context_kv_buffers` hands
+            # back either the chunk workspace or a fresh buffer of
+            # `self.qk_head_dim`, and both are the WIDENED 320 for a NoPE
+            # model, which CK's 256 head-dim cap refuses.
+            prefill_q, k_chunk = self._drop_rope_pad(prefill_q, k_chunk)
+            ctx_out, ctx_lse = self._flash_attn_prefill(
+                prefill_q,
+                k_chunk,
+                v_chunk,
+                cu_seqlens_q=attn_metadata.cu_seqlens_q[
+                    : chunk_meta.cu_seqlens_k[c].shape[0]
                 ],
-                local_context_lens_allranks=chunk_meta.local_context_lens_allranks,
-                sum_seq_len=sum_seq_len,
-                max_seq_len=chunk_meta.max_seqlen_k[c],
-                chunk_size=chunk_meta.chunk_size,
-                chunk_idx=c,
-                toks=toks,
-            )
-
-            # 4. kv_b_proj decompress -> k_nope, v; concat k_pe -> k.
-            kv_c_normed = kv_c_normed.squeeze(1)
-            kv_nope = self.kv_b_proj(kv_c_normed).view(
-                -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
-            )
-            k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
-
-            # 5. flash attention over the (unmasked) context chunk.
-            ctx_out, ctx_lse = flash_attn_varlen_func(
-                q=prefill_q,
-                k=k,
-                v=v,
-                cu_seqlens_q=attn_metadata.cu_seqlens_q,
                 cu_seqlens_k=chunk_meta.cu_seqlens_k[c],
                 max_seqlen_q=attn_metadata.max_seqlen_q,
                 max_seqlen_k=chunk_meta.max_seqlen_k[c],
                 min_seqlen_q=attn_metadata.min_seqlen_q,
                 dropout_p=attn_metadata.dropout_p,
-                softmax_scale=self.scale,
                 causal=False,
                 return_lse=True,
+                q_fp8=q_fp8,
+                kv_fp8=kv_fp8,
             )
 
-            # 6. LSE-merge across chunks.
+            # 5. LSE-merge across chunks.
             if chunked_out is None:
                 chunked_out = ctx_out
                 chunked_lse = ctx_lse
@@ -903,6 +2002,27 @@ class MLAAttention(nn.Module):
 
         return chunked_out, chunked_lse
 
+    def _dcp_context_kv_buffers(
+        self, chunk_meta, sum_seq_len: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Destination k/v for one DCP context chunk's fused gather.
+
+        Prefers the shared chunk workspace, which is sized to
+        ``attn_prefill_chunk_size`` tokens. DCP chunks the cached prefix per
+        sequence and its window must stay block-aligned, so a step carrying more
+        cached-prefix sequences than the token budget can divide into
+        block-sized windows produces a chunk wider than that; allocate for those
+        rather than write past the workspace.
+        """
+        k_workspace = chunk_meta.k_workspace
+        if k_workspace is not None and sum_seq_len <= k_workspace.shape[0]:
+            return k_workspace[:sum_seq_len], chunk_meta.v_workspace[:sum_seq_len]
+        kwargs = {"dtype": self.dtype, "device": self.kv_b_proj.weight.device}
+        return (
+            torch.empty((sum_seq_len, self.num_heads, self.qk_head_dim), **kwargs),
+            torch.empty((sum_seq_len, self.num_heads, self.v_head_dim), **kwargs),
+        )
+
     def _forward_prefill_mha(
         self,
         q: torch.Tensor,
@@ -912,10 +2032,12 @@ class MLAAttention(nn.Module):
         attn_metadata: AttentionMetaData,
     ) -> torch.Tensor:
         assert attn_metadata is not None
+        self._check_flydsl_fp8_mha(q)
 
         if k_rope.dim() == 2:
             k_rope = k_rope.unsqueeze(1)
 
+        quant_k_rope = None
         if use_triton_gemm():
             weight = self.kv_b_proj.weight
             weight_scale = self.kv_b_proj.weight_scale
@@ -991,27 +2113,28 @@ class MLAAttention(nn.Module):
                     [self.qk_nope_head_dim, self.v_head_dim], dim=-1
                 )
 
-                k = torch.cat((k_nope, k_rope.expand((*k_nope.shape[:-1], -1))), dim=-1)
+                k, quant_k_rope = self._prepare_prefill_k(k_nope, k_rope)
         else:
             kv_nope = self.kv_b_proj(kv_c_normed).view(
                 -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
-            k = torch.cat((k_nope, k_rope.expand((*k_nope.shape[:-1], -1))), dim=-1)
+            k, quant_k_rope = self._prepare_prefill_k(k_nope, k_rope)
 
-        output = flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
+        q, k = self._drop_rope_pad(q, k)
+        output = self._flash_attn_prefill(
+            q,
+            k,
+            v,
             cu_seqlens_q=attn_metadata.cu_seqlens_q,
             cu_seqlens_k=attn_metadata.cu_seqlens_k,
             max_seqlen_q=attn_metadata.max_seqlen_q,
             max_seqlen_k=attn_metadata.max_seqlen_k,
             min_seqlen_q=attn_metadata.min_seqlen_q,
             dropout_p=attn_metadata.dropout_p,
-            softmax_scale=self.scale,
             causal=True,
+            k_rope=quant_k_rope,
         )
 
         return self.o_proj(output.flatten(start_dim=-2))
@@ -1021,12 +2144,28 @@ class MLAAttention(nn.Module):
         q: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: AttentionMetaData,
+        return_lse: bool = False,
+        q_prepadded: bool = False,
     ) -> torch.Tensor:
         assert attn_metadata is not None
         B = q.shape[0]
-        num_heads_q = q.shape[1]
 
-        q = self._pad_query_heads(q)
+        # Under DCP the sparse path has already gathered the group's query heads,
+        # so it pads to its own kernel width -- NOT decode's, whose persistence
+        # gate differs (see mla_dcp_sparse_prefill_is_persistent). Every other
+        # caller pads the per-rank count.
+        dcp_sparse = self.is_sparse_mla and self.dcp_world_size > 1
+        if q_prepadded:
+            # The fused q write already produced the padded width, so q.shape[1]
+            # is the kernel width and the real head count is this rank's own.
+            num_heads_q = self.num_heads
+        else:
+            num_heads_q = q.shape[1]
+            q = (
+                self._pad_sparse_prefill_query_heads(q)
+                if dcp_sparse
+                else self._pad_query_heads(q)
+            )
 
         # In the seg path q arrives with a padded per-head row stride
         # (_MLA_Q_OUT_PADDED_DIM); slice back to the logical
@@ -1044,7 +2183,18 @@ class MLAAttention(nn.Module):
             device=q.device,
         )
 
-        paged_cu_seqlens_q = attn_metadata.cu_seqlens_q
+        # The paged kernels take their batch from the q-cums; cut them to the
+        # requests actually scheduled, which is the width prepare_prefill fills
+        # before padding the tail out to running_bs.
+        #
+        # context.scheduled_bs is batch.total_seqs_num, while the builder sized
+        # these arrays by total_seqs_num_prefill. The two differ only on a batch
+        # carrying decode rows, and such a batch leaves total_tokens_num_prefill
+        # at 0 -- hence is_prefill False, which is the branch this function is
+        # reached from. Every is_prefill batch sets the two counts equal.
+        fwd_context = get_forward_context()
+        n_seqs = fwd_context.context.scheduled_bs
+        paged_cu_seqlens_q = attn_metadata.cu_seqlens_q[: n_seqs + 1]
         paged_kv_indptr = attn_metadata.kv_indptr
         paged_kv_indices = attn_metadata.kv_indices
         kv_last_page_lens = attn_metadata.kv_last_page_lens
@@ -1056,15 +2206,65 @@ class MLAAttention(nn.Module):
             # Sparse attention needs one last-page len per query token; the dense
             # kv_last_page_lens (per-seq) would over-read -> illegal access.
             kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
+            if self.dcp_world_size > 1:
+                # The indexer compacted this rank's owned candidates to the front
+                # of each query token's region, so the region lengths are the
+                # per-rank (and per-layer) ones, not the global sparse_kv_indptr.
+                # Same substitution the decode path makes.
+                paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer[
+                    : paged_cu_seqlens_q.shape[0]
+                ]
             max_q_len = 1
 
+        final_lse = None
         if kv_c_and_k_pe_cache.numel() > 0:
             if envs.ATOM_MLA_PAGE_SIZE is not None:
                 page_size = envs.ATOM_MLA_PAGE_SIZE
             else:
                 page_size = 1
-            if self.kv_cache_dtype.startswith("fp8"):
-                mla_decode_fwd(
+            # `mla_prefill_asm_fwd` NEVER writes its LSE output, so DCP also needs
+            # `mla_decode_fwd` kernel.
+            use_decode_kernel = self.kv_cache_dtype.startswith("fp8") or return_lse
+            if use_decode_kernel:
+                is_fp8 = self.kv_cache_dtype.startswith("fp8")
+                # A full IndexShare layer rewrites the rank-local compact
+                # indptr, so the once-per-step work metadata (built from the
+                # GLOBAL sparse_kv_indptr) does not describe this rank's regions
+                # -- rebuild it here, or run non-persistent.
+                #
+                # Read from the same predicate the gathered pad width came from
+                # rather than re-deriving the gate: gqa=64 is correct only in
+                # persistent mode, so running one way while the width was chosen
+                # for the other silently miscomputes. The assert keeps the two
+                # spellings honest if either side gains a condition.
+                sparse_dcp_persistent = (
+                    dcp_sparse and self.dcp_sparse_prefill_persistent
+                )
+                assert sparse_dcp_persistent == (
+                    is_fp8
+                    and dcp_sparse
+                    and self.sparse_dcp_metadata_rebuild
+                    and self.dcp_persistent_supported
+                    and page_size <= 1
+                ), (
+                    "DCP sparse prefill would run in a different mode than the "
+                    "one its gathered query width was padded for; update "
+                    "mla_dcp_sparse_prefill_is_persistent alongside this gate."
+                )
+                if sparse_dcp_persistent and self.owns_sparse_indexer:
+                    self._rebuild_sparse_dcp_persistent_metadata(
+                        attn_metadata,
+                        q,
+                        kv_c_and_k_pe_cache,
+                        paged_cu_seqlens_q,
+                        paged_kv_indptr,
+                        kv_last_page_lens,
+                        work_prefix="sparse_prefill_",
+                    )
+                use_work_meta = is_fp8 and (
+                    self.dcp_world_size <= 1 or sparse_dcp_persistent
+                )
+                _, final_lse = mla_decode_fwd(
                     q,
                     kv_c_and_k_pe_cache.view(-1, page_size, 1, q.shape[-1]),
                     o,
@@ -1074,27 +2274,43 @@ class MLAAttention(nn.Module):
                     kv_last_page_lens,
                     max_q_len,
                     page_size=page_size,
+                    num_kv_splits=max(2, 16 // max(1, self.dcp_world_size)),
                     sm_scale=self.scale,
-                    q_scale=self._q_scale,
-                    kv_scale=self._k_scale,
-                    work_meta_data=getattr(
-                        attn_metadata, "sparse_prefill_work_meta_data", None
+                    q_scale=self._q_scale if is_fp8 else None,
+                    kv_scale=self._k_scale if is_fp8 else None,
+                    work_meta_data=(
+                        getattr(attn_metadata, "sparse_prefill_work_meta_data", None)
+                        if use_work_meta
+                        else None
                     ),
-                    work_indptr=getattr(
-                        attn_metadata, "sparse_prefill_work_indptr", None
+                    work_indptr=(
+                        getattr(attn_metadata, "sparse_prefill_work_indptr", None)
+                        if use_work_meta
+                        else None
                     ),
-                    work_info_set=getattr(
-                        attn_metadata, "sparse_prefill_work_info_set", None
+                    work_info_set=(
+                        getattr(attn_metadata, "sparse_prefill_work_info_set", None)
+                        if use_work_meta
+                        else None
                     ),
-                    reduce_indptr=getattr(
-                        attn_metadata, "sparse_prefill_reduce_indptr", None
+                    reduce_indptr=(
+                        getattr(attn_metadata, "sparse_prefill_reduce_indptr", None)
+                        if use_work_meta
+                        else None
                     ),
-                    reduce_final_map=getattr(
-                        attn_metadata, "sparse_prefill_reduce_final_map", None
+                    reduce_final_map=(
+                        getattr(attn_metadata, "sparse_prefill_reduce_final_map", None)
+                        if use_work_meta
+                        else None
                     ),
-                    reduce_partial_map=getattr(
-                        attn_metadata, "sparse_prefill_reduce_partial_map", None
+                    reduce_partial_map=(
+                        getattr(
+                            attn_metadata, "sparse_prefill_reduce_partial_map", None
+                        )
+                        if use_work_meta
+                        else None
                     ),
+                    return_lse=return_lse,
                 )
             else:
                 mla_prefill_fwd(
@@ -1111,7 +2327,42 @@ class MLAAttention(nn.Module):
                     None,
                 )
 
-        o = self._restore_query_heads(o, num_heads_q)
+        restore = (
+            self._restore_sparse_prefill_query_heads
+            if dcp_sparse
+            else self._restore_query_heads
+        )
+        o = restore(o, num_heads_q)
+        if final_lse is not None:
+            final_lse = restore(final_lse, num_heads_q)
+
+        if return_lse:
+            assert final_lse is not None, (
+                "return_lse requested but the attention kernel produced no LSE "
+                "(empty KV cache?)"
+            )
+            if self.is_sparse_mla and self.dcp_world_size > 1:
+                # One kernel for what torch spelled in five.
+                #
+                # `torch.where(torch.isfinite(lse).unsqueeze(-1), o, 0.0)` costs
+                # four launches to build the mask -- torch decomposes isfinite
+                # into abs/ne/eq/mul -- plus one to apply it. The mask is a few
+                # KB, so those four are pure launch overhead: 5.5 us each,
+                # 22.3 us per layer, measured.
+                #
+                # The fifth is the expensive one and the reason for the kernel:
+                # `where` reads and rewrites every byte of `o` even though a
+                # non-finite LSE is an edge case and nearly every row survives
+                # untouched. The Triton version returns before touching `o` for
+                # a finite row.
+                from atom.model_ops.dcp_ops import zero_nonfinite_rows
+
+                zero_nonfinite_rows(o, final_lse)
+            # These feed a cross-rank combine, not the bmm, so the head slice
+            # has to be materialised rather than left as a view. (Handing the
+            # view down instead was measured: same tokens, same copy cost --
+            # see `_restore_sparse_prefill_query_heads`.)
+            return o.contiguous(), final_lse.contiguous()
 
         return self._v_up_proj_and_o_proj(o)
 
@@ -1136,19 +2387,92 @@ class MLAAttention(nn.Module):
         # [num_token_slots, 1, d] -> [num_blocks, block_size, d] -> [.., 1, ..]
         return kv_cache.view(num_blocks, block_size, d).unsqueeze(1)
 
+    def _should_rebuild_sparse_dcp_persistent_metadata(
+        self, use_persistent_mode: bool
+    ) -> bool:
+        return (
+            use_persistent_mode
+            and self.is_sparse_mla
+            and self.dcp_world_size > 1
+            and self.owns_sparse_indexer
+        )
+
+    def _rebuild_sparse_dcp_persistent_metadata(
+        self,
+        attn_metadata: AttentionMetaData,
+        q: torch.Tensor,
+        kv_buffer: torch.Tensor,
+        paged_cu_seqlens_q: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_last_page_lens: torch.Tensor,
+        work_prefix: str = "",
+    ) -> None:
+        """Rebuild persistent work/reduce metadata from this layer's DCP top-k.
+
+        A full GLM IndexShare layer rewrites ``dcp_sparse_kv_indptr_buffer``
+        after selecting and compacting the rank-owned top-k. Persistent work
+        descriptors embed those region boundaries, so they must be rebuilt
+        after that mutation rather than once per decode step from the global
+        sparse indptr. Shared IndexShare layers reuse the preceding full layer's
+        indices, compact indptr, and work plan and therefore skip this call.
+        """
+        if not work_prefix:
+            assert attn_metadata.max_seqlen_q == 1, (
+                "The unprefixed sparse DCP work buffers describe a q_len=1 step; "
+                'an MTP verify step must pass work_prefix="sparse_mtp_".'
+            )
+        elif work_prefix == "sparse_mtp_":
+            assert attn_metadata.max_seqlen_q > 1, (
+                "sparse_mtp_ work buffers describe the per-token verify layout; "
+                "a q_len=1 step must use the unprefixed ones."
+            )
+        assert q.shape[1] == self.dcp_kernel_num_heads
+        get_mla_metadata_v1(
+            paged_cu_seqlens_q,
+            paged_kv_indptr,
+            paged_kv_last_page_lens,
+            self.dcp_kernel_num_heads,
+            1,  # nhead_kv
+            True,
+            getattr(attn_metadata, f"{work_prefix}work_meta_data"),
+            getattr(attn_metadata, f"{work_prefix}work_info_set"),
+            getattr(attn_metadata, f"{work_prefix}work_indptr"),
+            getattr(attn_metadata, f"{work_prefix}reduce_indptr"),
+            getattr(attn_metadata, f"{work_prefix}reduce_final_map"),
+            getattr(attn_metadata, f"{work_prefix}reduce_partial_map"),
+            page_size=1,
+            dtype_q=q.dtype,
+            dtype_kv=kv_buffer.dtype,
+            kv_granularity=16,
+            max_seqlen_qo=1,
+            uni_seqlen_qo=1,
+            fast_mode=1,
+            max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
+        )
+
     def _forward_decode(
         self,
         q: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: AttentionMetaData,
         return_lse: bool = False,
+        q_prepadded: bool = False,
     ) -> torch.Tensor:
+        # attn_metadata.causal is True for the target; False only for DSpark's
+        # bidirectional draft block (set by the proposer). The asm kernel picks
+        # a different .co by this flag, so the target must stay causal.
+        causal = attn_metadata.causal
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata is not None
         B = q.shape[0]
-        num_heads_q = q.shape[1]
 
-        q = self._pad_query_heads(q)
+        if q_prepadded:
+            # The fused q write already produced the padded width, so q.shape[1]
+            # is the kernel width and the real head count is this rank's own.
+            num_heads_q = self.num_heads
+        else:
+            num_heads_q = q.shape[1]
+            q = self._pad_decode_query_heads(q)
 
         # In the seg path q arrives with a padded per-head row stride
         # (_MLA_Q_OUT_PADDED_DIM); slice back to the logical
@@ -1240,21 +2564,47 @@ class MLAAttention(nn.Module):
                     # all-1s sparse buffer, NOT the dense per-block
                     # kv_last_page_lens (which makes the asm kernel over-read
                     # past the written sparse-index region -> illegal access).
-                    paged_kv_indptr = attn_metadata.sparse_kv_indptr
+                    paged_cu_seqlens_q = attn_metadata.cu_seqlens_q[: B + 1]
+                    paged_kv_indptr = attn_metadata.sparse_kv_indptr[: B + 1]
                     paged_kv_indices = self.sparse_kv_indices_buffer
-                    paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
+                    paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens[:B]
+                if self.dcp_world_size > 1:
+                    # The indexer compacted this layer's owned top-k, so the
+                    # real lengths are here, not in sparse_kv_indptr; `B` is a
+                    # token count on both branches.
+                    paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer[: B + 1]
 
             dp_size = get_dp_group().world_size
-            use_persistent_mode = not (dp_size > 1)
-            if envs.ATOM_MLA_PAGE_SIZE > 1:
-                use_persistent_mode = False
-            if self.dcp_world_size > 1 and not self.dcp_persistent_supported:
-                use_persistent_mode = False
+            use_persistent_mode = should_use_persistent_mode(
+                dp_size=dp_size,
+                dpa_persistent_supported=self._dpa_persistent_supported,
+                page_size=envs.ATOM_MLA_PAGE_SIZE,
+                dcp_world_size=self.dcp_world_size,
+                dcp_persistent_supported=self.dcp_persistent_supported,
+            )
+            # Sparse DCP persistent decode rebuilds the work plan below from
+            # the layer-local compact indptr; MTP verify is per-token q_len=1
+            # rows and rebuilds into the sparse_mtp_ buffers.
+            if self.is_sparse_mla and self.dcp_world_size > 1:
+                use_persistent_mode = (
+                    use_persistent_mode and self.sparse_dcp_metadata_rebuild
+                )
 
             # Sparse layers in MTP verify use separate persistent metadata
             # (per-token, max_seqlen_qo=1) while dense layers use normal metadata
             # (max_seqlen_qo=2).
             is_sparse_mtp = self.is_sparse_mla and attn_metadata.max_seqlen_q > 1
+
+            if self._should_rebuild_sparse_dcp_persistent_metadata(use_persistent_mode):
+                self._rebuild_sparse_dcp_persistent_metadata(
+                    attn_metadata,
+                    q,
+                    kv_buffer,
+                    paged_cu_seqlens_q,
+                    paged_kv_indptr,
+                    paged_kv_last_page_lens,
+                    work_prefix="sparse_mtp_" if is_sparse_mtp else "",
+                )
 
             if not use_persistent_mode:
                 work_meta_data = None
@@ -1295,11 +2645,13 @@ class MLAAttention(nn.Module):
             # the intra-block causal mask must be applied on GLOBAL positions
             # g(j)=j*W+r. Pass the cprr params (g_kv_indptr + cp world/rank) so the
             # kernel selects the cprr variant and masks correctly. qlen=1 keeps the
-            # plain path (single query sees all local KV -> no mask needed).
+            # plain path (single query sees all local KV -> no mask needed), and so
+            # does a non-causal block (DSpark drafts bidirectionally: every query
+            # legitimately sees every KV row, so there is no mask to place).
             cp_world_size = 1
             cp_rank = 0
             g_kv_indptr = None
-            if self.dcp_world_size > 1 and max_q_len > 1:
+            if self.dcp_world_size > 1 and max_q_len > 1 and causal:
                 cp_world_size = self.dcp_world_size
                 cp_rank = self.dcp_rank
                 g_kv_indptr = getattr(attn_metadata, "g_kv_indptr", None)
@@ -1335,14 +2687,16 @@ class MLAAttention(nn.Module):
                 g_kv_indptr=g_kv_indptr,
                 cp_world_size=cp_world_size,
                 cp_rank=cp_rank,
+                causal=causal,
             )
 
-        o = self._restore_query_heads(o, num_heads_q)
+        o = self._restore_decode_query_heads(o, num_heads_q)
         if final_lse is not None:
-            final_lse = self._restore_query_heads(final_lse, num_heads_q)
+            final_lse = self._restore_decode_query_heads(final_lse, num_heads_q)
 
         if return_lse:
-            return o, final_lse
+            # Bound for a cross-rank combine rather than the bmm: materialise.
+            return o.contiguous(), final_lse.contiguous()
 
         return self._v_up_proj_and_o_proj(o)
 
@@ -1386,13 +2740,107 @@ class MLAAttention(nn.Module):
                 scale=self._k_scale,
             )
 
+    # One diagnostic line per outcome per process, not per layer: see the log
+    # below. Two entries at most -- the first write necessarily takes the per-op
+    # path (it is what moves the rope cache to the device), so logging only the
+    # very first call would report a fusion that is in fact running.
+    _ctx_kv_fusion_logged: ClassVar[set[bool]] = set()
+
+    def write_context_kv_latent(
+        self,
+        kv_cache: torch.Tensor,
+        kv_lora: torch.Tensor,
+        positions: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_a_layernorm: nn.Module,
+    ) -> None:
+        """Norm + RoPE + store raw latent rows at an explicit slot_mapping.
+
+        A drafter that writes target-derived CONTEXT rows into its own paged
+        cache (Kimi-K3 DSpark's ``write_context_kv``) has no query and no
+        attn_metadata for those rows, so it cannot reach the cache through
+        ``forward_impl``; it holds the raw ``kv_lora`` and the slots itself.
+        This lives here rather than in the model so that every cache layout
+        stays behind one door, as ``_pcp_write_full_kv`` already is.
+
+        ``kv_lora`` is ``[N, kv_lora_rank + qk_rope_head_dim]`` straight off the
+        projection -- normally the strided ``[..., q_lora_rank:]`` half of a
+        fused q/kv projection, which both paths below read without copying.
+        """
+        use_fused = self._ctx_kv_fusion_enabled and (
+            # A plain [num_blocks, block_size, entry] cache (a per-token cache
+            # is that with block_size 1). The empty pre-allocation every layer
+            # holds before allocate_kv_cache fails here too, so a premature
+            # write still aborts in the per-op kernels rather than scribbling.
+            kv_cache.dim() == 3
+            and kv_cache.shape[-1] == self.kv_lora_rank + self.qk_rope_head_dim
+            and kv_cache.stride(-1) == 1
+            and kv_lora.dim() == 2
+            and kv_lora.stride(-1) == 1
+            # get_rope leaves cos/sin on the host until its first forward, which
+            # also casts them to the activation dtype. Until that has happened
+            # the kernel cannot read them (and would read fp32 where the per-op
+            # path reads bf16), so the first write of a layer takes the per-op
+            # path and moves them; every later one fuses.
+            and self.rotary_emb.cos_cache.device == kv_cache.device
+            # The fused kernel inlines ATOM RMSNorm's math; a Gemma-style norm
+            # (x * (1 + w)) or any other flavour must keep calling its module.
+            and isinstance(kv_a_layernorm, RMSNorm)
+        )
+        # Every rejection above is silent and per call, so a layout the kernel
+        # does not recognise would otherwise leave the fusion inert with nothing
+        # in the log to say so. One line, first write of the process.
+        if use_fused not in MLAAttention._ctx_kv_fusion_logged:
+            MLAAttention._ctx_kv_fusion_logged.add(use_fused)
+            logger.info(
+                "MLA context-row KV write: %s (ATOM_DSPARK_FUSED_CTX_KV=%d, "
+                "cache %s %s, kv_lora %s)",
+                "FUSED" if use_fused else "per-op",
+                int(envs.ATOM_DSPARK_FUSED_CTX_KV),
+                tuple(kv_cache.shape),
+                kv_cache.dtype,
+                tuple(kv_lora.shape),
+            )
+        if use_fused:
+            fused_mla_ctx_norm_rope_cache(
+                kv_lora,
+                kv_a_layernorm.weight,
+                positions,
+                self.rotary_emb.cos_cache,
+                self.rotary_emb.sin_cache,
+                slot_mapping.flatten(),
+                kv_cache,
+                self._k_scale_device,
+                kv_a_layernorm.eps,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+                self.rotary_emb.is_neox_style,
+                # An "auto" cache is a straight copy in aiter's kAuto branch and
+                # ignores _k_scale entirely; only fp8 dequant-scales the store.
+                self.kv_cache_dtype.startswith("fp8"),
+            )
+            return
+
+        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv_c = kv_a_layernorm(kv_c)
+        # RoPE the positional lane only -- there is no query on the context
+        # path. The rope kernel is 2-component (rotates query AND key, in place
+        # on the rotary_dim views) and the YaRN variant
+        # (DeepseekScalingRotaryEmbedding) declares `key` as a REQUIRED
+        # positional, unlike the base class whose `forward_native` takes it as
+        # optional. So pass a throwaway for the query side, exactly as
+        # deepseek_v2 does for its own k-only rope under PCP.
+        k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
+        _, k_pe = self.rotary_emb(positions, torch.empty_like(k_pe), k_pe)
+        self._pcp_write_full_kv(kv_cache, kv_c, k_pe, slot_mapping)
+
     def forward_impl(
         self,
         q: torch.Tensor,
         k_nope: torch.Tensor,
         k_rope: torch.Tensor,
         positions: torch.Tensor = None,
-        q_scale: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # kv_cache = self.kv_cache
         forward_context: ForwardContext = get_forward_context()
@@ -1414,7 +2862,11 @@ class MLAAttention(nn.Module):
         kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
 
         if context.is_prefill and not use_prefill_mla:
-            prefill_q = self.q_proj(q, x_scale=q_scale).view(
+            # QREP: q_proj emits the whole DCP-group head set, but prefill needs
+            # only this rank's heads (QREP optimizes decode's AllGather Q, not
+            # prefill).
+            proj = self._local_q_proj() if self.qrep_enabled else self.q_proj
+            prefill_q = proj(q, x_scale=q_scale).view(
                 -1, self.num_heads, self.qk_head_dim
             )
             prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
@@ -1476,7 +2928,17 @@ class MLAAttention(nn.Module):
                     prefill_q, k_nope, k_rope, kv_cache, attn_metadata
                 )
         else:
-            q_nope, q_rope = self._q_proj_and_k_up_proj(q, x_scale=q_scale)
+            # DCP Query Replication (QREP): decode produces the full group-head
+            # query locally so it can skip the AllGather Q below. Correctness holds
+            # even when use_qrep is False (group=False slices back to per-rank heads
+            # and the AG path runs as before); use_qrep only toggles the optimization.
+            # Excludes prefill and the seg path (seg alloc is per-rank sized).
+            use_qrep = (
+                self.qrep_enabled and not context.is_prefill and not self.use_seg_mla
+            )
+            q_nope, q_rope = self._q_proj_and_k_up_proj(
+                q, x_scale=q_scale, group=use_qrep
+            )
 
             # ---- Prefill Context Parallel --------------------------------
             # q is this rank's 1/pcp queries, so q_out is naturally 1/pcp. But
@@ -1516,16 +2978,36 @@ class MLAAttention(nn.Module):
                     dtype=attn_metadata.dtype_q,
                     device=q_nope.device,
                 )
-            else:
-                q_out = torch.empty(
+            elif self._fused_q_head_pad:
+                # Allocate at the width the MLA kernels dispatch on, zeroed so
+                # the dead lanes match what F.pad used to produce, and let the
+                # fused write below fill the real-head slice in place. `q_out`
+                # therefore reaches attention already padded.
+                q_out = torch.zeros(
                     (
                         q_nope.shape[0],
-                        self.num_heads,
+                        self.padded_num_heads,
                         self.kv_lora_rank + self.qk_rope_head_dim,
                     ),
                     dtype=attn_metadata.dtype_q,
                     device=q_nope.device,
                 )
+            else:
+                q_out = torch.empty(
+                    (
+                        q_nope.shape[0],
+                        self.qrep_num_heads if use_qrep else self.num_heads,
+                        self.kv_lora_rank + self.qk_rope_head_dim,
+                    ),
+                    dtype=attn_metadata.dtype_q,
+                    device=q_nope.device,
+                )
+            # What the fused writer fills: the real heads only. Under
+            # `_fused_q_head_pad` that is a slice of the padded buffer above,
+            # reached through the kernel's runtime q_out strides.
+            q_out_write = (
+                q_out[:, : self.num_heads] if self._fused_q_head_pad else q_out
+            )
             if kv_cache.numel() > 0:
                 if (
                     envs.ATOM_USE_TRITON_MLA
@@ -1582,7 +3064,7 @@ class MLAAttention(nn.Module):
                             -1,
                             self.kv_lora_rank + self.qk_rope_head_dim,
                         ),
-                        q_out,
+                        q_out_write,
                         write_slot_mapping,
                         self._k_scale,
                         self._q_scale,
@@ -1612,20 +3094,24 @@ class MLAAttention(nn.Module):
                     )
 
             if context.is_prefill:
-                output = self._forward_prefill_mla(q_out, kv_cache, attn_metadata)
+                if self.is_sparse_mla and self.dcp_world_size > 1:
+                    output = self._dcp_sparse_prefill(q_out, kv_cache, attn_metadata)
+                else:
+                    output = self._forward_prefill_mla(
+                        q_out,
+                        kv_cache,
+                        attn_metadata,
+                        q_prepadded=self._fused_q_head_pad,
+                    )
             elif self.dcp_world_size > 1:
-                # DCP decode: AllGather Q on the head dim, decode locally with LSE,
-                # then combine partial outputs across ranks (AG LSE + correct + RS).
-                q_out = self.dcp_group.all_gather(q_out, dim=1)
-                o, lse = self._forward_decode(
-                    q_out, kv_cache, attn_metadata, return_lse=True
-                )
-                from atom.model_ops.dcp_ops import cp_lse_ag_out_rs
-
-                o = cp_lse_ag_out_rs(o, lse, self.dcp_group, ctx=self._cp_triton_ctx)
-                output = self._v_up_proj_and_o_proj(o)
+                output = self._dcp_decode(q_out, kv_cache, attn_metadata, use_qrep)
             else:
-                output = self._forward_decode(q_out, kv_cache, attn_metadata)
+                output = self._forward_decode(
+                    q_out,
+                    kv_cache,
+                    attn_metadata,
+                    q_prepadded=self._fused_q_head_pad,
+                )
 
         return output
 
@@ -1637,7 +3123,7 @@ class MLAAttention(nn.Module):
         kv_cache: torch.Tensor = None,
         attn_metadata=None,
         positions: torch.Tensor = None,
-        q_scale: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
         output: torch.Tensor = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -1660,6 +3146,9 @@ def _convert_req_index_to_global_index_kernel(
     out_kv_indices,  # int32
     # shapes (compile-time where possible)
     NUM_TOPK_TOKENS: tl.constexpr,
+    OUT_NUMEL: tl.constexpr,
+    TOKEN_ROWS: tl.constexpr,
+    KV_INDICES_NUMEL: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tile width along columns
     # strides (in elements)
@@ -1678,6 +3167,9 @@ def _convert_req_index_to_global_index_kernel(
     kv_start = tl.load(kv_indptr + batch_id)
     kv_end = tl.load(kv_indptr + batch_id + 1)
     out_kv_start = tl.load(page_kv_indptr + batch_id)
+    # This request OWNS only [out_kv_start, out_kv_end); the output is packed
+    # by page_kv_indptr, so anything past it belongs to request batch_id + 1.
+    out_kv_end = tl.load(page_kv_indptr + batch_id + 1)
     kv_len = kv_end - kv_start
     qo_start = tl.load(qo_indptr + batch_id)
     qo_end = tl.load(qo_indptr + batch_id + 1)
@@ -1685,20 +3177,47 @@ def _convert_req_index_to_global_index_kernel(
     for token_id in range(qo_start, qo_end):
         # Load token indices for this tile
         ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
-        tok = tl.load(ti_ptr)  # int32
+        valid_token_row = (token_id >= 0) & (token_id < TOKEN_ROWS)
+        tok = tl.load(ti_ptr, mask=valid_token_row, other=-1)  # int32
 
         # Split masks: store_mask = column-valid, load_mask adds tok-bound
         # guard to prevent OOB GPU fault (masked load yields 0 = valid page).
-        store_mask = (indice_id < kv_len) & (indice_id < NUM_TOPK_TOKENS)
-        load_mask = store_mask & (tok >= 0) & (tok < kv_len)
+        valid_col_mask = (indice_id < kv_len) & (indice_id < NUM_TOPK_TOKENS)
+        kv_offset = kv_start + tok
+        load_mask = (
+            valid_token_row
+            & valid_col_mask
+            & (tok >= 0)
+            & (tok < kv_len)
+            & (kv_offset >= 0)
+            & (kv_offset < KV_INDICES_NUMEL)
+        )
         out_val = tl.load(
-            kv_indices + kv_start + tok,
+            kv_indices + kv_offset,
             mask=load_mask,
             other=0,
         )
+        out_val = tl.where(out_val >= 0, out_val, 0)
 
         # Store results
-        out_ptr_ij = out_kv_indices + out_kv_start + indice_id
+        out_offset = out_kv_start + indice_id
+        # `valid_col_mask` bounds the column by kv_len, which counts entries on
+        # the INPUT side; it is not the width of this request's output region.
+        # A pooled selection makes the two diverge -- the row is padded out to
+        # `round_up(index_topk + kpool - 1, 128)` columns while the region holds
+        # at most `index_topk + kpool - 1` -- and a long context makes kv_len
+        # exceed both, so every column stores. The surplus columns are the top-k
+        # padding, -1, which `tl.where(out_val >= 0, ...)` turns into cache slot
+        # 0 and writes over the START of request batch_id + 1. OUT_NUMEL only
+        # catches the final request, so the corruption is silent for the rest.
+        store_mask = (
+            valid_token_row
+            & valid_col_mask
+            & (out_offset >= 0)
+            & (out_offset < out_kv_end)
+            & (out_offset < OUT_NUMEL)
+        )
+        out_ptr_ij = out_kv_indices + out_offset
         tl.store(
             out_ptr_ij,
             out_val,
@@ -1715,7 +3234,7 @@ def triton_convert_req_index_to_global_index(
     BLOCK_SIZE: int = 1,  # page_block_size = 1 for now
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 128,  # tile width along columns
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ):
     """
     out[token_id, indice_id] =
@@ -1723,9 +3242,8 @@ def triton_convert_req_index_to_global_index(
             token_indices[token_id, indice_id] // BLOCK_SIZE] * BLOCK_SIZE
         + token_indices[token_id, indice_id] % BLOCK_SIZE
 
-    Only when token_indices[token_id, indice_id] == -1 do we output -1.
-    For safety, we also output -1 if the derived block_id would be
-        out-of-bounds.
+    Invalid metadata is mapped to cache slot 0 so it cannot become a negative
+    or out-of-range address in the downstream assembly MLA kernel.
     """
     assert kv_indices.dtype == torch.int32
     assert token_indices.dtype == torch.int32
@@ -1735,20 +3253,31 @@ def triton_convert_req_index_to_global_index(
         f"BLOCK_N ({BLOCK_N})"
     )
 
-    num_batch = kv_indptr.shape[0] - 1
+    # DP attention can expose transient local/global metadata length skew.
+    # Launch only rows represented by every indptr; otherwise the kernel reads
+    # qo/page indptr one row past its allocation before payload guards apply.
+    num_batch = min(
+        qo_indptr.shape[0] - 1,
+        kv_indptr.shape[0] - 1,
+        page_kv_indptr.shape[0] - 1,
+    )
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
     # Ensure contiguous tensors on the same device
-    qo_indptr_c = qo_indptr.contiguous()
-    kv_indptr_c = kv_indptr.contiguous()
+    qo_indptr_c = qo_indptr[: num_batch + 1].contiguous()
+    kv_indptr_c = kv_indptr[: num_batch + 1].contiguous()
     kv_indices_c = kv_indices.contiguous()
     token_indices_c = token_indices.contiguous()
-    page_kv_indptr_c = page_kv_indptr.contiguous()
-    # NOTE: MTP (max_seqlen_q > 1) uses triton_convert_req_index_to_global_index_dsa_prefill instead
-    if out is not None:
-        new_kv_indices = out[: kv_indices.shape[0]]
-    else:
-        new_kv_indices = torch.empty_like(kv_indices)
+    page_kv_indptr_c = page_kv_indptr[: num_batch + 1].contiguous()
+    # Sparse output is packed by page_kv_indptr.  Its workspace upper bound is
+    # rows * topk, not the dense kv_indices length.
+    total_out = num_batch * NUM_TOPK_TOKENS
+    new_kv_indices = _sparse_index_workspace(
+        out,
+        total_out,
+        device=token_indices.device,
+        name="triton_convert_req_index_to_global_index",
+    )
 
     # Strides in elements
     ti_stride0, ti_stride1 = token_indices_c.stride()
@@ -1765,6 +3294,9 @@ def triton_convert_req_index_to_global_index(
         new_kv_indices,
         # shapes / constexprs
         NUM_TOPK_TOKENS,
+        new_kv_indices.numel(),
+        token_indices_c.shape[0],
+        kv_indices_c.numel(),
         BLOCK_SIZE,
         BLOCK_N,
         # strides
@@ -1778,15 +3310,21 @@ def triton_convert_req_index_to_global_index(
 def _convert_req_index_to_global_index_dsa_prefill_kernel(
     dsa_qo_indptr,  # int32 [num_tokens + 1]
     dsa_kv_indptr,  # int32 [num_tokens + 1]
-    token_to_seq_idxs,  # int32 [num_tokens]
+    batch_id_per_q_token,  # int32 [num_tokens]
     topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS]
     block_table,  # int32 [num_req, max_num_blocks_per_req]
     cu_seqlens_q,  # int32 [num_tokens + 1]
     out_kv_indices,  # int32
     # shapes (compile-time where possible)
     NUM_TOPK_TOKENS: tl.constexpr,
+    OUT_NUMEL: tl.constexpr,
+    NUM_REQ: tl.constexpr,
+    MAX_NUM_BLOCKS_PER_REQ: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tile width along columns
+    # The FP8 indexer scores one concatenated KV plane, so a request's own
+    # position is `indice - cu_seqlens_q[req]`; the paged FP4 scorer emits it.
+    SEQ_LOCAL: tl.constexpr,
     # strides (in elements)
     ti_stride0: tl.int64,  # topk_indices stride 0
     ti_stride1: tl.constexpr,  # topk_indices stride 1
@@ -1798,7 +3336,8 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
 
     col_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    req_id = tl.load(token_to_seq_idxs + token_id)  # int32
+    req_id = tl.load(batch_id_per_q_token + token_id)  # int32
+    valid_req = (req_id >= 0) & (req_id < NUM_REQ)
 
     kv_start = tl.load(dsa_kv_indptr + token_id)
     kv_end = tl.load(dsa_kv_indptr + token_id + 1)
@@ -1808,24 +3347,41 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     indice = tl.load(
         topk_indices + token_id * ti_stride0 + col_id * ti_stride1
     )  # int32
-    pre_seqlens_q = tl.load(cu_seqlens_q + req_id)
+    pre_seqlens_q = tl.load(cu_seqlens_q + req_id, mask=valid_req, other=0)
+    req_kv_end = tl.load(cu_seqlens_q + req_id + 1, mask=valid_req, other=0)
+    req_kv_len = req_kv_end - pre_seqlens_q
 
-    seq_token_idx = indice - pre_seqlens_q
+    seq_token_idx = indice if SEQ_LOCAL else indice - pre_seqlens_q
     block_id = seq_token_idx // PAGE_SIZE
     inblock_offset = seq_token_idx % PAGE_SIZE
 
     # Guard block_table access
-    store_mask = (col_id < kv_len) & (col_id < NUM_TOPK_TOKENS)
-    valid_mask = store_mask & (indice >= 0)
+    out_offset = kv_start + col_id
+    store_mask = (
+        (col_id < kv_len)
+        & (col_id < NUM_TOPK_TOKENS)
+        & (out_offset >= 0)
+        & (out_offset < OUT_NUMEL)
+    )
+    valid_mask = (
+        valid_req
+        & store_mask
+        & (indice >= 0)
+        & (seq_token_idx >= 0)
+        & (seq_token_idx < req_kv_len)
+        & (block_id >= 0)
+        & (block_id < MAX_NUM_BLOCKS_PER_REQ)
+    )
     physical_block = tl.load(
         block_table + req_id * bt_stride0 + block_id * bt_stride1,
         mask=valid_mask,
         other=-1,
     )
-    out_val = tl.where(valid_mask, physical_block * PAGE_SIZE + inblock_offset, -1)
+    physical_valid = valid_mask & (physical_block >= 0)
+    out_val = tl.where(physical_valid, physical_block * PAGE_SIZE + inblock_offset, 0)
 
     # Store results
-    out_ptr_ij = out_kv_indices + kv_start + col_id
+    out_ptr_ij = out_kv_indices + out_offset
     tl.store(
         out_ptr_ij,
         out_val,
@@ -1836,7 +3392,7 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
 def triton_convert_req_index_to_global_index_dsa_prefill(
     dsa_qo_indptr: torch.Tensor,  # int32 [num_tokens + 1]
     dsa_kv_indptr: torch.Tensor,  # int32 [num_tokens + 1]
-    token_to_seq_idxs: torch.Tensor,  # int32 [num_tokens]
+    batch_id_per_q_token: torch.Tensor,  # int32 [num_tokens]
     topk_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]
     block_table: torch.Tensor,  # int32 [num_req, max_num_blocks_per_req]
     cu_seqlens_q: torch.Tensor,  # int32 [num_tokens + 1]
@@ -1844,7 +3400,8 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
     PAGE_SIZE: int = 1,
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 1024,  # tile width along columns
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
+    seq_local: bool = False,
 ):
 
     assert topk_indices.shape[1] == NUM_TOPK_TOKENS
@@ -1853,16 +3410,27 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
         f"BLOCK_N ({BLOCK_N})"
     )
 
-    num_tokens = dsa_qo_indptr.shape[0] - 1
+    num_tokens = min(
+        dsa_qo_indptr.shape[0] - 1,
+        dsa_kv_indptr.shape[0] - 1,
+        batch_id_per_q_token.shape[0],
+        topk_indices.shape[0],
+    )
+    dsa_qo_indptr = dsa_qo_indptr[: num_tokens + 1]
+    dsa_kv_indptr = dsa_kv_indptr[: num_tokens + 1]
+    batch_id_per_q_token = batch_id_per_q_token[:num_tokens]
+    topk_indices = topk_indices[:num_tokens]
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
     total_out = num_tokens * NUM_TOPK_TOKENS
-    if out is not None:
-        new_kv_indices = out[:total_out]
-    else:
-        new_kv_indices = torch.empty(
-            total_out, dtype=torch.int32, device=topk_indices.device
-        )
+    new_kv_indices = _sparse_index_workspace(
+        out,
+        total_out,
+        device=topk_indices.device,
+        name="triton_convert_req_index_to_global_index_dsa_prefill",
+    )
+    num_req = min(block_table.shape[0], cu_seqlens_q.shape[0] - 1)
+    max_num_blocks_per_req = block_table.shape[1]
 
     # Strides in elements
     ti_stride0, ti_stride1 = topk_indices.stride()
@@ -1873,15 +3441,19 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
     _convert_req_index_to_global_index_dsa_prefill_kernel[grid](
         dsa_qo_indptr,
         dsa_kv_indptr,
-        token_to_seq_idxs,
+        batch_id_per_q_token,
         topk_indices,
         block_table,
         cu_seqlens_q,
         new_kv_indices,
         # shapes / constexprs
         NUM_TOPK_TOKENS,
+        new_kv_indices.numel(),
+        num_req,
+        max_num_blocks_per_req,
         PAGE_SIZE,
         BLOCK_N,
+        seq_local,
         # strides
         ti_stride0,
         ti_stride1,
@@ -1894,7 +3466,7 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
 @triton.jit
 def _gather_kv_indices_sparse_kernel(
     sparse_kv_indptr,
-    token_to_seq_idxs,
+    batch_id_per_q_token,
     topk_indices,
     kv_indices,
     kv_indptr,
@@ -1908,7 +3480,13 @@ def _gather_kv_indices_sparse_kernel(
     tile_id = tl.program_id(1)
     col_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    req_id = tl.load(token_to_seq_idxs + token_id)
+    # `-1` marks a CUDAGraph pad token (see token_layout/batch_ids.py). Its row
+    # must be inert, and both halves of that matter: the `kv_indptr` loads would
+    # read one entry BEFORE the buffer, and the gather below would index
+    # `block_table` at row -1 for any pad row whose topk slot still holds a
+    # stale non-negative id.
+    req_id = tl.load(batch_id_per_q_token + token_id)
+    valid_req = req_id >= 0
 
     out_start = tl.load(sparse_kv_indptr + token_id)
     out_end = tl.load(sparse_kv_indptr + token_id + 1)
@@ -1916,12 +3494,12 @@ def _gather_kv_indices_sparse_kernel(
 
     pos = tl.load(topk_indices + token_id * ti_stride0 + col_id * ti_stride1)
 
-    kv_base = tl.load(kv_indptr + req_id)
-    kv_end = tl.load(kv_indptr + req_id + 1)
+    kv_base = tl.load(kv_indptr + req_id, mask=valid_req, other=0)
+    kv_end = tl.load(kv_indptr + req_id + 1, mask=valid_req, other=0)
     req_kv_len = kv_end - kv_base
 
     store_mask = (col_id < kv_len) & (col_id < NUM_TOPK_TOKENS)
-    valid_mask = store_mask & (pos >= 0) & (pos < req_kv_len)
+    valid_mask = store_mask & valid_req & (pos >= 0) & (pos < req_kv_len)
 
     out_val = tl.load(
         kv_indices + kv_base + pos,
@@ -1938,13 +3516,13 @@ def _gather_kv_indices_sparse_kernel(
 
 def triton_gather_kv_indices_sparse(
     sparse_kv_indptr: torch.Tensor,
-    token_to_seq_idxs: torch.Tensor,
+    batch_id_per_q_token: torch.Tensor,
     topk_indices: torch.Tensor,
     kv_indices: torch.Tensor,
     kv_indptr: torch.Tensor,
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 1024,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ):
     assert topk_indices.shape[1] == NUM_TOPK_TOKENS
     assert NUM_TOPK_TOKENS % BLOCK_N == 0
@@ -1954,27 +3532,29 @@ def triton_gather_kv_indices_sparse(
     # per-token inputs aligned to the actual valid intersection before launch;
     # otherwise the kernel may read past topk_indices.
     num_tokens = min(
-        token_to_seq_idxs.shape[0],
+        batch_id_per_q_token.shape[0],
         topk_indices.shape[0],
         sparse_kv_indptr.shape[0] - 1,
     )
     sparse_kv_indptr = sparse_kv_indptr[: num_tokens + 1]
-    token_to_seq_idxs = token_to_seq_idxs[:num_tokens]
+    batch_id_per_q_token = batch_id_per_q_token[:num_tokens]
     topk_indices = topk_indices[:num_tokens]
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
     total_out = num_tokens * NUM_TOPK_TOKENS
-    if out is not None:
-        out_buf = out[:total_out]
-    else:
-        out_buf = torch.empty(total_out, dtype=torch.int32, device=topk_indices.device)
+    out_buf = _sparse_index_workspace(
+        out,
+        total_out,
+        device=topk_indices.device,
+        name="triton_gather_kv_indices_sparse",
+    )
 
     ti_stride0, ti_stride1 = topk_indices.stride()
     grid = (num_tokens, tiles_per_row)
 
     _gather_kv_indices_sparse_kernel[grid](
         sparse_kv_indptr,
-        token_to_seq_idxs,
+        batch_id_per_q_token,
         topk_indices,
         kv_indices,
         kv_indptr,

@@ -21,43 +21,133 @@ from typing import Any, ClassVar
 
 from .qwen3_tool_parser import QWEN_TOOL_PREFIX
 from .schema import build_param_types, coerce_json_or_raw
-from .tool_parser import BufferedMarkerParser, ToolCall, unique_tool_call_id
+from .tool_parser import (
+    RegionParse,
+    ToolCall,
+    ToolCallParser,
+    continues_a_call,
+    declared_tools_allow,
+    unique_tool_call_id,
+    usable_tool_name,
+)
 
-_TOOLCALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>|<tool_call>(.*)$", re.DOTALL)
+TOOL_CALL_OPEN = "<tool_call>"
+# A call's body may not contain another `<tool_call>`. Without that the
+# non-greedy match ran from the *first* opener in the region to the first
+# close, so an answer that quotes the tag and then makes a real call produced
+# a "name" of the whole sentence -- rejected by `usable_tool_name`, after which
+# `finditer` resumed past the real call and found nothing at all. The tag is
+# what this format opens a call with, so it cannot appear inside one.
+_NOT_NESTED = r"(?:(?!<tool_call>).)"
+_TOOLCALL_RE = re.compile(
+    r"<tool_call>("
+    + _NOT_NESTED
+    + r"*?)</tool_call>|<tool_call>("
+    + _NOT_NESTED
+    + r"*)",
+    re.DOTALL,
+)
+# No `$` on the unclosed alternative. An unclosed call ends where the next one
+# opens, not only at end of stream: with the anchor, a call the model forgot
+# to close followed by a second call matched neither alternative at the first
+# opener, so `finditer` skipped the first call entirely and returned the
+# second -- one call where the model made two, and a different one from the
+# one the early name had already announced.
+# This format needs the name test more than the others do: without it the
+# unterminated branch above turns any prose after a `<tool_call>` into a call
+# -- an answer explaining that "the model writes <tool_call> followed by the
+# name" produced a call named " followed by the name. Hope that helps!", and a
+# Hermes-style `<tool_call>{"name": ...}` produced one named after the whole
+# JSON object. Both reached clients as `tool_calls`. It is `usable_tool_name`
+# now, shared: the same question was being answered six ways, and three
+# formats were not asking it at all.
+_ARG_OPENER = "<arg_key>"
 _ARG_RE = re.compile(
     r"<arg_key>(.*?)</arg_key>\s*<arg_value>"
-    r"(.*?)(?:</arg_value>|(?=<arg_key>)|(?=</tool_call>)|$)",
+    r"(.*?)(?:</arg_value>|(?=<arg_key>)|(?=</tool_call>)|\Z)",
     re.DOTALL,
 )
 
 
-class GlmParser(BufferedMarkerParser):
+class GlmParser(ToolCallParser):
     NAME: ClassVar[str] = "glm"
     START_MARKERS: ClassVar[tuple[str, ...]] = ("<tool_call>",)
+    # The call's own closer, and there is no wrapper around it, so
+    # `CALL_CLOSERS` stays empty. Blank here because the two coincide answered
+    # "is there an inner block" with the tuple that says "what ends a call",
+    # and left this the one format whose region could never be seen to close.
+    CALL_SELF_CLOSERS: ClassVar[tuple[str, ...]] = ("</tool_call>",)
+
+    @classmethod
+    def render_call(cls, name: str, args: dict[str, str]) -> str:
+        body = "".join(
+            f"<arg_key>{k}</arg_key><arg_value>{v}</arg_value>" for k, v in args.items()
+        )
+        return f"<tool_call>{name}{body}</tool_call>"
 
     @classmethod
     def detect(cls, text: str) -> bool:
         """Detect the GLM ``<tool_call>...<arg_key>`` format (never Qwen/DSML)."""
         if QWEN_TOOL_PREFIX in text:  # '<function=' -> Qwen, not GLM
             return False
-        return "<arg_key>" in text or "<tool_call>" in text
+        # `<arg_key>` and not a bare `<tool_call>`: this runs on a rendered
+        # chat template, where a Hermes-JSON model shows the same tag and has
+        # no `<arg_key>` anywhere. Accepting the tag alone bound every such
+        # model to this parser for the process lifetime and logged it as a
+        # success -- /mnt/Qwen3-8B resolved to `glm` while /data/Qwen3.5-27B
+        # resolved to `qwen`, two members of one family disagreeing.
+        return "<arg_key>" in text
 
     @classmethod
-    def parse(cls, text: str, tools: list | None) -> tuple[str, list[ToolCall]]:
-        """Parse GLM tool calls; return (leading_content, tool_calls)."""
+    def parse_region(
+        cls, region: str, tools: list | None, *, at_end: bool
+    ) -> RegionParse:
         param_types = build_param_types(tools)
-        start = text.find("<tool_call>")
-        if start == -1:
-            return text.strip(), []
-        content = text[:start]
         tool_calls: list[ToolCall] = []
-        for m in _TOOLCALL_RE.finditer(text):
-            body = m.group(1) if m.group(1) is not None else m.group(2)
+        spans: list[tuple[int, int]] = []
+        for m in _TOOLCALL_RE.finditer(region):
+            closed = m.group(1) is not None
+            body = m.group(1) if closed else m.group(2)
             if not body:
                 continue
             ak = body.find("<arg_key>")
-            name = (body if ak == -1 else body[:ak]).strip()
-            if not name:
+            # The argument opener having arrived *is* the follower evidence,
+            # and it is consumed into the name/body split rather than left in
+            # `rest` -- so an empty `rest` here means "the follower came and
+            # went", not "nothing came". Reading the two the same way made a
+            # call whose arguments were still arriving unnameable, which is
+            # the one shape announcing early exists for.
+            arg_key_arrived = ak != -1
+            if closed or arg_key_arrived:
+                name, rest = body[:ak].strip() if ak != -1 else body.strip(), ""
+            else:
+                # Unclosed and no complete `<arg_key>` yet. The name runs to
+                # the first `<`, and whatever follows is the test below.
+                #
+                # Cut on the character and not on `len(name)`: the name is
+                # stripped, so a single newline after `<tool_call>` shifted
+                # that slice by one and left the name's own last character in
+                # `rest`. A `read_file` call truncated after a leading newline
+                # failed the test and was shipped to the user as raw markup.
+                lt = body.find("<")
+                name = (body if lt == -1 else body[:lt]).strip()
+                rest = "" if lt == -1 else body[lt:]
+            if not usable_tool_name(name):
+                continue
+            # See `QwenXmlParser._is_truncated_call`: an unclosed region is a
+            # cut-off call or prose quoting the tag, and prose has to fail
+            # both tests -- a declared name, and nothing after it but this
+            # format's own next token. `<tool_call>get_weather<br>` fails the
+            # second; a call cut off inside its own `<arg_key>` passes it, and
+            # used to be rejected along with the prose.
+            if not closed and not (
+                declared_tools_allow(name, param_types)
+                and (
+                    arg_key_arrived
+                    or (not rest and at_end)
+                    or continues_a_call(rest, (_ARG_OPENER,), arrived=not at_end)
+                )
+            ):
                 continue
             types = param_types.get(name, {})
             args: dict[str, Any] = {}
@@ -65,6 +155,7 @@ class GlmParser(BufferedMarkerParser):
                 k = pm.group(1).strip()
                 if k:
                     args[k] = coerce_json_or_raw(pm.group(2), types.get(k))
+            spans.append((m.start(), cls.markup_end(region, m.end())))
             tool_calls.append(
                 ToolCall(
                     id=unique_tool_call_id(),
@@ -75,4 +166,4 @@ class GlmParser(BufferedMarkerParser):
                     },
                 )
             )
-        return content.strip(), tool_calls
+        return RegionParse(tuple(tool_calls), tuple(spans))

@@ -17,6 +17,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from atom.model_ops.v4_kernels.compress_plan import (
     CompressPlan,
     make_compress_plans,
+    plan_context_lens,
 )
 from atom.model_ops.v4_kernels.csa_translate_pack import (
     csa_translate_pack,
@@ -35,6 +36,8 @@ from atom.model_ops.v4_kernels.paged_decode import (
     sparse_attn_v4_paged_decode_reference,
 )
 from atom.model_ops.v4_kernels.paged_decode_indices import (
+    build_v4_paged_decode_indptr,
+    build_v4_paged_decode_indptr_reference,
     hca_compress_paged_offsets,
     write_v4_paged_decode_indices,
     write_v4_paged_decode_indices_reference,
@@ -64,6 +67,8 @@ __all__ = [
     "FP4_MQA_PARALLEL_UNIT_NUM",
     "CompressPlan",
     "QKNormRopeOut",
+    "build_v4_paged_decode_indptr",
+    "build_v4_paged_decode_indptr_reference",
     "csa_translate_pack",
     "csa_translate_pack_reference",
     "fp4_indexer_enabled",
@@ -72,6 +77,7 @@ __all__ = [
     "hca_compress_paged_offsets",
     "inverse_rope_inplace",
     "make_compress_plans",
+    "plan_context_lens",
     "qk_norm_rope_maybe_quant",
     "qk_norm_rope_maybe_quant_fp8_2buff",
     "qk_norm_rope_maybe_quant_reference",
@@ -91,13 +97,23 @@ __all__ = [
 
 logger = logging.getLogger("atom")
 
-# FP4 indexer persistent-grid schedule params, shared by the decode
-# (`pa_mqa_logits_fp4`) and prefill (`pa_mqa_logits_fp4_prefill`) kernels.
+# FP4 indexer persistent-grid schedule params for the `pa_mqa_logits_fp4_prefill`
+# kernels, which decode and prefill both score through.
 # The attention metadata builder precomputes each path's cta_info with these
 # and the scorer passes the matching block_k, so layout and grid agree. They
 # live here (rather than in either caller) because both the builder and the
-# model-side scorer must use the SAME values. Mirrors the kernel defaults.
-FP4_MQA_PARALLEL_UNIT_NUM = 512
+# model-side scorer must use the SAME values.
+#
+# The grid floor is a CTA-count target, not the kernel default: every consumer
+# takes `max(floor, rows)`, so it only adds split-K to grids too small to fill
+# the GPU and is an identity for the wide ones. Splits are numerically inert --
+# each CTA gets a disjoint KV-column range, no cross-CTA partial sums.
+# 512 idled the machine on long contexts, where rows shrink as the logits buffer
+# widens: decode rows=128 W~32768 54.1us -> 51.2us, prefill rows=1024 224.6us ->
+# 206.2us. 4096 is not any shape's optimum (CTA-count quantization makes the
+# ordering shape-specific) but has the smallest worst-case regret of the values
+# tried; re-tune against a real workload mix.
+FP4_MQA_PARALLEL_UNIT_NUM = 4096
 FP4_MQA_BLOCK_K = 256
 
 
@@ -122,19 +138,18 @@ def fp4_indexer_enabled(index_cache_dtype: Any, *, warn: bool = False) -> bool:
     mismatch. Lives here rather than in either caller for the same reason as
     `FP4_MQA_*` above.
 
-    The FP4 mqa-logits / scatter kernels are gfx950 (MI355X / CDNA4) only; on any
-    other arch fall back to the FP8 indexer instead of failing. Pass `warn=True`
-    from the builder only — it runs once, while `Indexer.__init__` runs per CSA
-    layer and would repeat the message.
+    gfx942 keeps the FP8 indexer because its FP4 path is unsupported. Pass
+    `warn=True` from the builder only — it runs once, while `Indexer.__init__`
+    runs per CSA layer and would repeat the message.
     """
     if index_cache_dtype != "fp4":
         return False
     gfx = get_gfx()
-    if gfx != "gfx950":
+    if gfx == "gfx942":
         if warn:
             logger.warning(
-                "--index_cache_dtype fp4 requires a gfx950 (MI355X / CDNA4) GPU; "
-                "current arch is %r. Falling back to the FP8 indexer.",
+                "The DeepSeek-V4 FP4 indexer is unsupported on %r. Falling "
+                "back to the FP8 indexer.",
                 gfx,
             )
         return False

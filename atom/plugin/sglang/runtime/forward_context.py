@@ -11,6 +11,7 @@ from typing import Any
 import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+from atom.models.utils import IntermediateTensors
 from atom.plugin.sglang.runtime.context import bind_current_forward_batch
 
 logger = logging.getLogger("atom.plugin.sglang.runtime.forward_context")
@@ -51,27 +52,55 @@ def _materialize_atom_dummy_forward(
     ForwardBatch,
 ]:
     """Convert an empty SGLang IDLE batch into ATOM-style dummy inputs."""
+    if positions is not None:
+        device = positions.device
+    elif input_ids is not None:
+        device = input_ids.device
+    elif input_embeds is not None:
+        device = input_embeds.device
+    else:
+        raise RuntimeError(
+            "SGLang dummy forward materialization requires at least one of "
+            "positions, input_ids, or input_embeds"
+        )
 
-    if positions is None:
-        raise RuntimeError("SGLang dummy forward materialization requires positions")
-    if input_ids is None:
-        raise RuntimeError("SGLang dummy forward materialization requires input_ids")
-
-    dummy_positions = positions.new_zeros((1,))
-    dummy_input_ids = input_ids.new_zeros((1,))
+    if positions is not None:
+        dummy_positions_shape = (
+            (3, 1) if positions.ndim == 2 and positions.shape[0] == 3 else (1,)
+        )
+        dummy_positions = positions.new_zeros(dummy_positions_shape)
+    else:
+        dummy_positions = torch.zeros((1,), dtype=torch.long, device=device)
+    dummy_input_ids = (
+        input_ids.new_zeros((1,))
+        if input_ids is not None
+        else torch.zeros((1,), dtype=torch.long, device=device)
+    )
     dummy_input_embeds = _pad_dummy_like(input_embeds, length=1, fill_value=0)
 
     model_forward_batch = copy.copy(forward_batch)
     model_forward_batch.positions = dummy_positions
     model_forward_batch.batch_size = 1
     model_forward_batch.seq_lens_sum = 1
-    model_forward_batch.seq_lens = forward_batch.seq_lens.new_ones((1,))
-    model_forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu.new_ones((1,))
+    seq_lens = getattr(forward_batch, "seq_lens", None)
+    seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+    model_forward_batch.seq_lens = (
+        seq_lens.new_ones((1,))
+        if torch.is_tensor(seq_lens)
+        else torch.ones((1,), dtype=torch.int32, device=device)
+    )
+    model_forward_batch.seq_lens_cpu = (
+        seq_lens_cpu.new_ones((1,))
+        if torch.is_tensor(seq_lens_cpu)
+        else torch.ones((1,), dtype=torch.int32, device="cpu")
+    )
 
     return dummy_input_ids, dummy_positions, dummy_input_embeds, model_forward_batch
 
 
 def _trim_hidden_states_for_output(hidden_states, num_tokens: int):
+    if isinstance(hidden_states, IntermediateTensors):
+        return hidden_states[:num_tokens]
     if torch.is_tensor(hidden_states):
         return hidden_states[:num_tokens]
     if isinstance(hidden_states, tuple):
@@ -86,7 +115,6 @@ def _resolve_num_tokens_across_dp(
     atom_config: Any,
     forward_batch: ForwardBatch,
     num_tokens: int,
-    is_dummy_run: bool,
 ) -> torch.Tensor:
     """Resolve per-DP token counts for ATOM's CPU-side DPMetadata."""
 
@@ -117,12 +145,28 @@ def _resolve_num_tokens_across_dp(
             (dp_size,), num_tokens, dtype=torch.int32, device="cpu"
         )
 
-    if is_dummy_run:
-        # SGLang reports idle ranks as 0 tokens, but ATOM materializes them
-        # as one local dummy token so collectives and DPMetadata stay aligned.
-        dp_rank = atom_config.parallel_config.data_parallel_rank
-        num_tokens_across_dp[dp_rank] = num_tokens
+    # SGLang reports idle ranks as 0 tokens, but ATOM materializes every idle
+    # rank as one physical dummy token. Normalize the complete vector on every
+    # rank so collectives and DPMetadata use identical sizes.
+    num_tokens_across_dp.clamp_min_(1)
     return num_tokens_across_dp
+
+
+def _resolve_running_tokens_are_unified(
+    atom_config: Any,
+    forward_batch: ForwardBatch,
+) -> bool:
+    """Resolve the DP decode mode needed by ATOM TBO.
+
+    This was added after skewed TBO prefill incorrectly inherited the Context
+    default ``True`` and entered the uniform-decode MORI path, which could
+    truncate variable-length buffers and eventually trigger a HIP error.
+    Keep the legacy default when TBO is disabled.
+    """
+
+    if not atom_config.enable_tbo or not atom_config.enable_dp_attention:
+        return True
+    return not forward_batch.is_extend_in_batch
 
 
 def _max_len_from_optional(cpu_lens, gpu_lens, default: int) -> int:
@@ -191,8 +235,7 @@ def _slice_v4_graph_metadata_for_capture(
                 pass
 
     for name in (
-        "batch_id_per_token",
-        "batch_id_per_token_cpu",
+        "batch_id_per_q_token",
         "slot_mapping",
         "kv_indices_swa",
         "kv_indices_csa",
@@ -221,8 +264,6 @@ def _slice_v4_graph_metadata_for_capture(
         "state_slot_mapping_cpu",
         "n_committed_csa_per_seq",
         "n_committed_csa_per_seq_cpu",
-        "n_committed_hca_per_seq",
-        "n_committed_hca_per_seq_cpu",
         "context_lens",
     ):
         _slice_attr(name, bs)
@@ -238,7 +279,7 @@ def _slice_v4_graph_metadata_for_capture(
     if isinstance(indexer_meta, dict):
         indexer_meta = dict(indexer_meta)
         for key in (
-            "batch_id_per_token_gpu",
+            "batch_id_per_q_token",
             "seq_base_per_token_gpu",
             "cu_starts_gpu",
             "cu_ends_gpu",
@@ -425,7 +466,7 @@ def stage_glm52_draft_decode_graph_metadata(
         "sparse_kv_indptr",
         "sparse_kv_last_page_lens",
         "sparse_cu_seqlens_q",
-        "token_to_seq_idxs",
+        "batch_id_per_q_token",
         "work_meta_data",
         "work_indptr",
         "work_info_set",
@@ -486,6 +527,7 @@ def _build_minimax_m3_metadata(
         build_atom_minimax_m3_attention_metadata_from_sglang,
         is_minimax_m3_config,
         maybe_get_minimax_m3_pools_from_sglang_batch,
+        minimax_m3_num_idx_heads,
     )
 
     if not is_minimax_m3_config(hf_config):
@@ -503,6 +545,9 @@ def _build_minimax_m3_metadata(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token_pool=req_to_token_pool,
         max_model_len=int(atom_config.max_model_len),
+        num_idx_heads=minimax_m3_num_idx_heads(
+            hf_config, atom_config.tensor_parallel_size
+        ),
     )
 
 
@@ -589,10 +634,79 @@ def _build_eagle3_llama_metadata(
     )
 
 
+def _build_kimi_k3_metadata(
+    atom_config: Any, forward_batch: ForwardBatch, positions: torch.Tensor
+):
+    from atom.plugin.sglang.kimi_k3_bridge import (
+        build_kimi_k3_attention_metadata,
+        maybe_get_kimi_k3_pools,
+    )
+
+    attn_metadata = getattr(forward_batch, "atom_kimi_k3_graph_metadata", None)
+    if attn_metadata is None:
+        backend = _get_sglang_attention_backend()
+        attn_metadata = getattr(backend, "atom_kimi_k3_graph_metadata", None)
+    if attn_metadata is None and _is_current_stream_capturing():
+        from atom.plugin.sglang.attention_backend.kimi_k3_backend import (
+            ATOMKimiK3BackendForSgl,
+        )
+
+        attn_metadata = ATOMKimiK3BackendForSgl._last_atom_kimi_k3_graph_metadata
+
+    token_to_kv_pool, req_to_token_pool = maybe_get_kimi_k3_pools(forward_batch)
+    if token_to_kv_pool is None or req_to_token_pool is None:
+        raise RuntimeError("Kimi-K3 SGLang pools are unavailable")
+    if attn_metadata is None:
+        attn_metadata = build_kimi_k3_attention_metadata(
+            forward_batch,
+            positions,
+            token_to_kv_pool=token_to_kv_pool,
+            req_to_token_pool=req_to_token_pool,
+        )
+
+    from atom.plugin.sglang.attention_backend.attention_gdn import (
+        SGLangGDNForwardContext,
+    )
+
+    attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
+    if forward_batch.forward_mode.is_decode_or_idle():
+        full_attn_backend = getattr(attn_backend, "full_attn_backend", attn_backend)
+        forward_metadata = getattr(full_attn_backend, "forward_metadata", None)
+        kv_indices = getattr(forward_metadata, "kv_indices", None)
+        if kv_indices is None:
+            raise RuntimeError(
+                "Kimi-K3 decode metadata has no KV indices; "
+                f"backend={type(full_attn_backend).__name__}, "
+                f"forward_metadata={forward_metadata is not None}"
+            )
+        attn_metadata.kv_indptr = forward_metadata.kv_indptr
+        attn_metadata.kv_indices = kv_indices
+        attn_metadata.kv_last_page_lens = getattr(
+            forward_metadata, "kv_last_page_len", None
+        )
+        for name in (
+            "work_meta_data",
+            "work_info_set",
+            "work_indptr",
+            "reduce_indptr",
+            "reduce_final_map",
+            "reduce_partial_map",
+            "num_kv_splits",
+        ):
+            setattr(attn_metadata, name, getattr(forward_metadata, name, None))
+
+    linear_backend = SGLangGDNForwardContext._linear_attn_backend(attn_backend)
+    attn_metadata.gdn_metadata = SGLangGDNForwardContext._build_gdn_metadata(
+        forward_batch, linear_backend
+    )
+    return attn_metadata
+
+
 def _set_atom_forward_context(
     atom_config: Any,
     forward_batch: ForwardBatch,
     positions: torch.Tensor,
+    save_kv_cache: bool | None = None,
 ) -> None:
     """Bridge SGLang batch metadata into ATOM's global forward context."""
 
@@ -608,48 +722,20 @@ def _set_atom_forward_context(
             include_v2=True
         )
     )
+    from atom.plugin.sglang.runtime.model_arch import resolve_model_arch_spec
+
+    hf_config = getattr(atom_config, "hf_config", None)
+    model_arch, model_adapter = resolve_model_arch_spec(hf_config)
     attn_metadata = None
-    try:
-        attn_metadata = _build_minimax_m3_metadata(
-            atom_config,
-            forward_batch,
-            positions,
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            "Failed to build ATOM MiniMax-M3 sparse metadata for SGLang"
-        ) from exc
-
-    if attn_metadata is None:
+    if model_adapter.build_forward_metadata is not None:
         try:
-            attn_metadata = _build_glm52_dsa_metadata(
-                atom_config,
-                forward_batch,
-                positions,
+            attn_metadata = model_adapter.build_forward_metadata(
+                atom_config, forward_batch, positions
             )
         except Exception as exc:
             raise RuntimeError(
-                "Failed to build ATOM GLM-5.2 DSA metadata for SGLang"
-            ) from exc
-
-    if attn_metadata is None:
-        try:
-            attn_metadata = _build_deepseek_v4_metadata(forward_batch, positions)
-        except Exception as exc:
-            raise RuntimeError(
-                "Failed to build ATOM DeepSeek-V4 metadata for SGLang"
-            ) from exc
-
-    if attn_metadata is None:
-        try:
-            attn_metadata = _build_eagle3_llama_metadata(
-                atom_config,
-                forward_batch,
-                positions,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "Failed to build ATOM EAGLE3 draft metadata for SGLang"
+                "Failed to build ATOM metadata for SGLang model "
+                f"{model_arch or '<unknown>'}"
             ) from exc
 
     if attn_metadata is None:
@@ -676,6 +762,15 @@ def _set_atom_forward_context(
         else:
             max_seqlen_q = 1 if forward_mode.is_decode_or_idle() else 0
         attn_metadata = _build_generic_attention_metadata(forward_batch, max_seqlen_q)
+    # SGLang attention backends normally honor save_kv_cache=False by skipping
+    # their explicit set_kv_buffer call. Native ATOM attention writes K/V inside
+    # its kernel instead, where slot_mapping=-1 is the established no-write
+    # sentinel. Translate the SGLang flag here to preserve the same semantics.
+    if (
+        save_kv_cache is False
+        and getattr(attn_metadata, "slot_mapping", None) is not None
+    ):
+        attn_metadata.slot_mapping = torch.full_like(attn_metadata.slot_mapping, -1)
     batch_size = int(forward_batch.batch_size)
     is_dummy_run = _is_dummy_forward(forward_batch)
     is_prefill = forward_mode.is_prefill()
@@ -687,23 +782,43 @@ def _set_atom_forward_context(
             AttnState.PREFILL_PREFIX,
             AttnState.PREFILL_NATIVE,
         )
-    num_tokens = int(positions.shape[0])
+    # Qwen-VL mRoPE positions use [3, num_tokens], while ordinary position
+    # tensors use [num_tokens]. The token dimension is therefore the last
+    # dimension for mRoPE rather than the leading coordinate dimension.
+    num_tokens = int(
+        positions.shape[-1]
+        if positions.ndim == 2 and positions.shape[0] == 3
+        else positions.shape[0]
+    )
 
-    if bool(atom_config.enable_dp_attention):
+    max_q = int(getattr(attn_metadata, "max_seqlen_q", 1) or 1)
+    enable_dp_attention = bool(atom_config.enable_dp_attention)
+    if enable_dp_attention:
         num_tokens_across_dp = _resolve_num_tokens_across_dp(
-            atom_config, forward_batch, num_tokens, is_dummy_run
+            atom_config, forward_batch, num_tokens
         )
-        graph_bs = int(torch.max(num_tokens_across_dp).item())
+        # Already TOKENS, and already the group max -- what MoE pads to.
+        running_tokens = int(torch.max(num_tokens_across_dp).item())
     else:
         num_tokens_across_dp = None
-        graph_bs = num_tokens if is_prefill else batch_size
+        running_tokens = num_tokens if is_prefill else batch_size * max_q
+    # Sequences, per the field's contract -- the TBO split divides this into
+    # per-ubatch request counts, so handing it a token count would make each
+    # ubatch `max_seqlen_q` times too wide. Prefill's value is unread there.
+    running_bs = batch_size if is_prefill else max(1, running_tokens // max_q)
 
+    running_tokens_are_unified = _resolve_running_tokens_are_unified(
+        atom_config, forward_batch
+    )
     context = Context(
         positions=positions,
         is_prefill=is_prefill,
         is_dummy_run=is_dummy_run,
-        batch_size=batch_size,
-        graph_bs=graph_bs,
+        scheduled_bs=batch_size,
+        scheduled_tokens=num_tokens,
+        running_bs=running_bs,
+        running_tokens=running_tokens,
+        running_tokens_are_unified=running_tokens_are_unified,
     )
     set_forward_context(
         attn_metadata=attn_metadata,
@@ -736,11 +851,12 @@ class SGLangPluginRuntime:
     input_ids: torch.Tensor | None = None
     input_embeds: torch.Tensor | None = None
     set_forward_context: bool = True
+    save_kv_cache: bool | None = None
     _original_forward_batch: ForwardBatch = field(init=False, repr=False)
     _is_dummy_run: bool = field(init=False, default=False)
     _exit_stack: ExitStack = field(init=False, repr=False)
 
-    def __enter__(self) -> "SGLangPluginRuntime":
+    def __enter__(self) -> SGLangPluginRuntime:  # noqa: PYI034
         self._original_forward_batch = self.forward_batch
         self._is_dummy_run = _is_dummy_forward(self.forward_batch)
 
@@ -764,6 +880,7 @@ class SGLangPluginRuntime:
                 self.atom_config,
                 self.forward_batch,
                 self.positions,
+                save_kv_cache=self.save_kv_cache,
             )
             self._exit_stack.callback(_reset_atom_forward_context)
         return self

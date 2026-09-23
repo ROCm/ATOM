@@ -9,6 +9,8 @@ This guide covers when to use online quantization, the full configuration
 syntax, ready-to-run recipes for the most common model families, how to verify
 the result, and troubleshooting tips. For the dataclass-level field reference,
 see [`configuration_guide.md` § Online quantization at load time](./configuration_guide.md#online-quantization-at-load-time).
+For help choosing a configuration for a model that has no recipe here, see
+[`online_quantization_best_practices.md`](./online_quantization_best_practices.md).
 
 ## Online vs. offline quantization
 

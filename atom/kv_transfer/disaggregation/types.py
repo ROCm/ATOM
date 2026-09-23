@@ -11,8 +11,9 @@ KV output aggregator.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -22,9 +23,147 @@ EngineId = str
 ReqId = str | int
 TransferId = int
 
+
+@dataclass(frozen=True)
+class SaveOperationId:
+    """Exact identity of one scheduler-issued PAGE/SLOT save generation.
+
+    A request can emit several overlapping asynchronous saves. The
+    scheduler-lifetime ``generation`` prevents delayed or duplicated TP-worker
+    completions for one save from completing another.
+    """
+
+    req_id: ReqId
+    generation: int
+
+    def __post_init__(self) -> None:
+        if self.generation < 0:
+            raise ValueError("save operation generation must be nonnegative")
+
+
+SaveCompletionId = ReqId | SaveOperationId
+
+
+@dataclass(frozen=True)
+class SaveSourceGroupId:
+    """Exact source-safe identity for one batched PAGE staging group.
+
+    ``ranges`` are the absolute token ranges copied from scheduler-owned GPU
+    blocks into independent LMCache MemoryObjs by one ``batched_from_gpu``
+    call.  The enclosing :class:`SaveOperationId` prevents a late callback for
+    an older request lifecycle from releasing a newer lifecycle's blocks.
+    """
+
+    save_operation: SaveOperationId
+    ranges: tuple[tuple[int, int], ...]
+
+    def __post_init__(self) -> None:
+        if not self.ranges:
+            raise ValueError("save source group must contain at least one range")
+        for start, end in self.ranges:
+            if start < 0 or end <= start:
+                raise ValueError(f"invalid save source range: {start}:{end}")
+
+    @property
+    def req_id(self) -> ReqId:
+        return self.save_operation.req_id
+
+
+@dataclass(frozen=True)
+class LoadOperationId:
+    """Exact identity of one scheduler-issued PAGE/SLOT load generation."""
+
+    req_id: ReqId
+    generation: int
+
+    def __post_init__(self) -> None:
+        if self.generation < 0:
+            raise ValueError("load operation generation must be nonnegative")
+
+
+LoadCompletionId = ReqId | LoadOperationId
+
+
+@dataclass(frozen=True)
+class StateStoreOperationId:
+    """Exact identity of one hand-out of a state checkpoint to the CPU tier.
+
+    Not keyed by request: by the time a state store lands, the request that
+    produced the checkpoint is long gone and only the prefix hash remains. But
+    the hash alone is not an identity -- the same prefix is stored again after
+    an eviction or a load miss, and `KVOutputAggregator` tombstones every
+    `(channel, operation_id)` it has taken quorum on, so a second store under a
+    bare hash is dropped as a duplicate: its pin is never settled and its
+    bytes are never re-indexed. `generation` is what separates the attempts.
+    """
+
+    prefix_hash: int
+    generation: int
+
+    def __post_init__(self) -> None:
+        if self.generation < 0:
+            raise ValueError("state store generation must be nonnegative")
+
+
+ConnectorCompletionId = (
+    ReqId
+    | SaveOperationId
+    | SaveSourceGroupId
+    | LoadOperationId
+    | StateStoreOperationId
+)
+ConnectorCompletionKey = tuple[str, ConnectorCompletionId]
+
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ConnectorCompletion:
+    """One terminal event emitted on a connector-owned completion channel.
+
+    ``channel`` names the protocol owner without teaching generic transport
+    layers what the event means.  ``operation_id`` correlates the same event
+    across TP workers, and ``succeeded=False`` is failure-dominant when the TP
+    aggregator combines worker reports.
+    """
+
+    channel: str
+    operation_id: ConnectorCompletionId
+    succeeded: bool
+
+    def __post_init__(self) -> None:
+        if not self.channel:
+            raise ValueError("connector completion channel must be non-empty")
+        if type(self.succeeded) is not bool:
+            raise TypeError("connector completion succeeded must be bool")
+        try:
+            hash(self.operation_id)
+        except TypeError as exc:
+            raise TypeError(
+                "connector completion operation_id must be hashable"
+            ) from exc
+
+    @property
+    def key(self) -> ConnectorCompletionKey:
+        return self.channel, self.operation_id
+
+
+# Region roles used for producer-to-DCP-consumer relayout. The consumer stores
+# both MLA and DSA index caches interleave-sharded; producer MLA bytes are
+# token-contiguous, while producer preshuffled DSA index bytes require staging.
+MLA_KV_ROLE = "mla.kv"
+INDEX_CACHE_ROLE = "dsa.index_cache"
+# FP4 splits the DSv4 CSA indexer into two PAGE regions -- packed data and
+# e8m0 scales -- whose roles share this prefix. The names themselves are minted
+# by DeepseekV4AttentionMetadataBuilder._indexer_page_pools; a transport only
+# needs the prefix to tell the layout apart from the single-region FP8 one.
+INDEX_CACHE_FP4_PREFIX = "dsv4.csa_indexer.fp4_"
+# Producer gather callbacks need one staging slot per concurrent send worker.
+# Mooncake and attention-pool allocation share this fallback so their defaults
+# cannot drift independently.
+DEFAULT_SHARDED_STAGING_WORKERS = 16
 
 
 @dataclass
@@ -34,22 +173,122 @@ class KVTransferRegion:
     base_addr: int
     total_bytes: int
     unit_bytes: int  # bytes per block (block-indexed) or per slot (slot-indexed)
+    # Unit `i` sits at `base_addr + total_bytes - (i+1) * unit_bytes` instead of
+    # `base_addr + i * unit_bytes`. A pool that numbers its units back from its
+    # end does so to keep adding one from relocating the rest; the region map
+    # has to know, because both ends compute an address from the same id.
+    reverse_indexed: bool = False
+    # Stable semantic identity used by layout fingerprints. Physical addresses
+    # and list positions are process-local implementation details; a named role
+    # makes equal-sized planes distinguishable across code versions.
+    semantic_role: str | None = None
+
+    def unit_addr(self, index: int) -> int:
+        if self.reverse_indexed:
+            return self.base_addr + self.total_bytes - (index + 1) * self.unit_bytes
+        return self.base_addr + index * self.unit_bytes
 
 
 @dataclass
 class KVTransferTensors:
+    """Physical PAGE, SLOT, and compressor-only staging region contract.
+
+    ``block_regions`` contain forward-indexed, block-indexed PAGE units.
+    ``swa_block_regions`` is a legacy field name for complete reverse-indexed
+    per-request SLOT units, including both compressor state and SWA.
+    ``expected_full_slot_region_count`` makes a stateful layout's complete
+    plane count explicit so registration can reject a missing plane.
+    ``staging_region`` plus ``gather_slot``/``scatter_slot`` cover only the
+    compressor-state PD staging pool and are invalid as sidecar SLOT sources.
+    ``index_staging_region`` plus ``prepare_sharded_index`` and
+    ``gather_sharded_index`` cover producer-side repacking of preshuffled index
+    pages before DCP-sharded RDMA. The prepared indices are shared across index
+    layers.
+
+    ``tp_replication_factor`` describes byte-identical PAGE replicas, not the
+    number of physical consumers. A value equal to tensor parallel size lets a
+    remote cache store one copy while every TP worker still retrieves into its
+    own local GPU cache. The declaration applies to every ``block_region``;
+    mixed replicated/sharded layouts must leave it at ``1`` until the transfer
+    protocol can describe replication per region group.
+    """
+
+    # Block-indexed PAGE regions, indexed forward by block id.
     block_regions: list[KVTransferRegion]
     slot_regions: list[KVTransferRegion]
-    num_blocks: int
     num_slots: int = 0
-    # paged-SWA: SWA lives in a SEPARATE pool addressed by seq.swa_block_table
-    # (not the compressed block_table), so these regions are transferred keyed by
-    # swa_block_table — only the live window (last ~128-token block) per request.
+    # Optional producer-local -> consumer-global mapping for non-uniform block
+    # region layouts. Uniform per-layer groups leave this unset and use the
+    # connector's existing group-major inference.
+    block_region_consumer_indices: list[int] | None = None
+    # Legacy field name: full per-request SLOT regions keyed by pool group.
+    # `unit_bytes` includes compressor state and SWA, not just one ring.
     swa_block_regions: list[KVTransferRegion] = field(default_factory=list)
+    # Compressor-only PD staging; never a complete sidecar SLOT source.
     staging_region: KVTransferRegion | None = None
     staging_pool_size: int = 0
     gather_slot: Callable[[int, int], None] | None = None
     scatter_slot: Callable[[int, int], None] | None = None
+    # Appended for positional compatibility with existing generic descriptors.
+    expected_full_slot_region_count: int | None = None
+    # Zero-copy, physical-order views paired with block regions.
+    # Each view is [num_units, physical_slots_per_unit, opaque_width]; it may
+    # retain its native dtype, and one dim-0 unit must cover exactly the paired
+    # region's unit_bytes. The last two dimensions describe copy geometry, not
+    # a semantic token/head layout.
+    block_tensor_views: list[Any] = field(default_factory=list)
+    # Number of TP workers whose complete PAGE layout is byte-identical.
+    # ``1`` means no cross-rank deduplication is safe.
+    tp_replication_factor: int = 1
+    # The attention metadata builder, published by `ModelRunner` after the tier
+    # is built inside `register_kv_caches` -- the one place builder and connector
+    # are both in scope. The kimi_k3 state tier reads its `state_runtime.
+    # checkpoint_spec.layout_id` to fold the state geometry into every key. Typed
+    # `object` because `types` must not import the model engine; None on every
+    # layout that has no state tier to name. Declared here rather than set as a
+    # loose runtime attribute so the field the connector reads is part of the
+    # contract, not an undocumented assignment two layers away.
+    state_backend: object | None = None
+    # Producer-side DSA index-page staging. The callback fills one pool slot
+    # with compact destination pages and returns (base_addr, page_count).
+    index_staging_region: KVTransferRegion | None = None
+    index_staging_pool_size: int = 0
+    index_staging_chunk_pages: int = 0
+    gather_sharded_index: Callable[..., tuple[int, int]] | None = None
+    # Appended after the original staging fields for positional compatibility.
+    prepare_sharded_index: Callable[..., Any] | None = None
+    # Scheduler blocks the PAGE regions are addressed in. `init=False` because
+    # a backend cannot answer it: `req.block_ids` is the scheduler's id space,
+    # and a backend counts in its own page -- a different unit even where it is
+    # the same number. Set through `set_block_count`.
+    num_blocks: int = field(init=False, default=0)
+
+    def set_block_count(self, num_blocks: int) -> None:
+        """Fix the block id space, and check every region is in it.
+
+        Called once the last contributor's regions are in the list; a draft
+        appends its own after construction, so this cannot be a `__post_init__`.
+
+        A region that does not divide into exactly `num_blocks` units was
+        registered in some other unit. Both ends would still agree on
+        `base + id * unit_bytes` and disagree on the stride, so the wrong bytes
+        move and nothing reports it.
+        """
+        for i, region in enumerate(self.block_regions):
+            name = region.semantic_role or i
+            if not region.unit_bytes or region.total_bytes % region.unit_bytes:
+                raise ValueError(
+                    f"PAGE region {name} does not divide into whole blocks: "
+                    f"{region.total_bytes} B in units of {region.unit_bytes} B"
+                )
+            held = region.total_bytes // region.unit_bytes
+            if held != num_blocks:
+                raise ValueError(
+                    f"PAGE region {name} holds {held} blocks but the scheduler "
+                    f"addresses {num_blocks}; it is registered in some unit "
+                    "other than the scheduler's block"
+                )
+        self.num_blocks = num_blocks
 
 
 @dataclass
@@ -64,9 +303,15 @@ class KVConnectorOutput:
         finished_sending: Request IDs whose KV send completed on this worker.
         finished_recving: Request IDs whose KV receive completed on this worker.
         failed_recving: Request IDs whose KV receive failed on this worker.
-        finished_saving: Request IDs whose local fire-and-forget save completed.
-        finished_loading: Request IDs whose local/offload KV load completed.
-        failed_loading: Request IDs whose local/offload KV load failed.
+        finished_saving: Exact save generations whose local fire-and-forget
+            PAGE work completed (legacy connectors may still report request IDs).
+        finished_loading: Exact offload load generations that completed (legacy
+            connectors may still report request IDs).
+        failed_loading: Exact offload load generations that failed (legacy
+            connectors may still report request IDs).
+        connector_completions: Terminal events on connector-owned channels.
+            Generic composite/aggregation layers transport these opaquely;
+            channel owners interpret them after TP aggregation.
         expected_finished_count: How many finished notifications should be
             expected per request (used by the aggregator).
     """
@@ -74,10 +319,11 @@ class KVConnectorOutput:
     finished_sending: set[ReqId] = field(default_factory=set)
     finished_recving: set[ReqId] = field(default_factory=set)
     failed_recving: set[ReqId] = field(default_factory=set)
-    finished_saving: set[ReqId] = field(default_factory=set)
-    finished_loading: set[ReqId] = field(default_factory=set)
-    failed_loading: set[ReqId] = field(default_factory=set)
+    finished_saving: set[SaveCompletionId] = field(default_factory=set)
+    finished_loading: set[LoadCompletionId] = field(default_factory=set)
+    failed_loading: set[LoadCompletionId] = field(default_factory=set)
     expected_finished_count: int = 0
+    connector_completions: set[ConnectorCompletion] = field(default_factory=set)
 
     def is_empty(self) -> bool:
         """Return True if no transfers finished on this worker."""
@@ -88,6 +334,7 @@ class KVConnectorOutput:
             and not self.finished_saving
             and not self.finished_loading
             and not self.failed_loading
+            and not self.connector_completions
         )
 
     def __repr__(self) -> str:
@@ -97,7 +344,8 @@ class KVConnectorOutput:
             f"failed_recving={self.failed_recving}, "
             f"finished_saving={self.finished_saving}, "
             f"loading={self.finished_loading}, "
-            f"failed_loading={self.failed_loading})"
+            f"failed_loading={self.failed_loading}, "
+            f"connector_completions={self.connector_completions})"
         )
 
 
@@ -122,8 +370,16 @@ class ReqMeta:
     remote_tp_size: int = 0
     transfer_id: int = 0
     local_slot_index: int = -1
-    # paged-SWA: parallel block ids into the SEPARATE SWA pool. Empty for
-    # non-V4 backends. -1 entries are window-freed and skipped by the transfer.
+
+    # PD incremental: blocks already in decode's prefix cache; both sides
+    # skip block_ids[:num_computed_blocks]. 0 = full transfer.
+    num_computed_blocks: int = 0
+    # How many producer blocks correspond to one destination block. 1 when
+    # producer and consumer share a DCP world, consumer dcp_size when the
+    # producer is unsharded.
+    src_block_skip_factor: int = 1
+    # The request's SWA ring slot, as a one-element list so it zips with the
+    # region loop like block ids do. Empty for backends with no SWA state.
     local_swa_block_ids: list[int] = field(default_factory=list)
     remote_swa_block_ids: list[int] = field(default_factory=list)
 
@@ -156,6 +412,22 @@ class ConnectorMetadata:
     and the worker-side connector consumes it in ``start_load_kv``.
     """
 
+    #: Attributes whose truthiness means "the worker has something to do this
+    #: step". A subclass **extends** this rather than replacing it, and owns
+    #: only its own fields -- which is the point: the engine drops metadata
+    #: that reports no work, so a field added to a subclass and not listed
+    #: here leaves every request parked against it waiting for a report nobody
+    #: was asked to produce. Keeping the list next to the fields it names is
+    #: what makes that omission local instead of a shared table three
+    #: connector families have to remember to edit.
+    WORK_FIELDS: tuple[str, ...] = (
+        "reqs_to_recv",
+        "reqs_to_save",
+        "reqs_to_send",
+        "reqs_in_batch",
+        "reqs_not_processed",
+    )
+
     def __init__(self) -> None:
         self.reqs_to_recv: dict[ReqId, ReqMeta] = {}
         self.reqs_to_save: dict[ReqId, ReqMeta] = {}
@@ -163,6 +435,10 @@ class ConnectorMetadata:
         self.reqs_in_batch: set[ReqId] = set()
         self.reqs_not_processed: set[ReqId] = set()
         self.request_id_to_transfer_id: dict[ReqId, int] = {}
+
+    def has_work(self) -> bool:
+        """Whether the worker has anything to do with this snapshot."""
+        return any(bool(getattr(self, name, None)) for name in self.WORK_FIELDS)
 
     @staticmethod
     def _build_req_meta(
@@ -192,6 +468,8 @@ class ConnectorMetadata:
             ),
             transfer_id=kv_transfer_params.get("transfer_id", 0),
             local_slot_index=kv_transfer_params.get("local_slot_index", -1),
+            num_computed_blocks=kv_transfer_params.get("num_computed_blocks", 0),
+            src_block_skip_factor=kv_transfer_params.get("src_block_skip_factor", 1),
         )
 
     def add_new_req_to_save(
@@ -215,3 +493,35 @@ class ConnectorMetadata:
         self.reqs_to_recv[request_id] = self._build_req_meta(
             request_id, local_block_ids, kv_transfer_params, local_swa_block_ids
         )
+
+
+#: Fallback for objects that are not `ConnectorMetadata` -- test doubles and
+#: duck-typed sub-metas. Real metadata answers through `has_work`; this list is
+#: deliberately not the place to register a new field.
+_DUCK_TYPED_WORK_FIELDS = (
+    "requests",
+    "state_loads",
+    "state_stores",
+    "lookup_requests_in_step",
+    "reqs_to_recv",
+    "reqs_to_save",
+    "reqs_to_send",
+    "reqs_in_batch",
+    "reqs_not_processed",
+)
+
+
+def connector_metadata_has_work(metadata: object | None) -> bool:
+    """Return whether connector metadata contains dispatchable work.
+
+    Asks the metadata rather than inspecting it, so that each connector family
+    declares its own work fields next to where it defines them. The engine
+    drops a snapshot that reports nothing, so an unreported field is a
+    permanently parked request, not a wasted step.
+    """
+    if metadata is None:
+        return False
+    probe = getattr(metadata, "has_work", None)
+    if callable(probe):
+        return bool(probe())
+    return any(bool(getattr(metadata, name, None)) for name in _DUCK_TYPED_WORK_FIELDS)

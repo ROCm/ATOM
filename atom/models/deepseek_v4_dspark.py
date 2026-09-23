@@ -42,13 +42,68 @@ Checkpoint layout (DeepSeek-V4-Pro-DSpark):
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from torch import nn
 
+from atom.config import get_current_atom_config
+from atom.models.dspark_draft import DSparkDraftModel
+from atom.utils import envs, mark_spliting_op
+from atom.utils.decorators import support_torch_compile
+
 if TYPE_CHECKING:
     from atom.config import Config
+
+
+def _dspark_block_attention_fake(
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    draft_pos: torch.Tensor,
+    valid_target: torch.Tensor,
+    topk_idxs: torch.Tensor | None,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+@mark_spliting_op(
+    is_custom=True, gen_fake=_dspark_block_attention_fake, mutates_args=[]
+)
+def dspark_block_attention(
+    x: torch.Tensor,  # [B, T, dim] per-block hidden (post attn_norm)
+    positions: torch.Tensor,  # [B] anchor position per request
+    draft_pos: torch.Tensor,  # [B, T] block plan: absolute draft positions
+    valid_target: torch.Tensor,  # [B, W] block plan: window validity
+    topk_idxs: torch.Tensor | None,  # [B,T,W+T] gather idxs; None on fp8
+    layer_name: str,
+) -> torch.Tensor:  # [B, T, dim]
+    """Dynamo-opaque wrapper around one DSpark stage's block attention.
+
+    REQUIRED for the draft to compile at all, not an optimization. The fused
+    ``qk_norm_rope_maybe_quant`` lazily JIT-builds a flydsl kernel on first call
+    for a given shape, and Dynamo cannot trace that builder (it hits
+    ``function.__new__``). Tracing into it graph-breaks, and the break splits the
+    forward into two Dynamo graphs, the second of which trips ``VllmBackend can
+    only be called once``.
+
+    The V4 target calls the very same kernel and is fine precisely because its
+    call site (``DeepseekV4Attention._attn_compress``) is reachable only through
+    ``torch.ops.aiter.v4_attn_compress``, a splitting op. This mirrors that,
+    at the WIDE granularity (``v4_attention_with_output``): the whole attention
+    sub-layer stays eager.
+
+    Being opaque also means everything inside runs eagerly EVERY step, which is
+    what makes the ``is_dummy_run`` / ``attn_metadata`` reads in
+    ``dspark_attention`` safe -- they can no longer bake into a compiled graph.
+
+    The plan's tensors are passed individually because a custom op's schema
+    cannot carry the ``_DSparkBlockPlan`` dataclass.
+    """
+    layer = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return layer.dspark_attention(x, positions, draft_pos, valid_target, topk_idxs)
 
 
 class DSparkMarkovHead(nn.Module):
@@ -74,6 +129,9 @@ class DSparkMarkovHead(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
         self.rank = rank
+        # Read once here rather than per sampled position: envs re-reads the
+        # environment on every attribute access.
+        self.fused_sample = envs.ATOM_DSPARK_FUSED_MARKOV_SAMPLE
         # W1: per-token embedding lookup table [V, r].
         self.markov_w1 = nn.Embedding(vocab_size, rank)
         # W2: logit projection stored as [V, r] (matches checkpoint); applied as
@@ -97,6 +155,46 @@ class DSparkMarkovHead(nn.Module):
             markov_embed.float(), self.markov_w2.weight.float().t()
         )
         return logits_bias, markov_embed
+
+    def sample_next(
+        self, token_ids: torch.Tensor, base_logits: torch.Tensor, out: torch.Tensor
+    ) -> torch.Tensor:
+        """One greedy block position: the argmax of the biased logits into `out`.
+
+        Same contract as the Kimi-K3 head's ``sample_next``; the fused path
+        never materializes the ``[*, V]`` bias, keeping ``W2`` bf16 and reducing
+        straight to ids with an fp32 accumulator (see the op's module docstring
+        for the numerics). ``markov_embed`` is the return because the confidence
+        head consumes it; the ids are not, so that `out` stays the only place
+        to read them whether or not the caller is compiled.
+
+        Args:
+            token_ids:   [B]     ids of the previously sampled token x_{k-1}.
+            base_logits: [B, V]  this position's base logits.
+            out:         [B]     where the ids land; a strided view is fine,
+                                 which is how the caller's own block becomes
+                                 the destination instead of a copy's source.
+        Returns:
+            markov_embed: [B, r]  W1[x_{k-1}].
+        """
+        if self.fused_sample:
+            # Imported here, not at module scope: this file keeps its Triton /
+            # AITER dependencies behind the guarded import block below so the
+            # head stays constructible on a runner with no AITER build.
+            from atom.model_ops.dspark_markov_sample import dspark_markov_argmax
+
+            return dspark_markov_argmax(
+                base_logits,
+                token_ids,
+                self.markov_w1.weight,
+                self.markov_w2.weight,
+                out,
+            )
+        bias, markov_embed = self(token_ids)
+        # bf16 + fp32 promotes the slice to fp32 before the add, so an explicit
+        # .float() would only materialize it twice for the same sum.
+        out.copy_((base_logits + bias).argmax(dim=-1))
+        return markov_embed
 
 
 class DSparkConfidenceHead(nn.Module):
@@ -149,25 +247,41 @@ def _linear_out(output):
     return output[0] if isinstance(output, tuple) else output
 
 
+def _ckpt_index_path(model_path: str) -> str:
+    """Locate the shard index of a checkpoint named by directory or hub repo.
+
+    ``--model`` accepts either, and the hub form is not hypothetical: CI passes
+    the bare repo id on any runner without a local model mirror mounted. Only
+    the index is wanted here, so fetch that one file, never the shards.
+    """
+    import os
+
+    if os.path.isdir(model_path):
+        return os.path.join(model_path, "model.safetensors.index.json")
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(model_path, "model.safetensors.index.json")
+
+
 def _count_dspark_stages(model_path, default: int = 0) -> int:
     """Count distinct ``mtp.{i}.*`` stages in the checkpoint index.
 
     DSpark stores its backbone as ``mtp.0 .. mtp.{N-1}`` in the V4 checkpoint
     (N=3 for V4-Pro-DSpark). We must build exactly N stages or the last stage's
     Markov/confidence-head weights get dropped at load. The HF config's
-    ``num_nextn_predict_layers`` is unrelated (it is 1, a serial-MTP field).
+    ``num_nextn_predict_layers`` is unrelated (it is 1, a serial-MTP field),
+    and neither is ``dspark_target_layer_ids``, whose length counts the target
+    hidden states stage 0 concatenates, not the stages downstream of it.
     """
     import json
-    import os
     import re
 
     if not model_path:
         return default
-    idx_path = os.path.join(model_path, "model.safetensors.index.json")
     try:
-        with open(idx_path) as f:
+        with open(_ckpt_index_path(model_path)) as f:
             weight_map = json.load(f)["weight_map"]
-    except Exception:
+    except Exception:  # noqa: BLE001 -- a probe: any unreadable index means "no"
         return default
     stages = set()
     for name in weight_map:
@@ -183,6 +297,14 @@ def _fake_fp8_e4m3_inplace(x: torch.Tensor, block_size: int = 64) -> None:
     The HF DSpark module is QAT-trained: the non-RoPE KV lanes are quant/dequant
     through FP8 E4M3 at inference to match training numerics. Keeps the rolling
     KV cache in its native dtype (only the values pass through the round-trip).
+
+    Eager on purpose. Only the bf16 path reaches it -- the fp8 path quantizes
+    the same lanes for real, so both call sites skip it. A Triton rewrite
+    measured ~11us against ~65us, but it speeds up the path this work is moving
+    off and adds a second numerics surface (fp32 scale there, input-dtype scale
+    here, disagreeing on power-of-two boundaries). If the bf16 path ever needs
+    it, fold the round trip into `qk_norm_rope_maybe_quant`, which already
+    produces `kv` one line earlier, rather than add a kernel beside it.
     """
     if x.numel() == 0:
         return
@@ -238,40 +360,63 @@ def _dspark_block_topk_idxs(
 class _DSparkBlockPlan:
     """Per-block invariants shared by every DSpark stage.
 
-    ``dspark_attention`` runs once per stage, but these three tensors depend only
-    on ``(positions, T, W)`` — never on stage weights — so they are built once per
+    ``dspark_attention`` runs once per stage, but these tensors depend only on
+    ``(positions, T, W)`` — never on stage weights — so they are built once per
     ``forward_spec`` and reused. Recomputing them per stage rebuilt the
     ``[B, T, W+T]`` gather-index block once per stage for identical values.
+
+    ``topk_idxs`` is ``None`` when the fp8 path is planned: that path addresses
+    KV as a CSR list of pool rows and never gathers a materialised
+    ``[B, W+T, 512]``, so the block would be built and never read. See
+    :func:`_build_block_plan`.
     """
 
     draft_pos: torch.Tensor  # [B, T]      anchor+1 .. anchor+T
     valid_target: torch.Tensor  # [B, W]      rolling-window slot validity
-    topk_idxs: torch.Tensor  # [B, T, W+T] sparse_attn gather indices
+    topk_idxs: torch.Tensor | None  # [B, T, W+T] gather indices, or None
 
 
 def _build_block_plan(
     positions: torch.Tensor,  # [B] anchor position per request
     T: int,  # draft width
     W: int,  # rolling window size
-    is_dummy_run: bool,
+    fp8_planned: bool,  # process-constant; see DSparkLayer.dspark_fp8_planned
 ) -> _DSparkBlockPlan:
-    """Build the per-block invariants once for the whole DSpark backbone."""
+    """Build the per-block invariants once for the whole DSpark backbone.
+
+    TRACED — no ``is_dummy_run`` parameter on purpose. This function is pure
+    tensor arithmetic over ``positions`` and touches no unbound state, so it
+    needs no warmup special case: on a dummy run it produces a mask over a
+    window that ``dspark_attention`` returns as zeros, and the resulting garbage
+    is discarded. A gate here would be baked from the warmup trace under
+    ``CompilationLevel >= DYNAMO_ONCE`` and permanently zero the window.
+    Re-adding one is a silent accuracy bug; ``tests/test_dspark.py`` asserts the
+    parameter stays gone.
+
+    ``fp8_planned`` is a different kind of flag and IS safe to bake: it is an
+    env var and a config field, both settled before the model is constructed,
+    so the warmup trace sees the value every later step sees. It drops
+    ``topk_idxs``, which is ~5 launches and a ``[B, T, W+T]`` int32 allocation
+    per forward that the CSR path never loads. The one caller that still needs
+    the block under this flag — the warmup dummy run, which cannot take the fp8
+    branch because `swa_plane` is unbound — rebuilds it eagerly inside
+    ``dspark_attention``, where a gate cannot bake.
+    """
     B = positions.shape[0]
     device = positions.device
     offsets = torch.arange(1, T + 1, device=device, dtype=positions.dtype)
     draft_pos = positions.view(B, 1) + offsets.view(1, T)
-    if is_dummy_run:
-        # warmup runs BEFORE allocate_kv_cache: no window is bound yet, so every
-        # slot is invalid (the draft output is discarded anyway).
-        valid_target = torch.zeros(B, W, dtype=torch.bool, device=device)
-    else:
-        # slot s valid iff its absolute position (anchor-(W-1)+s) >= 0.
-        slot_ids = torch.arange(W, device=device).view(1, W)
-        valid_target = slot_ids >= (W - 1) - positions.view(B, 1)
+    # slot s valid iff its absolute position (anchor-(W-1)+s) >= 0.
+    slot_ids = torch.arange(W, device=device).view(1, W)
+    valid_target = slot_ids >= (W - 1) - positions.view(B, 1)
     return _DSparkBlockPlan(
         draft_pos=draft_pos,
         valid_target=valid_target,
-        topk_idxs=_dspark_block_topk_idxs(B, T, W, valid_target, device),
+        topk_idxs=(
+            None
+            if fp8_planned
+            else _dspark_block_topk_idxs(B, T, W, valid_target, device)
+        ),
     )
 
 
@@ -287,7 +432,7 @@ def _dspark_block_sparse_attention_torch(
     Kept as a kernel-free, inspectable reference. The production path
     (``_dspark_block_sparse_attention``) dispatches to the fused flash kernel.
     """
-    B, T, H, D = q.shape
+    B, T, H, _ = q.shape
     W = kv.shape[1] - T
     # Scores: [B, H, T, W+T]  (broadcast single KV head over H query heads).
     scores = torch.einsum("bthd,bsd->bhts", q.float(), kv.float()) * scale
@@ -371,12 +516,19 @@ def _dspark_block_sparse_attention(
 try:
     from atom.model_ops.layernorm import RMSNorm
     from atom.model_ops.linear import ReplicatedLinear
+    from atom.model_ops.v4_kernels.dspark_fp8_indices import DSparkIndexBuffers
+    from atom.model_ops.v4_kernels.paged_decode import sparse_attn_v4_paged_decode
     from atom.model_ops.v4_kernels.qk_norm_rope_maybe_quant import (
         qk_norm_rope_maybe_quant,
     )
     from atom.model_ops.v4_kernels.state_writes import (
         dspark_paged_window_gather,
         swa_write,
+    )
+    from atom.model_ops.v4_kernels.v4_quant import (
+        V4_DIM_QK_PACKED,
+        V4_DIM_ROPE,
+        quantize_bf16_to_v4_2buff_triton,
     )
     from atom.models.deepseek_v4 import (
         Block,
@@ -386,7 +538,7 @@ try:
     )
 
     _ATOM_V4_AVAILABLE = True
-except Exception:  # pragma: no cover - exercised only in the stubbed test sandbox
+except Exception:  # noqa: BLE001  # pragma: no cover - stubbed test sandbox only
     _ATOM_V4_AVAILABLE = False
     Block = object  # type: ignore
 
@@ -416,6 +568,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         markov_rank: int,
         target_layer_ids: tuple,
         block_size: int,
+        write_per_batch: int,
         prefix: str = "",
         alt_stream=None,
         indexer_stream=None,
@@ -431,6 +584,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         self.num_stages = num_stages
         self.block_size = block_size
         self.window_size = args.window_size
+        self.write_per_batch = write_per_batch
 
         if stage_id == 0:
             self.main_proj = ReplicatedLinear(
@@ -457,16 +611,43 @@ class DSparkLayer(Block):  # type: ignore[misc]
             )
             self.hc_head_scale = atom_parameter(torch.empty(1, dtype=torch.float32))
 
-        # PAGED-SWA: draft window KV lives in a paged pool bound by
+        # The draft window KV lives in an SWA ring bound by
         # DeepseekV4AttentionMetadataBuilder.build_kv_cache_tensor at
-        # allocate_kv_cache; see precompute_context_kv / dspark_attention.
+        # allocate_kv_cache; see write_context_kv / dspark_attention.
         #
-        # Mark this attn as a DSpark draft layer so the builder always binds it a
-        # PRIVATE bf16 SWA pool, even under an fp8 target KV cache. DSpark's block
-        # attention runs bf16 (no fused fp8 kernel for its [window ++ draft-block]
-        # shape), so an fp8 draft window is a measured net regression. The target
-        # KV cache is unaffected (still fp8).
-        self.attn.dspark_draft = True
+        # What this layer's window has to be made of, which the pool reserves
+        # rather than infers. Declaring a dtype at all is what makes this a
+        # FIELD-window layer: the pool carries the window as a state field
+        # priced in bytes, because a bf16 window is not a width the packed
+        # planes hold.
+        #
+        # The fp8 path wants the opposite: its window IS the planes' 2buff
+        # layout, so staying silent takes `build_kv_cache_tensor`'s ordinary
+        # branch, which binds `swa_plane` + `swa_plane_rope` + `kv_fp8`. It also
+        # restores the `prepare_mtp_decode` fast path a field window disables
+        # (`deepseek_v4_attn.py:592`).
+        #
+        # No opt-in flag; the pool's dtype decides. The rope plane exists
+        # exactly under `--kv_cache_dtype fp8`, which is already when the TARGET
+        # takes the same asm kernel (`paged_decode.py:1081` dispatches on
+        # `unified_kv_rope is not None`, with no arch guard of its own), so the
+        # draft is exposed to what the target already is and nothing more.
+        #
+        # Config, so the TRACED region may read it -- unlike `attn.kv_fp8`,
+        # which binds only after warmup has traced.
+        self.dspark_fp8_planned = get_current_atom_config().kv_cache_dtype == "fp8"
+        if not self.dspark_fp8_planned:
+            self.attn.window_kv_dtype = torch.bfloat16
+
+        # Register for the opaque attention op's lookup. `dspark_attention` is
+        # reachable ONLY through torch.ops.aiter.dspark_block_attention, which
+        # takes this name and resolves the layer here -- the standard way to get
+        # module state into a Dynamo-opaque op (see module_dispatch_ops.py, and
+        # DeepseekV4Attention's own registration in deepseek_v4.py).
+        self.dspark_layer_name = f"{self.attn.layer_name}.dspark"
+        get_current_atom_config().compilation_config.static_forward_context[
+            self.dspark_layer_name
+        ] = self
 
     def reset_kv_cache(self, max_num_seqs: int, device, dtype) -> None:
         """No-op: draft KV is paged into the shared pool (bound at
@@ -477,7 +658,11 @@ class DSparkLayer(Block):  # type: ignore[misc]
     # ---- DSpark attention path (replaces Block.attn's paged sparse attn) -----
 
     def _compute_main_kv(
-        self, main_x: torch.Tensor, positions: torch.Tensor
+        self,
+        main_x: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        fake_quant: bool = True,
     ) -> torch.Tensor:
         """Project target hidden states into rolling-window KV rows (post
         kv_norm + RoPE + QAT). main_x: [T, dim] -> [T, head_dim].
@@ -486,7 +671,10 @@ class DSparkLayer(Block):  # type: ignore[misc]
         than ``main_x``; only its first T entries are used.
 
         The NoPE lanes are fake-quantized through fp8 E4M3 (DSpark QAT numerics)
-        then stored bf16 — matching the QAT-trained draft's expected KV values."""
+        then stored bf16 — matching the QAT-trained draft's expected KV values.
+        ``fake_quant=False`` skips that round trip for the caller that quantizes
+        the same lanes for real on its way into an fp8 window; doing both would
+        quantize twice, and under two different amax floors."""
         a = self.attn
         qr_kv = _linear_out(a.wqkv_a(main_x))
         _, kv = torch.split(qr_kv, [a.q_lora_rank, a.head_dim], dim=-1)
@@ -501,83 +689,111 @@ class DSparkLayer(Block):  # type: ignore[misc]
         # (-0 == 0).
         if rope_dim:
             a.rotary_emb.forward(positions.view(-1)[: kv.shape[0]], kv[..., -rope_dim:])
-        _apply_dspark_kv_qat_(kv, rope_dim)
+        if fake_quant:
+            _apply_dspark_kv_qat_(kv, rope_dim)
         return kv.view(-1, a.head_dim)
 
-    def precompute_context_kv(
+    def write_context_kv(
         self,
         main_x: torch.Tensor,  # [T, dim]  target hidden(s)
         positions: torch.Tensor,  # [T]
-        cu_seqlens_q: torch.Tensor,  # [B+1] int32 per-req spans into main_x
-        write_per_batch: int,
     ) -> None:
         """Write target-KV rows into each request's rolling window.
 
-        ``main_x`` is the flat [T, dim] ragged batch of every scheduled token and
-        ``cu_seqlens_q`` ([B+1]) delimits the per-request spans; the last
-        ``min(seq_len, write_per_batch)`` rows of each span are written. Callers
-        pass ``write_per_batch = window_size``, which covers a prefill tail and a
-        decode verify span alike.
+        ``main_x`` is the flat [T, dim] ragged batch of every scheduled token;
+        ``cu_seqlens_q`` ([B+1]) delimits the per-request spans and is read off
+        the live forward context, per the
+        :meth:`DSparkDraftModel.write_context_kv` contract. The last
+        ``min(seq_len, self.write_per_batch)`` rows of each span are written,
+        which covers a prefill tail and a decode verify span alike.
 
         Every scheduled row is written on every step: the window must hold a row
         for every position it spans, and the read side gathers slots by absolute
         position regardless of whether they were ever written. See
         :meth:`DSparkProposer.propose` for why writing rejected rows is safe.
 
-        PAGED-SWA: the draft window KV now lives in the shared paged pool
-        (``self.attn.swa_kv``, this draft layer's slice of ``unified_kv``),
-        content-addressed by ``swa_block_tables`` exactly like the V4 target SWA
-        (#1417). ``swa_write`` is the same cudagraph-safe Triton kernel the target
-        uses: it derives all indices in-kernel from ``cu_seqlens_q`` +
-        ``positions`` (no advanced-index buffer-mutation, no ``.item()`` sync), so
-        it graph-replays correctly. The physical destination comes entirely from
-        ``swa_block_tables``, so no per-request state slot is needed here.
+        The draft window KV lives in the draft layer's own plane
+        (``self.attn.swa_plane``), addressed by ``self.attn.swa_window`` exactly
+        like the V4 target's window. ``swa_write`` is the same
+        cudagraph-safe Triton kernel the target uses: it derives all indices
+        in-kernel from ``cu_seqlens_q`` + ``positions`` (no advanced-index
+        buffer-mutation, no ``.item()`` sync), so it graph-replays correctly.
+
+        ``write_per_batch`` must not exceed ``a.swa_window.ring_slots``; the
+        draft's ``window_size`` and the target's ``win_with_spec`` are separate
+        configs and ``swa_write`` asserts the relation rather than aliasing
+        silently.
         """
         from atom.utils.forward_context import get_forward_context
 
         fc = get_forward_context()
-        # warmup_model runs BEFORE allocate_kv_cache, so `self.attn.swa_kv` /
-        # `swa_block_size` are unbound and `swa_block_tables` is absent. Same
-        # short-circuit as the V4 target (deepseek_v4.py is_dummy_run guard):
-        # skip the paged SWA write on dummy runs — warmup discards draft output.
-        if fc.context.is_dummy_run:
-            return
         attn_md = fc.attn_metadata
+        B = fc.context.scheduled_bs
+        cu_seqlens_q = attn_md.cu_seqlens_q[: B + 1]
         a = self.attn
-        main_kv = self._compute_main_kv(main_x, positions)  # [T, head_dim]
-        # The SWA pool is allocated bf16 for DSpark draft layers regardless of the
-        # target's kv_cache_dtype, while main_kv carries the model dtype — two
-        # independent sources. Assert instead of casting so a mismatch surfaces
-        # here rather than as a silent per-step copy (or a silently reinterpreted
-        # store inside the swa_write kernel, which has no dtype guard).
-        # `raise`, not `assert`: a bare assert vanishes under `python -O`, and
-        # swa_write has no dtype guard, so the mismatch would become a silently
-        # reinterpreted store.
-        if main_kv.dtype != a.swa_kv.dtype:
-            raise TypeError(
-                f"DSpark draft KV dtype {main_kv.dtype} != SWA pool dtype "
-                f"{a.swa_kv.dtype}. The draft pool is allocated bf16 "
-                "unconditionally; a non-bf16 --dtype needs that allocation "
-                "widened, not a cast here."
+        # An fp8 window is the planes' own 2buff layout, so the verified target
+        # KV is quantized for real on its way in and scattered across both
+        # planes, exactly as the draft block's own KV is by the fused quant in
+        # `dspark_attention`. The QAT fake round trip is skipped: it holds the
+        # same NoPE lanes at fp8 precision in bf16 storage, which is what the
+        # real quant supersedes.
+        to_2buff = a.swa_plane.dtype != torch.bfloat16
+        main_kv = self._compute_main_kv(
+            main_x, positions, fake_quant=not to_2buff
+        )  # [T, head_dim]
+        if to_2buff:
+            k_packed, k_rope = quantize_bf16_to_v4_2buff_triton(main_kv)
+            swa_write(
+                None,  # bf16 KV: unused once the 2buff pair is supplied
+                positions,  # [T] int64
+                cu_seqlens_q,  # [B+1] int32, per-req spans
+                attn_md.state_slot_out[:B],  # [B] ring slot per request
+                a.swa_plane,  # [plane_rows, 512] fp8
+                a.swa_window,
+                self.write_per_batch,
+                k_packed=k_packed.view(-1, 1, V4_DIM_QK_PACKED),
+                k_rope=k_rope.view(-1, 1, V4_DIM_ROPE),
+                pool_rope=a.swa_plane_rope,  # [plane_rows, 64] bf16
+                prefix=f"{a.layer_name}.dspark_swa_write_2buff",
             )
-        B = cu_seqlens_q.shape[0] - 1
+            return
+        # The window was reserved at the dtype this layer declared in
+        # `window_kv_dtype`, while main_kv carries whatever the projections
+        # produce — two independent sources. Assert instead of casting so a
+        # mismatch surfaces here rather than as a silent per-step copy, or as a
+        # silently reinterpreted store inside swa_write, which has no dtype
+        # guard. `raise`, not `assert`: a bare assert vanishes under `python -O`.
+        if main_kv.dtype != a.swa_plane.dtype:
+            raise TypeError(
+                f"DSpark draft KV dtype {main_kv.dtype} != window dtype "
+                f"{a.swa_plane.dtype}, which is what this layer asked the pool "
+                "to reserve. Change `window_kv_dtype` to match the projections, "
+                "not cast here."
+            )
         swa_write(
             main_kv,  # [T, head_dim]
             positions,  # [T] int64
             cu_seqlens_q,  # [B+1] int32, per-req spans
-            attn_md.swa_block_tables[:B],  # [B, max_blocks]
-            a.swa_kv,  # [num_pages, head_dim]
-            a.swa_block_size,
-            write_per_batch,
+            attn_md.state_slot_out[:B],  # [B] ring slot per request
+            a.swa_plane,  # [plane_rows, head_dim]
+            a.swa_window,
+            self.write_per_batch,
         )
 
     def dspark_attention(
         self,
         x: torch.Tensor,  # [B, T, dim]  per-block hidden (post attn_norm)
         positions: torch.Tensor,  # [B]  anchor position per request
-        plan: "_DSparkBlockPlan",  # per-block invariants, shared across stages
+        draft_pos: torch.Tensor,  # [B, T]     block plan, shared across stages
+        valid_target: torch.Tensor,  # [B, W]     block plan
+        topk_idxs: torch.Tensor,  # [B, T, W+T] block plan
     ) -> torch.Tensor:  # [B, T, dim]
-        """Block attention over (rolling target window ++ draft block KV)."""
+        """Block attention over (rolling target window ++ draft block KV).
+
+        EAGER — reached only via ``torch.ops.aiter.dspark_block_attention``, so
+        this body is never traced. That is deliberate (the flydsl JIT below is
+        untraceable) and it is what lets the forward-context reads here stay.
+        """
         a = self.attn
         B, T, _ = x.shape
         flat = x.view(B * T, -1)
@@ -594,14 +810,51 @@ class DSparkLayer(Block):  # type: ignore[misc]
         # q stays 2-D [B*T, H*D], kv 2-D [B*T, D] — the fused kernel wants 2-D.
 
         # Draft positions (anchor+1 .. anchor+T) come from the shared block plan.
-        draft_pos = plan.draft_pos
         rope_dim = a.rope_head_dim
+        from atom.utils.forward_context import get_forward_context
+
+        fc = get_forward_context()
+        W = self.window_size
+        # The runtime form of `dspark_fp8_planned`: the same fact, read off the
+        # pool once it is actually bound (warmup precedes that). Keyed on the
+        # rope plane and nothing else, which is both what the asm kernel
+        # dispatches on (`paged_decode.py:1081`) and the stricter of the two
+        # signals -- `build_kv_cache_tensor` clears the planes on its
+        # early-return branch without clearing `kv_fp8`. Fall back rather than
+        # fail: both paths are correct and differ in numerics and speed.
+        slots = draft_rows = batch_ids = kv_indices = kv_indptr = None
+        use_fp8 = (
+            getattr(a, "unified_kv_rope", None) is not None
+            and not fc.context.is_dummy_run
+        )
+        if use_fp8:
+            slots = fc.attn_metadata.state_slot_out[:B]
+            # Ring rows for this block's own KV, scattered by the fused quant
+            # below as it computes it. Speculative/rejected rows are safe (as in
+            # `write_context_kv`, `dspark_proposer.py:372-376`): they land above
+            # the anchor and nothing gathers above the anchor, so they stay
+            # unreadable until an accepting step overwrites them. Stages share the
+            # row NUMBER, not the row -- `swa_plane` is each layer's own view.
+            #
+            # One Triton launch builds the ring rows + CSR together; only stage 0
+            # pays and later stages read the same buffers back. Sound because the
+            # numbers are stage-invariant (every layer has compress ratio 0, hence
+            # one `WindowParams`, and each `swa_plane` is base-row-relative). The
+            # bundle is owned by `_DSparkInner`, borrowed via its `index_buffers`
+            # accessor (lazy); `bufs.views` raises if stage 0 did not fill first.
+            bufs = self.index_buffers(T, W, x.device)
+            if self.stage_id == 0:
+                bufs.build(a.swa_window, slots, positions)
+            kv_indices, kv_indptr, draft_rows = bufs.views(B)
+            batch_ids = bufs.batch_ids[: B * T]
+
         # Per-head weightless Q RMSNorm + weighted KV RMSNorm + GPT-J RoPE in ONE
         # fused kernel — the same `qk_norm_rope_maybe_quant` the V4 target runs
-        # every layer (bf16 path: quant off, no SWA fusion — DSpark scatters its
-        # window separately). Replaces the draft's hand-written weightless Q-norm
-        # + kv_norm + the `rotary_emb.forward` (_V4RoPE) RoPE launch. `kv` is
-        # passed PRE-norm; the kernel applies kv_norm.weight internally.
+        # every layer. `kv` is passed PRE-norm; the kernel applies
+        # kv_norm.weight internally. Under fp8 the one launch additionally
+        # group-quants into the 2buff layout and scatters the draft KV into the
+        # ring, mirroring the target's decode call (`deepseek_v4.py:3060`); the
+        # bf16 path quants nothing and scatters its window separately.
         qkn = qk_norm_rope_maybe_quant(
             q,
             kv,
@@ -615,60 +868,87 @@ class DSparkLayer(Block):  # type: ignore[misc]
             a.eps,
             quant_q=False,
             quant_k=False,
+            fp8_2buff=use_fp8,
+            swa_nope_scale_buff=a.swa_plane if use_fp8 else None,
+            swa_rope_buff=a.swa_plane_rope if use_fp8 else None,
+            swa_dest_rows=draft_rows if use_fp8 else None,
+            batch_id_per_q_token=batch_ids if use_fp8 else None,
             prefix=f"{a.layer_name}.dspark_qk_norm_rope",
         )
-        q = qkn.q_sa.view(B, T, a.n_local_heads, a.head_dim)
-        kv = qkn.kv.view(B * T, 1, a.head_dim)
-        _apply_dspark_kv_qat_(kv, rope_dim)
-        kv = kv.view(B, T, a.head_dim)
 
-        # Assemble the [window ++ draft block] KV. The window-validity mask and
-        # gather indices are stage-invariant and come from the block plan; only
-        # the KV gather is per-stage (each stage owns its own swa_kv slice).
-        # PAGED-SWA: gather the dense [B, W, head_dim] rolling window from the
-        # shared paged pool (this draft layer's swa_kv slice), addressed by
-        # swa_block_tables — the same content-addressing the write used.
-        from atom.utils.forward_context import get_forward_context
-
-        fc = get_forward_context()
-        W = self.window_size
-        if fc.context.is_dummy_run:
-            # warmup runs BEFORE allocate_kv_cache → swa_kv / swa_block_tables
-            # unbound. All-zero window so the forward still compiles at shape
-            # (draft output is discarded).
-            window_kv = kv.new_zeros(B, W, a.head_dim)
+        if use_fp8:
+            # KV is all in the ring now, addressable as pool rows and never
+            # materialised: one CSR list per query row (N = B*T, max_seqlen_q=1,
+            # the target's decode convention, `deepseek_v4_attn.py:3727`). The
+            # list broadcasts along T -- a request's T positions share one slice.
+            out = sparse_attn_v4_paged_decode(
+                None,  # bf16 q: dead on the asm path, which reads q_packed_in
+                a.unified_kv,
+                kv_indices,
+                kv_indptr,
+                a.attn_sink[: a.n_local_heads],
+                # Ignored downstream — the kernel hardcodes 1/sqrt(512), which
+                # is what `head_dim**-0.5` already is here. Passed for parity.
+                a.softmax_scale,
+                unified_kv_rope=a.unified_kv_rope,
+                q_packed_in=qkn.q_packed,
+                q_rope_in=qkn.q_rope,
+                qo_indptr=bufs.qo_indptr[: B * T + 1],
+                prefix=f"{a.layer_name}.dspark_attn_fp8",
+            )  # [B*T, n_heads, head_dim]
+            out = out.view(B, T, a.n_local_heads, a.head_dim)
         else:
-            attn_md = fc.attn_metadata
-            window_kv = dspark_paged_window_gather(
-                a.swa_kv,  # [num_pages, head_dim]
-                attn_md.swa_block_tables[:B],  # [B, max_blocks]
-                positions,  # [B] anchor positions
-                W,
-                a.swa_block_size,
-            )  # [B, W, head_dim]
-        all_kv = torch.cat([window_kv, kv], dim=1)  # [B, W+T, head_dim]
+            q = qkn.q_sa.view(B, T, a.n_local_heads, a.head_dim)
+            kv = qkn.kv.view(B * T, 1, a.head_dim)
+            _apply_dspark_kv_qat_(kv, rope_dim)
+            kv = kv.view(B, T, a.head_dim)
 
-        out = _dspark_block_sparse_attention(
-            q,
-            all_kv,
-            a.attn_sink[: a.n_local_heads],
-            plan.valid_target,
-            plan.topk_idxs,
-            a.softmax_scale,
-        )  # [B, T, n_heads, head_dim]
+            if topk_idxs is None:
+                # The plan omits the block when fp8 is PLANNED, but planning
+                # is not taking: warmup (`swa_plane` unbound) and any layer left
+                # without planes land here and still need it. Rebuilt here, not
+                # in `_build_block_plan`, because this body is opaque to Dynamo
+                # -- the branch cannot bake, which there it would.
+                topk_idxs = _dspark_block_topk_idxs(B, T, W, valid_target, x.device)
 
-        # Output projection: mirror DeepseekV4Attention.forward_impl's output
-        # stage exactly (deepseek_v4.py:1922-1930): inverse-RoPE on the rope
-        # lanes, grouped output-LoRA einsum with the BF16 wo_a weight, then wo_b.
+            # Assemble the [window ++ draft block] KV. The window-validity mask
+            # and gather indices are stage-invariant and come from the block
+            # plan; only the KV gather is per-stage (each stage owns its plane).
+            if fc.context.is_dummy_run:
+                # warmup runs BEFORE allocate_kv_cache → swa_plane /
+                # state_slot_out unbound. All-zero window so the forward still
+                # compiles at shape (draft output is discarded).
+                window_kv = kv.new_zeros(B, W, a.head_dim)
+            else:
+                window_kv = dspark_paged_window_gather(
+                    a.swa_plane,  # [plane_rows, head_dim]
+                    fc.attn_metadata.state_slot_out[:B],  # [B] ring slot per req
+                    positions,  # [B] anchor positions
+                    W,
+                    a.swa_window,
+                )  # [B, W, head_dim]
+            all_kv = torch.cat([window_kv, kv], dim=1)  # [B, W+T, head_dim]
+
+            out = _dspark_block_sparse_attention(
+                q,
+                all_kv,
+                a.attn_sink[: a.n_local_heads],
+                valid_target,
+                topk_idxs,
+                a.softmax_scale,
+            )  # [B, T, n_heads, head_dim]
+
+        # Output projection: mirror DeepseekV4Attention's output stage exactly
+        # (the attention halves + `_attn_post`). `_wo_a_grouped_lora` owns the inverse
+        # RoPE on both wo_a paths, so hand it the un-inverse-RoPE'd output and
+        # inherit whichever path the shared wo_a is on.
         # GPU-VERIFY: numerics validated against the V4 reference output stage.
         o = out.view(B * T, a.n_local_heads, a.head_dim)
-        rope_dim = a.rope_head_dim
-        # Remove the absolute-position contribution carried in via value-side RoPE.
-        a.rotary_emb.inverse(draft_pos.view(-1), o[..., -rope_dim:])
-        o = o.view(B * T, a.n_local_groups, -1)
-        wo_a = a.wo_a.weight.view(a.n_local_groups, a.o_lora_rank, -1)
-        o = torch.einsum("sgd,grd->sgr", o, wo_a)
-        out_final = _linear_out(a.wo_b(o.flatten(1))).view(B, T, -1)
+        draft_pos_flat = draft_pos.view(-1)
+        o = a._wo_a_grouped_lora(
+            o, draft_pos_flat, prefix=f"{a.layer_name}.dspark_wo_a"
+        )
+        out_final = _linear_out(a.wo_b(o)).view(B, T, -1)
         return out_final
 
     def forward_block(
@@ -700,7 +980,16 @@ class DSparkLayer(Block):  # type: ignore[misc]
             self.norm_eps,
         )
         attn_in = hc_state.x_prev.view(B, T, -1)
-        attn_out = self.dspark_attention(attn_in, positions, plan)
+        # Through the opaque splitting op, never `self.dspark_attention` direct:
+        # that body contains an untraceable JIT kernel builder. See the op.
+        attn_out = torch.ops.aiter.dspark_block_attention(
+            attn_in,
+            positions,
+            plan.draft_pos,
+            plan.valid_target,
+            plan.topk_idxs,
+            self.dspark_layer_name,
+        )
         hc_state.x_prev = attn_out.view(B * T, -1)
         # ----- FFN sub-layer with mHC mixing -----
         hc_state = self.fuse_hc(
@@ -715,7 +1004,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         return hc_state
 
 
-class DeepseekV4DSpark(nn.Module):
+class DeepseekV4DSpark(DSparkDraftModel):
     """Top-level DSpark draft wrapper (mirrors DeepseekV4MTP's contract).
 
     Owns the DSpark backbone layers (loaded from the V4 checkpoint's ``mtp.*``
@@ -732,11 +1021,11 @@ class DeepseekV4DSpark(nn.Module):
         from atom.model_loader.loader import WeightsMapper
 
         weights_mapper = WeightsMapper(orig_to_new_prefix={"mtp.": "model.mtp."})
-    weights_mapping = {
+    weights_mapping: ClassVar[dict[str, str]] = {
         ".gate.bias": ".gate.e_score_correction_bias",
         ".scale": ".weight_scale_inv",
     }
-    packed_modules_mapping = {
+    packed_modules_mapping: ClassVar[dict[str, tuple[str, int]]] = {
         "attn.wq_a": ("attn.wqkv_a", 0),
         "attn.wkv": ("attn.wqkv_a", 1),
         "compressor.wkv": ("compressor.wkv_gate", 0),
@@ -745,7 +1034,9 @@ class DeepseekV4DSpark(nn.Module):
         "shared_experts.w3": ("shared_experts.gate_up_proj", 1),
     }
 
-    def __init__(self, config: "Config", prefix: str = "") -> None:
+    def __init__(self, config: "Config", prefix: str = "", *, alt_stream=None) -> None:
+        # `alt_stream` is the drafter's uniform contract; V4's DSpark layers
+        # keep their shared expert on the one stream, so it goes unused here.
         super().__init__()
         self.atom_config = config
         self.hf_config = config.hf_config
@@ -761,9 +1052,20 @@ class DeepseekV4DSpark(nn.Module):
         self.atom_config.quant_config = self.args.quant_config
 
         self.block_size = int(self.hf_config.dspark_block_size)
+        # Draft width the compiled graph was built for; see forward_spec.
+        self._compiled_num_draft: int | None = None
         # Rolling target-KV window width. Exposed on the wrapper (top level) so the
         # proposer never reaches through `self.model.model.mtp[0]` to read it.
         self.window_size = int(self.args.window_size)
+        # Markov-head vocab, exposed at the top level (like window_size) so the
+        # proposer can clamp the anchor without reaching into the draft layers.
+        self.vocab_size = int(self.args.vocab_size)
+        num_spec = getattr(
+            getattr(config, "speculative_config", None),
+            "num_speculative_tokens",
+            None,
+        )
+        self.write_per_batch = self.window_size + int(num_spec or self.block_size)
         self.markov_rank = int(self.hf_config.dspark_markov_rank)
         self.noise_token_id = int(self.hf_config.dspark_noise_token_id)
         self.target_layer_ids = tuple(
@@ -780,17 +1082,20 @@ class DeepseekV4DSpark(nn.Module):
         )
         if self.num_stages <= 0:
             raise ValueError(
-                "Could not determine DSpark stage count from the checkpoint; "
+                "Could not determine DSpark stage count from the checkpoint at "
+                f"{getattr(config, 'model', None)!r} (no readable "
+                "model.safetensors.index.json holding mtp.{i}.* weights); "
                 "set dspark_num_layers in the config."
             )
 
         self.model = _DSparkInner(
             self.atom_config,
-            self.args,
+            args=self.args,
             num_stages=self.num_stages,
             markov_rank=self.markov_rank,
             target_layer_ids=self.target_layer_ids,
             block_size=self.block_size,
+            write_per_batch=self.write_per_batch,
             noise_token_id=self.noise_token_id,
         )
 
@@ -830,24 +1135,27 @@ class DeepseekV4DSpark(nn.Module):
         for layer in self.model.layers:
             layer.reset_kv_cache(max_num_seqs, device, dtype)
 
+    def prepare_block(self, metadata_builder, num_draft, scheduled_bs, running_bs):
+        self.model.index_buffers(
+            num_draft, int(self.window_size), metadata_builder.row_ids.device
+        ).mask_pad_tail(metadata_builder.row_ids, scheduled_bs, running_bs)
+
     # ---- drafting entry points (called by the proposer) --------------------
 
-    def precompute_context_kv(
-        self,
-        main_hidden,
-        positions,
-        cu_seqlens_q,
-        write_per_batch: int,
-    ) -> None:
-        """Populate every stage's rolling target-KV window from target hidden.
+    def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
+        """``main_norm(main_proj(concat(aux)))`` -- the shared context.
 
-        Pass the flat ragged batch of all scheduled tokens with the real
-        ``cu_seqlens_q`` and ``write_per_batch = window_size``. See
-        :meth:`DSparkLayer.precompute_context_kv`.
+        Stage 0 owns main_proj/main_norm; the projection runs once and every
+        stage then writes its own rolling-KV rows from it (each stage has its
+        own kv cache and attention linears).
         """
-        self.model.precompute_context_kv(
-            main_hidden, positions, cu_seqlens_q, write_per_batch
-        )
+        stage0 = self.model.mtp[0]
+        return stage0.main_norm(_linear_out(stage0.main_proj(aux_concat)))
+
+    @property
+    def context_layers(self):
+        """Every backbone stage keeps its own window; `mtp` is already in order."""
+        return self.model.mtp
 
     def forward_spec(
         self,
@@ -858,7 +1166,7 @@ class DeepseekV4DSpark(nn.Module):
         """One DSpark draft block: parallel backbone + sequential Markov head.
 
         Takes no target hidden: the target context reaches the block through the
-        rolling KV window, which ``precompute_context_kv`` must have populated
+        rolling KV window, which ``write_context_kv`` must have populated
         for this step beforehand.
 
         ``num_draft`` selects the draft width; when the verify horizon
@@ -869,21 +1177,70 @@ class DeepseekV4DSpark(nn.Module):
             draft_token_ids: [B, num_draft]
             confidence: [B, num_draft]
         """
-        return self.model.forward_spec(input_ids, positions, num_draft=num_draft)
+        T = int(num_draft) if num_draft is not None else self.block_size
+
+        # num_draft is a python int, so the decorator does not mark it dynamic
+        # and it is baked into the compiled graph. It is constant for the
+        # process -- min(mtp_k, window_size) -- so baking is correct, but say so
+        # loudly rather than silently replaying a graph built for another width.
+        if self._compiled_num_draft is None:
+            self._compiled_num_draft = T
+        elif T != self._compiled_num_draft:
+            raise ValueError(
+                f"DSpark draft width changed after the first forward "
+                f"({self._compiled_num_draft} -> {T}). num_draft is baked into "
+                f"the compiled graph at CompilationLevel >= DYNAMO_ONCE."
+            )
+
+        return self.head_and_sample(
+            self.block_backbone(input_ids, positions, T), input_ids, T
+        )
+
+    def block_backbone(
+        self,
+        input_ids: torch.Tensor,  # [B]  anchor token per request (x0)
+        positions: torch.Tensor,  # [B]  anchor position per request
+        num_draft: int,
+    ):
+        """The parallel half: the compiled backbone over the whole draft width.
+
+        Returns the inner's ``(normed, hc_hidden)`` pair untouched -- the mHC
+        hidden is the pre-norm reduction the confidence head needs. Positions
+        are the ANCHOR's; expanding them across the block happens inside the
+        compiled region.
+        """
+        # __call__, not .forward -- the decorator's compiled dispatch lives there.
+        return self.model(input_ids, positions, num_draft)
+
+    def head_and_sample(self, out, anchor_ids: torch.Tensor, num_draft: int):
+        """The sequential half: LM head, then the Markov sampler. ``num_draft``
+        is taken for the shared surface and unused -- the width is carried by
+        ``hc_hidden``'s middle dimension."""
+        normed, hc_hidden = out
+        return self.model.head_and_sample(normed, hc_hidden, anchor_ids)
 
 
+@support_torch_compile
 class _DSparkInner(nn.Module):
-    """Inner module owning the DSpark backbone layers; embed/head set externally."""
+    """Inner module owning the DSpark backbone layers; embed/head set externally.
+
+    COMPILED — ``forward`` is the traced entry point. The decorator is here
+    rather than on ``DeepseekV4DSpark`` so the wrapper keeps its public
+    ``forward_spec`` / ``write_context_kv`` signatures (the proposer's hot
+    path is unchanged) and so ``write_context_kv`` stays eager: the
+    decorator only replaces ``__call__``, never other methods.
+    """
 
     def __init__(
         self,
         atom_config: "Config",
-        args: "DeepseekV4Args",
         *,
+        args: "DeepseekV4Args",
         num_stages: int,
         markov_rank: int,
         target_layer_ids: tuple,
         block_size: int,
+        write_per_batch: int,
         noise_token_id: int,
     ):
         super().__init__()
@@ -905,41 +1262,69 @@ class _DSparkInner(nn.Module):
                     markov_rank=markov_rank,
                     target_layer_ids=target_layer_ids,
                     block_size=block_size,
+                    write_per_batch=write_per_batch,
                     prefix=f"mtp.{i}",
                 )
                 for i in range(num_stages)
             ]
         )
         self.layers = self.mtp  # alias for reset_kv_cache iteration
+        # The fp8 index bundle is owned here (one per backbone) and allocated by
+        # `index_buffers`. Each stage borrows that accessor: `dspark_attention`
+        # only has the layer (from `static_forward_context`), so hand it a handle.
+        # A *bound method*, not the backbone itself -- an nn.Module set as a layer
+        # attribute would register as a child and cycle the module tree.
+        self._max_num_seqs = int(atom_config.max_num_seqs)
+        self._index_bufs: DSparkIndexBuffers | None = None
+        for layer in self.mtp:
+            layer.index_buffers = self.index_buffers
         self.embed = None  # set by share_with_target
         self.head = None
 
-    def precompute_context_kv(
-        self,
-        main_hidden,
-        positions,
-        cu_seqlens_q,
-        write_per_batch: int,
-    ) -> None:
-        # Stage 0 owns main_proj/main_norm; project once, reuse the rolling-KV
-        # write per stage (each stage has its own kv cache + attn linears).
-        stage0 = self.mtp[0]
-        main_x = _linear_out(stage0.main_proj(main_hidden))
-        main_x = stage0.main_norm(main_x)
-        for layer in self.mtp:
-            layer.precompute_context_kv(
-                main_x, positions, cu_seqlens_q, write_per_batch
-            )
+    def index_buffers(self, draft: int, window: int, device) -> "DSparkIndexBuffers":
+        """The backbone's one `DSparkIndexBuffers`, allocated once and cached.
 
-    def forward_spec(self, input_ids, positions, num_draft=None):
+        Sized at `max_num_seqs` and only ever sliced; `draft` (T) / `window` (W)
+        are fixed for the process, so the first call's shape is the only shape.
+        Lazy because the draft width is a forward argument (not known at build)
+        and the alloc must stay in the eager attention op, out of the traced
+        `forward`.
+        """
+        if self._index_bufs is None:
+            self._index_bufs = DSparkIndexBuffers.allocate(
+                self._max_num_seqs, draft, window, device
+            )
+        return self._index_bufs
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,  # [B]  anchor token per request (x0)
+        positions: torch.Tensor,  # [B]  anchor position per request
+        num_draft: int,  # draft width T; see the note below
+    ):
+        """TRACED ENTRY POINT — see the COMPILE BOUNDARY note at the top of this
+        file before editing anything reachable from here.
+
+        ``input_ids`` / ``positions`` are the only dynamic-shaped arguments; the
+        decorator marks dim 0 (the batch) dynamic on the first call.
+
+        ``num_draft`` is a python int, so it is NOT marked dynamic and is baked
+        permanently into the compiled graph. That is correct — the draft width is
+        ``min(mtp_k, window_size)``, both fixed for the process — and the caller
+        (``DeepseekV4DSpark.forward_spec``) raises if it ever changes.
+
+        Returns the block's hidden state, NOT tokens: ``(normed [B*T, dim],
+        hc_hidden [B, T, dim])``. The LM head and Markov sampler follow in the
+        uncompiled ``head_and_sample``.
+        """
         B = input_ids.shape[0]
         # Draft width defaults to the training block size but may be widened up to
         # the rolling window when num_speculative_tokens > block_size (the weights
         # are draft-width-agnostic; positions past the block size are RoPE-
         # extrapolated). Cap at window_size so the [window ++ draft] KV stays sane.
-        T = int(num_draft) if num_draft is not None else self.block_size
+        T = int(num_draft)
         # No main_proj here: the target context reaches the draft block through
-        # the rolling KV window (written by precompute_context_kv and gathered in
+        # the rolling KV window (written by write_context_kv and gathered in
         # each stage's attention), not through this forward's activations.
 
         # Build the draft block input ids: [anchor, noise, noise, ...].
@@ -951,13 +1336,8 @@ class _DSparkInner(nn.Module):
         # Per-block invariants (draft positions, window validity, gather indices)
         # depend only on (positions, T, W), so build them once and share across
         # every stage instead of recomputing them inside each stage's attention.
-        from atom.utils.forward_context import get_forward_context
-
         plan = _build_block_plan(
-            positions,
-            T,
-            self.mtp[0].window_size,
-            get_forward_context().context.is_dummy_run,
+            positions, T, self.mtp[0].window_size, self.mtp[0].dspark_fp8_planned
         )
 
         # ----- Parallel backbone: run all stages over the block in one pass ---
@@ -979,12 +1359,26 @@ class _DSparkInner(nn.Module):
         hc_hidden = self.head.hc_head(
             reduced, last.hc_head_fn, last.hc_head_scale, last.hc_head_base
         )  # [B*T, dim]
-        base_logits = self.head.get_logits(last.norm(hc_hidden)).view(
-            B, T, -1
-        )  # [B, T, vocab]
+        # The compiled region ENDS here, at the hidden state -- the LM head and
+        # the Markov sampler run eagerly in `head_and_sample`. Same division the
+        # V4 target uses: `DeepseekV4Model.forward` is the decorated part and
+        # `compute_logits` is a separate uncompiled step.
+        #
+        # Not a style choice: under TP, ParallelLMHead.forward does an aiter
+        # all_gather whose first call lazily JIT-loads an aiter module, and
+        # tracing that loader reaches shutil.which()/posix.stat, which Dynamo
+        # cannot trace -- the same graph-break-then-"VllmBackend can only be
+        # called once" failure the attention op fixes.
+        return last.norm(hc_hidden), hc_hidden.view(B, T, -1)  # [B*T,dim], [B,T,dim]
 
-        # ----- Sequential Markov head: sample the block left-to-right ---------
-        return self.forward_head(base_logits, hc_hidden.view(B, T, -1), input_ids)
+    def head_and_sample(self, normed, hc_hidden, anchor_ids):
+        """LM head + sequential Markov sampling. NOT TRACED (see `forward`).
+
+        normed: [B*T, dim] post-norm hidden; hc_hidden: [B, T, dim] pre-norm.
+        """
+        B, T, _ = hc_hidden.shape
+        base_logits = self.head.get_logits(normed).view(B, T, -1)  # [B, T, vocab]
+        return self.forward_head(base_logits, hc_hidden, anchor_ids)
 
     def forward_head(self, base_logits, hc_hidden, anchor_ids):
         """Apply the Markov transition bias position-by-position and sample.
@@ -1001,12 +1395,13 @@ class _DSparkInner(nn.Module):
         out_ids[:, 0] = anchor_ids
         markov_embeds = []
         for k in range(T):
-            bias, m_embed = last.markov_head(out_ids[:, k])  # [B, V], [B, r]
-            logits_k = base_logits[:, k].float() + bias
-            out_ids[:, k + 1] = logits_k.argmax(
-                dim=-1
-            )  # greedy (temp handled upstream)
-            markov_embeds.append(m_embed)
+            # Greedy (temperature handled upstream). The column is the op's
+            # destination, so no id is written twice.
+            markov_embeds.append(
+                last.markov_head.sample_next(
+                    out_ids[:, k], base_logits[:, k], out_ids[:, k + 1]
+                )
+            )
         confidence = last.confidence_head(
             hc_hidden, torch.stack(markov_embeds, dim=1)
         )  # [B, T]
