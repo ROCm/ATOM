@@ -793,11 +793,12 @@ start_router() {
   fi
   local -a router_policy_args=(--policy "${router_policy}")
   if [[ "${router_policy}" == "cache_aware" ]]; then
-    # Match the original InferenceX V4 P/D cache-aware routing parameters.
+    # Keep the InferenceX defaults, with a case-level absolute-load override.
     router_policy_args+=(
       --prefill-policy cache_aware --decode-policy cache_aware
       --cache-threshold 0.8
-      --balance-abs-threshold 20 --balance-rel-threshold 2.0
+      --balance-abs-threshold "${ROUTER_BALANCE_ABS_THRESHOLD:-20}"
+      --balance-rel-threshold 2.0
       --eviction-interval 300
     )
     router_rank_mapping_args=(--atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}")
