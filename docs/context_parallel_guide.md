@@ -357,79 +357,41 @@ wired, so it can default on without breaking mixed runs:
 | `-dcp 1` | `decode_context_parallel_size <= 1 (no DCP group)` — no AllGather Q to remove |
 | fp4 (`ATOM_USE_TRITON_MXFP4_BMM=1`) | `fp4 (mxfp4) BMM weights` — different scale structure |
 
-QREP composes with **MTP** (dense MLA and sparse / DSA): QREP only changes how
-`q_out` is produced (load-time replicated `q_proj` instead of a runtime
-AllGather), while the verify path's mask (the `cprr` kernel on dense, the
-sparse indexer's per-token candidate exchange on sparse / DSA) keys off the KV
-side, not off `q_out`'s provenance — the two are independent. Validated on
-GLM-5.2-FP8 sparse DCP8, fp8 KV, MTP=3 (gsm8k nshot=20): QREP on
-0.9469/0.9477 vs. QREP off 0.9492/0.9492, within combined stderr. That arm
-never selects `cprr` (sparse MTP verify flattens to `q_len=1` per token, see
-below), so it covers the sparse indexer side only. The `cprr` side is covered
-separately by Kimi-K3 + DSpark, tp8/dcp8, fp8 KV, `num_speculative_tokens=7`
-with QREP on (gsm8k 0.98 over 200 questions, nshot=5): K3's MLA layers are
-dense (`is_sparse=False`), and the target's block verify is causal with
-`q_len > 1`, so that run dispatches the `cprr` kernel
-(`mla_a8w8_qh32_qseqlen4_gqaratio32_lse_cprr_ps` appears in the server log)
-while QREP is active for every layer -- i.e. `cprr` runs on a QREP-produced
-`q_out`, which is the combination the removed `speculative_config` gate used
-to block.
+QREP composes with **MTP** (dense MLA and sparse / DSA): it only changes how
+`q_out` is produced, and the verify path's mask keys off the KV side, not
+`q_out`'s provenance — the two are independent. Validated both ways: GLM-5.2-FP8
+sparse, dcp8, MTP=3 (gsm8k, QREP on/off agree within stderr) covers the sparse
+indexer's verify path; Kimi-K3 + DSpark, dcp8 (gsm8k 0.98/200, nshot=5) covers
+dense MLA's `cprr` kernel running on a QREP-produced `q_out` — the combination
+the removed `speculative_config` gate used to block.
 
 A layer whose `q_proj` was not built with the QREP override falls back to
 AllGather automatically instead of misreading a narrow q as the wide QREP
-layout, regardless of the global flag — target models, MTP, eagle3, and
-DSpark are all wired today, so this is a safety net for a future model that
-isn't.
+layout — target models, MTP, eagle3, and DSpark are all wired today, so this
+is a safety net for a future model that isn't.
 
-The two log lines are deliberately asymmetric, so read them accordingly:
+To confirm QREP actually took effect (the config flag being `true` is not the
+same as it running): a wired layer logs `enable_query_replication is on and
+active ...` once per process; an unwired one logs `... layer N's q_proj was
+not built with qrep_tp_override ...` once per layer. The positive line only
+says QREP is on *somewhere* — on a fully wired model, check for the
+**absence of any fallback line** to confirm every layer got it.
 
-| | When | Granularity |
-|---|---|---|
-| `enable_query_replication is on and active (q_proj built with qrep_tp_override).` | at least one layer is wired | **once per process** (so once per rank), no layer number |
-| `... but layer N's q_proj was not built with qrep_tp_override -- falling back to AllGather Q for it` | a layer is not wired | **once per layer**, names the layer |
+Costs KV budget: replicating the query heads shrinks the KV pool by roughly
+5% (measured on DeepSeek-R1 tp8/dcp8: 235 016 → 221 020 blocks). Before this
+change, `speculative_config` unconditionally disabled QREP, so upgrading an
+existing MTP/eagle3/DSpark + DCP deployment now applies this cost where it
+didn't before, with no config change on your part — check KV capacity at
+startup if tuned tightly, or pass
+`--dcp-config '{"enable_query_replication": false}'` to opt back out.
 
-So the positive line only tells you QREP is on somewhere; it cannot tell you
-which layers use it. The check that QREP actually took effect on every layer
-is the **absence of any fallback line** — on a fully wired model you should
-see exactly one positive line per rank and no warnings at all. The flag being
-`true` is not the same as QREP running.
-
-Note it costs KV budget: replicating the query heads shrinks the KV pool by
-roughly 5% (measured on DeepSeek-R1 tp8/dcp8: 235 016 → 221 020 blocks).
-
-> **Upgrading an existing MTP/eagle3/DSpark + DCP deployment?** Before this
-> change, `speculative_config` being set unconditionally disabled QREP, so
-> `enable_query_replication`'s default of `true` had no effect under
-> speculative decode. It now applies there too, and the ~5% KV-pool cost
-> above lands on every such deployment on upgrade with no config change on
-> your part. If a deployment is tuned tightly against `--gpu-memory-utilization`
-> / a fixed `--max-model-len` / `--max-num-seqs`, check KV capacity at startup
-> after upgrading, or pass `--dcp-config '{"enable_query_replication": false}'`
-> to opt back out.
-
-**Known limitation: no effect under the vLLM plugin — confirmed harmless, not
-just unverified.** ATOM's global config always reports
-`decode_context_parallel_size = 1` in vLLM-plugin mode (the plugin config
-generator never sets it from vLLM's own
-`parallel_config.decode_context_parallel_size`) — deliberately, so ATOM's
-native DCP collectives and kernels stay out of vLLM's own separate DCP
-implementation. `qrep_tp_override` and `wants_qrep` both read this same
-value, so under the plugin `q_proj` is built at the plain per-rank width and
-`qrep_enabled` is frozen `False` at construction, with no log line either
-way, regardless of the vLLM-side DCP size.
-
-This cannot surface as a bug: `AttentionForVllmMLA` (`plugin/vllm/attention/
-layer_mla.py`) overrides `_forward_decode` and `_forward_prefill` with its
-own AllGather-based implementations under those names, never calls
-`super()` anywhere in the file, and never references `_q_proj_and_k_up_proj`,
-`_local_q_proj`, `_forward_prefill_mla`, or any `qrep_*` attribute — the only
-places that read `qrep_enabled`/`qrep_num_heads`/`W_K_qrep`. The plugin's own
-forward path is fully independent of `MLAAttention`'s QREP-aware code, and
-the `q_proj` it built (plain, never widened) is exactly what that path
-expects. The only cost is the missed optimization, not a correctness risk.
-Making it actually work would mean threading the real DCP size into just the
-QREP decision without also re-enabling the native DCP paths this separation
-exists to suppress — not attempted here.
+**No effect under the vLLM plugin** (confirmed harmless, not just
+unverified): ATOM's global config always reports `decode_context_parallel_size
+= 1` in vLLM-plugin mode, deliberately, so QREP never activates there and
+`q_proj` stays plain per-rank width. This can't surface as a bug — the
+plugin's `AttentionForVllmMLA` has its own, separately-named forward
+implementation that never touches any QREP-aware code path in `MLAAttention`
+— just a missed optimization, not a correctness risk.
 
 ### `enable_project_before_merge` (PBM)
 
