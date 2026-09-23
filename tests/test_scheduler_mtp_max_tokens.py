@@ -50,6 +50,10 @@ class TestMTPMaxTokens:
                 num_rejected=np.asarray([0]),
                 num_bonus=np.asarray([0]),
                 draft_token_ids=np.asarray([[20, 21, 22]]),
+                # What a pp=1 engine sends: `is_deferred_out` is
+                # `pipeline_parallel_size == 1`, and the window modelled above
+                # (drafts plus a lagging provisional run) is the deferred one.
+                is_deferred_out=True,
             ),
             stream_output_queue=stream_queue,
         )
