@@ -265,6 +265,15 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self._worker_state_stored: dict[int, int] = {}
         self._worker_state_store_failed: dict[int, int] = {}
         self._worker_state_load_failed: dict[str, int] = {}
+        # KDA stores wait until `wait_for_save`. That hook runs after the
+        # target forward and, when speculative decoding defers connector
+        # finalize, after `postprocess_mamba` has folded the accepted tokens
+        # into the boundary page. Recording the fence in `start_load_kv`
+        # copies the page before that write.
+        self._pending_kda_stores: list = []
+        # No-forward steps never call `wait_for_save`. Nothing writes the
+        # boundary page on those steps, so `get_finished` may flush instead.
+        self._kda_flush_stores_in_get_finished = False
         # Scheduler half of the recurrent leg.
         self._kda_planner = None
         self._state_load_failure_reports: dict[str, int] = {}
@@ -466,32 +475,47 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             summarize_layout_id(views.layout_id),
         )
 
-    def _dispatch_kda(self, metadata) -> None:
-        """Issue this step's recurrent transfers.
+    def _dispatch_kda_loads(self, metadata) -> None:
+        """Issue this step's recurrent loads. Stores are flushed later.
 
-        The store fence is recorded here and nowhere else. A boundary block is
-        written by ``preprocess_mamba``'s copy-on-write copy on the forward's
-        compute stream in this same step, and ``StagedTransfer`` gathers on a
-        private stream that never waits on it -- so without an event recorded on
-        the compute stream *now*, the gather may read the block's previous
-        occupant and store it under this boundary's prefix hash. One event for
-        the whole step: the copies were all enqueued before this point, so one
-        record after them fences every block in the batch.
+        Loads are on the TTFT path and write blocks of requests that are
+        parked, not blocks this forward is updating. Stores are the opposite:
+        the page they read is written by this step's forward and, with
+        speculative decoding, by ``postprocess_mamba`` after ``get_finished``.
+        ``wait_for_save`` is the hook that runs after both.
         """
         tier = self._kda_tier
         if tier is None:
             return
-        stores = getattr(metadata, "kda_stores", None) or ()
-        if stores:
-            ready_event = None
-            if torch.cuda.is_available():
-                ready_event = torch.cuda.Event()
-                ready_event.record()
-            for store in stores:
-                tier.submit_store(store, ready_event)
         for load in getattr(metadata, "kda_loads", None) or ():
             self._kda_expect.add(load.req_id)
             tier.submit_load(load)
+
+    def _stash_kda_stores(self, metadata) -> None:
+        stores = getattr(metadata, "kda_stores", None) or ()
+        if stores:
+            self._pending_kda_stores.extend(stores)
+
+    def _flush_kda_stores(self) -> None:
+        """D2H the stashed boundary pages, fenced to the compute stream now.
+
+        One event for the whole step. Every producer kernel queued on the
+        compute stream before this call -- the forward, and mamba postprocess
+        when this runs from ``wait_for_save`` -- is visible to the gather.
+        ``StagedTransfer`` reads on a private stream and does not wait on
+        that producer itself.
+        """
+        tier = self._kda_tier
+        stores = self._pending_kda_stores
+        self._pending_kda_stores = []
+        if tier is None or not stores:
+            return
+        ready_event = None
+        if torch.cuda.is_available():
+            ready_event = torch.cuda.Event()
+            ready_event.record()
+        for store in stores:
+            tier.submit_store(store, ready_event)
 
     def _join_kda(self, dense_recving: set[str]) -> set[str]:
         """Hold a finished dense load until its recurrent half has landed.
@@ -528,12 +552,22 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 self._worker_state_load_failed[req_id] = (
                     self._worker_state_load_failed.get(req_id, 0) + 1
                 )
-                logger.warning(
-                    "ATOM LMCache offload: recurrent state missing for %s; "
-                    "invalidating %d attention blocks so the prefix is recomputed",
-                    req_id,
-                    len(result.error_block_ids),
-                )
+                if not result.error_block_ids:
+                    # finished_recving with an empty invalid set is how vLLM
+                    # caches an MLA prefix whose KDA state never arrived.
+                    logger.error(
+                        "ATOM LMCache offload: recurrent state missing for %s "
+                        "and no attention block could be named; the external "
+                        "prefix cannot be invalidated",
+                        req_id,
+                    )
+                else:
+                    logger.warning(
+                        "ATOM LMCache offload: recurrent state missing for %s; "
+                        "invalidating %d attention blocks so the prefix is recomputed",
+                        req_id,
+                        len(result.error_block_ids),
+                    )
         return released
 
     def _attention_layers(self) -> dict[str, Any]:
@@ -553,7 +587,14 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         inner = getattr(metadata, "inner", None)
         if inner is not None:
             self._worker.start_load_kv(inner)
-        self._dispatch_kda(metadata)
+        self._dispatch_kda_loads(metadata)
+        self._stash_kda_stores(metadata)
+        # ``kv_connector_no_forward`` builds a context with no attention
+        # metadata and does not call ``wait_for_save``. There is no forward
+        # and no mamba postprocess on that step, so flushing from
+        # ``get_finished`` cannot race a writer.
+        attn_metadata = getattr(forward_context, "attn_metadata", None)
+        self._kda_flush_stores_in_get_finished = attn_metadata is None
         # The scheduler half's release list is picked up here rather than in
         # `get_finished` because this is the hook that runs on every step --
         # including the zero-token steps the engine is only turning the crank
@@ -601,12 +642,19 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         """Inert: saves are issued per request from ``build_connector_meta``."""
 
     def wait_for_save(self) -> None:
-        """Inert: saves are fire-and-forget on ATOM's save executor.
+        """Flush recurrent stores after the forward that writes their pages.
 
-        Blocking the forward on them would put offload on the critical path,
-        which is the opposite of what the tier is for. Completion still reaches
-        the scheduler via ``get_finished``.
+        Dense saves stay fire-and-forget; blocking the forward on the D2H
+        would put offload on the critical path. This hook does not wait for
+        the copy. It only records the fence and submits the job.
+
+        vLLM calls it after the target forward. With speculative decoding it
+        is deferred until after the draft model and after
+        ``postprocess_mamba``, which is the copy that writes the accepted
+        recurrent state into the boundary page. A fence taken in
+        ``start_load_kv`` lands before that copy.
         """
+        self._flush_kda_stores()
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Translate ATOM's four completion sets into vLLM's two.
@@ -653,6 +701,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self._worker_completions.extend(out.connector_completions)
 
         if self._kda_tier is not None:
+            if self._kda_flush_stores_in_get_finished:
+                self._flush_kda_stores()
+                self._kda_flush_stores_in_get_finished = False
             finished_recving = self._join_kda(finished_recving)
 
         finished_sending = set(self._pending_release_ids)

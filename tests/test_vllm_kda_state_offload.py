@@ -521,6 +521,50 @@ def test_unresolvable_destination_is_queued_as_a_failing_load():
     assert load.error_block_ids == (22,)
 
 
+def test_unaligned_hit_fails_closed_instead_of_writing_the_wrong_row():
+    """``n // block - 1`` and ``(n - 1) // block`` disagree when n is not a
+    multiple of the mamba block. The forward reads the second. Writing the
+    first stores a successful load into a block the forward never reads.
+
+    The hash block divides 70, so this is the alignment guard and not the
+    missing-key guard.
+    """
+    planner = make_planner(hash_block_size=10)
+    request = FakeRequest("r0")
+
+    planner.resolve_load(
+        request,
+        ([21, 22, 23], [11, 12, 13, 14]),
+        70,
+        ATTENTION_GROUP,
+        10,
+        MAMBA_BLOCK,
+    )
+
+    (load,) = planner.take_loads()
+    assert load.block_ids == ()
+    assert load.error_block_ids
+
+
+def test_a_missed_attention_slice_still_names_real_blocks():
+    """An empty invalid set lets vLLM cache the MLA prefix."""
+    planner = make_planner()
+    request = FakeRequest("r0")
+
+    planner.resolve_load(
+        request,
+        ([21], []),
+        CHUNK,
+        ATTENTION_GROUP,
+        64,
+        64,
+    )
+
+    (load,) = planner.take_loads()
+    assert load.block_ids == ()
+    assert load.error_block_ids == (21,)
+
+
 def test_no_external_tokens_queues_nothing():
     planner = make_planner()
     planner.resolve_load(
@@ -957,6 +1001,24 @@ def test_sweep_offers_every_chunk_aligned_boundary_below_the_frontier():
     )
 
     assert [store.block_ids for store in stores] == [(21,), (22,), (23,)]
+
+
+def test_an_uncached_hole_is_retried_without_restoring_a_later_boundary():
+    planner = make_planner()
+    pool = FakePool()
+    planner.bind_gpu_block_pool(pool)
+    request = FakeRequest("r1")
+    publish_boundary(pool, request, 2 * CHUNK, {MAMBA_GROUP: 22})
+
+    first = planner.collect_cached_boundary_stores({"r1": 2 * CHUNK}, {"r1": request})
+    assert [store.block_ids for store in first] == [(22,)]
+
+    second = planner.collect_cached_boundary_stores({"r1": 2 * CHUNK}, {"r1": request})
+    assert second == []
+
+    publish_boundary(pool, request, CHUNK, {MAMBA_GROUP: 11})
+    third = planner.collect_cached_boundary_stores({"r1": 2 * CHUNK}, {"r1": request})
+    assert [store.block_ids for store in third] == [(11,)]
 
 
 def test_a_boundary_is_offered_once_across_steps():

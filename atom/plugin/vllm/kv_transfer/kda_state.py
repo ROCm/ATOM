@@ -336,6 +336,11 @@ class _PendingStore:
     prefix_hash: int
     reports: int = 0
     failures: int = 0
+    # Which request offered this store. Cleared when that request is
+    # preempted or finishes, so the recomputed life can offer the boundary
+    # again; while it is set, a later sweep of the same request must not pin
+    # the same blocks a second time.
+    req_id: str | None = None
 
 
 @dataclass
@@ -526,9 +531,10 @@ class KdaBoundaryPlanner:
         # read by `cap_hit` -- ATOM's scheduler hands the hook a SeqView, which
         # carries no block hashes of its own.
         self._lookup_ctx: tuple[str, Any] | None = None
-        # How far the content-addressed sweep has already offered boundaries
-        # for each live request, so a boundary is offered once rather than on
-        # every step it remains resident.
+        # How far each live request's sweep has contiguously resolved.
+        # A boundary the pool does not hold yet stays behind this cursor, so
+        # a later step can store it once the state is actually registered.
+        # Advancing past that hole is what made a too-early miss permanent.
         self._swept: dict[str, int] = {}
         # Why this leg has nothing to show, when it has nothing to show. Until
         # these existed the whole leg was `logger.debug`, and a run that
@@ -644,9 +650,11 @@ class KdaBoundaryPlanner:
 
         The destination is positional and that is safe here, unlike on the save
         side: vLLM has just allocated this request's mamba blocks for the hit,
-        so row ``num_total_computed // mamba_block_size - 1`` of *each* mamba
+        so row ``(num_total_computed - 1) // mamba_block_size`` of *each* mamba
         group is the block the resuming forward will read its initial state
-        from. All of them, because the state is only whole across the groups.
+        from. That row is only well-defined when the hit ends on a mamba block
+        boundary; otherwise the load is failed and the prefix recomputed.
+        All of them, because the state is only whole across the groups.
 
         A destination that cannot be resolved is queued as a failing load rather
         than dropped. Dropping it would leave the dense leg to report success on
@@ -664,14 +672,28 @@ class KdaBoundaryPlanner:
             num_external_tokens,
             attention_block_size,
         )
-        block_ids = self._boundary_blocks(group_blocks, num_total_computed)
+        aligned = num_total_computed % self.mamba_block_size == 0
+        block_ids = (
+            self._boundary_blocks(group_blocks, num_total_computed) if aligned else ()
+        )
         if h is None or not block_ids:
+            # An unaligned end is not a row we can fill. preprocess_mamba reads
+            # ``(num_computed - 1) // block_size``, which is a different row
+            # from ``num_computed // block_size - 1`` unless the hit ends on a
+            # block boundary. Writing the wrong row leaves the forward on the
+            # previous occupant's state and ``get`` still returns success.
             logger.warning(
                 "KDA state offload: %s hit %d tokens but its boundary state has "
                 "no %s; failing the load so the prefix is recomputed",
                 req_id,
                 num_total_computed,
-                "key" if h is None else "destination block",
+                (
+                    "key"
+                    if h is None
+                    else (
+                        "block-aligned boundary" if not aligned else "destination block"
+                    )
+                ),
             )
             self._loads.append(KdaLoad(req_id, int(h or 0), (), error_blocks))
             return
@@ -688,7 +710,13 @@ class KdaBoundaryPlanner:
         half restore this module exists to prevent. One unresolved group
         therefore fails the whole load.
         """
-        row = num_total_computed // self.mamba_block_size - 1
+        # Same row ``preprocess_mamba`` reads as the initial state:
+        # ``(num_computed_tokens - 1) // block_size``. Equal to
+        # ``num_computed // block_size - 1`` only when num_computed is a
+        # whole number of mamba blocks; the caller rejects the other case.
+        if num_total_computed % self.mamba_block_size != 0:
+            return ()
+        row = (num_total_computed - 1) // self.mamba_block_size
         if row < 0:
             return ()
         block_ids: list[int] = []
@@ -719,13 +747,25 @@ class KdaBoundaryPlanner:
         unusable prefix; naming more would throw away blocks the GPU prefix
         cache legitimately owns.
         """
-        if attention_group_id >= len(group_blocks) or attention_block_size <= 0:
+        if attention_group_id >= len(group_blocks):
             return ()
         blocks = group_blocks[attention_group_id]
+        if attention_block_size <= 0:
+            return tuple(int(b) for b in blocks if int(b) > NULL_BLOCK_ID)
         local = max(0, num_total_computed - num_external_tokens)
         start = local // attention_block_size
         end = -(-num_total_computed // attention_block_size)
-        return tuple(int(b) for b in blocks[start:end] if int(b) > NULL_BLOCK_ID)
+        precise = tuple(int(b) for b in blocks[start:end] if int(b) > NULL_BLOCK_ID)
+        if precise:
+            return precise
+        # The slice missed every allocated attention block (the table is
+        # shorter than this block size, or every id in range is the null
+        # placeholder). An empty set here is silent wrong output: the failed
+        # KDA load still releases the request, and vLLM caches the MLA prefix
+        # when ``invalid_block_ids`` is empty. Naming every real attention
+        # block recomputes more than the external hit, which is the safe
+        # direction.
+        return tuple(int(b) for b in blocks if int(b) > NULL_BLOCK_ID)
 
     def take_loads(self) -> list[KdaLoad]:
         loads, self._loads = self._loads, []
@@ -811,11 +851,13 @@ class KdaBoundaryPlanner:
                 if h is None:
                     continue
                 block_ids = tuple(blocks[group_id] for group_id in self.group_ids)
-                accepted.append(self._issue_store(h, block_ids))
+                accepted.append(self._issue_store(h, block_ids, req_id=req_id))
                 self._counters["handoff_stores"] += 1
         return accepted
 
-    def _issue_store(self, prefix_hash: int, block_ids: tuple[int, ...]) -> KdaStore:
+    def _issue_store(
+        self, prefix_hash: int, block_ids: tuple[int, ...], req_id: str | None = None
+    ) -> KdaStore:
         """Pin a boundary's blocks and queue the job that copies them out.
 
         The pin is taken here, at submission, and released in
@@ -827,7 +869,9 @@ class KdaBoundaryPlanner:
         """
         self._next_op_id += 1
         store = KdaStore(self._next_op_id, prefix_hash, block_ids)
-        self._pending_stores[store.op_id] = _PendingStore(block_ids, prefix_hash)
+        self._pending_stores[store.op_id] = _PendingStore(
+            block_ids, prefix_hash, req_id=None if req_id is None else str(req_id)
+        )
         pool = self._pool
         if pool is not None:
             pool.touch([pool.blocks[block_id] for block_id in block_ids])
@@ -876,48 +920,67 @@ class KdaBoundaryPlanner:
             frontier = int(frontier)
             cursor = self._swept.get(req_id, 0)
             boundary = ((cursor // self.chunk_size) + 1) * self.chunk_size
+            # Advance only through a contiguous resolved prefix. A hole (no
+            # hash yet, or the pool does not hold the state yet) stays at the
+            # cursor so the next step retries it. Later boundaries in this
+            # step are still offered; an in-flight offer is not repeated.
+            advanced = cursor
+            blocked = False
             while boundary <= frontier:
                 self._counters["sweep_offered"] += 1
-                store = self._store_for_cached_boundary(block_hashes, boundary)
+                store, retry = self._store_for_cached_boundary(
+                    block_hashes, boundary, req_id
+                )
                 if store is not None:
                     accepted.append(store)
                     self._counters["sweep_stores"] += 1
+                if retry:
+                    blocked = True
+                elif not blocked:
+                    advanced = boundary
                 boundary += self.chunk_size
-            self._swept[req_id] = max(cursor, frontier)
+            self._swept[req_id] = max(cursor, advanced)
         return accepted
 
     def _store_for_cached_boundary(
-        self, block_hashes, boundary_tokens: int
-    ) -> KdaStore | None:
-        """The store job for one chunk-aligned boundary, or None.
+        self, block_hashes, boundary_tokens: int, req_id: str
+    ) -> tuple[KdaStore | None, bool]:
+        """The store job for one chunk-aligned boundary, and whether to retry.
 
-        None is returned -- and counted -- rather than raised for all three of
-        the ordinary reasons: vLLM has not hashed that far, the mamba groups do
-        not hold that boundary any more, or this index already claims it.
+        ``(None, True)`` is a hole: vLLM has not hashed that far, or the pool
+        does not hold the state yet. The sweep must not move its cursor past
+        it. ``(None, False)`` is resolved without a new store (already indexed,
+        or already pinned for this request).
         """
         h = self.boundary_hash(block_hashes, boundary_tokens)
         if h is None:
             self._counters["sweep_no_hash"] += 1
-            return None
-        if h in self._index.hashes:
-            # Already stored once. Re-storing would move the same bytes under
-            # the same key and buy nothing; the optimistic index treats a later
-            # eviction as a failed load, which forgets the hash and lets the
-            # next sweep past this boundary offer it again.
+            return None, True
+        if h in self._index.hashes or self._offer_in_flight(h, req_id):
+            # Already stored once, or pinned and waiting for rank quorum.
+            # Re-storing would move the same bytes under the same key. A
+            # failed load forgets the hash, and ``forget_request`` drops the
+            # in-flight claim, so a later sweep can offer it again.
             self._counters["sweep_known"] += 1
-            return None
+            return None, False
         blocks = self._pool.get_cached_block(
             block_hashes[boundary_tokens // self.hash_block_size - 1],
             list(self.group_ids),
         )
         if not blocks:
             self._counters["sweep_uncached"] += 1
-            return None
+            return None, True
         block_ids = tuple(int(block.block_id) for block in blocks)
         if any(block_id <= NULL_BLOCK_ID for block_id in block_ids):
             self._counters["sweep_uncached"] += 1
-            return None
-        return self._issue_store(h, block_ids)
+            return None, True
+        return self._issue_store(h, block_ids, req_id=req_id), False
+
+    def _offer_in_flight(self, prefix_hash: int, req_id: str) -> bool:
+        for pending in self._pending_stores.values():
+            if pending.prefix_hash == prefix_hash and pending.req_id == req_id:
+                return True
+        return False
 
     def forget_request(self, req_id: str) -> None:
         """Drop a finished or preempted request's sweep cursor.
@@ -926,7 +989,14 @@ class KdaBoundaryPlanner:
         frontier rewound; keeping the cursor would skip every boundary it
         recomputes. Dropping it is also what keeps the dict bounded.
         """
-        self._swept.pop(str(req_id), None)
+        req_id = str(req_id)
+        self._swept.pop(req_id, None)
+        # The in-flight pin stays until quorum -- those blocks may still be
+        # mid-copy. Dropping the request id is what lets the recomputed life
+        # offer the boundary again instead of treating the old pin as "known".
+        for pending in self._pending_stores.values():
+            if pending.req_id == req_id:
+                pending.req_id = None
 
     def absorb_reports(self, stored, failed) -> None:
         """Unpin a boundary's blocks once every rank has reported on them.
