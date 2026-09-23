@@ -137,6 +137,7 @@ def mla_builder_cls():
         ),
         "atom.utils.block_convert": _module(
             "atom.utils.block_convert",
+            decompose_slots_triton=noop,
             kv_indices_generate_triton=noop,
             mtp_prepare_decode_mla_kernel=noop,
         ),
