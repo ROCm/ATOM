@@ -42,7 +42,6 @@ from atom.distributed.pp_comm import (
 )
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
 from atom.distributed.ulysses_sp import (
-    attn_head_shard_size,
     get_sp_world_size,
     set_sp_world_size,
     sp_gather_tokens,
@@ -649,9 +648,7 @@ class ModelRunner:
         # cross-rank gather before the LM head can run.
         # tp_world_size: how many TP shards have a process.
         # They differ under simulated TP and under SP.
-        self.world_size = (
-            config.tensor_parallel_size * config.sequence_parallel_size
-        )
+        self.world_size = config.tensor_parallel_size * config.sequence_parallel_size
         self.tp_world_size = config.tp_world_size
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.tp_world_size}"
@@ -4089,9 +4086,7 @@ class ModelRunner:
                             with torch.cuda.graph(
                                 graph, self.graph_pool, stream=capture_ctx.stream
                             ):
-                                model_output = self.model(
-                                    model_ids, model_positions
-                                )
+                                model_output = self.model(model_ids, model_positions)
                                 outputs[:local_tokens] = model_output
                                 if self.logits_in_graph:
                                     graph_logits = self.model.compute_logits(

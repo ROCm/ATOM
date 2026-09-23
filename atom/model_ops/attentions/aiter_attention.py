@@ -9,7 +9,6 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
-from aiter.dist.parallel_state import get_tp_group
 
 from atom.config import _is_minimax_m3_config
 from atom.distributed.ulysses_sp import attn_head_shard_size
@@ -444,9 +443,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         config = self.model_runner.config
         hf_config = config.hf_config
         num_query_heads = self.num_attention_heads
-        num_kv_heads = max(
-            1, hf_config.num_key_value_heads // attn_head_shard_size()
-        )
+        num_kv_heads = max(1, hf_config.num_key_value_heads // attn_head_shard_size())
         block_size = self.block_size
 
         var = self.model_runner.forward_vars
@@ -1387,9 +1384,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         config = self.model_runner.config
         hf_config = config.hf_config
         num_query_heads = self.num_attention_heads
-        num_kv_heads = max(
-            1, hf_config.num_key_value_heads // attn_head_shard_size()
-        )
+        num_kv_heads = max(1, hf_config.num_key_value_heads // attn_head_shard_size())
         p = f"ub{ubatch_idx}_"
         var = self.model_runner.forward_vars
 
