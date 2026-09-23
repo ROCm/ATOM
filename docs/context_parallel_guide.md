@@ -407,17 +407,29 @@ roughly 5% (measured on DeepSeek-R1 tp8/dcp8: 235 016 → 221 020 blocks).
 > after upgrading, or pass `--dcp-config '{"enable_query_replication": false}'`
 > to opt back out.
 
-**Known limitation: no effect under the vLLM plugin.** ATOM's global config
-always reports `decode_context_parallel_size = 1` in vLLM-plugin mode (the
-plugin config generator never sets it from vLLM's own
+**Known limitation: no effect under the vLLM plugin — confirmed harmless, not
+just unverified.** ATOM's global config always reports
+`decode_context_parallel_size = 1` in vLLM-plugin mode (the plugin config
+generator never sets it from vLLM's own
 `parallel_config.decode_context_parallel_size`) — deliberately, so ATOM's
 native DCP collectives and kernels stay out of vLLM's own separate DCP
 implementation. `qrep_tp_override` and `wants_qrep` both read this same
-value, so under the plugin QREP is silently never active, with no log line
-either way, regardless of the vLLM-side DCP size. Making it work would mean
-threading the real DCP size into just the QREP decision without also
-re-enabling the native DCP paths this separation exists to suppress — not
-attempted here.
+value, so under the plugin `q_proj` is built at the plain per-rank width and
+`qrep_enabled` is frozen `False` at construction, with no log line either
+way, regardless of the vLLM-side DCP size.
+
+This cannot surface as a bug: `AttentionForVllmMLA` (`plugin/vllm/attention/
+layer_mla.py`) overrides `_forward_decode` and `_forward_prefill` with its
+own AllGather-based implementations under those names, never calls
+`super()` anywhere in the file, and never references `_q_proj_and_k_up_proj`,
+`_local_q_proj`, `_forward_prefill_mla`, or any `qrep_*` attribute — the only
+places that read `qrep_enabled`/`qrep_num_heads`/`W_K_qrep`. The plugin's own
+forward path is fully independent of `MLAAttention`'s QREP-aware code, and
+the `q_proj` it built (plain, never widened) is exactly what that path
+expects. The only cost is the missed optimization, not a correctness risk.
+Making it actually work would mean threading the real DCP size into just the
+QREP decision without also re-enabling the native DCP paths this separation
+exists to suppress — not attempted here.
 
 ### `enable_project_before_merge` (PBM)
 
