@@ -12,9 +12,19 @@ import types
 from unittest.mock import patch
 
 import pytest
+
+# Named on the module, not on "aiter", for the reason tests/test_dspark.py gives:
+# a test collected after one that stubs `sys.modules["aiter"]` dies on a symbol
+# rather than the name, and `exc_type` turns that ImportError into a skip too.
+mod_eagle = pytest.importorskip(
+    "atom.spec_decode.eagle_proposer",
+    reason="the drafter imports aiter at module load",
+    exc_type=ImportError,
+)
+
 import torch
 
-from atom.spec_decode.eagle_proposer import EagleProposer
+EagleProposer = mod_eagle.EagleProposer
 
 TARGET_QUERY_WIDTH = 5  # mtp_k=4 verify: 1 + 4 rows per sequence
 
