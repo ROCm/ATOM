@@ -1072,6 +1072,62 @@ def test_qrep_enabled_for_layer_falls_back_when_scale_not_row_sliceable():
     ), "a widened q_proj whose scale can't be row-sliced must still fall back"
 
 
+_ATTENTION_MLA_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "atom"
+    / "model_ops"
+    / "attention_mla.py"
+)
+
+
+def test_mlaattention_init_actually_calls_qrep_enabled_for_layer():
+    """Pins the real call site, not just the functions it calls.
+
+    Every test above exercises `qrep_enabled_for_layer` / `q_proj_is_qrep_widened`
+    / `q_proj_has_row_sliceable_scale` directly -- none of them would notice if
+    `MLAAttention.__init__`'s own `self.qrep_enabled = qrep_enabled_for_layer(...)`
+    were changed to pass the wrong arguments, hardcode a value, or call
+    something else entirely. Read by `ast` on the source text, not by
+    importing: `attention_mla.py` needs triton/aiter at module scope, so this
+    stays on the CPU gate like the rest of this file's QREP coverage.
+    """
+    tree = ast.parse(_ATTENTION_MLA_PATH.read_text(encoding="utf-8"))
+    calls = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "qrep_enabled_for_layer"
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Attribute)
+        and node.targets[0].attr == "qrep_enabled"
+    ]
+    assert len(calls) == 1, (
+        "expected exactly one `self.qrep_enabled = qrep_enabled_for_layer(...)` "
+        f"assignment in attention_mla.py; found {len(calls)}"
+    )
+    (call,) = calls
+    assert not call.keywords, (
+        "expected qrep_enabled_for_layer's call site to use positional args"
+    )
+
+    def _name(node):
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            return f"{node.value.id}.{node.attr}"
+        return None
+
+    arg_names = [_name(arg) for arg in call.args]
+    assert arg_names == [
+        "wants_qrep",
+        "self.q_proj",
+        "self.qrep_num_heads",
+        "self.qk_head_dim",
+    ], f"qrep_enabled_for_layer's call site changed shape: got {arg_names}"
+
+
 # ──────────────── QREP wiring at the q_proj producers (CPU, source-level) ──
 #
 # `q_proj_is_qrep_widened` above is the safety net: a q_proj that was never
