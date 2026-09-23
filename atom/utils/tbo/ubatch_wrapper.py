@@ -178,9 +178,9 @@ class UBatchWrapper(nn.Module):
         errors: list[Exception | None] = [None] * N
 
         device = input_ids.device
-        assert N <= self._num_workers, (
-            f"TBO needs {N} ubatch workers but pool has {self._num_workers}"
-        )
+        assert (
+            N <= self._num_workers
+        ), f"TBO needs {N} ubatch workers but pool has {self._num_workers}"
         self._ensure_workers(device)
 
         def _make_job(idx):
