@@ -498,7 +498,7 @@ two-pass delta. The baseline to beat is the one in
 
 The null above is a property of that **client**, not of the tier. Re-measured at
 the same natural 0.85 pool with a controlled-prefix synthetic workload, the tier
-goes from supplying 0.30% of prompt tokens to supplying **~82%**, and throughput
+goes from supplying 0.30% of prompt tokens to supplying **82-88%**, and throughput
 moves with it. Each row is 1800 s, TP8, seed 530419, `PREFIX_POOL=16`,
 `--prompt-prefix-length 27648`, `--num-dataset-entries 256`, tier **90 GiB/rank**,
 n=1.
@@ -511,6 +511,7 @@ n=1.
 | 20 | OFF | 1895 | 1.05 | 536.43 | 35.07 | 1018.62 |  0    | 79.86 |
 | 24 | ON  | 2707 | 1.50 | 766.07 | 28.59 |  909.09 | 82.65 | 10.42 |
 | 24 | OFF | 2118 | 1.17 | 599.62 | 37.74 | 1105.80 |  0    | 79.93 |
+| 32 | ON  | 3028 | 1.67 | 856.28 | 34.55 |  989.26 | 87.73 |  5.70 |
 | 32 | OFF | 2283 | 1.26 | 646.09 | 47.00 | 1288.97 |  0    | 80.04 |
 
 Deltas are taken from **request counts** over identical 1800 s windows, not from
@@ -520,11 +521,31 @@ already +/-0.5%.
 - conc 16: **+20.5%**  (2226 vs 1847)
 - conc 20: **+22.4%**  (2320 vs 1895)
 - conc 24: **+27.8%**  (2707 vs 2118)
+- conc 32: **+32.6%**  (3028 vs 2283)
 
 Recompute (`1 - local_HBM_hit - tier_supplied`) is what moves: ON
-7.29 / 7.17 / 6.93% against OFF 20.17 / 20.14 / 20.07%, i.e. **2.8x** less work
-recomputed at every concurrency. The conc-32 ON arm was never run -- the sweep's
-host-memory gate never cleared -- so conc 32 has an OFF arm only and no delta.
+7.29 / 7.17 / 6.93 / 6.57% against OFF 20.17 / 20.14 / 20.07 / 19.96%, i.e.
+**2.8x to 3.0x** less work recomputed, the ratio widening with concurrency.
+
+The conc-32 ON arm ran a day after the other seven (2026-09-23 03:17). The sweep
+itself never reached it: `wait_for_gpus.sh` gates on 756 GiB of raw `MemFree`
+(8 ranks x 90 GiB x 1.05) and the host was at 553. The GPUs were idle; what held
+the gate was 1,068 GiB of K3 weights resident in the page cache, one arm's NFS
+re-read at a time, measured per-file with `fincore`. Releasing them with
+`posix_fadvise(POSIX_FADV_DONTNEED)` -- clean pages only, no `drop_caches`, no
+peer's memory touched -- moved `MemFree` 467 -> 1539 GiB and the gate cleared on
+the next poll. The arm is otherwise identical to the other seven: same container,
+image digest, `atom_head`, tier, seed and client geometry, and the same
+`GPU KV cache size: 1,886,245 tokens / 28.78x`.
+
+One cosmetic difference in its log: an `EngineDeadError` from `AsyncLLM
+output_handler` at 03:47:27. It is teardown, not a fault -- the same second
+carries `[shutdown] API server: shutdown triggered` and the driver's own SIGTERM
+(`run_k3_arm.sh` tears down only after `verdict.txt` is written, i.e. after
+aiperf and the metrics scrape), the last engine log 5 s earlier is healthy
+(`Running: 1 reqs`, 734.9 tok/s), and aiperf reports `was_cancelled=False` with
+an empty `error_summary` over all 3,028 requests. The other arms simply won the
+race between output-handler cancellation and the engine's exit.
 
 **What differs from the pair above, and what does not.** The HBM pool is *not*
 the difference: both working points ran with no `--num-gpu-blocks-override`, and
@@ -553,27 +574,44 @@ as lanes are added:
 | 16 | 704 | 270,336 tok | yes |
 | 20 | 484 | 185,856 tok | yes |
 | 24 | 264 | 101,376 tok | yes |
+| 32 | -176 | none | yes (no HBM floor) |
 
 The upper edge is the tier: 90 GiB/rank at 56,448 B/token is 1,711,961 tokens,
-well above `d`. So `d` sits inside `[reusable prefix, tier)` at all three
-concurrencies -- which is why HBM answers only ~11% and the tier collects ~82%
--- and the band's lower edge drops as concurrency rises, which is the direction
-the gain moves (+20.5% -> +27.8%). At conc 32 the formula goes negative
-(`1584 - 32 x 55 = -176`): there is no reusable prefix left at all, so the ON
-arm that was never run would have been the most tier-dependent of the set.
+well above `d`. So `d` sits inside `[reusable prefix, tier)` at every
+concurrency -- which is why HBM answers only ~11% and the tier collects ~82% --
+and the band's lower edge drops as concurrency rises, which is the direction the
+gain moves (+20.5% -> +32.6%).
+
+At conc 32 the formula goes negative (`1584 - 32 x 55 = -176`): the live requests
+claim more blocks than the pool holds, so no reusable prefix survives between
+turns and every reuse must come from the tier. That was written as a prediction
+before the arm ran, and the arm confirms it: conc 32 is the most tier-dependent
+point of the set by a clear margin -- tier **87.73%** against 81.6-82.7% at the
+other three, HBM local hit **5.70%** against 10.4-11.1% -- and it carries the
+largest gain (+32.6%). The prediction was directional only; the size of the step
+was not predicted.
 
 Comparability *within* this table was checked rather than asserted. Mean input
-length is identical to the digit across all six arms (32,333.87 tokens); a
+length is identical to the digit across all eight arms (32,333.87 tokens); a
 per-pair `run.env` diff shows only `arm=` differing (plus 1 GiB of host
-`MemFree` on the conc-16 pair); `atom_head` is `6f66121b7d` in every arm.
+`MemFree` on the conc-16 pair, and the conc-32 pair's 1437 vs 1539 GiB from
+the page-cache release above -- an observation, not a knob); `atom_head` is
+`6f66121b7d` in every arm.
 `atom_dirty` is 2 on the conc-16 pair and 3 on the later ones -- the extra file
 is an untracked `scheduler.py` that no arm imported, so every arm ran the same
 code.
 
 Every arm is **n=1**. There is no repetition at any single working point, so no
-noise floor: the +20.5/22.4/27.8% figures carry no error bar. They are reported
-because the direction is the same at three concurrencies and the recompute
-identity moves with them, not because a single pair would be conclusive.
+noise floor: the +20.5/22.4/27.8/32.6% figures carry no error bar. They are
+reported because the direction is the same at four concurrencies, the trend is
+monotone in the direction the band arithmetic predicts, and the recompute
+identity moves with them -- not because a single pair would be conclusive.
+
+The trend also runs *with* the known bias recorded in `run_sweep.sh`: holding the
+prefix pool fixed puts `d` further above the floor as concurrency rises, which
+favours hits at high concurrency. A rising gain is therefore the direction that
+bias would also produce, and this table cannot separate the two. A falling trend
+would have been the bias-free reading.
 
 ## Related
 
