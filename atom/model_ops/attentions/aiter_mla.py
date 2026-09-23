@@ -437,21 +437,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self.persistent_num_heads = self.padded_num_attention_heads
 
         if self.sparse_dcp_metadata_rebuild:
-            # sparse_prefill_num_heads/sparse_mtp_num_heads below reuse
-            # persistent_num_heads (decode's width function), not
-            # mla_dcp_sparse_prefill_num_heads (what attention_mla.py actually
-            # pads the gathered Q to). They agree for every head count in
-            # production today, but decode's persistent branch returns an
-            # unrounded multiple of 16 while sparse prefill rounds up to
-            # 16/32/64/128 -- assert they still agree rather than let a
-            # future mismatch surface as a corrupted reduce write.
-            #
-            # Both sides here use the default min_kernel_heads=16, same as
-            # persistent_num_heads above -- this only checks the two width
-            # functions agree at that floor. A model passing MLAAttention a
-            # higher min_query_heads (Kimi-K3 DSpark: 32, for fp8 + 2-wide
-            # non-causal blocks) has already diverged from that floor before
-            # this assert runs; this predates QREP and is not re-verified here.
+            # persistent_num_heads above is decode's width; sparse prefill
+            # rounds differently and can disagree (see
+            # mla_dcp_sparse_prefill_num_heads's docstring) -- catch that here
+            # instead of a corrupted reduce write. Both sides use the default
+            # min_kernel_heads=16, so this doesn't cover a model overriding
+            # min_query_heads (Kimi-K3 DSpark: 32), a pre-existing gap
+            # unrelated to QREP.
             expected_sparse_prefill_num_heads = mla_dcp_sparse_prefill_num_heads(
                 self.num_attention_heads,
                 self.dcp_world_size,
