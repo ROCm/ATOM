@@ -217,7 +217,6 @@ def _flydsl_pa_decode_num_seqs(
     return num_seqs
 
 
-
 _FLYDSL_PLAN_MAX_BATCH = 4096
 _FLYDSL_PLAN_SCRATCH: dict[tuple, tuple] = {}
 
@@ -229,14 +228,14 @@ def flydsl_plan_matches(plan, num_seqs: int, num_kv_heads: int) -> bool:
     is aiter's `validate` raising, i.e. a dead worker. Checked here so the call
     can fall back to the static path instead.
     """
-    return (
-        int(plan.reduce_info.shape[0]) == int(num_seqs)
-        and int(plan.num_kv_heads) == int(num_kv_heads)
-    )
+    return int(plan.reduce_info.shape[0]) == int(num_seqs) and int(
+        plan.num_kv_heads
+    ) == int(num_kv_heads)
 
 
-def _flydsl_plan_scratch(plan, query_length, query_group_size, head_dim,
-                         out_dtype, device):
+def _flydsl_plan_scratch(
+    plan, query_length, query_group_size, head_dim, out_dtype, device
+):
     """Partial-output buffers for a planned call, allocated once per shape.
 
     Planned output is packed [kv_heads, capacity, rows(, D)] where the static
@@ -343,8 +342,12 @@ def run_pa_decode_gluon(
         if work_plan is not None:
             nkv = k_cache.shape[1]
             ml, es, tmp = _flydsl_plan_scratch(
-                work_plan, max_seqlen_q, q.shape[-2] // nkv, q.shape[-1],
-                output.dtype, context_lens.device,
+                work_plan,
+                max_seqlen_q,
+                q.shape[-2] // nkv,
+                q.shape[-1],
+                output.dtype,
+                context_lens.device,
             )
 
         # Slice off ATOM's sequence-axis padding so the rectangle FlyDSL
@@ -363,9 +366,11 @@ def run_pa_decode_gluon(
             # `pa_decode` accepts, since it asserts the two are equal. The
             # static one gets the count `get_recommended_splits` sized the
             # scratch for.
-            max_context_partition_num
-            if work_plan is None
-            else int(work_plan.max_partitions),
+            (
+                max_context_partition_num
+                if work_plan is None
+                else int(work_plan.max_partitions)
+            ),
             context_partition_size,
             compute_type,
             q_scale,

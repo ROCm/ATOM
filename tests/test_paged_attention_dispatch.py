@@ -462,9 +462,7 @@ class TestWorkPlanWiring:
 
         from atom.model_ops.attentions import aiter_attention as aa
 
-        src = inspect.getsource(
-            aa.AiterAttentionMetadataBuilder.prepare_mtp_decode
-        )
+        src = inspect.getsource(aa.AiterAttentionMetadataBuilder.prepare_mtp_decode)
         assert "refresh_flydsl_plan" in src
 
     def test_scratch_is_keyed_by_capacity(self):
@@ -478,12 +476,15 @@ class TestWorkPlanWiring:
         from atom.model_ops.base_attention import _flydsl_plan_scratch
 
         dev = torch.device("cuda", 0)
-        small = _flydsl_plan_scratch(_FakePlan(capacity=512), 4, 16, 128,
-                                     torch.bfloat16, dev)
-        again = _flydsl_plan_scratch(_FakePlan(capacity=512), 4, 16, 128,
-                                     torch.bfloat16, dev)
-        big = _flydsl_plan_scratch(_FakePlan(capacity=1024), 4, 16, 128,
-                                   torch.bfloat16, dev)
+        small = _flydsl_plan_scratch(
+            _FakePlan(capacity=512), 4, 16, 128, torch.bfloat16, dev
+        )
+        again = _flydsl_plan_scratch(
+            _FakePlan(capacity=512), 4, 16, 128, torch.bfloat16, dev
+        )
+        big = _flydsl_plan_scratch(
+            _FakePlan(capacity=1024), 4, 16, 128, torch.bfloat16, dev
+        )
         assert small[0] is again[0], "same shape should reuse"
         assert big[0] is not small[0], "a grown capacity must not reuse"
         assert big[0].shape[1] == 1024
@@ -519,9 +520,9 @@ class TestWorkPlanWiring:
         assert builder.refresh_flydsl_plan(ctx(8)) is first, "same rung must reuse"
         other = builder.refresh_flydsl_plan(ctx(16))
         assert other is not first, "a different rung needs its own plan"
-        assert builder.refresh_flydsl_plan(ctx(8)) is first, (
-            "returning to a rung must hand back the plan its graph captured"
-        )
+        assert (
+            builder.refresh_flydsl_plan(ctx(8)) is first
+        ), "returning to a rung must hand back the plan its graph captured"
 
     def test_a_plan_built_for_another_batch_is_refused(self):
         """The guard that keeps a shape mismatch from killing the worker.
@@ -606,13 +607,13 @@ class TestWorkPlanWiring:
         # Draft pass: its own buffer, sliced to running_bs -- never scheduled_bs.
         assert "prepare_mtp_decode" in args, "draft no longer refreshes the plan"
         for arg in args["prepare_mtp_decode"]:
-            assert isinstance(arg, ast.Subscript), (
-                f"draft plan must be sliced to running_bs, got {ast.dump(arg)}"
-            )
+            assert isinstance(
+                arg, ast.Subscript
+            ), f"draft plan must be sliced to running_bs, got {ast.dump(arg)}"
             upper = getattr(arg.slice, "upper", None)
-            assert isinstance(upper, ast.Name) and upper.id == "running_bs", (
-                f"draft plan must be sliced to running_bs, got {ast.dump(arg)}"
-            )
+            assert (
+                isinstance(upper, ast.Name) and upper.id == "running_bs"
+            ), f"draft plan must be sliced to running_bs, got {ast.dump(arg)}"
 
     def test_gluon_is_the_default_and_the_env_short_circuits(self):
         """The env is the first gate, and off is the default.
@@ -636,9 +637,9 @@ class TestWorkPlanWiring:
         assert envs.ATOM_PA_FLYDSL is False, "FlyDSL must be opt-in"
 
         src = inspect.getsource(ba.run_pa_decode_gluon)
-        assert "envs.ATOM_PA_FLYDSL and _flydsl_pa_decode_num_seqs" in src, (
-            "the env gate is gone, or no longer short-circuits the capability check"
-        )
+        assert (
+            "envs.ATOM_PA_FLYDSL and _flydsl_pa_decode_num_seqs" in src
+        ), "the env gate is gone, or no longer short-circuits the capability check"
 
     def test_planner_needs_flydsl(self, monkeypatch):
         """With FlyDSL off the builder must not build a plan either.

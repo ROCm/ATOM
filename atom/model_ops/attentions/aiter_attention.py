@@ -798,8 +798,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         if not (envs.ATOM_PA_FLYDSL and envs.ATOM_PA_FLYDSL_PLAN):
             return None
         # From base_attention, not duplicated: the op checks the same bound.
-        from atom.model_ops.base_attention import _FLYDSL_PLAN_MAX_BATCH
         from aiter.ops.flydsl.pa_decode import plan_pa_decode
+
+        from atom.model_ops.base_attention import _FLYDSL_PLAN_MAX_BATCH
 
         n = int(context_lens.shape[0])
         if not 1 <= n <= _FLYDSL_PLAN_MAX_BATCH:
@@ -811,19 +812,22 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         key = (n, self._flydsl_kv_heads, context_lens.device.index)
         plan = self._flydsl_plans.get(key)
         if plan is None:
-            plan = plan_pa_decode(
-                context_lens, self._flydsl_kv_heads, query_length=1
-            )
+            plan = plan_pa_decode(context_lens, self._flydsl_kv_heads, query_length=1)
             self._flydsl_plans[key] = plan
             logger.info(
                 "flydsl work plan: num_seqs=%d kv_heads=%d max_partitions=%d "
                 "capacity=%d",
-                n, self._flydsl_kv_heads,
-                int(plan.max_partitions), int(plan.capacity),
+                n,
+                self._flydsl_kv_heads,
+                int(plan.max_partitions),
+                int(plan.capacity),
             )
         else:
             plan_pa_decode(
-                context_lens, self._flydsl_kv_heads, query_length=1, plan=plan,
+                context_lens,
+                self._flydsl_kv_heads,
+                query_length=1,
+                plan=plan,
             )
         return plan
 

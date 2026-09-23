@@ -624,9 +624,6 @@ class PagedAttentionImpl(nn.Module):
             sinks=self.sinks,
             sliding_window=self.sliding_window,
             ps=True,
-            # The one site whose context lengths are the real per-request ones,
-            # so the only one a work plan can rebalance. Same boundary as the
-            # `dense_decode_splits` call above.
             allow_flydsl_plan=True,
         )
 
