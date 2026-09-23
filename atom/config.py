@@ -1618,24 +1618,14 @@ def qrep_unsupported_reason(dcp_size: int, mxfp4_bmm: bool) -> str | None:
 def q_proj_is_qrep_widened(q_proj, qrep_num_heads: int, qk_head_dim: int) -> bool:
     """Whether `q_proj` was actually built with `qrep_tp_override`.
 
-    Requires both:
-      - provenance: `q_proj.effective_tp_overridden` (set by `LinearBase` iff
-        it was constructed with `qrep_tp_override`'s kwargs) is true.
-      - shape: `q_proj.weight`'s width matches `qrep_num_heads * qk_head_dim`.
+    Requires both provenance (`q_proj.effective_tp_overridden`) and shape
+    (`weight.shape[0] == qrep_num_heads * qk_head_dim`). Shape alone isn't
+    enough: at `tp == dcp`, `override_tp_size` becomes 1 (a no-op), so a
+    QREP-widened q_proj and a plain, never-sharded one end up the same
+    width. Provenance alone isn't enough either: it says intent, not that
+    the resulting shape is what `_local_q_proj`/`W_K_qrep` actually assume.
 
-    Shape alone is not enough: at `tp == dcp`, `qrep_tp_override` computes
-    `override_tp_size = tp // dcp == 1`, a no-op, so the "widened" width is
-    just the full un-sharded head count -- indistinguishable by shape from a
-    layer that was never sharded at all (e.g. a `ReplicatedLinear`) and so
-    never got the row-ordering the override actually guarantees. Provenance
-    alone is not enough either: it says intent, not that the resulting shape
-    is what every consumer (`_local_q_proj`'s row slicing, the `W_K_qrep`
-    gather) assumes. Both together catch a layer that never opted in (e.g. an
-    eagle3 / DSpark draft's own q_proj, still at the plain per-rank width) and
-    a layer that opted in but produced the wrong width regardless.
-
-    Dependency-free (only `getattr`/`.shape`) so it stays importable, and
-    testable, without triton/aiter.
+    Dependency-free so it stays importable, and testable, without triton/aiter.
     """
     if not getattr(q_proj, "effective_tp_overridden", False):
         return False
@@ -1653,21 +1643,14 @@ _ROW_SLICEABLE_QUANT_TYPE_NAMES = frozenset({"per_1x128", "per_Token"})
 def q_proj_has_row_sliceable_scale(q_proj) -> bool:
     """Whether `_local_q_proj`'s row view can safely narrow `q_proj`'s scale.
 
-    QREP's prefill path (`_local_q_proj`) row-slices `q_proj.weight` via
-    `make_row_view`, which also narrows a 2D per-output-channel
-    `weight_scale` -- but only knows how to for `per_1x128` and `per_Token`;
-    anything else (e.g. mxfp4's `per_1x32`) raises `NotImplementedError` the
-    first time prefill actually runs. `qrep_unsupported_reason`'s mxfp4 gate
-    only checks the global `ATOM_USE_TRITON_MXFP4_BMM` env var, which says
-    nothing about any individual layer's on-disk quant type, so a checkpoint
-    that ships genuinely mxfp4-quantized attention weights (the
-    `is_quark_static_mxfp4` path) without that env var set would sail past
-    it. Checking the actual scale layout here, per layer, closes that gap
-    independently of what the env var says.
+    `make_row_view` narrows a 2D per-output-channel `weight_scale` only for
+    `per_1x128`/`per_Token`; anything else (e.g. mxfp4's `per_1x32`) raises
+    `NotImplementedError` on first use. `qrep_unsupported_reason`'s mxfp4
+    gate only checks a global env var, not any layer's actual quant type, so
+    this catches it per layer instead.
 
-    No weight_scale, or one that is not 2D / has only one row, is not the
-    per-output-channel case `make_row_view` special-cases at all -- shared
-    as-is by the row view, so it is always safe.
+    No weight_scale, or one that isn't 2D with >1 row, isn't the
+    per-output-channel case at all -- always safe.
     """
     weight_scale = getattr(q_proj, "weight_scale", None)
     if weight_scale is None:

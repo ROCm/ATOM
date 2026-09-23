@@ -1053,12 +1053,9 @@ def test_q_proj_has_row_sliceable_scale_true_for_per_1x128_and_per_token():
 
 
 def test_q_proj_has_row_sliceable_scale_false_for_mxfp4_per_1x32():
-    """The is_quark_static_mxfp4 gap: qrep_unsupported_reason's mxfp4 gate only
-    checks the global ATOM_USE_TRITON_MXFP4_BMM env var, which says nothing
-    about a specific layer's on-disk quant type. A q_proj genuinely
-    mxfp4-quantized (per_1x32 weight_scale) is not one make_row_view knows
-    how to row-slice -- it would raise NotImplementedError the first time
-    prefill actually runs. This must be caught per layer instead.
+    """The is_quark_static_mxfp4 gap: the env-var mxfp4 gate says nothing
+    about a specific layer's actual quant type. A genuinely mxfp4-quantized
+    q_proj (per_1x32) isn't one make_row_view can row-slice.
     """
     q_proj = _FakeLinear(out_features=64 * 128, effective_tp_overridden=True)
     q_proj.weight_scale = torch.empty(64 * 128 // 32, 1)
@@ -1130,17 +1127,12 @@ def test_mlaattention_init_actually_calls_qrep_enabled_for_layer():
 
 # ──────────────── QREP wiring at the q_proj producers (CPU, source-level) ──
 #
-# `q_proj_is_qrep_widened` above is the safety net: a q_proj that was never
-# widened falls back to AllGather instead of being misread as the wide layout.
-# These pin the other half -- that the models which are SUPPOSED to get QREP do
-# pass `qrep_tp_override` into the query projection. Nothing else covers it:
-# dropping the override from a draft model leaves every other test in this file
-# green, and the only symptom is an AllGather saving silently lost.
-#
-# Read from source (ast) rather than by constructing a layer: a real K3DSpark /
-# Eagle3 attention needs a distributed env and a GPU, which would put this
-# behind @needs_gpu -- off the CPU gate where the rest of the QREP coverage
-# deliberately lives.
+# Pins the other half of the safety net above: models that are SUPPOSED to
+# get QREP actually pass `qrep_tp_override` into q_proj. Nothing else covers
+# this -- dropping the override from a draft model leaves every other test
+# green, with only a silently-lost AllGather saving as the symptom. Read
+# from source (ast), not by constructing a layer, which would need a GPU
+# and put this behind @needs_gpu, off the CPU gate.
 
 _ATOM_MODELS = Path(__file__).resolve().parent.parent / "atom" / "models"
 
@@ -1196,14 +1188,11 @@ def _q_proj_linear_calls(path):
 def _qrep_override_names(scope):
     """Local names bound to ``qrep_tp_override(...)`` within `scope`.
 
-    `scope` is a function node (see `_q_proj_linear_calls`), not the whole
-    module: two unrelated classes in the same file binding the same variable
-    name to two different things must not let one satisfy the other.
-
-    The four wired models spell it two ways -- `**qrep_tp_override(tp)` inline,
-    or `x = qrep_tp_override(tp)` once and `**x` at the call. Matching only the
-    inline form would pin the spelling instead of the property, and would have
-    passed exactly one of the four.
+    `scope` is a function node, not the whole module -- two unrelated classes
+    binding the same variable name must not let one satisfy the other.
+    Matches both spellings (`**qrep_tp_override(tp)` inline, or bound to a
+    name first) since pinning only the inline form would pass just one of
+    the four wired models.
     """
     names = set()
     for node in ast.walk(scope):

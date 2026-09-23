@@ -520,13 +520,10 @@ class LinearBase(nn.Module):
         # valid TP size and eff_rank a valid rank within it, all downstream param
         # sizing / weight_loader narrowing is inherited unchanged.
         #
-        # `effective_tp_overridden` records that this layer went through the
-        # override path, independent of the shape it produced: a consumer that
-        # needs to know whether a layer was actually built this way (as opposed
-        # to merely being wide enough by coincidence, e.g. at tp == dcp where
-        # override_tp_size == 1 makes the override a no-op and the output as
-        # wide as an un-sharded layer) should read this rather than reverse-
-        # engineer it from `output_size`.
+        # Records that this layer went through the override path -- vs. merely
+        # being wide enough by coincidence (e.g. at tp == dcp, where
+        # override_tp_size == 1 makes the override a no-op) -- so a consumer
+        # can check this instead of reverse-engineering it from `output_size`.
         self.effective_tp_overridden = override_tp_size is not None
         if override_tp_size is not None or override_tp_rank is not None:
             assert (

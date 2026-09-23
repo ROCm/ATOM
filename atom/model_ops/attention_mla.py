@@ -318,18 +318,14 @@ def mla_dcp_sparse_prefill_num_heads(
 ) -> int:
     """Width to pad the GATHERED query heads to for a DCP sparse prefill.
 
-    The counterpart of ``mla_dcp_kernel_num_heads`` for the other DCP call site.
-    Sparse prefill all-gathers Q on the head dim as well, so what gets
-    dispatched on is ``num_heads * dcp_world_size`` there too -- the per-rank
-    count is never seen and is the wrong thing to pad. It needs its own table
-    because the widths that compute correctly are not decode's; see
-    ``_MLA_DCP_SPARSE_PREFILL_WIDTHS``.
+    Sparse prefill all-gathers Q on the head dim too, so what dispatches is
+    ``num_heads * dcp_world_size``, not the per-rank count -- needs its own
+    table (``_MLA_DCP_SPARSE_PREFILL_WIDTHS``) since decode's widths don't
+    compute correctly here.
 
-    ``persistent`` must come from ``mla_dcp_sparse_prefill_is_persistent``, not
-    decode's predicate: the two agree today, but this call site's width table
-    (``_MLA_DCP_SPARSE_PREFILL_WIDTHS*``) is its own and kept separate so it
-    can't start silently reading a table sized for the other mode if the two
-    predicates ever diverge again.
+    ``persistent`` must come from ``mla_dcp_sparse_prefill_is_persistent``,
+    not decode's predicate: they agree today, but this table is kept
+    separate so it can't silently read decode's if they ever diverge.
     """
     gathered = max(num_heads * dcp_world_size, min_kernel_heads)
     widths = (
@@ -704,13 +700,10 @@ class MLAAttention(nn.Module):
 
         # DCP Query Replication (QREP): q_proj is sharded on effective TP =
         # tp/dcp so decode can skip the per-step AllGather Q; W_K is gathered
-        # to match, at load. Gate on actual q_proj width, not just the config
-        # flag: a model that has not wired qrep_tp_override into its q_proj
-        # construction would otherwise silently reinterpret a narrow q as the
-        # wide QREP layout. Every wired model today (target + eagle3/DSpark
-        # drafts) passes this; GLM-5.3-Flash is deliberately unwired and falls
-        # back (see _QREP_UNWIRED_MODELS in tests/test_dcp_merge_ops.py), and
-        # this guards any future model in the same position.
+        # to match, at load. Gate on actual q_proj width (qrep_enabled_for_layer),
+        # not just the config flag, so a model that never wired
+        # qrep_tp_override (see _QREP_UNWIRED_MODELS) falls back safely
+        # instead of misreading a narrow q as the wide QREP layout.
         self.qrep_num_heads = self.num_heads * self.dcp_world_size
         wants_qrep = (
             self.dcp_world_size > 1
@@ -851,13 +844,10 @@ class MLAAttention(nn.Module):
                 self.dcp_kernel_num_heads - self.num_heads * dcp_world_size
             )
 
-        # Sparse prefill gathers query heads too, and needs its own width (see
-        # mla_dcp_sparse_prefill_num_heads). Sized here alongside decode's so
-        # the vllm plugin's re-init picks both up. Uses its own persistence
-        # predicate, not decode's, so this width always matches the mode this
-        # call site actually runs in -- even though the two predicates agree
-        # today, borrowing decode's answer directly would silently break if
-        # they ever diverge again.
+        # Sparse prefill gathers query heads too, and needs its own width
+        # (mla_dcp_sparse_prefill_num_heads), sized here so the vllm plugin's
+        # re-init picks both up. Uses its own persistence predicate so it
+        # can't silently borrow decode's answer if the two ever diverge.
         self.dcp_sparse_prefill_persistent = False
         self.dcp_sparse_prefill_num_heads = self.num_heads
         if dcp_world_size > 1 and self.is_sparse_mla:
