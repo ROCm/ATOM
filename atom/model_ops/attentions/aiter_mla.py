@@ -19,6 +19,7 @@ from atom.distributed.dcp_utils import (
     dcp_persistent_supported,
     get_dcp_rank,
     get_dcp_world_size,
+    mla_dcp_sparse_prefill_is_persistent,
 )
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
@@ -43,6 +44,7 @@ from atom.model_ops.attention_mla import (
     MLAAttention,
     mla_dcp_decode_is_persistent,
     mla_dcp_kernel_num_heads,
+    mla_dcp_sparse_prefill_num_heads,
 )
 from atom.model_ops.glm5_next.geometry import (
     effective_kpool_size,
@@ -433,6 +435,40 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
         else:
             self.persistent_num_heads = self.padded_num_attention_heads
+
+        if self.sparse_dcp_metadata_rebuild:
+            # sparse_prefill_num_heads / sparse_mtp_num_heads below reuse
+            # persistent_num_heads (decode's width function/table) to size the
+            # sparse-prefill work buffers, instead of calling
+            # mla_dcp_sparse_prefill_num_heads (the function attention_mla.py
+            # actually uses to pad the runtime gathered Q). The two agree for
+            # every head count in production today (128- or 64-head models on
+            # power-of-two tp/dcp), but decode's persistent branch returns the
+            # unrounded multiple of 16 (e.g. 48) while sparse prefill's own
+            # table rounds up to its dispatchable set (16/32/64/128) -- so a
+            # future sparse model whose gathered width lands off that set
+            # would get work buffers sized for one width while the kernel
+            # dispatches at another. Assert it here, once at metadata-builder
+            # construction, rather than let it surface as a corrupted reduce
+            # write or an unrelated-looking crash deep in a later step.
+            expected_sparse_prefill_num_heads = mla_dcp_sparse_prefill_num_heads(
+                self.num_attention_heads,
+                self.dcp_world_size,
+                persistent=mla_dcp_sparse_prefill_is_persistent(
+                    self.dcp_world_size,
+                    dcp_persistent,
+                    sparse_metadata_rebuild=self.sparse_dcp_metadata_rebuild,
+                ),
+            )
+            assert self.persistent_num_heads == expected_sparse_prefill_num_heads, (
+                "sparse-prefill work buffers would be sized for "
+                f"{self.persistent_num_heads} gathered heads (decode's width "
+                f"function), but the sparse-prefill kernel actually dispatches "
+                f"at {expected_sparse_prefill_num_heads} heads (its own width "
+                "function) -- decode's and sparse prefill's width tables "
+                "disagree for this num_attention_heads/dcp combination. See "
+                "mla_dcp_sparse_prefill_num_heads's docstring."
+            )
 
         max_seqlen_qo = getattr(model_runner, "num_spec_tokens", 0) + 1
         (

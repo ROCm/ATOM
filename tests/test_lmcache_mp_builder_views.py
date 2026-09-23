@@ -100,6 +100,7 @@ def mla_builder_cls():
             dcp_persistent_supported=noop,
             get_dcp_rank=lambda: 0,
             get_dcp_world_size=lambda: 1,
+            mla_dcp_sparse_prefill_is_persistent=lambda *args, **kwargs: False,
         ),
         "atom.distributed.pcp_utils": _module(
             "atom.distributed.pcp_utils",
@@ -119,6 +120,7 @@ def mla_builder_cls():
             MLAAttention=type("MLAAttention", (), {}),
             mla_dcp_decode_is_persistent=lambda *args, **kwargs: False,
             mla_dcp_kernel_num_heads=noop,
+            mla_dcp_sparse_prefill_num_heads=noop,
         ),
         "atom.model_ops.glm5_next.geometry": _module(
             "atom.model_ops.glm5_next.geometry",
