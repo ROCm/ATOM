@@ -296,6 +296,30 @@ class QuarkParser(QuantConfigParser):
         )
 
 
+@register_quant_parser("iq2r")
+class Iq2rParser(QuantConfigParser):
+    """Parse AITER IQ2R checkpoints without treating them as MXFP4."""
+
+    def parse(self, hf_quant_config: dict) -> ParsedQuantConfig:
+        schema = hf_quant_config.get("schema")
+        schema_version = hf_quant_config.get("schema_version")
+        if schema != "aiter-gpt-oss-iq2r-overlay" or schema_version != 1:
+            raise ValueError(
+                "unsupported IQ2R overlay contract: expected "
+                "schema='aiter-gpt-oss-iq2r-overlay', schema_version=1; "
+                f"got schema={schema!r}, schema_version={schema_version!r}"
+            )
+        return ParsedQuantConfig(
+            global_spec=LayerQuantConfig(
+                quant_type=QuantType.iq2r_2bit,
+                quant_dtype=torch.uint8,
+                is_dynamic=False,
+                quant_method="iq2r",
+            ),
+            exclude_layers=list(hf_quant_config.get("modules_to_not_convert") or []),
+        )
+
+
 # -- Online quantization ----------------------------------------------------
 
 

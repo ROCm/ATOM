@@ -17,6 +17,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from typing import Optional
 
 import torch
@@ -28,6 +29,7 @@ from aiter.dist.communication_op import (
     tensor_model_parallel_all_reduce,
 )
 from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_world_size
+from aiter.tuned_gemm import tgemm
 
 # from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from aiter.rotary_embedding import get_rope
@@ -55,6 +57,10 @@ from torch import nn
 from transformers import GptOssConfig
 
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
+_PROFILE_MOE_ABLATION = os.environ.get("ATOM_PROFILE_MOE_ABLATION", "").lower()
+_IQ2R_FUSE_NEXT_RMSNORM = os.environ.get(
+    "ATOM_IQ2R_FUSE_NEXT_RMSNORM", "0"
+).lower() not in ("0", "false", "off")
 
 
 def cdiv(x, y):
@@ -232,22 +238,68 @@ class MLPBlock(torch.nn.Module):
             self.moe_hidden_pad = self.experts.quant_method.hidden_pad
         else:
             self.moe_hidden_pad = 0
+        self.can_fuse_next_rmsnorm = (
+            _IQ2R_FUSE_NEXT_RMSNORM
+            and _PROFILE_MOE_ABLATION in ("", "none")
+            and self.tp_size == 1
+            and getattr(self.experts.quant_method, "supports_fused_next_rmsnorm", False)
+        )
+        self.uses_iq2r_router_frontend = self.tp_size == 1 and getattr(
+            self.experts.quant_method, "supports_router_bias_deferral", False
+        )
 
     def process_weights_after_loading(self):
         if getattr(self.experts.quant_method, "use_triton", False):
             return
         _interleave_swiglu_weights(self.experts)
 
+    def _router_forward(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        router_input = x[..., : self.hidden_size]
+        if self.uses_iq2r_router_frontend and router_input.shape[0] <= 8:
+            if self.router.bias is None:
+                raise RuntimeError("GPT-OSS IQ2R requires a BF16 router bias")
+            # AITER's M<=8 skinny BF16 GEMV otherwise launches a separate bias
+            # add. Keep its BF16 GEMV output and let the fused IQ2R router
+            # front end apply the BF16 bias before top-k in the same launch.
+            logits = tgemm.mm(
+                router_input,
+                self.router.weight,
+                None,
+                otype=torch.bfloat16,
+            )
+            return logits, self.router.bias
+        return self.router(router_input), None
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         num_tokens = x.shape[0]
 
-        g = self.router(x[..., : self.hidden_size])
+        if _PROFILE_MOE_ABLATION == "all":
+            # Profiling-only whole-MoE ablation. This removes the router,
+            # top-k, dispatch, and expert graph while preserving the model's
+            # logical hidden width and the surrounding production CUDA graph.
+            return x[..., : self.hidden_size] * 0
 
-        # Pad input for MXFP4 MoE GEMM alignment if needed
-        if self.moe_hidden_pad > 0 and self.tp_size > 1:
-            x = F.pad(x, (0, self.moe_hidden_pad))
+        if self.uses_iq2r_router_frontend:
+            if self.router.bias is None:
+                raise RuntimeError("GPT-OSS IQ2R requires a BF16 router bias")
+            # Keep the M-dependent router choice outside the dynamic compiled
+            # graph. The custom op sees the concrete replay shape: M<=8 folds
+            # bias into the IQ2R route kernel; larger M uses the normal biased
+            # router projection.
+            x = self.experts.forward_iq2r_with_router(
+                x,
+                self.router.weight,
+                self.router.bias,
+            )
+        else:
+            g = self.router(x[..., : self.hidden_size])
 
-        x = self.experts(hidden_states=x, router_logits=g)
+            # Pad input for MXFP4 MoE GEMM alignment if needed
+            if self.moe_hidden_pad > 0 and self.tp_size > 1:
+                x = F.pad(x, (0, self.moe_hidden_pad))
+            x = self.experts(hidden_states=x, router_logits=g)
 
         if self.tp_size > 1 and not ENABLE_ALLREDUCE_RMSNORM_FUSION:
             x = tensor_model_parallel_all_reduce(x)
@@ -260,6 +312,25 @@ class MLPBlock(torch.nn.Module):
             x = tensor_model_parallel_all_gather(x.contiguous(), 0)
             x = x[:num_tokens]
         return x
+
+    def forward_fused_next_rmsnorm(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        norm_epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.can_fuse_next_rmsnorm:
+            raise RuntimeError("IQ2R next-layer RMSNorm fusion is not available")
+        g, router_bias = self._router_forward(x)
+        return self.experts.forward_iq2r_add_rmsnorm(
+            x,
+            g,
+            router_bias,
+            residual,
+            norm_weight,
+            norm_epsilon,
+        )
 
 
 class TransformerBlock(torch.nn.Module):
@@ -310,9 +381,15 @@ class TransformerBlock(torch.nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         residual: torch.Tensor | None,
-    ) -> torch.Tensor:
+        input_is_normalized: bool = False,
+        next_norm_weight: torch.Tensor | None = None,
+        next_norm_epsilon: float = 1e-5,
+    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
         # Self Attention
-        if residual is None:
+        if input_is_normalized:
+            if residual is None:
+                raise RuntimeError("pre-normalized GPT-OSS input requires residual")
+        elif residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
@@ -322,8 +399,17 @@ class TransformerBlock(torch.nn.Module):
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
+        if self.mlp.can_fuse_next_rmsnorm and next_norm_weight is not None:
+            output, residual = self.mlp.forward_fused_next_rmsnorm(
+                hidden_states,
+                residual,
+                next_norm_weight,
+                next_norm_epsilon,
+            )
+            return output, residual, True
+
         output = self.mlp(hidden_states)
-        return output, residual
+        return output, residual, False
 
 
 @support_torch_compile
@@ -394,14 +480,34 @@ class GptOssModel(nn.Module):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = []
+        input_is_normalized = False
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             if i in self.aux_hidden_state_layers:
-                aux_hidden_states.append(x if residual is None else x + residual)
-            x, residual = layer(x, positions, residual)
+                if input_is_normalized:
+                    assert residual is not None
+                    aux_hidden_states.append(residual)
+                else:
+                    aux_hidden_states.append(x if residual is None else x + residual)
+
+            next_norm = None
+            if layer.mlp.can_fuse_next_rmsnorm:
+                if i + 1 < self.end_layer:
+                    next_norm = self.layers[i + 1].input_layernorm
+                elif get_pp_group().is_last_rank:
+                    next_norm = self.norm
+            x, residual, input_is_normalized = layer(
+                x,
+                positions,
+                residual,
+                input_is_normalized=input_is_normalized,
+                next_norm_weight=(next_norm.weight if next_norm is not None else None),
+                next_norm_epsilon=(next_norm.eps if next_norm is not None else 1e-5),
+            )
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": x, "residual": residual})
-        x, _ = self.norm(x, residual)
+        if not input_is_normalized:
+            x, _ = self.norm(x, residual)
 
         if len(aux_hidden_states) > 0:
             return x, aux_hidden_states
