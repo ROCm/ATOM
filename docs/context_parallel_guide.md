@@ -572,13 +572,13 @@ virtual q_len=1 rows. Unsupported paths (including gfx942 and plugin or
 speculative sparse DCP paths without the per-layer rebuild) remain
 non-persistent and round a gathered 64 up to **128**.
 
-**Sparse prefill's persistent path is not fp8-only.** Decode's gqa=64 kernel
-requirement above is fp8-specific (aiter has no bf16/bf16 persistent lse
-kernel gap here — it ships one), but sparse *prefill*'s persistent mode has no
-KV-dtype gate: `mla_dcp_sparse_prefill_is_persistent()` only checks DCP world
-size, per-layer metadata rebuild, and page size. A bf16-KV sparse DCP prefill
-that satisfies those reaches gqa=64 directly the same as fp8 does; only a
-prefill that fails one of those (e.g. gfx942, or DCP≤1) still pads to 128.
+**Sparse prefill's persistent path is not fp8-only.** Unlike the fp8-and-fp8
+requirement above (which is specifically about decode's gqa=64 kernel), sparse
+*prefill*'s persistent mode has no KV-dtype gate at all:
+`mla_dcp_sparse_prefill_is_persistent()` only checks DCP world size, per-layer
+metadata rebuild, and page size. A bf16-KV sparse DCP prefill that satisfies
+those reaches gqa=64 directly the same as fp8 does; only a prefill that fails
+one of those (e.g. gfx942, or DCP≤1) still pads to 128.
 
 **GLM-5.2 is the model that benefits**: 64 query heads at `-tp 8` is 8 per
 rank, so `-dcp 8` gathers exactly 64 and now dispatches the native persistent
@@ -708,9 +708,9 @@ contributing under DCP rather than collapsing back to single-token decode.
 | `atom/model_engine/arg_utils.py` | `--decode-context-parallel-size` / `-dcp` CLI |
 | `atom/config.py` | `DCPConfig` (the four `--dcp-config` knobs) + their validation; `qrep_unsupported_reason` auto-gating; DCP validation (`tp % dcp == 0`); spec-decode + DCP arch gate (gfx950); per-layer QREP eligibility -- `q_proj_is_qrep_widened`, `q_proj_has_row_sliceable_scale`, `qrep_enabled_for_layer` |
 | `atom/model_engine/block_manager.py` | Interleaved block allocation; prefix-cache virtual-block accounting |
-| `atom/distributed/dcp_utils.py` | DCP distributed-access layer: `get_dcp_world_size` / `dcp_is_enabled` / `get_dcp_group` / `get_dcp_rank`; platform-capability queries `dcp_persistent_supported` / `dcp_prefill_merge_bf16_ok`; `mla_dcp_sparse_prefill_is_persistent` |
+| `atom/distributed/dcp_utils.py` | DCP distributed-access layer: `get_dcp_world_size` / `dcp_is_enabled` / `get_dcp_group` / `get_dcp_rank`; platform-capability queries `dcp_persistent_supported` / `dcp_prefill_merge_bf16_ok`; `mla_dcp_decode_is_persistent` / `mla_dcp_sparse_prefill_is_persistent` |
 | `atom/model_ops/dcp_ops.py` | Both merge backends -- `cp_lse_ag_out_rs` (AG+RS LSE-combine) and `cp_lse_a2a` (all-to-all pack / unpack-combine kernels); `reorg_kvcache`, local compressed-KV gather, `dcp_all_gather` / `dcp_all_gather_query_heads` (custom-collective AllGather) |
-| `atom/model_ops/attention_mla.py` | Server-mode DCP decode + prefix-cache / chunked-prefill context; `mla_dcp_kernel_num_heads` / `mla_dcp_decode_is_persistent` gathered-head-width padding; `qrep_tp_override`; the per-layer QREP decision at `MLAAttention.__init__` |
+| `atom/model_ops/attention_mla.py` | Server-mode DCP decode + prefix-cache / chunked-prefill context; `mla_dcp_kernel_num_heads` gathered-head-width padding; `qrep_tp_override`; the per-layer QREP decision at `MLAAttention.__init__` |
 | `atom/model_ops/attentions/aiter_mla.py`, `attentions/backends.py` | DCP decode / prefill metadata (interleaved slot_mapping, local seq lens) |
 | `atom/plugin/vllm/attention/layer_mla.py`, `attention/metadata.py` | vllm-atom plugin DCP decode + prefill context; persistent-metadata head sizing |
 | `atom/models/kimi_k3.py` | Kimi-K3 hybrid backbone (KDA + MLA) served under DCP |
