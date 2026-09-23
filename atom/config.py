@@ -1633,11 +1633,15 @@ def q_proj_is_qrep_widened(q_proj, qrep_num_heads: int, qk_head_dim: int) -> boo
     return weight is not None and weight.shape[0] == qrep_num_heads * qk_head_dim
 
 
-# Quant types `ColumnParallelLinear.make_row_view` can narrow a 2D
-# per-output-channel `weight_scale` for. Named, not imported from aiter's
-# QuantType enum, so this stays importable without triton/aiter; the aiter
-# side is pybind11-bound but its members' `.name` is this same string.
-_ROW_SLICEABLE_QUANT_TYPE_NAMES = frozenset({"per_1x128", "per_Token"})
+# Quant types `make_row_view` narrows safely for a single-partition q_proj
+# (unquantized/per_Tensor never hit its per-output-channel branch there;
+# per_1x128/per_Token are the two it explicitly handles). Named, not
+# imported from aiter's QuantType enum, so this stays importable without
+# triton/aiter; the aiter side is pybind11-bound but its members' `.name` is
+# this same string.
+_ROW_SLICEABLE_QUANT_TYPE_NAMES = frozenset(
+    {"No", "per_Tensor", "per_1x128", "per_Token"}
+)
 
 
 def q_proj_has_row_sliceable_scale(q_proj) -> bool:
@@ -1649,17 +1653,16 @@ def q_proj_has_row_sliceable_scale(q_proj) -> bool:
     gate only checks a global env var, not any layer's actual quant type, so
     this catches it per layer instead.
 
-    No weight_scale, or one that isn't 2D with >1 row, isn't the
-    per-output-channel case at all -- always safe.
+    Keyed on `quant_type` alone, not `weight_scale`'s presence/shape:
+    `quant_type` is set unconditionally in `LinearBase.__init__`, but
+    `weight_scale` is not -- the online-quant-streaming path
+    (`source_quant_dtype` set) defers building it to
+    `process_weights_after_loading`, well after this runs. Reading
+    `weight_scale is None` as "safe" there would be checking a scale that
+    does not exist yet, not one that will never exist.
     """
-    weight_scale = getattr(q_proj, "weight_scale", None)
-    if weight_scale is None:
-        return True
-    scale_data = getattr(weight_scale, "data", weight_scale)
-    if scale_data.dim() != 2 or scale_data.shape[0] <= 1:
-        return True
-    quant_type = getattr(q_proj, "quant_type", None)
-    return getattr(quant_type, "name", None) in _ROW_SLICEABLE_QUANT_TYPE_NAMES
+    name = getattr(getattr(q_proj, "quant_type", None), "name", None)
+    return name is None or name in _ROW_SLICEABLE_QUANT_TYPE_NAMES
 
 
 def qrep_enabled_for_layer(

@@ -1028,28 +1028,19 @@ class _FakeQuantType:
         self.name = name
 
 
-def test_q_proj_has_row_sliceable_scale_true_when_no_weight_scale():
-    """Unquantized (e.g. bf16): no weight_scale at all, always safe to slice."""
+def test_q_proj_has_row_sliceable_scale_true_when_no_quant_type():
+    """Unquantized (e.g. bf16), no `quant_type` attribute at all: safe."""
     q_proj = _FakeLinear(out_features=64 * 128, effective_tp_overridden=True)
     assert q_proj_has_row_sliceable_scale(q_proj)
 
 
-def test_q_proj_has_row_sliceable_scale_true_for_1d_or_single_row_scale():
-    """per_Tensor (or any non-per-output-channel scale): make_row_view shares
-    it as-is, never enters the branch this check guards."""
-    q_proj = _FakeLinear(out_features=64 * 128, effective_tp_overridden=True)
-    q_proj.weight_scale = torch.empty(1)
-    assert q_proj_has_row_sliceable_scale(q_proj)
-
-
-def test_q_proj_has_row_sliceable_scale_true_for_per_1x128_and_per_token():
-    for name in ("per_1x128", "per_Token"):
+def test_q_proj_has_row_sliceable_scale_true_for_safe_quant_types():
+    for name in ("No", "per_Tensor", "per_1x128", "per_Token"):
         q_proj = _FakeLinear(out_features=64 * 128, effective_tp_overridden=True)
-        q_proj.weight_scale = torch.empty(64 * 128 // 4, 1)
         q_proj.quant_type = _FakeQuantType(name)
         assert q_proj_has_row_sliceable_scale(
             q_proj
-        ), f"make_row_view narrows {name} scales; the check should allow it"
+        ), f"{name} should be safe to row-slice"
 
 
 def test_q_proj_has_row_sliceable_scale_false_for_mxfp4_per_1x32():
@@ -1058,14 +1049,28 @@ def test_q_proj_has_row_sliceable_scale_false_for_mxfp4_per_1x32():
     q_proj (per_1x32) isn't one make_row_view can row-slice.
     """
     q_proj = _FakeLinear(out_features=64 * 128, effective_tp_overridden=True)
-    q_proj.weight_scale = torch.empty(64 * 128 // 32, 1)
     q_proj.quant_type = _FakeQuantType("per_1x32")
+    assert not q_proj_has_row_sliceable_scale(q_proj)
+
+
+def test_q_proj_has_row_sliceable_scale_false_before_weight_scale_exists():
+    """The online-quant-streaming timing gap this check used to miss: a
+    layer built with `source_quant_dtype` set (LinearBase.__init__) defers
+    creating `weight_scale` to `process_weights_after_loading`, well after
+    MLAAttention.__init__ runs -- so `q_proj` here has no `weight_scale`
+    attribute yet, even though `quant_type` (set unconditionally at
+    construction) already says `per_1x32`. Reading the absent `weight_scale`
+    as "safe" would enable QREP on a layer that raises the first time
+    prefill actually row-slices its real, later-built scale.
+    """
+    q_proj = _FakeLinear(out_features=64 * 128, effective_tp_overridden=True)
+    q_proj.quant_type = _FakeQuantType("per_1x32")
+    assert not hasattr(q_proj, "weight_scale")
     assert not q_proj_has_row_sliceable_scale(q_proj)
 
 
 def test_qrep_enabled_for_layer_falls_back_when_scale_not_row_sliceable():
     q_proj = _FakeLinear(out_features=64 * 128, effective_tp_overridden=True)
-    q_proj.weight_scale = torch.empty(64 * 128 // 32, 1)
     q_proj.quant_type = _FakeQuantType("per_1x32")
     assert not qrep_enabled_for_layer(
         True, q_proj, qrep_num_heads=64, qk_head_dim=128

@@ -2014,9 +2014,12 @@ class MLAAttention(nn.Module):
                         kv_last_page_lens,
                         work_prefix="sparse_prefill_",
                     )
-                # Not gated on is_fp8: sparse_prefill_work_* buffers are
-                # allocated/filled for the layer's real dtype regardless of
-                # DCP world size, so bf16 works the same as fp8 here.
+                # Not gated on is_fp8: the DCP arm's sparse_prefill_work_*
+                # buffers are allocated/filled for the layer's real dtype
+                # regardless. The dcp_world_size <= 1 arm is dead for bf16
+                # either way -- use_decode_kernel above already requires fp8
+                # or return_lse, and return_lse is never true when DCP is off
+                # -- kept only so both arms read the same condition.
                 use_work_meta = self.dcp_world_size <= 1 or sparse_dcp_persistent
                 _, final_lse = mla_decode_fwd(
                     q,
