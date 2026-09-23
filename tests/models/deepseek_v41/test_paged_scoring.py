@@ -40,13 +40,13 @@ def test_paged_scoring_bands_match_one_shot(monkeypatch, candidate_mode, trim_ti
     candidates = None
     if candidate_mode == "consume":
         candidates = torch.arange(8, dtype=torch.int32, device="cuda").repeat(rows, 1)
-    kwargs = dict(
-        topk=64,
-        weights_scale=0.01,
-        candidates=candidates,
-        block_size=8,
-        candidate_count=8 if candidate_mode == "produce" else 0,
-    )
+    kwargs = {
+        "topk": 64,
+        "weights_scale": 0.01,
+        "candidates": candidates,
+        "block_size": 8,
+        "candidate_count": 8 if candidate_mode == "produce" else 0,
+    }
     monkeypatch.setattr(envs, "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", 2048)
     expected = score_topk_paged(query, weights, plane, tiles, visible, **kwargs)
     # 257 x 1024 x 4 bytes crosses 1 MiB: bands end in a one-row tail.

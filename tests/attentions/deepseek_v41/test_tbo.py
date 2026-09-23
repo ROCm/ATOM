@@ -153,9 +153,11 @@ def test_parent_engram_join_runs_when_a_microbatch_fails():
         )
     )
     builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
-    with pytest.raises(RuntimeError, match="failed child"):
-        with builder.ubatch_forward(parent):
-            raise RuntimeError("failed child")
+    with (
+        pytest.raises(RuntimeError, match="failed child"),
+        builder.ubatch_forward(parent),
+    ):
+        raise RuntimeError("failed child")
     assert events == ["stage", "join"]
 
 
@@ -165,15 +167,15 @@ def test_real_tbo_workers_share_one_uva_prefetch_and_keep_cross_layer_state(
 ):
     from atom.utils.forward_context import get_forward_context
     from atom.utils.tbo.ubatching import (
-        tbo_yield_and_switch_from_compute_to_comm,
         tbo_switch_to_compute_sync,
+        tbo_yield_and_switch_from_compute_to_comm,
     )
-    from tests.model_ops.engram.test_overlap import make_batch, make_staging
     from tests.model_ops.engram.test_hash_bounds import build, tiny_config
+    from tests.model_ops.engram.test_overlap import make_batch, make_staging
 
     builder, parent = make_parent("cuda", lengths=(9, 5))
     mapping = build(tiny_config())
-    staging, backing = make_staging(mapping)
+    staging, _backing = make_staging(mapping)
     calls = []
     start = staging.start
     join = staging.join
