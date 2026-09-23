@@ -240,7 +240,7 @@ def test_native_dspark_passes_production_admission(graph, dynamic, tp_size, leve
             level=level,
             cudagraph_mode=(
                 CUDAGraphMode.FULL if level == 3 else CUDAGraphMode.PIECEWISE
-            )
+            ),
         ),
         hf_config=SimpleNamespace(),
         speculative_config=SimpleNamespace(
