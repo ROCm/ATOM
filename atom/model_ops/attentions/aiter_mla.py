@@ -1688,10 +1688,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # across a block -- silently, since every index stays in bounds. Both
         # sides' indices are a pure function of `slots`, `total_kv` and `block`,
         # all of which are settled here, once per forward. The gather itself
-        # runs once per indexer layer, so leaving the decomposition there had
-        # every layer rebuild the same tensors: `arange`, two divides, two
-        # remainders and the swizzle, times 79 layers -- 4.9 ms of stream time
-        # per forward at either of this workload's typical `total_kv`.
+        # runs once per layer that owns an indexer, so leaving the decomposition
+        # there had every such layer rebuild the same tensors: `arange`, two
+        # divides, two remainders and the swizzle, 63us each on gfx950 and flat
+        # in `total_kv`. GLM-5.2 has 22 such layers (21 "full" plus the MTP
+        # draft; its 57 "shared" layers reuse a full layer's top-k and never
+        # reach the gather), so 1.4 ms of stream time per prefill forward.
         #
         # On the device, not on the host beside `slots`: the arithmetic is 20x
         # faster per element there (0.076 ms against 1.29 ms at total_kv=232k,
