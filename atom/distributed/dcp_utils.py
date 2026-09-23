@@ -18,6 +18,7 @@ only the distributed-access layer.
 """
 
 from atom.config import get_current_atom_config
+from atom.utils import envs
 
 
 def get_dcp_world_size() -> int:
@@ -61,6 +62,38 @@ def dcp_persistent_supported() -> bool:
     from aiter.jit.utils.chip_info import get_gfx
 
     return get_gfx() == "gfx950"
+
+
+def mla_dcp_sparse_prefill_is_persistent(
+    dcp_world_size: int,
+    dcp_persistent_supported: bool,
+    *,
+    sparse_metadata_rebuild: bool = False,
+) -> bool:
+    """Whether a DCP sparse prefill reaches ``mla_decode_fwd`` in persistent mode.
+
+    Mirrors the gate ``_forward_prefill_mla`` applies per forward and is the
+    single source the gathered pad width is derived from -- the two must move
+    together, or a path runs one way while its width was padded for the other.
+
+    Not gated on KV cache dtype: the work-metadata buffers are allocated and
+    filled for the layer's real dtype regardless
+    (`get_mla_metadata_info_v1`/`get_mla_metadata_v1` take `dtype_q`/`dtype_kv`
+    unconditionally), and persistent vs non-persistent agree to bf16 rounding.
+    `_forward_prefill_mla`'s `use_work_meta` has the matching `dcp_world_size
+    <= 1` arm for symmetry, but it is unreachable for bf16 today: that call
+    site only reaches `use_work_meta` at all when `use_decode_kernel` is true,
+    and `use_decode_kernel` is `kv_cache_dtype.startswith("fp8") or return_lse`
+    with `return_lse` never passed at the non-DCP call site.
+
+    Lives here, not in ``atom.config``: its input ``dcp_persistent_supported``
+    is this module's own function, and this stays dependency-free (only
+    ``atom.utils.envs``) for the same CPU-importability reason that one is.
+    """
+    if dcp_world_size <= 1 or not sparse_metadata_rebuild:
+        return False
+    page_size = envs.ATOM_MLA_PAGE_SIZE if envs.ATOM_MLA_PAGE_SIZE is not None else 1
+    return dcp_persistent_supported and page_size <= 1
 
 
 def dcp_prefill_merge_bf16_ok() -> bool:

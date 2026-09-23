@@ -36,6 +36,7 @@ runner, and those are the only ones that gate actually runs.
 """
 
 import ast
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -43,15 +44,15 @@ import numpy as np
 import pytest
 import torch
 
-# atom.config imports cleanly without triton/aiter, so the config tests below
-# run on the CPU gate.
+# atom.config and atom.distributed.dcp_utils both import cleanly without
+# triton/aiter, so the tests below run on the CPU gate.
 from atom.config import (
     DCPConfig,
-    mla_dcp_sparse_prefill_is_persistent,
     q_proj_is_qrep_widened,
     qrep_enabled_for_layer,
     qrep_unsupported_reason,
 )
+from atom.distributed.dcp_utils import mla_dcp_sparse_prefill_is_persistent
 
 try:
     import triton
@@ -919,8 +920,6 @@ def test_gate_takes_no_interleave_input():
     re-coupling the two requires deliberately passing it in, and the docstring
     on `qrep_unsupported_reason` says not to.
     """
-    import inspect
-
     params = inspect.signature(qrep_unsupported_reason).parameters
     assert "interleave" not in " ".join(params), (
         "the QREP gate must not depend on the KV interleave granularity; "
@@ -941,8 +940,6 @@ def test_gate_does_not_look_at_speculative_config():
     a re-added `speculative_config` keyword-with-default would pass a value
     check again but not this one, same as `test_gate_takes_no_interleave_input`.
     """
-    import inspect
-
     params = inspect.signature(qrep_unsupported_reason).parameters
     assert not any(
         "spec" in p for p in params
@@ -1425,8 +1422,6 @@ def test_sparse_prefill_persistence_does_not_look_at_dtype():
     optional keyword with a default; pin the decoupling at the signature
     instead.
     """
-    import inspect
-
     params = inspect.signature(mla_dcp_sparse_prefill_is_persistent).parameters
     assert not any("dtype" in p or "kv_cache" in p for p in params), (
         "the DCP sparse-prefill persistence predicate must not key off KV "

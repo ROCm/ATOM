@@ -1640,35 +1640,6 @@ def qrep_enabled_for_layer(
     return wants_qrep and q_proj_is_qrep_widened(q_proj, qrep_num_heads, qk_head_dim)
 
 
-def mla_dcp_sparse_prefill_is_persistent(
-    dcp_world_size: int,
-    dcp_persistent_supported: bool,
-    *,
-    sparse_metadata_rebuild: bool = False,
-) -> bool:
-    """Whether a DCP sparse prefill reaches ``mla_decode_fwd`` in persistent mode.
-
-    Mirrors the gate ``_forward_prefill_mla`` applies per forward and is the
-    single source the gathered pad width is derived from -- the two must move
-    together, or a path runs one way while its width was padded for the other.
-
-    Not gated on KV cache dtype: the work-metadata buffers are allocated and
-    filled for the layer's real dtype regardless
-    (`get_mla_metadata_info_v1`/`get_mla_metadata_v1` take `dtype_q`/`dtype_kv`
-    unconditionally), and persistent vs non-persistent agree to bf16 rounding.
-    The non-DCP (`dcp_world_size <= 1`) call site is fixed the same way in
-    `_forward_prefill_mla`'s `use_work_meta`.
-
-    Only depends on ``atom.utils.envs`` (not triton/aiter), so it stays
-    importable, and testable, from here -- next to the QREP helpers above for
-    the same reason.
-    """
-    if dcp_world_size <= 1 or not sparse_metadata_rebuild:
-        return False
-    page_size = envs.ATOM_MLA_PAGE_SIZE if envs.ATOM_MLA_PAGE_SIZE is not None else 1
-    return dcp_persistent_supported and page_size <= 1
-
-
 def indexer_cp_unsupported_reason(
     arches,
     tp_size: int,

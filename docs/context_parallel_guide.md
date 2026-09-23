@@ -397,6 +397,16 @@ see exactly one positive line per rank and no warnings at all. The flag being
 Note it costs KV budget: replicating the query heads shrinks the KV pool by
 roughly 5% (measured on DeepSeek-R1 tp8/dcp8: 235 016 → 221 020 blocks).
 
+> **Upgrading an existing MTP/eagle3/DSpark + DCP deployment?** Before this
+> change, `speculative_config` being set unconditionally disabled QREP, so
+> `enable_query_replication`'s default of `true` had no effect under
+> speculative decode. It now applies there too, and the ~5% KV-pool cost
+> above lands on every such deployment on upgrade with no config change on
+> your part. If a deployment is tuned tightly against `--gpu-memory-utilization`
+> / a fixed `--max-model-len` / `--max-num-seqs`, check KV capacity at startup
+> after upgrading, or pass `--dcp-config '{"enable_query_replication": false}'`
+> to opt back out.
+
 ### `enable_project_before_merge` (PBM)
 
 The merge is a per-(token, head) scalar weighting plus a cross-rank sum, and
@@ -576,6 +586,14 @@ virtual q_len=1 rows. Unsupported paths (including gfx942 and plugin or
 speculative sparse DCP paths without the per-layer rebuild) remain
 non-persistent and round a gathered 64 up to **128**.
 
+**Sparse prefill's persistent path is not fp8-only.** Decode's gqa=64 kernel
+requirement above is fp8-specific (aiter has no bf16/bf16 persistent lse
+kernel gap here — it ships one), but sparse *prefill*'s persistent mode has no
+KV-dtype gate: `mla_dcp_sparse_prefill_is_persistent()` only checks DCP world
+size, per-layer metadata rebuild, and page size. A bf16-KV sparse DCP prefill
+that satisfies those reaches gqa=64 directly the same as fp8 does; only a
+prefill that fails one of those (e.g. gfx942, or DCP≤1) still pads to 128.
+
 **GLM-5.2 is the model that benefits**: 64 query heads at `-tp 8` is 8 per
 rank, so `-dcp 8` gathers exactly 64 and now dispatches the native persistent
 gqa64 kernel instead of padding to 128. `-tp 4 -dcp 4` has the same gathered
@@ -622,10 +640,10 @@ sharded index cache, so there is no intra-block mask to place.
 | | Supported |
 |---|---|
 | GPU arch | **gfx950 only** (the `cprr` kernel is persistent-only and ships for gfx950; gfx942 has no such kernel) |
-| Method | `--method mtp` (`num_speculative_tokens` = 1, 2, or 3) |
+| Method | `--method mtp` (dense MLA: `num_speculative_tokens` 1, 2, or 3 validated above; sparse / DSA has no runtime bound and the [GLM-5.2 recipe](../recipes/Agentic-GLM-5.2.md) runs it at 4 and 5 — see the Model row) |
 | KV cache dtype | **bf16 and fp8** both work for all of `num_speculative_tokens` 1/2/3 (dense MLA) |
 | DCP size | dcp2 / dcp4 / dcp8 all validated (`tp8`, dense MLA) |
-| Model | Dense MLA (V3 / R1): full matrix above (exercises the `cprr` kernel). Sparse / DSA (GLM-5.2-FP8): validated at fp8 KV, `num_speculative_tokens=3`, dcp8 — QREP-on and QREP-off agree within combined stderr on gsm8k nshot=20 (0.9469/0.9477 vs. 0.9492/0.9492); other `num_speculative_tokens`, KV dtypes, and DCP sizes on sparse follow the same mechanism but are not independently re-checked |
+| Model | Dense MLA (V3 / R1): full matrix above (exercises the `cprr` kernel). Sparse / DSA (GLM-5.2-FP8): validated at fp8 KV, `num_speculative_tokens=3`, dcp8 — QREP-on and QREP-off agree within combined stderr on gsm8k nshot=20 (0.9469/0.9477 vs. 0.9492/0.9492). The mechanism this section argues (sparse never selects `cprr`, so QREP's provenance is irrelevant to it) does not itself depend on the draft depth, KV dtype, or DCP size, but only `num_speculative_tokens=3`/fp8/dcp8 got this A/B; the recipe's `num_speculative_tokens=4`/`5` points run on the same mechanism without their own accuracy re-check |
 
 **Usage** (add MTP flags to any DCP command):
 
@@ -690,7 +708,7 @@ contributing under DCP rather than collapsing back to single-token decode.
 | prefix caching / chunked prefill | Supported (dense and sparse / DSA). On **Kimi-K3** the validated configuration has prefix caching **off**, per its recipe |
 | Kimi-K3 KDA layers | Not sharded — the KDA recurrent state is per-request, not paged, so DCP frees only the MLA share of attention memory |
 | Kimi-K3 gathered head width | Padded to a natively dispatched MLA width (16 / 32 / 64 / 128); past 128 it falls back to the folded kernel with a warning — lower `-dcp` or raise `-tp` |
-| gathered head width 64 + fp8 KV | Native sparse / DSA prefill and q_len=1 decode on gfx950 rebuild persistent metadata per full IndexShare layer and run gqa64 directly; unsupported non-persistent paths still pad to 128 — see [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64) |
+| gathered head width 64 | Native sparse / DSA prefill (bf16 or fp8 KV) and q_len=1 decode (fp8 KV) on gfx950 rebuild persistent metadata per full IndexShare layer and run gqa64 directly; unsupported non-persistent paths still pad to 128 — see [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64) |
 | speculative decode (MTP), dense MLA | Supported on **gfx950 only** (bf16/fp8, `num_speculative_tokens` 1–3); raises at startup on gfx942 |
 | speculative decode (DSpark), Kimi-K3 | Supported on gfx950; validated at `tp8 -dcp 8` with `num_speculative_tokens 2` |
 | speculative decode (MTP), sparse / DSA | Supported on **gfx950 only**; validated on GLM-5.2-FP8 at fp8 KV, `num_speculative_tokens=3`, dcp8 |

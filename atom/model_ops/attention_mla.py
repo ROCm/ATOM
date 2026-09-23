@@ -45,17 +45,14 @@ from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 from aiter.ops.triton.kv_cache import cat_and_cache_mla as triton_cat_and_cache_mla
 from torch import nn
 
-from atom.config import (
-    get_current_atom_config,
-    mla_dcp_sparse_prefill_is_persistent,
-    qrep_enabled_for_layer,
-)
+from atom.config import get_current_atom_config, qrep_enabled_for_layer
 from atom.distributed.dcp_utils import (
     dcp_persistent_supported,
     dcp_prefill_merge_bf16_ok,
     get_dcp_group,
     get_dcp_rank,
     get_dcp_world_size,
+    mla_dcp_sparse_prefill_is_persistent,
 )
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
@@ -255,7 +252,11 @@ _MLA_DCP_MAX_KERNEL_HEADS = 128
 _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT = (16, 32, 128)
 _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT_FP8 = (16, 128)
 _MLA_DCP_SPARSE_PREFILL_WIDTHS = (16, 128)
-_MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT = _MLA_DCP_KERNEL_WIDTHS
+# Same widths as decode's persistent table today (both dispatch on aiter's
+# persistent kernel set), but a separate tuple on purpose: aliasing the two
+# would let a decode-only change to _MLA_DCP_KERNEL_WIDTHS silently repoint
+# sparse prefill's gathered pad width too.
+_MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT = (16, 32, 64, 128)
 
 _dcp_kernel_width_warned = False
 _dcp_sparse_prefill_width_warned = False
@@ -735,7 +736,9 @@ class MLAAttention(nn.Module):
         # flag: a model that has not wired qrep_tp_override into its q_proj
         # construction would otherwise silently reinterpret a narrow q as the
         # wide QREP layout. Every wired model today (target + eagle3/DSpark
-        # drafts) passes this; it guards a future model that doesn't.
+        # drafts) passes this; GLM-5.3-Flash is deliberately unwired and falls
+        # back (see _QREP_UNWIRED_MODELS in tests/test_dcp_merge_ops.py), and
+        # this guards any future model in the same position.
         self.qrep_num_heads = self.num_heads * self.dcp_world_size
         wants_qrep = (
             self.dcp_world_size > 1
@@ -744,12 +747,16 @@ class MLAAttention(nn.Module):
         self.qrep_enabled = qrep_enabled_for_layer(
             wants_qrep, self.q_proj, self.qrep_num_heads, self.qk_head_dim
         )
+        # Keyed on type(self), not the MLAAttention base class: subclasses
+        # (SGLangATOMGLM52MLAAttention, the vLLM plugin's AttentionForVllmMLA)
+        # would otherwise share one base-class flag/set and mask each other.
+        qrep_cls = type(self)
         if (
             wants_qrep
             and self.qrep_enabled
-            and not getattr(MLAAttention, "_qrep_enabled_logged", False)
+            and not getattr(qrep_cls, "_qrep_enabled_logged", False)
         ):
-            MLAAttention._qrep_enabled_logged = True
+            qrep_cls._qrep_enabled_logged = True
             logger.info(
                 "dcp_config.enable_query_replication is on and active "
                 "(q_proj built with qrep_tp_override)."
@@ -758,14 +765,14 @@ class MLAAttention(nn.Module):
         # layer's fallback would permanently mask a later, different layer's
         # fallback (a real regression) from ever being logged.
         qrep_fallback_logged_layers = getattr(
-            MLAAttention, "_qrep_fallback_logged_layers", frozenset()
+            qrep_cls, "_qrep_fallback_logged_layers", frozenset()
         )
         if (
             wants_qrep
             and not self.qrep_enabled
             and self.layer_num not in qrep_fallback_logged_layers
         ):
-            MLAAttention._qrep_fallback_logged_layers = qrep_fallback_logged_layers | {
+            qrep_cls._qrep_fallback_logged_layers = qrep_fallback_logged_layers | {
                 self.layer_num
             }
             logger.warning(
