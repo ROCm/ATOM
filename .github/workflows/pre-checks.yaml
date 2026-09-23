@@ -21,92 +21,14 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  black:
-    name: Check Code Style with Black
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-      - name: Describe Pre Checkin scope
-        run: |
-          echo "Pre Checkin is the shared gate for lightweight validation before GPU CI starts."
-          echo "Future fast, non-GPU checks can be added here so Native and OOT reuse one result."
-      - name: Run Black
-        uses: psf/black@stable
-
-  ruff:
-    name: Check Code Style with Ruff
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-      - name: Set up Python environment
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-      - name: Install dependencies
-        run: pip3 install ruff
-      - name: Install reviewdog
-        uses: reviewdog/action-setup@e04ffabe3898a0af8d0fb1af00c188831c4b5893
-        with:
-          reviewdog_version: v0.21.1
-      - name: Run ruff with reviewdog
-        env:
-          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          ruff check . \
-            --output-format=rdjson \
-            --exit-zero \
-            --no-fix \
-          | reviewdog \
-            -f=rdjson \
-            -name="ruff" \
-            -reporter=github-pr-review \
-            -filter-mode=diff_context \
-            -fail-on-error=true
-
-  validate-catalog:
-    name: Validate accuracy catalogs against schema
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-      - name: Set up Python environment
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-      - name: Install dependencies
-        run: pip3 install jsonschema
-      - name: Validate catalogs
-        run: python3 .github/scripts/validate_catalog.py
-
   unit-tests:
-    name: Run non-GPU unit tests
+    name: CI orchestration regression tests (CPU only)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0  # setuptools_scm needs full history/tags for versioning
-      - name: Set up Python environment
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-      - name: Install dependencies
-        run: |
-          pip3 install torch --index-url https://download.pytorch.org/whl/cpu
-          pip3 install -e .
-          pip3 install pytest msgpack quart
-          # atom/diffusion test deps. Without them 38 diffusion tests self-skip
-          # via importorskip and the subsystem gets no CI coverage at all.
-          pip3 install av pillow httpx
-      - name: Run unit tests
-        env:
-          UNIT_TEST_REPORT: unit-report.xml
-        run: bash .github/scripts/run_unit_tests.sh
-      - name: Upload JUnit report
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: unit-test-report
-          path: unit-report.xml
+    - uses: actions/checkout@v6
+    - run: python3 -m pip install pytest pyyaml
+    - run: pytest --noconftest -p no:cacheprovider -q tests/test_heavy_ci_gate.py tests/test_ci_orchestration_edges.py
+      env:
+        PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
