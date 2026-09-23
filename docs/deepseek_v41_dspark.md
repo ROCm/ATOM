@@ -11,13 +11,25 @@ and throughput require validation for the deployment workload.
 
 ## Supported configuration
 
-The supported deployment scope is TP4 with whole-expert EP, BF16 KV, the FP8
-index plane and text requests, using compilation level 0. Target execution can
-be eager or use whole-forward decode graphs (`FULL`); the draft has its own
-graph. The runtime also accepts `PIECEWISE`.
+DSpark requires BF16 KV, the FP8 index plane and text requests. Tensor
+parallelism follows the model's dimension-divisibility checks, with no TP4-only
+admission gate. Configuration tests cover TP1/2/4/8; the GPU benchmark evidence
+covers TP2 and TP4 without EP at level 3 FULL. See the
+[AgentX recipe](../recipes/DeepSeek-V4.1-Flash-Agentic.md) for commands and the
+synthetic-acceptance scope of those measurements.
 
-Not admitted: packed speculative caches, multimodal speculation, synthetic
-acceptance, relaxed MTP acceptance, and speculative output token logprobs — the
+The existing quality/development baseline uses TP4 with whole-expert EP at
+compilation level 0. Target execution can be eager or use whole-forward decode
+graphs (`FULL`); the draft has its own graph. The runtime also accepts
+`PIECEWISE` at level 0, and level 3 with FULL graphs or eager execution.
+
+Synthetic acceptance is rejected by default. For performance reproduction only,
+`ATOM_DSV41_BENCHMARK_SYNTHETIC=1` admits an explicitly configured synthetic
+schedule and emits a warning; it does not change the shared rejection sampler
+or enable relaxed verification.
+
+Not admitted: packed speculative caches, multimodal speculation,
+relaxed MTP acceptance, and speculative output token logprobs — the
 current output protocol cannot return the last of these correctly. Both target
 and draft MoE reuse V4 FusedMoE. Non-speculative vision and packed cache support
 are independent of all of this.

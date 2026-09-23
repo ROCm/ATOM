@@ -27,8 +27,10 @@ def config():
     )
 
 
-def test_static_and_explicitly_calibrated_native_dspark():
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+def test_static_and_explicitly_calibrated_native_dspark(tp_size):
     value = config()
+    value.tensor_parallel_size = tp_size
     validate_speculative_config(value)
     value.dspark = DSparkConfig(
         confidence_schedule=True, ragged=True, calibration_profile="profile.json"
@@ -39,7 +41,6 @@ def test_static_and_explicitly_calibrated_native_dspark():
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("tensor_parallel_size", 8),
         ("kv_cache_dtype", "fp4"),
     ],
 )
@@ -92,3 +93,16 @@ def test_relaxed_acceptance_cannot_bypass_target_distribution(monkeypatch):
     monkeypatch.setenv("ATOM_ENABLE_RELAXED_MTP", "1")
     with pytest.raises(ValueError, match="strict target verification"):
         validate_speculative_config(config())
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+def test_synthetic_acceptance_requires_explicit_benchmark_opt_in(monkeypatch, tp_size):
+    cfg = config()
+    cfg.tensor_parallel_size = tp_size
+    cfg.speculative_config.synthetic_acceptance_rates = [0.8] * 5
+    monkeypatch.delenv("ATOM_DSV41_BENCHMARK_SYNTHETIC", raising=False)
+    with pytest.raises(ValueError, match="real target verification"):
+        validate_speculative_config(cfg)
+    monkeypatch.setenv("ATOM_DSV41_BENCHMARK_SYNTHETIC", "1")
+    with pytest.warns(RuntimeWarning, match="performance benchmarking only"):
+        validate_speculative_config(cfg)
