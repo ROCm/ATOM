@@ -521,6 +521,34 @@ def test_unresolvable_destination_is_queued_as_a_failing_load():
     assert load.error_block_ids == (22,)
 
 
+def test_failed_kda_load_never_names_a_mamba_block_as_invalid():
+    """``scheduler.py`` skips non-attention groups when truncating a failed
+    load. That skip is only safe if this connector reports attention ids.
+    A mamba id in ``error_block_ids`` would be invisible to recovery, and
+    vLLM would cache the MLA prefix as if the recurrent state had arrived.
+    """
+    planner = make_planner()
+    request = FakeRequest("r0")
+    mamba_blocks = [11, 12, 13, 14]
+    attention_blocks = [21, 22, 23]
+
+    planner.resolve_load(
+        request,
+        (attention_blocks, mamba_blocks, [31, 32]),
+        CHUNK,
+        ATTENTION_GROUP,
+        CHUNK,
+        CHUNK,
+    )
+
+    (load,) = planner.take_loads()
+    named = set(load.error_block_ids)
+    assert named
+    assert named.isdisjoint(mamba_blocks)
+    assert named.isdisjoint([31, 32])
+    assert named <= set(attention_blocks)
+
+
 def test_unaligned_hit_fails_closed_instead_of_writing_the_wrong_row():
     """``n // block - 1`` and ``(n - 1) // block`` disagree when n is not a
     multiple of the mamba block. The forward reads the second. Writing the
@@ -689,7 +717,10 @@ def test_a_load_whose_second_group_has_no_destination_fails_whole():
 def test_mamba_groups_must_agree_on_block_size():
     """A boundary is one block in every group at the same token count."""
     pytest.importorskip("vllm")
-    from vllm.v1.kv_cache_interface import MambaSpec
+    try:
+        from vllm.v1.kv_cache_interface import MambaSpec
+    except ImportError:
+        pytest.skip("vllm is present but has no MambaSpec (stub or old tree)")
 
     from atom.plugin.vllm.kv_transfer.kda_state import find_mamba_groups
 
