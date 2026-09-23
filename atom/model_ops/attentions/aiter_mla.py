@@ -53,6 +53,7 @@ from atom.model_ops.sparse_indexer_fp4 import (
     FP4_MQA_PARALLEL_UNIT_NUM,
     fp4_decode_parallel_units,
     fp4_decode_schedule,
+    fp4_index_scale_rows_np,
     fp4_prefill_schedule,
     sparse_indexer_fp4_enabled,
 )
@@ -1680,6 +1681,36 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.dcp_indexer_fp4_local_slots = torch.from_numpy(
             slots.astype(np.int32)
         ).to(dev, non_blocking=True)
+
+        # The staging gather addresses two planes whose row axes disagree: the
+        # packed E2M1 one is flat, the e8m0 one an `_MFMA_M`-wide transpose of
+        # it, so a reader moving them together has to bend or it mixes exponents
+        # across a block -- silently, since every index stays in bounds. Both
+        # sides' indices are a pure function of `slots`, `total_kv` and `block`,
+        # all of which are settled here, once per forward. The gather itself
+        # runs once per indexer layer, so leaving the decomposition there had
+        # every layer rebuild the same tensors: `arange`, two divides, two
+        # remainders and the swizzle, times the layer count.
+        #
+        # Publishing them costs one pass over each here and nothing per layer.
+        # numpy rather than torch on the device for the same reason `slots`
+        # already is: it is host arithmetic on data the host just built, and it
+        # keeps `sparse_indexer_fp4` free of any device dependency.
+        def publish(name, src):
+            page, row = src // block, src % block
+            for suffix, arr in (
+                ("page", page),
+                ("row", row),
+                ("scale_row", fp4_index_scale_rows_np(row, block)),
+            ):
+                setattr(
+                    attn_metadata,
+                    f"{name}_{suffix}",
+                    torch.from_numpy(arr.astype(np.int32)).to(dev, non_blocking=True),
+                )
+
+        publish("dcp_indexer_fp4_read", slots)
+        publish("dcp_indexer_fp4_stage", np.arange(total_kv, dtype=np.int64))
 
         # Fixed width, not `pages`: the scorer specializes on this table's
         # stride, so a per-batch width recompiles it. Sized at a whole batch's

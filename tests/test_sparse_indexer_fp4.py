@@ -14,6 +14,7 @@ rounding. The FP8 default has to come out of all of it untouched.
 import importlib
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -32,7 +33,6 @@ from atom.model_ops.sparse_indexer_fp4 import (
 )
 
 
-# The DSA indexer geometry GLM-5.2 and DeepSeek-V3.2 share.
 def _expect_scale_row(rows, block):
     """The e8m0 row swizzle, spelled out here rather than imported.
 
@@ -44,6 +44,7 @@ def _expect_scale_row(rows, block):
     return (rows % 16) * (block // 16) + rows // 16
 
 
+# The DSA indexer geometry GLM-5.2 and DeepSeek-V3.2 share.
 DSA = SimpleNamespace(index_topk=2048, index_n_heads=32, index_head_dim=128)
 
 HEADS, HEAD_DIM, _BLOCK = 32, 128, FP4_KV_BLOCK_SIZE
@@ -398,67 +399,36 @@ def _assert_agrees(got, want, visible, topk):
     assert overlap > 0.99, overlap
 
 
-def test_fp4_index_slots_agrees_with_the_swizzle_at_every_tail(on_gfx950):
-    """The kernel's three outputs, against the formula, over a grid's edges.
+def test_scale_row_swizzle_agrees_across_torch_and_numpy():
+    """The e8m0 row bend, in both spellings, against a written-out oracle.
 
-    Nothing else reaches it directly: the staging test reads it through two
-    planes of a DCP gather, so a wrong `page` and a wrong `row` that cancel
-    would still pass there. Here each output is compared on its own.
-
-    The sizes are chosen for the tail. TILE is 1024, so 1023/1025/4097/100001
-    leave a partial last block where the mask is what keeps the extra lanes from
-    storing; 64 and 1024 leave none; 0 launches no grid at all. A kernel that
-    ignored the mask would pass on the exact multiples and corrupt the rest.
+    The prefill metadata builder uses the numpy form and everything else the
+    torch one, so the two have to stay the same function -- if they drift, one
+    plane's rows are bent and the other's are not, and the mismatch is silent
+    because every index stays in bounds either way. No GPU: this is integer
+    arithmetic, and pinning it is the only coverage the swizzle gets on a
+    CPU-only CI runner.
     """
-    from atom.model_ops.sparse_indexer_fp4 import fp4_index_slots
+    from atom.model_ops.sparse_indexer_fp4 import (
+        fp4_index_scale_rows,
+        fp4_index_scale_rows_np,
+    )
 
-    def expect(rows, block):
-        return (rows % 16) * (block // 16) + rows // 16
+    rows = torch.arange(_BLOCK)
+    want = _expect_scale_row(rows, _BLOCK)
+    assert torch.equal(fp4_index_scale_rows(rows, _BLOCK), want)
+    assert np.array_equal(fp4_index_scale_rows_np(rows.numpy(), _BLOCK), want.numpy())
+    # A permutation of the block, so no two rows share a destination.
+    assert sorted(want.tolist()) == list(range(_BLOCK))
 
-    for n in (0, 1, 63, 64, 1023, 1024, 1025, 4097, 100001):
-        want = torch.arange(n, device="cuda")
-        # Both ways in: the slot list itself, and the length that stands for it.
-        from_slots = fp4_index_slots(_BLOCK, want)
-        from_count = fp4_index_slots(_BLOCK, total_kv=n, device=want.device)
-
-        for got, how in ((from_slots, "slots"), (from_count, "total_kv")):
-            page, row, scale_row = got
-            assert page.shape == (n,), (how, n, page.shape)
-            assert page.dtype == torch.int64, how  # used as an advanced index
-            assert torch.equal(page, want // _BLOCK), (how, n)
-            assert torch.equal(row, want % _BLOCK), (how, n)
-            assert torch.equal(scale_row, expect(want % _BLOCK, _BLOCK)), (how, n)
-
-    # A slot list is not required to be 1-D; the outputs follow its shape.
-    slots = torch.randint(0, 4096 * _BLOCK, (3, 17), device="cuda")
-    page, row, scale_row = fp4_index_slots(_BLOCK, slots)
-    assert page.shape == slots.shape
-    assert torch.equal(scale_row, expect(slots % _BLOCK, _BLOCK))
-
-
-def test_fp4_index_slots_refuses_what_it_cannot_serve(on_gfx950):
-    """Each guard, because every one of them covers a silent wrong answer.
-
-    A wrong `block_size` still indexes in bounds, on another row's exponents.
-    Both arguments or neither would leave the caller guessing which slots it
-    got. A host tensor would reach Triton, which refuses pointers it cannot
-    read -- the other `model_ops` kernels raise there too rather than fall back.
-    """
-    from atom.model_ops.sparse_indexer_fp4 import fp4_index_slots
-
-    dev = torch.device("cuda")
-    slots = torch.arange(8, device=dev)
-
-    with pytest.raises(ValueError, match="exactly one"):
-        fp4_index_slots(_BLOCK, slots, total_kv=8, device=dev)
-    with pytest.raises(ValueError, match="exactly one"):
-        fp4_index_slots(_BLOCK)
-    with pytest.raises(ValueError, match="64-row blocks"):
-        fp4_index_slots(16, total_kv=8, device=dev)
-    with pytest.raises(ValueError, match="needs `device`"):
-        fp4_index_slots(_BLOCK, total_kv=8)
-    with pytest.raises(RuntimeError, match="AMD GPU"):
-        fp4_index_slots(_BLOCK, torch.arange(8))
+    # The page size is checked rather than assumed: a caller paging the cache
+    # differently gets a mapping that is wrong and still in bounds.
+    for fn, arg in (
+        (fp4_index_scale_rows, rows),
+        (fp4_index_scale_rows_np, rows.numpy()),
+    ):
+        with pytest.raises(ValueError, match="64-row blocks"):
+            fn(arg, 16)
 
 
 def test_decode_scores_the_cache_the_fused_writer_wrote(on_gfx950):
@@ -565,9 +535,7 @@ def test_dcp_decode_scores_each_query_token_over_its_own_local_window(on_gfx950)
     _assert_agrees(logits, want, local_ctx, topk=512)
 
 
-def test_dcp_prefill_staging_keeps_every_key_with_its_own_exponent(
-    on_gfx950, monkeypatch
-):
+def test_dcp_prefill_staging_keeps_every_key_with_its_own_exponent(monkeypatch):
     """Staging moves two planes whose row axes disagree -- the packed one flat,
     the e8m0 one transposed -- so it cannot address them with a single index.
 
@@ -577,9 +545,6 @@ def test_dcp_prefill_staging_keeps_every_key_with_its_own_exponent(
     end-to-end accuracy run can pass with this broken; the random planes here
     remove that cover.
 
-    On a chip rather than on CPU tensors: `fp4_index_slots` is a Triton kernel
-    and refuses host pointers, as every other kernel in `model_ops` does. The
-    planes are tiny, so this costs a GPU rather than any real time.
     """
     dsv2 = _import_or_skip("atom.models.deepseek_v2")
 
@@ -587,14 +552,39 @@ def test_dcp_prefill_staging_keeps_every_key_with_its_own_exponent(
     block, world, src_pages = _BLOCK, 2, 4
     local = 64
     total_kv = world * local
-    shape = {"dtype": torch.uint8, "device": "cuda"}
+    shape = {"dtype": torch.uint8, "device": "cpu"}
     data_src = torch.randint(0, 256, (src_pages, 1, 4, block, 16), **shape)
     scale_src = torch.randint(0, 256, (src_pages, 1, 4, block), **shape)
 
-    # This rank's slots, spread over pages and rows so no source row equals the
-    # destination row it lands on; the gather then reorders them again.
-    slots = torch.randperm(src_pages * block, device="cuda")[:local].to(torch.int32)
-    gather_index = torch.randperm(total_kv, device="cuda").to(torch.int32)
+    # This rank's slots, spread over pages and rows so that after the gather no
+    # source row equals the destination row it lands on. That property is the
+    # whole reason a swizzle bug is visible here -- where a source row happens
+    # to equal its destination, the position proves nothing.
+    #
+    # Built rather than drawn, and built on the gathered order, which is where
+    # the property has to hold. It used to come out of two bare `randperm`s
+    # under a module-level seed, so it was a property of whichever RNG stream
+    # was current: the GPU-gated tests above consume the CPU generator when a
+    # card is present and skip when it is not, so the same file drew a
+    # different permutation on the two runs and the comment was true on at most
+    # one of them. Rotating both the slot rows and the gather by one puts every
+    # destination two rows from its source on any box. Pages stay drawn, so the
+    # test still crosses page boundaries.
+    g = torch.Generator().manual_seed(0)
+    src_row = (torch.arange(local) + 1) % block
+    src_page = torch.randperm(src_pages, generator=g).repeat(-(-local // src_pages))[
+        :local
+    ]
+    slots = (src_page * block + src_row).to(torch.int32)
+
+    tok = torch.arange(total_kv)
+    gather_index = ((tok + 1) % local + local * (tok // local)).to(torch.int32)
+
+    _src = slots[gather_index.long() % local].long()
+    assert not torch.any(_src % block == tok % block), (
+        "some source row lands on its own row; those positions cannot tell a "
+        "correct swizzle from a missing one"
+    )
     monkeypatch.setattr(
         dsv2,
         "get_dcp_group",
@@ -609,13 +599,24 @@ def test_dcp_prefill_staging_keeps_every_key_with_its_own_exponent(
         SimpleNamespace(
             dcp_indexer_fp4_local_slots=slots,
             dcp_indexer_gather_index=gather_index,
+            # The builder settles both index sets once per forward; the gather
+            # only reads them. Spelled out here rather than imported so this
+            # test says what it expects the builder to have published.
+            dcp_indexer_fp4_read_page=slots.long() // block,
+            dcp_indexer_fp4_read_row=slots.long() % block,
+            dcp_indexer_fp4_read_scale_row=_expect_scale_row(
+                slots.long() % block, block
+            ),
+            dcp_indexer_fp4_stage_page=tok // block,
+            dcp_indexer_fp4_stage_row=tok % block,
+            dcp_indexer_fp4_stage_scale_row=_expect_scale_row(tok % block, block),
         ),
         total_kv,
         block,
     )
 
     src = slots[gather_index.long() % local].long()
-    got_rows = torch.arange(total_kv, device="cuda")
+    got_rows = torch.arange(total_kv)
     q_dst = _expect_scale_row(got_rows % block, block)
     q_src = _expect_scale_row(src % block, block)
     assert torch.equal(
