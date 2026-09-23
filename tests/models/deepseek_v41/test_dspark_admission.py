@@ -14,6 +14,8 @@ def config():
     return SimpleNamespace(
         model="/model",
         tensor_parallel_size=4,
+        enable_dp_attention=False,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
         kv_cache_dtype="bf16",
         index_cache_dtype="fp8",
         hf_config=SimpleNamespace(),
@@ -101,3 +103,22 @@ def test_native_and_fixed_acceptance_schedules_are_admitted(tp_size, rates):
     cfg.tensor_parallel_size = tp_size
     cfg.speculative_config.synthetic_acceptance_rates = rates
     validate_speculative_config(cfg)
+
+
+@pytest.mark.parametrize("tp,dp", [(4, 1), (1, 4)])
+def test_dpa_dspark_before_and_after_engine_normalization(tp, dp):
+    value = config()
+    value.enable_dp_attention = True
+    value.tensor_parallel_size = tp
+    value.parallel_config.data_parallel_size = dp
+    validate_speculative_config(value)
+
+
+@pytest.mark.parametrize("tp,dp", [(1, 1), (1, 2), (1, 8), (4, 2)])
+def test_dspark_rejects_unvalidated_dpa_width(tp, dp):
+    value = config()
+    value.enable_dp_attention = True
+    value.tensor_parallel_size = tp
+    value.parallel_config.data_parallel_size = dp
+    with pytest.raises(ValueError, match="four DPA ranks"):
+        validate_speculative_config(value)
