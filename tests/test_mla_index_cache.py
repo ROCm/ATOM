@@ -574,6 +574,72 @@ def test_hybrid_transfer_regions_compact_both_kv_and_index_rows(monkeypatch):
     assert len(set(transfer_tensors.block_region_consumer_indices)) == 4
 
 
+@pytest.mark.parametrize(
+    "use_triton,page_size,shuffle,unsupported_layout",
+    [
+        (False, 64, False, "segmented"),
+        (True, 64, True, "shuffled"),
+        (False, 1, False, None),
+        # The shuffle flag is inactive without the Triton MLA backend.
+        (False, 1, True, None),
+        # Triton without shuffle keeps token-contiguous KV, even at page 64.
+        (True, 64, False, None),
+    ],
+)
+def test_mla_staging_rejects_unsupported_layout_before_gather(
+    monkeypatch, use_triton, page_size, shuffle, unsupported_layout
+):
+    from atom.model_ops.attentions.mla_kv_pool import MlaKvPool
+
+    monkeypatch.setattr(aiter_mla.envs, "ATOM_USE_TRITON_MLA", use_triton)
+    monkeypatch.setattr(aiter_mla.envs, "ATOM_MLA_PAGE_SIZE", page_size)
+    monkeypatch.setattr(aiter_mla.envs, "ATOM_USE_TRITON_MLA_SHUFFLE_KV", shuffle)
+    builder, runner = _builder(None, total_local_layers=1)
+    runner.config.kv_cache_block_size = 64
+    runner.config.kv_transfer_config = {
+        "kv_connector": "mooncake",
+        "kv_role": "kv_producer",
+        "num_worker_threads": 1,
+    }
+    builder.kv_pool = MlaKvPool(
+        layers=1,
+        block_size=64,
+        entry_dim=576,
+        kv_dtype=torch.uint8,
+        index_layers=1,
+        index_rows_per_block=64,
+        index_dim=144,
+        index_dtype=torch.uint8,
+    )
+    builder.kv_pool.allocate(4, "cpu")
+    gather_calls = []
+
+    def gather(source, staging, indices, block_size):
+        if unsupported_layout is not None:
+            pytest.fail("Unsupported MLA layout reached the token gather")
+        gather_calls.append((source, staging, block_size))
+        return 0
+
+    monkeypatch.setattr(aiter_mla, "gather_dcp_mla_pages", gather)
+    transfer = builder.get_kv_transfer_tensors()
+    # Keep whole-page transfers available and retain the rejecting callback:
+    # dropping it would silently fall back to direct per-token RDMA.
+    assert len(transfer.block_regions) == 2
+    assert transfer.gather_sharded_mla is not None
+    if unsupported_layout is not None:
+        with pytest.raises(RuntimeError, match=f"{unsupported_layout} layout"):
+            transfer.gather_sharded_mla(0, None, 0)
+        assert not gather_calls
+    else:
+        addr, pages = transfer.gather_sharded_mla(0, None, 0)
+        assert addr != 0 and pages == 0
+        assert len(gather_calls) == 1
+        source, staging, block_size = gather_calls[0]
+        assert source.data_ptr() == transfer.block_regions[0].base_addr
+        assert staging.is_contiguous() and staging.dtype == torch.uint8
+        assert block_size == 64
+
+
 class _FakeMetadataBuffer:
     def __init__(self, size):
         self.np = np.zeros(size, dtype=np.int32)

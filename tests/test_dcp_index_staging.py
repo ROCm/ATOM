@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -31,6 +33,11 @@ def test_mla_gather_preserves_sharded_bytes_and_partial_page(dcp_size, dtype, wi
             src_ids, block_size=block_size, dcp_size=dcp_size, dcp_rank=rank
         )
         indices = prepare_dcp_index_gather_indices(plan, torch.device(device))
+        indices = replace(
+            indices,
+            src_block_id_per_token=indices.src_block_id_per_token.to(index_dtype),
+            src_token=indices.src_token.to(index_dtype),
+        )
         staging = torch.full(
             (plan.dst_pages + 1, block_size * width),
             253,
@@ -51,6 +58,105 @@ def test_mla_gather_preserves_sharded_bytes_and_partial_page(dcp_size, dtype, wi
         assert torch.all(
             staging[-1] == 253
         ), "gather overwrote a neighboring pool region"
+
+
+@pytest.fixture
+def mla_gather_inputs():
+    block_size, width = 16, 48
+    plan = build_dcp_shard_plan(
+        [3, 0, 2], block_size=block_size, dcp_size=2, dcp_rank=1
+    )
+    indices = prepare_dcp_index_gather_indices(plan, torch.device("cpu"))
+    source = torch.zeros(4, block_size, width, dtype=torch.uint8)
+    staging = torch.full(
+        (plan.dst_pages + 1, block_size * width), 253, dtype=torch.uint8
+    )
+    return source, staging, indices, block_size
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.int8])
+def test_mla_gather_rejects_non_byte_staging_before_write(mla_gather_inputs, dtype):
+    source, staging, indices, block_size = mla_gather_inputs
+    staging = staging.to(dtype)
+    before = staging.clone()
+    with pytest.raises(TypeError, match="staging must have dtype torch.uint8"):
+        gather_dcp_mla_pages(source, staging, indices, block_size)
+    torch.testing.assert_close(staging, before)
+
+
+@pytest.mark.parametrize(
+    "field", ["source", "staging", "src_block_id_per_token", "src_token", "valid"]
+)
+def test_mla_gather_rejects_mixed_devices(mla_gather_inputs, field):
+    source, staging, indices, block_size = mla_gather_inputs
+    # A metadata-only device exercises this contract without requiring a GPU.
+    if field == "source":
+        source = source.to("meta")
+    elif field == "staging":
+        staging = staging.to("meta")
+    else:
+        indices = replace(indices, **{field: getattr(indices, field).to("meta")})
+    with pytest.raises(ValueError, match="same device as source"):
+        gather_dcp_mla_pages(source, staging, indices, block_size)
+
+
+@pytest.mark.parametrize("field", ["src_block_id_per_token", "src_token", "valid"])
+@pytest.mark.parametrize("shape", ["broadcast", "short", "2d"])
+def test_mla_gather_rejects_malformed_index_shapes(mla_gather_inputs, field, shape):
+    source, staging, indices, block_size = mla_gather_inputs
+    tensor = getattr(indices, field)
+    if shape == "broadcast":
+        tensor = tensor[:1]
+    elif shape == "short":
+        tensor = tensor[:-1]
+    else:
+        tensor = tensor.reshape(1, -1)
+    indices = replace(indices, **{field: tensor})
+    with pytest.raises(ValueError, match=f"{field} must be a 1-D tensor"):
+        gather_dcp_mla_pages(source, staging, indices, block_size)
+    assert torch.all(staging == 253)
+
+
+@pytest.mark.parametrize(
+    "field,dtype",
+    [
+        ("src_block_id_per_token", torch.bool),
+        ("src_token", torch.float32),
+        ("valid", torch.uint8),
+    ],
+)
+def test_mla_gather_rejects_invalid_index_dtypes(mla_gather_inputs, field, dtype):
+    source, staging, indices, block_size = mla_gather_inputs
+    indices = replace(indices, **{field: getattr(indices, field).to(dtype)})
+    with pytest.raises(TypeError, match=f"{field} must have dtype"):
+        gather_dcp_mla_pages(source, staging, indices, block_size)
+    assert torch.all(staging == 253)
+
+
+def test_mla_gather_rejects_negative_page_count(mla_gather_inputs):
+    source, staging, indices, block_size = mla_gather_inputs
+    with pytest.raises(ValueError, match="nonnegative destination page count"):
+        gather_dcp_mla_pages(
+            source, staging, replace(indices, dst_pages=-1), block_size
+        )
+
+
+@pytest.mark.parametrize("shape", [(), (4,), (0, 16, 48), (4, 16, 0)])
+def test_mla_gather_rejects_invalid_source_pages(mla_gather_inputs, shape):
+    _, staging, indices, block_size = mla_gather_inputs
+    source = torch.empty(shape, dtype=torch.uint8)
+    with pytest.raises(ValueError, match="nonempty source pages"):
+        gather_dcp_mla_pages(source, staging, indices, block_size)
+
+
+def test_mla_gather_empty_plan_preserves_staging_and_checks_dtype(mla_gather_inputs):
+    source, staging, _, block_size = mla_gather_inputs
+    plan = build_dcp_shard_plan([], block_size=block_size, dcp_size=2, dcp_rank=0)
+    indices = prepare_dcp_index_gather_indices(plan, torch.device("cpu"))
+    assert gather_dcp_mla_pages(source, staging, indices, block_size) == 0
+    assert torch.all(staging == 253)
+    with pytest.raises(TypeError, match="staging must have dtype torch.uint8"):
+        gather_dcp_mla_pages(source, staging.float(), indices, block_size)
 
 
 @pytest.mark.parametrize("index_head_dim", [128, 256])
