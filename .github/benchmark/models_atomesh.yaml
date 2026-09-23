@@ -374,7 +374,7 @@ models:
               [1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]
             extra_args: "--decode-context-parallel-size 4 --cudagraph-mode FULL"
           env:
-            common: &glm52_agentic_lmcache_cpp4_dcp4_env_common
+            common:
               ATOM_MLA_PAGE_SIZE: "1"
               ATOM_ONLINE_QUANT_STREAMING: "0"
               ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB: "2047"
@@ -490,8 +490,18 @@ models:
             workers: 3
             cudagraph: "[1,2,4,8,12,16,20,24]"
           env:
-            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
-            prefill: *glm52_agentic_lmcache_cpp4_dcp4_env_prefill
+            # The standalone TP4 recipe leaves TOPK_FORCE_PATH and the indexer
+            # budget at their defaults, so only the CPP4 prefill sets them.
+            common:
+              ATOM_MLA_PAGE_SIZE: "1"
+              ATOM_ONLINE_QUANT_STREAMING: "0"
+              ATOM_USE_TRITON_MLA: "0"
+              MAX_JOBS: "16"
+              PYTHONHASHSEED: "0"
+            prefill:
+              <<: *glm52_agentic_lmcache_cpp4_dcp4_env_prefill
+              ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB: "2047"
+              TOPK_FORCE_PATH: "one"
             decode:
               <<: *glm52_agentic_lmcache_cpp4_dcp4_env_decode
               ATOM_USE_FLYDSL_GATHER_KV_B_PROJ: "0"
