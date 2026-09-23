@@ -44,12 +44,12 @@ class Attention(BaseAttention):
             not is_plugin_mode()
         ), "ATOM native Attention is only supported for ATOM native/server mode"
 
-        # Under Ulysses SP the caller's counts are the projection's width --
-        # every head, since SP leaves the weights unsharded -- while attention
-        # itself runs on this rank's 1/sp slice of them after the all-to-all.
-        # The KV pool geometry is read back off these attributes, so dividing
-        # here is also what sizes the cache for the heads this rank caches.
+        # Projections keep all heads; attention and its KV pool own 1/SP.
         sp_size = get_sp_world_size()
+        if sp_size > 1 and (sinks is not None or alibi_slopes is not None):
+            raise ValueError(
+                "Ulysses SP does not support attention sinks or ALiBi slopes."
+            )
         num_heads //= sp_size
         num_kv_heads = max(1, num_kv_heads // sp_size)
         # MiniMax-M3 carries one indexer query head per kv head, so its packed

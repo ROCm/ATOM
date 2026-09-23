@@ -146,8 +146,7 @@ class EngineArgs:
             default=1,
             help="Ulysses sequence parallel size. Shards tokens across the "
             "group and trades sequence for heads around attention via "
-            "all-to-all. Replaces tensor parallel (requires -tp 1) and "
-            "implies expert parallel.",
+            "all-to-all. Requires --tensor-parallel-size 1.",
         )
         parser.add_argument(
             "--data-parallel-size",

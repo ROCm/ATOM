@@ -640,14 +640,9 @@ class ModelRunner:
         self.block_size = config.kv_cache_block_size
         self.kv_cache_dtype = config.kv_cache_dtype
         self.enforce_eager = config.enforce_eager
-        # world_size: how many ways the attention heads are split -- what the
-        # KV-head math below divides by. TP splits them once; Ulysses SP splits
-        # them again after its all-to-all, so a rank owning 1/(tp*sp) of the
-        # heads must size its KV cache for exactly that share. It also keeps
-        # `logits_in_graph` off under SP, where the hidden states need a
-        # cross-rank gather before the LM head can run.
-        # tp_world_size: how many TP shards have a process.
-        # They differ under simulated TP and under SP.
+        # KV caches follow the attention head shards. SP needs a hidden-state
+        # gather before the LM head, so this also disables logits_in_graph.
+        # tp_world_size counts actual TP worker processes.
         self.world_size = config.tensor_parallel_size * config.sequence_parallel_size
         self.tp_world_size = config.tp_world_size
         self.rank = rank
@@ -886,9 +881,7 @@ class ModelRunner:
         return 0
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
-        # Publish the SP width before anything sizes itself by head count: the
-        # attention layers, the KV pool and the metadata builder all divide by
-        # it during model construction, which happens right after this.
+        # Attention layers, KV pools and metadata need the SP head count.
         set_sp_world_size(config.sequence_parallel_size)
         # Calculate local device rank considering DP, PP and PCP.
         # On a single node the physical GPU index equals the global distributed
@@ -1206,7 +1199,7 @@ class ModelRunner:
             warmup_max_tokens = max_num_batched_tokens // dp_size
 
         pcp_size = self.config.prefill_context_parallel_size
-        if pcp_size > 1:
+        if pcp_size > 1 and not sp_is_enabled():
             warmup_max_tokens = max(1, warmup_max_tokens // pcp_size)
 
         num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
@@ -1288,9 +1281,7 @@ class ModelRunner:
             ),
         }
         if sp_is_enabled():
-            # Ulysses feeds the model this rank's token chunk, so a graph has to
-            # be captured against a buffer of that width rather than a slice of
-            # the global one. `positions` needs no twin: it is passed whole.
+            # Each graph captures a fixed address for this rank's token shard.
             self.forward_vars["sp_input_ids"] = torch.empty(
                 sp_pad_len(self.max_num_batched_tokens) // get_sp_world_size(),
                 dtype=self.tokenID_processor.input_ids.gpu.dtype,
@@ -1441,21 +1432,15 @@ class ModelRunner:
         return sp_pad_len(num_tokens) // get_sp_world_size()
 
     def sp_graph_input_ids(self, num_tokens: int) -> torch.Tensor:
-        """This rank's token chunk, staged into its own fixed-address buffer.
-
-        A captured graph reads one address, so the shard cannot be a fresh
-        slice each step; it is copied into `sp_input_ids` instead. The tail
-        past the real tokens is zeroed rather than left stale so a padded
-        decode never feeds the LM head an id from a previous step.
-        """
+        """Stage this rank's padded token shard at the graph's fixed address."""
         local = self.sp_local_tokens(num_tokens)
-        buf = self.forward_vars["sp_input_ids"]
-        src = self.forward_vars["input_ids"].gpu
-        padded = sp_pad_len(num_tokens)
-        if padded > num_tokens:
-            src[num_tokens:padded].zero_()
-        buf[:local].copy_(src[sp_local_slice(num_tokens)])
-        return buf[:local]
+        buf = self.forward_vars["sp_input_ids"][:local]
+        src = self.forward_vars["input_ids"].gpu[:num_tokens]
+        shard = src[sp_local_slice(num_tokens)]
+        buf[: shard.numel()].copy_(shard)
+        # Pad the local buffer: the global buffer may end at num_tokens.
+        buf[shard.numel() :].zero_()
+        return buf
 
     def _get_num_kv_heads(self):
         """Return the per-rank number of KV heads."""
@@ -2474,7 +2459,7 @@ class ModelRunner:
             attn_metadata=attn_metadata,
             atom_config=self.config,
             context=context,
-            num_tokens=scheduled_tokens,
+            num_tokens=running_tokens if sp_is_enabled() else scheduled_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             spec_decode_metadata=spec_decode_metadata,
             ubatch_slices=ubatch_slices,
@@ -2863,15 +2848,16 @@ class ModelRunner:
                 input_ids, positions, _pcp_bal_groups, _pcp_size, forward_context
             )
 
-        # Ulysses SP: hand the model only this rank's token chunk. `positions`
-        # stays whole -- it is consumed inside the attention op, which by then
-        # has all-to-all'd its way back to the full sequence, and its length is
-        # how that op tells the real tokens from the divisibility pad.
-        sp_total_tokens = input_ids.shape[0]
-        if sp_is_enabled():
-            input_ids = sp_split_tokens(input_ids)
+        if sp_is_enabled() and getattr(batch, "multimodal_data", None):
+            raise ValueError(
+                "Ulysses SP does not support multimodal embedding merging."
+            )
 
         if not forward_mode.use_cudagraph:
+            # Attention exchanges shards back to the full sequence, so positions
+            # keep their global length and also identify the SP padding.
+            sp_total_tokens = input_ids.shape[0]
+            input_ids = sp_split_tokens(input_ids)
             # prefill, or decode forced eager (enforce_eager / DP peer
             # prefill / bs above the largest captured graph).
             with record_function(label):
@@ -3045,18 +3031,15 @@ class ModelRunner:
 
                 graph_key = (running_bs, forward_context.attn_metadata.max_seqlen_q)
                 if sp_is_enabled():
-                    # Stage this rank's chunk into the address the graph
-                    # captured, then put the shards back together after replay:
-                    # the graph produced only 1/sp of the rows.
                     self.sp_graph_input_ids(running_tokens)
-                    self.graphs[graph_key].replay()
+                self.graphs[graph_key].replay()
+                if sp_is_enabled():
                     local = self.sp_local_tokens(running_tokens)
                     hidden_states = sp_gather_tokens(
                         self.forward_vars["outputs"][:local], running_tokens
                     )[:scheduled_tokens]
-                    return self.model.compute_logits(hidden_states), hidden_states
-                self.graphs[graph_key].replay()
-                hidden_states = self.forward_vars["outputs"][:scheduled_tokens]
+                else:
+                    hidden_states = self.forward_vars["outputs"][:scheduled_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
                 # copy ops were captured into the graph.
                 if self.logits_in_graph:

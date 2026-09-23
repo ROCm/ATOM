@@ -1,29 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Ulysses sequence parallelism (SP) for the native ATOM LLM path.
+"""Ulysses sequence parallelism for the native ATOM LLM path.
 
-Ulysses shards the token sequence across the SP group for every layer except
-attention, then trades sequence for heads around attention itself::
-
-    linear/MoE:  [T/W, H,   D]      weights replicated (dense) or EP-sharded
-                    | all-to-all
-    attention:   [T,   H/W, D]      full sequence, this rank's head slice
-                    | all-to-all
-    linear/MoE:  [T/W, H,   D]
-
-Attention and dense weights are replicated; attention's TP all-reduce becomes
-two head/sequence exchanges. MoE weights remain sharded: its communication is
-either a token all-gather plus reduce-scatter or routed EP dispatch/combine.
-That MoE traffic must be included when comparing SP with TP.
-
-The split is contiguous, not round-robin as in PCP: attention is head-sharded
-and still sees every token, so contiguous chunks carry no causal-mask
-imbalance, and they make the all-to-all a plain equal-split exchange with no
-re-ranging on either side.
-
-The SP group rides on the PCP dimension of aiter's rank grid (world =
-dp x pp x pcp x tp), which already spans the right ranks and is already folded
-into the EP group. Pure Ulysses therefore runs at ``-tp 1 -sp W``.
+Ranks own contiguous token chunks outside attention. Two all-to-alls trade
+``[T/W, H, D]`` for ``[T, H/W, D]`` around attention, which retains global
+sequence metadata. Dense weights are replicated; MoE weights remain sharded.
+SP uses AITER's PCP rank dimension and runs with ``-tp 1 -sp W``.
 """
 
 from functools import partial
@@ -32,9 +14,7 @@ import torch
 
 from atom.utils import envs
 
-# Metadata helpers are also used by CPU-only forward-context consumers. Import
-# AITER and Triton only in the operations that need their GPU runtime.
-# Set by each ModelRunner before distributed/model construction.
+# Keep GPU imports lazy for CPU-only metadata consumers. Set by ModelRunner.
 _SP_WORLD_SIZE: int = 1
 
 
@@ -67,13 +47,7 @@ def get_sp_group():
 
 
 def attn_head_shard_size() -> int:
-    """Ways the attention heads are split: TP shards them, SP shards them again.
-
-    Every per-rank head count (q/kv heads on the impl, the KV pool geometry,
-    the metadata builder's head count) must divide by this rather than by the
-    TP size alone, or the KV cache will be sized for heads this rank never
-    computes.
-    """
+    """Head-sharding factor used by attention, metadata, and KV-cache geometry."""
     from aiter.dist.parallel_state import get_tp_group
 
     return get_tp_group().world_size * _SP_WORLD_SIZE
@@ -90,13 +64,7 @@ def sp_pad_len(total_tokens: int, sp_size: int | None = None) -> int:
 
 
 def sp_tokens_across_ranks(num_tokens: int | None) -> tuple[int, ...] | None:
-    """Per-rank token counts for a step, in the shape DP metadata reports them.
-
-    A routed all2all MoE bounds its receive buffer by this table. Ulysses
-    shards a step evenly, so it is one count repeated -- but it still has to be
-    published, because the table is otherwise only built when DP is what splits
-    the tokens.
-    """
+    """Per-rank token counts used to size routed MoE receive buffers."""
     if _SP_WORLD_SIZE <= 1 or num_tokens is None:
         return None
     return (sp_pad_len(num_tokens) // _SP_WORLD_SIZE,) * _SP_WORLD_SIZE
@@ -110,12 +78,9 @@ def sp_local_slice(total_tokens: int) -> slice:
 
 
 def sp_split_tokens(x: torch.Tensor) -> torch.Tensor:
-    """Take this rank's contiguous 1/W chunk along dim 0, padding the tail.
+    """Take this rank's contiguous chunk, padding with zeros along dim 0.
 
-    Padding rows are copies of nothing in particular -- they are dropped again
-    by `sp_gather_tokens` and never reach attention (the attention op slices
-    back to the real token count before running the kernel), so their contents
-    are irrelevant as long as they are finite.
+    Attention and the final gather discard padding before returning results.
     """
     if _SP_WORLD_SIZE <= 1:
         return x
@@ -133,13 +98,10 @@ _ALLGATHER_MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
 
 
 def _custom_gather_ok(payload: torch.Tensor, group) -> bool:
-    """Whether aiter's registered-buffer all-gather can carry this payload.
+    """Whether AITER's registered-buffer all-gather supports this payload.
 
-    EVERY TERM MUST BE RANK-INVARIANT. This picks between two collectives, so a
-    split decision does not degrade -- it deadlocks, with part of the group in
-    aiter's gather and the rest in RCCL's, and no error from either. SP shards
-    tokens evenly and pads to the group, so `payload` has the same shape on
-    every rank; the rest is fixed when the group is built.
+    All predicates must agree across ranks: choosing different collectives
+    deadlocks. Padded SP shards have equal shapes on every rank.
     """
     if not envs.ATOM_USE_CUSTOM_ALL_GATHER:
         return False
@@ -150,10 +112,7 @@ def _custom_gather_ok(payload: torch.Tensor, group) -> bool:
 
 
 def _custom_reduce_scatter_ok(payload: torch.Tensor, group) -> bool:
-    """Whether aiter's registered-buffer reduce-scatter can carry this payload.
-
-    Rank-invariant for the reason in `_custom_gather_ok`.
-    """
+    """Rank-invariant gate for AITER's registered-buffer reduce-scatter."""
     ca_comm = getattr(getattr(group, "device_communicator", None), "ca_comm", None)
     if ca_comm is None or ca_comm.disabled:
         return False
@@ -161,24 +120,14 @@ def _custom_reduce_scatter_ok(payload: torch.Tensor, group) -> bool:
 
 
 def _prefer_all_gather(payload: torch.Tensor, group) -> bool:
-    """Whether to trade this exchange's all-to-all for an all-gather.
-
-    The size test comes first because it is the performance decision; the rest
-    is availability, and when availability says no the all-to-all is correct at
-    every size.
-    """
+    """Use registered-buffer all-gather only for small supported payloads."""
     if payload.numel() * payload.element_size() > _ALLGATHER_MAX_PAYLOAD_BYTES:
         return False
     return _custom_gather_ok(payload, group)
 
 
 def _all_gather_tokens(x: torch.Tensor) -> torch.Tensor:
-    """All-gather token shards, over aiter's buffers where they can take it.
-
-    `all_gather` defaults to `use_custom=False`, which is RCCL -- slower, and
-    its WorkNCCL end event is recorded inside capture but queried later by the
-    watchdog thread (see `all_gather_with_padding` for that crash).
-    """
+    """Gather token shards, preferring graph-compatible AITER transports."""
     x = x.contiguous()
     group = get_sp_group()
     if _custom_gather_ok(x, group):
@@ -207,10 +156,7 @@ def ulysses_gather_heads(x: torch.Tensor) -> torch.Tensor:
     s_local, width = x.shape[0] // w, x.shape[1]
     group = get_sp_group()
 
-    # Concatenating on the head axis puts the heads in the same rank order the
-    # all-to-all rebuilds, and leaves our token chunk as a plain row slice --
-    # so this transport also skips the transpose the other one cannot avoid.
-    # aiter's gather takes the last dim only in 16-byte multiples.
+    # AITER's last-dimension gather requires 16-byte alignment.
     if width * x.element_size() % 16 == 0 and _prefer_all_gather(x, group):
         start = group.rank_in_group * s_local
         return group.all_gather(x, use_custom=True, dim=1)[start : start + s_local]
@@ -230,25 +176,14 @@ def _swap_heads(x, s_local, width):
 
 
 def sp_moe_gather(x: torch.Tensor) -> torch.Tensor:
-    """Collect the group's token shards ahead of an expert-parallel MoE.
-
-    Expert parallelism shards the experts, so a token can only be served by the
-    rank that owns its expert -- but under SP each rank holds a different token
-    shard, so without this a token routed off-rank would contribute nothing at
-    all (silently: the kernels just skip non-local expert ids).
-
-    """
+    """Gather token shards so each rank can evaluate its local experts."""
     if _SP_WORLD_SIZE <= 1:
         return x
     return _all_gather_tokens(x)
 
 
 def sp_moe_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
-    """Sum every rank's expert contributions and keep this rank's token shard.
-
-    Keep the input dtype throughout communication. A quantized all-reduce
-    followed by slicing introduces rounding error and sends unused rows.
-    """
+    """Sum expert contributions in the input dtype and keep this token shard."""
     if _SP_WORLD_SIZE <= 1:
         return x
     x = x.contiguous()
@@ -278,35 +213,20 @@ def _exchange(send):
 
     recv = torch.empty_like(send)
     all_to_all_into(recv, send, get_sp_group())
-    # recv[i] holds rank i's tokens for our slice; ranks own contiguous token
-    # chunks, so concatenating on rank rebuilds global token order.
+    # Rank-major receive order is global token order for contiguous shards.
     return recv.reshape(recv.shape[0] * recv.shape[1], recv.shape[2])
 
 
 def _exchange_tensors(tensors, shards=None):
-    """Trade tokens for heads on several tensors in a single all-to-all.
-
-    Each arrives as ``[S/W, width]`` on this rank's token chunk; the result is
-    one packed ``[S, sum(width/W)]`` tensor on this rank's head slice, in the
-    order given. Batching them into one collective rather than one each
-    matters more than it looks: this runs once per attention layer, and decode
-    is latency-bound, not bandwidth-bound.
-
-    This is the path for models that hand q/k/v over as separate tensors; when
-    they are ranges of one fused projection, `_exchange_columns` builds the
-    same buffer without a copy per tensor.
-    """
+    """Exchange separate fields into one packed tensor with all sequence rows."""
     w = _SP_WORLD_SIZE
     shards = shards or [w] * len(tensors)
     widths = [t.shape[-1] // n for t, n in zip(tensors, shards)]
     proto = tensors[0]
-    # Packed straight into the send buffer rather than cat-then-stack: the
-    # obvious spelling of this copies every element twice.
+    # Copy directly into the send buffer, replicating shared KV head shards.
     send = proto.new_empty((w, proto.shape[0], sum(widths)))
     col = 0
     for tensor, width, n in zip(tensors, widths, shards):
-        # Heads are the major axis of the flat width, so destination rank i
-        # owns one contiguous column range: [S, w*width] -> [w, S, width].
         field = tensor.view(tensor.shape[0], n, width).permute(1, 0, 2)
         send[:, :, col : col + width].view(n, w // n, tensor.shape[0], width).copy_(
             field[:, None]
@@ -316,18 +236,7 @@ def _exchange_tensors(tensors, shards=None):
 
 
 def _exchange_columns(source, spec, owner):
-    """Same exchange, for fields that are column ranges of one fused tensor.
-
-    `spec` lists them as ``(column offset, full width, mode)`` into `source`.
-    Because they share a tensor, the whole send buffer is one gather along the
-    column axis instead of a copy per field -- worth the indirection at 60
-    attention layers, where decode pays each launch in latency no matter how
-    small the payload. The permutation only depends on the layer's widths, so
-    it is built once and kept on the layer.
-
-    A ``_REPLICATE`` field is taken whole for every destination. This adds
-    payload bytes but shares the collective with the sharded fields.
-    """
+    """Exchange fused fields described by (column offset, width, head shards)."""
     w = _SP_WORLD_SIZE
     group = get_sp_group()
     if not _prefer_all_gather(source, group):
@@ -336,56 +245,38 @@ def _exchange_columns(source, spec, owner):
         return _exchange(pack_fields(source, tuple(spec), w))
     columns = getattr(owner, "_sp_send_columns", None)
     if columns is None or columns.device != source.device:
-        # Built from arange rather than a host list so there is no host-to-
-        # device copy to capture, in case the first call lands inside a graph.
+        # Device aranges also support first use during graph capture.
         arange = partial(torch.arange, device=source.device)
-        dest = arange(w).unsqueeze(1)
-
         ranges = []
         for offset, width, mode in spec:
             shards = mode or w
             local = width // shards
-            ranges.append(arange(local) + offset + (dest // (w // shards)) * local)
-        columns = torch.cat(ranges, dim=1)
+            start = offset + (group.rank_in_group // (w // shards)) * local
+            ranges.append(arange(local) + start)
+        columns = torch.cat(ranges)
         owner._sp_send_columns = columns
 
-    return group.custom_all_gather(source).index_select(1, columns[group.rank_in_group])
+    return group.custom_all_gather(source).index_select(1, columns)
 
 
 def ulysses_attention(attn, query, key, value, positions, q_scale, qkv):
-    """Run this rank's head slice of `attn` over the whole sequence.
+    """Run this rank's head slice over the full sequence, then restore tokens.
 
-    Q/K/V arrive as this rank's token chunk carrying every head; the
-    all-to-all swaps that for every token carrying this rank's head slice,
-    which is exactly the shape the unchanged attention kernels and the
-    (global, unsharded) attention metadata already expect. The reverse
-    exchange puts the output back on this rank's token chunk.
-
-    Called from inside the attention custom op, so the collectives are already
-    opaque to Dynamo and the padding slice below never reaches a traced graph.
+    Called inside the attention custom op, keeping collectives and padding
+    slices opaque to Dynamo.
     """
     w = _SP_WORLD_SIZE
     kv_shards = min(w, key.shape[-1] // attn.head_dim)
     if qkv is None:
         packed = _exchange_tensors([query, key, value], [w, kv_shards, kv_shards])
     else:
-        # Models that fuse the projection hand q/k/v over as column ranges of
-        # `qkv`, so describe the exchange against that tensor and gather it in
-        # one pass. MiniMax-M3 also packs indexer fields after q/k/v, and its
-        # fused qk-norm/RoPE/KV-insert kernel finds them by offset -- so they
-        # must ride the same exchange and land in the same order, at the
-        # sharded widths the impl re-splits with. index_k is a single head
-        # shared by every indexer head, so it has no head axis to trade and
-        # replicates instead.
+        # MiniMax-M3's fused kernel also reads indexer fields by column offset.
         q_size, kv_size = query.shape[-1], key.shape[-1]
         spec = [
             (0, q_size, _SCATTER),
             (q_size, kv_size, kv_shards),
             (q_size + kv_size, kv_size, kv_shards),
         ]
-        # The impl re-splits `qkv` at these same offsets, so a caller whose
-        # q/k/v are not those column ranges is already broken -- but say so
-        # here rather than let the gather quietly send the wrong columns.
         if any(
             t.untyped_storage().data_ptr() != qkv.untyped_storage().data_ptr()
             or t.storage_offset() != qkv.storage_offset() + offset
@@ -410,17 +301,13 @@ def ulysses_attention(attn, query, key, value, positions, q_scale, qkv):
             spec.append((index_q_start + index_q_width, idx_dim, _REPLICATE))
         packed = _exchange_columns(qkv, spec, attn)
 
-    # `positions` is passed through unsharded, so it still counts the real
-    # tokens; anything past that is the divisibility pad, which the metadata
-    # does not describe and the kernels must not see.
+    # Global positions and attention metadata exclude the divisibility pad.
     real_tokens = positions.shape[-1]
     padded_tokens = packed.shape[0]
     if real_tokens < padded_tokens:
         packed = packed[:real_tokens]
 
-    # Column views, left non-contiguous on purpose: this is the same thing the
-    # models hand the impl unsharded (`qkv.split(...)`), so the kernels already
-    # take it, and materializing them would copy q/k/v a second time.
+    # Attention accepts column views, so avoid another Q/K/V copy.
     q_width = query.shape[-1] // w
     kv_width = key.shape[-1] // kv_shards
     out = attn.impl.forward(
@@ -429,9 +316,7 @@ def ulysses_attention(attn, query, key, value, positions, q_scale, qkv):
         value=packed[:, q_width + kv_width : q_width + 2 * kv_width],
         position=positions,
         q_scale=q_scale,
-        # Only hand a packed tensor to callers that supplied one: elsewhere its
-        # presence would switch the impl onto a fused path the unsharded run
-        # never takes.
+        # Preserve the caller's choice of fused or separate Q/K/V kernels.
         qkv=packed if qkv is not None else None,
     )
 
