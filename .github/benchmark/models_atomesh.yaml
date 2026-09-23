@@ -702,6 +702,47 @@ models:
               DECODE_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"lmcache_offload","kv_role":"offload"}
 
+        - &kimi_k3_agentic_2p1d
+          <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c64
+          topology: 2p1d
+          display_topology: 2P1D-TP8-DCP8
+          nodes: "${ATOMESH_2P1D_NODES}"
+          concurrency: [64]
+          prefill:
+            workers: 2
+            tp: 8
+            dcp: 8
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 128
+          env: *kimi_k3_agentic_lmcache192_env
+
+        - <<: *kimi_k3_agentic_2p1d
+          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c72
+          concurrency: [72]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 144
+
+        - <<: *kimi_k3_agentic_2p1d
+          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c128
+          concurrency: [128]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 256
+
+        - <<: *kimi_k3_agentic_2p1d
+          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c256
+          concurrency: [256]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 512
+
     accuracy:
       task: gsm8k
       fewshot: 5

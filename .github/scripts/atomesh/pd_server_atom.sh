@@ -146,6 +146,19 @@ is_agentic_dpa() {
     }
 }
 
+# More than one prefill process. Distinct from DPA, which is ranks inside one process.
+is_agentic_multi_prefill() {
+  [[ "${BENCHMARK_KIND}" == "aiperf_agentic" \
+    && "${xP}" =~ ^[0-9]+$ \
+    && "${xP}" -gt 1 ]]
+}
+
+# Agentic traces are multi-turn. A later turn has to reach the worker that kept
+# the prefix: a DP rank under DPA, or one prefill instance when several are up.
+is_agentic_session_affinity() {
+  is_agentic_dpa || is_agentic_multi_prefill
+}
+
 ISL_LIST="${ISL_LIST:-8192}"
 OSL="${OSL:-1024}"
 CONC_LIST="${CONC_LIST:-4,8}"
@@ -853,9 +866,15 @@ start_router() {
     )
   fi
   local -a router_dp_aware_args=()
+  local -a router_prefill_policy_args=()
   if is_agentic_dpa; then
     router_policy="dp_sticky"
     router_dp_aware_args=(--dp-aware)
+  elif is_agentic_multi_prefill; then
+    # Pin the session to one prefill. Decode keeps ROUTER_POLICY: a single
+    # decode has nothing to stick, and --dp-aware is only for ranks that share
+    # one endpoint.
+    router_prefill_policy_args=(--prefill-policy dp_sticky)
   elif [[ "${#router_rank_mapping_args[@]}" -gt 0 ]]; then
     router_dp_aware_args=(--dp-aware)
   fi
@@ -867,6 +886,7 @@ start_router() {
     "${prefill_args[@]}"
     "${decode_args[@]}"
     --policy "${router_policy}"
+    "${router_prefill_policy_args[@]}"
     "${router_rank_mapping_args[@]}"
     "${router_dp_aware_args[@]}"
     --backend atom
@@ -1089,7 +1109,9 @@ write_aiperf_chrome_trace() {
 run_aiperf_agentic_benchmark() {
   ensure_aiperf
 
-  if is_agentic_dpa; then
+  if is_agentic_session_affinity; then
+    # dp_sticky keys off X-Session-ID. Without it every turn is placed by load
+    # and the prefix written by one turn is invisible to the next.
     export AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true
   else
     unset AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID
