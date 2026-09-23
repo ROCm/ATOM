@@ -52,6 +52,7 @@ from atom.distributed.dcp_utils import (
     get_dcp_group,
     get_dcp_rank,
     get_dcp_world_size,
+    mla_dcp_decode_is_persistent,
     mla_dcp_sparse_prefill_is_persistent,
 )
 from atom.distributed.pcp_utils import (
@@ -260,35 +261,6 @@ _MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT = (16, 32, 64, 128)
 
 _dcp_kernel_width_warned = False
 _dcp_sparse_prefill_width_warned = False
-
-
-def mla_dcp_decode_is_persistent(
-    is_sparse: bool,
-    dcp_world_size: int,
-    dcp_persistent_supported: bool,
-    *,
-    sparse_metadata_rebuild: bool = False,
-) -> bool:
-    """Whether a DCP decode will reach ``mla_decode_fwd`` in persistent mode.
-
-    The live decision is made per step in ``_forward_decode``; this mirrors the
-    parts of it that are already settled at construction time, because the
-    gathered head width has to be fixed there (it sizes the persistent work
-    descriptors as well as the kernel's nhead). Sparse MLA under DCP is
-    persistent only when the caller rebuilds work/reduce metadata after each
-    full indexer layer compacts its rank-local top-k. Only gfx950 ships the
-    lse-emitting persistent kernel DCP needs, and persistent mode wants page
-    size 1. The one remaining runtime gate, ``dpa_persistent_supported``, is
-    unconditionally true, so nothing here can claim persistent mode that the
-    step then refuses.
-
-    ``dcp_persistent_supported`` is taken as an argument rather than queried
-    here, the way ``should_use_persistent_mode`` takes it: callers already cache
-    it to keep ``get_gfx()`` off the per-forward path.
-    """
-    if dcp_world_size <= 1 or (is_sparse and not sparse_metadata_rebuild):
-        return False
-    return dcp_persistent_supported and envs.ATOM_MLA_PAGE_SIZE <= 1
 
 
 def mla_dcp_kernel_num_heads(

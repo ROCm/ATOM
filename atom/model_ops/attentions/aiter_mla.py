@@ -19,6 +19,7 @@ from atom.distributed.dcp_utils import (
     dcp_persistent_supported,
     get_dcp_rank,
     get_dcp_world_size,
+    mla_dcp_decode_is_persistent,
     mla_dcp_sparse_prefill_is_persistent,
 )
 from atom.distributed.pcp_utils import (
@@ -42,7 +43,6 @@ from atom.model_ops.attention_mla import (
     _MLA_MIN_HEADS,
     _MLA_SPLIT_BUDGET_AUTO,
     MLAAttention,
-    mla_dcp_decode_is_persistent,
     mla_dcp_kernel_num_heads,
     mla_dcp_sparse_prefill_num_heads,
 )

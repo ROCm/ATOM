@@ -64,6 +64,40 @@ def dcp_persistent_supported() -> bool:
     return get_gfx() == "gfx950"
 
 
+def mla_dcp_decode_is_persistent(
+    is_sparse: bool,
+    dcp_world_size: int,
+    dcp_persistent_supported: bool,
+    *,
+    sparse_metadata_rebuild: bool = False,
+) -> bool:
+    """Whether a DCP decode will reach ``mla_decode_fwd`` in persistent mode.
+
+    The live decision is made per step in ``_forward_decode``; this mirrors the
+    parts of it that are already settled at construction time, because the
+    gathered head width has to be fixed there (it sizes the persistent work
+    descriptors as well as the kernel's nhead). Sparse MLA under DCP is
+    persistent only when the caller rebuilds work/reduce metadata after each
+    full indexer layer compacts its rank-local top-k. Only gfx950 ships the
+    lse-emitting persistent kernel DCP needs, and persistent mode wants page
+    size 1. The one remaining runtime gate, ``dpa_persistent_supported``, is
+    unconditionally true, so nothing here can claim persistent mode that the
+    step then refuses.
+
+    ``dcp_persistent_supported`` is taken as an argument rather than queried
+    here, the way ``should_use_persistent_mode`` takes it: callers already cache
+    it to keep ``get_gfx()`` off the per-forward path.
+
+    Lives here, not in ``atom.model_ops.attention_mla``: dependency-free
+    (only ``atom.utils.envs``), so it stays importable, and testable,
+    without triton/aiter, and so ``mla_dcp_sparse_prefill_is_persistent``
+    below can share this body instead of duplicating it.
+    """
+    if dcp_world_size <= 1 or (is_sparse and not sparse_metadata_rebuild):
+        return False
+    return dcp_persistent_supported and envs.ATOM_MLA_PAGE_SIZE <= 1
+
+
 def mla_dcp_sparse_prefill_is_persistent(
     dcp_world_size: int,
     dcp_persistent_supported: bool,
@@ -76,8 +110,12 @@ def mla_dcp_sparse_prefill_is_persistent(
     single source the gathered pad width is derived from -- the two must move
     together, or a path runs one way while its width was padded for the other.
 
-    Not gated on KV cache dtype: the work-metadata buffers are allocated and
-    filled for the layer's real dtype regardless
+    A thin ``is_sparse=True`` call into ``mla_dcp_decode_is_persistent``, not
+    a second copy of its body: decode's ``is_sparse and not
+    sparse_metadata_rebuild`` guard is exactly this call site's ``not
+    sparse_metadata_rebuild`` once ``is_sparse`` is pinned true, and neither
+    function has ever been gated on KV cache dtype -- the work-metadata
+    buffers are allocated and filled for the layer's real dtype regardless
     (`get_mla_metadata_info_v1`/`get_mla_metadata_v1` take `dtype_q`/`dtype_kv`
     unconditionally), and persistent vs non-persistent agree to bf16 rounding.
     `_forward_prefill_mla`'s `use_work_meta` has the matching `dcp_world_size
@@ -86,14 +124,18 @@ def mla_dcp_sparse_prefill_is_persistent(
     and `use_decode_kernel` is `kv_cache_dtype.startswith("fp8") or return_lse`
     with `return_lse` never passed at the non-DCP call site.
 
-    Lives here, not in ``atom.config``: its input ``dcp_persistent_supported``
-    is this module's own function, and this stays dependency-free (only
-    ``atom.utils.envs``) for the same CPU-importability reason that one is.
+    This is the only producer `_forward_prefill_mla`'s per-forward assert
+    checks against; that assert independently re-derives the same condition
+    inline rather than calling this function, specifically so drift between
+    the two spellings is still catchable -- collapsing this function into
+    decode's does not touch that.
     """
-    if dcp_world_size <= 1 or not sparse_metadata_rebuild:
-        return False
-    page_size = envs.ATOM_MLA_PAGE_SIZE if envs.ATOM_MLA_PAGE_SIZE is not None else 1
-    return dcp_persistent_supported and page_size <= 1
+    return mla_dcp_decode_is_persistent(
+        True,
+        dcp_world_size,
+        dcp_persistent_supported,
+        sparse_metadata_rebuild=sparse_metadata_rebuild,
+    )
 
 
 def dcp_prefill_merge_bf16_ok() -> bool:

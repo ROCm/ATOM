@@ -53,7 +53,10 @@ from atom.config import (
     qrep_enabled_for_layer,
     qrep_unsupported_reason,
 )
-from atom.distributed.dcp_utils import mla_dcp_sparse_prefill_is_persistent
+from atom.distributed.dcp_utils import (
+    mla_dcp_decode_is_persistent,
+    mla_dcp_sparse_prefill_is_persistent,
+)
 
 try:
     import triton
@@ -1650,6 +1653,50 @@ def test_sparse_prefill_persistence_does_not_look_at_dtype():
     assert not any("dtype" in p or "kv_cache" in p for p in params), (
         "the DCP sparse-prefill persistence predicate must not key off KV "
         f"cache dtype; got parameters {list(params)}"
+    )
+
+
+@pytest.mark.parametrize("dcp_world_size", [1, 2, 8])
+@pytest.mark.parametrize("dcp_persistent_supported", [False, True])
+@pytest.mark.parametrize("sparse_metadata_rebuild", [False, True])
+def test_sparse_prefill_persistence_is_decodes_with_is_sparse_true(
+    dcp_world_size, dcp_persistent_supported, sparse_metadata_rebuild
+):
+    """`mla_dcp_sparse_prefill_is_persistent` is a thin `is_sparse=True` call
+    into `mla_dcp_decode_is_persistent`, not a second copy of its body --
+    pins that the delegation actually agrees with the general function
+    across the inputs that matter, not just that it happens to today by
+    construction.
+    """
+    assert mla_dcp_sparse_prefill_is_persistent(
+        dcp_world_size,
+        dcp_persistent_supported,
+        sparse_metadata_rebuild=sparse_metadata_rebuild,
+    ) == mla_dcp_decode_is_persistent(
+        True,
+        dcp_world_size,
+        dcp_persistent_supported,
+        sparse_metadata_rebuild=sparse_metadata_rebuild,
+    )
+
+
+def test_decode_is_persistent_false_below_dcp_2():
+    assert not mla_dcp_decode_is_persistent(False, 1, True, sparse_metadata_rebuild=True)
+
+
+def test_decode_is_persistent_sparse_requires_metadata_rebuild():
+    """Dense decode (`is_sparse=False`) never looks at `sparse_metadata_rebuild`
+    at all; sparse decode is unconditionally non-persistent without it."""
+    assert mla_dcp_decode_is_persistent(False, 8, True, sparse_metadata_rebuild=False)
+    assert not mla_dcp_decode_is_persistent(
+        True, 8, True, sparse_metadata_rebuild=False
+    )
+    assert mla_dcp_decode_is_persistent(True, 8, True, sparse_metadata_rebuild=True)
+
+
+def test_decode_is_persistent_requires_platform_support():
+    assert not mla_dcp_decode_is_persistent(
+        False, 8, False, sparse_metadata_rebuild=True
     )
 
 
