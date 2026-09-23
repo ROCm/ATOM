@@ -14,7 +14,11 @@ if not torch.cuda.is_available():
 from atom.config import CompilationConfig, CUDAGraphMode
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.models.deepseek_v41.multimodal import DeepseekV41MultimodalModel
-from atom.models.deepseek_v41.runtime import DeepseekV41RuntimeModel, RuntimeBlock
+from atom.models.deepseek_v41.runtime import (
+    DeepseekV41RuntimeModel,
+    RuntimeBlock,
+    _record_tbo_expert_output,
+)
 from atom.spec_decode.drafter import Drafter
 from atom.utils import forward_context
 from atom.utils.backends import VllmBackend
@@ -76,6 +80,7 @@ class TinyBlock(RuntimeBlock):
         self.attn_norm = nn.Identity()
         self.attn = Attention()
         self.ffn = FFN()
+        self.ffn.register_forward_hook(_record_tbo_expert_output)
         self.engram = None
 
     def prepare_attention(self, state, embeddings, image_mask):

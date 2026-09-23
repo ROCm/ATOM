@@ -98,8 +98,6 @@ def runtime_config(**overrides):
         {"prefill_context_parallel_size": 2},
         {"decode_context_parallel_size": 2},
         {"parallel_config": SimpleNamespace(data_parallel_size=2)},
-        {"enable_dp_attention": True},
-        {"enable_tbo": True},
         {"enable_tbo_decode": True},
         {"kv_transfer_config": {"connector": "moriio"}},
         {"enable_rapidserve": True},
@@ -327,3 +325,14 @@ def test_a_page_that_does_not_hold_whole_index_blocks_is_refused():
     with pytest.raises(ValueError, match="needs whole 16-row blocks"):
         V41PoolGeometry(40, ((2, 2), (20, 1)), 16, 128, 512, 128)
     V41PoolGeometry(40, ((2, 2), (20, 1)), 16, 128, 512, 128, index_block_rows=8)
+
+
+@pytest.mark.parametrize("tp,dp", [(4, 1), (1, 4)])
+def test_dpa_admission_before_and_after_engine_normalization(tp, dp):
+    validate_runtime_config(
+        runtime_config(
+            enable_dp_attention=True,
+            tensor_parallel_size=tp,
+            parallel_config=SimpleNamespace(data_parallel_size=dp),
+        )
+    )

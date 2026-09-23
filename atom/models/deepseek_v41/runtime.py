@@ -20,7 +20,10 @@ def _fake_layer_output(hidden, layer_name):
 @torch_compile_guard(mutates_args=["hidden"], gen_fake=lambda hidden: None)
 def v41_begin_forward(hidden: torch.Tensor) -> None:
     """Read live request state on every execution, including graph capture."""
-    metadata = get_forward_context().attn_metadata
+    context = get_forward_context()
+    metadata = context.attn_metadata
+    if metadata.image_mask is not None and context.dp_metadata is not None:
+        raise NotImplementedError("V4.1 DP attention supports text requests only")
     metadata.step.begin_forward()
     if not metadata.step.requests:
         return
@@ -65,8 +68,26 @@ def v41_engram(residual: torch.Tensor, layer_name: str) -> torch.Tensor:
     return Block.engram_forward(layer, residual, embeddings, metadata.image_mask)
 
 
+def _record_tbo_expert_output(_module, _inputs, output):
+    # V4.1 TBO is eager-only. Compiled decode owns its graph storage and
+    # must not trace the thread-local TBO query into the graph.
+    if torch.compiler.is_compiling():
+        return
+    from atom.utils.tbo.ubatching import tbo_active
+
+    if tbo_active():
+        # DPA scatter allocates on comm; shared-expert combine and mHC consume
+        # on compute. The partner can reuse comm storage after this reference
+        # is dropped, before those consumers finish. Track just this output.
+        output.record_stream(torch.cuda.current_stream())
+
+
 class RuntimeBlock(Block):
     """Serving uses the same guarded ops in eager and compiled execution."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ffn.experts.register_forward_hook(_record_tbo_expert_output)
 
     def attention_forward(self, hidden, cache, step, rope):
         return v41_attention(hidden, self.layer_name)
@@ -87,6 +108,9 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
     # imports directly and does not route through here.
 
     block_cls = RuntimeBlock
+    # Keep communication on a separate HIP priority queue. The runtime blocks
+    # protect comm-allocated expert outputs at their compute consumer boundary.
+    tbo_comm_stream_priority = -1
 
     def __init__(self, atom_config):
         config = atom_config
@@ -119,6 +143,11 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
                 None if inputs_embeds is None else inputs_embeds.unsqueeze(0)
             ),
         ).squeeze(0)
+
+    def forward_ubatch(self, input_ids, positions):
+        # Prefill TBO runs eager; tracing a shared compiled model from two
+        # cooperatively yielding threads is not a supported compile boundary.
+        return self.forward(input_ids, positions)
 
     def compute_logits(self, hidden):
         return self.head.get_logits(self.norm(hidden))

@@ -18,6 +18,10 @@ covers TP2 and TP4 without EP at level 3 FULL. See the
 [AgentX recipe](../recipes/DeepSeek-V4.1-Flash-Agentic.md) for commands and the
 fixed acceptance length used in those measurements.
 
+Four-rank data-parallel attention is also supported with BF16 KV and the FP8
+index plane. Text prefill can use TBO with tensor-sharded experts (EP disabled);
+see the [DPA and TBO configuration](deepseek_v41_runtime.md#data-parallel-attention).
+
 The existing quality/development baseline uses TP4 with whole-expert EP at
 compilation level 0. Target execution can be eager or use whole-forward decode
 graphs (`FULL`); the draft has its own graph. The runtime also accepts

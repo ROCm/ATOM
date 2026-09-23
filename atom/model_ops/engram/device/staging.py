@@ -186,3 +186,21 @@ class EngramStagedRows(dict):
 
     def join(self):
         self.staging.join()
+
+    def slice(self, token_slice):
+        return EngramRowsView(self, token_slice)
+
+
+class EngramRowsView(dict):
+    """Consume a parent's rows without restarting or closing its lookup."""
+
+    def __init__(self, parent, token_slice):
+        super().__init__(
+            (layer, rows[:, token_slice]) for layer, rows in parent.items()
+        )
+        self.parent = parent
+
+    def get(self, layer, default=None):
+        if layer in self:
+            self.parent.get(layer)
+        return super().get(layer, default)

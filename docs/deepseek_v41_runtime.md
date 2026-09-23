@@ -119,7 +119,8 @@ optional target graphs; its draft
 windows, accepted-prefix state, calibration profile, supported scope and **quality
 limitations** are in [the DSpark guide](deepseek_v41_dspark.md). Packed
 speculative caches and multimodal speculation are rejected, as are
-PP/CP/DP, TBO, KV transfer, plugin execution and EPLB — all before loading.
+PP/CP, DP without DP attention, decode TBO, KV transfer, plugin execution and
+EPLB — all before loading. Four-rank DPA supports text requests and prefill TBO.
 Compilation level 3 is admitted with FULL graphs or eager execution; the
 [AgentX recipe](../recipes/DeepSeek-V4.1-Flash-Agentic.md) records TP2/TP4
 no-EP GPU benchmark results with fixed acceptance length 3.51.
@@ -128,3 +129,70 @@ The [chat and tool protocol](deepseek_v41_protocol.md) and
 [vision and multimodal chunking](deepseek_v41_vision.md) are enabled
 independently of speculation. Host Engram lookup still reads final GPU IDs on
 the CPU; moving the lookup to HBM and fusing it further is future work.
+
+
+## Data-parallel attention
+
+`--tensor-parallel-size 4 --enable-dp-attention` starts four attention ranks,
+each with TP1 attention, embeddings and output head. Tensor-sharded routed
+experts exchange activations through the existing DP gather/scatter transport.
+For five-token DSpark, keep BF16 KV and the FP8 index plane:
+
+```bash
+HIP_VISIBLE_DEVICES=0,1,2,3 python -m atom.entrypoints.openai_server \
+  --model /mnt/DeepSeek-V4.1-Flash \
+  --tensor-parallel-size 4 --enable-dp-attention \
+  --kv-cache-dtype bf16 --index-cache-dtype fp8 \
+  --method dspark --num-speculative-tokens 5 \
+  --level 3 --cudagraph-mode FULL \
+  --max-num-seqs 64 --max-num-batched-tokens 16384 \
+  --attn-prefill-chunk-size 16384
+```
+
+Idle ranks participate in collectives using empty request metadata in the same
+pool buffers that graph capture used. Padding rows carry batch ID -1 and
+zero-length requests, so they neither read nor write state. Startup warmup,
+before pool allocation, continues to use its private scratch cache.
+
+Engram follows the attention TP group: under DPA each rank reads all hash
+heads for its own requests. Each Flash rank registers about 183 GiB of mapped
+host table storage, so startup registration takes longer than TP4.
+
+## Prefill two-batch overlap
+
+Add `--enable-tbo prefill` to the DPA command above, leaving EP disabled.
+Microbatches execute eagerly; decode keeps its compiled/CUDA Graph path.
+The existing `ATOM_TBO_PREFILL_MIN_TOKENS` threshold applies, and
+`ATOM_TBO_PREFILL_TOKEN_SPLIT=1` permits splitting within a request. Eligibility
+is agreed across DP ranks; an idle or incompatible peer selects ordinary execution.
+
+Each microbatch preserves absolute token positions, request state slots and
+page tables, with separate compression plans, attention indptrs and cross-layer
+selection state. Ragged prefill retains local row counts and reuses the
+per-microbatch counts exchanged by ForwardMode.decide for variable-size MoE
+collectives. Callers without that count table retain the CPU-collective fallback.
+
+Engram snapshots the parent's n-gram history before its cursor advances.
+After metadata construction, the parent starts one side-stream lookup around
+both microbatches. Each consumes its token slice and waits at its Engram layer;
+the parent joins the lookup after both workers finish, including failure.
+Already-staged rows are sliced identically when Engram overlap is disabled.
+
+V4.1 requests communication priority -1 through `tbo_comm_stream_priority`;
+models without a declaration retain priority 0. MoE keeps the existing
+compute-to-communication yield and event order. A V4.1 runtime output hook
+records the compute consumer of the comm-allocated routed-expert result before
+shared-expert combine and mHC consume it. This prevents a partner microbatch
+from reusing its storage before those consumers finish. The hook only acts
+in eager TBO; compiled decode does not trace the thread-local TBO query.
+
+Eager prefill expands index tile tables only through the largest request end,
+including cached prefixes. Paged scoring bounds each logits band by both its
+addressing limit and `ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB` (default 2048 MiB).
+Decode retains fixed-width metadata for graph replay. TBO uses the existing
+single warmup and KV sizing calculation, with no additional budget policy.
+
+Correctness and overlap must be checked together: serial execution can hide
+cross-stream reuse errors, while overlapping kernels alone do not demonstrate
+an end-to-end throughput improvement. The GPU regressions exercise the runtime
+output hook under delayed consumption and partner allocation pressure.

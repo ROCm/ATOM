@@ -28,7 +28,9 @@ from aiter.ops.quant import dynamic_per_token_scaled_quant
 from aiter.ops.topk import top_k_per_row_decode
 from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
+from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
 from atom.model_ops.v4_kernels import scale_indexer_weights
+from atom.utils import envs
 
 from .candidate_table import candidate_block_table, lift_candidate_selection
 from .indexer import pick_candidate_blocks
@@ -52,9 +54,9 @@ def plane_rows(width):
     """Query rows a `width`-column logits plane may hold at once.
 
     Its readers reach a row as `row * stride` in int32, so a plane past 2**31
-    elements wraps to a negative address. `width` follows the model-length cap
-    and not the live context, so only a long-context configuration can get
-    there; wherever a batch already fits, this leaves it in one piece.
+    elements wraps to a negative address. Decode keeps the model-length cap;
+    eager prefill can narrow it to live pages. Wherever a batch already fits,
+    this address bound leaves it in one piece.
     """
     return max(1, (2**31 - 1) // width)
 
@@ -87,8 +89,9 @@ def score_topk_paged(
     `candidates` bounds this layer to an earlier layer's blocks and
     `candidate_count` makes this layer that earlier one; never both.
 
-    Rows run in bands of `plane_rows(width)`, a bound rather than a knob: a
-    width that fits the whole batch in one band gets one.
+    Rows run in bands bounded by both the index addressing limit and the
+    shared logits memory budget. In a 1M-context configuration, the address
+    limit alone allows an 8 GiB temporary, even for short live contexts.
     """
     rows, heads = weights.shape
     tile = plane.shape[1]
@@ -123,7 +126,12 @@ def score_topk_paged(
         if candidate_count
         else None
     )
-    band = plane_rows(width)
+    band = min(
+        plane_rows(width),
+        sparse_indexer_row_chunk(
+            rows, width, envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
+        ),
+    )
     # One band's plane, reused; a short last band is a prefix of it.
     logits = torch.empty(
         min(rows, band), width, dtype=torch.float32, device=query.device
