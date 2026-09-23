@@ -87,7 +87,7 @@ class NodeSelectionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "needs at least 2 node"):
             expand_cell(nodes="mia1-p02-g42")
 
-    def test_configured_pool_preserves_candidates_and_required_count(self):
+    def test_node_pool_does_not_constrain_selection(self):
         pool = "pit2-p03-g01,pit2-p03-g03,pit2-p03-g07,pit2-p03-g42"
         for layout, prefill, decode, expected in (
             ("single_node", 1, 1, 1),
@@ -103,28 +103,11 @@ class NodeSelectionTest(unittest.TestCase):
                     prefill_workers=prefill,
                     decode_workers=decode,
                 )
-                self.assertEqual(cell["nodes"], pool.split(","))
+                self.assertEqual(cell["nodes"], [])
                 self.assertEqual(cell["num_nodes"], expected)
-
-    def test_configured_pool_validates_explicit_selection(self):
-        pool = "pit2-p03-g01,pit2-p03-g03,pit2-p03-g07"
-        cell = expand_cell(node_pool=pool, nodes="pit2-p03-g03,pit2-p03-g07")
-        self.assertEqual(cell["nodes"], ["pit2-p03-g03", "pit2-p03-g07"])
-        cell = expand_cell(
-            node_pool=pool, layout="single_node", single_node="pit2-p03-g07"
-        )
-        self.assertEqual(cell["nodes"], ["pit2-p03-g07"])
-        for nodes in ("pit2-p03-g01,pit2-p03-g44", "pit2-p03-g01,pit2-p03-g01"):
-            with self.subTest(nodes=nodes), self.assertRaises(ValueError):
-                expand_cell(node_pool=pool, nodes=nodes)
-
-    def test_configured_pool_does_not_affect_other_runners(self):
-        for runner in ("atomesh-cicd-mi350", "atomesh-cicd-mi355-crusoe"):
-            with self.subTest(runner=runner):
-                cell = expand_cell(runner=runner, nodes="n1,n2,n3", node_pool="tw1,tw2")
-                expected = ["n1", "n2", "n3"] if runner == "atomesh-cicd-mi350" else []
-                self.assertEqual(cell["nodes"], expected)
-                self.assertEqual(cell["num_nodes"], 2)
+        cell = expand_cell(node_pool=pool, nodes="mia1-p02-g42,mia1-p02-g44")
+        self.assertEqual(cell["nodes"], ["mia1-p02-g42", "mia1-p02-g44"])
+        self.assertEqual(cell["num_nodes"], 2)
 
     def test_spur_requires_candidates_and_allocates_required_count(self):
         with self.assertRaisesRegex(ValueError, "non-empty Spur nodelist"):
