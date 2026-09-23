@@ -112,6 +112,91 @@ def dequant_per_block_fp8(
 # Optional E8M0 dtype: only available on newer torch builds.
 _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", None)
 
+_NVFP4_BLOCK_SIZE = 16
+_FP4_E2M1_LUT = torch.tensor(
+    [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ],
+    dtype=torch.float32,
+)
+
+
+def dequantize_nvfp4(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_scale_2: torch.Tensor | None,
+    out_dtype: torch.dtype = torch.float32,
+    high_nibble_first: bool = False,
+) -> torch.Tensor:
+    """Decode Quark or NVIDIA ModelOpt NVFP4 into a floating-point 2D weight.
+
+    ``weight`` stores two E2M1 values per uint8, ``weight_scale`` stores one
+    E4M3 scale per 16 logical values, and ``weight_scale_2`` is the optional
+    FP32 global multiplier. This mirrors SGLang's NVFP4 source decoder used by
+    its online NVFP4-to-MXFP4 path.
+    """
+    if weight.ndim != 2 or weight_scale.ndim != 2:
+        raise ValueError(
+            "NVFP4 dequantization expects 2D weight and scale tensors, got "
+            f"weight={tuple(weight.shape)}, scale={tuple(weight_scale.shape)}."
+        )
+    if weight.dtype != torch.uint8:
+        raise TypeError(
+            f"NVFP4 packed weight must use uint8 storage, got {weight.dtype}."
+        )
+
+    rows, packed_cols = weight.shape
+    logical_cols = packed_cols * 2
+    if logical_cols % _NVFP4_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"NVFP4 logical K={logical_cols} must be divisible by "
+            f"group_size={_NVFP4_BLOCK_SIZE}."
+        )
+    expected_scale_shape = (rows, logical_cols // _NVFP4_BLOCK_SIZE)
+    if tuple(weight_scale.shape) != expected_scale_shape:
+        raise ValueError(
+            f"NVFP4 scale shape {tuple(weight_scale.shape)} does not match "
+            f"expected {expected_scale_shape}."
+        )
+
+    low = (weight & 0xF).to(torch.int64)
+    high = (weight >> 4).to(torch.int64)
+    first, second = (high, low) if high_nibble_first else (low, high)
+    lut = _FP4_E2M1_LUT.to(device=weight.device)
+    dequantized = torch.empty(
+        rows, logical_cols, dtype=torch.float32, device=weight.device
+    )
+    dequantized[:, 0::2] = lut[first]
+    dequantized[:, 1::2] = lut[second]
+
+    scale = weight_scale.to(torch.float32)
+    if weight_scale_2 is not None:
+        try:
+            scale = scale * weight_scale_2.to(device=weight.device, dtype=torch.float32)
+        except RuntimeError as exc:
+            raise ValueError(
+                "NVFP4 global scale is not broadcastable to block scales: "
+                f"global={tuple(weight_scale_2.shape)}, "
+                f"block={tuple(weight_scale.shape)}."
+            ) from exc
+    scale = scale.repeat_interleave(_NVFP4_BLOCK_SIZE, dim=-1)
+    return (dequantized * scale).to(out_dtype)
+
 
 def _mx_block_scale_dtype():
     """The block-scale dtype mandated by the MX (microscaling) format: E8M0.
@@ -226,10 +311,10 @@ def dequant_weight_online(
 ) -> torch.Tensor:
     """Dequantize an online-quant SOURCE weight back to the default float dtype.
 
-    Single entry point shared by the Linear and MoE online-quant paths and the
-    inverse counterpart of :func:`quant_weight_online`: it turns an
-    already-quantized weight back into float so it can be re-quantized to a
-    different target format.
+    Shared by the Linear and MoE online-quant paths for every source except
+    NVFP4 (decoded by :func:`dequantize_nvfp4`), and the inverse counterpart
+    of :func:`quant_weight_online`: it turns an already-quantized weight back
+    into float so it can be re-quantized to a different target format.
 
     A source is identified by BOTH its ``quant_type`` (the block layout) and its
     element ``quant_dtype``. The layout alone is not enough: ``per_1x32`` is the

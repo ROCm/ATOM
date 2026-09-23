@@ -5,6 +5,7 @@ import itertools
 import logging
 from collections.abc import Callable
 from functools import partial as functools_partial
+from typing import ClassVar
 
 import torch
 from aiter import (
@@ -34,13 +35,17 @@ from atom.model_ops.utils import (
     shuffle_weights,
 )
 from atom.quant_spec import (
+    NVFP4_DTYPE,
+    NVFP4_GROUP_SIZE,
     LayerQuantConfig,
     should_skip_online_quant,
     should_stream_online_quant,
+    validate_nvfp4_online_target,
     will_online_requant,
 )
 from atom.quantization.quark.utils import (
     dequant_weight_online,
+    dequantize_nvfp4,
     quant_weight_online,
 )
 from atom.utils import envs
@@ -506,6 +511,9 @@ class LinearBase(nn.Module):
         params_dtype = layer_quant_config.quant_dtype
         self.source_quant_dtype = source_quant_dtype
         self.layer_quant_config = layer_quant_config
+        is_nvfp4 = params_dtype == NVFP4_DTYPE
+        if is_nvfp4:
+            validate_nvfp4_online_target(quant_config, prefix)
         self.quant_config = quant_config
         super().__init__()
         self.reduce_results = reduce_results
@@ -544,6 +552,20 @@ class LinearBase(nn.Module):
             self.output_partition_sizes = [
                 divide(s, self.tp_size) for s in self.output_partition_sizes
             ]
+        if is_nvfp4 and self.input_size % NVFP4_GROUP_SIZE != 0:
+            raise ValueError(
+                f"NVFP4 logical K={self.input_size} must be divisible by "
+                f"group_size={NVFP4_GROUP_SIZE}."
+            )
+        # Checked here rather than at conversion: MXFP4 is the only way out of
+        # NVFP4, so a 16-aligned K that is not 32-aligned can never run, and
+        # finding out after the checkpoint has loaded helps no one.
+        if is_nvfp4 and self.input_size % 32 != 0:
+            raise ValueError(
+                f"{prefix}: NVFP4 logical K={self.input_size} is valid for "
+                "the source group size 16 but cannot be converted by the "
+                "MXFP4 Linear path, which requires K divisible by 32."
+            )
 
         # Stream eligible source weights through meta storage.
         self._stream_online_quant = self.source_quant_dtype is None and (
@@ -561,13 +583,14 @@ class LinearBase(nn.Module):
                 )
             )
         else:
+            weight_dtype = torch.uint8 if is_nvfp4 else params_dtype
             weight_size = (
                 (self.output_size, self.input_size)
-                if params_dtype not in [dtypes.fp4x2, dtypes.i4x2]
+                if params_dtype not in (dtypes.fp4x2, dtypes.i4x2, NVFP4_DTYPE)
                 else (self.output_size, self.input_size // 2)
             )
             self.weight = atom_parameter(
-                torch.empty(weight_size, dtype=params_dtype, device=param_device)
+                torch.empty(weight_size, dtype=weight_dtype, device=param_device)
             )
         if bias:
             output_type = get_current_atom_config().torch_dtype
@@ -621,7 +644,31 @@ class LinearBase(nn.Module):
                 )
 
         if quant_type != QuantType.No and self.source_quant_dtype is None:
-            if quant_type == QuantType.per_Tensor:
+            if is_nvfp4:
+                # Quark / NVIDIA ModelOpt NVFP4 wire format:
+                #   weight          U8-packed FP4 E2M1, two values per byte
+                #   weight_scale    FP8 E4M3, one scale per 16 logical values
+                #   weight_scale_2  F32 global weight scale per source projection
+                #
+                # Merged linears retain one scalar per source projection so no
+                # information is lost before the NVFP4 -> MXFP4 online
+                # conversion pass.
+                self.weight_scale = atom_parameter(
+                    torch.empty(
+                        self.output_size,
+                        self.input_size // NVFP4_GROUP_SIZE,
+                        dtype=torch.float8_e4m3fn,
+                        device=param_device,
+                    )
+                )
+                self.weight_scale_2 = atom_parameter(
+                    torch.empty(
+                        len(self.output_partition_sizes),
+                        dtype=torch.float32,
+                        device=param_device,
+                    )
+                )
+            elif quant_type == QuantType.per_Tensor:
                 self.weight_scale = atom_parameter(
                     torch.empty(
                         len(self.output_partition_sizes),
@@ -675,11 +722,25 @@ class LinearBase(nn.Module):
         else:
             self.weight.weight_loader_process = self.weight_loader_process
             self.register_parameter("weight_scale", None)
+        if getattr(self, "weight_scale_2", None) is None:
+            self.register_parameter("weight_scale_2", None)
+        # The converted MXFP4 layer quantizes activations dynamically, so no
+        # static activation scale is loaded and the slot stays None for
+        # streaming to ignore.
+        # Quark checkpoints still ship `input_scale_2`; it is intentionally
+        # unused, so the loader listing it as a dropped tensor is expected.
+        self.register_parameter("input_scale_2", None)
         self.weight.weight_loader = self.weight_loader
         if self.bias is not None:
             self.bias.weight_loader = self.weight_loader
         if self.weight_scale is not None:
             self.weight_scale.weight_loader = self.weight_loader
+        if self.weight_scale_2 is not None:
+            self.weight_scale_2.weight_loader_process = self.weight_loader_process
+            # Use one format-specific loader for every Linear subclass. In
+            # particular, QKV variants must not reinterpret replicated scalar
+            # metadata as tensor-parallel rows in their custom weight loaders.
+            self.weight_scale_2.weight_loader = self._load_nvfp4_global_scale
         self.need_normalize_e4m3fn_to_e4m3fnuz = params_dtype == torch.float8_e4m3fnuz
         self.quant_func = get_hip_quant(self.quant_type)
         self.is_output_padded = False
@@ -724,6 +785,73 @@ class LinearBase(nn.Module):
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
         param.weight_loader_process(param_data, loaded_weight)
+
+    def _load_nvfp4_global_scale(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: int | tuple[int, ...] | None = None,
+    ) -> None:
+        """Load replicated NVFP4 per-tensor global scales.
+
+        These scalars do not follow either tensor-parallel dimension. A merged
+        projection owns one value per source projection; ordinary projections
+        own one value. Every TP rank receives the same scalar(s).
+        """
+        param_data = param.data
+        values = loaded_weight.reshape(-1)
+        if isinstance(loaded_shard_id, str):
+            shard_map = getattr(self, "_nvfp4_global_scale_shard_map", None)
+            if shard_map is None:
+                raise ValueError(
+                    f"{self.prefix}: {type(self).__name__} defines no "
+                    "_nvfp4_global_scale_shard_map, so NVFP4 global scale shard "
+                    f"id {loaded_shard_id!r} has no slot. Add the map to the "
+                    "class, mapping each str shard id to its index in "
+                    "output_partition_sizes (or a tuple of indices)."
+                )
+            if loaded_shard_id not in shard_map:
+                supported = ", ".join(repr(key) for key in shard_map) or "none"
+                raise ValueError(
+                    f"{type(self).__name__} does not support NVFP4 global scale "
+                    f"shard id {loaded_shard_id!r}; supported ids: {supported}."
+                )
+            mapped_shard_id = shard_map[loaded_shard_id]
+            if isinstance(mapped_shard_id, tuple) and values.numel() == 1:
+                values = values.expand(len(mapped_shard_id))
+            self._load_nvfp4_global_scale(param, values, mapped_shard_id)
+            return
+        if isinstance(loaded_shard_id, tuple):
+            if values.numel() != len(loaded_shard_id):
+                raise RuntimeError(
+                    "NVFP4 global scale count does not match merged shard ids: "
+                    f"values={values.numel()}, shard_ids={loaded_shard_id}."
+                )
+            for value, shard_id in zip(values, loaded_shard_id):
+                self._load_nvfp4_global_scale(param, value, shard_id)
+            return
+        if loaded_shard_id is None:
+            if values.numel() != param_data.numel():
+                raise RuntimeError(
+                    "NVFP4 global scale shape mismatch: "
+                    f"param={tuple(param_data.shape)}, loaded={tuple(loaded_weight.shape)}."
+                )
+            param.weight_loader_process(param_data, values.reshape(param_data.shape))
+            return
+        if not isinstance(loaded_shard_id, int) or not (
+            0 <= loaded_shard_id < param_data.numel()
+        ):
+            raise ValueError(
+                f"Invalid NVFP4 global scale shard id {loaded_shard_id!r}; "
+                f"expected [0, {param_data.numel() - 1}]."
+            )
+        if values.numel() != 1:
+            raise RuntimeError(
+                "Each NVFP4 source projection must provide exactly one global "
+                f"scale, got {values.numel()}."
+            )
+        target = param_data.narrow(0, loaded_shard_id, 1)
+        param.weight_loader_process(target, values)
 
     def _gather_full_weight(self, weight):
         """Gather sharded weight from all TP ranks to reconstruct the full unpartitioned weight."""
@@ -777,6 +905,7 @@ class LinearBase(nn.Module):
         )
         online_quant_type = online_layer_quant_config.quant_type
         online_quant_dtype = online_layer_quant_config.quant_dtype
+        source_is_nvfp4 = self.params_dtype == NVFP4_DTYPE
         if should_skip_online_quant(
             self.quant_type, self.params_dtype, online_layer_quant_config
         ):
@@ -791,12 +920,12 @@ class LinearBase(nn.Module):
             f"Unsupported online quant: "
             f"dtype={online_quant_dtype}, type={online_quant_type}"
         )
-        # Quark models arrive in several source formats. We can re-quantize any
-        # source we know how to dequantize back to float first: unquantized
+        # Serialized models arrive in several source formats. We can re-quantize
+        # any source we know how to dequantize back to float first: unquantized
         # (No), per-tensor FP8 (per_Tensor), per-output-channel FP8 (per_Token /
-        # ptpc_fp8), 128x128 block FP8 (per_1x128) and MXFP8 (per_1x32). Any
-        # other source is rejected up front rather than silently producing
-        # garbage.
+        # ptpc_fp8), 128x128 block FP8 (per_1x128), MXFP8 (per_1x32) and NVFP4
+        # (per_1x32 with NVFP4_DTYPE). Any other source is rejected up front
+        # rather than silently producing garbage.
         assert self.quant_type in [
             QuantType.No,
             QuantType.per_Tensor,
@@ -859,17 +988,43 @@ class LinearBase(nn.Module):
         # to the online target format (no-op for an unquantized source).
         # output_partition_sizes lets per_Tensor merged layers (qkv/gate_up)
         # apply the right per-partition scale to each output row-range.
-        weight = dequant_weight_online(
-            weight,
-            weight_scale,
-            self.quant_type,
-            self.params_dtype,
-            self.output_partition_sizes,
-        )
-
-        q_weight, weight_scale = quant_weight_online(
-            weight, online_quant_type, online_quant_dtype
-        )
+        if source_is_nvfp4:
+            if weight_scale is None:
+                raise RuntimeError(f"{self.prefix}: NVFP4 weight_scale is missing.")
+            global_scale = getattr(self, "weight_scale_2", None)
+            global_scale = global_scale.data.reshape(-1)
+            if global_scale.numel() != len(self.output_partition_sizes):
+                raise RuntimeError(
+                    f"{self.prefix}: expected {len(self.output_partition_sizes)} "
+                    "NVFP4 global weight scales, got "
+                    f"{global_scale.numel()}."
+                )
+            per_row_scale_2 = global_scale.repeat_interleave(
+                torch.tensor(
+                    self.output_partition_sizes,
+                    device=global_scale.device,
+                )
+            ).view(-1, 1)
+            weight = dequantize_nvfp4(
+                weight,
+                weight_scale,
+                per_row_scale_2,
+                out_dtype=torch.float32,
+            )
+            q_weight, weight_scale = quant_weight_online(
+                weight, online_quant_type, online_quant_dtype
+            )
+        else:
+            weight = dequant_weight_online(
+                weight,
+                weight_scale,
+                self.quant_type,
+                self.params_dtype,
+                self.output_partition_sizes,
+            )
+            q_weight, weight_scale = quant_weight_online(
+                weight, online_quant_type, online_quant_dtype
+            )
         if need_gather:
             q_weight, weight_scale = self._shard_quantized_weight(
                 q_weight, weight_scale
@@ -886,11 +1041,16 @@ class LinearBase(nn.Module):
         # Update quant state
         self.quant_type = online_quant_type
         self.params_dtype = online_quant_dtype
+        self.layer_quant_config = online_layer_quant_config
+        self._stream_online_quant = False
         self.quant_func = get_hip_quant(online_quant_type)
         self.need_normalize_e4m3fn_to_e4m3fnuz = (
             online_quant_dtype == torch.float8_e4m3fnuz
             and online_quant_type == QuantType.per_Token
         )
+        if source_is_nvfp4:
+            self.weight_scale_2 = None
+            self.input_scale_2 = None
         # A dynamic online target (e.g. ptpc per_Token) quantizes activations at
         # runtime. Drop any static input_scale inherited from a static per_Tensor
         # source, otherwise the per-token quant kernel rejects it
@@ -928,6 +1088,11 @@ class LinearBase(nn.Module):
         # Re-quantize before process_weights if online quantization is enabled
         if self.quant_config is not None and self.quant_config.online_quant:
             self.online_quantize_weight()
+        if self.params_dtype == NVFP4_DTYPE:
+            raise RuntimeError(
+                f"{self.prefix}: NVFP4 weights were not converted to MXFP4 by "
+                "online quantization."
+            )
         if self.quant_type.value == QuantType.per_Tensor.value and (
             len(self.output_partition_sizes) > 1
             or hasattr(self, "_loaded_weight_scale_for_requant")
@@ -1091,6 +1256,12 @@ class LinearBase(nn.Module):
         otype=dtypes.bf16,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.params_dtype == NVFP4_DTYPE:
+            raise RuntimeError(
+                f"{self.prefix}: NVFP4 checkpoint weights are loaded, but direct "
+                "NVFP4 inference is intentionally blocked. Convert this layer "
+                "to MXFP4 during online quantization before forward."
+            )
         # A quant path that cannot honour out= must not silently ignore it.
         assert out is None or self.supports_out(), (
             "Linear out= requested but this quant path does not support it "
@@ -2016,6 +2187,12 @@ class QKVGParallelLinear(ColumnParallelLinear):
 
 
 class QKVParallelLinear(ColumnParallelLinear):
+    _nvfp4_global_scale_shard_map: ClassVar[dict[str, int]] = {
+        "q": 0,
+        "k": 1,
+        "v": 2,
+    }
+
     def __init__(
         self,
         hidden_size: int,
@@ -2106,6 +2283,14 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
     single column-parallel GEMM. ``index_q`` follows the KV-head sharding and
     replication rules, while ``index_k`` is a single replicated head.
     """
+
+    _nvfp4_global_scale_shard_map: ClassVar[dict[str, int]] = {
+        "q": 0,
+        "k": 1,
+        "v": 2,
+        "index_q": 3,
+        "index_k": 4,
+    }
 
     def __init__(
         self,
