@@ -30,6 +30,7 @@ env \
   ATOM_FORCE_ATTN_TRITON=1 \
   AITER_LOG_LEVEL=WARNING \
   ATOM_GC_THRESHOLD=20000,50,50 \
+  ATOM_PA_FLYDSL=1 \
   python3 -u -m atom.entrypoints.openai_server \
     --model "$FP4_TARGET" --served-model-name "$FP4_TARGET" \
     --host 0.0.0.0 --port 8896 --server-port 8890 \
@@ -50,6 +51,14 @@ env \
     --spec-decode-acceptance-rate 0.5933 \
   > server_c${CONC}.log 2>&1 &
 ```
+
+## FlyDSL paged decode
+
+`ATOM_PA_FLYDSL=1` is opt-in and off by default. It routes the paged decode to aiter's FlyDSL kernel instead of gluon, and brings aiter #5546's GPU work planner with it (`ATOM_PA_FLYDSL_PLAN`, on by default, and inert without `ATOM_PA_FLYDSL=1`).
+
+gluon splits every request in a batch the same way. An agentic decode batch is not uniform — measured over 30,400 steps at CONC=32, the step-internal `max/min` context ratio is p50 2.49, p90 22.2, and 31.2% of steps exceed 4× — so one long request owns the critical path. The planner sizes each request's partition count from its real context length instead, under a workgroup budget.
+
+Shapes outside FlyDSL's domain fall back to gluon on their own, so turning this on cannot make a working configuration raise. Measured against the gluon path on the same node, p90 interactivity: −0.0% at CONC=1, +4.0% at 10, +11.8% at 15, +20.5% at 20. The gain needs a batch with something to rebalance, which is why CONC=1 is flat.
 
 ## Indexer-only decode context parallelism
 
@@ -79,7 +88,6 @@ Run the 40c and 48c points with LMCache CPU offload and the SLRU cache policy. K
 
 ```bash
   ROCR_VISIBLE_DEVICES=0,1,4,5 \
-  HIP_VISIBLE_DEVICES=0,1,4,5 \
   PYTHONHASHSEED=0 \
   LMCACHE_LOCAL_CPU=True \
   LMCACHE_MAX_LOCAL_CPU_SIZE=256 \
