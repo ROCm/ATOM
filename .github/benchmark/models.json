@@ -20,17 +20,17 @@
       "path": "deepseek-ai/DeepSeek-V4.1-Flash",
       "prefix": "deepseek-v41-flash-agentic",
       "runner": "atom-mi355-8gpu.predownload",
-      "env_vars": "HIP_VISIBLE_DEVICES=0,1,2,3\nOMP_NUM_THREADS=4\nATOM_NUMA_BIND=0\nAITER_LOG_LEVEL=WARNING\nATOM_DSV41_BENCHMARK_SYNTHETIC=1\nAIPERF_WARMUP_REQUESTS_PER_LANE=5",
+      "env_vars": "HIP_VISIBLE_DEVICES=0,1\nOMP_NUM_THREADS=4\nATOM_NUMA_BIND=0\nAITER_LOG_LEVEL=WARNING\nATOM_DSV41_BENCHMARK_SYNTHETIC=1\nAIPERF_WARMUP_REQUESTS_PER_LANE=5",
       "config": {
-        "tp": 4,
+        "tp": 2,
         "kv_cache_dtype": "bf16",
         "trust_remote_code": true,
         "extra_args": "--host 0.0.0.0 --index-cache-dtype fp8 --gpu-memory-utilization 0.9 --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 --max-num-seqs 128 --level 3 --cudagraph-mode FULL --method dspark --num-speculative-tokens 5 --spec-decode-acceptance-length 3.51 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --tool-call-parser dsml_v41"
       },
       "variants": [
         {
-          "label": "Agentic TP4 no EP DSpark5",
-          "suffix": "-tp4-noep-dspark5",
+          "label": "Agentic TP2 no EP DSpark5",
+          "suffix": "-tp2-noep-dspark5",
           "bench_kind": "aiperf_agentic",
           "extra_args": "--cudagraph-capture-sizes '[1,2,3,4,5,6,7,8,16,32,48,64,128]'",
           "conc_min": 1,
@@ -51,8 +51,8 @@
           ]
         },
         {
-          "label": "Agentic TP4 no EP DSpark5 dense capture",
-          "suffix": "-tp4-noep-dspark5-dense-capture",
+          "label": "Agentic TP2 no EP DSpark5 dense capture",
+          "suffix": "-tp2-noep-dspark5-dense-capture",
           "bench_kind": "aiperf_agentic",
           "extra_args": "--cudagraph-capture-sizes '[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,48,64,128]'",
           "conc_min": 1,

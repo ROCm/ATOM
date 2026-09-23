@@ -631,7 +631,7 @@ def test_v41_sweep_matches_requested_runtime():
     for cell in cells:
         args = shlex.split(cell["server_args"])
         for flag, value in {
-            "-tp": "4", "--level": "3", "--kv_cache_dtype": "bf16",
+            "-tp": "2", "--level": "3", "--kv_cache_dtype": "bf16",
             "--index-cache-dtype": "fp8", "--cudagraph-mode": "FULL",
             "--max-num-seqs": "128", "--num-speculative-tokens": "5",
             "--method": "dspark", "--spec-decode-acceptance-length": "3.51",
@@ -640,6 +640,8 @@ def test_v41_sweep_matches_requested_runtime():
         assert not any("expert-parallel" in a or "expert_parallel" in a for a in args)
         assert "--enable-dp-attention" not in args
         assert "ATOM_DSV41_BENCHMARK_SYNTHETIC=1" in cell["env_vars"]
+        assert "HIP_VISIBLE_DEVICES=0,1" in cell["env_vars"].splitlines()
+        assert "-tp2-noep-dspark5" in cell["suffix"]
         capture = json.loads(args[args.index("--cudagraph-capture-sizes") + 1])
         if cell["conc"] == 32:
             assert capture == list(range(1, 33)) + [48, 64, 128]

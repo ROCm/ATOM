@@ -85,7 +85,7 @@ on:
         type: boolean
         default: true
       agentic_deepseek_v41flash:
-        description: "Run ONLY DeepSeek-V4.1-Flash agentic TP4, no EP, DSpark5, AL3.51; c=1,2,8,16,32,64."
+        description: "Run ONLY DeepSeek-V4.1-Flash agentic TP2, no EP, DSpark5, AL3.51; c=1,2,8,16,32,64."
         type: boolean
         default: true
       agentic_deepseek_v4pro:
