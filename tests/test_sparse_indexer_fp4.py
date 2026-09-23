@@ -657,17 +657,53 @@ def test_staged_page_table_spans_a_whole_batch_not_one_sequence():
         assert not staged[:, pages:].any(), pages
 
 
-def test_builder_publishes_the_staging_indices_it_derives():
+@pytest.mark.parametrize(
+    "n_slots, n_iota",
+    [(0, 0), (1, 1), (7, 5), (300, 100), (1023, 1024), (1025, 4000), (60_000, 232_003)],
+)
+def test_decompose_slots_matches_torch(n_slots, n_iota):
+    """The one-launch slot decomposition against the torch form it replaces.
+
+    The sizes straddle the kernel's 1024-wide tile on both inputs, and either
+    input may be the longer one. Slots include negatives: triton's `//` and `%`
+    truncate where torch's floor, which is why the kernel shifts and masks, and
+    this is what would notice if it stopped.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires a ROCm GPU")
+    block_convert = _import_or_skip("atom.utils.block_convert")
+
+    g = torch.Generator().manual_seed(0)
+    slots = torch.randint(-5 * _BLOCK, 40_000 * _BLOCK, (n_slots,), generator=g)
+    slots = slots.to(torch.int32).cuda()
+    lut = fp4_index_scale_rows(torch.arange(_BLOCK, dtype=torch.int32), _BLOCK).cuda()
+    got = block_convert.decompose_slots_triton(slots, n_iota, _BLOCK, lut)
+
+    token = torch.arange(n_iota, dtype=torch.int32, device="cuda")
+    want = []
+    for src in (slots, token):
+        page, row = src // _BLOCK, src % _BLOCK
+        want += [page, row, fp4_index_scale_rows(row, _BLOCK)]
+    for i, (a, b) in enumerate(zip(got, want)):
+        assert a.dtype == torch.int32 and torch.equal(a, b), i
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_builder_publishes_the_staging_indices_it_derives(device):
     """The six index tensors the DCP FP4 gather reads, as the builder publishes
-    them.
+    them, on both paths: the one-launch kernel on a GPU, the torch form without.
 
     The staging test above feeds those tensors in by hand, so it pins the
     gather and says nothing about the builder: swap `page` and `row` in the
     builder and it stays green. This runs the builder itself over block tables
     whose pages are neither zero nor their own column, with sequences that end
     mid-block, so a slot's page, its row and its swizzled row all differ and
-    each is checked against the written-out oracle on its own.
+    each is checked against the written-out oracle on its own. On the GPU this
+    is also what pins the kernel's six outputs to the six names they are
+    published under.
     """
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires a ROCm GPU")
     aiter_mla = _import_or_skip(
         "atom.model_ops.attentions.aiter_mla",
         reason="the MLA builder imports triton at module scope",
@@ -677,10 +713,13 @@ def test_builder_publishes_the_staging_indices_it_derives():
     block, bs, per_seq = 64, 2, 6
     builder = SimpleNamespace(
         model_runner=SimpleNamespace(block_size=block),
-        device=torch.device("cpu"),
+        device=torch.device(device),
         max_bs=4,
         block_table_cols=per_seq,
     )
+    if device == "cuda":
+        rows = torch.arange(block, dtype=torch.int32, device=device)
+        builder._fp4_scale_row_lut = fp4_index_scale_rows(rows, block)
     lpad = np.array([block + 5, 2 * block + 3], dtype=np.int64)
     cu_pad = np.concatenate([[0], np.cumsum(lpad)]).astype(np.int64)
     table = np.array([[7, 3, 0, 0], [11, 2, 9, 0]], dtype=np.int32)
@@ -696,13 +735,13 @@ def test_builder_publishes_the_staging_indices_it_derives():
         + [2 * block + j for j in range(block)]
         + [9 * block + j for j in range(3)]
     )
-    assert torch.equal(meta.dcp_indexer_fp4_local_slots.long(), want_slots)
+    assert torch.equal(meta.dcp_indexer_fp4_local_slots.long().cpu(), want_slots)
 
     tok = torch.arange(total_kv)
     for side, src in (("read", want_slots), ("stage", tok)):
-        page = getattr(meta, f"dcp_indexer_fp4_{side}_page")
-        row = getattr(meta, f"dcp_indexer_fp4_{side}_row")
-        scale_row = getattr(meta, f"dcp_indexer_fp4_{side}_scale_row")
+        page = getattr(meta, f"dcp_indexer_fp4_{side}_page").cpu()
+        row = getattr(meta, f"dcp_indexer_fp4_{side}_row").cpu()
+        scale_row = getattr(meta, f"dcp_indexer_fp4_{side}_scale_row").cpu()
         # The width main indexed with; nothing here needs to widen to int64.
         assert page.dtype == row.dtype == scale_row.dtype == torch.int32, side
         assert torch.equal(page.long(), src // block), side

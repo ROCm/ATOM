@@ -59,6 +59,7 @@ from atom.model_ops.sparse_indexer_fp4 import (
 )
 from atom.utils import CpuGpuBuffer, envs, upload_numpy
 from atom.utils.block_convert import (
+    decompose_slots_triton,
     kv_indices_generate_triton,
     mtp_prepare_decode_mla_kernel,
 )
@@ -404,6 +405,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.dcp_rank = get_dcp_rank()
         self._publishes_dcp_local_lens = self.is_sparse and self.dcp_world_size > 1
         self._tbo_full_running_bs = 0
+        # The e8m0 row bend the DCP FP4 staging indices need, as a table, so the
+        # kernel that publishes them reads `fp4_index_scale_rows` instead of
+        # restating it. The kernel is compiled here too: its only caller is a
+        # long DCP prefill, which warmup never reaches, so a lazy first compile
+        # would land inside a served request.
+        self._fp4_scale_row_lut = None
+        if self._indexer_fp4 and self.dcp_world_size > 1:
+            block = model_runner.block_size
+            rows = torch.arange(block, dtype=torch.int32, device=self.device)
+            self._fp4_scale_row_lut = fp4_index_scale_rows(rows, block)
+            decompose_slots_triton(rows[:1], 1, block, self._fp4_scale_row_lut)
 
         # DCP decode all-gathers Q on the head dim, so the head count reaching
         # mla_decode_fwd (and thus the persistent decode metadata) is the padded
@@ -1690,30 +1702,36 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # all of which are settled here, once per forward. The gather itself
         # runs once per layer that owns an indexer, so leaving the decomposition
         # there had every such layer rebuild the same tensors: `arange`, two
-        # divides, two remainders and the swizzle, 63us each on gfx950 and flat
-        # in `total_kv`. GLM-5.2 has 22 such layers (21 "full" plus the MTP
-        # draft; its 57 "shared" layers reuse a full layer's top-k and never
-        # reach the gather), so 1.4 ms of stream time per prefill forward.
+        # divides, two remainders and the swizzle, 24us of stream time each on
+        # gfx950 and flat in `total_kv`. GLM-5.2 has 22 such layers (21 "full"
+        # plus the MTP draft; its 57 "shared" layers reuse a full layer's top-k
+        # and never reach the gather), so 0.5 ms per prefill forward.
         #
-        # On the device, not on the host beside `slots`: the arithmetic is 20x
-        # faster per element there (0.076 ms against 1.29 ms at total_kv=232k,
-        # gfx950), it reuses the upload `slots` already needs instead of adding
-        # six more, and a page/row pair the device computes is the same pair the
-        # per-layer code computed before this change.
-        def publish(name, src):
-            page, row = src // block, src % block
-            for suffix, idx in (
-                ("page", page),
-                ("row", row),
-                ("scale_row", fp4_index_scale_rows(row, block)),
-            ):
-                setattr(attn_metadata, f"{name}_{suffix}", idx)
-
-        publish("dcp_indexer_fp4_read", attn_metadata.dcp_indexer_fp4_local_slots)
-        publish(
-            "dcp_indexer_fp4_stage",
-            torch.arange(total_kv, dtype=torch.int32, device=dev),
-        )
+        # One launch, on the device. Eager torch spends thirteen small kernels
+        # here (24us of stream time against 3us for this one), and the host is
+        # the wrong place: numpy is 20x slower per element at this work and
+        # would add six uploads beside the one `slots` already needs.
+        read, stage = "dcp_indexer_fp4_read", "dcp_indexer_fp4_stage"
+        slots_dev = attn_metadata.dcp_indexer_fp4_local_slots
+        lut = getattr(self, "_fp4_scale_row_lut", None)
+        if lut is not None:
+            idx = decompose_slots_triton(slots_dev, total_kv, block, lut)
+        else:
+            # No device kernel (a CPU build, or a builder the tests assemble):
+            # the same decomposition in torch, and the reference the kernel's
+            # test compares against.
+            token = torch.arange(total_kv, dtype=torch.int32, device=dev)
+            idx = []
+            for src in (slots_dev, token):
+                page, row = src // block, src % block
+                idx += [page, row, fp4_index_scale_rows(row, block)]
+        names = [
+            f"{side}_{part}"
+            for side in (read, stage)
+            for part in ("page", "row", "scale_row")
+        ]
+        for name, tensor in zip(names, idx):
+            setattr(attn_metadata, name, tensor)
 
         # Fixed width, not `pages`: the scorer specializes on this table's
         # stride, so a per-batch width recompiles it. Sized at a whole batch's
