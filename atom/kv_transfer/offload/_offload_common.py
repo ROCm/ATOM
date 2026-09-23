@@ -15,6 +15,7 @@ import logging
 import os
 import threading
 import time
+import weakref
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 
@@ -451,6 +452,17 @@ class OffloadSchedulerMixin(ABC):
     handoff mechanics whose invariants are identical for both layouts.
     """
 
+    # The tier-hit memo answers three methods that any scheduler may reach
+    # before `_init_offload_statistics` has run (the hand-built schedulers in
+    # the tests, and any future partial construction). It is an optimisation,
+    # so its default has to be "remember nothing" rather than an AttributeError
+    # halfway through a lookup. `_remember_tier_hit` replaces the None with a
+    # per-instance dict on first use.
+    _tier_hit_memo: dict | None = None
+    _tier_memo_steps = 32
+    _tier_retry_steps = 32
+    total_lookups_skipped_by_memo = 0
+
     # Save/load lifecycle contract. Declared abstract so a missing forwarder is
     # a construction-time TypeError, not a silent no-op behind the delegating
     # shell -- the failure mode that let DSV4 ship without abandon_save, and
@@ -491,6 +503,10 @@ class OffloadSchedulerMixin(ABC):
         # external-tier attempt per request; see `_repeat_load_suppressed`.
         self._load_failed_seqs: dict[str, object] = {}
         self.total_suppressed_load_retries = 0
+        # Repeats of `get_num_new_matched_tokens` served from the remembered
+        # tier hit instead of a fresh external-tier lookup.
+        self.total_lookups_skipped_by_memo = 0
+        self._init_tier_hit_memo()
         # Early block-release observability. Populated by layouts that support
         # exact source-block leases; unsupported layouts leave these at 0.
         self.total_early_released_blocks = 0  # freed at request-finish, not save-gated
@@ -614,6 +630,7 @@ class OffloadSchedulerMixin(ABC):
             "loads_pending": len(self._load_inflight_tokens),
             "saves_pending": len(self._save_inflight_tokens),
             "suppressed_load_retries": self.total_suppressed_load_retries,
+            "lookups_skipped_by_memo": self.total_lookups_skipped_by_memo,
         }
         if hasattr(self, "total_early_released_blocks"):
             statistics.update(
@@ -685,6 +702,174 @@ class OffloadSchedulerMixin(ABC):
         if hit == int(num_prompt):
             hit -= 1
         return self._chunk_floor(hit)
+
+    # -- the one expensive input: how much of this prompt the tier holds ---
+    def _init_tier_hit_memo(self) -> None:
+        """Remember each waiting request's tier hit, so it is asked once.
+
+        Both schedulers ask `get_num_new_matched_tokens` before allocating, and
+        every allocation failure returns the request to the head of the waiting
+        queue unchanged -- so a full KV cache turns one question into one
+        question per step. The question is not cheap: it copies the prompt,
+        hashes it a chunk at a time on the scheduler thread (~5k hashes for a
+        645k-token prompt) and blocks on the tier's reply. The step rate
+        collapses, the running requests cannot finish, the cache never drains,
+        and the engine livelocks with the GPUs idle.
+
+        Only the hit is remembered -- the single costly quantity. Everything
+        downstream of it (the load spec, the save floors, the decline rules) is
+        arithmetic, and is re-derived on every call against the frontier of the
+        moment, so no verdict and no side effect is ever replayed.
+
+        The hit is a function of the prompt, which is fixed, and of the tier's
+        contents, which can only gain a prefix while this request waits. So the
+        entry goes stale in one direction, and the budgets below bound how long
+        that can last: `OFFLOAD_LOOKUP_MEMO_STEPS` caps the replays of an
+        answer, and `OFFLOAD_LOOKUP_RETRY_STEPS` caps how long a non-answer (a
+        tier timeout, which costs `lmcache.mp.lookup_timeout` seconds of
+        scheduler thread each time it is retried) suppresses the next attempt.
+        """
+
+        # sid -> (weak ref to the sequence asked about, hit or None, budget).
+        self._tier_hit_memo: dict[str, tuple[object, int | None, int]] = {}
+        self._tier_memo_steps = self._positive_env("OFFLOAD_LOOKUP_MEMO_STEPS", 32)
+        self._tier_retry_steps = self._positive_env("OFFLOAD_LOOKUP_RETRY_STEPS", 32)
+
+    @staticmethod
+    def _positive_env(name: str, default: int) -> int:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            value = -1
+        if value < 0:
+            logger.warning(
+                "LMCache offload scheduler: invalid %s=%r; using %d",
+                name,
+                raw,
+                default,
+            )
+            return default
+        return value
+
+    @staticmethod
+    def _weak_seq(seq):
+        """A reference that does not keep an aborted request's prompt alive.
+
+        A request can leave the waiting queue without ever reaching
+        `request_finished` -- `Scheduler._reject_aborted_waiting` is one such
+        path -- and an entry holding the sequence strongly would pin its whole
+        `token_ids` list for the life of the process.
+        """
+
+        try:
+            return weakref.ref(seq)
+        except TypeError:
+            # Sequence views may use __slots__ without __weakref__. Falling
+            # back to a strong reference keeps the memo correct; the entry is
+            # then released by the ordinary lifecycle drops below.
+            return lambda seq=seq: seq
+
+    def _remembered_tier_hit(self, seq, sid: str) -> tuple[bool, int | None]:
+        """`(answered, hit)` -- spending one step of this entry's budget.
+
+        `answered` False means the caller must run the lookup itself.
+        """
+
+        memo = self._tier_hit_memo
+        entry = memo.get(sid) if memo else None
+        if entry is None:
+            return False, None
+        ref, hit, budget = entry
+        if ref() is not seq or budget <= 0:
+            memo.pop(sid, None)
+            return False, None
+        memo[sid] = (ref, hit, budget - 1)
+        self.total_lookups_skipped_by_memo += 1
+        return True, hit
+
+    def _remember_tier_hit(self, seq, sid: str, hit: int | None) -> None:
+        budget = self._tier_retry_steps if hit is None else self._tier_memo_steps
+        if self._tier_hit_memo is None:
+            self._tier_hit_memo = {}
+        self._tier_hit_memo[sid] = (
+            self._weak_seq(seq),
+            None if hit is None else int(hit),
+            int(budget),
+        )
+
+    def _last_tier_hit(self, seq, sid: str) -> int | None:
+        """The raw hit behind this step's answer -- before floor and caps.
+
+        A subclass that has the last word on an answer (`_MPOffloadScheduler`
+        refuses a whole-prompt hit that its block size cannot host) needs the
+        length the tier reported, which the load spec no longer carries once
+        `_loadable_hit` has floored it. Reading it back off the lookup client
+        would only work on the steps that ran a lookup. Does not spend the
+        memo's budget: this is a read of the answer already given.
+        """
+
+        entry = (self._tier_hit_memo or {}).get(sid)
+        if entry is None or entry[0]() is not seq:
+            return None
+        return entry[1]
+
+    def _forget_tier_hit(self, sid: str) -> None:
+        if self._tier_hit_memo:
+            self._tier_hit_memo.pop(sid, None)
+
+    def _ensure_lookup_pin(self, seq, sid: str, spec) -> bool:
+        """Re-take the worker-side lookup pin before a load is committed.
+
+        An answer served from the remembered hit carries no pin: the metadata
+        dispatch unpins every lookup that did not become a load
+        (`lookup_requests_in_step` is the worker's *unpin* list). An answer does
+        not need one -- the request is only waiting, and nothing reads the tier.
+        A transfer does: it must not read an entry that nothing is holding. So
+        the step that turns a load spec into a dispatched retrieve asks the tier
+        for real, and the load stands only if the tier still holds at least what
+        the spec promised. If it holds less -- evicted in the steps since -- the
+        load is dropped and the request prefills, which is what would have
+        happened with no tier at all.
+
+        Confirming rather than re-deriving is deliberate: by this point the spec
+        may have been shaped by something this mixin does not own (the unaligned
+        handoff moves `hbm_cached_tokens` to a chunk boundary the prefill is
+        walking towards), and rebuilding it here would quietly erase that.
+
+        That is one lookup per committed load, which is what the tier cost was
+        before this connector remembered anything; the repeats the livelock was
+        made of are the steps that never get here.
+
+        `_fresh_tier_lookup` belongs to the two concrete schedulers
+        (`ChunkedOffloadSchedulerBase`, `DSV4OffloadScheduler`); this mixin only
+        sequences it.
+        """
+
+        # `_lookup_results` is the dense scheduler's live-pin carrier. The DSV4
+        # scheduler releases every pin at the end of the step it was taken in,
+        # so it has none and always answers this with a fresh lookup.
+        pending = getattr(self, "_lookup_results", {}).get(sid)
+        if pending is not None and pending[0] is seq:
+            return True
+        if self._lookup_client is None:
+            # Nothing to confirm: with no client no lookup ever ran, so this
+            # spec did not come from one and holds no pin to re-take.
+            return True
+        hit = self._fresh_tier_lookup(seq, sid)
+        if hit is None or int(hit) < int(spec.lmcache_cached_tokens):
+            logger.debug(
+                "[OFFLOAD-LOOKUP] seq=%s load dropped: tier now holds %s, "
+                "spec promised %d",
+                seq.id,
+                hit,
+                int(spec.lmcache_cached_tokens),
+            )
+            self._clear_pending_load(sid)
+            return False
+        return True
 
     def _repeat_load_suppressed(self, seq, sid: str) -> bool:
         """True once this request has spent its one external-tier attempt.

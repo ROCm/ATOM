@@ -822,6 +822,12 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         So the decision is taken here, before the promise. When ATOM declines it
         has already cleared its pending-load state, and reporting no external
         tokens leaves the request to prefill normally.
+
+        This runs before `allocate_slots` and is gated only on
+        `num_computed_tokens == 0`, so a request that fails allocation is asked
+        the identical question again next step. What keeps that from becoming a
+        per-step tier lookup lives in ATOM's scheduler; see
+        `OffloadSchedulerMixin._init_tier_hit_memo`.
         """
         seq = self._seqs.get_or_create(request)
         seq.set_num_cached_tokens(num_computed_tokens)
