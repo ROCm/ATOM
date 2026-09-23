@@ -1076,10 +1076,7 @@ def test_qrep_enabled_for_layer_falls_back_when_scale_not_row_sliceable():
 
 
 _ATTENTION_MLA_PATH = (
-    Path(__file__).resolve().parent.parent
-    / "atom"
-    / "model_ops"
-    / "attention_mla.py"
+    Path(__file__).resolve().parent.parent / "atom" / "model_ops" / "attention_mla.py"
 )
 
 
@@ -1111,9 +1108,9 @@ def test_mlaattention_init_actually_calls_qrep_enabled_for_layer():
         f"assignment in attention_mla.py; found {len(calls)}"
     )
     (call,) = calls
-    assert not call.keywords, (
-        "expected qrep_enabled_for_layer's call site to use positional args"
-    )
+    assert (
+        not call.keywords
+    ), "expected qrep_enabled_for_layer's call site to use positional args"
 
     def _name(node):
         if isinstance(node, ast.Name):
@@ -1183,9 +1180,7 @@ def _q_proj_linear_calls(path):
         if not isinstance(func, ast.FunctionDef):
             continue
         for node in ast.walk(func):
-            if not isinstance(node, ast.Assign) or not isinstance(
-                node.value, ast.Call
-            ):
+            if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
                 continue
             for target in node.targets:
                 if (
@@ -1681,7 +1676,9 @@ def test_sparse_prefill_persistence_is_decodes_with_is_sparse_true(
 
 
 def test_decode_is_persistent_false_below_dcp_2():
-    assert not mla_dcp_decode_is_persistent(False, 1, True, sparse_metadata_rebuild=True)
+    assert not mla_dcp_decode_is_persistent(
+        False, 1, True, sparse_metadata_rebuild=True
+    )
 
 
 def test_decode_is_persistent_sparse_requires_metadata_rebuild():
