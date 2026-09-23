@@ -631,7 +631,17 @@ start_logged_process() {
   local log_file="$2"
   shift 2
 
-  if command -v setsid >/dev/null 2>&1; then
+  # packed_nodes runs many workers per node; tee-ing them all to stdout
+  # overflows the Spur srun message limit (32 MB). Write to file only and
+  # emit a short startup marker so the outer log shows the process is alive.
+  if [[ "${PACKED_NODES_PD:-0}" == "1" ]]; then
+    echo "[runtime] logging ${log_file} (file-only, packed layout)"
+    if command -v setsid >/dev/null 2>&1; then
+      setsid "$@" >"${log_file}" 2>&1 &
+    else
+      "$@" >"${log_file}" 2>&1 &
+    fi
+  elif command -v setsid >/dev/null 2>&1; then
     setsid "$@" > >(tee "${log_file}") 2>&1 &
   else
     "$@" > >(tee "${log_file}") 2>&1 &

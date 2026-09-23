@@ -366,7 +366,7 @@ models:
             workers: 1
             tp: 1
             cudagraph: none
-            extra_args: "--pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192"
+            extra_args: "--pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192 --disable-uvicorn-access-log"
           decode:
             workers: 1
             tp: 4
@@ -495,7 +495,7 @@ models:
           decode:
             <<: &glm52_agentic_tp4_mtp5_decode
               tp: 4
-              extra_args: "--gpu-memory-utilization 0.95 --cudagraph-mode FULL"
+              extra_args: "--gpu-memory-utilization 0.95 --cudagraph-mode FULL --disable-uvicorn-access-log"
             workers: 3
             cudagraph: "[1,2,4,8,12,16,20,24]"
           env:
