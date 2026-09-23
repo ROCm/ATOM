@@ -63,7 +63,7 @@ def _build(groups, t_pad=None):
     }
     out["csa_n_committed_per_token"] = torch.zeros(t_pad, dtype=torch.int32, device=DEV)
     build_v4_paged_decode_indptr(
-        batch_id_per_token=torch.tensor(batch_id, dtype=torch.int32, device=DEV),
+        batch_id_per_q_token=torch.tensor(batch_id, dtype=torch.int32, device=DEV),
         positions=torch.tensor(positions, dtype=torch.int64, device=DEV),
         T_pad=t_pad,
         win=WIN,

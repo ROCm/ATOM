@@ -29,7 +29,7 @@ _PATH = (
 _spec = importlib.util.spec_from_file_location("_batch_ids_under_test", _PATH)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
-batch_id_per_token = _mod.batch_id_per_token
+build_batch_ids = _mod.build_batch_ids
 
 
 # ── the transcriptions this replaced, verbatim ─────────────────────────────
@@ -65,7 +65,7 @@ SHAPES = [
 @pytest.mark.parametrize("seqlens", SHAPES, ids=lambda s: f"bs{len(s)}_T{sum(s)}")
 def test_matches_the_unpadded_transcription(seqlens):
     sq = np.asarray(seqlens, dtype=np.int32)
-    assert np.array_equal(batch_id_per_token(sq), ref_unpadded(sq))
+    assert np.array_equal(build_batch_ids(sq), ref_unpadded(sq))
 
 
 @pytest.mark.parametrize("seqlens", SHAPES, ids=lambda s: f"bs{len(s)}_T{sum(s)}")
@@ -73,34 +73,34 @@ def test_matches_the_unpadded_transcription(seqlens):
 def test_matches_the_padded_transcription(seqlens, slack):
     sq = np.asarray(seqlens, dtype=np.int32)
     width = int(sq.sum()) + slack
-    assert np.array_equal(batch_id_per_token(sq, pad_to=width), ref_padded(sq, width))
+    assert np.array_equal(build_batch_ids(sq, pad_to=width), ref_padded(sq, width))
 
 
 def test_the_pad_tail_names_no_sequence():
     """A captured step runs at the bucket width whatever the batch. A padding
     token that named sequence 0 would have every consumer resolve it to that
     request's row and attend on its behalf; `-1` is what the kernels bail on."""
-    got = batch_id_per_token(np.asarray([2, 1], np.int32), pad_to=8)
+    got = build_batch_ids(np.asarray([2, 1], np.int32), pad_to=8)
     assert got[:3].tolist() == [0, 0, 1]
     assert (got[3:] == -1).all()
 
 
 def test_the_dtype_is_the_one_the_buffer_takes():
     """Staged into an int32 mirror; int64 here would truncate on the way in."""
-    assert batch_id_per_token(np.asarray([2, 2], np.int32)).dtype == np.int32
-    assert batch_id_per_token(np.asarray([2, 2], np.int64)).dtype == np.int32
+    assert build_batch_ids(np.asarray([2, 2], np.int32)).dtype == np.int32
+    assert build_batch_ids(np.asarray([2, 2], np.int64)).dtype == np.int32
 
 
 def test_a_bucket_narrower_than_the_batch_is_refused():
     """Silently truncating would drop real tokens off the end of the step."""
     with pytest.raises(AssertionError):
-        batch_id_per_token(np.asarray([4, 4], np.int32), pad_to=7)
+        build_batch_ids(np.asarray([4, 4], np.int32), pad_to=7)
 
 
 def test_writes_into_a_caller_buffer_without_reaching_past_it():
     sq = np.asarray([3, 2], np.int32)
     dst = np.full(32, -7, dtype=np.int32)
-    got = batch_id_per_token(sq, pad_to=8, out=dst)
+    got = build_batch_ids(sq, pad_to=8, out=dst)
     assert np.shares_memory(got, dst)
     assert got.tolist() == [0, 0, 0, 1, 1, -1, -1, -1]
     assert (dst[8:] == -7).all(), "wrote past the requested width"

@@ -25,6 +25,9 @@ from atom.plugin.sglang.attention_backend.backend_resolver import (
     resolve_attn_backend,
     resolve_mamba_req_pool,
 )
+from atom.plugin.sglang.patches.qwen4_exp_recognition_patch import (
+    apply_gdn_pad_sentinels,
+)
 from atom.utils.forward_context import (
     AttentionMetaData,
     Context,
@@ -498,6 +501,12 @@ class SGLangGDNForwardContext:
             query_start_loc, idx = reconstructed
         device = query_start_loc.device
         idx = idx.to(dtype=torch.int32, device=device)
+        # Native GDN pad clone. Hybrid already pads Flash like 2.4T;
+        # drop this after Native GDN consumes Hybrid buffers directly.
+        # See apply_gdn_pad_sentinels in qwen4_exp_recognition_patch.py.
+        idx, query_start_loc = apply_gdn_pad_sentinels(
+            forward_batch, idx, query_start_loc, mode, bs
+        )
         common_kwargs = {
             "num_spec_decodes": 0,
             "num_spec_decode_tokens": 0,
@@ -610,8 +619,12 @@ class SGLangGDNForwardContext:
         reuse_current_context = current_context.context is not None
         prev_attn_metadata = current_context.attn_metadata
         prev_context_kv = current_context.kv_cache_data
+        active_kv = forward_context.kv_cache_data
+        if reuse_current_context:
+            active_kv = dict(prev_context_kv or {})
+            active_kv.update(forward_context.kv_cache_data)
         try:
-            set_kv_cache_data(forward_context.kv_cache_data)
+            set_kv_cache_data(active_kv)
             attn_md = (
                 copy.copy(prev_attn_metadata)
                 if reuse_current_context and prev_attn_metadata is not None
@@ -625,7 +638,7 @@ class SGLangGDNForwardContext:
                 # ranks skip this binder and would never join that collective.
                 # Preserve all outer attention fields while injecting GDN data.
                 current_context.attn_metadata = attn_md
-                current_context.kv_cache_data = forward_context.kv_cache_data
+                current_context.kv_cache_data = active_kv
             else:
                 set_forward_context(
                     attn_metadata=attn_md,

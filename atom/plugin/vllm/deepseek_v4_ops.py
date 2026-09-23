@@ -30,7 +30,7 @@ from atom.model_ops.attentions.pool_layout.v4_pool_geometry import HCA_RATIO
 
 @triton.jit
 def _v4_decode_hca_compress_tail_kernel(
-    batch_id_per_token_ptr,  # [>=T] int — sentinel -1 in CG pad tail
+    batch_id_per_q_token_ptr,  # [>=T] int — sentinel -1 in CG pad tail
     positions_ptr,  # [>=T] int — global token position
     hca_indptr_ptr,  # [>=T+1] int32 — ragged (SWA prefix + HCA committed)
     block_tables_ptr,  # [num_reqs, MAX_BLOCKS] int — per-seq paged block ids
@@ -57,7 +57,7 @@ def _v4_decode_hca_compress_tail_kernel(
     ``_v4_paged_prefill_indices_kernel``.
     """
     t = tl.program_id(0)
-    bid = tl.load(batch_id_per_token_ptr + t)
+    bid = tl.load(batch_id_per_q_token_ptr + t)
     if bid < 0:
         return  # CG-padded sentinel — leave outputs untouched
     # Groups closed at or before this token's own position -- see the rule next
@@ -78,7 +78,7 @@ def _v4_decode_hca_compress_tail_kernel(
 @triton.jit
 def _v4_decode_indices_fused_kernel(
     state_slot_per_seq_ptr,  # [bs] int32
-    batch_id_per_token_ptr,  # [>=T] int — sentinel -1 in CG pad tail
+    batch_id_per_q_token_ptr,  # [>=T] int — sentinel -1 in CG pad tail
     positions_ptr,  # [>=T] int — global token position
     swa_indptr_ptr,  # [>=T+1] int32 — ragged SWA-prefix cumsum
     csa_indptr_ptr,  # [>=T+1] int32 — ragged (SWA + CSA topk)
@@ -102,7 +102,7 @@ def _v4_decode_indices_fused_kernel(
     with no cross-program race.
     """
     t = tl.program_id(0)
-    bid = tl.load(batch_id_per_token_ptr + t)
+    bid = tl.load(batch_id_per_q_token_ptr + t)
     if bid < 0:
         return  # CG-padded sentinel — leave outputs untouched
 
@@ -138,7 +138,7 @@ def _v4_decode_indices_fused_kernel(
 def write_v4_decode_indices_fused(
     *,
     state_slot_per_seq: torch.Tensor,
-    batch_id_per_token: torch.Tensor,
+    batch_id_per_q_token: torch.Tensor,
     positions: torch.Tensor,
     swa_indptr: torch.Tensor,
     csa_indptr: torch.Tensor,
@@ -163,7 +163,7 @@ def write_v4_decode_indices_fused(
     if T == 0:
         return
     assert state_slot_per_seq.dim() == 1
-    assert batch_id_per_token.dim() == 1 and batch_id_per_token.shape[0] >= T
+    assert batch_id_per_q_token.dim() == 1 and batch_id_per_q_token.shape[0] >= T
     assert positions.dim() == 1 and positions.shape[0] >= T
     assert swa_indptr.dim() == 1 and swa_indptr.shape[0] >= T + 1
     assert csa_indptr.dim() == 1 and csa_indptr.shape[0] >= T + 1
@@ -176,7 +176,7 @@ def write_v4_decode_indices_fused(
     BLOCK_N = triton.next_power_of_2(win)
     _v4_decode_indices_fused_kernel[(T,)](
         state_slot_per_seq,
-        batch_id_per_token,
+        batch_id_per_q_token,
         positions,
         swa_indptr,
         csa_indptr,
@@ -196,7 +196,7 @@ def write_v4_decode_indices_fused(
 
 def write_v4_decode_hca_compress_tail(
     *,
-    batch_id_per_token: torch.Tensor,
+    batch_id_per_q_token: torch.Tensor,
     positions: torch.Tensor,
     hca_indptr: torch.Tensor,
     block_tables: torch.Tensor,
@@ -219,10 +219,10 @@ def write_v4_decode_hca_compress_tail(
     — matching the existing on-GPU prefill build.
 
     All tensors are GPU tensors. Per-seq inputs are indexed by
-    ``batch_id_per_token`` inline (no caller pre-gather).
+    ``batch_id_per_q_token`` inline (no caller pre-gather).
 
     Args:
-      batch_id_per_token:      ``[>=T]``   int — token→seq map; -1 skipped.
+      batch_id_per_q_token:      ``[>=T]``   int — token→seq map; -1 skipped.
       positions:               ``[>=T]``   int — global token positions; each
                                            token's HCA count is
                                            ``(positions[t]+1)//128``.
@@ -238,7 +238,7 @@ def write_v4_decode_hca_compress_tail(
     """
     if T == 0:
         return
-    assert batch_id_per_token.dim() == 1 and batch_id_per_token.shape[0] >= T
+    assert batch_id_per_q_token.dim() == 1 and batch_id_per_q_token.shape[0] >= T
     assert positions.dim() == 1 and positions.shape[0] >= T
     assert hca_indptr.dim() == 1 and hca_indptr.shape[0] >= T + 1
     assert block_tables.dim() == 2
@@ -246,7 +246,7 @@ def write_v4_decode_hca_compress_tail(
 
     BLOCK_J = triton.next_power_of_2(win)
     _v4_decode_hca_compress_tail_kernel[(T,)](
-        batch_id_per_token,
+        batch_id_per_q_token,
         positions,
         hca_indptr,
         block_tables,

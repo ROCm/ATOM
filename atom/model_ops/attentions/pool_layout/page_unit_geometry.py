@@ -33,33 +33,42 @@ class PageUnitGeometryMixin:
         """The sparse-indexer cache that rides this PAGE unit, or `None`.
 
         Plain MLA owns only its KV rows, so the generic geometry has no index
-        cache. A sparse-indexer model (`runner.is_deepseek_v32`) overrides this
-        to return `runner.index_cache`, whose layers `_page_unit_regions`
+        cache. A sparse-indexer model (`runner.has_mla_indexer`) overrides this
+        to return the pool's index view, whose layers `_page_unit_regions`
         appends after the MLA rows.
         """
         return None
 
+    def _page_unit_kv_cache(self):
+        """The MLA rows a PAGE unit owns a region of.
+
+        The pool's own view, `(rows, blocks, block_size, entry)`. A hook for the
+        same reason `_page_unit_index_cache` is one: this module owns the
+        arithmetic, not where the tensor comes from.
+        """
+        return self.kv_pool.cache.view("kv")
+
     def _page_unit_regions(self) -> tuple[np.ndarray, np.ndarray]:
         """Base address and per-unit stride of every region a PAGE id owns.
 
-        `kv_cache` is `(rows, physical_blocks, physical_block_size, entry)`: a
-        block owns one contiguous region per row, rows a fixed stride apart.
-        Affine in the block id and a pool property, so it is computed once.
+        The pool's KV view is `(rows, blocks, block_size, entry)`: a block owns
+        one contiguous region per row, rows a fixed stride apart. Affine in the
+        block id and a pool property, so it is computed once.
 
-        The units are the trap: `unit_ids` carries **logical** block ids while
-        the tensor is shaped in **physical** blocks (K3's `block_ratio` is 128),
-        so a region is `runner.block_size` tokens wide, not `physical_block_size`.
-        The granularity assertion below is the one relation that cannot hold if
-        the two are confused -- a startup error, not 127 blocks of scrambled state.
+        The units were the trap here, and the view is what takes it away: it is
+        shaped in the same **logical** blocks `unit_ids` carries, so a region is
+        `runner.block_size` tokens wide by construction rather than by
+        remembering that the allocation pages at 1 (K3's `block_ratio` is 128).
+        The granularity assertion below still checks the relation.
         """
         runner = self.model_runner
-        cache = runner.kv_cache
+        cache = self._page_unit_kv_cache()
         index_cache = self._page_unit_index_cache()
-        # Key on the full layout, not `data_ptr()` alone. `model_runner.kv_cache`
-        # is reassigned in two places -- the P/D IPC import
-        # (`model_runner.py:4472`) and the rollout sleep/wake path
-        # (`rollout/memory_manager.py` deletes it, then `_resume_kv_cache` ->
-        # `allocate_kv_cache` with a possibly *reduced* block count). Address
+        # Key on the full layout, not `data_ptr()` alone. The pool is rebuilt in
+        # two places -- the P/D IPC import (`_bind_kv_cache_to_modules`) and the
+        # rollout sleep/wake path (`rollout/memory_manager.py` releases it, then
+        # `_resume_kv_cache` -> `allocate_kv_cache` with a possibly *reduced*
+        # block count). Address
         # equality does not imply geometry equality: a same-start-address
         # reallocation keeps `data_ptr()` but changes `stride(0)`, so `row_stride`
         # (and thus every base for row > 0) goes stale while `rows`/`region`
@@ -69,7 +78,7 @@ class PageUnitGeometryMixin:
         # any of those changing a cache miss that rebuilds. Mirrors the DSV4
         # sibling (`deepseek_v4_attn.py`), which keys on the same evidence.
         #
-        # A sparse-indexer model (`runner.is_deepseek_v32`) rides its index cache
+        # A sparse-indexer model (`runner.has_mla_indexer`) rides its index cache
         # in the same PAGE unit, appended after the MLA rows. Its layout is part
         # of the identity too -- key on it (or `None`) so a reallocated or
         # resized index cache is a miss that rebuilds, exactly like the MLA pool.
@@ -177,7 +186,7 @@ class PageUnitGeometryMixin:
         this view path -- called bare, not unpacked.
         """
         self._page_unit_regions()
-        cache = self.model_runner.kv_cache
+        cache = self._page_unit_kv_cache()
         rows, entry = cache.shape[0], cache.shape[3]
         block = self.model_runner.block_size
         # Logical blocks the pool holds, which is what a unit id indexes.

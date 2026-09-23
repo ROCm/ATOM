@@ -35,6 +35,7 @@ def _gemma_rmsnorm_kernel(
     HAS_RESIDUAL: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_PRGMS: tl.constexpr,
+    GROUPS: tl.constexpr = 1,
 ):
     """Fused add + GemmaRMSNorm (weight offset x * (1 + w)).
 
@@ -50,6 +51,16 @@ def _gemma_rmsnorm_kernel(
     g = g + 1.0  # Gemma offset
 
     for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=2):
+        if GROUPS > 1:
+            # Each group has its own affine weights in the full-width vector.
+            g = (
+                tl.load(
+                    g_ptr + (row_idx % GROUPS) * n_cols + col_offsets,
+                    mask=mask,
+                    other=0.0,
+                ).to(tl.float32)
+                + 1.0
+            )
         input_ptrs = input_ptr + row_idx * input_row_stride + col_offsets
         input_ptrs = tl.multiple_of(input_ptrs, (16,))
         x = tl.load(input_ptrs, mask=mask, other=0.0, cache_modifier=".cg")
@@ -80,20 +91,32 @@ def _gemma_rmsnorm_kernel(
 # ── Kernel launcher (shared by both custom ops) ─────────────────────────────
 
 
-def gemma_rmsnorm_triton(x, weight, eps, residual):
+def gemma_rmsnorm_triton(x, weight, eps, residual, group_size=None):
     """Launch the Triton kernel. Returns out or (out, residual_out)."""
     ori_shape = x.shape
-    x = x.view(-1, ori_shape[-1])
+    width = group_size or ori_shape[-1]
+    groups = ori_shape[-1] // width
+    # Preserve the existing ungrouped stride/layout contract. Only grouped
+    # normalization needs to materialize independently contiguous groups.
+    x = x.view(-1, width) if group_size is None else x.reshape(-1, width).contiguous()
     n_rows, n_cols = x.shape
 
     out = torch.empty_like(x)
 
     has_residual = residual is not None
     if has_residual:
-        residual = residual.view(-1, ori_shape[-1])
+        residual = (
+            residual.view(-1, width)
+            if group_size is None
+            else residual.reshape(-1, width).contiguous()
+        )
         residual_out = torch.empty_like(residual)
     else:
         residual_out = x  # dummy, won't be written
+
+    if not n_rows:
+        result = out.view(ori_shape)
+        return (result, residual_out.view(ori_shape)) if has_residual else result
 
     BLOCK_SIZE = triton.next_power_of_2(n_cols)
     NUM_PRGMS = min(n_rows, 304)  # MI355X has 304 CUs
@@ -112,6 +135,7 @@ def gemma_rmsnorm_triton(x, weight, eps, residual):
         HAS_RESIDUAL=has_residual,
         BLOCK_SIZE=BLOCK_SIZE,
         NUM_PRGMS=NUM_PRGMS,
+        GROUPS=groups,
     )
 
     out = out.view(ori_shape)

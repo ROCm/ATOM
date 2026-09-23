@@ -4,14 +4,15 @@
 import inspect
 import logging
 import os
+from contextlib import nullcontext
 from typing import Optional
 
 import numpy as np
 import torch
-
 from aiter import init_dist_env
 from aiter.dist.parallel_state import get_tp_group
 from aiter.dist.utils import get_distributed_init_method
+
 from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.rollout.memory_manager import MemoryManagerMixin
@@ -40,6 +41,91 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
     # responsible for mapping to VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER before constructing the
     # runner.
     DP_DEVICE_MAP_ENV = "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
+
+    def __init__(self, rank: int, config):
+        # 0 -- the default -- means "this checkpoint's vocabulary is not
+        # padded", which is the right answer for almost every model and costs
+        # one comparison per step.
+        self._true_vocab_size = config.true_vocab_size
+        super().__init__(rank, config)
+        self._check_true_vocab_size(config)
+
+    def _check_true_vocab_size(self, config) -> None:
+        """Refuse a value that would mask nothing, rather than mask nothing.
+
+        The number counts the tokenizer's real tokens, so it can be neither
+        negative nor larger than the rows the embedding matrix has. Either way
+        round it silently disables the mask, which is the failure this whole
+        path exists to prevent.
+        """
+        if self._true_vocab_size < 0:
+            raise ValueError(
+                f"Invalid true_vocab_size={self._true_vocab_size}; expected >= 0, "
+                f"where 0 means the vocabulary is not padded."
+            )
+        if not self._true_vocab_size:
+            return
+        # Not every PretrainedConfig subclass carries vocab_size at the top
+        # level; when it is missing there is nothing to check against.
+        padded = getattr(config.hf_config, "vocab_size", 0)
+        if padded and self._true_vocab_size > padded:
+            raise ValueError(
+                f"true_vocab_size={self._true_vocab_size} exceeds the checkpoint's "
+                f"vocab_size={padded}, so it would mask nothing. It counts the "
+                f"tokenizer's real tokens, which cannot be more than the "
+                f"embedding matrix has rows."
+            )
+        logger.info(
+            "Rollout masks the vocabulary tail above %d (checkpoint has %d rows)",
+            self._true_vocab_size,
+            padded,
+        )
+
+    def postprocess(
+        self,
+        batch: ScheduledBatch,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor | None,
+        top_ps: torch.Tensor | None,
+        all_greedy: bool,
+        hidden_states: torch.Tensor,
+        needs_independent_noise: bool = False,
+    ) -> ScheduledBatchOutput:
+        """Mask the padding tail of the vocabulary before sampling.
+
+        A checkpoint whose embedding matrix is padded up to a friendlier width
+        -- Qwen3 rounds 151665 real tokens up to 151936 -- leaves the tail rows
+        holding whatever the padding was initialised to. On that checkpoint
+        they are copies of an existing embedding rather than zero or -inf, so
+        the sampler reaches them and can return an id the tokenizer cannot
+        decode. Training frameworks mask them on their side; a rollout engine
+        that does not disagrees with the trainer over exactly those positions.
+
+        This covers the decode sampling path, which is every token a colocated
+        rollout generates. Two other places reach a sampler without coming
+        through here, and are NOT covered:
+
+        * ``ModelRunner.prefill_forward`` samples the first token itself, for
+          the disaggregated prefill worker to hand to a decode engine.
+        * ``compute_argmax_token`` is greedy over a TP-SHARDED vocab, reducing
+          each rank's shard to ``(max, global_idx)``. Masking it needs the shard
+          offset, so it belongs with that reduction rather than here; a drafter
+          proposing a tail id is then rejected by the verify step above, but the
+          argmax a verify step compares against comes from the same function.
+        """
+        if self._true_vocab_size > 0 and logits.shape[-1] > self._true_vocab_size:
+            logits[..., self._true_vocab_size :] = float("-inf")
+        return super().postprocess(
+            batch,
+            logits,
+            temperatures,
+            top_ks,
+            top_ps,
+            all_greedy,
+            hidden_states,
+            needs_independent_noise=needs_independent_noise,
+        )
 
     def _setup_device_and_distributed(self, rank: int, config):
         """Override to set up DP-isolated NCCL worlds.
@@ -238,30 +324,32 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
         context = forward_context.context
 
         if context.is_prefill:
-            positions = context.positions
-            if getattr(self, "_use_hook_capture", False):
-                self._hook_captured_hidden_states = {}
-                self._hook_capture_enabled = True
-                try:
-                    hidden_states = self.model(input_ids, positions)
-                finally:
-                    self._hook_capture_enabled = False
-                captured = self._hook_captured_hidden_states
-            else:
-                result = self.model(
-                    input_ids,
-                    positions,
-                    capture_hidden_state_layers=self._aux_layer_ids,
-                )
-                if isinstance(result, tuple):
-                    hidden_states, captured = result
+            metrics = self.gpu_forward_metrics
+            with metrics.measure(batch) if metrics is not None else nullcontext():
+                positions = context.positions
+                if getattr(self, "_use_hook_capture", False):
+                    self._hook_captured_hidden_states = {}
+                    self._hook_capture_enabled = True
+                    try:
+                        hidden_states = self.model(input_ids, positions)
+                    finally:
+                        self._hook_capture_enabled = False
+                    captured = self._hook_captured_hidden_states
                 else:
-                    hidden_states = result
-                    captured = {}
-            logits = self.model.compute_logits(hidden_states)
-            self._captured_hidden_states = captured
-            self._captured_last_hidden_states = hidden_states.detach()
-            return logits, hidden_states
+                    result = self.model(
+                        input_ids,
+                        positions,
+                        capture_hidden_state_layers=self._aux_layer_ids,
+                    )
+                    if isinstance(result, tuple):
+                        hidden_states, captured = result
+                    else:
+                        hidden_states = result
+                        captured = {}
+                logits = self.model.compute_logits(hidden_states)
+                self._captured_hidden_states = captured
+                self._captured_last_hidden_states = hidden_states.detach()
+                return logits, hidden_states
 
         return super().run_model(input_ids, batch)
 

@@ -99,7 +99,11 @@ def _patch_dspark_fused_markov_sample() -> None:
     @functools.wraps(original_sample)
     def wrapped_sample_sequential(self, num_reqs: int, head_hidden):
         markov_argmax = getattr(self.model, "markov_argmax", None)
-        if markov_argmax is None or self.draft_logits is not None:
+        if (
+            getattr(self, "enable_adaptive_verification", False)
+            or markov_argmax is None
+            or self.draft_logits is not None
+        ):
             return original_sample(self, num_reqs, head_hidden)
 
         n_spec = self.num_speculative_steps

@@ -22,7 +22,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from functools import lru_cache
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 if TYPE_CHECKING:
     from atom.model_ops.attentions.deepseek_v4_attn import AttentionMetaData_DSV4
@@ -40,7 +40,7 @@ from aiter import silu_and_mul as aiter_silu_and_mul
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.batched_gemm_op_a8w8 import (
     batched_gemm_a8w8_mxscale,
     batched_gemm_a8w8_mxscale_bpreshuffle,
@@ -95,9 +95,7 @@ from atom.model_ops.quant_v4 import act_quant_inplace
 from atom.model_ops.sparse_attn_v4 import (
     hc_split_sinkhorn,
 )
-from atom.model_ops.topK import (
-    is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
-)
+from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
 from atom.model_ops.triton_hash_topk import hash_topk_triton
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.utils import atom_parameter, shuffle_weights
@@ -588,7 +586,7 @@ def _wo_a_is_bf16_on_disk(model_path):
         with open(idx_path) as f:
             idx = json.load(f)
         wmap = idx.get("weight_map", {})
-    except Exception:
+    except Exception:  # noqa: BLE001 -- a probe: any unreadable index means "no"
         return False
     probe = "layers.0.attn.wo_a.weight"
     if probe not in wmap:
@@ -608,12 +606,14 @@ def _wo_a_is_bf16_on_disk(model_path):
                 return True  # BF16 weight; no scale needed regardless of index
             if not scale_present_in_idx:
                 return False
-            if "layers.0.attn.wo_a.scale" not in h.keys():
+            # `.keys()` is not redundant: safetensors' handle has no
+            # `__contains__`, so `not in h` would raise. noqa: SIM118
+            if "layers.0.attn.wo_a.scale" not in h.keys():  # noqa: SIM118
                 # Index lies. wo_a still FP8 but no scale → loader will fail
                 # anyway; safer to fall back to no_spec, although this case is
                 # unexpected.
                 return True
-    except Exception:
+    except Exception:  # noqa: BLE001 -- a probe: any unreadable shard means "no"
         return False
     return False
 
@@ -1775,33 +1775,17 @@ class Indexer(nn.Module):
         ``_max_model_len_idx`` for FP4) is unbounded by ``max_num_batched_tokens``,
         so a burst of long-context requests can push a single un-chunked
         allocation to tens of GiB (#1376). ``chunk_tokens`` shrinks as
-        ``row_width`` grows. When the budget is disabled (0) or a single chunk
-        already fits, the loop runs once (``chunk_start==0`` and
-        ``chunk_end==total_tokens``) and matches the single-shot path — callers
-        can detect that to reuse a schedule precomputed outside the fwd.
+        ``row_width`` grows. When a single chunk already fits, the loop runs
+        once (``chunk_start==0`` and ``chunk_end==total_tokens``) and matches the
+        single-shot path — callers can detect that to reuse a schedule
+        precomputed outside the fwd.
 
         Returns ``[total_tokens, topk]`` int32 (raw kernel output; caller remaps).
         """
         topk_out = torch.empty((total_tokens, topk), dtype=torch.int32, device=device)
-        budget_bytes = SPARSE_INDEXER_LOGITS_BUDGET_MB * 1024 * 1024
-        if (
-            budget_bytes > 0
-            and row_width > 0
-            and budget_bytes // (row_width * 4) < total_tokens
-        ):
-            # 4 bytes per fp32 logit; row_width * 4 is one row's footprint. Round
-            # the budget-derived row count DOWN: a multiple of 128 (aligned to the
-            # kernel's row tiling) in the normal regime, avoiding coarse power-of-2
-            # doubling. Below 128 rows (extreme row_width), fall back to a
-            # power-of-2 floor so it degrades 64/32/.../1 instead of collapsing to 1.
-            budget_rows = budget_bytes // (row_width * 4)
-            if budget_rows >= 128:
-                chunk_tokens = (budget_rows // 128) * 128
-            else:
-                chunk_tokens = 1 << (max(1, budget_rows).bit_length() - 1)
-        else:
-            # Budget disabled, or a single chunk already fits all rows.
-            chunk_tokens = total_tokens
+        chunk_tokens = sparse_indexer_row_chunk(
+            total_tokens, row_width, SPARSE_INDEXER_LOGITS_BUDGET_MB
+        )
         for chunk_start in range(0, total_tokens, chunk_tokens):
             chunk_end = min(chunk_start + chunk_tokens, total_tokens)
             rs = row_starts[chunk_start:chunk_end]
@@ -2021,7 +2005,13 @@ class Indexer(nn.Module):
 
         device = q_fp4.device
         total_tokens = q_fp4.size(0)
-        row_to_batch = indexer_meta["batch_id_per_token_gpu"].to(torch.int32)
+        # Off the metadata, not the dict: `indexer_meta` IS
+        # `attn_metadata.indexer_meta`, so the tensor is already reachable and
+        # copying it in gave the decode branch -- which builds its own dict --
+        # a second place to forget.
+        batch_id_per_q_token = get_forward_context().attn_metadata.batch_id_per_q_token[
+            :total_tokens
+        ]
         local_ends = indexer_meta["visible_end_gpu"]  # [total_tokens] int32
         local_starts = indexer_meta["fp4_prefill_local_starts"]
         # Full-batch schedule precomputed once (outside the fwd) in the metadata
@@ -2061,7 +2051,7 @@ class Indexer(nn.Module):
                 # dropped (their logits stay -inf -> wrong top-k); the shared CTA
                 # floor keeps a small chunk spread across the GPU.
                 _, cta_info, n_ctas = compute_prefill_schedule(
-                    row_to_batch[chunk_start:chunk_end],
+                    batch_id_per_q_token[chunk_start:chunk_end],
                     rs,
                     re,
                     FP4_MQA_BLOCK_K,
@@ -2082,7 +2072,7 @@ class Indexer(nn.Module):
                 self.kv_scale,
                 block_tables,
                 weights[chunk_start:chunk_end],
-                row_to_batch[chunk_start:chunk_end],
+                batch_id_per_q_token[chunk_start:chunk_end],
                 rs,
                 re,
                 max_seq_len,
@@ -2120,7 +2110,7 @@ class Indexer(nn.Module):
         A sequence forwards its own number of query tokens, so `total_tokens` is
         their sum and a `[bs, next_n]` view does not exist. None is needed: the
         decode tokens are already laid out per-seq ascending, so row `r` IS token
-        `r` and `batch_id_per_token` is the row-to-sequence map the ragged-prefill
+        `r` and `batch_id_per_q_token` is the row-to-sequence map the ragged-prefill
         kernel wants — no scatter, no second layout.
 
         Per-row MTP tail-causal window: row n of seq b scores compressed KV
@@ -2156,7 +2146,10 @@ class Indexer(nn.Module):
         # so the full padded q_fp4 is scored single-shot: pad rows are skipped by
         # the kernel (empty window → 0 CTAs → no paged KV read) and their top-k is
         # -1 (ignored downstream by csa_translate_pack). No strip / pad-back.
-        row_to_batch = indexer_meta["fp4_row_to_batch"]
+        # Off the metadata, not the dict -- see `_score_topk_prefill_fp4`.
+        batch_id_per_q_token = get_forward_context().attn_metadata.batch_id_per_q_token[
+            : q_fp4.size(0)
+        ]
         local_starts = indexer_meta["fp4_local_starts"]
         local_ends = indexer_meta["fp4_local_ends"]
         cta_info = indexer_meta["fp4_cta_info"]
@@ -2188,7 +2181,7 @@ class Indexer(nn.Module):
             self.kv_scale,
             block_tables,
             weights,
-            row_to_batch,
+            batch_id_per_q_token,
             local_starts,
             local_ends,
             max_seq_len,
@@ -2336,10 +2329,11 @@ class DeepseekV4Attention(nn.Module):
             prefix=f"{p}.wo_b",
         )
         self.softmax_scale = self.head_dim**-0.5
-        # Cached at construction (non-compiled) so `_attn_post` — now traced into
-        # the graphed dense piece — doesn't graph-break on a runtime get_gfx().
-        self._is_gfx1250 = get_gfx() == "gfx1250"
-        self._is_gfx950 = get_gfx() == "gfx950"
+        # Cache the runtime architecture outside compiled code so _attn_post
+        # can use static flags without tracing GPU detection.
+        arch = get_gfx_runtime()
+        self._is_gfx1250 = arch == "gfx1250"
+        self._is_gfx950 = arch == "gfx950"
         self._is_preshuffle = (
             self._is_gfx1250
         )  # TODO: gfx950 will support preshuffle in the future
@@ -2500,6 +2494,14 @@ class DeepseekV4Attention(nn.Module):
                 shuffle_weights(w, layout=(16, 16))
             # Cached as module attrs so the forward skips the reshape and the
             # scale conversion on every call.
+            #
+            # A VIEW of the live parameter, and `shuffle_weights` now writes
+            # through the storage rather than rebinding it, so this tracks the
+            # bytes rather than pinning the ones it was built from. That is why
+            # it is taken AFTER the shuffle above: built before, it would have
+            # named the same bytes in the wrong layout. Nothing shuffles this
+            # weight again -- `quant_type` is set to `No` below, which is also
+            # what a weight sync reads -- so tracking is what is wanted here.
             self._wo_a_w_fp8 = w.data.view(G, N, K)
             self._wo_a_w_scale = w_scale
             self._wo_a_mxscale = True
@@ -2963,7 +2965,7 @@ class DeepseekV4Attention(nn.Module):
 
         Split out of the attention body so it can run one graph piece earlier, in
         the compiled dense piece, via the opaque `v4_qk_norm_rope` op -- its grid is
-        `q.shape[0]`, `batch_id_per_token` is `[T]` and only gates the store, and
+        `q.shape[0]`, `batch_id_per_q_token` is `[T]` and only gates the store, and
         `swa_dest_rows` is a whole buffer, so a num_tokens-keyed piece holds it.
 
         Running AHEAD of the compressor is safe: nothing here reads what the
@@ -3022,7 +3024,7 @@ class DeepseekV4Attention(nn.Module):
             quant_q=False,
             quant_k=False,
             fp8_2buff=self.kv_fp8,
-            batch_id_per_token=attn_md.batch_id_per_token if is_decode else None,
+            batch_id_per_q_token=attn_md.batch_id_per_q_token if is_decode else None,
             # Where each token's own KV row goes, built once per forward for
             # this layer's compress class. The fused write takes the row rather
             # than the slot because a window row is no longer `slot * cs +
@@ -3126,8 +3128,9 @@ class DeepseekV4Attention(nn.Module):
                 kv_indices = attn_md.kv_indices_hca
                 kv_indptr = attn_md.kv_indptr_hca
             # Dispatch on kv-cache layout inside the wrapper: fp8 2buff
-            # (unified_kv_rope set) → aiter asm op5 with pre-packed fp8 Q + the
-            # 2buff fp8/bf16 pools read with no requant; bf16 (unified_kv_rope
+            # (unified_kv_rope set) → aiter ASM with pre-packed fp8 Q + the
+            # 2buff fp8/bf16 pools read with no requant. The optional H=128
+            # prefill-ASM decode route also consumes the shared empty CSR.
             o = sparse_attn_v4_paged_decode(
                 qkn.q_sa,
                 self.unified_kv,
@@ -3139,6 +3142,7 @@ class DeepseekV4Attention(nn.Module):
                 q_packed_in=qkn.q_packed,
                 q_rope_in=qkn.q_rope,
                 qo_indptr=attn_md.qo_indptr,
+                empty_kv_indptr=attn_md.empty_kv_indptr,
                 prefix=f"{self.layer_name}.sparse_attn_decode",
             )  # [S, H, head_dim]
         else:
@@ -3313,7 +3317,7 @@ class DeepseekV4Attention(nn.Module):
         Per doc §6.4:
           block_idx_in_seq = topk_local // csa_block_capacity
           slot_in_block    = topk_local %  csa_block_capacity
-          physical_block   = block_tables[batch_id_per_token[t], block_idx_in_seq]
+          physical_block   = block_tables[batch_id_per_q_token[t], block_idx_in_seq]
           row              = physical_block * envelope_rows + slot_in_block
 
         Fully fused into one triton kernel — no [T, index_topk] intermediates,
@@ -3361,7 +3365,7 @@ class DeepseekV4Attention(nn.Module):
             attn_md.block_tables,
             positions,
             kv_indptr,
-            attn_md.batch_id_per_token,
+            attn_md.batch_id_per_q_token,
             skip_buf,
             kv_indices,
             envelope_rows=attn_md.envelope_rows,
@@ -3515,18 +3519,9 @@ class MoE(nn.Module):
             # attribute mutation across the compile boundary, so stashing on
             # `self.foo` from inside forward is a no-op at runtime.
         assert args.n_shared_experts == 1
-        self._fuse_shared_into_routed = (
-            is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
-                qc,
-                shared_expert_prefix=f"{prefix}.shared_experts",
-                routed_expert_prefix=f"{prefix}.experts",
-            )
-        )
         moe_cfg = SimpleNamespace(
             routed_scaling_factor=self.routed_scaling_factor,
-            n_shared_experts=(
-                args.n_shared_experts if self._fuse_shared_into_routed else 0
-            ),
+            n_shared_experts=args.n_shared_experts,
         )
         self.experts = FusedMoE(
             num_experts=self.n_routed_experts,
@@ -3546,8 +3541,10 @@ class MoE(nn.Module):
             # inter=3072/TP8=384 is a 128-multiple; pad to 128 (not the 256
             # default) to avoid padding the MoE intermediate up to 512.
             pad_align=128,
+            enable_comm_fused=True,
         )
         self.experts.swiglu_limit = args.swiglu_limit
+        self._fuse_shared_into_routed = self.experts.num_fused_shared_experts > 0
 
         if not self._fuse_shared_into_routed:
             # self.experts.num_fused_shared_experts = 0
@@ -3577,13 +3574,15 @@ class MoE(nn.Module):
             and self.alt_stream is not None
             and envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
         )
+        # Keep comm-fused token-bucket dispatch dynamic under torch.compile.
+        self._use_comm_fused_dispatch = self.experts._comm_fused_moe is not None
         # Register self in static_forward_context so the custom op dispatcher
         # can look us up by `layer_name` (= self.prefix). Needed by
         # maybe_dual_stream_forward (dual-stream) AND moe_pcp_merge_forward
         # — the latter requires registration regardless of
         # dual-stream, so register whenever either consumer is active.
         _pcp_merge_on = get_pcp_world_size() > 1 and bool(envs.ATOM_PCP_MOE_MERGE)
-        if self._use_dual_stream or _pcp_merge_on:
+        if self._use_dual_stream or self._use_comm_fused_dispatch or _pcp_merge_on:
             get_current_atom_config().compilation_config.static_forward_context[
                 prefix
             ] = self
@@ -3657,8 +3656,12 @@ class MoE(nn.Module):
         return topk_weights, topk_ids
 
     def routed_expert_forward(
-        self, x: torch.Tensor  # [num_tokens, dim]
-    ) -> torch.Tensor:  # [num_tokens, dim]
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]
+        shared_partial: torch.Tensor | None = None,
+        before_stage2=None,
+        stage2_stream: torch.cuda.Stream | None = None,
+    ) -> tuple[torch.Tensor, bool]:
         """Gate + FusedMoE routed-expert pass.
 
         For hash layers the gate's `tid2eid` lookup needs `input_ids`;
@@ -3667,7 +3670,13 @@ class MoE(nn.Module):
         `_hash_topk` (FusedMoE's custom_routing_function) reads it there.
         """
         router_logits = self.gate(x)  # [num_tokens, n_routed_experts]
-        return self.experts(hidden_states=x, router_logits=router_logits)
+        return self.experts.forward_maybe_comm_fused(
+            x,
+            router_logits,
+            shared_partial,
+            before_stage2=before_stage2,
+            stage2_stream=stage2_stream,
+        )
 
     @staticmethod
     def _gather_ids_for_dp(ids: torch.Tensor, ctx) -> torch.Tensor:
@@ -3725,9 +3734,13 @@ class MoE(nn.Module):
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Sequential: shared_experts → routed_experts → combine."""
         shared = self.shared_experts(x) if self.shared_experts is not None else None
-        routed = self.routed_expert_forward(x)
+        routed, is_complete = self.routed_expert_forward(x, shared_partial=shared)
+        if is_complete:
+            return routed
         return self.combine_outputs(
-            routed, shared, prefix=f"{self.prefix}.combine_outputs"
+            routed,
+            shared,
+            prefix=f"{self.prefix}.combine_outputs",
         )
 
     def dual_stream_moe_forward(
@@ -3738,12 +3751,26 @@ class MoE(nn.Module):
         independent; main stream waits on alt_stream's completion before
         combining.
         """
-        current_stream = get_forward_context().main_stream
-        self.alt_stream.wait_stream(current_stream)
-        routed = self.routed_expert_forward(x)
+        routed_stream = torch.cuda.current_stream(x.device)
+        self.alt_stream.wait_stream(routed_stream)
+
+        def produce_shared():
+            with torch.cuda.stream(self.alt_stream):
+                shared = self.shared_experts.forward(x)
+            routed_stream.wait_stream(self.alt_stream)
+            shared.record_stream(routed_stream)
+            return shared
+
+        routed, is_complete = self.routed_expert_forward(
+            x,
+            before_stage2=produce_shared,
+            stage2_stream=routed_stream,
+        )
+        if is_complete:
+            return routed
         with torch.cuda.stream(self.alt_stream):
             shared = self.shared_experts.forward(x)
-        current_stream.wait_stream(self.alt_stream)
+        routed_stream.wait_stream(self.alt_stream)
         return self.combine_outputs(
             routed, shared, prefix=f"{self.prefix}.combine_outputs"
         )
@@ -3758,11 +3785,8 @@ class MoE(nn.Module):
         assert (
             x.dim() == 2 and x.shape[-1] == self.dim
         ), f"MoE expects 2D [num_tokens, {self.dim}], got {tuple(x.shape)}"
-        if self._use_dual_stream:
-            # Shared custom op (also used by V2). Dispatcher reads
-            # `_use_dual_stream` + per-call num_tokens vs threshold to pick
-            # dual vs single. Custom op = Dynamo barrier so stream context
-            # inside `dual_stream_moe_forward` is opaque to torch.compile.
+        if self._use_dual_stream or self._use_comm_fused_dispatch:
+            # Keep stream and comm-fused dispatch opaque to torch.compile.
             return torch.ops.aiter.maybe_dual_stream_forward(x, self.prefix)
         return self.single_stream_moe_forward(x)
 
@@ -3773,6 +3797,7 @@ class HCState:
     post_mix: torch.Tensor | None = None
     comb_mix: torch.Tensor | None = None
     x_prev: torch.Tensor | None = None
+    res_preshuffle: bool = False
 
 
 class Block(nn.Module):
@@ -3820,7 +3845,8 @@ class Block(nn.Module):
         self.hc_eps = args.hc_eps
         mix_hc = (2 + hc_mult) * hc_mult
         hc_dim = hc_mult * args.dim
-        # All HC params stored in fp32 (matches reference's `set_dtype(torch.float32)`).
+        # Load HC params in FP32. BF16 mode replaces fn storage after loading;
+        # base and scale remain FP32.
         self.hc_attn_fn = atom_parameter(
             torch.empty(mix_hc, hc_dim, dtype=torch.float32)
         )
@@ -3843,12 +3869,33 @@ class Block(nn.Module):
         self._mhc_fused_post_pre = (
             getattr(aiter, "mhc_fused_post_pre", None) if _dim_ok else None
         )
+        self.enable_hc_fn_pack_bf16 = (
+            envs.ATOM_MHC_USE_BF16
+            and self._mhc_pre is not None
+            and hasattr(aiter, "mhc_shuffle_fn")
+        )
         self.enable_fused_hc = (
-            hasattr(aiter, "mhc_fused_post_pre") and not self.layer_id == 0
+            self._mhc_fused_post_pre is not None and self.layer_id != 0
         )
 
     # mHC `hc_post_mult_value`: V4 uses `2.0 * sigmoid(post)` for the post gate.
     HC_POST_MULT = 2.0
+
+    def process_weights_after_loading(self):
+        """Pack constant mHC fn weights into AITER's BF16 hi/lo block layout.
+
+        AITER selects the block size for the runtime GPU architecture. Pack once
+        after loading, then use w_preshuffle_bf16=1 without shuffling residuals.
+        No-op unless enable_hc_fn_pack_bf16.
+        """
+        if not self.enable_hc_fn_pack_bf16:
+            return
+        for name in ("hc_attn_fn", "hc_ffn_fn"):
+            fn = getattr(self, name)
+            if fn.dtype == torch.int32:
+                continue
+            # Replace storage on the existing Parameter: retain no FP32 copy.
+            fn.data = aiter.mhc_shuffle_fn(fn.data.contiguous().float())
 
     def hc_pre(
         self,
@@ -3858,6 +3905,7 @@ class Block(nn.Module):
         hc_base: torch.Tensor,  # [mix_hc] fp32
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 1e-6,
+        res_preshuffle: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reduce mHC residual `[num_tokens, hc, dim]` to sub-layer input `[num_tokens, dim]`.
 
@@ -3874,6 +3922,11 @@ class Block(nn.Module):
         if self._mhc_pre is not None:
             # aiter mhc_pre wants [M, hc, dim] and returns
             # (post [M, hc, 1], comb [M, hc, hc], y [M, dim]).
+            # mhc_pre restores the ordinary residual layout when the runtime
+            # fuse policy says this input is shuffled.
+            pack_kw = {"w_preshuffle_bf16": 1} if self.enable_hc_fn_pack_bf16 else {}
+            if res_preshuffle:
+                pack_kw["res_preshuffle"] = True
             post, comb, y = self._mhc_pre(
                 residual,
                 hc_fn,
@@ -3886,6 +3939,7 @@ class Block(nn.Module):
                 int(self.hc_sinkhorn_iters),
                 norm_weight,
                 norm_eps,
+                **pack_kw,
             )
             return y, post.squeeze(-1), comb
 
@@ -3915,6 +3969,7 @@ class Block(nn.Module):
         residual: torch.Tensor,  # [num_tokens, hc, dim]  pre-layer residual
         post: torch.Tensor,  # [num_tokens, hc]       from hc_pre
         comb: torch.Tensor,  # [num_tokens, hc, hc]   from hc_pre
+        res_preshuffle: bool = False,
     ) -> torch.Tensor:  # [num_tokens, hc, dim]  new residual
         """Expand sub-layer output `[num_tokens, dim]` back to mHC residual
         `[num_tokens, hc, dim]`.
@@ -3929,8 +3984,16 @@ class Block(nn.Module):
         if self._mhc_post is not None:
             # `out` inherits residual.dtype = x.dtype (residual stream is BF16
             # end-to-end in Block.forward), so no cast needed on the kernel path.
+            post_kw = {"res_preshuffle": True} if res_preshuffle else {}
             out = torch.empty_like(residual)
-            self._mhc_post(out, x, residual, post.unsqueeze(-1), comb)
+            self._mhc_post(
+                out,
+                x,
+                residual,
+                post.unsqueeze(-1),
+                comb,
+                **post_kw,
+            )
             return out
 
         # Torch fallback. fp32 (post, comb) × BF16 (x, residual) promotes to
@@ -3954,8 +4017,15 @@ class Block(nn.Module):
         hc_base: torch.Tensor,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 1e-6,
+        res_preshuffle: bool = False,
         prefix: str = "",
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # BF16 weight packing is independent of the residual layout.
+        pack_kw = {}
+        if self.enable_hc_fn_pack_bf16:
+            pack_kw["w_preshuffle_bf16"] = True
+        if res_preshuffle:
+            pack_kw["res_preshuffle"] = True
         return self._mhc_fused_post_pre(
             x,
             residual,
@@ -3971,6 +4041,7 @@ class Block(nn.Module):
             int(self.hc_sinkhorn_iters),
             norm_weight,
             norm_eps,
+            **pack_kw,
         )
 
     @mark_trace
@@ -3985,6 +4056,7 @@ class Block(nn.Module):
         hc_base: torch.Tensor,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 1e-6,
+        res_preshuffle: bool = False,
         prefix: str = "",
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if x is not None:
@@ -3992,7 +4064,13 @@ class Block(nn.Module):
         else:
             res = residual
         x, post, comb = self.hc_pre(
-            res, hc_fn, hc_scale, hc_base, norm_weight, norm_eps
+            res,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+            norm_eps,
+            res_preshuffle=res_preshuffle,
         )
         return x, post, comb, res
 
@@ -4009,7 +4087,7 @@ class Block(nn.Module):
         post = hc_state.post_mix
         comb = hc_state.comb_mix
         x = hc_state.x_prev
-        if self.enable_fused_hc and x is not None:
+        if (self.enable_fused_hc or hc_state.res_preshuffle) and x is not None:
             post, comb, x, res = self.mhc_fused_post_pre(
                 x,
                 residual,
@@ -4020,8 +4098,11 @@ class Block(nn.Module):
                 hc_base,
                 norm_weight,
                 norm_eps,
+                res_preshuffle=hc_state.res_preshuffle,
                 prefix=f"{self.prefix}.mhc_fused_post_pre",
             )
+            # Match hc_pre's [tokens, hc] state for subsequent post/pre calls.
+            post = post.squeeze(-1)
         else:
             x, post, comb, res = self.mhc_post_pre(
                 x,
@@ -4033,9 +4114,16 @@ class Block(nn.Module):
                 hc_base,
                 norm_weight,
                 norm_eps,
+                res_preshuffle=hc_state.res_preshuffle,
                 prefix=f"{self.prefix}.mhc_post_pre",
             )
-        return HCState(residual=res, post_mix=post, comb_mix=comb, x_prev=x)
+        return HCState(
+            residual=res,
+            post_mix=post,
+            comb_mix=comb,
+            x_prev=x,
+            res_preshuffle=hc_state.res_preshuffle,
+        )
 
     def forward(
         self,
@@ -4122,7 +4210,14 @@ class ParallelHead(ParallelLMHead):
         via Sigmoid-gated weighted sum (vs Block.hc_pre's Sinkhorn variant).
         """
         _, _, y = aiter.mhc_pre(
-            x, hc_fn, hc_scale, hc_base, self.norm_eps, self.hc_eps, sinkhorn_repeat=0
+            x,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            self.norm_eps,
+            self.hc_eps,
+            sinkhorn_repeat=0,
+            **({"w_preshuffle_bf16": 1} if hc_fn.dtype == torch.int32 else {}),
         )
         return y
 
@@ -4282,6 +4377,10 @@ class DeepseekV4Model(nn.Module):
         self.norm_eps = args.norm_eps
         self.hc_eps = args.hc_eps
         self.hc_mult = args.hc_mult
+        self._mhc_arch = get_gfx_runtime()
+        self.enable_res_preshuffle = hasattr(
+            aiter, "mhc_res_shuffle_enabled"
+        ) and aiter.mhc_res_shuffle_enabled(1, self._mhc_arch)
 
         # VocabParallelEmbedding shards along vocab dim. At TP=1 weight shape
         # equals nn.Embedding's [vocab_size, dim] so dummy state_dicts load
@@ -4326,6 +4425,19 @@ class DeepseekV4Model(nn.Module):
         self.hc_head_base = atom_parameter(torch.empty(hc_mult, dtype=torch.float32))
         self.hc_head_scale = atom_parameter(torch.empty(1, dtype=torch.float32))
 
+    def process_weights_after_loading(self):
+        """Pack the head's constant fn using AITER's architecture-specific layout."""
+        if (
+            not envs.ATOM_MHC_USE_BF16
+            or not hasattr(aiter, "mhc_shuffle_fn")
+            or self.hc_head_fn.dtype == torch.int32
+        ):
+            return
+        # Replace storage instead of keeping a second packed Parameter.
+        self.hc_head_fn.data = aiter.mhc_shuffle_fn(
+            self.hc_head_fn.data.contiguous().float()
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,  # [num_tokens] int  flat ragged-batch token ids
@@ -4333,10 +4445,10 @@ class DeepseekV4Model(nn.Module):
     ) -> torch.Tensor:  # [num_tokens, hc, dim]  pre-hc_head residual stream
         """Forward over `num_tokens` flat ragged-batch tokens.
 
-        Returns the mHC residual stack `[num_tokens, hc, dim]` BEFORE hc_head
-        reduction — `hc_head + RMSNorm + LM head` are all deferred to
-        `compute_logits`. Returning the hc-shaped residual lets the (future)
-        MTP draft consume it without re-expanding from a dim-reduced state.
+        Returns the mHC residual stack `[num_tokens, hc, dim]` before hc_head
+        reduction. The final layer unshuffles and uses standalone hc_post;
+        `hc_head + RMSNorm + LM head` remain in `compute_logits`, and MTP keeps
+        the same three-dimensional residual contract.
         """
         assert input_ids.dim() == 1, f"input_ids must be 1D, got {input_ids.shape}"
         # PCP note: under PCP, `input_ids`/`positions` arrive already round-robin-
@@ -4346,16 +4458,38 @@ class DeepseekV4Model(nn.Module):
         # the K/V all-gather inside attention reconstructs full KV per layer,
         # and the final all-gather + un-pad happens back in the caller.
         h = self.embed(input_ids)  # [num_tokens, dim]
-        # Expand to hc_mult copies for Hyper-Connections: [num_tokens, hc, dim]
-        h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
-        hc_state = HCState(residual=h, post_mix=None, comb_mix=None, x_prev=None)
+        # Keep this static: concrete-M gating is handled inside AITER custom ops.
+        # Checking h.size(0) here would specialize the compiled graph to warmup M.
+        res_preshuffle = self.enable_res_preshuffle and (
+            self.layers[0]._mhc_fused_post_pre is not None
+        )
+        if hasattr(aiter, "mhc_res_repeat"):
+            # Aiter writes either the ordinary repeated residual or the shuffled
+            # gfx1250 layout directly, without materializing repeat + shuffle.
+            h = aiter.mhc_res_repeat(h, self.hc_mult, res_preshuffle)
+        else:
+            # Older AITER versions only support the ordinary residual layout.
+            h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+            res_preshuffle = False
+        hc_state = HCState(
+            residual=h,
+            post_mix=None,
+            comb_mix=None,
+            x_prev=None,
+            res_preshuffle=res_preshuffle,
+        )
 
         for layer in self.layers:
             hc_state = layer(hc_state, positions)
-        h = self.layers[-1].hc_post(
-            hc_state.x_prev, hc_state.residual, hc_state.post_mix, hc_state.comb_mix
+
+        last_layer = self.layers[-1]
+        return last_layer.hc_post(
+            hc_state.x_prev,
+            hc_state.residual,
+            hc_state.post_mix,
+            hc_state.comb_mix,
+            res_preshuffle=hc_state.res_preshuffle,
         )
-        return h
 
 
 class DeepseekV4ForCausalLM(nn.Module):
@@ -4400,11 +4534,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             "hc_head_": "model.hc_head_",
         }
     )
-    weights_mapping = {
+    weights_mapping: ClassVar[dict[str, str]] = {
         ".gate.bias": ".gate.e_score_correction_bias",
         ".scale": ".weight_scale_inv",
     }
-    packed_modules_mapping = {
+    packed_modules_mapping: ClassVar[dict[str, tuple[str, int]]] = {
         "attn.wq_a": ("attn.wqkv_a", 0),
         "attn.wkv": ("attn.wqkv_a", 1),
         "compressor.wkv": ("compressor.wkv_gate", 0),
@@ -4581,11 +4715,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         self,
         hidden_states: torch.Tensor,  # [num_tokens, hc, dim]  pre-hc_head residual
     ) -> torch.Tensor:  # [bs, vocab]
-        # mHC reduce + final RMSNorm + LM head are all here so `model.forward`
-        # can return the un-reduced [N, hc, dim] residual stream — the future
-        # MTP draft consumes it directly without re-expanding from a dim-reduced
-        # state. CG output buffer is sized [N, hc, dim] in ModelRunner via the
-        # `extra_output_dims = (hc_mult,)` hook on this class.
+        # Reduce the final unshuffled residual, normalize, then project logits.
         x = self.model.head.hc_head(
             hidden_states,
             self.model.hc_head_fn,
@@ -4685,7 +4815,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # → `experts.w13_` (param_name_part), keeping the `weight` / `scale` suffix.
         try:
             expert_mapping = self.get_expert_mapping()
-        except Exception:
+        except Exception:  # noqa: BLE001 -- optional; a model without one loads fine
             expert_mapping = []
         # Build longest-first index for unambiguous matching (shared with std loader).
         expert_index: dict[str, tuple[str, int, str]] = {}

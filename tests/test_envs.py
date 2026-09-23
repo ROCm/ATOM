@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Tests for atom/utils/envs.py — lazy env var evaluation
 
+import logging
+
 import pytest
 
 # All ATOM_* env vars that could affect default-value tests
@@ -13,6 +15,8 @@ _ATOM_ENV_VARS = [
     "ATOM_DP_BASE_PORT",
     "ATOM_USE_TRITON_GEMM",
     "ATOM_USE_TRITON_MXFP4_BMM",
+    "ATOM_USE_V4_PREFILL_ASM_FOR_DECODE",
+    "ATOM_MHC_USE_BF16",
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION",
     "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION",
     "ATOM_ENABLE_DS_QKNORM_QUANT_FUSION",
@@ -20,7 +24,10 @@ _ATOM_ENV_VARS = [
     "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST",
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT",
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT",
+    "ATOM_USE_MODEL_SENSITIVE_RMSNORM",
     "ATOM_TORCH_PROFILER_DIR",
+    "ATOM_ENABLE_METRICS_DEVICE_TIMER",
+    "ATOM_METRICS_UPDATE_INTERVAL_S",
     "ATOM_PROFILER_MORE",
     "ATOM_PROFILER_TIMEOUT",
     "ATOM_LOG_MORE",
@@ -29,6 +36,7 @@ _ATOM_ENV_VARS = [
     "ATOM_DISABLE_VLLM_PLUGIN",
     "ATOM_USE_CUSTOM_ALL_GATHER",
     "ATOM_ENABLE_RELAXED_MTP",
+    "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ",
 ]
 
 
@@ -67,14 +75,30 @@ class TestEnvsDefaults:
     def test_dp_base_port_default(self):
         assert _get_envs().ATOM_DP_BASE_PORT == 0
 
+    def test_mhc_use_bf16_default(self):
+        assert _get_envs().ATOM_MHC_USE_BF16 is True
+
     def test_use_triton_gemm_default(self):
         assert _get_envs().ATOM_USE_TRITON_GEMM is False
+
+    def test_use_v4_prefill_asm_for_decode_default_disabled(self):
+        assert _get_envs().ATOM_USE_V4_PREFILL_ASM_FOR_DECODE is False
 
     def test_ds_input_rmsnorm_quant_fusion_default_enabled(self):
         assert _get_envs().ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is True
 
+    def test_model_sensitive_rmsnorm_default_disabled(self):
+        assert _get_envs().ATOM_USE_MODEL_SENSITIVE_RMSNORM is False
+
     def test_torch_profiler_dir_default(self):
         assert _get_envs().ATOM_TORCH_PROFILER_DIR is None
+
+    def test_metrics_device_timer_default_disabled(self):
+        assert _get_envs().ATOM_ENABLE_METRICS_DEVICE_TIMER is False
+
+    def test_metrics_update_interval_default(self, caplog):
+        assert _get_envs().ATOM_METRICS_UPDATE_INTERVAL_S == 1.0
+        assert not caplog.records
 
     def test_profiler_more_default(self):
         assert _get_envs().ATOM_PROFILER_MORE is False
@@ -100,6 +124,9 @@ class TestEnvsDefaults:
     def test_atom_enable_gdn_decode_lossy_fast_default(self):
         assert _get_envs().ATOM_ENABLE_GDN_DECODE_LOSSY_FAST is False
 
+    def test_use_flydsl_gather_kv_b_proj_default(self):
+        assert _get_envs().ATOM_USE_FLYDSL_GATHER_KV_B_PROJ is True
+
     def test_unknown_attr_raises(self):
         with pytest.raises(AttributeError):
             _ = _get_envs().ATOM_NONEXISTENT_VAR
@@ -107,6 +134,11 @@ class TestEnvsDefaults:
 
 class TestEnvsOverrides:
     """Test that env vars are read dynamically (lazy evaluation)."""
+
+    @pytest.mark.parametrize("value, expected", [("0", False), ("1", True)])
+    def test_mhc_use_bf16_override(self, monkeypatch, value, expected):
+        monkeypatch.setenv("ATOM_MHC_USE_BF16", value)
+        assert _get_envs().ATOM_MHC_USE_BF16 is expected
 
     def test_dp_rank_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_DP_RANK", "3")
@@ -122,6 +154,10 @@ class TestEnvsOverrides:
         assert _get_envs().ATOM_DP_MASTER_PORT == 29700
         assert _get_envs().ATOM_DP_BASE_PORT == 29800
 
+    def test_use_v4_prefill_asm_for_decode_enabled(self, monkeypatch):
+        monkeypatch.setenv("ATOM_USE_V4_PREFILL_ASM_FOR_DECODE", "1")
+        assert _get_envs().ATOM_USE_V4_PREFILL_ASM_FOR_DECODE is True
+
     def test_torch_profiler_dir_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", "/tmp/prof")
         assert _get_envs().ATOM_TORCH_PROFILER_DIR == "/tmp/prof"
@@ -130,9 +166,35 @@ class TestEnvsOverrides:
         monkeypatch.setenv("ATOM_PROFILER_MORE", "1")
         assert _get_envs().ATOM_PROFILER_MORE is True
 
+    def test_metrics_device_timer_enabled(self, monkeypatch):
+        monkeypatch.setenv("ATOM_ENABLE_METRICS_DEVICE_TIMER", "1")
+        assert _get_envs().ATOM_ENABLE_METRICS_DEVICE_TIMER is True
+
+    @pytest.mark.parametrize("value", ["0.25", "5"])
+    def test_metrics_update_interval_override(self, monkeypatch, caplog, value):
+        monkeypatch.setenv("ATOM_METRICS_UPDATE_INTERVAL_S", value)
+        assert _get_envs().ATOM_METRICS_UPDATE_INTERVAL_S == float(value)
+        assert not caplog.records
+
+    @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf", "", "bad"])
+    def test_metrics_update_interval_warns_and_defaults(
+        self, monkeypatch, caplog, value
+    ):
+        monkeypatch.setenv("ATOM_METRICS_UPDATE_INTERVAL_S", value)
+        assert _get_envs().ATOM_METRICS_UPDATE_INTERVAL_S == 1.0
+        assert len(caplog.records) == 1
+        record = caplog.records[0]
+        assert record.levelno == logging.WARNING
+        assert f"ATOM_METRICS_UPDATE_INTERVAL_S={value!r}" in record.getMessage()
+        assert "using default 1.0" in record.getMessage()
+
     def test_profiler_timeout_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_PROFILER_TIMEOUT", "900")
         assert _get_envs().ATOM_PROFILER_TIMEOUT == 900.0
+
+    def test_model_sensitive_rmsnorm_enabled(self, monkeypatch):
+        monkeypatch.setenv("ATOM_USE_MODEL_SENSITIVE_RMSNORM", "1")
+        assert _get_envs().ATOM_USE_MODEL_SENSITIVE_RMSNORM is True
 
     def test_log_more_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_LOG_MORE", "1")
@@ -165,6 +227,16 @@ class TestEnvsOverrides:
     def test_atom_enable_gdn_decode_lossy_fast_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", "1")
         assert _get_envs().ATOM_ENABLE_GDN_DECODE_LOSSY_FAST is True
+
+    def test_use_flydsl_gather_kv_b_proj_disabled(self, monkeypatch):
+        # The interesting lever now that the default is on: "1" would pass even
+        # against a hard-coded True, so assert the opt-out instead.
+        monkeypatch.setenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "0")
+        assert _get_envs().ATOM_USE_FLYDSL_GATHER_KV_B_PROJ is False
+
+    def test_use_flydsl_gather_kv_b_proj_only_one_enables(self, monkeypatch):
+        monkeypatch.setenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "true")
+        assert _get_envs().ATOM_USE_FLYDSL_GATHER_KV_B_PROJ is False
 
 
 class TestIsSet:

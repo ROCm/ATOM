@@ -94,11 +94,16 @@ def anthropic_to_openai_messages(
                 result.append({"role": "assistant", "content": content})
             elif isinstance(content, list):
                 text_parts = []
+                reasoning_parts = []
                 tool_calls = []
                 for block in content:
                     if isinstance(block, dict):
                         if block.get("type") == "text":
                             text_parts.append(block["text"])
+                        elif block.get("type") == "thinking":
+                            thinking = block.get("thinking")
+                            if isinstance(thinking, str) and thinking:
+                                reasoning_parts.append(thinking)
                         elif block.get("type") == "tool_use":
                             tool_calls.append(
                                 {
@@ -111,6 +116,8 @@ def anthropic_to_openai_messages(
                                 }
                             )
                 entry = {"role": "assistant", "content": "\n".join(text_parts) or None}
+                if reasoning_parts:
+                    entry["reasoning_content"] = "\n".join(reasoning_parts)
                 if tool_calls:
                     entry["tool_calls"] = tool_calls
                 result.append(entry)

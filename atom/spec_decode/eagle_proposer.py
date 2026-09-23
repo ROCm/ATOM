@@ -14,9 +14,10 @@ from atom.distributed.pcp_utils import (
     pcp_pad_len,
     pcp_round_robin_split,
 )
+from atom.model_ops.embed_head import empty_token_ids
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
+from atom.spec_decode.draft_kv import draft_kv_builder
 from atom.spec_decode.drafter import Drafter
-from atom.spec_decode.eagle3_kv_builder import Eagle3DraftBuilder
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
@@ -137,31 +138,31 @@ class EagleProposer(Drafter):
             self._reuse_step_buffers = False
             return ()
         draft_hf = self.speculative_config.draft_model_hf_config
-        # DeepSeek-V4 carries the mHC residual, so its hidden is [N, hc, dim]
-        # rather than [N, dim]. `hc_mult` is absent on every architecture that
-        # does not, which is exactly the two-dimensional case.
-        hc = getattr(draft_hf, "hc_mult", None)
+        shape_fn = getattr(self.model, "draft_graph_hidden_state_shape", None)
+        if shape_fn is not None:
+            hidden_shape = shape_fn(draft_hf)
+        else:
+            # Other draft models retain the config-based mHC shape contract.
+            hc = getattr(draft_hf, "hc_mult", None)
+            hidden_shape = (draft_hf.hidden_size,)
+            if hc is not None:
+                hidden_shape = (hc, draft_hf.hidden_size)
         inputs = {
-            # int64, not the int32 of the token buffer step 0 reads: a mid-step's
-            # ids come from `compute_draft_ids`, which is an argmax. The loop
-            # rebinds `input_ids` from one to the other, so the two halves
-            # genuinely differ.
-            "input_ids": StagedInput(dtype=torch.int64),
+            # The same int32 the token buffer step 0 reads: the loop rebinds
+            # `input_ids` from that buffer to this one, and `stage` asserts the
+            # two agree.
+            "input_ids": StagedInput(dtype=torch.int32),
             "positions": StagedInput(dtype=torch.int64),
             "hidden_states": StagedInput(
-                shape=(
-                    (hc, draft_hf.hidden_size)
-                    if hc is not None
-                    else (draft_hf.hidden_size,)
-                ),
+                shape=hidden_shape,
                 dtype=self.dtype,
             ),
         }
-        # Keep this capability at the non-compiled call site. DeepSeekMTPModel
-        # has the two-dimensional hidden-state and shared-head contracts needed
-        # to feed its fixed graph inputs directly; other draft architectures
-        # remain on the owned-output path.
-        self._reuse_step_buffers = draft_hf.architectures[0] == "DeepSeekMTPModel"
+        # Only models with the fixed hidden-state and shared-head contracts
+        # can feed the staged buffers directly. Others own their output storage.
+        self._reuse_step_buffers = getattr(
+            self.model, "reuse_draft_graph_step_buffers", False
+        )
         self.step = DraftGraph(
             forward=self._step_forward,
             epilogue=self._step_head,
@@ -179,14 +180,14 @@ class EagleProposer(Drafter):
 
         Nothing of the target's metadata is installed here. The pad rows are
         already masked where it matters: `prepare_mtp_decode` writes `-1` into
-        `batch_id_per_token`, and the index kernel returns on `bid < 0` before it
+        `batch_id_per_q_token`, and the index kernel returns on `bid < 0` before it
         ever loads a ring slot.
         """
         return self.model(
             input_ids=input_ids, positions=positions, hidden_states=hidden_states
         )
 
-    def _step_head(self, out, running_bs, *, input_ids, hidden_states, **_):
+    def _step_head(self, fwd_out, running_bs, *, input_ids, hidden_states, **_):
         """The mid-step's draft ids, recorded with the backbone that made them.
 
         Both come back because the next mid-step reads the hidden states and
@@ -195,10 +196,13 @@ class EagleProposer(Drafter):
         is the caller's, on the way out.
         """
         if self._reuse_step_buffers:
-            hidden_states.copy_(out[:running_bs])
+            hidden_states.copy_(fwd_out[:running_bs])
             self.model.compute_draft_ids(hidden_states, out=input_ids)
             return hidden_states, input_ids
-        return out, self.model.compute_draft_ids(out)
+        # No fixed storage on this flavor, so the ids land in the graph's own
+        # pool -- where `argmax`'s result landed before.
+        ids = empty_token_ids(fwd_out)
+        return fwd_out, self.model.compute_draft_ids(fwd_out, out=ids)
 
     def _build_draft_model(self, model_class) -> nn.Module:
         draft_model_hf_config = self.speculative_config.draft_model_hf_config
@@ -223,16 +227,14 @@ class EagleProposer(Drafter):
                 draft_atom_config,
                 layer_offset=self.config.hf_config.num_hidden_layers,
             )
-            # MHA draft (e.g. K2.5 LlamaForCausalLMEagle3): owns an independent
-            # non-MLA KV cache via Eagle3DraftBuilder, attached to the runner.
-            # MLA draft (e.g. K2.6 EAGLE 3.1): same MLA shape as target, so
-            # it piggybacks on the target's MLA pool (model_runner accounts
-            # for the +1 draft layer via num_nextn_predict_layers default).
-            draft_is_mla = bool(getattr(draft_model_hf_config, "kv_lora_rank", None))
-            if not draft_is_mla:
-                self.runner.eagle3_draft_builder = Eagle3DraftBuilder(
-                    self.runner, draft_model_hf_config
-                )
+            # Whether this draft needs a KV pool of its own is a property of
+            # the draft's config, answered by the backend that config resolves
+            # to. A draft whose rows are the target's latent (K2.6 EAGLE 3.1)
+            # binds into the target's pool and gets None here; model_runner
+            # accounts for its +1 layer via num_nextn_predict_layers.
+            builder = draft_kv_builder(self.runner, draft_model_hf_config)
+            if builder is not None:
+                self.runner.draft_kv_builder = builder
             return model
 
         return model_class(self.config)
@@ -359,7 +361,7 @@ class EagleProposer(Drafter):
         input_ids.scatter_(0, last_token_indices, anchor_ids)
 
         d_input_ids = input_ids
-        d_positions = positions[:num_tokens] + 1
+        d_positions = positions[..., :num_tokens] + 1
         d_hidden = draft_hidden
         # Same split as propose()'s i==0 step: this pass reuses the same
         # 1/pcp-reindexed attn_metadata. Only q is sharded -- attention
@@ -442,7 +444,7 @@ class EagleProposer(Drafter):
         attn_metadata, context = fc.attn_metadata, fc.context
         var = self.runner.forward_vars
         builder = self.runner.attn_metadata_builder
-        target_uses_mla = self.runner.use_mla
+        target_uses_mla = self.runner.attn_family.is_mla
         has_flat_kv = "kv_indices" in var
         i0_max_seqlen_q = attn_metadata.max_seqlen_q
         attn_metadata.max_seqlen_q = 1
@@ -478,6 +480,11 @@ class EagleProposer(Drafter):
             # itself; the verify step's has the right row count, wrong rows.
             attn_metadata.dcp_token_block_tables = attn_metadata.block_tables
         attn_metadata.context_lens = var["context_lens"].gpu[:running_bs]
+        # Unguarded because the base builder answers it: this runs for every
+        # target a draft can have, and only the MLA one has an FP4 indexer. The
+        # draft's rows are its own, and a replay addresses whatever row count
+        # the schedule buffer holds.
+        builder._publish_indexer_fp4_decode_schedule(attn_metadata, running_bs, 1)
         if "sparse_kv_indptr" in var:
             attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].gpu[
                 : running_bs + 1
@@ -485,10 +492,11 @@ class EagleProposer(Drafter):
         cu_seqlens_q[: running_bs + 1] = builder.row_ids[: running_bs + 1]
         if target_uses_mla and has_flat_kv:
             # MLA: block_size=1, kv_indptr tracks tokens
-            # Per REAL request: `num_reject_tokens` is scheduled_bs-long, a pad row
-            # rejected nothing. Their `kv_indptr` keeps what the target left,
-            # which is one of its own valid ranges, so their reads stay in
-            # bounds; their WRITES are what has to be neutralized, below.
+            # Per REAL request: `num_reject_tokens` is scheduled_bs-long, a pad
+            # row rejected nothing. That leaves the tail holding whatever batch
+            # last occupied those rows, which no longer continues the rows just
+            # rebased here -- `prepare_mtp_decode` closes it, per backend.
+            # Their WRITES are neutralized below.
             kv_indptr[1 : scheduled_bs + 1] -= torch.cumsum(num_reject_tokens, dim=0)
         if positions.ndim == 1:
             positions = torch.index_select(positions, 0, last_token_indices)
@@ -545,9 +553,12 @@ class EagleProposer(Drafter):
         else:
             hidden_states = target_hidden_states
 
+        # Step-major while the loop fills it: `draft_token_ids[i]` is then a
+        # contiguous row, and the id-consuming Triton kernels (masked embedding,
+        # the fp8 MTP prologue) index at unit stride. Transposed on the way out.
         draft_token_ids = torch.empty(
-            scheduled_bs,
             self.mtp_k,
+            scheduled_bs,
             dtype=next_token_ids.dtype,
             device=next_token_ids.device,
         )
@@ -555,7 +566,7 @@ class EagleProposer(Drafter):
             draft_token_ids.fill_(-1)
         var = self.runner.forward_vars
         # Eaale3 only support mha currently
-        draft_uses_mha = hasattr(self.runner, "eagle3_draft_builder")
+        draft_uses_mha = hasattr(self.runner, "draft_kv_builder")
 
         # Eagle3 MHA reuses target metadata, but the target may be MLA.  Keep
         # write slots sized to this draft pass, and when prefix cache is active
@@ -669,55 +680,26 @@ class EagleProposer(Drafter):
                         if self._reuse_step_buffers
                         else None
                     )
-                    sample_hidden_states = (
-                        torch.index_select(
-                            ret_hidden_states,
-                            0,
-                            last_token_indices,
-                            out=hidden_out,
-                        )
-                        if hidden_out is not None
-                        else torch.index_select(
-                            ret_hidden_states, 0, last_token_indices
-                        )
+                    # out=None is index_select's own default: it allocates.
+                    sample_hidden_states = torch.index_select(
+                        ret_hidden_states, 0, last_token_indices, out=hidden_out
                     )
                 else:
                     sample_hidden_states = ret_hidden_states[:scheduled_bs]
-                # Only step 0 and a flavor with no declared pass land here; a
-                # recorded mid-step produced its ids inside the graph.
-                # Every draft model EagleProposer can build implements this --
-                # the DSpark archs in support_draft_model_arch_dict do not, but
-                # they are DSparkProposer's and never reach this loop. All of
-                # them reduce per vocab shard and all-gather only [N, 2] rather
-                # than the full [N, vocab] logits, which is token-identical to
-                # compute_logits().argmax(-1) here because is_draft suppresses
-                # the LM head's prefill last-token slice. How the ids are
-                # produced stays the model's business, not this loop's.
-                ids_out = (
-                    self.step.buffer("input_ids", scheduled_bs)
-                    if self._reuse_step_buffers
-                    and graphed_ids is None
-                    and i + 1 < self.mtp_k
-                    else None
-                )
+                # This step's row is owned storage -- the assembled matrix's
+                # async D2H reads it while later replays run.
+                exported = draft_token_ids[i]
                 if graphed_ids is not None:
                     next_input_ids = graphed_ids[:scheduled_bs]
-                    # The fixed ids feed the next replay, but exported draft ids
-                    # need owned storage that a later replay cannot overwrite
-                    # while their assembled matrix is copied to the host.
-                    new_draft_ids = (
-                        next_input_ids.clone()
-                        if self._reuse_step_buffers
-                        else next_input_ids
-                    )
+                    exported.copy_(next_input_ids)
                 else:
-                    new_draft_ids = (
-                        self.model.compute_draft_ids(sample_hidden_states, out=ids_out)
-                        if ids_out is not None
-                        else self.model.compute_draft_ids(sample_hidden_states)
+                    # Every draft model EagleProposer can build implements this
+                    # (DSpark's do not, but they never reach here), and it is
+                    # token-identical to compute_logits().argmax(-1) because
+                    # is_draft suppresses the LM head's prefill last-token slice.
+                    next_input_ids = self.model.compute_draft_ids(
+                        sample_hidden_states, out=exported
                     )
-                    next_input_ids = new_draft_ids
-                draft_token_ids[:, i] = new_draft_ids
 
                 if i < self.mtp_k - 1:
                     do_attn_metadata_update = (
@@ -781,6 +763,15 @@ class EagleProposer(Drafter):
                     )
                     for k, v in workinfos.items():
                         attn_metadata.__dict__[k] = v
+                    # Every step, and only after `prepare_mtp_decode`: that call
+                    # is what refreshes the DCP local lengths the schedule is
+                    # built from, and a replay reads the buffer's contents. The
+                    # publish in `_enter_decode_metadata` runs before the
+                    # refresh, and steps 1+ reached their forward with step 0's.
+                    builder = self.runner.attn_metadata_builder
+                    builder._publish_indexer_fp4_decode_schedule(
+                        attn_metadata, running_bs, 1
+                    )
                     if has_flat_kv and "slot_mapping" not in workinfos:
                         # MLA/MHA path: slot derived from flat kv_indices. Both,
                         # and the slot_mapping written below, are the ones
@@ -790,7 +781,6 @@ class EagleProposer(Drafter):
                         raw_slots = attn_metadata.kv_indices[
                             attn_metadata.kv_indptr[1 : running_bs + 1] - 1
                         ]
-                        builder = self.runner.attn_metadata_builder
                         if getattr(builder, "dcp_world_size", 1) > 1:
                             # DCP interleave-S: only rank ((ctx-1)//S) % W owns this
                             # draft token; other ranks' kv_indptr didn't grow, so
@@ -821,5 +811,5 @@ class EagleProposer(Drafter):
                     hidden_states = sample_hidden_states
 
         # self.runner.debug(f"final {draft_token_ids=}")
-        # [batch_size, mtp_k]
-        return draft_token_ids
+        # [batch_size, mtp_k], contiguous: every consumer indexes by sequence.
+        return draft_token_ids.t().contiguous()

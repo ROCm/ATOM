@@ -217,6 +217,27 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         in_capture: bool = False,
     ):
         """Build ATOM metadata for SGLang's split CUDA graph init protocol."""
+        # QSA path (Flash-Next). This backend previously only knew paged MHA/MLA:
+        # capture/replay filled FlashInfer kv_indices / page_table / kv_lens
+        # (the 2.4T / Qwen3.5 path below). QSA does not read those tables.
+        # Fill Native-style persistent QSA page tables outside the graph, then
+        # return so we do not run page_table.fill_(0) on every decode replay.
+        if (
+            getattr(self, "_qwen4_exp_qsa_graph", None) is not False
+            and forward_batch.forward_mode.is_decode_or_idle()
+        ):
+            from atom.plugin.sglang.qwen4_exp_bridge import (
+                prepare_qwen4_exp_decode_graph_metadata,
+            )
+
+            qsa_md = prepare_qwen4_exp_decode_graph_metadata(forward_batch, in_capture)
+            if qsa_md is not None:
+                self._qwen4_exp_qsa_graph = True
+                self._set_qwen4_exp_qsa_graph_forward_metadata()
+                return
+            # Decode and not Flash: skip the QSA probe on later replays.
+            self._qwen4_exp_qsa_graph = False
+
         if in_capture:
             self.init_forward_metadata_capture_cuda_graph(
                 forward_batch.batch_size,
@@ -239,6 +260,33 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 forward_batch.seq_lens_cpu,
                 forward_batch.out_cache_loc,
             )
+            if (
+                forward_batch.forward_mode.is_decode_or_idle()
+                and (num_padding := int(getattr(forward_batch, "num_padding", 0))) > 0
+            ):
+                # Decode CUDA graphs pad batches to a captured bucket. SGLang
+                # fills those rows with seq_len=1 and req_pool_index=0, but ATOM
+                # uses kv_lens to derive the KV write slot inside the graph.
+                # Mark padded rows as empty so their slot_mapping becomes -1
+                # instead of overwriting request-pool row 0.
+                real_bs = forward_batch.batch_size - num_padding
+                self.forward_metadata.kv_lens[real_bs:].zero_()
+
+    def _set_qwen4_exp_qsa_graph_forward_metadata(self) -> None:
+        """Placeholder so the hybrid parent still sees a ForwardMetadata.
+
+        QSA reads plugin persistent buffers, not these FlashInfer fields.
+        """
+        self.forward_metadata = ForwardMetadata(
+            kv_indptr=None,
+            kv_indices=None,
+            qo_indptr=None,
+            kv_last_page_len=None,
+            max_q_len=1,
+            max_kv_len=None,
+            page_table=None,
+            kv_lens=None,
+        )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         """ATOM's full-attention metadata is prepared outside the captured graph."""
@@ -1885,7 +1933,10 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
-        use_native_dense_mha = self._should_use_native_dense_mha(layer)
+        use_native_dense_mha = (
+            envs.ATOM_AITER_FP8_PREFILL_ATTN
+            and self._should_use_native_dense_mha(layer)
+        )
 
         if k is not None:
             assert v is not None

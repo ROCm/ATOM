@@ -53,7 +53,7 @@ def build(geometry):
     """Run kernel and reference over one shared decode batch."""
     torch.manual_seed(0)
     positions = torch.tensor(POSITIONS, dtype=torch.int32, device=DEV)
-    batch_id_per_token = torch.tensor(BATCH_ID, dtype=torch.int32, device=DEV)
+    batch_id_per_q_token = torch.tensor(BATCH_ID, dtype=torch.int32, device=DEV)
     slots = torch.tensor(SLOTS, dtype=torch.int32, device=DEV)
     n_per = torch.minimum(positions + 1, torch.full_like(positions, WIN)).tolist()
 
@@ -87,7 +87,7 @@ def build(geometry):
         }
         fn(
             state_slot_per_seq=slots,
-            batch_id_per_token=batch_id_per_token,
+            batch_id_per_q_token=batch_id_per_q_token,
             positions=positions,
             dest_rows=dest,
             T=T,
@@ -279,7 +279,7 @@ def _hca_case(bs, n_hca_per_seq, positions, geometry=GEOMETRY):
     )
     write_v4_paged_decode_indices(
         state_slot_per_seq=torch.tensor(SLOTS[:1] * bs, **dev),
-        batch_id_per_token=torch.tensor(batch_id, **dev),
+        batch_id_per_q_token=torch.tensor(batch_id, **dev),
         positions=torch.tensor(positions, **dev),
         swa_indptr=swa_indptr,
         csa_indptr=None,
@@ -373,7 +373,7 @@ def test_without_block_tables_the_head_is_left_alone():
     swa_indptr = torch.tensor(np.cumsum([0] + n_per), **dev)
     write_v4_paged_decode_indices(
         state_slot_per_seq=torch.tensor(SLOTS[:1] * bs, **dev),
-        batch_id_per_token=torch.tensor(batch_id, **dev),
+        batch_id_per_q_token=torch.tensor(batch_id, **dev),
         positions=torch.tensor(positions + [0], **dev),
         swa_indptr=swa_indptr,
         csa_indptr=None,

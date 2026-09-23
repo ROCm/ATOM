@@ -95,8 +95,27 @@ def indexer_qk_rope_quant_and_cache(
     weights_scale: float,
     preshuffle: bool = False,
     is_neox: bool = True,
+    q_scale_out: torch.Tensor | None = None,
+    kv_cache_scale: torch.Tensor | None = None,
 ) -> None:
-    """Run the fused indexer cache op with ATOM's DCP query semantics."""
+    """Run the fused indexer cache op with ATOM's DCP query semantics.
+
+    The two scale buffers together switch the op to packed E2M1 + e8m0 outputs,
+    and are forwarded only when given so that an aiter predating them still
+    accepts the FP8 call -- the same version tolerance the seg-variant import
+    above keeps. One without the other would fall back to FP8 and write that
+    layout into FP4-shaped buffers, so it is refused here rather than passed on.
+    """
+    if (q_scale_out is None) != (kv_cache_scale is None):
+        raise ValueError(
+            "FP4 output needs both q_scale_out and kv_cache_scale, got only "
+            + ("q_scale_out" if q_scale_out is not None else "kv_cache_scale")
+        )
+    fp4_out = (
+        {"q_scale_out": q_scale_out, "kv_cache_scale": kv_cache_scale}
+        if q_scale_out is not None
+        else {}
+    )
     _indexer_qk_rope_quant_and_cache(
         q,
         q_out,
@@ -117,6 +136,7 @@ def indexer_qk_rope_quant_and_cache(
         preshuffle=preshuffle,
         is_neox=is_neox,
         compute_all_q_rope=get_dcp_world_size() > 1,
+        **fp4_out,
     )
 
 
@@ -470,6 +490,19 @@ if is_rocm_aiter_fp4bmm_enabled():
     from atom.model_ops.utils import quark_post_load_weights
 
 
+# Optional flydsl backend for `_kv_b_proj_gather`, gated by
+# ATOM_USE_FLYDSL_GATHER_KV_B_PROJ.
+try:
+    from aiter.ops.flydsl import (
+        gather_kv_b_proj_flydsl,
+        gather_kv_b_proj_flydsl_supported,
+    )
+
+    _FLYDSL_GATHER_AVAILABLE = True
+except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
+    _FLYDSL_GATHER_AVAILABLE = False
+
+
 # MLA Specific Arguments
 @dataclass
 class MLAModules:
@@ -661,6 +694,10 @@ class MLAAttention(nn.Module):
         # ==1 falls back to the original interleaved per-token (page_size=1)
         # kernels with an unpadded 576-wide q_out. The triton path never uses seg.
         self.use_seg_mla = (not self.use_triton_mla) and envs.ATOM_MLA_PAGE_SIZE > 1
+        self.use_flydsl_gather_kv_b_proj = bool(envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ)
+        # Resolved on the first gather, when the weights and cache exist; see
+        # `_kv_b_proj_gather`. None = not asked yet.
+        self._flydsl_gather_ok: bool | None = None
         if self.use_seg_mla:
             if envs.ATOM_MLA_PAGE_SIZE != _MLA_SEG_PAGE_SIZE:
                 raise RuntimeError(
@@ -874,6 +911,12 @@ class MLAAttention(nn.Module):
         """Undo `_pad_sparse_prefill_query_heads` on an output or per-head LSE."""
         if x.shape[1] == num_heads:
             return x
+        # Keep the `.contiguous()`. Returning the strided view instead was
+        # measured and does not help: output stays bit-identical, but
+        # aten::copy_ over the prefill is unchanged (59,717 -> 59,793 us across
+        # 154 -> 152 launches). The copy is not removed, only moved -- the PBM
+        # leg's reshape/bmm materialises it instead. Removing it for real means
+        # teaching that bmm to take a strided input, which is an aiter change.
         return x[:, :num_heads, ...].contiguous()
 
     def _pad_decode_query_heads(self, q: torch.Tensor) -> torch.Tensor:
@@ -1034,7 +1077,7 @@ class MLAAttention(nn.Module):
             self._qrep_local_src = w
         return self._qrep_local_proj
 
-    def _dcp_merge(self, o, lse, ctx=None, owned_counts=None):
+    def _dcp_merge(self, o, lse, ctx=None, owned_counts=None, quant_dtype=None):
         """Bind this layer's DCP group and backend to ``dcp_ops.dcp_lse_merge``."""
         from atom.model_ops.dcp_ops import dcp_lse_merge
 
@@ -1045,7 +1088,39 @@ class MLAAttention(nn.Module):
             self.dcp_comm_backend,
             ctx=ctx,
             owned_counts=owned_counts,
+            quant_dtype=quant_dtype,
         )
+
+    def _dcp_fused_quant_dtype(self):
+        """o_proj's activation dtype if the combine can emit it, else None.
+
+        The combine can only absorb the quant when o_proj reads its output
+        directly (PBM) and wants exactly a per-token FP8 activation. A static
+        input_scale is not a per-token scale, and the block schemes need a scale
+        per channel GROUP with a layout choice; all of those keep the standalone
+        quant kernel they have today.
+        """
+        if not self.pbm_enabled:
+            return None
+        if self.dcp_comm_backend != "a2a":
+            return None
+        op = getattr(self, "o_proj", None)
+        qt = getattr(op, "quant_type", None)
+        # QuantType is compared by .value throughout ATOM: the enum can be
+        # re-imported under a different module identity, breaking `is`/`==`.
+        if qt is None or getattr(qt, "value", None) != QuantType.per_Token.value:
+            return None
+        # Same set the sibling predicate in attention_residual.py accepts, and
+        # the layer's own spelling is what comes back: `dtypes.fp8` is e4m3fn
+        # here but e4m3fnuz on MI300, so matching one identity would skip the
+        # fusion for the other, and returning the constant rather than what the
+        # layer holds would quantize to the wrong FP8 format.
+        params_dtype = getattr(op, "params_dtype", None)
+        if params_dtype not in (dtypes.fp8, torch.float8_e4m3fn):
+            return None
+        if getattr(op, "input_scale", None) is not None:
+            return None
+        return params_dtype
 
     @mark_trace(prefix="dcp_project_merge_out", torch_compile=False)
     def _dcp_project_merge_out(
@@ -1061,13 +1136,27 @@ class MLAAttention(nn.Module):
             o = self._v_up_proj(
                 o, self.W_V_dcp, self.W_V_dcp_scale, num_heads=o.shape[1]
             )
+        # Only PBM hands the merge output straight to o_proj, so it is the only
+        # path whose activation quant the combine can absorb. The fp32 merge is
+        # a prefill-accuracy path and keeps its bf16 store.
+        fused_quant = None if merge_in_fp32 else self._dcp_fused_quant_dtype()
         if merge_in_fp32:
             dtype = o.dtype
             o = self._dcp_merge(o.float(), lse, ctx=ctx, owned_counts=owned_counts).to(
                 dtype
             )
         else:
-            o = self._dcp_merge(o, lse, ctx=ctx, owned_counts=owned_counts)
+            o = self._dcp_merge(
+                o, lse, ctx=ctx, owned_counts=owned_counts, quant_dtype=fused_quant
+            )
+        if fused_quant is not None:
+            o, o_scale = o
+            if o_scale is not None:
+                return self.o_proj(
+                    o.reshape(-1, self.num_heads * self.v_head_dim), o_scale
+                )
+            # Single-rank DCP: there was no combine to fold into, so the tensor
+            # came back unquantized and o_proj quantizes it as it always has.
         if self.pbm_enabled:
             return self.o_proj(o.reshape(-1, self.num_heads * self.v_head_dim))
         return self._v_up_proj_and_o_proj(o)
@@ -1376,17 +1465,48 @@ class MLAAttention(nn.Module):
         DCP -- and ``kv_indices`` selects rows out of it.
         """
         weight = self.kv_b_proj.weight
+        gather_weight = _maybe_view_mxfp4_weight_for_gather(self.kv_b_proj, weight)
+        weight_scale = getattr(self.kv_b_proj, "weight_scale", None)
+        preshuffled = getattr(weight, "is_shuffled", False)
+
+        # `_FLYDSL_GATHER_AVAILABLE` says the import worked, which is a different
+        # question from whether that backend serves THESE tensors: it is gfx950,
+        # page_size 1, fp8 cache and fp8 weight only. A bf16 cache (GLM-5.2), an
+        # unquantized weight (Kimi-K3) or an MXFP4 one make it raise, and that
+        # used to take the engine down rather than reach the Triton op below,
+        # which covers all of them. Every term is fixed by the weights and the
+        # cache, so ask once and keep the answer.
+        if self.use_flydsl_gather_kv_b_proj and _FLYDSL_GATHER_AVAILABLE:
+            if self._flydsl_gather_ok is None:
+                self._flydsl_gather_ok = gather_kv_b_proj_flydsl_supported(
+                    kv_buffer, gather_weight, weight_scale, k_out, v_out
+                )
+            if self._flydsl_gather_ok:
+                gather_kv_b_proj_flydsl(
+                    kv_buffer,
+                    self._k_scale,
+                    kv_indptr,
+                    kv_indices,
+                    cu_seqlens_k,
+                    gather_weight,
+                    weight_scale,
+                    k_out,
+                    v_out,
+                    weight_preshuffle=preshuffled,
+                )
+                return
+
         gather_kv_b_proj(
             kv_buffer,
             self._k_scale,
             kv_indptr,
             kv_indices,
             cu_seqlens_k,
-            _maybe_view_mxfp4_weight_for_gather(self.kv_b_proj, weight),
-            getattr(self.kv_b_proj, "weight_scale", None),
+            gather_weight,
+            weight_scale,
             k_out,
             v_out,
-            weight_preshuffle=getattr(weight, "is_shuffled", False),
+            weight_preshuffle=preshuffled,
         )
 
     def _forward_prefill_cached_chunked(
@@ -1998,11 +2118,26 @@ class MLAAttention(nn.Module):
                 "(empty KV cache?)"
             )
             if self.is_sparse_mla and self.dcp_world_size > 1:
-                o = torch.where(
-                    torch.isfinite(final_lse).unsqueeze(-1), o, torch.zeros_like(o)
-                )
+                # One kernel for what torch spelled in five.
+                #
+                # `torch.where(torch.isfinite(lse).unsqueeze(-1), o, 0.0)` costs
+                # four launches to build the mask -- torch decomposes isfinite
+                # into abs/ne/eq/mul -- plus one to apply it. The mask is a few
+                # KB, so those four are pure launch overhead: 5.5 us each,
+                # 22.3 us per layer, measured.
+                #
+                # The fifth is the expensive one and the reason for the kernel:
+                # `where` reads and rewrites every byte of `o` even though a
+                # non-finite LSE is an edge case and nearly every row survives
+                # untouched. The Triton version returns before touching `o` for
+                # a finite row.
+                from atom.model_ops.dcp_ops import zero_nonfinite_rows
+
+                zero_nonfinite_rows(o, final_lse)
             # These feed a cross-rank combine, not the bmm, so the head slice
-            # has to be materialised rather than left as a view.
+            # has to be materialised rather than left as a view. (Handing the
+            # view down instead was measured: same tokens, same copy cost --
+            # see `_restore_sparse_prefill_query_heads`.)
             return o.contiguous(), final_lse.contiguous()
 
         return self._v_up_proj_and_o_proj(o)
@@ -2951,7 +3086,7 @@ def triton_convert_req_index_to_global_index(
 def _convert_req_index_to_global_index_dsa_prefill_kernel(
     dsa_qo_indptr,  # int32 [num_tokens + 1]
     dsa_kv_indptr,  # int32 [num_tokens + 1]
-    token_to_seq_idxs,  # int32 [num_tokens]
+    batch_id_per_q_token,  # int32 [num_tokens]
     topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS]
     block_table,  # int32 [num_req, max_num_blocks_per_req]
     cu_seqlens_q,  # int32 [num_tokens + 1]
@@ -2963,6 +3098,9 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     MAX_NUM_BLOCKS_PER_REQ: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tile width along columns
+    # The FP8 indexer scores one concatenated KV plane, so a request's own
+    # position is `indice - cu_seqlens_q[req]`; the paged FP4 scorer emits it.
+    SEQ_LOCAL: tl.constexpr,
     # strides (in elements)
     ti_stride0: tl.int64,  # topk_indices stride 0
     ti_stride1: tl.constexpr,  # topk_indices stride 1
@@ -2974,7 +3112,7 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
 
     col_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    req_id = tl.load(token_to_seq_idxs + token_id)  # int32
+    req_id = tl.load(batch_id_per_q_token + token_id)  # int32
     valid_req = (req_id >= 0) & (req_id < NUM_REQ)
 
     kv_start = tl.load(dsa_kv_indptr + token_id)
@@ -2989,7 +3127,7 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     req_kv_end = tl.load(cu_seqlens_q + req_id + 1, mask=valid_req, other=0)
     req_kv_len = req_kv_end - pre_seqlens_q
 
-    seq_token_idx = indice - pre_seqlens_q
+    seq_token_idx = indice if SEQ_LOCAL else indice - pre_seqlens_q
     block_id = seq_token_idx // PAGE_SIZE
     inblock_offset = seq_token_idx % PAGE_SIZE
 
@@ -3030,7 +3168,7 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
 def triton_convert_req_index_to_global_index_dsa_prefill(
     dsa_qo_indptr: torch.Tensor,  # int32 [num_tokens + 1]
     dsa_kv_indptr: torch.Tensor,  # int32 [num_tokens + 1]
-    token_to_seq_idxs: torch.Tensor,  # int32 [num_tokens]
+    batch_id_per_q_token: torch.Tensor,  # int32 [num_tokens]
     topk_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]
     block_table: torch.Tensor,  # int32 [num_req, max_num_blocks_per_req]
     cu_seqlens_q: torch.Tensor,  # int32 [num_tokens + 1]
@@ -3039,6 +3177,7 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 1024,  # tile width along columns
     out: torch.Tensor | None = None,
+    seq_local: bool = False,
 ):
 
     assert topk_indices.shape[1] == NUM_TOPK_TOKENS
@@ -3050,12 +3189,12 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
     num_tokens = min(
         dsa_qo_indptr.shape[0] - 1,
         dsa_kv_indptr.shape[0] - 1,
-        token_to_seq_idxs.shape[0],
+        batch_id_per_q_token.shape[0],
         topk_indices.shape[0],
     )
     dsa_qo_indptr = dsa_qo_indptr[: num_tokens + 1]
     dsa_kv_indptr = dsa_kv_indptr[: num_tokens + 1]
-    token_to_seq_idxs = token_to_seq_idxs[:num_tokens]
+    batch_id_per_q_token = batch_id_per_q_token[:num_tokens]
     topk_indices = topk_indices[:num_tokens]
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
@@ -3078,7 +3217,7 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
     _convert_req_index_to_global_index_dsa_prefill_kernel[grid](
         dsa_qo_indptr,
         dsa_kv_indptr,
-        token_to_seq_idxs,
+        batch_id_per_q_token,
         topk_indices,
         block_table,
         cu_seqlens_q,
@@ -3090,6 +3229,7 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
         max_num_blocks_per_req,
         PAGE_SIZE,
         BLOCK_N,
+        seq_local,
         # strides
         ti_stride0,
         ti_stride1,
@@ -3102,7 +3242,7 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
 @triton.jit
 def _gather_kv_indices_sparse_kernel(
     sparse_kv_indptr,
-    token_to_seq_idxs,
+    batch_id_per_q_token,
     topk_indices,
     kv_indices,
     kv_indptr,
@@ -3116,7 +3256,13 @@ def _gather_kv_indices_sparse_kernel(
     tile_id = tl.program_id(1)
     col_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    req_id = tl.load(token_to_seq_idxs + token_id)
+    # `-1` marks a CUDAGraph pad token (see token_layout/batch_ids.py). Its row
+    # must be inert, and both halves of that matter: the `kv_indptr` loads would
+    # read one entry BEFORE the buffer, and the gather below would index
+    # `block_table` at row -1 for any pad row whose topk slot still holds a
+    # stale non-negative id.
+    req_id = tl.load(batch_id_per_q_token + token_id)
+    valid_req = req_id >= 0
 
     out_start = tl.load(sparse_kv_indptr + token_id)
     out_end = tl.load(sparse_kv_indptr + token_id + 1)
@@ -3124,12 +3270,12 @@ def _gather_kv_indices_sparse_kernel(
 
     pos = tl.load(topk_indices + token_id * ti_stride0 + col_id * ti_stride1)
 
-    kv_base = tl.load(kv_indptr + req_id)
-    kv_end = tl.load(kv_indptr + req_id + 1)
+    kv_base = tl.load(kv_indptr + req_id, mask=valid_req, other=0)
+    kv_end = tl.load(kv_indptr + req_id + 1, mask=valid_req, other=0)
     req_kv_len = kv_end - kv_base
 
     store_mask = (col_id < kv_len) & (col_id < NUM_TOPK_TOKENS)
-    valid_mask = store_mask & (pos >= 0) & (pos < req_kv_len)
+    valid_mask = store_mask & valid_req & (pos >= 0) & (pos < req_kv_len)
 
     out_val = tl.load(
         kv_indices + kv_base + pos,
@@ -3146,7 +3292,7 @@ def _gather_kv_indices_sparse_kernel(
 
 def triton_gather_kv_indices_sparse(
     sparse_kv_indptr: torch.Tensor,
-    token_to_seq_idxs: torch.Tensor,
+    batch_id_per_q_token: torch.Tensor,
     topk_indices: torch.Tensor,
     kv_indices: torch.Tensor,
     kv_indptr: torch.Tensor,
@@ -3162,12 +3308,12 @@ def triton_gather_kv_indices_sparse(
     # per-token inputs aligned to the actual valid intersection before launch;
     # otherwise the kernel may read past topk_indices.
     num_tokens = min(
-        token_to_seq_idxs.shape[0],
+        batch_id_per_q_token.shape[0],
         topk_indices.shape[0],
         sparse_kv_indptr.shape[0] - 1,
     )
     sparse_kv_indptr = sparse_kv_indptr[: num_tokens + 1]
-    token_to_seq_idxs = token_to_seq_idxs[:num_tokens]
+    batch_id_per_q_token = batch_id_per_q_token[:num_tokens]
     topk_indices = topk_indices[:num_tokens]
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
@@ -3184,7 +3330,7 @@ def triton_gather_kv_indices_sparse(
 
     _gather_kv_indices_sparse_kernel[grid](
         sparse_kv_indptr,
-        token_to_seq_idxs,
+        batch_id_per_q_token,
         topk_indices,
         kv_indices,
         kv_indptr,

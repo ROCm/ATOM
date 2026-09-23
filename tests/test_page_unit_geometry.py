@@ -71,8 +71,18 @@ class TestPageUnitAddressesAreArithmetic:
             block_size=self.LOGICAL_BS if block_size is None else block_size,
             state_runtime=runtime,
         )
-        stub = SimpleNamespace(model_runner=runner, _page_unit_region_cache=None)
+        # The pool stands in for the arena's `view("kv")`, re-read on every
+        # call so the tests that swap the tensor out still swap what the
+        # geometry sees.
+        stub = SimpleNamespace(
+            model_runner=runner,
+            kv_pool=SimpleNamespace(
+                cache=SimpleNamespace(view=lambda _name: runner.kv_cache)
+            ),
+            _page_unit_region_cache=None,
+        )
         for name in (
+            "_page_unit_kv_cache",
             "_page_unit_index_cache",
             "_page_unit_regions",
             "_page_unit_bases",

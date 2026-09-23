@@ -7,7 +7,9 @@ concurrency list; see ``catalog.build_cell_configs``) to ``$GITHUB_OUTPUT`` as
 ``configs_json`` plus a ``has_cells`` flag.
 
 Behaviour by event:
-- ``schedule``      -> all models, catalog ``default_scenarios`` (nightly grid).
+- ``schedule``      -> all models, catalog ``default_scenarios`` filtered by
+  ``CADENCE`` (the workflow derives it from which cron fired: the nightly grid,
+  or the weekly one).
 - ``workflow_dispatch`` -> only models whose checkbox is ticked, workload from
   the ``param_lists`` input. Also validates that the dispatch model checkboxes
   stay in sync with the catalog prefixes (fails fast on drift).
@@ -38,6 +40,7 @@ DEFAULT_PARAM_LISTS = "1024,1024,128,0.8"
 # independent of the random model grid. Keys map to catalog prefixes; the map
 # must cover exactly the catalog's agentic prefixes (asserted in the tests).
 AGENTIC_MODEL_INPUTS = {
+    "agentic_deepseek_v41flash": "deepseek-v41-flash-agentic",
     "agentic_deepseek_v4pro": "deepseek-v4-pro",
     "agentic_m3_mxfp4": "m3-mxfp4-agentic",
 }
@@ -55,6 +58,7 @@ RESERVED_INPUTS = {
     "enable_rtl",
     "param_lists",
     "atom_commit",
+    "aiter_commit",
     "publish_to_dashboard",
 }
 
@@ -108,6 +112,12 @@ def main() -> int:
     event = os.environ.get("EVENT_NAME", "")
     inputs = json.loads(os.environ.get("INPUTS_JSON") or "{}")
 
+    # Which slice of `default_scenarios` this run wants. Set by the workflow off
+    # the cron that fired; unset means no filter. Only the schedule path reads
+    # it -- a dispatch always carries `param_lists`, which replaces the catalog
+    # scenarios outright.
+    cadence = os.environ.get("CADENCE") or None
+
     if event == "schedule":
         model_filter = None
         param_lists = None
@@ -137,6 +147,8 @@ def main() -> int:
     env_filter = os.environ.get("BENCH_KIND_FILTER", "")
     if env_filter:
         bench_kinds = {k for k in env_filter.split(",") if k}
+        if os.environ.get("MODEL_FILTER"):
+            model_filter = set(os.environ["MODEL_FILTER"].split(","))
     elif event != "schedule" and agentic_models:
         # EXCLUSIVE over bench_kind: only agentic variants run, never the random
         # sweep in the same dispatch (mixing a few random cells into an agentic
@@ -168,13 +180,12 @@ def main() -> int:
         model_filter=model_filter,
         bench_kind_filter=bench_kinds,
         conc_filter=conc_filter,
+        cadence=cadence,
     )
     if conc_filter and not configs:
-        # The box is free text, so this is usually a typo rather than catalog
-        # drift. Fail loudly and name what IS runnable: `has_cells=false` would
-        # just skip the run in silence and look like a passing dispatch.
         available = sorted(
-            {c["conc"] for c in build_cells(CATALOG, bench_kind_filter=bench_kinds)}
+            {c["conc"] for c in build_cells(CATALOG, bench_kind_filter=bench_kinds,
+                                           model_filter=model_filter)}
         )
         print(
             f"ERROR: no agentic cells at concurrency {sorted(conc_filter)}. "
@@ -183,14 +194,19 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    if event == "schedule" and not configs:
+        print(f"ERROR: no cells for cadence {cadence!r} and model filter "
+              f"{model_filter!r}", file=sys.stderr)
+        return 1
     _emit(configs)
 
     n_cells = sum(len(json.loads(c["concurrency"])) for c in configs)
     n_models = len({c["prefix"] for c in configs})
     n_total = len(load_variants(CATALOG))
     print(
-        f"Event={event}: {n_cells} cells across {n_models} models "
-        f"-> {len(configs)} matrix configs ({n_total} variants in catalog)",
+        f"Event={event} cadence={cadence or 'all'}: {n_cells} cells across "
+        f"{n_models} models -> {len(configs)} matrix configs "
+        f"({n_total} variants in catalog)",
         file=sys.stderr,
     )
     return 0

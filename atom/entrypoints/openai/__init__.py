@@ -6,6 +6,9 @@
 
 def main():
     """Lazy entry point to avoid importing heavy deps at package level."""
+    from atom.metrics.prometheus import initialize_metrics
+
+    initialize_metrics()
     from .api_server import main as _main
 
     _main()

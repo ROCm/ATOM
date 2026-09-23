@@ -42,8 +42,17 @@ def _make_block_stored(
     parent: int | None,
     block_size: int,
     medium: str = MEDIUM_GPU,
+    token_offset: int | None = None,
 ) -> BlockStored:
-    """Construct a BlockStored event from a coalesced run of new blocks."""
+    """Construct a BlockStored event from a coalesced run of new blocks.
+
+    `token_offset` is the sequence position of the first token of the run's
+    first block, so consumers can map block i to
+    `[token_offset + i*block_size, token_offset + (i+1)*block_size)`.
+    `block_size` here is the hash block size (block_size * dcp_world_size),
+    the span of one block-table entry in global tokens, so the offset must be
+    computed in the same unit.
+    """
     # A list, not the `array("i")` the publish paths carry: the event is
     # msgpack-encoded and msgspec has no encoding for an array. The publisher
     # counts encode failures rather than raising, so an array here takes the
@@ -57,6 +66,7 @@ def _make_block_stored(
         token_ids=tokens,
         block_size=block_size,
         medium=medium,
+        token_offset=token_offset,
     )
 
 
@@ -131,7 +141,12 @@ class BlockManager:
         # The compressed KV blocks. Same class the sliding window uses for its
         # own index space — hash eviction has to happen at the same moment in
         # both or a prefix hit could be honoured by one pool and not the other.
-        self.kv = BlockPool(num_blocks, on_evict=self._record_evicted)
+        self.kv = BlockPool(
+            num_blocks,
+            on_evict=self._record_evicted,
+            cache_policy=envs.ATOM_PREFIX_CACHE_POLICY,
+            protected_ratio=envs.ATOM_PREFIX_CACHE_PROTECTED_RATIO,
+        )
         # Per-request cache slot pool. Used by attention types with a
         # stateful per-request buffer (GDN recurrent state, V4 compressor
         # state). The backing tensor is pre-allocated by ModelRunner and
@@ -840,7 +855,7 @@ class BlockManager:
         caller's loop variable holds a hash that is not in the chain.
         """
         chain = list(block_hashes)
-        h = chain[-1] if chain else -1
+        h = chain[-1] if chain else seq.cache_seed
         for i in range(len(chain), blocks):
             h = self.compute_hash(self._hash_block_tokens(seq, i), h)
             chain.append(h)
@@ -882,7 +897,7 @@ class BlockManager:
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
         # read the WHOLE history, so this stays a full front-to-back chained
         # match). Record each block's hash for the SWA scan below.
-        h = -1
+        h = seq.cache_seed
         compressed_hit = 0
         block_hashes: list[int] = []
         for i in range(self._n_hash_blocks(seq) - 1):
@@ -1000,7 +1015,7 @@ class BlockManager:
             num_cached_blocks,
             int(seq.offload_joint.claim_tokens or 0) // hbs,
         )
-        h = -1
+        h = seq.cache_seed
         hit_hash = -1
         for i in range(claim_blocks):
             token_ids = self._hash_block_tokens(seq, i)
@@ -1546,7 +1561,7 @@ class BlockManager:
         source-level bug; callers skip the range rather than mint false hashes.
         """
         if start <= 0:
-            return -1
+            return seq.cache_seed
         h = self.kv.block(seq.block_table[start - 1]).hash
         if h != -1:
             return h
@@ -1619,7 +1634,8 @@ class BlockManager:
                     store_run_hashes,
                     store_run_tokens,
                     store_run_parent,
-                    self.hash_block_size,
+                    hbs,
+                    token_offset=start * hbs,
                 )
             )
         pos = base + num_new_tokens
@@ -2397,7 +2413,8 @@ class BlockManager:
                             # into a list already. See `_make_block_stored`.
                             list(token_ids),
                             parent_hash if parent_hash != -1 else None,
-                            self.hash_block_size,
+                            hbs,
+                            token_offset=i * hbs,
                         )
                     )
 
@@ -2458,6 +2475,64 @@ class BlockManager:
         # output does not publish the same physical blocks again.
         seq.prefix_hashes_published = True
         return num_full - start
+
+    def deallocate_partial(
+        self, seq: Sequence, protected_block_ids: frozenset[int]
+    ) -> None:
+        """Deallocate `seq` now, except block IDs a pending offload save reads.
+
+        Used by the offload early-block-release path (see
+        `DenseOffloadScheduler.protected_block_ids`) instead of deferring the
+        whole request behind `deferred_free_blocks`: everything in
+        `seq.block_table` that is *not* in `protected_block_ids` -- decode
+        blocks, an unaligned prompt tail, already-saved ranges, or any other
+        block the in-flight save never reads -- is returned to `BlockPool`
+        immediately, same as `deallocate`. `protected_block_ids` must already
+        be frozen by the caller (from the connector's exact block-range for the
+        in-flight `SaveOperationId`) before this clears `seq.block_table`.
+
+        Each protected block is first ``claim``ed for the save lease, then the
+        request is deallocated normally. This makes ownership explicit: shared
+        prefix blocks retain their other owners, while the save owns exactly
+        one refcount share until ``free_leased_blocks`` releases it.
+        """
+        if seq.has_per_req_cache:
+            # Per-request recurrent state (GDN/hybrid checkpoints) has release
+            # ordering this simplified path never replicates (orphan load
+            # slots, `state_offload.abandon_load`, fork-source pins -- see
+            # `deallocate` below). Not reachable today: every offload connector
+            # that can drive early release sets `_permit_per_request_state =
+            # False` and rejects such a model at `register_kv_caches`. Kept as
+            # an explicit guard rather than a silent skip, so a future
+            # hybrid connector that both permits per-request state and enables
+            # early release fails loudly here instead of freeing a leased PAGE
+            # or leaking a state slot.
+            raise RuntimeError(
+                "partial PAGE deallocation is unsupported for per-request state"
+            )
+        table = set(seq.block_table)
+        unknown = set(protected_block_ids) - table
+        if unknown:
+            raise ValueError(
+                f"cannot lease blocks not owned by seq {seq.id}: {sorted(unknown)}"
+            )
+        for block_id in protected_block_ids:
+            self.kv.claim(block_id)
+        self.deallocate(seq)
+
+    def free_leased_blocks(self, block_ids) -> None:
+        """Return block IDs a `deallocate_partial` lease held back, to the pool.
+
+        Called once the offload connector reports the exact save generation
+        that read `block_ids` as source-safe (`take_source_safe_releases`) or
+        reclaims it after a stall (`reclaim_stale_leases`). Idempotent only in
+        the sense that the connector guarantees each block ID is surfaced by
+        exactly one of `take_source_safe_releases` / `reclaim_stale_leases` for
+        one lease -- calling this twice for the same ID double-frees the block,
+        same as calling `BlockPool.free` twice would.
+        """
+        for block_id in block_ids:
+            self.kv.free(block_id)
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
@@ -2588,11 +2663,14 @@ class BlockManager:
         block_hashes: list[int],
         token_ids: list[int],
         parent_block_hash: int | None = None,
+        token_offset: int | None = None,
     ) -> None:
         """Emit a BlockStored(medium=REMOTE) for blocks received from a remote
         KV transfer producer (Mooncake/MoriIO decode side). Called by the
         KVConnector worker once the transfer completes so external KV-cache
-        consumers (LMCache, etc.) can track remote-resident blocks."""
+        consumers (LMCache, etc.) can track remote-resident blocks.
+
+        `token_offset` is the sequence position of the first remote block."""
         if self._event_log is None or not block_hashes:
             return
         self._event_log.append(
@@ -2602,5 +2680,6 @@ class BlockManager:
                 parent_block_hash,
                 self.hash_block_size,
                 medium=MEDIUM_REMOTE,
+                token_offset=token_offset,
             )
         )

@@ -46,6 +46,7 @@ from atom.kv_transfer.disaggregation.types import (
     SaveOperationId,
     StateStoreOperationId,
 )
+from atom.kv_transfer.offload import _block_gpu_connector
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
@@ -60,6 +61,7 @@ from atom.kv_transfer.offload.hybrid.dsv4 import policy as connector_module
 from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
 from atom.kv_transfer.offload.hybrid.dsv4.connector import (
     DSV4_CHECKPOINT_SAVE_CHANNEL,
+    DSV4_PAGE_SAVE_CHANNEL,
 )
 from atom.kv_transfer.offload.hybrid.dsv4.connector import (
     DSV4OffloadConnector as LMCacheOffloadConnector,
@@ -159,6 +161,7 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._load_lifecycles = {}
     sched._active_load_operations = {}
     sched._save_inflight = {}
+    sched._save_watermark_rollback = {}
     sched._lookup_in_step = []
     sched._handoff_loads = set()
     sched.hash_block_size = 4
@@ -172,6 +175,8 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._sidecar_hash_cache = {}
     sched._load_inflight_tokens = {}
     sched._save_inflight_tokens = {}
+    sched._load_failed_seqs = {}
+    sched.total_suppressed_load_retries = 0
     sched.total_load_requests = 0
     sched.total_loaded_tokens = 0
     sched.total_load_failures = 0
@@ -339,9 +344,56 @@ def _install_fake_fused_chunk_major(codec: DenseKVByteCodec) -> None:
                 seg.index_copy_(0, idx, src)
                 offset += count * nbytes
 
+    prepared_groups = []
+    prepared_pack_indices = []
+    prepared_unpack_indices = []
+
+    def _prepare(segments, seg_block_bytes, groups, device):
+        normalized = tuple(
+            (tuple(chunk_block_counts), tuple(flat_block_ids))
+            for chunk_block_counts, flat_block_ids in groups
+        )
+        prepared_groups.append(normalized)
+        return SimpleNamespace(
+            segments=segments,
+            seg_block_bytes=seg_block_bytes,
+            groups=normalized,
+            device=device,
+            group_count=len(normalized),
+            upload_count=int(any(ids for _counts, ids in normalized)),
+        )
+
+    def _pack_prepared(prepared, group_index, device_buf):
+        prepared_pack_indices.append(group_index)
+        counts, ids = prepared.groups[group_index]
+        _pack(
+            prepared.segments,
+            prepared.seg_block_bytes,
+            counts,
+            ids,
+            device_buf,
+        )
+
+    def _unpack_prepared(prepared, group_index, device_buf):
+        prepared_unpack_indices.append(group_index)
+        counts, ids = prepared.groups[group_index]
+        _unpack(
+            device_buf,
+            prepared.segments,
+            prepared.seg_block_bytes,
+            counts,
+            ids,
+        )
+
     codec._fused_kv_staging = SimpleNamespace(
         fused_pack_chunk_major=_pack,
         fused_unpack_chunk_major=_unpack,
+        prepare_chunk_major_groups=_prepare,
+        fused_pack_chunk_major_prepared=_pack_prepared,
+        fused_unpack_chunk_major_prepared=_unpack_prepared,
+        prepared_groups=prepared_groups,
+        prepared_pack_indices=prepared_pack_indices,
+        prepared_unpack_indices=prepared_unpack_indices,
     )
 
 
@@ -376,6 +428,10 @@ def _dense_registration_connector() -> DenseOffloadConnector:
     connector._engine = None
     connector._codec = None
     connector._lookup_server = None
+    # `register_kv_caches` logs the pool widths, which a real worker sets in
+    # `__init__`; this connector is built through `__new__`.
+    connector.save_workers = 1
+    connector.load_workers = 1
     return connector
 
 
@@ -983,6 +1039,155 @@ def test_dense_codec_rejects_per_request_state_by_default():
     assert codec.num_blocks == 6
 
 
+# --- FP4 sparse indexer: the index region is two planes -------------------
+#
+# `--index_cache_dtype fp4` stores the indexer keys as packed E2M1 plus a
+# separate e8m0 exponent plane (`mla_kv_pool.py` declares both). A codec that
+# moves the keys without the exponents restores a prefix whose every index is
+# still in bounds and whose scoring is wrong -- so these pin that both planes
+# are in the moved bytes, not just that registration succeeded.
+
+_FP4_ROWS = 64  # FP4_KV_BLOCK_SIZE
+_FP4_K_TILES = 1  # index_head_dim 128 // _K_TILE 128
+_FP4_NTPW = 4
+
+
+def _fp4_index_kv_caches(torch, num_blocks, *, with_scale=True):
+    """One DSA layer shaped like the FP4 pool's two index planes.
+
+    Shapes follow `fp4_index_block_shapes(64, 128)`: data
+    `(k_tiles, 4, rows, 16)` and scale `(k_tiles, 4, rows)`, both uint8, with
+    the pool's block axis outermost.
+    """
+    gen = torch.arange
+    kv = (gen(num_blocks * _FP4_ROWS * 16, dtype=torch.uint8) % 251).reshape(
+        num_blocks, _FP4_ROWS, 16
+    )
+    index = (
+        gen(num_blocks * _FP4_K_TILES * _FP4_NTPW * _FP4_ROWS * 16, dtype=torch.uint8)
+        % 241
+    ).reshape(num_blocks, _FP4_K_TILES, _FP4_NTPW, _FP4_ROWS, 16)
+    scale = (
+        gen(num_blocks * _FP4_K_TILES * _FP4_NTPW * _FP4_ROWS, dtype=torch.uint8) % 239
+        + 3
+    ).reshape(num_blocks, _FP4_K_TILES, _FP4_NTPW, _FP4_ROWS)
+    return {
+        "l0": SimpleNamespace(
+            k_cache=kv,
+            v_cache=None,
+            k_scale=None,
+            v_scale=None,
+            index_cache=index,
+            index_scale=scale if with_scale else None,
+        )
+    }
+
+
+def test_dense_codec_moves_the_fp4_index_scale_plane():
+    """A store/restore cycle must bring the e8m0 plane back with the keys.
+
+    The planes are zeroed between pack and unpack because that is what the
+    cycle this codec serves actually does to them -- the blocks are freed and
+    handed to another request before the restore. Asserting round-trip
+    equality without the zeroing would pass on a codec that never moved the
+    scale plane at all: it would simply still be holding its original bytes.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    num_blocks = 4
+    original = _fp4_index_kv_caches(torch, num_blocks)
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=original["l0"].k_cache.clone(),
+            v_cache=None,
+            k_scale=None,
+            v_scale=None,
+            index_cache=original["l0"].index_cache.clone(),
+            index_scale=original["l0"].index_scale.clone(),
+        )
+    }
+
+    codec = DenseKVByteCodec(kv_caches)
+
+    # Three planes move, not two, and the block price counts all three.
+    assert len(codec._segments) == 3
+    assert codec.num_blocks == num_blocks
+    assert codec.bytes_per_block == sum(
+        t.numel() // num_blocks
+        for t in (
+            kv_caches["l0"].k_cache,
+            kv_caches["l0"].index_cache,
+            kv_caches["l0"].index_scale,
+        )
+    )
+
+    _install_fake_fused_chunk_major(codec)
+    block_ids = list(range(num_blocks))
+    device_buf = torch.empty(
+        codec.bytes_per_block * num_blocks, dtype=torch.uint8, device=codec.device
+    )
+    codec.gpu_to_chunk_major_device_buffer(device_buf, [block_ids])
+
+    # The blocks are reused by someone else before the restore.
+    for plane in ("k_cache", "index_cache", "index_scale"):
+        getattr(kv_caches["l0"], plane).zero_()
+
+    codec.chunk_major_device_buffer_to_gpu(device_buf, [block_ids])
+
+    for plane in ("k_cache", "index_cache", "index_scale"):
+        assert torch.equal(
+            getattr(kv_caches["l0"], plane), getattr(original["l0"], plane)
+        ), f"{plane} did not survive the store/restore cycle"
+
+
+def test_dense_codec_orders_the_fp4_scale_plane_after_its_keys():
+    """Segment order is the on-disk byte layout, so it is part of the contract.
+
+    Reordering these silently reinterprets every chunk already in a tier that
+    `build_page_namespace` still considers the same domain -- the namespace
+    document has no segment order in it. A reorder has to bump
+    `PAGE_LAYOUT_VERSION`, and this is what makes that deliberate.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    kv_caches = _fp4_index_kv_caches(torch, 4)
+    codec = DenseKVByteCodec(kv_caches)
+
+    layer = kv_caches["l0"]
+    assert [s.data_ptr() for s in codec._segments] == [
+        layer.k_cache.data_ptr(),
+        layer.index_cache.data_ptr(),
+        layer.index_scale.data_ptr(),
+    ]
+
+
+def test_dense_codec_fp8_indexer_layout_is_unchanged():
+    """FP8 has one index plane and must keep the byte layout it already has.
+
+    `index_scale` is None on every non-FP4 layer, and the FP8 caches already
+    written to a tier have to stay readable.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    kv_caches = _fp4_index_kv_caches(torch, 4, with_scale=False)
+    codec = DenseKVByteCodec(kv_caches)
+
+    layer = kv_caches["l0"]
+    assert len(codec._segments) == 2
+    assert codec.bytes_per_block == (
+        layer.k_cache.numel() // 4 + layer.index_cache.numel() // 4
+    )
+
+
 def test_lmcache_connector_maps_dcp_ranges_on_virtual_block_grid():
     import torch
 
@@ -1109,6 +1314,88 @@ def test_staged_pipeline_allocates_on_first_consumer_stream(
         ("run", "a", first_stream_name),
     ]
     assert ("run", "b", second_stream_name) in trace
+
+
+@pytest.mark.parametrize("shared_stream", [True, False])
+def test_staged_pipeline_skips_the_handshake_on_a_shared_stream(shared_stream):
+    """One stream orders the stages itself, so it must issue no event calls.
+
+    Not a cosmetic saving: every one of those calls enters the GPU runtime and
+    releases the GIL, and it is charged once per staging group.
+    """
+    from atom.kv_transfer.offload.atom_lmcache_staging import (
+        _PipelineStage,
+        run_staged_pipeline,
+    )
+
+    calls = []
+
+    class _FakeStream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_event(self, event):
+            calls.append(("wait", event.name))
+
+        def synchronize(self):
+            pass
+
+    class _FakeEvent:
+        def __init__(self, name):
+            self.name = name
+
+        def record(self, stream):
+            calls.append(("record", self.name))
+
+    class _FakeState:
+        def __init__(self):
+            self.staging_buffer = SimpleNamespace(
+                tensor=None,
+                ready_event=_FakeEvent("ready"),
+                free_event=_FakeEvent("free"),
+                free_event_valid=False,
+            )
+
+        def stream_ctx(self, stream):
+            return nullcontext()
+
+    state = _FakeState()
+    pack = _FakeStream("pack")
+    copy = pack if shared_stream else _FakeStream("copy")
+    ran = []
+
+    # Three groups: the free-event wait only appears from the second onwards,
+    # so a single group would not distinguish the two modes.
+    run_staged_pipeline(
+        state,
+        [SimpleNamespace(nbytes=8) for _ in range(3)],
+        stage_a=_PipelineStage(pack, lambda group, buf: ran.append("a")),
+        stage_b=_PipelineStage(copy, lambda group, buf: ran.append("b")),
+        ensure_buffer=lambda _buffer, _nbytes: object(),
+        group_nbytes=lambda group: group.nbytes,
+    )
+
+    assert ran == ["a", "b"] * 3
+    if shared_stream:
+        assert calls == []
+        # A recorded-event flag that outlived its event would gate a later
+        # transfer on something that was never recorded.
+        assert state.staging_buffer.free_event_valid is False
+    else:
+        assert calls == [
+            ("record", "ready"),
+            ("wait", "ready"),
+            ("record", "free"),
+            ("wait", "free"),
+            ("record", "ready"),
+            ("wait", "ready"),
+            ("record", "free"),
+            ("wait", "free"),
+            ("record", "ready"),
+            ("wait", "ready"),
+            ("record", "free"),
+        ]
+        assert state.staging_buffer.free_event_valid is True
 
 
 def _exception_pipeline(monkeypatch, direction: str, *, failed_stream: str | None):
@@ -1285,8 +1572,14 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
 
     if not hasattr(torch, "arange"):
         pytest.skip("real torch is unavailable")
+    # The fast path under test runs its copies inside `torch.cuda.stream()`,
+    # so it needs a device even though what it asserts is a layout.
+    if not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required")
 
-    monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "2")
+    # Force two physical pipeline groups so Dense must prepare all groups in
+    # one metadata upload and launch each group by index.
+    monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "1")
     original = {
         "l0": SimpleNamespace(
             k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
@@ -1306,32 +1599,10 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
     codec = DenseKVByteCodec(kv_caches)
     connector = BlockGPUConnector(codec, block_size=4, chunk_size=8)
     _install_fake_fused_chunk_major(codec)
+    fused = codec._fused_kv_staging
     monkeypatch.setattr(connector, "_assert_fused_chunk_major_available", lambda: None)
 
-    pack_groups = []
-    unpack_groups = []
     buffer_requests = []
-
-    monkeypatch.setattr(
-        codec,
-        "gpu_to_chunk_major_device_buffer",
-        lambda device_buf, block_id_groups, stream=None: (
-            pack_groups.append([list(group) for group in block_id_groups]),
-            DenseKVByteCodec.gpu_to_chunk_major_device_buffer(
-                codec, device_buf, block_id_groups, stream=None
-            ),
-        )[-1],
-    )
-    monkeypatch.setattr(
-        codec,
-        "chunk_major_device_buffer_to_gpu",
-        lambda device_buf, block_id_groups, stream=None: (
-            unpack_groups.append([list(group) for group in block_id_groups]),
-            DenseKVByteCodec.chunk_major_device_buffer_to_gpu(
-                codec, device_buf, block_id_groups, stream=None
-            ),
-        )[-1],
-    )
     orig_ensure_staging_buffer = connector._ensure_staging_buffer
 
     def _ensure_staging_buffer(staging_buffer, nbytes):
@@ -1341,25 +1612,19 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
 
     monkeypatch.setattr(connector, "_ensure_staging_buffer", _ensure_staging_buffer)
 
-    class _FakeEvent:
-        def record(self, stream) -> None:
-            pass
-
-    class _FakeStream:
-        def wait_event(self, event) -> None:
-            pass
-
-        def synchronize(self) -> None:
-            pass
-
     class _FakeState:
         def __init__(self) -> None:
-            self.pack_stream = _FakeStream()
-            self.copy_stream = _FakeStream()
+            # Real streams and events, not doubles: the connector hands these
+            # to `torch.cuda.stream()` and to `Stream.wait_event`, which read a
+            # good deal more of those protocols than a double is worth
+            # reimplementing (device, stream_id, Event.wait ...). Nothing this
+            # test asserts needs them recorded.
+            self.pack_stream = torch.cuda.Stream()
+            self.copy_stream = torch.cuda.Stream()
             self.staging_buffer = SimpleNamespace(
                 tensor=None,
-                ready_event=_FakeEvent(),
-                free_event=_FakeEvent(),
+                ready_event=torch.cuda.Event(),
+                free_event=torch.cuda.Event(),
                 free_event_valid=False,
             )
 
@@ -1396,9 +1661,12 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
             original["l0"].v_cache[[3]].reshape(-1),
         ]
     )
-    assert pack_groups == [[[1, 2], [3]]]
-    assert all(nbytes <= 4 * codec.bytes_per_block for nbytes, _ in buffer_requests)
-    assert all(capacity == 4 * codec.bytes_per_block for _, capacity in buffer_requests)
+    # Save staging is tail-to-head, but every MemoryObj still receives the
+    # bytes for its original exact range.
+    assert fused.prepared_groups == [(((1,), (3,)), ((2,), (1, 2)))]
+    assert fused.prepared_pack_indices == [0, 1]
+    assert all(nbytes <= 2 * codec.bytes_per_block for nbytes, _ in buffer_requests)
+    assert all(capacity == 2 * codec.bytes_per_block for _, capacity in buffer_requests)
     assert torch.equal(memory_objs[0].tensor, expected0)
     assert torch.equal(memory_objs[1].tensor, expected1)
 
@@ -1411,12 +1679,21 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
         block_ids=[0, 1, 2, 3, 4, 5],
     )
 
-    assert unpack_groups == [[[1, 2], [3]]]
+    # Load/retrieve remains in ordinary head-to-tail order.
+    assert fused.prepared_groups == [
+        (((1,), (3,)), ((2,), (1, 2))),
+        (((2,), (1, 2)), ((1,), (3,))),
+    ]
+    assert fused.prepared_unpack_indices == [0, 1]
     for bid in [1, 2, 3]:
         assert torch.equal(kv_caches["l0"].k_cache[bid], original["l0"].k_cache[bid])
         assert torch.equal(kv_caches["l0"].v_cache[bid], original["l0"].v_cache[bid])
     assert torch.count_nonzero(kv_caches["l0"].k_cache[0]) == 0
     assert torch.count_nonzero(kv_caches["l0"].v_cache[0]) == 0
+    stats = connector.last_transfer_stats()
+    assert stats["batch_block_ids_enabled"] == 1
+    assert stats["batch_id_groups"] == 2
+    assert stats["batch_id_uploads"] == 1
 
 
 def test_lmcache_connector_requires_fused_chunk_major_staging():
@@ -1502,14 +1779,10 @@ def test_lmcache_connector_respects_staging_buffer_chunks_env(monkeypatch):
     assert connector._thread_state().staging_buffer.tensor is None
 
 
-def test_lmcache_connector_default_staging_buffer_chunks_is_two(monkeypatch):
+def _tiny_staging_codec():
+    """A codec with one block per LMCache chunk and a very small chunk."""
     import torch
 
-    if not hasattr(torch, "arange"):
-        pytest.skip("real torch is unavailable")
-
-    monkeypatch.delenv("OFFLOAD_GPU_STAGING_CHUNKS", raising=False)
-    monkeypatch.delenv("OFFLOAD_GPU_STAGING_MAX_BYTES", raising=False)
     kv_caches = {
         "l0": SimpleNamespace(
             k_cache=torch.arange(2 * 2, dtype=torch.uint8).reshape(2, 2),
@@ -1518,11 +1791,85 @@ def test_lmcache_connector_default_staging_buffer_chunks_is_two(monkeypatch):
             v_scale=None,
         )
     }
-    codec = DenseKVByteCodec(kv_caches)
+    return DenseKVByteCodec(kv_caches)
+
+
+def _clear_staging_env(monkeypatch):
+    monkeypatch.delenv("OFFLOAD_GPU_STAGING_CHUNKS", raising=False)
+    monkeypatch.delenv("OFFLOAD_GPU_STAGING_MAX_BYTES", raising=False)
+
+
+def test_default_staging_buffer_is_sized_in_bytes_not_chunks(monkeypatch):
+    """The default buys a fixed number of bytes, whatever a chunk happens to be.
+
+    This is the whole point of the byte-denominated default: two KV geometries
+    with different bytes-per-chunk must end up with the same buffer size, not
+    the same chunk count.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    _clear_staging_env(monkeypatch)
+    codec = _tiny_staging_codec()
+    chunk_bytes = codec.bytes_per_block  # block_size == chunk_size below
+    monkeypatch.setattr(
+        _block_gpu_connector, "_DEFAULT_GPU_STAGING_BYTES", 4 * chunk_bytes
+    )
+
+    connector = BlockGPUConnector(codec, block_size=4, chunk_size=4)
+
+    assert connector.gpu_staging_chunk_bytes == chunk_bytes
+    assert connector.gpu_staging_buffer_chunks == 4
+    assert connector.gpu_staging_buffer_bytes == 4 * chunk_bytes
+
+
+def test_default_staging_buffer_never_drops_below_two_chunks(monkeypatch):
+    """A geometry whose single chunk already exceeds the target keeps two.
+
+    The byte target raises the floor for small-chunk models; it must not cut
+    large-chunk models down to a single chunk, which would be worse than the
+    chunk-denominated default they have today.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    _clear_staging_env(monkeypatch)
+    codec = _tiny_staging_codec()
+    monkeypatch.setattr(
+        _block_gpu_connector, "_DEFAULT_GPU_STAGING_BYTES", codec.bytes_per_block // 2
+    )
+
     connector = BlockGPUConnector(codec, block_size=4, chunk_size=4)
 
     assert connector.gpu_staging_buffer_chunks == 2
-    assert connector.gpu_staging_buffer_bytes == 2 * connector.gpu_staging_chunk_bytes
+
+
+def test_default_staging_buffer_chunk_count_is_capped(monkeypatch):
+    """A tiny chunk must not turn the byte target into an unbounded count.
+
+    The buffer is allocated at its full size, so the chunk count is what bounds
+    per-group work; without a cap a geometry with a very small chunk would ask
+    for millions of them.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    _clear_staging_env(monkeypatch)
+    codec = _tiny_staging_codec()
+    monkeypatch.setattr(_block_gpu_connector, "_DEFAULT_GPU_STAGING_BYTES", 1 << 30)
+
+    connector = BlockGPUConnector(codec, block_size=4, chunk_size=4)
+
+    assert (
+        connector.gpu_staging_buffer_chunks
+        == _block_gpu_connector._MAX_DEFAULT_GPU_STAGING_CHUNKS
+    )
 
 
 def test_codec_chunk_major_device_buffer_layout():
@@ -1650,6 +1997,41 @@ def test_codec_chunk_major_rejects_duplicate_block_ids():
 
     with pytest.raises(ValueError, match="duplicate block ids"):
         codec.gpu_to_chunk_major_device_buffer(device_buf, [[0, 1], [1]])
+
+
+def test_dense_prepared_ids_preserve_per_pipeline_group_validation():
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
+            v_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
+            k_scale=None,
+            v_scale=None,
+        )
+    }
+    codec = DenseKVByteCodec(kv_caches)
+    _install_fake_fused_chunk_major(codec)
+    stream = object()
+
+    # A physical block may recur after the preceding pipeline group has been
+    # fenced/reused, matching the legacy per-group validation contract.
+    owner = codec.prepare_block_id_groups(
+        [[[0, 1]], [[1, 2]]], device=codec.device, stream=stream
+    )
+    assert owner.group_count == 2
+    assert owner.upload_count == 1
+    assert codec._fused_kv_staging.prepared_groups == [(((2,), (0, 1)), ((2,), (1, 2)))]
+
+    # Repetition inside one pipeline group is still rejected before upload.
+    with pytest.raises(ValueError, match="duplicate block ids"):
+        codec.prepare_block_id_groups(
+            [[[0, 1], [1]]], device=codec.device, stream=stream
+        )
+    assert len(codec._fused_kv_staging.prepared_groups) == 1
 
 
 def test_scheduler_alignment_uses_dcp_hash_blocks_and_lmcache_chunks(monkeypatch):
@@ -2552,6 +2934,149 @@ def test_save_callbacks_clear_only_matching_operation_generation():
     assert sched.should_defer_free(seq) is False
 
 
+def _page_completion(operation, *, succeeded: bool) -> ConnectorCompletion:
+    return ConnectorCompletion(DSV4_PAGE_SAVE_CHANNEL, operation, succeeded)
+
+
+def test_failed_page_save_rolls_the_watermark_back_and_re_emits():
+    """A PAGE save that never lands must not leave its range skipped forever.
+
+    The watermark is advanced where the save is *emitted*, so a save dropped on
+    admission takes a range of the prefix with it: every later incremental save
+    skips it, the PAGE boundary can never become visible, and SLOT publication
+    times out for the rest of the sequence's life. The scheduler only learns
+    this from the PAGE channel -- `finished_saving` reports the drop and the
+    success identically.
+    """
+    sched = _scheduler()
+    seq = SimpleNamespace(
+        id=730,
+        token_ids=list(range(16)),
+        block_table=[1, 2, 3, 4],
+        num_prompt_tokens=16,
+        num_cached_tokens=8,
+        has_per_req_cache=False,
+    )
+    sched._save_tracker["730"] = [seq, 0]
+
+    first = sched.build_connector_meta().requests[0]
+    assert first.save_spec.skip_leading_tokens == 0
+    assert sched._save_tracker["730"][1] == 8
+
+    # The worker dropped it (max_pending_saves). Nothing was persisted.
+    assert (
+        sched.connector_completion(
+            _page_completion(first.save_operation, succeeded=False)
+        )
+        is True
+    )
+    assert sched._save_tracker["730"][1] == 0
+    # Failure must not be counted as saved bytes.
+    assert sched.total_saved_tokens == 0
+
+    # `save_finished` still arrives, and clears the operation so the next step
+    # is free to re-emit the range the drop left behind.
+    sched.save_finished(first.save_operation)
+    assert sched._save_inflight == {}
+    assert sched.total_saved_tokens == 0
+
+    retry = sched.build_connector_meta().requests[0]
+    assert retry.save_operation != first.save_operation
+    assert retry.save_spec.skip_leading_tokens == 0
+    assert retry.token_ids == list(range(8))
+
+    # This one lands: the advance stands and the record is retired.
+    assert (
+        sched.connector_completion(
+            _page_completion(retry.save_operation, succeeded=True)
+        )
+        is True
+    )
+    assert sched._save_tracker["730"][1] == 8
+    assert sched._save_watermark_rollback == {}
+
+    sched.save_finished(retry.save_operation)
+    assert sched.total_saved_tokens == 8
+
+    seq.num_cached_tokens = 16
+    tail = sched.build_connector_meta().requests[0]
+    assert tail.save_spec.skip_leading_tokens == 8
+
+
+def test_page_watermark_records_do_not_outlive_their_request():
+    """Records are keyed by operation, so they must be dropped with the request."""
+    sched = _scheduler()
+    seq = SimpleNamespace(
+        id=731,
+        token_ids=list(range(16)),
+        block_table=[1, 2, 3, 4],
+        num_prompt_tokens=16,
+        num_cached_tokens=8,
+        has_per_req_cache=False,
+    )
+    sched._save_tracker["731"] = [seq, 0]
+    sched.build_connector_meta()
+    assert sched._save_watermark_rollback["731"]
+
+    sched.abandon_save(seq.id)
+    assert sched._save_watermark_rollback == {}
+
+    sched._save_tracker["731"] = [seq, 0]
+    sched.build_connector_meta()
+    assert sched._save_watermark_rollback["731"]
+
+    sched._save_inflight.clear()
+    sched.request_finished(seq)
+    assert sched._save_watermark_rollback == {}
+
+
+def test_worker_reports_a_page_verdict_on_every_terminal_path():
+    """A missing report strands the operation in the TP aggregator forever."""
+    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn._lock = threading.Lock()
+    conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
+    conn._done_sidecar_save = set()
+    conn._failed_sidecar_save = set()
+    conn._pending_save_ops = {}
+    conn._pending_legacy_save_ops = {}
+    conn._max_pending_saves = 4
+
+    operation = SaveOperationId(732, 0)
+    req = SimpleNamespace(
+        req_id=732,
+        token_ids=list(range(8)),
+        block_ids=[1, 2],
+        save_spec=SimpleNamespace(skip_leading_tokens=0, can_save=True),
+        slot_save_spec=None,
+        save_operation=operation,
+    )
+
+    conn._finish_unadmitted_save(req)
+
+    assert conn._failed_page_save == {operation}
+    assert conn._done_page_save == set()
+    # It is still reported as terminal on the plain saving path, so the
+    # scheduler's inflight bookkeeping still clears.
+    assert conn._done_save == {operation}
+
+    # A SLOT-only save moved no watermark and must not claim a PAGE verdict.
+    conn._failed_page_save.clear()
+    conn._done_save.clear()
+    slot_only = SimpleNamespace(
+        req_id=733,
+        token_ids=list(range(8)),
+        block_ids=[1, 2],
+        save_spec=None,
+        slot_save_spec=SimpleNamespace(boundary_tokens=8, boundary_block_hash=7),
+        save_operation=SaveOperationId(733, 0),
+    )
+    conn._finish_unadmitted_save(slot_only)
+    assert conn._failed_page_save == set()
+    assert conn._done_page_save == set()
+
+
 def test_raw_callbacks_cannot_retire_exact_active_operations():
     page_sched = _scheduler()
     page_seq = SimpleNamespace(
@@ -3423,7 +3948,14 @@ def test_sidecar_chunk_cut_preserves_earlier_load_handoff_cap():
     assert sched.adjust_prefill_chunk_after_alloc(seq, 16_000) == 4096
 
 
-def test_full_prompt_hit_is_clamped_before_load_spec():
+def test_full_prompt_hit_is_clamped_and_floored_before_load_spec():
+    # A full-prompt hit is decremented so something is left to compute, and
+    # then floored back onto a chunk boundary. Both steps are load-bearing:
+    # LMCache resolves at chunk granularity, so the bare decrement (7 here,
+    # 32767 on GLM-5.2 with chunk 64) names tokens the tier does not hold and
+    # the load can only ever fail -- which parks the request in
+    # WAITING_FOR_REMOTE_KVS and, since a failed load used to leave no record,
+    # forever. chunk_size is 4, so 8 -> 7 -> 4.
     sched = _scheduler()
     sched._lookup_client = _LookupClient(hit=8)
     seq = SimpleNamespace(
@@ -3435,9 +3967,39 @@ def test_full_prompt_hit_is_clamped_before_load_spec():
 
     need, should_park = sched.get_num_new_matched_tokens(seq)
 
-    assert need == 7
+    assert need == 4
     assert should_park is True
-    assert sched._load_specs[str(seq.id)].lmcache_cached_tokens == 7
+    assert sched._load_specs[str(seq.id)].lmcache_cached_tokens == 4
+
+
+def test_dsv4_failed_load_is_not_retried_for_the_same_request():
+    # Same one-attempt rule as the dense layout: without it, `load_failed`
+    # clears the pending load and the lookup memo, so the next scheduler pass
+    # hits, parks, and fails again -- holding the request's KV blocks and its
+    # concurrency slot for the life of the benchmark.
+    sched = _scheduler()
+    sched._lookup_client = _LookupClient(hit=6)
+    seq = SimpleNamespace(
+        id=125,
+        num_prompt_tokens=8,
+        token_ids=list(range(8)),
+        num_cached_tokens=0,
+        has_per_req_cache=False,
+    )
+
+    assert sched.get_num_new_matched_tokens(seq) == (4, True)
+    assert sched.load_failed("125") is True
+    assert sched._load_failed_seqs == {"125": seq}
+
+    assert sched.get_num_new_matched_tokens(seq) == (0, False)
+    assert sched.total_suppressed_load_retries == 1
+    # Reported, not just counted: a suppressed retry is a silent hit-rate loss
+    # -- the request serves correctly, from HBM, having skipped the tier -- so
+    # the only way to see it in a running server is through the statistics dict.
+    assert sched.get_statistics()["suppressed_load_retries"] == 1
+
+    sched.request_finished(seq)
+    assert sched._load_failed_seqs == {}
 
 
 def test_lookup_miss_is_forwarded_for_worker_unpin():
@@ -3737,6 +4299,8 @@ def test_worker_completes_noop_load_when_hbm_satisfies():
     conn._done_load = set()
     conn._failed_load = set()
     conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
     conn._engine = SimpleNamespace(unpinned=[])
     conn._engine.lookup_unpin = lambda lookup_id: conn._engine.unpinned.append(
         lookup_id
@@ -3762,6 +4326,8 @@ def test_worker_load_terminal_paths_report_exact_operation_once():
     conn._done_load = set()
     conn._failed_load = set()
     conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
     conn._done_sidecar_save = set()
     conn._failed_sidecar_save = set()
     conn._pending_save_ops = {}
@@ -3834,6 +4400,8 @@ def test_worker_reports_unaligned_hbm_load_as_failed_without_exception():
     conn._done_load = set()
     conn._failed_load = set()
     conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
     conn.chunk_size = 4
     conn._engine = SimpleNamespace(unpinned=[])
     conn._engine.lookup_unpin = lambda lookup_id: conn._engine.unpinned.append(
@@ -3870,6 +4438,8 @@ def test_worker_save_uses_lmcache_engine_store():
     conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
     conn._lock = threading.Lock()
     conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
     conn._pending_save_ops = {}
     conn._pending_legacy_save_ops = {}
     conn._save_req_locks = {}
@@ -3915,6 +4485,8 @@ def test_worker_save_waits_for_forward_event_before_store():
     conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
     conn._lock = threading.Lock()
     conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
     conn._pending_save_ops = {}
     conn._pending_legacy_save_ops = {}
     conn._save_req_locks = {}
@@ -3959,6 +4531,8 @@ def test_worker_load_uses_lmcache_engine_retrieve_and_marks_done():
     conn._done_load = set()
     conn._failed_load = set()
     conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
     conn.chunk_size = 4
     conn._engine = _Engine()
 
@@ -4002,6 +4576,8 @@ def test_worker_load_partial_retrieve_marks_failed():
     conn._done_load = set()
     conn._failed_load = set()
     conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
     conn.chunk_size = 4
     conn._engine = _Engine()
 
@@ -4024,6 +4600,8 @@ def test_load_exception_is_reported_as_failed_recving():
     conn._lock = threading.Lock()
     conn._done_load = set()
     conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
     conn._failed_load = set()
     req = SimpleNamespace(req_id=42)
 
@@ -4231,9 +4809,46 @@ def _install_byte_addressing_fused(codec: DenseKVByteCodec) -> None:
                     )
                     offset += nbytes
 
+    def _prepare(segments, seg_block_bytes, groups, device):
+        normalized = tuple(
+            (tuple(chunk_block_counts), tuple(flat_block_ids))
+            for chunk_block_counts, flat_block_ids in groups
+        )
+        return SimpleNamespace(
+            segments=segments,
+            seg_block_bytes=seg_block_bytes,
+            groups=normalized,
+            device=device,
+            group_count=len(normalized),
+            upload_count=int(any(ids for _counts, ids in normalized)),
+        )
+
+    def _pack_prepared(prepared, group_index, device_buf):
+        counts, ids = prepared.groups[group_index]
+        _pack(
+            prepared.segments,
+            prepared.seg_block_bytes,
+            counts,
+            ids,
+            device_buf,
+        )
+
+    def _unpack_prepared(prepared, group_index, device_buf):
+        counts, ids = prepared.groups[group_index]
+        _unpack(
+            device_buf,
+            prepared.segments,
+            prepared.seg_block_bytes,
+            counts,
+            ids,
+        )
+
     codec._fused_kv_staging = SimpleNamespace(
         fused_pack_chunk_major=_pack,
         fused_unpack_chunk_major=_unpack,
+        prepare_chunk_major_groups=_prepare,
+        fused_pack_chunk_major_prepared=_pack_prepared,
+        fused_unpack_chunk_major_prepared=_unpack_prepared,
     )
 
 
@@ -4474,6 +5089,7 @@ def test_scheduler_offload_statistics_are_cumulative():
         "saved_tokens": 4096,
         "loads_pending": 0,
         "saves_pending": 0,
+        "suppressed_load_retries": 0,
     }
 
 
@@ -4620,6 +5236,34 @@ def test_replica_world_size_counts_pp_and_tp_but_not_dp():
     assert offcfg.lmcache_replica_world_size(_dp_config(5, pp_size=4, tp_size=8)) == 32
     assert offcfg.lmcache_replica_world_size(_dp_config(5)) == 1
     assert offcfg.lmcache_replica_world_size(SimpleNamespace()) == 1
+
+
+def test_replica_world_size_reads_vllm_parallel_config():
+    # On the plugin path `config` is a VllmConfig, which keeps the parallel
+    # sizes under `parallel_config` and carries nothing at the top level.
+    # Reading only the top level returned world=1 for a TP4 replica, so the
+    # all-rank lookup_server_worker_ids=[0,1,2,3] went out of range and the
+    # lookup client silently failed to build -- leaving the offload tier
+    # written but never read.
+    vllm_shaped = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            tensor_parallel_size=4,
+        )
+    )
+    assert offcfg.lmcache_replica_world_size(vllm_shaped) == 4
+
+    vllm_shaped_pp = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=2,
+            tensor_parallel_size=4,
+        )
+    )
+    assert offcfg.lmcache_replica_world_size(vllm_shaped_pp) == 8
+
+    # A parallel_config that only carries ranks (ATOM's own shape) must not
+    # shadow the top-level sizes.
+    assert offcfg.lmcache_replica_world_size(_dp_config(5, pp_size=4, tp_size=8)) == 32
 
 
 class _RecordingRunnerMgr:

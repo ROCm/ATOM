@@ -61,7 +61,7 @@ def _run(builder, *, positions, batch_id, t_pad):
     """Drive one builder over a batch and hand back its four outputs."""
     out = _outputs(t_pad, t_pad)
     builder(
-        batch_id_per_token=torch.tensor(batch_id, dtype=torch.int32, device=DEV),
+        batch_id_per_q_token=torch.tensor(batch_id, dtype=torch.int32, device=DEV),
         # int64, as the production `positions` buffer is.
         positions=torch.tensor(positions, dtype=torch.int64, device=DEV),
         T_pad=t_pad,
@@ -172,7 +172,7 @@ def test_a_token_indexed_destination_must_be_exactly_the_token_axis():
     out = _outputs(8, 4)
     with pytest.raises(ValueError, match="exactly T_pad"):
         build_v4_paged_decode_indptr(
-            batch_id_per_token=torch.zeros(8, dtype=torch.int32, device=DEV),
+            batch_id_per_q_token=torch.zeros(8, dtype=torch.int32, device=DEV),
             positions=torch.arange(8, device=DEV),
             T_pad=4,
             win=WIN,

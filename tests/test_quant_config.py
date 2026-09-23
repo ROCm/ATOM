@@ -148,11 +148,25 @@ def _load_module(filename: str, module_name: str):
     return mod
 
 
-# Load quant_spec first, then inject it so config.py can import it.
+# Load quant_spec first, then inject it so config.py can import it -- and put
+# the real one back, which the previous version of this never did.
+#
+# Leaving this copy installed replaced `atom.quant_spec` for the whole session.
+# Modules imported before this file kept the original `LayerQuantConfig` and
+# `QuantType`; modules imported after got these. Two enums that print the same
+# and compare unequal, so `quant_type != QuantType.No` was true for a config
+# that said `No` -- `test_qwen4_exp_quantization` then built a quantized layer
+# and died on a `weight_scale` that branch does not create. `tests/conftest.py`
+# now fails whichever test leaves such a duplicate behind.
+_real_quant_spec = sys.modules.get("atom.quant_spec")
 _qs = _load_module("quant_spec.py", "atom.quant_spec")
-sys.modules["atom.quant_spec"] = _qs
-
-_m = _load_module("config.py", "_atom_config_test")
+try:
+    _m = _load_module("config.py", "_atom_config_test")
+finally:
+    if _real_quant_spec is None:
+        sys.modules.pop("atom.quant_spec", None)
+    else:
+        sys.modules["atom.quant_spec"] = _real_quant_spec
 
 QuantizationConfig = _m.QuantizationConfig
 LayerQuantConfig = _qs.LayerQuantConfig
