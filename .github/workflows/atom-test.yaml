@@ -218,7 +218,7 @@ jobs:
           HF_TOKEN: ${{ secrets.AMD_HF_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -d "/models" ]; then
+          if [ -n "${MODEL_HOST_ROOT:-}" ] && docker exec "$CONTAINER_NAME" test -d /models; then
             docker exec \
               -e HF_TOKEN="${HF_TOKEN:-}" \
               -e MODEL_ID="${SMOKE_MODEL}" \
@@ -226,7 +226,7 @@ jobs:
               "$CONTAINER_NAME" \
               bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'
           else
-            echo "No /models mount; simple_inference will fetch from the hub."
+            echo "No container /models mount; simple_inference will fetch from the hub."
           fi
 
       - name: Run offline inference
@@ -236,7 +236,7 @@ jobs:
         timeout-minutes: 15
         run: |
           set -euo pipefail
-          if [ -d "/models" ]; then
+          if [ -n "${MODEL_HOST_ROOT:-}" ] && docker exec "$CONTAINER_NAME" test -d /models; then
             model_path="/models/${SMOKE_MODEL}"
           else
             model_path="${SMOKE_MODEL}"
@@ -478,9 +478,9 @@ jobs:
         timeout-minutes: 150
         run: |
           set -euo pipefail
-          if [ -d "/models" ]; then
+          if [ -n "${MODEL_HOST_ROOT:-}" ] && docker exec "$CONTAINER_NAME" test -d /models; then
             model_dir="/models/${{ matrix.model_path }}"
-            echo "/models directory found, checking cache and lock-protected download for ${model_dir}"
+            echo "container /models directory found, checking cache and lock-protected download for ${model_dir}"
             if ! docker exec \
               -e HF_TOKEN="${HF_TOKEN:-}" \
               -e MODEL_ID="${{ matrix.model_path }}" \
@@ -494,7 +494,7 @@ jobs:
               exit 1
             fi
           else
-            echo "/models directory not found, skipping model download"
+            echo "container /models directory not found, skipping model download"
           fi
         env:
           MODEL_DOWNLOAD_TIMEOUT: "30m"
@@ -513,7 +513,7 @@ jobs:
           echo ""
           echo "========== Running test =========="
 
-          if [ -d "/models" ]; then
+          if [ -n "${MODEL_HOST_ROOT:-}" ] && docker exec "$CONTAINER_NAME" test -d /models; then
             model_path="/models/${{ matrix.model_path }}"
           else
             model_path="${{ matrix.model_path }}"
@@ -566,7 +566,7 @@ jobs:
           set -euo pipefail
           echo ""
           echo "========== Launching ATOM server =========="
-          if [ -d "/models" ]; then
+          if [ -n "${MODEL_HOST_ROOT:-}" ] && docker exec "$CONTAINER_NAME" test -d /models; then
             model_path="/models/${{ matrix.model_path }}"
           else
             model_path="${{ matrix.model_path }}"
