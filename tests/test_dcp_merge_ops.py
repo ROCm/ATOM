@@ -1166,25 +1166,41 @@ _QREP_UNWIRED_MODELS = {
 
 
 def _q_proj_linear_calls(path):
-    """Module tree plus every ``self.q_proj``/``self.q_b_proj = <Linear>(...)``."""
+    """Every ``self.q_proj``/``self.q_b_proj = <Linear>(...)`` in the module,
+    each paired with its enclosing function (typically ``__init__``).
+
+    The enclosing function is returned alongside the call so the override-name
+    lookup below can be scoped to it, instead of the whole module: two
+    unrelated classes in the same file binding the same variable name to two
+    different things must not let one satisfy the other.
+    """
     tree = ast.parse(path.read_text(encoding="utf-8"))
     found = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+    for func in ast.walk(tree):
+        if not isinstance(func, ast.FunctionDef):
             continue
-        for target in node.targets:
-            if (
-                isinstance(target, ast.Attribute)
-                and target.attr in ("q_proj", "q_b_proj")
-                and isinstance(target.value, ast.Name)
-                and target.value.id == "self"
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Assign) or not isinstance(
+                node.value, ast.Call
             ):
-                found.append((target.attr, node.value, node.lineno))
-    return tree, found
+                continue
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and target.attr in ("q_proj", "q_b_proj")
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "self"
+                ):
+                    found.append((target.attr, node.value, node.lineno, func))
+    return found
 
 
-def _qrep_override_names(tree):
-    """Local names bound to ``qrep_tp_override(...)`` anywhere in the module.
+def _qrep_override_names(scope):
+    """Local names bound to ``qrep_tp_override(...)`` within `scope`.
+
+    `scope` is a function node (see `_q_proj_linear_calls`), not the whole
+    module: two unrelated classes in the same file binding the same variable
+    name to two different things must not let one satisfy the other.
 
     The four wired models spell it two ways -- `**qrep_tp_override(tp)` inline,
     or `x = qrep_tp_override(tp)` once and `**x` at the call. Matching only the
@@ -1192,7 +1208,7 @@ def _qrep_override_names(tree):
     passed exactly one of the four.
     """
     names = set()
-    for node in ast.walk(tree):
+    for node in ast.walk(scope):
         if (
             isinstance(node, ast.Assign)
             and isinstance(node.value, ast.Call)
@@ -1220,6 +1236,57 @@ def _passes_qrep_override(call, override_names):
     return False
 
 
+def test_qrep_override_names_is_scoped_to_the_enclosing_function():
+    """A name bound in one function must not satisfy a call in another.
+
+    This used to be checked module-globally (any name ever bound to
+    `qrep_tp_override(...)` anywhere in the file passed at any q_proj call
+    on any branch), which a coincidental variable-name collision across two
+    unrelated classes/functions in the same file could fool.
+    """
+    source = """
+def build_wired(tp_size):
+    q_qrep_override = qrep_tp_override(tp_size)
+    self.q_proj = ColumnParallelLinear(**q_qrep_override)
+
+def build_unwired(tp_size):
+    q_qrep_override = some_other_thing(tp_size)
+    self.q_proj = ColumnParallelLinear(**q_qrep_override)
+"""
+    tree = ast.parse(source)
+    functions = {f.name: f for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)}
+
+    def _q_proj_call(func):
+        for node in ast.walk(func):
+            if (
+                isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.targets[0], ast.Attribute)
+                and node.targets[0].attr == "q_proj"
+            ):
+                return node.value
+        raise AssertionError("no q_proj assignment found")
+
+    wired_call = _q_proj_call(functions["build_wired"])
+    unwired_call = _q_proj_call(functions["build_unwired"])
+
+    assert _passes_qrep_override(
+        wired_call, _qrep_override_names(functions["build_wired"])
+    )
+    assert not _passes_qrep_override(
+        unwired_call, _qrep_override_names(functions["build_unwired"])
+    ), "a same-named variable bound in a DIFFERENT function must not pass"
+
+    # Confirms the scoping above is actually doing the work: checked against
+    # the whole module's bound names instead, the same call incorrectly
+    # passes, because build_wired's binding is visible module-wide.
+    assert _passes_qrep_override(unwired_call, _qrep_override_names(tree)), (
+        "sanity check failed -- if this now also fails, the synthetic source "
+        "above no longer reproduces the module-wide false pass this test "
+        "guards against"
+    )
+
+
 @pytest.mark.parametrize("filename", _QREP_WIRED_MODELS)
 def test_q_proj_producers_pass_qrep_tp_override(filename):
     """Both target models and both speculative drafts must widen q_proj.
@@ -1230,13 +1297,12 @@ def test_q_proj_producers_pass_qrep_tp_override(filename):
     still passes.
     """
     path = _ATOM_MODELS / filename
-    tree, calls = _q_proj_linear_calls(path)
+    calls = _q_proj_linear_calls(path)
     assert calls, f"{filename}: no self.q_proj/self.q_b_proj assignment found"
-    override_names = _qrep_override_names(tree)
     missing = [
         f"{filename}:{lineno} (self.{attr})"
-        for attr, call, lineno in calls
-        if not _passes_qrep_override(call, override_names)
+        for attr, call, lineno, func in calls
+        if not _passes_qrep_override(call, _qrep_override_names(func))
     ]
     assert not missing, (
         "query projections built without qrep_tp_override -- MLAAttention will "
@@ -1244,12 +1310,44 @@ def test_q_proj_producers_pass_qrep_tp_override(filename):
     )
 
 
+def _builds_mla_modules(path):
+    """Whether this file constructs an ``MLAModules(...)``, robust to aliasing.
+
+    A real check (import-tracked name, actually called), not a literal
+    substring match on ``"MLAModules("`` -- which an aliased import
+    (``import ... as MM``) would evade, and a comment merely mentioning the
+    name would falsely trip.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    local_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").endswith(
+            "attention_mla"
+        ):
+            local_names.update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name == "MLAModules"
+            )
+    if not local_names:
+        return False
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in local_names
+        for node in ast.walk(tree)
+    )
+
+
 def test_every_mla_model_has_an_explicit_qrep_decision():
-    """A new MLA model must be classified, not silently left unwired."""
+    """A new MLA model must be classified, not silently left unwired.
+
+    `rglob`, not `glob`: a non-recursive scan would miss an MLA model added
+    under a subpackage (`atom/models/<family>/...`), the direction some of
+    `atom/model_ops/` already organizes new code in.
+    """
     producers = {
-        path.name
-        for path in _ATOM_MODELS.glob("*.py")
-        if "MLAModules(" in path.read_text(encoding="utf-8")
+        path.name for path in _ATOM_MODELS.rglob("*.py") if _builds_mla_modules(path)
     }
     undecided = producers - set(_QREP_WIRED_MODELS) - set(_QREP_UNWIRED_MODELS)
     assert not undecided, (
