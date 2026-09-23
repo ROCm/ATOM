@@ -136,6 +136,13 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             rank=rank,
         )
         self.chunk_size = int(cfg.chunk_size)
+        # Kept, not just passed on: a hybrid model stores its recurrent state in
+        # the same LMCache instance through a second codec, and that codec has
+        # to be keyed by the same model name, world size and worker id or the
+        # two tiers would disagree about what "the same prefix on this rank"
+        # means. Re-deriving it there would be a copy of this call's arguments
+        # that nothing keeps in sync.
+        self._lmcache_metadata = meta
 
         # ZMQ lookup server so the scheduler process can query our hit counts.
         try:
@@ -216,9 +223,9 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             operation, SaveOperationId
         ):
             with self._lock:
-                # Keep the legacy terminal channel as well: MultiConnector's
-                # producer send/save pairing consumes this field before
-                # connector-owned completions reach the scheduler.
+                # Reported independently of the P/D send: this terminal is
+                # what dispatches the next chunk. The dedicated channel below
+                # carries store success/failure and lease cleanup.
                 self._done_save.add(operation)
                 self._connector_completions.add(
                     ConnectorCompletion(

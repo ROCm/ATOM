@@ -44,6 +44,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 | `Glm5NextForConditionalGeneration` | `atom.models.glm5_next` | `Glm5NextForConditionalGeneration` | Yes | Yes | Text-only GLM-5.3-Flash: hybrid KDA + pooled sparse MLA, mHC, NoPE zero padding; PCP/DCP/MTP/TBO not yet supported |
 | `Qwen3NextForCausalLM` | `atom.models.qwen3_next` | `Qwen3NextForCausalLM` | Yes | No | Hybrid architecture: full attention + Gated DeltaNet linear attention, GQA, QK norm, FusedMoE |
 | `KimiK3ForConditionalGeneration` | `atom.models.kimi_k3` | `KimiK3ForConditionalGeneration` | Yes | Yes | Hybrid architecture: MLA full attention + KDA linear attention, SiTU activation, MXFP4 latent MoE, MoonViT3d vision tower |
+| `DeepseekV41ForCausalLM` | `atom.models.deepseek_v41` | `DeepseekV41ForCausalLM` | Yes | Yes | CSA2 topology, Single-Pass mHC, Engram n-gram memory, FP8 index plane with a paged scorer, native W4A8/FP4 weights, vision tower, native DSpark speculation |
 
 **Note:** `DeepSeekMTP` (`atom.models.deepseek_mtp.DeepSeekMTP`), `Qwen3NextMTP` (`atom.models.qwen3_next_mtp.Qwen3NextMTP`), and `Qwen3_5MTP` (`atom.models.qwen3_5_mtp.Qwen3_5MTP`) are not in the registry — they are used exclusively as speculative draft models and are loaded separately via `EagleProposer`.
 
@@ -155,6 +156,15 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 - **MoE:** MXFP4 latent MoE (`KimiSparseMoeBlock`) with SiTU activation and optional dual-stream shared/routed overlap (`ATOM_K3_SHARED_EXPERT_OVERLAP`).
 - **Vision:** `atom/models/kimi_k3_vl.py` implements MoonViT3d — patch embed with a bilinearly resampled learnable position grid, 27 blocks with packed `wqkv` and complex 2D RoPE over non-causal varlen attention, then an `sd2_tpool` 2x2 merge and a `patchmergerv2` projector into the 7168-wide text space. Replicated per TP rank (~0.9 GB bf16), built only on the first pipeline rank.
 - **Image tokens:** The HF processor emits one `<|media_pad|>` per image and expands it inside the model. ATOM instead expands it during input processing (`build_kimi_k3_inputs` in `atom/models/kimi_k3.py`, using the shared helper in `atom/multimodal/processing.py`) so the scheduler, KV blocks and positions see the true prompt length. Multimodal prefills are consequently never chunked.
+
+### DeepSeek-V4.1 (`DeepseekV41ForCausalLM`)
+
+- **Architecture:** Its own package, `atom/models/deepseek_v41/`, rather than a reshape of V4 — CSA2 attention topology with compressor/indexer ownership per layer, single-pass mHC, Engram n-gram memory and an optional vision tower. The V4 BF16 sparse attention and inverse RoPE kernels are reused unmodified.
+- **Cache:** A paged main KV plane plus an FP8 index plane; `index_cache_dtype="fp8"` is the only index format, and the runtime refuses any other before loading weights. Main storage takes `bf16` or a packed `fp4` layout. Geometry is declared in `atom/model_ops/attentions/pool_layout/v41_pool_geometry.py` with no model or scheduler imports.
+- **MoE:** V4's `FusedMoE`, subclassed only to flatten the offline caller's batch dimension and declare `bias_vl`. There is no second expert backend.
+- **Graphs:** `CUDAGraphMode.FULL` captures the whole decode forward, one graph per `(batch size, query bucket)`; `PIECEWISE` records the dense pieces with attention eager between them. `torch.compile` is not supported.
+- **Speculation:** Native DSpark proposes five tokens from the checkpoint's three draft stages. Implemented and tested, with quality acceptance still open — see [the DSpark guide](deepseek_v41_dspark.md).
+- **Guides:** [runtime](deepseek_v41_runtime.md), [cache format and graphs](deepseek_v41_performance.md), [protocol](deepseek_v41_protocol.md), [image requests](deepseek_v41_vision.md), [DSpark](deepseek_v41_dspark.md), [recipe](../recipes/DeepSeek-V4.1-Flash.md).
 
 ### Qwen3.5 MTP (`Qwen3_5MTP`)
 

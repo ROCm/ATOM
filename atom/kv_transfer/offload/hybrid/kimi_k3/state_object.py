@@ -158,8 +158,12 @@ class StateByteCodec:
             raise
         return True
 
-    def get(self, h: int, slot: int) -> bool:
-        """Load one image back into Active Slot `slot`. False on a miss.
+    def get(self, h: int, slot) -> bool:
+        """Load one image back into `slot`. False on a miss.
+
+        `slot` is whatever the bound backend addresses an entry by, and is
+        passed through untouched: ATOM's native path an Active Slot index, the
+        vLLM plugin path one block id per mamba KV cache group.
 
         The reference must be discharged here: `get_blocking` does a
         `ref_count_up()` for the caller, and without the matching down LRU drops

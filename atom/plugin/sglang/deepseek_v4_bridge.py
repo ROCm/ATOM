@@ -1151,6 +1151,11 @@ def _make_compress_plans(extend_lens_cpu, context_lens_cpu, device):
         np.ascontiguousarray(context_lens_cpu, dtype=np.int32),
         [(CSA_RATIO, True), (HCA_RATIO, False)],
         plan_buffers=plan_buffers,
+        # V4's K_pool (8 CSA / 128 HCA) is already wider than any draft span
+        # this bridge runs, so its ring needs no extra retention and 0 keeps
+        # the plan byte-identical. A bridge that ever narrows K_pool below
+        # `1 + spec steps` has to pass its ring slack here instead.
+        extra_write=0,
     )
     # Eager path (running_bs unset): full-buffer write slice; the eager bridge
     # launches update_compressor_states with exactly num_write rows.
@@ -1344,6 +1349,7 @@ def _make_decode_graph_compress_plans(extend_lens_cpu, context_lens_cpu, bufs):
         plan_buffers=bufs.plan_buffers,
         running_bs=bufs.decode_running_bs,
         max_q_len=bufs.decode_q_len,
+        extra_write=0,  # See `_make_compress_plans`: K_pool already covers it.
     )
 
 
@@ -1406,6 +1412,7 @@ def _make_verify_graph_compress_plans(extend_lens_cpu, context_lens_cpu, bufs):
         [(CSA_RATIO, True), (HCA_RATIO, False)],
         plan_buffers=bufs.plan_buffers,
         decode_capacity_per_ratio=bufs.verify_compress_cap,
+        extra_write=0,  # See `_make_compress_plans`: K_pool already covers it.
     )
 
 

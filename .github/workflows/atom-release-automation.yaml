@@ -55,25 +55,26 @@ jobs:
   prepare:
     name: Resolve release target
     runs-on: ubuntu-latest
+    # The resolve step pushes the release branch and tag through the
+    # credential checkout persists, and those pushes ride GITHUB_TOKEN on
+    # purpose: a push made with GITHUB_TOKEN triggers no workflow events, so
+    # creating the tag cannot fire this workflow's own `on: push: tags` and
+    # start a second two-flavor build of the same release. The 2026-09-22
+    # dispatch proved the hazard live: its tag push started run 35682961559.
+    # An app token handed to checkout would both trigger events and carry the
+    # app's name. The write permission the pushes need is granted here
+    # because the workflow default is read.
+    permissions:
+      contents: write
     outputs:
       should_run: ${{ steps.resolve.outputs.should_run }}
       skip_reason: ${{ steps.resolve.outputs.skip_reason }}
       release_tag: ${{ steps.resolve.outputs.release_tag }}
       release_branch: ${{ steps.resolve.outputs.release_branch }}
     steps:
-      - name: Generate release app token
-        id: release_app_token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.ATOM_CI_APP_ID }}
-          private-key: ${{ secrets.ATOM_CI_APP_PRIVATE_KEY }}
-          owner: ROCm
-          repositories: ATOM
-
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          token: ${{ steps.release_app_token.outputs.token }}
           fetch-depth: 0
 
       - name: Resolve release target
@@ -163,11 +164,37 @@ jobs:
               git push origin "refs/heads/${release_branch}"
               git fetch --force origin "refs/heads/${release_branch}:refs/remotes/origin/${release_branch}"
               branch_exists=true
+            else
+              # A branch an earlier failed run left behind can point anywhere:
+              # release/v0.1.6 sat on July's v0.1.6-rc0 while main had moved
+              # two months on, and the 2026-09-21 run tagged that stale head
+              # and built it. The tag, the branch and the release must all
+              # carry one commit, so a branch that is not where the release
+              # ref resolves is a half-finished state to clean up, not
+              # something to build on.
+              branch_commit="$(git rev-parse "refs/remotes/origin/${release_branch}^{commit}")"
+              if [ "${branch_commit}" != "${target_commit}" ]; then
+                echo "Release branch ${release_branch} is at ${branch_commit}, but ${INPUT_RELEASE_REF} resolves to ${target_commit}."
+                echo "Delete the branch (it will be recreated from ${INPUT_RELEASE_REF}), or pass release_ref=${release_branch} to release the branch as it stands."
+                exit 1
+              fi
             fi
             if [ "${tag_exists}" != "true" ]; then
-              git tag "${release_tag}" "$(git rev-parse "refs/remotes/origin/${release_branch}^{commit}")"
+              # target_commit, not the branch head: with a pre-existing branch
+              # the two can differ, and the tag decides what gets built.
+              git tag "${release_tag}" "${target_commit}"
               git push origin "refs/tags/${release_tag}"
               tag_exists=true
+            else
+              # Same check for the tag: the build checks the tag out, so a tag
+              # left on a stale commit ships that commit no matter where the
+              # branch points.
+              tag_commit="$(git rev-parse "refs/tags/${release_tag}^{commit}")"
+              if [ "${tag_commit}" != "${target_commit}" ]; then
+                echo "Release tag ${release_tag} is at ${tag_commit}, but ${INPUT_RELEASE_REF} resolves to ${target_commit}."
+                echo "Delete the tag (it will be recreated from ${INPUT_RELEASE_REF}), or pass release_ref=${release_tag} to release the tag as it stands."
+                exit 1
+              fi
             fi
           fi
 

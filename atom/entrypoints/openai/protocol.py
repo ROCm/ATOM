@@ -5,9 +5,16 @@
 
 import json
 import time
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    NonNegativeInt,
+    TypeAdapter,
+    ValidationError,
+)
 
 # ============================================================================
 # Constants
@@ -33,6 +40,43 @@ def validate_max_tokens(max_tokens: int) -> int:
     if max_tokens < 1:
         raise ValueError(f"max_tokens must be at least 1, got {max_tokens}")
     return max_tokens
+
+
+#: Validate token IDs with pydantic-core, avoiding a Python loop.
+PromptTokenIds = list[NonNegativeInt]
+_PROMPT_TOKEN_IDS_ADAPTER = TypeAdapter(PromptTokenIds)
+
+
+def resolve_prompt_token_ids(
+    prompt_token_ids: PromptTokenIds | None,
+    kv_transfer_params: dict[str, Any] | None,
+) -> PromptTokenIds | None:
+    """Resolve IDs from the top-level field or vLLM-compatible PD metadata.
+
+    Reject empty lists and conflicting IDs between the two locations.
+    """
+    from_kv = (kv_transfer_params or {}).get("prompt_token_ids")
+    if prompt_token_ids is None and from_kv is None:
+        return None
+
+    if from_kv is not None:
+        try:
+            from_kv = _PROMPT_TOKEN_IDS_ADAPTER.validate_python(from_kv)
+        except ValidationError as e:
+            raise ValueError(
+                "kv_transfer_params['prompt_token_ids'] must be a list of "
+                f"non-negative integers: {e.errors()[0]['msg']}"
+            ) from e
+        if prompt_token_ids is not None and from_kv != prompt_token_ids:
+            raise ValueError(
+                "prompt_token_ids and kv_transfer_params['prompt_token_ids'] "
+                "disagree; a request cannot carry two different prompts"
+            )
+
+    ids = prompt_token_ids if prompt_token_ids is not None else from_kv
+    if not ids:
+        raise ValueError("prompt_token_ids was given but is empty")
+    return ids
 
 
 def openai_stop_reason(finish_reason: str | None) -> str | None:
@@ -161,13 +205,16 @@ class ChatMessage(BaseModel):
                 parts.append(part.get("text", ""))
         return "\n".join(parts)
 
-    def to_template_dict(self) -> dict[str, Any]:
+    def to_template_dict(self, *, preserve_content: bool = False) -> dict[str, Any]:
         """Convert to dict for chat template, preserving tool-related fields.
 
         Returns a dict with role, content, and any extra fields (tool_calls,
         tool_call_id, name, reasoning_content, tools) that the chat template needs.
         """
-        d: dict[str, Any] = {"role": self.role, "content": self.get_content_text()}
+        d: dict[str, Any] = {
+            "role": self.role,
+            "content": self.content if preserve_content else self.get_content_text(),
+        }
         # Preserve extra fields needed by chat templates (e.g. Kimi-K2/K3).
         # "tools" carries K3 dynamically-loaded tools declared inside a system
         # message; encoding_k3.build_chat_segments renders them per-message.
@@ -205,7 +252,10 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Any | None = None  # "auto", "none", "required", or {function: {name}}
     # Structured output: {"type": "text"|"json_object"|"json_schema", ...}
     response_format: dict[str, Any] | None = None
-    reasoning_effort: str | None = None  # "low"|"high"|"max"
+    # V4.1 also accepts an exact integer budget; bool/float coercion is invalid.
+    reasoning_effort: str | Annotated[int, Field(strict=True, ge=1, le=100)] | None = (
+        None
+    )
     # K3 thinking control (sent by clients via extra_body):
     # {"type": "enabled"|"disabled", "keep": "all", "effort": "low"|"high"|"max"}.
     # Without this field pydantic (extra="ignore") silently drops it, so effort
@@ -218,6 +268,14 @@ class ChatCompletionRequest(BaseModel):
     # Optional KV-transfer metadata for P/D disaggregation.
     kv_transfer_params: dict[str, Any] | None = None
     data_parallel_rank: int | None = None
+    # Pre-tokenized text prompt; messages are still required and validated.
+    prompt_token_ids: PromptTokenIds | None = None
+    # Echo prompt IDs in non-streaming responses, including n > 1.
+    return_token_ids: bool | None = None
+
+    def get_prompt_token_ids(self) -> PromptTokenIds | None:
+        """This request's pre-tokenized prompt, or None to render+tokenize."""
+        return resolve_prompt_token_ids(self.prompt_token_ids, self.kv_transfer_params)
 
     def get_max_tokens(self) -> int:
         """Return the effective generation cap for OpenAI chat requests."""
@@ -243,7 +301,8 @@ class CompletionRequest(BaseModel):
     model_config = {"extra": "ignore"}
 
     model: str | None = None
-    prompt: str
+    # Required when no prompt_token_ids are supplied.
+    prompt: str | None = None
     temperature: float | None = DEFAULT_TEMPERATURE
     top_k: int | None = DEFAULT_TOP_K
     top_p: float | None = DEFAULT_TOP_P
@@ -257,6 +316,22 @@ class CompletionRequest(BaseModel):
     # Optional DPA routing hint inserted by atomesh for DP-aware workers.
     data_parallel_rank: int | None = None
     n: int | None = 1
+    # See `ChatCompletionRequest` for both of these.
+    prompt_token_ids: PromptTokenIds | None = None
+    return_token_ids: bool | None = None
+
+    def get_prompt_token_ids(self) -> PromptTokenIds | None:
+        """This request's pre-tokenized prompt, or None to tokenize `prompt`."""
+        return resolve_prompt_token_ids(self.prompt_token_ids, self.kv_transfer_params)
+
+    def get_prompt_or_tokens(self) -> "str | PromptTokenIds":
+        """Return pre-tokenized IDs when supplied, otherwise require text."""
+        ids = self.get_prompt_token_ids()
+        if ids is not None:
+            return ids
+        if self.prompt is None:
+            raise ValueError("either 'prompt' or 'prompt_token_ids' is required")
+        return self.prompt
 
     def get_max_tokens(self) -> int:
         """Return the effective generation cap for completion requests."""
@@ -282,6 +357,8 @@ class ChatCompletionResponse(BaseModel):
     choices: list[dict[str, Any]]
     usage: dict[str, Any]
     kv_transfer_params: dict[str, Any] | None = None
+    # Echoed back only when the request set `return_token_ids`.
+    prompt_token_ids: PromptTokenIds | None = None
 
     model_config = ConfigDict(extra="allow")
 
@@ -297,6 +374,8 @@ class CompletionResponse(BaseModel):
     usage: dict[str, Any]
     # Optional KV-transfer metadata returned for P/D disaggregation.
     kv_transfer_params: dict[str, Any] | None = None
+    # Echoed back only when the request set `return_token_ids`.
+    prompt_token_ids: PromptTokenIds | None = None
 
 
 class ModelCard(BaseModel):

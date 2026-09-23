@@ -897,6 +897,10 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         self._reqs_need_recv: dict[ReqId, tuple[Any, list[int]]] = {}
         self._reqs_need_save: dict[ReqId, tuple[Any, list[int]]] = {}
 
+        # Source-block ownership -- see `MooncakeConnectorScheduler` for why
+        # the claim is taken in `request_finished` rather than at alloc.
+        self._awaiting_send: set[str] = set()
+
         # Bidirectional transfer_id <-> request_id mapping
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
@@ -974,6 +978,18 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         to the decode instance.  On the consumer side this cleans up
         the transfer_id mapping.
         """
+        if self.is_producer and getattr(seq, "leave_reason", None) == "aborted":
+            # No send claim protects an abort's blocks from reuse. Never
+            # advertise their addresses, including any previous metadata.
+            seq.kv_transfer_params_output = None
+            return
+
+        # Claim the source blocks -- the metadata below hands the peer their
+        # addresses. Gated on `is_producer` alone: unlike mooncake this backend
+        # never reads `do_remote_decode` and sends everything it prefills.
+        if self.is_producer:
+            self._awaiting_send.add(str(seq.id))
+
         # Attach output metadata for the proxy to relay
         first_token_id = seq.output_tokens[0] if seq.output_tokens else None
         drafts = getattr(seq, "spec_token_ids", None)
@@ -1001,6 +1017,15 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             transfer_id = self.request_id_to_transfer_id.pop(seq.id, None)
             if transfer_id is not None:
                 self.transfer_id_to_request_id.pop(transfer_id, None)
+
+    def should_defer_free(self, seq: Sequence) -> bool:
+        return str(seq.id) in self._awaiting_send
+
+    def send_finished(self, req_id) -> None:
+        self._awaiting_send.discard(str(req_id))
+
+    def source_blocks_released(self, seq: Sequence) -> None:
+        """No block-lifetime state remains after the send claim is retired."""
 
 
 def _zmq_ctx(socket_type: int, addr: str):
