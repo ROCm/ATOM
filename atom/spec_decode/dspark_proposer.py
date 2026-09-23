@@ -4,6 +4,8 @@ import torch
 from torch import nn
 from torch.profiler import record_function
 
+from aiter.dist.parallel_state import get_pp_group
+
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
@@ -13,6 +15,33 @@ from atom.utils.block_convert import kv_indices_generate_triton
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
+
+
+def build_aux_capture_spec(config) -> AuxCaptureSpec | None:
+    """The spec a DSpark drafter would declare, without building the drafter.
+
+    Pipeline stages that hold tapped target layers but no drafter need it to arm
+    their own capture (`PPAuxRelay`), and under PP only the last stage has a
+    drafter to ask. `DSparkProposer._aux_capture_spec` defers here for the
+    default contract so the two cannot drift; a draft model that overrides
+    `target_aux_capture_spec` is refused there, since this cannot reproduce it.
+
+    None when the config has no DSpark draft to capture for.
+    """
+    spec_cfg = getattr(config, "speculative_config", None)
+    if spec_cfg is None or not spec_cfg.use_dspark():
+        return None
+    draft_cfg = spec_cfg.draft_model_hf_config
+    layer_ids = tuple(
+        int(i) for i in (getattr(draft_cfg, "dspark_target_layer_ids", None) or ())
+    )
+    if not layer_ids:
+        raise ValueError("DSpark requires dspark_target_layer_ids on the draft config.")
+    return AuxCaptureSpec(
+        layer_ids=layer_ids,
+        hidden_size=config.hf_config.hidden_size,
+        extract=DSparkProposer._extract_layer_hidden,
+    )
 
 
 class DSparkProposer(Drafter):
@@ -463,6 +492,19 @@ class DSparkProposer(Drafter):
     # ---- aux-hidden-state ownership (declarative; base owns the hook machinery) ----
     def _aux_capture_spec(self, target_model: nn.Module) -> AuxCaptureSpec:
         """Resolve the draft's feature contract; the base owns capture buffers."""
+        own = getattr(self.model, "target_aux_capture_spec", None)
+        if own is None:
+            return build_aux_capture_spec(self.config)
+        if get_pp_group().world_size > 1:
+            # PPAuxRelay reconstructs this spec on the stages that hold tapped
+            # layers but no drafter, and it has no draft model to ask. Relaying
+            # rows captured under the default contract into a draft expecting
+            # its own would be silently wrong, so refuse instead.
+            raise NotImplementedError(
+                f"{type(self.model).__name__} declares its own "
+                "target_aux_capture_spec, which pipeline parallelism cannot "
+                "reconstruct on a drafterless stage."
+            )
         draft_cfg = self.speculative_config.draft_model_hf_config
         layer_ids = tuple(
             int(i) for i in getattr(draft_cfg, "dspark_target_layer_ids", ())
@@ -471,14 +513,7 @@ class DSparkProposer(Drafter):
             raise ValueError(
                 "DSpark requires dspark_target_layer_ids on the draft config."
             )
-        own = getattr(self.model, "target_aux_capture_spec", None)
-        if own is not None:
-            return own(layer_ids, self.config.hf_config.hidden_size)
-        return AuxCaptureSpec(
-            layer_ids=layer_ids,
-            hidden_size=self.config.hf_config.hidden_size,
-            extract=self._extract_layer_hidden,
-        )
+        return own(layer_ids, self.config.hf_config.hidden_size)
 
     @staticmethod
     def _extract_layer_hidden(output, block: nn.Module):

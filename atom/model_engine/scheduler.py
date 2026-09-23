@@ -174,6 +174,7 @@ class ScheduledBatch:
         is_final_chunk: list[bool] | None = None,
         next_token_ids: list[int] | None = None,
         state_maintenance_ops: StateMaintenanceOps | None = None,
+        is_deferred_out: bool = True,
     ):
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
@@ -296,8 +297,18 @@ class ScheduledBatch:
         for i, (seq, num) in enumerate(zip(seqs.values(), num_scheduled_tokens)):
             if seq.type == SequenceType.PREFILL:
                 offset = self.num_cached_tokens[i]
-            else:
+            elif is_deferred_out or num_spec_step == 0:
                 offset = seq.num_tokens - num_rejected[i] - num
+            else:
+                # Undeferred speculation: postprocess has already written this
+                # step's anchor back and refilled the window it was given, so
+                # what is at the tail is one run of exactly `num` placeholders,
+                # whatever was rejected. The anchor is the token in front of it.
+                #
+                # Subtracting `num_rejected` as well, as the deferred path does,
+                # double-counts -- the run is already that much shorter there --
+                # and starts the window that far into the real output.
+                offset = seq.num_tokens - num - 1
             staged.extend(seq.token_ids[offset : offset + num])
         # Checked here because nothing downstream will: the array below wraps
         # whatever length was staged, and a sequence too short to fill its
@@ -579,14 +590,23 @@ class Scheduler:
         self.drafter_needs_next_token = self.use_spec and not (
             config.speculative_config.use_dspark()
         )
-        # True when this engine both drafts and verifies; False under PP
-        # (which only drafts for handoff to the decode node).
+        # True when this engine both drafts and verifies. Under PP the drafter
+        # runs on the last stage (`_build_output`'s non-deferred branch) and its
+        # rows come back on `ScheduledBatchOutput.draft_token_ids`, so the head
+        # can schedule them for verification like any other engine —
+        # `prepare_input_ids` stages the draft columns for every decode row
+        # because there is no GPU-side carry to rewrite them.
         pp_size = getattr(config, "pipeline_parallel_size", 1)
-        self.spec_decode_local = self.use_spec and pp_size == 1
-        if self.use_spec and not self.spec_decode_local:
+        self.spec_decode_local = self.use_spec
+        # Mirrors `tokenID_processor.is_deferred_out`, which postprocess only
+        # learns from `fwd_output`. Scheduling needs it a step earlier: the two
+        # modes leave a different number of trailing placeholders behind, so
+        # they do not find the decode anchor in the same place.
+        self.is_deferred_out = pp_size == 1
+        if self.use_spec and pp_size > 1:
             logger.info(
-                "Speculative decoding: drafting only (pipeline_parallel_size=%d). "
-                "Drafts are produced for handoff; this engine verifies none.",
+                "Speculative decoding: verifying locally under pipeline "
+                "parallelism (pipeline_parallel_size=%d).",
                 pp_size,
             )
         # `engine_stats` (spec / cache / throughput sections) is constructed
@@ -2169,6 +2189,7 @@ class Scheduler:
             total_seqs_num_decode=num_seqs_decode,
             connector_meta_output=connector_meta_output,
             num_spec_step=self.mtp_k if self.spec_decode_local else 0,
+            is_deferred_out=self.is_deferred_out,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             remote_kv_block_ids=sorted(remote_kv_blocks) if remote_kv_blocks else [],
             remote_kv_seq_blocks=remote_kv_seq_blocks,
@@ -2837,8 +2858,8 @@ class Scheduler:
         # coherent answer that ends before it answers anything.
         #
         # `num_placeholder_tokens` is the only width that describes what is
-        # actually there: postprocess appends `mtp_k + is_deferred_out -
-        # num_rejected` slots and records exactly that count. Re-deriving it
+        # actually there: postprocess records exactly what it appended, and the
+        # two output modes do not append the same amount. Re-deriving it
         # here as `mtp_k + num_rejected` agrees only when deferred output is
         # off AND nothing was rejected -- on a TP-only MTP engine it leaves one
         # `eos_token_id` behind (the case above), and with `num_rejected = r`
@@ -3068,11 +3089,17 @@ class Scheduler:
 
         need_placeholder = is_deferred_out or self.spec_decode_local
         # Drafts occupy trailing slots only on an engine that verifies them; a
-        # drafting-only engine's tokens are all real.
-        num_placeholder_width = self.mtp_k if self.spec_decode_local else 0
-        num_placeholder = self.mtp_k
-        if is_deferred_out:
-            num_placeholder += 1
+        # drafting-only engine's tokens are all real. Undeferred, the write
+        # below lands inside the one outstanding run and leaves `num_rejected`
+        # of it behind, so `num_rejected` alone already names the tail.
+        num_placeholder_width = (
+            self.mtp_k if (self.spec_decode_local and is_deferred_out) else 0
+        )
+        # A verify step hands back up to `mtp_k` accepted drafts plus one bonus
+        # token, so the run it writes into is `mtp_k + 1` wide. Deferred output
+        # spends that slot on its one-step lag when there is no speculation
+        # (`mtp_k` is 0), which is the same number.
+        num_placeholder = self.mtp_k + 1
 
         for seq in self.running:
             # Cancellation does not require sampled output. Middle prefill
@@ -3159,7 +3186,14 @@ class Scheduler:
                 # contaminating downstream logs and arithmetic with np.int32.
                 num_rejected = int(fwd_output.num_rejected[idx])
                 num_bonus = int(fwd_output.num_bonus[idx])
-                offset = 0 if (num_new_token + num_rejected) == 1 else self.mtp_k
+                # Deferred output is a step behind, so two runs are outstanding
+                # and the one this step's tokens belong to starts `mtp_k`
+                # further back. Undeferred there is only ever one.
+                offset = (
+                    self.mtp_k
+                    if (is_deferred_out and (num_new_token + num_rejected) != 1)
+                    else 0
+                )
                 # Align stats with vLLM: only count steps that actually ran
                 # speculation (drafts proposed and validated). Skip the
                 # prefill-only step where no draft tokens were scored against
@@ -3410,7 +3444,17 @@ class Scheduler:
                     # Clamped because `preempt()` strips exactly this many:
                     # `range()` on a negative width appends nothing, so storing
                     # one unclamped would claim placeholders that are not there.
-                    num = max(0, num_placeholder - seq.num_rejected)
+                    if is_deferred_out:
+                        num = max(0, num_placeholder - seq.num_rejected)
+                    else:
+                        # Refill the one outstanding run back to its full width
+                        # rather than deriving the shortfall from the rejects:
+                        # a step that scored no drafts at all consumes one slot
+                        # with `num_rejected` at zero, and `num_placeholder -
+                        # num_rejected` would grow the run by `mtp_k` for it.
+                        # A sequence that took the append branch above has no
+                        # run yet and gets the whole width.
+                        num = max(0, num_placeholder - seq.num_placeholder_tokens)
                     for _ in range(num):
                         seq.append_token(self.eos_token_id)
                         if seq.return_logprobs:
@@ -4383,6 +4427,7 @@ class DecodeScheduler(Scheduler):
                 total_seqs_num=len(scheduled_seqs),
                 total_seqs_num_decode=len(scheduled_seqs),
                 num_spec_step=self.mtp_k if self.spec_decode_local else 0,
+                is_deferred_out=self.is_deferred_out,
                 scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
                 cu_stream_fraction=self.cu_fraction,
                 state_maintenance_ops=self.block_manager.take_state_maintenance_ops(),

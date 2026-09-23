@@ -22,7 +22,24 @@ logger = logging.getLogger("atom")
 
 # Keys carried between pipeline stages. `sparse_kv_indices` is optional: present
 # only when a PP boundary splits a DSA IndexShare group (see model_runner).
-_PP_PROXY_KEYS = ("hidden_states", "residual", "sparse_kv_indices")
+# `block_residual` is Kimi-K3's AttnRes block window ([T, k, H], k < the
+# model's attn_res_block_size at the boundary); it is a distinct key from
+# `residual` because the two are different tensors, not two spellings of one.
+# `dspark_aux` carries a block drafter's target aux hidden states forward to the
+# stage that holds the drafter (see spec_decode/pp_aux_relay.py); like
+# `sparse_kv_indices` it is injected and popped by model_runner, not by any
+# model's forward.
+# A key absent from this tuple is dropped by the send with no diagnostic, and
+# the receiving stage fails on the KeyError its model's forward raises.
+PP_AUX_KEY = "dspark_aux"
+
+_PP_PROXY_KEYS = (
+    "hidden_states",
+    "residual",
+    "block_residual",
+    "sparse_kv_indices",
+    PP_AUX_KEY,
+)
 
 
 def pp_send_allgather_group():

@@ -36,6 +36,7 @@ from atom.distributed.pcp_utils import (
     pcp_round_robin_split,
 )
 from atom.distributed.pp_comm import (
+    PP_AUX_KEY,
     async_send_intermediate_tensors,
     commit_pp_send_work,
     recv_intermediate_tensors,
@@ -189,6 +190,7 @@ class tokenIDProcessor:
         max_num_batched_tokens: int,
         use_spec: bool = False,
         num_spec_tokens: int = 0,
+        spec_enabled: bool | None = None,
     ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
         self.is_deferred_out = getattr(runner.config, "pipeline_parallel_size", 1) == 1
@@ -205,6 +207,12 @@ class tokenIDProcessor:
             max_num_batched_tokens, dtype=torch.int32, device=device
         )
         self.use_spec = use_spec
+        # `use_spec` answers "does this stage draft and sample", which under PP
+        # is the last one alone. This answers "is the run speculative at all",
+        # which is what the per-stage state rollback keys off: the batch's
+        # acceptance counts have to be picked up everywhere, not just where
+        # they were produced.
+        self.spec_enabled = use_spec if spec_enabled is None else spec_enabled
         self.num_spec_tokens = num_spec_tokens
 
         self.async_copy_stream = torch.cuda.Stream(runner.device)
@@ -495,12 +503,51 @@ class tokenIDProcessor:
             token_ids = scheduled_tokens[
                 total_tokens_prefill : total_tokens_prefill + total_tokens_decode
             ]
-            if self.use_spec:
-                # Reached only under pipeline parallel, which no spec path
-                # supports yet; wants the deferred branch's per-request staging.
-                raise NotImplementedError("pipeline parallel + speculative decode")
-
             self.input_ids.np[:total_tokens_decode] = token_ids
+            if self.spec_enabled:
+                # Every row's draft columns, not just the newly admitted ones
+                # the deferred branch stages. There the anchor of a carried-over
+                # request is still on the GPU and `fill_deferred_decode_ids`
+                # rewrites its whole row from `prev_token_ids`; here (PP) the
+                # host already holds the real anchor -- postprocess wrote it
+                # back before this batch was built -- so `scheduled_tokens`
+                # above is correct at column 0 and only the drafts are missing.
+                #
+                # `spec_enabled`, not `use_spec`: this fills the ids the
+                # embedding reads, and the embedding is on the FIRST stage,
+                # while `use_spec` is only true on the LAST one. Gated the
+                # other way the verify window reaches the model with drafts
+                # still at their placeholder value, so every column past the
+                # anchor scores against a token nobody proposed.
+                _, lens, cu_np = self.runner.attn_metadata_builder.decode_spans(
+                    batch
+                )
+                spec = batch.scheduled_spec_decode_tokens
+                for i in range(len(lens)):
+                    n_draft = int(lens[i]) - 1
+                    if n_draft > 0:
+                        s = int(cu_np[i]) + 1
+                        self.input_ids.np[s : s + n_draft] = spec[i, :n_draft]
+            # The deferred branch publishes these further down and the
+            # backends read them off the processor, not off the batch:
+            # `GDNAttentionMetadataBuilder.prepare_num_accepted_tokens`
+            # leaves `num_accepted_tokens` at its fill value of 1 when
+            # `num_bonus` is None. Left unset, every request looks like it
+            # accepted exactly its anchor, and the linear-attention state
+            # rolls back to the wrong position on any step that accepted
+            # more. They describe the PREVIOUS step, which is what a
+            # rollback at the head of this one wants.
+            #
+            # Outside `use_spec`, which is `... and get_pp_group().is_last_rank`:
+            # only the last stage drafts and samples, but every stage carries
+            # linear-attention layers and every one of them has to roll back by
+            # the same amount. Reading it off the batch is what makes that
+            # possible -- the counts are pickled to all stages, while the
+            # processor these used to come from is only ever filled where
+            # sampling happens.
+            if self.spec_enabled:
+                self.num_rejected = batch.num_rejected
+                self.num_bonus = batch.num_bonus
             return self.input_ids.copy_to_gpu(total_tokens_decode)
 
         # PD consumer first decode: no prior prefill step initialized
@@ -690,7 +737,8 @@ class ModelRunner:
         default_dtype = self.config.torch_dtype
         torch.set_default_dtype(default_dtype)
         torch.set_default_device(self.device)
-        use_spec = bool(self.config.speculative_config) and get_pp_group().is_last_rank
+        spec_enabled = bool(self.config.speculative_config)
+        use_spec = spec_enabled and get_pp_group().is_last_rank
         self.num_spec_tokens = (
             self.config.speculative_config.num_speculative_tokens if use_spec else 0
         )
@@ -701,6 +749,7 @@ class ModelRunner:
             self.config.max_num_batched_tokens,
             use_spec,
             self.num_spec_tokens,
+            spec_enabled,
         )
         self.sampler = Sampler()
         self.arange_np = np.arange(
@@ -798,6 +847,7 @@ class ModelRunner:
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
         if getattr(self, "drafter", None) is not None:
             self.drafter.arm_aux_capture(self.model)
+        self._build_pp_aux_relay()
         self._init_forward_vars_ring()
         self.forward_done_event = torch.cuda.Event()
         initialize_eplb_runtime(self)
@@ -2674,6 +2724,41 @@ class ModelRunner:
             off += local_len
         return torch.cat(outs)
 
+    def _build_pp_aux_relay(self):
+        """Stand up the aux-hidden-state relay when a drafter taps target layers
+        this stage's pipeline neighbours own. See `spec_decode/pp_aux_relay.py`.
+
+        Runs on EVERY stage, including the ones with no drafter: those are the
+        stages that have to capture and forward. The spec is derived from the
+        speculative config rather than the drafter object for the same reason --
+        only the last stage has one.
+        """
+        self.pp_aux_relay = None
+        self._pp_recv_aux = None
+        if get_pp_group().world_size <= 1 or self.config.speculative_config is None:
+            return
+        from atom.spec_decode.dspark_proposer import build_aux_capture_spec
+        from atom.spec_decode.pp_aux_relay import PPAuxRelay
+
+        drafter = getattr(self, "drafter", None)
+        if drafter is not None:
+            spec = drafter._aux_capture_spec(self.model)
+        else:
+            spec = build_aux_capture_spec(self.config)
+        if spec is None:
+            return
+        relay = PPAuxRelay(
+            spec,
+            self.model,
+            self.config.max_num_batched_tokens,
+            self.device,
+            self.config.torch_dtype,
+        )
+        if not relay.incoming_ids and not relay.outgoing_ids:
+            return
+        relay.arm(self.model, lambda: get_forward_context().context.is_draft)
+        self.pp_aux_relay = relay
+
     def _setup_pp_shared_indexer(self):
         """Cache per-rank predicates for GLM-5.2 DSA IndexShare PP-boundary
         top-k transfer. Computed once.
@@ -2877,6 +2962,15 @@ class ModelRunner:
                     if recv_sparse is not None and self._pp_recv_needs_sparse:
                         tgt = self.attn_metadata_builder._sparse_kv_indices_gpu
                         tgt[: recv_sparse.numel()].copy_(recv_sparse)
+                    # DSpark aux hidden states from target layers on earlier
+                    # stages. Popped for the same reason as the top-k above.
+                    self._pp_recv_aux = intermediate_tensors.tensors.pop(
+                        PP_AUX_KEY, None
+                    )
+                    if self.pp_aux_relay is not None and pp_group.is_last_rank:
+                        self.pp_aux_relay.absorb(
+                            self._pp_recv_aux, self.drafter._aux_buffers
+                        )
 
                 if pp_enabled:
                     model_output = self.model(
@@ -2900,6 +2994,13 @@ class ModelRunner:
                         model_output.tensors["sparse_kv_indices"] = (
                             self.attn_metadata_builder._sparse_kv_indices_gpu[:n]
                         )
+                    if self.pp_aux_relay is not None:
+                        aux = self.pp_aux_relay.pack(
+                            self._pp_recv_aux,
+                            model_output.tensors["hidden_states"].shape[0],
+                        )
+                        if aux is not None:
+                            model_output.tensors[PP_AUX_KEY] = aux
                     if self._pp_pending_send:
                         commit_pp_send_work(self._pp_pending_send)
                     self._pp_pending_send = async_send_intermediate_tensors(
@@ -3148,8 +3249,24 @@ class ModelRunner:
                 prev_rejected_num = np.zeros(0, dtype=np.int32)
                 prev_bonus_num = np.zeros(0, dtype=np.int32)
         else:
-            prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
-            prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
+            # Nothing is deferred on this path, so the counts that belong with
+            # the tokens `prepare_sampled_ids` just emitted are THIS step's --
+            # not, as on the deferred path, the previous step's. Zeroes here
+            # read as "every draft was accepted": the scheduler stages the next
+            # step's window at `seq.num_tokens - num_rejected - num`
+            # (`ScheduledBatch.__init__`), so the anchor lands `num_rejected`
+            # slots late, on the trailing `eos_token_id` placeholders, and the
+            # request degenerates into fluent noise.
+            #
+            # `num_bonus_tokens` is None on a step that scored no drafts (the
+            # `spec_decode_metadata is None` branch above), where nothing was
+            # rejected and the zeros are right.
+            if num_bonus_tokens is not None:
+                prev_rejected_num = num_reject_tokens.cpu().numpy().astype(np.int32)
+                prev_bonus_num = num_bonus_tokens.cpu().numpy().astype(np.int32)
+            else:
+                prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
+                prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
             # PP stages (is_deferred_out=False) still run the drafter.
             if hasattr(self, "drafter"):
                 # Mid-prompt sequences get their anchor corrected inside

@@ -43,6 +43,7 @@ from atom.model_ops.attention_mla import (
     MLAAttention,
     mla_dcp_decode_is_persistent,
     mla_dcp_kernel_num_heads,
+    mla_kernel_num_heads,
 )
 from atom.model_ops.glm5_next.geometry import (
     effective_kpool_size,
@@ -375,7 +376,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         config = model_runner.config
         hf_config = config.hf_config
         # `self.num_attention_heads` set by CommonAttentionBuilder.__init__.
-        self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
+        # Must name the same width as `MLAAttention.padded_num_heads`: that one
+        # pads the query, this one sizes the work descriptors the kernel reading
+        # that query will consume. Rounded up for the same reason.
+        self.padded_num_attention_heads = mla_kernel_num_heads(
+            max(self.num_attention_heads, _MLA_MIN_HEADS)
+        )
         self.is_sparse = model_runner.has_mla_indexer
         self.index_topk = hf_config.index_topk if self.is_sparse else -1
         # GLM-5.3's pooled indexer selects `index_topk // index_kpool` POOLS --
