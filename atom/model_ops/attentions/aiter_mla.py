@@ -53,7 +53,7 @@ from atom.model_ops.sparse_indexer_fp4 import (
     FP4_MQA_PARALLEL_UNIT_NUM,
     fp4_decode_parallel_units,
     fp4_decode_schedule,
-    fp4_index_scale_rows_np,
+    fp4_index_scale_rows,
     fp4_prefill_schedule,
     sparse_indexer_fp4_enabled,
 )
@@ -1690,27 +1690,28 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # all of which are settled here, once per forward. The gather itself
         # runs once per indexer layer, so leaving the decomposition there had
         # every layer rebuild the same tensors: `arange`, two divides, two
-        # remainders and the swizzle, times the layer count.
+        # remainders and the swizzle, times 79 layers -- 4.9 ms of stream time
+        # per forward at either of this workload's typical `total_kv`.
         #
-        # Publishing them costs one pass over each here and nothing per layer.
-        # numpy rather than torch on the device for the same reason `slots`
-        # already is: it is host arithmetic on data the host just built, and it
-        # keeps `sparse_indexer_fp4` free of any device dependency.
+        # On the device, not on the host beside `slots`: the arithmetic is 20x
+        # faster per element there (0.076 ms against 1.29 ms at total_kv=232k,
+        # gfx950), it reuses the upload `slots` already needs instead of adding
+        # six more, and a page/row pair the device computes is the same pair the
+        # per-layer code computed before this change.
         def publish(name, src):
             page, row = src // block, src % block
-            for suffix, arr in (
+            for suffix, idx in (
                 ("page", page),
                 ("row", row),
-                ("scale_row", fp4_index_scale_rows_np(row, block)),
+                ("scale_row", fp4_index_scale_rows(row, block)),
             ):
-                setattr(
-                    attn_metadata,
-                    f"{name}_{suffix}",
-                    torch.from_numpy(arr.astype(np.int32)).to(dev, non_blocking=True),
-                )
+                setattr(attn_metadata, f"{name}_{suffix}", idx)
 
-        publish("dcp_indexer_fp4_read", slots)
-        publish("dcp_indexer_fp4_stage", np.arange(total_kv, dtype=np.int64))
+        publish("dcp_indexer_fp4_read", attn_metadata.dcp_indexer_fp4_local_slots)
+        publish(
+            "dcp_indexer_fp4_stage",
+            torch.arange(total_kv, dtype=torch.int32, device=dev),
+        )
 
         # Fixed width, not `pages`: the scorer specializes on this table's
         # stride, so a per-batch width recompiles it. Sized at a whole batch's

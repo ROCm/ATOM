@@ -399,36 +399,26 @@ def _assert_agrees(got, want, visible, topk):
     assert overlap > 0.99, overlap
 
 
-def test_scale_row_swizzle_agrees_across_torch_and_numpy():
-    """The e8m0 row bend, in both spellings, against a written-out oracle.
+def test_scale_row_swizzle_matches_its_oracle():
+    """The e8m0 row bend against a written-out oracle.
 
-    The prefill metadata builder uses the numpy form and everything else the
-    torch one, so the two have to stay the same function -- if they drift, one
-    plane's rows are bent and the other's are not, and the mismatch is silent
-    because every index stays in bounds either way. No GPU: this is integer
-    arithmetic, and pinning it is the only coverage the swizzle gets on a
-    CPU-only CI runner.
+    Every FP4 reader that moves the two planes together bends through this one
+    function, and a wrong bend is silent: it mixes exponents across a block
+    while every index stays in bounds. No GPU -- this is integer arithmetic, and
+    pinning it is the only coverage the swizzle gets on a CPU-only CI runner.
     """
-    from atom.model_ops.sparse_indexer_fp4 import (
-        fp4_index_scale_rows,
-        fp4_index_scale_rows_np,
-    )
+    from atom.model_ops.sparse_indexer_fp4 import fp4_index_scale_rows
 
     rows = torch.arange(_BLOCK)
     want = _expect_scale_row(rows, _BLOCK)
     assert torch.equal(fp4_index_scale_rows(rows, _BLOCK), want)
-    assert np.array_equal(fp4_index_scale_rows_np(rows.numpy(), _BLOCK), want.numpy())
     # A permutation of the block, so no two rows share a destination.
     assert sorted(want.tolist()) == list(range(_BLOCK))
 
     # The page size is checked rather than assumed: a caller paging the cache
     # differently gets a mapping that is wrong and still in bounds.
-    for fn, arg in (
-        (fp4_index_scale_rows, rows),
-        (fp4_index_scale_rows_np, rows.numpy()),
-    ):
-        with pytest.raises(ValueError, match="64-row blocks"):
-            fn(arg, 16)
+    with pytest.raises(ValueError, match="64-row blocks"):
+        fp4_index_scale_rows(rows, 16)
 
 
 def test_decode_scores_the_cache_the_fused_writer_wrote(on_gfx950):
@@ -636,8 +626,6 @@ def test_staged_page_table_spans_a_whole_batch_not_one_sequence():
     allowance the table would turn a legal schedule into a mid-serving raise,
     so it spans a full batch; the tail the scorer never reads stays zero rather
     than aliasing a real page."""
-    import numpy as np
-
     aiter_mla = _import_or_skip(
         "atom.model_ops.attentions.aiter_mla",
         reason="the MLA builder imports triton at module scope",

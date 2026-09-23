@@ -14,7 +14,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-import numpy as np
 import torch
 
 logger = logging.getLogger("atom")
@@ -179,20 +178,6 @@ def fp4_index_scale_rows(rows: torch.Tensor, block_size: int) -> torch.Tensor:
     lane count is a property of the plane the kernel wrote, and a caller paging
     the cache differently would otherwise get a wrong mapping that is still
     in-bounds. `fp4_index_block_shapes` is what holds the two equal.
-    """
-    _check_block(block_size)
-    lanes = FP4_KV_BLOCK_SIZE // _MFMA_M
-    return (rows % _MFMA_M) * lanes + rows // _MFMA_M
-
-
-def fp4_index_scale_rows_np(rows: np.ndarray, block_size: int) -> np.ndarray:
-    """`fp4_index_scale_rows` on host arrays, for the prefill metadata builder.
-
-    The builder settles these once per forward in numpy, beside the slot list it
-    already computes there, so the gather does not rebuild them per layer. Same
-    expression as the torch form on purpose -- numpy's `//` and `%` floor for
-    negative values exactly as torch's do, so a slot list either path can
-    produce decomposes the same way in both.
     """
     _check_block(block_size)
     lanes = FP4_KV_BLOCK_SIZE // _MFMA_M
