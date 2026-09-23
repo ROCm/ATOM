@@ -35,14 +35,7 @@ from atom.model_ops.sparse_indexer_fp4 import (
 
 
 def _expect_scale_row(rows, block):
-    """The e8m0 row swizzle, spelled out here rather than imported.
-
-    This is what `fp4_index_scale_rows` and the indices the metadata builder
-    publishes are checked against, so it has to be independent of them: a test
-    that asks the implementation what to expect passes just as happily when the
-    implementation is wrong. `fp4_index_scale_rows` explains why the swizzle
-    exists and what a wrong row costs.
-    """
+    """The e8m0 row swizzle, written out so tests don't ask the code under test."""
     return (rows % 16) * (block // 16) + rows // 16
 
 
@@ -402,21 +395,12 @@ def _assert_agrees(got, want, visible, topk):
 
 
 def test_scale_row_swizzle_matches_its_oracle():
-    """The e8m0 row bend against a written-out oracle.
-
-    Every FP4 reader that moves the two planes together bends through this one
-    function, and a wrong bend is silent: it mixes exponents across a block
-    while every index stays in bounds. No GPU -- this is integer arithmetic, and
-    pinning it is the only coverage the swizzle gets on a CPU-only CI runner.
-    """
+    """The e8m0 row swizzle on CPU: a wrong one is silent, every index in bounds."""
     rows = torch.arange(_BLOCK)
     want = _expect_scale_row(rows, _BLOCK)
     assert torch.equal(fp4_index_scale_rows(rows, _BLOCK), want)
-    # A permutation of the block, so no two rows share a destination.
     assert sorted(want.tolist()) == list(range(_BLOCK))
 
-    # The page size is checked rather than assumed: a caller paging the cache
-    # differently gets a mapping that is wrong and still in bounds.
     with pytest.raises(ValueError, match="64-row blocks"):
         fp4_index_scale_rows(rows, 16)
 
@@ -545,20 +529,8 @@ def test_dcp_prefill_staging_keeps_every_key_with_its_own_exponent(monkeypatch):
     data_src = torch.randint(0, 256, (src_pages, 1, 4, block, 16), **shape)
     scale_src = torch.randint(0, 256, (src_pages, 1, 4, block), **shape)
 
-    # This rank's slots, spread over pages and rows so that after the gather no
-    # source row equals the destination row it lands on. That property is the
-    # whole reason a swizzle bug is visible here -- where a source row happens
-    # to equal its destination, the position proves nothing.
-    #
-    # Built rather than drawn, and built on the gathered order, which is where
-    # the property has to hold. It used to come out of two bare `randperm`s
-    # under a module-level seed, so it was a property of whichever RNG stream
-    # was current: the GPU-gated tests above consume the CPU generator when a
-    # card is present and skip when it is not, so the same file drew a
-    # different permutation on the two runs and the comment was true on at most
-    # one of them. Rotating both the slot rows and the gather by one puts every
-    # destination two rows from its source on any box. Pages stay drawn, so the
-    # test still crosses page boundaries.
+    # No source row may land on its own row, or a missing swizzle goes unseen.
+    # Built by rotation, not randperm, so it holds on any box and RNG stream.
     g = torch.Generator().manual_seed(0)
     src_row = (torch.arange(local) + 1) % block
     src_page = torch.randperm(src_pages, generator=g).repeat(-(-local // src_pages))[
@@ -588,9 +560,7 @@ def test_dcp_prefill_staging_keeps_every_key_with_its_own_exponent(monkeypatch):
         SimpleNamespace(
             dcp_indexer_fp4_local_slots=slots,
             dcp_indexer_gather_index=gather_index,
-            # The builder settles both index sets once per forward; the gather
-            # only reads them. Spelled out here rather than imported so this
-            # test says what it expects the builder to have published.
+            # What the builder publishes, written out.
             dcp_indexer_fp4_read_page=slots.long() // block,
             dcp_indexer_fp4_read_row=slots.long() % block,
             dcp_indexer_fp4_read_scale_row=_expect_scale_row(
@@ -662,13 +632,7 @@ def test_staged_page_table_spans_a_whole_batch_not_one_sequence():
     [(0, 0), (1, 1), (7, 5), (300, 100), (1023, 1024), (1025, 4000), (60_000, 232_003)],
 )
 def test_decompose_slots_matches_torch(n_slots, n_iota):
-    """The one-launch slot decomposition against the torch form it replaces.
-
-    The sizes straddle the kernel's 1024-wide tile on both inputs, and either
-    input may be the longer one. Slots include negatives: triton's `//` and `%`
-    truncate where torch's floor, which is why the kernel shifts and masks, and
-    this is what would notice if it stopped.
-    """
+    """decompose_slots_triton vs torch: tile tails, either input longer, negative slots."""
     if not torch.cuda.is_available():
         pytest.skip("requires a ROCm GPU")
     block_convert = _import_or_skip("atom.utils.block_convert")
@@ -690,17 +654,10 @@ def test_decompose_slots_matches_torch(n_slots, n_iota):
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_builder_publishes_the_staging_indices_it_derives(device):
-    """The six index tensors the DCP FP4 gather reads, as the builder publishes
-    them, on both paths: the one-launch kernel on a GPU, the torch form without.
+    """The builder's six staging index tensors, on the kernel and torch paths.
 
-    The staging test above feeds those tensors in by hand, so it pins the
-    gather and says nothing about the builder: swap `page` and `row` in the
-    builder and it stays green. This runs the builder itself over block tables
-    whose pages are neither zero nor their own column, with sequences that end
-    mid-block, so a slot's page, its row and its swizzled row all differ and
-    each is checked against the written-out oracle on its own. On the GPU this
-    is also what pins the kernel's six outputs to the six names they are
-    published under.
+    Non-trivial block tables and mid-block sequence ends, so page, row and
+    swizzled row all differ; on GPU this also pins outputs to their names.
     """
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires a ROCm GPU")
@@ -742,7 +699,6 @@ def test_builder_publishes_the_staging_indices_it_derives(device):
         page = getattr(meta, f"dcp_indexer_fp4_{side}_page").cpu()
         row = getattr(meta, f"dcp_indexer_fp4_{side}_row").cpu()
         scale_row = getattr(meta, f"dcp_indexer_fp4_{side}_scale_row").cpu()
-        # The width main indexed with; nothing here needs to widen to int64.
         assert page.dtype == row.dtype == scale_row.dtype == torch.int32, side
         assert torch.equal(page.long(), src // block), side
         assert torch.equal(row.long(), src % block), side

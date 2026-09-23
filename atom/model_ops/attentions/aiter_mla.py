@@ -405,11 +405,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.dcp_rank = get_dcp_rank()
         self._publishes_dcp_local_lens = self.is_sparse and self.dcp_world_size > 1
         self._tbo_full_running_bs = 0
-        # The e8m0 row bend the DCP FP4 staging indices need, as a table, so the
-        # kernel that publishes them reads `fp4_index_scale_rows` instead of
-        # restating it. The kernel is compiled here too: its only caller is a
-        # long DCP prefill, which warmup never reaches, so a lazy first compile
-        # would land inside a served request.
+        # e8m0 row-swizzle table for decompose_slots_triton. Compile the kernel
+        # now: warmup never reaches a long DCP prefill.
         self._fp4_scale_row_lut = None
         if self._indexer_fp4 and self.dcp_world_size > 1:
             block = model_runner.block_size
@@ -1694,32 +1691,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             slots.astype(np.int32)
         ).to(dev, non_blocking=True)
 
-        # The staging gather addresses two planes whose row axes disagree: the
-        # packed E2M1 one is flat, the e8m0 one an `_MFMA_M`-wide transpose of
-        # it, so a reader moving them together has to bend or it mixes exponents
-        # across a block -- silently, since every index stays in bounds. Both
-        # sides' indices are a pure function of `slots`, `total_kv` and `block`,
-        # all of which are settled here, once per forward. The gather itself
-        # runs once per layer that owns an indexer, so leaving the decomposition
-        # there had every such layer rebuild the same tensors: `arange`, two
-        # divides, two remainders and the swizzle, 24us of stream time each on
-        # gfx950 and flat in `total_kv`. GLM-5.2 has 22 such layers (21 "full"
-        # plus the MTP draft; its 57 "shared" layers reuse a full layer's top-k
-        # and never reach the gather), so 0.5 ms per prefill forward.
-        #
-        # One launch, on the device. Eager torch spends thirteen small kernels
-        # here (24us of stream time against 3us for this one), and the host is
-        # the wrong place: numpy is 20x slower per element at this work and
-        # would add six uploads beside the one `slots` already needs.
+        # Page / row / e8m0 row for the DCP FP4 staging gather. They depend only
+        # on `slots` and `total_kv`, so build them once per forward, not per layer.
         read, stage = "dcp_indexer_fp4_read", "dcp_indexer_fp4_stage"
         slots_dev = attn_metadata.dcp_indexer_fp4_local_slots
         lut = getattr(self, "_fp4_scale_row_lut", None)
         if lut is not None:
             idx = decompose_slots_triton(slots_dev, total_kv, block, lut)
         else:
-            # No device kernel (a CPU build, or a builder the tests assemble):
-            # the same decomposition in torch, and the reference the kernel's
-            # test compares against.
+            # Torch fallback (CPU / test builders); also the kernel's reference.
             token = torch.arange(total_kv, dtype=torch.int32, device=dev)
             idx = []
             for src in (slots_dev, token):
