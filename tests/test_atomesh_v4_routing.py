@@ -69,7 +69,7 @@ start_router
             ["bash", "-eu", "-c", self.script],
             cwd=ROOT,
             env=dict(
-                self.env,
+                {**self.env, **cell["env"]["common"]},
                 ROUTER_POLICY=policy or service["router"]["policy"],
                 ATOMESH_MESH_BINARY="/test/atomesh",
                 ATOM_PD_RANK_MAPPING_POLICY="none",
@@ -106,6 +106,9 @@ start_router
         }
         for cell in self.cells:
             with self.subTest(concurrency=cell["concurrency"]):
+                expected["--balance-abs-threshold"] = (
+                    "40" if cell["concurrency"] == [256] else "20"
+                )
                 self.assertEqual(cell["service"]["router"]["policy"], "cache_aware")
                 args = self.router_args(cell)
                 self.assertIn("--dp-aware", args)

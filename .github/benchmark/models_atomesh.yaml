@@ -1202,6 +1202,10 @@ models:
         - <<: *dsv4_0813_agentic_dpa_no_offload
           name: ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c256
           concurrency: [256]
+          # Compare 40/2.0 with the 20/2.0 baseline from Atomesh run #1277.
+          env:
+            common:
+              ROUTER_BALANCE_ABS_THRESHOLD: "40"
           server:
             common_args:
               max_num_seqs: 512
