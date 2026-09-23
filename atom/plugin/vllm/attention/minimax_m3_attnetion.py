@@ -10,6 +10,8 @@ runtime below; dense layers use vLLM's Triton custom-op backend after applying
 MiniMax-M3's q/k norm + RoPE transform.
 """
 
+import logging
+
 import aiter
 import torch
 from aiter import dtypes
@@ -33,7 +35,48 @@ from atom.plugin.vllm.attention.layer_common import (
 )
 from atom.utils import mark_spliting_op
 
+logger = logging.getLogger("atom")
+
 _MINIMAX_M3_TOPK_CACHE_STATE: dict = {}
+_BREAKABLE_PREFLIGHT_DONE = False
+
+
+def _warn_if_eager_break_is_inert() -> None:
+    """Say so, once, if M3's only graph-capture protection is switched off.
+
+    ``_sparse_attn_run`` below carries ``@eager_break_during_capture``, but the
+    decorator hands the call straight through unless breakable cudagraph is
+    enabled. vLLM enables it for M3 from a hardcoded tuple of architecture
+    names in its own config, which ATOM tracks daily and does not own; setting
+    ``VLLM_USE_BREAKABLE_CUDAGRAPH=0`` also removes it. Either way the sparse
+    layers get captured with one batch's block_table, seq_lens and topk indices
+    frozen into every replay.
+
+    A warning rather than a refusal: with the break removed the server still
+    boots and cold prompts still answer correctly (measured on M3 TP4,
+    2026-09-23), so the failure this guards against is a correctness risk on
+    reused prefixes, not a configuration that is always wrong. What is not
+    acceptable is reaching that state in silence.
+    """
+    global _BREAKABLE_PREFLIGHT_DONE
+    if _BREAKABLE_PREFLIGHT_DONE:
+        return
+    _BREAKABLE_PREFLIGHT_DONE = True
+
+    from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
+
+    if is_breakable_cudagraph_enabled():
+        return
+    logger.warning(
+        "MiniMax-M3 sparse attention: breakable cudagraph is OFF, so the "
+        "@eager_break_during_capture on _sparse_attn_run does nothing. If "
+        "cudagraphs are captured at all, the sparse layers are captured with "
+        "this batch's metadata frozen into every replay -- cold prompts still "
+        "answer correctly, reused prefixes may answer fluently from the wrong "
+        "KV. Expected only when VLLM_USE_BREAKABLE_CUDAGRAPH=0 is set on "
+        "purpose; otherwise check that M3 is still named in vLLM's "
+        "auto-enable gate (vllm/config/vllm.py)."
+    )
 
 
 def minimax_m3_sparse_attention_fake(
@@ -203,6 +246,7 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         **kwargs,
     ) -> None:
         super().__init__()
+        _warn_if_eager_break_is_inert()
         del (
             alibi_slopes,
             use_mla,

@@ -110,3 +110,91 @@ def test_the_break_writes_into_a_caller_owned_buffer():
     assert run is not None and "output" in {
         a.arg for a in run.args.args
     }, "the eager break must receive the buffer rather than allocate one"
+
+
+# ---------------------------------------------------------------------------
+# The other half of the contract: the decorator above only does anything while
+# breakable cudagraph is on, and for M3 nobody turns it on explicitly -- vLLM
+# does it from a hardcoded tuple of architecture names in its own config. So
+# M3's prefix-reuse correctness rests on a literal in a package ATOM tracks
+# daily and does not own. Drop the name there (a rename, a refactor of the
+# gate, an upstream decision to enable breakable some other way) and the
+# decorator becomes dead code, in silence: the server still boots, cold
+# prompts still answer correctly, and only reused prefixes read the wrong KV.
+#
+# ATOM's own `splitting_ops` (atom/config.py) cannot cover for it. That list
+# belongs to ATOM's native engine, and in plugin mode with breakable enabled
+# vLLM sets CompilationMode.NONE -- there is no FX split to fall back to. This
+# test is the whole fallback.
+
+M3_ARCHITECTURES = (
+    "MiniMaxM3SparseForCausalLM",
+    "MiniMaxM3SparseForConditionalGeneration",
+)
+
+BREAKABLE_ENV = "VLLM_USE_BREAKABLE_CUDAGRAPH"
+
+
+def _vllm_config_source() -> Path | None:
+    """Path to vllm/config/vllm.py without importing vllm."""
+    import importlib.util
+
+    spec = importlib.util.find_spec("vllm")
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    path = Path(next(iter(spec.submodule_search_locations))) / "config" / "vllm.py"
+    return path if path.exists() else None
+
+
+def _auto_enable_gate(tree: ast.Module) -> ast.If | None:
+    """The ``if`` whose body switches the breakable env var on.
+
+    Matched by what it does, not by where it sits or what the tuple is called,
+    so upstream reformatting does not turn this guard into a false alarm.
+    """
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        for stmt in ast.walk(ast.Module(body=node.body, type_ignores=[])):
+            if not isinstance(stmt, ast.Assign):
+                continue
+            for target in stmt.targets:
+                if (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.slice, ast.Constant)
+                    and target.slice.value == BREAKABLE_ENV
+                ):
+                    return node
+    return None
+
+
+def test_vllm_still_auto_enables_breakable_cudagraph_for_m3():
+    source = _vllm_config_source()
+    assert source is not None, (
+        "vllm is not importable, so the architecture gate M3 depends on cannot "
+        "be checked -- this guard must not pass quietly in that state"
+    )
+
+    gate = _auto_enable_gate(ast.parse(source.read_text()))
+    assert gate is not None, (
+        f"no `if` in {source} assigns os.environ[{BREAKABLE_ENV!r}] any more. "
+        "vLLM changed how breakable cudagraph gets enabled; re-derive how M3 "
+        "turns it on before deleting this test, because M3's eager break is "
+        "inert whenever it is off"
+    )
+
+    named = {
+        n.value
+        for n in ast.walk(gate.test)
+        if isinstance(n, ast.Constant) and isinstance(n.value, str)
+    }
+    missing = [arch for arch in M3_ARCHITECTURES if arch not in named]
+    assert not missing, (
+        f"{missing} no longer appear in vLLM's breakable auto-enable gate "
+        f"({source}). M3's @{BREAK_DECORATOR} only fires while breakable "
+        "cudagraph is enabled, so with this gate closed M3's sparse layers are "
+        "captured with one batch's block_table and topk indices frozen into "
+        "every replay. Cold prompts still look right; reused prefixes answer "
+        f"fluently from the wrong KV. Either get the names restored upstream, "
+        f"or set {BREAKABLE_ENV}=1 for M3 from the ATOM plugin"
+    )
