@@ -1130,6 +1130,66 @@ def test_mlaattention_init_actually_calls_qrep_enabled_for_layer():
     ], f"qrep_enabled_for_layer's call site changed shape: got {arg_names}"
 
 
+def test_rebuild_sparse_dcp_persistent_metadata_call_sites_use_their_own_width():
+    """Pins gathered_num_heads at both call sites, not just the function.
+
+    Decode and sparse prefill round the gathered query width through
+    different tables (mla_dcp_kernel_num_heads vs mla_dcp_sparse_prefill_
+    num_heads) and can disagree (e.g. num_heads=12, dcp=8 -> 96 vs 128).
+    Passing the wrong one plans persistent work descriptors for the wrong
+    nhead; nothing importable on the CPU gate would notice a regression
+    here, so read the two call sites from source instead.
+    """
+    tree = ast.parse(_ATTENTION_MLA_PATH.read_text(encoding="utf-8"))
+
+    def _name(node):
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            return f"{node.value.id}.{node.attr}"
+        return None
+
+    by_enclosing_func = {}
+    for func in ast.walk(tree):
+        if not isinstance(func, ast.FunctionDef):
+            continue
+        for node in ast.walk(func):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_rebuild_sparse_dcp_persistent_metadata"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "self"
+            ):
+                by_enclosing_func[func.name] = _name(node.args[6])
+
+    assert by_enclosing_func == {
+        "_forward_decode": "self.dcp_kernel_num_heads",
+        "_forward_prefill_mla": "self.dcp_sparse_prefill_num_heads",
+    }, (
+        "a _rebuild_sparse_dcp_persistent_metadata call site is passing the "
+        f"wrong gathered_num_heads (7th positional arg): got {by_enclosing_func}"
+    )
+
+
+@needs_dcp_ops
+def test_dcp_kernel_and_sparse_prefill_num_heads_can_diverge():
+    """Demonstrates the gap the test above guards against is real, not just
+    hypothetical: at this head count the two width tables actually disagree.
+    """
+    decode_width = mla_dcp_kernel_num_heads(
+        12, 8, kv_cache_dtype="bf16", persistent=True
+    )
+    prefill_width = mla_dcp_sparse_prefill_num_heads(12, 8, persistent=True)
+    assert (decode_width, prefill_width) == (96, 128), (
+        "expected decode's and sparse prefill's width tables to disagree "
+        f"here; got decode={decode_width}, prefill={prefill_width} -- if "
+        "they now agree, the case above no longer proves the two call sites "
+        "must use their own width, pick another num_heads/dcp pair that "
+        "still diverges"
+    )
+
+
 # ──────────────── QREP wiring at the q_proj producers (CPU, source-level) ──
 #
 # Pins the other half of the safety net above: models that are SUPPOSED to

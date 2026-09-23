@@ -753,7 +753,15 @@ class MLAAttention(nn.Module):
             ):
                 reason = "q_proj's quant type cannot be row-sliced by _local_q_proj"
             else:
-                reason = "q_proj was not built with qrep_tp_override"
+                # Not just "never called qrep_tp_override": also covers a
+                # wrapper that hides .weight from us while its inner linear
+                # really was overridden (see q_proj_is_qrep_widened's "Known
+                # residual gap" docstring note) -- don't name a specific
+                # cause we can't actually distinguish here.
+                reason = (
+                    "q_proj is not QREP-widened (no qrep_tp_override, or its "
+                    "width does not match the DCP-group head set)"
+                )
             logger.warning(
                 "dcp_config.enable_query_replication is on, but layer %d's "
                 "%s -- falling back to AllGather Q for it.",
