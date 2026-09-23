@@ -17,6 +17,7 @@ from atom.kv_transfer.disaggregation.sharded_transfer import build_dcp_shard_pla
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
 @pytest.mark.parametrize("width", [48, 576])
 def test_mla_gather_preserves_sharded_bytes_and_partial_page(dcp_size, dtype, width):
+    pytest.importorskip("triton", reason="MLA gather is a Triton kernel")
     device = torch.device("cuda")
     block_size = 16
     # Permuted source blocks and a partial final page exercise physical block
