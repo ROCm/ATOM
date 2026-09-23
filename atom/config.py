@@ -1618,16 +1618,65 @@ def qrep_unsupported_reason(dcp_size: int, mxfp4_bmm: bool) -> str | None:
 def q_proj_is_qrep_widened(q_proj, qrep_num_heads: int, qk_head_dim: int) -> bool:
     """Whether `q_proj` was actually built with `qrep_tp_override`.
 
-    A layer that never opted in (e.g. an eagle3 / DSpark draft's own q_proj)
-    still has `q_proj.weight` at the plain per-rank width; reinterpreting that
-    as the wide QREP layout would corrupt or crash downstream, so this must be
-    checked before enabling QREP for the layer.
+    Requires both:
+      - provenance: `q_proj.effective_tp_overridden` (set by `LinearBase` iff
+        it was constructed with `qrep_tp_override`'s kwargs) is true.
+      - shape: `q_proj.weight`'s width matches `qrep_num_heads * qk_head_dim`.
+
+    Shape alone is not enough: at `tp == dcp`, `qrep_tp_override` computes
+    `override_tp_size = tp // dcp == 1`, a no-op, so the "widened" width is
+    just the full un-sharded head count -- indistinguishable by shape from a
+    layer that was never sharded at all (e.g. a `ReplicatedLinear`) and so
+    never got the row-ordering the override actually guarantees. Provenance
+    alone is not enough either: it says intent, not that the resulting shape
+    is what every consumer (`_local_q_proj`'s row slicing, the `W_K_qrep`
+    gather) assumes. Both together catch a layer that never opted in (e.g. an
+    eagle3 / DSpark draft's own q_proj, still at the plain per-rank width) and
+    a layer that opted in but produced the wrong width regardless.
 
     Dependency-free (only `getattr`/`.shape`) so it stays importable, and
     testable, without triton/aiter.
     """
+    if not getattr(q_proj, "effective_tp_overridden", False):
+        return False
     weight = getattr(q_proj, "weight", None)
     return weight is not None and weight.shape[0] == qrep_num_heads * qk_head_dim
+
+
+# Quant types `ColumnParallelLinear.make_row_view` can narrow a 2D
+# per-output-channel `weight_scale` for. Named, not imported from aiter's
+# QuantType enum, so this stays importable without triton/aiter; the aiter
+# side is pybind11-bound but its members' `.name` is this same string.
+_ROW_SLICEABLE_QUANT_TYPE_NAMES = frozenset({"per_1x128", "per_Token"})
+
+
+def q_proj_has_row_sliceable_scale(q_proj) -> bool:
+    """Whether `_local_q_proj`'s row view can safely narrow `q_proj`'s scale.
+
+    QREP's prefill path (`_local_q_proj`) row-slices `q_proj.weight` via
+    `make_row_view`, which also narrows a 2D per-output-channel
+    `weight_scale` -- but only knows how to for `per_1x128` and `per_Token`;
+    anything else (e.g. mxfp4's `per_1x32`) raises `NotImplementedError` the
+    first time prefill actually runs. `qrep_unsupported_reason`'s mxfp4 gate
+    only checks the global `ATOM_USE_TRITON_MXFP4_BMM` env var, which says
+    nothing about any individual layer's on-disk quant type, so a checkpoint
+    that ships genuinely mxfp4-quantized attention weights (the
+    `is_quark_static_mxfp4` path) without that env var set would sail past
+    it. Checking the actual scale layout here, per layer, closes that gap
+    independently of what the env var says.
+
+    No weight_scale, or one that is not 2D / has only one row, is not the
+    per-output-channel case `make_row_view` special-cases at all -- shared
+    as-is by the row view, so it is always safe.
+    """
+    weight_scale = getattr(q_proj, "weight_scale", None)
+    if weight_scale is None:
+        return True
+    scale_data = getattr(weight_scale, "data", weight_scale)
+    if scale_data.dim() != 2 or scale_data.shape[0] <= 1:
+        return True
+    quant_type = getattr(q_proj, "quant_type", None)
+    return getattr(quant_type, "name", None) in _ROW_SLICEABLE_QUANT_TYPE_NAMES
 
 
 def qrep_enabled_for_layer(
@@ -1635,9 +1684,16 @@ def qrep_enabled_for_layer(
 ) -> bool:
     """The per-layer QREP decision, kept testable on its own: asserting only
     `q_proj_is_qrep_widened`'s behavior can't catch the `and` being dropped
-    (or weakened) at the call site.
+    (or weakened) at the call site. Also requires `q_proj_has_row_sliceable_scale`
+    so a layer that is genuinely QREP-widened but whose on-disk quant type
+    `_local_q_proj` cannot row-slice falls back to AllGather instead of
+    raising the first time prefill runs.
     """
-    return wants_qrep and q_proj_is_qrep_widened(q_proj, qrep_num_heads, qk_head_dim)
+    return (
+        wants_qrep
+        and q_proj_is_qrep_widened(q_proj, qrep_num_heads, qk_head_dim)
+        and q_proj_has_row_sliceable_scale(q_proj)
+    )
 
 
 def indexer_cp_unsupported_reason(

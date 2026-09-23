@@ -48,6 +48,7 @@ import torch
 # triton/aiter, so the tests below run on the CPU gate.
 from atom.config import (
     DCPConfig,
+    q_proj_has_row_sliceable_scale,
     q_proj_is_qrep_widened,
     qrep_enabled_for_layer,
     qrep_unsupported_reason,
@@ -956,8 +957,9 @@ def test_gate_does_not_look_at_speculative_config():
 
 
 class _FakeLinear:
-    def __init__(self, out_features, in_features=8):
+    def __init__(self, out_features, in_features=8, effective_tp_overridden=False):
         self.weight = torch.empty(out_features, in_features)
+        self.effective_tp_overridden = effective_tp_overridden
 
 
 class _NoWeight:
@@ -968,7 +970,9 @@ class _NoWeight:
 
 
 def test_q_proj_is_qrep_widened_true_when_shard_matches():
-    q_proj = _FakeLinear(out_features=64 * 128)  # qrep_num_heads * qk_head_dim
+    q_proj = _FakeLinear(
+        out_features=64 * 128, effective_tp_overridden=True
+    )  # qrep_num_heads * qk_head_dim
     assert q_proj_is_qrep_widened(q_proj, qrep_num_heads=64, qk_head_dim=128)
 
 
@@ -982,7 +986,19 @@ def test_q_proj_is_qrep_widened_false_for_plain_per_rank_shard():
 def test_q_proj_is_qrep_widened_false_when_no_weight_attr():
     """GLM-5.3's `_ZeroRopePad` wraps its inner Linear without exposing
     `.weight` on itself -- must fall back cleanly, not raise."""
-    q_proj = _NoWeight(_FakeLinear(out_features=8 * 128))
+    q_proj = _NoWeight(_FakeLinear(out_features=8 * 128, effective_tp_overridden=True))
+    assert not q_proj_is_qrep_widened(q_proj, qrep_num_heads=64, qk_head_dim=128)
+
+
+def test_q_proj_is_qrep_widened_false_when_shape_matches_but_not_overridden():
+    """The tp == dcp degeneracy: qrep_tp_override's override_tp_size becomes
+    tp // dcp == 1 there, a no-op, so a QREP-widened q_proj and a plain
+    ReplicatedLinear that was never sharded at all end up the same width --
+    shape alone can't tell them apart. Provenance can: only a layer that
+    actually went through LinearBase's override path sets
+    `effective_tp_overridden`.
+    """
+    q_proj = _FakeLinear(out_features=64 * 128)  # right shape, wrong provenance
     assert not q_proj_is_qrep_widened(q_proj, qrep_num_heads=64, qk_head_dim=128)
 
 
@@ -991,7 +1007,7 @@ def test_qrep_enabled_for_layer_is_the_and_not_just_the_helper():
     dropped `and` at the call site would leave every helper test green while
     re-enabling QREP for unwired layers.
     """
-    widened = _FakeLinear(out_features=64 * 128)
+    widened = _FakeLinear(out_features=64 * 128, effective_tp_overridden=True)
     narrow = _FakeLinear(out_features=8 * 128)
     assert qrep_enabled_for_layer(True, widened, qrep_num_heads=64, qk_head_dim=128)
     assert not qrep_enabled_for_layer(
@@ -1000,6 +1016,60 @@ def test_qrep_enabled_for_layer_is_the_and_not_just_the_helper():
     assert not qrep_enabled_for_layer(
         True, narrow, qrep_num_heads=64, qk_head_dim=128
     ), "must not enable QREP for a layer whose q_proj was never widened"
+
+
+class _FakeQuantType:
+    """Stand-in for a pybind11-bound aiter QuantType member: has a `.name`."""
+
+    def __init__(self, name):
+        self.name = name
+
+
+def test_q_proj_has_row_sliceable_scale_true_when_no_weight_scale():
+    """Unquantized (e.g. bf16): no weight_scale at all, always safe to slice."""
+    q_proj = _FakeLinear(out_features=64 * 128, effective_tp_overridden=True)
+    assert q_proj_has_row_sliceable_scale(q_proj)
+
+
+def test_q_proj_has_row_sliceable_scale_true_for_1d_or_single_row_scale():
+    """per_Tensor (or any non-per-output-channel scale): make_row_view shares
+    it as-is, never enters the branch this check guards."""
+    q_proj = _FakeLinear(out_features=64 * 128, effective_tp_overridden=True)
+    q_proj.weight_scale = torch.empty(1)
+    assert q_proj_has_row_sliceable_scale(q_proj)
+
+
+def test_q_proj_has_row_sliceable_scale_true_for_per_1x128_and_per_token():
+    for name in ("per_1x128", "per_Token"):
+        q_proj = _FakeLinear(out_features=64 * 128, effective_tp_overridden=True)
+        q_proj.weight_scale = torch.empty(64 * 128 // 4, 1)
+        q_proj.quant_type = _FakeQuantType(name)
+        assert q_proj_has_row_sliceable_scale(
+            q_proj
+        ), f"make_row_view narrows {name} scales; the check should allow it"
+
+
+def test_q_proj_has_row_sliceable_scale_false_for_mxfp4_per_1x32():
+    """The is_quark_static_mxfp4 gap: qrep_unsupported_reason's mxfp4 gate only
+    checks the global ATOM_USE_TRITON_MXFP4_BMM env var, which says nothing
+    about a specific layer's on-disk quant type. A q_proj genuinely
+    mxfp4-quantized (per_1x32 weight_scale) is not one make_row_view knows
+    how to row-slice -- it would raise NotImplementedError the first time
+    prefill actually runs. This must be caught per layer instead.
+    """
+    q_proj = _FakeLinear(out_features=64 * 128, effective_tp_overridden=True)
+    q_proj.weight_scale = torch.empty(64 * 128 // 32, 1)
+    q_proj.quant_type = _FakeQuantType("per_1x32")
+    assert not q_proj_has_row_sliceable_scale(q_proj)
+
+
+def test_qrep_enabled_for_layer_falls_back_when_scale_not_row_sliceable():
+    q_proj = _FakeLinear(out_features=64 * 128, effective_tp_overridden=True)
+    q_proj.weight_scale = torch.empty(64 * 128 // 32, 1)
+    q_proj.quant_type = _FakeQuantType("per_1x32")
+    assert not qrep_enabled_for_layer(
+        True, q_proj, qrep_num_heads=64, qk_head_dim=128
+    ), "a widened q_proj whose scale can't be row-sliced must still fall back"
 
 
 # ──────────────── QREP wiring at the q_proj producers (CPU, source-level) ──
