@@ -52,7 +52,9 @@ def test_eplb_controls_effective_triton_backend(
         quant_method=None,
         is_dynamic=True,
     )
-    moe_config = SimpleNamespace(a_quant_dtype=None)
+    # TP, not EP: `use_triton` is `use_triton_moe and not use_ep`, so the
+    # expectation below is about the TP half of that pair.
+    moe_config = SimpleNamespace(a_quant_dtype=None, use_ep=False)
 
     method = moe_mod.Mxfp4MoEMethod(quant_config, moe_config)
 
@@ -76,8 +78,11 @@ def test_standard_post_routing_arguments_are_preserved(monkeypatch):
     method.intermediate_pad = 0
     # Skip both pre-routing early returns so apply() reaches the post-routing
     # block. use_triton_decode=False also short-circuits get_forward_context().
+    # `use_triton_ep` is the EP half of the same pair and is read further down;
+    # False keeps this on the TP path the post-routing block belongs to.
     method.use_triton = False
     method.use_triton_decode = False
+    method.use_triton_ep = False
     method.select_experts_with_record = lambda **_kwargs: (
         "topk_weights",
         "topk_ids",

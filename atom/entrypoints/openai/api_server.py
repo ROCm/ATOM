@@ -42,6 +42,7 @@ from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
 from atom.multimodal.processing import prepare_multimodal_inputs
+from atom.multimodal.registry import get_native_multimodal_processor
 from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
 from atom.utils.gc_utils import (
@@ -650,7 +651,13 @@ def _get_multimodal_processor():
     global processor
     if processor is None:
         logger.info(f"Loading multimodal processor from {model_name}...")
-        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        processor = get_native_multimodal_processor(
+            _get_engine_config(), tokenizer, custom_message_encoder
+        )
+        if processor is None:
+            processor = AutoProcessor.from_pretrained(
+                model_name, trust_remote_code=True
+            )
     return processor
 
 
@@ -1070,7 +1077,7 @@ async def generate_async_fanout(
                 try:
                     engine.core_mgr.abort_request(_seq.id)
                 except Exception:
-                    pass
+                    logger.debug("abort_request failed on teardown", exc_info=True)
             engine.io_processor.requests.pop(_seq.id, None)
 
     finished_at = time.time()
@@ -1209,7 +1216,7 @@ def cleanup_stream(seq_id: int, aborted: bool = False) -> None:
         try:
             engine.core_mgr.abort_request(seq_id)
         except Exception:
-            pass
+            logger.debug("abort_request failed on teardown", exc_info=True)
     engine.io_processor.requests.pop(seq_id, None)
 
 
@@ -1519,7 +1526,7 @@ async def value_error_handler(request: Request, exc: ValueError):
 
 @app.exception_handler(Exception)
 async def general_error_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled error: {exc}", exc_info=True)
+    logger.error("Unhandled error: %s", exc, exc_info=exc)
     return JSONResponse(
         status_code=500,
         content={
@@ -1614,7 +1621,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             prompt = apply_chat_template(
                 tokenizer,
                 custom_message_encoder,
-                [msg.to_template_dict() for msg in messages],
+                messages,
                 tools=request.tools,
                 **merged_kwargs,
             )
@@ -1794,8 +1801,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         logger.error(f"Validation error in chat_completions: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Error in chat_completions: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Error in chat_completions")
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/v1/completions")
@@ -1914,8 +1921,8 @@ async def completions(request: CompletionRequest, raw_request: Request):
         logger.error(f"Validation error in completions: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Error in completions: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Error in completions")
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/v1/messages")
@@ -1972,7 +1979,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         prompt = apply_chat_template(
             tokenizer,
             custom_message_encoder,
-            [msg.to_template_dict() for msg in messages],
+            messages,
             tools=anthropic_to_openai_tools(request.tools),
             **merged_kwargs,
         )
@@ -2017,6 +2024,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                     max_ctx = int(_v)
                     break
             except Exception:
+                logger.debug("max_ctx candidate rejected", exc_info=True)
                 continue
         if not max_ctx:
             max_ctx = 30720
@@ -2256,6 +2264,14 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
     except _ClientDisconnected:
         # Client hung up; seq already aborted + popped. Nothing to return.
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": str(exc)},
+            },
+        )
     except Exception as e:
         logger.exception("Error in anthropic_messages")
         return JSONResponse(
@@ -2349,7 +2365,7 @@ async def responses_create(raw_request: Request):
         prompt = apply_chat_template(
             tokenizer,
             custom_message_encoder,
-            [msg.to_template_dict() for msg in messages],
+            messages,
             tools=openai_tools,
             **merged_kwargs,
         )
@@ -2537,6 +2553,8 @@ async def responses_create(raw_request: Request):
 
     except _ClientDisconnected:
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
+    except ValueError as exc:
+        return await value_error_handler(raw_request, exc)
     except Exception as e:
         logger.exception("Error in responses_create")
         return JSONResponse(

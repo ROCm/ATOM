@@ -1568,7 +1568,7 @@ def channel_tokens(parser) -> list[str]:
     """
     module = sys.modules[parser.__module__]
     found: set[str] = set()
-    for value in vars(module).values():
+    for value in (*vars(module).values(), *vars(parser).values()):
         if isinstance(value, str):
             found.add(value)
         elif isinstance(value, tuple):
@@ -2158,6 +2158,7 @@ CALL_OPENERS: dict[str, str] = {
     "qwen": "<tool_call><function=get_weather>",
     "kimi_k3": '<|open|>tools<|sep|><|open|>call tool="get_weather" index="0"<|sep|>',
     "dsml": f'<{_D}tool_calls><{_D}invoke name="get_weather">',
+    "dsml_v41": f'<{_D} calls><{_D} invoke name="get_weather">',
     "minimax": f'{_NS}<tool_call>{_NS}<invoke name="get_weather">',
 }
 
@@ -2173,6 +2174,7 @@ CALL_CONTINUATIONS: dict[str, str] = {
         "<|close|>argument<|sep|><|close|>call<|sep|>"
     ),
     "dsml": f'<{_D}parameter name="city">Paris',
+    "dsml_v41": f'<{_D} parameter name="city">Paris',
     "minimax": f"{_NS}<city>Paris",
 }
 
@@ -2187,6 +2189,7 @@ FOREIGN_CLOSERS: dict[str, str] = {
     "qwen": "</tool_call>",
     "kimi_k3": "<|close|>response<|sep|>",
     "dsml": "</tool_call>",
+    "dsml_v41": "</tool_call>",
     "minimax": "</function>",
 }
 
@@ -2881,6 +2884,7 @@ class TestAnUnclosedCallDoesNotSwallowTheNextOne:
         "qwen": "</function></tool_call>",
         "glm": "</tool_call>",
         "dsml": f"</{_D}invoke></{_D}tool_calls>",
+        "dsml_v41": f"</{_D} invoke></{_D} calls>",
         "minimax": f"{_NS}</invoke>{_NS}</tool_call>",
         "kimi": "<|tool_calls_section_end|>",
         "kimi_k3": "<|close|>call<|sep|><|close|>tools<|sep|>",
@@ -3107,7 +3111,7 @@ class TestEveryParserDefersToTheSharedNameTest:
 
     @staticmethod
     def _module_of(parser):
-        return sys.modules[parser.__module__]
+        return sys.modules[parser.parse_region.__module__]
 
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
     def test_a_refusal_is_honoured(self, parser, monkeypatch):

@@ -153,6 +153,22 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
     ):
         raise NotImplementedError
 
+    def commit_speculative_state(self, metadata, last_token_indices):
+        """Commit accepted target rows before draft reads and state checkpoints.
+
+        Backends with tentative recurrent state select the accepted prefix here.
+        Paged KV backends whose rejected rows are hidden by sequence length need
+        no additional action.
+        """
+        return
+
+    def prepare_model_inputs(self, input_ids, metadata):
+        """Prepare model inputs after state maintenance and final token staging."""
+
+    def close(self):
+        """Release backend-owned host workers and mapped resources."""
+        self.release_kv_pools()
+
     def prepare_mtp_decode(
         self,
         bs: int,

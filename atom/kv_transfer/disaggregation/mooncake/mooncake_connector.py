@@ -333,6 +333,13 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self._reqs_need_recv: dict[ReqId, tuple[Any, list[int]]] = {}
         self._reqs_need_save: dict[ReqId, tuple[Any, list[int]]] = {}
 
+        # Source-block ownership: the scheduler frees a finished request's HBM
+        # only once every connector stops claiming it. Claimed in
+        # `request_finished` -- the call that hands the peer these addresses --
+        # and NOT at alloc: `Scheduler._is_preemptable` negates this same
+        # predicate, so an earlier claim would pin every running request.
+        self._awaiting_send: set[str] = set()
+
         # Bidirectional transfer_id <-> request_id mapping
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
@@ -480,6 +487,20 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             )
 
     def request_finished(self, seq: Sequence) -> None:
+        if self.is_producer and getattr(seq, "leave_reason", None) == "aborted":
+            # No send claim protects an abort's blocks from reuse. Never
+            # advertise their addresses or dispatch a queued producer save.
+            self._reqs_need_save.pop(seq.id, None)
+            seq.kv_transfer_params_output = None
+            return
+
+        # Claim iff we will send: the same `do_remote_decode` gate that fills
+        # `_reqs_need_save`.
+        if self.is_producer and (getattr(seq, "kv_transfer_params", None) or {}).get(
+            "do_remote_decode"
+        ):
+            self._awaiting_send.add(str(seq.id))
+
         first_token_id = seq.output_tokens[0] if seq.output_tokens else None
         drafts = getattr(seq, "spec_token_ids", None)
         draft_token_ids = (
@@ -513,6 +534,15 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             transfer_id = self.request_id_to_transfer_id.pop(seq.id, None)
             if transfer_id is not None:
                 self.transfer_id_to_request_id.pop(transfer_id, None)
+
+    def should_defer_free(self, seq: Sequence) -> bool:
+        return str(seq.id) in self._awaiting_send
+
+    def send_finished(self, req_id) -> None:
+        self._awaiting_send.discard(str(req_id))
+
+    def source_blocks_released(self, seq: Sequence) -> None:
+        """No block-lifetime state remains after the send claim is retired."""
 
 
 # ===================================================================
