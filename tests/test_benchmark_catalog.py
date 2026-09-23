@@ -550,10 +550,14 @@ def test_cadence_splits_the_nightly_without_losing_cells():
 def test_nightly_dropped_1k1k_and_weekly_is_exactly_that():
     """The split as configured: 1k/1k moved off the nightly, nothing else did."""
     nightly = {
-        (c["isl"], c["osl"]) for c in catalog.build_cells(CATALOG, cadence="nightly")
+        (c["isl"], c["osl"]) for c in catalog.build_cells(
+            CATALOG, cadence="nightly", bench_kind_filter={"random"}
+        )
     }
     weekly = {
-        (c["isl"], c["osl"]) for c in catalog.build_cells(CATALOG, cadence="weekly")
+        (c["isl"], c["osl"]) for c in catalog.build_cells(
+            CATALOG, cadence="weekly", bench_kind_filter={"random"}
+        )
     }
 
     assert (1024, 1024) not in nightly
@@ -563,8 +567,8 @@ def test_nightly_dropped_1k1k_and_weekly_is_exactly_that():
 def test_untagged_scenarios_stay_nightly():
     """Adding a scenario must not need a `cadence` field to keep working.
 
-    A model's or variant's own `scenarios` override the defaults, and none of
-    them carries a tag today -- they have to land on the nightly, not vanish.
+    A model's or variant's untagged `scenarios` override the defaults and
+    must still land on the nightly, even when other overrides are weekly.
     """
     cat = catalog._load_catalog(CATALOG)
     tagged = {
@@ -575,7 +579,13 @@ def test_untagged_scenarios_stay_nightly():
     overrides = [
         m["prefix"]
         for m in cat["models"]
-        if m.get("scenarios") or any(v.get("scenarios") for v in m.get("variants", []))
+        if any(
+            sc.get("cadence", catalog.DEFAULT_CADENCE) == catalog.DEFAULT_CADENCE
+            for sc in [
+                *m.get("scenarios", []),
+                *(sc for v in m.get("variants", []) for sc in v.get("scenarios", [])),
+            ]
+        )
     ]
     nightly = {c["prefix"] for c in catalog.build_cells(CATALOG, cadence="nightly")}
     for prefix in overrides:
@@ -653,3 +663,15 @@ def test_dispatch_input_count_fits_github_limit():
     workflow = _workflow()
     on = workflow.get("on", workflow.get(True))
     assert len(on["workflow_dispatch"]["inputs"]) <= 25
+
+
+def test_v41_agentic_weekly_cadence():
+    """Weekly selection must include the full curve without a nightly replay."""
+    filters = dict(
+        model_filter={"deepseek-v41-flash-agentic"},
+        bench_kind_filter={"aiperf_agentic"},
+    )
+    weekly = catalog.build_cells(CATALOG, cadence="weekly", **filters)
+    assert sorted(c["conc"] for c in weekly) == [1, 2, 8, 16, 32, 64]
+    assert catalog.build_cells(CATALOG, cadence="nightly", **filters) == []
+    assert weekly == catalog.build_cells(CATALOG, **filters)

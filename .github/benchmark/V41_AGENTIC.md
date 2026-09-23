@@ -10,8 +10,12 @@ Run **ATOM Benchmark** on this branch with `agentic_deepseek_v41flash=true`,
 `agentic_concurrency=all`, `agentic_duration=3600`, and the other agentic
 toggles false. Leave `atom_commit` empty to use this branch. The random-model
 checkboxes are ignored when the V4.1 agentic toggle is selected.
-The branch also contains a manual-only **ATOM Agentic Benchmark** workflow
-that selects only V4.1.
+The branch also contains **ATOM Agentic Benchmark**, selecting only V4.1.
+It runs weekly on Sunday at **13:07 Beijing time (05:07 UTC)** and retains
+manual dispatch. Both V4.1 scenarios belong to the weekly cadence; the
+independent random benchmark remains unchanged. GitHub scheduled workflows
+run from the default branch, so the timer becomes active after this change
+is merged into `main`.
 
 The matrix runs concurrency 1, 2, 8, 16, 32, 64. Every cell uses TP2 on GPUs
 0-1, no EP or DPA, level 3, FULL graphs, BF16 KV, FP8 index, DSpark5, synthetic

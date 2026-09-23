@@ -37,6 +37,7 @@
           "conc_max": 64,
           "scenarios": [
             {
+              "cadence": "weekly",
               "isl": 262144,
               "osl": 1024,
               "concurrency": [
@@ -59,6 +60,7 @@
           "conc_max": 64,
           "scenarios": [
             {
+              "cadence": "weekly",
               "isl": 262144,
               "osl": 1024,
               "concurrency": [
