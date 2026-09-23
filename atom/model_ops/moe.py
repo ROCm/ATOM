@@ -1822,6 +1822,88 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_scale=layer.w2_weight_scale,
         )
 
+    @lru_cache(maxsize=64)
+    def _sp_input_can_prequantize(self, layer, tokens, dtype):
+        # Only move an existing, row-local FP4 quantization across the gather.
+        # Small batches and inline/ksplit kernels may consume BF16 directly.
+        if (
+            tokens < 8192
+            or dtype != torch.bfloat16
+            or self.quant_type != QuantType.per_1x32
+            or self.use_triton
+            or self.use_triton_ep
+            or self.fused_experts is not None
+            or layer.use_ep
+            or layer.custom_routing_function is not None
+            or layer.apply_router_weight_on_input
+            or layer.activation not in (ActivationType.Silu, ActivationType.Swiglu)
+            or layer.w13_input_scale is not None
+            or layer.hidden_size % 256
+            or get_gfx() != "gfx950"
+        ):
+            return False
+        from aiter.fused_moe import (
+            get_2stage_cfgs,
+            get_inter_dim,
+            get_padded_M,
+            resolve_activation_dtype,
+        )
+
+        w1, w2 = layer.w13_weight, layer.w2_weight
+        gate_mode = GateMode.INTERLEAVE if self.is_guinterleave else GateMode.SEPARATED
+        q_dtype = resolve_activation_dtype(
+            self.quant_type,
+            w1.dtype,
+            activation=layer.activation,
+            gate_mode=gate_mode,
+            M=tokens,
+            hidden_dtype=dtype,
+        )
+        if q_dtype != dtypes.fp4x2:
+            return False
+        experts, hidden, intermediate = get_inter_dim(w1.shape, w2.shape)
+        shuffled = getattr(w1, "is_shuffled", False) or getattr(
+            w2, "is_shuffled", False
+        )
+        config = get_2stage_cfgs(
+            get_padded_M(tokens),
+            hidden,
+            intermediate,
+            experts,
+            layer.top_k + layer.num_fused_shared_experts,
+            dtype,
+            q_dtype,
+            w1.dtype,
+            self.quant_type,
+            intermediate != w1.shape[1],
+            layer.activation,
+            False,
+            self.hidden_pad,
+            self.intermediate_pad,
+            shuffled,
+            gate_mode,
+            has_stage1_bias=layer.w13_bias is not None,
+            has_stage2_bias=layer.w2_bias is not None,
+            swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
+            opus_weights_shuffled=getattr(w1, "is_shuffled", False)
+            and getattr(w2, "is_shuffled", False),
+        )
+        return config.prequant and not config.run_1stage and config.ksplit <= 1
+
+    def gather_sp_input(self, layer, x):
+        if not self._sp_input_can_prequantize(
+            layer, x.shape[0] * get_sp_world_size(), x.dtype
+        ):
+            return sp_moe_gather(x), None
+        quantized, scale = get_hip_quant(self.quant_type)(
+            x, quant_dtype=dtypes.fp4x2, shuffle=False
+        )
+        # Bitwise BF16 views let the custom all-gather copy FP4/E8M0 bytes.
+        # No conversion or floating-point arithmetic occurs in the gather.
+        quantized = sp_moe_gather(quantized.view(torch.bfloat16)).view(dtypes.fp4x2)
+        scale = sp_moe_gather(scale.view(torch.bfloat16)).view(dtypes.fp8_e8m0)
+        return quantized, scale
+
     @mark_trace
     def apply(
         self,
@@ -1842,6 +1924,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         fused_shared_experts_scoring_func: str | None = None,
         activation: ActivationType = ActivationType.Silu,
         prefix: str = "",
+        sp_input_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # ATOM_USE_TRITON_MOE_DECODE splits the two kernels by phase: the weights
         # sit in the FlyDSL layout, so prefill falls through to the FlyDSL tail
@@ -2036,7 +2119,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             e_score_correction_bias=e_score_correction_bias,
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
         )
-        a1_scale = getattr(layer, "w13_input_scale", None)
+        a1_scale = (
+            sp_input_scale
+            if sp_input_scale is not None
+            else getattr(layer, "w13_input_scale", None)
+        )
         a2_scale = getattr(layer, "w2_input_scale", None)
         moe_extra_args = {
             "gate_mode": (
@@ -2214,6 +2301,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
                 a1_scale=a1_scale,
+                dtype=torch.bfloat16 if sp_input_scale is not None else None,
                 a2_scale=a2_scale,
                 doweight_stage1=apply_router_weight_on_input,
                 bias1=layer.w13_bias,
@@ -5256,8 +5344,18 @@ class FusedMoE(torch.nn.Module):
         # Gather SP token shards for local expert computation, then sum partials
         # back to each owner. Routed all2all handles token movement itself.
         sp_moe = sp_is_enabled() and not self.moe_parallel_config.use_all2all_kernels
+        sp_input_kwargs = {}
         if sp_moe:
-            hidden_states = sp_moe_gather(hidden_states)
+            if (
+                type(self.quant_method) is Mxfp4MoEMethod
+                and self.moe_parallel_config.dp_logical_ratio == 1
+            ):
+                hidden_states, input_scale = self.quant_method.gather_sp_input(
+                    self, hidden_states
+                )
+                sp_input_kwargs["sp_input_scale"] = input_scale
+            else:
+                hidden_states = sp_moe_gather(hidden_states)
             router_logits = sp_moe_gather(router_logits)
 
         # Simulated DP with no peers to gather from: the absent ranks' token
@@ -5288,6 +5386,7 @@ class FusedMoE(torch.nn.Module):
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
             prefix=f"{self.prefix}.fused_moe",
+            **sp_input_kwargs,
         )
 
         if dp_repeat > 1:
