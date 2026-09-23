@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 # from flash_attn import flash_attn_with_kvcache
+import functools
 import logging
 from abc import ABC, abstractmethod
 
@@ -153,9 +154,26 @@ def run_pa_fwd_asm(
     )
 
 
+# Copies of aiter's own limits, pinned against its source by a test. Mirroring
+# them is what lets an unsupported call fall back instead of raising inside
+# aiter; a copy that drifts either over-rejects or stops protecting.
 _FLYDSL_PA_MAX_PARTITIONS = 256
 _FLYDSL_PA_TILE = 256
+_FLYDSL_PA_BLOCK_SIZES = (16, 64, 128)
+_FLYDSL_PA_ARCHS = ("gfx942", "gfx950")
 _flydsl_pa_routed: set[tuple] = set()
+_flydsl_plan_refused: set[tuple] = set()
+
+
+@functools.lru_cache(maxsize=1)
+def _flydsl_arch_supported() -> bool:
+    """Whether FlyDSL builds kernels for the running GPU.
+
+    aiter raises NotImplementedError on anything else, from inside the call.
+    """
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    return get_gfx_runtime() in _FLYDSL_PA_ARCHS
 
 
 def _flydsl_pa_decode_num_seqs(
@@ -201,6 +219,12 @@ def _flydsl_pa_decode_num_seqs(
         return None
     if k_cache.dim() != 5 or k_cache.shape[-1] != 16:
         return None
+    # block_size is dim -2 of the page-16 cache. --block-size 256/1024 reaches
+    # this site whenever use_triton_attn is set, which the published recipe does.
+    if k_cache.shape[-2] not in _FLYDSL_PA_BLOCK_SIZES:
+        return None
+    if not _flydsl_arch_supported():
+        return None
     if context_partition_size != _FLYDSL_PA_TILE:
         return None
     if not 1 <= max_context_partition_num <= _FLYDSL_PA_MAX_PARTITIONS:
@@ -237,6 +261,10 @@ def _flydsl_plan_scratch(
     plan, query_length, query_group_size, head_dim, out_dtype, device
 ):
     """Partial-output buffers for a planned call, allocated once per shape.
+
+    Returned in the order the call site passes them: exp_sums, max_logits,
+    temporary_output. The first two are interchangeable buffers (same shape,
+    same dtype), which is exactly why a swapped unpacking would go unnoticed.
 
     Planned output is packed [kv_heads, capacity, rows(, D)] where the static
     API wants [num_seqs, kv_heads, partitions, rows(, D)]; passing the static
@@ -307,9 +335,12 @@ def run_pa_decode_gluon(
     # Once per shape signature: a run that quietly fell back to gluon
     # everywhere is otherwise indistinguishable from one where FlyDSL did not
     # help.
-    sig = (bool(flydsl_seqs), max_seqlen_q, q.shape[0], context_lens.shape[0])
-    if sig not in _flydsl_pa_routed:
-        _flydsl_pa_routed.add(sig)
+    # Bounded on purpose: the row counts vary per step -- the sparse sites see a
+    # new one on every prefill tail -- so keying on them leaks one entry and one
+    # log line per distinct length for the life of the process.
+    route_sig = (bool(flydsl_seqs), max_seqlen_q, q.shape[-1], compute_type)
+    if route_sig not in _flydsl_pa_routed:
+        _flydsl_pa_routed.add(route_sig)
         logger.info(
             "pa_decode -> %s (rows=%d max_seqlen_q=%d padded_seqs=%d "
             "head_dim=%d %s)",
@@ -325,7 +356,7 @@ def run_pa_decode_gluon(
         from aiter.ops.flydsl.pa_decode import pa_decode as _flydsl_pa_decode
 
         work_plan = None
-        es, ml, tmp = exp_sums, max_logits, temporary_output
+        n = flydsl_seqs
         # Built once per forward by the metadata builder, not here: it is a
         # function of context_lens alone. `allow_flydsl_plan` keeps the choice
         # with the caller, as the split count already is -- the sparse sites and
@@ -338,10 +369,28 @@ def run_pa_decode_gluon(
             if work_plan is not None and not flydsl_plan_matches(
                 work_plan, flydsl_seqs, k_cache.shape[1]
             ):
-                work_plan = None  # static path: slower, not fatal
-        if work_plan is not None:
+                # Static path: slower, not fatal. Logged because the planner
+                # keeps refreshing a plan nothing reads, which looks exactly
+                # like "the planner does not help" in an A/B.
+                # Keyed on the plan's batch alone, which is a capture-ladder
+                # rung and therefore bounded. The op's own count is not: the
+                # case this warning exists for is a non-unified DP step, where
+                # it tracks the real batch and would mint a new key every step.
+                plan_n = int(work_plan.reduce_info.shape[0])
+                if plan_n not in _flydsl_plan_refused:
+                    _flydsl_plan_refused.add(plan_n)
+                    logger.warning(
+                        "flydsl work plan refused, falling back to the static "
+                        "path: op wants %d seqs, plan was built for %d",
+                        flydsl_seqs,
+                        plan_n,
+                    )
+                work_plan = None
+        if work_plan is None:
+            es, ml, tmp = exp_sums[:n], max_logits[:n], temporary_output[:n]
+        else:
             nkv = k_cache.shape[1]
-            ml, es, tmp = _flydsl_plan_scratch(
+            es, ml, tmp = _flydsl_plan_scratch(
                 work_plan,
                 max_seqlen_q,
                 q.shape[-2] // nkv,
@@ -352,7 +401,6 @@ def run_pa_decode_gluon(
 
         # Slice off ATOM's sequence-axis padding so the rectangle FlyDSL
         # requires holds. Views, no copy: dim 0 is the outermost axis of each.
-        n = flydsl_seqs
         return _flydsl_pa_decode(
             output,
             q,
@@ -376,12 +424,11 @@ def run_pa_decode_gluon(
             q_scale,
             k_scale,
             v_scale,
-            exp_sums=es if work_plan is not None else exp_sums[:n],
-            max_logits=ml if work_plan is not None else max_logits[:n],
-            temporary_output=tmp if work_plan is not None else temporary_output[:n],
+            exp_sums=es,
+            max_logits=ml,
+            temporary_output=tmp,
             alibi_slopes=alibi_slopes,
             sinks=sinks,
-            # FlyDSL spells "no sliding window" as 0; ATOM's gluon path uses -1.
             sliding_window=0,
             ps=ps,
             work_plan=work_plan,

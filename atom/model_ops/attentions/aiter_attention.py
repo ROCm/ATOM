@@ -805,6 +805,15 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         n = int(context_lens.shape[0])
         if not 1 <= n <= _FLYDSL_PLAN_MAX_BATCH:
             return None
+        # plan_pa_decode rejects anything else. This builder serves several
+        # models; one of them handing int64 lengths would raise on the first step.
+        if (
+            context_lens.dtype is not torch.int32
+            or not context_lens.is_cuda
+            or context_lens.ndim != 1
+            or not context_lens.is_contiguous()
+        ):
+            return None
 
         # `max_partitions` omitted on purpose: that takes plan_pa_decode's own
         # default. Setting it from the static split count clamps every request
