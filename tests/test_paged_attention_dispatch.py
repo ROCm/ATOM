@@ -414,7 +414,9 @@ class TestWorkPlanWiring:
         request the same count and documents itself as "not a variable-work
         scheduler"; the plan's ceiling is an upper bound the planner divides
         under a workgroup budget. Feeding one into the other clamps the long
-        request to the short requests' share.
+        request to the short requests' share. Every number measured on this
+        branch was measured at the default, so changing it is a perf claim
+        nothing here backs.
         """
         from atom.model_ops.attentions import aiter_attention as aa
 
@@ -424,9 +426,7 @@ class TestWorkPlanWiring:
             seen.update(kwargs)
             return _FakePlan()
 
-        monkeypatch.setattr(
-            "aiter.ops.flydsl.pa_decode.plan_pa_decode", fake_plan, raising=False
-        )
+        monkeypatch.setattr("aiter.ops.flydsl.pa_decode.plan_pa_decode", fake_plan)
         builder = aa.AiterAttentionMetadataBuilder.__new__(
             aa.AiterAttentionMetadataBuilder
         )
@@ -435,8 +435,7 @@ class TestWorkPlanWiring:
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
 
-        ctx = _fake_ctx(8)
-        assert builder.refresh_flydsl_plan(ctx) is not None
+        assert builder.refresh_flydsl_plan(_fake_ctx(8), create=True) is not None
         assert "max_partitions" not in seen, f"ceiling was set: {seen}"
 
     def test_planner_off_returns_no_plan(self, monkeypatch):
@@ -475,24 +474,40 @@ class TestWorkPlanWiring:
         )
         assert builder.refresh_flydsl_plan(ctx) is None
 
-    def test_only_the_dense_call_site_opts_in(self):
-        """The planner is per call site, the way the split count already is.
+    def test_only_the_dense_call_site_passes_a_plan(self):
+        """Which call sites hand in a plan IS the boundary.
 
-        Red if the default flips, if a sparse site starts asking, or if the
-        dense one stops. On uniform lengths the planner is a measured loss
-        (0.56x at B8/257) that a larger ceiling does not rescue, and the two
-        sparse sites are 57 of the 63 pa_decode calls in a step.
+        There is no flag any more: the parameter defaults to None, so a site
+        that does not pass one gets the static path. The two MiniMax-M3 sparse
+        sites read a fixed topk window (nothing to rebalance, and measured a net
+        loss), and the vLLM/SGLang bridges run under someone else's forward
+        context entirely.
         """
         import inspect
 
         from atom.model_ops import attention_mha
-        from atom.model_ops.base_attention import run_pa_decode_gluon
+        from atom.model_ops.base_attention import run_pa_decode
         from atom.model_ops.minimax_m3 import sparse_attn
 
-        param = inspect.signature(run_pa_decode_gluon).parameters["allow_flydsl_plan"]
-        assert param.default is False
-        assert "allow_flydsl_plan=True" in inspect.getsource(attention_mha)
-        assert "allow_flydsl_plan" not in inspect.getsource(sparse_attn)
+        param = inspect.signature(run_pa_decode).parameters["work_plan"]
+        assert param.default is None, "a plan must be opt-in, per call site"
+        assert "work_plan=" in inspect.getsource(attention_mha)
+        assert "work_plan=" not in inspect.getsource(sparse_attn)
+        # Read the bridges as text, never import them: they pull in vllm /
+        # sglang, which a CPU-only checkout does not have, and the claim being
+        # tested is about the source anyway.
+        import pathlib
+
+        import atom
+
+        root = pathlib.Path(atom.__file__).parent
+        for rel in (
+            "plugin/vllm/attention/layer_mha.py",
+            "plugin/sglang/attention_backend/full_attention/full_attention_backend.py",
+        ):
+            f = root / rel
+            assert f.is_file(), f"{rel} moved; this boundary is no longer checked"
+            assert "work_plan=" not in f.read_text(), rel
 
     def test_every_draft_pass_refreshes_the_plan(self):
         """Weak on purpose, and the weakness is the point.
@@ -511,29 +526,44 @@ class TestWorkPlanWiring:
         assert "refresh_flydsl_plan" in src
 
     @pytest.mark.skipif(not _HAS_CUDA, reason="allocates real scratch buffers")
-    def test_scratch_is_keyed_by_capacity(self):
-        """A refresh that grows the plan must not reuse the old buffers.
+    def test_scratch_is_per_plan_not_per_shape(self):
+        """Two plans must never share buffers, however alike their shapes.
 
-        Red if capacity leaves the key: the second call would hand back buffers
-        sized for 512 while the kernel writes 1024 rows.
+        capacity is a constant under the workgroup budget at kv_heads=1, so a
+        shape-only key hands every capture rung -- and, under TBO, two
+        concurrent ubatches -- the same three tensors to write at once. Wrong
+        logits, no error, and it vanishes under HIP_LAUNCH_BLOCKING.
         """
         import torch
 
-        from atom.model_ops.base_attention import _flydsl_plan_scratch
+        from atom.model_ops.base_attention import (
+            _FLYDSL_PLAN_SCRATCH,
+            _flydsl_plan_scratch,
+        )
 
         dev = torch.device("cuda", 0)
-        small = _flydsl_plan_scratch(
-            _FakePlan(capacity=512), 4, 16, 128, torch.bfloat16, dev
-        )
-        again = _flydsl_plan_scratch(
-            _FakePlan(capacity=512), 4, 16, 128, torch.bfloat16, dev
-        )
-        big = _flydsl_plan_scratch(
-            _FakePlan(capacity=1024), 4, 16, 128, torch.bfloat16, dev
-        )
-        assert small[0] is again[0], "same shape should reuse"
-        assert big[0] is not small[0], "a grown capacity must not reuse"
-        assert big[0].shape[1] == 1024
+        before = dict(_FLYDSL_PLAN_SCRATCH)
+        try:
+            plan = _FakePlan(capacity=512)
+            first = _flydsl_plan_scratch(plan, 4, 16, 128, torch.bfloat16, dev)
+            again = _flydsl_plan_scratch(plan, 4, 16, 128, torch.bfloat16, dev)
+            assert first[0] is again[0], "the same plan must reuse its buffers"
+
+            twin = _FakePlan(capacity=512)
+            other = _flydsl_plan_scratch(twin, 4, 16, 128, torch.bfloat16, dev)
+            assert (
+                other[0] is not first[0]
+            ), "a second plan of identical shape must get its own buffers"
+
+            big = _flydsl_plan_scratch(
+                _FakePlan(capacity=1024), 4, 16, 128, torch.bfloat16, dev
+            )
+            assert big[0].shape[1] == 1024
+        finally:
+            # The cache is a module global with no eviction; leaving ~25 MB of
+            # live CUDA buffers behind would charge every later test for it.
+            _FLYDSL_PLAN_SCRATCH.clear()
+            _FLYDSL_PLAN_SCRATCH.update(before)
 
     def test_one_plan_per_batch_and_never_replaced(self, monkeypatch):
         """Decode replays captured graphs, one per capture-ladder size.
@@ -561,9 +591,9 @@ class TestWorkPlanWiring:
 
         ctx = _fake_ctx
 
-        first = builder.refresh_flydsl_plan(ctx(8))
+        first = builder.refresh_flydsl_plan(ctx(8), create=True)
         assert builder.refresh_flydsl_plan(ctx(8)) is first, "same rung must reuse"
-        other = builder.refresh_flydsl_plan(ctx(16))
+        other = builder.refresh_flydsl_plan(ctx(16), create=True)
         assert other is not first, "a different rung needs its own plan"
         assert (
             builder.refresh_flydsl_plan(ctx(8)) is first
@@ -603,6 +633,112 @@ class TestWorkPlanWiring:
         )
         assert "flydsl_work_plan" in src
 
+    def test_only_the_capture_builders_mint_a_plan(self):
+        """The value of `create`, at every site, in every builder.
+
+        Six calls refresh a plan and two mint one; which is which is the whole
+        contract. A sed that moved `create=True` onto a runtime path once left
+        every test here green, and so did deleting it from the GDN builder --
+        one check read the keyword without its value, the other read one file.
+        So walk the AST of all three.
+        """
+        import ast
+        import pathlib
+
+        import atom
+
+        root = pathlib.Path(atom.__file__).parent / "model_ops" / "attentions"
+        sites = []
+
+        def visit(node, where):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                where = node.name
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "refresh_flydsl_plan"
+            ):
+                create = {k.arg: k.value for k in node.keywords}.get("create")
+                sites.append((f, where, getattr(create, "value", None) is True))
+            for child in ast.iter_child_nodes(node):
+                visit(child, where)
+
+        for f in ("aiter_attention.py", "gdn_attn.py", "qwen4_exp_attn.py"):
+            visit(ast.parse((root / f).read_text()), None)
+
+        assert sites, "nothing calls refresh_flydsl_plan; this test moved"
+        minting = {(f, fn) for f, fn, mints in sites if mints}
+        assert minting == {
+            ("aiter_attention.py", "build_for_cudagraph_capture"),
+            ("gdn_attn.py", "build_for_cudagraph_capture"),
+        }, f"plans may only be minted during capture, got {sorted(minting)}"
+        assert len(sites) - len(minting) >= 4, "a runtime refresh site went missing"
+
+    def test_plans_are_only_minted_during_capture(self, monkeypatch):
+        """A runtime batch that was never captured gets the static path.
+
+        aiter's planner takes batch as a tl.constexpr, so a new value costs a
+        kernel specialization -- 65-72 ms cold -- and a plan that can never be
+        freed, since some captured graph may have baked its pointers in.
+        Minting one mid-serving would be a stall for a batch no graph replays.
+        """
+        from atom.model_ops.attentions import aiter_attention as aa
+
+        built = []
+
+        def fake_plan(context_lens, num_kv_heads, **kw):
+            built.append(context_lens.shape[0])
+            return _FakePlan()
+
+        monkeypatch.setattr("aiter.ops.flydsl.pa_decode.plan_pa_decode", fake_plan)
+        builder = aa.AiterAttentionMetadataBuilder.__new__(
+            aa.AiterAttentionMetadataBuilder
+        )
+        builder._flydsl_kv_heads = 1
+        builder._flydsl_plans = {}
+        builder._flydsl_plan_unplanned = False
+        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
+        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
+
+        assert (
+            builder.refresh_flydsl_plan(_fake_ctx(31)) is None
+        ), "an uncaptured batch must not mint a plan"
+        assert built == [], "no planner call may happen outside capture"
+        assert builder.refresh_flydsl_plan(_fake_ctx(31), create=True) is not None
+        assert built == [31]
+        assert (
+            builder.refresh_flydsl_plan(_fake_ctx(31)) is not None
+        ), "once captured, replay refreshes it without create="
+
+    def test_the_unplanned_notice_waits_for_a_capture(self, monkeypatch):
+        """One shot, spent on the batch that means something.
+
+        Before the first capture every call lands on the static path -- profile
+        run, eager warmup -- so logging there burns the notice on a step that
+        says nothing, and the batch that really is uncaptured mid-serving then
+        goes unreported.
+        """
+        from atom.model_ops.attentions import aiter_attention as aa
+
+        monkeypatch.setattr(
+            "aiter.ops.flydsl.pa_decode.plan_pa_decode",
+            lambda *a, **kw: _FakePlan(),
+        )
+        builder = aa.AiterAttentionMetadataBuilder.__new__(
+            aa.AiterAttentionMetadataBuilder
+        )
+        builder._flydsl_kv_heads = 1
+        builder._flydsl_plans = {}
+        builder._flydsl_plan_unplanned = False
+        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
+        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
+
+        builder.refresh_flydsl_plan(_fake_ctx(31))
+        assert not builder._flydsl_plan_unplanned, "nothing captured yet; stay quiet"
+        builder.refresh_flydsl_plan(_fake_ctx(8), create=True)
+        builder.refresh_flydsl_plan(_fake_ctx(31))
+        assert builder._flydsl_plan_unplanned, "an uncaptured batch after capture"
+
     def test_plan_is_built_for_the_row_count_the_op_derives(self):
         """The row count the builder plans for must be the one the op passes.
 
@@ -628,6 +764,7 @@ class TestWorkPlanWiring:
 
         tree = ast.parse(inspect.getsource(aa))
         args = {}
+        calls_by_fn = {}
         for fn in ast.walk(tree):
             if not isinstance(fn, ast.FunctionDef):
                 continue
@@ -638,6 +775,29 @@ class TestWorkPlanWiring:
                     and node.func.attr == "refresh_flydsl_plan"
                 ):
                     args.setdefault(fn.name, []).append(node.args[0])
+                    calls_by_fn.setdefault(fn.name, []).append(node)
+
+        # Who may mint a plan, and who may only refresh one. Minting is a
+        # kernel specialization aiter caches per batch value; doing it at
+        # runtime stalls a step for a batch no captured graph will replay, and
+        # NOT doing it at capture time means no plan is ever created and the
+        # planner is silently off. Neither shows up in any behavioural test --
+        # driving either path needs a model runner.
+        creates = {
+            fn: any(
+                any(kw.arg == "create" for kw in call.keywords)
+                for call in calls_by_fn[fn]
+            )
+            for fn in calls_by_fn
+        }
+        assert creates.get(
+            "build_for_cudagraph_capture"
+        ), "capture must pass create=; without it no plan is ever minted"
+        assert not creates.get("prepare_decode"), (
+            "replay must not mint plans: that is a mid-serving kernel "
+            "specialization for a batch no graph replays"
+        )
+        assert not creates.get("prepare_mtp_decode"), "same, for the draft pass"
 
         # Target passes: the whole buffer, which is already running_bs long
         # with the padded tail zeroed. A zero-length row gets no work.
@@ -682,7 +842,7 @@ class TestWorkPlanWiring:
         monkeypatch.delenv("ATOM_PA_FLYDSL", raising=False)
         assert envs.ATOM_PA_FLYDSL is False, "FlyDSL must be opt-in"
 
-        src = inspect.getsource(ba.run_pa_decode_gluon)
+        src = inspect.getsource(ba.run_pa_decode)
         assert (
             "envs.ATOM_PA_FLYDSL and _flydsl_pa_decode_num_seqs" in src
         ), "the env gate is gone, or no longer short-circuits the capability check"
@@ -757,9 +917,17 @@ class TestFlyDSLCapabilityGate:
 
         from atom.model_ops.base_attention import _flydsl_pa_decode_num_seqs
 
+        q = over.pop("q", None)
+        if q is None:
+            q = torch.empty(16, 16, 128, device="meta", dtype=torch.bfloat16)
         kw = {
-            "q": torch.empty(16, 16, 128, device="meta", dtype=torch.bfloat16),
+            "output": (
+                over.pop("output", None) if "output" in over else torch.empty_like(q)
+            ),
+            "q": q,
             "k_cache": torch.empty(4, 1, 8, 128, 16, device="meta", dtype=_FP8),
+            "v_cache": torch.empty(4, 1, 8, 128, 16, device="meta", dtype=_FP8),
+            "block_tables": torch.empty(4, 64, device="meta", dtype=torch.int32),
             "context_lens": torch.empty(4, device="meta", dtype=torch.int32),
             "max_seqlen_q": 4,
             "max_context_partition_num": 32,
@@ -839,16 +1007,15 @@ class TestFlyDSLCapabilityGate:
         odd = torch.empty(15, 16, 128, device="meta", dtype=torch.bfloat16)
         assert self._call(q=odd) is None
 
-    @pytest.mark.parametrize(
-        "head_dim,ok", [(64, True), (128, True), (256, True), (192, False), (96, False)]
-    )
-    def test_head_dim_stays_a_subset_of_aiters(self, monkeypatch, head_dim, ok):
-        """Narrower than aiter on purpose; widening is what breaks.
+    @pytest.mark.parametrize("head_dim", [192, 96, 256])
+    def test_head_dim_the_cache_does_not_encode_falls_back(self, monkeypatch, head_dim):
+        """Two clauses, and the second is the one that was missing.
 
-        aiter takes `hd % 64 == 0 and (hd//16 <= 8 or hd//16 % 8 == 0)`, so 192
-        and 96 are rejects on both sides today -- but ATOM rejecting them is
-        what keeps the call from reaching aiter at all. Relaxing this clause
-        toward aiter's would hand it shapes it raises on.
+        192 and 96 fail ATOM's own whitelist. 256 passes it -- and used to be
+        asserted as accepted -- but the baseline cache is (.., 8, 128, 16),
+        whose num_hgroups encodes head_dim 128, and aiter rejects a q that
+        disagrees with its cache. Pinning that acceptance as the contract is
+        what would have kept the clause from ever being added.
         """
         import torch
 
@@ -856,7 +1023,19 @@ class TestFlyDSLCapabilityGate:
             "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
         )
         q = torch.empty(16, 16, head_dim, device="meta", dtype=torch.bfloat16)
-        assert (self._call(q=q) == 4) is ok
+        assert self._call(q=q) is None
+
+    def test_head_dim_matching_the_cache_is_accepted(self, monkeypatch):
+        """The positive half: 256 is fine once the cache encodes 256."""
+        import torch
+
+        monkeypatch.setattr(
+            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
+        )
+        q = torch.empty(16, 16, 256, device="meta", dtype=torch.bfloat16)
+        k = torch.empty(4, 1, 16, 128, 16, device="meta", dtype=_FP8)
+        v = torch.empty(4, 1, 16, 128, 16, device="meta", dtype=_FP8)
+        assert self._call(q=q, k_cache=k, v_cache=v) == 4
 
     def test_zero_query_length_falls_back_instead_of_dividing(self, monkeypatch):
         """`divmod(rows, 0)` is a ZeroDivisionError, not a fallback."""
@@ -890,6 +1069,115 @@ class TestFlyDSLCapabilityGate:
         )
         k = torch.empty(*shape, device="meta", dtype=_FP8)
         assert self._call(k_cache=k) is None
+
+    @pytest.mark.parametrize("head_dim,hgroups", [(96, 6), (1152, 72)])
+    def test_head_dim_outside_atoms_own_whitelist_falls_back(
+        self, monkeypatch, head_dim, hgroups
+    ):
+        """The whitelist clause alone, with the cache made to agree.
+
+        The cases above fail the cache clause too, so deleting the whitelist
+        left them green. 96 is neither 64 nor a multiple of 128; 1152 is a
+        multiple but past aiter's 1024 ceiling.
+        """
+        import torch
+
+        monkeypatch.setattr(
+            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
+        )
+        q = torch.empty(16, 16, head_dim, device="meta", dtype=torch.bfloat16)
+        k = torch.empty(4, 1, hgroups, 128, 16, device="meta", dtype=_FP8)
+        assert self._call(q=q, k_cache=k, v_cache=k) is None
+
+    def test_a_q_dtype_the_kernel_has_no_arm_for_falls_back(self, monkeypatch):
+        """aiter picks its scale from q.dtype and raises on anything else."""
+        import torch
+
+        monkeypatch.setattr(
+            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
+        )
+        q = torch.empty(16, 16, 128, device="meta", dtype=torch.float32)
+        assert self._call(q=q) is None
+
+    def test_an_output_that_disagrees_with_q_falls_back(self, monkeypatch):
+        """aiter writes through the output pointer as if it were q's twin."""
+        import torch
+
+        monkeypatch.setattr(
+            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
+        )
+        other_dtype = torch.empty(16, 16, 128, device="meta", dtype=torch.float16)
+        assert self._call(output=other_dtype) is None
+        other_shape = torch.empty(32, 16, 128, device="meta", dtype=torch.bfloat16)
+        assert self._call(output=other_shape) is None
+
+    def test_a_non_contiguous_head_dim_axis_falls_back(self, monkeypatch):
+        """Both axes: aiter checks q and output separately (pa_decode:443,448)."""
+        import torch
+
+        monkeypatch.setattr(
+            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
+        )
+        skewed = torch.empty(
+            16, 128, 16, device="meta", dtype=torch.bfloat16
+        ).transpose(1, 2)
+        assert skewed.shape == (16, 16, 128) and skewed.stride(2) != 1
+        contiguous = torch.empty(16, 16, 128, device="meta", dtype=torch.bfloat16)
+        assert self._call(q=skewed, output=contiguous) is None
+        assert self._call(output=skewed) is None
+
+    def test_q_heads_that_do_not_divide_over_kv_heads_fall_back(self, monkeypatch):
+        """The kernel gives each kv head a whole group; 16 over 3 has no split."""
+        import torch
+
+        monkeypatch.setattr(
+            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
+        )
+        k = torch.empty(4, 3, 8, 128, 16, device="meta", dtype=_FP8)
+        assert self._call(k_cache=k, v_cache=k) is None
+
+    def test_a_v_cache_of_another_dtype_falls_back(self, monkeypatch):
+        """One compute_type covers both caches; a split pair raises inside aiter."""
+        import torch
+
+        monkeypatch.setattr(
+            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
+        )
+        v = torch.empty(4, 1, 8, 128, 16, device="meta", dtype=torch.bfloat16)
+        assert self._call(v_cache=v) is None
+
+    @pytest.mark.parametrize(
+        "field", ["k_cache", "v_cache", "block_tables", "context_lens"]
+    )
+    def test_a_non_contiguous_argument_falls_back(self, monkeypatch, field):
+        """aiter demands all four contiguous (pa_decode.py:464-470).
+
+        Nothing in this tree hands one over -- every cache view is a `.view()`,
+        which raises rather than returning a skewed tensor -- but the SGLang
+        bridge takes its pool from someone else and ATOM_PA_FLYDSL routes it
+        too, so the gate promises a fallback it could not keep.
+        """
+        import torch
+
+        monkeypatch.setattr(
+            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
+        )
+        skewed = {
+            "k_cache": lambda: torch.empty(
+                4, 1, 8, 16, 128, device="meta", dtype=_FP8
+            ).transpose(3, 4),
+            "v_cache": lambda: torch.empty(
+                4, 1, 8, 16, 128, device="meta", dtype=_FP8
+            ).transpose(3, 4),
+            "block_tables": lambda: torch.empty(
+                64, 4, device="meta", dtype=torch.int32
+            ).t(),
+            "context_lens": lambda: torch.empty(8, device="meta", dtype=torch.int32)[
+                ::2
+            ],
+        }[field]()
+        assert not skewed.is_contiguous()
+        assert self._call(**{field: skewed}) is None
 
     @pytest.mark.skipif(not _HAS_FLYDSL_PA, reason="needs aiter #4332")
     def test_the_arch_probe_binding_exists(self):
@@ -940,3 +1228,26 @@ class TestFlyDSLConstantsMatchAiter:
         src = self._aiter_src("ops/flydsl/pa_decode.py")
         for arch in _FLYDSL_PA_ARCHS:
             assert f'"{arch}"' in src, f"aiter no longer names {arch}"
+
+    @pytest.mark.skipif(not _HAS_FLYDSL_PA, reason="needs aiter #4332")
+    def test_tile_size_and_batch_cap(self):
+        """The two limits the comment claimed were pinned and were not.
+
+        _FLYDSL_PA_TILE is the only context_partition_size aiter accepts, and
+        _FLYDSL_PLAN_MAX_BATCH is where its planner stops. Drift either way is
+        silent: too strict falls back more than it must, too loose hands aiter
+        a call it raises on.
+        """
+        from atom.model_ops.base_attention import (
+            _FLYDSL_PA_TILE,
+            _FLYDSL_PLAN_MAX_BATCH,
+        )
+
+        src = self._aiter_src("ops/flydsl/pa_decode.py")
+        assert (
+            f"context_partition_size={_FLYDSL_PA_TILE}" in src
+        ), "aiter's accepted partition size moved"
+        plan_src = self._aiter_src("ops/flydsl/kernels/pa_decode_plan.py")
+        assert (
+            str(_FLYDSL_PLAN_MAX_BATCH) in plan_src
+        ), "aiter's planner batch cap moved"

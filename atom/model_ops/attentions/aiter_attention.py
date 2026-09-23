@@ -261,6 +261,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         # Kept flydsl work plan here and refreshed once per prepare_*.
         self._flydsl_kv_heads = num_head_k
         self._flydsl_plans: dict[tuple, object] = {}
+        self._flydsl_plan_unplanned = False
         (
             (work_meta_data_size, work_meta_data_type),
             (work_indptr_size, work_indptr_type),
@@ -781,7 +782,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             slot_regions=[],
         )
 
-    def refresh_flydsl_plan(self, context_lens):
+    def refresh_flydsl_plan(self, context_lens, *, create=False):
         """Build or refresh aiter #5546's work plan for this forward.
 
         Depends only on context_lens, which every layer of one forward shares,
@@ -820,6 +821,26 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         # alike and removes the planner's mechanism -- this tree did that once.
         key = (n, self._flydsl_kv_heads, context_lens.device.index)
         plan = self._flydsl_plans.get(key)
+        if plan is None and not create:
+            # Plans are only ever minted during cudagraph capture, where the
+            # batch is a ladder rung and the cost lands at startup. aiter's
+            # planner takes batch as a tl.constexpr, so a new value is a kernel
+            # specialization -- 65-72 ms cold -- and a plan that is never freed
+            # because some captured graph may have baked its pointers in. A
+            # runtime batch with no plan is one no graph will replay, so the
+            # static path is the right answer for it rather than a stall.
+            # Only once a capture has happened: before the first one every
+            # call lands here (profile run, eager warmup), and logging then
+            # burns the one shot on a step that says nothing.
+            if self._flydsl_plans and not self._flydsl_plan_unplanned:
+                self._flydsl_plan_unplanned = True
+                logger.info(
+                    "flydsl: batch %d has no plan, running the static path; "
+                    "captured batches are %s",
+                    n,
+                    sorted({k[0] for k in self._flydsl_plans}),
+                )
+            return None
         if plan is None:
             plan = plan_pa_decode(context_lens, self._flydsl_kv_heads, query_length=1)
             self._flydsl_plans[key] = plan
@@ -889,6 +910,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             last_token_indices = slot_mapping
         # Dummy runs skip the draft attention, so keep this launch as a no-op:
         # their synthetic context_lens can point past block_tables.
+        skip_update = running_bs == 0 or get_forward_context().context.is_dummy_run
         _mtp_prepare_decode_metadata_kernel[(max(1, triton.cdiv(running_bs, 128)),)](
             context_lens,
             block_tables,
@@ -897,7 +919,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             positions_out,
             last_token_indices,
             running_bs,
-            running_bs == 0 or get_forward_context().context.is_dummy_run,
+            skip_update,
             update_context_lens,
             update_positions,
             select_positions,
@@ -929,8 +951,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
             )
-        workinfos["flydsl_work_plan"] = self.refresh_flydsl_plan(
-            context_lens[:running_bs]
+        # Same short-circuit as the metadata launch above. A dummy step would
+        # refresh the live work_info from synthetic lengths, but every real
+        # decode refreshes before it replays, so this is wasted work rather
+        # than a wrong answer. Free here because skip_update is already
+        # computed; the GDN and Qwen4 overrides would have to reach for the
+        # forward context to save the same kernel.
+        workinfos["flydsl_work_plan"] = (
+            None if skip_update else self.refresh_flydsl_plan(context_lens[:running_bs])
         )
         return workinfos
 
@@ -1488,7 +1516,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         positions = var["positions"].copy_to_gpu(scheduled_tokens)
         # Decode replays a captured graph, so the op must see a plan HERE
         attn_metadata.flydsl_work_plan = self.refresh_flydsl_plan(
-            attn_metadata.context_lens
+            attn_metadata.context_lens, create=True
         )
         context = Context(
             positions=positions,
