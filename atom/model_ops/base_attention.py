@@ -175,40 +175,21 @@ def _flydsl_pa_decode_num_seqs(
 ) -> int | None:
     """Sequence count to run aiter's FlyDSL paged decode with, or None for gluon.
 
-    Mirrors the kernel's own validation so an unsupported call falls to gluon
-    instead of raising from inside aiter. Every clause here is a hard reject
-    there, not a preference.
+    Mirrors the kernel's own validation, so an unsupported call falls back to
+    gluon instead of raising from inside aiter. Every clause below is a hard
+    reject there, not a preference.
 
-    The returned count is the point of the function. FlyDSL indexes ``query``
-    as ``[num_seqs, query_length, ...]`` and demands ``q.shape[0] ==
-    context_lens.shape[0] * query_length`` exactly, while ATOM pads its two
-    axes independently: ``context_lens`` is built to ``running_bs`` (the
-    sequence axis, padded for graph identity) with ``[scheduled_bs:running_bs]``
-    zeroed, and ``q`` to ``running_tokens`` (the row axis, padded for MoE).
-    ``forward_context.Context`` says so outright -- "the ratio is not always
-    max_seqlen_q". So the two disagree by a padding slot on a perfectly
-    ordinary step, which is what raised
+    Why a count rather than a bool: FlyDSL demands
+    ``q.shape[0] == context_lens.shape[0] * query_length`` exactly, but ATOM
+    pads its sequence axis (to running_bs, tail zeroed) and its row axis (to
+    running_tokens) independently, so the two disagree by a padding slot on an
+    ordinary step. gluon absorbs that; FlyDSL raises. Recovering the count the
+    way gluon does and slicing the per-sequence arguments to it hands FlyDSL
+    the same rectangle.
 
-        ValueError: query.shape[0] (12) must equal
-                    context_lengths.shape[0] * query_length (4 * 4)
-
-    gluon absorbs this: it derives its own batch as ``q.shape[0] //
-    query_length`` and the surplus rows, holding ``context_lens == 0``, do no
-    work. Recovering that count here and slicing the per-sequence arguments to
-    it hands FlyDSL the same rectangle, dropping exactly the zeroed tail.
-
-    Deliberately NOT restricted to ``max_seqlen_q == 1``. The dense path is
-    where FlyDSL's headroom over gluon lives (it splits past the 32 gluon's PS
-    reduce caps at), it runs ``max_seqlen_q == num_spec + 1``, and FlyDSL tunes
-    that shape specifically -- it has a query_length==4 MTP4 grid split. Only
-    the sparse path is naturally ``max_seqlen_q == 1``, having already given
-    every query token its own row, table and causal length.
-
-    The cache-layout clause is structural too: the page-16 SHUFFLE cache is
-    ``[nb, Hkv, head_dim // x, 16, x]`` with ``x = 16 // element_size``, which
-    equals FlyDSL's required ``[nb, Hkv, head_dim // 16, block_size, 16]``
-    exactly when the cache is 1 byte per element. A bf16 cache gives x == 8 and
-    is rejected -- as is its bf16 ``compute_type``.
+    Not restricted to ``max_seqlen_q == 1`` on purpose: dense is where FlyDSL's
+    headroom over gluon lives, it runs ``num_spec + 1``, and FlyDSL tunes that
+    shape (it has a query_length==4 MTP4 grid split).
     """
     import aiter
 
@@ -301,7 +282,7 @@ def run_pa_decode_gluon(
     sinks: torch.Tensor | None = None,
     sliding_window: int = -1,
     ps: bool = True,
-    allow_work_plan: bool = False,
+    allow_flydsl_plan: bool = False,
 ):
     """Run the AITER paged-attention decode kernel.
 
@@ -347,10 +328,10 @@ def run_pa_decode_gluon(
         work_plan = None
         es, ml, tmp = exp_sums, max_logits, temporary_output
         # Built once per forward by the metadata builder, not here: it is a
-        # function of context_lens alone. `allow_work_plan` keeps the choice
+        # function of context_lens alone. `allow_flydsl_plan` keeps the choice
         # with the caller, as the split count already is -- the sparse sites and
         # the vLLM/SGLang bridges never opt in.
-        if allow_work_plan:
+        if allow_flydsl_plan:
             from atom.utils.forward_context import get_forward_context
 
             md = get_forward_context().attn_metadata

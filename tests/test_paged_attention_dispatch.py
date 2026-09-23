@@ -444,10 +444,10 @@ class TestWorkPlanWiring:
         from atom.model_ops.base_attention import run_pa_decode_gluon
         from atom.model_ops.minimax_m3 import sparse_attn
 
-        param = inspect.signature(run_pa_decode_gluon).parameters["allow_work_plan"]
+        param = inspect.signature(run_pa_decode_gluon).parameters["allow_flydsl_plan"]
         assert param.default is False
-        assert "allow_work_plan=True" in inspect.getsource(attention_mha)
-        assert "allow_work_plan" not in inspect.getsource(sparse_attn)
+        assert "allow_flydsl_plan=True" in inspect.getsource(attention_mha)
+        assert "allow_flydsl_plan" not in inspect.getsource(sparse_attn)
 
     def test_every_draft_pass_refreshes_the_plan(self):
         """Weak on purpose, and the weakness is the point.
