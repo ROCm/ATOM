@@ -216,9 +216,21 @@ class FusedMoEParallelConfig:
     # The other half of --all2all-backend: which MoRI kernel family to ask for.
     low_latency: bool = False
 
+    # Ulysses SP shards the token dimension over exactly the ranks the EP group
+    # spans, which is the job DP does in the topology the all2all path was
+    # written for. Only set at `-tp 1 -sp W`: with TP in the mix a token shard
+    # is held by a whole TP group, and dispatching it from each member would
+    # route the same token more than once.
+    sp_shards_tokens: bool = False
+
     @property
     def selected_all2all_backend(self) -> str | None:
-        if self.dp_size <= 1 or not self.use_ep or self.dp_logical_ratio != 1:
+        # Routed dispatch needs the tokens spread across the EP group, so that
+        # sending each one only to the ranks owning its experts is less traffic
+        # than every rank holding the whole sequence already.
+        if not self.use_ep or self.dp_logical_ratio != 1:
+            return None
+        if self.dp_size <= 1 and not self.sp_shards_tokens:
             return None
         if self.requested_all2all_backend == "none":
             return None
@@ -361,6 +373,7 @@ class FusedMoEParallelConfig:
             * sp_size,
             requested_all2all_backend=requested_all2all_backend,
             low_latency=low_latency,
+            sp_shards_tokens=sp_size > 1 and tp_size_ == 1,
         )
 
 
@@ -630,6 +643,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             ),
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
+            shared_experts_fused=layer.num_fused_shared_experts > 0,
         )
         if layer.expert_layout.shared_is_routed:
             # EPLB places and records shared experts with routed experts.
@@ -5027,7 +5041,17 @@ class FusedMoE(torch.nn.Module):
         num_fused_shared_experts: int = 0,
         fused_shared_experts_scoring_func: str | None = None,
         routed_scaling_factor: float = 1.0,
+        shared_experts_fused: bool | None = None,
     ):
+        # `num_fused_shared_experts` says how many shared columns the AITER topK
+        # metadata buffer carries; `shared_experts_fused` says whether a shared
+        # expert is fused into the top-k list at all, which is what decides who
+        # applies `routed_scaling_factor`. They only differ for the dispatch
+        # remap layout, which appends the shared column after routing and so
+        # asks for a zero-width metadata buffer while the model still skips its
+        # own routed-scale multiply.
+        if shared_experts_fused is None:
+            shared_experts_fused = num_fused_shared_experts > 0
 
         # custom_routing_function takes precedence (e.g. DeepSeek-V4 hash routing
         # in the first 3 layers, where topk_ids are looked up from a per-token
@@ -5110,7 +5134,7 @@ class FusedMoE(torch.nn.Module):
                 # experts are not fused; DeepSeek-V4 folds it into routing.
                 route_scale = (
                     routed_scaling_factor
-                    if fuse_shared or scoring_func == "sqrtsoftplus"
+                    if shared_experts_fused or scoring_func == "sqrtsoftplus"
                     else 1.0
                 )
                 topk_gating(
@@ -5293,13 +5317,18 @@ class FusedMoE(torch.nn.Module):
             hidden_states = naive_multicast(hidden_states, cu_tokens_across_dp_cpu)
             router_logits = naive_multicast(router_logits, cu_tokens_across_dp_cpu)
 
-        # Ulysses SP gives every rank a different token shard, but the expert
-        # weights are sharded over that same dimension -- so this rank holds
-        # only a slice of the computation for EVERY token, not the whole
-        # computation for its own. Gather the sequence, contribute this rank's
-        # slice, and let the reduce-scatter hand back a finished token shard.
-        # Shapes are static, so both collectives are graph-safe.
-        sp_moe = sp_is_enabled()
+        # Ulysses SP gives every rank a different token shard. Under TP-style
+        # expert sharding this rank holds a slice of the computation for EVERY
+        # token rather than the whole computation for its own, so the sequence
+        # has to be gathered and the partials reduce-scattered back. Shapes are
+        # static, so both collectives are graph-safe.
+        #
+        # Routed EP wants the opposite: this rank owns whole experts, so it
+        # needs only the tokens routed to them, and the dispatch all-to-all
+        # inside `quant_method.apply` moves exactly those. A token reaches 2.73
+        # of 4 ranks on average at top_k 4 over 128 experts, so leaving the
+        # shard where it is beats gathering all of it.
+        sp_moe = sp_is_enabled() and not self.moe_parallel_config.use_all2all_kernels
         if sp_moe:
             hidden_states = sp_moe_gather(hidden_states)
             router_logits = sp_moe_gather(router_logits)

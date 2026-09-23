@@ -55,7 +55,10 @@ class Attention(BaseAttention):
         # MiniMax-M3 carries one indexer query head per kv head, so its packed
         # width follows the kv heads through the same all-to-all.
         if kwargs.get("index_q_size"):
-            kwargs["index_q_size"] = max(1, kwargs["index_q_size"] // sp_size)
+            index_dim = kwargs["index_head_dim"]
+            kwargs["index_q_size"] = (
+                max(1, kwargs["index_q_size"] // index_dim // sp_size) * index_dim
+            )
 
         super().__init__(
             num_heads=num_heads,
