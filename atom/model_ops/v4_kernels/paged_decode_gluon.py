@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Shared KV panels for gfx950 single-pass sparse decode."""
+"""Single-pass sparse decode with shared KV panels on CDNA3/4."""
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -15,7 +15,7 @@ def _load_kv_panel(kv_ptr, slots, positions, channels, length, row_stride, dim_s
 
 
 @gluon.jit
-def _paged_decode_fused_gfx950_kernel(
+def _paged_decode_fused_gluon_kernel(
     q_ptr,
     unified_kv_ptr,
     _kv_scales_ptr,
@@ -42,11 +42,13 @@ def _paged_decode_fused_gfx950_kernel(
     QUANT_KV: gl.constexpr,
     GROUP_SIZE: gl.constexpr,
     NUM_GROUPS: gl.constexpr,
+    CDNA_VERSION: gl.constexpr,
 ):
     # Share the existing fused launch signature with the quantized fallback.
     gl.static_assert(BLOCK_D == 512)
     gl.static_assert(D == 512 and (BLOCK_H == 16 or BLOCK_H == 32) and not QUANT_KV)
-    gl.static_assert(BLOCK_K == 1024 // BLOCK_H)
+    gl.static_assert(CDNA_VERSION == 3 or CDNA_VERSION == 4)
+    gl.static_assert(BLOCK_K == 32 or (CDNA_VERSION == 4 and BLOCK_K == 64))
     # H16 uses its register budget for a wider tile; H32 prefetches a half panel.
     PREFETCH: gl.constexpr = BLOCK_H == 32
     t = gl.program_id(0)
@@ -54,8 +56,8 @@ def _paged_decode_fused_gfx950_kernel(
     HEAD_WAVES: gl.constexpr = 1 if BLOCK_H <= 16 else 2
     KV_WAVES: gl.constexpr = 4 // HEAD_WAVES
     matrix: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4,
-        instr_shape=[16, 16, 32],
+        version=CDNA_VERSION,
+        instr_shape=[16, 16, 32 if CDNA_VERSION == 4 else 16],
         transposed=True,
         warps_per_cta=[HEAD_WAVES, KV_WAVES],
     )
@@ -97,11 +99,18 @@ def _paged_decode_fused_gfx950_kernel(
     acc0 = gl.full((BLOCK_H, BLOCK_D // 2), 0, gl.float32, matrix)
     acc1 = gl.full((BLOCK_H, BLOCK_D // 2), 0, gl.float32, matrix)
     # QK consumes register panels; PV reuses those KV rows through one LDS tile.
-    kv_shared_layout: gl.constexpr = (
-        gl.amd.cdna4.compute_efficient_padded_shared_layout(
-            rhs, [BLOCK_K, BLOCK_D], unified_kv_ptr.dtype.element_ty, is_k_contig=False
+    if CDNA_VERSION == 4:
+        kv_shared_layout: gl.constexpr = (
+            gl.amd.cdna4.compute_efficient_padded_shared_layout(
+                rhs,
+                [BLOCK_K, BLOCK_D],
+                unified_kv_ptr.dtype.element_ty,
+                is_k_contig=False,
+            )
         )
-    )
+    else:
+        # CDNA3 has 32 LDS banks and 64 KiB per CTA; use an unpadded K32 tile.
+        kv_shared_layout: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 8, [1, 0])
     kv_shared = gl.allocate_shared_memory(
         unified_kv_ptr.dtype.element_ty, (BLOCK_K, BLOCK_D), kv_shared_layout
     )
@@ -145,10 +154,10 @@ def _paged_decode_fused_gfx950_kernel(
         kv_shared1.store(raw1.permute((1, 0)))
         key0 = gl.convert_layout(raw0, rhs)
         key1 = gl.convert_layout(raw1, rhs)
-        scores = gl.amd.cdna4.mfma(
+        scores = gl.amd.cdna3.mfma(
             q0, key0, gl.full((BLOCK_H, BLOCK_K), 0, gl.float32, matrix)
         )
-        scores = gl.amd.cdna4.mfma(q1, key1, scores) * qk_scale
+        scores = gl.amd.cdna3.mfma(q1, key1, scores) * qk_scale
         scores = gl.where(offset + score_token[None, :] < length, scores, neg)
         if PREFETCH:
             next_slots = gl.load(
@@ -173,8 +182,8 @@ def _paged_decode_fused_gfx950_kernel(
         value0 = kv_shared0.load(rhs)
         value1 = kv_shared1.load(rhs)
         p = prob_shared.load(lhs)
-        acc0 = gl.amd.cdna4.mfma(p, value0, acc0 * correction[:, None])
-        acc1 = gl.amd.cdna4.mfma(p, value1, acc1 * correction[:, None])
+        acc0 = gl.amd.cdna3.mfma(p, value0, acc0 * correction[:, None])
+        acc1 = gl.amd.cdna3.mfma(p, value1, acc1 * correction[:, None])
         maximum = m_new
         if PREFETCH:
             slots = next_slots

@@ -59,8 +59,8 @@ from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 from aiter.ops.triton.utils.device_info import get_num_sms
 
 from atom.model_ops.sparse_attn_v4 import _sparse_attn_ragged_torch
-from atom.model_ops.v4_kernels.paged_decode_gfx950 import (
-    _paged_decode_fused_gfx950_kernel,
+from atom.model_ops.v4_kernels.paged_decode_gluon import (
+    _paged_decode_fused_gluon_kernel,
 )
 from atom.model_ops.v4_kernels.pool_index import row_offset
 from atom.utils import envs
@@ -709,19 +709,21 @@ def _sparse_attn_v4_paged_decode_triton(
 
     qk_scale = float(softmax_scale) * LOG2E
     _bk, num_warps, num_stages = _kernel_config(block_h)
-    use_gfx950_fused = (
+    cdna_version = {"gfx942": 3, "gfx950": 4}.get(get_gfx())
+    use_gluon_fused = (
         kv_splits == 1
         and not quant_kv
         and q.dtype == torch.bfloat16
         and D == 512
         and block_h in (16, 32)
         and block_k is None
-        and get_gfx() == "gfx950"
+        and cdna_version is not None
     )
     if block_k is None:
-        if use_gfx950_fused:
-            # Keep the score tile at 1024 elements: H16/K64 or H32/K32.
-            block_k = 1024 // block_h
+        if use_gluon_fused:
+            # CDNA3 must fit KV + probabilities within 64 KiB LDS.
+            # CDNA4 can widen H16 to K64 while keeping 1024 score elements.
+            block_k = 1024 // block_h if cdna_version == 4 else 32
         else:
             # fp8 dequant inflates per-tile ALU work ~4×; a wider K tile amortizes
             # the per-tile dequant cost (scale load + cast + multiply) over more
@@ -749,8 +751,8 @@ def _sparse_attn_v4_paged_decode_triton(
     if kv_splits == 1:
         grid_fused = (T, n_head_blocks)
         kernel = (
-            _paged_decode_fused_gfx950_kernel
-            if use_gfx950_fused
+            _paged_decode_fused_gluon_kernel
+            if use_gluon_fused
             else _paged_decode_fused_kernel
         )
         kernel[grid_fused](
@@ -780,12 +782,13 @@ def _sparse_attn_v4_paged_decode_triton(
             QUANT_KV=quant_kv,
             GROUP_SIZE=_FP8_GROUP_SIZE,
             NUM_GROUPS=num_groups_arg,
+            **({"CDNA_VERSION": cdna_version} if use_gluon_fused else {}),
             num_warps=num_warps,
             num_stages=num_stages,
             # Buffer-load lowering for 32-head tiles can cross 256 VGPRs.
             waves_per_eu=(
                 2
-                if not use_gfx950_fused and block_h == 32 and D == 512 and not quant_kv
+                if not use_gluon_fused and block_h == 32 and D == 512 and not quant_kv
                 else 0
             ),
         )

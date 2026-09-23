@@ -7,6 +7,7 @@ import torch
 pytest.importorskip("triton")
 pytest.importorskip("aiter")
 
+from atom.model_ops.v4_kernels import paged_decode
 from atom.model_ops.v4_kernels.paged_decode import (
     _sparse_attn_v4_paged_decode_triton,
 )
@@ -14,6 +15,16 @@ from atom.model_ops.v4_kernels.paged_decode import (
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="ROCm GPU required"
 )
+
+
+@pytest.fixture(params=[False, True], ids=["native", "cdna3_layout"])
+def fused_arch(request, monkeypatch):
+    if request.param:
+        if paged_decode.get_gfx() != "gfx950":
+            pytest.skip("CDNA3 layout coverage on CDNA4 requires gfx950")
+        # CDNA4 can execute the older BF16 MFMA. Exercise its layout and K32
+        # tiling against the same oracle; this is not gfx942 hardware validation.
+        monkeypatch.setattr(paged_decode, "get_gfx", lambda: "gfx942")
 
 
 def _inputs(heads, dim, dtype, quantized=False):
@@ -85,7 +96,9 @@ def _check(actual, expected, ptr):
         (32, 512, torch.bfloat16, True),
     ],
 )
-def test_fused_decode_matches_fp64_with_ragged_rows(heads, dim, dtype, quantized):
+def test_fused_decode_matches_fp64_with_ragged_rows(
+    heads, dim, dtype, quantized, fused_arch
+):
     query, cache, indices, ptr, sink, scales = _inputs(heads, dim, dtype, quantized)
     actual = _sparse_attn_v4_paged_decode_triton(
         query, cache, indices, ptr, sink, dim**-0.5, scales, kv_splits=1
@@ -95,7 +108,7 @@ def test_fused_decode_matches_fp64_with_ragged_rows(heads, dim, dtype, quantized
 
 
 @pytest.mark.parametrize("heads", [16, 32])
-def test_fused_decode_graph_reads_changed_csr_and_sink(heads):
+def test_fused_decode_graph_reads_changed_csr_and_sink(heads, fused_arch):
     query, cache, indices, ptr, sink, scales = _inputs(heads, 512, torch.bfloat16)
 
     def forward():
@@ -121,7 +134,7 @@ def test_fused_decode_graph_reads_changed_csr_and_sink(heads):
 
 
 @pytest.mark.parametrize("heads", [16, 32])
-def test_fused_decode_addresses_past_int32_element_offsets(heads):
+def test_fused_decode_addresses_past_int32_element_offsets(heads, fused_arch):
     torch.manual_seed(20260922)
     tokens, dim = 512, 512
     first_slot = 1 << 22
@@ -139,3 +152,31 @@ def test_fused_decode_addresses_past_int32_element_offsets(heads):
     )
     expected = _reference(query, cache, indices, ptr, sink, None)
     _check(actual, expected, ptr)
+
+
+@pytest.mark.parametrize("heads", [16, 32])
+def test_fused_decode_strided_channels(heads, fused_arch):
+    query, cache, indices, ptr, sink, scales = _inputs(heads, 512, torch.bfloat16)
+    q_storage = torch.empty(*query.shape[:-1], 1024, device="cuda", dtype=query.dtype)
+    kv_storage = torch.empty(cache.shape[0], 1024, device="cuda", dtype=cache.dtype)
+    q_storage[..., ::2].copy_(query)
+    kv_storage[:, ::2].copy_(cache)
+    query, cache = q_storage[..., ::2], kv_storage[:, ::2]
+    actual = _sparse_attn_v4_paged_decode_triton(
+        query, cache, indices, ptr, sink, 512**-0.5, kv_splits=1
+    )
+    _check(actual, _reference(query, cache, indices, ptr, sink, scales), ptr)
+
+
+@pytest.mark.parametrize("block_k,arch", [(16, None), (None, "gfx90a")])
+def test_fused_decode_fallback_matches_reference(block_k, arch, monkeypatch):
+    if arch is not None:
+        monkeypatch.setattr(paged_decode, "get_gfx", lambda: arch)
+    # Explicit tile overrides and unsupported devices must remain usable
+    # without invoking the Gluon implementation.
+    monkeypatch.setattr(paged_decode, "_paged_decode_fused_gluon_kernel", None)
+    query, cache, indices, ptr, sink, scales = _inputs(16, 512, torch.bfloat16)
+    actual = _sparse_attn_v4_paged_decode_triton(
+        query, cache, indices, ptr, sink, 512**-0.5, kv_splits=1, block_k=block_k
+    )
+    _check(actual, _reference(query, cache, indices, ptr, sink, scales), ptr)
