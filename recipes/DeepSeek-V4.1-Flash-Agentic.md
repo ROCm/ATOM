@@ -2,96 +2,42 @@
 
 This recipe runs the SemiAnalysis/Weka AgentX replay on one TP2 or TP4 ATOM
 instance, with no expert parallelism, BF16 KV, FP8 index cache, level 3 FULL
-graphs and DSpark with five draft tokens. Start with **TP2 c16** for a balanced
-point, **TP2 c32** for higher throughput, or **TP4 c8** for interactivity above
-200 output tokens/s/user in these measurements.
+graphs and DSpark with five draft tokens.
 
 The measurements use **fixed acceptance length 3.51**, configured with
 `--spec-decode-acceptance-length 3.51`.
 
-## Measured operating points
+## Performance
 
-Each point has a 3,600-second profiling setting; startup, dataset preparation
-and warmup are separate. AgentX concurrency counts session trees with subagent
-fan-out, not a fixed batch of decode requests. Different points finish different
-request mixes, so this is an operating-point comparison, not a controlled TP
-scaling experiment or an ISL-normalized comparison.
+Each concurrency point uses a 3,600-second profiling setting, excluding startup
+and warmup.
 
-The axes use the local `ix_metrics.py` definition:
-
-- **X = 1000 / P90 ITL(ms)**, output tokens/s/user. This is ordinary interactivity,
-  without TTFT or E2E normalization.
-- **Y = (sum input tokens + sum output tokens) / request span / GPU count**,
+- **X = 1000 / P90 ITL(ms)**, output tokens/s/user.
+- **Y = (total input + total output tokens) / request span / GPU count**,
   tokens/s/GPU. Input includes cached tokens.
-- Request span is `(last successful profiling request end - first successful
-  profiling request start)` in seconds; warmup and error records are excluded.
-  GPU count is 2 for TP2 and 4 for TP4.
+- Request span runs from the first successful profiling request start to the
+  last successful profiling request end. GPU count is 2 for TP2 and 4 for TP4.
 
-| TP | Concurrency | X | Y (tokens/s/GPU) | Successful requests | Selection |
-|---:|---:|---:|---:|---:|---|
-| 2 | 1 | 287.23 | 10,133.87 | 270 | Lowest-load/highest-X reference |
-| 2 | 2 | 255.57 | 10,743.47 | 417 | Optional low-load point |
-| 4 | 2 | 284.58 | 5,691.77 | 425 | TP2 c1 has higher X and Y |
-| 4 | 8 | 221.80 | 14,553.90 | 1,345 | Recommended high-interactivity point |
-| 2 | 8 | 166.86 | 27,095.30 | 1,288 | Recommended intermediate point |
-| 4 | 16 | 141.46 | 26,473.64 | 2,523 | TP2 c8 has higher X and Y |
-| 2 | 16 | 104.87 | 46,969.42 | 2,366 | Recommended balanced point |
-| 4 | 32 | 82.72 | 47,932.15 | 4,212 | Optional narrow throughput step |
-| 2 | 32 | 57.33 | 83,359.20 | 3,828 | Recommended throughput point |
-| 4 | 64 | 40.45 | 67,353.94 | 7,371 | TP2 c32 has higher X and Y |
-| 2 | 64 | 24.83 | 103,358.43 | 5,950 | Maximum measured Y; low interactivity |
+### TP2
 
-A compact sweep is **TP2 c1 → TP4 c8 → TP2 c8 → TP2 c16 → TP2 c32**.
-Add TP2 c64 only if approximately 25 output tokens/s/user is acceptable.
-TP2 c2 and TP4 c32 also remain on the measured X/Y frontier, but offer small
-throughput increments relative to their faster neighbors.
+| Concurrency | X (output tokens/s/user) | Y (tokens/s/GPU) | Successful requests |
+|---:|---:|---:|---:|
+| 1 | 287.23 | 10,133.87 | 270 |
+| 2 | 255.57 | 10,743.47 | 417 |
+| 8 | 166.86 | 27,095.30 | 1,288 |
+| 16 | 104.87 | 46,969.42 | 2,366 |
+| 32 | 57.33 | 83,359.20 | 3,828 |
+| 64 | 24.83 | 103,358.43 | 5,950 |
 
-Useful comparisons:
+### TP4
 
-| Candidate | Reference | X change | Y change |
-|---|---|---:|---:|
-| TP2 c8 | TP4 c16 | +17.96% | +2.35% |
-| TP2 c16 | TP4 c32 | +26.79% | -2.01% |
-| TP2 c32 | TP4 c64 | +41.73% | +23.76% |
-| TP2 c64 | TP2 c32 | -56.69% | +23.99% |
-
-TP2 c16 is the close **per-GPU throughput** match to TP4 c32. TP2 c32 and
-TP4 c16 are not equivalent: their (X, Y) coordinates are (57.33, 83,359.20)
-and (141.46, 26,473.64). There is no universal concurrency conversion between
-TP2 and TP4. Dividing Y by GPU count also does not measure multiple co-located
-instances; these runs used one instance per benchmark job.
-
-### Evidence and metric reconstruction
-
-- TP2: [Action 35834179304](https://github.com/ROCm/ATOM/actions/runs/35834179304),
-  commit `f3f112e482aebfb0efde44afc7e599a2630b962f`.
-- TP4: [Action 35823705134](https://github.com/ROCm/ATOM/actions/runs/35823705134),
-  commit `016f4ee9bee58447fb83be5f2481f1623bfac972`.
-  c2/8/16/32/64 completed; c1 failed and has no point in this table. The overall
-  TP4 workflow conclusion is therefore failure.
-- Both: `rocm/atom-dev:nightly_202609221542`, MI355X 288 GB, reported ROCm 7.2.4,
-  image-provided AIPerf 0.12.0, no AITER reinstall. The workflow checked the
-  AIPerf version, not its exact installed commit.
-
-These historical coordinates are **reconstructed from uploaded aggregate JSON**:
-`p90_itl_ms`, `total_input_tokens`, `total_output_tokens`,
-`benchmark_duration_s` and `tensor_parallel_size`. Token totals also agree with
-mean sequence length times successful request count. The artifacts do not
-include `profile_export.jsonl`, so the historical points have not been independently
-revalidated record by record. c32 and c64 on TP2 report request error rates of
-0.03% and 0.07%; a successful CI job does not imply zero request errors.
-
-Do not substitute `total_token_throughput / TP` for Y. AIPerf can use an explicit
-observation window for that field. For example, TP2 c64 has 750,280,742 total
-tokens and a 3,629.509147904-second request span:
-
-```text
-X = 1000 / 40.27481646885673 = 24.82941172
-Y = 750280742 / 3629.509147904 / 2 = 103358.43105
-```
-
-The exported total throughput instead implies a 3,930.003136760-second window,
-giving 95,455.49 tokens/s/GPU. Preserve both definitions if comparing dashboards.
+| Concurrency | X (output tokens/s/user) | Y (tokens/s/GPU) | Successful requests |
+|---:|---:|---:|---:|
+| 2 | 284.58 | 5,691.77 | 425 |
+| 8 | 221.80 | 14,553.90 | 1,345 |
+| 16 | 141.46 | 26,473.64 | 2,523 |
+| 32 | 82.72 | 47,932.15 | 4,212 |
+| 64 | 40.45 | 67,353.94 | 7,371 |
 
 ## Prepare one point
 
@@ -101,9 +47,7 @@ model cache is elsewhere. Use one fresh container and output directory per point
 and finish/stop the previous point before launching another on the same GPUs or
 port.
 
-The commands below use the recipe's admission-fix revision for both TP sizes.
-The historical measurements retain their original source revisions above;
-record the source revision when collecting new results.
+The commands below use the same source revision for TP2 and TP4.
 
 ```bash
 set -euo pipefail
