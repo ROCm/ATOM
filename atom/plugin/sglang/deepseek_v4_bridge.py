@@ -440,6 +440,17 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
         # create full/SWA index allocators and then call register_mapping().
         self.full_kv_pool = None
         self.swa_kv_pool = None
+        # Upstream DeepSeekV4TokenToKVPool always publishes these flags. After
+        # install_deepseek_v4_proxy_pool_patch(), isinstance(proxy, DeepSeekV4TokenToKVPool)
+        # is True, and 0.5.19/0.5.20 paths (PD draft-state transfer, hybrid
+        # assemblers) read pool._unified_kv directly. ATOM owns its own arena
+        # views and does not enter SGLang's unified_kv_triton pool layout, so
+        # keep both False while still exposing the ABI.
+        self._unified_kv = False
+        self._unified_kv_fp8 = False
+        self.unified_kv_pool = None
+        self.c4_kv_pool = None
+        self.c128_kv_pool = None
 
         self.num_slots = max(
             1, int(num_req_slots) if num_req_slots is not None else self.max_num_reqs
@@ -793,6 +804,21 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
         # DSV4 pools do not use the generic precomputed SWA location path, and
         # ATOM writes the proxy arena through its own bridge metadata.
         pass
+
+    def get_unified_kv(self, layer_id: int) -> torch.Tensor:
+        """Expose ATOM's carved unified plane for SGLang duck-typed readers.
+
+        ``_unified_kv`` stays False so SGLang does not take its own
+        unified_kv_triton allocation path; callers that still ask for the
+        plane (env-gated backends, diagnostics) get the proxy view.
+        """
+        local = int(layer_id) - int(self.start_layer)
+        return self.views["unified"][local]
+
+    def get_unified_kv_rope(self, layer_id: int) -> torch.Tensor | None:
+        local = int(layer_id) - int(self.start_layer)
+        rope = self.views["unified_rope"][local]
+        return rope
 
     def get_state_buf_infos(self):
         return ([], [], [])

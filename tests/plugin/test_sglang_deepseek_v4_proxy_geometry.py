@@ -83,6 +83,11 @@ def test_proxy_geometry_matches_per_layer_cache_views():
 
     assert geometry.classes == (DENSE_RATIO, CSA_RATIO, HCA_RATIO)
     assert geometry.window_params(0).ring_start == 0
+    # SGLang 0.5.19/0.5.20 DeepSeekV4TokenToKVPool ABI: flag must exist and
+    # stay False for the ATOM proxy (no upstream unified_kv_triton layout).
+    assert pool._unified_kv is False
+    assert pool._unified_kv_fp8 is False
+    assert pool.get_unified_kv(1).data_ptr() == pool.views["unified"][1].data_ptr()
     for layer, ratio, compressed in (
         (1, 4, pool.views["csa_main"][0]),
         (2, 128, pool.views["hca_main"][0]),
