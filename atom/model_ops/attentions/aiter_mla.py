@@ -445,6 +445,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # unrounded multiple of 16 while sparse prefill rounds up to
             # 16/32/64/128 -- assert they still agree rather than let a
             # future mismatch surface as a corrupted reduce write.
+            #
+            # Both sides here use the default min_kernel_heads=16, same as
+            # persistent_num_heads above -- this only checks the two width
+            # functions agree at that floor. A model passing MLAAttention a
+            # higher min_query_heads (Kimi-K3 DSpark: 32, for fp8 + 2-wide
+            # non-causal blocks) has already diverged from that floor before
+            # this assert runs; this predates QREP and is not re-verified here.
             expected_sparse_prefill_num_heads = mla_dcp_sparse_prefill_num_heads(
                 self.num_attention_heads,
                 self.dcp_world_size,

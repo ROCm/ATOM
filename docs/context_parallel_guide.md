@@ -365,17 +365,19 @@ indexer's verify path; Kimi-K3 + DSpark, dcp8 (gsm8k 0.98/200, nshot=5) covers
 dense MLA's `cprr` kernel running on a QREP-produced `q_out` — the combination
 the removed `speculative_config` gate used to block.
 
-A layer whose `q_proj` was not built with the QREP override falls back to
-AllGather automatically instead of misreading a narrow q as the wide QREP
-layout — target models, MTP, eagle3, and DSpark are all wired today, so this
-is a safety net for a future model that isn't.
+A layer falls back to AllGather automatically, instead of enabling QREP
+incorrectly, for either of two reasons: `q_proj` was never built with the QREP
+override (target models, MTP, eagle3, and DSpark are all wired today, so this
+is a safety net for a future model that isn't), or it was, but its on-disk
+quant type is one `_local_q_proj`'s row view cannot narrow (e.g. mxfp4).
 
 To confirm QREP actually took effect (the config flag being `true` is not the
 same as it running): a wired layer logs `enable_query_replication is on and
-active ...` once per process; an unwired one logs `... layer N's q_proj was
-not built with qrep_tp_override ...` once per layer. The positive line only
-says QREP is on *somewhere* — on a fully wired model, check for the
-**absence of any fallback line** to confirm every layer got it.
+active ...` once per process; an unwired one logs `... layer N's <reason> --
+falling back to AllGather Q for it` once per layer, naming whichever of the
+two reasons above applies. The positive line only says QREP is on
+*somewhere* — on a fully wired model, check for the **absence of any
+fallback line** to confirm every layer got it.
 
 Costs KV budget: replicating the query heads shrinks the KV pool by roughly
 5% (measured on DeepSeek-R1 tp8/dcp8: 235 016 → 221 020 blocks). Before this

@@ -1625,6 +1625,13 @@ def q_proj_is_qrep_widened(q_proj, qrep_num_heads: int, qk_head_dim: int) -> boo
     width. Provenance alone isn't enough either: it says intent, not that
     the resulting shape is what `_local_q_proj`/`W_K_qrep` actually assume.
 
+    Known residual gap: if `q_proj` is a wrapper that hides `.weight`
+    (`getattr` returns None, e.g. GLM-5.3's `_ZeroRopePad`) while its
+    wrapped linear actually was overridden, this returns False and the
+    caller falls back to AllGather -- safe today because no wrapper of
+    that shape is ever also wired to `qrep_tp_override`, but nothing here
+    would catch a future model that combines both.
+
     Dependency-free so it stays importable, and testable, without triton/aiter.
     """
     if not getattr(q_proj, "effective_tp_overridden", False):
