@@ -364,6 +364,8 @@ def decompose_slots_triton(
         raise TypeError(
             f"slots and row_lut must be int32, got {slots.dtype} and {row_lut.dtype}"
         )
+    if n_iota < 0:
+        raise ValueError(f"n_iota must be non-negative, got {n_iota}")
     if row_lut.numel() != block_size:
         raise ValueError(
             f"row_lut must have {block_size} entries, got {row_lut.numel()}"
