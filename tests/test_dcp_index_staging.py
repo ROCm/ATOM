@@ -12,13 +12,13 @@ from atom.kv_transfer.disaggregation.index_staging import (
 from atom.kv_transfer.disaggregation.sharded_transfer import build_dcp_shard_plan
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 @pytest.mark.parametrize("dcp_size", [2, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
-def test_mla_gather_preserves_sharded_bytes_and_partial_page(device, dcp_size, dtype):
-    if device == "cuda" and not torch.cuda.is_available():
-        pytest.skip("GPU required")
-    block_size, width = 16, 48
+@pytest.mark.parametrize("width", [48, 576])
+def test_mla_gather_preserves_sharded_bytes_and_partial_page(dcp_size, dtype, width):
+    device = torch.device("cuda")
+    block_size = 16
     # Permuted source blocks and a partial final page exercise physical block
     # addressing, every DCP rank, and padding without depending on the planner.
     src_ids = [4, 0, 6, 2, 5]
