@@ -818,3 +818,57 @@ def test_one_unrepresentable_request_aborts_the_batch():
     assert (
         ragged_verify_lens([1, 1], FULL_Q, np.array([0, 3]), np.array([6, 2])) is None
     )
+
+
+def _q_bucket_runner():
+    """The slice of a runner `_dspark_apply_q_bucket` actually reads."""
+    from types import SimpleNamespace
+
+    drafter = SimpleNamespace(
+        uses_confidence_schedule=True,
+        mtp_k=3,
+        verify_scheduler=SimpleNamespace(ell_by_req={7: 1}),
+    )
+    config = SimpleNamespace(dspark=SimpleNamespace(ragged=False, q_buckets="1,2,4"))
+    return SimpleNamespace(drafter=drafter, config=config)
+
+
+def _decode_batch(width, num_spec_step):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        total_tokens_num_prefill=0,
+        total_seqs_num_decode=1,
+        total_tokens_num_decode=width,
+        total_tokens_num=width,
+        num_spec_step=num_spec_step,
+        req_ids=[7],
+        num_scheduled_tokens=np.array([width], dtype=np.int32),
+        scheduled_tokens=np.arange(width, dtype=np.int32),
+        num_bonus=None,
+        scheduled_spec_decode_tokens=np.zeros((1, max(width - 1, 0)), dtype=np.int32),
+    )
+
+
+def test_q_bucket_leaves_a_target_only_decode_at_width_one():
+    """Producer decode is scheduled q=1 while the drafter still says mtp_k=3.
+
+    ell=1 and buckets 1,2,4 would otherwise quantize up to q=2 and read past
+    the one reserved token.
+    """
+    from atom.model_engine.model_runner import ModelRunner
+
+    batch = _decode_batch(width=1, num_spec_step=0)
+    assert ModelRunner._dspark_apply_q_bucket(_q_bucket_runner(), batch) is None
+    assert batch.num_scheduled_tokens.tolist() == [1]
+    assert batch.scheduled_tokens.tolist() == [0]
+
+
+def test_q_bucket_still_shrinks_a_verifying_decode():
+    """The same ell and buckets, on a batch that reserved the full width."""
+    from atom.model_engine.model_runner import ModelRunner
+
+    batch = _decode_batch(width=4, num_spec_step=3)
+    assert ModelRunner._dspark_apply_q_bucket(_q_bucket_runner(), batch) == 2
+    assert batch.num_scheduled_tokens.tolist() == [2]
+    assert batch.total_tokens_num_decode == 2

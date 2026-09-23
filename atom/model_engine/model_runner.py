@@ -2184,6 +2184,12 @@ class ModelRunner:
         scheduled_bs = batch.total_seqs_num_decode
         if scheduled_bs <= 0:
             return
+        # A batch with no draft slots was scheduled target-only (a P/D producer
+        # reserves one token per request). The drafter still carries `mtp_k`,
+        # so quantizing ell+1 up into a bucket would widen past the tokens and
+        # the KV this step reserved.
+        if int(getattr(batch, "num_spec_step", 0) or 0) <= 0:
+            return None
         full_q = self.drafter.mtp_k + 1
 
         # {req_id: ell} from an EARLIER step's propose() (verify_scheduler, same
@@ -2252,6 +2258,11 @@ class ModelRunner:
         # segment: token[0] is the anchor; the rest are placeholders overwritten
         # by token_ids[:, 1:] = scheduled_spec_decode_tokens downstream.
         old_nst = batch.num_scheduled_tokens
+        # Rounding a bucket up must not outgrow what the scheduler reserved.
+        # The producer case returns above; this stops a stale ell from doing
+        # the same to any other target-narrow batch.
+        if int(np.min(old_nst[:scheduled_bs])) < q:
+            return None
         sched = np.asarray(batch.scheduled_tokens)
         old_cu = np.zeros(scheduled_bs + 1, dtype=np.int64)
         np.cumsum(old_nst[:scheduled_bs], out=old_cu[1:])

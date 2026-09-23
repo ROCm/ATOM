@@ -1906,6 +1906,17 @@ class _DSparkSpecConfig:
         return True
 
 
+class _EagleSpecConfig:
+    """Same surface, serial MTP / EAGLE: the drafter reads the successor."""
+
+    def __init__(self, num_speculative_tokens: int):
+        self.num_speculative_tokens = num_speculative_tokens
+        self.method = "eagle"
+
+    def use_dspark(self) -> bool:
+        return False
+
+
 class TestPostprocess:
     def _prefill(self, scheduler, seq):
         scheduler.add(seq)
@@ -1995,6 +2006,40 @@ class TestPostprocess:
             sched = self._sched_with_kv_role(kv_config)
             assert sched.use_spec is False
             assert sched.mtp_k == 0
+            # DSpark does not read the successor, so the producer stays off it.
+            assert sched.drafter_needs_next_token is False
+
+    def test_an_eagle_producer_still_records_the_successor(self, seq_factory):
+        """Verification stays off; the successor token does not.
+
+        `use_spec` sizes the decode window. EAGLE's middle-chunk draft KV and
+        the DP alignment anchor both read `next_token_ids`, which is a
+        property of the drafter and has to survive on a producer.
+        """
+        cfg = MockConfig(
+            speculative_config=_EagleSpecConfig(3),
+            kv_transfer_config={
+                "kv_connector": "mooncake",
+                "kv_role": "kv_producer",
+            },
+            max_num_batched_tokens=6,
+            num_kvcache_blocks=100,
+            kv_cache_block_size=4,
+            enable_chunked_prefill=True,
+        )
+        with mock.patch(
+            "atom.utils.forward_context.get_kvconnector", return_value=None
+        ):
+            sched = Scheduler(cfg)
+        assert sched.use_spec is False
+        assert sched.mtp_k == 0
+        assert sched.drafter_needs_next_token is True
+
+        seq = seq_factory(list(range(10)))
+        sched.add(seq)
+        batch, _ = sched.schedule()
+        assert batch.total_tokens_num_prefill == 6
+        assert batch.next_token_ids == [6]
 
     def test_a_pd_consumer_still_speculates(self):
         sched = self._sched_with_kv_role(
