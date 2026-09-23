@@ -11,7 +11,6 @@ if TYPE_CHECKING:
 
 import numpy as np
 import torch
-from aiter.dist.parallel_state import get_tp_group
 from torch import nn
 
 from atom.config import DCPConfig

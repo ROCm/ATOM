@@ -1,4 +1,1 @@
 *.sh text eol=lf
-
-# Keep generated benchmark evidence available without expanding it in PR diffs.
-/docs/benchmarks/ulysses_sp*.json linguist-generated=true

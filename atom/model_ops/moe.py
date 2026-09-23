@@ -216,18 +216,12 @@ class FusedMoEParallelConfig:
     # The other half of --all2all-backend: which MoRI kernel family to ask for.
     low_latency: bool = False
 
-    # Ulysses SP shards the token dimension over exactly the ranks the EP group
-    # spans, which is the job DP does in the topology the all2all path was
-    # written for. Only set at `-tp 1 -sp W`: with TP in the mix a token shard
-    # is held by a whole TP group, and dispatching it from each member would
-    # route the same token more than once.
+    # SP supplies distinct token shards to EP dispatchers at TP=1.
     sp_shards_tokens: bool = False
 
     @property
     def selected_all2all_backend(self) -> str | None:
-        # Routed dispatch needs the tokens spread across the EP group, so that
-        # sending each one only to the ranks owning its experts is less traffic
-        # than every rank holding the whole sequence already.
+        # Routed dispatch requires distinct token shards and real EP peers.
         if not self.use_ep or self.dp_logical_ratio != 1:
             return None
         if self.dp_size <= 1 and not self.sp_shards_tokens:
@@ -285,15 +279,8 @@ class FusedMoEParallelConfig:
             enable_dp_attention or parallel_config.moe_ep_flatten_tp_across_dp
         )
 
-        # dp_logical, not dp_size_: with DP-attention simulated down to a single
-        # rank the real product is 1, but the deployment being reproduced still
-        # shards experts, so EP must stay on.
-        # Ulysses SP counts here too -- it contributes devices the experts are
-        # split over, so `-tp 1 -sp W` is as much an EP-capable topology as
-        # `-tp W`. SP does not turn EP on by itself, though: the fold below
-        # shards the MoE either way, and on MXFP4 weights the sliced-expert
-        # layout keeps aiter's fused a16w4 GEMMs, which measured faster than
-        # the whole-expert layout EP would pick.
+        # Include simulated DP and SP ranks when deciding whether experts can
+        # shard. SP folds into MoE TP below unless EP is explicitly enabled.
         sp_size = get_sp_world_size()
         use_ep = (
             dp_logical * tp_size_ * sp_size > 1
@@ -324,11 +311,8 @@ class FusedMoEParallelConfig:
         )
 
         pcp_size = get_prefill_context_model_parallel_world_size()
-        # Ulysses SP rides the same rank dimension and always folds in: it
-        # replicates every other weight, so without this the MoE would be
-        # replicated too and a large one would not fit at all. Folded into
-        # tp_size it lands on exactly the layout plain TP would have produced.
-        # PCP proper keeps the fold behind an env switch.
+        # SP always shards MoE weights over the PCP rank dimension. Ordinary
+        # PCP makes that fold optional.
         pcp_merge = pcp_size > 1 and (envs.ATOM_PCP_MOE_MERGE or sp_is_enabled())
         if pcp_merge:
             pcp_rank = get_prefill_context_model_parallel_rank()
@@ -375,38 +359,6 @@ class FusedMoEParallelConfig:
             low_latency=low_latency,
             sp_shards_tokens=sp_size > 1 and tp_size_ == 1,
         )
-
-
-def naive_multicast_fake(
-    x: torch.Tensor, cu_tokens_across_dp_cpu: torch.Tensor
-) -> torch.Tensor:
-    assert len(x.shape) == 2
-    # print(f"cu_tokens_across_dp_cpu: {cu_tokens_across_dp_cpu}")
-    buffer = torch.empty(
-        (cu_tokens_across_dp_cpu[-1], x.size(1)), device=x.device, dtype=x.dtype
-    )
-    return buffer
-
-
-@torch_compile_guard()
-def naive_multicast(
-    x: torch.Tensor, cu_tokens_across_dp_cpu: torch.Tensor
-) -> torch.Tensor:
-    dp_rank = get_dp_group().rank_in_group
-    assert len(x.shape) == 2
-    # print(f"cu_tokens_across_dp_cpu: {cu_tokens_across_dp_cpu}")
-    buffer = torch.empty(
-        (cu_tokens_across_dp_cpu[-1], x.size(1)), device=x.device, dtype=x.dtype
-    )
-
-    start = 0 if dp_rank == 0 else cu_tokens_across_dp_cpu[dp_rank - 1]
-    end = cu_tokens_across_dp_cpu[dp_rank]
-    buffer[start:end, :].copy_(x)
-    for idx in range(get_dp_group().world_size):
-        start = 0 if idx == 0 else cu_tokens_across_dp_cpu[idx - 1]
-        end = cu_tokens_across_dp_cpu[idx]
-        get_dp_group().broadcast(buffer[start:end, :], idx)
-    return buffer
 
 
 def pad_for_all_gather(x: torch.Tensor) -> tuple[torch.Tensor, int]:
@@ -3680,9 +3632,7 @@ class FusedMoE(torch.nn.Module):
 
     @property
     def shared_expert_weight(self) -> float:
-        # Unscaled by the SP width on purpose: the fused shared expert is not
-        # summed across EP ranks, so SP's reduce-scatter sees one copy of it
-        # just as TP's all-reduce does.
+        # Shared experts contribute once per token after the MoE reduction.
         return (
             1.0
             if is_rocm_aiter_fuse_routed_scaling_factor()
@@ -5043,13 +4993,8 @@ class FusedMoE(torch.nn.Module):
         routed_scaling_factor: float = 1.0,
         shared_experts_fused: bool | None = None,
     ):
-        # `num_fused_shared_experts` says how many shared columns the AITER topK
-        # metadata buffer carries; `shared_experts_fused` says whether a shared
-        # expert is fused into the top-k list at all, which is what decides who
-        # applies `routed_scaling_factor`. They only differ for the dispatch
-        # remap layout, which appends the shared column after routing and so
-        # asks for a zero-width metadata buffer while the model still skips its
-        # own routed-scale multiply.
+        # Dispatch layouts append shared columns after routing, so a zero-width
+        # AITER shared buffer does not imply the model applies the routed scale.
         if shared_experts_fused is None:
             shared_experts_fused = num_fused_shared_experts > 0
 
@@ -5308,26 +5253,8 @@ class FusedMoE(torch.nn.Module):
         if get_dp_group().world_size > 1:
             return self.forward_impl_graph(hidden_states, router_logits)
 
-        dp_group = get_dp_group()
-        if dp_group.world_size > 1:
-            cu_tokens_across_dp_cpu = (
-                get_forward_context().dp_metadata.cu_tokens_across_dp_cpu
-            )
-
-            hidden_states = naive_multicast(hidden_states, cu_tokens_across_dp_cpu)
-            router_logits = naive_multicast(router_logits, cu_tokens_across_dp_cpu)
-
-        # Ulysses SP gives every rank a different token shard. Under TP-style
-        # expert sharding this rank holds a slice of the computation for EVERY
-        # token rather than the whole computation for its own, so the sequence
-        # has to be gathered and the partials reduce-scattered back. Shapes are
-        # static, so both collectives are graph-safe.
-        #
-        # Routed EP wants the opposite: this rank owns whole experts, so it
-        # needs only the tokens routed to them, and the dispatch all-to-all
-        # inside `quant_method.apply` moves exactly those. A token reaches 2.73
-        # of 4 ranks on average at top_k 4 over 128 experts, so leaving the
-        # shard where it is beats gathering all of it.
+        # Gather SP token shards for local expert computation, then sum partials
+        # back to each owner. Routed all2all handles token movement itself.
         sp_moe = sp_is_enabled() and not self.moe_parallel_config.use_all2all_kernels
         if sp_moe:
             hidden_states = sp_moe_gather(hidden_states)
@@ -5368,15 +5295,6 @@ class FusedMoE(torch.nn.Module):
 
         if sp_moe:
             final_hidden_states = sp_moe_reduce_scatter(final_hidden_states)
-
-        dp_group = get_dp_group()
-        if dp_group.world_size > 1:
-            dp_rank = dp_group.rank_in_group
-            start = 0 if dp_rank == 0 else cu_tokens_across_dp_cpu[dp_rank - 1]
-            end = cu_tokens_across_dp_cpu[dp_rank]
-
-            all_hidden_states = get_dp_group().all_reduce(final_hidden_states)
-            final_hidden_states = all_hidden_states[start:end, :]
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             # Default set to False. (May have to add shared expert outputs.)
