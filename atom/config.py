@@ -2103,6 +2103,11 @@ class Config:
         back into the expert layer's sharding (``FusedMoEParallelConfig.make``).
         """
         sp = self.sequence_parallel_size
+        if self.parallel_config.data_parallel_size != 1:
+            raise ValueError(
+                "Ulysses SP currently requires data_parallel_size=1: the DP "
+                "MoE forward path does not gather/scatter SP token shards."
+            )
         if self.tensor_parallel_size != 1:
             raise ValueError(
                 f"--sequence-parallel-size {sp} requires --tensor-parallel-size 1: "
@@ -2121,11 +2126,16 @@ class Config:
         hf_text = get_hf_text_config(self.hf_config)
         for name in ("num_attention_heads", "num_key_value_heads"):
             heads = getattr(hf_text, name, None)
-            if heads is not None and heads % sp:
+            if heads is None:
+                continue
+            valid = heads % sp == 0
+            if name == "num_key_value_heads" and heads < sp:
+                valid = sp % heads == 0
+            if not valid:
                 raise ValueError(
-                    f"--sequence-parallel-size {sp} must divide {name} ({heads}): "
-                    "Ulysses splits attention by head, so a rank cannot own a "
-                    "fraction of one."
+                    f"--sequence-parallel-size {sp} is incompatible with "
+                    f"{name} ({heads}): heads must divide evenly across ranks, "
+                    "or KV heads must replicate evenly to query-head owners."
                 )
         self.prefill_context_parallel_size = sp
 
@@ -2653,6 +2663,12 @@ class Config:
         # graph: the attention op carries two extra all-to-alls and the per-rank
         # head counts shrink, so an sp run must not reuse a pcp artifact.
         factors.append(self.sequence_parallel_size)
+        # EP and its transport change expert shapes and whether the shared MLP
+        # is a separate compiled subgraph. Reusing the gather/scatter artifact
+        # for routed SP otherwise loads a callable with the wrong parameters.
+        factors.append(
+            (self.enable_expert_parallel, self.moe_all2all_backend, self.moe_backend)
+        )
         # MiniMax-M3 indexer-only CP changes the FUSED QKV OUTPUT WIDTH: index_q
         # is this rank's one head under TP and all `sparse_num_index_heads` of
         # them under CP (minimax_m3.py, linear.py), so the traced graph and the

@@ -11,11 +11,10 @@ attention, then trades sequence for heads around attention itself::
                     | all-to-all
     linear/MoE:  [T/W, H,   D]
 
-Against tensor parallelism at the same GPU count this replaces two per-layer
-all-reduces of the full hidden state with two all-to-alls that move
-``(W-1)/W * T * H * D / W`` elements, at the cost of replicating the attention
-and dense weights on every rank. Routed experts stay sharded via EP, so the
-memory delta is bounded by the (small) dense side of the model.
+Attention and dense weights are replicated; attention's TP all-reduce becomes
+two head/sequence exchanges. MoE weights remain sharded: its communication is
+either a token all-gather plus reduce-scatter or routed EP dispatch/combine.
+That MoE traffic must be included when comparing SP with TP.
 
 The split is contiguous, not round-robin as in PCP: attention is head-sharded
 and still sees every token, so contiguous chunks carry no causal-mask
@@ -36,10 +35,10 @@ from aiter.dist.parallel_state import (
     get_tp_group,
 )
 
+from atom.distributed.sp_kernels import all_to_all_into, pack_fields
 from atom.utils import envs
 
-# Set by Config.__post_init__ so head-count math is available during model
-# construction, before the process groups exist.
+# Set by each ModelRunner before distributed/model construction.
 _SP_WORLD_SIZE: int = 1
 
 
@@ -88,6 +87,19 @@ def sp_pad_len(total_tokens: int, sp_size: int | None = None) -> int:
     return total_tokens if rem == 0 else total_tokens + (sp_size - rem)
 
 
+def sp_tokens_across_ranks(num_tokens: int | None) -> tuple[int, ...] | None:
+    """Per-rank token counts for a step, in the shape DP metadata reports them.
+
+    A routed all2all MoE bounds its receive buffer by this table. Ulysses
+    shards a step evenly, so it is one count repeated -- but it still has to be
+    published, because the table is otherwise only built when DP is what splits
+    the tokens.
+    """
+    if _SP_WORLD_SIZE <= 1 or num_tokens is None:
+        return None
+    return (sp_pad_len(num_tokens) // _SP_WORLD_SIZE,) * _SP_WORLD_SIZE
+
+
 def sp_local_slice(total_tokens: int) -> slice:
     """This rank's contiguous token range within a padded sequence."""
     local = sp_pad_len(total_tokens) // _SP_WORLD_SIZE
@@ -113,22 +125,8 @@ def sp_split_tokens(x: torch.Tensor) -> torch.Tensor:
     return x[sp_local_slice(total)].contiguous()
 
 
-# Above this the all-to-all's smaller payload wins; below it, sending W times
-# the bytes through aiter's registered buffers still beats RCCL's generic
-# kernel. Measured at SP4 on this exchange's shape (`bench_sp_exchange.py`,
-# per-rank input bytes -> us, all-to-all vs all-gather):
-#
-#     77K   131 -> 92     3080K  117 -> 88
-#   1232K   129 -> 89     3696K   80 -> 82   <- crossover
-#   2464K   119 -> 91     4928K   81 -> 105
-#
-# There is no second crossover further up: the gather sends W times the bytes,
-# so it only falls further behind (at 78M, 536 -> 1534), and past the 64 MiB
-# registered-buffer ceiling it is unavailable anyway. A 30k prefill split four
-# ways lands at 148M, well inside all-to-all's half of the range.
-#
-# `indexer_cp` puts its own crossover at 512KB, but that is a different payload
-# shape and a different pair of kernels; this one runs six times further.
+# Small payloads can benefit from the registered-buffer all-gather. Large
+# prefills use all-to-all to avoid receiving unused heads.
 _ALLGATHER_MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
 
 
@@ -160,21 +158,6 @@ def _custom_reduce_scatter_ok(payload: torch.Tensor, group) -> bool:
     return bool(ca_comm.should_custom_rs(payload, 0))
 
 
-def _quick_all_reduce_ok(payload: torch.Tensor, group) -> bool:
-    """Whether aiter's quantized all-reduce can carry this payload.
-
-    Rank-invariant for the reason in `_custom_gather_ok`. Note this kernel
-    quantizes (`AITER_QUICK_REDUCE_QUANTIZATION`, INT4 as the servers set it),
-    so it is only interchangeable with an exact collective where the model
-    already tolerates it -- which is why the only caller is the MoE reduce,
-    the same sum TP sends through this kernel.
-    """
-    qr_comm = getattr(getattr(group, "device_communicator", None), "qr_comm", None)
-    if qr_comm is None or qr_comm.disabled:
-        return False
-    return bool(qr_comm.should_quick_allreduce(payload))
-
-
 def _prefer_all_gather(payload: torch.Tensor, group) -> bool:
     """Whether to trade this exchange's all-to-all for an all-gather.
 
@@ -196,7 +179,14 @@ def _all_gather_tokens(x: torch.Tensor) -> torch.Tensor:
     """
     x = x.contiguous()
     group = get_sp_group()
-    return group.all_gather(x, use_custom=_custom_gather_ok(x, group), dim=0)
+    if _custom_gather_ok(x, group):
+        return group.all_gather(x, use_custom=True, dim=0)
+    pynccl = getattr(getattr(group, "device_communicator", None), "pynccl_comm", None)
+    if pynccl is not None and not pynccl.disabled:
+        out = x.new_empty((x.shape[0] * _SP_WORLD_SIZE, *x.shape[1:]))
+        pynccl.all_gather(out, x)
+        return out
+    return group.all_gather(x, dim=0)
 
 
 def sp_gather_tokens(x: torch.Tensor, total_tokens: int) -> torch.Tensor:
@@ -223,11 +213,16 @@ def ulysses_gather_heads(x: torch.Tensor) -> torch.Tensor:
         start = group.rank_in_group * s_local
         return group.all_gather(x, use_custom=True, dim=1)[start : start + s_local]
 
-    send = x.reshape(w, s_local, width).contiguous()
+    return _swap_heads(x, s_local, width)
+
+
+def _swap_heads(x, s_local, width):
+    """``[w*s_local, width] -> [s_local, w*width]`` by all-to-all."""
+    send = x.reshape(_SP_WORLD_SIZE, s_local, width).contiguous()
     recv = torch.empty_like(send)
-    torch.distributed.all_to_all_single(recv, send, group=group.device_group)
+    all_to_all_into(recv, send, get_sp_group())
     # recv[i] is head-group i for our token chunk -> concatenate on heads.
-    return recv.permute(1, 0, 2).reshape(s_local, w * width)
+    return recv.permute(1, 0, 2).reshape(s_local, _SP_WORLD_SIZE * width)
 
 
 def sp_moe_gather(x: torch.Tensor) -> torch.Tensor:
@@ -238,10 +233,6 @@ def sp_moe_gather(x: torch.Tensor) -> torch.Tensor:
     shard, so without this a token routed off-rank would contribute nothing at
     all (silently: the kernels just skip non-local expert ids).
 
-    Gathering to the full sequence and reducing back is the same traffic a TP
-    MoE's all-reduce already costs, and at these EP widths it is also what a
-    dispatch/combine all-to-all would move: with top_k of the experts spread
-    over sp ranks, nearly every token has work on nearly every rank anyway.
     """
     if _SP_WORLD_SIZE <= 1:
         return x
@@ -251,37 +242,42 @@ def sp_moe_gather(x: torch.Tensor) -> torch.Tensor:
 def sp_moe_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
     """Sum every rank's expert contributions and keep this rank's token shard.
 
-    Reduce-scatter is the shape that fits, but aiter only accelerates it under
-    the 64 MiB registered-buffer ceiling and a prefill MoE output is several
-    hundred MB, so it lands on RCCL's generic kernel. All-reduce over the same
-    tensor has a quantized kernel with a 2 GB ceiling -- the one TP's own MoE
-    reduce already runs on -- and the scatter half is then a free row slice.
-    Paying for the rows we discard still wins: at 30k tokens x 6144, 1921us on
-    RCCL's reduce-scatter against 1263us this way.
+    Keep the input dtype throughout communication. A quantized all-reduce
+    followed by slicing introduces rounding error and sends unused rows.
     """
     if _SP_WORLD_SIZE <= 1:
         return x
     x = x.contiguous()
     group = get_sp_group()
-    if not _custom_reduce_scatter_ok(x, group) and _quick_all_reduce_ok(x, group):
-        return group.all_reduce(x)[sp_local_slice(x.shape[0])]
+    # The generic communicator allocates a second output and copies it even
+    # for dim=0. PyNccl can write the final token shard directly.
+    if not _custom_reduce_scatter_ok(x, group):
+        pynccl = getattr(
+            getattr(group, "device_communicator", None), "pynccl_comm", None
+        )
+        if pynccl is not None and not pynccl.disabled:
+            out = x.new_empty((x.shape[0] // _SP_WORLD_SIZE, *x.shape[1:]))
+            pynccl.reduce_scatter(out, x)
+            return out
     return group.reduce_scatter(x, dim=0)
 
 
-_SCATTER = 0  # split this field's heads across the group
-_REPLICATE = 1  # no head axis to split: every rank needs the whole thing
+_SCATTER = 0  # zero means one head shard per rank
+_REPLICATE = 1  # one shard, replicated on every rank
+# Other positive values specify how many head shards a field has. For GQA
+# with fewer KV heads than ranks, consecutive query-head owners share a shard.
 
 
 def _exchange(send):
     """All-to-all a ``[W, S/W, width]`` send buffer into global token order."""
     recv = torch.empty_like(send)
-    torch.distributed.all_to_all_single(recv, send, group=get_sp_group().device_group)
+    all_to_all_into(recv, send, get_sp_group())
     # recv[i] holds rank i's tokens for our slice; ranks own contiguous token
     # chunks, so concatenating on rank rebuilds global token order.
     return recv.reshape(recv.shape[0] * recv.shape[1], recv.shape[2])
 
 
-def _exchange_tensors(tensors):
+def _exchange_tensors(tensors, shards=None):
     """Trade tokens for heads on several tensors in a single all-to-all.
 
     Each arrives as ``[S/W, width]`` on this rank's token chunk; the result is
@@ -295,17 +291,19 @@ def _exchange_tensors(tensors):
     same buffer without a copy per tensor.
     """
     w = _SP_WORLD_SIZE
-    widths = [t.shape[-1] // w for t in tensors]
+    shards = shards or [w] * len(tensors)
+    widths = [t.shape[-1] // n for t, n in zip(tensors, shards)]
     proto = tensors[0]
     # Packed straight into the send buffer rather than cat-then-stack: the
     # obvious spelling of this copies every element twice.
     send = proto.new_empty((w, proto.shape[0], sum(widths)))
     col = 0
-    for tensor, width in zip(tensors, widths):
+    for tensor, width, n in zip(tensors, widths, shards):
         # Heads are the major axis of the flat width, so destination rank i
         # owns one contiguous column range: [S, w*width] -> [w, S, width].
-        send[:, :, col : col + width].copy_(
-            tensor.view(tensor.shape[0], w, width).permute(1, 0, 2)
+        field = tensor.view(tensor.shape[0], n, width).permute(1, 0, 2)
+        send[:, :, col : col + width].view(n, w // n, tensor.shape[0], width).copy_(
+            field[:, None]
         )
         col += width
     return _exchange(send)
@@ -321,44 +319,29 @@ def _exchange_columns(source, spec, owner):
     small the payload. The permutation only depends on the layer's widths, so
     it is built once and kept on the layer.
 
-    A ``_REPLICATE`` field is taken whole for every destination, so its slot
-    comes back carrying every rank's tokens -- an all-gather, folded into the
-    same exchange for free.
+    A ``_REPLICATE`` field is taken whole for every destination. This adds
+    payload bytes but shares the collective with the sharded fields.
     """
     w = _SP_WORLD_SIZE
+    group = get_sp_group()
+    if not _prefer_all_gather(source, group):
+        return _exchange(pack_fields(source, tuple(spec), w))
     columns = getattr(owner, "_sp_send_columns", None)
     if columns is None or columns.device != source.device:
         # Built from arange rather than a host list so there is no host-to-
         # device copy to capture, in case the first call lands inside a graph.
         arange = partial(torch.arange, device=source.device)
         dest = arange(w).unsqueeze(1)
+
         ranges = []
         for offset, width, mode in spec:
-            if mode is _REPLICATE:
-                ranges.append((arange(width) + offset).expand(w, width))
-            else:
-                local = width // w
-                ranges.append(arange(local) + (offset + dest * local))
+            shards = mode or w
+            local = width // shards
+            ranges.append(arange(local) + offset + (dest // (w // shards)) * local)
         columns = torch.cat(ranges, dim=1)
         owner._sp_send_columns = columns
 
-    group = get_sp_group()
-    if _prefer_all_gather(source, group):
-        # Same result by the other transport: take every rank's tokens whole,
-        # then keep only our own columns. Four times the bytes, but through
-        # aiter's registered buffers instead of RCCL's generic kernel, and the
-        # column pass is the one this path would run anyway.
-        return group.custom_all_gather(source).index_select(
-            1, columns[group.rank_in_group]
-        )
-
-    tokens, local_width = source.shape[0], columns.shape[1]
-    send = torch.gather(
-        source.unsqueeze(0).expand(w, -1, -1),
-        2,
-        columns.unsqueeze(1).expand(w, tokens, local_width),
-    )
-    return _exchange(send)
+    return group.custom_all_gather(source).index_select(1, columns[group.rank_in_group])
 
 
 def ulysses_attention(attn, query, key, value, positions, q_scale, qkv):
@@ -374,8 +357,9 @@ def ulysses_attention(attn, query, key, value, positions, q_scale, qkv):
     opaque to Dynamo and the padding slice below never reaches a traced graph.
     """
     w = _SP_WORLD_SIZE
+    kv_shards = min(w, key.shape[-1] // attn.head_dim)
     if qkv is None:
-        packed = _exchange_tensors([query, key, value])
+        packed = _exchange_tensors([query, key, value], [w, kv_shards, kv_shards])
     else:
         # Models that fuse the projection hand q/k/v over as column ranges of
         # `qkv`, so describe the exchange against that tensor and gather it in
@@ -388,8 +372,8 @@ def ulysses_attention(attn, query, key, value, positions, q_scale, qkv):
         q_size, kv_size = query.shape[-1], key.shape[-1]
         spec = [
             (0, q_size, _SCATTER),
-            (q_size, kv_size, _SCATTER),
-            (q_size + kv_size, kv_size, _SCATTER),
+            (q_size, kv_size, kv_shards),
+            (q_size + kv_size, kv_size, kv_shards),
         ]
         # The impl re-splits `qkv` at these same offsets, so a caller whose
         # q/k/v are not those column ranges is already broken -- but say so
@@ -411,9 +395,10 @@ def ulysses_attention(attn, query, key, value, positions, q_scale, qkv):
                     f"Ulysses SP: fused qkv has {tail} trailing columns but "
                     f"{type(attn.impl).__name__} declares no indexer layout."
                 )
-            index_q_width = attn.impl.index_q_size * w
+            index_q_width = tail - idx_dim
             index_q_start = qkv.shape[-1] - (index_q_width + idx_dim)
-            spec.append((index_q_start, index_q_width, _SCATTER))
+            index_shards = min(w, index_q_width // idx_dim)
+            spec.append((index_q_start, index_q_width, index_shards))
             spec.append((index_q_start + index_q_width, idx_dim, _REPLICATE))
         packed = _exchange_columns(qkv, spec, attn)
 
@@ -429,7 +414,7 @@ def ulysses_attention(attn, query, key, value, positions, q_scale, qkv):
     # models hand the impl unsharded (`qkv.split(...)`), so the kernels already
     # take it, and materializing them would copy q/k/v a second time.
     q_width = query.shape[-1] // w
-    kv_width = key.shape[-1] // w
+    kv_width = key.shape[-1] // kv_shards
     out = attn.impl.forward(
         query=packed[:, :q_width],
         key=packed[:, q_width : q_width + kv_width],
