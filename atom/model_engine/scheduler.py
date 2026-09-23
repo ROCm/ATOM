@@ -580,12 +580,19 @@ class Scheduler:
         is_pd_producer = kv_config_has_producer(
             getattr(config, "kv_transfer_config", {}) or {}
         )
-        self.use_spec = config.speculative_config is not None and not is_pd_producer
+        has_spec = config.speculative_config is not None
+        self.use_spec = has_spec and not is_pd_producer
         self.mtp_k: int = (
             config.speculative_config.num_speculative_tokens if self.use_spec else 0
         )  # type: ignore
-        # EAGLE/MTP needs the successor token; DSpark does not.
-        self.drafter_needs_next_token = self.use_spec and not (
+        # Successor-token metadata belongs to the drafter, not to whether this
+        # engine verifies drafts. A P/D producer keeps the drafter loaded and
+        # still writes its context KV, but `use_spec` stays off so it never
+        # pads or verifies. Gating this on `use_spec` left EAGLE's middle
+        # chunks without `next_token_ids`: compute_draft_kv returned without
+        # writing draft KV, and the DP alignment pass kept its dummy anchor.
+        # DSpark drafts from aux hidden states and does not read the successor.
+        self.drafter_needs_next_token = has_spec and not (
             config.speculative_config.use_dspark()
         )
         # True when this engine both drafts and verifies; False under PP

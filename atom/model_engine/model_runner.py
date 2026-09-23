@@ -2172,107 +2172,21 @@ class ModelRunner:
         Mutates only the worker's batch copy (counts + scheduled_spec_decode_
         tokens truncated to q-1); KV stays reserved at mtp_k+1. No-op unless
         DSpark confidence scheduling is on and this is a pure-decode batch.
+        The bucket math lives in `apply_q_bucket` so CPU CI can run it without
+        importing this module (which loads AITER).
         """
-        # No idempotency guard: `prepare_model` is the one caller and runs
-        # this once per batch. It used to be two, and the guard returned
-        # early on the second -- which now means returning None, i.e. the
-        # FULL length, undoing the shrink it was written to protect.
-        if not (hasattr(self, "drafter") and self.drafter.uses_confidence_schedule):
-            return None
-        if batch.total_tokens_num_prefill > 0:
-            return None  # mixed/prefill step: keep full length
-        scheduled_bs = batch.total_seqs_num_decode
-        if scheduled_bs <= 0:
-            return
-        full_q = self.drafter.mtp_k + 1
+        from atom.spec_decode.dspark_scheduler import apply_q_bucket
 
-        # {req_id: ell} from an EARLIER step's propose() (verify_scheduler, same
-        # process) — the freshest one whose async D2H has landed, which is a step
-        # or two back while the CPU runs ahead; reading it never syncs. The
-        # worker batch copy has req_ids but NOT the scheduler-side `seqs` dict,
-        # so look ell up by req_id. A request with no ell yet (new this step, or
-        # its copy still in flight) -> full length (never under-verify).
-        verify_scheduler = self.drafter.verify_scheduler
-        by_req = (
-            verify_scheduler.ell_by_req if verify_scheduler is not None else None
-        ) or {}
-        if not by_req:
-            return
-
-        # ==== RAGGED path (paper §5.2 avoid-padding) — FULLY INDEPENDENT =====
-        # This branch is hoisted ABOVE the q-bucket early-return so it never
-        # depends on dspark.q_buckets. Each decode seq forwards its own
-        # ell_r+1 tokens (no batch-level pad to a single q). num_scheduled_tokens
-        # becomes a true ragged array; all V4 attn metadata/kernels are already
-        # per-token + marker-driven, so this is the only construction change.
-        # Graph replay picks a (bs, q_eff) graph captured from the independent
-        # dspark.ragged_graph_sizes set. Anchor lower bound (q>=num_bonus+1)
-        # is applied PER REQUEST so each seg can hold its own anchor.
-        if self.config.dspark.ragged:
-            return self._dspark_apply_ragged(batch, scheduled_bs, full_q, by_req)
-        # ====================================================================
-
-        # ---- Q-BUCKET path (older batch-uniform padding scheme) ------------
-        from atom.spec_decode.dspark_scheduler import (
-            quantize_to_bucket,
-            resolve_q_buckets,
+        drafter = getattr(self, "drafter", None)
+        dspark = getattr(getattr(self, "config", None), "dspark", None)
+        return apply_q_bucket(
+            batch,
+            drafter,
+            dspark,
+            apply_ragged=lambda scheduled_bs, full_q, by_req: self._dspark_apply_ragged(
+                batch, scheduled_bs, full_q, by_req
+            ),
         )
-
-        buckets = resolve_q_buckets(self.config.dspark.q_buckets, full_q)
-        if buckets == [full_q]:
-            return  # no smaller buckets configured -> Phase-1 behavior
-
-        max_ell = 0
-        for rid in batch.req_ids[:scheduled_bs]:
-            ell = by_req.get(rid)
-            max_ell = full_q - 1 if ell is None else max(max_ell, int(ell))
-            if max_ell >= full_q - 1:
-                break
-
-        # Lower bound q >= max_num_bonus + 1: ell is only the PREDICTED accept
-        # count, but the anchor sits at the PREVIOUS step's ACTUAL num_bonus. If
-        # q-1 < num_bonus the anchor falls outside the shrunk segment and the
-        # draft propose scatter/index_select goes OOB. No-op when num_bonus is
-        # unavailable (first decode step).
-        max_num_bonus = 0
-        num_bonus_arr = getattr(batch, "num_bonus", None)
-        if num_bonus_arr is not None:
-            nb = np.asarray(num_bonus_arr)[:scheduled_bs]
-            if nb.size > 0:
-                max_num_bonus = int(nb.max())
-        need = max(max_ell + 1, max_num_bonus + 1)
-        q = quantize_to_bucket(need, buckets)
-        if q >= full_q:
-            return  # no shrink possible this step
-
-        # Rebuild scheduled_tokens (flat [seq0 tokens | seq1 tokens | ...]) to the
-        # new q-per-seq layout BEFORE rewriting the counts (need the old per-seq
-        # lengths to slice). Pure-decode step (we returned early on prefill), so
-        # the array is entirely decode segments. Keep the first q of each seq's
-        # segment: token[0] is the anchor; the rest are placeholders overwritten
-        # by token_ids[:, 1:] = scheduled_spec_decode_tokens downstream.
-        old_nst = batch.num_scheduled_tokens
-        sched = np.asarray(batch.scheduled_tokens)
-        old_cu = np.zeros(scheduled_bs + 1, dtype=np.int64)
-        np.cumsum(old_nst[:scheduled_bs], out=old_cu[1:])
-        new_sched = np.empty(scheduled_bs * q, dtype=sched.dtype)
-        for i in range(scheduled_bs):
-            start = int(old_cu[i])
-            new_sched[i * q : (i + 1) * q] = sched[start : start + q]
-        batch.scheduled_tokens = new_sched
-
-        # Rewrite decode token counts to q (anchor + q-1 drafts) per seq.
-        nst = old_nst.copy()
-        prefill_tok = int(batch.total_tokens_num_prefill)
-        nst[:scheduled_bs] = q
-        batch.num_scheduled_tokens = nst
-        batch.total_tokens_num_decode = int(nst[:scheduled_bs].sum())
-        batch.total_tokens_num = prefill_tok + batch.total_tokens_num_decode
-        # Truncate each request's draft block to q-1 (regular matrix: all seqs q-1).
-        spec = batch.scheduled_spec_decode_tokens
-        if spec is not None and getattr(spec, "size", 0) > 0:
-            batch.scheduled_spec_decode_tokens = np.ascontiguousarray(spec[:, : q - 1])
-        return q
 
     def _dspark_apply_ragged(self, batch, scheduled_bs, full_q, by_req):
         """DSpark per-request RAGGED verify (paper §5.2 avoid-padding).
