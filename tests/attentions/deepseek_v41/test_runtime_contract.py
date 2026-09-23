@@ -92,7 +92,7 @@ def runtime_config(**overrides):
     "override",
     [
         {"enforce_eager": False},
-        {"compilation_config": SimpleNamespace(level=3)},
+        {"compilation_config": SimpleNamespace(level=2)},
         {"speculative_config": SimpleNamespace(method="mtp", num_speculative_tokens=5)},
         {"pipeline_parallel_size": 2},
         {"prefill_context_parallel_size": 2},
@@ -127,14 +127,20 @@ def test_empty_rank_padding_has_no_cache_writes(monkeypatch):
     before = cache.backing.clone()
     step = cache.begin_step([])
     metadata = SimpleNamespace(
-        step=step, cache=cache, next_histories=np.empty((0, 3), dtype=np.int64)
+        step=step,
+        cache=cache,
+        next_histories=np.empty((0, 3), dtype=np.int64),
+        image_mask=None,
     )
     monkeypatch.setattr(
         runtime, "get_forward_context", lambda: SimpleNamespace(attn_metadata=metadata)
     )
     model = DeepseekV41RuntimeModel.__new__(DeepseekV41RuntimeModel)
     torch.nn.Module.__init__(model)
-    model.config = SimpleNamespace(hidden_size=64)
+    model.do_not_compile = True
+    model.config = SimpleNamespace(hidden_size=64, hc_mult=4)
+    model.topology = []
+    model.layers = torch.nn.ModuleList()
     model.embed = torch.nn.Embedding(16, 64)
     # No layers are constructed: a step with no requests must not reach one.
     output = model(torch.zeros(8, dtype=torch.int32), torch.zeros(8, dtype=torch.int32))
@@ -171,17 +177,19 @@ def test_a_forward_reads_nothing_the_forward_before_it_selected(monkeypatch):
         runtime, "get_forward_context", lambda: SimpleNamespace(attn_metadata=metadata)
     )
     seen = {}
-    monkeypatch.setattr(
-        DeepseekV41RuntimeModel,
-        "forward_hidden",
-        lambda self, tokens, *args, **kwargs: (
-            seen.update({name: dict(memo) for name, memo in memos.items()}),
-            torch.zeros(*tokens.shape, 64),
-        )[1],
-    )
+    original_begin = runtime.v41_begin_forward
+
+    def observe_begin(hidden):
+        original_begin(hidden)
+        seen.update({name: dict(memo) for name, memo in memos.items()})
+
+    monkeypatch.setattr(runtime, "v41_begin_forward", observe_begin)
     model = DeepseekV41RuntimeModel.__new__(DeepseekV41RuntimeModel)
     torch.nn.Module.__init__(model)
-    model.config = SimpleNamespace(hidden_size=64)
+    model.do_not_compile = True
+    model.config = SimpleNamespace(hidden_size=64, hc_mult=4)
+    model.topology = []
+    model.layers = torch.nn.ModuleList()
     model.embed = torch.nn.Embedding(16, 64)
     model(torch.zeros(1, dtype=torch.int32), torch.zeros(1, dtype=torch.int32))
     assert seen == {name: {} for name in memos}
@@ -244,3 +252,26 @@ def test_native_dspark_passes_production_admission(graph, dynamic):
     value.kv_cache_dtype = "fp4"
     with pytest.raises(ValueError, match="BF16"):
         validate_runtime_config(value)
+
+
+def test_level3_requires_full_graph_or_eager_runtime():
+    from atom.config import CUDAGraphMode
+
+    validate_runtime_config(runtime_config(compilation_config=SimpleNamespace(level=3)))
+    validate_runtime_config(
+        runtime_config(
+            enforce_eager=False,
+            compilation_config=SimpleNamespace(
+                level=3, cudagraph_mode=CUDAGraphMode.FULL
+            ),
+        )
+    )
+    with pytest.raises(ValueError, match="level 3 CUDA Graph mode"):
+        validate_runtime_config(
+            runtime_config(
+                enforce_eager=False,
+                compilation_config=SimpleNamespace(
+                    level=3, cudagraph_mode=CUDAGraphMode.PIECEWISE
+                ),
+            )
+        )

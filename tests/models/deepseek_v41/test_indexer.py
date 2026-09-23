@@ -100,3 +100,72 @@ def test_unit_table_expands_the_page_table_in_place(units):
     # A zero-token forward still owes its caller the shape it will index.
     empty = torch.empty(0, dtype=torch.int32, device="cuda")
     assert unit_table(block_tables, empty, units).shape == (0, columns * units)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_banded_score_plane_preserves_full_and_reindex_selection(monkeypatch):
+    from atom.model_ops.deepseek_v41 import paged_scoring as scoring
+    from atom.model_ops.deepseek_v41.index_write import write_index_rows
+    from atom.model_ops.deepseek_v41.unit_table import unit_table
+
+    torch.manual_seed(1921)
+    rows, width, heads, dim, per_page = 7, 512, 32, 128, 128
+    plane = torch.empty(4, per_page, dim + 4, dtype=torch.uint8, device="cuda")
+    table = torch.tensor([[2, 0, 3, 1]], dtype=torch.int32, device="cuda")
+    plan = torch.zeros(width, 4, dtype=torch.int32, device="cuda")
+    plan[:, 2] = torch.arange(width, device="cuda")
+    keys = torch.randn(width, dim, dtype=torch.bfloat16, device="cuda")
+    write_index_rows(keys, plane, plan, table, per_page, ratio=1, scale_fmt="fp32")
+    tiles = unit_table(table, torch.zeros(rows, dtype=torch.int32, device="cuda"), 8)
+    query = torch.randn(rows, heads, dim, dtype=torch.bfloat16, device="cuda")
+    weights = torch.rand(rows, heads, dtype=torch.float32, device="cuda")
+    visible = torch.tensor(
+        [0, 1, 33, 64, 129, 511, 512], device="cuda", dtype=torch.int32
+    )
+    args = (query, weights, plane.view(-1, 16, dim + 4), tiles, visible)
+    kwargs = {"topk": 64, "weights_scale": (heads * dim) ** -0.5}
+    full, candidates = scoring.score_topk_paged(*args, **kwargs, candidate_count=16)
+    reindex, _ = scoring.score_topk_paged(*args, **kwargs, candidates=candidates)
+    real_score = scoring.deepgemm_fp8_paged_mqa_logits
+    sizes = []
+
+    def observe(*args, **kwargs):
+        scores = args[3]
+        sizes.append(scores.numel() * scores.element_size())
+        return real_score(*args, **kwargs)
+
+    # Three rows per band, including a short last band. Verify through the
+    # real quantized paged scorer and selector, not a mocked score function.
+    original_plane_rows = scoring.plane_rows
+    monkeypatch.setattr(scoring, "plane_rows", lambda width: 3)
+    monkeypatch.setattr(scoring, "deepgemm_fp8_paged_mqa_logits", observe)
+    actual, chosen = scoring.score_topk_paged(*args, **kwargs, candidate_count=16)
+    actual_reindex, _ = scoring.score_topk_paged(*args, **kwargs, candidates=chosen)
+    torch.testing.assert_close(actual, full, rtol=0, atol=0)
+    torch.testing.assert_close(chosen, candidates, rtol=0, atol=0)
+    torch.testing.assert_close(actual_reindex, reindex, rtol=0, atol=0)
+    assert len(sizes) == 6 and max(sizes) <= 3 * width * 4
+    assert torch.all(actual[0] == -1)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replay_full, replay_candidates = scoring.score_topk_paged(
+            *args, **kwargs, candidate_count=16
+        )
+        replay_reindex, _ = scoring.score_topk_paged(
+            *args, **kwargs, candidates=replay_candidates
+        )
+    visible.copy_(visible.flip(0))
+    graph.replay()
+    # Compare the captured bands against an unbanded forward after live bounds
+    # change. The empty row moves to the end and must not retain stale IDs.
+    monkeypatch.setattr(scoring, "plane_rows", original_plane_rows)
+    expected, expected_candidates = scoring.score_topk_paged(
+        *args, **kwargs, candidate_count=16
+    )
+    expected_reindex, _ = scoring.score_topk_paged(
+        *args, **kwargs, candidates=expected_candidates
+    )
+    torch.testing.assert_close(replay_full, expected, rtol=0, atol=0)
+    torch.testing.assert_close(replay_candidates, expected_candidates, rtol=0, atol=0)
+    torch.testing.assert_close(replay_reindex, expected_reindex, rtol=0, atol=0)

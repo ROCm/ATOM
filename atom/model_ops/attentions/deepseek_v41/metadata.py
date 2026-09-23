@@ -62,6 +62,9 @@ class BatchStep:
     selected: dict[int, torch.Tensor] = field(default_factory=dict)
     candidates: dict[int, torch.Tensor] = field(default_factory=dict)
     tiles: dict[int, torch.Tensor] = field(default_factory=dict)
+    # First layer of an index group -> the `(prefix, pptr, extend, eptr)` one
+    # launch wrote for the whole run.
+    group_indices: dict[int, tuple[torch.Tensor, ...]] = field(default_factory=dict)
     indptrs: dict[int, tuple] = field(default_factory=dict)
     # ratio -> [width] int32: compressed rows each query row may see. Worked
     # out on the host, where `positions` is staged and where RoPE takes its
@@ -88,6 +91,7 @@ class BatchStep:
         self.selected.clear()
         self.candidates.clear()
         self.tiles.clear()
+        self.group_indices.clear()
 
     @property
     def width(self):
@@ -107,6 +111,27 @@ class BatchStep:
 def visible_buffer_name(ratio):
     """One spelling for the buffer the builder declares and this module fills."""
     return f"v41_index_visible_{ratio}"
+
+
+def _publish_block_tables(tables, requests, running_bs):
+    """Reuse the fixed device page table until its rows or padding change.
+
+    Every V4.1 publication, including dummy/capture batches, goes through here.
+    DSpark borrows padding entries only temporarily and restores them before
+    returning. Cache the mapping, not positions: advancing within an allocated
+    page does not change an address in this table.
+    """
+    rows = tuple(tuple(span.block_ids) for span in requests)
+    key = (running_bs, rows)
+    previous = getattr(tables, "_v41_published_rows", None)
+    if previous is not None and previous[0] is tables.gpu and previous[1] == key:
+        return tables.gpu[:running_bs]
+    if rows:
+        pack_rows(tables.np, [np.asarray(row, dtype=np.int32) for row in rows])
+    tables.np[len(rows) : running_bs] = 0
+    published = tables.copy_to_gpu(running_bs)
+    tables._v41_published_rows = (tables.gpu, key)
+    return published
 
 
 def prepare_batch_step(
@@ -200,15 +225,14 @@ def prepare_batch_step(
             dtype=torch.int32,
             device=device,
         )
-    tables = buffers["block_tables"]
-    if scheduled_bs:
-        pack_rows(
-            tables.np, [np.asarray(span.block_ids, dtype=np.int32) for span in requests]
-        )
-    tables.np[scheduled_bs:running_bs] = 0
     published = {
-        name: buffers[name].copy_to_gpu(count) for name, count in required.items()
+        name: buffers[name].copy_to_gpu(count)
+        for name, count in required.items()
+        if name != "block_tables"
     }
+    published["block_tables"] = _publish_block_tables(
+        buffers["block_tables"], requests, running_bs
+    )
     return BatchStep(
         requests,
         published["positions"],

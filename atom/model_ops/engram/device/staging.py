@@ -12,20 +12,24 @@ from unittest.mock import patch
 
 import torch
 
-from atom.model_ops.engram_hash import engram_snapshot, engram_snapshot_indices
-
+from atom.model_ops.engram.device.hashing import (
+    engram_snapshot,
+    engram_snapshot_indices,
+)
+from atom.model_ops.engram.device.uva import uva_gather_into
 
 logger = logging.getLogger(__name__)
 
 
 class EngramStaging:
-    def __init__(self, host):
-        self.host = host
+    def __init__(self, uva):
+        self.uva = uva
+        self.host = host = uva.host
         self.stream = torch.cuda.Stream(host.device)
         self.done = {layer: torch.cuda.Event() for layer in host.layer_ids}
         self.snapshot = torch.empty(
             host.max_num_tokens,
-            host.hash_tables.ngram,
+            uva.hash_tables.ngram,
             dtype=torch.int64,
             device=host.device,
         )
@@ -99,7 +103,7 @@ class EngramStaging:
             # Capture uses serving's kernels without accessing synthetic state.
             snapshot.fill_(-2)
         else:
-            engram_snapshot(self.host.hash_tables, batch, snapshot)
+            engram_snapshot(self.uva.hash_tables, batch, snapshot)
         return EngramStagedRows(self, width)
 
     def start(self, width):
@@ -111,13 +115,14 @@ class EngramStaging:
         with torch.cuda.stream(self.stream):
             for layer in host.layer_ids:
                 ids = engram_snapshot_indices(
-                    host.hash_tables,
+                    self.uva.hash_tables,
                     layer,
                     self.snapshot[:width],
-                    host._row_ids[:width],
+                    self.uva.row_ids[:width],
                 )
                 table = host.prefetcher._tables[layer]
-                table.gather_into(
+                uva_gather_into(
+                    table,
                     ids,
                     self.flat[layer][:width].view(
                         width, host.local_heads, table.head_dim

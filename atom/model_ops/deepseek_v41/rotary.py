@@ -62,6 +62,11 @@ class RotaryEmbedding(nn.Module):
         """Complex view for CPU/reference callers; GPU execution uses the caches."""
         return torch.complex(self.cos_cache, self.sin_cache)
 
+    @property
+    def rope_dim(self):
+        """Trailing width this rotates; a row's NoPE prefix is what is left."""
+        return self.cos_cache.shape[-1] * 2
+
     def forward(self, x, positions, *, inverse=False):
         """Rotate the final RoPE dimensions in place, preserving the NoPE prefix."""
         if x.is_cuda:
@@ -116,7 +121,7 @@ class RotaryEmbedding(nn.Module):
             flat_positions,
             self.cos_cache[:, None, None, :],
             self.sin_cache[:, None, None, :],
-            self.cos_cache.shape[-1] * 2,
+            self.rope_dim,
             batch * length,
         )
 

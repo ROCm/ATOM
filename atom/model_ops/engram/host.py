@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: MIT
-"""Engram host prefetch and flat staging; the runner owns committed history."""
+"""Engram host prefetch and flat staging; the runner owns committed history.
+
+Host-side throughout. Page-locking a shard and voting on the outcome live here
+because they are `cudart` and Gloo calls that a CPU-only machine can run and
+test; hashing on the device and the gather that reads a registered shard are
+`device.runtime.EngramUva`, which this module never imports -- the caller
+supplies it, and a caller that supplies nothing gets the host path.
+"""
 
 from __future__ import annotations
 
@@ -13,8 +20,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from atom.model_ops.engram_hash import EngramHashTables, engram_row_indices
-from atom.model_ops.engram_lookup import HostEmbeddingTable
+from atom.model_ops.engram.tables import HostEmbeddingTable
 from atom.utils import CpuGpuBuffer, envs
 
 logger = logging.getLogger(__name__)
@@ -239,6 +245,7 @@ class EngramHost:
         head_dim,
         device,
         dtype=torch.bfloat16,
+        device_lookup=None,
     ):
         self.prefetcher = prefetcher
         # Gather straight into the staging dtype rather than float32-then-downcast.
@@ -247,25 +254,16 @@ class EngramHost:
         # gathering them on the host (ATOM_ENGRAM_UVA). All-or-nothing -- a
         # partially registered set would silently keep the host path for some
         # layers, which is the confusing half-state to avoid.
+        #
+        # `device_lookup` is the class that does the reading, supplied rather
+        # than imported: it reaches Triton and this module must not. No class,
+        # no UVA -- which is also what a CPU-only test wants to say.
         self.uva = False
         self._tp_group = None
         # Every table this rank page-locked, for the fallback and the shutdown.
         self._pinned_tables = []
-        self._ids_staging = None
-        self.hash_tables = None
-        self._row_ids = None
-        if device.type == "cuda" and envs.ATOM_ENGRAM_UVA:
+        if device_lookup is not None and device.type == "cuda" and envs.ATOM_ENGRAM_UVA:
             self.uva = self._enable_uva(prefetcher, num_hash_heads)
-        if self.uva:
-            # The row indices the UVA gather takes, produced where the tokens
-            # are. One buffer for every layer: a layer's rows are consumed by
-            # its own gather before the next layer is hashed.
-            self.hash_tables = EngramHashTables.from_mapping(
-                prefetcher._hash_mapping, device
-            )
-            self._row_ids = torch.empty(
-                max_num_tokens, num_hash_heads, dtype=torch.int64, device=device
-            )
         self.max_num_tokens = max_num_tokens
         self.embed_width = num_hash_heads * head_dim
         self.device = device
@@ -287,15 +285,28 @@ class EngramHost:
         self.copy_done = torch.cuda.Event() if self.copy_stream is not None else None
         self._copy_pending = False
         self._staged_rows = 0
-        self.overlap = None
-        if self.uva and envs.ATOM_ENGRAM_OVERLAP:
-            from atom.model_engine.engram_staging import EngramStaging
-
-            self.overlap = EngramStaging(self)
+        # After the buffers: the lookup reads them, and the pin_memory above
+        # reads `self.uva`, so registration has to come first and allocation
+        # between the two.
+        self.lookup = device_lookup(self, num_hash_heads) if self.uva else None
 
     @property
     def layer_ids(self):
         return self.prefetcher.layer_ids
+
+    # What the device lookup holds, asked of the host because both readers may
+    # run on a rank that has no lookup -- `None` is the answer there, not an
+    # attribute error. Typed nowhere here: the objects come from the injected
+    # class, and naming them would be the import this module exists to avoid.
+    @property
+    def overlap(self):
+        """The side-stream staging, when there is a device lookup running one."""
+        return None if self.lookup is None else self.lookup.overlap
+
+    @property
+    def hash_tables(self):
+        """The device n-gram hash tables, for callers that hash their own batch."""
+        return None if self.lookup is None else self.lookup.hash_tables
 
     def _prepare_staging(self, rows, padded_rows):
         staged = rows if padded_rows is None else padded_rows
@@ -337,8 +348,8 @@ class EngramHost:
         # Before the prefetch cache, not after: what that cache holds is
         # embedding rows, which the UVA path never stages from the host. Taking
         # them here only threw them away -- and evicted them on the way.
-        if self.uva:
-            return self._stage_uva(requests, rows, staged, batch)
+        if self.lookup is not None:
+            return self.lookup.stage(requests, rows, staged, batch)
         values = {}
         missing = []
         for request in requests:
@@ -373,8 +384,8 @@ class EngramHost:
         range: the full table on every rank is what a TP job cannot afford.
 
         The answer is the GROUP's. An empty shard and a refused registration are
-        both per-rank outcomes, and `_stage_uva` ends in an all-gather: a rank
-        that fell back alone would strand every other rank in that collective.
+        both per-rank outcomes, and the device lookup ends in an all-gather: a
+        rank that fell back alone would strand every other rank in it.
         """
         from aiter.dist.parallel_state import get_tp_group
 
@@ -445,104 +456,8 @@ class EngramHost:
             table.disable_uva()
         self._pinned_tables = []
 
-    def _rows_from_host(self, requests, rows):
-        """Hash on the host and stage the indices through pinned memory.
-
-        `from_numpy(...).to(device)` would copy from PAGEABLE memory, where
-        `non_blocking` is ignored and the driver stages through its own bounce
-        buffer every step.
-        """
-        if self._ids_staging is None:
-            self._ids_staging = CpuGpuBuffer(
-                self.max_num_tokens,
-                self.total_heads,
-                dtype=torch.int64,
-                device=self.device,
-                pin_memory=True,
-            )
-        per_layer = self.prefetcher.row_indices(requests)
-
-        def upload(layer):
-            self._ids_staging.np[:rows] = per_layer[layer]
-            return self._ids_staging.copy_to_gpu(rows)
-
-        return upload
-
-    def _rows_from_device(self, batch, rows):
-        """Hash where the ids are, from the very tensor the model embeds."""
-
-        def hashed(layer):
-            return engram_row_indices(
-                self.hash_tables,
-                layer,
-                batch.compressed,
-                batch.batch_ids,
-                batch.cu_seqlens,
-                batch.history,
-                batch.history_index,
-                self._row_ids[:rows],
-            )
-
-        return hashed
-
-    def _stage_uva(self, requests, rows, staged, batch=None):
-        """Device lookup: only the row INDICES reach the gather.
-
-        The gather kernel reads the table rows out of page-locked host memory
-        and dequantizes them there, so neither it nor the fp8 decode runs on
-        the host and there is no embedding H2D.
-
-        Each rank owns a slice of the hash heads and writes zeros for the rest,
-        so the all-gather that reassembles the full width is a concatenation;
-        the projection that consumes it is replicated.
-        """
-        indices = (
-            self._rows_from_device(batch, rows)
-            if batch is not None
-            else self._rows_from_host(requests, rows)
-        )
-        for layer, buffer in self.buffers.items():
-            ids = indices(layer)
-            table = self.prefetcher._tables[layer]
-            if ids.shape != (rows, self.total_heads):
-                raise RuntimeError(
-                    f"engram UVA indices are {tuple(ids.shape)}, expected "
-                    f"{(rows, self.total_heads)}"
-                )
-            # empty, not zeros: the kernel stores every row it is given, writing
-            # zeros itself for the heads this rank does not own. Flat
-            # `[tokens, local_heads * head_dim]`, which is the same bytes the
-            # kernel writes and the layout the all-gather below wants.
-            flat = torch.empty(
-                rows,
-                self.local_heads * table.head_dim,
-                dtype=buffer.gpu.dtype,
-                device=self.device,
-            )
-            table.gather_into(
-                ids,
-                flat.view(rows, self.local_heads, table.head_dim),
-                head_start=self.head_start,
-                local_heads=self.local_heads,
-                total_heads=self.total_heads,
-            )
-            out = flat
-            if self._tp_group is not None:
-                # Gather on the LAST dim of a 2-D view, which is what routes this
-                # through aiter's IPC all-gather instead of NCCL: the custom path
-                # needs dim 0 or a 16-byte-aligned last dim, and a head slice is
-                # `local_heads * head_dim * 2` bytes wide. NCCL is not just
-                # slower here -- its end event, recorded during a CUDAGraph
-                # capture, is later read by the watchdog and crashes with
-                # hipErrorCapturedEvent (see moe.all_gather_with_padding).
-                # Rank-major concatenation puts head `h` back at column
-                # `h * head_dim`, so the result needs no transpose; the trailing
-                # columns are the padding an indivisible head count leaves.
-                out = self._tp_group.all_gather(out, use_custom=True, dim=1)
-                out = out[:, : self.embed_width]
-            buffer.gpu[:rows].copy_(out)
-            if staged > rows:
-                buffer.gpu[rows:staged].zero_()
+    def mark_staged(self, staged):
+        """Record rows the device lookup filled in place, with no H2D to await."""
         self._staged_rows = staged
         self._copy_pending = False
         return staged
@@ -554,7 +469,7 @@ class EngramHost:
         copy and shipping it: same bytes, no H2D, and it leaves the host half
         of these buffers untouched -- which is what lets them go unpinned.
 
-        On the device for the same reason `_stage_uva` is: `prepare_model_inputs`
+        On the device for the same reason the UVA staging is: `prepare_model_inputs`
         runs before the capture region opens (`build_for_cudagraph_capture` is
         called, and only then is the graph captured), so this memset is issued
         outside it and is not recorded into any graph.
@@ -563,9 +478,7 @@ class EngramHost:
         if self.uva:
             for buffer in self.buffers.values():
                 buffer.gpu[:rows].zero_()
-            self._staged_rows = rows
-            self._copy_pending = False
-            return rows
+            return self.mark_staged(rows)
         for buffer in self.buffers.values():
             buffer.cpu[:rows].zero_()
         return self._copy_to_device(rows)
@@ -590,165 +503,3 @@ class EngramHost:
         # `from_checkpoint`'s ExitStack unwinds in.
         self._release_shard()
         self.prefetcher.shutdown()
-
-
-@dataclass(frozen=True)
-class EngramBatch:
-    """One forward as the kernels see it: every field already on device.
-
-    `compressed` is derived from the very tensor the model embeds, so the rows
-    Engram looks up and the tokens the model runs cannot disagree. `history` is
-    any `[n, max_ngram_size - 1]` int64 plane with `history_index` naming a row
-    per request, which is how the committed cursor is read where it lies rather
-    than gathered out first.
-    """
-
-    compressed: torch.Tensor
-    batch_ids: torch.Tensor
-    cu_seqlens: torch.Tensor
-    history: torch.Tensor
-    history_index: torch.Tensor
-
-
-@dataclass(frozen=True)
-class EngramInputs:
-    embeddings: dict[int, torch.Tensor]
-    histories: np.ndarray
-    compressed_rows: tuple[np.ndarray, ...]
-
-
-class EngramInputPreparer:
-    """Prepare finalized runtime tokens using the cache's restored history.
-
-    No request-history dictionary: the returned history commits with the model
-    state, and generic STATE checkpoints carry it across migration and reuse.
-    """
-
-    def __init__(self, mapping, host, resources=None):
-        self.mapping, self.host, self.resources = mapping, host, resources
-
-    @classmethod
-    def from_checkpoint(cls, directory, config, max_tokens, device):
-        from contextlib import ExitStack
-
-        from transformers import AutoTokenizer
-
-        from atom.model_loader.deepseek_v41 import engram_tables
-        from atom.model_ops.engram import (
-            CompressedTokenizer,
-            EngramConfig,
-            NgramHashMapping,
-        )
-
-        resources = ExitStack()
-        try:
-            tables = resources.enter_context(engram_tables(directory, config))
-            tokenizer = AutoTokenizer.from_pretrained(directory, local_files_only=True)
-            engram_config = EngramConfig.from_hf(config.to_dict())
-            mapping = NgramHashMapping(
-                engram_config,
-                CompressedTokenizer(
-                    tokenizer, expected_size=engram_config.compressed_vocab_size
-                ),
-            )
-            host = EngramHost(
-                EngramPrefetcher(mapping, tables),
-                max_tokens,
-                engram_config.num_hash_heads,
-                engram_config.head_dim,
-                device,
-            )
-            resources.callback(host.shutdown)
-            return cls(mapping, host, resources)
-        except BaseException:
-            resources.close()
-            raise
-
-    def prepare(
-        self,
-        spans,
-        token_ids,
-        histories,
-        *,
-        dummy=False,
-        token_mask=None,
-        padded_rows=None,
-        batch=None,
-    ):
-        """Stage one embedding row per row the forward will run.
-
-        `token_ids` are the rows the requests own. `padded_rows` is the width
-        the forward runs, which is wider whenever the batch was padded up to a
-        captured shape -- the tail belongs to no request, so it is staged as
-        zeros rather than looked up, and it cannot be read off `token_ids`
-        because the padding is applied to the model's input after this.
-
-        `batch` moves the n-gram hashing to the device (`EngramBatch`). The
-        readback below stays: `compressed_rows` and the advanced history are
-        still worked out here, and both want the ids on the host. What goes is
-        the per-layer, per-request hashing -- measured at 4.4 ms of every 48 ms
-        decode step, with the device idle for all of it.
-        """
-        compressed_rows = []
-        rows = token_ids.numel() if padded_rows is None else padded_rows
-        if self.host.overlap is not None and (batch is not None or dummy):
-            return EngramInputs(
-                self.host.overlap.prepare(batch, rows), histories, ()
-            )
-        if dummy:
-            self.host.stage_dummy(rows)
-            next_histories = histories
-        elif batch is not None:
-            # Nothing left for the host to read the ids for: the rows are
-            # hashed from them on the device and the advanced history is
-            # written there too, so the readback below goes with the work it
-            # was feeding. `histories` passes through because the caller still
-            # holds the committed one; the next one now lives in the cursor.
-            self.host.stage_embeddings((), padded_rows=rows, batch=batch)
-            next_histories = histories
-        else:
-            # These are the final GPU IDs, including deferred decode tokens.
-            # One D2H per batch is the eager host-lookup contract; the device
-            # path above is the one that retires it.
-            ids = token_ids.detach().cpu().numpy()
-            requests, next_histories = [], []
-            for span, history in zip(spans, histories):
-                tokens = ids[span.token_slice]
-                mask = None if token_mask is None else token_mask[span.token_slice]
-                requests.append(
-                    EngramRequest(
-                        span.request_id,
-                        0,
-                        span.position,
-                        tuple(tokens),
-                        tuple(history),
-                        token_mask=None if mask is None else tuple(mask),
-                    )
-                )
-                compressed = self.mapping.compress_tokens(
-                    tokens[None, :], None if mask is None else mask[None, :]
-                )
-                compressed_rows.append(compressed[0])
-                next_histories.append(
-                    self.mapping.advance_history(history[None, :], compressed)[0]
-                )
-            self.host.stage_embeddings(requests, padded_rows=rows)
-            next_histories = np.asarray(next_histories, dtype=np.int64).reshape(
-                histories.shape
-            )
-        self.host.wait_for_embeddings()
-        return EngramInputs(
-            {
-                layer: self.host.embeddings(layer).unsqueeze(0)
-                for layer in self.host.layer_ids
-            },
-            next_histories,
-            tuple(compressed_rows),
-        )
-
-    def close(self):
-        if self.resources is not None:
-            self.resources.close()
-            self.resources = None
-        else:
-            self.host.shutdown()

@@ -18,12 +18,18 @@ from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
     MAIN_FP4,
 )
 from atom.model_ops.blockscale import quantize_fp4
+from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
 from atom.model_ops.deepseek_v41.compressor import compress_batch
 from atom.model_ops.deepseek_v41.dspark import gather_window_rows
 from atom.model_ops.deepseek_v41.index_write import write_index_rows
+from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.deepseek_v41.unit_table import unit_table
 from atom.model_ops.v4_kernels import make_compress_plans
-from atom.model_ops.v4_kernels.state_writes import swa_write
+from atom.model_ops.v4_kernels.state_writes import (
+    swa_scatter_rows,
+    swa_scatter_rows_reference,
+    swa_write,
+)
 from atom.utils import CpuGpuBuffer
 
 from .indices import build_indices, fill_step_indptrs
@@ -355,12 +361,15 @@ class PagedAttentionCache:
         starts = step.request_positions[:count]
         ids = [span.request_id for span in step.requests]
         if histories:
-            cursors = self.cursor[step.slots[:count].long()].cpu().numpy()
+            cursors = (
+                torch.index_select(self.cursor, 0, step.slots[:count]).cpu().numpy()
+            )
         else:
             # Issued before the reset below, so a recycled slot is captured as
             # its old tenant left it -- which is why the judge skips position 0.
             self._probe[:count].copy_(
-                self.cursor[step.slots[:count].long()], non_blocking=True
+                torch.index_select(self.cursor, 0, step.slots[:count]),
+                non_blocking=True,
             )
             if self._probe_done is not None:
                 self._probe_done.record()
@@ -471,28 +480,25 @@ class PagedAttentionCache:
         return table
 
     def _scatter_rows(self, pages, step, value, ratio):
-        """One destination per plan row, resolved from that same plan.
+        """Scatter plan rows with V4's dtype-agnostic, sentinel-aware writer.
 
-        A pair is native value and scale bytes, which is what the caller has
-        when the plane it is writing is a quantized one -- the plane's own
-        dtype is not asked, because the value already answered it.
-
-        Page and offset stay apart rather than becoming one row index: a page
-        is a stride in the arena and not `rows * dim` of it, so flattening the
-        two would copy the plane and drop the write. `live` is what keeps a
-        plan's sentinel rows out, torch indexing having no `-1` to skip on --
-        the index plane's kernel reads the plan and needs none of this.
+        PAGE fields have gaps between pages. Give the existing row scatter a
+        zero-copy view whose row stride is one element, so destination indices
+        are element offsets into this field's span. This retains the real page
+        stride without flattening/copying the field or compacting live rows on
+        the host during CUDA graph capture.
         """
         per_page = pages.shape[1]
         plan = step.plans[ratio].compress_plan_gpu
         batch = plan[:, 1].long()
-        live = batch >= 0
-        # The compressed row the index kernel derives inline; here it has to
-        # be a tensor, because torch indexing is what does the scatter.
         rows = plan[:, 2].long() // ratio
         page = step.block_tables[batch.clamp_min(0), (rows // per_page).clamp_min(0)]
+        offsets = page.long() * pages.stride(0) + (rows % per_page) * pages.stride(1)
+        last = (pages.shape[0] - 1) * pages.stride(0) + (per_page - 1) * pages.stride(1)
+        pool = pages.as_strided((last + 1, pages.shape[-1]), (1, 1))
         rows_in = pack_rows(*value) if isinstance(value, tuple) else value
-        pages[page.long()[live], (rows % per_page)[live]] = rows_in[0][live]
+        scatter = swa_scatter_rows if pages.is_cuda else swa_scatter_rows_reference
+        scatter(rows_in[0], offsets, batch, pool)
 
     def compress_state(self, owner):
         """This owner's `(kv_state, score_state)`, each `[slots, ring, dim]`.
@@ -553,8 +559,64 @@ class PagedAttentionCache:
         # index itself, so casting the whole tensor first was a copy of it.
         return gather_window_rows(self.state.view("window"), layers, slots)
 
+    def rope_quant_window(self, layer, query, kv, rope, step):
+        """Rotate the query, quantize the KV row, and store it where it can be.
+
+        A decode stores the row and produces nothing: no query of a decode
+        attends to it, so the window write folds in here. A prefill produces
+        the row and stores nothing, because the queries in this very chunk have
+        yet to read the rows a store would overwrite -- that write stays behind
+        attention, in `write_window`. The cache layout only decides the
+        payload, so both halves of that read the same either way.
+
+        Returns the BF16 row an extend pass attends to and whatever the window
+        still owes, `None` for each the caller has no use for.
+        """
+        dim, packed = self.geometry.head_dim, self.packed
+        if not step.width:
+            return (None, None) if step.decode else (torch.empty_like(kv), None)
+        seam = (
+            query.view(step.width, -1, dim),
+            kv.view(step.width, dim),
+            rope.cos_cache,
+            rope.sin_cache,
+            step.positions,
+        )
+        if step.decode:
+            rope_quant_window(
+                *seam,
+                rope_dim=rope.rope_dim,
+                # The packed pool is byte-addressed and the BF16 one is a
+                # `[rows, head_dim]` view, which is the whole difference.
+                ring=(
+                    self.backing if packed else self.pool,
+                    step,
+                    self.geometry.window(layer, self.num_pages),
+                    packed,
+                ),
+            )
+            return None, None
+        qat = torch.empty_like(kv)
+        values = torch.empty_like(kv, dtype=FP8_DTYPE) if packed else None
+        scales = (
+            torch.empty(
+                (*kv.shape[:-1], dim // 32),
+                device=kv.device,
+                dtype=torch.float8_e8m0fnu,
+            )
+            if packed
+            else None
+        )
+        rope_quant_window(
+            *seam, rope_dim=rope.rope_dim, qat=qat, values=values, scales=scales
+        )
+        return qat, (values, scales) if packed else qat
+
     def write_window(self, layer, kv, step):
-        if step.width:
+        # `None` is `rope_quant_window` reporting that it already stored the
+        # row, not an empty batch: those two differ in whether `step.width` is
+        # zero, and only this one can reach here after a real forward.
+        if kv is not None and step.width:
             window = self.geometry.window(layer, self.num_pages)
             if self.packed:
                 write_packed_window(
@@ -576,12 +638,47 @@ class PagedAttentionCache:
             )
 
     def attention_indices(self, spec, step):
-        selected = step.selected[spec.topk_owner] if spec.ratio else None
+        """This layer's prefix rows, built with its whole group's on a decode.
+
+        The group's first layer is also the layer that owns its selection, so
+        by the time anyone asks, every input the run shares already exists.
+        Later layers find theirs written and launch nothing.
+        """
+        first = spec.index_group_start
+        if not step.decode or spec.index_group_size == 1:
+            # A run of one, anchored on this layer's own ring, so a spec that
+            # declares no group never has to name a start. A prefill takes this
+            # too: it pays work rather than dispatch, and its `extend` plane is
+            # this layer's alone.
+            prefix, pptr, extend, eptr = self._index_group(spec, step, spec.layer_id, 1)
+            return prefix[0], pptr, extend, eptr
+        built = step.group_indices.get(first)
+        if built is None:
+            built = self._index_group(spec, step, first, spec.index_group_size)
+            step.group_indices[first] = built
+        prefix, pptr, extend, eptr = built
+        return prefix[spec.layer_id - first], pptr, extend, eptr
+
+    def _index_group(self, spec, step, first, layers):
+        """One build covering `layers` consecutive layers from `first`.
+
+        The per-layer ring offset is read off the geometry rather than
+        rebuilt here, so the kernel's stride and `window()` cannot drift.
+        """
+        window = self.geometry.window(first, self.num_pages)
+        stride = (
+            0
+            if layers == 1
+            else self.geometry.window(first + 1, self.num_pages).ring_start
+            - window.ring_start
+        )
         return build_indices(
-            selected,
+            step.selected[spec.topk_owner] if spec.ratio else None,
             step,
             self.geometry,
-            self.geometry.window(spec.layer_id, self.num_pages),
+            window,
             spec.kv_owner,
             spec.ratio,
+            layers,
+            stride,
         )

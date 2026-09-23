@@ -86,6 +86,7 @@ def unallocated_moe(monkeypatch):
     def capture_v4(self, layer_id, args, prefix="", alt_stream=None):
         nn.Module.__init__(self)
         self.gate = nn.Module()
+        self.experts = SimpleNamespace(custom_routing_function=None)
         self.quant_config = args.quant_config
         self.prefix = prefix
         self.alt_stream = alt_stream
@@ -118,6 +119,7 @@ def build_v41(unallocated_moe):
             hf_config=hf,
             max_model_len=32,
             enforce_eager=True,
+            compilation_config=SimpleNamespace(level=0, static_forward_context={}),
             online_quant_config=online,
         )
         with torch.device("meta"):

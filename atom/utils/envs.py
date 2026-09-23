@@ -198,6 +198,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ": lambda: (
         os.getenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "1") == "1"
     ),
+    # FlyDSL FP8 prefill with fused QKV quantization and direct FP8 gather output
+    # where supported. Unsupported attention inputs raise. Added 2026-09-10.
+    "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN": lambda: (
+        os.getenv("ATOM_USE_FLYDSL_FP8_PREFILL_ATTN", "0") == "1"
+    ),
     # QK-norm-rope-cache-quant fusion for Qwen3 dense and MoE; disabled by default.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
@@ -265,6 +270,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
+    # DeepSeek-V4.1: how many of an attention layer's branches leave the main
+    # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
+    # the scorer that first reads it; 2 the indexer as well, on one of its own.
+    # Default 0 because forking measured slower per layer, not faster -- the
+    # periods and the noise floor under them are in the environment doc, and
+    # end-to-end throughput is too coarse to see an effect that size.
+    "ATOM_DSV41_SIDE_STREAMS": lambda: int(os.getenv("ATOM_DSV41_SIDE_STREAMS", "0")),
     # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
     # (K3DSparkMLAAttention.write_context_kv) into one Triton kernel --
     # RMSNorm(kv_c) + rope(k_pe) + concat + paged-cache store, versus today's
@@ -716,11 +728,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK", "") == ""
         else float(os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK"))
     ),
-    # TTFT SLA guard: if any rank's oldest schedulable waiting prefill has queued
-    # (since arrival) >= this many ms, force-release regardless of the fill
-    # target. Bounds worst-case TTFT. Empty string => None => disabled (set this
-    # to your TTFT budget in ms to activate; a small value under heavy backlog
-    # will fire every tick and defeat coalescing, so size it to the SLA).
+    # After decode protection, bound extra coalescing by queue age. Checkpoint
+    # dependency waits use TTFT_MAX_TICKS; this is not an end-to-end TTFT bound.
+    # Empty string => None => disabled.
     "ATOM_PREFILL_DELAYER_MAX_QUEUE_MS": lambda: (
         None
         if os.getenv("ATOM_PREFILL_DELAYER_MAX_QUEUE_MS", "") == ""
@@ -729,6 +739,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # After a prefill forward, protect this many scheduler passes for decode
     # before allowing another prefill. Mirrors SGLang's
     # --prefill-decode-interval; 0 disables the hard interval.
+    # A nonzero interval also enables local coalescing on TP without PP.
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
     ),

@@ -25,6 +25,7 @@ decides when that stops paying.
 import torch
 import triton
 import triton.language as tl
+from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.mhc import (
     get_mhc_fused_post_pre_config,
     get_mhc_pre_splitk,
@@ -223,6 +224,57 @@ def pre_delayed(
     Returns `(residual, layer_input, next_pre_mix, post_mix, combination)`.
     `residual` is the caller's own tensor when no post was requested.
     """
+    outputs = v41_mhc_pre_delayed(
+        residual,
+        pre_mix,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=sinkhorn_iters,
+        post_mult=post_mult,
+        sublayer_output=sublayer_output,
+        post_mix=post_mix,
+        combination=combination,
+    )
+    # Preserve the no-post input alias outside the custom op. The guarded
+    # implementation returns four new tensors, or five when post updates it.
+    return (residual, *outputs) if sublayer_output is None else tuple(outputs)
+
+
+def _pre_delayed_fake(
+    residual, pre_mix, hc_fn, hc_scale, hc_base, *, sublayer_output=None, **kwargs
+):
+    *outer, hc, hidden = residual.shape
+    outputs = [
+        residual.new_empty((*outer, hidden)),
+        residual.new_empty((*outer, hc), dtype=torch.float32),
+        residual.new_empty((*outer, hc), dtype=torch.float32),
+        residual.new_empty((*outer, hc, hc), dtype=torch.float32),
+    ]
+    return (
+        outputs if sublayer_output is None else [torch.empty_like(residual), *outputs]
+    )
+
+
+@torch_compile_guard(mutates_args=[], gen_fake=_pre_delayed_fake)
+def v41_mhc_pre_delayed(
+    residual: torch.Tensor,
+    pre_mix: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    *,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    post_mult: float,
+    sublayer_output: torch.Tensor | None = None,
+    post_mix: torch.Tensor | None = None,
+    combination: torch.Tensor | None = None,
+) -> list[torch.Tensor]:
+    """Choose AITER's shape/device tuning at execution time, outside Dynamo."""
     hc_mult, hidden = residual.shape[-2], residual.shape[-1]
     outer = residual.shape[:-2]
     flat = residual.view(-1, hc_mult, hidden)
@@ -294,10 +346,10 @@ def pre_delayed(
         gemm_out, sqrsum, hc_scale, hc_base, hc_mult, hc_hidden, rms_eps, hc_eps
     )
     layer_input = collapse_streams(projected, pre_mix.reshape(rows, hc_mult))
-    return (
-        residual,
+    outputs = [
         layer_input.view(*outer, hidden),
         next_pre.view(*outer, hc_mult),
         next_post.view(*outer, hc_mult),
         next_comb.view(*outer, hc_mult, hc_mult),
-    )
+    ]
+    return outputs if sublayer_output is None else [residual, *outputs]

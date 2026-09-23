@@ -2164,11 +2164,15 @@ class Config:
             or (self.plugin_config is not None and self.plugin_config.is_vllm)
         ) and self.compilation_config.level == CompilationLevel.PIECEWISE:
             self.compilation_config.set_splitting_ops_for_v1()
-            # Keep an explicit cudagraph_mode (e.g. FULL); default to
-            # PIECEWISE only when unset. splitting_ops/sizes are set either
-            # way so the model is still piece-split-compiled at level 3.
+            # Default to PIECEWISE, except V4.1 whose Engram stream fork/join
+            # currently requires a FULL graph. Explicit choices are preserved.
+            # splitting_ops/sizes still configure the level-3 backend.
             if self.compilation_config.cudagraph_mode is None:
-                self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+                self.compilation_config.cudagraph_mode = (
+                    CUDAGraphMode.FULL
+                    if self.hf_config.model_type == "deepseek_v41_text"
+                    else CUDAGraphMode.PIECEWISE
+                )
             self.compilation_config.init_with_cudagraph_sizes()
 
         self.torch_dtype = (

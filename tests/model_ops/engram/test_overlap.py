@@ -2,7 +2,7 @@
 """Real UVA lookup under warmup, capture, and changing graph replay inputs.
 
 Run pytest on one GPU, or torchrun --nproc-per-node=4 -m
-tests.model_ops.test_engram_overlap to include AITER collectives.
+tests.model_ops.engram.test_overlap to include AITER collectives.
 """
 
 import mmap
@@ -18,18 +18,18 @@ if not torch.cuda.is_available():
     # instead of skipping.
     pytest.skip("requires GPU", allow_module_level=True)
 
-from atom.model_engine.engram_runtime import EngramBatch
-from atom.model_engine.engram_staging import EngramStaging
-from atom.model_ops.engram import EngramConfig
-from atom.model_ops.engram_hash import (
+from atom.model_ops.engram.device.hashing import (
     EngramHashTables,
     engram_row_indices_reference,
     engram_snapshot,
     engram_snapshot_indices,
 )
-from atom.model_ops.engram_lookup import HostEmbeddingTable
-from tests.model_ops.test_engram_hash import case, compress
-from tests.model_ops.test_engram_hash_bounds import V41_FLASH, build, tiny_config
+from atom.model_ops.engram.device.runtime import EngramBatch
+from atom.model_ops.engram.device.staging import EngramStaging
+from atom.model_ops.engram.mapping import EngramConfig
+from atom.model_ops.engram.tables import HostEmbeddingTable
+from tests.model_ops.engram.test_hash_bounds import V41_FLASH, build, tiny_config
+from tests.model_ops.engram.test_hashing import case, compress
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 
@@ -121,12 +121,8 @@ def make_staging(mapping, group=None):
         head_start=rank * local_heads,
         total_heads=config.num_hash_heads,
         embed_width=config.num_hash_heads * config.head_dim,
-        hash_tables=EngramHashTables.from_mapping(mapping, device),
         prefetcher=SimpleNamespace(_tables=tables),
         _tp_group=group,
-        _row_ids=torch.empty(
-            32, config.num_hash_heads, dtype=torch.int64, device=device
-        ),
         buffers={
             layer: SimpleNamespace(
                 gpu=torch.empty(
@@ -139,7 +135,16 @@ def make_staging(mapping, group=None):
             for layer in config.layer_ids
         },
     )
-    return EngramStaging(host), backing
+    # The staging hangs off the device lookup, which owns the hash tables and
+    # the row-index buffer; the host half of it is what holds the rest.
+    uva = SimpleNamespace(
+        host=host,
+        hash_tables=EngramHashTables.from_mapping(mapping, device),
+        row_ids=torch.empty(
+            32, config.num_hash_heads, dtype=torch.int64, device=device
+        ),
+    )
+    return EngramStaging(uva), backing
 
 
 def exercise_replay(group=None):

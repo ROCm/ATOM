@@ -75,6 +75,40 @@ def _indptr_scan(
 
 
 @triton.jit
+def _indptr_scan_all(
+    batches,
+    positions,
+    cu,
+    prefixes,
+    extends,
+    tokens,
+    DECODE: tl.constexpr,
+    WINDOW: tl.constexpr,
+    RATIOS: tl.constexpr,
+    TOPKS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # Ratios have independent scans, but share one launch. Each program owns
+    # one output pair; no cross-program prefix or synchronization is needed.
+    for i in tl.static_range(len(RATIOS)):
+        if tl.program_id(0) == i:
+            _indptr_scan(
+                batches,
+                positions,
+                cu,
+                prefixes[i],
+                extends[i],
+                tokens,
+                DECODE,
+                WINDOW,
+                RATIOS[i] or 1,
+                TOPKS[i],
+                not DECODE,
+                BLOCK,
+            )
+
+
+@triton.jit
 def _indices(
     selected,
     pptr,
@@ -89,6 +123,8 @@ def _indices(
     table_stride,
     global_offset,
     ring_start,
+    layer_stride,
+    plane,
     DECODE: tl.constexpr,
     ROWS_PER_PAGE: tl.constexpr,
     PAGE_ROWS: tl.constexpr,
@@ -103,6 +139,12 @@ def _indices(
     MAIN_ROW_BYTES: tl.constexpr,
 ):
     t = tl.program_id(0)
+    # One program row per layer of the group. Everything a layer's indices
+    # depend on is shared across the run except its ring, which sits exactly
+    # `layer_stride` further along -- so the axis is an offset, not a lookup.
+    layer = tl.program_id(1)
+    ring_start += layer * layer_stride
+    prefix += layer * plane
     batch = tl.load(batches + t)
     # Defined only where the batch id is, as V4's decode writer is: a padding
     # row owns no slot to address and was given no room to write into.
@@ -159,31 +201,38 @@ def fill_step_indptrs(step, geometry, buffers):
     pass skips, and a table at a fresh address each forward is one its replay
     reads at the capture's.
     """
+    ratios = geometry.layer_ratios
     built = {}
-    for ratio in geometry.layer_ratios:
+    for ratio in ratios:
         prefix, extend = buffers[ratio]
-        topk = geometry.batch_topk(ratio)
         pptr = prefix[: step.width + 1]
         eptr = pptr if step.decode else extend[: step.width + 1]
-        _indptr_scan[(1,)](
+        built[ratio] = (pptr, eptr, geometry.batch_topk(ratio))
+    if ratios:
+        _indptr_scan_all[(len(ratios),)](
             step.batch_ids,
             step.positions,
             step.cu_seqlens_q,
-            pptr,
-            eptr,
+            tuple(built[ratio][0] for ratio in ratios),
+            tuple(built[ratio][1] for ratio in ratios),
             step.width,
             DECODE=step.decode,
             WINDOW=geometry.window_size,
-            RATIO=ratio or 1,
-            TOPK=topk,
-            EXTEND=not step.decode,
-            BLOCK=1024,
+            RATIOS=ratios,
+            TOPKS=tuple(built[ratio][2] for ratio in ratios),
+            BLOCK=min(1024, triton.next_power_of_2(max(step.width, 1))),
         )
-        built[ratio] = (pptr, eptr, topk)
     return built
 
 
-def build_indices(selected, step, geometry, window, owner, ratio):
+def build_indices(selected, step, geometry, window, owner, ratio, layers=1, stride=0):
+    """`layers` consecutive layers' indices, starting at `window`'s.
+
+    Only a decode groups: its `extend` is empty, so the run needs no second
+    plane, and it is the pass whose cost is the launch rather than the work.
+    """
+    if layers > 1 and not step.decode:
+        raise ValueError("Only a decode batches its index build across layers")
     topk = 0 if selected is None else selected.shape[-1]
     pptr, eptr, reserved = step.indptrs[ratio]
     if topk != reserved:
@@ -191,8 +240,9 @@ def build_indices(selected, step, geometry, window, owner, ratio):
         # any scorer ran. Another width leaves every row a hole its reader
         # dereferences.
         raise ValueError(f"Scorer width {topk} is not the {reserved} reserved")
+    plane = step.width * (topk + geometry.window_size)
     prefix = torch.empty(
-        step.width * (topk + geometry.window_size),
+        layers * plane,
         dtype=torch.int64 if geometry.packed else torch.int32,
         device=step.positions.device,
     )
@@ -202,7 +252,7 @@ def build_indices(selected, step, geometry, window, owner, ratio):
         device=step.positions.device,
     )
     if step.width:
-        _indices[(step.width,)](
+        _indices[(step.width, layers)](
             selected if topk else prefix,
             pptr,
             prefix,
@@ -216,6 +266,8 @@ def build_indices(selected, step, geometry, window, owner, ratio):
             step.block_tables.stride(0),
             geometry.main_offset(owner) if ratio else 0,
             window.ring_start,
+            stride,
+            plane,
             DECODE=step.decode,
             ROWS_PER_PAGE=geometry.block_size // (ratio or 1),
             PAGE_ROWS=geometry.page_bytes
@@ -227,4 +279,4 @@ def build_indices(selected, step, geometry, window, owner, ratio):
             WINDOW=geometry.window_size,
             **window_constexprs(window),
         )
-    return prefix, pptr, extend, eptr
+    return prefix.view(layers, plane), pptr, extend, eptr

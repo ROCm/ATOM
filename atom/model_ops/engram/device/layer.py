@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from atom.config import QuantizationConfig
-from atom.model_ops.engram_fused import engram_post_wkv
+from atom.model_ops.engram.device.gate import engram_post_wkv
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.utils import atom_parameter
 

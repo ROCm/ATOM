@@ -19,6 +19,7 @@ from atom.model_ops.attentions.deepseek_v41.cache import (
 )
 from atom.model_ops.attentions.deepseek_v41.checkpoints import StateCopies
 from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
+from atom.models.deepseek_v41.config import AttentionMode, LayerAttentionSpec
 from tests.attentions.deepseek_v41.helpers import geometry
 
 
@@ -108,7 +109,6 @@ def test_a_rows_prefix_slice_is_exactly_as_long_as_what_gets_written(ratio, topk
     Checked against the writer's own rule rather than against the scan's,
     which is the only way the two can be caught disagreeing.
     """
-    from types import SimpleNamespace
 
     from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 
@@ -135,7 +135,7 @@ def test_a_rows_prefix_slice_is_exactly_as_long_as_what_gets_written(ratio, topk
         columns < counts[:, None], columns.expand(step.width, topk), -1
     ).int()
     step.selected[0] = selection.unsqueeze(0)
-    spec = SimpleNamespace(layer_id=1, ratio=ratio, kv_owner=0, topk_owner=0)
+    spec = LayerAttentionSpec(1, ratio, AttentionMode.REUSE, 0, 0)
     _, pptr, _, _ = cache.attention_indices(spec, step)
     window = (step.positions + 1).clamp(max=geo.window_size)
     written = window + (selection >= 0).sum(-1)
@@ -145,14 +145,67 @@ def test_a_rows_prefix_slice_is_exactly_as_long_as_what_gets_written(ratio, topk
     )
 
 
-def test_a_graph_sized_plans_sentinel_rows_land_on_the_page_nobody_owns():
-    """The rows a fixed grid adds beyond the batch address nothing live.
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_one_grouped_build_writes_what_the_per_layer_builds_would(ratio):
+    """A run's launch against the launches it replaces, plane by plane.
 
-    A plan cut for a CUDAGraph is `running_bs * per-seq bound` rows whatever
-    the batch, and the tail is `-1` in both fields. The index and packed-main
-    scatters are torch advanced indexing, where `-1` is the LAST page and the
-    last row of it -- a live request's, at every shape this runs. The
-    destination is the one PAGE the scheduler cannot name instead.
+    The run shares every input but its ring, so what this catches is the one
+    thing the grid's second axis has to get right: layer `j` addressing layer
+    `j`'s window. A stride off by a layer still produces valid-looking rows --
+    another layer's -- so the comparison has to be against a build that names
+    each layer, not against a formula rewritten here.
+    """
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+
+    layers = 4
+    geo = V41PoolGeometry(
+        layers, ((0, ratio),), 32, 8, 512, 32, layer_ratios=(ratio,), index_topk=8
+    )
+    cache = PagedAttentionCache(geo, 32, 4, "cuda")
+    spans = (
+        RequestSpan(1, 3, 0, 1, 0, (0, 1, 2)),
+        RequestSpan(2, 200, 1, 1, 1, tuple(range(3, 16))),
+    )
+    step = cache.begin_step(spans, running_bs=2, running_tokens=2, max_q_len=1)
+    assert step.decode
+    selection = torch.where(
+        torch.arange(8, device="cuda") < ((step.positions + 1) // ratio)[:, None],
+        torch.arange(8, device="cuda").expand(step.width, 8),
+        -1,
+    ).int()
+    step.selected[0] = selection.unsqueeze(0)
+
+    def built(size):
+        rows = []
+        step.group_indices.clear()
+        for layer in range(layers):
+            spec = LayerAttentionSpec(
+                layer,
+                ratio,
+                AttentionMode.REUSE,
+                0,
+                0,
+                index_group_start=0,
+                index_group_size=size,
+            )
+            prefix, pptr, _, _ = cache.attention_indices(spec, step)
+            # A plane is reserved for the widest row and written to the indptr,
+            # so comparing past it compares two `torch.empty` tails.
+            rows.append(prefix[: int(pptr[-1])].clone())
+        return rows
+
+    alone, grouped = built(1), built(layers)
+    # Two layers' rings must differ, or every stride passes.
+    assert not torch.equal(alone[0], alone[1])
+    assert all(torch.equal(a, b) for a, b in zip(alone, grouped, strict=True))
+
+
+def test_graph_plan_sentinel_rows_do_not_write_to_live_pages():
+    """Capacity padding is skipped without compacting the scatter's input.
+
+    Two owner fields make each plane noncontiguous across PAGE boundaries;
+    flattening that view would copy it and lose every intended write.
     """
     from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
     from atom.model_ops.v4_kernels import make_compress_plans
@@ -305,3 +358,91 @@ def test_a_deferred_probe_skips_the_slot_its_own_step_resets(small_config, devic
     assert cache.cursor[0, 0] == 0
     # The probe carries slot 0's pre-reset row; position 0 is what excludes it.
     cache.prepare_state(cache.begin_step([replace(fresh, request_id=32)]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("decode", [False, True])
+@pytest.mark.parametrize("width", [0, 96, 1025])
+@pytest.mark.parametrize(
+    "ratios", [(0,), (1,), (2,), (0, 1), (0, 2), (1, 2), (0, 1, 2)]
+)
+def test_shared_indptr_launch_matches_row_counts_and_replay(decode, width, ratios):
+    from types import SimpleNamespace
+
+    from atom.model_ops.attentions.deepseek_v41.indices import fill_step_indptrs
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+
+    geo = V41PoolGeometry(
+        len(ratios),
+        tuple((i, ratio) for i, ratio in enumerate(ratios) if ratio),
+        32,
+        128,
+        512,
+        32,
+        layer_ratios=ratios,
+        index_topk=64,
+    )
+    live = max(0, width - 7)
+    lengths = [live // 3, live // 3, live - 2 * (live // 3)]
+    cu = torch.tensor(
+        [0, lengths[0], sum(lengths[:2]), live], dtype=torch.int32, device="cuda"
+    )
+    batches = torch.cat(
+        [
+            torch.full((n,), b, device="cuda", dtype=torch.int32)
+            for b, n in enumerate(lengths)
+        ]
+        + [torch.full((width - live,), -1, device="cuda", dtype=torch.int32)]
+    )
+    positions = torch.zeros(width, device="cuda", dtype=torch.int32)
+    buffers = {
+        r: (
+            torch.full((width + 1,), -7, device="cuda", dtype=torch.int32),
+            torch.full((width + 1,), -9, device="cuda", dtype=torch.int32),
+        )
+        for r in geo.layer_ratios
+    }
+    step = SimpleNamespace(
+        width=width,
+        decode=decode,
+        positions=positions,
+        batch_ids=batches,
+        cu_seqlens_q=cu,
+    )
+    assert tuple(fill_step_indptrs(step, geo, buffers)) == ratios
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        built = fill_step_indptrs(step, geo, buffers)
+    for starts in [(0, 127, 300), (511, 3, 120)]:
+        pos = []
+        windows, reaches = [], []
+        for start, n in zip(starts, lengths):
+            for j in range(n):
+                absolute = start + j
+                pos.append(absolute)
+                windows.append(
+                    max(0, (absolute + 1 if decode else start) - max(absolute - 127, 0))
+                )
+                reaches.append(min(j + 1, 128))
+        positions.copy_(
+            torch.tensor(pos + [0] * (width - live), device="cuda", dtype=torch.int32)
+        )
+        graph.replay()
+        for ratio, (prefix, extend, topk) in built.items():
+            counts = [
+                w + (min((p + 1) // ratio, topk) if ratio else 0)
+                for w, p in zip(windows, pos)
+            ] + [0] * (width - live)
+            expected = torch.tensor(
+                [0] + list(np.cumsum(counts)), device="cuda", dtype=torch.int32
+            )
+            torch.testing.assert_close(prefix, expected, rtol=0, atol=0)
+            if decode:
+                assert extend.data_ptr() == prefix.data_ptr()
+            else:
+                expected = torch.tensor(
+                    [0] + list(np.cumsum(reaches + [0] * (width - live))),
+                    device="cuda",
+                    dtype=torch.int32,
+                )
+                torch.testing.assert_close(extend, expected, rtol=0, atol=0)

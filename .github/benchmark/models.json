@@ -25,7 +25,7 @@
         "tp": 4,
         "kv_cache_dtype": "bf16",
         "trust_remote_code": true,
-        "extra_args": "--host 0.0.0.0 --index-cache-dtype fp8 --gpu-memory-utilization 0.9 --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 --max-num-seqs 128 --level 3 --cudagraph-mode FULL --method dspark --num-speculative-tokens 5 --spec-decode-acceptance-length 3.51 --enable-prefix-caching --block-size 16 --state-checkpoint-interval-tokens 8192 --tool-call-parser dsml_v41"
+        "extra_args": "--host 0.0.0.0 --index-cache-dtype fp8 --gpu-memory-utilization 0.9 --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 --max-num-seqs 128 --level 3 --cudagraph-mode FULL --method dspark --num-speculative-tokens 5 --spec-decode-acceptance-length 3.51 --enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --tool-call-parser dsml_v41"
       },
       "variants": [
         {
@@ -190,6 +190,28 @@
           "bench_args": "--num-prompts 20480 --num-warmups 256",
           "conc_min": 4096,
           "conc_max": 4096
+        }
+      ]
+    },
+    {
+      "display": "DeepSeek-V4.1-Flash",
+      "path": "deepseek-ai/DeepSeek-V4.1-Flash",
+      "prefix": "deepseek-v41-flash",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "",
+      "config": {
+        "tp": 4,
+        "kv_cache_dtype": "bf16",
+        "extra_args": "--index_cache_dtype fp8"
+      },
+      "variants": [
+        {
+          "label": "DSpark",
+          "suffix": "-dspark",
+          "extra_args": "--method dspark --num-speculative-tokens 5",
+          "bench_args": "--use-chat-template",
+          "conc_min": 4,
+          "conc_max": 256
         }
       ]
     },

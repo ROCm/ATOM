@@ -88,16 +88,33 @@ runs:
         fi
 
         MODEL_HOST_ROOT=""
-        for d in /shared_nfs/huggingface_models /models /data/models; do
-          if [ -d "$d" ]; then
-            MODEL_HOST_ROOT="$d"
-            break
-          fi
-        done
+        # PITT predownload runners keep model payloads on the Docker host under
+        # /models. The Actions runner process may not see that host path itself,
+        # so do not gate the bind mount on `[ -d /models ]` for that label.
+        if [ "${RUNNER_LABEL}" = "atom-mi355-8gpu.predownload" ]; then
+          MODEL_HOST_ROOT="/models"
+        else
+          # Prefer the common host cache roots used by the GPU workflows.
+          for d in \
+            /models \
+            /shared_nfs/huggingface_models \
+            /shared_nfs/models \
+            /it-share/models \
+            /mnt/raid0/pretrained_model \
+            /shared/data/WRH/models \
+            /data/models \
+            /data/pretrained_model; do
+            if [ -d "$d" ]; then
+              MODEL_HOST_ROOT="$d"
+              break
+            fi
+          done
+        fi
 
         MODEL_MOUNT=""
         if [ -n "$MODEL_HOST_ROOT" ]; then
           MODEL_MOUNT="-v ${MODEL_HOST_ROOT}:/models"
+          echo "Using model cache root: ${MODEL_HOST_ROOT}"
           echo "MODEL_HOST_ROOT=${MODEL_HOST_ROOT}" >> "$GITHUB_ENV"
         else
           echo "Warning: no model cache directory found on runner; skipping /models mount and disabling model pre-download optimization."

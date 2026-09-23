@@ -896,9 +896,16 @@ def _fake_head(batch):
         pp_transport=MagicMock(),
         scheduler=MagicMock(),
         _poll_kv_transfer_progress=MagicMock(),
+        _dispatch_idle_offload_work=MagicMock(),
+        # Real throttle, mocked dispatch: `_pp_head_step` runs on a loop that
+        # never sleeps, so it must go through `_advance_idle_kv_transfer`.
+        _next_idle_kv_drain=0.0,
     )
     head.scheduler.schedule.side_effect = [(batch, {}), None]
     head.scheduler.take_rejected.return_value = None
+    head._advance_idle_kv_transfer = PPEngineCoreProc._advance_idle_kv_transfer.__get__(
+        head
+    )
     head._dispatch_connector_only_batch = (
         PPEngineCoreProc._dispatch_connector_only_batch.__get__(head)
     )
@@ -934,6 +941,42 @@ def test_pp_head_skips_empty_meta_of_request_less_batch():
         head.pp_transport.send_metadata.assert_not_called()
 
 
+def test_pp_head_dispatches_idle_offload_without_a_batch():
+    """`Scheduler.is_finished()` stays false while blocks are deferred, so the
+    loop re-enters `_pp_head_step` and never reaches its own idle-drain branch.
+    The leftover suffix saves must be dispatched here or never at all."""
+    head = _fake_head(None)
+    head._dispatch_idle_offload_work.assert_called_once()
+
+
+def test_pp_head_idle_dispatch_shares_the_drain_throttle(monkeypatch):
+    """The loop has no sleep; a direct dispatch would rebuild connector
+    metadata on every turn."""
+    PPEngineCoreProc = _pp_engine_core_cls()
+    from atom.model_engine import engine_core
+
+    # CI can spend longer than the 1 ms drain interval between calls. Control
+    # the clock so this tests the throttle rather than the runner's speed.
+    now = 100.0
+    monkeypatch.setattr(engine_core, "time", SimpleNamespace(monotonic=lambda: now))
+    head = _fake_head(None)
+    head._dispatch_idle_offload_work.assert_called_once()
+    assert head._next_idle_kv_drain == now + engine_core.KV_IDLE_DRAIN_INTERVAL_S
+
+    now += engine_core.KV_IDLE_DRAIN_INTERVAL_S / 2
+    head.scheduler.schedule.side_effect = [None]
+    PPEngineCoreProc._pp_head_step(head)
+
+    head._dispatch_idle_offload_work.assert_called_once()  # still once: throttled
+
+    now = head._next_idle_kv_drain
+    head.scheduler.schedule.side_effect = [None]
+    PPEngineCoreProc._pp_head_step(head)
+
+    assert head._dispatch_idle_offload_work.call_count == 2
+    assert head._next_idle_kv_drain == now + engine_core.KV_IDLE_DRAIN_INTERVAL_S
+
+
 def test_pp_head_forwards_normal_batch_with_meta():
     """A batch with requests keeps the original path: dispatch, send, forward."""
     meta = _FakeMeta(["load-r1"])
@@ -944,6 +987,7 @@ def test_pp_head_forwards_normal_batch_with_meta():
     assert _dispatched_metas(head) == [meta]
     head.pp_transport.send_metadata.assert_called_once_with(batch)
     head.runner_mgr.call_func.assert_any_call("forward", batch, wait_out=True)
+    head._dispatch_idle_offload_work.assert_called_once()  # Next schedule is None.
 
 
 def test_pp_downstream_skips_forward_for_request_less_batch():

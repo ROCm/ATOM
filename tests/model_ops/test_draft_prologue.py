@@ -31,11 +31,8 @@ if not torch.cuda.is_available():
         allow_module_level=True,
     )
 
-from atom.model_ops.deepseek_v41.dspark import (
-    build_block_state,
-    draft_step,
-    draft_step_indices,
-)
+from atom.model_ops.deepseek_v41.draft_block import draft_step
+from atom.model_ops.deepseek_v41.dspark import build_block_state, draft_step_indices
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 
 DEV = "cuda"

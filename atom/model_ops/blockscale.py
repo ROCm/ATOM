@@ -14,9 +14,33 @@ import triton
 
 from .blockscale_kernels.blockscale_gemm import (
     blockscale_gemm_fp4_kernel,
-    blockscale_gemm_fp8_kernel,
 )
-from .blockscale_kernels.quantization import quantize_fp4_kernel, quantize_fp8_kernel
+from .blockscale_kernels.quantization import (
+    FP8_DTYPE,
+    quantize_fp4_kernel,
+    quantize_fp8_kernel,
+)
+
+
+def _get_aiter_fp8_gemm():
+    try:
+        from aiter import gemm_a8w8_blockscale
+    except ImportError:
+        return None
+    # The older same-named interface only supports FP32 128x128 scales.
+    # The registered schema retains the signature hidden by torch_compile_guard.
+    try:
+        schema = torch.ops.aiter.gemm_a8w8_blockscale.default._schema
+    except AttributeError:
+        return None
+    return (
+        gemm_a8w8_blockscale
+        if any(arg.name == "split_k" for arg in schema.arguments)
+        else None
+    )
+
+
+_aiter_fp8_gemm = _get_aiter_fp8_gemm()
 
 
 def _check_quant_input(x, group):
@@ -30,7 +54,7 @@ def _check_quant_input(x, group):
 def quantize_fp8(x: torch.Tensor, *, dequantize: bool = False):
     """E4M3, group32 E8M0 ceil scales; optionally return QAT values in x.dtype."""
     x = _check_quant_input(x, 32)
-    output = torch.empty_like(x, dtype=x.dtype if dequantize else torch.float8_e4m3fn)
+    output = torch.empty_like(x, dtype=x.dtype if dequantize else FP8_DTYPE)
     scales = (
         None
         if dequantize
@@ -97,20 +121,12 @@ def quantize_fp4(
     return output if dequantize else (output.view(torch.float4_e2m1fn_x2), scales)
 
 
-_TARGET_WAVES = 2
-
-
 @functools.lru_cache(maxsize=8)
 def _units(index: int | None = None) -> int:
-    """Compute units on the current device; both tile and split gates use it."""
+    """Compute units used to size local split-K grids."""
     return torch.cuda.get_device_properties(
         torch.cuda.current_device() if index is None else index
     ).multi_processor_count
-
-
-def _auto_split_k(m: int, n: int, k: int, device, fp4: bool = True) -> int:
-    """How many ways to split K, so the launch grid fills the device."""
-    return _fp4_split_k(m, n, k, device) if fp4 else _fp8_split_k(m, n, k, device)
 
 
 def _fp4_split_k(m: int, n: int, k: int, device) -> int:
@@ -131,55 +147,6 @@ def _fp4_split_k(m: int, n: int, k: int, device) -> int:
     return max(1, min(16, k // 1024, -(-units // blocks)))
 
 
-def _fp8_split_k(m: int, n: int, k: int, device) -> int:
-    """Splits for the FP8 path, from the tile the same shape will run.
-
-    The grid against the CU count is the whole gate: a 16-workgroup kv_a at
-    m=1 more than halves, a 288-workgroup shared w1 at m=128 loses 1.3x. Two
-    waves rather than one, because shorter splits also even out the tail.
-    Asking for more than K/BK is harmless -- the caller re-derives the count
-    from ``part_k``.
-    """
-    bm, bn, bk, _, _ = _select_fp8_tile(m, n, k)
-    blocks = -(-m // bm) * -(-n // bn)
-    units = _units(device.index)
-    if blocks >= units:
-        return 1
-    return max(1, min(16, k // bk, -(-(_TARGET_WAVES * units) // blocks)))
-
-
-def _select_fp8_tile(m: int, n: int, k: int):
-    """(BM, BN, BK, num_warps, num_stages) for the FP8 kernel.
-
-    Swept through ``native_quant_linear`` so each candidate ran with its real
-    split count, and with the inputs rotated -- a sweep on pinned tensors reads
-    a third of the decode time and picks differently. The M bands are also the
-    JIT variant count per projection; N and K are constexpr there, so branching
-    on them is free.
-
-    Small M is weight-bandwidth bound on a grid too small to fill the CUs, so
-    BM drops to the MFMA minimum and BK widens. The tile squares up on the grid
-    it would leave rather than on N: a narrow projection at m=1024 still wants
-    the small tile, because a 128-wide one leaves 80 workgroups of 256.
-    """
-    if m <= 16:
-        return 16, 32, 512, 2, 2
-    if m <= 64:
-        # A wide, deep weight has enough work per output tile to pay for a
-        # square one this early; kv_a and wq_a at m=32 do not.
-        return (64, 64, 256, 4, 2) if n * k >= 2**25 else (32, 32, 512, 2, 2)
-    if m <= 256:
-        # A narrow projection cannot make enough 64-wide tiles to fill the CUs
-        # here -- kv_a at m=128 leaves 16 workgroups -- and split-K only lifts
-        # that to 160. Halving the tile is what fills it. Picked on the sum
-        # over N in {512, 768, 1024} x m in {128, 256}, not on kv_a alone: the
-        # 16x16x1024 tile that wins kv_a at m=128 is 30% slower at N=768.
-        return (32, 32, 512, 2, 2) if n <= 1024 else (64, 64, 256, 4, 2)
-    if n <= 1024 or -(-m // 128) * -(-n // 128) < _units() // 2:
-        return 64, 64, 256, 4, 2
-    return 128, 128, 256, 4, 1
-
-
 def native_quant_linear(
     x,
     weight,
@@ -192,9 +159,10 @@ def native_quant_linear(
 ):
     """FP8 32x32/1x32 or W4A8 1x32 GEMM; inputs and weights stay native.
 
-    Weight scales remain compact. FP8 goes through the microscaling MFMA, W4A8
-    unpacks to BF16 for a plain one; both accumulate in FP32 through the
-    split-K reduction to the requested output conversion. A8 QAT and native
+    Weight scales remain compact. FP8 prefers AITER's configured GEMM interface
+    and falls back to local kernels on older AITER builds. W4A8 unpacks to
+    BF16 for a plain MFMA; both accumulate in FP32 before the
+    requested output conversion. A8 QAT and native
     weight storage are retained without materializing a dequantized weight.
     """
     if x.ndim < 2 or weight.ndim != 2 or dtype not in (torch.bfloat16, torch.float32):
@@ -213,6 +181,22 @@ def native_quant_linear(
     if x_scale is None:
         x, x_scale = quantize_fp8(x)
     m = x.numel() // k
+    if split_k is not None and (not isinstance(split_k, int) or split_k < 1):
+        raise ValueError("split_k must be a positive integer")
+    if weight_scale.shape != (-(-n // weight_group_rows), k // 32):
+        raise ValueError("Weight scale shape does not match the declared source blocks")
+    if not fp4 and _aiter_fp8_gemm is not None:
+        batched = x.ndim > 2
+        output = _aiter_fp8_gemm(
+            x.view(m, k) if batched else x,
+            weight,
+            x_scale.view(m, k // 32) if batched else x_scale,
+            weight_scale,
+            dtype=dtype,
+            split_k=split_k,
+        )
+        return output.view(*x.shape[:-1], n) if batched else output
+
     if (
         x.dtype != torch.float8_e4m3fn
         or x_scale.dtype != torch.float8_e8m0fnu
@@ -221,10 +205,7 @@ def native_quant_linear(
         raise ValueError(
             "Activations must be E4M3 with E8M0 activation and weight scales"
         )
-    if x_scale.shape != (*x.shape[:-1], k // 32) or weight_scale.shape != (
-        -(-n // weight_group_rows),
-        k // 32,
-    ):
+    if x_scale.shape != (*x.shape[:-1], k // 32):
         raise ValueError("Scale shape does not match the declared source blocks")
     tensors = (x, weight, x_scale, weight_scale)
     if any(
@@ -233,67 +214,49 @@ def native_quant_linear(
         raise ValueError(
             "GEMM operands must be contiguous on the same CUDA/ROCm device"
         )
+    if not fp4:
+        from .blockscale_kernels.fp8 import gemm_fp8_local
+
+        return gemm_fp8_local(
+            x,
+            weight,
+            x_scale,
+            weight_scale,
+            dtype=dtype,
+            weight_group_rows=weight_group_rows,
+            split_k=split_k,
+            cu_num=_units(x.device.index),
+        )
     output = torch.empty((*x.shape[:-1], n), device=x.device, dtype=dtype)
     if m == 0:
         return output
-    if fp4:
-        bm, bn, bk, warps, stages = (16 if m <= 16 else 32), 64, 32, 4, 2
-    else:
-        bm, bn, bk, warps, stages = _select_fp8_tile(m, n, k)
-    splits = split_k if split_k is not None else _auto_split_k(m, n, k, x.device, fp4)
-    if not isinstance(splits, int) or splits < 1:
-        raise ValueError("split_k must be a positive integer")
-    # Round each slice up to the tile, then re-derive how many slices that is.
+    bm, bn, bk = (16 if m <= 16 else 32), 64, 32
+    splits = split_k if split_k is not None else _fp4_split_k(m, n, k, x.device)
     slice_k = -(-k // splits)
     part_k = -(-slice_k // bk) * bk
     splits = -(-k // part_k)
-    # Folding the reduction into the kernel costs more than the extra launch:
-    # see the split-K note in the module docstring.
     partial = (
         output
         if splits == 1
         else torch.empty((splits, m, n), device=x.device, dtype=torch.float32)
     )
-    # Integer ceildivs rather than triton.cdiv: at decode this launch path
-    # costs more than the kernel it launches. The E8M0 grids go in as uint8
-    # because Triton has no dtype for them; E4M3 goes in as itself.
-    grid = (-(-m // bm), -(-n // bn), splits)
-    scales = (x_scale.view(torch.uint8), weight_scale.view(torch.uint8))
-    if fp4:
-        blockscale_gemm_fp4_kernel[grid](
-            x,
-            weight.view(torch.uint8),
-            *scales,
-            partial,
-            m,
-            n,
-            k,
-            part_k,
-            bm,
-            bn,
-            bk,
-            num_warps=warps,
-            num_stages=stages,
-            # Pins the BF16 MFMA shape this path was tuned against.
-            matrix_instr_nonkdim=16,
-        )
-    else:
-        blockscale_gemm_fp8_kernel[grid](
-            x,
-            weight,
-            *scales,
-            partial,
-            m,
-            n,
-            k,
-            weight_group_rows,
-            part_k,
-            bm,
-            bn,
-            bk,
-            num_warps=warps,
-            num_stages=stages,
-        )
+    blockscale_gemm_fp4_kernel[(-(-m // bm), -(-n // bn), splits)](
+        x,
+        weight.view(torch.uint8),
+        x_scale.view(torch.uint8),
+        weight_scale.view(torch.uint8),
+        partial,
+        m,
+        n,
+        k,
+        part_k,
+        bm,
+        bn,
+        bk,
+        num_warps=4,
+        num_stages=2,
+        matrix_instr_nonkdim=16,
+    )
     if splits > 1:
         from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
             _gemm_splitk_reduce_kernel,

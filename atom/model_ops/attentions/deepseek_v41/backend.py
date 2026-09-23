@@ -6,7 +6,6 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from atom.model_engine.engram_runtime import EngramBatch, EngramInputPreparer
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attentions.backends import AttentionBackend, CommonAttentionBuilder
@@ -15,7 +14,11 @@ from atom.model_ops.attentions.deepseek_v4_attn import (
 )
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import page_pool, state_pool
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
-from atom.model_ops.engram_hash import engram_compress, engram_cursor_rows
+from atom.model_ops.engram.device.hashing import (
+    engram_compress,
+    engram_cursor_rows,
+)
+from atom.model_ops.engram.device.runtime import EngramBatch, EngramInputPreparer
 from atom.models.deepseek_v41.config import AttentionMode, build_attention_topology
 from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import AttentionMetaData, AttnState, Context

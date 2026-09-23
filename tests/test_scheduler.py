@@ -30,8 +30,8 @@ from atom.sampling_params import SamplingParams
 class _OffloadMixinStub(OffloadSchedulerMixin):
     """Concrete `OffloadSchedulerMixin` for scheduler tests.
 
-    `OffloadSchedulerMixin` declares the six save/load lifecycle methods abstract
-    so a missing forwarder is a construction-time TypeError. These test doubles
+    `OffloadSchedulerMixin` declares the seven save/load lifecycle methods
+    abstract so a missing forwarder is a construction-time TypeError. These test doubles
     exercise only the scheduler's deferred-free / preemption paths, so this base
     fills the contract with harmless defaults and each local `_Connector`
     overrides the methods it drives.
@@ -43,6 +43,7 @@ class _OffloadMixinStub(OffloadSchedulerMixin):
     def save_finished(self, req_id) -> None: ...
     def abandon_save(self, req_id) -> None: ...
     def release_stalled_save(self, seq) -> None: ...
+    def source_blocks_released(self, seq) -> None: ...
     def load_failed(self, req_id) -> bool:
         return False
 
@@ -427,7 +428,7 @@ class TestSchedulerAddQuery:
 
 
 class TestSchedule:
-    def test_non_offload_abort_keeps_existing_receive_cleanup(self):
+    def test_non_offload_abort_retains_receive_until_terminal(self):
         seq = SimpleNamespace(
             id=96,
             status=SequenceStatus.ABORTED,
@@ -435,6 +436,7 @@ class TestSchedule:
         )
         sched = Scheduler.__new__(Scheduler)
         sched._rejected = []
+        sched._inflight_prefix_wait = {}
         sched.deferred_free_blocks = {}
         sched.finished_recving_kv_req_ids = []
         sched.failed_recving_kv_req_ids = []
@@ -443,14 +445,19 @@ class TestSchedule:
 
         sched._reject_aborted_waiting(seq)
 
-        assert sched.deferred_free_blocks == {}
-        assert sched._num_parked_remote_kv == 0
+        assert sched.deferred_free_blocks == {seq.id: seq}
+        assert sched._num_parked_remote_kv == 1
+        assert seq._awaiting_aborted_load_cleanup
         assert sched._rejected == [seq]
 
+    @pytest.mark.parametrize("producer", [False, True])
+    @pytest.mark.parametrize("load_outcome", ["finished_loading", "failed_loading"])
     @pytest.mark.parametrize("first_terminal", ["load", "save"])
     def test_aborted_load_and_save_both_finish_before_release(
         self,
         first_terminal,
+        load_outcome,
+        producer,
     ):
         load = 97
         save = 97
@@ -465,13 +472,18 @@ class TestSchedule:
 
         class _Connector(_OffloadMixinStub):
             is_offload = True
-            is_producer = False
+            is_producer = producer
 
             def __init__(self):
                 self.pending_save = True
+                self.pending_send = False
 
             def load_finished(self, operation):
                 events.append(("load_finished", operation))
+                return operation == load
+
+            def load_failed(self, operation):
+                events.append(("load_failed", operation))
                 return operation == load
 
             def save_finished(self, operation):
@@ -481,15 +493,24 @@ class TestSchedule:
 
             def should_defer_free(self, value):
                 assert value is seq
-                return self.pending_save
+                return self.pending_save or self.pending_send
 
             def request_finished(self, value):
                 events.append(("request_finished", value.id))
+                self.pending_send = self.is_producer
+
+            def send_finished(self, req_id):
+                assert req_id == seq.id
+                self.pending_send = False
+
+            def source_blocks_released(self, value):
+                events.append(("source_blocks_released", value.id))
 
         sched = Scheduler.__new__(Scheduler)
         sched.waiting = deque()
         sched.running = deque()
         sched._rejected = []
+        sched._inflight_prefix_wait = {}
         sched.deferred_free_blocks = {}
         sched.finished_recving_kv_req_ids = []
         sched.failed_recving_kv_req_ids = []
@@ -504,7 +525,7 @@ class TestSchedule:
         assert seq._awaiting_aborted_load_cleanup is True
 
         outputs = {
-            "load": KVConnectorOutput(finished_loading={load}),
+            "load": KVConnectorOutput(**{load_outcome: {load}}),
             "save": KVConnectorOutput(finished_saving={save}),
         }
         second_terminal = "save" if first_terminal == "load" else "load"
@@ -518,8 +539,13 @@ class TestSchedule:
 
         assert sched.deferred_free_blocks == {}
         assert sched._num_parked_remote_kv == 0
+        assert not sched.kv_connector.pending_send
         assert events.count(("request_finished", seq.id)) == 1
         assert events.count(("deallocate", seq.id)) == 1
+        assert events[-2:] == [
+            ("deallocate", seq.id),
+            ("source_blocks_released", seq.id),
+        ]
 
     def test_empty_returns_none(self, scheduler):
         assert scheduler.schedule() is None
@@ -1630,6 +1656,35 @@ def _spec_config(mtp_k):
     )
 
 
+class TestProducerPreemptability:
+    """A P/D producer must not make its own running requests unpreemptable.
+
+    `_is_preemptable` negates `should_defer_free`, the predicate that now
+    carries the send's claim. Claiming at alloc instead of at
+    `request_finished` would pin every running request on a prefill node.
+    """
+
+    def test_preemptable_until_the_send_is_published(self, scheduler, seq_factory):
+        seq = seq_factory([1, 2, 3, 4])
+        scheduler.add(seq)
+        scheduler.schedule()
+        published: set[str] = set()
+        scheduler.kv_connector = SimpleNamespace(
+            is_producer=True,
+            # Claim only once the peer has the addresses, as the real ones do.
+            request_finished=lambda s: published.add(str(s.id)),
+            should_defer_free=lambda s: str(s.id) in published,
+        )
+
+        assert scheduler._is_preemptable(seq) is True
+        scheduler.kv_connector.request_finished(seq)
+        assert scheduler._is_preemptable(seq) is False
+
+        published.clear()
+        assert scheduler._preempt_one_running() is True
+        assert seq.status == SequenceStatus.WAITING
+
+
 class TestPreemptStripsExactlyThePlaceholders:
     """`preempt()` and `postprocess()` have to agree on the placeholder width.
 
@@ -1961,6 +2016,168 @@ class TestPostprocess:
         seq = self._prefill(scheduler, seq_factory([1, 2, 3, 4]))
         scheduler.postprocess(list(scheduler.running), self._output(seq.id, [2]))
         assert scheduler.get_request_counts() == (0, 0)
+
+    @pytest.mark.parametrize("pp_size", [1, 4])
+    def test_producer_retains_blocks_until_send_finishes(self, seq_factory, pp_size):
+        # The claim lives on the connector, not on a producer branch here: the
+        # scheduler only asks `should_defer_free` and retires via `send_finished`.
+        sched = Scheduler(MockConfig(pipeline_parallel_size=pp_size))
+        seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
+        pending_send: set[str] = set()
+        sched.kv_connector = SimpleNamespace(
+            is_producer=True,
+            request_finished=lambda s: pending_send.add(str(s.id)),
+            should_defer_free=lambda s: str(s.id) in pending_send,
+            send_finished=lambda rid: pending_send.discard(str(rid)),
+        )
+        sched.postprocess([seq], self._output(seq.id, [2]))
+
+        assert seq.block_table
+        assert not sched.is_finished()
+        sched._update_from_kv_xfer_finished(
+            KVConnectorOutput(finished_sending={seq.id})
+        )
+        assert not seq.block_table
+        assert sched.is_finished()
+
+    @pytest.mark.parametrize("pp_size", [1, 4])
+    @pytest.mark.parametrize("streaming", [False, True])
+    @pytest.mark.parametrize(
+        "tokens,max_tokens,stop_sequences",
+        [
+            ([7], 100, []),
+            ([2, 7], 100, []),
+            ([7, 8], 1, []),
+            ([7, 8], 100, [[7]]),
+            ([9, 8], 100, []),
+        ],
+        ids=["abort", "eos", "max_tokens", "stop_sequence", "stop_token"],
+    )
+    def test_an_aborted_producer_request_gets_its_blocks_back(
+        self,
+        seq_factory,
+        pp_size,
+        streaming,
+        tokens,
+        max_tokens,
+        stop_sequences,
+    ):
+        """The claim is conditional on `leave_reason`, so it must be set first.
+
+        A backend declines to claim an abort because an abort never sends and
+        nothing would ever retire the claim. That guard only works if
+        `postprocess` has assigned `seq.leave_reason` by the time it calls
+        `request_finished` -- it used to assign it afterwards, so every aborted
+        request on a producer node was claimed and then parked forever.
+        """
+        sched = Scheduler(
+            MockConfig(pipeline_parallel_size=pp_size, stop_token_ids=[9])
+        )
+        seq = self._prefill(
+            sched,
+            seq_factory(
+                [1, 2, 3, 4],
+                sampling_params=SamplingParams(max_tokens=max_tokens),
+                stop_token_sequences=stop_sequences,
+            ),
+        )
+        pending_send: set[str] = set()
+        seen_reasons: list = []
+
+        def _finish(s):
+            seen_reasons.append(getattr(s, "leave_reason", None))
+            if getattr(s, "leave_reason", None) != "aborted":
+                pending_send.add(str(s.id))
+
+        sched.kv_connector = SimpleNamespace(
+            is_producer=True,
+            request_finished=_finish,
+            should_defer_free=lambda s: str(s.id) in pending_send,
+            send_finished=lambda rid: pending_send.discard(str(rid)),
+        )
+        seq.status = SequenceStatus.ABORTED
+
+        stream = mock.Mock() if streaming else None
+        finished = sched.postprocess([seq], self._output(seq.id, tokens), stream)
+
+        assert finished == [seq]
+        assert seen_reasons == ["aborted"], "exactly once, with the reason settled"
+        assert not pending_send
+        assert not seq.block_table
+        assert not sched.deferred_free_blocks
+        assert sched.is_finished()
+        # Cancellation now finishes before consuming sampled output; the
+        # engine delivers the terminal sequence through its output queue.
+        assert seq.num_tokens == seq.num_prompt_tokens
+        if streaming:
+            stream.put_nowait.assert_not_called()
+
+    def test_an_abort_retires_a_claim_the_backend_took_anyway(self, seq_factory):
+        """The scheduler does not depend on every backend re-deriving the guard.
+
+        Whether a send will be issued is the scheduler's knowledge; a backend
+        that claims unconditionally must not be able to strand the blocks.
+        """
+        sched = Scheduler(MockConfig())
+        seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
+        pending_send: set[str] = set()
+        sched.kv_connector = SimpleNamespace(
+            is_producer=True,
+            request_finished=lambda s: pending_send.add(str(s.id)),
+            should_defer_free=lambda s: str(s.id) in pending_send,
+            send_finished=lambda rid: pending_send.discard(str(rid)),
+        )
+        seq.status = SequenceStatus.ABORTED
+
+        sched.postprocess([seq], self._output(seq.id, [7]), mock.Mock())
+
+        assert not pending_send, "the scheduler retired the claim itself"
+        assert not seq.block_table
+        assert not sched.deferred_free_blocks
+
+    def test_the_release_tells_the_connector_its_blocks_are_back(self, seq_factory):
+        """`source_blocks_released`, not a second `request_finished`.
+
+        The offload schedulers key their save tracker on the *blocks*, so they
+        can only drop it at the release -- and the release must not re-arm the
+        P/D send claim that `request_finished` takes.
+        """
+        sched = Scheduler(MockConfig())
+        seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
+        saving = {str(seq.id)}
+        finished: list = []
+        released: list = []
+        sched.kv_connector = SimpleNamespace(
+            is_producer=False,
+            request_finished=finished.append,
+            should_defer_free=lambda s: str(s.id) in saving,
+            source_blocks_released=released.append,
+        )
+
+        sched.postprocess([seq], self._output(seq.id, [2]), mock.Mock())
+        assert finished == [seq] and released == []
+        assert seq.id in sched.deferred_free_blocks
+
+        saving.clear()
+        sched._maybe_release_deferred(seq)
+
+        assert released == [seq], "the terminal the deferred path never reached"
+        assert finished == [seq], "and not by finishing the request a second time"
+        assert not seq.block_table
+
+    def test_producer_without_a_send_claim_frees_immediately(self, seq_factory):
+        # No claim -> nothing defers it. The old producer branch parked it
+        # anyway, waiting for a send that was never issued.
+        sched = Scheduler(MockConfig())
+        seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
+        sched.kv_connector = SimpleNamespace(
+            is_producer=True, should_defer_free=lambda s: False
+        )
+        sched.postprocess([seq], self._output(seq.id, [2]))
+
+        assert not seq.block_table
+        assert not sched.deferred_free_blocks
+        assert sched.is_finished()
 
 
 # ── chunked-prefill finality ───────────────────────────────────────────────
@@ -2473,6 +2690,90 @@ class TestStalledOffloadSaveReclaim:
         # Notified with the string request id, matching the connector's sid keys.
         assert abandoned == ["1"]
 
+    def test_save_timeout_does_not_release_a_pending_producer_send(self, monkeypatch):
+        """Abandoning the save must not free a source the RDMA still reads.
+
+        The reclaimer drops offload's work, then re-asks the composite: an
+        unreported send keeps its claim, so the blocks stay put -- but the seq
+        stays stalled, so every later pass tries again. Giving up after the
+        first attempt (by clearing the stamp) is how a claim nobody would ever
+        answer -- an abort's above all -- lost its blocks for good.
+        """
+        import time as _time
+
+        seq = SimpleNamespace(id=1, _deferred_save_at=_time.monotonic() - 500.0)
+        pending_send = {"1"}
+        abandoned: list = []
+        connector = SimpleNamespace(
+            save_abandon_timeout_s=lambda: 100.0,
+            abandon_save=abandoned.append,
+            should_defer_free=lambda s: str(s.id) in pending_send,
+            send_finished=lambda rid: pending_send.discard(str(rid)),
+        )
+        s, freed = self._sched(monkeypatch, [seq], connector=connector)
+        assert s._reconcile_stalled_deferred_saves() == 0
+        assert not freed
+        assert seq.id in s.deferred_free_blocks
+        # Counted as abandoned though nothing was released, and still stamped so
+        # a later pass revisits it.
+        assert s._abandoned_saves == 1
+        assert abandoned == ["1"]
+        assert seq._deferred_save_at is not None
+
+        # A second pass retries the release without re-abandoning the save.
+        s._next_save_reconcile_at = 0.0
+        assert s._reconcile_stalled_deferred_saves() == 0
+        assert s._abandoned_saves == 1
+        assert abandoned == ["1"]
+
+        # Once the send reports, that retry is what collects the blocks.
+        connector.send_finished(1)
+        s._next_save_reconcile_at = 0.0
+        assert s._reconcile_stalled_deferred_saves() == 1
+        assert freed == [seq.id]
+        assert not s.deferred_free_blocks
+        assert seq._deferred_save_at is None
+
+    def test_a_claim_nobody_will_retire_is_escalated(self, monkeypatch, caplog):
+        """The retry is not an escape hatch on its own, so it must be visible.
+
+        Dropping the save no longer guarantees the release: `abandon_save` does
+        not clear an active load, and a send whose report is never coming keeps
+        its claim. The reclaimer then retries forever with nothing to show for
+        it -- the same wedge it exists to prevent, only silent. One ERROR after
+        `_RELEASE_WEDGE_ATTEMPTS` passes is what makes it diagnosable.
+        """
+        import logging
+        import time as _time
+
+        import atom.model_engine.scheduler as sched_mod
+
+        seq = SimpleNamespace(id=1, _deferred_save_at=_time.monotonic() - 500.0)
+        connector = SimpleNamespace(
+            save_abandon_timeout_s=lambda: 100.0,
+            abandon_save=lambda rid: None,
+            should_defer_free=lambda s: True,  # a claim that never clears
+        )
+        s, freed = self._sched(monkeypatch, [seq], connector=connector)
+
+        with caplog.at_level(logging.ERROR, logger=sched_mod.logger.name):
+            for _ in range(sched_mod._RELEASE_WEDGE_ATTEMPTS - 1):
+                s._next_save_reconcile_at = 0.0
+                s._reconcile_stalled_deferred_saves()
+            assert not caplog.records, "a merely slow send must not trip it"
+
+            s._next_save_reconcile_at = 0.0
+            s._reconcile_stalled_deferred_saves()
+            assert len(caplog.records) == 1
+            assert "[1]" in caplog.records[0].getMessage()
+
+            s._next_save_reconcile_at = 0.0
+            s._reconcile_stalled_deferred_saves()
+            assert len(caplog.records) == 1, "once per request, not once per pass"
+
+        assert not freed
+        assert s._abandoned_saves == 1, "the save is still only abandoned once"
+
     def test_it_self_throttles_so_a_1ms_poll_is_cheap(self, monkeypatch):
         import time as _time
 
@@ -2687,6 +2988,11 @@ def test_cancel_without_sampled_output_releases_state_and_pages(partial):
     scheduler.postprocess(list(seqs.values()), empty, batch=batch)
     assert seq.is_partial_prefill == partial
     assert seq.state_slot >= 0 and seq.block_table
+    scheduler.kv_connector = SimpleNamespace(
+        request_finished=mock.Mock(),
+        send_finished=mock.Mock(),
+        should_defer_free=lambda seq: False,
+    )
     seq.status = SequenceStatus.ABORTED
     # A completed middle chunk or deferred first decode carries no sampled
     # token for this request. It must still drive the normal finish/free path.
@@ -2697,3 +3003,5 @@ def test_cancel_without_sampled_output_releases_state_and_pages(partial):
     assert scheduler._partial_prefill_count == 0
     assert not scheduler.running
     assert scheduler.total_finished_requests == 1
+    scheduler.kv_connector.request_finished.assert_called_once_with(seq)
+    scheduler.kv_connector.send_finished.assert_called_once_with(seq.id)

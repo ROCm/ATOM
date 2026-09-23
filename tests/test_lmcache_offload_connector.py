@@ -87,8 +87,9 @@ from atom.kv_transfer.offload.metadata import (
     SlotSaveSpec,
 )
 from atom.model_engine.block_manager import BlockManager
-from atom.model_engine.scheduler import Scheduler
+from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import OffloadJointRecord, SequenceStatus
+from atom.sampling_params import SamplingParams
 
 if _torch_stub is not None and sys.modules.get("torch") is _torch_stub:
     # The torch-dependent atom imports above have bound their `torch` references,
@@ -120,7 +121,7 @@ class _OffloadMixinStub(OffloadSchedulerMixin):
     """Concrete `OffloadSchedulerMixin` for tests that exercise only frontier and
     completion mechanics, not a real save/load lifecycle.
 
-    The mixin now declares the six save/load methods abstract (a missing
+    The mixin now declares the seven save/load methods abstract (a missing
     forwarder is a construction-time TypeError, not a silent no-op behind the
     shell). Test doubles must therefore satisfy the contract; this base fills it
     with harmless defaults so the ABC constructs, and each local `_Connector`
@@ -133,6 +134,7 @@ class _OffloadMixinStub(OffloadSchedulerMixin):
     def save_finished(self, req_id) -> None: ...
     def abandon_save(self, req_id) -> None: ...
     def release_stalled_save(self, seq) -> None: ...
+    def source_blocks_released(self, seq) -> None: ...
     def load_failed(self, req_id) -> bool:
         return False
 
@@ -162,6 +164,7 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._active_load_operations = {}
     sched._save_inflight = {}
     sched._save_watermark_rollback = {}
+    sched._finished_save_progress_at = {}
     sched._lookup_in_step = []
     sched._handoff_loads = set()
     sched.hash_block_size = 4
@@ -3003,6 +3006,144 @@ def test_failed_page_save_rolls_the_watermark_back_and_re_emits():
     assert tail.save_spec.skip_leading_tokens == 8
 
 
+@pytest.mark.parametrize("late_completion", [False, True])
+def test_failed_page_retries_end_without_reclaiming_a_live_copy(
+    monkeypatch, seq_factory, late_completion
+):
+    import time
+
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    offload = _scheduler()
+    monkeypatch.setattr(offload, "save_abandon_timeout_s", lambda: 30.0)
+    engine = Scheduler(MockConfig())
+    seq = seq_factory(list(range(16)), sampling_params=SamplingParams(max_tokens=1))
+    engine.add(seq)
+    batch, _ = engine.schedule()
+    engine.kv_connector = offload
+    sid = str(seq.id)
+    offload._save_tracker[sid] = [seq, 0]
+    engine.postprocess(
+        [seq],
+        ScheduledBatchOutput(
+            req_ids=[seq.id],
+            token_ids=[(7,)],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+        ),
+        batch=batch,
+    )
+
+    def fail(operation):
+        engine._update_from_kv_xfer_finished(
+            KVConnectorOutput(
+                finished_saving={operation},
+                connector_completions={_page_completion(operation, succeeded=False)},
+            )
+        )
+
+    for elapsed in (1, 10, 20, 29):
+        now[0] = 1000.0 + elapsed
+        operation = offload.build_connector_meta().requests[0].save_operation
+        if elapsed != 29 or not late_completion:
+            fail(operation)
+        assert seq.block_table
+
+    now[0] = 1031.0
+    assert (
+        not offload.build_connector_meta().requests
+    ), "retries must stop without progress"
+    # The most recent copy still has its full retention window.
+    assert engine._reconcile_stalled_deferred_saves() == 0
+    assert seq.block_table
+    if late_completion:
+        assert offload.should_defer_free(seq)
+        fail(operation)
+    else:
+        # A quiet idle poll eventually reclaims the undispatched retry too.
+        now[0] = 1060.0
+        assert engine._reconcile_stalled_deferred_saves() == 1
+
+    assert not seq.block_table
+    assert not offload._save_tracker
+    assert not offload._finished_save_progress_at
+    assert not offload.has_pending_work()
+    assert engine.is_finished()
+
+
+def test_successful_page_save_refreshes_finished_request_progress(monkeypatch):
+    import time
+
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    sched = _scheduler()
+    monkeypatch.setattr(sched, "save_abandon_timeout_s", lambda: 30.0)
+    seq = SimpleNamespace(
+        id=732,
+        token_ids=list(range(16)),
+        block_table=[1, 2, 3, 4],
+        num_prompt_tokens=16,
+        num_cached_tokens=8,
+    )
+    sched._save_tracker["732"] = [seq, 0]
+    first = sched.build_connector_meta().requests[0]
+    seq.num_cached_tokens = 16
+    sched.request_finished(seq)
+    now[0] = 1029.0
+    sched.process_completions(
+        KVConnectorOutput(
+            finished_saving={first.save_operation},
+            connector_completions={
+                _page_completion(first.save_operation, succeeded=True)
+            },
+        )
+    )
+
+    now[0] = 1031.0
+    suffix = sched.build_connector_meta().requests[0]
+    assert suffix.save_spec.skip_leading_tokens == 8
+    sched.process_completions(
+        KVConnectorOutput(
+            finished_saving={suffix.save_operation},
+            connector_completions={
+                _page_completion(suffix.save_operation, succeeded=True)
+            },
+        )
+    )
+    assert not sched.should_defer_free(seq)
+    sched.source_blocks_released(seq)
+    assert not sched._finished_save_progress_at
+
+
+def test_retry_expiry_keeps_inflight_sidecar_owned(monkeypatch):
+    import time
+
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    sched = _stateful_scheduler(hit=0)
+    monkeypatch.setattr(sched, "save_abandon_timeout_s", lambda: 30.0)
+    seq = _stateful_seq(
+        req_id=733, num_prompt_tokens=8192, num_cached_tokens=8192, group=2
+    )
+    sched._save_tracker["733"] = [seq, 0]
+    req = sched.build_connector_meta().requests[0]
+    sched.request_finished(seq)
+    now[0] = 1031.0
+    sched.process_completions(
+        KVConnectorOutput(
+            finished_saving={req.save_operation},
+            connector_completions={
+                _page_completion(req.save_operation, succeeded=False)
+            },
+        )
+    )
+    assert sched.should_defer_free(seq), "the sidecar still reads source blocks"
+    assert not sched.build_connector_meta().requests
+    sched.sidecar_save_failed(req.save_operation)
+    assert not sched.should_defer_free(seq)
+
+
 def test_page_watermark_records_do_not_outlive_their_request():
     """Records are keyed by operation, so they must be dropped with the request."""
     sched = _scheduler()
@@ -3028,6 +3169,64 @@ def test_page_watermark_records_do_not_outlive_their_request():
     sched._save_inflight.clear()
     sched.request_finished(seq)
     assert sched._save_watermark_rollback == {}
+
+
+def test_a_deferred_request_is_forgotten_when_its_blocks_come_back():
+    """`request_finished` cannot be the terminal for a request that defers.
+
+    It runs while `should_defer_free` is still True -- the save is the reason
+    the blocks are held -- so the tracker, which holds the `Sequence` and is
+    what the save loop iterates, has to survive it. `save_finished` clears only
+    `_save_inflight`, and `abandon_save` / `release_stalled_save` are failure
+    exits, so nothing else ever drops it: the scheduler saying the blocks are
+    back is the only remaining terminal. Miss it and every completed request
+    leaks its tracker entry, and one whose watermark was rolled back keeps
+    re-emitting saves against a freed, reusable block table.
+    """
+    sched = _scheduler()
+    seq = SimpleNamespace(
+        id=740,
+        token_ids=list(range(16)),
+        block_table=[1, 2, 3, 4],
+        num_prompt_tokens=16,
+        num_cached_tokens=8,
+        has_per_req_cache=False,
+    )
+    sched._save_tracker["740"] = [seq, 0]
+    sched._failed_sidecar_saves["740"] = {(8, 0xABC)}
+    sched.build_connector_meta()
+    assert sched._save_inflight["740"] and sched._save_watermark_rollback["740"]
+
+    sched.request_finished(seq)
+    assert sched.should_defer_free(seq) is True
+    assert sched._save_tracker["740"][0] is seq, "the save still reads these blocks"
+
+    # The save reports; nothing is deferring the free any more.
+    sched._save_inflight.clear()
+    assert sched.should_defer_free(seq) is False
+    assert "740" in sched._save_tracker, "completion alone does not retire it"
+
+    sched.source_blocks_released(seq)
+
+    assert sched._save_tracker == {}
+    assert sched._failed_sidecar_saves == {}
+    assert sched._save_watermark_rollback == {}
+
+
+def test_a_released_request_does_not_take_a_successors_tracker_entry():
+    """Identity-guarded, like every other terminal here.
+
+    A recycled request id whose new lifecycle has already registered must not
+    lose its entry to the previous one's release.
+    """
+    sched = _scheduler()
+    old = SimpleNamespace(id=741)
+    new = SimpleNamespace(id=741)
+    sched._save_tracker["741"] = [new, 0]
+
+    sched.source_blocks_released(old)
+
+    assert sched._save_tracker["741"][0] is new
 
 
 def test_worker_reports_a_page_verdict_on_every_terminal_path():
@@ -3385,6 +3584,7 @@ def test_aborted_parked_load_defers_owned_resources_until_terminal(
         value.state_slot = -1
 
     host = Scheduler.__new__(Scheduler)
+    host._inflight_prefix_wait = {}
     host.kv_connector = _Connector()
     host.block_manager = SimpleNamespace(deallocate=deallocate)
     host.deferred_free_blocks = {}
@@ -3451,6 +3651,7 @@ def test_aborted_parked_load_consumes_already_queued_terminal(queued_field):
         value.state_slot = -1
 
     host = Scheduler.__new__(Scheduler)
+    host._inflight_prefix_wait = {}
     host.kv_connector = _Connector()
     host.block_manager = SimpleNamespace(deallocate=deallocate)
     host.deferred_free_blocks = {}
@@ -3524,6 +3725,7 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
         value.state_slot = -1
 
     host = Scheduler.__new__(Scheduler)
+    host._inflight_prefix_wait = {}
     host.kv_connector = _Connector()
     host.block_manager = SimpleNamespace(
         kv_events_enabled=False,
@@ -4683,7 +4885,10 @@ def test_pending_work_tracks_undispatched_loads_and_unreported_saves():
     assert sched.has_pending_work() is False
 
 
-def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight():
+@pytest.mark.parametrize("send_first", [False, True])
+def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight(
+    send_first,
+):
     sched = _scheduler()
     seq = SimpleNamespace(
         id=10,
@@ -4708,13 +4913,90 @@ def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight():
     meta2 = sched.build_connector_meta()
     assert len(meta2.requests) == 0
 
-    sched.save_finished(meta1.requests[0].save_operation)
+    # The producer finishes with one save in flight and a suffix not yet issued.
+    # The `multi=[mooncake, lmcache_offload]` composite ORs the send's claim
+    # with offload's, so either one alone keeps the source alive.
+    pending_send = {str(seq.id)}
+    freed = []
+    engine_sched = Scheduler.__new__(Scheduler)
+    engine_sched.deferred_free_blocks = {seq.id: seq}
+    engine_sched.block_manager = SimpleNamespace(deallocate=freed.append)
+    engine_sched.kv_connector = SimpleNamespace(
+        is_producer=True,
+        is_offload=True,
+        process_completions=sched.process_completions,
+        should_defer_free=lambda s: (
+            str(s.id) in pending_send or sched.should_defer_free(s)
+        ),
+        send_finished=lambda rid: pending_send.discard(str(rid)),
+    )
+    report = engine_sched._update_from_kv_xfer_finished
+    if send_first:
+        report(KVConnectorOutput(finished_sending={seq.id}))
+        assert not freed
+
+    first_save = meta1.requests[0].save_operation
+    report(KVConnectorOutput(finished_saving={first_save}))
+    assert str(seq.id) not in sched._save_inflight
+    assert not freed  # The undispatched suffix still owns the source blocks.
     meta3 = sched.build_connector_meta()
 
     assert len(meta3.requests) == 1
     assert len(meta3.requests[0].token_ids) == 12
     assert meta3.requests[0].save_spec.skip_leading_tokens == 8
     assert meta3.requests[0].is_last_prefill is True
+
+    report(KVConnectorOutput(finished_saving={first_save}))  # Stale generation.
+    assert not freed
+    report(KVConnectorOutput(finished_saving={meta3.requests[0].save_operation}))
+    if not send_first:
+        assert not freed  # All saves finished, but the send still owns blocks.
+        report(KVConnectorOutput(finished_sending={seq.id}))
+    assert freed == [seq]
+    assert not engine_sched.deferred_free_blocks
+
+
+def test_each_dispatched_save_gets_a_full_source_retention_window():
+    """A deferred request dispatches its chunks serially, so the retention
+    clock cannot be stamped once at park time.
+
+    `_reconcile_stalled_deferred_saves` abandons a save older than
+    `save_abandon_timeout_s()`. One stamp used to be enough (one save per
+    finished request); now generation k+1 would inherit the remains of
+    generation 1's window -- and `abandon_save` cannot cancel the worker's
+    running `store()`, so its source would be freed mid-copy.
+    """
+    import time as _time
+
+    sched = _scheduler()
+    seq = SimpleNamespace(
+        id=11,
+        token_ids=list(range(12)),
+        block_table=[3, 4, 5],
+        num_prompt_tokens=12,
+        num_cached_tokens=8,
+        is_partial_prefill=True,
+    )
+    sched._save_tracker[str(seq.id)] = [seq, 0]
+
+    first = sched.build_connector_meta().requests[0]
+    # The request finishes and is parked; the scheduler stamps the clock.
+    parked_at = _time.monotonic() - 1000.0
+    seq._deferred_save_at = parked_at
+    seq.num_cached_tokens = 12
+    seq.is_partial_prefill = False
+
+    sched.save_finished(first.save_operation)
+    suffix = sched.build_connector_meta().requests[0]
+
+    assert suffix.save_spec.skip_leading_tokens == 8, "this is a later generation"
+    assert (
+        seq._deferred_save_at > parked_at
+    ), "the suffix save needs its own window, or the reclaimer frees it mid-copy"
+
+    # A request still in `running` has no clock; arming one here would hand the
+    # reclaimer a sequence it must not touch.
+    sched._refresh_save_reclaim_clock(SimpleNamespace(id=12))
 
 
 def test_finished_saving_releases_deferred_free_with_string_req_id():
@@ -4748,6 +5030,40 @@ def test_finished_saving_releases_deferred_free_with_string_req_id():
 
     assert sched.block_manager.deallocated == [9]
     assert sched.deferred_free_blocks == {}
+
+
+@pytest.mark.parametrize("send_first", [False, True])
+def test_producer_waits_for_send_and_final_save(send_first):
+    class Connector(_OffloadMixinStub):
+        is_producer = True
+        is_offload = True
+        pending_save = True  # Also represents a final save not yet dispatched.
+        pending_send = True
+
+        def save_finished(self, req_id):
+            self.pending_save = False
+
+        def send_finished(self, req_id):
+            self.pending_send = False
+
+        def should_defer_free(self, seq):
+            return self.pending_save or self.pending_send
+
+    host = Scheduler.__new__(Scheduler)
+    host.kv_connector = Connector()
+    freed = []
+    host.block_manager = SimpleNamespace(deallocate=lambda seq: freed.append(seq.id))
+    seq = SimpleNamespace(id=9)
+    host.deferred_free_blocks = {9: seq}
+    send = KVConnectorOutput(finished_sending={9})
+    save = KVConnectorOutput(finished_saving={"9"})
+    first, last = (send, save) if send_first else (save, send)
+    host._update_from_kv_xfer_finished(first)
+    assert freed == []
+    assert host.deferred_free_blocks == {9: seq}
+    host._update_from_kv_xfer_finished(last)
+    assert freed == [9]
+    assert host.deferred_free_blocks == {}
 
 
 def test_finished_recv_matches_string_req_id():
@@ -5981,6 +6297,9 @@ def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
         # alias-aware sweep above sees it, so anchor it so a regression to a
         # `self.kv_connector`-only scan fails here loudly.
         "max_pending_saves",
+        # Without this read the send's claim never clears and a producer's
+        # blocks are parked forever.
+        "send_finished",
     }
     lost = sorted(must_be_seen - probed)
     assert not lost, (
@@ -6002,6 +6321,8 @@ def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
     # listed here. Anything ELSE the composite fails to expose is NOT routed and
     # lands as a failure below, forcing a deliberate decision rather than a
     # silent default; add it here only with the routing that covers it.
+    # Retention hooks are mandatory on both shells. Offload's send_finished
+    # explicitly does nothing, since it has no P/D send claim to retire.
     multi_routes_via_sub: set[str] = {"max_pending_saves"}
     for shell in (LMCacheOffloadConnectorScheduler, MultiConnectorScheduler):
         allow = multi_routes_via_sub if shell is MultiConnectorScheduler else set()
@@ -6198,7 +6519,7 @@ def test_offload_mixin_lifecycle_is_enforced_at_construction():
     """The abstract lifecycle contract is enforcement, not documentation.
 
     `OffloadSchedulerMixin` inherits `ABC`, so ABCMeta refuses to instantiate a
-    subclass that leaves any of the six save/load methods unimplemented. This is
+    subclass that leaves any of the seven save/load methods unimplemented. This is
     the mechanism that turns a missing forwarder into a construction-time
     TypeError instead of a silent no-op behind the delegating shell -- the
     failure mode that let DSV4 ship without `abandon_save`. (On a *plain* class
@@ -6211,6 +6532,8 @@ def test_offload_mixin_lifecycle_is_enforced_at_construction():
         def save_finished(self, req_id): ...
 
         def release_stalled_save(self, seq): ...
+
+        def source_blocks_released(self, seq): ...
 
         def load_failed(self, req_id):
             return False

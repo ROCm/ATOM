@@ -19,7 +19,7 @@ DRY_RUN=0
 JOB_ID=""
 SLURM_JOB_ACTIVE=0
 SCANCEL_SENT=0
-declare -A SPUR_SHARED_LOG_LINES=()
+declare -A SPUR_SHARED_LOG_OFFSETS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -367,23 +367,27 @@ fi
 stream_spur_shared_logs_once() {
   local job_id="$1"
   local run_dir="${LOG_ROOT}/slurm_job-${job_id}"
-  local log_file rel_path current_line
+  local log_file rel_path current_offset
 
   [[ -d "${run_dir}" ]] || return 0
 
   shopt -s nullglob
-  for log_file in \
-    "${run_dir}"/rank-*/container*.log \
-    "${run_dir}"/logs/*.log \
-    "${run_dir}"/logs/*/*.log; do
+  # Container logs already include the server/router output via tee. Reading
+  # logs/ as well would print the same messages twice.
+  for log_file in "${run_dir}"/rank-*/container*.log; do
     rel_path="${log_file#"${run_dir}/"}"
-    current_line="${SPUR_SHARED_LOG_LINES[${log_file}]:-0}"
-    SPUR_SHARED_LOG_LINES["${log_file}"]="$(stream_file_lines "${log_file}" "[spur:${rel_path}] " "${current_line}")"
+    current_offset="${SPUR_SHARED_LOG_OFFSETS[${log_file}]:-0}"
+    SPUR_SHARED_LOG_OFFSETS["${log_file}"]="$(
+      python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_stream_log.py" \
+        "${log_file}" "${current_offset}" "[spur:${rel_path}] "
+    )"
   done
   shopt -u nullglob
 }
 
-if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+# Every Spur worker writes container output to shared storage, regardless of
+# runner label. Stream it from the submitter rather than through Spur RPCs.
+if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
   SLURM_EXTRA_LOG_STREAMER=stream_spur_shared_logs_once
 fi
 install_slurm_cancel_traps

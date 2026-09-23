@@ -629,9 +629,11 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         can issue a fresh save for a deferred request, and releasing it in the
         same step would free the blocks that save is about to read.
 
-        The final `request_finished` is what pops ATOM's save tracker, which is
-        in turn what stops the save loop from ever emitting a save against
-        blocks vLLM is about to reassign.
+        `source_blocks_released` is what pops ATOM's save tracker, which is in
+        turn what stops the save loop from ever emitting a save against blocks
+        vLLM is about to reassign. Not `request_finished` a second time: that
+        one also takes the P/D send claim, and the two calls are the same split
+        the native `Scheduler._maybe_release_deferred` makes.
         """
         if not self._deferred_frees:
             return []
@@ -641,7 +643,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
             if seq is not None:
                 if self._scheduler.should_defer_free(seq):
                     continue
-                self._scheduler.request_finished(seq)
+                self._scheduler.source_blocks_released(seq)
             self._seqs.drop(req_id)
             released.append(req_id)
         self._deferred_frees.difference_update(released)

@@ -1,80 +1,12 @@
 # SPDX-License-Identifier: MIT
-"""Group32 GEMMs against native FP8 or packed FP4 weights.
+"""Group32 W4A8 GEMM against packed FP4 weights.
 
-Both take E4M3 activations with E8M0 group scales, accumulate in FP32, and
-index the weight scale grid rather than expanding it. Two kernels rather
-than one: FP8 hands its codes to the microscaling MFMA and spans several
-scale groups per tile, FP4 has to unpack and scale a single group by hand,
-and folding both into one body duplicated the pointer bookkeeping.
+E4M3 activations and E2M1 weights use E8M0 row/group scales. The kernel
+unpacks one group at a time through BF16 MFMA and accumulates in FP32.
 """
 
 import triton
 import triton.language as tl
-
-
-@triton.jit(do_not_specialize=["M"])
-def blockscale_gemm_fp8_kernel(
-    A,
-    B,
-    AS,
-    BS,
-    C,
-    # Runtime, not constexpr: M is the token count, and specializing on it
-    # recompiles the kernel for every prefill chunk length.
-    M,
-    N: tl.constexpr,
-    K: tl.constexpr,
-    B_GROUP_N: tl.constexpr,
-    PART_K: tl.constexpr,
-    BM: tl.constexpr,
-    BN: tl.constexpr,
-    BK: tl.constexpr,
-):
-    """E4M3 x E4M3 with E8M0 group scales, on the CDNA4 microscaling MFMA.
-
-    A tile spans BK/32 scale groups. Below BK 64 Triton lowers dot_scaled to a
-    BF16 emulation instead, which is several times slower.
-    """
-    tl.static_assert(BK >= 64 and BK % 32 == 0)
-    row = tl.program_id(0) * BM + tl.arange(0, BM)
-    col = tl.program_id(1) * BN + tl.arange(0, BN)
-    split = tl.program_id(2)
-    groups: tl.constexpr = K // 32
-    ks = tl.arange(0, BK)
-    gs = tl.arange(0, BK // 32)
-    rows = row[:, None] < M
-    cols = col < N
-    # One scale row per B_GROUP_N output columns, so the column index is
-    # divided rather than the grid expanded.
-    bs_row = (col[:, None] // B_GROUP_N) * groups
-
-    acc = tl.zeros((BM, BN), tl.float32)
-    start = split * PART_K
-    for base in range(start, tl.minimum(start + PART_K, K), BK):
-        offs = base + ks
-        span = base // 32 + gs
-        live = offs < K
-        held = span < groups
-        a = tl.load(
-            A + row[:, None] * K + offs[None, :], rows & live[None, :], other=0.0
-        )
-        b = tl.load(
-            B + col[:, None] * K + offs[None, :],
-            cols[:, None] & live[None, :],
-            other=0.0,
-        )
-        a_code = tl.load(
-            AS + row[:, None] * groups + span[None, :], rows & held[None, :], other=127
-        )
-        b_code = tl.load(
-            BS + bs_row + span[None, :], cols[:, None] & held[None, :], other=127
-        )
-        # acc= leaves the sum in the matrix core's registers: one rounding per
-        # tile instead of two, and no separate vector add.
-        acc = tl.dot_scaled(a, a_code, "e4m3", b.T, b_code, "e4m3", acc=acc)
-    tl.store(
-        C + split * M * N + row[:, None] * N + col[None, :], acc, rows & cols[None, :]
-    )
 
 
 @triton.jit

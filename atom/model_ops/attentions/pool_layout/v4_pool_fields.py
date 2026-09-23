@@ -38,6 +38,16 @@ MQA_LOGITS_PRESHUFFLE_ROWS = 16
 CSA_INDEXER_DATA = "csa_indexer_data"
 CSA_INDEXER_SCALE = "csa_indexer_scale"
 
+FP4_GFX950_PRESHUFFLE = "fp4-gfx950-preshuffle"
+FP4_GFX1250_NATURAL = "fp4-gfx1250-natural"
+
+
+def fp4_indexer_layout_for_arch(arch: str) -> str:
+    """Return the on-wire FP4 indexer layout for a GPU architecture."""
+    if arch == "gfx1250":
+        return FP4_GFX1250_NATURAL
+    return FP4_GFX950_PRESHUFFLE
+
 
 def main_kv_plane_fields(
     head_dim: int,
@@ -74,14 +84,30 @@ def fp8_indexer_block_fields(
     ]
 
 
-def fp4_indexer_block_fields(rows: int, index_head_dim: int) -> list[EntryField]:
+def fp4_indexer_block_fields(
+    rows: int,
+    index_head_dim: int,
+    layout: str = FP4_GFX950_PRESHUFFLE,
+) -> list[EntryField]:
     """Packed E2M1 plus one e8m0 byte per group of 32, one layer's block.
 
-    The `pa_mqa_logits_fp4` preshuffle layout, which is why the group axes sit
-    outside the row axis. One pool per region here, so a region's shape is a
-    pool's shape after the layer and block axes.
+    gfx950 keeps the legacy `pa_mqa_logits_fp4` preshuffle. gfx1250 OPUS reads
+    natural rows: 64 packed E2M1 bytes and four E8M0 bytes for D=128. One pool
+    per region here, so a region's shape is a pool's shape after the layer and
+    block axes.
     """
+    if index_head_dim % 128 != 0:
+        raise ValueError(
+            f"FP4 index_head_dim must be a multiple of 128, got {index_head_dim}"
+        )
     k_tiles = index_head_dim // 128
+    if layout == FP4_GFX1250_NATURAL:
+        return [
+            EntryField(CSA_INDEXER_DATA, 1, (rows, index_head_dim // 2), torch.uint8),
+            EntryField(CSA_INDEXER_SCALE, 1, (rows, index_head_dim // 32), torch.uint8),
+        ]
+    if layout != FP4_GFX950_PRESHUFFLE:
+        raise ValueError(f"unknown FP4 indexer layout {layout!r}")
     return [
         EntryField(CSA_INDEXER_DATA, 1, (k_tiles, 4, rows, 16), torch.uint8),
         EntryField(CSA_INDEXER_SCALE, 1, (k_tiles, 4, rows), torch.uint8),

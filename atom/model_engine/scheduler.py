@@ -26,6 +26,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -49,6 +50,9 @@ from atom.model_engine.state_runtime import (
 )
 from atom.utils import envs
 
+if TYPE_CHECKING:
+    from atom.model_engine.prefill_delayer import PrefillDelayer
+
 logger = logging.getLogger("atom")
 
 
@@ -56,6 +60,14 @@ logger = logging.getLogger("atom")
 # engine polls KV progress every millisecond (KV_IDLE_DRAIN_INTERVAL_S), so the
 # reconciler no-ops until this interval has passed.
 _SAVE_RECONCILE_INTERVAL_S = 5.0
+
+# Release attempts a deferred request may fail after its save was abandoned
+# before `_reconcile_stalled_deferred_saves` calls it wedged. The reclaimer
+# retries rather than force-freeing (a claimed source may be under a live RDMA
+# read), so a claim nobody will ever retire no longer has a way out -- it has
+# to be visible instead. Deliberately well past the abandon timeout: a P/D send
+# that is merely slow must not trip it.
+_RELEASE_WEDGE_ATTEMPTS = 12
 
 # Memoised result of `_offload_max_pending_saves`, a process constant likewise.
 _MAX_PENDING_OFFLOAD: int | None = None
@@ -543,6 +555,11 @@ class Scheduler:
         # Reclamation bookkeeping for offload saves whose completion is never
         # reported (see `_reconcile_stalled_deferred_saves`).
         self._abandoned_saves: int = 0
+        # Set by the PP head: a lost stage report leaves a partial quorum in
+        # its `PPKVAggregator`, which the scheduler owns no handle on. A direct
+        # callback rather than a buffer -- under `pp_size == 1` nobody sets it,
+        # and an unread buffer is its own slow leak.
+        self.on_save_abandoned = None
         self._next_save_reconcile_at: float = 0.0
 
         # Scheduling delay for batching efficiency
@@ -685,14 +702,172 @@ class Scheduler:
                 endpoint="",
             )
 
-        # Cross-DP prefill alignment. Set by DPEngineCoreProc after
-        # dp_group is available. See `prefill_delayer.py` for rationale.
-        from atom.model_engine.prefill_delayer import PrefillDelayer
-
+        # Set by EngineCore for cross-DP alignment or opt-in TP decode protection.
         self.prefill_delayer: PrefillDelayer | None = None
+        self._local_prefill_coalescing = False
+        self._inflight_prefix_wait: dict[int, int] = {}
 
-    def set_prefill_delayer(self, delayer) -> None:
+    def set_prefill_delayer(self, delayer: PrefillDelayer | None) -> None:
         self.prefill_delayer = delayer
+        self._local_prefill_coalescing = delayer is not None and delayer.is_local
+        self._inflight_prefix_wait = {}
+
+    def _wait_for_inflight_prefix(self, seq: Sequence, cached_tokens: int) -> bool:
+        """Bounded wait for a hybrid producer's planned prompt-end checkpoint."""
+        bm = self.block_manager
+        delayer = self.prefill_delayer
+        if (
+            not bm.enable_prefix_caching
+            or not bm.state.enabled
+            or bm.state_checkpoint_interval_tokens == 0
+            or not seq.has_per_req_cache
+            or seq.multimodal_data is not None
+        ):
+            return False
+        deadline = self._inflight_prefix_wait.get(seq.id)
+        if deadline is not None and self._schedule_tick >= deadline:
+            return False
+        for producer in self.running:
+            anchor = producer.checkpoint_end_pos
+            if (
+                producer.status != SequenceStatus.RUNNING
+                or producer.num_cached_tokens >= anchor
+                or anchor - cached_tokens < self.max_num_batched_tokens
+                or anchor >= seq.num_prompt_tokens
+                or producer.multimodal_data is not None
+                or producer.cache_seed != seq.cache_seed
+            ):
+                continue
+            keepers = bm.checkpointers_at(
+                producer,
+                anchor,
+                # A fork needs room both to preserve the producer's state and
+                # to restore it in the consumer's first forward.
+                min(producer.num_prompt_tokens - anchor, seq.num_tokens - anchor),
+            )
+            if not keepers or any(
+                cache.applies(seq) and cache not in keepers for cache in bm.state_caches
+            ):
+                continue
+            # Reject divergent heads cheaply; equal long buffers stay in NumPy.
+            head = min(anchor, 64)
+            if (
+                memoryview(seq.token_ids)[:head]
+                != memoryview(producer.token_ids)[:head]
+            ):
+                continue
+            if np.array_equal(
+                np.frombuffer(seq.token_ids, dtype=np.int32, count=anchor),
+                np.frombuffer(producer.token_ids, dtype=np.int32, count=anchor),
+            ):
+                self._inflight_prefix_wait.setdefault(
+                    seq.id, self._schedule_tick + delayer.ttft_max_ticks
+                )
+                return True
+        return False
+
+    def _waiting_prefills(self):
+        for seq in self.waiting:
+            if (
+                seq.status
+                not in (SequenceStatus.ABORTED, SequenceStatus.WAITING_FOR_REMOTE_KVS)
+                and self._unschedulable_reason(seq) is None
+            ):
+                yield seq
+
+    def _local_prefill_pending_work(self) -> tuple[bool, int]:
+        """Count probed work; a bounded scan never invents fill for unseen work."""
+        budget = self.max_num_batched_tokens
+        pending = 0
+        if self._partial_prefill_count:
+            for seq in self.running:
+                if not seq.is_partial_prefill:
+                    continue
+                chunk = self._partial_prefill_chunk(seq, pending)
+                if not chunk:
+                    break
+                chunk = self._preview_prefill_chunk(seq, seq.num_cached_tokens, chunk)
+                pending += chunk
+                if pending >= budget:
+                    break
+        prefillable = pending > 0
+        if pending >= budget or len(self.running) >= self.max_num_seqs:
+            return prefillable, min(pending, budget)
+        probed_tokens = 0
+        slots = self.max_num_seqs - len(self.running)
+        for seq in self._waiting_prefills():
+            offload_resume = self._is_offload_prefill_resume(seq)
+            if offload_resume:
+                cached = self._offload_prefill_start(seq)
+            else:
+                if probed_tokens >= budget:
+                    break
+                cached_blocks = self.block_manager.can_allocate(
+                    seq, record=False, reuse_hashes=True
+                )
+                probed_tokens += seq.num_tokens
+                if cached_blocks < 0:
+                    break  # Phase 2 also stops at the first allocation refusal.
+                if slots <= self._num_parked_remote_kv:
+                    # A connector query can pin remote KV, so leave it to
+                    # admission. Do not count uncertain remote-slot fit as
+                    # fill or mistake an individually fitting request for idle.
+                    prefillable = True
+                    break
+                cached = cached_blocks * self.block_manager.hash_block_size
+            remaining = (
+                seq.num_tokens - cached
+                if offload_resume
+                else self._new_prefill_tokens(seq, cached)
+            )
+            chunk = self._prefill_chunk_for_budget(remaining, budget - pending, pending)
+            if chunk is None or (
+                self._requires_atomic_prefill(seq) and chunk < remaining
+            ):
+                break
+            chunk = self._preview_prefill_chunk(seq, cached, chunk)
+            prefillable = True
+            pending += chunk
+            slots -= 1
+            if pending >= budget:
+                return True, budget
+            if slots == 0:
+                break
+        return prefillable, pending
+
+    def _offload_prefill_start(self, seq: Sequence) -> int:
+        if seq.num_cached_tokens < seq.num_tokens:
+            return seq.num_cached_tokens
+        hbs = self.block_manager.hash_block_size
+        return max(0, (seq.num_tokens - 1) // hbs * hbs)
+
+    def _new_prefill_tokens(self, seq: Sequence, cached_tokens: int) -> int:
+        remaining = seq.num_tokens - cached_tokens
+        if (
+            not self._requires_atomic_prefill(seq)
+            and self.enable_chunked_prefill
+            and 0 < self.long_prefill_token_threshold < remaining
+        ):
+            remaining = self.long_prefill_token_threshold
+        return remaining
+
+    def _partial_prefill_chunk(self, seq: Sequence, batched_tokens: int) -> int:
+        remaining = seq.num_tokens - seq.num_cached_tokens
+        if 0 < self.long_prefill_token_threshold < remaining:
+            remaining = self.long_prefill_token_threshold
+        return self._chunked_prefill_size(
+            remaining, self.max_num_batched_tokens - batched_tokens, batched_tokens
+        )
+
+    def _preview_prefill_chunk(self, seq: Sequence, start: int, chunk: int) -> int:
+        # Estimation must not cancel a state fork. Only the actual admission
+        # finalizes that decision after the delayer releases the batch.
+        if self._requires_atomic_prefill(seq):
+            return chunk
+        target = self.block_manager.checkpoint_cut(
+            seq, start, start + chunk, record=False
+        )
+        return target - start if target else chunk
 
     def _can_admit_head_prefill(self) -> bool:
         """Match SGL's `local_prefillable=True` semantics: report True iff
@@ -719,7 +894,10 @@ class Scheduler:
                 break
             if self._unschedulable_reason(seq) is not None:
                 continue
-            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+            if seq.status in (
+                SequenceStatus.ABORTED,
+                SequenceStatus.WAITING_FOR_REMOTE_KVS,
+            ):
                 continue
             num_new_tokens = seq.num_tokens - seq.num_cached_tokens
             if (
@@ -790,8 +968,8 @@ class Scheduler:
         early-exits the scan: one batch's worth is all the coalescer compares
         against, so there's no point summing a deep queue.
 
-        Skips the same non-admittable seqs as `_can_admit_head_prefill` —
-        unschedulable, WAITING_FOR_REMOTE_KVS, and oversized-when-chunking-off —
+        Skips unschedulable, ABORTED, WAITING_FOR_REMOTE_KVS, and
+        oversized-when-chunking-off sequences —
         so the "queued work" signal counts only tokens this rank could actually
         prefill this step. Counting remote-KV / unschedulable tokens here would
         inflate the cross-rank aggregate and reach the fill target before a real
@@ -804,7 +982,10 @@ class Scheduler:
         for seq in self.waiting:
             if self._unschedulable_reason(seq) is not None:
                 continue
-            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+            if seq.status in (
+                SequenceStatus.ABORTED,
+                SequenceStatus.WAITING_FOR_REMOTE_KVS,
+            ):
                 continue
             num_new_tokens = seq.num_tokens - seq.num_cached_tokens
             if (
@@ -855,18 +1036,19 @@ class Scheduler:
         """Age in ms (since arrival) of the oldest ADMITTABLE waiting prefill,
         or 0.0 if none.
 
-        Feeds PrefillDelayer's TTFT SLA guard: if this exceeds max_queue_ms the
-        coalescer force-releases so a request never starves in the queue. Uses
-        `seq.arrive_time` (wall-clock seconds, stamped at engine entry) — the
-        true end-to-end wait, including backlog and coalescer holds. Skips the
-        same non-admittable seqs as `_can_admit_head_prefill` (unschedulable,
-        WAITING_FOR_REMOTE_KVS) so a permanently-stuck seq can't peg the guard.
+        After decode protection, max_queue_ms releases extra coalescing based
+        on time since arrival, including backlog. This does not bound resource
+        or checkpoint waits. ABORTED, remote-loading and statically rejected
+        requests do not contribute.
         """
         oldest_arrive = None
         for seq in self.waiting:
             if self._unschedulable_reason(seq) is not None:
                 continue
-            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+            if seq.status in (
+                SequenceStatus.ABORTED,
+                SequenceStatus.WAITING_FOR_REMOTE_KVS,
+            ):
                 continue
             if oldest_arrive is None or seq.arrive_time < oldest_arrive:
                 oldest_arrive = seq.arrive_time
@@ -983,7 +1165,44 @@ class Scheduler:
         if callable(callback):
             callback(str(seq.id))
 
+    def _connector_send_finished(self, req_id) -> None:
+        """Drop the connector's send claim on a request's source blocks.
+
+        The mutator half of `should_defer_free` for the send leg, as
+        `_connector_abandon_save` is for the save leg. Guarded: only a producer
+        connector tracks sends.
+        """
+        callback = getattr(self.kv_connector, "send_finished", None)
+        if callable(callback):
+            callback(req_id)
+
+    def _connector_source_blocks_released(self, seq: Sequence) -> None:
+        """Tell the connector its source blocks are back in the pool.
+
+        The terminal half of `request_finished` for a connector that deferred
+        the free. Not `request_finished` a second time: that one also takes the
+        P/D send claim, so re-invoking it would re-arm the claim this release
+        just cleared. The base requires an explicit implementation; the guard
+        also supports an absent connector and minimal scheduler test doubles.
+        """
+        callback = getattr(self.kv_connector, "source_blocks_released", None)
+        if callable(callback):
+            callback(seq)
+
     def _maybe_release_deferred(self, seq: Sequence) -> None:
+        """Release once every connector has let go of the source blocks.
+
+        `should_defer_free` is the one predicate; `MultiConnector` ORs it across
+        its subs. It must stay a predicate rather than a tally of completion
+        reports, because offload also owns chunks it has computed but not yet
+        dispatched a save for.
+
+        Deliberately does not call `request_finished` -- callers arrive with the
+        request already finished, and a second call re-arms the P/D send claim
+        this check just cleared. The block-lifetime cleanup that the second call
+        used to carry is now its own hook, `source_blocks_released`, invoked
+        below once the free has actually happened.
+        """
         if (
             seq.id not in self.deferred_free_blocks
             or getattr(seq, "_awaiting_aborted_load_cleanup", False)
@@ -991,11 +1210,11 @@ class Scheduler:
         ):
             return
 
-        callback = getattr(self.kv_connector, "request_finished", None)
-        if callable(callback):
-            callback(seq)
         self.deferred_free_blocks.pop(seq.id, None)
         self.block_manager.deallocate(seq)
+        # After the free, not before: the connector may only forget the state
+        # keyed on these blocks once nothing can read them again.
+        self._connector_source_blocks_released(seq)
 
     def _save_abandon_timeout_s(self) -> float:
         """Seconds a deferred save may sit before reclamation, or 0 to disable.
@@ -1018,25 +1237,31 @@ class Scheduler:
         the blocks were never released. Once the save has been deferred longer
         than `_save_abandon_timeout_s()` -- set above LMCache's pin
         timeout, so upstream has force-unpinned and released the source bytes --
-        the blocks are safe to return to the pool. Without this, a single
+        the save's own hold on the blocks can go. Without this, a single
         never-reported save keeps `has_pending_kv_work()` True forever and the
         engine busy-loops with every GPU idle.
 
-        Mirrors the producer `finished_sending` reclaim (pop + deallocate),
-        deliberately not re-invoking `request_finished`: it was already called
-        when the request finished, before the block free was deferred. It does
-        notify the connector via `abandon_save`, though -- freeing the blocks
-        here is not enough on its own: the connector still holds the save in
-        `_save_inflight` (and, on K3, in the stall latch), so `should_defer_free`
-        would stay True and `has_pending_kv_work()` would never clear without
-        that drop.
+        Abandoning the save is not the same as freeing the blocks: the release
+        still goes through `should_defer_free`, so an unreported P/D send keeps
+        its source alive and `finished_sending` frees it later -- which is why
+        the release attempt repeats every interval while the abandon happens
+        once (`_save_abandoned`). The flip side is that this is no longer an
+        unconditional escape: if `abandon_save` does not clear every claim (an
+        active load does not go through it), the retry never succeeds, so
+        `_RELEASE_WEDGE_ATTEMPTS` makes that state loud rather than silent.
+        Reclamation does not re-invoke `request_finished`: it was already called
+        when the request finished. It does notify the connector via
+        `abandon_save` -- freeing the blocks here is not enough on its own: the
+        connector holds the save in `_save_inflight` (and, on K3, in the stall
+        latch), so `should_defer_free` would stay True and
+        `has_pending_kv_work()` would never clear without that drop.
 
         The complement of the K3 connector's stall escape
         (`kimi_k3.connector.save_stall_seconds()`), not a duplicate of it: that
         one releases the blocks of a save the backend never took, on a shorter
         clock, and leaves a save already handed out alone -- precisely the case
         this reclaims once the report is not coming. Between them every deferred
-        save has a way out.
+        save has a way out -- as long as dropping the save drops the last claim.
         """
         timeout = self._save_abandon_timeout_s()
         if timeout <= 0:
@@ -1071,22 +1296,60 @@ class Scheduler:
             if getattr(seq, "_deferred_save_at", None) is not None
             and now - seq._deferred_save_at >= timeout
         ]
+        released = 0
+        abandoned = 0
+        wedged: list = []
         for seq in stalled:
-            self.deferred_free_blocks.pop(seq.id, None)
-            self._connector_abandon_save(seq)
-            self.block_manager.deallocate(seq)
-            self._abandoned_saves += 1
-        if stalled:
+            # The save is abandoned once; the release attempt is not. Whether
+            # the blocks come back is a separate question -- a send that has
+            # not reported still claims them -- and giving up on the first
+            # attempt (by clearing the stamp) was how an unanswerable claim,
+            # an abort's above all, lost its blocks for good. Retry each
+            # interval instead, so a late `finished_sending`, or an explicit
+            # retirement, is enough to collect them.
+            if not getattr(seq, "_save_abandoned", False):
+                self._connector_abandon_save(seq)
+                seq._save_abandoned = True
+                self._abandoned_saves += 1
+                observer = getattr(self, "on_save_abandoned", None)
+                if callable(observer):
+                    observer(seq.id)
+                abandoned += 1
+            self._maybe_release_deferred(seq)
+            if seq.id not in self.deferred_free_blocks:
+                seq._deferred_save_at = None
+                released += 1
+            else:
+                seq._release_attempts = getattr(seq, "_release_attempts", 0) + 1
+                if seq._release_attempts == _RELEASE_WEDGE_ATTEMPTS:
+                    wedged.append(seq.id)
+        if wedged:
+            # Once: `_release_attempts` only equals the threshold on one pass.
+            logger.error(
+                "Blocks for request(s) %s survived %d release attempts (%.0fs) "
+                "after their save was abandoned -- a connector still claims the "
+                "source and no completion report is coming to retire that "
+                "claim. These blocks will not return to the pool and "
+                "has_pending_kv_work() stays True. Check the P/D backend's "
+                "send completions.",
+                wedged,
+                _RELEASE_WEDGE_ATTEMPTS,
+                _RELEASE_WEDGE_ATTEMPTS * _SAVE_RECONCILE_INTERVAL_S,
+            )
+        if abandoned or released:
             logger.warning(
-                "Reclaimed %d offload save(s) still deferred after %.0fs with no "
+                "Abandoned %d offload save(s) still deferred after %.0fs with no "
                 "completion report (LMCache force-unpins a stalled save without "
-                "reporting it); freed their blocks so the engine does not stall. "
+                "reporting it); released %d of %d stalled allocation(s), retrying "
+                "the rest while a P/D send still owns the source. "
                 "total abandoned_saves=%d",
-                len(stalled),
+                abandoned,
                 timeout,
+                released,
+                len(stalled),
                 self._abandoned_saves,
             )
-        return len(stalled) + lease_reclaims
+        return released + lease_reclaims
 
     @staticmethod
     def _requires_atomic_prefill(seq):
@@ -1254,34 +1517,60 @@ class Scheduler:
 
         self._promote_ready_remote_kv_requests()
         self._park_ready_offload_partial_prefills()
+        # Reclaim aborted heads even when decode protection vetoes Phase 2.
+        while self.waiting and self.waiting[0].status == SequenceStatus.ABORTED:
+            self._reject_aborted_waiting(self.waiting.popleft())
 
         # should_allow_prefill() runs a cross-DP all_reduce and MUST be called
         # every tick on every rank for lockstep — hence before the early-return.
         if self.prefill_delayer is not None:
             # pending = fresh waiting new-tokens + resumable partials' remaining,
             # capped at the batch budget: the coalescer's accumulation signal.
-            pending_tokens = min(
-                self._waiting_new_token_count()
-                + self._partial_prefill_remaining_tokens(),
-                self.max_num_batched_tokens,
+            running_decode_batch = max(
+                0, len(self.running) - self._partial_prefill_count
             )
+            protects_decode = self.prefill_delayer.protects_decode(running_decode_batch)
+            if protects_decode or (
+                self._local_prefill_coalescing and not running_decode_batch
+            ):
+                # Existence is sufficient during the hard protection window:
+                # fit probes cannot change its decision. Coalescer hold bounds
+                # start afterwards. With no decode, admission proceeds directly.
+                prefillable = (
+                    self._partial_prefill_count > 0
+                    or next(self._waiting_prefills(), None) is not None
+                )
+                pending_tokens = 0
+            elif self._local_prefill_coalescing:
+                prefillable, pending_tokens = self._local_prefill_pending_work()
+            else:
+                prefillable = self._can_admit_head_prefill()
+                pending_tokens = min(
+                    self._waiting_new_token_count()
+                    + self._partial_prefill_remaining_tokens(),
+                    self.max_num_batched_tokens,
+                )
             delayer_allows = self.prefill_delayer.should_allow_prefill(
-                prefillable=self._can_admit_head_prefill(),
+                prefillable=prefillable,
                 pending_tokens=pending_tokens,
                 # decode-only: self.running also holds mid-chunked-prefill seqs,
                 # which are NOT decode load — counting them would defeat the
                 # coalescer's "no decode → fire" fast path.
-                running_decode_batch=max(
-                    0, len(self.running) - self._partial_prefill_count
-                ),
-                kv_usage=self._kv_usage(),
+                running_decode_batch=running_decode_batch,
+                kv_usage=0.0 if protects_decode else self._kv_usage(),
                 has_partial=self._partial_prefill_count > 0,
-                oldest_waiting_age_ms=self._oldest_waiting_prefill_age_ms(),
+                oldest_waiting_age_ms=(
+                    self._oldest_waiting_prefill_age_ms()
+                    if not protects_decode
+                    and self.prefill_delayer.max_queue_ms is not None
+                    else 0.0
+                ),
             )
         else:
             delayer_allows = True
 
-        if not self.running and not self.waiting:
+        # Rejections may still need an empty batch to dispatch connector cleanup.
+        if not self.running and not self.waiting and not self._rejected:
             return None
 
         # ---- Phase 1: resume partial prefills from running ----
@@ -1296,13 +1585,7 @@ class Scheduler:
                     break
                 if not seq.is_partial_prefill:
                     continue
-                remaining = seq.num_tokens - seq.num_cached_tokens
-                if 0 < self.long_prefill_token_threshold < remaining:
-                    remaining = self.long_prefill_token_threshold
-                budget_remaining = self.max_num_batched_tokens - num_batched_tokens
-                chunk = self._chunked_prefill_size(
-                    remaining, budget_remaining, num_batched_tokens
-                )
+                chunk = self._partial_prefill_chunk(seq, num_batched_tokens)
                 if chunk:
                     chunk = self._finalize_prefill_chunk(
                         seq, seq.num_cached_tokens, chunk
@@ -1316,6 +1599,8 @@ class Scheduler:
                 num_scheduled_tokens.append(chunk)
 
         # ---- Phase 2: new requests from waiting ----
+        prefix_waiters: deque[Sequence] = deque()
+        prefix_bypass_left = min(16, self.max_num_seqs)
         while (
             delayer_allows
             and (self.delay_factor <= 0 or self._passed_delay(time.time()))
@@ -1323,6 +1608,10 @@ class Scheduler:
             and num_seqs_prefill < self.max_num_seqs
             and num_batched_tokens < self.max_num_batched_tokens
         ):
+            if prefix_waiters:
+                if prefix_bypass_left == 0:
+                    break
+                prefix_bypass_left -= 1
             seq = self.waiting.popleft()
 
             # Client disconnected before this seq ever ran: it holds no KV yet
@@ -1353,6 +1642,7 @@ class Scheduler:
             # Re-check here (not just at submit) since pool state may change.
             unschedulable = self._unschedulable_reason(seq)
             if unschedulable is not None:
+                self._inflight_prefix_wait.pop(seq.id, None)
                 seq.status = SequenceStatus.FINISHED
                 seq.leave_reason = f"unschedulable: {unschedulable}"
                 seq.multimodal_data = None
@@ -1410,8 +1700,7 @@ class Scheduler:
                     # costs one block of forward, and the forward has to happen
                     # regardless: the first decode samples from the logits this
                     # prefill produces, and there is nowhere else to get them.
-                    hbs = self.block_manager.hash_block_size
-                    seq.num_cached_tokens = max(0, (seq.num_tokens - 1) // hbs * hbs)
+                    seq.num_cached_tokens = self._offload_prefill_start(seq)
                     num_new_tokens = seq.num_tokens - seq.num_cached_tokens
                 budget_remaining = self.max_num_batched_tokens - num_batched_tokens
                 chunk = self._prefill_chunk_for_budget(
@@ -1458,7 +1747,13 @@ class Scheduler:
             # (post-prefix-cache) remaining token count. V4 SWA correctness is
             # enforced inside can_allocate (_swa_bounded_hit bounds the hit to
             # where the trailing-window SWA is present); no post-hoc warmup trim.
-            num_cached_blocks = self.block_manager.can_allocate(seq)
+            block_hashes = []
+            num_cached_blocks = self.block_manager.can_allocate(
+                seq,
+                record=False,
+                block_hashes=block_hashes,
+                reuse_hashes=self._local_prefill_coalescing,
+            )
             if num_cached_blocks < 0:
                 self.waiting.appendleft(seq)
                 break
@@ -1467,16 +1762,23 @@ class Scheduler:
             # their decoded tokens — preempt() frees their KV blocks but keeps
             # the token_ids, so num_tokens > num_prompt_tokens and those tokens
             # still need KV recomputed.
-            num_new_tokens = (
-                seq.num_tokens - num_cached_blocks * self.block_manager.hash_block_size
+            num_new_tokens = self._new_prefill_tokens(
+                seq, num_cached_blocks * self.block_manager.hash_block_size
             )
-            atomic_prefill = self._requires_atomic_prefill(seq)
             if (
-                not atomic_prefill
-                and self.enable_chunked_prefill
-                and 0 < self.long_prefill_token_threshold < num_new_tokens
+                self._local_prefill_coalescing
+                and (not needs_remote_load or self._connector_flag("is_offload"))
+                and self._wait_for_inflight_prefix(
+                    seq,
+                    max(
+                        num_cached_blocks * self.block_manager.hash_block_size,
+                        seq.offload_joint.kv_prefix_tokens,
+                    ),
+                )
             ):
-                num_new_tokens = self.long_prefill_token_threshold
+                prefix_waiters.append(seq)
+                continue
+            atomic_prefill = self._requires_atomic_prefill(seq)
             budget_remaining = self.max_num_batched_tokens - num_batched_tokens
             chunk = self._prefill_chunk_for_budget(
                 num_new_tokens, budget_remaining, num_batched_tokens
@@ -1484,6 +1786,7 @@ class Scheduler:
             if chunk is None or (atomic_prefill and chunk < num_new_tokens):
                 self.waiting.appendleft(seq)
                 break
+            self.block_manager.record_allocation(seq, num_cached_blocks, block_hashes)
             if not self.block_manager.allocate(seq, num_cached_blocks):
                 # A state-less joint boundary could not be privatised without
                 # risking a shared decoding sequence's blocks (finding #2).
@@ -1531,6 +1834,7 @@ class Scheduler:
                         self.waiting.appendleft(seq)
                         break
                 self._park_for_remote_load(seq, skipped_waiting_requests)
+                self._inflight_prefix_wait.pop(seq.id, None)
                 continue
 
             if seq.offload_joint.boundary_tokens:
@@ -1567,6 +1871,7 @@ class Scheduler:
                 # same wake-up -- because to the scheduler both are one event:
                 # a transfer into blocks this request already holds.
                 self._park_for_remote_load(seq, skipped_waiting_requests)
+                self._inflight_prefix_wait.pop(seq.id, None)
                 continue
 
             # Refresh, not a duplicate of the set above: that one is guarded
@@ -1607,6 +1912,7 @@ class Scheduler:
                 num_seqs_prefill,
                 num_batched_tokens,
             )
+            self._inflight_prefix_wait.pop(seq.id, None)
 
         if skipped_waiting_requests:
             logger.debug(
@@ -1614,6 +1920,10 @@ class Scheduler:
                 len(skipped_waiting_requests),
             )
             self.waiting.extend(skipped_waiting_requests)
+        if prefix_waiters:
+            # Keep deferred requests in arrival order while bounded lookahead
+            # admits independent work without extending their deadlines.
+            self.waiting.extendleft(reversed(prefix_waiters))
 
         if self._num_parked_remote_kv > 0 and self._schedule_tick % 1000 == 0:
             logger.info(
@@ -1953,20 +2263,18 @@ class Scheduler:
         return True
 
     def _reject_aborted_waiting(self, seq: Sequence) -> None:
+        self._inflight_prefix_wait.pop(seq.id, None)
         has_inflight_load = bool(getattr(seq, "_counted_as_inflight_load", False))
         seq.status = SequenceStatus.FINISHED
         seq.leave_reason = "aborted"
         seq.multimodal_data = None
         self._rejected.append(seq)
-        if not has_inflight_load and self._connector_flag("is_offload"):
-            # A lookup can pin CPU KV before HBM allocation succeeds. No load
-            # is in flight yet, but the connector still owns cleanup work.
-            # Already-dispatched loads retain the completion-driven path below.
-            self.kv_connector.cancel_pending_load(seq)
+        if not has_inflight_load:
+            # A lookup can pin CPU KV before HBM allocation succeeds.
+            if self._connector_flag("is_offload"):
+                self.kv_connector.cancel_pending_load(seq)
             self.deferred_free_blocks[seq.id] = seq
-            self._maybe_release_deferred(seq)
-        if not has_inflight_load or not self._connector_flag("is_offload"):
-            self._uncount_inflight_load(seq)
+            self._cleanup_aborted_load(seq)
             return
 
         self.deferred_free_blocks[seq.id] = seq
@@ -1982,10 +2290,32 @@ class Scheduler:
             return
         seq._awaiting_aborted_load_cleanup = True
 
+    def abort_request(self, req_id: int) -> bool:
+        """Reclaim waiting cancellations on the event, independent of admission."""
+        for seq in self.waiting:
+            if seq.id == req_id:
+                self.waiting.remove(seq)
+                seq.status = SequenceStatus.ABORTED
+                self._reject_aborted_waiting(seq)
+                return True
+        for seq in self.running:
+            if seq.id == req_id:
+                seq.status = SequenceStatus.ABORTED
+                return True
+        return False
+
     def _cleanup_aborted_load(self, seq: Sequence) -> None:
         if hasattr(seq, "_awaiting_aborted_load_cleanup"):
             delattr(seq, "_awaiting_aborted_load_cleanup")
         self._uncount_inflight_load(seq)
+        # The one path that never went through `postprocess`, so it finishes
+        # the request here rather than before the park.
+        callback = getattr(self.kv_connector, "request_finished", None)
+        if callable(callback):
+            callback(seq)
+        # As in `_reject_aborted_waiting`: an abort never sends, so the
+        # scheduler retires the send claim rather than waiting for a report.
+        self._connector_send_finished(seq.id)
         self._maybe_release_deferred(seq)
 
     def _finish_aborted_load_cleanup(self, req_id) -> bool:
@@ -3027,6 +3357,11 @@ class Scheduler:
                 ),
             )
 
+            if leave_reason is not None:
+                # Publish transfer metadata before constructing the terminal
+                # output. Aborts without sampled output use the same helper.
+                self._mark_finished(seq, leave_reason, num_tokens)
+
             # Prepare stream output
             # A terminal event is required even when truncation leaves no
             # tokens (for example max_tokens <= 0). Async consumers wait for
@@ -3034,8 +3369,6 @@ class Scheduler:
             if stream_output_queue is not None and (
                 new_tokens or leave_reason is not None
             ):
-                if self.kv_connector is not None and leave_reason is not None:
-                    self.kv_connector.request_finished(seq)
                 output_tokens_list = (
                     list(new_tokens)
                     if isinstance(new_tokens, tuple)
@@ -3065,7 +3398,6 @@ class Scheduler:
                 # logger.info(
                 #     f"Sequence {seq.id} finished with reason: {leave_reason}, {seq.token_ids[-8:]=}"
                 # )
-                self._mark_finished(seq, leave_reason, num_tokens)
                 finished_seqs.append(seq)
 
         if stream_output_queue is not None and stream_outputs:
@@ -3095,15 +3427,10 @@ class Scheduler:
                 seq.is_partial_prefill = False
                 self._partial_prefill_count -= 1
             if self.kv_connector is not None:
-                if hasattr(self.kv_connector, "request_finished"):
-                    self.kv_connector.request_finished(seq)
-                if self._connector_flag("is_producer"):
-                    logger.debug(
-                        "Deferring block free for seq %s until KV send completes.",
-                        seq.id,
-                    )
-                    self.deferred_free_blocks[seq.id] = seq
-                elif self._connector_should_defer_free(seq):
+                # `request_finished` already ran once, above, while the reason
+                # was being settled -- it must not run again now that the claim
+                # it takes is a side effect.
+                if self._connector_should_defer_free(seq):
                     protected = self._connector_protected_block_ids(seq)
                     if protected is not None:
                         # Early block release: only the save's exact source
@@ -3134,8 +3461,8 @@ class Scheduler:
                         )
                     else:
                         logger.debug(
-                            "Deferring block free for seq %s until KV save "
-                            "completes.",
+                            "Deferring block free for seq %s until every KV "
+                            "owner releases it.",
                             seq.id,
                         )
                         # Stamp when the save was deferred so the reconciler
@@ -3155,8 +3482,18 @@ class Scheduler:
         return finished_seqs
 
     def _mark_finished(self, seq, reason, num_tokens):
-        seq.num_tokens = num_tokens
+        # Set the reason before the connector decides whether to claim the
+        # source blocks. This runs exactly once, including early cancellation
+        # without sampled output and requests without a stream queue.
         seq.leave_reason = reason
+        if self.kv_connector is not None:
+            callback = getattr(self.kv_connector, "request_finished", None)
+            if callable(callback):
+                callback(seq)
+            if reason == "aborted":
+                # No peer will report a send for a cancelled request.
+                self._connector_send_finished(seq.id)
+        seq.num_tokens = num_tokens
         seq.multimodal_data = None
         seq.status = SequenceStatus.FINISHED
         self.total_finished_requests += 1
@@ -3384,8 +3721,8 @@ class Scheduler:
         """Reconcile scheduler state with completed KV transfers.
 
         * ``finished_recving``: marks requests as ready for decode scheduling.
-        * ``finished_sending``: releases deferred block allocations on the
-          producer side.
+        * ``finished_sending``: releases the producer's send ownership; blocks
+          remain deferred while the connector still has offload work.
         """
         if kv_connector_output is None:
             return
@@ -3398,10 +3735,12 @@ class Scheduler:
             kv_connector_output = process_completions(kv_connector_output)
 
         for req_id in kv_connector_output.finished_recving or ():
-            if metrics := getattr(self, "metrics", None):
-                metrics.finish_kv_wait(req_id, succeeded=True)
             assert not is_producer, "Only consumer should update recving KV status"
             logger.debug("Finished recving KV transfer for request %s", req_id)
+            if self._finish_aborted_load_cleanup(req_id):
+                continue
+            if metrics := getattr(self, "metrics", None):
+                metrics.finish_kv_wait(req_id, succeeded=True)
             self.finished_recving_kv_req_ids.append(req_id)
 
         for req_id in kv_connector_output.failed_recving or ():
@@ -3411,6 +3750,8 @@ class Scheduler:
             logger.warning(
                 "KV receive failed for request %s; falling back to prefill.", req_id
             )
+            if self._finish_aborted_load_cleanup(req_id):
+                continue
             self.failed_recving_kv_req_ids.append(req_id)
 
         # The two loading channels carry state-tier loads as well as KV ones,
@@ -3463,19 +3804,19 @@ class Scheduler:
                 self.kv_connector.is_producer
             ), "Only producer should free blocks after sending KV"
             logger.debug("Finished sending KV transfer for request %s", req_id)
+            # Before asking, not after: the release below queries the connector.
+            self._connector_send_finished(req_id)
             seq = self._deferred_sequence(req_id)
             if seq is None:
                 # Already reclaimed by `_reconcile_stalled_deferred_saves` after
                 # a stall; a late completion report has nothing left to free.
                 continue
-            self.deferred_free_blocks.pop(seq.id, None)
-            self.block_manager.deallocate(seq)
+            self._maybe_release_deferred(seq)
 
-        if not is_producer:
-            for req_id in finished_saving:
-                seq = self._deferred_sequence(req_id)
-                if seq is not None:
-                    self._maybe_release_deferred(seq)
+        for req_id in finished_saving:
+            seq = self._deferred_sequence(req_id)
+            if seq is not None:
+                self._maybe_release_deferred(seq)
         # Early-release requests are never in `deferred_free_blocks` (they were
         # fully torn down, minus their lease, at finish time), so the loops
         # above have nothing to find for them. Drain independently of producer
@@ -3558,7 +3899,8 @@ class Scheduler:
         eligible_waiting = [
             seq
             for seq in self.waiting
-            if seq.status != SequenceStatus.WAITING_FOR_REMOTE_KVS
+            if seq.status
+            not in (SequenceStatus.ABORTED, SequenceStatus.WAITING_FOR_REMOTE_KVS)
         ]
         if eligible_waiting:
             # new request is waiting, will do prefill
@@ -3830,6 +4172,16 @@ class DecodeScheduler(Scheduler):
 
     _ENGINE_LABEL = "Decode "
     _METRICS_ROLE = "decode"
+
+    def abort_request(self, req_id: int) -> bool:
+        # RapidServe does not drain the standard scheduler's rejection queue.
+        # Preserve its mark-only cancellation path.
+        with self._prefill_lock:
+            for seq in (*self.running, *self.waiting):
+                if seq.id == req_id:
+                    seq.status = SequenceStatus.ABORTED
+                    return True
+        return False
 
     def get_request_counts(self) -> tuple[int, int]:
         """Fold in the two queues this scheduler adds.

@@ -616,3 +616,32 @@ def test_weekly_cron_matches_the_cadence_expressions():
     ):
         assert weekly in text, f"{field} does not reference the weekly cron {weekly!r}"
         assert "weekly" in text and "nightly" in text, field
+
+
+def test_v41_sweep_matches_requested_runtime():
+    import json
+    import shlex
+
+    cells = catalog.build_cells(
+        CATALOG,
+        model_filter={"deepseek-v41-flash-agentic"},
+        bench_kind_filter={"aiperf_agentic"},
+    )
+    assert sorted(c["conc"] for c in cells) == [1, 2, 8, 16, 32, 64]
+    for cell in cells:
+        args = shlex.split(cell["server_args"])
+        for flag, value in {
+            "-tp": "4", "--level": "3", "--kv_cache_dtype": "bf16",
+            "--index-cache-dtype": "fp8", "--cudagraph-mode": "FULL",
+            "--max-num-seqs": "128", "--num-speculative-tokens": "5",
+            "--method": "dspark", "--spec-decode-acceptance-length": "3.51",
+        }.items():
+            assert args[args.index(flag) + 1] == value
+        assert not any("expert-parallel" in a or "expert_parallel" in a for a in args)
+        assert "--enable-dp-attention" not in args
+        assert "ATOM_DSV41_BENCHMARK_SYNTHETIC=1" in cell["env_vars"]
+        capture = json.loads(args[args.index("--cudagraph-capture-sizes") + 1])
+        if cell["conc"] == 32:
+            assert capture == list(range(1, 33)) + [48, 64, 128]
+        else:
+            assert capture == list(range(1, 9)) + [16, 32, 48, 64, 128]

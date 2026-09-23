@@ -507,7 +507,7 @@ def test_scheduler_abort_before_allocation_releases_lookup_pin(
     scheduler.add(seq)
     allocation_attempts = []
 
-    def cannot_allocate(value):
+    def cannot_allocate(value, **_kwargs):
         allocation_attempts.append(value.id)
         return -1
 

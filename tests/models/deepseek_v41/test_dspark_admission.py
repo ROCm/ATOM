@@ -92,3 +92,17 @@ def test_relaxed_acceptance_cannot_bypass_target_distribution(monkeypatch):
     monkeypatch.setenv("ATOM_ENABLE_RELAXED_MTP", "1")
     with pytest.raises(ValueError, match="strict target verification"):
         validate_speculative_config(config())
+
+
+def test_synthetic_acceptance_requires_explicit_benchmark_opt_in(monkeypatch):
+    cfg = config()
+    cfg.speculative_config.synthetic_acceptance_rates = [0.8] * 5
+    monkeypatch.delenv("ATOM_DSV41_BENCHMARK_SYNTHETIC", raising=False)
+    with pytest.raises(ValueError, match="real target verification"):
+        validate_speculative_config(cfg)
+    monkeypatch.setenv("ATOM_DSV41_BENCHMARK_SYNTHETIC", "1")
+    with pytest.warns(RuntimeWarning, match="performance benchmarking only"):
+        validate_speculative_config(cfg)
+    cfg.tensor_parallel_size = 8
+    with pytest.raises(ValueError, match="TP4"):
+        validate_speculative_config(cfg)
