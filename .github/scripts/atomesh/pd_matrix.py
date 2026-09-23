@@ -371,6 +371,11 @@ def build_cell(
     )
     cell_id = slug(f"{model_name}-{suite_cfg.get('name', topology)}-{suite_name}")
     image = override_image or str(backend_cfg.get("image"))
+    eval_only = bool(suite_cfg.get("eval_only", False))
+    if eval_only and not suite_cfg.get("run_eval", False):
+        raise ValueError("eval_only requires run_eval=true")
+    if eval_only and accuracy_cfg.get("task", "gsm8k") not in {"gsm8k", "swebench_lite"}:
+        raise ValueError("eval_only requires a supported accuracy task")
     return {
         "id": cell_id,
         "suite": suite_name,
@@ -409,6 +414,7 @@ def build_cell(
             "router": role_env(defaults, backend_cfg, model_cfg, suite_cfg, "router"),
         },
         "run_eval": bool(suite_cfg.get("run_eval", False)),
+        "eval_only": eval_only,
         "accuracy": {
             "task": str(accuracy_cfg.get("task", "gsm8k")),
             "fewshot": int(accuracy_cfg.get("fewshot", 3)),

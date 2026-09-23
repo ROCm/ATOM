@@ -1209,3 +1209,47 @@ models:
           decode:
             <<: *dsv4_0813_agentic_dpa_decode
             cudagraph: "[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64]"
+
+      # Manual accuracy suite: no performance workload or synthetic acceptance.
+      accuracy:
+        - name: ds-v4-0813-1p1d-tp8-dspark3-gsm8k-only-c16
+          topology: 1p1d
+          display_topology: 1P1D-TP8-DSPARK3
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [4096]
+          osl: 4096
+          concurrency: [16]
+          router:
+            policy: cache_aware
+          server:
+            common_args:
+              max_model_len: 8192
+              max_num_seqs: 32
+              decode_max_num_seqs: 32
+              spec_decode_acceptance_length: ""
+          prefill:
+            workers: 1
+            tp: 8
+            cudagraph_mode: FULL
+            compilation_level: 3
+            extra_args: "--enable-tbo"
+          decode:
+            workers: 1
+            tp: 8
+            cudagraph: "[1,2,4,8,12,16,20,24,28,32]"
+            cudagraph_mode: FULL
+            compilation_level: 3
+            extra_args: ""
+          benchmark:
+            kind: random
+          run_eval: true
+          eval_only: true
+          accuracy:
+            task: gsm8k
+            fewshot: 5
+            eval_concurrency: [16]
+            model_type: local-chat-completions
+            endpoint: chat/completions
+            max_gen_toks: 4096
+            apply_chat_template: true

@@ -24,7 +24,14 @@ mkdir -p "${RUN_DIR}"
 chmod 0777 "${RUN_DIR}" 2>/dev/null || true
 
 EXECUTION_PHASES=(combined)
-if [[ "${BENCHMARK_KIND:-random}" == "aiperf_agentic" \
+if [[ "${EVAL_ONLY:-false}" == "true" || "${EVAL_ONLY:-false}" == "1" ]]; then
+  if [[ "${RUN_EVAL:-false}" != "true" && "${RUN_EVAL:-false}" != "1" ]]; then
+    echo "ERROR: EVAL_ONLY requires RUN_EVAL=true" >&2
+    exit 2
+  fi
+  # Enter the existing fresh eval phase, which also removes synthetic AL.
+  EXECUTION_PHASES=(eval)
+elif [[ "${BENCHMARK_KIND:-random}" == "aiperf_agentic" \
   && ( "${EVAL_TASK:-gsm8k}" == "swebench_lite" \
     || "${EVAL_TASK:-gsm8k}" == "gsm8k" ) \
   && ( "${RUN_EVAL:-false}" == "true" || "${RUN_EVAL:-false}" == "1" ) ]]; then
