@@ -347,7 +347,7 @@ models:
           pd_worker_layout: single_node
           concurrency: [48]
           server:
-            common_args:
+            common_args: &glm52_agentic_lmcache_cpp4_dcp4_args
               kv_cache_dtype: fp8
               block_size: 16
               max_num_seqs: 512
@@ -367,14 +367,14 @@ models:
             tp: 1
             cudagraph: none
             extra_args: "--pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192"
-          decode: &glm52_agentic_lmcache_cpp4_dcp4_decode
+          decode:
             workers: 1
             tp: 4
             cudagraph: >-
               [1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]
             extra_args: "--decode-context-parallel-size 4 --cudagraph-mode FULL"
           env:
-            common:
+            common: &glm52_agentic_lmcache_cpp4_dcp4_env_common
               ATOM_MLA_PAGE_SIZE: "1"
               ATOM_ONLINE_QUANT_STREAMING: "0"
               ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB: "2047"
@@ -382,7 +382,7 @@ models:
               MAX_JOBS: "16"
               PYTHONHASHSEED: "0"
               TOPK_FORCE_PATH: "one"
-            prefill:
+            prefill: &glm52_agentic_lmcache_cpp4_dcp4_env_prefill
               HIP_VISIBLE_DEVICES: "0,1,2,3"
               VLLM_PP_LAYER_PARTITION: "20,20,20,18"
               LMCACHE_LOCAL_CPU: "True"
@@ -401,7 +401,7 @@ models:
               OFFLOAD_MIN_LOAD_TOKENS: "0"
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
-            decode:
+            decode: &glm52_agentic_lmcache_cpp4_dcp4_env_decode
               HIP_VISIBLE_DEVICES: "4,5,6,7"
               DECODE_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
@@ -461,66 +461,160 @@ models:
           concurrency: [48]
 
 
-      # Manual-only 1PnD scaling of the CPP4/DCP4 recipe above. The packed
-      # layout keeps node 0 identical to the 1P1D recipe (P on GPUs 0-3, D on
-      # 4-7) and fills later nodes with two TP4 decodes each, so 1P3D uses two
-      # nodes and 1P5D three.
+      # Manual-only 1PnD scaling. Prefill is the CPP4 (TP1 x PP4) prefill of
+      # the 1P1D recipe above; each decode is the standalone TP4 + MTP5 recipe
+      # in recipes/Agentic-GLM-5.2.md (no DCP, golden AL 3.61, 0.95 memory,
+      # 2 x CONC sequences and CUDAGraph sizes). The packed layout keeps node 0
+      # like the 1P1D recipe (P on GPUs 0-3, D on 4-7) and fills later nodes
+      # with two decodes each, so 1P3D uses two nodes and 1P5D three.
       agentic_multi_decode:
-        # 3 TP4+DCP4 decodes behind one CPP4 prefill on 2 nodes.
-        - &glm52_agentic_lmcache_cpp4_1p3d
+        - &glm52_agentic_cpp4_tp4_mtp5
           <<: *glm52_agentic_lmcache_cpp4_dcp4
-          topology: 1p3d_cpp4_dcp4
+          name: glm-52-mxfp4-1p3d-cpp4-tp4-mtp5-agentic-lmcache-1m-c12
+          topology: 1p3d_cpp4_tp4_mtp5
           pd_worker_layout: packed_nodes
           nodes: "${ATOMESH_2P1D_NODES}"
+          concurrency: [12]
+          server:
+            common_args:
+              <<: &glm52_agentic_cpp4_tp4_mtp5_args
+                <<: *glm52_agentic_lmcache_cpp4_dcp4_args
+                online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*"]}'
+                extra_args: "--level 3 --method mtp --num-speculative-tokens 5 --spec-decode-acceptance-length 3.61"
+                decode_max_num_batched_tokens: 16384
+              decode_max_num_seqs: 24
           decode:
-            <<: *glm52_agentic_lmcache_cpp4_dcp4_decode
+            <<: &glm52_agentic_tp4_mtp5_decode
+              tp: 4
+              extra_args: "--gpu-memory-utilization 0.95 --cudagraph-mode FULL"
             workers: 3
-          name: glm-52-mxfp4-1p3d-cpp4-dcp4-agentic-lmcache-1m-c12
-          concurrency: [12]
+            cudagraph: "[1,2,4,8,12,16,20,24]"
+          env:
+            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
+            prefill: *glm52_agentic_lmcache_cpp4_dcp4_env_prefill
+            decode:
+              <<: *glm52_agentic_lmcache_cpp4_dcp4_env_decode
+              ATOM_USE_FLYDSL_GATHER_KV_B_PROJ: "0"
+              PYTHONNOUSERSITE: "1"
+              # Force RDMA to avoid HIP IPC shared-pool address corruption.
+              MC_DISABLE_HIP: "1"
 
-        - <<: *glm52_agentic_lmcache_cpp4_1p3d
-          name: glm-52-mxfp4-1p3d-cpp4-dcp4-agentic-lmcache-1m-c16
+        - <<: *glm52_agentic_cpp4_tp4_mtp5
+          name: glm-52-mxfp4-1p3d-cpp4-tp4-mtp5-agentic-lmcache-1m-c16
+          topology: 1p3d_cpp4_tp4_mtp5
           concurrency: [16]
-
-        - <<: *glm52_agentic_lmcache_cpp4_1p3d
-          name: glm-52-mxfp4-1p3d-cpp4-dcp4-agentic-lmcache-1m-c20
-          concurrency: [20]
-
-        - <<: *glm52_agentic_lmcache_cpp4_1p3d
-          name: glm-52-mxfp4-1p3d-cpp4-dcp4-agentic-lmcache-1m-c24
-          concurrency: [24]
-
-        - <<: *glm52_agentic_lmcache_cpp4_1p3d
-          name: glm-52-mxfp4-1p3d-cpp4-dcp4-agentic-lmcache-1m-c32
-          concurrency: [32]
-
-        # 5 TP4+DCP4 decodes behind one CPP4 prefill on 3 nodes.
-        - &glm52_agentic_lmcache_cpp4_1p5d
-          <<: *glm52_agentic_lmcache_cpp4_dcp4
-          topology: 1p5d_cpp4_dcp4
-          pd_worker_layout: packed_nodes
-          nodes: "${ATOMESH_2P1D_NODES}"
+          server:
+            common_args:
+              <<: *glm52_agentic_cpp4_tp4_mtp5_args
+              decode_max_num_seqs: 32
           decode:
-            <<: *glm52_agentic_lmcache_cpp4_dcp4_decode
-            workers: 5
-          name: glm-52-mxfp4-1p5d-cpp4-dcp4-agentic-lmcache-1m-c12
-          concurrency: [12]
+            <<: *glm52_agentic_tp4_mtp5_decode
+            workers: 3
+            cudagraph: "[1,2,4,8,12,16,20,24,28,32]"
 
-        - <<: *glm52_agentic_lmcache_cpp4_1p5d
-          name: glm-52-mxfp4-1p5d-cpp4-dcp4-agentic-lmcache-1m-c16
-          concurrency: [16]
-
-        - <<: *glm52_agentic_lmcache_cpp4_1p5d
-          name: glm-52-mxfp4-1p5d-cpp4-dcp4-agentic-lmcache-1m-c20
+        - <<: *glm52_agentic_cpp4_tp4_mtp5
+          name: glm-52-mxfp4-1p3d-cpp4-tp4-mtp5-agentic-lmcache-1m-c20
+          topology: 1p3d_cpp4_tp4_mtp5
           concurrency: [20]
+          server:
+            common_args:
+              <<: *glm52_agentic_cpp4_tp4_mtp5_args
+              decode_max_num_seqs: 40
+          decode:
+            <<: *glm52_agentic_tp4_mtp5_decode
+            workers: 3
+            cudagraph: "[1,2,4,8,12,16,20,24,28,32,36,40]"
 
-        - <<: *glm52_agentic_lmcache_cpp4_1p5d
-          name: glm-52-mxfp4-1p5d-cpp4-dcp4-agentic-lmcache-1m-c24
+        - <<: *glm52_agentic_cpp4_tp4_mtp5
+          name: glm-52-mxfp4-1p3d-cpp4-tp4-mtp5-agentic-lmcache-1m-c24
+          topology: 1p3d_cpp4_tp4_mtp5
           concurrency: [24]
+          server:
+            common_args:
+              <<: *glm52_agentic_cpp4_tp4_mtp5_args
+              decode_max_num_seqs: 48
+          decode:
+            <<: *glm52_agentic_tp4_mtp5_decode
+            workers: 3
+            cudagraph: "[1,2,4,8,12,16,20,24,28,32,36,40,44,48]"
 
-        - <<: *glm52_agentic_lmcache_cpp4_1p5d
-          name: glm-52-mxfp4-1p5d-cpp4-dcp4-agentic-lmcache-1m-c32
+        - <<: *glm52_agentic_cpp4_tp4_mtp5
+          name: glm-52-mxfp4-1p3d-cpp4-tp4-mtp5-agentic-lmcache-1m-c32
+          topology: 1p3d_cpp4_tp4_mtp5
           concurrency: [32]
+          server:
+            common_args:
+              <<: *glm52_agentic_cpp4_tp4_mtp5_args
+              decode_max_num_seqs: 64
+          decode:
+            <<: *glm52_agentic_tp4_mtp5_decode
+            workers: 3
+            cudagraph: "[1,2,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64]"
+
+        - <<: *glm52_agentic_cpp4_tp4_mtp5
+          name: glm-52-mxfp4-1p5d-cpp4-tp4-mtp5-agentic-lmcache-1m-c12
+          topology: 1p5d_cpp4_tp4_mtp5
+          concurrency: [12]
+          server:
+            common_args:
+              <<: *glm52_agentic_cpp4_tp4_mtp5_args
+              decode_max_num_seqs: 24
+          decode:
+            <<: *glm52_agentic_tp4_mtp5_decode
+            workers: 5
+            cudagraph: "[1,2,4,8,12,16,20,24]"
+
+        - <<: *glm52_agentic_cpp4_tp4_mtp5
+          name: glm-52-mxfp4-1p5d-cpp4-tp4-mtp5-agentic-lmcache-1m-c16
+          topology: 1p5d_cpp4_tp4_mtp5
+          concurrency: [16]
+          server:
+            common_args:
+              <<: *glm52_agentic_cpp4_tp4_mtp5_args
+              decode_max_num_seqs: 32
+          decode:
+            <<: *glm52_agentic_tp4_mtp5_decode
+            workers: 5
+            cudagraph: "[1,2,4,8,12,16,20,24,28,32]"
+
+        - <<: *glm52_agentic_cpp4_tp4_mtp5
+          name: glm-52-mxfp4-1p5d-cpp4-tp4-mtp5-agentic-lmcache-1m-c20
+          topology: 1p5d_cpp4_tp4_mtp5
+          concurrency: [20]
+          server:
+            common_args:
+              <<: *glm52_agentic_cpp4_tp4_mtp5_args
+              decode_max_num_seqs: 40
+          decode:
+            <<: *glm52_agentic_tp4_mtp5_decode
+            workers: 5
+            cudagraph: "[1,2,4,8,12,16,20,24,28,32,36,40]"
+
+        - <<: *glm52_agentic_cpp4_tp4_mtp5
+          name: glm-52-mxfp4-1p5d-cpp4-tp4-mtp5-agentic-lmcache-1m-c24
+          topology: 1p5d_cpp4_tp4_mtp5
+          concurrency: [24]
+          server:
+            common_args:
+              <<: *glm52_agentic_cpp4_tp4_mtp5_args
+              decode_max_num_seqs: 48
+          decode:
+            <<: *glm52_agentic_tp4_mtp5_decode
+            workers: 5
+            cudagraph: "[1,2,4,8,12,16,20,24,28,32,36,40,44,48]"
+
+        - <<: *glm52_agentic_cpp4_tp4_mtp5
+          name: glm-52-mxfp4-1p5d-cpp4-tp4-mtp5-agentic-lmcache-1m-c32
+          topology: 1p5d_cpp4_tp4_mtp5
+          concurrency: [32]
+          server:
+            common_args:
+              <<: *glm52_agentic_cpp4_tp4_mtp5_args
+              decode_max_num_seqs: 64
+          decode:
+            <<: *glm52_agentic_tp4_mtp5_decode
+            workers: 5
+            cudagraph: "[1,2,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64]"
 
     accuracy:
       task: gsm8k
