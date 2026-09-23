@@ -314,6 +314,8 @@ class Sequence:
         # collector a slot to walk for each one. `json.dumps` is the only
         # consumer that needs a list, and it converts at its own boundary.
         self.logprobs: array.array = array.array("d")
+        # MoE routes gathered from KV slots: int16 [seq_len-1, layers, top_k].
+        self.routed_experts: np.ndarray | None = None
         # stream callback
         self.stream_callback = stream_callback
         # The completion half of `token_ids`, kept in step with it by every

@@ -49,6 +49,7 @@ class EngineArgs:
     data_parallel_base_port: int | None = None
     enforce_eager: bool = False
     enable_prefix_caching: bool = True
+    enable_return_routed_experts: bool = False
     port: int = 8006
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: str | None = None
@@ -206,6 +207,15 @@ class EngineArgs:
             default=True,
             help="Enable prefix caching (default: enabled). "
             "Use --no-enable_prefix_caching to disable.",
+        )
+        parser.add_argument(
+            "--enable-return-routed-experts",
+            dest="enable_return_routed_experts",
+            action="store_true",
+            help="Return per-request MoE expert ids on generate() as "
+            "routed_experts int16 [seq_len-1, num_layers, top_k]. "
+            "Requires DCP=PCP=PP=1, no DP-attention, and no KV transfer, "
+            "offload, or RapidServe.",
         )
         parser.add_argument(
             "--port",

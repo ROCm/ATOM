@@ -470,6 +470,7 @@ class ScheduledBatchOutput:
         is_prev_prefill=False,
         logprobs=None,
         dspark_ell: np.ndarray | None = None,
+        routed_experts: dict[int, np.ndarray] | None = None,
     ):
         self.req_ids = req_ids
         self.token_ids = token_ids
@@ -484,6 +485,9 @@ class ScheduledBatchOutput:
         # (main-process) scheduler so the NEXT step can size each request's
         # verification to ell_r+1. None when DSpark scheduling is off.
         self.dspark_ell = dspark_ell
+        # Per-request MoE routes gathered this step, keyed by req_id.
+        # Each value is int16 [num_forwarded_tokens, num_layers, top_k].
+        self.routed_experts = routed_experts
         # O(1) lookup: req_id -> index (lazy-built on first access)
         self._req_id_to_idx: dict[int, int] | None = None
 
@@ -535,6 +539,24 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.config = config
+        if getattr(config, "enable_return_routed_experts", False):
+            from atom.model_ops.fused_moe.routed_experts_capturer import (
+                check_return_routed_experts,
+            )
+
+            check_return_routed_experts(
+                getattr(config, "decode_context_parallel_size", 1),
+                getattr(config, "prefill_context_parallel_size", 1),
+                getattr(config, "pipeline_parallel_size", 1),
+                kv_transfer_config=getattr(config, "kv_transfer_config", None),
+                enable_rapidserve=bool(
+                    getattr(config, "enable_rapidserve", False)
+                    or getattr(config, "disagg_is_decode", False)
+                    or "RapidServeModelRunner"
+                    in str(getattr(config, "runner_qualname", ""))
+                ),
+                enable_dp_attention=bool(getattr(config, "enable_dp_attention", False)),
+            )
         pc = getattr(config, "parallel_config", None)
         self.metrics = SchedulerMetrics(
             getattr(pc, "data_parallel_rank", 0)
@@ -2997,6 +3019,15 @@ class Scheduler:
                 seq = running_by_id.get(request_id)
                 if seq is not None and "embedding_spans" in data:
                     seq.multimodal_cache_ready = True
+        routed = getattr(fwd_output, "routed_experts", None)
+        if routed:
+            seq_map = dict(running_by_id)
+            for seq in seqs:
+                seq_map[seq.id] = seq
+            for req_id, arr in routed.items():
+                seq = seq_map.get(req_id)
+                if seq is not None:
+                    seq.routed_experts = arr
         num_prefill = int(getattr(batch, "total_seqs_num_prefill", 0))
         prefill_ids = set(batch.req_ids[:num_prefill]) if num_prefill else set()
         if self._connector_flag("is_offload") and num_prefill:
@@ -3366,6 +3397,12 @@ class Scheduler:
             # A terminal event is required even when truncation leaves no
             # tokens (for example max_tokens <= 0). Async consumers wait for
             # this finished RequestOutput and would otherwise block forever.
+            if leave_reason is not None and seq.routed_experts is not None:
+                from atom.model_ops.fused_moe.routed_experts_capturer import (
+                    trim_routed_experts,
+                )
+
+                seq.routed_experts = trim_routed_experts(seq.routed_experts, num_tokens)
             if stream_output_queue is not None and (
                 new_tokens or leave_reason is not None
             ):
@@ -3383,6 +3420,9 @@ class Scheduler:
                         seq, "kv_transfer_params_output", None
                     ),
                     num_cached_tokens=getattr(seq, "prefix_cache_hit_tokens", 0),
+                    routed_experts=(
+                        seq.routed_experts if leave_reason is not None else None
+                    ),
                 )
 
                 if request_output.kv_transfer_params_output is not None:

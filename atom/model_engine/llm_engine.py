@@ -929,6 +929,8 @@ class InputOutputProcessor:
                 "ttft": ttft,  # Time to first token in seconds
                 "tpot": tpot,  # Time per output token in seconds
             }
+            if req.routed_experts is not None:
+                outputs[req.id]["routed_experts"] = req.routed_experts
         return outputs
 
     def has_pending_requests(self):
