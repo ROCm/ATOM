@@ -16,17 +16,15 @@ parallelism follows the model's dimension-divisibility checks, with no TP4-only
 admission gate. Configuration tests cover TP1/2/4/8; the GPU benchmark evidence
 covers TP2 and TP4 without EP at level 3 FULL. See the
 [AgentX recipe](../recipes/DeepSeek-V4.1-Flash-Agentic.md) for commands and the
-synthetic-acceptance scope of those measurements.
+fixed acceptance length used in those measurements.
 
 The existing quality/development baseline uses TP4 with whole-expert EP at
 compilation level 0. Target execution can be eager or use whole-forward decode
 graphs (`FULL`); the draft has its own graph. The runtime also accepts
 `PIECEWISE` at level 0, and level 3 with FULL graphs or eager execution.
 
-Synthetic acceptance is rejected by default. For performance reproduction only,
-`ATOM_DSV41_BENCHMARK_SYNTHETIC=1` admits an explicitly configured synthetic
-schedule and emits a warning; it does not change the shared rejection sampler
-or enable relaxed verification.
+Fixed acceptance schedules use the common `--spec-decode-acceptance-length`
+or `--spec-decode-acceptance-rate` options and the shared rejection sampler.
 
 Not admitted: packed speculative caches, multimodal speculation,
 relaxed MTP acceptance, and speculative output token logprobs — the

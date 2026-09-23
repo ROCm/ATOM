@@ -122,7 +122,7 @@ speculative caches and multimodal speculation are rejected, as are
 PP/CP/DP, TBO, KV transfer, plugin execution and EPLB — all before loading.
 Compilation level 3 is admitted with FULL graphs or eager execution; the
 [AgentX recipe](../recipes/DeepSeek-V4.1-Flash-Agentic.md) records TP2/TP4
-no-EP GPU benchmark results under synthetic acceptance.
+no-EP GPU benchmark results with fixed acceptance length 3.51.
 
 The [chat and tool protocol](deepseek_v41_protocol.md) and
 [vision and multimodal chunking](deepseek_v41_vision.md) are enabled

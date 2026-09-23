@@ -6,12 +6,8 @@ graphs and DSpark with five draft tokens. Start with **TP2 c16** for a balanced
 point, **TP2 c32** for higher throughput, or **TP4 c8** for interactivity above
 200 output tokens/s/user in these measurements.
 
-The measurements use **forced acceptance length 3.51**. They measure execution
-performance under a synthetic acceptance schedule, not generation quality or
-the model's natural acceptance rate. The explicit
-`ATOM_DSV41_BENCHMARK_SYNTHETIC=1` opt-in is required for this benchmark;
-ordinary DSpark keeps real target verification. See the
-[model recipe](DeepSeek-V4.1-Flash.md) for quality and runtime limitations.
+The measurements use **fixed acceptance length 3.51**, configured with
+`--spec-decode-acceptance-length 3.51`.
 
 ## Measured operating points
 
@@ -76,7 +72,6 @@ instances; these runs used one instance per benchmark job.
 - Both: `rocm/atom-dev:nightly_202609221542`, MI355X 288 GB, reported ROCm 7.2.4,
   image-provided AIPerf 0.12.0, no AITER reinstall. The workflow checked the
   AIPerf version, not its exact installed commit.
-- [CSV with source fields](data/deepseek-v41-agentic-20260923.csv).
 
 These historical coordinates are **reconstructed from uploaded aggregate JSON**:
 `p90_itl_ms`, `total_input_tokens`, `total_output_tokens`,
@@ -106,10 +101,9 @@ model cache is elsewhere. Use one fresh container and output directory per point
 and finish/stop the previous point before launching another on the same GPUs or
 port.
 
-For historical reproduction, the commands below select the source commit that
-produced each table. The TP2 admission fix and synthetic benchmark opt-in are
-also included with this recipe in ATOM; performance on newer source revisions
-must be measured separately.
+The commands below use the recipe's admission-fix revision for both TP sizes.
+The historical measurements retain their original source revisions above;
+record the source revision when collecting new results.
 
 ```bash
 set -euo pipefail
@@ -117,13 +111,12 @@ TP=2
 CONC=16                         # TP2: 1/2/8/16/32/64; TP4: 2/8/16/32/64
 IMAGE=rocm/atom-dev:nightly_202609221542
 MODEL_HOST_ROOT=/models
+ATOM_REV=0312ff1ccf32e1be7410baaf26b0cc5eda44d38b
 case "$TP" in
   2)
-    ATOM_REV=f3f112e482aebfb0efde44afc7e599a2630b962f
     GPU_IDS=0,1
     ;;
   4)
-    ATOM_REV=016f4ee9bee58447fb83be5f2481f1623bfac972
     GPU_IDS=0,1,2,3
     ;;
   *) echo "This recipe measures TP2 and TP4" >&2; exit 1 ;;
@@ -148,7 +141,7 @@ docker run -dt --name "$CTR" --network=host --ipc=host \
   -e HIP_VISIBLE_DEVICES="$GPU_IDS" \
   -e TP="$TP" -e CONC="$CONC" \
   -e OMP_NUM_THREADS=4 -e ATOM_NUMA_BIND=0 -e AITER_LOG_LEVEL=WARNING \
-  -e ATOM_DISABLE_MMAP=true -e ATOM_DSV41_BENCHMARK_SYNTHETIC=1 \
+  -e ATOM_DISABLE_MMAP=true \
   "$IMAGE" bash
 
 docker exec "$CTR" aiperf --version
