@@ -1594,6 +1594,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             def prepare_sharded_index(plan: DCPShardPlan):
                 return prepare_dcp_index_gather_indices(plan, first_index_page.device)
 
+            # Contiguous pool views can still contain a segmented or shuffled
+            # page. Match the cache writer's layout selection, and reject it
+            # when a DCP gather is requested; whole-page transfers need no
+            # token relayout and can keep using the registered regions.
+            mla_staging_layout = "token-contiguous"
+            if envs.ATOM_USE_TRITON_MLA:
+                if envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+                    mla_staging_layout = "shuffled"
+            elif envs.ATOM_MLA_PAGE_SIZE > 1:
+                mla_staging_layout = "segmented"
+
             def staging_slot(region_idx, pool_idx):
                 # Both page formats share one pool, but each transfer requires
                 # packed pages; slicing columns would retain the larger stride.
@@ -1607,6 +1618,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             def gather_sharded_mla(region_idx, indices, pool_idx):
                 if block_regions[region_idx].semantic_role != MLA_KV_ROLE:
                     raise ValueError(f"Region {region_idx} is not token-contiguous MLA")
+                if mla_staging_layout != "token-contiguous":
+                    raise RuntimeError(
+                        "DCP MLA page gathering requires token-contiguous KV, "
+                        f"but the producer uses the {mla_staging_layout} layout. "
+                        "Use ATOM_MLA_PAGE_SIZE=1 for non-Triton MLA, or "
+                        "ATOM_USE_TRITON_MLA_SHUFFLE_KV=0 for Triton MLA."
+                    )
                 slot = staging_slot(region_idx, pool_idx)
                 pages = gather_dcp_mla_pages(
                     block_tensor_views[region_idx], slot, indices, scheduler_block_size
