@@ -11,6 +11,7 @@ payload mapping and PAGE/SLOT policy.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 import threading
@@ -32,6 +33,76 @@ from atom.kv_transfer.offload import config as offcfg
 
 logger = logging.getLogger("atom")
 _VALID_KV_ROLES = {"offload", "kv_both", "kv_producer", "kv_consumer"}
+
+# Set while ``LMCacheEngine.retrieve`` runs. 0.5.5rc3 unpins every retrieved
+# object inside retrieve, and ``lookup_unpin`` unpins those same keys again
+# once the copy has returned. The second decrement drives ``pin_count``
+# negative; LMCache then treats the buffer as free and the next copy can
+# overwrite it. Holding the pin across retrieve leaves ``lookup_unpin`` as
+# the single release, which is what upstream LMCache #5098 did.
+_RETRIEVE_HOLD_PIN = contextvars.ContextVar(
+    "atom_lmcache_retrieve_hold_pin", default=False
+)
+_RETRIEVE_PIN_PATCHED = False
+
+
+def _unpin_unless_retrieve_holds_it(orig):
+    def unpin(self):
+        if _RETRIEVE_HOLD_PIN.get():
+            return True
+        return orig(self)
+
+    return unpin
+
+
+def _hold_pin_during_retrieve(method):
+    def wrapped(self, *args, **kwargs):
+        token = _RETRIEVE_HOLD_PIN.set(True)
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            _RETRIEVE_HOLD_PIN.reset(token)
+
+    return wrapped
+
+
+def install_single_lookup_unpin() -> None:
+    """Make a retrieved chunk's lookup pin release exactly once.
+
+    Idempotent. No-op when lmcache is not importable (unit tests that never
+    build an engine). Subclasses that override ``unpin`` are patched too,
+    because ``TensorMemoryObj.unpin`` does not call the base.
+    """
+    global _RETRIEVE_PIN_PATCHED
+    if _RETRIEVE_PIN_PATCHED:
+        return
+    try:
+        from lmcache.v1.cache_engine import LMCacheEngine
+        from lmcache.v1.memory_management import MemoryObj
+    except ImportError:
+        return
+
+    def _patch_unpin(cls) -> None:
+        if "unpin" in cls.__dict__:
+            current = cls.__dict__["unpin"]
+            if not getattr(current, "__isabstractmethod__", False) and not getattr(
+                current, "_atom_single_unpin", False
+            ):
+                wrapped = _unpin_unless_retrieve_holds_it(current)
+                wrapped._atom_single_unpin = True
+                cls.unpin = wrapped
+        for sub in list(cls.__subclasses__()):
+            _patch_unpin(sub)
+
+    _patch_unpin(MemoryObj)
+    for name in ("retrieve", "retrieve_layer"):
+        current = getattr(LMCacheEngine, name, None)
+        if current is None or getattr(current, "_atom_hold_pin", False):
+            continue
+        wrapped = _hold_pin_during_retrieve(current)
+        wrapped._atom_hold_pin = True
+        setattr(LMCacheEngine, name, wrapped)
+    _RETRIEVE_PIN_PATCHED = True
 
 
 def tokens_to_tensor(tokens: list[int]) -> torch.Tensor:
@@ -108,6 +179,8 @@ def build_offload_engine(
     from lmcache.v1.memory_management import MemoryFormat
 
     from atom.kv_transfer.offload.metadata import ATOMRawBytesLMCacheMetadata
+
+    install_single_lookup_unpin()
 
     if cfg is None:
         cfg = offcfg.build_lmcache_config(getattr(config, "kv_transfer_config", None))
