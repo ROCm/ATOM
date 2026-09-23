@@ -585,7 +585,7 @@ jobs:
   rdma-smoke-test:
     name: Mooncake RDMA smoke test
     needs: [load-config]
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.suite == 'smoke' }}
+    if: ${{ !cancelled() && needs.load-config.result == 'success' && github.event_name == 'workflow_dispatch' && inputs.suite == 'smoke' }}
     runs-on: ${{ inputs.atomesh_slurm_submit_runner }}
     timeout-minutes: 75
     env:
@@ -1589,8 +1589,12 @@ jobs:
   run-model-benchmark:
     name: ${{ matrix.id }}
     needs: [load-config]
+    # An explicit status check stops the implicit success() from skipping this
+    # job whenever the upstream stage-routing-bundle job is skipped.
     if: >-
-      needs.load-config.outputs.has_matrix == 'true'
+      !cancelled()
+      && needs.load-config.result == 'success'
+      && needs.load-config.outputs.has_matrix == 'true'
       && (
         github.event_name == 'schedule'
         || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark)
