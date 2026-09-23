@@ -645,3 +645,9 @@ def test_v41_sweep_matches_requested_runtime():
             assert capture == list(range(1, 33)) + [48, 64, 128]
         else:
             assert capture == list(range(1, 9)) + [16, 32, 48, 64, 128]
+
+
+def test_dispatch_input_count_fits_github_limit():
+    workflow = _workflow()
+    on = workflow.get("on", workflow.get(True))
+    assert len(on["workflow_dispatch"]["inputs"]) <= 25

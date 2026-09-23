@@ -104,9 +104,6 @@ on:
         description: "Agentic replay seconds per cell. 3600 = official; under 900 forces --unsafe-override and stamps submission_valid=false."
         type: string
         default: "3600"
-      extra_args:
-        description: "Extra arguments to pass to the ATOM server"
-        type: string
       image:
         description: "Image to use for the benchmark"
         type: string
@@ -117,10 +114,6 @@ on:
         default: ""
       enable_profiler:
         description: "Enable torch profiler to collect trace for performance debugging"
-        type: boolean
-        default: false
-      enable_rtl:
-        description: "Enable RTL (rocm-trace-lite) GPU kernel tracing for prefill/decode analysis"
         type: boolean
         default: false
       param_lists:
@@ -136,11 +129,6 @@ on:
         description: "ATOM commit SHA to checkout; leave empty to use the workflow ref"
         type: string
         default: ""
-      aiter_commit:
-        description: "ROCm/aiter commit SHA, tag, or branch to reinstall before benchmarking; leave empty to keep the image version"
-        type: string
-        default: ""
-
 permissions:
   actions: read
   contents: write
@@ -211,10 +199,10 @@ jobs:
       concurrency: ${{ matrix.config.concurrency }}
       image: ${{ inputs.image || 'rocm/atom-dev:latest' }}
       enable_profiler: ${{ inputs.enable_profiler || false }}
-      enable_rtl: ${{ inputs.enable_rtl || false }}
-      extra_args: ${{ inputs.extra_args || '' }}
+      enable_rtl: ${{ false || false }}
+      extra_args: ${{ '' || '' }}
       atom_commit: ${{ inputs.atom_commit || '' }}
-      aiter_commit: ${{ inputs.aiter_commit || '' }}
+      aiter_commit: ${{ '' || '' }}
 
   summarize-benchmark-result:
     concurrency:
@@ -474,10 +462,10 @@ jobs:
           download-required: "false"
 
       - name: Reinstall AITER from requested ref
-        if: ${{ inputs.aiter_commit != '' }}
+        if: ${{ '' != '' }}
         env:
           CONTAINER_NAME: atom-regression
-          AITER_GIT_REF: ${{ inputs.aiter_commit }}
+          AITER_GIT_REF: ${{ '' }}
         run: bash .github/scripts/install_aiter_from_ref.sh
 
       - name: Launch server
