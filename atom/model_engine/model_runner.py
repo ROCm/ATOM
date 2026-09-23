@@ -211,6 +211,7 @@ class tokenIDProcessor:
         max_num_batched_tokens: int,
         use_spec: bool = False,
         num_spec_tokens: int = 0,
+        spec_enabled: bool | None = None,
     ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
         kv_cfg = getattr(runner.config, "kv_transfer_config", {}) or {}
@@ -250,6 +251,12 @@ class tokenIDProcessor:
             publication_group="input_ids",
         )
         self.use_spec = use_spec
+        # `use_spec` answers "does this stage draft and sample", which under PP
+        # is the last one alone. This answers "is the run speculative at all",
+        # which is what the per-stage state rollback keys off: the batch's
+        # acceptance counts have to be picked up everywhere, not just where
+        # they were produced.
+        self.spec_enabled = use_spec if spec_enabled is None else spec_enabled
         self.num_spec_tokens = num_spec_tokens
         # Block-drafter warmup fabricates at least two requests, even when
         # the service admits only one. Real batches/graphs obey max_num_seqs.
@@ -551,7 +558,7 @@ class tokenIDProcessor:
                     self._publish_input_ids(total_tokens_decode, publication_group),
                     None,
                 )
-            if self.use_spec:
+            if self.spec_enabled:
                 # Every row's draft columns, not just the newly admitted ones
                 # the deferred branch stages. There the anchor of a carried-over
                 # request is still on the GPU and `fill_deferred_decode_ids`
@@ -559,6 +566,13 @@ class tokenIDProcessor:
                 # host already holds the real anchor -- postprocess wrote it
                 # back before this batch was built -- so `scheduled_tokens`
                 # above is correct at column 0 and only the drafts are missing.
+                #
+                # `spec_enabled`, not `use_spec`: this fills the ids the
+                # embedding reads, and the embedding is on the FIRST stage,
+                # while `use_spec` is only true on the LAST one. Gated the
+                # other way the verify window reaches the model with drafts
+                # still at their placeholder value, so every column past the
+                # anchor scores against a token nobody proposed.
                 _, lens, cu_np = self.runner.attn_metadata_builder.decode_spans(batch)
                 spec = batch.scheduled_spec_decode_tokens
                 for i in range(len(lens)):
@@ -566,15 +580,24 @@ class tokenIDProcessor:
                     if n_draft > 0:
                         s = int(cu_np[i]) + 1
                         self.input_ids.np[s : s + n_draft] = spec[i, :n_draft]
-                # The deferred branch publishes these further down and the
-                # backends read them off the processor, not off the batch:
-                # `GDNAttentionMetadataBuilder.prepare_num_accepted_tokens`
-                # leaves `num_accepted_tokens` at its fill value of 1 when
-                # `num_bonus` is None. Left unset, every request looks like it
-                # accepted exactly its anchor, and the linear-attention state
-                # rolls back to the wrong position on any step that accepted
-                # more. They describe the PREVIOUS step, which is what a
-                # rollback at the head of this one wants.
+            # The deferred branch publishes these further down and the
+            # backends read them off the processor, not off the batch:
+            # `GDNAttentionMetadataBuilder.prepare_num_accepted_tokens`
+            # leaves `num_accepted_tokens` at its fill value of 1 when
+            # `num_bonus` is None. Left unset, every request looks like it
+            # accepted exactly its anchor, and the linear-attention state
+            # rolls back to the wrong position on any step that accepted
+            # more. They describe the PREVIOUS step, which is what a
+            # rollback at the head of this one wants.
+            #
+            # Outside `use_spec`, which is `... and get_pp_group().is_last_rank`:
+            # only the last stage drafts and samples, but every stage carries
+            # linear-attention layers and every one of them has to roll back by
+            # the same amount. Reading it off the batch is what makes that
+            # possible -- the counts are pickled to all stages, while the
+            # processor these used to come from is only ever filled where
+            # sampling happens.
+            if self.spec_enabled:
                 self.num_rejected = batch.num_rejected
                 self.num_bonus = batch.num_bonus
             return (
@@ -800,7 +823,8 @@ class ModelRunner:
         default_dtype = self.config.torch_dtype
         torch.set_default_dtype(default_dtype)
         torch.set_default_device(self.device)
-        use_spec = bool(self.config.speculative_config) and get_pp_group().is_last_rank
+        spec_enabled = bool(self.config.speculative_config)
+        use_spec = spec_enabled and get_pp_group().is_last_rank
         self.num_spec_tokens = (
             self.config.speculative_config.num_speculative_tokens if use_spec else 0
         )
@@ -811,6 +835,7 @@ class ModelRunner:
             self.config.max_num_batched_tokens,
             use_spec,
             self.num_spec_tokens,
+            spec_enabled,
         )
         self.sampler = Sampler()
         self.arange_np = np.arange(
