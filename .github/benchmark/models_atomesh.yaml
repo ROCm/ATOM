@@ -475,6 +475,15 @@ models:
           pd_worker_layout: packed_nodes
           nodes: "${ATOMESH_2P1D_NODES}"
           concurrency: [12]
+          # Decode reuses its local prefix cache and pulls only the missing
+          # blocks from prefill, so keep each trajectory on one decode. The
+          # default 64-request balance trigger never fires at these
+          # concurrencies; fall back to the shortest queue past a gap of 2, and
+          # require half the prompt to match so a shared system prompt alone
+          # does not pin new trajectories to one decode.
+          router:
+            decode_policy: cache_aware
+            extra_args: "--cache-threshold 0.5 --balance-abs-threshold 2"
           server:
             common_args:
               <<: &glm52_agentic_cpp4_tp4_mtp5_args

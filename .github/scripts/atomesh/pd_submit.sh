@@ -220,6 +220,7 @@ exports = {
     "ROUTER_POLICY": router.get("policy", "random"),
     "ROUTER_PREFILL_POLICY": router.get("prefill_policy", ""),
     "ROUTER_DECODE_POLICY": router.get("decode_policy", ""),
+    "ROUTER_EXTRA_ARGS": router.get("extra_args", ""),
     "PROMETHEUS_PORT": router.get("prometheus_port", 29100),
     "KV_CACHE_DTYPE": server_args.get("kv_cache_dtype", "fp8"),
     "BLOCK_SIZE": server_args.get("block_size", 16),

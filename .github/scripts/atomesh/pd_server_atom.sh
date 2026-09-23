@@ -877,6 +877,9 @@ start_router() {
   if [[ -n "${ROUTER_DECODE_POLICY:-}" ]]; then
     router_role_policy_args+=(--decode-policy "${ROUTER_DECODE_POLICY}")
   fi
+  # Policy tuning such as --cache-threshold / --balance-abs-threshold.
+  local -a router_extra_args=()
+  read -r -a router_extra_args <<< "${ROUTER_EXTRA_ARGS:-}"
   if [[ "${router_policy}" == "kv_cache_aware" ]]; then
     ATOM_CACHE_ROUTING_CALIBRATION="${RUNTIME_LOG_DIR}/cache-routing-calibration.json"
     python3 "${ATOMESH_SCRIPT_DIR}/agentic_routing.py" router \
@@ -901,6 +904,7 @@ start_router() {
     "${router_role_policy_args[@]}"
     "${router_rank_mapping_args[@]}"
     "${router_dp_aware_args[@]}"
+    "${router_extra_args[@]}"
     --backend atom
     --log-level info
     --disable-circuit-breaker
