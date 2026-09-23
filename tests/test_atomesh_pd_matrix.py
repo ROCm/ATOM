@@ -71,6 +71,26 @@ class NodeSelectionTest(unittest.TestCase):
                 self.assertEqual(cell["nodes"], [])
                 self.assertEqual(cell["num_nodes"], expected)
 
+    def test_packed_nodes_fills_gpu_slots_before_adding_nodes(self):
+        prefill = {"workers": 1, "tp": 1, "extra_args": "--pipeline-parallel-size 4"}
+        for decode_workers, expected in ((1, 1), (3, 2), (5, 3)):
+            with self.subTest(decode_workers=decode_workers):
+                decode = {"workers": decode_workers, "tp": 4}
+                self.assertEqual(
+                    pd_matrix.required_node_count("packed_nodes", prefill, decode),
+                    expected,
+                )
+        # A TP8 worker cannot share its node, so 1P1D TP8 still needs two.
+        self.assertEqual(
+            pd_matrix.required_node_count("packed_nodes", {"tp": 8}, {"tp": 8}), 2
+        )
+        with self.assertRaisesRegex(ValueError, "fit on one 8-GPU node"):
+            pd_matrix.required_node_count(
+                "packed_nodes",
+                {"tp": 8, "extra_args": "--pipeline-parallel-size=2"},
+                {"tp": 4},
+            )
+
     def test_tw_explicit_nodes_are_preserved(self):
         nodes = ["mia1-p02-g42", "mia1-p02-g44", "mia1-p02-g47"]
         cell = self.build_cell(nodes=",".join(nodes))

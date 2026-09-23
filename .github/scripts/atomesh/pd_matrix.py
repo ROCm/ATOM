@@ -142,6 +142,29 @@ def resolve_runner(runner_cfg: dict[str, Any]) -> dict[str, Any]:
     return runner
 
 
+PIPELINE_SIZE_RE = re.compile(r"--pipeline-parallel-size(?:=|\s+)(\d+)")
+GPUS_PER_NODE = 8
+
+
+def worker_gpu_count(role_cfg: dict[str, Any]) -> int:
+    match = PIPELINE_SIZE_RE.search(str(role_cfg.get("extra_args", "")))
+    return int(role_cfg.get("tp", 8)) * (int(match.group(1)) if match else 1)
+
+
+def packed_node_count(prefill_cfg: dict[str, Any], decode_cfg: dict[str, Any]) -> int:
+    """Mirror pd_server_atom.sh: fill nodes P-first; no worker spans two nodes."""
+    nodes, used = 1, 0
+    for role_cfg in (prefill_cfg, decode_cfg):
+        gpus = worker_gpu_count(role_cfg)
+        if gpus > GPUS_PER_NODE:
+            raise ValueError("packed_nodes workers must fit on one 8-GPU node")
+        for _ in range(int(role_cfg.get("workers", 1))):
+            if used + gpus > GPUS_PER_NODE:
+                nodes, used = nodes + 1, 0
+            used += gpus
+    return nodes
+
+
 def required_node_count(
     pd_worker_layout: str,
     prefill_cfg: dict[str, Any],
@@ -149,6 +172,8 @@ def required_node_count(
 ) -> int:
     if pd_worker_layout == "single_node":
         return 1
+    if pd_worker_layout == "packed_nodes":
+        return packed_node_count(prefill_cfg, decode_cfg)
     if pd_worker_layout == "paired_nodes":
         prefill = int(prefill_cfg.get("workers", 1))
         if prefill != int(decode_cfg.get("workers", 1)):
