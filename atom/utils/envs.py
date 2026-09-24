@@ -618,6 +618,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM": lambda: (
         os.getenv("ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM", "0") == "1"
     ),
+    # gfx1250 MXFP8 ASM GEMM for DSv4 attn wq_b/indexer.wq_b/wo_b at M >= 512.
+    "ATOM_DSV4_USE_GFX1250_MXFP8_ASM_GEMM": lambda: (
+        os.getenv("ATOM_DSV4_USE_GFX1250_MXFP8_ASM_GEMM", "0") == "1"
+    ),
     # --- V4 Attention Backend Refactor (PR-A: kill .item(), unlock CUDAGraph) ---
     # `legacy` (default) keeps the per-seq Python dispatch loop with .item()
     # syncs in deepseek_v4.py. `new` routes through V4AttentionBackend with
