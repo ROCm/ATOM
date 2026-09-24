@@ -6,6 +6,7 @@ MODEL_PATH=${2:-meta-llama/Meta-Llama-3-8B-Instruct}
 EXTRA_ARGS=("${@:3}")
 ATOM_DOCKER_IMAGE=${ATOM_DOCKER_IMAGE:-}
 ATOM_SERVER_PORT=${ATOM_SERVER_PORT:-8000}
+ATOM_INFER_STUCK_POLLS="${ATOM_INFER_STUCK_POLLS:-18}"
 
 print_device_mapping_debug() {
   [ "${ATOM_DEBUG_DEVICE_MAPPING:-0}" = "1" ] || return 0
@@ -240,7 +241,7 @@ PY
   fi
 
   # Supervise: drain detects engine fault (exit 2 in <=10s), engine hang
-  # (exit 1 in <=60s), clean completion (exit 0 when client gone + no
+  # (exit 1 after 18×10s by default; configurable), clean completion (exit 0 when client gone + no
   # pending output), or timeout (exit 4 at MAX_MIN). Without this the
   # accuracy step burns the full `timeout-minutes` whenever an aiter
   # kernel asserts mid-prefill or a GPU faults — lm_eval just keeps
@@ -251,8 +252,11 @@ PY
   #     concurrency burst on short ISL configs)
   #   - DP-attention SHM coordination warnings (`shared memory broadcast
   #     block found in 60.0 seconds` is CPU-idle waiting, not a hang)
-  # Real GPU hangs / faults still surface within ACCURACY_TIMEOUT_MINUTES.
-  bash scripts/wait_infer_drain.sh 8000 "$ACCURACY_TIMEOUT_MINUTES" 10 "$ATOM_CLIENT_LOG" 18
+  # Real GPU faults still surface within one poll via fault grep; no-output
+  # hangs can be tuned by the caller via ATOM_INFER_STUCK_POLLS.
+  bash scripts/wait_infer_drain.sh \
+    8000 "$ACCURACY_TIMEOUT_MINUTES" 10 \
+    "$ATOM_CLIENT_LOG" "$ATOM_INFER_STUCK_POLLS"
   DRAIN_RC=$?
   if [ "$DRAIN_RC" -ne 0 ]; then
     echo "wait_infer_drain.sh exit=$DRAIN_RC — killing client pgid $CLIENT_PID"
@@ -466,10 +470,8 @@ if [ "$TYPE" == "benchmark" ]; then
 
   echo "========== Supervising benchmark with wait_infer_drain.sh =========="
   # Per-model overrides: ATOM_BENCHMARK_STUCK_POLLS, ATOM_BENCHMARK_MAX_MINUTES.
-  # Default stuck window is 18 × POLL_SEC (3 min); long-running cases (e.g.
-  # 8k/1k high concurrency) set ATOM_BENCHMARK_STUCK_POLLS in models.json.
   benchmark_max_minutes=${ATOM_BENCHMARK_MAX_MINUTES:-120}
-  benchmark_stuck_polls=${ATOM_BENCHMARK_STUCK_POLLS:-18}
+  benchmark_stuck_polls=${ATOM_BENCHMARK_STUCK_POLLS:-$ATOM_INFER_STUCK_POLLS}
   bash scripts/wait_infer_drain.sh \
     ${ATOM_SERVER_PORT} "$benchmark_max_minutes" 10 \
     "$ATOM_CLIENT_LOG" "$benchmark_stuck_polls"
