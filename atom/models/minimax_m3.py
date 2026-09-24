@@ -33,6 +33,11 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from atom.model_ops.minimax_m3 import attention_fp8 as _attention_fp8
+from atom.model_ops.minimax_m3.input_norm_fp8 import (
+    fused_m3_gemma_norm_fp8,
+    supports_m3_fused_gemma_fp8,
+)
 from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
@@ -46,6 +51,7 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 
 
@@ -115,6 +121,23 @@ def _linear_consumes_per_token_fp8(linear: nn.Module) -> bool:
         quant_type_value == QuantType.per_Token.value
         and getattr(linear, "params_dtype", None) == dtypes.fp8
     )
+
+
+def _minimax_m3_attend_and_project(attn, o_proj, q, k, v, positions, qkv):
+    # Keep one output schema for all token counts; the opaque custom op selects
+    # the measured transport at runtime, including when a graph is reused.
+    if (
+        getattr(attn, "_m3_sp_fp8_output_supported", False)
+        and q.dtype == torch.bfloat16
+        and q.shape[-1] == 8192
+        and o_proj.input_size == 8192
+        and _linear_consumes_per_token_fp8(o_proj)
+    ):
+        output, scale = torch.ops.aiter.minimax_m3_attention_fp8(
+            q, k, v, positions, attn.layer_name, qkv
+        )
+        return o_proj(output, x_scale=scale)
+    return o_proj(attn(q, k, v, positions=positions, qkv=qkv))
 
 
 def _minimax_m3_cos_sin_cache(
@@ -294,6 +317,13 @@ class MiniMaxM3MoE(nn.Module):
             # padded intermediate avoids backend pad-skip precision issues.
             self.experts.quant_method.intermediate_pad = 0
         self.experts.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
+        self.experts._sp_tiled_sort_enabled = False
+        if envs.ATOM_SP_MOE_TILED_SORT:
+            from atom.model_ops.sp_moe_sort import supports_m3_sp_tiled_sort
+
+            self.experts._sp_tiled_sort_enabled = supports_m3_sp_tiled_sort(
+                self.experts
+            )
         self.fuse_shared_experts = (
             getattr(self.experts, "num_fused_shared_experts", 0) > 0
         )
@@ -390,6 +420,9 @@ class MiniMaxM3Attention(nn.Module):
             k_norm=self.k_norm,
             prefix=f"{prefix}.attn",
         )
+        self.attn._m3_sp_fp8_output_supported = (
+            _attention_fp8.supports_m3_attention_fp8(self.q_size)
+        )
 
     def forward(
         self,
@@ -399,8 +432,9 @@ class MiniMaxM3Attention(nn.Module):
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        attn_output = self.attn(q, k, v, positions=positions, qkv=qkv)
-        return self.o_proj(attn_output)
+        return _minimax_m3_attend_and_project(
+            self.attn, self.o_proj, q, k, v, positions, qkv
+        )
 
 
 class MiniMaxM3SparseAttention(nn.Module):
@@ -540,6 +574,9 @@ class MiniMaxM3SparseAttention(nn.Module):
             sparse_layer_ordinal=self.sparse_layer_ordinal,
             index_cache_dtype=index_cache_config,
         )
+        self.attn._m3_sp_fp8_output_supported = (
+            _attention_fp8.supports_m3_attention_fp8(self.q_size)
+        )
 
     def forward(
         self,
@@ -560,8 +597,9 @@ class MiniMaxM3SparseAttention(nn.Module):
             ],
             dim=-1,
         )
-        attn_output = self.attn(q, k, v, positions, qkv=qkv)
-        return self.o_proj(attn_output)
+        return _minimax_m3_attend_and_project(
+            self.attn, self.o_proj, q, k, v, positions, qkv
+        )
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
@@ -612,6 +650,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self._m3_fused_gemma_fp8 = supports_m3_fused_gemma_fp8(config.hidden_size)
 
     def forward(
         self,
@@ -631,7 +670,14 @@ class MiniMaxM3DecoderLayer(nn.Module):
             not self.is_moe_layer
             and _linear_consumes_per_token_fp8(self.mlp.gate_up_proj)
         )
-        if residual is None:
+        if self._m3_fused_gemma_fp8 and fuse_input_ar_rmsnorm_quant:
+            hidden_states, hidden_states_scale, residual = fused_m3_gemma_norm_fp8(
+                hidden_states,
+                self.input_layernorm.weight,
+                self.input_layernorm.variance_epsilon,
+                residual,
+            )
+        elif residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         elif fuse_input_ar_rmsnorm_quant:
@@ -657,7 +703,15 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states_scale=hidden_states_scale,
         )
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
-        if fuse_post_attention_ar_rmsnorm_quant:
+        if self._m3_fused_gemma_fp8 and fuse_post_attention_ar_rmsnorm_quant:
+            hidden_states, hidden_states_scale, residual = fused_m3_gemma_norm_fp8(
+                hidden_states,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
+                residual,
+            )
+            hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)
+        elif fuse_post_attention_ar_rmsnorm_quant:
             hidden_states, hidden_states_scale, residual = (
                 fused_allreduce_gemma_rms_norm_quant(
                     hidden_states, residual, self.post_attention_layernorm

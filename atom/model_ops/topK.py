@@ -38,6 +38,24 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
         and _has_module("mori")
     )
     if (
+        getattr(config, "sequence_parallel_size", 1) > 1
+        and config.enable_expert_parallel
+        and (requested_all2all == "rccl" or mori_selected)
+    ):
+        # Routed shared-expert fusion only has an MXFP4 implementation. Keep
+        # other dtypes on the model's ordinary shared MLP, which computes its
+        # local SP tokens with full weights. The loader uses this same decision
+        # so shared weights cannot be redirected to a nonexistent fused slot.
+        routed_spec = (
+            quant_config.get_layer_quant_config(
+                routed_expert_prefix, check_children=True
+            )
+            if quant_config is not None and routed_expert_prefix is not None
+            else quant_config
+        )
+        if getattr(routed_spec, "quant_dtype", None) != torch.float4_e2m1fn_x2:
+            return False
+    if (
         dp_size > 1
         and mori_selected
         and config.enable_dp_attention

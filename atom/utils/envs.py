@@ -48,6 +48,28 @@ def _positive_float_env(name: str, default: str) -> float:
 environment_variables: dict[str, Callable[[], Any]] = {
     # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
     "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
+    "ATOM_COMPILE_CACHE_ROOT": lambda: os.path.expanduser(
+        os.getenv("ATOM_COMPILE_CACHE_ROOT", "~/.cache/atom")
+    ),
+    # SP communication candidates remain opt-in until accuracy and serving
+    # performance have been verified for the model and workload.
+    "ATOM_SP_MOE_LOCAL_TOPK": lambda: os.getenv("ATOM_SP_MOE_LOCAL_TOPK", "0") == "1",
+    "ATOM_SP_MOE_PACK_GATHER": lambda: os.getenv("ATOM_SP_MOE_PACK_GATHER", "0") == "1",
+    "ATOM_SP_QUICK_REDUCE_SCATTER": lambda: (
+        os.getenv("ATOM_SP_QUICK_REDUCE_SCATTER", "0") == "1"
+    ),
+    "ATOM_SP_ATTN_FP8": lambda: os.getenv("ATOM_SP_ATTN_FP8", "0") == "1",
+    "ATOM_SP_REGISTER_GRAPH_INPUTS": lambda: (
+        os.getenv("ATOM_SP_REGISTER_GRAPH_INPUTS", "0") == "1"
+    ),
+    "ATOM_SP_FUSED_GEMMA_FP8": lambda: (
+        os.getenv("ATOM_SP_FUSED_GEMMA_FP8", "0") == "1"
+    ),
+    "ATOM_SP_HEAD_EXCHANGE": lambda: os.getenv("ATOM_SP_HEAD_EXCHANGE", "0") == "1",
+    "ATOM_SP_MOE_QUANT_REGISTERED": lambda: (
+        os.getenv("ATOM_SP_MOE_QUANT_REGISTERED", "0") == "1"
+    ),
+    "ATOM_SP_MOE_TILED_SORT": lambda: (os.getenv("ATOM_SP_MOE_TILED_SORT", "0") == "1"),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
