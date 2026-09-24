@@ -1895,6 +1895,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer, x.shape[0] * get_sp_world_size(), x.dtype
         ):
             return sp_moe_gather(x), None
+        if envs.ATOM_SP_MOE_QUANT_REGISTERED:
+            from atom.distributed.sp_registered_buffer import quantize_gather_moe_input
+            from atom.distributed.ulysses_sp import get_sp_group
+
+            direct = quantize_gather_moe_input(x, get_sp_group())
+            if direct is not None:
+                quantized, scale = direct
+                scale = sp_moe_gather(scale.view(torch.bfloat16)).view(dtypes.fp8_e8m0)
+                return quantized, scale
         quantized, scale = get_hip_quant(self.quant_type)(
             x, quant_dtype=dtypes.fp4x2, shuffle=False
         )
@@ -1903,6 +1912,44 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         quantized = sp_moe_gather(quantized.view(torch.bfloat16)).view(dtypes.fp4x2)
         scale = sp_moe_gather(scale.view(torch.bfloat16)).view(dtypes.fp8_e8m0)
         return quantized, scale
+
+    def gather_sp_routed_input(self, layer, x, router_logits, *, packed=False):
+        """Move row-local routing before the SP gather, retaining all route bits.
+
+        The caller only selects this path for the existing non-EP external-FP4
+        kernel configuration. EPLB/dispatch remapping must remain disabled:
+        those operations can depend on the global token position and rank.
+        """
+        weights, ids = self.select_experts_with_record(
+            layer=layer,
+            hidden_states=x,
+            router_logits=router_logits,
+            use_grouped_topk=layer.use_grouped_topk,
+            top_k=layer.top_k,
+            renormalize=layer.renormalize,
+            topk_group=layer.topk_group,
+            num_expert_group=layer.num_expert_group,
+            global_num_experts=layer.global_num_experts,
+            custom_routing_function=layer.custom_routing_function,
+            scoring_func=layer.scoring_func,
+            e_score_correction_bias=layer.e_score_correction_bias,
+            fused_shared_experts_scoring_func=layer.shared_expert_scoring_func,
+        )
+        if packed:
+            from atom.model_ops.sp_moe_pack import (
+                quantize_pack_moe_inputs,
+                unpack_moe_inputs,
+            )
+
+            send, quantized, scale = quantize_pack_moe_inputs(x, weights, ids)
+            gathered = sp_moe_gather(send)
+            return unpack_moe_inputs(
+                gathered, quantized, scale, weights, ids, get_sp_world_size()
+            )
+        quantized, scale = self.gather_sp_input(layer, x)
+        weights = sp_moe_gather(weights)
+        ids = sp_moe_gather(ids.view(torch.bfloat16)).view(torch.int32)
+        return quantized, scale, weights, ids
 
     @mark_trace
     def apply(
@@ -1925,6 +1972,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         activation: ActivationType = ActivationType.Silu,
         prefix: str = "",
         sp_input_scale: torch.Tensor | None = None,
+        sp_topk: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         # ATOM_USE_TRITON_MOE_DECODE splits the two kernels by phase: the weights
         # sit in the FlyDSL layout, so prefill falls through to the FlyDSL tail
@@ -2104,21 +2152,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 act_quant=self.act_quant,
             )
 
-        topk_weights, topk_ids = self.select_experts_with_record(
-            layer=layer,
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            global_num_experts=global_num_experts,
-            custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            e_score_correction_bias=e_score_correction_bias,
-            fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
-        )
+        if sp_topk is None:
+            topk_weights, topk_ids = self.select_experts_with_record(
+                layer=layer,
+                hidden_states=x,
+                router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                global_num_experts=global_num_experts,
+                custom_routing_function=custom_routing_function,
+                scoring_func=scoring_func,
+                e_score_correction_bias=e_score_correction_bias,
+                fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
+            )
+        else:
+            topk_weights, topk_ids = sp_topk
         a1_scale = (
             sp_input_scale
             if sp_input_scale is not None
@@ -2302,6 +2353,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_scale=layer.w2_weight_scale,
                 a1_scale=a1_scale,
                 dtype=torch.bfloat16 if sp_input_scale is not None else None,
+                use_tiled_sort=getattr(layer, "_sp_tiled_sort_enabled", False),
                 a2_scale=a2_scale,
                 doweight_stage1=apply_router_weight_on_input,
                 bias1=layer.w13_bias,
@@ -5346,17 +5398,44 @@ class FusedMoE(torch.nn.Module):
         sp_moe = sp_is_enabled() and not self.moe_parallel_config.use_all2all_kernels
         sp_input_kwargs = {}
         if sp_moe:
-            if (
+            mxfp4_input = (
                 type(self.quant_method) is Mxfp4MoEMethod
                 and self.moe_parallel_config.dp_logical_ratio == 1
-            ):
+            )
+            local_topk = (
+                mxfp4_input
+                and (envs.ATOM_SP_MOE_LOCAL_TOPK or envs.ATOM_SP_MOE_PACK_GATHER)
+                and not self.use_ep
+                and not self.expert_layout.shared_is_routed
+                and not self.use_grouped_topk
+                and self.scoring_func == "sigmoid"
+                and hidden_states.shape[0] * get_sp_world_size() >= 32768
+                and self.quant_method._sp_input_can_prequantize(
+                    self,
+                    hidden_states.shape[0] * get_sp_world_size(),
+                    hidden_states.dtype,
+                )
+            )
+            if local_topk:
+                hidden_states, input_scale, weights, ids = (
+                    self.quant_method.gather_sp_routed_input(
+                        self,
+                        hidden_states,
+                        router_logits,
+                        packed=envs.ATOM_SP_MOE_PACK_GATHER,
+                    )
+                )
+                sp_input_kwargs["sp_input_scale"] = input_scale
+                sp_input_kwargs["sp_topk"] = (weights, ids)
+            elif mxfp4_input:
                 hidden_states, input_scale = self.quant_method.gather_sp_input(
                     self, hidden_states
                 )
                 sp_input_kwargs["sp_input_scale"] = input_scale
             else:
                 hidden_states = sp_moe_gather(hidden_states)
-            router_logits = sp_moe_gather(router_logits)
+            if not local_topk:
+                router_logits = sp_moe_gather(router_logits)
 
         # Simulated DP with no peers to gather from: the absent ranks' token
         # shards are stood in for locally, same as after the gather in

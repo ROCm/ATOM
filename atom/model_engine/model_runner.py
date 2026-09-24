@@ -45,6 +45,7 @@ from atom.distributed.ulysses_sp import (
     get_sp_world_size,
     set_sp_world_size,
     sp_gather_tokens,
+    sp_graph_capture,
     sp_is_enabled,
     sp_local_slice,
     sp_pad_len,
@@ -3911,7 +3912,12 @@ class ModelRunner:
         # Whether it supports a ragged num_tokens_pad (zero-copy-q attn-core graphs).
         supports_ragged_capture = "num_tokens_pad" in _build_params
 
-        with pause_gc(), graph_capture() as capture_ctx, self.capture_profiler as prof:
+        with (
+            pause_gc(),
+            graph_capture() as capture_ctx,
+            sp_graph_capture(capture_ctx),
+            self.capture_profiler as prof,
+        ):
             for max_q_len in q_buckets:
                 capture_range = (
                     tqdm.tqdm(self.capture_sizes)

@@ -2714,6 +2714,25 @@ class Config:
         # deploying it on top of a cache built with the other setting — reuses a
         # stale artifact and trips assert_size_stride at runtime.
         factors.append(bool(envs.ATOM_REPLICATE_VOCAB_EMBED))
+        # SP attention FP8 changes a Tensor-returning split op into a tuple
+        # (activation, scale). Other SP communication modes must also retain
+        # separate artifacts when users switch ablation configurations.
+        factors.append(
+            (
+                bool(envs.ATOM_SP_MOE_LOCAL_TOPK),
+                bool(envs.ATOM_SP_MOE_PACK_GATHER),
+                bool(envs.ATOM_SP_QUICK_REDUCE_SCATTER),
+                bool(envs.ATOM_SP_ATTN_FP8),
+                bool(envs.ATOM_SP_REGISTER_GRAPH_INPUTS),
+                bool(envs.ATOM_SP_FUSED_GEMMA_FP8),
+                bool(envs.ATOM_SP_HEAD_EXCHANGE),
+                bool(envs.ATOM_SP_MOE_QUANT_REGISTERED),
+                bool(envs.ATOM_SP_MOE_TILED_SORT),
+            )
+        )
+        if envs.ATOM_SP_FUSED_GEMMA_FP8:
+            # Invalidate graphs using the retired standalone norm/quant op.
+            factors.append("m3_gemma_fp8_aiter_per_token_v2")
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False

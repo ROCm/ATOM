@@ -16,6 +16,7 @@ import torch.fx as fx
 from atom.config import CompilationConfig, Config, CUDAGraphMode
 from atom.utils import (
     compilation_counter,
+    envs,
     is_torch_equal_or_newer,
 )
 from torch._dispatch.python import enable_python_dispatcher
@@ -472,7 +473,7 @@ def set_model_tag(tag: str):
         model_tag = old_tag
 
 
-VLLM_CACHE_ROOT = os.path.expanduser("~/.cache/atom")
+VLLM_CACHE_ROOT = envs.ATOM_COMPILE_CACHE_ROOT
 
 
 class VllmBackend:

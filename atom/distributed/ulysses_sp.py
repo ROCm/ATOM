@@ -46,6 +46,23 @@ def get_sp_group():
     return get_pcp_group()
 
 
+def sp_graph_capture(capture_context):
+    """Register SP collective inputs along with the enclosing device graph.
+
+    AITER's global capture context does not include the PCP group used by SP.
+    Reuse its stream, and avoid flushing an already active communicator.
+    """
+    from contextlib import nullcontext
+
+    if not envs.ATOM_SP_REGISTER_GRAPH_INPUTS or not sp_is_enabled():
+        return nullcontext()
+    group = get_sp_group()
+    ca_comm = getattr(getattr(group, "device_communicator", None), "ca_comm", None)
+    if ca_comm is None or ca_comm.disabled or getattr(ca_comm, "_IS_CAPTURING", False):
+        return nullcontext()
+    return group.graph_capture(capture_context)
+
+
 def attn_head_shard_size() -> int:
     """Head-sharding factor used by attention, metadata, and KV-cache geometry."""
     from aiter.dist.parallel_state import get_tp_group
@@ -166,6 +183,15 @@ def ulysses_gather_heads(x: torch.Tensor) -> torch.Tensor:
 
 def _swap_heads(x, s_local, width):
     """``[w*s_local, width] -> [s_local, w*width]`` by all-to-all."""
+    if envs.ATOM_SP_HEAD_EXCHANGE:
+        from atom.distributed.sp_head_exchange import (
+            exchange_heads,
+            head_exchange_communicator,
+        )
+
+        ca = head_exchange_communicator(x)
+        if ca is not None:
+            return exchange_heads(x, ca)
     from atom.distributed.sp_kernels import all_to_all_into
 
     send = x.reshape(_SP_WORLD_SIZE, s_local, width).contiguous()
@@ -188,6 +214,12 @@ def sp_moe_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
         return x
     x = x.contiguous()
     group = get_sp_group()
+    if envs.ATOM_SP_QUICK_REDUCE_SCATTER:
+        from atom.distributed.quick_reduce_scatter import try_quick_reduce_scatter
+
+        out = try_quick_reduce_scatter(x, group)
+        if out is not None:
+            return out
     # The generic communicator allocates a second output and copies it even
     # for dim=0. PyNccl can write the final token shard directly.
     if not _custom_reduce_scatter_ok(x, group):
@@ -259,7 +291,9 @@ def _exchange_columns(source, spec, owner):
     return group.custom_all_gather(source).index_select(1, columns)
 
 
-def ulysses_attention(attn, query, key, value, positions, q_scale, qkv):
+def ulysses_attention(
+    attn, query, key, value, positions, q_scale, qkv, output_transform=None
+):
     """Run this rank's head slice over the full sequence, then restore tokens.
 
     Called inside the attention custom op, keeping collectives and padding
@@ -324,4 +358,6 @@ def ulysses_attention(attn, query, key, value, positions, q_scale, qkv):
         out = torch.cat(
             [out, out.new_zeros(padded_tokens - real_tokens, *out.shape[1:])], dim=0
         )
+    if output_transform is not None:
+        return output_transform(out)
     return ulysses_gather_heads(out)
