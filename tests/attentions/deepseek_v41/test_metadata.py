@@ -385,3 +385,74 @@ def test_startup_dummy_keeps_private_scratch_before_pool_allocation():
     assert builder.cache is None
     assert metadata.cache is not None
     assert metadata.step.scheduled == 6
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize(
+    "phase,position,length",
+    [
+        ("prefill", 0, 1),
+        ("prefill", 31, 1),
+        ("prefill", 32, 1),
+        ("decode", 31, 1),
+        ("verify", 31, 1),
+        ("verify", 31, 3),
+    ],
+)
+def test_parent_preparation_preserves_phase(device, phase, position, length):
+    """A one-token parent prefill needs prefill metadata even with DSpark on."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required")
+    from atom.utils.forward_context import AttnState
+
+    geo = V41PoolGeometry(
+        1,
+        ((0, 2),),
+        32,
+        4,
+        512,
+        32,
+        speculative_tokens=0 if phase == "decode" else 2,
+        layer_ratios=(0, 2),
+        index_topk=4,
+        index_block_rows=8,
+    )
+    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    builder.geometry, builder.device, builder.block_size = geo, device, 32
+    builder.cache = PagedAttentionCache(geo, 4, 1, device, max_tokens=8)
+    builder.model_runner = SimpleNamespace(
+        forward_vars=metadata_buffers(1, 8, 4, device, geo),
+        tokenID_processor=SimpleNamespace(num_rejected=None),
+    )
+    batch = SimpleNamespace(
+        is_dummy_run=False,
+        state_slots_committed=[0],
+        req_ids=(17,),
+        num_scheduled_tokens=(length,),
+        context_lens=(position + length,),
+        block_tables=((0, 1, 2, 3),),
+        total_seqs_num=1,
+        total_tokens_num=length,
+        num_spec_step=length - 1,
+    )
+    if phase == "prefill":
+        metadata, positions = builder.prepare_prefill(batch, 1)
+    else:
+        metadata, positions = builder.prepare_decode(batch, 1, length, length)
+    step = metadata.step
+    assert step.is_prefill == (phase == "prefill")
+    assert step.decode == (phase != "prefill")
+    assert step.tentative == (phase == "verify")
+    assert metadata.state == (
+        AttnState.PREFILL_PREFIX if phase == "prefill" else AttnState.DECODE
+    )
+    assert positions.tolist() == list(range(position, position + length))
+    assert not hasattr(builder, "_tbo_storage")
+    if device == "cuda":
+        for prefix, extend, _ in step.indptrs.values():
+            assert (prefix.data_ptr() != extend.data_ptr()) == (phase == "prefill")
+            if phase == "prefill":
+                assert extend.tolist() == [0, 1]
+        tiles = builder.cache.unit_tiles(step, 2)
+        columns = (position + length + 31) // 32 if phase == "prefill" else 4
+        assert tiles.shape == (length, columns * (geo.rows_per_page(2) // 8))

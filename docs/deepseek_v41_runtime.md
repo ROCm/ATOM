@@ -166,6 +166,10 @@ The existing `ATOM_TBO_PREFILL_MIN_TOKENS` threshold applies, and
 `ATOM_TBO_PREFILL_TOKEN_SPLIT=1` permits splitting within a request. Eligibility
 is agreed across DP ranks; an idle or incompatible peer selects ordinary execution.
 
+Parent preparation and TBO children both preserve the explicit prefill phase.
+A one-token prefill therefore uses prefill indptrs and bounded tile tables even
+when DSpark is enabled; tentative verification retains decode semantics.
+
 Each microbatch preserves absolute token positions, request state slots and
 page tables, with separate compression plans, attention indptrs and cross-layer
 selection state. Ragged prefill retains local row counts and reuses the

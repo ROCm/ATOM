@@ -74,7 +74,7 @@ class BatchStep:
     # built once per forward and read by every owner that shares that ratio.
     plans: dict[int, object] = field(default_factory=dict)
     tentative: bool = False
-    # Splitting a prefill down to one token must not select decode kernels.
+    # A one-token prefill, parent or microbatch, must not select decode kernels.
     is_prefill: bool = False
     # Where each request starts, on the host. Built for `prefill_positions`
     # anyway, and published so the state lifecycle compares against the same

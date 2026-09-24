@@ -264,6 +264,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         *,
         max_q_len=None,
         tentative=False,
+        is_prefill=False,
         start_positions=None,
     ):
         spans, offset, next_page = [], 0, 0
@@ -339,6 +340,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         step = cache.begin_step(
             spans,
             tentative=verifying,
+            is_prefill=is_prefill,
             buffers=self.model_runner.forward_vars,
             running_bs=running_bs,
             running_tokens=running_tokens,
@@ -378,7 +380,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         return metadata, positions.gpu[:running_tokens]
 
     def prepare_prefill(self, batch, running_bs):
-        return self._prepare(batch, running_bs, batch.total_tokens_num)
+        return self._prepare(batch, running_bs, batch.total_tokens_num, is_prefill=True)
 
     @contextmanager
     def ubatch_forward(self, metadata):
