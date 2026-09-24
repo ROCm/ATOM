@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Tuple
 
 import aiter
 import torch
@@ -20,13 +19,15 @@ from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
+from aiter.ops.triton.quant.fused_mxfp8_quant import fused_dual_rmsnorm_mxfp8_quant
+from torch import Tensor, nn
+from torch.overrides import handle_torch_function, has_torch_function_unary
+
 from atom.config import QuantizationConfig
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
-from atom.utils.decorators import mark_trace
 from atom.utils import envs
-from torch import Tensor, nn
-from torch.overrides import handle_torch_function, has_torch_function_unary
+from atom.utils.decorators import mark_trace
 
 
 def silu(input: Tensor, inplace: bool = False) -> Tensor:
@@ -72,7 +73,7 @@ def rmsnorm2d_fwd_(
 @torch_compile_guard()
 def rmsnorm2d_fwd_with_add_(
     x: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor, eps: float, dim: int
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     ori_shape = x.shape
     x = x.reshape(-1, dim)
     out = torch.empty_like(x)
@@ -117,7 +118,7 @@ def fused_add_rmsnorm_pad_fake_tensors(
     epsilon: float,
     res: torch.Tensor,
     x_pad_to_multiple: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     M, N = x.shape
     N_out = (N + x_pad_to_multiple - 1) // x_pad_to_multiple * x_pad_to_multiple
     out = torch.empty((M, N_out), dtype=x.dtype, device=x.device)
@@ -132,7 +133,7 @@ def fused_add_rmsnorm_pad_(
     epsilon: float,
     res: torch.Tensor,
     x_pad_to_multiple: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     return fused_add_rmsnorm_pad(x, weight, epsilon, res, x_pad_to_multiple)
 
 
@@ -154,6 +155,19 @@ _QV_PER_1X32 = QuantType.per_1x32.value
 _QV_PER_1X128 = QuantType.per_1x128.value
 _QV_PER_TOKEN = QuantType.per_Token.value
 _AITER_RMS_QUANT_TYPE_VALUES = frozenset({_QV_PER_1X32, _QV_PER_1X128, _QV_PER_TOKEN})
+_FP8_VALUE_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
+
+def _is_mxfp8(quant_type_value: int, value_dtype: torch.dtype | None) -> bool:
+    """`per_1x32` carrying E4M3 values rather than packed E2M1.
+
+    The quant type cannot answer this on its own: MXFP4 and MXFP8 share the
+    group and the UE8M0 scale format and differ only in how wide a value is,
+    so the value dtype is the one thing that separates them. DeepSeek-V4.1's
+    `native_quant_config` is the caller that wants the FP8 width, and its GEMM
+    (`native_quant_linear`) reads the scale row-major, unshuffled.
+    """
+    return quant_type_value == _QV_PER_1X32 and value_dtype in _FP8_VALUE_DTYPES
 
 
 def _aiter_rms_quant_fake(
@@ -162,12 +176,20 @@ def _aiter_rms_quant_fake(
     eps: float,
     quant_type_value: int,
     transpose_scale: bool,
-    res1: Optional[torch.Tensor] = None,
+    res1: torch.Tensor | None = None,
+    value_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from aiter.utility.dtypes import fp8
 
     M, N = x.shape
-    if quant_type_value == _QV_PER_1X32:
+    if _is_mxfp8(quant_type_value, value_dtype):
+        # MXFP8: out=(M, N) E4M3; scale=(M, N/32) UE8M0, one byte per group and
+        # row-major, which is the `(x, x_scale)` pair `native_quant_linear`
+        # takes -- the same pair its own `quantize_fp8` would have produced, so
+        # the linear skips quantizing and reads these directly.
+        out = torch.empty((M, N), dtype=fp8, device=x.device)
+        scale = torch.empty((M, N // 32), dtype=torch.float8_e8m0fnu, device=x.device)
+    elif quant_type_value == _QV_PER_1X32:
         # MXFP4: out=(M, N/2) fp4x2; scale=(⌈M/256⌉*256, ⌈⌈N/32⌉/8⌉*8) UE8M0
         # bytes (kernel writes one uint8 per group; passing fp8_e8m0fnu
         # directly yields the matching byte layout — no fp32 view).
@@ -208,14 +230,20 @@ def _aiter_rms_quant(
     eps: float,
     quant_type_value: int,
     transpose_scale: bool,
-    res1: Optional[torch.Tensor] = None,
+    res1: torch.Tensor | None = None,
+    value_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from aiter import add_rmsnorm_quant, rmsnorm_quant
 
     out, scale, out_res1 = _aiter_rms_quant_fake(
-        x, weight, eps, quant_type_value, transpose_scale, res1
+        x, weight, eps, quant_type_value, transpose_scale, res1, value_dtype
     )
-    if quant_type_value == _QV_PER_1X32:
+    if _is_mxfp8(quant_type_value, value_dtype):
+        # The FP8 width is carried by `out`'s dtype and the UE8M0 format by
+        # `scale`'s -- the kernel reads both off the tensors it is handed, so
+        # the only thing left to state is that the scale stays row-major.
+        group_size, shuffle = 32, False
+    elif quant_type_value == _QV_PER_1X32:
         group_size, shuffle = 32, True
     elif quant_type_value == _QV_PER_1X128:
         group_size, shuffle = 128, transpose_scale
@@ -239,7 +267,7 @@ class RMSNorm(nn.Module):
         fused_allreduce: bool = False,
         fused_quant: bool = False,
         fused_quant_emit_bf16: bool = False,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -343,7 +371,7 @@ class RMSNorm(nn.Module):
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
-        x_scale: Optional[torch.Tensor] = None,
+        x_scale: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.x_pad_to_multiple > 0:
             assert (
@@ -450,14 +478,40 @@ class RMSNorm(nn.Module):
             ):
                 # Dynamic-scale fused RMSNorm + quant via aiter HIP kernels.
                 # Static FP8 (x_scale provided) stays on the branch above.
+                #
+                # The kernel takes a matrix; every other branch here folds the
+                # leading dims away and gives them back, so a caller does not.
+                lead = x.shape[:-1]
+                batched = len(lead) > 1
+                if batched and self._aiter_transpose_scale:
+                    # A column-major scale is a `(groups, M)` buffer viewed as
+                    # `(M, groups)`, so it is contiguous and the reshape below
+                    # would succeed on it and hand back a mis-mapped scale
+                    # rather than raise. Only `per_1x128` asks for one, and no
+                    # batched caller does today -- this is what keeps the two
+                    # from meeting silently.
+                    raise ValueError(
+                        "A column-major fused RMSNorm scale takes a 2-D input; "
+                        f"got {tuple(x.shape)}"
+                    )
                 x, x_scale, residual_out = _aiter_rms_quant(
-                    x,
+                    x.reshape(-1, self.dim) if batched else x,
                     self.weight,
                     self.eps,
                     self.quant_type.value,
                     self._aiter_transpose_scale,
-                    residual,
+                    (
+                        residual.reshape(-1, self.dim)
+                        if batched and residual is not None
+                        else residual
+                    ),
+                    self.params_dtype,
                 )
+                if batched:
+                    x = x.view(*lead, -1)
+                    x_scale = x_scale.view(*lead, -1)
+                    if residual_out is not None:
+                        residual_out = residual_out.view(*lead, -1)
                 if residual is None:
                     return x, x_scale
                 return (x, x_scale), residual_out
@@ -872,8 +926,8 @@ def fused_allreduce_gemma_rms_norm_quant(
 # ---------------------------------------------------------------------------
 # Fused Q/K RMSNorm Triton kernel
 # ---------------------------------------------------------------------------
-import triton  # noqa: E402
-import triton.language as tl  # noqa: E402
+import triton
+import triton.language as tl
 
 
 @triton.jit
@@ -981,11 +1035,11 @@ def _fused_qk_norm_single_kernel(
 def fused_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
-    q_weight: Optional[torch.Tensor],
+    q_weight: torch.Tensor | None,
     k_weight: torch.Tensor,
     eps: float,
     add_unit_offset: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused Q/K RMSNorm in a single Triton kernel launch.
 
     Args:
@@ -1094,7 +1148,7 @@ class DualRMSNorm:
     @mark_trace
     def __call__(
         self, q: torch.Tensor, k: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             q: [num_tokens, num_q_heads * head_dim]
@@ -1117,6 +1171,49 @@ class DualRMSNorm:
             q.view(-1, self.num_q_heads * self.head_dim),
             k.view(-1, self.num_kv_heads * self.head_dim),
         )
+
+
+class DualRMSNormMXFP8:
+    """Two RMSNorms in one launch, Q landing in MXFP8 and K in its own dtype.
+
+    Not an nn.Module; it reads the weights off the two norms it is handed, as
+    `DualRMSNorm` does. Unlike that one the widths are independent and only
+    the token count is shared, which is what a Q latent normed beside a KV
+    latent needs. Q comes back as the ``(e4m3, e8m0 group-32)`` pair a
+    native-quant GEMM reads without quantizing again. RoPE is the caller's.
+    """
+
+    def __init__(self, q_norm: nn.Module, k_norm: nn.Module, prefix: str) -> None:
+        assert _is_mxfp8(q_norm.quant_type.value, q_norm.params_dtype), (
+            f"{prefix}: Q emits MXFP8, not "
+            f"{q_norm.quant_type}/{q_norm.params_dtype}"
+        )
+        self.q_norm = q_norm
+        self.k_norm = k_norm
+        self.prefix = prefix
+
+    @mark_trace
+    def __call__(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # The kernel takes matrices; fold the leading dims away and give them
+        # back, as the RMSNorm branches do, so a caller does not.
+        lead = q.shape[:-1]
+        q_fp8, q_scale, k_out = fused_dual_rmsnorm_mxfp8_quant(
+            q.reshape(-1, q.shape[-1]),
+            k.reshape(-1, k.shape[-1]),
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.q_norm.eps,
+            eps_k=self.k_norm.eps,
+        )
+        # The kernel types the scale by its bytes; its readers read e8m0.
+        q_scale = q_scale.view(torch.float8_e8m0fnu)
+        if len(lead) > 1:
+            q_fp8 = q_fp8.view(*lead, -1)
+            q_scale = q_scale.view(*lead, -1)
+            k_out = k_out.view(*lead, -1)
+        return q_fp8, q_scale, k_out
 
 
 # ---------------------------------------------------------------------------
@@ -1239,7 +1336,7 @@ def layernorm2d_fwd_with_add_(
     bias: torch.Tensor,
     eps: float,
     dim: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     ori_shape = x.shape
     x = x.reshape(-1, dim)
     out = torch.empty_like(x)

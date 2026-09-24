@@ -207,11 +207,17 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     def request_finished(self, seq) -> None:
         self._impl.request_finished(seq)
 
+    def source_blocks_released(self, seq) -> None:
+        self._impl.source_blocks_released(seq)
+
     def should_park_for_load_after_alloc(self, seq) -> bool:
         return self._impl.should_park_for_load_after_alloc(seq)
 
     def should_defer_free(self, seq) -> bool:
         return self._impl.should_defer_free(seq)
+
+    def send_finished(self, req_id) -> None:
+        self._impl.send_finished(req_id)
 
     def protected_block_ids(self, seq):
         callback = getattr(self._impl, "protected_block_ids", None)

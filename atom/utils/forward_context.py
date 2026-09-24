@@ -845,6 +845,34 @@ def get_forward_context() -> ForwardContext:
     return _forward_context
 
 
+@contextmanager
+def side_stream(stream: torch.cuda.Stream | None):
+    """Issue the block beside the main stream instead of on it.
+
+    Yields `(issuing, joining)`: the stream the block runs on, and the one to
+    wait on it afterwards, `None` when nothing forked.
+
+    Forks only inside the capture loop, the one window where a side stream is
+    both safe and useful: eager launches pile up across layers with nothing to
+    drain them, and a replay runs no Python, inheriting the recorded layout.
+    `in_hipgraph` covers that loop's warmup forward too, which matters because
+    AITER caches a kernel's scratch per `(device, stream)` and rejects a first
+    allocation made during capture.
+
+    The gate lives here rather than at each caller so that two branches of one
+    layer cannot drift into disagreeing about when forking is allowed. A caller
+    whose feature is switched off hands `None` and takes the same path, so the
+    switch needs no second branch anywhere.
+    """
+    context = get_forward_context()
+    if stream is None or not context.in_hipgraph:
+        yield context.main_stream, None
+        return
+    stream.wait_stream(context.main_stream)
+    with torch.cuda.stream(stream):
+        yield stream, context.main_stream
+
+
 def _normalize_cudagraph_runtime_mode(mode: Any) -> CUDAGraphMode | None:
     """Normalize a frontend runtime mode to ATOM's concrete enum.
 

@@ -7,8 +7,12 @@ from aiter_stub import stubbed_aiter
 with stubbed_aiter():
     from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
     from atom.kv_transfer.disaggregation.types import (
+        ConnectorCompletion,
         KVConnectorOutput,
+        LoadOperationId,
         SaveOperationId,
+        SaveSourceGroupId,
+        StateStoreOperationId,
     )
     from atom.model_engine.pp_engine_core import PPEngineCoreProc
 
@@ -59,14 +63,13 @@ def _head(pp_size, local_outputs, downstream_messages=()):
     proc.kv_transfer_enabled = True
     proc.pp_size = pp_size
     proc._pp_kv_aggregator = None
-    proc._held_sending = {}
     proc.scheduler = FakeScheduler()
     proc.runner_mgr = FakeRunnerMgr(local_outputs)
     proc.pp_transport = FakePPTransport(downstream_messages)
     return proc
 
 
-def test_send_waits_for_every_pp_stage_save():
+def test_send_is_reported_while_save_waits_for_every_pp_stage():
     proc = _head(
         pp_size=3,
         local_outputs=[
@@ -80,21 +83,16 @@ def test_send_waits_for_every_pp_stage_save():
     )
 
     proc._poll_kv_transfer_progress()
-    assert proc.scheduler.released_sending() == set()  # stage 2 still saving
-    assert proc._held_sending == {"a": ("a", {"a"})}
+    assert proc.scheduler.released_sending() == {"a"}
+    assert proc.scheduler.released_saving() == set()  # stage 2 still saving
 
     proc._poll_kv_transfer_progress()
     assert proc.scheduler.released_sending() == {"a"}
     assert proc.scheduler.released_saving() == {"a"}
-    assert proc._held_sending == {}
 
 
-def test_send_pairs_with_a_save_operation_id():
-    # The offload connector reports a SaveOperationId(req_id, generation) once
-    # it tracks save generations, while mooncake reports a bare request id.
-    # Both have to collapse onto the request before they can be paired; keying
-    # the two sides differently releases every send unheld and lets the head
-    # free blocks a downstream stage is still saving from.
+def test_save_operation_id_waits_for_quorum_independently_of_send():
+    # Send is request-scoped; each save generation still needs PP quorum.
     op = SaveOperationId(9, 2)
     proc = _head(
         pp_size=2,
@@ -109,21 +107,16 @@ def test_send_pairs_with_a_save_operation_id():
     )
 
     proc._poll_kv_transfer_progress()
-    assert proc.scheduler.released_sending() == set()  # stage 1 still saving
-    assert proc._held_sending == {"9": (9, {op})}
+    assert proc.scheduler.released_sending() == {9}
+    assert proc.scheduler.released_saving() == set()  # stage 1 still saving
 
     proc._poll_kv_transfer_progress()
     assert proc.scheduler.released_sending() == {9}
     assert proc.scheduler.released_saving() == {op}
-    assert proc._held_sending == {}
 
 
-def test_send_waits_for_every_save_generation():
-    # A chunked prefill saves once per chunk, so the pairing rank flushes the
-    # send together with every generation it accumulated. The head must hold
-    # the send until each of those generations has reached PP quorum, not just
-    # the first one — the stages lag each other, and a stage still short of
-    # quorum is still reading the blocks the send would free.
+def test_each_save_generation_needs_its_own_quorum():
+    # Completing one save must neither complete nor delay another generation.
     g2, g3 = SaveOperationId(9, 2), SaveOperationId(9, 3)
     proc = _head(
         pp_size=2,
@@ -140,18 +133,16 @@ def test_send_waits_for_every_save_generation():
     )
 
     proc._poll_kv_transfer_progress()
-    assert proc.scheduler.released_sending() == set()
-    assert proc._held_sending == {"9": (9, {g2, g3})}
+    assert proc.scheduler.released_sending() == {9}
+    assert proc.scheduler.released_saving() == set()
 
     proc._poll_kv_transfer_progress()
-    assert proc.scheduler.released_sending() == set()  # generation 3 pending
+    assert proc.scheduler.released_sending() == {9}
     assert proc.scheduler.released_saving() == {g2}
-    assert proc._held_sending == {"9": (9, {g3})}
 
     proc._poll_kv_transfer_progress()
     assert proc.scheduler.released_sending() == {9}
     assert proc.scheduler.released_saving() == {g2, g3}
-    assert proc._held_sending == {}
 
 
 def test_send_without_a_save_is_not_held():
@@ -172,7 +163,6 @@ def test_send_without_a_save_is_not_held():
 
     proc._poll_kv_transfer_progress()
     assert proc.scheduler.released_sending() == {"a", "b"}
-    assert proc._held_sending == {}
 
 
 def test_send_passes_through_before_any_offload_activity():
@@ -242,3 +232,183 @@ def test_load_failure_does_not_block_another_request():
 def test_aggregator_rejects_bad_pp_size():
     with pytest.raises(ValueError):
         PPKVAggregator(0)
+
+
+def test_an_abandoned_save_releases_its_partial_quorum():
+    """`forget`: the aggregator's terminal for a report that is not coming.
+
+    A tally only drains on full quorum, so one lost stage report would pin
+    `has_pending()` -- and with it `has_pending_kv_work()` -- for the life of
+    the process: the head wakes every drain interval with nothing to do and
+    every shutdown burns the full drain timeout. Bounded, but permanent, and
+    it accumulates per lost report.
+
+    Keyed by what the worker reported (a `SaveOperationId` here), while the
+    scheduler abandons by `seq.id`, so `forget` has to collapse the two.
+    """
+    agg = PPKVAggregator(2)
+    op = SaveOperationId(req_id="7", generation=1)
+    assert agg.ingest(0, KVConnectorOutput(finished_saving={op})).is_empty()
+    assert agg.ingest(0, KVConnectorOutput(finished_saving={"8"})).is_empty()
+    assert agg.has_pending() is True
+
+    agg.forget(7)  # the scheduler counts in ints; the connector in strings
+
+    assert agg.has_pending() is True, "only request 7 is abandoned"
+    agg.forget("8")
+    assert agg.has_pending() is False
+
+    # The late report from the missing stage cannot resurrect the tally into a
+    # quorum of one.
+    assert agg.ingest(1, KVConnectorOutput(finished_saving={op})).is_empty()
+    assert agg.has_pending() is False
+
+
+@pytest.mark.parametrize("seen_before_abandon", [False, True])
+@pytest.mark.parametrize("succeeded", [False, True])
+def test_abandoned_save_drops_late_store_and_source_reports(
+    seen_before_abandon, succeeded
+):
+    agg = PPKVAggregator(2)
+    operation = SaveOperationId("7", 1)
+    source = SaveSourceGroupId(operation, ((0, 8),))
+    report = KVConnectorOutput(
+        finished_saving={operation},
+        connector_completions={
+            ConnectorCompletion("store", operation, succeeded),
+            ConnectorCompletion("source_safe", source, True),
+        },
+    )
+    if seen_before_abandon:
+        assert agg.ingest(0, report).is_empty()
+
+    agg.forget(7)
+
+    # Save reports/channels need not have appeared before abandonment.
+    for rank in (1, 0):
+        assert agg.ingest(rank, report).is_empty()
+        assert not agg.has_pending()
+
+
+@pytest.mark.parametrize("failed_load", [False, True])
+def test_abandoning_save_preserves_same_request_load_quorum(failed_load):
+    agg = PPKVAggregator(2)
+    save = SaveOperationId("7", 1)
+    load = LoadOperationId("7", 2)
+    disposition = ConnectorCompletion("load_disposition", load, True)
+    state = ConnectorCompletion("state_store", StateStoreOperationId(7, 3), True)
+    agg.ingest(
+        0,
+        KVConnectorOutput(
+            finished_saving={save},
+            finished_loading=set() if failed_load else {load},
+            failed_loading={load} if failed_load else set(),
+            connector_completions={disposition, state},
+        ),
+    )
+
+    agg.forget(7)
+
+    assert agg.has_pending()
+    output = agg.ingest(
+        1,
+        KVConnectorOutput(
+            finished_loading={load},
+            connector_completions={disposition, state},
+        ),
+    )
+    assert output.finished_loading == (set() if failed_load else {load})
+    assert output.failed_loading == ({load} if failed_load else set())
+    assert output.connector_completions == {disposition, state}
+    assert not output.finished_saving
+    assert not agg.has_pending()
+
+
+def test_abandoning_save_preserves_untyped_connector_events():
+    # A raw channel identity does not say it is a request's save. In
+    # particular an independent state hash may equal a native request ID.
+    agg = PPKVAggregator(2)
+    event = ConnectorCompletion("custom_state", 7, True)
+    agg.ingest(0, KVConnectorOutput(connector_completions={event}))
+    agg.forget(7)
+    output = agg.ingest(1, KVConnectorOutput(connector_completions={event}))
+    assert output.connector_completions == {event}
+    assert not agg.has_pending()
+
+
+def test_save_tombstones_are_bounded_and_do_not_block_unrelated_requests():
+    agg = PPKVAggregator(2, terminal_tombstone_limit=2)
+    for request_id in range(3):
+        agg.forget(request_id)
+    assert len(agg._abandoned_saves) == 2
+    assert agg.ingest(1, KVConnectorOutput(finished_saving={"1", 2})).is_empty()
+    assert not agg.has_pending()
+
+    other = SaveOperationId(3, 0)
+    assert agg.ingest(0, KVConnectorOutput(finished_saving={other})).is_empty()
+    assert agg.ingest(
+        1, KVConnectorOutput(finished_saving={other})
+    ).finished_saving == {other}
+    assert not agg.has_pending()
+
+
+def test_reset_clears_abandoned_save_tombstones():
+    agg = PPKVAggregator(2)
+    operation = SaveOperationId(7, 1)
+    agg.forget(7)
+    assert agg.ingest(0, KVConnectorOutput(finished_saving={operation})).is_empty()
+    assert not agg.has_pending()
+    agg.reset()
+    assert agg.ingest(0, KVConnectorOutput(finished_saving={operation})).is_empty()
+    assert agg.ingest(
+        1, KVConnectorOutput(finished_saving={operation})
+    ).finished_saving == {operation}
+    assert not agg.has_pending()
+
+
+def test_aggregator_rejects_nonpositive_tombstone_limit():
+    with pytest.raises(ValueError, match="terminal_tombstone_limit"):
+        PPKVAggregator(2, terminal_tombstone_limit=0)
+
+
+@pytest.mark.parametrize("local_report", [False, True])
+def test_pp_head_remembers_abandonment_before_first_stage_report(local_report):
+    operation = SaveOperationId("7", 1)
+    report = KVConnectorOutput(finished_saving={operation})
+    proc = _head(
+        pp_size=2,
+        local_outputs=[report] if local_report else [],
+        downstream_messages=[] if local_report else [[(1, report)]],
+    )
+    proc.scheduler.deferred_free_blocks = {}
+    proc.scheduler.kv_connector = None
+    proc.scheduler.on_save_abandoned = proc._forget_pp_save_quorum
+
+    proc.scheduler.on_save_abandoned(7)
+    assert not proc.has_pending_kv_work()
+    proc._poll_kv_transfer_progress()
+
+    assert not proc.scheduler.outputs
+    assert not proc.has_pending_kv_work()
+
+
+def test_the_pp_head_gives_the_aggregator_the_scheduler_s_verdict():
+    """The two terminals share one trigger, so they cannot drift.
+
+    The scheduler decides a save is beyond hope; it has no handle on the
+    aggregator, so the head registers the only route between them.
+    """
+    proc = _head(pp_size=2, local_outputs=[])
+    proc._pp_kv_aggregator = PPKVAggregator(2)
+    # The wiring `__init__` does; asserted through `has_pending_kv_work`, which
+    # is the predicate that keeps the head awake and stretches every shutdown.
+    proc.scheduler.on_save_abandoned = proc._forget_pp_save_quorum
+    proc.scheduler.deferred_free_blocks = {}
+    proc.scheduler.is_finished = lambda: True
+    proc.scheduler.kv_connector = None
+
+    proc._pp_kv_aggregator.ingest(0, KVConnectorOutput(finished_saving={"3"}))
+    assert proc.has_pending_kv_work() is True
+
+    proc.scheduler.on_save_abandoned(3)
+    assert proc.has_pending_kv_work() is False

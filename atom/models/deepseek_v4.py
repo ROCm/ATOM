@@ -78,6 +78,10 @@ from atom.model_loader.loader import WeightsMapper
 # code as opaque; Indexer.forward_batched dispatches via the latter to hide
 # its dynamic-shape internals from Dynamo / fake-tensor mode.
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
+from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+    FP4_GFX1250_NATURAL,
+    fp4_indexer_layout_for_arch,
+)
 from atom.model_ops.communication_op import (
     tensor_model_parallel_all_reduce,
 )
@@ -1477,7 +1481,8 @@ class Indexer(nn.Module):
         # one indexer slot per `compress_ratio` source tokens.
         self._max_model_len_idx = args.max_seq_len // compress_ratio
 
-        # FP4-indexer flag, self-computed at construction so it is correct BEFORE
+        # Indexer quantization mode, self-computed at construction so it is
+        # correct BEFORE
         # the graphed `_attn_pre`/`forward_pre` piece is traced — the graph bakes
         # this branch, and the builder's re-assert in `build_kv_cache_tensor` does
         # NOT reliably precede that trace (verified: defaulting False here bakes
@@ -1490,6 +1495,16 @@ class Indexer(nn.Module):
         self._indexer_fp4 = fp4_indexer_enabled(
             get_current_atom_config().index_cache_dtype
         )
+        self.quant_mode = "fp4" if self._indexer_fp4 else "per_row_fp8"
+        # `quant_mode` says how values are quantized; `indexer_layout` says how
+        # those values are physically stored and therefore which scorer ABI
+        # consumes them. Both gfx950 and gfx1250 use quant_mode="fp4", but their
+        # preshuffled/natural layouts are intentionally incompatible.
+        self.indexer_layout = (
+            fp4_indexer_layout_for_arch(get_gfx_runtime())
+            if self._indexer_fp4
+            else "fp8"
+        )
 
         self.compressor = Compressor(
             args,
@@ -1498,6 +1513,9 @@ class Indexer(nn.Module):
             rotate=True,
             prefix=f"{prefix}.compressor",
         )
+        # Set before graph tracing and before KV-cache binding. The inner
+        # compressor and the Indexer scorer now share one authoritative mode.
+        self.compressor.quant_mode = self.quant_mode
         # PR3-pre2c-B: Indexer.kv_cache is bound by the V4 attention builder
         # to a `[num_blocks, csa_rows_per_block, head_dim]` per-CSA-layer view
         # of the global
@@ -1615,22 +1633,32 @@ class Indexer(nn.Module):
         if self._indexer_fp4:
             # ── FP4 indexer path ──────────────────────────────────────────
             # Q is FP4-quantized (E2M1 + per-group(32) e8m0) in the
-            # `pa_mqa_logits_fp4` preshuffle layout. The MQA-logits kernel
+            # architecture-selected preshuffle/natural layout. The MQA-logits
+            # kernel
             # dequants Q internally via e8m0, so `weights` carry ONLY the
             # static `_weights_scale` (no per-row q_scale premultiply).
             d_packed = self.head_dim // 2
-            k_tiles = self.head_dim // 128
-            qs_pad = ((self.n_heads // 16 + 3) // 4) * 4
             q_fp4 = torch.empty(
                 (total_tokens, self.n_heads, d_packed),
                 dtype=torch.uint8,
                 device=q.device,
             )
-            q_scale = torch.empty(
-                (total_tokens, k_tiles, 4, 16, qs_pad),
-                dtype=torch.uint8,
-                device=q.device,
-            )
+            if self.indexer_layout == FP4_GFX1250_NATURAL:
+                q_scale = torch.empty(
+                    (total_tokens, self.n_heads, self.head_dim // 32),
+                    dtype=torch.uint8,
+                    device=q.device,
+                )
+                shuffle_scale = False
+            else:
+                k_tiles = self.head_dim // 128
+                qs_pad = ((self.n_heads // 16 + 3) // 4) * 4
+                q_scale = torch.empty(
+                    (total_tokens, k_tiles, 4, 16, qs_pad),
+                    dtype=torch.uint8,
+                    device=q.device,
+                )
+                shuffle_scale = True
             rope_rotate_activation(
                 q_fp4.view(dtypes.fp4x2),
                 q,
@@ -1640,7 +1668,7 @@ class Indexer(nn.Module):
                 rd,
                 out_scale=q_scale,
                 group_size=32,
-                shuffle_scale=True,
+                shuffle_scale=shuffle_scale,
                 do_rotate_act=False,
             )
             # weights_proj output (bf16) goes straight to the MQA-logits kernel:
@@ -1967,7 +1995,166 @@ class Indexer(nn.Module):
         )
         return topk_local  # [total_tokens, index_topk] int32, raw seq-local
 
-    # ── FP4 indexer scoring (gfx950) ──────────────────────────────────────
+    # ── FP4 indexer scoring ────────────────────────────────────────────────
+
+    def _score_topk_prefill_fp4(
+        self,
+        q_fp4: torch.Tensor,
+        q_scale: torch.Tensor,
+        block_tables: torch.Tensor,
+        weights: torch.Tensor,
+        indexer_meta: dict,
+        topk: int,
+    ) -> torch.Tensor:
+        """Dispatch FP4 prefill scoring from the cache's physical layout."""
+        if self.indexer_layout == FP4_GFX1250_NATURAL:
+            return self._score_topk_prefill_fp4_opus(
+                q_fp4, q_scale, block_tables, weights, indexer_meta, topk
+            )
+        return self._score_topk_prefill_fp4_flydsl(
+            q_fp4, q_scale, block_tables, weights, indexer_meta, topk
+        )
+
+    def _score_topk_decode_fp4(
+        self,
+        q_fp4: torch.Tensor,
+        q_scale: torch.Tensor,
+        block_tables: torch.Tensor,
+        weights: torch.Tensor,
+        indexer_meta: dict,
+        topk: int,
+    ) -> torch.Tensor:
+        """Dispatch FP4 decode scoring from the cache's physical layout."""
+        if self.indexer_layout == FP4_GFX1250_NATURAL:
+            return self._score_topk_decode_fp4_opus(
+                q_fp4, q_scale, block_tables, weights, indexer_meta, topk
+            )
+        return self._score_topk_decode_fp4_flydsl(
+            q_fp4, q_scale, block_tables, weights, indexer_meta, topk
+        )
+
+    # gfx1250 OPUS natural-layout launchers.
+
+    def _score_topk_prefill_fp4_opus(
+        self,
+        q_fp4: torch.Tensor,
+        q_scale: torch.Tensor,
+        block_tables: torch.Tensor,
+        weights: torch.Tensor,
+        indexer_meta: dict,
+        topk: int,
+    ) -> torch.Tensor:
+        """Score all precomputed query chunks with their per-forward OPUS plans."""
+        from aiter.ops.opus.pa_mqa_logits_mxfp4 import pa_mqa_logits_mxfp4
+
+        if weights.dtype != torch.bfloat16:
+            raise TypeError(
+                f"gfx1250 OPUS FP4 MQA requires BF16 weights, got {weights.dtype}"
+            )
+        total_tokens = q_fp4.size(0)
+        max_seq_len = indexer_meta["fp4_prefill_max_seq_len"]
+        chunks = indexer_meta["fp4_opus_prefill_chunks"]
+        local_starts = indexer_meta["fp4_prefill_local_starts"]
+        local_ends = indexer_meta["visible_end_gpu"]
+        # Every planned row is fully overwritten by top_k_per_row_prefill,
+        # including its -1 padding when fewer than ``topk`` entries are visible.
+        # Match the FP8/FlyDSL path and avoid a full-output fill before every CSA
+        # layer. DCP may append dummy rows that are deliberately excluded from
+        # the OPUS plans; only that unplanned tail still needs the sentinel.
+        topk_out = torch.empty(
+            (total_tokens, topk), dtype=torch.int32, device=q_fp4.device
+        )
+        planned_tokens = chunks[-1][1] if chunks else 0
+        if planned_tokens < total_tokens:
+            topk_out[planned_tokens:].fill_(-1)
+        kv_block_size = self.kv_cache.size(1)
+        for chunk_start, chunk_end, plan in chunks:
+            rs = local_starts[chunk_start:chunk_end]
+            re = local_ends[chunk_start:chunk_end]
+            logits = torch.empty(
+                (chunk_end - chunk_start, max_seq_len),
+                dtype=torch.float32,
+                device=q_fp4.device,
+            )
+            pa_mqa_logits_mxfp4(
+                q_fp4[chunk_start:chunk_end],
+                q_scale[chunk_start:chunk_end],
+                self.kv_cache,
+                self.kv_scale,
+                block_tables,
+                weights[chunk_start:chunk_end],
+                plan,
+                max_seq_len,
+                weight_scale=self._weights_scale,
+                kv_block_size=kv_block_size,
+                out=logits,
+            )
+            top_k_per_row_prefill(
+                logits,
+                rs,
+                re,
+                topk_out[chunk_start:chunk_end],
+                None,
+                chunk_end - chunk_start,
+                logits.stride(0),
+                logits.stride(1),
+                k=topk,
+            )
+        return topk_out
+
+    def _score_topk_decode_fp4_opus(
+        self,
+        q_fp4: torch.Tensor,
+        q_scale: torch.Tensor,
+        block_tables: torch.Tensor,
+        weights: torch.Tensor,
+        indexer_meta: dict,
+        topk: int,
+    ) -> torch.Tensor:
+        """Launch the fixed-grid OPUS decode plan built once by metadata."""
+        from aiter.ops.opus.pa_mqa_logits_mxfp4 import pa_mqa_logits_mxfp4
+
+        if weights.dtype != torch.bfloat16:
+            raise TypeError(
+                f"gfx1250 OPUS FP4 MQA requires BF16 weights, got {weights.dtype}"
+            )
+        plan = indexer_meta["fp4_opus_plan"]
+        local_ends = plan.local_ends
+        padded_tokens = q_fp4.size(0)
+        logits = torch.empty(
+            (padded_tokens, self._max_model_len_idx),
+            dtype=torch.float32,
+            device=q_fp4.device,
+        )
+        pa_mqa_logits_mxfp4(
+            q_fp4,
+            q_scale,
+            self.kv_cache,
+            self.kv_scale,
+            block_tables,
+            weights,
+            plan,
+            self._max_model_len_idx,
+            weight_scale=self._weights_scale,
+            kv_block_size=self.kv_cache.size(1),
+            out=logits,
+        )
+        topk_out = torch.empty(
+            (padded_tokens, topk), dtype=torch.int32, device=q_fp4.device
+        )
+        top_k_per_row_decode(
+            logits,
+            1,
+            local_ends,
+            topk_out,
+            padded_tokens,
+            logits.stride(0),
+            logits.stride(1),
+            k=topk,
+        )
+        return topk_out
+
+    # ── FP4 indexer scoring (gfx950 FlyDSL preshuffle) ────────────────────
     # Both paths read the paged FP4 indexer cache directly via `block_tables`
     # (no cp_gather / deepgemm); Q is FP4 (`q_fp4`/`q_scale`). The flydsl
     # kernels emit SEQ-LOCAL logits, so prefill needs no `seq_base` subtract
@@ -1976,7 +2163,7 @@ class Indexer(nn.Module):
     # builder into a fixed buffer and the grid (total_ctas) is fixed at
     # parallel_unit_num. Prefill stays eager (dynamic total_tokens).
 
-    def _score_topk_prefill_fp4(
+    def _score_topk_prefill_fp4_flydsl(
         self,
         q_fp4: torch.Tensor,  # [total_tokens, n_heads, head_dim//2] uint8
         q_scale: torch.Tensor,  # [total_tokens, K_TILES, 4, 16, QS_PAD] uint8
@@ -2096,7 +2283,7 @@ class Indexer(nn.Module):
             score_chunk=_score,
         )  # [total_tokens, topk] int32, raw seq-local
 
-    def _score_topk_decode_fp4(
+    def _score_topk_decode_fp4_flydsl(
         self,
         q_fp4: torch.Tensor,  # [padded_tokens, n_heads, head_dim//2] uint8
         q_scale: torch.Tensor,  # [padded_tokens, K_TILES, 4, 16, QS_PAD] uint8

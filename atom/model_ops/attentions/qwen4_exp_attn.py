@@ -624,6 +624,16 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         )
         return attn_metadata, positions
 
+    def _refreshed_flydsl_plan(self, var, running_bs: int):
+        """The draft's own plan, never the target's.
+
+        Each draft pass advances context_lens and the planner bakes per-task
+        tile ranges from it, so an inherited plan attends over the pre-bump
+        context. The op cannot catch it: its guard compares batch and kv-head
+        count, and neither changes.
+        """
+        return self.refresh_flydsl_plan(var["context_lens"].gpu[:running_bs])
+
     def prepare_mtp_decode(
         self,
         bs: int,
@@ -639,7 +649,11 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         slots = var["slot_mapping"].gpu[:running_bs]
         if getattr(self, "qsa_arena", None) is None:
             # Allocation profiling runs all draft steps before the pools exist.
-            return {"slot_mapping": slots, "qsa_metadata": None}
+            return {
+                "slot_mapping": slots,
+                "qsa_metadata": None,
+                "flydsl_work_plan": self._refreshed_flydsl_plan(var, running_bs),
+            }
         logical = var["qsa_logical_positions"].gpu[:running_bs]
         req_ids = var["qsa_token_to_req"].gpu[:running_bs]
         compressed = var["qsa_compressed_slots"][:running_bs]
@@ -659,6 +673,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         )
         return {
             "slot_mapping": slots,
+            "flydsl_work_plan": self._refreshed_flydsl_plan(var, running_bs),
             "qsa_metadata": Qwen4ExpQSAMetadata(
                 tables,
                 slots,

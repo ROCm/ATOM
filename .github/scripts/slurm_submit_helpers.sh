@@ -406,6 +406,7 @@ stream_file_lines() {
   local file="$1"
   local prefix="$2"
   local current_line="$3"
+  local exclude_pattern="${4:-}"
   local total_lines
 
   if [[ ! -f "${file}" ]]; then
@@ -415,13 +416,16 @@ stream_file_lines() {
 
   total_lines="$(wc -l < "${file}" | tr -d ' ')"
   if [[ "${total_lines}" -gt "${current_line}" ]]; then
-    awk -v start="${current_line}" -v prefix="${prefix}" 'NR > start { print prefix $0 }' "${file}" >&2
+    awk -v start="${current_line}" -v prefix="${prefix}" -v exclude="${exclude_pattern}" \
+      'NR > start && (exclude == "" || $0 !~ exclude) { print prefix $0 }' "${file}" >&2
   fi
   printf '%s\n' "${total_lines}"
 }
 
 stream_slurm_logs_once() {
-  OUT_LINE="$(stream_file_lines "${SLURM_JOB_OUTPUT}" "[slurm.out] " "${OUT_LINE}")"
+  # Keep routine worker startup banners in the file, without repeating them in CI.
+  local startup_banners='^(RCCL RDMA GID index: [0-9]+|=== Spur job [0-9]+: dispatching [0-9]+ node workers ===)[[:space:]]*$'
+  OUT_LINE="$(stream_file_lines "${SLURM_JOB_OUTPUT}" "[slurm.out] " "${OUT_LINE}" "${startup_banners}")"
   ERR_LINE="$(stream_file_lines "${SLURM_JOB_ERROR}" "[slurm.err] " "${ERR_LINE}")"
 }
 

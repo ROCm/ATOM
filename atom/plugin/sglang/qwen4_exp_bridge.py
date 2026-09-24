@@ -672,12 +672,14 @@ def build_qsa_metadata(
         )
 
     seq_lens = _seq_lens(forward_batch, device)[:bs]
-    pin_for_graph = _is_capturing() or _DECODE_GRAPH.active
-    max_seq_len = (
-        ctx_len
-        if pin_for_graph or seq_lens.numel() == 0
-        else int(seq_lens.max().item())
-    )
+    # Decode-graph capture pins scoring width to the engine context so every
+    # replay has a constant grid. Eager prefill/extend must use the live batch:
+    # `_DECODE_GRAPH.active` stays True after capture and would otherwise make a
+    # 4096-token prefill score `context_length` (e.g. 131072) on every QSA layer.
+    if _is_capturing() or seq_lens.numel() == 0:
+        max_seq_len = ctx_len
+    else:
+        max_seq_len = int(seq_lens.max().item())
     table_tokens = _clamp_table_tokens(pool, max(max_seq_len, indexer_budget))
     block_tables = _eager_block_tables(
         pool=pool,

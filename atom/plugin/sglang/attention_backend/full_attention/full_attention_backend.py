@@ -25,7 +25,7 @@ from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import get_bool_env_var
 
-from atom.model_ops.base_attention import run_pa_decode_gluon
+from atom.model_ops.base_attention import run_pa_decode
 from atom.plugin.sglang.attention_backend.full_attention.kv_cache import (
     set_kv_buffer_with_layout_shuffle as _set_kv_buffer_with_layout_shuffle,
 )
@@ -2789,7 +2789,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 dtype=q.dtype,
                 device=q.device,
             )
-            run_pa_decode_gluon(
+            run_pa_decode(
                 output=out,
                 q=q_3d,
                 k_cache=k_cache,

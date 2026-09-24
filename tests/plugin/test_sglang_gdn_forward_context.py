@@ -209,6 +209,7 @@ def test_extend_fallback_marks_padded_requests_as_empty():
         metadata.non_spec_state_indices_tensor,
         torch.tensor([4, 8, -1], dtype=torch.int32),
     )
+    assert metadata.flydsl_prefill_metadata is None
 
 
 def test_build_context_falls_back_to_local_decode_mode(monkeypatch):
@@ -272,3 +273,159 @@ def test_bind_preserves_outer_attention_metadata(monkeypatch):
     assert current_context.attn_metadata is outer_metadata
     assert current_context.kv_cache_data is outer_kv
     assert kv_updates[0] is bound_kv
+
+
+def _qwen4_flydsl_atom_config():
+    impl = SimpleNamespace(
+        allow_aiter_flydsl=True,
+        dt_bias=torch.zeros(1, dtype=torch.bfloat16),
+        gdn_flydsl_policy=None,
+    )
+    return (
+        SimpleNamespace(
+            compilation_config=SimpleNamespace(
+                static_forward_context={"Linear_0": SimpleNamespace(impl=impl)}
+            ),
+            enable_dp_attention=False,
+        ),
+        impl,
+    )
+
+
+class _TemporalPool:
+    def __init__(self, temporal):
+        self.mamba_map = {0: None}
+        self._cache = SimpleNamespace(
+            conv=[torch.zeros(2, 4)],
+            temporal=temporal,
+        )
+
+    @staticmethod
+    def get_mamba_indices(req_pool_indices):
+        return req_pool_indices
+
+    def mamba2_layer_cache(self, layer_id):
+        return self._cache
+
+
+def test_extend_attaches_flydsl_prefill_metadata_for_qwen4(monkeypatch):
+    from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
+
+    cfg, impl = _qwen4_flydsl_atom_config()
+    impl.gdn_flydsl_policy = GDNFlyDSLPolicy(prefill=True, decode=True)
+    monkeypatch.setattr(attention_gdn, "get_current_atom_config", lambda: cfg)
+    schedule = object()
+    monkeypatch.setattr(
+        "atom.model_ops.fla_ops.gdn_flydsl.build_prefill_metadata",
+        lambda lengths, cu_seqlens: schedule,
+    )
+    pool = _MambaPool()
+    forward_batch = SimpleNamespace(
+        forward_mode=_ExtendMode(),
+        batch_size=1,
+        req_pool_indices=torch.tensor([0], dtype=torch.int32),
+        req_to_token_pool=pool,
+        extend_start_loc=torch.tensor([0], dtype=torch.int32),
+        extend_seq_lens=torch.tensor([8], dtype=torch.int32),
+        extend_prefix_lens=torch.tensor([0], dtype=torch.int32),
+    )
+    metadata = SGLangGDNForwardContext._build_gdn_metadata(
+        forward_batch, SimpleNamespace(forward_metadata=None, req_to_token_pool=pool)
+    )
+    assert metadata is not None
+    assert metadata.flydsl_prefill_metadata is schedule
+    assert impl.allow_aiter_flydsl
+
+
+def test_extend_skips_flydsl_metadata_when_prefill_disabled(monkeypatch):
+    from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
+
+    cfg, impl = _qwen4_flydsl_atom_config()
+    impl.gdn_flydsl_policy = GDNFlyDSLPolicy(prefill=False, decode=True)
+    monkeypatch.setattr(attention_gdn, "get_current_atom_config", lambda: cfg)
+    monkeypatch.setattr(
+        "atom.model_ops.fla_ops.gdn_flydsl.build_prefill_metadata",
+        lambda lengths, cu_seqlens: object(),
+    )
+    pool = _MambaPool()
+    forward_batch = SimpleNamespace(
+        forward_mode=_ExtendMode(),
+        batch_size=1,
+        req_pool_indices=torch.tensor([0], dtype=torch.int32),
+        req_to_token_pool=pool,
+        extend_start_loc=torch.tensor([0], dtype=torch.int32),
+        extend_seq_lens=torch.tensor([8], dtype=torch.int32),
+        extend_prefix_lens=torch.tensor([0], dtype=torch.int32),
+    )
+    metadata = SGLangGDNForwardContext._build_gdn_metadata(
+        forward_batch, SimpleNamespace(forward_metadata=None, req_to_token_pool=pool)
+    )
+    assert metadata is not None
+    assert metadata.flydsl_prefill_metadata is None
+
+
+def test_ensure_flydsl_policy_binds_qwen4_impls_once(monkeypatch):
+    from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
+
+    cfg, impl = _qwen4_flydsl_atom_config()
+    monkeypatch.setattr(attention_gdn, "get_current_atom_config", lambda: cfg)
+    calls = []
+
+    def _select_policy(**kwargs):
+        calls.append(kwargs)
+        return GDNFlyDSLPolicy(prefill=True, decode=True)
+
+    monkeypatch.setattr(
+        "atom.model_ops.fla_ops.gdn_flydsl.select_policy",
+        _select_policy,
+    )
+    state = torch.zeros(2, 24, 128, 128)
+    first = attention_gdn._ensure_flydsl_policy(state)
+    second = attention_gdn._ensure_flydsl_policy(state)
+    assert first.decode and first.prefill
+    assert second is first
+    assert impl.gdn_flydsl_policy is first
+    assert len(calls) == 1
+
+
+def test_kv_cache_uses_zero_copy_kv_view_when_flydsl_decode(monkeypatch):
+    from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
+
+    cfg, impl = _qwen4_flydsl_atom_config()
+    monkeypatch.setattr(attention_gdn, "get_current_atom_config", lambda: cfg)
+    monkeypatch.setattr(
+        attention_gdn,
+        "_ensure_flydsl_policy",
+        lambda state: GDNFlyDSLPolicy(prefill=True, decode=True),
+    )
+    impl.gdn_flydsl_policy = GDNFlyDSLPolicy(prefill=True, decode=True)
+    raw = torch.zeros(4, 24, 128, 128)
+    pool = _TemporalPool(raw)
+    out = SGLangGDNForwardContext._build_kv_cache_tensors(
+        SimpleNamespace(req_to_token_pool=pool),
+        SimpleNamespace(req_to_token_pool=pool),
+    )
+    view = out["layer_0"].v_cache
+    assert view.data_ptr() == raw.data_ptr()
+    assert view.stride()[-2:] == (1, 128)
+    assert impl.gdn_flydsl_policy.decode
+
+
+def test_kv_cache_keeps_mamba_layout_without_qwen4_flydsl(monkeypatch):
+    monkeypatch.setattr(
+        attention_gdn,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(
+            compilation_config=SimpleNamespace(static_forward_context={}),
+            enable_dp_attention=False,
+        ),
+    )
+    raw = torch.zeros(4, 24, 128, 128)
+    pool = _TemporalPool(raw)
+    out = SGLangGDNForwardContext._build_kv_cache_tensors(
+        SimpleNamespace(req_to_token_pool=pool),
+        SimpleNamespace(req_to_token_pool=pool),
+    )
+    view = out["layer_0"].v_cache
+    assert view is raw
+    assert view.stride()[-2:] == (128, 1)

@@ -599,6 +599,12 @@ class LLMEngine:
             "saved_tokens",
             "loads_pending",
             "saves_pending",
+            # Why a waiting request is not costing a tier lookup per step, and
+            # whether its one external-tier attempt was already spent. Both are
+            # what an operator reads when the engine looks stalled with the
+            # GPUs idle; see `OffloadSchedulerMixin._init_tier_hit_memo`.
+            "lookups_skipped_by_memo",
+            "suppressed_load_retries",
         )
         offload_totals = {
             key: sum(int(stats.get(key, 0)) for stats in offload_rank_stats)
@@ -722,6 +728,7 @@ class InputOutputProcessor:
                 "kimi_linear",
                 "glm5_next_text",
                 "deepseek_v4",
+                "deepseek_v41_text",
                 "qwen4_exp_text",
             }
         )
@@ -793,6 +800,12 @@ class InputOutputProcessor:
           deltas to independent queues (one per choice index). Falls back to
           the scalar ``stream_callback`` for every sibling.
         """
+        request_validator = getattr(self.config.hf_config, "validate_request", None)
+        if request_validator is not None:
+            request_validator(
+                num_draft_tokens=self.num_speculative_tokens,
+                multimodal_data=multimodal_data,
+            )
         n = max(1, int(getattr(sampling_params, "n", 1)))
 
         tokens = (
