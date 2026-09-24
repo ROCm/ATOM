@@ -645,17 +645,21 @@ python3 -m atom.benchmarks.benchmark_serving \
 > failed` buried above the table. `--random-range-ratio 1.0` pins the input
 > length; `--ignore-eos` makes every request generate the full output length.
 
-| | 1k/1k, conc 64 | 14k/500, conc 64 |
-|---|---|---|
-| Successful requests | 256 / 256 | 128 / 128 |
-| Duration (s) | 481.48 | 233.10 |
-| Output tok/s | **544.45** | **274.56** |
-| Total tok/s | 1088.90 | 8146.84 |
-| Concurrency (actual) | 56.01 | 61.30 |
-| TTFT median / p99 (ms) | 2080 / 33217 | 21986 / 46390 |
-| TPOT mean (ms) | 96.94 | 178.22 |
-| ITL mean (ms) | 96.84 | 177.87 |
-| E2EL median (ms) | 101642 | 110666 |
+| | 1k/1k, conc 64 | 14k/500, conc 64 | 14k/32, conc 64 |
+|---|---|---|---|
+| Successful requests | 256 / 256 | 128 / 128 | 64 / 64 |
+| Duration (s) | 481.48 | 233.10 | 45.81 |
+| Output tok/s | **544.45** | **274.56** | 44.71 |
+| Total tok/s | 1088.90 | 8146.84 | **20073.36** |
+| Concurrency (actual) | 56.01 | 61.30 | 58.40 |
+| TTFT median / p99 (ms) | 2080 / 33217 | 21986 / 46390 | 32158 / 41811 |
+| TPOT mean (ms) | 96.94 | 178.22 | 321.75 |
+| ITL mean / p99 (ms) | 96.84 / 101 | 177.87 / 176 | 311.69 / 6971 |
+| E2EL median (ms) | 101642 | 110666 | 40581 |
+
+⚠️ **These are cluster aggregates, not per-GPU.** `benchmark_serving` divides by
+duration only (`sum(output_lens) / dur_s`), with no notion of device count.
+Across 64 GPUs the 1k/1k figure is 8.51 output tok/s per GPU.
 
 Reading these:
 
@@ -683,16 +687,31 @@ The table above is aggregate and unaffected.
 The server writes torch profiler traces only if it was started with a profiler
 directory; the client flag alone does nothing.
 
-**Server** — either form, set before launch:
+**Server** — ⚠️ **the CLI flag only. The environment variable does not work.**
 
 ```bash
-ATOM_TORCH_PROFILER_DIR=/data/profile_run     # envs.py
-# or: --torch-profiler-dir /data/profile_run
+--torch-profiler-dir /data/profile_run        # this one
+# ATOM_TORCH_PROFILER_DIR=/data/profile_run   # does NOT work, see below
 ```
 
-`config.py` takes the env var as the default for `torch_profiler_dir`, and
-`model_runner.py` appends the rank name, so each rank gets its own
-subdirectory under that path.
+`envs.py` defines `ATOM_TORCH_PROFILER_DIR` and `config.py` appears to take it
+as the default for `torch_profiler_dir`, but something downstream overrides it:
+`atom/plugin/config.py` hardcodes `torch_profiler_dir=None` in three places.
+Measured, on this image:
+
+| | `Engine kwargs` | traces written |
+|---|---|---|
+| `ATOM_TORCH_PROFILER_DIR=<dir>` | `'torch_profiler_dir': None` | **none** |
+| `--torch-profiler-dir <dir>` | `'torch_profiler_dir': '<dir>'` | yes |
+
+**Check the log before spending a run on it:**
+
+```bash
+grep -o "'torch_profiler_dir': [^,]*" <server log> | head -1
+```
+
+`model_runner.py` appends the rank name to that path, so each rank writes its
+own subdirectory — `dp0_tp0/`, `dp1_tp0/`, … one `.pt.trace.json.gz` each.
 
 **Client** — add `--profile` to `benchmark_serving`. It POSTs
 `/start_profile` before the run and `/stop_profile` after
@@ -708,11 +727,35 @@ python3 -m atom.benchmarks.benchmark_serving \
   --ignore-eos --profile
 ```
 
-> ⚠️ **`--profile` against a server started without a profiler directory is a
-> silent no-op** — the benchmark runs and reports normally, and no trace is
-> written. Point the directory at a bind-mounted path (`/data` here) so the
-> traces land on the host; keep `--num-prompts` to a single concurrency wave,
-> since traces are large.
+> ⚠️ **A server without a working profiler directory is a silent no-op, and it
+> is quieter than it sounds.** `POST /start_profile` still answers
+> `HTTP 200 {"message":"Profiling started"}`, the client still prints
+> `Starting profiler...` / `Stopping profiler...`, and the benchmark still
+> reports a full set of metrics. The only symptom is an empty output directory.
+> Point the directory at a bind-mounted path (`/data` here) so traces land on
+> the host, and keep `--num-prompts` to a single concurrency wave — 14k/32 at
+> concurrency 64 produced 162 MB per node, ~41 MB per rank.
+
+Verified output, 16 ranks over 4 nodes:
+
+```
+profile_run/dp0_tp0/Kimi-K3_ts_20260924_100111_980.pt.trace.json.gz   41 MB
+```
+
+2.5M trace events, loadable in Perfetto. Top GPU time on a 14k-prefill-heavy
+run looks like this — worth knowing before tuning the wrong thing:
+
+| GPU time (us) | kernel |
+|---|---|
+| 11,160,833 | `_gemm_a16w16_gfx1250_bandwidth_bound_kernel_BLOCK_M_256_N_256_K_64` |
+| 10,078,004 | `mori_ep_dispatch_tdm_fp4x2_ws16_h1792_k16_64x16` |
+| 4,785,535 | `ep_combine_fused_sync_0` |
+| 2,714,530 | `a8w4_tdm_fp4_t64x256x256_w1x4_b3_K3584_e56_act3_q1r4` |
+| 2,290,119 | `a8w4_tdm_fp4_t64x256x256_w1x4_b3_K3072_e56_epscatter` |
+
+**Expert all-to-all is the second-largest cost and close to the first**:
+dispatch + combine together are 14.9M us against 11.2M for the biggest GEMM.
+And that GEMM names itself `bandwidth_bound`.
 
 ---
 
