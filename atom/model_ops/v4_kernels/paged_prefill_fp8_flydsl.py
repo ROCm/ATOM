@@ -13,11 +13,6 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
-from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr.typing import T
-
 from aiter import dtypes
 from aiter.ops.flydsl.kernels.tensor_shim import (
     GTensor,
@@ -25,6 +20,10 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     ptr_arg,
     ptr_buf_tensor,
 )
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr.typing import T
 
 V4_DIM_NOPE = 448
 V4_DIM_ROPE = 64
@@ -938,7 +937,7 @@ def _build_qk_pv_h128_launcher():
     return launch
 
 
-@lru_cache(maxsize=16)
+@lru_cache(maxsize=64)
 def _build_sparse_prefill_launcher(
     pipeline_two: bool = False,
     cluster_two: bool = False,
@@ -966,6 +965,14 @@ def _build_sparse_prefill_launcher(
     dynamic_full_prefix: bool = False,
     prefix_only: bool = False,
     split_partial: bool = False,
+    implicit_split_tasks: bool = False,
+    implicit_max_splits: int = 0,
+    implicit_block_k: int = 32,
+    implicit_split_tiles: int = 0,
+    implicit_split_tiles_short: int = 0,
+    implicit_split_short_max_tiles: int = 0,
+    implicit_split_tiles_mid: int = 0,
+    implicit_split_mid_max_tiles: int = 0,
     waves_per_eu: int = 0,
 ):
     """Build the H128 paged sparse-prefill kernel.
@@ -1064,6 +1071,15 @@ def _build_sparse_prefill_launcher(
             + ("_dynfullprefix" if dynamic_full_prefix else "")
             + ("_prefixonly" if prefix_only else "")
             + ("_splitpartial" if split_partial else "")
+            + (
+                f"_implicit_s{implicit_max_splits}_bk{implicit_block_k}"
+                f"_long{implicit_split_tiles}_short{implicit_split_tiles_short}"
+                f"_shortmax{implicit_split_short_max_tiles}"
+                f"_mid{implicit_split_tiles_mid}"
+                f"_midmax{implicit_split_mid_max_tiles}"
+                if implicit_split_tasks
+                else ""
+            )
             + (f"_weu{waves_per_eu}" if waves_per_eu else "")
         ),
         known_block_size=[QK_WAVES * 64, 1, 1],
@@ -1091,11 +1107,42 @@ def _build_sparse_prefill_launcher(
     ):
         tid = fx.Int32(fx.thread_idx.x)
         task = fx.Int32(fx.block_idx.x)
-        split_task_query_i32 = ptr_buf_tensor(split_task_query, fx.Int32)
-        split_task_start_i32 = ptr_buf_tensor(split_task_start, fx.Int32)
-        split_task_len_i32 = ptr_buf_tensor(split_task_len, fx.Int32)
-        split_task_row_i32 = ptr_buf_tensor(split_task_row, fx.Int32)
-        if fx.const_expr(split_partial):
+        prefix_indptr_i32 = ptr_buf_tensor(prefix_indptr, fx.Int32)
+        if fx.const_expr(split_partial and implicit_split_tasks):
+            implicit_tokens = fx.Int32(fx.grid_dim.x) // fx.Int32(implicit_max_splits)
+            split = task // implicit_tokens
+            query = task % implicit_tokens
+            kv_start = fx.Int32(prefix_indptr_i32[query])
+            kv_len = fx.Int32(prefix_indptr_i32[query + 1]) - kv_start
+            num_tiles = (kv_len + fx.Int32(implicit_block_k - 1)) // fx.Int32(
+                implicit_block_k
+            )
+            segment_tiles = fx.Int32(implicit_split_tiles)
+            if fx.const_expr(implicit_split_tiles_mid > 0):  # noqa: SIM102
+                if num_tiles <= fx.Int32(implicit_split_mid_max_tiles):
+                    segment_tiles = fx.Int32(implicit_split_tiles_mid)
+            if fx.const_expr(implicit_split_tiles_short > 0):  # noqa: SIM102
+                if num_tiles <= fx.Int32(implicit_split_short_max_tiles):
+                    segment_tiles = fx.Int32(implicit_split_tiles_short)
+            active_splits = (num_tiles + segment_tiles - fx.Int32(1)) // segment_tiles
+            if active_splits > fx.Int32(implicit_max_splits):  # noqa: PLR1730
+                active_splits = fx.Int32(implicit_max_splits)
+            if split >= active_splits:
+                return
+            segment_rows = segment_tiles * fx.Int32(implicit_block_k)
+            local_start = split * segment_rows
+            local_end = local_start + segment_rows
+            if split == fx.Int32(implicit_max_splits - 1):
+                local_end = kv_len
+            if local_end > kv_len:  # noqa: PLR1730
+                local_end = kv_len
+            prefix_start = kv_start + local_start
+            prefix_len = local_end - local_start
+        elif fx.const_expr(split_partial):
+            split_task_query_i32 = ptr_buf_tensor(split_task_query, fx.Int32)
+            split_task_start_i32 = ptr_buf_tensor(split_task_start, fx.Int32)
+            split_task_len_i32 = ptr_buf_tensor(split_task_len, fx.Int32)
+            split_task_row_i32 = ptr_buf_tensor(split_task_row, fx.Int32)
             query = fx.Int32(split_task_query_i32[task])
         else:
             query = task
@@ -1108,7 +1155,6 @@ def _build_sparse_prefill_launcher(
         q_i32 = GTensor(q_packed, dtype=T.i32, shape=(-1,))
         q_rope_i32 = GTensor(q_rope, dtype=T.i32, shape=(-1,))
         prefix_indices_i32 = ptr_buf_tensor(prefix_indices, fx.Int32)
-        prefix_indptr_i32 = ptr_buf_tensor(prefix_indptr, fx.Int32)
         extend_indices_i32 = ptr_buf_tensor(extend_indices, fx.Int32)
         extend_indptr_i32 = ptr_buf_tensor(extend_indptr, fx.Int32)
         sink_f32 = ptr_buf_tensor(attn_sink, fx.Float32)
@@ -2302,10 +2348,10 @@ def _build_sparse_prefill_launcher(
                 assume_segment_full,
             )
 
-        if fx.const_expr(split_partial):
+        if fx.const_expr(split_partial and not implicit_split_tasks):
             prefix_start = fx.Int32(split_task_start_i32[task])
             prefix_len = fx.Int32(split_task_len_i32[task])
-        else:
+        elif fx.const_expr(not split_partial):
             prefix_start = fx.Int32(prefix_indptr_i32[query])
             prefix_len = fx.Int32(prefix_indptr_i32[query + 1]) - prefix_start
         if fx.const_expr(dynamic_full_prefix):
@@ -2366,7 +2412,10 @@ def _build_sparse_prefill_launcher(
 
         out_row = wave * fx.Int32(16) + lane_group * fx.Int32(4)
         if fx.const_expr(split_partial):
-            partial_row = fx.Int32(split_task_row_i32[task])
+            if fx.const_expr(implicit_split_tasks):
+                partial_row = query * fx.Int32(implicit_max_splits) + split
+            else:
+                partial_row = fx.Int32(split_task_row_i32[task])
             if lane_group == fx.Int32(0):
                 partial_meta_offset = partial_row * QK_BLOCK_ROWS + head
                 partial_m_f32[partial_meta_offset] = m_row
@@ -2782,6 +2831,14 @@ def sparse_attn_v4_paged_prefill_fp8_flydsl(
     split_task_row: torch.Tensor | None = None,
     partial_m: torch.Tensor | None = None,
     partial_l: torch.Tensor | None = None,
+    implicit_split_tasks: bool = False,
+    implicit_max_splits: int = 0,
+    implicit_block_k: int = 32,
+    implicit_split_tiles: int = 0,
+    implicit_split_tiles_short: int = 0,
+    implicit_split_short_max_tiles: int = 0,
+    implicit_split_tiles_mid: int = 0,
+    implicit_split_mid_max_tiles: int = 0,
 ) -> torch.Tensor:
     """Run the benchmark-only H=128 FlyDSL sparse-prefill kernel.
 
@@ -2903,6 +2960,18 @@ def sparse_attn_v4_paged_prefill_fp8_flydsl(
         raise RuntimeError(
             "split_partial currently requires prefix_only and fixed_softmax_ref"
         )
+    if implicit_split_tasks and not split_partial:
+        raise RuntimeError("implicit_split_tasks requires split_partial")
+    if implicit_split_tasks and (
+        implicit_max_splits <= 1
+        or implicit_block_k <= 0
+        or implicit_split_tiles <= 0
+        or implicit_split_tiles_short < 0
+        or implicit_split_short_max_tiles < 0
+        or implicit_split_tiles_mid < 0
+        or implicit_split_mid_max_tiles < 0
+    ):
+        raise RuntimeError("invalid implicit split-task configuration")
 
     split_tensors = (
         split_task_query,
@@ -2911,14 +2980,22 @@ def sparse_attn_v4_paged_prefill_fp8_flydsl(
         split_task_row,
     )
     if split_partial:
-        if any(value is None for value in split_tensors):
-            raise RuntimeError("split_partial requires all split task tensors")
-        split_tensors = tuple(
-            value.to(dtype=torch.int32).contiguous()  # type: ignore[union-attr]
-            for value in split_tensors
-        )
-        if len({value.numel() for value in split_tensors}) != 1:
-            raise RuntimeError("split task tensors must have matching lengths")
+        if implicit_split_tasks:
+            split_tensors = (
+                kv_indptr_prefix,
+                kv_indptr_prefix,
+                kv_indptr_prefix,
+                kv_indptr_prefix,
+            )
+        else:
+            if any(value is None for value in split_tensors):
+                raise RuntimeError("split_partial requires all split task tensors")
+            split_tensors = tuple(
+                value.to(dtype=torch.int32).contiguous()  # type: ignore[union-attr]
+                for value in split_tensors
+            )
+            if len({value.numel() for value in split_tensors}) != 1:
+                raise RuntimeError("split task tensors must have matching lengths")
         if partial_m is None or partial_l is None:
             raise RuntimeError("split_partial requires partial_m and partial_l")
         if (
@@ -3036,6 +3113,14 @@ def sparse_attn_v4_paged_prefill_fp8_flydsl(
                     bool(dynamic_full_prefix),
                     bool(prefix_only),
                     bool(split_partial),
+                    bool(implicit_split_tasks),
+                    int(implicit_max_splits),
+                    int(implicit_block_k),
+                    int(implicit_split_tiles),
+                    int(implicit_split_tiles_short),
+                    int(implicit_split_short_max_tiles),
+                    int(implicit_split_tiles_mid),
+                    int(implicit_split_mid_max_tiles),
                     int(waves_per_eu),
                 ),
                 ptr_arg(q_packed),
@@ -3054,7 +3139,11 @@ def sparse_attn_v4_paged_prefill_fp8_flydsl(
                 ptr_arg(partial_m),
                 ptr_arg(partial_l),
                 float(softmax_scale),
-                int(split_tensors[0].numel() if split_partial else tokens),
+                int(
+                    tokens * implicit_max_splits
+                    if implicit_split_tasks
+                    else split_tensors[0].numel() if split_partial else tokens
+                ),
                 stream,
             )
     return out

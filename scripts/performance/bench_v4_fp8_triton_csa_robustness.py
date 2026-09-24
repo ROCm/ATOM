@@ -14,6 +14,9 @@ from pathlib import Path
 import torch
 
 from atom.model_ops.v4_kernels.paged_decode import _sparse_attn_v4_paged_decode_asm
+from atom.model_ops.v4_kernels.paged_decode_fp8_flydsl import (
+    sparse_attn_v4_paged_decode_fp8_flydsl_graphsafe,
+)
 from atom.model_ops.v4_kernels.paged_decode_fp8_triton import (
     sparse_attn_v4_paged_decode_fp8_triton,
     sparse_attn_v4_paged_decode_fp8_triton_auto,
@@ -34,6 +37,29 @@ LOCAL_HEADS = 128
 
 def _parse_ints(value: str) -> list[int]:
     return [int(item) for item in value.split(",")]
+
+
+def _parse_flydsl_graphsafe_config(value: str) -> tuple[int, int, int, int, int, int]:
+    """Parse CAP,LONG,SHORT,SHORT_MAX,HEAD_GROUP,WAVES_PER_EU."""
+    try:
+        config = tuple(int(item) for item in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("FlyDSL config must contain integers") from exc
+    if len(config) != 6:
+        raise argparse.ArgumentTypeError(
+            "FlyDSL config must be CAP,LONG,SHORT,SHORT_MAX,HEAD_GROUP,WAVES_PER_EU"
+        )
+    cap, long_tiles, short_tiles, short_max, head_group, waves_per_eu = config
+    if (
+        cap <= 1
+        or long_tiles <= 0
+        or short_tiles < 0
+        or short_max < 0
+        or head_group not in (1, 2, 4, 8)
+        or waves_per_eu < 0
+    ):
+        raise argparse.ArgumentTypeError("invalid FlyDSL graph-safe config")
+    return config  # type: ignore[return-value]
 
 
 def _capture(fn: Callable[[], torch.Tensor]) -> Callable[[], torch.Tensor]:
@@ -80,7 +106,12 @@ def _stats(values: list[float]) -> dict[str, float]:
 
 
 def _benchmark_case(
-    *, batch: int, kv_len: int, seed: int, iterations: int
+    *,
+    batch: int,
+    kv_len: int,
+    seed: int,
+    iterations: int,
+    flydsl_graphsafe_config: tuple[int, int, int, int, int, int] | None,
 ) -> dict[str, object]:
     tokens = batch * VERIFY_WIDTH
     pages = batch * kv_len
@@ -98,6 +129,10 @@ def _benchmark_case(
     kv_packed, kv_rope = quantize_bf16_to_v4_2buff_triton(kv.view(pages, 1, HEAD_DIM))
     kv_packed = kv_packed.view(pages, HEAD_DIM)
     kv_rope = kv_rope.view(pages, ROPE_HEAD_DIM)
+    empty_indptr = torch.zeros_like(indptr)
+    flydsl_out = torch.empty(
+        (tokens, LOCAL_HEADS, HEAD_DIM), dtype=torch.bfloat16, device=device
+    )
     flush = torch.zeros(64 * 1024 * 1024 // 4, dtype=torch.float32, device=device)
 
     def aiter() -> torch.Tensor:
@@ -161,6 +196,30 @@ def _benchmark_case(
             gfx950_native_v=True,
         ),
     }
+    if flydsl_graphsafe_config is not None:
+        cap, long_tiles, short_tiles, short_max, head_group, waves_per_eu = (
+            flydsl_graphsafe_config
+        )
+        eager["flydsl_graphsafe"] = lambda: (
+            sparse_attn_v4_paged_decode_fp8_flydsl_graphsafe(
+                q_packed,
+                q_rope,
+                kv_packed,
+                kv_rope,
+                indices,
+                indptr,
+                empty_indptr,
+                sink,
+                SOFTMAX_SCALE,
+                max_splits=cap,
+                split_tiles=long_tiles,
+                split_tiles_short=short_tiles,
+                split_short_max_tiles=short_max,
+                reduce_head_group=head_group,
+                waves_per_eu=waves_per_eu,
+                out=flydsl_out,
+            )
+        )
     reference = eager["aiter"]().float()
     correctness = {}
     for name, runner in eager.items():
@@ -194,6 +253,16 @@ def _benchmark_case(
         results[name]["speedup_vs_aiter_pct"] = (
             aiter_p50 / results[name]["p50_us"] - 1.0
         ) * 100.0
+        results[name]["speedup_vs_triton_auto_pct"] = (
+            results["triton_auto"]["p50_us"] / results[name]["p50_us"] - 1.0
+        ) * 100.0
+    flydsl_text = ""
+    if flydsl_graphsafe_config is not None:
+        flydsl_text = (
+            f" flydsl-gs={results['flydsl_graphsafe']['p50_us']:7.3f}us "
+            f"(vs-auto "
+            f"{results['flydsl_graphsafe']['speedup_vs_triton_auto_pct']:+6.2f}%)"
+        )
     print(
         f"seed={seed} K={kv_len:4d} B={batch:2d} split={splits} "
         f"AITER={aiter_p50:7.3f}us "
@@ -202,7 +271,7 @@ def _benchmark_case(
         f"attention={results['triton_attention']['p50_us']:7.3f}us "
         f"({results['triton_attention']['speedup_vs_aiter_pct']:+6.2f}%) "
         f"auto={results['triton_auto']['p50_us']:7.3f}us "
-        f"({results['triton_auto']['speedup_vs_aiter_pct']:+6.2f}%)",
+        f"({results['triton_auto']['speedup_vs_aiter_pct']:+6.2f}%)" + flydsl_text,
         flush=True,
     )
     return {
@@ -222,6 +291,14 @@ def main() -> None:
     parser.add_argument("--kv-lens", type=_parse_ints, default=[384, 640, 1152])
     parser.add_argument("--seeds", type=_parse_ints, default=[20260917, 20260918])
     parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument(
+        "--flydsl-graphsafe-config",
+        type=_parse_flydsl_graphsafe_config,
+        help=(
+            "also benchmark graph-safe FlyDSL as "
+            "CAP,LONG,SHORT,SHORT_MAX,HEAD_GROUP,WAVES_PER_EU"
+        ),
+    )
     parser.add_argument("--json", type=Path, required=True)
     args = parser.parse_args()
     if args.iterations % 2:
@@ -237,6 +314,7 @@ def main() -> None:
                         kv_len=kv_len,
                         seed=seed,
                         iterations=args.iterations,
+                        flydsl_graphsafe_config=args.flydsl_graphsafe_config,
                     )
                 )
                 gc.collect()
@@ -251,6 +329,14 @@ def main() -> None:
         < case["results"]["triton_none"]["p50_us"]
         for case in cases
     )
+    flydsl_graphsafe_wins = (
+        sum(
+            case["results"]["flydsl_graphsafe"]["speedup_vs_triton_auto_pct"] > 0
+            for case in cases
+        )
+        if args.flydsl_graphsafe_config is not None
+        else None
+    )
     payload = {
         "iterations": args.iterations,
         "cases": cases,
@@ -258,13 +344,20 @@ def main() -> None:
             "case_count": len(cases),
             "triton_attention_wins_vs_aiter": wins,
             "attention_hint_wins_vs_none": hint_wins,
+            "flydsl_graphsafe_wins_vs_triton_auto": flydsl_graphsafe_wins,
         },
     }
     args.json.parent.mkdir(parents=True, exist_ok=True)
     args.json.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     print(
         f"summary: Triton attention beat AITER in {wins}/{len(cases)} cases; "
-        f"hint beat default Triton in {hint_wins}/{len(cases)} cases",
+        f"hint beat default Triton in {hint_wins}/{len(cases)} cases"
+        + (
+            "; graph-safe FlyDSL beat Triton auto in "
+            f"{flydsl_graphsafe_wins}/{len(cases)} cases"
+            if args.flydsl_graphsafe_config is not None
+            else ""
+        ),
         flush=True,
     )
 

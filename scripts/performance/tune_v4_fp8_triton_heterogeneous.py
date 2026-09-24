@@ -22,6 +22,9 @@ from pathlib import Path
 import torch
 
 from atom.model_ops.v4_kernels.paged_decode import _sparse_attn_v4_paged_decode_asm
+from atom.model_ops.v4_kernels.paged_decode_fp8_flydsl import (
+    sparse_attn_v4_paged_decode_fp8_flydsl_graphsafe,
+)
 from atom.model_ops.v4_kernels.paged_decode_fp8_triton import (
     sparse_attn_v4_paged_decode_fp8_triton,
     sparse_attn_v4_paged_decode_fp8_triton_auto,
@@ -58,6 +61,7 @@ class Config:
     waves_per_eu: int = 1
     reduce_d_chunk: int = 512
     reduce_num_warps: int = 1
+    reduce_head_group: int = 1
     split_tiles_short: int = 0
     split_short_max_tiles: int = 0
     split_tiles_mid: int = 0
@@ -142,6 +146,65 @@ def _parse_vectors(value: str) -> list[tuple[int, ...]]:
             "vectors and context lengths must be non-empty and positive"
         )
     return vectors
+
+
+def _parse_flydsl_graphsafe_config(value: str) -> Config:
+    """Parse a graph-safe FlyDSL schedule, optionally with a middle K tier."""
+    fields = value.split(",")
+    if len(fields) not in (7, 9):
+        raise argparse.ArgumentTypeError(
+            "FlyDSL config must be "
+            "NAME,CAP,LONG,SHORT,SHORT_MAX[,MID,MID_MAX],HEAD_GROUP,WAVES_PER_EU"
+        )
+    name = fields[0]
+    try:
+        values = tuple(int(item) for item in fields[1:])
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "FlyDSL config fields after NAME must be integers"
+        ) from exc
+    if len(values) == 6:
+        cap, long_tiles, short_tiles, short_max, head_group, waves_per_eu = values
+        mid_tiles = mid_max = 0
+    else:
+        (
+            cap,
+            long_tiles,
+            short_tiles,
+            short_max,
+            mid_tiles,
+            mid_max,
+            head_group,
+            waves_per_eu,
+        ) = values
+    if (
+        cap <= 1
+        or long_tiles <= 0
+        or short_tiles < 0
+        or short_max < 0
+        or mid_tiles < 0
+        or mid_max < 0
+        or head_group not in (1, 2, 4, 8)
+        or waves_per_eu < 0
+    ):
+        raise argparse.ArgumentTypeError("invalid FlyDSL graph-safe config")
+    return Config(
+        name,
+        "flydsl_graphsafe",
+        128,
+        32,
+        cap,
+        2,
+        8,
+        0,
+        split_tiles=long_tiles,
+        split_tiles_short=short_tiles,
+        split_short_max_tiles=short_max,
+        split_tiles_mid=mid_tiles,
+        split_mid_max_tiles=mid_max,
+        waves_per_eu=waves_per_eu,
+        reduce_head_group=head_group,
+    )
 
 
 def _hca_rows(context_len: int) -> int:
@@ -231,8 +294,34 @@ def _make_runner(
     indices: torch.Tensor,
     indptr: torch.Tensor,
     sink: torch.Tensor,
+    empty_indptr: torch.Tensor | None = None,
+    flydsl_out: torch.Tensor | None = None,
 ) -> Callable[[], torch.Tensor]:
     def run() -> torch.Tensor:
+        if config.mode == "flydsl_graphsafe":
+            if empty_indptr is None or flydsl_out is None:
+                raise RuntimeError("graph-safe FlyDSL buffers were not provided")
+            return sparse_attn_v4_paged_decode_fp8_flydsl_graphsafe(
+                q_packed,
+                q_rope,
+                kv_packed,
+                kv_rope,
+                indices,
+                indptr,
+                empty_indptr,
+                sink,
+                SOFTMAX_SCALE,
+                max_splits=config.kv_splits,
+                block_k=config.block_k,
+                split_tiles=config.split_tiles,
+                split_tiles_short=config.split_tiles_short,
+                split_short_max_tiles=config.split_short_max_tiles,
+                split_tiles_mid=config.split_tiles_mid,
+                split_mid_max_tiles=config.split_mid_max_tiles,
+                reduce_head_group=config.reduce_head_group,
+                waves_per_eu=config.waves_per_eu,
+                out=flydsl_out,
+            )
         if config.mode == "auto":
             return sparse_attn_v4_paged_decode_fp8_triton_auto(
                 q_packed,
@@ -331,6 +420,10 @@ def benchmark_vector(
     kv_packed, kv_rope = quantize_bf16_to_v4_2buff_triton(kv.view(pages, 1, HEAD_DIM))
     kv_packed = kv_packed.view(pages, HEAD_DIM)
     kv_rope = kv_rope.view(pages, ROPE_HEAD_DIM)
+    empty_indptr = torch.zeros_like(indptr)
+    flydsl_out = torch.empty(
+        (tokens, LOCAL_HEADS, HEAD_DIM), dtype=torch.bfloat16, device=device
+    )
     qo_indptr = torch.arange(tokens + 1, dtype=torch.int32, device=device)
     flush = torch.zeros(
         l2_flush_mib * 1024 * 1024 // 4, dtype=torch.float32, device=device
@@ -360,6 +453,8 @@ def benchmark_vector(
             indices,
             indptr,
             sink,
+            empty_indptr,
+            flydsl_out,
         )
         for config in configs
     }
@@ -440,6 +535,14 @@ def main() -> None:
         "--configs",
         help="comma-separated config names; default benchmarks every config",
     )
+    parser.add_argument(
+        "--flydsl-graphsafe-config",
+        type=_parse_flydsl_graphsafe_config,
+        help=(
+            "benchmark one graph-safe FlyDSL config as "
+            "NAME,CAP,LONG,SHORT,SHORT_MAX[,MID,MID_MAX],HEAD_GROUP,WAVES_PER_EU"
+        ),
+    )
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
     if args.warmup < 0 or args.iterations <= 0 or args.l2_flush_mib <= 0:
@@ -448,7 +551,9 @@ def main() -> None:
         raise RuntimeError("this benchmark requires a ROCm GPU")
 
     global CONFIGS
-    if args.configs:
+    if args.flydsl_graphsafe_config is not None:
+        CONFIGS = (CONFIGS[0], args.flydsl_graphsafe_config)
+    elif args.configs:
         requested = args.configs.split(",")
         configs_by_name = {config.name: config for config in CONFIGS}
         missing = [name for name in requested if name not in configs_by_name]

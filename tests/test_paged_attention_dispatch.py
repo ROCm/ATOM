@@ -646,6 +646,168 @@ class TestV4NativeFp8Routing:
         )
         assert result == "triton"
 
+    def test_b6_hca_routes_to_graphsafe_flydsl(self, monkeypatch):
+        from atom.model_ops.v4_kernels import paged_decode
+
+        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
+        monkeypatch.setenv("ATOM_V4_FLYDSL_FP8_DECODE", "1")
+        monkeypatch.setenv("ATOM_V4_TRITON_HYBRID_DECODE", "1")
+        monkeypatch.setattr(paged_decode, "_device_arch", lambda _index: "gfx950")
+        monkeypatch.setitem(
+            sys.modules,
+            "atom.model_ops.v4_kernels.paged_decode_fp8_flydsl",
+            SimpleNamespace(
+                sparse_attn_v4_paged_decode_fp8_flydsl_auto=(
+                    lambda *args, **kwargs: "flydsl"
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            paged_decode,
+            "_sparse_attn_v4_paged_decode_asm",
+            lambda *args, **kwargs: "aiter",
+        )
+        marker = object()
+        q_packed = SimpleNamespace(
+            shape=(6 * 7, 128, 512), device=SimpleNamespace(index=0)
+        )
+        result = paged_decode.sparse_attn_v4_paged_decode(
+            None,
+            marker,
+            marker,
+            marker,
+            marker,
+            1.0,
+            unified_kv_rope=marker,
+            q_packed_in=q_packed,
+            q_rope_in=marker,
+            qo_indptr=marker,
+            empty_kv_indptr=marker,
+            query_group=7,
+            kv_kind="hca",
+        )
+        assert result == "flydsl"
+
+    def test_csa_b10_b16_routes_to_graphsafe_flydsl(self, monkeypatch):
+        from atom.model_ops.v4_kernels import paged_decode
+
+        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
+        monkeypatch.delenv("ATOM_V4_FLYDSL_FP8_DECODE", raising=False)
+        monkeypatch.setattr(paged_decode, "_device_arch", lambda _index: "gfx950")
+        monkeypatch.setitem(
+            sys.modules,
+            "atom.model_ops.v4_kernels.paged_decode_fp8_flydsl",
+            SimpleNamespace(
+                sparse_attn_v4_paged_decode_fp8_flydsl_auto=(
+                    lambda *args, **kwargs: "flydsl"
+                )
+            ),
+        )
+        marker = object()
+        for requests in (10, 16):
+            q_packed = SimpleNamespace(
+                shape=(requests * 7, 128, 512), device=SimpleNamespace(index=0)
+            )
+            result = paged_decode.sparse_attn_v4_paged_decode(
+                None,
+                marker,
+                marker,
+                marker,
+                marker,
+                1.0,
+                unified_kv_rope=marker,
+                q_packed_in=q_packed,
+                q_rope_in=marker,
+                qo_indptr=marker,
+                empty_kv_indptr=marker,
+                query_group=7,
+                kv_kind="csa",
+            )
+            assert result == "flydsl"
+
+    def test_flydsl_decode_master_zero_keeps_aiter(self, monkeypatch):
+        from atom.model_ops.v4_kernels import paged_decode
+
+        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "0")
+        monkeypatch.setenv("ATOM_V4_FLYDSL_FP8_DECODE", "1")
+        monkeypatch.setattr(paged_decode, "_device_arch", lambda _index: "gfx950")
+        monkeypatch.setattr(
+            paged_decode,
+            "_sparse_attn_v4_paged_decode_asm",
+            lambda *args, **kwargs: "aiter",
+        )
+        marker = object()
+        q_packed = SimpleNamespace(
+            shape=(6 * 7, 128, 512), device=SimpleNamespace(index=0)
+        )
+        result = paged_decode.sparse_attn_v4_paged_decode(
+            None,
+            marker,
+            marker,
+            marker,
+            marker,
+            1.0,
+            unified_kv_rope=marker,
+            q_packed_in=q_packed,
+            q_rope_in=marker,
+            qo_indptr=marker,
+            empty_kv_indptr=marker,
+            query_group=7,
+            kv_kind="hca",
+        )
+        assert result == "aiter"
+
+    @pytest.mark.parametrize(
+        "kv_kind,tokens,kv_len,expected",
+        [
+            ("hca", 6 * 7, 2048, (13, 14, 10, 50, 11, 64)),
+            ("csa", 10 * 7, 384, (3, 8, 6, 12, 0, 0)),
+            ("csa", 12 * 7, 1152, (3, 8, 6, 12, 0, 0)),
+            ("csa", 13 * 7, 384, (2, 9, 6, 12, 0, 0)),
+            ("csa", 16 * 7, 1152, (2, 9, 6, 12, 0, 0)),
+        ],
+    )
+    def test_flydsl_auto_selects_measured_schedule(
+        self, monkeypatch, kv_kind, tokens, kv_len, expected
+    ):
+        from atom.model_ops.v4_kernels import paged_decode_fp8_flydsl as fp8
+
+        captured = {}
+
+        def candidate(*args, **kwargs):
+            captured.update(kwargs)
+            return "flydsl"
+
+        monkeypatch.setattr(
+            fp8,
+            "sparse_attn_v4_paged_decode_fp8_flydsl_graphsafe",
+            candidate,
+        )
+        q_packed = SimpleNamespace(shape=(tokens, 128, 512))
+        kv_indices = SimpleNamespace(numel=lambda: tokens * kv_len)
+        result = fp8.sparse_attn_v4_paged_decode_fp8_flydsl_auto(
+            q_packed,
+            object(),
+            object(),
+            object(),
+            kv_indices,
+            object(),
+            object(),
+            object(),
+            1.0,
+            query_group=7,
+            kv_kind=kv_kind,
+        )
+        assert result == "flydsl"
+        assert (
+            captured["max_splits"],
+            captured["split_tiles"],
+            captured["split_tiles_short"],
+            captured["split_short_max_tiles"],
+            captured["split_tiles_mid"],
+            captured["split_mid_max_tiles"],
+        ) == expected
+
     def test_default_hybrid_does_not_route_other_architectures_to_aiter(
         self, monkeypatch
     ):

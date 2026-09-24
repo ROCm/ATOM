@@ -5,34 +5,38 @@ DeepSeek-V4 native two-buffer FP8 attention on gfx950. It separates production
 routing from benchmark-only candidates and records the workload definitions
 needed to reproduce each result.
 
-Last updated: 2026-09-23.
+Last updated: 2026-09-24.
 
 ## Scope
 
-The tuning study covered four related paths, but the PR retains only the two
-that passed their promotion gates:
+The tuning study covered four related paths. The PR retains the three that
+passed their promotion gates:
 
-1. Native two-buffer FP8 paged decode implemented in Triton (retained).
+1. Native two-buffer FP8 paged decode implemented in Triton (retained as the
+   fallback outside the qualified FlyDSL envelope).
 2. An H=128 sparse-prefill kernel implemented in FlyDSL (retained).
-3. Native two-buffer FP8 sparse prefill implemented in Triton (removed after
+3. Graph-safe H=128/q7 FP8 decode implemented in FlyDSL (retained for HCA B6
+   and CSA B10-B16 on gfx950).
+4. Native two-buffer FP8 sparse prefill implemented in Triton (removed after
    losing to AITER OPUS at both measured production shapes).
-4. H=128 FlyDSL split1 and compact split-K decode paths (removed after the
-   graph-safe implementation failed the 8/8 heterogeneous promotion gate).
 
 The current result is not an unconditional replacement for every AITER
 attention kernel:
 
-- Decode uses a production hybrid policy on gfx950.
+- Decode uses a production hybrid policy on gfx950. FlyDSL is the default for
+  the qualified H128/q7 HCA B6 and CSA B10-B16 shapes; Triton and AITER remain
+  fallbacks outside that measured envelope.
 - FlyDSL prefill is production-routed on gfx950 only for H=128, no-sentinel
   native FP8 inputs with `max_seqlen_q <= 127` and `max_seqlen_k < 4096`.
   Longer extend tails and total K lengths at or above 4096 stay on AITER OPUS.
   The post-ABI-fix production dispatch beats OPUS by 11.70% at
   T2048/P1151/E127; the P4095/E127 and P8192/E127 fallback outputs are
   bit-identical to direct OPUS.
-- FlyDSL decode was removed. Split1 could not replace the complete Triton CSA
-  matrix, and the GPU-resident graph-safe split-K implementation won only 7/8
-  heterogeneous HCA B6 vectors. Production retains the 8/8-winning Triton
-  HCA B6 path.
+- FlyDSL decode planning and reduction are now entirely FlyDSL. Stage 1 derives
+  a split-major fixed-grid task map directly from GPU-resident `kv_indptr`, and
+  the reducer derives the live split count from the same tensor. There is no
+  host `.tolist()`, GPU readback, dynamic grid, or Triton planning/reduction
+  kernel in the promoted path.
 
 ## Status summary
 
@@ -41,6 +45,8 @@ attention kernel:
 | Triton decode | CSA B10-B16, two seeds, K=384/640/1152 | 42/42 wins | 42 reference points | All positive | Production hybrid |
 | Triton decode | CSA B12, K=1152 | 86.241 us | 88.760 us | +2.92% | Production hybrid |
 | Triton decode | HCA B6 heterogeneous vectors | All 8 vectors win | AITER decode | About +4% to +43% | Native-V opt-in |
+| FlyDSL decode | CSA B10-B16, K=384/640/1152, two seeds | 42/42 wins | Triton auto | +1.34% to +33.83%, +12.31% average | Production default |
+| FlyDSL decode | HCA B6, eight heterogeneous vectors, two seeds | 16/16 wins | Tuned Triton | +1.42% to +19.99%, +8.01% average | Production default |
 | Triton prefill | T=2048, P=1151, E=127, mixed | 577.06-577.74 us | 464.48-464.86 us | Candidate latency about 24.2% higher | Removed |
 | Triton prefill | T=2048, P=8192, E=127, mixed | 2486.29-2489.97 us | 1849.35-1849.83 us | Candidate latency about 34.4% higher | Removed |
 | FlyDSL prefill | T=2048, P=1151, E=127, mixed | 402.92 us | OPUS 464.48 us | +15.28% throughput-style speedup | Benchmark-only |
@@ -59,7 +65,7 @@ attention kernel:
 | FlyDSL decode split1 | CSA B10-B16, two seeds, K=384/640/1152 | 40/42 wins vs AITER; 15/42 wins vs Triton auto | 42 reference points | Median 2.88% behind Triton auto | Removed |
 | FlyDSL decode split1 | HCA B6 heterogeneous vectors | 0/8 wins | AITER and tuned Triton | 58.36%-73.21% behind AITER | Removed |
 | FlyDSL decode split-K | HCA B6, eight heterogeneous vectors | 49.92-94.88 us | Packed Triton 56.54-112.50 us; AITER 61.18-127.64 us | 8/8 wins; +5.36% to +52.78% vs Triton | Removed: host-planned only |
-| FlyDSL decode graph-safe split-K | HCA B6, eight heterogeneous vectors | 7/8 wins | AITER decode | Worst regression 1.59% at cap10 and 3.01% at cap12 | Removed |
+| Earlier FlyDSL graph-safe split-K | HCA B6, eight heterogeneous vectors | 7/8 wins | AITER decode | Superseded by the split-major retune | Historical rejection |
 
 In the benchmark JSON, `delta_pct` is computed from the throughput-style ratio
 `reference_us / candidate_us - 1`. A negative value therefore does not equal
@@ -77,12 +83,14 @@ compared directly with E127 Triton numbers.
 | `ATOM_USE_TRITON_ATTN` | `1` | Master switch for the native Triton attention paths. `0` permits AITER fallback. |
 | `ATOM_V4_TRITON_HYBRID_DECODE` | `1` | On gfx950, route only measured decode winners to Triton. `0` forces all supported native-FP8 decode shapes to Triton. |
 | `ATOM_V4_TRITON_NATIVE_BF16_V` | `0` | Enables the experimental gfx950 native FP8-to-BF16 V path for eligible HCA decode shapes. It also enables the tuned B6 HCA specialization. |
+| `ATOM_V4_FLYDSL_FP8_DECODE` | `1` | Enables the qualified gfx950 H128/q7 FlyDSL decode routes. Set to `0` for matched Triton comparisons. The master attention switch still takes precedence. |
 | `ATOM_V4_FLYDSL_FP8_PREFILL` | `0` | Enables the gfx950 H=128 FlyDSL prefill route for eligible no-sentinel inputs with `max_seqlen_q <= 127` and `max_seqlen_k < 4096`; all other inputs use OPUS. |
 | `ATOM_FORCE_V4_PREFILL_OPUS` | `0` | Forces the native-FP8 prefill path back to OPUS. |
 
 Relevant dispatch implementations:
 
 - `atom/model_ops/v4_kernels/paged_decode.py`
+- `atom/model_ops/v4_kernels/paged_decode_fp8_flydsl.py`
 - `atom/model_ops/v4_kernels/paged_decode_fp8_triton.py`
 - `atom/model_ops/v4_kernels/paged_prefill.py`
 - `atom/model_ops/v4_kernels/paged_prefill_fp8_flydsl.py`
@@ -132,8 +140,9 @@ seeds:   20260917, 20260918
 total:   42 points
 ```
 
-All 42 points beat AITER. For B12/K1152, the production auto path measured
-86.241 us versus 88.760 us for AITER, a 2.92% speedup.
+All 42 Triton points beat AITER. For B12/K1152, the Triton auto path measured
+86.241 us versus 88.760 us for AITER, a 2.92% speedup. The graph-safe FlyDSL
+retune below now supersedes Triton for this qualified production envelope.
 
 ### FlyDSL decode split1 experiment
 
@@ -207,12 +216,51 @@ launch grid is sized to the active task count rather than a graph-safe maximum,
 and sentinel/empty/ragged coverage plus a matched 900-second AgentX run remain
 outstanding.
 
-The production-integration follow-up moved planning onto the GPU and used a
-fixed graph-safe maximum grid. With planner caps 10 and 12 it was correct but
+The first production-integration follow-up moved planning onto the GPU and used
+a fixed graph-safe maximum grid. With planner caps 10 and 12 it was correct but
 won only seven of the eight heterogeneous vectors. The losing vector was 1.59%
-slower than AITER at cap10 and 3.01% slower at cap12. Since this no longer meets
-the 8/8 promotion gate, the FlyDSL decode implementation and runtime switch
-were removed; the tuned Triton HCA B6 specialization remains active.
+slower than AITER at cap10 and 3.01% slower at cap12, so that version was not
+promoted.
+
+### Graph-safe FlyDSL decode retune
+
+The retained implementation removes the separate Triton planner and generates
+the split-major task mapping inside the FlyDSL stage-1 kernel. It launches a
+fixed `tokens * max_splits` grid, exits inactive splits before loading Q/K/V,
+and lets the FlyDSL reducer derive the live split count from `kv_indptr`.
+
+The final schedules are:
+
+```text
+HCA B6:      cap13 / long14 / mid11<=64 / short10<=50 / head_group=8
+CSA B10-B12: cap3  / long8  / short6  / short_max_tiles=12 / head_group=8
+CSA B13-B16: cap2  / long9  / short6  / short_max_tiles=12 / head_group=8
+```
+
+CSA uses only host-visible batch size for the fixed grid. The live K384 versus
+K640/K1152 segment choice is made on GPU from each `kv_indptr` delta. This is
+important because vLLM commonly passes a compact `kv_indices` view while
+SGLang CUDA Graph replay can retain a worst-case backing buffer; tensor
+capacity is therefore not a portable K-length signal.
+
+Two seeds and 100 timed CUDA-Graph replays per point produced:
+
+| CSA K | Points | FlyDSL wins vs Triton auto | Minimum | Maximum | Average |
+|---:|---:|---:|---:|---:|---:|
+| 384 | 14 | 14/14 | +2.33% | +20.11% | +10.22% |
+| 640 | 14 | 14/14 | +11.85% | +33.83% | +22.05% |
+| 1152 | 14 | 14/14 | +1.34% | +7.57% | +4.66% |
+| Total | 42 | 42/42 | +1.34% | +33.83% | +12.31% |
+
+The final HCA B6 matrix used eight heterogeneous vectors, two seeds, and 200 timed
+replays per vector. FlyDSL won all 16 comparisons against the tuned packed
+Triton path, from +1.42% to +19.99%, with a +8.01% average. Minimum cosine was
+`0.9999961`; all outputs were finite.
+
+A production dispatcher capture was also replayed with one fixed, worst-case
+CSA index buffer while changing only the GPU-resident `kv_indptr` lengths among
+K384, K640, and K1152. All three replays were finite and had cosine similarity
+at least `0.99999630` against AITER.
 
 ### HCA routing boundary
 
@@ -223,28 +271,30 @@ requests prefer different work decompositions.
 - The same configurations regress heterogeneous vectors by approximately
   6% to 21% and are not production-safe.
 - The adaptive B6 packed path wins all eight tested heterogeneous vectors.
-- The compact FlyDSL split-K prototype is faster on all eight vectors, but its
-  host planner and active-sized grid are not valid production routing yet.
+- The retained FlyDSL split-K path is faster on all eight vectors across both
+  formal seeds and uses no host planner or active-sized grid.
 - More aggressive native-V routing produced favorable 360-second results but
   later regressed ITL in a matched 900-second C96 run.
 
-Therefore, with the default gfx950 hybrid policy, H=128 q7 HCA normally falls
-back to AITER. The B6 Triton specialization additionally requires
+Therefore, with the default gfx950 hybrid policy, H=128 q7 HCA B6 routes to
+FlyDSL. Other HCA batch shapes still fall back to AITER unless separately
+qualified. The old B6 Triton specialization remains available for matched
+comparison when `ATOM_V4_FLYDSL_FP8_DECODE=0` and
 `ATOM_V4_TRITON_NATIVE_BF16_V=1`.
 
-For the matched C96 E2E comparison in this document, native BF16 V is enabled,
-so the validated Triton B6 specialization is used while FlyDSL decode remains
-disabled.
+The matched C96 E2E comparison later in this document predates this retune and
+used the Triton B6 specialization with FlyDSL decode disabled. A new matched
+900-second E2E run is still required before attributing an end-to-end gain to
+the FlyDSL decode promotion.
 
-The FlyDSL split1 adapter was also tested on the same eight B6 heterogeneous
+The removed FlyDSL split1 adapter was also tested on the same eight B6 heterogeneous
 vectors with CUDA Graph replay. It was correct (minimum cosine `0.99999619`,
 maximum relative RMSE `0.00273328`, maximum absolute error `0.00390625`, zero
 non-finite outputs), but lost all eight vectors: 58.36%-73.21% behind AITER and
 61.08%-78.95% behind the tuned packed/adaptive Triton path. One CTA per query
 serializes each request's full variable-length KV range, so this result confirms
-that HCA replacement requires split scheduling plus packed active-task
-compaction. The new split-K prototype supplies both and supersedes split1 for
-HCA tuning, but it must not be routed until planning and graph-safety are fixed.
+that HCA replacement requires split scheduling. The retained graph-safe
+split-major split-K path supplies that decomposition and supersedes split1.
 
 ### Decode experiments not promoted
 
@@ -729,21 +779,44 @@ CSA B10-B16 robustness:
 ```bash
 HIP_VISIBLE_DEVICES=0 PYTHONPATH=. \
 python scripts/performance/bench_v4_fp8_triton_csa_robustness.py \
-  --batches 10,11,12,13,14,15,16 \
+  --batches 10,11,12 \
   --kv-lens 384,640,1152 \
   --seeds 20260917,20260918 \
   --iterations 100 \
-  --json /tmp/v4-fp8-csa-robustness.json
+  --flydsl-graphsafe-config 3,8,6,12,8,1 \
+  --json /tmp/v4-fp8-csa-b10-b12-flydsl.json
+
+HIP_VISIBLE_DEVICES=0 PYTHONPATH=. \
+python scripts/performance/bench_v4_fp8_triton_csa_robustness.py \
+  --batches 13,14,15,16 \
+  --kv-lens 384,640,1152 \
+  --seeds 20260917,20260918 \
+  --iterations 100 \
+  --flydsl-graphsafe-config 2,9,6,12,8,1 \
+  --json /tmp/v4-fp8-csa-b13-b16-flydsl.json
 ```
 
-HCA tuning must include heterogeneous context vectors. Uniform-only winners
-must not be promoted into the hybrid dispatcher.
+HCA tuning must include heterogeneous context vectors. The retained schedule
+can be reproduced with:
+
+```bash
+HIP_VISIBLE_DEVICES=0 PYTHONPATH=. \
+python scripts/performance/tune_v4_fp8_triton_heterogeneous.py \
+  --seed 20260917 \
+  --warmup 10 \
+  --iterations 100 \
+  --flydsl-graphsafe-config flydsl-final,13,14,10,50,11,64,8,1 \
+  --json /tmp/v4-fp8-hca-b6-flydsl.json
+```
+
+Uniform-only HCA winners must not be promoted into the hybrid dispatcher.
 
 ### Static validation
 
 ```bash
 python3 -m py_compile \
   atom/model_ops/v4_kernels/paged_decode.py \
+  atom/model_ops/v4_kernels/paged_decode_fp8_flydsl.py \
   atom/model_ops/v4_kernels/paged_decode_fp8_triton.py \
   atom/model_ops/v4_kernels/paged_prefill.py \
   atom/model_ops/v4_kernels/paged_prefill_fp8_flydsl.py \
@@ -795,7 +868,8 @@ A candidate should not replace AITER/OPUS unless all relevant gates pass:
 3. Extend FlyDSL qualification to sentinel, empty-query, ragged-tail, uniform,
    and additional shapes before widening the current Q <= 127/K < 4096
    production envelope.
-4. Keep production HCA routing on the 8/8-winning Triton implementation.
+4. Extend the graph-safe FlyDSL decode qualification beyond HCA B6 and CSA
+   B10-B16 only after the same heterogeneous and multi-seed promotion gates.
 5. Only after attention promotion, continue replacing the remaining AITER
    QK norm/RoPE/quant, FP4 indexer and compressor kernels.
 
@@ -851,6 +925,16 @@ runs/v4-fp8-flydsl-production-20260923/
   pointer-abi-t2048-p1151-e2048-causal-abba5.json
   ragged-t3072-p1151-e3072-causal-abba3.json
   pointer-abi-production-dispatch-p4095-e127-abba5.json
+```
+
+Graph-safe FlyDSL decode retune:
+
+```text
+runs/v4-fp8-flydsl-retune-20260924/
+  final-pr-hca-tritier-seed17-all8-200.json
+  final-pr-hca-tritier-seed18-all8-200.json
+  csa-b10-12-cap3-long8-short6-seeds17-18-100.json
+  csa-b13-16-cap2-long9-short6-seeds17-18-100.json
 ```
 
 Matched C96 end-to-end A/B:
