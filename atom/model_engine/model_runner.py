@@ -45,6 +45,7 @@ from atom.distributed.ulysses_sp import (
     get_sp_world_size,
     set_sp_world_size,
     sp_gather_tokens,
+    sp_graph_capture,
     sp_is_enabled,
     sp_local_slice,
     sp_pad_len,
@@ -4148,7 +4149,12 @@ class ModelRunner:
                 self.h2d_owner.fail()
                 raise
 
-        with pause_gc(), graph_capture() as capture_ctx, self.capture_profiler as prof:
+        with (
+            pause_gc(),
+            graph_capture() as capture_ctx,
+            sp_graph_capture(capture_ctx),
+            self.capture_profiler as prof,
+        ):
             for max_q_len in q_buckets:
                 capture_range = (
                     tqdm.tqdm(self.capture_sizes)
