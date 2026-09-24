@@ -189,8 +189,7 @@ class UBatchWrapper(nn.Module):
                 try:
                     ub_input_ids, ub_positions = ub_inputs[idx]
                     with tbo_ctxs[idx]:
-                        forward = getattr(self.model, "forward_ubatch", self.model)
-                        model_output = forward(ub_input_ids, ub_positions)
+                        model_output = self.model(ub_input_ids, ub_positions)
                     results.append((idx, self._validate_ubatch_output(model_output)))
                 except Exception as e:
                     # logger.exception captures the full traceback. The partner

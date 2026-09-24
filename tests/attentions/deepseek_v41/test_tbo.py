@@ -303,8 +303,9 @@ def test_split_attention_reads_preceding_microbatch_window(cut):
 @pytest.mark.parametrize("unified", [False, True])
 @pytest.mark.parametrize("layers", [1, 8])
 @pytest.mark.parametrize("stress_lifetime", [False, True])
+@pytest.mark.parametrize("level", [0, 3])
 def test_dp_moe_original_schedule_preserves_outputs(
-    monkeypatch, unified, layers, stress_lifetime
+    monkeypatch, tmp_path, unified, layers, stress_lifetime, level
 ):
     """Exercise the real MoE scheduler with delayed, local collective stand-ins.
 
@@ -312,15 +313,27 @@ def test_dp_moe_original_schedule_preserves_outputs(
     Exercise the actual V4.1 output hook with delayed compute and enough
     partner allocations to reuse an unprotected comm output.
     """
+    from atom.config import CompilationConfig, CUDAGraphMode
     from atom.model_ops import moe
     from atom.models.deepseek_v41.model import Block
     from atom.models.deepseek_v41.runtime import DeepseekV41RuntimeModel, RuntimeBlock
-    from atom.utils.tbo.ubatching import tbo_current_ubatch_id
+    from atom.utils.decorators import support_torch_compile
+    from atom.utils.forward_context import get_forward_context
+    from atom.utils.tbo.ubatching import tbo_active, tbo_current_ubatch_id
 
     builder, parent = make_parent("cuda")
     calls = []
     width = 5120 if stress_lifetime else 1
-    config = SimpleNamespace(enable_dp_attention=True)
+    config = SimpleNamespace(
+        enable_dp_attention=True,
+        compilation_config=CompilationConfig(
+            level=level,
+            cudagraph_mode=CUDAGraphMode.FULL,
+            cache_dir=str(tmp_path),
+            splitting_ops=[],
+            compile_sizes=[],
+        ),
+    )
     monkeypatch.setattr(moe, "get_current_atom_config", lambda: config)
     monkeypatch.setattr(moe, "get_dp_group", lambda: None)
 
@@ -369,9 +382,28 @@ def test_dp_moe_original_schedule_preserves_outputs(
         prefix="test",
     )
 
+    def run_experts(hidden, router):
+        # Compile on the main thread before exercising the TBO workers, as
+        # ModelRunner warmup does. The custom op keeps scheduling at runtime.
+        if not tbo_active():
+            return hidden * 2 + router
+        context = get_forward_context().context
+        context.running_tokens_are_unified = unified
+        iteration = getattr(context, "test_moe_iteration", 0)
+        if iteration == 0:
+            calls.append((tbo_current_ubatch_id(), "prepare"))
+        context.test_moe_iteration = iteration + 1
+        result = moe.FusedMoE.forward_impl_graph(layer, hidden, router)
+        if stress_lifetime and iteration + 1 == layers:
+            torch.cuda._sleep(100_000_000)
+        return result
+
+    layer.forward_impl = run_experts
+    config.compilation_config.static_forward_context["test"] = layer
+
     class RoutedExperts(torch.nn.Module):
         def forward(self, hidden, router):
-            return moe.FusedMoE.forward_impl_graph(layer, hidden, router)
+            return torch.ops.aiter.moe_forward(hidden, router, "test")
 
     def block_init(self):
         torch.nn.Module.__init__(self)
@@ -380,26 +412,19 @@ def test_dp_moe_original_schedule_preserves_outputs(
 
     monkeypatch.setattr(Block, "__init__", block_init)
 
+    @support_torch_compile(dynamic_arg_dims={"input_ids": 0, "positions": 0})
     class Model(torch.nn.Module):
         tbo_comm_stream_priority = DeepseekV41RuntimeModel.tbo_comm_stream_priority
 
-        def __init__(self):
+        def __init__(self, atom_config):
             super().__init__()
             # Use the real runtime constructor to install the ownership hook.
             self.block = RuntimeBlock()
 
-        def forward(self, ids, positions):
-            from atom.utils.forward_context import get_forward_context
-
-            get_forward_context().context.running_tokens_are_unified = unified
-            calls.append((tbo_current_ubatch_id(), "prepare"))
-            hidden = ids.float()[:, None].expand(-1, width).contiguous()
-            result = hidden
+        def forward(self, input_ids, positions):
+            result = input_ids.float()[:, None].expand(-1, width).contiguous()
             for _ in range(layers):
                 result = self.block.ffn.experts(result, result + 3)
-            # Force consumption on compute after reduce-scatter on comm.
-            if stress_lifetime:
-                torch.cuda._sleep(100_000_000)
             return result + torch.ones_like(result)
 
     ids = torch.arange(14, device="cuda", dtype=torch.int32)
@@ -418,7 +443,12 @@ def test_dp_moe_original_schedule_preserves_outputs(
         ubatch_slices=_split_prefill_token_midpoint(2, [10, 4], 2, None),
     )
     monkeypatch.setattr(_forward_context_local, "ctx", ctx, raising=False)
-    wrapper = UBatchWrapper(Model(), builder)
+    model = Model(config)
+    with torch.inference_mode():
+        model(ids, parent.step.positions)
+    if level == 3:
+        assert len(model.compiled_codes) == 1
+    wrapper = UBatchWrapper(model, builder)
     for _ in range(3):
         calls.clear()
         actual = wrapper(ids, parent.step.positions)
