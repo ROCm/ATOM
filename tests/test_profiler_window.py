@@ -93,9 +93,18 @@ def make_handler(delay=0, max_iters=0, scheduler=None, fail_on=None):
     return handler, runner_mgr
 
 
+def engine_step(handler):
+    """One engine step: the forward's hook, then the loop's mailbox check.
+
+    Both halves, because the hook only counts and the check is what acts.
+    """
+    handler.profiler_step()
+    handler.apply_deferred_profiler_action()
+
+
 def run_steps(handler, count):
     for _ in range(count):
-        handler.profiler_step()
+        engine_step(handler)
 
 
 def broadcast(handlers, cmd, **payload):
@@ -141,7 +150,7 @@ def rpc_steps(delay=0, max_iters=0, steps=20, body=None):
     landed = dict.fromkeys(mgr.calls, 0)
     for step in range(1, steps + 1):
         already_sent = len(mgr.calls)
-        handler.profiler_step()
+        engine_step(handler)
         landed.update(dict.fromkeys(mgr.calls[already_sent:], step))
     return landed
 
@@ -208,7 +217,7 @@ def test_windows_reset_between_requests():
     start_window(one)
     run_steps(handler, 2)
     assert mgr.calls == one_window + ["start_profiler"]
-    handler.profiler_step()
+    engine_step(handler)
     assert mgr.calls == one_window * 2
 
     # An explicit stop cancels a pending delay, so nothing opens behind it.
@@ -238,6 +247,22 @@ def test_a_failed_auto_start_leaves_the_engine_idle_and_says_so():
     run_steps(handler, 2 + 5)
     assert mgr.calls[-2:] == ["start_profiler", "stop_profiler"]
     assert "error" not in broadcast(one, "stop_profile")[0], "a stale error"
+
+
+def test_the_transition_is_sent_from_the_busy_loop_not_the_forward_hook():
+    """Every busy loop checks the utility queue, so that check is what sends
+    the RPC: from the hook it would be a second call on the queues the
+    forward still holds.
+    """
+    handler, mgr = make_handler(delay=1)
+    start_window([(handler, mgr)])
+
+    handler.profiler_step()
+    assert mgr.calls == [], "the hook sent the RPC itself"
+
+    # An empty queue, the common case, must still carry the transition out.
+    handler.process_queue(queue.Queue(), SimpleNamespace(_has_pending_utility=False))
+    assert mgr.calls == ["start_profiler"]
 
 
 # ── Per-request window ────────────────────────────────────────────────────
@@ -286,7 +311,7 @@ def test_a_request_window_does_not_outlive_its_run():
     start_window(one)
     run_steps(handler, 4)
     assert mgr.calls == one_window + ["start_profiler"]
-    handler.profiler_step()
+    engine_step(handler)
     assert mgr.calls == one_window * 2
     assert (handler.profiler_delay_iters, handler.profiler_max_iters) == (
         0,
@@ -507,7 +532,7 @@ def test_scheduler_detailed_aggregates_track_the_recorded_window():
     start_window([(handler, mgr)])
     assert scheduler.profile_active is False, "armed is not yet recording"
 
-    handler.profiler_step()
+    engine_step(handler)
     assert scheduler.profile_active is True
 
     run_steps(handler, 2)

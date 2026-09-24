@@ -87,6 +87,7 @@ class EngineUtilityHandler:
         self._profiler_active = False
         self._profiler_reservation: str | None = None
         self._profiler_last_error: str | None = None
+        self._profiler_deferred: str | None = None
 
     def process_queue(self, utility_queue, engine):
         """Drain *utility_queue* and execute each command.
@@ -96,7 +97,12 @@ class EngineUtilityHandler:
 
         Sleep/wake state is tracked on *engine._is_rl_weights_offloaded* so that the
         busy-loop can skip model execution while the weights are offloaded.
+
+        Every busy loop calls this at the top of every iteration, which is
+        why the profiler's deferred transition is applied from here: it is
+        the one place outside ``call_func`` that all of them reach.
         """
+        self.apply_deferred_profiler_action()
         if not engine._has_pending_utility:
             return
 
@@ -422,24 +428,38 @@ class EngineUtilityHandler:
     def profiler_step(self):
         """Advance the profiler window once per completed forward.
 
-        Called after the forward RPC returns, so the trace export that closing
-        a window triggers runs between engine steps rather than inside one.
+        Counters only. This runs from inside `call_func`, so starting or
+        stopping here would send a second RPC from the frame still holding
+        the first; the boundary is recorded and acted on from the engine
+        loop instead.
         """
         if self._profiler_pending:
             self._profiler_pending -= 1
             if self._profiler_pending == 0:
-                try:
-                    self._start_profiler_now()
-                except Exception as e:
-                    # Store the error and disable the profiler
-                    self._profiler_active = False
-                    self._profiler_recorded = 0
-                    self._profiler_last_error = f"profiler auto-start failed: {e}"
-                    logger.exception(f"{self.label}: profiler auto-start failed")
+                self._profiler_deferred = "start"
         elif self._profiler_active and self._effective_max_iters:
             self._profiler_recorded += 1
             if self._profiler_recorded >= self._effective_max_iters:
-                self._stop_profiler_now()
+                self._profiler_deferred = "stop"
+
+    def apply_deferred_profiler_action(self):
+        """Act on a window boundary `profiler_step` reached, if any.
+
+        On a PP head this lands at the end of the pass rather than mid-burst,
+        so a window closes on whole pipeline waves.
+        """
+        action, self._profiler_deferred = self._profiler_deferred, None
+        if action == "stop":
+            self._stop_profiler_now()
+        elif action == "start":
+            try:
+                self._start_profiler_now()
+            except Exception as e:
+                # Store the error and disable the profiler
+                self._profiler_active = False
+                self._profiler_recorded = 0
+                self._profiler_last_error = f"profiler auto-start failed: {e}"
+                logger.exception(f"{self.label}: profiler auto-start failed")
 
     # ------------------------------------------------------------------
     # MTP statistics
