@@ -67,3 +67,35 @@ regexes = [
   '''[A-Z][A-Z0-9_]*SHA512\s*[=:]''',
   '''[A-Z][A-Z0-9_]*MD5\s*[=:]''',
 ]
+
+# ---------------------------------------------------------------------------
+# `generic-api-key` fires on any high-entropy value sitting near a word like
+# "key" or "token". In this tree the trigger is model vocabulary -- a tensor
+# name, or a filename that happens to contain "token" -- so the entries below
+# anchor on the shape of the value rather than on file paths. A real
+# credential in the same files is still reported.
+# ---------------------------------------------------------------------------
+
+[[allowlists]]
+description = "Model file digests in a reference manifest"
+# `tests/models/*/fixtures/reference_manifest.json` pins a HuggingFace
+# revision as `"sha256": {"<filename>": "<digest>"}`. `tokenizer.json` and
+# `tokenizer_config.json` are the entries that trip the rule, since their
+# names contain "token".
+#
+# The digest alone is indistinguishable from a 64-hex credential, so this
+# matches the filename key and the digest together rather than allowlisting
+# every 64-character hex string in the tree.
+regexTarget = "match"
+regexes = [
+  '''\.(?:json|py|txt|md|ya?ml|bin|safetensors|model)": "[0-9a-f]{64}"''',
+]
+
+[[allowlists]]
+description = "snake_case identifiers"
+# `last_token_idx = sequence_lengths_plus_1 - 1`. At least one underscore is
+# required and every segment is capped at 12 characters, so an unbroken token
+# -- a hex digest, an access key id -- does not qualify.
+regexes = [
+  '''^[a-z][a-z0-9]{0,11}(?:_[a-z0-9]{1,12}){1,5}$''',
+]
