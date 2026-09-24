@@ -10,8 +10,8 @@ run-name: >-
       || format('manual ({0})', github.actor) }}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.agentic_profile || 'random' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && (inputs.agentic_profile == '' || inputs.agentic_profile == 'random') }}
 
 on:
   schedule:
@@ -24,6 +24,11 @@ on:
     - cron: '37 4 * * 0'
   workflow_dispatch:
     inputs:
+      agentic_profile:
+        description: "Select test/nightly to run ONLY the agentic workflow; random keeps the model checkboxes below"
+        type: choice
+        options: [random, test, nightly]
+        default: random
       publish_to_dashboard:
         description: "Upload results to the dashboard (off by default for manual runs; schedule always publishes)"
         type: boolean
@@ -88,9 +93,9 @@ on:
         description: "Extra arguments to pass to the ATOM server"
         type: string
       image:
-        description: "Image to use for the benchmark"
+        description: "Image override; empty uses the random/agentic profile default"
         type: string
-        default: "rocm/atom-dev:latest"
+        default: ""
       runner:
         description: "Optional runner label override for manual runs; leave empty to use model defaults"
         type: string
@@ -132,12 +137,30 @@ env:
   CADENCE: ${{ github.event_name == 'schedule' && github.event.schedule == '37 4 * * 0' && 'weekly' || 'nightly' }}
 
 jobs:
+  agentic:
+    name: Agentic benchmark
+    if: github.event_name == 'workflow_dispatch' && inputs.agentic_profile != 'random' && inputs.agentic_profile != ''
+    uses: ./.github/workflows/atom-agentic-benchmark.yaml
+    permissions:
+      contents: read
+    secrets: inherit
+    with:
+      profile: ${{ inputs.agentic_profile }}
+      image: ${{ inputs.image || '' }}
+      runner: ${{ inputs.runner || '' }}
+      atom_commit: ${{ inputs.atom_commit || '' }}
+      aiter_commit: ${{ inputs.aiter_commit || '' }}
+      extra_args: ${{ inputs.extra_args || '' }}
+      enable_profiler: ${{ inputs.enable_profiler || false }}
+      enable_rtl: ${{ inputs.enable_rtl || false }}
+
   # Single source of the benchmark matrix. Expands the structured catalog
   # (.github/benchmark/models.json) into fully-resolved per-run "cells" — one
   # matrix dimension — applying model selection and per-variant concurrency
   # bands in one place. See .github/scripts/{catalog,build_benchmark_matrix}.py
   # and .github/benchmark/README.md.
   build-matrix:
+    if: inputs.agentic_profile == '' || inputs.agentic_profile == 'random'
     name: Build benchmark matrix
     runs-on: ubuntu-latest
     outputs:
@@ -199,7 +222,7 @@ jobs:
     concurrency:
       group: gh-pages-deploy
       cancel-in-progress: false
-    if: always()
+    if: always() && (inputs.agentic_profile == '' || inputs.agentic_profile == 'random')
     name: Summarize benchmark result
     needs: [benchmark]
     runs-on: ubuntu-latest
@@ -616,6 +639,7 @@ jobs:
   profiler-analysis:
     if: >-
       always()
+      && (inputs.agentic_profile == '' || inputs.agentic_profile == 'random')
       && (needs.collect-regression-traces.result != 'cancelled'
           && needs.collect-regression-traces.result != 'skipped'
           || inputs.enable_profiler == true)

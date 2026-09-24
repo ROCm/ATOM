@@ -6,28 +6,71 @@ on:
   schedule:
     # Daily at 08:17 UTC / 16:17 Beijing time, outside the random benchmark crons.
     - cron: '17 8 * * *'
+  workflow_call:
+    inputs:
+      profile:
+        type: string
+        default: test
+      dry_run:
+        type: boolean
+        default: false
+      models:
+        type: string
+        default: ""
+      concurrency:
+        type: string
+        default: ""
+      duration_seconds:
+        type: string
+        default: ""
+      image:
+        type: string
+        default: ""
+      runner:
+        type: string
+        default: ""
+      extra_args:
+        type: string
+        default: ""
+      atom_commit:
+        type: string
+        default: ""
+      aiter_commit:
+        type: string
+        default: ""
+      enable_profiler:
+        type: boolean
+        default: false
+      enable_rtl:
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
+      profile:
+        description: "test: TP4 c=2/4 for 900s; nightly: InferenceX #3387 TP2/TP4 sweep for 3600s"
+        type: choice
+        options: [test, nightly]
+        default: test
       dry_run:
         description: "Preview and save the resolved configuration without allocating GPU runners"
         type: boolean
         default: false
       models:
-        description: "Comma-separated model prefixes; empty selects all of models_agentic.json"
+        description: "Comma-separated model prefixes; empty selects all models in the profile"
         type: string
         default: ""
       concurrency:
-        description: "Comma-separated concurrency override; empty uses the catalog (currently 2,4)"
+        description: "Comma-separated concurrency override; empty uses the profile's grid"
         type: string
         default: ""
       duration_seconds:
-        description: "Profiling duration per cell, from 900 to 3600 seconds"
-        type: number
-        default: 900
-      image:
-        description: "Benchmark image; use a nightly tag or digest for reproducible manual runs"
+        description: "900–3600 seconds per point; empty uses the profile (test 900, nightly 3600)"
         type: string
-        default: "rocm/atom-dev:latest"
+        default: ""
+      image:
+        description: "Empty uses the profile image; optionally override with an immutable tag or digest"
+        type: string
+        default: ""
       runner:
         description: "Dedicated GPU CI runner override; empty uses the catalog"
         type: string
@@ -57,7 +100,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  group: atom-agentic-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: false
 
 jobs:
@@ -68,10 +111,14 @@ jobs:
     outputs:
       configs_json: ${{ steps.build.outputs.configs_json }}
       has_cells: ${{ steps.build.outputs.has_cells }}
+      checkout_sha: ${{ steps.revision.outputs.sha }}
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.atom_commit || github.ref }}
+          ref: ${{ inputs.atom_commit || github.sha }}
+      - name: Record checked-out commit
+        id: revision
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - id: build
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -115,9 +162,9 @@ jobs:
       ratio: ${{ matrix.config.ratio }}
       ratio_str: ${{ matrix.config.ratio_str }}
       concurrency: ${{ matrix.config.concurrency }}
-      image: ${{ inputs.image || 'rocm/atom-dev:latest' }}
+      image: ${{ matrix.config.image }}
       extra_args: ${{ inputs.extra_args || '' }}
-      atom_commit: ${{ inputs.atom_commit || '' }}
+      atom_commit: ${{ needs.build-matrix.outputs.checkout_sha }}
       aiter_commit: ${{ inputs.aiter_commit || '' }}
       enable_profiler: ${{ inputs.enable_profiler || false }}
       enable_rtl: ${{ inputs.enable_rtl || false }}

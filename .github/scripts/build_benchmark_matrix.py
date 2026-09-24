@@ -37,6 +37,7 @@ DEFAULT_PARAM_LISTS = "1024,1024,128,0.8"
 
 # workflow_dispatch inputs that are NOT model toggles.
 RESERVED_INPUTS = {
+    "agentic_profile",
     "extra_args",
     "image",
     "runner",

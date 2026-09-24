@@ -123,7 +123,7 @@ jobs:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.atom_commit || github.ref }}
+          ref: ${{ inputs.atom_commit || github.sha }}
 
       - name: Start container + download model
         uses: ./.github/actions/atom-bench-container
@@ -148,6 +148,27 @@ jobs:
           CONTAINER_NAME: atom-benchmark
           AITER_GIT_REF: ${{ inputs.aiter_commit }}
         run: bash .github/scripts/install_aiter_from_ref.sh
+
+      - name: Verify checked-out ATOM code
+        run: |
+          docker exec -i -e EXPECTED_ATOM_SHA="$(git rev-parse HEAD)" atom-benchmark python3 - <<'PY'
+          import importlib.util
+          import os
+          import subprocess
+          from pathlib import Path
+
+          source = Path(importlib.util.find_spec("atom").origin).resolve().parent
+          expected_source = Path("/workspace/atom").resolve()
+          if source != expected_source:
+              raise SystemExit(f"ATOM imports from {source}, expected {expected_source}")
+          sha = subprocess.check_output(
+              ["git", "-c", "safe.directory=/workspace", "-C", "/workspace", "rev-parse", "HEAD"],
+              text=True,
+          ).strip()
+          if sha != os.environ["EXPECTED_ATOM_SHA"]:
+              raise SystemExit(f"Checkout SHA mismatch: {sha}")
+          print(f"Executing ATOM checkout {sha} from {source}; image supplies the runtime.")
+          PY
 
       - name: Collect GPU info (inside container)
         id: gpu-info

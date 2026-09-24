@@ -17,11 +17,17 @@ from build_benchmark_matrix import _emit
 from catalog import build_cell_configs, load_variants
 
 CATALOG = ".github/benchmark/models_agentic.json"
+NIGHTLY_CATALOG = ".github/benchmark/models_agentic_nightly.json"
+PROFILE_CATALOGS = {"test": CATALOG, "nightly": NIGHTLY_CATALOG}
 
 
-def build_configs(path=CATALOG, inputs=None):
+def build_configs(path=None, inputs=None):
     """Apply manual overrides while retaining catalog concurrency bands."""
     inputs = inputs or {}
+    profile = inputs.get("profile") or "test"
+    if profile not in PROFILE_CATALOGS:
+        raise ValueError(f"Unknown agentic profile: {profile}")
+    path = path or PROFILE_CATALOGS[profile]
     known = {variant["prefix"] for variant in load_variants(path)}
     selected = {
         name.strip() for name in inputs.get("models", "").split(",") if name.strip()
@@ -30,6 +36,7 @@ def build_configs(path=CATALOG, inputs=None):
         raise ValueError(f"Unknown agentic models: {sorted(selected - known)}")
 
     param_lists = None
+    values = None
     if inputs.get("concurrency", "").strip():
         values = [int(value.strip()) for value in inputs["concurrency"].split(",")]
         if (
@@ -40,11 +47,23 @@ def build_configs(path=CATALOG, inputs=None):
             raise ValueError("Concurrency must contain 1–256 unique positive integers")
         # ISL/OSL/ratio are naming placeholders for the shared template. Agentic
         # metrics use the actual trace tokens and store these dimensions as null.
-        param_lists = ";".join(f"0,0,{value},1" for value in values)
+        if profile == "test":
+            param_lists = ";".join(f"0,0,{value},1" for value in values)
 
     configs = build_cell_configs(
         path, param_lists=param_lists, model_filter=selected or None
     )
+    if profile == "nightly" and values is not None:
+        # Keep the catalog's per-point capture recipe. A blind scenario override
+        # would duplicate c32 in both sparse and dense capture variants.
+        available = {c for config in configs for c in json.loads(config["concurrency"])}
+        if set(values) - available:
+            raise ValueError("Nightly concurrency must be a subset of its catalog grid")
+        for config in configs:
+            config["concurrency"] = json.dumps(
+                [c for c in json.loads(config["concurrency"]) if c in values]
+            )
+        configs = [config for config in configs if json.loads(config["concurrency"])]
     if not configs or len(configs) > 256:
         raise ValueError("The agentic catalog must produce 1–256 matrix configurations")
     for config in configs:
@@ -69,6 +88,7 @@ def build_configs(path=CATALOG, inputs=None):
             raise ValueError("A concurrency matrix cannot exceed 256 cells")
         env["AIPERF_BENCHMARK_DURATION"] = str(seconds)
         config["env_vars"] = "\n".join(f"{key}={value}" for key, value in env.items())
+        config["image"] = inputs.get("image") or "rocm/atom-dev:latest"
     return configs
 
 
@@ -78,6 +98,28 @@ def write_run_config(configs, inputs, event, output_dir):
     output.mkdir(parents=True, exist_ok=True)
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     dispatch = {**inputs, "atom_commit": commit}
+    workflow_file = (
+        os.environ.get("GITHUB_WORKFLOW_REF", "").split("@")[0].rsplit("/", 1)[-1]
+        or "atom-agentic-benchmark.yaml"
+    )
+    if workflow_file == "atom-benchmark.yaml":
+        dispatch = {
+            key: value
+            for key, value in dispatch.items()
+            if key
+            in {
+                "image",
+                "runner",
+                "extra_args",
+                "atom_commit",
+                "aiter_commit",
+                "enable_profiler",
+                "enable_rtl",
+            }
+        }
+        dispatch.update(
+            agentic_profile=inputs.get("profile", "test"), publish_to_dashboard=False
+        )
     record = {
         "event": event,
         "actor": os.environ.get("GITHUB_ACTOR", ""),
@@ -97,7 +139,7 @@ def write_run_config(configs, inputs, event, output_dir):
                 "gh",
                 "workflow",
                 "run",
-                "atom-agentic-benchmark.yaml",
+                workflow_file,
                 "--repo",
                 os.environ.get("GITHUB_REPOSITORY", "ROCm/ATOM"),
                 "--ref",
@@ -126,7 +168,7 @@ def write_run_config(configs, inputs, event, output_dir):
         effective = {
             "model": config["model_path"],
             "runner": inputs.get("runner") or config["runner"],
-            "image": inputs.get("image") or "rocm/atom-dev:latest",
+            "image": config["image"],
             "concurrency": json.loads(config["concurrency"]),
             "server_args": config["server_args"],
             "extra_args": inputs.get("extra_args") or "",
@@ -195,7 +237,7 @@ def main():
         inputs = (
             json.loads(os.environ.get("INPUTS_JSON") or "{}")
             if event == "workflow_dispatch"
-            else {}
+            else {"profile": "nightly"}
         )
         configs = build_configs(inputs=inputs)
         if os.environ.get("AGENTIC_RUN_CONFIG_DIR"):

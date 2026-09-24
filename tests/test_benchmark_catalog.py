@@ -401,7 +401,9 @@ def test_agentic_schedule_uses_catalog_defaults(tmp_path, monkeypatch):
     assert main() == 0
     values = dict(line.split("=", 1) for line in output.read_text().splitlines())
     assert values["has_cells"] == "true"
-    assert json.loads(values["configs_json"]) == build_configs()
+    assert json.loads(values["configs_json"]) == build_configs(
+        inputs={"profile": "nightly"}
+    )
 
 
 def test_agentic_gpu_workflow_only_runs_manually_or_on_schedule():
@@ -410,7 +412,76 @@ def test_agentic_gpu_workflow_only_runs_manually_or_on_schedule():
         (REPO / ".github/workflows/atom-agentic-benchmark.yaml").read_text()
     )
     triggers = workflow.get("on", workflow.get(True))
-    assert set(triggers) == {"workflow_dispatch", "schedule"}
+    assert set(triggers) == {"workflow_dispatch", "schedule", "workflow_call"}
     assert workflow["jobs"]["benchmark"]["uses"] == (
         "./.github/workflows/benchmark-tmpl.yml"
     )
+
+
+def test_agentic_nightly_matches_inferencex_3387_recipe():
+    import json
+    import shlex
+
+    from build_agentic_benchmark_matrix import build_configs
+
+    points = set()
+    for config in build_configs(inputs={"profile": "nightly"}):
+        args = shlex.split(config["server_args"])
+        tp = int(args[args.index("-tp") + 1])
+        captures = json.loads(args[args.index("--cudagraph-capture-sizes") + 1])
+        env = dict(line.split("=", 1) for line in config["env_vars"].splitlines())
+        assert config["image"] == "rocm/atom-dev:latest"
+        assert env["HIP_VISIBLE_DEVICES"] == ",".join(str(i) for i in range(tp))
+        assert env["AIPERF_BENCHMARK_DURATION"] == "3600"
+        assert env["AIPERF_WARMUP_REQUESTS_PER_LANE"] == "5"
+        assert env["ATOM_DSV41_BENCHMARK_SYNTHETIC"] == "1"
+        assert "AIPERF_MAX_CONTEXT_LENGTH" not in env
+        for flag, value in {
+            "--spec-decode-acceptance-length": "3.51",
+            "--num-speculative-tokens": "5",
+            "--max-num-seqs": "128",
+            "--max-num-batched-tokens": "16384",
+            "--attn-prefill-chunk-size": "16384",
+            "--state-checkpoint-interval-tokens": "8192",
+            "--cudagraph-mode": "FULL",
+            "--level": "3",
+            "--tool-call-parser": "dsml_v41",
+        }.items():
+            assert args[args.index(flag) + 1] == value
+        assert "--enforce-eager" not in args
+        for conc in json.loads(config["concurrency"]):
+            assert (tp, conc) not in points
+            points.add((tp, conc))
+            assert captures == (
+                list(range(1, 33)) + [48, 64, 128]
+                if conc == 32
+                else [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 48, 64, 128]
+            )
+    assert points == {(2, c) for c in [1, 2, 8, 16, 32, 64]} | {
+        (4, c) for c in [2, 8, 16, 32, 64]
+    }
+
+
+def test_agentic_nightly_subset_keeps_capture_recipe_without_duplicate_points():
+    import json
+
+    from build_agentic_benchmark_matrix import build_configs
+
+    configs = build_configs(inputs={"profile": "nightly", "concurrency": "32"})
+    assert len(configs) == 2
+    assert all(json.loads(config["concurrency"]) == [32] for config in configs)
+    with pytest.raises(ValueError, match="subset"):
+        build_configs(inputs={"profile": "nightly", "concurrency": "4"})
+
+
+def test_agentic_manual_default_stays_a_two_point_test():
+    import json
+
+    from build_agentic_benchmark_matrix import build_configs
+
+    (config,) = build_configs()
+    assert json.loads(config["concurrency"]) == [2, 4]
+    assert "-tp 4" in config["server_args"]
+    assert "--cudagraph-mode FULL" in config["server_args"]
+    assert "AIPERF_BENCHMARK_DURATION=900" in config["env_vars"]
+    assert config["image"] == "rocm/atom-dev:latest"

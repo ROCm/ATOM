@@ -49,11 +49,11 @@ not dependencies of this lightweight file producer.
 The existing ATOM Benchmark workflow collects bundles for random cells. The
 independent **ATOM Agentic Benchmark** workflow
 (`.github/workflows/atom-agentic-benchmark.yaml`) runs daily at 08:17 UTC and can
-also be dispatched manually. It loads `.github/benchmark/models_agentic.json`
-and reuses `benchmark-tmpl.yml` for execution, collection and artifact uploads.
+also be dispatched manually. It loads a profile-specific catalog and reuses
+`benchmark-tmpl.yml` for execution, collection and artifact uploads.
 Visualization and long-term data browsing remain in AgenticViewer.
 
-The initial agentic catalog runs DeepSeek V4.1 Flash, FP8 weights, DSpark5, TP4,
+The default manual **test** profile (`models_agentic.json`) runs DeepSeek V4.1 Flash, FP8 weights, DSpark5, TP4,
 BF16 KV and FP8 index cache, using `FULL` CUDA graphs at concurrency 2 and 4.
 Each cell profiles for 900 seconds, uses a 262144-token context limit and 10
 additional warmup requests per lane. The replay dataset is
@@ -61,12 +61,45 @@ additional warmup requests per lane. The replay dataset is
 is enabled. This graph recipe still needs a real GPU run; the earlier local
 acceptance used eager mode.
 
-Manual inputs select model prefixes, override the concurrency list or profiling
-duration (900–3600 seconds), and optionally select an image, runner or code refs.
-Empty model/concurrency inputs use the catalog. Prefer an immutable image tag or
-digest for comparisons, and use a ref containing this workflow and producer.
+The scheduled **nightly** profile (`models_agentic_nightly.json`) follows
+[InferenceX PR #3387](https://github.com/SemiAnalysisAI/InferenceX/pull/3387) at
+`89384690e5ebafd5407e965ec95b648f869524bb`:
+
+| Profile | TP | Concurrency | Seconds per point | Warmup per lane |
+| --- | --- | --- | --- | --- |
+| test (manual default) | 4 | 2, 4 | 900 | 10 |
+| nightly | 2 | 1, 2, 8, 16, 32, 64 | 3600 | 5 |
+| nightly | 4 | 2, 8, 16, 32, 64 | 3600 | 5 |
+
+Nightly uses FP4 weight metadata, BF16 KV, FP8 index cache, five-token DSpark
+with fixed AL 3.51, max-num-seqs 128, 16K batching/prefill chunks, prefix caching
+with block size 16, 8K state checkpoints, level 3, FULL graphs and `dsml_v41`.
+c32 captures sizes 1–32 plus 48/64/128; other points use the upstream sparse
+list. There is no EP or KV offload. Fixed acceptance is marked synthetic in the
+bundle; it is not accuracy evidence, and the producer's existing validity policy
+keeps it separate from real-acceptance performance.
+
+Both profiles use `rocm/atom-dev:latest` unless manually overridden. The image
+supplies dependencies; ATOM executes from the checked-out repository. By default,
+the checkout is the triggering branch's event SHA, rather than a later branch
+head or the image's baked-in ATOM source. The matrix and GPU jobs use the same
+resolved SHA, and a preflight verifies both the SHA and the `/workspace/atom`
+Python import path. An explicit `atom_commit` remains available for controlled
+replays. Runtime image identity is recorded in each bundle.
+
+Manual inputs select a profile and model prefixes, override profiling duration
+(900–3600 seconds), and optionally select image, runner or code refs. Empty
+model/concurrency/duration inputs use the profile. Nightly concurrency overrides
+select a subset of its existing points, preserving the c32 capture recipe.
+Use a ref containing this workflow and producer.
 The scheduled workflow becomes active when it is on the default branch; it does
 not run from a PR. Each run retains its own artifacts without updating gh-pages.
+
+Before the new workflow is registered on the default branch, use the existing
+**ATOM Benchmark** manual entry with `agentic_profile: test` (or `nightly`). It
+calls the same agentic workflow from the selected branch, skips all random
+benchmark/dashboard/regression jobs and preserves the usual image/ref options.
+The default `agentic_profile: random` retains the existing benchmark behavior.
 
 Actions run titles follow the existing benchmark convention: `manual (<actor>)`
 or `nightly`, with GitHub's native run number shown alongside. The separate

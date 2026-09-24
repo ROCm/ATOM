@@ -3,7 +3,7 @@ on:
   pull_request:
     paths:
       - 'atom/benchmarks/**'
-      - '.github/benchmark/models_agentic.json'
+      - '.github/benchmark/models_agentic*.json'
       - '.github/scripts/*benchmark*'
       - '.github/scripts/atom_test.sh'
       - '.github/scripts/aiperf*'
