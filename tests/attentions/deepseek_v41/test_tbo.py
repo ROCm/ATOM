@@ -294,6 +294,7 @@ def test_split_attention_reads_preceding_microbatch_window(cut):
         child = builder.build_ubatch_prefill_metadata(
             parent, part, part.request_slice.stop - part.request_slice.start, i
         )
+        assert child.step.is_prefill and not child.step.decode
         actual.append(attend(child.step, part.token_slice.start, part.token_slice.stop))
     torch.testing.assert_close(torch.cat(actual), expected, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(cache.state.view("window"), final_window, rtol=0, atol=0)

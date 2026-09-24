@@ -479,6 +479,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         step = prepare_batch_step(
             tuple(spans),
             self.device,
+            is_prefill=True,
             buffers=buffers,
             running_bs=running_bs,
             running_tokens=width,

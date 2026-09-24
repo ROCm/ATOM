@@ -206,3 +206,33 @@ def test_parent_fallback_gathers_once_per_layer_and_stage():
                     dtype=value.dtype,
                 )
                 torch.testing.assert_close(value, expected.expand_as(value))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize(
+    "lengths,request_index,token", [((2,), 0, 0), ((1, 1), 1, 1), ((10, 4), 1, 13)]
+)
+def test_single_token_prefill_child_keeps_prefill_semantics(
+    lengths, request_index, token
+):
+    from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+        MQA_LOGITS_PRESHUFFLE_ROWS,
+    )
+    from atom.utils.forward_context import AttnState
+
+    builder, parent = make_parent("cuda", lengths=lengths)
+    part = UBatchSlice(slice(request_index, request_index + 1), slice(token, token + 1))
+    child = builder.build_ubatch_prefill_metadata(parent, part, 1)
+    assert child.step.width == 1
+    assert child.step.is_prefill and not child.step.decode
+    assert child.state == AttnState.PREFILL_PREFIX
+    for prefix, extend, _ in child.step.indptrs.values():
+        assert prefix.data_ptr() != extend.data_ptr()
+    assert child.step.indptrs[0][1].tolist() == [0, 1]
+    # Keep the prefill tile bound even though this microbatch has one token.
+    tiles = child.cache.unit_tiles(child.step, 1)
+    end = child.step.requests[0].end
+    columns = (end + builder.geometry.block_size - 1) // builder.geometry.block_size
+    assert tiles.shape[-1] == columns * (
+        builder.geometry.rows_per_page(1) // MQA_LOGITS_PRESHUFFLE_ROWS
+    )
