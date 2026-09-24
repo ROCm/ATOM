@@ -77,6 +77,10 @@ class UBatchWrapper(nn.Module):
                 if job is not None:
                     job()
             finally:
+                # Idle workers must not pin the preceding batch's KV/metadata
+                # through their thread-local context or completed job closure.
+                _forward_context_local.ctx = None
+                job = None
                 self._worker_job_done[idx].set()
 
     def _ensure_workers(self, device: torch.device):
@@ -96,18 +100,24 @@ class UBatchWrapper(nn.Module):
             self.comm_stream = torch.cuda.Stream(priority=priority)
 
     def forward(
-        self, input_ids: torch.Tensor, positions: torch.Tensor
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> UBatchModelOutput:
         ctx = get_forward_context()
         if ctx.ubatch_slices is None:
+            if inputs_embeds is not None:
+                return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
             return self.model(input_ids, positions)
-        return self._run_ubatches(input_ids, positions, ctx)
+        return self._run_ubatches(input_ids, positions, ctx, inputs_embeds)
 
     def _run_ubatches(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> UBatchModelOutput:
         """Launch threads that each call self.model() inside a TBOContext."""
         self._ensure_comm_stream()
@@ -189,7 +199,15 @@ class UBatchWrapper(nn.Module):
                 try:
                     ub_input_ids, ub_positions = ub_inputs[idx]
                     with tbo_ctxs[idx]:
-                        model_output = self.model(ub_input_ids, ub_positions)
+                        if inputs_embeds is None:
+                            model_output = self.model(ub_input_ids, ub_positions)
+                        else:
+                            token_slice = ctx.ubatch_slices[idx].token_slice
+                            model_output = self.model(
+                                ub_input_ids,
+                                ub_positions,
+                                inputs_embeds=inputs_embeds[token_slice],
+                            )
                     results.append((idx, self._validate_ubatch_output(model_output)))
                 except Exception as e:
                     # logger.exception captures the full traceback. The partner
@@ -224,6 +242,11 @@ class UBatchWrapper(nn.Module):
                 for i in range(N):
                     self._worker_job_done[i].wait()
         finally:
+            # Both workers have left their contexts. Break the partner cycle
+            # so child metadata is released without waiting for cyclic GC.
+            for tbo_ctx in tbo_ctxs:
+                tbo_ctx.partner = None
+                tbo_ctx.forward_context = None
             # Restore original forward context
             _forward_context_local.ctx = saved_ctx
 
