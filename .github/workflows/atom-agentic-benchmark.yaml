@@ -1,0 +1,153 @@
+name: ATOM Agentic Benchmark
+# GitHub displays the native run number beside this title (e.g. nightly #650).
+run-name: ${{ github.event_name == 'schedule' && 'nightly' || format('manual ({0})', github.actor) }}
+
+on:
+  schedule:
+    # Daily at 08:17 UTC / 16:17 Beijing time, outside the random benchmark crons.
+    - cron: '17 8 * * *'
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Preset — test: TP4 / c=2,4 / 900s; nightly: TP2+TP4 / 3600s"
+        type: choice
+        options: [test, nightly]
+        default: test
+      models:
+        description: "Models (optional) — empty uses the preset; e.g. deepseek-v41-flash"
+        type: string
+        default: ""
+      concurrency:
+        description: "Concurrency (optional) — empty uses the preset; test defaults to 2,4"
+        type: string
+        default: ""
+      duration_seconds:
+        description: "Seconds per point (optional) — empty uses test: 900 / nightly: 3600; allowed 900–3600"
+        type: string
+        default: ""
+      dry_run:
+        description: "Preview configuration only (no GPU allocation)"
+        type: boolean
+        default: false
+      image:
+        description: "Advanced: image override — empty uses rocm/atom-dev:latest"
+        type: string
+        default: ""
+      runner:
+        description: "Advanced: runner override — empty uses the preset's GPU runner"
+        type: string
+        default: ""
+      extra_args:
+        description: "Advanced: extra ATOM server arguments"
+        type: string
+        default: ""
+      atom_commit:
+        description: "Advanced: ATOM revision override — empty runs the branch selected above"
+        type: string
+        default: ""
+      aiter_wheel:
+        description: "Advanced: AITER wheel — latest, HTTPS .whl URL, or artifact:<ID>; empty keeps image version"
+        type: string
+        default: ""
+      aiter_commit:
+        description: "Advanced: AITER revision override — empty keeps the image version"
+        type: string
+        default: ""
+      enable_profiler:
+        description: "Advanced: collect graph-capture traces and a 30-second replay profile"
+        type: boolean
+        default: false
+      enable_rtl:
+        description: "Advanced: collect rocm-trace-lite traces"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: atom-agentic-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-matrix:
+    name: Build agentic benchmark matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      configs_json: ${{ steps.build.outputs.configs_json }}
+      has_cells: ${{ steps.build.outputs.has_cells }}
+      checkout_sha: ${{ steps.revision.outputs.sha }}
+      aiter_wheel_artifact_id: ${{ steps.aiter-upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.sha }}
+      - name: Record checked-out commit
+        id: revision
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - id: build
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUTS_JSON: ${{ toJson(inputs) }}
+          AGENTIC_RUN_CONFIG_DIR: agentic-run-config
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: python3 .github/scripts/build_agentic_benchmark_matrix.py
+      - name: Download requested AITER wheel once
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.aiter_wheel != '' && inputs.dry_run != true }}
+        env:
+          AITER_WHEEL_REQUEST: ${{ inputs.aiter_wheel }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/prepare_benchmark_aiter_wheel.py
+      - name: Share pinned AITER wheel with all points
+        id: aiter-upload
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.aiter_wheel != '' && inputs.dry_run != true }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: atom-agentic-aiter-wheel-${{ github.run_attempt }}
+          path: aiter-whl/
+          compression-level: 0
+          retention-days: 15
+          if-no-files-found: error
+      - name: Save run configuration
+        uses: actions/upload-artifact@v7
+        with:
+          name: atom-agentic-run-config-${{ github.run_attempt }}
+          path: agentic-run-config/
+          retention-days: 15
+          if-no-files-found: error
+
+  benchmark:
+    name: ${{ matrix.config.display }} agentic
+    needs: [build-matrix]
+    if: >-
+      !cancelled()
+      && needs.build-matrix.result == 'success'
+      && needs.build-matrix.outputs.has_cells == 'true'
+      && inputs.dry_run != true
+    strategy:
+      fail-fast: false
+      matrix:
+        config: ${{ fromJson(needs.build-matrix.outputs.configs_json) }}
+    uses: ./.github/workflows/benchmark-tmpl.yml
+    secrets: inherit
+    with:
+      display: ${{ matrix.config.display }}
+      prefix: ${{ matrix.config.prefix }}
+      suffix: ${{ matrix.config.suffix }}
+      model_path: ${{ matrix.config.model_path }}
+      server_args: ${{ matrix.config.server_args }}
+      bench_kind: ${{ matrix.config.bench_kind }}
+      env_vars: ${{ matrix.config.env_vars }}
+      runner: ${{ inputs.runner || matrix.config.runner }}
+      concurrency: ${{ matrix.config.concurrency }}
+      image: ${{ matrix.config.image }}
+      image_display: ${{ matrix.config.image_display }}
+      extra_args: ${{ inputs.extra_args || '' }}
+      atom_commit: ${{ needs.build-matrix.outputs.checkout_sha }}
+      aiter_commit: ${{ inputs.aiter_commit || '' }}
+      aiter_wheel_artifact_id: ${{ needs.build-matrix.outputs.aiter_wheel_artifact_id }}
+      enable_profiler: ${{ inputs.enable_profiler || false }}
+      enable_rtl: ${{ inputs.enable_rtl || false }}

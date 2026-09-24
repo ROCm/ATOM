@@ -22,6 +22,7 @@ from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
 from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
 from atom.quant_spec import (
+    NVFP4_DTYPE,
     LayerQuantConfig,
     get_quant_parser,
 )
@@ -363,6 +364,7 @@ class QuantizationConfig:
             "mxfp4",
             "mxfp8",
             "quark",
+            "modelopt",
             "compressed-tensors",
         ]:
             self.online_quant = True
@@ -388,6 +390,26 @@ class QuantizationConfig:
         self.global_spec = parsed_quant_config.global_spec
         self.layer_pattern_specs = parsed_quant_config.layer_pattern_specs
         self.exclude_layers = list(parsed_quant_config.exclude_layers)
+        self._validate_nvfp4_online_quant()
+
+    def _validate_nvfp4_online_quant(self):
+        """Reject NVFP4 checkpoint specs when no online config was given.
+
+        NVFP4 runs only after online conversion to MXFP4. This fails while the
+        config is parsed, before any layer is built;
+        `validate_nvfp4_online_target` checks each NVFP4 layer's target as it
+        is built.
+        """
+        if self.online_quant:
+            return
+        specs = [self.global_spec, *(spec for _, spec in self.layer_pattern_specs)]
+        if any(spec.quant_dtype == NVFP4_DTYPE for spec in specs):
+            raise ValueError(
+                "The checkpoint has NVFP4 layers, but no online quantization "
+                "config was given. NVFP4 weights cannot run directly: pass "
+                "--online_quant_config with an mxfp4 target, for example "
+                '\'{"global_quant_config": "mxfp4"}\'.'
+            )
 
     # -- typed API (preferred) ----------------------------------------------
 
@@ -441,7 +463,7 @@ class QuantizationConfig:
         return self.global_spec.quant_type
 
     @property
-    def quant_dtype(self) -> torch.dtype:
+    def quant_dtype(self) -> torch.dtype | str:
         return self.global_spec.quant_dtype
 
     @property
@@ -613,6 +635,13 @@ class QuantizationConfig:
         for name in self.exclude_layers:
             new_exclude.extend(_remap_layer_name(name))
         self.exclude_layers = list(dict.fromkeys(new_exclude))
+
+        # Both lists have been through the same remap here, which is what makes
+        # them comparable; `quant_exclude_name_mapping` below rewrites only the
+        # exclude side.
+        if self.quant_method == "modelopt":
+            self._validate_packed_layer_specs()
+
         if self.online_quant:
             new_online_pattern_specs = []
             for pattern, spec in self.online_layer_pattern_specs:
@@ -630,6 +659,40 @@ class QuantizationConfig:
         # module paths declare `quant_exclude_name_mapping` as a class attribute.
         if quant_exclude_name_mapping:
             self.apply_exclude_name_mapping(quant_exclude_name_mapping)
+
+    def _validate_packed_layer_specs(self):
+        """Reject fused parameters whose source projections disagree.
+
+        ModelOpt records one entry per source projection, while ATOM builds one
+        packed parameter per fused name. Siblings that disagree collapse into
+        duplicate patterns during the remap above, and `get_layer_quant_config`
+        returns whichever comes first -- so a packed (N, K/2) uint8 NVFP4 weight
+        can be loaded into an (N, K) fp8 parameter with nothing said.
+
+        A projection absent from the config is deliberately not an error: a
+        model's packed mapping lists every projection that *may* fuse, and real
+        exports legitimately omit the ones a given layer does not have (M3 has
+        `index_q_proj`/`index_k_proj` only on its indexer layers).
+        """
+        seen: dict[str, LayerQuantConfig] = {}
+        for pattern, spec in self.layer_pattern_specs:
+            previous = seen.setdefault(pattern, spec)
+            if previous != spec:
+                raise ValueError(
+                    f"Conflicting quantization specs for packed layer {pattern!r}: "
+                    f"{previous} vs {spec}. Source projections fused into one ATOM "
+                    "parameter must share one spec."
+                )
+        for pattern in seen:
+            # FusedMoE resolves its experts container with check_children=True,
+            # so an exclude entry naming one expert de-quantizes all of them.
+            if self._is_excluded(pattern, self.exclude_layers, check_children=True):
+                raise ValueError(
+                    f"Packed layer {pattern!r} is quantized by at least one source "
+                    "projection and excluded by another. Exclude all of them or "
+                    "none: a partial exclusion de-quantizes the whole fused layer "
+                    "to bf16 while the checkpoint still holds packed weights."
+                )
 
 
 def glm5_kpool_block_size(index_kpool: int) -> int:
@@ -843,10 +906,55 @@ def _is_minimax_m3_config(hf_config: PretrainedConfig) -> bool:
     return False
 
 
+_MINIMAX_M3_MLP_LAYER_TYPES = {"dense": 0, "sparse": 1}
+
+
+def _normalize_minimax_m3_mlp_layer_types(config: PretrainedConfig) -> None:
+    """Express `mlp_layer_types` as the `moe_layer_freq` list the model reads.
+
+    MiniMax-M3 exports carry one of the two fields, and a config without
+    `moe_layer_freq` builds every layer as MoE, so a list that cannot be read
+    exactly must fail here rather than build the wrong layers.
+    """
+    layer_types = getattr(config, "mlp_layer_types", None)
+    if layer_types is None:
+        return
+    num_layers = config.num_hidden_layers
+    if len(layer_types) != num_layers:
+        raise ValueError(
+            f"MiniMax-M3 mlp_layer_types has {len(layer_types)} entries, but "
+            f"num_hidden_layers is {num_layers}."
+        )
+    unknown = sorted(
+        {repr(label) for label in layer_types}
+        - {repr(label) for label in _MINIMAX_M3_MLP_LAYER_TYPES}
+    )
+    if unknown:
+        raise ValueError(
+            f"MiniMax-M3 mlp_layer_types has unknown labels {', '.join(unknown)}; "
+            "expected 'dense' or 'sparse'."
+        )
+    moe_layer_freq = [_MINIMAX_M3_MLP_LAYER_TYPES[label] for label in layer_types]
+    existing = getattr(config, "moe_layer_freq", None)
+    if existing is None:
+        config.moe_layer_freq = moe_layer_freq
+    elif (
+        not isinstance(existing, (list, tuple))
+        or [int(freq != 0) for freq in existing] != moe_layer_freq
+    ):
+        raise ValueError(
+            "MiniMax-M3 config sets both mlp_layer_types and moe_layer_freq, and "
+            "they disagree on which layers are MoE."
+        )
+
+
 def _normalize_minimax_m3_text_config(hf_config: PretrainedConfig) -> None:
     if not _is_minimax_m3_config(hf_config):
         return
     text_config = getattr(hf_config, "text_config", None)
+    _normalize_minimax_m3_mlp_layer_types(
+        text_config if text_config is not None else hf_config
+    )
     if text_config is None or text_config is hf_config:
         return
 

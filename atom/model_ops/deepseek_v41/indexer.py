@@ -115,15 +115,26 @@ def restrict_to_candidates_reference(logits, candidates, visible, block_size, ti
     )
 
 
-@triton.jit
+def _maxima_lanes(rows):
+    """Programs per row for `_block_maxima_kernel`, about 2048 in the grid.
+
+    A tile is one load and one max, so extra lanes have little latency to hide
+    and an idle one is pure launch cost: the grid wants to fill the machine
+    once and no more. Within about 10% of the best lane count from 6 to 8191
+    rows and 2k to 256k context.
+    """
+    return min(256, max(1, 2048 // max(rows, 1)))
+
+
+@triton.jit(do_not_specialize=["lanes"])
 def _block_maxima_kernel(
     logits,
     visible,
     maxima,
     ends,
-    blocks,
     logits_stride,
     maxima_stride,
+    lanes,
     BLOCK: tl.constexpr,
     TILE: tl.constexpr,
 ):
@@ -132,22 +143,29 @@ def _block_maxima_kernel(
     The newest block holds the most recent tokens and is only partly filled, so
     it is pinned rather than left to be outscored. `ends` is the top-k's row
     bound in blocks, written here because this pass already knows it.
+
+    Nothing past a row's `ends` is read or written: the top-k stops there, and
+    the width is the block table's -- `max_model_len` -- not the row's context.
+    `lanes` programs stride over a row's tiles, so the grid is fixed for a
+    captured shape while the work follows the context. It is a runtime value
+    and never specialized: it follows the row count, which on an eager prefill
+    is any token count, and one compile per value would land in serving.
     """
     row = tl.program_id(0)
     seen = tl.load(visible + row).to(tl.int32)
-    ids = tl.program_id(1) * TILE + tl.arange(0, TILE)
-    columns = ids[:, None] * BLOCK + tl.arange(0, BLOCK)[None, :]
-    scores = tl.load(
-        logits + row * logits_stride + columns,
-        columns < seen,
-        other=float("-inf"),
-    )
-    best = tl.max(scores, axis=1)
-    newest = (seen - 1) // BLOCK
-    best = tl.where((seen > 0) & (ids == newest), float("inf"), best)
-    tl.store(maxima + row * maxima_stride + ids, best, ids < blocks)
+    last = tl.cdiv(seen, BLOCK)
+    for tile in range(tl.program_id(1), tl.cdiv(last, TILE), lanes):
+        ids = tile * TILE + tl.arange(0, TILE)
+        columns = ids[:, None] * BLOCK + tl.arange(0, BLOCK)[None, :]
+        scores = tl.load(
+            logits + row * logits_stride + columns,
+            columns < seen,
+            other=float("-inf"),
+        )
+        best = tl.where(ids == last - 1, float("inf"), tl.max(scores, axis=1))
+        tl.store(maxima + row * maxima_stride + ids, best, ids < last)
     if tl.program_id(1) == 0:
-        tl.store(ends + row, (seen + BLOCK - 1) // BLOCK)
+        tl.store(ends + row, last)
 
 
 def pick_candidate_blocks(logits, visible, block_size, out, tile=64):
@@ -162,14 +180,15 @@ def pick_candidate_blocks(logits, visible, block_size, out, tile=64):
     blocks = _blocks(width, block_size)
     maxima = torch.empty(rows, blocks, dtype=torch.float32, device=logits.device)
     ends = torch.empty(rows, dtype=torch.int32, device=logits.device)
-    _block_maxima_kernel[(rows, triton.cdiv(blocks, tile))](
+    lanes = min(_maxima_lanes(rows), triton.cdiv(blocks, tile))
+    _block_maxima_kernel[(rows, lanes)](
         logits,
         visible,
         maxima,
         ends,
-        blocks,
         logits.stride(0),
         maxima.stride(0),
+        lanes,
         BLOCK=block_size,
         TILE=tile,
     )

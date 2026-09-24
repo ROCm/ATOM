@@ -160,6 +160,7 @@ def make_minimax_m3_expert_params_mapping(
             ("w2", ("w2", "down_proj")),
             ("w3", ("w3", "up_proj")),
         ):
+            # weight_scale_2 can be easily replaced using the mapping provided here.
             if shard_id in ("w1", "w3"):
                 param_prefix = "experts.w13_"
                 scale_param = "experts.w13_weight_scale"

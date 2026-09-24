@@ -348,6 +348,60 @@ def test_scoring_inside_the_candidates_picks_what_masking_the_full_width_picked(
         scoring.score_topk_paged(*mismatched, **kwargs, candidates=candidates)
 
 
+def _picked_blocks_reference(logits, visible, block_size, keep):
+    """Candidate blocks by sorting, the definition rather than a restatement.
+
+    A block's score is its best visible column, the newest block outranks every
+    other, ties go to the smaller id, and the kept ids come back ascending.
+    """
+    logits, visible = logits.cpu(), visible.cpu().long()
+    rows, width = logits.shape
+    past = torch.arange(width) >= visible[:, None]
+    scores = logits.masked_fill(past, float("-inf"))
+    scores = scores.view(rows, -1, block_size).amax(-1)
+    ids = torch.arange(scores.shape[1])
+    last = (visible[:, None] + block_size - 1) // block_size
+    scores = scores.masked_fill(ids == last - 1, float("inf"))
+    # A stable descending sort puts equal scores in ascending id order.
+    best = torch.sort(scores, dim=1, descending=True, stable=True).indices[:, :keep]
+    # Blocks past a row's end were never candidates; they sort last as padding.
+    best = torch.where(best < last, best, scores.shape[1]).sort(dim=1).values
+    return torch.where(best < scores.shape[1], best, -1).to(torch.int32)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("rows", [48, 4096])
+def test_candidate_blocks_come_from_the_visible_prefix_alone(rows):
+    """The picked blocks match their definition on rows far narrower than the table.
+
+    Columns past a row's visibility hold `+inf`, and the table is wider than any
+    row's context -- the shape serving runs, where the table is `max_model_len`
+    wide. `rows` 4096 leaves each lane several tiles to walk, 48 one each.
+    """
+    from atom.model_ops.deepseek_v41.indexer import pick_candidate_blocks
+
+    torch.manual_seed(11)
+    block_size, keep, width = 8, 16, 4096
+    edges = [0, 1, 7, 8, 9, keep * block_size, keep * block_size + 1, width]
+    visible = torch.randint(0, width + 1, (rows,), dtype=torch.int32)
+    visible[: len(edges)] = torch.tensor(edges, dtype=torch.int32)
+    visible = visible.cuda()
+    # Few distinct values, so ties are common and the tie rule is exercised.
+    logits = torch.randint(0, 4, (rows, width), device="cuda").float()
+    past = torch.arange(width, device="cuda")[None, :] >= visible[:, None]
+    logits = logits.masked_fill(past, float("inf"))
+    out = torch.full((rows, keep), 12345, dtype=torch.int32, device="cuda")
+
+    pick_candidate_blocks(logits, visible, block_size, out, tile=16)
+
+    blocks = (visible + block_size - 1) // block_size
+    # Armed: rows that keep everything and rows that must choose both occur.
+    assert (blocks <= keep).any() and (blocks > keep).any()
+    assert torch.equal(
+        out.cpu(), _picked_blocks_reference(logits, visible, block_size, keep)
+    )
+
+
 def _candidate_fixture(rows_per_block, seed=7):
     """Ragged kept-lists over a shared plane, including a row that kept none.
 
