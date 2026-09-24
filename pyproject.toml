@@ -28,7 +28,6 @@ Issues = "https://github.com/ROCm/ATOM/issues"
 write_to = "atom/_version.py"
 write_to_template = "__version__ = '{version}'\n"
 fallback_version = "0.1.0"
-git_describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--match", "v[0-9]*"]
 
 [tool.setuptools.packages.find]
 where = ["."]
