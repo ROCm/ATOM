@@ -71,6 +71,7 @@ from atom.distributed.pcp_utils import (
     pcp_round_robin_split,
 )
 from atom.model_loader.loader import WeightsMapper
+from atom.model_loader.weight_utils import local_model_dir
 
 # Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`
 # (shared with deepseek_v2) and `torch.ops.aiter.indexer_score_topk` (V4-only).
@@ -581,6 +582,10 @@ def _wo_a_is_bf16_on_disk(model_path):
     the model — otherwise the FP8 + scale param shapes mismatch the BF16
     tensor on disk and produce garbage attention output.
     """
+    # A hub id is not where its files are, and this probe picks FP8 vs BF16
+    # parameter shapes: answering "no" for every remote checkpoint is the
+    # mismatch this docstring warns produces garbage attention output.
+    model_path = local_model_dir(model_path)
     if not model_path or not os.path.isdir(model_path):
         return False
     idx_path = os.path.join(model_path, "model.safetensors.index.json")

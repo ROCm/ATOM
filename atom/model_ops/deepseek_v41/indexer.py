@@ -2,9 +2,11 @@
 """CSA2 candidate block selection: level one of the two-level index top-k.
 
 A source layer picks the blocks, and the layers after it score their own rows
-only inside them (`restrict_to_candidates`). Both are read out of the FP8 plane
-by `paged_scoring`, which is the only index scorer there is -- and which bands
-the plane so that these kernels' `row * stride` stays inside int32.
+only inside them -- by paging over the kept list (`candidate_table`), which is
+what makes the mask below a twin rather than a step. The picking is read out
+of the FP8 plane by `paged_scoring`, which is the only index scorer there is --
+and which bands the plane so that this kernel's `row * stride` stays inside
+int32.
 """
 
 import torch
@@ -83,15 +85,17 @@ def _restrict_lanes(rows):
     return min(256, max(1, 16384 // max(rows, 1)))
 
 
-def restrict_to_candidates(logits, candidates, visible, block_size, tile=64):
+def restrict_to_candidates_reference(logits, candidates, visible, block_size, tile=64):
     """-inf every column outside the candidate blocks, in place.
 
+    Nothing calls this: `candidate_table` reaches the same selection by paging
+    over the kept list instead. Kept as the judge of that -- restating it in the
+    test would be the same addressing written twice.
+
     The blocks are an earlier layer's, picked from that layer's own scores, so
-    this is not redundant with the top-k below it: a row this layer ranks
+    this is not redundant with the top-k after it: a row this layer ranks
     highly can sit in a block that layer did not keep, and dropping it is the
-    mechanism. Masking a fully scored width selects the same rows as scoring
-    only the kept ones, and the blocks stay a list of ids because the column
-    mask they stand for is the largest allocation on a long-context step.
+    mechanism.
     """
     rows, width = logits.shape
     topk_blocks = candidates.shape[-1]

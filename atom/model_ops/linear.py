@@ -521,6 +521,12 @@ class LinearBase(nn.Module):
         # rank materializes its whole DCP group's output shard). Since eff_tp is a
         # valid TP size and eff_rank a valid rank within it, all downstream param
         # sizing / weight_loader narrowing is inherited unchanged.
+        #
+        # Records that this layer went through the override path -- vs. merely
+        # being wide enough by coincidence (e.g. at tp == dcp, where
+        # override_tp_size == 1 makes the override a no-op) -- so a consumer
+        # can check this instead of reverse-engineering it from `output_size`.
+        self.effective_tp_overridden = override_tp_size is not None
         if override_tp_size is not None or override_tp_rank is not None:
             assert (
                 override_tp_size is not None and override_tp_rank is not None

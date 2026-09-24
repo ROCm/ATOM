@@ -85,8 +85,11 @@ level 0, and broader compiler support remains outside the supported scope.
 The paged scorer bands queries at the int32 addressing limit. A large band can
 require nearly 8 GiB of FP32 logits; quantized queries, tile tables and selection
 workspace occupy additional memory. Reserve scratch headroom when sizing
-long-context workloads. Visibility-sized scratch and candidate-only Reindex
-remain optimization work.
+long-context workloads. Visibility-sized scratch remains optimization work.
+
+A Reindex layer scores `candidate_topk_blocks` blocks rather than the whole
+context: the index plane is paged at `candidate_block_size`, so the candidate
+source's list is the scorer's block table.
 
 Cache packing and expert activation quantization affect numerical behavior.
 Native FP8/FP4 execution does not promise bitwise equality with an all-BF16

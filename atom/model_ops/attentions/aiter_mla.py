@@ -19,6 +19,8 @@ from atom.distributed.dcp_utils import (
     dcp_persistent_supported,
     get_dcp_rank,
     get_dcp_world_size,
+    mla_dcp_decode_is_persistent,
+    mla_dcp_sparse_prefill_is_persistent,
 )
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
@@ -41,8 +43,8 @@ from atom.model_ops.attention_mla import (
     _MLA_MIN_HEADS,
     _MLA_SPLIT_BUDGET_AUTO,
     MLAAttention,
-    mla_dcp_decode_is_persistent,
     mla_dcp_kernel_num_heads,
+    mla_dcp_sparse_prefill_num_heads,
 )
 from atom.model_ops.glm5_next.geometry import (
     effective_kpool_size,
@@ -433,6 +435,33 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
         else:
             self.persistent_num_heads = self.padded_num_attention_heads
+
+        if self.sparse_dcp_metadata_rebuild:
+            # persistent_num_heads above is decode's width; sparse prefill
+            # rounds differently and can disagree (see
+            # mla_dcp_sparse_prefill_num_heads's docstring) -- catch that here
+            # instead of a corrupted reduce write. Both sides use the default
+            # min_kernel_heads=16, so this doesn't cover a model overriding
+            # min_query_heads (Kimi-K3 DSpark: 32), a pre-existing gap
+            # unrelated to QREP.
+            expected_sparse_prefill_num_heads = mla_dcp_sparse_prefill_num_heads(
+                self.num_attention_heads,
+                self.dcp_world_size,
+                persistent=mla_dcp_sparse_prefill_is_persistent(
+                    self.dcp_world_size,
+                    dcp_persistent,
+                    sparse_metadata_rebuild=self.sparse_dcp_metadata_rebuild,
+                ),
+            )
+            assert self.persistent_num_heads == expected_sparse_prefill_num_heads, (
+                "sparse-prefill work buffers would be sized for "
+                f"{self.persistent_num_heads} gathered heads (decode's width "
+                f"function), but the sparse-prefill kernel actually dispatches "
+                f"at {expected_sparse_prefill_num_heads} heads (its own width "
+                "function) -- decode's and sparse prefill's width tables "
+                "disagree for this num_attention_heads/dcp combination. See "
+                "mla_dcp_sparse_prefill_num_heads's docstring."
+            )
 
         max_seqlen_qo = getattr(model_runner, "num_spec_tokens", 0) + 1
         (
