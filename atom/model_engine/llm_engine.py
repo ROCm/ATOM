@@ -4,6 +4,7 @@
 import itertools
 import logging
 import time
+import uuid
 from collections import Counter
 from dataclasses import fields
 from typing import Any
@@ -289,24 +290,41 @@ class LLMEngine:
         outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
         return outputs
 
+    def _broadcast_utility(self, cmd: str, **kwargs) -> list[dict[str, Any]]:
+        """Run *cmd* on every engine and return one result dict per engine."""
+        responses = self.core_mgr.broadcast_utility_command_sync(cmd, **kwargs)
+        return [resp.get("result", {}) for resp in responses]
+
     def start_profile(
         self, delay_iters: int | None = None, max_iters: int | None = None
     ) -> list[dict[str, Any]]:
-        """Start profiling on every engine.
+        """Start profiling on every engine, or on none of them.
 
-        *delay_iters* / *max_iters* override the launch flags for this run
-        only; ``None`` leaves each engine on its configured default.
+        Two rounds: every engine first says whether it can record, and only
+        if all of them agreed is any profiler started.
         """
-        responses = self.core_mgr.broadcast_utility_command_sync(
-            "start_profile", delay_iters=delay_iters, max_iters=max_iters
-        )
-        return [resp.get("result", {}) for resp in responses]
+        token = uuid.uuid4().hex
+        try:
+            reserved = self._broadcast_utility(
+                "reserve_profile",
+                token=token,
+                delay_iters=delay_iters,
+                max_iters=max_iters,
+            )
+        except TimeoutError:
+            # A reservation nobody releases refuses every later
+            # /start_profile until the server restarts.
+            self._broadcast_utility("release_profile", token=token)
+            raise
+        if any("error" in result for result in reserved):
+            self._broadcast_utility("release_profile", token=token)
+            return reserved
+        return self._broadcast_utility("commit_profile", token=token)
 
     def stop_profile(self) -> list[dict[str, Any]]:
-        responses = self.core_mgr.broadcast_utility_command_sync(
+        return self._broadcast_utility(
             "stop_profile", timeout=envs.ATOM_PROFILER_TIMEOUT
         )
-        return [resp.get("result", {}) for resp in responses]
 
     def print_mtp_statistics(self):
         self.core_mgr.send_utility_command("get_mtp_stats")

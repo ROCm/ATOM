@@ -317,12 +317,10 @@ class ErrorResponse(BaseModel):
 class StartProfileRequest(BaseModel):
     """Optional body for /start_profile.
 
-    Unset fields fall back to ``--profiler-*-iters``. An empty body is
-    unchanged from the launch flags.
+    Unset fields fall back to ``--profiler-*-iters``.
     """
 
     # `--profile` reuses the completions POST helper, so extra fields arrive.
-    # Forbidding them would 422 that client.
     model_config = {"extra": "ignore"}
 
     # ge=0 so a negative window is a 422 from body validation.

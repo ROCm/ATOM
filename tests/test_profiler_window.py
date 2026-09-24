@@ -29,6 +29,7 @@ from atom.model_engine.engine_utility import EngineUtilityHandler
 
 with stubbed_aiter():
     from atom.model_engine.async_proc import AsyncIOProcManager
+    from atom.model_engine.llm_engine import LLMEngine
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 ENGINE_LOOP_PATHS = [
@@ -91,10 +92,38 @@ def run_steps(handler, count):
         handler.profiler_step()
 
 
+def broadcast(handlers, cmd, **payload):
+    """Run one utility command on every handler, returning a result each.
+
+    Dispatched through `_execute_utility_command` so that a command missing
+    from `_UTILITY_HANDLERS`, and so unreachable from an engine, fails here.
+    """
+    results = []
+    for handler, _ in handlers:
+        handler._execute_utility_command(cmd, {"cmd": cmd, **payload})
+        results.append(handler.output_queue.get_nowait()[1]["result"])
+    return results
+
+
+def start_window(handlers, body=None, token="a-run"):
+    """The two rounds `LLMEngine.start_profile` drives, against *handlers*.
+
+    What a server runs, so every window test starts its run through this.
+    """
+    payload = {} if body is None else dict(body)
+    # "cmd" belongs to the command, not the window: `broadcast` puts it back.
+    payload.pop("cmd", None)
+    reserved = broadcast(handlers, "reserve_profile", token=token, **payload)
+    if any("error" in result for result in reserved):
+        broadcast(handlers, "release_profile", token=token)
+        return reserved
+    return broadcast(handlers, "commit_profile", token=token)
+
+
 def rpc_steps(delay=0, max_iters=0, steps=20, body=None):
     """Run a window and report which step each RPC landed on.
 
-    Step 0 is the `start_profile` request itself, before any forward. A name
+    Step 0 is the `/start_profile` request itself, before any forward. A name
     absent from the result was never sent, so an equality check on the whole
     mapping also pins the cases that must never auto-stop.
 
@@ -102,7 +131,7 @@ def rpc_steps(delay=0, max_iters=0, steps=20, body=None):
     which may carry a window of its own.
     """
     handler, mgr = make_handler(delay, max_iters)
-    handler._handle_start_profile({} if body is None else body)
+    start_window([(handler, mgr)], body)
     landed = dict.fromkeys(mgr.calls, 0)
     for step in range(1, steps + 1):
         already_sent = len(mgr.calls)
@@ -133,19 +162,25 @@ def test_window_boundaries(delay, max_iters, expected):
 @pytest.mark.parametrize("delay", [0, 5])
 def test_second_start_profile_is_rejected(delay):
     handler, mgr = make_handler(delay=delay, max_iters=10)
+    one = [(handler, mgr)]
 
-    handler._handle_start_profile({})
-    first = handler.output_queue.get_nowait()[1]["result"]
+    first = start_window(one)[0]
     # The endpoint runs `"error" in result` and `"message" in result` on this,
     # so every branch has to answer with a dict rather than the RPC's own
     # return value, which is a bare True.
     assert isinstance(first, dict)
     assert "error" not in first and first["message"]
-    handler._handle_start_profile({})
-    assert "error" in handler.output_queue.get_nowait()[1]["result"]
+    # Asking for a window of its own as well, because a refused request must
+    # not retarget the recording already in flight: the reply says 409 while
+    # the trace silently runs to the refused caller's length.
+    second = start_window(one, {"max_iters": 100}, token="another-run")[0]
+    assert "error" in second and second["conflict"] is True
 
     run_steps(handler, delay + 10)
-    assert mgr.calls.count("start_profiler") == 1, "rejected call must not re-arm"
+    assert mgr.calls == [
+        "start_profiler",
+        "stop_profiler",
+    ], "the refused request re-armed the profiler or moved the live window"
 
     if delay:
         # The endpoint forwards this, so the wording lives in the handler only.
@@ -155,23 +190,24 @@ def test_second_start_profile_is_rejected(delay):
 
 def test_windows_reset_between_requests():
     handler, mgr = make_handler(delay=1, max_iters=2)
+    one = [(handler, mgr)]
     one_window = ["start_profiler", "stop_profiler"]
 
-    handler._handle_start_profile({})
+    start_window(one)
     run_steps(handler, 3)
     assert mgr.calls == one_window
 
     # The second window has to re-arm the delay and restart the recorded
     # count, or its stop lands early instead of on the third step again.
-    handler._handle_start_profile({})
+    start_window(one)
     run_steps(handler, 2)
     assert mgr.calls == one_window + ["start_profiler"]
     handler.profiler_step()
     assert mgr.calls == one_window * 2
 
     # An explicit stop cancels a pending delay, so nothing opens behind it.
-    handler._handle_start_profile({})
-    handler._handle_stop_profile({})
+    start_window(one)
+    broadcast(one, "stop_profile")
     run_steps(handler, 10)
     assert mgr.calls == one_window * 2 + ["stop_profiler"]
 
@@ -197,11 +233,8 @@ def test_request_body_overrides_the_launch_flags(body, expected):
 
 
 def test_a_bodyless_request_keeps_the_launch_flags():
-    """What the endpoint actually sends when the POST carried no body.
-
-    It passes both kwargs unconditionally, so the payload has the keys
-    present and set to None rather than absent -- the case a handler reading
-    `args.get(...)` truthily instead of against None would get wrong.
+    """What the endpoint sends for a bodyless POST: both keys present and
+    None, rather than absent.
     """
     payload = {"cmd": "start_profile", "delay_iters": None, "max_iters": None}
     assert rpc_steps(delay=2, max_iters=3, body=payload) == {
@@ -213,16 +246,16 @@ def test_a_bodyless_request_keeps_the_launch_flags():
 
 def test_a_request_window_does_not_outlive_its_run():
     handler, mgr = make_handler(delay=0, max_iters=5)
+    one = [(handler, mgr)]
     one_window = ["start_profiler", "stop_profiler"]
 
-    handler._handle_start_profile({"max_iters": 1})
+    start_window(one, {"max_iters": 1})
     run_steps(handler, 1)
     assert mgr.calls == one_window
 
-    # The next request omits the field, so it falls back to the flag's 5 --
-    # not to the 1 the previous caller asked for. Resolving the override onto
-    # `profiler_max_iters` itself would stop this window on its first step.
-    handler._handle_start_profile({})
+    # The next request omits the field, so it falls back to the flag's 5,
+    # not to the 1 the previous caller asked for.
+    start_window(one)
     run_steps(handler, 4)
     assert mgr.calls == one_window + ["start_profiler"]
     handler.profiler_step()
@@ -233,22 +266,183 @@ def test_a_request_window_does_not_outlive_its_run():
     ), "the launch flags are defaults and must stay untouched"
 
 
-def test_a_rejected_start_cannot_move_the_live_window():
-    """The window belongs to the run that is being measured.
+# ── Atomic multi-engine start ─────────────────────────────────────────────
 
-    Resolving the request before the already-in-progress check would let a
-    refused call retarget a recording that is already half over -- the reply
-    says 409 and the trace silently runs to someone else's length.
+
+def test_a_busy_engine_refuses_and_no_idle_engine_is_started():
+    """The disagg case: two engines whose windows close at different times.
+
+    A `/start_profile` in between finds one engine idle and the other still
+    recording, and a trace the idle one began here is one the refused client
+    will never stop.
     """
-    handler, mgr = make_handler(delay=0, max_iters=3)
-    handler._handle_start_profile({})
-    handler.profiler_step()
+    decode, decode_mgr = make_handler(max_iters=3)
+    prefill, prefill_mgr = make_handler(max_iters=9)
+    pd = [(decode, decode_mgr), (prefill, prefill_mgr)]
 
-    handler._handle_start_profile({"delay_iters": 0, "max_iters": 100})
-    assert "error" in list(handler.output_queue.queue)[-1][1]["result"]
+    start_window(pd)
+    run_steps(decode, 3)
+    run_steps(prefill, 1)
+    assert decode_mgr.calls == ["start_profiler", "stop_profiler"], "decode is done"
+    assert prefill_mgr.calls == ["start_profiler"], "prefill is still recording"
 
-    run_steps(handler, 2)
-    assert mgr.calls == ["start_profiler", "stop_profiler"]
+    idle_before = list(decode_mgr.calls)
+    refused = start_window(pd, {"max_iters": 100}, token="second-run")
+
+    assert refused[0] == {"reserved": True}
+    assert "error" in refused[1] and refused[1]["conflict"] is True
+    assert decode_mgr.calls == idle_before, "the idle engine opened a second trace"
+    assert prefill._profiler_active, "the busy engine's recording was disturbed"
+    assert decode._profiler_reservation is None, "the refusal left a claim behind"
+
+    # The 409's advice, and the happy path: reserve is inert, commit starts.
+    broadcast(pd, "stop_profile")
+    stopped = [list(mgr.calls) for _, mgr in pd]
+    assert broadcast(pd, "reserve_profile", token="retry") == [
+        {"reserved": True},
+        {"reserved": True},
+    ]
+    assert [list(mgr.calls) for _, mgr in pd] == stopped, "reserve acted on a worker"
+
+    broadcast(pd, "commit_profile", token="retry")
+    assert [mgr.calls[-1] for _, mgr in pd] == ["start_profiler", "start_profiler"]
+
+
+def test_only_the_token_holder_can_release_or_commit():
+    """Defensive: `start_profile()` blocks, so FastAPI serialises the two
+    requests today. The token holds if that endpoint stops blocking.
+    """
+    one = [make_handler()]
+    mgr = one[0][1]
+
+    # No "conflict" flag on a stray commit, so the endpoint answers 500.
+    stray = broadcast(one, "commit_profile", token="never-reserved")[0]
+    assert "error" in stray and "conflict" not in stray
+    assert mgr.calls == []
+
+    assert broadcast(one, "reserve_profile", token="winner") == [{"reserved": True}]
+    assert broadcast(one, "reserve_profile", token="loser")[0]["conflict"] is True
+    assert broadcast(one, "release_profile", token="loser") == [{"released": False}]
+
+    assert broadcast(one, "commit_profile", token="winner") == [
+        {"message": "Profiling started"}
+    ]
+    assert mgr.calls == ["start_profiler"]
+
+
+def test_the_one_shot_start_profile_command_is_the_two_rounds_in_one():
+    """Kept for a caller that holds one engine and sends the one command.
+
+    An unregistered utility command is silently ignored, so an out-of-tree
+    caller would get a no-op rather than an error if this drifted.
+    """
+    one_shot = [make_handler(delay=1, max_iters=2)]
+    two_rounds = [make_handler(delay=1, max_iters=2)]
+
+    assert broadcast(one_shot, "start_profile") == start_window(two_rounds)
+
+    for handler, mgr in one_shot + two_rounds:
+        run_steps(handler, 3)
+        assert mgr.calls == ["start_profiler", "stop_profiler"]
+
+
+def test_stopping_clears_a_reservation_left_by_a_dead_caller():
+    one = [make_handler()]
+    mgr = one[0][1]
+
+    broadcast(one, "reserve_profile", token="abandoned")
+    broadcast(one, "stop_profile")
+
+    assert broadcast(one, "reserve_profile", token="fresh") == [{"reserved": True}]
+    assert broadcast(one, "commit_profile", token="fresh")[0]["message"]
+    assert mgr.calls == ["stop_profiler", "start_profiler"]
+
+
+class FakeCoreMgr:
+    """Records the rounds `LLMEngine` broadcasts.
+
+    `refuse` is the index of an engine that reports a conflict on reserve;
+    `timeout` makes the reserve round raise, as the real broadcast does when
+    an engine stops answering.
+    """
+
+    def __init__(self, engines=2, refuse=None, timeout=False):
+        self.engines = engines
+        self.refuse = refuse
+        self.timeout = timeout
+        self.rounds = []
+
+    def broadcast_utility_command_sync(self, cmd, timeout=300.0, **kwargs):
+        self.rounds.append((cmd, kwargs))
+        if cmd == "reserve_profile":
+            if self.timeout:
+                raise TimeoutError("engine never answered")
+            results = [{"reserved": True} for _ in range(self.engines)]
+            if self.refuse is not None:
+                results[self.refuse] = {"error": "busy", "conflict": True}
+        elif cmd == "commit_profile":
+            results = [{"message": "Profiling started"} for _ in range(self.engines)]
+        else:
+            results = [{"released": True} for _ in range(self.engines)]
+        return [{"cmd": cmd, "result": result} for result in results]
+
+
+def engine_with(core_mgr):
+    """An `LLMEngine` with only a core manager: `__init__` would load a
+    tokenizer and spawn engine processes.
+    """
+    engine = LLMEngine.__new__(LLMEngine)
+    engine.core_mgr = core_mgr
+    return engine
+
+
+def test_the_engine_reserves_everywhere_before_it_commits_anywhere():
+    core_mgr = FakeCoreMgr()
+    engine = engine_with(core_mgr)
+
+    results = engine.start_profile(delay_iters=1, max_iters=2)
+
+    assert [cmd for cmd, _ in core_mgr.rounds] == ["reserve_profile", "commit_profile"]
+    # One token for both rounds, and the window travels with the reservation.
+    reserve_kwargs, commit_kwargs = (kwargs for _, kwargs in core_mgr.rounds)
+    assert reserve_kwargs["delay_iters"] == 1 and reserve_kwargs["max_iters"] == 2
+    assert commit_kwargs == {"token": reserve_kwargs["token"]}
+    assert all("error" not in r for r in results)
+
+    engine.start_profile()
+    tokens = {kwargs["token"] for _, kwargs in core_mgr.rounds}
+    assert len(tokens) == 2, "a reused token lets one run commit another's reservation"
+
+
+def test_one_refusal_releases_the_others_and_commits_nothing():
+    core_mgr = FakeCoreMgr(refuse=1)
+
+    results = engine_with(core_mgr).start_profile()
+
+    assert [cmd for cmd, _ in core_mgr.rounds] == [
+        "reserve_profile",
+        "release_profile",
+    ], "an engine was committed after a sibling refused"
+    # The refusal round comes back: the endpoint needs every answer to pick
+    # 409 over 500 and to say how many refused.
+    assert [("error" in r) for r in results] == [False, True]
+
+
+def test_a_reserve_timeout_releases_before_it_propagates():
+    """Otherwise the engines that did answer hold a reservation for good,
+    and every later /start_profile is refused until a restart.
+    """
+    core_mgr = FakeCoreMgr(timeout=True)
+
+    with pytest.raises(TimeoutError):
+        engine_with(core_mgr).start_profile()
+
+    assert [cmd for cmd, _ in core_mgr.rounds] == [
+        "reserve_profile",
+        "release_profile",
+    ]
+    reserve_kwargs, release_kwargs = (kwargs for _, kwargs in core_mgr.rounds)
+    assert release_kwargs["token"] == reserve_kwargs["token"]
 
 
 def test_call_func_ticks_only_on_completed_forwards():
@@ -280,9 +474,9 @@ def test_scheduler_detailed_aggregates_track_the_recorded_window():
     from atom.model_engine.scheduler import Scheduler
 
     scheduler = Scheduler(MockConfig())
-    handler, _ = make_handler(delay=1, max_iters=2, scheduler=scheduler)
+    handler, mgr = make_handler(delay=1, max_iters=2, scheduler=scheduler)
 
-    handler._handle_start_profile({})
+    start_window([(handler, mgr)])
     assert scheduler.profile_active is False, "armed is not yet recording"
 
     handler.profiler_step()

@@ -49,12 +49,18 @@ class EngineUtilityHandler:
         "clear_kv_cache": "_handle_clear_kv_cache",
         "configure_hidden_states": "_handle_configure_hidden_states",
         "start_profile": "_handle_start_profile",
+        "reserve_profile": "_handle_reserve_profile",
+        "commit_profile": "_handle_commit_profile",
+        "release_profile": "_handle_release_profile",
         "stop_profile": "_handle_stop_profile",
         "get_mtp_stats": "_handle_get_mtp_stats",
         "get_mtp_statistics": "_handle_get_mtp_statistics",
         "get_cache_statistics": "_handle_get_cache_statistics",
         "abort_request": "_handle_abort_request",
     }
+
+    # Stands in for a caller's token on the one-shot `start_profile` path.
+    _ONE_SHOT_RESERVATION: ClassVar[str] = "start_profile"
 
     def __init__(
         self,
@@ -79,6 +85,7 @@ class EngineUtilityHandler:
         self._profiler_pending = 0
         self._profiler_recorded = 0
         self._profiler_active = False
+        self._profiler_reservation: str | None = None
 
     def process_queue(self, utility_queue, engine):
         """Drain *utility_queue* and execute each command.
@@ -293,15 +300,15 @@ class EngineUtilityHandler:
             self.scheduler.profile_active = False
         self._profiler_active = False
         self._profiler_pending = 0
+        self._profiler_reservation = None
         logger.info(f"{self.label}: profiler stopped, result={result}")
         return result
 
     def _resolve_window(self, args: dict):
         """Fix the window for one run from the request, else the launch flags.
 
-        Resolved per request rather than written back onto
-        ``profiler_delay_iters`` / ``profiler_max_iters``, so one caller's
-        window cannot leak into the next request that asks for none.
+        ``int()`` because the counters step by one, and a float would miss
+        the zero they stop at.
         """
         delay = args.get("delay_iters")
         max_iters = args.get("max_iters")
@@ -312,30 +319,88 @@ class EngineUtilityHandler:
             self.profiler_max_iters if max_iters is None else int(max_iters)
         )
 
-    def _handle_start_profile(self, args: dict):
+    def _reserve_window(self, token, args: dict) -> dict:
+        """Agree to record for *token*; no profiler is started here.
+
+        The window is pinned now, so the commit round carries no parameters.
+        """
+        if not token:
+            result = {"error": "A profiling reservation requires a token."}
+            logger.warning(f"{self.label}: {result['error']}")
+            return result
         if self._profiler_active or self._profiler_pending:
-            # Starting twice without an intervening stop would leave one trace
-            # spanning both runs while the window counts from the second call.
-            # Resolving before this check would also let the rejected call
-            # move the window the live run is being measured against.
             result = {
-                "error": "Profiling is already in progress. Call /stop_profile first."
+                "error": "Profiling is already in progress. Call /stop_profile first.",
+                "conflict": True,
             }
             logger.warning(f"{self.label}: {result['error']}")
-        else:
-            self._resolve_window(args)
-            if self._effective_delay_iters:
-                self._profiler_pending = self._effective_delay_iters
-                result = {
-                    "armed_after_iters": self._effective_delay_iters,
-                    "message": (
-                        f"Profiling armed. Recording starts after "
-                        f"{self._effective_delay_iters} engine steps."
-                    ),
-                }
-                logger.info(f"{self.label}: {result['message']}")
-            else:
-                result = self._start_profiler_now()
+            return result
+        if self._profiler_reservation not in (None, token):
+            result = {
+                "error": (
+                    "Another /start_profile is being set up. "
+                    "Call /stop_profile first."
+                ),
+                "conflict": True,
+            }
+            logger.warning(f"{self.label}: {result['error']}")
+            return result
+        self._profiler_reservation = token
+        self._resolve_window(args)
+        return {"reserved": True}
+
+    def _commit_window(self, token) -> dict:
+        """Act on a reservation: arm the delay, or start recording now."""
+        if self._profiler_reservation != token:
+            result = {"error": "No profiling reservation to commit."}
+            logger.warning(f"{self.label}: {result['error']}")
+            return result
+        self._profiler_reservation = None
+        if self._effective_delay_iters:
+            self._profiler_pending = self._effective_delay_iters
+            result = {
+                "armed_after_iters": self._effective_delay_iters,
+                "message": (
+                    f"Profiling armed. Recording starts after "
+                    f"{self._effective_delay_iters} engine steps."
+                ),
+            }
+            logger.info(f"{self.label}: {result['message']}")
+            return result
+        return self._start_profiler_now()
+
+    def _release_window(self, token) -> dict:
+        """Give up a reservation, token-matched, profiler untouched."""
+        released = self._profiler_reservation == token and token is not None
+        if released:
+            self._profiler_reservation = None
+            logger.info(f"{self.label}: profiling reservation released")
+        return {"released": released}
+
+    def _handle_reserve_profile(self, args: dict):
+        result = self._reserve_window(args.get("token"), args)
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": "reserve_profile", "result": result})
+        )
+
+    def _handle_commit_profile(self, args: dict):
+        result = self._commit_window(args.get("token"))
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": "commit_profile", "result": result})
+        )
+
+    def _handle_release_profile(self, args: dict):
+        result = self._release_window(args.get("token"))
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": "release_profile", "result": result})
+        )
+
+    def _handle_start_profile(self, args: dict):
+        """Reserve and commit in one step, for a caller holding one engine."""
+        token = args.get("token") or self._ONE_SHOT_RESERVATION
+        result = self._reserve_window(token, args)
+        if "error" not in result:
+            result = self._commit_window(token)
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "start_profile", "result": result})
         )

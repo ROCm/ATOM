@@ -2457,18 +2457,16 @@ async def start_profile(request: StartProfileRequest | None = None):
         raise HTTPException(status_code=500, detail=f"Failed to start profiling: {e!s}")
     errors = [r["error"] for r in results if "error" in r]
     if errors:
-        if len(errors) == len(results):
-            detail = errors[0]
-        else:
-            # Every engine decides for itself and the broadcast has already
-            # run, so the ones that were idle are recording by now. Say so
-            # rather than letting the 409 imply nothing started.
+        # A conflict means no engine was started, so the caller can retry
+        # after a /stop_profile. Anything else failed on our side.
+        conflict = any(r.get("conflict") for r in results)
+        detail = errors[0]
+        if len(errors) < len(results):
             detail = (
-                f"Profiling already in progress on {len(errors)} of "
-                f"{len(results)} engines; the others have now started. "
-                "Call /stop_profile before retrying."
+                f"{detail} ({len(errors)} of {len(results)} engines refused; "
+                "none were started.)"
             )
-        raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=409 if conflict else 500, detail=detail)
     message = next(
         (r["message"] for r in results if "message" in r), "Profiling started"
     )
