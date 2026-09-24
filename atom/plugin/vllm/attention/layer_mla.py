@@ -1269,6 +1269,13 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             # v_up projection
             self._v_up_proj(attn_out, out=output[:num_decode_tokens])
 
+        # Same reason as forward_impl_sparse: attention writes the live rows
+        # only, and the rest of this allocation still holds whatever used it
+        # last. This path carries the 57 dense MLA layers of GLM-5.3 against
+        # the sparse path's 21, so leaving it undefined leaks far more of the
+        # residual stream than the sparse case that was fixed first.
+        if output_padded.shape[0] > num_actual_toks:
+            output_padded[num_actual_toks:].zero_()
         return output_padded
 
     def do_kv_cache_update(
