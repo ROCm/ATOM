@@ -8,6 +8,7 @@ import torch
 from atom.plugin.sglang.attention_backend.backend_resolver import real_batch_size
 from atom.plugin.sglang.qwen4_exp_bridge import (
     _DECODE_GRAPH,
+    _DRAFT_QSA,
     _NO_WRITE,
     _eager_qsa_max_seq_len,
     _fill_block_tables_into,
@@ -24,8 +25,10 @@ from atom.plugin.sglang.qwen4_exp_bridge import (
 @pytest.fixture(autouse=True)
 def _reset_decode_graph():
     _DECODE_GRAPH.reset()
+    _DRAFT_QSA.reset()
     yield
     _DECODE_GRAPH.reset()
+    _DRAFT_QSA.reset()
 
 
 class _DecodeMode:
@@ -397,6 +400,50 @@ def test_verify_qsa_seq_lens_cover_tree_root_at_prefix():
     assert qsa is not None
     assert qsa.seq_lens.tolist() == [67]
     assert qsa.logical_positions.tolist() == [64, 65, 66]
+
+
+def test_draft_decode_qsa_lifts_one_token_step(monkeypatch):
+    """Draft decode is 1 token/req but sits at seq_lens, so QSA must include it."""
+    from atom.plugin.sglang import qwen4_exp_bridge as bridge
+
+    monkeypatch.setattr(bridge, "_is_draft_forward", lambda: True)
+    monkeypatch.setattr(
+        bridge,
+        "_server_args",
+        lambda: SimpleNamespace(
+            context_length=8192,
+            max_model_len=8192,
+            max_running_requests=8,
+            page_size=64,
+            speculative_num_draft_tokens=3,
+        ),
+    )
+    pool = _Pool()
+    device = torch.device("cpu")
+    fb = SimpleNamespace(
+        forward_mode=_DecodeMode(),
+        batch_size=1,
+        num_padding=0,
+        device=device,
+        req_pool_indices=torch.tensor([0], dtype=torch.int32),
+        seq_lens=torch.tensor([64], dtype=torch.int32),
+        req_to_token_pool=pool,
+        out_cache_loc=torch.tensor([64], dtype=torch.int64),
+        page_size=64,
+        spec_info=SimpleNamespace(draft_token_num=3, num_tokens_per_req=3),
+    )
+    atom_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            model_type="qwen4_exp",
+            indexer_compress_ratio=4,
+            indexer_budget=2048,
+            page_size=64,
+        )
+    )
+    qsa = build_qsa_metadata(atom_config, fb, torch.tensor([64], dtype=torch.int64))
+    assert qsa is not None
+    assert qsa.seq_lens.tolist() == [65]
+    assert qsa.logical_positions.tolist() == [64]
 
 
 def test_qsa_tokens_per_req_is_one_on_decode_three_on_verify():

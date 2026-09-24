@@ -859,9 +859,11 @@ def _fill_qsa_like_native(
         seq.fill_(1)
     if live_bs < bs:
         seq[live_bs:] = 0
-    # Decode is pos = seq_lens - 1; skip the no-op GPU lift. Verify / draft
-    # width is > 1 and must raise prefix seq_lens to max(pos)+1.
-    if tokens_per_req > 1:
+    # Target decode is pos = seq_lens - 1; the lift is a no-op and a wasted
+    # kernel on the captured graph. Draft decode is also 1 token/req, but its
+    # position sits at seq_lens, so QSA must see max(pos)+1. Verify and
+    # draft-extend are wider than 1.
+    if tokens_per_req > 1 or _is_draft_forward():
         _lift_qsa_seq_lens(seq, logical, live_bs=live_bs, tokens_per_req=tokens_per_req)
     # Page tables after the seq_lens lift: draft slots that cross a page boundary must
     # stay visible, and mixed-length tails must not alias page 0.

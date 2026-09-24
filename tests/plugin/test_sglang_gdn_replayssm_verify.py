@@ -66,7 +66,9 @@ def _impl() -> SGLangGatedDeltaNet:
         NUM_V_HEADS // TP_SIZE, device="cuda", dtype=torch.float32
     )
     impl.conv1d = SimpleNamespace(
-        weight=torch.randn(CONV_DIM, 1, CONV_KERNEL, device="cuda", dtype=torch.bfloat16),
+        weight=torch.randn(
+            CONV_DIM, 1, CONV_KERNEL, device="cuda", dtype=torch.bfloat16
+        ),
         bias=torch.randn(CONV_DIM, device="cuda", dtype=torch.bfloat16),
     )
     return impl
