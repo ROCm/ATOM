@@ -241,7 +241,7 @@ PY
   fi
 
   # Supervise: drain detects engine fault (exit 2 in <=10s), engine hang
-  # (exit 1 in <=60s by default), clean completion (exit 0 when client gone + no
+  # (exit 1 after 18×10s by default; configurable), clean completion (exit 0 when client gone + no
   # pending output), or timeout (exit 4 at MAX_MIN). Without this the
   # accuracy step burns the full `timeout-minutes` whenever an aiter
   # kernel asserts mid-prefill or a GPU faults — lm_eval just keeps
