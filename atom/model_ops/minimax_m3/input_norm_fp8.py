@@ -16,8 +16,14 @@ def fused_m3_gemma_norm_fp8(x, weight, epsilon, residual=None):
     # numerical contract is validated by model accuracy, not BF16 byte parity.
     if x.shape[0] > 0:
         fused_qk_rmsnorm_per_token_quant(
-            out, scale, x, weight, epsilon,
-            q_res_out=res_out, q_residual=residual, gemma_norm=True,
+            out,
+            scale,
+            x,
+            weight,
+            epsilon,
+            q_res_out=res_out,
+            q_residual=residual,
+            gemma_norm=True,
         )
     # First decoder layer keeps the original residual stream by reference.
     return out, scale, x if residual is None else res_out
@@ -25,8 +31,9 @@ def fused_m3_gemma_norm_fp8(x, weight, epsilon, residual=None):
 
 def supports_m3_fused_gemma_fp8(hidden_width: int) -> bool:
     """Startup-only support gate; caller caches this before graph tracing."""
-    from atom.config import get_current_atom_config
     from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+
+    from atom.config import get_current_atom_config
     from atom.distributed.ulysses_sp import get_sp_world_size
     from atom.utils import envs
 
@@ -40,6 +47,7 @@ def supports_m3_fused_gemma_fp8(hidden_width: int) -> bool:
     ):
         return False
     from aiter.jit.utils.chip_info import get_gfx_runtime
+
     from atom.plugin.prepare import is_plugin_mode
 
     return not is_plugin_mode() and get_gfx_runtime() == "gfx950"

@@ -75,14 +75,14 @@ def main():
         )
         ids = torch.cat((ids, torch.full_like(ids[:, :1], experts - 1)), dim=1)
         weights = torch.softmax(torch.randn(tokens, topk, device="cuda"), dim=-1)
-        kwargs = dict(
-            activation=layer.activation,
-            quant_type=method.quant_type,
-            w1_scale=s1,
-            w2_scale=s2,
-            swiglu_limit=layer.swiglu_limit,
-            dtype=torch.bfloat16,
-        )
+        kwargs = {
+            "activation": layer.activation,
+            "quant_type": method.quant_type,
+            "w1_scale": s1,
+            "w2_scale": s2,
+            "swiglu_limit": layer.swiglu_limit,
+            "dtype": torch.bfloat16,
+        }
         expected = fused_moe(
             gathered, layer.w13_weight, layer.w2_weight, weights, ids, **kwargs
         )
