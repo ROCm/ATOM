@@ -159,11 +159,18 @@ jobs:
 
       - name: Record the wheel
         id: wheel
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           wheels=(lmcache-src/dist_rocm_torch210/*.whl)
           test "${#wheels[@]}" -eq 1
           wheel=$(basename "${wheels[0]}")
+          # The Dockerfiles rebuild this name from the release tag alone.
+          if [ "${wheel}" != "lmcache-${VERSION}-${EXPECTED_WHEEL_TAG}.whl" ]; then
+            echo "Unexpected wheel name ${wheel}; the Dockerfiles expect lmcache-${VERSION}-${EXPECTED_WHEEL_TAG}.whl."
+            exit 1
+          fi
           sha256=$(sha256sum "${wheels[0]}" | cut -d' ' -f1)
           echo "wheel=${wheel}" >> "$GITHUB_OUTPUT"
           echo "sha256=${sha256}" >> "$GITHUB_OUTPUT"
@@ -263,7 +270,6 @@ jobs:
             echo "Release ${RELEASE_TAG} already exists; not overwriting it."
             exit 1
           fi
-          url="https://github.com/${GH_REPO}/releases/download/${RELEASE_TAG}/${WHEEL//+/%2B}"
           cat > notes.md <<EOF
           LMCache wheel for ATOM's ROCm 7.2.4 / torch 2.10.0 image (gfx942, gfx950), built by [this run](${GITHUB_SERVER_URL}/${GH_REPO}/actions/runs/${GITHUB_RUN_ID}).
 
@@ -275,8 +281,7 @@ jobs:
           Pin in docker/Dockerfile:
 
           \`\`\`
-          ARG LMCACHE_WHEEL_NAME=${WHEEL}
-          ARG LMCACHE_WHEEL_URL=${url}
+          ARG LMCACHE_WHEEL_RELEASE=${RELEASE_TAG}
           ARG LMCACHE_WHEEL_SHA256=${SHA256}
           \`\`\`
           EOF
@@ -332,8 +337,8 @@ jobs:
           # requirements by hand, so a new Requires-Dist has to be added there
           # in the PR. Surface the difference instead of leaving it to the
           # image build to find.
-          old_url="$(sed -n 's/^ARG LMCACHE_WHEEL_URL=//p' docker/Dockerfile)"
-          curl -fsSL "${old_url}" -o "${RUNNER_TEMP}/old.whl"
+          old_release="$(sed -n 's/^ARG LMCACHE_WHEEL_RELEASE=//p' docker/Dockerfile)"
+          gh release download "${old_release}" --pattern '*.whl' --output "${RUNNER_TEMP}/old.whl"
           requires() {
             unzip -p "$1" '*.dist-info/METADATA' | sed -n 's/^Requires-Dist: //p' | sort
           }
@@ -345,9 +350,8 @@ jobs:
       - name: Open the PR
         run: |
           set -euo pipefail
-          url="https://github.com/${GH_REPO}/releases/download/${RELEASE_TAG}/${WHEEL//+/%2B}"
           .github/scripts/bump_lmcache_wheel_pin.py \
-            --name "${WHEEL}" --url "${url}" --sha256 "${SHA256}"
+            --release "${RELEASE_TAG}" --sha256 "${SHA256}"
           branch="ci/lmcache-wheel-${RELEASE_TAG#lmcache-}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

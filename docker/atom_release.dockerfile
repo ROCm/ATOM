@@ -638,12 +638,13 @@ RUN echo "========== Install atomesh binary ==========" && \
 
 # ========== LMCache (ROCm 7.2.4 / torch 2.10) for KV offload ==========
 # Install a wheel built for the image's exact PyTorch ABI. Keep --no-deps so
-# pip cannot replace the preinstalled ROCm torch stack. The expected
-# lmcache.__version__ comes from LMCACHE_WHEEL_NAME, so a pin is just the three
-# args below; .github/workflows/lmcache-rocm-wheel.yaml rewrites them when it
-# publishes a new wheel (.github/scripts/bump_lmcache_wheel_pin.py).
-ARG LMCACHE_WHEEL_NAME=lmcache-0.5.6.dev98+g05fc77a0.rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1-cp312-cp312-manylinux_2_39_x86_64.whl
-ARG LMCACHE_WHEEL_URL=https://github.com/ROCm/ATOM/releases/download/lmcache-v0.5.6.dev98-g05fc77a0-rocm-torch210/lmcache-0.5.6.dev98%2Bg05fc77a0.rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1-cp312-cp312-manylinux_2_39_x86_64.whl
+# pip cannot replace the preinstalled ROCm torch stack. The pin is a release of
+# this repository published by .github/workflows/lmcache-rocm-wheel.yaml, which
+# also opens the PR that moves it. The wheel name, its URL and the expected
+# lmcache.__version__ follow from the release tag; the ABI suffix and wheel tag
+# are the workflow's ROCM_TORCH210_LOCAL_VERSION and EXPECTED_WHEEL_TAG, and
+# change only with the image's torch.
+ARG LMCACHE_WHEEL_RELEASE=lmcache-v0.5.6.dev98-g05fc77a0-rocm-torch210
 ARG LMCACHE_WHEEL_SHA256=a5fe8f3f5b9dee602ac7d11241f65a1640cd3d26c101f2d1d0e0d8aee88b7aab
 # Docker builds do not expose a GPU, so LMCache's torch.cuda.is_available()
 # backend predicate is overridden only in the validation process below.
@@ -660,8 +661,13 @@ ARG LMCACHE_WHEEL_SHA256=a5fe8f3f5b9dee602ac7d11241f65a1640cd3d26c101f2d1d0e0d8a
 ARG LMCACHE_TAG=v0.4.5
 RUN if [ -z "${ROCM_HOME}" ]; then \
       echo "========== [ATOM] Install LMCache ROCm torch 2.10 wheel ==========" && \
-          curl -fL "${LMCACHE_WHEEL_URL}" -o "/tmp/${LMCACHE_WHEEL_NAME}" && \
-          echo "${LMCACHE_WHEEL_SHA256}  /tmp/${LMCACHE_WHEEL_NAME}" | sha256sum -c - && \
+          lmcache_version="$(echo "${LMCACHE_WHEEL_RELEASE}" | sed -nE \
+              's/^lmcache-v([^-]+)-(g[0-9a-f]{8})-rocm-torch210$/\1+\2.rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1/p')" && \
+          { [ -n "${lmcache_version}" ] || { echo "Unexpected LMCACHE_WHEEL_RELEASE=${LMCACHE_WHEEL_RELEASE}"; exit 1; }; } && \
+          lmcache_wheel="lmcache-${lmcache_version}-cp312-cp312-manylinux_2_39_x86_64.whl" && \
+          curl -fL "https://github.com/ROCm/ATOM/releases/download/${LMCACHE_WHEEL_RELEASE}/$(echo "${lmcache_wheel}" | sed 's/+/%2B/')" \
+              -o "/tmp/${lmcache_wheel}" && \
+          echo "${LMCACHE_WHEEL_SHA256}  /tmp/${lmcache_wheel}" | sha256sum -c - && \
           "${VENV_PYTHON}" -m pip install \
               prometheus_client==0.25.0 aiofile==3.11.1 aiofiles caio==0.9.25 \
               blake3 redis sortedcontainers pyzmq cupy-rocm-7-0 \
@@ -670,8 +676,8 @@ RUN if [ -z "${ROCM_HOME}" ]; then \
               opentelemetry-exporter-otlp==1.40.0 \
               opentelemetry-exporter-prometheus==0.61b0 \
               "grpcio>=1.78.0" "protobuf>=6.31.1,<7" && \
-          "${VENV_PYTHON}" -m pip install --no-deps "/tmp/${LMCACHE_WHEEL_NAME}" && \
-          rm -f "/tmp/${LMCACHE_WHEEL_NAME}" && \
+          "${VENV_PYTHON}" -m pip install --no-deps "/tmp/${lmcache_wheel}" && \
+          rm -f "/tmp/${lmcache_wheel}" && \
           "${VENV_PYTHON}" -c "import torch; torch.cuda.is_available = lambda: True; import lmcache, lmcache.cuda_ops, lmcache.lmcache_native; \
       from lmcache.v1.cache_engine import LMCacheEngineBuilder; \
       from lmcache.v1.memory_management import MemoryFormat; \
@@ -683,7 +689,7 @@ RUN if [ -z "${ROCM_HOME}" ]; then \
       from lmcache.v1.multiprocess.futures import DeviceMessagingFuture; \
       from lmcache.v1.multiprocess.group_view import EngineGroupInfo; \
       assert 'rocm' in torch.__version__, torch.__version__; \
-      assert lmcache.__version__ == '${LMCACHE_WHEEL_NAME}'.split('-')[1], lmcache.__version__; \
+      assert lmcache.__version__ == '${lmcache_version}', lmcache.__version__; \
       assert lmcache.cuda_ops.__file__.endswith('.so'), lmcache.cuda_ops.__file__; \
       assert lmcache.lmcache_native.__file__.endswith('.so'), lmcache.lmcache_native.__file__; \
       assert hasattr(lmcache.cuda_ops, 'execute_object_group_transfer'), 'cuda_ops extension is incomplete'; \
