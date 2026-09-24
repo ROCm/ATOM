@@ -95,6 +95,36 @@ Notes:
   its private expert-weight layout to the rebalancer via `get_eplb_weight_views`,
   so expert migration operates on the live fused weights.
 
+### MegaMoE on gfx1250 (mori v2 transport, EP + DP attention)
+
+On gfx1250 the EP + DP MoE all2all runs on mori's `dispatch_combine_v2`
+(`ATOM_MORI_V2=1`), and by default each routed-MoE layer is handed to aiter's
+`MegaMoEGfx1250`, which owns dispatch, both grouped GEMMs and combine. Two
+switches control how much of that layer is fused; both default to on:
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `ATOM_MEGA_STAGE2_FUSED` | `1` | The gemm2 epilogue P2P-writes each weighted route into the peers' combine staging, so combine only barriers and sums. `0` falls back to mori's plain gather combine. Formerly `ATOM_MORI_V2_FUSED`. |
+| `ATOM_MEGA_STAGE1_FUSED` | `1` | Compact stage 1: routing/layout planning fused with the flydsl TDM dispatch, which writes the grouped GEMM1's per-expert rows directly. Needs stage 2 fused and a quantizing `MEGA_DISPATCH_WIRE` (`fp4`, or `fp8` with `AITER_FORCE_A8W4=1`); on a `bf16` wire it is ignored. When on, dispatch runs on flydsl TDM rather than mori. |
+
+```bash
+ATOM_MORI_V2=1 MORI_GPU_ARCHS=gfx1250 FLYDSL_GPU_ARCH=gfx1250 \
+MEGA_DISPATCH_WIRE=fp4 ATOM_MEGA_COMBINE_WIRE=fp4 \
+ATOM_MOE_GU_ITLV=1 ATOM_DP_LM_HEAD_MODE=allgather \
+python -m atom.entrypoints.openai_server \
+  --model deepseek-ai/DeepSeek-V4-Pro \
+  --kv_cache_dtype fp8 -tp 4 \
+  --enable-expert-parallel --enable-dp-attention
+```
+
+Notes:
+- The log line `[MORI-V2] Created MegaMoE ... dispatch=flydsl wire=fp4 ...
+  stage1_fused=True` confirms the compact stage-1 path is active.
+- Compact stage 1 cannot run with the Triton experts (`ATOM_USE_TRITON_MOE*`);
+  set `ATOM_MEGA_STAGE1_FUSED=0` to use them.
+- `ATOM_DP_LM_HEAD_MODE=allgather` avoids RCCL `all_to_all_single`, which
+  cannot be captured into a hipGraph on gfx1250.
+
 ### FP8 on MI308 / gfx942 (V4-Flash-Base, FP8 per-block routed experts)
 
 [DeepSeek-V4-Flash-Base](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Base) ships the same V4 architecture (mHC + CSA + HCA + sparse attn + MTP) as V4-Pro, but **routed experts are FP8 e4m3 per-block 128×128** (instead of V4-Pro's FP4 e2m1 microscaling). This trades a small expert-memory increase for end-to-end ROCm `gfx942` (MI308) compatibility — `aiter`'s FP8 grouped GEMM has been tuned for `gfx942`, while the FP4 path was authored for `gfx950` (MI355X).
