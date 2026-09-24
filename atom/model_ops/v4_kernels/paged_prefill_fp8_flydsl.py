@@ -178,6 +178,50 @@ def _ds_read_b64_tr_b16_finish(raw_lo, raw_hi):
     )
 
 
+def _ds_read_b64_tr_b16_single_start(address, d_offset_bytes: int):
+    """Start one gfx950 BF16 transpose fragment."""
+    raw_type = ir.VectorType.get([2], ir.IntegerType.get_signless(32))
+    return llvm.inline_asm(
+        raw_type,
+        [fx.Int32(address).ir_value()],
+        f"ds_read_b64_tr_b16 $0, $1 offset:{d_offset_bytes};\n",
+        "=&v,v,~{memory}",
+        has_side_effects=True,
+    )
+
+
+def _ds_read_b64_tr_b16_single_advance(address, d_offset_bytes: int, raw):
+    """Issue one transpose fragment and publish the previous one."""
+    raw_type = ir.VectorType.get([2], ir.IntegerType.get_signless(32))
+    result_type = ir.Type.parse("!llvm.struct<(vector<2xi32>, vector<2xi32>)>")
+    result = llvm.inline_asm(
+        result_type,
+        [fx.Int32(address).ir_value(), raw],
+        (
+            f"ds_read_b64_tr_b16 $0, $2 offset:{d_offset_bytes};\n"
+            "s_waitcnt lgkmcnt(1);\n"
+        ),
+        "=&v,=v,v,1,~{memory}",
+        has_side_effects=True,
+    )
+    return (
+        llvm.extractvalue(raw_type, result, [1]),
+        llvm.extractvalue(raw_type, result, [0]),
+    )
+
+
+def _ds_read_b64_tr_b16_single_finish(raw):
+    """Wait for and publish one outstanding transpose fragment."""
+    raw_type = ir.VectorType.get([2], ir.IntegerType.get_signless(32))
+    return llvm.inline_asm(
+        raw_type,
+        [raw],
+        "s_waitcnt lgkmcnt(0);\n",
+        "=v,0,~{memory}",
+        has_side_effects=True,
+    )
+
+
 def _ds_read_b64_tr_b16_pair_start(
     address, d_offset_bytes: int, next_k_offset_bytes: int
 ):
@@ -568,7 +612,6 @@ def _build_qk_h128_launcher():
         lane = tid % fx.Int32(64)
         lane_row = lane % fx.Int32(16)
         lane_group = lane // fx.Int32(16)
-
         q_i32 = GTensor(q_packed, dtype=T.i32, shape=(-1,))
         k_i32 = GTensor(k_packed, dtype=T.i32, shape=(-1,))
         q_rope_i32 = GTensor(q_rope, dtype=T.i32, shape=(-1,))
@@ -937,7 +980,7 @@ def _build_qk_pv_h128_launcher():
     return launch
 
 
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=128)
 def _build_sparse_prefill_launcher(
     pipeline_two: bool = False,
     cluster_two: bool = False,
@@ -973,6 +1016,9 @@ def _build_sparse_prefill_launcher(
     implicit_split_short_max_tiles: int = 0,
     implicit_split_tiles_mid: int = 0,
     implicit_split_mid_max_tiles: int = 0,
+    write_partial_m: bool = True,
+    write_split_count: bool = False,
+    zero_inactive_splits: bool = False,
     waves_per_eu: int = 0,
 ):
     """Build the H128 paged sparse-prefill kernel.
@@ -997,27 +1043,35 @@ def _build_sparse_prefill_launcher(
     """
 
     rolling_pipeline = pipeline_two or cluster_two
+    stage_block_k = implicit_block_k if implicit_split_tasks else QK_BLOCK_COLS
+    stage_k_fragments = stage_block_k // 16
+    stage_waves = 4 if stage_block_k == 16 else QK_WAVES
+    stage_block_threads = stage_waves * 64
+    stage_head_rows = stage_waves * 16
+    packed_dma_passes = stage_block_k * 32 // stage_block_threads
     raw_wave_bytes = 64 * 16
     raw_wave_stride_bytes = raw_wave_bytes + (32 if wave_padded_k else 0)
     raw_wave_stride_dwords = raw_wave_stride_bytes // 4
-    packed_wave_blocks = 16
-    rope_wave_blocks = 4
+    packed_wave_blocks = packed_dma_passes * stage_waves
+    rope_wave_blocks = stage_block_k // 8
     packed_slot_dwords = packed_wave_blocks * raw_wave_stride_bytes // 4
     rope_slot_dwords = rope_wave_blocks * raw_wave_stride_bytes // 4
     raw_stage_slots = 2 if rolling_pipeline else 1
     pv_stage_slots = 2 if rolling_pipeline else 1
-    pv_stride = QK_BLOCK_COLS + lds_padding
+    pv_stride = stage_block_k + lds_padding
     p_lane_stride = 10
     p_slot_elems = (
-        QK_WAVES * 64 * p_lane_stride if p_lane_layout else QK_BLOCK_ROWS * pv_stride
+        stage_block_threads * p_lane_stride
+        if p_lane_layout
+        else stage_head_rows * pv_stride
     )
     v_stride = V4_DIM_QK + 16 if transpose_v else pv_stride
-    v_slot_elems = QK_BLOCK_COLS * v_stride if transpose_v else V4_DIM_QK * v_stride
+    v_slot_elems = stage_block_k * v_stride if transpose_v else V4_DIM_QK * v_stride
     p_stage_elems = (
         p_slot_elems * pv_stage_slots if rolling_pipeline and not register_p else 1
     )
     q_stage_stride = 25
-    q_stage_elems = QK_WAVES * 64 * q_stage_stride if stage_q else 1
+    q_stage_elems = stage_block_threads * q_stage_stride if stage_q else 1
 
     @fx.struct
     class SharedStorage:
@@ -1025,14 +1079,16 @@ def _build_sparse_prefill_launcher(
         k_rope: fx.Array[fx.Int32, rope_slot_dwords * raw_stage_slots, 16]
         p: fx.Array[fx.BFloat16, p_stage_elems, 16]
         v: fx.Array[fx.BFloat16, v_slot_elems * pv_stage_slots, 16]
-        valid: fx.Array[fx.Int32, 32 * raw_stage_slots, 16]
+        valid: fx.Array[fx.Int32, stage_block_k * raw_stage_slots, 16]
         q: fx.Array[fx.Int32, q_stage_elems, 16]
         alpha: fx.Array[
-            fx.Float32, 128 if rolling_pipeline or not alpha_bpermute else 1, 16
+            fx.Float32,
+            stage_head_rows if rolling_pipeline or not alpha_bpermute else 1,
+            16,
         ]
 
     kernel_value_attrs = {
-        "rocdl.flat_work_group_size": "512,512",
+        "rocdl.flat_work_group_size": f"{stage_block_threads},{stage_block_threads}",
         "passthrough": [
             ["denormal-fp-math-f32", "preserve-sign,preserve-sign"],
             ["no-nans-fp-math", "true"],
@@ -1080,9 +1136,12 @@ def _build_sparse_prefill_launcher(
                 if implicit_split_tasks
                 else ""
             )
+            + ("_nom" if split_partial and not write_partial_m else "")
+            + ("_splitcount" if write_split_count else "")
+            + ("_zeroinactive" if zero_inactive_splits else "")
             + (f"_weu{waves_per_eu}" if waves_per_eu else "")
         ),
-        known_block_size=[QK_WAVES * 64, 1, 1],
+        known_block_size=[stage_block_threads, 1, 1],
     )
     def kernel(
         q_packed: fx.Pointer,
@@ -1107,13 +1166,29 @@ def _build_sparse_prefill_launcher(
     ):
         tid = fx.Int32(fx.thread_idx.x)
         task = fx.Int32(fx.block_idx.x)
+        wave = tid // fx.Int32(64)
+        lane = tid % fx.Int32(64)
+        lane_row = lane % fx.Int32(16)
+        lane_group = lane // fx.Int32(16)
+        local_head = wave * fx.Int32(16) + lane_row
         prefix_indptr_i32 = ptr_buf_tensor(prefix_indptr, fx.Int32)
+        if fx.const_expr(write_split_count):
+            split_counts_i32 = ptr_buf_tensor(partial_m, fx.Int32)
         if fx.const_expr(split_partial and implicit_split_tasks):
-            implicit_tokens = fx.Int32(fx.grid_dim.x) // fx.Int32(implicit_max_splits)
-            split = task // implicit_tokens
-            query = task % implicit_tokens
-            kv_start = fx.Int32(prefix_indptr_i32[query])
-            kv_len = fx.Int32(prefix_indptr_i32[query + 1]) - kv_start
+            implicit_units = fx.Int32(fx.grid_dim.x) // fx.Int32(implicit_max_splits)
+            split = task // implicit_units
+            unit = task % implicit_units
+            if fx.const_expr(stage_block_k == 16):
+                query = unit // fx.Int32(2)
+                head_block = unit % fx.Int32(2)
+                kv_query = query
+                head = head_block * fx.Int32(64) + local_head
+            else:
+                kv_query = unit
+                query = unit
+                head = wave * fx.Int32(16) + lane_row
+            kv_start = fx.Int32(prefix_indptr_i32[kv_query])
+            kv_len = fx.Int32(prefix_indptr_i32[kv_query + 1]) - kv_start
             num_tiles = (kv_len + fx.Int32(implicit_block_k - 1)) // fx.Int32(
                 implicit_block_k
             )
@@ -1127,7 +1202,46 @@ def _build_sparse_prefill_launcher(
             active_splits = (num_tiles + segment_tiles - fx.Int32(1)) // segment_tiles
             if active_splits > fx.Int32(implicit_max_splits):  # noqa: PLR1730
                 active_splits = fx.Int32(implicit_max_splits)
+            if fx.const_expr(write_split_count):
+                if split == fx.Int32(0):
+                    if fx.const_expr(stage_block_k == 16):
+                        if head_block == fx.Int32(0):
+                            if tid == fx.Int32(0):
+                                split_counts_i32[query] = active_splits
+                    else:
+                        if tid == fx.Int32(0):
+                            split_counts_i32[query] = active_splits
             if split >= active_splits:
+                if fx.const_expr(zero_inactive_splits):
+                    heads_per_cta = 64 if stage_block_k == 16 else 128
+                    head_start = (
+                        head_block * fx.Int32(64)
+                        if fx.const_expr(stage_block_k == 16)
+                        else fx.Int32(0)
+                    )
+                    partial_row = query * fx.Int32(implicit_max_splits) + split
+                    if tid < fx.Int32(heads_per_cta):
+                        ptr_buf_tensor(partial_l, fx.Float32)[
+                            partial_row * fx.Int32(QK_BLOCK_ROWS) + head_start + tid
+                        ] = fx.Float32(0.0)
+                    zero_values = fx.Vector.filled(8, 0.0, fx.Float16)
+                    zero_base = partial_row * fx.Int32(
+                        QK_BLOCK_ROWS * V4_DIM_QK
+                    ) + head_start * fx.Int32(V4_DIM_QK)
+                    zero_vectors_per_thread = (
+                        heads_per_cta * V4_DIM_QK // 8 // stage_block_threads
+                    )
+                    zero_step = fx.Int32(0)
+                    while zero_step < fx.Int32(zero_vectors_per_thread):
+                        zero_offset = (
+                            tid + zero_step * fx.Int32(stage_block_threads)
+                        ) * fx.Int32(8)
+                        GTensor(out, dtype=T.f16, shape=(-1,)).vec_store(
+                            (zero_base + zero_offset,),
+                            zero_values,
+                            vec_size=8,
+                        )
+                        zero_step = zero_step + fx.Int32(1)
                 return
             segment_rows = segment_tiles * fx.Int32(implicit_block_k)
             local_start = split * segment_rows
@@ -1144,13 +1258,10 @@ def _build_sparse_prefill_launcher(
             split_task_len_i32 = ptr_buf_tensor(split_task_len, fx.Int32)
             split_task_row_i32 = ptr_buf_tensor(split_task_row, fx.Int32)
             query = fx.Int32(split_task_query_i32[task])
+            head = wave * fx.Int32(16) + lane_row
         else:
             query = task
-        wave = tid // fx.Int32(64)
-        lane = tid % fx.Int32(64)
-        lane_row = lane % fx.Int32(16)
-        lane_group = lane // fx.Int32(16)
-        head = wave * fx.Int32(16) + lane_row
+            head = wave * fx.Int32(16) + lane_row
 
         q_i32 = GTensor(q_packed, dtype=T.i32, shape=(-1,))
         q_rope_i32 = GTensor(q_rope, dtype=T.i32, shape=(-1,))
@@ -1261,6 +1372,13 @@ def _build_sparse_prefill_launcher(
         mma_a = fx.make_rmem_tensor(8, fx.BFloat16)
         mma_b = fx.make_rmem_tensor(8, fx.BFloat16)
         mma_c = fx.make_rmem_tensor(4, fx.Float32)
+        pv_bf16_mma = fx.make_mma_atom(
+            fx.rocdl.MFMA(16, 16, stage_block_k, fx.BFloat16)
+        )
+        pv_operand_elems = stage_block_k // 4
+        pv_mma_a = fx.make_rmem_tensor(pv_operand_elems, fx.BFloat16)
+        pv_mma_b = fx.make_rmem_tensor(pv_operand_elems, fx.BFloat16)
+        pv_mma_c = fx.make_rmem_tensor(4, fx.Float32)
         output_acc = [
             fx.make_rmem_tensor(4, fx.Float32)
             for _ in fx.range_constexpr(PREFILL_D_PER_CTA // 16)
@@ -1294,6 +1412,9 @@ def _build_sparse_prefill_launcher(
             frag_a,
             frag_b,
             frag_c,
+            pv_frag_a,
+            pv_frag_b,
+            pv_frag_c,
             q_tensor,
             q_rope_tensor,
             assume_segment_full,
@@ -1304,7 +1425,7 @@ def _build_sparse_prefill_launcher(
                 def stage_tile(stage_slot, stage_offset, stage_valid, stage_is_full):
                     packed_slot_bytes = stage_slot * fx.Int32(packed_slot_dwords * 4)
                     rope_slot_bytes = stage_slot * fx.Int32(rope_slot_dwords * 4)
-                    valid_slot_base = stage_slot * fx.Int32(QK_BLOCK_COLS)
+                    valid_slot_base = stage_slot * fx.Int32(stage_block_k)
 
                     # Resolve all three gather indices first.  If an index load
                     # sits between two global_load_lds operations, LLVM emits
@@ -1314,8 +1435,8 @@ def _build_sparse_prefill_launcher(
                     packed_chunks_in_row = []
                     packed_source_rows = []
                     packed_row_valid = []
-                    for dma_pass in fx.range_constexpr(2):
-                        chunk = tid + fx.Int32(dma_pass * 512)
+                    for dma_pass in fx.range_constexpr(packed_dma_passes):
+                        chunk = tid + fx.Int32(dma_pass * stage_block_threads)
                         stage_row = chunk // fx.Int32(32)
                         chunk_in_row = chunk % fx.Int32(32)
                         logical_row = stage_offset + stage_row
@@ -1362,7 +1483,7 @@ def _build_sparse_prefill_launcher(
                     rope_stage_row = rope_chunk // fx.Int32(8)
                     rope_chunk_in_row = rope_chunk % fx.Int32(8)
                     rope_logical_row = stage_offset + rope_stage_row
-                    rope_active = wave < fx.Int32(4)
+                    rope_active = wave < fx.Int32(rope_wave_blocks)
                     if fx.const_expr(assume_segment_full):
                         rope_in_range = rope_active
                         rope_safe_logical_row = rope_active.select(
@@ -1381,7 +1502,9 @@ def _build_sparse_prefill_launcher(
                                 )
                     if fx.const_expr(broadcast_indices):
                         rope_source_row_seed = fx.Int32(0)
-                        if (wave < fx.Int32(4)) & (rope_chunk_in_row == fx.Int32(0)):
+                        if (wave < fx.Int32(rope_wave_blocks)) & (
+                            rope_chunk_in_row == fx.Int32(0)
+                        ):
                             rope_source_row_seed = fx.Int32(
                                 indices_i32[start + rope_safe_logical_row]
                             )
@@ -1410,16 +1533,16 @@ def _build_sparse_prefill_launcher(
                     # Two CTA-wide passes cover the 16 KiB packed tile.  The
                     # LDS address is wave-uniform; global_load_lds supplies the
                     # per-lane 16-byte destination stride implicitly.
-                    for dma_pass in fx.range_constexpr(2):
+                    for dma_pass in fx.range_constexpr(packed_dma_passes):
                         stage_row = packed_stage_rows[dma_pass]
                         chunk_in_row = packed_chunks_in_row[dma_pass]
                         if fx.const_expr(wave_padded_k):
                             packed_wave_offset = fx.Int32(
-                                (dma_pass * QK_WAVES) * raw_wave_stride_bytes
+                                (dma_pass * stage_waves) * raw_wave_stride_bytes
                             ) + wave * fx.Int32(raw_wave_stride_bytes)
                         else:
                             packed_wave_offset = fx.Int32(
-                                dma_pass * 512 * 16
+                                dma_pass * stage_block_threads * 16
                             ) + wave * fx.Int32(64 * 16)
                         dma_128(
                             source_div,
@@ -1437,7 +1560,7 @@ def _build_sparse_prefill_launcher(
                             ].select(fx.Int32(1), fx.Int32(0))
 
                     # Four waves cover the 4 KiB RoPE tile.
-                    if wave < fx.Int32(4):
+                    if wave < fx.Int32(rope_wave_blocks):
                         if fx.const_expr(wave_padded_k):
                             rope_wave_offset = wave * fx.Int32(raw_wave_stride_bytes)
                         else:
@@ -1456,7 +1579,7 @@ def _build_sparse_prefill_launcher(
                         fx.Int32(0),
                         fx.Int32(0),
                         valid_stage,
-                        length >= fx.Int32(QK_BLOCK_COLS),
+                        length >= fx.Int32(stage_block_k),
                     )
                     fx.rocdl.s_waitcnt(0)
                     fx.rocdl.sched_barrier(0)
@@ -1484,12 +1607,14 @@ def _build_sparse_prefill_launcher(
                         )
                     else:
                         p_read_base = (
-                            p_slot_base + head * pv_stride + lane_group * fx.Int32(8)
+                            p_slot_base
+                            + local_head * pv_stride
+                            + lane_group * fx.Int32(pv_operand_elems)
                         )
                     p_values = fx.Vector.from_elements(
                         [
                             fx.BFloat16(p_stage[p_read_base + fx.Int32(i)])
-                            for i in fx.range_constexpr(8)
+                            for i in fx.range_constexpr(pv_operand_elems)
                         ],
                         fx.BFloat16,
                     )
@@ -1518,15 +1643,38 @@ def _build_sparse_prefill_launcher(
                         frag_c.store(old * alpha)
                     else:
                         frag_c.store(old)
-                    fx.mma_atom_call(bf16_mma, frag_c, pv_frag_a, frag_b, frag_c)
+                    fx.mma_atom_call(pv_bf16_mma, frag_c, pv_frag_a, frag_b, frag_c)
                     output_acc[ds].store(fx.Vector(frag_c.load()))
 
-                source_k = lane_group * fx.Int32(8) + lane_row // fx.Int32(4)
+                source_k = lane_group * fx.Int32(
+                    pv_operand_elems
+                ) + lane_row // fx.Int32(4)
                 source_d = (lane_row % fx.Int32(4)) * fx.Int32(4)
                 v_address_base = v_lds_base + fx.Index(
                     v_slot_base + source_k * fx.Int32(v_stride) + source_d
                 ) * fx.Index(2)
-                if fx.const_expr(transpose_v and pairwise_pv):
+                if fx.const_expr(transpose_v and stage_block_k == 16):
+                    raw_v = _ds_read_b64_tr_b16_single_start(v_address_base, 0)
+                    for ds in fx.range_constexpr(PREFILL_D_PER_CTA // 16):
+                        if fx.const_expr(ds + 1 < PREFILL_D_PER_CTA // 16):
+                            ready_v, raw_v = _ds_read_b64_tr_b16_single_advance(
+                                v_address_base,
+                                (ds + 1) * 16 * 2,
+                                raw_v,
+                            )
+                        else:
+                            ready_v = _ds_read_b64_tr_b16_single_finish(raw_v)
+                        v_values = fx.Vector(ready_v).bitcast(fx.BFloat16)
+                        accumulate_pv(
+                            ds,
+                            v_values,
+                            pv_frag_b,
+                            pv_frag_c,
+                            pv_output_acc,
+                            alpha_vector,
+                            rescale_output,
+                        )
+                elif fx.const_expr(transpose_v and pairwise_pv):
                     raw_v_pair = _ds_read_b64_tr_b16_pair_start(
                         v_address_base, 0, 4 * v_stride * 2
                     )
@@ -1669,26 +1817,26 @@ def _build_sparse_prefill_launcher(
                             v_rope_values[i]
                         )
 
-            previous_p_values = fx.Vector.filled(8, 0.0, fx.BFloat16)
+            previous_p_values = fx.Vector.filled(pv_operand_elems, 0.0, fx.BFloat16)
             previous_high_scores = fx.Vector.filled(4, 0.0, fx.Float32)
             previous_low_sum = fx.Float32(0.0)
             while tile_offset < length:
                 tile_row = tid // fx.Int32(V_STAGE_THREADS_PER_ROW)
                 tile_dword = tid % fx.Int32(V_STAGE_THREADS_PER_ROW)
                 if fx.const_expr(rolling_pipeline):
-                    tile_index = tile_offset // fx.Int32(QK_BLOCK_COLS)
+                    tile_index = tile_offset // fx.Int32(stage_block_k)
                     stage_slot = tile_index & fx.Int32(1)
                     k_slot_base = stage_slot * fx.Int32(packed_slot_dwords)
                     rope_slot_base = stage_slot * fx.Int32(rope_slot_dwords)
-                    valid_slot_base = stage_slot * fx.Int32(QK_BLOCK_COLS)
-                    next_tile_offset = tile_offset + fx.Int32(QK_BLOCK_COLS)
+                    valid_slot_base = stage_slot * fx.Int32(stage_block_k)
+                    next_tile_offset = tile_offset + fx.Int32(stage_block_k)
                     has_next_tile = next_tile_offset < length
                     if has_next_tile:
                         stage_tile(
                             stage_slot ^ fx.Int32(1),
                             next_tile_offset,
                             valid_stage,
-                            next_tile_offset + fx.Int32(QK_BLOCK_COLS) <= length,
+                            next_tile_offset + fx.Int32(stage_block_k) <= length,
                         )
                 else:
                     k_slot_base = fx.Int32(0)
@@ -1774,7 +1922,7 @@ def _build_sparse_prefill_launcher(
                 packed_k_step_bases = []
                 packed_k_scale_bases = []
                 rope_k_row_bases = []
-                for nt in fx.range_constexpr(2):
+                for nt in fx.range_constexpr(stage_k_fragments):
                     k_row = fx.Int32(nt * 16) + lane_row
                     if fx.const_expr(wave_padded_k):
                         packed_row_base = (
@@ -1873,10 +2021,10 @@ def _build_sparse_prefill_launcher(
                 if fx.const_expr(reuse_q_across_n):
                     qk_acc = [
                         fx.Vector.filled(4, 0.0, fx.Float32).ir_value()
-                        for _ in fx.range_constexpr(2)
+                        for _ in fx.range_constexpr(stage_k_fragments)
                     ]
                     scale_k_values = []
-                    for nt in fx.range_constexpr(2):
+                    for nt in fx.range_constexpr(stage_k_fragments):
                         if fx.const_expr(permute_k_scales):
                             scale_k_values.append(
                                 _load_permuted_opsel_scales(
@@ -1900,7 +2048,7 @@ def _build_sparse_prefill_launcher(
                             )
                     for step in fx.range_constexpr(4):
                         q_operand = load_q_operand(step)
-                        for nt in fx.range_constexpr(2):
+                        for nt in fx.range_constexpr(stage_k_fragments):
                             k_operand = load_k_operand(nt, step)
                             qk_acc[nt] = fx.rocdl.mfma_scale_f32_16x16x128_f8f6f4(
                                 T.f32x4,
@@ -1918,16 +2066,16 @@ def _build_sparse_prefill_launcher(
                             )
                     for step in fx.range_constexpr(2):
                         q_values = load_q_rope(step)
-                        for nt in fx.range_constexpr(2):
+                        for nt in fx.range_constexpr(stage_k_fragments):
                             frag_c.store(fx.Vector(qk_acc[nt]))
                             frag_a.store(load_k_rope(nt, step))
                             frag_b.store(q_values)
                             fx.mma_atom_call(bf16_mma, frag_c, frag_a, frag_b, frag_c)
                             qk_acc[nt] = fx.Vector(frag_c.load()).ir_value()
-                    for nt in fx.range_constexpr(2):
+                    for nt in fx.range_constexpr(stage_k_fragments):
                         score_fragments.append(fx.Vector(qk_acc[nt]))
                 else:
-                    for nt in fx.range_constexpr(2):
+                    for nt in fx.range_constexpr(stage_k_fragments):
                         if fx.const_expr(permute_k_scales):
                             scale_k = _load_permuted_opsel_scales(
                                 k_stage,
@@ -1996,7 +2144,7 @@ def _build_sparse_prefill_launcher(
                         for i in fx.range_constexpr(4):
                             p_stage[
                                 previous_p_slot_base
-                                + head * pv_stride
+                                + local_head * pv_stride
                                 + previous_p_col
                                 + i
                             ] = previous_high_p[i].to(fx.BFloat16)
@@ -2022,7 +2170,7 @@ def _build_sparse_prefill_launcher(
                         if fx.const_expr(fixed_softmax_ref):
                             rescale_previous = False
                         elif fx.const_expr(rescale_once):
-                            rescale_previous = tile_offset == fx.Int32(QK_BLOCK_COLS)
+                            rescale_previous = tile_offset == fx.Int32(stage_block_k)
                         else:
                             rescale_previous = True
                         if fx.const_expr(not cluster_two):
@@ -2030,9 +2178,9 @@ def _build_sparse_prefill_launcher(
                                 stage_slot ^ fx.Int32(1),
                                 rescale_previous,
                                 previous_p_values,
-                                frag_a,
-                                frag_b,
-                                frag_c,
+                                pv_frag_a,
+                                pv_frag_b,
+                                pv_frag_c,
                                 output_acc,
                             )
                         else:
@@ -2040,9 +2188,9 @@ def _build_sparse_prefill_launcher(
                                 stage_slot ^ fx.Int32(1),
                                 False,
                                 previous_p_values,
-                                frag_a,
-                                frag_b,
-                                frag_c,
+                                pv_frag_a,
+                                pv_frag_b,
+                                pv_frag_c,
                                 output_acc,
                             )
                 if fx.const_expr(setprio):
@@ -2051,7 +2199,7 @@ def _build_sparse_prefill_launcher(
                 scaled_scores = []
                 if fx.const_expr(not fixed_softmax_ref):
                     tile_max = fx.Float32(-float("inf"))
-                for nt in fx.range_constexpr(2):
+                for nt in fx.range_constexpr(stage_k_fragments):
                     values = []
                     for i in fx.range_constexpr(4):
                         key = fx.Int32(nt * 16 + lane_group * 4 + i)
@@ -2060,7 +2208,7 @@ def _build_sparse_prefill_launcher(
                             if fx.const_expr(assume_segment_full):
                                 pass
                             elif fx.const_expr(full_tile_fastpath):
-                                if tile_offset + fx.Int32(QK_BLOCK_COLS) <= length:
+                                if tile_offset + fx.Int32(stage_block_k) <= length:
                                     pass
                                 else:
                                     score = (tile_offset + key < length).select(
@@ -2098,7 +2246,7 @@ def _build_sparse_prefill_launcher(
 
                 p_fragments = []
                 tile_sum = fx.Float32(0.0)
-                softmax_fragments = 1 if cluster_two else 2
+                softmax_fragments = 1 if cluster_two else stage_k_fragments
                 for nt in fx.range_constexpr(softmax_fragments):
                     values = []
                     for i in fx.range_constexpr(4):
@@ -2127,9 +2275,9 @@ def _build_sparse_prefill_launcher(
                         pass
                     elif fx.const_expr(rescale_once):
                         if rescale_current:
-                            alpha_stage[head] = alpha
+                            alpha_stage[local_head] = alpha
                     else:
-                        alpha_stage[head] = alpha
+                        alpha_stage[local_head] = alpha
                 elif fx.const_expr(alpha_bpermute):
                     alpha_values = []
                     for i in fx.range_constexpr(4):
@@ -2145,11 +2293,11 @@ def _build_sparse_prefill_launcher(
                         )
                     alpha_vector = fx.Vector.from_elements(alpha_values, fx.Float32)
                 else:
-                    alpha_stage[head] = alpha
+                    alpha_stage[local_head] = alpha
 
                 if fx.const_expr(rolling_pipeline and not register_p):
                     p_slot_base = stage_slot * fx.Int32(p_slot_elems)
-                    p_store_fragments = 1 if cluster_two else 2
+                    p_store_fragments = 1 if cluster_two else stage_k_fragments
                     for nt in fx.range_constexpr(p_store_fragments):
                         p_col = fx.Int32(nt * 16) + lane_group * fx.Int32(4)
                         if fx.const_expr(p_lane_layout):
@@ -2169,18 +2317,23 @@ def _build_sparse_prefill_launcher(
                                     fx.BFloat16
                                 )
                             else:
-                                p_stage[p_slot_base + head * pv_stride + p_col + i] = (
-                                    p_fragments[nt][i].to(fx.BFloat16)
-                                )
+                                p_stage[
+                                    p_slot_base + local_head * pv_stride + p_col + i
+                                ] = p_fragments[nt][i].to(fx.BFloat16)
                 else:
                     # Convert the two QK C-fragments into the K32 PV A-operand
                     # layout without an LDS round trip.  Destination lane
                     # groups 0/1 consume keys 0..15, groups 2/3 keys 16..31.
-                    source_lane0 = (lane_group & fx.Int32(1)) * fx.Int32(32) + lane_row
-                    source_lane1 = source_lane0 + fx.Int32(16)
-                    use_high_nt = lane_group >= fx.Int32(2)
                     p_values_f32 = []
-                    for source_lane in (source_lane0, source_lane1):
+                    if fx.const_expr(stage_block_k == 16):
+                        source_lanes = (lane_group * fx.Int32(16) + lane_row,)
+                    else:
+                        source_lane0 = (lane_group & fx.Int32(1)) * fx.Int32(
+                            32
+                        ) + lane_row
+                        source_lanes = (source_lane0, source_lane0 + fx.Int32(16))
+                        use_high_nt = lane_group >= fx.Int32(2)
+                    for source_lane in source_lanes:
                         for i in fx.range_constexpr(4):
                             source_byte = source_lane * fx.Int32(4)
                             p0 = fx.Float32(
@@ -2192,16 +2345,21 @@ def _build_sparse_prefill_launcher(
                                     )
                                 ).bitcast(fx.Float32)
                             )
-                            p1 = fx.Float32(
-                                fx.Int32(
-                                    fx.rocdl.ds_bpermute(
-                                        T.i32,
-                                        source_byte.ir_value(),
-                                        p_fragments[1][i].bitcast(fx.Int32).ir_value(),
-                                    )
-                                ).bitcast(fx.Float32)
-                            )
-                            p_values_f32.append(use_high_nt.select(p1, p0))
+                            if fx.const_expr(stage_block_k == 16):
+                                p_values_f32.append(p0)
+                            else:
+                                p1 = fx.Float32(
+                                    fx.Int32(
+                                        fx.rocdl.ds_bpermute(
+                                            T.i32,
+                                            source_byte.ir_value(),
+                                            p_fragments[1][i]
+                                            .bitcast(fx.Int32)
+                                            .ir_value(),
+                                        )
+                                    ).bitcast(fx.Float32)
+                                )
+                                p_values_f32.append(use_high_nt.select(p1, p0))
                     p_values = fx.Vector.from_elements(p_values_f32, fx.Float32).to(
                         fx.BFloat16
                     )
@@ -2224,7 +2382,7 @@ def _build_sparse_prefill_launcher(
                         fx.rocdl.s_barrier()
                 else:
                     fx.rocdl.s_barrier()
-                    frag_a.store(p_values)
+                    pv_frag_a.store(p_values)
                     out_row = wave * fx.Int32(16) + lane_group * fx.Int32(4)
                     for ds in fx.range_constexpr(PREFILL_D_PER_CTA // 16):
                         d_col = fx.Int32(ds * 16) + lane_row
@@ -2252,16 +2410,24 @@ def _build_sparse_prefill_launcher(
                                 ],
                                 fx.Float32,
                             )
-                        frag_b.store(v_values)
-                        frag_c.store(scaled_old)
-                        fx.mma_atom_call(bf16_mma, frag_c, frag_a, frag_b, frag_c)
-                        output_acc[ds].store(fx.Vector(frag_c.load()))
+                        pv_frag_b.store(v_values)
+                        pv_frag_c.store(scaled_old)
+                        fx.mma_atom_call(
+                            pv_bf16_mma,
+                            pv_frag_c,
+                            pv_frag_a,
+                            pv_frag_b,
+                            pv_frag_c,
+                        )
+                        output_acc[ds].store(fx.Vector(pv_frag_c.load()))
                     fx.rocdl.s_barrier()
-                tile_offset = tile_offset + fx.Int32(QK_BLOCK_COLS)
+                tile_offset = tile_offset + fx.Int32(stage_block_k)
 
             if fx.const_expr(rolling_pipeline):
                 if length > fx.Int32(0):
-                    last_slot = ((length - fx.Int32(1)) // fx.Int32(32)) & fx.Int32(1)
+                    last_slot = (
+                        (length - fx.Int32(1)) // fx.Int32(stage_block_k)
+                    ) & fx.Int32(1)
                     if fx.const_expr(cluster_two):
                         last_p_slot_base = last_slot * fx.Int32(p_slot_elems)
                         last_high_sum = fx.Float32(0.0)
@@ -2280,7 +2446,10 @@ def _build_sparse_prefill_launcher(
                         last_p_col = fx.Int32(16) + lane_group * fx.Int32(4)
                         for i in fx.range_constexpr(4):
                             p_stage[
-                                last_p_slot_base + head * pv_stride + last_p_col + i
+                                last_p_slot_base
+                                + local_head * pv_stride
+                                + last_p_col
+                                + i
                             ] = last_high_p[i].to(fx.BFloat16)
                         fx.rocdl.s_waitcnt(lgkmcnt=0)
                         fx.rocdl.sched_barrier(0)
@@ -2288,25 +2457,25 @@ def _build_sparse_prefill_launcher(
                             last_slot,
                             False,
                             previous_p_values,
-                            frag_a,
-                            frag_b,
-                            frag_c,
+                            pv_frag_a,
+                            pv_frag_b,
+                            pv_frag_c,
                             output_acc,
                         )
                     else:
                         if fx.const_expr(fixed_softmax_ref):
                             rescale_last = False
                         elif fx.const_expr(rescale_once):
-                            rescale_last = length <= fx.Int32(QK_BLOCK_COLS)
+                            rescale_last = length <= fx.Int32(stage_block_k)
                         else:
                             rescale_last = True
                         run_staged_pv(
                             last_slot,
                             rescale_last,
                             previous_p_values,
-                            frag_a,
-                            frag_b,
-                            frag_c,
+                            pv_frag_a,
+                            pv_frag_b,
+                            pv_frag_c,
                             output_acc,
                         )
                     fx.rocdl.s_barrier()
@@ -2343,6 +2512,9 @@ def _build_sparse_prefill_launcher(
                 mma_a,
                 mma_b,
                 mma_c,
+                pv_mma_a,
+                pv_mma_b,
+                pv_mma_c,
                 q_packed,
                 q_rope,
                 assume_segment_full,
@@ -2355,7 +2527,7 @@ def _build_sparse_prefill_launcher(
             prefix_start = fx.Int32(prefix_indptr_i32[query])
             prefix_len = fx.Int32(prefix_indptr_i32[query + 1]) - prefix_start
         if fx.const_expr(dynamic_full_prefix):
-            if (prefix_len & fx.Int32(QK_BLOCK_COLS - 1)) == fx.Int32(0):
+            if (prefix_len & fx.Int32(stage_block_k - 1)) == fx.Int32(0):
                 m_row, l_row = run_segment(
                     prefix_packed,
                     prefix_rope,
@@ -2410,7 +2582,8 @@ def _build_sparse_prefill_launcher(
                 assume_full_tiles,
             )
 
-        out_row = wave * fx.Int32(16) + lane_group * fx.Int32(4)
+        local_out_row = wave * fx.Int32(16) + lane_group * fx.Int32(4)
+        global_out_row = head - lane_row + lane_group * fx.Int32(4)
         if fx.const_expr(split_partial):
             if fx.const_expr(implicit_split_tasks):
                 partial_row = query * fx.Int32(implicit_max_splits) + split
@@ -2418,16 +2591,17 @@ def _build_sparse_prefill_launcher(
                 partial_row = fx.Int32(split_task_row_i32[task])
             if lane_group == fx.Int32(0):
                 partial_meta_offset = partial_row * QK_BLOCK_ROWS + head
-                partial_m_f32[partial_meta_offset] = m_row
+                if fx.const_expr(write_partial_m):
+                    partial_m_f32[partial_meta_offset] = m_row
                 partial_l_f32[partial_meta_offset] = l_row
             out_base = partial_row * QK_BLOCK_ROWS * V4_DIM_QK
             for ds in fx.range_constexpr(PREFILL_D_PER_CTA // 16):
                 values = fx.Vector(output_acc[ds].load())
                 out_col = fx.Int32(ds * 16) + lane_row
                 for i in fx.range_constexpr(4):
-                    out_f16[out_base + (out_row + i) * V4_DIM_QK + out_col] = values[
-                        i
-                    ].to(fx.Float16)
+                    out_f16[out_base + (global_out_row + i) * V4_DIM_QK + out_col] = (
+                        values[i].to(fx.Float16)
+                    )
         else:
             sink_log2 = fx.Float32(sink_f32[head]) * fx.Float32(LOG2E)
             final_m = fx.max(m_row, sink_log2)
@@ -2451,7 +2625,7 @@ def _build_sparse_prefill_launcher(
                     final_scale_values, fx.Float32
                 )
             else:
-                alpha_smem[head] = final_scale
+                alpha_smem[local_head] = final_scale
                 fx.rocdl.s_barrier()
 
             out_base = query * QK_BLOCK_ROWS * V4_DIM_QK
@@ -2462,8 +2636,8 @@ def _build_sparse_prefill_launcher(
                     if fx.const_expr(alpha_bpermute):
                         scale = fx.Float32(final_scale_vector[i])
                     else:
-                        scale = fx.Float32(alpha_smem[out_row + i])
-                    out_bf16[out_base + (out_row + i) * V4_DIM_QK + out_col] = (
+                        scale = fx.Float32(alpha_smem[local_out_row + i])
+                    out_bf16[out_base + (global_out_row + i) * V4_DIM_QK + out_col] = (
                         values[i] * scale
                     ).to(fx.BFloat16)
 
@@ -2513,7 +2687,7 @@ def _build_sparse_prefill_launcher(
             softmax_scale,
         ).launch(
             grid=(grid_x, 1, 1),
-            block=(QK_WAVES * 64, 1, 1),
+            block=(stage_block_threads, 1, 1),
             stream=stream,
             value_attrs=kernel_value_attrs,
         )
@@ -2839,6 +3013,9 @@ def sparse_attn_v4_paged_prefill_fp8_flydsl(
     implicit_split_short_max_tiles: int = 0,
     implicit_split_tiles_mid: int = 0,
     implicit_split_mid_max_tiles: int = 0,
+    write_partial_m: bool = True,
+    write_split_count: bool = False,
+    zero_inactive_splits: bool = False,
 ) -> torch.Tensor:
     """Run the benchmark-only H=128 FlyDSL sparse-prefill kernel.
 
@@ -2964,7 +3141,7 @@ def sparse_attn_v4_paged_prefill_fp8_flydsl(
         raise RuntimeError("implicit_split_tasks requires split_partial")
     if implicit_split_tasks and (
         implicit_max_splits <= 1
-        or implicit_block_k <= 0
+        or implicit_block_k not in (16, 32)
         or implicit_split_tiles <= 0
         or implicit_split_tiles_short < 0
         or implicit_split_short_max_tiles < 0
@@ -2972,7 +3149,6 @@ def sparse_attn_v4_paged_prefill_fp8_flydsl(
         or implicit_split_mid_max_tiles < 0
     ):
         raise RuntimeError("invalid implicit split-task configuration")
-
     split_tensors = (
         split_task_query,
         split_task_start,
@@ -2998,20 +3174,28 @@ def sparse_attn_v4_paged_prefill_fp8_flydsl(
                 raise RuntimeError("split task tensors must have matching lengths")
         if partial_m is None or partial_l is None:
             raise RuntimeError("split_partial requires partial_m and partial_l")
-        if (
-            partial_m.dtype != torch.float32
-            or partial_l.dtype != torch.float32
-            or partial_m.shape != partial_l.shape
-            or partial_m.ndim != 3
-            or partial_m.shape[0] != tokens
-            or partial_m.shape[2] != QK_BLOCK_ROWS
-            or not partial_m.is_contiguous()
-            or not partial_l.is_contiguous()
-        ):
+        valid_partial_l = (
+            partial_l.dtype == torch.float32
+            and partial_l.ndim == 3
+            and partial_l.shape[0] == tokens
+            and partial_l.shape[2] == QK_BLOCK_ROWS
+            and partial_l.is_contiguous()
+        )
+        valid_partial_m = (
+            partial_m.dtype == torch.int32
+            and partial_m.shape == (tokens,)
+            and partial_m.is_contiguous()
+            if write_split_count
+            else partial_m.dtype == torch.float32
+            and partial_m.shape == partial_l.shape
+            and partial_m.is_contiguous()
+        )
+        if not valid_partial_l or not valid_partial_m:
             raise RuntimeError(
-                "partial_m and partial_l must be contiguous float32 " "shape [T,S,128]"
+                "partial_l must be contiguous float32 shape [T,S,128]; "
+                "partial_m must match it unless write_split_count uses int32 [T]"
             )
-        partial_shape = (*partial_m.shape, V4_DIM_QK)
+        partial_shape = (*partial_l.shape, V4_DIM_QK)
         if out is None:
             out = torch.empty(
                 partial_shape, dtype=torch.float16, device=q_packed.device
@@ -3121,6 +3305,9 @@ def sparse_attn_v4_paged_prefill_fp8_flydsl(
                     int(implicit_split_short_max_tiles),
                     int(implicit_split_tiles_mid),
                     int(implicit_split_mid_max_tiles),
+                    bool(write_partial_m),
+                    bool(write_split_count),
+                    bool(zero_inactive_splits),
                     int(waves_per_eu),
                 ),
                 ptr_arg(q_packed),
@@ -3140,9 +3327,13 @@ def sparse_attn_v4_paged_prefill_fp8_flydsl(
                 ptr_arg(partial_l),
                 float(softmax_scale),
                 int(
-                    tokens * implicit_max_splits
-                    if implicit_split_tasks
-                    else split_tensors[0].numel() if split_partial else tokens
+                    tokens * 2 * implicit_max_splits
+                    if implicit_split_tasks and implicit_block_k == 16
+                    else (
+                        tokens * implicit_max_splits
+                        if implicit_split_tasks
+                        else split_tensors[0].numel() if split_partial else tokens
+                    )
                 ),
                 stream,
             )

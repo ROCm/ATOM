@@ -521,32 +521,11 @@ class TestV4NativeFp8Routing:
 
         assert v4_decode_query_group(min_q, max_q) == expected
 
-    def test_env_one_routes_native_fp8_to_triton(self, monkeypatch):
-        from atom.model_ops.v4_kernels import paged_decode, paged_decode_fp8_triton
-
-        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
-        monkeypatch.setenv("ATOM_V4_TRITON_HYBRID_DECODE", "0")
-        monkeypatch.setattr(
-            paged_decode_fp8_triton,
-            "sparse_attn_v4_paged_decode_fp8_triton_auto",
-            lambda *args, **kwargs: "triton",
-        )
-        monkeypatch.setattr(
-            paged_decode,
-            "_sparse_attn_v4_paged_decode_asm",
-            lambda *args, **kwargs: "aiter",
-        )
-        assert _call_v4_native_fp8_decode(paged_decode) == "triton"
-
-    def test_env_zero_routes_native_fp8_to_aiter(self, monkeypatch):
-        from atom.model_ops.v4_kernels import paged_decode, paged_decode_fp8_triton
+    def test_master_switch_zero_routes_native_fp8_to_aiter(self, monkeypatch):
+        from atom.model_ops.v4_kernels import paged_decode
 
         monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "0")
-        monkeypatch.setattr(
-            paged_decode_fp8_triton,
-            "sparse_attn_v4_paged_decode_fp8_triton_auto",
-            lambda *args, **kwargs: "triton",
-        )
+        monkeypatch.setenv("ATOM_V4_FLYDSL_FP8_DECODE", "1")
         monkeypatch.setattr(
             paged_decode,
             "_sparse_attn_v4_paged_decode_asm",
@@ -555,103 +534,14 @@ class TestV4NativeFp8Routing:
         assert _call_v4_native_fp8_decode(paged_decode) == "aiter"
 
     @pytest.mark.parametrize(
-        "tokens,heads,query_group,kv_kind,expected",
-        [
-            (7, 128, 7, "hca", "aiter"),
-            (63, 128, 7, "csa", "triton"),
-            (70, 128, 7, "csa", "triton"),
-            (84, 16, 7, "dspark", "triton"),
-            (64, 16, 4, "hca", "triton"),
-        ],
+        "requests",
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 16, 17, 18, 32],
     )
-    def test_hybrid_routes_only_measured_winners(
-        self,
-        monkeypatch,
-        tokens,
-        heads,
-        query_group,
-        kv_kind,
-        expected,
-    ):
-        from atom.model_ops.v4_kernels import paged_decode, paged_decode_fp8_triton
-
-        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
-        monkeypatch.setenv("ATOM_V4_TRITON_HYBRID_DECODE", "1")
-        monkeypatch.delenv("ATOM_V4_TRITON_NATIVE_BF16_V", raising=False)
-        monkeypatch.setattr(paged_decode, "_device_arch", lambda _index: "gfx950")
-        monkeypatch.setattr(
-            paged_decode_fp8_triton,
-            "sparse_attn_v4_paged_decode_fp8_triton_auto",
-            lambda *args, **kwargs: "triton",
-        )
-        monkeypatch.setattr(
-            paged_decode,
-            "_sparse_attn_v4_paged_decode_asm",
-            lambda *args, **kwargs: "aiter",
-        )
-        marker = object()
-        q_packed = SimpleNamespace(
-            shape=(tokens, heads, 512), device=SimpleNamespace(index=0)
-        )
-        result = paged_decode.sparse_attn_v4_paged_decode(
-            None,
-            marker,
-            marker,
-            marker,
-            marker,
-            1.0,
-            unified_kv_rope=marker,
-            q_packed_in=q_packed,
-            q_rope_in=marker,
-            qo_indptr=marker,
-            query_group=query_group,
-            kv_kind=kv_kind,
-        )
-        assert result == expected
-
-    def test_hybrid_routes_native_b6_hca_to_triton(self, monkeypatch):
-        from atom.model_ops.v4_kernels import paged_decode, paged_decode_fp8_triton
-
-        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
-        monkeypatch.setenv("ATOM_V4_TRITON_HYBRID_DECODE", "1")
-        monkeypatch.setenv("ATOM_V4_TRITON_NATIVE_BF16_V", "1")
-        monkeypatch.setattr(paged_decode, "_device_arch", lambda _index: "gfx950")
-        monkeypatch.setattr(
-            paged_decode_fp8_triton,
-            "sparse_attn_v4_paged_decode_fp8_triton_auto",
-            lambda *args, **kwargs: "triton",
-        )
-        monkeypatch.setattr(
-            paged_decode,
-            "_sparse_attn_v4_paged_decode_asm",
-            lambda *args, **kwargs: "aiter",
-        )
-        marker = object()
-        q_packed = SimpleNamespace(
-            shape=(6 * 7, 128, 512), device=SimpleNamespace(index=0)
-        )
-        result = paged_decode.sparse_attn_v4_paged_decode(
-            None,
-            marker,
-            marker,
-            marker,
-            marker,
-            1.0,
-            unified_kv_rope=marker,
-            q_packed_in=q_packed,
-            q_rope_in=marker,
-            qo_indptr=marker,
-            query_group=7,
-            kv_kind="hca",
-        )
-        assert result == "triton"
-
-    def test_b6_hca_routes_to_graphsafe_flydsl(self, monkeypatch):
+    def test_csa_b1_b32_routes_to_graphsafe_flydsl(self, monkeypatch, requests):
         from atom.model_ops.v4_kernels import paged_decode
 
         monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
-        monkeypatch.setenv("ATOM_V4_FLYDSL_FP8_DECODE", "1")
-        monkeypatch.setenv("ATOM_V4_TRITON_HYBRID_DECODE", "1")
+        monkeypatch.delenv("ATOM_V4_FLYDSL_FP8_DECODE", raising=False)
         monkeypatch.setattr(paged_decode, "_device_arch", lambda _index: "gfx950")
         monkeypatch.setitem(
             sys.modules,
@@ -666,6 +556,42 @@ class TestV4NativeFp8Routing:
             paged_decode,
             "_sparse_attn_v4_paged_decode_asm",
             lambda *args, **kwargs: "aiter",
+        )
+        marker = object()
+        q_packed = SimpleNamespace(
+            shape=(requests * 7, 128, 512), device=SimpleNamespace(index=0)
+        )
+        result = paged_decode.sparse_attn_v4_paged_decode(
+            None,
+            marker,
+            marker,
+            marker,
+            marker,
+            1.0,
+            unified_kv_rope=marker,
+            q_packed_in=q_packed,
+            q_rope_in=marker,
+            qo_indptr=marker,
+            empty_kv_indptr=marker,
+            query_group=7,
+            kv_kind="csa",
+        )
+        assert result == "flydsl"
+
+    def test_b6_hca_routes_to_graphsafe_flydsl(self, monkeypatch):
+        from atom.model_ops.v4_kernels import paged_decode
+
+        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
+        monkeypatch.setenv("ATOM_V4_FLYDSL_FP8_DECODE", "1")
+        monkeypatch.setattr(paged_decode, "_device_arch", lambda _index: "gfx950")
+        monkeypatch.setitem(
+            sys.modules,
+            "atom.model_ops.v4_kernels.paged_decode_fp8_flydsl",
+            SimpleNamespace(
+                sparse_attn_v4_paged_decode_fp8_flydsl_auto=(
+                    lambda *args, **kwargs: "flydsl"
+                )
+            ),
         )
         marker = object()
         q_packed = SimpleNamespace(
@@ -688,67 +614,39 @@ class TestV4NativeFp8Routing:
         )
         assert result == "flydsl"
 
-    def test_csa_b5_b32_routes_to_graphsafe_flydsl(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "tokens,heads,query_group,kv_kind,arch",
+        [
+            (33 * 7, 128, 7, "csa", "gfx950"),
+            (5 * 7, 128, 7, "hca", "gfx950"),
+            (6 * 7, 64, 7, "hca", "gfx950"),
+            (6 * 4, 128, 4, "hca", "gfx950"),
+            (6 * 7, 128, 7, "hca", "gfx1250"),
+        ],
+    )
+    def test_unqualified_native_fp8_shapes_fall_back_to_aiter(
+        self,
+        monkeypatch,
+        tokens,
+        heads,
+        query_group,
+        kv_kind,
+        arch,
+    ):
         from atom.model_ops.v4_kernels import paged_decode
 
         monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
-        monkeypatch.delenv("ATOM_V4_FLYDSL_FP8_DECODE", raising=False)
-        monkeypatch.setattr(paged_decode, "_device_arch", lambda _index: "gfx950")
-        monkeypatch.setitem(
-            sys.modules,
-            "atom.model_ops.v4_kernels.paged_decode_fp8_flydsl",
-            SimpleNamespace(
-                sparse_attn_v4_paged_decode_fp8_flydsl_auto=(
-                    lambda *args, **kwargs: "flydsl"
-                )
-            ),
-        )
-        marker = object()
-        for requests in (5, 6, 7, 8, 9, 10, 16, 17, 18, 32):
-            q_packed = SimpleNamespace(
-                shape=(requests * 7, 128, 512), device=SimpleNamespace(index=0)
-            )
-            result = paged_decode.sparse_attn_v4_paged_decode(
-                None,
-                marker,
-                marker,
-                marker,
-                marker,
-                1.0,
-                unified_kv_rope=marker,
-                q_packed_in=q_packed,
-                q_rope_in=marker,
-                qo_indptr=marker,
-                empty_kv_indptr=marker,
-                query_group=7,
-                kv_kind="csa",
-            )
-            assert result == "flydsl"
-
-    @pytest.mark.parametrize("requests", [4, 33])
-    def test_csa_outside_flydsl_envelope_keeps_triton(self, monkeypatch, requests):
-        from atom.model_ops.v4_kernels import paged_decode, paged_decode_fp8_triton
-
-        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
-        monkeypatch.delenv("ATOM_V4_FLYDSL_FP8_DECODE", raising=False)
-        monkeypatch.setattr(paged_decode, "_device_arch", lambda _index: "gfx950")
-        monkeypatch.setitem(
-            sys.modules,
-            "atom.model_ops.v4_kernels.paged_decode_fp8_flydsl",
-            SimpleNamespace(
-                sparse_attn_v4_paged_decode_fp8_flydsl_auto=(
-                    lambda *args, **kwargs: "flydsl"
-                )
-            ),
-        )
+        monkeypatch.setenv("ATOM_V4_FLYDSL_FP8_DECODE", "1")
+        monkeypatch.setattr(paged_decode, "_device_arch", lambda _index: arch)
+        monkeypatch.setattr(paged_decode, "get_gfx", lambda: "gfx950")
         monkeypatch.setattr(
-            paged_decode_fp8_triton,
-            "sparse_attn_v4_paged_decode_fp8_triton_auto",
-            lambda *args, **kwargs: "triton",
+            paged_decode,
+            "_sparse_attn_v4_paged_decode_asm",
+            lambda *args, **kwargs: "aiter",
         )
         marker = object()
         q_packed = SimpleNamespace(
-            shape=(requests * 7, 128, 512), device=SimpleNamespace(index=0)
+            shape=(tokens, heads, 512), device=SimpleNamespace(index=0)
         )
         result = paged_decode.sparse_attn_v4_paged_decode(
             None,
@@ -762,16 +660,16 @@ class TestV4NativeFp8Routing:
             q_rope_in=marker,
             qo_indptr=marker,
             empty_kv_indptr=marker,
-            query_group=7,
-            kv_kind="csa",
+            query_group=query_group,
+            kv_kind=kv_kind,
         )
-        assert result == "triton"
+        assert result == "aiter"
 
-    def test_flydsl_decode_master_zero_keeps_aiter(self, monkeypatch):
+    def test_flydsl_opt_out_routes_native_fp8_to_aiter(self, monkeypatch):
         from atom.model_ops.v4_kernels import paged_decode
 
-        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "0")
-        monkeypatch.setenv("ATOM_V4_FLYDSL_FP8_DECODE", "1")
+        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
+        monkeypatch.setenv("ATOM_V4_FLYDSL_FP8_DECODE", "0")
         monkeypatch.setattr(paged_decode, "_device_arch", lambda _index: "gfx950")
         monkeypatch.setattr(
             paged_decode,
@@ -800,26 +698,34 @@ class TestV4NativeFp8Routing:
         assert result == "aiter"
 
     @pytest.mark.parametrize(
-        "kv_kind,tokens,kv_len,expected",
+        "kv_kind,tokens,expected,block_k,head_group,waves,machine_sink,fixed",
         [
-            ("hca", 6 * 7, 2048, (13, 14, 10, 50, 11, 64)),
-            ("csa", 5 * 7, 384, (6, 6, 3, 20, 0, 0)),
-            ("csa", 6 * 7, 1152, (6, 6, 3, 20, 0, 0)),
-            ("csa", 7 * 7, 384, (6, 6, 4, 12, 0, 0)),
-            ("csa", 8 * 7, 1152, (6, 6, 4, 12, 0, 0)),
-            ("csa", 9 * 7, 640, (3, 8, 6, 12, 0, 0)),
-            ("csa", 10 * 7, 384, (3, 8, 6, 12, 0, 0)),
-            ("csa", 12 * 7, 1152, (3, 8, 6, 12, 0, 0)),
-            ("csa", 13 * 7, 384, (2, 9, 6, 12, 0, 0)),
-            ("csa", 16 * 7, 1152, (2, 9, 6, 12, 0, 0)),
-            ("csa", 17 * 7, 384, (2, 10, 6, 12, 0, 0)),
-            ("csa", 18 * 7, 1152, (2, 10, 6, 12, 0, 0)),
-            ("csa", 19 * 7, 384, (2, 9, 6, 12, 0, 0)),
-            ("csa", 32 * 7, 1152, (2, 9, 6, 12, 0, 0)),
+            ("hca", 6 * 7, (13, 14, 10, 50, 11, 64), 32, 8, 1, False, 0),
+            ("csa", 1 * 7, (15, 5, 2, 24, 3, 40), 16, 1, 1, True, 15),
+            ("csa", 2 * 7, (8, 9, 3, 24, 5, 40), 16, 1, 1, True, 8),
+            ("csa", 3 * 7, (8, 9, 3, 24, 5, 40), 16, 1, 1, True, 8),
+            ("csa", 4 * 7, (6, 12, 4, 24, 7, 40), 16, 1, 1, True, 6),
+            ("csa", 5 * 7, (6, 6, 3, 20, 0, 0), 32, 8, 0, False, 0),
+            ("csa", 6 * 7, (6, 6, 3, 20, 0, 0), 32, 8, 0, False, 0),
+            ("csa", 7 * 7, (6, 6, 4, 12, 0, 0), 32, 8, 1, False, 0),
+            ("csa", 8 * 7, (6, 6, 4, 12, 0, 0), 32, 8, 1, False, 0),
+            ("csa", 12 * 7, (3, 8, 6, 12, 0, 0), 32, 8, 1, False, 0),
+            ("csa", 16 * 7, (2, 9, 6, 12, 0, 0), 32, 8, 1, False, 0),
+            ("csa", 18 * 7, (2, 10, 6, 12, 0, 0), 32, 8, 1, False, 0),
+            ("csa", 32 * 7, (2, 9, 6, 12, 0, 0), 32, 8, 1, False, 0),
         ],
     )
     def test_flydsl_auto_selects_measured_schedule(
-        self, monkeypatch, kv_kind, tokens, kv_len, expected
+        self,
+        monkeypatch,
+        kv_kind,
+        tokens,
+        expected,
+        block_k,
+        head_group,
+        waves,
+        machine_sink,
+        fixed,
     ):
         from atom.model_ops.v4_kernels import paged_decode_fp8_flydsl as fp8
 
@@ -835,13 +741,12 @@ class TestV4NativeFp8Routing:
             candidate,
         )
         q_packed = SimpleNamespace(shape=(tokens, 128, 512))
-        kv_indices = SimpleNamespace(numel=lambda: tokens * kv_len)
         result = fp8.sparse_attn_v4_paged_decode_fp8_flydsl_auto(
             q_packed,
             object(),
             object(),
             object(),
-            kv_indices,
+            object(),
             object(),
             object(),
             object(),
@@ -858,728 +763,8 @@ class TestV4NativeFp8Routing:
             captured["split_tiles_mid"],
             captured["split_mid_max_tiles"],
         ) == expected
-        assert captured["waves_per_eu"] == (
-            0 if kv_kind == "csa" and tokens <= 6 * 7 else 1
-        )
-
-    def test_default_hybrid_does_not_route_other_architectures_to_aiter(
-        self, monkeypatch
-    ):
-        from atom.model_ops.v4_kernels import paged_decode, paged_decode_fp8_triton
-
-        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
-        monkeypatch.delenv("ATOM_V4_TRITON_HYBRID_DECODE", raising=False)
-        monkeypatch.setattr(paged_decode, "_device_arch", lambda _index: "gfx1250")
-        monkeypatch.setattr(
-            paged_decode_fp8_triton,
-            "sparse_attn_v4_paged_decode_fp8_triton_auto",
-            lambda *args, **kwargs: "triton",
-        )
-        monkeypatch.setattr(
-            paged_decode,
-            "_sparse_attn_v4_paged_decode_asm",
-            lambda *args, **kwargs: "aiter",
-        )
-        marker = object()
-        q_packed = SimpleNamespace(shape=(7, 128, 512), device=SimpleNamespace(index=0))
-        result = paged_decode.sparse_attn_v4_paged_decode(
-            None,
-            marker,
-            marker,
-            marker,
-            marker,
-            1.0,
-            unified_kv_rope=marker,
-            q_packed_in=q_packed,
-            q_rope_in=marker,
-            qo_indptr=marker,
-            query_group=7,
-            kv_kind="hca",
-        )
-        assert result == "triton"
-
-    @pytest.mark.parametrize("query_group", [1, 2, 3])
-    def test_only_supported_query_groups_use_query_fusion(
-        self, monkeypatch, query_group
-    ):
-        from atom.model_ops.v4_kernels import paged_decode_fp8_triton as fp8
-
-        calls = []
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton",
-            lambda *args, **kwargs: calls.append(("regular", kwargs)) or "regular",
-        )
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton_query_group",
-            lambda *args, **kwargs: (
-                calls.append(("query_group", kwargs)) or "query_group"
-            ),
-        )
-        q = SimpleNamespace(shape=(64, 16, 512))
-        result = fp8.sparse_attn_v4_paged_decode_fp8_triton_auto(
-            q,
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            1.0,
-            query_group=query_group,
-            kv_kind="csa",
-        )
-        assert result == "regular"
-        assert calls[0][0] == "regular"
-
-    @pytest.mark.parametrize(
-        "requests,expected",
-        [
-            (1, (16, 16)),
-            (2, (16, 16)),
-            (3, (32, 8)),
-            (5, (32, 8)),
-            (6, (16, 4)),
-            (12, (16, 4)),
-            (13, (16, 2)),
-            (24, (16, 2)),
-            (25, (16, 1)),
-        ],
-    )
-    def test_dspark_uses_short_window_tuned_dispatch(
-        self, monkeypatch, requests, expected
-    ):
-        from atom.model_ops.v4_kernels import paged_decode_fp8_triton as fp8
-
-        calls = []
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton",
-            lambda *args, **kwargs: calls.append(("regular", kwargs)) or "regular",
-        )
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton_query_group",
-            lambda *args, **kwargs: (
-                calls.append(("query_group", kwargs)) or "query_group"
-            ),
-        )
-        q = SimpleNamespace(shape=(requests * 6, 16, 512))
-        result = fp8.sparse_attn_v4_paged_decode_fp8_triton_auto(
-            q,
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            1.0,
-            kv_kind="dspark",
-        )
-        assert result == "regular"
-        _, kwargs = calls[0]
-        block_k, splits = expected
-        assert kwargs["block_h"] == 16
-        assert kwargs["block_k"] == block_k
-        assert kwargs["kv_splits"] == splits
-        assert kwargs["num_stages"] == 2
-        assert kwargs["matrix_instr_nonkdim"] == 16
-        assert kwargs["use_mxfp8_qk"] is True
-        assert kwargs["reduce_num_warps"] == 1
-        assert kwargs["fp16_partials"] is True
-
-    @pytest.mark.parametrize("tokens", [7, 14])
-    def test_q7_c1_c2_use_regular_split16(self, monkeypatch, tokens):
-        from atom.model_ops.v4_kernels import paged_decode_fp8_triton as fp8
-
-        calls = []
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton",
-            lambda *args, **kwargs: calls.append(("regular", kwargs)) or "regular",
-        )
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton_query_group",
-            lambda *args, **kwargs: (
-                calls.append(("query_group", kwargs)) or "query_group"
-            ),
-        )
-        q = SimpleNamespace(shape=(tokens, 16, 512))
-        result = fp8.sparse_attn_v4_paged_decode_fp8_triton_auto(
-            q,
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            1.0,
-            query_group=7,
-            kv_kind="hca",
-        )
-        assert result == "regular"
-        _, kwargs = calls[0]
-        assert kwargs["block_h"] == 16
-        assert kwargs["block_k"] == 16
-        assert kwargs["kv_splits"] == 16
-        assert kwargs["num_stages"] == 2
-        assert kwargs["num_warps"] == 4
-        assert kwargs["use_mxfp8_qk"] is True
-        assert kwargs["reduce_num_warps"] == 4
-        assert kwargs["fp16_partials"] is True
-
-    @pytest.mark.parametrize(
-        "tokens,expected_split",
-        [(28, 16), (56, 16), (112, 8)],
-    )
-    def test_q7_c4_plus_uses_four_query_stripes(
-        self,
-        monkeypatch,
-        tokens,
-        expected_split,
-    ):
-        from atom.model_ops.v4_kernels import paged_decode_fp8_triton as fp8
-
-        calls = []
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton",
-            lambda *args, **kwargs: calls.append(("regular", kwargs)) or "regular",
-        )
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton_query_group",
-            lambda *args, **kwargs: (
-                calls.append(("query_group", kwargs)) or "query_group"
-            ),
-        )
-        q = SimpleNamespace(shape=(tokens, 16, 512))
-        result = fp8.sparse_attn_v4_paged_decode_fp8_triton_auto(
-            q,
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            1.0,
-            query_group=7,
-            kv_kind="hca",
-        )
-        assert result == "query_group"
-        _, kwargs = calls[0]
-        assert kwargs["query_group"] == 7
-        assert kwargs["fused_query_group"] == 4
-        assert kwargs["block_k"] == 16
-        assert kwargs["kv_splits"] == expected_split
-        assert kwargs["num_stages"] == 2
-        assert kwargs["num_warps"] == 4
-        assert kwargs["use_mxfp8_qk"] is True
-        assert kwargs["reduce_num_warps"] == 1
-        assert kwargs["fp16_partials"] is True
-
-    @pytest.mark.parametrize(
-        "tokens,expected_split,expected_block_k,expected_stages",
-        [
-            (7, 16, 64, 1),
-            (14, 8, 32, 1),
-            (21, 4, 64, 1),
-            (28, 4, 64, 1),
-        ],
-    )
-    def test_q7_dp_hca_low_batch_uses_query_and_head_tiled_triton(
-        self,
-        monkeypatch,
-        tokens,
-        expected_split,
-        expected_block_k,
-        expected_stages,
-    ):
-        from atom.model_ops.v4_kernels import paged_decode_fp8_triton as fp8
-
-        calls = []
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton",
-            lambda *args, **kwargs: calls.append(("regular", kwargs)) or "regular",
-        )
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton_query_group",
-            lambda *args, **kwargs: (
-                calls.append(("query_group", kwargs)) or "query_group"
-            ),
-        )
-        q = SimpleNamespace(shape=(tokens, 128, 512))
-        result = fp8.sparse_attn_v4_paged_decode_fp8_triton_auto(
-            q,
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            1.0,
-            query_group=7,
-            kv_kind="hca",
-        )
-        assert result == "query_group"
-        _, kwargs = calls[0]
-        assert kwargs["query_group"] == 7
-        assert kwargs["fused_query_group"] == 4
-        assert kwargs["block_h"] == 16
-        assert kwargs["block_k"] == expected_block_k
-        assert kwargs["kv_splits"] == expected_split
-        assert kwargs["num_stages"] == expected_stages
-        assert kwargs["num_warps"] == 4
-        assert kwargs["waves_per_eu"] == 1
-        assert kwargs["matrix_instr_nonkdim"] == 0
-        assert kwargs["use_mxfp8_qk"] is True
-        assert kwargs.get("use_native_bf16_v", False) is False
-        assert kwargs["reduce_num_warps"] == 1
-        assert kwargs["fp16_partials"] is True
-
-    @pytest.mark.parametrize(
-        "requests,expected_splits",
-        [
-            (1, 16),
-            (2, 8),
-            (3, 8),
-            (4, 8),
-        ],
-    )
-    def test_q7_dp_hca_native_bf16_v_uses_regular_low_batch_kernel(
-        self, monkeypatch, requests, expected_splits
-    ):
-        from atom.model_ops.v4_kernels import paged_decode_fp8_triton as fp8
-
-        calls = []
-        monkeypatch.setattr(fp8, "_ENABLE_NATIVE_BF16_V", True)
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton",
-            lambda *args, **kwargs: calls.append(("regular", kwargs)) or "regular",
-        )
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton_query_group",
-            lambda *args, **kwargs: (
-                calls.append(("query_group", kwargs)) or "query_group"
-            ),
-        )
-        q = SimpleNamespace(shape=(requests * 7, 128, 512))
-        result = fp8.sparse_attn_v4_paged_decode_fp8_triton_auto(
-            q,
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            1.0,
-            query_group=7,
-            kv_kind="hca",
-        )
-        assert result == "regular"
-        _, kwargs = calls[0]
-        assert kwargs["block_h"] == 64
-        assert kwargs["block_k"] == 32
-        assert kwargs["kv_splits"] == expected_splits
-        assert kwargs["num_stages"] == 2
-        assert kwargs["num_warps"] == 4
-        assert kwargs["waves_per_eu"] == 1
-        assert kwargs["matrix_instr_nonkdim"] == 16
-        assert kwargs["use_mxfp8_qk"] is True
-        assert kwargs["use_native_bf16_v"] is True
-        assert kwargs["reduce_num_warps"] == 1
-        assert kwargs["fp16_partials"] is True
-
-    @pytest.mark.parametrize(
-        "requests,expected",
-        [
-            (5, (64, 8, 1, 0)),
-            (6, (32, 8, 2, 16)),
-            (7, (32, 2, 2, 16)),
-            (8, (32, 2, 2, 16)),
-            (9, (32, 2, 2, 16)),
-            (10, (32, 7, 2, 16)),
-            (11, (32, 3, 2, 16)),
-            (12, (32, 3, 2, 16)),
-            (13, (32, 4, 2, 16)),
-            (14, (32, 2, 2, 16)),
-            (16, (32, 2, 2, 16)),
-            (32, (32, 2, 2, 16)),
-        ],
-    )
-    def test_q7_dp_hca_b5_plus_uses_qh64_tuned_dispatch(
-        self, monkeypatch, requests, expected
-    ):
-        from atom.model_ops.v4_kernels import paged_decode_fp8_triton as fp8
-
-        calls = []
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton",
-            lambda *args, **kwargs: calls.append(("regular", kwargs)) or "regular",
-        )
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton_query_group",
-            lambda *args, **kwargs: (
-                calls.append(("query_group", kwargs)) or "query_group"
-            ),
-        )
-        q = SimpleNamespace(shape=(requests * 7, 128, 512))
-        result = fp8.sparse_attn_v4_paged_decode_fp8_triton_auto(
-            q,
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            1.0,
-            query_group=7,
-            kv_kind="hca",
-        )
-        assert result == "regular"
-        _, kwargs = calls[0]
-        block_k, splits, stages, matrix = expected
-        assert kwargs["block_h"] == 64
-        assert kwargs["block_k"] == block_k
-        assert kwargs["kv_splits"] == splits
-        assert kwargs["num_stages"] == stages
-        assert kwargs["matrix_instr_nonkdim"] == matrix
-        assert kwargs["use_mxfp8_qk"] is True
-        assert kwargs["use_native_bf16_v"] is False
-        assert kwargs["reduce_num_warps"] == 1
-        assert kwargs["fp16_partials"] is True
-
-    def test_q7_dp_hca_native_bf16_v_requires_explicit_opt_in(self, monkeypatch):
-        from atom.model_ops.v4_kernels import paged_decode_fp8_triton as fp8
-
-        calls = []
-        monkeypatch.setattr(fp8, "_ENABLE_NATIVE_BF16_V", True)
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton",
-            lambda *args, **kwargs: calls.append(kwargs) or "regular",
-        )
-        q = SimpleNamespace(shape=(5 * 7, 128, 512))
-        result = fp8.sparse_attn_v4_paged_decode_fp8_triton_auto(
-            q,
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            1.0,
-            query_group=7,
-            kv_kind="hca",
-        )
-        assert result == "regular"
-        assert calls[0]["use_native_bf16_v"] is True
-
-    @pytest.mark.parametrize(
-        "packed_uniform_splits,packed_query_group,split_tiles,error",
-        [
-            (-1, 7, 1, r"packed_uniform_splits must be in \[0, kv_splits\]"),
-            (5, 7, 1, r"packed_uniform_splits must be in \[0, kv_splits\]"),
-            (3, 0, 1, "requires packed_query_group and split_tiles"),
-            (3, 7, 0, "requires packed_query_group and split_tiles"),
-        ],
-    )
-    def test_packed_uniform_split_validation(
-        self,
-        packed_uniform_splits,
-        packed_query_group,
-        split_tiles,
-        error,
-    ):
-        from atom.model_ops.v4_kernels import paged_decode_fp8_triton as fp8
-
-        q_packed = SimpleNamespace(
-            dtype=fp8.dtypes.fp8,
-            shape=(7, 128, 512),
-            dim=lambda: 3,
-        )
-        q_rope = SimpleNamespace(dtype=fp8.torch.bfloat16, shape=(7, 128, 64))
-        kv_packed = SimpleNamespace(
-            dtype=fp8.dtypes.fp8,
-            shape=(16, 512),
-            dim=lambda: 2,
-        )
-        kv_rope = SimpleNamespace(dtype=fp8.torch.bfloat16, shape=(16, 64))
-
-        with pytest.raises(ValueError, match=error):
-            fp8.sparse_attn_v4_paged_decode_fp8_triton(
-                q_packed,
-                q_rope,
-                kv_packed,
-                kv_rope,
-                object(),
-                object(),
-                object(),
-                1.0,
-                kv_splits=4,
-                split_tiles=split_tiles,
-                packed_query_group=packed_query_group,
-                packed_uniform_splits=packed_uniform_splits,
-            )
-
-    def test_q7_dp_hca_native_bf16_v_b6_uses_packed_adaptive_split(self, monkeypatch):
-        from atom.model_ops.v4_kernels import paged_decode_fp8_triton as fp8
-
-        calls = []
-        monkeypatch.setattr(fp8, "_ENABLE_NATIVE_BF16_V", True)
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton",
-            lambda *args, **kwargs: calls.append(kwargs) or "regular",
-        )
-        q = SimpleNamespace(shape=(6 * 7, 128, 512))
-        result = fp8.sparse_attn_v4_paged_decode_fp8_triton_auto(
-            q,
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            1.0,
-            query_group=7,
-            kv_kind="hca",
-        )
-
-        assert result == "regular"
-        assert calls == [
-            {
-                "block_h": 64,
-                "block_k": 64,
-                "kv_splits": 11,
-                "num_stages": 2,
-                "num_warps": 4,
-                "waves_per_eu": 1,
-                "matrix_instr_nonkdim": 16,
-                "use_mxfp8_qk": True,
-                "use_native_bf16_v": True,
-                "split_tiles": 9,
-                "split_tiles_short": 7,
-                "split_short_max_tiles": 32,
-                "packed_query_group": 7,
-                "reduce_d_chunk": 512,
-                "reduce_num_warps": 1,
-                "fp16_partials": True,
-            }
-        ]
-
-    @pytest.mark.parametrize(
-        "requests,expected",
-        [
-            (1, (16, 16, 2, 16)),
-            (2, (16, 8, 2, 16)),
-            (3, (32, 4, 3, 16)),
-            (4, (32, 4, 3, 16)),
-            (5, (64, 4, 1, 0)),
-            (6, (32, 3, 3, 16)),
-            (7, (32, 2, 3, 16)),
-            (8, (32, 2, 3, 16)),
-            (9, (32, 2, 3, 16)),
-            (10, (64, 3, 2, 16)),
-            (11, (64, 3, 2, 16)),
-            (12, (64, 3, 2, 16)),
-            (13, (64, 1, 2, 16)),
-            (14, (64, 1, 2, 16)),
-            (16, (64, 1, 2, 16)),
-        ],
-    )
-    def test_q7_dp_csa_uses_qh64_tuned_dispatch(self, monkeypatch, requests, expected):
-        from atom.model_ops.v4_kernels import paged_decode_fp8_triton as fp8
-
-        calls = []
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton",
-            lambda *args, **kwargs: calls.append(("regular", kwargs)) or "regular",
-        )
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton_query_group",
-            lambda *args, **kwargs: (
-                calls.append(("query_group", kwargs)) or "query_group"
-            ),
-        )
-        q = SimpleNamespace(shape=(requests * 7, 128, 512))
-        result = fp8.sparse_attn_v4_paged_decode_fp8_triton_auto(
-            q,
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            1.0,
-            query_group=7,
-            kv_kind="csa",
-            gfx950_native_v=True,
-        )
-        assert result == "regular"
-        _, kwargs = calls[0]
-        block_k, splits, stages, matrix_nonkdim = expected
-        assert kwargs["block_h"] == 64
-        assert kwargs["block_k"] == block_k
-        assert kwargs["kv_splits"] == splits
-        assert kwargs["num_stages"] == stages
-        assert kwargs["matrix_instr_nonkdim"] == matrix_nonkdim
-        assert kwargs["use_mxfp8_qk"] is True
-        assert kwargs["use_native_bf16_v"] is (requests >= 10)
-        assert kwargs["schedule_hint"] == ("attention" if requests >= 10 else "none")
-        assert kwargs["fp16_partials"] is True
-
-    def test_c16_csa_uses_tuned_q4_split16(self, monkeypatch):
-        from atom.model_ops.v4_kernels import paged_decode_fp8_triton as fp8
-
-        calls = []
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton",
-            lambda *args, **kwargs: calls.append(("regular", kwargs)) or "regular",
-        )
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton_query_group",
-            lambda *args, **kwargs: (
-                calls.append(("query_group", kwargs)) or "query_group"
-            ),
-        )
-        q = SimpleNamespace(shape=(64, 16, 512))
-        result = fp8.sparse_attn_v4_paged_decode_fp8_triton_auto(
-            q,
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            1.0,
-            query_group=4,
-            kv_kind="csa",
-        )
-        assert result == "query_group"
-        _, kwargs = calls[0]
-        assert kwargs["query_group"] == 4
-        assert kwargs["kv_splits"] == 16
-        assert kwargs["matrix_instr_nonkdim"] == 16
-        assert kwargs["use_mxfp8_qk"] is False
-        assert kwargs["fp16_partials"] is True
-
-    def test_c16_hca_uses_tuned_regular_split4(self, monkeypatch):
-        from atom.model_ops.v4_kernels import paged_decode_fp8_triton as fp8
-
-        calls = []
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton",
-            lambda *args, **kwargs: calls.append(("regular", kwargs)) or "regular",
-        )
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton_query_group",
-            lambda *args, **kwargs: (
-                calls.append(("query_group", kwargs)) or "query_group"
-            ),
-        )
-        q = SimpleNamespace(shape=(64, 16, 512))
-        result = fp8.sparse_attn_v4_paged_decode_fp8_triton_auto(
-            q,
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            1.0,
-            query_group=4,
-            kv_kind="hca",
-        )
-        assert result == "regular"
-        _, kwargs = calls[0]
-        assert kwargs["block_h"] == 16
-        assert kwargs["block_k"] == 16
-        assert kwargs["kv_splits"] == 4
-        assert kwargs["num_stages"] == 3
-        assert kwargs["num_warps"] == 8
-        assert kwargs["fp16_partials"] is True
-
-    def test_c64_hca_uses_capture_safe_q4_fp16_partials(self, monkeypatch):
-        from atom.model_ops.v4_kernels import paged_decode_fp8_triton as fp8
-
-        calls = []
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton",
-            lambda *args, **kwargs: calls.append(("regular", kwargs)) or "regular",
-        )
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton_query_group",
-            lambda *args, **kwargs: (
-                calls.append(("query_group", kwargs)) or "query_group"
-            ),
-        )
-        q = SimpleNamespace(shape=(256, 16, 512))
-        result = fp8.sparse_attn_v4_paged_decode_fp8_triton_auto(
-            q,
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            1.0,
-            query_group=4,
-            kv_kind="hca",
-        )
-        assert result == "query_group"
-        _, kwargs = calls[0]
-        assert kwargs["query_group"] == 4
-        assert kwargs["kv_splits"] == 4
-        assert kwargs["block_k"] == 16
-        assert kwargs["num_stages"] == 3
-        assert kwargs["fp16_partials"] is True
-
-    @pytest.mark.parametrize("kv_kind", ["csa", "hca"])
-    def test_q4_dp_heads_use_regular_triton(self, monkeypatch, kv_kind):
-        from atom.model_ops.v4_kernels import paged_decode_fp8_triton as fp8
-
-        calls = []
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton",
-            lambda *args, **kwargs: calls.append(("regular", kwargs)) or "regular",
-        )
-        monkeypatch.setattr(
-            fp8,
-            "sparse_attn_v4_paged_decode_fp8_triton_query_group",
-            lambda *args, **kwargs: (
-                calls.append(("query_group", kwargs)) or "query_group"
-            ),
-        )
-        q = SimpleNamespace(shape=(256, 128, 512))
-        result = fp8.sparse_attn_v4_paged_decode_fp8_triton_auto(
-            q,
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            1.0,
-            query_group=4,
-            kv_kind=kv_kind,
-        )
-        assert result == "regular"
-        assert calls[0][0] == "regular"
+        assert captured["block_k"] == block_k
+        assert captured["reduce_head_group"] == head_group
+        assert captured["waves_per_eu"] == waves
+        assert captured["machine_sink"] is machine_sink
+        assert captured["fixed_reduce_splits"] == fixed

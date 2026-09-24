@@ -11,7 +11,7 @@ pytest.importorskip("aiter", reason="paged_decode imports the AITER runtime")
 
 from aiter.ops import mla_sparse_prefill
 
-from atom.model_ops.v4_kernels import paged_decode, paged_decode_fp8_triton
+from atom.model_ops.v4_kernels import paged_decode
 
 
 def _dispatch(
@@ -21,9 +21,8 @@ def _dispatch(
     heads: int = 128,
     gfx: str = "gfx1250",
     with_empty_indptr: bool = True,
-    use_triton: bool = False,
 ):
-    monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1" if use_triton else "0")
+    monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "0")
     monkeypatch.setenv("ATOM_USE_V4_PREFILL_ASM_FOR_DECODE", "1" if enabled else "0")
     monkeypatch.setattr(paged_decode, "get_gfx", lambda: gfx)
     monkeypatch.setattr(
@@ -36,12 +35,6 @@ def _dispatch(
         "_sparse_attn_v4_paged_decode_asm",
         lambda *args, **kwargs: "decode",
     )
-    monkeypatch.setattr(
-        paged_decode_fp8_triton,
-        "sparse_attn_v4_paged_decode_fp8_triton_auto",
-        lambda *args, **kwargs: "triton",
-    )
-
     n = 2
     return paged_decode.sparse_attn_v4_paged_decode(
         q=torch.empty((n, heads, 512)),
@@ -62,10 +55,6 @@ def _dispatch(
 
 def test_enabled_ep4_head128_uses_prefill_asm(monkeypatch):
     assert _dispatch(monkeypatch, enabled=True) == "prefill"
-
-
-def test_triton_dispatch_takes_priority_over_prefill_asm(monkeypatch):
-    assert _dispatch(monkeypatch, enabled=True, use_triton=True) == "triton"
 
 
 def test_decode_csr_becomes_prefix_and_extend_is_empty(monkeypatch):

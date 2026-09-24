@@ -82,7 +82,7 @@ _FP8_DTYPE = torch.float8_e4m3fnuz
 
 
 def v4_decode_query_group(min_seqlen_q: int, max_seqlen_q: int) -> int:
-    """Expose rectangular verify widths with a tuned Triton specialization.
+    """Expose rectangular verify widths with tuned native-FP8 specializations.
 
     Four-row verification uses the query-fused kernel, while DSpark K6 produces seven target
     rows and uses a q7-specific regular/striped launch policy. All ragged or
@@ -102,49 +102,6 @@ def _device_arch(device_index: int) -> str:
     ).split(":", 1)[0]
 
 
-def _use_triton_native_fp8_decode(
-    q_packed: torch.Tensor,
-    *,
-    query_group: int,
-    kv_kind: str,
-) -> bool:
-    """Select the native two-buffer FP8 decode backend at capture time.
-
-    On gfx950, the default hybrid policy keeps the Triton kernels only where
-    measurements beat the AITER assembly path. The native-V B6 HCA
-    specialization remains available as the matched Triton fallback; other
-    measured HCA shapes stay on AITER. DP CSA remains eligible for Triton when
-    it falls outside the qualified FlyDSL envelope.
-
-    The decision uses only captured tensor shapes, device architecture, and
-    layer kind, so it is safe for CUDA Graph replay.
-    ``ATOM_V4_TRITON_HYBRID_DECODE=0`` restores the all-Triton policy, while
-    ``ATOM_USE_TRITON_ATTN=0`` still forces AITER for every native FP8 decode
-    shape.
-    """
-    if os.environ.get("ATOM_USE_TRITON_ATTN", "1") != "1":
-        return False
-    if os.environ.get("ATOM_V4_TRITON_HYBRID_DECODE", "1") != "1":
-        return True
-
-    device_index = q_packed.device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    if _device_arch(device_index) != "gfx950":
-        return True
-
-    tokens, heads, _ = q_packed.shape
-    if heads == 128 and query_group == 7:
-        if kv_kind == "hca":
-            return (
-                tokens == 6 * query_group
-                and os.environ.get("ATOM_V4_TRITON_NATIVE_BF16_V", "0") == "1"
-            )
-        if kv_kind == "csa" and tokens % query_group == 0:
-            return True
-    return True
-
-
 def _use_flydsl_native_fp8_decode(
     q_packed: torch.Tensor,
     *,
@@ -153,10 +110,9 @@ def _use_flydsl_native_fp8_decode(
 ) -> bool:
     """Select the qualified gfx950 H128/q7 FlyDSL specializations.
 
-    The FlyDSL policy is enabled by default for measured winners and can be
-    disabled independently for matched Triton comparisons. The master Triton
-    attention switch still forces every native-FP8 attention call back to
-    AITER for matched A/B runs.
+    FlyDSL is the only native-FP8 custom decode backend. The legacy
+    ``ATOM_USE_TRITON_ATTN`` switch remains the attention master switch for
+    compatibility: setting it to zero routes native-FP8 decode to AITER/ASM.
     """
     if os.environ.get("ATOM_USE_TRITON_ATTN", "1") != "1":
         return False
@@ -173,7 +129,7 @@ def _use_flydsl_native_fp8_decode(
         return tokens == 6 * query_group
     if kv_kind == "csa":
         requests = tokens // query_group
-        return tokens % query_group == 0 and 5 <= requests <= 32
+        return tokens % query_group == 0 and 1 <= requests <= 32
     return False
 
 
@@ -1359,12 +1315,11 @@ def sparse_attn_v4_paged_decode(
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
     Native 2buff fp8 (``unified_kv_rope`` provided): measured gfx950 H128/q7
-    HCA B6 and CSA B5-B32 shapes use the graph-safe FlyDSL dispatcher unless
-    ``ATOM_V4_FLYDSL_FP8_DECODE=0``. Other qualified shapes route to Triton
-    when ``ATOM_USE_TRITON_ATTN=1``; measured hybrid losers route back to AITER.
-    Eligible gfx1250 H=128 shapes may reuse the sparse-prefill ASM kernel when
-    ``ATOM_USE_V4_PREFILL_ASM_FOR_DECODE=1``. All paths consume pre-packed fp8
-    Q and the fp8 NoPE + bf16 RoPE pools with no requant.
+    HCA B6 and CSA B1-B32 shapes use the graph-safe FlyDSL dispatcher. Other
+    shapes route to AITER, except eligible gfx1250 H=128 shapes may reuse the
+    sparse-prefill ASM kernel when ``ATOM_USE_V4_PREFILL_ASM_FOR_DECODE=1``.
+    All paths consume pre-packed fp8 Q and the fp8 NoPE + bf16 RoPE pools with
+    no requant.
 
     Otherwise (bf16): the existing Triton / reference path. When ``kv_scales``
     is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and is dequantized
@@ -1393,35 +1348,6 @@ def sparse_attn_v4_paged_decode(
                 softmax_scale,
                 query_group=query_group,
                 kv_kind=kv_kind,
-            )
-        if _use_triton_native_fp8_decode(
-            q_packed_in,
-            query_group=query_group,
-            kv_kind=kv_kind,
-        ):
-            from atom.model_ops.v4_kernels.paged_decode_fp8_triton import (
-                sparse_attn_v4_paged_decode_fp8_triton_auto,
-            )
-
-            device = getattr(q_packed_in, "device", None)
-            device_index = getattr(device, "index", None)
-            gfx950_native_v = False
-            if device is not None:
-                if device_index is None:
-                    device_index = torch.cuda.current_device()
-                gfx950_native_v = _device_arch(device_index) == "gfx950"
-            return sparse_attn_v4_paged_decode_fp8_triton_auto(
-                q_packed_in,
-                q_rope_in,
-                unified_kv,
-                unified_kv_rope,
-                kv_indices,
-                kv_indptr,
-                attn_sink,
-                softmax_scale,
-                query_group=query_group,
-                kv_kind=kv_kind,
-                gfx950_native_v=gfx950_native_v,
             )
         if (
             envs.ATOM_USE_V4_PREFILL_ASM_FOR_DECODE
