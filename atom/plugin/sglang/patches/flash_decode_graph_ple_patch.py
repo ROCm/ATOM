@@ -28,7 +28,9 @@ def apply_flash_decode_graph_ple_patch() -> None:
             if HybridLinearAttnBackend is not None:
                 break
         except (ImportError, AttributeError) as exc:
-            logger.debug("HybridLinearAttnBackend import failed (%s): %s", mod_name, exc)
+            logger.debug(
+                "HybridLinearAttnBackend import failed (%s): %s", mod_name, exc
+            )
             continue
     if HybridLinearAttnBackend is None:
         logger.debug("HybridLinearAttnBackend unavailable; skip Flash PLE patch")
