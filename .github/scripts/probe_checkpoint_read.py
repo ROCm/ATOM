@@ -47,6 +47,44 @@ def log(msg):
     print(f"[probe {time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def _read_first(*paths):
+    for path in paths:
+        try:
+            with open(path) as f:
+                return f.read().strip()
+        except OSError:
+            continue
+    return None
+
+
+def memory():
+    """This cgroup's limit and usage, and the host's available memory, in GiB."""
+
+    def gib(raw):
+        return round(int(raw) / GiB, 1) if raw and raw.isdigit() else raw
+
+    avail = None
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("MemAvailable:"):
+                avail = round(int(line.split()[1]) / 1024**2, 1)
+    return {
+        "cgroup_max": gib(
+            _read_first(
+                "/sys/fs/cgroup/memory.max",
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+            )
+        ),
+        "cgroup_current": gib(
+            _read_first(
+                "/sys/fs/cgroup/memory.current",
+                "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+            )
+        ),
+        "host_available": avail,
+    }
+
+
 def mount_of(path):
     """The /proc/self/mountinfo entry serving `path`: longest mount-point prefix."""
     real = os.path.realpath(path)
@@ -121,12 +159,16 @@ def _read_blocks(path, block, start=0, length=None):
 
 
 def pattern_whole_per_rank(files, ranks, **_):
-    """What CI does today: every rank `f.read()`s every shard, in the same order."""
+    """What CI does today: every rank reads every shard, in the same order.
+
+    The loader `f.read()`s a shard whole; this streams it through one reused
+    buffer instead -- the same sequential requests, without holding `ranks`
+    shard-sized copies in memory at once.
+    """
 
     def rank_loop():
         for path in files:
-            with open(path, "rb") as f:
-                f.read()
+            _read_blocks(path, 64 << 20)
 
     threads = [threading.Thread(target=rank_loop) for _ in range(ranks)]
     for t in threads:
@@ -214,6 +256,7 @@ def run_sweep(files, per_run, ranks):
             "gb_per_s": round(size / secs / 1e9, 3),
             "resident_before": round(before, 4),
             "resident_after": round(resident_fraction(subset), 4),
+            "memory": memory(),
         }
         log(json.dumps(row))
         results.append(row)
@@ -279,6 +322,7 @@ def run_load(model, files, label, env_over, server_args, log_dir, max_minutes, t
         "max_read_queue_s": max((p[0] for p in phases), default=None),
         "max_drain_s": max((p[1] for p in phases), default=None),
         "resident_before": round(before, 4),
+        "memory": memory(),
     }
     log(json.dumps(row))
     # The next launch needs the GPUs back; the workers are gone with the group.
@@ -286,76 +330,79 @@ def run_load(model, files, label, env_over, server_args, log_dir, max_minutes, t
     return row
 
 
+def _save(out, name, data):
+    with open(os.path.join(out, f"{name}.json"), "w") as f:
+        json.dump(data, f, indent=1)
+
+
+def _load_configs(out, tp):
+    """Loader configurations by label; `best` follows the sweep, if one ran."""
+    configs = {
+        "mmap_prefetch": {"ATOM_DISABLE_MMAP": "false"},
+        "disable_mmap": {"ATOM_DISABLE_MMAP": "true"},
+    }
+    try:
+        with open(os.path.join(out, "sweep.json")) as f:
+            sweep = json.load(f)
+    except OSError:
+        return configs
+    extents = [r for r in sweep if r["pattern"] == "extents"]
+    if extents:
+        best = max(extents, key=lambda r: r["gb_per_s"])
+        configs["mmap_prefetch_best"] = {
+            "ATOM_DISABLE_MMAP": "false",
+            "ATOM_LOADER_PREFETCH_THREADS": str(max(1, best["threads"] // tp)),
+            "ATOM_LOADER_PREFETCH_BLOCK_MB": str(best["block"]),
+        }
+    return configs
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("phase", choices=["info", "sweep", "load"])
     ap.add_argument("model")
+    ap.add_argument("--config", help="loader configuration label, for `load`")
+    ap.add_argument("--tag", help="suffix for this load's result file")
     ap.add_argument("--per-run", type=int, default=13)
     ap.add_argument("--out", default="probe_results")
     ap.add_argument("--load-minutes", type=int, default=45)
-    ap.add_argument("--skip-sweep", action="store_true")
-    ap.add_argument("--skip-load", action="store_true")
     ap.add_argument("--tp", type=int, default=8)
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
     files = sorted(glob.glob(os.path.join(args.model, "*.safetensors")))
-    total = sum(os.path.getsize(p) for p in files)
-    info = {
-        "model": args.model,
-        "shards": len(files),
-        "gib": round(total / GiB, 1),
-        "mount": mount_of(args.model),
-        "nproc": os.cpu_count(),
-        "meminfo": subprocess.run(
-            ["free", "-g"], capture_output=True, text=True, check=False
-        ).stdout,
-    }
-    log(json.dumps(info, indent=1))
-    probe_evict = evict(files[:2])
-    log(f"eviction self-check: resident after DONTNEED = {probe_evict:.4f}")
 
-    results = {"info": info, "sweep": [], "load": []}
-    if not args.skip_sweep:
-        results["sweep"] = run_sweep(files, args.per_run, args.tp)
-
-    if not args.skip_load:
-        server_args = ["--kv_cache_dtype", "fp8", "-tp", str(args.tp)]
-        configs = [
-            ("mmap_prefetch4", {"ATOM_DISABLE_MMAP": "false"}),
-            ("disable_mmap", {"ATOM_DISABLE_MMAP": "true"}),
-            ("mmap_prefetch4_again", {"ATOM_DISABLE_MMAP": "false"}),
-        ]
-        streams = [r for r in results["sweep"] if r["pattern"] == "extents"]
-        if streams:
-            best = max(streams, key=lambda r: r["gb_per_s"])
-            per_rank = max(1, best["threads"] // args.tp)
-            if per_rank != 4:
-                configs.append(
-                    (
-                        f"mmap_prefetch{per_rank}",
-                        {
-                            "ATOM_DISABLE_MMAP": "false",
-                            "ATOM_LOADER_PREFETCH_THREADS": str(per_rank),
-                            "ATOM_LOADER_PREFETCH_BLOCK_MB": str(best["block"]),
-                        },
-                    )
-                )
-        for label, env_over in configs:
-            results["load"].append(
-                run_load(
-                    args.model,
-                    files,
-                    label,
-                    env_over,
-                    server_args,
-                    args.out,
-                    args.load_minutes,
-                    args.tp,
-                )
-            )
-
-    with open(os.path.join(args.out, "results.json"), "w") as f:
-        json.dump(results, f, indent=1)
+    if args.phase == "info":
+        info = {
+            "model": args.model,
+            "shards": len(files),
+            "gib": round(sum(os.path.getsize(p) for p in files) / GiB, 1),
+            "mount": mount_of(args.model),
+            "nproc": os.cpu_count(),
+            "memory": memory(),
+            "eviction_self_check": evict(files[:2]),
+        }
+        log(json.dumps(info, indent=1))
+        _save(args.out, "info", info)
+    elif args.phase == "sweep":
+        _save(args.out, "sweep", run_sweep(files, args.per_run, args.tp))
+    else:
+        configs = _load_configs(args.out, args.tp)
+        if args.config not in configs:
+            log(f"no configuration {args.config!r}; have {sorted(configs)}")
+            return
+        label = args.config + (f"_{args.tag}" if args.tag else "")
+        row = run_load(
+            args.model,
+            files,
+            label,
+            configs[args.config],
+            ["--kv_cache_dtype", "fp8", "-tp", str(args.tp)],
+            args.out,
+            args.load_minutes,
+            args.tp,
+        )
+        _save(args.out, f"load_{label}", row)
     log("done")
 
 

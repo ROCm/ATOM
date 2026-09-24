@@ -52,6 +52,8 @@ jobs:
           grep -E " (nfs|nfs4|cifs|lustre|fuse[^ ]*|ceph) " /proc/mounts || true
           free -g
           nproc
+          echo "runner cgroup memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null) current=$(cat /sys/fs/cgroup/memory.current 2>/dev/null)"
+          docker info --format 'docker root={{.DockerRootDir}} cgroup={{.CgroupVersion}} mem={{.MemTotal}}' || true
 
       - name: Install ATOM
         run: |
@@ -63,22 +65,48 @@ jobs:
             test -f $MODEL_PATH/config.json
           "
 
-      - name: Run probe
-        timeout-minutes: 220
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc "
-            cd /workspace
-            python3 .github/scripts/probe_checkpoint_read.py $MODEL_PATH --out /workspace/probe_results
-          " 2>&1 | tee probe.log
+      # One step per measurement: a step's log is kept once it completes, so a
+      # runner lost mid-probe still leaves everything before it readable.
+      - name: Probe info
+        run: docker exec "$CONTAINER_NAME" python3 .github/scripts/probe_checkpoint_read.py info "$MODEL_PATH"
+
+      - name: Probe sweep
+        timeout-minutes: 60
+        run: docker exec "$CONTAINER_NAME" python3 .github/scripts/probe_checkpoint_read.py sweep "$MODEL_PATH"
+
+      - name: Upload sweep
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ckpt-read-probe-sweep-${{ github.run_id }}
+          path: probe_results/
+
+      - name: Load mmap_prefetch (1)
+        if: always()
+        timeout-minutes: 50
+        run: docker exec "$CONTAINER_NAME" python3 .github/scripts/probe_checkpoint_read.py load "$MODEL_PATH" --config mmap_prefetch --tag 1
+
+      - name: Load disable_mmap
+        if: always()
+        timeout-minutes: 50
+        run: docker exec "$CONTAINER_NAME" python3 .github/scripts/probe_checkpoint_read.py load "$MODEL_PATH" --config disable_mmap
+
+      - name: Load mmap_prefetch (2)
+        if: always()
+        timeout-minutes: 50
+        run: docker exec "$CONTAINER_NAME" python3 .github/scripts/probe_checkpoint_read.py load "$MODEL_PATH" --config mmap_prefetch --tag 2
+
+      - name: Load mmap_prefetch_best
+        if: always()
+        timeout-minutes: 50
+        run: docker exec "$CONTAINER_NAME" python3 .github/scripts/probe_checkpoint_read.py load "$MODEL_PATH" --config mmap_prefetch_best
 
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: ckpt-read-probe-${{ github.run_id }}
-          path: |
-            probe.log
-            probe_results/
+          path: probe_results/
 
       - name: Clean up
         if: always()
