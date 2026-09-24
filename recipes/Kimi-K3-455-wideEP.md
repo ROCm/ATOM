@@ -185,22 +185,18 @@ sudo rm -f /dev/shm/psm_* /dev/shm/nccl-*
 
 ---
 
-## Two upstream changes this configuration needs
+## One upstream change this configuration needs
 
-Both are being upstreamed; until they land, this recipe assumes a build that has
-them.
+**`ATOM_UNFUSED_GATHER_KV_B_PROJ=1`** — an unfused torch fallback for
+`gather_kv_b_proj`. On gfx1250 the fused Triton kernel cannot be compiled for
+the shapes a *chunked* prefill produces; Triton emits a PHI node with mismatched
+operand types and LLVM asserts
+(`PHINode::setIncomingValue: getType() == V->getType()`), aborting the process.
+FlyDSL is not an alternative — it is gfx950-only. The fallback does not
+implement the shuffled-KV layout, hence `ATOM_USE_TRITON_MLA_SHUFFLE_KV=0`.
 
-1. **`--cudagraph-mode FULL_DECODE_ONLY`** — `CUDAGraphMode` has always defined
-   it, but the CLI whitelist omitted it. It is not optional here: see
-   [KV budget](#kv-budget) below.
-2. **`ATOM_UNFUSED_GATHER_KV_B_PROJ=1`** — an unfused torch fallback for
-   `gather_kv_b_proj`. On gfx1250 the fused Triton kernel cannot be compiled for
-   the shapes a *chunked* prefill produces; Triton emits a PHI node with
-   mismatched operand types and LLVM asserts
-   (`PHINode::setIncomingValue: getType() == V->getType()`), aborting the
-   process. FlyDSL is not an alternative — it is gfx950-only.
-   The fallback does not implement the shuffled-KV layout, hence
-   `ATOM_USE_TRITON_MLA_SHUFFLE_KV=0`.
+This is being upstreamed; until it lands, this recipe assumes a build that has
+it.
 
 ---
 
@@ -226,13 +222,17 @@ python3 -m atom.entrypoints.openai_server \
   --data-parallel-master-port 29500 --data-parallel-base-port 29700 \
   --enable-expert-parallel --enable-dp-attention \
   --kv_cache_dtype fp8 --index-cache-dtype fp8 \
-  --cudagraph-mode FULL_DECODE_ONLY \
+  --cudagraph-mode FULL \
   --max-num-seqs 8 \
   --max-num-batched-tokens 2048 \
   --gpu-memory-utilization 0.90 \
   --no-enable_prefix_caching \
   --disable_uvicorn_access_log
 ```
+
+> The validated run above was launched with `--cudagraph-mode FULL_DECODE_ONLY`
+> rather than `FULL`. On the native engine the two are equivalent (see
+> [KV budget](#kv-budget)), and `FULL` is the default, so the recipe uses it.
 
 Do **not** set `--max-model-len`; let ATOM use the model's own
 `max_position_embeddings` (1048576). Confirm `'max_model_len': None` in the log.
@@ -305,11 +305,21 @@ grep 'Memory budget' <log> | tail -1     # available_for_kv must be positive
 grep -oE 'experts=[0-9]+' <log> | sort -u  # EP16 -> 56
 ```
 
-With `--cudagraph-mode FULL` and the default `--max-num-batched-tokens 16384`,
-the cudagraph pool and activation estimate grow to ~77 GB and `available_for_kv`
-goes to about **−33 GB**, so the server never starts. `FULL_DECODE_ONLY` plus
-`--max-num-batched-tokens 2048` is what makes it positive: prefill runs eager,
-so the memory profile is taken on a decode-shaped forward.
+With the default `--max-num-batched-tokens 16384`, `peak_torch` and the
+cudagraph estimate together reach ~77 GB and `available_for_kv` goes to about
+**−33 GB**, so the server never starts. **`--max-num-batched-tokens 2048` is the
+lever**: the profile run is what sets `peak_torch`, and
+`_estimate_cudagraph_overhead()` derives the pool estimate from that same
+allocator high-water mark, so shrinking the profile batch shrinks both terms.
+
+`--cudagraph-mode` is *not* a second lever here, despite appearances. ATOM's
+manual capture is already decode-only by construction — `capture_cudagraph()`
+iterates `max_schedulable_decode_bs(...)` and prefill never replays a graph — and
+nothing in the native runtime calls `mixed_mode()`, which is the only predicate
+where `FULL` and `FULL_DECODE_ONLY` differ. The two are interchangeable on this
+path, so this recipe uses the default `FULL`. (`FULL_DECODE_ONLY` *is* honored
+when ATOM runs as a vLLM plugin backend, where vLLM's own runner reads
+`mixed_mode()`.)
 
 ---
 
@@ -402,7 +412,7 @@ max_tokens=3500  -> content='...#### 72'  finish_reason=stop
 | Every token is `!`, service otherwise perfect | Translation not in effect — B0 silicon running A0 kernels. See the top of this page. Most common failure by a wide margin |
 | `FAIL: HOTSWAP=1 but /app/rjprefix not found` | The prefix is not in the container. Re-install it; `docker rm` removes it. **Do not "fix" this with `HOTSWAP=0`** |
 | First decode request SIGABRTs, silently | `ATOM_USE_TRITON_MLA=1` not set |
-| `available_for_kv` negative, server never starts | Needs `--cudagraph-mode FULL_DECODE_ONLY` and `--max-num-batched-tokens 2048` |
+| `available_for_kv` negative, server never starts | Lower `--max-num-batched-tokens` (2048 here). `--cudagraph-mode` does not affect this on the native engine — see [KV budget](#kv-budget) |
 | LLVM PHI assertion on long input at concurrency | Triton `gather_kv_b_proj` codegen; set `ATOM_UNFUSED_GATHER_KV_B_PROJ=1` |
 | `assert not ca_comm.disabled` kills the ModelRunner while HTTP stays up | `ATOM_USE_CUSTOM_ALL_GATHER` and `AITER_CUSTOM_AR_USE_SYMM_MEM` must be set together |
 | MoE GUGU layout error | `ATOM_MOE_GU_ITLV=1` |
