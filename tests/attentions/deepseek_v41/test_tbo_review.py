@@ -7,6 +7,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+pytest.importorskip("aiter", reason="V4.1 metadata requires the AITER runtime")
+
 from atom.model_ops.engram.device.staging import EngramStagedRows, EngramStaging
 from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import Context, ForwardContext, _forward_context_local
