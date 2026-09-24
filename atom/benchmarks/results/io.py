@@ -87,7 +87,9 @@ def iter_jsonl(path):
             try:
                 row = json.loads(line, parse_constant=_invalid_constant)
                 if not isinstance(row, dict):
-                    raise ValueError("record must be an object")  # noqa: TRY004 - invalid file format
+                    raise ValueError(  # noqa: TRY004 - invalid file format
+                        "record must be an object"
+                    )
                 yield row
             except (ValueError, TypeError) as exc:
                 raise ValueError(f"{path.name}:{line_number}: {exc}") from exc
@@ -99,7 +101,9 @@ class JsonlWriter:
     def __init__(self, path):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.file = open(path, "w", encoding="utf-8", buffering=64 * 1024)  # noqa: SIM115 - closed by recorder lifecycle
+        self.file = open(  # noqa: SIM115 - closed by recorder lifecycle
+            path, "w", encoding="utf-8", buffering=64 * 1024
+        )
         self.next_flush = time.monotonic() + 1
 
     def write(self, row):

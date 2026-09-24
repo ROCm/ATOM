@@ -64,11 +64,11 @@ def from_aiperf(row, index):
         "parent_id": meta.get("parent_correlation_id") or meta.get("parent_session_id"),
         "turn_index": meta.get("turn_index"),
         "phase": meta.get("benchmark_phase", "unknown"),
-        "status": "cancelled"
-        if meta.get("was_cancelled")
-        else "error"
-        if error
-        else "success",
+        "status": (
+            "cancelled"
+            if meta.get("was_cancelled")
+            else "error" if error else "success"
+        ),
         "error": error,
         "start_ns": timestamp(meta.get("request_start_ns")),
         "end_ns": timestamp(meta.get("request_end_ns")),
@@ -173,13 +173,15 @@ class RequestRecorder:
                     ),
                     "ttft_s": ttft,
                     "harness_ttft_s": output.ttft,
-                    "first_content_ns": str(output.first_content_ns)
-                    if getattr(output, "first_content_ns", None)
-                    else None,
+                    "first_content_ns": (
+                        str(output.first_content_ns)
+                        if getattr(output, "first_content_ns", None)
+                        else None
+                    ),
                     "e2el_s": full_duration or output.latency,
-                    "full_decode_duration_s": full_duration - ttft
-                    if full_duration is not None
-                    else None,
+                    "full_decode_duration_s": (
+                        full_duration - ttft if full_duration is not None else None
+                    ),
                     "harness_e2el_s": output.latency,
                     "output_tokens": tokens,
                     "token_count_source": token_source,

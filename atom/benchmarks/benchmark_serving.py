@@ -584,9 +584,13 @@ async def benchmark(
 
     async def limited_request_func(request_func_input, pbar):
         if semaphore is None:
-            return await measured_request(request_func_input=request_func_input, pbar=pbar)
+            return await measured_request(
+                request_func_input=request_func_input, pbar=pbar
+            )
         async with semaphore:
-            return await measured_request(request_func_input=request_func_input, pbar=pbar)
+            return await measured_request(
+                request_func_input=request_func_input, pbar=pbar
+            )
 
     print("Starting main benchmark run...")
 

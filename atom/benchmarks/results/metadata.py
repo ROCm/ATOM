@@ -253,12 +253,14 @@ def capture_config(model, server_argv, kind, concurrency, launch=None):
             "concurrency": concurrency,
             "isl": int(os.environ.get("ISL", "0")) if kind == "random" else None,
             "osl": int(os.environ.get("OSL", "0")) if kind == "random" else None,
-            "range_ratio": os.environ.get("RANDOM_RANGE_RATIO")
-            if kind == "random"
-            else None,
-            "dataset": os.environ.get("AIPERF_PUBLIC_DATASET")
-            if kind == "agentic"
-            else "random",
+            "range_ratio": (
+                os.environ.get("RANDOM_RANGE_RATIO") if kind == "random" else None
+            ),
+            "dataset": (
+                os.environ.get("AIPERF_PUBLIC_DATASET")
+                if kind == "agentic"
+                else "random"
+            ),
             "dataset_revision": os.environ.get("AIPERF_DATASET_REVISION"),
             "duration_s": os.environ.get("AIPERF_BENCHMARK_DURATION"),
             "warmup_requests_per_lane": os.environ.get(

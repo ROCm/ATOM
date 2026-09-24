@@ -367,11 +367,11 @@ def build_bundle(
             "compatibility_commit": COMPATIBILITY_COMMIT,
             "curve_group_id": summary["curve_group_id"],
             "config_id": fingerprint(config),
-            "status": "failed"
-            if exit_code or not counts.get("profiled_success")
-            else "complete"
-            if not missing
-            else "partial",
+            "status": (
+                "failed"
+                if exit_code or not counts.get("profiled_success")
+                else "complete" if not missing else "partial"
+            ),
             "capabilities": summary["capabilities"],
             "files": {},
         }
@@ -421,7 +421,9 @@ def verify_bundle(root, summary_only=False):
         raise ValueError("Unsupported bundle schema")
     files = manifest.get("files")
     if not isinstance(files, dict):
-        raise ValueError("Missing file manifest")  # noqa: TRY004 - invalid bundle format
+        raise ValueError(  # noqa: TRY004 - invalid bundle format
+            "Missing file manifest"
+        )
     required = {
         "config.json",
         "summary.json",

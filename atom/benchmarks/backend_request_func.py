@@ -7,7 +7,7 @@ import sys
 import time
 import traceback
 from dataclasses import dataclass, field
-from typing import List, Optional, Union
+from typing import Optional, Union
 
 import aiohttp
 import huggingface_hub.constants
@@ -39,7 +39,7 @@ class RequestFuncOutput:
     latency: float = 0.0
     output_tokens: int | None = None
     ttft: float = 0.0  # Time to first token
-    itl: List[float] = field(default_factory=list)  # List of inter-token latencies
+    itl: list[float] = field(default_factory=list)  # List of inter-token latencies
     tpot: float = 0.0  # avg next-token latencies
     prompt_len: int = 0
     error: str = ""
@@ -332,7 +332,7 @@ async def async_request_openai_completions(
                     output.success = False
             output.request_end_ns = time.time_ns()
             output.full_response_duration_s = time.perf_counter() - st
-        except Exception:
+        except Exception:  # noqa: BLE001 - record request failures
             output.success = False
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
@@ -434,7 +434,7 @@ async def async_request_openai_chat_completions(
                     output.success = False
             output.request_end_ns = time.time_ns()
             output.full_response_duration_s = time.perf_counter() - st
-        except Exception:
+        except Exception:  # noqa: BLE001 - record request failures
             output.success = False
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
