@@ -385,6 +385,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         *,
         max_q_len=None,
         tentative=False,
+        is_prefill=False,
         start_positions=None,
         query_prefix_ready=False,
         engram_live=True,
@@ -486,6 +487,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             spans,
             block_tables=rows,
             tentative=verifying,
+            is_prefill=is_prefill,
             buffers=self.model_runner.forward_vars,
             running_bs=running_bs,
             running_tokens=running_tokens,
@@ -539,7 +541,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
 
     def prepare_prefill(self, batch, running_bs):
         return self._prepare(
-            batch, running_bs, batch.total_tokens_num, query_prefix_ready=True
+            batch, running_bs, batch.total_tokens_num, query_prefix_ready=True, is_prefill=True
         )
 
     @contextmanager
