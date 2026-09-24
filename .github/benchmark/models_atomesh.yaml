@@ -469,6 +469,17 @@ models:
               <<: *glm52_agentic_args
               online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*"]}'
               extra_args: "--level 3 --method mtp --num-speculative-tokens 4 --spec-decode-acceptance-rate 0.5825"
+          prefill:
+            workers: 1
+            tp: 4
+            # Disable CUDA graphs on prefill: the DPA+MTP draft warmup fix
+            # (PR #2367) is not in the base image yet. Prefill only does
+            # chunked prefill, so graphs provide no benefit here.
+            cudagraph: none
+            extra_args: >-
+              --enable-dp-attention
+              --attn-prefill-chunk-size 131072
+              --long-prefill-token-threshold 131072
           decode:
             workers: 1
             tp: 4
