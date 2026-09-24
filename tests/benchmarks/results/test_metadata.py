@@ -16,6 +16,11 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def test_git_sha_of_checkout_with_different_owner(tmp_path, monkeypatch):
+    # Hosted runners may trust all directories in their system/global config.
+    # Isolate those settings so the simulated ownership mismatch is effective.
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "0")
     subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
     subprocess.run(
         [
