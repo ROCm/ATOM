@@ -1,0 +1,48 @@
+{
+  "purpose": "CPU scheduler-source contracts and cross-language parity; not policy performance validation",
+  "source_head": "80b85aa6d8e1721b8dec45da252910d29c167f85",
+  "source_sha256": {
+    "atom/model_engine/block_manager.py": "242ce82c0525eadb05292014769b5f6c71da14f63c8a3abc1e5a0fbb0dfd1f71",
+    "atom/model_engine/state_runtime.py": "aebeaaab32fb26c7a998fc99e78b79f69a12e923a1b8dc0b9a0663e63fb6d681",
+    "atom/model_engine/state_cache.py": "750b9dca691d7dcf7c97bd7e9322e5c4fb5a19c38f6403f645b21e31d0db93fd",
+    "atom/model_engine/page_unit_checkpoint.py": "58d37eeeefc979f8864cc88ce90b0d166fcd2845b0baa588c83123ed3c6e0656",
+    "atom/model_engine/scheduler.py": "6bb5f1ab99014ba962a9386a7a7579d7788eb4a41033f2f0083cbb2344616f6a",
+    "atom/model_engine/sequence.py": "ff7a3d153f1dd2075b0f085420d4fb9db0a27b96bac1e01207588c04df4d41d7",
+    "atom/metrics/routing_trace.py": "ed585e97637521a8b354a739c851eeba53f3fd8488808088e56f04709ecfa350",
+    "atom/mesh/src/policies/adaptive_cache_aware.rs": "cbfccea1bb43d191ba9a892b9fc4b4e1b7ac36112b28e8f57ba2d2cf80725dea",
+    "atom/mesh/src/policies/mod.rs": "bd267f860f2970bd07c3041d180c2a776cc74a9ade9376b8b7cc7ebbadba0021",
+    "atom/mesh/Cargo.toml": "90f84cf3fdacaa53626a4f2c180fb58d593a54eb79217d68d28493582ddc5647",
+    "atom/model_ops/attentions/deepseek_v4_attn.py": "668d880522e057ae74aa34eda0372fb98e56aa54831ec1ca7a54def4d720200c"
+  },
+  "archive_sha256": "9b6323e30f91e2632bfa98d7c370e57256facc608c5af14b43cbcdfec6f8dc92",
+  "oracle_warning": "Backlog cache comes from later first admission. These inputs are NOT available to the router.",
+  "chronological_test_warning": "The last 20% was inspected to diagnose checkpoint geometry; it is no longer an untouched blind test.",
+  "source_contract_cases": 5000,
+  "factual_steps": 130,
+  "cycle_model": {
+    "names": [
+      "intercept",
+      "global_query",
+      "max_rank_query",
+      "global_query_context",
+      "max_rank_query_context"
+    ],
+    "coefficients": [
+      0.19053810792083709,
+      1.1447054789687817e-05,
+      4.2003272577018524e-05,
+      0.0,
+      1.1779312439719456e-10
+    ],
+    "step_error_s": 0.0
+  },
+  "error_guard": {
+    "value_s": 0.6681326836048957,
+    "source": "absolute cycle residual P90 on 130 middle calibration steps; not test steps",
+    "meaning": "empirical sensitivity guard, not simultaneous/counterfactual coverage"
+  },
+  "fixture_sha256": {
+    "source-chunks.tsv": "22e6ad37e3842d0d0f630904d724b65393901ef5fa8928581bf8131c3841d63f",
+    "factual-forecasts.tsv": "9a55a9bea78aa76aaaaa540b606c4ae3fc487260f56eac137c94fe21477088c6"
+  }
+}

@@ -12,6 +12,7 @@ use crate::core::{HashRing, Worker};
 mod cache_aware;
 mod dp_sticky;
 mod factory;
+pub mod measured_prefill;
 mod power_of_two;
 mod prefix_hash;
 mod random;
