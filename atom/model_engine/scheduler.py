@@ -242,6 +242,19 @@ class ScheduledBatch:
             [getattr(seq, "needs_independent_noise", False) for seq in seqs.values()],
             dtype=bool,
         )
+        # These decisions are identical on every TP rank. Compute them once in
+        # the central scheduler instead of repeating NumPy reductions after
+        # each worker unpickles the batch.
+        self.all_greedy = bool((self.temperatures == 0).all())
+        self.has_independent_noise = bool(self.needs_independent_noise.any())
+        self.needs_top_k = bool((self.top_ks != -1).any())
+        self.needs_top_p = bool((self.top_ps < 1.0).any())
+        self.uniform_top_k = bool(
+            len(self.top_ks) <= 1 or (self.top_ks == self.top_ks[0]).all()
+        )
+        self.uniform_top_p = bool(
+            len(self.top_ps) <= 1 or (self.top_ps == self.top_ps[0]).all()
+        )
 
         self.is_first_decode_without_local_prefill = [
             seq.is_first_decode for seq in seqs.values()

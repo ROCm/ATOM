@@ -44,6 +44,39 @@ def _node_cpus(node: int) -> set[int]:
         return _parse_cpulist(f.read())
 
 
+def _physical_core_groups(cpus: set[int]) -> list[set[int]]:
+    """Return topology-sibling CPU groups, ordered by logical CPU id."""
+    groups: dict[frozenset[int], set[int]] = {}
+    for cpu in sorted(cpus):
+        path = f"/sys/devices/system/cpu/cpu{cpu}/topology/core_cpus_list"
+        try:
+            with open(path) as f:
+                siblings = _parse_cpulist(f.read()) & cpus
+        except OSError:
+            siblings = {cpu}
+        key = frozenset(siblings or {cpu})
+        groups[key] = set(key)
+    return sorted(groups.values(), key=min)
+
+
+def _partition_physical_cores(
+    cpus: set[int], partition: int, partitions: int
+) -> set[int]:
+    """Give one worker a disjoint set of complete physical cores."""
+    if partitions <= 1:
+        return cpus
+    if partition < 0 or partition >= partitions:
+        raise ValueError(f"partition {partition} outside [0, {partitions})")
+    cores = _physical_core_groups(cpus)
+    per_partition = len(cores) // partitions
+    if per_partition == 0:
+        raise RuntimeError(
+            f"{len(cores)} physical cores cannot be split across {partitions} GPUs"
+        )
+    start = partition * per_partition
+    return set().union(*cores[start : start + per_partition])
+
+
 def _physical_index(gpu_id: int) -> int:
     """Map a logical GPU id to the physical index, honoring *_VISIBLE_DEVICES.
 
@@ -134,7 +167,9 @@ def _set_preferred_memory(node: int) -> None:
         logger.debug(f"numa_set_preferred({node}) skipped: {e}")
 
 
-def numa_bind_to_node(gpu_id: int, label: str = "") -> None:
+def numa_bind_to_node(
+    gpu_id: int, label: str = "", *, local_gpu_count: int | None = None
+) -> None:
     """Bind the current process to its GPU's NUMA-local cores and memory.
 
     No-op unless ``ATOM_NUMA_BIND`` is enabled. Must run before any large
@@ -156,9 +191,26 @@ def numa_bind_to_node(gpu_id: int, label: str = "") -> None:
             raise RuntimeError(
                 f"NUMA node {node} has no CPUs allowed by the current affinity"
             )
+        partition_desc = ""
+        if envs.ATOM_NUMA_BIND_PER_GPU and local_gpu_count is not None:
+            peers = [
+                candidate
+                for candidate in range(local_gpu_count)
+                if _resolve_node(candidate) == node
+            ]
+            if gpu_id not in peers:
+                raise RuntimeError(
+                    f"gpu {gpu_id} was not found among NUMA node {node} peers {peers}"
+                )
+            partition = peers.index(gpu_id)
+            cpus = _partition_physical_cores(cpus, partition, len(peers))
+            partition_desc = f", partition={partition}/{len(peers)}"
         os.sched_setaffinity(0, cpus)
         _set_preferred_memory(node)
-        logger.info(f"NUMA bind{tag}: gpu={gpu_id} -> node {node} ({len(cpus)} cores)")
+        logger.info(
+            f"NUMA bind{tag}: gpu={gpu_id} -> node {node}{partition_desc} "
+            f"({len(cpus)} logical CPUs)"
+        )
     except Exception as e:
         msg = (
             f"NUMA bind{tag} failed for gpu {gpu_id}: {e}. In docker add "
