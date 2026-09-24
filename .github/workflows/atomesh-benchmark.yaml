@@ -1559,8 +1559,11 @@ jobs:
                       return {key: remap_model_paths(item) for key, item in value.items()}
                   if isinstance(value, list):
                       return [remap_model_paths(item) for item in value]
-                  if isinstance(value, str) and (value == old_model_root or value.startswith(old_model_root + "/")):
-                      return "/share_nfs/models" + value[len(old_model_root):]
+                  if isinstance(value, str):
+                      if value == old_model_root:
+                          return "/share_nfs/models"
+                      # extra_args may embed model paths in shell-quoted JSON.
+                      return value.replace(old_model_root + "/", "/share_nfs/models/")
                   return value
 
               cell = remap_model_paths(cell)
