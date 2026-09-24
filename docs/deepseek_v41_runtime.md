@@ -161,8 +161,10 @@ host table storage, so startup registration takes longer than TP4.
 ## Prefill two-batch overlap
 
 Add `--enable-tbo prefill` to the DPA command above, leaving EP disabled.
-V4.1 prefill TBO requires DP attention with more than one DP rank and rejects
-plain TP and single-rank DPA at configuration validation. Microbatches use
+V4.1 prefill TBO requires DP attention with more than one effective DP rank.
+Before engine normalization this width is `tensor_parallel_size * data_parallel_size`:
+TP4 with the default DP size of 1 launches four DP-attention ranks and is accepted.
+Plain TP and effective single-rank DPA are rejected. Microbatches use
 the configured compilation level; decode keeps its CUDA Graph path.
 The existing `ATOM_TBO_PREFILL_MIN_TOKENS` threshold applies.
 `ATOM_TBO_PREFILL_TOKEN_SPLIT=1` is the default and can split within a request;

@@ -385,7 +385,11 @@ def validate_runtime_config(config):
             config.enable_tbo
             and (
                 not config.enable_dp_attention
-                or config.parallel_config.data_parallel_size <= 1
+                # Config validates before CoreManager folds TP into DP.
+                # After normalization TP is 1, so the product is unchanged.
+                or config.parallel_config.data_parallel_size
+                * config.tensor_parallel_size
+                <= 1
             ),
         ),
         ("KV transfer", bool(config.kv_transfer_config) or config.enable_rapidserve),
