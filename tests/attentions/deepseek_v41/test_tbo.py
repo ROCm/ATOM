@@ -305,7 +305,7 @@ def test_split_attention_reads_preceding_microbatch_window(cut):
 @pytest.mark.parametrize("layers", [1, 8])
 @pytest.mark.parametrize("stress_lifetime", [False, True])
 @pytest.mark.parametrize("level", [0, 3])
-@pytest.mark.parametrize("dispatch", ["fallback", "fused"])
+@pytest.mark.parametrize("dispatch", ["fallback", "complete"])
 def test_dp_moe_original_schedule_preserves_outputs(
     monkeypatch, tmp_path, unified, layers, stress_lifetime, level, dispatch
 ):
@@ -314,6 +314,9 @@ def test_dp_moe_original_schedule_preserves_outputs(
     Keep the original MoE yield-before-communication schedule.
     Exercise the V4.1 post-dispatch lifetime boundary with delayed compute
     and enough partner allocations to reuse an unprotected comm output.
+    The synthetic complete=True return checks downstream consumers and flag
+    preservation only. It does not exercise comm-fused backend internals;
+    that backend's factory excludes TBO.
     """
     from atom.config import CompilationConfig, CUDAGraphMode
     from atom.model_ops import moe
@@ -409,8 +412,8 @@ def test_dp_moe_original_schedule_preserves_outputs(
             return torch.ops.aiter.moe_forward(hidden, router, "test")
 
         def forward_maybe_comm_fused(self, hidden, router, shared, **kwargs):
-            if dispatch == "fused":
-                # Like the fused backend, bypass Module.__call__ and hooks.
+            if dispatch == "complete":
+                # Synthetic completed output; bypass Module.__call__ and hooks.
                 return torch.ops.aiter.moe_forward(hidden, router, "test"), True
             return self(hidden, router), False
 
@@ -440,7 +443,7 @@ def test_dp_moe_original_schedule_preserves_outputs(
             result = input_ids.float()[:, None].expand(-1, width).contiguous()
             for _ in range(layers):
                 result, complete = self.block.ffn.routed_expert_forward(result)
-                assert complete == (dispatch == "fused")
+                assert complete == (dispatch == "complete")
             return result + torch.ones_like(result)
 
     ids = torch.arange(14, device="cuda", dtype=torch.int32)

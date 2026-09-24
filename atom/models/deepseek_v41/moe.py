@@ -67,9 +67,10 @@ class MoE(V4MoE):
             before_stage2=before_stage2,
             stage2_stream=stage2_stream,
         )
-        # Both comm-fused dispatch and its fallback return here before shared
-        # combine/mHC consume the output on compute. A module forward hook
-        # misses the fused path, which calls the backend directly.
+        # create_comm_fused_moe_backend excludes TBO (and DP > 1), so TBO
+        # returns the fallback routed output before shared combine/mHC.
+        # This marker protects consumers after dispatch returns; it cannot
+        # fence an internal combine in a backend returning is_complete=True.
         v41_record_tbo_expert_output(routed)
         return routed, is_complete
 

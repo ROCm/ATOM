@@ -181,9 +181,15 @@ Already-staged rows are sliced identically when Engram overlap is disabled.
 V4.1 requests communication priority -1 through `tbo_comm_stream_priority`;
 models without a declaration retain priority 0. MoE keeps the existing
 compute-to-communication yield and event order. V4.1 records the compute
-consumer at the routed-expert dispatch return, covering both comm-fused and
-fallback paths before shared-expert combine and mHC consume the result. This prevents a partner microbatch
-from reusing its storage before those consumers finish. A custom-op boundary
+consumer of the fallback routed output at the dispatch return, before
+shared-expert combine and mHC consume the result. This prevents a partner
+microbatch from reusing its storage before those consumers finish. The existing
+`create_comm_fused_moe_backend` factory rejects TBO and DP > 1, so TBO cannot
+enter the communication-fused backend. A `complete=True` return already includes
+shared-expert combine and TP reduction; a marker after that return can protect
+only downstream consumers, not backend-internal allocations or combine. If
+comm-fused TBO support is added, its internal consumer boundary must be audited
+separately. A custom-op boundary
 keeps the thread-local TBO query at runtime and retains the lifetime marker
 in compiled execution. Microbatches use the normal model call and honor the
 configured compilation level. TP vision requests pass token-aligned image
@@ -204,5 +210,8 @@ single warmup and KV sizing calculation, with no additional budget policy.
 
 Correctness and overlap must be checked together: serial execution can hide
 cross-stream reuse errors, while overlapping kernels alone do not demonstrate
-an end-to-end throughput improvement. The GPU regressions exercise both fused and fallback dispatch returns under
-delayed consumption and partner allocation pressure.
+an end-to-end throughput improvement. The GPU regressions exercise fallback
+dispatch and a synthetic `complete=True` return under delayed consumption and
+partner allocation pressure. The latter checks downstream output lifetime and
+completion-flag preservation, not real comm-fused backend internals. The CPU
+comm-fused integration tests verify that its factory rejects TBO and DP > 1.
