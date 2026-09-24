@@ -1120,7 +1120,7 @@ models:
     env:
       common:
         ROUTER_PREFILL_POLICY: adaptive_cache_aware
-        RUST_LOG: "info,atomesh::policies::adaptive_cache_aware=debug"
+        RUST_LOG: "info,mesh::policies::adaptive_cache_aware=debug"
         AITER_BF16_FP8_MOE_BOUND: "0"
         ATOM_MOE_GU_ITLV: "1"
         MC_GID_INDEX: "1"

@@ -161,7 +161,7 @@ reserved work until prefill completes, and does not model chunk progress, cache
 offload, or the delay imposed on other requests. Prefix history is not a live KV
 residency inventory. Benchmark this opt-in policy for the intended workload.
 
-Debug logs under `atomesh::policies::adaptive_cache_aware` expose candidate
+Debug logs under `mesh::policies::adaptive_cache_aware` expose candidate
 `wait_saving_work`, `extra_work`, `error_margin_work`, and `net_gain_work`, as well
 as the selected rank, cached characters, queue work, and `changed_affinity`.
 These are work estimates; a routing affinity change is not itself proof of a
