@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::debug;
 
-use super::policy_apply::apply_policy;
+use super::policy_apply::{apply_policy, apply_prefill_policy};
 use super::traits::{PdPlanner, PolicySource, WorkerSource};
 use super::types::{PlacementError, PlacementPlan, Protocol, RequestDescriptor};
 use crate::core::{ConnectionMode, HashRing, Worker, WorkerType};
@@ -72,7 +72,7 @@ impl DefaultPlanner {
         let decode_policy = self.policies.decode_policy();
         let hash_ring = self.hash_ring_for(req.model_id);
 
-        let prefill = apply_policy(
+        let (prefill, prefill_reservation) = apply_prefill_policy(
             &prefill_candidates,
             prefill_policy.as_ref(),
             req,
@@ -94,6 +94,7 @@ impl DefaultPlanner {
             decode,
             prefill_policy: prefill_policy.name(),
             decode_policy: decode_policy.name(),
+            prefill_reservation,
         })
     }
 }

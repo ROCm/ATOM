@@ -626,6 +626,37 @@ impl Tree {
         (matched_text, result.tenant.to_string())
     }
 
+    /// Read-only prefix lengths for several tenants in one traversal. Unlike
+    /// prefix_match_tenant this neither interns IDs nor renews LRU timestamps.
+    /// Character counts are approximate cache work, not tokenizer token counts.
+    pub fn prefix_match_counts_for_tenants(&self, text: &str, tenants: &[&str]) -> Vec<usize> {
+        let mut counts = vec![0; tenants.len()];
+        let mut active = vec![true; tenants.len()];
+        let mut remaining = text;
+        let mut current = Arc::clone(&self.root);
+        while let Some(first) = remaining.chars().next() {
+            let Some(child) = current.children.get(&first).map(|e| e.value().clone()) else {
+                break;
+            };
+            let segment = child.text.read().unwrap();
+            let shared = shared_prefix_count(remaining, segment.as_str());
+            let full = shared == segment.char_count();
+            drop(segment);
+            for (i, tenant) in tenants.iter().enumerate() {
+                active[i] &= child.tenant_last_access_time.contains_key(*tenant);
+                if active[i] {
+                    counts[i] += shared;
+                }
+            }
+            if !full || !active.iter().any(|&present| present) {
+                break;
+            }
+            remaining = advance_by_chars(remaining, shared);
+            current = child;
+        }
+        counts
+    }
+
     #[allow(dead_code)]
     pub fn prefix_match_tenant(&self, text: &str, tenant: &str) -> String {
         // Use slice-based traversal - no Vec<char> allocation
@@ -1001,6 +1032,35 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn adaptive_multi_tenant_probe_counts_unicode_without_renewing_lru() {
+        let tree = Tree::new();
+        tree.insert("你好abc", "a");
+        tree.insert("你好axy", "b");
+        let mut nodes = vec![tree.root.clone()];
+        while let Some(node) = nodes.pop() {
+            for mut entry in node.tenant_last_access_time.iter_mut() {
+                *entry.value_mut() = 1;
+            }
+            nodes.extend(node.children.iter().map(|e| e.value().clone()));
+        }
+        let before = Tree::node_to_string(&tree.root, "", true);
+        assert_eq!(
+            tree.prefix_match_counts_for_tenants("你好abcd", &["a", "b", "missing"]),
+            vec![5, 3, 0]
+        );
+        assert_eq!(
+            tree.prefix_match_counts_for_tenants("你", &["a", "b"]),
+            vec![1, 1]
+        );
+        assert_eq!(
+            tree.prefix_match_counts_for_tenants("", &["a", "b"]),
+            vec![0, 0]
+        );
+        assert_eq!(Tree::node_to_string(&tree.root, "", true), before);
+        assert_eq!(tree.tenant_char_count.len(), 2);
+    }
 
     /// Helper to convert tenant_char_count to HashMap<String, usize> for comparison
     fn get_maintained_counts(tree: &Tree) -> HashMap<String, usize> {

@@ -1,4 +1,5 @@
 //! Exercise real HTTP dispatch while independently holding P and D responses.
+mod adaptive;
 use super::*;
 use crate::core::{BasicWorkerBuilder, WorkerType};
 use axum::{routing::post, Router};
@@ -110,6 +111,16 @@ fn dispatch(
     d: &GatedServer,
     streaming: bool,
 ) -> JoinHandle<Response> {
+    dispatch_with_reservation(kind, p, d, streaming, None)
+}
+
+fn dispatch_with_reservation(
+    kind: DispatchKind,
+    p: &GatedServer,
+    d: &GatedServer,
+    streaming: bool,
+    reservation: Option<Box<dyn PrefillReservation>>,
+) -> JoinHandle<Response> {
     let mut router = tests::create_test_pd_router();
     let prefill = p.worker.clone();
     let decode = d.worker.clone();
@@ -143,6 +154,7 @@ fn dispatch(
                         ctx,
                         Instant::now(),
                         None,
+                        reservation,
                     )
                     .await
             }

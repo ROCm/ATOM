@@ -45,7 +45,7 @@ use crate::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, MeshMetrics},
     },
-    policies::PolicyRegistry,
+    policies::{PolicyRegistry, PrefillFeedback, PrefillReservation},
     protocols::{
         chat::ChatCompletionRequest,
         common::{GenerationRequest, InputIds, StringOrArray},
@@ -508,7 +508,15 @@ impl PDRouter {
     async fn plan_pd_pair(
         &self,
         context: &PDRequestContext<'_>,
-    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>, PairCtx), Response> {
+    ) -> Result<
+        (
+            Arc<dyn Worker>,
+            Arc<dyn Worker>,
+            PairCtx,
+            Option<Box<dyn PrefillReservation>>,
+        ),
+        Response,
+    > {
         let descriptor = RequestDescriptor {
             model_id: context.model_id,
             protocol: Some(Protocol::Http),
@@ -518,15 +526,21 @@ impl PDRouter {
             stream: context.is_stream,
         };
 
-        let (mut prefill, decode, prefill_policy, decode_policy) =
+        let (mut prefill, decode, prefill_policy, decode_policy, prefill_reservation) =
             match self.planner.plan(&descriptor).await {
                 Ok(PlacementPlan::Pair {
                     prefill,
                     decode,
                     prefill_policy,
                     decode_policy,
-                    ..
-                }) => (prefill, decode, prefill_policy, decode_policy),
+                    prefill_reservation,
+                }) => (
+                    prefill,
+                    decode,
+                    prefill_policy,
+                    decode_policy,
+                    prefill_reservation,
+                ),
                 Ok(PlacementPlan::Single { .. }) => {
                     return Err(error::internal_error(
                         "unexpected_single_plan",
@@ -550,6 +564,15 @@ impl PDRouter {
             decode_policy,
         );
 
+        if prefill_reservation.is_some()
+            && (self.backend != BackendType::Atom
+                || self.atom_pd_rank_mapping_policy != AtomPdRankMappingPolicy::None)
+        {
+            return Err(error::internal_error(
+                "unsupported_prefill_reservation",
+                "Reserved prefill work requires ATOM relay without rank remapping",
+            ));
+        }
         if let BackendType::Atom = self.backend {
             prefill = self.apply_atom_pd_rank_mapping_policy(prefill, &decode);
             info!(
@@ -566,7 +589,7 @@ impl PDRouter {
             .adapter
             .prepare_pair(prefill.as_ref(), decode.as_ref())
             .map_err(Self::handle_serialization_error)?;
-        Ok((prefill, decode, ctx))
+        Ok((prefill, decode, ctx, prefill_reservation))
     }
 
     /// vLLM Mooncake mode: fire prefill request as background task, stream decode response.
@@ -600,10 +623,11 @@ impl PDRouter {
                     let shared_request = Arc::clone(&shared_request);
                     let context = context.clone();
                     async move {
-                        let (prefill, decode, ctx) = match self.plan_pd_pair(&context).await {
-                            Ok(t) => t,
-                            Err(resp) => return resp,
-                        };
+                        let (prefill, decode, ctx, _prefill_reservation) =
+                            match self.plan_pd_pair(&context).await {
+                                Ok(t) => t,
+                                Err(resp) => return resp,
+                            };
 
                         debug!(
                             "vLLM PD retry attempt {} prefill={} decode={}",
@@ -880,10 +904,11 @@ impl PDRouter {
                     let shared_request = Arc::clone(&shared_request);
                     let context = context.clone();
                     async move {
-                        let (prefill, decode, ctx) = match self.plan_pd_pair(&context).await {
-                            Ok(t) => t,
-                            Err(resp) => return resp,
-                        };
+                        let (prefill, decode, ctx, prefill_reservation) =
+                            match self.plan_pd_pair(&context).await {
+                                Ok(t) => t,
+                                Err(resp) => return resp,
+                            };
 
                         debug!(
                             "ATOM PD retry attempt {} prefill={} decode={}",
@@ -922,6 +947,7 @@ impl PDRouter {
                             ctx,
                             start_time,
                             correlation_id,
+                            prefill_reservation,
                         )
                         .await
                     }
@@ -982,11 +1008,15 @@ impl PDRouter {
         ctx: PairCtx,
         _start_time: Instant,
         correlation_id: Option<String>,
+        mut prefill_reservation: Option<Box<dyn PrefillReservation>>,
     ) -> Response {
         // Reserve the pair before the first await, including streaming requests.
         // D remains reserved while P runs because this request already selected D.
         let prefill_guard = WorkerLoadGuard::new(prefill.clone(), headers);
         let decode_guard = WorkerLoadGuard::new(decode.clone(), headers);
+        if let Some(reservation) = prefill_reservation.as_mut() {
+            reservation.mark_dispatched();
+        }
 
         events::RequestPDSentEvent {
             prefill_url: prefill.url(),
@@ -1108,6 +1138,9 @@ impl PDRouter {
                 "enrich_decode_kv_failed",
                 format!("Failed to enrich decode kv: {}", e),
             );
+        }
+        if let Some(mut reservation) = prefill_reservation.take() {
+            reservation.complete(PrefillFeedback::from_response(&prefill_body));
         }
         let carried_ids = AtomAdapter::carry_prompt_token_ids(&prefill_body, &mut kv_params);
         debug!(
@@ -1242,10 +1275,11 @@ impl PDRouter {
                     let shared_request = Arc::clone(&shared_request);
                     let context = context.clone();
                     async move {
-                        let (prefill, decode, ctx) = match self.plan_pd_pair(&context).await {
-                            Ok(t) => t,
-                            Err(resp) => return resp,
-                        };
+                        let (prefill, decode, ctx, _prefill_reservation) =
+                            match self.plan_pd_pair(&context).await {
+                                Ok(t) => t,
+                                Err(resp) => return resp,
+                            };
 
                         debug!(
                             "PD retry attempt {} using prefill={} decode={}",

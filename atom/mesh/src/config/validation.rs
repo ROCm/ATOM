@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::ConnectionMode;
 
 /// Configuration validator
 pub(crate) struct ConfigValidator;
@@ -76,6 +77,16 @@ impl ConfigValidator {
     fn validate_policy(policy: &PolicyConfig) -> ConfigResult<()> {
         match policy {
             PolicyConfig::Random | PolicyConfig::RoundRobin | PolicyConfig::DpSticky => {}
+            PolicyConfig::AdaptiveCacheAware {
+                eviction_interval_secs,
+                max_tree_size,
+            } => {
+                if *eviction_interval_secs == 0 || *max_tree_size == 0 {
+                    return Err(ConfigError::IncompatibleConfig {
+                        reason: "adaptive_cache_aware requires positive eviction_interval_secs and max_tree_size".into(),
+                    });
+                }
+            }
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold: _,
@@ -325,6 +336,22 @@ impl ConfigValidator {
     }
 
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        let adaptive = |p: &PolicyConfig| matches!(p, PolicyConfig::AdaptiveCacheAware { .. });
+        let p = config.mode.get_prefill_policy(&config.policy);
+        let d = config.mode.get_decode_policy(&config.policy);
+        if adaptive(&config.policy) || adaptive(p) || adaptive(d) {
+            if !matches!(config.mode, RoutingMode::PrefillDecode { .. })
+                || !adaptive(p)
+                || adaptive(d)
+                || config.backend != BackendType::Atom
+                || !matches!(config.connection_mode, ConnectionMode::Http)
+                || config.atom_pd_rank_mapping_policy != AtomPdRankMappingPolicy::None
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "adaptive_cache_aware is supported only for ATOM HTTP prefill with an independent decode policy and atom_pd_rank_mapping_policy=none".into(),
+                });
+            }
+        }
         {
             if let PolicyConfig::PowerOfTwo { .. } = &config.policy {
                 let worker_count = config.mode.worker_count();
@@ -413,6 +440,78 @@ impl ConfigValidator {
 mod tests {
     use super::*;
     use crate::core::ConnectionMode;
+
+    fn adaptive_config() -> RouterConfig {
+        let mut config = RouterConfig::new(
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![("http://p:8000".into(), None)],
+                decode_urls: vec!["http://d:8000".into()],
+                prefill_policy: Some(PolicyConfig::AdaptiveCacheAware {
+                    eviction_interval_secs: 30,
+                    max_tree_size: 100000,
+                }),
+                decode_policy: Some(PolicyConfig::DpSticky),
+            },
+            PolicyConfig::Random,
+        );
+        config.backend = BackendType::Atom;
+        config
+    }
+
+    #[test]
+    fn adaptive_configuration_accepts_only_supported_prefill_lifecycle() {
+        let good = adaptive_config();
+        assert!(ConfigValidator::validate(&good).is_ok());
+        let mut bad = good.clone();
+        bad.backend = BackendType::Sglang;
+        assert!(ConfigValidator::validate(&bad).is_err());
+        let mut bad = good.clone();
+        bad.backend = BackendType::Vllm;
+        assert!(ConfigValidator::validate(&bad).is_err());
+        let mut bad = good.clone();
+        bad.connection_mode = ConnectionMode::Grpc { port: None };
+        assert!(ConfigValidator::validate(&bad).is_err());
+        let mut bad = good.clone();
+        bad.atom_pd_rank_mapping_policy = AtomPdRankMappingPolicy::Idx2Idx;
+        assert!(ConfigValidator::validate(&bad).is_err());
+        let adaptive = good.mode.get_prefill_policy(&good.policy).clone();
+        let mut bad = good.clone();
+        if let RoutingMode::PrefillDecode { decode_policy, .. } = &mut bad.mode {
+            *decode_policy = Some(adaptive.clone());
+        }
+        assert!(ConfigValidator::validate(&bad).is_err());
+        let mut bad = good;
+        bad.mode = RoutingMode::Regular {
+            worker_urls: vec!["http://p:8000".into()],
+        };
+        bad.policy = adaptive;
+        assert!(ConfigValidator::validate(&bad).is_err());
+    }
+
+    #[test]
+    fn adaptive_configuration_roundtrips_and_requires_bounded_cache_maintenance() {
+        let policy = adaptive_config()
+            .mode
+            .get_prefill_policy(&PolicyConfig::Random)
+            .clone();
+        let json = serde_json::to_string(&policy).unwrap();
+        let parsed: PolicyConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.name(), "adaptive_cache_aware");
+        assert!(
+            ConfigValidator::validate_policy(&PolicyConfig::AdaptiveCacheAware {
+                eviction_interval_secs: 0,
+                max_tree_size: 100
+            })
+            .is_err()
+        );
+        assert!(
+            ConfigValidator::validate_policy(&PolicyConfig::AdaptiveCacheAware {
+                eviction_interval_secs: 30,
+                max_tree_size: 0
+            })
+            .is_err()
+        );
+    }
 
     #[test]
     fn test_validate_regular_mode() {

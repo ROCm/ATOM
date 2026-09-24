@@ -9,6 +9,7 @@ use async_trait::async_trait;
 
 use crate::core::{HashRing, Worker};
 
+mod adaptive_cache_aware;
 mod cache_aware;
 mod dp_sticky;
 mod factory;
@@ -19,6 +20,7 @@ mod registry;
 mod round_robin;
 pub mod tree;
 pub(crate) mod utils;
+pub use adaptive_cache_aware::AdaptiveCacheAwarePolicy;
 pub use cache_aware::CacheAwarePolicy;
 pub use dp_sticky::DpStickyPolicy;
 pub use factory::PolicyFactory;
@@ -28,6 +30,41 @@ pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
 pub use tree::PrefixMatchResult;
+
+/// Feedback from a successfully parsed and validated P response. Missing or
+/// invalid usage must not be treated as zero misses.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PrefillFeedback {
+    pub input_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
+}
+
+impl PrefillFeedback {
+    /// ATOM's OpenAI P response carries standard usage. Some compatible
+    /// versions expose cache reads as a flat field instead of token details.
+    pub fn from_response(body: &serde_json::Value) -> Self {
+        let usage = &body["usage"];
+        Self {
+            input_tokens: usage["prompt_tokens"].as_u64(),
+            cached_tokens: usage["prompt_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .or_else(|| usage["prompt_cache_read_tokens"].as_u64()),
+        }
+    }
+}
+
+/// Owns work reserved during selection. Drop releases an abandoned/failed
+/// attempt; complete confirms P cache state and releases work before D streams.
+pub trait PrefillReservation: Send + Sync + Debug {
+    fn mark_dispatched(&mut self);
+    fn complete(&mut self, feedback: PrefillFeedback);
+}
+
+#[derive(Debug)]
+pub struct PrefillSelection {
+    pub index: usize,
+    pub reservation: Option<Box<dyn PrefillReservation>>,
+}
 
 /// Core trait for load balancing policies
 ///
@@ -48,6 +85,20 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
     ) -> Option<usize>;
+
+    /// Select and optionally reserve prefill work as one atomic policy action.
+    async fn select_prefill_worker(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> Option<PrefillSelection> {
+        self.select_worker(workers, info)
+            .await
+            .map(|index| PrefillSelection {
+                index,
+                reservation: None,
+            })
+    }
 
     /// Update policy state after request completion
     ///

@@ -230,6 +230,13 @@ pub enum PolicyConfig {
     #[serde(rename = "dp_sticky")]
     DpSticky,
 
+    /// Experimental ATOM HTTP prefill cost policy; no per-concurrency thresholds.
+    #[serde(rename = "adaptive_cache_aware")]
+    AdaptiveCacheAware {
+        eviction_interval_secs: u64,
+        max_tree_size: usize,
+    },
+
     #[serde(rename = "cache_aware")]
     CacheAware {
         cache_threshold: f32,
@@ -274,6 +281,7 @@ impl PolicyConfig {
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::DpSticky => "dp_sticky",
             PolicyConfig::CacheAware { .. } => "cache_aware",
+            PolicyConfig::AdaptiveCacheAware { .. } => "adaptive_cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::PrefixHash { .. } => "prefix_hash",
         }

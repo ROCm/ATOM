@@ -128,6 +128,45 @@ USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only \
 
 Prefill entries may include an optional bootstrap port (e.g. for Mooncake KV cache transfer).
 
+### Experimental adaptive prefill routing
+
+For ATOM HTTP P/D deployments, select `--prefill-policy adaptive_cache_aware`
+with an independent decode policy and `--atom-pd-rank-mapping-policy none`:
+
+```bash
+./target/release/atomesh launch --backend atom --pd-disaggregation --dp-aware \
+  --prefill http://prefill:30001 --decode http://decode:30011 \
+  --prefill-policy adaptive_cache_aware --decode-policy cache_aware \
+  --atom-pd-rank-mapping-policy none
+```
+
+The policy compares the outstanding prefill work saved by moving a request with
+the extra uncached work and observed cache prediction error at the destination.
+It retains the previous confirmed session worker (from the sticky routing header),
+or the best prefix match, unless another worker has positive estimated net benefit.
+It uses neither a concurrency-specific load threshold nor a migration quota.
+`--cache-threshold`, `--balance-abs-threshold`, and `--balance-rel-threshold` still
+configure a `cache_aware` decode policy, but do not tune adaptive prefill decisions.
+
+Work is reserved atomically during placement and released when prefill completes,
+fails, or is cancelled. Successful prefill responses confirm cache ownership and
+train an error margin from `usage.prompt_tokens` and cached-token usage. Missing
+usage does not count as a training sample. Cache and reservations distinguish
+model, worker URL, and DP rank. The existing tree size and eviction interval
+options control the approximate prefix history.
+
+This first version measures estimated uncached Unicode-character work, not time
+or exact tokens. It assumes comparable prefill workers and one router, keeps full
+reserved work until prefill completes, and does not model chunk progress, cache
+offload, or the delay imposed on other requests. Prefix history is not a live KV
+residency inventory. Benchmark this opt-in policy for the intended workload.
+
+Debug logs under `atomesh::policies::adaptive_cache_aware` expose candidate
+`wait_saving_work`, `extra_work`, `error_margin_work`, and `net_gain_work`, as well
+as the selected rank, cached characters, queue work, and `changed_affinity`.
+These are work estimates; a routing affinity change is not itself proof of a
+successful consecutive-turn migration.
+
 ### gRPC routing
 
 ```bash

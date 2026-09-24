@@ -91,6 +91,7 @@ impl PdPlanner for MockPdPlanner {
                 decode: decode.clone(),
                 prefill_policy,
                 decode_policy,
+                prefill_reservation: None,
             }),
             PlannerMode::RepeatErr(e) => Err(e.clone()),
         }

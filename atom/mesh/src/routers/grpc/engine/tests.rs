@@ -840,6 +840,7 @@ mod e_engine_dispatch {
             decode: mock_http_only_worker("http://d:8000"),
             prefill_policy: "rr",
             decode_policy: "rr",
+            prefill_reservation: None,
         };
         match Dispatcher::dispatch(&e, &plan, &mut basic_payload()).await {
             Ok(_) => panic!("expected ConnectionAcquireFailed"),
@@ -876,6 +877,7 @@ mod e_engine_dispatch {
             decode: mock_grpc_worker("http://d:8000", WorkerType::Decode),
             prefill_policy: "rr",
             decode_policy: "rr",
+            prefill_reservation: None,
         };
         let _s = mock.dispatch(&plan, &mut basic_payload()).await.unwrap();
         let calls = mock.calls();

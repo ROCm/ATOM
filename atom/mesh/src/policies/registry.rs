@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 /// When the first worker of a new model is added, it determines the policy for that model.
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
-use super::{CacheAwarePolicy, LoadBalancingPolicy, PolicyFactory};
+use super::{AdaptiveCacheAwarePolicy, CacheAwarePolicy, LoadBalancingPolicy, PolicyFactory};
 use crate::{config::types::PolicyConfig, core::Worker};
 
 /// Registry for managing model-to-policy mappings
@@ -285,6 +285,9 @@ impl PolicyRegistry {
     pub fn remove_worker_from_cache_aware(&self, model_id: &str, worker_url: &str) {
         // Get the policy for this model
         if let Some(policy) = self.get_policy(model_id) {
+            if let Some(adaptive) = policy.as_any().downcast_ref::<AdaptiveCacheAwarePolicy>() {
+                adaptive.remove_worker_by_url(worker_url);
+            }
             if policy.name() == "cache_aware" {
                 if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
                     cache_aware.remove_worker_by_url(worker_url);
@@ -302,6 +305,9 @@ impl PolicyRegistry {
             .into_iter()
             .flatten()
         {
+            if let Some(adaptive) = policy.as_any().downcast_ref::<AdaptiveCacheAwarePolicy>() {
+                adaptive.remove_worker_by_url(worker_url);
+            }
             if policy.name() == "cache_aware" {
                 if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
                     cache_aware.remove_worker_by_url(worker_url);

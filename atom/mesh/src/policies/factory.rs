@@ -3,8 +3,9 @@
 use std::sync::Arc;
 
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, DpStickyPolicy, LoadBalancingPolicy, PowerOfTwoPolicy,
-    PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    AdaptiveCacheAwarePolicy, CacheAwareConfig, CacheAwarePolicy, DpStickyPolicy,
+    LoadBalancingPolicy, PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy,
+    RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -19,6 +20,13 @@ impl PolicyFactory {
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
             PolicyConfig::DpSticky => Arc::new(DpStickyPolicy::new()),
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
+            PolicyConfig::AdaptiveCacheAware {
+                eviction_interval_secs,
+                max_tree_size,
+            } => Arc::new(AdaptiveCacheAwarePolicy::new(
+                *eviction_interval_secs,
+                *max_tree_size,
+            )),
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold,
@@ -55,6 +63,7 @@ impl PolicyFactory {
             "round_robin" | "roundrobin" => Some(Arc::new(RoundRobinPolicy::new())),
             "dp_sticky" | "dpsticky" => Some(Arc::new(DpStickyPolicy::new())),
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
+            "adaptive_cache_aware" => Some(Arc::new(AdaptiveCacheAwarePolicy::new(30, 10000))),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "prefix_hash" | "prefixhash" => Some(Arc::new(PrefixHashPolicy::with_defaults())),
             _ => None,

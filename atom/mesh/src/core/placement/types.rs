@@ -32,6 +32,7 @@ pub enum PlacementPlan {
         decode: Arc<dyn Worker>,
         prefill_policy: &'static str,
         decode_policy: &'static str,
+        prefill_reservation: Option<Box<dyn crate::policies::PrefillReservation>>,
     },
 }
 
