@@ -498,6 +498,11 @@ if is_rocm_aiter_fp4bmm_enabled():
     from atom.model_ops.utils import quark_post_load_weights
 
 
+# Unfused torch fallback for `_kv_b_proj_gather`, gated by
+# ATOM_UNFUSED_GATHER_KV_B_PROJ. Pure torch, so unlike the two kernel backends
+# it is always importable and needs no availability flag.
+from atom.model_ops.mla_unfused_gather import unfused_gather_kv_b_proj
+
 # Optional flydsl backend for `_kv_b_proj_gather`, gated by
 # ATOM_USE_FLYDSL_GATHER_KV_B_PROJ.
 try:
@@ -706,6 +711,21 @@ class MLAAttention(nn.Module):
         # kernels with an unpadded 576-wide q_out. The triton path never uses seg.
         self.use_seg_mla = (not self.use_triton_mla) and envs.ATOM_MLA_PAGE_SIZE > 1
         self.use_flydsl_gather_kv_b_proj = bool(envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ)
+        # Unfused torch gather: an escape hatch for targets where Triton cannot
+        # compile the fused kernel for chunked-prefill shapes. Refuse the one
+        # combination it cannot serve here, at construction, rather than from
+        # inside the first chunked prefill.
+        self.use_unfused_gather_kv_b_proj = bool(envs.ATOM_UNFUSED_GATHER_KV_B_PROJ)
+        if (
+            self.use_unfused_gather_kv_b_proj
+            and self.use_triton_mla
+            and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV
+        ):
+            raise RuntimeError(
+                "ATOM_UNFUSED_GATHER_KV_B_PROJ=1 cannot read the shuffled-KV "
+                "cache layout. Set ATOM_USE_TRITON_MLA_SHUFFLE_KV=0, or unset "
+                "ATOM_UNFUSED_GATHER_KV_B_PROJ."
+            )
         # Resolved on the first gather, when the weights and cache exist; see
         # `_kv_b_proj_gather`. None = not asked yet.
         self._flydsl_gather_ok: bool | None = None
@@ -1695,7 +1715,14 @@ class MLAAttention(nn.Module):
                     return k_gather, v_gather, *kv_out_scales
                 return None
 
-        gather_kv_b_proj(
+        # Checked after FlyDSL: where the fused kernel compiles at all, it wins.
+        # This path trades throughput for existing.
+        gather = (
+            unfused_gather_kv_b_proj
+            if self.use_unfused_gather_kv_b_proj
+            else gather_kv_b_proj
+        )
+        gather(
             kv_buffer,
             self._k_scale,
             kv_indptr,

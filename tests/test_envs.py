@@ -37,6 +37,7 @@ _ATOM_ENV_VARS = [
     "ATOM_USE_CUSTOM_ALL_GATHER",
     "ATOM_ENABLE_RELAXED_MTP",
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ",
+    "ATOM_UNFUSED_GATHER_KV_B_PROJ",
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN",
 ]
 
@@ -127,6 +128,10 @@ class TestEnvsDefaults:
 
     def test_use_flydsl_gather_kv_b_proj_default(self):
         assert _get_envs().ATOM_USE_FLYDSL_GATHER_KV_B_PROJ is True
+
+    def test_unfused_gather_kv_b_proj_default(self):
+        """Off: the fused kernel is the right answer wherever it compiles."""
+        assert _get_envs().ATOM_UNFUSED_GATHER_KV_B_PROJ is False
 
     def test_use_flydsl_fp8_prefill_attn_default(self):
         assert _get_envs().ATOM_USE_FLYDSL_FP8_PREFILL_ATTN is False
@@ -241,6 +246,14 @@ class TestEnvsOverrides:
     def test_use_flydsl_gather_kv_b_proj_only_one_enables(self, monkeypatch):
         monkeypatch.setenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "true")
         assert _get_envs().ATOM_USE_FLYDSL_GATHER_KV_B_PROJ is False
+
+    def test_unfused_gather_kv_b_proj_enabled(self, monkeypatch):
+        monkeypatch.setenv("ATOM_UNFUSED_GATHER_KV_B_PROJ", "1")
+        assert _get_envs().ATOM_UNFUSED_GATHER_KV_B_PROJ is True
+
+    def test_unfused_gather_kv_b_proj_only_one_enables(self, monkeypatch):
+        monkeypatch.setenv("ATOM_UNFUSED_GATHER_KV_B_PROJ", "true")
+        assert _get_envs().ATOM_UNFUSED_GATHER_KV_B_PROJ is False
 
 
 class TestIsSet:

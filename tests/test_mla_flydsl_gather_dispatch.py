@@ -31,6 +31,7 @@ def _impl(**over):
         "kv_b_proj": SimpleNamespace(weight=SimpleNamespace(is_shuffled=True)),
         "_k_scale": None,
         "use_flydsl_gather_kv_b_proj": True,
+        "use_unfused_gather_kv_b_proj": False,
         "_flydsl_gather_ok": None,
         "_flydsl_gather_fp8_ok": None,
     }
@@ -91,6 +92,31 @@ def test_env_off_never_asks(spies):
     _gather(impl)
     assert (spies.flydsl, spies.triton) == (0, 1)
     assert spies.asked == 0
+
+
+@pytest.mark.parametrize("flydsl_ok, flydsl, unfused", [(True, 1, 0), (False, 0, 1)])
+def test_unfused_replaces_only_the_triton_op(spies, monkeypatch, flydsl_ok, flydsl,
+                                             unfused):
+    """ATOM_UNFUSED_GATHER_KV_B_PROJ is the last resort, not the first.
+
+    It is a torch chain that exists so a target whose Triton cannot compile the
+    fused kernel can still serve. Where a kernel backend works, it wins -- so the
+    env must displace the Triton op and nothing above it.
+    """
+    calls = []
+    monkeypatch.setattr(mla, "unfused_gather_kv_b_proj", lambda *a, **k: calls.append(a))
+    spies.answer = flydsl_ok
+    _gather(_impl(use_unfused_gather_kv_b_proj=True))
+    assert (spies.flydsl, len(calls), spies.triton) == (flydsl, unfused, 0)
+
+
+def test_unfused_off_keeps_the_triton_op(spies, monkeypatch):
+    monkeypatch.setattr(
+        mla, "unfused_gather_kv_b_proj", Mock(side_effect=AssertionError("unexpected"))
+    )
+    spies.answer = False
+    _gather(_impl())
+    assert spies.triton == 1
 
 
 @pytest.mark.parametrize("supported", [False, True])
