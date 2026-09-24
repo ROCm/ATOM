@@ -578,7 +578,7 @@ RUN echo "========== [ATOM] Install LMCache ROCm torch 2.10 wheel ==========" &&
         opentelemetry-exporter-otlp==1.40.0 \
         opentelemetry-exporter-prometheus==0.61b0 \
         "grpcio>=1.78.0" "protobuf>=6.31.1,<7" && \
-    "${VENV_PYTHON}" -m pip install --no-deps "/tmp/${lmcache_wheel}" && \
+    "${VENV_PYTHON}" -m pip install --no-deps "${lmcache_wheel}" && \
     rm -rf /tmp/lmcache-wheel && \
     "${VENV_PYTHON}" -c "import torch; torch.cuda.is_available = lambda: True; import lmcache, lmcache.cuda_ops, lmcache.lmcache_native; \
 from lmcache.v1.cache_engine import LMCacheEngineBuilder; \
