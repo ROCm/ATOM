@@ -70,6 +70,7 @@ from .protocol import (
     CompletionRequest,
     ModelCard,
     ModelList,
+    StartProfileRequest,
     validate_max_tokens,
 )
 from .reasoning import (
@@ -2751,14 +2752,43 @@ async def server_info():
 
 
 @app.post("/start_profile")
-async def start_profile():
-    """Start profiling the engine."""
+async def start_profile(request: StartProfileRequest | None = None):
+    """Start profiling the engine.
+
+    An omitted window field falls back to its ``--profiler-*-iters`` flag.
+    """
     try:
-        engine.start_profile()
-        return {"status": "success", "message": "Profiling started"}
+        results = engine.start_profile(
+            delay_iters=None if request is None else request.delay_iters,
+            max_iters=None if request is None else request.max_iters,
+        )
     except Exception as e:
         logger.exception("Failed to start profiling")
         raise HTTPException(status_code=500, detail=f"Failed to start profiling: {e!s}")
+    errors = [r["error"] for r in results if "error" in r]
+    if errors:
+        # A conflict means no engine was started, so the caller can retry
+        # after a /stop_profile. Anything else failed on our side.
+        conflict = any(r.get("conflict") for r in results)
+        detail = errors[0]
+        if len(errors) < len(results):
+            detail = (
+                f"{detail} ({len(errors)} of {len(results)} engines refused; "
+                "none were started.)"
+            )
+        raise HTTPException(status_code=409 if conflict else 500, detail=detail)
+    message = next(
+        (r["message"] for r in results if "message" in r), "Profiling started"
+    )
+    response = {"status": "success", "message": message}
+    # Present only when a delay is configured, so a client can wait out the
+    # window without parsing the message.
+    armed = next(
+        (r["armed_after_iters"] for r in results if "armed_after_iters" in r), None
+    )
+    if armed is not None:
+        response["armed_after_iters"] = armed
+    return response
 
 
 @app.post("/stop_profile")
@@ -2766,9 +2796,13 @@ async def stop_profile():
     """Stop profiling the engine."""
     try:
         traces = engine.stop_profile()
+        # An engine whose delay_iters failed to start reports it here.
+        errors = [t["error"] for t in traces if isinstance(t, dict) and "error" in t]
         return {
-            "status": "success",
-            "message": "Profiling stopped. Trace files generated.",
+            "status": "error" if errors else "success",
+            "message": (
+                errors[0] if errors else "Profiling stopped. Trace files generated."
+            ),
             "traces": traces,
         }
     except Exception as e:

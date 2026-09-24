@@ -30,6 +30,14 @@ class EngineUtilityHandler:
         Label used in log messages (default ``"Engine Core"``).
     scheduler : Scheduler, optional
         The scheduler instance, needed by MTP statistics handlers.
+    profiler_delay_iters : int, optional
+        Engine steps to skip after ``start_profile`` before the profiler
+        records (default 0, record immediately). A ``start_profile`` carrying
+        its own ``delay_iters`` overrides this for that run only.
+    profiler_max_iters : int, optional
+        Recorded steps after which the profiler stops itself (default 0, run
+        until ``stop_profile``). A ``start_profile`` carrying
+        its own ``max_iters`` overrides this for that run only.
     """
 
     # Utility command name  ->  handler method name
@@ -42,6 +50,9 @@ class EngineUtilityHandler:
         "clear_kv_cache": "_handle_clear_kv_cache",
         "configure_hidden_states": "_handle_configure_hidden_states",
         "start_profile": "_handle_start_profile",
+        "reserve_profile": "_handle_reserve_profile",
+        "commit_profile": "_handle_commit_profile",
+        "release_profile": "_handle_release_profile",
         "stop_profile": "_handle_stop_profile",
         "get_mtp_stats": "_handle_get_mtp_stats",
         "get_mtp_statistics": "_handle_get_mtp_statistics",
@@ -49,13 +60,35 @@ class EngineUtilityHandler:
         "abort_request": "_handle_abort_request",
     }
 
+    # Stands in for a caller's token on the one-shot `start_profile` path.
+    _ONE_SHOT_RESERVATION: ClassVar[str] = "start_profile"
+
     def __init__(
-        self, runner_mgr, output_queue, label: str = "Engine Core", scheduler=None
+        self,
+        runner_mgr,
+        output_queue,
+        label: str = "Engine Core",
+        scheduler=None,
+        profiler_delay_iters: int = 0,
+        profiler_max_iters: int = 0,
     ):
         self.runner_mgr = runner_mgr
         self.output_queue = output_queue
         self.label = label
         self.scheduler = scheduler
+        self.profiler_delay_iters = profiler_delay_iters
+        self.profiler_max_iters = profiler_max_iters
+        # The window in force for the current run. `start_profile` may carry
+        # its own, so these are what the counters read; the two fields above
+        # stay immutable defaults for the next request that omits them.
+        self._effective_delay_iters = profiler_delay_iters
+        self._effective_max_iters = profiler_max_iters
+        self._profiler_pending = 0
+        self._profiler_recorded = 0
+        self._profiler_active = False
+        self._profiler_reservation: str | None = None
+        self._profiler_last_error: str | None = None
+        self._profiler_deferred: str | None = None
 
     def process_queue(self, utility_queue, engine):
         """Drain *utility_queue* and execute each command.
@@ -65,7 +98,12 @@ class EngineUtilityHandler:
 
         Sleep/wake state is tracked on *engine._is_rl_weights_offloaded* so that the
         busy-loop can skip model execution while the weights are offloaded.
+
+        Every busy loop calls this at the top of every iteration, which is
+        why the profiler's deferred transition is applied from here: it is
+        the one place outside ``call_func`` that all of them reach.
         """
+        self.apply_deferred_profiler_action()
         if not engine._has_pending_utility:
             return
 
@@ -252,26 +290,195 @@ class EngineUtilityHandler:
     # Profiler
     # ------------------------------------------------------------------
 
-    def _handle_start_profile(self, args: dict):
-        result = self.runner_mgr.call_func("start_profiler", wait_out=True)
+    def _start_profiler_now(self):
+        # start_profiler returns a bare True per rank, which the caller has no
+        # use for: every branch here answers with a dict the endpoint can
+        # inspect for "error" and "message".
+        self.runner_mgr.call_func("start_profiler", wait_out=True)
         # Flip the scheduler flag so per-iteration detailed aggregates
         # (compute_detailed_aggregates) are emitted while profiling is active.
         if self.scheduler is not None:
             self.scheduler.profile_active = True
+        self._profiler_active = True
+        self._profiler_recorded = 0
+        self._profiler_last_error = None
         logger.info(f"{self.label}: profiler started")
+        return {"message": "Profiling started"}
+
+    def _stop_profiler_now(self):
+        logger.info(f"{self.label}: stopping profiler...")
+        result = self.runner_mgr.call_func("stop_profiler", wait_out=True)
+        if self.scheduler is not None:
+            self.scheduler.profile_active = False
+        self._profiler_active = False
+        self._profiler_pending = 0
+        self._profiler_reservation = None
+        logger.info(f"{self.label}: profiler stopped, result={result}")
+        return result
+
+    def _resolve_window(self, args: dict):
+        """Fix the window for one run from the request, else the launch flags.
+
+        ``int()`` because the counters step by one, and a float would miss
+        the zero they stop at. Returns an error message, or None, and only
+        pins the window when there is nothing to report.
+        """
+        delay = args.get("delay_iters")
+        max_iters = args.get("max_iters")
+        delay = self.profiler_delay_iters if delay is None else int(delay)
+        max_iters = self.profiler_max_iters if max_iters is None else int(max_iters)
+        if delay < 0 or max_iters < 0:
+            # The HTTP body is validated, but this is also reachable from
+            # `LLMEngine.start_profile`, and a negative delay counts away
+            # from zero: the window would never open.
+            return (
+                "A profiling window cannot be negative: "
+                f"delay_iters={delay}, max_iters={max_iters}."
+            )
+        self._effective_delay_iters = delay
+        self._effective_max_iters = max_iters
+        return None
+
+    def _reserve_window(self, token, args: dict) -> dict:
+        """Agree to record for *token*; no profiler is started here.
+
+        The window is pinned now, so the commit round carries no parameters.
+        """
+        if not token:
+            result = {"error": "A profiling reservation requires a token."}
+            logger.warning(f"{self.label}: {result['error']}")
+            return result
+        if self._profiler_active or self._profiler_pending:
+            result = {
+                "error": "Profiling is already in progress. Call /stop_profile first.",
+                "conflict": True,
+            }
+            logger.warning(f"{self.label}: {result['error']}")
+            return result
+        if self._profiler_reservation not in (None, token):
+            result = {
+                "error": (
+                    "Another /start_profile is being set up. "
+                    "Call /stop_profile first."
+                ),
+                "conflict": True,
+            }
+            logger.warning(f"{self.label}: {result['error']}")
+            return result
+        error = self._resolve_window(args)
+        if error is not None:
+            logger.warning(f"{self.label}: {error}")
+            return {"error": error}
+        self._profiler_reservation = token
+        # The run that failed is over; its error must not reach this one.
+        self._profiler_last_error = None
+        return {"reserved": True}
+
+    def _commit_window(self, token) -> dict:
+        """Act on a reservation: arm the delay, or start recording now."""
+        if self._profiler_reservation != token:
+            result = {"error": "No profiling reservation to commit."}
+            logger.warning(f"{self.label}: {result['error']}")
+            return result
+        self._profiler_reservation = None
+        if self._effective_delay_iters:
+            self._profiler_pending = self._effective_delay_iters
+            result = {
+                "armed_after_iters": self._effective_delay_iters,
+                "message": (
+                    f"Profiling armed. Recording starts after "
+                    f"{self._effective_delay_iters} engine steps."
+                ),
+            }
+            logger.info(f"{self.label}: {result['message']}")
+            return result
+        return self._start_profiler_now()
+
+    def _release_window(self, token) -> dict:
+        """Give up a reservation, token-matched, profiler untouched."""
+        released = self._profiler_reservation == token and token is not None
+        if released:
+            self._profiler_reservation = None
+            logger.info(f"{self.label}: profiling reservation released")
+        return {"released": released}
+
+    def _handle_reserve_profile(self, args: dict):
+        result = self._reserve_window(args.get("token"), args)
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": "reserve_profile", "result": result})
+        )
+
+    def _handle_commit_profile(self, args: dict):
+        result = self._commit_window(args.get("token"))
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": "commit_profile", "result": result})
+        )
+
+    def _handle_release_profile(self, args: dict):
+        result = self._release_window(args.get("token"))
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": "release_profile", "result": result})
+        )
+
+    def _handle_start_profile(self, args: dict):
+        """Reserve and commit in one step, for a caller holding one engine."""
+        token = args.get("token") or self._ONE_SHOT_RESERVATION
+        result = self._reserve_window(token, args)
+        if "error" not in result:
+            result = self._commit_window(token)
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "start_profile", "result": result})
         )
 
     def _handle_stop_profile(self, args: dict):
-        logger.info(f"{self.label}: stopping profiler...")
-        result = self.runner_mgr.call_func("stop_profiler", wait_out=True)
-        if self.scheduler is not None:
-            self.scheduler.profile_active = False
-        logger.info(f"{self.label}: profiler stopped, result={result}")
+        result = self._stop_profiler_now()
+        if self._profiler_last_error is not None:
+            if isinstance(result, dict):
+                result = {**result, "error": self._profiler_last_error}
+            else:
+                result = {"error": self._profiler_last_error}
+            self._profiler_last_error = None
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "stop_profile", "result": result})
         )
+
+    def profiler_step(self):
+        """Advance the profiler window once per completed forward.
+
+        Counters only. This runs from inside `call_func`, so starting or
+        stopping here would send a second RPC from the frame still holding
+        the first; the boundary is recorded and acted on from the engine
+        loop instead.
+        """
+        if self._profiler_pending:
+            self._profiler_pending -= 1
+            if self._profiler_pending == 0:
+                self._profiler_deferred = "start"
+        elif self._profiler_active and self._effective_max_iters:
+            self._profiler_recorded += 1
+            if self._profiler_recorded >= self._effective_max_iters:
+                self._profiler_deferred = "stop"
+
+    def apply_deferred_profiler_action(self):
+        """Act on a window boundary `profiler_step` reached, if any."""
+        action, self._profiler_deferred = self._profiler_deferred, None
+        if action is None:
+            return
+        try:
+            if action == "start":
+                self._start_profiler_now()
+            else:
+                self._stop_profiler_now()
+        except Exception as e:
+            # Nobody is waiting on this: the caller was answered when the
+            # window was armed. Leave the engine idle rather than stuck
+            # recording, and keep the reason for the next /stop_profile.
+            self._profiler_active = False
+            self._profiler_recorded = 0
+            self._profiler_pending = 0
+            self._profiler_reservation = None
+            self._profiler_last_error = f"profiler auto-{action} failed: {e}"
+            logger.exception(f"{self.label}: profiler auto-{action} failed")
 
     # ------------------------------------------------------------------
     # MTP statistics
