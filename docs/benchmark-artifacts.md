@@ -180,6 +180,10 @@ Node is a development dependency only. SA's v3 flattener does not consume nested
 normalized interactivity; a local viewer reads it from the ATOM summary without
 SA database IDs. Schemas under `results/schemas/` describe the file contract.
 
+Random dataset generation and client tests do not load server-side chat encoders
+or their model-weight dependencies. The benchmark CLI loads encoders when it runs;
+importing the dataset helpers does not require the engine or PyTorch.
+
 CPU tests do not establish GPU overhead or real-run completeness. Acceptance
 requires a random full bundle, an agentic run with at least two comparable
 concurrency points, and download/rebuild after runner cleanup.

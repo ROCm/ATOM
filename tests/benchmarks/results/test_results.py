@@ -41,6 +41,33 @@ FIXTURES = Path(__file__).parent / "fixtures"
 ROOT = Path(__file__).resolve().parents[3]
 
 
+def test_random_dataset_import_does_not_load_server_encoders():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import importlib.abc
+import sys
+
+class RejectServerEncoder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname == "atom.entrypoints.openai.chat_encoders":
+            raise ImportError("server encoders are unavailable in client-only CI")
+
+sys.meta_path.insert(0, RejectServerEncoder())
+from atom.benchmarks.benchmark_serving import sample_random_requests
+assert callable(sample_random_requests)
+""",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def make_bundle(tmp_path, kind="random", config=None, **kwargs):
     config = config or read_json(FIXTURES / f"{kind}-config.json")
     raw = tmp_path / "aiperf"

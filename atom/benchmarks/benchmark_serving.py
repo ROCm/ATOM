@@ -46,11 +46,6 @@ import numpy as np
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
-from atom.entrypoints.openai.chat_encoders import (
-    apply_chat_template,
-    load_custom_message_encoder,
-)
-
 from .backend_request_func import (
     ASYNC_REQUEST_FUNCS,
     RequestFuncInput,
@@ -843,6 +838,13 @@ def save_to_pytorch_benchmark_format(
 
 
 def main(args: argparse.Namespace):
+    # Server-side encoders may load model utilities; dataset-only users do not
+    # need those dependencies just to import the benchmark client.
+    from atom.entrypoints.openai.chat_encoders import (
+        apply_chat_template,
+        load_custom_message_encoder,
+    )
+
     # Raise the open-file soft limit before opening any connections. At high
     # --max-concurrency each in-flight request is a socket (fd); the default
     # RLIMIT_NOFILE soft (~1024) is exhausted client-side (EMFILE on socket()),
