@@ -145,7 +145,87 @@ done
 ```
 
 `BANDWIDTH: 0 Mb/s`, `LATENCY: 0 ns` and `VERSION: 4294967295` in `amd-smi
-fabric` are **not** faults; this firmware does not populate those fields.
+fabric` are **not** faults; this firmware does not populate those fields — they
+are unpopulated, not measured. To actually measure the link, use ubench07 below.
+
+### Validate the fabric first — ubench07
+
+Strongly recommended before the first multi-node launch, and the first thing to
+re-run when a launch hangs. The expert all-to-all rides this fabric, and **a bad
+link hangs rather than errors** — indistinguishable at the server level from the
+intermittent `ncclCommInitRank` hang. Ten minutes here saves a 25-minute cold
+start that ends in a stuck rendezvous.
+
+`07_ualoe` in the `ubench` suite tests **UALink-over-Ethernet between two
+separate OS images** using HIP fabric VMM handles: one node exports a GPU
+allocation as a fabric handle, ships it over a socket, the peer imports it and
+drives traffic across the fabric. (`06_interconnect_bandwidth` cannot do this —
+`hipMemcpyPeerAsync` only sees GPUs in the local process.) It needs ROCm ≥ 7.15
+and `amd-smi` ≥ 26.2.1, and is not part of `run_all.sh` because it needs a peer.
+
+```bash
+# AMD-internal tarball; ask your AMD contact if the host is not reachable to you
+wget http://dcgpuval-storage.amd.com/users/rexyap/MI450/Script/ubench-20260712.tar.gz
+tar xzf ubench-20260712.tar.gz && cd ubench-20260712/07_ualoe
+./rebuild.sh gfx1250          # -> build/ualoe_p2p.exe, build/ualoe_bw.exe
+```
+
+**Correctness first** — single GPU, seconds. Start the exporter first:
+
+```bash
+# node A (exporter, owns the memory and waits)
+./build/ualoe_p2p.exe export -port=55559 -gpu=0
+# node B (importer) -- peer IP is node A's DATA-PLANE address
+./build/ualoe_p2p.exe import -peer_ip=<nodeA-data-plane-ip> -port=55559 -gpu=0
+```
+
+Both sides must print `RESULT OK: 1/1 pairs PASS`. Omitting `-gpu` uses **all**
+local GPUs, pairing GPU *i* on one node with GPU *i* on the other and reporting
+the aggregate.
+
+**Then bandwidth.** `ualoe_bw` is symmetric — both sides export and import, so
+`bidir` is true full duplex. Start the `listen` side first; the `connect` side
+prints the table:
+
+```bash
+./build/ualoe_bw.exe listen  -port=55560                          # node A
+./build/ualoe_bw.exe connect -peer_ip=<nodeA-ip> -port=55560      # node B
+```
+
+Measured on this cluster (4 GPU pairs aggregated, 1 GB transfers):
+
+| Direction | GB/s |
+|---|---|
+| read | 2029 |
+| write | 3192 |
+| **bidirectional** | **3986** |
+
+That is the same order as intra-node XGMI, which is what rules out cross-node
+bandwidth as a concern for wide EP. **A result near ~4.5 GB/s instead means
+MNNVL is not in effect and the traffic silently fell back to TCP** — check
+`NCCL_MNNVL_ENABLE=1`. Two orders of magnitude, so this is not a subtle reading.
+
+The suite's README says `ACCEL_STATE` must be `READY`; this firmware reports
+`ACTIVE` for the same condition.
+
+#### Three ways this wastes your afternoon
+
+1. **Aggregate mode takes every GPU on both nodes.** On a shared box, confirm
+   nobody else is running first.
+2. **A dead peer leaves the `listen` side holding device memory and never
+   exiting**, and the *next* round then fails silently — no table, no error.
+   Clean up between rounds:
+   ```bash
+   ps -eo pid,args --no-headers \
+     | awk '$2 ~ /ualoe_(bw|p2p)\.exe$/ {print $1}' | xargs -r kill -9
+   ```
+   Do **not** use `pkill -f ualoe`: your own command line contains that string,
+   so it kills the shell you are typing in.
+3. **Fabric failures land in `dmesg`, not on stdout.** The tool may just sit
+   there. Look for `IMPORT: NPA-RSP timeout from remote AccId:<n>` or
+   `LSDMA PIO error`. Map the id back with `accel 4*(N-1) .. +3` for node *N* —
+   `ACCELERATOR_ID` from `amd-smi fabric` is the same global numbering — to find
+   which node and which GPU is at fault.
 
 **Other requirements**
 
@@ -442,8 +522,9 @@ max_tokens=3500  -> content='...#### 72'  finish_reason=stop
 | `assert not ca_comm.disabled` kills the ModelRunner while HTTP stays up | `ATOM_USE_CUSTOM_ALL_GATHER` and `AITER_CUSTOM_AR_USE_SYMM_MEM` must be set together |
 | MoE GUGU layout error | `ATOM_MOE_GU_ITLV=1` |
 | `ATOM_USE_TRITON_MOE_DECODE=1` asserts | K3's activation is `situ`, not SiLU |
-| Startup stops at `load RCCL version`, CPU spinning at ~110% | Intermittent `ncclCommInitRank` hang. Retry; allow ≥25 min |
-| Multi-node rendezvous hangs with no error | Nodes are not in the same `PPOD_ID` / `VPOD_ID` domain |
+| Startup stops at `load RCCL version`, CPU spinning at ~110% | Intermittent `ncclCommInitRank` hang. Retry; allow ≥25 min. Looks identical to a bad fabric — rule that out with [ubench07](#validate-the-fabric-first--ubench07) once, then retry |
+| Multi-node rendezvous hangs with no error | Nodes are not in the same `PPOD_ID` / `VPOD_ID` domain, or the fabric itself is bad. Confirm with [ubench07](#validate-the-fabric-first--ubench07) before blaming the engine |
+| Cross-node bandwidth ~4.5 GB/s instead of thousands | MNNVL not in effect, silently fell back to TCP. Set `NCCL_MNNVL_ENABLE=1` |
 | Log appears frozen | tqdm writes `\r`; pipe through `tr '\r' '\n'` |
 
 ---
