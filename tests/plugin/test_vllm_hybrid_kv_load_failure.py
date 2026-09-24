@@ -77,15 +77,16 @@ def _install_vllm_stubs() -> None:
 
 _install_vllm_stubs()
 
-from atom.plugin.vllm.scheduler import (  # noqa: E402
-    _HybridKVLoadFailureMixin,
-    select_scheduler_cls,
-    vllm_needs_hybrid_kv_load_fix,
-)
-from vllm.v1.kv_cache_interface import (  # noqa: E402
+from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
     EncoderOnlyAttentionSpec,
+)
+
+from atom.plugin.vllm.scheduler import (
+    _HybridKVLoadFailureMixin,
+    select_scheduler_cls,
+    vllm_needs_hybrid_kv_load_fix,
 )
 
 

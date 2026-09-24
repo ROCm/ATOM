@@ -109,11 +109,7 @@ def _glm_dsa_registration(
     ``indexers`` layers. The contiguous prefix is the small fixture; the
     checkpoint's own layer ids are ``GLM53_FULL_INDEXER_LAYERS``.
     """
-    owned = (
-        set(indexer_layers)
-        if indexer_layers is not None
-        else set(range(indexers))
-    )
+    owned = set(indexer_layers) if indexer_layers is not None else set(range(indexers))
     kv: dict[str, torch.Tensor] = {}
     for i in range(layers):
         kv[f"model.layers.{i}.self_attn.attn"] = _mla()
@@ -177,14 +173,12 @@ def test_checkpoint_indexer_layers_are_not_a_contiguous_prefix():
     assert 3 not in full and 4 not in full and 5 not in full
     assert full[3] == 6 and full[-1] == TOTAL_LAYERS - 4
 
-    tensors = build_kv_cache_tensors(
-        _glm_dsa_registration(indexer_layers=full)
-    )
+    tensors = build_kv_cache_tensors(_glm_dsa_registration(indexer_layers=full))
 
-    assert [i for i, t in enumerate(tensors) if t.index_cache is not None] == list(
-        full
+    assert [i for i, t in enumerate(tensors) if t.index_cache is not None] == list(full)
+    assert all(
+        t.index_cache.shape[-1] == IDX_DIM for t in tensors if t.index_cache is not None
     )
-    assert all(t.index_cache.shape[-1] == IDX_DIM for t in tensors if t.index_cache is not None)
 
 
 def test_packed_indexer_scale_round_trips_with_its_row():
@@ -203,7 +197,9 @@ def test_packed_indexer_scale_round_trips_with_its_row():
     kv: dict[str, torch.Tensor] = {}
     scales: dict[int, torch.Tensor] = {}
     for i in range(n_layers):
-        mla = torch.arange(nb * BS * MLA_DIM, dtype=torch.uint8).reshape(nb, BS, MLA_DIM)
+        mla = torch.arange(nb * BS * MLA_DIM, dtype=torch.uint8).reshape(
+            nb, BS, MLA_DIM
+        )
         mla.add_(i)
         kv[f"model.layers.{i}.self_attn.attn"] = mla
         if i in full:
