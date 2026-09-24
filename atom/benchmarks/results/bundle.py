@@ -234,6 +234,7 @@ def build_bundle(
                 "server_metrics_export.json",
                 "server_metrics_export.csv",
                 "inputs.json",
+                "dataset-identity.json",
                 "profile_export_raw.jsonl",
                 "profile_export_aiperf_timeslices.json",
                 "aiperf.log",
@@ -268,6 +269,18 @@ def build_bundle(
             inputs = Path(raw_dir) / "inputs.json"
             if inputs.is_file():
                 config["workload"]["dataset_content_sha256"] = sha256(inputs)
+            identity_path = Path(raw_dir) / "dataset-identity.json"
+            if identity_path.is_file():
+                identity = read_json(identity_path)
+                if identity.get("dataset_provenance") != run_meta.get("dataset"):
+                    raise ValueError(
+                        "Dataset identity does not match the AIPerf export"
+                    )
+                files = identity.get("files", [])
+                digest = identity.get("dataset_content_sha256")
+                if not files or fingerprint(files) != digest:
+                    raise ValueError("Invalid dataset content ledger")
+                config["workload"]["dataset_content_sha256"] = digest
             if type(config["validity"].get("submission_valid")) is not bool:
                 measurement_errors.append(
                     "AIPerf submission validity missing or malformed"

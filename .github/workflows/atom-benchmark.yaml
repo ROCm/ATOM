@@ -25,7 +25,7 @@ on:
   workflow_dispatch:
     inputs:
       agentic_profile:
-        description: "Select test/nightly to run ONLY the agentic workflow; random keeps the model checkboxes below"
+        description: "Select test/nightly to run ONLY agentic benchmarks; random keeps the model checkboxes below"
         type: choice
         options: [random, test, nightly]
         default: random
@@ -137,45 +137,46 @@ env:
   CADENCE: ${{ github.event_name == 'schedule' && github.event.schedule == '37 4 * * 0' && 'weekly' || 'nightly' }}
 
 jobs:
-  agentic:
-    name: Agentic benchmark
-    if: github.event_name == 'workflow_dispatch' && inputs.agentic_profile != 'random' && inputs.agentic_profile != ''
-    uses: ./.github/workflows/atom-agentic-benchmark.yaml
-    permissions:
-      contents: read
-    secrets: inherit
-    with:
-      profile: ${{ inputs.agentic_profile }}
-      image: ${{ inputs.image || '' }}
-      runner: ${{ inputs.runner || '' }}
-      atom_commit: ${{ inputs.atom_commit || '' }}
-      aiter_commit: ${{ inputs.aiter_commit || '' }}
-      extra_args: ${{ inputs.extra_args || '' }}
-      enable_profiler: ${{ inputs.enable_profiler || false }}
-      enable_rtl: ${{ inputs.enable_rtl || false }}
-
   # Single source of the benchmark matrix. Expands the structured catalog
   # (.github/benchmark/models.json) into fully-resolved per-run "cells" — one
   # matrix dimension — applying model selection and per-variant concurrency
   # bands in one place. See .github/scripts/{catalog,build_benchmark_matrix}.py
   # and .github/benchmark/README.md.
   build-matrix:
-    if: inputs.agentic_profile == '' || inputs.agentic_profile == 'random'
     name: Build benchmark matrix
     runs-on: ubuntu-latest
     outputs:
       configs_json: ${{ steps.build.outputs.configs_json }}
       has_cells: ${{ steps.build.outputs.has_cells }}
+      checkout_sha: ${{ steps.revision.outputs.sha }}
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.atom_commit || github.ref }}
+          ref: ${{ inputs.atom_commit || github.sha }}
+      - name: Record checked-out commit
+        id: revision
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - id: build
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUTS_JSON: ${{ toJson(inputs) }}
           CADENCE: ${{ env.CADENCE }}
-        run: python3 .github/scripts/build_benchmark_matrix.py
+          AGENTIC_PROFILE: ${{ inputs.agentic_profile }}
+          AGENTIC_RUN_CONFIG_DIR: agentic-run-config
+        run: |
+          if [[ "$EVENT_NAME" == workflow_dispatch && "$AGENTIC_PROFILE" != random && -n "$AGENTIC_PROFILE" ]]; then
+            python3 .github/scripts/build_agentic_benchmark_matrix.py
+          else
+            python3 .github/scripts/build_benchmark_matrix.py
+          fi
+      - name: Save agentic run configuration
+        if: github.event_name == 'workflow_dispatch' && inputs.agentic_profile != 'random' && inputs.agentic_profile != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: atom-agentic-run-config-${{ github.run_attempt }}
+          path: agentic-run-config/
+          retention-days: 15
+          if-no-files-found: error
 
   # Top-level fan-out: one matrix entry per (model variant × scenario) config.
   # Each invokes benchmark-tmpl.yml, which fans out over the config's
@@ -184,7 +185,7 @@ jobs:
   # (config × conc) cell still runs as its own parallel job; the caller job name
   # stays `benchmark` so downstream `needs:` are unchanged.
   benchmark:
-    name: ${{ matrix.config.display }} ${{ matrix.config.scenario }}
+    name: ${{ matrix.config.display }} ${{ matrix.config.bench_kind == 'aiperf_agentic' && 'agentic' || matrix.config.scenario }}
     needs: [build-matrix]
     if: >-
       !cancelled()
@@ -215,7 +216,7 @@ jobs:
       enable_profiler: ${{ inputs.enable_profiler || false }}
       enable_rtl: ${{ inputs.enable_rtl || false }}
       extra_args: ${{ inputs.extra_args || '' }}
-      atom_commit: ${{ inputs.atom_commit || '' }}
+      atom_commit: ${{ needs.build-matrix.outputs.checkout_sha }}
       aiter_commit: ${{ inputs.aiter_commit || '' }}
 
   summarize-benchmark-result:

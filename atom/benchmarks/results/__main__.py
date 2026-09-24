@@ -15,6 +15,10 @@ def main(argv=None):
     launch = commands.add_parser("capture-launch")
     launch.add_argument("--output", required=True)
     launch.add_argument("args", nargs=argparse.REMAINDER)
+    dataset = commands.add_parser("capture-hf-dataset")
+    dataset.add_argument("--cache-dir", required=True)
+    dataset.add_argument("--export", required=True)
+    dataset.add_argument("--output", required=True)
     capture = commands.add_parser("capture-config")
     capture.add_argument("--output", required=True)
     capture.add_argument("--launch")
@@ -66,6 +70,10 @@ def main(argv=None):
                     "atom_sha": git_sha(Path.cwd()),
                 },
             )
+        elif args.command == "capture-hf-dataset":
+            from .metadata import capture_hf_dataset
+
+            write_json(args.output, capture_hf_dataset(args.cache_dir, args.export))
         elif args.command == "capture-config":
             from .metadata import capture_config
 
@@ -107,15 +115,19 @@ def main(argv=None):
                 client_launch=args.client_launch,
                 harness_summary=args.harness_summary,
             )
+            validation = read_json(Path(args.output) / "validation.json")
             print(
                 json.dumps(
                     {
                         "output": args.output,
                         "status": result["status"],
                         "point_id": result["point_id"],
+                        "missing": validation["missing"],
                     }
                 )
             )
+            for reason in validation["missing"]:
+                print(f"Bundle incomplete: {reason}", file=sys.stderr)
             if result["status"] == "failed":
                 return 1
             if args.require_full and result["status"] != "complete":

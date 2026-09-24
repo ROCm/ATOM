@@ -396,10 +396,22 @@ jobs:
           DIAGNOSTICS_URL: ${{ steps.bundle-diagnostics.outputs.artifact-url }}
         with:
           script: |
+            const fs = require('fs');
+            const path = require('path');
             const escape = value => String(value).replace(/[&<>"']/g, char =>
               ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[char]));
             core.summary.addHeading(escape(`${process.env.POINT_DISPLAY} · c=${process.env.CONC}`));
             core.summary.addRaw(`Status before cleanup: ${escape(process.env.POINT_STATUS)}\n\n`);
+            const validationPath = path.join('benchmark-bundles', process.env.RESULT_FILENAME, 'validation.json');
+            if (fs.existsSync(validationPath)) {
+              const validation = JSON.parse(fs.readFileSync(validationPath, 'utf8'));
+              core.summary.addRaw(`Bundle complete: ${validation.complete}; measurement valid: ${validation.measurement_valid}\n\n`);
+              for (const reason of validation.missing || []) {
+                core.summary.addRaw(`- ${escape(reason)}\n`);
+                core.warning(`Bundle incomplete: ${reason}`);
+              }
+              core.summary.addRaw('\n');
+            }
             for (const [label, url] of [
               ['Summary bundle', process.env.SUMMARY_URL],
               ['Full bundle', process.env.BUNDLE_URL],

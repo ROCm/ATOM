@@ -412,7 +412,7 @@ def test_agentic_gpu_workflow_only_runs_manually_or_on_schedule():
         (REPO / ".github/workflows/atom-agentic-benchmark.yaml").read_text()
     )
     triggers = workflow.get("on", workflow.get(True))
-    assert set(triggers) == {"workflow_dispatch", "schedule", "workflow_call"}
+    assert set(triggers) == {"workflow_dispatch", "schedule"}
     assert workflow["jobs"]["benchmark"]["uses"] == (
         "./.github/workflows/benchmark-tmpl.yml"
     )
@@ -485,3 +485,33 @@ def test_agentic_manual_default_stays_a_two_point_test():
     assert "--cudagraph-mode FULL" in config["server_args"]
     assert "AIPERF_BENCHMARK_DURATION=900" in config["env_vars"]
     assert config["image"] == "rocm/atom-dev:latest"
+
+
+@pytest.mark.parametrize("profile", ["test", "nightly"])
+def test_existing_workflow_agentic_entry_preserves_profile(
+    tmp_path, monkeypatch, profile
+):
+    import json
+
+    from build_agentic_benchmark_matrix import build_configs, main
+
+    output = tmp_path / "github-output"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv(
+        "INPUTS_JSON", json.dumps({"agentic_profile": profile, "deepseek-v4-pro": True})
+    )
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    monkeypatch.setenv(
+        "GITHUB_WORKFLOW_REF",
+        "ROCm/ATOM/.github/workflows/atom-benchmark.yaml@refs/heads/test",
+    )
+    monkeypatch.setenv("AGENTIC_RUN_CONFIG_DIR", str(config_dir))
+    assert main() == 0
+    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert json.loads(values["configs_json"]) == build_configs(
+        inputs={"profile": profile}
+    )
+    dispatch = json.loads((config_dir / "dispatch-inputs.json").read_text())
+    assert dispatch["agentic_profile"] == profile
+    assert "deepseek-v4-pro" not in dispatch and "profile" not in dispatch

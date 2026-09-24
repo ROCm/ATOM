@@ -13,11 +13,12 @@ code. The manual default remains DeepSeek V4.1 Flash + DSpark5, TP4 with FULL
 graphs, concurrency 2/4 and 900 seconds per point. Nightly follows InferenceX
 PR #3387: TP2 c=1/2/8/16/32/64 and TP4 c=2/8/16/32/64, 3600 seconds per point,
 5 warmup requests per lane and fixed AL 3.51. The existing ATOM Benchmark manual
-entry can delegate to either profile via `agentic_profile`; random model
+entry can select either profile via `agentic_profile`; random model
 checkboxes and dashboard jobs are skipped in that mode. Manual `dry_run` previews
 the matrix without GPU jobs; run summaries include configuration, replay commands
 and per-point artifact links. Titles use `manual (<actor>)` / `nightly` with
-GitHub's native run number. Both workflows reuse
+GitHub's native run number. Both entries group jobs as model configuration →
+concurrency points and directly reuse
 `benchmark-tmpl.yml`; the agentic workflow publishes data artifacts for external
 consumers, including AgenticViewer. See
 [`benchmark-artifacts.md`](../../docs/benchmark-artifacts.md#ci-and-configuration)

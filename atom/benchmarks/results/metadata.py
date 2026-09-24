@@ -54,15 +54,59 @@ PERFORMANCE_KEYS = {
 
 
 def git_sha(path):
+    # Container bind mounts can be owned by the host UID. Trust only the
+    # inspected checkout for this read, without changing global Git config.
+    path = Path(path).resolve()
     try:
         return subprocess.check_output(
-            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            [
+                "git",
+                "-c",
+                f"safe.directory={path}",
+                "-C",
+                str(path),
+                "rev-parse",
+                "HEAD",
+            ],
             stderr=subprocess.DEVNULL,
             timeout=5,
             text=True,
         ).strip()
     except (OSError, subprocess.SubprocessError):
         return None
+
+
+def capture_hf_dataset(cache_dir, export_path):
+    """Hash this replay's isolated HF cache, including the actual Arrow inputs.
+
+    AIPerf deliberately omits inputs.json for Weka traces. The caller gives HF
+    a fresh cache and disables AIPerf's mmap cache so these are the loaded data,
+    not an unrelated cached revision. Retain the ledger, not a second dataset.
+    """
+    from .io import fingerprint, sha256
+
+    export = read_json(export_path)
+    provenance = export.get("metadata", {}).get("dataset", {})
+    if not provenance.get("hf_dataset_name"):
+        raise ValueError("AIPerf export is missing the HF dataset identity")
+    cache = Path(cache_dir)
+    infos = list(cache.rglob("dataset_info.json"))
+    if len(infos) != 1:
+        raise ValueError("Expected exactly one dataset in the isolated HF cache")
+    directory = infos[0].parent
+    arrows = sorted(directory.glob("*.arrow"))
+    if not arrows:
+        raise ValueError("The replay's HF cache contains no Arrow input files")
+    files = [
+        {"path": path.name, "size": path.stat().st_size, "sha256": sha256(path)}
+        for path in [infos[0], *arrows]
+    ]
+    return {
+        "source": "isolated_hf_cache",
+        "dataset_provenance": provenance,
+        "files": files,
+        "dataset_content_sha256": fingerprint(files),
+    }
 
 
 def performance_env():

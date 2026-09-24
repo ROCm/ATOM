@@ -58,8 +58,8 @@ BF16 KV and FP8 index cache, using `FULL` CUDA graphs at concurrency 2 and 4.
 Each cell profiles for 900 seconds, uses a 262144-token context limit and 10
 additional warmup requests per lane. The replay dataset is
 `semianalysis_cc_traces_weka_062126` with 393 entries. Strict full-bundle validation
-is enabled. This graph recipe still needs a real GPU run; the earlier local
-acceptance used eager mode.
+is enabled. The initial FULL-graph CI run completed both replays; its bundles
+exposed missing checkout and dataset identities, now covered by capture regressions.
 
 The scheduled **nightly** profile (`models_agentic_nightly.json`) follows
 [InferenceX PR #3387](https://github.com/SemiAnalysisAI/InferenceX/pull/3387) at
@@ -97,8 +97,10 @@ not run from a PR. Each run retains its own artifacts without updating gh-pages.
 
 Before the new workflow is registered on the default branch, use the existing
 **ATOM Benchmark** manual entry with `agentic_profile: test` (or `nightly`). It
-calls the same agentic workflow from the selected branch, skips all random
-benchmark/dashboard/regression jobs and preserves the usual image/ref options.
+builds the same agentic matrix from the selected branch and invokes the GPU
+template directly. Both entries group jobs as model configuration → concurrency
+points, without an extra workflow wrapper. Random benchmark/dashboard/regression
+jobs are skipped and the usual image/ref options are preserved.
 The default `agentic_profile: random` retains the existing benchmark behavior.
 
 Actions run titles follow the existing benchmark convention: `manual (<actor>)`
@@ -114,13 +116,21 @@ expandable server/environment details. Every run saves an
 file pins the ATOM checkout and retains the preview flag; set `dry_run` to `false`
 to execute. Image/AITER refs still need pinning for version comparisons. Each
 GPU job also links its uploaded summary, full bundle and failure diagnostics;
-an uploaded full bundle can still be incomplete after a failed run. Configuration
+an uploaded full bundle can still be incomplete after a failed run. Missing
+requirements appear in the CLI output and per-point Actions summary. Configuration
 and data artifacts are retained for 15 days (the repository limit), diagnostics for 14 days; download
 them before expiry for long-term storage.
 
 Model revision is read from the downloaded checkpoint's `.hf-revision` marker;
 the executing image, AITER and AIPerf identities are captured at runtime. Dataset
-content is retained and hashed rather than labeled with an unverified revision.
+identity comes from retained `inputs.json` when available. For Weka (which skips
+that export), the replay uses a fresh `HF_DATASETS_CACHE` with AIPerf mmap reuse
+disabled. After replay, `capture-hf-dataset` hashes the actual Arrow files and
+`dataset_info.json`, and retains `raw/aiperf/dataset-identity.json.gz` with their
+sizes, SHA-256 hashes and exported dataset provenance. The workload content hash
+is the canonical hash of this ledger. Dataset bytes stay in temporary storage
+and are removed after capture; they are not duplicated in uploaded artifacts.
+No current remote revision or historical cache is substituted for loaded data.
 The zero ISL/OSL and ratio in artifact names are shared-template placeholders;
 agentic workload metadata leaves these dimensions null and uses actual token
 counts. The random nightly/weekly catalog remains independent.
@@ -135,7 +145,7 @@ Use the existing catalog `env_vars` or reusable workflow environment for:
 | `BENCHMARK_PRECISION` | Weight precision, separate from KV cache dtype. |
 | `BENCHMARK_MODEL_KEY` / `BENCHMARK_HARDWARE` | Optional canonical SA export keys. |
 | `ATOM_BENCHMARK_GPU_PCI_IDS` | Explicit allocated PCI IDs when HIP discovery cannot resolve allocation. |
-| `AIPERF_DATASET_REVISION` | Dataset version; retained `inputs.json` also supplies a content hash. |
+| `AIPERF_DATASET_REVISION` | Optional known dataset version; automatic capture uses the actual input content hash. |
 
 For manual shell runs, set `ATOM_BENCHMARK_CAPTURE=1` at server launch to capture
 resolved arguments. CI sets this only on benchmark containers. A standalone

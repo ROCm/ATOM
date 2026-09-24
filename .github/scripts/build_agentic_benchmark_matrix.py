@@ -239,6 +239,8 @@ def main():
             if event == "workflow_dispatch"
             else {"profile": "nightly"}
         )
+        if "agentic_profile" in inputs:
+            inputs["profile"] = inputs.pop("agentic_profile")
         configs = build_configs(inputs=inputs)
         if os.environ.get("AGENTIC_RUN_CONFIG_DIR"):
             write_run_config(

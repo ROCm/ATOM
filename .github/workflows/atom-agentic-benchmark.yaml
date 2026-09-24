@@ -6,44 +6,6 @@ on:
   schedule:
     # Daily at 08:17 UTC / 16:17 Beijing time, outside the random benchmark crons.
     - cron: '17 8 * * *'
-  workflow_call:
-    inputs:
-      profile:
-        type: string
-        default: test
-      dry_run:
-        type: boolean
-        default: false
-      models:
-        type: string
-        default: ""
-      concurrency:
-        type: string
-        default: ""
-      duration_seconds:
-        type: string
-        default: ""
-      image:
-        type: string
-        default: ""
-      runner:
-        type: string
-        default: ""
-      extra_args:
-        type: string
-        default: ""
-      atom_commit:
-        type: string
-        default: ""
-      aiter_commit:
-        type: string
-        default: ""
-      enable_profiler:
-        type: boolean
-        default: false
-      enable_rtl:
-        type: boolean
-        default: false
   workflow_dispatch:
     inputs:
       profile:

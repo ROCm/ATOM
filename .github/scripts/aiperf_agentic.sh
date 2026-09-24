@@ -191,6 +191,14 @@ run_aiperf_agentic() {
     && ctx_args=(--max-context-length "${AIPERF_MAX_CONTEXT_LENGTH}")
 
   mkdir -p "${out_dir}"
+  # Weka intentionally skips inputs.json. Isolate the actual HF inputs for a
+  # content ledger; a reused AIPerf mmap cache would bypass loading these files.
+  local dataset_cache=""
+  if [[ -n "${ATOM_BUNDLE_WORK:-}" ]]; then
+    dataset_cache=$(mktemp -d /tmp/atom-benchmark-dataset.XXXXXX)
+    export HF_DATASETS_CACHE="$dataset_cache"
+    export AIPERF_DATASET_MMAP_CACHE_ENABLED=false
+  fi
   local -a AIPERF_COMMAND
   AIPERF_COMMAND=("${AIPERF_VENV}/bin/aiperf" profile \
     "${unsafe_args[@]}" \
@@ -230,6 +238,13 @@ run_aiperf_agentic() {
   if [[ ! -f "${out_dir}/profile_export_aiperf.json" ]]; then
     echo "[aiperf][FAIL] ${out_dir}/profile_export_aiperf.json was not produced" >&2
     return 1
+  fi
+  if [[ -n "$dataset_cache" ]]; then
+    python3 -m atom.benchmarks.results capture-hf-dataset \
+      --cache-dir "$dataset_cache" --export "${out_dir}/profile_export_aiperf.json" \
+      --output "${out_dir}/dataset-identity.json" \
+      || echo '[bundle] HF dataset capture failed; completeness validation will report missing identity' >&2
+    rm -rf -- "$dataset_cache"
   fi
 }
 
