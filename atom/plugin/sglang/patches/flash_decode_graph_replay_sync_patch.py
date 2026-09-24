@@ -24,7 +24,8 @@ def apply_flash_decode_graph_replay_sync_patch() -> None:
             cls = getattr(mod, cls_name, None)
             if cls is not None:
                 runners.append(cls)
-        except Exception:
+        except (ImportError, AttributeError) as exc:
+            logger.debug("CUDA graph runner import failed (%s): %s", mod_name, exc)
             continue
     if not runners:
         logger.debug("No CUDA graph runner for Flash long-replay sync patch")
@@ -60,7 +61,7 @@ def apply_flash_decode_graph_replay_sync_patch() -> None:
                                 orig.__name__,
                                 seq,
                             )
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001
                         logger.warning("Flash long decode graph sync failed: %s", exc)
                     return result
 

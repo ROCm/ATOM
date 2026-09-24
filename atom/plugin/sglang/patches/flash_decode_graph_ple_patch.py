@@ -27,7 +27,8 @@ def apply_flash_decode_graph_ple_patch() -> None:
             HybridLinearAttnBackend = getattr(mod, "HybridLinearAttnBackend", None)
             if HybridLinearAttnBackend is not None:
                 break
-        except Exception:  # noqa: BLE001
+        except (ImportError, AttributeError) as exc:
+            logger.debug("HybridLinearAttnBackend import failed (%s): %s", mod_name, exc)
             continue
     if HybridLinearAttnBackend is None:
         logger.debug("HybridLinearAttnBackend unavailable; skip Flash PLE patch")
@@ -46,7 +47,7 @@ def apply_flash_decode_graph_ple_patch() -> None:
             )
 
             refresh_flash_decode_graph_ple(forward_batch, in_capture=in_capture)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "refresh_flash_decode_graph_ple failed (in_capture=%s): %s",
                 in_capture,
