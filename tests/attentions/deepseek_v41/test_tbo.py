@@ -304,18 +304,20 @@ def test_split_attention_reads_preceding_microbatch_window(cut):
 @pytest.mark.parametrize("layers", [1, 8])
 @pytest.mark.parametrize("stress_lifetime", [False, True])
 @pytest.mark.parametrize("level", [0, 3])
+@pytest.mark.parametrize("dispatch", ["fallback", "fused"])
 def test_dp_moe_original_schedule_preserves_outputs(
-    monkeypatch, tmp_path, unified, layers, stress_lifetime, level
+    monkeypatch, tmp_path, unified, layers, stress_lifetime, level, dispatch
 ):
     """Exercise the real MoE scheduler with delayed, local collective stand-ins.
 
     Keep the original MoE yield-before-communication schedule.
-    Exercise the actual V4.1 output hook with delayed compute and enough
-    partner allocations to reuse an unprotected comm output.
+    Exercise the V4.1 post-dispatch lifetime boundary with delayed compute
+    and enough partner allocations to reuse an unprotected comm output.
     """
     from atom.config import CompilationConfig, CUDAGraphMode
     from atom.model_ops import moe
     from atom.models.deepseek_v41.model import Block
+    from atom.models.deepseek_v41.moe import MoE
     from atom.models.deepseek_v41.runtime import DeepseekV41RuntimeModel, RuntimeBlock
     from atom.utils.decorators import support_torch_compile
     from atom.utils.forward_context import get_forward_context
@@ -405,10 +407,22 @@ def test_dp_moe_original_schedule_preserves_outputs(
         def forward(self, hidden, router):
             return torch.ops.aiter.moe_forward(hidden, router, "test")
 
+        def forward_maybe_comm_fused(self, hidden, router, shared, **kwargs):
+            if dispatch == "fused":
+                # Like the fused backend, bypass Module.__call__ and hooks.
+                return torch.ops.aiter.moe_forward(hidden, router, "test"), True
+            return self(hidden, router), False
+
+    class Gate(torch.nn.Module):
+        def forward(self, hidden):
+            return hidden + 3
+
     def block_init(self):
         torch.nn.Module.__init__(self)
-        self.ffn = torch.nn.Module()
+        self.ffn = MoE.__new__(MoE)
+        torch.nn.Module.__init__(self.ffn)
         self.ffn.experts = RoutedExperts()
+        self.ffn.gate = Gate()
 
     monkeypatch.setattr(Block, "__init__", block_init)
 
@@ -418,13 +432,14 @@ def test_dp_moe_original_schedule_preserves_outputs(
 
         def __init__(self, atom_config):
             super().__init__()
-            # Use the real runtime constructor to install the ownership hook.
+            # Keep the real V4.1 routed-expert dispatch boundary.
             self.block = RuntimeBlock()
 
         def forward(self, input_ids, positions):
             result = input_ids.float()[:, None].expand(-1, width).contiguous()
             for _ in range(layers):
-                result = self.block.ffn.experts(result, result + 3)
+                result, complete = self.block.ffn.routed_expert_forward(result)
+                assert complete == (dispatch == "fused")
             return result + torch.ones_like(result)
 
     ids = torch.arange(14, device="cuda", dtype=torch.int32)

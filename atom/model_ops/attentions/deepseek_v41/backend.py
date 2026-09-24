@@ -244,6 +244,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         self.copies.warmup()
 
     def release_kv_pools(self):
+        for _, _, done in getattr(self, "_tbo_storage", {}).values():
+            if done is not None:
+                done.synchronize()
+        self._tbo_storage = {}
         self.cache = self.copies = None
 
     def close(self):
@@ -378,16 +382,21 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
 
     @contextmanager
     def ubatch_forward(self, metadata):
-        """One Engram fork/join around both eager prefill microbatches."""
+        """Keep parent rows and child metadata alive through GPU consumption."""
         rows = metadata.engram_embeddings
-        if getattr(rows, "stage", None) is None:
-            yield
-            return
-        rows.stage()
+        staged = getattr(rows, "stage", None) is not None
         try:
+            if staged:
+                rows.stage()
             yield
         finally:
-            rows.join()
+            if staged:
+                rows.join()
+            # Worker completion only means GPU work was enqueued. Fence the
+            # child storage after its consumers, including failed forwards.
+            for _, _, done in getattr(self, "_tbo_storage", {}).values():
+                if done is not None:
+                    done.record()
 
     def _prefill_ubatch_storage(self, index):
         # Independent of the parent's buffers and decode captures. Allocate on
@@ -428,8 +437,16 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 )
                 for ratio in self.geometry.layer_ratios
             }
-            self._tbo_storage[index] = buffers, indptrs
-        return self._tbo_storage[index]
+            done = (
+                torch.cuda.Event() if torch.device(self.device).type != "cpu" else None
+            )
+            self._tbo_storage[index] = buffers, indptrs, done
+        buffers, indptrs, done = self._tbo_storage[index]
+        if done is not None:
+            # CPU writes into pinned staging must wait too; a GPU stream wait
+            # alone would still let them race the previous asynchronous H2D.
+            done.synchronize()
+        return buffers, indptrs
 
     def build_ubatch_prefill_metadata(
         self, metadata, ub_slice, running_bs, ubatch_idx=0
@@ -484,6 +501,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         )
         if step.positions.is_cuda:
             step.indptrs = fill_step_indptrs(step, self.geometry, indptrs)
+            # Also cover callers that build metadata without running a model.
+            self._tbo_storage[ubatch_idx][2].record()
         child = AttentionMetaData(
             cu_seqlens_q=step.cu_seqlens_q,
             max_seqlen_q=step.max_q_len,

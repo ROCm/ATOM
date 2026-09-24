@@ -68,29 +68,8 @@ def v41_engram(residual: torch.Tensor, layer_name: str) -> torch.Tensor:
     return Block.engram_forward(layer, residual, embeddings, metadata.image_mask)
 
 
-@torch_compile_guard(mutates_args=["output"], gen_fake=lambda output: None)
-def v41_record_tbo_expert_output(output: torch.Tensor) -> None:
-    # Keep the runtime thread/stream query opaque to compilation. The mutation
-    # dependency retains this lifetime marker before output consumers.
-    from atom.utils.tbo.ubatching import tbo_active
-
-    if tbo_active():
-        # DPA scatter allocates on comm; shared-expert combine and mHC consume
-        # on compute. The partner can reuse comm storage after this reference
-        # is dropped, before those consumers finish. Track just this output.
-        output.record_stream(torch.cuda.current_stream())
-
-
-def _record_tbo_expert_output(_module, _inputs, output):
-    v41_record_tbo_expert_output(output)
-
-
 class RuntimeBlock(Block):
     """Serving uses the same guarded ops in eager and compiled execution."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.ffn.experts.register_forward_hook(_record_tbo_expert_output)
 
     def attention_forward(self, hidden, cache, step, rope):
         return v41_attention(hidden, self.layer_name)

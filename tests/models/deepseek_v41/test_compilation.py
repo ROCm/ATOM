@@ -17,7 +17,6 @@ from atom.models.deepseek_v41.multimodal import DeepseekV41MultimodalModel
 from atom.models.deepseek_v41.runtime import (
     DeepseekV41RuntimeModel,
     RuntimeBlock,
-    _record_tbo_expert_output,
 )
 from atom.spec_decode.drafter import Drafter
 from atom.utils import forward_context
@@ -80,7 +79,6 @@ class TinyBlock(RuntimeBlock):
         self.attn_norm = nn.Identity()
         self.attn = Attention()
         self.ffn = FFN()
-        self.ffn.register_forward_hook(_record_tbo_expert_output)
         self.engram = None
 
     def prepare_attention(self, state, embeddings, image_mask):

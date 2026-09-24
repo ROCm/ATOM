@@ -180,13 +180,20 @@ Already-staged rows are sliced identically when Engram overlap is disabled.
 
 V4.1 requests communication priority -1 through `tbo_comm_stream_priority`;
 models without a declaration retain priority 0. MoE keeps the existing
-compute-to-communication yield and event order. A V4.1 runtime output hook
-records the compute consumer of the comm-allocated routed-expert result before
-shared-expert combine and mHC consume it. This prevents a partner microbatch
+compute-to-communication yield and event order. V4.1 records the compute
+consumer at the routed-expert dispatch return, covering both comm-fused and
+fallback paths before shared-expert combine and mHC consume the result. This prevents a partner microbatch
 from reusing its storage before those consumers finish. A custom-op boundary
 keeps the thread-local TBO query at runtime and retains the lifetime marker
 in compiled execution. Microbatches use the normal model call and honor the
-configured compilation level.
+configured compilation level. TP vision requests pass token-aligned image
+embeddings and masks through the split. DPA remains text-only.
+
+Child metadata storage is fenced through GPU consumption before reuse,
+including its pinned staging buffers, and released with the KV pools. When
+the private Engram TP collective is unavailable, the parent materializes one
+fallback gather per layer before launching workers; child views only wait
+for and slice these rows.
 
 Eager prefill expands index tile tables only through the largest request end,
 including cached prefixes. Paged scoring bounds each logits band by both its
@@ -196,5 +203,5 @@ single warmup and KV sizing calculation, with no additional budget policy.
 
 Correctness and overlap must be checked together: serial execution can hide
 cross-stream reuse errors, while overlapping kernels alone do not demonstrate
-an end-to-end throughput improvement. The GPU regressions exercise the runtime
-output hook under delayed consumption and partner allocation pressure.
+an end-to-end throughput improvement. The GPU regressions exercise both fused and fallback dispatch returns under
+delayed consumption and partner allocation pressure.

@@ -20,6 +20,7 @@ no fused variant to inherit.
 """
 
 import torch
+from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import mm_topk
@@ -27,6 +28,15 @@ from atom.model_ops.utils import atom_parameter
 from atom.models.deepseek_v4 import DeepseekV4Args
 from atom.models.deepseek_v4 import MoE as V4MoE
 from atom.utils.forward_context import get_forward_context
+
+
+@torch_compile_guard(mutates_args=["output"], gen_fake=lambda output: None)
+def v41_record_tbo_expert_output(output: torch.Tensor) -> None:
+    # Keep this runtime stream dependency in compiled execution as well.
+    from atom.utils.tbo.ubatching import tbo_active
+
+    if tbo_active():
+        output.record_stream(torch.cuda.current_stream())
 
 
 class MoE(V4MoE):
@@ -47,6 +57,21 @@ class MoE(V4MoE):
         )
 
         self.experts.custom_routing_function = self._topk
+
+    def routed_expert_forward(
+        self, x, shared_partial=None, before_stage2=None, stage2_stream=None
+    ):
+        routed, is_complete = super().routed_expert_forward(
+            x,
+            shared_partial=shared_partial,
+            before_stage2=before_stage2,
+            stage2_stream=stage2_stream,
+        )
+        # Both comm-fused dispatch and its fallback return here before shared
+        # combine/mHC consume the output on compute. A module forward hook
+        # misses the fused path, which calls the backend directly.
+        v41_record_tbo_expert_output(routed)
+        return routed, is_complete
 
     def _topk(self, hidden_states, gating_output, topk, renormalize):
         image_mask = getattr(get_forward_context().attn_metadata, "image_mask", None)
