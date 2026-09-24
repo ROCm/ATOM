@@ -118,6 +118,11 @@ class GDNAttentionMetadata:
     no_initial_state: torch.Tensor | None = None
     non_spec_state_indices_i64: torch.Tensor | None = None
     non_spec_state_indices_in_i64: torch.Tensor | None = None
+    # Whether any sequence in this step reads its incoming state from a slot
+    # other than the one it writes. Host-side so a backend can skip the fork
+    # handling without a device sync; the index tensors alone cannot answer it
+    # without one, and they differ as objects on every step.
+    has_state_fork: bool = False
     spec_sequence_masks: torch.Tensor | None = None  # shape: [batch,]
     spec_token_indx: torch.Tensor | None = None
     non_spec_token_indx: torch.Tensor | None = None
@@ -1190,6 +1195,7 @@ class GDNStateMixin(PoolRowsMixin):
         non_spec_state_indices_in = self.non_spec_state_indices_in_tensor.np
         spec_state_indices = self.spec_state_indices_tensor.np
         fork_srcs = getattr(batch, "state_fork_srcs", None) or ()
+        self._has_state_fork = any(s >= 0 for s in fork_srcs)
         assert not (with_spec and any(s >= 0 for s in fork_srcs)), (
             "state fork on the spec-decode path: spec_state_indices_tensor has "
             "no read-side counterpart (BlockManager only forks onto prefill)"
@@ -1368,6 +1374,7 @@ class GDNStateMixin(PoolRowsMixin):
             no_initial_state=no_initial_state,
             non_spec_state_indices_i64=non_spec_state_indices_i64,
             non_spec_state_indices_in_i64=non_spec_state_indices_in_i64,
+            has_state_fork=getattr(self, "_has_state_fork", False),
             spec_sequence_masks=spec_sequence_masks,
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
