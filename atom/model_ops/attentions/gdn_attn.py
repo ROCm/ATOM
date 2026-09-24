@@ -1546,6 +1546,13 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         result = {}
         if self.block_size == 1024:
             result = self.set_aiter_persistent_worker_buffers(running_bs)
+        # The draft advanced context_lens, and the planner bakes per-task tile
+        # ranges from it. Inheriting prepare_decode's plan would attend over the
+        # pre-bump context -- a wrong answer, and one the op cannot detect: the
+        # shape guard only compares batch and kv-head count.
+        result["flydsl_work_plan"] = self.refresh_flydsl_plan(
+            var["context_lens"].gpu[:running_bs]
+        )
         return result
 
     def build_for_cudagraph_capture(self, bs: int):
@@ -1567,6 +1574,14 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         )
 
         attn_metadata.gdn_metadata = self._build_gdn_capture_metadata(bs)
+
+        # Decode replays this graph, so the op must see a plan HERE: absent at
+        # capture time, the static path is what gets recorded and every later
+        # refresh feeds a graph that never reads it -- with no error, and an
+        # A/B of the planner that measures pure overhead.
+        attn_metadata.flydsl_work_plan = self.refresh_flydsl_plan(
+            attn_metadata.context_lens, create=True
+        )
 
         positions = var["positions"].copy_to_gpu(bs)
         # A capture runs a full synthetic batch, so nothing is padded and the

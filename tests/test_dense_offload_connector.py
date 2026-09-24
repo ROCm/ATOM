@@ -6,6 +6,9 @@ from types import SimpleNamespace
 import pytest
 
 from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
+from atom.kv_transfer.disaggregation.multi.multi_connector import (
+    MultiConnectorScheduler,
+)
 from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     LoadOperationId,
@@ -67,6 +70,9 @@ def _arm_load(scheduler, seq, *, hbm=0, lmcache=8):
         can_load=True,
     )
     scheduler._reqs_need_recv[sid] = seq
+    # An armed load always comes from a lookup, and the pin it took is what the
+    # dispatch confirms before handing the retrieve to the worker.
+    scheduler._lookup_results[sid] = (seq, lmcache)
 
 
 def _engine_scheduler(connector):
@@ -575,6 +581,246 @@ def test_hbm_catches_up_after_a_pending_cpu_lookup(monkeypatch):
     metadata = scheduler.build_connector_meta()
     assert metadata.lookup_requests_in_step == ["55"]
     assert metadata.requests == []
+
+
+def _counting_lookup(calls, hit):
+    def lookup(_tokens, lookup_id):
+        calls.append(lookup_id)
+        return hit
+
+    return SimpleNamespace(lookup=lookup, clear_lookup_status=lambda _sid: None)
+
+
+def test_native_retry_on_a_full_kv_cache_reuses_the_lookup(
+    monkeypatch, scheduler, seq_factory
+):
+    """One lookup per frontier, not one per scheduler step.
+
+    ATOM's own scheduler runs the external-tier lookup at the top of its waiting
+    loop, ahead of `can_allocate`, and every failure path puts the sequence back
+    at the head of `waiting` with its frontier untouched -- so the next step
+    asks the identical question. A complete miss pins nothing, so
+    `build_connector_meta` dispatches the lookup's cleanup and the step after
+    that hashes the whole prompt again. With the KV cache full that is every
+    step, on the scheduler thread, which is how the engine livelocks.
+    """
+
+    connector = _scheduler(monkeypatch, "kv_consumer")
+    calls = []
+    connector._lookup_client = _counting_lookup(calls, 0)
+    scheduler.kv_connector = connector
+    seq = seq_factory(list(range(24)))
+    scheduler.add(seq)
+    monkeypatch.setattr(
+        scheduler.block_manager, "can_allocate", lambda seq, **_kwargs: -1
+    )
+
+    for _ in range(8):
+        scheduler.schedule()
+
+    assert list(scheduler.waiting) == [seq]
+    assert calls == [str(seq.id)]
+    assert connector.total_lookups_skipped_by_memo == 7
+
+
+def test_native_admission_spends_the_memo(monkeypatch, scheduler, seq_factory):
+    """Admission spends the remembered hit.
+
+    Once the request is scheduled its load spec has been dispatched and its
+    frontier moves, so the next question about this id is a different one and
+    has to reach the tier. A preempted request therefore pays for one lookup,
+    not for a replay of an answer that no longer describes anything.
+    """
+
+    connector = _scheduler(monkeypatch, "kv_consumer")
+    calls = []
+    connector._lookup_client = _counting_lookup(calls, 0)
+    scheduler.kv_connector = connector
+    seq = seq_factory(list(range(24)))
+    scheduler.add(seq)
+    kv_full = {"yes": True}
+    can_allocate = scheduler.block_manager.can_allocate
+    monkeypatch.setattr(
+        scheduler.block_manager,
+        "can_allocate",
+        lambda seq, **kwargs: -1 if kv_full["yes"] else can_allocate(seq, **kwargs),
+    )
+
+    scheduler.schedule()
+    assert calls == [str(seq.id)]
+    assert str(seq.id) in connector._tier_hit_memo
+
+    kv_full["yes"] = False
+    scheduler.schedule()
+
+    assert list(scheduler.waiting) == []
+    assert connector._tier_hit_memo == {}
+
+
+def test_a_declined_load_is_not_looked_up_again_every_step(monkeypatch):
+    """The plugin's shape: the decline is what releases the lookup.
+
+    vLLM hands ATOM the real HBM frontier, so `should_park_for_load_after_alloc`
+    routinely declines a hit -- already covered by HBM, unaligned, or below the
+    transfer floor. Declining clears the pending load, which makes the lookup
+    dispatchable, so the pin is gone by the next step. The request is still at
+    the head of the waiting queue, so without the remembered hit the next step
+    pays the tier again. A declined hit parks nothing, so the remembered answer
+    is the whole answer and no lookup is needed to escalate it.
+    """
+
+    sched = _scheduler(monkeypatch, "kv_consumer")
+    sched._min_load_tokens = 8192  # every hit here is "too small" to transfer
+    calls = []
+    sched._lookup_client = _counting_lookup(calls, 16)
+    seq = _load_seq(60, num_prompt_tokens=24)
+
+    for _ in range(8):
+        need, _park = sched.get_num_new_matched_tokens(seq)
+        assert not (need > 0 and sched.should_park_for_load_after_alloc(seq))
+        sched.build_connector_meta()
+
+    assert calls == ["60"]
+    assert sched.total_lookups_skipped_by_memo == 7
+    assert "60" not in sched._load_specs
+
+
+def test_a_moved_frontier_is_re_derived_from_the_same_hit(monkeypatch):
+    """The frontier moves; the tier's answer about the prompt does not.
+
+    How much of the prompt the tier holds is a property of the prompt, so the
+    HBM frontier is not part of the question -- it only decides how much of
+    that hit is still worth transferring. Re-asking the tier because the
+    frontier moved would pay for the one expensive input again to learn
+    something already known.
+    """
+
+    sched = _scheduler(monkeypatch, "kv_consumer")
+    sched._min_load_tokens = 0
+    calls = []
+    sched._lookup_client = _counting_lookup(calls, 16)
+    seq = _load_seq(61, num_prompt_tokens=24)
+
+    assert sched.get_num_new_matched_tokens(seq) == (16, True)
+    sched.build_connector_meta()
+    seq.num_cached_tokens = 8
+
+    assert sched.get_num_new_matched_tokens(seq) == (8, True)
+    assert calls == ["61"]
+
+
+def test_a_failed_lookup_backs_off_before_it_is_retried(monkeypatch):
+    """A timeout is not an answer, but retrying it every step is what hurts.
+
+    Each retry costs `lmcache.mp.lookup_timeout` seconds *of the scheduler
+    thread*, so a tier that has stopped replying would stall the engine harder
+    than the hashing did. The non-answer is remembered too, for
+    `OFFLOAD_LOOKUP_RETRY_STEPS` steps, and then the tier is asked again -- a
+    dropped reply must not become a permanent miss for the rest of the
+    request's life.
+    """
+
+    sched = _scheduler(monkeypatch, "kv_consumer")
+    sched._min_load_tokens = 0
+    sched._tier_retry_steps = 1
+    replies = [None, 16]
+    calls = []
+
+    def lookup(_tokens, lookup_id):
+        calls.append(lookup_id)
+        return replies.pop(0)
+
+    sched._lookup_client = SimpleNamespace(
+        lookup=lookup, clear_lookup_status=lambda _sid: None
+    )
+    seq = _load_seq(62, num_prompt_tokens=24)
+
+    assert sched.get_num_new_matched_tokens(seq) == (0, False)
+    sched.build_connector_meta()
+
+    # Inside the backoff: answered from the remembered non-answer.
+    assert sched.get_num_new_matched_tokens(seq) == (0, False)
+    assert calls == ["62"]
+    sched.build_connector_meta()
+
+    # Budget spent: the tier is asked again.
+    assert sched.get_num_new_matched_tokens(seq) == (16, True)
+    assert calls == ["62", "62"]
+
+
+def test_a_stale_memo_expires_and_asks_the_tier_again(monkeypatch):
+    """The remembered hit describes a tier that keeps moving.
+
+    Nothing tells this connector that another engine stored a longer prefix, or
+    that this one evicted the prefix it matched. So the memo is a bounded
+    optimisation, not a cache: after `OFFLOAD_LOOKUP_MEMO_STEPS` replays the
+    question is put to the tier again.
+    """
+
+    sched = _scheduler(monkeypatch, "kv_consumer")
+    sched._min_load_tokens = 8192  # every hit here is declined after alloc
+    sched._tier_memo_steps = 2
+    calls = []
+    sched._lookup_client = _counting_lookup(calls, 16)
+    seq = _load_seq(65, num_prompt_tokens=24)
+
+    for _ in range(4):
+        need, _park = sched.get_num_new_matched_tokens(seq)
+        if need > 0:
+            sched.should_park_for_load_after_alloc(seq)
+        sched.build_connector_meta()
+
+    assert calls == ["65", "65"]
+
+
+def test_a_multi_connector_cancel_re_arms_honestly(monkeypatch):
+    """Losing to another sub must not cost a fresh hash every step.
+
+    `MultiConnectorScheduler` queries *every* sub on every scheduler pass and
+    cancels the pending load of everyone but the winner, so under the supported
+    `[moriio, lmcache_offload]` ordering the offload sub arms a load and has it
+    taken away. The cancel does not forget the hit: the tier did not stop
+    holding the prefix because another connector won this step. So when moriio
+    stops matching -- its `kv_async_tagged` is one-shot -- the offload sub
+    answers from what it already knows, and only the dispatch pays the tier.
+    """
+
+    sched = _scheduler(monkeypatch, "kv_consumer")
+    sched._min_load_tokens = 0
+    calls = []
+    sched._lookup_client = _counting_lookup(calls, 16)
+    moriio_matched = {"yes": False}
+
+    def moriio_match(_seq):
+        if moriio_matched["yes"]:
+            return 0, False
+        moriio_matched["yes"] = True
+        return 16, True
+
+    moriio = SimpleNamespace(get_num_new_matched_tokens=moriio_match)
+    multi = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
+    multi._connectors = [moriio, sched]
+    multi._load_winner = {}
+    seq = _load_seq(64, num_prompt_tokens=24)
+
+    for _ in range(5):
+        assert multi.get_num_new_matched_tokens(seq) == (16, True)
+        sched.build_connector_meta()
+
+    assert calls == ["64"]
+    assert sched._load_specs["64"].lmcache_cached_tokens == 16
+
+
+def test_a_finished_request_leaves_no_memo_behind(monkeypatch):
+    sched = _scheduler(monkeypatch, "kv_consumer")
+    calls = []
+    sched._lookup_client = _counting_lookup(calls, 0)
+    seq = _load_seq(63, num_prompt_tokens=24)
+
+    sched.get_num_new_matched_tokens(seq)
+    sched.request_finished(seq)
+
+    assert sched._tier_hit_memo == {}
 
 
 def test_cpu_pin_is_retained_until_retrieve_finishes(monkeypatch):

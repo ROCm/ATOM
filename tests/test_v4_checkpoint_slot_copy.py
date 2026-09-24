@@ -52,7 +52,11 @@ from atom.model_ops.attentions.pool_layout.entry_arena import (
     field_extents,
 )
 from atom.model_ops.attentions.pool_layout.paged_state_copy import plan_segmented_copy
-from atom.model_ops.attentions.pool_layout.v4_pool_fields import main_kv_plane_fields
+from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+    FP4_GFX950_PRESHUFFLE,
+    FP4_GFX1250_NATURAL,
+    main_kv_plane_fields,
+)
 from atom.model_ops.attentions.pool_layout.v4_pool_geometry import CSA_RATIO, HCA_RATIO
 
 NEG_INF = float("-inf")
@@ -425,6 +429,8 @@ class TestTheBuilderDeclaresWhatItDrops:
             compress_ratios = (0, 0, 4, 128, 4, 128, 4, -1)
             _kv_fp8 = False
             _indexer_fp4 = False
+            indexer_quant_mode = "per_row_fp8"
+            indexer_layout = "fp8"
             _field_window_dtype = torch.bfloat16
             _field_window_layers = (43,)
             # A bf16 build's one plane. The state-carried window is a ring of
@@ -491,6 +497,20 @@ class TestTheBuilderDeclaresWhatItDrops:
         assert after != before
         assert ":nocopy=:" in after, "the id moved for some other reason"
 
+    def test_fp4_layout_id_fences_gfx950_from_gfx1250(self):
+        stub = self.builder_stub()
+        stub._indexer_fp4 = True
+        stub.indexer_quant_mode = "fp4"
+
+        stub.indexer_layout = FP4_GFX950_PRESHUFFLE
+        gfx950 = Builder.state_transfer(stub).paged_layout_id
+        stub.indexer_layout = FP4_GFX1250_NATURAL
+        gfx1250 = Builder.state_transfer(stub).paged_layout_id
+
+        assert ":index=fp4-gfx950-preshuffle:" in gfx950
+        assert ":index=fp4-gfx1250-natural:" in gfx1250
+        assert gfx950 != gfx1250
+
 
 class TestPageUnitAddressesAreArithmetic:
     """The addresses `_page_unit_regions` computes are the ones slicing gave.
@@ -533,6 +553,8 @@ class TestPageUnitAddressesAreArithmetic:
             pool_geometry = _Geo()
             csa_layers = tuple(range(self.N_CSA))
             _indexer_fp4 = False
+            indexer_quant_mode = "per_row_fp8"
+            indexer_layout = "fp8"
             _page_unit_region_cache = None
             _page_unit_region_owners = ()
 
@@ -621,6 +643,8 @@ class TestPageUnitRegionsValidateTheirOwnAddresses:
         stub._page_unit_region_cache = None
         stub._page_unit_region_owners = ()
         stub._indexer_fp4 = False
+        stub.indexer_quant_mode = "per_row_fp8"
+        stub.indexer_layout = "fp8"
         stub.csa_layers = [0]
         stub.model_runner = SimpleNamespace(v4_csa_idx_kv=idx)
         stub._kv_planes = lambda: [plane]

@@ -8,7 +8,9 @@ image requests support chunked prefill and request-owned embedding lifetime.
 The reference revision is `dba1be0a40aa45a94ad051997016db3960a90277`, AITER is
 pinned to `2039d2b96cd547ebc52f8d55f5f29ec1b8290796`, and Engram builds on
 ROCm/ATOM PR #2185. The primary deployment scope is TP4 with whole-expert EP
-on MI355X GPUs.
+on MI355X GPUs. For measured TP2/TP4 no-EP, level-3 FULL AgentX performance,
+see the [AgentX benchmark recipe](DeepSeek-V4.1-Flash-Agentic.md), using
+fixed acceptance length 3.51.
 
 | Capability | Status |
 |---|---|
@@ -27,7 +29,8 @@ on MI355X GPUs.
 | Optional CED decoder replay | Not started |
 | Optional encoder replay with a persistent global cache | Not started |
 | TP4 with routed experts sharded across TP instead of whole-expert EP | Supported; relative throughput is workload-dependent |
-| Distributed and deployment combinations beyond TP4 | Not validated |
+| TP2 no EP | GPU benchmark completed at level 3 FULL; see the [AgentX recipe](DeepSeek-V4.1-Flash-Agentic.md) for commands and measured points |
+| Other TP sizes | Configuration tests cover TP1/2/4/8 and dimension divisibility; this does not establish GPU or quality validation for TP1/8 |
 
 The full-layer path remains the numerical and performance baseline. CED and
 bounded replay are approximate modes with separate quality gates and cache

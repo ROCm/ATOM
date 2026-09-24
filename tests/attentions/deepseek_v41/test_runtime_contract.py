@@ -226,14 +226,21 @@ def test_an_index_plane_other_than_fp8_is_refused(index_dtype):
 
 @pytest.mark.parametrize("graph", [False, True])
 @pytest.mark.parametrize("dynamic", [False, True])
-def test_native_dspark_passes_production_admission(graph, dynamic):
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("level", [0, 3])
+def test_native_dspark_passes_production_admission(graph, dynamic, tp_size, level):
     from atom.config import CUDAGraphMode, DSparkConfig
 
     value = runtime_config(
         model="/model",
+        tensor_parallel_size=tp_size,
+        enable_expert_parallel=False,
         enforce_eager=not graph,
         compilation_config=SimpleNamespace(
-            level=0, cudagraph_mode=CUDAGraphMode.PIECEWISE
+            level=level,
+            cudagraph_mode=(
+                CUDAGraphMode.FULL if level == 3 else CUDAGraphMode.PIECEWISE
+            ),
         ),
         hf_config=SimpleNamespace(),
         speculative_config=SimpleNamespace(

@@ -328,16 +328,12 @@ def validate_speculative_config(config):
 
         if Path(speculative.model).resolve() != Path(config.model).resolve():
             raise ValueError("DeepSeek-V4.1 DSpark must use the target checkpoint")
-    if config.tensor_parallel_size != 4:
-        raise ValueError("DeepSeek-V4.1 DSpark is validated on TP4")
     if config.kv_cache_dtype != "bf16":
         raise ValueError("DeepSeek-V4.1 DSpark requires a BF16 KV cache")
     from atom.utils import envs
 
     if envs.ATOM_ENABLE_RELAXED_MTP:
         raise ValueError("DeepSeek-V4.1 DSpark requires strict target verification")
-    if speculative.synthetic_acceptance_rates is not None:
-        raise ValueError("DeepSeek-V4.1 DSpark requires real target verification")
     if config.dspark.confidence_schedule and (
         not config.dspark.ragged or not config.dspark.calibration_profile
     ):

@@ -1109,6 +1109,13 @@ impl PDRouter {
                 format!("Failed to enrich decode kv: {}", e),
             );
         }
+        let carried_ids = AtomAdapter::carry_prompt_token_ids(&prefill_body, &mut kv_params);
+        debug!(
+            "ATOM PD request_id={} carried {} prompt token ids to decode {}",
+            correlation_for_log,
+            carried_ids,
+            decode.url()
+        );
 
         let decode_obj = match decode_request_json.as_object_mut() {
             Some(o) => o,

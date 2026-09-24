@@ -471,12 +471,13 @@ def build_chat_response(
             "latency_s": round(final_output.get("latency", 0.0), 4),
         },
     )
+    update: dict[str, Any] = {}
     if "kv_transfer_output_meta_info" in final_output:
-        response = response.model_copy(
-            update={
-                "kv_transfer_params": final_output["kv_transfer_output_meta_info"],
-            }
-        )
+        update["kv_transfer_params"] = final_output["kv_transfer_output_meta_info"]
+    if "prompt_token_ids" in final_output:
+        update["prompt_token_ids"] = final_output["prompt_token_ids"]
+    if update:
+        response = response.model_copy(update=update)
     return response
 
 
@@ -512,7 +513,7 @@ def build_chat_response_multi(
     ]
     prompt_tokens = final_outputs[0]["num_tokens_input"]
     completion_tokens = sum(out["num_tokens_output"] for out in final_outputs)
-    return ChatCompletionResponse(
+    response = ChatCompletionResponse(
         id=request_id,
         created=int(time.time()),
         model=model,
@@ -536,6 +537,12 @@ def build_chat_response_multi(
             "num_choices": len(final_outputs),
         },
     )
+    # Sibling outputs share the first output's prompt IDs.
+    if "prompt_token_ids" in final_outputs[0]:
+        response = response.model_copy(
+            update={"prompt_token_ids": final_outputs[0]["prompt_token_ids"]}
+        )
+    return response
 
 
 async def stream_chat_response_fanout(

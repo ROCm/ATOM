@@ -571,24 +571,10 @@ class tokenIDProcessor:
         src_np = self.decode_src.np[:bs]
         src_np.fill(NEW_SEQUENCE)
         src_np[deferred_curr_indices] = deferred_prev_indices
-        fill_deferred_decode_ids(
-            self.input_ids.gpu,
-            self.runner.forward_vars["cu_seqlens_q"].gpu[: bs + 1],
-            self.decode_src.copy_to_gpu(bs),
-            self.prev_token_ids,
-            self.draft_token_ids if self.pre_num_decode_token_per_seq > 1 else None,
-            max_tokens_per_seq=int(lens.max()) if bs else 1,
-        )
-
-        # CUDAGraph tail padding. A replayed decode graph reads a fixed
-        # `running_bs * tokens_per_seq` tokens out of this buffer, but a step
-        # writes only what it scheduled, and `bs` sits between two
-        # captured buckets on most steps -- a 65-request batch replays the 128
-        # graph, so 63 requests' worth of slots are never written. Nobody else
-        # fills them: `run_model` pads `cu_seqlens_q` so the padded sequences are
-        # empty for attention, but the ids stay whatever the previous forward
-        # left, and the MoE path does consume padded rows. Zero is a legal vocab
-        # id, so the embedding gather stays in bounds either way.
+        # How wide the forward reads: a replayed decode graph takes a fixed
+        # `running_bs * tokens_per_seq` whatever the batch scheduled, and `bs`
+        # sits between two captured buckets on most steps -- a 65-request batch
+        # replays the 128 graph. The kernel zeroes the difference.
         fill_to = total_tokens_decode
         if not self.runner.enforce_eager:
             gbs = next(
@@ -596,8 +582,15 @@ class tokenIDProcessor:
             )
             if gbs is not None:
                 fill_to = max(fill_to, int(gbs) * tokens_per_seq)
-        if fill_to > total_tokens_decode:
-            self.input_ids.gpu[total_tokens_decode:fill_to].zero_()
+        fill_deferred_decode_ids(
+            self.input_ids.gpu,
+            self.runner.forward_vars["cu_seqlens_q"].gpu[: bs + 1],
+            self.decode_src.copy_to_gpu(bs),
+            self.prev_token_ids,
+            self.draft_token_ids if self.pre_num_decode_token_per_seq > 1 else None,
+            max_tokens_per_seq=int(lens.max()) if bs else 1,
+            width=fill_to,
+        )
 
         input_ids = self.input_ids.gpu[:total_tokens]
         return input_ids

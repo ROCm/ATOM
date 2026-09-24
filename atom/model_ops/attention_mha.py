@@ -18,7 +18,7 @@ from atom.model_ops.base_attention import (
     cp_mha_gather_cache,
     dense_decode_splits,
     gluon_decode_over_limit,
-    run_pa_decode_gluon,
+    run_pa_decode,
     run_pa_fwd_asm,
 )
 from atom.utils import envs
@@ -602,7 +602,7 @@ class PagedAttentionImpl(nn.Module):
         compute_type = (
             torch.bfloat16 if self.kv_cache_dtype == "bf16" else aiter.dtypes.fp8
         )
-        run_pa_decode_gluon(
+        run_pa_decode(
             output=o,
             q=q,
             k_cache=k_cache,
@@ -624,6 +624,12 @@ class PagedAttentionImpl(nn.Module):
             sinks=self.sinks,
             sliding_window=self.sliding_window,
             ps=True,
+            # The one site whose context lengths are the real per-request ones,
+            # so the only one a work plan can rebalance -- same boundary as the
+            # `dense_decode_splits` call above. Read off the context this call
+            # already holds, never the thread-local one: a TBO worker thread
+            # that never installed its own shares the other ubatch's.
+            work_plan=getattr(attn_metadata, "flydsl_work_plan", None),
         )
 
         return o

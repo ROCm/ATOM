@@ -234,7 +234,15 @@ Runs in the EngineCore process. It decides **what** to load/save; it never
 touches GPU memory.
 
 - **`get_num_new_matched_tokens(seq)`** — on a new request, queries the worker's
-  `LookupServer` over ZMQ for how many prompt tokens LMCache holds. If the hit
+  `LookupServer` over ZMQ for how many prompt tokens LMCache holds. The query is
+  the expensive part (prompt copy, chunk hashing, blocking round trip on the
+  scheduler thread) and the call runs *before* allocation, so a request that
+  cannot be admitted is asked again on the very next step: the hit is therefore
+  remembered per request lifetime and replayed for up to
+  `OFFLOAD_LOOKUP_MEMO_STEPS` steps, while the answer built from it is re-derived
+  every call. The pin that query takes is released with the step, so the step
+  that actually dispatches the load queries once more to re-take it, and drops
+  the load if the tier no longer holds what the `LoadSpec` promised. If the hit
   exceeds what HBM already has, it records a `LoadSpec` and returns
   `(need, True)` to **park the sequence** in `WAITING_FOR_REMOTE_KVS`. For a
   stateful DSV4 request, the PAGE hit is reduced to the newest aligned boundary
@@ -288,12 +296,16 @@ Following one request end to end ties the pieces together:
 
 1. **Lookup.** A new request arrives; the scheduler's
    `get_num_new_matched_tokens` asks the rank-0 `LookupServer` over ZMQ how many
-   prompt tokens LMCache holds. If that hit exceeds the HBM prefix cache, it
-   records a `LoadSpec` and **parks** the sequence in `WAITING_FOR_REMOTE_KVS`.
+   prompt tokens LMCache holds — once per request, not once per step: if
+   allocation fails the request comes back at the same frontier and the
+   remembered hit answers it (see the scheduler-side description above). If that
+   hit exceeds the HBM prefix cache, it records a `LoadSpec` and **parks** the
+   sequence in `WAITING_FOR_REMOTE_KVS`.
 2. **Decide.** After blocks are allocated, `_decide_load_after_alloc` re-checks the
    *real* HBM floor and chooses load vs. recompute (see
    [When Does a Reload Actually Happen?](#when-does-a-reload-actually-happen)).
-3. **Enqueue.** `build_connector_meta` emits an `LMCacheReqMeta`; the worker's
+3. **Enqueue.** `build_connector_meta` re-takes the lookup pin (one query per
+   load actually dispatched) and emits an `LMCacheReqMeta`; the worker's
    `start_load_kv` submits the load to the load daemon and returns — the RPC
    thread stays free to run `forward`.
 4. **Move.** The daemon runs `engine.retrieve`, which drives

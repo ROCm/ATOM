@@ -22,9 +22,12 @@ from atom.model_ops.attentions.pool_layout.entry_arena import entry_bytes_for
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     CSA_INDEXER_DATA,
     CSA_INDEXER_SCALE,
+    FP4_GFX950_PRESHUFFLE,
+    FP4_GFX1250_NATURAL,
     MAIN_KV_NOPE,
     MAIN_KV_ROPE,
     fp4_indexer_block_fields,
+    fp4_indexer_layout_for_arch,
     fp8_indexer_block_fields,
     indexer_block_regions,
     main_kv_plane_fields,
@@ -98,6 +101,21 @@ class TestIndexerBlockRegions:
         assert data.shape == (2, 4, 64, 16)
         assert scale.shape == (2, 4, 64)
         assert data.dtype is scale.dtype is torch.uint8
+
+    def test_gfx1250_fp4_pools_use_natural_rows(self):
+        data, scale = fp4_indexer_block_fields(
+            _SHIPPED_ROWS, _SHIPPED_INDEX_HEAD_DIM, FP4_GFX1250_NATURAL
+        )
+
+        assert data.shape == (64, 64)
+        assert data.bytes_per_entry == 4096
+        assert scale.shape == (64, 4)
+        assert scale.bytes_per_entry == 256
+        assert data.dtype is scale.dtype is torch.uint8
+
+    def test_fp4_layout_is_architecture_specific(self):
+        assert fp4_indexer_layout_for_arch("gfx950") == FP4_GFX950_PRESHUFFLE
+        assert fp4_indexer_layout_for_arch("gfx1250") == FP4_GFX1250_NATURAL
 
     def test_regions_are_a_prefix_sum_with_nothing_between_them(self):
         fields = fp8_indexer_block_fields(64, 128, torch.uint8)
