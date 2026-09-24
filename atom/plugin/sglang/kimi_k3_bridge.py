@@ -27,7 +27,16 @@ def _is_kimi_k3_owner(owner: Any) -> bool:
 
 
 def _kimi_k3_mem_fraction_already_restored(ctx: Any) -> bool:
-    for source, fields in getattr(ctx, "overrides_log", None) or ():
+    # 0.5.20: overrides_log is a method (not a property). Prefer the public
+    # API; fall back to the private list for older trees / plain mocks.
+    log = getattr(ctx, "overrides_log", None)
+    if callable(log):
+        entries = log()
+    elif log is not None:
+        entries = log
+    else:
+        entries = getattr(ctx, "_overrides_log", None) or ()
+    for source, fields in entries:
         if source == _KIMI_K3_MEM_FRACTION_OVERRIDE and "mem_fraction_static" in fields:
             return True
     return False
@@ -48,9 +57,6 @@ def _restore_kimi_k3_mem_fraction(owner: Any) -> None:
         from sglang.srt.runtime_context import get_context, get_exec, get_schedule
 
         ctx = get_context()
-        if _kimi_k3_mem_fraction_already_restored(ctx):
-            return
-
         # Resolved leaf — not server_args.attention_backend (operator raw input).
         attention_backend = str(
             getattr(getattr(get_exec(), "kernel", None), "attention_backend", "") or ""
@@ -64,6 +70,9 @@ def _restore_kimi_k3_mem_fraction(owner: Any) -> None:
         )
         return
 
+    if _kimi_k3_mem_fraction_already_restored(ctx):
+        return
+
     if attention_backend != "aiter" or context_len <= 8192:
         return
 
@@ -71,11 +80,12 @@ def _restore_kimi_k3_mem_fraction(owner: Any) -> None:
         "mem_fraction_static"
     ) is not None
     try:
-        from sglang.srt import environ as sgl_envs
-
-        honor_explicit = bool(sgl_envs.SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION.get())
-    except Exception:  # noqa: BLE001 - older SGLang builds
+        # Must import ``envs`` (the Envs instance), not the environ module.
+        from sglang.srt.environ import envs
+    except ImportError:
         honor_explicit = False
+    else:
+        honor_explicit = bool(envs.SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION.get())
 
     if explicit_mem_fraction and honor_explicit:
         # Upstream did not apply the 0.85 scale; do not divide it back out.
