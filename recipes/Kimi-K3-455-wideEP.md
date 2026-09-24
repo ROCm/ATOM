@@ -15,6 +15,7 @@ section first — on this silicon it is the difference between 95% and 0%.
 | Parallelism | `-tp 1 --data-parallel-size 16 --data-parallel-size-local 4`, EP16, DP attention |
 | Attention | Triton MLA (`ATOM_USE_TRITON_MLA=1`), unshuffled KV |
 | Fabric | UALink within a node-set sharing one `PPOD_ID` + `VPOD_ID`; RCCL over the data-plane NIC |
+| **Required ATOM patch** | [PR #2380](https://github.com/ROCm/ATOM/pull/2380) — stock ATOM aborts on chunked prefill here |
 | **GSM8K (lm_eval, 5-shot, full 1319)** | **strict-match 0.9545 ±0.0057**, flexible-extract 0.9538 ±0.0058 |
 | Throughput / TTFT / TPOT | **not characterized yet** — see [Not yet measured](#not-yet-measured) |
 
@@ -148,7 +149,10 @@ fabric` are **not** faults; this firmware does not populate those fields.
 
 **Other requirements**
 
-- A **gfx1250 bring-up image** with ATOM, aiter, mori and FlyDSL.
+- A **gfx1250 bring-up image** with ATOM, aiter, mori and FlyDSL, built from an
+  ATOM that carries [PR #2380](https://github.com/ROCm/ATOM/pull/2380) — see
+  [Required patch](#-required-patch-atom-pr-2380). Stock ATOM will not serve
+  this configuration.
 - Passwordless SSH between all four nodes (launch is fanned out over it).
 - The full checkpoint on **every** node (~1.42 TiB each), plus swap — weight
   loading peaks well above the 250 GB of host RAM on these boxes.
@@ -185,18 +189,39 @@ sudo rm -f /dev/shm/psm_* /dev/shm/nccl-*
 
 ---
 
-## One upstream change this configuration needs
+## ⚠️ Required patch: ATOM PR #2380
 
-**`ATOM_UNFUSED_GATHER_KV_B_PROJ=1`** — an unfused torch fallback for
-`gather_kv_b_proj`. On gfx1250 the fused Triton kernel cannot be compiled for
-the shapes a *chunked* prefill produces; Triton emits a PHI node with mismatched
-operand types and LLVM asserts
-(`PHINode::setIncomingValue: getType() == V->getType()`), aborting the process.
-FlyDSL is not an alternative — it is gfx950-only. The fallback does not
-implement the shuffled-KV layout, hence `ATOM_USE_TRITON_MLA_SHUFFLE_KV=0`.
+**This configuration does not run on stock ATOM.** Apply
+[ROCm/ATOM#2380 — *feat(mla): unfused torch fallback for gather_kv_b_proj*](https://github.com/ROCm/ATOM/pull/2380)
+before serving, and set `ATOM_UNFUSED_GATHER_KV_B_PROJ=1`. Without the patch the
+env var does nothing and the server dies on the first long prompt at
+concurrency.
 
-This is being upstreamed; until it lands, this recipe assumes a build that has
-it.
+```bash
+git fetch origin pull/2380/head:mla-unfused-gather && git checkout mla-unfused-gather
+# or, once merged, any main at or past that commit
+```
+
+**Why it is needed.** On gfx1250 the fused Triton `gather_kv_b_proj` cannot be
+compiled for the shapes a *chunked* prefill produces. Triton emits a PHI node
+with mismatched operand types and LLVM asserts:
+
+```
+llvm/IR/Instructions.h: PHINode::setIncomingValue:
+Assertion `getType() == V->getType()' failed.
+```
+
+That is a **compile-time abort with no fallback** — the process dies, so a long
+prompt at concurrency takes the engine down. FlyDSL is not an alternative here:
+it is gfx950-only and aborts in its own compiler if forced. The patch adds a
+pure-torch implementation of the same chain (row gather, cache dequant,
+`kv_b_proj`, the k_nope/v split, the k_pe concat), which needs no codegen and so
+cannot miscompile.
+
+It is off by default and checked after FlyDSL, so it changes nothing on
+architectures where the fused kernel compiles. It does not implement the
+shuffled-KV layout — hence `ATOM_USE_TRITON_MLA_SHUFFLE_KV=0` below, which the
+patch enforces at construction rather than mid-prefill.
 
 ---
 
@@ -256,7 +281,7 @@ export ENABLE_CK=0                        # CK is not ported to gfx1250
 # --- attention ---
 export ATOM_USE_TRITON_MLA=1              # unset: first decode SIGABRTs, silently
 export ATOM_USE_TRITON_MLA_SHUFFLE_KV=0   # the unfused gather has no shuffled layout
-export ATOM_UNFUSED_GATHER_KV_B_PROJ=1
+export ATOM_UNFUSED_GATHER_KV_B_PROJ=1    # requires ATOM PR #2380
 export ATOM_USE_AITER_TRITON_ATTN=1 ATOM_USE_UNIFIED_ATTN=1
 
 # --- MoE ---
@@ -413,7 +438,7 @@ max_tokens=3500  -> content='...#### 72'  finish_reason=stop
 | `FAIL: HOTSWAP=1 but /app/rjprefix not found` | The prefix is not in the container. Re-install it; `docker rm` removes it. **Do not "fix" this with `HOTSWAP=0`** |
 | First decode request SIGABRTs, silently | `ATOM_USE_TRITON_MLA=1` not set |
 | `available_for_kv` negative, server never starts | Lower `--max-num-batched-tokens` (2048 here). `--cudagraph-mode` does not affect this on the native engine — see [KV budget](#kv-budget) |
-| LLVM PHI assertion on long input at concurrency | Triton `gather_kv_b_proj` codegen; set `ATOM_UNFUSED_GATHER_KV_B_PROJ=1` |
+| LLVM PHI assertion on long input at concurrency | Triton `gather_kv_b_proj` codegen. Needs [PR #2380](https://github.com/ROCm/ATOM/pull/2380) **and** `ATOM_UNFUSED_GATHER_KV_B_PROJ=1` — the env var alone does nothing on stock ATOM |
 | `assert not ca_comm.disabled` kills the ModelRunner while HTTP stays up | `ATOM_USE_CUSTOM_ALL_GATHER` and `AITER_CUSTOM_AR_USE_SYMM_MEM` must be set together |
 | MoE GUGU layout error | `ATOM_MOE_GU_ITLV=1` |
 | `ATOM_USE_TRITON_MOE_DECODE=1` asserts | K3's activation is `situ`, not SiLU |
