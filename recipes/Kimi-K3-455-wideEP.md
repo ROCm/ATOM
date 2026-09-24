@@ -15,7 +15,7 @@ section first — on this silicon it is the difference between 95% and 0%.
 | Parallelism | `-tp 1 --data-parallel-size 16 --data-parallel-size-local 4`, EP16, DP attention |
 | Attention | Triton MLA (`ATOM_USE_TRITON_MLA=1`), unshuffled KV |
 | Fabric | UALink within a node-set sharing one `PPOD_ID` + `VPOD_ID`; RCCL over the data-plane NIC |
-| **Required ATOM patch** | [PR #2380](https://github.com/ROCm/ATOM/pull/2380) — stock ATOM aborts on chunked prefill here |
+| **Required ATOM patch** | [PR #2380](https://github.com/ROCm/ATOM/pull/2380) — apply the **diff** to the image's ATOM; stock ATOM aborts on chunked prefill here |
 | **GSM8K (lm_eval, 5-shot, full 1319)** | **strict-match 0.9545 ±0.0057**, flexible-extract 0.9538 ±0.0058 |
 | Throughput / TTFT / TPOT | **not characterized yet** — see [Not yet measured](#not-yet-measured) |
 
@@ -281,7 +281,8 @@ The suite's README says `ACCEL_STATE` must be `READY`; this firmware reports
 **Other requirements**
 
 - A **gfx1250 bring-up image** with ATOM, aiter, mori and FlyDSL, built from an
-  ATOM that carries [PR #2380](https://github.com/ROCm/ATOM/pull/2380) — see
+  ATOM that carries [PR #2380](https://github.com/ROCm/ATOM/pull/2380) — apply
+  that PR's **diff** to the image's own ATOM rather than replacing it, see
   [Required patch](#-required-patch-atom-pr-2380). Stock ATOM will not serve
   this configuration.
 - Passwordless SSH between all four nodes (launch is fanned out over it).
@@ -323,10 +324,53 @@ before serving, and set `ATOM_UNFUSED_GATHER_KV_B_PROJ=1`. Without the patch the
 env var does nothing and the server dies on the first long prompt at
 concurrency.
 
+### Apply the diff to the ATOM inside the image — do not swap in the PR's ATOM
+
+> **Take the code change, not the branch.** The PR is based on `main`; the
+> gfx1250 image carries its own bring-up build of ATOM, which is *not* `main`.
+> Checking out the PR branch (or installing ATOM from it) replaces that build
+> and silently drops whatever bring-up deltas the image was made with — you
+> would be debugging a different engine than the one this recipe was validated
+> against. **Apply the PR's diff on top of the image's own ATOM tree.**
+
+Only three files matter at runtime — `atom/model_ops/mla_unfused_gather.py`
+(new), `atom/model_ops/attention_mla.py`, `atom/utils/envs.py`. The other three
+are tests, which the image does not ship; drop them or the hunks will not apply.
+
 ```bash
-git fetch origin pull/2380/head:mla-unfused-gather && git checkout mla-unfused-gather
-# or, once merged, any main at or past that commit
+# on the host
+curl -sSL https://github.com/ROCm/ATOM/pull/2380.diff -o /tmp/2380.diff
+filterdiff -i 'atom/*' /tmp/2380.diff > /tmp/2380-runtime.diff   # patchutils
+sudo docker cp /tmp/2380-runtime.diff k3ep16:/tmp/
 ```
+
+```bash
+# inside the container: patch the ATOM the server actually imports, whatever
+# layout it was installed with (editable checkout or site-packages wheel)
+ATOM_ROOT=$(python3 -c 'import atom, os; print(os.path.dirname(os.path.dirname(atom.__file__)))')
+cd "$ATOM_ROOT"
+patch -p1 --dry-run < /tmp/2380-runtime.diff   # read this before the real run
+patch -p1           < /tmp/2380-runtime.diff
+```
+
+Without `filterdiff`, apply the whole diff and let the `tests/` hunks fail —
+just confirm from the output that the three `atom/` files applied cleanly.
+
+Verify, in the container:
+
+```bash
+python3 -c "import atom.model_ops.mla_unfused_gather as m; print(m.__file__)"
+python3 -c "from atom.utils import envs; print(envs.ATOM_UNFUSED_GATHER_KV_B_PROJ)"
+# -> the module path, then False (True once the env var is set)
+```
+
+If the second line raises `AttributeError`, `envs.py` did not get patched and
+the env var will be ignored at runtime — which is the silent half of this
+failure.
+
+Like the rocjitsu prefix, this edits the container's filesystem, so **`docker
+rm` discards it** and it must be re-applied on a rebuilt container. Do it on all
+four nodes.
 
 **Why it is needed.** On gfx1250 the fused Triton `gather_kv_b_proj` cannot be
 compiled for the shapes a *chunked* prefill produces. Triton emits a PHI node
