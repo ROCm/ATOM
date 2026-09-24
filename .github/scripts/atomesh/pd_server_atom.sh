@@ -43,6 +43,9 @@ ROUTER_PORT="${ROUTER_PORT:-8000}"
 ROUTER_POLICY="${ROUTER_POLICY:-random}"
 ATOM_PD_RANK_MAPPING_POLICY="${ATOM_PD_RANK_MAPPING_POLICY:-none}"
 PROMETHEUS_PORT="${PROMETHEUS_PORT:-29100}"
+ATOMESH_HARDWARE_METRICS="${ATOMESH_HARDWARE_METRICS:-true}"
+ATOMESH_HARDWARE_PORT="${ATOMESH_HARDWARE_PORT:-29108}"
+ATOMESH_HARDWARE_INTERVAL_SECONDS="${ATOMESH_HARDWARE_INTERVAL_SECONDS:-1}"
 HANDSHAKE_PORT="${HANDSHAKE_PORT:-6301}"
 PREFILL_DP_MASTER_PORT="${PREFILL_DP_MASTER_PORT:-29500}"
 PREFILL_DP_BASE_PORT="${PREFILL_DP_BASE_PORT:-29600}"
@@ -65,6 +68,7 @@ PREFILL_PORT=$((PREFILL_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 DECODE_PORT=$((DECODE_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 ROUTER_PORT=$((ROUTER_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 PROMETHEUS_PORT=$((PROMETHEUS_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+ATOMESH_HARDWARE_PORT=$((ATOMESH_HARDWARE_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 HANDSHAKE_PORT=$((HANDSHAKE_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 PREFILL_DP_MASTER_PORT=$((PREFILL_DP_MASTER_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 PREFILL_DP_BASE_PORT=$((PREFILL_DP_BASE_PORT + ATOMESH_SERVICE_PORT_OFFSET))
@@ -83,6 +87,7 @@ for shifted_port_name in \
   DECODE_PORT \
   ROUTER_PORT \
   PROMETHEUS_PORT \
+  ATOMESH_HARDWARE_PORT \
   HANDSHAKE_PORT \
   PREFILL_DP_MASTER_PORT \
   PREFILL_DP_BASE_PORT \
@@ -641,8 +646,34 @@ cleanup_processes() {
   for pid in "$@"; do
     terminate_process_group "${pid}"
   done
+  terminate_process_group "${hardware_pid:-}"
+  hardware_pid=""
   purge_lmcache_disk
   return "${rc}"
+}
+
+start_hardware_metrics() {
+  [[ "${ATOMESH_HARDWARE_METRICS}" == "true" || "${ATOMESH_HARDWARE_METRICS}" == "1" ]] || return 0
+  [[ "${BENCHMARK_KIND}" == "aiperf_agentic" && "${ATOMESH_EXECUTION_PHASE}" != "eval" ]] || return 0
+  hardware_registration_dir="${RUNTIME_LOG_DIR}/hardware-rank-${NODE_RANK}-$$"
+  mkdir -p "${hardware_registration_dir}"
+  start_logged_process hardware_pid "${RUNTIME_LOG_DIR}/hardware-rank-${NODE_RANK}.log" \
+    python3 "${ATOMESH_SCRIPT_DIR}/observability/hardware_exporter.py" \
+    --registration-dir "${hardware_registration_dir}" --host "${host_ip}" \
+    --port "${ATOMESH_HARDWARE_PORT}" --hostname "${host_name}" \
+    --sample-interval-seconds "${ATOMESH_HARDWARE_INTERVAL_SECONDS}"
+}
+
+register_hardware_worker() {
+  [[ -n "${hardware_registration_dir:-}" ]] || return 0
+  local role="$1" name="$2" count="$3"
+  if ! timeout 30s python3 "${ATOMESH_SCRIPT_DIR}/observability/hardware_exporter.py" \
+    --register "${hardware_registration_dir}/${name}.json" --role "${role}" \
+    --device-count "${count}" >> "${RUNTIME_LOG_DIR}/hardware-rank-${NODE_RANK}.log" 2>&1; then
+    echo "[hardware][WARN] Could not resolve ${name} GPUs; see hardware log"
+    # A malformed registration records a partial mapping without guessing GPUs.
+    printf '%s\n' '{}' > "${hardware_registration_dir}/${name}.json"
+  fi
 }
 
 write_metadata() {
@@ -704,6 +735,7 @@ start_prefill() {
     "${prefill_cudagraph_args[@]}"
     ${PREFILL_SERVER_ARGS}
   )
+  register_hardware_worker prefill "${log_name}" "${PREFILL_TP_SIZE}"
   dump_launch_info "PREFILL" "${prefill_cmd[@]}"
   start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_cmd[@]}"
 }
@@ -757,6 +789,7 @@ start_decode() {
     "${decode_cudagraph_args[@]}"
     ${DECODE_SERVER_ARGS}
   )
+  register_hardware_worker decode "${log_name}" "${DECODE_TP_SIZE}"
   dump_launch_info "DECODE" "${decode_cmd[@]}"
   start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${decode_cache_env[@]}" "${decode_dp_env[@]}" "${decode_cmd[@]}"
 }
@@ -1040,6 +1073,13 @@ run_aiperf_agentic_benchmark() {
     --model "${MODEL_NAME} · ${DISPLAY_TOPOLOGY}"
     --mesh "127.0.0.1:${PROMETHEUS_PORT}"
   )
+  if [[ "${ATOMESH_HARDWARE_METRICS}" == "true" || "${ATOMESH_HARDWARE_METRICS}" == "1" ]]; then
+    report_args+=(--hardware-scrape-interval-seconds "${ATOMESH_HARDWARE_INTERVAL_SECONDS}")
+    local hardware_ip
+    while IFS= read -r hardware_ip; do
+      report_args+=(--hardware "${hardware_ip}:${ATOMESH_HARDWARE_PORT}")
+    done < <(printf '%s\n' "${prefill_ips[@]}" "${decode_ips[@]}" | sort -u)
+  fi
   local idx
   for idx in "${!prefill_ips[@]}"; do
     server_metrics_args+=("http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/metrics")
@@ -1330,6 +1370,8 @@ run_benchmark_and_eval() {
 }
 
 write_metadata
+trap 'cleanup_processes' EXIT
+start_hardware_metrics
 
 if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
   start_prefill "prefill-rank-0"

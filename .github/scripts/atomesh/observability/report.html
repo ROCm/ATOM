@@ -47,9 +47,9 @@
 "use strict";
 const DATA=JSON.parse(document.getElementById("report-data").textContent);
 const META=DATA.meta, GLOBAL_STAT_KEYS=["mean","p50","p90","p95","p99"];
-const STAT_KEYS=[...GLOBAL_STAT_KEYS,"running","waiting","waiting_kv","used","evictable","vacant","hit","reuse","lmcache","gpu"].filter(k=>DATA.panels.some(p=>k in p.series));
-const LABELS={mean:"Mean",p50:"P50",p90:"P90",p95:"P95",p99:"P99",running:"Running",waiting:"Waiting",waiting_kv:"KV waiting",used:"Used",evictable:"Cached / evictable",vacant:"Vacant",hit:"Cache hit",reuse:"Total reuse",gpu:"GPU",lmcache:"LMCache"};
-const COLORS={mean:"#8490a8",p50:"#22a69a",p90:"#6382ef",p95:"#b483da",p99:"#f09b58",running:"#3864e8",waiting:"#f09b58",waiting_kv:"#b483da",used:"#3864e8",evictable:"#22a69a",vacant:"#8490a8",hit:"#22a69a",reuse:"#22a69a",gpu:"#6382ef",lmcache:"#b483da"};
+const STAT_KEYS=[...GLOBAL_STAT_KEYS,"min","max","running","waiting","waiting_kv","used","evictable","vacant","hit","reuse","lmcache","gpu"].filter(k=>DATA.panels.some(p=>k in p.series));
+const LABELS={min:"Min",max:"Max",mean:"Mean",p50:"P50",p90:"P90",p95:"P95",p99:"P99",running:"Running",waiting:"Waiting",waiting_kv:"KV waiting",used:"Used",evictable:"Cached / evictable",vacant:"Vacant",hit:"Cache hit",reuse:"Total reuse",gpu:"GPU",lmcache:"LMCache"};
+const COLORS={min:"#22a69a",max:"#f09b58",mean:"#8490a8",p50:"#22a69a",p90:"#6382ef",p95:"#b483da",p99:"#f09b58",running:"#3864e8",waiting:"#f09b58",waiting_kv:"#b483da",used:"#3864e8",evictable:"#22a69a",vacant:"#8490a8",hit:"#22a69a",reuse:"#22a69a",gpu:"#6382ef",lmcache:"#b483da"};
 const $=id=>document.getElementById(id), finite=v=>typeof v==="number"&&Number.isFinite(v);
 const fmt=v=>finite(v)?v.toLocaleString("en-US",{maximumFractionDigits:v<10?2:1}):"—";
 const fmtCount=v=>finite(v)?v.toLocaleString("en-US",{maximumFractionDigits:0}):"—";
@@ -68,7 +68,7 @@ const orderedStates=[...pairedRows.flat(),...states.filter(s=>!pairedStates.has(
 const matchesRole=s=>roleFilter==="all"||s.role===roleFilter;
 const matchesCategory=s=>categoryFilter==="all"||(categoryFilter==="overview"?s.p.overview:s.p.category===categoryFilter);
 const isShown=s=>s.enabled&&matchesRole(s)&&matchesCategory(s);
-const selectedInstances={prefill:"",decode:"",standalone:""};
+const selectedInstances={prefill:"",decode:"",standalone:"",hardware:""};
 const instancePickers={};
 function countSpec(p){
  if(p.kind==="blocks")return {field:"block_counts",keys:["used","total"],labels:["Used","Total"],unit:"blocks",note:""};
@@ -79,7 +79,7 @@ function countSpec(p){
 function setPanelScope(s){
  s.scope=selectedInstances[s.role]||"";
  const bundle=s.scope?s.base.instances?.[s.scope]:s.base;
- s.p={...s.base,series:bundle?.series||{},records:bundle?.records||[],block_counts:bundle?.block_counts,cache_counts:bundle?.cache_counts};
+ s.p={...s.base,sample_counts:bundle?.sample_counts||[],series:bundle?.series||{},records:bundle?.records||[],block_counts:bundle?.block_counts,cache_counts:bundle?.cache_counts};
  const spec=countSpec(s.p);
  if(spec){
   s.countMaps=Object.fromEntries(spec.keys.map(k=>[k,new Map(s.p[spec.field]?.[k]||[])]));
@@ -106,13 +106,13 @@ for(const b of $("role-controls").querySelectorAll("button")){
  b.disabled=b.dataset.role!=="all"&&!states.some(s=>s.role===b.dataset.role);
  b.onclick=()=>{roleFilter=b.dataset.role;hoverTime=null;activePanel=null;refresh();};
 }
-for(const [key,label] of [["overview","Overview"],["latency","Latency"],["workload","Workload"],["cache","Cache & KV"],["all","All metrics"]]){
+for(const [key,label] of [["overview","Overview"],["latency","Latency"],["workload","Workload"],["cache","Cache & KV"],["hardware","Hardware"],["all","All metrics"]]){
  const b=node("button","chip",label);b.dataset.category=key;
- b.onclick=()=>{categoryFilter=key;hoverTime=null;activePanel=null;refresh();};
+ b.onclick=()=>{categoryFilter=key;if(key==="hardware")roleFilter="all";hoverTime=null;activePanel=null;refresh();};
  $("category-controls").append(b);
 }
 if(!states.some(s=>s.role==="overall"))$("scope-note").textContent="Service instances are identified by host and port";
-for(const [role,label] of [["prefill","Prefill"],["decode","Decode"],["standalone","Service"]]){
+for(const [role,label] of [["prefill","Prefill"],["decode","Decode"],["standalone","Service"],["hardware","GPU"]]){
  if(!states.some(s=>s.role===role))continue;
  const instances=[...new Set([...(META.instances||[]).filter(i=>i.role===role).map(i=>i.instance),...states.filter(s=>s.role===role).flatMap(s=>Object.keys(s.base.instances||{}))])].sort();
  const wrapper=node("label","instance-picker"),select=node("select");select.dataset.role=role;select.setAttribute("aria-label",label+" instance");
@@ -131,11 +131,23 @@ function buildPanel(s){
  const card=node("article","panel");card.dataset.panel=s.p.id;
  const head=node("div","panel-head"),titles=node("div");s.source=node("div","panel-source",s.p.label);titles.append(node("h2","panel-title",s.p.title),s.source);
  const reading=node("div","panel-reading");s.value=node("div","panel-value");s.stat=node("div","panel-stat");reading.append(s.value,s.stat);head.append(titles,reading);
+ if(s.p.kind==="hardware"){
+  const summary=node("div","table-shell"),table=node("table"),head=node("thead"),row=node("tr");
+  for(const label of ["GPU · full invocation", "Mean", "Min", "Max", "P5", "P95", "Samples", "Coverage %", ...(s.p.unit==="W"&&s.p.id==="hardware_power"?["Energy J", "Integrated s"]:[])])row.append(node("th","",label));
+  head.append(row);table.append(head);const body=node("tbody");
+  for(const [gpu,bundle] of Object.entries(s.base.instances||{})){
+   const r=node("tr"),v=bundle.summary||{};r.append(node("td","",gpu));
+   for(const key of ["mean","min","max","p5","p95","samples","coverage_percent",...(s.p.unit==="W"&&s.p.id==="hardware_power"?["energy_joules","integrated_seconds"]:[])])r.append(node("td","",fmt(v[key])));
+   body.append(r);
+  }
+  table.append(body);summary.append(table);s.hardwareSummary=summary;
+ }
  const legend=node("div","legend");s.legends={};for(const k of STAT_KEYS.filter(k=>k in s.p.series)){const b=node("button","");b.dataset.stat=k;b.style.setProperty("--series",COLORS[k]);b.append(node("i","dot"),node("span","",LABELS[k]));b.onclick=()=>{s.visible.has(k)?s.visible.delete(k):s.visible.add(k);refresh();};legend.append(b);s.legends[k]=b;}
  s.shell=node("div","plot-shell");s.canvas=node("canvas");s.canvas.setAttribute("role","img");s.canvas.setAttribute("aria-label",s.p.title+", "+s.p.unit+"; switch to Data table for all values");s.empty=node("div","empty-chart");s.tip=node("div","tooltip");s.tip.hidden=true;s.shell.append(s.canvas,s.empty,s.tip);
  s.table=node("div","table-shell");s.table.hidden=true;
  const foot=node("div","panel-foot");s.footLabel=node("span","source-tag");foot.append(s.footLabel,node("span","",META.kind==="demo"?"Synthetic data":"Recorded data"));
  card.append(head,node("div","panel-description",s.p.detail));
+ if(s.hardwareSummary)card.append(s.hardwareSummary);
  if(countSpec(s.p)){
   s.blockCounts=node("div","block-counts");
   card.append(s.blockCounts);
@@ -200,7 +212,7 @@ function updateReading(s){
   s.value.replaceChildren(node("span","",fmtCount(record?.context_tokens)),node("small","","tokens"));s.stat.textContent=fmtCount(records.length)+" requests in range"+(record?" · "+record.request_id:"");return;
  }
  // Gauge headlines follow panel semantics; histogram headlines prefer the highest visible percentile.
- const priority={blocks:["used","evictable","vacant"],queues:["running","waiting","waiting_kv"],cache:["hit"]}[s.p.kind]||[...GLOBAL_STAT_KEYS].reverse();
+ const priority={hardware:["mean","max","min"],blocks:["used","evictable","vacant"],queues:["running","waiting","waiting_kv"],cache:["hit"]}[s.p.kind]||[...GLOBAL_STAT_KEYS].reverse();
  const key=s.p.cache_breakdown?"reuse":priority.find(k=>s.visible.has(k));const point=key&&hoverTime!==null?near(s.p.series[key],hoverTime):null;const value=s.p.cache_breakdown?(s.p.series.reuse||[]).find(p=>p[0]===selectedCountTime(s))?.[1]:hoverTime!==null?point?.[1]:latest(s.p.series[key],range[1],range[0]);s.value.replaceChildren(node("span","",fmt(value)),node("small","",s.p.unit));s.stat.textContent=key?LABELS[key]+(hoverTime!==null?" · "+utc(hoverTime):" · Latest in range"):"No series selected";
 }
 function renderTable(s){
@@ -214,6 +226,7 @@ function renderTable(s){
  }
  const keys=STAT_KEYS.filter(k=>s.visible.has(k));
  const columns=keys.map(k=>({label:LABELS[k]+" · "+s.p.unit,points:s.p.series[k]||[],format:fmt}));
+ if(s.p.kind==="hardware")columns.push({label:"Samples",unit:"samples",points:s.p.sample_counts||[],format:fmtCount});
  const spec=countSpec(s.p);if(spec)spec.keys.forEach((k,i)=>columns.push({label:spec.labels[i]+" · "+spec.unit,points:s.p[spec.field]?.[k]||[],format:fmtCount}));
  const ts=[...new Set(columns.flatMap(c=>c.points.map(p=>p[0])))].filter(t=>t>=range[0]&&t<=range[1]).sort((a,b)=>a-b);
  const table=node("table"),head=node("thead"),hr=node("tr");hr.append(node("th","","Time · UTC"));for(const c of columns)hr.append(node("th","",c.label));head.append(hr);table.append(head);
@@ -224,7 +237,7 @@ function refresh(){
  $("panel-count").textContent=states.filter(isShown).length+" metrics";$("no-panels").hidden=states.some(isShown);
  for(const b of $("category-controls").querySelectorAll("button")){
   b.setAttribute("aria-pressed",b.dataset.category===categoryFilter);
-  b.disabled=b.dataset.category!=="all"&&!states.some(s=>matchesRole(s)&&(b.dataset.category==="overview"?s.p.overview:s.p.category===b.dataset.category));
+  b.disabled=b.dataset.category!=="all"&&!states.some(s=>(b.dataset.category==="hardware"||matchesRole(s))&&(b.dataset.category==="overview"?s.p.overview:s.p.category===b.dataset.category));
  }
  for(const [role,picker] of Object.entries(instancePickers))picker.hidden=roleFilter!=="all"&&roleFilter!==role;
  $("ttft-summary").textContent=fmt(latest(states.find(s=>["mesh_ttft","api_ttft"].includes(s.p.id))?.p.series.p99,range[1],range[0]));
@@ -236,14 +249,15 @@ function refresh(){
  let column=1;
  for(const s of orderedStates.filter(s=>!pairedStates.has(s)&&isShown(s))){s.card.style.setProperty("--panel-row",row);s.card.style.setProperty("--panel-column",column);if(column===2)row++;column=3-column;}
  for(const k of GLOBAL_STAT_KEYS){const available=states.filter(s=>(s.p.series[k]||[]).some(v=>finite(v[1])));statButtons[k].disabled=!available.length;statButtons[k].setAttribute("aria-pressed",available.length>0&&available.every(s=>s.visible.has(k)));}
- for(const s of states){s.toggle.hidden=!(matchesRole(s)&&matchesCategory(s));s.source.textContent=s.p.label+" · "+(s.role==="overall"?"Global":s.scope||"All instances");s.footLabel.textContent=(s.p.kind==="requests"?dispatchLabel(s.p)+" · one value per request":s.p.kind&&s.p.kind!=="cache"?"Sampled state":"Window "+META.window+" s")+" · "+(s.scope||"Pooled across instances");s.toggle.setAttribute("aria-pressed",s.enabled);s.card.hidden=!isShown(s);s.shell.hidden=view!=="chart";s.table.hidden=view!=="table";for(const k of Object.keys(s.legends)){s.legends[k].setAttribute("aria-pressed",s.visible.has(k));s.legends[k].disabled=!(s.p.series[k]||[]).some(v=>finite(v[1]));}if(isShown(s)){if(view==="table")renderTable(s);else draw(s);}}
+ for(const s of states){s.toggle.hidden=!(matchesRole(s)&&matchesCategory(s));s.source.textContent=s.p.label+" · "+(s.role==="overall"?"Global":s.scope||"All instances");s.footLabel.textContent=(s.p.kind==="requests"?dispatchLabel(s.p)+" · one value per request":s.p.kind==="hardware"?"Within-bin min / mean / max":s.p.kind&&s.p.kind!=="cache"?"Sampled state":"Window "+META.window+" s")+" · "+(s.scope||"Pooled across instances");s.toggle.setAttribute("aria-pressed",s.enabled);s.card.hidden=!isShown(s);s.shell.hidden=view!=="chart";s.table.hidden=view!=="table";for(const k of Object.keys(s.legends)){s.legends[k].setAttribute("aria-pressed",s.visible.has(k));s.legends[k].disabled=!(s.p.series[k]||[]).some(v=>finite(v[1]));}if(isShown(s)){if(view==="table")renderTable(s);else draw(s);}}
 }
 $("export-csv").onclick=()=>{
  const rows=[["panel","statistic","timestamp_utc","value","unit","instance","request_id","sequence_id"]];
  for(const s of orderedStates.filter(isShown)){
   if(s.p.kind==="requests"){for(const r of requestRecords(s))rows.push([s.p.title,"Context length",new Date(r.timestamp*1000).toISOString(),r.context_tokens,"tokens",r.instance,r.request_id,r.sequence_id]);continue;}
   const columns=STAT_KEYS.filter(k=>s.visible.has(k)).map(k=>({label:LABELS[k],unit:s.p.unit,points:s.p.series[k]||[]}));
-  const spec=countSpec(s.p);if(spec)spec.keys.forEach((k,i)=>columns.push({label:spec.labels[i],unit:spec.unit,points:s.p[spec.field]?.[k]||[]}));
+  if(s.p.kind==="hardware")columns.push({label:"Samples",unit:"samples",points:s.p.sample_counts||[],format:fmtCount});
+ const spec=countSpec(s.p);if(spec)spec.keys.forEach((k,i)=>columns.push({label:spec.labels[i],unit:spec.unit,points:s.p[spec.field]?.[k]||[]}));
   for(const c of columns)for(const [t,v] of c.points)if(t>=range[0]&&t<=range[1])rows.push([s.p.title,c.label,new Date(t*1000).toISOString(),finite(v)?v:"",c.unit,s.scope||"all","",""]);
  }
  const quote=v=>'"'+String(v).replaceAll('"','""')+'"';
