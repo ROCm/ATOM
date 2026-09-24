@@ -783,7 +783,11 @@ start_router() {
   fi
   local -a router_dp_aware_args=()
   if is_agentic_dpa; then
-    router_policy="dp_sticky"
+    # Default to dp_sticky for DPA agentic; respect an explicit policy
+    # (e.g. cache_aware) set via the yaml's router.policy field.
+    if [[ "${ROUTER_POLICY}" == "random" ]]; then
+      router_policy="dp_sticky"
+    fi
     router_dp_aware_args=(--dp-aware)
   elif [[ "${#router_rank_mapping_args[@]}" -gt 0 ]]; then
     router_dp_aware_args=(--dp-aware)
