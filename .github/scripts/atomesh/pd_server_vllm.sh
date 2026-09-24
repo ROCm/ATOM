@@ -34,7 +34,7 @@ join_path() {
 # Split a shell-quoted argument string (e.g. JSON flags) into array $1.
 split_args() {
   mapfile -d '' -t "$1" < <(
-    python3 -c 'import shlex, sys; sys.stdout.write("\0".join(shlex.split(sys.argv[1])))' "$2"
+    python3 -c 'import shlex, sys; sys.stdout.write("".join(a + "\0" for a in shlex.split(sys.argv[1])))' "$2"
   )
 }
 
