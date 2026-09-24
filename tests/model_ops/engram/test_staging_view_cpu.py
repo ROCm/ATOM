@@ -20,7 +20,7 @@ def view_type():
         if isinstance(node, ast.ClassDef) and node.name == "EngramRowsView"
     )
     namespace = {"Mapping": Mapping, "__name__": "engram_view_cpu_test"}
-    exec(
+    exec(  # noqa: S102 - only the checked-in class AST, never external input
         compile(ast.Module(body=[definition], type_ignores=[]), str(path), "exec"),
         namespace,
     )

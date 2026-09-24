@@ -121,9 +121,11 @@ def test_dpa_dspark_admission_does_not_fix_parallel_width(tp, dp):
 @pytest.mark.parametrize("media", [None, {"image": 1}])
 def test_request_admission_checks_dpa_independently_of_dspark(dpa, draft_tokens, media):
     cfg = DeepseekV41TextConfig()
-    kwargs = dict(
-        num_draft_tokens=draft_tokens, multimodal_data=media, enable_dp_attention=dpa
-    )
+    kwargs = {
+        "num_draft_tokens": draft_tokens,
+        "multimodal_data": media,
+        "enable_dp_attention": dpa,
+    }
     if media and (dpa or draft_tokens):
         with pytest.raises(ValueError, match="text requests only"):
             cfg.validate_request(**kwargs)
