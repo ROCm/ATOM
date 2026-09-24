@@ -14,7 +14,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import threading
 import time
 from collections import deque
@@ -41,6 +40,7 @@ from atom.kv_transfer.offload.chunked_scheduler import (
     ChunkedOffloadSchedulerBase,
 )
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReqMeta
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -80,7 +80,7 @@ def _transfer_mode(config: Any) -> str:
     extra = _extra_config(config)
     configured_mode = extra.get("lmcache.mp.mp_transfer_mode")
     if configured_mode is None:
-        configured_mode = os.environ.get("LMCACHE_MP_TRANSFER_MODE", "auto")
+        configured_mode = envs.LMCACHE_MP_TRANSFER_MODE
     transfer_mode = str(configured_mode).strip().lower()
     if transfer_mode not in ("auto", "lmcache_driven", "engine_driven"):
         raise ValueError(

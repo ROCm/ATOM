@@ -20,7 +20,6 @@ Every scheduler here owns an :class:`~atom.model_engine.engine_stats.EngineStats
 from __future__ import annotations
 
 import logging
-import os
 import struct
 import threading
 import time
@@ -85,14 +84,12 @@ def _offload_max_pending_saves() -> int:
     global _MAX_PENDING_OFFLOAD
     if _MAX_PENDING_OFFLOAD is not None:
         return _MAX_PENDING_OFFLOAD
-    raw = os.environ.get("OFFLOAD_MAX_PENDING_SAVES", "2")
     try:
-        value = int(raw)
-    except ValueError:
-        logger.warning(
-            "invalid OFFLOAD_MAX_PENDING_SAVES=%r; using 2 for the state tier",
-            raw,
-        )
+        value = envs.OFFLOAD_MAX_PENDING_SAVES
+    except ValueError as exc:
+        logger.warning("%s; using 2 for the state tier", exc)
+        value = None
+    if value is None:
         value = 2
     _MAX_PENDING_OFFLOAD = max(1, value)
     return _MAX_PENDING_OFFLOAD

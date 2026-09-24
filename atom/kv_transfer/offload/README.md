@@ -1009,8 +1009,8 @@ staging. Dense and DSV4 instantiate this shared adapter directly.
 Small but load-bearing. `_ThreadTransferState` lazily creates, per thread, the two
 CUDA streams (`pack_stream`, `copy_stream`) and a `_StagingBuffer` holding the
 device tensor plus `ready`/`free` CUDA events that gate the pipeline hand-off.
-Also the `_env_flag/_env_int/_env_optional_int` helpers that parse the `OFFLOAD_*`
-knobs. This per-thread isolation is exactly why load and save never contend.
+The `OFFLOAD_*` knobs are parsed in `atom/utils/envs.py` like every other ATOM
+env var. This per-thread isolation is exactly why load and save never contend.
 
 ### `config.py` & `metadata.py` — wiring and descriptors
 

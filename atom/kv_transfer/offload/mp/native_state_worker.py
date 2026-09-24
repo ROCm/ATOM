@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -39,6 +38,7 @@ from atom.kv_transfer.offload.mp.native_state_layout import (
     build_native_state_mp_layout,
 )
 from atom.model_engine.page_unit_checkpoint import CheckpointRestoreOp
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 NATIVE_STATE_MP_STORE_CHANNEL = "native_state_mp_store"
@@ -88,7 +88,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         self._restore_descriptor_slots: list[int] = []
         self._max_pending_saves = max_pending_saves(
             getattr(config, "kv_transfer_config", {}) or {},
-            int(os.environ.get("OFFLOAD_COPY_WORKERS", "1")),
+            envs.OFFLOAD_COPY_WORKERS,
         )
 
     def register_kv_caches(

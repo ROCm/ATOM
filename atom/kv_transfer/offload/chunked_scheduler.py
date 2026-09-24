@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 
 from atom.kv_transfer.disaggregation.base import KVConnectorSchedulerBase
@@ -28,6 +27,7 @@ from atom.kv_transfer.offload.metadata import (
     LoadSpec,
     SaveSpec,
 )
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -143,28 +143,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         # chunk-aligned, recompute the misaligned head up to the next chunk
         # boundary, then load the aligned remainder from CPU. (Previously gated
         # by the OFFLOAD_UNALIGNED_HANDOFF env var; now unconditional.)
-        try:
-            self._min_load_tokens = max(
-                0, int(os.environ.get("OFFLOAD_MIN_LOAD_TOKENS", "8192"))
-            )
-        except ValueError:
-            logger.warning(
-                "LMCache offload scheduler: invalid OFFLOAD_MIN_LOAD_TOKENS=%r; "
-                "using 8192",
-                os.environ.get("OFFLOAD_MIN_LOAD_TOKENS"),
-            )
-            self._min_load_tokens = 8192
-        try:
-            self._min_save_tokens = max(
-                0, int(os.environ.get("OFFLOAD_MIN_SAVE_TOKENS", "8192"))
-            )
-        except ValueError:
-            logger.warning(
-                "LMCache offload scheduler: invalid OFFLOAD_MIN_SAVE_TOKENS=%r; "
-                "using 8192",
-                os.environ.get("OFFLOAD_MIN_SAVE_TOKENS"),
-            )
-            self._min_save_tokens = 8192
+        self._min_load_tokens = envs.OFFLOAD_MIN_LOAD_TOKENS
+        self._min_save_tokens = envs.OFFLOAD_MIN_SAVE_TOKENS
 
     def bind_block_manager(self, block_manager) -> None:
         if self._block_manager is not None and self._block_manager is not block_manager:

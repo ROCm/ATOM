@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,6 +32,7 @@ from atom.kv_transfer.offload.mp.native_state_worker import (
     require_native_state_server,
 )
 from atom.model_engine.page_unit_checkpoint import SuspendedCheckpointRestore
+from atom.utils import envs
 
 _MAX_SAVE_ATTEMPTS = 3
 
@@ -101,7 +101,7 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
                 )
             self._max_pending_saves = max_pending_saves(
                 getattr(self._config, "kv_transfer_config", {}) or {},
-                int(os.environ.get("OFFLOAD_COPY_WORKERS", "1") or 1),
+                envs.OFFLOAD_COPY_WORKERS,
             )
             self._image_reservation_bytes = (
                 coordinator.store.spec.units_per_checkpoint
