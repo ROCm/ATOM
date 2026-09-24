@@ -5,6 +5,10 @@ The only index scorer there is: it hands the plane to
 `deepgemm_fp8_paged_mqa_logits` and never materializes a key, and what it asks
 in return is that visibility be a per-row prefix.
 
+A layer bounded by an earlier layer's candidates scores only those blocks: the
+kept list is handed over as the block table (`candidate_table`), so the width
+is `candidate_topk_blocks` blocks and not a whole context.
+
 Each query row is its own batch item (`next_n=1`) with its own bound and its
 own tile list, so nothing here is a function of the batch's composition: a
 prefill token, a decode token and a drafted token are the same row to it, and
@@ -26,10 +30,8 @@ from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logi
 
 from atom.model_ops.v4_kernels import scale_indexer_weights
 
-from .indexer import (
-    pick_candidate_blocks,
-    restrict_to_candidates,
-)
+from .candidate_table import candidate_block_table, lift_candidate_selection
+from .indexer import pick_candidate_blocks
 
 
 def quantize_query_rows(query):
@@ -77,8 +79,10 @@ def score_topk_paged(
     picked: both kernels take `visible` as the bound, so the columns the
     scorer left unwritten are outside it.
 
-    The scored width and the block the kernel pages by both come off `plane`,
-    which is the only place either is a fact rather than a restatement.
+    The block the kernel pages by comes off `plane`, which is the only place
+    it is a fact rather than a restatement. The width follows it: a row's whole
+    context, or the kept blocks alone. Which one does not reach the caller --
+    `selected` is compressed-row ids either way.
 
     `candidates` bounds this layer to an earlier layer's blocks and
     `candidate_count` makes this layer that earlier one; never both.
@@ -88,7 +92,24 @@ def score_topk_paged(
     """
     rows, heads = weights.shape
     tile = plane.shape[1]
-    width = tiles.shape[1] * tile
+    # Producing candidates reads scores at their real columns, so a layer that
+    # also scored inside someone else's would have two meanings for a column.
+    assert not (candidate_count and candidates is not None)
+    compacted = candidates is not None
+    if compacted:
+        # One number reached by two paths: the geometry pages the plane at
+        # `candidate_block_size`, and this is where they have to agree.
+        assert block_size == tile, (
+            f"a candidate block is {block_size} rows but the index plane is "
+            f"paged at {tile}; the candidate list cannot be a block table"
+        )
+        table, bound = candidate_block_table(
+            candidates, tiles, visible, rows_per_block=tile
+        )
+        width = candidates.shape[1] * tile
+    else:
+        # Every block the request owns, and the row's own visibility into it.
+        table, bound, width = tiles, visible, tiles.shape[1] * tile
     q_fp8, q_scale = quantize_query_rows(query)
     # Q's scale is dequantized by folding it into its head's weight, which is
     # the only place the kernel has for it. Elementwise, so the whole batch's
@@ -110,22 +131,20 @@ def score_topk_paged(
     for start in range(0, rows, band):
         count = min(band, rows - start)
         span = slice(start, start + count)
-        seen, scores = visible[span], logits[:count]
+        seen, scores = bound[span], logits[:count]
         deepgemm_fp8_paged_mqa_logits(
             q_fp8[span].view(count, 1, heads, q_fp8.shape[-1]),
             plane.unsqueeze(-2),
             scaled[span],
             scores,
             seen,
-            tiles[span],
+            table[span],
             width,
             KVBlockSize=tile,
             Preshuffle=True,
         )
         if candidate_count:
             pick_candidate_blocks(scores, seen, block_size, chosen[span])
-        if candidates is not None:
-            restrict_to_candidates(scores, candidates[span], seen, block_size)
         top_k_per_row_decode(
             scores,
             1,
@@ -137,6 +156,10 @@ def score_topk_paged(
             k=topk,
             stable=True,
         )
+    if compacted:
+        # Columns of the compacted width, which only this function knows how to
+        # read; every caller past it wants compressed-row ids.
+        lift_candidate_selection(selected, candidates, rows_per_block=tile)
     # Ascending already: `stable=True` is aiter's deterministic ascending,
     # smallest-index-first emit with `-1` for a short row, which is the order
     # the attention kernel sums its prefix in. Re-sorting it here was a kernel

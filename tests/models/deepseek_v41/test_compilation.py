@@ -12,6 +12,7 @@ if not torch.cuda.is_available():
     pytest.skip("ROCm GPU required", allow_module_level=True)
 
 from atom.config import CompilationConfig, CUDAGraphMode
+from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.models.deepseek_v41.multimodal import DeepseekV41MultimodalModel
 from atom.models.deepseek_v41.runtime import DeepseekV41RuntimeModel, RuntimeBlock
 from atom.spec_decode.drafter import Drafter
@@ -43,42 +44,69 @@ class Rows(dict):
 
 
 class Attention(nn.Module):
-    def forward(self, hidden, cache, step, rope):
+    def forward(self, hidden, hidden_scale, cache, step, rope):
         assert not step.selected
         return hidden + step.shift
 
 
 class FFN(nn.Module):
-    def forward(self, hidden, image_mask=None):
-        return hidden * 2
+    def forward(self, hidden):
+        image_mask = forward_context.get_forward_context().attn_metadata.image_mask
+        result = hidden * 2
+        if image_mask is not None:
+            result = result + image_mask.unsqueeze(-1) * 10
+        return result
+
+
+class Engram(nn.Module):
+    layer_id = 0
+
+    def forward(self, residual, embeddings, token_mask):
+        update = embeddings.unsqueeze(-2)
+        if token_mask is not None:
+            update = update * token_mask[..., None, None]
+        return residual + update
 
 
 class TinyBlock(RuntimeBlock):
     def __init__(self):
         nn.Module.__init__(self)
         self.layer_name = "v41.layers.0"
+        # The block norms its own input now; this stub's is already normed.
+        self.attn_norm = nn.Identity()
         self.attn = Attention()
         self.ffn = FFN()
         self.engram = None
 
-    def prepare_attention(self, residual, pre_mix, embeddings, image_mask):
-        return residual.mean(-2), residual, pre_mix, pre_mix, pre_mix
+    def prepare_attention(self, state, embeddings, image_mask):
+        residual = state.settle().residual
+        if self.engram is not None:
+            residual = self.engram_forward(residual, embeddings, image_mask)
+        return residual.mean(-2), residual, state.pre_mix, state.pre_mix, state.pre_mix
 
     def prepare_ffn(self, output, residual, pre, post, comb):
         return output, residual, pre, post, comb
 
     def finish_ffn(self, output, residual, pre, post, comb):
-        return output.unsqueeze(-2).expand_as(residual).contiguous(), pre
+        # Settled, not owed: this stub's post is a broadcast, not the mHC
+        # expansion `settle` applies.
+        return SinglePassHCState(
+            output.unsqueeze(-2).expand_as(residual).contiguous(), pre
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm compiler")
-@pytest.mark.parametrize("level", [0, 3])
-def test_runtime_guard_with_live_steps_and_aux_hooks(monkeypatch, tmp_path, level):
+@pytest.mark.parametrize("level, images", [(0, False), (0, True), (3, False)])
+def test_runtime_guard_with_live_steps_and_aux_hooks(
+    monkeypatch, tmp_path, level, images
+):
     def tiny_init(self, config, **kwargs):
         nn.Module.__init__(self)
         self.config = config
         self.embed = nn.Embedding(32, 8, device="cuda")
         self.layers = nn.ModuleList([TinyBlock()])
+        if images:
+            self.layers[0].engram = Engram()
         self.topology = [SimpleNamespace(layer_id=0, ratio=0)]
         self.global_rope = self.window_rope = None
 
@@ -126,8 +154,17 @@ def test_runtime_guard_with_live_steps_and_aux_hooks(monkeypatch, tmp_path, leve
         ]:
             step = Step(rows, shift, empty)
             embeddings = Rows()
+            mask = None
+            if images:
+                embeddings[0] = torch.full((1, rows, 8), 5.0, device="cuda")
+                # Mixed images, then text, then an image-only chunk. The mask
+                # must be read anew on each serving invocation.
+                if not empty and rows != 17:
+                    mask = torch.arange(rows, device="cuda")[None] % 2 == 0
+                    if rows == 4:
+                        mask.fill_(True)
             metadata = SimpleNamespace(
-                step=step, cache=None, engram_embeddings=embeddings, image_mask=None
+                step=step, cache=None, engram_embeddings=embeddings, image_mask=mask
             )
             monkeypatch.setattr(
                 forward_context,
@@ -140,12 +177,18 @@ def test_runtime_guard_with_live_steps_and_aux_hooks(monkeypatch, tmp_path, leve
             )
             tokens = torch.arange(rows, device="cuda", dtype=torch.int64)
             expected_embed = model.embed(tokens)
-            actual = model(tokens, tokens)
+            inputs_embeds = expected_embed + 0.25 if images else None
+            if inputs_embeds is not None:
+                expected_embed = inputs_embeds
+            actual = model(tokens, tokens, inputs_embeds=inputs_embeds)
+            engram_update = 5.0 if mask is None else (~mask).T * 5.0
             expected = (
                 torch.zeros_like(expected_embed)
                 if empty
-                else (expected_embed + shift) * 2
+                else (expected_embed + (engram_update if images else 0) + shift) * 2
             )
+            if mask is not None:
+                expected = expected + mask.T * 10
             torch.testing.assert_close(actual, expected)
             if not empty:
                 torch.testing.assert_close(aux[:rows], expected_embed)

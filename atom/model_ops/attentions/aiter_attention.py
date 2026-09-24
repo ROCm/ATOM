@@ -258,6 +258,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             max_qlen = 1
 
         num_head_k = max(1, hf_config.num_key_value_heads // get_tp_group().world_size)
+        # Kept flydsl work plan here and refreshed once per prepare_*.
+        self._flydsl_kv_heads = num_head_k
+        self._flydsl_plans: dict[tuple, object] = {}
+        self._flydsl_plan_unplanned = False
         (
             (work_meta_data_size, work_meta_data_type),
             (work_indptr_size, work_indptr_type),
@@ -778,6 +782,85 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             slot_regions=[],
         )
 
+    def refresh_flydsl_plan(self, context_lens, *, create=False):
+        """Build or refresh aiter #5546's work plan for this forward.
+
+        Depends only on context_lens, which every layer of one forward shares,
+        so it is built here rather than per pa_decode call. Decode replays a
+        captured graph, so the plan must be visible to the op at capture time
+        (see build_for_cudagraph_capture) and its tensors must never be
+        reallocated afterwards -- hence one entry per batch, kept forever, and
+        refreshed in place before each replay. The refresh is a GPU kernel with
+        no readback. None when FlyDSL or the planner is off, or when the batch
+        is out of range.
+        """
+        # The plan only feeds FlyDSL; building one with FlyDSL off is a
+        # refresh kernel per step that nothing reads.
+        if not (envs.ATOM_PA_FLYDSL and envs.ATOM_PA_FLYDSL_PLAN):
+            return None
+        # From base_attention, not duplicated: the op checks the same bound.
+        from aiter.ops.flydsl.pa_decode import plan_pa_decode
+
+        from atom.model_ops.base_attention import _FLYDSL_PLAN_MAX_BATCH
+
+        n = int(context_lens.shape[0])
+        if not 1 <= n <= _FLYDSL_PLAN_MAX_BATCH:
+            return None
+        # plan_pa_decode rejects anything else. This builder serves several
+        # models; one of them handing int64 lengths would raise on the first step.
+        if (
+            context_lens.dtype is not torch.int32
+            or not context_lens.is_cuda
+            or context_lens.ndim != 1
+            or not context_lens.is_contiguous()
+        ):
+            return None
+
+        # `max_partitions` omitted on purpose: that takes plan_pa_decode's own
+        # default. Setting it from the static split count clamps every request
+        # alike and removes the planner's mechanism -- this tree did that once.
+        key = (n, self._flydsl_kv_heads, context_lens.device.index)
+        plan = self._flydsl_plans.get(key)
+        if plan is None and not create:
+            # Plans are only ever minted during cudagraph capture, where the
+            # batch is a ladder rung and the cost lands at startup. aiter's
+            # planner takes batch as a tl.constexpr, so a new value is a kernel
+            # specialization -- 65-72 ms cold -- and a plan that is never freed
+            # because some captured graph may have baked its pointers in. A
+            # runtime batch with no plan is one no graph will replay, so the
+            # static path is the right answer for it rather than a stall.
+            # Only once a capture has happened: before the first one every
+            # call lands here (profile run, eager warmup), and logging then
+            # burns the one shot on a step that says nothing.
+            if self._flydsl_plans and not self._flydsl_plan_unplanned:
+                self._flydsl_plan_unplanned = True
+                logger.info(
+                    "flydsl: batch %d has no plan, running the static path; "
+                    "captured batches are %s",
+                    n,
+                    sorted({k[0] for k in self._flydsl_plans}),
+                )
+            return None
+        if plan is None:
+            plan = plan_pa_decode(context_lens, self._flydsl_kv_heads, query_length=1)
+            self._flydsl_plans[key] = plan
+            logger.info(
+                "flydsl work plan: num_seqs=%d kv_heads=%d max_partitions=%d "
+                "capacity=%d",
+                n,
+                self._flydsl_kv_heads,
+                int(plan.max_partitions),
+                int(plan.capacity),
+            )
+        else:
+            plan_pa_decode(
+                context_lens,
+                self._flydsl_kv_heads,
+                query_length=1,
+                plan=plan,
+            )
+        return plan
+
     def prepare_mtp_decode(
         self,
         bs: int,
@@ -827,6 +910,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             last_token_indices = slot_mapping
         # Dummy runs skip the draft attention, so keep this launch as a no-op:
         # their synthetic context_lens can point past block_tables.
+        skip_update = running_bs == 0 or get_forward_context().context.is_dummy_run
         _mtp_prepare_decode_metadata_kernel[(max(1, triton.cdiv(running_bs, 128)),)](
             context_lens,
             block_tables,
@@ -835,7 +919,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             positions_out,
             last_token_indices,
             running_bs,
-            running_bs == 0 or get_forward_context().context.is_dummy_run,
+            skip_update,
             update_context_lens,
             update_positions,
             select_positions,
@@ -867,6 +951,15 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
             )
+        # Same short-circuit as the metadata launch above. A dummy step would
+        # refresh the live work_info from synthetic lengths, but every real
+        # decode refreshes before it replays, so this is wasted work rather
+        # than a wrong answer. Free here because skip_update is already
+        # computed; the GDN and Qwen4 overrides would have to reach for the
+        # forward context to save the same kernel.
+        workinfos["flydsl_work_plan"] = (
+            None if skip_update else self.refresh_flydsl_plan(context_lens[:running_bs])
+        )
         return workinfos
 
     def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
@@ -1155,6 +1248,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             min_seqlen_q=min_seqlen_q,
             **ctx,
         )
+        attn_metadata.flydsl_work_plan = self.refresh_flydsl_plan(
+            attn_metadata.context_lens
+        )
         if self._has_sparse_attention:
             from atom.model_ops.minimax_m3.sparse_attn import (
                 make_sparse_decode_metadata,
@@ -1418,6 +1514,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             )
 
         positions = var["positions"].copy_to_gpu(scheduled_tokens)
+        # Decode replays a captured graph, so the op must see a plan HERE
+        attn_metadata.flydsl_work_plan = self.refresh_flydsl_plan(
+            attn_metadata.context_lens, create=True
+        )
         context = Context(
             positions=positions,
             is_prefill=False,

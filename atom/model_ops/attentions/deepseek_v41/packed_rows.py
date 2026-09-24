@@ -10,6 +10,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.model_ops.blockscale_kernels.quantization import FP8_TL_DTYPE
+
 
 @triton.jit
 def _e8m0(code):
@@ -39,8 +41,11 @@ def load_mixed_rows(pool, tagged_rows, dims, valid, D: tl.constexpr):
     mask = valid[:, None] & (d < D)
     raw = tl.load(pool + base + tl.where(fp8, d, d // 2), mask, other=0)
     code = (raw >> ((d % 2) * 4)) & 15
+    # The value byte is an activation this process quantized, so its encoding
+    # follows the device. The FP4 scale below stays E4M3 on every device: it is
+    # the checkpoint's format, not a choice this build gets to make.
     value = tl.where(
-        fp8, raw.to(tl.float8e4nv, bitcast=True).to(tl.float32), _e2m1(code)
+        fp8, raw.to(FP8_TL_DTYPE, bitcast=True).to(tl.float32), _e2m1(code)
     )
     scale = tl.load(
         pool + base + tl.where(fp8, D + d // 32, D // 2 + d // 16), mask, other=127

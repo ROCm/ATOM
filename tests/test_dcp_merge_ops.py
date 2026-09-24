@@ -35,15 +35,28 @@ module-level skip would take the config tests down with it on the CPU CI
 runner, and those are the only ones that gate actually runs.
 """
 
+import ast
+import inspect
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
-# atom.config imports cleanly without triton/aiter, so the config tests below
-# run on the CPU gate.
-from atom.config import DCPConfig, qrep_unsupported_reason
+# atom.config and atom.distributed.dcp_utils both import cleanly without
+# triton/aiter, so the tests below run on the CPU gate.
+from atom.config import (
+    DCPConfig,
+    q_proj_has_row_sliceable_scale,
+    q_proj_is_qrep_widened,
+    qrep_enabled_for_layer,
+    qrep_unsupported_reason,
+)
+from atom.distributed.dcp_utils import (
+    mla_dcp_decode_is_persistent,
+    mla_dcp_sparse_prefill_is_persistent,
+)
 
 try:
     import triton
@@ -57,7 +70,6 @@ try:
         _MLA_DCP_SPARSE_PREFILL_WIDTHS,
         _MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT,
         mla_dcp_kernel_num_heads,
-        mla_dcp_sparse_prefill_is_persistent,
         mla_dcp_sparse_prefill_num_heads,
     )
     from atom.model_ops.dcp_ops import (
@@ -534,10 +546,6 @@ def test_reorg_kvcache_rejects_a_wrong_total():
 # actually runs.
 
 
-class _Spec:
-    """Stand-in for a speculative_config; only its non-None-ness is read."""
-
-
 # ──────────────────────────────────────────────────── project-before-merge ──
 
 
@@ -890,19 +898,18 @@ def test_interleave_size_must_be_positive():
 
 
 @pytest.mark.parametrize(
-    "dcp, spec, mxfp4, expected",
+    "dcp, mxfp4, expected",
     [
-        (8, None, False, None),  # the ordinary case: supported
-        (2, None, False, None),
-        (1, None, False, "decode_context_parallel_size <= 1 (no DCP group)"),
-        (8, _Spec(), False, "speculative decode (qlen>1 cprr path)"),
-        (8, None, True, "fp4 (mxfp4) BMM weights"),
+        (8, False, None),  # the ordinary case: supported
+        (2, False, None),
+        (1, False, "decode_context_parallel_size <= 1 (no DCP group)"),
+        (8, True, "fp4 (mxfp4) BMM weights"),
         # dcp is checked first: with no DCP group the other reasons are moot.
-        (1, _Spec(), True, "decode_context_parallel_size <= 1 (no DCP group)"),
+        (1, True, "decode_context_parallel_size <= 1 (no DCP group)"),
     ],
 )
-def test_gate_truth_table(dcp, spec, mxfp4, expected):
-    assert qrep_unsupported_reason(dcp, spec, mxfp4) == expected
+def test_gate_truth_table(dcp, mxfp4, expected):
+    assert qrep_unsupported_reason(dcp, mxfp4) == expected
 
 
 def test_gate_takes_no_interleave_input():
@@ -917,8 +924,6 @@ def test_gate_takes_no_interleave_input():
     re-coupling the two requires deliberately passing it in, and the docstring
     on `qrep_unsupported_reason` says not to.
     """
-    import inspect
-
     params = inspect.signature(qrep_unsupported_reason).parameters
     assert "interleave" not in " ".join(params), (
         "the QREP gate must not depend on the KV interleave granularity; "
@@ -928,8 +933,481 @@ def test_gate_takes_no_interleave_input():
 
 def test_gate_reason_is_human_readable():
     """The reason string is logged verbatim; it should name the actual cause."""
-    reason = qrep_unsupported_reason(1, None, False)
+    reason = qrep_unsupported_reason(1, False)
     assert "decode_context_parallel_size" in reason
+
+
+def test_gate_does_not_look_at_speculative_config():
+    """QREP's provenance of q_out is invisible to both verify-path consumers
+    (`cprr` and the sparse indexer's candidate exchange), so speculative decode
+    never needed this gate. Pin it at the signature, not a value assertion --
+    a re-added `speculative_config` keyword-with-default would pass a value
+    check again but not this one, same as `test_gate_takes_no_interleave_input`.
+    """
+    params = inspect.signature(qrep_unsupported_reason).parameters
+    assert not any(
+        "spec" in p for p in params
+    ), f"the QREP gate must not key off the speculative config; got {list(params)}"
+
+
+# ─────────────────────────────────────── per-layer QREP eligibility (CPU) ──
+#
+# `q_proj_is_qrep_widened` keeps layers that never opted into QREP (eagle3 /
+# DSpark drafts, GLM-5.3's `_ZeroRopePad`) on the AllGather path instead of
+# misreading a narrow q as the wide QREP layout. It and `qrep_enabled_for_layer`
+# live in atom.config, not atom.model_ops.attention_mla, so these tests run on
+# the CPU-only CI gate instead of being silently skipped there.
+
+
+class _FakeLinear:
+    def __init__(self, out_features, in_features=8, effective_tp_overridden=False):
+        self.weight = torch.empty(out_features, in_features)
+        self.effective_tp_overridden = effective_tp_overridden
+
+
+class _NoWeight:
+    """Stand-in for `_ZeroRopePad`: wraps a linear but exposes no `.weight`."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+
+def test_q_proj_is_qrep_widened_true_when_shard_matches():
+    q_proj = _FakeLinear(
+        out_features=64 * 128, effective_tp_overridden=True
+    )  # qrep_num_heads * qk_head_dim
+    assert q_proj_is_qrep_widened(q_proj, qrep_num_heads=64, qk_head_dim=128)
+
+
+def test_q_proj_is_qrep_widened_false_for_plain_per_rank_shard():
+    """The un-widened case: e.g. an eagle3 / DSpark draft's own q_proj, built
+    without `qrep_tp_override`, still at the plain `num_heads/tp` width."""
+    q_proj = _FakeLinear(out_features=8 * 128)  # num_local_heads * qk_head_dim
+    assert not q_proj_is_qrep_widened(q_proj, qrep_num_heads=64, qk_head_dim=128)
+
+
+def test_q_proj_is_qrep_widened_false_when_no_weight_attr():
+    """GLM-5.3's `_ZeroRopePad` wraps its inner Linear without exposing
+    `.weight` on itself -- must fall back cleanly, not raise."""
+    q_proj = _NoWeight(_FakeLinear(out_features=8 * 128, effective_tp_overridden=True))
+    assert not q_proj_is_qrep_widened(q_proj, qrep_num_heads=64, qk_head_dim=128)
+
+
+def test_q_proj_is_qrep_widened_false_when_shape_matches_but_not_overridden():
+    """The tp == dcp degeneracy: qrep_tp_override's override_tp_size becomes
+    tp // dcp == 1 there, a no-op, so a QREP-widened q_proj and a plain
+    ReplicatedLinear that was never sharded at all end up the same width --
+    shape alone can't tell them apart. Provenance can: only a layer that
+    actually went through LinearBase's override path sets
+    `effective_tp_overridden`.
+    """
+    q_proj = _FakeLinear(out_features=64 * 128)  # right shape, wrong provenance
+    assert not q_proj_is_qrep_widened(q_proj, qrep_num_heads=64, qk_head_dim=128)
+
+
+def test_qrep_enabled_for_layer_is_the_and_not_just_the_helper():
+    """Pins the `and`, not just `q_proj_is_qrep_widened` -- a weakened or
+    dropped `and` at the call site would leave every helper test green while
+    re-enabling QREP for unwired layers.
+    """
+    widened = _FakeLinear(out_features=64 * 128, effective_tp_overridden=True)
+    narrow = _FakeLinear(out_features=8 * 128)
+    assert qrep_enabled_for_layer(True, widened, qrep_num_heads=64, qk_head_dim=128)
+    assert not qrep_enabled_for_layer(
+        False, widened, qrep_num_heads=64, qk_head_dim=128
+    ), "must not enable QREP just because q_proj happens to be wide enough"
+    assert not qrep_enabled_for_layer(
+        True, narrow, qrep_num_heads=64, qk_head_dim=128
+    ), "must not enable QREP for a layer whose q_proj was never widened"
+
+
+class _FakeQuantType:
+    """Stand-in for a pybind11-bound aiter QuantType member: has a `.name`."""
+
+    def __init__(self, name):
+        self.name = name
+
+
+def test_q_proj_has_row_sliceable_scale_true_when_no_quant_type():
+    """Unquantized (e.g. bf16), no `quant_type` attribute at all: safe."""
+    q_proj = _FakeLinear(out_features=64 * 128, effective_tp_overridden=True)
+    assert q_proj_has_row_sliceable_scale(q_proj)
+
+
+def test_q_proj_has_row_sliceable_scale_true_for_safe_quant_types():
+    for name in ("No", "per_Tensor", "per_1x128", "per_Token"):
+        q_proj = _FakeLinear(out_features=64 * 128, effective_tp_overridden=True)
+        q_proj.quant_type = _FakeQuantType(name)
+        assert q_proj_has_row_sliceable_scale(
+            q_proj
+        ), f"{name} should be safe to row-slice"
+
+
+def test_q_proj_has_row_sliceable_scale_false_for_mxfp4_per_1x32():
+    """The is_quark_static_mxfp4 gap: the env-var mxfp4 gate says nothing
+    about a specific layer's actual quant type. A genuinely mxfp4-quantized
+    q_proj (per_1x32) isn't one make_row_view can row-slice.
+    """
+    q_proj = _FakeLinear(out_features=64 * 128, effective_tp_overridden=True)
+    q_proj.quant_type = _FakeQuantType("per_1x32")
+    assert not q_proj_has_row_sliceable_scale(q_proj)
+
+
+def test_q_proj_has_row_sliceable_scale_false_before_weight_scale_exists():
+    """The online-quant-streaming timing gap this check used to miss: a
+    layer built with `source_quant_dtype` set (LinearBase.__init__) defers
+    creating `weight_scale` to `process_weights_after_loading`, well after
+    MLAAttention.__init__ runs -- so `q_proj` here has no `weight_scale`
+    attribute yet, even though `quant_type` (set unconditionally at
+    construction) already says `per_1x32`. Reading the absent `weight_scale`
+    as "safe" would enable QREP on a layer that raises the first time
+    prefill actually row-slices its real, later-built scale.
+    """
+    q_proj = _FakeLinear(out_features=64 * 128, effective_tp_overridden=True)
+    q_proj.quant_type = _FakeQuantType("per_1x32")
+    assert not hasattr(q_proj, "weight_scale")
+    assert not q_proj_has_row_sliceable_scale(q_proj)
+
+
+def test_qrep_enabled_for_layer_falls_back_when_scale_not_row_sliceable():
+    q_proj = _FakeLinear(out_features=64 * 128, effective_tp_overridden=True)
+    q_proj.quant_type = _FakeQuantType("per_1x32")
+    assert not qrep_enabled_for_layer(
+        True, q_proj, qrep_num_heads=64, qk_head_dim=128
+    ), "a widened q_proj whose scale can't be row-sliced must still fall back"
+
+
+_ATTENTION_MLA_PATH = (
+    Path(__file__).resolve().parent.parent / "atom" / "model_ops" / "attention_mla.py"
+)
+
+
+def test_mlaattention_init_actually_calls_qrep_enabled_for_layer():
+    """Pins the real call site, not just the functions it calls.
+
+    Every test above exercises `qrep_enabled_for_layer` / `q_proj_is_qrep_widened`
+    / `q_proj_has_row_sliceable_scale` directly -- none of them would notice if
+    `MLAAttention.__init__`'s own `self.qrep_enabled = qrep_enabled_for_layer(...)`
+    were changed to pass the wrong arguments, hardcode a value, or call
+    something else entirely. Read by `ast` on the source text, not by
+    importing: `attention_mla.py` needs triton/aiter at module scope, so this
+    stays on the CPU gate like the rest of this file's QREP coverage.
+    """
+    tree = ast.parse(_ATTENTION_MLA_PATH.read_text(encoding="utf-8"))
+    calls = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "qrep_enabled_for_layer"
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Attribute)
+        and node.targets[0].attr == "qrep_enabled"
+    ]
+    assert len(calls) == 1, (
+        "expected exactly one `self.qrep_enabled = qrep_enabled_for_layer(...)` "
+        f"assignment in attention_mla.py; found {len(calls)}"
+    )
+    (call,) = calls
+    assert (
+        not call.keywords
+    ), "expected qrep_enabled_for_layer's call site to use positional args"
+
+    def _name(node):
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            return f"{node.value.id}.{node.attr}"
+        return None
+
+    arg_names = [_name(arg) for arg in call.args]
+    assert arg_names == [
+        "wants_qrep",
+        "self.q_proj",
+        "self.qrep_num_heads",
+        "self.qk_head_dim",
+    ], f"qrep_enabled_for_layer's call site changed shape: got {arg_names}"
+
+
+def test_rebuild_sparse_dcp_persistent_metadata_call_sites_use_their_own_width():
+    """Pins gathered_num_heads at both call sites, not just the function.
+
+    Decode and sparse prefill round the gathered query width through
+    different tables (mla_dcp_kernel_num_heads vs mla_dcp_sparse_prefill_
+    num_heads) and can disagree (e.g. num_heads=12, dcp=8 -> 96 vs 128).
+    Passing the wrong one plans persistent work descriptors for the wrong
+    nhead; nothing importable on the CPU gate would notice a regression
+    here, so read the two call sites from source instead.
+    """
+    tree = ast.parse(_ATTENTION_MLA_PATH.read_text(encoding="utf-8"))
+
+    def _name(node):
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            return f"{node.value.id}.{node.attr}"
+        return None
+
+    by_enclosing_func = {}
+    for func in ast.walk(tree):
+        if not isinstance(func, ast.FunctionDef):
+            continue
+        for node in ast.walk(func):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_rebuild_sparse_dcp_persistent_metadata"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "self"
+            ):
+                by_enclosing_func[func.name] = _name(node.args[6])
+
+    assert by_enclosing_func == {
+        "_forward_decode": "self.dcp_kernel_num_heads",
+        "_forward_prefill_mla": "self.dcp_sparse_prefill_num_heads",
+    }, (
+        "a _rebuild_sparse_dcp_persistent_metadata call site is passing the "
+        f"wrong gathered_num_heads (7th positional arg): got {by_enclosing_func}"
+    )
+
+
+@needs_dcp_ops
+def test_dcp_kernel_and_sparse_prefill_num_heads_can_diverge():
+    """Demonstrates the gap the test above guards against is real, not just
+    hypothetical: at this head count the two width tables actually disagree.
+    """
+    decode_width = mla_dcp_kernel_num_heads(
+        12, 8, kv_cache_dtype="bf16", persistent=True
+    )
+    prefill_width = mla_dcp_sparse_prefill_num_heads(12, 8, persistent=True)
+    assert (decode_width, prefill_width) == (96, 128), (
+        "expected decode's and sparse prefill's width tables to disagree "
+        f"here; got decode={decode_width}, prefill={prefill_width} -- if "
+        "they now agree, the case above no longer proves the two call sites "
+        "must use their own width, pick another num_heads/dcp pair that "
+        "still diverges"
+    )
+
+
+# ──────────────── QREP wiring at the q_proj producers (CPU, source-level) ──
+#
+# Pins the other half of the safety net above: models that are SUPPOSED to
+# get QREP actually pass `qrep_tp_override` into q_proj. Nothing else covers
+# this -- dropping the override from a draft model leaves every other test
+# green, with only a silently-lost AllGather saving as the symptom. Read
+# from source (ast), not by constructing a layer, which would need a GPU
+# and put this behind @needs_gpu, off the CPU gate.
+
+_ATOM_MODELS = Path(__file__).resolve().parent.parent / "atom" / "models"
+
+# Query projections here must carry qrep_tp_override.
+_QREP_WIRED_MODELS = (
+    "deepseek_v2.py",  # DeepSeek V2/V3/V3.2 and GLM-5.2 (GlmMoeDsaForCausalLM)
+    "kimi_k3.py",  # Kimi-K3 target
+    "kimi_k3_dspark.py",  # DSpark draft for Kimi-K3
+    "eagle3_deepseek_mla.py",  # eagle3 MLA draft
+)
+
+# MLA models that deliberately do NOT wire QREP, with the reason. A newly added
+# MLA model has to land in one list or the other -- that is what the census
+# below forces, so "nobody remembered the override" cannot pass silently.
+_QREP_UNWIRED_MODELS = {
+    "glm5_next.py": (
+        "GLM-5.3-Flash wraps q_proj in _ZeroRopePad, which hardcodes the "
+        "per-rank head count and exposes no .weight for the width check to see "
+        "through; wiring it takes three coordinated changes, not the one-line "
+        "override."
+    ),
+}
+
+
+def _q_proj_linear_calls(path):
+    """Every ``self.q_proj``/``self.q_b_proj = <Linear>(...)`` in the module,
+    each paired with its enclosing function (typically ``__init__``).
+
+    The enclosing function is returned alongside the call so the override-name
+    lookup below can be scoped to it, instead of the whole module: two
+    unrelated classes in the same file binding the same variable name to two
+    different things must not let one satisfy the other.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    found = []
+    for func in ast.walk(tree):
+        if not isinstance(func, ast.FunctionDef):
+            continue
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+                continue
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and target.attr in ("q_proj", "q_b_proj")
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "self"
+                ):
+                    found.append((target.attr, node.value, node.lineno, func))
+    return found
+
+
+def _qrep_override_names(scope):
+    """Local names bound to ``qrep_tp_override(...)`` within `scope`.
+
+    `scope` is a function node, not the whole module -- two unrelated classes
+    binding the same variable name must not let one satisfy the other.
+    Matches both spellings (`**qrep_tp_override(tp)` inline, or bound to a
+    name first) since pinning only the inline form would pass just one of
+    the four wired models.
+    """
+    names = set()
+    for node in ast.walk(scope):
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "qrep_tp_override"
+        ):
+            names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+    return names
+
+
+def _passes_qrep_override(call, override_names):
+    """Whether the call gets `qrep_tp_override`'s kwargs, inline or via a name."""
+    for kw in call.keywords:
+        if kw.arg is not None:
+            continue
+        v = kw.value
+        if (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Name)
+            and v.func.id == "qrep_tp_override"
+        ):
+            return True
+        if isinstance(v, ast.Name) and v.id in override_names:
+            return True
+    return False
+
+
+def test_qrep_override_names_is_scoped_to_the_enclosing_function():
+    """A name bound in one function must not satisfy a call in another.
+
+    This used to be checked module-globally (any name ever bound to
+    `qrep_tp_override(...)` anywhere in the file passed at any q_proj call
+    on any branch), which a coincidental variable-name collision across two
+    unrelated classes/functions in the same file could fool.
+    """
+    source = """
+def build_wired(tp_size):
+    q_qrep_override = qrep_tp_override(tp_size)
+    self.q_proj = ColumnParallelLinear(**q_qrep_override)
+
+def build_unwired(tp_size):
+    q_qrep_override = some_other_thing(tp_size)
+    self.q_proj = ColumnParallelLinear(**q_qrep_override)
+"""
+    tree = ast.parse(source)
+    functions = {f.name: f for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)}
+
+    def _q_proj_call(func):
+        for node in ast.walk(func):
+            if (
+                isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.targets[0], ast.Attribute)
+                and node.targets[0].attr == "q_proj"
+            ):
+                return node.value
+        raise AssertionError("no q_proj assignment found")
+
+    wired_call = _q_proj_call(functions["build_wired"])
+    unwired_call = _q_proj_call(functions["build_unwired"])
+
+    assert _passes_qrep_override(
+        wired_call, _qrep_override_names(functions["build_wired"])
+    )
+    assert not _passes_qrep_override(
+        unwired_call, _qrep_override_names(functions["build_unwired"])
+    ), "a same-named variable bound in a DIFFERENT function must not pass"
+
+    # Confirms the scoping above is actually doing the work: checked against
+    # the whole module's bound names instead, the same call incorrectly
+    # passes, because build_wired's binding is visible module-wide.
+    assert _passes_qrep_override(unwired_call, _qrep_override_names(tree)), (
+        "sanity check failed -- if this now also fails, the synthetic source "
+        "above no longer reproduces the module-wide false pass this test "
+        "guards against"
+    )
+
+
+@pytest.mark.parametrize("filename", _QREP_WIRED_MODELS)
+def test_q_proj_producers_pass_qrep_tp_override(filename):
+    """Both target models and both speculative drafts must widen q_proj.
+
+    The drafts are the ones with no other coverage at all: a draft builds its
+    own q_proj independently of the target, so forgetting the override there
+    costs the AllGather saving for those layers while every functional test
+    still passes.
+    """
+    path = _ATOM_MODELS / filename
+    calls = _q_proj_linear_calls(path)
+    assert calls, f"{filename}: no self.q_proj/self.q_b_proj assignment found"
+    missing = [
+        f"{filename}:{lineno} (self.{attr})"
+        for attr, call, lineno, func in calls
+        if not _passes_qrep_override(call, _qrep_override_names(func))
+    ]
+    assert not missing, (
+        "query projections built without qrep_tp_override -- MLAAttention will "
+        "fall back to AllGather Q for their layers: " + ", ".join(missing)
+    )
+
+
+def _builds_mla_modules(path):
+    """Whether this file constructs an ``MLAModules(...)``, robust to aliasing.
+
+    A real check (import-tracked name, actually called), not a literal
+    substring match on ``"MLAModules("`` -- which an aliased import
+    (``import ... as MM``) would evade, and a comment merely mentioning the
+    name would falsely trip.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    local_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").endswith(
+            "attention_mla"
+        ):
+            local_names.update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name == "MLAModules"
+            )
+    if not local_names:
+        return False
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in local_names
+        for node in ast.walk(tree)
+    )
+
+
+def test_every_mla_model_has_an_explicit_qrep_decision():
+    """A new MLA model must be classified, not silently left unwired.
+
+    `rglob`, not `glob`: a non-recursive scan would miss an MLA model added
+    under a subpackage (`atom/models/<family>/...`), the direction some of
+    `atom/model_ops/` already organizes new code in.
+    """
+    producers = {
+        path.name for path in _ATOM_MODELS.rglob("*.py") if _builds_mla_modules(path)
+    }
+    undecided = producers - set(_QREP_WIRED_MODELS) - set(_QREP_UNWIRED_MODELS)
+    assert not undecided, (
+        "these models build an MLA q_proj but are in neither the QREP-wired "
+        f"list nor the documented-unwired list: {sorted(undecided)}. Add "
+        "qrep_tp_override to the query projection, or record why it cannot be "
+        "wired in _QREP_UNWIRED_MODELS."
+    )
 
 
 # ═══════════════════════════════ ColumnParallelLinear.make_row_view (GPU) ══
@@ -1184,20 +1662,18 @@ def test_decode_width_comes_from_the_matching_table(num_heads, dcp, dtype):
 @needs_dcp_ops
 @pytest.mark.parametrize("rebuild", [False, True])
 @pytest.mark.parametrize("num_heads, dcp", HEAD_WIDTH_SHAPES)
-@pytest.mark.parametrize("dtype", ["bf16", "fp8"])
 def test_sparse_prefill_width_matches_its_own_persistence_predicate(
-    num_heads, dcp, dtype, rebuild
+    num_heads, dcp, rebuild
 ):
     """The pairing this whole file exists for.
 
-    The width must come from the table for the mode ``_forward_prefill_mla``
-    will actually run in -- which is NOT decode's mode, because the prefill work
-    metadata is only built on the fp8 branch. Reading decode's answer here is
-    exactly how a bf16 sparse prefill would get padded to gqa=64 and then run
-    non-persistent.
+    The width must come from this call site's own table
+    (``_MLA_DCP_SPARSE_PREFILL_WIDTHS*``), not decode's -- reading decode's
+    answer here is exactly how a sparse prefill would get its width chosen
+    from the wrong table.
     """
     persistent = mla_dcp_sparse_prefill_is_persistent(
-        dtype, dcp, True, sparse_metadata_rebuild=rebuild
+        dcp, True, sparse_metadata_rebuild=rebuild
     )
     w = mla_dcp_sparse_prefill_num_heads(
         num_heads, dcp, HEAD_WIDTH_MIN, persistent=persistent
@@ -1213,6 +1689,66 @@ def test_sparse_prefill_width_matches_its_own_persistence_predicate(
         assert w >= gathered
     if not persistent:
         assert w != 64, "non-persistent sparse prefill must not dispatch gqa=64"
+
+
+def test_sparse_prefill_persistence_does_not_look_at_dtype():
+    """Was gated on KV cache dtype (fp8-only); see
+    mla_dcp_sparse_prefill_is_persistent's docstring for why that gate was
+    wrong. A value assertion would not catch a dtype parameter re-added as an
+    optional keyword with a default; pin the decoupling at the signature
+    instead.
+    """
+    params = inspect.signature(mla_dcp_sparse_prefill_is_persistent).parameters
+    assert not any("dtype" in p or "kv_cache" in p for p in params), (
+        "the DCP sparse-prefill persistence predicate must not key off KV "
+        f"cache dtype; got parameters {list(params)}"
+    )
+
+
+@pytest.mark.parametrize("dcp_world_size", [1, 2, 8])
+@pytest.mark.parametrize("dcp_persistent_supported", [False, True])
+@pytest.mark.parametrize("sparse_metadata_rebuild", [False, True])
+def test_sparse_prefill_persistence_is_decodes_with_is_sparse_true(
+    dcp_world_size, dcp_persistent_supported, sparse_metadata_rebuild
+):
+    """`mla_dcp_sparse_prefill_is_persistent` is a thin `is_sparse=True` call
+    into `mla_dcp_decode_is_persistent`, not a second copy of its body --
+    pins that the delegation actually agrees with the general function
+    across the inputs that matter, not just that it happens to today by
+    construction.
+    """
+    assert mla_dcp_sparse_prefill_is_persistent(
+        dcp_world_size,
+        dcp_persistent_supported,
+        sparse_metadata_rebuild=sparse_metadata_rebuild,
+    ) == mla_dcp_decode_is_persistent(
+        True,
+        dcp_world_size,
+        dcp_persistent_supported,
+        sparse_metadata_rebuild=sparse_metadata_rebuild,
+    )
+
+
+def test_decode_is_persistent_false_below_dcp_2():
+    assert not mla_dcp_decode_is_persistent(
+        False, 1, True, sparse_metadata_rebuild=True
+    )
+
+
+def test_decode_is_persistent_sparse_requires_metadata_rebuild():
+    """Dense decode (`is_sparse=False`) never looks at `sparse_metadata_rebuild`
+    at all; sparse decode is unconditionally non-persistent without it."""
+    assert mla_dcp_decode_is_persistent(False, 8, True, sparse_metadata_rebuild=False)
+    assert not mla_dcp_decode_is_persistent(
+        True, 8, True, sparse_metadata_rebuild=False
+    )
+    assert mla_dcp_decode_is_persistent(True, 8, True, sparse_metadata_rebuild=True)
+
+
+def test_decode_is_persistent_requires_platform_support():
+    assert not mla_dcp_decode_is_persistent(
+        False, 8, False, sparse_metadata_rebuild=True
+    )
 
 
 @needs_dcp_ops

@@ -114,7 +114,6 @@ from atom.model_ops.sparse_indexer_fp4 import (
     FP4_MQA_PARALLEL_UNIT_NUM,
     FP4_QUANT_BLOCK_SIZE,
     assert_fp4_indexer_supported,
-    fp4_index_scale_rows,
     fp4_q_scale_shape,
     sparse_indexer_fp4_enabled,
 )
@@ -1485,23 +1484,25 @@ def _dcp_stage_indexer_fp4_prefill(
     The two planes disagree on their row axis, so both the read and the write
     bend through `fp4_index_scale_rows`; see it for what goes wrong otherwise.
     """
-    slots = prefill_metadata.dcp_indexer_fp4_local_slots
-    page, row = slots // block_size, slots % block_size
+    # Built once per forward by the metadata builder.
+    page = prefill_metadata.dcp_indexer_fp4_read_page
+    row = prefill_metadata.dcp_indexer_fp4_read_row
     data = kv_cache[page, :, :, row, :]
-    scale = kv_cache_scale[page, :, :, fp4_index_scale_rows(row, block_size)]
+    scale = kv_cache_scale[page, :, :, prefill_metadata.dcp_indexer_fp4_read_scale_row]
 
     dcp_group = get_dcp_group()
     gather_index = prefill_metadata.dcp_indexer_gather_index
     data = dcp_group.all_gather(data, dim=0).index_select(0, gather_index)
     scale = dcp_group.all_gather(scale, dim=0).index_select(0, gather_index)
 
-    token = torch.arange(total_kv, device=data.device)
-    page, row = token // block_size, token % block_size
+    page = prefill_metadata.dcp_indexer_fp4_stage_page
+    row = prefill_metadata.dcp_indexer_fp4_stage_row
+    scale_row = prefill_metadata.dcp_indexer_fp4_stage_scale_row
     pages = -(-total_kv // block_size)
     staged = kv_cache.new_zeros(pages, *kv_cache.shape[1:])
     staged[page, :, :, row, :] = data
     staged_scale = kv_cache_scale.new_zeros(pages, *kv_cache_scale.shape[1:])
-    staged_scale[page, :, :, fp4_index_scale_rows(row, block_size)] = scale
+    staged_scale[page, :, :, scale_row] = scale
     return staged, staged_scale
 
 

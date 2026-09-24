@@ -58,8 +58,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
         The standalone connector supplies LMCache's legacy lookup client. The
         multiprocess connector supplies a small adapter with the same public
-        ``lookup``/``clear_lookup_status`` contract, so both transports retain
-        one scheduling and exact-completion implementation.
+        ``lookup``/``clear_lookup_status`` methods, so both transports retain one
+        scheduling and exact-completion implementation. The two differ in one
+        documented way: the adapter's ``lookup`` also returns ``None``, meaning
+        "the worker did not answer in time", which is not a hit of zero and must
+        not be remembered as one.
         """
         self._init_offload_statistics()
         self._config = config
@@ -81,6 +84,14 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             minimum=1,
         )
         self._lookup_client = lookup_client
+
+        # Optional veto on how far a reported hit may reach, installed by a
+        # hybrid connector. A model whose recurrent state must be restored
+        # alongside the KV has a second condition this scheduler knows nothing
+        # about -- the state at the hit boundary has to exist too -- and the
+        # only safe answer to a missing state is a shorter hit. Called with
+        # ``(seq, hit)`` and returns the permitted hit.
+        self._hit_cap_hook = None
 
         # req_id -> LoadSpec (pending load decided at match time)
         self._load_specs: dict[str, LoadSpec] = {}
@@ -151,37 +162,73 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._clear_pending_load(sid)
             self._active_load_operations.pop(sid, None)
             self._load_failed_seqs.pop(sid, None)
+            self._forget_tier_hit(sid)
         self._load_lifecycles[sid] = seq
 
+    def install_hit_cap_hook(self, hook) -> None:
+        """Let a hybrid connector shorten every hit this scheduler reports.
+
+        One hook, not a list: the cap is a correctness constraint rather than a
+        policy, and two of them would raise the question of which wins for a
+        reader who has to be sure the answer is "the shortest".
+        """
+        self._hit_cap_hook = hook
+
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
+        """How many extra prompt tokens the external tier can supply.
+
+        Called once per step for as long as the request stays unadmitted, so
+        the tier hit is remembered rather than asked for again
+        (`OffloadSchedulerMixin._init_tier_hit_memo`) while the answer below is
+        re-derived every call. A remembered hit carries no worker-side lookup
+        pin; the pin is re-taken where the load is committed
+        (`OffloadSchedulerMixin._ensure_lookup_pin`).
+        """
+
         if not self._do_load or self._lookup_client is None:
             return 0, False
         self._begin_load_lifecycle(seq)
         sid = str(seq.id)
         if self._repeat_load_suppressed(seq, sid):
             return 0, False
-        num_prompt = seq.num_prompt_tokens
-        token_ids = list(seq.token_ids[:num_prompt])
         pending = self._lookup_results.get(sid)
         if pending is not None and pending[0] is not seq:
             # An older lifecycle still owns this worker-side pin. Its cleanup
             # must be dispatched before the ID can acquire a new lease.
             return 0, False
-        try:
-            if pending is None:
-                if sid not in self._lookup_in_step:
-                    self._lookup_in_step.append(sid)
-                self._lookup_results[sid] = (seq, 0)
-                hit = self._lookup_client.lookup(token_ids, lookup_id=sid)
-                if hit is None:
-                    self._lookup_results.pop(sid, None)
-                else:
-                    self._lookup_results[sid] = (seq, int(hit))
-            else:
-                hit = pending[1]
-        except Exception:
-            logger.exception("LMCache offload lookup failed for seq %s", seq.id)
+        if pending is not None:
+            hit = pending[1]
+        else:
+            remembered, hit = self._remembered_tier_hit(seq, sid)
+            if not remembered:
+                hit = self._fresh_tier_lookup(seq, sid)
+        if hit is None:
             return 0, False
+        return self._answer_from_tier_hit(seq, sid, hit)
+
+    def _fresh_tier_lookup(self, seq, sid: str) -> int | None:
+        """Ask the tier, take its pin, and remember the hit. None if it did not answer."""
+
+        num_prompt = seq.num_prompt_tokens
+        token_ids = list(seq.token_ids[:num_prompt])
+        if sid not in self._lookup_in_step:
+            self._lookup_in_step.append(sid)
+        self._lookup_results[sid] = (seq, 0)
+        try:
+            hit = self._lookup_client.lookup(token_ids, lookup_id=sid)
+        except Exception:
+            # The ID stays in `_lookup_in_step` so the dispatch unpins whatever
+            # a half-run lookup may have taken.
+            logger.exception("LMCache offload lookup failed for seq %s", seq.id)
+            self._lookup_results.pop(sid, None)
+            self._remember_tier_hit(seq, sid, None)
+            return None
+        if hit is None:
+            self._lookup_results.pop(sid, None)
+        else:
+            hit = int(hit)
+            self._lookup_results[sid] = (seq, hit)
+        self._remember_tier_hit(seq, sid, hit)
         if logger.isEnabledFor(logging.DEBUG):
             _lh = None
             try:
@@ -203,25 +250,57 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 hit,
                 _lh,
             )
+        return hit
+
+    def _answer_from_tier_hit(self, seq, sid: str, hit: int) -> tuple[int, bool]:
+        """Turn a tier hit into this step's answer, and arm what it implies."""
+
         if not hit:
             return 0, False
+        num_prompt = seq.num_prompt_tokens
+        frontier = int(seq.num_cached_tokens)
         hit = self._loadable_hit(hit, num_prompt)
+        if self._hit_cap_hook is not None:
+            # After `_loadable_hit`, so the hook caps the hit that will
+            # actually be requested; before the save floor is recorded, so a
+            # capped hit does not leave a floor claiming the tier already holds
+            # the part that was just refused. The cap names a state boundary,
+            # which need not be a chunk multiple, so it is floored again --
+            # `_loadable_hit`'s own reason applies unchanged to the capped
+            # length.
+            capped = int(self._hit_cap_hook(seq, hit))
+            if capped < hit:
+                logger.debug(
+                    "[OFFLOAD-LOOKUP] seq=%s hit capped %d -> %d",
+                    seq.id,
+                    hit,
+                    capped,
+                )
+                hit = self._chunk_floor(capped)
+            if hit <= 0:
+                self._clear_pending_load(sid)
+                self._hit_save_floors.pop(sid, None)
+                return 0, False
         self._hit_save_floors[sid] = hit
-        need = hit - int(seq.num_cached_tokens)
+        need = hit - frontier
         if need <= 0:
             self._clear_pending_load(sid)
             self._hit_save_floors[sid] = self._chunk_floor(hit)
             return 0, False
         self._load_specs[sid] = LoadSpec(
-            hbm_cached_tokens=int(seq.num_cached_tokens),
+            hbm_cached_tokens=frontier,
             lmcache_cached_tokens=hit,
             can_load=False,
         )
-        return need, True  # True => park in WAITING_FOR_REMOTE_KVS
+        # True => park in WAITING_FOR_REMOTE_KVS
+        return need, True
 
     def update_state_after_alloc(self, seq) -> None:
         self._begin_load_lifecycle(seq)
         sid = str(seq.id)
+        # Admitted: the frontier moves and the load spec is dispatched, so a
+        # remembered hit has been spent. A preempted request asks again.
+        self._forget_tier_hit(sid)
         ls = self._load_specs.get(sid) if self._do_load else None
         logger.debug(
             "[OFFLOAD-ALLOC] seq=%s ls_found=%s num_cached_now=%s",
@@ -333,6 +412,13 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             )
             if not should_load:
                 self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
+                self._clear_pending_load(sid)
+                continue
+            # This is the one place a retrieve is handed to the worker, so it
+            # is where the load's lookup pin has to be live -- a spec derived
+            # from a remembered hit has none yet.
+            if not self._ensure_lookup_pin(seq, sid, ls):
+                self._mark_load_skip(seq, "tier_lost_prefix", hbm, lmc, need, chunk)
                 self._clear_pending_load(sid)
                 continue
             # num_cached after load = max(HBM, offload); never drop below HBM.
@@ -827,6 +913,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             # them as already persisted.
             entry[1] = self._chunk_floor(floor)
         self._record_failed_load_attempt(sid)
+        # Drop the hit too. `_repeat_load_suppressed` already answers for this
+        # request, but the memo must not outlive the load spec it would imply
+        # if that guard is ever moved or short-circuited.
+        self._forget_tier_hit(sid)
         self._clear_pending_load(sid)
         return True
 
@@ -847,6 +937,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         sid = str(seq.id)
         if self._load_lifecycles.get(sid) is not seq:
             return
+        # The remembered hit is left alone: a cancel says this connector is not
+        # the one loading the request right now, not that the tier stopped
+        # holding the prefix, so re-answering from it is honest. The tier is
+        # asked again before anything is transferred (`_ensure_lookup_pin`).
         self._clear_pending_load(sid)
         active = self._active_load_operations.get(sid)
         if active is not None and active[0] is seq:
@@ -879,6 +973,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 self._cancel_load_statistics(active[1])
             self._load_lifecycles.pop(sid, None)
         self._release_failed_load_attempt(sid, seq)
+        self._forget_tier_hit(sid)
         entry = self._save_tracker.get(sid)
         if entry is not None and entry[0] is seq:
             if self._early_release:

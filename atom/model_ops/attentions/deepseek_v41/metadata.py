@@ -62,6 +62,9 @@ class BatchStep:
     selected: dict[int, torch.Tensor] = field(default_factory=dict)
     candidates: dict[int, torch.Tensor] = field(default_factory=dict)
     tiles: dict[int, torch.Tensor] = field(default_factory=dict)
+    # First layer of an index group -> the `(prefix, pptr, extend, eptr)` one
+    # launch wrote for the whole run.
+    group_indices: dict[int, tuple[torch.Tensor, ...]] = field(default_factory=dict)
     indptrs: dict[int, tuple] = field(default_factory=dict)
     # ratio -> [width] int32: compressed rows each query row may see. Worked
     # out on the host, where `positions` is staged and where RoPE takes its
@@ -88,6 +91,7 @@ class BatchStep:
         self.selected.clear()
         self.candidates.clear()
         self.tiles.clear()
+        self.group_indices.clear()
 
     @property
     def width(self):

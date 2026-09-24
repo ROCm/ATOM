@@ -428,7 +428,7 @@ class TestSchedulerAddQuery:
 
 
 class TestSchedule:
-    def test_non_offload_abort_keeps_existing_receive_cleanup(self):
+    def test_non_offload_abort_retains_receive_until_terminal(self):
         seq = SimpleNamespace(
             id=96,
             status=SequenceStatus.ABORTED,
@@ -436,6 +436,7 @@ class TestSchedule:
         )
         sched = Scheduler.__new__(Scheduler)
         sched._rejected = []
+        sched._inflight_prefix_wait = {}
         sched.deferred_free_blocks = {}
         sched.finished_recving_kv_req_ids = []
         sched.failed_recving_kv_req_ids = []
@@ -444,8 +445,9 @@ class TestSchedule:
 
         sched._reject_aborted_waiting(seq)
 
-        assert sched.deferred_free_blocks == {}
-        assert sched._num_parked_remote_kv == 0
+        assert sched.deferred_free_blocks == {seq.id: seq}
+        assert sched._num_parked_remote_kv == 1
+        assert seq._awaiting_aborted_load_cleanup
         assert sched._rejected == [seq]
 
     @pytest.mark.parametrize("producer", [False, True])
@@ -508,6 +510,7 @@ class TestSchedule:
         sched.waiting = deque()
         sched.running = deque()
         sched._rejected = []
+        sched._inflight_prefix_wait = {}
         sched.deferred_free_blocks = {}
         sched.finished_recving_kv_req_ids = []
         sched.failed_recving_kv_req_ids = []

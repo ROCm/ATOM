@@ -373,19 +373,46 @@ jobs:
       - name: Test Docker image
         if: ${{ success() && steps.gates.outputs.main == 'true' && inputs.skip_tests != true }}
         timeout-minutes: 60
+        env:
+          SMOKE_MODEL: meta-llama/Meta-Llama-3-8B-Instruct
         run: |
           echo "Clean up containers..."
           docker ps -aq -f "name=${CI_CONTAINER}" | xargs -r docker stop | xargs -r docker rm
-              
+
           if [ -f "/etc/podinfo/gha-render-devices" ]; then
             DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
-              
+
+          # Serve the smoke model from the runner's shared cache rather than
+          # pulling it from the hub every night, on every line. On 2026-09-18
+          # the rocm10.0 line died 11s in when huggingface.co dropped the
+          # connection under list_repo_templates. That call falls back to
+          # local files on httpx.NetworkError, but a mid-request disconnect
+          # raises RemoteProtocolError -- a sibling class, not a subclass --
+          # which escapes. A local path skips the call outright. Probe order
+          # matches .github/actions/setup-gpu-container.
+          MODEL_HOST_ROOT=""
+          for d in /shared_nfs/huggingface_models /models /data/models; do
+            if [ -d "$d" ]; then
+              MODEL_HOST_ROOT="$d"
+              break
+            fi
+          done
+
+          MODEL_MOUNT=""
+          if [ -n "${MODEL_HOST_ROOT}" ]; then
+            MODEL_MOUNT="-v ${MODEL_HOST_ROOT}:/models"
+            echo "Model cache: ${MODEL_HOST_ROOT} -> /models"
+          else
+            echo "::warning::No model cache directory on this runner; falling back to fetching ${SMOKE_MODEL} from the hub. That fallback is the path that failed on 2026-09-18."
+          fi
+
           echo "Starting container: ${CI_CONTAINER} (image: ${CI_IMAGE})"
           docker run -dt --device=/dev/kfd $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
+            ${MODEL_MOUNT} \
             --ipc=host --group-add video \
             --shm-size 16g \
             --cap-add=SYS_PTRACE \
@@ -395,12 +422,47 @@ jobs:
             --ulimit stack=67108864 \
             --name "${CI_CONTAINER}" \
             "${CI_IMAGE}"
-              
-          docker exec "${CI_CONTAINER}" bash -c \
-            "rm -f ~/.cache/huggingface/token ~/.cache/huggingface/stored_tokens 2>/dev/null; \
+
+          # Populate the cache under a lock on the shared mount. The script
+          # defaults MODEL_LOCK_ROOT to /tmp, inside the container, so the two
+          # lines would hold two flocks on two pods while guarding one
+          # directory on shared storage. Free on a cache hit; on a revision
+          # change both would mv the same path.
+          MODEL_PATH="${SMOKE_MODEL}"
+          if [ -n "${MODEL_HOST_ROOT}" ]; then
+            docker exec \
+              -e HF_TOKEN="${HF_TOKEN:-}" \
+              -e MODEL_ID="${SMOKE_MODEL}" \
+              -e TARGET_DIR="/models/${SMOKE_MODEL}" \
+              -e MODEL_LOCK_ROOT="/models/.atom-model-locks" \
+              "${CI_CONTAINER}" \
+              bash -c 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'
+            MODEL_PATH="/models/${SMOKE_MODEL}"
+          fi
+          echo "Model path: ${MODEL_PATH}"
+
+          # pipefail inside the exec: without it the pipeline's status is
+          # grep's, and an inference that prints its prompts and completions
+          # and then dies (a crash in the final statistics or cleanup) would
+          # still read as success, skip the hub probe below and pass the
+          # nightly on a failed image.
+          if ! docker exec "${CI_CONTAINER}" bash -c \
+            "set -o pipefail; \
+             rm -f ~/.cache/huggingface/token ~/.cache/huggingface/stored_tokens 2>/dev/null; \
              python3 -m atom.examples.simple_inference \
-               --model meta-llama/Meta-Llama-3-8B-Instruct \
-               --temperature 0 | grep -E '^Prompt: |^Completion:'" > atom_release_output.txt
+               --model '${MODEL_PATH}' \
+               --temperature 0 | grep -E '^Prompt: |^Completion:'" > atom_release_output.txt; then
+            # A dropped connection and a broken image leave the same trace
+            # in the log. Record which HF edge answered, and how fast.
+            echo "::group::Inference failed -- hub reachability from inside ${CI_CONTAINER}"
+            docker exec -e SMOKE_MODEL="${SMOKE_MODEL}" "${CI_CONTAINER}" bash -c \
+              'curl -sS -o /dev/null --max-time 20 \
+                 -w "huggingface.co: http=%{http_code} edge=%{remote_ip} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s\n" \
+                 https://huggingface.co/api/models/${SMOKE_MODEL} \
+                 || echo "huggingface.co: curl exited $?"' || true
+            echo "::endgroup::"
+            exit 1
+          fi
           
           echo ""
           echo "========== Showing release output below =========="

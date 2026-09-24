@@ -174,6 +174,7 @@ QuarkParser = _qs.QuarkParser
 QuarkOnlineParser = _qs.QuarkOnlineParser
 GenericParser = _qs.GenericParser
 get_quant_parser = _qs.get_quant_parser
+will_online_requant = _qs.will_online_requant
 
 
 # =========================================================================
@@ -804,3 +805,72 @@ def test_get_hf_config_restores_qwen3_next_full_attention_interval(monkeypatch):
     result = _m.get_hf_config("Qwen/Qwen3-Next-80B-A3B-Thinking")
 
     assert result.full_attention_interval == 4
+
+
+# =========================================================================
+# Tests — will_online_requant
+# =========================================================================
+
+
+# MiniMaxAI/MiniMax-M3-MXFP8's own `quantization_config`, and the online config
+# the nightly benchmark launches it with. A layer's format has to be decided
+# from the pair: the model-wide `online_quant` flag is true for every layer
+# here, including the ones the online exclude list leaves on their checkpoint
+# weights.
+M3_MXFP8_SOURCE = {
+    "quant_method": "mxfp8",
+    "activation_scheme": "dynamic",
+    "weight_block_size": [1, 32],
+    "ignored_layers": ["lm_head", "model.embed_tokens", "vision_tower"],
+}
+M3_MXFP8_ONLINE = {
+    "global_quant_config": "ptpc_fp8",
+    "exclude_layer": [
+        "lm_head",
+        "model.embed_tokens",
+        "vision_tower",
+        "multi_modal_projector",
+        "patch_merge_mlp",
+        "*block_sparse_moe",
+    ],
+}
+ATTENTION = "language_model.model.layers.3.self_attn.qkv_proj"
+SHARED_EXPERT = (
+    "language_model.model.layers.3.block_sparse_moe.shared_experts.gate_up_proj"
+)
+
+
+class TestWillOnlineRequant:
+    def _m3_config(self):
+        return QuantizationConfig(
+            FakeHFConfig(torch_dtype=BF16, quantization_config=M3_MXFP8_SOURCE),
+            online_quant_config=M3_MXFP8_ONLINE,
+        )
+
+    def test_none_config_never_requantizes(self):
+        assert will_online_requant(None, ATTENTION, QuantType.per_1x32, FP8) is False
+
+    def test_offline_only_config_never_requantizes(self):
+        qcfg = QuantizationConfig(
+            FakeHFConfig(torch_dtype=BF16, quantization_config=M3_MXFP8_SOURCE)
+        )
+        assert qcfg.online_quant is False
+        assert will_online_requant(qcfg, ATTENTION, QuantType.per_1x32, FP8) is False
+
+    def test_attention_linear_is_requantized(self):
+        qcfg = self._m3_config()
+        assert qcfg.online_quant is True
+        assert will_online_requant(qcfg, ATTENTION, QuantType.per_1x32, FP8) is True
+
+    def test_online_excluded_layer_keeps_its_checkpoint_weight(self):
+        # `*block_sparse_moe` is excluded online while the checkpoint quantizes
+        # everything under it but the router gate, so the model-wide flag and
+        # this layer's answer disagree.
+        qcfg = self._m3_config()
+        assert (
+            will_online_requant(qcfg, SHARED_EXPERT, QuantType.per_1x32, FP8) is False
+        )
+
+    def test_source_already_at_online_target_is_not_requantized(self):
+        qcfg = self._m3_config()
+        assert will_online_requant(qcfg, ATTENTION, QuantType.per_Token, FP8) is False

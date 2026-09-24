@@ -783,10 +783,25 @@ start_router() {
   fi
   local -a router_dp_aware_args=()
   if is_agentic_dpa; then
-    router_policy="dp_sticky"
+    # Respect explicit cache-aware routing for DPA workloads.
+    if [[ "${router_policy}" != "cache_aware" ]]; then
+      router_policy="dp_sticky"
+    fi
     router_dp_aware_args=(--dp-aware)
   elif [[ "${#router_rank_mapping_args[@]}" -gt 0 ]]; then
     router_dp_aware_args=(--dp-aware)
+  fi
+  local -a router_policy_args=(--policy "${router_policy}")
+  if [[ "${router_policy}" == "cache_aware" ]]; then
+    # Keep the InferenceX defaults, with a case-level absolute-load override.
+    router_policy_args+=(
+      --prefill-policy cache_aware --decode-policy cache_aware
+      --cache-threshold 0.8
+      --balance-abs-threshold "${ROUTER_BALANCE_ABS_THRESHOLD:-20}"
+      --balance-rel-threshold 2.0
+      --eviction-interval 300
+    )
+    router_rank_mapping_args=(--atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}")
   fi
   local -a router_cmd=(
     "${mesh_binary}" launch
@@ -795,7 +810,7 @@ start_router() {
     --pd-disaggregation
     "${prefill_args[@]}"
     "${decode_args[@]}"
-    --policy "${router_policy}"
+    "${router_policy_args[@]}"
     "${router_rank_mapping_args[@]}"
     "${router_dp_aware_args[@]}"
     --backend atom
@@ -1260,6 +1275,7 @@ run_eval() {
       --num_fewshot "${EVAL_FEWSHOT}" \
       "${limit_arg[@]}" \
       "${eval_extra_args[@]}" \
+      --log_samples \
       --output_path "${result_dir}"
 
     python3 - "${result_dir}" "${eval_conc}" <<'PY'

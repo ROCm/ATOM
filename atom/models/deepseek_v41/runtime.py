@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""ModelRunner interface over the accepted V4.1 text backbone."""
+"""ModelRunner interface over the V4.1 multimodal backbone."""
 
 import torch
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -26,8 +26,6 @@ def v41_begin_forward(hidden: torch.Tensor) -> None:
         return
     if hidden.shape[-2] != metadata.step.width:
         raise ValueError("Token rows disagree with the width this step declared")
-    if metadata.image_mask is not None:
-        raise NotImplementedError("V4.1 compiled runtime supports text-only routing")
     stage = getattr(metadata.engram_embeddings, "stage", None)
     if stage is not None:
         stage()
@@ -51,7 +49,9 @@ def v41_attention(hidden: torch.Tensor, layer_name: str) -> torch.Tensor:
     if not metadata.step.requests:
         return torch.zeros_like(hidden)
     layer, rope = context.no_compile_layers[layer_name]
-    return layer.attn(hidden, metadata.cache, metadata.step, rope)
+    # Through the block's own body, so the input norm and the quantized pair it
+    # may hand the first GEMM stay on one side of this boundary.
+    return Block.attention_forward(layer, hidden, metadata.cache, metadata.step, rope)
 
 
 @torch_compile_guard(mutates_args=[], gen_fake=_fake_layer_output)
@@ -62,9 +62,7 @@ def v41_engram(residual: torch.Tensor, layer_name: str) -> torch.Tensor:
         return residual.clone()
     layer, _ = context.no_compile_layers[layer_name]
     embeddings = metadata.engram_embeddings.get(layer.engram.layer_id)
-    if embeddings is None:
-        raise ValueError("Engram rows must be prepared before model execution")
-    return layer.engram(residual, embeddings, None)
+    return Block.engram_forward(layer, residual, embeddings, metadata.image_mask)
 
 
 class RuntimeBlock(Block):
@@ -116,6 +114,7 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
             input_ids.unsqueeze(0),
             None,
             None,
+            image_mask=get_forward_context().attn_metadata.image_mask,
             inputs_embeds=(
                 None if inputs_embeds is None else inputs_embeds.unsqueeze(0)
             ),

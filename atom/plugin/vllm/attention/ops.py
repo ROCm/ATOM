@@ -1,6 +1,7 @@
 from typing import Optional
 
 import torch
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 
 from atom.utils import mark_spliting_op
 
@@ -62,29 +63,37 @@ def atom_vllm_mla_attention_fake(
     kv_c_normed: torch.Tensor,
     k_pe: torch.Tensor,
     layer_name: str,
-    output_hidden_size: int,
-) -> torch.Tensor:
-    return q.new_empty((q.shape[0], output_hidden_size))
+    output: torch.Tensor,
+) -> None:
+    return None
 
 
-@mark_spliting_op(
-    is_custom=True,
-    gen_fake=atom_vllm_mla_attention_fake,
-    mutates_args=[],
-)
-def atom_vllm_mla_attention(
+@eager_break_during_capture
+def _mla_attention_run(
     q: torch.Tensor,
     kv_c_normed: torch.Tensor,
     k_pe: torch.Tensor,
     layer_name: str,
-    output_hidden_size: int,
-) -> torch.Tensor:
+    output: torch.Tensor,
+) -> None:
+    """Run MLA outside the piecewise cudagraph, writing into ``output``.
+
+    Everything this layer reads that varies per batch -- ``attn_metadata`` and
+    its block tables, sequence lengths and DCP work descriptors -- is fetched
+    here rather than passed in, because the breakable cudagraph records this
+    callable once and replays it. An argument would be pinned to the object
+    that existed at capture time; a lookup re-reads the live batch. That is
+    also why the tensors stay as arguments: those are cudagraph-pool buffers
+    whose addresses the surrounding segments depend on.
+
+    Without the break the whole layer is captured, and every replay indexes
+    the KV cache with the capture batch's tables -- an illegal access as soon
+    as a later batch is shaped differently.
+
+    Full decode graphs are untouched: the decorator hands the call straight
+    through when the runtime mode is ``FULL``.
+    """
     layer, attn_metadata, kv_cache = _get_layer_context(layer_name)
-    output = torch.empty(
-        (q.shape[0], output_hidden_size),
-        dtype=q.dtype,
-        device=q.device,
-    )
     layer.forward_impl(
         q,
         kv_c_normed,
@@ -93,4 +102,24 @@ def atom_vllm_mla_attention(
         attn_metadata=attn_metadata,
         output=output,
     )
-    return output
+
+
+@mark_spliting_op(
+    is_custom=True,
+    gen_fake=atom_vllm_mla_attention_fake,
+    mutates_args=["output"],
+)
+def atom_vllm_mla_attention(
+    q: torch.Tensor,
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
+    layer_name: str,
+    output: torch.Tensor,
+) -> None:
+    """Opaque splitting-op boundary for the MLA attention layer.
+
+    Takes ``output`` from the caller instead of allocating it: a tensor
+    allocated in here would land at a fresh address on every replay, while the
+    captured segments downstream keep reading the address they saw at capture.
+    """
+    _mla_attention_run(q, kv_c_normed, k_pe, layer_name, output)
