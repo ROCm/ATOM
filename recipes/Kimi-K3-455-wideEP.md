@@ -622,10 +622,179 @@ max_tokens=3500  -> content='...#### 72'  finish_reason=stop
 
 ---
 
+## Throughput
+
+Fixed-length `benchmark_serving`, run from inside the container on the
+coordinator. Config exactly as above — `--max-num-seqs 8`, prefix caching off,
+`--max-num-batched-tokens 2048`, `max_model_len` unset.
+
+```bash
+python3 -m atom.benchmarks.benchmark_serving \
+  --backend openai --host <node0-ip> --port 8000 \
+  --model /models/Kimi-K3 --tokenizer /models/Kimi-K3 --trust-remote-code \
+  --served-model-name moonshotai/Kimi-K3 \
+  --dataset-name random --random-input-len 1024 --random-output-len 1024 \
+  --random-range-ratio 1.0 --max-concurrency 64 --num-prompts 256 \
+  --ignore-eos --percentile-metrics ttft,tpot,itl,e2el
+```
+
+> ⚠️ **`--served-model-name` is not optional.** Without it the client puts
+> `--model`'s value (a filesystem path) in the request body, the server 404s
+> every request, and the benchmark still "completes" — in under a second, with
+> every metric printed as `0.00`. The only hint is a `UserWarning: All requests
+> failed` buried above the table. `--random-range-ratio 1.0` pins the input
+> length; `--ignore-eos` makes every request generate the full output length.
+
+| | 1k/1k, conc 64 | 14k/500, conc 64 |
+|---|---|---|
+| Successful requests | 256 / 256 | 128 / 128 |
+| Duration (s) | 481.48 | 233.10 |
+| Output tok/s | **544.45** | **274.56** |
+| Total tok/s | 1088.90 | 8146.84 |
+| Concurrency (actual) | 56.01 | 61.30 |
+| TTFT median / p99 (ms) | 2080 / 33217 | 21986 / 46390 |
+| TPOT mean (ms) | 96.94 | 178.22 |
+| ITL mean (ms) | 96.84 | 177.87 |
+| E2EL median (ms) | 101642 | 110666 |
+
+Reading these:
+
+- **TPOT 96.94 ms is ~10.3 tok/s per stream, which is what a single stream gets
+  on its own** (a warm-up request of 1024 tokens took 92.8 s). Concurrency 64
+  costs almost nothing per stream, i.e. decode is nowhere near saturated.
+  `--max-num-seqs 8` caps each DP rank at 8 sequences — 128 slots across dp16,
+  and a decode batch of at most 8. There is headroom here that this recipe does
+  not reach.
+- **The 14k total of 8146 tok/s is not 7.5x better decode**; it counts input
+  tokens, and that run is 1.84M input against 64k output. Compare
+  `Output tok/s`: 544 → 275, i.e. decode roughly halves at long context.
+- **14k TTFT is ~10x the 1k figure** because `--max-num-batched-tokens 2048`
+  splits a 14336-token prompt into 7 chunked-prefill steps. That is the cost of
+  the conservative setting, not a fault.
+
+⚠️ ATOM's own `tput_per_gpu` divides by `tp × pp × pcp` — **DP is not counted**.
+With TP=1 the denominator is 1 and any per-GPU figure is 16x too high here.
+The table above is aggregate and unaffected.
+
+---
+
+## Profiling
+
+The server writes torch profiler traces only if it was started with a profiler
+directory; the client flag alone does nothing.
+
+**Server** — either form, set before launch:
+
+```bash
+ATOM_TORCH_PROFILER_DIR=/data/profile_run     # envs.py
+# or: --torch-profiler-dir /data/profile_run
+```
+
+`config.py` takes the env var as the default for `torch_profiler_dir`, and
+`model_runner.py` appends the rank name, so each rank gets its own
+subdirectory under that path.
+
+**Client** — add `--profile` to `benchmark_serving`. It POSTs
+`/start_profile` before the run and `/stop_profile` after
+(routes in `atom/entrypoints/openai/api_server.py`):
+
+```bash
+python3 -m atom.benchmarks.benchmark_serving \
+  --backend openai --host <node0-ip> --port 8000 \
+  --model /models/Kimi-K3 --tokenizer /models/Kimi-K3 --trust-remote-code \
+  --served-model-name moonshotai/Kimi-K3 \
+  --dataset-name random --random-input-len 14336 --random-output-len 32 \
+  --random-range-ratio 1.0 --max-concurrency 64 --num-prompts 64 \
+  --ignore-eos --profile
+```
+
+> ⚠️ **`--profile` against a server started without a profiler directory is a
+> silent no-op** — the benchmark runs and reports normally, and no trace is
+> written. Point the directory at a bind-mounted path (`/data` here) so the
+> traces land on the host; keep `--num-prompts` to a single concurrency wave,
+> since traces are large.
+
+---
+
+## Agentic (AgentX)
+
+Trace replay of real Claude Code sessions, not synthetic fixed lengths:
+ISL median ~104k tokens, OSL median ~339, theoretical prefix cache hit 97.34%.
+
+⚠️ **This needs `--enable_prefix_caching` on the server** — the opposite of the
+launch above. Without it every turn re-prefills the whole history and the
+numbers describe repeated prefill, not the engine.
+
+```
+aiperf          0.12.0  (SemiAnalysis fork, NOT PyPI upstream)
+submodule       utils/aiperf @ 754356e9a39acc6cc6afb242d123bb57c3fb6f75
+                git describe: agentx-v1.0.2-3-g754356e9
+Python          3.11  (aiperf dropped 3.10)
+dataset         semianalysisai/cc-traces-weka-062126 — 393 traces,
+                traces.jsonl 1.85 GB, public (no HF_TOKEN needed)
+```
+
+```bash
+git clone --recurse-submodules https://github.com/SemiAnalysisAI/InferenceX.git
+git -C InferenceX/utils/aiperf checkout 754356e9a39acc6cc6afb242d123bb57c3fb6f75
+unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
+uv venv --python 3.11 "$AIPERF_RUNTIME_DIR/venv"
+uv pip install --python "$AIPERF_RUNTIME_DIR/venv/bin/python" \
+    -r InferenceX/utils/agentic-benchmark/requirements.txt -e InferenceX/utils/aiperf
+hf download --repo-type dataset semianalysisai/cc-traces-weka-062126
+```
+
+```bash
+export AIPERF_DATASET_CONFIGURATION_TIMEOUT=1800
+export AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT=1800
+export AIPERF_UI_REALTIME_METRICS_ENABLED=true
+export AIPERF_HTTP_TCP_USER_TIMEOUT=900000
+
+aiperf profile \
+  --scenario inferencex-agentx-mvp \
+  --url http://<node0-ip>:8000 \
+  --endpoint /v1/chat/completions --endpoint-type chat --streaming \
+  --model moonshotai/Kimi-K3 \
+  --tokenizer moonshotai/Kimi-K3 --tokenizer-trust-remote-code \
+  --apply-chat-template \
+  --concurrency 16 --benchmark-duration 1800 --stats-interval 30 \
+  --random-seed 42 --failed-request-threshold 0.10 \
+  --trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75 \
+  --warmup-requests-per-lane 10 --warmup-grace-period 1800 \
+  --trace-idle-gap-cap-seconds 300 \
+  --use-server-token-count --no-gpu-telemetry \
+  --num-dataset-entries 393 --slice-duration 1.0 \
+  --public-dataset semianalysis_cc_traces_weka_062126 \
+  --output-artifact-dir <artifacts>
+```
+
+Two things that bite before the first request:
+
+- **`--tokenizer` must be the HF repo id, not the local model path.** The
+  wire name passed to `--model` is not a repo id, and the model directory may
+  not be readable by the account running aiperf. `moonshotai/Kimi-K3` is public
+  and only the tokenizer files are fetched.
+- **`tokenizer.chat_template` is `None` for K3, and that is fine.**
+  `tokenization_kimi.py` implements `apply_chat_template()` as a method rather
+  than shipping a Jinja template string, so `--apply-chat-template` works even
+  though the attribute reads empty. Verify before a 30-minute run:
+  ```bash
+  python -c "from transformers import AutoTokenizer as A; \
+    t=A.from_pretrained('moonshotai/Kimi-K3',trust_remote_code=True); \
+    print(t.apply_chat_template([{'role':'user','content':'hi'}],tokenize=False))"
+  ```
+
+The scenario enforces `--benchmark-duration >= 900`; shorter needs
+`--unsafe-override` and marks the result `submission_valid=false`.
+Effective concurrency is far below `--concurrency` because lanes spend much of
+the trace idle — read the Effective figures, not the nominal ones.
+
+---
+
 ## Not yet measured
 
-- **Throughput, TTFT and TPOT have not been benchmarked.** The configuration
-  above is the one that first served correct output at full size; it is not
-  tuned, and `--max-num-seqs 8` in particular is conservative.
-- Agentic (AgentX) has not been brought up on this configuration.
-- Prefix caching is disabled here and untested on this platform.
+- Agentic (AgentX) numbers on this configuration — the setup above is
+  validated, the run is not yet reported here.
+- Prefix caching is disabled in the launch above and untested on this platform.
+- `--max-num-seqs` has not been swept; see the note under
+  [Throughput](#throughput) for why it is the first thing to try.
