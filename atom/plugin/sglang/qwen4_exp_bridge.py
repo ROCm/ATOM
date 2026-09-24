@@ -7,15 +7,17 @@ Compute stays in Native ATOM (#2048): QSA, indexer, GDN, hyper-connection, PLE.
 This module only translates the current step's page tables into the structs
 those kernels already read.
 
-Decode CUDA-graph contract matches Native ATOM FULL graph:
+Decode / TARGET_VERIFY graph contract:
 
-- Capture bakes *addresses* of persistent QSA buffers into ``graph.replay()``.
-- Replay (and capture) fill those buffers *outside* the graph, the way Native
-  ``prepare_decode`` does: host ``build_batch_ids`` + H2D + Triton
-  ``qsa_compressed_slots``. No GPU ``arange`` / ``searchsorted`` / ``where``
-  rebuild, and ``model.forward`` must not re-run that rebuild while capturing
-  (otherwise the eager aten ops get recorded into the graph).
-- Prefill stays eager. Do not enable SGLang --ple-offload-embedding.
+- Allocate persistent buffers for the serving batch ceiling, MTP token width
+  and full context length before capture. Never replace captured storage.
+- Fill QSA metadata outside the graph. Packed token IDs use request-major
+  order; padded tokens and unused pages carry the Native ``-1`` sentinel.
+- Attach the active backend's request pool to batches and graph replay views.
+- Draft runs eagerly and must not overwrite the target's graph buffers.
+- Lift speculative QSA context lengths to cover query positions beyond
+  SGLang's accepted prefix, without changing scheduler-owned seq_lens.
+- PLE aliases Hybrid GDN's static state indices. Prefill stays eager.
 """
 
 from __future__ import annotations
@@ -24,20 +26,18 @@ import logging
 from types import SimpleNamespace
 from typing import Any
 
-import numpy as np
 import torch
 
 from atom.model_ops.attentions.qwen4_exp_attn import (
     Qwen4ExpPLEMetadata,
     Qwen4ExpQSAMetadata,
 )
-from atom.model_ops.attentions.token_layout.batch_ids import build_batch_ids
 from atom.plugin.sglang.attention_backend.backend_resolver import (
     real_batch_size,
     resolve_attn_backend,
     resolve_mamba_req_pool,
 )
-from atom.utils import CpuGpuBuffer
+from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger(__name__)
 
@@ -53,13 +53,6 @@ def _server_args() -> Any | None:
         return get_global_server_args()
     except Exception:  # noqa: BLE001
         return None
-
-
-def _cpu_gpu_i32(size: int, device: torch.device) -> CpuGpuBuffer:
-    try:
-        return CpuGpuBuffer(size, dtype=torch.int32, device=device, pin_memory=True)
-    except Exception:  # noqa: BLE001
-        return CpuGpuBuffer(size, dtype=torch.int32, device=device, pin_memory=False)
 
 
 def _is_capturing() -> bool:
@@ -83,7 +76,7 @@ class _Qwen4ExpDecodeGraphBuffers:
 
     PLE slot indices are *not* copied here. Capture binds
     ``state_indices_*`` to Hybrid GDN's static ``mamba_cache_indices`` the way
-    Native ``_ple_state_slots`` aliases the GDN CpuGpuBuffer. Replay's linear
+    Native ``_ple_state_slots`` aliases the GDN slot buffer. Replay's linear
     ``out_graph`` overwrites that tensor in place.
     """
 
@@ -99,14 +92,16 @@ class _Qwen4ExpDecodeGraphBuffers:
         self.logical_positions: torch.Tensor | None = None
         self.seq_lens: torch.Tensor | None = None
         self.has_initial_state: torch.Tensor | None = None
-        self.max_seq_len = 1
         self.active = False
         self.last_qsa: Qwen4ExpQSAMetadata | None = None
         self.last_ple: Qwen4ExpPLEMetadata | None = None
-        self._token_to_req_buf: CpuGpuBuffer | None = None
-        self._req_pool_indices: torch.Tensor | None = None
+        self.num_accepted_tokens: torch.Tensor | None = None
 
-    def ensure(
+    def reset(self) -> None:
+        """Drop persistent buffers. Tests only; never call after CUDA-graph capture."""
+        self.__init__()
+
+    def allocate_once(
         self,
         *,
         max_bs: int,
@@ -114,13 +109,18 @@ class _Qwen4ExpDecodeGraphBuffers:
         max_pages: int,
         device: torch.device,
     ) -> None:
+        """Allocate once at serving capacity; reject later growth/device changes.
+
+        ``max_tokens`` includes the launch-time MTP width, even if the first
+        capture is ordinary decode. ``max_pages`` covers the full context,
+        since selected indexer tokens may occur anywhere in that context.
+        """
         max_bs = max(int(max_bs), 1)
         max_tokens = max(int(max_tokens), max_bs)
         max_pages = max(int(max_pages), 1)
         need = (
             self.block_tables is None
-            or self._token_to_req_buf is None
-            or self._req_pool_indices is None
+            or self.token_to_req is None
             or self.has_initial_state is None
             or self.device != device
             or self.max_bs < max_bs
@@ -129,22 +129,19 @@ class _Qwen4ExpDecodeGraphBuffers:
         )
         if not need:
             return
-        # CUDA graphs bake buffer *addresses*. Growing after a capture leaves
-        # older graphs pointing at freed storage — always allocate once to the
-        # high-water mark and never replace live buffers mid-serve if possible.
-        grew_after_init = self.block_tables is not None
-        self.max_bs = max(self.max_bs, max_bs)
-        self.max_tokens = max(self.max_tokens, max_tokens)
-        self.max_pages = max(self.max_pages, max_pages)
-        self.device = device
-        if grew_after_init:
-            logger.warning(
-                "Flash decode graph QSA buffers grew after init "
-                "(bs=%s tokens=%s pages=%s); existing CUDA graphs may be stale",
-                self.max_bs,
-                self.max_tokens,
-                self.max_pages,
+        if self.block_tables is not None:
+            raise RuntimeError(
+                "Flash QSA graph capacity/device mismatch: "
+                f"allocated bs={self.max_bs} tokens={self.max_tokens} "
+                f"pages={self.max_pages} device={self.device}; "
+                f"requested bs={max_bs} tokens={max_tokens} "
+                f"pages={max_pages} device={device}. "
+                "Allocate the serving capacity before CUDA-graph capture."
             )
+        self.max_bs = max_bs
+        self.max_tokens = max_tokens
+        self.max_pages = max_pages
+        self.device = device
         self.block_tables = torch.zeros(
             (self.max_bs, self.max_pages), dtype=torch.int32, device=device
         )
@@ -154,10 +151,9 @@ class _Qwen4ExpDecodeGraphBuffers:
         self.compressed_slot_mapping = torch.full(
             (self.max_tokens,), _NO_WRITE, dtype=torch.int64, device=device
         )
-        self._token_to_req_buf = _cpu_gpu_i32(self.max_tokens, device)
-        self.token_to_req = self._token_to_req_buf.gpu
-        self._req_pool_indices = torch.zeros(
-            (self.max_bs,), dtype=torch.int32, device=device
+        # Graph-baked GPU address. Packed ids are written in place; pad stays -1.
+        self.token_to_req = torch.full(
+            (self.max_tokens,), _NO_WRITE, dtype=torch.int32, device=device
         )
         self.logical_positions = torch.full(
             (self.max_tokens,), _NO_WRITE, dtype=torch.int64, device=device
@@ -165,6 +161,9 @@ class _Qwen4ExpDecodeGraphBuffers:
         self.seq_lens = torch.zeros((self.max_bs,), dtype=torch.int32, device=device)
         self.has_initial_state = torch.ones(
             (self.max_bs,), dtype=torch.bool, device=device
+        )
+        self.num_accepted_tokens = torch.ones(
+            (self.max_bs,), dtype=torch.int32, device=device
         )
         self.active = True
 
@@ -182,7 +181,6 @@ class _Qwen4ExpDecodeGraphBuffers:
         assert self.token_to_req is not None
         assert self.logical_positions is not None
         assert self.seq_lens is not None
-        self.max_seq_len = max(int(max_seq_len), 1)
         self.last_qsa = Qwen4ExpQSAMetadata(
             block_tables=self.block_tables[:bs, : self.max_pages],
             slot_mapping=self.slot_mapping[:num_tokens],
@@ -190,7 +188,7 @@ class _Qwen4ExpDecodeGraphBuffers:
             token_to_req=self.token_to_req[:num_tokens],
             logical_positions=self.logical_positions[:num_tokens],
             seq_lens=self.seq_lens[:bs],
-            max_seq_len=self.max_seq_len,
+            max_seq_len=max(int(max_seq_len), 1),
         )
         return self.last_qsa
 
@@ -212,17 +210,7 @@ class _Qwen4ExpDecodeGraphBuffers:
         """
         bs = int(batch_size)
         if self.has_initial_state is None:
-            if _is_capturing():
-                raise RuntimeError(
-                    "Flash PLE graph buffers must be preallocated before capture"
-                )
-            self.ensure(
-                max_bs=bs,
-                max_tokens=max(bs, self.max_tokens),
-                max_pages=max(self.max_pages, 1),
-                device=query_start_loc.device,
-            )
-        assert self.has_initial_state is not None
+            raise RuntimeError("Flash PLE graph buffers must be allocated before bind")
         self.last_ple = Qwen4ExpPLEMetadata(
             query_start_loc=query_start_loc[: bs + 1],
             ngram_state=ngram_state,
@@ -236,14 +224,104 @@ class _Qwen4ExpDecodeGraphBuffers:
 
 
 _DECODE_GRAPH = _Qwen4ExpDecodeGraphBuffers()
+# Draft stays eager (Flash mRoPE) but must not write the buffers baked into
+# the target verify graph. A second set still keeps page tables and seq_lens
+# on device, so a draft step does not allocate or sync seq_lens back to host.
+_DRAFT_QSA = _Qwen4ExpDecodeGraphBuffers()
 
 
-def _pin_decode_graph(forward_batch: Any) -> bool:
-    """Decode step that must write the persistent CUDA-graph QSA buffers."""
+def _is_draft_forward() -> bool:
+    """True while the NextN draft model owns this forward (``context.is_draft``)."""
+    return bool(getattr(get_forward_context().context, "is_draft", False))
+
+
+def _is_target_verify(forward_batch: Any) -> bool:
     mode = getattr(forward_batch, "forward_mode", None)
-    if mode is None or not mode.is_decode_or_idle():
+    return bool(
+        mode is not None
+        and callable(getattr(mode, "is_target_verify", None))
+        and mode.is_target_verify()
+    )
+
+
+def _is_verify_or_draft_extend(forward_batch: Any) -> bool:
+    """TARGET_VERIFY or DRAFT_EXTEND_V2: request-major equal-width
+    ``tokens_per_req`` tokens.
+
+    Check these modes explicitly; they are not ragged prefill.
+    ``token_to_req`` / cu_seqlens must use ``draft_token_num``, not leftover
+    ``extend_start_loc``. Decode (1 token/req) is neither.
+    """
+    if _is_target_verify(forward_batch):
+        return True
+    mode = getattr(forward_batch, "forward_mode", None)
+    return bool(
+        mode is not None
+        and callable(getattr(mode, "is_draft_extend_v2", None))
+        and mode.is_draft_extend_v2()
+    )
+
+
+def _use_decode_graph_buffers(forward_batch: Any) -> bool:
+    """Decode / TARGET_VERIFY step that must write persistent CUDA-graph QSA buffers.
+
+    Draft decode is eager (Flash mRoPE) and shares this process with the
+    target. Writing the draft into ``_DECODE_GRAPH`` overwrites the addresses
+    TARGET_VERIFY already captured.
+    """
+    mode = getattr(forward_batch, "forward_mode", None)
+    if mode is None or _is_draft_forward():
+        return False
+    if not (mode.is_decode_or_idle() or mode.is_target_verify()):
+        return False
+    if _DECODE_GRAPH.active and forward_batch.batch_size > _DECODE_GRAPH.max_bs:
+        # SGLang falls back to eager above the graph ceiling. Build separate
+        # metadata instead of writing beyond the captured buffers.
         return False
     return _DECODE_GRAPH.active or _is_capturing()
+
+
+def _get_qsa_tokens_per_req(forward_batch: Any) -> int:
+    """How many tokens this step actually fills per live request.
+
+    Decode / idle is always 1. TARGET_VERIFY / DRAFT_EXTEND is
+    ``draft_token_num`` (3 when ``speculative-num-steps=2``). Buffer
+    *allocation* uses ``_get_qsa_graph_max_tokens_per_req`` (CLI width).
+    """
+    mode = getattr(forward_batch, "forward_mode", None)
+    if mode is not None and mode.is_decode_or_idle():
+        return 1
+    spec = getattr(forward_batch, "spec_info", None)
+    for attr in ("draft_token_num", "num_tokens_per_req"):
+        val = getattr(spec, attr, None)
+        if val:
+            return max(int(val), 1)
+    return 1
+
+
+def _get_qsa_graph_max_tokens_per_req() -> int:
+    """Launch-time tokens/req for persistent QSA CUDA-graph buffers.
+
+    After SGLang speculative init, TARGET_VERIFY width is
+    ``speculative_num_draft_tokens`` (Flash chain: ``steps+1``). Fill still
+    uses ``_get_qsa_tokens_per_req``.
+    """
+    args = _server_args()
+    return max(int(getattr(args, "speculative_num_draft_tokens", 0) or 0), 1)
+
+
+def bind_qsa_replay_batch(forward_batch: Any, backend: Any) -> Any:
+    """Attach pool pointers that SGLang's CUDA-graph replay view drops.
+
+    ``build_replay_fb_view`` is a ``SimpleNamespace`` with seq_lens / positions
+    / req_pool_indices. Without ``req_to_token_pool``,
+    QSA metadata cannot gather the current request page tables.
+    """
+    if getattr(forward_batch, "req_to_token_pool", None) is None:
+        pool = getattr(backend, "req_to_token_pool", None)
+        if pool is not None:
+            forward_batch.req_to_token_pool = pool
+    return forward_batch
 
 
 def _is_qwen4_exp_config(atom_config: Any) -> bool:
@@ -256,7 +334,7 @@ def _is_qwen4_exp_config(atom_config: Any) -> bool:
     )
     if not arch:
         return False
-    return any("Qwen4Exp" in str(a) or "FlashNext" in str(a) for a in arch)
+    return any("Qwen4Exp" in str(a) for a in arch)
 
 
 def _linear_static_ple_slots(
@@ -325,23 +403,27 @@ def _compress_ratio(atom_config: Any) -> int:
 
 
 def _req_to_token_pool(forward_batch: Any) -> Any:
-    backend = resolve_attn_backend(forward_batch)
-    linear = getattr(backend, "full_attn_backend", None) or getattr(
-        backend, "attn_backend", None
-    )
-    return (
-        getattr(forward_batch, "req_to_token_pool", None)
-        or getattr(backend, "req_to_token_pool", None)
-        or getattr(linear, "req_to_token_pool", None)
-        or resolve_mamba_req_pool(forward_batch, backend)
-    )
+    """SGLang page table on the batch.
+
+    Wrappers attach the active backend pool before model forward. Graph
+    replay views use ``bind_qsa_replay_batch`` to attach it before metadata fill.
+    """
+    pool = forward_batch.req_to_token_pool
+    if pool is None:
+        raise RuntimeError(
+            "Flash QSA requires req_to_token_pool on the batch; "
+            "replay views must call bind_qsa_replay_batch first"
+        )
+    return pool
 
 
 def _seq_lens(forward_batch: Any, device: torch.device) -> torch.Tensor:
     seq = getattr(forward_batch, "seq_lens", None)
     bs = int(getattr(forward_batch, "batch_size", 0) or 0)
     if torch.is_tensor(seq):
-        seq = seq.to(device=device, dtype=torch.int32)[:bs]
+        # QSA may lift these lengths for speculative queries; never mutate
+        # the scheduler's prefix lengths.
+        seq = seq.to(device=device, dtype=torch.int32)[:bs].clone()
     else:
         seq = torch.ones((bs,), dtype=torch.int32, device=device)
     live_bs = real_batch_size(forward_batch)
@@ -349,9 +431,41 @@ def _seq_lens(forward_batch: Any, device: torch.device) -> torch.Tensor:
         # CUDA-graph pad rows keep seq_len_fill_value (usually 1) and a
         # finished request's page table. Zero them so QSA does not score
         # or write freed pages.
-        seq = seq.clone()
         seq[live_bs:] = 0
     return seq
+
+
+def _lift_qsa_seq_lens(
+    seq_lens: torch.Tensor,
+    logical_positions: torch.Tensor,
+    *,
+    live_bs: int,
+    tokens_per_req: int,
+) -> None:
+    """Raise QSA context lengths to include each request's speculative queries.
+
+    Native QSA requires ``logical_pos < seq_lens[req]``, while SGLang verify
+    and draft positions can extend beyond its accepted prefix lengths.
+    Operate on a QSA-owned copy. Only complete live rows contribute; padded
+    rows stay zero and ordinary decode already satisfies the bound.
+    """
+    tokens_per_req = max(int(tokens_per_req), 1)
+    grouped = min(int(logical_positions.numel()), int(live_bs) * tokens_per_req)
+    grouped //= tokens_per_req
+    if grouped <= 0:
+        return
+    max_pos = (
+        logical_positions[: grouped * tokens_per_req]
+        .view(grouped, tokens_per_req)
+        .clamp(min=0)
+        .max(dim=1)
+        .values
+    )
+    torch.maximum(
+        seq_lens[:grouped],
+        (max_pos + 1).to(dtype=seq_lens.dtype),
+        out=seq_lens[:grouped],
+    )
 
 
 def _query_start_loc(
@@ -360,22 +474,34 @@ def _query_start_loc(
     mode = forward_batch.forward_mode
     bs = int(forward_batch.batch_size)
     live_bs = real_batch_size(forward_batch)
-    if mode.is_decode_or_idle():
-        loc = torch.arange(0, bs + 1, dtype=torch.int32, device=device)
-        loc[live_bs + 1 :] = live_bs
+    # Packed decode / TARGET_VERIFY / DRAFT_EXTEND must not fall through
+    # to leftover prefill extend_start_loc.
+    # Decode width is 1 via ``_get_qsa_tokens_per_req``.
+    if mode.is_decode_or_idle() or _is_verify_or_draft_extend(forward_batch):
+        tokens_per_req = _get_qsa_tokens_per_req(forward_batch)
+        loc = torch.arange(
+            0,
+            tokens_per_req * bs + 1,
+            tokens_per_req,
+            dtype=torch.int32,
+            device=device,
+        )
+        loc[live_bs + 1 :] = tokens_per_req * live_bs
         return loc
     if mode.is_extend():
-        loc = torch.empty((bs + 1,), dtype=torch.int32, device=device)
-        if live_bs:
-            loc[:live_bs] = forward_batch.extend_start_loc[:live_bs].to(
+        start = getattr(forward_batch, "extend_start_loc", None)
+        lens = getattr(forward_batch, "extend_seq_lens", None)
+        if torch.is_tensor(start) and torch.is_tensor(lens) and live_bs:
+            loc = torch.empty((bs + 1,), dtype=torch.int32, device=device)
+            loc[:live_bs] = start[:live_bs].to(dtype=torch.int32)
+            loc[live_bs:] = (start[live_bs - 1] + lens[live_bs - 1]).to(
                 dtype=torch.int32
             )
-            loc[live_bs:] = (
-                forward_batch.extend_start_loc[live_bs - 1]
-                + forward_batch.extend_seq_lens[live_bs - 1]
-            ).to(dtype=torch.int32)
-        else:
-            loc.fill_(0)
+            return loc
+        loc = torch.empty((bs + 1,), dtype=torch.int32, device=device)
+        loc.fill_(0)
+        if live_bs:
+            loc[live_bs:] = num_tokens
         return loc
     return torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
 
@@ -401,26 +527,83 @@ def _sequence_index_positions(positions: torch.Tensor, num_tokens: int) -> torch
     return pos.to(torch.int64)
 
 
-def _token_to_req_and_logical(
+def _token_to_req_from_packed(
     *,
-    query_start_loc: torch.Tensor,
+    live_bs: int,
+    tokens_per_req: int,
+    num_tokens: int,
+    device: torch.device,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Packed (equal-width) token→req. Ragged uses
+    ``_token_to_req_from_query_start_loc``. Pad is ``-1``.
+
+    Searchsorted-from-cu_seqlens defaults unmapped rows to 0, so a mixed
+    TARGET_VERIFY / decode batch would score every leftover token against
+    request 0's page table. Identical-length concurrent requests hide that
+    (same context length); mixed lengths do not.
+
+    Graph replay passes the baked ``token_to_req`` as ``out`` so the CUDA-graph
+    address stays fixed. Eager allocates a fresh tensor.
+
+    Decode (``tokens_per_req == 1``) is ``arange(n)``. Verify / draft-extend
+    is ``arange(n) // tokens_per_req``. Pad is filled once; live rows are
+    not written as ``-1`` then overwritten.
+    """
+    dst = (
+        out[:num_tokens]
+        if out is not None
+        else torch.empty((num_tokens,), dtype=torch.int32, device=device)
+    )
+    tokens_per_req = max(int(tokens_per_req), 1)
+    n = min(int(num_tokens), max(int(live_bs), 0) * tokens_per_req)
+    if n > 0:
+        torch.arange(n, out=dst[:n], dtype=torch.int32, device=dst.device)
+        if tokens_per_req > 1:
+            dst[:n].floor_divide_(tokens_per_req)
+    if n < dst.numel():
+        dst[n:].fill_(_NO_WRITE)
+    return dst
+
+
+def _qsa_logical_positions(
     positions: torch.Tensor,
     num_tokens: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Prefill fallback: token→req from cu_seqlens (not used on decode graph)."""
-    device = positions.device
-    token_to_req = torch.zeros((num_tokens,), dtype=torch.int32, device=device)
-    logical = torch.full((num_tokens,), _NO_WRITE, dtype=torch.int64, device=device)
-    if query_start_loc.numel() < 2 or num_tokens <= 0:
-        return token_to_req, logical
-    token_ids = torch.arange(num_tokens, device=device)
-    ends = query_start_loc[1:]
-    req = torch.searchsorted(ends, token_ids, right=True)
-    valid = token_ids < query_start_loc[-1]
-    token_to_req = torch.where(valid, req.to(torch.int32), token_to_req)
+    valid: torch.Tensor,
+) -> torch.Tensor:
+    """Sequence index per token. Invalid rows stay ``_NO_WRITE``, not 0."""
+    logical = torch.full(
+        (num_tokens,), _NO_WRITE, dtype=torch.int64, device=positions.device
+    )
     pos = _sequence_index_positions(positions, num_tokens)
-    logical = torch.where(valid, pos, logical)
-    return token_to_req, logical
+    if pos.numel() == 0:
+        return logical
+    n = pos.numel()
+    # ``valid`` is a prefix (packed live rows, or tokens before cu_seqlens[-1]).
+    # Write the prefix in place; holes stay ``_NO_WRITE`` without a second tensor.
+    logical[:n].copy_(pos)
+    logical[:n].masked_fill_(~valid[:n], _NO_WRITE)
+    return logical
+
+
+def _token_to_req_from_query_start_loc(
+    query_start_loc: torch.Tensor | None,
+    num_tokens: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Ragged prefill token→req. Unmapped rows are ``_NO_WRITE``, not 0."""
+    if query_start_loc is None or query_start_loc.numel() < 2 or num_tokens <= 0:
+        token_to_req = torch.full(
+            (num_tokens,), _NO_WRITE, dtype=torch.int32, device=device
+        )
+        valid = torch.zeros((num_tokens,), dtype=torch.bool, device=device)
+        return token_to_req, valid
+    token_ids = torch.arange(num_tokens, device=device)
+    valid = token_ids < query_start_loc[-1]
+    token_to_req = torch.searchsorted(query_start_loc[1:], token_ids, right=True).to(
+        torch.int32
+    )
+    return token_to_req.masked_fill(~valid, _NO_WRITE), valid
 
 
 def _compressed_slots_native(
@@ -457,20 +640,34 @@ def _fill_block_tables_into(
     table_tokens: int,
     block_size: int,
     live_bs: int,
+    seq_lens: torch.Tensor | None = None,
 ) -> None:
-    """Gather live rows into ``out[:bs]``; zero pad rows. No max_bs fill."""
+    """Gather live rows into ``out[:bs]``; unused pages and pad rows are ``-1``.
+
+    SGLang's paged allocator reserves physical page 0 for dummy writes.
+    Translate it to Native QSA's no-write sentinel in every column, then
+    mask the unallocated tail using the request's context length.
+    """
     req_to_token = pool.req_to_token
     bs = int(req_pool_indices.shape[0])
     live = max(min(int(live_bs), bs), 0)
     max_blocks = max(1, (int(table_tokens) + block_size - 1) // block_size)
     pages = min(max_blocks, int(out.shape[1]))
-    out[:bs].zero_()
+    out[:bs].fill_(_NO_WRITE)
     if live == 0 or pages == 0:
         return
     gathered = req_to_token[req_pool_indices[:live], : pages * block_size : block_size]
     gathered = gathered.to(dtype=out.dtype) // block_size
+    gathered.masked_fill_(gathered <= 0, _NO_WRITE)
     copy_pages = min(int(gathered.shape[1]), pages)
     out[:live, :copy_pages].copy_(gathered[:, :copy_pages])
+    if seq_lens is not None and live > 0 and copy_pages > 0:
+        n_pages = (
+            (seq_lens[:live].to(dtype=torch.int64) + (block_size - 1)) // block_size
+        ).clamp(min=0, max=copy_pages)
+        page_ids = torch.arange(copy_pages, device=out.device, dtype=torch.int64)
+        invalid = page_ids.unsqueeze(0) >= n_pages.unsqueeze(1)
+        out[:live, :copy_pages].masked_fill_(invalid, _NO_WRITE)
 
 
 def _clamp_table_tokens(pool: Any, table_tokens: int) -> int:
@@ -488,10 +685,13 @@ def _eager_block_tables(
     block_size: int,
     live_bs: int,
     device: torch.device,
+    seq_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     pages = max(1, (int(table_tokens) + block_size - 1) // block_size)
-    tables = torch.zeros(
-        (int(req_pool_indices.shape[0]), pages), dtype=torch.int32, device=device
+    tables = torch.empty(
+        (int(req_pool_indices.shape[0]), pages),
+        dtype=torch.int32,
+        device=device,
     )
     _fill_block_tables_into(
         tables,
@@ -500,6 +700,7 @@ def _eager_block_tables(
         table_tokens=table_tokens,
         block_size=block_size,
         live_bs=live_bs,
+        seq_lens=seq_lens,
     )
     return tables
 
@@ -516,6 +717,49 @@ def _eager_slot_mapping(
     return out
 
 
+def _host_positive_max(values: Any) -> int | None:
+    """Max of a host-side length list. GPU tensors are refused.
+
+    ``Tensor.max().item()`` on a device tensor synchronizes the stream.
+    Draft extend calls that right after target verify, so the sync waits
+    out the verify graph.
+    """
+    if isinstance(values, torch.Tensor):
+        if values.numel() == 0 or values.device.type != "cpu":
+            return None
+        return int(values.max().item())
+    if values is None:
+        return None
+    try:
+        return max(int(v) for v in values)
+    except ValueError:
+        return None
+
+
+def _eager_qsa_max_seq_len(
+    forward_batch: Any,
+    seq_lens: torch.Tensor,
+    *,
+    tokens_per_req: int,
+    ctx_len: int,
+) -> int:
+    """Page-table width without reading the GPU ``seq_lens`` copy.
+
+    The graph path already pins this to the context length. Eager draft
+    and verify lift lengths on device, so the host prefix plus the
+    speculative width is enough and does not drain the previous step.
+    """
+    host_max = _host_positive_max(getattr(forward_batch, "seq_lens_cpu", None))
+    if host_max is not None:
+        extra = (
+            int(tokens_per_req) if int(tokens_per_req) > 1 or _is_draft_forward() else 0
+        )
+        return max(host_max + extra, 1)
+    if seq_lens.device.type == "cpu" and seq_lens.numel():
+        return max(int(seq_lens.max().item()), 1)
+    return max(int(ctx_len), 1)
+
+
 def _serving_context_len(indexer_budget: int) -> int:
     ctx_len = indexer_budget
     args = _server_args()
@@ -525,6 +769,28 @@ def _serving_context_len(indexer_budget: int) -> int:
         ctx_len,
         int(getattr(args, "context_length", 0) or 0),
         int(getattr(args, "max_model_len", 0) or 0),
+    )
+
+
+def _ensure_draft_qsa(device: torch.device, block_size: int) -> None:
+    """Allocate the draft page tables once, at serving capacity."""
+    args = _server_args()
+    max_bs = 32
+    ctx = 1
+    if args is not None:
+        max_bs = max(int(getattr(args, "max_running_requests", 32) or 32), 1)
+        ctx = max(
+            int(getattr(args, "context_length", 0) or 0),
+            int(getattr(args, "max_model_len", 0) or 0),
+            1,
+        )
+    tokens_per_req = _get_qsa_graph_max_tokens_per_req()
+    pages = max(1, (ctx + block_size - 1) // block_size)
+    _DRAFT_QSA.allocate_once(
+        max_bs=max_bs,
+        max_tokens=max_bs * tokens_per_req,
+        max_pages=pages,
+        device=device,
     )
 
 
@@ -540,97 +806,95 @@ def _fill_qsa_like_native(
     num_tokens: int,
     indexer_budget: int,
     ctx_len: int,
+    buffers: _Qwen4ExpDecodeGraphBuffers | None = None,
 ) -> Qwen4ExpQSAMetadata:
-    """Native ``_build_qsa_metadata`` / ``prepare_decode`` for SGLang decode graph.
+    """Native ``_build_qsa_metadata`` / ``prepare_decode`` for SGLang CUDA graphs.
 
-    Host ``build_batch_ids`` + H2D for token→req, GPU gather of live page-table
+    GPU packed token→req into the baked tensor, GPU gather of live page-table
     rows, Triton ``qsa_compressed_slots`` in place. Persistent addresses stay
     the ones baked into the CUDA graph.
+
+    Decode is one token per request. TARGET_VERIFY is ``draft_token_num``
+    tokens per request; pad-row tokens stay ``_NO_WRITE``.
     """
     device = positions.device
-    max_pages = _DECODE_GRAPH.max_pages if _DECODE_GRAPH.max_pages > 0 else 1
-    _DECODE_GRAPH.ensure(
-        max_bs=bs,
-        max_tokens=num_tokens,
-        max_pages=max_pages,
-        device=device,
-    )
-    assert _DECODE_GRAPH.block_tables is not None
-    assert _DECODE_GRAPH.slot_mapping is not None
-    assert _DECODE_GRAPH.compressed_slot_mapping is not None
-    assert _DECODE_GRAPH.logical_positions is not None
-    assert _DECODE_GRAPH.seq_lens is not None
-    assert _DECODE_GRAPH._req_pool_indices is not None
+    tokens_per_req = _get_qsa_tokens_per_req(forward_batch)
+    graph = _DECODE_GRAPH if buffers is None else buffers
+    assert graph.block_tables is not None
+    assert graph.slot_mapping is not None
+    assert graph.compressed_slot_mapping is not None
+    assert graph.logical_positions is not None
+    assert graph.seq_lens is not None
+    assert graph.token_to_req is not None
 
     table_tokens = _clamp_table_tokens(pool, max(ctx_len, indexer_budget))
 
-    req_idx = _DECODE_GRAPH._req_pool_indices[:bs]
-    src_idx = forward_batch.req_pool_indices[:bs]
-    if src_idx.dtype != torch.int32:
-        src_idx = src_idx.to(dtype=torch.int32)
-    req_idx.copy_(src_idx)
-    if live_bs < bs:
-        req_idx[live_bs:].zero_()
-    _fill_block_tables_into(
-        _DECODE_GRAPH.block_tables,
-        pool=pool,
-        req_pool_indices=req_idx,
-        table_tokens=table_tokens,
-        block_size=block_size,
-        live_bs=live_bs,
-    )
-
-    live_tokens = min(num_tokens, live_bs)
-    slot = _DECODE_GRAPH.slot_mapping[:num_tokens]
+    live_tokens = min(num_tokens, live_bs * tokens_per_req)
+    # Native kernels consume the current bucket's views. Initialize its pad
+    # tokens; storage beyond those views is not part of this replay.
+    slot = graph.slot_mapping[:num_tokens]
     slot.fill_(_NO_WRITE)
     out_loc = getattr(forward_batch, "out_cache_loc", None)
     if torch.is_tensor(out_loc) and live_tokens:
         loc = out_loc.reshape(-1)[:live_tokens]
-        slot[: loc.numel()].copy_(loc.to(dtype=torch.int64))
+        if loc.dtype != slot.dtype:
+            loc = loc.to(dtype=slot.dtype)
+        slot[: loc.numel()].copy_(loc)
 
-    logical = _DECODE_GRAPH.logical_positions[:num_tokens]
+    logical = graph.logical_positions[:num_tokens]
     logical.fill_(_NO_WRITE)
     pos = _sequence_index_positions(positions, num_tokens)
     copy_pos = min(int(pos.numel()), live_tokens)
     if copy_pos:
         logical[:copy_pos].copy_(pos[:copy_pos])
 
-    seq = _DECODE_GRAPH.seq_lens[:bs]
+    seq = graph.seq_lens[:bs]
     src_seq = getattr(forward_batch, "seq_lens", None)
     if torch.is_tensor(src_seq):
-        seq.copy_(src_seq[:bs].to(device=device, dtype=torch.int32))
+        src = src_seq[:bs]
+        if src.dtype != seq.dtype or src.device != device:
+            src = src.to(device=device, dtype=seq.dtype)
+        seq.copy_(src)
     else:
         seq.fill_(1)
     if live_bs < bs:
         seq[live_bs:] = 0
-        slot[live_bs:num_tokens] = _NO_WRITE
-        logical[live_bs:num_tokens] = _NO_WRITE
+    # Decode is pos = seq_lens - 1; skip the no-op GPU lift. Verify / draft
+    # width is > 1 and must raise prefix seq_lens to max(pos)+1.
+    if tokens_per_req > 1:
+        _lift_qsa_seq_lens(seq, logical, live_bs=live_bs, tokens_per_req=tokens_per_req)
+    # Page tables after the seq_lens lift: draft slots that cross a page boundary must
+    # stay visible, and mixed-length tails must not alias page 0.
+    _fill_block_tables_into(
+        graph.block_tables,
+        pool=pool,
+        # Gather runs outside the graph and reads only live requests. The
+        # source indices need neither a persistent copy nor pad-row writes.
+        req_pool_indices=forward_batch.req_pool_indices[:bs],
+        table_tokens=table_tokens,
+        block_size=block_size,
+        live_bs=live_bs,
+        seq_lens=seq,
+    )
 
-    if _DECODE_GRAPH._token_to_req_buf is not None:
-        if live_bs == 0:
-            _DECODE_GRAPH._token_to_req_buf.np[:num_tokens] = _NO_WRITE
-        else:
-            build_batch_ids(
-                np.ones(live_bs, dtype=np.int64),
-                pad_to=num_tokens,
-                pad=_NO_WRITE,
-                out=_DECODE_GRAPH._token_to_req_buf.np,
-            )
-        _DECODE_GRAPH._token_to_req_buf.copy_to_gpu(num_tokens)
-    else:
-        ttr = _DECODE_GRAPH.token_to_req[:num_tokens]
-        ttr.fill_(_NO_WRITE)
-        if live_bs:
-            ttr[:live_bs] = torch.arange(live_bs, dtype=torch.int32, device=device)
+    _token_to_req_from_packed(
+        live_bs=live_bs,
+        tokens_per_req=tokens_per_req,
+        num_tokens=num_tokens,
+        device=device,
+        out=graph.token_to_req,
+    )
 
     _compressed_slots_native(
         slot,
         logical,
         compress_ratio,
-        _DECODE_GRAPH.compressed_slot_mapping[:num_tokens],
+        graph.compressed_slot_mapping[:num_tokens],
     )
+    # Same constant as Native prepare_decode: the scored width is the engine
+    # context, not the live sequence. Draft stays eager, matching Native mRoPE.
     max_seq_len = max(ctx_len, indexer_budget, 1)
-    return _DECODE_GRAPH.view_qsa(bs=bs, num_tokens=num_tokens, max_seq_len=max_seq_len)
+    return graph.view_qsa(bs=bs, num_tokens=num_tokens, max_seq_len=max_seq_len)
 
 
 def build_qsa_metadata(
@@ -639,9 +903,6 @@ def build_qsa_metadata(
     positions: torch.Tensor,
 ) -> Qwen4ExpQSAMetadata | None:
     pool = _req_to_token_pool(forward_batch)
-    if pool is None or not hasattr(pool, "req_to_token"):
-        logger.debug("Flash QSA bridge: no req_to_token pool; skip QSA metadata")
-        return None
 
     device = positions.device
     bs = int(forward_batch.batch_size)
@@ -657,7 +918,32 @@ def build_qsa_metadata(
     live_bs = real_batch_size(forward_batch)
     indexer_budget = _indexer_budget(atom_config)
     ctx_len = _serving_context_len(indexer_budget)
-    if _pin_decode_graph(forward_batch):
+    # Draft metadata used to take the eager path: one host sync of seq_lens
+    # and a fresh page-table allocation on every step. That drains the GPU
+    # between the graphed verify and each eager draft, which is most of the
+    # small-batch MTP gap versus Native. Keep a private buffer set instead.
+    if _is_draft_forward():
+        mode = getattr(forward_batch, "forward_mode", None)
+        packed = bool(
+            mode is not None
+            and (mode.is_decode_or_idle() or _is_verify_or_draft_extend(forward_batch))
+        )
+        if packed:
+            _ensure_draft_qsa(device, block_size)
+            return _fill_qsa_like_native(
+                forward_batch=forward_batch,
+                positions=positions,
+                pool=pool,
+                block_size=block_size,
+                compress_ratio=compress_ratio,
+                live_bs=live_bs,
+                bs=bs,
+                num_tokens=num_tokens,
+                indexer_budget=indexer_budget,
+                ctx_len=ctx_len,
+                buffers=_DRAFT_QSA,
+            )
+    if _use_decode_graph_buffers(forward_batch):
         return _fill_qsa_like_native(
             forward_batch=forward_batch,
             positions=positions,
@@ -671,15 +957,50 @@ def build_qsa_metadata(
             ctx_len=ctx_len,
         )
 
-    seq_lens = _seq_lens(forward_batch, device)[:bs]
-    # Decode-graph capture pins scoring width to the engine context so every
-    # replay has a constant grid. Eager prefill/extend must use the live batch:
-    # `_DECODE_GRAPH.active` stays True after capture and would otherwise make a
-    # 4096-token prefill score `context_length` (e.g. 131072) on every QSA layer.
+    seq_lens = _seq_lens(forward_batch, device)
+    tokens_per_req = _get_qsa_tokens_per_req(forward_batch)
+    slot_mapping = _eager_slot_mapping(forward_batch, num_tokens, device)
+    mode = getattr(forward_batch, "forward_mode", None)
+    packed_step = bool(
+        mode is not None
+        and (mode.is_decode_or_idle() or _is_verify_or_draft_extend(forward_batch))
+    )
+    if packed_step:
+        token_to_req = _token_to_req_from_packed(
+            live_bs=live_bs,
+            tokens_per_req=tokens_per_req,
+            num_tokens=num_tokens,
+            device=device,
+        )
+        logical = _qsa_logical_positions(positions, num_tokens, token_to_req >= 0)
+        if live_bs < bs:
+            pad_from = min(num_tokens, live_bs * tokens_per_req)
+            if pad_from < num_tokens:
+                slot_mapping[pad_from:] = _NO_WRITE
+        # Target decode is pos = seq_lens - 1 (no-op). Draft decode is tpr=1
+        # but sits at seq_lens; verify / draft-extend are tpr > 1.
+        if tokens_per_req > 1 or _is_draft_forward():
+            _lift_qsa_seq_lens(
+                seq_lens, logical, live_bs=live_bs, tokens_per_req=tokens_per_req
+            )
+    else:
+        query_start_loc = _query_start_loc(forward_batch, num_tokens, device)
+        token_to_req, valid = _token_to_req_from_query_start_loc(
+            query_start_loc, num_tokens, device
+        )
+        logical = _qsa_logical_positions(positions, num_tokens, valid)
+        slot_mapping = slot_mapping.masked_fill(~valid, _NO_WRITE)
+    # Decode-graph capture may pin width to context. Eager steps use the
+    # host prefix; do not synchronize the GPU seq_lens copy.
     if _is_capturing() or seq_lens.numel() == 0:
         max_seq_len = ctx_len
     else:
-        max_seq_len = int(seq_lens.max().item())
+        max_seq_len = _eager_qsa_max_seq_len(
+            forward_batch,
+            seq_lens,
+            tokens_per_req=tokens_per_req,
+            ctx_len=ctx_len,
+        )
     table_tokens = _clamp_table_tokens(pool, max(max_seq_len, indexer_budget))
     block_tables = _eager_block_tables(
         pool=pool,
@@ -688,32 +1009,12 @@ def build_qsa_metadata(
         block_size=block_size,
         live_bs=live_bs,
         device=device,
+        seq_lens=seq_lens,
     )
-    slot_mapping = _eager_slot_mapping(forward_batch, num_tokens, device)
-    query_start_loc = _query_start_loc(forward_batch, num_tokens, device)
-    token_to_req, logical = _token_to_req_and_logical(
-        query_start_loc=query_start_loc,
-        positions=positions,
-        num_tokens=num_tokens,
-    )
-    if query_start_loc.numel():
-        token_ids = torch.arange(num_tokens, device=device)
-        slot_mapping = torch.where(
-            token_ids < query_start_loc[-1],
-            slot_mapping,
-            torch.full_like(slot_mapping, _NO_WRITE),
-        )
-    if live_bs < bs:
-        pad_tokens = min(num_tokens, bs)
-        if pad_tokens > live_bs:
-            slot_mapping = slot_mapping.clone()
-            slot_mapping[live_bs:pad_tokens] = _NO_WRITE
-            logical = logical.clone()
-            logical[live_bs:pad_tokens] = _NO_WRITE
 
     compressed = torch.empty_like(slot_mapping)
     _compressed_slots_native(slot_mapping, logical, compress_ratio, compressed)
-    return Qwen4ExpQSAMetadata(
+    qsa = Qwen4ExpQSAMetadata(
         block_tables=block_tables,
         slot_mapping=slot_mapping,
         compressed_slot_mapping=compressed,
@@ -722,6 +1023,7 @@ def build_qsa_metadata(
         seq_lens=seq_lens,
         max_seq_len=max(max_seq_len, 1),
     )
+    return qsa
 
 
 def _ple_state_pool_slots(forward_batch: Any, idx: torch.Tensor | None) -> int:
@@ -742,8 +1044,16 @@ def _ple_state_pool_slots(forward_batch: Any, idx: torch.Tensor | None) -> int:
     slots = _max_int_attrs(
         _req_to_token_pool(forward_batch), ("size", "max_num_reqs"), slots
     )
-    if torch.is_tensor(idx) and idx.numel() and not _is_capturing():
-        slots = max(slots, int(idx.clamp(min=0).max().item()) + 1)
+    # Host indices only. A GPU ``idx.max().item()`` drains verify, which is
+    # still queued when eager draft builds PLE state. Pool capacity above
+    # already matches Native's whole-pool allocation.
+    if (
+        torch.is_tensor(idx)
+        and idx.numel()
+        and not _is_capturing()
+        and idx.device.type == "cpu"
+    ):
+        slots = max(slots, int(idx.max().item()) + 1)
     return slots
 
 
@@ -833,13 +1143,22 @@ def _build_decode_graph_ple_metadata(
     bs = int(forward_batch.batch_size)
     num_slots = _ple_state_pool_slots(forward_batch, idx)
     conv_state, ngram_state = _ensure_ple_states(model, atom_config, num_slots)
+    accepted = getattr(gdn_metadata, "num_accepted_tokens", None)
+    if accepted is None and _is_target_verify(forward_batch):
+        # Eager verify used ones; reuse the persistent ones-buffer so capture
+        # does not allocate a fresh tensor whose address dies on replay.
+        if _DECODE_GRAPH.num_accepted_tokens is None:
+            raise RuntimeError(
+                "Flash PLE graph buffers must be allocated before TARGET_VERIFY"
+            )
+        accepted = _DECODE_GRAPH.num_accepted_tokens[:bs]
     ple = _DECODE_GRAPH.bind_graph_ple(
         query_start_loc=query_start_loc,
         ngram_state=ngram_state,
         state_indices=idx,
         conv_state=conv_state,
         batch_size=bs,
-        num_accepted_tokens=getattr(gdn_metadata, "num_accepted_tokens", None),
+        num_accepted_tokens=accepted,
     )
     if not getattr(_build_decode_graph_ple_metadata, "_logged", False):
         logger.info(
@@ -864,13 +1183,24 @@ def build_ple_metadata(
     hf = _hf_text_config(atom_config)
     if not getattr(hf, "ple_layer_ids", None):
         return None
-    if _pin_decode_graph(forward_batch):
+    if _use_decode_graph_buffers(forward_batch):
         return _build_decode_graph_ple_metadata(
             atom_config, forward_batch, model=model, gdn_metadata=gdn_metadata
         )
-    if gdn_metadata is None:
-        return None
     idx = getattr(gdn_metadata, "non_spec_state_indices_tensor", None)
+    idx_in = getattr(gdn_metadata, "non_spec_state_indices_in_tensor", None)
+    accepted = getattr(gdn_metadata, "num_accepted_tokens", None)
+    if gdn_metadata is None:
+        if not _is_target_verify(forward_batch):
+            return None
+        slots = _linear_static_ple_slots(forward_batch, None)
+        if slots is None:
+            return None
+        _, idx = slots
+        idx_in = idx
+        accepted = torch.ones(
+            (int(forward_batch.batch_size),), dtype=torch.int32, device=idx.device
+        )
     if idx is None:
         return None
 
@@ -878,11 +1208,12 @@ def build_ple_metadata(
     bs = int(forward_batch.batch_size)
     num_tokens = _num_tokens_from_positions(positions)
     query_start_loc = _query_start_loc(forward_batch, num_tokens, device)
-    is_prefill = bool(forward_batch.forward_mode.is_extend())
+    is_prefill = bool(
+        forward_batch.forward_mode.is_extend()
+    ) and not _is_verify_or_draft_extend(forward_batch)
 
     live_bs = real_batch_size(forward_batch)
     idx = idx[:bs].to(device=device, dtype=torch.int32)
-    idx_in = getattr(gdn_metadata, "non_spec_state_indices_in_tensor", None)
     if idx_in is None:
         idx_in = idx
     else:
@@ -918,7 +1249,7 @@ def build_ple_metadata(
         state_indices_out=idx,
         has_initial_state=has_initial,
         conv_state=conv_state,
-        num_accepted_tokens=getattr(gdn_metadata, "num_accepted_tokens", None),
+        num_accepted_tokens=accepted,
     )
 
 
@@ -951,8 +1282,9 @@ def bind_qsa_caches(model: Any, forward_batch: Any, atom_config: Any) -> None:
     compress_ratio = _compress_ratio(atom_config)
     hf = _hf_text_config(atom_config)
     index_head_dim = int(getattr(hf, "indexer_head_dim", 128))
-    kv_heads = max(int(getattr(qsa_layers[0], "num_kv_heads", 2)), 1)
-    head_dim = int(getattr(qsa_layers[0], "head_dim", 256))
+    is_draft = getattr(hf, "model_type", None) == "qwen4_exp_mtp"
+    if is_draft and len(qsa_layers) != 1:
+        raise ValueError("Flash MTP requires exactly one QSA draft layer")
 
     num_pages = None
     for attr in ("num_pages", "page_num"):
@@ -972,6 +1304,10 @@ def bind_qsa_caches(model: Any, forward_batch: Any, atom_config: Any) -> None:
         logger.warning("Flash QSA bridge: cannot size indexer caches yet")
         return
 
+    getter = getattr(pool, "get_kv_buffer", None)
+    if not callable(getter):
+        raise TypeError("Flash QSA requires a SGLang KV pool with get_kv_buffer")
+
     device = next(model.parameters()).device
     raw = torch.zeros(
         (len(qsa_layers), num_pages, block_size, 1, index_head_dim),
@@ -989,76 +1325,89 @@ def bind_qsa_caches(model: Any, forward_batch: Any, atom_config: Any) -> None:
         dtype=torch.bfloat16,
         device=device,
     )
-    used_pool = 0
     pool_shape = None
     for i, layer in enumerate(qsa_layers):
-        k_cache = None
-        v_cache = None
-        getter = getattr(pool, "get_kv_buffer", None) if pool is not None else None
-        if callable(getter):
-            try:
-                k_buf, v_buf = getter(int(getattr(layer, "layer_num", i)))
-            except Exception:  # noqa: BLE001
-                k_buf = v_buf = None
-            if torch.is_tensor(k_buf) and torch.is_tensor(v_buf) and k_buf.dim() == 3:
-                tokens, heads, dim = k_buf.shape
-                pages = tokens // block_size
-                if pages > 0 and tokens == pages * block_size:
-                    k_cache = k_buf.view(pages, block_size, heads, dim)
-                    v_cache = v_buf.view(pages, block_size, heads, dim)
-                    used_pool += 1
-                    pool_shape = tuple(k_buf.shape)
-        if k_cache is None:
-            k_cache = torch.zeros(
-                (num_pages, block_size, kv_heads, head_dim),
-                dtype=torch.bfloat16,
-                device=device,
+        # Native draft layer 48 belongs to a separate, single-layer SGLang
+        # pool. Target layers retain their logical ids; the pool owns their
+        # full_attention_layer_id_mapping. Never guess another target layer.
+        layer_id = 0 if is_draft else int(layer.layer_num)
+        try:
+            k_buf, v_buf = getter(layer_id)
+        except (KeyError, IndexError) as exc:
+            raise RuntimeError(
+                f"Flash QSA KV mapping missing for layer {layer_id} "
+                f"(draft={is_draft}, pool={type(pool).__name__})"
+            ) from exc
+        if (
+            not torch.is_tensor(k_buf)
+            or not torch.is_tensor(v_buf)
+            or k_buf.ndim != 3
+            or v_buf.shape != k_buf.shape
+            or k_buf.shape[0] == 0
+            or k_buf.shape[0] % block_size
+        ):
+            raise ValueError(
+                f"Flash QSA layer {layer_id} requires matching paged K/V "
+                f"buffers [tokens, heads, dim], with tokens divisible by {block_size}"
             )
-            v_cache = torch.zeros_like(k_cache)
+        tokens, heads, dim = k_buf.shape
+        pages = tokens // block_size
+        k_cache = k_buf.view(pages, block_size, heads, dim)
+        v_cache = v_buf.view(pages, block_size, heads, dim)
+        pool_shape = tuple(k_buf.shape)
         layer.bind_caches(k_cache, v_cache, raw[i], compressed[i], None)
     model._atom_qwen4_exp_qsa_raw = raw
     model._atom_qwen4_exp_qsa_compressed = compressed
     model._atom_qwen4_exp_qsa_bound = True
     logger.info(
         "Bound %s QSA layers pages=%s block=%s compress=%s "
-        "sglang_pool_view=%s/%s pool_shape=%s (Native layout = paged view of [T,H,D])",
+        "pool_shape=%s (Native layout = paged view of [T,H,D])",
         len(qsa_layers),
         num_pages,
         block_size,
         compress_ratio,
-        used_pool,
-        len(qsa_layers),
         pool_shape,
     )
 
 
+def _get_cuda_graph_max_bs() -> int:
+    """Use SGLang's resolved decode buckets; older versions use CLI fields."""
+    args = _server_args()
+    decode = getattr(getattr(args, "cuda_graph_config", None), "decode", None)
+    buckets = getattr(decode, "bs", None)
+    if buckets:
+        graph_bs = max(buckets)
+    elif getattr(decode, "max_bs", None) is not None:
+        graph_bs = int(decode.max_bs)
+    else:
+        graph_bs = int(
+            getattr(args, "cuda_graph_max_bs_decode", None)
+            or getattr(args, "cuda_graph_max_bs", 0)
+            or 0
+        )
+    running = int(getattr(args, "max_running_requests", 0) or 0)
+    if running > 0:
+        graph_bs = min(graph_bs, running) if graph_bs > 0 else running
+    return graph_bs
+
+
 def _decode_graph_capacity(
     atom_config: Any, forward_batch: Any
-) -> tuple[int, int, torch.device]:
-    """High-water sizes so capture never reallocates persistent QSA buffers."""
+) -> tuple[int, int, int, torch.device]:
+    """High-water sizes so capture never reallocates persistent QSA buffers.
+
+    Returns ``(max_bs, max_tokens, max_pages, device)``. ``max_tokens`` is
+    ``max_bs *`` CLI MTP width, not the current-step fill width.
+    """
     device = getattr(forward_batch, "device", None)
     if device is None:
         pos = getattr(forward_batch, "positions", None)
         device = pos.device if torch.is_tensor(pos) else torch.device("cuda")
     bs = int(getattr(forward_batch, "batch_size", 0) or 0)
-    graph_bs = 0
-    for key in ("cuda_graph_max_bs_decode", "cuda_graph_max_bs"):
-        val = getattr(forward_batch, key, None)
-        if val is None:
-            continue
-        try:
-            graph_bs = max(graph_bs, int(val))
-        except (TypeError, ValueError):
-            pass
-    if graph_bs <= 0:
-        args = _server_args()
-        if args is not None:
-            graph_bs = int(
-                getattr(args, "cuda_graph_max_bs_decode", None)
-                or getattr(args, "cuda_graph_max_bs", 0)
-                or 0
-            )
+    graph_bs = _get_cuda_graph_max_bs()
     max_bs = max(bs, graph_bs, 8)
+    max_tokens_per_req = _get_qsa_graph_max_tokens_per_req()
+    max_tokens = max_bs * max_tokens_per_req
     indexer_budget = _indexer_budget(atom_config)
     block_size = _block_size(forward_batch, atom_config)
     # Page table must cover the full context, not just indexer_budget.
@@ -1067,7 +1416,20 @@ def _decode_graph_capacity(
     # logical_page and drop the recent context.
     ctx_len = _serving_context_len(indexer_budget)
     max_pages = max((ctx_len + block_size - 1) // block_size, 1)
-    return max_bs, max_pages, torch.device(device)
+    return max_bs, max_tokens, max_pages, torch.device(device)
+
+
+def _ensure_decode_graph_buffers(atom_config: Any, forward_batch: Any) -> None:
+    """Allocate persistent QSA CUDA-graph buffers at CLI high-water, once."""
+    max_bs, max_tokens, max_pages, device = _decode_graph_capacity(
+        atom_config, forward_batch
+    )
+    _DECODE_GRAPH.allocate_once(
+        max_bs=max_bs,
+        max_tokens=max_tokens,
+        max_pages=max_pages,
+        device=device,
+    )
 
 
 def prepare_qwen4_exp_decode_graph_metadata(
@@ -1083,7 +1445,10 @@ def prepare_qwen4_exp_decode_graph_metadata(
     ``graph.replay()``.
     """
     mode = getattr(forward_batch, "forward_mode", None)
-    if mode is None or not mode.is_decode_or_idle():
+    if mode is None:
+        return None
+    is_verify = _is_target_verify(forward_batch)
+    if not (mode.is_decode_or_idle() or is_verify):
         return None
     if atom_config is None:
         try:
@@ -1095,22 +1460,18 @@ def prepare_qwen4_exp_decode_graph_metadata(
     if atom_config is None or not _is_qwen4_exp_config(atom_config):
         return None
 
+    tokens_per_req = _get_qsa_tokens_per_req(forward_batch)
     positions = getattr(forward_batch, "positions", None)
     if not torch.is_tensor(positions):
         bs = int(getattr(forward_batch, "batch_size", 0) or 0)
         device = getattr(forward_batch, "device", None) or torch.device("cuda")
-        positions = torch.zeros((max(bs, 1),), dtype=torch.int64, device=device)
+        positions = torch.zeros(
+            (max(bs, 1) * tokens_per_req,), dtype=torch.int64, device=device
+        )
 
-    # Force graph-buffer path for this decode step (capture or replay).
-    _DECODE_GRAPH.active = True
-    max_bs, max_pages, device = _decode_graph_capacity(atom_config, forward_batch)
+    # Allocation activates the graph-buffer path for capture and replay.
+    _ensure_decode_graph_buffers(atom_config, forward_batch)
     block_size = _block_size(forward_batch, atom_config)
-    _DECODE_GRAPH.ensure(
-        max_bs=max_bs,
-        max_tokens=max_bs,
-        max_pages=max_pages,
-        device=device,
-    )
 
     qsa = build_qsa_metadata(atom_config, forward_batch, positions)
     # QSA page tables only. PLE aliases Hybrid GDN's static mamba_cache_indices
@@ -1118,22 +1479,16 @@ def prepare_qwen4_exp_decode_graph_metadata(
     # linear child has filled those slots). Replay does not rebuild PLE.
     if in_capture:
         logger.info(
-            "Flash decode CUDA-graph QSA buffers ready: "
-            "block_size=%s bs<=%s tokens<=%s pages<=%s max_seq_len=%s",
+            "Flash %s CUDA-graph QSA buffers ready: "
+            "block_size=%s bs<=%s tokens<=%s tokens_per_req=%s pages<=%s max_seq_len=%s",
+            "target_verify" if is_verify else "decode",
             block_size,
             _DECODE_GRAPH.max_bs,
             _DECODE_GRAPH.max_tokens,
+            tokens_per_req,
             _DECODE_GRAPH.max_pages,
-            _DECODE_GRAPH.max_seq_len,
+            qsa.max_seq_len,
         )
-        if block_size != 64 and max_pages > 64:
-            logger.warning(
-                "Flash QSA block_size=%s yields pages<=%s; "
-                "expected page-size 64 → pages<=32 for indexer_budget=2048. "
-                "Wrong block_size causes OOB page ids on long decode.",
-                block_size,
-                max_pages,
-            )
     return qsa
 
 

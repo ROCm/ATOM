@@ -93,6 +93,17 @@ except ImportError:
     pass
 
 
+def _model_runner_uses_native_qsa(model_runner) -> bool:
+    cfg = getattr(model_runner, "model_config", None)
+    hf = getattr(cfg, "hf_config", None) if cfg is not None else None
+    archs = getattr(hf, "architectures", None) or []
+    if any("Qwen4Exp" in str(a) for a in archs):
+        return True
+    text = getattr(hf, "text_config", None) or hf
+    mt = str(getattr(text, "model_type", "") or "")
+    return mt.startswith("qwen4_exp")
+
+
 class ATOMAttnBackendForSgl(AiterAttnBackend):
     """ATOM's custom attention backend for sglang plugin mode.
 
@@ -112,6 +123,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         super().__init__(model_runner, skip_prefill, kv_indptr_buf, topk)
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token_pool = model_runner.req_to_token_pool
+        self._atom_native_qsa = _model_runner_uses_native_qsa(model_runner)
         mapping = getattr(
             model_runner.token_to_kv_pool, "full_attention_layer_id_mapping", None
         )
@@ -191,8 +203,20 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             max_seqlen_qo = max(max_seqlen_qo, self.speculative_num_steps + 1)
         return max_seqlen_qo
 
+    def _uses_native_qsa(self) -> bool:
+        return bool(getattr(self, "_atom_native_qsa", False))
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
+        # Native QSA (Flash-Next) does not read FlashInfer MHA/MLA tables.
+        # TARGET_VERIFY / draft-extend would otherwise take the speculative
+        # MHA path and run the wrong kernel on QSA caches.
+        if self._uses_native_qsa() and (
+            forward_batch.forward_mode.is_target_verify()
+            or is_draft_extend_mode(forward_batch.forward_mode, include_v2=True)
+        ):
+            self._set_qwen4_exp_qsa_graph_forward_metadata()
+            return
         if forward_batch.forward_mode.is_decode_or_idle():
             self._init_forward_metadata_decode(forward_batch)
         elif self.use_mla and forward_batch.forward_mode.is_draft_extend_v2():
@@ -222,21 +246,35 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         # (the 2.4T / Qwen3.5 path below). QSA does not read those tables.
         # Fill Native-style persistent QSA page tables outside the graph, then
         # return so we do not run page_table.fill_(0) on every decode replay.
+        is_qsa_cuda_graph_mode = forward_batch.forward_mode.is_decode_or_idle() or (
+            self._uses_native_qsa() and forward_batch.forward_mode.is_target_verify()
+        )
         if (
             getattr(self, "_qwen4_exp_qsa_graph", None) is not False
-            and forward_batch.forward_mode.is_decode_or_idle()
+            and is_qsa_cuda_graph_mode
         ):
             from atom.plugin.sglang.qwen4_exp_bridge import (
+                bind_qsa_replay_batch,
                 prepare_qwen4_exp_decode_graph_metadata,
             )
 
+            # Replay fb_view omits req_to_token_pool. Reattach before fill.
+            bind_qsa_replay_batch(forward_batch, self)
             qsa_md = prepare_qwen4_exp_decode_graph_metadata(forward_batch, in_capture)
             if qsa_md is not None:
                 self._qwen4_exp_qsa_graph = True
                 self._set_qwen4_exp_qsa_graph_forward_metadata()
                 return
             # Decode and not Flash: skip the QSA probe on later replays.
-            self._qwen4_exp_qsa_graph = False
+            if forward_batch.forward_mode.is_decode_or_idle():
+                self._qwen4_exp_qsa_graph = False
+
+        if self._uses_native_qsa() and (
+            forward_batch.forward_mode.is_target_verify()
+            or is_draft_extend_mode(forward_batch.forward_mode, include_v2=True)
+        ):
+            self._set_qwen4_exp_qsa_graph_forward_metadata()
+            return
 
         if in_capture:
             self.init_forward_metadata_capture_cuda_graph(
@@ -287,6 +325,68 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             page_table=None,
             kv_lens=None,
         )
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: int | None
+    ):
+        """Refresh QSA pages after draft writes the real tree positions.
+
+        AITER's override is a no-op. Overlap plan-stream load_batch fills QSA
+        with stale positions; this copies the post-draft tree into the graph
+        buffers and refills Native QSA outside the replay.
+        """
+        if not self._uses_native_qsa():
+            return super().update_verify_buffers_to_fill_after_draft(
+                spec_info, cuda_graph_bs
+            )
+        if cuda_graph_bs is None:
+            return
+        from types import SimpleNamespace
+
+        from atom.plugin.sglang.qwen4_exp_bridge import (
+            prepare_qwen4_exp_decode_graph_metadata,
+        )
+
+        runner = getattr(self.model_runner, "decode_cuda_graph_runner", None)
+        buffers = getattr(runner, "buffers", None)
+        if buffers is None:
+            return
+        tokens_per_req = int(
+            getattr(spec_info, "draft_token_num", None)
+            or getattr(spec_info, "num_tokens_per_req", None)
+            or 1
+        )
+        tokens_per_req = max(tokens_per_req, 1)
+        bs = int(cuda_graph_bs)
+        total = bs * tokens_per_req
+        positions = getattr(spec_info, "positions", None)
+        graph_pos = getattr(buffers, "positions", None)
+        if torch.is_tensor(positions) and torch.is_tensor(graph_pos):
+            n = min(int(positions.numel()), total, int(graph_pos.numel()))
+            if n:
+                graph_pos[:n].copy_(positions[:n])
+            if total > n and graph_pos.numel() >= total:
+                graph_pos[n:total].zero_()
+        raw_bs = int(getattr(runner, "raw_bs", bs) or bs)
+        seq = buffers.seq_lens[:bs]
+        req_idx = buffers.req_pool_indices[:bs]
+        out_loc = getattr(buffers, "out_cache_loc", None)
+        fb = SimpleNamespace(
+            batch_size=bs,
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            positions=graph_pos[:total] if torch.is_tensor(graph_pos) else positions,
+            seq_lens=seq,
+            req_pool_indices=req_idx,
+            out_cache_loc=(out_loc[:total] if torch.is_tensor(out_loc) else None),
+            spec_info=spec_info,
+            num_padding=max(bs - raw_bs, 0),
+            device=self.device,
+            attn_backend=self,
+            req_to_token_pool=self.req_to_token_pool,
+            page_size=getattr(self, "page_size", None),
+        )
+        prepare_qwen4_exp_decode_graph_metadata(fb, in_capture=False)
+        self._set_qwen4_exp_qsa_graph_forward_metadata()
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         """ATOM's full-attention metadata is prepared outside the captured graph."""
