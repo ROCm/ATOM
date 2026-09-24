@@ -195,10 +195,12 @@ in compiled execution. Microbatches use the normal model call and honor the
 configured compilation level. TP vision requests pass token-aligned image
 embeddings and masks through the split. DPA remains text-only.
 
-Child metadata reuse separates host and device dependencies: pinned staging
-waits only for its previous H2D, while the upload stream waits for prior GPU
-consumers before overwriting device storage. Storage is released with the KV pools. When
-the private Engram TP collective is unavailable, the parent materializes one
+Child metadata reuse first queries the prior completion event. If it has
+completed, storage is reused without host or device waits. Otherwise, pinned
+staging waits only if its previous H2D is still pending, while the upload stream
+waits for prior GPU consumers before overwriting device storage. Storage is
+released with the KV pools. When the private Engram TP collective is unavailable,
+the parent materializes one
 fallback gather per layer before launching workers; child views only wait
 for and slice these rows.
 

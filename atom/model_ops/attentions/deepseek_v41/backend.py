@@ -442,11 +442,12 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             done = torch.cuda.Event() if on_gpu else None
             self._tbo_storage[index] = buffers, indptrs, h2d_done, done
         buffers, indptrs, h2d_done, done = self._tbo_storage[index]
-        if h2d_done is not None:
-            # CPU may rewrite pinned staging as soon as its previous H2D has
-            # read it. Keep device overwrites behind prior readers without
-            # blocking the CPU on the rest of the model forward.
-            h2d_done.synchronize()
+        if done is not None and not done.query():
+            # Completed forwards need no reuse waits. For in-flight work,
+            # protect pinned staging only until H2D has read it, then order
+            # device overwrites after the remaining GPU consumers.
+            if not h2d_done.query():
+                h2d_done.synchronize()
             torch.cuda.current_stream(self.device).wait_event(done)
         return buffers, indptrs
 
