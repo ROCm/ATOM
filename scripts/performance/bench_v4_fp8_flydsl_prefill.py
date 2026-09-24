@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ABBA benchmark for V4 native-FP8 sparse prefill candidates vs AITER OPUS.
+"""ABBA benchmark for V4 FlyDSL/dispatch native-FP8 prefill vs AITER OPUS.
 
 The generated CSR rows model long-context V4 prefill rather than dense full
 attention: the prefix span is the retained SWA/compressor set and the extend
@@ -23,45 +23,23 @@ from atom.model_ops.v4_kernels.paged_prefill_fp8_flydsl import (
     sparse_attn_v4_paged_prefill_fp8_flydsl,
 )
 from atom.model_ops.v4_kernels.paged_prefill import sparse_attn_v4_paged_prefill
-from atom.model_ops.v4_kernels.paged_prefill_fp8_triton import (
-    sparse_attn_v4_paged_prefill_fp8_triton,
-)
 from atom.model_ops.v4_kernels.v4_quant import quantize_bf16_to_v4_2buff_triton
 
 
 @dataclass(frozen=True)
 class Config:
-    block_h: int
-    block_k: int
-    num_warps: int
-    num_stages: int
     waves_per_eu: int
 
     @property
     def name(self) -> str:
-        return (
-            f"bh{self.block_h}-bk{self.block_k}-w{self.num_warps}-"
-            f"s{self.num_stages}-weu{self.waves_per_eu}"
-        )
+        return f"weu{self.waves_per_eu}"
 
 
-DEFAULT_CONFIGS = (
-    Config(8, 16, 4, 1, 1),
-    Config(8, 32, 4, 1, 1),
-    Config(16, 16, 4, 1, 1),
-    Config(16, 32, 4, 1, 1),
-    Config(16, 64, 4, 1, 1),
-    Config(32, 32, 4, 1, 1),
-)
+DEFAULT_CONFIGS = (Config(1),)
 
 
 def _parse_config(value: str) -> Config:
-    fields = value.lower().replace("x", ",").split(",")
-    if len(fields) != 5:
-        raise argparse.ArgumentTypeError(
-            "config must be block_h,block_k,num_warps,num_stages,waves_per_eu"
-        )
-    return Config(*(int(field) for field in fields))
+    return Config(int(value))
 
 
 def _counts(tokens: int, maximum: int, scenario: str) -> list[int]:
@@ -163,29 +141,7 @@ def main() -> None:
         default=0,
         help="replace every Nth prefix index with -1 (0 disables injection)",
     )
-    parser.add_argument("--matrix-instr-nonkdim", type=int, default=0)
-    parser.add_argument("--extend-num-stages", type=int)
-    parser.add_argument("--schedule-hint", default="none")
     parser.add_argument("--assume-full-tiles", action="store_true")
-    parser.add_argument("--no-sentinel-hot-loop", action="store_true")
-    parser.add_argument("--tail-block-k", type=int, choices=(16, 32, 64), default=64)
-    parser.add_argument("--mxfp8-v", action="store_true")
-    parser.add_argument("--bf16-acc", action="store_true")
-    parser.add_argument("--packed-qk-load", action="store_true")
-    parser.add_argument("--keep-kv-cache", action="store_true")
-    parser.add_argument("--reuse-kv-raw", action="store_true")
-    parser.add_argument("--reuse-kv-fp8", action="store_true")
-    parser.add_argument("--coalesced-v-load", action="store_true")
-    parser.add_argument("--fused-pv-acc", action="store_true")
-    parser.add_argument(
-        "--v-cache-modifier", choices=("default", "ca", "cg"), default="default"
-    )
-    parser.add_argument("--reuse-v-scale", action="store_true")
-    parser.add_argument("--pairwise-bf16-v", action="store_true")
-    parser.add_argument("--full-bf16-v", action="store_true")
-    parser.add_argument("--head-first-grid", action="store_true")
-    parser.add_argument("--grid-group-tokens", type=int, default=0)
-    parser.add_argument("--compiled-launch", action="store_true")
     parser.add_argument(
         "--profile-target",
         choices=("both", "opus", "candidate"),
@@ -194,8 +150,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--backend",
-        choices=("triton", "flydsl", "dispatch"),
-        default="triton",
+        choices=("flydsl", "dispatch"),
+        default="flydsl",
     )
     parser.add_argument("--flydsl-pipeline-two", action="store_true")
     parser.add_argument("--flydsl-cluster-two", action="store_true")
@@ -231,7 +187,7 @@ def main() -> None:
         "--config",
         action="append",
         type=_parse_config,
-        help="repeatable: block_h,block_k,num_warps,num_stages,waves_per_eu",
+        help="repeatable FlyDSL waves-per-EU value",
     )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
@@ -328,7 +284,7 @@ def main() -> None:
     opus_out = torch.empty(
         args.tokens, args.heads, 512, dtype=torch.bfloat16, device=device
     )
-    triton_out = torch.empty_like(opus_out)
+    candidate_out = torch.empty_like(opus_out)
 
     def opus():
         return pa_sparse_prefill_fp8_opus(*opus_common, out=opus_out)
@@ -349,7 +305,7 @@ def main() -> None:
                     extend_indptr,
                     sink,
                     scale,
-                    out=triton_out,
+                    out=candidate_out,
                     unified_kv_rope=prefix_rope,
                     q_packed=q_packed,
                     q_rope=q_rope,
@@ -359,65 +315,34 @@ def main() -> None:
                     max_seqlen_q=args.extend_len,
                     max_seqlen_k=args.prefix_len + args.extend_len,
                 )
-            if args.backend == "flydsl":
-                return sparse_attn_v4_paged_prefill_fp8_flydsl(
-                    *candidate_common,
-                    out=triton_out,
-                    waves_per_eu=config.waves_per_eu,
-                    pipeline_two=args.flydsl_pipeline_two,
-                    cluster_two=args.flydsl_cluster_two,
-                    wave_padded_k=args.flydsl_wave_padded_k,
-                    alpha_bpermute=args.flydsl_alpha_bpermute,
-                    lds_padding=args.flydsl_lds_padding,
-                    rescale_once=args.flydsl_rescale_once,
-                    fixed_softmax_ref=args.flydsl_fixed_softmax_ref,
-                    transpose_v=args.flydsl_transpose_v,
-                    register_p=args.flydsl_register_p,
-                    cache_q_step=args.flydsl_cache_q_step,
-                    reuse_q_across_n=args.flydsl_reuse_q_across_n,
-                    broadcast_indices=args.flydsl_broadcast_indices,
-                    no_sentinel=args.flydsl_no_sentinel,
-                    full_tile_fastpath=args.flydsl_full_tile_fastpath,
-                    p_lane_layout=args.flydsl_p_lane_layout,
-                    stage_q=args.flydsl_stage_q,
-                    cache_all_q=args.flydsl_cache_all_q,
-                    assume_full_tiles=args.assume_full_tiles,
-                    permute_k_scales=args.flydsl_permute_k_scales,
-                    pairwise_pv=args.flydsl_pairwise_pv,
-                    post_misched=args.flydsl_post_misched,
-                    machine_sink=args.flydsl_machine_sink,
-                    setprio=args.flydsl_setprio,
-                    dynamic_full_prefix=args.flydsl_dynamic_full_prefix,
-                )
-            return sparse_attn_v4_paged_prefill_fp8_triton(
+            return sparse_attn_v4_paged_prefill_fp8_flydsl(
                 *candidate_common,
-                out=triton_out,
-                matrix_instr_nonkdim=args.matrix_instr_nonkdim,
-                extend_num_stages=args.extend_num_stages,
-                schedule_hint=args.schedule_hint,
+                out=candidate_out,
+                waves_per_eu=config.waves_per_eu,
+                pipeline_two=args.flydsl_pipeline_two,
+                cluster_two=args.flydsl_cluster_two,
+                wave_padded_k=args.flydsl_wave_padded_k,
+                alpha_bpermute=args.flydsl_alpha_bpermute,
+                lds_padding=args.flydsl_lds_padding,
+                rescale_once=args.flydsl_rescale_once,
+                fixed_softmax_ref=args.flydsl_fixed_softmax_ref,
+                transpose_v=args.flydsl_transpose_v,
+                register_p=args.flydsl_register_p,
+                cache_q_step=args.flydsl_cache_q_step,
+                reuse_q_across_n=args.flydsl_reuse_q_across_n,
+                broadcast_indices=args.flydsl_broadcast_indices,
+                no_sentinel=args.flydsl_no_sentinel,
+                full_tile_fastpath=args.flydsl_full_tile_fastpath,
+                p_lane_layout=args.flydsl_p_lane_layout,
+                stage_q=args.flydsl_stage_q,
+                cache_all_q=args.flydsl_cache_all_q,
                 assume_full_tiles=args.assume_full_tiles,
-                no_sentinel_hot_loop=args.no_sentinel_hot_loop,
-                tail_block_k=args.tail_block_k,
-                use_mxfp8_v=args.mxfp8_v,
-                use_bf16_acc=args.bf16_acc,
-                packed_qk_load=args.packed_qk_load,
-                keep_kv_cache=args.keep_kv_cache,
-                reuse_kv_raw=args.reuse_kv_raw,
-                reuse_kv_fp8=args.reuse_kv_fp8,
-                coalesced_v_load=args.coalesced_v_load,
-                fused_pv_acc=args.fused_pv_acc,
-                v_cache_modifier=(
-                    ""
-                    if args.v_cache_modifier == "default"
-                    else f".{args.v_cache_modifier}"
-                ),
-                reuse_v_scale=args.reuse_v_scale,
-                pairwise_bf16_v=args.pairwise_bf16_v,
-                full_bf16_v=args.full_bf16_v,
-                head_first_grid=args.head_first_grid,
-                grid_group_tokens=args.grid_group_tokens,
-                compiled_launch=args.compiled_launch,
-                **kwargs,
+                permute_k_scales=args.flydsl_permute_k_scales,
+                pairwise_pv=args.flydsl_pairwise_pv,
+                post_misched=args.flydsl_post_misched,
+                machine_sink=args.flydsl_machine_sink,
+                setprio=args.flydsl_setprio,
+                dynamic_full_prefix=args.flydsl_dynamic_full_prefix,
             )
 
         if args.profile_target != "both":
@@ -437,8 +362,7 @@ def main() -> None:
                 }
             )
             print(
-                f"{config.name:23} {args.profile_target}="
-                f"{stats['median_us']:9.2f} us",
+                f"{config.name:23} {args.profile_target}={stats['median_us']:9.2f} us",
                 flush=True,
             )
             continue
@@ -451,26 +375,26 @@ def main() -> None:
         opus()
         candidate()
         torch.cuda.synchronize()
-        diff = (opus_out.float() - triton_out.float()).abs()
+        diff = (opus_out.float() - candidate_out.float()).abs()
         cosine = torch.nn.functional.cosine_similarity(
-            opus_out.float().flatten(), triton_out.float().flatten(), dim=0
+            opus_out.float().flatten(), candidate_out.float().flatten(), dim=0
         ).item()
         per_token_max = diff.reshape(args.tokens, -1).max(dim=1).values
         worst_count = min(16, args.tokens)
         worst_values, worst_indices = torch.topk(per_token_max, worst_count)
 
         opus_samples: list[float] = []
-        triton_samples: list[float] = []
+        candidate_samples: list[float] = []
         for iteration in range(args.iterations):
-            order = ((opus, opus_samples), (candidate, triton_samples))
+            order = ((opus, opus_samples), (candidate, candidate_samples))
             if iteration % 2:
                 order = tuple(reversed(order))
             for fn, samples in order:
                 samples.append(_time_once(fn))
 
         opus_stats = _summary(opus_samples)
-        triton_stats = _summary(triton_samples)
-        speedup = opus_stats["median_us"] / triton_stats["median_us"]
+        candidate_stats = _summary(candidate_samples)
+        speedup = opus_stats["median_us"] / candidate_stats["median_us"]
         record = {
             "backend": args.backend,
             "flydsl_pipeline_two": args.flydsl_pipeline_two,
@@ -499,7 +423,7 @@ def main() -> None:
             "config": config.name,
             "config_values": kwargs,
             "opus": opus_stats,
-            "triton": triton_stats,
+            "candidate": candidate_stats,
             "speedup": speedup,
             "delta_pct": (speedup - 1.0) * 100.0,
             "max_abs": diff.max().item(),
@@ -527,12 +451,12 @@ def main() -> None:
             "mean_abs": diff.mean().item(),
             "cosine": cosine,
             "opus_nonfinite": int((~torch.isfinite(opus_out)).sum().item()),
-            "candidate_nonfinite": int((~torch.isfinite(triton_out)).sum().item()),
+            "candidate_nonfinite": int((~torch.isfinite(candidate_out)).sum().item()),
         }
         records.append(record)
         print(
             f"{config.name:23} OPUS={opus_stats['median_us']:9.2f} us "
-            f"{args.backend}={triton_stats['median_us']:9.2f} us "
+            f"{args.backend}={candidate_stats['median_us']:9.2f} us "
             f"delta={record['delta_pct']:+7.2f}% cos={cosine:.8f} "
             f"max={record['max_abs']:.6g} "
             f"nonfinite={record['opus_nonfinite']}/{record['candidate_nonfinite']}",
@@ -548,25 +472,7 @@ def main() -> None:
             "scenario": args.scenario,
             "input_std": args.input_std,
             "prefix_sentinel_period": args.prefix_sentinel_period,
-            "matrix_instr_nonkdim": args.matrix_instr_nonkdim,
-            "extend_num_stages": args.extend_num_stages,
-            "schedule_hint": args.schedule_hint,
             "assume_full_tiles": args.assume_full_tiles,
-            "no_sentinel_hot_loop": args.no_sentinel_hot_loop,
-            "tail_block_k": args.tail_block_k,
-            "mxfp8_v": args.mxfp8_v,
-            "bf16_acc": args.bf16_acc,
-            "reuse_kv_raw": args.reuse_kv_raw,
-            "reuse_kv_fp8": args.reuse_kv_fp8,
-            "coalesced_v_load": args.coalesced_v_load,
-            "fused_pv_acc": args.fused_pv_acc,
-            "v_cache_modifier": args.v_cache_modifier,
-            "reuse_v_scale": args.reuse_v_scale,
-            "pairwise_bf16_v": args.pairwise_bf16_v,
-            "full_bf16_v": args.full_bf16_v,
-            "head_first_grid": args.head_first_grid,
-            "grid_group_tokens": args.grid_group_tokens,
-            "compiled_launch": args.compiled_launch,
             "profile_target": args.profile_target,
             "backend": args.backend,
             "prefix_nnz": int(prefix_indices.numel()),

@@ -146,37 +146,6 @@ def _use_triton_native_fp8_decode(
     return True
 
 
-def _use_flydsl_native_fp8_decode(
-    q_packed: torch.Tensor,
-    *,
-    query_group: int,
-    kv_kind: str,
-) -> bool:
-    """Select the qualified gfx950 HCA B6 FlyDSL specialization.
-
-    The environment switch is intentionally explicit while the mixed
-    Triton/FlyDSL policy is being validated end to end.  The master Triton
-    attention switch still provides one control that forces every native-FP8
-    attention call back to AITER for matched A/B runs.
-    """
-    if os.environ.get("ATOM_USE_TRITON_ATTN", "1") != "1":
-        return False
-    if os.environ.get("ATOM_V4_FLYDSL_FP8_DECODE", "0") != "1":
-        return False
-
-    device_index = q_packed.device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    tokens, heads, _ = q_packed.shape
-    return (
-        _device_arch(device_index) == "gfx950"
-        and tokens == 6 * 7
-        and heads == 128
-        and query_group == 7
-        and kv_kind == "hca"
-    )
-
-
 @functools.lru_cache(maxsize=1)
 def _cu_count() -> int:
     """Compute-unit count of the active GPU, queried once via aiter.
@@ -1372,26 +1341,6 @@ def sparse_attn_v4_paged_decode(
     unreachable from the model).
     """
     if unified_kv_rope is not None:
-        if empty_kv_indptr is not None and _use_flydsl_native_fp8_decode(
-            q_packed_in,
-            query_group=query_group,
-            kv_kind=kv_kind,
-        ):
-            from atom.model_ops.v4_kernels.paged_decode_fp8_flydsl import (
-                sparse_attn_v4_paged_decode_fp8_flydsl_graphsafe,
-            )
-
-            return sparse_attn_v4_paged_decode_fp8_flydsl_graphsafe(
-                q_packed_in,
-                q_rope_in,
-                unified_kv,
-                unified_kv_rope,
-                kv_indices,
-                kv_indptr,
-                empty_kv_indptr,
-                attn_sink,
-                softmax_scale,
-            )
         if _use_triton_native_fp8_decode(
             q_packed_in,
             query_group=query_group,

@@ -24,9 +24,7 @@ def _dispatch(
     use_triton: bool = False,
 ):
     monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1" if use_triton else "0")
-    monkeypatch.setattr(
-        paged_decode.envs, "ATOM_USE_V4_PREFILL_ASM_FOR_DECODE", enabled
-    )
+    monkeypatch.setenv("ATOM_USE_V4_PREFILL_ASM_FOR_DECODE", "1" if enabled else "0")
     monkeypatch.setattr(paged_decode, "get_gfx", lambda: gfx)
     monkeypatch.setattr(
         paged_decode,

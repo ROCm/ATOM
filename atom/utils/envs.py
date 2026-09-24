@@ -501,18 +501,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FORCE_V4_PREFILL_OPUS": lambda: (
         os.getenv("ATOM_FORCE_V4_PREFILL_OPUS", "0") == "1"
     ),
-    # Experimental gfx950 Triton implementation of DeepSeek-V4 native 2-buffer
-    # FP8 sparse prefill.  Kept opt-in until the long-context matrix is at least
-    # parity with AITER OPUS.  ATOM_USE_TRITON_ATTN remains the master switch.
-    "ATOM_V4_TRITON_FP8_PREFILL": lambda: (
-        os.getenv("ATOM_V4_TRITON_FP8_PREFILL", "0") == "1"
-    ),
-    # Qualified gfx950 H=128 FlyDSL kernels. Decode currently covers the HCA
-    # B6/q7 graph shape; prefill covers sentinel-free max-Q <= 127 and
-    # max-K < 4096. Larger ranges stay on AITER OPUS.
-    "ATOM_V4_FLYDSL_FP8_DECODE": lambda: (
-        os.getenv("ATOM_V4_FLYDSL_FP8_DECODE", "0") == "1"
-    ),
+    # Qualified gfx950 H=128 FlyDSL prefill kernel for sentinel-free
+    # max-Q <= 127 and max-K < 4096. Larger ranges stay on AITER OPUS.
     "ATOM_V4_FLYDSL_FP8_PREFILL": lambda: (
         os.getenv("ATOM_V4_FLYDSL_FP8_PREFILL", "0") == "1"
     ),

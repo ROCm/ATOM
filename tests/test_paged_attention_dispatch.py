@@ -397,7 +397,7 @@ def _call_v4_native_fp8_prefill(
 
 class TestV4NativeFp8PrefillRouting:
     def _patch_backends(self, monkeypatch, arch="gfx950"):
-        from atom.model_ops.v4_kernels import paged_prefill, paged_prefill_fp8_triton
+        from atom.model_ops.v4_kernels import paged_prefill
 
         monkeypatch.setattr(paged_prefill, "get_gfx_runtime", lambda: arch)
         monkeypatch.setattr(paged_prefill, "_HAS_PREFILL_ASM", False)
@@ -405,11 +405,6 @@ class TestV4NativeFp8PrefillRouting:
             paged_prefill,
             "pa_sparse_prefill_fp8_opus",
             lambda *args, **kwargs: "opus",
-        )
-        monkeypatch.setattr(
-            paged_prefill_fp8_triton,
-            "sparse_attn_v4_paged_prefill_fp8_triton",
-            lambda *args, **kwargs: "triton",
         )
         monkeypatch.setitem(
             sys.modules,
@@ -426,7 +421,6 @@ class TestV4NativeFp8PrefillRouting:
         paged_prefill = self._patch_backends(monkeypatch)
         monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
         monkeypatch.setenv("ATOM_V4_FLYDSL_FP8_PREFILL", "1")
-        monkeypatch.setenv("ATOM_V4_TRITON_FP8_PREFILL", "1")
         monkeypatch.delenv("ATOM_FORCE_V4_PREFILL_OPUS", raising=False)
         assert (
             _call_v4_native_fp8_prefill(
@@ -449,7 +443,6 @@ class TestV4NativeFp8PrefillRouting:
         paged_prefill = self._patch_backends(monkeypatch)
         monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
         monkeypatch.setenv("ATOM_V4_FLYDSL_FP8_PREFILL", "1")
-        monkeypatch.setenv("ATOM_V4_TRITON_FP8_PREFILL", "1")
         monkeypatch.delenv("ATOM_FORCE_V4_PREFILL_OPUS", raising=False)
         assert (
             _call_v4_native_fp8_prefill(
@@ -466,7 +459,6 @@ class TestV4NativeFp8PrefillRouting:
         paged_prefill = self._patch_backends(monkeypatch)
         monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
         monkeypatch.setenv("ATOM_V4_FLYDSL_FP8_PREFILL", "1")
-        monkeypatch.setenv("ATOM_V4_TRITON_FP8_PREFILL", "1")
         monkeypatch.delenv("ATOM_FORCE_V4_PREFILL_OPUS", raising=False)
         assert (
             _call_v4_native_fp8_prefill(
@@ -482,7 +474,6 @@ class TestV4NativeFp8PrefillRouting:
         paged_prefill = self._patch_backends(monkeypatch)
         monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
         monkeypatch.setenv("ATOM_V4_FLYDSL_FP8_PREFILL", "1")
-        monkeypatch.delenv("ATOM_V4_TRITON_FP8_PREFILL", raising=False)
         monkeypatch.delenv("ATOM_FORCE_V4_PREFILL_OPUS", raising=False)
         assert (
             _call_v4_native_fp8_prefill(
@@ -493,118 +484,8 @@ class TestV4NativeFp8PrefillRouting:
             == "opus"
         )
 
-    def test_explicit_candidate_routes_gfx950_fp8_prefill_to_triton(self, monkeypatch):
-        paged_prefill = self._patch_backends(monkeypatch)
-        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
-        monkeypatch.setenv("ATOM_V4_TRITON_FP8_PREFILL", "1")
-        monkeypatch.delenv("ATOM_FORCE_V4_PREFILL_OPUS", raising=False)
-        assert _call_v4_native_fp8_prefill(paged_prefill) == "triton"
-
     @pytest.mark.parametrize(
-        "prefix_has_sentinel,expected_hot_loop",
-        [(False, True), (True, False)],
-    )
-    def test_large_head_candidate_uses_low_token_prefill_schedule(
-        self, monkeypatch, prefix_has_sentinel, expected_hot_loop
-    ):
-        paged_prefill = self._patch_backends(monkeypatch)
-        from atom.model_ops.v4_kernels import paged_prefill_fp8_triton
-
-        captured = {}
-
-        def candidate(*args, **kwargs):
-            captured.update(kwargs)
-            return "triton"
-
-        monkeypatch.setattr(
-            paged_prefill_fp8_triton,
-            "sparse_attn_v4_paged_prefill_fp8_triton",
-            candidate,
-        )
-        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
-        monkeypatch.setenv("ATOM_V4_TRITON_FP8_PREFILL", "1")
-        monkeypatch.delenv("ATOM_FORCE_V4_PREFILL_OPUS", raising=False)
-
-        assert (
-            _call_v4_native_fp8_prefill(
-                paged_prefill,
-                heads=128,
-                prefix_has_sentinel=prefix_has_sentinel,
-            )
-            == "triton"
-        )
-        assert captured["block_h"] == 64
-        assert captured["block_k"] == 32
-        assert captured["num_warps"] == 4
-        assert captured["waves_per_eu"] == 0
-        assert captured["tail_block_k"] == 32
-        assert captured["full_bf16_v"] is True
-        assert captured["no_sentinel_hot_loop"] is expected_hot_loop
-        assert captured["compiled_launch"] is True
-
-    def test_large_head_candidate_uses_large_token_prefill_schedule(self, monkeypatch):
-        paged_prefill = self._patch_backends(monkeypatch)
-        from atom.model_ops.v4_kernels import paged_prefill_fp8_triton
-
-        captured = {}
-
-        def candidate(*args, **kwargs):
-            captured.update(kwargs)
-            return "triton"
-
-        monkeypatch.setattr(
-            paged_prefill_fp8_triton,
-            "sparse_attn_v4_paged_prefill_fp8_triton",
-            candidate,
-        )
-        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
-        monkeypatch.setenv("ATOM_V4_TRITON_FP8_PREFILL", "1")
-        monkeypatch.delenv("ATOM_FORCE_V4_PREFILL_OPUS", raising=False)
-
-        assert (
-            _call_v4_native_fp8_prefill(paged_prefill, heads=128, tokens=256)
-            == "triton"
-        )
-        assert captured["block_h"] == 32
-        assert captured["block_k"] == 32
-        assert captured["num_warps"] == 2
-        assert captured["num_stages"] == 3
-        assert captured["extend_num_stages"] is None
-        assert captured["waves_per_eu"] == 0
-        assert captured["tail_block_k"] == 32
-        assert captured["full_bf16_v"] is True
-        assert captured["head_first_grid"] is False
-        assert captured["grid_group_tokens"] == 8
-        assert captured["compiled_launch"] is True
-
-    def test_very_large_token_candidate_uses_shallow_extend_pipeline(self, monkeypatch):
-        paged_prefill = self._patch_backends(monkeypatch)
-        from atom.model_ops.v4_kernels import paged_prefill_fp8_triton
-
-        captured = {}
-
-        def candidate(*args, **kwargs):
-            captured.update(kwargs)
-            return "triton"
-
-        monkeypatch.setattr(
-            paged_prefill_fp8_triton,
-            "sparse_attn_v4_paged_prefill_fp8_triton",
-            candidate,
-        )
-        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
-        monkeypatch.setenv("ATOM_V4_TRITON_FP8_PREFILL", "1")
-        monkeypatch.delenv("ATOM_FORCE_V4_PREFILL_OPUS", raising=False)
-
-        assert (
-            _call_v4_native_fp8_prefill(paged_prefill, heads=128, tokens=1024)
-            == "triton"
-        )
-        assert captured["num_stages"] == 3
-        assert captured["extend_num_stages"] == 1
-
-    @pytest.mark.parametrize(
-        "master,candidate,force_opus,arch",
+        "master,flydsl,force_opus,arch",
         [
             ("1", "0", "0", "gfx950"),
             ("0", "1", "0", "gfx950"),
@@ -613,11 +494,11 @@ class TestV4NativeFp8PrefillRouting:
         ],
     )
     def test_unqualified_fp8_prefill_keeps_aiter(
-        self, monkeypatch, master, candidate, force_opus, arch
+        self, monkeypatch, master, flydsl, force_opus, arch
     ):
         paged_prefill = self._patch_backends(monkeypatch, arch=arch)
         monkeypatch.setenv("ATOM_USE_TRITON_ATTN", master)
-        monkeypatch.setenv("ATOM_V4_TRITON_FP8_PREFILL", candidate)
+        monkeypatch.setenv("ATOM_V4_FLYDSL_FP8_PREFILL", flydsl)
         monkeypatch.setenv("ATOM_FORCE_V4_PREFILL_OPUS", force_opus)
         assert _call_v4_native_fp8_prefill(paged_prefill) == "opus"
 
@@ -764,80 +645,6 @@ class TestV4NativeFp8Routing:
             kv_kind="hca",
         )
         assert result == "triton"
-
-    def test_opt_in_b6_hca_routes_to_graphsafe_flydsl(self, monkeypatch):
-        from atom.model_ops.v4_kernels import paged_decode
-
-        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
-        monkeypatch.setenv("ATOM_V4_FLYDSL_FP8_DECODE", "1")
-        monkeypatch.setenv("ATOM_V4_TRITON_HYBRID_DECODE", "1")
-        monkeypatch.setattr(paged_decode, "_device_arch", lambda _index: "gfx950")
-        monkeypatch.setitem(
-            sys.modules,
-            "atom.model_ops.v4_kernels.paged_decode_fp8_flydsl",
-            SimpleNamespace(
-                sparse_attn_v4_paged_decode_fp8_flydsl_graphsafe=(
-                    lambda *args, **kwargs: "flydsl"
-                )
-            ),
-        )
-        monkeypatch.setattr(
-            paged_decode,
-            "_sparse_attn_v4_paged_decode_asm",
-            lambda *args, **kwargs: "aiter",
-        )
-        marker = object()
-        q_packed = SimpleNamespace(
-            shape=(6 * 7, 128, 512), device=SimpleNamespace(index=0)
-        )
-        result = paged_decode.sparse_attn_v4_paged_decode(
-            None,
-            marker,
-            marker,
-            marker,
-            marker,
-            1.0,
-            unified_kv_rope=marker,
-            q_packed_in=q_packed,
-            q_rope_in=marker,
-            qo_indptr=marker,
-            empty_kv_indptr=marker,
-            query_group=7,
-            kv_kind="hca",
-        )
-        assert result == "flydsl"
-
-    def test_flydsl_decode_master_zero_keeps_aiter(self, monkeypatch):
-        from atom.model_ops.v4_kernels import paged_decode
-
-        monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "0")
-        monkeypatch.setenv("ATOM_V4_FLYDSL_FP8_DECODE", "1")
-        monkeypatch.setattr(paged_decode, "_device_arch", lambda _index: "gfx950")
-        monkeypatch.setattr(
-            paged_decode,
-            "_sparse_attn_v4_paged_decode_asm",
-            lambda *args, **kwargs: "aiter",
-        )
-        marker = object()
-        q_packed = SimpleNamespace(
-            shape=(6 * 7, 128, 512), device=SimpleNamespace(index=0)
-        )
-        result = paged_decode.sparse_attn_v4_paged_decode(
-            None,
-            marker,
-            marker,
-            marker,
-            marker,
-            1.0,
-            unified_kv_rope=marker,
-            q_packed_in=q_packed,
-            q_rope_in=marker,
-            qo_indptr=marker,
-            empty_kv_indptr=marker,
-            query_group=7,
-            kv_kind="hca",
-        )
-        assert result == "aiter"
 
     def test_default_hybrid_does_not_route_other_architectures_to_aiter(
         self, monkeypatch

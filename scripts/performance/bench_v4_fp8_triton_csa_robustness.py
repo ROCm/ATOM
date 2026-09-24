@@ -14,9 +14,6 @@ from pathlib import Path
 import torch
 
 from atom.model_ops.v4_kernels.paged_decode import _sparse_attn_v4_paged_decode_asm
-from atom.model_ops.v4_kernels.paged_decode_fp8_flydsl import (
-    sparse_attn_v4_paged_decode_fp8_flydsl_split1,
-)
 from atom.model_ops.v4_kernels.paged_decode_fp8_triton import (
     sparse_attn_v4_paged_decode_fp8_triton,
     sparse_attn_v4_paged_decode_fp8_triton_auto,
@@ -83,7 +80,7 @@ def _stats(values: list[float]) -> dict[str, float]:
 
 
 def _benchmark_case(
-    *, batch: int, kv_len: int, seed: int, iterations: int, include_flydsl: bool
+    *, batch: int, kv_len: int, seed: int, iterations: int
 ) -> dict[str, object]:
     tokens = batch * VERIFY_WIDTH
     pages = batch * kv_len
@@ -101,11 +98,6 @@ def _benchmark_case(
     kv_packed, kv_rope = quantize_bf16_to_v4_2buff_triton(kv.view(pages, 1, HEAD_DIM))
     kv_packed = kv_packed.view(pages, HEAD_DIM)
     kv_rope = kv_rope.view(pages, ROPE_HEAD_DIM)
-    empty_indices = indices[:0]
-    empty_indptr = torch.zeros_like(indptr)
-    flydsl_out = torch.empty(
-        (tokens, LOCAL_HEADS, HEAD_DIM), dtype=torch.bfloat16, device=device
-    )
     flush = torch.zeros(64 * 1024 * 1024 // 4, dtype=torch.float32, device=device)
 
     def aiter() -> torch.Tensor:
@@ -169,23 +161,6 @@ def _benchmark_case(
             gfx950_native_v=True,
         ),
     }
-    if include_flydsl:
-        eager["flydsl_split1"] = lambda: (
-            sparse_attn_v4_paged_decode_fp8_flydsl_split1(
-                q_packed,
-                q_rope,
-                kv_packed,
-                kv_rope,
-                indices,
-                indptr,
-                empty_indices,
-                empty_indptr,
-                sink,
-                SOFTMAX_SCALE,
-                out=flydsl_out,
-                assume_full_tiles=kv_len % 32 == 0,
-            )
-        )
     reference = eager["aiter"]().float()
     correctness = {}
     for name, runner in eager.items():
@@ -219,12 +194,6 @@ def _benchmark_case(
         results[name]["speedup_vs_aiter_pct"] = (
             aiter_p50 / results[name]["p50_us"] - 1.0
         ) * 100.0
-    flydsl_text = ""
-    if include_flydsl:
-        flydsl_text = (
-            f" flydsl={results['flydsl_split1']['p50_us']:7.3f}us "
-            f"({results['flydsl_split1']['speedup_vs_aiter_pct']:+6.2f}%)"
-        )
     print(
         f"seed={seed} K={kv_len:4d} B={batch:2d} split={splits} "
         f"AITER={aiter_p50:7.3f}us "
@@ -233,8 +202,7 @@ def _benchmark_case(
         f"attention={results['triton_attention']['p50_us']:7.3f}us "
         f"({results['triton_attention']['speedup_vs_aiter_pct']:+6.2f}%) "
         f"auto={results['triton_auto']['p50_us']:7.3f}us "
-        f"({results['triton_auto']['speedup_vs_aiter_pct']:+6.2f}%)"
-        f"{flydsl_text}",
+        f"({results['triton_auto']['speedup_vs_aiter_pct']:+6.2f}%)",
         flush=True,
     )
     return {
@@ -254,11 +222,6 @@ def main() -> None:
     parser.add_argument("--kv-lens", type=_parse_ints, default=[384, 640, 1152])
     parser.add_argument("--seeds", type=_parse_ints, default=[20260917, 20260918])
     parser.add_argument("--iterations", type=int, default=100)
-    parser.add_argument(
-        "--include-flydsl",
-        action="store_true",
-        help="also benchmark the H=128 FlyDSL split1 decode candidate",
-    )
     parser.add_argument("--json", type=Path, required=True)
     args = parser.parse_args()
     if args.iterations % 2:
@@ -274,7 +237,6 @@ def main() -> None:
                         kv_len=kv_len,
                         seed=seed,
                         iterations=args.iterations,
-                        include_flydsl=args.include_flydsl,
                     )
                 )
                 gc.collect()
@@ -289,14 +251,6 @@ def main() -> None:
         < case["results"]["triton_none"]["p50_us"]
         for case in cases
     )
-    flydsl_wins = (
-        sum(
-            case["results"]["flydsl_split1"]["speedup_vs_aiter_pct"] > 0
-            for case in cases
-        )
-        if args.include_flydsl
-        else None
-    )
     payload = {
         "iterations": args.iterations,
         "cases": cases,
@@ -304,19 +258,13 @@ def main() -> None:
             "case_count": len(cases),
             "triton_attention_wins_vs_aiter": wins,
             "attention_hint_wins_vs_none": hint_wins,
-            "flydsl_split1_wins_vs_aiter": flydsl_wins,
         },
     }
     args.json.parent.mkdir(parents=True, exist_ok=True)
     args.json.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     print(
         f"summary: Triton attention beat AITER in {wins}/{len(cases)} cases; "
-        f"hint beat default Triton in {hint_wins}/{len(cases)} cases"
-        + (
-            f"; FlyDSL split1 beat AITER in {flydsl_wins}/{len(cases)} cases"
-            if args.include_flydsl
-            else ""
-        ),
+        f"hint beat default Triton in {hint_wins}/{len(cases)} cases",
         flush=True,
     )
 
