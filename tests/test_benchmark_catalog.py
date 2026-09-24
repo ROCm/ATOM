@@ -418,7 +418,7 @@ def test_agentic_gpu_workflow_only_runs_manually_or_on_schedule():
     )
 
 
-def test_agentic_nightly_matches_inferencex_3387_recipe():
+def test_agentic_nightly_grid_and_shared_capture_recipe():
     import json
     import shlex
 
@@ -439,7 +439,7 @@ def test_agentic_nightly_matches_inferencex_3387_recipe():
         for flag, value in {
             "--spec-decode-acceptance-length": "3.51",
             "--num-speculative-tokens": "5",
-            "--max-num-seqs": "128",
+            "--gpu-memory-utilization": "0.95",
             "--max-num-batched-tokens": "16384",
             "--attn-prefill-chunk-size": "16384",
             "--state-checkpoint-interval-tokens": "8192",
@@ -449,33 +449,35 @@ def test_agentic_nightly_matches_inferencex_3387_recipe():
         }.items():
             assert args[args.index(flag) + 1] == value
         assert "--enforce-eager" not in args
+        assert "--max-num-seqs" not in args
+        assert captures == list(range(1, 33)) + [48, 64, 96, 128, 160, 192, 224, 256]
         for conc in json.loads(config["concurrency"]):
             assert (tp, conc) not in points
             points.add((tp, conc))
-            assert captures == (
-                list(range(1, 33)) + [48, 64, 128]
-                if conc == 32
-                else [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 48, 64, 128]
-            )
-    assert points == {(2, c) for c in [1, 2, 8, 16, 32, 64]} | {
-        (4, c) for c in [2, 8, 16, 32, 64]
+    assert points == {(2, c) for c in [1, 2, 4, 8, 16, 32, 64, 128]} | {
+        (4, c) for c in [1, 4, 8]
     }
 
 
-def test_agentic_nightly_subset_keeps_capture_recipe_without_duplicate_points():
+def test_agentic_nightly_subset_keeps_each_tp_grid():
     import json
 
     from build_agentic_benchmark_matrix import build_configs
 
     configs = build_configs(inputs={"profile": "nightly", "concurrency": "32"})
-    assert len(configs) == 2
+    assert len(configs) == 1
+    assert "-tp 2" in configs[0]["server_args"]
     assert all(json.loads(config["concurrency"]) == [32] for config in configs)
+    configs = build_configs(inputs={"profile": "nightly", "concurrency": "1,4,8"})
+    assert len(configs) == 2
+    assert all(json.loads(config["concurrency"]) == [1, 4, 8] for config in configs)
     with pytest.raises(ValueError, match="subset"):
-        build_configs(inputs={"profile": "nightly", "concurrency": "4"})
+        build_configs(inputs={"profile": "nightly", "concurrency": "256"})
 
 
 def test_agentic_manual_default_stays_a_two_point_test():
     import json
+    import shlex
 
     from build_agentic_benchmark_matrix import build_configs
 
@@ -485,6 +487,66 @@ def test_agentic_manual_default_stays_a_two_point_test():
     assert "--cudagraph-mode FULL" in config["server_args"]
     assert "AIPERF_BENCHMARK_DURATION=900" in config["env_vars"]
     assert config["image"] == "rocm/atom-dev:latest"
+    args = shlex.split(config["server_args"])
+    assert args[args.index("--gpu-memory-utilization") + 1] == "0.95"
+    assert "--max-num-seqs" not in args
+    assert json.loads(args[args.index("--cudagraph-capture-sizes") + 1]) == (
+        list(range(1, 33)) + [48, 64, 96, 128, 160, 192, 224, 256]
+    )
+
+
+@pytest.mark.parametrize("profile", ["test", "nightly"])
+def test_agentic_matrix_has_no_random_dimensions(profile):
+    from build_agentic_benchmark_matrix import build_configs
+
+    unused = {"scenario", "scenarios", "isl", "osl", "ratio", "ratio_str", "bench_args"}
+    for config in build_configs(inputs={"profile": profile}):
+        assert not unused.intersection(config)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("scenarios", []), ("bench_args", "--ignored"), ("conc_max", 1)],
+)
+def test_agentic_rejects_unused_variant_fields(tmp_path, field, value):
+    import json
+
+    from build_agentic_benchmark_matrix import CATALOG, build_configs
+
+    data = json.loads((REPO / CATALOG).read_text())
+    data["models"][0]["variants"][0][field] = value
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="Unsupported variant fields"):
+        build_configs(path=path)
+
+
+@pytest.mark.parametrize("values", [[], [True], [0, 4], [4, 4], [1, 9999]])
+def test_agentic_rejects_invalid_catalog_concurrency(tmp_path, values):
+    import json
+
+    from build_agentic_benchmark_matrix import CATALOG, build_configs
+
+    data = json.loads((REPO / CATALOG).read_text())
+    data["models"][0]["variants"][0]["concurrency"] = values
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="Concurrency"):
+        build_configs(path=path)
+
+
+def test_agentic_rejects_colliding_artifact_names(tmp_path):
+    import json
+
+    from build_agentic_benchmark_matrix import CATALOG, build_configs
+
+    data = json.loads((REPO / CATALOG).read_text())
+    variant = data["models"][0]["variants"][0]
+    data["models"][0]["variants"].append({**variant, "extra_args": "-tp 2"})
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="Duplicate agentic artifact prefix"):
+        build_configs(path=path)
 
 
 @pytest.mark.parametrize("profile", ["test", "nightly"])

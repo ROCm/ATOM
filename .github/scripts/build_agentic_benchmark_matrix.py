@@ -14,63 +14,113 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from build_benchmark_matrix import _emit
-from catalog import build_cell_configs, load_variants
+from catalog import build_args, build_env_vars
 
 CATALOG = ".github/benchmark/models_agentic.json"
 NIGHTLY_CATALOG = ".github/benchmark/models_agentic_nightly.json"
 PROFILE_CATALOGS = {"test": CATALOG, "nightly": NIGHTLY_CATALOG}
 
 
+def _check_fields(record, allowed, context):
+    if not isinstance(record, dict):
+        raise TypeError(f"{context} must be an object")
+    unknown = record.keys() - allowed
+    if unknown:
+        raise ValueError(f"Unsupported {context} fields: {sorted(unknown)}")
+
+
+def _concurrency(values):
+    if (
+        not isinstance(values, list)
+        or not 1 <= len(values) <= 256
+        or any(type(value) is not int or not 1 <= value <= 256 for value in values)
+        or len(set(values)) != len(values)
+    ):
+        raise ValueError("Concurrency must contain unique integers between 1 and 256")
+    return sorted(values)
+
+
+def _load_configs(path):
+    """Load agentic variants directly, without random-workload dimensions."""
+    catalog = json.loads(Path(path).read_text())
+    _check_fields(catalog, {"models", "reference"}, "catalog")
+    configs = []
+    identities = set()
+    for model in catalog["models"]:
+        _check_fields(
+            model,
+            {"display", "path", "prefix", "runner", "env_vars", "config", "variants"},
+            "model",
+        )
+        _check_fields(
+            model.get("config", {}),
+            {"tp", "kv_cache_dtype", "trust_remote_code", "extra_args"},
+            "server config",
+        )
+        for variant in model["variants"]:
+            _check_fields(
+                variant,
+                {"label", "suffix", "extra_args", "env_vars", "concurrency"},
+                "variant",
+            )
+            identity = model["prefix"] + variant["suffix"]
+            if identity in identities:
+                raise ValueError(f"Duplicate agentic artifact prefix: {identity}")
+            identities.add(identity)
+            configs.append(
+                {
+                    "display": f"{model['display']} {variant['label']}",
+                    "prefix": model["prefix"],
+                    "suffix": variant["suffix"],
+                    "model_path": model["path"],
+                    "server_args": build_args(model.get("config", {}), variant),
+                    "bench_kind": "aiperf_agentic",
+                    "env_vars": build_env_vars(model, variant),
+                    "runner": model["runner"],
+                    "concurrency": json.dumps(_concurrency(variant["concurrency"])),
+                }
+            )
+    return configs
+
+
 def build_configs(path=None, inputs=None):
-    """Apply manual overrides while retaining catalog concurrency bands."""
+    """Apply test overrides or select a subset of the nightly concurrency grid."""
     inputs = inputs or {}
     profile = inputs.get("profile") or "test"
     if profile not in PROFILE_CATALOGS:
         raise ValueError(f"Unknown agentic profile: {profile}")
     path = path or PROFILE_CATALOGS[profile]
-    known = {variant["prefix"] for variant in load_variants(path)}
+    configs = _load_configs(path)
+    known = {config["prefix"] for config in configs}
     selected = {
         name.strip() for name in inputs.get("models", "").split(",") if name.strip()
     }
     if selected - known:
         raise ValueError(f"Unknown agentic models: {sorted(selected - known)}")
+    configs = [c for c in configs if not selected or c["prefix"] in selected]
 
-    param_lists = None
-    values = None
     if inputs.get("concurrency", "").strip():
-        values = [int(value.strip()) for value in inputs["concurrency"].split(",")]
-        if (
-            not all(value > 0 for value in values)
-            or len(set(values)) != len(values)
-            or len(values) > 256
-        ):
-            raise ValueError("Concurrency must contain 1–256 unique positive integers")
-        # ISL/OSL/ratio are naming placeholders for the shared template. Agentic
-        # metrics use the actual trace tokens and store these dimensions as null.
-        if profile == "test":
-            param_lists = ";".join(f"0,0,{value},1" for value in values)
-
-    configs = build_cell_configs(
-        path, param_lists=param_lists, model_filter=selected or None
-    )
-    if profile == "nightly" and values is not None:
-        # Keep the catalog's per-point capture recipe. A blind scenario override
-        # would duplicate c32 in both sparse and dense capture variants.
-        available = {c for config in configs for c in json.loads(config["concurrency"])}
-        if set(values) - available:
-            raise ValueError("Nightly concurrency must be a subset of its catalog grid")
+        values = _concurrency(
+            [int(value.strip()) for value in inputs["concurrency"].split(",")]
+        )
+        if profile == "nightly":
+            available = {
+                c for config in configs for c in json.loads(config["concurrency"])
+            }
+            if set(values) - available:
+                raise ValueError(
+                    "Nightly concurrency must be a subset of its catalog grid"
+                )
         for config in configs:
             config["concurrency"] = json.dumps(
                 [c for c in json.loads(config["concurrency"]) if c in values]
+                if profile == "nightly"
+                else values
             )
         configs = [config for config in configs if json.loads(config["concurrency"])]
     if not configs or len(configs) > 256:
         raise ValueError("The agentic catalog must produce 1–256 matrix configurations")
     for config in configs:
-        if config["bench_kind"] != "aiperf_agentic":
-            raise ValueError(
-                "The agentic catalog must only contain aiperf_agentic cells"
-            )
         env = dict(
             line.split("=", 1) for line in config["env_vars"].splitlines() if line
         )
@@ -84,8 +134,6 @@ def build_configs(path=None, inputs=None):
         # reusable workflow's 180-minute benchmark step timeout.
         if not 900 <= seconds <= 3600:
             raise ValueError("Duration must be between 900 and 3600 seconds")
-        if len(json.loads(config["concurrency"])) > 256:
-            raise ValueError("A concurrency matrix cannot exceed 256 cells")
         env["AIPERF_BENCHMARK_DURATION"] = str(seconds)
         config["env_vars"] = "\n".join(f"{key}={value}" for key, value in env.items())
         config["image"] = inputs.get("image") or "rocm/atom-dev:latest"
@@ -226,7 +274,7 @@ def main():
         count = sum(len(json.loads(config["concurrency"])) for config in configs)
         print(f"Event={event}: {count} agentic cells", file=sys.stderr)
         return 0
-    except (ValueError, TypeError) as exc:
+    except (ValueError, TypeError, KeyError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 

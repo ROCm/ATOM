@@ -10,9 +10,14 @@ two catalogs: [`models_agentic.json`](./models_agentic.json) for the default
 manual test, and [`models_agentic_nightly.json`](./models_agentic_nightly.json)
 for the daily 08:17 UTC run. Both use `rocm/atom-dev:latest` and checked-out branch
 code. The manual default remains DeepSeek V4.1 Flash + DSpark5, TP4 with FULL
-graphs, concurrency 2/4 and 900 seconds per point. Nightly follows InferenceX
-PR #3387: TP2 c=1/2/8/16/32/64 and TP4 c=2/8/16/32/64, 3600 seconds per point,
-5 warmup requests per lane and fixed AL 3.51. Select **ATOM Agentic Benchmark**
+graphs, concurrency 2/4 and 900 seconds per point. Nightly is based on InferenceX
+PR #3387 with a custom grid: TP2 c=1/2/4/8/16/32/64/128 and TP4 c=1/4/8,
+3600 seconds per point, 5 warmup requests per lane and fixed AL 3.51.
+Both profiles set GPU memory utilization to 0.95, omit the max-num-seqs override,
+and use capture sizes 1–32 plus 48/64/96/128/160/192/224/256 for every point.
+Agentic variants declare `concurrency` directly; random `scenarios`, ISL/OSL,
+length ratios and concurrency bands are not part of these catalogs.
+Select **ATOM Agentic Benchmark**
 for these runs; **ATOM Benchmark** keeps the random-workload model checkboxes
 and dashboard settings in its own form. The temporary mixed entry has been
 removed. The independent workflow must reach the default branch before GitHub
@@ -174,7 +179,9 @@ pip install jsonschema
 python .github/scripts/validate_catalog.py
 ```
 
-## Data contracts (keep stable)
+## Data contracts
+
+The following random-workload contracts keep the existing dashboard compatible:
 
 - **Result file**: `benchmark_serving` writes `<result_filename>.json` where
   `result_filename = "{prefix}{suffix}-{isl}-{osl}-{conc}-{ratio}"`; uploaded as
@@ -190,6 +197,12 @@ python .github/scripts/validate_catalog.py
   matrixes over configs; `benchmark-tmpl.yml` matrixes over each config's
   `concurrency`. Both stay < GitHub's 256-jobs-per-matrix limit. Adding a model
   or scenario needs no workflow edit — the caller matrix is fully dynamic.
+
+Agentic uses `build_agentic_benchmark_matrix.py` to build one config per variant
+with a direct `concurrency` list. It shares the server-argument/environment
+composition helpers and execution template, but does not pass random dimensions
+or unused `bench_args`. Agentic result names are `<prefix><suffix>-c<concurrency>`;
+full and summary bundles continue to be discovered through their manifests.
 
 ## How to …
 

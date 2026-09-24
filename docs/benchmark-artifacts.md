@@ -61,23 +61,34 @@ additional warmup requests per lane. The replay dataset is
 is enabled. The initial FULL-graph CI run completed both replays; its bundles
 exposed missing checkout and dataset identities, now covered by capture regressions.
 
-The scheduled **nightly** profile (`models_agentic_nightly.json`) follows
+The scheduled **nightly** profile (`models_agentic_nightly.json`) is based on
 [InferenceX PR #3387](https://github.com/SemiAnalysisAI/InferenceX/pull/3387) at
-`89384690e5ebafd5407e965ec95b648f869524bb`:
+`89384690e5ebafd5407e965ec95b648f869524bb`, with a custom concurrency grid,
+memory utilization and unified graph capture sizes:
 
 | Profile | TP | Concurrency | Seconds per point | Warmup per lane |
 | --- | --- | --- | --- | --- |
 | test (manual default) | 4 | 2, 4 | 900 | 10 |
-| nightly | 2 | 1, 2, 8, 16, 32, 64 | 3600 | 5 |
-| nightly | 4 | 2, 8, 16, 32, 64 | 3600 | 5 |
+| nightly | 2 | 1, 2, 4, 8, 16, 32, 64, 128 | 3600 | 5 |
+| nightly | 4 | 1, 4, 8 | 3600 | 5 |
 
 Nightly uses FP4 weight metadata, BF16 KV, FP8 index cache, five-token DSpark
-with fixed AL 3.51, max-num-seqs 128, 16K batching/prefill chunks, prefix caching
+with fixed AL 3.51, 16K batching/prefill chunks, prefix caching
 with block size 16, 8K state checkpoints, level 3, FULL graphs and `dsml_v41`.
-c32 captures sizes 1–32 plus 48/64/128; other points use the upstream sparse
-list. There is no EP or KV offload. Fixed acceptance is marked synthetic in the
+Both test and nightly set `--gpu-memory-utilization 0.95`, leave `--max-num-seqs`
+unset (the checked-out engine supplies its default), and capture sizes 1–32 plus
+48/64/96/128/160/192/224/256 for every point. There is no EP or KV offload.
+Fixed acceptance is marked synthetic in the
 bundle; it is not accuracy evidence, and the producer's existing validity policy
 keeps it separate from real-acceptance performance.
+
+Agentic catalogs declare a `concurrency` list on each model variant. They do not
+use random `scenarios`, ISL/OSL, length ratios or concurrency bands. The builder
+rejects unsupported fields and duplicate artifact prefixes before GPU allocation.
+`AIPERF_SCENARIO` is distinct: it selects the actual AIPerf trace-replay scenario.
+Agentic artifact names use `<prefix><suffix>-c<concurrency>`; random artifact
+names retain their input/output-length and ratio dimensions. Old bundles remain
+readable through their manifests.
 
 Both profiles use `rocm/atom-dev:latest` unless manually overridden. The image
 supplies dependencies; ATOM executes from the checked-out repository. By default,
@@ -90,7 +101,7 @@ replays. Runtime image identity is recorded in each bundle.
 Manual inputs select a profile and model prefixes, override profiling duration
 (900–3600 seconds), and optionally select image, runner or code refs. Empty
 model/concurrency/duration inputs use the profile. Nightly concurrency overrides
-select a subset of its existing points, preserving the c32 capture recipe.
+select a subset of each TP variant's existing points.
 Use a ref containing this workflow and producer.
 The scheduled workflow becomes active when it is on the default branch; it does
 not run from a PR. Each run retains its own artifacts without updating gh-pages.
@@ -107,7 +118,7 @@ register that entry. Completed validation runs remain available in their history
 For the standard manual test, select the branch under **Use workflow from**,
 leave **Preset** at `test` and click **Run workflow**. Model, concurrency and
 duration overrides can stay empty. Both presets use DSpark5 and FULL graphs.
-Use `nightly` to run the full InferenceX #3387 grid, or enable **Preview
+Use `nightly` to run the configured 11-point grid, or enable **Preview
 configuration only** to inspect it without allocating GPUs. Image, runner,
 code overrides and profiler settings are labeled **Advanced**; they do not
 need changing for the default test. Jobs remain grouped by model configuration

@@ -1,6 +1,6 @@
-# Reusable benchmark template: runs ONE (model variant × scenario) config across
-# its concurrency list. The caller (atom-benchmark.yaml) matrixes over configs
-# and invokes this once per config; this workflow matrixes over `concurrency`.
+# Reusable benchmark template: runs ONE model config across its concurrency list.
+# The random and agentic callers matrix over configs
+# and invoke this once per config; this workflow matrixes over `concurrency`.
 # Two-level fan-out keeps both matrices under GitHub's 256-job-per-matrix limit
 # while every (config × conc) cell still runs as its own parallel job. Mirrors
 # the scenario-sharded reusable-workflow pattern in InferenceX run-sweep.
@@ -41,17 +41,21 @@ on:
         type: string
         required: true
       isl:
+        description: "Random workload input length; unused for agentic replay"
         type: string
-        required: true
+        default: ""
       osl:
+        description: "Random workload output length; unused for agentic replay"
         type: string
-        required: true
+        default: ""
       ratio:
+        description: "Random workload length ratio; unused for agentic replay"
         type: string
-        required: true
+        default: ""
       ratio_str:
+        description: "Random workload ratio label; unused for agentic replay"
         type: string
-        required: true
+        default: ""
       concurrency:
         description: "JSON array of concurrency values (second-level matrix)"
         type: string
@@ -104,7 +108,10 @@ jobs:
       OSL: ${{ inputs.osl }}
       CONC: ${{ matrix.conc }}
       RANDOM_RANGE_RATIO: ${{ inputs.ratio }}
-      RESULT_FILENAME: ${{ inputs.prefix }}${{ inputs.suffix }}-${{ inputs.isl }}-${{ inputs.osl }}-${{ matrix.conc }}-${{ inputs.ratio_str }}
+      RESULT_FILENAME: >-
+        ${{ inputs.bench_kind == 'aiperf_agentic'
+            && format('{0}{1}-c{2}', inputs.prefix, inputs.suffix, matrix.conc)
+            || format('{0}{1}-{2}-{3}-{4}-{5}', inputs.prefix, inputs.suffix, inputs.isl, inputs.osl, matrix.conc, inputs.ratio_str) }}
 
     steps:
       - name: Kill all Docker containers

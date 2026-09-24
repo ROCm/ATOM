@@ -116,13 +116,8 @@ jobs:
       model_path: ${{ matrix.config.model_path }}
       server_args: ${{ matrix.config.server_args }}
       bench_kind: ${{ matrix.config.bench_kind }}
-      bench_args: ${{ matrix.config.bench_args }}
       env_vars: ${{ matrix.config.env_vars }}
       runner: ${{ inputs.runner || matrix.config.runner }}
-      isl: ${{ matrix.config.isl }}
-      osl: ${{ matrix.config.osl }}
-      ratio: ${{ matrix.config.ratio }}
-      ratio_str: ${{ matrix.config.ratio_str }}
       concurrency: ${{ matrix.config.concurrency }}
       image: ${{ matrix.config.image }}
       extra_args: ${{ inputs.extra_args || '' }}

@@ -335,11 +335,7 @@ def build_cell_configs(
                 "osl": c["osl"],
                 "ratio": c["ratio"],
                 "ratio_str": _fmt_ratio(c["ratio"]),
-                "scenario": (
-                    "agentic"
-                    if c["bench_kind"] == "aiperf_agentic"
-                    else scenario_tag(c["isl"], c["osl"])
-                ),
+                "scenario": scenario_tag(c["isl"], c["osl"]),
                 "_conc": [],
             }
             configs[key] = cfg
