@@ -86,6 +86,7 @@ class EngineUtilityHandler:
         self._profiler_recorded = 0
         self._profiler_active = False
         self._profiler_reservation: str | None = None
+        self._profiler_last_error: str | None = None
 
     def process_queue(self, utility_queue, engine):
         """Drain *utility_queue* and execute each command.
@@ -290,6 +291,7 @@ class EngineUtilityHandler:
             self.scheduler.profile_active = True
         self._profiler_active = True
         self._profiler_recorded = 0
+        self._profiler_last_error = None
         logger.info(f"{self.label}: profiler started")
         return {"message": "Profiling started"}
 
@@ -407,6 +409,12 @@ class EngineUtilityHandler:
 
     def _handle_stop_profile(self, args: dict):
         result = self._stop_profiler_now()
+        if self._profiler_last_error is not None:
+            if isinstance(result, dict):
+                result = {**result, "error": self._profiler_last_error}
+            else:
+                result = {"error": self._profiler_last_error}
+            self._profiler_last_error = None
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "stop_profile", "result": result})
         )
@@ -420,7 +428,14 @@ class EngineUtilityHandler:
         if self._profiler_pending:
             self._profiler_pending -= 1
             if self._profiler_pending == 0:
-                self._start_profiler_now()
+                try:
+                    self._start_profiler_now()
+                except Exception as e:
+                    # Store the error and disable the profiler
+                    self._profiler_active = False
+                    self._profiler_recorded = 0
+                    self._profiler_last_error = f"profiler auto-start failed: {e}"
+                    logger.exception(f"{self.label}: profiler auto-start failed")
         elif self._profiler_active and self._effective_max_iters:
             self._profiler_recorded += 1
             if self._profiler_recorded >= self._effective_max_iters:

@@ -61,13 +61,19 @@ NOT_FORWARD = frozenset(
 
 
 class FakeRunnerMgr:
-    """Records the RPC names the handler sends, in order."""
+    """Records the RPC names the handler sends, in order.
 
-    def __init__(self):
+    `fail_on` is an RPC that raises, as a worker-side profiler failure does.
+    """
+
+    def __init__(self, fail_on=None):
         self.calls = []
+        self.fail_on = fail_on
 
     def call_func(self, func_name, *args, wait_out=False):
         self.calls.append(func_name)
+        if func_name == self.fail_on:
+            raise RuntimeError("worker said no")
         # Return what the real runners return: start_profiler answers with a
         # bare True, stop_profiler with the trace info.
         if func_name == "start_profiler":
@@ -75,8 +81,8 @@ class FakeRunnerMgr:
         return {"trace_dir": "/tmp/traces", "elapsed": 0.0}
 
 
-def make_handler(delay=0, max_iters=0, scheduler=None):
-    runner_mgr = FakeRunnerMgr()
+def make_handler(delay=0, max_iters=0, scheduler=None, fail_on=None):
+    runner_mgr = FakeRunnerMgr(fail_on)
     handler = EngineUtilityHandler(
         runner_mgr,
         queue.Queue(),
@@ -210,6 +216,28 @@ def test_windows_reset_between_requests():
     broadcast(one, "stop_profile")
     run_steps(handler, 10)
     assert mgr.calls == one_window * 2 + ["stop_profiler"]
+
+
+def test_a_failed_auto_start_leaves_the_engine_idle_and_says_so():
+    """The delay is spent by the time the start runs, so a raise there ends
+    the window with nobody to tell: the caller was answered when it armed.
+    """
+    handler, mgr = make_handler(delay=2, max_iters=5, fail_on="start_profiler")
+    one = [(handler, mgr)]
+
+    start_window(one)
+    run_steps(handler, 2)
+
+    assert mgr.calls == ["start_profiler"], "the failed start is the only RPC"
+    assert not handler._profiler_active and not handler._profiler_pending
+    assert "auto-start failed" in broadcast(one, "stop_profile")[0]["error"]
+
+    # Idle rather than wedged: the next request is accepted and records.
+    mgr.fail_on = None
+    assert "error" not in start_window(one)[0]
+    run_steps(handler, 2 + 5)
+    assert mgr.calls[-2:] == ["start_profiler", "stop_profiler"]
+    assert "error" not in broadcast(one, "stop_profile")[0], "a stale error"
 
 
 # ── Per-request window ────────────────────────────────────────────────────

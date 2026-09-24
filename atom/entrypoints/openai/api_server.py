@@ -2486,9 +2486,13 @@ async def stop_profile():
     """Stop profiling the engine."""
     try:
         traces = engine.stop_profile()
+        # An engine whose delay_iters failed to start reports it here.
+        errors = [t["error"] for t in traces if isinstance(t, dict) and "error" in t]
         return {
-            "status": "success",
-            "message": "Profiling stopped. Trace files generated.",
+            "status": "error" if errors else "success",
+            "message": (
+                errors[0] if errors else "Profiling stopped. Trace files generated."
+            ),
             "traces": traces,
         }
     except Exception as e:

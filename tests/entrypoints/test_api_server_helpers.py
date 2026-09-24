@@ -412,6 +412,39 @@ class TestStartProfile:
         assert client.post("/start_profile").status_code == 500
 
 
+class TestStopProfile:
+    """Where an engine reports the auto-start that failed after it armed."""
+
+    @staticmethod
+    def _client(monkeypatch, traces):
+        pytest.importorskip("httpx")
+        from fastapi.testclient import TestClient
+
+        monkeypatch.setattr(
+            api_server, "engine", SimpleNamespace(stop_profile=lambda: traces)
+        )
+        return TestClient(api_server.app)
+
+    def test_an_engine_error_is_reported_instead_of_a_trace(self, monkeypatch):
+        failed = {"trace_dir": "/traces", "error": "profiler auto-start failed: boom"}
+        client = self._client(monkeypatch, [{"trace_dir": "/traces"}, failed])
+
+        body = client.post("/stop_profile").json()
+
+        assert body["status"] == "error"
+        assert (
+            "auto-start failed" in body["message"]
+        ), "the only place left to tell the caller, so it cannot stay in the list"
+
+    def test_a_clean_stop_still_reports_success(self, monkeypatch):
+        client = self._client(monkeypatch, [{"trace_dir": "/traces", "elapsed": 1.3}])
+
+        body = client.post("/stop_profile").json()
+
+        assert body["status"] == "success"
+        assert body["traces"] == [{"trace_dir": "/traces", "elapsed": 1.3}]
+
+
 class TestValidateContextLength:
     """Oversized OpenAI requests should fail before entering the scheduler."""
 
