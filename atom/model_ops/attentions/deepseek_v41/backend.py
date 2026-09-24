@@ -244,7 +244,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         self.copies.warmup()
 
     def release_kv_pools(self):
-        for _, _, done in getattr(self, "_tbo_storage", {}).values():
+        for _, _, _, done in getattr(self, "_tbo_storage", {}).values():
             if done is not None:
                 done.synchronize()
         self._tbo_storage = {}
@@ -394,7 +394,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 rows.join()
             # Worker completion only means GPU work was enqueued. Fence the
             # child storage after its consumers, including failed forwards.
-            for _, _, done in getattr(self, "_tbo_storage", {}).values():
+            for _, _, _, done in getattr(self, "_tbo_storage", {}).values():
                 if done is not None:
                     done.record()
 
@@ -437,15 +437,17 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 )
                 for ratio in self.geometry.layer_ratios
             }
-            done = (
-                torch.cuda.Event() if torch.device(self.device).type != "cpu" else None
-            )
-            self._tbo_storage[index] = buffers, indptrs, done
-        buffers, indptrs, done = self._tbo_storage[index]
-        if done is not None:
-            # CPU writes into pinned staging must wait too; a GPU stream wait
-            # alone would still let them race the previous asynchronous H2D.
-            done.synchronize()
+            on_gpu = torch.device(self.device).type != "cpu"
+            h2d_done = torch.cuda.Event() if on_gpu else None
+            done = torch.cuda.Event() if on_gpu else None
+            self._tbo_storage[index] = buffers, indptrs, h2d_done, done
+        buffers, indptrs, h2d_done, done = self._tbo_storage[index]
+        if h2d_done is not None:
+            # CPU may rewrite pinned staging as soon as its previous H2D has
+            # read it. Keep device overwrites behind prior readers without
+            # blocking the CPU on the rest of the model forward.
+            h2d_done.synchronize()
+            torch.cuda.current_stream(self.device).wait_event(done)
         return buffers, indptrs
 
     def build_ubatch_prefill_metadata(
@@ -501,9 +503,13 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             extra_write=0,
         )
         if step.positions.is_cuda:
+            _, _, h2d_done, done = self._tbo_storage[ubatch_idx]
+            # All pinned-buffer copies have now been enqueued. This event is
+            # never moved to the end of the forward: it gates host reuse only.
+            h2d_done.record()
             step.indptrs = fill_step_indptrs(step, self.geometry, indptrs)
-            # Also cover callers that build metadata without running a model.
-            self._tbo_storage[ubatch_idx][2].record()
+            # Cover device preparation even when no model forward follows.
+            done.record()
         child = AttentionMetaData(
             cu_seqlens_q=step.cu_seqlens_q,
             max_seqlen_q=step.max_q_len,

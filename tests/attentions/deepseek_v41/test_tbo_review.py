@@ -34,7 +34,8 @@ def _metadata_tensors(child):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 @pytest.mark.parametrize("failed", [False, True])
-def test_child_metadata_reuse_waits_for_gpu_readers(failed):
+@pytest.mark.parametrize("cross_stream", [False, True])
+def test_child_metadata_reuse_waits_for_gpu_readers(failed, cross_stream):
     builder, first = make_parent("cuda", starts=(3, 8))
     reference_builder, second = make_parent("cuda", starts=(17, 21))
     part = UBatchSlice(slice(0, 2), slice(0, 14))
@@ -48,16 +49,20 @@ def test_child_metadata_reuse_waits_for_gpu_readers(failed):
     # Allocate before delaying the stream so allocation/first-use work cannot
     # accidentally close the race under test.
     builder.build_ubatch_prefill_metadata(first, part, 2)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
+    streams = [torch.cuda.Stream() for _ in range(2 if cross_stream else 1)]
+    for stream in streams:
+        stream.wait_stream(torch.cuda.current_stream())
     reads = []
-    with torch.cuda.stream(stream):
-        for i in range(6):
+    for i in range(6):
+        with torch.cuda.stream(streams[i % len(streams)]):
             parent = (first, second)[i % 2]
             torch.cuda._sleep(100_000_000)
             child = builder.build_ubatch_prefill_metadata(parent, part, 2)
             try:
                 with builder.ubatch_forward(parent):
+                    # Delay device readers after H2D too, so a host-only fence
+                    # cannot hide an overwrite from the next upload stream.
+                    torch.cuda._sleep(100_000_000)
                     reads.append(
                         {
                             name: value.clone()
@@ -70,7 +75,8 @@ def test_child_metadata_reuse_waits_for_gpu_readers(failed):
                 assert failed and str(error) == "child failed after enqueue"
             # No synchronize between forwards: reuse must fence the pinned
             # writes and device readers itself, including the error path.
-    stream.synchronize()
+    for stream in streams:
+        stream.synchronize()
     for i, tensors in enumerate(reads):
         for name, value in tensors.items():
             torch.testing.assert_close(value.cpu(), expected[i % 2][name])
@@ -141,7 +147,7 @@ def test_wrapper_preserves_image_embeddings_and_masks(monkeypatch, split):
         # locals or job closures after the builder releases its storage.
         refs = [
             weakref.ref(buffers["positions"].gpu)
-            for buffers, _, _ in builder._tbo_storage.values()
+            for buffers, _, _, _ in builder._tbo_storage.values()
         ]
         builder.release_kv_pools()
         assert all(ref() is None for ref in refs)
@@ -238,3 +244,32 @@ def test_single_token_prefill_child_keeps_prefill_semantics(
     assert tiles.shape[-1] == columns * (
         builder.geometry.rows_per_page(1) // MQA_LOGITS_PRESHUFFLE_ROWS
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_host_staging_reuse_does_not_wait_for_model_completion():
+    builder, first = make_parent("cuda", starts=(3, 8))
+    _, second = make_parent("cuda", starts=(17, 21))
+    part = UBatchSlice(slice(0, 2), slice(0, 14))
+    child = builder.build_ubatch_prefill_metadata(first, part, 2)
+    expected = child.step.positions.cpu()
+    compute, upload = torch.cuda.Stream(), torch.cuda.Stream()
+    compute.wait_stream(torch.cuda.current_stream())
+    finished = torch.cuda.Event()
+    with torch.cuda.stream(compute):
+        with builder.ubatch_forward(first):
+            # H2D has finished; only model consumers are deliberately delayed.
+            torch.cuda._sleep(1_000_000_000)
+            observed = child.step.positions.clone()
+        finished.record()
+    try:
+        with torch.cuda.stream(upload):
+            next_child = builder.build_ubatch_prefill_metadata(second, part, 2)
+        # A device-side wait may delay the next upload, but must not delay the
+        # CPU until those previous model consumers finish.
+        assert not finished.query()
+    finally:
+        compute.synchronize()
+        upload.synchronize()
+    torch.testing.assert_close(observed.cpu(), expected)
+    torch.testing.assert_close(next_child.step.positions, second.step.positions)
