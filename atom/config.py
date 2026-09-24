@@ -307,6 +307,14 @@ class CompilationConfig:
                 "aiter.mla_attention",
                 "aiter.atom_vllm_mha_attention",
                 "aiter.atom_vllm_mla_attention",
+                # NOT listed here: the DSA indexer ops
+                # (aiter.sparse_attn_indexer_plugin_mode / _kpool). Adding
+                # them changes nothing, and not because they are innocent:
+                # split_graph() ignores this list entirely and splits on the
+                # `spliting_op` attribute that mark_spliting_op() sets at
+                # registration (atom/utils/backends.py:_split_judge_func).
+                # Measured 2026-09-23: the segment count is 157 whether this
+                # list has four entries, five, or six.
             ]
 
 
