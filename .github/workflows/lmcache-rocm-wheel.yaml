@@ -26,7 +26,8 @@ name: LMCache ROCm torch 2.10 Wheel
 # overwritten. They are deliberately not GitHub Releases: a release needs a git
 # tag, and a tag reachable from main is what setuptools-scm's git describe picks
 # up when computing ATOM's own version. The Dockerfiles pin the image by digest
-# and the wheel by sha256. source_run_id publishes the wheel an earlier
+# and the wheel by sha256; after publishing, the workflow opens a draft PR that
+# moves that pin to the new wheel. source_run_id publishes the wheel an earlier
 # run built instead of rebuilding it, while that run's artifact is still kept.
 
 on:
@@ -46,6 +47,11 @@ on:
         type: string
         required: false
         default: ''
+      bump_pr:
+        description: "After publishing, open a draft PR that pins the new wheel in the Dockerfiles."
+        type: boolean
+        required: false
+        default: true
       runner:
         description: "Runner to build on. A GPU runner also runs LMCache's HIP transfer kernels."
         type: choice
@@ -189,7 +195,7 @@ jobs:
           wheels=(lmcache-src/dist_rocm_torch210/*.whl)
           test "${#wheels[@]}" -eq 1
           wheel=$(basename "${wheels[0]}")
-          # The publish job parses the version from this name.
+          # The publish job and the Dockerfiles parse the version from this name.
           if [ "${wheel}" != "lmcache-${VERSION}-${EXPECTED_WHEEL_TAG}.whl" ]; then
             echo "Unexpected wheel name ${wheel}; the Dockerfiles expect lmcache-${VERSION}-${EXPECTED_WHEEL_TAG}.whl."
             exit 1
@@ -465,3 +471,97 @@ jobs:
             echo "ARG LMCACHE_WHEEL_SHA256=${SHA256}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  bump-pr:
+    name: Open a PR pinning the new wheel
+    needs: publish
+    if: ${{ !cancelled() && needs.publish.result == 'success' && inputs.bump_pr }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      LMCACHE_COMMIT: ${{ inputs.lmcache_commit }}
+      VERSION: ${{ needs.publish.outputs.version }}
+      IMAGE: ${{ needs.publish.outputs.image }}
+      IMAGE_TAG: ${{ needs.publish.outputs.image_tag }}
+      WHEEL: ${{ needs.publish.outputs.wheel }}
+      SHA256: ${{ needs.publish.outputs.sha256 }}
+      SOURCE_RUN: ${{ needs.publish.outputs.source_run }}
+    steps:
+      - name: Checkout ATOM
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Download the wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.publish.outputs.artifact }}
+          run-id: ${{ needs.publish.outputs.source_run }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/new-wheel
+
+      - name: Compare dependencies with the current pin
+        run: |
+          set -euo pipefail
+          # The Dockerfiles install LMCache with --no-deps and list its
+          # requirements by hand, so a new Requires-Dist has to be added there
+          # in the PR. Surface the difference instead of leaving it to the
+          # image build to find.
+          old_image="$(sed -n 's/^ARG LMCACHE_WHEEL_IMAGE="\(.*\)"$/\1/p' docker/Dockerfile)"
+          # A FROM scratch image has no command; create is enough for docker cp.
+          cid="$(docker create "${old_image}" /none)"
+          docker cp "${cid}:/" "${RUNNER_TEMP}/old-image"
+          docker rm "${cid}" >/dev/null
+          cp "${RUNNER_TEMP}"/old-image/*.whl "${RUNNER_TEMP}/old.whl"
+          requires() {
+            unzip -p "$1" '*.dist-info/METADATA' | sed -n 's/^Requires-Dist: //p' | sort
+          }
+          requires "${RUNNER_TEMP}/old.whl" > "${RUNNER_TEMP}/old-requires.txt"
+          requires "${RUNNER_TEMP}/new-wheel/${WHEEL}" > "${RUNNER_TEMP}/new-requires.txt"
+          diff -u "${RUNNER_TEMP}/old-requires.txt" "${RUNNER_TEMP}/new-requires.txt" \
+            > "${RUNNER_TEMP}/requires.diff" || true
+
+      - name: Open the PR
+        run: |
+          set -euo pipefail
+          .github/scripts/bump_lmcache_wheel_pin.py \
+            --image "${IMAGE}" --sha256 "${SHA256}"
+          branch="ci/lmcache-wheel-${IMAGE_TAG#lmcache-}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "${branch}"
+          git commit -am "build(docker): pin LMCache ${VERSION} wheel" \
+            -m "Built from LMCache/LMCache@${LMCACHE_COMMIT} by ${GITHUB_SERVER_URL}/${GH_REPO}/actions/runs/${SOURCE_RUN}."
+          git push origin "${branch}"
+          {
+            echo "Pins the LMCache wheel image \`${IMAGE}\` in docker/Dockerfile and docker/atom_release.dockerfile."
+            echo
+            echo "- LMCache commit: [${LMCACHE_COMMIT}](https://github.com/LMCache/LMCache/commit/${LMCACHE_COMMIT})"
+            echo "- Version: \`${VERSION}\`"
+            echo "- sha256: \`${SHA256}\`"
+            echo "- Built by: ${GITHUB_SERVER_URL}/${GH_REPO}/actions/runs/${SOURCE_RUN}"
+            echo
+            echo "## Requires-Dist changes"
+            echo
+            if [[ -s "${RUNNER_TEMP}/requires.diff" ]]; then
+              echo "The Dockerfiles install the wheel with \`--no-deps\`; add new requirements to the \`pip install\` before it."
+              echo
+              echo '```diff'
+              tail -n +3 "${RUNNER_TEMP}/requires.diff"
+              echo '```'
+            else
+              echo "None."
+            fi
+            echo
+            echo "Opened as a draft by the LMCache wheel workflow. PRs created with the workflow token do not start CI; mark it ready for review to run the checks."
+          } > "${RUNNER_TEMP}/pr.md"
+          pr_url="$(gh pr create --draft \
+            --base "${{ github.event.repository.default_branch }}" \
+            --head "${branch}" \
+            --title "build(docker): pin LMCache ${VERSION} wheel" \
+            --body-file "${RUNNER_TEMP}/pr.md")"
+          echo "- **Bump PR**: ${pr_url}" >> "$GITHUB_STEP_SUMMARY"
