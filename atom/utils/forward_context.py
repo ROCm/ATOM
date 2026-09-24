@@ -950,9 +950,14 @@ def set_forward_context(
     # an all2all comes to bound its receive buffer by one rank's count. Assigned
     # unconditionally, because the capture loop reuses one Context across
     # buckets and a set-only write would leave the last table behind.
-    context.running_tokens_across_dp = (
-        None if num_tokens_across_dp is None else tuple(num_tokens_across_dp.tolist())
-    )
+    if num_tokens_across_dp is not None:
+        context.running_tokens_across_dp = tuple(num_tokens_across_dp.tolist())
+    elif dp_metadata is not None:
+        # DPMetadata.make may have obtained the table via its CPU collective
+        # (e.g. draft graph warmup). Publish that resolved table to EP too.
+        context.running_tokens_across_dp = tuple(dp_metadata.get_sizes_across_dp())
+    else:
+        context.running_tokens_across_dp = None
 
     _forward_context = ForwardContext(
         attn_metadata=attn_metadata,

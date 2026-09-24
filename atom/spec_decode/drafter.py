@@ -615,6 +615,9 @@ class Drafter(abc.ABC):
             running_tokens,
             unified=running_tokens_are_unified,
         )
+        context.running_tokens_across_dp = tuple(
+            forward_context.dp_metadata.get_sizes_across_dp()
+        )
 
     def prepare_inputs(
         self,

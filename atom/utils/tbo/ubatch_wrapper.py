@@ -593,6 +593,10 @@ class UBatchWrapper(nn.Module):
             running_tokens = ub_running_bs * int(
                 getattr(ctx.attn_metadata, "max_seqlen_q", 1) or 1
             )
+        if running_tokens_across_dp is None and dp_metadata is not None:
+            # The fallback CPU collective already resolved this child's table.
+            # Never substitute the parent's counts for a microbatch's bounds.
+            running_tokens_across_dp = tuple(dp_metadata.get_sizes_across_dp())
         ub_context = Context(
             positions=ctx.context.positions[ub_slice.token_slice],
             is_prefill=ctx.context.is_prefill,
