@@ -472,14 +472,16 @@ models:
           prefill:
             workers: 1
             tp: 4
-            # Disable CUDA graphs on prefill: the DPA+MTP draft warmup fix
-            # (PR #2367) is not in the base image yet. Prefill only does
-            # chunked prefill, so graphs provide no benefit here.
+            # Fully eager prefill: the DPA+MTP draft warmup fix (PR #2367) is
+            # not in the base image yet, and cudagraph_mode FULL_AND_PIECEWISE
+            # inherited from the model service config still triggers piecewise
+            # capture even with cudagraph: none. --enforce-eager bypasses both.
             cudagraph: none
             extra_args: >-
               --enable-dp-attention
               --attn-prefill-chunk-size 131072
               --long-prefill-token-threshold 131072
+              --enforce-eager
           decode:
             workers: 1
             tp: 4
