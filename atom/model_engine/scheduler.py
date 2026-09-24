@@ -636,6 +636,27 @@ class Scheduler:
         # them until the head releases the id after postprocess, so a seq is
         # never decoded against a token not yet appended.
         self._pp_inflight_token_block: set[int] = set()
+        # Seq ids whose last chunk ended on a state-checkpoint rung and whose
+        # checkpoint has not been filed yet. The prefill scheduler skips them,
+        # so the forward after the rung is issued only once the slot holding
+        # the state as of that rung has been handed over.
+        #
+        # Without the hold the two are the other way round under PP: the next
+        # chunk is scheduled off the pipeline's depth, before the retiring one
+        # reaches postprocess, and it writes the very slot the checkpoint is
+        # about to pin -- which is then filed under the rung's hash holding
+        # state from somewhere past it. Every later request resuming there
+        # picks up a prefix that consumed tokens it never sent.
+        #
+        # `checkpointers_at` states the invariant ("a forward that overshoots a
+        # rung is ahead of the hash it would be filed under") and prefill keeps
+        # it by cutting chunks to land on the rung. Under one forward in flight
+        # that is the whole of it; under several the overshoot arrives from the
+        # *next* forward instead, and only ordering can rule it out.
+        #
+        # Costs one pipeline bubble per checkpoint, not per chunk -- which is
+        # what `state_checkpoint_interval_tokens` already exists to amortize.
+        self._pp_checkpoint_hold: set[int] = set()
 
         from atom.utils.forward_context import get_kvconnector
 
@@ -1409,6 +1430,8 @@ class Scheduler:
                 if num_seqs_prefill >= self.max_num_seqs:
                     break
                 if not seq.is_partial_prefill:
+                    continue
+                if seq.id in self._pp_checkpoint_hold:
                     continue
                 remaining = seq.num_tokens - seq.num_cached_tokens
                 if 0 < self.long_prefill_token_threshold < remaining:
@@ -2305,6 +2328,7 @@ class Scheduler:
         target = bm.checkpoint_cut(seq, start, start + chunk)
         if target:
             chunk = target - start
+        on_rung = bool(target)
         # `cancel_state_fork` runs only when the first two hold, and returning
         # False is what leaves the fork in place — hence holding the chunk open.
         if (
@@ -2313,6 +2337,21 @@ class Scheduler:
             and not bm.cancel_state_fork(seq)
         ):
             chunk = bm.state.min_fork_tokens
+            # Lengthened past the rung, so job 1 did not happen after all.
+            on_rung = False
+        # Third job, and only when several forwards are in flight: keep the
+        # next chunk out of the pipeline until this one's checkpoint is filed.
+        # See `_pp_checkpoint_hold` for what overtakes what without it. Only
+        # where a following prefill chunk exists — a rung at the prompt's own
+        # end is followed by the first decode, which `_pp_inflight_token_block`
+        # already holds back.
+        if (
+            on_rung
+            and self.advance_on_schedule
+            and bm.enable_prefix_caching
+            and start + chunk < seq.num_prompt_tokens
+        ):
+            self._pp_checkpoint_hold.add(seq.id)
         return chunk
 
     def _checkpoint_room(self, seq: Sequence, finished: bool) -> int:
@@ -2751,6 +2790,10 @@ class Scheduler:
             return
         seq_by_id = self._batch_seq_lookup(seqs)
         for i, req_id in enumerate(batch.req_ids):
+            # Before the bail-outs below, not after: a seq preempted while held
+            # never reaches its checkpoint, and a hold left behind would keep
+            # it out of the prefill scan for the rest of its life.
+            self._pp_checkpoint_hold.discard(req_id)
             seq = seq_by_id.get(req_id)
             if seq is None or not seq.block_table:
                 logger.warning(
@@ -2762,6 +2805,19 @@ class Scheduler:
             chunk = int(batch.num_scheduled_tokens[i])
             start_tokens = int(batch.num_cached_tokens[i])
             self.block_manager.hash_blocks(seq, chunk, start_tokens=start_tokens)
+
+    def holds_checkpoint_hostage(self, batch: ScheduledBatch) -> bool:
+        """Whether any seq in `batch` is waiting on this batch's checkpoint.
+
+        The head asks before deciding whether a retiring middle chunk's prefix
+        hashes can wait for the next batch that produces output. They normally
+        can — that is what the deferral buys. A held seq cannot wait: it is out
+        of the prefill scan until its checkpoint is filed, so deferring the
+        filing behind a batch that may not exist yet is what would stall it.
+        """
+        return bool(self._pp_checkpoint_hold) and any(
+            req_id in self._pp_checkpoint_hold for req_id in batch.req_ids
+        )
 
     def postprocess(
         self,
@@ -2812,6 +2868,9 @@ class Scheduler:
             seq_by_id = self._batch_seq_lookup(seqs)
             final = batch.is_final_chunk
             for i, req_id in enumerate(batch.req_ids):
+                # See register_prefill_hashes: dropped before the bail-out so a
+                # seq that never reaches its checkpoint is not held forever.
+                self._pp_checkpoint_hold.discard(req_id)
                 seq = seq_by_id.get(req_id)
                 if seq is None or final is None or not seq.block_table:
                     continue
