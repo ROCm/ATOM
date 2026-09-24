@@ -10,6 +10,7 @@ from functools import wraps
 from prometheus_client import Histogram
 
 from atom.metrics.histogram import LATENCY_BUCKETS
+from atom.metrics.routing_trace import get_writer
 
 logger = logging.getLogger("atom")
 
@@ -63,6 +64,9 @@ class GPUForwardMetrics:
         ).labels(**labels)
         self.max_requests = max_requests
         self.requests = OrderedDict()
+        self.trace_writer = get_writer()
+        self.trace_labels = labels
+        self.trace_pending = {}
 
     def _discard_request(self, req_id):
         state = self.requests.pop(req_id, None)
@@ -101,17 +105,32 @@ class GPUForwardMetrics:
                 break
             self.pending.popleft()
             seconds = start.elapsed_time(end) / 1000
+            batch_id = self.trace_pending.pop(id(end), None)
             if not math.isfinite(seconds) or seconds < 0:
                 logger.warning(
                     "Invalid GPU forward duration %r; discarding %d request timings",
                     seconds,
                     len(requests),
                 )
+                if batch_id is not None:
+                    self.trace_writer.emit(
+                        "gpu_sample_dropped",
+                        batch_id=batch_id,
+                        reason="invalid_duration",
+                        worker=self.trace_labels,
+                    )
                 for state in requests:
                     if self.requests.get(state.req_id) is state:
                         self._discard_request(state.req_id)
                 self.free.append((start, end))
                 continue
+            if batch_id is not None:
+                self.trace_writer.emit(
+                    "gpu_batch",
+                    batch_id=batch_id,
+                    seconds=seconds,
+                    worker=self.trace_labels,
+                )
             self.steps.observe(seconds)
             for state in requests:
                 state.pending -= 1
@@ -131,7 +150,19 @@ class GPUForwardMetrics:
             yield
             return
         requests = self._request_chunks(batch)
+        batch_id = (
+            getattr(batch, "routing_trace_id", None)
+            if self.trace_writer is not None
+            else None
+        )
         if len(self.pending) >= self.max_pending:
+            if batch_id is not None:
+                self.trace_writer.emit(
+                    "gpu_sample_dropped",
+                    batch_id=batch_id,
+                    reason="pending_limit",
+                    worker=self.trace_labels,
+                )
             for state in requests:
                 self._discard_request(state.req_id)
             yield
@@ -152,6 +183,8 @@ class GPUForwardMetrics:
             # when the next forward reuses it.
             self.free.append((start, end))
             raise
+        if batch_id is not None:
+            self.trace_pending[id(end)] = batch_id
         self.pending.append((start, end, requests))
 
 

@@ -32,6 +32,7 @@ import numpy as np
 
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.metrics.routing_trace import trace_enqueue
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.engine_stats import EngineStats
@@ -1087,12 +1088,14 @@ class Scheduler:
         )
 
     def add(self, seq: Sequence):
+        trace_enqueue(self, seq)
         self.metrics.enqueue(seq)
         self._warn_if_unschedulable(seq)
         self.waiting.append(seq)
 
     def extend(self, seqs: list[Sequence]):
         for seq in seqs:
+            trace_enqueue(self, seq)
             self.metrics.enqueue(seq)
             self._warn_if_unschedulable(seq)
         self.waiting.extend(seqs)
@@ -4029,6 +4032,7 @@ class PrefillScheduler:
         pass
 
     def add(self, seq: Sequence):
+        trace_enqueue(self, seq)
         self.metrics.enqueue(seq)
         self.waiting.append(seq)
 

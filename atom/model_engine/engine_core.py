@@ -14,6 +14,7 @@ import zmq
 from atom.config import Config, ParallelConfig
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
+from atom.metrics.routing_trace import EngineTrace, get_writer
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
@@ -179,6 +180,11 @@ class EngineCore:
         if self.kv_transfer_enabled:
             # Physical: one output per launched worker, else this waits forever.
             self.kv_aggregator = KVOutputAggregator(world_size=config.tp_world_size)
+
+        writer = get_writer()
+        self.routing_trace = EngineTrace(config, writer) if writer is not None else None
+        if self.routing_trace is not None:
+            self.scheduler._routing_trace = self.routing_trace
 
         self.utility_handler = EngineUtilityHandler(
             self.runner_mgr,
@@ -400,8 +406,14 @@ class EngineCore:
             self.scheduler.shutdown_kv_events()
 
     def _process_engine_step(self):
+        trace = getattr(self, "routing_trace", None)
+        if trace is not None:
+            trace.begin(self.scheduler)
         try:
-            return self._process_engine_step_inner()
+            executed = self._process_engine_step_inner()
+            if trace is not None:
+                trace.end(self.scheduler, executed)
+            return executed
         finally:
             # Swallow publisher errors so they cannot mask an exception from
             # the engine step itself.
@@ -453,6 +465,9 @@ class EngineCore:
         # Run the model forward pass if there are actual sequences
         has_seqs = len(scheduled_batch.req_ids) > 0
         if has_seqs:
+            trace = getattr(self, "routing_trace", None)
+            if trace is not None:
+                trace.batch(scheduled_batch, seqs)
             self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
             self.scheduler.metrics.record_forward(scheduled_batch, seqs)
             fwd_out = self.runner_mgr.call_func(
@@ -482,6 +497,9 @@ class EngineCore:
             stream_output_queue=self.stream_output_queue,
             batch=scheduled_batch,
         )
+
+        if getattr(self, "routing_trace", None) is not None:
+            self.routing_trace.postprocess(scheduled_batch, finished_seqs)
 
         # Send stream outputs to main process via output_queue
         try:

@@ -389,6 +389,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_METRICS_UPDATE_INTERVAL_S": lambda: _positive_float_env(
         "ATOM_METRICS_UPDATE_INTERVAL_S", "1.0"
     ),
+    # Bounded JSONL calibration evidence. Empty disables all trace hooks.
+    "ATOM_ROUTING_TRACE_DIR": lambda: os.getenv("ATOM_ROUTING_TRACE_DIR", ""),
     "ATOM_ENABLE_METRICS_DEVICE_TIMER": lambda: os.getenv(
         "ATOM_ENABLE_METRICS_DEVICE_TIMER", "0"
     )

@@ -342,7 +342,11 @@ class EngineUtilityHandler:
         if envs.ATOM_ENABLE_METRICS_DEVICE_TIMER and self.runner_mgr is not None:
             self.runner_mgr.call_func("poll_forward_metrics")
         if scheduler_metrics:
-            self.output_queue.put_nowait(("METRICS", self.collect_metrics()))
+            metrics = self.collect_metrics()
+            trace = getattr(self.scheduler, "_routing_trace", None)
+            if trace is not None:
+                trace.snapshot(self.scheduler, metrics)
+            self.output_queue.put_nowait(("METRICS", metrics))
 
     def collect_metrics(self) -> dict:
         """One rank's scheduler, KV, MTP, and cache metrics."""
