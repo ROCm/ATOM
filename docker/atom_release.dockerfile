@@ -652,7 +652,6 @@ RUN echo "========== Install atomesh binary ==========" && \
 # ROCM_TORCH210_LOCAL_VERSION and EXPECTED_WHEEL_TAG, and change only with the
 # image's torch.
 ARG LMCACHE_WHEEL_SHA256=a5fe8f3f5b9dee602ac7d11241f65a1640cd3d26c101f2d1d0e0d8aee88b7aab
-COPY --from=lmcache_wheel / /tmp/lmcache-wheel/
 # Docker builds do not expose a GPU, so LMCache's torch.cuda.is_available()
 # backend predicate is overridden only in the validation process below.
 # Two install paths, because the published wheel targets one ABI: its filename
@@ -666,7 +665,8 @@ COPY --from=lmcache_wheel / /tmp/lmcache-wheel/
 # tells the two apart. Collapse this back to one path once a matching wheel
 # exists.
 ARG LMCACHE_TAG=v0.4.5
-RUN if [ -z "${ROCM_HOME}" ]; then \
+RUN --mount=type=bind,from=lmcache_wheel,target=/tmp/lmcache-wheel \
+    if [ -z "${ROCM_HOME}" ]; then \
       echo "========== [ATOM] Install LMCache ROCm torch 2.10 wheel ==========" && \
           set -- /tmp/lmcache-wheel/*.whl && \
           { [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "Expected one wheel in LMCACHE_WHEEL_IMAGE, found: $*"; exit 1; }; } && \
@@ -684,7 +684,6 @@ RUN if [ -z "${ROCM_HOME}" ]; then \
               opentelemetry-exporter-prometheus==0.61b0 \
               "grpcio>=1.78.0" "protobuf>=6.31.1,<7" && \
           "${VENV_PYTHON}" -m pip install --no-deps "${lmcache_wheel}" && \
-          rm -rf /tmp/lmcache-wheel && \
           "${VENV_PYTHON}" -c "import torch; torch.cuda.is_available = lambda: True; import lmcache, lmcache.cuda_ops, lmcache.lmcache_native; \
       from lmcache.v1.cache_engine import LMCacheEngineBuilder; \
       from lmcache.v1.memory_management import MemoryFormat; \
@@ -708,7 +707,6 @@ RUN if [ -z "${ROCM_HOME}" ]; then \
       print('OK: lmcache', lmcache.__version__, 'HIP cuda_ops; torch', torch.__version__)" ; \
     else \
       echo "========== [ATOM] LMCache HIP c_ops (${LMCACHE_TAG}, arch=${PYTORCH_ROCM_ARCH}) ==========" && \
-          rm -rf /tmp/lmcache-wheel && \
           git clone https://github.com/LMCache/LMCache.git /opt/LMCache && \
           cd /opt/LMCache && git checkout ${LMCACHE_TAG} && \
           "${VENV_PYTHON}" -m pip install -r requirements/build.txt && \

@@ -339,10 +339,16 @@ jobs:
             exit 1
           fi
           attempt="${artifact##*-}"
-          build=$(gh api "${api}/attempts/${attempt}/jobs?per_page=100" \
-            --jq '[.jobs[] | select(.name | startswith("Build and validate"))][0].conclusion // empty')
+          IFS=$'\t' read -r build_name build < <(gh api "${api}/attempts/${attempt}/jobs?per_page=100" \
+            --jq '[.jobs[] | select(.name | startswith("Build and validate"))][0] | "\(.name)\t\(.conclusion)"')
           if [ "${build}" != "success" ]; then
             echo "Run ${SOURCE_RUN_ID} attempt ${attempt}: build job concluded '${build}', not success."
+            exit 1
+          fi
+          # The wheel name only carries 8 hex digits; the job name has the full
+          # commit the source run was dispatched with.
+          if [ "${build_name}" != "Build and validate LMCache ${LMCACHE_COMMIT}" ]; then
+            echo "Run ${SOURCE_RUN_ID} built '${build_name#Build and validate LMCache }', not ${LMCACHE_COMMIT}."
             exit 1
           fi
           echo "run_id=${SOURCE_RUN_ID}" >> "$GITHUB_OUTPUT"
@@ -440,8 +446,9 @@ jobs:
             --label "com.amd.atom.lmcache.build-run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN}" \
             -t "${ref}" "${RUNNER_TEMP}/wheel-image"
           .github/scripts/docker_push_retry.sh "${ref}"
-          digest=$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${ref}" \
-            | sed -n "s|^${IMAGE_REPO}@||p" | head -1)
+          # The registry's answer does not depend on the local image store
+          # (RepoDigests reads differently under containerd).
+          digest=$(docker buildx imagetools inspect "${ref}" --format '{{.Manifest.Digest}}')
           if ! [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "Could not read the pushed digest of ${ref}."
             exit 1
@@ -462,7 +469,11 @@ jobs:
             echo "- **Version**: \`${VERSION}\`"
             echo "- **Wheel**: \`${WHEEL}\`"
             echo "- **Built by**: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN}"
-            echo "- **Build image**: \`${ROCM_PYTORCH_IMAGE}\`"
+            if [ "${SOURCE_RUN}" = "${GITHUB_RUN_ID}" ]; then
+              echo "- **Build image**: \`${ROCM_PYTORCH_IMAGE}\`"
+            else
+              echo "- **Build image**: see the build run's summary"
+            fi
             echo
             echo "Pin in docker/Dockerfile and docker/atom_release.dockerfile:"
             echo
@@ -480,6 +491,8 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      # download-artifact with run-id reads through the Actions API.
+      actions: read
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -533,10 +546,12 @@ jobs:
           branch="ci/lmcache-wheel-${IMAGE_TAG#lmcache-}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git switch -c "${branch}"
+          git switch -C "${branch}"
           git commit -am "build(docker): pin LMCache ${VERSION} wheel" \
             -m "Built from LMCache/LMCache@${LMCACHE_COMMIT} by ${GITHUB_SERVER_URL}/${GH_REPO}/actions/runs/${SOURCE_RUN}."
-          git push origin "${branch}"
+          # The branch name is fixed per wheel and owned by this job, so a re-run
+          # after a failure below replaces what the previous attempt pushed.
+          git push --force origin "${branch}"
           {
             echo "Pins the LMCache wheel image \`${IMAGE}\` in docker/Dockerfile and docker/atom_release.dockerfile."
             echo
@@ -559,9 +574,12 @@ jobs:
             echo
             echo "Opened as a draft by the LMCache wheel workflow. PRs created with the workflow token do not start CI; mark it ready for review to run the checks."
           } > "${RUNNER_TEMP}/pr.md"
-          pr_url="$(gh pr create --draft \
-            --base "${{ github.event.repository.default_branch }}" \
-            --head "${branch}" \
-            --title "build(docker): pin LMCache ${VERSION} wheel" \
-            --body-file "${RUNNER_TEMP}/pr.md")"
+          pr_url="$(gh pr list --head "${branch}" --state open --json url --jq '.[0].url // empty')"
+          if [ -z "${pr_url}" ]; then
+            pr_url="$(gh pr create --draft \
+              --base "${{ github.event.repository.default_branch }}" \
+              --head "${branch}" \
+              --title "build(docker): pin LMCache ${VERSION} wheel" \
+              --body-file "${RUNNER_TEMP}/pr.md")"
+          fi
           echo "- **Bump PR**: ${pr_url}" >> "$GITHUB_STEP_SUMMARY"
