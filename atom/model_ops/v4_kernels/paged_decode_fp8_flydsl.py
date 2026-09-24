@@ -371,6 +371,7 @@ def sparse_attn_v4_paged_decode_fp8_flydsl_auto(
 
     if kv_kind == "hca":
         config = (13, 14, 10, 50, 11, 64)
+        waves_per_eu = 1
     elif kv_kind == "csa":
         # Keep the captured grid independent of the live K length. vLLM passes
         # a compact index view, while SGLang graphs retain a worst-case backing
@@ -379,7 +380,24 @@ def sparse_attn_v4_paged_decode_fp8_flydsl_auto(
         # the short (K384) segment size on device. The batch-visible split cap
         # keeps launch overhead low at B13+ while preserving K1152 throughput.
         requests = tokens // query_group
-        config = (3, 8, 6, 12, 0, 0) if requests <= 12 else (2, 9, 6, 12, 0, 0)
+        if requests <= 6:
+            config = (6, 6, 3, 20, 0, 0)
+            waves_per_eu = 0
+        elif requests <= 8:
+            config = (6, 6, 4, 12, 0, 0)
+            waves_per_eu = 1
+        elif requests <= 12:
+            config = (3, 8, 6, 12, 0, 0)
+            waves_per_eu = 1
+        elif requests <= 16:
+            config = (2, 9, 6, 12, 0, 0)
+            waves_per_eu = 1
+        elif requests <= 18:
+            config = (2, 10, 6, 12, 0, 0)
+            waves_per_eu = 1
+        else:
+            config = (2, 9, 6, 12, 0, 0)
+            waves_per_eu = 1
     else:
         raise ValueError(f"unsupported FlyDSL decode KV kind: {kv_kind}")
 
@@ -408,7 +426,7 @@ def sparse_attn_v4_paged_decode_fp8_flydsl_auto(
         split_tiles_mid=split_tiles_mid,
         split_mid_max_tiles=split_mid_max_tiles,
         reduce_head_group=8,
-        waves_per_eu=1,
+        waves_per_eu=waves_per_eu,
         out=out,
     )
 

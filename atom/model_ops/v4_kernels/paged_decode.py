@@ -112,10 +112,9 @@ def _use_triton_native_fp8_decode(
 
     On gfx950, the default hybrid policy keeps the Triton kernels only where
     measurements beat the AITER assembly path. The native-V B6 HCA
-    specialization uses a GPU-side packed work map and remains on Triton;
-    other measured HCA shapes stay on AITER. DP CSA stays on Triton: the
-    gfx950 native-V path plus the attention scheduler now covers its former
-    B10+ crossover.
+    specialization remains available as the matched Triton fallback; other
+    measured HCA shapes stay on AITER. DP CSA remains eligible for Triton when
+    it falls outside the qualified FlyDSL envelope.
 
     The decision uses only captured tensor shapes, device architecture, and
     layer kind, so it is safe for CUDA Graph replay.
@@ -174,7 +173,7 @@ def _use_flydsl_native_fp8_decode(
         return tokens == 6 * query_group
     if kv_kind == "csa":
         requests = tokens // query_group
-        return tokens % query_group == 0 and 10 <= requests <= 16
+        return tokens % query_group == 0 and 5 <= requests <= 32
     return False
 
 
@@ -1360,7 +1359,7 @@ def sparse_attn_v4_paged_decode(
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
     Native 2buff fp8 (``unified_kv_rope`` provided): measured gfx950 H128/q7
-    HCA B6 and CSA B10-B16 shapes use the graph-safe FlyDSL dispatcher unless
+    HCA B6 and CSA B5-B32 shapes use the graph-safe FlyDSL dispatcher unless
     ``ATOM_V4_FLYDSL_FP8_DECODE=0``. Other qualified shapes route to Triton
     when ``ATOM_USE_TRITON_ATTN=1``; measured hybrid losers route back to AITER.
     Eligible gfx1250 H=128 shapes may reuse the sparse-prefill ASM kernel when

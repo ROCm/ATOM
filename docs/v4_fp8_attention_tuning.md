@@ -16,7 +16,7 @@ passed their promotion gates:
    fallback outside the qualified FlyDSL envelope).
 2. An H=128 sparse-prefill kernel implemented in FlyDSL (retained).
 3. Graph-safe H=128/q7 FP8 decode implemented in FlyDSL (retained for HCA B6
-   and CSA B10-B16 on gfx950).
+   and CSA B5-B32 on gfx950).
 4. Native two-buffer FP8 sparse prefill implemented in Triton (removed after
    losing to AITER OPUS at both measured production shapes).
 
@@ -24,7 +24,7 @@ The current result is not an unconditional replacement for every AITER
 attention kernel:
 
 - Decode uses a production hybrid policy on gfx950. FlyDSL is the default for
-  the qualified H128/q7 HCA B6 and CSA B10-B16 shapes; Triton and AITER remain
+  the qualified H128/q7 HCA B6 and CSA B5-B32 shapes; Triton and AITER remain
   fallbacks outside that measured envelope.
 - FlyDSL prefill is production-routed on gfx950 only for H=128, no-sentinel
   native FP8 inputs with `max_seqlen_q <= 127` and `max_seqlen_k < 4096`.
@@ -45,7 +45,7 @@ attention kernel:
 | Triton decode | CSA B10-B16, two seeds, K=384/640/1152 | 42/42 wins | 42 reference points | All positive | Production hybrid |
 | Triton decode | CSA B12, K=1152 | 86.241 us | 88.760 us | +2.92% | Production hybrid |
 | Triton decode | HCA B6 heterogeneous vectors | All 8 vectors win | AITER decode | About +4% to +43% | Native-V opt-in |
-| FlyDSL decode | CSA B10-B16, K=384/640/1152, two seeds | 42/42 wins | Triton auto | +1.34% to +33.83%, +12.31% average | Production default |
+| FlyDSL decode | CSA B5-B32, K=384/640/1152, two seeds | 168/168 wins | Triton auto | +0.56% to +43.85%, +18.91% average | Production default |
 | FlyDSL decode | HCA B6, eight heterogeneous vectors, two seeds | 16/16 wins | Tuned Triton | +1.42% to +19.99%, +8.01% average | Production default |
 | Triton prefill | T=2048, P=1151, E=127, mixed | 577.06-577.74 us | 464.48-464.86 us | Candidate latency about 24.2% higher | Removed |
 | Triton prefill | T=2048, P=8192, E=127, mixed | 2486.29-2489.97 us | 1849.35-1849.83 us | Candidate latency about 34.4% higher | Removed |
@@ -232,9 +232,13 @@ and lets the FlyDSL reducer derive the live split count from `kv_indptr`.
 The final schedules are:
 
 ```text
-HCA B6:      cap13 / long14 / mid11<=64 / short10<=50 / head_group=8
-CSA B10-B12: cap3  / long8  / short6  / short_max_tiles=12 / head_group=8
-CSA B13-B16: cap2  / long9  / short6  / short_max_tiles=12 / head_group=8
+HCA B6:      cap13 / long14 / mid11<=64 / short10<=50 / head_group=8 / weu1
+CSA B5-B6:   cap6  / long6  / short3<=20 / head_group=8 / weu0
+CSA B7-B8:   cap6  / long6  / short4<=12 / head_group=8 / weu1
+CSA B9-B12:  cap3  / long8  / short6<=12 / head_group=8 / weu1
+CSA B13-B16: cap2  / long9  / short6<=12 / head_group=8 / weu1
+CSA B17-B18: cap2  / long10 / short6<=12 / head_group=8 / weu1
+CSA B19-B32: cap2  / long9  / short6<=12 / head_group=8 / weu1
 ```
 
 CSA uses only host-visible batch size for the fixed grid. The live K384 versus
@@ -243,14 +247,24 @@ important because vLLM commonly passes a compact `kv_indices` view while
 SGLang CUDA Graph replay can retain a worst-case backing buffer; tensor
 capacity is therefore not a portable K-length signal.
 
-Two seeds and 100 timed CUDA-Graph replays per point produced:
+Two seeds and 100-200 timed CUDA-Graph replays per point produced:
 
-| CSA K | Points | FlyDSL wins vs Triton auto | Minimum | Maximum | Average |
-|---:|---:|---:|---:|---:|---:|
-| 384 | 14 | 14/14 | +2.33% | +20.11% | +10.22% |
-| 640 | 14 | 14/14 | +11.85% | +33.83% | +22.05% |
-| 1152 | 14 | 14/14 | +1.34% | +7.57% | +4.66% |
-| Total | 42 | 42/42 | +1.34% | +33.83% | +12.31% |
+| CSA envelope | Points | FlyDSL wins vs Triton auto | Minimum | Maximum | Average |
+|---|---:|---:|---:|---:|---:|
+| B5-B32, K=384/640/1152 | 168 | 168/168 | +0.56% | +43.85% | +18.91% |
+
+The earlier B10-B16 matrix remains a useful stable subset: 42/42 wins with a
++1.34% minimum and +12.31% average. The expanded matrix adds batch-specific
+split caps for B5-B9 and B17-B32. A separate B33-B64 one-seed screen was 96/96
+positive (+5.64% minimum), but it is not production-routed because the larger
+partial-buffer envelope has not completed the same two-seed and end-to-end
+qualification. B1-B4 remain on Triton: its low-batch q7 query fusion avoids
+repeating the KV traversal, while the current FlyDSL kernel still assigns one
+query to each stage-1 CTA.
+
+Across the 168 promoted CSA points, minimum cosine versus AITER was
+`0.99999595`, maximum relative RMSE was `0.00282215`, maximum absolute error
+was `0.0078125`, and no output contained NaN or Inf.
 
 The final HCA B6 matrix used eight heterogeneous vectors, two seeds, and 200 timed
 replays per vector. FlyDSL won all 16 comparisons against the tuned packed
@@ -933,8 +947,15 @@ Graph-safe FlyDSL decode retune:
 runs/v4-fp8-flydsl-retune-20260924/
   final-pr-hca-tritier-seed17-all8-200.json
   final-pr-hca-tritier-seed18-all8-200.json
+  formal-csa-b5-6-cap6-l6-s3-hg8-w0-seeds17-18-200.json
+  formal-csa-b7-8-cap6-l6-s4-seeds17-18-200.json
+  formal-csa-b9-seeds17-18-200.json
   csa-b10-12-cap3-long8-short6-seeds17-18-100.json
   csa-b13-16-cap2-long9-short6-seeds17-18-100.json
+  screen-csa-b17-18-cap2-l10-s6-seeds17-18-100.json
+  formal-csa-b17-32-seeds17-18-100.json
+  screen-csa-b33-48-seed17-20.json
+  screen-csa-b49-64-seed17-20.json
 ```
 
 Matched C96 end-to-end A/B:
