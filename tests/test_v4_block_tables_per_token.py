@@ -3,7 +3,7 @@
 """Expanding `block_tables[bs]` into the per-query-row table the MQA kernel reads.
 
 `_attach_v4_paged_decode_meta` used to build this on the host -- zero the whole
-buffer, mask the rows whose `mqa_row_to_batch` is not -1, gather those from
+buffer, mask the rows whose `mqa_batch_id_per_q_token` is not -1, gather those from
 `block_tables`, ship the result -- and now gathers it on the device from
 tensors that are already there.
 
@@ -37,7 +37,7 @@ def _block_tables(bs: int) -> np.ndarray:
 
 
 def _per_token_layout(bs: int, tokens_per_seq: int, t_pad: int):
-    """One row per query token: the map is `batch_id_per_token`, padded with -1."""
+    """One row per query token: the map is `batch_id_per_q_token`, padded with -1."""
     t = bs * tokens_per_seq
     old = np.full(t_pad, -1, dtype=np.int32)
     old[:t] = np.repeat(np.arange(bs, dtype=np.int32), tokens_per_seq)

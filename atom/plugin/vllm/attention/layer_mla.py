@@ -309,6 +309,32 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         self.q_pad_num_heads = getattr(self, "q_pad_num_heads", None)
         _register_vllm_static_forward_context(self)
 
+        # vLLM 0.28 moved MLA's DCP collectives behind an `MLADCPManager` that
+        # its own MLAAttention builds when `impl.dcp_world_size > 1`;
+        # MLACommonMetadataBuilder then reads it back off the registered layer
+        # and asserts the type. ATOM keeps `dcp_world_size = -1` so vLLM's DCP
+        # paths stay out of its decode kernels, so that constructor never ran
+        # and every DCP>1 MLA run aborted on the assert while building metadata.
+        # ATOM only needs the manager for the builder's chunked-prefill KV
+        # gather; its own decode paths do not call the manager.
+        if dcp_size > 1 and getattr(self, "dcp_manager", None) is None:
+            from vllm.v1.attention.ops.dcp_utils import MLADCPManager
+
+            self.dcp_manager = MLADCPManager(
+                vllm_config=vllm_config,
+                device=next(self.kv_b_proj.parameters()).device,
+                num_heads=self.num_heads,
+                query_head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
+                output_head_dim=self.kv_lora_rank,
+                # ATOM never feeds MLA a quantized query, so the query keeps
+                # the layer dtype (vLLM's `supports_quant_query_input` branch).
+                query_dtype=self.dtype,
+                output_dtype=self.dtype,
+                padded_num_heads=self.q_pad_num_heads,
+                is_lse_base_on_e=getattr(self, "lse_base_on_e", True),
+                use_pcp=getattr(self, "use_pcp", False),
+            )
+
         atom_static_context = atom_config.compilation_config.static_forward_context
         atom_static_context[model_layer_name] = self
         if "positions" not in atom_static_context:
@@ -488,7 +514,9 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                     cu_seq_lens=prefill_metadata.chunked_context.padded_local_cu_seq_lens[
                         i
                     ],
-                    token_to_seq=prefill_metadata.chunked_context.padded_local_token_to_seq[
+                    # vLLM's parameter name -- NOT ours. Do not sweep it along
+                    # when renaming the ATOM-side spelling.
+                    token_to_seq=prefill_metadata.chunked_context.padded_local_batch_id_per_k_token[
                         i
                     ],
                     num_tokens=toks,
@@ -603,7 +631,8 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 dst=workspace,
                 block_table=prefill_metadata.block_table,
                 cu_seq_lens=prefill_metadata.chunked_context.cu_seq_lens[i],
-                token_to_seq=prefill_metadata.chunked_context.token_to_seq[i],
+                # vLLM's parameter name -- NOT ours (see the DCP call above).
+                token_to_seq=prefill_metadata.chunked_context.batch_id_per_k_token[i],
                 num_tokens=prefill_metadata.chunked_context.chunk_total_token[i],
                 kv_cache_dtype=self.kv_cache_dtype,
                 scale=k_scale,
@@ -1029,6 +1058,12 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         q = q[:num_actual_toks, ...]
         k_c_normed = k_c_normed[:num_actual_toks, ...]
         k_pe = k_pe[:num_actual_toks, ...]
+        # Model runner V2 sizes slot_mapping to the CUDA-graph token width and
+        # marks the tail with PAD_SLOT_ID, but leaves num_actual_tokens unpadded
+        # on the piecewise path; V1 never pads it. The cache kernels launch one
+        # block per slot and index q/kv by that block, so slot_mapping must not
+        # outrun the tensors sliced above. Same trim layer_mha already applies.
+        slot_mapping = attn_metadata.slot_mapping[:num_actual_toks]
 
         decode_q = q[:num_decode_tokens]
         prefill_q = q[num_decode_tokens:]
@@ -1056,7 +1091,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                     k_c_normed,
                     self.rotary_emb_cos_sin_cache,
                     self.rotary_emb.is_neox_style,
-                    attn_metadata.slot_mapping,
+                    slot_mapping,
                     kv_cache,
                     self.kv_cache_dtype,
                     self._k_scale,
@@ -1068,7 +1103,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                         k_c_normed,
                         k_pe.squeeze(1),
                         kv_cache,
-                        attn_metadata.slot_mapping.flatten(),
+                        slot_mapping.flatten(),
                         kv_cache_dtype=self.kv_cache_dtype,
                         scale=self._k_scale,
                     )
@@ -1166,7 +1201,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                         self.kv_lora_rank + self.qk_rope_head_dim,
                     ),
                     decode_q[:, : self.num_heads] if fused_q_head_pad else decode_q,
-                    attn_metadata.slot_mapping,
+                    slot_mapping,
                     self._k_scale,
                     self._q_scale,
                     positions,
@@ -1338,6 +1373,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         q = q[:num_actual_toks, ...]
         k_c_normed = k_c_normed[:num_actual_toks, ...]
         k_pe = k_pe[:num_actual_toks, ...].unsqueeze(1)
+        slot_mapping = sparse_meta.slot_mapping[:num_actual_toks]
 
         positions = None
         if self._is_vllm_forward_context_available():
@@ -1416,7 +1452,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                     kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
                 ),
                 q_out,
-                sparse_meta.slot_mapping,
+                slot_mapping,
                 self._k_scale,
                 self._q_scale,
                 positions,
@@ -1465,20 +1501,26 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         if self.calculate_kv_scales:
             self.calc_kv_scales(q, kv_c_normed, k_pe)
-        output = torch.ops.aiter.atom_vllm_mla_attention(
+        output = torch.empty(
+            (q.shape[0], self.num_heads * self.v_head_dim),
+            dtype=q.dtype,
+            device=q.device,
+        )
+        torch.ops.aiter.atom_vllm_mla_attention(
             q,
             kv_c_normed,
             k_pe,
             self.layer_name,
-            self.num_heads * self.v_head_dim,
+            output,
         )
         return self.o_proj(output)
 
     def get_kv_cache_spec(self, vllm_config):
         from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
+        block_size = vllm_config.cache_config.block_size
         return MLAAttentionSpec(
-            block_size=vllm_config.cache_config.block_size,
+            block_size=block_size,
             num_kv_heads=1,
             head_size=self.head_size,
             dtype=self.kv_cache_torch_dtype,

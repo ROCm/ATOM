@@ -57,6 +57,7 @@ from atom.kv_transfer.offload._offload_common import (
     build_offload_engine,
     max_pending_saves,
     pp_aware_rank_and_world,
+    tokens_to_tensor,
     validated_kv_role,
 )
 from atom.kv_transfer.offload.hybrid.dsv4.codec import (
@@ -90,6 +91,13 @@ from atom.kv_transfer.offload.metadata import (
 logger = logging.getLogger("atom")
 
 DSV4_CHECKPOINT_SAVE_CHANNEL = "atom.dsv4.checkpoint.save"
+# PAGE saves need a terminal channel of their own because ``finished_saving``
+# cannot express failure: it is one undifferentiated set, so a save rejected on
+# admission or killed inside the executor reaches the scheduler looking exactly
+# like one that landed. The scheduler advances its saved watermark when a save
+# is *emitted*, so with no failure signal it can never learn to take that
+# advance back, and the skipped range becomes a permanent hole in the prefix.
+DSV4_PAGE_SAVE_CHANNEL = "atom.dsv4.page.save"
 
 
 def _wait_for_publication(
@@ -221,11 +229,32 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         # The ATOM LMCache GPU connector owns per-thread staging streams.
         # OFFLOAD_COPY_WORKERS tunes the SAVE pool only.
         n_save_workers = int(os.environ.get("OFFLOAD_COPY_WORKERS", "1"))
+        # The SLOT load path is *not* thread-safe against itself: a worker batch
+        # shares one staging row across its loads (`_SlotLoadBatchReservation`)
+        # precisely because the load executor runs them in submission order. A
+        # second load thread would run two loads through the same staging row
+        # concurrently and corrupt both. OFFLOAD_LOAD_WORKERS therefore does not
+        # apply to DSV4 -- honour it loudly rather than silently.
+        n_load_env = int(os.environ.get("OFFLOAD_LOAD_WORKERS", "1"))
+        if n_load_env != 1:
+            logger.warning(
+                "ATOM DSV4 offload: ignoring OFFLOAD_LOAD_WORKERS=%d; the SLOT "
+                "load path shares one staging row per worker batch and requires "
+                "a serial load executor",
+                n_load_env,
+            )
         self._max_pending_saves = max_pending_saves(kvc, n_save_workers)
         self._save_admission = threading.BoundedSemaphore(self._max_pending_saves)
+        # Terminal PAGE-save outcomes, drained by ``get_finished`` onto
+        # ``DSV4_PAGE_SAVE_CHANNEL``. Every request carrying a ``save_spec``
+        # lands in exactly one of these, on every path out of the save, so the
+        # TP aggregator always reaches a verdict instead of stranding the key.
+        self._done_page_save: set = set()
+        self._failed_page_save: set = set()
         self._init_worker_common(
             config,
             save_workers=n_save_workers,
+            load_workers=1,
             thread_name_prefix="lmc-offload",
         )
         # Kept separate from _done_save: PAGE completion releases deferred
@@ -751,6 +780,31 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                         slot_snapshot,
                     )
 
+    def _report_page_save_locked(self, req: LMCacheReqMeta, *, succeeded: bool) -> None:
+        """Record one request's terminal PAGE outcome. Caller holds ``_lock``.
+
+        Only a request that carries a ``save_spec`` moved the scheduler's
+        watermark, so only that one needs a verdict -- a SLOT-only save has
+        nothing to roll back.
+        """
+        if getattr(req, "save_spec", None) is None:
+            return
+        completion_id = self._save_completion_id(req)
+        if succeeded:
+            self._done_page_save.add(completion_id)
+        else:
+            self._failed_page_save.add(completion_id)
+
+    def _report_page_save(self, req: LMCacheReqMeta, *, succeeded: bool) -> None:
+        """Lock-taking form of :meth:`_report_page_save_locked`.
+
+        ``_lock`` is a plain ``Lock``, so this must never be called while it is
+        already held; the in-executor path reports through the ``_locked`` form
+        inside the section it already owns.
+        """
+        with self._lock:
+            self._report_page_save_locked(req, succeeded=succeeded)
+
     def _finish_unadmitted_save(
         self,
         req: LMCacheReqMeta,
@@ -759,6 +813,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
     ) -> None:
         """Terminally reject a save before retaining any operation state."""
 
+        self._report_page_save(req, succeeded=False)
         completion_id = self._save_completion_id(req)
         with self._lock:
             save_operation = getattr(req, "save_operation", None)
@@ -882,6 +937,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         slot_snapshot: _SlotSaveSnapshot | None,
     ) -> None:
         """Safely retire an RPC snapshot when executor submission fails."""
+        self._report_page_save(req, succeeded=False)
         try:
             gpu_complete = True
             try:
@@ -1031,6 +1087,14 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                     self._complete_load_locked(req, succeeded=False)
                 elif getattr(req, "slot_save_spec", None) is not None:
                     self._failed_sidecar_save.add(self._save_completion_id(req))
+                if kind == "save":
+                    # Backstop. ``_do_save_req`` normally reports its own PAGE
+                    # verdict and swallows its errors, so this only fires if it
+                    # died outside that handling -- but a save that reports
+                    # nothing would sit in the TP aggregator forever, so the
+                    # failure has to be recorded here too. A duplicate report is
+                    # harmless: the aggregator is failure-dominant per worker.
+                    self._report_page_save_locked(req, succeeded=False)
 
     def _complete_load_locked(self, req: LMCacheReqMeta, *, succeeded: bool) -> None:
         completion_id = self._load_completion_id(req)
@@ -1144,7 +1208,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         t_retrieve0 = time.perf_counter()
         self._reset_gpu_connector_transfer_stats()
         ret_mask = self._engine.retrieve(
-            torch.tensor(toks),
+            tokens_to_tensor(toks),
             mask=mask,
             block_ids=req.block_ids,
             req_id=str(req.req_id),
@@ -1447,6 +1511,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         slot_blob = None
         slot_preparation_error: Exception | None = None
         page_plan = None
+        page_stored = False
         t_total0 = time.perf_counter()
         store_ms = 0.0
         transfer_stats: dict[str, int | float] = {}
@@ -1536,19 +1601,28 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 t_store0 = time.perf_counter()
                 self._reset_gpu_connector_transfer_stats()
                 self._engine.store(
-                    torch.tensor(toks),
+                    tokens_to_tensor(toks),
                     mask=mask,
                     block_ids=req.block_ids,
                     req_id=str(req.req_id),
                 )
                 store_ms = (time.perf_counter() - t_store0) * 1000
                 transfer_stats = self._last_gpu_connector_transfer_stats()
+            if slot_spec is None:
+                # PAGE-only save. `store` returning is the only durability
+                # signal that exists here, so it is the verdict; a raise above
+                # leaves this False and the advance gets taken back.
+                page_stored = True
 
             if slot_spec is not None:
-                if slot_preparation_error is not None:
-                    raise slot_preparation_error
-                _, slot_store, _ = self._require_slot_components()
-                checkpoint_codec = self._require_checkpoint_codec()
+                # A stateful save can check its own work, and this probe is the
+                # only confirmation that the PAGEs behind the advance are
+                # actually queryable. Run it before anything SLOT-related, so
+                # the PAGE verdict never depends on staging, and claim the
+                # advance only once it passes -- reporting success on a
+                # visibility timeout would commit a watermark over a prefix
+                # nobody can read, which is the hole this channel exists to
+                # prevent.
                 boundary_tokens = int(slot_spec.boundary_tokens)
 
                 def _page_boundary_visible() -> bool:
@@ -1563,6 +1637,16 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                     raise RuntimeError(
                         "PAGE coverage did not become session-visible before timeout"
                     )
+                # Confirmed. Everything below is sidecar-only, and a SLOT
+                # failure from here on must not revoke a PAGE advance that did
+                # land -- that is why the verdict is taken at this exact point
+                # and not at the end of the block.
+                page_stored = True
+
+                if slot_preparation_error is not None:
+                    raise slot_preparation_error
+                _, slot_store, _ = self._require_slot_components()
+                checkpoint_codec = self._require_checkpoint_codec()
                 if slot_blob is None:
                     raise RuntimeError("SLOT CPU frame is unavailable after D2H")
                 checkpoint_codec.finalize_tensor_(
@@ -1636,11 +1720,22 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                     save_failure_reason = "staging_cleanup"
 
             with self._lock:
+                self._report_page_save_locked(req, succeeded=page_stored)
                 if slot_spec is not None:
                     if sidecar_published:
                         self._done_sidecar_save.add(self._save_completion_id(req))
                     else:
                         self._failed_sidecar_save.add(self._save_completion_id(req))
+            if not page_stored and getattr(req, "save_spec", None) is not None:
+                logger.warning(
+                    "LMCache offload: PAGE save did not land rank=%s req=%s "
+                    "skip=%d reason=%s error_type=%s",
+                    getattr(self, "_rank", "?"),
+                    req.req_id,
+                    skip,
+                    save_failure_reason,
+                    save_error_type,
+                )
             if slot_spec is not None:
                 if sidecar_published:
                     logger.info(
@@ -1704,6 +1799,10 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             fss = set(self._failed_sidecar_save)
             self._done_sidecar_save.clear()
             self._failed_sidecar_save.clear()
+            dps = set(self._done_page_save)
+            fps = set(self._failed_page_save)
+            self._done_page_save.clear()
+            self._failed_page_save.clear()
         connector_completions = {
             ConnectorCompletion(
                 channel=DSV4_CHECKPOINT_SAVE_CHANNEL,
@@ -1719,6 +1818,22 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 succeeded=False,
             )
             for completion_id in fss
+        )
+        connector_completions.update(
+            ConnectorCompletion(
+                channel=DSV4_PAGE_SAVE_CHANNEL,
+                operation_id=completion_id,
+                succeeded=True,
+            )
+            for completion_id in dps
+        )
+        connector_completions.update(
+            ConnectorCompletion(
+                channel=DSV4_PAGE_SAVE_CHANNEL,
+                operation_id=completion_id,
+                succeeded=False,
+            )
+            for completion_id in fps
         )
         return KVConnectorOutput(
             finished_sending=set(),
@@ -1791,6 +1906,14 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self._load_lifecycles: dict[str, object] = {}
         self._active_load_operations: dict[str, tuple[object, LoadOperationId]] = {}
         self._save_inflight: dict[str, set[SaveOperationId]] = {}
+        # sid -> {save operation: the watermark before that operation's advance}.
+        # ``build_connector_meta`` advances the saved watermark where it *emits*
+        # a save, so the advance is a prediction, not a fact. Keep what each one
+        # was contingent on so a save that never lands can take its advance back.
+        self._save_watermark_rollback: dict[str, dict[SaveOperationId, int]] = {}
+        # Finished requests get a bounded window without successful PAGE saves.
+        # Dispatch refreshes the copy-retention clock, not this progress clock.
+        self._finished_save_progress_at: dict[str, float] = {}
         # Stateful PAGE/SLOT protocol. Sidecar commits are session-local because
         # worker-side sidecar storage is not queried by the scheduler.
         self._committed_sidecar_hashes = _BoundedLRUSet(
@@ -1852,23 +1975,48 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             self._active_slot_loads.pop(sid, None)
             self._active_load_operations.pop(sid, None)
             self._handoff_loads.discard(sid)
+            self._load_failed_seqs.pop(sid, None)
+            self._forget_tier_hit(sid)
         self._load_lifecycles[sid] = seq
 
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
+        """How many extra prompt tokens the external tier can supply.
+
+        Same retry shape, and the same remembered hit, as the dense scheduler
+        (`OffloadSchedulerMixin._init_tier_hit_memo`): the boundary search below
+        reads sidecar state that moves underneath the hit, so only the hit is
+        remembered and the answer is derived on every call.
+        """
+
         if not self._do_load or self._lookup_client is None:
             return 0, False
         self._begin_load_lifecycle(seq)
+        sid = str(seq.id)
+        if self._repeat_load_suppressed(seq, sid):
+            return 0, False
+        remembered, hit = self._remembered_tier_hit(seq, sid)
+        if not remembered:
+            hit = self._fresh_tier_lookup(seq, sid)
+        if hit is None:
+            self._clear_lookup_retry_state(sid)
+            return 0, False
+        return self._answer_from_tier_hit(seq, sid, hit)
+
+    def _fresh_tier_lookup(self, seq, sid: str) -> int | None:
+        """Ask the tier, take its pin, and remember the hit. None if it did not answer."""
+
         num_prompt = seq.num_prompt_tokens
         token_ids = list(seq.token_ids[:num_prompt])
-        sid = str(seq.id)
         if sid not in self._lookup_in_step:
             self._lookup_in_step.append(sid)
         try:
             hit = self._lookup_client.lookup(token_ids, lookup_id=sid)
         except Exception:
             logger.exception("LMCache offload lookup failed for seq %s", seq.id)
-            self._clear_lookup_retry_state(sid)
-            return 0, False
+            self._remember_tier_hit(seq, sid, None)
+            return None
+        hit = None if hit is None else int(hit)
+        self._remember_tier_hit(seq, sid, hit)
         if logger.isEnabledFor(logging.DEBUG):
             _lh = None
             try:
@@ -1890,13 +2038,17 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 hit,
                 _lh,
             )
+        return hit
+
+    def _answer_from_tier_hit(self, seq, sid: str, hit: int) -> tuple[int, bool]:
+        """Turn a tier hit into this step's answer, and arm what it implies."""
+
         if not hit:
             self._clear_lookup_retry_state(sid)
             return 0, False
-        hit = int(hit)
-        if hit == num_prompt:  # full-prompt hit → recompute last token
-            hit -= 1
-        self._hit_save_floors[sid] = self._chunk_floor(hit)
+        num_prompt = seq.num_prompt_tokens
+        hit = self._loadable_hit(hit, num_prompt)
+        self._hit_save_floors[sid] = hit
         if bool(getattr(seq, "has_per_req_cache", False)):
             boundary_hashes, _ = self._sidecar_hash_data(seq)
             boundary = (hit // self.resume_alignment) * self.resume_alignment
@@ -1930,6 +2082,9 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
     def update_state_after_alloc(self, seq) -> None:
         sid = str(seq.id)
         self._begin_load_lifecycle(seq)
+        # Admitted: the frontier moves and the load spec is dispatched, so a
+        # remembered hit has been spent. A preempted request asks again.
+        self._forget_tier_hit(sid)
         ls = self._load_specs.get(sid) if self._do_load else None
         initial_saved = max(
             self._lmcache_hit_save_floor(ls),
@@ -1968,6 +2123,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             entry = self._save_tracker.get(sid)
             if entry is None or entry[0] is not seq:
                 self._save_tracker[sid] = [seq, initial_saved]
+                self._finished_save_progress_at.pop(sid, None)
                 self._sidecar_hash_cache.pop(sid, None)
                 self._failed_sidecar_saves.pop(sid, None)
             else:
@@ -2190,6 +2346,13 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
                 self._clear_pending_load(sid)
                 continue
+            # This is the one place a retrieve is handed to the worker, so it
+            # is where the load's lookup pin has to be live -- a spec derived
+            # from a remembered hit has none yet.
+            if not self._ensure_lookup_pin(seq, sid, ls):
+                self._mark_load_skip(seq, "tier_lost_prefix", hbm, lmc, need, chunk)
+                self._clear_pending_load(sid)
+                continue
             slot_load_spec = None
             if bool(getattr(seq, "has_per_req_cache", False)):
                 pending_slot = self._pending_slot_loads.get(sid)
@@ -2262,7 +2425,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         # chunk's forward has completed; use it as the D2H-safe frontier.
         chunk = self.chunk_size or 256
         for sid, entry in self._save_tracker.items():
-            if not self._do_save:
+            if not self._do_save or self._save_retries_expired(sid):
                 continue
             seq, saved = entry
             if sid in self._reqs_need_recv or sid in loading_sids:
@@ -2309,6 +2472,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 save_operation,
                 aligned - saved if page_save_due else 0,
             )
+            self._refresh_save_reclaim_clock(seq)
             meta.add_request(
                 LMCacheReqMeta(
                     req_id=seq.id,
@@ -2325,6 +2489,9 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 )
             )
             if page_save_due:
+                self._save_watermark_rollback.setdefault(sid, {})[save_operation] = int(
+                    entry[1]
+                )
                 entry[1] = aligned
                 self._save_inflight.setdefault(sid, set()).add(save_operation)
             if sidecar_candidate is not None:
@@ -2350,6 +2517,19 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         )
         return self._sidecar_save_candidate(seq, computed) is not None
 
+    def _save_retries_expired(self, sid: str) -> bool:
+        """Stop new work after a finished request makes no save progress.
+
+        Use the existing abandon window, independently of the per-dispatch
+        source-retention clock. In-flight PAGE/SLOT operations still own the
+        blocks until their completion or the normal stalled-copy reclaim.
+        """
+        progress_at = self._finished_save_progress_at.get(sid)
+        if progress_at is None:
+            return False
+        timeout = self.save_abandon_timeout_s()
+        return timeout > 0 and time.monotonic() - progress_at >= timeout
+
     def should_defer_free(self, seq) -> bool:
         if self._has_active_load(seq):
             return True
@@ -2359,8 +2539,10 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         return (
             sid in self._save_inflight
             or sid in self._sidecar_save_inflight
-            or self._has_pending_save(seq)
-            or self._has_pending_sidecar_save(seq)
+            or (
+                not self._save_retries_expired(sid)
+                and (self._has_pending_save(seq) or self._has_pending_sidecar_save(seq))
+            )
         )
 
     def has_pending_work(self) -> bool:
@@ -2375,6 +2557,61 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         """
         return bool(
             self._reqs_need_recv or self._save_inflight or self._sidecar_save_inflight
+        )
+
+    @staticmethod
+    def _watermark_sid(operation) -> str:
+        return str(getattr(operation, "req_id", operation))
+
+    def _forget_save_watermark(self, operation) -> int | None:
+        """Drop one operation's contingency record, returning what it held."""
+        sid = self._watermark_sid(operation)
+        pending = self._save_watermark_rollback.get(sid)
+        if pending is None:
+            return None
+        previous = pending.pop(operation, None)
+        if not pending:
+            self._save_watermark_rollback.pop(sid, None)
+        return previous
+
+    def _release_save_watermark(self, operation) -> None:
+        """Retire the record of a save that landed; its advance was correct."""
+        previous = self._forget_save_watermark(operation)
+        sid = self._watermark_sid(operation)
+        if previous is not None and sid in self._finished_save_progress_at:
+            self._finished_save_progress_at[sid] = time.monotonic()
+
+    def _rollback_save_watermark(self, operation) -> None:
+        """Take back the watermark advance of a save that never landed.
+
+        The advance told every later incremental save to skip that range. With
+        nothing persisting it the range is a permanent hole in the prefix:
+        ``_page_boundary_visible`` can never see a PAGE hit reach
+        ``boundary_tokens``, so SLOT publication times out forever and no prefix
+        is ever complete -- which is why raising CPU capacity cannot help, one
+        saturation poisons the sequence. Lowering the watermark makes the next
+        step re-emit the range. Lowering past a *later* save that did land costs
+        one redundant write and nothing else: stores are idempotent, and the
+        prefix has to be contiguous anyway, so everything beyond the hole was
+        unusable regardless.
+        """
+        previous = self._forget_save_watermark(operation)
+        if previous is None:
+            return
+        sid = self._watermark_sid(operation)
+        entry = self._save_tracker.get(sid)
+        if entry is None:
+            return
+        current = int(entry[1])
+        if current <= previous:
+            return
+        entry[1] = previous
+        logger.warning(
+            "LMCache offload: save watermark rolled back req=%s %d -> %d "
+            "(save did not land); those PAGEs will be saved again",
+            sid,
+            current,
+            previous,
         )
 
     def save_finished(self, req_id) -> None:
@@ -2423,6 +2660,10 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         if sidecar is not None:
             self._cancel_save_statistics(sidecar[0])
         self._save_tracker.pop(sid, None)
+        self._finished_save_progress_at.pop(sid, None)
+        # The tracker entry is gone, so there is no longer a watermark to take
+        # back; keeping the records would only leak.
+        self._save_watermark_rollback.pop(sid, None)
 
     def release_stalled_save(self, seq) -> None:
         """Drop bookkeeping for a stall-escaped save the scheduler is freeing.
@@ -2436,6 +2677,20 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
     def connector_completion(self, completion: ConnectorCompletion) -> bool:
         """Apply one TP-aggregated completion owned by the DSV4 scheduler."""
 
+        if completion.channel == DSV4_PAGE_SAVE_CHANNEL:
+            # `process_completions` runs this before `save_finished`, so the
+            # watermark is corrected while the operation is still in
+            # `_save_inflight`; clearing it there then lets the very next
+            # `build_connector_meta` re-emit the range.
+            if completion.succeeded:
+                self._release_save_watermark(completion.operation_id)
+            else:
+                self._rollback_save_watermark(completion.operation_id)
+                # Nothing was persisted, so these bytes must not land in
+                # `total_saved_tokens`; cancelling first makes the
+                # `_finish_save_statistics` in `save_finished` a no-op.
+                self._cancel_save_statistics(completion.operation_id)
+            return True
         if completion.channel != DSV4_CHECKPOINT_SAVE_CHANNEL:
             return False
         if completion.succeeded:
@@ -2499,6 +2754,10 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             # [HBM, LMC) chunks be saved again instead of permanently treating
             # them as already persisted.
             entry[1] = self._chunk_floor(floor)
+        self._record_failed_load_attempt(sid)
+        # See the dense scheduler's `load_failed`: the remembered hit must not
+        # outlive the load spec it would imply.
+        self._forget_tier_hit(sid)
         self._clear_pending_load(sid)
         return True
 
@@ -2516,8 +2775,30 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self._load_save_floors.pop(sid, None)
         return True
 
+    def _drop_finished_save_state(self, sid: str, seq) -> None:
+        """Forget a finished request's save bookkeeping.
+
+        Keyed on the *blocks*, not the request: `_save_tracker` holds the
+        `Sequence` and is what `build_connector_meta`'s save loop iterates
+        (reading `seq.block_table` straight out of it), so it may only be
+        dropped once nothing can still read that block table. The sidecar
+        failure set and the watermark records are scoped to the same tracker
+        entry and go with it. Both terminals route here -- `request_finished`
+        when the free was not deferred at all, `source_blocks_released` when
+        it was.
+        """
+        entry = self._save_tracker.get(sid)
+        if entry is None or entry[0] is not seq:
+            return
+        self._save_tracker.pop(sid, None)
+        self._finished_save_progress_at.pop(sid, None)
+        self._failed_sidecar_saves.pop(sid, None)
+        self._save_watermark_rollback.pop(sid, None)
+
     def request_finished(self, seq) -> None:
         sid = str(seq.id)
+        self._release_failed_load_attempt(sid, seq)
+        self._forget_tier_hit(sid)
         if self._load_lifecycles.get(sid) is seq:
             self._clear_pending_load(sid)
             self._active_slot_loads.pop(sid, None)
@@ -2530,11 +2811,25 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         if cached is not None and cached[0] is seq:
             self._sidecar_hash_cache.pop(sid, None)
         entry = self._save_tracker.get(sid)
-        if entry is not None and entry[0] is seq and not self.should_defer_free(seq):
-            self._save_tracker.pop(sid, None)
-            self._failed_sidecar_saves.pop(sid, None)
+        if entry is not None and entry[0] is seq:
+            self._finished_save_progress_at.setdefault(sid, time.monotonic())
+        if not self.should_defer_free(seq):
+            self._drop_finished_save_state(sid, seq)
         if hasattr(seq, "_load_operation"):
             delattr(seq, "_load_operation")
+
+    def source_blocks_released(self, seq) -> None:
+        """Terminal for the deferred path: the blocks are back in the pool.
+
+        DSV4 always defers -- it has no early-release exit and so no
+        `_finish_retired_request` -- which makes this the *only* terminal its
+        normal completion path ever reaches. Without it every request leaks a
+        tracker entry (and the `Sequence` it pins), and a request whose
+        watermark was rolled back by a failed save keeps `page_save_due` True
+        forever, re-emitting a save against a freed, reusable block table on
+        every step.
+        """
+        self._drop_finished_save_state(str(seq.id), seq)
 
 
 __all__ = [

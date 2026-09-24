@@ -417,7 +417,7 @@ def _report_coverage(
     # output buffers, weight_scale params merged from multiple checkpoint scales).
     # Heuristic: anything ending in `_shuffled`, `_packed`, etc. Conservative
     # default = report everything else.
-    suppressed_suffixes = ("_shuffled", "_packed", "_meta_for_quant", "weight_scale_2")
+    suppressed_suffixes = ("_shuffled", "_packed", "_meta_for_quant")
     truly_unloaded = [
         n for n in unloaded if not any(n.endswith(s) for s in suppressed_suffixes)
     ]
@@ -447,7 +447,6 @@ def _report_coverage(
             "output_scale",
             "kv_scale",
             "inv_freq",
-            "weight_scale_2",
         )
         actionable_drops = [
             (orig, mapped)

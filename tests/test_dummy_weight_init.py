@@ -11,7 +11,6 @@ finite values instead of leaving them as torch.empty garbage:
             fp4 (uint8 fp4x2 weight + uint8 e8m0 scale) and fp8 packed weights.
 """
 
-import sys
 import unittest
 
 import pytest
@@ -20,26 +19,6 @@ import pytest
 # pulls atom.model_ops -> AITER (GPU-only). Skip on the non-GPU unit gate; runs
 # in GPU CI (and locally on the box) where AITER is present.
 pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
-
-# Loading the real atom source wipes the conftest.py stubs; snapshot and restore
-# sys.modules so this file's effect stays local to its own collection (mirrors
-# test_mxfp4_moe_has_bias.py).
-_saved_atom_modules: dict[str, object] = {}
-
-
-def setUpModule():
-    global _saved_atom_modules
-    _saved_atom_modules = {
-        name: mod for name, mod in sys.modules.items() if name.startswith("atom")
-    }
-    for name in list(_saved_atom_modules):
-        del sys.modules[name]
-
-
-def tearDownModule():
-    for name in [n for n in sys.modules if n.startswith("atom")]:
-        del sys.modules[name]
-    sys.modules.update(_saved_atom_modules)
 
 
 def _build_module():

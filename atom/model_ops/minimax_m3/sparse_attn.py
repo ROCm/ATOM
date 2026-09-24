@@ -10,16 +10,18 @@ Only the MiniMax M3 paths are implemented: base-2 softmax, no attention sink,
 and split-K decode with a separate merge step.
 """
 
+import functools
 from dataclasses import dataclass
 
-import aiter  # noqa: F401  (used by the gluon PA runners for aiter.dtypes.fp8)
+import aiter
 import torch
 
-try:
-    from vllm.triton_utils import tl, triton
-except ModuleNotFoundError:
-    import triton
-    import triton.language as tl
+# Adapted for ATOM: the vLLM original took these from `vllm.triton_utils`,
+# which couples to vLLM internals. ATOM imports triton directly everywhere else.
+import triton
+import triton.language as tl
+
+from atom.model_ops.minimax_m3.index_topk import build_n_valid_column_per_row
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
@@ -60,6 +62,16 @@ class MiniMaxM3SparseMetadata:
     num_prefills: int
     prefill: MiniMaxM3SparsePrefillMetadata | None = None
     decode: MiniMaxM3SparseDecodeMetadata | None = None
+    n_valid_column_per_row: torch.Tensor | None = None
+    """[num_idx_heads * total_q] int32 GPU -- live columns of each index-selector
+    row, head-major to match `score.view(rows, max_block)`. None on an empty batch.
+
+    Built once here and read by every sparse layer: the bound is
+    `ceil(causal_len / SPARSE_BLOCK_SIZE)`, a function of the query token alone,
+    so a per-layer rebuild would repeat one launch tens of times a step -- what
+    `deepseek_v4_attn.csa_n_committed_per_token` hoists out for the sibling
+    indexer. `index_topk` consumes it and never derives its own.
+    """
 
 
 def make_sparse_prefill_metadata(
@@ -72,6 +84,8 @@ def make_sparse_prefill_metadata(
     max_seq_len: int,
     num_prefills: int,
     num_prefill_tokens: int,
+    num_idx_heads: int,
+    n_valid_column_per_row_out: torch.Tensor | None = None,
 ) -> MiniMaxM3SparseMetadata:
     query_lens = cu_seqlens_q[1 : num_prefills + 1] - cu_seqlens_q[:num_prefills]
     prefix_lens = seq_lens - query_lens
@@ -92,6 +106,16 @@ def make_sparse_prefill_metadata(
         num_prefills=num_prefills,
         prefill=prefill,
         decode=None,
+        # Ragged rows: query starts, and the keys already behind each request.
+        n_valid_column_per_row=build_n_valid_column_per_row(
+            cu_seqlens_q,
+            prefix_lens,
+            batch=num_prefills,
+            total_q=num_prefill_tokens,
+            num_idx_heads=num_idx_heads,
+            decode_max_q=0,
+            out=n_valid_column_per_row_out,
+        ),
     )
 
 
@@ -101,11 +125,14 @@ def make_sparse_decode_metadata(
     block_table: torch.Tensor,
     slot_mapping: torch.Tensor,
     max_seq_len: int,
+    num_idx_heads: int,
     max_query_len: int = 1,
+    n_valid_column_per_row_out: torch.Tensor | None = None,
 ) -> MiniMaxM3SparseMetadata:
     decode = MiniMaxM3SparseDecodeMetadata(
         seq_lens=seq_lens, block_table=block_table, max_query_len=max_query_len
     )
+    batch = seq_lens.shape[0]
     return MiniMaxM3SparseMetadata(
         seq_lens=seq_lens,
         max_seq_len=max_seq_len,
@@ -113,6 +140,17 @@ def make_sparse_decode_metadata(
         num_prefills=0,
         prefill=None,
         decode=decode,
+        # Dense rows: `max_query_len` per request, so both index arrays collapse
+        # to seq_lens and each request's tail token ends at its full length.
+        n_valid_column_per_row=build_n_valid_column_per_row(
+            seq_lens,
+            seq_lens,
+            batch=batch,
+            total_q=batch * max_query_len,
+            num_idx_heads=num_idx_heads,
+            decode_max_q=max_query_len,
+            out=n_valid_column_per_row_out,
+        ),
     )
 
 
@@ -123,6 +161,123 @@ def _is_fp8_kv_cache_tensor(kv_cache: torch.Tensor) -> bool:
         getattr(torch, "float8_e5m2", None),
     )
     return kv_cache.dtype in {dtype for dtype in fp8_dtypes if dtype is not None}
+
+
+@functools.cache
+def _gluon_one_pass_max_rows(device_index: int | None) -> int:
+    """Rows up to which split-KV still covers the GPU, at aiter's occupancy.
+
+    Under it gluon wins (ASM is launch-bound), over it loses. Both factors are
+    aiter's: it sizes its split ladder against `multi_processor_count *
+    get_occupancy()`, so the bare CU count would halve this and hand rows
+    33..64 to ASM, which loses there. rows=1 asks for its cap, not a copy.
+
+    256 * 2 // 8 = 64 on MI355X, and the measured crossover is 64..80 there
+    (gluon 11.2us vs ASM 14.7 at 64 rows; 15.9 vs 15.1 at 80). On triton 3.8 it
+    moves to ~36 -- gluon is a Triton JIT and 3.8 compiles it up to 2x slower,
+    while ASM is hand-written and does not move. The image pins 3.7 (#2173);
+    re-measure on both before touching this.
+    """
+    from aiter.ops.triton.gluon.pa_decode_gluon import (
+        get_occupancy,
+        get_recommended_splits,
+    )
+
+    cus = torch.cuda.get_device_properties(device_index).multi_processor_count
+    return max(1, cus * get_occupancy() // get_recommended_splits(1, 1))
+
+
+# The maskless fp8 kernel returns NaN for gqa=16 when the context needs exactly
+# 16 pages with a partial tail (241..255 tokens); gqa=8 is correct there, and
+# two 8-head queries of one request are the same arithmetic over the same KV.
+# Unconditional: the trigger is a sparse_ctx value, and reading it costs a sync.
+_ASM_NAN_GROUP = 16
+_ASM_SPLIT = 2
+
+# A maskless mtp>0 kernel is unreachable through the heuristic (a null qo_indptr
+# forces mtp=0, a non-null one forces msk=1), so name the row. An unlisted dtype
+# keeps the unsplit path rather than aborting inside aiter.
+_ASM_SPLIT_KERNELS = {
+    torch.bfloat16: "_ZN5aiter40pa_bf16_pertokenFp8_gqa8_1tg_4w_mtp_msk0E",
+    torch.float16: "_ZN5aiter40pa_fp16_pertokenFp8_gqa8_1tg_4w_mtp_msk0E",
+}
+
+
+# Every request contributes two queries, so the indptr is 2 * arange. Allocated
+# once past any batch (1 MiB) and narrowed per call: narrow raises where a slice
+# would hand the kernel a short tensor, and a pool that grew on demand would
+# allocate inside a graph capture.
+_SPLIT_INDPTR_ROWS = 1 << 18
+
+
+@functools.cache
+def _split_indptr(device: torch.device) -> torch.Tensor:
+    return torch.arange(
+        0,
+        (_SPLIT_INDPTR_ROWS + 1) * _ASM_SPLIT,
+        _ASM_SPLIT,
+        dtype=torch.int32,
+        device=device,
+    )
+
+
+def _sparse_pa_ran_on_asm(
+    q: torch.Tensor,  # [rows, query_group_size, head_dim]
+    k_cache: torch.Tensor,  # page-16 SHUFFLE, kv-head already collapsed
+    v_cache: torch.Tensor,
+    sparse_bt: torch.Tensor,
+    sparse_ctx: torch.Tensor,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+    out: torch.Tensor,
+) -> bool:
+    """Run the selection on ASM; False if ASM is unfit or unprofitable here.
+
+    The test sits with the call because past ``PA_ASM_MAX_QUERY_GROUP_SIZE``
+    the heuristic substitutes an mtp=1 kernel and answers wrongly rather than
+    refusing -- a test that can be skipped is one that will be. bf16 KV is in
+    the table but unmeasured, so it is not claimed; too few rows and ASM fits
+    but loses, see ``_gluon_one_pass_max_rows``.
+    """
+    from atom.model_ops.base_attention import (
+        PA_ASM_MAX_QUERY_GROUP_SIZE,
+        run_pa_fwd_asm,
+    )
+
+    rows, group, head_dim = q.shape
+    if (
+        k_scale is None
+        or not _is_fp8_kv_cache_tensor(k_cache)
+        or group > PA_ASM_MAX_QUERY_GROUP_SIZE
+        or rows <= _gluon_one_pass_max_rows(q.device.index)
+    ):
+        return False
+
+    kernel_name = _ASM_SPLIT_KERNELS.get(q.dtype) if group == _ASM_NAN_GROUP else None
+    qo_indptr, max_qlen = None, 1
+    if kernel_name:
+        # Rows 2b/2b+1 are request b's head halves -- the kernel's own
+        # q[b*qlen + i] layout, so one block-table row still serves both.
+        qo_indptr = _split_indptr(q.device).narrow(0, 0, rows + 1)
+        q = q.view(rows * _ASM_SPLIT, group // _ASM_SPLIT, head_dim)
+        out = out.view(q.shape)
+        max_qlen = _ASM_SPLIT
+
+    pages, pbs = k_cache.shape[0], k_scale.shape[-1]
+    run_pa_fwd_asm(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        block_tables=sparse_bt,
+        context_lens=sparse_ctx,
+        k_scale=k_scale.view(pages, 1, pbs),
+        v_scale=v_scale.view(pages, 1, pbs),
+        out=out,
+        qo_indptr=qo_indptr,
+        max_qlen=max_qlen,
+        kernel_name=kernel_name,
+    )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -524,7 +679,7 @@ def minimax_m3_sparse_attn(
     output: torch.Tensor,  # [total_q, num_heads, head_dim]
 ) -> None:
     """GQA block-sparse attention over the selected blocks. block_size_q == 1."""
-    total_q, num_heads, head_dim = q.shape
+    _total_q, num_heads, head_dim = q.shape
     batch = cu_seqlens_q.shape[0] - 1
     topk = topk_idx.shape[-1]
     gqa_group_size = num_heads // num_kv_heads
@@ -1147,27 +1302,17 @@ def minimax_m3_sparse_attn_decode_asm(
     sparse_bt: torch.Tensor | None = None,  # prebuilt (fused topk) -> skip build
     sparse_ctx: torch.Tensor | None = None,
 ) -> None:
-    """Block-sparse decode attention via the AITER Gluon paged-attention kernel.
+    """Block-sparse decode attention over the page-16 SHUFFLE KV cache.
 
     The lightning-indexer's selected logical 128-blocks are compacted into a
     dense PHYSICAL 16-page block_table (each 128-block -> 8 pages, tail packed
-    last) + exact context_lens, then fed to the Gluon split-KV paged-attention
-    decode kernel (``pa_decode_gluon``) over the page-16 SHUFFLE KV cache. The
-    split-KV (flash-decoding) implementation is more efficient than the monolithic
-    ASM kernel at low concurrency (few decode sequences), where it parallelizes
-    over KV partitions to keep the GPU busy.
-
-    If ``sparse_bt`` / ``sparse_ctx`` are provided (built fused inside the topk
-    merge kernel), the standalone compaction launch is skipped.
+    last) + exact context_lens, then run one row per sequence. A ``sparse_bt`` /
+    ``sparse_ctx`` built fused inside the topk merge kernel skips the standalone
+    compaction launch.
 
     Requires per-rank num_kv_heads == 1 (the indexer top-k is per-kv-head; one
     shared block_table cannot express per-kv-head selection) and head_dim == 128.
     """
-    from atom.model_ops.base_attention import run_pa_decode_gluon
-    from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
-
-    assert q.shape[-1] == 128, "Gluon paged-attention requires head_dim == 128."
-
     if sparse_bt is None or sparse_ctx is None:
         # Standalone (non-fused) build is num_kv_heads==1 only; the fused topk emit
         # is what produces the kv-head-collapsed sparse_bt/ctx for num_kv_heads>1.
@@ -1179,86 +1324,22 @@ def minimax_m3_sparse_attn_decode_asm(
             topk_idx, block_table, seq_lens
         )
 
-    # Collapse (token, kv_head) into the row dim so gluon runs with an effective
-    # num_kv_heads_view == 1. ZERO data copy: q/cache/output/scale are views, and
-    # sparse_bt already encodes the kv-head in its page ids (page = phys16*Hkv+kvh,
-    # matching the collapsed cache view [num_phys16*Hkv, 1, ...]).
-    #   q:    [T, Hq, 128]               -> [T*Hkv, g, 128]   (g = Hq // Hkv)
-    #   kv:   [num_phys16, Hkv, ...]      -> [num_phys16*Hkv, 1, ...]
-    #   out:  [T, Hq, 128]               -> [T*Hkv, g, 128]
-    # Hkv == 1 is the identity (no shape change).
-    assert q.is_contiguous(), "decode_asm requires contiguous q for the kv-head view"
-    T, num_q_heads_total, head_size = q.shape
-    g = num_q_heads_total // num_kv_heads
-    q_view = q.view(T * num_kv_heads, g, head_size)
-    out_view = output.view(T * num_kv_heads, g, head_size)
-    # .view (not .reshape): the SHUFFLE cache slices are contiguous, so collapsing
-    # (num_phys16, Hkv) -> num_phys16*Hkv is guaranteed zero-copy; a copy here would
-    # silently break the page-id encoding alignment.
-    nph16, _hkv = k_cache.shape[0], k_cache.shape[1]
-    k_cache_view = k_cache.view(nph16 * _hkv, 1, *k_cache.shape[2:])
-    v_cache_view = v_cache.view(nph16 * _hkv, 1, *v_cache.shape[2:])
-
-    num_seqs = T * num_kv_heads
-    num_kv_heads_view = 1
-    query_group_size = g
-    max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads_view)
-    context_partition_size = 256
-    intermediate_shape = (
-        num_seqs,
-        num_kv_heads_view,
-        max_context_partition_num,
-        query_group_size,
+    _sparse_pa_per_row(
+        q,
+        k_cache,
+        v_cache,
+        sparse_bt,
+        sparse_ctx,
+        num_kv_heads,
+        sm_scale,
+        output,
+        k_scale,
+        v_scale,
     )
-    exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
-    max_logits = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
-    temporary_output = torch.empty(
-        *intermediate_shape, head_size, dtype=q.dtype, device=q.device
-    )
-    # fp8 KV cache -> fp8 compute_type + per-token scales; bf16 otherwise. The scale
-    # tensor [num_phys16, Hkv, pbs] collapses the same way as the cache.
-    is_fp8 = _is_fp8_kv_cache_tensor(k_cache)
-    compute_type = aiter.dtypes.fp8 if is_fp8 else torch.bfloat16
-    if is_fp8 and k_scale is not None:
-        # [num_phys16, Hkv, pbs] -> [num_phys16*Hkv, 1, pbs, 1], matching the cache.
-        pbs = k_scale.shape[-1]
-        gluon_k_scale = k_scale.view(nph16 * _hkv, 1, pbs).unsqueeze(-1)
-        gluon_v_scale = v_scale.view(nph16 * _hkv, 1, pbs).unsqueeze(-1)
-    else:
-        gluon_k_scale = gluon_v_scale = None
-    run_pa_decode_gluon(
-        output=out_view,
-        q=q_view,
-        k_cache=k_cache_view,
-        v_cache=v_cache_view,
-        context_lens=sparse_ctx,
-        block_tables=sparse_bt,
-        softmax_scale=sm_scale,
-        max_seqlen_q=1,
-        max_context_partition_num=max_context_partition_num,
-        context_partition_size=context_partition_size,
-        compute_type=compute_type,
-        q_scale=None,
-        k_scale=gluon_k_scale,
-        v_scale=gluon_v_scale,
-        exp_sums=exp_sums,
-        max_logits=max_logits,
-        temporary_output=temporary_output,
-        alibi_slopes=None,
-        sinks=None,
-        sliding_window=-1,
-        ps=True,
-    )
-
-
-# ---------------------------------------------------------------------------
-# ASM paged-attention PREFILL path (per-token-as-decode).
-#
-# In M3 sparse attention each prefill query token attends its OWN per-token top-k
 
 
 @torch.no_grad()
-def _run_prefill_fp8_gluon(
+def _sparse_pa_per_row(
     q: torch.Tensor,  # [total_q, num_heads, head_dim==128]
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -1270,28 +1351,46 @@ def _run_prefill_fp8_gluon(
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
 ) -> None:
-    """fp8 prefill via the Gluon split-KV decode kernel (per-token-as-decode).
+    """Run one sparse selection per row, on ASM where it pays and Gluon else.
 
-    Each of the ``total_q`` query tokens is treated as an independent length-1
-    "sequence" with its own sparse 16-page block_table + causal context_len --
-    identical setup to ``minimax_m3_sparse_attn_decode_asm``, just with
-    ``num_seqs == total_q``. This avoids the pa_fwd_asm maskless-fp8 NaN bug at
-    the 256-token boundary (see caller).
+    A row is a decode sequence or a prefill query token -- both are a length-1
+    "sequence" with its own 16-page block_table + context_len, so both halves
+    are this one function and the shape alone picks the kernel.
+
+    Prefill was Gluon-only until the pa_fwd_asm "maskless-fp8 NaN at the
+    256-token boundary" it was avoiding turned out not to reproduce: 32768 rows
+    over every causal length 1..2048 give zero NaN and cos 0.9993 vs gluon.
     """
-    from atom.model_ops.base_attention import run_pa_decode_gluon
     from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 
-    # Collapse (token, kv_head) -> row so gluon runs num_kv_heads_view == 1, mirroring
-    # minimax_m3_sparse_attn_decode_asm. sparse_bt/ctx are already [T*Hkv, ...] with
-    # kv-head-encoded page ids. Zero-copy views; Hkv == 1 is the identity.
-    assert q.is_contiguous(), "prefill gluon requires contiguous q for the kv-head view"
+    from atom.model_ops.base_attention import run_pa_decode
+
+    assert q.shape[-1] == 128, "Paged attention here requires head_dim == 128."
+    # Collapse (token, kv_head) -> row so gluon runs num_kv_heads_view == 1.
+    # sparse_bt/ctx already carry kv-head-encoded page ids (page = phys16*Hkv +
+    # kvh), matching the collapsed cache view. Zero-copy; Hkv == 1 is identity.
+    assert q.is_contiguous(), "contiguous q required for the kv-head view"
     T, num_q_heads_total, head_size = q.shape
     g = num_q_heads_total // num_kv_heads
     q_view = q.view(T * num_kv_heads, g, head_size)
     out_view = output.view(T * num_kv_heads, g, head_size)
+    # .view, not .reshape: the SHUFFLE slices are contiguous so this is always
+    # zero-copy, and a copy would silently break the page-id encoding alignment.
     nph16, _hkv = k_cache.shape[0], k_cache.shape[1]
     k_cache_view = k_cache.view(nph16 * _hkv, 1, *k_cache.shape[2:])
     v_cache_view = v_cache.view(nph16 * _hkv, 1, *v_cache.shape[2:])
+
+    if _sparse_pa_ran_on_asm(
+        q_view,
+        k_cache_view,
+        v_cache_view,
+        sparse_bt,
+        sparse_ctx,
+        k_scale,
+        v_scale,
+        out_view,
+    ):
+        return
 
     num_seqs = T * num_kv_heads
     num_kv_heads_view = 1
@@ -1319,7 +1418,7 @@ def _run_prefill_fp8_gluon(
         gluon_v_scale = v_scale.view(nph16 * _hkv, 1, pbs).unsqueeze(-1)
     else:
         gluon_k_scale = gluon_v_scale = None
-    run_pa_decode_gluon(
+    run_pa_decode(
         output=out_view,
         q=q_view,
         k_cache=k_cache_view,
@@ -1380,8 +1479,6 @@ def minimax_m3_sparse_attn_prefill_asm(
     that don't populate it), derive it on-device, SYNC-FREE, via searchsorted /
     arange (no .item(), no GPU repeat_interleave).
     """
-    assert q.shape[-1] == 128, "ASM paged-attention requires head_dim == 128."
-
     total_q = q.shape[0]
     device = q.device
     if qo_indptr is None:
@@ -1409,7 +1506,7 @@ def minimax_m3_sparse_attn_prefill_asm(
             topk_idx, block_table, query_req_id, query_abs_pos
         )
 
-    _run_prefill_fp8_gluon(
+    _sparse_pa_per_row(
         q,
         k_cache,
         v_cache,

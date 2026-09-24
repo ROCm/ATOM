@@ -3,7 +3,7 @@
 """Which bytes of a DeepSeek-V4 Active Slot a checkpoint carries, and that a
 store/restore round trip moves exactly those and nothing else.
 
-`checkpoint_ranges_for` (tested in `test_state_arena.py`) says which bytes of the
+`checkpoint_ranges_for` (tested in `test_entry_arena.py`) says which bytes of the
 compressor *arena* are live. This file covers the step after it: composing
 those with the sliding-window rows that share the slot, turning the result into
 byte segments at a slot's real address, and round-tripping them through the
@@ -45,14 +45,19 @@ Builder = pytest.importorskip(
     exc_type=ImportError,
 ).DeepseekV4AttentionMetadataBuilder
 
-from atom.model_ops.attentions.paged_state_copy import plan_segmented_copy
-from atom.model_ops.attentions.state_arena import (
-    StateField,
+from atom.model_ops.attentions.pool_layout.entry_arena import (
+    EntryField,
     checkpoint_ranges_for,
     entry_bytes_for,
     field_extents,
 )
-from atom.model_ops.attentions.v4_pool_geometry import CSA_RATIO, HCA_RATIO
+from atom.model_ops.attentions.pool_layout.paged_state_copy import plan_segmented_copy
+from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+    FP4_GFX950_PRESHUFFLE,
+    FP4_GFX1250_NATURAL,
+    main_kv_plane_fields,
+)
+from atom.model_ops.attentions.pool_layout.v4_pool_geometry import CSA_RATIO, HCA_RATIO
 
 NEG_INF = float("-inf")
 ROW_BYTES = 64
@@ -63,13 +68,13 @@ SLOTS = 3
 # stays whole. Same order as `_state_fields`, which is the order the bytes are
 # seen in.
 FIELDS = [
-    StateField("csa_main_kv", 2, (4, 8), torch.float32),
-    StateField("csa_main_score", 2, (4, 8), torch.float32, NEG_INF),
-    StateField("hca_main_kv", 2, (16, 8), torch.float32, in_checkpoint=False),
-    StateField(
+    EntryField("csa_main_kv", 2, (4, 8), torch.float32),
+    EntryField("csa_main_score", 2, (4, 8), torch.float32, NEG_INF),
+    EntryField("hca_main_kv", 2, (16, 8), torch.float32, in_checkpoint=False),
+    EntryField(
         "hca_main_score", 2, (16, 8), torch.float32, NEG_INF, in_checkpoint=False
     ),
-    StateField("state_window", 1, (6, 8), torch.float32),
+    EntryField("state_window", 1, (6, 8), torch.float32),
 ]
 ARENA_BYTES = entry_bytes_for(FIELDS)
 ARENA_ROWS = -(-ARENA_BYTES // ROW_BYTES)
@@ -424,8 +429,14 @@ class TestTheBuilderDeclaresWhatItDrops:
             compress_ratios = (0, 0, 4, 128, 4, 128, 4, -1)
             _kv_fp8 = False
             _indexer_fp4 = False
+            indexer_quant_mode = "per_row_fp8"
+            indexer_layout = "fp8"
             _field_window_dtype = torch.bfloat16
             _field_window_layers = (43,)
+            # A bf16 build's one plane. The state-carried window is a ring of
+            # these rows in its own dtype, so `_state_fields` reads its shape
+            # and its alignment from here.
+            _plane_fields = main_kv_plane_fields(head_dim, torch.bfloat16)
 
             def __init__(self):
                 pass  # the real one wants a ModelRunner, a model and a GPU
@@ -433,7 +444,7 @@ class TestTheBuilderDeclaresWhatItDrops:
         return _Stub()
 
     @classmethod
-    def build_fields(cls) -> list[StateField]:
+    def build_fields(cls) -> list[EntryField]:
         return Builder._state_fields(cls.builder_stub())
 
     def test_hca_is_the_only_thing_dropped(self):
@@ -486,6 +497,20 @@ class TestTheBuilderDeclaresWhatItDrops:
         assert after != before
         assert ":nocopy=:" in after, "the id moved for some other reason"
 
+    def test_fp4_layout_id_fences_gfx950_from_gfx1250(self):
+        stub = self.builder_stub()
+        stub._indexer_fp4 = True
+        stub.indexer_quant_mode = "fp4"
+
+        stub.indexer_layout = FP4_GFX950_PRESHUFFLE
+        gfx950 = Builder.state_transfer(stub).paged_layout_id
+        stub.indexer_layout = FP4_GFX1250_NATURAL
+        gfx1250 = Builder.state_transfer(stub).paged_layout_id
+
+        assert ":index=fp4-gfx950-preshuffle:" in gfx950
+        assert ":index=fp4-gfx1250-natural:" in gfx1250
+        assert gfx950 != gfx1250
+
 
 class TestPageUnitAddressesAreArithmetic:
     """The addresses `_page_unit_regions` computes are the ones slicing gave.
@@ -528,6 +553,8 @@ class TestPageUnitAddressesAreArithmetic:
             pool_geometry = _Geo()
             csa_layers = tuple(range(self.N_CSA))
             _indexer_fp4 = False
+            indexer_quant_mode = "per_row_fp8"
+            indexer_layout = "fp8"
             _page_unit_region_cache = None
             _page_unit_region_owners = ()
 
@@ -616,6 +643,8 @@ class TestPageUnitRegionsValidateTheirOwnAddresses:
         stub._page_unit_region_cache = None
         stub._page_unit_region_owners = ()
         stub._indexer_fp4 = False
+        stub.indexer_quant_mode = "per_row_fp8"
+        stub.indexer_layout = "fp8"
         stub.csa_layers = [0]
         stub.model_runner = SimpleNamespace(v4_csa_idx_kv=idx)
         stub._kv_planes = lambda: [plane]

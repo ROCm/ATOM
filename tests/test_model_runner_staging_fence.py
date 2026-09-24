@@ -101,6 +101,36 @@ def test_dummy_forward_participates_in_staging_lifetime():
     )
 
 
+def test_prefill_ready_events_are_recorded_after_model_submission():
+    method = _method("forward")
+    helper = _method("_record_kv_cache_ready")
+    run_model = _attribute_calls(method, "run_model")
+    ready_events = _attribute_calls(method, "_record_kv_cache_ready")
+    helper_source = ast.unparse(helper)
+
+    assert len(run_model) == 1
+    assert len(ready_events) == 2
+    assert all(run_model[0].lineno < event.lineno for event in ready_events)
+    assert "batch.total_seqs_num_prefill <= 0" in helper_source
+    assert "batch.is_final_chunk" in helper_source
+    assert "if is_final" in helper_source
+    assert "record_kv_cache_ready" in helper_source
+
+
+def test_cudagraph_capture_runs_in_inference_mode():
+    """Capture must match the inference mode used by warmup and serving.
+
+    Some backends lazily allocate persistent output buffers during an earlier
+    inference-mode warmup.  Capturing outside that mode makes a later in-place
+    update of those inference tensors fail, for example in a padded MoE bucket.
+    """
+    method = _method("capture_cudagraph")
+
+    assert "torch.inference_mode()" in {
+        ast.unparse(decorator) for decorator in method.decorator_list
+    }
+
+
 def test_late_draft_uploads_are_staged_by_prepare_model():
     """Draft setup must not start a new pinned H2D after the staging event."""
     prepare_model = _method("prepare_model")
@@ -112,7 +142,15 @@ def test_late_draft_uploads_are_staged_by_prepare_model():
     )
 
     assert len(_attribute_calls(prepare_model, "anchors_to_gpu")) == 1
-    assert len(_attribute_calls(prepare_model, "copy_to_gpu")) == 1
+    # Zero, not one: the per-request verify lengths used to be staged here into
+    # their own pinned buffer, and now ride `cu_seqlens_q`, which
+    # the attention builder's `publish_cu_seqlens_q` uploads once per step.
+    #
+    # This walks `prepare_model`'s own body, so it sees neither that upload nor
+    # any other a callee makes -- it catches a copy written HERE, not a second
+    # copy of the same buffer. That one is enforced by there being a single
+    # publisher, not by this count.
+    assert len(_attribute_calls(prepare_model, "copy_to_gpu")) == 0
     assert not _attribute_calls(propose, "anchors_to_gpu")
     assert not _attribute_calls(propose, "copy_to_gpu")
     assert not _attribute_calls(compute_draft_kv, "anchors_to_gpu")

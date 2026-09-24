@@ -46,12 +46,6 @@ import numpy as np
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
-from atom.entrypoints.openai.chat_encoders import (
-    apply_chat_template,
-    load_custom_message_encoder,
-)
-from atom.utils.arg_parser import FlexibleArgumentParser
-
 from .backend_request_func import (
     ASYNC_REQUEST_FUNCS,
     RequestFuncInput,
@@ -487,6 +481,16 @@ async def benchmark(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
+    records_path = os.environ.get("ATOM_BENCHMARK_REQUESTS")
+    recorder = None
+    measured_request = warmup_request = request_func
+    if records_path:
+        from atom.benchmarks.results.records import RequestRecorder
+
+        recorder = RequestRecorder(records_path, tokenizer=tokenizer)
+        measured_request = functools.partial(recorder.call, request_func)
+        warmup_request = functools.partial(measured_request, phase="warmup")
+
     print("Starting initial single prompt test run...")
     test_prompt, test_prompt_len, test_output_len, test_mm_content = input_requests[0]
     if backend != "openai-chat" and test_mm_content is not None:
@@ -518,7 +522,7 @@ async def benchmark(
 
         async def warmup_limited_req_fn():
             async with warmup_semaphore:
-                return await request_func(
+                return await warmup_request(
                     request_func_input=test_input, pbar=warmup_pbar
                 )
 
@@ -575,9 +579,13 @@ async def benchmark(
 
     async def limited_request_func(request_func_input, pbar):
         if semaphore is None:
-            return await request_func(request_func_input=request_func_input, pbar=pbar)
+            return await measured_request(
+                request_func_input=request_func_input, pbar=pbar
+            )
         async with semaphore:
-            return await request_func(request_func_input=request_func_input, pbar=pbar)
+            return await measured_request(
+                request_func_input=request_func_input, pbar=pbar
+            )
 
     print("Starting main benchmark run...")
 
@@ -608,6 +616,8 @@ async def benchmark(
             )
         )
     outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+    if recorder:
+        recorder.close()
 
     if pbar is not None:
         pbar.close()
@@ -828,6 +838,13 @@ def save_to_pytorch_benchmark_format(
 
 
 def main(args: argparse.Namespace):
+    # Server-side encoders may load model utilities; dataset-only users do not
+    # need those dependencies just to import the benchmark client.
+    from atom.entrypoints.openai.chat_encoders import (
+        apply_chat_template,
+        load_custom_message_encoder,
+    )
+
     # Raise the open-file soft limit before opening any connections. At high
     # --max-concurrency each in-flight request is a socket (fd); the default
     # RLIMIT_NOFILE soft (~1024) is exhausted client-side (EMFILE on socket()),
@@ -980,6 +997,8 @@ def main(args: argparse.Namespace):
 
 
 if __name__ == "__main__":
+    from atom.utils.arg_parser import FlexibleArgumentParser
+
     parser = FlexibleArgumentParser(
         description="Benchmark the online serving throughput."
     )

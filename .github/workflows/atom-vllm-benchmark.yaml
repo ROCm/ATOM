@@ -158,13 +158,13 @@ on:
         type: string
         default: ""
       publish_to_dashboard:
-        description: "Upload benchmark results to the dashboard"
+        description: "Upload benchmark results to the dashboard (off by default for manual runs; schedule always publishes)"
         type: boolean
-        default: true
+        default: false
       upload_to_custom_dashboard:
-        description: "Upload benchmark results to the LLM-Booster dashboard"
+        description: "Upload benchmark results to the LLM-Booster dashboard (off by default for manual runs)"
         type: boolean
-        default: true
+        default: false
 
 jobs:
   wait-for-older-manual-runs:
@@ -1032,8 +1032,11 @@ jobs:
           echo "oot_image_tag=${OOT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Push custom OOT image
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
-          docker push "${{ steps.image-meta.outputs.oot_image_tag }}"
+          .github/scripts/docker_push_retry.sh "${{ steps.image-meta.outputs.oot_image_tag }}"
 
       - name: Clean up build images
         if: always()
@@ -1179,6 +1182,9 @@ jobs:
           if [ -d "/shared_nfs/huggingface_models" ]; then
             MODEL_CACHE_MOUNT="-v /shared_nfs/huggingface_models:/models"
             MODEL_CACHE_DESC="/shared_nfs/huggingface_models (shared host path)"
+          elif [ -d "/shared_nfs/models" ]; then
+            MODEL_CACHE_MOUNT="-v /shared_nfs/models:/models"
+            MODEL_CACHE_DESC="/shared_nfs/models (shared host path)"
           elif [ -d "/it-share/models" ]; then
             MODEL_CACHE_MOUNT="-v /it-share/models:/models"
             MODEL_CACHE_DESC="/it-share/models (shared host path)"
@@ -1247,6 +1253,8 @@ jobs:
             model_dir="/models/${model_dir#/models/}"
           elif [[ "${model_dir}" = /shared_nfs/huggingface_models/* ]]; then
             model_dir="/models/${model_dir#/shared_nfs/huggingface_models/}"
+          elif [[ "${model_dir}" = /shared_nfs/models/* ]]; then
+            model_dir="/models/${model_dir#/shared_nfs/models/}"
           elif [[ "${model_dir}" = /it-share/models/* ]]; then
             model_dir="/models/${model_dir#/it-share/models/}"
           elif [[ "${model_dir}" = /data/models/* ]]; then
@@ -1284,6 +1292,8 @@ jobs:
             model_dir="/models/${model_dir#/models/}"
           elif [[ "${model_dir}" = /shared_nfs/huggingface_models/* ]]; then
             model_dir="/models/${model_dir#/shared_nfs/huggingface_models/}"
+          elif [[ "${model_dir}" = /shared_nfs/models/* ]]; then
+            model_dir="/models/${model_dir#/shared_nfs/models/}"
           elif [[ "${model_dir}" = /it-share/models/* ]]; then
             model_dir="/models/${model_dir#/it-share/models/}"
           elif [[ "${model_dir}" = /data/models/* ]]; then

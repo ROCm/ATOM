@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use tracing::warn;
 use uuid::Uuid;
 
 use super::super::types::AdapterError;
@@ -57,6 +58,30 @@ impl AtomAdapter {
         }
         Ok(())
     }
+
+    /// Copy prompt IDs into decode KV metadata using vLLM's PD format.
+    /// Return the number copied, or zero when no usable IDs are available.
+    pub fn carry_prompt_token_ids(prefill_body: &Value, kv: &mut Value) -> usize {
+        let Some(ids) = prefill_body.get("prompt_token_ids") else {
+            return 0;
+        };
+        if ids.is_null() {
+            return 0;
+        }
+        let Some(len) = ids.as_array().map(|a| a.len()).filter(|n| *n > 0) else {
+            warn!(
+                "prefill returned an unusable prompt_token_ids ({}); decode will tokenize",
+                ids
+            );
+            return 0;
+        };
+        let Some(obj) = kv.as_object_mut() else {
+            warn!("decode kv_transfer_params is not an object; dropping prompt_token_ids");
+            return 0;
+        };
+        obj.insert("prompt_token_ids".to_string(), ids.clone());
+        len
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +129,8 @@ impl BackendAdapter for AtomAdapter {
             obj.insert("max_completion_tokens".to_string(), json!(1));
         }
         obj.remove("stream_options");
+        // Request prompt IDs for decode reuse; older servers may omit them.
+        obj.insert("return_token_ids".to_string(), Value::Bool(true));
         Ok(())
     }
 

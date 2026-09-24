@@ -236,14 +236,21 @@ Two sharing patterns are handled:
 
 The `embed_tokens` layer is always shared when shapes match and pipeline parallelism is not used.
 
-### Propose loop: MHA vs MLA branching
+### Propose loop: metadata is the backend's, not the proposer's
 
-The `propose()` method iterates `mtp_k` draft steps. On the first iteration (`i == 0`), it sets up attention metadata for single-token decode. The metadata setup branches based on `runner.use_mla`:
+The `propose()` method iterates `mtp_k` draft steps. Every step calls
+`runner.attn_metadata_builder.prepare_mtp_decode()` and merges the dict it
+returns into `attn_metadata`, so *which* fields a step updates — `kv_indptr`
+and `kv_indices` for MLA, `block_tables` and `context_lens` for MHA — is the
+backend's answer and not a branch here. The proposer passes
+`num_reject_tokens` on `i == 0` only, which is how the previous step's
+rejected speculative tokens are taken back out.
 
-- **MLA models** (DeepSeek, Qwen3 MoE) — use `kv_indptr` and `kv_last_page_lens` with block_size=1 paged KV cache. `kv_indptr` is adjusted by subtracting the cumulative `num_reject_tokens` to account for rejected speculative tokens from the previous step.
-- **MHA models** (GDN/hybrid architectures) — use `block_tables` and `context_lens`. `context_lens` is incremented by 1 at each draft step to reflect the additional KV entries.
-
-On subsequent iterations (`i > 0`), `max_seqlen_k` is incremented and `prepare_mtp_decode()` is called to update backend-specific attention metadata.
+One thing does branch, on a builder capability rather than a model family:
+`fuse_mtp_decode_position_update`. Where a builder sets it, the per-step
+position bump and the `context_lens` increment ride into its kernel through
+`update_context_lens` / `positions_out`; where it does not, `propose()` does
+both itself before the call.
 
 ### `prepare_mtp_decode()`
 
