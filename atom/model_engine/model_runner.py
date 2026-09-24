@@ -291,11 +291,15 @@ class tokenIDProcessor:
         # Single Event for both copies (vs. per-tensor send_to_cpu_async) so the
         # consumer pops one queue entry and synchronizes once instead of twice.
         copy_done = torch.cuda.Event()
-        with torch.cuda.stream(self.async_copy_stream):
-            data_ready.wait(stream=self.async_copy_stream)
+        # Keep the tiny accept/reject transfer ahead of the draft proposal on
+        # the model stream. On ROCm, putting this dependency on the side stream
+        # can let draft kernels overtake it and stall the next target prepare.
+        status_stream = torch.cuda.current_stream()
+        with torch.cuda.stream(status_stream):
+            data_ready.wait(stream=status_stream)
             cpu_num_rejected = num_rejected.to("cpu", non_blocking=True)
             cpu_num_bonus = num_bonus.to("cpu", non_blocking=True)
-            copy_done.record(self.async_copy_stream)
+            copy_done.record(status_stream)
         self.pending_mtp_status_copies.append(
             (cpu_num_rejected, cpu_num_bonus, copy_done)
         )
@@ -2438,14 +2442,19 @@ class ModelRunner:
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, bool, bool]:
         bs = batch.total_seqs_num
 
-        # Check on CPU whether all requests are greedy (temperature=0)
-        all_greedy = (batch.temperatures == 0).all()
+        # Rank-invariant reductions are computed once by the scheduler. Keep
+        # fallbacks for batches produced by older rollout/disaggregation code.
+        all_greedy = getattr(batch, "all_greedy", None)
+        if all_greedy is None:
+            all_greedy = bool((batch.temperatures == 0).all())
 
         # Check on CPU whether any fan-out sibling needs per-row random noise.
         # Missing attribute (e.g. dummy runs, older callers) -> False.
-        needs_independent_noise = bool(
-            getattr(batch, "needs_independent_noise", np.zeros(0, dtype=bool)).any()
-        )
+        needs_independent_noise = getattr(batch, "has_independent_noise", None)
+        if needs_independent_noise is None:
+            needs_independent_noise = bool(
+                getattr(batch, "needs_independent_noise", np.zeros(0, dtype=bool)).any()
+            )
 
         temp_buffer = self.forward_vars["temperatures"]
         # Clamp temperatures on CPU to avoid division by zero in sampler
@@ -2454,14 +2463,21 @@ class ModelRunner:
 
         # Check on CPU whether filtering is needed to avoid GPU sync in sampler.
         # If no filtering needed, return None to skip GPU copy entirely.
-        needs_topk = (batch.top_ks != -1).any()
-        needs_topp = (batch.top_ps < 1.0).any()
+        needs_topk = getattr(batch, "needs_top_k", None)
+        if needs_topk is None:
+            needs_topk = bool((batch.top_ks != -1).any())
+        needs_topp = getattr(batch, "needs_top_p", None)
+        if needs_topp is None:
+            needs_topp = bool((batch.top_ps < 1.0).any())
 
         if needs_topk:
             top_k_buffer = self.forward_vars["top_ks"]
             top_k_buffer.np[:bs] = batch.top_ks
             # If all values are the same, only copy one element to save bandwidth
-            if bs > 1 and (batch.top_ks == batch.top_ks[0]).all():
+            uniform_topk = getattr(batch, "uniform_top_k", None)
+            if uniform_topk is None:
+                uniform_topk = bool(bs <= 1 or (batch.top_ks == batch.top_ks[0]).all())
+            if bs > 1 and uniform_topk:
                 top_ks = top_k_buffer.copy_to_gpu(1)
             else:
                 top_ks = top_k_buffer.copy_to_gpu(bs)
@@ -2472,7 +2488,10 @@ class ModelRunner:
             top_p_buffer = self.forward_vars["top_ps"]
             top_p_buffer.np[:bs] = batch.top_ps
             # If all values are the same, only copy one element to save bandwidth
-            if bs > 1 and (batch.top_ps == batch.top_ps[0]).all():
+            uniform_topp = getattr(batch, "uniform_top_p", None)
+            if uniform_topp is None:
+                uniform_topp = bool(bs <= 1 or (batch.top_ps == batch.top_ps[0]).all())
+            if bs > 1 and uniform_topp:
                 top_ps = top_p_buffer.copy_to_gpu(1)
             else:
                 top_ps = top_p_buffer.copy_to_gpu(bs)

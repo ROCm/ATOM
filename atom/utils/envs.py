@@ -408,6 +408,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # stops collection while the watch still reports the healthy shape.
     # See tune_gc in atom/utils/gc_utils.py.
     "ATOM_GC_THRESHOLD": lambda: os.getenv("ATOM_GC_THRESHOLD", "").strip(),
+    # Compact repeated per-request block tables in scheduler -> TP worker
+    # forward RPCs. The first appearance is complete; later steps carry only
+    # appended block IDs.
+    "ATOM_COMPACT_BLOCK_TABLE_RPC": lambda: (
+        os.getenv("ATOM_COMPACT_BLOCK_TABLE_RPC", "1") == "1"
+    ),
     # Whether the incremental detokenizer may reuse the delta it last emitted
     # in place of one of its two decodes per update. "auto" verifies at startup
     # that this tokenizer decodes a token span the same way wherever the window
@@ -781,6 +787,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Master switch: pin each GPU worker to its GPU-local NUMA node's CPU cores
     # and preferred memory. Default off so baseline/pinned A/B stays clean.
     "ATOM_NUMA_BIND": lambda: os.getenv("ATOM_NUMA_BIND", "0") == "1",
+    # Split a NUMA node's physical cores into disjoint per-GPU groups instead
+    # of giving every worker on that node the same broad affinity mask.
+    "ATOM_NUMA_BIND_PER_GPU": lambda: os.getenv("ATOM_NUMA_BIND_PER_GPU", "1") == "1",
     # Auto-detect the GPU->NUMA-node mapping (amdsmi first, sysfs fallback).
     # Default on, so `ATOM_NUMA_BIND=1` alone is zero-config.
     "ATOM_AUTO_NUMA_BIND": lambda: os.getenv("ATOM_AUTO_NUMA_BIND", "1") == "1",

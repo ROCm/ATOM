@@ -90,6 +90,14 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 |----------|------|---------|-------------|
 | **ATOM_DISABLE_VLLM_PLUGIN** | bool | 0 (false) | If set to `1`, disable the vLLM plugin registration entirely. |
 
+## Host-control performance
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_COMPACT_BLOCK_TABLE_RPC** | bool | 1 (true) | Send the first per-request KV block table in full and only appended block IDs on later scheduler-to-worker forward RPCs. Set `0` to restore full block-table payloads. |
+| **ATOM_NUMA_BIND** | bool | 0 (false) | Bind GPU workers to NUMA-local CPUs and preferred memory. |
+| **ATOM_NUMA_BIND_PER_GPU** | bool | 1 (true) | With `ATOM_NUMA_BIND=1`, split each NUMA node's physical cores into disjoint per-GPU groups while preserving SMT siblings. Set `0` for the former shared node-wide mask. |
+
 ## Kernel / backend selection
 
 | Variable | Type | Default | Description |

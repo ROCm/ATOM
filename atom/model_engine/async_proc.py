@@ -13,6 +13,8 @@ This module provides:
   from all workers.
 """
 
+import array
+import copy
 import logging
 import multiprocessing
 import pickle
@@ -25,12 +27,14 @@ from dataclasses import dataclass
 from threading import Thread
 from typing import ClassVar
 
+import numpy as np
 import zmq
 import zmq.asyncio
 from aiter.dist.shm_broadcast import MessageQueue
 
 from atom.kv_transfer.disaggregation import KVConnectorOutput, KVOutputAggregator
 from atom.utils import (
+    envs,
     get_mp_context,
     get_open_zmq_ipc_path,
     init_exit_handler,
@@ -44,6 +48,129 @@ from atom.utils.gc_utils import maybe_attach_gc_debug_callback, tune_gc
 from atom.utils.numa_utils import numa_bind_to_node
 
 logger = logging.getLogger("atom")
+
+
+@dataclass(frozen=True)
+class _BlockTableDelta:
+    """Compact, generation-local representation of repeated block tables."""
+
+    base_lengths: np.ndarray
+    tail_offsets: np.ndarray
+    tail_values: np.ndarray
+
+
+class _BlockTableDeltaEncoder:
+    """Encode append-only scheduler block tables as small per-step deltas."""
+
+    def __init__(self):
+        # req_id -> (the scheduler's array object, published length, last id)
+        self._cache: dict[int, tuple[object, int, int | None]] = {}
+
+    def encode(self, batch):
+        rows = getattr(batch, "block_tables", None)
+        req_ids = getattr(batch, "req_ids", None)
+        if (
+            not rows
+            or req_ids is None
+            or len(rows) != len(req_ids)
+            or any(
+                not isinstance(row, array.array)
+                or row.typecode != "i"
+                or row.itemsize != np.dtype(np.int32).itemsize
+                for row in rows
+            )
+        ):
+            self._cache.clear()
+            return batch
+
+        base_lengths = np.empty(len(rows), dtype=np.int32)
+        tail_offsets = np.empty(len(rows) + 1, dtype=np.int32)
+        tail_offsets[0] = 0
+        tails: list[np.ndarray] = []
+        next_cache: dict[int, tuple[object, int, int | None]] = {}
+
+        for i, (req_id, row) in enumerate(zip(req_ids, rows, strict=True)):
+            row_len = len(row)
+            last_id = int(row[-1]) if row_len else None
+            cached = self._cache.get(int(req_id))
+            base = 0
+            if cached is not None:
+                old_row, old_len, old_last = cached
+                # Sequence.block_table is append-only while a request is live.
+                # Identity plus the old boundary value catches replacement,
+                # truncation, and clear-then-refill before allowing reuse.
+                if (
+                    old_row is row
+                    and old_len <= row_len
+                    and (old_len == 0 or int(row[old_len - 1]) == old_last)
+                ):
+                    base = old_len
+            base_lengths[i] = base
+            tail = np.frombuffer(
+                row, dtype=np.int32, count=row_len - base, offset=4 * base
+            )
+            tails.append(tail)
+            tail_offsets[i + 1] = tail_offsets[i] + tail.size
+            next_cache[int(req_id)] = (row, row_len, last_id)
+
+        tail_values = (
+            np.concatenate(tails, dtype=np.int32)
+            if tail_offsets[-1]
+            else np.empty(0, dtype=np.int32)
+        )
+        wire_batch = copy.copy(batch)
+        wire_batch.block_tables = _BlockTableDelta(
+            base_lengths=base_lengths,
+            tail_offsets=tail_offsets,
+            tail_values=tail_values,
+        )
+        self._cache = next_cache
+        return wire_batch
+
+
+class _BlockTableDeltaDecoder:
+    """Rebuild worker-local ``array('i')`` rows from an encoded delta."""
+
+    def __init__(self):
+        self._cache: dict[int, array.array] = {}
+
+    def decode(self, batch):
+        delta = getattr(batch, "block_tables", None)
+        if not isinstance(delta, _BlockTableDelta):
+            self._cache.clear()
+            return batch
+
+        req_ids = batch.req_ids
+        if len(req_ids) != len(delta.base_lengths):
+            raise RuntimeError("block-table delta/request count mismatch")
+
+        rows: list[array.array] = []
+        next_cache: dict[int, array.array] = {}
+        for i, req_id in enumerate(req_ids):
+            req_id = int(req_id)
+            base = int(delta.base_lengths[i])
+            start = int(delta.tail_offsets[i])
+            end = int(delta.tail_offsets[i + 1])
+            if base:
+                cached_row = self._cache.get(req_id)
+                if cached_row is None or len(cached_row) != base:
+                    raise RuntimeError(
+                        f"missing block-table prefix for request {req_id}: "
+                        f"need {base}, have "
+                        f"{None if cached_row is None else len(cached_row)}"
+                    )
+                # Do not append into a row retained by the previous batch: the
+                # token processor can keep that batch for deferred output.
+                row = cached_row if end == start else cached_row[:]
+            else:
+                row = array.array("i")
+            if end > start:
+                row.frombytes(memoryview(delta.tail_values[start:end]).cast("B"))
+            rows.append(row)
+            next_cache[req_id] = row
+        batch.block_tables = rows
+        self._cache = next_cache
+        return batch
 
 
 @dataclass
@@ -138,7 +265,13 @@ class AsyncIOProc:
             if dp_local_rank is None:
                 dp_local_rank = cfg.parallel_config.data_parallel_rank
             gpu = dp_local_rank * cfg.tp_world_size + rank
-            numa_bind_to_node(gpu, label)
+            numa_bind_to_node(
+                gpu,
+                label,
+                local_gpu_count=(
+                    cfg.parallel_config.data_parallel_size_local * cfg.tp_world_size
+                ),
+            )
         except Exception as e:  # noqa: BLE001 - binding is an optimization
             # NUMA binding only affects locality, never correctness, so any
             # failure (missing libnuma, restricted cpuset, odd topology) must
@@ -183,6 +316,7 @@ class AsyncIOProc:
             self.io_threads.append(t)
 
         self.all_ranks_barrier = all_ranks_barrier
+        self._forward_batch_decoder = _BlockTableDeltaDecoder()
 
         runner_class = resolve_obj_by_qualname(runner_qualname)
         self.runners: list[object] = []
@@ -275,6 +409,8 @@ class AsyncIOProc:
 
     def get_func(self):
         method_name, *args = self.rpc_broadcast_mq.dequeue()
+        if method_name == "forward" and args:
+            args[0] = self._forward_batch_decoder.decode(args[0])
         return method_name, args
 
 
@@ -309,6 +445,8 @@ class AsyncIOProcManager:
         self.rpc_broadcast_mq = MessageQueue(
             proc_num, proc_num, max_chunk_bytes=16 * 1024 * 1024
         )
+        self._compact_forward_rpc = envs.ATOM_COMPACT_BLOCK_TABLE_RPC
+        self._forward_batch_encoder = _BlockTableDeltaEncoder()
         scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
         self.still_running = True
         # Register atexit to clean up shared memory even if exit() doesn't complete
@@ -447,6 +585,8 @@ class AsyncIOProcManager:
     def call_func(self, func_name: str, *args, wait_out: bool = False):
         """Standard RPC call for non-KV operations."""
         logger.debug(f"{self.label}: call_func {func_name} {args}")
+        if func_name == "forward" and args and self._compact_forward_rpc:
+            args = (self._forward_batch_encoder.encode(args[0]), *args[1:])
         msg = (func_name, *args)
         self.rpc_broadcast_mq.enqueue(msg)
         if wait_out:
