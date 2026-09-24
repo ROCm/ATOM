@@ -183,8 +183,10 @@ models without a declaration retain priority 0. MoE keeps the existing
 compute-to-communication yield and event order. A V4.1 runtime output hook
 records the compute consumer of the comm-allocated routed-expert result before
 shared-expert combine and mHC consume it. This prevents a partner microbatch
-from reusing its storage before those consumers finish. The hook only acts
-in eager TBO; compiled decode does not trace the thread-local TBO query.
+from reusing its storage before those consumers finish. A custom-op boundary
+keeps the thread-local TBO query at runtime and retains the lifetime marker
+in compiled execution. Microbatches use the normal model call and honor the
+configured compilation level.
 
 Eager prefill expands index tile tables only through the largest request end,
 including cached prefixes. Paged scoring bounds each logits band by both its
