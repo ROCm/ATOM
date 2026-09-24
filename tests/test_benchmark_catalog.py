@@ -593,7 +593,8 @@ def test_agentic_dispatch_replay_preserves_profile(tmp_path, monkeypatch, profil
     assert calls == ["rocm/atom-dev:latest"]
     dispatch = json.loads((config_dir / "dispatch-inputs.json").read_text())
     assert dispatch["profile"] == profile
-    assert dispatch["dry_run"] is True
+    assert dispatch["dry_run"] == "true"
+    assert all(isinstance(value, str) for value in dispatch.values())
     assert dispatch["atom_commit"]
     assert dispatch["image"] == pinned
     assert "atom-agentic-benchmark.yaml" in (config_dir / "README.md").read_text()

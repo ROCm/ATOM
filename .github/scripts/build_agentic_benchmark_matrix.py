@@ -177,7 +177,11 @@ def write_run_config(configs, inputs, event, output_dir, image_resolution=None):
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-    dispatch = {**inputs, "atom_commit": commit}
+    # gh workflow run --json accepts string-valued inputs, including booleans.
+    dispatch = {
+        key: str(value).lower() if isinstance(value, bool) else str(value)
+        for key, value in {**inputs, "atom_commit": commit}.items()
+    }
     if image_resolution:
         dispatch["image"] = image_resolution["pinned"]
     record = {
@@ -277,8 +281,8 @@ def write_run_config(configs, inputs, event, output_dir, image_resolution=None):
             "",
             (
                 "The dispatch file pins the ATOM checkout; the workflow ref must still exist. "
-                "The image digest is pinned too; an explicit AITER override must use a SHA for exact replays. "
-                "A preview keeps `dry_run: true`; change it to `false` to execute."
+                "The image and downloaded wheel are pinned too; an AITER source ref must use a SHA for exact replays. "
+                "A preview keeps `dry_run` set to the string `true`; change it to `false` to execute."
             ),
             "",
             (

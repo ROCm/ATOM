@@ -5,6 +5,7 @@ on:
       - 'atom/benchmarks/**'
       - '.github/benchmark/models_agentic*.json'
       - '.github/scripts/*benchmark*'
+      - '.github/scripts/*aiter*'
       - '.github/scripts/atom_test.sh'
       - '.github/scripts/aiperf*'
       - '.github/scripts/profile_agentic_replay.py'
@@ -30,7 +31,8 @@ jobs:
       - name: Validate producer, streaming client and catalog
         run: |
           python -m pytest -q --confcutdir=tests/benchmarks/results \
-            tests/benchmarks/results tests/test_benchmark_catalog.py tests/test_benchmark_random_dataset.py
+            tests/benchmarks/results tests/test_benchmark_catalog.py tests/test_benchmark_random_dataset.py tests/test_benchmark_aiter_wheel.py
+          bash -n .github/scripts/download_aiter_wheel.sh .github/scripts/install_aiter_wheel.sh
           bash -n .github/scripts/atom_test.sh
           bash -n .github/scripts/aiperf_agentic.sh
           bash -n .github/scripts/benchmark_bundle.sh
