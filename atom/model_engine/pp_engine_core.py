@@ -155,6 +155,16 @@ class PPEngineCoreProc(EngineCore):
                 self.scheduler.release_pp_inflight(scheduled_batch)
                 if self._defer_prefix_hash:
                     self._pending_prefix_hash.append((scheduled_batch, seqs))
+                    # Deferring assumes something downstream will come along
+                    # and flush. A seq held on this chunk's state checkpoint
+                    # is out of the prefill scan until then, so if it is the
+                    # only traffic there is nothing left to do the flushing.
+                    # Retiring the batch is already the signal the filing
+                    # needs — a checkpoint re-points a slot and files an
+                    # index, it copies nothing, so it wants FIFO order rather
+                    # than a completed forward.
+                    if self.scheduler.holds_checkpoint_hostage(scheduled_batch):
+                        self._flush_pending_prefix_hashes()
                 continue
 
             fwd_out = self.pp_transport.recv_tokens(timeout_ms=poll_ms)
