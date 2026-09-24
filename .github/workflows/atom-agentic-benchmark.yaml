@@ -1,0 +1,123 @@
+name: ATOM Agentic Benchmark
+# GitHub displays the native run number beside this title (e.g. nightly #650).
+run-name: ${{ github.event_name == 'schedule' && 'nightly' || format('manual ({0})', github.actor) }}
+
+on:
+  schedule:
+    # Daily at 08:17 UTC / 16:17 Beijing time, outside the random benchmark crons.
+    - cron: '17 8 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Preview and save the resolved configuration without allocating GPU runners"
+        type: boolean
+        default: false
+      models:
+        description: "Comma-separated model prefixes; empty selects all of models_agentic.json"
+        type: string
+        default: ""
+      concurrency:
+        description: "Comma-separated concurrency override; empty uses the catalog (currently 2,4)"
+        type: string
+        default: ""
+      duration_seconds:
+        description: "Profiling duration per cell, from 900 to 3600 seconds"
+        type: number
+        default: 900
+      image:
+        description: "Benchmark image; use a nightly tag or digest for reproducible manual runs"
+        type: string
+        default: "rocm/atom-dev:latest"
+      runner:
+        description: "Dedicated GPU CI runner override; empty uses the catalog"
+        type: string
+        default: ""
+      extra_args:
+        description: "Additional ATOM server arguments"
+        type: string
+        default: ""
+      atom_commit:
+        description: "ATOM ref to check out; empty uses the workflow ref"
+        type: string
+        default: ""
+      aiter_commit:
+        description: "AITER ref to reinstall; empty keeps the image version"
+        type: string
+        default: ""
+      enable_profiler:
+        description: "Collect torch profiler traces"
+        type: boolean
+        default: false
+      enable_rtl:
+        description: "Collect rocm-trace-lite traces"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-matrix:
+    name: Build agentic benchmark matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      configs_json: ${{ steps.build.outputs.configs_json }}
+      has_cells: ${{ steps.build.outputs.has_cells }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
+      - id: build
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUTS_JSON: ${{ toJson(inputs) }}
+          AGENTIC_RUN_CONFIG_DIR: agentic-run-config
+        run: python3 .github/scripts/build_agentic_benchmark_matrix.py
+      - name: Save run configuration
+        uses: actions/upload-artifact@v7
+        with:
+          name: atom-agentic-run-config-${{ github.run_attempt }}
+          path: agentic-run-config/
+          retention-days: 30
+          if-no-files-found: error
+
+  benchmark:
+    name: ${{ matrix.config.display }} agentic
+    needs: [build-matrix]
+    if: >-
+      !cancelled()
+      && needs.build-matrix.result == 'success'
+      && needs.build-matrix.outputs.has_cells == 'true'
+      && inputs.dry_run != true
+    strategy:
+      fail-fast: false
+      matrix:
+        config: ${{ fromJson(needs.build-matrix.outputs.configs_json) }}
+    uses: ./.github/workflows/benchmark-tmpl.yml
+    secrets: inherit
+    with:
+      display: ${{ matrix.config.display }}
+      prefix: ${{ matrix.config.prefix }}
+      suffix: ${{ matrix.config.suffix }}
+      model_path: ${{ matrix.config.model_path }}
+      server_args: ${{ matrix.config.server_args }}
+      bench_kind: ${{ matrix.config.bench_kind }}
+      bench_args: ${{ matrix.config.bench_args }}
+      env_vars: ${{ matrix.config.env_vars }}
+      runner: ${{ inputs.runner || matrix.config.runner }}
+      isl: ${{ matrix.config.isl }}
+      osl: ${{ matrix.config.osl }}
+      ratio: ${{ matrix.config.ratio }}
+      ratio_str: ${{ matrix.config.ratio_str }}
+      concurrency: ${{ matrix.config.concurrency }}
+      image: ${{ inputs.image || 'rocm/atom-dev:latest' }}
+      extra_args: ${{ inputs.extra_args || '' }}
+      atom_commit: ${{ inputs.atom_commit || '' }}
+      aiter_commit: ${{ inputs.aiter_commit || '' }}
+      enable_profiler: ${{ inputs.enable_profiler || false }}
+      enable_rtl: ${{ inputs.enable_rtl || false }}

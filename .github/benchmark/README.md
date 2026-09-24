@@ -4,6 +4,20 @@ Nightly + on-demand performance benchmarking for the models in
 [`models.json`](./models.json), driven by
 [`.github/workflows/atom-benchmark.yaml`](../workflows/atom-benchmark.yaml).
 
+Agentic trace replay uses the separate
+[`ATOM Agentic Benchmark`](../workflows/atom-agentic-benchmark.yaml) workflow and
+[`models_agentic.json`](./models_agentic.json). It runs daily at 08:17 UTC and
+supports manual model, concurrency, duration, image, runner and code-ref
+selection. The initial configuration is DeepSeek V4.1 Flash + DSpark5, TP4 with
+FULL graphs, concurrency 2/4 and 900 seconds per point. Manual `dry_run` previews
+the matrix without GPU jobs; run summaries include configuration, replay commands
+and per-point artifact links. Titles use `manual (<actor>)` / `nightly` with
+GitHub's native run number. Both workflows reuse
+`benchmark-tmpl.yml`; the agentic workflow publishes data artifacts for external
+consumers, including AgenticViewer. See
+[`benchmark-artifacts.md`](../../docs/benchmark-artifacts.md#ci-and-configuration)
+for capture and verification details.
+
 ## Flow
 
 ```
@@ -110,6 +124,7 @@ allocated for them**.
 |--------|------|
 | `catalog.py` | catalog loader: `load_variants`, `build_cells`, `build_cell_configs`, `scenario_tag`, `validate_dispatch_inputs`, `build_args` |
 | `build_benchmark_matrix.py` | turns the GitHub event + dispatch inputs into the `configs_json` matrix output (variant×scenario configs, each with a concurrency list) |
+| `build_agentic_benchmark_matrix.py` | expands the agentic catalog for scheduled runs or validated manual overrides; emits the reusable-template matrix and saves run configuration, replay inputs and the Actions summary |
 | `dashboard_models_map.py` | prefix→display map JS for the dashboard |
 | `regression_rerun.py` | regression report → rerun matrix |
 | `atom_test.sh` | in-container driver: `launch` / `benchmark` / `accuracy` / `stop` |

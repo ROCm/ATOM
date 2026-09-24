@@ -323,6 +323,7 @@ jobs:
             "benchmark-bundles/$RESULT_FILENAME" --output "bundle-summaries/$RESULT_FILENAME"
 
       - name: Upload versioned summary
+        id: bundle-summary
         if: always()
         uses: actions/upload-artifact@v7
         with:
@@ -332,6 +333,7 @@ jobs:
           retention-days: 30
 
       - name: Upload complete bundle
+        id: bundle-full
         if: always()
         uses: actions/upload-artifact@v7
         with:
@@ -353,6 +355,7 @@ jobs:
             ' || true
 
       - name: Preserve unpackaged failure evidence
+        id: bundle-diagnostics
         if: failure() || cancelled()
         uses: actions/upload-artifact@v7
         with:
@@ -360,6 +363,31 @@ jobs:
           path: benchmark-evidence/${{ env.RESULT_FILENAME }}/
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Link agentic point artifacts
+        if: always() && inputs.bench_kind == 'aiperf_agentic'
+        uses: actions/github-script@v7
+        env:
+          POINT_DISPLAY: ${{ inputs.display }}
+          POINT_STATUS: ${{ job.status }}
+          SUMMARY_URL: ${{ steps.bundle-summary.outputs.artifact-url }}
+          BUNDLE_URL: ${{ steps.bundle-full.outputs.artifact-url }}
+          DIAGNOSTICS_URL: ${{ steps.bundle-diagnostics.outputs.artifact-url }}
+        with:
+          script: |
+            const escape = value => String(value).replace(/[&<>"']/g, char =>
+              ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[char]));
+            core.summary.addHeading(escape(`${process.env.POINT_DISPLAY} · c=${process.env.CONC}`));
+            core.summary.addRaw(`Status before cleanup: ${escape(process.env.POINT_STATUS)}\n\n`);
+            for (const [label, url] of [
+              ['Summary bundle', process.env.SUMMARY_URL],
+              ['Full bundle', process.env.BUNDLE_URL],
+              ['Failure diagnostics', process.env.DIAGNOSTICS_URL],
+            ]) {
+              if (url) core.summary.addLink(label, url).addBreak();
+            }
+            core.summary.addRaw('\nA full-bundle upload may contain partial evidence after failure; check its manifest status.\n');
+            await core.summary.write();
 
       - name: Clean Up
         if: always()

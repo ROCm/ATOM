@@ -344,3 +344,73 @@ def test_weekly_cron_matches_the_cadence_expressions():
     ):
         assert weekly in text, f"{field} does not reference the weekly cron {weekly!r}"
         assert "weekly" in text and "nightly" in text, field
+
+
+def test_agentic_dispatch_overrides_keep_the_server_recipe():
+    import json
+
+    from build_agentic_benchmark_matrix import build_configs
+
+    defaults = build_configs()
+    selected = build_configs(
+        inputs={
+            "models": "deepseek-v41-flash",
+            "concurrency": "4,8",
+            "duration_seconds": 1200,
+        }
+    )
+    assert len(defaults) == len(selected) == 1
+    assert selected[0]["server_args"] == defaults[0]["server_args"]
+    assert selected[0]["bench_kind"] == "aiperf_agentic"
+    assert json.loads(selected[0]["concurrency"]) == [4, 8]
+    env = dict(line.split("=", 1) for line in selected[0]["env_vars"].splitlines())
+    assert env["AIPERF_BENCHMARK_DURATION"] == "1200"
+    assert env["ATOM_BUNDLE_REQUIRE_FULL"] == "1"
+
+
+@pytest.mark.parametrize(
+    "inputs",
+    [
+        {"models": "unknown-model"},
+        {"concurrency": "0,4"},
+        {"concurrency": "2,2"},
+        {"concurrency": "2,,4"},
+        {"concurrency": "9999"},
+        {"duration_seconds": 899},
+        {"duration_seconds": 3601},
+        {"duration_seconds": 900.5},
+        {"duration_seconds": True},
+    ],
+)
+def test_agentic_bad_inputs_fail_before_allocating_gpu_jobs(inputs):
+    from build_agentic_benchmark_matrix import build_configs
+
+    with pytest.raises(ValueError):
+        build_configs(inputs=inputs)
+
+
+def test_agentic_schedule_uses_catalog_defaults(tmp_path, monkeypatch):
+    import json
+
+    from build_agentic_benchmark_matrix import build_configs, main
+
+    output = tmp_path / "github-output"
+    monkeypatch.setenv("EVENT_NAME", "schedule")
+    monkeypatch.setenv("INPUTS_JSON", '{"models":"unknown","duration_seconds":1}')
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    assert main() == 0
+    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert values["has_cells"] == "true"
+    assert json.loads(values["configs_json"]) == build_configs()
+
+
+def test_agentic_gpu_workflow_only_runs_manually_or_on_schedule():
+    yaml = pytest.importorskip("yaml")
+    workflow = yaml.safe_load(
+        (REPO / ".github/workflows/atom-agentic-benchmark.yaml").read_text()
+    )
+    triggers = workflow.get("on", workflow.get(True))
+    assert set(triggers) == {"workflow_dispatch", "schedule"}
+    assert workflow["jobs"]["benchmark"]["uses"] == (
+        "./.github/workflows/benchmark-tmpl.yml"
+    )

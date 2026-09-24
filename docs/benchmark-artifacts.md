@@ -46,12 +46,51 @@ not dependencies of this lightweight file producer.
 
 ## CI and configuration
 
-The existing benchmark workflow collects bundles for random cells. Catalog
-models/variants can set `bench_kind: aiperf_agentic`; the reusable template
-passes the choice to `atom_test.sh`. The current catalog does not enable an
-agentic cell. Configure it explicitly on the validation branch before an agentic
-CI run. There are no new global dispatch inputs, and the experimental TP2
-configuration is not added to nightly defaults.
+The existing ATOM Benchmark workflow collects bundles for random cells. The
+independent **ATOM Agentic Benchmark** workflow
+(`.github/workflows/atom-agentic-benchmark.yaml`) runs daily at 08:17 UTC and can
+also be dispatched manually. It loads `.github/benchmark/models_agentic.json`
+and reuses `benchmark-tmpl.yml` for execution, collection and artifact uploads.
+Visualization and long-term data browsing remain in AgenticViewer.
+
+The initial agentic catalog runs DeepSeek V4.1 Flash, FP8 weights, DSpark5, TP4,
+BF16 KV and FP8 index cache, using `FULL` CUDA graphs at concurrency 2 and 4.
+Each cell profiles for 900 seconds, uses a 262144-token context limit and 10
+additional warmup requests per lane. The replay dataset is
+`semianalysis_cc_traces_weka_062126` with 393 entries. Strict full-bundle validation
+is enabled. This graph recipe still needs a real GPU run; the earlier local
+acceptance used eager mode.
+
+Manual inputs select model prefixes, override the concurrency list or profiling
+duration (900–3600 seconds), and optionally select an image, runner or code refs.
+Empty model/concurrency inputs use the catalog. Prefer an immutable image tag or
+digest for comparisons, and use a ref containing this workflow and producer.
+The scheduled workflow becomes active when it is on the default branch; it does
+not run from a PR. Each run retains its own artifacts without updating gh-pages.
+
+Actions run titles follow the existing benchmark convention: `manual (<actor>)`
+or `nightly`, with GitHub's native run number shown alongside. The separate
+workflow has its own run-number sequence. Scheduled and manual runs have separate
+concurrency groups; neither cancels an executing run.
+
+Select **dry_run** to preview the resolved matrix using only a CPU runner. The
+Actions summary shows the point count, concurrency, duration, checkout SHA and
+expandable server/environment details. Every run saves an
+`atom-agentic-run-config-<attempt>` artifact containing `run-config.json`,
+`dispatch-inputs.json` and a README with a `gh workflow run` command. The dispatch
+file pins the ATOM checkout and retains the preview flag; set `dry_run` to `false`
+to execute. Image/AITER refs still need pinning for version comparisons. Each
+GPU job also links its uploaded summary, full bundle and failure diagnostics;
+an uploaded full bundle can still be incomplete after a failed run. Configuration
+and data artifacts are retained for 30 days, diagnostics for 14 days; download
+them before expiry for long-term storage.
+
+Model revision is read from the downloaded checkpoint's `.hf-revision` marker;
+the executing image, AITER and AIPerf identities are captured at runtime. Dataset
+content is retained and hashed rather than labeled with an unverified revision.
+The zero ISL/OSL and ratio in artifact names are shared-template placeholders;
+agentic workload metadata leaves these dimensions null and uses actual token
+counts. The random nightly/weekly catalog remains independent.
 
 Use the existing catalog `env_vars` or reusable workflow environment for:
 
