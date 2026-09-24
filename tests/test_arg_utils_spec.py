@@ -27,9 +27,19 @@ if _atom_config_stub is not None:
         # --cudagraph-mode string; use a real enum so subscript access works.
         import enum as _enum
 
+        # Mirrors atom.config.CUDAGraphMode, including the tuple-valued modes:
+        # --cudagraph-mode derives its choices from this enum, so a stub that
+        # omits members would quietly narrow what the CLI test sees.
         _atom_config_stub.CUDAGraphMode = _enum.Enum(
             "CUDAGraphMode",
-            {"NONE": 0, "PIECEWISE": 1, "FULL": 2, "FULL_AND_PIECEWISE": 3},
+            {
+                "NONE": 0,
+                "PIECEWISE": 1,
+                "FULL": 2,
+                "FULL_DECODE_ONLY": (2, 0),
+                "FULL_AND_PIECEWISE": (2, 1),
+                "AF_PIECEWISE": (1, 1),
+            },
         )
     if not hasattr(_atom_config_stub, "DSparkConfig"):
         # arg_utils imports DSparkConfig and calls DSparkConfig.from_dict() to
@@ -236,3 +246,44 @@ class TestEngineArgsIndexCacheDtype:
         )
 
         assert args.index_cache_dtype == "fp8"
+
+
+class TestCudagraphModeChoices:
+    """Every mode the enum defines must be reachable from the CLI.
+
+    `FULL_DECODE_ONLY` was defined in `CUDAGraphMode` and resolved correctly by
+    `decode_mode()` / `mixed_mode()` / `separate_routine()`, but the argparse
+    whitelist was a hand-maintained literal that left it out -- so the only way
+    to select it was to edit the list in place. Deriving `choices` from the enum
+    is what these tests pin: add a mode, and the CLI offers it.
+    """
+
+    def _choices(self):
+        parser = argparse.ArgumentParser()
+        EngineArgs.add_cli_args(parser)
+        action = next(
+            a for a in parser._actions if "--cudagraph-mode" in a.option_strings
+        )
+        return list(action.choices)
+
+    def test_choices_match_the_enum(self):
+        from atom.config import CUDAGraphMode
+
+        assert self._choices() == [m.name for m in CUDAGraphMode]
+
+    def test_full_decode_only_is_accepted(self):
+        """The mode this regression is about: capture decode, prefill eager."""
+        parser = argparse.ArgumentParser()
+        EngineArgs.add_cli_args(parser)
+
+        args = EngineArgs.from_cli_args(
+            parser.parse_args(["--cudagraph-mode", "FULL_DECODE_ONLY"])
+        )
+
+        assert args.cudagraph_mode == "FULL_DECODE_ONLY"
+
+    def test_default_is_unchanged(self):
+        parser = argparse.ArgumentParser()
+        EngineArgs.add_cli_args(parser)
+
+        assert EngineArgs.from_cli_args(parser.parse_args([])).cudagraph_mode == "FULL"
