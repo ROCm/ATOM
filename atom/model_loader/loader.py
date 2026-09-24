@@ -44,6 +44,22 @@ from atom.utils import envs
 logger = logging.getLogger("atom")
 
 
+def _weight_identity(param: nn.Parameter) -> str:
+    """Name the weight a loader was handed, for failures inside one.
+
+    `WeightDispatcher._parameter` records the runtime and checkpoint names on
+    the parameter, since loaders take `(param, tensor)` and would otherwise have
+    only shapes to report.
+    """
+    names = getattr(param, "_atom_load_names", None)
+    if names is None:
+        return "an unnamed parameter"
+    param_name, ckpt_name = names
+    if ckpt_name == param_name:
+        return f"`{param_name}`"
+    return f"`{param_name}` (checkpoint `{ckpt_name}`)"
+
+
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     if loaded_weight.numel() == param.data.numel():
         param.data.copy_(loaded_weight)
@@ -58,7 +74,22 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
         # slice out of bounds → empty → copy_ fails.
         tp_rank_start = loaded_weight_per_rank * get_tp_group().rank_in_group
         tp_rank_end = tp_rank_start + loaded_weight_per_rank
-        param.data.copy_(loaded_weight.view(-1)[tp_rank_start:tp_rank_end])
+        try:
+            param.data.copy_(loaded_weight.view(-1)[tp_rank_start:tp_rank_end])
+        except RuntimeError as error:
+            # The element counts matched, so this reached the flat-slice path,
+            # but the destination is not laid out as one contiguous rank-major
+            # run -- it needs a real sharded loader, or no sharding at all.
+            raise RuntimeError(
+                f"default_weight_loader: flat TP slice does not fit "
+                f"{_weight_identity(param)}. param shape={tuple(param.shape)} "
+                f"dtype={param.dtype} numel={param.data.numel()}; loaded "
+                f"shape={tuple(loaded_weight.shape)} dtype={loaded_weight.dtype} "
+                f"numel={loaded_weight.numel()}; tp_size="
+                f"{get_tp_group().world_size} rank_in_group="
+                f"{get_tp_group().rank_in_group} slice=[{tp_rank_start}:"
+                f"{tp_rank_end}]"
+            ) from error
     else:
         # Shape mismatch we cannot resolve — leaving the destination at its init
         # value is almost always a bug. The post-load check in load_model() will
@@ -66,7 +97,8 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
         # never wrote to it). Raise here so the failure is loud at copy time
         # too, instead of being masked by the default ones-init of RMSNorm etc.
         raise RuntimeError(
-            f"default_weight_loader: shape mismatch — param={tuple(param.shape)} "
+            f"default_weight_loader: shape mismatch on {_weight_identity(param)} — "
+            f"param={tuple(param.shape)} "
             f"loaded={tuple(loaded_weight.shape)}. Cannot copy."
         )
 
@@ -200,10 +232,17 @@ def initialize_dummy_weights(model: nn.Module, mode: str) -> None:
     for name, param in model.named_parameters():
         data = param.data
         if mode == "zero":
-            # zero_() works in place for every dtype (incl. fp4x2/fp8/int) and
-            # every shape; a uint8 byte-view would crash on 0-dim scalar or
-            # non-contiguous params (view requires stride(-1)==1, dim>0).
-            data.zero_()
+            # zero_() is the fast path: valid for every shape and every
+            # standard dtype (fp8/int/bf16/...). Packed sub-byte dtypes
+            # (e.g. Float4_e2m1fn_x2) have no CUDA fill kernel, so zero_()
+            # raises ("fill_cuda" not implemented for that dtype); fall back
+            # to zeroing the raw bytes instead (all-zero bytes == zero-valued
+            # weights). Only packed weights reach the fallback, and those are
+            # contiguous and >=1D, so the uint8 view is always valid there.
+            try:
+                data.zero_()
+            except (NotImplementedError, RuntimeError):
+                data.view(torch.uint8).zero_()
             continue
         # mode == "xavier"
         dt = data.dtype

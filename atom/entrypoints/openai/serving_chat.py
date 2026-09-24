@@ -25,7 +25,7 @@ from .sse import data_frame
 from .streaming_dispatch import StreamOutputCollector
 from .tool_parser import ToolCallStreamParser, parse_tool_calls
 from .tool_parser.registry import forbids_tool_calls
-from .tool_parser.tool_parser import usable_tool_name
+from .tool_parser.tool_parser import qualified_tool_name
 
 logger = logging.getLogger("atom")
 
@@ -69,7 +69,25 @@ def normalize_chat_tools(tools: Any) -> Any:
     return normalized
 
 
-def resolve_thinking(request: ChatCompletionRequest) -> tuple[bool | None, str | None]:
+def _tool_parser_for_request(parser_cls, tools):
+    """Return the parser this request actually needs.
+
+    A no-tools request cannot produce a dispatchable tool call. Disable parsers
+    whose markers only open tool-call regions so an unclosed marker remains
+    ordinary content instead of withholding the stream until EOS. Parsers that
+    consume model-wide channel framing must remain active without tools.
+    """
+    if parser_cls is None or tools:
+        return parser_cls
+    consumes_channel_framing = any(
+        not parser_cls.opens_region(marker) for marker in parser_cls.START_MARKERS
+    )
+    return parser_cls if consumes_channel_framing else None
+
+
+def resolve_thinking(
+    request: ChatCompletionRequest,
+) -> tuple[bool | None, str | int | None]:
     """Resolve (enabled, effort) from the request's thinking / reasoning_effort.
 
     ``thinking`` (extra_body) takes precedence over ``reasoning_effort``.
@@ -97,12 +115,15 @@ def resolve_thinking(request: ChatCompletionRequest) -> tuple[bool | None, str |
         effort = thinking.get("effort")
     elif request.reasoning_effort is not None:
         effort = request.reasoning_effort
-    if effort not in VALID_TEMPLATE_EFFORTS:
+    if isinstance(effort, (int, float)):
+        if type(effort) is not int or not 1 <= effort <= 100:
+            raise ValueError("reasoning effort must be an integer in [1, 100]")
+    elif not isinstance(effort, str) or effort not in VALID_TEMPLATE_EFFORTS:
         effort = None
     return enabled, effort
 
 
-def _validate_one_tool(tool: Any, index: int) -> None:
+def _validate_one_tool(tool: Any, index: int) -> str:
     if not isinstance(tool, dict):
         # ValueError (not TypeError) so the handler maps it to HTTP 400.
         raise ValueError(f"tools[{index}] must be an object")  # noqa: TRY004
@@ -111,18 +132,10 @@ def _validate_one_tool(tool: Any, index: int) -> None:
     fn = tool.get("function")
     if not isinstance(fn, dict):
         raise ValueError(f"tools[{index}].function must be an object")  # noqa: TRY004
-    name = fn.get("name")
-    # The same predicate the parsers apply to a name the *model* writes. The
-    # second grammar that used to be here, `^[A-Za-z_][A-Za-z0-9_-]*$`, was
-    # the stricter: it rejected a leading digit that OpenAI's own
-    # `^[a-zA-Z0-9_-]{1,64}$` allows, every non-ASCII name, and MCP's
-    # `server.tool` -- a 400 before the model ever ran, while `/v1/messages`
-    # validated nothing and accepted all three.
-    if not isinstance(name, str) or not usable_tool_name(name):
-        raise ValueError(
-            f"tools[{index}].function.name must be a dispatchable name: "
-            "a word character followed by word characters, dots or dashes"
-        )
+    try:
+        return qualified_tool_name(tool)
+    except ValueError as exc:
+        raise ValueError(f"tools[{index}].{exc}") from exc
 
 
 def validate_tool_list(tools: Any) -> None:
@@ -132,8 +145,7 @@ def validate_tool_list(tools: Any) -> None:
         raise ValueError("tools must be an array")  # noqa: TRY004
     seen: set[str] = set()
     for i, tool in enumerate(tools):
-        _validate_one_tool(tool, i)
-        name = tool["function"]["name"]
+        name = _validate_one_tool(tool, i)
         if name in seen:
             raise ValueError(f"duplicate tool name: {name}")
         seen.add(name)
@@ -164,11 +176,11 @@ def validate_chat_request(request: ChatCompletionRequest) -> None:
                 )
             # A named tool_choice must reference a declared tool.
             names = {
-                t["function"]["name"]
+                qualified_tool_name(t)
                 for t in (request.tools or [])
                 if isinstance(t, dict) and isinstance(t.get("function"), dict)
             }
-            if fn["name"] not in names:
+            if qualified_tool_name(tool_choice) not in names:
                 raise ValueError(f"tool_choice names unknown tool: {fn['name']}")
         else:
             raise ValueError("tool_choice must be a string or an object")
@@ -256,7 +268,7 @@ async def stream_chat_response(
     reasoning_filter = reasoning.stream()
     tool_parser = ToolCallStreamParser(
         tools=tools,
-        parser_cls=tool_parser_cls,
+        parser_cls=_tool_parser_for_request(tool_parser_cls, tools),
         suppress_calls=forbids_tool_calls(tool_choice),
     )
     has_tool_calls = False
@@ -394,7 +406,7 @@ def _build_chat_choice(
     content, tool_calls = parse_tool_calls(
         content_with_tools,
         tools,
-        parser_cls=tool_parser_cls,
+        parser_cls=_tool_parser_for_request(tool_parser_cls, tools),
         suppress_calls=forbids_tool_calls(tool_choice),
     )
 
@@ -459,12 +471,13 @@ def build_chat_response(
             "latency_s": round(final_output.get("latency", 0.0), 4),
         },
     )
+    update: dict[str, Any] = {}
     if "kv_transfer_output_meta_info" in final_output:
-        response = response.model_copy(
-            update={
-                "kv_transfer_params": final_output["kv_transfer_output_meta_info"],
-            }
-        )
+        update["kv_transfer_params"] = final_output["kv_transfer_output_meta_info"]
+    if "prompt_token_ids" in final_output:
+        update["prompt_token_ids"] = final_output["prompt_token_ids"]
+    if update:
+        response = response.model_copy(update=update)
     return response
 
 
@@ -500,7 +513,7 @@ def build_chat_response_multi(
     ]
     prompt_tokens = final_outputs[0]["num_tokens_input"]
     completion_tokens = sum(out["num_tokens_output"] for out in final_outputs)
-    return ChatCompletionResponse(
+    response = ChatCompletionResponse(
         id=request_id,
         created=int(time.time()),
         model=model,
@@ -524,6 +537,12 @@ def build_chat_response_multi(
             "num_choices": len(final_outputs),
         },
     )
+    # Sibling outputs share the first output's prompt IDs.
+    if "prompt_token_ids" in final_outputs[0]:
+        response = response.model_copy(
+            update={"prompt_token_ids": final_outputs[0]["prompt_token_ids"]}
+        )
+    return response
 
 
 async def stream_chat_response_fanout(
@@ -558,7 +577,7 @@ async def stream_chat_response_fanout(
     tool_parsers = [
         ToolCallStreamParser(
             tools=tools,
-            parser_cls=tool_parser_cls,
+            parser_cls=_tool_parser_for_request(tool_parser_cls, tools),
             suppress_calls=forbids_tool_calls(tool_choice),
         )
         for _ in range(n)

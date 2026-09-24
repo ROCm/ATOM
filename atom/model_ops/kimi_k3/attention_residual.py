@@ -56,6 +56,7 @@ if _HAS_TRITON:
         ps_ptr,
         sw_ptr,
         y_ptr,
+        ys_ptr,
         hs_ptr,
         hs2_ptr,
         pref_ptr,
@@ -65,6 +66,8 @@ if _HAS_TRITON:
         H,
         eps,
         out_eps,
+        fp8_max,
+        inv_fp8_max,
         stride_br_t,
         stride_br_b,
         stride_ps_t,
@@ -78,6 +81,7 @@ if _HAS_TRITON:
         DO_ADD2: tl.constexpr,  # fold a second addend (shared-expert output)
         WRITE_PREF: tl.constexpr,  # write the (summed) prefix back to pref_ptr
         OUT_NORM: tl.constexpr,  # fold the caller's output rmsnorm into the store
+        QUANT: tl.constexpr,  # fold the consumer's per-token quant into the store
     ):
         # One program per row t: rmsnorm each of the Bp = B+1 candidates, score =
         # <normed, score_weight>, softmax over Bp, then weighted sum -> y[t].
@@ -168,6 +172,22 @@ if _HAS_TRITON:
             # Free: b_o is already fully formed in registers.
             rs = tl.rsqrt(tl.sum(tl.where(m_d, b_o * b_o, 0.0), axis=0) / H + out_eps)
             b_o = b_o * rs * tl.load(ow_ptr + o_d, mask=m_d, other=0.0).to(tl.float32)
+        if QUANT:
+            # Also free, and for the same reason OUT_NORM is: the row is already
+            # in registers, so the per-token amax is a register reduction and the
+            # store just narrows. Folding it here is what lets the consuming GEMM
+            # skip a standalone quant of this same [T, H] -- the fusion the
+            # RMSNorm module does on the paths where it, rather than this kernel,
+            # applies out_norm.
+            amax = tl.max(tl.where(m_d, tl.abs(b_o), 0.0), axis=0)
+            # amax * (1/fp8_max), not amax / fp8_max -- triton's ROCm fdiv is
+            # 1 ulp off IEEE and would put this row's scale on a different code
+            # than aiter's per-token quant, which the non-fused path uses for the
+            # same activation. See the same note in kimi_k3/quant.py.
+            scale = amax * inv_fp8_max
+            inv = tl.where(scale > 0.0, 1.0 / scale, 0.0)
+            b_o = tl.minimum(tl.maximum(b_o * inv, -fp8_max), fp8_max)
+            tl.store(ys_ptr + t, scale)
         tl.store(y_ptr + t * stride_yt + o_d, b_o.to(y_ptr.dtype.element_ty), mask=m_d)
 
 
@@ -200,7 +220,10 @@ def _apply_attn_res_impl(
     out_norm_weight: torch.Tensor | None = None,  # [H], folded: y = rmsnorm(y)
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,  # [T, H], folded the same way
-) -> tuple[torch.Tensor, torch.Tensor]:
+    quant_dtype: torch.dtype | None = None,  # folded: y = per-token quant(y)
+) -> (
+    tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+):
     """Block-residual soft-attention mix: rmsnorm each of the B+1 candidates,
     score = <normed, score_weight>, softmax over B+1, weighted sum.
 
@@ -218,6 +241,11 @@ def _apply_attn_res_impl(
     When ``out_norm_weight`` is given, the caller's rmsnorm OF THE RESULT (every
     apply_attn_res call site in kimi_k3.py feeds one) is folded in too, so the
     returned ``y`` is already normed and scaled.
+
+    ``quant_dtype`` folds the CONSUMING GEMM's per-token activation quant in as
+    well, returning ``(y_quantized, y_scale, prefix_out)`` instead of
+    ``(y, prefix_out)``. It requires ``out_norm_weight``: quantizing an unnormed
+    mix would hand the consumer an activation on the wrong scale entirely.
     """
     T, B, H = block_residual.shape
     Bp = B + 1
@@ -226,10 +254,23 @@ def _apply_attn_res_impl(
     if do_add2 and not do_add:
         raise ValueError("add_hidden2 requires add_hidden")
     out_norm = out_norm_weight is not None
+    quant = quant_dtype is not None
+    if quant and not out_norm:
+        raise ValueError("quant_dtype requires out_norm_weight")
+    fp8_max = float(torch.finfo(quant_dtype).max) if quant else 1.0
     br = block_residual.contiguous()
     ps = prefix_sum.contiguous()
     sw = score_weight.contiguous()
-    y = torch.empty((T, H), device=block_residual.device, dtype=prefix_sum.dtype)
+    y = torch.empty(
+        (T, H),
+        device=block_residual.device,
+        dtype=quant_dtype if quant else prefix_sum.dtype,
+    )
+    # Always allocated (triton needs a tensor); size 1 and never dereferenced
+    # when QUANT is False.
+    y_scale = torch.empty(
+        (T, 1) if quant else (1,), device=block_residual.device, dtype=torch.float32
+    )
     ow = out_norm_weight.contiguous() if out_norm else sw
     # hs/hs2/pref pointers are always passed (triton needs a tensor); when not
     # adding they alias ps and are never dereferenced (DO_ADD / DO_ADD2 /
@@ -244,6 +285,7 @@ def _apply_attn_res_impl(
         ps,
         sw,
         y,
+        y_scale,
         hs,
         hs2,
         pref,
@@ -253,6 +295,8 @@ def _apply_attn_res_impl(
         H,
         float(eps),
         float(out_eps),
+        fp8_max,
+        1.0 / fp8_max,
         br.stride(0),
         br.stride(1),
         ps.stride(0),
@@ -268,8 +312,12 @@ def _apply_attn_res_impl(
         DO_ADD2=do_add2,
         WRITE_PREF=do_add,
         OUT_NORM=out_norm,
+        QUANT=quant,
     )
-    return y, (pref if do_add else prefix_sum)
+    prefix_out = pref if do_add else prefix_sum
+    if quant:
+        return y, y_scale, prefix_out
+    return y, prefix_out
 
 
 def _apply_attn_res_op(
@@ -353,6 +401,109 @@ direct_register_custom_op(
 )
 
 
+# Quantizing variants. Separate ops rather than an optional `quant_dtype` on the
+# two above because the return arity differs (the scale), and a schema's return
+# type is fixed at registration.
+
+
+def _apply_attn_res_quant_op(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    out_norm_weight: torch.Tensor,
+    out_eps: float,
+    quant_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    y, y_scale, _ = _apply_attn_res_impl(
+        prefix_sum,
+        block_residual,
+        score_weight,
+        eps,
+        out_norm_weight=out_norm_weight,
+        out_eps=out_eps,
+        quant_dtype=quant_dtype,
+    )
+    return y, y_scale
+
+
+def _apply_attn_res_quant_op_fake(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    out_norm_weight: torch.Tensor,
+    out_eps: float,
+    quant_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty_like(prefix_sum, dtype=quant_dtype),
+        torch.empty(
+            (prefix_sum.shape[0], 1), device=prefix_sum.device, dtype=torch.float32
+        ),
+    )
+
+
+direct_register_custom_op(
+    op_name="kimi_k3_apply_attn_res_quant",
+    op_func=_apply_attn_res_quant_op,
+    mutates_args=[],
+    fake_impl=_apply_attn_res_quant_op_fake,
+)
+
+
+def _apply_attn_res_add_quant_op(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    add_hidden: torch.Tensor,
+    out_norm_weight: torch.Tensor,
+    out_eps: float,
+    quant_dtype: torch.dtype,
+    add_hidden2: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _apply_attn_res_impl(
+        prefix_sum,
+        block_residual,
+        score_weight,
+        eps,
+        add_hidden,
+        out_norm_weight=out_norm_weight,
+        out_eps=out_eps,
+        add_hidden2=add_hidden2,
+        quant_dtype=quant_dtype,
+    )
+
+
+def _apply_attn_res_add_quant_op_fake(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    add_hidden: torch.Tensor,
+    out_norm_weight: torch.Tensor,
+    out_eps: float,
+    quant_dtype: torch.dtype,
+    add_hidden2: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty_like(prefix_sum, dtype=quant_dtype),
+        torch.empty(
+            (prefix_sum.shape[0], 1), device=prefix_sum.device, dtype=torch.float32
+        ),
+        torch.empty_like(prefix_sum),
+    )
+
+
+direct_register_custom_op(
+    op_name="kimi_k3_apply_attn_res_add_quant",
+    op_func=_apply_attn_res_add_quant_op,
+    mutates_args=[],
+    fake_impl=_apply_attn_res_add_quant_op_fake,
+)
+
+
 @mark_trace
 def apply_attn_res(
     prefix_sum: torch.Tensor,
@@ -363,12 +514,44 @@ def apply_attn_res(
     out_norm_weight: torch.Tensor | None = None,
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    quant_dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Dispatch an opaque custom op whose CUDA implementation selects by concrete T.
 
     ``out_norm_weight`` folds the caller's rmsnorm of the result into the kernel;
     the returned mixed output is then already normed and scaled by it.
-    ``add_hidden2`` folds a second addend into the prefix (see the impl)."""
+    ``add_hidden2`` folds a second addend into the prefix (see the impl).
+
+    ``quant_dtype`` additionally folds the consuming GEMM's per-token quant in,
+    making the first element of the returned pair a ``(quantized, scale)`` tuple
+    rather than a tensor -- the same shape the fused-quant RMSNorm hands its
+    consumers, so the call sites that already unpack one need no new branch."""
+    if quant_dtype is not None:
+        if add_hidden is None:
+            if add_hidden2 is not None:
+                raise ValueError("add_hidden2 requires add_hidden")
+            y, y_scale = torch.ops.aiter.kimi_k3_apply_attn_res_quant(
+                prefix_sum,
+                block_residual,
+                score_weight,
+                eps,
+                out_norm_weight,
+                out_eps,
+                quant_dtype,
+            )
+            return (y, y_scale), prefix_sum
+        y, y_scale, prefix_out = torch.ops.aiter.kimi_k3_apply_attn_res_add_quant(
+            prefix_sum,
+            block_residual,
+            score_weight,
+            eps,
+            add_hidden,
+            out_norm_weight,
+            out_eps,
+            quant_dtype,
+            add_hidden2,
+        )
+        return (y, y_scale), prefix_out
     if add_hidden is None:
         if add_hidden2 is not None:
             raise ValueError("add_hidden2 requires add_hidden")

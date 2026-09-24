@@ -60,7 +60,11 @@ from aiter.rotary_embedding import get_rope
 from torch import nn
 
 from atom.model_ops.activation import SiluAndMul
-from atom.model_ops.attention_mla import MLAModules, mla_min_query_heads
+from atom.model_ops.attention_mla import (
+    MLAModules,
+    mla_min_query_heads,
+    qrep_tp_override,
+)
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.dspark_markov_sample import dspark_markov_argmax
 from atom.model_ops.layernorm import RMSNorm
@@ -125,33 +129,41 @@ class DSparkMarkovHead(nn.Module):
         )
         return logits_bias, markov_embed
 
-    def sample_next(self, token_ids: torch.Tensor, base_logits: torch.Tensor):
-        """One greedy block position: the argmax of the biased logits, and W1[x].
+    def sample_next(
+        self, token_ids: torch.Tensor, base_logits: torch.Tensor, out: torch.Tensor
+    ) -> torch.Tensor:
+        """One greedy block position: the argmax of the biased logits into `out`.
 
         The bias itself is never returned, which is what lets the fused path
         skip materializing it: ``dspark_markov_argmax`` keeps ``W2`` bf16 and
         reduces straight to ids, with the same fp32 accumulation the softmax
         guarantee above asks for (see that module for the numerics argument).
-        ``markov_embed`` is still returned because V4's confidence head
-        consumes it.
+        ``markov_embed`` is the return because V4's confidence head consumes it;
+        the ids are not, so that `out` stays the only place to read them whether
+        or not the caller is compiled.
 
         Args:
             token_ids:   [B]     ids of the previously sampled token x_{k-1}.
             base_logits: [B, V]  this position's base logits.
+            out:         [B]     where the ids land; a strided view is fine,
+                                 which is how the caller's own block becomes
+                                 the destination instead of a copy's source.
         Returns:
-            next_ids:     [B]     argmax over the biased logits.
             markov_embed: [B, r]  W1[x_{k-1}].
         """
         if self.fused_sample:
-            markov_embed = self.markov_w1(token_ids)
-            next_ids = dspark_markov_argmax(
-                base_logits, markov_embed, self.markov_w2.weight
+            return dspark_markov_argmax(
+                base_logits,
+                token_ids,
+                self.markov_w1.weight,
+                self.markov_w2.weight,
+                out,
             )
-            return next_ids, markov_embed
         bias, markov_embed = self(token_ids)
         # bf16 + fp32 promotes the slice to fp32 before the add, so an explicit
         # .float() would only materialize it twice for the same sum.
-        return (base_logits + bias).argmax(dim=-1), markov_embed
+        out.copy_((base_logits + bias).argmax(dim=-1))
+        return markov_embed
 
 
 def _dspark_block_width(draft_config, atom_config) -> int:
@@ -229,6 +241,10 @@ class K3DSparkMLAAttention(nn.Module):
         self.v_head_dim = config.v_head_dim
         self.scaling = self.qk_head_dim**-0.5
 
+        # No-op unless QREP is on (see qrep_tp_override); the draft shares the
+        # target's DCP group, so this is all the wiring QREP needs here.
+        q_qrep_override = qrep_tp_override(tp_size)
+
         # q_a_proj and kv_a_proj_with_mqa share an input, so the checkpoint's two
         # weights load into one merged projection (see packed_modules_mapping).
         self.fused_qkv_a_proj = MergedReplicatedLinear(
@@ -250,6 +266,7 @@ class K3DSparkMLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.q_b_proj",
+            **q_qrep_override,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
@@ -561,14 +578,19 @@ class K3DSparkDecoderLayer(nn.Module):
         self.self_attn.write_context_kv(ctx_hidden, positions, slot_mapping)
 
     def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = residual + self.self_attn(positions, hidden_states)
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        return residual + self.mlp(hidden_states)
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        return self.mlp(hidden_states), residual
 
 
 class KimiK3DSpark(DSparkDraftModel):
@@ -644,6 +666,9 @@ class KimiK3DSpark(DSparkDraftModel):
         # Bound by share_with_target(); both are skipped at load.
         self.embed_tokens = None
         self.lm_head = None
+        # vLLM 0.28 probes this attribute before enabling adaptive verification.
+        # This checkpoint deliberately skips the training-only head.
+        self.confidence_head = None
 
     # ---- weight-loading hooks ---------------------------------------------
 
@@ -699,6 +724,29 @@ class KimiK3DSpark(DSparkDraftModel):
         always ``None`` here -- this checkpoint's confidence head is
         training-only (see ``skip_weight_prefixes``). The proposer already
         handles ``None`` by leaving the verify length fixed.
+
+        The two halves below are also callable separately, which is how the
+        proposer declares this block as a capturable pass: the backbone is the
+        recorded forward and the head is its epilogue. Kept as the composition
+        so the whole block still has one name, and so nothing that only wants a
+        block has to know it is made of two pieces.
+        """
+        return self.head_and_sample(
+            self.block_backbone(input_ids, positions, num_draft),
+            input_ids,
+            num_draft,
+        )
+
+    def block_backbone(
+        self,
+        input_ids: torch.Tensor,  # [B]   verified anchor token per request
+        positions: torch.Tensor,  # [B*T] block absolute positions
+        num_draft: int,
+    ) -> torch.Tensor:
+        """The parallel half: embed the block, run the layers, norm.
+
+        Returns the post-final-norm hidden states, ``[B*T, hidden]`` -- flat,
+        because that is what the LM head takes and what the layers produced.
         """
         bs = input_ids.shape[0]
         T = num_draft
@@ -712,12 +760,25 @@ class KimiK3DSpark(DSparkDraftModel):
         draft_ids[:, 0] = input_ids
         hidden = self.embed_tokens(draft_ids.view(-1))
 
+        residual = None
         for layer in self.layers:
-            hidden = layer(positions, hidden)
-        hidden = self.final_norm(hidden)
+            hidden, residual = layer(positions, hidden, residual)
+        hidden, _ = self.final_norm(hidden, residual)
+        return hidden
 
-        base_logits = self.lm_head(hidden).view(bs, T, -1)
-        return self._sample_block(base_logits, input_ids), None
+    def head_and_sample(
+        self,
+        hidden: torch.Tensor,  # [B*T, hidden] post-final-norm
+        anchor_ids: torch.Tensor,  # [B]
+        num_draft: int,
+    ):
+        """The sequential half: LM head, then Markov sampling over the block.
+
+        Batch comes from ``anchor_ids`` rather than from ``hidden``, which is
+        flat over ``B*T`` and so cannot say which of the two axes it holds.
+        """
+        base_logits = self.lm_head(hidden).view(anchor_ids.shape[0], num_draft, -1)
+        return self._sample_block(base_logits, anchor_ids), None
 
     def _sample_block(
         self,
@@ -736,7 +797,8 @@ class KimiK3DSpark(DSparkDraftModel):
         out_ids[:, 0] = anchor_ids
         for k in range(T):
             # Greedy: temperature/sampling is applied by the target's verify.
-            out_ids[:, k + 1], _ = self.markov_head.sample_next(
-                out_ids[:, k], base_logits[:, k]
+            # The column is the op's destination, so no id is written twice.
+            self.markov_head.sample_next(
+                out_ids[:, k], base_logits[:, k], out_ids[:, k + 1]
             )
         return out_ids[:, 1:]

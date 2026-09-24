@@ -45,11 +45,14 @@ if is_sglang():
         Qwen3_5MoeForCausalLM,
     )
     from atom.models.qwen3_next import Qwen3NextForCausalLM
+    from atom.models.qwen4_exp import Qwen4ExpForConditionalGeneration
 
     _ATOM_SUPPORTED_MODELS.update(
         {
             "DeepseekV4ForCausalLM": DeepseekV4ForCausalLM,
             "Qwen3NextForCausalLM": Qwen3NextForCausalLM,
+            "Qwen3_5ForCausalLM": Qwen3_5ForCausalLM,
+            "Qwen3_5MoeForCausalLM": Qwen3_5MoeForCausalLM,
             "Qwen3_5ForConditionalGeneration": Qwen3_5ForCausalLM,
             "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForCausalLM,
             # ROCm/ATOM#1078: route Kimi-K2.x through ATOM's quant-aware model
@@ -60,6 +63,8 @@ if is_sglang():
             # (BF16) attention projections.
             "KimiK25ForConditionalGeneration": KimiK25ForCausalLM,
             "KimiK3ForConditionalGeneration": KimiK3ForCausalLM,
+            # Qwen3.8-Flash-Next / Qwen4Exp — not Qwen3.5.
+            "Qwen4ExpForConditionalGeneration": Qwen4ExpForConditionalGeneration,
         }
     )
     _ATOM_SUPPORTED_DRAFT_MODELS = {
@@ -427,10 +432,10 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
 
                     original_batch_size = forward_batch.batch_size
                     original_out_cache_loc = forward_batch.out_cache_loc
-                    graph_bs = int(self.bs)
-                    forward_batch.batch_size = graph_bs
+                    running_bs = int(self.bs)
+                    forward_batch.batch_size = running_bs
                     forward_batch.out_cache_loc = self.buffers.out_cache_loc[
-                        : graph_bs * self.topk * self.speculative_num_steps
+                        : running_bs * self.topk * self.speculative_num_steps
                     ]
                     try:
                         stage_glm52_draft_decode_graph_metadata(

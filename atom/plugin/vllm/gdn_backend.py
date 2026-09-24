@@ -31,8 +31,20 @@ class AtomGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
     """ATOM GDN metadata builder.
 
     Inherits vLLM's GDN builder so runner-side ``isinstance`` checks for spec
-    decode continue to work. The post-build compaction rebuilds request-indexed
-    metadata for FULL-cudagraph padded decode rows.
+    decode continue to work.  The post-build compaction rebuilds request-indexed
+    metadata for the rows a FULL-cudagraph decode was padded with.
+
+    vLLM cannot mark those rows itself on this path.  For a pure-decode batch
+    ``max_query_len`` is 1, so ``split_decodes_and_prefills`` takes its fast
+    path and returns ``num_decodes = num_reqs`` -- the *padded* request count.
+    Its own guard then reads
+    ``non_spec_state_indices_tensor[num_decodes:].fill_(NULL_BLOCK_ID)``, which
+    is a no-op once ``num_decodes == batch_size``, so the padded slots keep
+    whatever ``block_table_tensor[:, 0]`` held.  ATOM's GDN decode kernel is
+    request-indexed, so it walks them and folds them into ssm_state.
+
+    Kimi-K3 runs the same pass from its own builder
+    (``AtomKimiK3KDAMetadataBuilder._adapt_full_graph_decode_metadata``).
     """
 
     def build(  # type: ignore[override]

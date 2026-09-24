@@ -201,6 +201,8 @@ class Qwen3_5MTP(nn.Module):
         self,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
+        *,
+        out: torch.Tensor,
     ) -> torch.Tensor:
         """Greedy draft token ids via distributed argmax — each rank reduces its
         own vocab shard and only [N, 2] is all-gathered, instead of the full
@@ -209,7 +211,7 @@ class Qwen3_5MTP(nn.Module):
         prefill last-token slice (is_draft is set for the whole propose loop),
         so both see the same rows.
         """
-        return self.lm_head.compute_argmax_token(hidden_states)
+        return self.lm_head.compute_argmax_token(hidden_states, out=out)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales

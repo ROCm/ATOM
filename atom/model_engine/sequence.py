@@ -3,6 +3,7 @@
 
 import array
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import Enum, auto
 from itertools import count
 from typing import Any
@@ -30,16 +31,106 @@ def new_token_ids(token_ids=()) -> array.array:
     return array.array("i", token_ids)
 
 
-def new_block_table(block_ids=()) -> array.array:
-    """A sequence's physical block ids.
+# Drawn once per table and once per non-append mutation of one, never reused.
+# A `version` therefore names an epoch during which one specific table only
+# ever grew, which is what `block_table_codec` needs to ship a forward's block
+# tables as appends alone -- see `BlockTable`.
+_block_table_versions = count()
+
+
+class BlockTable(array.array):
+    """A sequence's physical block ids, tagged with a mutation `version`.
 
     An `array("i")` rather than a list because every forward marshals these
     into the int32 `block_tables` buffer, where a list costs one CPython int
     unboxing per block (~17k per step at 50 seqs x 100k ctx) and an array is a
     memcpy. It behaves as a list for append/pop/index/len/iterate; it has no
     `.clear()` (use `del bt[:]`) and no `.copy()` (use `list(bt)`).
+
+    `version` is what makes the table's own growth self-describing: it is
+    redrawn by every mutation that is *not* an append, so
+
+        same version and a length of at least n  =>  the first n ids are the
+        same ids they were when that version was last observed
+
+    with no need to re-read the prefix. `BlockTableDeltaEncoder` turns that
+    into "send only the ids appended since the last step". Appends deliberately
+    do not redraw it, so the hot path (`BlockManager.allocate` appending one
+    block per decode step) keeps the inherited C `array.append` with no Python
+    frame on top -- 40 ns against 36 for a plain `array`, which is the subclass
+    method lookup and nothing else.
+
+    A version is a global draw rather than a per-table counter so that a fresh
+    table for a recycled request id can never look like a known one: no two
+    live tables ever carry the same version.
     """
-    return array.array("i", block_ids)
+
+    __slots__ = ("version",)
+
+    def __new__(cls, block_ids=()):
+        return super().__new__(cls, "i", block_ids)
+
+    def __init__(self, block_ids=()):
+        self.version = next(_block_table_versions)
+
+    # A copy is a different table and must draw its own version, or two tables
+    # would answer for one. All three hooks are needed: `array` supplies its
+    # own `__copy__`/`__deepcopy__`, which hand back a bare `array` and drop
+    # the version silently, and its reconstructor leaves the attribute unset,
+    # which surfaces much later as an AttributeError in whoever reads it.
+
+    def __reduce_ex__(self, protocol):
+        return _rebuild_block_table, (self.tobytes(),)
+
+    def __copy__(self):
+        return _rebuild_block_table(self.tobytes())
+
+    def __deepcopy__(self, memo):
+        return _rebuild_block_table(self.tobytes())
+
+
+def _rebuild_block_table(raw: bytes) -> "BlockTable":
+    table = BlockTable()
+    table.frombytes(raw)
+    return table
+
+
+def _revises_block_table(name: str) -> Callable:
+    """Wrap `array.array.<name>` so it redraws the table's version first."""
+    inherited = getattr(array.array, name)
+
+    def revise(self, *args):
+        self.version = next(_block_table_versions)
+        return inherited(self, *args)
+
+    revise.__name__ = name
+    revise.__qualname__ = f"BlockTable.{name}"
+    revise.__doc__ = f"`array.array.{name}`, plus a new version."
+    return revise
+
+
+# Every `array` mutator that can disturb ids already in the table. The ones
+# left out -- `append`, `extend`, `frombytes`, `fromfile`, `fromlist` and
+# `__iadd__` -- only ever add past the end, which is exactly the case the
+# version is defined to survive. Assigned in a loop so the reviewable artifact
+# is this list rather than eight near-identical bodies.
+for _mutator in (
+    "__setitem__",
+    "__delitem__",
+    "__imul__",
+    "byteswap",
+    "insert",
+    "pop",
+    "remove",
+    "reverse",
+):
+    setattr(BlockTable, _mutator, _revises_block_table(_mutator))
+del _mutator
+
+
+def new_block_table(block_ids=()) -> BlockTable:
+    """A sequence's physical block ids. See `BlockTable`."""
+    return BlockTable(block_ids)
 
 
 class SequenceStatus(Enum):
@@ -67,6 +158,61 @@ def get_exit_sequence():
     return exit_seq
 
 
+@dataclass
+class OffloadJointRecord:
+    """The KV-transfer offload/joint-load protocol state for one sequence.
+
+    These six values were six flat attributes on `Sequence`, written from
+    `BlockManager` and `Scheduler` and read back by the offload connector, with
+    the joint subset re-initialised by hand in several places -- so a reset that
+    forgot one field left a stale span the connector would then act on. Grouped
+    here so the whole protocol state is one field (`Sequence.offload_joint`) and
+    the joint boundary has one place to be dropped from (`reset_joint`).
+    """
+
+    # Content hash of a checkpoint the tier was asked to fetch back into
+    # `state_slot`, or -1. Tells the scheduler to park, and tells the failure
+    # path that `num_cached_tokens` is claiming undelivered state.
+    load_hash: int = -1
+    # The LMCache-resident KV prefix in tokens, as this admission's lookup
+    # reported it -- the KV leg's ceiling. Written before `can_allocate`, which
+    # is where the two legs agree on one boundary. 0 = no lookup.
+    kv_prefix_tokens: int = 0
+    # The boundary both legs of a joint load are aimed at, or 0. Chosen by
+    # `can_allocate`: the rightmost checkpoint rung the LMCache KV prefix
+    # covers. `num_cached_tokens` stays at the HBM prefix until both legs
+    # report, which keeps the forward honest if either fails.
+    boundary_tokens: int = 0
+    # Content hash of that boundary's last block, for the state leg.
+    boundary_hash: int = -1
+    # How far the KV leg transfers, in tokens: the LMCache chunk that *covers*
+    # the boundary above, which is at or past it. The request still only claims
+    # the boundary -- see `_claim_after_load`.
+    kv_tokens: int = 0
+    # How far `allocate` claimed straight out of the HBM prefix cache, in
+    # tokens. Above `num_cached_tokens`, not below it: the blocks in
+    # `(hit, compressed_hit]` hold this prompt's KV and are still indexed --
+    # the state gate cut the hit, the KV never went anywhere. Claiming them is
+    # what keeps the KV leg from paying LMCache to resend what the pool already
+    # has, and it is where that leg starts.
+    claim_tokens: int = 0
+
+    def reset_joint(self) -> None:
+        """Drop the joint boundary and both of its transfer spans.
+
+        The four joint fields move together -- a boundary is meaningless
+        without the KV span aimed at it and the prefix claimed below it -- so
+        the sites that abandon a joint load in full clear them through here
+        rather than by hand. Leaves `load_hash` and `kv_prefix_tokens`
+        untouched: they are set on their own paths and are not part of the
+        boundary this drops.
+        """
+        self.boundary_tokens = 0
+        self.boundary_hash = -1
+        self.kv_tokens = 0
+        self.claim_tokens = 0
+
+
 class Sequence:
     counter = count()
 
@@ -89,11 +235,17 @@ class Sequence:
         mrope_positions: np.ndarray | None = None,
         mrope_position_delta: int = 0,
         data_parallel_rank: int | None = None,
+        dp_session_id: str | None = None,
+        dp_parent_session_id: str | None = None,
     ):
         # Built here rather than as a default argument: one instance shared by
         # every defaulting Sequence would be a mutable default in all but name.
         if sampling_params is None:
             sampling_params = SamplingParams()
+        if num_draft_tokens and sampling_params.logprobs:
+            raise ValueError(
+                "Token logprobs are not supported with speculative decoding"
+            )
         self.block_size = block_size
         self.id = id or next(Sequence.counter)
         self.external_request_id = request_id
@@ -109,10 +261,27 @@ class Sequence:
         # allocate() / free it in deallocate().
         self.has_per_req_cache = has_per_req_cache
         self.multimodal_data = multimodal_data
+        self.multimodal_cache_ready = False
+        # Immutable content identity survives payload release and preemption.
+        self.cache_seed = -1
+        if multimodal_data is not None:
+            from atom.model_engine.multimodal_runtime import multimodal_cache_seed
+
+            self.cache_seed = multimodal_data.get("cache_seed")
+            if self.cache_seed is None:
+                self.cache_seed = multimodal_cache_seed(multimodal_data)
         self.mrope_positions = mrope_positions
         self.mrope_position_delta = mrope_position_delta
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
+        # Host-known prefix, excluding deferred outputs and draft placeholders.
+        # Read by the DSpark state audit and the runtime benchmark; the width
+        # preemption strips is `num_placeholder_tokens`, which is recorded
+        # where the placeholders are appended.
+        self.num_finalized_tokens = len(token_ids)
+        # Initial local prefill telemetry; kept across preemption/recomputation.
+        self.prefill_gpu_chunks = 0
+        self.prefill_gpu_complete = False
         self.num_rejected = 0
         self.num_cached_tokens = 0
         # Tokens whose blocks are registered in the prefix cache: through the
@@ -126,8 +295,8 @@ class Sequence:
         # The same hit asked counterfactually: how far it would have reached
         # with a state checkpoint at every boundary. Equal to the admitted hit
         # when nothing was lost to a missing checkpoint, so the difference is
-        # the reuse a checkpoint would have delivered — what CacheStats reports
-        # as recoverable.
+        # the reuse a checkpoint would have delivered — what the EngineStats
+        # cache section reports as recoverable.
         self.num_wanted_hit_blocks = 0
         # That gap as a prompt position, once it is worth a forward: the one
         # place off the checkpoint grid where this seq's prefill is cut so a
@@ -144,6 +313,34 @@ class Sequence:
         # request counts again, which it should.
         self.checkpoint_demand_counted = False
         self.checkpoint_demand_declined = False
+        # The demand's sibling: this prompt's own end, floored to the hash
+        # grid. 0 = nowhere.
+        #
+        # The demand is reactive — it only exists once a hit has already been
+        # refused for want of a checkpoint, which is one request too late for
+        # the position that serves the *next* turn of a conversation. On
+        # agentic traffic that position is where nearly all the reuse is (see
+        # `BlockManager._record_checkpoint_end`), so it is reserved up front
+        # rather than waited for.
+        #
+        # Written by `BlockManager._record_checkpoint_end` at admission, read
+        # by `checkpoint_cut` and `checkpointers_at` — which must agree, the
+        # same contract `checkpoint_demand_pos` is held to.
+        self.checkpoint_end_pos = 0
+        # The chained content hash of every block of this prompt, not just the
+        # ones that hit. Empty unless the state backend reserves checkpoints
+        # midstep (`StateTransfer.readable_midstep`), which is the only caller
+        # that needs to name a position the forward has not reached yet — see
+        # `BlockManager._extend_hash_chain` for why it cannot simply be the
+        # `block_hashes` the admission scan built.
+        self.block_hashes: list[int] = []
+        # Slots taken for midstep checkpoints of the forward now in flight,
+        # as `(slot, position, hash)` — one slot each, since a checkpoint never
+        # carries speculation scratch. Filled by `BlockManager.plan_midstep`
+        # before the batch is built, drained by `commit_midstep` after it, and
+        # handed back by `cancel_midstep` if that forward never runs. Non-empty
+        # only between those two points.
+        self.midstep_reservations: list[tuple] = []
         # Where this seq last kept a checkpoint. Prefill lands on the grid so
         # this tracks it, but a speculative decode step lands wherever
         # `1 + accepted` puts it, and there the grid is unreachable — see
@@ -157,18 +354,30 @@ class Sequence:
         # garbage sampled tokens from intermediate chunks and to skip the
         # scheduler's Phase 1 scan when no partials exist.
         self.is_partial_prefill = False
+        # `new_block_table` is main's: an array("i") rather than a list,
+        # because every forward marshals these into the int32 buffer.
         self.block_table = new_block_table()
-        # Per-request cache slot index (filled by BlockManager.allocate()).
-        # -1 = unallocated. The slot indexes into the per-req cache tensors
-        # owned by ModelRunner (e.g. mamba_k_cache for GDN).
-        self.per_req_cache_group = -1
-        # Group the NEXT forward reads its incoming state from, when that is not
-        # the group it writes (`per_req_cache_group`). Set by BlockManager on a
-        # state fork — resuming from a checkpoint, or taking one — and
-        # cleared by the scheduler once a batch has carried it, so it describes
-        # exactly one forward. -1 = read and write the same group, the case for
-        # every step in between.
+        # Per-request state slots (filled by BlockManager.allocate()), indexing
+        # the per-req cache tensors owned by ModelRunner (e.g. mamba_k_cache for
+        # GDN). Empty = unallocated.
+        #
+        # `[0]` is the committed state, which every path reads and writes;
+        # `[1:]` is one rollback slot per speculated token, which only the
+        # spec-decode path touches. Held as a list rather than a base index
+        # because the slots are allocated one at a time and need not be
+        # adjacent — see `StateSlotPool`.
+        self.state_slots: list[int] = []
+        # Slot the NEXT forward reads its incoming state from, when that is not
+        # the slot it writes (`state_slot`). Set by BlockManager on a state fork
+        # — resuming from a checkpoint, or taking one — and cleared by the
+        # scheduler once a batch has carried it, so it describes exactly one
+        # forward. -1 = read and write the same slot, the case for every step in
+        # between. Always a single slot: a checkpoint is one slot wide.
         self.state_fork_src = -1
+        # The KV-transfer offload/joint-load protocol state -- six values that
+        # move together through admission and load. Grouped so a joint reset
+        # cannot forget a field; see `OffloadJointRecord`.
+        self.offload_joint = OffloadJointRecord()
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p
@@ -245,6 +454,11 @@ class Sequence:
         # Explicitly requested DP rank, e.g. for cache aware DP routing.
         # Consumed by CoreManager._dispatch_to_dp_ranks as a routing hint.
         self.data_parallel_rank = data_parallel_rank
+        # Optional client session lineage used by CoreManager's cache-aware,
+        # token-load-aware DPA router.  These are routing metadata only; they
+        # are deliberately kept out of the model-facing request payload.
+        self.dp_session_id = dp_session_id
+        self.dp_parent_session_id = dp_parent_session_id
 
     def __len__(self):
         return self._num_tokens
@@ -264,6 +478,31 @@ class Sequence:
         self.last_block_num_tokens = (
             self._num_tokens - (self.num_blocks - 1) * self.block_size
         )
+
+    @property
+    def state_slot(self) -> int:
+        """The committed state slot, or -1 if this seq holds none.
+
+        What every non-speculative path means by "the" slot: the one the
+        forward reads and writes, the one a fork gives away, the one a
+        checkpoint is. The rollback slots are `state_slots[1:]` and only the
+        spec-decode path has any use for them.
+        """
+        return self.state_slots[0] if self.state_slots else -1
+
+    @state_slot.setter
+    def state_slot(self, slot: int) -> None:
+        """Re-point the committed slot, keeping the rollback set.
+
+        A fork moves where the request writes without disturbing its scratch:
+        the speculation slots persist across forwards (step N's accepted slot
+        is step N+1's initial state), so they belong to the request rather than
+        to whichever slot it currently commits into.
+        """
+        if self.state_slots:
+            self.state_slots[0] = slot
+        else:
+            self.state_slots = [slot]
 
     @property
     def is_finished(self):

@@ -23,10 +23,29 @@ class StateTransfer:
     kind: str
     fork_tokens: int = 0
     paged_layout_id: str | None = None
+    #: Whether this backend can extract a state snapshot at a position *inside*
+    #: a forward, rather than only at the forward's last token.
+    #:
+    #: A separate axis from `kind`, and it must stay one. `kind` answers how a
+    #: slot is handed to *another request*; this answers where within one
+    #: forward a snapshot can be taken at all. GDN is `fork(1)` and — because
+    #: its chunk kernel's per-chunk intermediates are copied out —
+    #: midstep-readable; DeepSeek-V4 is `copy()` and is not, because its
+    #: compressor ring is not materialized at interior boundaries the way a
+    #: chunk kernel's `h` is. Deriving either from the other would silently
+    #: turn the prefill chunk cut off for a backend that still needs it.
+    #:
+    #: Default False, so every backend keeps today's behavior until it has
+    #: actually ported the copy-out.
+    readable_midstep: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.fork_tokens, int) or isinstance(self.fork_tokens, bool):
             raise TypeError("fork_tokens must be an integer")
+        if not isinstance(self.readable_midstep, bool):
+            raise TypeError("readable_midstep must be a bool")
+        if self.kind == NONE and self.readable_midstep:
+            raise ValueError("none transfer has no state to read midstep")
         if self.kind == COPY:
             if self.fork_tokens != 0:
                 raise ValueError("copy transfer cannot bind successor tokens")
@@ -50,25 +69,26 @@ class StateTransfer:
         return cls(NONE)
 
     @classmethod
-    def fork(cls, tokens: int) -> "StateTransfer":
-        return cls(FORK, tokens)
+    def fork(cls, tokens: int, readable_midstep: bool = False) -> "StateTransfer":
+        return cls(FORK, tokens, readable_midstep=readable_midstep)
 
     @classmethod
-    def copy(cls, layout_id: str) -> "StateTransfer":
-        return cls(COPY, paged_layout_id=layout_id)
+    def copy(cls, layout_id: str, readable_midstep: bool = False) -> "StateTransfer":
+        return cls(COPY, paged_layout_id=layout_id, readable_midstep=readable_midstep)
 
-    def to_wire(self) -> dict[str, str | int | None]:
+    def to_wire(self) -> dict[str, str | int | bool | None]:
         return {
             "kind": self.kind,
             "fork_tokens": self.fork_tokens,
             "paged_layout_id": self.paged_layout_id,
+            "readable_midstep": self.readable_midstep,
         }
 
     @classmethod
     def from_wire(cls, wire: object) -> "StateTransfer":
         if not isinstance(wire, Mapping):
             raise TypeError("state transfer capability must be a mapping")
-        expected = {"kind", "fork_tokens", "paged_layout_id"}
+        expected = {"kind", "fork_tokens", "paged_layout_id", "readable_midstep"}
         if set(wire) != expected:
             raise ValueError(
                 "invalid state transfer capability fields: "
@@ -78,6 +98,7 @@ class StateTransfer:
             kind=wire["kind"],  # type: ignore[arg-type]
             fork_tokens=wire["fork_tokens"],  # type: ignore[arg-type]
             paged_layout_id=wire["paged_layout_id"],  # type: ignore[arg-type]
+            readable_midstep=wire["readable_midstep"],  # type: ignore[arg-type]
         )
 
     @property

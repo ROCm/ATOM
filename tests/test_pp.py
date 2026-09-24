@@ -17,9 +17,16 @@ from torch import nn
 
 # pp_comm imports aiter.dist.parallel_state and aiter.ops.communication, which
 # need a GPU build; stub them so the wrapper logic can be tested on CPU.
-sys.modules.setdefault("aiter", types.ModuleType("aiter"))
-sys.modules.setdefault("aiter.ops", types.ModuleType("aiter.ops"))
-sys.modules.setdefault("aiter.dist", types.ModuleType("aiter.dist"))
+# The top-level name is taken back down below.
+_stubbed: list[str] = []
+for _name, _mod in (
+    ("aiter", types.ModuleType("aiter")),
+    ("aiter.ops", types.ModuleType("aiter.ops")),
+    ("aiter.dist", types.ModuleType("aiter.dist")),
+):
+    if _name not in sys.modules:
+        sys.modules[_name] = _mod
+        _stubbed.append(_name)
 
 _ps_stub = sys.modules.get("aiter.dist.parallel_state") or types.ModuleType(
     "aiter.dist.parallel_state"
@@ -58,6 +65,16 @@ from atom.models.utils import (
     make_layers,
 )
 from tests.conftest import MockConfig
+
+# Drop the top-level name now that the imports above are bound. The submodules
+# stay -- the connectors reach for them lazily, at call time -- but `aiter`
+# itself has no reader here, and leaving it is what made
+# `pytest.importorskip("aiter")` succeed in every module collected after this
+# one: the skip did not fire, and the real `from aiter import ...` inside the
+# module under test then raised ImportError during collection, which takes the
+# whole run down instead of skipping one file.
+if "aiter" in _stubbed:
+    del sys.modules["aiter"]
 
 # ---------------------------------------------------------------------------
 # Layer partition

@@ -17,9 +17,9 @@ Both are the runner's business, not the model's. A model opts in by decorating
 the method that IS its core -- no separate wrapper, the decorated function is the
 core itself::
 
-    @piecewise_core(key=decode_bucket_key, copy_per_step=("positions",))
-    def _attn_core(self, *, x, q, kv_pre, ..., positions):
-        ...the paged attention body...
+    @piecewise_core(key=decode_bucket_key)
+    def _attn_compress(self, *, x):
+        ...the body that needs its own graph...
 
 and writes nothing else -- no staging buffers, no per-input policy, no dummy
 forward to measure shapes. The inputs and their order come off the function's
@@ -29,8 +29,9 @@ eager path just passes ``piecewise=False`` and the body runs directly.
 What this deliberately does NOT do is let the producer write the graph's input
 buffer directly. That saves the clone's copy, but only by making every producer
 in the chain aware of the capture -- which is what the previous design did, and
-is what made this feature reach into the model layer. Two small copies per layer
-(`q` and `kv_pre`; the other inputs were already copied) buy that back.
+is what made this feature reach into the model layer. ``copy_per_step`` buys
+that back for whichever inputs cannot be captured on -- name one and the runner
+clones and refreshes it. V4 currently names none.
 """
 
 import functools
@@ -49,19 +50,31 @@ def decode_bucket_key(forward_context) -> tuple:
     """``(bucket_bs, q_eff)`` for a core captured per decode bucket.
 
     Nothing here is model-specific -- both come off the forward context -- so
-    every decode core keys the same way. ``bucket_bs`` is the ceil-to-captured
-    graph_bs (``forward_mode.effective_bs`` at replay; a capture Context has no
-    forward_mode, so batch_size == graph_bs == bucket).
+    every decode core keys the same way. ``bucket_bs`` is the step's
+    ``running_bs`` (a capture Context has no forward_mode, so batch_size is
+    already the bucket).
     """
     attn_metadata = getattr(forward_context, "attn_metadata", None)
     context = getattr(forward_context, "context", None)
     q_eff = int(getattr(attn_metadata, "max_seqlen_q", 1) or 1)
     forward_mode = getattr(context, "forward_mode", None)
-    if forward_mode is not None and getattr(forward_mode, "effective_bs", 0):
-        bucket_bs = int(forward_mode.effective_bs)
+    if forward_mode is not None and getattr(forward_mode, "running_bs", 0):
+        bucket_bs = int(forward_mode.running_bs)
     else:
-        bucket_bs = int(getattr(context, "batch_size", 0) or 0)
+        bucket_bs = int(getattr(context, "scheduled_bs", 0) or 0)
     return (bucket_bs, q_eff)
+
+
+def _is_decode(forward_context) -> bool:
+    """Whether this step is a decode.
+
+    Checked by NAME, like ``_annotation_names_tensor`` above and for the same
+    reason: this module stays free of a torch import, and ``AttnState`` lives
+    behind one. Any ``PREFILL_*`` reads as not-decode, which is the only
+    distinction that matters here.
+    """
+    state = getattr(getattr(forward_context, "attn_metadata", None), "state", None)
+    return getattr(state, "name", "") == "DECODE"
 
 
 def _annotation_names_tensor(annotation: Any) -> bool:
@@ -136,15 +149,18 @@ def _resolve_zero_copy(names: tuple[str, ...], copied: frozenset) -> frozenset:
 def piecewise_core(
     *,
     key: Callable[[Any], tuple] = lambda _fc: (),
-    max_tokens: int = 512,
+    max_tokens: int | None = None,
     copy_per_step: tuple[str, ...] = (),
 ):
     """Give the decorated function its own cudagraph, keyed per layer and shape.
 
     ``key`` adds whatever else changes the graph's shape beyond the layer and the
     token count -- for a decode core that is the bucket, `decode_bucket_key`.
-    ``max_tokens`` bounds the rows a captured graph covers; a longer step (a
-    prefill) runs eager.
+    Only DECODE steps are captured; a prefill runs eager, delivering into the
+    persistent output slot. ``max_tokens`` is an OPTIONAL extra cap on the rows
+    a captured graph covers -- a memory lever, off by default. It used to be 512
+    and to be the only gate, which silently excluded every decode bucket above
+    ~85 sequences at DSpark q=6.
 
     Every TENSOR input is captured on directly -- the graph reads the producer's
     own tensor and nothing copies it -- EXCEPT the names in ``copy_per_step``,
@@ -174,6 +190,16 @@ def piecewise_core(
     caller has no branch of its own to keep.
     """
 
+    if isinstance(copy_per_step, str):
+        # `("positions")` is a string, not a 1-tuple, and `frozenset` of it is a
+        # set of CHARACTERS -- which subtracts nothing from the input names, so
+        # the entry silently means "copy nothing" while reading as its opposite.
+        # That shipped once. A one-name tuple needs its trailing comma.
+        raise TypeError(
+            f"copy_per_step must be a tuple of names, got the string "
+            f"{copy_per_step!r}. A single name needs a trailing comma: "
+            f'("{copy_per_step}",). Without it this silently copies nothing.'
+        )
     copied = frozenset(copy_per_step)
 
     def decorate(fn: Callable) -> Callable:
@@ -197,13 +223,32 @@ def piecewise_core(
                 return fn(layer, **inputs)
 
             layer_name = getattr(layer, "layer_name", id(layer))
-            num_tokens = int(inputs[input_names[0]].shape[0])
+            # Row count off the first input the caller actually passed. A core
+            # whose signature covers several call shapes leaves the inputs of the
+            # shapes it is not in as None -- declaration order still decides
+            # which one anchors, but a None one is skipped rather than crashing.
+            # Every tensor input is [num_tokens, ...], so any of them will do.
+            anchor = next(
+                (inputs[n] for n in input_names if inputs.get(n) is not None), None
+            )
+            if anchor is None:
+                raise ValueError(
+                    f"{fn.__name__} was called with every tensor input None; "
+                    "the runner has no way to size the graph. Inputs are "
+                    f"{list(input_names)}."
+                )
+            num_tokens = int(anchor.shape[0])
             # One output slot per (layer, flat row count): the address the dense
             # piece downstream was captured reading.
             out_key = (layer_name, num_tokens)
             # Config args are not graph inputs: bind them into the compute so they
             # are baked at capture, and hand the runner only the tensor inputs.
-            tensor_inputs = {n: inputs[n] for n in input_names if n in inputs}
+            # EVERY declared input, None included. A core whose signature spans
+            # several call shapes leaves the inputs of the shapes it is not in as
+            # None, and those parameters still have to be bound or the call is a
+            # missing-argument TypeError. The runner already leaves a None alone
+            # (`input_buffers` / `replay` both check), so it takes the same dict.
+            tensor_inputs = {n: inputs.get(n) for n in input_names}
             core = functools.partial(
                 fn, layer, **{n: inputs[n] for n in passthrough_names if n in inputs}
             )
@@ -212,11 +257,22 @@ def piecewise_core(
             # `capture` off (plain PIECEWISE) short-circuits to the deliver tail
             # below: the core runs eager and only its result is stabilised, with
             # no graph of its own ever recorded.
+            # DECODE, not a row count. Prefill is what must not be captured --
+            # its shapes are one-off, and the compressor's prefill plan is
+            # sliced to an actual count rather than a graph-fixed capacity -- and
+            # asking that question directly beats bounding tokens and hoping the
+            # two coincide. They did not: at DSpark q=6 a 512-row bound also cut
+            # every decode above bs~85, so AF was silently OFF for the three
+            # largest buckets. `max_tokens` survives as an optional cap for the
+            # reason the bound was introduced (capture memory), now off by
+            # default -- the pool measured 8.37GB before the granularity split
+            # and 1.62GB after.
             eligible = (
                 capture
                 and not getattr(context, "is_dummy_run", False)
                 and getattr(forward_context, "attn_metadata", None) is not None
-                and num_tokens <= max_tokens
+                and _is_decode(forward_context)
+                and (max_tokens is None or num_tokens <= max_tokens)
             )
             # num_tokens is a KEY DIM, not an incidental one: the graph is
             # captured at exactly this flat row count.
@@ -237,7 +293,10 @@ def piecewise_core(
                     read_from, refresh = runner.input_buffers(
                         tensor_inputs, input_names, zero_copy
                     )
-                    out_slot = outputs.slot(out_key, core(**read_from))
+                    # A void core -- one whose whole effect is on paged state --
+                    # has no result to stabilise and no slot to size.
+                    warm = core(**read_from)
+                    out_slot = None if warm is None else outputs.slot(out_key, warm)
                     runner.capture(graph_key, read_from, refresh, core, out_slot)
                 elif runner.has_graph(graph_key) and not capturing:
                     return runner.replay(graph_key, tensor_inputs)
@@ -246,7 +305,8 @@ def piecewise_core(
             # or a step whose key was never captured. Also the tail of the
             # capture branch above -- it fed on clones, so its result is not this
             # forward's answer.
-            return outputs.deliver(out_key, core(**tensor_inputs))
+            result = core(**tensor_inputs)
+            return None if result is None else outputs.deliver(out_key, result)
 
         wrapper.input_names = input_names
         wrapper.passthrough_names = passthrough_names

@@ -36,7 +36,7 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     "Qwen3_5MoeForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5MoeForConditionalGeneration",
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration",
     "KimiK3ForConditionalGeneration": (
-        "atom.plugin.vllm.models.kimi_k3:KimiK3ForCausalLMVllm"
+        "atom.plugin.vllm.models.kimi_k3:KimiK3ForConditionalGenerationVllm"
     ),
     # vLLM registers this arch too, but only to its NVIDIA implementation.
     "K3DSparkModel": "atom.plugin.vllm.models.kimi_k3_dspark:KimiK3DSparkVllm",
@@ -154,6 +154,11 @@ def register_platform() -> str | None:
 
     apply_vllm_rocm_dcp_full_graph_patch()
 
+    # aiter's custom all-reduce needs vLLM's rendezvous to stay on a TCPStore.
+    from atom.plugin.vllm.dist_store_patch import apply_vllm_tcp_store_patch
+
+    apply_vllm_tcp_store_patch()
+
     # Do not call _set_plugin_mode() here. SGLang (and other stacks) discover
     # vllm.platform_plugins and would set atom's backbone to "vllm" before
     # importing SGLang plugin modules — then atom.models.qwen3_5's ``if is_vllm():``
@@ -171,8 +176,39 @@ def register_platform() -> str | None:
 
     apply_vllm_v4_block_reuse_patch()
 
+    _register_kv_connectors()
+
     # return the ATOM platform to vllm
     return "atom.plugin.vllm.platform.ATOMPlatform"
+
+
+def _register_kv_connectors() -> None:
+    """Expose ATOM's byte-level LMCache offload to vLLM's connector factory.
+
+    Convenience only. vLLM validates ``kv_transfer_config`` while building
+    VllmConfig, which happens BEFORE platform plugins are invoked, so a run
+    that names the connector by bare name fails config validation before this
+    ever runs. The supported way to select it is vLLM's out-of-tree entry
+    point, which takes priority over the registry and needs no registration:
+
+        --kv-transfer-config '{"kv_connector": "AtomLMCacheOffloadConnector",
+          "kv_connector_module_path": "atom.plugin.vllm.kv_transfer.connector",
+          "kv_role": "kv_both"}'
+
+    Registered by module path so importing the plugin does not drag in the
+    offload stack (and LMCache) for every run.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+    name = "AtomLMCacheOffloadConnector"
+    if name in getattr(KVConnectorFactory, "_registry", {}):
+        return
+    KVConnectorFactory.register_connector(
+        name,
+        "atom.plugin.vllm.kv_transfer.connector",
+        name,
+    )
+    logger.info("Registered ATOM KV connector: %s", name)
 
 
 def _patch_vllm_attention_process_weights_after_loading(attention) -> None:
@@ -294,6 +330,16 @@ def register_model() -> None:
         vllm_model_registry._try_load_model_cls.cache_clear()
         vllm_model_registry._try_inspect_model_cls.cache_clear()
 
+    # vLLM rejects Kimi-K3 DSpark under DCP while validating the speculative
+    # config. That validation runs later than this hook but earlier than any
+    # model is built, and unlike register_platform -- which vLLM invokes from
+    # inside its own import -- here vllm.engine is safe to import.
+    from atom.plugin.vllm.dspark_dcp_patch import (
+        apply_vllm_dspark_dcp_config_patch,
+    )
+
+    apply_vllm_dspark_dcp_config_patch()
+
     # patch attention process weights after loading
     # to avoid the specific handle in ATOM loader
     try:
@@ -328,6 +374,12 @@ def register_model() -> None:
     from atom.plugin.vllm.mori_patch import apply_vllm_mori_patch
 
     apply_vllm_mori_patch()
+
+    from atom.plugin.vllm.qwen35_attention_patch import (
+        apply_qwen35_vllm_attention_patch,
+    )
+
+    apply_qwen35_vllm_attention_patch()
     # Expose batch-ordered req_ids to ATOM metadata builders so the DeepSeek-V4
     # proxy can key state-slot allocation on the request id (host-resident)
     # instead of a D2H copy of the first block id.

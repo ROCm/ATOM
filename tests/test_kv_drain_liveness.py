@@ -42,6 +42,13 @@ class FakeScheduler:
         self.deferred_free_blocks = dict(deferred or {})
         self.kv_connector = connector
         self.outputs = []
+        self.state_publishes = 0
+
+    def _publish_state_loads(self):
+        self.state_publishes += 1
+
+    def _publish_state_stores(self):
+        self.state_publishes += 1
 
     def _update_from_kv_xfer_finished(self, out):
         self.outputs.append(out)
@@ -100,7 +107,6 @@ def _head(pp_size, *, deferred=None, connector=None, outputs=(), messages=()):
     proc.kv_transfer_enabled = True
     proc.pp_size = pp_size
     proc._pp_kv_aggregator = None
-    proc._held_sending = {}
     proc._next_idle_kv_drain = 0.0
     proc.scheduler = FakeScheduler(deferred, connector)
     proc.runner_mgr = FakeRunnerMgr(outputs)
@@ -139,9 +145,8 @@ def test_connector_without_the_hook_is_not_pending():
 # -- the PP head's extra holding state -------------------------------------
 
 
-def test_held_send_keeps_the_head_alive():
-    proc = _head(2)
-    proc._held_sending = {"a": "a"}
+def test_deferred_producer_keeps_the_head_alive():
+    proc = _head(2, deferred={"a": object()})
     assert proc.has_pending_kv_work() is True
 
 
@@ -163,20 +168,19 @@ def test_aggregator_pending_clears_on_quorum():
 # -- the drain itself ------------------------------------------------------
 
 
-def test_idle_drain_releases_the_last_held_send():
+def test_idle_drain_reports_the_last_stage_save():
     # The regression guard: scheduler queues are empty, so only
     # has_pending_kv_work() can keep the head polling long enough for stage 1
     # to report and free the request's blocks.
     proc = _head(2, messages=[[(1, KVConnectorOutput(finished_saving={"a"}))]])
     proc._pp_kv_aggregator = PPKVAggregator(2)
     proc._pp_kv_aggregator.ingest(0, KVConnectorOutput(finished_saving={"a"}))
-    proc._held_sending = {"a": "a"}
 
     assert proc.has_pending_kv_work() is True
     proc._advance_idle_kv_transfer()
 
-    assert proc.scheduler.released_sending() == {"a"}
-    assert proc._held_sending == {}
+    assert proc.scheduler.outputs[-1].finished_saving == {"a"}
+    assert proc.scheduler.released_sending() == set()
     assert proc.has_pending_kv_work() is False
 
 
@@ -249,3 +253,38 @@ def test_exit_drain_is_a_noop_without_kv_transfer():
     proc = _engine(enabled=False, deferred={7: object()})
     proc._drain_kv_work_at_exit()
     assert proc.runner_mgr.polls == 0
+
+
+# -- new state work is dispatched at idle, but NOT while draining at exit ---
+
+
+def test_idle_drain_publishes_new_state_work():
+    # Normal idle: publish new state loads/stores so a lull between batches
+    # still makes forward progress on the offload tiers.
+    proc = _engine(connector=FakeConnector(pending=True))
+    proc._advance_idle_kv_transfer()
+    assert proc.scheduler.state_publishes == 2  # both loads and stores
+
+
+def test_exit_drain_does_not_publish_new_state_work():
+    # Shutdown drain must let in-flight transfers finish and report, but must
+    # not publish new state work: a fresh store keeps has_pending_kv_work True,
+    # so the loop that waits on it would manufacture its own exit condition and
+    # never converge. It still builds/processes the meta to flush what is in
+    # flight.
+    connector = FakeConnector(pending=True)
+
+    original = connector.has_pending_work
+
+    def clear_after_first_poll():
+        pending = original()
+        connector.pending = False
+        return pending
+
+    connector.has_pending_work = clear_after_first_poll
+    proc = _engine(connector=connector)
+    proc._drain_kv_work_at_exit()
+
+    assert proc.scheduler.state_publishes == 0
+    assert connector.builds == 1  # in-flight work still flushed
+    assert proc.runner_mgr.dispatched == ["process_kvconnector_output"]

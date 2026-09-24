@@ -31,16 +31,43 @@ from __future__ import annotations
 
 import logging
 import operator
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 
 logger = logging.getLogger("atom")
 
 
+@dataclass(frozen=True)
+class _PreparedDenseBlockIdGroups:
+    """Validated dense groups plus their single-upload Triton metadata."""
+
+    _codec: DenseKVByteCodec
+    _stream: Any
+    _groups: tuple[tuple[tuple[int, ...], ...], ...]
+    _triton_metadata: Any
+
+    @property
+    def group_count(self) -> int:
+        return len(self._groups)
+
+    @property
+    def upload_count(self) -> int:
+        return int(getattr(self._triton_metadata, "upload_count", 0))
+
+
 class DenseKVByteCodec:
     """Per-block byte mover between paged GPU KV tensors and flat buffers."""
 
-    def __init__(self, kv_caches: dict, num_blocks: int | None = None) -> None:
+    def __init__(
+        self,
+        kv_caches: dict,
+        num_blocks: int | None = None,
+        *,
+        permit_per_request_state: bool = False,
+    ) -> None:
         """``kv_caches``: ordered ``{layer_name: KVCacheTensor}`` from
         ``register_kv_caches``. We flatten every movable per-layer tensor (K, V,
         and fp8 scales when present) into one ordered segment list.
@@ -61,9 +88,41 @@ class DenseKVByteCodec:
         we take ``num_blocks`` explicitly and derive each segment's per-block
         byte stride as ``segment_bytes / num_blocks``. ``num_blocks`` falls back
         to ``segment.shape[0]`` (the block-major assumption) when not supplied,
-        preserving the original non-MLA behaviour."""
+        preserving the original non-MLA behaviour.
+
+        ``permit_per_request_state`` gates whether a per-request recurrent-state
+        tensor in ``kv_caches`` is skipped or rejected. A hybrid connector that
+        moves state through its own tier (kimi_k3) sets it True to skip. The
+        plain dense path leaves it False: a GDN model (Qwen3-Next, Qwen3.5)
+        registered on ``lmcache_offload`` puts its slot-indexed mamba
+        caches in this dict, and the dense path has no rule keeping its KV
+        prefix aligned with that linear state -- restoring KV while the state is
+        stale is silent wrong output. Skipping the tensor here used to hide that
+        behind a successful registration; failing closed keeps those models off
+        the dense path, which is where the pre-PR divisibility ``ValueError``
+        left them."""
         self._segments: list[torch.Tensor] = []
         for kvt in kv_caches.values():
+            # A hybrid registers its per-request recurrent state in the same
+            # dict, because the linear-attention forward reads it from
+            # `kv_cache_data`. It is indexed by request slot, not by block, so
+            # including it either fails the divisibility check below or -- if
+            # the slot count happens to divide `num_blocks` -- inflates
+            # `bytes_per_block` past what `block_regions` describes. The tier
+            # reaches those bytes through `state_entry_views`.
+            if getattr(kvt, "per_request_state", False):
+                if not permit_per_request_state:
+                    raise ValueError(
+                        "DenseKVByteCodec: per-request recurrent state was "
+                        "registered on the plain dense offload path. This is a "
+                        "GDN/linear-attention model (e.g. Qwen3-Next, "
+                        "Qwen3.5); the dense path would restore its "
+                        "KV prefix while the recurrent state stayed stale -- "
+                        "silent wrong output. Use a connector that owns a state "
+                        "tier (kimi_k3), which passes "
+                        "permit_per_request_state=True."
+                    )
+                continue
             for t in (
                 getattr(kvt, "k_cache", None),
                 getattr(kvt, "v_cache", None),
@@ -71,6 +130,14 @@ class DenseKVByteCodec:
                 getattr(kvt, "v_scale", None),
                 # DSA indexer cache (GLM-5.2 / DeepSeek-V3.2 sparse layers).
                 getattr(kvt, "index_cache", None),
+                # Its e8m0 exponents under `--index_cache_dtype fp4`, None
+                # otherwise. Appended after the keys rather than beside them
+                # because this order IS the stored byte layout: `bytes_per_block`
+                # sums these in sequence and a chunk is read back by offset.
+                # Reordering reinterprets every chunk already in a tier, and
+                # `build_page_namespace` has no segment order in it to notice --
+                # so a reorder has to bump `PAGE_LAYOUT_VERSION`.
+                getattr(kvt, "index_scale", None),
             ):
                 if t is not None and isinstance(t, torch.Tensor) and t.numel() > 0:
                     self._segments.append(t)
@@ -157,7 +224,7 @@ class DenseKVByteCodec:
 
     def _normalize_block_id_groups(
         self,
-        block_id_groups: list[list[int]],
+        block_id_groups: Sequence[Sequence[int]],
         *,
         reject_repeated: bool,
     ) -> tuple[list[list[int]], list[int], list[int]]:
@@ -184,6 +251,27 @@ class DenseKVByteCodec:
                 f"for {nblocks} blocks; need {required} bytes, "
                 f"got {int(device_buf.numel())}"
             )
+
+    def _validate_prepared_owner(
+        self,
+        owner: _PreparedDenseBlockIdGroups,
+        group_index: int,
+        stream: torch.cuda.Stream | None,
+    ) -> tuple[int, tuple[tuple[int, ...], ...]]:
+        if (
+            not isinstance(owner, _PreparedDenseBlockIdGroups)
+            or owner._codec is not self
+        ):
+            raise ValueError("prepared block IDs belong to a different dense codec")
+        if stream is not owner._stream:
+            raise ValueError("prepared block IDs must use their preparation stream")
+        try:
+            index = operator.index(group_index)
+        except TypeError as exc:
+            raise ValueError("prepared group_index must be an integer") from exc
+        if isinstance(group_index, bool) or index < 0 or index >= owner.group_count:
+            raise ValueError("prepared group_index is out of range")
+        return index, owner._groups[index]
 
     # -- public API -------------------------------------------------------
     def gpu_to_chunk_major_device_buffer(
@@ -247,6 +335,109 @@ class DenseKVByteCodec:
                     self._seg_block_bytes,
                     chunk_block_counts,
                     flat_block_ids,
+                )
+
+    def prepare_block_id_groups(
+        self,
+        group_block_ids: Sequence[Sequence[Sequence[int]]],
+        *,
+        device: torch.device | str,
+        stream: torch.cuda.Stream,
+    ) -> _PreparedDenseBlockIdGroups:
+        """Validate every dense staging group and upload its metadata once."""
+
+        normalized_groups = []
+        triton_groups = []
+        for block_id_groups in group_block_ids:
+            groups, flat_block_ids, chunk_block_counts = (
+                self._normalize_block_id_groups(
+                    block_id_groups,
+                    reject_repeated=True,
+                )
+            )
+            normalized_groups.append(tuple(tuple(block_ids) for block_ids in groups))
+            triton_groups.append((tuple(chunk_block_counts), tuple(flat_block_ids)))
+
+        target = torch.device(device)
+        if target.type == "cuda" and target.index is None:
+            target = self.device
+        if target != self.device:
+            raise ValueError("prepared block IDs require the dense codec device")
+        if self._fused_kv_staging is None:
+            raise RuntimeError(
+                "DenseKVByteCodec requires Triton fused chunk-major staging"
+            )
+        if self.device.type == "cuda":
+            if stream is None or torch.device(stream.device) != target:
+                raise ValueError(
+                    "prepared block IDs require an explicit matching stream"
+                )
+            stream_ctx = torch.cuda.stream(stream)
+        else:
+            stream_ctx = _nullctx()
+        prepare = getattr(self._fused_kv_staging, "prepare_chunk_major_groups", None)
+        if prepare is None:
+            raise RuntimeError("dense prepared-ID staging is unavailable")
+        if not callable(prepare):
+            raise TypeError("dense prepared-ID staging entry point is not callable")
+        with self._device_ctx(), stream_ctx:
+            triton_metadata = prepare(
+                self._segments,
+                self._seg_block_bytes,
+                triton_groups,
+                target,
+            )
+        return _PreparedDenseBlockIdGroups(
+            self,
+            stream,
+            tuple(normalized_groups),
+            triton_metadata,
+        )
+
+    def gpu_to_chunk_major_device_buffer_prepared(
+        self,
+        device_buf: torch.Tensor,
+        owner: _PreparedDenseBlockIdGroups,
+        group_index: int,
+        *,
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        index, block_id_groups = self._validate_prepared_owner(
+            owner, group_index, stream
+        )
+        self._validate_device_buf(
+            device_buf, sum(len(block_ids) for block_ids in block_id_groups)
+        )
+        with self._device_ctx():
+            stream_ctx = torch.cuda.stream(stream) if stream is not None else _nullctx()
+            with stream_ctx:
+                self._fused_kv_staging.fused_pack_chunk_major_prepared(
+                    owner._triton_metadata,
+                    index,
+                    device_buf,
+                )
+
+    def chunk_major_device_buffer_to_gpu_prepared(
+        self,
+        device_buf: torch.Tensor,
+        owner: _PreparedDenseBlockIdGroups,
+        group_index: int,
+        *,
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        index, block_id_groups = self._validate_prepared_owner(
+            owner, group_index, stream
+        )
+        self._validate_device_buf(
+            device_buf, sum(len(block_ids) for block_ids in block_id_groups)
+        )
+        with self._device_ctx():
+            stream_ctx = torch.cuda.stream(stream) if stream is not None else _nullctx()
+            with stream_ctx:
+                self._fused_kv_staging.fused_unpack_chunk_major_prepared(
+                    owner._triton_metadata,
+                    index,
+                    device_buf,
                 )
 
 

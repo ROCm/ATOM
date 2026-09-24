@@ -148,18 +148,36 @@ def _load_module(filename: str, module_name: str):
     return mod
 
 
-# Load quant_spec first, then inject it so config.py can import it.
+# Load quant_spec first, then inject it so config.py can import it -- and put
+# the real one back, which the previous version of this never did.
+#
+# Leaving this copy installed replaced `atom.quant_spec` for the whole session.
+# Modules imported before this file kept the original `LayerQuantConfig` and
+# `QuantType`; modules imported after got these. Two enums that print the same
+# and compare unequal, so `quant_type != QuantType.No` was true for a config
+# that said `No` -- `test_qwen4_exp_quantization` then built a quantized layer
+# and died on a `weight_scale` that branch does not create. `tests/conftest.py`
+# now fails whichever test leaves such a duplicate behind.
+_real_quant_spec = sys.modules.get("atom.quant_spec")
 _qs = _load_module("quant_spec.py", "atom.quant_spec")
-sys.modules["atom.quant_spec"] = _qs
-
-_m = _load_module("config.py", "_atom_config_test")
+try:
+    _m = _load_module("config.py", "_atom_config_test")
+finally:
+    if _real_quant_spec is None:
+        sys.modules.pop("atom.quant_spec", None)
+    else:
+        sys.modules["atom.quant_spec"] = _real_quant_spec
 
 QuantizationConfig = _m.QuantizationConfig
 LayerQuantConfig = _qs.LayerQuantConfig
+NVFP4_DTYPE = _qs.NVFP4_DTYPE
 QuarkParser = _qs.QuarkParser
 QuarkOnlineParser = _qs.QuarkOnlineParser
+ModelOptParser = _qs.ModelOptParser
 GenericParser = _qs.GenericParser
 get_quant_parser = _qs.get_quant_parser
+will_online_requant = _qs.will_online_requant
+validate_nvfp4_online_target = _qs.validate_nvfp4_online_target
 
 
 # =========================================================================
@@ -186,6 +204,13 @@ class TestLayerQuantConfig:
         spec = LayerQuantConfig(quant_type=QuantType.per_Token, quant_dtype=FP8)
         assert spec.is_quantized is True
 
+    def test_nvfp4_dtype_is_explicit(self):
+        spec = LayerQuantConfig(
+            quant_type=QuantType.per_1x32,
+            quant_dtype=NVFP4_DTYPE,
+        )
+        assert spec.quant_dtype == "nvfp4"
+
     def test_frozen(self):
         spec = LayerQuantConfig()
         with pytest.raises(AttributeError):
@@ -205,6 +230,10 @@ class TestParserRegistry:
     def test_online_quant_registered(self):
         parser = get_quant_parser("online_quant")
         assert isinstance(parser, QuarkOnlineParser)
+
+    def test_modelopt_registered(self):
+        parser = get_quant_parser("modelopt")
+        assert isinstance(parser, ModelOptParser)
 
     def test_generic_fallback(self):
         parser = get_quant_parser("compressed-tensors")
@@ -230,6 +259,210 @@ class TestGenericParser:
         assert result.global_spec.quant_dtype == FP8
         assert result.global_spec.is_dynamic is True
         assert result.global_spec.quant_method == "fbgemm_fp8"
+
+
+# =========================================================================
+# Tests — ModelOptParser
+# =========================================================================
+
+
+class TestModelOptParser:
+    @staticmethod
+    def _mixed_config():
+        return {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "exclude_modules": ["language_model.model.embed_tokens", "lm_head"],
+            "quantized_layers": {
+                "language_model.model.layers.0.mlp.gate_proj": {"quant_algo": "MXFP8"},
+                "language_model.model.layers.0.mlp.up_proj": {"quant_algo": "MXFP8"},
+                "language_model.model.layers.3.block_sparse_moe.shared_experts.gate_proj": {
+                    "quant_algo": "MXFP8"
+                },
+                "language_model.model.layers.3.block_sparse_moe.shared_experts.up_proj": {
+                    "quant_algo": "MXFP8"
+                },
+                "language_model.model.layers.3.block_sparse_moe.experts.0.w1": {
+                    "quant_algo": "NVFP4"
+                },
+                "language_model.model.layers.3.block_sparse_moe.experts.1.w3": {
+                    "quant_algo": "NVFP4"
+                },
+            },
+        }
+
+    def test_mixed_mxfp8_and_nvfp4(self):
+        result = ModelOptParser().parse(self._mixed_config())
+        patterns = dict(result.layer_pattern_specs)
+
+        assert result.global_spec.quant_type == QuantType.No
+        dense = patterns["language_model.model.layers.0.mlp.gate_proj"]
+        assert dense.quant_type == QuantType.per_1x32
+        assert dense.quant_dtype == FP8
+        experts = patterns["language_model.model.layers.3.block_sparse_moe.experts"]
+        assert experts.quant_type == QuantType.per_1x32
+        assert experts.quant_dtype == NVFP4_DTYPE
+        assert (
+            len(
+                [
+                    name
+                    for name, _ in result.layer_pattern_specs
+                    if ".block_sparse_moe.experts" in name
+                ]
+            )
+            == 1
+        )
+        assert result.exclude_layers == [
+            "language_model.model.embed_tokens",
+            "lm_head",
+        ]
+
+    def test_mixed_config_remaps_wrapper_and_packed_names(self):
+        hf = FakeHFConfig(
+            torch_dtype=BF16,
+            quantization_config=self._mixed_config(),
+        )
+        qcfg = QuantizationConfig(
+            hf,
+            online_quant_config={"global_quant_config": "mxfp4"},
+        )
+        qcfg.remap_layer_name(
+            FakeHFConfig(model_type="minimax_m3_vl"),
+            packed_modules_mapping={
+                ".gate_proj": (".gate_up_proj", 0),
+                ".up_proj": (".gate_up_proj", 1),
+            },
+            quant_exclude_name_mapping={
+                "language_model.model.": "model.",
+            },
+        )
+
+        dense = qcfg.get_layer_quant_config("model.layers.0.mlp.gate_up_proj")
+        experts = qcfg.get_layer_quant_config("model.layers.3.block_sparse_moe.experts")
+        wrapped_experts = qcfg.get_layer_quant_config(
+            "language_model.model.layers.3.block_sparse_moe.experts"
+        )
+        wrapped_shared = qcfg.get_layer_quant_config(
+            "language_model.model.layers.3.block_sparse_moe.shared_experts"
+        )
+        assert dense.quant_dtype == FP8
+        assert experts.quant_dtype == NVFP4_DTYPE
+        assert wrapped_experts == experts
+        assert wrapped_shared.quant_dtype == FP8
+        assert qcfg.online_quant is True
+        assert (
+            qcfg.get_layer_quant_config(
+                "model.layers.3.block_sparse_moe.experts",
+                use_online_quant=True,
+            ).quant_dtype
+            == FP4X2
+        )
+        assert "model.embed_tokens" in qcfg.exclude_layers
+
+    @staticmethod
+    def _parse_and_remap_like_m3(config):
+        qcfg = QuantizationConfig(
+            FakeHFConfig(torch_dtype=BF16, quantization_config=config),
+            online_quant_config={"global_quant_config": "mxfp4"},
+        )
+        qcfg.remap_layer_name(
+            FakeHFConfig(model_type="minimax_m3_vl"),
+            packed_modules_mapping={
+                ".gate_proj": (".gate_up_proj", 0),
+                ".up_proj": (".gate_up_proj", 1),
+            },
+            quant_exclude_name_mapping={"language_model.model.": "model."},
+        )
+        return qcfg
+
+    def test_excluding_one_expert_is_rejected(self):
+        """FusedMoE resolves its experts container with check_children=True, so
+        one excluded expert would build every expert in the layer as bf16."""
+        config = self._mixed_config()
+        config["exclude_modules"].append(
+            "language_model.model.layers.3.block_sparse_moe.experts.5.w1"
+        )
+        with pytest.raises(ValueError, match="excluded by another"):
+            self._parse_and_remap_like_m3(config)
+
+    def test_excluding_the_router_keeps_experts_quantized(self):
+        config = self._mixed_config()
+        config["exclude_modules"].append(
+            "language_model.model.layers.3.block_sparse_moe.gate"
+        )
+        qcfg = self._parse_and_remap_like_m3(config)
+        experts = qcfg.get_layer_quant_config(
+            "model.layers.3.block_sparse_moe.experts", check_children=True
+        )
+        assert experts.quant_dtype == NVFP4_DTYPE
+
+    def test_nvfp4_without_online_target_is_rejected_at_setup(self):
+        """NVFP4 without an online config fails while the config is parsed."""
+        hf = FakeHFConfig(torch_dtype=BF16, quantization_config=self._mixed_config())
+        with pytest.raises(ValueError, match="no online quantization config"):
+            QuantizationConfig(hf)
+
+    def test_non_nvfp4_checkpoint_needs_no_online_target(self):
+        """Guards the check above from rejecting every quantized checkpoint."""
+        config = self._mixed_config()
+        config["quantized_layers"] = {
+            "language_model.model.layers.0.mlp.gate_proj": {"quant_algo": "MXFP8"}
+        }
+        qcfg = QuantizationConfig(
+            FakeHFConfig(torch_dtype=BF16, quantization_config=config)
+        )
+        assert qcfg.online_quant is False
+
+    def test_nvfp4_layer_without_mxfp4_online_target_is_rejected(self):
+        """Resolves the online target the same way the layer does when built."""
+        experts = "language_model.model.layers.3.block_sparse_moe.experts"
+        hf = FakeHFConfig(torch_dtype=BF16, quantization_config=self._mixed_config())
+        excluded = QuantizationConfig(
+            hf,
+            online_quant_config={
+                "global_quant_config": "mxfp4",
+                "exclude_layer": [experts],
+            },
+        )
+        with pytest.raises(ValueError, match="excluded from online quantization"):
+            validate_nvfp4_online_target(excluded, experts)
+
+        converted = QuantizationConfig(
+            hf, online_quant_config={"global_quant_config": "mxfp4"}
+        )
+        validate_nvfp4_online_target(converted, experts)
+
+    # `validate_nvfp4_global_scales` inspects tensor values, so it is covered in
+    # tests/test_nvfp4_loading.py instead -- the `torch` this copy of
+    # quant_spec closed over is a MagicMock, and every check would pass.
+
+    def test_nvfp4_rejects_non_16_group_size(self):
+        config = self._mixed_config()
+        config["quantized_layers"] = {
+            "model.layers.0.mlp.experts.0.w1": {
+                "quant_algo": "NVFP4",
+                "group_size": 32,
+            }
+        }
+        with pytest.raises(ValueError, match="group_size=16"):
+            ModelOptParser().parse(config)
+
+    @pytest.mark.parametrize("quant_algo", ["NVFP4", "MXFP8", "FP8", ""])
+    def test_only_mixed_precision_is_read(self, quant_algo):
+        """A uniform `quant_algo` is rejected rather than guessed at.
+
+        The generic heuristics would substring-match the "fp4" inside "nvfp4"
+        and report group-32 MXFP4, and they read neither `quantized_layers`
+        nor `exclude_modules`.
+        """
+        with pytest.raises(ValueError, match="MIXED_PRECISION"):
+            ModelOptParser().parse(
+                {
+                    "quant_method": "modelopt",
+                    "quant_algo": quant_algo,
+                    "exclude_modules": ["lm_head"],
+                }
+            )
 
 
 # =========================================================================
@@ -267,6 +500,148 @@ class TestQuarkParser:
         assert result.global_spec.quant_type == QuantType.per_1x32
         assert result.global_spec.quant_dtype == FP4X2
         assert result.global_spec.is_dynamic is False
+
+    def test_two_stage_nvfp4(self):
+        parser = QuarkParser()
+        result = parser.parse(
+            {
+                "quant_method": "quark",
+                "global_quant_config": {
+                    "weight": [
+                        {
+                            "qscheme": "per_group",
+                            "dtype": "fp4",
+                            "group_size": 16,
+                            "is_dynamic": False,
+                            "is_scale_quant": False,
+                        },
+                        {
+                            "qscheme": "per_tensor",
+                            "dtype": "fp8_e4m3",
+                            "is_dynamic": False,
+                            "is_scale_quant": True,
+                        },
+                    ],
+                    "input_tensors": [
+                        {
+                            "qscheme": "per_group",
+                            "dtype": "fp4",
+                            "group_size": 16,
+                            "is_dynamic": True,
+                            "is_scale_quant": False,
+                        },
+                        {
+                            "qscheme": "per_tensor",
+                            "dtype": "fp8_e4m3",
+                            "is_dynamic": False,
+                            "is_scale_quant": True,
+                        },
+                    ],
+                },
+            }
+        )
+        spec = result.global_spec
+        assert spec.quant_type == QuantType.per_1x32
+        assert spec.quant_dtype == NVFP4_DTYPE
+        assert spec.is_dynamic is True
+
+    @pytest.mark.parametrize(
+        ("section", "stage", "field", "invalid_value"),
+        [
+            ("weight", 0, "is_dynamic", True),
+            ("input_tensors", 0, "is_dynamic", False),
+            ("input_tensors", 0, "group_size", 32),
+            ("weight", 1, "is_dynamic", True),
+            ("input_tensors", 1, "is_dynamic", True),
+        ],
+    )
+    def test_two_stage_nvfp4_rejects_mismatched_stage(
+        self, section, stage, field, invalid_value
+    ):
+        layer_config = {
+            "weight": [
+                {
+                    "qscheme": "per_group",
+                    "dtype": "fp4",
+                    "group_size": 16,
+                    "is_dynamic": False,
+                },
+                {
+                    "qscheme": "per_tensor",
+                    "dtype": "fp8_e4m3",
+                    "is_dynamic": False,
+                },
+            ],
+            "input_tensors": [
+                {
+                    "qscheme": "per_group",
+                    "dtype": "fp4",
+                    "group_size": 16,
+                    "is_dynamic": True,
+                },
+                {
+                    "qscheme": "per_tensor",
+                    "dtype": "fp8_e4m3",
+                    "is_dynamic": False,
+                },
+            ],
+        }
+        layer_config[section][stage][field] = invalid_value
+
+        with pytest.raises(ValueError, match="recognizes only NVFP4"):
+            QuarkParser().parse(
+                {
+                    "quant_method": "quark",
+                    "global_quant_config": layer_config,
+                }
+            )
+
+    def test_two_stage_nvfp4_requires_matching_input_stages(self):
+        with pytest.raises(ValueError, match="both `weight` and `input_tensors`"):
+            QuarkParser().parse(
+                {
+                    "quant_method": "quark",
+                    "global_quant_config": {
+                        "weight": [
+                            {
+                                "qscheme": "per_group",
+                                "dtype": "fp4",
+                                "group_size": 16,
+                                "is_dynamic": False,
+                            },
+                            {
+                                "qscheme": "per_tensor",
+                                "dtype": "fp8_e4m3",
+                                "is_dynamic": False,
+                            },
+                        ],
+                        "input_tensors": {"is_dynamic": True},
+                    },
+                }
+            )
+
+    def test_unknown_sequential_quark_format_is_rejected(self):
+        parser = QuarkParser()
+        with pytest.raises(ValueError, match="recognizes only NVFP4"):
+            parser.parse(
+                {
+                    "quant_method": "quark",
+                    "global_quant_config": {
+                        "weight": [
+                            {
+                                "qscheme": "per_group",
+                                "dtype": "fp4",
+                                "group_size": 32,
+                            },
+                            {
+                                "qscheme": "per_tensor",
+                                "dtype": "fp8_e4m3",
+                                "is_scale_quant": True,
+                            },
+                        ]
+                    },
+                }
+            )
 
     def test_no_input_tensors_defaults_dynamic(self):
         parser = QuarkParser()
@@ -694,6 +1069,82 @@ class TestRemapLayerName:
 
         assert qcfg.exclude_layers.count("model.layers.0.gate_up_proj") == 1
 
+    def test_packed_conflict_validation_is_modelopt_mixed_only(self):
+        qcfg = QuantizationConfig(config=None)
+        qcfg.quant_method = "quark"
+        qcfg.layer_pattern_specs = [
+            (
+                "model.layers.0.mlp.gate_proj",
+                LayerQuantConfig(quant_type=QuantType.per_Token),
+            ),
+            (
+                "model.layers.0.mlp.up_proj",
+                LayerQuantConfig(quant_type=QuantType.per_1x32),
+            ),
+        ]
+
+        qcfg.remap_layer_name(
+            FakeHFConfig(model_type="minimax_m3"),
+            packed_modules_mapping={
+                ".gate_proj": (".gate_up_proj", 0),
+                ".up_proj": (".gate_up_proj", 1),
+            },
+        )
+
+        assert [pattern for pattern, _ in qcfg.layer_pattern_specs] == [
+            "model.layers.0.mlp.gate_up_proj",
+            "model.layers.0.mlp.gate_up_proj",
+        ]
+
+    @staticmethod
+    def _modelopt_packed_config(gate_spec, up_spec):
+        qcfg = QuantizationConfig(config=None)
+        qcfg.quant_method = "modelopt"
+        qcfg.layer_pattern_specs = [
+            ("model.layers.0.mlp.gate_proj", gate_spec),
+            ("model.layers.0.mlp.up_proj", up_spec),
+        ]
+        return qcfg
+
+    @staticmethod
+    def _remap_gate_up(qcfg):
+        qcfg.remap_layer_name(
+            FakeHFConfig(model_type="minimax_m3"),
+            packed_modules_mapping={
+                ".gate_proj": (".gate_up_proj", 0),
+                ".up_proj": (".gate_up_proj", 1),
+            },
+        )
+
+    def test_modelopt_packed_spec_conflict_is_rejected(self):
+        """gate_proj NVFP4 + up_proj MXFP8 would build one spec for both."""
+        qcfg = self._modelopt_packed_config(
+            LayerQuantConfig(quant_type=QuantType.per_1x32, quant_dtype=NVFP4_DTYPE),
+            LayerQuantConfig(quant_type=QuantType.per_1x32, quant_dtype=FP8),
+        )
+
+        with pytest.raises(ValueError, match="Conflicting quantization specs"):
+            self._remap_gate_up(qcfg)
+
+    def test_modelopt_partial_packed_exclusion_is_rejected(self):
+        spec = LayerQuantConfig(quant_type=QuantType.per_1x32, quant_dtype=NVFP4_DTYPE)
+        qcfg = self._modelopt_packed_config(spec, spec)
+        qcfg.exclude_layers = ["model.layers.0.mlp.up_proj"]
+
+        with pytest.raises(ValueError, match="excluded by another"):
+            self._remap_gate_up(qcfg)
+
+    def test_modelopt_agreeing_packed_sources_are_accepted(self):
+        spec = LayerQuantConfig(quant_type=QuantType.per_1x32, quant_dtype=NVFP4_DTYPE)
+        qcfg = self._modelopt_packed_config(spec, spec)
+
+        self._remap_gate_up(qcfg)
+
+        assert (
+            qcfg.get_layer_quant_config("model.layers.0.mlp.gate_up_proj").quant_dtype
+            == NVFP4_DTYPE
+        )
+
     def test_glm_moe_dsa_remaps_like_deepseek_v3(self):
         """GLM-5 (glm_moe_dsa) uses same packed fusing as deepseek_v3."""
         qcfg = QuantizationConfig(config=None)
@@ -790,3 +1241,72 @@ def test_get_hf_config_restores_qwen3_next_full_attention_interval(monkeypatch):
     result = _m.get_hf_config("Qwen/Qwen3-Next-80B-A3B-Thinking")
 
     assert result.full_attention_interval == 4
+
+
+# =========================================================================
+# Tests — will_online_requant
+# =========================================================================
+
+
+# MiniMaxAI/MiniMax-M3-MXFP8's own `quantization_config`, and the online config
+# the nightly benchmark launches it with. A layer's format has to be decided
+# from the pair: the model-wide `online_quant` flag is true for every layer
+# here, including the ones the online exclude list leaves on their checkpoint
+# weights.
+M3_MXFP8_SOURCE = {
+    "quant_method": "mxfp8",
+    "activation_scheme": "dynamic",
+    "weight_block_size": [1, 32],
+    "ignored_layers": ["lm_head", "model.embed_tokens", "vision_tower"],
+}
+M3_MXFP8_ONLINE = {
+    "global_quant_config": "ptpc_fp8",
+    "exclude_layer": [
+        "lm_head",
+        "model.embed_tokens",
+        "vision_tower",
+        "multi_modal_projector",
+        "patch_merge_mlp",
+        "*block_sparse_moe",
+    ],
+}
+ATTENTION = "language_model.model.layers.3.self_attn.qkv_proj"
+SHARED_EXPERT = (
+    "language_model.model.layers.3.block_sparse_moe.shared_experts.gate_up_proj"
+)
+
+
+class TestWillOnlineRequant:
+    def _m3_config(self):
+        return QuantizationConfig(
+            FakeHFConfig(torch_dtype=BF16, quantization_config=M3_MXFP8_SOURCE),
+            online_quant_config=M3_MXFP8_ONLINE,
+        )
+
+    def test_none_config_never_requantizes(self):
+        assert will_online_requant(None, ATTENTION, QuantType.per_1x32, FP8) is False
+
+    def test_offline_only_config_never_requantizes(self):
+        qcfg = QuantizationConfig(
+            FakeHFConfig(torch_dtype=BF16, quantization_config=M3_MXFP8_SOURCE)
+        )
+        assert qcfg.online_quant is False
+        assert will_online_requant(qcfg, ATTENTION, QuantType.per_1x32, FP8) is False
+
+    def test_attention_linear_is_requantized(self):
+        qcfg = self._m3_config()
+        assert qcfg.online_quant is True
+        assert will_online_requant(qcfg, ATTENTION, QuantType.per_1x32, FP8) is True
+
+    def test_online_excluded_layer_keeps_its_checkpoint_weight(self):
+        # `*block_sparse_moe` is excluded online while the checkpoint quantizes
+        # everything under it but the router gate, so the model-wide flag and
+        # this layer's answer disagree.
+        qcfg = self._m3_config()
+        assert (
+            will_online_requant(qcfg, SHARED_EXPERT, QuantType.per_1x32, FP8) is False
+        )
+
+    def test_source_already_at_online_target_is_not_requantized(self):
+        qcfg = self._m3_config()
+        assert will_online_requant(qcfg, ATTENTION, QuantType.per_Token, FP8) is False

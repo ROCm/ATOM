@@ -157,7 +157,7 @@ class ATOMGLM52DSABackendForSgl(AttentionBackend):
             "sparse_kv_indptr",
             "sparse_kv_last_page_lens",
             "sparse_cu_seqlens_q",
-            "token_to_seq_idxs",
+            "batch_id_per_q_token",
             "work_meta_data",
             "work_indptr",
             "work_info_set",

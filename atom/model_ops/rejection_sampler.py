@@ -1,11 +1,11 @@
-from typing import Optional
-
 import torch
 import triton
 import triton.language as tl
+from aiter import topk_select
+from torch import nn
+
 from atom.utils import envs
 from atom.utils.forward_context import SpecDecodeMetadata
-from torch import nn
 
 ATOM_ENABLE_RELAXED_MTP = envs.ATOM_ENABLE_RELAXED_MTP
 if ATOM_ENABLE_RELAXED_MTP:
@@ -119,6 +119,8 @@ class RejectionSampler(nn.Module):
         target_logits: torch.Tensor,
         # [batch_size, 1]
         bonus_token_ids: torch.Tensor,
+        *,
+        target_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Ensure target_logits is contiguous. For greedy sampling, we can use
         # logits directly (argmax is the same for logits and probs), but we
@@ -143,6 +145,7 @@ class RejectionSampler(nn.Module):
             bonus_token_ids,
             synthetic_acceptance_rates=self.synthetic_acceptance_rates,
             synthetic_step=self._synthetic_step,
+            target_token_ids=target_token_ids,
         )
         if self.synthetic_acceptance_rates is not None:
             self._synthetic_step += 1
@@ -158,7 +161,7 @@ def rejection_sample(
     # [batch_size]
     cu_num_draft_tokens: torch.Tensor,
     # [num_tokens, vocab_size]
-    draft_probs: Optional[torch.Tensor],
+    draft_probs: torch.Tensor | None,
     # [num_tokens, vocab_size]
     target_probs: torch.Tensor,
     # [batch_size, 1]
@@ -168,6 +171,7 @@ def rejection_sample(
     synthetic_acceptance_rates: tuple[float, ...] | None = None,
     # Per-step seed for the (rank-consistent) synthetic RNG; ignored otherwise.
     synthetic_step: int = 0,
+    target_token_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert draft_token_ids.ndim == 1
     assert draft_probs is None or draft_probs.ndim == 2
@@ -183,6 +187,18 @@ def rejection_sample(
     assert target_probs.is_contiguous()
     assert bonus_token_ids.is_contiguous()
     assert target_probs.shape == (num_tokens, vocab_size)
+    if target_token_ids is not None:
+        if target_token_ids.shape != draft_token_ids.shape:
+            raise ValueError("Sampled target IDs must cover every verification row")
+        target_token_ids = target_token_ids.contiguous()
+
+    # Every `topk_select` below passes `tie="low"`, which is the whole reason
+    # its answer is the same pick `torch.argmax`/`torch.topk` made. The default
+    # promises no direction among equal scores, so a near-tie would resolve
+    # differently from one TP rank to the next -- and the accept/reject pattern
+    # these feed has to agree across ranks or `num_bonus_tokens` desyncs. It is
+    # free at k=1: the reduction that serves k=1 can keep the promise anyway.
+    # Indices come back int32, which is what the kernels here load.
 
     # Create output buffer. Each kernel program writes positions
     # [0 .. num_draft_tokens] for its request and fills the unwritten tail
@@ -202,7 +218,8 @@ def rejection_sample(
         # target argmax as the correction token and stop (same output layout /
         # num_bonus_tokens semantics as the greedy path).
         cond_rates = _get_synthetic_cond_rates(synthetic_acceptance_rates, device)
-        target_argmax = target_probs.argmax(dim=-1)
+        _, target_argmax = topk_select(target_probs, 1, tie="low")
+        target_argmax = target_argmax.view(-1)
         # Rank-consistent uniforms: a dedicated device generator re-seeded from the
         # step counter draws the same Philox stream on every TP rank / GPU, so the
         # accept/reject pattern — and hence num_bonus_tokens — matches the
@@ -232,9 +249,16 @@ def rejection_sample(
             num_spec_steps,
             num_warps=1,
         )
-    elif RELAXED_TOP_N <= 1:
-        # Strict greedy path: draft must exactly match target argmax
-        target_argmax = target_probs.argmax(dim=-1)
+    elif target_token_ids is not None or RELAXED_TOP_N <= 1:
+        # Match the actual target draw for stochastic requests; greedy requests
+        # take the target argmax and must match it exactly. The prefix kernel
+        # needs only token IDs. `topk_select`, not `.argmax`: the tie rule
+        # above is what keeps the accept/reject pattern equal across TP ranks.
+        if target_token_ids is None:
+            _, target_argmax = topk_select(target_probs, 1, tie="low")
+            target_argmax = target_argmax.view(-1)
+        else:
+            target_argmax = target_token_ids
         rejection_greedy_sample_kernel[(batch_size,)](
             output_token_ids,
             num_bonus_tokens,
@@ -249,12 +273,24 @@ def rejection_sample(
         # Relaxed acceptance path: accept if draft is among top-N
         # candidates with prob >= (top1_prob - delta)
         probs = target_probs.softmax(dim=-1, dtype=torch.float32)
-        topn_probs, topn_ids = torch.topk(probs, RELAXED_TOP_N, dim=-1)
+        # `sorted` is what puts the top-1 in slot 0 for `top1_probs` below.
+        #
+        # Among EQUAL probabilities the slot order is unspecified, here as it
+        # was under `torch.topk` -- neither promises one. Measured over
+        # 64-256 rows of three vocabularies: the id set per row is identical
+        # every time and the values are bitwise equal, so `valid_mask` and the
+        # kernel's membership test are unaffected; slot 0, which the kernel
+        # emits as the correction token, moved on 2 rows of 256 and in both the
+        # two ids held the same probability. Rank-consistent either way, since
+        # `tie="low"` leaves only backends whose answer is a function of the row.
+        topn_probs, topn_ids = topk_select(
+            probs, RELAXED_TOP_N, sorted=True, tie="low", return_value=True
+        )
 
         top1_probs = topn_probs[:, 0:1]
         valid_mask = topn_probs >= (top1_probs - RELAXED_DELTA)
         topn_ids[~valid_mask] = -1
-        topn_ids = topn_ids.to(torch.int32).contiguous()
+        topn_ids = topn_ids.contiguous()
 
         rejection_relaxed_sample_kernel[(batch_size,)](
             output_token_ids,

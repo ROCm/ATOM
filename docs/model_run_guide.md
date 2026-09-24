@@ -28,6 +28,7 @@ docker run -it --device=/dev/kfd --device=/dev/dri \
 | Kimi-K2-Thinking | MoE | FP8 | 8 | [recipes/Kimi-K2-Thinking.md](https://github.com/ROCm/ATOM/blob/main/recipes/Kimi-K2-Thinking.md) |
 | Qwen3-235B | MoE | FP8 | 8 | [recipes/Qwen3-235b.md](https://github.com/ROCm/ATOM/blob/main/recipes/Qwen3-235b.md) |
 | Qwen3-Next | MoE | FP8 | 8 | [recipes/Qwen3-Next.md](https://github.com/ROCm/ATOM/blob/main/recipes/Qwen3-Next.md) |
+| Qwen3.8-Flash-Next | MoE + GDN + QSA | BF16 | 2 × 288 GiB (TP2+EP) | [recipes/Qwen3.8-Flash-Next.md](https://github.com/ROCm/ATOM/blob/main/recipes/Qwen3.8-Flash-Next.md) |
 
 ### vLLM plugin backend
 

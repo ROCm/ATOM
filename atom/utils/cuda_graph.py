@@ -14,6 +14,7 @@ from aiter import logger
 from atom.config import Config, CUDAGraphMode
 from atom.utils import compilation_counter, weak_ref_tensors
 from atom.utils.forward_context import get_forward_context
+from atom.utils.graph_holders import register_graph_holder
 
 # from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
 # from vllm.config import CUDAGraphMode, VllmConfig
@@ -143,6 +144,38 @@ class CUDAGraphWrapper:
         # the entries for different batch descriptors that we need to capture
         # cudagraphs for.
         self.concrete_cudagraph_entries: dict[BatchDescriptor, CUDAGraphEntry] = {}
+        # Nothing else can find these graphs: the backend installs this wrapper
+        # in a graph module's `__dict__`, off both `_modules` and any path from
+        # the runner. See `atom/utils/graph_holders.py`.
+        register_graph_holder(self)
+
+    def release_graphs(self) -> int:
+        """Drop every graph captured here, so what it captured can be freed.
+
+        The entry, not just the graph: `output` is a live reference into the
+        graph's private pool, which is the memory a release is trying to
+        reclaim. Recapture needs no arranging -- `__call__` records on the first
+        step whose entry has no graph -- but it must not happen mid-serve, so
+        whoever calls this has to stop PIECEWISE being dispatched first (for the
+        runner that is `_piecewise_captured_tokens`).
+        """
+        global _shared_graph_pool
+
+        dropped = 0
+        for descriptor, entry in self.concrete_cudagraph_entries.items():
+            if entry.cudagraph is not None:
+                dropped += 1
+            # Forget the pool this bucket recorded into. A pool whose last graph
+            # has just gone away stays in the allocator's table with a use count
+            # of zero until an `empty_cache()` erases it, and starting a capture
+            # on an id in that state trips an internal assertion instead of
+            # making a new pool. `runner.graph_pool = None` has always done this
+            # for the manual store; these two globals are the piecewise
+            # equivalents. Same expression `__call__` keys them by.
+            _graph_pools.pop(descriptor.num_tokens if descriptor else 0, None)
+        self.concrete_cudagraph_entries.clear()
+        _shared_graph_pool = None
+        return dropped
 
     def __getattr__(self, key: str):
         # allow accessing the attributes of the runnable.
@@ -339,6 +372,25 @@ class CudagraphCaptureRunner:
         self._graphs: dict = {}
         self._pool = None
         self._capture_error_mode = capture_error_mode
+        # A runner is a module-level global of the model that uses it
+        # (`deepseek_v4.py`), passed to the core per step rather than held by
+        # anything the releaser can walk. See `atom/utils/graph_holders.py`.
+        register_graph_holder(self)
+
+    def release_graphs(self) -> int:
+        """Drop every recording, so what it captured can be freed.
+
+        These graphs hold the base of the KV pool like any decode graph does --
+        an attention core writes the KV it attends. `has_graph` answers False
+        afterwards, so the next step runs the core eagerly (delivering into its
+        output slot) until a capture pass records again.
+        """
+        dropped = len(self._graphs)
+        self._graphs.clear()
+        # The next capture makes its own; see `CUDAGraphWrapper.release_graphs`
+        # for why reusing this handle is not safe.
+        self._pool = None
+        return dropped
 
     def has_graph(self, key) -> bool:
         return key in self._graphs
@@ -376,9 +428,13 @@ class CudagraphCaptureRunner:
         in_bufs: dict,
         refresh: dict,
         compute_fn: Callable,
-        out_buf: torch.Tensor,
+        out_buf: torch.Tensor | None,
     ) -> None:
         """Record `compute_fn(**in_bufs)` under `key`, landing in `out_buf`.
+
+        `out_buf` is None for a core that returns nothing -- one whose whole
+        effect is on paged state. Then there is nothing to copy and nothing for
+        replay to hand back.
 
         The output copy goes INSIDE the graph, so a later replay refreshes
         `out_buf` with no Python at all.
@@ -396,10 +452,12 @@ class CudagraphCaptureRunner:
             stream=torch.cuda.current_stream(),
             capture_error_mode=self._capture_error_mode,
         ):
-            out_buf.copy_(compute_fn(**in_bufs))
+            result = compute_fn(**in_bufs)
+            if out_buf is not None:
+                out_buf.copy_(result)
         self._graphs[key] = {"graph": graph, "in": refresh, "out": out_buf}
 
-    def replay(self, key, named_args: dict) -> torch.Tensor:
+    def replay(self, key, named_args: dict) -> torch.Tensor | None:
         """Refresh the inputs this runner owns, replay, and return the output."""
         entry = self._graphs[key]
         # Only the inputs this runner cloned are here. A zero-copy one is not:
@@ -409,4 +467,4 @@ class CudagraphCaptureRunner:
             if src is not None:
                 buf.copy_(src)
         entry["graph"].replay()
-        return entry["out"]  # the graph copied the result in for us
+        return entry["out"]  # None for a void core; else the graph copied it in

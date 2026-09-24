@@ -42,6 +42,15 @@ class VerifyScheduler:
         self.runner = runner
         self.sps_table: torch.Tensor | None = None
         self.sts_temperatures: torch.Tensor | None = None
+        self.calibration_profile = getattr(
+            runner.config.dspark, "calibration_profile", None
+        )
+        if self.calibration_profile is not None:
+            from atom.spec_decode.calibration import load_calibration
+
+            self.sps_table, self.sts_temperatures = load_calibration(
+                runner.config, runner.device
+            )
         self._last_ell: torch.Tensor | None = None
         # FIFO of in-flight async D2H copies of ell, one entry per step:
         # (event, cpu_buf, req_ids). Read by index in _resolve_ell, never popped.

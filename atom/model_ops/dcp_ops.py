@@ -11,12 +11,26 @@ softmax, selected by ``DCPConfig.comm_backend``:
 
 They are mathematically equivalent but not bitwise identical; see the A2A
 section below for why one collective can replace two.
+
+Also here: the sparse indexer's DCP support -- the decode candidate exchange
+(fused into one aiter op) and the sparse-prefill owned-slot filter.
 """
 
 import numpy as np
 import torch
 import triton
 import triton.language as tl
+
+from atom.distributed.dcp_layout import (  # noqa: F401
+    dcp_global_pos,
+    dcp_local_index,
+    dcp_owner_rank,
+)
+from atom.distributed.dcp_utils import get_dcp_group, get_dcp_world_size
+from atom.utils.forward_context import get_published_dcp_local_context_lens
+
+# Token-ownership arithmetic lives in ``dcp_layout`` so P/D relayout can share
+# it without importing Triton. Re-exported here for existing attention callers.
 
 _AG_CUSTOM_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
@@ -133,7 +147,11 @@ def _correct_attn_cp_out_kernel(
     )
 
     lse = tl.load(lses_ptr + lse_offsets)
-    lse = tl.where((lse != lse) | (lse == float("inf")), -float("inf"), lse)
+    lse = tl.where(
+        (lse != lse) | (lse == float("inf")),  # noqa: PLR0124 - Triton NaN check
+        -float("inf"),
+        lse,
+    )
 
     lse_max = tl.max(lse, axis=0)
     lse_max = tl.where(lse_max == -float("inf"), 0, lse_max)
@@ -151,7 +169,8 @@ def _correct_attn_cp_out_kernel(
     local_lse = tl.load(lses_ptr + local_lse_offset)
     lse_diff = local_lse - global_lse
     lse_diff = tl.where(
-        (lse_diff != lse_diff) | (lse_diff == float("inf")),
+        (lse_diff != lse_diff)  # noqa: PLR0124 - Triton NaN check
+        | (lse_diff == float("inf")),
         -float("inf"),
         lse_diff,
     )
@@ -284,9 +303,88 @@ def _lse_pack_slots(dtype: torch.dtype) -> int:
 
 
 @triton.jit
+def _zero_nonfinite_rows_kernel(
+    out_ptr,  # [B, H, D]   attention output, written in place
+    lse_ptr,  # [B, H]      fp32 per-head LSE
+    out_stride_b,
+    out_stride_h,
+    lse_stride_b,
+    lse_stride_h,
+    HEAD_DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Zero the (token, head) rows whose LSE is not finite. One program per row.
+
+    Replaces five launches with one. The Python it stands in for --
+
+        o = torch.where(torch.isfinite(lse).unsqueeze(-1), o, 0.0)
+
+    -- costs four kernels just to build the mask, because torch decomposes
+    isfinite into abs/ne/eq/mul, and a fifth to apply it. The mask is [B, H],
+    a few KB; at ~5.5 us per launch that chain is pure launch overhead.
+
+    The bigger win is the early return. A non-finite LSE means the row saw no
+    valid KV, which is an edge case -- nearly every row is finite. `where`
+    cannot know that: it reads and rewrites all of `o` regardless. Here a
+    finite row exits before touching `o` at all, so the common case costs one
+    scalar load per row instead of a full read-modify-write of [B, H, D].
+    """
+    b = tl.program_id(axis=0).to(tl.int64)
+    h = tl.program_id(axis=1).to(tl.int64)
+
+    lse = tl.load(lse_ptr + b * lse_stride_b + h * lse_stride_h)
+    # isfinite: NaN fails `lse == lse`, +-inf fails the abs bound. `&` rather
+    # than `and` to match the rest of this file and to keep the predicate a
+    # single elementwise op; `tl.abs` has no side effect, so nothing is lost by
+    # not short-circuiting.
+    if (lse == lse) & (tl.abs(lse) < float("inf")):  # noqa: PLR0124
+        return
+
+    base = out_ptr + b * out_stride_b + h * out_stride_h
+    for off in tl.range(0, HEAD_DIM, BLOCK):
+        idx = off + tl.arange(0, BLOCK)
+        keep = idx < HEAD_DIM
+        # BLOCK rounds HEAD_DIM up, so the tail lanes of the last block are out
+        # of range. The store mask already keeps them from writing; folding them
+        # onto 0 keeps the address itself inside the row too, as the two a2a
+        # kernels in this file do for their padding rank lanes.
+        tl.store(
+            base + tl.where(keep, idx, 0),
+            tl.zeros([BLOCK], dtype=out_ptr.dtype.element_ty),
+            mask=keep,
+        )
+
+
+def zero_nonfinite_rows(out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
+    """In-place `out[~isfinite(lse)] = 0`, one kernel. See the kernel docstring."""
+    assert out.dim() == 3 and lse.dim() == 2, (out.shape, lse.shape)
+    assert out.shape[:2] == lse.shape, (out.shape, lse.shape)
+    # The kernel indexes the head dim as `base + idx`, i.e. it assumes a unit
+    # stride there. Every caller passes a fresh `torch.empty` or the result of
+    # `.contiguous()`, but a violation would write the wrong memory silently,
+    # so it is checked rather than assumed.
+    assert out.stride(2) == 1, f"head dim must be contiguous, got {out.stride()}"
+    b, h, d = out.shape
+    if b == 0 or h == 0:
+        return out
+    _zero_nonfinite_rows_kernel[(b, h)](
+        out,
+        lse,
+        out.stride(0),
+        out.stride(1),
+        lse.stride(0),
+        lse.stride(1),
+        HEAD_DIM=d,
+        BLOCK=min(1024, triton.next_power_of_2(d)),
+    )
+    return out
+
+
+@triton.jit
 def _dcp_a2a_pack_kernel(
     out_ptr,  # [B, H, D]      this rank's partial attention output
     lse_ptr,  # [B, H]         fp32
+    owned_counts_ptr,  # [B]   true rank-local sparse counts, or unused
     send_ptr,  # [N, B, H_LOCAL, D + LSE_PACK]
     out_stride_b,
     out_stride_h,
@@ -298,6 +396,7 @@ def _dcp_a2a_pack_kernel(
     H_LOCAL: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     LSE_PACK: tl.constexpr,
+    HAS_OWNED_COUNTS: tl.constexpr,
 ):
     """Scatter (output, lse) into the per-destination send buffer.
 
@@ -320,6 +419,11 @@ def _dcp_a2a_pack_kernel(
     tl.store(dst_base + d, src)
 
     lse = tl.load(lse_ptr + b * lse_stride_b + h * lse_stride_h)
+    if HAS_OWNED_COUNTS:
+        # Empty sparse-DCP rows carry one dummy KV slot so persistent metadata
+        # remains valid. Neutralize that slot while packing the existing A2A
+        # payload; this adds no kernel launch to the decode path.
+        lse = tl.where(tl.load(owned_counts_ptr + b) == 0, float("-inf"), lse)
     if LSE_PACK == 1:
         tl.store(dst_base + HEAD_DIM, lse)
     else:
@@ -362,9 +466,14 @@ def _dcp_a2a_unpack_combine_kernel(
 
     n = tl.arange(0, N_ROUNDED)
     valid = n < N_RANKS
+    # The padding lanes are masked at every load, which is the documented Triton
+    # contract. They are also folded onto lane 0 here so no pointer is ever
+    # FORMED outside `recv` -- belt and braces, asked for in review, and free:
+    # the select folds into the address arithmetic.
+    n_safe = tl.where(valid, n, 0)
     base = (
         recv_ptr
-        + n.to(tl.int64) * recv_stride_n
+        + n_safe.to(tl.int64) * recv_stride_n
         + b * recv_stride_b
         + h * recv_stride_h
     )
@@ -404,7 +513,11 @@ def _dcp_a2a_unpack_combine_kernel(
     factor = tl.where((factor != factor) | (~valid), 0.0, factor)  # noqa: PLR0124
 
     d = tl.arange(0, HEAD_DIM)
-    vals = tl.load(base[:, None] + d[None, :]).to(tl.float32)
+    # Masked for the same reason as the fused kernel: the padding lanes of a
+    # non-power-of-two group address memory past `recv`.
+    vals = tl.load(base[:, None] + d[None, :], mask=valid[:, None], other=0.0).to(
+        tl.float32
+    )
     # THIS is what stops an empty rank from poisoning the row. aiter returns
     # o=NaN alongside lse=-inf, and NaN * 0 = NaN, so the NaN has to be replaced
     # BEFORE the multiply -- zeroing the weight is not enough.
@@ -417,7 +530,132 @@ def _dcp_a2a_unpack_combine_kernel(
     )
 
 
-def cp_lse_a2a(cp_attn_out, cp_attn_lse, cp_group, return_lse: bool = False):
+@triton.jit
+def _dcp_a2a_unpack_combine_quant_kernel(
+    recv_ptr,  # [N, B, H_LOCAL, D + LSE_PACK]  N = source rank (KV shard)
+    out_ptr,  # [B, H_LOCAL, D] fp8
+    out_scale_ptr,  # [B, 1] fp32, one scale per TOKEN
+    recv_stride_n,
+    recv_stride_b,
+    recv_stride_h,
+    out_stride_b,
+    out_stride_h,
+    N_RANKS,
+    HEAD_DIM: tl.constexpr,
+    H_LOCAL: tl.constexpr,
+    LSE_PACK: tl.constexpr,
+    N_ROUNDED: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    """Combine + per-token FP8 quant in one launch. ONE PROGRAM PER TOKEN.
+
+    Why the grid changes from (B, H_LOCAL) to (B,): a per-token scale is the max
+    over the WHOLE row, i.e. across every local head, so the head axis can no
+    longer be split across programs -- a program that sees one head cannot know
+    the row max. Folding the quant in therefore costs occupancy (B*H_LOCAL ->
+    B programs) and buys the removal of a whole kernel launch. The saved launch
+    wins across the whole range: swept under CUDA-graph replay at H_LOCAL=4,
+    HEAD_DIM=256, N_RANKS=4, the fused form is 11-17% faster from B=1 to B=512
+    and 38-54% faster from B=2048 up, with no B where it loses.
+
+    The combine math is bit-for-bit the unfused kernel; only the store differs.
+    Quantizing from the fp32 accumulator rather than a bf16 round trip moves the
+    result by up to one bf16 step, and measurably TOWARDS the fp64 reference:
+    relative error is 0.998x the unfused path's at B=8/48/256/2048.
+    """
+    b = tl.program_id(axis=0).to(tl.int64)
+
+    n = tl.arange(0, N_ROUNDED)
+    h = tl.arange(0, H_LOCAL)
+    d = tl.arange(0, HEAD_DIM)
+    valid = n < N_RANKS
+    # The padding lanes are masked at every load, which is the documented Triton
+    # contract. They are also folded onto lane 0 here so no pointer is ever
+    # FORMED outside `recv` -- belt and braces, asked for in review, and free:
+    # the select folds into the address arithmetic.
+    n_safe = tl.where(valid, n, 0)
+
+    # [N, H] base of each (shard, head) record for this token.
+    hbase = (
+        recv_ptr
+        + n_safe[:, None].to(tl.int64) * recv_stride_n
+        + b * recv_stride_b
+        + h[None, :].to(tl.int64) * recv_stride_h
+    )
+
+    if LSE_PACK == 1:
+        lse = tl.load(hbase + HEAD_DIM, mask=valid[:, None], other=float("-inf"))
+        lse = lse.to(tl.float32)
+    else:
+        hi = tl.load(hbase + HEAD_DIM, mask=valid[:, None], other=0).to(
+            tl.uint16, bitcast=True
+        )
+        lo = tl.load(hbase + HEAD_DIM + 1, mask=valid[:, None], other=0).to(
+            tl.uint16, bitcast=True
+        )
+        bits = (hi.to(tl.uint32) << 16) | lo.to(tl.uint32)
+        lse = bits.to(tl.float32, bitcast=True)
+        lse = tl.where(valid[:, None], lse, float("-inf"))
+
+    # Same non-finite handling as the unfused kernel: a rank that owns no KV for
+    # this row reports lse=-inf and o=NaN, and NaN*0 is still NaN, so the NaN has
+    # to be killed before the multiply, not after.
+    lse_is_nan = lse != lse  # noqa: PLR0124
+    lse = tl.where(lse_is_nan | (lse == float("inf")), float("-inf"), lse)
+
+    lse_max = tl.max(lse, axis=0)
+    lse_max = tl.where(lse_max == float("-inf"), 0.0, lse_max)
+    global_lse = tl.log(tl.sum(tl.exp(lse - lse_max), axis=0)) + lse_max
+
+    factor = tl.exp(lse - global_lse[None, :])
+    factor_is_nan = factor != factor  # noqa: PLR0124
+    factor = tl.where(factor_is_nan | (~valid[:, None]), 0.0, factor)
+
+    # [N, H, D]. Mask the padding lanes: N_ROUNDED rounds up to a power of two,
+    # so for a non-power-of-two group the high lanes address memory past `recv`.
+    # Their factor is already 0, so this changes no result -- it stops the read.
+    vals = tl.load(
+        hbase[:, :, None] + d[None, None, :], mask=valid[:, None, None], other=0.0
+    ).to(tl.float32)
+    vals = tl.where(factor[:, :, None] == 0.0, 0.0, vals)
+    acc = tl.sum(vals * factor[:, :, None], axis=0)  # [H, D]
+
+    # Per-token scale: reduce over BOTH remaining axes, which is exactly the row
+    # o_proj will see once [H, D] is flattened to one activation row.
+    # This has to reproduce aiter's per-token quantizer bit for bit: the two are
+    # interchangeable for the same activation, and o_proj cannot tell which one
+    # produced its input. Three details carry that, none of them cosmetic:
+    #
+    #   * `* (1 / FP8_MAX)`, not `/ FP8_MAX`. Triton's fdiv on ROCm is 1 ulp off
+    #     IEEE here, which moves ~0.1% of elements to an adjacent FP8 code
+    #     (measured: 4869 of 4.2M, and 54% of rows get a different scale).
+    #     `atom/model_ops/kimi_k3/quant.py` carries the same note.
+    #   * one reciprocal, then a multiply per element -- not a divide per element.
+    #   * an all-zero row keeps scale 0 and takes a zero reciprocal, so the row
+    #     comes out zero instead of NaN. That is what aiter stores at the shapes
+    #     this path produces and what `kimi_k3/quant.py` deliberately mirrors;
+    #     a non-zero floor here would make the two non-interchangeable for a row
+    #     every rank reports empty.
+    row_max = tl.max(tl.abs(acc))
+    scale = row_max * (1.0 / FP8_MAX)
+    inv = tl.where(scale > 0.0, 1.0 / scale, 0.0)
+    tl.store(out_scale_ptr + b, scale)
+
+    q = tl.minimum(tl.maximum(acc * inv, -FP8_MAX), FP8_MAX)
+    tl.store(
+        out_ptr + b * out_stride_b + h[:, None] * out_stride_h + d[None, :],
+        q.to(out_ptr.dtype.element_ty),
+    )
+
+
+def cp_lse_a2a(
+    cp_attn_out,
+    cp_attn_lse,
+    cp_group,
+    return_lse: bool = False,
+    owned_counts=None,
+    quant_dtype=None,
+):
     """A2A backend: pack -> one all-to-all -> local LSE combine.
 
     Drop-in for ``cp_lse_ag_out_rs``: same inputs, same ``[B, H_local, D]``
@@ -428,9 +666,28 @@ def cp_lse_a2a(cp_attn_out, cp_attn_lse, cp_group, return_lse: bool = False):
         cp_attn_lse: ``[B, H]`` matching log-sum-exp, fp32.
         cp_group: DCP GroupCoordinator.
         return_lse: also return the merged ``[B, H_local]`` global LSE.
+        owned_counts: optional true rank-local sparse-KV count per row. Empty
+            rows are masked inside the existing A2A pack kernel.
+        quant_dtype: when given (per-token FP8), the combine also quantizes and
+            the call returns ``(out_fp8, scale)`` instead of ``out``. This
+            deletes the standalone per-token quant launch that o_proj would
+            otherwise need -- see ``_dcp_a2a_unpack_combine_quant_kernel``.
+            ``scale is None`` in the return means the output came back
+            UNQUANTIZED and the caller must quantize as before; that is the
+            single-rank shortcut below, not an error.
     """
+    # Checked before the single-rank shortcut, not after: that path returns
+    # early, so an assertion below it would let the one caller combination this
+    # function cannot serve slip through with the LSE silently dropped.
+    assert (
+        quant_dtype is None or not return_lse
+    ), "cp_lse_a2a: the fused-quant combine does not emit LSE"
+
     n_ranks = cp_group.world_size
     if n_ranks == 1:
+        if quant_dtype is not None:
+            # Nothing to combine, so there is no kernel to fold the quant into.
+            return cp_attn_out, None
         return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
 
     b, h_total, head_dim = cp_attn_out.shape
@@ -446,11 +703,20 @@ def cp_lse_a2a(cp_attn_out, cp_attn_lse, cp_group, return_lse: bool = False):
 
     cp_attn_out = cp_attn_out.contiguous()
     cp_attn_lse = cp_attn_lse.contiguous().to(torch.float32)
+    has_owned_counts = owned_counts is not None
+    if has_owned_counts:
+        owned_counts = owned_counts.contiguous()
+        assert owned_counts.numel() >= b
+    else:
+        # HAS_OWNED_COUNTS removes the load at compile time; use an existing
+        # device pointer so no placeholder tensor or allocation is introduced.
+        owned_counts = cp_attn_lse
 
     send = torch.empty((n_ranks, b, h_local, head_dim + pack), dtype=dtype, device=dev)
     _dcp_a2a_pack_kernel[(b, h_total)](
         cp_attn_out,
         cp_attn_lse,
+        owned_counts,
         send,
         cp_attn_out.stride(0),
         cp_attn_out.stride(1),
@@ -462,12 +728,35 @@ def cp_lse_a2a(cp_attn_out, cp_attn_lse, cp_group, return_lse: bool = False):
         H_LOCAL=h_local,
         HEAD_DIM=head_dim,
         LSE_PACK=pack,
+        HAS_OWNED_COUNTS=has_owned_counts,
     )
 
     # The N axis flips meaning here: it is "destination rank" on the way in and
     # "source rank / KV shard" on the way out.
     recv = torch.empty_like(send)
     torch.distributed.all_to_all_single(recv, send, group=cp_group.device_group)
+
+    if quant_dtype is not None:
+        out = torch.empty((b, h_local, head_dim), dtype=quant_dtype, device=dev)
+        # [b, 1] is the layout gemm_a8w8 / tgemm.mm expect for a per-token scale.
+        out_scale = torch.empty((b, 1), dtype=torch.float32, device=dev)
+        _dcp_a2a_unpack_combine_quant_kernel[(b,)](
+            recv,
+            out,
+            out_scale,
+            recv.stride(0),
+            recv.stride(1),
+            recv.stride(2),
+            out.stride(0),
+            out.stride(1),
+            n_ranks,
+            HEAD_DIM=head_dim,
+            H_LOCAL=h_local,
+            LSE_PACK=pack,
+            N_ROUNDED=triton.next_power_of_2(n_ranks),
+            FP8_MAX=float(torch.finfo(quant_dtype).max),
+        )
+        return out, out_scale
 
     out = torch.empty((b, h_local, head_dim), dtype=dtype, device=dev)
     out_lse = (
@@ -495,7 +784,22 @@ def cp_lse_a2a(cp_attn_out, cp_attn_lse, cp_group, return_lse: bool = False):
     return (out, out_lse) if return_lse else out
 
 
-def dcp_lse_merge(cp_attn_out, cp_attn_lse, cp_group, backend="a2a", ctx=None):
+def mask_empty_dcp_lse(
+    cp_attn_lse: torch.Tensor, owned_counts: torch.Tensor
+) -> torch.Tensor:
+    """Mark dummy-backed local rows as absent before the DCP softmax merge."""
+    return cp_attn_lse.masked_fill(owned_counts[:, None] == 0, float("-inf"))
+
+
+def dcp_lse_merge(
+    cp_attn_out,
+    cp_attn_lse,
+    cp_group,
+    backend="a2a",
+    ctx=None,
+    owned_counts=None,
+    quant_dtype=None,
+):
     """Reconstruct the global softmax from the per-rank partials.
 
     Dispatches to one of the two backends above. Both compute the same weighted
@@ -504,11 +808,29 @@ def dcp_lse_merge(cp_attn_out, cp_attn_lse, cp_group, backend="a2a", ctx=None):
     why one all-to-all can replace AllGather-LSE + ReduceScatter). Equivalent
     math, not bitwise identical.
 
+    ``owned_counts`` is the optional rank-local sparse-KV count per row. Empty
+    prefill rows contain a dummy cache slot to keep persistent metadata valid;
+    masking only their small LSE tensor here lets the existing merge kernels
+    suppress the corresponding output without another full-output pass.
+
     ``ctx`` is the Triton context the AG+RS backend caches its launches in; the
     a2a backend does not use one.
     """
     if backend == "a2a":
-        return cp_lse_a2a(cp_attn_out, cp_attn_lse, cp_group)
+        return cp_lse_a2a(
+            cp_attn_out,
+            cp_attn_lse,
+            cp_group,
+            owned_counts=owned_counts,
+            quant_dtype=quant_dtype,
+        )
+    assert (
+        quant_dtype is None
+    ), "dcp_lse_merge: fused-quant combine is only implemented for backend=a2a"
+    if owned_counts is not None:
+        # AG+RS has no existing kernel before its LSE AllGather. The default
+        # A2A path above fuses this mask and remains launch-free.
+        cp_attn_lse = mask_empty_dcp_lse(cp_attn_lse, owned_counts)
     return cp_lse_ag_out_rs(cp_attn_out, cp_attn_lse, cp_group, ctx=ctx)
 
 
@@ -534,6 +856,56 @@ def dcp_gather_compressed_kv(
     gathered = kv_cache.index_select(0, slot_ids)
     # Collapse any singleton head dim -> [toks, kv_lora_rank + qk_rope_head_dim].
     return gathered.reshape(slot_ids.shape[0], -1)
+
+
+def dcp_reorg_row_indices(
+    padded_local_chunk_seq_lens: np.ndarray,
+    real_local_chunk_lens: np.ndarray,
+) -> np.ndarray:
+    """The reorg of an AllGathered compressed-KV chunk, as a row map.
+
+    Same reordering ``reorg_kvcache`` performs by slicing and concatenating,
+    expressed as ``dst_row -> src_row`` so a kernel can apply it in one gather.
+    ``reorg_kvcache`` walks the (seq, rank) segments in Python on every layer;
+    this walks them once per step in the metadata builder, and the gather then
+    rides along with the ``kv_b_proj`` decompress instead of costing two
+    ``cat``s of its own.
+
+    Args:
+        padded_local_chunk_seq_lens: [bs] per-seq padded local chunk length.
+            Uniform across ranks, so it also gives each rank's AllGather block
+            size (``toks = sum``) and each seq's offset inside a block.
+        real_local_chunk_lens: [bs, dcp] per-(seq, rank) REAL local chunk
+            length. Where it falls short of the padded length is exactly the
+            padding this map drops.
+
+    Returns:
+        int32 [``real_local_chunk_lens.sum()``] rows into the
+        ``[toks * dcp, d]`` AllGather buffer, per-seq contiguous and rank-major
+        within a seq -- the layout ``cu_seqlens_k`` describes.
+    """
+    padded = np.asarray(padded_local_chunk_seq_lens, dtype=np.int64).reshape(-1)
+    lens = np.asarray(real_local_chunk_lens, dtype=np.int64)
+    bs, dcp = lens.shape
+    assert padded.shape[0] == bs, (padded.shape, lens.shape)
+
+    toks = int(padded.sum())
+    seq_base = np.zeros(bs, dtype=np.int64)
+    np.cumsum(padded[:-1], out=seq_base[1:])
+    # Rank r's block starts at r * toks, and seq i sits at the same offset
+    # inside every block because the padded length is rank-invariant.
+    starts = (
+        seq_base[:, None] + np.arange(dcp, dtype=np.int64)[None, :] * toks
+    ).reshape(-1)
+
+    lens = lens.reshape(-1)  # (seq, rank) row-major == reorg's walk order
+    seg_base = np.zeros(lens.shape[0], dtype=np.int64)
+    np.cumsum(lens[:-1], out=seg_base[1:])
+    # Row `seg_base[s] + j` of the output is row `starts[s] + j` of the input,
+    # so a single arange carries the per-segment offset j.
+    total = int(lens.sum())
+    rows = np.repeat(starts - seg_base, lens) + np.arange(total, dtype=np.int64)
+    return rows.astype(np.int32)
 
 
 def reorg_kvcache(
@@ -640,334 +1012,318 @@ def get_dcp_local_seq_lens(seq_lens, dcp_size, dcp_rank, cp_kv_cache_interleave_
     return base + remainder
 
 
-def dcp_owner_rank(pos, dcp_size, cp_kv_cache_interleave_size=1):
-    """Which DCP rank owns global token ``pos`` under interleaved KV storage.
+def get_dcp_local_window_lens(
+    seq_lens, max_seqlen_q, dcp_size, dcp_rank, cp_kv_cache_interleave_size=1
+):
+    """Per-DCP-rank local KV length of each query token's causal window.
 
-    Interleaving groups tokens into chunks of ``cp_kv_cache_interleave_size`` (= S); chunk
-    ``c = pos // S`` is stored on rank ``c % dcp_size``. For S == 1 this reduces
-    to the round-robin ``pos % dcp_size``.
-
-    Works elementwise on Python ints, numpy arrays and torch tensors (only ``//``
-    and ``%`` are used). Consistent with vLLM's slot kernel
-    (``block_table.py`` ``is_local``) because ``block_size * W`` is a multiple of
-    ``S * W`` when ``block_size % S == 0``, so computing on the global position
-    equals computing on the virtual-block offset.
+    Draft position ``j`` attends to global positions ``[0, seq_len -
+    max_seqlen_q + j]``; that extra position belongs to a single rank, so the
+    ranks' local lengths do not all advance with j. Returns a flat
+    ``[len(seq_lens) * max_seqlen_q]`` array in (sequence, draft position)
+    order. ``max_seqlen_q == 1`` reproduces ``get_dcp_local_seq_lens``.
     """
-    return (pos // cp_kv_cache_interleave_size) % dcp_size
-
-
-def dcp_local_index(pos, dcp_size, cp_kv_cache_interleave_size=1):
-    """Local KV-sequence index of global token ``pos`` on its owning rank.
-
-    Each ``S * W`` super-block contributes ``S`` tokens to a rank, so the local
-    index is ``(pos // (S*W)) * S + (pos % S)``. For S == 1 this reduces to the
-    round-robin ``pos // dcp_size``.
-
-    To map to a physical slot (given ``block_size % S == 0``):
-        block_table_index = pos // (block_size * dcp_size)   # == local_index // block_size
-        slot_offset       = local_index % block_size
-        slot              = block_table[block_table_index] * block_size + slot_offset
-
-    Elementwise over Python ints / numpy / torch.
-    """
-    sw = cp_kv_cache_interleave_size * dcp_size
-    return (pos // sw) * cp_kv_cache_interleave_size + (
-        pos % cp_kv_cache_interleave_size
+    windows = seq_lens[:, None] - max_seqlen_q + 1 + np.arange(max_seqlen_q)
+    return get_dcp_local_seq_lens(
+        # Row 0 is the committed token count, which a scheduled decode row
+        # always has at least one of; the clip is for callers that do not.
+        windows.clip(min=0).ravel(),
+        dcp_size,
+        dcp_rank,
+        cp_kv_cache_interleave_size,
     )
 
 
-def dcp_global_pos(local_index, dcp_rank, dcp_size, cp_kv_cache_interleave_size=1):
-    """Inverse of ``dcp_local_index``: global token position of local KV index
-    ``local_index`` held on ``dcp_rank``.
-
-    Local index j on rank r sits in local S-group ``j // S`` at offset ``j % S``;
-    that group is global chunk ``(j//S)*W + r``, so the global position is
-    ``((j//S)*W + r) * S + (j % S)``. For S == 1 this reduces to the round-robin
-    ``j*W + r``. Used to reconstruct globally-unique ids for exchanged sparse
-    top-k candidates (the id must be a total order over global positions).
-
-    Elementwise over Python ints / numpy / torch.
-    """
-    return (
-        (local_index // cp_kv_cache_interleave_size) * dcp_size + dcp_rank
-    ) * cp_kv_cache_interleave_size + (local_index % cp_kv_cache_interleave_size)
-
-
-def dcp_pack_topk_candidates(
-    local_logits,
-    local_idx,
-    local_lens,
+def dcp_prefill_slot_mapping(
+    block_tables,
+    cached_lens,
+    context_lens,
+    block_size,
+    dcp_size,
     dcp_rank,
-    dcp_world_size,
-    out_pair,
     cp_kv_cache_interleave_size=1,
 ):
-    """Turn a rank-local top-k into exchangeable (score, global_id) pairs.
+    """Per-token KV slots for a prefill step, ``-1`` where another rank owns it.
 
-    out_pair: fp32 [2, rows, k] -- plane 0 holds scores, plane 1 holds int32
-    global ids reinterpreted as fp32 so both travel in one collective. Slots the
-    local top-k did not fill get (-inf, -1); the merge sinks them via -inf and
-    never selects the -1 gids.
+    ``block_tables`` is one ragged per-sequence row per sequence, and the two
+    length arrays bound each sequence's span; the result is the flattened token
+    axis in sequence order. The body is the slot formula ``dcp_local_index``
+    documents above, applied per token -- kept here rather than in the
+    attention builder so the rank filter and the addressing it depends on stay
+    in one file, and so the builder needs to know nothing about interleaving.
 
-    Under interleave-S sharding a local index j on rank r is global position
-    ``((j//S)*W + r)*S + j%S`` (S=1 -> the round-robin j*W + r), so the id is
-    globally unique -- which is what makes the tie-break a total order.
+    A loop, not array arithmetic: this axis is a per-rank filter, and no
+    configuration in this tree runs ``dcp_size > 1`` to check a vectorized
+    rewrite against.
     """
-    rows, _k = local_idx.shape
-    # Bound-check rather than assume a padding convention from the aiter kernel.
-    valid = (local_idx >= 0) & (local_idx < local_lens.view(rows, 1))
-    safe = torch.where(valid, local_idx, torch.zeros_like(local_idx))
-    sc = torch.gather(local_logits, 1, safe.to(torch.int64))
-    out_pair[0].copy_(torch.where(valid, sc, torch.full_like(sc, -float("inf"))))
-    gid = torch.where(
-        valid,
-        dcp_global_pos(
-            local_idx, dcp_rank, dcp_world_size, cp_kv_cache_interleave_size
-        ),
-        torch.full_like(local_idx, -1),
-    )
-    out_pair.view(torch.int32)[1].copy_(gid)
+    virtual_block_size = block_size * dcp_size
+    slot_mapping = []
+    rows = zip(block_tables, cached_lens, context_lens)
+    for block_table, cached_seqlen, seqlen in rows:
+        for pos in range(cached_seqlen, seqlen):
+            if dcp_owner_rank(pos, dcp_size, cp_kv_cache_interleave_size) != dcp_rank:
+                slot_mapping.append(-1)
+                continue
+            local_offset = (
+                dcp_local_index(pos, dcp_size, cp_kv_cache_interleave_size) % block_size
+            )
+            slot_mapping.append(
+                block_table[pos // virtual_block_size] * block_size + local_offset
+            )
+    return slot_mapping
 
 
-# ---------------------------------------------------------------------------
-# DCP sparse index filter + round-robin localize (decode & prefill).
-# Two-pass compacting filter: count this rank's owned top-k, then pack the
-# owned slots to the front of each region (no -1 holes -- see cp_lse_ag_out_rs).
-# ---------------------------------------------------------------------------
+def dcp_local_logits_width(max_model_len: int, dcp_world_size: int) -> int:
+    """Column count of one DCP rank's local indexer logits plane.
 
-
-@triton.jit
-def _count_owned_dcp_kernel(
-    qo_indptr,  # int32 [num_requests + 1]
-    global_kv_indptr,  # int32 [num_requests + 1] -- GLOBAL context (column range)
-    token_indices_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- GLOBAL top-k positions
-    out_counts,  # int32 [num_requests] -- owned top-k count per request
-    DCP_RANK: tl.constexpr,
-    DCP_WORLD: tl.constexpr,
-    INTERLEAVE: tl.constexpr,  # cp_kv_cache_interleave_size S (1 = round-robin)
-    NUM_TOPK_TOKENS: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    ti_stride0,
-    ti_stride1,
-):
-    """Pass 1 of the compacting DCP filter: how many of the global top-k
-    positions does this rank own, per request? Its exclusive cumsum gives the
-    compacted output offsets used by ``_compact_filter_dcp_kernel``.
-
-    qlen==1 only (DCP + sparse + MTP is rejected upstream), so each request has
-    exactly one query token. Owner of global position g is rank (g//S)%W
-    (S=INTERLEAVE; S=1 -> g%W).
+    The FP4 metadata builder bakes this into a CUDAGraph-captured schedule while
+    the scorer allocates the plane, so the two have to read it off one formula.
     """
-    batch_id = tl.program_id(0)
-    token_id = tl.load(qo_indptr + batch_id)
-
-    count = 0
-    for tile_start in range(0, NUM_TOPK_TOKENS, BLOCK_N):
-        indice_id = tile_start + tl.arange(0, BLOCK_N)
-        col_valid = indice_id < NUM_TOPK_TOKENS
-        ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
-        tok = tl.load(ti_ptr, mask=col_valid, other=-1)
-        owned = col_valid & (tok >= 0) & (((tok // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
-        count += tl.sum(owned.to(tl.int32))
-
-    tl.store(out_counts + batch_id, count)
+    return -(-max_model_len // dcp_world_size)
 
 
-@triton.jit
-def _compact_filter_dcp_kernel(
-    qo_indptr,  # int32 [num_requests + 1]
-    global_kv_indptr,  # int32 [num_requests + 1] -- GLOBAL context (column range)
-    out_kv_indptr,  # int32 [num_requests + 1] -- COMPACTED offsets (cumsum of pass 1)
-    block_table,  # int32 [num_req, max_num_blocks_per_req] -- logical(global) blocks
-    token_indices_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- GLOBAL top-k positions
-    out_kv_indices,  # int32 [>= out_kv_indptr[-1]]
-    DCP_RANK: tl.constexpr,
-    DCP_WORLD: tl.constexpr,
-    INTERLEAVE: tl.constexpr,  # cp_kv_cache_interleave_size S (1 = round-robin)
-    PAGE_SIZE: tl.constexpr,  # runner (physical) block size
-    NUM_TOPK_TOKENS: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    ti_stride0,
-    ti_stride1,
-    bt_stride0: tl.int64,
-    bt_stride1: tl.constexpr,
-):
-    # DCP interleave-S: a GLOBAL position g is owned by rank ``(g // S) % W``; on
-    # the owner rank its physical slot follows the virtual-block layout used by
-    # _dcp_round_robin_slot / ATOM PR #847 (S=1 -> the original round-robin):
-    #     vbs  = PAGE_SIZE * W
-    #     vb   = g % vbs
-    #     slot = block_table[req, g // vbs] * PAGE_SIZE
-    #            + (vb // (W*S)) * S + (vb % S)
-    # token_indices holds GLOBAL positions (the indexer scored the full sequence
-    # via all-gathered logits). This rank keeps ONLY the positions it owns and
-    # writes them COMPACTED to the front of its region -- no -1 holes. Holes are
-    # exactly what breaks aiter's lse path (immediate fault on the persistent
-    # kernel, silently unwritten lse on the split-KV one).
-    #
-    # Compaction is order-preserving (tl.cumsum within a tile plus a running
-    # offset across tiles) rather than atomic-allocated like vLLM, so the KV
-    # order -- and hence the floating-point accumulation order -- is
-    # deterministic run to run, which the dcp=1 vs dcp=N comparison relies on.
-    #
-    # NOTE: the slot is computed from block_table directly (like vLLM) rather
-    # than gathered from a precomputed kv_indices -- the DCP round-robin
-    # per-token slot array does not exist on the sparse path (dense reads go
-    # through block_tables in-kernel).
-    batch_id = tl.program_id(0)
-
-    out_kv_start = tl.load(out_kv_indptr + batch_id)
-    token_id = tl.load(qo_indptr + batch_id)
-
-    vbs = PAGE_SIZE * DCP_WORLD
-    written = 0
-    for tile_start in range(0, NUM_TOPK_TOKENS, BLOCK_N):
-        indice_id = tile_start + tl.arange(0, BLOCK_N)
-        # Full top-k width; `tok >= 0` is the only valid-id guard. Must stay in
-        # lock-step with `_count_owned_dcp_kernel` (see the note there on why the
-        # old `indice_id < g_kv_len` mask is wrong) -- if the two disagree, the
-        # counted offsets and the written entries diverge.
-        col_valid = indice_id < NUM_TOPK_TOKENS
-
-        ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
-        tok = tl.load(ti_ptr, mask=col_valid, other=-1)  # GLOBAL position
-
-        idx_valid = (
-            col_valid & (tok >= 0) & (((tok // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
-        )
-
-        block_id = tok // vbs
-        vb = tok % vbs
-        inblock_offset = (vb // (DCP_WORLD * INTERLEAVE)) * INTERLEAVE + (
-            vb % INTERLEAVE
-        )
-        physical_block = tl.load(
-            block_table + batch_id * bt_stride0 + block_id * bt_stride1,
-            mask=idx_valid,
-            other=0,
-        )
-        slot = physical_block * PAGE_SIZE + inblock_offset
-
-        # Exclusive prefix sum of the owned mask -> destination inside this tile.
-        owned_i32 = idx_valid.to(tl.int32)
-        dst = written + tl.cumsum(owned_i32, axis=0) - owned_i32
-        tl.store(out_kv_indices + out_kv_start + dst, slot, mask=idx_valid)
-        written += tl.sum(owned_i32)
-
-
-def triton_filter_and_convert_dcp_index(
-    qo_indptr: torch.Tensor,  # int32 [num_requests + 1]
-    global_kv_indptr: torch.Tensor,  # int32 [num_requests + 1]
-    block_table: torch.Tensor,  # int32 [num_req, max_num_blocks_per_req] logical
-    token_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS] GLOBAL pos
+def dcp_local_context_lens(
+    attn_metadata,
     dcp_rank: int,
     dcp_world_size: int,
-    block_size: int,  # runner (physical) block size == PAGE_SIZE
-    out_kv_indptr: torch.Tensor,  # int32 [num_requests + 1] COMPACTED, written here
-    owned_counts: torch.Tensor,  # int32 [>= num_requests] scratch for pass 1
-    NUM_TOPK_TOKENS: int = 2048,
-    BLOCK_N: int = 128,
-    out: torch.Tensor | None = None,
-    cp_kv_cache_interleave_size: int = 1,
-):
-    """DCP (interleave-S) filter + localize of global top-k positions,
-    **compacting** each rank's owned slots to the front of its region.
+    cp_kv_cache_interleave_size: int,
+    num_rows: int,
+) -> torch.Tensor:
+    """This rank's LOCAL KV length for each of ``num_rows`` query tokens.
 
-    ``token_indices[token_id, indice_id]`` is a GLOBAL token position selected by
-    the indexer (scored over the full sequence via all-gathered logits). This
-    rank keeps a position ``g`` only if ``g % W == dcp_rank`` and maps it to its
-    physical slot via the round-robin (virtual-block) layout, computed directly
-    from ``block_table`` (like vLLM):
-        vbs  = block_size * W
-        slot = block_table[req, g // vbs] * block_size + (g % vbs) // W
+    Matches get_dcp_local_seq_lens / prepare_decode's slot split: each full S*W
+    super-block gives every rank S tokens, and the tail remainder is handed out
+    S at a time by rank. S=1 -> the round-robin base + (does this rank own the
+    +1 tail?) split.
 
-    Non-owned positions are **dropped**, not marked: the kept slots are packed
-    contiguously (original top-k order preserved) and ``out_kv_indptr`` is
-    rewritten to the resulting per-request lengths. This replaces the earlier
-    "fixed length + -1 sentinel" layout, whose holes broke aiter's lse output.
-    Because the kept count depends on the per-layer top-k selection,
-    ``out_kv_indptr`` is layer-dependent and must be recomputed on every call --
-    it cannot feed the once-per-step persistent metadata, which is why sparse+DCP
-    runs non-persistent for now.
-
-    The 8 ranks' kept sets are disjoint and their union is exactly the global
-    top-k, which is what makes the downstream ``cp_lse_ag_out_rs`` merge valid.
+    Depends only on context_lens / S / W / dcp_rank, so it is the same for every
+    layer and prepare_decode already computes it on the host. Prefer that
+    published buffer -- deriving it here costs 7 elementwise kernels on every
+    full-index layer (21 of them on GLM-5.2). The fallback keeps metadata
+    builders that do not publish it working.
     """
-    assert token_indices.dtype == torch.int32
-    assert token_indices.shape[1] == NUM_TOPK_TOKENS
-    assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
-        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by"
-        f"BLOCK_N ({BLOCK_N})"
+    local_ctx = get_published_dcp_local_context_lens(attn_metadata, num_rows)
+    if local_ctx is not None:
+        return local_ctx
+    g_ctx = attn_metadata.context_lens
+    if g_ctx.shape[0] != num_rows:
+        # This fallback only sees per-request lengths; per-draft windows
+        # have to come from the published buffer.
+        raise ValueError(
+            f"no published DCP local context lengths, and context_lens holds "
+            f"{g_ctx.shape[0]} rows for {num_rows} query tokens"
+        )
+    S = cp_kv_cache_interleave_size
+    W = dcp_world_size
+    full_chunks = g_ctx // (S * W)
+    base = full_chunks * S
+    remainder = (g_ctx - base * W - dcp_rank * S).clamp(0, S)
+    return (base + remainder).to(torch.int32)
+
+
+# ---------------------------------------------------------------------------
+# DCP decode candidate exchange (fused).
+#
+# The sequence this replaced reconstructed the GLOBAL top-k on every rank and
+# then handed it to the decode filter, which kept only the ~1/W of it the rank
+# owns -- W times the tokens actually needed, with (W-1)/W discarded.
+#
+# The merge emits THIS RANK'S owned physical KV slots directly, already
+# localized and compacted, plus the kv_indptr the attention needs. Two
+# consequences follow from ownership being positional -- candidate column `c`
+# came from rank `c // k_loc`:
+#
+#   * gids never travel, so the all-gather carries [rows, k_loc] scores instead
+#     of [2, rows, k_loc] score+gid -- HALF the payload;
+#   * the separate gather that re-read the selected scores out of the logits
+#     disappears, because the local top-k emits each score alongside its index.
+#
+# REQUIRES an aiter exposing `flydsl_dcp_topk_merge` and a
+# `top_k_per_row_decode` that takes `values`. There is no fallback: an older
+# aiter raises at the first decode.
+# ---------------------------------------------------------------------------
+
+
+def dcp_decode_candidate_exchange_fused(
+    attn_metadata,
+    padded_q_fp8_decode_tokens: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    dcp_rank: int,
+    num_decode_tokens: int,
+    topk_tokens: int,
+    max_model_len: int,
+    runner_block_size: int,
+    stable_topk: bool,
+    cp_kv_cache_interleave_size: int,
+    out_kv_indices: torch.Tensor,
+    out_kv_indptr: torch.Tensor,
+    owned_counts: torch.Tensor,
+    q_scale: torch.Tensor | None = None,
+    kv_scale: torch.Tensor | None = None,
+    weights_scale: float = 1.0,
+) -> None:
+    """Score the local shard, exchange scores, emit this rank's owned KV slots.
+
+    Writes ``out_kv_indices`` / ``out_kv_indptr`` / ``owned_counts`` in place and
+    leaves topk_indices untouched: the op already did the ownership filter, the
+    slot localize and the compaction, so there is nothing left to convert.
+
+    Why the local top-k suffices: fewer tokens outrank a given token locally than
+    globally, so a token in the global top-K is in its own rank's local top-K and
+    the exchanged candidates contain every global winner this rank owns. Caveat:
+    the local top-k is a score-only radix-select whose tie handling differs from
+    a gid-ordered tie-break, so when the local boundary (2048th) sits on a score
+    tie a tied token may be dropped before the exchange. Exact fp32 score ties
+    are rare, so this is a negligible boundary effect, not a systematic loss.
+
+    Only the scoring below is dtype-bound: pass `q_scale`/`kv_scale` to score the
+    shard in FP4 instead of FP8. Everything after it -- the local top-k, the
+    exchange and the merge -- reads fp32 logits and is the same either way.
+    """
+    # Imported here, not at module scope, so this module stays importable on a
+    # machine without aiter (collection of CPU-only tests, doc builds).
+    from aiter.ops.topk import flydsl_dcp_topk_merge, top_k_per_row_decode
+    from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+
+    from atom.model_ops.sparse_indexer_fp4 import FP4_MQA_BLOCK_K
+
+    dcp_world_size = get_dcp_world_size()
+    # Size everything off num_decode_tokens, the rows this rank actually
+    # scheduled -- NOT padded_q_fp8_decode_tokens.shape, which is the padded
+    # capture width. Sizing off the padded array walks rows nothing scheduled
+    # and hands attention a width it did not ask for (upstream 0b4f1ddba).
+    #
+    # Rows are query tokens, so the (batch, next_n) query is flattened here and
+    # next_n never reaches aiter: its window formula `seqLens[row // next_n] -
+    # next_n + row % next_n + 1` advances every rank's LOCAL length once per
+    # draft position, but that extra position belongs to one rank. At next_n ==
+    # 1 it degenerates to `seqLens[row]` and local_ctx carries the real windows.
+    q_rows = padded_q_fp8_decode_tokens.reshape(
+        num_decode_tokens, 1, *padded_q_fp8_decode_tokens.shape[2:]
     )
-    assert 0 <= dcp_rank < dcp_world_size
-    assert out is not None, "sparse_kv_indices_buffer (out) is required"
+    # One block-table row per query token; both aiter ops address it by row.
+    block_tables = attn_metadata.dcp_token_block_tables[:num_decode_tokens]
 
-    num_batch = global_kv_indptr.shape[0] - 1
-
-    qo_indptr_c = qo_indptr.contiguous()
-    global_kv_indptr_c = global_kv_indptr.contiguous()
-    block_table_c = block_table.contiguous()
-    token_indices_c = token_indices.contiguous()
-
-    ti_stride0, ti_stride1 = token_indices_c.stride()
-    bt_stride0, bt_stride1 = block_table_c.stride()
-    grid = (num_batch,)
-
-    # Pass 1: per-request count of owned top-k positions.
-    counts = owned_counts[:num_batch]
-    _count_owned_dcp_kernel[grid](
-        qo_indptr_c,
-        global_kv_indptr_c,
-        token_indices_c,
-        counts,
+    local_ctx = dcp_local_context_lens(
+        attn_metadata,
         dcp_rank,
         dcp_world_size,
         cp_kv_cache_interleave_size,
-        NUM_TOPK_TOKENS,
-        BLOCK_N,
-        ti_stride0,
-        ti_stride1,
+        num_decode_tokens,
+    )
+    l_max = dcp_local_logits_width(max_model_len, dcp_world_size)
+    local_logits = torch.empty(
+        [num_decode_tokens, l_max], dtype=torch.float32, device="cuda"
+    )
+    if q_scale is None:
+        deepgemm_fp8_paged_mqa_logits(
+            q_rows,
+            kv_cache,
+            weights[:num_decode_tokens],
+            local_logits,
+            local_ctx,
+            block_tables,
+            l_max,
+            KVBlockSize=runner_block_size,
+            Preshuffle=True,
+        )
+    else:
+        from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
+
+        # The schedule the metadata builder published is the one this kernel was
+        # captured with, and it is built off `local_ctx` at `l_max` -- the same
+        # two the call below scores in. Neither may be re-derived here.
+        flydsl_pa_mqa_logits_fp4(
+            q_rows,
+            q_scale[:num_decode_tokens].unsqueeze(1),
+            kv_cache,
+            kv_scale,
+            block_tables,
+            weights[:num_decode_tokens],
+            local_ctx,
+            l_max,
+            weight_scale=weights_scale,
+            next_n=1,
+            block_k=FP4_MQA_BLOCK_K,
+            kv_block_size=runner_block_size,
+            out=local_logits,
+            cta_info=attn_metadata.indexer_fp4_cta_info,
+            total_ctas=attn_metadata.indexer_fp4_n_ctas,
+        )
+
+    # k_loc is the constant `topk_tokens`, never the live local length: the
+    # exchanged size must be static for CUDAGraph. Short contexts therefore ship
+    # (-inf, -1) padding, which the merge drops without any masking here.
+    k_loc = topk_tokens
+    local_idx = torch.empty(
+        num_decode_tokens, k_loc, dtype=torch.int32, device=local_logits.device
+    )
+    send = torch.empty(
+        num_decode_tokens, k_loc, dtype=torch.float32, device=local_logits.device
+    )
+    # The merge op allocates no device scratch of its own, so the caller owns
+    # its staging buffer -- same lifetime as the three above.
+    staging = torch.empty(
+        num_decode_tokens, k_loc, dtype=torch.int32, device=local_logits.device
+    )
+    top_k_per_row_decode(
+        local_logits,
+        1,  # next_n: one row per query token, windows come from local_ctx
+        local_ctx,
+        local_idx,
+        num_decode_tokens,
+        local_logits.stride(0),
+        local_logits.stride(1),
+        k_loc,
+        stable=stable_topk,
+        values=send,
     )
 
-    # Exclusive cumsum -> compacted offsets. Written in place so the caller's
-    # tensor (and anything already holding a view of it) sees the update.
-    # dtype=int32 keeps the accumulation in int32 (torch would promote integral
-    # cumsum to int64 by default, which the kernels' int32 pointers reject).
-    # zero_() rather than `out_kv_indptr[0] = 0`: assigning a Python scalar goes
-    # through a host->device copy, which HIP rejects while a graph is capturing
-    # (hipErrorStreamCaptureUnsupported). Everything here must stay device-side.
-    out_kv_indptr[:1].zero_()
-    torch.cumsum(counts, dim=0, dtype=torch.int32, out=out_kv_indptr[1 : num_batch + 1])
+    # Half the payload of the (score, gid) exchange. Still moved as int32 so no
+    # float canonicalization can touch the bits; bitcast back is free.
+    n_cand = dcp_world_size * k_loc
+    gathered_sc = (
+        get_dcp_group()
+        .all_gather(send.view(torch.int32), dim=0)
+        .view(dcp_world_size, num_decode_tokens, k_loc)
+        .permute(1, 0, 2)
+        .reshape(num_decode_tokens, n_cand)
+    )
 
-    # Pass 2: write the owned slots packed to the front of each region.
-    _compact_filter_dcp_kernel[grid](
-        qo_indptr_c,
-        global_kv_indptr_c,
+    flydsl_dcp_topk_merge(
+        gathered_sc.view(torch.float32),
+        local_idx,
+        block_tables,
+        out_kv_indices,
         out_kv_indptr,
-        block_table_c,
-        token_indices_c,
-        out,
+        owned_counts,
+        staging,
         dcp_rank,
         dcp_world_size,
-        cp_kv_cache_interleave_size,
-        block_size,
-        NUM_TOPK_TOKENS,
-        BLOCK_N,
-        ti_stride0,
-        ti_stride1,
-        bt_stride0,
-        bt_stride1,
+        topk_tokens,
+        runner_block_size,
     )
-    return out
+
+
+# ---------------------------------------------------------------------------
+# DCP sparse index filter + round-robin localize (sparse PREFILL).
+# Two-pass compacting filter: count this rank's owned top-k, then pack the
+# owned slots to the front of each region (no -1 holes -- see cp_lse_ag_out_rs).
+#
+# Decode has no twin here any more: aiter's flydsl_dcp_topk_merge emits this
+# rank's owned slots directly, so nothing is left to filter afterwards.
+# ---------------------------------------------------------------------------
 
 
 @triton.jit
 def _count_owned_dcp_prefill_kernel(
     dsa_kv_indptr,  # int32 [num_tokens + 1] -- GLOBAL per-token candidate counts
-    token_to_seq_idxs,  # int32 [num_tokens]
+    batch_id_per_q_token,  # int32 [num_tokens]
     topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- FLAT KV indices
     cu_seqlens_k,  # int32 [num_req + 1] -- per-seq base of the flat KV axis
     out_counts,  # int32 [num_tokens]
+    out_metadata_counts,  # int32 [num_tokens], max(out_counts, 1)
     DCP_RANK: tl.constexpr,
     DCP_WORLD: tl.constexpr,
     INTERLEAVE: tl.constexpr,  # cp_kv_cache_interleave_size S (1 = round-robin)
@@ -986,8 +1342,12 @@ def _count_owned_dcp_prefill_kernel(
     is what the round-robin owner is derived from -- is `indice - cu_seqlens_k[req]`.
     """
     token_id = tl.program_id(0)
-    req_id = tl.load(token_to_seq_idxs + token_id)
-    base = tl.load(cu_seqlens_k + req_id)
+    # `-1` marks a CUDAGraph pad token (see token_layout/batch_ids.py): its row
+    # owns nothing. `valid_req` must gate the SAME way in pass 2 below, or the
+    # counts this pass writes stop describing what that pass writes.
+    req_id = tl.load(batch_id_per_q_token + token_id)
+    valid_req = req_id >= 0
+    base = tl.load(cu_seqlens_k + req_id, mask=valid_req, other=0)
 
     count = 0
     for tile_start in range(0, NUM_TOPK_TOKENS, BLOCK_N):
@@ -1000,18 +1360,22 @@ def _count_owned_dcp_prefill_kernel(
         )
         pos = indice - base  # position within the sequence
         owned = (
-            col_valid & (indice >= 0) & (((pos // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
+            col_valid
+            & valid_req
+            & (indice >= 0)
+            & (((pos // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
         )
         count += tl.sum(owned.to(tl.int32))
 
     tl.store(out_counts + token_id, count)
+    tl.store(out_metadata_counts + token_id, tl.maximum(count, 1))
 
 
 @triton.jit
 def _compact_filter_dcp_prefill_kernel(
     dsa_kv_indptr,  # int32 [num_tokens + 1] -- GLOBAL per-token candidate counts
     out_kv_indptr,  # int32 [num_tokens + 1] -- COMPACTED offsets (cumsum of pass 1)
-    token_to_seq_idxs,  # int32 [num_tokens]
+    batch_id_per_q_token,  # int32 [num_tokens]
     topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- FLAT KV indices
     cu_seqlens_k,  # int32 [num_req + 1]
     block_table,  # int32 [num_req, max_num_blocks_per_req] -- logical(global) blocks
@@ -1041,8 +1405,10 @@ def _compact_filter_dcp_prefill_kernel(
     deterministic.
     """
     token_id = tl.program_id(0)
-    req_id = tl.load(token_to_seq_idxs + token_id)
-    base = tl.load(cu_seqlens_k + req_id)
+    # Pad-token guard, in lockstep with pass 1 (see the note there).
+    req_id = tl.load(batch_id_per_q_token + token_id)
+    valid_req = req_id >= 0
+    base = tl.load(cu_seqlens_k + req_id, mask=valid_req, other=0)
     out_kv_start = tl.load(out_kv_indptr + token_id)
 
     vbs = PAGE_SIZE * DCP_WORLD
@@ -1061,7 +1427,10 @@ def _compact_filter_dcp_prefill_kernel(
         )
         pos = indice - base
         idx_valid = (
-            col_valid & (indice >= 0) & (((pos // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
+            col_valid
+            & valid_req
+            & (indice >= 0)
+            & (((pos // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
         )
 
         block_id = pos // vbs
@@ -1081,16 +1450,18 @@ def _compact_filter_dcp_prefill_kernel(
         tl.store(out_kv_indices + out_kv_start + dst, slot, mask=idx_valid)
         written += tl.sum(owned_i32)
 
-    # A row this rank owns nothing of is left EMPTY (zero-length region). That is
-    # both legal and correct for mla_decode_fwd: it writes lse = -inf, which
-    # cp_lse_ag_out_rs turns into a zero weight. Its `o` comes out NaN (0/0), so
-    # the caller zeroes those rows -- see _forward_prefill_mla. No dummy candidate
-    # is injected; the attention never sees fabricated KV.
+    # Persistent MLA's fast metadata builder does not handle zero-length rows:
+    # one empty row can leave that row and several following short rows without
+    # valid work descriptors. Reserve one slot for an empty row and point it at
+    # a valid dummy cache entry. The attention caller uses the original
+    # `owned_counts == 0` to replace this row with the exact softmax identity
+    # (O=0, LSE=-inf), so the dummy never contributes to the DCP merge.
+    tl.store(out_kv_indices + out_kv_start, 0, mask=written == 0)
 
 
 def triton_filter_and_convert_dcp_index_prefill(
     dsa_kv_indptr: torch.Tensor,  # int32 [num_tokens + 1] GLOBAL counts
-    token_to_seq_idxs: torch.Tensor,  # int32 [num_tokens]
+    batch_id_per_q_token: torch.Tensor,  # int32 [num_tokens]
     topk_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS] FLAT indices
     cu_seqlens_k: torch.Tensor,  # int32 [num_req + 1]
     block_table: torch.Tensor,  # int32 [num_req, max_num_blocks_per_req] logical
@@ -1104,12 +1475,12 @@ def triton_filter_and_convert_dcp_index_prefill(
     out: torch.Tensor | None = None,
     cp_kv_cache_interleave_size: int = 1,
 ):
-    """Sparse-PREFILL twin of ``triton_filter_and_convert_dcp_index``.
+    """Filter a sparse-PREFILL top-k down to this rank's owned KV slots.
 
-    The decode version keys on requests (qlen==1); prefill has one row per query
-    token and its ``topk_indices`` are flat KV indices rather than
-    within-sequence positions. Everything else -- two passes, in-place int32
-    cumsum, order-preserving compaction -- is identical, and the same
+    Prefill has one row per query token and its ``topk_indices`` are flat KV
+    indices rather than within-sequence positions. (The decode path no longer
+    needs this at all -- the fused merge emits owned slots directly.) Two passes,
+    in-place int32 cumsum, order-preserving compaction, and the same
     layer-scoped buffers are reused (they are sized ``max_num_batched_tokens``,
     which bounds the prefill token count too).
     """
@@ -1125,7 +1496,7 @@ def triton_filter_and_convert_dcp_index_prefill(
     num_tokens = dsa_kv_indptr.shape[0] - 1
 
     dsa_kv_indptr_c = dsa_kv_indptr.contiguous()
-    token_to_seq_idxs_c = token_to_seq_idxs.contiguous()
+    batch_id_per_q_token_c = batch_id_per_q_token.contiguous()
     topk_indices_c = topk_indices.contiguous()
     cu_seqlens_k_c = cu_seqlens_k.contiguous()
     block_table_c = block_table.contiguous()
@@ -1135,12 +1506,14 @@ def triton_filter_and_convert_dcp_index_prefill(
     grid = (num_tokens,)
 
     counts = owned_counts[:num_tokens]
+    metadata_counts = out_kv_indptr[1 : num_tokens + 1]
     _count_owned_dcp_prefill_kernel[grid](
         dsa_kv_indptr_c,
-        token_to_seq_idxs_c,
+        batch_id_per_q_token_c,
         topk_indices_c,
         cu_seqlens_k_c,
         counts,
+        metadata_counts,
         dcp_rank,
         dcp_world_size,
         cp_kv_cache_interleave_size,
@@ -1150,17 +1523,21 @@ def triton_filter_and_convert_dcp_index_prefill(
         ti_stride1,
     )
 
-    # Same device-side-only cumsum as the decode path (see its comment for why
-    # zero_() and dtype=torch.int32 are required).
+    # The count kernel already wrote max(count, 1) into the destination tail,
+    # so this per-full-layer path needs neither an allocation nor another
+    # pointwise operator. Exact input/output overlap is supported by cumsum.
     out_kv_indptr[:1].zero_()
     torch.cumsum(
-        counts, dim=0, dtype=torch.int32, out=out_kv_indptr[1 : num_tokens + 1]
+        metadata_counts,
+        dim=0,
+        dtype=torch.int32,
+        out=metadata_counts,
     )
 
     _compact_filter_dcp_prefill_kernel[grid](
         dsa_kv_indptr_c,
         out_kv_indptr,
-        token_to_seq_idxs_c,
+        batch_id_per_q_token_c,
         topk_indices_c,
         cu_seqlens_k_c,
         block_table_c,

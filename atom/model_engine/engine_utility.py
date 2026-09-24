@@ -6,6 +6,7 @@ import queue
 from typing import ClassVar
 
 from atom.model_engine.sequence import SequenceStatus
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -217,16 +218,19 @@ class EngineUtilityHandler:
         )
 
     def _handle_abort_request(self, args: dict):
-        """Mark a sequence ABORTED (client disconnected) so the scheduler finishes
-        it at the next step via the normal stop path (frees KV, drops it)."""
+        """Cancel queued work promptly; running forwards finish via postprocess."""
         req_id = args.get("req_id") if isinstance(args, dict) else None
         if req_id is None or self.scheduler is None:
             return
-        found = False
-        for seq in list(self.scheduler.running) + list(self.scheduler.waiting):
-            if seq.id == req_id:
-                seq.status = SequenceStatus.ABORTED
-                found = True
+        abort = getattr(self.scheduler, "abort_request", None)
+        if callable(abort):
+            found = abort(req_id)
+        else:
+            found = False
+            for seq in list(self.scheduler.running) + list(self.scheduler.waiting):
+                if seq.id == req_id:
+                    seq.status = SequenceStatus.ABORTED
+                    found = True
         logger.info(f"{self.label}: abort_request req_id={req_id} found={found}")
 
     def _handle_configure_hidden_states(self, args: dict):
@@ -275,8 +279,9 @@ class EngineUtilityHandler:
 
     def _handle_get_mtp_stats(self, args: dict):
         """Print MTP statistics to log (fire-and-forget)."""
-        if self.scheduler is not None and self.scheduler.spec_stats is not None:
-            self.scheduler.spec_stats._log()
+        stats = None if self.scheduler is None else self.scheduler.engine_stats
+        if stats is not None and stats.spec_enabled:
+            stats.log_spec()
         else:
             logger.info(
                 "\n[MTP Stats] No MTP statistics available "
@@ -285,10 +290,11 @@ class EngineUtilityHandler:
 
     def _handle_get_mtp_statistics(self, args: dict):
         """Return structured MTP statistics via UTILITY_RESPONSE."""
-        if self.scheduler is None or self.scheduler.spec_stats is None:
+        stats = None if self.scheduler is None else self.scheduler.engine_stats
+        if stats is None or not stats.spec_enabled:
             result = {"enabled": False}
         else:
-            result = self.scheduler.spec_stats.get_statistics()
+            result = stats.spec_statistics()
             result["enabled"] = True
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "get_mtp_statistics", "result": result})
@@ -306,20 +312,20 @@ class EngineUtilityHandler:
         handful of requests cannot wait for that interval, and reading it out
         of a log is not something a client can do at all.
         """
-        stats = None if self.scheduler is None else self.scheduler.cache_stats
-        if stats is None:
+        stats = None if self.scheduler is None else self.scheduler.engine_stats
+        if stats is None or not stats.cache_enabled:
             result = {"enabled": False}
         else:
-            result = stats.get_statistics()
+            result = stats.cache_statistics()
             result["enabled"] = True
-            # `CacheStats` counts the reuse a request wanted and did not
+            # The cache section counts the reuse a request wanted and did not
             # get; the funnel is where it was lost.
             result |= self.scheduler.block_manager.checkpoint_funnel()
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "get_cache_statistics", "result": result})
         )
 
-    def push_metrics(self) -> None:
+    def push_metrics(self, *, scheduler_metrics: bool = True) -> None:
         """Publish this rank's metrics snapshot on the output socket.
 
         Pushed on the engine's own clock rather than answered on demand. The
@@ -331,7 +337,12 @@ class EngineUtilityHandler:
         caller to mistake for its own. Pushing removes the deadline, and with it
         the last off-loop writer on the control socket.
         """
-        self.output_queue.put_nowait(("METRICS", self.collect_metrics()))
+        # Poll ready device events even after the final forward. Workers write
+        # native metrics directly; this RPC has no response payload.
+        if envs.ATOM_ENABLE_METRICS_DEVICE_TIMER and self.runner_mgr is not None:
+            self.runner_mgr.call_func("poll_forward_metrics")
+        if scheduler_metrics:
+            self.output_queue.put_nowait(("METRICS", self.collect_metrics()))
 
     def collect_metrics(self) -> dict:
         """One rank's scheduler, KV, MTP, and cache metrics."""
@@ -339,22 +350,27 @@ class EngineUtilityHandler:
             result = {"enabled": False}
         else:
             running, waiting = self.scheduler.get_request_counts()
-            kv_pool = self.scheduler.block_manager.kv
+            # None on the P/D prefill side, which owns no blocks — the decode
+            # process does. Its snapshot then carries no kv_blocks_* keys at
+            # all rather than a fabricated empty pool; the aggregator sums with
+            # `.get(key, 0)`, so the decode rank's real figures come through
+            # unchanged.
+            block_manager = getattr(self.scheduler, "block_manager", None)
+            kv_pool = None if block_manager is None else block_manager.kv
             kv_connector = getattr(self.scheduler, "kv_connector", None)
 
-            spec_stats = self.scheduler.spec_stats
-            if spec_stats is None:
+            engine_stats = self.scheduler.engine_stats
+            if not engine_stats.spec_enabled:
                 mtp = {"enabled": False}
             else:
-                mtp = {"enabled": True, **spec_stats.get_statistics()}
+                mtp = {"enabled": True, **engine_stats.spec_statistics()}
 
-            cache_stats = self.scheduler.cache_stats
-            if cache_stats is None:
+            if not engine_stats.cache_enabled:
                 cache = {"enabled": False}
             else:
                 cache = {
                     "enabled": True,
-                    **cache_stats.get_statistics(),
+                    **engine_stats.cache_statistics(),
                     **self.scheduler.block_manager.checkpoint_funnel(),
                 }
 
@@ -365,6 +381,9 @@ class EngineUtilityHandler:
             )
             result = {
                 "enabled": True,
+                # "prefill" / "decode" / "" — lets the aggregator recognise a
+                # P/D pair, where one request is held by both ranks at once.
+                "role": getattr(self.scheduler, "_METRICS_ROLE", ""),
                 "requests_running": running,
                 "requests_waiting": waiting,
                 "requests_parked_kv_load": int(
@@ -381,13 +400,34 @@ class EngineUtilityHandler:
                     getattr(self.scheduler, "total_generation_tokens", 0)
                 ),
                 "preemptions": int(getattr(self.scheduler, "total_preemptions", 0)),
-                "kv_blocks_used": kv_pool.num_used,
-                "kv_blocks_free": kv_pool.num_free,
-                "kv_blocks_total": kv_pool.num_blocks,
-                "kv_blocks_indexed": kv_pool.num_indexed,
                 "mtp": mtp,
                 "cache": cache,
                 "offload": offload,
             }
+            if kv_pool is not None:
+                reusable = kv_pool.num_reusable_free
+                result |= {
+                    "kv_blocks_used": kv_pool.num_used,
+                    "kv_blocks_free": kv_pool.num_free,
+                    "kv_blocks_total": kv_pool.num_blocks,
+                    "kv_blocks_indexed": kv_pool.num_indexed,
+                    "kv_blocks_evictable": reusable,
+                    "kv_blocks_vacant": kv_pool.num_free - reusable,
+                }
+
+            metrics = getattr(self.scheduler, "metrics", None)
+            if metrics is not None:
+                parked = sum(
+                    seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+                    for seq in self.scheduler.waiting
+                )
+                # Shared-cache disaggregation has a separate prefill queue,
+                # whereas connector-based PD parks requests in `waiting`.
+                external = parked + len(getattr(self.scheduler, "prefill_waiting", ()))
+                result["scheduler_metrics"] = {
+                    "running": running,
+                    "waiting": max(0, waiting - external),
+                    "waiting_kv": external,
+                }
 
         return result

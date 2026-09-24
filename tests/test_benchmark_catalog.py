@@ -246,3 +246,414 @@ def test_build_cell_configs_one_config_per_server_key():
         for c in configs
     ]
     assert len(keys) == len(set(keys))
+
+
+def _workflow():
+    yaml = pytest.importorskip("yaml")
+    return yaml.safe_load(WORKFLOW.read_text())
+
+
+def test_cadence_splits_the_nightly_without_losing_cells():
+    """The two crons must partition the catalog: every cell runs on exactly one.
+
+    The point of the split is a shorter nightly, so a cell silently belonging to
+    neither cadence would stop being benchmarked at all and nothing would say so.
+    """
+    everything = catalog.build_cells(CATALOG)
+    nightly = catalog.build_cells(CATALOG, cadence="nightly")
+    weekly = catalog.build_cells(CATALOG, cadence="weekly")
+
+    assert nightly and weekly, "both cadences must produce cells"
+    assert len(nightly) + len(weekly) == len(everything)
+
+    def keys(cells):
+        return {
+            (c["prefix"], c["suffix"], c["isl"], c["osl"], c["conc"]) for c in cells
+        }
+
+    assert keys(nightly) | keys(weekly) == keys(everything)
+    assert not (keys(nightly) & keys(weekly)), "a cell runs on one cadence only"
+
+
+def test_nightly_dropped_1k1k_and_weekly_is_exactly_that():
+    """The split as configured: 1k/1k moved off the nightly, nothing else did."""
+    nightly = {
+        (c["isl"], c["osl"]) for c in catalog.build_cells(CATALOG, cadence="nightly")
+    }
+    weekly = {
+        (c["isl"], c["osl"]) for c in catalog.build_cells(CATALOG, cadence="weekly")
+    }
+
+    assert (1024, 1024) not in nightly
+    assert weekly == {(1024, 1024)}
+
+
+def test_untagged_scenarios_stay_nightly():
+    """Adding a scenario must not need a `cadence` field to keep working.
+
+    A model's or variant's own `scenarios` override the defaults, and none of
+    them carries a tag today -- they have to land on the nightly, not vanish.
+    """
+    cat = catalog._load_catalog(CATALOG)
+    tagged = {
+        sc.get("cadence", catalog.DEFAULT_CADENCE) for sc in cat["default_scenarios"]
+    }
+    assert catalog.DEFAULT_CADENCE in tagged, "the default must remain reachable"
+
+    overrides = [
+        m["prefix"]
+        for m in cat["models"]
+        if m.get("scenarios") or any(v.get("scenarios") for v in m.get("variants", []))
+    ]
+    nightly = {c["prefix"] for c in catalog.build_cells(CATALOG, cadence="nightly")}
+    for prefix in overrides:
+        assert prefix in nightly, f"{prefix} overrides scenarios but runs on no cron"
+
+
+def test_every_cron_produces_cells():
+    """Each cadence the workflow can ask for must resolve to a real grid.
+
+    `build_benchmark_matrix` fails the run on an empty schedule matrix, so a
+    typo'd tag would take the whole nightly down -- catch it here instead.
+    """
+    on = _workflow().get("on", _workflow().get(True))
+    crons = [c["cron"] for c in on["schedule"]]
+    assert len(crons) == 2, "expected a nightly and a weekly cron"
+
+    for cadence in ("nightly", "weekly"):
+        assert catalog.build_cells(CATALOG, cadence=cadence), cadence
+
+
+def test_weekly_cron_matches_the_cadence_expressions():
+    """The weekly cron string is repeated in `run-name` and `env.CADENCE`.
+
+    If they drift, a weekly run is titled `nightly`, and the baseline lookup --
+    which matches on that title -- hands the next nightly a 1k/1k-only run to
+    compare against. Every cell then reports no baseline, and nothing errors.
+    """
+    wf = _workflow()
+    on = wf.get("on", wf.get(True))
+    crons = [c["cron"] for c in on["schedule"]]
+    weekly_crons = [c for c in crons if c.strip().endswith("0")]
+    assert len(weekly_crons) == 1, f"expected one weekly cron, got {weekly_crons}"
+    weekly = weekly_crons[0]
+
+    for field, text in (
+        ("run-name", wf["run-name"]),
+        ("env.CADENCE", wf["env"]["CADENCE"]),
+    ):
+        assert weekly in text, f"{field} does not reference the weekly cron {weekly!r}"
+        assert "weekly" in text and "nightly" in text, field
+
+
+def test_agentic_dispatch_overrides_keep_the_server_recipe():
+    import json
+
+    from build_agentic_benchmark_matrix import build_configs
+
+    defaults = build_configs()
+    selected = build_configs(
+        inputs={
+            "models": "deepseek-v41-flash",
+            "concurrency": "4,8",
+            "duration_seconds": 1200,
+        }
+    )
+    assert len(defaults) == len(selected) == 1
+    assert selected[0]["server_args"] == defaults[0]["server_args"]
+    assert selected[0]["bench_kind"] == "aiperf_agentic"
+    assert json.loads(selected[0]["concurrency"]) == [4, 8]
+    env = dict(line.split("=", 1) for line in selected[0]["env_vars"].splitlines())
+    assert env["AIPERF_BENCHMARK_DURATION"] == "1200"
+    assert env["ATOM_BUNDLE_REQUIRE_FULL"] == "1"
+
+
+@pytest.mark.parametrize(
+    "inputs",
+    [
+        {"models": "unknown-model"},
+        {"concurrency": "0,4"},
+        {"concurrency": "2,2"},
+        {"concurrency": "2,,4"},
+        {"concurrency": "9999"},
+        {"duration_seconds": 899},
+        {"duration_seconds": 3601},
+        {"duration_seconds": 900.5},
+        {"duration_seconds": True},
+    ],
+)
+def test_agentic_bad_inputs_fail_before_allocating_gpu_jobs(inputs):
+    from build_agentic_benchmark_matrix import build_configs
+
+    with pytest.raises(ValueError):
+        build_configs(inputs=inputs)
+
+
+def test_agentic_schedule_uses_catalog_defaults(tmp_path, monkeypatch):
+    import json
+
+    from build_agentic_benchmark_matrix import build_configs, main
+
+    monkeypatch.setattr(
+        "build_agentic_benchmark_matrix.resolve_run_image",
+        lambda image: {"requested": image, "pinned": image, "display": image},
+    )
+
+    output = tmp_path / "github-output"
+    monkeypatch.setenv("EVENT_NAME", "schedule")
+    monkeypatch.setenv("INPUTS_JSON", '{"models":"unknown","duration_seconds":1}')
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    assert main() == 0
+    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert values["has_cells"] == "true"
+    expected = build_configs(inputs={"profile": "nightly"})
+    for config in expected:
+        config["image_display"] = config["image"]
+    assert json.loads(values["configs_json"]) == expected
+
+
+def test_agentic_gpu_workflow_only_runs_manually_or_on_schedule():
+    yaml = pytest.importorskip("yaml")
+    workflow = yaml.safe_load(
+        (REPO / ".github/workflows/atom-agentic-benchmark.yaml").read_text()
+    )
+    triggers = workflow.get("on", workflow.get(True))
+    assert set(triggers) == {"workflow_dispatch", "schedule"}
+    assert workflow["jobs"]["benchmark"]["uses"] == (
+        "./.github/workflows/benchmark-tmpl.yml"
+    )
+
+
+def test_agentic_nightly_grid_and_shared_capture_recipe():
+    import json
+    import shlex
+
+    from build_agentic_benchmark_matrix import build_configs
+
+    points = set()
+    for config in build_configs(inputs={"profile": "nightly"}):
+        args = shlex.split(config["server_args"])
+        tp = int(args[args.index("-tp") + 1])
+        captures = json.loads(args[args.index("--cudagraph-capture-sizes") + 1])
+        env = dict(line.split("=", 1) for line in config["env_vars"].splitlines())
+        assert config["image"] == "rocm/atom-dev:latest"
+        assert env["HIP_VISIBLE_DEVICES"] == ",".join(str(i) for i in range(tp))
+        assert env["AIPERF_BENCHMARK_DURATION"] == "3600"
+        assert env["AIPERF_WARMUP_REQUESTS_PER_LANE"] == "5"
+        assert env["ATOM_DSV41_BENCHMARK_SYNTHETIC"] == "1"
+        assert "AIPERF_MAX_CONTEXT_LENGTH" not in env
+        for flag, value in {
+            "--spec-decode-acceptance-length": "3.51",
+            "--num-speculative-tokens": "5",
+            "--gpu-memory-utilization": "0.95",
+            "--max-num-batched-tokens": "16384",
+            "--attn-prefill-chunk-size": "16384",
+            "--state-checkpoint-interval-tokens": "8192",
+            "--cudagraph-mode": "FULL",
+            "--level": "3",
+            "--tool-call-parser": "dsml_v41",
+        }.items():
+            assert args[args.index(flag) + 1] == value
+        assert "--enforce-eager" not in args
+        assert "--max-num-seqs" not in args
+        assert captures == list(range(1, 33)) + [48, 64, 96, 128, 160, 192, 224, 256]
+        for conc in json.loads(config["concurrency"]):
+            assert (tp, conc) not in points
+            points.add((tp, conc))
+    assert points == {(2, c) for c in [1, 2, 4, 8, 16, 32, 64, 128]} | {
+        (4, c) for c in [1, 4, 8]
+    }
+
+
+def test_agentic_nightly_subset_keeps_each_tp_grid():
+    import json
+
+    from build_agentic_benchmark_matrix import build_configs
+
+    configs = build_configs(inputs={"profile": "nightly", "concurrency": "32"})
+    assert len(configs) == 1
+    assert "-tp 2" in configs[0]["server_args"]
+    assert all(json.loads(config["concurrency"]) == [32] for config in configs)
+    configs = build_configs(inputs={"profile": "nightly", "concurrency": "1,4,8"})
+    assert len(configs) == 2
+    assert all(json.loads(config["concurrency"]) == [1, 4, 8] for config in configs)
+    with pytest.raises(ValueError, match="subset"):
+        build_configs(inputs={"profile": "nightly", "concurrency": "256"})
+
+
+def test_agentic_manual_default_stays_a_two_point_test():
+    import json
+    import shlex
+
+    from build_agentic_benchmark_matrix import build_configs
+
+    (config,) = build_configs()
+    assert json.loads(config["concurrency"]) == [2, 4]
+    assert "-tp 4" in config["server_args"]
+    assert "--cudagraph-mode FULL" in config["server_args"]
+    assert "AIPERF_BENCHMARK_DURATION=900" in config["env_vars"]
+    assert config["image"] == "rocm/atom-dev:latest"
+    args = shlex.split(config["server_args"])
+    assert args[args.index("--gpu-memory-utilization") + 1] == "0.95"
+    assert "--max-num-seqs" not in args
+    assert json.loads(args[args.index("--cudagraph-capture-sizes") + 1]) == (
+        list(range(1, 33)) + [48, 64, 96, 128, 160, 192, 224, 256]
+    )
+
+
+@pytest.mark.parametrize("profile", ["test", "nightly"])
+def test_agentic_matrix_has_no_random_dimensions(profile):
+    from build_agentic_benchmark_matrix import build_configs
+
+    unused = {"scenario", "scenarios", "isl", "osl", "ratio", "ratio_str", "bench_args"}
+    for config in build_configs(inputs={"profile": profile}):
+        assert not unused.intersection(config)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("scenarios", []), ("bench_args", "--ignored"), ("conc_max", 1)],
+)
+def test_agentic_rejects_unused_variant_fields(tmp_path, field, value):
+    import json
+
+    from build_agentic_benchmark_matrix import CATALOG, build_configs
+
+    data = json.loads((REPO / CATALOG).read_text())
+    data["models"][0]["variants"][0][field] = value
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="Unsupported variant fields"):
+        build_configs(path=path)
+
+
+@pytest.mark.parametrize("values", [[], [True], [0, 4], [4, 4], [1, 9999]])
+def test_agentic_rejects_invalid_catalog_concurrency(tmp_path, values):
+    import json
+
+    from build_agentic_benchmark_matrix import CATALOG, build_configs
+
+    data = json.loads((REPO / CATALOG).read_text())
+    data["models"][0]["variants"][0]["concurrency"] = values
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="Concurrency"):
+        build_configs(path=path)
+
+
+def test_agentic_rejects_colliding_artifact_names(tmp_path):
+    import json
+
+    from build_agentic_benchmark_matrix import CATALOG, build_configs
+
+    data = json.loads((REPO / CATALOG).read_text())
+    variant = data["models"][0]["variants"][0]
+    data["models"][0]["variants"].append({**variant, "extra_args": "-tp 2"})
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="Duplicate agentic artifact prefix"):
+        build_configs(path=path)
+
+
+@pytest.mark.parametrize("profile", ["test", "nightly"])
+def test_agentic_dispatch_replay_preserves_profile(tmp_path, monkeypatch, profile):
+    import json
+
+    from build_agentic_benchmark_matrix import build_configs, main
+
+    pinned = "rocm/atom-dev:latest@sha256:" + "a" * 64
+    calls = []
+
+    def resolve(image):
+        calls.append(image)
+        return {
+            "requested": image,
+            "pinned": pinned,
+            "display": "rocm/atom-dev:nightly_test",
+        }
+
+    monkeypatch.setattr("build_agentic_benchmark_matrix.resolve_run_image", resolve)
+
+    output = tmp_path / "github-output"
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("INPUTS_JSON", json.dumps({"profile": profile, "dry_run": True}))
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    monkeypatch.setenv(
+        "GITHUB_WORKFLOW_REF",
+        "ROCm/ATOM/.github/workflows/atom-agentic-benchmark.yaml@refs/heads/test",
+    )
+    monkeypatch.setenv("AGENTIC_RUN_CONFIG_DIR", str(config_dir))
+    assert main() == 0
+    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    expected = build_configs(inputs={"profile": profile})
+    for config in expected:
+        config.update(image=pinned, image_display="rocm/atom-dev:nightly_test")
+    assert json.loads(values["configs_json"]) == expected
+    assert calls == ["rocm/atom-dev:latest"]
+    dispatch = json.loads((config_dir / "dispatch-inputs.json").read_text())
+    assert dispatch["profile"] == profile
+    assert dispatch["dry_run"] == "true"
+    assert all(isinstance(value, str) for value in dispatch.values())
+    assert dispatch["atom_commit"]
+    assert dispatch["image"] == pinned
+    assert "atom-agentic-benchmark.yaml" in (config_dir / "README.md").read_text()
+
+
+def test_agentic_latest_resolves_to_digest_not_mutable_nightly_tag(monkeypatch):
+    from build_agentic_benchmark_matrix import resolve_run_image
+
+    monkeypatch.setattr(
+        "resolve_atom_image.resolve_image",
+        lambda *args: {
+            "reference_digest": "sha256:" + "a" * 64,
+            "resolved_image": "rocm/atom-dev:nightly_test",
+        },
+    )
+    resolved = resolve_run_image("rocm/atom-dev:latest")
+    assert resolved["pinned"] == "rocm/atom-dev:latest@sha256:" + "a" * 64
+    # A replay with a digest must not consult the registry again.
+    monkeypatch.setattr(
+        "resolve_atom_image.resolve_image",
+        lambda *args: pytest.fail("registry lookup during pinned replay"),
+    )
+    assert resolve_run_image(resolved["pinned"])["pinned"] == resolved["pinned"]
+
+
+def test_agentic_image_resolution_failure_emits_no_matrix(tmp_path, monkeypatch):
+    from build_agentic_benchmark_matrix import main
+
+    def fail(image):
+        raise RuntimeError("registry unavailable")
+
+    monkeypatch.setattr("build_agentic_benchmark_matrix.resolve_run_image", fail)
+    monkeypatch.setenv("EVENT_NAME", "schedule")
+    output = tmp_path / "output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    assert main() == 1
+    assert not output.exists()
+
+
+def test_agentic_custom_image_digest_resolution(monkeypatch):
+    from build_agentic_benchmark_matrix import resolve_run_image
+
+    digest = "sha256:" + "b" * 64
+
+    def inspect(command, **kwargs):
+        assert command == [
+            "docker",
+            "buildx",
+            "imagetools",
+            "inspect",
+            "example.org/atom:test",
+        ]
+        assert kwargs["timeout"] == 90
+        return f"Name: example.org/atom:test\nDigest: {digest}\n"
+
+    monkeypatch.setattr(
+        "build_agentic_benchmark_matrix.subprocess.check_output", inspect
+    )
+    assert (
+        resolve_run_image("example.org/atom:test")["pinned"]
+        == f"example.org/atom:test@{digest}"
+    )

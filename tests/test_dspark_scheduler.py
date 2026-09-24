@@ -14,8 +14,8 @@ from atom.spec_decode.dspark_scheduler import (
     build_sps_table,
     calibrate_confidence,
     expected_throughput,
-    flat_bucket_fits,
     ragged_verify_len,
+    ragged_verify_lens,
     schedule_prefix_lengths,
     survival_probabilities,
 )
@@ -765,60 +765,56 @@ def test_nonpositive_scheduled_len_imposes_no_bound():
 
 def test_both_bounds_hold_across_the_grid():
     for ell in (None, -1, 0, 1, 3, 5, 50):
-        for max_nb in (0, 1, 4):
+        for nb in (0, 1, 4):
             for sched in (1, 2, 3, FULL_Q):
-                li = ragged_verify_len(ell, FULL_Q, max_nb, sched)
+                li = ragged_verify_len(ell, FULL_Q, nb, sched)
                 if li is None:
-                    assert sched < max_nb + 1, (ell, max_nb, sched)
+                    assert sched < nb + 1, (ell, nb, sched)
                     continue
-                assert max_nb + 1 <= li <= FULL_Q, (ell, max_nb, sched, li)
-                assert li <= sched, (ell, max_nb, sched, li)
+                assert nb + 1 <= li <= FULL_Q, (ell, nb, sched, li)
+                assert li <= sched, (ell, nb, sched, li)
 
 
 # ---------------------------------------------------------------------------
-# The ragged shrink is only safe if the REPLAY can follow it down.
+# The batch-level rule. These are about `ragged_verify_lens` refusing to let one
+# request's bonus count set another's floor -- the failure that kept this whole
+# path inert, since the summary a caller reaches for is a batch MAXIMUM and one
+# request accepts every draft on nearly every step at real concurrency.
+# ---------------------------------------------------------------------------
 
 
-def test_full_cudagraphs_cannot_represent_a_ragged_shrink():
-    """No captured flat bucket set -> no representable shrink.
+def test_each_request_answers_to_its_own_bonus_count():
+    """Two requests, bonuses 2 and 5: 3 + 6 = 9 tokens forwarded, not 6 + 6.
 
-    This is the configuration that trapped: under FULL (non-PIECEWISE)
-    cudagraphs nothing flat is captured, `_dynamic_num_tokens_pad` returns None,
-    every caller falls back to `bs * max_seqlen_q`, and the replay runs over
-    more tokens than the rebuild populated. The tail holds the previous step's
-    ids, which the draft's Markov lookup then indexes out of range.
+    Under the batch max both floors become 6 == FULL_Q, i.e. no shrink at all.
+    `ells` are stale/absent here so the bonus floor is what decides -- exactly
+    the state a mid-stream decode step is in.
     """
-    assert flat_bucket_fits(3, 6, []) is False
-    assert flat_bucket_fits(3, 6, None) is False
+    lens = ragged_verify_lens([2, 5], FULL_Q, np.array([2, 5]), np.array([6, 6]))
+    assert lens.tolist() == [3, 6]
+    assert int(lens.sum()) == 9
+
+    # The defect, stated as its own case so the two are read side by side.
+    flattened = ragged_verify_lens([2, 5], FULL_Q, np.array([5, 5]), np.array([6, 6]))
+    assert flattened.tolist() == [FULL_Q, FULL_Q]
 
 
-def test_bucket_must_cover_the_total_and_divide_by_q():
-    buckets = [6, 12, 24]
-    # 3 real tokens at q=6 -> bucket 6 holds them and 6 % 6 == 0.
-    assert flat_bucket_fits(3, 6, buckets) is True
-    assert flat_bucket_fits(6, 6, buckets) is True
-    # Bigger than every captured bucket -> nothing can hold it.
-    assert flat_bucket_fits(25, 6, buckets) is False
-    # Covers the total but is not q-divisible -> the per-seq rows would not tile.
-    assert flat_bucket_fits(3, 6, [10]) is False
-    # Degenerate q never matches (guards the b % q modulo).
-    assert flat_bucket_fits(3, 0, buckets) is False
+def test_one_saturated_request_does_not_pin_the_rest():
+    """The concurrency shape that made this inert: 63 short requests beside one
+    that accepted everything. Only the last should be at full length."""
+    bs = 64
+    nb = np.zeros(bs, dtype=np.int32)
+    nb[-1] = FULL_Q - 1  # accepted every draft
+    lens = ragged_verify_lens([1] * bs, FULL_Q, nb, np.full(bs, FULL_Q, dtype=np.int32))
+    assert lens[:-1].tolist() == [2] * (bs - 1)
+    assert int(lens[-1]) == FULL_Q
+    # Under the batch max this sum is bs * FULL_Q and nothing ever shrinks.
+    assert int(lens.sum()) < bs * FULL_Q
 
 
-def test_predicate_agrees_with_dynamic_num_tokens_pad():
-    """Must stay in step with the lookup it mirrors: yes exactly when that
-    lookup finds a bucket, no exactly when it returns the None that triggers the
-    unsafe `bs * max_seqlen_q` fallback."""
-    buckets = [6, 12, 24]
-
-    def pad_lookup(total, q):
-        for b in buckets:
-            if b >= total and q > 0 and b % q == 0:
-                return b
-        return None
-
-    for total in (0, 1, 3, 6, 7, 12, 25):
-        for q in (0, 1, 3, 6):
-            assert flat_bucket_fits(total, q, buckets) is (
-                pad_lookup(total, q) is not None
-            ), (total, q)
+def test_one_unrepresentable_request_aborts_the_batch():
+    """The layout is chosen once per step, so a single crossing pair has to take
+    the whole batch back to rectangular rather than leaving one seq mis-sized."""
+    assert (
+        ragged_verify_lens([1, 1], FULL_Q, np.array([0, 3]), np.array([6, 2])) is None
+    )

@@ -19,7 +19,7 @@ DRY_RUN=0
 JOB_ID=""
 SLURM_JOB_ACTIVE=0
 SCANCEL_SENT=0
-declare -A SPUR_SHARED_LOG_LINES=()
+declare -A SPUR_SHARED_LOG_OFFSETS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -70,9 +70,23 @@ service = cell.get("service", {})
 prefill = service.get("prefill", {})
 decode = service.get("decode", {})
 router = service.get("router", {})
-server_args = cell.get("server_args", {})
 benchmark = cell.get("benchmark", {})
 accuracy = cell.get("accuracy", {})
+
+
+class TrackedArgs(dict):
+    """Remembers which keys the export mapping below actually reads."""
+
+    def __init__(self, data):
+        super().__init__(data)
+        self.seen = set()
+
+    def get(self, key, default=None):
+        self.seen.add(key)
+        return super().get(key, default)
+
+
+server_args = TrackedArgs(cell.get("server_args", {}))
 
 def shell_value(value):
     if isinstance(value, (list, dict)):
@@ -92,22 +106,19 @@ def q(value):
     return shlex.quote(str(shell_value(value)))
 
 slurm_submit_runner = runner.get("slurm_submit_runner", "atomesh-cicd")
+is_crusoe_v2 = slurm_submit_runner == "atomesh-cicd-mi355-crusoe"
 spur_controller_addr = runner.get("spur_controller_addr")
-crusoe_runner_labels = {
-    "atomesh-cicd-crusoe-mi355",
-    "atomesh-cicd-mi355-crusoe",
-}
-if slurm_submit_runner in crusoe_runner_labels:
-    default_spur_accounting_addr = "http://crs-m2m-cpu-spur-005.crusoe.amd.com:6819"
-else:
-    default_spur_accounting_addr = "http://134.199.196.72:6819"
-if not spur_controller_addr:
-    if slurm_submit_runner in crusoe_runner_labels:
-        spur_controller_addr = "http://crs-m2m-cpu-spur-005.crusoe.amd.com:6817"
-    else:
-        spur_controller_addr = os.environ.get(
-            "SPUR_CONTROLLER_ADDR", "http://134.199.196.72:6817"
-        )
+spur_accounting_addr = os.environ.get("SPUR_ACCOUNTING_ADDR", "")
+if is_crusoe_v2:
+    spur_controller_addr = "http://crs-m2m-cpu-spur-v2-001.crusoe.amd.com:6817"
+    spur_accounting_addr = os.environ.get("SPUR_V2_ACCOUNTING_ADDR") or (
+        "http://crs-m2m-cpu-spur-v2-001.crusoe.amd.com:6819"
+    )
+elif not spur_controller_addr:
+    spur_controller_addr = os.environ.get("SPUR_CONTROLLER_ADDR") or (
+        "http://134.199.196.72:6817"
+        if slurm_submit_runner == "atomesh-cicd-mi350" else ""
+    )
 
 exports = {
     "ATOMESH_CELL_ID": cell["id"],
@@ -134,6 +145,9 @@ exports = {
     "AIPERF_COMMIT": benchmark.get("aiperf_commit", ""),
     "AIPERF_SCENARIO": benchmark.get("scenario", ""),
     "AIPERF_PUBLIC_DATASET": benchmark.get("public_dataset", ""),
+    "AIPERF_APPLY_CHAT_TEMPLATE": str(
+        benchmark.get("apply_chat_template", False)
+    ).lower(),
     "AIPERF_MAX_CONTEXT_LENGTH": benchmark.get("max_context_length", ""),
     "AIPERF_NUM_DATASET_ENTRIES": benchmark.get("num_dataset_entries", ""),
     "AIPERF_BENCHMARK_DURATION": benchmark.get("benchmark_duration", ""),
@@ -172,10 +186,18 @@ exports = {
     "DECODE_WORKERS": decode.get("workers", 1),
     "PREFILL_TP": prefill.get("tp", 8),
     "DECODE_TP": decode.get("tp", 8),
+    "PREFILL_DCP_SIZE": prefill.get("dcp", 1),
+    "DECODE_DCP_SIZE": decode.get("dcp", 1),
     "PREFILL_ENABLE_DP": str(prefill.get("enable_dp_attention", False)).lower(),
     "DECODE_ENABLE_DP": str(decode.get("enable_dp_attention", False)).lower(),
     "PREFILL_CUDAGRAPH": prefill.get("cudagraph", ""),
     "DECODE_CUDAGRAPH": decode.get("cudagraph", ""),
+    "PREFILL_CUDAGRAPH_MODE": prefill.get("cudagraph_mode", ""),
+    "DECODE_CUDAGRAPH_MODE": decode.get("cudagraph_mode", ""),
+    "PREFILL_COMPILATION_LEVEL": prefill.get("compilation_level", ""),
+    "DECODE_COMPILATION_LEVEL": decode.get("compilation_level", ""),
+    "PREFILL_CUDAGRAPH_MAX_NUM_SEQS": prefill.get("cudagraph_max_num_seqs", ""),
+    "DECODE_CUDAGRAPH_MAX_NUM_SEQS": decode.get("cudagraph_max_num_seqs", ""),
     "PREFILL_PORT": prefill.get("port", 8010),
     "DECODE_PORT": decode.get("port", 8020),
     "ROUTER_PORT": router.get("port", 8000),
@@ -199,10 +221,17 @@ exports = {
     "SPEC_METHOD": server_args.get("method", ""),
     "DRAFT_MODEL_PATH": server_args.get("draft_model", ""),
     "NUM_SPEC_TOKENS": server_args.get("num_speculative_tokens", ""),
+    "SPEC_DECODE_ACCEPTANCE_LENGTH": server_args.get(
+        "spec_decode_acceptance_length", ""
+    ),
+    "STATE_CHECKPOINT_INTERVAL_TOKENS": server_args.get(
+        "state_checkpoint_interval_tokens", ""
+    ),
     "EXTRA_SERVER_ARGS": server_args.get("extra_args", ""),
     "PREFILL_EXTRA_SERVER_ARGS": prefill.get("extra_args", ""),
     "DECODE_EXTRA_SERVER_ARGS": decode.get("extra_args", ""),
     "RUN_EVAL": str(cell.get("run_eval", False)).lower(),
+    "EVAL_ONLY": str(cell.get("eval_only", False)).lower(),
     "EVAL_TASK": accuracy.get("task", "gsm8k"),
     "EVAL_FEWSHOT": accuracy.get("fewshot", 3),
     "EVAL_LIMIT": "" if accuracy.get("limit") is None else accuracy.get("limit"),
@@ -224,18 +253,30 @@ exports = {
     "SWEBENCH_MAX_WORKERS": "" if accuracy.get("max_workers") is None else accuracy.get("max_workers"),
     "SWEBENCH_EVAL_TIMEOUT": "" if accuracy.get("instance_timeout") is None else accuracy.get("instance_timeout"),
     "SLURM_SUBMIT_RUNNER": slurm_submit_runner,
-    "SLURM_ACCOUNT": runner.get("slurm_account", "amd-frameworks"),
-    "SLURM_PARTITION": runner.get("slurm_partition", "amd-frameworks"),
+    "SLURM_ACCOUNT": "amd-aifw-dev" if is_crusoe_v2 else runner.get("slurm_account", "amd-frameworks"),
+    "SLURM_PARTITION": "" if is_crusoe_v2 else runner.get("slurm_partition", "amd-frameworks"),
+    "SLURM_QOS": "amd-aifw-dev-qos" if is_crusoe_v2 else runner.get("slurm_qos", ""),
     "SLURM_CPUS_PER_TASK": runner.get("cpus_per_task", 114),
     "SLURM_GPUS_PER_NODE": runner.get("gpus_per_node", 8),
     "SLURM_TIME_LIMIT": runner.get("time_limit", "06:00:00"),
     "SLURM_LOG_ROOT": runner.get("log_root", "/it-share/ATOMESH_LOG/"),
     "SPUR_CONTROLLER_ADDR": spur_controller_addr,
-    "SPUR_ACCOUNTING_ADDR": runner.get(
-        "spur_accounting_addr",
-        os.environ.get("SPUR_ACCOUNTING_ADDR", default_spur_accounting_addr),
-    ),
+    "SPUR_ACCOUNTING_ADDR": spur_accounting_addr,
 }
+
+# server_args is mapped key by key above, so a key the mapping never read would
+# be dropped without a trace. The launcher always passes --trust-remote-code.
+server_args.get("trust_remote_code")
+dropped = sorted(set(server_args) - server_args.seen)
+if dropped:
+    reason = (
+        f"ERROR: {cell['id']} sets unsupported server_args {dropped}; "
+        "raw server flags belong in extra_args"
+    )
+    # A non-zero exit here is swallowed by `eval "$(...)"`, so fail via the shell.
+    print(f"echo {shlex.quote(reason)} >&2")
+    print("exit 1")
+    raise SystemExit(0)
 
 for key, value in exports.items():
     print(f"export {key}={q(value)}")
@@ -255,6 +296,7 @@ SLURM_LOG_ROOT="${SLURM_LOG_ROOT//\$\{USER\}/${CURRENT_USER}}"
 SLURM_LOG_ROOT="${SLURM_LOG_ROOT//\$USER/${CURRENT_USER}}"
 export LOG_ROOT="${SLURM_LOG_ROOT%/}/${ATOMESH_CELL_ID}-${GITHUB_RUN_ID:-local}-$(date +%Y%m%d%H%M%S)"
 export SLURM_JOB_NAME="${ATOMESH_CELL_ID}-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+export SLURM_CANCEL_HELPER="${RESULT_DIR}/${ATOMESH_CELL_ID}.slurm-cancel.sh"
 if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
   export SLURM_OUTPUT="/tmp/atomesh-%j.out"
   export SLURM_ERROR="/tmp/atomesh-%j.err"
@@ -263,24 +305,28 @@ else
   export SLURM_ERROR="${LOG_ROOT}/slurm-%j.err"
 fi
 SLURM_LOG_POLL_INTERVAL="${SLURM_LOG_POLL_INTERVAL:-30}"
+SLURM_ACCOUNTING_TIMEOUT="${SLURM_ACCOUNTING_TIMEOUT:-180}"
+SLURM_ACCOUNTING_POLL_INTERVAL="${SLURM_ACCOUNTING_POLL_INTERVAL:-2}"
 USES_SPUR_CONTROLLER=0
-if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
+if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
   USES_SPUR_CONTROLLER=1
 fi
+source "${REPO_ROOT}/.github/scripts/slurm_submit_helpers.sh"
+detect_slurm_backend
 
 echo "=== ATOMesh benchmark cell ==="
 echo "cell=${ATOMESH_CELL_ID}"
 echo "model=${MODEL_NAME}"
 echo "topology=${DISPLAY_TOPOLOGY}"
 echo "nodes=${NODE_LIST}"
+echo "slurm_account=${SLURM_ACCOUNT:-default}"
+echo "slurm_partition=${SLURM_PARTITION:-default}"
+echo "slurm_qos=${SLURM_QOS:-default}"
 echo "isl=${ISL_LIST} osl=${OSL} concurrency=${CONC_LIST}"
 echo "slurm_job_name=${SLURM_JOB_NAME}"
 echo "log_root=${LOG_ROOT}"
 if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
   echo "spur_controller=${SPUR_CONTROLLER_ADDR}"
-fi
-if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
-  echo "spur_accounting=${SPUR_ACCOUNTING_ADDR}"
 fi
 
 mkdir -p "${RESULT_DIR}"
@@ -302,6 +348,9 @@ PY
 fi
 
 mkdir -p "${LOG_ROOT}"
+# Recorded before sbatch so the job summary can point at the logs even when the
+# Slurm job never starts or dies before copying anything back.
+printf '%s\n' "${LOG_ROOT}" > "${RESULT_DIR}/${ATOMESH_CELL_ID}.log-root"
 
 if ! command -v sbatch >/dev/null 2>&1; then
   echo "ERROR: sbatch not found; use --dry-run on non-Slurm runners" >&2
@@ -319,26 +368,29 @@ fi
 stream_spur_shared_logs_once() {
   local job_id="$1"
   local run_dir="${LOG_ROOT}/slurm_job-${job_id}"
-  local log_file rel_path current_line
+  local log_file rel_path current_offset
 
   [[ -d "${run_dir}" ]] || return 0
 
   shopt -s nullglob
-  for log_file in \
-    "${run_dir}"/rank-*/container*.log \
-    "${run_dir}"/logs/*.log \
-    "${run_dir}"/logs/*/*.log; do
+  # Container logs already include the server/router output via tee. Reading
+  # logs/ as well would print the same messages twice.
+  for log_file in "${run_dir}"/rank-*/container*.log; do
     rel_path="${log_file#"${run_dir}/"}"
-    current_line="${SPUR_SHARED_LOG_LINES[${log_file}]:-0}"
-    SPUR_SHARED_LOG_LINES["${log_file}"]="$(stream_file_lines "${log_file}" "[spur:${rel_path}] " "${current_line}")"
+    current_offset="${SPUR_SHARED_LOG_OFFSETS[${log_file}]:-0}"
+    SPUR_SHARED_LOG_OFFSETS["${log_file}"]="$(
+      python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_stream_log.py" \
+        "${log_file}" "${current_offset}" "[spur:${rel_path}] "
+    )"
   done
   shopt -u nullglob
 }
 
-if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+# Every Spur worker writes container output to shared storage, regardless of
+# runner label. Stream it from the submitter rather than through Spur RPCs.
+if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
   SLURM_EXTRA_LOG_STREAMER=stream_spur_shared_logs_once
 fi
-source "${REPO_ROOT}/.github/scripts/atomesh/slurm_submit_helpers.sh"
 install_slurm_cancel_traps
 
 IFS=',' read -r -a NODE_ARRAY <<< "${NODE_LIST}"
@@ -354,7 +406,7 @@ if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
 #SBATCH --chdir=/tmp
 EOF
   if [[ -n "${NODE_LIST}" ]]; then
-    printf '#SBATCH --nodelist=%s\n' "${NODE_LIST}" >> "${SUBMIT_SCRIPT}"
+    printf '#SBATCH -w %s\n' "${NODE_LIST}" >> "${SUBMIT_SCRIPT}"
   fi
   cat >> "${SUBMIT_SCRIPT}" <<EOF
 #SBATCH --output=${SLURM_OUTPUT}
@@ -374,7 +426,7 @@ else
     --export=ALL 
     --job-name "${SLURM_JOB_NAME}"
   )
-  if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
+  if [[ "${USES_SPUR_CONTROLLER}" == "1" && -n "${SPUR_CONTROLLER_ADDR}" ]]; then
     SBATCH_CMD+=(--controller "${SPUR_CONTROLLER_ADDR}")
   fi
   if [[ -n "${SLURM_ACCOUNT}" ]]; then
@@ -383,8 +435,8 @@ else
   if [[ -n "${SLURM_PARTITION}" ]]; then
     SBATCH_CMD+=(--partition "${SLURM_PARTITION}")
   fi
-  if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
-    SBATCH_CMD+=(-q amd-burst-qos --reservation=atomesh-ci)
+  if [[ -n "${SLURM_QOS}" ]]; then
+    SBATCH_CMD+=(--qos "${SLURM_QOS}")
   fi
   SBATCH_CMD+=(
     --nodes "${NUM_NODES}"
@@ -395,7 +447,8 @@ else
     --time "${SLURM_TIME_LIMIT}"
   )
   if [[ -n "${NODE_LIST}" ]]; then
-    SBATCH_CMD+=(--nodelist "${NODE_LIST}")
+    slurm_node_selection_args "${NODE_LIST}" "${NUM_NODES}"
+    SBATCH_CMD+=("${SLURM_NODE_SELECTION_ARGS[@]}")
   fi
   SBATCH_CMD+=(
     --output "${SLURM_OUTPUT}"
@@ -405,6 +458,8 @@ else
 fi
 
 echo "=== submitting Slurm job ==="
+# Bind completion evidence to this submission, including job-ID reuse.
+export ATOMESH_RUN_TOKEN="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
 printf ' %q' "${SBATCH_CMD[@]}"
 echo
 write_slurm_cancel_helper ""
@@ -426,13 +481,31 @@ echo "${JOB_ID}" | tee "${RESULT_DIR}/${ATOMESH_CELL_ID}.slurm-job-id"
 write_slurm_cancel_helper "${JOB_ID}"
 
 set_slurm_job_log_paths "${JOB_ID}"
+SLURM_STATUS_DIR="${LOG_ROOT}/slurm_job-${JOB_ID}"
+SLURM_STATUS_RANKS="${NUM_NODES}"
 monitor_slurm_job "${JOB_ID}"
+
+# Fall back to published results if accounting has no final state.
 read_slurm_exit_code "${JOB_ID}"
+read_slurm_status_files "${LOG_ROOT}/slurm_job-${JOB_ID}" "${NUM_NODES}"
 SLURM_JOB_ACTIVE=0
 SBATCH_RC="${SLURM_JOB_RC}"
 echo "slurm_state=${SLURM_STATE}"
 echo "slurm_exit_code=${SLURM_EXIT_CODE}"
 echo "slurm job exit code: ${SBATCH_RC}"
+
+# Preserve the raw scheduler result and reconcile only a fully completed Spur
+# workload. monitor_slurm_job above must still wait for scheduler termination.
+if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
+  set +e
+  python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_job_result.py" resolve \
+    --run-dir "${SLURM_STATUS_DIR}" --job-id "${JOB_ID}" \
+    --run-token "${ATOMESH_RUN_TOKEN}" --num-ranks "${NUM_NODES}" \
+    --scheduler-state "${SLURM_STATE}" --scheduler-exit-code "${SLURM_EXIT_CODE}" \
+    --scheduler-rc "${SLURM_JOB_RC}" --spur 1
+  SBATCH_RC=$?
+  set -e
+fi
 
 if [[ -d "${LOG_ROOT}" ]]; then
   mkdir -p "${RESULT_DIR}/${ATOMESH_CELL_ID}"

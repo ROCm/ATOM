@@ -6,6 +6,7 @@
 
 import logging
 import queue
+import time
 from collections import deque
 
 from atom.distributed.pp_transport import PPStageTransport
@@ -16,6 +17,7 @@ from atom.kv_transfer.disaggregation.types import (
 )
 from atom.model_engine.engine_core import EngineCore
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -48,7 +50,12 @@ class PPEngineCoreProc(EngineCore):
         # per-request ring now and publishes nothing, so the exception is gone.
         self._defer_prefix_hash: bool = bm.enable_prefix_caching
         self._pp_kv_aggregator: PPKVAggregator | None = None
-        self._held_sending: dict = {}
+        # The aggregator's other terminal. Its tallies only drain on full
+        # quorum, so a stage whose report is lost for good would keep
+        # `has_pending_kv_work()` True for the life of the process. The
+        # scheduler already decides when a save is beyond hope; this is the
+        # only way that decision reaches a dict it has no handle on.
+        self.scheduler.on_save_abandoned = self._forget_pp_save_quorum
         logger.info(
             f"{self.label}: PP stage {self.pp_rank}/{self.pp_size} "
             f"(head={self.is_head}, last={self.is_last}) ready"
@@ -62,9 +69,16 @@ class PPEngineCoreProc(EngineCore):
 
     def _head_busy_loop(self):
         shutdown = False
+        metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
+        next_metrics_push = 0.0
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
+                now = time.monotonic()
+                if now >= next_metrics_push:
+                    next_metrics_push = now + metrics_interval
+                    self.utility_handler.push_metrics()
+                self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
                     break
@@ -96,9 +110,16 @@ class PPEngineCoreProc(EngineCore):
                 self.output_queue.put_nowait(rejected)
 
             if result is None:
+                # Deferred blocks keep `Scheduler.is_finished()` false, so
+                # `_head_busy_loop` never reaches its own idle-drain branch;
+                # the remaining suffix saves have to be dispatched here. Via
+                # `_advance_idle_kv_transfer` to share the drain throttle --
+                # this loop does not sleep.
+                self._advance_idle_kv_transfer()
                 break
             scheduled_batch, seqs = result
             if scheduled_batch is None:
+                self._advance_idle_kv_transfer()
                 break
             if len(scheduled_batch.req_ids) == 0:
                 self._dispatch_connector_only_batch(scheduled_batch)
@@ -114,6 +135,7 @@ class PPEngineCoreProc(EngineCore):
                     scheduled_batch.connector_meta_output,
                 )
             self.pp_transport.send_metadata(scheduled_batch)
+            self.scheduler.metrics.record_forward(scheduled_batch, seqs)
             self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
             self.scheduler.mark_pp_inflight(scheduled_batch)
             self._in_flight.append((scheduled_batch, seqs, needs_output))
@@ -177,23 +199,32 @@ class PPEngineCoreProc(EngineCore):
 
     # -- KV transfer PP aggregation ------------------------------------------
 
-    def has_pending_kv_work(self) -> bool:
-        """Extend the base predicate with the head's PP-only holding state.
+    def _forget_pp_save_quorum(self, req_id) -> None:
+        """Drop a request's partial stage tallies once its save is abandoned.
 
-        ``_held_sending`` pins a mooncake send until every stage has reported
-        its save, and ``_pp_kv_aggregator`` holds the partial per-stage
-        tallies that release it. Both outlive the scheduler queues, and both
-        only drain from ``_poll_kv_transfer_progress``.
+        Fires from `Scheduler._reconcile_stalled_deferred_saves`, so the
+        aggregator gives up on exactly the requests the scheduler already has,
+        and the two cannot drift.
+        """
+        # A save can time out before any stage reports. Its first late report
+        # must encounter the terminal record too, not create a fresh tally.
+        if self._pp_kv_aggregator is None:
+            self._pp_kv_aggregator = PPKVAggregator(self.pp_size)
+        self._pp_kv_aggregator.forget(req_id)
+
+    def has_pending_kv_work(self) -> bool:
+        """Keep polling while an offload operation lacks stage completions.
+
+        The scheduler holds producer blocks until both send and offload work
+        finish. The PP aggregator only tracks each offload operation's quorum.
         """
         if super().has_pending_kv_work():
-            return True
-        if self._held_sending:
             return True
         return (
             self._pp_kv_aggregator is not None and self._pp_kv_aggregator.has_pending()
         )
 
-    def _dispatch_idle_offload_work(self) -> None:
+    def _dispatch_idle_offload_work(self, dispatch_new: bool = True) -> None:
         """Override: fan the idle connector metadata out to every PP stage.
 
         ``Scheduler.schedule()`` returns None once waiting and running are
@@ -201,7 +232,13 @@ class PPEngineCoreProc(EngineCore):
         materializes while draining. Build the metadata directly instead, and
         ship it downstream too — otherwise the stages never save their layers
         and ``PPKVAggregator`` cannot reach a quorum.
+
+        ``dispatch_new`` exists only to match the base signature the shutdown
+        drain calls through: this override never publishes new state loads/
+        stores (the state tier refuses ``pp_size > 1`` outright, so there are
+        none), so it has nothing to gate and the flag is inert here.
         """
+        del dispatch_new
         if not self.kv_transfer_enabled:
             return
         connector = getattr(self.scheduler, "kv_connector", None)
@@ -247,13 +284,31 @@ class PPEngineCoreProc(EngineCore):
         if not self.kv_transfer_enabled:
             return
 
+        # Reclaim any offload save whose completion report never came (worker
+        # crash, dropped completion, LMCache force-unpin). This override fully
+        # replaces the base `_poll_kv_transfer_progress`, whose getattr-guarded
+        # call is the reclaimer's only caller repo-wide; without mirroring it
+        # here, under `pp_size > 1` a stalled save stays in
+        # `Scheduler.deferred_free_blocks` forever -- `has_pending_kv_work()`
+        # stays True, so the engine busy-loops with every GPU idle, the blocks
+        # never return to the pool, and `_drain_kv_work_at_exit` spins to
+        # `KV_SHUTDOWN_DRAIN_TIMEOUT_S` on every shutdown. Self-throttled, so
+        # calling it each poll is cheap; placed above the has_offload /
+        # pp_messages early-returns so a quiet poll still reclaims.
+        reconcile = getattr(self.scheduler, "_reconcile_stalled_deferred_saves", None)
+        if callable(reconcile):
+            reconcile()
+
         # Collect local TP-aggregated output.
         kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
         if kvoutput is None:
             kvoutput = KVConnectorOutput()
 
-        # Recv/failed_recving go directly to scheduler.
+        # Mooncake's send already has PP-wide completion semantics. Report it
+        # independently of saves: the scheduler owns the joint release barrier,
+        # including suffix saves that have not been dispatched yet.
         non_offload = KVConnectorOutput(
+            finished_sending=kvoutput.finished_sending,
             finished_recving=kvoutput.finished_recving,
             failed_recving=kvoutput.failed_recving,
         )
@@ -265,47 +320,27 @@ class PPEngineCoreProc(EngineCore):
             kvoutput.finished_loading
             or kvoutput.failed_loading
             or kvoutput.finished_saving
+            # connector_completions are offload channel events (kimi_k3 state
+            # dispositions, dsv4 checkpoint boundaries). They too span all PP
+            # stages, so they must reach the aggregator rather than the
+            # scheduler directly -- and count as "offload work" so this poll
+            # does not early-return and strand them.
+            or kvoutput.connector_completions
         )
         pp_messages = self.pp_transport.recv_kv_status(timeout_ms=0)
 
-        if not has_offload and not pp_messages and not kvoutput.finished_sending:
-            return
-
-        # No offload connector → finished_sending goes straight to scheduler.
-        if self._pp_kv_aggregator is None and not has_offload and not pp_messages:
-            if kvoutput.finished_sending:
-                self.scheduler._update_from_kv_xfer_finished(
-                    KVConnectorOutput(finished_sending=kvoutput.finished_sending)
-                )
+        if not has_offload and not pp_messages:
             return
 
         if self._pp_kv_aggregator is None:
             self._pp_kv_aggregator = PPKVAggregator(self.pp_size)
-
-        # MultiConnector releases a request's send and its stage-local save in
-        # the same poll (see its "Send/save pairing" docstring), so a send that
-        # arrives with no save alongside it belongs to a request no stage is
-        # saving — a prompt shorter than the offload chunk, or one whose chunks
-        # were already persisted. Holding those would strand them forever: no
-        # finished_saving is ever coming. Only the paired sends wait for the
-        # PP-wide save quorum.
-        local_saving = {str(rid) for rid in kvoutput.finished_saving or ()}
-        unpaired_sending = set()
-        for rid in kvoutput.finished_sending or ():
-            if str(rid) in local_saving:
-                self._held_sending[str(rid)] = rid
-            else:
-                unpaired_sending.add(rid)
-        if unpaired_sending:
-            self.scheduler._update_from_kv_xfer_finished(
-                KVConnectorOutput(finished_sending=unpaired_sending)
-            )
 
         # Ingest head (stage 0) offload output.
         offload_local = KVConnectorOutput(
             finished_loading=kvoutput.finished_loading,
             failed_loading=kvoutput.failed_loading,
             finished_saving=kvoutput.finished_saving,
+            connector_completions=kvoutput.connector_completions,
         )
         if not offload_local.is_empty():
             self._ingest_and_release(offload_local, 0)
@@ -318,23 +353,21 @@ class PPEngineCoreProc(EngineCore):
         result = self._pp_kv_aggregator.ingest(pp_rank, output)
         if result.is_empty():
             return
-        # Release held finished_sending whose global save is now complete.
-        rel = set()
-        for rid in result.finished_saving or ():
-            held = self._held_sending.pop(str(rid), None)
-            if held is not None:
-                rel.add(held)
-        if rel:
-            result.finished_sending = rel
         self.scheduler._update_from_kv_xfer_finished(result)
 
     # -- Downstream busy loop ------------------------------------------------
 
     def _downstream_busy_loop(self):
         shutdown = False
+        metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
+        next_metrics_push = 0.0
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
+                now = time.monotonic()
+                if now >= next_metrics_push:
+                    next_metrics_push = now + metrics_interval
+                    self.utility_handler.push_metrics(scheduler_metrics=False)
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
                     break

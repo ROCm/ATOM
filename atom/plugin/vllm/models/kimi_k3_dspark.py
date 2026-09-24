@@ -28,9 +28,11 @@ class KimiK3DSparkDraft(KimiK3DSparkBase):
         hidden_states = (
             inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)
         )
+        residual = None
         for layer in self.layers:
-            hidden_states = layer(positions, hidden_states)
-        return self.final_norm(hidden_states)
+            hidden_states, residual = layer(positions, hidden_states, residual)
+        hidden_states, _ = self.final_norm(hidden_states, residual)
+        return hidden_states
 
     def write_combined_context_kv(
         self,
@@ -109,8 +111,16 @@ class KimiK3DSparkVllm(ATOMForCausalLM):
 
         Collapses the pair above plus the add and the argmax. Only reachable once
         ``spec_decode_patch._patch_dspark_fused_markov_sample`` installed itself.
+
+        The ids come back through a destination rather than a return value: the
+        native loop writes one column of its own block, and vLLM's spelling
+        wants a tensor, so it allocates the one column's worth.
         """
-        return self.model.markov_head.sample_next(token_ids, base_logits)[0]
+        ids = torch.empty(
+            base_logits.shape[0], dtype=torch.int64, device=base_logits.device
+        )
+        self.model.markov_head.sample_next(token_ids, base_logits, ids)
+        return ids
 
     def map_draft_to_target(self, draft_token_ids: torch.Tensor) -> torch.Tensor:
         return draft_token_ids

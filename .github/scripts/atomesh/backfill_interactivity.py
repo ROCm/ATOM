@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Rewrite published ATOMesh agentic points to p90 e2e normalized interactivity.
+"""Backfill published ATOMesh agentic points with both interactivity definitions.
 
-``process_result.py`` computes the new definition for every *future* run. The
-points already on gh-pages still carry ``1000 / median_tpot_ms``, which would
-leave the dashboard mixing two definitions on one axis. This script recomputes
-them from the per-request records stored in each run's
-``atomesh-model-benchmark-*`` artifact and rewrites
+``process_result.py`` computes them for every *future* run. Points already on
+gh-pages predate that: the oldest still carry ``1000 / median_tpot_ms`` on the
+main axis, and none carry the plain ``1/p90(ITL)`` number the dashboard now
+offers as a second axis. This script recomputes both from the per-request records
+stored in each run's ``atomesh-model-benchmark-*`` artifact and rewrites
 ``benchmark-dashboard/data.js`` in place.
 
     # one-time: pull the artifacts, then rewrite
@@ -37,8 +37,8 @@ from interactivity import (
     DEFAULT_PERCENTILE,
     METHOD_MEDIAN_TPOT,
     METHOD_P90_E2E,
+    agentic_interactivity,
     locate_records,
-    p90_e2e_normalized_interactivity,
 )
 from process_result import AGENTIC_BENCHMARK_KIND, RESULT_RE, round_or_none
 
@@ -129,12 +129,16 @@ def recompute(
         if records is None:
             continue
         try:
-            computed.append(p90_e2e_normalized_interactivity(records, percentile))
+            computed.append(agentic_interactivity(records, percentile))
         except (OSError, ValueError) as exc:
             return None, f"{records}: {exc}"
     if not computed:
         return None, f"no profile_export.jsonl beside {matches[0].name}"
-    values = {round(entry["value"], 6) for entry in computed}
+    # Both metrics have to agree, not just the primary one: a disagreement in
+    # either means the two result files describe different runs.
+    values = {
+        (round(entry["value"], 6), round(entry["itl_value"], 6)) for entry in computed
+    }
     if len(values) > 1:
         return None, (
             f"{len(matches)} result files named {result_stem}.json disagree "
@@ -185,12 +189,26 @@ def backfill(
             # Pareto frontier, so "measured the old way" must not be
             # indistinguishable from "field missing because something upstream
             # broke" -- those want opposite responses from whoever reads it next.
+            #
+            # setdefault, not assignment: on a second pass the artifacts behind an
+            # earlier successful backfill may have expired, and overwriting would
+            # relabel a correctly computed p90 point as legacy -- ejecting it from
+            # the frontier over nothing worse than an aged-out artifact.
             skipped.append((label, reason))
-            updated["interactivity_method"] = METHOD_MEDIAN_TPOT
+            updated.setdefault("interactivity_method", METHOD_MEDIAN_TPOT)
         else:
             updated["interactivity"] = round_or_none(result["value"])
             updated["interactivity_method"] = METHOD_P90_E2E
             updated["interactivity_n_requests"] = result["n_requests"]
+            updated["interactivity_p90_itl"] = round_or_none(result["itl_value"])
+
+        # Re-running against an already-backfilled file must be a no-op -- which
+        # includes the report: a point recomputed to the value it already had is
+        # not a change, and listing it would make a second pass look like it did
+        # work and hide any point that genuinely did move.
+        if updated == point:
+            continue
+        if result is not None:
             changed.append(
                 {
                     "gh_run": gh_run,
@@ -200,13 +218,10 @@ def backfill(
                     "concurrency": point.get("concurrency"),
                     "old": point.get("interactivity"),
                     "new": updated["interactivity"],
+                    "p90_itl": updated["interactivity_p90_itl"],
                     "n_requests": result["n_requests"],
                 }
             )
-
-        # Re-running against an already-backfilled file must be a no-op.
-        if updated == point:
-            continue
         pieces.append(raw[cursor : match.start(1)])
         pieces.append(encode_point(updated))
         cursor = match.end(1)
@@ -219,7 +234,7 @@ def report(changed: list[dict[str, Any]], skipped: list[tuple[str, str]]) -> Non
     if changed:
         print(
             f"\n{'run':<12} {'model':<16} {'config':<44} {'conc':>5} "
-            f"{'old':>10} {'new':>10} {'change':>9} {'n':>7}"
+            f"{'old':>10} {'new':>10} {'change':>9} {'p90_itl':>10} {'n':>7}"
         )
         for row in sorted(changed, key=lambda r: (r["gh_run"], str(r["run_id"]))):
             old, new = row["old"], row["new"]
@@ -231,7 +246,8 @@ def report(changed: list[dict[str, Any]], skipped: list[tuple[str, str]]) -> Non
             print(
                 f"{row['gh_run']:<12} {str(row['model'])[:16]:<16} "
                 f"{str(row['config'])[:44]:<44} {row['concurrency']!s:>5} "
-                f"{old!s:>10} {new!s:>10} {delta:>9} {row['n_requests']:>7}"
+                f"{old!s:>10} {new!s:>10} {delta:>9} {row['p90_itl']!s:>10} "
+                f"{row['n_requests']:>7}"
             )
     if skipped:
         print(

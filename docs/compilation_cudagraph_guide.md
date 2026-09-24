@@ -123,12 +123,12 @@ CUDA graph capture is handled by `ModelRunner.capture_cudagraph()` in `atom/mode
 ```text
 capture_cudagraph()
   |
-  +-- Determine graph_bs list
+  +-- Determine capture_sizes list
   |     |-- If cudagraph_capture_sizes is set: use directly
   |     |-- If cuda_graph_sizes has 1 value N: [1, 2, 4, 8, 16, 32, ..., N]
   |     +-- If cuda_graph_sizes has >1 values: use the provided list
   |
-  +-- Sort graph_bs in descending order (largest batch first)
+  +-- Sort capture_sizes in descending order (largest batch first)
   |
   +-- Assert max batch size <= max_num_seqs
   |
@@ -148,19 +148,19 @@ capture_cudagraph()
   |     +-- Store: self.graphs[(bs, max_q_len)] = graph
   |     +-- torch.cuda.synchronize()
   |
-  +-- Sort graph_bs back to ascending order
-  +-- Return (elapsed_time, graph_bs)
+  +-- Sort capture_sizes back to ascending order
+  +-- Return (elapsed_time, capture_sizes)
 ```
 
 ### Graph keying
 
-Each captured graph is stored in a dictionary keyed by a `(graph_bs, max_q_len)` tuple:
+Each captured graph is stored in a dictionary keyed by a `(running_bs, max_q_len)` tuple:
 
 ```python
 self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = dict()
 ```
 
-- `graph_bs`: The padded batch size used during capture.
+- `running_bs`: The padded batch size used during capture.
 - `max_q_len`: The maximum query length per sequence. For standard decode, this is `1`. For MTP (Multi-Token Prediction) speculative decoding, this is `mtp_k + 1`.
 
 ### Graph pool sharing
@@ -194,14 +194,14 @@ def run_model(self, input_ids):
     is_prefill = context.is_prefill
     positions = context.positions
 
-    if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
+    if is_prefill or self.enforce_eager or bs > self.capture_sizes[-1]:
         # Eager path: prefills, enforce_eager mode, or oversized batches
         hidden_states = self.model(input_ids, positions)
     else:
         # Graph replay path: decode batches within captured range
-        graph_bs = context.graph_bs
+        running_bs = context.running_bs
         max_q_len = forward_context.attn_metadata.max_seqlen_q
-        graph_key = (graph_bs, max_q_len)
+        graph_key = (running_bs, max_q_len)
         self.graphs[graph_key].replay()
         num_tokens = context.batch_size * max_q_len
         hidden_states = self.forward_vars["outputs"][:num_tokens]
@@ -268,7 +268,7 @@ The `ForwardContext` dataclass in `atom/utils/forward_context.py` provides a mod
 | `no_compile_layers` | `dict[int, Any]` | Layers that should skip compilation (from `static_forward_context`) |
 | `attn_metadata` | `AttentionMetaData` or `dict` | Attention-specific metadata (sequence lengths, block tables, etc.) |
 | `kv_cache_data` | `dict[str, KVCacheTensor]` | KV cache tensors for each layer |
-| `context` | `Context` | Basic forward pass context (positions, is_prefill, batch_size, graph_bs) |
+| `context` | `Context` | Basic forward pass context (positions, is_prefill, batch_size, running_bs, running_tokens) |
 | `dp_metadata` | `DPMetadata` | Data-parallel metadata (token counts across DP ranks) |
 | `spec_decode_metadata` | `SpecDecodeMetadata` | Speculative decoding metadata (draft tokens, logits indices) |
 
@@ -292,15 +292,16 @@ class Context:
     positions: torch.Tensor    # Token position IDs
     is_prefill: bool = False   # Whether this is a prefill step
     batch_size: int = 0        # Number of sequences in the batch
-    graph_bs: int = 0          # Padded batch size for graph lookup
+    running_bs: int = 0        # Padded SEQUENCE count: graph lookup, draft width
+    running_tokens: int = 0    # Padded ROW count: what MoE all_gather pads to
     is_draft: bool = False     # Whether this is a draft model forward
 ```
 
-The `graph_bs` field is particularly important for CUDA graph dispatch: it holds the padded batch size that maps to a pre-captured graph key.
+`running_bs` drives CUDA graph dispatch: it holds the padded batch size that maps to a pre-captured graph key. `running_tokens` is the same shape counted in hidden_states rows, which is what MoE pads to before the cross-DP all_gather -- the two are not interconvertible on a prefill (ragged prompts) or a DSpark ragged decode (flat token bucket), which is why both are stored.
 
 ### Integration with CUDA graphs
 
-For ModelRunner's direct CUDA graph path (non-piecewise), the forward context is set before `run_model()` via `set_forward_context()`, and `run_model()` reads `context.graph_bs` and `attn_metadata.max_seqlen_q` to look up the correct pre-captured graph.
+For ModelRunner's direct CUDA graph path (non-piecewise), the forward context is set before `run_model()` via `set_forward_context()`, and `run_model()` reads `context.running_bs` and `attn_metadata.max_seqlen_q` to look up the correct pre-captured graph.
 
 For the piecewise path, `CUDAGraphWrapper` (in `atom/utils/cuda_graph.py`) expects `batch_descriptor` and `cudagraph_runtime_mode` fields on the forward context to decide whether to capture, replay, or run eagerly:
 
@@ -412,7 +413,7 @@ Related fields on `Config`:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enforce_eager` | `bool` | `False` | Force eager execution, skip all compilation and CUDA graphs. |
-| `graph_bs` | `Optional[list[int]]` | `None` | Final list of batch sizes for CUDA graph capture (computed from `CompilationConfig`). |
+| `capture_sizes` | `Optional[list[int]]` | `None` | Final list of batch sizes for CUDA graph capture (computed from `CompilationConfig`). |
 | `compilation_config` | `CompilationConfig` | `CompilationConfig()` | The compilation configuration dataclass. |
 
 ## Decision tree
@@ -461,7 +462,7 @@ CompilationConfig(level=3)
 #   splitting_ops = ["aiter.unified_attention_with_output", "aiter.mla_attention"]
 #   cudagraph_mode = CUDAGraphMode.PIECEWISE
 #   cuda_graph_sizes = [512]
-#   graph_bs = [1, 2, 4, 8, 16, 32, ..., 512]
+#   capture_sizes = [1, 2, 4, 8, 16, 32, ..., 512]
 ```
 
 **Custom capture sizes**:

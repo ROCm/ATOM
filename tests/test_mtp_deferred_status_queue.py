@@ -4,7 +4,13 @@ from unittest import mock
 import numpy as np
 import pytest
 
-pytest.importorskip("aiter", reason="requires AITER to import model_runner")
+# On the module, not on "aiter" -- see tests/test_dspark.py for why a name-only
+# guard passes on the non-GPU runner and then aborts collection.
+pytest.importorskip(
+    "atom.model_engine.model_runner",
+    reason="requires AITER to import model_runner",
+    exc_type=ImportError,
+)
 
 from atom.model_engine.model_runner import tokenIDProcessor
 from atom.model_engine.scheduler import ScheduledBatch
@@ -20,6 +26,72 @@ def _prefill_batch(is_final_chunk: list[bool]) -> ScheduledBatch:
     batch.total_seqs_num_decode = 0
     batch.is_final_chunk = is_final_chunk
     return batch
+
+
+def _batch_with_ids(req_ids: list[int], *, is_dummy_run: bool) -> ScheduledBatch:
+    """The two fields `get_token_locations` reads, and nothing else."""
+    batch = object.__new__(ScheduledBatch)
+    batch.req_ids = req_ids
+    batch.is_dummy_run = is_dummy_run
+    return batch
+
+
+def _locations(prev: ScheduledBatch, cur: ScheduledBatch):
+    processor = object.__new__(tokenIDProcessor)
+    processor.prev_batch = prev
+    return tokenIDProcessor.get_token_locations(processor, cur)
+
+
+def test_a_dummy_carries_nothing_over_to_the_next_dummy():
+    """Back-to-back DP-sync dummies must not look like one carried-over request.
+
+    `dummy_execution` fabricates its sequence with a fixed id, so a second
+    dummy matches the first by id and is taken for a request that ran last
+    step. It then reads that "request's" anchor and drafts out of
+    `prev_token_ids` / `draft_token_ids`, which by then hold whatever the draft
+    pass's graph-pool storage was overwritten with -- out-of-vocab ids that
+    fault the target's embedding gather. A rank idling behind someone else's
+    long chunked prefill runs dummies back to back, so this is the ordinary
+    case at high concurrency, not a corner.
+    """
+    dummy_id = -1  # what dummy_execution builds; the collision is with ITSELF
+    first = _batch_with_ids([dummy_id], is_dummy_run=True)
+    second = _batch_with_ids([dummy_id], is_dummy_run=True)
+
+    locs = _locations(first, second)
+
+    assert locs.deferred_curr.tolist() == []
+    assert locs.deferred_prev.tolist() == []
+    assert locs.new_curr.tolist() == [0]
+
+
+def test_a_real_batch_after_a_dummy_takes_the_host_path():
+    """...and so does a real request that wakes up after one.
+
+    Not a consolation prize for the line above: the dummy's own `postprocess`
+    reports the PREVIOUS batch's tokens, so by the time this request is
+    scheduled its anchor is already on the host. Reading `prev_token_ids`
+    instead would be reading the dummy's forward.
+    """
+    dummy = _batch_with_ids([-1], is_dummy_run=True)
+    real = _batch_with_ids([7, 9], is_dummy_run=False)
+
+    locs = _locations(dummy, real)
+
+    assert locs.deferred_curr.tolist() == []
+    assert locs.new_curr.tolist() == [0, 1]
+
+
+def test_a_real_batch_still_carries_over_from_a_real_batch():
+    """The dummy rule must not cost an ordinary decode step its deferred rows."""
+    prev = _batch_with_ids([7, 9], is_dummy_run=False)
+    cur = _batch_with_ids([9, 11], is_dummy_run=False)
+
+    locs = _locations(prev, cur)
+
+    assert locs.deferred_curr.tolist() == [0]  # req 9 is position 0 now...
+    assert locs.deferred_prev.tolist() == [1]  # ...and was position 1 before
+    assert locs.new_curr.tolist() == [1]
 
 
 def _processor() -> tokenIDProcessor:
@@ -45,8 +117,8 @@ def test_middle_prefills_preserve_status_until_mixed_final_batch():
 
     # Pure middle chunks skip postprocess, so neither the deferred-token queue
     # nor its matching MTP-status queue may advance.
-    tokenIDProcessor.prepare_input_ids(processor, _prefill_batch([False]))
-    tokenIDProcessor.prepare_input_ids(processor, _prefill_batch([False, False]))
+    tokenIDProcessor.prepare_input_ids(processor, _prefill_batch([False]), 1)
+    tokenIDProcessor.prepare_input_ids(processor, _prefill_batch([False, False]), 1)
 
     processor.recv_mtp_status_async.assert_not_called()
     np.testing.assert_array_equal(processor.prev_rejected_num, [7])
@@ -55,7 +127,7 @@ def test_middle_prefills_preserve_status_until_mixed_final_batch():
     # If any request reaches its final chunk, the batch runs postprocess. Its
     # status dequeue must therefore happen exactly once, even though another
     # request in the same batch is still a middle chunk.
-    tokenIDProcessor.prepare_input_ids(processor, _prefill_batch([False, True]))
+    tokenIDProcessor.prepare_input_ids(processor, _prefill_batch([False, True]), 1)
 
     processor.recv_mtp_status_async.assert_called_once_with()
     np.testing.assert_array_equal(processor.prev_rejected_num, [2])
