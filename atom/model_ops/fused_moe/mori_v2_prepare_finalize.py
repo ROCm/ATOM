@@ -17,9 +17,9 @@ test_moe_layer_ep.py):
 
 Two transports sit behind the same prepare/finalize pair:
 
-  * ATOM_MORI_V2_FUSED=0 -- mori's own v2 op-layer, combine_mode="gather". The
+  * ATOM_MEGA_STAGE2_FUSED=0 -- mori's own v2 op-layer, combine_mode="gather". The
     untouched upstream baseline.
-  * ATOM_MORI_V2_FUSED=1 -- aiter's MegaMoEGfx1250, whose gemm2 epilogue
+  * ATOM_MEGA_STAGE2_FUSED=1 -- aiter's MegaMoEGfx1250, whose gemm2 epilogue
     P2P-writes each weighted (token,k) result straight into the peers' combine
     staging, so combine only barriers + sums. It owns the whole layer
     (dispatch -> expert GEMM -> fused combine), so MoriV2ModularKernel hands it
@@ -132,10 +132,10 @@ def _import_v2() -> None:
 
 
 def _resolve_transport() -> str:
-    """ "mega" when ATOM_MORI_V2_FUSED is on, else mori's plain gather op-layer."""
+    """ "mega" when ATOM_MEGA_STAGE2_FUSED is on, else mori's plain gather op-layer."""
     from atom.utils import envs as _atom_envs
 
-    return "mega" if _atom_envs.ATOM_MORI_V2_FUSED else "gather"
+    return "mega" if _atom_envs.ATOM_MEGA_STAGE2_FUSED else "gather"
 
 
 @lru_cache(maxsize=1)
@@ -225,6 +225,11 @@ if os.environ.get("MEGA_WIRE") not in (None, os.environ.get("MEGA_DISPATCH_WIRE"
         "the old name is no longer read"
     )
 _MEGA_DISPATCH_WIRE = os.environ.get("MEGA_DISPATCH_WIRE", "bf16")
+# aiter's stage1_fused requires a quantizing wire and the flydsl dispatch.
+_MEGA_STAGE1_FUSED = envs.ATOM_MEGA_STAGE1_FUSED and _MEGA_DISPATCH_WIRE in (
+    "fp8",
+    "fp4",
+)
 
 
 def init_mega_transport(
@@ -280,6 +285,7 @@ def init_mega_transport(
         # built (the staging layout itself no longer depends on it).
         _MEGA_DISPATCH_WIRE,
         combine_quant,
+        _MEGA_STAGE1_FUSED,
     )
     cached = _MEGA_TRANSPORTS.get(key)
     if cached is not None:
@@ -314,15 +320,15 @@ def init_mega_transport(
         # Passed, not left to aiter's own read of the env, so the key and the
         # transport cannot drift.
         dispatch_wire=_MEGA_DISPATCH_WIRE,
-        # Only mori's dispatch carries the scale row, so a quantizing wire has
-        # no other backend to run on. Named here rather than left to
-        # $MEGA_DISPATCH, whose default is flydsl: otherwise asking for fp4 is
-        # rejected at the first MoE layer for a reason the operator did not set.
+        # A quantizing wire runs on mori's dispatch unless stage 1 is fused,
+        # which only the flydsl TDM dispatch implements. Named here rather than
+        # left to $MEGA_DISPATCH so the pairing cannot be misconfigured.
         **(
-            {"dispatch_backend": "mori"}
+            {"dispatch_backend": "flydsl" if _MEGA_STAGE1_FUSED else "mori"}
             if _MEGA_DISPATCH_WIRE in ("fp8", "fp4")
             else {}
         ),
+        stage1_fused=_MEGA_STAGE1_FUSED,
         # Only injected when asked for: an aiter without the combine-quant
         # epilogue has no such kwarg and would raise TypeError on every run.
         **({"combine_quant": combine_quant} if combine_quant != "none" else {}),
@@ -341,7 +347,8 @@ def init_mega_transport(
     logger.info(
         "[MORI-V2] Created MegaMoE: ep_rank=%d ep_size=%d hidden=%d inter=%d "
         "experts=%d topk=%d M=%d act=%s gate=%s quant=%s pad=(%d,%d) "
-        "swiglu_limit=%s dispatch=%s wire=%s combine_quant=%s force_a8w4=%s",
+        "swiglu_limit=%s dispatch=%s wire=%s combine_quant=%s force_a8w4=%s "
+        "stage1_fused=%s",
         ep_rank,
         ep_size,
         hidden_dim,
@@ -360,6 +367,7 @@ def init_mega_transport(
         combine_quant,
         # The other half of the pair: logged together so a mismatch is readable.
         os.environ.get("AITER_FORCE_A8W4", "0"),
+        mega._config.stage1_fused,
     )
     return mega
 
@@ -458,7 +466,7 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         if inter_dim <= 0:
             raise ValueError(
                 "the fused transport needs the per-partition intermediate size, "
-                f"got {inter_dim}; ATOM_MORI_V2_FUSED=1 requires the a8w4 "
+                f"got {inter_dim}; ATOM_MEGA_STAGE2_FUSED=1 requires the a8w4 "
                 "(Mxfp4MoEMethod) quant path."
             )
         self.mega = init_mega_transport(
@@ -705,6 +713,12 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         # a4w4, mega bf16 + a8w4 all match to the last bit). Off by default
         # until it has run a real serve.
         if mega is not None and triton_experts is not None:
+            if mega._config.stage1_fused:
+                raise RuntimeError(
+                    "triton_mega_moe drives MegaMoE's token-major dispatch and "
+                    "cannot run on the compact stage-1 plan; set "
+                    "ATOM_MEGA_STAGE1_FUSED=0 to use the Triton experts"
+                )
             from atom.model_ops.fused_moe_triton import triton_mega_moe
 
             assert not kwargs.get(
