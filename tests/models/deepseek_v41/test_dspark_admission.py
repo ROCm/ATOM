@@ -114,3 +114,41 @@ def test_dpa_dspark_admission_does_not_fix_parallel_width(tp, dp):
     value.tensor_parallel_size = tp
     value.parallel_config.data_parallel_size = dp
     validate_speculative_config(value)
+
+
+@pytest.mark.parametrize("dpa", [False, True])
+@pytest.mark.parametrize("draft_tokens", [0, 5])
+@pytest.mark.parametrize("media", [None, {"image": 1}])
+def test_request_admission_checks_dpa_independently_of_dspark(dpa, draft_tokens, media):
+    cfg = DeepseekV41TextConfig()
+    kwargs = dict(
+        num_draft_tokens=draft_tokens, multimodal_data=media, enable_dp_attention=dpa
+    )
+    if media and (dpa or draft_tokens):
+        with pytest.raises(ValueError, match="text requests only"):
+            cfg.validate_request(**kwargs)
+    else:
+        cfg.validate_request(**kwargs)
+
+
+@pytest.mark.parametrize("draft_tokens", [0, 5])
+def test_dpa_media_rejected_before_tokenization_and_sequence_creation(draft_tokens):
+    from atom.model_engine.llm_engine import InputOutputProcessor
+
+    def unexpected_encode(prompt):
+        pytest.fail("Unsupported media reached tokenization")
+
+    processor = SimpleNamespace(
+        config=SimpleNamespace(
+            hf_config=DeepseekV41TextConfig(), enable_dp_attention=True
+        ),
+        num_speculative_tokens=draft_tokens,
+        tokenizer=SimpleNamespace(encode=unexpected_encode),
+    )
+    with pytest.raises(ValueError, match="DP attention supports text requests only"):
+        InputOutputProcessor.preprocess_fanout(
+            processor,
+            "image prompt",
+            SimpleNamespace(n=2),
+            multimodal_data={"image": 1},
+        )

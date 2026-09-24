@@ -805,6 +805,7 @@ class InputOutputProcessor:
             request_validator(
                 num_draft_tokens=self.num_speculative_tokens,
                 multimodal_data=multimodal_data,
+                enable_dp_attention=self.config.enable_dp_attention,
             )
         n = max(1, int(getattr(sampling_params, "n", 1)))
 

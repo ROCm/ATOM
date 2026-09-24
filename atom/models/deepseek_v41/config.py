@@ -204,7 +204,11 @@ class DeepseekV41TextConfig(PretrainedConfig):
                 "moe_intermediate_size must be divisible by tensor parallel size"
             )
 
-    def validate_request(self, *, num_draft_tokens, multimodal_data):
+    def validate_request(
+        self, *, num_draft_tokens, multimodal_data, enable_dp_attention=False
+    ):
+        if enable_dp_attention and multimodal_data:
+            raise ValueError("DeepSeek-V4.1 DP attention supports text requests only")
         if num_draft_tokens and multimodal_data:
             raise ValueError(
                 "DeepSeek-V4.1 DSpark currently supports text requests only"
@@ -366,6 +370,14 @@ def validate_runtime_config(config):
             and not config.enable_dp_attention,
         ),
         ("decode TBO", config.enable_tbo_decode),
+        (
+            "prefill TBO without multi-rank DP attention",
+            config.enable_tbo
+            and (
+                not config.enable_dp_attention
+                or config.parallel_config.data_parallel_size <= 1
+            ),
+        ),
         (
             # `lmcache_mp` is the one transport admitted: it checkpoints STATE
             # through the backend's PAGE-backed copies. P/D and in-process

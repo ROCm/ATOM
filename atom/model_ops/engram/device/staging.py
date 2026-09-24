@@ -9,6 +9,7 @@ fixed addresses (`EngramStep`): a replay reads its own step.
 
 import logging
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from unittest.mock import patch
 
@@ -280,16 +281,24 @@ class EngramStagedRows(dict):
         return EngramRowsView(self, token_slice)
 
 
-class EngramRowsView(dict):
-    """Consume a parent's rows without restarting or closing its lookup."""
+class EngramRowsView(Mapping):
+    """Read-only token slices; every value access waits for the parent lookup.
+
+    Mapping routes get/items/values/dict copies through __getitem__, so none
+    can expose a device row without establishing its consumer dependency.
+    """
 
     def __init__(self, parent, token_slice):
-        super().__init__(
-            (layer, rows[:, token_slice]) for layer, rows in parent.items()
-        )
+        self._rows = {layer: rows[:, token_slice] for layer, rows in parent.items()}
         self.parent = parent
 
-    def get(self, layer, default=None):
-        if layer in self:
-            self.parent.get(layer)
-        return super().get(layer, default)
+    def __getitem__(self, layer):
+        rows = self._rows[layer]
+        self.parent.get(layer)
+        return rows
+
+    def __iter__(self):
+        return iter(self._rows)
+
+    def __len__(self):
+        return len(self._rows)

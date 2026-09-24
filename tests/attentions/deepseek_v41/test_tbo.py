@@ -11,12 +11,10 @@ pytest.importorskip("aiter")
 from atom.model_ops.attentions.deepseek_v41.backend import DeepseekV41MetadataBuilder
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
-from atom.models.deepseek_v41.config import validate_runtime_config
 from atom.utils.forward_context import Context, ForwardContext, _forward_context_local
 from atom.utils.tbo.ubatch_splitting import UBatchSlice, _split_prefill_token_midpoint
 from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
 from tests.attentions.deepseek_v41.helpers import metadata_buffers
-from tests.attentions.deepseek_v41.test_runtime_contract import runtime_config
 
 
 def make_parent(device, lengths=(10, 4), starts=(3, 8)):
@@ -132,19 +130,6 @@ def test_prefill_slices_keep_absolute_positions_and_independent_plans(device, cu
     assert parent.cache.pending is None
 
 
-def test_prefill_tbo_admission_keeps_decode_tbo_rejected():
-    for dpa in (False, True):
-        validate_runtime_config(
-            runtime_config(enable_tbo=True, enable_dp_attention=dpa)
-        )
-        with pytest.raises(ValueError, match="decode TBO"):
-            validate_runtime_config(
-                runtime_config(
-                    enable_tbo=True, enable_tbo_decode=True, enable_dp_attention=dpa
-                )
-            )
-
-
 def test_parent_engram_join_runs_when_a_microbatch_fails():
     events = []
     parent = SimpleNamespace(
@@ -240,7 +225,7 @@ def test_real_tbo_workers_share_one_uva_prefetch_and_keep_cross_layer_state(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 @pytest.mark.parametrize("cut", [1, 7, 10, 11, 13])
-def test_split_attention_reads_preceding_microbatch_window(cut):
+def test_split_attention_reads_preceding_microbatch_window(cut, monkeypatch):
     from atom.model_ops.v4_kernels import (
         sparse_attn_v4_paged_decode,
         sparse_attn_v4_paged_prefill,
@@ -289,14 +274,58 @@ def test_split_attention_reads_preceding_microbatch_window(cut):
         UBatchSlice(slice(0, 1 if cut <= 10 else 2), slice(0, cut)),
         UBatchSlice(slice(0 if cut < 10 else 1, 2), slice(cut, 14)),
     ]
-    actual = []
-    for i, part in enumerate(parts):
-        child = builder.build_ubatch_prefill_metadata(
-            parent, part, part.request_slice.stop - part.request_slice.start, i
-        )
-        assert child.step.is_prefill and not child.step.decode
-        actual.append(attend(child.step, part.token_slice.start, part.token_slice.stop))
-    torch.testing.assert_close(torch.cat(actual), expected, rtol=1e-2, atol=1e-2)
+    from atom.utils.forward_context import get_forward_context
+    from atom.utils.tbo.ubatching import (
+        tbo_current_ubatch_id,
+        tbo_switch_to_compute_sync,
+        tbo_yield_and_switch_from_compute_to_comm,
+    )
+
+    order = []
+
+    class Model(torch.nn.Module):
+        tbo_comm_stream_priority = -1
+
+        def forward(self, ids, positions):
+            index = tbo_current_ubatch_id()
+            step = get_forward_context().attn_metadata.step
+            part = parts[index]
+            assert step.is_prefill and not step.decode
+            order.append((index, "attention"))
+            output = attend(step, part.token_slice.start, part.token_slice.stop)
+            order.append((index, "write_window"))
+            # Match the production boundary: attention writes its window before
+            # FFN yields to the other worker. GPU launches remain asynchronous.
+            tbo_yield_and_switch_from_compute_to_comm()
+            torch.cuda._sleep(2_000_000)
+            tbo_switch_to_compute_sync()
+            return output
+
+    ctx = ForwardContext(
+        attn_metadata=parent,
+        no_compile_layers={},
+        kv_cache_data={},
+        context=Context(
+            positions=parent.step.positions,
+            is_prefill=True,
+            scheduled_bs=2,
+            running_bs=2,
+            scheduled_tokens=14,
+            running_tokens=14,
+        ),
+        ubatch_slices=parts,
+    )
+    monkeypatch.setattr(_forward_context_local, "ctx", ctx, raising=False)
+    actual = UBatchWrapper(Model(), builder)(
+        torch.arange(14, device="cuda", dtype=torch.int32), parent.step.positions
+    )
+    assert order == [
+        (0, "attention"),
+        (0, "write_window"),
+        (1, "attention"),
+        (1, "write_window"),
+    ]
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(cache.state.view("window"), final_window, rtol=0, atol=0)
 
 
