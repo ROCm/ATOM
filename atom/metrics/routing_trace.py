@@ -201,6 +201,24 @@ def trace_enqueue(scheduler, seq):
         )
 
 
+def trace_api_sequence(request_id, seq):
+    """Join API attempts to engine IDs even when external_request_id is unset.
+
+    The normal single-output API intentionally keeps its own ID map. Log the
+    bridge before dispatch, without changing Sequence or routing metadata.
+    Sequence IDs are allocated by one API process; keep that process's stream
+    ID and a separate trace directory for each server run when joining offline.
+    """
+    writer = get_writer()
+    if writer is not None:
+        writer.emit(
+            "api_sequence",
+            request_id=request_id,
+            seq_id=int(seq.id),
+            sibling_index=int(seq.sibling_index),
+        )
+
+
 class EngineTrace:
     def __init__(self, config, writer):
         if config.pipeline_parallel_size != 1 or config.enable_rapidserve:

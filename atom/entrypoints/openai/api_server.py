@@ -37,7 +37,7 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from atom import SamplingParams
 from atom.entrypoints.chat_utils import has_multimodal_content, parse_chat_messages
-from atom.metrics.routing_trace import trace_api_request
+from atom.metrics.routing_trace import trace_api_request, trace_api_sequence
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.request import RequestOutput
@@ -813,6 +813,7 @@ async def generate_async(
         )
 
     seq = await loop.run_in_executor(None, do_preprocess)
+    trace_api_sequence(request_id, seq)
     try:
         _validate_sequence_context_length(seq)
     except Exception:
@@ -935,6 +936,7 @@ async def generate_async_multimodal(
         )
 
     seq = await loop.run_in_executor(None, do_preprocess)
+    trace_api_sequence(request_id, seq)
     try:
         _validate_sequence_context_length(seq)
     except Exception:
@@ -1058,6 +1060,8 @@ async def generate_async_fanout(
         )
 
     seqs = await loop.run_in_executor(None, do_preprocess)
+    for seq in seqs:
+        trace_api_sequence(request_id, seq)
     try:
         _validate_sequence_context_length(seqs[0])
     except Exception:
@@ -1215,6 +1219,7 @@ async def setup_streaming_request(
     seq = None
     try:
         seq = await executor_loop.run_in_executor(None, do_preprocess)
+        trace_api_sequence(request_id, seq)
         _validate_sequence_context_length(seq)
     except Exception:
         _stream_loops.pop(request_id, None)
@@ -1437,6 +1442,8 @@ async def setup_streaming_request_fanout(
     seqs = []
     try:
         seqs = await executor_loop.run_in_executor(None, do_preprocess)
+        for seq in seqs:
+            trace_api_sequence(request_id, seq)
         _validate_sequence_context_length(seqs[0])
     except Exception:
         _stream_loops.pop(request_id, None)

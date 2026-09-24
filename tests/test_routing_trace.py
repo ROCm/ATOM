@@ -232,6 +232,23 @@ def test_real_sequence_and_batch_preserve_chunk_features():
     json.dumps(sink.events, allow_nan=False)
 
 
+def test_single_output_api_bridge_works_without_external_sequence_id(monkeypatch):
+    import pickle
+
+    from atom.model_engine.sequence import Sequence
+
+    sink = Sink()
+    monkeypatch.setattr(trace, "get_writer", lambda: sink)
+    request = Sequence([1, 2, 3], block_size=4)
+    assert request.external_request_id is None
+    trace.trace_api_sequence("api-attempt", request)
+    received = pickle.loads(pickle.dumps(request))
+    bridge = sink.events[-1]
+    assert bridge["request_id"] == "api-attempt"
+    assert bridge["seq_id"] == received.id
+    assert received.external_request_id is None
+
+
 def test_real_engine_step_does_not_publish_completion_on_forward_error():
     from aiter_stub import stubbed_aiter
 
