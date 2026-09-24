@@ -490,9 +490,8 @@ models:
               --enable-dp-attention
               --dp-load-balance least_requests
               --cudagraph-mode FULL
-          service:
-            router:
-              policy: cache_aware
+          router:
+            policy: cache_aware
 
         - <<: *glm52_agentic_lmcache_dpa4_cacheaware_1p1d
           name: glm-52-mxfp4-1p1d-dpa4-cacheaware-agentic-lmcache-1m-c28
