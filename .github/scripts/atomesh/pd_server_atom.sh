@@ -16,6 +16,7 @@ ATOMESH_PD_WORKER_LAYOUT="${ATOMESH_PD_WORKER_LAYOUT:-multi_node}"
 SINGLE_NODE_PD=0
 PREFILL_SINGLE_NODE_PD=0
 DECODE_SINGLE_NODE_PD=0
+PACKED_NODES_PD=0
 case "${ATOMESH_PD_WORKER_LAYOUT}" in
   single_node)
     SINGLE_NODE_PD=1
@@ -25,6 +26,9 @@ case "${ATOMESH_PD_WORKER_LAYOUT}" in
     ;;
   decode_single_node)
     DECODE_SINGLE_NODE_PD=1
+    ;;
+  packed_nodes)
+    PACKED_NODES_PD=1
     ;;
 esac
 
@@ -93,7 +97,7 @@ done
 unset shifted_port_name
 unset -f validate_shifted_port
 USE_EXPLICIT_DP_PORTS=0
-if [[ "${SINGLE_NODE_PD}" == "1" || "${PREFILL_SINGLE_NODE_PD}" == "1" || "${DECODE_SINGLE_NODE_PD}" == "1" ]]; then
+if [[ "${SINGLE_NODE_PD}" == "1" || "${PREFILL_SINGLE_NODE_PD}" == "1" || "${DECODE_SINGLE_NODE_PD}" == "1" || "${PACKED_NODES_PD}" == "1" ]]; then
   USE_EXPLICIT_DP_PORTS=1
 fi
 
@@ -316,6 +320,56 @@ if [[ "${SINGLE_NODE_PD}" == "1" ]]; then
   decode_ips+=("${IP_ARRAY[0]}")
   decode_ports+=("${DECODE_PORT}")
   decode_args+=(--decode "http://${IP_ARRAY[0]}:${DECODE_PORT}")
+elif [[ "${PACKED_NODES_PD}" == "1" ]]; then
+  # PP size is not a top-level env var on this launcher; parse it from extra_args.
+  _pp_from_args() {
+    local args="$1"
+    if [[ "${args}" =~ --pipeline-parallel-size[=\ ]+([0-9]+) ]]; then
+      echo "${BASH_REMATCH[1]}"
+    else
+      echo 1
+    fi
+  }
+  PREFILL_PP_SIZE="$(_pp_from_args "${PREFILL_SERVER_ARGS}")"
+  DECODE_PP_SIZE="$(_pp_from_args "${DECODE_SERVER_ARGS}")"
+  prefill_nodes=()
+  prefill_gpus=()
+  decode_nodes=()
+  decode_gpus=()
+  packed_node=0
+  packed_used=0
+  place_packed_worker() {
+    local width="$1"
+    local -n placed_nodes="$2"
+    local -n placed_gpus="$3"
+    if (( width > 8 )); then
+      echo "ERROR: packed_nodes workers must fit on one 8-GPU node" >&2
+      exit 2
+    fi
+    if (( packed_used + width > 8 )); then
+      packed_node=$((packed_node + 1))
+      packed_used=0
+    fi
+    placed_nodes+=("${packed_node}")
+    placed_gpus+=("$(seq -s, "${packed_used}" "$((packed_used + width - 1))")")
+    packed_used=$((packed_used + width))
+  }
+  for idx in $(seq 0 $((xP - 1))); do
+    place_packed_worker "$((PREFILL_PP_SIZE * PREFILL_TP_SIZE))" prefill_nodes prefill_gpus
+    prefill_ips+=("${IP_ARRAY[${prefill_nodes[$idx]}]:-}")
+    prefill_ports+=("$((PREFILL_PORT + idx))")
+    prefill_args+=(--prefill "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}")
+  done
+  for idx in $(seq 0 $((yD - 1))); do
+    place_packed_worker "$((DECODE_PP_SIZE * DECODE_TP_SIZE))" decode_nodes decode_gpus
+    decode_ips+=("${IP_ARRAY[${decode_nodes[$idx]}]:-}")
+    decode_ports+=("$((DECODE_PORT + idx))")
+    decode_args+=(--decode "http://${decode_ips[$idx]}:${decode_ports[$idx]}")
+  done
+  if (( packed_node + 1 != ${#IP_ARRAY[@]} )); then
+    echo "ERROR: packed_nodes needs $((packed_node + 1)) node(s), got ${#IP_ARRAY[@]}" >&2
+    exit 2
+  fi
 elif [[ "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   for idx in $(seq 0 $((xP - 1))); do
     prefill_port=$((PREFILL_PORT + idx))
@@ -565,7 +619,14 @@ start_logged_process() {
   local log_file="$2"
   shift 2
 
-  if command -v setsid >/dev/null 2>&1; then
+  if [[ "${PACKED_NODES_PD:-0}" == "1" ]]; then
+    echo "[runtime] logging ${log_file} (file-only, packed layout)"
+    if command -v setsid >/dev/null 2>&1; then
+      setsid "$@" >"${log_file}" 2>&1 &
+    else
+      "$@" >"${log_file}" 2>&1 &
+    fi
+  elif command -v setsid >/dev/null 2>&1; then
     setsid "$@" > >(tee "${log_file}") 2>&1 &
   else
     "$@" > >(tee "${log_file}") 2>&1 &
@@ -676,7 +737,11 @@ start_prefill() {
   local handshake_port="${3:-${HANDSHAKE_PORT}}"
   local dp_master_port="${4:-${PREFILL_DP_MASTER_PORT}}"
   local dp_base_port="${5:-${PREFILL_DP_BASE_PORT}}"
+  local visible_devices="${6:-}"
   apply_role_env "ATOMESH_PREFILL_ENV_" "${host_ip}"
+  if [[ -n "${visible_devices}" ]]; then
+    export HIP_VISIBLE_DEVICES="${visible_devices}"
+  fi
   reset_lmcache_disk
   local -a prefill_cache_env=()
   build_server_cache_env "prefill" "${server_port}" prefill_cache_env
@@ -714,7 +779,11 @@ start_decode() {
   local handshake_port="${3:-${HANDSHAKE_PORT}}"
   local dp_master_port="${4:-${DECODE_DP_MASTER_PORT}}"
   local dp_base_port="${5:-${DECODE_DP_BASE_PORT}}"
+  local visible_devices="${6:-}"
   apply_role_env "ATOMESH_DECODE_ENV_" "${host_ip}"
+  if [[ -n "${visible_devices}" ]]; then
+    export HIP_VISIBLE_DEVICES="${visible_devices}"
+  fi
   local max_conc
   max_conc="$(echo "${BENCH_MAX_CONCURRENCY}" | tr 'x,' '\n' | sort -n | tail -1)"
   local decode_max_num_seqs="${MAX_NUM_SEQS}"
@@ -1348,6 +1417,63 @@ if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
   wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
   run_benchmark_and_eval
   cleanup_processes "${router_pid}" "${prefill_pid}" "${decode_pid}"
+elif [[ "${PACKED_NODES_PD}" == "1" ]]; then
+  worker_pids=()
+  declare -A local_worker_pid=()
+  # Save the base handshake port; each worker overrides it so
+  # apply_role_env expands ${HANDSHAKE_PORT} to the per-worker value.
+  PACKED_BASE_HANDSHAKE_PORT="${HANDSHAKE_PORT}"
+  for idx in "${!prefill_nodes[@]}"; do
+    [[ "${prefill_nodes[$idx]}" -eq "${NODE_RANK}" ]] || continue
+    gpu_start="${prefill_gpus[$idx]%%,*}"
+    export HANDSHAKE_PORT="$((PACKED_BASE_HANDSHAKE_PORT + gpu_start))"
+    start_prefill "prefill-rank-${NODE_RANK}-worker-${idx}" "${prefill_ports[$idx]}" \
+      "${HANDSHAKE_PORT}" \
+      "$((PREFILL_DP_MASTER_PORT + idx * 400))" "$((PREFILL_DP_BASE_PORT + idx * 400))" \
+      "${prefill_gpus[$idx]}"
+    worker_pids+=("${server_pid}")
+    local_worker_pid["prefill-${idx}"]="${server_pid}"
+  done
+  for idx in "${!decode_nodes[@]}"; do
+    [[ "${decode_nodes[$idx]}" -eq "${NODE_RANK}" ]] || continue
+    gpu_start="${decode_gpus[$idx]%%,*}"
+    export HANDSHAKE_PORT="$((PACKED_BASE_HANDSHAKE_PORT + gpu_start))"
+    start_decode "decode-rank-${NODE_RANK}-worker-${idx}" "${decode_ports[$idx]}" \
+      "${HANDSHAKE_PORT}" \
+      "$((DECODE_DP_MASTER_PORT + idx * 400))" "$((DECODE_DP_BASE_PORT + idx * 400))" \
+      "${decode_gpus[$idx]}"
+    worker_pids+=("${server_pid}")
+    local_worker_pid["decode-${idx}"]="${server_pid}"
+  done
+  trap 'cleanup_processes ${router_pid:-} ${worker_pids[*]:-}' EXIT
+  if [[ "${NODE_RANK}" -eq 0 ]]; then
+    for idx in "${!prefill_ips[@]}"; do
+      wait_http "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/health" \
+        "prefill-${prefill_ips[$idx]}:${prefill_ports[$idx]}" \
+        "${WAIT_SERVER_TIMEOUT}" "${local_worker_pid["prefill-${idx}"]:-}"
+    done
+    for idx in "${!decode_ips[@]}"; do
+      wait_http "http://${decode_ips[$idx]}:${decode_ports[$idx]}/health" \
+        "decode-${decode_ips[$idx]}:${decode_ports[$idx]}" \
+        "${WAIT_SERVER_TIMEOUT}" "${local_worker_pid["decode-${idx}"]:-}"
+    done
+    start_router
+    wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
+    run_benchmark_and_eval
+  else
+    wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}"
+    # Monitor all local workers while waiting for the router to shut down.
+    for pid in "${worker_pids[@]}"; do
+      if ! kill -0 "${pid}" 2>/dev/null; then
+        set +e; wait "${pid}"; rc=$?; set -e
+        [[ "${rc}" -eq 0 ]] && rc=1
+        echo "[wait][FAIL] packed worker ${pid} exited early rc=${rc}" >&2
+        exit "${rc}"
+      fi
+    done
+    wait_router_closed
+  fi
+  cleanup_processes "${router_pid:-}" "${worker_pids[@]}"
 elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   prefill_pids=()
   for idx in $(seq 0 $((xP - 1))); do
