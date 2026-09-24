@@ -3,6 +3,9 @@ ARG BASE_IMAGE="rocm/pytorch:latest"
 ARG OOT_BASE_IMAGE="rocm/atom-dev:latest"
 ARG SGLANG_BASE_IMAGE="rocm/atom-dev:latest"
 ARG GPU_ARCH="gfx942;gfx950"
+# LMCache wheel image (FROM scratch, one wheel at /), pinned by digest. See the
+# LMCache section of atom_image.
+ARG LMCACHE_WHEEL_IMAGE="rocm/atom-dev:lmcache-v0.5.6.dev98-g05fc77a0-rocm-torch210@sha256:PENDING"
 
 # OOT image extends an ATOM base image that already contains atom/aiter/mori.
 FROM ${OOT_BASE_IMAGE} AS atom_oot
@@ -400,6 +403,9 @@ RUN echo "========== [Parallel] Building Aiter ==========" && \
     MAX_JOBS=$MAX_JOBS PREBUILD_KERNELS=$PREBUILD_KERNELS \
     GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop
 
+# The LMCache wheel, published by .github/workflows/lmcache-rocm-wheel.yaml.
+FROM ${LMCACHE_WHEEL_IMAGE} AS lmcache_wheel
+
 # --------------------------------------------------------------------
 # Stage 3: Final merge — collect all build artifacts + install MORI/ATOM
 # --------------------------------------------------------------------
@@ -547,22 +553,23 @@ RUN echo "========== Install atomesh binary ==========" && \
 
 # ========== LMCache (ROCm 7.2.4 / torch 2.10) for KV offload ==========
 # Install a wheel built for the image's exact PyTorch ABI. Keep --no-deps so
-# pip cannot replace the preinstalled ROCm torch stack. The pin is a release of
-# this repository published by .github/workflows/lmcache-rocm-wheel.yaml, which
-# also opens the PR that moves it. The wheel name, its URL and the expected
-# lmcache.__version__ follow from the release tag; the ABI suffix and wheel tag
-# are the workflow's ROCM_TORCH210_LOCAL_VERSION and EXPECTED_WHEEL_TAG, and
-# change only with the image's torch.
-ARG LMCACHE_WHEEL_RELEASE=lmcache-v0.5.6.dev98-g05fc77a0-rocm-torch210
+# pip cannot replace the preinstalled ROCm torch stack. The wheel comes from
+# LMCACHE_WHEEL_IMAGE, a FROM scratch image holding only the wheel, which
+# .github/workflows/lmcache-rocm-wheel.yaml pushes to Docker Hub; the same
+# workflow opens the PR that moves the pin. The expected lmcache.__version__
+# follows from the wheel name; the ABI suffix and wheel tag are the workflow's
+# ROCM_TORCH210_LOCAL_VERSION and EXPECTED_WHEEL_TAG, and change only with the
+# image's torch.
 ARG LMCACHE_WHEEL_SHA256=a5fe8f3f5b9dee602ac7d11241f65a1640cd3d26c101f2d1d0e0d8aee88b7aab
+COPY --from=lmcache_wheel / /tmp/lmcache-wheel/
 RUN echo "========== [ATOM] Install LMCache ROCm torch 2.10 wheel ==========" && \
-    lmcache_version="$(echo "${LMCACHE_WHEEL_RELEASE}" | sed -nE \
-        's/^lmcache-v([^-]+)-(g[0-9a-f]{8})-rocm-torch210$/\1+\2.rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1/p')" && \
-    { [ -n "${lmcache_version}" ] || { echo "Unexpected LMCACHE_WHEEL_RELEASE=${LMCACHE_WHEEL_RELEASE}"; exit 1; }; } && \
-    lmcache_wheel="lmcache-${lmcache_version}-cp312-cp312-manylinux_2_39_x86_64.whl" && \
-    curl -fL "https://github.com/ROCm/ATOM/releases/download/${LMCACHE_WHEEL_RELEASE}/$(echo "${lmcache_wheel}" | sed 's/+/%2B/')" \
-        -o "/tmp/${lmcache_wheel}" && \
-    echo "${LMCACHE_WHEEL_SHA256}  /tmp/${lmcache_wheel}" | sha256sum -c - && \
+    set -- /tmp/lmcache-wheel/*.whl && \
+    { [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "Expected one wheel in LMCACHE_WHEEL_IMAGE, found: $*"; exit 1; }; } && \
+    lmcache_wheel="$1" && \
+    lmcache_version="$(basename "${lmcache_wheel}" | sed -nE \
+        's/^lmcache-([^-]+\.rocm7\.2\.4\.torch2\.10\.git3d3aa833\.cxx11abi1)-cp312-cp312-manylinux_2_39_x86_64\.whl$/\1/p')" && \
+    { [ -n "${lmcache_version}" ] || { echo "Unexpected LMCache wheel ${lmcache_wheel}"; exit 1; }; } && \
+    echo "${LMCACHE_WHEEL_SHA256}  ${lmcache_wheel}" | sha256sum -c - && \
     "${VENV_PYTHON}" -m pip install \
         prometheus_client==0.25.0 aiofile==3.11.1 aiofiles caio==0.9.25 \
         blake3 redis sortedcontainers pyzmq cupy-rocm-7-0 \
@@ -572,7 +579,7 @@ RUN echo "========== [ATOM] Install LMCache ROCm torch 2.10 wheel ==========" &&
         opentelemetry-exporter-prometheus==0.61b0 \
         "grpcio>=1.78.0" "protobuf>=6.31.1,<7" && \
     "${VENV_PYTHON}" -m pip install --no-deps "/tmp/${lmcache_wheel}" && \
-    rm -f "/tmp/${lmcache_wheel}" && \
+    rm -rf /tmp/lmcache-wheel && \
     "${VENV_PYTHON}" -c "import torch; torch.cuda.is_available = lambda: True; import lmcache, lmcache.cuda_ops, lmcache.lmcache_native; \
 from lmcache.v1.cache_engine import LMCacheEngineBuilder; \
 from lmcache.v1.memory_management import MemoryFormat; \
