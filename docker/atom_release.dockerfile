@@ -637,11 +637,11 @@ RUN echo "========== Install atomesh binary ==========" && \
     atomesh --version
 
 # ========== LMCache (ROCm 7.2.4 / torch 2.10) for KV offload ==========
-# Install a wheel built for the image's exact PyTorch ABI. LMCache publishes
-# torch 2.10 wheels only with tagged releases, so this one is built from an
-# LMCache dev commit by .github/workflows/lmcache-rocm-wheel.yaml and pinned
-# from this repository's releases. Keep --no-deps so pip cannot replace the
-# preinstalled ROCm torch stack.
+# Install a wheel built for the image's exact PyTorch ABI. Keep --no-deps so
+# pip cannot replace the preinstalled ROCm torch stack. The expected
+# lmcache.__version__ comes from LMCACHE_WHEEL_NAME, so a pin is just the three
+# args below; .github/workflows/lmcache-rocm-wheel.yaml rewrites them when it
+# publishes a new wheel (.github/scripts/bump_lmcache_wheel_pin.py).
 ARG LMCACHE_WHEEL_NAME=lmcache-0.5.6.dev98+g05fc77a0.rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1-cp312-cp312-manylinux_2_39_x86_64.whl
 ARG LMCACHE_WHEEL_URL=https://github.com/ROCm/ATOM/releases/download/lmcache-v0.5.6.dev98-g05fc77a0-rocm-torch210/lmcache-0.5.6.dev98%2Bg05fc77a0.rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1-cp312-cp312-manylinux_2_39_x86_64.whl
 ARG LMCACHE_WHEEL_SHA256=a5fe8f3f5b9dee602ac7d11241f65a1640cd3d26c101f2d1d0e0d8aee88b7aab
@@ -683,7 +683,7 @@ RUN if [ -z "${ROCM_HOME}" ]; then \
       from lmcache.v1.multiprocess.futures import DeviceMessagingFuture; \
       from lmcache.v1.multiprocess.group_view import EngineGroupInfo; \
       assert 'rocm' in torch.__version__, torch.__version__; \
-      assert lmcache.__version__ == '0.5.6.dev98+g05fc77a0.rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1', lmcache.__version__; \
+      assert lmcache.__version__ == '${LMCACHE_WHEEL_NAME}'.split('-')[1], lmcache.__version__; \
       assert lmcache.cuda_ops.__file__.endswith('.so'), lmcache.cuda_ops.__file__; \
       assert lmcache.lmcache_native.__file__.endswith('.so'), lmcache.lmcache_native.__file__; \
       assert hasattr(lmcache.cuda_ops, 'execute_object_group_transfer'), 'cuda_ops extension is incomplete'; \
