@@ -89,14 +89,14 @@ start_router
             line[4:] for line in result.stdout.splitlines() if line.startswith("ARG:")
         ]
 
-    def test_all_v4_concurrencies_launch_cache_aware_on_both_roles(self):
+    def test_all_v4_concurrencies_launch_adaptive_prefill_and_cache_aware_decode(self):
         self.assertEqual(
             {tuple(cell["concurrency"]) for cell in self.cells},
             {(128,), (192,), (256,)},
         )
         expected = {
             "--policy": "cache_aware",
-            "--prefill-policy": "cache_aware",
+            "--prefill-policy": "adaptive_cache_aware",
             "--decode-policy": "cache_aware",
             "--cache-threshold": "0.8",
             "--balance-abs-threshold": "20",
