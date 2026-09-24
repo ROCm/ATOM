@@ -260,7 +260,9 @@ jobs:
           # the runner host, whose python is whatever the host image ships,
           # and subprocess.run(capture_output=...) needs 3.7. The python below
           # only normalises a string, so it works on any python3.
-          DESCRIBE=$(git describe --tags --long --dirty)
+          # Only ATOM's own vX.Y.Z tags; others (e.g. lmcache-v...) would become
+          # the base version. Same filter as setuptools-scm in pyproject.toml.
+          DESCRIBE=$(git describe --tags --long --dirty --match 'v[0-9]*')
           VERSIONS=$(ROCM_VER="${ROCM_VER}" DATE_STAMP="${DATE_STAMP}" DESCRIBE="${DESCRIBE}" python3 - <<'PYEOF'
           import os, re
 

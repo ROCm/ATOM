@@ -79,26 +79,48 @@ env:
   ROCM_TORCH210_LOCAL_VERSION: rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1
 
 jobs:
-  build:
-    name: Build and validate LMCache ${{ inputs.lmcache_commit }}
-    if: ${{ inputs.source_run_id == '' }}
-    runs-on: ${{ inputs.runner || 'build-only-atom' }}
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-      wheel: ${{ steps.wheel.outputs.wheel }}
-      sha256: ${{ steps.wheel.outputs.sha256 }}
+  # Both the build and the source_run_id publish path rely on these, so they
+  # are checked once, before either runs.
+  check-inputs:
+    name: Check inputs
+    runs-on: ubuntu-latest
+    env:
+      LMCACHE_COMMIT: ${{ inputs.lmcache_commit }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      PUBLISH: ${{ inputs.publish }}
     steps:
-      - name: Check the requested commit
-        env:
-          LMCACHE_COMMIT: ${{ inputs.lmcache_commit }}
+      - name: Check inputs
         run: |
+          set -euo pipefail
           # A branch name would make the image tag say one thing and hold another
           # the next time someone reruns it.
           if ! [[ "${LMCACHE_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
             echo "lmcache_commit must be a full 40-character lowercase SHA, got '${LMCACHE_COMMIT}'."
             exit 1
           fi
+          if [ -n "${SOURCE_RUN_ID}" ]; then
+            if ! [[ "${SOURCE_RUN_ID}" =~ ^[0-9]+$ ]]; then
+              echo "source_run_id must be the numeric run ID (.../actions/runs/<id>), got '${SOURCE_RUN_ID}'."
+              exit 1
+            fi
+            # Otherwise both jobs skip and the run is green having done nothing.
+            if [ "${PUBLISH}" != "true" ]; then
+              echo "source_run_id only selects the wheel to publish; set publish=true as well."
+              exit 1
+            fi
+          fi
 
+  build:
+    name: Build and validate LMCache ${{ inputs.lmcache_commit }}
+    needs: check-inputs
+    if: ${{ inputs.source_run_id == '' }}
+    runs-on: ${{ inputs.runner || 'build-only-atom' }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      wheel: ${{ steps.wheel.outputs.wheel }}
+      sha256: ${{ steps.wheel.outputs.sha256 }}
+      artifact: ${{ steps.wheel.outputs.artifact }}
+    steps:
       - name: Checkout ATOM
         uses: actions/checkout@v4
         with:
@@ -175,6 +197,7 @@ jobs:
           sha256=$(sha256sum "${wheels[0]}" | cut -d' ' -f1)
           echo "wheel=${wheel}" >> "$GITHUB_OUTPUT"
           echo "sha256=${sha256}" >> "$GITHUB_OUTPUT"
+          echo "artifact=lmcache-rocm-torch210-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
           echo "${sha256}  ${wheel}"
 
       # A clean container of the build image, so nothing from the build tree or
@@ -241,10 +264,10 @@ jobs:
 
   publish:
     name: Publish the wheel image to Docker Hub
-    needs: build
+    needs: [check-inputs, build]
     # With source_run_id the build job is skipped on purpose.
     if: >-
-      ${{ !cancelled() && inputs.publish &&
+      ${{ !cancelled() && inputs.publish && needs.check-inputs.result == 'success' &&
           (needs.build.result == 'success' ||
            (inputs.source_run_id != '' && needs.build.result == 'skipped')) }}
     runs-on: ubuntu-latest
@@ -264,8 +287,6 @@ jobs:
       LMCACHE_COMMIT: ${{ inputs.lmcache_commit }}
       SOURCE_RUN_ID: ${{ inputs.source_run_id }}
       BUILT_SHA256: ${{ needs.build.outputs.sha256 }}
-      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
     steps:
       - name: Checkout ATOM
         uses: actions/checkout@v4
@@ -274,27 +295,69 @@ jobs:
             .github/actions
             .github/scripts
 
+      - name: Resolve the wheel artifact
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILT_ARTIFACT: ${{ needs.build.outputs.artifact }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          WORKFLOW_PATH: .github/workflows/lmcache-rocm-wheel.yaml
+        run: |
+          set -euo pipefail
+          if [ -z "${SOURCE_RUN_ID}" ]; then
+            # Named after the attempt that ran the build, which "Re-run failed
+            # jobs" reuses when only this job failed.
+            echo "run_id=${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+            echo "artifact=${BUILT_ARTIFACT}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          api="repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}"
+          read -r path branch < <(gh api "${api}" --jq '"\(.path) \(.head_branch)"')
+          # Only this workflow's build and validation can vouch for the wheel,
+          # and only as defined on the default branch or the branch publishing it.
+          if [ "${path}" != "${WORKFLOW_PATH}" ]; then
+            echo "Run ${SOURCE_RUN_ID} is ${path}, not ${WORKFLOW_PATH}."
+            exit 1
+          fi
+          if [ "${branch}" != "${DEFAULT_BRANCH}" ] && [ "${branch}" != "${GITHUB_REF_NAME}" ]; then
+            echo "Run ${SOURCE_RUN_ID} ran on ${branch}; publish it from ${branch} or ${DEFAULT_BRANCH}."
+            exit 1
+          fi
+          # A run re-run in full has one artifact per attempt; take the latest.
+          artifact=$(gh api "${api}/artifacts?per_page=100" --jq "
+            [.artifacts[] | select(.expired | not)
+             | select(.name | startswith(\"lmcache-rocm-torch210-${SOURCE_RUN_ID}-\"))]
+            | sort_by(.name | split(\"-\") | last | tonumber) | last | .name // empty")
+          if [ -z "${artifact}" ]; then
+            echo "Run ${SOURCE_RUN_ID} has no unexpired wheel artifact."
+            exit 1
+          fi
+          attempt="${artifact##*-}"
+          build=$(gh api "${api}/attempts/${attempt}/jobs?per_page=100" \
+            --jq '[.jobs[] | select(.name | startswith("Build and validate"))][0].conclusion // empty')
+          if [ "${build}" != "success" ]; then
+            echo "Run ${SOURCE_RUN_ID} attempt ${attempt}: build job concluded '${build}', not success."
+            exit 1
+          fi
+          echo "run_id=${SOURCE_RUN_ID}" >> "$GITHUB_OUTPUT"
+          echo "artifact=${artifact}" >> "$GITHUB_OUTPUT"
+          echo "Publishing ${artifact} from ${branch}"
+
       - name: Download the wheel
         uses: actions/download-artifact@v4
         with:
-          # An earlier run may have several attempts; the next step insists on
-          # exactly one wheel rather than picking one.
-          pattern: >-
-            ${{ inputs.source_run_id != ''
-                && format('lmcache-rocm-torch210-{0}-*', inputs.source_run_id)
-                || format('lmcache-rocm-torch210-{0}-{1}', github.run_id, github.run_attempt) }}
-          run-id: ${{ inputs.source_run_id || github.run_id }}
+          name: ${{ steps.source.outputs.artifact }}
+          run-id: ${{ steps.source.outputs.run_id }}
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/wheel-artifacts
 
       - name: Check the wheel
         id: wheel
+        env:
+          ARTIFACT: ${{ steps.source.outputs.artifact }}
+          SOURCE_RUN: ${{ steps.source.outputs.run_id }}
         run: |
           set -euo pipefail
-          if [ -n "${SOURCE_RUN_ID}" ] && ! [[ "${SOURCE_RUN_ID}" =~ ^[0-9]+$ ]]; then
-            echo "source_run_id must be a run ID, got '${SOURCE_RUN_ID}'."
-            exit 1
-          fi
           mapfile -t wheels < <(find "${RUNNER_TEMP}/wheel-artifacts" -name '*.whl')
           if [ "${#wheels[@]}" -ne 1 ]; then
             echo "Expected exactly one wheel, found ${#wheels[@]}: ${wheels[*]}"
@@ -324,8 +387,8 @@ jobs:
             echo "version=${version}"
             echo "sha256=${sha256}"
             echo "image_tag=lmcache-v${base}-g${short}-rocm-torch210"
-            echo "artifact=$(basename "$(dirname "${path}")")"
-            echo "source_run=${SOURCE_RUN_ID:-${GITHUB_RUN_ID}}"
+            echo "artifact=${ARTIFACT}"
+            echo "source_run=${SOURCE_RUN}"
           } >> "$GITHUB_OUTPUT"
           echo "${sha256}  ${wheel}"
 
@@ -342,13 +405,20 @@ jobs:
           IMAGE_TAG: ${{ steps.wheel.outputs.image_tag }}
           SHA256: ${{ steps.wheel.outputs.sha256 }}
           SOURCE_RUN: ${{ steps.wheel.outputs.source_run }}
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
           set -euo pipefail
           ref="${IMAGE_REPO}:${IMAGE_TAG}"
           # The Dockerfiles pin the digest, so a moved tag would not change what
           # they install, but it would make the tag lie about the pinned wheel.
-          if docker manifest inspect "${ref}" >/dev/null 2>&1; then
+          # Anything but "no such manifest" (rate limit, 5xx, network) is not
+          # proof that the tag is free.
+          if err=$(docker manifest inspect "${ref}" 2>&1 >/dev/null); then
             echo "${ref} already exists; not overwriting it."
+            exit 1
+          elif [[ "${err}" != *"no such manifest"* ]]; then
+            echo "Could not check whether ${ref} exists: ${err}"
             exit 1
           fi
           cat > "${RUNNER_TEMP}/wheel-image/Dockerfile" <<'EOF'
