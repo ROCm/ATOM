@@ -68,6 +68,34 @@ def test_buffered_records_flush_on_close_and_periodic_write(tmp_path, monkeypatc
     assert len(list(iter_jsonl(path))) == 12
 
 
+@pytest.mark.parametrize(
+    "environment,synthetic",
+    [
+        (
+            {
+                "SERVER_ARGS": "-tp 2 --spec_decode_acceptance_length=3.51",
+                "ATOM_DSV41_BENCHMARK_SYNTHETIC": "0",
+            },
+            True,
+        ),
+        ({"SERVER_ARGS": "-tp 2 --spec-decode-acceptance-rate 0.8"}, True),
+        ({"ENABLE_TORCH_PROFILER": "1"}, False),
+        ({"ENABLE_RTL_PROFILER": "1"}, False),
+    ],
+)
+def test_single_node_dashboard_excludes_forced_and_instrumented(environment, synthetic):
+    fixture = read_json(FIXTURES / "aiperf-dashboard.json")
+    result = dashboard_module().dashboard_summary(
+        {**fixture["source"], "metadata": {"submission_valid": True}},
+        Path("aiperf/profile_export_aiperf.json"),
+        2,
+        environment,
+        single_node=True,
+    )
+    assert result["synthetic"] is synthetic
+    assert result["dashboard_publish_allowed"] is False
+
+
 def test_resolved_client_overrides_survive_launch_capture(tmp_path):
     from atom.benchmarks.results.__main__ import main
 

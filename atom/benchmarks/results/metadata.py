@@ -29,6 +29,9 @@ PERFORMANCE_KEYS = {
     "ATOM_MOE_GU_ITLV",
     "ATOM_NUMA_BIND",
     "ATOM_DSV41_BENCHMARK_SYNTHETIC",
+    "ENABLE_TORCH_PROFILER",
+    "ENABLE_RTL_PROFILER",
+    "ATOM_AGENTIC_PROFILE_SECONDS",
     "AIPERF_UNSAFE_OVERRIDE",
     "AIPERF_SCENARIO",
     "AIPERF_PUBLIC_DATASET",
@@ -155,6 +158,26 @@ def option(argv, names, default=None):
             result = argv[i + 1]
         elif normalized in names and "=" in arg:
             result = arg.split("=", 1)[1]
+    return result
+
+
+def synthetic_settings(argv, environment):
+    """Derive forced acceptance from executed flags, retaining legacy declarations."""
+    settings = {}
+    for key in ("length", "rate"):
+        value = option(argv, (f"--spec-decode-acceptance-{key}",))
+        if value is not None:
+            settings[f"acceptance_{key}"] = float(value)
+    declared = environment.get("ATOM_DSV41_BENCHMARK_SYNTHETIC")
+    forced = bool(settings)
+    # A declaration can describe older/custom synthetic mechanisms. Preserve it
+    # conservatively, but it must never hide forced acceptance in actual argv.
+    result = {"synthetic": forced or declared in ("1", "true"), **settings}
+    if declared is not None:
+        result["synthetic_declared"] = declared in ("1", "true")
+        result["synthetic_declaration_mismatch"] = (
+            result["synthetic_declared"] != forced
+        )
     return result
 
 
@@ -326,7 +349,11 @@ def capture_config(model, server_argv, kind, concurrency, launch=None):
             "alignment": "client and collector share the host clock",
         },
         "validity": {
-            "synthetic": env.get("ATOM_DSV41_BENCHMARK_SYNTHETIC") == "1",
+            **synthetic_settings(argv, env),
+            "instrumented": any(
+                env.get(key) == "1"
+                for key in ("ENABLE_TORCH_PROFILER", "ENABLE_RTL_PROFILER")
+            ),
             "unsafe_override": os.environ.get("AIPERF_UNSAFE_OVERRIDE") in ("1", "true")
             or (
                 kind == "agentic"

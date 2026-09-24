@@ -30,7 +30,7 @@ SUMMARY_FILES = {
 
 
 def recipe_fingerprint(config, version=AGGREGATION_VERSION):
-    if version not in ("1.0.0", "1.0.1"):
+    if version not in ("1.0.0", "1.0.1", "1.0.2"):
         raise ValueError(f"Unsupported aggregation version: {version}")
     # Physical card IDs locate evidence but do not define a curve.
     # Software versions, graph settings and workload settings do define one.
@@ -180,11 +180,18 @@ def build_bundle(
         inferencex_export,
         metadata_errors,
     )
-    from .metadata import resolve_client_config
+    from .metadata import resolve_client_config, synthetic_settings
     from .records import from_aiperf
     from .telemetry import attach_telemetry
 
     config = copy.deepcopy(config)
+    actual = synthetic_settings(
+        config["recipe"].get("server_argv", []), config["recipe"].get("environment", {})
+    )
+    # Old bundles may lack the original declaration or use another synthetic
+    # mechanism. Rebuild must not erase their existing conservative marker.
+    actual["synthetic"] |= bool(config["validity"].get("synthetic"))
+    config["validity"].update(actual)
     resolve_client_config(config, client_launch)
     problems = config_errors(config)
     if problems:
@@ -340,15 +347,14 @@ def build_bundle(
                 {"recipe": recipe_id, "workload": workload_scope}
             ),
         )
-        valid = not config["validity"].get("synthetic") and not config["validity"].get(
-            "unsafe_override"
-        )
+        valid = not config["validity"].get("unsafe_override")
         valid = valid and config["validity"].get("submission_valid") is not False
         validation = {
             "complete": not missing,
             "missing": missing,
             "exit_code": exit_code,
             "measurement_valid": valid
+            and not missing
             and not measurement_errors
             and not counts.get("invalid")
             and exit_code == 0
@@ -357,6 +363,11 @@ def build_bundle(
             "requested_full": require_full,
             "export_errors": {"inferencex": metadata_errors(config)},
         }
+        validation["submission_eligible"] = (
+            validation["measurement_valid"]
+            and not config["validity"].get("synthetic")
+            and not config["validity"].get("instrumented")
+        )
         write_json(temporary / "validation.json", validation)
         write_json(temporary / "summary.json", summary)
         write_view(
@@ -369,7 +380,7 @@ def build_bundle(
             export["benchmark_outcome"] = {
                 "status": "success" if validation["measurement_valid"] else "failed"
             }
-            export["submission_valid"] = validation["measurement_valid"]
+            export["submission_valid"] = validation["submission_eligible"]
             write_json(temporary / "exports" / "inferencex-v3.json", export)
         manifest = {
             "schema_version": SCHEMA_VERSION,

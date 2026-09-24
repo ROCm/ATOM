@@ -300,16 +300,64 @@ def test_full_metadata_gate(tmp_path, field):
     assert read_json(root / "validation.json")["missing"]
 
 
-def test_synthetic_retains_evidence_but_not_valid_performance(tmp_path):
+def test_synthetic_performance_is_valid_but_not_submission_eligible(tmp_path):
     config = read_json(FIXTURES / "random-config.json")
     config["validity"]["synthetic"] = True
     root, m = make_bundle(tmp_path, config=config)
     assert m["status"] == "complete"
-    assert not read_json(root / "validation.json")["measurement_valid"]
+    validation = read_json(root / "validation.json")
+    assert validation["measurement_valid"]
+    assert not validation["submission_eligible"]
+    assert validation["validity"]["synthetic"]
     assert (
         read_json(root / "exports/inferencex-v3.json")["benchmark_outcome"]["status"]
-        == "failed"
+        == "success"
     )
+    assert not read_json(root / "exports/inferencex-v3.json")["submission_valid"]
+
+
+@pytest.mark.parametrize("failure", ["unsafe", "missing", "exit", "submission"])
+def test_synthetic_cannot_hide_invalid_measurement(tmp_path, failure):
+    config = read_json(FIXTURES / "random-config.json")
+    config["validity"]["synthetic"] = True
+    if failure == "unsafe":
+        config["validity"]["unsafe_override"] = True
+    elif failure == "missing":
+        config["software"]["atom_sha"] = None
+    elif failure == "submission":
+        config["validity"]["submission_valid"] = False
+    root, _ = make_bundle(
+        tmp_path, config=config, exit_code=17 if failure == "exit" else 0
+    )
+    validation = read_json(root / "validation.json")
+    assert not validation["measurement_valid"]
+    assert not validation["submission_eligible"]
+
+
+@pytest.mark.parametrize(
+    "flag", ["--spec-decode-acceptance-length", "--spec_decode_acceptance_rate"]
+)
+def test_forced_acceptance_overrides_false_synthetic_declaration(flag):
+    from atom.benchmarks.results.metadata import synthetic_settings
+
+    settings = synthetic_settings(
+        [flag, "0.2", flag + "=0.8"], {"ATOM_DSV41_BENCHMARK_SYNTHETIC": "0"}
+    )
+    assert settings["synthetic"]
+    assert settings["synthetic_declaration_mismatch"]
+    assert (
+        settings["acceptance_length" if "length" in flag else "acceptance_rate"] == 0.8
+    )
+
+
+def test_rebuild_detects_previously_unmarked_forced_acceptance(tmp_path):
+    config = read_json(FIXTURES / "random-config.json")
+    config["recipe"]["server_argv"].extend(["--spec-decode-acceptance-length", "3.51"])
+    root, _ = make_bundle(tmp_path, config=config)
+    validation = read_json(root / "validation.json")
+    assert validation["measurement_valid"]
+    assert validation["validity"]["synthetic"]
+    assert not validation["submission_eligible"]
 
 
 def test_checksum_and_traversal(tmp_path):

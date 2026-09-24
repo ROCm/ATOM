@@ -16,6 +16,9 @@
     "measurement_valid": {
       "type": "boolean"
     },
+    "submission_eligible": {
+      "type": "boolean"
+    },
     "missing": {
       "type": "array",
       "items": {

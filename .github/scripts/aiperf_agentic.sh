@@ -232,7 +232,13 @@ run_aiperf_agentic() {
     python3 -m atom.benchmarks.results capture-launch \
       --output "$ATOM_BUNDLE_WORK/client-launch.json" -- "${AIPERF_COMMAND[@]}"
   fi
-  AIPERF_UI_REALTIME_METRICS_ENABLED=true "${AIPERF_COMMAND[@]}" 2>&1 \
+  local -a replay_command=("${AIPERF_COMMAND[@]}")
+  if [[ "${ENABLE_TORCH_PROFILER:-0}" == 1 ]]; then
+    replay_command=(python3 "$(dirname -- "${BASH_SOURCE[0]}")/profile_agentic_replay.py" \
+      --url "$url" --output "$out_dir/profiler-window.json" \
+      --seconds "${ATOM_AGENTIC_PROFILE_SECONDS:-30}" -- "${AIPERF_COMMAND[@]}")
+  fi
+  AIPERF_UI_REALTIME_METRICS_ENABLED=true "${replay_command[@]}" 2>&1 \
     | tee "${out_dir}/aiperf.log" || return $?
 
   if [[ ! -f "${out_dir}/profile_export_aiperf.json" ]]; then

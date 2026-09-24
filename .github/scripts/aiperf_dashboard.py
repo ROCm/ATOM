@@ -85,18 +85,24 @@ def dashboard_summary(data, src, conc, env, *, single_node=False):
     }
 
     if single_node:
+        from atom.benchmarks.results.metadata import synthetic_settings
+
         parser = argparse.ArgumentParser(add_help=False)
         parser.add_argument("-tp", "--tensor-parallel-size", type=int, default=1)
         parallel, _ = parser.parse_known_args(shlex.split(env.get("SERVER_ARGS", "")))
         validity = data.get("metadata", data)
+        synthetic = synthetic_settings(shlex.split(env.get("SERVER_ARGS", "")), env)
         payload.update(
             tensor_parallel_size=parallel.tensor_parallel_size,
             output_sequence_length=avg("output_sequence_length"),
             input_sequence_length=avg("input_sequence_length"),
             dashboard_publish_allowed=(
                 validity.get("submission_valid") is not False
-                and env.get("ATOM_DSV41_BENCHMARK_SYNTHETIC") != "1"
+                and not synthetic["synthetic"]
+                and env.get("ENABLE_TORCH_PROFILER") != "1"
+                and env.get("ENABLE_RTL_PROFILER") != "1"
             ),
+            synthetic=synthetic["synthetic"],
         )
     return {key: value for key, value in payload.items() if value is not None}
 

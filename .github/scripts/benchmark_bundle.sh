@@ -39,8 +39,14 @@ stop_benchmark_client() {
   # Both drain failure and the exit trap use this same bounded cleanup.
   [[ -n "${CLIENT_PID:-}" ]] || return 0
   kill -TERM -- -"$CLIENT_PID" 2>/dev/null || true
-  for _ in 1 2 3 4 5; do
-    kill -0 "$CLIENT_PID" 2>/dev/null || break
+  local grace=5 i
+  # Allow the replay wrapper's bounded stop_profile request to flush traces.
+  [[ "${ENABLE_TORCH_PROFILER:-0}" == 1 ]] && grace=135
+  for ((i=0; i<grace; i++)); do
+    # The group leader can exit before the profiler child finishes flushing.
+    # Ignore zombies, which cannot perform cleanup and may await reaping.
+    ps -eo pgid=,stat= | awk -v group="$CLIENT_PID" \
+      '$1 == group && $2 !~ /^Z/ { alive=1 } END { exit !alive }' || break
     sleep 1
   done
   kill -KILL -- -"$CLIENT_PID" 2>/dev/null || true

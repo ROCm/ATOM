@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -19,6 +20,34 @@ from catalog import build_args, build_env_vars
 CATALOG = ".github/benchmark/models_agentic.json"
 NIGHTLY_CATALOG = ".github/benchmark/models_agentic_nightly.json"
 PROFILE_CATALOGS = {"test": CATALOG, "nightly": NIGHTLY_CATALOG}
+
+
+def resolve_run_image(image):
+    """Resolve once on CPU; all cells and replay inputs use the immutable digest."""
+    if "@" in image:
+        if not re.fullmatch(r".+@sha256:[0-9a-f]{64}", image):
+            raise ValueError("Image digest must be a sha256 reference")
+        return {"requested": image, "pinned": image, "display": image}
+    if image == "rocm/atom-dev:latest":
+        from resolve_atom_image import resolve_image
+
+        resolved = resolve_image("rocm/atom-dev", "latest", None, "native")
+        digest = resolved["reference_digest"]
+        display = resolved["resolved_image"]
+    else:
+        # buildx resolves public OCI registries without pulling GPU image layers.
+        output = subprocess.check_output(
+            ["docker", "buildx", "imagetools", "inspect", image],
+            text=True,
+            timeout=90,
+        )
+        match = re.search(r"^Digest:\s+(sha256:[0-9a-f]{64})\s*$", output, re.MULTILINE)
+        if not match:
+            raise ValueError("Registry did not return an image digest")
+        digest, display = match[1], image
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(digest)):
+        raise ValueError("Registry returned an invalid image digest")
+    return {"requested": image, "pinned": f"{image}@{digest}", "display": display}
 
 
 def _check_fields(record, allowed, context):
@@ -140,12 +169,14 @@ def build_configs(path=None, inputs=None):
     return configs
 
 
-def write_run_config(configs, inputs, event, output_dir):
+def write_run_config(configs, inputs, event, output_dir, image_resolution=None):
     """Save the resolved matrix, dispatch inputs and an Actions run summary."""
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     dispatch = {**inputs, "atom_commit": commit}
+    if image_resolution:
+        dispatch["image"] = image_resolution["pinned"]
     record = {
         "event": event,
         "actor": os.environ.get("GITHUB_ACTOR", ""),
@@ -156,6 +187,7 @@ def write_run_config(configs, inputs, event, output_dir):
         "checkout_sha": commit,
         "inputs": inputs,
         "configs": configs,
+        "image_resolution": image_resolution,
     }
     (output / "run-config.json").write_text(json.dumps(record, indent=2) + "\n")
     (output / "dispatch-inputs.json").write_text(json.dumps(dispatch, indent=2) + "\n")
@@ -236,7 +268,7 @@ def write_run_config(configs, inputs, event, output_dir):
             "",
             (
                 "The dispatch file pins the ATOM checkout; the workflow ref must still exist. "
-                "Set an immutable image and AITER ref for version comparisons. "
+                "The image digest is pinned too; an explicit AITER override must use a SHA for exact replays. "
                 "A preview keeps `dry_run: true`; change it to `false` to execute."
             ),
             "",
@@ -266,15 +298,26 @@ def main():
             else {"profile": "nightly"}
         )
         configs = build_configs(inputs=inputs)
+        resolution = resolve_run_image(configs[0]["image"])
+        for config in configs:
+            config["image"] = resolution["pinned"]
+            config["image_display"] = resolution["display"]
         if os.environ.get("AGENTIC_RUN_CONFIG_DIR"):
             write_run_config(
-                configs, inputs, event, os.environ["AGENTIC_RUN_CONFIG_DIR"]
+                configs, inputs, event, os.environ["AGENTIC_RUN_CONFIG_DIR"], resolution
             )
         _emit(configs)
         count = sum(len(json.loads(config["concurrency"])) for config in configs)
         print(f"Event={event}: {count} agentic cells", file=sys.stderr)
         return 0
-    except (ValueError, TypeError, KeyError) as exc:
+    except (
+        ValueError,
+        TypeError,
+        KeyError,
+        RuntimeError,
+        OSError,
+        subprocess.SubprocessError,
+    ) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 

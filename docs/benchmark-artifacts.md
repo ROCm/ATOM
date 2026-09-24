@@ -78,9 +78,11 @@ with block size 16, 8K state checkpoints, level 3, FULL graphs and `dsml_v41`.
 Both test and nightly set `--gpu-memory-utilization 0.95`, leave `--max-num-seqs`
 unset (the checked-out engine supplies its default), and capture sizes 1–32 plus
 48/64/96/128/160/192/224/256 for every point. There is no EP or KV offload.
-Fixed acceptance is marked synthetic in the
-bundle; it is not accuracy evidence, and the producer's existing validity policy
-keeps it separate from real-acceptance performance.
+Fixed acceptance is marked synthetic in the bundle. Complete, successful fixed-AL
+measurements form their own performance curves, with an explicit Synthetic/AL
+label; they are not accuracy evidence or eligible for official submissions.
+The producer derives forced acceptance from the executed server arguments,
+including manual overrides, and records disagreements with the catalog declaration.
 
 Agentic catalogs declare a `concurrency` list on each model variant. They do not
 use random `scenarios`, ISL/OSL, length ratios or concurrency bands. The builder
@@ -96,7 +98,18 @@ the checkout is the triggering branch's event SHA, rather than a later branch
 head or the image's baked-in ATOM source. The matrix and GPU jobs use the same
 resolved SHA, and a preflight verifies both the SHA and the `/workspace/atom`
 Python import path. An explicit `atom_commit` remains available for controlled
-replays. Runtime image identity is recorded in each bundle.
+replays. The CPU matrix job resolves the requested image to one immutable digest
+for the entire run, including dispatch replay inputs. A same-digest nightly tag
+is used for display when available; GPU cells verify and record the running image
+ID. Each new nightly run resolves the then-current latest image.
+
+`enable_profiler` retains graph-capture traces and starts a bounded replay sample
+after AIPerf reports its profiling phase (after warmup). The replay sample defaults
+to 30 seconds; `ATOM_AGENTIC_PROFILE_SECONDS` permits a window up to 120 seconds.
+The wrapper stops the profiler on completion, error or cancellation and retains
+`raw/profiler-window.json`. Profiler failures fail the client step, and trace
+upload is attempted even on failed runs. Instrumented measurements are labeled
+and excluded from submission eligibility.
 
 Manual inputs select a profile and model prefixes, override profiling duration
 (900–3600 seconds), and optionally select image, runner or code refs. Empty
@@ -196,7 +209,10 @@ benchmark-bundles/<RESULT_FILENAME>/
 ```
 
 Missing observations have capabilities and reasons, never invented zeroes.
-Synthetic/unsafe measurements retain evidence but are invalid for comparison.
+`measurement_valid` requires complete metadata/evidence, valid records, successful
+requests, a zero client exit and no unsafe override or AIPerf submission rejection.
+`submission_eligible` additionally excludes synthetic and instrumented experiments.
+Invalid measurements retain their evidence for diagnosis.
 The producer does not replace the legacy summary or change its statistical
 window. Normalized data and the original summary remain separate.
 
@@ -225,7 +241,11 @@ metrics into a new directory from retained originals.
 Rebuild preserves point identity within an aggregation version; floating-point
 summaries may differ at machine precision across Python versions. Version 1.0.1
 adds captured client performance settings to recipe identity, so rebuilding a
-1.0.0 bundle can produce a new point ID. The original bundle remains intact.
+1.0.0 bundle can produce a new point ID. Version 1.0.2 separates measurement
+validity from submission eligibility and derives synthetic acceptance from the
+executed arguments. Older bundles remain readable; rebuild with the new producer
+to apply the corrected classification, which can change their point identity.
+The original bundle remains intact.
 
 ## Metrics and resource use
 

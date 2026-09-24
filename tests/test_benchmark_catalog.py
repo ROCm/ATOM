@@ -394,6 +394,11 @@ def test_agentic_schedule_uses_catalog_defaults(tmp_path, monkeypatch):
 
     from build_agentic_benchmark_matrix import build_configs, main
 
+    monkeypatch.setattr(
+        "build_agentic_benchmark_matrix.resolve_run_image",
+        lambda image: {"requested": image, "pinned": image, "display": image},
+    )
+
     output = tmp_path / "github-output"
     monkeypatch.setenv("EVENT_NAME", "schedule")
     monkeypatch.setenv("INPUTS_JSON", '{"models":"unknown","duration_seconds":1}')
@@ -401,9 +406,10 @@ def test_agentic_schedule_uses_catalog_defaults(tmp_path, monkeypatch):
     assert main() == 0
     values = dict(line.split("=", 1) for line in output.read_text().splitlines())
     assert values["has_cells"] == "true"
-    assert json.loads(values["configs_json"]) == build_configs(
-        inputs={"profile": "nightly"}
-    )
+    expected = build_configs(inputs={"profile": "nightly"})
+    for config in expected:
+        config["image_display"] = config["image"]
+    assert json.loads(values["configs_json"]) == expected
 
 
 def test_agentic_gpu_workflow_only_runs_manually_or_on_schedule():
@@ -555,6 +561,19 @@ def test_agentic_dispatch_replay_preserves_profile(tmp_path, monkeypatch, profil
 
     from build_agentic_benchmark_matrix import build_configs, main
 
+    pinned = "rocm/atom-dev:latest@sha256:" + "a" * 64
+    calls = []
+
+    def resolve(image):
+        calls.append(image)
+        return {
+            "requested": image,
+            "pinned": pinned,
+            "display": "rocm/atom-dev:nightly_test",
+        }
+
+    monkeypatch.setattr("build_agentic_benchmark_matrix.resolve_run_image", resolve)
+
     output = tmp_path / "github-output"
     config_dir = tmp_path / "config"
     monkeypatch.setenv("EVENT_NAME", "workflow_dispatch")
@@ -567,11 +586,73 @@ def test_agentic_dispatch_replay_preserves_profile(tmp_path, monkeypatch, profil
     monkeypatch.setenv("AGENTIC_RUN_CONFIG_DIR", str(config_dir))
     assert main() == 0
     values = dict(line.split("=", 1) for line in output.read_text().splitlines())
-    assert json.loads(values["configs_json"]) == build_configs(
-        inputs={"profile": profile}
-    )
+    expected = build_configs(inputs={"profile": profile})
+    for config in expected:
+        config.update(image=pinned, image_display="rocm/atom-dev:nightly_test")
+    assert json.loads(values["configs_json"]) == expected
+    assert calls == ["rocm/atom-dev:latest"]
     dispatch = json.loads((config_dir / "dispatch-inputs.json").read_text())
     assert dispatch["profile"] == profile
     assert dispatch["dry_run"] is True
     assert dispatch["atom_commit"]
+    assert dispatch["image"] == pinned
     assert "atom-agentic-benchmark.yaml" in (config_dir / "README.md").read_text()
+
+
+def test_agentic_latest_resolves_to_digest_not_mutable_nightly_tag(monkeypatch):
+    from build_agentic_benchmark_matrix import resolve_run_image
+
+    monkeypatch.setattr(
+        "resolve_atom_image.resolve_image",
+        lambda *args: {
+            "reference_digest": "sha256:" + "a" * 64,
+            "resolved_image": "rocm/atom-dev:nightly_test",
+        },
+    )
+    resolved = resolve_run_image("rocm/atom-dev:latest")
+    assert resolved["pinned"] == "rocm/atom-dev:latest@sha256:" + "a" * 64
+    # A replay with a digest must not consult the registry again.
+    monkeypatch.setattr(
+        "resolve_atom_image.resolve_image",
+        lambda *args: pytest.fail("registry lookup during pinned replay"),
+    )
+    assert resolve_run_image(resolved["pinned"])["pinned"] == resolved["pinned"]
+
+
+def test_agentic_image_resolution_failure_emits_no_matrix(tmp_path, monkeypatch):
+    from build_agentic_benchmark_matrix import main
+
+    def fail(image):
+        raise RuntimeError("registry unavailable")
+
+    monkeypatch.setattr("build_agentic_benchmark_matrix.resolve_run_image", fail)
+    monkeypatch.setenv("EVENT_NAME", "schedule")
+    output = tmp_path / "output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    assert main() == 1
+    assert not output.exists()
+
+
+def test_agentic_custom_image_digest_resolution(monkeypatch):
+    from build_agentic_benchmark_matrix import resolve_run_image
+
+    digest = "sha256:" + "b" * 64
+
+    def inspect(command, **kwargs):
+        assert command == [
+            "docker",
+            "buildx",
+            "imagetools",
+            "inspect",
+            "example.org/atom:test",
+        ]
+        assert kwargs["timeout"] == 90
+        return f"Name: example.org/atom:test\nDigest: {digest}\n"
+
+    monkeypatch.setattr(
+        "build_agentic_benchmark_matrix.subprocess.check_output", inspect
+    )
+    assert (
+        resolve_run_image("example.org/atom:test")["pinned"]
+        == f"example.org/atom:test@{digest}"
+    )

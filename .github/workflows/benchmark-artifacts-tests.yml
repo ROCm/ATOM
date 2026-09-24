@@ -7,6 +7,8 @@ on:
       - '.github/scripts/*benchmark*'
       - '.github/scripts/atom_test.sh'
       - '.github/scripts/aiperf*'
+      - '.github/scripts/profile_agentic_replay.py'
+      - '.github/scripts/resolve_atom_image.py'
       - '.github/scripts/atomesh/pd_server_atom.sh'
       - '.github/scripts/catalog.py'
       - '.github/workflows/*benchmark*'

@@ -50,7 +50,7 @@ on:
         type: string
         default: ""
       enable_profiler:
-        description: "Advanced: collect torch profiler traces"
+        description: "Advanced: collect graph-capture traces and a 30-second replay profile"
         type: boolean
         default: false
       enable_rtl:
@@ -86,6 +86,8 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           INPUTS_JSON: ${{ toJson(inputs) }}
           AGENTIC_RUN_CONFIG_DIR: agentic-run-config
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: python3 .github/scripts/build_agentic_benchmark_matrix.py
       - name: Save run configuration
         uses: actions/upload-artifact@v7
@@ -120,6 +122,7 @@ jobs:
       runner: ${{ inputs.runner || matrix.config.runner }}
       concurrency: ${{ matrix.config.concurrency }}
       image: ${{ matrix.config.image }}
+      image_display: ${{ matrix.config.image_display }}
       extra_args: ${{ inputs.extra_args || '' }}
       atom_commit: ${{ needs.build-matrix.outputs.checkout_sha }}
       aiter_commit: ${{ inputs.aiter_commit || '' }}

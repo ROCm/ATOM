@@ -64,6 +64,10 @@ on:
         type: string
         required: false
         default: "rocm/atom-dev:latest"
+      image_display:
+        description: "Optional name resolved from the same immutable image digest"
+        type: string
+        default: ""
       enable_profiler:
         type: boolean
         required: false
@@ -180,21 +184,18 @@ jobs:
       - name: Collect GPU info (inside container)
         id: gpu-info
         env:
-          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          REQUESTED_IMAGE: ${{ inputs.image }}
+          IMAGE_DISPLAY: ${{ inputs.image_display || inputs.image }}
         run: |
+          set -euo pipefail
           RUNNER_HINT="${{ inputs.runner }}"
           bash .github/scripts/collect_gpu_info.sh atom-benchmark docker "$RUNNER_HINT"
-          # Resolve latest → nightly_YYYYMMDDHHMMSS for dashboard display
-          DOCKER_IMAGE="${{ inputs.image }}"
-          if [ "$DOCKER_IMAGE" = "rocm/atom-dev:latest" ]; then
-            RESOLVED_IMAGE=""
-            if RESOLUTION_JSON="$(python3 .github/scripts/resolve_atom_image.py --repository rocm/atom-dev --reference-tag latest --image-family native 2>/dev/null)"; then
-              RESOLVED_IMAGE="$(echo "$RESOLUTION_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("resolved_image",""))')" || true
-            fi
-            DOCKER_IMAGE="${RESOLVED_IMAGE:-$DOCKER_IMAGE}"
-          fi
+          # A registry's latest may have changed since startup. Use the name
+          # resolved with this run's digest, never a second remote lookup.
+          DOCKER_IMAGE="$IMAGE_DISPLAY"
           IMAGE_ID=$(docker inspect --format '{{.Image}}' atom-benchmark)
+          EXPECTED_IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$REQUESTED_IMAGE")
+          test "$IMAGE_ID" = "$EXPECTED_IMAGE_ID"
           echo "image_digest=${IMAGE_ID}" >> "$GITHUB_OUTPUT"
           echo "docker_image=${DOCKER_IMAGE}" >> $GITHUB_OUTPUT
           echo "Docker: ${DOCKER_IMAGE}"
@@ -311,11 +312,11 @@ jobs:
           PY
 
       - name: Copy profiler traces
-        if: inputs.enable_profiler
+        if: always() && inputs.enable_profiler
         run: docker cp atom-benchmark:/app/trace ./profiler-traces 2>/dev/null || true
 
       - name: Upload profiler traces
-        if: inputs.enable_profiler
+        if: always() && inputs.enable_profiler
         uses: actions/upload-artifact@v7
         with:
           name: profiler-traces-${{ env.RESULT_FILENAME }}
