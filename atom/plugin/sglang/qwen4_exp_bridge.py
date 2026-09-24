@@ -55,13 +55,6 @@ def _server_args() -> Any | None:
         return None
 
 
-def _cpu_gpu_i32(size: int, device: torch.device) -> CpuGpuBuffer:
-    try:
-        return CpuGpuBuffer(size, dtype=torch.int32, device=device, pin_memory=True)
-    except Exception:  # noqa: BLE001
-        return CpuGpuBuffer(size, dtype=torch.int32, device=device, pin_memory=False)
-
-
 def _is_capturing() -> bool:
     if not torch.cuda.is_available():
         return False
@@ -69,6 +62,15 @@ def _is_capturing() -> bool:
         return bool(torch.cuda.is_current_stream_capturing())
     except Exception:  # noqa: BLE001
         return False
+
+
+def _cpu_gpu_i32(size: int, device: torch.device) -> CpuGpuBuffer:
+    # pin_memory allocates host pages — illegal during HIP stream capture.
+    pin = not _is_capturing()
+    try:
+        return CpuGpuBuffer(size, dtype=torch.int32, device=device, pin_memory=pin)
+    except Exception:  # noqa: BLE001
+        return CpuGpuBuffer(size, dtype=torch.int32, device=device, pin_memory=False)
 
 
 class _Qwen4ExpDecodeGraphBuffers:
