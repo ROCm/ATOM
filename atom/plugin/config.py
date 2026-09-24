@@ -17,20 +17,22 @@ VLLM_MORI_LAUNCH_CONFIG_TOKEN_THRESHOLD = 4096
 
 
 def get_sglang_server_args():
-    """Read SGLang operator ServerArgs across 0.5.19 and 0.5.20.
+    """Read SGLang operator ServerArgs (raw input record).
 
-    0.5.20 retired ``get_global_server_args()`` (it now raises). The live
-    record is ``sglang.srt.runtime_context.get_server_args()``. Fall back to
-    the legacy shim so unit tests and 0.5.19 still work.
+    Prefer ``runtime_context.get_server_args()``. This is the operator's
+    *input*, not resolution-decided values. Fields known to diverge after
+    resolution include ``mem_fraction_static`` (``get_schedule()``),
+    ``attention_backend`` (``get_exec().kernel``), ``max_running_requests``,
+    and ``context_length``. Callers that need the in-effect value should
+    read the corresponding namespace bag.
     """
     try:
         from sglang.srt.runtime_context import get_server_args
+    except ImportError:
+        # Only ≤0.5.18 lacks runtime_context.get_server_args.
+        from sglang.srt.server_args import get_global_server_args as get_server_args
 
-        return get_server_args()
-    except Exception:  # noqa: BLE001 - missing module or unpublished context
-        from sglang.srt.server_args import get_global_server_args
-
-        return get_global_server_args()
+    return get_server_args()
 
 
 def _get_sglang_tbo_flags(enable_two_batch_overlap: bool) -> tuple[bool, bool]:
@@ -608,6 +610,8 @@ def _generate_atom_config_from_sglang_config(config: Any):
         max_num_batched_tokens=max_num_batched_tokens,
         max_num_seqs=server_args.max_running_requests or 512,
         max_model_len=server_args.context_length,
+        # Operator raw input. AITER long-ctx may later scale this via
+        # get_schedule().mem_fraction_static; ATOM's pool is owned by SGLang.
         gpu_memory_utilization=server_args.mem_fraction_static,
         tensor_parallel_size=atom_tensor_parallel_size,
         prefill_context_parallel_size=atom_prefill_context_parallel_size,

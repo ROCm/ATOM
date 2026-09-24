@@ -289,14 +289,22 @@ def _atom_m3_index_dtype(owner: Any) -> torch.dtype:
     return index_dtype
 
 
+def _is_minimax_m3_owner(owner: Any) -> bool:
+    model_config = getattr(owner, "model_config", None)
+    return is_minimax_m3_config(getattr(model_config, "hf_config", None))
+
+
 def install_minimax_m3_pool_patch() -> None:
     """Keep ATOM FP8 index dtype + scale ABI on MiniMaxSparseKVPool.
 
-    SGLang 0.5.19 builds ``MiniMaxSparseKVPool`` natively, but ``index_dtype``
+    SGLang 0.5.19+ builds ``MiniMaxSparseKVPool`` natively, but ``index_dtype``
     stays ``model_dtype`` (bf16) unless NVIDIA ``m3_fp8_attn_gemm`` is on.
-    ATOM's sparse kernels follow ``index_cache_dtype`` (fp8 when KV is fp8),
-    so temporarily align ``model_dtype`` for that builder only. Also attach
-    ``get_kv_scale_buffer``, which upstream still omits.
+    ATOM's sparse kernels follow ``index_cache_dtype`` (fp8 when KV is fp8).
+
+    ``pool_configurator`` also bills index-K at ``model_dtype`` during
+    ``_resolve_memory_pool_config`` (before the pool builder). Wrap
+    ``configure()`` so budget accounting and allocation use the same dtype.
+    Also attach ``get_kv_scale_buffer``, which upstream still omits.
     """
 
     try:
@@ -318,22 +326,25 @@ def install_minimax_m3_pool_patch() -> None:
     if getattr(cls, "_atom_minimax_m3_pool_patched", False):
         return
 
-    original_build = cls._build_minimax_sparse_kv_pool
+    original_configure = cls.configure
 
-    def _build_minimax_sparse_kv_pool(self, *, max_total_num_tokens: int):
+    def configure(self, *, pre_model_load_memory: int):
+        if not _is_minimax_m3_owner(self):
+            return original_configure(self, pre_model_load_memory=pre_model_load_memory)
         wanted = _atom_m3_index_dtype(self)
         # Upstream picks index_dtype = model_dtype when m3_fp8_attn_gemm is off.
-        # Main KV still uses kv_cache_dtype, so this swap only affects index-K.
+        # Main KV still uses kv_cache_dtype; this swap only affects index-K
+        # cell_size billing and MiniMaxSparseKVPool.index_dtype.
         old_model_dtype = self.model_dtype
         if wanted != old_model_dtype:
             self.model_dtype = wanted
         try:
-            return original_build(self, max_total_num_tokens=max_total_num_tokens)
+            return original_configure(self, pre_model_load_memory=pre_model_load_memory)
         finally:
             if wanted != old_model_dtype:
                 self.model_dtype = old_model_dtype
 
-    cls._build_minimax_sparse_kv_pool = _build_minimax_sparse_kv_pool
+    cls.configure = configure
     cls._atom_minimax_m3_pool_patched = True
 
 

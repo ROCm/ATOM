@@ -12,8 +12,8 @@ import torch
 # plus the rotary lane: kv_lora_rank (512) + qk_rope_head_dim (64).
 KIMI_K3_MLA_CACHE_ENTRY_DIM = 576
 logger = logging.getLogger(__name__)
-# KVCacheConfigurator is a slots dataclass; instance flags AttributeError.
-_KIMI_K3_MEM_FRACTION_RESTORED: set[int] = set()
+# Provenance key for RuntimeContext.override — process-scoped, not id(owner).
+_KIMI_K3_MEM_FRACTION_OVERRIDE = "atom-kimi-k3-mem-fraction"
 
 
 def is_kimi_k3_config(config: Any) -> bool:
@@ -26,47 +26,72 @@ def _is_kimi_k3_owner(owner: Any) -> bool:
     return is_kimi_k3_config(getattr(model_config, "hf_config", None))
 
 
+def _kimi_k3_mem_fraction_already_restored(ctx: Any) -> bool:
+    for source, fields in getattr(ctx, "overrides_log", None) or ():
+        if source == _KIMI_K3_MEM_FRACTION_OVERRIDE and "mem_fraction_static" in fields:
+            return True
+    return False
+
+
 def _restore_kimi_k3_mem_fraction(owner: Any) -> None:
     """Undo SGLang AITER long-context 0.85 mem_fraction reserve for K3.
 
-    SGLang 0.5.17+ keeps resolved schedule config in a read-only bag; write
-    through ``RuntimeContext.override`` instead of mutating ``server_args``.
+    Mirror upstream ``attention_hook``: only undo when the *resolved* backend
+    is aiter, context_len > 8192, and the 0.85 scale was actually applied
+    (not skipped via ``SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION``). Write
+    through ``RuntimeContext.override``; dedupe by override source name.
     """
-
-    owner_id = id(owner)
-    if owner_id in _KIMI_K3_MEM_FRACTION_RESTORED:
-        return
 
     model_config = getattr(owner, "model_config", None)
     context_len = int(getattr(model_config, "context_len", 0) or 0)
     try:
-        from sglang.srt.runtime_context import get_context, get_schedule
+        from sglang.srt.runtime_context import get_context, get_exec, get_schedule
 
-        schedule = get_schedule()
+        ctx = get_context()
+        if _kimi_k3_mem_fraction_already_restored(ctx):
+            return
+
+        # Resolved leaf — not server_args.attention_backend (operator raw input).
         attention_backend = str(
-            getattr(get_context().server_args, "attention_backend", "")
+            getattr(getattr(get_exec(), "kernel", None), "attention_backend", "") or ""
         )
-        current = float(schedule.mem_fraction_static)
-    except Exception:  # noqa: BLE001 - fall back when context is unpublished
-        # Do not record the owner until the schedule is readable. The first
-        # call can run before RuntimeContext is published.
+        current = float(get_schedule().mem_fraction_static)
+        server_args = ctx.server_args
+    except Exception as exc:  # noqa: BLE001 - first call may precede publish
+        logger.warning(
+            "Kimi-K3 mem_fraction restore skipped: schedule/exec unread (%s)",
+            exc,
+        )
         return
 
-    if attention_backend == "aiter" and context_len > 8192:
-        restored = current / 0.85
-        if restored <= 1.0:
-            from sglang.srt.runtime_context import get_context
+    if attention_backend != "aiter" or context_len <= 8192:
+        return
 
-            get_context().override(
-                "atom-kimi-k3-mem-fraction", mem_fraction_static=restored
-            )
-            logger.info(
-                "Kimi-K3 restored mem_fraction_static %.4f -> %.4f after "
-                "SGLang AITER long-context reserve",
-                current,
-                restored,
-            )
-    _KIMI_K3_MEM_FRACTION_RESTORED.add(owner_id)
+    explicit_mem_fraction = (getattr(server_args, "_raw_input", None) or {}).get(
+        "mem_fraction_static"
+    ) is not None
+    try:
+        from sglang.srt import environ as sgl_envs
+
+        honor_explicit = bool(sgl_envs.SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION.get())
+    except Exception:  # noqa: BLE001 - older SGLang builds
+        honor_explicit = False
+
+    if explicit_mem_fraction and honor_explicit:
+        # Upstream did not apply the 0.85 scale; do not divide it back out.
+        return
+
+    restored = current / 0.85
+    if restored > 1.0:
+        return
+
+    ctx.override(_KIMI_K3_MEM_FRACTION_OVERRIDE, mem_fraction_static=restored)
+    logger.info(
+        "Kimi-K3 restored mem_fraction_static %.4f -> %.4f after "
+        "SGLang AITER long-context reserve",
+        current,
+        restored,
+    )
 
 
 def install_kimi_k3_pool_patch() -> None:
@@ -206,6 +231,7 @@ def install_kimi_k3_pool_patch() -> None:
     hybrid_arch.kimi_linear_config = _kimi_linear_config
     # Rebind already-imported local names. prepare_model runs after SGLang has
     # imported these modules, so module-attribute patch alone is a no-op there.
+    rebound = []
     for mod_name in (
         "sglang.srt.mem_cache.kv_cache_configurator",
         "sglang.srt.mem_cache.kv_cache_builder",
@@ -214,12 +240,13 @@ def install_kimi_k3_pool_patch() -> None:
         mod = sys.modules.get(mod_name)
         if mod is not None and hasattr(mod, "kimi_linear_config"):
             mod.kimi_linear_config = _kimi_linear_config
+            rebound.append(mod_name)
     cls._resolve_memory_pool_config = _resolve_memory_pool_config
     cls._init_pools = _init_pools
     cls._atom_kimi_k3_pool_patched = True
     logger.info(
-        "Kimi-K3 patched hybrid_arch.kimi_linear_config and rebound "
-        "kv_cache_configurator/kv_cache_builder/attention_registry imports"
+        "Kimi-K3 patched hybrid_arch.kimi_linear_config; rebound imports: %s",
+        rebound or "(none yet imported)",
     )
 
 
