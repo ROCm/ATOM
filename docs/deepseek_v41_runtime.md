@@ -161,9 +161,12 @@ host table storage, so startup registration takes longer than TP4.
 ## Prefill two-batch overlap
 
 Add `--enable-tbo prefill` to the DPA command above, leaving EP disabled.
-Microbatches execute eagerly; decode keeps its compiled/CUDA Graph path.
-The existing `ATOM_TBO_PREFILL_MIN_TOKENS` threshold applies, and
-`ATOM_TBO_PREFILL_TOKEN_SPLIT=1` permits splitting within a request. Eligibility
+V4.1 prefill TBO requires DP attention with more than one DP rank and rejects
+plain TP and single-rank DPA at configuration validation. Microbatches use
+the configured compilation level; decode keeps its CUDA Graph path.
+The existing `ATOM_TBO_PREFILL_MIN_TOKENS` threshold applies.
+`ATOM_TBO_PREFILL_TOKEN_SPLIT=1` is the default and can split within a request;
+set it to `0` to split only at request boundaries. Eligibility
 is agreed across DP ranks; an idle or incompatible peer selects ordinary execution.
 
 Parent preparation and TBO children both preserve the explicit prefill phase.
@@ -196,8 +199,9 @@ comm-fused TBO support is added, its internal consumer boundary must be audited
 separately. A custom-op boundary
 keeps the thread-local TBO query at runtime and retains the lifetime marker
 in compiled execution. Microbatches use the normal model call and honor the
-configured compilation level. TP vision requests pass token-aligned image
-embeddings and masks through the split. DPA remains text-only.
+configured compilation level. DPA remains text-only: image requests are
+rejected during request preprocessing, before sequences reach any DP worker,
+including when DSpark is disabled. TP vision runs without TBO.
 
 Child metadata reuse first queries the prior completion event. If it has
 completed, storage is reused without host or device waits. Otherwise, pinned

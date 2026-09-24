@@ -336,3 +336,23 @@ def test_dpa_admission_before_and_after_engine_normalization(tp, dp):
             parallel_config=SimpleNamespace(data_parallel_size=dp),
         )
     )
+
+
+@pytest.mark.parametrize("dp_size", [1, 2, 4])
+@pytest.mark.parametrize("dpa", [False, True])
+@pytest.mark.parametrize("ep", [False, True])
+def test_prefill_tbo_requires_multi_rank_dpa(dp_size, dpa, ep):
+    cfg = runtime_config(
+        enable_tbo=True,
+        enable_dp_attention=dpa,
+        enable_expert_parallel=ep,
+        parallel_config=SimpleNamespace(data_parallel_size=dp_size),
+    )
+    if dpa and dp_size > 1:
+        validate_runtime_config(cfg)
+        cfg.enable_tbo_decode = True
+        with pytest.raises(ValueError, match="decode TBO"):
+            validate_runtime_config(cfg)
+    else:
+        with pytest.raises(ValueError, match="prefill TBO"):
+            validate_runtime_config(cfg)
