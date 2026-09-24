@@ -499,6 +499,9 @@ models:
               PYTHONHASHSEED: "0"
               MAX_JOBS: "16"
             prefill:
+              # PP4×TP1 needs 4 GPUs but auto HIP_VISIBLE_DEVICES only
+              # exposes PREFILL_TP (=1) devices. Override explicitly.
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
               VLLM_PP_LAYER_PARTITION: "20,20,20,18"
               LMCACHE_LOCAL_CPU: "True"
               LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
