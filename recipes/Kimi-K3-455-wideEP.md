@@ -148,6 +148,57 @@ done
 fabric` are **not** faults; this firmware does not populate those fields — they
 are unpopulated, not measured. To actually measure the link, use ubench07 below.
 
+### After a reboot: load the driver, then confirm the links trained
+
+`amdgpu` is blacklisted on the kernel command line on these hosts, so after a
+reboot the driver is simply not loaded and **`/dev/kfd` does not exist**. That
+is configuration, not breakage.
+
+```bash
+sudo modprobe amdgpu gpu_recovery=0 halt_if_hws_hang=1
+```
+
+Both parameters are recommended for bring-up. They make the GPU **stop and stay
+diagnosable** on a hang instead of being reset out from under you: with the
+defaults (`gpu_recovery=-1`, `halt_if_hws_hang=0`) a hardware-scheduler hang
+triggers a recovery reset, and what you see afterwards is a run that died for no
+visible reason. On a 25-minute cold start with as many silent failure modes as
+this platform has, a silently reset GPU is an expensive thing to debug. Check
+what is actually loaded:
+
+```bash
+cat /sys/module/amdgpu/parameters/gpu_recovery        # want 0 (default -1)
+cat /sys/module/amdgpu/parameters/halt_if_hws_hang    # want 1 (default 0)
+```
+
+These are load-time parameters — if the driver is already up with the defaults,
+they only take effect after an `rmmod` / `modprobe` cycle.
+
+**Then wait for the links to train.** UALink takes tens of seconds after
+`modprobe`, during which `accel_state` reads `unconfigured`. That is normal;
+`inb-node-agent` finishes the configuration and it flips to `active`.
+
+```bash
+sudo cat /sys/class/drm/card*/device/ualink/accel_state              # all: active
+sudo cat /sys/class/drm/card*/device/ualink/local_accels             # e.g. 3 2 1 0
+sudo cat /sys/class/drm/card*/device/ualink/station_lane_en_bitmap   # non-zero, identical across cards
+```
+
+`accel_state` is the gate: **every** entry must read `active` before you try
+anything multi-node. The other two corroborate *how* it came up rather than
+merely that it did — `local_accels` lists the accelerators this card sees
+locally, and `station_lane_en_bitmap` is the per-station enabled-lane mask, so a
+partially-trained link shows up as a bitmap that differs from its peers or from
+what the same host reported when healthy. Record the healthy values for your
+nodes once and diff against them after a reboot; the readings vary with
+partitioning, so there is no single correct string to match.
+
+> Once the state reads `active`, **do not `modprobe` again** — that retrains the
+> links and costs you the wait for no reason.
+
+Do this before ubench07: an untrained link makes the fabric test fail in a way
+that looks like a fabric fault.
+
 ### Validate the fabric first — ubench07
 
 Strongly recommended before the first multi-node launch, and the first thing to
@@ -236,11 +287,6 @@ The suite's README says `ACCEL_STATE` must be `READY`; this firmware reports
 - Passwordless SSH between all four nodes (launch is fanned out over it).
 - The full checkpoint on **every** node (~1.42 TiB each), plus swap — weight
   loading peaks well above the 250 GB of host RAM on these boxes.
-- After a host reboot: `amdgpu` is blacklisted on the kernel command line, so
-  `/dev/kfd` will not exist until `sudo modprobe amdgpu`. UALink then takes tens
-  of seconds to train; `unconfigured` in
-  `/sys/class/drm/card*/device/ualink/accel_state` is normal during that window.
-  Do not re-`modprobe` once it reads `active` — that retrains the links.
 
 ---
 
@@ -522,6 +568,9 @@ max_tokens=3500  -> content='...#### 72'  finish_reason=stop
 | `assert not ca_comm.disabled` kills the ModelRunner while HTTP stays up | `ATOM_USE_CUSTOM_ALL_GATHER` and `AITER_CUSTOM_AR_USE_SYMM_MEM` must be set together |
 | MoE GUGU layout error | `ATOM_MOE_GU_ITLV=1` |
 | `ATOM_USE_TRITON_MOE_DECODE=1` asserts | K3's activation is `situ`, not SiLU |
+| `/dev/kfd` missing after a reboot | `amdgpu` is blacklisted on the kernel command line; `modprobe` it — see [After a reboot](#after-a-reboot-load-the-driver-then-confirm-the-links-trained) |
+| `accel_state` reads `unconfigured` | Links are still training after `modprobe`. Wait; do not re-`modprobe` |
+| A run dies with nothing in the log to explain it | Possibly a GPU recovery reset. Reload the driver with `gpu_recovery=0 halt_if_hws_hang=1` so the next one halts diagnosably |
 | Startup stops at `load RCCL version`, CPU spinning at ~110% | Intermittent `ncclCommInitRank` hang. Retry; allow ≥25 min. Looks identical to a bad fabric — rule that out with [ubench07](#validate-the-fabric-first--ubench07) once, then retry |
 | Multi-node rendezvous hangs with no error | Nodes are not in the same `PPOD_ID` / `VPOD_ID` domain, or the fabric itself is bad. Confirm with [ubench07](#validate-the-fabric-first--ubench07) before blaming the engine |
 | Cross-node bandwidth ~4.5 GB/s instead of thousands | MNNVL not in effect, silently fell back to TCP. Set `NCCL_MNNVL_ENABLE=1` |
