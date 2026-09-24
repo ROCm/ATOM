@@ -116,6 +116,25 @@ class _ThreadTransferState:
         return torch.cuda.stream(stream)
 
 
+def _compute_stream_for(state) -> Any:
+    """The stream the model's forward is running on, or ``None``.
+
+    ``None`` means "there is no CUDA context here", not "the fence was
+    skipped on a GPU". The pipeline is driven in tests by stream doubles with
+    no device behind them; ordering those against an invented compute stream
+    would assert nothing but that a double records a call. On a real worker
+    ``_ThreadTransferState`` always carries the device its streams were
+    created on, so this always returns a stream there -- which is what
+    ``test_run_staged_pipeline_fences_against_compute_stream`` pins down, so
+    that dropping the fence fails a test rather than passing quietly.
+    """
+
+    device = getattr(state, "device", None)
+    if device is None or not torch.cuda.is_available():
+        return None
+    return torch.cuda.current_stream(device=device)
+
+
 @dataclass(frozen=True)
 class _PipelineStage:
     """One leg of the event-synchronized staging pipeline."""
@@ -153,8 +172,8 @@ def run_staged_pipeline(
     # block whose attention write is still queued on the compute stream. The
     # terminal synchronize covers the other direction for loads, but there is
     # no host-side barrier in front of a save.
-    if stage_a.stream is not None:
-        compute_stream = torch.cuda.current_stream(device=state.device)
+    compute_stream = _compute_stream_for(state)
+    if compute_stream is not None and stage_a.stream is not None:
         stage_a.stream.wait_stream(compute_stream)
         if stage_b.stream is not None and stage_b.stream is not stage_a.stream:
             stage_b.stream.wait_stream(compute_stream)
