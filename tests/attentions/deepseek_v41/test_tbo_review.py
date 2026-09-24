@@ -251,9 +251,6 @@ def test_parent_fallback_gathers_once_per_layer_and_stage():
 def test_single_token_prefill_child_keeps_prefill_semantics(
     lengths, request_index, token
 ):
-    from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
-        MQA_LOGITS_PRESHUFFLE_ROWS,
-    )
     from atom.utils.forward_context import AttnState
 
     builder, parent = make_parent("cuda", lengths=lengths)
@@ -270,7 +267,7 @@ def test_single_token_prefill_child_keeps_prefill_semantics(
     end = child.step.requests[0].end
     columns = (end + builder.geometry.block_size - 1) // builder.geometry.block_size
     assert tiles.shape[-1] == columns * (
-        builder.geometry.rows_per_page(1) // MQA_LOGITS_PRESHUFFLE_ROWS
+        builder.geometry.rows_per_page(1) // builder.geometry.index_block_rows
     )
 
 
