@@ -33,8 +33,7 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from atom.model_ops.minimax_m3 import attention_fp8 as _attention_fp8  # noqa: F401
-from atom.utils import envs
+from atom.model_ops.minimax_m3 import attention_fp8 as _attention_fp8
 from atom.model_ops.minimax_m3.input_norm_fp8 import (
     fused_m3_gemma_norm_fp8,
     supports_m3_fused_gemma_fp8,
@@ -52,6 +51,7 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 
 
@@ -321,7 +321,9 @@ class MiniMaxM3MoE(nn.Module):
         if envs.ATOM_SP_MOE_TILED_SORT:
             from atom.model_ops.sp_moe_sort import supports_m3_sp_tiled_sort
 
-            self.experts._sp_tiled_sort_enabled = supports_m3_sp_tiled_sort(self.experts)
+            self.experts._sp_tiled_sort_enabled = supports_m3_sp_tiled_sort(
+                self.experts
+            )
         self.fuse_shared_experts = (
             getattr(self.experts, "num_fused_shared_experts", 0) > 0
         )

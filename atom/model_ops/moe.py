@@ -1243,6 +1243,10 @@ class Nvfp4MoEMethod(FusedMoEMethodBase):
 class Mxfp4MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(moe)
+        # Keep cached layer references within this model's lifetime.
+        self._sp_input_can_prequantize = lru_cache(maxsize=64)(
+            self._sp_input_can_prequantize
+        )
         self.quant_config = quant_config
         self.quant_type = quant_config.quant_type
         self.quant_dtype = quant_config.quant_dtype
@@ -1822,7 +1826,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_scale=layer.w2_weight_scale,
         )
 
-    @lru_cache(maxsize=64)
     def _sp_input_can_prequantize(self, layer, tokens, dtype):
         # Only move an existing, row-local FP4 quantization across the gather.
         # Small batches and inline/ksplit kernels may consume BF16 directly.

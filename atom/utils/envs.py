@@ -69,9 +69,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SP_MOE_QUANT_REGISTERED": lambda: (
         os.getenv("ATOM_SP_MOE_QUANT_REGISTERED", "0") == "1"
     ),
-    "ATOM_SP_MOE_TILED_SORT": lambda: (
-        os.getenv("ATOM_SP_MOE_TILED_SORT", "0") == "1"
-    ),
+    "ATOM_SP_MOE_TILED_SORT": lambda: (os.getenv("ATOM_SP_MOE_TILED_SORT", "0") == "1"),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(

@@ -112,7 +112,10 @@ def head_amax(x: torch.Tensor) -> torch.Tensor:
 
 
 def quantize_with_gathered_amax(
-    x: torch.Tensor, amax: torch.Tensor, world: int, rank: int,
+    x: torch.Tensor,
+    amax: torch.Tensor,
+    world: int,
+    rank: int,
     out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a head shard with global scales, returning this rank's scales."""
@@ -164,7 +167,11 @@ def gather_heads_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         from atom.distributed.sp_registered_buffer import registered_input_view
 
         ca = head_exchange_communicator(x)
-        scratch = registered_input_view(get_sp_group(), x.shape, dtypes.fp8) if ca is not None else None
+        scratch = (
+            registered_input_view(get_sp_group(), x.shape, dtypes.fp8)
+            if ca is not None
+            else None
+        )
         if scratch is not None:
             q, scale = quantize_with_gathered_amax(
                 x, amax, world, get_sp_group().rank_in_group, out=scratch[0]
