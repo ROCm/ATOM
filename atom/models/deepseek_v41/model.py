@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 """Full-layer eager text backbone. Checkpoint I/O and request preparation live outside."""
 
+from dataclasses import replace
+from types import SimpleNamespace
 from typing import ClassVar
 
 import torch
@@ -8,10 +10,7 @@ from aiter.dist.parallel_state import get_tp_group
 from torch import nn
 
 from atom.model_loader.weight_names import WeightsMapper
-from atom.model_ops.deepseek_v41.mhc import (
-    SinglePassHCState,
-    expand_residual,
-)
+from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.deepseek_v41.mhc_pre_delayed import pre_delayed
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 from atom.model_ops.embed_head import VocabParallelEmbedding
@@ -24,6 +23,8 @@ from atom.models.deepseek_v4 import (
     ParallelHead,
     make_v4_quant_config,
 )
+from atom.utils import envs
+from atom.utils.forward_context import get_forward_context
 
 from .attention import Attention
 from .config import build_attention_topology
@@ -42,10 +43,14 @@ class Block(nn.Module):
         *,
         moe_quant_config,
         alt_stream: torch.cuda.Stream | None = None,
+        compress_stream: torch.cuda.Stream | None = None,
+        index_stream: torch.cuda.Stream | None = None,
     ):
         super().__init__()
         self.layer_name = f"v41.layers.{spec.layer_id}"
-        self.attn = self.attention_cls(config, spec)
+        self.attn = self.attention_cls(
+            config, spec, compress_stream=compress_stream, index_stream=index_stream
+        )
         # FusedMoE names its parameters from this prefix, so it has to match the
         # module layout used by the shared loader: `layers.N` / `mtp.N`.
         self.ffn = MoE(
@@ -55,7 +60,19 @@ class Block(nn.Module):
             quant_config=moe_quant_config,
             alt_stream=alt_stream,
         )
-        self.attn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        # Where `wqkv_a` is the norm's only reader, the norm emits the
+        # `(e4m3, e8m0 group-32)` pair that GEMM would otherwise have made for
+        # itself -- one launch instead of two. A layer whose compressor or
+        # indexer also projects this tensor keeps the BF16 it needs.
+        self.attn_norm = RMSNorm(
+            config.hidden_size,
+            config.rms_norm_eps,
+            **(
+                {}
+                if spec.shares_attention_input
+                else {"fused_quant": True, "quant_config": native_quant_config()}
+            ),
+        )
         self.ffn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         # `post_mult` is the 2.0 in the post gate's `2 * sigmoid(...)`, which
         # the AITER stages take as a parameter where the torch body has it
@@ -94,7 +111,17 @@ class Block(nn.Module):
             )
 
     def attention_forward(self, hidden, cache, step, rope):
-        return self.attn(hidden, cache, step, rope)
+        """Norm this sublayer's input, then run it.
+
+        The norm stays on this side of the guarded op rather than in
+        `prepare_attention` so its quantized pair never has to cross one: the
+        op is declared over a single BF16 tensor, and what leaves it is the
+        attention output rather than anything shaped like its input.
+        """
+        normed = self.attn_norm(hidden)
+        if isinstance(normed, tuple):
+            return self.attn(*normed, cache, step, rope)
+        return self.attn(normed, None, cache, step, rope)
 
     def engram_forward(self, residual, embeddings, image_mask):
         if embeddings is None:
@@ -103,18 +130,28 @@ class Block(nn.Module):
             residual, embeddings, None if image_mask is None else ~image_mask
         )
 
-    def prepare_attention(self, residual, pre_mix, embeddings, image_mask):
+    def prepare_attention(self, state, embeddings, image_mask):
         if self.engram is not None:
-            residual = self.engram_forward(residual, embeddings, image_mask)
+            # Engram reads the residual between the post and the pre, so this
+            # is the one seam that cannot fold: settling leaves nothing owed
+            # and the projection below runs plain.
+            state = state.settle()
+            state = replace(
+                state,
+                residual=self.engram_forward(state.residual, embeddings, image_mask),
+            )
         residual, hidden, pre, post, comb = pre_delayed(
-            residual,
-            pre_mix,
+            state.residual,
+            state.pre_mix,
             self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
             **self.hc_options,
+            sublayer_output=state.pending,
+            post_mix=state.post_mix,
+            combination=state.combination,
         )
-        return self.attn_norm(hidden), residual, pre, post, comb
+        return hidden, residual, pre, post, comb
 
     def prepare_ffn(self, output, residual, pre, post, comb):
         # The attention post folds into this pre, which is the shape the seam
@@ -134,18 +171,20 @@ class Block(nn.Module):
         return self.ffn_norm(hidden), residual, pre, post, comb
 
     def finish_ffn(self, output, residual, pre, post, comb):
-        return expand_residual(output, residual, post, comb), pre
+        # Owed, not applied: the next block's pre folds this post into its own
+        # projection.
+        return SinglePassHCState(residual, pre, output, post, comb)
 
     def forward(self, state, cache, step, rope, embeddings=None, image_mask=None):
         hidden, residual, pre, post, comb = self.prepare_attention(
-            state.residual, state.pre_mix, embeddings, image_mask
+            state, embeddings, image_mask
         )
         output = self.attention_forward(hidden, cache, step, rope)
         hidden, residual, pre, post, comb = self.prepare_ffn(
             output, residual, pre, post, comb
         )
-        output = self.ffn(hidden, image_mask)
-        return SinglePassHCState(*self.finish_ffn(output, residual, pre, post, comb))
+        output = self.ffn(hidden)
+        return self.finish_ffn(output, residual, pre, post, comb)
 
 
 class DeepseekV41ForCausalLM(nn.Module):
@@ -197,12 +236,25 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.moe_quant_config = make_v4_quant_config(
             config, online_quant_config=online_quant_config
         )
-        # The shared expert runs here, beside the routed pass rather than after
-        # it. One stream for the whole model and not one per layer: a layer's
-        # attention is done before its MoE starts and layers do not overlap, so
-        # they cannot contend. Forking is decided per call by
-        # `maybe_dual_stream_forward`, which declines above a token count.
-        self.alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        # A stream earns a hardware queue only where two branches are live at
+        # once -- overlapping lifetimes, not independent data. One per model
+        # rather than per layer, because layers do not overlap.
+        # `ATOM_DSV41_SIDE_STREAMS` picks the level and the environment doc
+        # carries what each one measured.
+        #
+        # The compressor borrows the MoE's wherever it forks: its lifetime ends
+        # at the scorer, a sublayer before the shared expert is issued, and the
+        # MoE joins this stream inside its own forward. Only the indexer is
+        # ever live beside both, so only it costs a queue.
+        on_device = torch.cuda.is_available()
+        level = envs.ATOM_DSV41_SIDE_STREAMS
+        if level not in (0, 1, 2):
+            raise ValueError(f"ATOM_DSV41_SIDE_STREAMS must be 0, 1 or 2, not {level}")
+        if not on_device:
+            level = 0
+        self.alt_stream = torch.cuda.Stream() if on_device else None
+        self.compress_stream = self.alt_stream if level >= 1 else None
+        self.index_stream = torch.cuda.Stream() if level == 2 else None
         self.layers = nn.ModuleList(
             self.block_cls(
                 config,
@@ -210,6 +262,8 @@ class DeepseekV41ForCausalLM(nn.Module):
                 prefix=f"layers.{spec.layer_id}",
                 moe_quant_config=self.moe_quant_config,
                 alt_stream=self.alt_stream,
+                compress_stream=self.compress_stream,
+                index_stream=self.index_stream,
             )
             for spec in self.topology
         )
@@ -333,14 +387,22 @@ class DeepseekV41ForCausalLM(nn.Module):
         ):
             raise ValueError("logits_start requires a valid full-logits suffix")
         step = cache.begin_step(cache.position, token_ids.shape[1], token_ids.shape[0])
-        hidden = self.forward_hidden(
-            token_ids,
-            cache,
-            step,
-            engram_embeddings,
-            inputs_embeds=inputs_embeds,
-            image_mask=image_mask,
-        )
+        # Serving publishes this metadata in the attention backend. The offline
+        # entry owns it for one call too, so every MoE uses the same fixed hook.
+        context = get_forward_context()
+        previous = context.attn_metadata
+        context.attn_metadata = SimpleNamespace(image_mask=image_mask)
+        try:
+            hidden = self.forward_hidden(
+                token_ids,
+                cache,
+                step,
+                engram_embeddings,
+                inputs_embeds=inputs_embeds,
+                image_mask=image_mask,
+            )
+        finally:
+            context.attn_metadata = previous
         hidden = hidden[:, logits_start:] if full_logits else hidden[:, -1]
         logits = self.head.get_logits(self.norm(hidden).flatten(0, -2)).unflatten(
             0, hidden.shape[:-1]

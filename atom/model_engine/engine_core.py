@@ -167,6 +167,12 @@ class EngineCore:
                 config,
                 state_runtime=self.state_runtime,
             )
+            if (
+                config.parallel_config.data_parallel_size == 1
+                and config.pipeline_parallel_size == 1
+                and envs.ATOM_PREFILL_DECODE_INTERVAL > 0
+            ):
+                self._init_prefill_delayer(config)
 
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
         self._next_idle_kv_drain = 0.0
@@ -187,6 +193,31 @@ class EngineCore:
 
         self._send_ready_signal()
         logger.info(f"{self.label}: EngineCore fully initialized and ready")
+
+    def _init_prefill_delayer(self, config: Config, cpu_group=None):
+        if (
+            not envs.ATOM_ENABLE_PREFILL_DELAYER
+            or config.enable_rapidserve
+            or self.scheduler is None
+        ):
+            return
+        from atom.model_engine.prefill_delayer import PrefillDelayer
+
+        self.scheduler.set_prefill_delayer(
+            PrefillDelayer(
+                dp_size=config.parallel_config.data_parallel_size,
+                cpu_group=cpu_group,
+                max_num_batched_tokens=config.max_num_batched_tokens,
+                target_fill=envs.ATOM_PREFILL_DELAYER_TARGET_FILL,
+                ttft_max_ticks=envs.ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS,
+                partial_max_ticks=envs.ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS,
+                stall_ticks=envs.ATOM_PREFILL_DELAYER_STALL_TICKS,
+                kv_high_watermark=envs.ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK,
+                token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
+                max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
+                prefill_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL,
+            )
+        )
 
     def _freeze_after_startup(self):
         """Freeze this process and its ModelRunner workers.
@@ -726,24 +757,7 @@ class DPEngineCoreProc(EngineCore):
         self.engines_running = True
         self._shutting_down = False
 
-        if envs.ATOM_ENABLE_PREFILL_DELAYER:
-            from atom.model_engine.prefill_delayer import PrefillDelayer
-
-            self.scheduler.set_prefill_delayer(
-                PrefillDelayer(
-                    dp_size=config.parallel_config.data_parallel_size,
-                    cpu_group=self.dp_group,
-                    max_num_batched_tokens=config.max_num_batched_tokens,
-                    target_fill=envs.ATOM_PREFILL_DELAYER_TARGET_FILL,
-                    ttft_max_ticks=envs.ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS,
-                    partial_max_ticks=envs.ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS,
-                    stall_ticks=envs.ATOM_PREFILL_DELAYER_STALL_TICKS,
-                    kv_high_watermark=envs.ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK,
-                    token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
-                    max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
-                    prefill_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL,
-                )
-            )
+        self._init_prefill_delayer(config, self.dp_group)
 
     def _init_data_parallel(self, config: Config):
         dp_rank = config.parallel_config.data_parallel_rank

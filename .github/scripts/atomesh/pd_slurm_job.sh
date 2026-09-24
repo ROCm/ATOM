@@ -24,14 +24,21 @@ mkdir -p "${RUN_DIR}"
 chmod 0777 "${RUN_DIR}" 2>/dev/null || true
 
 EXECUTION_PHASES=(combined)
-if [[ "${BENCHMARK_KIND:-random}" == "aiperf_agentic" \
+if [[ "${EVAL_ONLY:-false}" == "true" || "${EVAL_ONLY:-false}" == "1" ]]; then
+  if [[ "${RUN_EVAL:-false}" != "true" && "${RUN_EVAL:-false}" != "1" ]]; then
+    echo "ERROR: EVAL_ONLY requires RUN_EVAL=true" >&2
+    exit 2
+  fi
+  # Enter the existing fresh eval phase, which also removes synthetic AL.
+  EXECUTION_PHASES=(eval)
+elif [[ "${BENCHMARK_KIND:-random}" == "aiperf_agentic" \
   && ( "${EVAL_TASK:-gsm8k}" == "swebench_lite" \
     || "${EVAL_TASK:-gsm8k}" == "gsm8k" ) \
   && ( "${RUN_EVAL:-false}" == "true" || "${RUN_EVAL:-false}" == "1" ) ]]; then
   EXECUTION_PHASES=(benchmark eval)
 fi
 ATOMESH_RESTART_PORT_OFFSET="${ATOMESH_RESTART_PORT_OFFSET:-1000}"
-if [[ "${#EXECUTION_PHASES[@]}" -gt 1 && ! "${ATOMESH_RESTART_PORT_OFFSET}" =~ ^[1-9][0-9]*$ ]]; then
+if [[ " ${EXECUTION_PHASES[*]} " == *" eval "* && ! "${ATOMESH_RESTART_PORT_OFFSET}" =~ ^[1-9][0-9]*$ ]]; then
   echo "ERROR: ATOMESH_RESTART_PORT_OFFSET must be a positive integer" >&2
   exit 2
 fi
@@ -205,7 +212,7 @@ EOF
   echo "[network] rank=${rank} ip=${node_ip} NCCL_SOCKET_IFNAME=${nccl_socket_ifname} MORI_SOCKET_IFNAME=${mori_socket_ifname}"
 
   bounded_docker_rm "${container}"
-  if [[ "${execution_phase}" != "eval" ]]; then
+  if [[ "${execution_phase}" != "eval" || "${EVAL_ONLY:-false}" == "true" || "${EVAL_ONLY:-false}" == "1" ]]; then
     docker pull "${DOCKER_IMAGE}"
   fi
 
@@ -615,7 +622,7 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
         docker kill "${container}" >/dev/null 2>&1 || true
         docker rm -f "${container}" >/dev/null 2>&1 || true
       fi
-      if [[ "${execution_phase}" != "eval" ]]; then
+      if [[ "${execution_phase}" != "eval" || "${EVAL_ONLY:-false}" == "true" || "${EVAL_ONLY:-false}" == "1" ]]; then
         docker pull "'"${DOCKER_IMAGE}"'"
       fi
       mesh_binary="${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"

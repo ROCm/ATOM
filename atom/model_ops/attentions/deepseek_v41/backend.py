@@ -8,6 +8,7 @@ import torch
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.state_runtime import StateTransfer
+from atom.model_loader.weight_utils import local_model_dir
 from atom.model_ops.attentions.backends import AttentionBackend, CommonAttentionBuilder
 from atom.model_ops.attentions.deepseek_v4_attn import (
     DeepseekV4AttentionMetadataBuilder,
@@ -91,6 +92,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             # window-only layer gets no buffer for one.
             layer_ratios=tuple(sorted({spec.ratio for spec in topology})),
             index_topk=self.config.index_topk,
+            # Paged at the length candidates are picked in, which is what lets
+            # a candidate list be a block table. A GPU that cannot page that
+            # short refuses when asked, so there is nothing to pre-empt here.
+            index_block_rows=self.config.candidate_block_size,
         )
         model_runner.forward_vars.update(
             self._compress_plan_buffers(
@@ -104,7 +109,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         self.dummy_weights = bool(model_runner.config.load_dummy)
         if not self.dummy_weights and self.config.engram_layer_ids:
             self.engram = EngramInputPreparer.from_checkpoint(
-                model_runner.config.model,
+                local_model_dir(model_runner.config.model),
                 self.config,
                 self.max_num_batched_tokens,
                 self.device,

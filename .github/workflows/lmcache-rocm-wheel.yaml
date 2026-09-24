@@ -1,0 +1,292 @@
+name: LMCache ROCm torch 2.10 Wheel
+
+# Builds an LMCache wheel for the ATOM image's torch ABI from any LMCache commit
+# and, when asked, publishes it as a pinned GitHub Release on this repository.
+#
+# The ATOM image ships AMD's ROCm 7.2.4 / torch 2.10.0 build. LMCache only
+# publishes a wheel for that ABI with tagged releases; its rolling nightly-rocm
+# wheel is built against torch 2.11 for the upstream vLLM image and fails to
+# load here (undefined c10::cuda::CUDACachingAllocator symbols). Waiting for a
+# tag is what this workflow removes: ATOM can pick up an LMCache fix as soon as
+# it lands on dev.
+#
+# The build itself is LMCache's: the scripts under .github/scripts at the
+# requested commit, run inside the same digest-pinned rocm/pytorch image that
+# LMCache's build_rocm_torch210_artifacts.yml uses. Nothing here re-implements
+# how LMCache compiles; this workflow only chooses the commit, the version and
+# where the result lives.
+#
+# Versioning follows LMCache's nightlies (setuptools-scm's guess-next-dev from
+# the last stable tag), with the commit and the torch ABI in the local segment:
+#
+#   lmcache-0.5.6.dev98+g05fc77a0.rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1-cp312-cp312-manylinux_2_39_x86_64.whl
+#
+# Published releases are tagged lmcache-v<version>-g<sha8>-rocm-torch210, are
+# never overwritten, and are marked pre-release and not-latest so they do not
+# displace ATOM's own release on the repository page. The Dockerfiles pin one of
+# them by URL and sha256.
+
+on:
+  workflow_dispatch:
+    inputs:
+      lmcache_commit:
+        description: "Full 40-character LMCache commit SHA to build (e.g. from LMCache/LMCache dev)."
+        type: string
+        required: true
+      publish:
+        description: "Publish the wheel as a GitHub Release on this repository. Off = build and validate only."
+        type: boolean
+        required: false
+        default: false
+      runner:
+        description: "Runner to build on. A GPU runner also runs LMCache's HIP transfer kernels."
+        type: choice
+        required: false
+        default: 'build-only-atom'
+        options:
+          - build-only-atom
+          - linux-atom-mi35x-1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lmcache-rocm-wheel-${{ inputs.lmcache_commit }}
+  cancel-in-progress: false
+
+env:
+  # Mirrors LMCache's build_rocm_torch210_artifacts.yml and the torch that
+  # docker/Dockerfile ships. Bump together.
+  ROCM_PYTORCH_IMAGE: >-
+    rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0@sha256:4449f856653602317e4101a76fce599c7fcd58ccec2e539951fce5f73083179e
+  EXPECTED_TORCH_VERSION: 2.10.0+rocm7.2.4.git3d3aa833
+  EXPECTED_TORCH_GIT_VERSION: 3d3aa833db84eed6b7f5595cb5f162c2f78300a4
+  EXPECTED_HIP_VERSION: "7.2.53211"
+  EXPECTED_ROCM_VERSION: "7.2.4"
+  EXPECTED_PYTHON_ABI: cp312
+  EXPECTED_CXX11_ABI: "1"
+  EXPECTED_WHEEL_TAG: cp312-cp312-manylinux_2_39_x86_64
+  MANYLINUX_PLATFORM: manylinux_2_39_x86_64
+  PYTORCH_ROCM_ARCH: gfx942;gfx950
+  ROCM_TORCH210_LOCAL_VERSION: rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1
+
+jobs:
+  build:
+    name: Build and validate LMCache ${{ inputs.lmcache_commit }}
+    runs-on: ${{ inputs.runner || 'build-only-atom' }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      wheel: ${{ steps.wheel.outputs.wheel }}
+      sha256: ${{ steps.wheel.outputs.sha256 }}
+    steps:
+      - name: Check the requested commit
+        env:
+          LMCACHE_COMMIT: ${{ inputs.lmcache_commit }}
+        run: |
+          # A branch name would make the release say one thing and hold another
+          # the next time someone reruns it.
+          if ! [[ "${LMCACHE_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "lmcache_commit must be a full 40-character lowercase SHA, got '${LMCACHE_COMMIT}'."
+            exit 1
+          fi
+
+      - name: Checkout ATOM
+        uses: actions/checkout@v4
+        with:
+          path: atom-src
+
+      - name: Checkout LMCache
+        uses: actions/checkout@v4
+        with:
+          repository: LMCache/LMCache
+          ref: ${{ inputs.lmcache_commit }}
+          path: lmcache-src
+          # Tags are needed to derive the version from the last stable release.
+          fetch-depth: 0
+
+      - name: Resolve the wheel version
+        id: version
+        working-directory: lmcache-src
+        env:
+          LMCACHE_COMMIT: ${{ inputs.lmcache_commit }}
+        run: |
+          set -euo pipefail
+          base_tag=$(git tag --merged HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          if [ -z "${base_tag}" ]; then
+            echo "No stable vX.Y.Z tag is reachable from ${LMCACHE_COMMIT}."
+            exit 1
+          fi
+          distance=$(git rev-list --count "${base_tag}..HEAD")
+          IFS=. read -r major minor patch <<< "${base_tag#v}"
+          if [ "${distance}" -eq 0 ]; then
+            base="${base_tag#v}"
+          else
+            base="${major}.${minor}.$((patch + 1)).dev${distance}"
+          fi
+          short="${LMCACHE_COMMIT:0:8}"
+          version="${base}+g${short}.${ROCM_TORCH210_LOCAL_VERSION}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=lmcache-v${base}-g${short}-rocm-torch210" >> "$GITHUB_OUTPUT"
+          echo "LMCache ${LMCACHE_COMMIT} -> ${version}"
+
+      - name: Build the wheel
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          script=lmcache-src/.github/scripts/build_rocm_torch210_wheel.sh
+          if [ ! -f "${script}" ]; then
+            echo "${script} does not exist at this LMCache commit; it predates the torch 2.10 wheel build."
+            exit 1
+          fi
+          docker run --rm \
+            -e EXPECTED_TORCH_VERSION -e EXPECTED_TORCH_GIT_VERSION \
+            -e EXPECTED_HIP_VERSION -e EXPECTED_ROCM_VERSION \
+            -e EXPECTED_PYTHON_ABI -e EXPECTED_CXX11_ABI -e EXPECTED_WHEEL_TAG \
+            -e PYTORCH_ROCM_ARCH -e MANYLINUX_PLATFORM \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION="${VERSION}" \
+            -e MAX_JOBS=16 \
+            -v "${PWD}/lmcache-src:/work/LMCache" \
+            --entrypoint bash "${ROCM_PYTORCH_IMAGE}" \
+            /work/LMCache/.github/scripts/build_rocm_torch210_wheel.sh
+
+      - name: Record the wheel
+        id: wheel
+        run: |
+          set -euo pipefail
+          wheels=(lmcache-src/dist_rocm_torch210/*.whl)
+          test "${#wheels[@]}" -eq 1
+          wheel=$(basename "${wheels[0]}")
+          sha256=$(sha256sum "${wheels[0]}" | cut -d' ' -f1)
+          echo "wheel=${wheel}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${sha256}" >> "$GITHUB_OUTPUT"
+          echo "${sha256}  ${wheel}"
+
+      # A clean container of the build image, so nothing from the build tree or
+      # an ATOM layer can mask a missing dependency or an ABI mismatch.
+      - name: Validate the wheel in a clean container
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          gpu_args=()
+          if [ -e /dev/kfd ]; then
+            gpu_args=(--device /dev/kfd --device /dev/dri --group-add video -e LMCACHE_ROCM_REQUIRE_GPU=1)
+          fi
+          docker run --rm "${gpu_args[@]}" \
+            -e EXPECTED_TORCH_VERSION -e EXPECTED_TORCH_GIT_VERSION \
+            -e EXPECTED_HIP_VERSION -e EXPECTED_ROCM_VERSION \
+            -e EXPECTED_PYTHON_ABI -e EXPECTED_CXX11_ABI -e EXPECTED_WHEEL_TAG \
+            -e VERSION \
+            -v "${PWD}/lmcache-src/dist_rocm_torch210:/wheel:ro" \
+            -v "${PWD}/lmcache-src/.github/scripts/validate_rocm_torch210_wheel.py:/validate_rocm_torch210_wheel.py:ro" \
+            -v "${PWD}/atom-src/.github/scripts/validate_lmcache_wheel_for_atom.py:/validate_lmcache_wheel_for_atom.py:ro" \
+            --entrypoint bash "${ROCM_PYTORCH_IMAGE}" -lc '
+              set -euo pipefail
+              python -m pip uninstall -y lmcache
+              # The dependency set LMCache validates its own wheel with. Never
+              # resolve the unpinned torch dependency from the wheel metadata.
+              python -m pip install \
+                aiohttp "numpy<=2.2.6" cachetools msgspec numba \
+                "prometheus-client>=0.18.0,<=0.24.1" psutil py-cpuinfo pyyaml \
+                "pyzmq>=25.0.0" requests sortedcontainers
+              python -m pip install --no-deps --force-reinstall /wheel/*.whl
+              cd /tmp
+              python /validate_rocm_torch210_wheel.py
+              python /validate_lmcache_wheel_for_atom.py --expected-version "${VERSION}"
+            '
+
+      - name: Upload wheel as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lmcache-rocm-torch210-${{ github.run_id }}-${{ github.run_attempt }}
+          path: lmcache-src/dist_rocm_torch210/*.whl
+          retention-days: 14
+
+      - name: Build summary
+        if: always()
+        run: |
+          {
+            echo "## LMCache ROCm torch 2.10 Wheel"
+            echo "- **LMCache commit**: [${{ inputs.lmcache_commit }}](https://github.com/LMCache/LMCache/commit/${{ inputs.lmcache_commit }})"
+            echo "- **Version**: ${{ steps.version.outputs.version }}"
+            echo "- **Wheel**: ${{ steps.wheel.outputs.wheel || '(build failed)' }}"
+            echo "- **sha256**: ${{ steps.wheel.outputs.sha256 }}"
+            echo "- **Build image**: ${ROCM_PYTORCH_IMAGE}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The build container writes as root; leave the self-hosted workspace
+      # clean for the next checkout.
+      - name: Cleanup build tree
+        if: always()
+        run: |
+          if [ -d lmcache-src ]; then
+            docker run --rm -v "${PWD}:/ws" --entrypoint rm "${ROCM_PYTORCH_IMAGE}" -rf /ws/lmcache-src || true
+          fi
+
+  publish:
+    name: Publish the wheel as a GitHub Release
+    needs: build
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      LMCACHE_COMMIT: ${{ inputs.lmcache_commit }}
+      VERSION: ${{ needs.build.outputs.version }}
+      RELEASE_TAG: ${{ needs.build.outputs.release_tag }}
+      WHEEL: ${{ needs.build.outputs.wheel }}
+      SHA256: ${{ needs.build.outputs.sha256 }}
+    steps:
+      - name: Download the wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: lmcache-rocm-torch210-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-wheel
+
+      - name: Create the release
+        run: |
+          set -euo pipefail
+          echo "${SHA256}  release-wheel/${WHEEL}" | sha256sum -c -
+          # A pinned Dockerfile trusts this URL and sha256 forever; never
+          # replace an asset under a tag that may already be referenced.
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "Release ${RELEASE_TAG} already exists; not overwriting it."
+            exit 1
+          fi
+          url="https://github.com/${GH_REPO}/releases/download/${RELEASE_TAG}/${WHEEL//+/%2B}"
+          cat > notes.md <<EOF
+          LMCache wheel for ATOM's ROCm 7.2.4 / torch 2.10.0 image (gfx942, gfx950), built by [this run](${GITHUB_SERVER_URL}/${GH_REPO}/actions/runs/${GITHUB_RUN_ID}).
+
+          - LMCache commit: [${LMCACHE_COMMIT}](https://github.com/LMCache/LMCache/commit/${LMCACHE_COMMIT})
+          - Version: \`${VERSION}\`
+          - Build image: \`${ROCM_PYTORCH_IMAGE}\`
+          - sha256: \`${SHA256}\`
+
+          Pin in docker/Dockerfile:
+
+          \`\`\`
+          ARG LMCACHE_WHEEL_NAME=${WHEEL}
+          ARG LMCACHE_WHEEL_URL=${url}
+          ARG LMCACHE_WHEEL_SHA256=${SHA256}
+          \`\`\`
+          EOF
+          gh release create "${RELEASE_TAG}" \
+            --target "${GITHUB_SHA}" \
+            --title "LMCache ${VERSION}" \
+            --notes-file notes.md \
+            --prerelease \
+            --latest=false \
+            "release-wheel/${WHEEL}"
+
+      - name: Release summary
+        run: |
+          {
+            echo "## LMCache Release"
+            echo "- **Tag**: ${RELEASE_TAG}"
+            echo "- **Wheel**: ${WHEEL}"
+            echo "- **sha256**: ${SHA256}"
+          } >> "$GITHUB_STEP_SUMMARY"

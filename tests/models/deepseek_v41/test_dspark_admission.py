@@ -27,8 +27,10 @@ def config():
     )
 
 
-def test_static_and_explicitly_calibrated_native_dspark():
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+def test_static_and_explicitly_calibrated_native_dspark(tp_size):
     value = config()
+    value.tensor_parallel_size = tp_size
     validate_speculative_config(value)
     value.dspark = DSparkConfig(
         confidence_schedule=True, ragged=True, calibration_profile="profile.json"
@@ -39,7 +41,6 @@ def test_static_and_explicitly_calibrated_native_dspark():
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("tensor_parallel_size", 8),
         ("kv_cache_dtype", "fp4"),
     ],
 )
@@ -56,7 +57,6 @@ def test_unvalidated_runtime_combinations_are_rejected(field, value):
         ("method", "mtp"),
         ("num_speculative_tokens", 4),
         ("model", "/another_model"),
-        ("synthetic_acceptance_rates", [1.0] * 5),
     ],
 )
 def test_incompatible_draft_contract_is_rejected(field, value):
@@ -92,3 +92,12 @@ def test_relaxed_acceptance_cannot_bypass_target_distribution(monkeypatch):
     monkeypatch.setenv("ATOM_ENABLE_RELAXED_MTP", "1")
     with pytest.raises(ValueError, match="strict target verification"):
         validate_speculative_config(config())
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("rates", [None, [1.0] * 5, [0.8] * 5])
+def test_native_and_fixed_acceptance_schedules_are_admitted(tp_size, rates):
+    cfg = config()
+    cfg.tensor_parallel_size = tp_size
+    cfg.speculative_config.synthetic_acceptance_rates = rates
+    validate_speculative_config(cfg)

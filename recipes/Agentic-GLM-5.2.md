@@ -320,9 +320,18 @@ For large-concurrency runs, TP4 + DCP4 reuses the same four GPUs to shard the
 decode KV cache and increase the available decode batch capacity. Speculative
 decoding stays on: `C16`-`C40` use four draft tokens and `C48` uses three.
 
-> **Note:** with MTP on the DCP path the engine disables DCP query replication,
-> and the KV pool is ~3.7% smaller because the draft layer carries its own KV.
-> Both are expected; compare MTP and non-MTP runs at the same concurrency.
+> **Note:** the draft layer carries its own KV, which shrinks the pool by
+> ~3.7% regardless of MTP/DCP interaction. DCP query replication (QREP) is
+> **on by default** here (this recipe never sets `ATOM_USE_TRITON_MXFP4_BMM`,
+> so the mxfp4 gate does not apply) and adds its own separate KV cost, on top
+> of the ~3.7% above — see `enable_query_replication` in
+> [Context Parallel Guide](../docs/context_parallel_guide.md#enable_query_replication-qrep)
+> for that cost's typical size (~5% on DeepSeek-R1 tp8/dcp8). **This exact
+> combination — MXFP4 weights + TP4/DCP4 + MTP + QREP — has not been run
+> end-to-end**; only GLM-5.2 FP8 tp8/dcp8 has. If `--gpu-memory-utilization
+> 0.95` runs tight at your concurrency, lower it or pass
+> `--dcp-config '{"enable_query_replication": false}'` to opt back out.
+> Compare MTP and non-MTP runs at the same concurrency and QREP setting.
 
 ```bash
 export MODEL_PATH=${MODEL_PATH:-amd/GLM-5.2-MXFP4}

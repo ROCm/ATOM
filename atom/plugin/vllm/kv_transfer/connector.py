@@ -20,6 +20,16 @@ it, so the plugin path gets the same guarantee the native path already tests
 
 Layer-granular hooks are deliberately inert: ATOM moves a whole request's blocks
 per transfer, not one layer at a time.
+
+Hybrid models (Kimi-K3: MLA attention plus KDA recurrent layers) get a second
+leg. vLLM gives them two KV cache groups, and a restored attention prefix is
+only correct if the recurrent state at the same token boundary is restored with
+it. The attention group keeps the byte-codec path described above; the recurrent
+group is moved by ``kda_state``, whose module docstring explains why it cannot
+share it. Everything joint lives here: the lookup cap that keeps a missing state
+from ever producing a half-restored prefix, the block pins that hold a
+handed-off boundary block across its store, and the two-leg join that only
+reports a load finished once both halves have landed.
 """
 
 import logging
@@ -32,11 +42,26 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
     KVConnectorWorkerMetadata,
+    SupportsHMA,
 )
 
 from atom.kv_transfer.disaggregation.types import ConnectorCompletion
 from atom.kv_transfer.offload._offload_common import offload_save_abandon_timeout_s
-from atom.plugin.vllm.kv_transfer.kv_cache_layout import build_kv_cache_tensors
+from atom.plugin.vllm.kv_transfer.kda_state import (
+    KdaBoundaryPlanner,
+    KdaPageViews,
+    KdaStateTier,
+    build_layout_id,
+    find_mamba_groups,
+    step_boundary_offloads,
+    summarize_layout_id,
+)
+from atom.plugin.vllm.kv_transfer.kv_cache_layout import (
+    build_kv_cache_tensors,
+    gather_group_tensors,
+    resolve_block_count,
+    split_kv_caches_by_group,
+)
 from atom.plugin.vllm.kv_transfer.offload_config import build_offload_config
 from atom.plugin.vllm.kv_transfer.seq_view import SeqViewRegistry
 
@@ -61,7 +86,14 @@ class AtomOffloadMetadata(KVConnectorMetadata):
     vLLM-shaped copy that would then have to be kept in sync.
     """
 
-    def __init__(self, inner, preempted_req_ids=(), release_req_ids=()) -> None:
+    def __init__(
+        self,
+        inner,
+        preempted_req_ids=(),
+        release_req_ids=(),
+        kda_stores=(),
+        kda_loads=(),
+    ) -> None:
         super().__init__()
         self.inner = inner
         # Requests vLLM preempted during this same ``schedule()`` call. Their
@@ -72,6 +104,11 @@ class AtomOffloadMetadata(KVConnectorMetadata):
         # worker echoes these as ``finished_sending``, which is the only thing
         # that frees blocks vLLM is holding on the connector's behalf.
         self.release_req_ids: list[str] = list(release_req_ids)
+        # Hybrid models only: recurrent boundary states to persist, and the
+        # boundary state each parked request needs back. Empty lists on every
+        # single-group model, which is every model but K3 today.
+        self.kda_stores = list(kda_stores)
+        self.kda_loads = list(kda_loads)
 
 
 class AtomOffloadWorkerMetadata(KVConnectorWorkerMetadata):
@@ -99,15 +136,37 @@ class AtomOffloadWorkerMetadata(KVConnectorWorkerMetadata):
     channel semantics belong to the layout, not to this adapter.
     """
 
-    def __init__(self, saved=None, load_failed=None, completions=None) -> None:
+    def __init__(
+        self,
+        saved=None,
+        load_failed=None,
+        completions=None,
+        state_stored=None,
+        state_store_failed=None,
+        state_load_failed=None,
+    ) -> None:
         self.saved: dict[str, int] = dict(saved or {})
         self.load_failed: dict[str, int] = dict(load_failed or {})
         self.completions: list[ConnectorCompletion] = list(completions or ())
+        # Recurrent-state reports. The store pair is keyed by the scheduler's
+        # own op id rather than by request id, because a boundary outlives the
+        # request that produced it -- it is keyed by prefix content, and the
+        # pinned block has to be released on the last rank's report whether or
+        # not that request still exists.
+        self.state_stored: dict[int, int] = dict(state_stored or {})
+        self.state_store_failed: dict[int, int] = dict(state_store_failed or {})
+        self.state_load_failed: dict[str, int] = dict(state_load_failed or {})
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
     ) -> "AtomOffloadWorkerMetadata":
-        for field in ("saved", "load_failed"):
+        for field in (
+            "saved",
+            "load_failed",
+            "state_stored",
+            "state_store_failed",
+            "state_load_failed",
+        ):
             mine = getattr(self, field)
             for req_id, count in (getattr(other, field, None) or {}).items():
                 mine[req_id] = mine.get(req_id, 0) + int(count)
@@ -117,12 +176,24 @@ class AtomOffloadWorkerMetadata(KVConnectorWorkerMetadata):
     def __repr__(self) -> str:
         return (
             f"AtomOffloadWorkerMetadata(saved={self.saved}, "
-            f"load_failed={self.load_failed}, completions={self.completions})"
+            f"load_failed={self.load_failed}, "
+            f"completions={self.completions}, "
+            f"state_stored={self.state_stored}, "
+            f"state_store_failed={self.state_store_failed}, "
+            f"state_load_failed={self.state_load_failed})"
         )
 
 
-class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
-    """Drives ``atom.kv_transfer.offload`` from vLLM's connector API."""
+class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
+    """Drives ``atom.kv_transfer.offload`` from vLLM's connector API.
+
+    ``SupportsHMA`` is not optional for a hybrid model, and not cosmetic for the
+    others. vLLM refuses to build a connector that lacks it when the hybrid
+    memory allocator is on (``KVConnectorFactory.create_connector``), and
+    silently turns HMA *off* when one is configured without it
+    (``config/vllm.py``) -- and a hybrid SSM model then fails at startup. So
+    without this base K3 does not mis-save, it does not boot.
+    """
 
     def __init__(self, vllm_config, role: KVConnectorRole, kv_cache_config=None):
         # kv_cache_config is required of out-of-tree v1 connectors: the factory
@@ -174,6 +245,44 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
             1, int(getattr(vllm_config.parallel_config, "world_size", 1) or 1)
         )
 
+        # ---- hybrid (several KV cache groups) -------------------------------
+        # Resolved once here so both halves agree on which group is which. A
+        # model with no mamba group leaves every field below inert and takes
+        # exactly the code path it takes today.
+        self._mamba_groups = find_mamba_groups(
+            getattr(kv_cache_config, "kv_cache_groups", None) or ()
+        )
+        self._attn_group_id = self._resolve_attention_group(kv_cache_config)
+        # Worker half of the recurrent leg.
+        self._kda_tier = None
+        # Requests whose recurrent load is still outstanding, the dense halves
+        # waiting on them, and the results waiting for a dense half. A load is
+        # only reported to vLLM once both legs are in; see `_join_kda`.
+        self._kda_expect: set[str] = set()
+        self._kda_dense_done: set[str] = set()
+        self._kda_results: dict[str, Any] = {}
+        self._kda_error_blocks: set[int] = set()
+        self._worker_state_stored: dict[int, int] = {}
+        self._worker_state_store_failed: dict[int, int] = {}
+        self._worker_state_load_failed: dict[str, int] = {}
+        # KDA stores wait until `wait_for_save`. That hook runs after the
+        # target forward and, when speculative decoding defers connector
+        # finalize, after `postprocess_mamba` has folded the accepted tokens
+        # into the boundary page. Recording the fence in `start_load_kv`
+        # copies the page before that write.
+        self._pending_kda_stores: list = []
+        # No-forward steps never call `wait_for_save`. Nothing writes the
+        # boundary page on those steps, so `get_finished` may flush instead.
+        self._kda_flush_stores_in_get_finished = False
+        # Scheduler half of the recurrent leg.
+        self._kda_planner = None
+        self._state_load_failure_reports: dict[str, int] = {}
+        # vLLM Request objects for the requests this connector has seen. The
+        # recurrent key is derived from `request.block_hashes`, and a boundary
+        # hand-off names only a request id. These are the scheduler's own
+        # objects, shared not copied, and dropped when the request finishes.
+        self._requests: dict[str, Any] = {}
+
         if role == KVConnectorRole.WORKER:
             from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
 
@@ -182,6 +291,64 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
             from atom.kv_transfer.offload.dense.connector import DenseOffloadScheduler
 
             self._scheduler = DenseOffloadScheduler(self._config)
+            self._init_kda_planner(vllm_config, kv_cache_config)
+
+    def _resolve_attention_group(self, kv_cache_config) -> int:
+        """Which group the existing byte-codec path owns.
+
+        One, and it has to be one: ``DenseOffloadConnector`` builds a single
+        codec over a single block geometry. Two attention groups would need two,
+        and silently registering only the first would offload half the layers
+        under keys that claim the whole prefix.
+        """
+        groups = getattr(kv_cache_config, "kv_cache_groups", None) or ()
+        if len(groups) <= 1:
+            return 0
+        mamba_ids = {group_id for group_id, _ in self._mamba_groups}
+        others = [gid for gid in range(len(groups)) if gid not in mamba_ids]
+        if len(others) != 1:
+            raise ValueError(
+                "ATOM offload connector: expected exactly one non-recurrent KV "
+                f"cache group, found {others}; the byte codec registers one "
+                "block geometry and cannot span several"
+            )
+        return others[0]
+
+    def _init_kda_planner(self, vllm_config, kv_cache_config) -> None:
+        """Stand up the scheduler half of the recurrent leg, if there is one."""
+        if not self._mamba_groups:
+            return
+        from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+
+        group_ids = tuple(group_id for group_id, _ in self._mamba_groups)
+        spec = self._mamba_groups[0][1]
+        cache_mode = getattr(vllm_config.cache_config, "mamba_cache_mode", None)
+        if cache_mode != "align":
+            # Any other mode keeps the recurrent state somewhere this connector
+            # has no hand-off for, so a boundary block id would be a guess. The
+            # failure would be a wrong restored state, which nothing reports.
+            raise ValueError(
+                "ATOM offload connector: a hybrid model needs "
+                f"--mamba-cache-mode align to offload KV, got {cache_mode!r}; "
+                "vLLM hands off exact boundary state blocks only in that mode"
+            )
+        _, hash_block_size = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+        self._kda_planner = KdaBoundaryPlanner(
+            group_ids=group_ids,
+            mamba_block_size=int(spec.block_size),
+            hash_block_size=int(hash_block_size),
+            chunk_size=int(self._scheduler.chunk_size),
+            world_size=self._world_size,
+        )
+        self._scheduler.install_hit_cap_hook(self._kda_planner.cap_hit)
+        logger.info(
+            "ATOM LMCache offload: recurrent state leg on group(s) %s "
+            "(mamba_block=%d, hash_block=%d, chunk=%d)",
+            ",".join(str(group_id) for group_id in group_ids),
+            int(spec.block_size),
+            int(hash_block_size),
+            int(self._scheduler.chunk_size),
+        )
 
     # ---- worker side --------------------------------------------------
 
@@ -192,25 +359,47 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         (one fp32 per token per head) on the layer, not in this dict, and a
         transfer that moves the mantissas without them silently dequantises a
         restored block against the previous occupant's scale.
+
+        On a hybrid model the dict holds two groups' layers with two different
+        page geometries. They are separated first, because the codec derives
+        every segment's stride from one shared block count and mixing the groups
+        would slice both at the wrong granularity.
         """
-        tensors = build_kv_cache_tensors(kv_caches, self._attention_layers())
+        groups = getattr(self._kv_cache_config, "kv_cache_groups", None) or ()
+        per_group = split_kv_caches_by_group(kv_caches, list(groups))
+        attention_caches = per_group[self._attn_group_id]
+        tensors = build_kv_cache_tensors(attention_caches, self._attention_layers())
         if not tensors:
             raise ValueError("ATOM offload connector: vLLM registered no KV caches")
 
-        # Every segment's per-block stride is derived from num_blocks, so it has
-        # to be the physical block count -- not a token count. Block-major KV
-        # carries it in dim 0; taking it from the first mapped k_cache keeps the
-        # value consistent with the very tensors the codec will slice.
-        num_blocks = int(tensors[0].k_cache.shape[0])
+        # Every segment's per-block stride is derived from num_blocks, so it
+        # has to be the count of blocks vLLM's block tables name, which is what
+        # `resolve_block_count` takes from the config and reconciles against the
+        # tensor. The leading dimension is NOT that count on ATOM's MLA backend:
+        # it asks for a kernel block size of 1, so vLLM allocates one row per
+        # token and dim 0 comes back 1536x too large on Kimi-K3.
+        leading_dim = int(tensors[0].k_cache.shape[0])
+        num_blocks = resolve_block_count(
+            leading_dim,
+            int(getattr(self._kv_cache_config, "num_blocks", 0)),
+            int(self._config.kv_cache_block_size),
+        )
 
         self._worker.register_kv_caches(
             {str(t.layer_num): t for t in tensors},
             num_blocks=num_blocks,
         )
+        # After the dense registration, not before: the recurrent codec shares
+        # the engine, its storage manager and its LMCache identity, and none of
+        # those exist until the call above has run.
+        self._init_kda_tier(per_group, list(groups))
         logger.info(
-            "ATOM LMCache offload: registered %d layers, num_blocks=%d",
+            "ATOM LMCache offload: registered %d layers, num_blocks=%d "
+            "(leading dim %d, block_size=%d)",
             len(tensors),
             num_blocks,
+            leading_dim,
+            int(self._config.kv_cache_block_size),
         )
         # Layout/dtype census. The codec moves opaque bytes, so a wrong dtype
         # never surfaces here -- it surfaces much later inside an attention
@@ -233,6 +422,154 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
                 dtype,
             )
 
+    def _init_kda_tier(
+        self, per_group: list[dict[str, "torch.Tensor"]], groups: list[Any]
+    ) -> None:
+        """Stand up the worker half of the recurrent leg, if there is one."""
+        if not self._mamba_groups:
+            return
+        from atom.kv_transfer.offload.hybrid.kimi_k3.staging import StagedTransfer
+        from atom.kv_transfer.offload.hybrid.kimi_k3.state_object import StateByteCodec
+
+        # Group order, and within a group vLLM's own layer order: the store
+        # gathers and the load scatters through this same list (see
+        # `gather_group_tensors`).
+        specs = [spec for _, spec in self._mamba_groups]
+        tensors_by_group = gather_group_tensors(
+            per_group, groups, [group_id for group_id, _ in self._mamba_groups]
+        )
+        views = KdaPageViews(
+            tensors_by_group, layout_id=build_layout_id(specs, tensors_by_group)
+        )
+
+        # Sized to one whole state image. The KV staging buffer is sized in
+        # LMCache chunks and is routinely an order of magnitude smaller, so
+        # sharing it would fail every transfer at `ensure_buffer`.
+        gpu_connector = self._worker._engine.gpu_connector
+        staged = StagedTransfer(
+            gpu_connector.device,
+            staging_buffer_bytes=views.entry_bytes,
+            release_after_transfer=gpu_connector.release_gpu_staging_after_transfer,
+        )
+        meta = self._worker._lmcache_metadata
+        codec = StateByteCodec(
+            views,
+            staged,
+            views.entry_bytes,
+            model_name=meta.model_name,
+            world_size=int(meta.world_size),
+            worker_id=int(meta.worker_id),
+            layout_id=views.layout_id,
+        )
+        # ONE pool, shared with the paged KV. A prefix's KV chunks and its
+        # boundary states are written in the same window, so they enter the same
+        # LRU and cool together -- which is exactly right, because a boundary
+        # whose KV has been evicted is worth nothing on its own.
+        codec.bind_storage_manager(self._worker._engine.storage_manager)
+        self._kda_tier = KdaStateTier(codec)
+        logger.info(
+            "ATOM LMCache offload: recurrent state tier up, %d layers, "
+            "entry=%.2f MiB, layout=%s",
+            sum(len(tensors) for tensors in tensors_by_group),
+            views.entry_bytes / (1 << 20),
+            summarize_layout_id(views.layout_id),
+        )
+
+    def _dispatch_kda_loads(self, metadata) -> None:
+        """Issue this step's recurrent loads. Stores are flushed later.
+
+        Loads are on the TTFT path and write blocks of requests that are
+        parked, not blocks this forward is updating. Stores are the opposite:
+        the page they read is written by this step's forward and, with
+        speculative decoding, by ``postprocess_mamba`` after ``get_finished``.
+        ``wait_for_save`` is the hook that runs after both.
+        """
+        tier = self._kda_tier
+        if tier is None:
+            return
+        for load in getattr(metadata, "kda_loads", None) or ():
+            self._kda_expect.add(load.req_id)
+            tier.submit_load(load)
+
+    def _stash_kda_stores(self, metadata) -> None:
+        stores = getattr(metadata, "kda_stores", None) or ()
+        if stores:
+            self._pending_kda_stores.extend(stores)
+
+    def _flush_kda_stores(self) -> None:
+        """D2H the stashed boundary pages, fenced to the compute stream now.
+
+        One event for the whole step. Every producer kernel queued on the
+        compute stream before this call -- the forward, and mamba postprocess
+        when this runs from ``wait_for_save`` -- is visible to the gather.
+        ``StagedTransfer`` reads on a private stream and does not wait on
+        that producer itself.
+        """
+        tier = self._kda_tier
+        stores = self._pending_kda_stores
+        self._pending_kda_stores = []
+        if tier is None or not stores:
+            return
+        ready_event = None
+        if torch.cuda.is_available():
+            ready_event = torch.cuda.Event()
+            ready_event.record()
+        for store in stores:
+            tier.submit_store(store, ready_event)
+
+    def _join_kda(self, dense_recving: set[str]) -> set[str]:
+        """Hold a finished dense load until its recurrent half has landed.
+
+        Reporting the request the moment the KV arrives is what would make a
+        half-restored prefix reachable: vLLM unparks on that report and caches
+        the whole external prefix. So a request with a recurrent leg is released
+        only when both halves are in, and a failed recurrent half is released
+        *with* the attention blocks it invalidates.
+        """
+        tier = self._kda_tier
+        stored, store_failed = tier.take_store_reports()
+        for op_id, count in stored.items():
+            self._worker_state_stored[op_id] = (
+                self._worker_state_stored.get(op_id, 0) + count
+            )
+        for op_id, count in store_failed.items():
+            self._worker_state_store_failed[op_id] = (
+                self._worker_state_store_failed.get(op_id, 0) + count
+            )
+        self._kda_results.update(tier.take_load_results())
+
+        released = {r for r in dense_recving if r not in self._kda_expect}
+        self._kda_dense_done |= dense_recving & self._kda_expect
+        for req_id in sorted(self._kda_dense_done):
+            result = self._kda_results.pop(req_id, None)
+            if result is None:
+                continue
+            self._kda_dense_done.discard(req_id)
+            self._kda_expect.discard(req_id)
+            released.add(req_id)
+            if not result.ok:
+                self._kda_error_blocks.update(result.error_block_ids)
+                self._worker_state_load_failed[req_id] = (
+                    self._worker_state_load_failed.get(req_id, 0) + 1
+                )
+                if not result.error_block_ids:
+                    # finished_recving with an empty invalid set is how vLLM
+                    # caches an MLA prefix whose KDA state never arrived.
+                    logger.error(
+                        "ATOM LMCache offload: recurrent state missing for %s "
+                        "and no attention block could be named; the external "
+                        "prefix cannot be invalidated",
+                        req_id,
+                    )
+                else:
+                    logger.warning(
+                        "ATOM LMCache offload: recurrent state missing for %s; "
+                        "invalidating %d attention blocks so the prefix is recomputed",
+                        req_id,
+                        len(result.error_block_ids),
+                    )
+        return released
+
     def _attention_layers(self) -> dict[str, Any]:
         """The layer modules behind vLLM's registered KV cache names.
 
@@ -250,6 +587,14 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         inner = getattr(metadata, "inner", None)
         if inner is not None:
             self._worker.start_load_kv(inner)
+        self._dispatch_kda_loads(metadata)
+        self._stash_kda_stores(metadata)
+        # ``kv_connector_no_forward`` builds a context with no attention
+        # metadata and does not call ``wait_for_save``. There is no forward
+        # and no mamba postprocess on that step, so flushing from
+        # ``get_finished`` cannot race a writer.
+        attn_metadata = getattr(forward_context, "attn_metadata", None)
+        self._kda_flush_stores_in_get_finished = attn_metadata is None
         # The scheduler half's release list is picked up here rather than in
         # `get_finished` because this is the hook that runs on every step --
         # including the zero-token steps the engine is only turning the crank
@@ -280,6 +625,10 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         if req_ids:
             logger.debug("ATOM LMCache offload: fencing preempted %s", list(req_ids))
             self._worker.wait_for_requests(req_ids)
+            if self._kda_tier is not None:
+                # Same hazard on the recurrent leg: a load in flight is writing
+                # into the boundary block this request no longer owns.
+                self._kda_tier.wait_for_requests(req_ids)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """Inert: transfers are per-request, not per-layer.
@@ -293,12 +642,19 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         """Inert: saves are issued per request from ``build_connector_meta``."""
 
     def wait_for_save(self) -> None:
-        """Inert: saves are fire-and-forget on ATOM's save executor.
+        """Flush recurrent stores after the forward that writes their pages.
 
-        Blocking the forward on them would put offload on the critical path,
-        which is the opposite of what the tier is for. Completion still reaches
-        the scheduler via ``get_finished``.
+        Dense saves stay fire-and-forget; blocking the forward on the D2H
+        would put offload on the critical path. This hook does not wait for
+        the copy. It only records the fence and submits the job.
+
+        vLLM calls it after the target forward. With speculative decoding it
+        is deferred until after the draft model and after
+        ``postprocess_mamba``, which is the copy that writes the accepted
+        recurrent state into the boundary page. A fence taken in
+        ``start_load_kv`` lands before that copy.
         """
+        self._flush_kda_stores()
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Translate ATOM's four completion sets into vLLM's two.
@@ -344,6 +700,12 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         # the save's block lease, and dropping them deadlocks the pool.
         self._worker_completions.extend(out.connector_completions)
 
+        if self._kda_tier is not None:
+            if self._kda_flush_stores_in_get_finished:
+                self._flush_kda_stores()
+                self._kda_flush_stores_in_get_finished = False
+            finished_recving = self._join_kda(finished_recving)
+
         finished_sending = set(self._pending_release_ids)
         self._pending_release_ids.clear()
         return finished_sending, finished_recving
@@ -358,8 +720,16 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         whole external prefix, and serves the never-written blocks as if they
         held real KV. Failure is not exotic on this path -- a hit whose HBM
         boundary is not chunk aligned, or a partial LMCache mask, is enough.
+
+        A hybrid model adds a second source: the attention blocks are filled
+        correctly but the recurrent state at their boundary never arrives. Those
+        blocks are just as unusable, so the two sets are one set here.
         """
-        return self._worker.take_load_error_blocks()
+        blocks = self._worker.take_load_error_blocks()
+        if self._kda_error_blocks:
+            blocks = set(blocks) | self._kda_error_blocks
+            self._kda_error_blocks = set()
+        return blocks
 
     def build_connector_worker_meta(self) -> AtomOffloadWorkerMetadata | None:
         """Hand this rank's save and load-failure reports to the scheduler half.
@@ -370,24 +740,59 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         no offload activity should not pickle an empty object per rank.
         """
         if not (
-            self._worker_saved or self._worker_load_failed or self._worker_completions
+            self._worker_saved
+            or self._worker_load_failed
+            or self._worker_completions
+            or self._worker_state_stored
+            or self._worker_state_store_failed
+            or self._worker_state_load_failed
         ):
             return None
         meta = AtomOffloadWorkerMetadata(
-            self._worker_saved, self._worker_load_failed, self._worker_completions
+            saved=self._worker_saved,
+            load_failed=self._worker_load_failed,
+            completions=self._worker_completions,
+            state_stored=self._worker_state_stored,
+            state_store_failed=self._worker_state_store_failed,
+            state_load_failed=self._worker_state_load_failed,
         )
         self._worker_saved = {}
         self._worker_load_failed = {}
         self._worker_completions = []
+        self._worker_state_stored = {}
+        self._worker_state_store_failed = {}
+        self._worker_state_load_failed = {}
         return meta
 
     def shutdown(self) -> None:
+        if self._kda_tier is not None:
+            self._kda_tier.close()
+            self._kda_tier = None
         for side in (self._worker, self._scheduler):
             close = getattr(side, "close", None) or getattr(side, "shutdown", None)
             if close is not None:
                 close()
 
     # ---- scheduler side -----------------------------------------------
+
+    def bind_gpu_block_pool(self, gpu_block_pool) -> None:
+        """Take the pool the recurrent leg pins handed-off boundary blocks in.
+
+        A boundary block is handed over while it is still an ordinary block of a
+        running request: nothing in vLLM holds it for the duration of an
+        asynchronous store, so the request can free it, the pool can reissue it,
+        and the store then reads the new occupant. The pin is how the block is
+        kept until every rank reports; `KdaBoundaryPlanner` owns both ends of it.
+
+        The pool is also kept on `self` for the exact-lease release path. vLLM
+        calls this unconditionally on the scheduler half before any request
+        runs, and only that half may touch the pool; the worker half never sees
+        this call and its `_gpu_block_pool` stays None, which is what keeps the
+        whole-request fallback correct on a vLLM too old to call this at all.
+        """
+        self._gpu_block_pool = gpu_block_pool
+        if self._kda_planner is not None:
+            self._kda_planner.bind_gpu_block_pool(gpu_block_pool)
 
     def get_num_new_matched_tokens(
         self, request, num_computed_tokens: int
@@ -417,10 +822,27 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         So the decision is taken here, before the promise. When ATOM declines it
         has already cleared its pending-load state, and reporting no external
         tokens leaves the request to prefill normally.
+
+        This runs before `allocate_slots` and is gated only on
+        `num_computed_tokens == 0`, so a request that fails allocation is asked
+        the identical question again next step. What keeps that from becoming a
+        per-step tier lookup lives in ATOM's scheduler; see
+        `OffloadSchedulerMixin._init_tier_hit_memo`.
         """
         seq = self._seqs.get_or_create(request)
         seq.set_num_cached_tokens(num_computed_tokens)
-        need, _ = self._scheduler.get_num_new_matched_tokens(seq)
+        self._requests[str(request.request_id)] = request
+        if self._kda_planner is not None:
+            # ATOM's scheduler hands the cap hook a SeqView, which carries no
+            # block hashes; this is how the hook reaches the vLLM Request whose
+            # lookup is running. Armed per lookup and cleared unconditionally,
+            # so a hook firing outside one has nothing stale to read.
+            self._kda_planner.begin_lookup(request)
+        try:
+            need, _ = self._scheduler.get_num_new_matched_tokens(seq)
+        finally:
+            if self._kda_planner is not None:
+                self._kda_planner.end_lookup()
         if need <= 0:
             return 0, False
         if not self._scheduler.should_park_for_load_after_alloc(seq):
@@ -429,9 +851,32 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         return need, True
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int):
+        """Record the allocation, and queue the recurrent half of any hit.
+
+        The total computed frontier is reconstructed rather than read off the
+        request: vLLM sets ``request.num_computed_tokens`` *after* this call, so
+        reading it here yields the pre-hit value. Summing what the lookup was
+        given with what it returned is also the stronger definition -- it is by
+        construction the same boundary the attention leg is about to fill.
+        """
         seq = self._seqs.get_or_create(request)
-        seq.set_block_table(_block_ids(blocks))
+        self._requests[str(request.request_id)] = request
+        groups = _group_block_ids(blocks)
+        # ATOM's byte codec addresses the attention group only; the recurrent
+        # group is addressed by the boundary hand-off, never positionally.
+        attention_blocks = groups[self._attn_group_id] if groups else []
+        num_total_computed = int(seq.num_cached_tokens) + int(num_external_tokens)
+        seq.set_block_table(list(attention_blocks))
         self._scheduler.update_state_after_alloc(seq)
+        if self._kda_planner is not None and num_external_tokens > 0:
+            self._kda_planner.resolve_load(
+                request,
+                groups,
+                num_total_computed,
+                self._attn_group_id,
+                int(num_external_tokens),
+                int(self._config.kv_cache_block_size),
+            )
 
     def build_connector_meta(self, scheduler_output) -> KVConnectorMetadata:
         """Snapshot this step's transfers.
@@ -483,9 +928,23 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
             seq = self._seqs.get(req_id)
             if seq is None:
                 continue
-            grown = _block_ids(new_blocks)
+            # Attention group only, for the reason given in
+            # `update_state_after_alloc`: the codec strides one block table, and
+            # the recurrent group's ids are addressed by the boundary hand-off,
+            # never positionally. Concatenating the groups here would put the
+            # recurrent ids at attention token offsets.
+            groups = _group_block_ids(new_blocks)
+            grown = list(groups[self._attn_group_id]) if groups else []
             seq.set_block_table(grown if replaces else seq.block_table + grown)
+        frontiers: dict[str, int] = {}
         for req_id, num_tokens in _scheduled_frontiers(scheduler_output):
+            # Unclamped, unlike the SeqView's copy below: that clamp exists to
+            # keep the dense codec from striding past the *attention* block
+            # table it was handed, and the recurrent leg does not index that
+            # table at all -- it resolves its blocks by hash. Clamping here too
+            # would drop the tail boundaries of exactly the long prompts this
+            # leg is for.
+            frontiers[str(req_id)] = int(num_tokens)
             seq = self._seqs.get(req_id)
             if seq is not None:
                 covered = len(seq.block_table) * block_size
@@ -495,7 +954,50 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         # Before `_collect_releases`, so a save abandoned on this step turns
         # into a release on this step rather than on the next one.
         self._reconcile_stale_saves()
-        return AtomOffloadMetadata(inner, preempted, self._collect_releases())
+        kda_stores = self._collect_kda_stores(scheduler_output, preempted, frontiers)
+        kda_loads = (
+            self._kda_planner.take_loads() if self._kda_planner is not None else []
+        )
+        return AtomOffloadMetadata(
+            inner,
+            preempted,
+            self._collect_releases(),
+            kda_stores,
+            kda_loads,
+        )
+
+    def _collect_kda_stores(self, scheduler_output, preempted, frontiers) -> list:
+        """This step's recurrent boundary stores, from both sources.
+
+        The hand-off has to be taken in the step it exists: the KV cache
+        manager hands the pending offloads over while the step is being built
+        and is not shipped to the workers, so there is no later step to read it
+        in. It is also, on its own, empty on any model whose mamba block size
+        equals its hash block size -- Kimi-K3 among them -- which is why the
+        content-addressed sweep runs beside it rather than as a fallback. See
+        ``kda_state``'s module docstring for why the two sources do not overlap.
+        """
+        if self._kda_planner is None:
+            return []
+        skip = set(preempted)
+        skip.update(
+            str(r) for r in getattr(scheduler_output, "finished_req_ids", None) or ()
+        )
+        for req_id in skip:
+            self._kda_planner.forget_request(req_id)
+        stores: list = []
+        offloads = step_boundary_offloads(scheduler_output)
+        if offloads:
+            stores.extend(
+                self._kda_planner.collect_stores(offloads, self._requests, skip)
+            )
+        stores.extend(
+            self._kda_planner.collect_cached_boundary_stores(
+                frontiers, self._requests, skip
+            )
+        )
+        self._kda_planner.log_stats()
+        return stores
 
     def _handle_preempted(self, scheduler_output) -> list[str]:
         """Forget the block table of every request vLLM just preempted.
@@ -525,6 +1027,16 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
             str(r) for r in getattr(scheduler_output, "preempted_req_ids", None) or ()
         ]
         for req_id in req_ids:
+            if self._kda_planner is not None:
+                # The recurrent destination was this request's boundary block,
+                # which is back in the pool. Nothing can be loaded into it, and
+                # leaving the claim pending would keep the index from ever
+                # deciding whether that boundary is still there.
+                self._kda_planner.forget_pending(req_id)
+                # And the sweep cursor: the request comes back with its
+                # frontier rewound, and a cursor left at the old high-water
+                # mark would skip every boundary it recomputes.
+                self._kda_planner.forget_request(req_id)
             seq = self._seqs.get(req_id)
             if seq is None:
                 continue
@@ -661,7 +1173,12 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         never reaches the scheduler half, the release is never produced, and the
         blocks are never returned -- a server that has gone idle silently loses
         KV capacity. This is the hook that says there is still work.
+
+        A pinned boundary block is the same problem in the other tier: its
+        release also rides on a worker report that only a step can deliver.
         """
+        if self._kda_planner is not None and self._kda_planner.has_pending_work():
+            return True
         return bool(self._deferred_frees or self._releases_in_flight)
 
     # Steps a promised load may go undispatched before it is called out. Loads
@@ -739,7 +1256,13 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         for req_id in connector_output.finished_recving or ():
             rid = str(req_id)
             self._promised_loads.pop(rid, None)
-            if self._load_failure_reports.pop(rid, 0) > 0:
+            state_failed = self._state_load_failure_reports.pop(rid, 0) > 0
+            if self._kda_planner is not None:
+                # Retract the index's claim on a boundary whose bytes are gone,
+                # so the next lookup caps at a boundary that is really there
+                # instead of failing the same load again.
+                self._kda_planner.on_load_result(rid, not state_failed)
+            if state_failed or self._load_failure_reports.pop(rid, 0) > 0:
                 # One rank that could not fill its shard makes the whole load a
                 # failure. Routing it through `load_finished` instead would pop
                 # the floor recording that the [HBM, LMCache) range is NOT
@@ -772,6 +1295,19 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         if meta is None:
             return
         self._apply_completions(getattr(meta, "completions", None) or ())
+        if self._kda_planner is not None:
+            # Before the loops below: a store quorum releases a pinned block and
+            # publishes the boundary, and both want to be true by the time this
+            # step's `finished_recving` ids are resolved.
+            self._kda_planner.absorb_reports(
+                getattr(meta, "state_stored", None),
+                getattr(meta, "state_store_failed", None),
+            )
+        for req_id, count in (getattr(meta, "state_load_failed", None) or {}).items():
+            rid = str(req_id)
+            self._state_load_failure_reports[rid] = (
+                self._state_load_failure_reports.get(rid, 0) + int(count)
+            )
         for req_id, count in (getattr(meta, "load_failed", None) or {}).items():
             rid = str(req_id)
             self._load_failure_reports[rid] = self._load_failure_reports.get(
@@ -830,17 +1366,6 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
                     "ATOM LMCache offload: unhandled completion channel %s", key[0]
                 )
 
-    def bind_gpu_block_pool(self, gpu_block_pool) -> None:
-        """Keep vLLM's block pool so a finished request can leave exact leases.
-
-        vLLM calls this unconditionally on the scheduler half before any
-        request runs. Only the scheduler half may touch the pool; the worker
-        half never sees this call and its `_gpu_block_pool` stays None, which
-        is also what keeps the fallback below correct on a vLLM too old to
-        call it at all.
-        """
-        self._gpu_block_pool = gpu_block_pool
-
     def _release_lease_sets(self, block_id_sets) -> None:
         """Drop the refcount shares a lease transferred to this connector.
 
@@ -865,9 +1390,39 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
             ordered = sorted(block_ids, reverse=True)
             pool.free_blocks([pool.blocks[block_id] for block_id in ordered])
 
+    def request_finished_all_groups(
+        self, request, block_ids: tuple[list[int], ...]
+    ) -> tuple[bool, dict | None]:
+        """The finish callback for every model, hybrid or not.
+
+        Declaring ``SupportsHMA`` makes vLLM route *all* models through this
+        method and stop calling ``request_finished`` at all, so this is the one
+        body rather than a hybrid-only variant of one.
+
+        ``block_ids`` is unused for the same reason it was unused before: the
+        decision to defer is about whether a save is still reading this
+        request's blocks, which ATOM tracks by request, and the blocks
+        themselves are vLLM's to free once it is told it may.
+        """
+        return self._request_finished(request)
+
     def request_finished(self, request, block_ids) -> tuple[bool, dict | None]:
+        """Unreachable while this connector declares ``SupportsHMA``.
+
+        vLLM dispatches on that base and never calls this for a connector that
+        has it. Kept because the abstract base still declares it, and delegating
+        rather than raising means a future vLLM that calls it gets the right
+        behaviour instead of a crash in production.
+        """
+        return self._request_finished(request)
+
+    def _request_finished(self, request) -> tuple[bool, dict | None]:
         req_id = request.request_id
         self._promised_loads.pop(req_id, None)
+        self._requests.pop(str(req_id), None)
+        if self._kda_planner is not None:
+            self._kda_planner.forget_pending(str(req_id))
+            self._kda_planner.forget_request(str(req_id))
         seq = self._seqs.get(req_id)
         if seq is not None:
             self._scheduler.request_finished(seq)
@@ -908,12 +1463,18 @@ def _req_id_of(completion_id) -> str:
     return str(getattr(completion_id, "req_id", completion_id))
 
 
-def _block_ids(blocks) -> list[int]:
-    """Flatten vLLM's allocated-block structure to plain ids.
+def _group_block_ids(blocks) -> tuple[list[int], ...]:
+    """vLLM's allocated-block structure as one list of ids per group.
 
     vLLM has spelled this several ways across versions (KVCacheBlocks with
-    ``get_block_ids()``, a per-group tuple of lists, or already-flat ids), and
-    the offload codec only ever needs the ids.
+    ``get_block_ids()``, a per-group tuple of lists, or already-flat ids).
+
+    Grouping is preserved rather than flattened, which the earlier version of
+    this helper did. Flattening is exactly wrong for a hybrid model: the two
+    groups have different page geometries and different block-table lengths, so
+    a concatenated list gives no position any meaning -- the attention codec
+    would stride into the recurrent group's ids, and the boundary row would be
+    counted from the wrong place.
     """
     getter = getattr(blocks, "get_block_ids", None)
     if getter is not None:
@@ -923,22 +1484,8 @@ def _block_ids(blocks) -> list[int]:
         and blocks
         and isinstance(blocks[0], (list, tuple))
     ):
-        # One group is the supported shape and unwraps to its ids. More than one
-        # means vLLM is paging this request against several independent block
-        # tables; concatenating them yields a list whose positions no longer map
-        # to token offsets, and the codec would happily copy bytes into the
-        # wrong blocks with nothing logged. ``build_kv_cache_tensors`` rejects
-        # the same condition from the tensor side at registration; this is the
-        # per-request half, for a model that only splits groups later.
-        if len(blocks) > 1:
-            raise ValueError(
-                "ATOM offload connector: vLLM allocated blocks in "
-                f"{len(blocks)} KV cache groups "
-                f"(sizes={[len(g) for g in blocks]}); the byte codec addresses "
-                "KV with a single block table and cannot flatten them."
-            )
-        return [int(b) for b in blocks[0]]
-    return [int(b) for b in (blocks or [])]
+        return tuple([int(b) for b in group] for group in blocks)
+    return ([int(b) for b in (blocks or [])],)
 
 
 def _scheduled_block_growth(scheduler_output):

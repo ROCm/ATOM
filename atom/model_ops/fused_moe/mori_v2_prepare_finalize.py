@@ -194,6 +194,25 @@ def _cco_per_rank_vmm(
 # are config-wide, so the first layer's are the model's.
 _MEGA_TRANSPORTS: dict = {}
 
+# $ATOM_MEGA_COMBINE_WIRE, the return trip's counterpart to $MEGA_DISPATCH_WIRE
+# below, spelled the same bf16|fp8|fp4 way. Unlike the dispatch wire it is a
+# free choice: combine moves post-expert tokens, so nothing downstream demands
+# a particular width. aiter names the same formats after their MX block layout.
+#
+# PREFILL only -- the quant/dequant pair is a fixed per-token cost against a
+# saving that scales with the tokens on the wire, so decode asks for bf16 back.
+# See MoriV2PrepareAndFinalize.combine_quant_for_step.
+_COMBINE_WIRES = {"bf16": "none", "fp8": "mxfp8", "fp4": "mxfp4"}
+_MEGA_COMBINE_WIRE = envs.ATOM_MEGA_COMBINE_WIRE
+if _MEGA_COMBINE_WIRE not in _COMBINE_WIRES:
+    raise RuntimeError(
+        f"ATOM_MEGA_COMBINE_WIRE must be one of {sorted(_COMBINE_WIRES)}, "
+        f"got {_MEGA_COMBINE_WIRE!r}"
+    )
+# Read once, like the dispatch wire: this is consulted per layer per forward.
+_MEGA_COMBINE_QUANT = _COMBINE_WIRES[_MEGA_COMBINE_WIRE]
+
+
 # bf16 | fp8 | fp4, and it must MATCH the expert GEMM's A operand -- on gfx1250
 # that is fp4 unless AITER_FORCE_A8W4=1. A mismatch is a row-width error, not a
 # slow path. Read once: init_mega_transport runs per MoE layer (61x for V4-Pro).
@@ -227,6 +246,7 @@ def init_mega_transport(
     swiglu_limit: float,
     situ_beta: torch.Tensor | None = None,
     situ_linear_beta: torch.Tensor | None = None,
+    combine_quant: str = "none",
 ) -> Any:
     """Create (and share) the MegaMoE that runs every MoE layer of this model.
 
@@ -234,6 +254,12 @@ def init_mega_transport(
     GEMM recipe. Only the weights differ per layer and those are forward()
     arguments, so one instance covers the whole model. Which dispatch kernel it
     uses is aiter's own call (MEGA_DISPATCH=flydsl|mori).
+
+    ``combine_quant`` names the quantized return-trip format this transport is
+    to BUILD ($ATOM_MEGA_COMBINE_WIRE, in aiter's spelling). It is a capability, not
+    the choice: MegaMoE compiles a combine reduce for it and for bf16, and
+    every forward then names the one it wants -- bf16 unless it says otherwise.
+    See combine_quant_for_step.
     """
     key = (
         ep_rank,
@@ -250,8 +276,10 @@ def init_mega_transport(
         intermediate_pad,
         swiglu_limit,
         # Keyed on: the wire sets the payload width and whether the scale
-        # region exists.
+        # region exists, and combine_quant sets which combine reduces are
+        # built (the staging layout itself no longer depends on it).
         _MEGA_DISPATCH_WIRE,
+        combine_quant,
     )
     cached = _MEGA_TRANSPORTS.get(key)
     if cached is not None:
@@ -295,6 +323,9 @@ def init_mega_transport(
             if _MEGA_DISPATCH_WIRE in ("fp8", "fp4")
             else {}
         ),
+        # Only injected when asked for: an aiter without the combine-quant
+        # epilogue has no such kwarg and would raise TypeError on every run.
+        **({"combine_quant": combine_quant} if combine_quant != "none" else {}),
     )
     # Peer-region stride in the flat symmetric VA. triton_mega_moe needs it to
     # address the combine staging window, and MegaMoE does not keep it.
@@ -310,7 +341,7 @@ def init_mega_transport(
     logger.info(
         "[MORI-V2] Created MegaMoE: ep_rank=%d ep_size=%d hidden=%d inter=%d "
         "experts=%d topk=%d M=%d act=%s gate=%s quant=%s pad=(%d,%d) "
-        "swiglu_limit=%s dispatch=%s wire=%s force_a8w4=%s",
+        "swiglu_limit=%s dispatch=%s wire=%s combine_quant=%s force_a8w4=%s",
         ep_rank,
         ep_size,
         hidden_dim,
@@ -326,6 +357,7 @@ def init_mega_transport(
         swiglu_limit,
         mega._config.dispatch_backend,
         mega._config.dispatch_wire,
+        combine_quant,
         # The other half of the pair: logged together so a mismatch is readable.
         os.environ.get("AITER_FORCE_A8W4", "0"),
     )
@@ -444,7 +476,38 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             swiglu_limit=float(getattr(layer, "swiglu_limit", 0.0)),
             situ_beta=getattr(layer, "activation_situ_beta", None),
             situ_linear_beta=getattr(layer, "activation_situ_linear_beta", None),
+            combine_quant=_MEGA_COMBINE_QUANT,
         )
+
+    @staticmethod
+    def combine_quant_for_step() -> str:
+        """This step's combine wire, named outright -- and DP-agreed.
+
+        The quantized wire is prefill-only: the quant/dequant pair is a fixed
+        per-token cost against a saving that scales with the tokens on the
+        wire, so it only pays off once the wire is busy.
+
+        Every rank has to name the SAME wire, and that is why `is_prefill`
+        cannot gate this on its own. Combine is P2P: gemm2's epilogue writes
+        this rank's rows into every PEER's arena in the format this rank
+        picked, and the peer's reduce reads them back in the format IT picked.
+        `is_prefill` is the local batch's (`ForwardMode.decide` never reduces
+        it), so on a ragged step a prefilling rank would scatter fp4 rows into
+        a decoding peer that reduces them as bf16 -- the same rank-local trap
+        select_mega documents. `running_tokens_are_unified` IS the group's
+        answer to "is anybody prefilling", so it is what opens the wire;
+        `is_prefill` then only speaks for dp_size==1, where it is the group.
+
+        No context (warmup, profile runs) counts as prefill -- that is the
+        shape those run at, and it exercises the quantized reduce before a
+        capture rather than first reaching it mid-serve.
+        """
+        context = get_forward_context().context
+        if context is None:
+            return _MEGA_COMBINE_QUANT
+        if context.is_prefill or not context.running_tokens_are_unified:
+            return _MEGA_COMBINE_QUANT
+        return "none"
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -716,6 +779,7 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
             recv_token_bound=self._recv_bound(
                 self.prepare_finalize.num_dispatchers() * mega.max_tokens_per_rank,
             ),
+            combine_quant=self.prepare_finalize.combine_quant_for_step(),
         )
 
     @staticmethod

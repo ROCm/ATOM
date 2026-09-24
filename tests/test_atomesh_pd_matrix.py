@@ -140,5 +140,27 @@ class NodeSelectionTest(unittest.TestCase):
         self.assertEqual(cell["num_nodes"], 2)
 
 
+class ModelPathSelectionTest(unittest.TestCase):
+    def test_runner_path_and_explicit_override(self):
+        config = {
+            "model_path": "${MODEL_ROOT}/native/model",
+            "model_path_by_runner": {"special-runner": "/shared/native/model"},
+        }
+        with patch.dict(os.environ, {"MODEL_ROOT": "/models"}, clear=True):
+            self.assertEqual(
+                pd_matrix.resolve_model_path("test-model", config, "special-runner"),
+                "/shared/native/model",
+            )
+            self.assertEqual(
+                pd_matrix.resolve_model_path("test-model", config, "other-runner"),
+                "/models/native/model",
+            )
+            os.environ["ATOMESH_MODEL_PATH_TEST_MODEL"] = "/explicit/model"
+            self.assertEqual(
+                pd_matrix.resolve_model_path("test-model", config, "special-runner"),
+                "/explicit/model",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

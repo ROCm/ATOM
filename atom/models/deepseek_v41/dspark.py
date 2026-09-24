@@ -17,7 +17,7 @@ from atom.model_ops.deepseek_v41.dspark import (
     fused_draft_kv_tail,
 )
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
-from atom.model_ops.deepseek_v41.projections import grouped_output_projection
+from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
 from atom.model_ops.linear import ReplicatedLinear
@@ -40,8 +40,12 @@ logger = logging.getLogger("atom")
 
 class DraftAttention(Attention):
     def context_keys(self, kv_normed, positions, rope, *, packed=False):
-        """Takes the latent already normed: `forward` gets it beside the query
-        out of one launch, and the standalone caller norms it itself."""
+        """The context row alone, for a caller with no query to rotate with it.
+
+        Takes the latent already normed, because its one caller normed it. A
+        draft step's own rows go through `forward`, which rotates and quantizes
+        them beside the query in a single launch instead.
+        """
         keys = rotate_rows(rope, kv_normed, positions)
         # Unlike V4's mixed NoPE/RoPE layout, V4.1 QAT covers all head lanes.
         return quantize_fp8(keys, dequantize=not packed)
@@ -63,14 +67,24 @@ class DraftAttention(Attention):
         _, kv_pre = self.project_qkv(hidden)
         return self.context_keys(self.kv_norm(kv_pre), positions, rope, packed=packed)
 
-    def forward(self, hidden, context_kv, step, rope):
-        q_lora, kv_pre = self.project_qkv(hidden)
+    def forward(self, hidden, hidden_scale, context_kv, step, rope):
+        q_lora, kv_pre = self.project_qkv(hidden, hidden_scale)
         qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )
-        query = rotate_rows(rope, query, step.positions)
-        keys = self.context_keys(kv_normed, step.positions, rope)
+        # Both rotations and the quantized row in one launch.
+        keys = torch.empty_like(kv_normed)
+        rows = kv_normed.shape[:-1].numel()
+        rope_quant_window(
+            query.view(rows, self.heads, self.head_dim),
+            kv_normed.view(rows, self.head_dim),
+            rope.cos_cache,
+            rope.sin_cache,
+            step.positions.flatten(),
+            rope_dim=rope.rope_dim,
+            qat=keys.view(rows, self.head_dim),
+        )
         output = draft_attention(
             query,
             context_kv[self.spec.layer_id],
@@ -79,10 +93,9 @@ class DraftAttention(Attention):
             step,
             self.softmax_scale,
         )
-        output = rotate_rows(rope, output, step.positions, inverse=True)
-        output = output.unflatten(-2, (self.groups, -1)).flatten(-2)
-        weight = self.wo_a.weight.view(self.groups, self.o_rank, -1)
-        return self.wo_b(grouped_output_projection(output, weight).flatten(-2))
+        return self._project_out(
+            rotate_rows(rope, output, step.positions, inverse=True)
+        )
 
 
 class DraftBlock(Block):
@@ -221,7 +234,11 @@ class DeepseekV41DSpark(DSparkDraftModel):
 
     @staticmethod
     def _target_layer_input(inputs, block):
-        residual = inputs[0].residual
+        # Settled, because a pre-hook runs before the fold: the block ahead of
+        # this one leaves its FFN post owed, and `residual` is by definition
+        # the value before it. The block pays the same post again into its own
+        # pre, which is the one seam where the draft costs the target a kernel.
+        residual = inputs[0].settle().residual
         return residual.mean(dim=-2).reshape(-1, residual.shape[-1])
 
     def project_context(self, aux_concat):
@@ -377,7 +394,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
         layers = self.context_layers
         norms = [a.kv_norm for a in layers]
         width = norms[0].weight.shape[-1]
-        pe_dim = self.rope.cos_cache.shape[-1] * 2
+        pe_dim = self.rope.rope_dim
         eps = {n.eps for n in norms}
         if (
             not all(isinstance(n, RMSNorm) for n in norms)

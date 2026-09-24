@@ -1,24 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from dataclasses import dataclass
-from collections.abc import Callable, Sequence
-from typing import TypeVar
-from typing import (
-    Dict,
-    List,
-    Protocol,
-    Tuple,
-    Union,
-)
-from contextlib import contextmanager
-from typing_extensions import overload
-import torch
-import torch.nn as nn
-from torch.nn.modules.module import register_module_module_registration_hook
-import os
-
-
 import logging
+import os
+from collections.abc import Callable, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import (
+    Protocol,
+    TypeVar,
+)
+
+import torch
+from torch import nn
+from torch.nn.modules.module import register_module_module_registration_hook
+from typing_extensions import overload
+
+from atom.model_loader.weight_utils import local_model_dir
 
 T = TypeVar("T")
 logger = logging.getLogger(__name__)
@@ -69,7 +66,7 @@ class StageMissingLayer(nn.Module):
 
 def get_pp_indices(
     num_hidden_layers: int, pp_rank: int, pp_size: int
-) -> Tuple[int, int]:
+) -> tuple[int, int]:
     """Try to evenly distribute layers across partitions.
 
     If the number of layers is not divisible by the number of partitions,
@@ -88,9 +85,7 @@ def get_pp_indices(
         try:
             partitions = [int(layer) for layer in partition_list_str.split(",")]
         except ValueError as err:
-            raise ValueError(
-                "Invalid partition string: {}".format(partition_list_str)
-            ) from err
+            raise ValueError(f"Invalid partition string: {partition_list_str}") from err
         if len(partitions) != pp_size:
             raise ValueError(f"{len(partitions)=} does not match {pp_size=}.")
         if sum(partitions) != num_hidden_layers:
@@ -120,7 +115,7 @@ def make_layers(
     layer_fn: LayerFn,
     prefix: str,
     layer_num_offset: int = 0,
-) -> Tuple[int, int, torch.nn.ModuleList]:
+) -> tuple[int, int, torch.nn.ModuleList]:
     """Make a list of layers with the given layer function, taking
     pipeline parallelism into account.
     """
@@ -141,10 +136,10 @@ def make_layers(
 
 
 # NOTE: don't use lru_cache here because it can prevent garbage collection
-_model_to_pp_missing_layer_names: Dict[int, List[str]] = {}
+_model_to_pp_missing_layer_names: dict[int, list[str]] = {}
 
 
-def get_pp_missing_layer_names(model: torch.nn.Module) -> List[str]:
+def get_pp_missing_layer_names(model: torch.nn.Module) -> list[str]:
     """Get the names of the missing layers in a pipeline parallel model."""
     model_id = id(model)
     if model_id in _model_to_pp_missing_layer_names:
@@ -190,7 +185,7 @@ class IntermediateTensors:
         # a string, and we will lose the information about the source file.
         self.tensors = tensors
 
-    def __getitem__(self, key: Union[str, slice]):
+    def __getitem__(self, key: str | slice):
         if isinstance(key, str):
             return self.tensors[key]
         elif isinstance(key, slice):
@@ -212,7 +207,7 @@ class IntermediateTensors:
         return f"IntermediateTensors(tensors={self.tensors})"
 
 
-def make_empty_intermediate_tensors_factory(keys: List[str], hidden_size: int):
+def make_empty_intermediate_tensors_factory(keys: list[str], hidden_size: int):
     def make_empty_intermediate_tensors(
         batch_size: int,
         dtype: torch.dtype,
@@ -270,6 +265,10 @@ def ckpt_has_tensor_suffix(model_path: str, suffix: str) -> bool:
     import json
     import os
 
+    # A hub id has a directory; it is in the hub cache, not at the id. Probing
+    # the id itself answers "no suffix" for every remote checkpoint, and this
+    # answer picks parameter dtypes.
+    model_path = local_model_dir(model_path)
     if not model_path or not os.path.isdir(model_path):
         logger.warning(
             "ckpt_has_tensor_suffix: model_path %r is not a directory; "
@@ -301,8 +300,8 @@ def ckpt_has_tensor_suffix(model_path: str, suffix: str) -> bool:
             from safetensors import safe_open
 
             with safe_open(safetensors_files[0], framework="pt") as sf:
-                return any(k.endswith(suffix) for k in sf.keys())
-        except Exception as e:
+                return any(k.endswith(suffix) for k in sf.keys())  # noqa: SIM118
+        except Exception as e:  # noqa: BLE001 -- a probe: unreadable means "no"
             logger.warning(
                 "ckpt_has_tensor_suffix: failed to read %s (%s); "
                 "assuming suffix %r is absent",
@@ -335,6 +334,10 @@ def ckpt_shared_expert_count(model_path: str | None) -> int:
     import os
     import re
 
+    # Same reason as `ckpt_has_tensor_suffix`: a hub id is not where its files
+    # are, and answering 0 for every remote checkpoint leaves the field unset
+    # on exactly the checkpoints that carry it.
+    model_path = local_model_dir(model_path)
     if not model_path or not os.path.isdir(model_path):
         return 0
 
@@ -354,7 +357,7 @@ def ckpt_shared_expert_count(model_path: str | None) -> int:
 
                 with safe_open(safetensors_files[0], framework="pt") as sf:
                     keys = list(sf.keys())
-            except Exception:
+            except Exception:  # noqa: BLE001 -- a probe: unreadable means "no"
                 return 0
 
     if not keys:

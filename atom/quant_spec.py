@@ -101,6 +101,30 @@ def should_skip_online_quant(cur_type, cur_dtype, online_cfg) -> bool:
     )
 
 
+def will_online_requant(
+    quant_config,
+    prefix: str,
+    source_quant_type,
+    source_quant_dtype,
+) -> bool:
+    """Whether *this* layer's weight gets replaced by online re-quantization.
+
+    ``quant_config.online_quant`` is a whole-model flag: it says the run was
+    launched with ``--online_quant_config``, not that any given layer is
+    affected. A layer named in the online ``exclude_layer`` list, or one whose
+    source already is the online target, keeps its checkpoint weight. Anything
+    that decides a layer's *format* -- which parameters to allocate, which GEMM
+    to dispatch -- has to ask per layer, because the two answers differ for
+    every model whose online config excludes part of the graph.
+    """
+    if quant_config is None or not getattr(quant_config, "online_quant", False):
+        return False
+    online_cfg = quant_config.get_layer_quant_config(prefix, use_online_quant=True)
+    return not should_skip_online_quant(
+        source_quant_type, source_quant_dtype, online_cfg
+    )
+
+
 def should_stream_online_quant(
     quant_config,
     prefix: str,
@@ -117,13 +141,10 @@ def should_stream_online_quant(
 
     if not envs.ATOM_ONLINE_QUANT_STREAMING:
         return False
-    if quant_config is None or not getattr(quant_config, "online_quant", False):
-        return False
     if not can_dequant_weight_online(source_quant_type, source_quant_dtype):
         return False
-    online_cfg = quant_config.get_layer_quant_config(prefix, use_online_quant=True)
-    return not should_skip_online_quant(
-        source_quant_type, source_quant_dtype, online_cfg
+    return will_online_requant(
+        quant_config, prefix, source_quant_type, source_quant_dtype
     )
 
 

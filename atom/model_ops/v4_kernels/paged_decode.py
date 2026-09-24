@@ -59,6 +59,9 @@ from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 from aiter.ops.triton.utils.device_info import get_num_sms
 
 from atom.model_ops.sparse_attn_v4 import _sparse_attn_ragged_torch
+from atom.model_ops.v4_kernels.paged_decode_gluon import (
+    _paged_decode_fused_gluon_kernel,
+)
 from atom.model_ops.v4_kernels.pool_index import row_offset
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
@@ -325,10 +328,9 @@ def _paged_decode_fused_kernel(
     alpha_sink = tl.exp2(sink - m_final)
     l_final = l_i * alpha_kv + alpha_sink
 
-    denom = tl.maximum(l_final, 1.0e-30)
-    out = tl.where(
-        l_final[:, None] > 0.0, (acc * alpha_kv[:, None]) / denom[:, None], 0.0
-    )
+    # Normalize once per head before broadcasting across the value channels.
+    scale = alpha_kv / tl.maximum(l_final, 1.0e-30)
+    out = tl.where(l_final[:, None] > 0.0, acc * scale[:, None], 0.0)
     tl.store(
         out_ptr
         + t * out_stride_t
@@ -707,12 +709,27 @@ def _sparse_attn_v4_paged_decode_triton(
 
     qk_scale = float(softmax_scale) * LOG2E
     _bk, num_warps, num_stages = _kernel_config(block_h)
+    cdna_version = {"gfx942": 3, "gfx950": 4}.get(get_gfx())
+    use_gluon_fused = (
+        kv_splits == 1
+        and not quant_kv
+        and q.dtype == torch.bfloat16
+        and D == 512
+        and block_h in (16, 32)
+        and block_k is None
+        and cdna_version is not None
+    )
     if block_k is None:
-        # fp8 dequant inflates per-tile ALU work ~4×; a wider K tile amortizes
-        # the per-tile dequant cost (scale load + cast + multiply) over more
-        # MFMA work. Empirically BLOCK_K=32 wins ~20% over BLOCK_K=16 on fp8
-        # (bs=512 ctx=4096: 3000µs → 2300µs) without hurting bf16.
-        block_k = 32 if quant_kv else _bk
+        if use_gluon_fused:
+            # CDNA3 must fit KV + probabilities within 64 KiB LDS.
+            # CDNA4 can widen H16 to K64 while keeping 1024 score elements.
+            block_k = 1024 // block_h if cdna_version == 4 else 32
+        else:
+            # fp8 dequant inflates per-tile ALU work ~4×; a wider K tile amortizes
+            # the per-tile dequant cost (scale load + cast + multiply) over more
+            # MFMA work. Empirically BLOCK_K=32 wins ~20% over BLOCK_K=16 on fp8
+            # (bs=512 ctx=4096: 3000µs → 2300µs) without hurting bf16.
+            block_k = 32 if quant_kv else _bk
 
     # Kernel reads (kv_scales_ptr, ks_stride_n) only when QUANT_KV — supply a
     # dummy 1-element fp32 tensor on the bf16 path so the launch signature
@@ -733,7 +750,12 @@ def _sparse_attn_v4_paged_decode_triton(
     # skipping the partial-buffer alloc and the second kernel launch.
     if kv_splits == 1:
         grid_fused = (T, n_head_blocks)
-        _paged_decode_fused_kernel[grid_fused](
+        kernel = (
+            _paged_decode_fused_gluon_kernel
+            if use_gluon_fused
+            else _paged_decode_fused_kernel
+        )
+        kernel[grid_fused](
             q,
             unified_kv,
             kv_scales_arg,
@@ -760,8 +782,15 @@ def _sparse_attn_v4_paged_decode_triton(
             QUANT_KV=quant_kv,
             GROUP_SIZE=_FP8_GROUP_SIZE,
             NUM_GROUPS=num_groups_arg,
+            **({"CDNA_VERSION": cdna_version} if use_gluon_fused else {}),
             num_warps=num_warps,
             num_stages=num_stages,
+            # Buffer-load lowering for 32-head tiles can cross 256 VGPRs.
+            waves_per_eu=(
+                2
+                if not use_gluon_fused and block_h == 32 and D == 512 and not quant_kv
+                else 0
+            ),
         )
         return out
 

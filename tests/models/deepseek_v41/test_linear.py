@@ -30,6 +30,78 @@ def _config(block_rows=32):
     return SimpleNamespace(get_layer_quant_config=lambda _: spec, online_quant=False)
 
 
+def _online_quant_config(block_rows=1):
+    """A real ``QuantizationConfig``: MXFP8 on disk, ptpc_fp8 online.
+
+    The stub above cannot stand in here -- the decision under test reads the
+    *online* side of the config for the layer's own prefix, which only the real
+    resolver knows how to answer.
+    """
+    from transformers import PretrainedConfig
+
+    from atom.config import QuantizationConfig
+
+    hf = PretrainedConfig()
+    hf.torch_dtype = torch.bfloat16
+    hf.quantization_config = {
+        "quant_method": "mxfp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [block_rows, 32],
+    }
+    return QuantizationConfig(
+        hf,
+        online_quant_config={
+            "global_quant_config": "ptpc_fp8",
+            "exclude_layer": ["*block_sparse_moe"],
+        },
+    )
+
+
+def test_online_requantized_source_drops_the_native_layout(linear_modules):
+    """MiniMax-M3-MXFP8's attention linears, which online quant overwrites.
+
+    Reading the model-wide `online_quant` flag instead of this layer's own
+    answer made every one of them raise at construction, which is a server that
+    never starts rather than a layer that picks the other GEMM.
+    """
+    linear, group = linear_modules
+    group.world_size = 1
+    module = linear.ColumnParallelLinear(
+        128,
+        256,
+        quant_config=_online_quant_config(),
+        prefix="language_model.model.layers.3.self_attn.qkv_proj",
+    )
+    assert module.native_a8_group_rows is None
+    assert module.weight.shape == (256, 128)
+    assert module.weight_scale.shape == (256, 4)
+
+
+def test_online_excluded_source_keeps_the_native_layout(linear_modules):
+    linear, group = linear_modules
+    group.world_size = 1
+    module = linear.ColumnParallelLinear(
+        128,
+        256,
+        quant_config=_online_quant_config(),
+        prefix="language_model.model.layers.3.block_sparse_moe.shared_experts.gate_up_proj",
+    )
+    assert module.native_a8_group_rows == 1
+    assert module.weight_scale.shape == (256, 4)
+
+
+def test_online_requantized_32x32_source_still_rejected(linear_modules):
+    linear, group = linear_modules
+    group.world_size = 1
+    with pytest.raises(ValueError, match="Native group32 A8"):
+        linear.ColumnParallelLinear(
+            128,
+            256,
+            quant_config=_online_quant_config(block_rows=32),
+            prefix="language_model.model.layers.3.self_attn.qkv_proj",
+        )
+
+
 @pytest.mark.parametrize("kind", ["ColumnParallelLinear", "RowParallelLinear"])
 def test_parallel_source_slices_and_scale_alignment(linear_modules, kind):
     linear, group = linear_modules
