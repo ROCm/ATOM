@@ -781,6 +781,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Master switch: pin each GPU worker to its GPU-local NUMA node's CPU cores
     # and preferred memory. Default off so baseline/pinned A/B stays clean.
     "ATOM_NUMA_BIND": lambda: os.getenv("ATOM_NUMA_BIND", "0") == "1",
+    # Split a NUMA node's physical cores into disjoint per-GPU groups instead
+    # of giving every worker on that node the same broad affinity mask.
+    "ATOM_NUMA_BIND_PER_GPU": lambda: os.getenv("ATOM_NUMA_BIND_PER_GPU", "1") == "1",
     # Auto-detect the GPU->NUMA-node mapping (amdsmi first, sysfs fallback).
     # Default on, so `ATOM_NUMA_BIND=1` alone is zero-config.
     "ATOM_AUTO_NUMA_BIND": lambda: os.getenv("ATOM_AUTO_NUMA_BIND", "1") == "1",

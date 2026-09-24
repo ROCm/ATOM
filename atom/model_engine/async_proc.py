@@ -138,7 +138,13 @@ class AsyncIOProc:
             if dp_local_rank is None:
                 dp_local_rank = cfg.parallel_config.data_parallel_rank
             gpu = dp_local_rank * cfg.tp_world_size + rank
-            numa_bind_to_node(gpu, label)
+            numa_bind_to_node(
+                gpu,
+                label,
+                local_gpu_count=(
+                    cfg.parallel_config.data_parallel_size_local * cfg.tp_world_size
+                ),
+            )
         except Exception as e:  # noqa: BLE001 - binding is an optimization
             # NUMA binding only affects locality, never correctness, so any
             # failure (missing libnuma, restricted cpuset, odd topology) must
