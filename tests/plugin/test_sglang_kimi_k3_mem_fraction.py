@@ -70,7 +70,7 @@ def test_restore_overrides_once_then_skips():
         override=override,
     )
     exec_bag = SimpleNamespace(kernel=SimpleNamespace(attention_backend="aiter"))
-    # Upstream already applied * 0.85.
+    # Upstream scaled operator input 0.85 by *0.85 → schedule holds 0.7225.
     schedule = SimpleNamespace(mem_fraction_static=0.85 * 0.85)
     owner = SimpleNamespace(model_config=SimpleNamespace(context_len=16384))
 
@@ -83,7 +83,7 @@ def test_restore_overrides_once_then_skips():
 
     assert len(log) == 1
     assert log[0][0] == _KIMI_K3_MEM_FRACTION_OVERRIDE
-    assert log[0][1]["mem_fraction_static"] == 1.0
+    assert log[0][1]["mem_fraction_static"] == 0.85
 
 
 def test_restore_skips_when_honor_explicit_mem_fraction():
