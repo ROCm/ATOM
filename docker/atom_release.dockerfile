@@ -637,11 +637,14 @@ RUN echo "========== Install atomesh binary ==========" && \
     atomesh --version
 
 # ========== LMCache (ROCm 7.2.4 / torch 2.10) for KV offload ==========
-# Install the official wheel built for the image's exact PyTorch ABI. Keep
-# --no-deps so pip cannot replace the preinstalled ROCm torch stack.
-ARG LMCACHE_WHEEL_NAME=lmcache-0.5.5rc3+rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1-cp312-cp312-manylinux_2_39_x86_64.whl
-ARG LMCACHE_WHEEL_URL=https://github.com/LMCache/LMCache/releases/download/v0.5.5rc3-rocm-torch210/lmcache-0.5.5rc3%2Brocm7.2.4.torch2.10.git3d3aa833.cxx11abi1-cp312-cp312-manylinux_2_39_x86_64.whl
-ARG LMCACHE_WHEEL_SHA256=06cda2fef1c2cf3926ffa59c4ba13b6029c6e40d3fba6db2bc2e7350a29c280f
+# Install a wheel built for the image's exact PyTorch ABI. LMCache publishes
+# torch 2.10 wheels only with tagged releases, so this one is built from an
+# LMCache dev commit by .github/workflows/lmcache-rocm-wheel.yaml and pinned
+# from this repository's releases. Keep --no-deps so pip cannot replace the
+# preinstalled ROCm torch stack.
+ARG LMCACHE_WHEEL_NAME=lmcache-0.5.6.dev98+g05fc77a0.rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1-cp312-cp312-manylinux_2_39_x86_64.whl
+ARG LMCACHE_WHEEL_URL=https://github.com/ROCm/ATOM/releases/download/lmcache-v0.5.6.dev98-g05fc77a0-rocm-torch210/lmcache-0.5.6.dev98%2Bg05fc77a0.rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1-cp312-cp312-manylinux_2_39_x86_64.whl
+ARG LMCACHE_WHEEL_SHA256=a5fe8f3f5b9dee602ac7d11241f65a1640cd3d26c101f2d1d0e0d8aee88b7aab
 # Docker builds do not expose a GPU, so LMCache's torch.cuda.is_available()
 # backend predicate is overridden only in the validation process below.
 # Two install paths, because the published wheel targets one ABI: its filename
@@ -665,7 +668,8 @@ RUN if [ -z "${ROCM_HOME}" ]; then \
               cachetools cryptography numba openai py-cpuinfo \
               opentelemetry-api==1.40.0 opentelemetry-sdk==1.40.0 \
               opentelemetry-exporter-otlp==1.40.0 \
-              opentelemetry-exporter-prometheus==0.61b0 && \
+              opentelemetry-exporter-prometheus==0.61b0 \
+              "grpcio>=1.78.0" "protobuf>=6.31.1,<7" && \
           "${VENV_PYTHON}" -m pip install --no-deps "/tmp/${LMCACHE_WHEEL_NAME}" && \
           rm -f "/tmp/${LMCACHE_WHEEL_NAME}" && \
           "${VENV_PYTHON}" -c "import torch; torch.cuda.is_available = lambda: True; import lmcache, lmcache.cuda_ops, lmcache.lmcache_native; \
@@ -679,7 +683,7 @@ RUN if [ -z "${ROCM_HOME}" ]; then \
       from lmcache.v1.multiprocess.futures import DeviceMessagingFuture; \
       from lmcache.v1.multiprocess.group_view import EngineGroupInfo; \
       assert 'rocm' in torch.__version__, torch.__version__; \
-      assert lmcache.__version__.startswith('0.5.5rc3+rocm7.2.4.torch2.10'), lmcache.__version__; \
+      assert lmcache.__version__ == '0.5.6.dev98+g05fc77a0.rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1', lmcache.__version__; \
       assert lmcache.cuda_ops.__file__.endswith('.so'), lmcache.cuda_ops.__file__; \
       assert lmcache.lmcache_native.__file__.endswith('.so'), lmcache.lmcache_native.__file__; \
       assert hasattr(lmcache.cuda_ops, 'execute_object_group_transfer'), 'cuda_ops extension is incomplete'; \
