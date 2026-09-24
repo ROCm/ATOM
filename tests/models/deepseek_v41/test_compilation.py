@@ -241,3 +241,82 @@ def test_mhc_guard_outputs_and_input_alias(monkeypatch, mode):
             kwargs,
             test_utils=("test_schema", "test_faketensor"),
         )
+
+
+@torch.inference_mode()
+def test_idle_prefill_runs_padding_ffn_without_attention_or_cache_writes(monkeypatch):
+    from atom.model_ops.attentions.deepseek_v41.backend import (
+        DeepseekV41MetadataBuilder,
+    )
+    from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+    from atom.utils.forward_context import AttnState
+    from tests.attentions.deepseek_v41.helpers import metadata_buffers
+
+    geo = V41PoolGeometry(
+        1, ((0, 2),), 32, 4, 512, 32, layer_ratios=(2,), index_block_rows=8
+    )
+    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    builder.geometry, builder.device, builder.block_size = geo, "cuda", 32
+    builder.cache = PagedAttentionCache(geo, 4, 2, "cuda", max_tokens=8)
+    builder.model_runner = SimpleNamespace(
+        forward_vars=metadata_buffers(2, 8, 4, "cuda", geo)
+    )
+    batch = SimpleNamespace(
+        is_dummy_run=True,
+        state_slots_committed=[],
+        req_ids=(-1,),
+        num_scheduled_tokens=(8,),
+        context_lens=(8,),
+        total_seqs_num=1,
+        total_tokens_num=8,
+    )
+    metadata, positions = builder.prepare_prefill(batch, 2)
+    metadata.engram_embeddings = Rows()
+    step = metadata.step
+    assert step.requests == () and step.is_prefill and not step.decode
+    assert metadata.state == AttnState.PREFILL_PREFIX
+    assert step.width == 8 and torch.all(step.batch_ids == -1)
+    builder.cache.backing.fill_(57)
+    before = builder.cache.backing.clone()
+
+    model = DeepseekV41RuntimeModel.__new__(DeepseekV41RuntimeModel)
+    nn.Module.__init__(model)
+    model.do_not_compile = True
+    model.config = SimpleNamespace(hidden_size=8, hc_mult=4)
+    model.layers = nn.ModuleList([TinyBlock()])
+    model.layers[0].engram = Engram()
+    model.topology = [SimpleNamespace(layer_id=0, ratio=2)]
+    model.global_rope = model.window_rope = None
+    model.embed = nn.Embedding(32, 8, device="cuda")
+    calls = []
+
+    def unexpected_attention_or_engram(*args):
+        pytest.fail("An idle rank must not enter attention or Engram kernels")
+
+    model.layers[0].attn.register_forward_pre_hook(unexpected_attention_or_engram)
+    model.layers[0].engram.register_forward_pre_hook(unexpected_attention_or_engram)
+    model.layers[0].ffn.register_forward_pre_hook(
+        lambda module, args: calls.append(args[0].shape[-2])
+    )
+    monkeypatch.setattr(
+        forward_context,
+        "_forward_context",
+        forward_context.ForwardContext(
+            attn_metadata=metadata,
+            no_compile_layers={"v41.layers.0": (model.layers[0], None)},
+            context=SimpleNamespace(is_draft=False, ubatch_token_offset=0),
+        ),
+    )
+    output = model(torch.zeros(8, dtype=torch.int32, device="cuda"), positions)
+    assert calls == [8]
+    assert output.shape == (8, 8) and output.count_nonzero() == 0
+    assert metadata.engram_embeddings.events == []
+    torch.testing.assert_close(builder.cache.backing, before, rtol=0, atol=0)
+
+    # The serving guard skips attention, but a direct metadata consumer must
+    # also accept this empty prefill and retain the full table capacity.
+    tiles = builder.cache.unit_tiles(step, 2)
+    assert tiles.shape == (8, 4 * (geo.rows_per_page(2) // geo.index_block_rows))
+    assert tiles.count_nonzero() == 0
+    assert builder.cache.unit_tiles(step, 2) is tiles

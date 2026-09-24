@@ -473,11 +473,11 @@ class PagedAttentionCache:
         table = step.tiles.get(ratio)
         if table is None:
             block_tables = step.block_tables
-            if not step.decode:
-                # Prefill is eager. Expand only pages visible to this step,
+            if not step.decode and step.requests:
+                # Expand only pages visible to a nonempty prefill step,
                 # including the cached prefix of a chunk/TBO microbatch. The
                 # persistent table can hold a 1M context even for an 8k prompt.
-                # Decode/verify keep the full width for graph replay.
+                # Decode/verify and empty steps retain the full table width.
                 end = max(request.end for request in step.requests)
                 columns = (
                     end + self.geometry.block_size - 1
