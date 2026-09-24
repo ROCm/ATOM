@@ -372,7 +372,10 @@ class LLMEngine:
             self._broadcast_utility("release_profile", token=token)
             return reserved
         try:
-            return self._broadcast_utility("commit_profile", token=token)
+            committed = self._broadcast_utility("commit_profile", token=token)
+            if any("error" in result for result in committed):
+                self.core_mgr.broadcast_utility_command("stop_profile")
+            return committed
         except Exception:
             # Engines that did commit are recording behind a /start_profile
             # that failed, and nothing else will close their window.
