@@ -2338,6 +2338,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 "flydsl fused_moe cannot serve as a fallback because the FlyDSL "
                 "scale layout is skipped under use_triton_ep."
             )
+            if getattr(layer, "_sp_tiled_sort_enabled", False):
+                moe_extra_args["use_tiled_sort"] = True
             return fused_moe(
                 x,
                 layer.w13_weight,
@@ -2351,7 +2353,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_scale=layer.w2_weight_scale,
                 a1_scale=a1_scale,
                 dtype=torch.bfloat16 if sp_input_scale is not None else None,
-                use_tiled_sort=getattr(layer, "_sp_tiled_sort_enabled", False),
                 a2_scale=a2_scale,
                 doweight_stage1=apply_router_weight_on_input,
                 bias1=layer.w13_bias,
