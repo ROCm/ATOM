@@ -12,7 +12,7 @@ def supports_m3_sp_tiled_sort(layer) -> bool:
     from atom.plugin.prepare import is_plugin_mode
     from atom.utils import envs
 
-    if (
+    return not (
         not envs.ATOM_SP_MOE_TILED_SORT
         or get_sp_world_size() != 4
         or is_plugin_mode()
@@ -28,7 +28,4 @@ def supports_m3_sp_tiled_sort(layer) -> bool:
         or layer.top_k != 4
         or layer.num_fused_shared_experts != 1
         or get_gfx_runtime() != "gfx950"
-    ):
-        return False
-
-    return True
+    )

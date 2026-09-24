@@ -56,11 +56,17 @@ def quantize_gather_moe_input(x, group):
         return None
     if x.shape[0] < 2048 or torch.cuda.is_current_stream_capturing():
         return None
-    candidate = registered_input_view(group, (x.shape[0], x.shape[1] // 2), dtypes.fp4x2)
+    candidate = registered_input_view(
+        group, (x.shape[0], x.shape[1] // 2), dtypes.fp4x2
+    )
     if candidate is None:
         return None
     quantized, ca = candidate
-    scale = torch.empty((x.shape[0], x.shape[1] // 32), device=x.device, dtype=dtypes.fp8_e8m0)
+    scale = torch.empty(
+        (x.shape[0], x.shape[1] // 32), device=x.device, dtype=dtypes.fp8_e8m0
+    )
     dynamic_per_group_scaled_quant(quantized, x, scale, 32, shuffle_scale=False)
-    gathered = ca.all_gather_reg(quantized.view(torch.bfloat16), dim=0).view(dtypes.fp4x2)
+    gathered = ca.all_gather_reg(quantized.view(torch.bfloat16), dim=0).view(
+        dtypes.fp4x2
+    )
     return gathered, scale

@@ -1,4 +1,5 @@
 """CPU regression for SP collective input registration during graph capture."""
+
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -26,8 +27,12 @@ def _group(actions, *, disabled=False, already_capturing=False):
             ca._IS_CAPTURING = False
             actions.append(("flush", context))
 
-    return SimpleNamespace(device_communicator=SimpleNamespace(ca_comm=ca),
-                           graph_capture=capture), ca
+    return (
+        SimpleNamespace(
+            device_communicator=SimpleNamespace(ca_comm=ca), graph_capture=capture
+        ),
+        ca,
+    )
 
 
 def _enable(monkeypatch, group):
@@ -42,15 +47,22 @@ def test_disabled_paths_do_not_resolve_group(monkeypatch, enabled, world_size):
     monkeypatch.setattr(ulysses_sp, "_SP_WORLD_SIZE", world_size)
 
     def forbidden():
-        raise AssertionError("disabled path must not initialize or resolve a communicator")
+        raise AssertionError(
+            "disabled path must not initialize or resolve a communicator"
+        )
 
     monkeypatch.setattr(ulysses_sp, "get_sp_group", forbidden)
     with ulysses_sp.sp_graph_capture(object()):
         pass
 
 
-@pytest.mark.parametrize("group", [SimpleNamespace(),
-                                  SimpleNamespace(device_communicator=SimpleNamespace(ca_comm=None))])
+@pytest.mark.parametrize(
+    "group",
+    [
+        SimpleNamespace(),
+        SimpleNamespace(device_communicator=SimpleNamespace(ca_comm=None)),
+    ],
+)
 def test_unavailable_communicator_is_noop(monkeypatch, group):
     _enable(monkeypatch, group)
     with ulysses_sp.sp_graph_capture(object()):
@@ -58,7 +70,9 @@ def test_unavailable_communicator_is_noop(monkeypatch, group):
 
 
 @pytest.mark.parametrize("disabled,active", [(True, False), (False, True)])
-def test_inactive_or_already_enclosed_communicator_is_noop(monkeypatch, disabled, active):
+def test_inactive_or_already_enclosed_communicator_is_noop(
+    monkeypatch, disabled, active
+):
     actions = []
     group, ca = _group(actions, disabled=disabled, already_capturing=active)
     _enable(monkeypatch, group)
@@ -89,8 +103,10 @@ def test_capture_failure_exits_registration_context(monkeypatch):
     group, ca = _group(actions)
     _enable(monkeypatch, group)
     context = object()
-    with pytest.raises(RuntimeError, match="capture aborted"):
-        with ulysses_sp.sp_graph_capture(context):
-            raise RuntimeError("capture aborted")
+    with (
+        pytest.raises(RuntimeError, match="capture aborted"),
+        ulysses_sp.sp_graph_capture(context),
+    ):
+        raise RuntimeError("capture aborted")
     assert not ca._IS_CAPTURING
     assert actions == [("enter", context), ("flush", context)]
