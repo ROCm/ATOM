@@ -82,6 +82,34 @@ def test_child_metadata_reuse_waits_for_gpu_readers(failed, cross_stream):
             torch.testing.assert_close(value.cpu(), expected[i % 2][name])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("cross_stream", [False, True])
+def test_completed_child_metadata_reuse_needs_no_wait(monkeypatch, cross_stream):
+    builder, first = make_parent("cuda", starts=(3, 8))
+    _, second = make_parent("cuda", starts=(17, 21))
+    part = UBatchSlice(slice(0, 2), slice(0, 14))
+    child = builder.build_ubatch_prefill_metadata(first, part, 2)
+    with builder.ubatch_forward(first):
+        observed = child.step.positions.clone()
+    # Model a caller that has already waited for the previous result.
+    observed.cpu()
+    builder._tbo_storage[0][3].synchronize()
+    storage = child.step.positions.data_ptr()
+    stream = torch.cuda.Stream() if cross_stream else torch.cuda.current_stream()
+
+    def unexpected_wait(*args, **kwargs):
+        pytest.fail("Completed metadata must be reused without another wait")
+
+    with torch.cuda.stream(stream), monkeypatch.context() as patch:
+        patch.setattr(torch.cuda.Event, "synchronize", unexpected_wait)
+        patch.setattr(torch.cuda.Stream, "wait_event", unexpected_wait)
+        next_child = builder.build_ubatch_prefill_metadata(second, part, 2)
+    stream.synchronize()
+    assert next_child.step.positions.data_ptr() == storage
+    torch.testing.assert_close(observed, first.step.positions)
+    torch.testing.assert_close(next_child.step.positions, second.step.positions)
+
+
 def test_release_kv_pools_drops_child_storage_and_rebuilds():
     builder, parent = make_parent("cpu")
     buffers, indptrs = builder._prefill_ubatch_storage(0)
@@ -247,7 +275,7 @@ def test_single_token_prefill_child_keeps_prefill_semantics(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
-def test_host_staging_reuse_does_not_wait_for_model_completion():
+def test_host_staging_reuse_does_not_wait_for_model_completion(monkeypatch):
     builder, first = make_parent("cuda", starts=(3, 8))
     _, second = make_parent("cuda", starts=(17, 21))
     part = UBatchSlice(slice(0, 2), slice(0, 14))
@@ -262,8 +290,13 @@ def test_host_staging_reuse_does_not_wait_for_model_completion():
             torch.cuda._sleep(1_000_000_000)
             observed = child.step.positions.clone()
         finished.record()
+
+    def unexpected_host_wait(*args, **kwargs):
+        pytest.fail("Completed H2D must not issue another host wait")
+
     try:
-        with torch.cuda.stream(upload):
+        with torch.cuda.stream(upload), monkeypatch.context() as patch:
+            patch.setattr(torch.cuda.Event, "synchronize", unexpected_host_wait)
             next_child = builder.build_ubatch_prefill_metadata(second, part, 2)
         # A device-side wait may delay the next upload, but must not delay the
         # CPU until those previous model consumers finish.
