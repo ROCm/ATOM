@@ -183,6 +183,9 @@ SA database IDs. Schemas under `results/schemas/` describe the file contract.
 Random dataset generation and client tests do not load server-side chat encoders
 or their model-weight dependencies. The benchmark CLI loads encoders when it runs;
 importing the dataset helpers does not require the engine or PyTorch.
+The shared non-GPU suite also collects these tests and installs `jsonschema` for
+the bundle contract assertions. The results directory has no local `conftest.py`,
+so it cannot shadow the shared fixtures imported by existing engine tests.
 
 CPU tests do not establish GPU overhead or real-run completeness. Acceptance
 requires a random full bundle, an agentic run with at least two comparable
