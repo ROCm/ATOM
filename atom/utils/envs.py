@@ -201,6 +201,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ": lambda: (
         os.getenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "1") == "1"
     ),
+    # gather_kv_b_proj: replace the Triton op with an unfused torch chain (row
+    # gather -> dequant -> GEMM -> split/concat). Escape hatch for targets where
+    # Triton cannot compile the fused kernel for chunked-prefill shapes and
+    # aborts the process; slower, and off unless asked for.
+    "ATOM_UNFUSED_GATHER_KV_B_PROJ": lambda: (
+        os.getenv("ATOM_UNFUSED_GATHER_KV_B_PROJ", "0") == "1"
+    ),
     # FlyDSL FP8 prefill with fused QKV quantization and direct FP8 gather output
     # where supported. Unsupported attention inputs raise. Added 2026-09-10.
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN": lambda: (
