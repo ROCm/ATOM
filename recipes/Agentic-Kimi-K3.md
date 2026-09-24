@@ -82,8 +82,8 @@ other band (C1…C48).
 
 ## 0. Container prerequisites
 
-Three things about the container decide whether the numbers above are
-reproducible at all. All fail quietly rather than loudly, so they are worth
+Two things about the container decide whether the numbers above are
+reproducible at all. Both fail quietly rather than loudly, so they are worth
 checking before the first run.
 
 ### triton must be 3.7.x
@@ -99,21 +99,6 @@ Nothing about aiter or ATOM changes the outcome: the same 2x gap survives
 swapping aiter's `.so` between revisions, swapping the ATOM checkout, and
 switching between a full CI prebuild and a lean JIT build. Use an image with
 triton 3.7.x, such as `kimi_k3_agentic_0907`.
-
-### FP8 prefill kernels must be precompiled
-
-```bash
-ls "$(python3 -c 'import aiter, os; print(os.path.dirname(aiter.__file__))')/jit/flydsl_cache" \
-  | grep -c '^launch_flash_attn_dualwave_swp_'   # expect 92 on a fresh container
-```
-
-The FlyDSL FP8 prefill attention kernel is compiled per configuration the first
-time a request needs it, stalling that request for seconds. aiter builds all 92
-Kimi-K3 variants ahead of time from
-`aiter/configs/model_configs/kimik3_fmha_fp8_aot.csv` (ROCm/aiter#5796); a count
-below 92 means the image predates that. ATOM must also include the
-`merge_attn_states` runtime-arg fix (ROCm/ATOM#2378), without which the MLA
-chunked-prefill merge recompiles for every distinct prefill token count.
 
 ### `DRAFT_MODEL_PATH` must point at a local copy
 
@@ -297,7 +282,7 @@ acceptance flags; ATOM rejects that pair at startup. See [`DSpark.md`](DSpark.md
 
 Kimi-K3 KDA decode can rebuild SSM state from a checkpoint ring
 (`ATOM_ENABLE_REPLAYSSM=1`). The table above is the AgentX default: off for
-CONC 1/2/4, on for CONC 8/12/14/16, off from CONC 32 up. Override with
+CONC 1/2/4, on for CONC 8/12/16, off from CONC 32 up. Override with
 `ATOM_ENABLE_REPLAYSSM=0` or `1` when comparing the other setting.
 
 ### State checkpointing
