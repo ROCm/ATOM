@@ -35,6 +35,7 @@ on:
         options:
           - smoke
           - nightly
+          - vllm
       rdma_smoke_nodes:
         description: 'Comma-separated Slurm candidate nodes for the Mooncake RDMA smoke test; Slurm selects two when multiple nodes are listed'
         required: false

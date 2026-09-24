@@ -41,6 +41,11 @@ PREFILL_PORT="${PREFILL_PORT:-8010}"
 DECODE_PORT="${DECODE_PORT:-8020}"
 ROUTER_PORT="${ROUTER_PORT:-8000}"
 ROUTER_POLICY="${ROUTER_POLICY:-random}"
+# Rank 0 waits on the ready path; other ranks poll the alive path until the
+# router goes away. Backend modules may override both.
+ROUTER_READY_PATH="/v1/models"
+ROUTER_ALIVE_PATH="/health"
+SERVED_MODEL_NAME="${MODEL_PATH}"
 ATOM_PD_RANK_MAPPING_POLICY="${ATOM_PD_RANK_MAPPING_POLICY:-none}"
 PROMETHEUS_PORT="${PROMETHEUS_PORT:-29100}"
 HANDSHAKE_PORT="${HANDSHAKE_PORT:-6301}"
@@ -236,7 +241,7 @@ dump_launch_info() {
   echo "  ${role} launch info"
   echo "========================================"
   echo "--- environment ---"
-  env | grep -E '^(HIP_|HSA_|AITER_|ATOM_|RCCL_|NCCL_|CUDA_|MOONCAKE_|MORI_|UCX_)' | sort || true
+  env | grep -E '^(HIP_|HSA_|AITER_|ATOM_|RCCL_|NCCL_|CUDA_|MOONCAKE_|MORI_|UCX_|VLLM_|GLOO_)' | sort || true
   echo "--- command ---"
   printf '%q ' "$@"
   echo ""
@@ -535,9 +540,9 @@ wait_http() {
 wait_router_closed() {
   local miss_count=0
   local max_misses=3
-  echo "[wait] router shutdown http://${NODE0_ADDR}:${ROUTER_PORT}/health"
+  echo "[wait] router shutdown http://${NODE0_ADDR}:${ROUTER_PORT}${ROUTER_ALIVE_PATH}"
   while true; do
-    if curl -sf --max-time 10 "http://${NODE0_ADDR}:${ROUTER_PORT}/health" >/dev/null 2>&1; then
+    if curl -sf --max-time 10 "http://${NODE0_ADDR}:${ROUTER_PORT}${ROUTER_ALIVE_PATH}" >/dev/null 2>&1; then
       miss_count=0
       if [[ -n "${server_pid:-}" ]] && ! kill -0 "${server_pid}" 2>/dev/null; then
         set +e
@@ -834,7 +839,8 @@ run_benchmark() {
       local result_file="pd-${BACKEND}-${safe_model}-${TOPOLOGY}-isl${isl}-osl${OSL}-conc${conc}-${RANDOM_RANGE_RATIO}.json"
       echo "[bench] ${result_file}"
       PYTHONDONTWRITEBYTECODE=1 python "${bench_script}" \
-        --model="${MODEL_PATH}" \
+        --model="${SERVED_MODEL_NAME}" \
+        --tokenizer="${MODEL_PATH}" \
         --backend=vllm \
         --base-url="http://127.0.0.1:${ROUTER_PORT}" \
         --dataset-name=random \
@@ -874,7 +880,11 @@ ensure_aiperf() {
   git -C "${AIPERF_DIR}" fetch https://github.com/SemiAnalysisAI/aiperf.git "${AIPERF_COMMIT}"
   git -C "${AIPERF_DIR}" checkout --detach "${AIPERF_COMMIT}"
   rm -rf "${AIPERF_VENV}"
-  python3 -m venv "${AIPERF_VENV}"
+  # Some serving images ship Python without ensurepip but bundle uv.
+  if ! python3 -m venv "${AIPERF_VENV}"; then
+    rm -rf "${AIPERF_VENV}"
+    uv venv --seed --python "$(command -v python3)" "${AIPERF_VENV}"
+  fi
   "${AIPERF_VENV}/bin/python" -m pip install --upgrade pip
   "${AIPERF_VENV}/bin/python" -m pip install -e "${AIPERF_DIR}"
   "${AIPERF_VENV}/bin/aiperf" --version
@@ -921,8 +931,9 @@ def total_tokens(name):
 cache_hit_tokens = total_tokens("total_usage_prompt_cache_read_tokens")
 cache_total_tokens = total_tokens("total_usage_prompt_tokens")
 
+backend = os.environ.get("BACKEND") or "atom"
 payload = {
-    "benchmark_backend": "atom",
+    "benchmark_backend": backend,
     # Directory holding this run's profile_export.jsonl, so process_result.py can
     # find the per-request records both interactivity definitions are computed
     # from, without reconstructing the directory name.
@@ -930,7 +941,7 @@ payload = {
     "benchmark_model_name": os.environ.get("MODEL_NAME")
     or data.get("model")
     or data.get("model_id"),
-    "backend": "atom",
+    "backend": backend,
     "benchmark_kind": os.environ.get("BENCHMARK_KIND") or "aiperf_agentic",
     "scenario": os.environ.get("AIPERF_SCENARIO"),
     "public_dataset": os.environ.get("AIPERF_PUBLIC_DATASET"),
@@ -1055,6 +1066,15 @@ run_aiperf_agentic_benchmark() {
       chat_template_args+=(--apply-chat-template)
     fi
 
+    # The metrics report reads ATOM/atomesh Prometheus series only.
+    local -a metrics_wrapper=()
+    if [[ "${BACKEND}" == "atom" ]]; then
+      metrics_wrapper=(
+        python3 "${ATOMESH_SCRIPT_DIR}/observability/collect_metrics.py"
+        --output "${out_dir}/metrics" "${report_args[@]}" --
+      )
+    fi
+
     echo "[aiperf] ${result_file}"
     mkdir -p "${out_dir}"
     AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT="${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT}" \
@@ -1063,8 +1083,7 @@ run_aiperf_agentic_benchmark() {
     AIPERF_DATASET_CONFIGURATION_TIMEOUT="${AIPERF_DATASET_CONFIGURATION_TIMEOUT}" \
     AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT="${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT}" \
     AIPERF_UI_REALTIME_METRICS_ENABLED=true \
-      python3 "${ATOMESH_SCRIPT_DIR}/observability/collect_metrics.py" \
-      --output "${out_dir}/metrics" "${report_args[@]}" -- \
+      "${metrics_wrapper[@]}" \
       "${AIPERF_VENV}/bin/aiperf" profile \
       "${unsafe_args[@]}" \
       --scenario "${AIPERF_SCENARIO}" \
@@ -1072,7 +1091,7 @@ run_aiperf_agentic_benchmark() {
       --endpoint /v1/chat/completions \
       --endpoint-type chat \
       --streaming \
-      --model "${MODEL_PATH}" \
+      --model "${SERVED_MODEL_NAME}" \
       --concurrency "${conc}" \
       --benchmark-duration "${AIPERF_BENCHMARK_DURATION}" \
       --stats-interval 30 \
@@ -1151,7 +1170,7 @@ run_swebench_lite_eval() {
     bash "${runner}" \
       --output-dir "${result_dir}" \
       --model-name "${MODEL_NAME}" \
-      --api-model "${MODEL_PATH}" \
+      --api-model "${SERVED_MODEL_NAME}" \
       --api-base "http://127.0.0.1:${ROUTER_PORT}/v1" \
       --run-id "${tag}" \
       --limit "${EVAL_LIMIT:-full}" \
@@ -1235,9 +1254,9 @@ run_eval() {
   fi
   local eval_model_args_base
   if [[ "${EVAL_MODEL_TYPE}" == "local-chat-completions" ]]; then
-    eval_model_args_base="model=${MODEL_PATH},base_url=http://127.0.0.1:${ROUTER_PORT}/v1/${EVAL_ENDPOINT},num_concurrent="
+    eval_model_args_base="model=${SERVED_MODEL_NAME},tokenizer=${MODEL_PATH},base_url=http://127.0.0.1:${ROUTER_PORT}/v1/${EVAL_ENDPOINT},num_concurrent="
   else
-    eval_model_args_base="model=${MODEL_PATH},base_url=http://127.0.0.1:${ROUTER_PORT}/v1/${EVAL_ENDPOINT},num_concurrent="
+    eval_model_args_base="model=${SERVED_MODEL_NAME},tokenizer=${MODEL_PATH},base_url=http://127.0.0.1:${ROUTER_PORT}/v1/${EVAL_ENDPOINT},num_concurrent="
     eval_model_args_extra="${eval_model_args_extra},tokenized_requests=False,trust_remote_code=True"
   fi
 
@@ -1313,6 +1332,10 @@ run_benchmark_and_eval() {
   fi
 }
 
+if [[ "${BACKEND}" == "vllm" ]]; then
+  source "${ATOMESH_SCRIPT_DIR}/pd_server_vllm.sh"
+fi
+
 write_metadata
 
 if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
@@ -1329,7 +1352,7 @@ if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
     wait_http "http://${ip}:${DECODE_PORT}/health" "decode-${ip}" "${WAIT_SERVER_TIMEOUT}" "${decode_pid}"
   done
   start_router
-  wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
+  wait_http "http://127.0.0.1:${ROUTER_PORT}${ROUTER_READY_PATH}" "router" "${WAIT_ROUTER_TIMEOUT}"
   run_benchmark_and_eval
   cleanup_processes "${router_pid}" "${prefill_pid}" "${decode_pid}"
 elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
@@ -1357,7 +1380,7 @@ elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
       "${WAIT_SERVER_TIMEOUT}"
   done
   start_router
-  wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
+  wait_http "http://127.0.0.1:${ROUTER_PORT}${ROUTER_READY_PATH}" "router" "${WAIT_ROUTER_TIMEOUT}"
   run_benchmark_and_eval
   cleanup_processes "${router_pid}" "${prefill_pids[@]}"
 elif [[ "${NODE_RANK}" -eq 0 ]]; then
@@ -1374,7 +1397,7 @@ elif [[ "${NODE_RANK}" -eq 0 ]]; then
       "${WAIT_SERVER_TIMEOUT}"
   done
   start_router
-  wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
+  wait_http "http://127.0.0.1:${ROUTER_PORT}${ROUTER_READY_PATH}" "router" "${WAIT_ROUTER_TIMEOUT}"
   run_benchmark_and_eval
   kill "${router_pid}" "${server_pid}" 2>/dev/null || true
 elif [[ "${DECODE_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -eq "${xP}" ]]; then
@@ -1391,25 +1414,25 @@ elif [[ "${DECODE_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -eq "${xP}" ]]; then
     decode_pids+=("${server_pid}")
   done
   trap 'cleanup_processes ${decode_pids[*]:-}' EXIT
-  wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}"
+  wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}${ROUTER_ALIVE_PATH}" "router" "${WAIT_SERVER_TIMEOUT}"
   wait_router_closed
   cleanup_processes "${decode_pids[@]}"
 elif [[ "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   start_decode
   trap 'cleanup_processes ${server_pid:-}' EXIT
-  wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
+  wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}${ROUTER_ALIVE_PATH}" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   wait_router_closed
   cleanup_processes "${server_pid}"
 elif [[ "${NODE_RANK}" -lt "${xP}" ]]; then
   start_prefill "prefill-rank-${NODE_RANK}"
   trap 'cleanup_processes ${server_pid:-}' EXIT
-  wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
+  wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}${ROUTER_ALIVE_PATH}" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   wait_router_closed
   cleanup_processes "${server_pid}"
 else
   start_decode
   trap 'cleanup_processes ${server_pid:-}' EXIT
-  wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
+  wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}${ROUTER_ALIVE_PATH}" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   wait_router_closed
   cleanup_processes "${server_pid}"
 fi

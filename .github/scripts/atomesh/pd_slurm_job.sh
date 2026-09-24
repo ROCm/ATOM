@@ -128,6 +128,37 @@ for key, value in sorted(os.environ.items()):
 PY
 }
 
+# vLLM workers self-register with vllm-router over ZMQ. The router ships in its
+# own image, so rank 0 runs it as a sidecar next to the serving container.
+start_vllm_router() {
+  local container="$1"
+  local log_file="$2"
+  local port_offset="$3"
+  local image="${ATOMESH_VLLM_ROUTER_IMAGE:?vllm.router.image is required}"
+  local discovery_port=$((ATOMESH_VLLM_ROUTER_DISCOVERY_PORT + port_offset))
+  local port=$((ROUTER_PORT + port_offset))
+
+  bounded_docker_rm "${container}"
+  docker pull "${image}" || return $?
+  echo "[router] ${container} port=${port} discovery=${discovery_port} log=${log_file}"
+  docker run -d --name "${container}" \
+    --user "$(id -u):$(id -g)" \
+    --network host \
+    --ulimit nofile=1048576:1048576 \
+    "${image}" \
+    vllm-router \
+    --vllm-pd-disaggregation \
+    --kv-connector moriio \
+    --vllm-discovery-address "0.0.0.0:${discovery_port}" \
+    --host 0.0.0.0 \
+    --port "${port}" \
+    --policy "${ROUTER_POLICY}" \
+    --prefill-policy "${ROUTER_POLICY}" \
+    --decode-policy "${ROUTER_POLICY}" \
+    --log-level info >/dev/null || return $?
+  docker logs -f "${container}" > "${log_file}" 2>&1 &
+}
+
 pre_cleanup_local() {
   echo "=== pre-cleanup: stop running containers on $(hostname) ==="
   set +e
@@ -210,9 +241,14 @@ EOF
   fi
 
   local mesh_binary="${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"
-  if [[ "${rank}" -eq 0 ]]; then
+  local router_container=""
+  if [[ "${rank}" -eq 0 && "${BACKEND}" == "atom" ]]; then
     mesh_binary="$(bash "${REPO_ROOT}/.github/scripts/atomesh/setup_mesh.sh" \
       "${REPO_ROOT}" "${RUN_DIR}" "${DOCKER_IMAGE}" "${env_file}" "${JOB_ID}")" || return $?
+  elif [[ "${rank}" -eq 0 && "${BACKEND}" == "vllm" ]]; then
+    router_container="${container}-router"
+    start_vllm_router "${router_container}" \
+      "${rank_dir}/router${phase_suffix}.log" "${service_port_offset}" || return $?
   fi
 
   docker_args=(
@@ -315,9 +351,11 @@ EOF
   [[ -d /it-share ]] && docker_args+=(-v /it-share:/it-share)
   [[ -d /shared_nfs ]] && docker_args+=(-v /shared_nfs:/shared_nfs)
 
+  # Serving images may define their own ENTRYPOINT (vLLM: `vllm serve`).
   docker_args+=(
+    --entrypoint bash
     "${DOCKER_IMAGE}"
-    bash -lc "export PATH=/run_logs/slurm_job-${JOB_ID}/bin:\${PATH}; cd /workspace/ATOM && bash .github/scripts/atomesh/pd_server_atom.sh"
+    -lc "export PATH=/run_logs/slurm_job-${JOB_ID}/bin:\${PATH}; cd /workspace/ATOM && bash .github/scripts/atomesh/pd_server_atom.sh"
   )
 
   local docker_rc
@@ -328,6 +366,8 @@ EOF
   docker "${docker_args[@]}" > "${rank_dir}/${container_log}" 2>&1
   docker_rc=$?
   set -e
+  # Other ranks exit once the router stops answering.
+  bounded_docker_rm "${router_container}"
   echo "[logs] rank=${rank} phase=${execution_phase} exited rc=${docker_rc}"
   if [[ "${docker_rc}" -ne 0 ]]; then
     echo "[logs] last 16384 bytes of ${rank_dir}/${container_log}:" >&2
@@ -415,7 +455,7 @@ EOF
     # Publish before cleanup: Spur accounting is unreliable, so the workflow
     # falls back to these per-rank codes.
     publish_rank_rc "${SPUR_NODE_RANK_FOR_CLEANUP}" "${rc}"
-    for suffix in "" "-benchmark" "-eval"; do
+    for suffix in "" "-benchmark" "-eval" "-router" "-benchmark-router" "-eval-router"; do
       bounded_docker_rm \
         "atomesh-${ATOMESH_CELL_ID}-${JOB_ID}-${SPUR_NODE_RANK_FOR_CLEANUP}${suffix}"
     done
@@ -467,6 +507,11 @@ if [[ -n "${SPUR_JOB_ID:-}" || -n "${SPUR_TASK_OFFSET:-}" || -n "${SPUR_PEER_NOD
     --ntasks="${NUM_NODES}" \
     --ntasks-per-node=1 \
     bash "${REPO_ROOT}/.github/scripts/atomesh/pd_slurm_job.sh" --spur-worker
+fi
+
+if [[ "${BACKEND:-atom}" != "atom" ]]; then
+  echo "ERROR: backend ${BACKEND} is only supported on Spur workers" >&2
+  exit 2
 fi
 
 mapfile -t ALLOC_NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")

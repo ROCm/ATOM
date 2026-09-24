@@ -14,6 +14,7 @@ from typing import Any
 import yaml
 
 ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+SUPPORTED_BACKENDS = {"atom", "vllm"}
 
 
 def deep_merge(*items: dict[str, Any]) -> dict[str, Any]:
@@ -230,9 +231,10 @@ def build_cell(
         raise ValueError(
             f"Model {model_name} references unknown backend {backend_name}"
         )
-    if backend_name != "atom":
+    if backend_name not in SUPPORTED_BACKENDS:
         raise ValueError(
-            f"Only atom backend is currently supported, got {backend_name}"
+            f"Unsupported backend {backend_name}; expected one of "
+            + ", ".join(sorted(SUPPORTED_BACKENDS))
         )
 
     prefill_cfg = deep_merge(
@@ -367,7 +369,24 @@ def build_cell(
         topology, suite_cfg, prefill_cfg, decode_cfg
     )
     cell_id = slug(f"{model_name}-{suite_cfg.get('name', topology)}-{suite_name}")
-    image = override_image or str(backend_cfg.get("image"))
+    # The workflow-level image override targets ATOM nightlies only.
+    image = str(
+        (override_image if backend_name == "atom" else None)
+        or suite_cfg.get("image")
+        or model_cfg.get("image")
+        or backend_cfg.get("image")
+    )
+    backend_extra = (
+        {
+            "vllm": deep_merge(
+                backend_cfg.get("vllm", {}),
+                model_cfg.get("vllm", {}),
+                suite_cfg.get("vllm", {}),
+            )
+        }
+        if backend_name == "vllm"
+        else {}
+    )
     return {
         "id": cell_id,
         "suite": suite_name,
@@ -428,6 +447,7 @@ def build_cell(
             "max_workers": accuracy_cfg.get("max_workers"),
             "instance_timeout": accuracy_cfg.get("instance_timeout"),
         },
+        **backend_extra,
     }
 
 

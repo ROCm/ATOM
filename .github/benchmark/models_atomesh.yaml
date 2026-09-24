@@ -42,6 +42,22 @@ backends:
         port: 8000
         policy: random
         prometheus_port: 29100
+  vllm:
+    image: vllm/vllm-openai-rocm:nightly@sha256:91e381f072d6a44e1e4c97c82dce06e50e5189905cb3999a11471c5a8fc6a563
+    service:
+      prefill:
+        port: 2584
+        tp: 8
+      decode:
+        port: 2584
+        tp: 8
+      router:
+        port: 30000
+        policy: consistent_hash
+    vllm:
+      router:
+        image: vllm/vllm-router:nightly-20260912-83944c4@sha256:ac68315ab8642c253571316a7ac377df51794665e5c20fb95e7b84b40f9021e3
+        discovery_port: 36367
 
 models:
   DeepSeek-V4-Pro:
@@ -685,6 +701,128 @@ models:
       max_gen_toks: 512
       apply_chat_template: true
       threshold: 0.94
+
+  # InferenceX Kimi-K3 vLLM P/D recipe (MoRIIO + LMCache MP DRAM tier).
+  Kimi-K3-MXFP4-vLLM:
+    backend: vllm
+    model_path: "${ATOMESH_MODEL_ROOT}/moonshotai/Kimi-K3"
+    precision: MXFP4
+    env:
+      common:
+        VLLM_USE_V1: "1"
+        VLLM_ROCM_USE_AITER: "1"
+        VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4: "1"
+        AITER_SITUV2_A8W4: "1"
+        AITER_BF16_FP8_MOE_BOUND: "0"
+        VLLM_ROCM_AITER_MLA_ASM_PADDING: asm
+        SAFETENSORS_FAST_GPU: "1"
+        VLLM_SSM_CONV_STATE_LAYOUT: DS
+        AITER_QUICK_REDUCE_QUANTIZATION: INT4
+        PYTHONHASHSEED: "42"
+        PREFIX_CACHING_HASH_ALGO: sha256
+        VLLM_USE_DIRECT_DCP_A2A: "0"
+        VLLM_USE_DIRECT_DCP_Q_GATHER: "0"
+        VLLM_USE_DIRECT_DCP_KV_GATHER: "0"
+        VLLM_ALLOW_DCP_FULL_CUDAGRAPH: "1"
+        VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+        VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "1200"
+        VLLM_SERVER_DEV_MODE: "0"
+        VLLM_DISABLE_REQUEST_ID_RANDOMIZATION: "1"
+        PYTHONNOUSERSITE: "1"
+        PYTHONDONTWRITEBYTECODE: "1"
+        HSA_ENABLE_SDMA: "1"
+        MORI_IO_SQ_BACKOFF_TIMEOUT_US: "50000"
+        MORI_IO_QP_MAX_SEND_WR: "16384"
+        MORI_IO_QP_MAX_CQE: "32768"
+        MORI_IO_QP_MAX_SGE: "2"
+        MORI_IO_TC_DISABLE: "0"
+        MORI_RDMA_TC: "104"
+      prefill:
+        VLLM_USE_BREAKABLE_CUDAGRAPH: "1"
+        TORCH_NCCL_BLOCKING_WAIT: "0"
+        NCCL_BLOCKING_WAIT: "0"
+      decode:
+        VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+        TORCH_NCCL_BLOCKING_WAIT: "0"
+        NCCL_BLOCKING_WAIT: "0"
+    vllm:
+      served_model_name: Kimi-K3
+      fork:
+        repo: https://github.com/YukioZzz/vllm
+        sha: 710a6cbef37aa7b7fb88255e09795729483943ad
+        files:
+          - distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py
+          - distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py
+          - distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py
+          - distributed/kv_transfer/kv_connector/v1/moriio/moriio_layout.py
+          - v1/core/kv_cache_manager.py
+          - v1/core/sched/scheduler.py
+          - model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py
+          - model_executor/models/qwen3_dflash.py
+      lmcache:
+        wheel: https://github.com/LMCache/LMCache/releases/download/nightly-rocm-2026-09-09/lmcache-0.5.5.dev114%2Brocm7.2-cp312-cp312-manylinux_2_35_x86_64.whl
+        packages:
+          - sortedcontainers==2.4.0
+          - opentelemetry-exporter-prometheus==0.61b0
+          - cupy-rocm-7-0==14.1.1
+        native_debs:
+          - http://archive.ubuntu.com/ubuntu/pool/universe/g/gflags/libgflags2.2_2.2.2-2_amd64.deb
+          - http://archive.ubuntu.com/ubuntu/pool/universe/g/google-glog/libgoogle-glog0v5_0.5.0+really0.4.0-2_amd64.deb
+          - http://archive.ubuntu.com/ubuntu/pool/main/libj/libjsoncpp/libjsoncpp25_1.9.5-3_amd64.deb
+        port: 6555
+        http_port: 8090
+        mq_timeout: 6000
+        l1_size_gb: 1799
+        server_args: >-
+          --l1-init-size-gb 10 --l1-read-ttl-seconds 1800 --chunk-size 12288
+          --separate-object-groups --max-cpu-workers 8 --max-gpu-workers 8
+          --eviction-policy LRU --supported-transfer-mode lmcache_driven --shm-name ''
+    server:
+      common_args:
+        extra_args: >-
+          --moe-backend auto --load-format fastsafetensors --gpu-memory-utilization 0.88
+          --language-model-only --max-num-seqs 80 --enable-auto-tool-choice
+          --tool-call-parser kimi_k3 --reasoning-parser kimi_k3 --max-model-len 1048576
+          --stream-interval 10 --enable-prefix-caching --prefix-match-unit 128
+          --kv-cache-dtype fp8 --block-size 128 --max-num-batched-tokens 16384
+          --attention-config '{"mla_prefill_backend":"ROCM_AITER_FA","use_prefill_query_quantization":true}'
+          --attention-backend ROCM_AITER_MLA --dcp-comm-backend a2a --cp-kv-cache-interleave-size 1536
+    suites:
+      vllm:
+        - &kimi_k3_vllm_dcp8_lmcache
+          name: kimi-k3-vllm-1p1d-tp8-dcp8-agentic-lmcache-1m-c48
+          topology: 1p1d
+          display_topology: 1P1D-TP8-DCP8
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [48]
+          prefill:
+            workers: 1
+            tp: 8
+            dcp: 8
+            extra_args: >-
+              --compilation-config '{"mode":3,"cudagraph_mode":"PIECEWISE","max_cudagraph_capture_size":512,"custom_ops":["+fused_rms_norm_gated","+quant_fp8","+grouped_topk","+sparse_attn_indexer","none"],"cudagraph_capture_sizes":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,24,32,48,64,96,128,256,512]}'
+          decode:
+            workers: 1
+            tp: 8
+            dcp: 8
+            extra_args: >-
+              --compilation-config '{"mode":3,"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":4096,"custom_ops":["+fused_rms_norm_gated","+quant_fp8","+grouped_topk","+sparse_attn_indexer","none"],"cudagraph_capture_sizes":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,128,256,512,1024,2048,4096]}'
+          benchmark: &kimi_k3_vllm_aiperf
+            <<: *agentic_1m_aiperf
+            aiperf_commit: 754356e9a39acc6cc6afb242d123bb57c3fb6f75
+            apply_chat_template: false
+          run_eval: false
+
+        # InferenceX fast mode: one warmup request per lane, 20-minute profile.
+        - <<: *kimi_k3_vllm_dcp8_lmcache
+          name: kimi-k3-vllm-1p1d-tp8-dcp8-agentic-lmcache-1m-c48-fast
+          benchmark:
+            <<: *kimi_k3_vllm_aiperf
+            benchmark_duration: 1200
+            warmup_requests_per_lane: 1
 
   Kimi-K2.5-MXFP4:
     backend: atom

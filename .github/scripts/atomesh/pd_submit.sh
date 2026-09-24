@@ -280,6 +280,20 @@ if dropped:
 for key, value in exports.items():
     print(f"export {key}={q(value)}")
 
+
+def flatten(prefix, value):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from flatten(f"{prefix}_{key.upper()}", item)
+    elif isinstance(value, list):
+        yield prefix, " ".join(str(item) for item in value)
+    else:
+        yield prefix, value
+
+
+for key, value in flatten("ATOMESH_VLLM", cell.get("vllm", {})):
+    print(f"export {key}={q(value)}")
+
 for key, value in cell.get("env", {}).get("common", {}).items():
     print(f"export ATOMESH_ENV_{key}={q(value)}")
 for key, value in cell.get("env", {}).get("prefill", {}).items():
