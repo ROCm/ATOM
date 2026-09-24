@@ -18,9 +18,11 @@ workers already hold. Anything else -- a table cleared and refilled, a prefix
 privatised in place by `BlockManager.disown_claimed_prefix`, a request seen
 for the first time -- redraws the version and is sent in full.
 
-The workers rebuild their rows from their own cache. Decoding is driven by the
-payload's type, not by configuration, so a worker cannot disagree with the
-scheduler about which encoding is in use.
+The workers rebuild their rows from their own cache. Both sides are always on
+and decoding is driven by the payload's type, so there is no setting a worker
+could hold differently from the scheduler: whichever form a batch arrives in
+is the form it is read in, and a step the encoder cannot account for arrives
+as whole tables and resets both caches at once.
 """
 
 import array

@@ -259,25 +259,6 @@ them there.
   into an unauthenticated response. `top` and `types_per_owner` bound the two
   breakdowns.
 
-## Forward RPC block tables
-
-Every forward broadcasts one `ScheduledBatch` to every TP worker, and its
-`block_tables` dominate it: one row per running request, the whole row every
-step, one block longer than the step before. At 50 sequences by 100k context
-that is ~313k ids — pickled once and unpickled once per rank per step — to say
-something whose new content is 50 ids.
-
-`BlockTable` (`atom/model_engine/sequence.py`) carries a `version` that only a
-non-append mutation redraws, so the encoder never has to compare ids to know
-that a row merely grew: same version and a length of at least *n* proves the
-first *n* ids are the ones the workers already hold. A table that was cleared,
-truncated, or privatised in place by `BlockManager.disown_claimed_prefix`
-redraws its version and is sent whole.
-
-| Variable | Type | Default | Description |
-|----------|------|---------|-------------|
-| **ATOM_COMPACT_BLOCK_TABLE_RPC** | bool | 1 (true) | Send only the block ids appended since the previous step. Set `0` to send whole tables, which is the pre-encoding wire format. Read on the scheduler side only — an encoded batch is identified by its payload type, so no worker-side setting can disagree with it. The encoder falls back to whole tables, once with a debug log, for any batch it cannot tie to the tables it last published: a warmup batch with no tables, a batch whose rows were built by hand (rollout, disaggregation), or a row count that does not match the request count. |
-
 ## Incremental detokenizer
 
 Streaming decodes each delta from two `tokenizer.decode` calls that share a

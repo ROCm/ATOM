@@ -347,13 +347,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # stops collection while the watch still reports the healthy shape.
     # See tune_gc in atom/utils/gc_utils.py.
     "ATOM_GC_THRESHOLD": lambda: os.getenv("ATOM_GC_THRESHOLD", "").strip(),
-    # Whether a forward RPC carries each request's block table in full or only
-    # the block ids appended since the last step. Read by the scheduler side
-    # alone: an encoded batch announces itself by type, so the workers need no
-    # matching setting. See atom/model_engine/block_table_codec.py.
-    "ATOM_COMPACT_BLOCK_TABLE_RPC": lambda: (
-        os.getenv("ATOM_COMPACT_BLOCK_TABLE_RPC", "1") == "1"
-    ),
     # Whether the incremental detokenizer may reuse the delta it last emitted
     # in place of one of its two decodes per update. "auto" verifies at startup
     # that this tokenizer decodes a token span the same way wherever the window
