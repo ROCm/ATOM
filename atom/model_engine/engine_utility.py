@@ -6,6 +6,7 @@ import queue
 from typing import ClassVar
 
 from atom.model_engine.sequence import SequenceStatus
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -255,16 +256,19 @@ class EngineUtilityHandler:
         )
 
     def _handle_abort_request(self, args: dict):
-        """Mark a sequence ABORTED (client disconnected) so the scheduler finishes
-        it at the next step via the normal stop path (frees KV, drops it)."""
+        """Cancel queued work promptly; running forwards finish via postprocess."""
         req_id = args.get("req_id") if isinstance(args, dict) else None
         if req_id is None or self.scheduler is None:
             return
-        found = False
-        for seq in list(self.scheduler.running) + list(self.scheduler.waiting):
-            if seq.id == req_id:
-                seq.status = SequenceStatus.ABORTED
-                found = True
+        abort = getattr(self.scheduler, "abort_request", None)
+        if callable(abort):
+            found = abort(req_id)
+        else:
+            found = False
+            for seq in list(self.scheduler.running) + list(self.scheduler.waiting):
+                if seq.id == req_id:
+                    seq.status = SequenceStatus.ABORTED
+                    found = True
         logger.info(f"{self.label}: abort_request req_id={req_id} found={found}")
 
     def _handle_configure_hidden_states(self, args: dict):
@@ -513,7 +517,7 @@ class EngineUtilityHandler:
             ("UTILITY_RESPONSE", {"cmd": "get_cache_statistics", "result": result})
         )
 
-    def push_metrics(self) -> None:
+    def push_metrics(self, *, scheduler_metrics: bool = True) -> None:
         """Publish this rank's metrics snapshot on the output socket.
 
         Pushed on the engine's own clock rather than answered on demand. The
@@ -525,7 +529,12 @@ class EngineUtilityHandler:
         caller to mistake for its own. Pushing removes the deadline, and with it
         the last off-loop writer on the control socket.
         """
-        self.output_queue.put_nowait(("METRICS", self.collect_metrics()))
+        # Poll ready device events even after the final forward. Workers write
+        # native metrics directly; this RPC has no response payload.
+        if envs.ATOM_ENABLE_METRICS_DEVICE_TIMER and self.runner_mgr is not None:
+            self.runner_mgr.call_func("poll_forward_metrics")
+        if scheduler_metrics:
+            self.output_queue.put_nowait(("METRICS", self.collect_metrics()))
 
     def collect_metrics(self) -> dict:
         """One rank's scheduler, KV, MTP, and cache metrics."""
@@ -588,11 +597,29 @@ class EngineUtilityHandler:
                 "offload": offload,
             }
             if kv_pool is not None:
+                reusable = kv_pool.num_reusable_free
                 result |= {
                     "kv_blocks_used": kv_pool.num_used,
                     "kv_blocks_free": kv_pool.num_free,
                     "kv_blocks_total": kv_pool.num_blocks,
                     "kv_blocks_indexed": kv_pool.num_indexed,
+                    "kv_blocks_evictable": reusable,
+                    "kv_blocks_vacant": kv_pool.num_free - reusable,
+                }
+
+            metrics = getattr(self.scheduler, "metrics", None)
+            if metrics is not None:
+                parked = sum(
+                    seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+                    for seq in self.scheduler.waiting
+                )
+                # Shared-cache disaggregation has a separate prefill queue,
+                # whereas connector-based PD parks requests in `waiting`.
+                external = parked + len(getattr(self.scheduler, "prefill_waiting", ()))
+                result["scheduler_metrics"] = {
+                    "running": running,
+                    "waiting": max(0, waiting - external),
+                    "waiting_kv": external,
                 }
 
         return result

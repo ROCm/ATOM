@@ -32,6 +32,7 @@ from vllm.model_executor.models.interfaces_base import (
 from vllm.sequence import IntermediateTensors
 
 import atom  # noqa: F401
+from atom.model_ops.embed_head import empty_token_ids
 from atom.plugin.config import (
     _generate_atom_config_from_vllm_config,
     generate_atom_config_for_plugin_mode,
@@ -155,7 +156,7 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "Qwen3_5ForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5ForConditionalGeneration_",
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration_",
     "KimiK3ForConditionalGeneration": (
-        "atom.plugin.vllm.models.kimi_k3:KimiK3ForCausalLM"
+        "atom.plugin.vllm.models.kimi_k3:KimiK3ForConditionalGeneration_"
     ),
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2:MiniMaxM2ForCausalLM",
     "DeepseekV4ForCausalLM": "atom.plugin.vllm.models.deepseek_v4:DeepseekV4ForCausalLM",
@@ -506,7 +507,16 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 else:
                     self.model = model_cls(self.atom_config)
         else:
-            self.model = model_cls(self.atom_config)
+            if model_arch == "KimiK3ForConditionalGeneration":
+                # Kimi-K3's inner class inherits vLLM SupportsQuant. Passing
+                # VllmConfig lets that protocol apply its quant mapper and
+                # packed-module mappings before the vision modules are built.
+                self.model = model_cls(
+                    self.atom_config,
+                    vllm_config=vllm_config,
+                )
+            else:
+                self.model = model_cls(self.atom_config)
 
         num_patched_post_load_hooks = _patch_required_act_dtype_post_load_hooks(
             self.model,
@@ -1099,8 +1109,10 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         vLLM's ``LLMBaseProposer._greedy_sample`` calls this (when
         ``use_local_argmax_reduction`` is enabled) in place of
         ``compute_logits(...).argmax(-1)``. Bridge it to the draft model's
-        ``compute_draft_ids``, which returns ``[N]`` int64 token ids and is
-        token-identical to ``compute_logits(...).argmax(-1)``.
+        ``compute_draft_ids``, which is token-identical to
+        ``compute_logits(...).argmax(-1)`` but answers into int32 storage the
+        caller owns -- so supply it here and widen, because vLLM's caller was
+        written against that op's int64 return.
 
         Every arch delivers the ``O(2*tp)`` behaviour vLLM enables this flag
         for: each rank reduces its own logit shard to ``(max_val, global_idx)``
@@ -1112,7 +1124,8 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             hidden_states = _deepseek_v4_mtp_unflatten_hidden_states(
                 hidden_states, self.model
             )
-        return self.model.compute_draft_ids(hidden_states)
+        ids = empty_token_ids(hidden_states)
+        return self.model.compute_draft_ids(hidden_states, out=ids).to(torch.long)
 
 
 class ATOMForCausalLM(ATOMModelBase, VllmModelForTextGeneration): ...

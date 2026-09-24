@@ -218,6 +218,7 @@ if ! command -v sbatch >/dev/null 2>&1; then
 fi
 
 source "${REPO_ROOT}/.github/scripts/slurm_submit_helpers.sh"
+detect_slurm_backend
 install_slurm_cancel_traps
 
 SBATCH_CMD=(
@@ -241,7 +242,7 @@ fi
 SBATCH_CMD+=(
   --job-name "${SLURM_JOB_NAME}"
 )
-if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
+if [[ "${USES_SPUR_CONTROLLER}" == "1" && -n "${SPUR_CONTROLLER_ADDR}" ]]; then
   SBATCH_CMD+=(--controller "${SPUR_CONTROLLER_ADDR}")
 fi
 SBATCH_CMD+=(
@@ -290,6 +291,8 @@ echo "${JOB_ID}" | tee "${RESULT_DIR}/${PLUGIN_CI_CELL_ID}.slurm-job-id"
 write_slurm_cancel_helper "${JOB_ID}"
 
 set_slurm_job_log_paths "${JOB_ID}"
+SLURM_STATUS_DIR="${LOG_ROOT}/slurm_job-${JOB_ID}"
+SLURM_STATUS_RANKS="${NUM_NODES}"
 monitor_slurm_job "${JOB_ID}"
 read_slurm_exit_code "${JOB_ID}"
 SLURM_STATUS_FILE="${LOG_ROOT}/slurm_job-${JOB_ID}/slurm-job.rc"

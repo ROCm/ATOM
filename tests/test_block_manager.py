@@ -239,6 +239,65 @@ class TestAllocateDeallocate:
         assert block_manager.can_allocate(probe) >= 0
 
 
+class TestDeallocatePartial:
+    """`deallocate_partial` backs offload early block release (see
+    `atom.kv_transfer.offload.dense.connector.DenseOffloadScheduler.
+    protected_block_ids`): everything a pending save does not read frees now;
+    the rest is left allocated (an implicit lease) until `free_leased_blocks`.
+    """
+
+    def test_frees_everything_outside_the_protected_set(self, seq_factory):
+        cfg = MockConfig(num_kvcache_blocks=32, kv_cache_block_size=4)
+        bm = BlockManager(cfg)
+        seq = seq_factory(list(range(48)))  # 12 blocks of 4 tokens
+        bm.allocate(seq)
+        assert len(seq.block_table) == 12
+        protected = frozenset(seq.block_table[:8])  # B1..B8
+
+        bm.deallocate_partial(seq, protected)
+
+        assert len(seq.block_table) == 0
+        assert seq.num_cached_tokens == 0
+        # Protected blocks are still allocated (ref_count untouched) --
+        # nothing else can claim them until `free_leased_blocks`.
+        assert bm.kv.num_used == 8
+        for block_id in protected:
+            assert bm.kv.block(block_id).ref_count >= 1
+
+    def test_free_leased_blocks_returns_the_rest_to_the_pool(self, seq_factory):
+        cfg = MockConfig(num_kvcache_blocks=32, kv_cache_block_size=4)
+        bm = BlockManager(cfg)
+        seq = seq_factory(list(range(48)))
+        bm.allocate(seq)
+        protected = frozenset(seq.block_table[:8])
+        bm.deallocate_partial(seq, protected)
+        assert bm.kv.num_used == 8
+
+        bm.free_leased_blocks(protected)
+
+        assert bm.kv.num_used == 0
+
+    def test_incremental_release_of_two_chunk_sized_leases(self, seq_factory):
+        """B1-B2 become source-safe first; B3-B8 stay leased until later."""
+        cfg = MockConfig(num_kvcache_blocks=32, kv_cache_block_size=4)
+        bm = BlockManager(cfg)
+        seq = seq_factory(list(range(48)))
+        bm.allocate(seq)
+        table = list(seq.block_table)
+        chunk_1_2 = frozenset(table[0:2])
+        chunk_3_8 = frozenset(table[2:8])
+        bm.deallocate_partial(seq, chunk_1_2 | chunk_3_8)
+        assert bm.kv.num_used == 8
+
+        bm.free_leased_blocks(chunk_1_2)
+        assert bm.kv.num_used == 6
+        for block_id in chunk_3_8:
+            assert bm.kv.block(block_id).ref_count >= 1
+
+        bm.free_leased_blocks(chunk_3_8)
+        assert bm.kv.num_used == 0
+
+
 # ── Prefix caching ────────────────────────────────────────────────────────
 
 
@@ -1198,9 +1257,14 @@ class TestJointChunkProbeIsGated:
         assert bm._joint_chunk_tokens == 0
         assert "LMCache chunk size" not in caplog.text
 
-    def test_a_hosted_tier_still_probes_and_says_so_when_it_cannot_read(self, caplog):
+    def test_a_hosted_tier_still_probes_and_says_so_when_it_cannot_read(
+        self, caplog, monkeypatch
+    ):
         """The warning is worth printing exactly here: the tier is on, so a
         missing chunk size really does disable the joint KV load."""
+        import sys
+
+        monkeypatch.setitem(sys.modules, "lmcache.v1.config", None)
         with caplog.at_level(logging.WARNING, logger="atom"):
             bm = self._bm(
                 {
@@ -1209,7 +1273,6 @@ class TestJointChunkProbeIsGated:
                     "offload_layout": "kimi_k3",
                 }
             )
-        # lmcache is not installed in the unit-test environment, so the probe
-        # runs and fails -- which is the point: it ran.
+        # Exercise the missing dependency even in images with LMCache installed.
         assert bm._joint_chunk_tokens == 0
         assert "LMCache chunk size" in caplog.text

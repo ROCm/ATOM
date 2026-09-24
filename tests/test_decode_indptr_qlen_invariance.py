@@ -34,7 +34,7 @@ if not torch.cuda.is_available():
         allow_module_level=True,
     )
 
-from atom.model_ops.attentions.v4_pool_geometry import CSA_RATIO, HCA_RATIO
+from atom.model_ops.attentions.pool_layout.v4_pool_geometry import CSA_RATIO, HCA_RATIO
 from atom.model_ops.v4_kernels.paged_decode_indices import (
     build_v4_paged_decode_indptr,
 )
@@ -63,7 +63,7 @@ def _build(groups, t_pad=None):
     }
     out["csa_n_committed_per_token"] = torch.zeros(t_pad, dtype=torch.int32, device=DEV)
     build_v4_paged_decode_indptr(
-        batch_id_per_token=torch.tensor(batch_id, dtype=torch.int32, device=DEV),
+        batch_id_per_q_token=torch.tensor(batch_id, dtype=torch.int32, device=DEV),
         positions=torch.tensor(positions, dtype=torch.int64, device=DEV),
         T_pad=t_pad,
         win=WIN,

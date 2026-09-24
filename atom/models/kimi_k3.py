@@ -110,8 +110,6 @@ def _normalize_kimi_config(config) -> None:
     )
     config.kimi_full_attn_layers = [int(i) - 1 for i in lin.get("full_attn_layers", [])]
     config.kimi_kda_layers = [int(i) - 1 for i in lin.get("kda_layers", [])]
-    config.num_gdn_attn_state = len(config.kimi_kda_layers)
-    config.num_full_attn = len(config.kimi_full_attn_layers)
 
     # Keep the logical Q/K head width available to shared model infrastructure.
     config.head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim

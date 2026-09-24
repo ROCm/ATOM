@@ -227,7 +227,7 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
     for a prefill/mixed batch whose bucket was captured, ``x`` / ``positions``
     (and every downstream per-token projection) arrive padded to ``T_pad``, but
     the sparse-attention metadata is built for the *real* token count (the
-    bridge's prefill path sets ``batch_id_per_token`` to length == real tokens).
+    bridge's prefill path sets ``batch_id_per_q_token`` to length == real tokens).
 
     There are two eager entry points, and ``DeepseekV4Attention.forward`` picks
     between them by cudagraph mode, so BOTH must reconcile the padding:
@@ -268,7 +268,7 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
             attn_md = fc.attn_metadata
             if attn_md is not None and attn_md.state is not AttnState.DECODE:
                 num_in = x.size(0)
-                bid = attn_md.batch_id_per_token
+                bid = attn_md.batch_id_per_q_token
                 num_real = bid.shape[0] if bid is not None else num_in
                 if num_real < num_in:
                     out = super().forward_impl(x[:num_real], positions[:num_real])
@@ -288,7 +288,7 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
     ) -> torch.Tensor:
         # NARROW entry (see class docstring). The pieces upstream produced every
         # per-token tensor at the padded bucket width, but the sparse-attention
-        # metadata this half reads (`batch_id_per_token`, `kv_indptr_*`) is sized
+        # metadata this half reads (`batch_id_per_q_token`, `kv_indptr_*`) is sized
         # to the real token count -- and this is the half that reads it, so this
         # is where the two have to be reconciled. Clip in, pad out: the padded
         # width is what the piecewise output buffer and the graphed `_attn_post`
@@ -306,7 +306,7 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
             attn_md = fc.attn_metadata
             if attn_md is not None and attn_md.state is not AttnState.DECODE:
                 num_in = positions.size(0)
-                bid = attn_md.batch_id_per_token
+                bid = attn_md.batch_id_per_q_token
                 num_real = bid.shape[0] if bid is not None else num_in
                 if num_real < num_in:
 

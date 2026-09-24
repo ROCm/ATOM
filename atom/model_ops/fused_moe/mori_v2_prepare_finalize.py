@@ -47,6 +47,7 @@ from aiter.ops.flydsl.moe_common import GateMode
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 try:
@@ -193,6 +194,25 @@ def _cco_per_rank_vmm(
 # are config-wide, so the first layer's are the model's.
 _MEGA_TRANSPORTS: dict = {}
 
+# $ATOM_MEGA_COMBINE_WIRE, the return trip's counterpart to $MEGA_DISPATCH_WIRE
+# below, spelled the same bf16|fp8|fp4 way. Unlike the dispatch wire it is a
+# free choice: combine moves post-expert tokens, so nothing downstream demands
+# a particular width. aiter names the same formats after their MX block layout.
+#
+# PREFILL only -- the quant/dequant pair is a fixed per-token cost against a
+# saving that scales with the tokens on the wire, so decode asks for bf16 back.
+# See MoriV2PrepareAndFinalize.combine_quant_for_step.
+_COMBINE_WIRES = {"bf16": "none", "fp8": "mxfp8", "fp4": "mxfp4"}
+_MEGA_COMBINE_WIRE = envs.ATOM_MEGA_COMBINE_WIRE
+if _MEGA_COMBINE_WIRE not in _COMBINE_WIRES:
+    raise RuntimeError(
+        f"ATOM_MEGA_COMBINE_WIRE must be one of {sorted(_COMBINE_WIRES)}, "
+        f"got {_MEGA_COMBINE_WIRE!r}"
+    )
+# Read once, like the dispatch wire: this is consulted per layer per forward.
+_MEGA_COMBINE_QUANT = _COMBINE_WIRES[_MEGA_COMBINE_WIRE]
+
+
 # bf16 | fp8 | fp4, and it must MATCH the expert GEMM's A operand -- on gfx1250
 # that is fp4 unless AITER_FORCE_A8W4=1. A mismatch is a row-width error, not a
 # slow path. Read once: init_mega_transport runs per MoE layer (61x for V4-Pro).
@@ -226,6 +246,7 @@ def init_mega_transport(
     swiglu_limit: float,
     situ_beta: torch.Tensor | None = None,
     situ_linear_beta: torch.Tensor | None = None,
+    combine_quant: str = "none",
 ) -> Any:
     """Create (and share) the MegaMoE that runs every MoE layer of this model.
 
@@ -233,6 +254,12 @@ def init_mega_transport(
     GEMM recipe. Only the weights differ per layer and those are forward()
     arguments, so one instance covers the whole model. Which dispatch kernel it
     uses is aiter's own call (MEGA_DISPATCH=flydsl|mori).
+
+    ``combine_quant`` names the quantized return-trip format this transport is
+    to BUILD ($ATOM_MEGA_COMBINE_WIRE, in aiter's spelling). It is a capability, not
+    the choice: MegaMoE compiles a combine reduce for it and for bf16, and
+    every forward then names the one it wants -- bf16 unless it says otherwise.
+    See combine_quant_for_step.
     """
     key = (
         ep_rank,
@@ -249,8 +276,10 @@ def init_mega_transport(
         intermediate_pad,
         swiglu_limit,
         # Keyed on: the wire sets the payload width and whether the scale
-        # region exists.
+        # region exists, and combine_quant sets which combine reduces are
+        # built (the staging layout itself no longer depends on it).
         _MEGA_DISPATCH_WIRE,
+        combine_quant,
     )
     cached = _MEGA_TRANSPORTS.get(key)
     if cached is not None:
@@ -294,13 +323,25 @@ def init_mega_transport(
             if _MEGA_DISPATCH_WIRE in ("fp8", "fp4")
             else {}
         ),
+        # Only injected when asked for: an aiter without the combine-quant
+        # epilogue has no such kwarg and would raise TypeError on every run.
+        **({"combine_quant": combine_quant} if combine_quant != "none" else {}),
     )
+    # Peer-region stride in the flat symmetric VA. triton_mega_moe needs it to
+    # address the combine staging window, and MegaMoE does not keep it.
+    #
+    # Read HERE -- every rank is constructing its transport and the barrier
+    # below follows -- because create_dev_comm() may be COLLECTIVE while the
+    # forward that consumes this is NOT rank-aligned: the Triton experts are
+    # picked per step, so a lazy first-use read could have only some ranks
+    # enter the collective, and hang.
+    mega._atom_per_rank_size = int(comm.create_dev_comm().per_rank_size)
     comm.barrier()
     _MEGA_TRANSPORTS[key] = mega
     logger.info(
         "[MORI-V2] Created MegaMoE: ep_rank=%d ep_size=%d hidden=%d inter=%d "
         "experts=%d topk=%d M=%d act=%s gate=%s quant=%s pad=(%d,%d) "
-        "swiglu_limit=%s dispatch=%s wire=%s force_a8w4=%s",
+        "swiglu_limit=%s dispatch=%s wire=%s combine_quant=%s force_a8w4=%s",
         ep_rank,
         ep_size,
         hidden_dim,
@@ -316,6 +357,7 @@ def init_mega_transport(
         swiglu_limit,
         mega._config.dispatch_backend,
         mega._config.dispatch_wire,
+        combine_quant,
         # The other half of the pair: logged together so a mismatch is readable.
         os.environ.get("AITER_FORCE_A8W4", "0"),
     )
@@ -434,7 +476,38 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             swiglu_limit=float(getattr(layer, "swiglu_limit", 0.0)),
             situ_beta=getattr(layer, "activation_situ_beta", None),
             situ_linear_beta=getattr(layer, "activation_situ_linear_beta", None),
+            combine_quant=_MEGA_COMBINE_QUANT,
         )
+
+    @staticmethod
+    def combine_quant_for_step() -> str:
+        """This step's combine wire, named outright -- and DP-agreed.
+
+        The quantized wire is prefill-only: the quant/dequant pair is a fixed
+        per-token cost against a saving that scales with the tokens on the
+        wire, so it only pays off once the wire is busy.
+
+        Every rank has to name the SAME wire, and that is why `is_prefill`
+        cannot gate this on its own. Combine is P2P: gemm2's epilogue writes
+        this rank's rows into every PEER's arena in the format this rank
+        picked, and the peer's reduce reads them back in the format IT picked.
+        `is_prefill` is the local batch's (`ForwardMode.decide` never reduces
+        it), so on a ragged step a prefilling rank would scatter fp4 rows into
+        a decoding peer that reduces them as bf16 -- the same rank-local trap
+        select_mega documents. `running_tokens_are_unified` IS the group's
+        answer to "is anybody prefilling", so it is what opens the wire;
+        `is_prefill` then only speaks for dp_size==1, where it is the group.
+
+        No context (warmup, profile runs) counts as prefill -- that is the
+        shape those run at, and it exercises the quantized reduce before a
+        capture rather than first reaching it mid-serve.
+        """
+        context = get_forward_context().context
+        if context is None:
+            return _MEGA_COMBINE_QUANT
+        if context.is_prefill or not context.running_tokens_are_unified:
+            return _MEGA_COMBINE_QUANT
+        return "none"
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -469,12 +542,15 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         assert (
             not apply_router_weight_on_input
         ), "mori does not support apply_router_weight_on_input=True now."
-        assert (
-            self.mega is None
-        ), "the fused transport runs the layer in MoriV2ModularKernel.forward()"
 
         # bf16 dispatch, no wire quant: scales=None. indices carry global expert
-        # ids (0..global_num_experts-1); mori routes id -> rank = id // EPR.
+        # ids (0..global_num_experts-1); the transport routes id -> rank = id //
+        # EPR.
+        #
+        # Gather transport only. MegaMoE never reaches prepare()/finalize() any
+        # more: MoriV2ModularKernel.forward sends it to triton_mega_moe (Triton
+        # experts) or to MegaMoE's own forward (flydsl experts), and both own
+        # their dispatch and combine end to end.
         recv_x, recv_w, _recv_s, recv_idx, _total_recv_t, routing = self._op.dispatch(
             a1,
             topk_weights.to(torch.float32),
@@ -484,7 +560,7 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         )
         self._routing = routing
 
-        # Capture-safe: do NOT call total_recv_t.item() (a GPU->CPU sync that is
+        # Capture-safe: do NOT call _total_recv_t.item() (a GPU->CPU sync that is
         # illegal during cudagraph capture). fused_moe is handed the FULL
         # fixed-size arena buffers, aliased in place rather than sliced to the
         # received count, so the shapes stay static across capture/replay.
@@ -492,11 +568,28 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         dispatch_ids = recv_idx
         dispatch_weights = recv_w
 
-        # num_local_tokens is left unset (expert_num_tokens=None): the grouped
-        # a8w4 path derives per-expert routing from the (already trimmed) global
-        # ids + expert_mask, exactly as test_moe_layer_ep.py does.
+        # The received-row count, for whoever needs it as a row mask.
+        #
+        # flydsl fused_moe does NOT: the grouped a8w4 path derives per-expert
+        # routing from the (already trimmed) global ids + expert_mask, and its
+        # kernels skip the tail past the device-side count on their own -- which
+        # is the whole correctness argument in _recv_bound. So it stays
+        # None there, exactly as before.
+        #
+        # The Triton/gluon EP experts DO: ep_sort_routing hands this straight to
+        # _ep_gate_prep_scan_kernel, whose row mask is skipped entirely when it
+        # is None. The mori buffer always has M > R, so without it the garbage
+        # rows in [R, M) fold into the histogram as LIVE gates (on the rank
+        # owning global expert 0, a zeroed/stale id maps to local expert 0) and,
+        # under the scatter-fused combine, get delivered into staging slots
+        # belonging to real tokens. Silently wrong rather than an error.
+        #
+        # Capture-safe: a (1,) int32 device scalar, allocated once by the
+        # transport and re-zeroed per dispatch, so the pointer is stable across
+        # cudagraph capture/replay and nothing is read on the host.
         expert_tokens_meta = mk.ExpertTokensMetadata(
-            expert_num_tokens=None, expert_num_tokens_cpu=None
+            expert_num_tokens=(_total_recv_t if envs.ATOM_USE_TRITON_MOE else None),
+            expert_num_tokens_cpu=None,
         )
         return (
             dispatch_a1,
@@ -531,40 +624,39 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
 
     Both transports get the same grid shrink. The dispatch arena is padded to a
     huge static token_num (ws * max_num_inp_token_per_rank) while the received
-    tokens occupy only the first ``total_recv`` rows, so under a uniform
-    all-ranks-decode batch it is capped at the static ``running_tokens*topk*dp``
-    bound (the V1/base policy): the grid-bound aiter kernels (route-ksplit
-    preshuffle, gather-reduce) then launch a grid sized to the decode bucket
-    instead of the full arena, and the single-block route/psum kernels shrink too.
+    tokens occupy only the first ``total_recv`` rows, so it is capped at the
+    static ``sum(running_tokens_across_dp)`` bound (same as the base policy):
+    the grid-bound aiter kernels (route-ksplit preshuffle, gather-reduce) then
+    launch a grid sized to what the group actually sent instead of the full
+    arena, and the single-block route/psum kernels shrink too.
     Gather slices the buffers here; the fused path passes the bound down as
     ``recv_token_bound`` because it never sees them.
     """
 
-    def _decode_recv_bound(self, topk_ids: torch.Tensor, arena_rows: int) -> int | None:
-        """Static recv-row bound for a uniform decode batch, else None (no shrink).
+    def _recv_bound(self, arena_rows: int) -> int | None:
+        """Recv-row bound for this step, or None when it does not shrink.
 
         Correctness / capture-safety:
-          * ``running_tokens`` is a python int, fixed per captured graph, so the
-            bound is static across capture/replay and no GPU->CPU sync is needed
-            (unlike reading the device ``total_recv``).
-          * Under uniform decode each of ``dp`` ranks holds ``running_tokens``,
-            each routed to ``topk`` experts; worst case every route lands on this
-            rank, so ``total_recv <= running_tokens*topk*dp``. The bound therefore
-            never drops a valid row, and the aiter kernels' device-side
-            ``num_valid_routes`` guard still skips the exact within-buffer tail
-            [total_recv, bound).
-          * Mixed/prefill batches keep the full arena, matching the base-class
-            guard.
+          * The counts are python ints, fixed per captured graph, so the bound is
+            static across capture/replay and no GPU->CPU sync is needed (unlike
+            reading the device ``total_recv``).
+          * mori dispatch deduplicates per destination rank, so each source
+            rank contributes at most its own token count -- never that times
+            topk. ``total_recv <= sum(running_tokens_across_dp)``; the bound
+            therefore never drops a valid row, and the aiter kernels'
+            device-side ``num_valid_routes`` guard still skips the exact
+            within-buffer tail [total_recv, bound).
+            Why the sum and not ``running_tokens * dp``: see the base method.
         """
         context = get_forward_context().context
         if context is None:
             return None
-        tokens_unified = getattr(
-            context, "running_tokens_are_unified", not context.is_prefill
+        across_dp = context.running_tokens_across_dp
+        assert across_dp is not None, (
+            "an all2all MoE needs the group's per-rank counts to bound what its "
+            "dispatch delivered; this step reached it with none reduced"
         )
-        if not tokens_unified:
-            return None
-        bound = context.running_tokens * topk_ids.shape[1] * get_dp_group().world_size
+        bound = sum(across_dp)
         return bound if bound < arena_rows else None
 
     def _maybe_trim_dispatch_output(
@@ -576,7 +668,7 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         topk_ids: torch.Tensor,
         expert_tokens_meta,
     ):
-        bound = self._decode_recv_bound(topk_ids, dispatch_a1.shape[0])
+        bound = self._recv_bound(dispatch_a1.shape[0])
         if bound is not None:
             dispatch_a1 = dispatch_a1[:bound]
             dispatch_ids = dispatch_ids[:bound]
@@ -595,7 +687,74 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         **kwargs,
     ) -> torch.Tensor:
         mega = self.prepare_finalize.mega
-        if mega is None:
+        triton_experts = (kwargs.get("moe_extra_args") or {}).get("triton_experts")
+
+        # MegaMoE as transport, with OUR experts, driven from one place.
+        #
+        # The alternative -- and what runs when this is off -- is the normal
+        # prepare -> experts -> finalize walk, where prepare() calls MegaMoE's
+        # dispatch, GEMM2 delivers into its staging window and finalize() calls
+        # its combine. That works, but it spreads one layer's transport across
+        # three methods and needs a public transport-only API on MegaMoE
+        # (dispatch / combine_scatter_target / combine) that exists solely for
+        # ATOM. triton_mega_moe does the same three steps in one function
+        # against MegaMoE's internals instead, so aiter needs no such API and
+        # the dispatch/combine underneath can later be swapped for our own.
+        #
+        # Bit-identical to the walk it replaces (mega fp4 + a4w4, mega bf16 +
+        # a4w4, mega bf16 + a8w4 all match to the last bit). Off by default
+        # until it has run a real serve.
+        if mega is not None and triton_experts is not None:
+            from atom.model_ops.fused_moe_triton import triton_mega_moe
+
+            assert not kwargs.get(
+                "apply_router_weight_on_input", False
+            ), "mori does not support apply_router_weight_on_input=True now."
+            arena_rows = (
+                self.prepare_finalize.num_dispatchers() * mega.max_tokens_per_rank
+            )
+            bound = self._recv_bound(topk_ids, arena_rows)
+            # The "Direction-3" shrink, reproduced from the base-class walk: the
+            # bound leaves graph_bs*topk*dp rows, but mori de-duplicates per
+            # destination rank, so at most graph_bs*max_seqlen_q*dp can be live.
+            # Guarded by the same uniform-decode test, via `bound`: None there
+            # means a mixed/prefill batch, which keeps the full arena.
+            #
+            # Guarded on the unified-decode test below, NOT on `bound is not
+            # None`: _recv_bound also returns None when the bound would not
+            # actually shrink the arena, and the base walk still applies M_eff in
+            # that case. Keying off `bound` would silently skip the trim there.
+            # Same test and same quantity the base walk uses. Inlined rather
+            # than imported: the flag it mirrors is a local in moe.apply().
+            m_eff = None
+            _ctx = get_forward_context().context
+            if (
+                _ctx is not None
+                and not _ctx.is_prefill
+                and getattr(_ctx, "running_tokens_are_unified", True)
+            ):
+                m_eff = _ctx.running_tokens * get_dp_group().world_size
+            return triton_mega_moe(
+                mega,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                w1=triton_experts["w13_weight"],
+                w2=triton_experts["w2_weight"],
+                w1_scale=triton_experts["w13_scale"],
+                w2_scale=triton_experts["w2_scale"],
+                expert_map=kwargs.get("expert_map"),
+                n_local_experts=w1.size(0),
+                w13_swizzle_layout=triton_experts["w13_swizzle_layout"],
+                w2_swizzle_layout=triton_experts["w2_swizzle_layout"],
+                w1_bias=triton_experts.get("w1_bias"),
+                w2_bias=triton_experts.get("w2_bias"),
+                swiglu_limit=triton_experts.get("swiglu_limit", 10.0),
+                recv_token_bound=bound,
+                m_eff=m_eff,
+            )
+
+        if mega is None or triton_experts:
             return super().forward(
                 hidden_states, w1, w2, topk_weights, topk_ids, **kwargs
             )
@@ -617,10 +776,10 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
             bias2=kwargs.get("bias2"),
             a1_scale=kwargs.get("a1_scale"),
             a2_scale=kwargs.get("a2_scale"),
-            recv_token_bound=self._decode_recv_bound(
-                topk_ids,
+            recv_token_bound=self._recv_bound(
                 self.prepare_finalize.num_dispatchers() * mega.max_tokens_per_rank,
             ),
+            combine_quant=self.prepare_finalize.combine_quant_for_step(),
         )
 
     @staticmethod

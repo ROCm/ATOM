@@ -24,6 +24,10 @@ Two plan tensors are produced per `compress_ratio`:
                    downstream compressor forward will actually read). One row
                    per `update_compressor_states` kernel program.
 
+A caller that declares a `key_rope` buffer also gets `[N] int64` beside that
+ratio's compress plan: `(position // ratio) * ratio`, the group's first token
+and so where its index key is rotated. Declaring none costs nothing.
+
 Each plan is sliced to a kernel-grid length that depends on the mode: tight
 `num_compress` / `num_write` for eager, or a fixed `running_bs * per_seq_bound`
 for the decode CUDAGraph path (padding rows sentinel-filled). See
@@ -62,6 +66,41 @@ class CompressPlan:
     # Consumed by the indexer-FP8 path to derive a flat slot_mapping for
     # `indexer_k_quant_and_cache`. None for empty fwds.
     compress_plan_cpu: np.ndarray | None = None  # [num_compress, 4] int32 or None
+    # Where `fused_compress` rotated each group's main latent, so where that
+    # group's index key has to be rotated too -- anywhere else selects other
+    # rows. int64 because the RoPE ABI casts to it regardless.
+    key_rope_positions_gpu: torch.Tensor | None = None  # [≥num_compress] int64 or None
+
+
+def _publish_key_rope_positions(plan_buffers, ratio, compress_buffer, count):
+    """Where RoPE rotates each boundary's key, or None if nobody asked.
+
+    Read back from the compress buffer AFTER its sentinel tail is filled, so
+    sentinel rows get the same arithmetic the live ones do rather than a
+    constant that would have to be kept in agreement with it.
+    """
+    buffer = plan_buffers[ratio].get("key_rope")
+    if buffer is None:
+        return None
+    if count:
+        buffer.np[:count] = (compress_buffer.np[:count, 2] // ratio) * ratio
+    return buffer.copy_to_gpu(count)
+
+
+def plan_context_lens(
+    positions: np.ndarray, cu_seqlens_q: np.ndarray, extend_lens: np.ndarray
+) -> np.ndarray:
+    """`context_lens_cpu` for `make_compress_plans`, read off this step's positions.
+
+    The plan re-derives each token's position as `(ctx - extend) + j`, so `ctx`
+    must be the seq length THROUGH the last token this forward writes. Taking
+    the seq's first position from `positions` rather than recomputing an anchor
+    is what stops the plan from placing a token somewhere attention does not:
+    the two anchors differ by `full_q - len_i` on a DSpark ragged step, and by
+    nothing anywhere else.
+    """
+    bs = len(extend_lens)
+    return (positions[cu_seqlens_q[:bs]] + extend_lens).astype(np.int32)
 
 
 def make_compress_plans(
@@ -73,6 +112,7 @@ def make_compress_plans(
     running_bs: int | None = None,
     max_q_len: int | None = None,
     decode_capacity_per_ratio: dict[int, int] | None = None,
+    extra_write: int,
 ) -> dict[int, CompressPlan]:
     """Build a CompressPlan per (ratio, overlap) variant.
 
@@ -125,6 +165,21 @@ def make_compress_plans(
                     contiguous-from-base so data pointers stay stable; only
                     `shape[0]` shrinks. Buffers are always sized to the prefill
                     worst case.
+      extra_write: REQUIRED int — positions per seq the write plan keeps BEYOND
+                    `K_pool`, i.e. it retains `K_pool + extra_write`.
+                    `max_spec_steps` on a fwd that can be rolled back (decode /
+                    verify / its CG capture); `0` on prefill, which nothing
+                    rejects. Bounded above by the ring's own slack
+                    (`deepseek_v4_attn.ring_extra`), since the write kernel
+                    stores at `position % STATE_SIZE` unmasked and two positions
+                    a ring apart would race for one row.
+                    Required rather than defaulted, because `K_pool` is the READ
+                    width: a fwd wider than `K_pool` that keeps only its last
+                    `K_pool` positions silently drops its own tokens, and a
+                    rejection then reads back into positions nobody kept. That
+                    is invisible wherever `K_pool >= 1 + max_spec_steps` (V4: 8
+                    and 128), which is exactly why nobody should get it by
+                    default.
 
     Returns:
       dict[ratio] -> CompressPlan. On empty fwd (`extend_lens_cpu.sum() == 0`)
@@ -145,26 +200,25 @@ def make_compress_plans(
 
     def _slices(
         ratio: int,
-        is_overlap: bool,
+        K_pool_size: int,
         n_compress: int,
-        n_write: int,
         full_wcap: int,
     ) -> tuple[int, int]:
         """(compress_slice, write_slice) — the fixed-or-tight kernel-grid lengths
         for this ratio. Three modes:
           * running_bs set (uniform decode CG): both = `running_bs * per_seq_bound`
-            (compress ceil(qlen/ratio); write min(qlen,K_pool)) — content-
-            independent, so capture/replay dispatch identical shapes and the
-            `[n_actual, cap)` region is exactly the `[bs, running_bs)` padding.
+            (compress ceil(qlen/ratio); write qlen, since a bounded fwd keeps
+            every token it computed) — content-independent, so capture/replay
+            dispatch identical shapes and the `[n_actual, cap)` region is
+            exactly the `[bs, running_bs)` padding.
           * decode_capacity_per_ratio set (extend-shaped verify CG): compress =
             explicit cap; write = full buffer (fixed by buffer sizing).
           * neither (eager): compress = n_compress (tight); write = full buffer.
         """
         if running_bs is not None:
-            k_pool = (2 if is_overlap else 1) * ratio
             return (
                 running_bs * ((max_q_len + ratio - 1) // ratio),  # ceil(qlen/ratio)
-                running_bs * min(max_q_len, k_pool),
+                running_bs * min(max_q_len, K_pool_size),
             )
         if decode_capacity_per_ratio is not None:
             return decode_capacity_per_ratio[ratio], full_wcap
@@ -177,7 +231,8 @@ def make_compress_plans(
         for ratio, is_overlap in unique_ratios_overlap:
             cbuf = plan_buffers[ratio]["compress"]
             wbuf = plan_buffers[ratio]["write"]
-            ccap, wcap = _slices(ratio, is_overlap, 0, 0, wbuf.np.shape[0])
+            K = ratio * (2 if is_overlap else 1)
+            ccap, wcap = _slices(ratio, K + extra_write, 0, wbuf.np.shape[0])
             assert ccap <= cbuf.np.shape[0] and wcap <= wbuf.np.shape[0], (
                 f"ratio={ratio} empty-fwd caps (compress={ccap}, write={wcap}) "
                 f"exceed buffers ({cbuf.np.shape[0]}, {wbuf.np.shape[0]}); "
@@ -194,6 +249,9 @@ def make_compress_plans(
                 num_write=0,
                 cu_compress_cpu=np.zeros(max(bs, 1) + 1, dtype=np.int32),
                 compress_plan_cpu=None,
+                key_rope_positions_gpu=_publish_key_rope_positions(
+                    plan_buffers, ratio, cbuf, ccap
+                ),
             )
         return out
 
@@ -207,14 +265,25 @@ def make_compress_plans(
     prefix_lens = context_lens_cpu - extend_lens_cpu
     positions = prefix_lens[batch_ids] + j_in_seq
 
+    # Only `window_len` depends on the ratio, so the row block is built once and
+    # the loop rewrites that one column. Both selections below are boolean
+    # fancy-indexing, which numpy always materializes as a copy -- that is what
+    # lets the next ratio overwrite column 3 without reaching a plan this one
+    # already published. Keep them gathers.
+    plan_rows = np.empty((total, 4), dtype=np.int32)
+    plan_rows[:, 0] = ragged_ids
+    plan_rows[:, 1] = batch_ids
+    plan_rows[:, 2] = positions
+
     for ratio, is_overlap in unique_ratios_overlap:
         K = ratio * (2 if is_overlap else 1)
+        # What the write plan retains. `K_pool` alone is the READ width: a fwd
+        # wider than it would drop its own tokens, and a rejection would then
+        # read back into positions nobody kept.
+        K_pool_size = K + extra_write
         # window_len = K - min(j_in_seq + 1, K)
         # Number of leading K-loop iterations that go to state cache.
-        window_lens = np.maximum(0, K - np.minimum(j_in_seq + 1, K)).astype(np.int32)
-        plan_rows = np.stack(
-            [ragged_ids, batch_ids, positions, window_lens], axis=1
-        ).astype(np.int32)
+        plan_rows[:, 3] = np.maximum(0, K - np.minimum(j_in_seq + 1, K))
 
         # compress: token at a compression boundary
         compress_mask = (positions + 1) % ratio == 0
@@ -230,14 +299,15 @@ def make_compress_plans(
         np.cumsum(compress_counts, out=cu_compress[1:])
 
         # write: tokens whose absolute position falls in the per-seq
-        # "last STATE_SIZE positions" window. STATE_SIZE = K.
-        # write_start[i] = max(0, context_lens[i] - K) — uniform across overlap/non-overlap;
+        # "last STATE_SIZE positions" window (see `_ring_slots`).
+        # write_start[i] = max(0, context_lens[i] - STATE_SIZE) — uniform across
+        # overlap/non-overlap;
         # the SGLang formula `(seq_len // ratio) * ratio - (ratio if overlap else 0)`
         # is a stricter bound that includes only ratio-aligned writes; the looser
-        # `context_len - K` is what ATOM's update_compressor_states already uses
-        # (state_writes.py:152-154 docstring) and what the fused kernel's
+        # `context_len - STATE_SIZE` is what ATOM's update_compressor_states already
+        # uses (state_writes.py:152-154 docstring) and what the fused kernel's
         # state-cache reader expects.
-        write_starts = np.maximum(0, context_lens_cpu - K).astype(np.int32)
+        write_starts = np.maximum(0, context_lens_cpu - K_pool_size).astype(np.int32)
         write_mask = positions >= write_starts[batch_ids]
         write_plan = plan_rows[write_mask]
 
@@ -248,9 +318,7 @@ def make_compress_plans(
         wbuf = plan_buffers[ratio]["write"]
         full_ccap = cbuf.np.shape[0]
         full_wcap = wbuf.np.shape[0]
-        compress_slice, write_slice = _slices(
-            ratio, is_overlap, n_compress, n_write, full_wcap
-        )
+        compress_slice, write_slice = _slices(ratio, K_pool_size, n_compress, full_wcap)
         assert n_compress <= compress_slice <= full_ccap, (
             f"ratio={ratio} num_compress={n_compress}, slice={compress_slice}, "
             f"buffer={full_ccap}: invariant violated. CG path requires "
@@ -283,5 +351,8 @@ def make_compress_plans(
             num_write=n_write,
             cu_compress_cpu=cu_compress,
             compress_plan_cpu=compress_plan if n_compress > 0 else None,
+            key_rope_positions_gpu=_publish_key_rope_positions(
+                plan_buffers, ratio, cbuf, compress_slice
+            ),
         )
     return out

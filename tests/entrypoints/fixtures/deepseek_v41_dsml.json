@@ -1,0 +1,40 @@
+[
+  {
+    "text": "before<｜DSML｜ calls><｜DSML｜ invoke name=\"math::run\"><｜DSML｜ parameter name=\"data\" string=\"false\">{\"x\":[1,null,true]}</｜DSML｜ parameter><｜DSML｜ parameter name=\"message\" string=\"true\">  中文 😀\nquoted \"x\"  </｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>",
+    "content": "before",
+    "calls": [
+      {
+        "name": "math::run",
+        "arguments": {
+          "data": {
+            "x": [
+              1,
+              null,
+              true
+            ]
+          },
+          "message": "  中文 😀\nquoted \"x\"  "
+        }
+      }
+    ]
+  },
+  {
+    "text": "<｜DSML｜ calls><｜DSML｜ invoke name=\"search\"><｜DSML｜ parameter name=\"query\" string=\"true\">Tokyo</｜DSML｜ parameter></｜DSML｜ invoke><｜DSML｜ invoke name=\"math::run\"><｜DSML｜ parameter name=\"count\" string=\"false\">42</｜DSML｜ parameter><｜DSML｜ parameter name=\"enabled\" string=\"false\">false</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>",
+    "content": "",
+    "calls": [
+      {
+        "name": "search",
+        "arguments": {
+          "query": "Tokyo"
+        }
+      },
+      {
+        "name": "math::run",
+        "arguments": {
+          "count": 42,
+          "enabled": false
+        }
+      }
+    ]
+  }
+]

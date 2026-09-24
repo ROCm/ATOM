@@ -1,6 +1,7 @@
 {
   "default_scenarios": [
     {
+      "cadence": "weekly",
       "isl": 1024,
       "osl": 1024,
       "concurrency": [4, 8, 16, 32, 64, 128, 256, 512],
@@ -111,6 +112,28 @@
           "bench_args": "--num-prompts 20480 --num-warmups 256",
           "conc_min": 4096,
           "conc_max": 4096
+        }
+      ]
+    },
+    {
+      "display": "DeepSeek-V4.1-Flash",
+      "path": "deepseek-ai/DeepSeek-V4.1-Flash",
+      "prefix": "deepseek-v41-flash",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "",
+      "config": {
+        "tp": 4,
+        "kv_cache_dtype": "bf16",
+        "extra_args": "--index_cache_dtype fp8"
+      },
+      "variants": [
+        {
+          "label": "DSpark",
+          "suffix": "-dspark",
+          "extra_args": "--method dspark --num-speculative-tokens 5",
+          "bench_args": "--use-chat-template",
+          "conc_min": 4,
+          "conc_max": 256
         }
       ]
     },

@@ -22,10 +22,12 @@ from atom.model_ops.attention_mla import (
     triton_convert_req_index_to_global_index,
     triton_convert_req_index_to_global_index_dsa_prefill,
 )
+from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
 from atom.utils import envs, forward_context
 from atom.utils.custom_register import direct_register_custom_op
 
 from . import kpool
+from .geometry import speculative_verify_enabled
 
 
 def _kpool_request_index(cu_seqlens_q: torch.Tensor, n_tokens: int) -> torch.Tensor:
@@ -141,8 +143,38 @@ def _sparse_attn_indexer_kpool(
         raise NotImplementedError(
             "GLM-5.3 kpool does not support DCP/PCP; use dcp=pcp=1"
         )
-    if not context.is_prefill and attn_metadata.max_seqlen_q > 1:
-        raise NotImplementedError("GLM-5.3 kpool does not support speculative decode")
+    # The explicit scheduler field lives on the nested GDN metadata today. The
+    # ragged-query condition remains a fallback for other metadata builders.
+    gdn_metadata = getattr(attn_metadata, "gdn_metadata", None)
+    is_speculative_verify = speculative_verify_enabled(
+        is_prefill=context.is_prefill,
+        num_spec_decodes=getattr(gdn_metadata, "num_spec_decodes", 0),
+        max_seqlen_q=attn_metadata.max_seqlen_q,
+    )
+    if is_speculative_verify:
+        from .speculative import run_speculative_kpool_indexer
+
+        run_speculative_kpool_indexer(
+            attn_metadata,
+            kv_cache,
+            q_fp8,
+            k,
+            gate_score,
+            weights,
+            compress_ape,
+            tail_cache,
+            state_slot_idx_in,
+            state_slot_idx,
+            positions,
+            sparse_kv_indices_buffer,
+            index_kpool,
+            topk_tokens,
+            topk_out_width,
+            get_current_atom_config().kv_cache_block_size,
+            scale_fmt,
+            stable_topk,
+        )
+        return result
 
     device = hidden_states.device
     block_size = get_current_atom_config().kv_cache_block_size
@@ -232,16 +264,9 @@ def _sparse_attn_indexer_kpool(
         pool_ke = pool_ke.to(torch.int32)
         pool_topk = torch.empty((n_tokens, select_k), dtype=torch.int32, device=device)
 
-        budget_bytes = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB * 1024 * 1024
-        if budget_bytes > 0 and budget_bytes // (max_pools * 4) < n_tokens:
-            budget_rows = budget_bytes // (max_pools * 4)
-            chunk_rows = (
-                (budget_rows // 128) * 128
-                if budget_rows >= 128
-                else 1 << (max(1, budget_rows).bit_length() - 1)
-            )
-        else:
-            chunk_rows = n_tokens
+        chunk_rows = sparse_indexer_row_chunk(
+            n_tokens, max_pools, envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
+        )
 
         for start in range(0, n_tokens, chunk_rows):
             end = min(start + chunk_rows, n_tokens)
@@ -279,7 +304,7 @@ def _sparse_attn_indexer_kpool(
         triton_convert_req_index_to_global_index_dsa_prefill(
             attn_metadata.sparse_cu_seqlens_q,
             attn_metadata.sparse_kv_indptr,
-            attn_metadata.token_to_seq_idxs,
+            attn_metadata.batch_id_per_q_token,
             topk_indices,
             attn_metadata.block_tables,
             attn_metadata.cu_seqlens_k,

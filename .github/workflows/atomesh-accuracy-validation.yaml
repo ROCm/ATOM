@@ -105,8 +105,12 @@ jobs:
           current = level_map.get(event, "pr")
           allowed = {"pr": {"pr"}, "main": {"pr", "main"}, "nightly": {"pr", "main", "nightly"}}[current]
           models = json.load(open(".github/benchmark/models_accuracy.json", encoding="utf-8"))
+          # NOTE: Meta-Llama-3-8B-Instruct was this whitelist's only "pr" entry
+          # and has been removed from models_accuracy.json, so atomesh
+          # standalone currently validates nothing on a pull request. Promoting
+          # a replacement changes what every atomesh PR pays for, so it is left
+          # to the job owner rather than decided here.
           atomesh_levels = {
-              "Meta-Llama-3-8B-Instruct": "pr",
               "DeepSeek-R1-0528": "main",
               "DeepSeek-V4-Pro MTP": "nightly",
               "gpt-oss-120b": "nightly",
@@ -403,10 +407,11 @@ jobs:
           fi
       
       - name: Run ATOM accuracy test
-        timeout-minutes: 30
+        timeout-minutes: ${{ matrix.accuracy_timeout_minutes || 30 }}
         env:
           MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
           CLIENT_COMMAND: ${{ matrix.client_command || '' }}
+          ACCURACY_TIMEOUT_MINUTES: ${{ matrix.accuracy_timeout_minutes || 30 }}
         run: |
           set -euo pipefail
           echo ""
@@ -424,6 +429,7 @@ jobs:
           echo "========== Running accuracy test =========="
           docker exec \
             -e CLIENT_COMMAND="${CLIENT_COMMAND}" \
+            -e ACCURACY_TIMEOUT_MINUTES="${ACCURACY_TIMEOUT_MINUTES}" \
             -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
             -e GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
             -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
@@ -594,4 +600,3 @@ jobs:
       - name: Push dashboard data
         if: hashFiles('accuracy-benchmark-input.json') != ''
         run: git push origin gh-pages
-

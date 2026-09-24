@@ -55,6 +55,8 @@ def _plans(extend, context):
         np.asarray(context, dtype=np.int32),
         RATIOS_OVERLAP,
         plan_buffers=_buffers(),
+        # No ring slack: these cases are about composition, not rollback.
+        extra_write=0,
     )
 
 
@@ -175,7 +177,7 @@ def _swa_env():
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("swa_write is a Triton kernel; needs a real GPU")
-    from atom.model_ops.attentions.v4_pool_geometry import (
+    from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
         CSA_RATIO,
         DENSE_RATIO,
         HCA_RATIO,
