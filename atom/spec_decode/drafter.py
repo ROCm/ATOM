@@ -268,11 +268,22 @@ class Drafter(abc.ABC):
                 local_tokens = bs * self.draft_tokens_per_seq
                 context.scheduled_tokens = local_tokens
                 context.running_tokens = local_tokens
+                # DP-uniform, so every rank's row is `local_tokens`. An
+                # all2all MoE bounds its receive buffer by this table, and a
+                # capture without it bakes no bound at all.
+                dp_size = self.config.parallel_config.data_parallel_size
                 set_forward_context(
                     attn_metadata=attn_metadata,
                     atom_config=self.config,
                     context=context,
                     num_tokens=local_tokens,
+                    num_tokens_across_dp=(
+                        torch.full(
+                            (dp_size,), local_tokens, dtype=torch.int32, device="cpu"
+                        )
+                        if dp_size > 1
+                        else None
+                    ),
                 )
                 pool = pass_.warmup(bs, pool=pool, stream=stream)
         runner.graph_pool = pool
@@ -632,10 +643,18 @@ class Drafter(abc.ABC):
         # The answer travels, not the table it implies -- `make` owns both ways
         # of reaching one, and skipping its all_reduce is why this is worth
         # stating at all.
-        forward_context.dp_metadata = DPMetadata.make(
+        dp_metadata = DPMetadata.make(
             parallel_config,
             running_tokens,
             unified=running_tokens_are_unified,
+        )
+        forward_context.dp_metadata = dp_metadata
+        # The per-rank table travels with the height: an all2all MoE bounds
+        # what its dispatch delivered by this sum, and the target's table
+        # describes the verified tokens, not this pass.
+        cu_tokens = dp_metadata.cu_tokens_across_dp_cpu.tolist()
+        context.running_tokens_across_dp = tuple(
+            b - a for a, b in zip([0] + cu_tokens[:-1], cu_tokens)
         )
 
     def prepare_inputs(

@@ -1245,9 +1245,13 @@ def test_propose_puts_the_pass_on_the_path_its_own_shape_is_on(monkeypatch):
     p.config.parallel_config = types.SimpleNamespace(
         data_parallel_size=2, data_parallel_rank=0
     )
-    monkeypatch.setattr(
-        mod_drafter.DPMetadata, "make", staticmethod(lambda *a, **k: "dp_meta")
-    )
+    made = []
+
+    def _make(cfg, batchsize, *a, **k):
+        made.append(_uniform_dp_meta(batchsize, 2))
+        return made[-1]
+
+    monkeypatch.setattr(mod_drafter.DPMetadata, "make", staticmethod(_make))
     fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
     fc.context.is_prefill = True
     fc.dp_metadata = None
@@ -1255,7 +1259,18 @@ def test_propose_puts_the_pass_on_the_path_its_own_shape_is_on(monkeypatch):
 
     assert fc.context.running_tokens_are_unified is True
     assert fc.context.is_prefill is False
-    assert fc.dp_metadata == "dp_meta"
+    assert fc.dp_metadata is made[-1]
+    # The per-rank table describes the draft pass, not the verified tokens.
+    assert fc.context.running_tokens_across_dp == (fc.context.running_tokens,) * 2
+
+
+def _uniform_dp_meta(tokens_per_rank, dp_size):
+    """What `_publish_draft_shape` reads off a DPMetadata: the cumulative table."""
+    return types.SimpleNamespace(
+        cu_tokens_across_dp_cpu=torch.cumsum(
+            torch.full((dp_size,), tokens_per_rank, dtype=torch.int32), dim=0
+        )
+    )
 
 
 class _BareFlavor(mod_drafter.Drafter):
@@ -1296,7 +1311,7 @@ def test_a_height_the_group_did_not_agree_on_is_asked_for_not_declared(monkeypat
         seen["batchsize"] = batchsize
         seen["table"] = num_tokens_across_dp
         seen["unified"] = unified
-        return "dp_meta"
+        return _uniform_dp_meta(batchsize, 2)
 
     monkeypatch.setattr(mod_drafter.DPMetadata, "make", staticmethod(_make))
     fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
