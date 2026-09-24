@@ -130,7 +130,7 @@ jobs:
         with:
           name: atom-agentic-run-config-${{ github.run_attempt }}
           path: agentic-run-config/
-          retention-days: 30
+          retention-days: 15
           if-no-files-found: error
 
   benchmark:

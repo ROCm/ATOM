@@ -351,7 +351,7 @@ jobs:
           name: atom-benchmark-summary-v1-${{ github.run_attempt }}-${{ env.RESULT_FILENAME }}
           path: bundle-summaries/${{ env.RESULT_FILENAME }}/
           if-no-files-found: warn
-          retention-days: 30
+          retention-days: 15
 
       - name: Upload complete bundle
         id: bundle-full
@@ -362,7 +362,7 @@ jobs:
           path: benchmark-bundles/${{ env.RESULT_FILENAME }}/
           if-no-files-found: warn
           compression-level: 0
-          retention-days: 30
+          retention-days: 15
 
       - name: Save logs after launch or packaging failure
         if: failure() || cancelled()

@@ -216,7 +216,7 @@ def write_run_config(configs, inputs, event, output_dir):
             "",
             (
                 "Each GPU job links its summary, full bundle and available failure diagnostics. "
-                "Artifacts expire after 30 days (failure diagnostics: 14 days); "
+                "Artifacts expire after 15 days (failure diagnostics: 14 days); "
                 "download them for long-term storage or import into AgenticViewer."
             ),
             "",

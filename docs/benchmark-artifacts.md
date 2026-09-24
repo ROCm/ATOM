@@ -115,7 +115,7 @@ file pins the ATOM checkout and retains the preview flag; set `dry_run` to `fals
 to execute. Image/AITER refs still need pinning for version comparisons. Each
 GPU job also links its uploaded summary, full bundle and failure diagnostics;
 an uploaded full bundle can still be incomplete after a failed run. Configuration
-and data artifacts are retained for 30 days, diagnostics for 14 days; download
+and data artifacts are retained for 15 days (the repository limit), diagnostics for 14 days; download
 them before expiry for long-term storage.
 
 Model revision is read from the downloaded checkpoint's `.hf-revision` marker;
@@ -175,7 +175,7 @@ complete manifest for later detail downloads. Creating it verifies only summary
 files; full verification explicitly scans the complete bundle. The existing
 `benchmark-*` artifact holds the client's own JSON. Unpackaged failure evidence
 is uploaded before container cleanup. Original benchmark failures remain failures.
-Bundles retain for 30 days, diagnostics 14.
+Bundles retain for 15 days, diagnostics 14.
 
 ## Local operations
 
