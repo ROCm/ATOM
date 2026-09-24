@@ -84,6 +84,10 @@ on:
         type: string
         required: false
         default: ""
+      aiter_wheel_artifact_id:
+        description: "Optional wheel artifact from this run, resolved once by the caller"
+        type: string
+        default: ""
       aiter_commit:
         type: string
         required: false
@@ -136,6 +140,16 @@ jobs:
         with:
           ref: ${{ inputs.atom_commit || github.sha }}
 
+      - name: Validate AITER override selection
+        env:
+          AITER_REF: ${{ inputs.aiter_commit }}
+          AITER_ARTIFACT: ${{ inputs.aiter_wheel_artifact_id }}
+        run: |
+          if [[ -n "$AITER_REF" && -n "$AITER_ARTIFACT" ]]; then
+            echo "::error::Choose an AITER source ref or a wheel, not both"
+            exit 1
+          fi
+
       - name: Start container + download model
         uses: ./.github/actions/atom-bench-container
         with:
@@ -152,6 +166,29 @@ jobs:
             -e CONC=${{ env.CONC }} -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }}
             -e ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }}
             -e ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }}
+
+      - name: Prepare AITER wheel directory
+        if: ${{ inputs.aiter_wheel_artifact_id != '' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/benchmark-aiter-whl"
+          rm -f "$RUNNER_TEMP/benchmark-aiter-whl"/amd_aiter*.whl "$RUNNER_TEMP/benchmark-aiter-whl/SHA256SUMS"
+
+      - name: Download pinned AITER wheel
+        if: ${{ inputs.aiter_wheel_artifact_id != '' }}
+        uses: actions/download-artifact@v5
+        with:
+          artifact-ids: ${{ inputs.aiter_wheel_artifact_id }}
+          path: ${{ runner.temp }}/benchmark-aiter-whl
+          merge-multiple: true
+
+      - name: Verify and install requested AITER wheel
+        if: ${{ inputs.aiter_wheel_artifact_id != '' }}
+        env:
+          CONTAINER_NAME: atom-benchmark
+          AITER_WHL_DIR: ${{ runner.temp }}/benchmark-aiter-whl
+        run: |
+          (cd "$AITER_WHL_DIR" && sha256sum --check SHA256SUMS)
+          bash .github/scripts/install_aiter_wheel.sh
 
       - name: Reinstall AITER from requested ref
         if: ${{ inputs.aiter_commit != '' }}

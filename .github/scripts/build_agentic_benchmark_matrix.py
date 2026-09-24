@@ -115,6 +115,9 @@ def _load_configs(path):
 def build_configs(path=None, inputs=None):
     """Apply test overrides or select a subset of the nightly concurrency grid."""
     inputs = inputs or {}
+    from prepare_benchmark_aiter_wheel import validate_request
+
+    validate_request(inputs.get("aiter_wheel", ""), inputs.get("aiter_commit", ""))
     profile = inputs.get("profile") or "test"
     if profile not in PROFILE_CATALOGS:
         raise ValueError(f"Unknown agentic profile: {profile}")
@@ -233,7 +236,13 @@ def write_run_config(configs, inputs, event, output_dir, image_resolution=None):
             "env_vars": dict(
                 line.split("=", 1) for line in config["env_vars"].splitlines()
             ),
-            "aiter_ref": inputs.get("aiter_commit") or "image version",
+            "aiter_ref": inputs.get("aiter_commit") or None,
+            "aiter_wheel": inputs.get("aiter_wheel") or None,
+            "aiter_source": (
+                "override"
+                if inputs.get("aiter_commit") or inputs.get("aiter_wheel")
+                else "image version"
+            ),
             "enable_profiler": inputs.get("enable_profiler", False),
             "enable_rtl": inputs.get("enable_rtl", False),
         }

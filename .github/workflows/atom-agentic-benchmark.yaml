@@ -45,6 +45,10 @@ on:
         description: "Advanced: ATOM revision override — empty runs the branch selected above"
         type: string
         default: ""
+      aiter_wheel:
+        description: "Advanced: AITER wheel — latest, HTTPS .whl URL, or artifact:<ID>; empty keeps image version"
+        type: string
+        default: ""
       aiter_commit:
         description: "Advanced: AITER revision override — empty keeps the image version"
         type: string
@@ -60,6 +64,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: atom-agentic-${{ github.ref }}-${{ github.event_name }}
@@ -69,11 +74,12 @@ jobs:
   build-matrix:
     name: Build agentic benchmark matrix
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 30
     outputs:
       configs_json: ${{ steps.build.outputs.configs_json }}
       has_cells: ${{ steps.build.outputs.has_cells }}
       checkout_sha: ${{ steps.revision.outputs.sha }}
+      aiter_wheel_artifact_id: ${{ steps.aiter-upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -89,6 +95,22 @@ jobs:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: python3 .github/scripts/build_agentic_benchmark_matrix.py
+      - name: Download requested AITER wheel once
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.aiter_wheel != '' && inputs.dry_run != true }}
+        env:
+          AITER_WHEEL_REQUEST: ${{ inputs.aiter_wheel }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/prepare_benchmark_aiter_wheel.py
+      - name: Share pinned AITER wheel with all points
+        id: aiter-upload
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.aiter_wheel != '' && inputs.dry_run != true }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: atom-agentic-aiter-wheel-${{ github.run_attempt }}
+          path: aiter-whl/
+          compression-level: 0
+          retention-days: 15
+          if-no-files-found: error
       - name: Save run configuration
         uses: actions/upload-artifact@v7
         with:
@@ -126,5 +148,6 @@ jobs:
       extra_args: ${{ inputs.extra_args || '' }}
       atom_commit: ${{ needs.build-matrix.outputs.checkout_sha }}
       aiter_commit: ${{ inputs.aiter_commit || '' }}
+      aiter_wheel_artifact_id: ${{ needs.build-matrix.outputs.aiter_wheel_artifact_id }}
       enable_profiler: ${{ inputs.enable_profiler || false }}
       enable_rtl: ${{ inputs.enable_rtl || false }}

@@ -278,3 +278,36 @@ pure TP8 (DPA disabled), DSpark K3, GSM8K 5-shot with the chat template,
 concurrency 16, and an 8K model context. `eval_only=true` starts fresh services
 and runs evaluation without the performance workload or synthetic acceptance
 length. Per-sample evaluation logs are retained in the result artifacts.
+
+
+### Optional AITER wheel for manual agentic benchmarks
+
+`ATOM Agentic Benchmark` accepts an optional **aiter_wheel** input:
+
+| Value | Behavior |
+| --- | --- |
+| Empty (default) | Keep the image's installed AITER; no wheel download or install. Scheduled runs also keep the image version. |
+| `latest` | Resolve the latest main Python 3.12 wheel with the existing S3-manifest/GitHub-artifact fallback. |
+| HTTPS URL ending in `amd_aiter-…whl` | Download that specific wheel version. Use a wheel compatible with the selected image's Python/PyTorch/ROCm. |
+| `artifact:<ID>` | Download that immutable wheel artifact from ROCm/aiter (Python 3.12). |
+
+Do not combine `aiter_wheel` with `aiter_commit`: matrix construction rejects
+the conflict before allocating GPU jobs. A dry run validates and records the
+requested selector but does not download a wheel or allocate GPUs.
+
+For actual runs, the CPU matrix job downloads once and reads the package
+metadata without importing it. It shares one artifact, including the wheel,
+`selection.json` and `SHA256SUMS`, with every concurrency job. Each job verifies
+the checksum, installs without replacing image dependencies, and verifies that
+`aiter` imports from the installed distribution instead of an old source checkout.
+Download, checksum, installation or import errors stop the job before benchmarking.
+
+The Actions summary and `atom-agentic-run-config-<attempt>/run-config.json`
+record the requested selector, pinned URL/artifact ID, package version, filename
+and SHA-256. `dispatch-inputs.json` pins the resolved wheel for replay; a fresh
+manual dispatch with `aiter_wheel=latest` resolves a new wheel. These links/artifacts
+can expire according to upstream retention. The runtime AITER identity remains
+recorded in each benchmark bundle.
+
+CPU regression checks: `python -m pytest tests/test_benchmark_catalog.py
+tests/test_benchmark_aiter_wheel.py`.
