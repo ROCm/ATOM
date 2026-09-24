@@ -146,6 +146,18 @@ def run_staged_pipeline(
     """
 
     staging_buffer = state.staging_buffer
+    # The two staging streams are side streams; the model's forward runs on the
+    # device's default stream and is the producer of the KV a save reads and
+    # the consumer of the KV a load writes. The handshake below orders stage_a
+    # against stage_b and nothing else, so without this fence a pack can read a
+    # block whose attention write is still queued on the compute stream. The
+    # terminal synchronize covers the other direction for loads, but there is
+    # no host-side barrier in front of a save.
+    if stage_a.stream is not None:
+        compute_stream = torch.cuda.current_stream(device=state.device)
+        stage_a.stream.wait_stream(compute_stream)
+        if stage_b.stream is not None and stage_b.stream is not stage_a.stream:
+            stage_b.stream.wait_stream(compute_stream)
     # One stream orders the two stages by itself, so the handshake around them
     # is a no-op -- but only semantically. Each of the four calls still enters
     # the GPU runtime, and each of those releases the GIL and has to take it
