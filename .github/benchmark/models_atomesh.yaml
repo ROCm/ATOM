@@ -356,7 +356,7 @@ models:
               decode_max_num_batched_tokens: ""
               online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}'
               gpu_memory_utilization: 0.85
-              extra_args: "--level 3 --method mtp --num-speculative-tokens 3 --spec-decode-acceptance-rate 0.6633"
+              extra_args: "--level 3 --method mtp --num-speculative-tokens 3 --spec-decode-acceptance-length 2.99"
           prefill:
             workers: 1
             tp: 1
