@@ -27,9 +27,6 @@ name: LMCache ROCm torch 2.10 Wheel
 # them by URL and sha256.
 
 on:
-  # TEMP: exercise the build job on the PR branch before merge; revert this commit.
-  push:
-    branches: [ci/lmcache-rocm-torch210-wheel]
   workflow_dispatch:
     inputs:
       lmcache_commit:
@@ -54,7 +51,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: lmcache-rocm-wheel-${{ inputs.lmcache_commit || '05fc77a0a7ababd9a7f2e343a771bc4bbc5b65cb' }}
+  group: lmcache-rocm-wheel-${{ inputs.lmcache_commit }}
   cancel-in-progress: false
 
 env:
@@ -75,7 +72,7 @@ env:
 
 jobs:
   build:
-    name: Build and validate LMCache ${{ inputs.lmcache_commit || '05fc77a0a7ababd9a7f2e343a771bc4bbc5b65cb' }}
+    name: Build and validate LMCache ${{ inputs.lmcache_commit }}
     runs-on: ${{ inputs.runner || 'build-only-atom' }}
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -85,7 +82,7 @@ jobs:
     steps:
       - name: Check the requested commit
         env:
-          LMCACHE_COMMIT: ${{ inputs.lmcache_commit || '05fc77a0a7ababd9a7f2e343a771bc4bbc5b65cb' }}
+          LMCACHE_COMMIT: ${{ inputs.lmcache_commit }}
         run: |
           # A branch name would make the release say one thing and hold another
           # the next time someone reruns it.
@@ -103,7 +100,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: LMCache/LMCache
-          ref: ${{ inputs.lmcache_commit || '05fc77a0a7ababd9a7f2e343a771bc4bbc5b65cb' }}
+          ref: ${{ inputs.lmcache_commit }}
           path: lmcache-src
           # Tags are needed to derive the version from the last stable release.
           fetch-depth: 0
@@ -112,7 +109,7 @@ jobs:
         id: version
         working-directory: lmcache-src
         env:
-          LMCACHE_COMMIT: ${{ inputs.lmcache_commit || '05fc77a0a7ababd9a7f2e343a771bc4bbc5b65cb' }}
+          LMCACHE_COMMIT: ${{ inputs.lmcache_commit }}
         run: |
           set -euo pipefail
           base_tag=$(git tag --merged HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
@@ -212,7 +209,7 @@ jobs:
         run: |
           {
             echo "## LMCache ROCm torch 2.10 Wheel"
-            echo "- **LMCache commit**: [${{ inputs.lmcache_commit || '05fc77a0a7ababd9a7f2e343a771bc4bbc5b65cb' }}](https://github.com/LMCache/LMCache/commit/${{ inputs.lmcache_commit || '05fc77a0a7ababd9a7f2e343a771bc4bbc5b65cb' }})"
+            echo "- **LMCache commit**: [${{ inputs.lmcache_commit }}](https://github.com/LMCache/LMCache/commit/${{ inputs.lmcache_commit }})"
             echo "- **Version**: ${{ steps.version.outputs.version }}"
             echo "- **Wheel**: ${{ steps.wheel.outputs.wheel || '(build failed)' }}"
             echo "- **sha256**: ${{ steps.wheel.outputs.sha256 }}"
@@ -238,7 +235,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      LMCACHE_COMMIT: ${{ inputs.lmcache_commit || '05fc77a0a7ababd9a7f2e343a771bc4bbc5b65cb' }}
+      LMCACHE_COMMIT: ${{ inputs.lmcache_commit }}
       VERSION: ${{ needs.build.outputs.version }}
       RELEASE_TAG: ${{ needs.build.outputs.release_tag }}
       WHEEL: ${{ needs.build.outputs.wheel }}
