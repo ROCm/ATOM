@@ -36,7 +36,7 @@ class V4RoutingTest(unittest.TestCase):
                     sys.executable,
                     str(SCRIPTS / "pd_matrix.py"),
                     "--suite",
-                    "nightly",
+                    "weekly",
                     "--model",
                     "DeepSeek-V4-Pro-0813",
                     "--output",
@@ -69,7 +69,7 @@ start_router
             ["bash", "-eu", "-c", self.script],
             cwd=ROOT,
             env=dict(
-                self.env,
+                self.env | cell["env"]["common"],
                 ROUTER_POLICY=policy or service["router"]["policy"],
                 ATOMESH_MESH_BINARY="/test/atomesh",
                 ATOM_PD_RANK_MAPPING_POLICY="none",
@@ -92,20 +92,22 @@ start_router
     def test_all_v4_concurrencies_launch_cache_aware_on_both_roles(self):
         self.assertEqual(
             {tuple(cell["concurrency"]) for cell in self.cells},
-            {(128,), (192,), (256,)},
+            {(1,), (2,), (16,), (32,), (128,), (192,), (256,)},
         )
         expected = {
             "--policy": "cache_aware",
             "--prefill-policy": "cache_aware",
             "--decode-policy": "cache_aware",
             "--cache-threshold": "0.8",
-            "--balance-abs-threshold": "20",
             "--balance-rel-threshold": "2.0",
             "--eviction-interval": "300",
             "--atom-pd-rank-mapping-policy": "none",
         }
         for cell in self.cells:
             with self.subTest(concurrency=cell["concurrency"]):
+                expected["--balance-abs-threshold"] = (
+                    "40" if cell["concurrency"] == [256] else "20"
+                )
                 self.assertEqual(cell["service"]["router"]["policy"], "cache_aware")
                 args = self.router_args(cell)
                 self.assertIn("--dp-aware", args)
@@ -113,6 +115,33 @@ start_router
                 for flag, value in expected.items():
                     self.assertEqual(args.count(flag), 1)
                     self.assertEqual(args[args.index(flag) + 1], value)
+
+    def test_weekly_service_capacity_and_performance_settings(self):
+        for cell in self.cells:
+            with self.subTest(concurrency=cell["concurrency"]):
+                concurrency = cell["concurrency"][0]
+                slots = max(32, concurrency * 2)
+                self.assertEqual(cell["suite"], "weekly")
+                self.assertEqual(cell["num_nodes"], 2)
+                self.assertEqual(cell["server_args"]["max_num_seqs"], slots)
+                self.assertEqual(cell["server_args"]["decode_max_num_seqs"], slots)
+                self.assertEqual(
+                    cell["server_args"]["spec_decode_acceptance_length"], 3.01
+                )
+                self.assertFalse(cell["run_eval"])
+                self.assertFalse(cell["eval_only"])
+                for role in ("prefill", "decode"):
+                    service = cell["service"][role]
+                    self.assertEqual(service["workers"], 1)
+                    self.assertEqual(service["tp"], 8)
+                    self.assertIn("--enable-dp-attention", service["extra_args"])
+                    connector = cell["env"][role][f"{role.upper()}_KV_TRANSFER_CONFIG"]
+                    self.assertIn('"kv_connector":"mooncake"', connector)
+                    self.assertNotIn("lmcache", connector.lower())
+                self.assertEqual(
+                    json.loads(cell["service"]["decode"]["cudagraph"]),
+                    list(range(1, slots // 8 + 1)),
+                )
 
     def test_existing_agentic_dpa_default_remains_sticky(self):
         args = self.router_args(self.cells[0], policy="random")

@@ -374,7 +374,10 @@ def build_cell(
     eval_only = bool(suite_cfg.get("eval_only", False))
     if eval_only and not suite_cfg.get("run_eval", False):
         raise ValueError("eval_only requires run_eval=true")
-    if eval_only and accuracy_cfg.get("task", "gsm8k") not in {"gsm8k", "swebench_lite"}:
+    if eval_only and accuracy_cfg.get("task", "gsm8k") not in {
+        "gsm8k",
+        "swebench_lite",
+    }:
         raise ValueError("eval_only requires a supported accuracy task")
     return {
         "id": cell_id,

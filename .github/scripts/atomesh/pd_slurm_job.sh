@@ -38,7 +38,7 @@ elif [[ "${BENCHMARK_KIND:-random}" == "aiperf_agentic" \
   EXECUTION_PHASES=(benchmark eval)
 fi
 ATOMESH_RESTART_PORT_OFFSET="${ATOMESH_RESTART_PORT_OFFSET:-1000}"
-if [[ "${#EXECUTION_PHASES[@]}" -gt 1 && ! "${ATOMESH_RESTART_PORT_OFFSET}" =~ ^[1-9][0-9]*$ ]]; then
+if [[ " ${EXECUTION_PHASES[*]} " == *" eval "* && ! "${ATOMESH_RESTART_PORT_OFFSET}" =~ ^[1-9][0-9]*$ ]]; then
   echo "ERROR: ATOMESH_RESTART_PORT_OFFSET must be a positive integer" >&2
   exit 2
 fi
@@ -212,7 +212,7 @@ EOF
   echo "[network] rank=${rank} ip=${node_ip} NCCL_SOCKET_IFNAME=${nccl_socket_ifname} MORI_SOCKET_IFNAME=${mori_socket_ifname}"
 
   bounded_docker_rm "${container}"
-  if [[ "${execution_phase}" != "eval" ]]; then
+  if [[ "${execution_phase}" != "eval" || "${EVAL_ONLY:-false}" == "true" || "${EVAL_ONLY:-false}" == "1" ]]; then
     docker pull "${DOCKER_IMAGE}"
   fi
 
@@ -622,7 +622,7 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
         docker kill "${container}" >/dev/null 2>&1 || true
         docker rm -f "${container}" >/dev/null 2>&1 || true
       fi
-      if [[ "${execution_phase}" != "eval" ]]; then
+      if [[ "${execution_phase}" != "eval" || "${EVAL_ONLY:-false}" == "true" || "${EVAL_ONLY:-false}" == "1" ]]; then
         docker pull "'"${DOCKER_IMAGE}"'"
       fi
       mesh_binary="${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"

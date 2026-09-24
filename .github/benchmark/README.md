@@ -193,33 +193,50 @@ python .github/scripts/catalog.py --cells .github/benchmark/models.json   # prev
 
 ## V4 AgentX P/D without offload
 
-Use **Atomesh Benchmark** (`atomesh-benchmark.yaml`) with `suite=nightly`,
-`model_names=DeepSeek-V4-Pro-0813`, and `run_model_benchmark=true`.
-Leave `benchmark_concurrency` empty to keep the three independent cases at
-128, 192, and 256. Alternatively, select an individual case in `case_names`:
+The `DeepSeek-V4-Pro-0813` **weekly** suite runs on the existing TW schedule:
+Friday 16:00 UTC (Saturday 00:00 Beijing time). It covers seven independent
+concurrencies, **1, 2, 16, 32, 128, 192, and 256**, each with fresh services on
+two eight-GPU nodes (1P1D, TP8 with DPA).
 
-- `ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c128`
-- `ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c192`
-- `ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c256`
+To dispatch manually, select **Atomesh Benchmark** (`atomesh-benchmark.yaml`),
+`suite=weekly`, `model_names=DeepSeek-V4-Pro-0813`, and
+`run_model_benchmark=true`. Leave `benchmark_concurrency` empty to preserve the
+per-case service sizing and routing settings. To run one concurrency, set
+`case_names=ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c256`, replacing
+`256` with the desired concurrency. Choose the corresponding Slurm submit
+runner for the target cluster. The existing MI350X daily schedule is unchanged.
 
-Each case allocates two eight-GPU nodes (1P1D, TP8 with DPA), reuses the GLM
-AgentX AIPerf workload, and starts fresh services. Use the corresponding Slurm
-submit runner for the target cluster. The checkpoint is expected at
-`${ATOMESH_MODEL_ROOT}/deepseek-ai/DeepSeek-V4-Pro-0813/`. Crusoe uses the
-`model_path_by_runner` setting to select
+The checkpoint is expected at
+`${ATOMESH_MODEL_ROOT}/deepseek-ai/DeepSeek-V4-Pro-0813/`. The Crusoe runner
+`atomesh-cicd-mi355-crusoe` uses `model_path_by_runner` to select
 `/shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro-0813`.
-The workflow's existing image selection and `atomesh_image` override apply.
+The workflow's image selection and `atomesh_image` override apply.
 
 Serving follows the no-offload DPA settings in
 [`DeepSeek-V4-Agentic-PD-Max.md`](../../recipes/DeepSeek-V4-Agentic-PD-Max.md):
-FP8 KV, FP4 index cache, DSpark K3 with benchmark-only AL 3.01, and TBO on
-prefill only. P/D `max-num-seqs` is 256 / 384 / 512; decode captures dense
-per-rank sizes 1..32 / 1..48 / 1..64. All three V4 DPA cases explicitly use
-DP-aware `cache_aware` routing on both P and D. The launch script preserves this
-selection instead of replacing it with the GLM Agentic+DPA `dp_sticky` default.
-Cache threshold is 0.8, absolute/relative load thresholds are 20/2.0, and the
-eviction interval is 300 seconds, matching the InferenceX V4 baseline. TW uses
-P/D rank mapping `none`. Both KV connectors are plain Mooncake; there is no
-LMCache CPU/NVMe pool or THP/HIP/HSA override. Evals are
-disabled for these diagnostic throughput cases. GPU CI must still establish
-startup and throughput behavior.
+FP8 KV, FP4 index cache, DSpark K3, and TBO on prefill only. The weekly suite
+reuses the GLM AgentX AIPerf workload with **synthetic acceptance length 3.01**
+and evals disabled; its results measure performance, not accuracy.
+
+| Concurrency | P/D max-num-seqs | Decode graph sizes per DP rank | Cache-aware absolute / relative thresholds |
+| --- | --- | --- | --- |
+| 1, 2, 16 | 32 | 1..4 | 20 / 2.0 |
+| 32 | 64 | 1..8 | 20 / 2.0 |
+| 128 | 256 | 1..32 | 20 / 2.0 |
+| 192 | 384 | 1..48 | 20 / 2.0 |
+| 256 | 512 | 1..64 | 40 / 2.0 |
+
+All seven cases use DP-aware `cache_aware` on both P and D, cache threshold 0.8,
+and eviction interval 300 seconds. TW uses P/D rank mapping `none`.
+Both KV connectors are plain Mooncake, without LMCache CPU/NVMe offload.
+The global slot floor of 32 retains four decode slots per DP rank for the
+lowest concurrency cases. GPU runs are needed to establish performance for
+new concurrency settings.
+
+For a separate accuracy run, select `suite=accuracy`, the same model, and
+`run_model_benchmark=true`, or use
+`case_names=ds-v4-0813-1p1d-tp8-dspark3-gsm8k-only-c16`. This manual case uses
+pure TP8 (DPA disabled), DSpark K3, GSM8K 5-shot with the chat template,
+concurrency 16, and an 8K model context. `eval_only=true` starts fresh services
+and runs evaluation without the performance workload or synthetic acceptance
+length. Per-sample evaluation logs are retained in the result artifacts.

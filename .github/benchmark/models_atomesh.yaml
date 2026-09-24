@@ -1154,7 +1154,7 @@ models:
         state_checkpoint_interval_tokens: 8192
         extra_args: "--index-cache-dtype fp4 --attn-prefill-chunk-size 16384 --enable-prefix-caching"
     suites:
-      nightly:
+      weekly:
         # Follow GLM AgentX: a fresh P/D allocation for every concurrency.
         # Only plain Mooncake connectors; no LMCache CPU/NVMe offload pool.
         - &dsv4_0813_agentic_dpa_no_offload
@@ -1202,6 +1202,9 @@ models:
         - <<: *dsv4_0813_agentic_dpa_no_offload
           name: ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c256
           concurrency: [256]
+          env:
+            common:
+              ROUTER_BALANCE_ABS_THRESHOLD: "40"
           server:
             common_args:
               max_num_seqs: 512
@@ -1209,6 +1212,38 @@ models:
           decode:
             <<: *dsv4_0813_agentic_dpa_decode
             cudagraph: "[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64]"
+
+        # Keep at least 32 global slots for the low-concurrency DPA cases.
+        - &dsv4_0813_agentic_dpa_low_concurrency
+          <<: *dsv4_0813_agentic_dpa_no_offload
+          name: ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c1
+          concurrency: [1]
+          server:
+            common_args:
+              max_num_seqs: 32
+              decode_max_num_seqs: 32
+          decode:
+            <<: *dsv4_0813_agentic_dpa_decode
+            cudagraph: "[1,2,3,4]"
+
+        - <<: *dsv4_0813_agentic_dpa_low_concurrency
+          name: ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c2
+          concurrency: [2]
+
+        - <<: *dsv4_0813_agentic_dpa_low_concurrency
+          name: ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c16
+          concurrency: [16]
+
+        - <<: *dsv4_0813_agentic_dpa_low_concurrency
+          name: ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c32
+          concurrency: [32]
+          server:
+            common_args:
+              max_num_seqs: 64
+              decode_max_num_seqs: 64
+          decode:
+            <<: *dsv4_0813_agentic_dpa_decode
+            cudagraph: "[1,2,3,4,5,6,7,8]"
 
       # Manual accuracy suite: no performance workload or synthetic acceptance.
       accuracy:
