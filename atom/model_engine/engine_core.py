@@ -16,7 +16,10 @@ from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.async_proc import AsyncIOProcManager
-from atom.model_engine.dynamic_chunking import ChunkSizePredictor
+from atom.model_engine.dynamic_chunking import (
+    DYNAMIC_CHUNKING_POLL_STEPS,
+    ChunkSizePredictor,
+)
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
@@ -45,11 +48,6 @@ from atom.utils.gc_utils import (
 )
 
 logger = logging.getLogger("atom")
-
-# Engine steps between checks for a newly calibrated chunk latency model. The
-# workers do the timing and the fitting; this only paces the RPC that collects
-# the result, which is why it can be this frequent without costing anything.
-DYNAMIC_CHUNKING_POLL_STEPS = 32
 
 # Pace of the idle KV drain. The busy loops never block, so an unpaced drain
 # would fire one worker RPC round per spin; 1ms matches the PP head's existing
@@ -85,6 +83,10 @@ class EngineCore:
         )
         self.input_address = input_address
         self.output_address = output_address
+        # Overridden once KV is allocated, if this process was asked for
+        # dynamic chunking on a real pipeline. Default keeps the historical
+        # PP path: middle chunks retire locally, with no completion ack.
+        self._pp_chunk_completion = False
         # Control traffic arrives on its own socket so CoreManager can keep the
         # request socket single-writer; see CoreManager._send_request.
         self.control_address = config.parallel_config.control_address
@@ -147,7 +149,16 @@ class EngineCore:
             assert ret, "Failed to allocate kv cache"
 
             config.num_kvcache_blocks = num_blocks
-            if config.enable_dynamic_chunking and config.pipeline_parallel_size > 1:
+            # Sticky for the process. Downstream stages clear
+            # `enable_dynamic_chunking` below because they never size chunks,
+            # and the head clears `_dynamic_chunking_enabled` once calibration
+            # ends. Both ends of the PP completion ack have to keep agreeing
+            # after that, and a server that did not ask for the feature must
+            # not pay the ack on its default chunked-prefill path.
+            self._pp_chunk_completion = (
+                config.enable_dynamic_chunking and config.pipeline_parallel_size > 1
+            )
+            if self._pp_chunk_completion:
                 # Startup profiling only measures the chunk cost that carries no
                 # attention; the attention terms are calibrated from real
                 # prefills while serving, so no chunk is rebalanced until then.

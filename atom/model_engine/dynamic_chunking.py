@@ -82,6 +82,17 @@ MAX_CALIBRATION_PREDICTION_STDERR_FRACTION = 0.05
 # never going to arrive.
 MAX_CALIBRATION_FIT_FAILURES = 8
 
+# Sole-prefill requests sampled without ever seeing two chunk sizes, or polls
+# that see no sample at all. Either means the sweep cannot converge, and
+# leaving it up sizes every later sole prefill for a fit that will not arrive.
+MAX_CALIBRATION_REQUESTS_WITHOUT_DIVERSITY = 8
+MAX_CALIBRATION_POLLS_WITHOUT_SAMPLES = 16
+
+# Engine steps between checks for a newly calibrated chunk latency model. The
+# workers do the timing and the fitting; this only paces the RPC that collects
+# the result, which is why it can be this frequent without costing anything.
+DYNAMIC_CHUNKING_POLL_STEPS = 32
+
 # Ignore models that shrink the reference chunk by less than this fraction.
 MIN_USEFUL_SHRINK_FRACTION = 0.05
 
@@ -504,7 +515,9 @@ class ChunkSizePredictor:
         out both too large to be equal-latency and too numerous.
 
         Returns ``nan`` when the floor alone exceeds the budget: no chunk size
-        matches the first chunk's runtime, and the caller should stop shrinking.
+        matches the first chunk's runtime. ``predict`` turns that into ``None``,
+        and the scheduler keeps the fixed chunk instead of shrinking further —
+        a smaller chunk would pay this floor again on the next forward.
         """
         target = self.target_latency(base_chunk_size) - self.prefix_coeff * history_len
         if target <= 0.0:
@@ -601,6 +614,7 @@ class DynamicChunkingWorker:
         self._samples_seen = 0
         self._last_prefix = -1
         self._requests_seen = 0
+        self._calibration_polls = 0
         self._rng = np.random.default_rng(0)
 
     def profile(self) -> dict | None:
@@ -615,13 +629,29 @@ class DynamicChunkingWorker:
             return None
 
         alignment = max(runner.block_size, 64)
-        max_chunk = min(
-            config.max_num_batched_tokens,
-            config.max_model_len,
-            config.num_kvcache_blocks * runner.block_size,
-        )
+        # Stage-invariant. `num_kvcache_blocks` differs per PP stage (layer
+        # count and free memory), and a grid that is shorter on one stage than
+        # its neighbour deadlocks the sweep's send/recv before the ready signal.
+        max_chunk = config.max_num_batched_tokens
+        if config.max_model_len:
+            max_chunk = min(max_chunk, config.max_model_len)
         max_chunk -= max_chunk % alignment
         chunk_grid = profile_chunk_grid(alignment, max_chunk)
+        vocab_size = getattr(
+            getattr(runner, "hf_text_config", None), "vocab_size", None
+        )
+        if not isinstance(vocab_size, int) or vocab_size <= 0:
+            # Multimodal configs nest the text vocab under `text_config`.
+            # `hf_config.vocab_size` is missing there, and raising would kill
+            # the worker the way a bad block table used to.
+            reason = (
+                "Dynamic chunking profiling needs hf_text_config.vocab_size; "
+                f"got {vocab_size!r}"
+            )
+            logger.warning("%s: %s", runner.label, reason)
+            return {"error": reason} if runner.rank == 0 else None
+        self._profile_vocab_size = vocab_size
+
         if len(chunk_grid) < MIN_PROFILE_SAMPLES:
             # Report it like a failed fit rather than raising: too little room to
             # profile is a reason to serve with fixed chunking, not to fail startup.
@@ -677,8 +707,11 @@ class DynamicChunkingWorker:
         runner = self._runner
 
         def run(chunk_size: int) -> None:
+            # Time `forward` only. `flush_pp_send` waits until the next stage
+            # posts its recv, so folding it into the window puts downstream
+            # back-pressure into `b`. Runtime samples stop at `finish_sample`,
+            # before `commit_pp_send_work`, and the two windows have to match.
             runner.forward(self._dummy_batch(chunk_size))
-            runner.flush_pp_send()
 
         # Absorbs first-shape compilation and lazy communicator costs.
         run(chunk_grid[0])
@@ -689,12 +722,16 @@ class DynamicChunkingWorker:
             # Best of two limits straggler bias.
             best_ms = math.inf
             for _ in range(2):
+                # Drain the previous send outside the window, so this forward's
+                # async send is not waiting on the stage behind it.
+                runner.flush_pp_send()
                 torch.cuda.synchronize(runner.device)
                 start = time.perf_counter()
                 run(chunk_size)
                 torch.cuda.synchronize(runner.device)
                 best_ms = min(best_ms, (time.perf_counter() - start) * 1000.0)
             latencies_ms.append(best_ms)
+        runner.flush_pp_send()
         return latencies_ms
 
     def _dummy_batch(self, chunk_size: int) -> ScheduledBatch:
@@ -704,8 +741,13 @@ class DynamicChunkingWorker:
         runner = self._runner
         block_size = runner.block_size
         # Random tokens avoid an unrealistic single-expert MoE profile.
+        vocab_size = getattr(self, "_profile_vocab_size", None)
+        if not isinstance(vocab_size, int) or vocab_size <= 0:
+            vocab_size = getattr(
+                getattr(runner, "hf_text_config", None), "vocab_size", None
+            )
         tokens = self._rng.integers(
-            0, int(runner.config.hf_config.vocab_size), size=chunk_size, dtype=np.int64
+            0, int(vocab_size), size=chunk_size, dtype=np.int64
         ).tolist()
         seq = Sequence(tokens, block_size=block_size, id=-2)
         seq.status = SequenceStatus.RUNNING
@@ -738,6 +780,21 @@ class DynamicChunkingWorker:
         if calibrator is None:
             return {"coefficients": None}
         self._drain()
+        self._calibration_polls += 1
+        if self._calibration_stalled(calibrator):
+            # Not a rejected fit: the sweep never produced two chunk sizes, or
+            # no sole prefill was ever sampled. Either way more polls will not
+            # grow a design matrix, so stop timing and leave chunking fixed.
+            logger.warning(
+                "%s: giving up on dynamic chunking calibration with %d sampled "
+                "requests, %d chunk sizes, after %d polls; chunking stays fixed",
+                runner.label,
+                self._requests_seen,
+                calibrator.num_chunk_sizes,
+                self._calibration_polls,
+            )
+            self._calibrator = None
+            return {"coefficients": None, "gave_up": True}
         try:
             predictor = calibrator.maybe_fit()
         except ValueError as exc:
@@ -787,6 +844,17 @@ class DynamicChunkingWorker:
             ),
             "num_shapes": calibrator.num_shapes,
         }
+
+    def _calibration_stalled(self, calibrator: ChunkLatencyCalibrator) -> bool:
+        if (
+            self._requests_seen >= MAX_CALIBRATION_REQUESTS_WITHOUT_DIVERSITY
+            and calibrator.num_chunk_sizes < MIN_CALIBRATION_CHUNK_SIZES
+        ):
+            return True
+        return (
+            self._requests_seen == 0
+            and self._calibration_polls >= MAX_CALIBRATION_POLLS_WITHOUT_SAMPLES
+        )
 
     def start_sample(self, batch: ScheduledBatch | None) -> ChunkTimingSample | None:
         """Start timing ``batch`` if it is a single-request prefill worth a sample.

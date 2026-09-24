@@ -153,6 +153,16 @@ class PPEngineCoreProc(EngineCore):
         poll_ms = 0 if launched else _PP_HEAD_IDLE_POLL_MS
         while self._in_flight:
             scheduled_batch, seqs, needs_output = self._in_flight[0]
+            # Default PP retires a middle chunk locally. The completion ack is
+            # only for a server that asked for dynamic chunking: both stages
+            # captured that choice in `_pp_chunk_completion` before calibration
+            # or a failed profile could clear the sizing flag.
+            if not needs_output and not getattr(self, "_pp_chunk_completion", False):
+                self._in_flight.popleft()
+                self.scheduler.release_pp_inflight(scheduled_batch)
+                if getattr(self, "_defer_prefix_hash", False):
+                    self._pending_prefix_hash.append((scheduled_batch, seqs))
+                continue
             completion = self.pp_transport.recv_completion(timeout_ms=poll_ms)
             if completion is None:
                 break
@@ -173,6 +183,10 @@ class PPEngineCoreProc(EngineCore):
                 continue
 
             assert fwd_out is not None, "final PP chunk completed without output"
+            assert list(fwd_out.req_ids) == list(scheduled_batch.req_ids), (
+                f"PP token ordering violated: received {list(fwd_out.req_ids)}, "
+                f"expected FIFO head {list(scheduled_batch.req_ids)}"
+            )
             self._flush_pending_prefix_hashes()
             finished_seqs = self.scheduler.postprocess(
                 seqs.values(),
@@ -403,7 +417,10 @@ class PPEngineCoreProc(EngineCore):
                 if self.kv_transfer_enabled:
                     self._poll_and_send_kv_status()
 
-                if self.is_last:
+                if self.is_last and (
+                    batch.produces_output()
+                    or getattr(self, "_pp_chunk_completion", False)
+                ):
                     output = fwd_out if batch.produces_output() else None
                     self.pp_transport.send_completion(batch.req_ids, output)
         finally:

@@ -2144,17 +2144,26 @@ class Config:
                 )
                 self.dcp_config.enable_query_replication = False
         assert 1 <= self.pipeline_parallel_size
-        if not 0.0 <= self.dynamic_chunking_smooth_factor <= 1.0:
-            raise ValueError("dynamic_chunking_smooth_factor must be in [0, 1]")
-        if self.dynamic_chunking_min_chunk_size <= 0:
-            raise ValueError("dynamic_chunking_min_chunk_size must be positive")
         if self.enable_dynamic_chunking:
-            if self.pipeline_parallel_size <= 1:
-                raise ValueError("Dynamic chunking requires pipeline_parallel_size > 1")
-            if not self.enable_chunked_prefill:
-                raise ValueError(
-                    "Dynamic chunking requires enable_chunked_prefill=True"
+            # Checked only when the feature is on. A stale
+            # ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR in a shared launch script
+            # must not stop a server that never asked for dynamic chunking.
+            if not 0.0 <= self.dynamic_chunking_smooth_factor <= 1.0:
+                raise ValueError("dynamic_chunking_smooth_factor must be in [0, 1]")
+            if self.dynamic_chunking_min_chunk_size <= 0:
+                raise ValueError("dynamic_chunking_min_chunk_size must be positive")
+            if self.pipeline_parallel_size <= 1 or not self.enable_chunked_prefill:
+                # Same degrade-to-fixed path as a failed profile or a rejected
+                # fit. Raising here would make `--enable-dynamic-chunking` on a
+                # TP-only server a hard failure, unlike every other miss.
+                logger.warning(
+                    "Dynamic chunking needs pipeline_parallel_size > 1 and "
+                    "enable_chunked_prefill=True (got pp=%d, chunked_prefill=%s); "
+                    "leaving chunking fixed",
+                    self.pipeline_parallel_size,
+                    self.enable_chunked_prefill,
                 )
+                self.enable_dynamic_chunking = False
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
         )

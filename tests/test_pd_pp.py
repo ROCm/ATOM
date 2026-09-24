@@ -1019,7 +1019,113 @@ def test_pp_downstream_skips_forward_for_request_less_batch():
         c for c in stage.runner_mgr.call_func.call_args_list if c.args[0] == "forward"
     ]
     assert forwards == []
-    stage.pp_transport.send_tokens.assert_not_called()
+    stage.pp_transport.send_completion.assert_not_called()
+
+
+def _downstream_stage(**overrides):
+    stage = SimpleNamespace(
+        kv_transfer_enabled=False,
+        is_last=True,
+        _pp_chunk_completion=False,
+        runner_mgr=MagicMock(),
+        pp_transport=MagicMock(),
+        scheduler=MagicMock(),
+        utility_handler=MagicMock(),
+        utility_queue=MagicMock(),
+        _is_idle_rl_weights_offloaded=lambda: False,
+        _poll_and_send_kv_status=MagicMock(),
+    )
+    for key, value in overrides.items():
+        setattr(stage, key, value)
+    return stage
+
+
+def test_pp_downstream_skips_the_middle_chunk_ack_by_default():
+    """A middle chunk retires on the last stage without a completion message."""
+    PPEngineCoreProc = _pp_engine_core_cls()
+    batch = _fake_batch([7], None)
+    batch.produces_output = lambda: False
+    stage = _downstream_stage()
+    stage.pull_and_process_input_queue = MagicMock(side_effect=[False, True])
+    stage.pp_transport.recv_metadata.return_value = batch
+
+    PPEngineCoreProc._downstream_busy_loop(stage)
+
+    stage.pp_transport.send_completion.assert_not_called()
+
+
+def test_pp_downstream_acks_a_middle_chunk_when_dynamic_chunking_was_requested():
+    PPEngineCoreProc = _pp_engine_core_cls()
+    batch = _fake_batch([7], None)
+    batch.produces_output = lambda: False
+    stage = _downstream_stage(_pp_chunk_completion=True)
+    stage.pull_and_process_input_queue = MagicMock(side_effect=[False, True])
+    stage.pp_transport.recv_metadata.return_value = batch
+
+    PPEngineCoreProc._downstream_busy_loop(stage)
+
+    stage.pp_transport.send_completion.assert_called_once_with([7], None)
+
+
+def _head_for_batch(batch, *, pp_chunk_completion=False):
+    PPEngineCoreProc = _pp_engine_core_cls()
+    head = SimpleNamespace(
+        _in_flight=deque(),
+        _defer_prefix_hash=False,
+        _pp_chunk_completion=pp_chunk_completion,
+        pp_size=2,
+        kv_transfer_enabled=False,
+        output_queue=MagicMock(),
+        runner_mgr=MagicMock(),
+        pp_transport=MagicMock(),
+        scheduler=MagicMock(),
+        _poll_kv_transfer_progress=MagicMock(),
+        _dispatch_idle_offload_work=MagicMock(),
+        _poll_dynamic_chunking_calibration=MagicMock(),
+        _advance_idle_kv_transfer=MagicMock(),
+        _next_idle_kv_drain=0.0,
+    )
+    head.scheduler.schedule.side_effect = [(batch, {7: SimpleNamespace(id=7)}), None]
+    head.scheduler.take_rejected.return_value = None
+    head._dispatch_connector_only_batch = MagicMock()
+    return PPEngineCoreProc, head
+
+
+def test_pp_head_retires_a_middle_chunk_without_a_completion_ack():
+    batch = _fake_batch([7], None)
+    batch.produces_output = lambda: False
+    PPEngineCoreProc, head = _head_for_batch(batch)
+
+    PPEngineCoreProc._pp_head_step(head)
+
+    head.pp_transport.recv_completion.assert_not_called()
+    head.scheduler.release_pp_inflight.assert_called_once_with(batch)
+    assert len(head._in_flight) == 0
+
+
+def test_pp_head_acks_a_middle_chunk_when_dynamic_chunking_was_requested():
+    batch = _fake_batch([7], None)
+    batch.produces_output = lambda: False
+    PPEngineCoreProc, head = _head_for_batch(batch, pp_chunk_completion=True)
+    head.pp_transport.recv_completion.return_value = ([7], None)
+
+    PPEngineCoreProc._pp_head_step(head)
+
+    head.pp_transport.recv_completion.assert_called()
+    head.scheduler.release_pp_inflight.assert_called_once_with(batch)
+
+
+def test_pp_head_rejects_a_final_chunk_whose_tokens_are_out_of_order():
+    batch = _fake_batch([7], None)
+    batch.produces_output = lambda: True
+    PPEngineCoreProc, head = _head_for_batch(batch)
+    head.pp_transport.recv_completion.return_value = (
+        [7],
+        SimpleNamespace(req_ids=[8]),
+    )
+
+    with pytest.raises(AssertionError, match="PP token ordering violated"):
+        PPEngineCoreProc._pp_head_step(head)
 
 
 def test_dcp_block_descriptors_are_streamed_in_bounded_batches():

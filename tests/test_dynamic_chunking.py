@@ -8,6 +8,8 @@ import pytest
 from atom.model_engine.dynamic_chunking import (
     CALIBRATION_SWEEP_RATIO,
     MAX_CALIBRATION_FIT_FAILURES,
+    MAX_CALIBRATION_POLLS_WITHOUT_SAMPLES,
+    MAX_CALIBRATION_REQUESTS_WITHOUT_DIVERSITY,
     MAX_PREFIX_OVERHEAD_FRACTION,
     ChunkLatencyCalibrator,
     ChunkSizePredictor,
@@ -453,9 +455,36 @@ def _profiling_worker(block_size=64, vocab_size=1024):
     """A worker over the only runner attributes `_dummy_batch` reads."""
     runner = SimpleNamespace(
         block_size=block_size,
+        hf_text_config=SimpleNamespace(vocab_size=vocab_size),
         config=SimpleNamespace(hf_config=SimpleNamespace(vocab_size=vocab_size)),
     )
     return DynamicChunkingWorker(runner)
+
+
+def test_worker_gives_up_when_calibration_never_sees_two_chunk_sizes():
+    runner = SimpleNamespace(rank=0, label="pp0")
+    worker = DynamicChunkingWorker(runner)
+    worker._calibrator = ChunkLatencyCalibrator(B, C)
+    worker._requests_seen = MAX_CALIBRATION_REQUESTS_WITHOUT_DIVERSITY
+
+    fit = worker.take_fit()
+
+    assert fit["gave_up"] is True
+    assert fit["coefficients"] is None
+    assert worker._calibrator is None
+
+
+def test_worker_gives_up_when_polls_see_no_samples():
+    runner = SimpleNamespace(rank=0, label="pp0")
+    worker = DynamicChunkingWorker(runner)
+    worker._calibrator = ChunkLatencyCalibrator(B, C)
+
+    for _ in range(MAX_CALIBRATION_POLLS_WITHOUT_SAMPLES - 1):
+        assert worker.take_fit() == {"coefficients": None}
+    fit = worker.take_fit()
+
+    assert fit["gave_up"] is True
+    assert worker._calibrator is None
 
 
 def test_startup_profiling_batch_block_table_is_marshallable():

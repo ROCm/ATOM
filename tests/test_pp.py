@@ -672,7 +672,12 @@ def test_the_calibration_sweep_alternates_between_two_fixed_chunk_sizes():
     sched = _calibrating_sched(max_num_batched_tokens=1024)
 
     assert sched.dynamic_chunk_predictor is None
-    assert sched._prefill_chunk_for_budget(10000, 1024, 0, history_len=0) == 256
+    assert (
+        sched._prefill_chunk_for_budget(
+            10000, 1024, 0, history_len=0, draw_calibration=True
+        )
+        == 256
+    )
     # Later chunks of the same request keep the base its first chunk used.
     assert (
         sched._chunked_prefill_size(
@@ -680,7 +685,40 @@ def test_the_calibration_sweep_alternates_between_two_fixed_chunk_sizes():
         )
         == 256
     )
-    assert sched._prefill_chunk_for_budget(10000, 1024, 0, history_len=0) == 1024
+    # A sizing query that is not admitted does not burn the other arm.
+    assert (
+        sched._prefill_chunk_for_budget(
+            10000, 1024, 0, history_len=0, draw_calibration=True
+        )
+        == 256
+    )
+    sched._commit_calibration_arm()
+    assert (
+        sched._prefill_chunk_for_budget(
+            10000, 1024, 0, history_len=0, draw_calibration=True
+        )
+        == 1024
+    )
+
+
+def test_calibration_gives_up_when_the_sweep_arms_collapse():
+    # min_chunk_size at the batch budget leaves one aligned size, so the fit
+    # can never see two chunk sizes. Give up at init instead of sweeping.
+    sched = Scheduler(
+        _pp_config(
+            enable_dynamic_chunking=True,
+            dynamic_chunking_min_chunk_size=4096,
+            max_num_batched_tokens=4096,
+        )
+    )
+
+    assert sched._calibrating is False
+    assert (
+        sched._prefill_chunk_for_budget(
+            10000, 4096, 0, history_len=0, draw_calibration=True
+        )
+        == 4096
+    )
 
 
 def test_the_calibration_sweep_ends_with_a_rejected_model():
