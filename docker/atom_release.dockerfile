@@ -4,7 +4,7 @@ ARG BASE_IMAGE="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0
 ARG GPU_ARCH="gfx942;gfx950"
 # LMCache wheel image (FROM scratch, one wheel at /), pinned by digest. See the
 # LMCache section of atom_image.
-ARG LMCACHE_WHEEL_IMAGE="rocm/atom-dev:lmcache-v0.5.6.dev98-g05fc77a0-rocm-torch210@sha256:PENDING"
+ARG LMCACHE_WHEEL_IMAGE="rocm/atom-dev:lmcache-v0.5.6.dev98-g05fc77a0-rocm-torch210@sha256:d3cfe74f42d78a188992cae98efbe23053610216e7b247632d6be772e9d465d6"
 # ROCm 10 flavor: pass --build-arg BASE_IMAGE=rocm10-base to build the whole
 # image on the pip-installed ROCm 10 SDK below instead of the rocm/pytorch
 # apt image. All ROCm 10 component versions are ARGs so the 10.1 tracking

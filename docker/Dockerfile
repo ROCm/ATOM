@@ -5,7 +5,7 @@ ARG SGLANG_BASE_IMAGE="rocm/atom-dev:latest"
 ARG GPU_ARCH="gfx942;gfx950"
 # LMCache wheel image (FROM scratch, one wheel at /), pinned by digest. See the
 # LMCache section of atom_image.
-ARG LMCACHE_WHEEL_IMAGE="rocm/atom-dev:lmcache-v0.5.6.dev98-g05fc77a0-rocm-torch210@sha256:PENDING"
+ARG LMCACHE_WHEEL_IMAGE="rocm/atom-dev:lmcache-v0.5.6.dev98-g05fc77a0-rocm-torch210@sha256:d3cfe74f42d78a188992cae98efbe23053610216e7b247632d6be772e9d465d6"
 
 # OOT image extends an ATOM base image that already contains atom/aiter/mori.
 FROM ${OOT_BASE_IMAGE} AS atom_oot
