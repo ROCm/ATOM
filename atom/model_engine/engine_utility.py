@@ -316,16 +316,24 @@ class EngineUtilityHandler:
         """Fix the window for one run from the request, else the launch flags.
 
         ``int()`` because the counters step by one, and a float would miss
-        the zero they stop at.
+        the zero they stop at. Returns an error message, or None, and only
+        pins the window when there is nothing to report.
         """
         delay = args.get("delay_iters")
         max_iters = args.get("max_iters")
-        self._effective_delay_iters = (
-            self.profiler_delay_iters if delay is None else int(delay)
-        )
-        self._effective_max_iters = (
-            self.profiler_max_iters if max_iters is None else int(max_iters)
-        )
+        delay = self.profiler_delay_iters if delay is None else int(delay)
+        max_iters = self.profiler_max_iters if max_iters is None else int(max_iters)
+        if delay < 0 or max_iters < 0:
+            # The HTTP body is validated, but this is also reachable from
+            # `LLMEngine.start_profile`, and a negative delay counts away
+            # from zero: the window would never open.
+            return (
+                "A profiling window cannot be negative: "
+                f"delay_iters={delay}, max_iters={max_iters}."
+            )
+        self._effective_delay_iters = delay
+        self._effective_max_iters = max_iters
+        return None
 
     def _reserve_window(self, token, args: dict) -> dict:
         """Agree to record for *token*; no profiler is started here.
@@ -353,8 +361,13 @@ class EngineUtilityHandler:
             }
             logger.warning(f"{self.label}: {result['error']}")
             return result
+        error = self._resolve_window(args)
+        if error is not None:
+            logger.warning(f"{self.label}: {error}")
+            return {"error": error}
         self._profiler_reservation = token
-        self._resolve_window(args)
+        # The run that failed is over; its error must not reach this one.
+        self._profiler_last_error = None
         return {"reserved": True}
 
     def _commit_window(self, token) -> dict:
@@ -443,23 +456,25 @@ class EngineUtilityHandler:
                 self._profiler_deferred = "stop"
 
     def apply_deferred_profiler_action(self):
-        """Act on a window boundary `profiler_step` reached, if any.
-
-        On a PP head this lands at the end of the pass rather than mid-burst,
-        so a window closes on whole pipeline waves.
-        """
+        """Act on a window boundary `profiler_step` reached, if any."""
         action, self._profiler_deferred = self._profiler_deferred, None
-        if action == "stop":
-            self._stop_profiler_now()
-        elif action == "start":
-            try:
+        if action is None:
+            return
+        try:
+            if action == "start":
                 self._start_profiler_now()
-            except Exception as e:
-                # Store the error and disable the profiler
-                self._profiler_active = False
-                self._profiler_recorded = 0
-                self._profiler_last_error = f"profiler auto-start failed: {e}"
-                logger.exception(f"{self.label}: profiler auto-start failed")
+            else:
+                self._stop_profiler_now()
+        except Exception as e:
+            # Nobody is waiting on this: the caller was answered when the
+            # window was armed. Leave the engine idle rather than stuck
+            # recording, and keep the reason for the next /stop_profile.
+            self._profiler_active = False
+            self._profiler_recorded = 0
+            self._profiler_pending = 0
+            self._profiler_reservation = None
+            self._profiler_last_error = f"profiler auto-{action} failed: {e}"
+            logger.exception(f"{self.label}: profiler auto-{action} failed")
 
     # ------------------------------------------------------------------
     # MTP statistics

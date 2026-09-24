@@ -311,15 +311,24 @@ class LLMEngine:
                 delay_iters=delay_iters,
                 max_iters=max_iters,
             )
-        except TimeoutError:
+        except Exception:
             # A reservation nobody releases refuses every later
-            # /start_profile until the server restarts.
-            self._broadcast_utility("release_profile", token=token)
+            # /start_profile until the server restarts, and an engine can
+            # have taken one however the round failed. Sent without waiting:
+            # the engine that just failed to answer would hide this error
+            # behind a second one.
+            self.core_mgr.broadcast_utility_command("release_profile", token=token)
             raise
         if any("error" in result for result in reserved):
             self._broadcast_utility("release_profile", token=token)
             return reserved
-        return self._broadcast_utility("commit_profile", token=token)
+        try:
+            return self._broadcast_utility("commit_profile", token=token)
+        except Exception:
+            # Engines that did commit are recording behind a /start_profile
+            # that failed, and nothing else will close their window.
+            self.core_mgr.broadcast_utility_command("stop_profile")
+            raise
 
     def stop_profile(self) -> list[dict[str, Any]]:
         return self._broadcast_utility(

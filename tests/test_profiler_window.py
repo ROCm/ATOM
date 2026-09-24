@@ -56,6 +56,7 @@ NOT_FORWARD = frozenset(
         "import_kv_cache_ipc_handle",
         "import_model_weight_ipc_handles",
         "process_kvconnector_output",
+        "release_multimodal_requests",
     }
 )
 
@@ -249,6 +250,55 @@ def test_a_failed_auto_start_leaves_the_engine_idle_and_says_so():
     assert "error" not in broadcast(one, "stop_profile")[0], "a stale error"
 
 
+def test_a_failed_auto_stop_leaves_the_engine_idle_and_says_so():
+    """The export runs with nobody waiting on it, and `_stop_profiler_now`
+    clears the window only once it returns.
+    """
+    handler, mgr = make_handler(max_iters=2, fail_on="stop_profiler")
+    one = [(handler, mgr)]
+
+    start_window(one)
+    run_steps(handler, 2)
+
+    assert mgr.calls == ["start_profiler", "stop_profiler"]
+    assert not handler._profiler_active, "a window still open refuses every new run"
+
+    mgr.fail_on = None
+    assert "auto-stop failed" in broadcast(one, "stop_profile")[0]["error"]
+    assert "error" not in start_window(one)[0], "the engine is wedged, not idle"
+
+
+def test_a_new_run_does_not_inherit_the_last_failure():
+    """The failure is reported by whoever stops next, so a run that is armed
+    and then stopped before it starts would be handed the previous one's.
+    """
+    handler, mgr = make_handler(delay=1, fail_on="start_profiler")
+    one = [(handler, mgr)]
+
+    start_window(one)
+    run_steps(handler, 1)
+
+    mgr.fail_on = None
+    start_window(one)
+    assert "error" not in broadcast(one, "stop_profile")[0]
+
+
+def test_a_negative_window_is_refused():
+    """The request body is validated, but `LLMEngine.start_profile` is a
+    public method: a negative delay counts away from zero and never opens.
+    """
+    handler, mgr = make_handler(max_iters=5)
+    one = [(handler, mgr)]
+
+    assert "error" in start_window(one, body={"delay_iters": -1})[0]
+    assert not mgr.calls, "a refused window reached the workers"
+
+    # Refusing must not disturb the window the flags describe.
+    assert "error" not in start_window(one)[0]
+    run_steps(handler, 5)
+    assert mgr.calls == ["start_profiler", "stop_profiler"]
+
+
 def test_the_transition_is_sent_from_the_busy_loop_not_the_forward_hook():
     """Every busy loop checks the utility queue, so that check is what sends
     the RPC: from the hook it would be a second call on the queues the
@@ -415,21 +465,26 @@ class FakeCoreMgr:
     """Records the rounds `LLMEngine` broadcasts.
 
     `refuse` is the index of an engine that reports a conflict on reserve;
-    `timeout` makes the reserve round raise, as the real broadcast does when
-    an engine stops answering.
+    `timeout_on` is the round that raises, as the real broadcast does when an
+    engine stops answering. Rounds sent without waiting are kept apart in
+    `sent`, since those are the ones that cannot hang.
     """
 
-    def __init__(self, engines=2, refuse=None, timeout=False):
+    def __init__(self, engines=2, refuse=None, timeout_on=None):
         self.engines = engines
         self.refuse = refuse
-        self.timeout = timeout
+        self.timeout_on = timeout_on
         self.rounds = []
+        self.sent = []
+
+    def broadcast_utility_command(self, cmd, **kwargs):
+        self.sent.append((cmd, kwargs))
 
     def broadcast_utility_command_sync(self, cmd, timeout=300.0, **kwargs):
         self.rounds.append((cmd, kwargs))
+        if cmd == self.timeout_on:
+            raise TimeoutError("engine never answered")
         if cmd == "reserve_profile":
-            if self.timeout:
-                raise TimeoutError("engine never answered")
             results = [{"reserved": True} for _ in range(self.engines)]
             if self.refuse is not None:
                 results[self.refuse] = {"error": "busy", "conflict": True}
@@ -485,17 +540,32 @@ def test_a_reserve_timeout_releases_before_it_propagates():
     """Otherwise the engines that did answer hold a reservation for good,
     and every later /start_profile is refused until a restart.
     """
-    core_mgr = FakeCoreMgr(timeout=True)
+    core_mgr = FakeCoreMgr(timeout_on="reserve_profile")
+
+    with pytest.raises(TimeoutError):
+        engine_with(core_mgr).start_profile()
+
+    assert [cmd for cmd, _ in core_mgr.rounds] == ["reserve_profile"]
+    assert [cmd for cmd, _ in core_mgr.sent] == [
+        "release_profile"
+    ], "waiting for the release times out again and buries the first error"
+    assert core_mgr.sent[0][1]["token"] == core_mgr.rounds[0][1]["token"]
+
+
+def test_a_commit_timeout_stops_the_engines_that_did_commit():
+    """The commit round starts profilers, so a timeout part-way through
+    leaves some recording behind a /start_profile that failed.
+    """
+    core_mgr = FakeCoreMgr(timeout_on="commit_profile")
 
     with pytest.raises(TimeoutError):
         engine_with(core_mgr).start_profile()
 
     assert [cmd for cmd, _ in core_mgr.rounds] == [
         "reserve_profile",
-        "release_profile",
+        "commit_profile",
     ]
-    reserve_kwargs, release_kwargs = (kwargs for _, kwargs in core_mgr.rounds)
-    assert release_kwargs["token"] == reserve_kwargs["token"]
+    assert [cmd for cmd, _ in core_mgr.sent] == ["stop_profile"]
 
 
 def test_call_func_ticks_only_on_completed_forwards():
@@ -508,6 +578,7 @@ def test_call_func_ticks_only_on_completed_forwards():
     mgr = AsyncIOProcManager.__new__(AsyncIOProcManager)
     mgr.label = "test"
     mgr.rpc_broadcast_mq = SimpleNamespace(enqueue=lambda msg: None)
+    mgr._block_table_encoder = SimpleNamespace(encode_rpc=lambda name, args: args)
     mgr.outputs_queue = queue.Queue()
     ticks = []
     mgr.on_forward_end = lambda: ticks.append(1)
