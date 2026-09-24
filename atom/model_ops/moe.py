@@ -77,6 +77,7 @@ from atom.quant_spec import (
     LayerQuantConfig,
     should_skip_online_quant,
     should_stream_online_quant,
+    validate_nvfp4_global_scales,
     validate_nvfp4_online_target,
 )
 from atom.quantization.quark.utils import (
@@ -3953,11 +3954,12 @@ class FusedMoE(torch.nn.Module):
             global_scale: torch.Tensor | None = None,
         ) -> torch.Tensor:
             if source_is_nvfp4:
+                # Both branches return the model dtype, so the w1_bf16 /
+                # w3_bf16 names below hold for every source format.
                 return dequantize_nvfp4(
                     w.contiguous(),
                     sc.contiguous(),
                     global_scale,
-                    out_dtype=torch.float32,
                 )
             return dequant_weight_online(
                 w.contiguous(), sc.contiguous(), source_quant_type, source_quant_dtype
@@ -4012,6 +4014,24 @@ class FusedMoE(torch.nn.Module):
         old_w2_scale = self.w2_weight_scale.data if need_dequant else None
         old_w13_scale_2 = self.w13_weight_scale_2.data if source_is_nvfp4 else None
         old_w2_scale_2 = self.w2_weight_scale_2.data if source_is_nvfp4 else None
+        if source_is_nvfp4:
+            # These buffers are zero-filled at allocation, so a checkpoint that
+            # omits *_weight_scale_2 leaves them zero and dequantizes every
+            # expert to all zeros -- a silent accuracy loss, not a crash.
+            # EPLB redundant replicas are exempt: fill_redundant copies them
+            # from their base experts only after this conversion has run, so
+            # their slots still hold the zero placeholder here.
+            n_base = self.num_local_base_experts
+            replicas_end = self.expert_layout.routed_physical_per_rank
+            for what, scale_2 in (
+                ("w13_weight_scale_2", old_w13_scale_2),
+                ("w2_weight_scale_2", old_w2_scale_2),
+            ):
+                validate_nvfp4_global_scales(
+                    torch.cat((scale_2[:n_base], scale_2[replicas_end:])),
+                    self.layer_name,
+                    what,
+                )
         device = old_w13_data.device
         # Nvfp4MoEMethod pads nothing itself, so an intermediate_pad on it was
         # pinned by the model for the MXFP4 target, whose create_weights resets it.

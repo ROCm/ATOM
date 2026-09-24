@@ -40,6 +40,7 @@ from atom.quant_spec import (
     LayerQuantConfig,
     should_skip_online_quant,
     should_stream_online_quant,
+    validate_nvfp4_global_scales,
     validate_nvfp4_online_target,
     will_online_requant,
 )
@@ -661,8 +662,12 @@ class LinearBase(nn.Module):
                         device=param_device,
                     )
                 )
+                # Zeroed, not empty: a checkpoint that carries no
+                # *.weight_scale_2 leaves this untouched, and zero is the one
+                # value online_quantize_weight can recognize as "never loaded".
+                # Uninitialized memory can read back as a plausible scale.
                 self.weight_scale_2 = atom_parameter(
-                    torch.empty(
+                    torch.zeros(
                         len(self.output_partition_sizes),
                         dtype=torch.float32,
                         device=param_device,
@@ -992,6 +997,13 @@ class LinearBase(nn.Module):
             if weight_scale is None:
                 raise RuntimeError(f"{self.prefix}: NVFP4 weight_scale is missing.")
             global_scale = getattr(self, "weight_scale_2", None)
+            # A checkpoint without *.weight_scale_2 leaves the zeroed
+            # placeholder in place and would dequantize the whole weight to 0.
+            validate_nvfp4_global_scales(
+                None if global_scale is None else global_scale.data,
+                self.prefix,
+                "weight_scale_2",
+            )
             global_scale = global_scale.data.reshape(-1)
             if global_scale.numel() != len(self.output_partition_sizes):
                 raise RuntimeError(
@@ -1005,12 +1017,9 @@ class LinearBase(nn.Module):
                     device=global_scale.device,
                 )
             ).view(-1, 1)
-            weight = dequantize_nvfp4(
-                weight,
-                weight_scale,
-                per_row_scale_2,
-                out_dtype=torch.float32,
-            )
+            # Decodes to the model dtype, like every other source format here;
+            # quant_weight_online would cast an FP32 weight down anyway.
+            weight = dequantize_nvfp4(weight, weight_scale, per_row_scale_2)
             q_weight, weight_scale = quant_weight_online(
                 weight, online_quant_type, online_quant_dtype
             )

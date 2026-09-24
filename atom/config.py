@@ -684,7 +684,9 @@ class QuantizationConfig:
                     "parameter must share one spec."
                 )
         for pattern in seen:
-            if self._is_excluded(pattern, self.exclude_layers):
+            # FusedMoE resolves its experts container with check_children=True,
+            # so an exclude entry naming one expert de-quantizes all of them.
+            if self._is_excluded(pattern, self.exclude_layers, check_children=True):
                 raise ValueError(
                     f"Packed layer {pattern!r} is quantized by at least one source "
                     "projection and excluded by another. Exclude all of them or "

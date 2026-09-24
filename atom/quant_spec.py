@@ -165,6 +165,31 @@ def validate_nvfp4_online_target(quant_config, prefix: str) -> None:
     )
 
 
+def validate_nvfp4_global_scales(scale_2, prefix: str, what: str) -> None:
+    """Reject an NVFP4 global scale that was never loaded from the checkpoint.
+
+    ``weight_scale_2`` is allocated zeroed up front and only filled if the
+    checkpoint actually carries a ``*_weight_scale_2`` tensor for the layer. If
+    it does not, dequantization reads the placeholder and silently produces an
+    all-zero weight that degrades accuracy with no error anywhere -- which is
+    why both allocation sites zero-fill. Every value has to be finite
+    and strictly positive: NVFP4 global scales are amax ratios, so zero, a
+    negative, a NaN or an inf all mean "not loaded", not "unusual checkpoint".
+    """
+    if scale_2 is None:
+        raise RuntimeError(
+            f"{prefix}: NVFP4 {what} is missing. NVFP4 is a two-level format "
+            "and cannot be dequantized without its global scale."
+        )
+    if not torch.all(torch.isfinite(scale_2) & (scale_2 > 0)):
+        raise RuntimeError(
+            f"{prefix}: NVFP4 {what} holds non-positive or non-finite values "
+            f"({scale_2.flatten().tolist()[:8]}...), which means the checkpoint "
+            "did not provide it. An NVFP4 checkpoint must carry a "
+            "*_weight_scale_2 tensor for every quantized layer."
+        )
+
+
 def should_stream_online_quant(
     quant_config,
     prefix: str,

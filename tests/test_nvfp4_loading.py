@@ -33,6 +33,7 @@ quant_spec = importlib.import_module("atom.quant_spec")
 NVFP4_DTYPE = quant_spec.NVFP4_DTYPE
 LayerQuantConfig = quant_spec.LayerQuantConfig
 should_stream_online_quant = quant_spec.should_stream_online_quant
+validate_nvfp4_global_scales = quant_spec.validate_nvfp4_global_scales
 dequantize_nvfp4 = importlib.import_module(
     "atom.quantization.quark.utils"
 ).dequantize_nvfp4
@@ -111,6 +112,47 @@ def test_dequantize_nvfp4_applies_block_and_global_scales():
         dequantized,
         torch.tensor([[36.0, 18.0] * 8], dtype=torch.float32),
     )
+
+
+def test_dequantize_nvfp4_requires_a_global_scale():
+    """NVFP4 is two-level; a missing global scale is a load bug, not a default."""
+    packed = torch.full((1, 8), 0x57, dtype=torch.uint8)
+    block_scale = torch.tensor([[2.0]], dtype=torch.float8_e4m3fn)
+
+    with pytest.raises(ValueError, match="two-level format"):
+        dequantize_nvfp4(packed, block_scale, None)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        # What a zeroed (MoE) buffer holds when the checkpoint carried no
+        # *_weight_scale_2, and what an uninitialized (Linear) one can hold.
+        [0.0, 0.0],
+        [1.0, 0.0],
+        [1.0, -0.5],
+        [1.0, float("nan")],
+        [1.0, float("inf")],
+    ],
+)
+def test_validate_nvfp4_global_scales_rejects_unloaded_values(bad):
+    with pytest.raises(RuntimeError, match="non-positive or non-finite"):
+        validate_nvfp4_global_scales(
+            torch.tensor(bad), "model.layers.0.mlp.gate_proj", "weight_scale_2"
+        )
+
+
+def test_validate_nvfp4_global_scales_accepts_a_loaded_checkpoint():
+    """Guards the check above from rejecting every real NVFP4 layer."""
+    validate_nvfp4_global_scales(
+        torch.tensor([[0.375, 1.5], [2.0, 0.125]]),
+        "model.layers.3.block_sparse_moe.experts",
+        "w13_weight_scale_2",
+    )
+    with pytest.raises(RuntimeError, match="weight_scale_2 is missing"):
+        validate_nvfp4_global_scales(
+            None, "model.layers.0.mlp.gate_proj", "weight_scale_2"
+        )
 
 
 def test_nvfp4_merged_linear_loads_all_checkpoint_tensors(monkeypatch):
@@ -194,6 +236,33 @@ def test_nvfp4_merged_linear_online_converts_to_mxfp4(monkeypatch):
     assert layer.weight_scale.shape == (64, 2)
     assert layer.weight_scale_2 is None
     assert layer.input_scale_2 is None
+
+
+def test_nvfp4_merged_linear_rejects_an_unloaded_global_scale(monkeypatch):
+    """Never running the weight_scale_2 loader must fail, not scale by zero."""
+    monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING", "0")
+    tp_group = SimpleNamespace(rank_in_group=0, world_size=1)
+    monkeypatch.setattr(linear_mod, "get_tp_group", lambda: tp_group)
+    monkeypatch.setattr(
+        linear_mod,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(torch_dtype=torch.bfloat16),
+    )
+
+    layer = MergedColumnParallelLinear(
+        64,
+        [32, 32],
+        quant_config=_nvfp4_to_mxfp4_config(),
+        prefix="model.layers.0.mlp.gate_up_proj",
+    )
+    layer.weight.data.fill_(0x22)
+    layer.weight_scale.data.fill_(2.0)
+    # No weight_scale_2 loader call: the checkpoint did not carry one, so the
+    # allocation-time zeros are still there.
+    assert not layer.weight_scale_2.data.any()
+
+    with pytest.raises(RuntimeError, match="non-positive or non-finite"):
+        layer.online_quantize_weight()
 
 
 def test_nvfp4_qkv_uses_format_specific_global_scale_loader(monkeypatch):
@@ -600,6 +669,85 @@ def test_nvfp4_moe_streaming_counts_split_global_scales(monkeypatch):
     assert layer._stream_loaded_numel == layer._stream_expected_numel
 
 
+def _nvfp4_moe_layer(
+    source,
+    target,
+    source_intermediate,
+    tp_size,
+    w13_scale_2=((0.5, 1.0),),
+    w2_scale_2=(1.5,),
+    num_local_base_experts=None,
+    routed_physical_per_rank=None,
+):
+    """The subset of FusedMoE state that `_online_quant` reads, as a namespace.
+
+    One local expert slot per `w2_scale_2` entry; by default every slot is a
+    routed base expert.
+    """
+    num_slots = len(w2_scale_2)
+    if num_local_base_experts is None:
+        num_local_base_experts = num_slots
+    if routed_physical_per_rank is None:
+        routed_physical_per_rank = num_local_base_experts
+    return SimpleNamespace(
+        online_quant=True,
+        quant_config=SimpleNamespace(
+            get_layer_quant_config=lambda *_args, **_kwargs: target
+        ),
+        layer_name="model.layers.3.block_sparse_moe.experts",
+        layer_quant_config=source,
+        source_is_nvfp4=True,
+        params_dtype=NVFP4_DTYPE,
+        quant_method=SimpleNamespace(intermediate_pad=0),
+        moe_config=SimpleNamespace(),
+        moe_quant_params={"params_dtype": NVFP4_DTYPE},
+        _stream_online_quant=False,
+        local_num_experts=num_slots,
+        num_local_base_experts=num_local_base_experts,
+        expert_layout=SimpleNamespace(
+            routed_physical_per_rank=routed_physical_per_rank
+        ),
+        intermediate_size_per_partition=source_intermediate,
+        has_bias=False,
+        use_ep=False,
+        tp_size=tp_size,
+        tp_rank=0,
+        w13_weight=nn.Parameter(
+            torch.full(
+                (num_slots, 2 * source_intermediate, 32), 0x22, dtype=torch.uint8
+            ),
+            requires_grad=False,
+        ),
+        w2_weight=nn.Parameter(
+            torch.full(
+                (num_slots, 64, source_intermediate // 2), 0x22, dtype=torch.uint8
+            ),
+            requires_grad=False,
+        ),
+        w13_weight_scale=nn.Parameter(
+            torch.full(
+                (num_slots, 2 * source_intermediate, 4),
+                2.0,
+                dtype=torch.float8_e4m3fn,
+            ),
+            requires_grad=False,
+        ),
+        w2_weight_scale=nn.Parameter(
+            torch.full(
+                (num_slots, 64, source_intermediate // 16),
+                2.0,
+                dtype=torch.float8_e4m3fn,
+            ),
+            requires_grad=False,
+        ),
+        w13_weight_scale_2=nn.Parameter(torch.tensor(w13_scale_2), requires_grad=False),
+        w2_weight_scale_2=nn.Parameter(torch.tensor(w2_scale_2), requires_grad=False),
+        _copy_quant_storage=FusedMoE._copy_quant_storage,
+        _load_model_weight_or_group_weight_scale=lambda **_kwargs: None,
+        _load_quant_weight_scale=lambda **_kwargs: None,
+    )
+
+
 @pytest.mark.parametrize(
     ("source_intermediate", "tp_size"),
     [(32, 1), (32, 2)],
@@ -666,57 +814,7 @@ def test_nvfp4_moe_online_conversion_uses_local_tp_shards(
 
     monkeypatch.setattr(moe_mod, "get_tp_group", lambda: NoGatherGroup())
 
-    layer = SimpleNamespace(
-        online_quant=True,
-        quant_config=SimpleNamespace(
-            get_layer_quant_config=lambda *_args, **_kwargs: target
-        ),
-        layer_name="model.layers.3.block_sparse_moe.experts",
-        layer_quant_config=source,
-        source_is_nvfp4=True,
-        params_dtype=NVFP4_DTYPE,
-        quant_method=SimpleNamespace(intermediate_pad=0),
-        moe_config=SimpleNamespace(),
-        moe_quant_params={"params_dtype": NVFP4_DTYPE},
-        _stream_online_quant=False,
-        local_num_experts=1,
-        intermediate_size_per_partition=source_intermediate,
-        has_bias=False,
-        use_ep=False,
-        tp_size=tp_size,
-        tp_rank=0,
-        w13_weight=nn.Parameter(
-            torch.full((1, 2 * source_intermediate, 32), 0x22, dtype=torch.uint8),
-            requires_grad=False,
-        ),
-        w2_weight=nn.Parameter(
-            torch.full((1, 64, source_intermediate // 2), 0x22, dtype=torch.uint8),
-            requires_grad=False,
-        ),
-        w13_weight_scale=nn.Parameter(
-            torch.full(
-                (1, 2 * source_intermediate, 4),
-                2.0,
-                dtype=torch.float8_e4m3fn,
-            ),
-            requires_grad=False,
-        ),
-        w2_weight_scale=nn.Parameter(
-            torch.full(
-                (1, 64, source_intermediate // 16),
-                2.0,
-                dtype=torch.float8_e4m3fn,
-            ),
-            requires_grad=False,
-        ),
-        w13_weight_scale_2=nn.Parameter(
-            torch.tensor([[0.5, 1.0]]), requires_grad=False
-        ),
-        w2_weight_scale_2=nn.Parameter(torch.tensor([1.5]), requires_grad=False),
-        _copy_quant_storage=FusedMoE._copy_quant_storage,
-        _load_model_weight_or_group_weight_scale=lambda **_kwargs: None,
-        _load_quant_weight_scale=lambda **_kwargs: None,
-    )
+    layer = _nvfp4_moe_layer(source, target, source_intermediate, tp_size)
 
     FusedMoE._online_quant(layer)
 
@@ -751,6 +849,94 @@ def test_nvfp4_moe_online_conversion_uses_local_tp_shards(
     dummy = nn.Parameter(torch.zeros(1, 2, 4))
     FusedMoE.weight_loader(layer, dummy, dummy, weight_name="")
     assert merged == [(dummy, (1, 2, 4), 0)]
+
+
+@pytest.mark.parametrize(
+    ("w13_scale_2", "w2_scale_2", "missing"),
+    [
+        (((0.0, 0.0),), (1.5,), "w13_weight_scale_2"),
+        (((0.5, 1.0),), (0.0,), "w2_weight_scale_2"),
+    ],
+)
+def test_nvfp4_moe_rejects_unloaded_global_scales(
+    monkeypatch, w13_scale_2, w2_scale_2, missing
+):
+    """The scale_2 buffers are zero-filled, so an absent checkpoint tensor
+    would otherwise dequantize every expert to all zeros without an error."""
+    monkeypatch.setattr(moe_mod, "get_tp_group", lambda: None)
+    target = LayerQuantConfig(
+        quant_type=QuantType.per_1x32,
+        quant_dtype=dtypes.fp4x2,
+        is_dynamic=True,
+        quant_method="quark",
+    )
+    layer = _nvfp4_moe_layer(
+        _nvfp4_spec(), target, 32, 1, w13_scale_2=w13_scale_2, w2_scale_2=w2_scale_2
+    )
+
+    with pytest.raises(RuntimeError, match=f"{missing} holds non-positive"):
+        FusedMoE._online_quant(layer)
+
+
+class _TargetCreationReached(Exception):
+    """Stands in for building the MXFP4 target: the scale_2 check passed."""
+
+
+@pytest.mark.parametrize(
+    ("w13_scale_2", "w2_scale_2", "error", "match"),
+    [
+        (
+            ((0.5, 1.0), (0.0, 0.0), (0.5, 1.0)),
+            (1.5, 0.0, 1.5),
+            _TargetCreationReached,
+            None,
+        ),
+        (
+            ((0.5, 1.0), (0.0, 0.0), (0.5, 1.0)),
+            (0.0, 0.0, 1.5),
+            RuntimeError,
+            "w2_weight_scale_2 holds non-positive",
+        ),
+        (
+            ((0.5, 1.0), (0.0, 0.0), (0.0, 0.0)),
+            (1.5, 0.0, 1.5),
+            RuntimeError,
+            "w13_weight_scale_2 holds non-positive",
+        ),
+    ],
+    ids=["replica-still-empty", "base-unloaded", "fused-shared-unloaded"],
+)
+def test_nvfp4_moe_global_scale_check_skips_eplb_redundant_replicas(
+    monkeypatch, w13_scale_2, w2_scale_2, error, match
+):
+    """Local slots are [routed base, EPLB redundant replica, fused shared].
+    fill_redundant copies the replica from its base expert only after online
+    quantization, so it alone may still be zero when the check runs."""
+    monkeypatch.setattr(moe_mod, "get_tp_group", lambda: None)
+
+    def reach_target_creation(*_args, **_kwargs):
+        raise _TargetCreationReached
+
+    monkeypatch.setattr(moe_mod, "_make_mxfp4_moe_method", reach_target_creation)
+    target = LayerQuantConfig(
+        quant_type=QuantType.per_1x32,
+        quant_dtype=dtypes.fp4x2,
+        is_dynamic=True,
+        quant_method="quark",
+    )
+    layer = _nvfp4_moe_layer(
+        _nvfp4_spec(),
+        target,
+        32,
+        1,
+        w13_scale_2=w13_scale_2,
+        w2_scale_2=w2_scale_2,
+        num_local_base_experts=1,
+        routed_physical_per_rank=2,
+    )
+
+    with pytest.raises(error, match=match):
+        FusedMoE._online_quant(layer)
 
 
 @pytest.mark.parametrize(
@@ -837,6 +1023,49 @@ def test_minimax_m3_uses_checkpoint_mlp_layer_types(nested, moe_layer_freq):
         False,
         True,
     ]
+
+
+@pytest.mark.parametrize(
+    ("root_fields", "text_fields"),
+    [
+        ({"mlp_layer_types": ["dense", "dense", "dense", "sparse"]}, {}),
+        (
+            {"mlp_layer_types": ["dense", "dense", "dense", "sparse"]},
+            {"mlp_layer_types": ["sparse"] * 4},
+        ),
+        ({"moe_layer_freq": [0, 0, 0, 1]}, {"moe_layer_freq": [1, 1, 1, 1]}),
+    ],
+    ids=[
+        "text-config-has-neither",
+        "overrides-mlp-layer-types",
+        "overrides-moe-layer-freq",
+    ],
+)
+def test_minimax_m3_root_layer_layout_reaches_text_config(root_fields, text_fields):
+    text_config = _minimax_m3_text_config(**text_fields)
+    hf_config = SimpleNamespace(
+        model_type="minimax_m3_vl", text_config=text_config, **root_fields
+    )
+
+    _normalize_minimax_m3_text_config(hf_config)
+
+    assert [_is_moe_layer(text_config, i) for i in range(4)] == [
+        False,
+        False,
+        False,
+        True,
+    ]
+
+
+def test_minimax_m3_root_mlp_layer_types_must_agree_with_text_moe_layer_freq():
+    hf_config = SimpleNamespace(
+        model_type="minimax_m3_vl",
+        text_config=_minimax_m3_text_config(moe_layer_freq=[0, 0, 1, 1]),
+        mlp_layer_types=["dense", "dense", "dense", "sparse"],
+    )
+
+    with pytest.raises(ValueError, match="disagree on which layers are MoE"):
+        _normalize_minimax_m3_text_config(hf_config)
 
 
 @pytest.mark.parametrize(

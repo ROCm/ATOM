@@ -359,6 +359,43 @@ class TestModelOptParser:
         )
         assert "model.embed_tokens" in qcfg.exclude_layers
 
+    @staticmethod
+    def _parse_and_remap_like_m3(config):
+        qcfg = QuantizationConfig(
+            FakeHFConfig(torch_dtype=BF16, quantization_config=config),
+            online_quant_config={"global_quant_config": "mxfp4"},
+        )
+        qcfg.remap_layer_name(
+            FakeHFConfig(model_type="minimax_m3_vl"),
+            packed_modules_mapping={
+                ".gate_proj": (".gate_up_proj", 0),
+                ".up_proj": (".gate_up_proj", 1),
+            },
+            quant_exclude_name_mapping={"language_model.model.": "model."},
+        )
+        return qcfg
+
+    def test_excluding_one_expert_is_rejected(self):
+        """FusedMoE resolves its experts container with check_children=True, so
+        one excluded expert would build every expert in the layer as bf16."""
+        config = self._mixed_config()
+        config["exclude_modules"].append(
+            "language_model.model.layers.3.block_sparse_moe.experts.5.w1"
+        )
+        with pytest.raises(ValueError, match="excluded by another"):
+            self._parse_and_remap_like_m3(config)
+
+    def test_excluding_the_router_keeps_experts_quantized(self):
+        config = self._mixed_config()
+        config["exclude_modules"].append(
+            "language_model.model.layers.3.block_sparse_moe.gate"
+        )
+        qcfg = self._parse_and_remap_like_m3(config)
+        experts = qcfg.get_layer_quant_config(
+            "model.layers.3.block_sparse_moe.experts", check_children=True
+        )
+        assert experts.quant_dtype == NVFP4_DTYPE
+
     def test_nvfp4_without_online_target_is_rejected_at_setup(self):
         """NVFP4 without an online config fails while the config is parsed."""
         hf = FakeHFConfig(torch_dtype=BF16, quantization_config=self._mixed_config())
@@ -394,6 +431,10 @@ class TestModelOptParser:
             hf, online_quant_config={"global_quant_config": "mxfp4"}
         )
         validate_nvfp4_online_target(converted, experts)
+
+    # `validate_nvfp4_global_scales` inspects tensor values, so it is covered in
+    # tests/test_nvfp4_loading.py instead -- the `torch` this copy of
+    # quant_spec closed over is a MagicMock, and every check would pass.
 
     def test_nvfp4_rejects_non_16_group_size(self):
         config = self._mixed_config()
