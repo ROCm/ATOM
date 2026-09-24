@@ -454,6 +454,78 @@ models:
           name: glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c48
           concurrency: [48]
 
+        # 1P1D: CPP4 prefill (PP4×TP1, GPU 0-3) + DPA4 decode (dp4×tp1,
+        # GPU 4-7) on a single node. MTP4 with fixed acceptance rate 0.5825.
+        # dp_sticky session-affinity routing via is_agentic_dpa().
+        - &glm52_agentic_lmcache_cpp4_dpa4_1p1d
+          <<: *glm52_agentic_tp4_tp4
+          name: glm-52-mxfp4-1p1d-cpp4-dpa4-agentic-lmcache-1m-c24
+          topology: 1p1d_cpp4_dpa4
+          display_topology: 1P1D-CPP4-DPA4-MTP4
+          pd_worker_layout: single_node
+          concurrency: [24]
+          server:
+            common_args:
+              kv_cache_dtype: fp8
+              block_size: 16
+              max_num_seqs: 512
+              enable_prefix_caching: true
+              decode_max_num_seqs: 128
+              max_model_len: ""
+              max_num_batched_tokens: ""
+              decode_max_num_batched_tokens: ""
+              online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*"]}'
+              gpu_memory_utilization: 0.9
+              extra_args: "--level 3 --method mtp --num-speculative-tokens 4 --spec-decode-acceptance-rate 0.5825"
+          prefill:
+            workers: 1
+            tp: 1
+            cudagraph: none
+            extra_args: "--pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192"
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16]"
+            extra_args: >-
+              --enable-dp-attention
+              --dp-load-balance least_requests
+              --cudagraph-mode FULL
+          env:
+            common:
+              MC_DISABLE_HIP: "1"
+              ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB: "2047"
+              PYTHONHASHSEED: "0"
+              MAX_JOBS: "16"
+            prefill:
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+              VLLM_PP_LAYER_PARTITION: "20,20,20,18"
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
+              LMCACHE_CHUNK_SIZE: "256"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_MIN_LOAD_TOKENS: "0"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+            decode:
+              HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+          benchmark:
+            <<: *agentic_1m_aiperf
+            wait_server_timeout: 5400
+
+        - <<: *glm52_agentic_lmcache_cpp4_dpa4_1p1d
+          name: glm-52-mxfp4-1p1d-cpp4-dpa4-agentic-lmcache-1m-c28
+          concurrency: [28]
+
+        - <<: *glm52_agentic_lmcache_cpp4_dpa4_1p1d
+          name: glm-52-mxfp4-1p1d-cpp4-dpa4-agentic-lmcache-1m-c32
+          concurrency: [32]
+
+        - <<: *glm52_agentic_lmcache_cpp4_dpa4_1p1d
+          name: glm-52-mxfp4-1p1d-cpp4-dpa4-agentic-lmcache-1m-c36
+          concurrency: [36]
+
         # 1P2D: CPP4 prefill (PP4×TP1, node 0) paired with 2× DPA4 decode
         # (dp4×tp1 each, node 1 GPU 0-3 and GPU 4-7). MTP4 with fixed
         # acceptance rate 0.5825. dp_sticky session-affinity routing via
