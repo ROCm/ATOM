@@ -488,9 +488,7 @@ def test_agentic_manual_default_stays_a_two_point_test():
 
 
 @pytest.mark.parametrize("profile", ["test", "nightly"])
-def test_existing_workflow_agentic_entry_preserves_profile(
-    tmp_path, monkeypatch, profile
-):
+def test_agentic_dispatch_replay_preserves_profile(tmp_path, monkeypatch, profile):
     import json
 
     from build_agentic_benchmark_matrix import build_configs, main
@@ -498,13 +496,11 @@ def test_existing_workflow_agentic_entry_preserves_profile(
     output = tmp_path / "github-output"
     config_dir = tmp_path / "config"
     monkeypatch.setenv("EVENT_NAME", "workflow_dispatch")
-    monkeypatch.setenv(
-        "INPUTS_JSON", json.dumps({"agentic_profile": profile, "deepseek-v4-pro": True})
-    )
+    monkeypatch.setenv("INPUTS_JSON", json.dumps({"profile": profile, "dry_run": True}))
     monkeypatch.setenv("GITHUB_OUTPUT", str(output))
     monkeypatch.setenv(
         "GITHUB_WORKFLOW_REF",
-        "ROCm/ATOM/.github/workflows/atom-benchmark.yaml@refs/heads/test",
+        "ROCm/ATOM/.github/workflows/atom-agentic-benchmark.yaml@refs/heads/test",
     )
     monkeypatch.setenv("AGENTIC_RUN_CONFIG_DIR", str(config_dir))
     assert main() == 0
@@ -513,5 +509,7 @@ def test_existing_workflow_agentic_entry_preserves_profile(
         inputs={"profile": profile}
     )
     dispatch = json.loads((config_dir / "dispatch-inputs.json").read_text())
-    assert dispatch["agentic_profile"] == profile
-    assert "deepseek-v4-pro" not in dispatch and "profile" not in dispatch
+    assert dispatch["profile"] == profile
+    assert dispatch["dry_run"] is True
+    assert dispatch["atom_commit"]
+    assert "atom-agentic-benchmark.yaml" in (config_dir / "README.md").read_text()

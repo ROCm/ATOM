@@ -12,9 +12,13 @@ for the daily 08:17 UTC run. Both use `rocm/atom-dev:latest` and checked-out bra
 code. The manual default remains DeepSeek V4.1 Flash + DSpark5, TP4 with FULL
 graphs, concurrency 2/4 and 900 seconds per point. Nightly follows InferenceX
 PR #3387: TP2 c=1/2/8/16/32/64 and TP4 c=2/8/16/32/64, 3600 seconds per point,
-5 warmup requests per lane and fixed AL 3.51. The existing ATOM Benchmark manual
-entry can select either profile via `agentic_profile`; random model
-checkboxes and dashboard jobs are skipped in that mode. Manual `dry_run` previews
+5 warmup requests per lane and fixed AL 3.51. Select **ATOM Agentic Benchmark**
+for these runs; **ATOM Benchmark** keeps the random-workload model checkboxes
+and dashboard settings in its own form. The temporary mixed entry has been
+removed. The independent workflow must reach the default branch before GitHub
+exposes its manual/scheduled entry. For a manual test, select the branch, leave
+the preset at `test` and keep optional overrides empty. Advanced execution and
+profiling settings are labeled separately. Manual `dry_run` previews
 the matrix without GPU jobs; run summaries include configuration, replay commands
 and per-point artifact links. Titles use `manual (<actor>)` / `nightly` with
 GitHub's native run number. Both entries group jobs as model configuration →

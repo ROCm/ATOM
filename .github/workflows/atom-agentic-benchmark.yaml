@@ -9,52 +9,52 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: "test: TP4 c=2/4 for 900s; nightly: InferenceX #3387 TP2/TP4 sweep for 3600s"
+        description: "Preset — test: TP4 / c=2,4 / 900s; nightly: TP2+TP4 / 3600s"
         type: choice
         options: [test, nightly]
         default: test
-      dry_run:
-        description: "Preview and save the resolved configuration without allocating GPU runners"
-        type: boolean
-        default: false
       models:
-        description: "Comma-separated model prefixes; empty selects all models in the profile"
+        description: "Models (optional) — empty uses the preset; e.g. deepseek-v41-flash"
         type: string
         default: ""
       concurrency:
-        description: "Comma-separated concurrency override; empty uses the profile's grid"
+        description: "Concurrency (optional) — empty uses the preset; test defaults to 2,4"
         type: string
         default: ""
       duration_seconds:
-        description: "900–3600 seconds per point; empty uses the profile (test 900, nightly 3600)"
+        description: "Seconds per point (optional) — empty uses test: 900 / nightly: 3600; allowed 900–3600"
         type: string
         default: ""
+      dry_run:
+        description: "Preview configuration only (no GPU allocation)"
+        type: boolean
+        default: false
       image:
-        description: "Empty uses the profile image; optionally override with an immutable tag or digest"
+        description: "Advanced: image override — empty uses rocm/atom-dev:latest"
         type: string
         default: ""
       runner:
-        description: "Dedicated GPU CI runner override; empty uses the catalog"
+        description: "Advanced: runner override — empty uses the preset's GPU runner"
         type: string
         default: ""
       extra_args:
-        description: "Additional ATOM server arguments"
+        description: "Advanced: extra ATOM server arguments"
         type: string
         default: ""
       atom_commit:
-        description: "ATOM ref to check out; empty uses the workflow ref"
+        description: "Advanced: ATOM revision override — empty runs the branch selected above"
         type: string
         default: ""
       aiter_commit:
-        description: "AITER ref to reinstall; empty keeps the image version"
+        description: "Advanced: AITER revision override — empty keeps the image version"
         type: string
         default: ""
       enable_profiler:
-        description: "Collect torch profiler traces"
+        description: "Advanced: collect torch profiler traces"
         type: boolean
         default: false
       enable_rtl:
-        description: "Collect rocm-trace-lite traces"
+        description: "Advanced: collect rocm-trace-lite traces"
         type: boolean
         default: false
 

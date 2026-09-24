@@ -98,28 +98,6 @@ def write_run_config(configs, inputs, event, output_dir):
     output.mkdir(parents=True, exist_ok=True)
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     dispatch = {**inputs, "atom_commit": commit}
-    workflow_file = (
-        os.environ.get("GITHUB_WORKFLOW_REF", "").split("@")[0].rsplit("/", 1)[-1]
-        or "atom-agentic-benchmark.yaml"
-    )
-    if workflow_file == "atom-benchmark.yaml":
-        dispatch = {
-            key: value
-            for key, value in dispatch.items()
-            if key
-            in {
-                "image",
-                "runner",
-                "extra_args",
-                "atom_commit",
-                "aiter_commit",
-                "enable_profiler",
-                "enable_rtl",
-            }
-        }
-        dispatch.update(
-            agentic_profile=inputs.get("profile", "test"), publish_to_dashboard=False
-        )
     record = {
         "event": event,
         "actor": os.environ.get("GITHUB_ACTOR", ""),
@@ -139,7 +117,7 @@ def write_run_config(configs, inputs, event, output_dir):
                 "gh",
                 "workflow",
                 "run",
-                workflow_file,
+                "atom-agentic-benchmark.yaml",
                 "--repo",
                 os.environ.get("GITHUB_REPOSITORY", "ROCm/ATOM"),
                 "--ref",
@@ -239,8 +217,6 @@ def main():
             if event == "workflow_dispatch"
             else {"profile": "nightly"}
         )
-        if "agentic_profile" in inputs:
-            inputs["profile"] = inputs.pop("agentic_profile")
         configs = build_configs(inputs=inputs)
         if os.environ.get("AGENTIC_RUN_CONFIG_DIR"):
             write_run_config(

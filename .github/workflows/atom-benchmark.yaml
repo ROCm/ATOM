@@ -10,8 +10,8 @@ run-name: >-
       || format('manual ({0})', github.actor) }}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.agentic_profile || 'random' }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && (inputs.agentic_profile == '' || inputs.agentic_profile == 'random') }}
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 on:
   schedule:
@@ -24,11 +24,6 @@ on:
     - cron: '37 4 * * 0'
   workflow_dispatch:
     inputs:
-      agentic_profile:
-        description: "Select test/nightly to run ONLY agentic benchmarks; random keeps the model checkboxes below"
-        type: choice
-        options: [random, test, nightly]
-        default: random
       publish_to_dashboard:
         description: "Upload results to the dashboard (off by default for manual runs; schedule always publishes)"
         type: boolean
@@ -93,7 +88,7 @@ on:
         description: "Extra arguments to pass to the ATOM server"
         type: string
       image:
-        description: "Image override; empty uses the random/agentic profile default"
+        description: "Docker image; empty uses rocm/atom-dev:latest"
         type: string
         default: ""
       runner:
@@ -161,22 +156,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           INPUTS_JSON: ${{ toJson(inputs) }}
           CADENCE: ${{ env.CADENCE }}
-          AGENTIC_PROFILE: ${{ inputs.agentic_profile }}
-          AGENTIC_RUN_CONFIG_DIR: agentic-run-config
-        run: |
-          if [[ "$EVENT_NAME" == workflow_dispatch && "$AGENTIC_PROFILE" != random && -n "$AGENTIC_PROFILE" ]]; then
-            python3 .github/scripts/build_agentic_benchmark_matrix.py
-          else
-            python3 .github/scripts/build_benchmark_matrix.py
-          fi
-      - name: Save agentic run configuration
-        if: github.event_name == 'workflow_dispatch' && inputs.agentic_profile != 'random' && inputs.agentic_profile != ''
-        uses: actions/upload-artifact@v7
-        with:
-          name: atom-agentic-run-config-${{ github.run_attempt }}
-          path: agentic-run-config/
-          retention-days: 15
-          if-no-files-found: error
+        run: python3 .github/scripts/build_benchmark_matrix.py
 
   # Top-level fan-out: one matrix entry per (model variant × scenario) config.
   # Each invokes benchmark-tmpl.yml, which fans out over the config's
@@ -185,7 +165,7 @@ jobs:
   # (config × conc) cell still runs as its own parallel job; the caller job name
   # stays `benchmark` so downstream `needs:` are unchanged.
   benchmark:
-    name: ${{ matrix.config.display }} ${{ matrix.config.bench_kind == 'aiperf_agentic' && 'agentic' || matrix.config.scenario }}
+    name: ${{ matrix.config.display }} ${{ matrix.config.scenario }}
     needs: [build-matrix]
     if: >-
       !cancelled()
@@ -223,7 +203,7 @@ jobs:
     concurrency:
       group: gh-pages-deploy
       cancel-in-progress: false
-    if: always() && (inputs.agentic_profile == '' || inputs.agentic_profile == 'random')
+    if: always()
     name: Summarize benchmark result
     needs: [benchmark]
     runs-on: ubuntu-latest
@@ -640,7 +620,6 @@ jobs:
   profiler-analysis:
     if: >-
       always()
-      && (inputs.agentic_profile == '' || inputs.agentic_profile == 'random')
       && (needs.collect-regression-traces.result != 'cancelled'
           && needs.collect-regression-traces.result != 'skipped'
           || inputs.enable_profiler == true)

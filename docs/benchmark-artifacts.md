@@ -95,13 +95,23 @@ Use a ref containing this workflow and producer.
 The scheduled workflow becomes active when it is on the default branch; it does
 not run from a PR. Each run retains its own artifacts without updating gh-pages.
 
-Before the new workflow is registered on the default branch, use the existing
-**ATOM Benchmark** manual entry with `agentic_profile: test` (or `nightly`). It
-builds the same agentic matrix from the selected branch and invokes the GPU
-template directly. Both entries group jobs as model configuration → concurrency
-points, without an extra workflow wrapper. Random benchmark/dashboard/regression
-jobs are skipped and the usual image/ref options are preserved.
-The default `agentic_profile: random` retains the existing benchmark behavior.
+Choose **ATOM Agentic Benchmark** in the Actions sidebar for agentic runs.
+The existing **ATOM Benchmark** retains its random-workload model checkboxes
+and dashboard settings. These are separate forms: GitHub dispatch inputs do
+not conditionally hide fields based on a selected profile. The temporary
+`agentic_profile` bridge used for the initial branch validation has been removed.
+The independent workflow must reach the default branch before its manual and
+scheduled entry is available; adding a file only to a PR branch does not
+register that entry. Completed validation runs remain available in their history.
+
+For the standard manual test, select the branch under **Use workflow from**,
+leave **Preset** at `test` and click **Run workflow**. Model, concurrency and
+duration overrides can stay empty. Both presets use DSpark5 and FULL graphs.
+Use `nightly` to run the full InferenceX #3387 grid, or enable **Preview
+configuration only** to inspect it without allocating GPUs. Image, runner,
+code overrides and profiler settings are labeled **Advanced**; they do not
+need changing for the default test. Jobs remain grouped by model configuration
+with concurrency points underneath.
 
 Actions run titles follow the existing benchmark convention: `manual (<actor>)`
 or `nightly`, with GitHub's native run number shown alongside. The separate
