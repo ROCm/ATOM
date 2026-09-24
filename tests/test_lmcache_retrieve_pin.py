@@ -21,8 +21,7 @@ class _Buf:
         self.pin_count -= 1
         if self.pin_count <= 0:
             self.freed = True
-        if self.pin_count < 0:
-            self.pin_count = 0
+        self.pin_count = max(self.pin_count, 0)
         return True
 
 

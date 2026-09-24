@@ -84,9 +84,7 @@ def _adapter(monkeypatch, dcp=1, *, block_size=BLOCK, chunk_size=CHUNK):
     return adapter, adapter._scheduler
 
 
-def _admit(
-    adapter, req_id="r0", prompt=PROMPT, allocated=BUDGET, block=BLOCK
-):
+def _admit(adapter, req_id="r0", prompt=PROMPT, allocated=BUDGET, block=BLOCK):
     """Admit a request whose block table covers only its first prefill chunk."""
     request = SimpleNamespace(request_id=req_id, prompt_token_ids=list(range(prompt)))
     blocks = list(range(allocated // block))
