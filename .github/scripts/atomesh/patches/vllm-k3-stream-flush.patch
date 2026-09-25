@@ -1,0 +1,135 @@
+--- a/vllm/parser/kimi_k3.py
++++ b/vllm/parser/kimi_k3.py
+@@ -10,8 +10,9 @@
+     DeltaMessage,
+     FunctionCall,
+ )
+-from vllm.parser.abstract_parser import DelegatingParser
++from vllm.parser.abstract_parser import DelegatingParser, StreamState
+ from vllm.reasoning.kimi_k3_reasoning_parser import KimiK3ReasoningParser
++from vllm.tool_parsers.kimi_k3_tool_parser import KimiK3ToolParser
+ 
+ if TYPE_CHECKING:
+     from vllm.entrypoints.openai.chat_completion.protocol import (
+@@ -93,6 +94,33 @@
+             delta_message.tool_calls = []
+         return delta_message, False
+ 
++    def finalize_generation(
++        self,
++        delta_message: DeltaMessage | None,
++        request: ChatCompletionRequest | ResponsesRequest,
++        state: StreamState,
++    ) -> DeltaMessage | None:
++        delta_message = super().finalize_generation(delta_message, request, state)
++        if not state.reasoning_ended and isinstance(
++            self._reasoning_parser, KimiK3ReasoningParser
++        ):
++            tail = self._reasoning_parser.finish_reasoning_streaming(
++                state.previous_text
++            )
++            if tail:
++                if delta_message is None:
++                    delta_message = DeltaMessage()
++                delta_message.reasoning = (delta_message.reasoning or "") + tail
++        elif isinstance(self._tool_parser, KimiK3ToolParser):
++            tail = self._tool_parser._extract_response_content(
++                state.previous_text, finished=True
++            )
++            if tail:
++                if delta_message is None:
++                    delta_message = DeltaMessage()
++                delta_message.content = (delta_message.content or "") + tail
++        return delta_message
++
+     def parse_delta(
+         self,
+         delta_text: str,
+@@ -116,14 +144,16 @@
+             self._tool_parser is not None
+             or not isinstance(self._reasoning_parser, KimiK3ReasoningParser)
+             or not state.reasoning_ended
+-            or delta_message is None
+         ):
+             return delta_message
+ 
+         stripped = self._reasoning_parser.strip_content_streaming(
+             previous_text=previous_content,
+             current_text=state.previous_text,
++            finished=finished,
+         )
++        if delta_message is None:
++            return stripped
+         delta_message.content = stripped.content if stripped is not None else None
+         if (
+             delta_message.role is None
+--- a/vllm/reasoning/kimi_k3_reasoning_parser.py
++++ b/vllm/reasoning/kimi_k3_reasoning_parser.py
+@@ -314,7 +314,16 @@
+                     break
+         return text[:-overlap] if overlap else text
+ 
+-    def _content_ready_to_emit(self, text: str) -> str:
++    def finish_reasoning_streaming(self, text: str) -> str:
++        """Release an unfinished marker as literal text at end of stream."""
++        if self._think_close_re.search(text):
++            return ""
++        safe = self._reasoning_text_ready_to_emit(text)
++        opened = self._think_open_re.search(text)
++        body = text[opened.end() :] if opened is not None else text
++        return body[len(safe) :]
++
++    def _content_ready_to_emit(self, text: str, *, finished: bool = False) -> str:
+         """Return the content prefix that is safe to stream now.
+ 
+         Mirrors ``_reasoning_text_ready_to_emit`` but for the post-reasoning
+@@ -330,6 +339,9 @@
+         # Remove complete close/message markers
+         text = self._response_close_re.sub("", text)
+         text = self._message_close_re.sub("", text)
++
++        if finished:
++            return text
+ 
+         # Hold back partial markers at the end
+         overlap = 0
+@@ -349,6 +361,8 @@
+         self,
+         previous_text: str,
+         current_text: str,
++        *,
++        finished: bool = False,
+     ) -> DeltaMessage | None:
+         """Strip XTML content wrappers from streaming deltas after reasoning.
+ 
+@@ -359,7 +373,7 @@
+         Works from accumulated text (``previous_text`` / ``current_text``
+         already contain only post-reasoning content).
+         """
+-        current_safe = self._content_ready_to_emit(current_text)
++        current_safe = self._content_ready_to_emit(current_text, finished=finished)
+         previous_safe = self._content_ready_to_emit(previous_text)
+         if current_safe.startswith(previous_safe):
+             delta = current_safe[len(previous_safe) :]
+--- a/vllm/tool_parsers/kimi_k3_tool_parser.py
++++ b/vllm/tool_parsers/kimi_k3_tool_parser.py
+@@ -268,7 +268,9 @@
+             return m["c"] or None
+         return self._strip_response_content(before)
+ 
+-    def _extract_response_content(self, current_text: str) -> str | None:
++    def _extract_response_content(
++        self, current_text: str, *, finished: bool = False
++    ) -> str | None:
+         # Streaming response text is computed from the accumulated text. This is
+         # what keeps split markers from leaking:
+         #   <|open|> / response / <|sep|>Hi     -> emit only "Hi" after open closes
+@@ -289,6 +291,8 @@
+         candidates = [i for i in (tools_start, response_end) if i != -1]
+         if candidates:
+             sendable_idx = min(candidates)
++        elif finished:
++            sendable_idx = len(current_text)
+         else:
+             overlap = max(
+                 _partial_tag_overlap(current_text, self.response_open),
