@@ -28,6 +28,7 @@ from torch import nn
 
 from atom.config import QuantizationConfig, get_current_atom_config
 from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
+from atom.model_ops.mxfp8_asm_gemm import asm_weight_scale, dsv4_mxfp8_asm_gemm
 from atom.model_ops.utils import (
     atom_parameter,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -749,6 +750,7 @@ class LinearBase(nn.Module):
         self.need_normalize_e4m3fn_to_e4m3fnuz = params_dtype == torch.float8_e4m3fnuz
         self.quant_func = get_hip_quant(self.quant_type)
         self.is_output_padded = False
+        self._mxfp8_asm = False  # set by mxfp8_asm_gemm.setup
 
     @property
     def weight_scale_row_group(self) -> int:
@@ -1186,6 +1188,16 @@ class LinearBase(nn.Module):
             self.params_dtype != dtypes.fp4x2 or not use_fp4_non_shuffle_triton_gemm()
         ):
             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
+        if getattr(self, "_mxfp8_asm", False):
+            self.set_mxfp8_asm_weight_scale()
+
+    def set_mxfp8_asm_weight_scale(self) -> None:
+        """(Re)build the ASM B-scale from weight_scale, in place once it exists."""
+        ws = asm_weight_scale(self.weight_scale.data, self.weight.shape[0])
+        if hasattr(self, "weight_scale_asm"):
+            self.weight_scale_asm.copy_(ws)
+        else:
+            self.register_buffer("weight_scale_asm", ws, persistent=False)
 
     def _maybe_pad_a8w8_preshuffle_output(self) -> bool:
         # The other half of the shuffle decision `process_weights_after_loading`
@@ -1276,7 +1288,11 @@ class LinearBase(nn.Module):
             "Linear out= requested but this quant path does not support it "
             f"(quant_type={self.quant_type})."
         )
-        if self.native_a8_group_rows is not None:
+        if self._mxfp8_asm:  # see atom/model_ops/mxfp8_asm_gemm.py
+            y = dsv4_mxfp8_asm_gemm(
+                x, x_scale, self.weight, self.weight_scale, self.weight_scale_asm, otype
+            )
+        elif self.native_a8_group_rows is not None:
             from atom.model_ops.blockscale import native_quant_linear
 
             y = native_quant_linear(

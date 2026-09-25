@@ -24,6 +24,7 @@ from torch import Tensor, nn
 from torch.overrides import handle_torch_function, has_torch_function_unary
 
 from atom.config import QuantizationConfig
+from atom.model_ops.mxfp8_asm_gemm import dsv4_mxfp8_asm_rms_quant
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.utils import envs
@@ -304,6 +305,7 @@ class RMSNorm(nn.Module):
             and quant_type.value == _QV_PER_1X128
             and envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
         )
+        self._mxfp8_asm = False  # set by mxfp8_asm_gemm.setup
 
     def process_weights_after_loading(self):
         """Post-load hook invoked by the model loader for every module.
@@ -481,6 +483,9 @@ class RMSNorm(nn.Module):
                 #
                 # The kernel takes a matrix; every other branch here folds the
                 # leading dims away and gives them back, so a caller does not.
+                if self._mxfp8_asm:  # see atom/model_ops/mxfp8_asm_gemm.py
+                    assert residual is None and x.dim() == 2
+                    return dsv4_mxfp8_asm_rms_quant(x, self.weight, self.eps)
                 lead = x.shape[:-1]
                 batched = len(lead) > 1
                 if batched and self._aiter_transpose_scale:

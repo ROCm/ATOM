@@ -2651,6 +2651,10 @@ class DeepseekV4Attention(nn.Module):
         Idempotent: if wo_a.weight is already BF16 (e.g. dequant was applied
         elsewhere), this is a no-op.
         """
+        if envs.ATOM_DSV4_USE_GFX1250_MXFP8_ASM_GEMM:
+            from atom.model_ops import mxfp8_asm_gemm
+
+            mxfp8_asm_gemm.setup(self)
 
         w = self.wo_a.weight
         if w.dtype == torch.bfloat16:
