@@ -446,6 +446,11 @@ EOF
       bounded_docker_rm \
         "atomesh-${ATOMESH_CELL_ID}-${JOB_ID}-${SPUR_NODE_RANK_FOR_CLEANUP}${suffix}"
     done
+    local query_rc=0
+    timeout --kill-after=5s 15s docker ps -a \
+      --filter "name=^/atomesh-${ATOMESH_CELL_ID}-${JOB_ID}-${SPUR_NODE_RANK_FOR_CLEANUP}(-|$)" \
+      --format '{{.Names}} {{.Status}}' > "${RUN_DIR}/cleanup-containers-${SPUR_NODE_RANK_FOR_CLEANUP}.txt" 2>&1 || query_rc=$?
+    printf '%s\n' "${query_rc}" > "${RUN_DIR}/cleanup-query-${SPUR_NODE_RANK_FOR_CLEANUP}.rc"
     return "${rc}"
   }
   trap 'cleanup_spur $?' EXIT
