@@ -26,6 +26,7 @@ from atom.model_engine.sequence import (
     new_block_table,
 )
 from atom.model_engine.state_runtime import StateRuntime
+from atom.model_engine.step_timing import StepTimingLog
 from atom.utils import (
     engine_process_name,
     envs,
@@ -64,6 +65,11 @@ class EngineCore:
 
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
+        self._step_timing = (
+            StepTimingLog(envs.ATOM_STEP_TIMING_LOG_S)
+            if envs.ATOM_STEP_TIMING_LOG_S > 0
+            else None
+        )
         self.input_queue = queue.Queue[Sequence]()
         self.output_queue = queue.Queue[list[Sequence]]()
         self.stream_output_queue = (
@@ -455,9 +461,14 @@ class EngineCore:
         if has_seqs:
             self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
             self.scheduler.metrics.record_forward(scheduled_batch, seqs)
+            fwd_start = time.perf_counter()
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
+            if self._step_timing is not None:
+                self._step_timing.record(
+                    scheduled_batch, time.perf_counter() - fwd_start, self.label
+                )
             if (
                 self.scheduler.prefill_delayer is not None
                 and scheduled_batch.total_seqs_num_prefill > 0

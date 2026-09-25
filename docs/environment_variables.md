@@ -345,6 +345,7 @@ the host, give each its own endpoints.
 | **ATOM_PROFILER_MORE** | bool | 0 (false) | When `ATOM_TORCH_PROFILER_DIR` is set and this is `1`, enables detailed profiling: `record_shapes`, `with_stack`, and `profile_memory`. Applies to both the run-phase profiler and the CUDA-graph capture profiler. |
 | **ATOM_ENABLE_DETAILED_ANNOTATION** | bool | 0 (false) | When profiling is active, appends detailed attention aggregates to the `prefill[]`/`decode[]` trace labels: `sqsq` (Σ N_Q²), `sqsk` (Σ N_Q·N_KV), and `sk` (Σ N_KV), where N_Q is the scheduled query tokens and N_KV the KV length per request. Used to estimate attention FLOPs for downstream roofline analysis. |
 | **ATOM_LOG_MORE** | bool | 0 (false) | If set to `1`, use verbose logging format (includes process name, PID, path, line number, function name). |
+| **ATOM_STEP_TIMING_LOG_S** | float | 0 (off) | If set to a positive number of seconds, each engine core logs a `[step-timing]` summary every that many seconds: per step kind (`prefill`, `decode`, `mixed`), the count, total, share, mean, p50, p90 and max of the host wall time of the synchronous `forward` call. Under DP attention that time includes waiting for the slowest rank at the lockstep MoE collectives. Diagnostics only; no device-side instrumentation. |
 
 ## Garbage collection
 

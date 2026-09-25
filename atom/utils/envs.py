@@ -438,6 +438,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "ATOM_PROFILER_TIMEOUT": lambda: float(os.getenv("ATOM_PROFILER_TIMEOUT", "300")),
     "ATOM_LOG_MORE": lambda: int(os.getenv("ATOM_LOG_MORE", "0")) != 0,
+    # Log a per-engine summary of forward wall time per step kind every N
+    # seconds (0 = off). Host-side timing of the synchronous forward call.
+    "ATOM_STEP_TIMING_LOG_S": lambda: float(os.getenv("ATOM_STEP_TIMING_LOG_S", "0")),
     # RTL (rocm-trace-lite) GPU kernel tracing — set to output directory to enable.
     # When set, the server launch is wrapped with `rtl trace` to collect per-kernel
     # GPU timestamps for both prefill and decode phases.
