@@ -307,6 +307,11 @@ def sparse_attn_indexer_plugin_mode(
     # V2 may pad metadata to the graph width while the tensors above contain
     # only live tokens. Cache kernels launch once per slot and index those
     # tensors directly, so the mapping must have the same live-token extent.
+    # Tried and measured: slicing to indexer_meta.num_actual_tokens instead of
+    # the padded width does NOT fix the prefix-reuse corruption (pass-2 bad
+    # 5/24 -> 6/24 on stock PIECEWISE), so the padded tail of this mapping is
+    # not where that corruption comes from. Left as-is rather than shipping an
+    # unproven change.
     slot_mapping = indexer_meta.slot_mapping[: q_input.shape[0]]
     has_decode = indexer_meta.num_decodes > 0
     has_prefill = indexer_meta.num_prefills > 0

@@ -188,6 +188,30 @@ def test_index_cache_follows_the_layer_that_owns_it():
     assert set(per_group[1]) == {"model.layers.1.kda"}
 
 
+def test_glm_indexer_follows_its_attention_layer_across_groups():
+    """GLM registers ``<p>.indexer.k_cache``, not ``<layer>.index_cache``.
+
+    Stripping only the M3 suffix leaves the GLM entry unmapped. On a
+    multi-group model that is either a boot failure or, if the entry were
+    guessed into a group, the indexer bytes stored under the wrong layer.
+    """
+    attn = "model.layers.0.self_attn.attn"
+    indexer = "model.layers.0.self_attn.indexer.k_cache"
+    kda = "model.layers.1.kda"
+    caches = {
+        attn: torch.zeros(4, 8),
+        indexer: torch.zeros(4, 132),
+        kda: torch.zeros(3, 8),
+    }
+    groups = [FakeGroup([attn]), FakeGroup([kda])]
+
+    per_group = split_kv_caches_by_group(caches, groups)
+
+    assert indexer in per_group[0]
+    assert attn in per_group[0]
+    assert set(per_group[1]) == {kda}
+
+
 def test_layer_belonging_to_no_group_is_an_error_not_a_guess():
     caches = {
         "model.layers.0.attn": torch.zeros(4, 8),
@@ -521,6 +545,34 @@ def test_unresolvable_destination_is_queued_as_a_failing_load():
     assert load.error_block_ids == (22,)
 
 
+def test_failed_kda_load_never_names_a_mamba_block_as_invalid():
+    """``scheduler.py`` skips non-attention groups when truncating a failed
+    load. That skip is only safe if this connector reports attention ids.
+    A mamba id in ``error_block_ids`` would be invisible to recovery, and
+    vLLM would cache the MLA prefix as if the recurrent state had arrived.
+    """
+    planner = make_planner()
+    request = FakeRequest("r0")
+    mamba_blocks = [11, 12, 13, 14]
+    attention_blocks = [21, 22, 23]
+
+    planner.resolve_load(
+        request,
+        (attention_blocks, mamba_blocks, [31, 32]),
+        CHUNK,
+        ATTENTION_GROUP,
+        CHUNK,
+        CHUNK,
+    )
+
+    (load,) = planner.take_loads()
+    named = set(load.error_block_ids)
+    assert named
+    assert named.isdisjoint(mamba_blocks)
+    assert named.isdisjoint([31, 32])
+    assert named <= set(attention_blocks)
+
+
 def test_unaligned_hit_fails_closed_instead_of_writing_the_wrong_row():
     """``n // block - 1`` and ``(n - 1) // block`` disagree when n is not a
     multiple of the mamba block. The forward reads the second. Writing the
@@ -689,7 +741,10 @@ def test_a_load_whose_second_group_has_no_destination_fails_whole():
 def test_mamba_groups_must_agree_on_block_size():
     """A boundary is one block in every group at the same token count."""
     pytest.importorskip("vllm")
-    from vllm.v1.kv_cache_interface import MambaSpec
+    try:
+        from vllm.v1.kv_cache_interface import MambaSpec
+    except ImportError:
+        pytest.skip("vllm is present but has no MambaSpec (stub or old tree)")
 
     from atom.plugin.vllm.kv_transfer.kda_state import find_mamba_groups
 

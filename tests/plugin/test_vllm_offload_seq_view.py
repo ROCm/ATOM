@@ -93,6 +93,7 @@ def test_preemption_forgets_placement_but_not_what_was_stored():
     view.set_num_cached_tokens(384)
     view.offload_loaded_tokens = 256
     view.offload_handoff_boundary_tokens = 256
+    view._deferred_save_at = 12.5
     view.prefix_hashes_published = True
 
     view.reset_for_preemption()
@@ -101,10 +102,34 @@ def test_preemption_forgets_placement_but_not_what_was_stored():
     assert view.num_cached_tokens == 0
     assert view.offload_loaded_tokens == 0
     assert view.offload_handoff_boundary_tokens == 0
+    assert view._deferred_save_at is None
     assert view.prefix_hashes_published is False
     # Same view: the request keeps its identity, so ATOM's scheduler must not
     # see this as a recycled request id.
     assert reg.get_or_create(req) is view
+
+
+def test_deferred_save_clock_refreshes_on_the_slotted_view():
+    """``_refresh_save_reclaim_clock`` writes ``seq._deferred_save_at``.
+
+    ATOM's ``Sequence`` has a ``__dict__`` and absorbs the write. A slotted
+    view without the slot raises ``AttributeError`` out of the save path, and
+    a clock that is not restarted abandons the copy while the worker is still
+    reading the blocks -- a truncated image under a valid prefix hash.
+    """
+    import time
+
+    from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
+
+    view = SeqViewRegistry().get_or_create(_request())
+    parked = time.monotonic() - 1000.0
+    view._deferred_save_at = parked
+
+    OffloadSchedulerMixin._refresh_save_reclaim_clock(
+        SimpleNamespace(_save_lease_at={id(view): parked}), view
+    )
+
+    assert view._deferred_save_at > parked
 
 
 def test_view_accepts_the_frozen_placement_the_chunked_scheduler_writes():
