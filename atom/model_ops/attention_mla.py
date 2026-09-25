@@ -3151,7 +3151,7 @@ class MLAAttention(nn.Module):
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["OUT_NUMEL", "TOKEN_ROWS", "KV_INDICES_NUMEL"])
 def _convert_req_index_to_global_index_kernel(
     qo_indptr,  # int32 [num_requests]
     kv_indptr,  # int32 [num_requests+1]
@@ -3159,11 +3159,11 @@ def _convert_req_index_to_global_index_kernel(
     kv_indices,  # int32 [num_requests * max_num_blocks_per_req]
     token_indices_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS]
     out_kv_indices,  # int32
-    # shapes (compile-time where possible)
+    # Fixed top-k/tile geometry; runtime bounds retain all safety masks.
     NUM_TOPK_TOKENS: tl.constexpr,
-    OUT_NUMEL: tl.constexpr,
-    TOKEN_ROWS: tl.constexpr,
-    KV_INDICES_NUMEL: tl.constexpr,
+    OUT_NUMEL,
+    TOKEN_ROWS,
+    KV_INDICES_NUMEL,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tile width along columns
     # strides (in elements)
@@ -3321,7 +3321,7 @@ def triton_convert_req_index_to_global_index(
     return new_kv_indices
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["OUT_NUMEL", "NUM_REQ"])
 def _convert_req_index_to_global_index_dsa_prefill_kernel(
     dsa_qo_indptr,  # int32 [num_tokens + 1]
     dsa_kv_indptr,  # int32 [num_tokens + 1]
@@ -3330,10 +3330,10 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     block_table,  # int32 [num_req, max_num_blocks_per_req]
     cu_seqlens_q,  # int32 [num_tokens + 1]
     out_kv_indices,  # int32
-    # shapes (compile-time where possible)
+    # Fixed top-k/tile geometry; runtime bounds retain all safety masks.
     NUM_TOPK_TOKENS: tl.constexpr,
-    OUT_NUMEL: tl.constexpr,
-    NUM_REQ: tl.constexpr,
+    OUT_NUMEL,
+    NUM_REQ,
     MAX_NUM_BLOCKS_PER_REQ: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tile width along columns

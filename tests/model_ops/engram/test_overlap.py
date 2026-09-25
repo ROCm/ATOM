@@ -20,6 +20,7 @@ if not torch.cuda.is_available():
 
 from atom.model_ops.engram.device.hashing import (
     EngramHashTables,
+    engram_cursor_rows_reference,
     engram_row_indices_reference,
     engram_snapshot,
     engram_snapshot_indices,
@@ -84,6 +85,67 @@ def test_snapshot_keeps_old_history_and_padding(config, lengths):
             mapping, layer, tokens, histories, masks
         )
         np.testing.assert_array_equal(out[:count].cpu().numpy(), expected)
+        assert torch.all(out[count:] == -1)
+
+
+@pytest.mark.parametrize("config", [tiny_config(), EngramConfig.from_hf(V41_FLASH)])
+@pytest.mark.parametrize("lengths", [[1, 1], [1, 6, 3], [6] * 8, [129, 3, 1]])
+@pytest.mark.parametrize("replay", [False, True])
+def test_snapshot_stages_all_cursor_prefixes_without_mutating_history(
+    config, lengths, replay
+):
+    mapping = build(config)
+    tables = EngramHashTables.from_mapping(mapping, torch.device("cuda"))
+    batch, tokens, histories, masks = make_batch(mapping, lengths, 7)
+    count = sum(lengths)
+    starts = np.arange(len(lengths)) * 31 + 2
+    positions = torch.tensor(
+        np.concatenate(
+            [np.arange(start, start + n) for start, n in zip(starts, lengths)]
+        ),
+        dtype=torch.int64,
+        device="cuda",
+    )
+    # Unscheduled prefixes and requests must retain their sentinels. Snapshot
+    # padding is still written as -2, including across a CTA boundary.
+    snapshot = torch.empty(count + 5, tables.ngram, dtype=torch.int64, device="cuda")
+    candidates = torch.full(
+        (len(lengths) + 1, max(lengths) + 2, tables.ngram),
+        -99,
+        dtype=torch.int64,
+        device="cuda",
+    )
+    original = batch.history.clone()
+
+    def prepare():
+        engram_snapshot(
+            tables, batch, snapshot, cursor_positions=positions, cursor_out=candidates
+        )
+
+    prepare()
+    if replay:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            prepare()
+        # Fixed addresses, changed data: replay must not reuse a cached result.
+        batch.compressed.fill_(-1)
+        candidates.fill_(-99)
+        graph.replay()
+        masks = [np.zeros(n, dtype=bool) for n in lengths]
+    expected = engram_cursor_rows_reference(mapping, tokens, histories, starts, masks)
+    for i, (length, rows) in enumerate(zip(lengths, expected)):
+        np.testing.assert_array_equal(candidates[i, :length].cpu().numpy(), rows)
+        assert torch.all(candidates[i, length:] == -99)
+    assert torch.all(candidates[len(lengths) :] == -99)
+    assert torch.equal(batch.history, original)
+    assert torch.all(snapshot[count:] == -2)
+    for layer in config.layer_ids:
+        out = torch.empty(count + 5, tables.heads, dtype=torch.int64, device="cuda")
+        engram_snapshot_indices(tables, layer, snapshot, out)
+        np.testing.assert_array_equal(
+            out[:count].cpu().numpy(),
+            engram_row_indices_reference(mapping, layer, tokens, histories, masks),
+        )
         assert torch.all(out[count:] == -1)
 
 

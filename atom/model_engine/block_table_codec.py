@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Ship a forward's block tables to the TP workers as appends alone.
+"""Ship a forward's block tables to the workers as appends alone.
 
-Every forward RPC broadcasts one `ScheduledBatch` to every TP worker, and its
+Every forward RPC broadcasts one `ScheduledBatch` to every worker, and its
 `block_tables` are the bulk of it: one row per running request, the whole row
 every step, growing one block per decode. At 50 seqs x 100k context that is
 ~313k ids -- 1.2 MiB pickled and unpickled per rank per step -- to say
@@ -25,7 +25,6 @@ is the form it is read in, and a step the encoder cannot account for arrives
 as whole tables and resets both caches at once.
 """
 
-import array
 import copy
 import logging
 from dataclasses import dataclass
@@ -158,10 +157,10 @@ class BlockTableDeltaEncoder:
 
 
 class BlockTableDeltaDecoder:
-    """Worker side: rebuild `array("i")` rows from a `BlockTableDelta`."""
+    """Worker side: rebuild versioned rows from a `BlockTableDelta`."""
 
     def __init__(self):
-        self._rows: dict[int, array.array] = {}
+        self._rows: dict[int, BlockTable] = {}
 
     def decode_rpc(self, func_name: str, args: list) -> list:
         """Decode `args[0]` in place if this is an encoded forward."""
@@ -184,8 +183,8 @@ class BlockTableDeltaDecoder:
                 f"{len(req_ids)} requests"
             )
 
-        rows: list[array.array] = []
-        cached: dict[int, array.array] = {}
+        rows: list[BlockTable] = []
+        cached: dict[int, BlockTable] = {}
         for i, req_id in enumerate(req_ids):
             req_id = int(req_id)
             base = int(delta.base_lengths[i])
@@ -203,9 +202,14 @@ class BlockTableDeltaDecoder:
                 # rewrite history the token processor may still be reading, so
                 # a row that grows is copied first. A row that did not grow is
                 # shared, which is the decode-step-with-no-new-block case.
-                row = previous if end == start else previous[:]
+                row = previous
+                if end != start:
+                    row = BlockTable(previous)
+                    # This is the next immutable snapshot in the same append
+                    # lineage. Equal version + length still means equal ids.
+                    row.version = previous.version
             else:
-                row = array.array("i")
+                row = BlockTable()
             if end > start:
                 row.frombytes(memoryview(delta.tail_values[start:end]).cast("B"))
             rows.append(row)

@@ -7,6 +7,8 @@ import numpy as np
 import pytest
 import torch
 
+from tests.attentions.deepseek_v41.helpers import PagedRequest, begin_step
+
 pytest.importorskip("aiter", reason="the draft stack builds AITER-backed layers")
 
 from torch import nn
@@ -94,14 +96,17 @@ def test_draft_context_write_spans_the_forwards_width_not_its_tokens(monkeypatch
     while the read side gathers by absolute position regardless.
     """
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
-    from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
     from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 
     cache = PagedAttentionCache(
         V41PoolGeometry(1, ((0, 2),), 32, 4, 512, 32), 8, 4, "cpu"
     )
-    step = cache.begin_step(
-        [RequestSpan(0, 0, 0, 1, 0, (0,))], running_bs=2, running_tokens=2, plans={}
+    step = begin_step(
+        cache,
+        [PagedRequest(0, 0, 0, 1, 0, (0,))],
+        running_bs=2,
+        running_tokens=2,
+        plans={},
     )
     # Three distinct numbers, so a slice by the wrong one cannot pass.
     assert step.scheduled == 1 and step.width == 2
@@ -229,6 +234,8 @@ def test_decode_positions_use_accepted_prefix_and_full_reservation():
         num_scheduled_tokens=(1, 3),
         block_tables=(tuple(range(10)), tuple(range(10, 20))),
     )
+    # Serving publishes this before input assembly and attention preparation.
+    builder.publish_cu_seqlens_q(batch, SimpleNamespace(running_bs=2))
     metadata, actual = builder.prepare_decode(batch, 2, 4, 3)
     assert [span.position for span in metadata.step.requests] == [129, 140]
     assert actual.tolist() == [129, 140, 141, 142]

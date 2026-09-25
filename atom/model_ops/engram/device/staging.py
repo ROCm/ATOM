@@ -95,7 +95,7 @@ class EngramStaging:
             "engram: hash/UVA/TP gather on one side stream with private IPC state"
         )
 
-    def prepare(self, batch, width):
+    def prepare(self, batch, width, *, cursor_positions=None, cursor_out=None):
         if not 0 <= width <= self.host.max_num_tokens:
             raise ValueError("Engram staging exceeds capacity")
         snapshot = self.snapshot[:width]
@@ -103,7 +103,13 @@ class EngramStaging:
             # Capture uses serving's kernels without accessing synthetic state.
             snapshot.fill_(-2)
         else:
-            engram_snapshot(self.uva.hash_tables, batch, snapshot)
+            engram_snapshot(
+                self.uva.hash_tables,
+                batch,
+                snapshot,
+                cursor_positions=cursor_positions,
+                cursor_out=cursor_out,
+            )
         return EngramStagedRows(self, width)
 
     def start(self, width):

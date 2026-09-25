@@ -40,6 +40,8 @@ class DeepseekV41Backend(AttentionBackend):
 
 
 class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
+    capture_owns_cu_seqlens_q = True
+
     # Reuse V4's publisher and staging contract, including fixed addresses and
     # running_bs padding. Only pool-slot -> physical-row geometry differs.
     _stage = DeepseekV4AttentionMetadataBuilder._stage
@@ -50,9 +52,28 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
     # `_unique_compress_ratios_overlap` and the `v4_*_plan_{ratio}` buffers,
     # which the property and `__init__` below supply under V4's names.
     _build_compress_plans = DeepseekV4AttentionMetadataBuilder._build_compress_plans
+    _compress_publication_group = (
+        DeepseekV4AttentionMetadataBuilder._compress_publication_group
+    )
     # An index key is rotated at its compression group's first token, not at
     # its own, so the plan has to publish those positions.
     _publishes_key_rope = True
+
+    @property
+    def h2d_group_members(self):
+        # Plans, state slots and step rows have no GPU consumer until
+        # begin_step builds its indptrs. Derive members from producer groups.
+        return {
+            "v41_metadata": tuple(
+                name
+                for name, buffer in self.model_runner.forward_vars.items()
+                if isinstance(buffer, CpuGpuBuffer)
+                and (
+                    buffer.publication_group in ("v4_plans", "v4_state", "v41_step")
+                    or name == "block_tables"
+                )
+            )
+        }
 
     @staticmethod
     def _physical_slots(pool_slots):
@@ -68,6 +89,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 self.max_bs, self.device, read_side=False
             )
         )
+        # The V4.1 step producer fills these together with per-ratio visibility.
+        for name in ("positions", "batch_id_per_q_token"):
+            model_runner.forward_vars[name].publication_group = "v41_step"
         self.config = model_runner.config.hf_config
         topology = build_attention_topology(self.config)[
             : self.config.num_hidden_layers
@@ -158,6 +182,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                     dtype=torch.int32,
                     device=device,
                     pin_memory=device != "cpu",
+                    publication_group="v4_plans",
                 )
                 # Sentinel, so a capture before the first real forward reads
                 # rows the kernels skip rather than zeros -- which would name
@@ -173,6 +198,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 dtype=torch.int64,
                 device=device,
                 pin_memory=device != "cpu",
+                publication_group="v4_plans",
             )
             # What a sentinel row works out to, so a pre-forward capture reads
             # the value every forward writes.
@@ -194,6 +220,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 dtype=torch.int32,
                 device=device,
                 pin_memory=device != "cpu",
+                publication_group="v41_step",
             )
             for ratio, _ in geometry.compress_ratios
         }
@@ -257,8 +284,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         max_q_len=None,
         tentative=False,
         start_positions=None,
+        query_prefix_ready=False,
     ):
-        spans, offset, next_page = [], 0, 0
+        spans, rows, offset, next_page = [], [], 0, 0
         slots = batch.state_slots_committed
         if not batch.is_dummy_run and len(slots) != batch.total_seqs_num:
             raise ValueError("CSA2 requires a STATE slot for every scheduled request")
@@ -273,18 +301,17 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 # a live slot or PAGE, even when its fabricated block ID is 0.
                 position = 0
                 count = -(-length // self.block_size)
-                blocks = tuple(range(next_page, next_page + count))
+                blocks = np.arange(next_page, next_page + count, dtype=np.int32)
                 next_page += count
                 slot = len(spans)
             else:
                 position = (
                     end - length if start_positions is None else int(start_positions[i])
                 )
-                blocks = tuple(batch.block_tables[i])
+                blocks = batch.block_tables[i]
                 slot = slots[i]
-            spans.append(
-                RequestSpan(request_id, position, offset, length, slot, blocks)
-            )
+            spans.append(RequestSpan(request_id, position, offset, length, slot))
+            rows.append(blocks)
             offset += length
         if offset != batch.total_tokens_num or running_tokens < offset:
             raise ValueError("CSA2 batch token spans disagree with the runner")
@@ -301,12 +328,20 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         )
         if cache is None:
             raise RuntimeError("CSA2 cache must be allocated before serving")
+        groups = getattr(self.model_runner, "h2d_groups", None)
+        combined = None if groups is None else groups.get("v41_metadata")
+        if combined is not None and combined.transport != "packed":
+            combined = None
+        if combined is not None:
+            for i in range(len(combined.counts)):
+                combined.counts[i] = None
         # Zero-token scheduler rows are excluded from spans. Publish in this
         # same request order, including the private dummy slots used at startup.
         state_slot_out = self._populate_state_slot_mappings(
             SimpleNamespace(state_slots_committed=[span.slot for span in spans]),
             len(spans),
             running_bs,
+            publication_group=combined,
         )
         verifying = tentative and not batch.is_dummy_run and bool(spans)
         # One plan per ratio for the whole batch, into the fixed-address
@@ -322,9 +357,11 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             running_bs=None if max_q_len is None else running_bs,
             max_q_len=max_q_len,
             extra_write=self.geometry.speculative_tokens if verifying else 0,
+            defer_to=combined,
         )
         step = cache.begin_step(
             spans,
+            block_tables=rows,
             tentative=verifying,
             buffers=self.model_runner.forward_vars,
             running_bs=running_bs,
@@ -332,6 +369,17 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             max_q_len=max_q_len,
             state_slot_out=state_slot_out,
             plans=plans,
+            publication_group=(
+                combined
+                if combined is not None
+                else None if groups is None else groups["v41_step"]
+            ),
+            query_prefix_ready=query_prefix_ready and len(spans) == len(batch.req_ids),
+            query_prefix_republish_reason=(
+                "compact zero-token scheduler rows for CSA2 after input assembly"
+                if query_prefix_ready and len(spans) != len(batch.req_ids)
+                else None
+            ),
         )
         positions = self.model_runner.forward_vars["positions"]
         cu = self.model_runner.forward_vars["cu_seqlens_q"].gpu[: running_bs + 1]
@@ -365,7 +413,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         return metadata, positions.gpu[:running_tokens]
 
     def prepare_prefill(self, batch, running_bs):
-        return self._prepare(batch, running_bs, batch.total_tokens_num)
+        return self._prepare(
+            batch, running_bs, batch.total_tokens_num, query_prefix_ready=True
+        )
 
     def prepare_decode(self, batch, running_bs, running_tokens, max_seqlen_q):
         starts = None
@@ -383,6 +433,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             max_q_len=max_seqlen_q,
             tentative=bool(self.geometry.speculative_tokens),
             start_positions=starts,
+            query_prefix_ready=True,
         )
 
     def _engram_batch(self, step, cache, metadata, tokens):
@@ -446,6 +497,14 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # stages addresses only -- the slots are somebody else's, and
         # `prepare_state`'s position-0 reset would zero their state.
         batch = self._engram_batch(step, cache, metadata, tokens)
+        # Tentative candidates have separate storage: freeze the hash inputs
+        # and stage every accepted prefix with one kernel. Committed cursors
+        # may alias history, so that path still advances AFTER the snapshot.
+        stage_cursor = (
+            batch is not None
+            and step.tentative
+            and self.engram.host.overlap is not None
+        )
         histories = (
             np.full((step.scheduled_bs, self.geometry.history_size), -1, np.int64)
             if metadata.dummy
@@ -460,6 +519,12 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 token_mask=metadata.token_mask,
                 padded_rows=step.width,
                 batch=batch,
+                cursor_positions=step.positions if stage_cursor else None,
+                cursor_out=(
+                    cache.tentative_staging.gpu[: step.scheduled_bs]
+                    if stage_cursor
+                    else None
+                ),
             )
             embeddings, histories = prepared.embeddings, prepared.histories
             if batch is None and cache.pending is not None:
@@ -486,7 +551,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # overwrites -- the hash kernel, the staging above -- has already run.
         # A tentative step's cursor is the sampler's to write, so the device
         # path stages its candidates here and commits them there.
-        if batch is not None:
+        if stage_cursor:
+            cache.pending.staged_on_device = True
+        elif batch is not None:
             self._write_engram_cursor(step, cache, batch)
         elif not metadata.dummy and not step.tentative:
             cache.advance_cursor(step, histories)
