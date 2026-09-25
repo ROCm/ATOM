@@ -19,7 +19,8 @@ jobs:
           if [[ -f "${result_dir}/slurm-cancel.sh" ]]; then
             timeout --kill-after=5s 90s bash "${result_dir}/slurm-cancel.sh" > "${result_dir}/cancel.log" 2>&1 || true
           fi
-          cp -a "/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG/k3-ipc-probe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/." "${result_dir}/" || true
+          bash .github/scripts/atomesh/pd_collect_logs.sh \
+            "/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG/k3-ipc-probe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" "${result_dir}" || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
