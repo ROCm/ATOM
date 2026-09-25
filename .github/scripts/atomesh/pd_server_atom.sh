@@ -1417,7 +1417,7 @@ if [[ "${TOPOLOGY}" == "1p0d" ]]; then
   trap 'cleanup_processes ${server_pid:-} ${lmcache_pid:-}' EXIT
   wait_http "http://127.0.0.1:${PREFILL_PORT}/health" "prefill" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   run_workload_phase() {
-    timeout --foreground --kill-after=10s 1800s bash "${ATOMESH_SCRIPT_DIR}/../k3-prefill-probe/workload.sh" "${PREFILL_PORT}" "${RUN_DIR}"
+    timeout --foreground --kill-after=10s 3600s bash "${ATOMESH_SCRIPT_DIR}/../k3-prefill-probe/workload.sh" "${PREFILL_PORT}" "${RUN_DIR}"
   }
   run_benchmark_and_eval "${server_pid}" "${lmcache_pid:-}"
   exit 0

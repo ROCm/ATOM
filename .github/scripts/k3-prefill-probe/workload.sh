@@ -5,7 +5,7 @@ results="$2/prefill-probe"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "${results}"
 exec > >(tee "${results}/workload.log") 2>&1
-client=(python3 -u "${script_dir}/client.py" --port "${port}" --prompts "${results}/prompts.jsonl" --timeout 1200)
+client=(python3 -u "${script_dir}/client.py" --port "${port}" --prompts "${results}/prompts.jsonl" --timeout 3000)
 reset_prefix() {
   python3 - "${port}" <<'PY'
 import json
@@ -24,16 +24,10 @@ else:
     raise SystemExit('P-PROBE prefix cache is still held')
 PY
 }
-echo 'P-PROBE preparing 48 mixed long prefixes'
-"${client[@]}" --mode prepare --n 48 --lengths 12289,16385,24577,65537,131073,262145
+echo 'P-PROBE preparing 64 prefixes through one million tokens'
+"${client[@]}" --mode prepare --n 64 --lengths 65537,131073,262145,524289,786433,1044481
 echo 'P-PROBE remote prefill with simulated consumer release'
-"${client[@]}" --mode prefill --concurrency 48 --logprobs 5 --out "${results}/prefill.jsonl"
-reset_prefix
-echo 'P-PROBE restore and generate'
-"${client[@]}" --mode generate --concurrency 48 --max-tokens 64 --logprobs 5 --out "${results}/restore.jsonl"
-reset_prefix
-echo 'P-PROBE repeated restore pressure'
-"${client[@]}" --mode generate --concurrency 48 --repeat 2 --max-tokens 64 --logprobs 5 --out "${results}/repeat.jsonl"
+"${client[@]}" --mode prefill --concurrency 64 --logprobs 5 --out "${results}/prefill.jsonl"
 reset_prefix
 curl --fail --silent --show-error --max-time 10 "http://127.0.0.1:${port}/metrics" > "${results}/final.metrics"
 echo 'P-PROBE completed'

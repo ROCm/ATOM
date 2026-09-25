@@ -1,7 +1,7 @@
 {
-  "id": "k3-prefill-stacks-probe",
+  "id": "k3-prefill-long-probe",
   "suite": "vllm",
-  "name": "k3-prefill-stacks-probe",
+  "name": "k3-prefill-long-probe",
   "model": "Kimi-K3-MXFP4-vLLM-DSpark",
   "backend": "vllm",
   "image": "vllm/vllm-openai-rocm:nightly@sha256:659b28319fef4ea0e3d8f33e25b4c35d6f663f5d818a5b2fa06dceaf859234e4",
@@ -21,9 +21,9 @@
   ],
   "osl": 1024,
   "concurrency": [
-    48
+    64
   ],
-  "concurrency_x": "48",
+  "concurrency_x": "64",
   "random_range_ratio": "0.8",
   "request_rate": "inf",
   "num_prompts_multiplier": 10,
@@ -62,7 +62,7 @@
     "slurm_submit_runner": "atomesh-cicd",
     "gpus_per_node": 8,
     "cpus_per_task": 114,
-    "time_limit": "01:15:00",
+    "time_limit": "02:00:00",
     "log_root": "/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG",
     "slurm_qos": "amd-atom-qos",
     "spur_controller_addr": "http://pit2-vm-amd-large-02:6817,http://pit2-vm-amd-large-03:6817,http://pit2-vm-amd-large-04:6817"
