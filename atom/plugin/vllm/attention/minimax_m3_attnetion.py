@@ -21,6 +21,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from atom.config import get_current_atom_config
 from atom.model_ops.minimax_m3.sparse_attn import (
     ASM_PAGE_SIZE,
+    BLOCK_PAGE_STRIDE,
     PAGES_PER_SPARSE_BLOCK,
     SPARSE_BLOCK_SIZE,
 )
@@ -138,6 +139,12 @@ class MiniMaxM3SparseIndexerCache(nn.Module, AttentionLayerBase):
     @property
     def impl(self):
         return self
+
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        # vLLM 0.29 hands every layer a logical [B, H, N, C] page view. The index
+        # cache publishes a single head slot, so drop it to get the
+        # [num_blocks, block_size, index_head_dim] the indexer kernels read.
+        self.kv_cache = kv_cache.squeeze(1)
 
     def get_attn_backend(self):
         return self.attn_backend
@@ -328,10 +335,13 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             # handles this by returning zero outputs.
             return
 
-        if self.kv_cache.ndim != 5:
+        # vLLM 0.29 layer view is 4D [num_blocks, head_slots, block_size,
+        # content]; `customize_spec` publishes two head slots (K page, V page)
+        # whose content is num_kv_heads * head_dim elements.
+        if self.kv_cache.ndim != 4:
             raise ValueError(
                 "MiniMax-M3 sparse KV cache must have shape "
-                "[num_blocks, 2, block_size, num_kv_heads, head_dim]."
+                "[num_blocks, 2, block_size, num_kv_heads * head_dim]."
             )
         if self.kv_cache.shape[1] != 2:
             raise ValueError("MiniMax-M3 sparse KV cache must store K and V.")
@@ -339,10 +349,8 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             raise ValueError(
                 f"MiniMax-M3 sparse KV block size must be {SPARSE_BLOCK_SIZE}."
             )
-        if self.kv_cache.shape[3] != self.num_kv_heads:
-            raise ValueError("MiniMax-M3 sparse KV cache head count mismatch.")
-        if self.kv_cache.shape[4] != self.head_dim:
-            raise ValueError("MiniMax-M3 sparse KV cache head dim mismatch.")
+        if self.kv_cache.shape[3] != self.num_kv_heads * self.head_dim:
+            raise ValueError("MiniMax-M3 sparse KV cache content size mismatch.")
 
         if self.index_cache_layer.kv_cache.ndim != 3:
             raise ValueError(
@@ -356,11 +364,32 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         if self.index_cache_layer.kv_cache.shape[2] != self.index_head_dim:
             raise ValueError("MiniMax-M3 index cache head dim mismatch.")
 
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        """Bind the cache and allocate the fp8 scales against it right away.
+
+        vLLM 0.29 runs `warmup_kernels` and cudagraph capture *after* binding,
+        so leaving the scales to the first forward would allocate them from
+        inside a capture -- out of the cudagraph pool, whose memory a later
+        replay reuses. `_ensure_fp8_scales` stays in the forward path as a
+        fallback for the layouts this cannot size from.
+        """
+        super().bind_kv_cache(kv_cache)
+        if self.kv_cache_dtype == "fp8" and kv_cache.dim() == 4:
+            self._ensure_fp8_scales(kv_cache)
+
     def _ensure_fp8_scales(self, kv_cache: torch.Tensor):
+        """Allocate the per-(page, kv-head) fp8 scales alongside the KV planes.
+
+        The scales mirror the KV buffer's half-block windowing: ``2 *
+        num_blocks`` rows, one per half block, with K taking rows ``[:-1]`` and V
+        rows ``[1:]`` so both windows have the same page count as their K/V
+        planes. See ``_page16_shuffle_cache_for_sparse_kernel``.
+        """
         if self.kv_cache_dtype != "fp8":
             return None, None
-        num_blocks, _kv, block_size, num_kv_heads, _head_dim = kv_cache.shape
-        expected_shape = (num_blocks, num_kv_heads, block_size)
+        num_blocks, _kv, block_size, _content = kv_cache.shape
+        num_kv_heads = self.num_kv_heads
+        expected_shape = (num_blocks * 2 - 1, num_kv_heads, block_size)
         if (
             self.k_scale is None
             or self.v_scale is None
@@ -368,15 +397,14 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             or self.k_scale.device != kv_cache.device
         ):
             self.kv_scale = torch.zeros(
-                2,
-                num_blocks,
+                num_blocks * 2,
                 num_kv_heads,
                 block_size,
                 dtype=dtypes.fp32,
                 device=kv_cache.device,
             )
-            self.k_scale = self.kv_scale[0]
-            self.v_scale = self.kv_scale[1]
+            self.k_scale = self.kv_scale[:-1]
+            self.v_scale = self.kv_scale[1:]
         return self.k_scale, self.v_scale
 
     def get_kv_transfer_scales(
@@ -418,24 +446,50 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
     def _page16_shuffle_cache_for_sparse_kernel(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, object, object]:
-        num_blocks, _kv, block_size, num_kv_heads, head_dim = self.kv_cache.shape
+        """Reinterpret the vLLM page view as the ASM page-16 SHUFFLE K/V caches.
+
+        vLLM 0.29 gives this layer a 4D ``[num_blocks, 2, 128, num_kv_heads *
+        head_dim]`` view: ``customize_spec`` asks for two head slots so a block's
+        bytes read as ``[K page | V page]``. Flattening the two slots away yields
+        ``2 * num_blocks`` half-blocks, and the K plane is simply every half-block
+        at an even index -- i.e. the K plane and the V plane are the *same*
+        buffer offset by one half-block. Taking ``flat[:-1]`` as K and
+        ``flat[1:]`` as V gives two windows with an identical page count (which
+        the ASM/gluon runners require, since they view K and V with one shared
+        ``num_phys16``) and each of them contiguous, so ``.view()`` -- a pure byte
+        reinterpretation into the ASM page-16 order the fused KV-insert wrote --
+        is legal on both.
+
+        The consequence for addressing: logical block ``b`` starts at half-block
+        ``2b`` in both windows, so it starts at physical 16-page
+        ``b * BLOCK_PAGE_STRIDE`` (16) while still owning only
+        ``PAGES_PER_SPARSE_BLOCK`` (8) of them. That is what the sparse
+        block-table emitters encode and what the metadata builder's slot rebase
+        matches.
+        """
+        num_blocks, num_slots, block_size, _content = self.kv_cache.shape
+        if num_slots != 2:
+            raise ValueError(
+                "MiniMax-M3 sparse KV cache must store K and V as two head "
+                f"slots, got {tuple(self.kv_cache.shape)}."
+            )
         if block_size != SPARSE_BLOCK_SIZE:
             raise ValueError("MiniMax-M3 sparse cache must use page size 128.")
-        k_cache, v_cache = self.kv_cache.unbind(1)
+        kv_cache = self.kv_cache
         if self.kv_cache_dtype == "fp8":
-            target_dtype = dtypes.d_dtypes[self.kv_cache_dtype]
-            k_cache = k_cache.view(target_dtype)
-            v_cache = v_cache.view(target_dtype)
-        x = 16 // k_cache.element_size()
-        num_phys16 = num_blocks * PAGES_PER_SPARSE_BLOCK
-        k_cache = k_cache.view(
+            kv_cache = kv_cache.view(dtypes.d_dtypes[self.kv_cache_dtype])
+        num_kv_heads, head_dim = self.num_kv_heads, self.head_dim
+        flat = kv_cache.view(num_blocks * 2, block_size, num_kv_heads, head_dim)
+        x = 16 // flat.element_size()
+        num_phys16 = (num_blocks * 2 - 1) * PAGES_PER_SPARSE_BLOCK
+        k_cache = flat[:-1].view(
             num_phys16,
             num_kv_heads,
             head_dim // x,
             ASM_PAGE_SIZE,
             x,
         )
-        v_cache = v_cache.view(
+        v_cache = flat[1:].view(
             num_phys16,
             num_kv_heads,
             ASM_PAGE_SIZE // x,
@@ -492,7 +546,7 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             self.index_q_norm.weight,
             self.index_k_norm.weight,
             self.num_idx_heads,
-            slot_mapping=main_metadata.slot_mapping[:num_tokens],
+            slot_mapping=main_metadata.half_page_slot_mapping[:num_tokens],
             kv_cache_k=k_cache,
             kv_cache_v=v_cache,
             index_cache=self.index_cache_layer.kv_cache,
@@ -581,6 +635,7 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             self.scale,
             emit_sparse_block_table=True,
             max_query_len=max_query_len,
+            block_page_stride=BLOCK_PAGE_STRIDE,
             # Dense rows, so both index arrays collapse to seq_lens. A batch
             # whose decode tokens are not `max_query_len` per request makes this
             # the wrong row count, and the selector declines on the shape rather
@@ -635,6 +690,7 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             self.num_kv_heads,
             self.scale,
             emit_sparse_block_table=True,
+            block_page_stride=BLOCK_PAGE_STRIDE,
             # Ragged rows: query starts, and the keys already behind each
             # request.
             n_valid_column_per_row=n_valid_column_per_row_for_forward(
@@ -688,6 +744,7 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             v_scale=v_scale,
             sparse_bt=sparse_bt,
             sparse_ctx=sparse_ctx,
+            block_page_stride=BLOCK_PAGE_STRIDE,
         )
 
     def _run_prefill_sparse_attention(
@@ -734,6 +791,7 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             prefix_lens=prefill_md.context_lens,
             sparse_bt=sparse_bt,
             sparse_ctx=sparse_ctx,
+            block_page_stride=BLOCK_PAGE_STRIDE,
         )
 
     def _run_sparse_attention(

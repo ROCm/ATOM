@@ -276,6 +276,7 @@ def _build_heterogeneous_kv_cache_config_from_groups(
         KVCacheConfig,
         KVCacheTensor,
         UniformTypeKVCacheSpecs,
+        compute_layout_strides,
     )
 
     def _iter_layer_specs(group):
@@ -297,20 +298,38 @@ def _build_heterogeneous_kv_cache_config_from_groups(
     num_blocks = max(num_blocks, 0)
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
 
+    # vLLM 0.29 puts every KVCacheTensor in one backing allocation and asks each
+    # for the same total `size`; a tensor picks out its own bytes with `offset`
+    # plus its layer/block strides. The two groups here must not alias, so give
+    # every layer its own slice instead of overlaying the groups.
+    layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+    total_size = bytes_per_block_all_layers * num_blocks
+
     kv_cache_tensors = []
+    offset = 0
     for group in kv_cache_groups:
         for layer_name, layer_spec in _iter_layer_specs(group):
+            layer_stride, block_stride = compute_layout_strides(
+                layer_spec, num_blocks, 1, layout
+            )[:2]
             kv_cache_tensors.append(
                 KVCacheTensor(
-                    size=layer_spec.page_size_bytes * num_blocks,
-                    shared_by=[layer_name],
+                    size=total_size,
+                    layers=[layer_name],
+                    layer_stride=layer_stride,
+                    block_stride=block_stride,
+                    offset=offset,
                 )
             )
+            offset += layer_spec.page_size_bytes * num_blocks
 
     return KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
+        prefix_cache_retention_interval=(
+            vllm_config.cache_config.prefix_cache_retention_interval
+        ),
     )
 
 

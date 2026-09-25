@@ -23,7 +23,10 @@ recognise a ragged decode segment before the kernels see it".
 import pytest
 import torch
 
-pytest.importorskip("vllm")
+try:  # `importorskip` only catches ImportError, and vLLM's platform probe
+    import vllm  # noqa: F401  # raises RuntimeError on a host with no GPU.
+except (ImportError, RuntimeError) as exc:
+    pytest.skip(f"vLLM is not importable here: {exc}", allow_module_level=True)
 
 from atom.plugin.vllm.attention.metadata import _uniform_decode_query_len
 

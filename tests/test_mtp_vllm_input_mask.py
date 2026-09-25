@@ -35,6 +35,7 @@ MODEL_WRAPPER = REPO_ROOT / "atom" / "plugin" / "vllm" / "model_wrapper.py"
 # arch -> (model module, predictor class that must carry the flag)
 MASKED_PREDICTORS = {
     "DeepSeekMTPModel": ("deepseek_mtp.py", "DeepSeekMultiTokenPredictor"),
+    "DeepseekV32MTPModel": ("deepseek_mtp.py", "DeepSeekMultiTokenPredictor"),
     "Glm4MoeMTPModel": ("glm4_moe_mtp.py", "Glm4MoeMultiTokenPredictor"),
 }
 
