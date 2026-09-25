@@ -853,7 +853,7 @@ models:
         files: all
       lmcache:
         <<: *kimi_k3_vllm_lmcache
-        patches: [patches/lmcache-k3-boundary.patch, patches/lmcache-event-lifetime.patch]
+        patches: [patches/lmcache-k3-boundary.patch, patches/lmcache-event-lifetime.patch, patches/lmcache-pending-store.patch]
     server:
       common_args:
         extra_args: >-
