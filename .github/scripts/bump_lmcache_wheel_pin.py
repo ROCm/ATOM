@@ -42,6 +42,8 @@ def main() -> int:
         "LMCACHE_WHEEL_IMAGE": f'"{args.image}"',
         "LMCACHE_WHEEL_SHA256": args.sha256,
     }
+    # Validate every input before changing any Dockerfile.
+    updates = []
     for file in args.files:
         path = Path(file)
         text = path.read_text()
@@ -52,6 +54,9 @@ def main() -> int:
                 return 1
             start, end = matches[0].span()
             text = f"{text[:start]}ARG {key}={value}{text[end:]}"
+        updates.append((path, text))
+
+    for path, text in updates:
         path.write_text(text)
         print(f"{path}: pinned {args.image}")
     return 0
