@@ -1,17 +1,18 @@
 {
-  "id": "k3-decode-dspark-probe",
+  "id": "k3-decode-no-dspark-control",
   "suite": "vllm",
-  "name": "k3-decode-dspark-probe",
-  "model": "Kimi-K3-MXFP4-vLLM-DSpark",
+  "name": "k3-decode-no-dspark-control",
+  "model": "Kimi-K3-MXFP4-vLLM-Control",
   "backend": "vllm",
   "image": "vllm/vllm-openai-rocm:nightly@sha256:659b28319fef4ea0e3d8f33e25b4c35d6f663f5d818a5b2fa06dceaf859234e4",
   "model_path": "/share_nfs/models/moonshotai/Kimi-K3",
   "precision": "MXFP4",
   "topology": "0p1d",
-  "display_topology": "D-only TP8/DCP8 generation and GSM8K diagnostic",
+  "display_topology": "D-only TP8/DCP8 no-DSpark control",
   "pd_worker_layout": "multi_node",
   "nodes": [
-    "pit2-p03-g13",
+    "pit2-p03-g07",
+    "pit2-p03-g09",
     "pit2-p03-g19",
     "pit2-p03-g42"
   ],
@@ -88,7 +89,7 @@
     }
   },
   "server_args": {
-    "extra_args": "--moe-backend auto --load-format fastsafetensors --gpu-memory-utilization 0.88 --language-model-only --max-num-seqs 80 --enable-auto-tool-choice --tool-call-parser kimi_k3 --reasoning-parser kimi_k3 --max-model-len 1048576 --stream-interval 10 --enable-prefix-caching --prefix-match-unit 128 --kv-cache-dtype fp8 --block-size 128 --max-num-batched-tokens 16384 --attention-config '{\"mla_prefill_backend\":\"ROCM_AITER_FA\",\"use_prefill_query_quantization\":true}' --attention-backend ROCM_AITER_MLA --dcp-comm-backend a2a --cp-kv-cache-interleave-size 1 --speculative-config '{\"model\":\"/share_nfs/models/Inferact/Kimi-K3-DSpark\",\"num_speculative_tokens\":4,\"method\":\"dspark\",\"attention_backend\":\"ROCM_AITER_MLA\",\"kv_cache_dtype\":\"fp8\",\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"standard\"}'"
+    "extra_args": "--moe-backend auto --load-format fastsafetensors --gpu-memory-utilization 0.88 --language-model-only --max-num-seqs 80 --enable-auto-tool-choice --tool-call-parser kimi_k3 --reasoning-parser kimi_k3 --max-model-len 1048576 --stream-interval 10 --enable-prefix-caching --prefix-match-unit 128 --kv-cache-dtype fp8 --block-size 128 --max-num-batched-tokens 16384 --attention-config '{\"mla_prefill_backend\":\"ROCM_AITER_FA\",\"use_prefill_query_quantization\":true}' --attention-backend ROCM_AITER_MLA --dcp-comm-backend a2a --cp-kv-cache-interleave-size 1"
   },
   "env": {
     "common": {
