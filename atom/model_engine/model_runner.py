@@ -932,6 +932,9 @@ class ModelRunner:
         dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
         pp_rank = config.parallel_config.pipeline_parallel_rank
         pp_size = config.pipeline_parallel_size
+        if pp_size > 1:
+            # Reject before any collective can wait for nonexistent ranks.
+            reject_simulated_tp(config, "pipeline parallel")
         # tp_world_size: how many GPUs this stage actually occupies.
         stage_span = config.tp_world_size * config.prefill_context_parallel_size
         engine_index = dp_rank_local * pp_size + pp_rank
@@ -956,16 +959,30 @@ class ModelRunner:
             config.parallel_config.data_parallel_master_ip,
             config.parallel_config.data_parallel_base_port,
         )
-        # Both branches handle simulated TP: the PP path only to reject it,
-        # since it would otherwise deadlock on a group sized for absent ranks.
+        dp_size = config.parallel_config.data_parallel_size
+        world_size = dp_size * pp_size * stage_span
+        dp_rank = config.parallel_config.data_parallel_rank
+        global_rank = (dp_rank * pp_size + pp_rank) * stage_span + rank
+        if (
+            config.parallel_config._managed_distributed_store
+            and not torch.distributed.is_initialized()
+        ):
+            # Preserve AITER's environment setup when preinitializing its group.
+            os.environ.setdefault(
+                "HIP_VISIBLE_DEVICES", ",".join(map(str, range(world_size)))
+            )
+            store = torch.distributed.TCPStore(
+                config.parallel_config.data_parallel_master_ip,
+                config.parallel_config.data_parallel_base_port,
+                is_master=False,
+            )
+            torch.distributed.init_process_group(
+                backend="nccl", store=store, rank=global_rank, world_size=world_size
+            )
+        # AITER reuses the default group and creates the model-parallel groups.
         if config.pipeline_parallel_size > 1:
             from atom.distributed.pp_comm import init_pp_aware_dist_env
 
-            reject_simulated_tp(config, "pipeline parallel")
-            dp_size = config.parallel_config.data_parallel_size
-            world_size = dp_size * pp_size * stage_span
-            dp_rank = config.parallel_config.data_parallel_rank
-            global_rank = (dp_rank * pp_size + pp_rank) * stage_span + rank
             # No local_rank here, unlike the non-PP branch below. Safe only
             # because PP is single-node today: CoreManager rejects multi-node
             # DP when pp_size > 1, and asserts PP+DP out entirely, so
