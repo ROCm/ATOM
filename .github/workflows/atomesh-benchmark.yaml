@@ -251,10 +251,15 @@ jobs:
             while read -r job_id job_state node_count _; do
               [[ "${job_id}" =~ ^[0-9]+$ && "${job_state}" == "RUNNING" ]] || continue
               [[ "${node_count}" =~ ^[1-9][0-9]*$ ]] || continue
-              timeout --kill-after=5s 45s srun --jobid="${job_id}" --overlap \
-                --immediate=10 --nodes="${node_count}" --ntasks="${node_count}" \
-                --ntasks-per-node=1 --cpus-per-task=1 --cpu-bind=none \
-                --mpi=none --label bash \
+              timeout 10s srun --jobid="${job_id}" --overlap --help \
+                > inspection/srun-overlap-help.txt 2>&1 || true
+              step_args=()
+              if grep -q -- '--nodes' inspection/srun-overlap-help.txt; then
+                step_args=(--nodes="${node_count}" --ntasks="${node_count}"
+                  --ntasks-per-node=1 --cpus-per-task=1 --cpu-bind=none --mpi=none --label)
+              fi
+              timeout --kill-after=5s 120s srun --jobid="${job_id}" --overlap \
+                "${step_args[@]}" bash \
                 "${GITHUB_WORKSPACE}/.github/scripts/atomesh/pd_inspect_processes.sh" \
                 "${job_id}" > "inspection/processes-${job_id}.log" 2>&1 || true
             done < inspection/squeue.txt

@@ -12,13 +12,17 @@ while IFS= read -r container; do
   [[ "${container}" == atomesh-* && "${container}" =~ -${job_id}-[0-9]+(-benchmark|-eval)?$ ]] || continue
   printf 'Container: %s\n' "${container}"
   # shellcheck disable=SC2016
-  timeout 20s docker exec "${container}" bash -c '
-    if ! command -v py-spy >/dev/null; then
-      echo "py-spy is not installed in this container"
-      exit 0
+  timeout --kill-after=5s 90s docker exec "${container}" bash -c '
+    spy="$(command -v py-spy || true)"
+    if [[ -z "${spy}" ]]; then
+      target=/tmp/atomesh-inspection-py-spy
+      timeout --kill-after=2s 40s python3 -m pip install --disable-pip-version-check \
+        --no-deps --target "${target}" py-spy==0.4.2 || exit 0
+      spy="${target}/bin/py-spy"
     fi
-    for pid in $(pgrep -f "^VLLM::Worker_TP0" || true); do
-      timeout --kill-after=2s 8s py-spy dump --pid "${pid}" --native || true
+    for pid in $(pgrep -f "^VLLM::(Worker_TP0|EngineCore)|^[^ ]*python[^ ]* .*lmcache server" || true); do
+      printf "Process %s\n" "${pid}"
+      timeout --kill-after=2s 8s "${spy}" dump --pid "${pid}" --native || true
     done
   ' || true
 done < <(docker ps --format '{{.Names}}')
