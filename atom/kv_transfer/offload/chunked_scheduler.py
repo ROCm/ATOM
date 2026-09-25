@@ -32,6 +32,7 @@ from atom.kv_transfer.offload.metadata import (
 logger = logging.getLogger("atom")
 
 DENSE_PAGE_SOURCE_SAFE_CHANNEL = "dense.page.source_safe"
+DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL = "dense.page.source_quiescent"
 DENSE_PAGE_STORE_CHANNEL = "dense.page.store"
 
 
@@ -70,6 +71,18 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self.kv_role = validated_kv_role(kvc)
         self._do_save = self.kv_role in ("offload", "kv_both", "kv_producer")
         self._do_load = self.kv_role in ("offload", "kv_both", "kv_consumer")
+        if self._do_save and int(getattr(config, "pipeline_parallel_size", 1) or 1) > 1:
+            # `Scheduler.advance_on_schedule` bumps num_cached_tokens inside
+            # schedule(), before that chunk's forward. The save frontier below
+            # reads the same field, so under PP a save can cover an in-flight
+            # chunk that the dense producer fence (recorded at dispatch) does
+            # not order after. Named here rather than asserted because PP
+            # offload has no supported configuration yet.
+            logger.warning(
+                "LMCache offload scheduler: pipeline parallelism advances the "
+                "prefill frontier before the forward runs; dense saves may "
+                "include a chunk the producer fence does not cover"
+            )
         self.block_size = offcfg._strict_integer(
             "Offload block size",
             config.kv_cache_block_size,
@@ -131,6 +144,12 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._save_lease_owner: dict[int, object] = {}
         self._pending_source_safe_releases: list[frozenset] = []
         self._source_safe_waiting_for_store: dict[SaveOperationId, set[int]] = {}
+        # A failed store may retry only after every TP rank has stopped reading
+        # its source. A post-submit failure need not provide that guarantee.
+        self._save_previous_frontier: dict[SaveOperationId, int] = {}
+        self._save_previous_owner: dict[SaveOperationId, object] = {}
+        self._save_quiescent: set[SaveOperationId] = set()
+        self._save_retry_blocked: dict[str, SaveOperationId] = {}
         self._save_nonce = 0
         self._load_nonce = 0
         self._load_lifecycles: dict[str, object] = {}
@@ -480,6 +499,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 continue  # loading this step; defer its save
             if sid in self._save_inflight:
                 continue  # keep at most one save per request in flight
+            blocked = self._save_retry_blocked.get(sid)
+            if blocked is not None and self._save_previous_owner.get(blocked) is seq:
+                continue  # failed source may still be in use on another rank
             computed = min(
                 int(
                     getattr(
@@ -519,6 +541,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 )
             )
             entry[1] = aligned
+            self._save_previous_frontier[save_operation] = saved
+            self._save_previous_owner[save_operation] = seq
             self._save_inflight[sid] = save_operation
             self._refresh_save_reclaim_clock(seq)
             self._save_rr_last = sid
@@ -643,7 +667,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             owner = self._save_lease_owner.pop(lease_key, None)
             owned_operations = [
                 op
-                for op, operation_owner in self._save_operation_owner.items()
+                for op, operation_owner in self._save_previous_owner.items()
                 if id(operation_owner) == lease_key
             ]
             sid = str(owner.id) if owner is not None else None
@@ -651,13 +675,16 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if operation in owned_operations:
                 self._save_inflight.pop(sid, None)
                 self._cancel_save_statistics(operation)
-            for candidate in [
-                op for op in self._save_operation_blocks if op in owned_operations
-            ]:
+            for candidate in owned_operations:
                 self._save_operation_blocks.pop(candidate, None)
                 self._save_operation_safe.pop(candidate, None)
                 self._save_operation_owner.pop(candidate, None)
                 self._source_safe_waiting_for_store.pop(candidate, None)
+                self._save_previous_frontier.pop(candidate, None)
+                self._save_previous_owner.pop(candidate, None)
+                self._save_quiescent.discard(candidate)
+                if sid is not None and self._save_retry_blocked.get(sid) == candidate:
+                    self._save_retry_blocked.pop(sid, None)
             if sid is not None:
                 entry = self._save_tracker.get(sid)
                 if entry is not None and entry[0] is owner:
@@ -715,6 +742,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             # connector channel. This terminal only clears the in-flight save.
             self._finish_retired_request(sid)
             return
+        if isinstance(active, SaveOperationId):
+            self._save_previous_frontier.pop(active, None)
+            self._save_previous_owner.pop(active, None)
+            self._save_quiescent.discard(active)
         self._finish_save_statistics(req_id)
         self._release_operation_lease(req_id)
         self._finish_retired_request(sid)
@@ -770,6 +801,12 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 return False
             self._source_group_finished(identity)
             return None
+        if completion.channel == DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL:
+            operation = completion.operation_id
+            if not isinstance(operation, SaveOperationId) or not completion.succeeded:
+                return False
+            self._source_quiescent(operation)
+            return None
         if completion.channel != DENSE_PAGE_STORE_CHANNEL:
             return False
         operation = completion.operation_id
@@ -810,14 +847,22 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 self._save_lease_blocks.pop(lease_key, None)
                 self._save_lease_at.pop(lease_key, None)
                 self._save_lease_owner.pop(lease_key, None)
+        all_safe = set(block_map.values()).issubset(safe)
+        if all_safe:
+            # Every rank has finished reading every source block of this save,
+            # so a store failure that arrives now (or already arrived) may
+            # retry without waiting for a separate quiescent report.
+            self._save_quiescent.add(operation)
         if self._save_inflight.get(sid) == operation:
             self._source_safe_waiting_for_store.setdefault(operation, set()).update(
                 newly_safe
             )
-        elif set(block_map.values()).issubset(safe):
+        elif all_safe:
             self._save_operation_blocks.pop(operation, None)
             self._save_operation_safe.pop(operation, None)
             self._save_operation_owner.pop(operation, None)
+        if all_safe and self._save_retry_blocked.get(sid) == operation:
+            self._retry_or_retire_failed_save(operation)
 
     def _store_finished(self, operation: SaveOperationId, *, succeeded: bool) -> None:
         sid = str(operation.req_id)
@@ -832,13 +877,72 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._save_inflight.pop(sid, None)
         self._source_safe_waiting_for_store.pop(operation, None)
         if succeeded:
+            self._save_previous_frontier.pop(operation, None)
+            self._save_previous_owner.pop(operation, None)
+            self._save_quiescent.discard(operation)
             self._finish_save_statistics(operation)
             # Store completion is also a source-safety fence for cache hits.
             self._release_operation_lease(operation)
         else:
             self._cancel_save_statistics(operation)
-            # Failed stores keep unsafe ranges leased until abandon timeout.
+            if operation in self._save_quiescent:
+                self._retry_or_retire_failed_save(operation)
+            else:
+                # A post-submit failure may still be reading the source. Do
+                # not retry or release its lease without a TP-wide fence.
+                self._save_retry_blocked[sid] = operation
+                return
         self._finish_retired_request(sid)
+
+    def _source_quiescent(self, operation: SaveOperationId) -> None:
+        sid = str(operation.req_id)
+        if (
+            operation not in self._save_previous_frontier
+            and operation not in self._save_operation_blocks
+        ):
+            return
+        self._save_quiescent.add(operation)
+        # Every rank either completed its store or rejected it before any GPU
+        # read. Its source blocks no longer need a save lease.
+        self._release_operation_lease(operation)
+        if self._save_retry_blocked.get(sid) == operation:
+            self._retry_or_retire_failed_save(operation)
+
+    def _retry_or_retire_failed_save(self, operation: SaveOperationId) -> None:
+        sid = str(operation.req_id)
+        if self._save_retry_blocked.get(sid) == operation:
+            self._save_retry_blocked.pop(sid, None)
+        self._save_quiescent.discard(operation)
+        # The failed operation is quiescent on every rank: its exact block map
+        # is no longer needed, and a retry records a fresh one.
+        self._release_operation_lease(operation)
+        previous = self._save_previous_frontier.pop(operation, None)
+        entry = self._save_tracker.get(sid)
+        owner = self._save_previous_owner.pop(operation, None)
+        if entry is None or previous is None:
+            return
+        if owner is not None and entry[0] is not owner:
+            return  # request ID was reused
+        if hasattr(entry[0], "_offload_finished_block_ids"):
+            # Teardown may already have returned the source blocks to the pool.
+            # A missing cache entry is safer than a retry against recycled KV.
+            self._save_tracker.pop(sid, None)
+            lease_key = id(entry[0])
+            remaining = self._save_lease_blocks.pop(lease_key, None)
+            self._save_lease_at.pop(lease_key, None)
+            self._save_lease_owner.pop(lease_key, None)
+            if remaining:
+                # Teardown also leased any not-yet-emitted suffix. No further
+                # save will read it once this request is retired.
+                self._pending_source_safe_releases.append(frozenset(remaining))
+                self.total_source_safe_released_blocks += len(remaining)
+            return
+        entry[1] = min(int(entry[1]), previous)
+        logger.warning(
+            "LMCache offload: retrying failed dense save req=%s from token %d",
+            sid,
+            previous,
+        )
 
     def _release_operation_lease(self, operation) -> None:
         if not isinstance(operation, SaveOperationId):
@@ -859,6 +963,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 self._save_lease_owner.pop(lease_key, None)
 
     def _finish_retired_request(self, sid: str) -> None:
+        if sid in self._save_retry_blocked:
+            return
         entry = self._save_tracker.get(sid)
         if entry is None:
             return
@@ -889,6 +995,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._save_operation_blocks.pop(operation, None)
             self._save_operation_safe.pop(operation, None)
             self._source_safe_waiting_for_store.pop(operation, None)
+            self._save_previous_frontier.pop(operation, None)
+            self._save_previous_owner.pop(operation, None)
+            self._save_quiescent.discard(operation)
+            if self._save_retry_blocked.get(sid) == operation:
+                self._save_retry_blocked.pop(sid, None)
         if blocks:
             self._pending_source_safe_releases.append(frozenset(blocks))
             self.total_abnormal_lease_reclaims += len(blocks)
@@ -962,6 +1073,23 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         entry = self._save_tracker.get(sid)
         if entry is not None and entry[0] is seq:
             self._save_tracker.pop(sid, None)
+        blocked = self._save_retry_blocked.get(sid)
+        if (
+            blocked is not None
+            and self._save_previous_owner.get(blocked) is seq
+            and sid not in self._save_tracker
+        ):
+            # The request's blocks are gone (never deferred, or released back
+            # to the pool), so a parked failed save has nothing left to retry
+            # or reclaim.
+            self._save_retry_blocked.pop(sid, None)
+            self._save_previous_frontier.pop(blocked, None)
+            self._save_previous_owner.pop(blocked, None)
+            self._save_quiescent.discard(blocked)
+            self._save_operation_blocks.pop(blocked, None)
+            self._save_operation_safe.pop(blocked, None)
+            self._save_operation_owner.pop(blocked, None)
+            self._source_safe_waiting_for_store.pop(blocked, None)
 
     def request_finished(self, seq) -> None:
         sid = str(seq.id)
@@ -1005,6 +1133,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
 
 __all__ = [
+    "DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL",
     "DENSE_PAGE_SOURCE_SAFE_CHANNEL",
     "DENSE_PAGE_STORE_CHANNEL",
     "ChunkedOffloadSchedulerBase",

@@ -24,6 +24,7 @@ from atom.kv_transfer.offload._block_gpu_connector import (
     _TransferGroup,
 )
 from atom.kv_transfer.offload.dense.connector import (
+    DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL,
     DENSE_PAGE_SOURCE_SAFE_CHANNEL,
     DENSE_PAGE_STORE_CHANNEL,
     DenseOffloadConnector,
@@ -73,6 +74,10 @@ def _source_safe(operation, *ranges):
 
 def _store_terminal(operation, succeeded=True):
     return ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, operation, succeeded)
+
+
+def _source_quiescent(operation):
+    return ConnectorCompletion(DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL, operation, True)
 
 
 def _finish_and_lease(scheduler, seq):
@@ -356,6 +361,153 @@ class TestTPQuorum:
 
 
 class TestStoreOutcomeSeparation:
+    def test_pre_submit_failure_retries_only_after_tp_source_quorum(self, monkeypatch):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(299, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 8
+        first = scheduler.build_connector_meta().requests[0]
+
+        scheduler.connector_completion(_store_terminal(first.save_operation, False))
+        assert scheduler.build_connector_meta().requests == []
+        assert scheduler._save_tracker[str(seq.id)][1] == 8
+
+        scheduler.connector_completion(_source_quiescent(first.save_operation))
+        retry = scheduler.build_connector_meta().requests[0]
+        assert retry.save_operation != first.save_operation
+        assert retry.save_spec.skip_leading_tokens == 0
+        assert retry.token_ids == first.token_ids
+
+    def test_retired_pre_submit_failure_releases_lease_without_retry(self, monkeypatch):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(298, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 8
+        operation = scheduler.build_connector_meta().requests[0].save_operation
+        assert _finish_and_lease(scheduler, seq) == frozenset({0, 1})
+        seq.block_table.clear()
+
+        scheduler.connector_completion(_store_terminal(operation, False))
+        assert scheduler.take_source_safe_releases() == []
+        scheduler.connector_completion(_source_quiescent(operation))
+        assert scheduler.take_source_safe_releases() == [frozenset({0, 1})]
+        assert scheduler.build_connector_meta().requests == []
+        assert scheduler.has_pending_work() is False
+
+    def test_mixed_tp_outcome_waits_for_all_source_quiescent_reports(self, monkeypatch):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(296, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 8
+        operation = scheduler.build_connector_meta().requests[0].save_operation
+        _finish_and_lease(scheduler, seq)
+        aggregator = KVOutputAggregator(world_size=2)
+
+        first = aggregator.aggregate(
+            [
+                KVConnectorOutput(
+                    connector_completions={
+                        _source_quiescent(operation),
+                        _store_terminal(operation, False),
+                    }
+                ),
+                KVConnectorOutput(),
+            ]
+        )
+        scheduler.process_completions(first)
+        assert scheduler.take_source_safe_releases() == []
+
+        second = aggregator.aggregate(
+            [
+                KVConnectorOutput(),
+                KVConnectorOutput(
+                    connector_completions={
+                        _source_quiescent(operation),
+                        _store_terminal(operation),
+                    }
+                ),
+            ]
+        )
+        scheduler.process_completions(second)
+        assert scheduler.take_source_safe_releases() == [frozenset({0, 1})]
+        assert scheduler.build_connector_meta().requests == []
+
+    def test_retired_failure_also_releases_unemitted_suffix(self, monkeypatch):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(295, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 8
+        operation = scheduler.build_connector_meta().requests[0].save_operation
+        seq.num_cached_tokens = 16
+        assert _finish_and_lease(scheduler, seq) == frozenset({0, 1, 2, 3})
+
+        scheduler.connector_completion(_store_terminal(operation, False))
+        scheduler.connector_completion(_source_quiescent(operation))
+
+        released = scheduler.take_source_safe_releases()
+        assert sorted(block for group in released for block in group) == [0, 1, 2, 3]
+        assert scheduler.build_connector_meta().requests == []
+        assert scheduler.has_pending_work() is False
+
+    def test_post_submit_failure_after_all_source_safe_retires_without_lease(
+        self, monkeypatch
+    ):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(294, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 16
+        operation = scheduler.build_connector_meta().requests[0].save_operation
+        scheduler.connector_completion(_source_safe(operation, (0, 16)))
+        # Every source block is already safe, so teardown leases nothing.
+        assert _finish_and_lease(scheduler, seq) == frozenset()
+        seq.block_table.clear()
+
+        scheduler.connector_completion(_store_terminal(operation, False))
+
+        assert scheduler._save_tracker == {}
+        assert scheduler._save_retry_blocked == {}
+        assert scheduler._save_previous_owner == {}
+        assert scheduler._save_operation_blocks == {}
+        assert scheduler._save_operation_owner == {}
+        assert scheduler.build_connector_meta().requests == []
+        assert scheduler.has_pending_work() is False
+
+    def test_live_post_submit_failure_retries_once_all_source_groups_are_safe(
+        self, monkeypatch
+    ):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(293, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 8
+        first = scheduler.build_connector_meta().requests[0]
+
+        scheduler.connector_completion(_store_terminal(first.save_operation, False))
+        assert scheduler.build_connector_meta().requests == []
+        scheduler.connector_completion(_source_safe(first.save_operation, (0, 8)))
+
+        retry = scheduler.build_connector_meta().requests[0]
+        assert retry.save_operation != first.save_operation
+        assert retry.save_spec.skip_leading_tokens == 0
+        assert retry.token_ids == first.token_ids
+        assert first.save_operation not in scheduler._save_operation_blocks
+
+    def test_post_submit_failure_keeps_lease_until_stall_reclaim(self, monkeypatch):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(297, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 8
+        operation = scheduler.build_connector_meta().requests[0].save_operation
+        _finish_and_lease(scheduler, seq)
+
+        scheduler.connector_completion(_store_terminal(operation, False))
+        assert scheduler.take_source_safe_releases() == []
+        assert scheduler.build_connector_meta().requests == []
+        assert scheduler.has_pending_work() is True
+        scheduler._save_lease_at[id(seq)] = time.monotonic() - 10
+        assert scheduler.reclaim_stale_leases(1) == [frozenset({0, 1})]
+        assert scheduler._save_retry_blocked == {}
+        assert scheduler.has_pending_work() is False
+
     def test_commit_failure_after_source_safe_releases_without_success_stats(
         self, monkeypatch
     ):
@@ -471,10 +623,14 @@ class TestNoDoubleFree:
         new.block_table = [10, 11, 12, 13]
         scheduler.update_state_after_alloc(new)
         new.num_cached_tokens = 8
-        scheduler.build_connector_meta()
+        new_operation = scheduler.build_connector_meta().requests[0].save_operation
 
         assert scheduler.protected_block_ids(new) == frozenset({10, 11})
         assert scheduler.take_source_safe_releases() == []
+        scheduler.connector_completion(_source_quiescent(old_operation))
+        assert scheduler._save_inflight[str(new.id)] == new_operation
+        assert scheduler._save_tracker[str(new.id)][0] is new
+        assert scheduler.take_source_safe_releases() == [frozenset({0, 1})]
 
 
 class TestEarlyReleaseDefaultsOn:

@@ -1,25 +1,31 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import threading
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
 from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnectorScheduler,
 )
 from atom.kv_transfer.disaggregation.types import (
+    ConnectorCompletion,
     KVConnectorOutput,
     LoadOperationId,
     SaveOperationId,
 )
 from atom.kv_transfer.offload import config as offcfg
+from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
     DenseOffloadScheduler,
 )
 from atom.kv_transfer.offload.metadata import (
+    LMCacheOffloadMetadata,
     LMCacheReqMeta,
     LoadSpec,
     SaveSpec,
@@ -330,6 +336,222 @@ def test_dense_worker_exact_save_generations_do_not_form_cross_tp_quorum():
         for worker in workers:
             worker._save_executor.shutdown(wait=True)
             worker._load_executor.shutdown(wait=True)
+
+
+def test_dense_save_passes_one_step_producer_event_to_every_store(monkeypatch):
+    trace = []
+    rpc_stream = object()
+    rpc_thread = threading.get_ident()
+    events = []
+
+    class Event:
+        def __init__(self):
+            events.append(self)
+
+        def record(self, stream):
+            # The fence is recorded once, on the dispatching RPC thread, so a
+            # save thread never records its own (unordered) event.
+            assert threading.get_ident() == rpc_thread
+            assert stream is rpc_stream
+            trace.append(("record", self))
+
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: rpc_stream)
+
+    class Engine:
+        gpu_connector = object()
+
+        @staticmethod
+        def store(_tokens, **kwargs):
+            trace.append(("store", kwargs["producer_event"]))
+
+    worker = DenseOffloadConnector(_config("kv_producer"))
+    worker.chunk_size = 8
+    worker._engine = Engine()
+    metadata = LMCacheOffloadMetadata()
+    metadata.requests.extend(
+        [
+            LMCacheReqMeta(
+                req_id=req_id,
+                token_ids=list(range(8)),
+                block_ids=[req_id],
+                save_spec=SaveSpec(skip_leading_tokens=0),
+            )
+            for req_id in (31, 32)
+        ]
+    )
+
+    try:
+        worker.start_load_kv(metadata)
+        worker.close()
+
+        assert len(events) == 1
+        event = events[0]
+        assert trace[0] == ("record", event)
+        assert trace[1:] == [
+            ("store", event),
+            ("store", event),
+        ]
+    finally:
+        worker.close()
+
+
+def test_guard_forwards_keyword_arguments_and_logs_function_name(caplog):
+    worker = DenseOffloadConnector(_config("kv_producer"))
+    seen = []
+
+    def fail_save(req, *, producer_event):
+        seen.append((req.req_id, producer_event))
+        raise RuntimeError("boom")
+
+    request = LMCacheReqMeta(
+        req_id=41,
+        token_ids=list(range(8)),
+        block_ids=[1],
+        save_spec=SaveSpec(skip_leading_tokens=0),
+        save_operation=SaveOperationId(req_id=41, generation=0),
+    )
+    try:
+        with caplog.at_level("ERROR", logger="atom"):
+            worker._guard("save", fail_save, request, producer_event="fence")
+        assert seen == [(41, "fence")]
+        assert "fail_save failed for 41" in caplog.text
+        assert worker.get_finished().finished_saving == {request.save_operation}
+    finally:
+        worker.close()
+
+
+def test_dense_save_fence_failure_does_not_drop_the_step_load(monkeypatch):
+    load_operation = LoadOperationId(req_id=33, generation=1)
+    save_operation = SaveOperationId(req_id=33, generation=1)
+    second_save_operation = SaveOperationId(req_id=34, generation=2)
+    record_calls = []
+
+    class Event:
+        @staticmethod
+        def record(_stream):
+            record_calls.append(1)
+            raise RuntimeError("sticky HIP error")
+
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.cuda, "current_stream", object)
+
+    worker = DenseOffloadConnector(_config("kv_both"))
+    worker.chunk_size = 8
+    worker._engine = SimpleNamespace(
+        gpu_connector=object(),
+        lookup_unpin=lambda _req_id: None,
+        store=lambda *_args, **_kwargs: pytest.fail(
+            "an unfenced save must not be submitted"
+        ),
+    )
+    metadata = LMCacheOffloadMetadata()
+    metadata.add_request(
+        LMCacheReqMeta(
+            req_id=33,
+            token_ids=list(range(8)),
+            block_ids=[3],
+            load_spec=LoadSpec(
+                hbm_cached_tokens=0,
+                lmcache_cached_tokens=0,
+                can_load=True,
+            ),
+            save_spec=SaveSpec(skip_leading_tokens=0),
+            load_operation=load_operation,
+            save_operation=save_operation,
+        )
+    )
+    metadata.add_request(
+        LMCacheReqMeta(
+            req_id=34,
+            token_ids=list(range(8)),
+            block_ids=[4],
+            save_spec=SaveSpec(skip_leading_tokens=0),
+            save_operation=second_save_operation,
+        )
+    )
+
+    try:
+        worker.start_load_kv(metadata)
+        worker.close()
+        output = worker.get_finished()
+
+        assert output.finished_loading == {load_operation}
+        assert output.failed_loading == set()
+        assert record_calls == [1]
+        assert output.finished_saving == {save_operation, second_save_operation}
+        assert (
+            ConnectorCompletion("dense.page.store", save_operation, False)
+            in output.connector_completions
+        )
+        assert (
+            ConnectorCompletion("dense.page.source_quiescent", save_operation, True)
+            in output.connector_completions
+        )
+        assert (
+            ConnectorCompletion(
+                "dense.page.source_quiescent", second_save_operation, True
+            )
+            in output.connector_completions
+        )
+    finally:
+        worker.close()
+
+
+def test_block_gpu_connector_waits_on_actual_pack_stream_without_host_sync():
+    trace = []
+    stats = {}
+    producer_event = SimpleNamespace(
+        synchronize=lambda: pytest.fail("producer event must not host-synchronize")
+    )
+    pack_stream = SimpleNamespace(
+        wait_event=lambda event: trace.append(("wait", event))
+    )
+    state = SimpleNamespace(pack_stream=pack_stream, copy_stream=object())
+    connector = BlockGPUConnector.__new__(BlockGPUConnector)
+    connector._capture_transfer_stats = lambda: nullcontext(stats)
+    connector._prepare_transfer = lambda *_args, **_kwargs: (state, [object()])
+    connector._record_transfer_shape = lambda *_args: None
+
+    def prepare_block_id_stage(*_args):
+        # The block-ID upload is the first pack-stream work of a transfer; it
+        # must already be ordered behind the producer.
+        trace.append(("block_ids", None))
+        return object(), None, False
+
+    connector._prepare_block_id_stage = prepare_block_id_stage
+    connector._run_staged_pipeline = lambda *_args, **_kwargs: trace.append(
+        ("pipeline", None)
+    )
+
+    connector.batched_from_gpu(
+        [object()],
+        [0],
+        [8],
+        producer_event=producer_event,
+    )
+
+    assert trace == [
+        ("wait", producer_event),
+        ("block_ids", None),
+        ("pipeline", None),
+    ]
+    assert stats["producer_fenced"] == 1
+
+
+def test_block_gpu_connector_producer_event_is_keyword_only():
+    connector = BlockGPUConnector.__new__(BlockGPUConnector)
+    with pytest.raises(TypeError):
+        connector.batched_from_gpu([object()], [0], [8], object())
+
+
+def test_block_gpu_connector_refuses_producer_fence_without_pack_stream():
+    producer_event = SimpleNamespace(
+        synchronize=lambda: pytest.fail("must not fall back to host sync")
+    )
+    state = SimpleNamespace(pack_stream=None, copy_stream=None)
+    with pytest.raises(RuntimeError, match="pack stream"):
+        BlockGPUConnector._wait_for_save_source(state, producer_event)
 
 
 @pytest.mark.parametrize("outcome", ["exception", "miss"])

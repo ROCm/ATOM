@@ -279,7 +279,11 @@ Runs in each TP-rank worker. It does the actual byte movement.
   requires complete SLOT geometry and creates its checkpoint codec/store,
   admission pool, and fingerprint; partial initialization fails startup.
 - **`start_load_kv(metadata)`** — enqueues each load on `_load_executor` and each
-  save on `_save_executor`. DSV4 first issues its source-safe D2D SLOT snapshot
+  save on `_save_executor`. Dense records one CUDA event per save-bearing step
+  on the dispatching stream and hands it to every save of that step; the save
+  thread forwards it through `engine.store(producer_event=...)` so
+  `batched_from_gpu` can order its pack stream after the producing forward
+  without a host sync. DSV4 first issues its source-safe D2D SLOT snapshot
   on the current stream before returning; all subsequent D2H, PAGE transfer,
   encoding, and publication work stays on the executors.
 - **`_do_load_req` / `_do_save_req`** — run on the daemon threads. They call
@@ -361,7 +365,7 @@ rather than the P/D decode-jump in `Scheduler.schedule()`.
 ```mermaid
 flowchart LR
     A["seq.num_cached_tokens<br/>advances"] --> B["scheduler:<br/>SaveSpec(skip_leading_tokens)<br/>new chunk-aligned tokens only"]
-    B --> C["worker _do_save_req:<br/>engine.store(tokens, mask, block_ids)"]
+    B --> C["worker _do_save_req:<br/>engine.store(tokens, mask, block_ids,<br/>producer_event=step fence)"]
     C --> D["batched_from_gpu"]
     subgraph PIPE_S["BlockGPUConnector (2-stage)"]
         direction LR
@@ -636,6 +640,7 @@ reloaded fp8 block dequantizes identically; no scale is recomputed or dropped.
 | PAGE coverage precedes AOS1 put | worker `_do_save_req` | The sidecar is the commit marker; it must never authorize missing PAGE chunks. |
 | AOS1 identity, size, TP, and CRC match | `decode_checkpoint` | Stale geometry, wrong rank, truncation, and corruption all recompute rather than restore. |
 | Exact save generations aggregate across TP | `SaveOperationId`, aggregator | A failed or delayed rank from another save cannot commit a boundary. |
+| Dense save packs wait on the step's producer event | dense `start_load_kv`, `batched_from_gpu` | A non-final prefill chunk yields no token, so nothing else orders the save thread's pack stream after the producing kernels; `producer_fenced` in the transfer stats reports the wait was enqueued. |
 
 ### Failure handling
 
@@ -830,7 +835,11 @@ staging. Dense and DSV4 instantiate this shared adapter directly.
   group through a two-stage, event-synced pipeline (pack stream ↔ copy stream) so
   packing the next group overlaps copying the current one.
 - **save vs load** — `batched_from_gpu` = pack(Triton) → copy-to-MemoryObj;
-  `batched_to_gpu` = copy-from-MemoryObj → unpack(Triton). State is thread-local,
+  `batched_to_gpu` = copy-from-MemoryObj → unpack(Triton). `batched_from_gpu`
+  takes a keyword-only `producer_event`; LMCache forwards `store(**kwargs)` to
+  it, which is the one cross-repo assumption the dense save fence rests on
+  (a store that reaches the connector without the event reports
+  `producer_fenced=0`). State is thread-local,
   so the load and save executors own **separate** staging buffers (see the HBM
   formula under [Save / Load Data Flow](#save--load-data-flow)).
 
