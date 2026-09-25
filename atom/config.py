@@ -1959,6 +1959,11 @@ class Config:
     # Requests in the sliding window behind the status line's prefix-cache hit
     # rate. Validated > 0 by EngineStats.
     cache_hit_rate_window: int = 1000
+    enable_dynamic_chunking: bool = False
+    dynamic_chunking_smooth_factor: float = 0.75
+    # Floor for solved chunks. Every extra chunk re-pays the cached-prefix
+    # rebuild, so the floor is what bounds that amplification.
+    dynamic_chunking_min_chunk_size: int = 4096
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
@@ -2247,6 +2252,26 @@ class Config:
                 )
                 self.dcp_config.enable_query_replication = False
         assert 1 <= self.pipeline_parallel_size
+        if self.enable_dynamic_chunking:
+            # Checked only when the feature is on. A stale
+            # ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR in a shared launch script
+            # must not stop a server that never asked for dynamic chunking.
+            if not 0.0 <= self.dynamic_chunking_smooth_factor <= 1.0:
+                raise ValueError("dynamic_chunking_smooth_factor must be in [0, 1]")
+            if self.dynamic_chunking_min_chunk_size <= 0:
+                raise ValueError("dynamic_chunking_min_chunk_size must be positive")
+            if self.pipeline_parallel_size <= 1 or not self.enable_chunked_prefill:
+                # Same degrade-to-fixed path as a failed profile or a rejected
+                # fit. Raising here would make `--enable-dynamic-chunking` on a
+                # TP-only server a hard failure, unlike every other miss.
+                logger.warning(
+                    "Dynamic chunking needs pipeline_parallel_size > 1 and "
+                    "enable_chunked_prefill=True (got pp=%d, chunked_prefill=%s); "
+                    "leaving chunking fixed",
+                    self.pipeline_parallel_size,
+                    self.enable_chunked_prefill,
+                )
+                self.enable_dynamic_chunking = False
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
         )

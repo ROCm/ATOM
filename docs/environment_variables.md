@@ -69,6 +69,17 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | **ATOM_PREFILL_DELAYER_DEBUG** | bool | false | Per-tick FIRE/HOLD debug logging. |
 | **ATOM_PREFILL_DELAYER_LOG_EVERY** | int | 1000 | Emit aggregate stats (per-exit fire counts + hold rate) every N decisions (0 disables). |
 
+## Dynamic chunking
+
+Interpolates pipeline-parallel chunk sizes between the configured batch budget
+and the equal-latency size solved from the calibrated chunk model. Read as the
+default of `--dynamic-chunking-smooth-factor`. Only consulted when
+`--enable-dynamic-chunking` is set.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR** | float | 0.75 | Blend from the initial chunk (`0`) to the equal-latency chunk (`1`). Must be in `[0, 1]` when dynamic chunking is enabled. |
+
 ## Model loading
 
 | Variable | Type | Default | Description |

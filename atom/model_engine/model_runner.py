@@ -43,6 +43,7 @@ from atom.distributed.pp_comm import (
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
+from atom.model_engine.dynamic_chunking import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
@@ -639,6 +640,7 @@ class ModelRunner:
         self.tp_world_size = config.tp_world_size
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.tp_world_size}"
+        self._dynamic_chunking = DynamicChunkingWorker(self)
         self.hf_text_config = get_hf_text_config(hf_config)
         if self.hf_text_config.model_type in ["llama"] and self.config.torch_dtype in [
             torch.bfloat16,
@@ -1240,6 +1242,14 @@ class ModelRunner:
         logger.info(
             f"{self.label}: warmup_model {time.time() - start_time:.2f} seconds with {num_seqs} reqs {total_tokens_num} tokens"
         )
+
+    def profile_dynamic_chunking(self):
+        """Fit chunk overhead from startup dummy forwards (engine RPC)."""
+        return self._dynamic_chunking.profile()
+
+    def take_dynamic_chunking_fit(self):
+        """Return newly calibrated chunk latency coefficients (engine RPC)."""
+        return self._dynamic_chunking.take_fit()
 
     def allocate_forward_vars(self):
         config = self.config
@@ -2878,6 +2888,8 @@ class ModelRunner:
                         tgt = self.attn_metadata_builder._sparse_kv_indices_gpu
                         tgt[: recv_sparse.numel()].copy_(recv_sparse)
 
+                # Time only the chunk computation between PP receive and send.
+                chunk_sample = self._dynamic_chunking.start_sample(batch)
                 if pp_enabled:
                     model_output = self.model(
                         input_ids,
@@ -2891,6 +2903,7 @@ class ModelRunner:
                     model_output = self.model(
                         input_ids, positions, inputs_embeds=inputs_embeds
                     )
+                self._dynamic_chunking.finish_sample(chunk_sample)
                 if pp_enabled and not pp_group.is_last_rank:
                     # GLM-5.2 IndexShare: carry top-k for next rank's shared layers.
                     if self._pp_send_needs_sparse:

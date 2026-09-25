@@ -98,6 +98,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SGLANG_EAGLE3_TP_VERIFY_BROADCAST": lambda: (
         os.getenv("ATOM_SGLANG_EAGLE3_TP_VERIFY_BROADCAST", "0") == "1"
     ),
+    # Dynamic CPP follows SGLang's quadratic chunk-size predictor. This factor
+    # interpolates between the configured initial chunk size (0) and the fitted
+    # equal-latency size (1). Values around 0.6-0.85 are typically most stable.
+    "ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR": lambda: float(
+        os.getenv("ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR", "0.75")
+    ),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
