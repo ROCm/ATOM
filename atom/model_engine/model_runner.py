@@ -999,6 +999,22 @@ class ModelRunner:
                 prefill_context_model_parallel_size=config.prefill_context_parallel_size,
             )
         else:
+            pc = config.parallel_config
+            # mori v2 never uses mori's shmem heap (it brings its own cco
+            # communicator), but aiter's MoriAll2AllManager initializes it
+            # anyway, and that init resolves every cross-host peer to RDMA: on
+            # an EP group spanning nodes with no NIC it asserts "no transport
+            # available for peer". v1 keeps the init -- its InterNodeV1 kernels
+            # reach remote peers through the heap.
+            # Shmem init is collective over the EP group, so this must agree on
+            # every rank -- hence not pc.is_multinode_dp, whose
+            # `data_parallel_rank > 0` arm is true for every engine but the
+            # first even on one node, once CoreManager has given each engine
+            # its global DP rank.
+            skip_mori_shmem_init = (
+                pc.data_parallel_size_local < pc.data_parallel_size
+                and envs.ATOM_MORI_V2
+            )
             # The group spans the devices that exist; apply_simulated_tp then
             # makes it *report* the logical width so layers shard that many ways.
             init_dist_env(
@@ -1016,6 +1032,7 @@ class ModelRunner:
                 decode_context_parallel_size=getattr(
                     config, "decode_context_parallel_size", 1
                 ),
+                skip_mori_shmem_init=skip_mori_shmem_init,
             )
             apply_simulated_tp(config)
 
