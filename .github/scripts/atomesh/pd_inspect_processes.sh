@@ -19,6 +19,19 @@ while IFS= read -r container; do
   timeout --kill-after=5s 90s docker exec "${container}" bash -c '
     id
     ps -eo pid,ppid,etimes,pcpu,stat,wchan:24,comm
+    declare -A metric_ports=()
+    offset="${ATOMESH_SERVICE_PORT_OFFSET:-0}"
+    for port in "${PREFILL_PORT:-}" "${DECODE_PORT:-}"; do
+      [[ "${port}" =~ ^[0-9]{1,5}$ && "${offset}" =~ ^[0-9]{1,5}$ ]] || continue
+      port=$((10#${port} + 10#${offset}))
+      ((port >= 1 && port <= 65535)) || continue
+      [[ -z "${metric_ports[${port}]:-}" ]] || continue
+      metric_ports["${port}"]=1
+      printf "Metrics port=%s\n" "${port}"
+      date -u
+      curl -fsS --connect-timeout 2 --max-time 5 "http://127.0.0.1:${port}/metrics" |
+        grep -E "^vllm:(request_success_total|request_generation_tokens_(sum|count|bucket)|request_prompt_tokens_(sum|count)|num_requests_running|num_requests_waiting|num_preemptions_total|kv_cache_usage_perc|generation_tokens_total|prompt_tokens_total)" || true
+    done
     spy="$(command -v py-spy || true)"
     if [[ -z "${spy}" ]]; then
       target=/tmp/atomesh-inspection-py-spy
