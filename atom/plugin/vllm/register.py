@@ -141,6 +141,22 @@ def _register_mxfp8_quantization_config() -> None:
 
 
 def register_platform() -> str | None:
+    """Return the ATOM platform's qualname for vLLM's platform-plugin group.
+
+    Registration work belongs in ``register_model()``, not here. vLLM calls this
+    while ``import vllm`` is still running its own module bodies, so importing
+    its deeper subtrees raises on a half-initialised module -- and the resolve
+    loop's ``except Exception: pass`` then drops ATOM's platform for the builtin
+    one. Anything imported here that reads ``current_platform`` loses it the
+    same way, by re-entering the resolve before it has memoised anything.
+
+    Measured on vLLM 0.28.1 (``2cf0a6915``): with the mxfp8 and KV-connector
+    registrations still called from here, ATOMPlatform was never live, so
+    DeepSeek-V4 silently lost the prefix-cache SWA rollback that
+    ``check_and_update_config`` installs.
+
+    Also called up to three times per process, so this stays idempotent.
+    """
 
     if disable_vllm_plugin:
         # return None instead of error because the flag can be used to
@@ -166,20 +182,36 @@ def register_platform() -> str | None:
     # absent. Backbone is set in register_model() for real vLLM runs.
 
     _register_hf_configs()
-    _register_mxfp8_quantization_config()
-    # DeepSeek-V4's packed proxy arena cannot immediately recycle block ids;
-    # install the targeted scheduler-side queue-order compatibility patch before
-    # any KVCacheManager is constructed.
-    from atom.plugin.vllm.deepseek_v4_prefix_patch import (
-        apply_vllm_v4_block_reuse_patch,
-    )
-
-    apply_vllm_v4_block_reuse_patch()
-
-    _register_kv_connectors()
 
     # return the ATOM platform to vllm
     return "atom.plugin.vllm.platform.ATOMPlatform"
+
+
+def _warn_if_atom_platform_not_live() -> None:
+    """Say so when vLLM memoised a platform other than ATOM's.
+
+    Nothing else does: vLLM logs the plugin as activated either way. Reads
+    ``_current_platform`` rather than ``current_platform`` because the public
+    attribute resolves on access, which would resolve it late from here -- where
+    it succeeds -- and hide what is being checked.
+    """
+    try:
+        import vllm.platforms as vllm_platforms
+
+        from atom.plugin.vllm.platform import ATOMPlatform
+    except ImportError:
+        return
+
+    live = getattr(vllm_platforms, "_current_platform", None)
+    if live is None or ATOMPlatform is None or isinstance(live, ATOMPlatform):
+        return
+
+    logger.warning(
+        "ATOM plugin: vLLM resolved current_platform to %s, not ATOMPlatform, so "
+        "ATOMPlatform.check_and_update_config never runs. For DeepSeek-V4 that "
+        "silently disables the prefix-cache SWA rollback. See register_platform().",
+        type(live).__name__,
+    )
 
 
 def _register_kv_connectors() -> None:
@@ -294,13 +326,22 @@ def register_model() -> None:
         return
 
     _set_plugin_mode()
-    # The general-plugin hook runs in the EngineCore process that owns the
-    # scheduler/KVCacheManager; install this here as well as in the platform hook.
+
+    # Not in `register_platform()`: these imports are circular there, see the
+    # note on it. This hook runs from `EngineArgs.__post_init__`, still before
+    # `ModelConfig` reads the checkpoint's `quant_method`.
+    _register_mxfp8_quantization_config()
+    _register_kv_connectors()
+
+    # Also the EngineCore process that owns the scheduler/KVCacheManager, so this
+    # has to be installed before any KVCacheManager is constructed.
     from atom.plugin.vllm.deepseek_v4_prefix_patch import (
         apply_vllm_v4_block_reuse_patch,
     )
 
     apply_vllm_v4_block_reuse_patch()
+
+    _warn_if_atom_platform_not_live()
 
     from atom.plugin.vllm.gdn_backend import register_gdn_attention_backend
 
