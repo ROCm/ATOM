@@ -20,14 +20,18 @@ class SeqView:
     """One vLLM request, shaped like an ATOM ``Sequence`` for offload."""
 
     __slots__ = (
+        # Stamped by the shared offload scheduler when it refreshes a parked
+        # deferred save; read back with ``getattr(seq, ..., None)``, so an
+        # unset slot reads as "not parked".
+        "_deferred_save_at",
         "_load_operation",
         "_num_cached_tokens",
         # Written by the chunked scheduler's early-block-release path, which
-        # freezes a finished request's placement so a final save can still be
-        # dispatched after vLLM has handed the blocks back. Deliberately left
-        # unset in ``__init__``: that path tests for them with ``hasattr``, and
-        # an unset slot is absent the same way a missing attribute is.
-        "_offload_finished_block_ids",
+        # marks a finished request and freezes its computed prefix so a final
+        # save can still be dispatched after vLLM has handed the blocks back.
+        # Deliberately left unset in ``__init__``: an unset slot reads as absent
+        # the same way a missing attribute does.
+        "_offload_finished",
         "_offload_finished_cached_tokens",
         "_request",
         "block_table",
@@ -113,7 +117,7 @@ class SeqView:
         # Frozen placement from a previous finish is placement too, and a
         # preempted request's is as stale as the live block table.
         for frozen in (
-            "_offload_finished_block_ids",
+            "_offload_finished",
             "_offload_finished_cached_tokens",
         ):
             if hasattr(self, frozen):

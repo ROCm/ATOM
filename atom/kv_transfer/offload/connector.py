@@ -177,6 +177,11 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     def __init__(self, config) -> None:
         self._impl = _build_scheduler(config)
 
+    def bind_block_manager(self, block_manager) -> None:
+        callback = getattr(self._impl, "bind_block_manager", None)
+        if callable(callback):
+            callback(block_manager)
+
     @property
     def has_state_tier(self) -> bool:
         """True when the selected impl actually hosts the KDA state tier.
@@ -222,6 +227,10 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     def protected_block_ids(self, seq):
         callback = getattr(self._impl, "protected_block_ids", None)
         return callback(seq) if callback is not None else None
+
+    def can_partially_deallocate_state(self, seq) -> bool:
+        callback = getattr(self._impl, "can_partially_deallocate_state", None)
+        return callable(callback) and callback(seq) is True
 
     def activate_block_leases(self, seq, block_ids) -> None:
         callback = getattr(self._impl, "activate_block_leases", None)

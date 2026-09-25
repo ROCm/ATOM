@@ -11,11 +11,13 @@ without knowing which model or attention implementation produced them.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
-import os
 import threading
 import time
 from collections import deque
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -23,19 +25,27 @@ import torch
 
 from atom.kv_transfer.disaggregation.base import KVConnectorBase
 from atom.kv_transfer.disaggregation.types import (
+    ConnectorCompletion,
     KVConnectorOutput,
     LoadCompletionId,
     LoadOperationId,
     SaveCompletionId,
+    SaveOperationId,
+    SaveSourceGroupId,
 )
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._offload_common import validated_kv_role
-from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
+from atom.kv_transfer.offload.chunked_scheduler import (
+    DENSE_PAGE_SOURCE_SAFE_CHANNEL,
+    DENSE_PAGE_STORE_CHANNEL,
+    ChunkedOffloadSchedulerBase,
+)
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReqMeta
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
-_MP_LAYOUT_VERSION = 2
+_MP_LAYOUT_VERSION = 3
 _OPERATION_TOMBSTONE_LIMIT = 4096
 
 
@@ -61,11 +71,17 @@ def _storage_kv_transfer_config(config: Any) -> dict[str, Any]:
     return kvc
 
 
+def _mp_session_id(config: Any, request_id: Any) -> str:
+    """Scope one LMCache MP request session to its global DP replica."""
+
+    return f"{offcfg.lmcache_engine_id(config)}:{request_id}"
+
+
 def _transfer_mode(config: Any) -> str:
     extra = _extra_config(config)
     configured_mode = extra.get("lmcache.mp.mp_transfer_mode")
     if configured_mode is None:
-        configured_mode = os.environ.get("LMCACHE_MP_TRANSFER_MODE", "auto")
+        configured_mode = envs.LMCACHE_MP_TRANSFER_MODE
     transfer_mode = str(configured_mode).strip().lower()
     if transfer_mode not in ("auto", "lmcache_driven", "engine_driven"):
         raise ValueError(
@@ -114,14 +130,24 @@ def _validate_mp_config(config: Any) -> tuple[int, int]:
         or 1,
         minimum=1,
     )
+    dp_size_local = offcfg._strict_integer(
+        "data_parallel_size_local",
+        getattr(parallel_config, "data_parallel_size_local", dp_size) or dp_size,
+        minimum=1,
+    )
     if pp_size != 1:
         raise NotImplementedError("lmcache_mp does not support PP yet")
     if dcp_size != 1:
         raise NotImplementedError("lmcache_mp does not support DCP yet")
     if pcp_size != 1:
         raise NotImplementedError("lmcache_mp does not support PCP yet")
-    if dp_size != 1 or bool(getattr(config, "enable_dp_attention", False)):
-        raise NotImplementedError("lmcache_mp currently supports TP-only deployments")
+    if dp_size_local != dp_size:
+        raise NotImplementedError(
+            "lmcache_mp supports DP and DP-attention only within one host; "
+            "multi-node DP requires one LMCache server per host and local "
+            "server routing "
+            f"(data_parallel_size={dp_size}, local={dp_size_local})"
+        )
 
     _transfer_mode(config)
     return tp_size, pp_size
@@ -140,6 +166,11 @@ def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
     """
 
     hf_config = getattr(config, "hf_config", None)
+    # MiniMax-M3 is GQA. Some TP ranks can happen to own the same KV head when
+    # TP exceeds the global KV-head count, but the complete PAGE object is not
+    # replicated across the whole TP group and must remain one shard per rank.
+    if offcfg._is_minimax_m3(hf_config):
+        return False
     hf_config = getattr(hf_config, "text_config", hf_config)
     return getattr(hf_config, "kv_lora_rank", None) is not None
 
@@ -168,22 +199,29 @@ def _published_tp_replication_factor(
     transfer_tensors: Any,
     *,
     tp_size: int,
+    native_state: bool = False,
 ) -> int:
-    """Validate the attention backend's whole-PAGE replication declaration."""
+    """Validate a backend's whole-object TP replication declaration."""
 
+    attribute = (
+        "native_state_tp_replication_factor"
+        if native_state
+        else "tp_replication_factor"
+    )
+    label = "native STATE" if native_state else "KV PAGE"
     factor = offcfg._strict_integer(
-        "KV PAGE TP replication factor",
-        getattr(transfer_tensors, "tp_replication_factor", 1),
+        f"{label} TP replication factor",
+        getattr(transfer_tensors, attribute, 1),
         minimum=1,
     )
     if tp_size % factor:
         raise ValueError(
-            f"KV PAGE TP replication factor {factor} must divide TP size {tp_size}"
+            f"{label} TP replication factor {factor} must divide TP size {tp_size}"
         )
     if factor not in (1, tp_size):
         raise NotImplementedError(
             "lmcache_mp currently supports only sharded or fully TP-replicated "
-            f"PAGE layouts, got replication factor {factor} for TP size {tp_size}"
+            f"{label} layouts, got replication factor {factor} for TP size {tp_size}"
         )
     return factor
 
@@ -218,7 +256,7 @@ def _server_urls(config: Any) -> list[str]:
     return urls
 
 
-def _model_namespace(config: Any) -> str:
+def _model_namespace(config: Any, *, checkpoint_spec: Any = None) -> str:
     """Build a model/layout namespace shared by scheduler and workers."""
 
     cfg = offcfg.build_lmcache_config(_storage_kv_transfer_config(config))
@@ -228,7 +266,21 @@ def _model_namespace(config: Any) -> str:
         cfg,
         world_size,
     )
-    return f"{page_namespace}::lmcache-mp-v{_MP_LAYOUT_VERSION}"
+    namespace = f"{page_namespace}::lmcache-mp-v{_MP_LAYOUT_VERSION}"
+    if checkpoint_spec is not None:
+        hf = getattr(config, "hf_config", None)
+        hf = getattr(hf, "text_config", hf)
+        document = {
+            "checkpoint": checkpoint_spec.to_wire(),
+            "hf_commit": getattr(hf, "_commit_hash", None),
+            "revision": getattr(config, "revision", None),
+            "model_revision": _extra_config(config).get("lmcache.mp.model_revision"),
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(document, sort_keys=True).encode()
+        ).hexdigest()[:32]
+        namespace += f"::native-state-v1-{fingerprint}"
+    return namespace
 
 
 def _parallel_strategy(config: Any, worker_id: int) -> Any:
@@ -247,7 +299,7 @@ def _parallel_strategy(config: Any, worker_id: int) -> Any:
     )
 
 
-def _make_scheduler_adapter(config: Any) -> Any:
+def _make_scheduler_adapter(config: Any, *, checkpoint_spec: Any = None) -> Any:
     import zmq
     from lmcache.integration.atom import AtomMPSchedulerAdapter
 
@@ -264,14 +316,14 @@ def _make_scheduler_adapter(config: Any) -> Any:
     return _ReaderAwareSchedulerAdapter(
         server_url=_server_urls(config)[0],
         context=zmq.Context.instance(),
-        model_name=_model_namespace(config),
+        model_name=_model_namespace(config, checkpoint_spec=checkpoint_spec),
         block_size=int(config.kv_cache_block_size),
         parallel_config=_parallel_strategy(config, 0),
         mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
     )
 
 
-def _make_worker_adapter(config: Any, rank: int) -> Any:
+def _make_worker_adapter(config: Any, rank: int, *, checkpoint_spec: Any = None) -> Any:
     import zmq
     from lmcache.integration.atom import AtomMPWorkerAdapter
 
@@ -279,7 +331,7 @@ def _make_worker_adapter(config: Any, rank: int) -> Any:
     return AtomMPWorkerAdapter(
         server_url=_server_urls(config)[0],
         context=zmq.Context.instance(),
-        model_name=_model_namespace(config),
+        model_name=_model_namespace(config, checkpoint_spec=checkpoint_spec),
         block_size=int(config.kv_cache_block_size),
         parallel_config=_parallel_strategy(config, rank),
         mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
@@ -372,9 +424,16 @@ def _build_cache_views(
         if bool(getattr(region, "reverse_indexed", False)):
             raise ValueError("lmcache_mp PAGE regions cannot be reverse-indexed")
 
+        # LMCache receives these tensors as opaque PAGE storage, not numerical
+        # values.  Publish a zero-copy byte view so every transfer path copies
+        # the exact bit pattern.  This is especially important on ROCm, where
+        # LMCache's Python raw-pointer fallback cannot express FP8 through the
+        # CUDA array interface and would otherwise reconstruct the destination
+        # as uint8 while keeping the staging object as FP8.
+        byte_view = view.view(torch.uint8)
         role = str(getattr(region, "semantic_role", None) or f"plane_{index}")
-        tensors[f"page.{index}.{role}"] = view
-        layout = (view.dtype, tuple(int(dim) for dim in view.shape[1:]))
+        tensors[f"page.{index}.{role}"] = byte_view
+        layout = (byte_view.dtype, tuple(int(dim) for dim in byte_view.shape[1:]))
         indices_by_layout.setdefault(layout, []).append(index)
         devices.add(view.device)
         bytes_per_block += unit_bytes
@@ -406,6 +465,8 @@ class _PendingLoad:
 class _PendingSave:
     completion: SaveCompletionId
     future: Any | None
+    start: int
+    end: int
 
 
 def _terminal_future_result(future: Any | None) -> tuple[bool, Any]:
@@ -450,15 +511,47 @@ def _remember_operation_tombstone(
         tombstones.discard(tombstone_order.popleft())
 
 
+def _chunk_ranges(start: int, end: int, chunk_size: int) -> tuple[tuple[int, int], ...]:
+    """Split ``[start, end)`` into LMCache chunk token ranges."""
+
+    return tuple(
+        (chunk_start, min(chunk_start + chunk_size, end))
+        for chunk_start in range(start, end, chunk_size)
+    )
+
+
+def _source_safe_completions(
+    operation: SaveOperationId, ranges: Iterable[Sequence[int]]
+) -> set[ConnectorCompletion]:
+    """One PAGE source-safe completion per finished token range of a save."""
+
+    return {
+        ConnectorCompletion(
+            DENSE_PAGE_SOURCE_SAFE_CHANNEL,
+            SaveSourceGroupId(operation, (tuple(token_range),)),
+            True,
+        )
+        for token_range in ranges
+    }
+
+
 class _MPLookupClient:
     """Synchronous lookup facade used by ATOM's existing scheduler policy."""
 
     token_database = None
 
-    def __init__(self, adapter: Any, *, timeout: float, poll_interval: float) -> None:
+    def __init__(
+        self,
+        adapter: Any,
+        *,
+        config: Any,
+        timeout: float,
+        poll_interval: float,
+    ) -> None:
         if timeout <= 0 or poll_interval <= 0:
             raise ValueError("LMCache MP lookup timeout and poll interval must be > 0")
         self._adapter = adapter
+        self._config = config
         self._timeout = timeout
         self._poll_interval = poll_interval
         self._lookups: dict[str, _LookupState] = {}
@@ -473,10 +566,11 @@ class _MPLookupClient:
 
         state = _LookupState(token_ids=list(token_ids))
         self._lookups[lookup_id] = state
-        self._adapter.maybe_submit_lookup_request(lookup_id, token_ids)
+        request_id = _mp_session_id(self._config, lookup_id)
+        self._adapter.maybe_submit_lookup_request(request_id, token_ids)
         deadline = time.monotonic() + self._timeout
         while True:
-            result = self._adapter.check_lookup_result(lookup_id)
+            result = self._adapter.check_lookup_result(request_id)
             if result is not None:
                 hit = int(result)
                 state.hit = hit
@@ -513,6 +607,7 @@ class _MPLookupClient:
                 f"invalid retrieve range for {lookup_id}: start={start}, end={end}"
             )
         state = self._lookups.get(lookup_id)
+        request_id = _mp_session_id(self._config, lookup_id)
         if (
             state is not None
             and state.hit is not None
@@ -527,7 +622,7 @@ class _MPLookupClient:
                 token_ids=state.token_ids,
                 start=0,
                 end=min(start, state.hit),
-                request_id=lookup_id,
+                request_id=request_id,
             )
         if (
             state is not None
@@ -539,12 +634,12 @@ class _MPLookupClient:
                 token_ids=state.token_ids,
                 start=end,
                 end=state.hit,
-                request_id=lookup_id,
+                request_id=request_id,
             )
         if state is not None:
             state.retrieve_start = start
             state.retrieve_end = end
-        self._adapter.cleanup_lookup_result(lookup_id)
+        self._adapter.cleanup_lookup_result(request_id)
 
     def complete_retrieve(self, lookup_id: str, *, succeeded: bool) -> None:
         # Once a retrieve is submitted, LMCache owns the remaining lookup
@@ -554,7 +649,7 @@ class _MPLookupClient:
         # scheduler cannot distinguish a pre-submit failure; that rarer case is
         # left to request end_session/server TTL cleanup instead.
         self._lookups.pop(lookup_id, None)
-        self._adapter.cleanup_lookup_result(lookup_id)
+        self._adapter.cleanup_lookup_result(_mp_session_id(self._config, lookup_id))
 
     def hit_tokens(self, lookup_id: str) -> int | None:
         state = self._lookups.get(lookup_id)
@@ -562,8 +657,9 @@ class _MPLookupClient:
 
     def clear_lookup_status(self, lookup_id: str) -> None:
         state = self._lookups.pop(lookup_id, None)
+        request_id = _mp_session_id(self._config, lookup_id)
         if state is not None and state.hit is None:
-            result = self._adapter.check_lookup_result(lookup_id)
+            result = self._adapter.check_lookup_result(request_id)
             if result is None:
                 logger.warning(
                     "LMCache MP lookup for request %s is still pending during "
@@ -571,7 +667,7 @@ class _MPLookupClient:
                     "cleanup releases any eventual locks",
                     lookup_id,
                 )
-                self._adapter.cleanup_lookup_result(lookup_id)
+                self._adapter.cleanup_lookup_result(request_id)
                 return
             state.hit = int(result)
         # Once retrieve has started, the transfer owns the remaining read
@@ -586,9 +682,9 @@ class _MPLookupClient:
                 token_ids=state.token_ids,
                 start=0,
                 end=state.hit,
-                request_id=lookup_id,
+                request_id=request_id,
             )
-        self._adapter.cleanup_lookup_result(lookup_id)
+        self._adapter.cleanup_lookup_result(request_id)
 
 
 class LMCacheMPConnector(KVConnectorBase):
@@ -621,7 +717,12 @@ class LMCacheMPConnector(KVConnectorBase):
         self._completed_load_operations: set[str] = set()
         self._completed_save_operation_order: deque[str] = deque()
         self._completed_load_operation_order: deque[str] = deque()
-        self._immediate_saves: set[SaveCompletionId] = set()
+        # Immediate successes include collapsed-TP non-writers. Keep their
+        # logical token range so they can report PAGE source-safety too: the TP
+        # aggregator must receive the same chunk completion from every rank
+        # before releasing the writer's source blocks early.
+        self._immediate_saves: dict[SaveCompletionId, tuple[int, int] | None] = {}
+        self._immediate_save_failures: set[SaveCompletionId] = set()
         self._immediate_load_failures: set[LoadCompletionId] = set()
         self._lock = threading.Lock()
 
@@ -761,7 +862,7 @@ class LMCacheMPConnector(KVConnectorBase):
 
         assert req.load_spec is not None
         completion = req.load_operation or req.req_id
-        request_id = str(req.req_id)
+        request_id = _mp_session_id(self._config, req.req_id)
         operation_id = _transfer_operation_id("load", completion)
         with self._lock:
             if (
@@ -823,7 +924,7 @@ class LMCacheMPConnector(KVConnectorBase):
 
         assert req.save_spec is not None
         completion = req.save_operation or req.req_id
-        request_id = str(req.req_id)
+        request_id = _mp_session_id(self._config, req.req_id)
         operation_id = _transfer_operation_id("save", completion)
         with self._lock:
             if (
@@ -835,6 +936,10 @@ class LMCacheMPConnector(KVConnectorBase):
                     f"duplicate LMCache MP save operation {operation_id!r}"
                 )
             self._submitting_saves.add(operation_id)
+        end = (len(req.token_ids) // self.chunk_size) * self.chunk_size
+        start = (
+            int(req.save_spec.skip_leading_tokens) // self.chunk_size
+        ) * self.chunk_size
         if not self._is_kv_writer:
             with self._lock:
                 self._submitting_saves.discard(operation_id)
@@ -843,12 +948,10 @@ class LMCacheMPConnector(KVConnectorBase):
                     self._completed_save_operations,
                     self._completed_save_operation_order,
                 )
-                self._immediate_saves.add(completion)
+                self._immediate_saves[completion] = (
+                    (start, end) if start < end else None
+                )
             return
-        end = (len(req.token_ids) // self.chunk_size) * self.chunk_size
-        start = (
-            int(req.save_spec.skip_leading_tokens) // self.chunk_size
-        ) * self.chunk_size
         if start >= end:
             with self._lock:
                 self._submitting_saves.discard(operation_id)
@@ -857,7 +960,7 @@ class LMCacheMPConnector(KVConnectorBase):
                     self._completed_save_operations,
                     self._completed_save_operation_order,
                 )
-                self._immediate_saves.add(completion)
+                self._immediate_saves[completion] = None
             return
         try:
             block_ids = self._block_slice(req, start, end)
@@ -867,7 +970,12 @@ class LMCacheMPConnector(KVConnectorBase):
                 start=start,
                 end=end,
             )
-            transfer = self._adapter.submit_store_request(
+            submit = getattr(
+                self._adapter,
+                "submit_store_request_with_chunk_events",
+                self._adapter.submit_store_request,
+            )
+            transfer = submit(
                 request_id,
                 op,
                 event,
@@ -884,13 +992,15 @@ class LMCacheMPConnector(KVConnectorBase):
                     self._completed_save_operations,
                     self._completed_save_operation_order,
                 )
-                self._immediate_saves.add(completion)
+                self._immediate_save_failures.add(completion)
             return
         with self._lock:
             self._submitting_saves.discard(operation_id)
             self._pending_saves[operation_id] = _PendingSave(
                 completion=completion,
                 future=transfer,
+                start=start,
+                end=end,
             )
 
     def get_finished(self) -> KVConnectorOutput:
@@ -899,6 +1009,7 @@ class LMCacheMPConnector(KVConnectorBase):
         done_load: set[LoadCompletionId] = set()
         failed_load: set[LoadCompletionId] = set()
         done_save: set[SaveCompletionId] = set()
+        connector_completions: set[ConnectorCompletion] = set()
         with self._lock:
             # Heartbeat health is a control-plane signal, not proof that GPU
             # work submitted before the failure has quiesced. Keep every real
@@ -906,7 +1017,20 @@ class LMCacheMPConnector(KVConnectorBase):
             # represented by None, while LMCache's missing-registration path
             # returns an event-free terminal False future.
             for operation_id, pending in list(self._pending_saves.items()):
-                terminal, _result = _terminal_future_result(pending.future)
+                take_ranges = getattr(pending.future, "take_completed_ranges", None)
+                if callable(take_ranges) and isinstance(
+                    pending.completion, SaveOperationId
+                ):
+                    try:
+                        connector_completions |= _source_safe_completions(
+                            pending.completion, take_ranges()
+                        )
+                    except Exception:
+                        logger.warning(
+                            "LMCache MP source-safe event polling failed",
+                            exc_info=True,
+                        )
+                terminal, result = _terminal_future_result(pending.future)
                 if terminal:
                     self._pending_saves.pop(operation_id, None)
                     _remember_operation_tombstone(
@@ -915,6 +1039,20 @@ class LMCacheMPConnector(KVConnectorBase):
                         self._completed_save_operation_order,
                     )
                     done_save.add(pending.completion)
+                    if isinstance(pending.completion, SaveOperationId):
+                        connector_completions |= _source_safe_completions(
+                            pending.completion,
+                            _chunk_ranges(
+                                pending.start, pending.end, int(self.chunk_size)
+                            ),
+                        )
+                        connector_completions.add(
+                            ConnectorCompletion(
+                                DENSE_PAGE_STORE_CHANNEL,
+                                pending.completion,
+                                result is True,
+                            )
+                        )
 
             for operation_id, pending in list(self._pending_loads.items()):
                 terminal, result = _terminal_future_result(pending.future)
@@ -931,20 +1069,40 @@ class LMCacheMPConnector(KVConnectorBase):
                 else:
                     done_load.add(pending.completion)
             done_save.update(self._immediate_saves)
+            for completion, token_range in self._immediate_saves.items():
+                if isinstance(completion, SaveOperationId):
+                    if token_range is not None:
+                        connector_completions |= _source_safe_completions(
+                            completion,
+                            _chunk_ranges(*token_range, int(self.chunk_size)),
+                        )
+                    connector_completions.add(
+                        ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, completion, True)
+                    )
+            for completion in self._immediate_save_failures:
+                done_save.add(completion)
+                if isinstance(completion, SaveOperationId):
+                    connector_completions.add(
+                        ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, completion, False)
+                    )
             failed_load.update(self._immediate_load_failures)
             self._immediate_saves.clear()
+            self._immediate_save_failures.clear()
             self._immediate_load_failures.clear()
         return KVConnectorOutput(
             finished_loading=done_load,
             failed_loading=failed_load,
             finished_saving=done_save,
+            connector_completions=connector_completions,
         )
 
 
 class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     """Scheduler-side LMCache MP connector for generic PAGE offload."""
 
-    def __init__(self, config: Any) -> None:
+    _supports_early_block_release = True
+
+    def __init__(self, config: Any, *, checkpoint_spec: Any = None) -> None:
         _validate_mp_config(config)
         kvc = getattr(config, "kv_transfer_config", {}) or {}
         validated_kv_role(kvc)
@@ -953,13 +1111,14 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             config.kv_cache_block_size,
             minimum=1,
         )
-        adapter = _make_scheduler_adapter(config)
+        adapter = _make_scheduler_adapter(config, checkpoint_spec=checkpoint_spec)
         try:
             extra = _extra_config(config)
             timeout = float(extra.get("lmcache.mp.lookup_timeout", 30.0))
             poll_interval = float(extra.get("lmcache.mp.lookup_poll_interval", 0.01))
             lookup_client = _MPLookupClient(
                 adapter,
+                config=config,
                 timeout=timeout,
                 poll_interval=poll_interval,
             )
@@ -974,6 +1133,10 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             if callable(shutdown):
                 shutdown()
             raise
+
+    def save_abandon_timeout_s(self) -> float:
+        """A timeout cannot prove that a remote MP DMA stopped reading HBM."""
+        return 0.0
 
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
         matched = super().get_num_new_matched_tokens(seq)
@@ -1053,7 +1216,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     def request_finished(self, seq: Any) -> None:
         super().request_finished(seq)
         try:
-            self._mp_adapter.end_session(str(seq.id))
+            self._mp_adapter.end_session(_mp_session_id(self._config, seq.id))
         except Exception:
             logger.warning(
                 "LMCache MP end_session failed for request %s",

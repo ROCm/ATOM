@@ -342,12 +342,65 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         self,
         store_ops: Sequence[CheckpointStoreOp],
         restore_ops: Sequence[CheckpointRestoreOp],
+        descriptor_slot: int = 0,
     ) -> None:
-        """Copy checkpoints between Active Slots and arbitrary PAGEs."""
+        """Copy checkpoints between Active Slots and arbitrary PAGEs.
+
+        Stateful backends use ``descriptor_slot`` to isolate concurrent copy
+        descriptors. The default implementation only handles the empty no-op
+        case, so it intentionally leaves that interface argument unused.
+        """
         if store_ops or restore_ops:
             raise NotImplementedError(
                 f"{type(self).__name__} does not implement PAGE-backed state copy"
             )
+
+    def _checkpoint_descriptor_device(self) -> torch.device:
+        """Device of the planes `execute_paged_state_copies` copies between."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement PAGE-backed state copy"
+        )
+
+    def _checkpoint_descriptor_buffer(self, descriptor_slot: int = 0) -> CpuGpuBuffer:
+        """Pinned staging for a step's whole descriptor, sized for the worst step.
+
+        Pinned because the alternative synchronizes: a pageable H2D from
+        `build()` makes the host wait out the forward already enqueued, which
+        measured 2.9 ms behind 4 ms of work against 0.1 ms staged. Reused
+        because allocating pinned memory is itself a synchronizing call.
+
+        A step can carry at most one store and one restore per sequence, so two
+        per sequence bounds it. The caller checks that bound rather than growing
+        on demand: a descriptor that did not fit would otherwise be silently
+        truncated into a copy of the wrong shape.
+
+        The store half of that bound is not a property of the batch -- it is
+        held by `PagedStateCheckpointCoordinator._supersede`, which keeps one
+        pending boundary per sequence. A change that let two of a sequence's
+        boundaries drain together would raise from `build()` here, and would be
+        storing one of them from the wrong slot besides; the two constraints
+        have the same owner and move together.
+
+        Slot 0 serves `build()`; each other `descriptor_slot` is a separate
+        buffer, so an out-of-band restore never shares staging with a step.
+        """
+        if descriptor_slot < 0:
+            raise ValueError("checkpoint descriptor slot must be non-negative")
+        descriptors = getattr(self, "_checkpoint_descriptors", None)
+        if descriptors is None:
+            descriptors = self._checkpoint_descriptors = {}
+        descriptor = descriptors.get(descriptor_slot)
+        if descriptor is None:
+            plan = self._checkpoint_copy_plan()
+            max_ops = 2 * int(self.model_runner.config.max_num_seqs)
+            descriptor = CpuGpuBuffer(
+                max_ops * plan.num_spans,
+                3,
+                dtype=torch.int64,
+                device=self._checkpoint_descriptor_device(),
+            )
+            descriptors[descriptor_slot] = descriptor
+        return descriptor
 
     def warmup_per_req_cache(self) -> None:
         """Pay whatever the first checkpoint copy would pay, before serving.

@@ -187,17 +187,28 @@ class DraftKvBuilder(PoolRowsMixin):
             v_scale=getattr(module, "v_scale", None),
         )
 
-    def get_kv_transfer_tensors(self) -> list:
-        from atom.kv_transfer.disaggregation.types import KVTransferRegion
+    def get_kv_transfer_tensors(self):
+        from atom.kv_transfer.disaggregation.types import (
+            KVTransferRegion,
+            KVTransferTensors,
+        )
 
-        return [
-            KVTransferRegion(
-                base_addr=t.data_ptr(),
-                total_bytes=t.numel() * t.element_size(),
-                unit_bytes=t.stride(0) * t.element_size(),
-                # The draft's rows sit in the same block ids as the target's,
-                # so its regions need a name that says which stack they are.
-                semantic_role=f"draft.{role}",
-            )
-            for role, t in self.kv_pool.region_tensors()
-        ]
+        region_tensors = self.kv_pool.region_tensors()
+        return KVTransferTensors(
+            block_regions=[
+                KVTransferRegion(
+                    base_addr=t.data_ptr(),
+                    total_bytes=t.numel() * t.element_size(),
+                    unit_bytes=t.stride(0) * t.element_size(),
+                    # The draft's rows sit in the same block ids as the target's,
+                    # so its regions need a name that says which stack they are.
+                    semantic_role=f"draft.{role}",
+                )
+                for role, t in region_tensors
+            ],
+            slot_regions=[],
+            block_tensor_views=[t.unsqueeze(1) for _, t in region_tensors],
+            # A paged MHA/GQA draft is a per-rank shard. Appending it to an
+            # otherwise replicated target must disable whole-object collapse.
+            tp_replication_factor=1,
+        )

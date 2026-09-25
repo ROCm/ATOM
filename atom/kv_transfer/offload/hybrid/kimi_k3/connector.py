@@ -11,7 +11,6 @@ CPU tier for that state: same paged-KV path, one extra leg.
 from __future__ import annotations
 
 import logging
-import os
 import time
 
 from atom.kv_transfer.disaggregation.types import (
@@ -37,6 +36,7 @@ from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import (
     _JointPark,
 )
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -611,7 +611,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         # its worker queue with, read from the other end.
         self._max_pending_saves = max_pending_saves(
             getattr(config, "kv_transfer_config", None) or {},
-            int(os.environ.get("OFFLOAD_COPY_WORKERS", "1") or 1),
+            envs.OFFLOAD_COPY_WORKERS,
         )
         self._save_inflight_since: dict[str, float] = {}
         self._save_stalled = False

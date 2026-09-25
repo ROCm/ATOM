@@ -20,7 +20,6 @@ Every scheduler here owns an :class:`~atom.model_engine.engine_stats.EngineStats
 from __future__ import annotations
 
 import logging
-import os
 import struct
 import threading
 import time
@@ -85,14 +84,12 @@ def _offload_max_pending_saves() -> int:
     global _MAX_PENDING_OFFLOAD
     if _MAX_PENDING_OFFLOAD is not None:
         return _MAX_PENDING_OFFLOAD
-    raw = os.environ.get("OFFLOAD_MAX_PENDING_SAVES", "2")
     try:
-        value = int(raw)
-    except ValueError:
-        logger.warning(
-            "invalid OFFLOAD_MAX_PENDING_SAVES=%r; using 2 for the state tier",
-            raw,
-        )
+        value = envs.OFFLOAD_MAX_PENDING_SAVES
+    except ValueError as exc:
+        logger.warning("%s; using 2 for the state tier", exc)
+        value = None
+    if value is None:
         value = 2
     _MAX_PENDING_OFFLOAD = max(1, value)
     return _MAX_PENDING_OFFLOAD
@@ -624,6 +621,9 @@ class Scheduler:
         from atom.utils.forward_context import get_kvconnector
 
         self.kv_connector = get_kvconnector("scheduler", config)
+        bind_block_manager = getattr(self.kv_connector, "bind_block_manager", None)
+        if callable(bind_block_manager):
+            bind_block_manager(self.block_manager)
 
         from atom.distributed.kv_events import (
             EventPublisher as _EventPublisher,
@@ -1122,6 +1122,16 @@ class Scheduler:
         if not callable(callback):
             return None
         return callback(seq)
+
+    def _connector_can_partially_deallocate_state(self, seq: Sequence) -> bool:
+        """Require an explicit connector guarantee before releasing state.
+
+        A PAGE block lease alone says nothing about a recurrent-state source.
+        Connectors without this capability therefore remain on the original
+        whole-request deferred-free path.
+        """
+        callback = getattr(self.kv_connector, "can_partially_deallocate_state", None)
+        return callable(callback) and callback(seq) is True
 
     def _drain_source_safe_releases(self) -> None:
         """Free block IDs the offload connector reports as newly source-safe.
@@ -2655,19 +2665,17 @@ class Scheduler:
         """The running-plus-queued cap for state-tier stores.
 
         Read off the connector's public `max_pending_saves` -- the canonical
-        `_offload_common.max_pending_saves` value it computed from
-        `kv_connector_extra_config` and `OFFLOAD_COPY_WORKERS`, the exact bound
-        the KV leg's `_may_emit_save` enforces. Sharing that number rather than
-        re-reading the bare `OFFLOAD_MAX_PENDING_SAVES` default of 2 keeps the
-        two legs from pinning different amounts of the same pool, and honours a
-        per-connector `"max_pending_saves"` override the env reader never sees.
-        Falls back to the env reader for a connector (or test double) that never
-        bounded its save queue (`max_pending_saves` is None, as on dense) and,
-        under `kv_connector: multi`, reaches the bound through the state-tier sub
-        -- `MultiConnectorScheduler` bounds nothing of its own, so without the
-        sub probe the composite silently caps the state leg at the env default of
-        2 while the KV leg keeps the sub's real bound. The public accessor means
-        neither read reaches through the delegating shell's `_impl` any more.
+        `_offload_common.max_pending_saves` value it computed from the
+        process-wide `OFFLOAD_MAX_PENDING_SAVES` setting and
+        `OFFLOAD_COPY_WORKERS`, and the exact bound the KV leg's
+        `_may_emit_save` enforces. Falls back to the env reader for a connector
+        (or test double) that never bounded its save queue (`max_pending_saves`
+        is None, as on dense) and, under `kv_connector: multi`, reaches the
+        bound through the state-tier sub -- `MultiConnectorScheduler` bounds
+        nothing of its own, so without the sub probe the composite can silently
+        use a different default from the state-tier implementation. The public
+        accessor means neither read reaches through the delegating shell's
+        `_impl` any more.
         """
         conn = self.kv_connector
         cap = getattr(conn, "max_pending_saves", None)
@@ -3432,14 +3440,22 @@ class Scheduler:
                 # it takes is a side effect.
                 if self._connector_should_defer_free(seq):
                     protected = self._connector_protected_block_ids(seq)
-                    if protected is not None:
+                    state_safe = (
+                        not seq.has_per_req_cache
+                        or self._connector_can_partially_deallocate_state(seq)
+                    )
+                    if protected is not None and state_safe:
                         # Early block release: only the save's exact source
                         # blocks stay pinned; everything else in this
                         # finished request's block_table -- decode blocks, an
                         # unaligned prompt tail, already-saved ranges -- frees
                         # now instead of waiting behind `deferred_free_blocks`.
                         before = len(seq.block_table)
-                        self.block_manager.deallocate_partial(seq, protected)
+                        # `state_safe` holds on this branch; restate it so the
+                        # block manager's own fail-closed check stays armed.
+                        self.block_manager.deallocate_partial(
+                            seq, protected, per_request_state_safe=True
+                        )
                         activate = getattr(
                             self.kv_connector, "activate_block_leases", None
                         )

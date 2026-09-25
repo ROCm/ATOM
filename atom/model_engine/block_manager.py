@@ -2499,7 +2499,11 @@ class BlockManager:
         return num_full - start
 
     def deallocate_partial(
-        self, seq: Sequence, protected_block_ids: frozenset[int]
+        self,
+        seq: Sequence,
+        protected_block_ids: frozenset[int],
+        *,
+        per_request_state_safe: bool = False,
     ) -> None:
         """Deallocate `seq` now, except block IDs a pending offload save reads.
 
@@ -2517,20 +2521,15 @@ class BlockManager:
         request is deallocated normally. This makes ownership explicit: shared
         prefix blocks retain their other owners, while the save owns exactly
         one refcount share until ``free_leased_blocks`` releases it.
+
+        Per-request recurrent state is fail-closed: its active slots may be
+        released here only when the connector explicitly confirms that every
+        state source needed after request teardown has an independent lease.
         """
-        if seq.has_per_req_cache:
-            # Per-request recurrent state (GDN/hybrid checkpoints) has release
-            # ordering this simplified path never replicates (orphan load
-            # slots, `state_offload.abandon_load`, fork-source pins -- see
-            # `deallocate` below). Not reachable today: every offload connector
-            # that can drive early release sets `_permit_per_request_state =
-            # False` and rejects such a model at `register_kv_caches`. Kept as
-            # an explicit guard rather than a silent skip, so a future
-            # hybrid connector that both permits per-request state and enables
-            # early release fails loudly here instead of freeing a leased PAGE
-            # or leaking a state slot.
+        if seq.has_per_req_cache and not per_request_state_safe:
             raise RuntimeError(
-                "partial PAGE deallocation is unsupported for per-request state"
+                "partial PAGE deallocation is unsupported for per-request "
+                "state without an explicit connector safety capability"
             )
         table = set(seq.block_table)
         unknown = set(protected_block_ids) - table
@@ -2541,6 +2540,57 @@ class BlockManager:
         for block_id in protected_block_ids:
             self.kv.claim(block_id)
         self.deallocate(seq)
+
+    def acquire_offload_prefix(
+        self,
+        seq: Sequence,
+        start_tokens: int,
+        end_tokens: int,
+    ) -> tuple[list[int], int, tuple[int, ...]]:
+        """Claim the still-resident contiguous prefix used by a late save.
+
+        A finished request no longer owns its old physical block table. Each
+        block is therefore resolved again through the content hash index and
+        token-checked before it is claimed. The scan stops at the first gap so
+        the returned range can never describe a cache object with a hole.
+        """
+        hbs = self._hash_block_size()
+        if (
+            start_tokens < 0
+            or end_tokens < start_tokens
+            or start_tokens % hbs
+            or end_tokens % hbs
+        ):
+            raise ValueError(
+                f"offload source range [{start_tokens}, {end_tokens}) must "
+                f"align to hash block size {hbs}"
+            )
+        end_block = end_tokens // hbs
+        start_block = start_tokens // hbs
+        block_ids = [-1] * end_block
+        claimed: list[int] = []
+        parent_hash = -1
+        available_end = start_tokens
+        for index in range(end_block):
+            token_ids = self._hash_block_tokens(seq, index)
+            block_hash = self.compute_hash(token_ids, parent_hash)
+            parent_hash = block_hash
+            if index < start_block:
+                continue
+            block_id = self.kv.lookup(block_hash)
+            if block_id < 0:
+                break
+            block = self.kv.block(block_id)
+            if block.hash != block_hash or block.token_ids != token_ids:
+                break
+            self.kv.claim(block_id)
+            claimed.append(block_id)
+            block_ids[index] = block_id
+            available_end = (index + 1) * hbs
+        # The caller may have to trim a partial LMCache chunk from the tail.
+        # Preserve token order until that trim is complete; a set is suitable
+        # only after the exact ordered prefix has been selected.
+        return block_ids, available_end, tuple(claimed)
 
     def free_leased_blocks(self, block_ids) -> None:
         """Return block IDs a `deallocate_partial` lease held back, to the pool.
