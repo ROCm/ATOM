@@ -61,6 +61,35 @@ PrepareResultType = tuple[
 ReceiverType = Callable[[], PrepareResultType]
 
 
+def aiter_ep_sentinel_expert_id(
+    num_experts: int, expert_map: torch.Tensor | None
+) -> int | None:
+    """The always-masked expert id AITER's EP convention expects, or None.
+
+    AITER's fused_moe treats the last top-k column as a fake expert whenever
+    an expert_mask is given, and subtracts it from the top-k of its tuned-kernel
+    key. FusedMoE advertises that fake expert by extending expert_map by exactly
+    one trailing -1 slot, which also leaves expert_mask[num_experts] == 0.
+    """
+    if expert_map is not None and expert_map.numel() == num_experts + 1:
+        return num_experts
+    return None
+
+
+def append_aiter_ep_sentinel(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sentinel_expert_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Append one zero-weight column routed to the masked sentinel expert."""
+    sentinel_ids = topk_ids.new_full((topk_ids.shape[0], 1), sentinel_expert_id)
+    sentinel_weights = topk_weights.new_zeros((topk_weights.shape[0], 1))
+    return (
+        torch.cat((topk_ids, sentinel_ids), dim=1),
+        torch.cat((topk_weights, sentinel_weights), dim=1),
+    )
+
+
 class FusedMoEPrepareAndFinalize(ABC):
     """
     An abstract base class for the [Quantize-Prepare] and [Finalize] steps
@@ -86,6 +115,21 @@ class FusedMoEPrepareAndFinalize(ABC):
     def needs_dispatch_output_trim(self) -> bool:
         """Whether prepare may return a fixed-capacity buffer with a dead tail."""
         return True
+
+    def adapt_routing_for_fused_moe(
+        self,
+        dispatch_ids: torch.Tensor,
+        dispatch_weights: torch.Tensor,
+        num_experts: int,
+        expert_map: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Adapt the dispatched routing for AITER fused_moe.
+
+        Runs after the receive-buffer trim and only ahead of AITER fused_moe;
+        combine keeps the caller's own topk_ids. The default is a no-op for
+        transports that already hand back what fused_moe expects.
+        """
+        return dispatch_ids, dispatch_weights
 
     def prepare_async(
         self,
@@ -640,6 +684,17 @@ class FusedMoEModularKernel(torch.nn.Module):
                 topk_ids,
                 apply_router_weight_on_input,
             )
+        # After the trim, so this touches only the rows the group sent rather
+        # than the whole receive arena. The Triton path above keeps the plain
+        # routing: its gate count comes from the column count.
+        dispatch_ids, dispatch_weights = (
+            self.prepare_finalize.adapt_routing_for_fused_moe(
+                dispatch_ids,
+                dispatch_weights,
+                global_num_experts,
+                expert_map,
+            )
+        )
         fused_out = fused_moe(
             dispatch_a1,
             w1,

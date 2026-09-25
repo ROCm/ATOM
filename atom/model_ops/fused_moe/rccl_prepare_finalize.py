@@ -254,17 +254,10 @@ class RcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         dispatch_a1, dispatch_scale, metadata, dispatch_ids, dispatch_weights = result
         if dispatch_ids is None or dispatch_weights is None:
             raise RuntimeError("RCCL prepare did not return routing tensors")
-        sentinel_ids = dispatch_ids.new_full(
-            (dispatch_ids.shape[0], 1), sentinel_expert_id
+        dispatch_ids, dispatch_weights = mk.append_aiter_ep_sentinel(
+            dispatch_ids, dispatch_weights, sentinel_expert_id
         )
-        sentinel_weights = dispatch_weights.new_zeros((dispatch_weights.shape[0], 1))
-        return (
-            dispatch_a1,
-            dispatch_scale,
-            metadata,
-            torch.cat((dispatch_ids, sentinel_ids), dim=1),
-            torch.cat((dispatch_weights, sentinel_weights), dim=1),
-        )
+        return dispatch_a1, dispatch_scale, metadata, dispatch_ids, dispatch_weights
 
     def _prepare_static_decode(
         self,
@@ -370,11 +363,7 @@ class RcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # AITER's EP kernel-selection ABI reserves one trailing, masked expert
         # ID and subtracts that column from its top-k tuning key.  FusedMoE
         # advertises the sentinel by extending expert_map by exactly one slot.
-        sentinel_expert_id = (
-            num_experts
-            if expert_map is not None and expert_map.numel() == num_experts + 1
-            else None
-        )
+        sentinel_expert_id = mk.aiter_ep_sentinel_expert_id(num_experts, expert_map)
         if apply_router_weight_on_input:
             raise NotImplementedError(
                 "RCCL routed MoE does not support apply_router_weight_on_input"

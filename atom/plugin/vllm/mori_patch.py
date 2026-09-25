@@ -5,7 +5,7 @@ it makes no ``is_vllm()`` decision and pulls in nothing from ``atom.plugin``.
 The two places where atom-vllm needs different behavior are isolated behind
 overridable methods and injected here, so native files stay clean:
 
-* ``MoriPrepareAndFinalize._get_dispatch_config`` (MORI launch config) -- vLLM
+* ``MoriPrepareAndFinalize._get_launch_config`` (MORI launch config) -- vLLM
   has no stable prefill/decode flag at that call site, so select by a
   token-count threshold instead.
 * ``FusedMoEModularKernel._maybe_trim_dispatch_output`` (dispatch-buffer trim)
@@ -139,27 +139,24 @@ def apply_vllm_mori_patch() -> None:
     if _MORI_PATCH_APPLIED:
         return
 
-    original_get_dispatch_config = MoriPrepareAndFinalize._get_dispatch_config
+    original_get_launch_config = MoriPrepareAndFinalize._get_launch_config
 
-    @functools.wraps(original_get_dispatch_config)
-    def vllm_get_dispatch_config(self, num_tokens=None):
+    @functools.wraps(original_get_launch_config)
+    def vllm_get_launch_config(self, phase, mori_op, num_tokens, dtype, hidden_dim):
         # vLLM does not expose a stable prefill/decode flag here, so use a
         # token-count threshold to keep MORI warmup and runtime selection
-        # deterministic in atom-vllm mode.
-        assert (
-            num_tokens is not None
-        ), "num_tokens is required to choose MORI launch config in vLLM mode."
+        # deterministic in atom-vllm mode. Same grid for dispatch and combine.
         # Cap block_num at the device CU count: mori's IntraNode grid-wide
         # barrier requires all gridDim.x blocks co-resident; >CU blocks (e.g.
         # 128 on the 80-CU MI308X) deadlock at warmup. Mirrors the native
-        # MoriPrepareAndFinalize._get_dispatch_config cap.
+        # MoriPrepareAndFinalize._get_launch_config cap.
         mp = get_cu_num()
         if num_tokens >= VLLM_MORI_LAUNCH_CONFIG_TOKEN_THRESHOLD:
             return min(128, mp), 16
         return min(64, mp), 4
 
-    vllm_get_dispatch_config._atom_vllm_mori_patched = True
-    MoriPrepareAndFinalize._get_dispatch_config = vllm_get_dispatch_config
+    vllm_get_launch_config._atom_vllm_mori_patched = True
+    MoriPrepareAndFinalize._get_launch_config = vllm_get_launch_config
 
     original_trim = mk.FusedMoEModularKernel._maybe_trim_dispatch_output
 

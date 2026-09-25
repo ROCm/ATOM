@@ -601,6 +601,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Combine-side codec. "none" (the MoRI default) sends bf16 back;
     # "fp8_blockwise" selects EpCombineIntraNodeKernel_*_fp8bwq_*.
     "ATOM_MORI_COMBINE_QUANT": lambda: os.getenv("ATOM_MORI_COMBINE_QUANT", "none"),
+    # IntraNode dispatch/combine launch geometry. "tuned" (default) looks each
+    # phase up in mori's shipped per-arch tuning tables, keyed by the group's
+    # largest per-rank token count; "legacy" keeps the fixed grid keyed on this
+    # rank's prefill flag (128 blocks x 16 warps prefilling, 64 x 4 otherwise).
+    "ATOM_MORI_LAUNCH_POLICY": lambda: os.getenv("ATOM_MORI_LAUNCH_POLICY", "tuned"),
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"

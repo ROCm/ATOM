@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import bisect
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache, lru_cache
 from typing import Any
 
 import torch
@@ -38,6 +39,85 @@ _FP8_DTYPES = (
 # make_prepare_finalize runs per MoE layer (58x for DSR1). envs.__getattr__ does
 # not cache, so binding here also keeps it to a single getenv.
 _FP4_DISPATCH = envs.ATOM_MORI_FP4_DISPATCH
+# Same reasoning: the launch policy is consulted on every dispatch and combine.
+_LAUNCH_POLICY = envs.ATOM_MORI_LAUNCH_POLICY
+
+# IntraNode kernels launch warp_per_block * 64 threads per block; 16 warps is
+# the 1024-thread block limit.
+_MAX_WARP_PER_BLOCK = 16
+
+# Launch tables already logged; every MoE layer has its own prepare/finalize.
+_LOGGED_LAUNCH_TABLES: set[tuple] = set()
+
+
+@cache
+def mori_tuned_launch_table(
+    phase: str,
+    ep_size: int,
+    dtype: torch.dtype,
+    hidden_dim: int,
+    topk: int,
+    zero_copy: bool | None = None,
+    quant_type: str | None = None,
+) -> tuple[tuple[int, ...], tuple[tuple[int, int], ...]] | None:
+    """MoRI's shipped IntraNode tuning rules for one call shape, as a step table.
+
+    Returns ``(ceilings, geometries)``: the ``(block_num, warp_per_block)`` for
+    a per-rank token count ``n`` is ``geometries[bisect_left(ceilings, n)]``,
+    and the extra last entry covers counts past the largest rule. It is built
+    by asking mori's own ``TuningConfigManager.lookup`` at every rule boundary
+    (and one past the last), so it reproduces what mori's AUTO mode would pick
+    -- tightest ceiling, clamp above, exact-then-relaxed hidden/topk -- without
+    paying that walk on every launch. ``zero_copy``/``quant_type`` filter the
+    combine rules and are left None for dispatch, as mori does.
+
+    block_num is capped at the CU count: the IntraNode combine's cross-device
+    barrier spins until every block has arrived, so all blocks must be
+    co-resident. None when mori's tuning module or a matching rule is missing.
+    """
+    try:
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+        from mori.ops.tuning_config import (
+            TuningConfigManager,
+            detect_gpu_model,
+            quant_type_to_config_str,
+        )
+
+        manager = TuningConfigManager.get_instance(
+            get_gfx_runtime(), "IntraNode", ep_size, detect_gpu_model()
+        )
+        if quant_type is not None:
+            quant_type = quant_type_to_config_str(quant_type)
+    except Exception as exc:  # noqa: BLE001 -- the caller falls back to legacy
+        logger.warning(f"[MORI] tuned launch table unavailable ({exc!r})")
+        return None
+    rules = manager.dispatch_rules if phase == "dispatch" else manager.combine_rules
+    if not rules:
+        return None
+    ceilings = tuple(sorted({int(rule["num_tokens"]) for rule in rules}))
+    cu_num = get_cu_num()
+    geometries = []
+    for num_tokens in ceilings + (ceilings[-1] + 1,):
+        params = TuningConfigManager.lookup(
+            rules,
+            dtype,
+            num_tokens,
+            hidden_dim,
+            zero_copy=zero_copy,
+            quant_type=quant_type,
+            topk=topk,
+        )
+        if params is None:
+            return None
+        geometries.append(
+            (
+                min(params.block_num, cu_num),
+                min(params.warp_per_block, _MAX_WARP_PER_BLOCK),
+            )
+        )
+    return ceilings, tuple(geometries)
+
+
 _MXFP8_DISPATCH = envs.ATOM_MORI_FP8_DISPATCH
 
 
@@ -210,6 +290,9 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.dispatch_format = dispatch_format
         self.quant_dtype = quant_dtype
         self._use_split_send_recv = low_latency and not internode
+        # (phase, op, dtype, hidden_dim) -> step table or None; see
+        # _get_launch_config.
+        self._launch_tables: dict[tuple, Any] = {}
 
     # Derived from the resolved format so there is no second copy to keep in
     # sync with the staging config.
@@ -255,28 +338,116 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         return self._mori_ops[tbo_current_ubatch_id()]
 
-    def _get_dispatch_config(self, num_tokens: int | None = None) -> tuple[int, int]:
-        """Return (block_num, warp_per_block) based on runtime mode.
+    def adapt_routing_for_fused_moe(
+        self,
+        dispatch_ids: torch.Tensor,
+        dispatch_weights: torch.Tensor,
+        num_experts: int,
+        expert_map: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # MoRI delivers only the real top-k columns, and AITER drops the last
+        # one from its tuned-kernel key under EP, so without the masked
+        # sentinel column a top-6 model looks up top-5 rows and misses every
+        # tuned kernel. Sits after the trim (see FusedMoEModularKernel.forward)
+        # so it costs the group's rows, not the receive arena's; the sentinel
+        # routes to expert_mask[num_experts] == 0, so moe_sorting drops it. The
+        # TBO receivers feed the same forward, so they get it too.
+        sentinel_expert_id = mk.aiter_ep_sentinel_expert_id(num_experts, expert_map)
+        if sentinel_expert_id is None:
+            return dispatch_ids, dispatch_weights
+        return mk.append_aiter_ep_sentinel(
+            dispatch_ids, dispatch_weights, sentinel_expert_id
+        )
 
-        Default policy keys off the forward-context prefill/decode flag.
-        atom-vllm has no stable prefill/decode flag at this call site and
-        instead selects by a token-count threshold; it overrides this method
-        via a plugin patch, so keep this body frontend-agnostic.
+    def _tuned_launch_table(
+        self, phase: str, mori_op: Any, dtype: torch.dtype, hidden_dim: int
+    ):
+        key = (phase, id(mori_op), dtype, hidden_dim)
+        if key in self._launch_tables:
+            return self._launch_tables[key]
+        config = mori_op.config
+        kernel_type = getattr(config.kernel_type, "name", str(config.kernel_type))
+        table = None
+        # Only the IntraNode kernels' tables and co-residency limits are
+        # accounted for here; other kernel types keep the legacy grid.
+        if kernel_type == "IntraNode":
+            table = mori_tuned_launch_table(
+                phase,
+                config.world_size,
+                dtype,
+                hidden_dim,
+                config.num_experts_per_token,
+                **(
+                    {}
+                    if phase == "dispatch"
+                    else {
+                        "zero_copy": not config.use_external_inp_buf,
+                        "quant_type": config.quant_type,
+                    }
+                ),
+            )
+        self._launch_tables[key] = table
+        log_key = (phase, kernel_type, dtype, hidden_dim)
+        if config.rank == 0 and log_key not in _LOGGED_LAUNCH_TABLES:
+            _LOGGED_LAUNCH_TABLES.add(log_key)
+            if table is None:
+                logger.info(
+                    f"[MORI] {phase} launch: no tuned table for {kernel_type} "
+                    f"{dtype} hidden={hidden_dim}; using the legacy grid"
+                )
+            else:
+                ceilings, geometries = table
+                steps = ", ".join(
+                    f"<={c}:{b}x{w}" for c, (b, w) in zip(ceilings, geometries)
+                )
+                logger.info(
+                    f"[MORI] {phase} launch (tokens/rank:blocks x warps) for "
+                    f"{dtype} hidden={hidden_dim}: {steps}, "
+                    f">{ceilings[-1]}:{geometries[-1][0]}x{geometries[-1][1]}"
+                )
+        return table
 
-        block_num is capped at the device CU count: mori's IntraNode
-        dispatch/combine use a hand-rolled grid-wide barrier
-        (CrossDeviceBarrierIntraNodeKernel) that spins until *all* gridDim.x
-        blocks have arrived, which requires every block to be co-resident. The
-        combine block (1024 threads + larger dynamic smem) gets ~1 block/CU
-        occupancy, so launching more blocks than CUs (e.g. 128 on the 80-CU
-        MI308X) leaves the surplus blocks unscheduled -> the barrier never
-        completes -> warmup deadlocks. Capping at multi_processor_count keeps
-        big-CU GPUs (MI300X/MI355X, >=128 CU) at 128 with no perf loss.
+    def _get_launch_config(
+        self,
+        phase: str,
+        mori_op: Any,
+        num_tokens: int,
+        dtype: torch.dtype,
+        hidden_dim: int,
+    ) -> tuple[int, int]:
+        """Return (block_num, warp_per_block) for one dispatch or combine launch.
+
+        Both kernels move what the whole group sends, not what this rank has:
+        a decoding rank's combine pushes back every row a prefilling peer
+        dispatched to it. So the tuned policy keys on the group's largest
+        per-rank count -- the shape mori's EP8 tables were measured at, every
+        rank sending the same count -- and falls back to this rank's own count
+        only where no DP reduction produced one. The count is a host value
+        fixed per captured graph, so the choice is graph safe. Dispatch and
+        combine are tuned separately; their best grids differ.
+
+        atom-vllm has no ATOM forward context at this call site and overrides
+        this method via a plugin patch, so keep the signature stable.
         """
-        mp = get_cu_num()
         context = get_forward_context().context
-        if context.is_prefill:
-            return min(128, mp), 16
+        if _LAUNCH_POLICY != "legacy":
+            table = self._tuned_launch_table(phase, mori_op, dtype, hidden_dim)
+            if table is not None:
+                across_dp = (
+                    None if context is None else context.running_tokens_across_dp
+                )
+                group_tokens = max(across_dp) if across_dp else num_tokens
+                ceilings, geometries = table
+                return geometries[bisect.bisect_left(ceilings, group_tokens)]
+        # The legacy grid: what upstream launches without a tuned table -- 128
+        # blocks x 16 warps on a prefilling rank, 64 x 4 otherwise, keyed on
+        # this rank's own prefill flag. Also the grid for kernel types the
+        # tuned tables do not cover. block_num is capped at the CU count for
+        # the same co-residency reason as the tuned table (e.g. 128 blocks on
+        # the 80-CU MI308X deadlocked warmup).
+        mp = get_cu_num()
+        if context is not None and context.is_prefill:
+            return min(128, mp), _MAX_WARP_PER_BLOCK
         return min(64, mp), 4
 
     # ---- Synchronous (non-TBO) path ----
@@ -319,7 +490,9 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             quant_func = get_hip_quant(quant_type)
             a1, scale = quant_func(a1, quant_dtype=dtypes.fp8)
 
-        block_num, warp_per_block = self._get_dispatch_config(a1.shape[0])
+        block_num, warp_per_block = self._get_launch_config(
+            "dispatch", self._mori_ops[0], a1.shape[0], a1.dtype, a1.shape[1]
+        )
 
         (
             dispatch_a1,
@@ -358,7 +531,13 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     ) -> torch.Tensor:
         num_token = topk_ids.shape[0]
 
-        block_num, warp_per_block = self._get_dispatch_config(num_token)
+        block_num, warp_per_block = self._get_launch_config(
+            "combine",
+            self._mori_ops[0],
+            num_token,
+            fused_expert_output.dtype,
+            fused_expert_output.shape[1],
+        )
 
         result = self._mori_ops[0].combine(
             fused_expert_output,
@@ -475,8 +654,11 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             tbo_yield_and_switch_from_compute_to_comm,
         )
 
-        block_num, warp_per_block = self._get_dispatch_config(a1.shape[0])
         mori_op = self._current_tbo_mori_op()
+
+        block_num, warp_per_block = self._get_launch_config(
+            "dispatch", mori_op, a1.shape[0], a1.dtype, a1.shape[1]
+        )
 
         tbo_yield_and_switch_from_compute_to_comm()
 
@@ -561,8 +743,15 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             tbo_yield_and_switch_from_compute_to_comm,
         )
 
-        block_num, warp_per_block = self._get_dispatch_config(num_token)
         mori_op = self._current_tbo_mori_op()
+
+        block_num, warp_per_block = self._get_launch_config(
+            "combine",
+            mori_op,
+            num_token,
+            fused_expert_output.dtype,
+            fused_expert_output.shape[1],
+        )
 
         # Yield to other thread FIRST, then switch to comm stream.
         tbo_yield_and_switch_from_compute_to_comm()
