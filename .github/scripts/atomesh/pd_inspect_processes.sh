@@ -20,9 +20,19 @@ while IFS= read -r container; do
         --no-deps --target "${target}" py-spy==0.4.2 || exit 0
       spy="${target}/bin/py-spy"
     fi
-    for pid in $(pgrep -f "^VLLM::(Worker_TP0|EngineCore)|^[^ ]*python[^ ]* .*lmcache server" || true); do
+    deadline=$((SECONDS + 45))
+    pids=$(pgrep -f "^[^ ]*python[^ ]* .*lmcache server" || true)
+    pids+=" $(pgrep -f "^VLLM::EngineCore" || true)"
+    pids+=" $(pgrep -f "^VLLM::Worker_TP[0-9]+" || true)"
+    for pid in ${pids}; do
+      remaining=$((deadline - SECONDS))
+      if ((remaining <= 0)); then
+        printf "Stack sampling budget exhausted before process %s\n" "${pid}"
+        break
+      fi
+      ((remaining <= 8)) || remaining=8
       printf "Process %s\n" "${pid}"
-      timeout --kill-after=2s 8s "${spy}" dump --pid "${pid}" --native || true
+      timeout --kill-after=1s "${remaining}s" "${spy}" dump --pid "${pid}" --native || true
     done
   ' || true
 done < <(docker ps --format '{{.Names}}')
