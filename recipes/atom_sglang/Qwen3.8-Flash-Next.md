@@ -1,56 +1,68 @@
-# Qwen3.8-Flash-Next on SGLang-ATOM (MI308, first knife)
+# Qwen3.8-Flash-Next on SGLang-ATOM
 
-Text-only eager serving. Native compute from ATOM PR **#2048**. GDN / graph
-sentinel from **#2067**. This plugin only translates `ForwardBatch` → Native
-QSA + PLE metadata.
+Flash uses `qwen4_exp` / `Qwen4ExpForConditionalGeneration`. Target and MTP
+compute run through Native ATOM `Qwen4Exp` and `Qwen4ExpMTP`; the plugin
+adapts SGLang scheduling, QSA KV pools, PLE state and HC hidden storage.
+It requires the Native Flash implementation in this tree and SGLang 0.5.17.
+The recognition patch supplies Flash config registration for that version.
 
-**Not Qwen3.5.** `Qwen4ExpForConditionalGeneration` / `qwen4_exp` is a third
-line. Do not hang Flash on `Qwen3_5*` EntryClass.
+## Text serving with MTP
 
-## Checkpoint
-
-```
-/data/pretrained_model/Qwen/Qwen3.8-Flash-Next-FP8
-```
-
-Architecture: `Qwen4ExpForConditionalGeneration`. Quant: FP8. KV must be **bf16**.
-
-## MI308 (this machine)
-
-- 8x gfx942, **~192 GB** HBM each (not 288 GB MI355).
-- Do **not** copy the 355 TP1 `--gpu-memory-utilization 0.98` command.
-- TP>1 **must** use expert parallel (`moe_intermediate_size=640`).
-- `page-size` / `block-size` divisible by `indexer_compress_ratio` (4).
-- Leave PLE in Native. Do **not** pass `--ple-offload-embedding` (avoids ~102 GB double alloc).
-- gfx950 FP8 prefill MHA from #2067 will not run here; ignore it.
-
-Suggested first launch (2-GPU, short context):
+The following configuration is tested on MI308X with TP2/EP2 and the
+Qwen3.8-Flash-Next-PTPC-FP8 checkpoint. Set `MODEL_PATH` to the local checkpoint.
+Target verification uses CUDA graphs and overlap scheduling. Draft graphs
+remain disabled because Native Flash MTP uses mRoPE.
 
 ```bash
+export MODEL_PATH=/models/Qwen3.8-Flash-Next-PTPC-FP8
+export CUDA_VISIBLE_DEVICES=0,1
+export HIP_VISIBLE_DEVICES=0,1
 export SGLANG_PLUGINS=atom_sglang
 export SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
+export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models
+export SGLANG_USE_AITER=1
+export SGLANG_AITER_KV_CACHE_LAYOUT=nhd
+export AITER_MOE_PADDING_SIZE=128
 
 python -m sglang.launch_server \
-  --model-path /data/pretrained_model/Qwen/Qwen3.8-Flash-Next-FP8 \
-  --tp 2 --enable-expert-parallel \
-  --kv-cache-dtype bf16 \
-  --page-size 64 \
-  --max-model-len 2048 \
-  --max-num-seqs 4 \
-  --mem-fraction-static 0.75 \
-  --disable-cuda-graph \
-  --trust-remote-code
+  --model-path "$MODEL_PATH" --trust-remote-code \
+  --host 127.0.0.1 --port 8000 \
+  --tp 2 --ep-size 2 --attention-backend aiter \
+  --kv-cache-dtype bf16 --page-size 64 \
+  --context-length 8192 --max-running-requests 8 \
+  --mem-fraction-static 0.70 --disable-radix-cache \
+  --cuda-graph-backend-decode full --cuda-graph-max-bs-decode 8 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 2 --speculative-eagle-topk 1 \
+  --sampling-defaults openai
 ```
 
-Native-only smoke (no SGLang plugin), after #2048 is on the tree:
+SGLang and ATOM must both be installed or available on `PYTHONPATH`.
+The target and draft share the same checkpoint, including its `mtp.*` weights.
+Flash MTP supports one QSA draft layer and top-k 1; separate draft checkpoints
+and other speculative algorithms are rejected. For eager comparison, replace
+the two CUDA graph flags with `--disable-cuda-graph` and add
+`--disable-overlap-schedule`. To serve without MTP, omit the speculative flags.
+
+A deterministic smoke request:
 
 ```bash
-python -m atom.entrypoints.openai_server \
-  --model /data/pretrained_model/Qwen/Qwen3.8-Flash-Next-FP8 \
-  -tp 2 --enable-expert-parallel --kv-cache-dtype bf16 \
-  --max-model-len 2048 --gpu-memory-utilization 0.75
+curl http://127.0.0.1:8000/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"The result of 17 + 25 is", "sampling_params":{"temperature":0,"top_k":1,"top_p":1,"max_new_tokens":64}}'
 ```
 
-## Out of scope (first knife)
+## Boundaries
 
-MTP, VLM, radix, speculative, tc_piecewise, CUDA graph, gfx942 kernel rewrites.
+- Use BF16 KV and page size 64. TP greater than 1 requires EP because the
+  expert intermediate width is 640.
+- Leave PLE embeddings in Native ATOM; do not enable PLE embedding offload.
+  The memory fraction above leaves room for plugin-owned QSA indexer caches.
+- Validation covers text requests, concurrent mixed lengths, long prompts,
+  slot reuse, and eager fallback above the largest captured batch followed by
+  graph replay. It does not establish
+  multimodal MTP, radix caching, performance gains, or correctness at other
+  parallel sizes and speculative horizons.
+- On a SGLang upgrade, review recognition and MTP EntryClass mapping separately.
+  Upstream Flash recognition does not replace Native ATOM compute or the
+  plugin's graph padding and post-draft metadata refresh contracts.

@@ -289,6 +289,27 @@ def test_qwen_backend_binds_zero_copy_vk_state(
         assert result.v_cache is raw
 
 
+@requires_gfx942
+def test_align_flydsl_decode_accepts_strided_and_padded_indices():
+    q, k, v, a, b, log, bias = inputs(4)
+    state = torch.randn(8, 24, 128, 128, device="cuda", dtype=torch.float32)
+    state = state.transpose(-1, -2).contiguous().transpose(-1, -2)
+    wide = torch.arange(16, device="cuda", dtype=torch.int32)
+    strided = wide[::2][:4]
+    padded = torch.arange(7, device="cuda", dtype=torch.int32)
+    assert not fly.decode_supported(q, k, v, a, b, state, log, bias, strided, strided)
+    assert not fly.decode_supported(q, k, v, a, b, state, log, bias, padded, padded)
+    from atom.plugin.sglang.attention_backend.attention_gdn import (
+        _align_flydsl_decode_slots,
+    )
+
+    reads = _align_flydsl_decode_slots(strided, 4)
+    writes = _align_flydsl_decode_slots(padded, 4)
+    assert fly.decode_supported(q, k, v, a, b, state, log, bias, reads, writes)
+    assert reads.tolist() == [0, 2, 4, 6]
+    assert writes.tolist() == [0, 1, 2, 3]
+
+
 def test_unsupported_device_decode_fallback(monkeypatch):
     from types import SimpleNamespace
 

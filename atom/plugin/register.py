@@ -269,6 +269,13 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         except Exception:
             return False
 
+    def _is_qwen4_exp_nextn_runner(runner) -> bool:
+        model_config = getattr(runner, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        return "Qwen4ExpForCausalLMNextN" in (
+            getattr(hf_config, "architectures", None) or []
+        )
+
     def _is_dsv4_or_glm52_nextn_runner(runner) -> bool:
         return _is_dsv4_nextn_runner(runner) or _is_glm52_nextn_runner(runner)
 
@@ -788,15 +795,22 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                         backend.get_cuda_graph_seq_len_fill_value = (
                             lambda value=GLM52_GRAPH_SEQ_LEN_CAPACITY: value
                         )
+            # Flash draft stays eager: mRoPE positions are [3, N], same as
+            # Native EagleProposer skipping mid-step graphs.
             skip_all_draft_graphs = (
                 _env_flag("ATOM_SGLANG_V4_DISABLE_DRAFT_CG")
                 and not _draft_extend_graph_enabled(draft_runner)
                 and _is_dsv4_or_glm52_nextn_runner(draft_runner)
-            )
+            ) or _is_qwen4_exp_nextn_runner(draft_runner)
             original_capture_cuda_graphs = None
             if skip_all_draft_graphs:
                 original_capture_cuda_graphs = self._capture_cuda_graphs
-                self._capture_cuda_graphs = lambda: None
+
+                def _skip_draft_cuda_graphs(_self=self):
+                    _self.cuda_graph_runner = None
+                    _self.cuda_graph_runner_for_draft_extend = None
+
+                self._capture_cuda_graphs = _skip_draft_cuda_graphs
             original_draft_extend_backend = None
             hide_draft_extend_backend = (
                 not _draft_extend_graph_enabled(draft_runner)
