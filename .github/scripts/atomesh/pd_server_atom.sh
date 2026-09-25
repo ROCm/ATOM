@@ -593,8 +593,10 @@ process_is_running() {
 
   if [[ -r "/proc/${pid}/stat" ]]; then
     state="$(awk '{ print $3 }' "/proc/${pid}/stat" 2>/dev/null || true)"
-    [[ -n "${state}" && "${state}" != "Z" ]]
-    return
+    if [[ -n "${state}" && "${state}" != "Z" ]]; then
+      return 0
+    fi
+    return 1
   fi
 
   kill -0 "${pid}" 2>/dev/null
@@ -605,17 +607,17 @@ terminate_process_group() {
   local deadline
 
   [[ "${pid}" =~ ^[0-9]+$ ]] || return 0
-  process_is_running "${pid}" || return 0
 
   kill -TERM -- "-${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null || true
   deadline=$(( $(date +%s) + 20 ))
   while process_is_running "${pid}" && [[ "$(date +%s)" -lt "${deadline}" ]]; do
     sleep 1
   done
-  if process_is_running "${pid}"; then
-    kill -KILL -- "-${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null || true
+  # The leader may have exited while its children remain alive.
+  kill -KILL -- "-${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null || true
+  if ! process_is_running "${pid}"; then
+    wait "${pid}" 2>/dev/null || true
   fi
-  wait "${pid}" 2>/dev/null || true
 }
 
 # LMCache's disk tier lives on a host bind mount, so unlike the container's own
@@ -652,6 +654,7 @@ purge_lmcache_disk() {
 cleanup_processes() {
   local rc=$?
   local pid
+  terminate_process_group "${workload_pid:-}"
   for pid in "$@"; do
     terminate_process_group "${pid}"
   done
@@ -1355,7 +1358,7 @@ PY
   echo "[eval] gsm8k runs done, results saved to ${RUN_DIR}/eval_results"
 }
 
-run_benchmark_and_eval() {
+run_workload_phase() {
   if [[ "${ATOMESH_EXECUTION_PHASE}" == "benchmark" ]]; then
     run_benchmark
   elif [[ "${ATOMESH_EXECUTION_PHASE}" == "eval" ]]; then
@@ -1371,6 +1374,45 @@ run_benchmark_and_eval() {
     run_eval
     run_benchmark
   fi
+}
+
+check_serving_processes() {
+  local pid rc=0
+  for pid in "$@"; do
+    [[ -n "${pid}" ]] || continue
+    if ! process_is_running "${pid}"; then
+      wait "${pid}" || rc=$?
+      [[ "${rc}" -ne 0 ]] || rc=1
+      echo "[workload][FAIL] serving process ${pid} exited during ${ATOMESH_EXECUTION_PHASE} rc=${rc}" >&2
+      return "${rc}"
+    fi
+  done
+}
+
+run_benchmark_and_eval() {
+  local rc=0
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  # Give the workload its own process group, including benchmark/eval children.
+  set -m
+  (
+    set +m
+    trap - EXIT HUP INT TERM
+    run_workload_phase
+  ) &
+  workload_pid=$!
+  set +m
+
+  while process_is_running "${workload_pid}"; do
+    check_serving_processes "$@"
+    sleep 1
+  done
+  wait "${workload_pid}" || rc=$?
+  terminate_process_group "${workload_pid}"
+  workload_pid=""
+  [[ "${rc}" -eq 0 ]] || return "${rc}"
+  check_serving_processes "$@"
   printf '%s\n' "${PHASE_COMPLETION_ID}" > "${PHASE_COMPLETION_FILE}.tmp"
   mv "${PHASE_COMPLETION_FILE}.tmp" "${PHASE_COMPLETION_FILE}"
 }
@@ -1421,7 +1463,7 @@ if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
   done
   start_router
   wait_http "http://127.0.0.1:${ROUTER_PORT}${ROUTER_READY_PATH}" "router" "${WAIT_ROUTER_TIMEOUT}"
-  run_benchmark_and_eval
+  run_benchmark_and_eval "${prefill_pid}" "${decode_pid}" "${router_pid:-}"
   cleanup_processes "${router_pid}" "${prefill_pid}" "${decode_pid}"
 elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   prefill_pids=()
@@ -1449,7 +1491,7 @@ elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   done
   start_router
   wait_http "http://127.0.0.1:${ROUTER_PORT}${ROUTER_READY_PATH}" "router" "${WAIT_ROUTER_TIMEOUT}"
-  run_benchmark_and_eval
+  run_benchmark_and_eval "${prefill_pids[@]}" "${router_pid:-}"
   cleanup_processes "${router_pid}" "${prefill_pids[@]}"
 elif [[ "${NODE_RANK}" -eq 0 ]]; then
   start_prefill "prefill-rank-0"
@@ -1466,7 +1508,7 @@ elif [[ "${NODE_RANK}" -eq 0 ]]; then
   done
   start_router
   wait_http "http://127.0.0.1:${ROUTER_PORT}${ROUTER_READY_PATH}" "router" "${WAIT_ROUTER_TIMEOUT}"
-  run_benchmark_and_eval
+  run_benchmark_and_eval "${server_pid}" "${router_pid:-}"
   kill "${router_pid}" "${server_pid}" 2>/dev/null || true
 elif [[ "${DECODE_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -eq "${xP}" ]]; then
   decode_pids=()
