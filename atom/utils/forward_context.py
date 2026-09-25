@@ -423,8 +423,9 @@ class ForwardMode:
             t = getattr(attn_metadata, name, None)
             return None if t is None else int(t.shape[0])
 
-        # `input_ids` is the argument, this rank's own rows -- the cudagraph
-        # branch re-slices the buffer to `running_tokens` itself.
+        # `input_ids` is the scheduled prefix at the runner boundary. Uniform
+        # decode exposes `running_tokens` to the model in both eager and graph
+        # execution; a mixed prefill/decode step keeps its local token count.
         assert input_ids.shape[0] == self.scheduled_tokens, (
             f"input_ids length {input_ids.shape[0]} != scheduled_tokens="
             f"{self.scheduled_tokens} ({self})"
@@ -480,8 +481,7 @@ class Context:
     is_prefill: bool = False
     is_dummy_run: bool = False
     # What this rank was handed. Duplicated from `forward_mode` because a
-    # capture context has none; `scheduled_tokens` is what an eager forward
-    # actually runs.
+    # capture context has none; `scheduled_tokens` counts this rank's real rows.
     scheduled_bs: int = 0
     scheduled_tokens: int = 0
     # The step's DP-unified padded shape. `running_bs` counts SEQUENCES (graph

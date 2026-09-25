@@ -227,23 +227,10 @@ class GDNStateMixin(PoolRowsMixin):
                 ),
             )
 
-        self.spec_state_indices_tensor = CpuGpuBuffer(
-            (self.max_bs, self.num_spec + 1),
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self.non_spec_state_indices_tensor = CpuGpuBuffer(
-            (self.max_bs,),
-            dtype=torch.int32,
-            device=self.device,
-        )
-        # Read side of a state fork. Only the prefill path can carry one (a
-        # fork is always followed by at least `min_fork_tokens` prompt tokens),
-        # so the spec/decode index buffers have no counterpart.
-        self.non_spec_state_indices_in_tensor = CpuGpuBuffer(
-            (self.max_bs,),
-            dtype=torch.int32,
-            device=self.device,
+        # All host state indices belong to the selected runner slot. The
+        # properties below follow PP rotation instead of retaining slot 0.
+        self.model_runner.forward_vars.update(
+            self._state_index_buffers(self.max_bs, self.num_spec, self.device)
         )
         self.spec_sequence_masks = torch.ones(
             (self.max_bs,),
@@ -280,8 +267,6 @@ class GDNStateMixin(PoolRowsMixin):
         )
 
         gdn_metadata = {
-            "spec_state_indices": self.spec_state_indices_tensor,
-            "non_spec_state_indices": self.non_spec_state_indices_tensor,
             "spec_sequence_masks": self.spec_sequence_masks,
             "spec_token_indx": self.spec_token_indx,
             "non_spec_token_indx": self.non_spec_token_indx,
@@ -290,6 +275,53 @@ class GDNStateMixin(PoolRowsMixin):
             "num_accepted_tokens": self.num_accepted_tokens,
         }
         self.model_runner.forward_vars.update(gdn_metadata)
+
+    @staticmethod
+    def _state_index_buffers(max_bs, num_spec, device):
+        kwargs = {
+            "dtype": torch.int32,
+            "device": device,
+            "pin_memory": torch.device(device).type != "cpu",
+            "publication_group": "gdn_state",
+        }
+        return {
+            "spec_state_indices": CpuGpuBuffer(max_bs, num_spec + 1, **kwargs),
+            "non_spec_state_indices": CpuGpuBuffer(max_bs, **kwargs),
+            "non_spec_state_indices_in": CpuGpuBuffer(max_bs, **kwargs),
+        }
+
+    @property
+    def spec_state_indices_tensor(self):
+        return self.model_runner.forward_vars["spec_state_indices"]
+
+    @property
+    def non_spec_state_indices_tensor(self):
+        return self.model_runner.forward_vars["non_spec_state_indices"]
+
+    @property
+    def non_spec_state_indices_in_tensor(self):
+        return self.model_runner.forward_vars["non_spec_state_indices_in"]
+
+    def _check_state_indices_writable(self):
+        groups = getattr(self.model_runner, "h2d_groups", None)
+        if groups is not None:
+            groups["gdn_state"].check_writable()
+
+    def _prepare_state_indices_for_capture(self, bs):
+        """Give Qwen4's synthetic requests distinct slots before capture."""
+        self._check_state_indices_writable()
+        for indices in (
+            self.non_spec_state_indices_tensor,
+            self.non_spec_state_indices_in_tensor,
+        ):
+            indices.np[:bs] = np.arange(bs, dtype=np.int32)
+            indices.copy_to_gpu(bs)
+        if self.use_spec_decode:
+            slots = self.spec_state_indices_tensor
+            slots.np[:bs] = np.arange(bs * slots.np.shape[1]).reshape(bs, -1)
+            if self.replayssm:
+                slots.np[:bs] = np.arange(bs)[:, None]
+            slots.copy_to_gpu(bs)
 
     # ------------------------------------------------------------------ #
     # Per-request cache hooks (called from ModelRunner via base class).  #
@@ -1060,6 +1092,7 @@ class GDNStateMixin(PoolRowsMixin):
         so this is where a contiguity assumption would have been *invented*
         rather than a place one has to be honoured.
         """
+        self._check_state_indices_writable()
         non_spec_state_indices = self.non_spec_state_indices_tensor.np
         non_spec_state_indices_in = self.non_spec_state_indices_in_tensor.np
         spec_state_indices = self.spec_state_indices_tensor.np
@@ -1146,18 +1179,18 @@ class GDNStateMixin(PoolRowsMixin):
         else:
             self.prepare_state_indices(batch, with_spec=True)
             self.prepare_num_accepted_tokens(batch)
+            # The published query prefix (including graph padding) ends at
+            # the scheduled token count. Use its CPU value so ragged decode
+            # does not synchronize the device just to size an index view.
             spec_token_size = min(
-                num_decodes * (self.num_spec + 1), query_start_loc[-1].item()
+                num_decodes * (self.num_spec + 1), batch.total_tokens_num
             )
-            spec_token_indx = torch.arange(
-                spec_token_size, dtype=torch.int32, device=self.device
-            )
-            non_spec_token_indx = torch.empty(
-                0, dtype=torch.int32, device=query_start_loc.device
-            )
-            spec_sequence_masks = torch.ones(
-                num_reqs, dtype=torch.bool, device=self.device
-            )
+            # The token range is immutable. Masks must be restored when a
+            # larger batch reuses entries padded False by a smaller batch.
+            spec_token_indx = self.spec_token_indx[:spec_token_size]
+            non_spec_token_indx = self.non_spec_token_indx[:0]
+            spec_sequence_masks = self.spec_sequence_masks[:num_reqs]
+            spec_sequence_masks.fill_(True)
             spec_state_indices_tensor = self.spec_state_indices_tensor.copy_to_gpu(
                 num_reqs
             )
@@ -1294,31 +1327,21 @@ class GDNStateMixin(PoolRowsMixin):
         if self.use_spec_decode:
             self.spec_state_indices_tensor.gpu[num_decodes:, :].fill_(PAD_SLOT_ID)
 
-            self.spec_sequence_masks[:num_decodes].copy_(
-                gdn_metadata.spec_sequence_masks, non_blocking=True
-            )
             self.spec_sequence_masks[num_decodes:].fill_(False)
-            gdn_metadata.spec_sequence_masks = self.spec_sequence_masks[:num_decodes]
-
-            self.spec_token_indx[: gdn_metadata.spec_token_indx.size(0)].copy_(
-                gdn_metadata.spec_token_indx, non_blocking=True
-            )
-            gdn_metadata.spec_token_indx = self.spec_token_indx[
-                : gdn_metadata.spec_token_indx.size(0)
-            ]
 
             self.spec_query_start_loc[: num_decodes + 1].copy_(
                 gdn_metadata.spec_query_start_loc[: num_decodes + 1], non_blocking=True
             )
-            spec_num_query_tokens = self.spec_query_start_loc[num_decodes]
-            self.spec_query_start_loc[num_decodes + 1 :].fill_(spec_num_query_tokens)
+            # Broadcast the final prefix directly: fill_(GPU scalar) creates
+            # a temporary device allocation on ROCm.
+            self.spec_query_start_loc[num_decodes + 1 :].copy_(
+                self.spec_query_start_loc[num_decodes : num_decodes + 1],
+                non_blocking=True,
+            )
             gdn_metadata.spec_query_start_loc = self.spec_query_start_loc[
                 : num_decodes + 1
             ]
 
-            self.num_accepted_tokens[:num_decodes].copy_(
-                gdn_metadata.num_accepted_tokens[:num_decodes], non_blocking=True
-            )
             self.num_accepted_tokens[num_decodes:].fill_(1)
             gdn_metadata.num_accepted_tokens = self.num_accepted_tokens[:num_decodes]
         else:
@@ -1329,8 +1352,9 @@ class GDNStateMixin(PoolRowsMixin):
                 gdn_metadata.non_spec_query_start_loc[: num_decodes + 1],
                 non_blocking=True,
             )
-            self.non_spec_query_start_loc[num_decodes + 1 :].fill_(
-                gdn_metadata.non_spec_query_start_loc[num_decodes]
+            self.non_spec_query_start_loc[num_decodes + 1 :].copy_(
+                self.non_spec_query_start_loc[num_decodes : num_decodes + 1],
+                non_blocking=True,
             )
             gdn_metadata.non_spec_query_start_loc = self.non_spec_query_start_loc[
                 : num_decodes + 1
@@ -1504,15 +1528,16 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         attn_metadata, positions = super().prepare_decode(
             batch, running_bs, running_tokens, max_seqlen_q
         )
-        self.model_runner.forward_vars["cu_seqlens_q"].cpu[
-            running_bs:
-        ] = batch.total_tokens_num_decode
-        # we fill the attn_metadata cu_seqlens_q here since aiter attn won't calc it for decode
-        attn_metadata.cu_seqlens_q = self.model_runner.forward_vars[
-            "cu_seqlens_q"
-        ].copy_to_gpu(running_bs + 1)
+        # publish_cu_seqlens_q already filled and uploaded the padded prefix
+        # before prepare_input_ids. Reuse it without rewriting a borrowed source.
+        attn_metadata.cu_seqlens_q = self.model_runner.forward_vars["cu_seqlens_q"].gpu[
+            : running_bs + 1
+        ]
 
-        self._attach_gdn_decode_metadata(batch, attn_metadata)
+        # The common decode builder already filled the block-table source.
+        self._attach_gdn_decode_metadata(
+            batch, attn_metadata, prepare_block_tables=False
+        )
         return attn_metadata, positions
 
     def prepare_mtp_decode(
@@ -1583,10 +1608,10 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             attn_metadata.context_lens, create=True
         )
 
-        positions = var["positions"].copy_to_gpu(bs)
         # A capture runs a full synthetic batch, so nothing is padded and the
         # scheduled shape is the running one.
         capture_tokens = bs * int(var["max_qlen"])
+        positions = var["positions"].copy_to_gpu(capture_tokens)
         context = Context(
             positions=positions,
             is_prefill=False,

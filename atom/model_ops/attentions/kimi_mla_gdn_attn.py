@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
@@ -428,14 +427,12 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         )
         return attn_metadata, positions
 
-    def build_for_cudagraph_capture(self, bs: int):
-        if self.block_size == 1:
-            var = self.model_runner.forward_vars
-            var["kv_indptr"].np[: bs + 1] = np.arange(bs + 1, dtype=np.int32)
-            var["kv_indptr"].copy_to_gpu(bs + 1)
-            var["kv_indices"].gpu[:bs].zero_()
-            var["kv_last_page_lens"].gpu[:bs].fill_(1)
+    def _capture_needs_nonempty_kv(self, max_q_len: int) -> bool:
+        # Kimi's dense MLA warmup needs a page even with page_size=1.
+        # The parent owns the single upload, including DCP + MTP capture.
+        return True
 
+    def build_for_cudagraph_capture(self, bs: int):
         attn_metadata, context = super().build_for_cudagraph_capture(bs)
         attn_metadata.gdn_metadata = self._build_gdn_capture_metadata(bs)
         return attn_metadata, context

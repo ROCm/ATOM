@@ -2,6 +2,12 @@
 
 This document describes the environment variables used in the ATOM project.
 
+## Metadata H2D
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_H2D_BACKEND** | str | `direct` | `packed` combines forward metadata into one H2D and GPU scatter per consumer group. `direct` copies each member separately. Both preserve source reuse gates and full cudagraph padding. Set before starting the runner. See [metadata publication](h2d_publication.md). |
+
 ## Data parallelism
 
 | Variable | Type | Default | Description |

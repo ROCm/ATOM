@@ -211,6 +211,7 @@ class PagedAttentionCache:
         self,
         requests,
         *,
+        block_tables,
         tentative=False,
         buffers=None,
         running_bs=None,
@@ -218,6 +219,9 @@ class PagedAttentionCache:
         max_q_len=None,
         state_slot_out=None,
         plans=None,
+        publication_group=None,
+        query_prefix_ready=False,
+        query_prefix_republish_reason=None,
     ):
         self.require_committed()
         requests = tuple(requests)
@@ -234,7 +238,9 @@ class PagedAttentionCache:
             )
         offset = 0
         seen = set()
-        for span in requests:
+        if len(block_tables) != len(requests):
+            raise ValueError("One PAGE table is required per request")
+        for span, row in zip(requests, block_tables):
             if span.length <= 0 or span.position < 0 or span.offset != offset:
                 raise ValueError(
                     "Request spans must be nonempty and partition the token batch"
@@ -242,15 +248,15 @@ class PagedAttentionCache:
             if not 0 <= span.slot < self.num_slots or span.slot in seen:
                 raise ValueError("Each request needs its own valid STATE slot")
             needed = -(-span.end // self.geometry.block_size)
-            if len(span.block_ids) < needed or any(
-                block < 0 or block >= self.num_pages for block in span.block_ids
-            ):
+            if len(row) < needed:
                 raise ValueError("Request PAGE table is incomplete or out of range")
             seen.add(span.slot)
             offset += span.length
         step = prepare_batch_step(
             requests,
             self.pool.device,
+            block_tables=block_tables,
+            page_limit=self.num_pages,
             tentative=tentative,
             buffers=buffers,
             running_bs=running_bs,
@@ -258,6 +264,9 @@ class PagedAttentionCache:
             max_q_len=max_q_len,
             state_slot_out=state_slot_out,
             ratios=tuple(ratio for ratio, _ in self.geometry.compress_ratios),
+            publication_group=publication_group,
+            query_prefix_ready=query_prefix_ready,
+            query_prefix_republish_reason=query_prefix_republish_reason,
         )
         step.plans = (
             self._private_plans(requests, tentative) if plans is None else plans
