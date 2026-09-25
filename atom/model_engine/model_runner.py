@@ -186,7 +186,6 @@ class TokenLocations(NamedTuple):
 
 
 class tokenIDProcessor:
-
     def __init__(
         self,
         runner: "ModelRunner",
@@ -657,7 +656,6 @@ class tokenIDProcessor:
 
 
 class ModelRunner:
-
     def __init__(self, rank: int, config: Config):
         self.config = config
         self.mark_trace = getattr(config, "mark_trace", False)
@@ -750,7 +748,9 @@ class ModelRunner:
             dtype=np.int64,
         )
 
-        model_class = resolve_obj_by_qualname(support_model_arch_dict[hf_config.architectures[0]])  # type: ignore
+        model_class = resolve_obj_by_qualname(
+            support_model_arch_dict[hf_config.architectures[0]]
+        )  # type: ignore
         # The model construction depends on quant_config,
         # so we must complete the remapping for layers before constructing the model.
         config.quant_config.remap_layer_name(
@@ -1062,6 +1062,27 @@ class ModelRunner:
         - Set to "1" to enable record_shapes, with_stack, and profile_memory.
         - Set to "0" or unset to disable these features (default).
         """
+        rocprofiler_rank = int(os.environ.get("ATOM_ROCPROFILER_RANK", self.rank))
+        if (
+            os.environ.get("ATOM_ROCPROFILER_CONTROL") == "1"
+            and self.rank == rocprofiler_rank
+        ):
+            torch.cuda.synchronize()
+            roctx = ctypes.CDLL("librocprofiler-sdk-roctx.so")
+            roctx.roctxProfilerResume.argtypes = [ctypes.c_uint64]
+            roctx.roctxProfilerResume.restype = ctypes.c_int
+            roctx.roctxRangePushA.argtypes = [ctypes.c_char_p]
+            roctx.roctxRangePushA.restype = ctypes.c_int
+            result = roctx.roctxProfilerResume(0)
+            if result != 0:
+                raise RuntimeError(f"roctxProfilerResume failed: {result}")
+            if trace_name:
+                result = roctx.roctxRangePushA(trace_name.encode("utf-8"))
+                if result < 0:
+                    raise RuntimeError(f"roctxRangePushA failed: {result}")
+                self._rocprofiler_range_active = True
+            self._rocprofiler_control_active = True
+
         if self.profiler_dir is not None and self.profiler is None:
             enable_detailed_profiling = envs.ATOM_PROFILER_MORE
             model_name = os.path.basename(self.config.model.rstrip("/"))
@@ -1141,6 +1162,23 @@ class ModelRunner:
         Returns a dict with ``trace_dir`` and ``elapsed`` so the caller
         can report where the trace was written.
         """
+        if getattr(self, "_rocprofiler_control_active", False):
+            torch.cuda.synchronize()
+            roctx = ctypes.CDLL("librocprofiler-sdk-roctx.so")
+            roctx.roctxRangePop.argtypes = []
+            roctx.roctxRangePop.restype = ctypes.c_int
+            roctx.roctxProfilerPause.argtypes = [ctypes.c_uint64]
+            roctx.roctxProfilerPause.restype = ctypes.c_int
+            if getattr(self, "_rocprofiler_range_active", False):
+                result = roctx.roctxRangePop()
+                if result < 0:
+                    raise RuntimeError(f"roctxRangePop failed: {result}")
+                self._rocprofiler_range_active = False
+            result = roctx.roctxProfilerPause(0)
+            if result != 0:
+                raise RuntimeError(f"roctxProfilerPause failed: {result}")
+            self._rocprofiler_control_active = False
+
         if self.profiler is None:
             return {"trace_dir": self.profiler_dir, "elapsed": 0.0}
         t0 = time.monotonic()

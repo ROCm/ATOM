@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,7 @@ try:
     import aiter.iq2r_moe as aiter_iq2r_moe
 
     import atom.model_ops.moe as moe_mod
+    from atom.config import QuantizationConfig
     from atom.quant_spec import get_quant_parser
 except Exception as exc:  # noqa: BLE001
     pytest.skip(
@@ -52,6 +54,51 @@ def test_iq2r_v2_parser_preserves_base_quant_and_targets_routed_experts():
     assert parsed.layer_pattern_specs[0][0] == "model.layers.*.mlp.experts"
     assert parsed.layer_pattern_specs[0][1].quant_method == "iq2r"
     assert parsed.exclude_layers == ["model.layers.*.mlp.gate"]
+
+
+def test_iq2r_overlay_online_quant_keeps_routed_experts_and_converts_shared():
+    config = SimpleNamespace(
+        torch_dtype=torch.bfloat16,
+        quantization_config={
+            "quant_method": "iq2r",
+            "schema": "aiter-iq2r-overlay",
+            "schema_version": 2,
+            "iq2r_modules": ["model.layers.*.mlp.experts"],
+            "base_quantization_config": {
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128],
+                "activation_scheme": "dynamic",
+            },
+        },
+    )
+    quant_config = QuantizationConfig(
+        config,
+        online_quant_config={
+            "global_quant_config": "ptpc_fp8",
+            "layer_quant_config": {"*shared_experts*": "mxfp4"},
+            "exclude_layer": ["*.mlp.experts"],
+        },
+    )
+
+    assert quant_config.online_quant is True
+    routed = quant_config.get_layer_quant_config("model.layers.3.mlp.experts")
+    routed_online = quant_config.get_layer_quant_config(
+        "model.layers.3.mlp.experts", use_online_quant=True
+    )
+    shared_online = quant_config.get_layer_quant_config(
+        "model.layers.3.mlp.shared_experts.gate_up_proj", use_online_quant=True
+    )
+    attention_online = quant_config.get_layer_quant_config(
+        "model.layers.3.self_attn.q_proj", use_online_quant=True
+    )
+
+    assert routed.quant_method == "iq2r"
+    assert routed.quant_type == moe_mod.QuantType.iq2r_2bit
+    assert routed_online.quant_type == moe_mod.QuantType.No
+    assert shared_online.quant_type == moe_mod.QuantType.per_1x32
+    assert shared_online.quant_dtype == moe_mod.dtypes.fp4x2
+    assert attention_online.quant_type == moe_mod.QuantType.per_Token
+    assert attention_online.quant_dtype == moe_mod.dtypes.fp8
 
 
 def test_iq2r_methods_share_one_model_scoped_workspace_cache():
@@ -101,6 +148,93 @@ def test_iq2r_weight_loader_requires_exact_self_contained_shapes():
 
     with pytest.raises(ValueError, match="shape mismatch"):
         method.load_weight(parameter, loaded[:, :-1])
+
+
+def test_iq2r_weight_loader_selects_interleaved_ep_experts():
+    method = object.__new__(moe_mod.Iq2rMoEMethod)
+    method.global_num_experts = 16
+    method.num_experts = 4
+    method.expert_start = 3
+    method.expert_stride = 4
+    parameter = torch.nn.Parameter(
+        torch.empty((4, 2), dtype=torch.uint8), requires_grad=False
+    )
+    parameter.iq2r_name = "w13_weight"
+    loaded = torch.arange(32, dtype=torch.uint8).reshape(16, 2)
+
+    method.load_weight(parameter, loaded)
+
+    torch.testing.assert_close(parameter, loaded[[3, 7, 11, 15]])
+
+
+def test_iq2r_weight_loader_selects_arbitrary_ep_experts():
+    method = object.__new__(moe_mod.Iq2rMoEMethod)
+    method.global_num_experts = 16
+    method.num_experts = 4
+    method.expert_start = 0
+    method.expert_stride = 1
+    method.local_expert_ids = (7, 1, 14, 3)
+    parameter = torch.nn.Parameter(
+        torch.empty((4, 2), dtype=torch.uint8), requires_grad=False
+    )
+    parameter.iq2r_name = "w13_weight"
+    loaded = torch.arange(32, dtype=torch.uint8).reshape(16, 2)
+
+    method.load_weight(parameter, loaded)
+
+    torch.testing.assert_close(parameter, loaded[[7, 1, 14, 3]])
+
+
+def test_iq2r_static_ep_placement_builds_logical_to_local_map(monkeypatch, tmp_path):
+    order = [7, 1, 14, 3, 0, 2, 4, 5, 6, 8, 9, 10, 11, 12, 13, 15]
+    path = tmp_path / "placement.json"
+    path.write_text(
+        __import__("json").dumps(
+            {
+                "schema": "atom-iq2r-static-ep-placement-v1",
+                "global_num_experts": 16,
+                "ep_size": 4,
+                "layers": {"3": order},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(moe_mod, "_IQ2R_EP_PLACEMENT_PATH", str(path))
+    monkeypatch.setattr(moe_mod, "_IQ2R_EP_LAYOUT", "contiguous")
+    moe_mod._load_iq2r_ep_placement.cache_clear()
+    method = object.__new__(moe_mod.Iq2rMoEMethod)
+    method.moe = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(
+            tp_size=1, ep_size=4, ep_rank=0, use_ep=True
+        ),
+        expert_layout=SimpleNamespace(
+            num_routed=16,
+            num_redundant=0,
+            num_fused_shared_experts=0,
+        ),
+        experts_per_token=4,
+    )
+    layer = torch.nn.Module()
+    layer.layer_id = 3
+    layer.has_bias = False
+    layer.register_buffer(
+        "expert_map",
+        torch.tensor([0, 1, 2, 3] + [-1] * 12, dtype=torch.int32),
+        persistent=False,
+    )
+
+    method.create_weights(
+        layer,
+        num_experts=4,
+        hidden_size=64,
+        intermediate_size_per_partition=64,
+        params_dtype=torch.bfloat16,
+    )
+
+    assert method.local_expert_ids == (7, 1, 14, 3)
+    expected = torch.full((16,), -1, dtype=torch.int32)
+    expected[torch.tensor(order[:4])] = torch.arange(4, dtype=torch.int32)
+    torch.testing.assert_close(layer.iq2r_logical_expert_map, expected)
 
 
 def test_iq2r_create_weights_exposes_exact_overlay_contract():
@@ -204,6 +338,200 @@ def test_iq2r_create_weights_accepts_plain_glm53_ep4_geometry_without_bias():
     assert tuple(layer.w2_weight_scale.shape) == (64, down.auxiliary_bytes)
     assert layer.w13_bias is None
     assert layer.w2_bias is None
+
+
+def test_iq2r_create_weights_accepts_plain_glm53_tp8_geometry_without_bias():
+    from aiter.ops.iq2r_format import IQ2RMetadata
+
+    method = object.__new__(moe_mod.Iq2rMoEMethod)
+    method.moe = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(
+            tp_size=8, tp_rank=3, ep_size=1, ep_rank=0, use_ep=False
+        ),
+        expert_layout=SimpleNamespace(
+            num_routed=256,
+            num_redundant=0,
+            num_fused_shared_experts=0,
+        ),
+        experts_per_token=8,
+    )
+    layer = torch.nn.Module()
+    layer.has_bias = False
+    with torch.device("meta"):
+        method.create_weights(
+            layer,
+            num_experts=256,
+            hidden_size=6144,
+            intermediate_size_per_partition=256,
+            params_dtype=torch.bfloat16,
+        )
+
+    gate = IQ2RMetadata(logical_n=512, logical_k=6144)
+    down = IQ2RMetadata(logical_n=6144, logical_k=256)
+    assert method.tp_size == 8
+    assert method.tp_rank == 3
+    assert method.full_gate_metadata == IQ2RMetadata(4096, 6144)
+    assert method.full_down_metadata == IQ2RMetadata(6144, 2048)
+    assert tuple(layer.w13_weight.shape) == (256, gate.data_bytes)
+    assert tuple(layer.w13_weight_scale.shape) == (256, gate.auxiliary_bytes)
+    assert tuple(layer.w2_weight.shape) == (256, down.data_bytes)
+    assert tuple(layer.w2_weight_scale.shape) == (256, down.auxiliary_bytes)
+    assert layer.iq2r_gate_up_metadata == gate
+    assert layer.iq2r_down_metadata == down
+
+
+def test_iq2r_create_weights_accepts_plain_glm53_tp8_fused_shared_expert():
+    from aiter.ops.iq2r_format import IQ2RMetadata
+
+    method = object.__new__(moe_mod.Iq2rMoEMethod)
+    method.moe = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(
+            tp_size=8, tp_rank=3, ep_size=1, ep_rank=0, use_ep=False
+        ),
+        expert_layout=SimpleNamespace(
+            mode=moe_mod.SharedExpertMode.LEGACY_AITER,
+            num_routed=256,
+            num_redundant=0,
+            num_fused_shared_experts=1,
+        ),
+        experts_per_token=9,
+    )
+    layer = torch.nn.Module()
+    layer.has_bias = False
+    with torch.device("meta"):
+        method.create_weights(
+            layer,
+            num_experts=257,
+            hidden_size=6144,
+            intermediate_size_per_partition=256,
+            params_dtype=torch.bfloat16,
+        )
+
+    gate = IQ2RMetadata(logical_n=512, logical_k=6144)
+    down = IQ2RMetadata(logical_n=6144, logical_k=256)
+    assert method.global_num_experts == 256
+    assert method.dispatch_num_experts == 257
+    assert method.num_experts == 257
+    assert tuple(layer.w13_weight.shape) == (257, gate.data_bytes)
+    assert tuple(layer.w13_weight_scale.shape) == (257, gate.auxiliary_bytes)
+    assert tuple(layer.w2_weight.shape) == (257, down.data_bytes)
+    assert tuple(layer.w2_weight_scale.shape) == (257, down.auxiliary_bytes)
+
+
+@pytest.mark.parametrize("tp_size", [4, 8])
+def test_iq2r_process_weights_prepares_tp_quad_layout(tp_size, monkeypatch):
+    from functools import partial
+
+    from aiter.ops import iq2r_format
+
+    monkeypatch.setenv("ATOM_IQ2R_GLM53_QUAD_PACK", "1")
+    # Meta tensors exercise full-size layout preparation without allocating
+    # model weights. Real codebook values are covered by the native suites.
+    monkeypatch.setattr(
+        iq2r_format,
+        "iq2r_validate_expert_weights",
+        partial(iq2r_format.iq2r_validate_expert_weights, verify_reserved_zero=False),
+    )
+    method = object.__new__(moe_mod.Iq2rMoEMethod)
+    method._workspaces = {}
+    method.moe = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(
+            tp_size=tp_size, tp_rank=0, ep_size=1, ep_rank=0, use_ep=False
+        ),
+        expert_layout=SimpleNamespace(
+            mode=moe_mod.SharedExpertMode.LEGACY_AITER,
+            num_routed=256,
+            num_redundant=0,
+            num_fused_shared_experts=1,
+        ),
+        experts_per_token=9,
+        max_num_tokens=8,
+    )
+    layer = torch.nn.Module()
+    layer.has_bias = False
+    with torch.device("meta"):
+        method.create_weights(
+            layer,
+            num_experts=257,
+            hidden_size=6144,
+            intermediate_size_per_partition=2048 // tp_size,
+            params_dtype=torch.bfloat16,
+        )
+        method.process_weights_after_loading(layer)
+
+    assert layer.iq2r_gate_quad_data.shape == (257, (64 // tp_size) * 48 * 2304)
+    assert layer.iq2r_gate_quad_data.dtype == torch.uint8
+    assert "iq2r_gate_quad_data" in dict(layer.named_buffers())
+    assert "iq2r_gate_quad_data" not in layer.state_dict()
+    assert len(method._workspaces) == 1
+
+
+def test_iq2r_tp_loader_slices_packed_intermediate_dimension():
+    from aiter.ops.iq2r_format import (
+        IQ2RMetadata,
+        iq2r_slice_input_data,
+        iq2r_slice_output_auxiliary,
+        iq2r_slice_output_data,
+    )
+
+    method = object.__new__(moe_mod.Iq2rMoEMethod)
+    method.num_experts = 2
+    method.global_num_experts = 2
+    method.tp_size = 2
+    method.tp_rank = 1
+    method.intermediate_size = 128
+    method.expert_start = 0
+    method.expert_stride = 1
+    method.local_expert_ids = None
+    method.full_gate_metadata = IQ2RMetadata(512, 256)
+    method.full_down_metadata = IQ2RMetadata(256, 256)
+    local_gate = IQ2RMetadata(256, 256)
+    local_down = IQ2RMetadata(256, 128)
+
+    cases = (
+        (
+            "w13_weight",
+            method.full_gate_metadata.data_bytes,
+            local_gate.data_bytes,
+            lambda value: iq2r_slice_output_data(
+                value, method.full_gate_metadata, 256, 256
+            ),
+        ),
+        (
+            "w13_weight_scale",
+            method.full_gate_metadata.auxiliary_bytes,
+            local_gate.auxiliary_bytes,
+            lambda value: iq2r_slice_output_auxiliary(
+                value, method.full_gate_metadata, 256, 256
+            ),
+        ),
+        (
+            "w2_weight",
+            method.full_down_metadata.data_bytes,
+            local_down.data_bytes,
+            lambda value: iq2r_slice_input_data(
+                value, method.full_down_metadata, 128, 128
+            ),
+        ),
+    )
+    generator = torch.Generator().manual_seed(0x53_08)
+    for name, source_width, target_width, expected_slice in cases:
+        loaded = torch.randint(
+            0,
+            256,
+            (2, source_width),
+            dtype=torch.uint8,
+            generator=generator,
+        )
+        parameter = torch.nn.Parameter(
+            torch.empty((2, target_width), dtype=torch.uint8),
+            requires_grad=False,
+        )
+        parameter.iq2r_name = name
+
+        method.load_weight(parameter, loaded)
+
+        torch.testing.assert_close(parameter, expected_slice(loaded))
 
 
 def test_iq2r_ep_loader_slices_full_overlay_on_expert_axis():
@@ -423,6 +751,236 @@ def test_iq2r_glm53_uses_grouped_sigmoid_router_and_glm_swiglu(monkeypatch):
     }
 
 
+def test_plain_glm53_fused_shared_uses_topk9_and_257_dispatch_experts(monkeypatch):
+    method = object.__new__(moe_mod.Iq2rMoEMethod)
+    method.moe = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(use_ep=False),
+        max_num_tokens=8,
+    )
+    method.num_experts = 257
+    method.global_num_experts = 256
+    method.dispatch_num_experts = 257
+    method.hidden_size = 4
+    method.intermediate_size = 2
+    method._workspaces = {}
+    layer = SimpleNamespace(
+        num_fused_shared_experts=1,
+        routed_scaling_factor=2.5,
+        w13_weight=torch.empty((257, 3), dtype=torch.uint8),
+        w13_weight_scale=torch.empty((257, 5), dtype=torch.uint8),
+        w2_weight=torch.empty((257, 2), dtype=torch.uint8),
+        w2_weight_scale=torch.empty((257, 7), dtype=torch.uint8),
+        w13_bias=None,
+        w2_bias=None,
+        iq2r_gate_up_metadata=SimpleNamespace(logical_n=4),
+        iq2r_down_metadata=SimpleNamespace(logical_n=4),
+        iq2r_gate_up_tile_n=128,
+        iq2r_down_tile_n=128,
+        swiglu_limit=0.0,
+        swiglu_alpha=1.0,
+        swiglu_up_offset=0.0,
+    )
+    hidden = torch.randn(2, 4, dtype=torch.bfloat16)
+    logits = torch.randn(2, 256, dtype=torch.float32)
+    correction = torch.randn(256, dtype=torch.float32)
+    topk_weights = torch.cat(
+        (
+            torch.full((2, 8), 0.125, dtype=torch.float32),
+            torch.ones((2, 1), dtype=torch.float32),
+        ),
+        dim=1,
+    )
+    topk_ids = torch.cat(
+        (
+            torch.arange(16, dtype=torch.int32).reshape(2, 8),
+            torch.full((2, 1), 256, dtype=torch.int32),
+        ),
+        dim=1,
+    )
+    selections = []
+
+    def fake_select(**kwargs):
+        selections.append(kwargs)
+        return topk_weights, topk_ids
+
+    class FakeWorkspace:
+        @classmethod
+        def allocate(cls, tokens, topk, *, device, **kwargs):
+            return (tokens, topk, device, kwargs)
+
+    calls = []
+    monkeypatch.setattr(moe_mod.FusedMoE, "select_experts", staticmethod(fake_select))
+    monkeypatch.setattr(aiter_iq2r_moe, "IQ2RMoeWorkspace", FakeWorkspace)
+    monkeypatch.setattr(
+        moe_mod,
+        "fused_moe",
+        lambda **kwargs: calls.append(kwargs) or torch.empty_like(hidden),
+    )
+
+    method.apply(
+        layer=layer,
+        x=hidden,
+        router_logits=logits,
+        top_k=8,
+        renormalize=True,
+        use_grouped_topk=True,
+        topk_group=1,
+        num_expert_group=1,
+        global_num_experts=256,
+        scoring_func="sigmoid",
+        e_score_correction_bias=correction,
+        activation=moe_mod.ActivationType.Swiglu,
+    )
+
+    assert len(selections) == 1
+    assert selections[0]["top_k"] == 8
+    assert selections[0]["num_routing_experts"] == 256
+    assert selections[0]["num_fused_shared_experts"] == 1
+    assert len(calls) == 1
+    assert calls[0]["topk_ids"].shape == (2, 9)
+    assert calls[0]["iq2r_workspace"][1] == 9
+    assert calls[0]["iq2r_workspace"][3]["max_experts"] == 257
+    assert calls[0]["iq2r_global_expert_count"] == 257
+
+
+def test_plain_glm53_ep8_selects_fused_biased_sigmoid_router(monkeypatch):
+    monkeypatch.setattr(moe_mod, "_IQ2R_FUSE_GLM_ROUTER", True)
+    method = object.__new__(moe_mod.Iq2rMoEMethod)
+    method.moe = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(use_ep=True),
+        max_num_tokens=16,
+    )
+    method.global_num_experts = 256
+    method.num_experts = 32
+    method.expert_start = 0
+    method.expert_stride = 1
+    method.hidden_size = 4
+    method.intermediate_size = 2
+    method._workspaces = {}
+    expert_map = torch.full((256,), -1, dtype=torch.int32)
+    expert_map[:32] = torch.arange(32, dtype=torch.int32)
+    layer = SimpleNamespace(
+        num_fused_shared_experts=0,
+        routed_scaling_factor=2.5,
+        iq2r_logical_expert_map=expert_map,
+        w13_weight=torch.empty((32, 3), dtype=torch.uint8),
+        w13_weight_scale=torch.empty((32, 5), dtype=torch.uint8),
+        w2_weight=torch.empty((32, 2), dtype=torch.uint8),
+        w2_weight_scale=torch.empty((32, 7), dtype=torch.uint8),
+        w13_bias=None,
+        w2_bias=None,
+        iq2r_gate_up_metadata=SimpleNamespace(logical_n=4),
+        iq2r_down_metadata=SimpleNamespace(logical_n=4),
+        iq2r_gate_up_tile_n=128,
+        iq2r_down_tile_n=128,
+        swiglu_limit=0.0,
+        swiglu_alpha=1.0,
+        swiglu_up_offset=0.0,
+    )
+    hidden = torch.randn(2, 4, dtype=torch.bfloat16)
+    shared = torch.randn_like(hidden)
+    pre_reduce_stream = object()
+    logits = torch.randn(2, 256, dtype=torch.float32)
+    correction = torch.randn(256, dtype=torch.float32)
+    selections = []
+
+    def fake_select(**kwargs):
+        selections.append(kwargs)
+        raise AssertionError("the exact plain-GLM decode shape must fuse routing")
+
+    class FakeWorkspace:
+        @classmethod
+        def allocate(cls, tokens, topk, *, device, **kwargs):
+            return SimpleNamespace(
+                topk_weights=torch.empty(tokens, topk, dtype=torch.float32),
+                topk_ids=torch.empty(tokens, topk, dtype=torch.int32),
+            )
+
+    calls = []
+    monkeypatch.setattr(moe_mod.FusedMoE, "select_experts", staticmethod(fake_select))
+    monkeypatch.setattr(aiter_iq2r_moe, "IQ2RMoeWorkspace", FakeWorkspace)
+    monkeypatch.setattr(
+        moe_mod,
+        "fused_moe",
+        lambda **kwargs: calls.append(kwargs) or torch.empty_like(hidden),
+    )
+
+    method.apply(
+        layer=layer,
+        x=hidden,
+        router_logits=logits,
+        top_k=8,
+        renormalize=True,
+        use_grouped_topk=True,
+        topk_group=1,
+        num_expert_group=1,
+        global_num_experts=256,
+        expert_map=expert_map,
+        scoring_func="sigmoid",
+        e_score_correction_bias=correction,
+        activation=moe_mod.ActivationType.Swiglu,
+        shared_output=shared,
+        pre_reduce_stream=pre_reduce_stream,
+    )
+
+    assert selections == []
+    assert len(calls) == 1
+    kwargs = calls[0]
+    assert kwargs["iq2r_router_logits"] is logits
+    assert kwargs["iq2r_router_bias"] is correction
+    assert kwargs["iq2r_router_scoring_func"] == "sigmoid"
+    assert kwargs["iq2r_router_routed_scaling_factor"] == 2.5
+    assert kwargs["iq2r_expert_map"] is expert_map
+    assert kwargs["iq2r_global_expert_count"] == 256
+    assert kwargs["iq2r_shared_output"] is shared
+    assert kwargs["iq2r_pre_reduce_stream"] is pre_reduce_stream
+
+
+def test_glm_iq2r_dual_stream_defers_join_to_aiter(monkeypatch):
+    from atom.models.deepseek_v2 import DeepseekV2MoE
+
+    waits = []
+    current_stream = SimpleNamespace(wait_stream=lambda stream: waits.append(stream))
+    alt_stream = SimpleNamespace(
+        wait_stream=lambda stream: waits.append(("alt", stream))
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: current_stream)
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
+
+    hidden = torch.randn(2, 4, dtype=torch.bfloat16)
+    shared = torch.randn_like(hidden)
+    combined = torch.randn_like(hidden)
+    final = torch.randn_like(hidden)
+    router_logits = torch.randn(2, 8)
+    calls = []
+
+    experts = SimpleNamespace(
+        quant_method=SimpleNamespace(supports_fused_shared_output=True),
+        forward_iq2r_add_shared_impl=lambda *args: calls.append(args) or combined,
+    )
+    moe = SimpleNamespace(
+        alt_stream=alt_stream,
+        shared_experts=lambda value: shared,
+        experts=experts,
+        router_logits=lambda value: router_logits,
+        combine_outputs=lambda routed, shared_arg, value: (
+            calls.append(("combine", routed, shared_arg, value)) or final
+        ),
+    )
+
+    result = DeepseekV2MoE.dual_stream_moe_forward(moe, hidden)
+
+    torch.testing.assert_close(result, final)
+    assert waits == [("alt", current_stream)]
+    assert calls[0] == (
+        hidden,
+        router_logits,
+        shared,
+        alt_stream,
+    )
+    assert calls[1] == ("combine", combined, None, hidden)
+
+
 def test_iq2r_plain_glm53_ep4_remaps_global_routes_and_skips_nonlocal(
     monkeypatch,
 ):
@@ -459,6 +1017,7 @@ def test_iq2r_plain_glm53_ep4_remaps_global_routes_and_skips_nonlocal(
     topk_weights = torch.full((1, 4), 0.25, dtype=torch.float32)
     global_topk_ids = torch.tensor([[0, 4, 5, 7]], dtype=torch.int32)
     expert_map = torch.tensor([-1, -1, -1, -1, 0, 1, -1, -1], dtype=torch.int32)
+    layer.iq2r_logical_expert_map = expert_map
 
     monkeypatch.setattr(
         moe_mod.FusedMoE,
@@ -495,6 +1054,7 @@ def test_iq2r_plain_glm53_ep4_remaps_global_routes_and_skips_nonlocal(
 
     assert len(calls) == 1
     assert calls[0]["topk_ids"] is global_topk_ids
+    assert calls[0]["iq2r_expert_map"] is expert_map
     assert calls[0]["iq2r_expert_start"] == 4
     assert calls[0]["swiglu_limit"] == 0.0
     assert calls[0]["beta"] == 1.0

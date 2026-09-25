@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: MIT
 
-"""Four-GPU correctness test for IQ2R expert-parallel route remapping.
+"""Multi-GPU correctness tests for IQ2R expert-parallel route remapping.
 
 Run explicitly with::
 
-    HIP_VISIBLE_DEVICES=0,1,2,3 RUN_IQ2R_EP4_TEST=1 \
+    HIP_VISIBLE_DEVICES=0,1,2,3 RUN_IQ2R_EP_TEST=1 \
       torchrun --standalone --nproc-per-node=4 -m pytest -q \
+      tests/test_iq2r_moe_ep_hip.py
+
+or::
+
+    HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 RUN_IQ2R_EP_TEST=1 \
+      torchrun --standalone --nproc-per-node=8 -m pytest -q \
       tests/test_iq2r_moe_ep_hip.py
 """
 
@@ -22,19 +28,21 @@ from aiter.ops.iq2r_format import IQ2RMetadata
 
 from atom.model_ops import moe as moe_mod
 
+_RUN_EP_TEST = (
+    os.environ.get("RUN_IQ2R_EP_TEST") == "1"
+    or os.environ.get("RUN_IQ2R_EP4_TEST") == "1"
+)
+
 pytestmark = pytest.mark.skipif(
-    os.environ.get("RUN_IQ2R_EP4_TEST") != "1",
-    reason="set RUN_IQ2R_EP4_TEST=1 and launch with torchrun --nproc-per-node=4",
+    not _RUN_EP_TEST,
+    reason="set RUN_IQ2R_EP_TEST=1 and launch with 4 or 8 torchrun workers",
 )
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _nccl_process_group():
     """Keep one process group alive across all tests in a torchrun worker."""
-    if (
-        os.environ.get("RUN_IQ2R_EP4_TEST") != "1"
-        or int(os.environ.get("WORLD_SIZE", "1")) != 4
-    ):
+    if not _RUN_EP_TEST or int(os.environ.get("WORLD_SIZE", "1")) not in (4, 8):
         yield
         return
 
@@ -86,9 +94,9 @@ def _layer(gate_data, gate_auxiliary, down_data, down_auxiliary):
     )
 
 
-def test_iq2r_ep4_sum_matches_full_expert_execution():
-    if int(os.environ.get("WORLD_SIZE", "1")) != 4:
-        pytest.skip("requires exactly four torchrun workers")
+def test_iq2r_ep_sum_matches_full_expert_execution():
+    if int(os.environ.get("WORLD_SIZE", "1")) not in (4, 8):
+        pytest.skip("requires exactly four or eight torchrun workers")
 
     rank = dist.get_rank()
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -230,9 +238,9 @@ def test_iq2r_ep4_sum_matches_full_expert_execution():
     assert all(torch.isfinite(output).all() for output in pending)
 
 
-def test_plain_glm53_real_layer_ep4_matches_full_execution():
-    if int(os.environ.get("WORLD_SIZE", "1")) != 4:
-        pytest.skip("requires exactly four torchrun workers")
+def test_plain_glm53_real_layer_ep_matches_full_execution():
+    if int(os.environ.get("WORLD_SIZE", "1")) not in (4, 8):
+        pytest.skip("requires exactly four or eight torchrun workers")
     checkpoint_dir = os.environ.get("GLM53_IQ2R_DIAGNOSTIC_DIR")
     if not checkpoint_dir:
         pytest.skip("set GLM53_IQ2R_DIAGNOSTIC_DIR to a compiled plain-GLM layer")

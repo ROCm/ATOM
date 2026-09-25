@@ -24,6 +24,7 @@
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
 import logging
+import os
 from typing import ClassVar
 
 import torch
@@ -1134,6 +1135,7 @@ class DeepseekV2MoE(nn.Module):
         config: PretrainedConfig,
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
+        layer_id: int | None = None,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
     ):
@@ -1184,6 +1186,7 @@ class DeepseekV2MoE(nn.Module):
             use_grouped_topk=True,
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
+            layer_id=layer_id,
             prefix=f"{prefix}.experts",
             scoring_func=config.scoring_func,
             e_score_correction_bias=self.gate.e_score_correction_bias,
@@ -1233,17 +1236,39 @@ class DeepseekV2MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
+        if (
+            os.environ.get("ATOM_IQ2R_AUDIT", "0").lower() not in ("0", "false", "off")
+            and type(self.experts.quant_method).__name__ == "Iq2rMoEMethod"
+            and layer_id in (None, 3)
+        ):
+            dispatch_experts = (
+                self.experts.global_num_experts + self.experts.num_fused_shared_experts
+            )
+            print(
+                "IQ2R_RUNTIME_AUDIT "
+                f"layer={layer_id} routed_experts={config.n_routed_experts} "
+                f"fused_shared_experts={self.experts.num_fused_shared_experts} "
+                f"dispatch_experts={dispatch_experts} "
+                f"execution_topk={self.experts.top_k + self.experts.num_fused_shared_experts} "
+                f"separate_shared_module={int(hasattr(self, 'shared_experts'))} "
+                f"dual_stream={int(self._use_dual_stream)}",
+                flush=True,
+            )
+
         if self._pcp_moe_merge_enabled or self._use_dual_stream:
             compilation_config = get_current_atom_config().compilation_config
             compilation_config.static_forward_context[prefix] = self
 
-    def routed_expert_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # `otype` must match the correction bias -- see `_moe_router_dtype`.
-        router_logits = (
+        return (
             self.gate(hidden_states)
             if self.router_dtype is None
             else self.gate(hidden_states, otype=self.router_dtype)
         )
+
+    def routed_expert_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        router_logits = self.router_logits(hidden_states)
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
@@ -1277,11 +1302,22 @@ class DeepseekV2MoE(nn.Module):
         alt_stream.wait_stream(current_stream)
 
         with torch.cuda.stream(alt_stream):
-            # final_hidden_states = self.routed_expert_forward(hidden_states)
             shared_output = self.shared_experts(hidden_states)
 
+        if getattr(self.experts.quant_method, "supports_fused_shared_output", False):
+            router_logits = self.router_logits(hidden_states)
+            final_hidden_states = self.experts.forward_iq2r_add_shared_impl(
+                hidden_states,
+                router_logits,
+                shared_output,
+                alt_stream,
+            )
+            final_hidden_states = self.combine_outputs(
+                final_hidden_states, None, hidden_states
+            )
+            return final_hidden_states.view(num_tokens, hidden_dim)
+
         final_hidden_states = self.routed_expert_forward(hidden_states)
-        # shared_output = self.shared_experts(hidden_states)
 
         current_stream.wait_stream(alt_stream)
 
@@ -1364,12 +1400,12 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        assert hidden_states.dim() == 2, (
-            f"Expected hidden_states to be 2D (seq_len, hidden_dim), but got {hidden_states.dim()}D, with shape {hidden_states.shape}"
-        )
-        assert hidden_states.shape[1] == self.experts.hidden_size, (
-            f"Hidden states dimension {hidden_states.shape[1]} does not match expected {self.experts.hidden_size}"
-        )
+        assert (
+            hidden_states.dim() == 2
+        ), f"Expected hidden_states to be 2D (seq_len, hidden_dim), but got {hidden_states.dim()}D, with shape {hidden_states.shape}"
+        assert (
+            hidden_states.shape[1] == self.experts.hidden_size
+        ), f"Hidden states dimension {hidden_states.shape[1]} does not match expected {self.experts.hidden_size}"
 
         if self._pcp_moe_merge_enabled:
             return torch.ops.aiter.deepseek_v2_moe_pcp_merge_forward(
@@ -3113,6 +3149,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 reduce_results=not self.fuse_ar_input_norm,
+                layer_id=layer_idx,
                 prefix=f"{prefix}.mlp",
                 alt_stream=alt_stream,
             )

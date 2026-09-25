@@ -778,7 +778,12 @@ class CoreManager:
         # processes' HeartbeatMonitor threads still depend on it.
         import time
 
-        deadline = time.monotonic() + 5
+        shutdown_grace_s = (
+            float(os.environ.get("ATOM_ROCPROFILER_SHUTDOWN_GRACE_S", "180"))
+            if os.environ.get("ATOM_ROCPROFILER_CONTROL") == "1"
+            else 5.0
+        )
+        deadline = time.monotonic() + shutdown_grace_s
         for proc in self.engine_core_processes:
             if proc is not None and proc.is_alive():
                 remaining = max(deadline - time.monotonic(), 0)

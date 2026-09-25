@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 import pickle
 import queue
 import threading
@@ -252,17 +253,24 @@ class EngineCore:
             self._send_engine_dead()
             return
         self.runner_mgr.keep_monitoring = False
+        profile_shutdown = os.environ.get("ATOM_ROCPROFILER_CONTROL") == "1"
+        shutdown_grace_s = (
+            float(os.environ.get("ATOM_ROCPROFILER_SHUTDOWN_GRACE_S", "180"))
+            if profile_shutdown
+            else 5.0
+        )
         try:
-            self.runner_mgr.call_func("exit")
+            self.runner_mgr.call_func("exit", wait_out=profile_shutdown)
         except Exception:
             pass  # shared memory may already be freed
+        deadline = time.monotonic() + shutdown_grace_s
         for proc in self.runner_mgr.procs:
             try:
                 alive = proc.is_alive()
             except ValueError:
                 continue  # process object already closed by CoreManager
             if alive:
-                proc.join(timeout=5)
+                proc.join(timeout=max(deadline - time.monotonic(), 0.0))
                 # The join above has a timeout; nothing after it did. A worker
                 # that outlives it keeps its VRAM slice and its all-reduce IPC
                 # handles, and `multiprocessing`'s atexit handler then joins the
@@ -276,9 +284,10 @@ class EngineCore:
                 try:
                     if proc.is_alive():
                         logger.warning(
-                            "%s: worker pid=%s still alive after 5s; terminating",
+                            "%s: worker pid=%s still alive after %.1fs; terminating",
                             self.label,
                             getattr(proc, "pid", "?"),
+                            shutdown_grace_s,
                         )
                         proc.terminate()
                         proc.join(timeout=5)

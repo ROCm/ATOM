@@ -347,8 +347,10 @@ class QuantizationConfig:
         else:
             self.quant_method = self.hf_quant_config.get("quant_method", "")
 
-        # Online quantization: re-quantize float / FP8 / MXFP4 / MXFP8 / Quark
-        # models at load time.
+        # Online quantization: re-quantize supported source tensors at load
+        # time. IQ2R overlays are eligible because their non-IQ2R layers retain
+        # the base checkpoint's ordinary quantization spec; callers must keep
+        # routed IQ2R modules excluded from the online target config.
         self.online_quant = False
         self.online_quant_config_raw = online_quant_config
         self.online_global_spec: LayerQuantConfig = LayerQuantConfig()
@@ -361,6 +363,7 @@ class QuantizationConfig:
             "mxfp8",
             "quark",
             "compressed-tensors",
+            "iq2r",
         ]:
             self.online_quant = True
             if self.quant_method == "compressed-tensors":

@@ -35,7 +35,6 @@ def _load_tokenizer(model: str, trust_remote_code: bool = False):
 
 
 class LLMEngine:
-
     def __init__(self, model, tokenizer=None, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
@@ -338,8 +337,10 @@ class LLMEngine:
         outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
         return outputs
 
-    def start_profile(self):
-        self.core_mgr.broadcast_utility_command_sync("start_profile")
+    def start_profile(self, trace_name: str | None = None):
+        self.core_mgr.broadcast_utility_command_sync(
+            "start_profile", trace_name=trace_name
+        )
         logger.info("Profiling started")
 
     def stop_profile(self) -> list[dict[str, Any]]:
@@ -679,7 +680,6 @@ class LLMEngine:
 
 
 class InputOutputProcessor:
-
     def __init__(self, config, tokenizer, block_size):
         self.config = config
         self.tokenizer = tokenizer
