@@ -1432,19 +1432,22 @@ if [[ "${TOPOLOGY}" == "0p1d" ]]; then
   start_decode "decode-rank-0"
   trap 'cleanup_processes ${server_pid:-}' EXIT
   wait_http "http://127.0.0.1:${DECODE_PORT}/health" "decode" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
-  timeout --kill-after=10s 600s bash "${ATOMESH_SCRIPT_DIR}/../k3-decode-probe/workload.sh" "${DECODE_PORT}" "${RUN_DIR}"
-  ROUTER_PORT="${DECODE_PORT}"
-  export -f run_eval run_lm_eval snapshot_eval_metrics
-  export RUN_EVAL EVAL_TASK EVAL_LIMIT EVAL_BATCH_SIZE EVAL_APPLY_CHAT_TEMPLATE \
-    EVAL_FEWSHOT_AS_MULTITURN EVAL_MAX_GEN_TOKS EVAL_MODEL_TYPE SERVED_MODEL_NAME \
-    MODEL_PATH ROUTER_PORT EVAL_ENDPOINT EVAL_CONCURRENCY EVAL_FEWSHOT \
-    EVAL_THRESHOLD RUN_DIR TOPOLOGY
-  timeout --kill-after=10s 1800s bash -euo pipefail -c '
-    decode_ips=(127.0.0.1)
-    decode_ports=("${ROUTER_PORT}")
-    prefill_ips=()
-    run_eval
-  '
+  run_workload_phase() {
+    timeout --foreground --kill-after=10s 600s bash "${ATOMESH_SCRIPT_DIR}/../k3-decode-probe/workload.sh" "${DECODE_PORT}" "${RUN_DIR}"
+    ROUTER_PORT="${DECODE_PORT}"
+    export -f run_eval run_lm_eval snapshot_eval_metrics
+    export RUN_EVAL EVAL_TASK EVAL_LIMIT EVAL_BATCH_SIZE EVAL_APPLY_CHAT_TEMPLATE \
+      EVAL_FEWSHOT_AS_MULTITURN EVAL_MAX_GEN_TOKS EVAL_MODEL_TYPE SERVED_MODEL_NAME \
+      MODEL_PATH ROUTER_PORT EVAL_ENDPOINT EVAL_CONCURRENCY EVAL_FEWSHOT \
+      EVAL_THRESHOLD RUN_DIR TOPOLOGY
+    timeout --foreground --kill-after=10s 1800s bash -euo pipefail -c '
+      decode_ips=(127.0.0.1)
+      decode_ports=("${ROUTER_PORT}")
+      prefill_ips=()
+      run_eval
+    '
+  }
+  run_benchmark_and_eval "${server_pid}"
   exit 0
 fi
 

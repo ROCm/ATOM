@@ -1,0 +1,214 @@
+--- /dev/null
++++ b/vllm/v1/worker/k3_memory_diagnostic.py
+@@ -0,0 +1,41 @@
++"""Startup memory observations; diagnostic branch only."""
++
++import json
++import os
++import time
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.v1.worker import workspace
++
++logger = init_logger(__name__)
++
++
++def log_startup_memory(stage: str, **fields) -> None:
++    free, total = torch.accelerator.get_memory_info()
++    stats = torch.cuda.memory_stats()
++    manager = workspace._manager
++    payload = {
++        "stage": stage,
++        "pid": os.getpid(),
++        "monotonic_ns": time.monotonic_ns(),
++        "device": torch.cuda.current_device(),
++        "free_bytes": free,
++        "total_bytes": total,
++        "allocated_bytes": stats.get("allocated_bytes.all.current"),
++        "reserved_bytes": stats.get("reserved_bytes.all.current"),
++        "active_bytes": stats.get("active_bytes.all.current"),
++        "inactive_split_bytes": stats.get("inactive_split_bytes.all.current"),
++        "peak_allocated_bytes": stats.get("allocated_bytes.all.peak"),
++        "workspace_bytes": (
++            [manager._workspace_size_bytes(ws) for ws in manager._current_workspaces]
++            if manager is not None
++            else None
++        ),
++        "workspace_locked": manager.is_locked() if manager is not None else None,
++        **fields,
++    }
++    logger.info(
++        "K3_STARTUP_MEMORY %s", json.dumps(payload, sort_keys=True, allow_nan=False)
++    )
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -86,6 +86,7 @@
+     ModelRunnerOutput,
+ )
+ from vllm.v1.utils import compute_iteration_details, report_usage_stats
++from vllm.v1.worker.k3_memory_diagnostic import log_startup_memory
+ from vllm.v1.worker.sentinel.gpu_worker_sentinel import WorkerSentinel
+ from vllm.v1.worker.startup_plan import (
+     maybe_apply_startup_plan,
+@@ -562,11 +563,14 @@
+ 
+         # Execute a forward pass with dummy inputs to profile the memory usage
+         # of the model.
++        log_startup_memory("worker.before_profile")
+         with memory_profiling(
+             self.init_snapshot,
+             weights_memory=int(self.model_runner.model_memory_usage),
+         ) as profile_result:
+             self.model_runner.profile_run()
++
++        log_startup_memory("worker.after_profile")
+ 
+         # Profile CUDA graph memory if graphs will be captured.
+         # ROCm is included: #44825 moved the profiler to
+@@ -621,6 +625,20 @@
+             - cudagraph_memory_estimate_applied
+         )
+ 
++        log_startup_memory(
++            "worker.kv_budget",
++            init_free_bytes=self.init_snapshot.free_memory,
++            profile_snapshot_free_bytes=profile_result.after_profile.free_memory,
++            profile_snapshot_allocated_bytes=profile_result.after_profile.torch_allocated,
++            profile_snapshot_peak_bytes=profile_result.after_profile.torch_peak,
++            requested_bytes=self.requested_memory,
++            consumed_bytes=profile_result.total_consumed,
++            transient_peak_bytes=profile_result.transient_peak_headroom,
++            non_kv_bytes=profile_result.non_kv_cache_memory,
++            graph_estimate_bytes=cudagraph_memory_estimate,
++            graph_applied_bytes=cudagraph_memory_estimate_applied,
++            available_kv_bytes=self.available_kv_cache_memory_bytes,
++        )
+         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
+         logger.debug(
+             "Initial free memory: %s GiB; Requested memory: %f (util), %s GiB",
+@@ -724,6 +742,12 @@
+     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+         """Allocate GPU KV cache with the specified kv_cache_config."""
+ 
++        log_startup_memory(
++            "worker.before_real_kv",
++            kv_blocks=kv_cache_config.num_blocks,
++            kv_config_bytes=sum(t.size for t in kv_cache_config.kv_cache_tensors),
++        )
++
+         # Update local config with adjusted num blocks after profiling,
+         # so that it's available to the warmup stage.
+         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
+@@ -757,6 +781,12 @@
+             self.model_runner, "_init_kv_zero_meta"
+         ):
+             self.model_runner._init_kv_zero_meta()
++
++        log_startup_memory(
++            "worker.after_real_kv",
++            kv_blocks=kv_cache_config.num_blocks,
++            kv_config_bytes=sum(t.size for t in kv_cache_config.kv_cache_tensors),
++        )
+ 
+     @instrument(span_name="Warmup (GPU)")
+     def compile_or_warm_up_model(self) -> CompilationTimes:
+@@ -799,6 +829,7 @@
+             # A workspace resize after capture frees what the graphs point at.
+             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+ 
++        log_startup_memory("worker.after_kernel_warmup")
+         cuda_graph_memory_bytes = 0
+         if not self.model_config.enforce_eager:
+             cuda_graph_memory_bytes = self.model_runner.capture_model()
+@@ -926,6 +957,7 @@
+         # (model weights, KV caches, CUDA graphs) during inference.
+         freeze_gc_heap()
+         maybe_attach_gc_debug_callback()
++        log_startup_memory("worker.after_all_warmup")
+ 
+         # Warmup / first-compile is done — activate the `VLLM_GPU_SYNC_CHECK`
+         # gate so subsequent `execute_model` / `sample_tokens` calls enforce it.
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -41,6 +41,7 @@
+ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
+ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+ from vllm.v1.worker.gpu.model_states.interface import ModelState
++from vllm.v1.worker.k3_memory_diagnostic import log_startup_memory
+ from vllm.v1.worker.utils import AttentionGroup, clear_layer_kv_caches
+ 
+ if TYPE_CHECKING:
+@@ -795,8 +796,16 @@
+     platform_cls._global_graph_pool = throwaway_pool
+ 
+     try:
++        log_startup_memory("profile.before_minimal_kv")
+         with set_current_vllm_config(runner.vllm_config):
+             _init_minimal_kv_cache_for_profiling(runner)
++        log_startup_memory(
++            "profile.after_minimal_kv",
++            kv_blocks=runner.kv_cache_config.num_blocks,
++            kv_config_bytes=sum(
++                t.size for t in runner.kv_cache_config.kv_cache_tensors
++            ),
++        )
+ 
+         manager = runner.cudagraph_manager
+         assert manager is not None
+@@ -841,6 +850,14 @@
+             # double-counted.
+             num_full_graphs = len(manager._capture_descs.get(CUDAGraphMode.FULL, []))
+             full_estimate = _extrapolate_full_graph_memory(mem_samples, num_full_graphs)
++            log_startup_memory(
++                "profile.estimate",
++                measured_bytes=measured,
++                full_samples_bytes=mem_samples,
++                num_full_graphs=num_full_graphs,
++                full_estimate_bytes=full_estimate,
++                estimate_bytes=max(measured - sum(mem_samples) + full_estimate, 0),
++            )
+             return max(measured - sum(mem_samples) + full_estimate, 0)
+         finally:
+             compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
+@@ -859,6 +876,7 @@
+             # manager and flushes the allocator.
+             del manager
+             _teardown_profiling_state(runner)
++            log_startup_memory("profile.after_teardown")
+     finally:
+         platform_cls._global_graph_pool = saved_global_pool
+ 
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -167,6 +167,7 @@
+     UBatchState,
+     maybe_build_ubatch_runner,
+ )
++from vllm.v1.worker.k3_memory_diagnostic import log_startup_memory
+ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+ from vllm.v1.worker.utils import (
+     KVBlockZeroer,
+@@ -952,6 +953,10 @@
+         with freeze_gc_for_cudagraph_capture():
+             torch.accelerator.empty_cache()
+             start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
++            log_startup_memory(
++                "profile.capture.before" if profile_only else "final.capture.before",
++                measured_free_bytes=start_free_gpu_memory,
++            )
+ 
+             with self.maybe_setup_dummy_loras(self.lora_config):
+                 if capture_encoder:
+@@ -988,6 +993,10 @@
+                         self.adaptive_verification.set_initial_cost_curves(timings)
+ 
+             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
++            log_startup_memory(
++                "profile.capture.after" if profile_only else "final.capture.after",
++                measured_free_bytes=end_free_gpu_memory,
++            )
+ 
+         if not profile_only:
+             # Lock workspace to prevent resizing during execution. A resize after
