@@ -868,14 +868,14 @@ models:
     suites:
       vllm:
         - &kimi_k3_vllm_dspark_dcp8
-          name: kimi-k3-vllm-dspark4-1p1d-tp8-dcp8-agentic-lmcache-1m-c48-fast
+          name: kimi-k3-vllm-dspark4-1p1d-tp8-dcp8-agentic-lmcache-1m-c64-target
           topology: 1p1d
           display_topology: 1P1D-TP8-DCP8
           pd_worker_layout: multi_node
           nodes: "${ATOMESH_1P1D_NODES}"
           isl: [1048576]
           osl: 1024
-          concurrency: [48]
+          concurrency: [64]
           prefill:
             workers: 1
             tp: 8
@@ -890,8 +890,9 @@ models:
               --compilation-config '{"mode":3,"cudagraph_mode":"FULL_AND_PIECEWISE","max_cudagraph_capture_size":512,"custom_ops":["+fused_rms_norm_gated"],"cudagraph_capture_sizes":[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256,272,288,304,320,336,352,368,384,400,416,432,448,464,480,496,512]}'
           benchmark:
             <<: *kimi_k3_vllm_aiperf
-            benchmark_duration: 1200
-            warmup_requests_per_lane: 1
+            apply_chat_template: true
+            benchmark_duration: 3600
+            warmup_requests_per_lane: 10
           run_eval: true
     accuracy:
       task: gsm8k
