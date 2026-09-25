@@ -1245,6 +1245,20 @@ snapshot_eval_metrics() {
   done
 }
 
+run_lm_eval() {
+  if command -v lm_eval >/dev/null 2>&1; then
+    lm_eval "$@"
+    return
+  fi
+  local eval_venv="/tmp/atomesh-lm-eval-${RUN_DIR##*/}"
+  if [[ ! -f "${eval_venv}/.complete" ]]; then
+    uv venv --clear --system-site-packages --python "$(command -v python3)" "${eval_venv}"
+    uv pip install --python "${eval_venv}/bin/python" 'lm-eval[api]==0.4.13'
+    touch "${eval_venv}/.complete"
+  fi
+  "${eval_venv}/bin/python" -m lm_eval "$@"
+}
+
 run_eval() {
   [[ "${RUN_EVAL}" == "true" ]] || [[ "${RUN_EVAL}" == "1" ]] || return 0
   if [[ "${EVAL_TASK}" == "swebench_lite" ]]; then
@@ -1254,9 +1268,6 @@ run_eval() {
   if [[ "${EVAL_TASK}" != "gsm8k" ]]; then
     echo "[eval] unsupported task ${EVAL_TASK}; skipping"
     return 0
-  fi
-  if ! command -v lm_eval >/dev/null 2>&1; then
-    python3 -m pip install 'lm-eval[api]'
   fi
   local limit_arg=()
   if [[ -n "${EVAL_LIMIT}" ]]; then
@@ -1298,7 +1309,7 @@ run_eval() {
     echo "========================================="
 
     snapshot_eval_metrics "${result_dir}" before
-    lm_eval --model "${EVAL_MODEL_TYPE}" \
+    run_lm_eval --model "${EVAL_MODEL_TYPE}" \
       --model_args "${eval_model_args_base}${eval_conc},max_retries=3${eval_model_args_extra}" \
       --tasks gsm8k \
       --num_fewshot "${EVAL_FEWSHOT}" \
@@ -1368,6 +1379,11 @@ if [[ "${BACKEND}" == "vllm" ]]; then
   source "${ATOMESH_SCRIPT_DIR}/pd_server_vllm.sh"
 fi
 
+if [[ "${NODE_RANK}" -eq 0 && "${EVAL_TASK}" == "gsm8k" \
+  && ( "${RUN_EVAL}" == "true" || "${RUN_EVAL}" == "1" ) ]]; then
+  timeout --kill-after=10s 300s bash -euo pipefail -c "$(declare -f run_lm_eval); $(declare -p RUN_DIR); run_lm_eval --help" > /dev/null
+fi
+
 write_metadata
 
 if [[ "${TOPOLOGY}" == "0p1d" ]]; then
@@ -1376,7 +1392,7 @@ if [[ "${TOPOLOGY}" == "0p1d" ]]; then
   wait_http "http://127.0.0.1:${DECODE_PORT}/health" "decode" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   timeout --kill-after=10s 600s bash "${ATOMESH_SCRIPT_DIR}/../k3-decode-probe/workload.sh" "${DECODE_PORT}" "${RUN_DIR}"
   ROUTER_PORT="${DECODE_PORT}"
-  export -f run_eval snapshot_eval_metrics
+  export -f run_eval run_lm_eval snapshot_eval_metrics
   export RUN_EVAL EVAL_TASK EVAL_LIMIT EVAL_BATCH_SIZE EVAL_APPLY_CHAT_TEMPLATE \
     EVAL_FEWSHOT_AS_MULTITURN EVAL_MAX_GEN_TOKS EVAL_MODEL_TYPE SERVED_MODEL_NAME \
     MODEL_PATH ROUTER_PORT EVAL_ENDPOINT EVAL_CONCURRENCY EVAL_FEWSHOT \
