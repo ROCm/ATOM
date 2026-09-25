@@ -1370,6 +1370,14 @@ fi
 
 write_metadata
 
+if [[ "${TOPOLOGY}" == "1p0d" ]]; then
+  start_prefill "prefill-rank-0"
+  trap 'cleanup_processes ${server_pid:-} ${lmcache_pid:-}' EXIT
+  wait_http "http://127.0.0.1:${PREFILL_PORT}/health" "prefill" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
+  timeout --kill-after=10s 900s bash "${ATOMESH_SCRIPT_DIR}/../k3-prefill-probe/workload.sh" "${PREFILL_PORT}" "${RUN_DIR}"
+  exit 0
+fi
+
 if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
   start_prefill "prefill-rank-0"
   prefill_pid="${server_pid}"

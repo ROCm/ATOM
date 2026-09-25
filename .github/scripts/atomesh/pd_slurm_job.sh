@@ -160,20 +160,7 @@ start_vllm_router() {
 }
 
 pre_cleanup_local() {
-  echo "=== pre-cleanup: stop running containers on $(hostname) ==="
-  set +e
-  running=()
-  while read -r id; do
-    [[ -n "${id}" ]] && running+=("${id}")
-  done < <(docker ps -q 2>/dev/null)
-
-  if [[ "${#running[@]}" -gt 0 ]]; then
-    docker ps --format "  {{.ID}} {{.Names}} {{.Status}}"
-    docker stop -t 0 "${running[@]}" >/dev/null 2>&1 || true
-  else
-    echo "no running containers"
-  fi
-  set -e
+  echo "P-only probe cleans only its own job containers."
 }
 
 run_container_rank() {
@@ -496,6 +483,11 @@ if [[ "${1:-}" == "--spur-worker" ]]; then
 fi
 
 if [[ -n "${SPUR_JOB_ID:-}" || -n "${SPUR_TASK_OFFSET:-}" || -n "${SPUR_PEER_NODES:-}" ]]; then
+  if [[ "${NUM_NODES}" -eq 1 ]]; then
+    timeout 15s srun --help > "${RUN_DIR}/srun-worker-help.txt" 2>&1 || true
+    run_spur_job
+    exit $?
+  fi
   # Spur sbatch runs the batch script only on the first allocated node; the
   # other nodes run placeholders until an srun step dispatches their workers.
   # Use an explicit worker argument because the batch shell also has rank 0
