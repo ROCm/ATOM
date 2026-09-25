@@ -82,7 +82,8 @@ for rel in files:
     shutil.copy2(src, dst)
 print(f"[vllm] overlaid {len(files)} Python files")
 PY
-  for patch_file in vllm-k3-read-source-lease.patch vllm-k3-read-failure.patch; do
+  for patch_file in vllm-k3-read-source-lease.patch vllm-k3-read-failure.patch \
+    vllm-k3-sync-read-init.patch vllm-k3-full-read-context.patch; do
     patch_file="${ATOMESH_SCRIPT_DIR}/patches/${patch_file}"
     echo "[vllm] applying patch $(sha256sum "${patch_file}")"
     git -C "${VLLM_SITE_DIR}" apply --check "${patch_file}"
