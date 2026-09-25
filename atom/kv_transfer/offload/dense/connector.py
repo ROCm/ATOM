@@ -161,7 +161,12 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 self._engine, meta
             )
         except Exception as e:  # noqa: BLE001  # optional save-only dependency
-            logger.warning("LMCache offload: lookup server not started: %s", e)
+            logger.warning(
+                "LMCache offload: lookup server not started: "
+                "error_type=%s error=%s",
+                type(e).__name__,
+                e,
+            )
 
         gpu_connector = self._engine.gpu_connector
         logger.info(
@@ -506,7 +511,10 @@ class DenseOffloadScheduler(ChunkedOffloadSchedulerBase):
             )
         except Exception as e:  # noqa: BLE001  # optional lookup service
             logger.warning(
-                "LMCache offload scheduler: lookup client unavailable: %s", e
+                "LMCache offload scheduler: lookup client unavailable: "
+                "error_type=%s error=%s",
+                type(e).__name__,
+                e,
             )
 
         super().__init__(
