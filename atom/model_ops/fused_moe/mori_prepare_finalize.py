@@ -14,8 +14,13 @@ from aiter.jit.utils.chip_info import get_cu_num
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
+from atom.plugin import is_plugin_mode
 from atom.utils import envs
-from atom.utils.forward_context import get_forward_context
+from atom.utils.forward_context import (
+    enable_pad_rows_device,
+    get_forward_context,
+    get_pad_rows_device,
+)
 
 try:
     import mori
@@ -119,6 +124,30 @@ def mori_tuned_launch_table(
 
 
 _MXFP8_DISPATCH = envs.ATOM_MORI_FP8_DISPATCH
+_MASK_PAD_ROWS = envs.ATOM_MORI_MASK_PAD_ROWS
+
+
+@cache
+def _log_pad_masking(active: bool) -> None:
+    """Say once, not per MoE layer, whether ATOM_MORI_MASK_PAD_ROWS took."""
+    if active:
+        logger.info("[MORI] DP pad rows are routed to expert -1 before dispatch")
+    else:
+        logger.warning(
+            "[MORI] ATOM_MORI_MASK_PAD_ROWS=1 ignored: needs the IntraNode "
+            "kernel and native ATOM serving"
+        )
+
+
+def _drops_negative_ids(mori_op: Any) -> bool:
+    """Whether this op's dispatch skips a (token, k) whose expert id is < 0.
+
+    Read in intranode.hpp: IntraNode dispatch writes such a pair's destination
+    as `worldSize`, sends nothing for it, and its combine then treats that
+    destination as absent. Other kernels are unverified, so they keep the ids.
+    """
+    kernel_type = getattr(getattr(mori_op, "config", None), "kernel_type", None)
+    return kernel_type == mori.ops.EpDispatchCombineKernelType.IntraNode
 
 
 @dataclass(frozen=True)
@@ -293,6 +322,19 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # (phase, op, dtype, hidden_dim) -> step table or None; see
         # _get_launch_config.
         self._launch_tables: dict[tuple, Any] = {}
+        # See mask_pad_topk_ids. Plugin frontends own their own step shapes
+        # and never publish the pad-row mask, so they are left out.
+        self._mask_pad_rows = False
+        if _MASK_PAD_ROWS:
+            self._mask_pad_rows = not is_plugin_mode() and _drops_negative_ids(
+                self._mori_ops[0]
+            )
+            _log_pad_masking(self._mask_pad_rows)
+            if self._mask_pad_rows:
+                enable_pad_rows_device(
+                    max_tokens_per_rank,
+                    torch.device("cuda", torch.cuda.current_device()),
+                )
 
     # Derived from the resolved format so there is no second copy to keep in
     # sync with the staging config.
@@ -449,6 +491,40 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         if context is not None and context.is_prefill:
             return min(128, mp), _MAX_WARP_PER_BLOCK
         return min(64, mp), 4
+
+    def mask_pad_topk_ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
+        """Route this rank's DP pad rows to expert -1.
+
+        A padded decode step runs `running_tokens` rows, of which only the
+        leading `scheduled_tokens` carry a request; the tail is there to match
+        the group's graph width. Its routing is real, so it pays dispatch, GEMM
+        and combine like any token, and being identical rows it piles onto the
+        same experts. IntraNode dispatch sends nothing for a negative id, and
+        combine sums nothing for a token sent nowhere, so a masked row costs
+        neither and comes back as zeros that are sliced off with the padding.
+
+        The pad-row mask is published on the device before every forward and
+        draft pass, so a capture records one select against it and each replay
+        follows its own step; an eager step checks the host count first and
+        skips the select when nothing is padded. Only rows that ARE the step's
+        `running_tokens` are touched: nothing else has a padded tail. TBO
+        ubatches are left alone, a ubatch's rows not being the step's prefix.
+        """
+        if not self._mask_pad_rows or self.supports_async():
+            return topk_ids
+        context = get_forward_context().context
+        num_rows = topk_ids.shape[0]
+        if context is None or num_rows != context.running_tokens:
+            return topk_ids
+        if (
+            not torch.cuda.is_current_stream_capturing()
+            and context.scheduled_tokens >= num_rows
+        ):
+            return topk_ids
+        pad_rows = get_pad_rows_device()
+        if pad_rows is None or pad_rows.shape[0] < num_rows:
+            return topk_ids
+        return torch.where(pad_rows[:num_rows], -1, topk_ids)
 
     # ---- Synchronous (non-TBO) path ----
 

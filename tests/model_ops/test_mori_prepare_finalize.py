@@ -39,6 +39,7 @@ def _expert_map():
 def _prepare_finalize():
     pf = mpf.MoriPrepareAndFinalize.__new__(mpf.MoriPrepareAndFinalize)
     pf._launch_tables = {}
+    pf._mask_pad_rows = False
     return pf
 
 

@@ -90,6 +90,7 @@ from atom.utils.forward_context import (
     ForwardMode,
     get_forward_context,
     get_kvconnector,
+    publish_scheduled_tokens,
     reset_forward_context,
     set_forward_context,
     set_kv_cache_data,
@@ -4365,6 +4366,8 @@ class ModelRunner:
             if graph is None:
                 continue
             B = bs * max_q_len
+            # Every row of the recording is real here: time the whole of it.
+            publish_scheduled_tokens(B)
             # Warm replay, then timed replays (median for robustness to jitter).
             graph.replay()
             torch.cuda.synchronize()

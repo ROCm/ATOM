@@ -131,6 +131,14 @@ class FusedMoEPrepareAndFinalize(ABC):
         """
         return dispatch_ids, dispatch_weights
 
+    def mask_pad_topk_ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
+        """Return `topk_ids` with rows that carry no request routed nowhere.
+
+        Identity unless the transport drops negative ids for free. Applied
+        before prepare, so dispatch and combine see the same routing.
+        """
+        return topk_ids
+
     def prepare_async(
         self,
         a1: torch.Tensor,
@@ -431,6 +439,7 @@ class FusedMoEModularKernel(torch.nn.Module):
         local_num_experts = w1.size(0)
         if global_num_experts == -1:
             global_num_experts = local_num_experts
+        topk_ids = self.prepare_finalize.mask_pad_topk_ids(topk_ids)
         (
             dispatch_a1,
             dispatch_scale,
