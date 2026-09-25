@@ -335,6 +335,15 @@ class OffloadWorkerMixin:
         raw = os.environ.get("OFFLOAD_PROFILE", "0").strip().lower()
         return bool(raw) and raw not in {"0", "false", "no", "off"}
 
+    @staticmethod
+    def _profile_transfer_stat(
+        transfer_stats: dict[str, int | float], key: str
+    ) -> float:
+        """Return one profile value without turning an absent timer into zero."""
+
+        value = transfer_stats.get(key)
+        return float("nan") if value is None else float(value)
+
     def _last_gpu_connector_transfer_stats(self) -> dict[str, int | float]:
         gpu_connector = getattr(getattr(self, "_engine", None), "gpu_connector", None)
         if gpu_connector is None or not hasattr(gpu_connector, "last_transfer_stats"):
