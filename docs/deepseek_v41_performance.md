@@ -18,6 +18,12 @@ Dense projections use native FP8 microscaling with FP32 accumulation. The
 grouped `wo_a` output projection remains BF16 and uses the shared V4 operator
 paths. Delayed mHC uses AITER stages.
 
+On AITER builds without the native group32 interface, the compatibility FP8
+GEMM keeps its four-way packed-K layout on one pipeline stage. Triton 3.7's
+two-stage variant can produce NaNs with masked K/N tails, including the TP2
+shared-expert down projection at K=1152. This kernel scheduling guard applies
+inside FULL graph execution as well; it does not require eager mode.
+
 V4/FusedMoE owns expert activation formats, routing-weight placement, GEMM
 dispatch, shared-expert overlap and expert-parallel exchange. V4.1 supplies
 its image routing bias through the shared `mm_topk` operator; see

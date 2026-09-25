@@ -6,6 +6,36 @@ import torch
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("score", [float("nan"), float("inf"), float("-inf"), 1.0])
+def test_nonfinite_scores_keep_candidate_context_inside_allocation(score):
+    """A short prefill must keep its newest block even when scores are nonfinite.
+
+    With NaN or +inf scores the old selector picked blocks 0..2047, dropping
+    block 5312. The consumer then read 42497 columns from a 16384-column
+    candidate allocation, causing the paged-logits GPU access fault.
+    """
+    from atom.model_ops.deepseek_v41.candidate_table import candidate_block_table
+    from atom.model_ops.deepseek_v41.indexer import pick_candidate_blocks
+
+    rows, width, block_size, kept = 3, 65536, 8, 2048
+    visible = torch.tensor([42497, 42498, 42499], dtype=torch.int32, device="cuda")
+    logits = torch.full((rows, width), score, device="cuda")
+    candidates = torch.empty(rows, kept, dtype=torch.int32, device="cuda")
+    tiles = torch.arange(width // block_size, dtype=torch.int32, device="cuda").repeat(
+        rows, 1
+    )
+    pick_candidate_blocks(logits, visible, block_size, candidates)
+    table, bound = candidate_block_table(
+        candidates, tiles, visible, rows_per_block=block_size
+    )
+
+    torch.testing.assert_close(candidates[:, -1], (visible - 1) // block_size)
+    assert bool((candidates[:, 1:] > candidates[:, :-1]).all())
+    assert bool((bound > (kept - 1) * block_size).all())
+    assert bool((bound <= table.shape[1] * block_size).all())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("tile", [8, 16])
 def test_written_plane_scores_as_if_it_were_never_shuffled(tile):
     """`write_index_rows` puts a row where `pa_mqa_logits` looks for it.
@@ -355,6 +385,12 @@ def _picked_blocks_reference(logits, visible, block_size, keep):
     other, ties go to the smaller id, and the kept ids come back ascending.
     """
     logits, visible = logits.cpu(), visible.cpu().long()
+    logits = torch.nan_to_num(
+        logits,
+        nan=float("-inf"),
+        posinf=torch.finfo(logits.dtype).max,
+        neginf=float("-inf"),
+    )
     rows, width = logits.shape
     past = torch.arange(width) >= visible[:, None]
     scores = logits.masked_fill(past, float("-inf"))

@@ -37,6 +37,37 @@ def _reference(x, weight, xs, ws):
     return a @ b.T
 
 
+@pytest.mark.parametrize("m", [1, 3, 4])
+@pytest.mark.parametrize("k", [1152, 1312, 1664])
+def test_compat_packed_partial_k_panels_remain_finite_on_graph_replay(
+    monkeypatch, m, k
+):
+    """Short shared-expert batches must not read undefined pipelined K tails.
+
+    In Triton 3.7 the two-stage PACK=4 kernel produced NaNs for the TP2
+    shared-expert down projection (N=5120, K=1152), even with finite operands.
+    Exercise the compatibility kernel even when AITER has its own backend.
+    """
+    monkeypatch.setattr(blockscale, "_aiter_fp8_gemm", None)
+    x, weight, xs, ws = _operands(m, 5120, k)
+    native_quant_linear(x, weight, ws, x_scale=xs, dtype=torch.float32)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = native_quant_linear(x, weight, ws, x_scale=xs, dtype=torch.float32)
+    for factor in (1.0, 0.5):
+        x.copy_((x.float() * factor).to(x.dtype))
+        graph.replay()
+        expected = _reference(x, weight, xs, ws)
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(
+            actual,
+            expected.float(),
+            rtol=3e-5,
+            atol=5e-5 * expected.abs().max().item(),
+        )
+
+
 @pytest.mark.parametrize(
     "m,n,k",
     [
