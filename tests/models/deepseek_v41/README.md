@@ -47,7 +47,10 @@ higher scores always win, the newest visible block is retained, and returned
 position IDs stay ascending. NaN scores are ignored for candidate ranking and
 positive infinity is capped below the newest block's exclusive infinity pin;
 the compacted context must remain inside its allocation even for nonfinite
-scores. Because the pinned upstream top-k defines no
+scores. Candidate-table tests also bypass selection to cover a missing newest
+block, partially filled candidate lists, empty rows, and changed visibility
+during graph replay. The last kept block contributes at most one block of
+visible rows. Because the pinned upstream top-k defines no
 deterministic position tie rule, exact ties are asserted against explicit
 position-based expectations in addition to dense reference checks on untied
 scores. Indexer checks alone establish neither model accuracy nor throughput.

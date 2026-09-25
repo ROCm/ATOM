@@ -136,11 +136,13 @@ def blockscale_gemm_fp8_packed_kernel(
             (rows[:, None] < M) & (ag < groups),
             other=127,
         )
-        b_code = tl.load(
-            BS + (cols[:, None] // 32) * groups + bg,
-            (cols[:, None] < N) & (bg < groups),
-            other=127,
-        )
+        # Triton 3.7's async LDS load can drop nonzero `other` for masked
+        # scales. Load from valid addresses, then select the neutral scale
+        # explicitly, preserving both K/N tails and the two-stage pipeline.
+        safe_col = tl.minimum(cols[:, None], N - 1)
+        safe_bg = tl.minimum(bg, groups - 1)
+        b_code = tl.load(BS + (safe_col // 32) * groups + safe_bg)
+        b_code = tl.where((cols[:, None] < N) & (bg < groups), b_code, 127)
         acc = tl.dot_scaled(a, a_code, "e4m3", b.T, b_code, "e4m3", acc=acc)
     panels = acc.reshape(BM, PACK, BN, PACK).trans(0, 2, 1, 3)
     pair = tl.arange(0, PACK)
@@ -273,10 +275,6 @@ def gemm_fp8_local(
     )
     if packed_tile is not None:
         bm, bn, bk, pack = packed_tile
-        # Triton 3.7's two-stage PACK=4 scaled-MFMA pipeline produces NaNs
-        # with masked K/N tails (e.g. V4.1 TP2 shared w2, K=1152). Keep the
-        # four-way packed layout unpipelined; PACK=1/2 retain overlap.
-        stages = 1 if pack == 4 else 2
         blockscale_gemm_fp8_packed_kernel[(-(-m // bm), -(-n // bn))](
             x,
             weight,
@@ -291,7 +289,7 @@ def gemm_fp8_local(
             bk,
             pack,
             num_warps=2,
-            num_stages=stages,
+            num_stages=2,
             matrix_instr_nonkdim=16,
         )
         return output

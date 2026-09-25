@@ -502,6 +502,67 @@ def test_candidate_block_table_matches_its_reference_and_covers_what_it_claims()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("topk_blocks", [16, 2048])
+def test_candidate_context_counts_only_kept_rows_when_newest_block_is_absent(
+    topk_blocks,
+):
+    """Candidate compaction bounds itself even if selection loses the newest block."""
+    from atom.model_ops.deepseek_v41.candidate_table import (
+        candidate_block_table,
+        candidate_block_table_reference,
+    )
+
+    block = 8
+    selections = [
+        list(range(topk_blocks)),
+        [0, 7, 511],
+        [0, 7, 5312],
+        [0, 7, 5311],
+        [],
+        [],
+        [5312],
+    ]
+    visible = torch.tensor(
+        [42499, 42499, 42499, 42496, 42499, 0, 42499], dtype=torch.int32, device="cuda"
+    )
+    candidates = torch.full(
+        (len(selections), topk_blocks), -1, dtype=torch.int32, device="cuda"
+    )
+    for row, kept in enumerate(selections):
+        candidates[row, : len(kept)] = torch.tensor(
+            kept, dtype=torch.int32, device="cuda"
+        )
+    tiles = torch.arange(8192, dtype=torch.int32, device="cuda").flip(0)
+    tiles = tiles.repeat(len(selections), 1)
+    candidate_block_table(candidates, tiles, visible, rows_per_block=block)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        table, context = candidate_block_table(
+            candidates, tiles, visible, rows_per_block=block
+        )
+    for advance in (0, 8192):
+        visible.add_(advance)
+        graph.replay()
+        expected_table, expected_context = candidate_block_table_reference(
+            candidates, tiles, visible, rows_per_block=block
+        )
+        torch.testing.assert_close(table, expected_table)
+        torch.testing.assert_close(context, expected_context)
+        # Count actual visible token IDs, independently of the bound formula.
+        for row, kept in enumerate(selections):
+            seen = int(visible[row])
+            covered = [
+                pos
+                for cand in kept
+                for pos in range(cand * block, (cand + 1) * block)
+                if pos < seen
+            ]
+            assert int(context[row]) == len(covered)
+            assert 0 <= int(context[row]) <= len(kept) * block
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 def test_lifting_a_selection_restores_real_rows_and_keeps_them_ascending():
     """Compacted columns back to compressed rows, order intact.
 

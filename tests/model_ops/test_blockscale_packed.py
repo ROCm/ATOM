@@ -37,10 +37,13 @@ def _reference(x, weight, xs, ws):
     return a @ b.T
 
 
-@pytest.mark.parametrize("m", [1, 3, 4])
-@pytest.mark.parametrize("k", [1152, 1312, 1664])
+@pytest.mark.parametrize(
+    "m,n,k",
+    [(m, 5120, k) for m in (1, 3, 4) for k in (1152, 1312, 1664)] + [(3, 2053, 1280)],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_compat_packed_partial_k_panels_remain_finite_on_graph_replay(
-    monkeypatch, m, k
+    monkeypatch, m, n, k, dtype
 ):
     """Short shared-expert batches must not read undefined pipelined K tails.
 
@@ -49,21 +52,22 @@ def test_compat_packed_partial_k_panels_remain_finite_on_graph_replay(
     Exercise the compatibility kernel even when AITER has its own backend.
     """
     monkeypatch.setattr(blockscale, "_aiter_fp8_gemm", None)
-    x, weight, xs, ws = _operands(m, 5120, k)
-    native_quant_linear(x, weight, ws, x_scale=xs, dtype=torch.float32)
+    x, weight, xs, ws = _operands(m, n, k)
+    native_quant_linear(x, weight, ws, x_scale=xs, dtype=dtype)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = native_quant_linear(x, weight, ws, x_scale=xs, dtype=torch.float32)
+        actual = native_quant_linear(x, weight, ws, x_scale=xs, dtype=dtype)
     for factor in (1.0, 0.5):
         x.copy_((x.float() * factor).to(x.dtype))
+        xs.view(torch.uint8).add_(1)
         graph.replay()
         expected = _reference(x, weight, xs, ws)
         assert torch.isfinite(actual).all()
         torch.testing.assert_close(
-            actual,
-            expected.float(),
-            rtol=3e-5,
+            actual.float(),
+            expected.to(dtype).float(),
+            rtol=0.016 if dtype == torch.bfloat16 else 3e-5,
             atol=5e-5 * expected.abs().max().item(),
         )
 
@@ -108,20 +112,21 @@ def test_group32_projection_panel_scales_and_tails(m, n, k, dtype):
 @pytest.mark.parametrize(
     "a_code,b_code", [(0, 254), (254, 0), (128, 0), (255, 127), (127, 255)]
 )
-def test_group32_projection_extreme_scale_codes(a_code, b_code):
-    x = torch.ones(3, 1280, device="cuda").to(torch.float8_e4m3fn)
-    weight = torch.ones(2048, 1280, device="cuda").to(torch.float8_e4m3fn)
-    xs = torch.full((3, 40), a_code, device="cuda", dtype=torch.uint8).view(
+@pytest.mark.parametrize("n,k", [(2048, 1280), (2053, 1152)])
+def test_group32_projection_extreme_scale_codes(a_code, b_code, n, k):
+    x = torch.ones(3, k, device="cuda").to(torch.float8_e4m3fn)
+    weight = torch.ones(n, k, device="cuda").to(torch.float8_e4m3fn)
+    xs = torch.full((3, k // 32), a_code, device="cuda", dtype=torch.uint8).view(
         torch.float8_e8m0fnu
     )
-    ws = torch.full((64, 40), b_code, device="cuda", dtype=torch.uint8).view(
-        torch.float8_e8m0fnu
-    )
+    ws = torch.full(
+        ((n + 31) // 32, k // 32), b_code, device="cuda", dtype=torch.uint8
+    ).view(torch.float8_e8m0fnu)
     actual = native_quant_linear(x, weight, ws, x_scale=xs, dtype=torch.float32)
     if 255 in (a_code, b_code):
         assert actual.isnan().all()
     else:
-        expected = torch.full_like(actual, 1280 * 2.0 ** (a_code + b_code - 254))
+        expected = torch.full_like(actual, k * 2.0 ** (a_code + b_code - 254))
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
