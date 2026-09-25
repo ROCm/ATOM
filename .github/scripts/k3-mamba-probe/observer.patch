@@ -1,0 +1,34 @@
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1445,6 +1445,31 @@
+                     if blocks and copy_destinations.isdisjoint(blocks):
+                         request.mamba_state_restored = True
+ 
++        for request in new_reqs_data:
++            salt = self.requests[request.req_id].cache_salt
++            if salt and salt.startswith("k3mb-"):
++                import json
++
++                stats = self.requests[request.req_id].prefill_stats
++                logger.info(
++                    "K3_MAMBA_BOUNDARY %s",
++                    json.dumps(
++                        {
++                            "req_id": request.req_id,
++                            "salt": salt,
++                            "N": request.prompt_len,
++                            "C": request.num_computed_tokens,
++                            "Q": num_scheduled_tokens[request.req_id],
++                            "restored": request.mamba_state_restored,
++                            "has_sync": has_sync_kv_loads,
++                            "local": stats.num_local_cached_tokens if stats else None,
++                            "external": stats.num_external_cached_tokens
++                            if stats
++                            else None,
++                        }
++                    ),
++                )
++
+         # Build the connector meta for ECConnector
+         if self.ec_connector is not None:
+             ec_meta: ECConnectorMetadata = self.ec_connector.build_connector_meta(

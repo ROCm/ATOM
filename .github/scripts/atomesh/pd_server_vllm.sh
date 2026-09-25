@@ -91,6 +91,7 @@ PY
     git -C "${VLLM_SITE_DIR}" apply --check "${patch_file}"
     git -C "${VLLM_SITE_DIR}" apply "${patch_file}"
   done
+  git -C "${VLLM_SITE_DIR}" apply "${ATOMESH_SCRIPT_DIR}/../k3-mamba-probe/observer.patch"
   server_pythonpath="$(join_path "${VLLM_SITE_DIR}" "${server_pythonpath}")"
   env PYTHONPATH="${server_pythonpath}" python3 - "${VLLM_SITE_DIR}" <<'PY'
 import sys

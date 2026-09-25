@@ -1272,6 +1272,12 @@ run_eval() {
     echo "[eval] unsupported task ${EVAL_TASK}; skipping"
     return 0
   fi
+  local boundary_rc=0
+  timeout --kill-after=10s 1200s python3 -u "${ATOMESH_SCRIPT_DIR}/../k3-mamba-probe/client.py" \
+    --prefill "http://${prefill_ips[0]}:${prefill_ports[0]}" \
+    --decode "http://${decode_ips[0]}:${decode_ports[0]}" \
+    --router "http://127.0.0.1:${ROUTER_PORT}" --model "${SERVED_MODEL_NAME}" \
+    --out "${RUN_DIR}/mamba-probe" --logs "${RUNTIME_LOG_DIR}" || boundary_rc=$?
   local limit_arg=()
   if [[ -n "${EVAL_LIMIT}" ]]; then
     limit_arg=(--limit "${EVAL_LIMIT}")
@@ -1357,6 +1363,7 @@ PY
   done
 
   echo "[eval] gsm8k runs done, results saved to ${RUN_DIR}/eval_results"
+  return "${boundary_rc}"
 }
 
 run_workload_phase() {
