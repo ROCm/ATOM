@@ -237,14 +237,34 @@ jobs:
           [[ "${SOURCE_RUN_ID}" =~ ^[0-9]+$ ]]
           mkdir -p inspection
           date -u > inspection/collected-at.txt
+          hostname > inspection/collector-host.txt
+          timeout 20s squeue --noheader --format='%i %T %j %N %R' \
+            > inspection/squeue.tmp 2> inspection/squeue-errors.txt || true
+          grep -F -- "-${SOURCE_RUN_ID}-" inspection/squeue.tmp > inspection/squeue.txt || true
+          rm -f inspection/squeue.tmp
           shopt -s nullglob
-          for log_root in \
+          log_roots=(
             /share_nfs/ATOMESH_RUNNER/ATOMESH_LOG/*-"${SOURCE_RUN_ID}"-* \
-            /it-share/ATOMESH_LOG/*-"${SOURCE_RUN_ID}"-*; do
+            /it-share/ATOMESH_LOG/*-"${SOURCE_RUN_ID}"-*
+          )
+          for marker in /share_nfs/ATOMESH_RUNNER/atomesh-runner-*/_work/ATOM/ATOM/atomesh-results/*.log-root; do
+            log_root="$(cat "${marker}" 2>/dev/null)" || continue
+            if [[ "${log_root}" == *-"${SOURCE_RUN_ID}"-* ]]; then
+              log_roots+=("${log_root}")
+              printf '%s\n' "${marker}: ${log_root}" >> inspection/log-root-markers.txt
+            fi
+          done
+          declare -A copied=()
+          for log_root in "${log_roots[@]}"; do
+            [[ -z "${copied[${log_root}]:-}" ]] || continue
+            copied["${log_root}"]=1
             timeout 120s bash .github/scripts/atomesh/pd_collect_logs.sh \
               "${log_root}" "inspection/$(basename "${log_root}")" || \
               echo "::warning::Log snapshot was incomplete: ${log_root}"
           done
+          if [[ "${#log_roots[@]}" -eq 0 ]]; then
+            echo "::warning::No shared log directory found for run ${SOURCE_RUN_ID}"
+          fi
           find inspection -type f -printf '%P %s bytes\n'
       - uses: actions/upload-artifact@v4
         if: always()
