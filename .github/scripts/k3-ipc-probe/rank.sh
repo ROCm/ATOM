@@ -18,7 +18,7 @@ trap 'exit 143' TERM
 exec > "${PROBE_RUN_DIR}/probe.log" 2>&1
 hostname
 date -u
-image=vllm/vllm-openai-rocm:nightly@sha256:91e381f072d6a44e1e4c97c82dce06e50e5189905cb3999a11471c5a8fc6a563
+image=vllm/vllm-openai-rocm:nightly@sha256:659b28319fef4ea0e3d8f33e25b4c35d6f663f5d818a5b2fa06dceaf859234e4
 timeout --kill-after=5s 90s docker pull "${image}"
 groups=()
 for group in video render; do
