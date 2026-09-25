@@ -1,0 +1,86 @@
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/base.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+@@ -192,6 +192,15 @@
+         return []
+ 
+     @property
++    def requires_full_step_completion(self) -> bool:
++        """Whether output readiness must cover post-sampling KV writes.
++
++        Out-of-band transfers cannot rely on the GPU stream to order loads
++        after earlier writes to a reused block, or before source publication.
++        """
++        return False
++
++    @property
+     def requires_kv_delivery(self) -> bool:
+         """Whether this connector hands off KV that must be reliably delivered.
+ 
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
+@@ -231,6 +231,10 @@
+         return bool(self._connectors) and all(
+             c.supports_divergent_local_hybrid_hits for c in self._connectors
+         )
++
++    @property
++    def requires_full_step_completion(self) -> bool:
++        return any(c.requires_full_step_completion for c in self._connectors)
+ 
+     @property
+     def requires_kv_delivery(self) -> bool:
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py
+@@ -214,6 +214,10 @@
+     def supports_divergent_local_hybrid_hits(self) -> bool:
+         # The READ path always transfers the recurrent-state slot, including
+         # when the attention prefix is already present locally.
++        return self.mode == MoRIIOMode.READ
++
++    @property
++    def requires_full_step_completion(self) -> bool:
+         return self.mode == MoRIIOMode.READ
+ 
+     def get_sync_load_block_ids(self, request: "Request") -> list[int]:
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -2058,6 +2058,15 @@
+         model_runner_output.kv_connector_output = kv_connector_output
+         model_runner_output.ec_connector_output = ec_connector_output
+ 
++        if (
++            self.speculator is not None
++            and self.kv_connector.requires_full_step_completion
++        ):
++            # Preserve early D2H copies, but publish output only after draft KV
++            # writes finish, before a READ can export or reuse these blocks.
++            self.output_copy_stream.wait_stream(self.main_stream)
++            async_output.copy_event.record(self.output_copy_stream)
++
+         return async_output
+ 
+     def take_draft_token_ids(self) -> DraftTokenIds | None:
+--- a/vllm/v1/worker/gpu/kv_connector.py
++++ b/vllm/v1/worker/gpu/kv_connector.py
+@@ -29,6 +29,10 @@
+ class KVConnector:
+     """KVConnector interface used by GPUModelRunner."""
+ 
++    @property
++    def requires_full_step_completion(self) -> bool:
++        return False
++
+     def pre_forward(self, scheduler_output: "SchedulerOutput") -> None:
+         pass
+ 
+@@ -56,6 +60,10 @@
+ 
+         self._pending_load_start = False
+         self._disabled = False
++
++    @property
++    def requires_full_step_completion(self) -> bool:
++        return not self._disabled and self.kv_connector.requires_full_step_completion
+ 
+     def pre_forward(self, scheduler_output: "SchedulerOutput") -> None:
+         if self._disabled:

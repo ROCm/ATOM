@@ -1,4 +1,4 @@
-name: K3 single prefill diagnostic
+name: K3 prefill stack diagnostic
 on:
   workflow_dispatch:
 permissions:
@@ -6,7 +6,7 @@ permissions:
 jobs:
   prefill-probe:
     runs-on: atomesh-cicd
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6
       - name: Run single full-model prefill probe
@@ -21,16 +21,16 @@ jobs:
           set -euo pipefail
           result_dir="prefill-probe-results/${GITHUB_RUN_ATTEMPT}"
           mkdir -p "${result_dir}"
-          cancel_script="${result_dir}/k3-prefill-dspark-lmcache-probe.slurm-cancel.sh"
+          cancel_script="${result_dir}/k3-prefill-stacks-probe.slurm-cancel.sh"
           if [[ -f "${cancel_script}" ]]; then
             timeout --kill-after=5s 90s bash "${cancel_script}" > "${result_dir}/cancel.log" 2>&1 || true
           fi
-          marker="${result_dir}/k3-prefill-dspark-lmcache-probe.log-root"
+          marker="${result_dir}/k3-prefill-stacks-probe.log-root"
           if [[ -f "${marker}" ]]; then
             bash .github/scripts/atomesh/pd_collect_logs.sh "$(cat "${marker}")" "${result_dir}/logs" || true
           fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: k3-prefill-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          name: k3-prefill-stacks-${{ github.run_id }}-${{ github.run_attempt }}
           path: prefill-probe-results/${{ github.run_attempt }}/

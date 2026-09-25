@@ -1,0 +1,14 @@
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -355,6 +355,11 @@
+ 
+     @instrument(span_name="Init device")
+     def init_device(self):
++        if self.local_rank == 0:
++            import faulthandler
++
++            faulthandler.dump_traceback_later(120, repeat=True)
++            logger.info("K3_STACKS TP0 self-dump enabled every 120 seconds")
+         if self.device_config.device_type == "cuda":
+             # This env var set by Ray causes exceptions with graph building.
+             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)

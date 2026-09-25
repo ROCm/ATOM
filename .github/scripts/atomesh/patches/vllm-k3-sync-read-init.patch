@@ -1,0 +1,85 @@
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/base.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+@@ -182,6 +182,15 @@
+         """
+         return False
+ 
++    def get_sync_load_block_ids(self, request: "Request") -> list[int]:
++        """Return blocks whose synchronous load replaces worker zeroing.
++
++        Every returned block must be fully initialized by the load before
++        forward can consume it. A failed load must abort forward, rather
++        than recompute using uninitialized blocks. Defaults to no blocks.
++        """
++        return []
++
+     @property
+     def requires_kv_delivery(self) -> bool:
+         """Whether this connector hands off KV that must be reliably delivered.
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
+@@ -414,6 +414,12 @@
+                 self._requests_to_connector[request.request_id] = i
+                 to_return = (toks, load_async)
+         return to_return
++
++    def get_sync_load_block_ids(self, request: "Request") -> list[int]:
++        chosen = self._requests_to_connector.get(request.request_id)
++        if chosen is None:
++            return []
++        return self._connectors[chosen].get_sync_load_block_ids(request)
+ 
+     def update_state_after_alloc(
+         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py
+@@ -215,6 +215,26 @@
+         # The READ path always transfers the recurrent-state slot, including
+         # when the attention prefix is already present locally.
+         return self.mode == MoRIIOMode.READ
++
++    def get_sync_load_block_ids(self, request: "Request") -> list[int]:
++        scheduler = self.connector_scheduler
++        if (
++            self.mode != MoRIIOMode.READ
++            or not self.kv_transfer_config.is_kv_consumer
++            or scheduler is None
++            or not scheduler._has_mamba
++            or self._vllm_config.cache_config.get_resolved_kv_cache_layout().name
++            != "LBNHC"
++        ):
++            return []
++        pending = scheduler._reqs_need_recv.get(request.request_id)
++        if pending is None:
++            return []
++        # LBNHC attention pages are contiguous and READ fills their entire span.
++        # Hybrid READ aborts forward on load failure.
++        # Use the actual destinations, excluding draft and decode-only blocks.
++        attn_blocks, _ = split_attn_mamba_block_ids(pending[1])
++        return attn_blocks
+ 
+     def __init__(
+         self,
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -336,7 +336,7 @@
+ 
+         self.has_mamba_layers = kv_cache_config.has_mamba_layers
+         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
+-        # Blocks that async KV loads will overwrite this step, skipped from
++        # Blocks that external KV loads will overwrite this step, skipped from
+         # zeroing since the zeroing could race the out-of-band write.
+         self._skip_zero_block_ids: set[int] = set()
+         self.need_mamba_block_aligned_split = (
+@@ -1235,6 +1235,11 @@
+                 if num_external_computed_tokens > 0:
+                     # load_kv_async is False here
+                     has_sync_kv_loads = True
++                    if self.needs_kv_cache_zeroing:
++                        assert self.connector is not None
++                        self._skip_zero_block_ids.update(
++                            self.connector.get_sync_load_block_ids(request)
++                        )
+                 if self.log_stats:
+                     request.record_event(
+                         EngineCoreEventType.SCHEDULED, scheduled_timestamp

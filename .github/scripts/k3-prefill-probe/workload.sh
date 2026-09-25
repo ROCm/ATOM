@@ -5,7 +5,7 @@ results="$2/prefill-probe"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "${results}"
 exec > >(tee "${results}/workload.log") 2>&1
-client=(python3 -u "${script_dir}/client.py" --port "${port}" --prompts "${results}/prompts.jsonl" --timeout 600)
+client=(python3 -u "${script_dir}/client.py" --port "${port}" --prompts "${results}/prompts.jsonl" --timeout 1200)
 reset_prefix() {
   python3 - "${port}" <<'PY'
 import json

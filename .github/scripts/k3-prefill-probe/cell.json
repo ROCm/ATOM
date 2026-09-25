@@ -1,7 +1,7 @@
 {
-  "id": "k3-prefill-dspark-lmcache-probe",
+  "id": "k3-prefill-stacks-probe",
   "suite": "vllm",
-  "name": "k3-prefill-dspark-lmcache-probe",
+  "name": "k3-prefill-stacks-probe",
   "model": "Kimi-K3-MXFP4-vLLM-DSpark",
   "backend": "vllm",
   "image": "vllm/vllm-openai-rocm:nightly@sha256:659b28319fef4ea0e3d8f33e25b4c35d6f663f5d818a5b2fa06dceaf859234e4",
@@ -11,7 +11,7 @@
   "display_topology": "P-only TP8/DCP8 diagnostic",
   "pd_worker_layout": "multi_node",
   "nodes": [
-    "pit2-p03-g13",
+    "pit2-p03-g07",
     "pit2-p03-g19",
     "pit2-p03-g42"
   ],
@@ -27,7 +27,7 @@
   "random_range_ratio": "0.8",
   "request_rate": "inf",
   "num_prompts_multiplier": 10,
-  "wait_server_timeout": 1200,
+  "wait_server_timeout": 2400,
   "wait_router_timeout": 600,
   "benchmark": {
     "random_range_ratio": 0.8,
@@ -62,7 +62,7 @@
     "slurm_submit_runner": "atomesh-cicd",
     "gpus_per_node": 8,
     "cpus_per_task": 114,
-    "time_limit": "00:40:00",
+    "time_limit": "01:15:00",
     "log_root": "/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG",
     "slurm_qos": "amd-atom-qos",
     "spur_controller_addr": "http://pit2-vm-amd-large-02:6817,http://pit2-vm-amd-large-03:6817,http://pit2-vm-amd-large-04:6817"
@@ -295,7 +295,8 @@
       "server_args": "--l1-init-size-gb 10 --l1-read-ttl-seconds 1800 --chunk-size 12288 --separate-object-groups --max-cpu-workers 8 --max-gpu-workers 8 --eviction-policy LRU --supported-transfer-mode lmcache_driven --shm-name ''",
       "patches": [
         "patches/lmcache-k3-boundary.patch",
-        "patches/lmcache-event-lifetime.patch"
+        "patches/lmcache-event-lifetime.patch",
+        "patches/lmcache-pending-store.patch"
       ]
     }
   }
