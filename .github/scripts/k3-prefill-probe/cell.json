@@ -296,7 +296,8 @@
       "patches": [
         "patches/lmcache-k3-boundary.patch",
         "patches/lmcache-event-lifetime.patch",
-        "patches/lmcache-pending-store.patch"
+        "patches/lmcache-pending-store.patch",
+        "patches/lmcache-event-trace.patch"
       ]
     }
   }

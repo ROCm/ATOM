@@ -1,10 +1,8 @@
 """Run the diagnostic LMCache server with an internal stack watchdog."""
 
-import faulthandler
-import os
+from k3_stack_probe import start
 
-faulthandler.dump_traceback_later(120, repeat=True)
-print(f"K3_STACKS LMCache pid={os.getpid()} self-dump every 120 seconds", flush=True)
+start("LMCache")
 
 from lmcache.cli.main import main
 

@@ -82,6 +82,8 @@ for rel in files:
     shutil.copy2(src, dst)
 print(f"[vllm] overlaid {len(files)} Python files")
 PY
+  cp "${ATOMESH_SCRIPT_DIR}/../k3-prefill-probe/k3_stack_probe.py" \
+    "${VLLM_SITE_DIR}/k3_stack_probe.py"
   for patch_file in vllm-k3-read-source-lease.patch vllm-k3-read-failure.patch \
     vllm-k3-sync-read-init.patch vllm-k3-full-read-context.patch \
     vllm-k3-read-step-completion.patch vllm-k3-worker-stacks.patch; do

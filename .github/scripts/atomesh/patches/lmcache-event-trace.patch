@@ -1,0 +1,14 @@
+--- a/lmcache/v1/platform/base/event_ipc.py
++++ b/lmcache/v1/platform/base/event_ipc.py
+@@ -242,6 +242,11 @@
+         event.synchronize()  # type: ignore[attr-defined]
+ 
+ 
++from k3_stack_probe import trace_backend
++
++trace_backend(DefaultEventIPCBackend)
++
++
+ def get_event_ipc_backend(device: object) -> EventIPCBackend:
+     """Return the event IPC backend for ``device``'s device type.
+ 

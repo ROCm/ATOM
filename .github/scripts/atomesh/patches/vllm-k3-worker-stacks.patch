@@ -1,14 +1,25 @@
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
-@@ -355,6 +355,11 @@
+@@ -355,6 +355,10 @@
  
      @instrument(span_name="Init device")
      def init_device(self):
 +        if self.local_rank == 0:
-+            import faulthandler
++            from k3_stack_probe import start
 +
-+            faulthandler.dump_traceback_later(120, repeat=True)
-+            logger.info("K3_STACKS TP0 self-dump enabled every 120 seconds")
++            start("TP0")
          if self.device_config.device_type == "cuda":
              # This env var set by Ray causes exceptions with graph building.
              os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+--- a/vllm/v1/executor/multiproc_executor.py
++++ b/vllm/v1/executor/multiproc_executor.py
+@@ -311,6 +311,9 @@
+                 return
+             _self.is_failed = True
+             proc = next(h.proc for h in workers if h.proc.sentinel == died[0])
++            from k3_stack_probe import report_exit
++
++            report_exit(proc)
+             logger.error(
+                 "Worker proc %s died unexpectedly (exit code: %s), "
+                 "shutting down executor.",
