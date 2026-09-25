@@ -75,22 +75,52 @@ def failed_rank(run_dir, job_id, run_token, num_ranks):
     return None
 
 
-def resolve(run_dir, job_id, run_token, num_ranks, state, exit_code, rc, spur):
+def resolve(
+    run_dir,
+    job_id,
+    run_token,
+    num_ranks,
+    state,
+    exit_code,
+    rc,
+    spur,
+    workload_check_rc=0,
+):
     completed = workload_completed(run_dir, job_id, run_token, num_ranks)
+    failure = failed_rank(run_dir, job_id, run_token, num_ranks)
+    failure_rc = failure["return_code"] if failure else workload_check_rc
     # Only the generic Spur failure may be reconciled. Explicit cancellation,
     # signals, timeouts, node failures and OOM retain the scheduler outcome.
-    override = spur and completed and (state, exit_code, rc) == ("FAILED", "1:0", 1)
+    override = (
+        spur
+        and completed
+        and not failure_rc
+        and (state, exit_code, rc) == ("FAILED", "1:0", 1)
+    )
+    reject_success = bool(failure_rc and rc == 0)
+    effective = {"state": state, "return_code": rc, "source": "scheduler"}
+    if reject_success:
+        effective = {
+            "state": "FAILED",
+            "return_code": failure_rc,
+            "source": "workload" if failure else "workload_check",
+        }
+    elif override:
+        effective = {"state": "COMPLETED", "return_code": 0, "source": "workload"}
+    workload = {"state": "COMPLETED" if completed else "UNVERIFIED"}
+    if failure:
+        workload = {"state": "FAILED", "return_code": failure_rc}
+    elif workload_check_rc:
+        workload = {"state": "CHECK_FAILED"}
+    if workload_check_rc:
+        workload["check_return_code"] = workload_check_rc
     return {
         "schema_version": 1,
         "job_id": job_id,
         "scheduler": {"state": state, "exit_code": exit_code, "return_code": rc},
-        "workload": {"state": "COMPLETED" if completed else "UNVERIFIED"},
-        "result": {
-            "state": "COMPLETED" if override else state,
-            "return_code": 0 if override else rc,
-            "source": "workload" if override else "scheduler",
-        },
-        "scheduler_workload_mismatch": bool(override),
+        "workload": workload,
+        "result": effective,
+        "scheduler_workload_mismatch": bool(override or reject_success),
     }
 
 
@@ -106,9 +136,12 @@ def main():
     parser.add_argument("--scheduler-state")
     parser.add_argument("--scheduler-exit-code")
     parser.add_argument("--scheduler-rc", type=int)
+    parser.add_argument("--workload-check-rc", type=int, default=0)
     parser.add_argument("--scheduler-error-path", type=Path)
     parser.add_argument("--spur", choices=("0", "1"), default="0")
     args = parser.parse_args()
+    if not 0 <= args.workload_check_rc <= 255:
+        parser.error("workload-check-rc must be between 0 and 255")
     if args.action == "check-failed":
         failure = failed_rank(args.run_dir, args.job_id, args.run_token, args.num_ranks)
         if failure is None and args.scheduler_error_path:
@@ -162,13 +195,20 @@ def main():
         args.scheduler_exit_code,
         args.scheduler_rc,
         args.spur == "1",
+        args.workload_check_rc,
     )
     write_json(args.run_dir / "job-result.json", result)
-    if result["scheduler_workload_mismatch"]:
+    if result["scheduler_workload_mismatch"] and result["result"]["return_code"] == 0:
         print(
             "WARNING: Spur reported FAILED/1:0, but every worker completed all workload phases. "
             "Using the workload result for CI; "
             "the scheduler failure is retained in job-result.json."
+        )
+    elif result["scheduler_workload_mismatch"]:
+        print(
+            "WARNING: Scheduler reported success, but the workload or its failure check failed. "
+            "Using the nonzero result for CI; "
+            "the scheduler result is retained in job-result.json."
         )
     print(f"workload_state={result['workload']['state']}")
     print(f"result_state={result['result']['state']}")
