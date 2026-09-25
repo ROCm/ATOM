@@ -524,29 +524,15 @@ if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
   python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_job_result.py" resolve \
     --run-dir "${SLURM_STATUS_DIR}" --job-id "${JOB_ID}" \
     --run-token "${ATOMESH_RUN_TOKEN}" --num-ranks "${NUM_NODES}" \
-    --scheduler-state "${SLURM_STATE}" --scheduler-exit-code "${SLURM_EXIT_CODE}" \
+    --scheduler-state "${SLURM_STATE}" --scheduler-exit-code="${SLURM_EXIT_CODE}" \
     --scheduler-rc "${SLURM_JOB_RC}" --spur 1
   SBATCH_RC=$?
   set -e
 fi
 
 if [[ -d "${LOG_ROOT}" ]]; then
-  mkdir -p "${RESULT_DIR}/${ATOMESH_CELL_ID}"
-  if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
-    tar \
-      --exclude='.cache' \
-      --exclude='./.cache' \
-      --exclude='.aiter' \
-      --exclude='./.aiter' \
-      -C "${LOG_ROOT}" \
-      -cf - . | tar \
-      --no-same-owner \
-      --no-same-permissions \
-      -C "${RESULT_DIR}/${ATOMESH_CELL_ID}" \
-      -xf - || true
-  else
-    cp -a "${LOG_ROOT}/." "${RESULT_DIR}/${ATOMESH_CELL_ID}/" || true
-  fi
+  bash "${REPO_ROOT}/.github/scripts/atomesh/pd_collect_logs.sh" \
+    "${LOG_ROOT}" "${RESULT_DIR}/${ATOMESH_CELL_ID}" || true
 fi
 
 exit "${SBATCH_RC}"

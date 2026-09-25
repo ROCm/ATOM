@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 def write_json(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(json.dumps(payload, indent=2) + "\n")
     temporary.replace(path)
