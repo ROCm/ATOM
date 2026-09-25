@@ -457,6 +457,9 @@ monitor_slurm_job() {
     if [[ -n "${SLURM_EXTRA_LOG_STREAMER:-}" ]]; then
       "${SLURM_EXTRA_LOG_STREAMER}" "${job_id}"
     fi
+    if [[ -n "${SLURM_EXTRA_STATUS_CHECKER:-}" ]]; then
+      "${SLURM_EXTRA_STATUS_CHECKER}" "${job_id}"
+    fi
 
     if slurm_state_is_terminal "${state}"; then
       # A missing queue entry alone is never evidence of completion.

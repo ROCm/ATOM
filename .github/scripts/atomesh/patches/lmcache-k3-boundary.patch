@@ -1,0 +1,74 @@
+--- a/lmcache/integration/vllm/lmcache_mp_connector.py
++++ b/lmcache/integration/vllm/lmcache_mp_connector.py
+@@ -1446,10 +1446,18 @@
+         for idx, request_id in enumerate(cached_reqs.req_ids):
+             request_tracker = self._get_request_tracker(request_id)
+ 
+-            # Update block ids
+-            new_block_ids = cached_reqs.new_block_ids[idx] or ()
+-            if request_id not in cached_reqs.resumed_req_ids:
+-                request_tracker.append_block_ids(new_block_ids)
++            # Mamba align tables relocate scratch blocks and invalidate old slots.
++            block_state = getattr(scheduler_output, "kv_connector_block_state", None)
++            current_blocks = (
++                block_state.get_block_ids(request_id) if block_state else None
++            )
++            if current_blocks is not None:
++                request_tracker.allocated_block_ids = {
++                    group_idx: list(blocks)
++                    for group_idx, blocks in enumerate(current_blocks)
++                }
++            elif request_id not in cached_reqs.resumed_req_ids:
++                request_tracker.append_block_ids(cached_reqs.new_block_ids[idx] or ())
+ 
+             # Use the incremental num_scheduled_tokens to
+             # stay consistent with _process_new_requests.
+--- a/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
++++ b/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
+@@ -149,7 +149,7 @@
+     committing them would serve garbage to a later prefix hit.
+ 
+     Args:
+-        block_ids: Raw per-kernel-group engine block ids (before any downsample),
++        block_ids: Per-kernel-group block ids for the slots being transferred,
+             indexed by kernel-group index.
+         object_groups: The object groups, indexed by object-group id.
+         blocks_per_chunk: Blocks in one chunk per kernel group, indexed by
+@@ -1139,19 +1139,28 @@
+                 event_backend.record_event(event, cache_context.stream)
+                 return event_backend.export_event(event, cache_context.device), False
+ 
+-            # Chunks whose block ids are all the null block (e.g. align-mode
+-            # Mamba chunks holding no real state) carry no valid KV and must not
+-            # be committed. Computed on the raw block ids before downsampling
+-            # mutates them.
++            block_ids_per_group_gpu = downsample_and_stage_block_ids(
++                cache_context, gpu_block_ids
++            )
++            # Check the transferred suffix: an earlier recurrent state cannot
++            # stand in for a missing state at this chunk's endpoint.
++            retained_blocks_per_chunk = [
++                cache_context.calculate_num_blocks(
++                    min(
++                        self._ctx.chunk_size,
++                        cache_context.kv_layer_groups_manager.get_subchunk_sw_size_tokens(
++                            group_idx
++                        ),
++                    ),
++                    group_idx,
++                )
++                for group_idx in range(len(blocks_per_chunk))
++            ]
+             skipped_chunks = all_null_chunk_masks(
+                 gpu_block_ids,
+                 cache_context.kv_layer_groups_manager.object_groups,
+-                blocks_per_chunk,
++                retained_blocks_per_chunk,
+                 num_chunks,
+-            )
+-
+-            block_ids_per_group_gpu = downsample_and_stage_block_ids(
+-                cache_context, gpu_block_ids
+             )
+ 
+             producer_event = event_backend.import_event(

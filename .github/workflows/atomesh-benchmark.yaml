@@ -27,6 +27,11 @@ on:
     - cron: '10 16 * * *'
   workflow_dispatch:
     inputs:
+      inspect_run_id:
+        description: 'Collect existing Slurm logs for this GitHub run ID without allocating GPUs'
+        required: false
+        default: ''
+        type: string
       suite:
         description: 'Benchmark suite'
         required: false
@@ -217,8 +222,39 @@ permissions:
   contents: write
 
 jobs:
+  inspect-run:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.inspect_run_id != '' }}
+    name: Inspect existing Slurm logs
+    runs-on: ${{ inputs.atomesh_slurm_submit_runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Collect existing logs
+        env:
+          SOURCE_RUN_ID: ${{ inputs.inspect_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "${SOURCE_RUN_ID}" =~ ^[0-9]+$ ]]
+          mkdir -p inspection
+          date -u > inspection/collected-at.txt
+          shopt -s nullglob
+          for log_root in \
+            /share_nfs/ATOMESH_RUNNER/ATOMESH_LOG/*-"${SOURCE_RUN_ID}"-* \
+            /it-share/ATOMESH_LOG/*-"${SOURCE_RUN_ID}"-*; do
+            timeout 120s bash .github/scripts/atomesh/pd_collect_logs.sh \
+              "${log_root}" "inspection/$(basename "${log_root}")" || \
+              echo "::warning::Log snapshot was incomplete: ${log_root}"
+          done
+          find inspection -type f -printf '%P %s bytes\n'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: atomesh-inspection-${{ inputs.inspect_run_id }}-${{ github.run_id }}
+          path: inspection/
+          retention-days: 7
+
   load-config:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: ${{ inputs.inspect_run_id == '' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
     name: Load ATOMesh benchmark config
     runs-on: ubuntu-latest
     outputs:
@@ -1718,6 +1754,19 @@ jobs:
             --result-dir "$RESULT_DIR" &
           PD_SUBMIT_PID=$!
           wait "${PD_SUBMIT_PID}"
+
+      - name: Collect Slurm logs
+        if: always()
+        env:
+          MATRIX_ID: ${{ matrix.id }}
+        run: |
+          set -euo pipefail
+          log_root_file="atomesh-results/${MATRIX_ID}.log-root"
+          if [[ -s "${log_root_file}" ]]; then
+            timeout 120s bash .github/scripts/atomesh/pd_collect_logs.sh \
+              "$(cat "${log_root_file}")" "atomesh-results/${MATRIX_ID}" || \
+              echo "::warning::Slurm log collection was incomplete"
+          fi
 
       - name: Summarize ${{ matrix.id }} benchmark result
         if: always()

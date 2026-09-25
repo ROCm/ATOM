@@ -399,10 +399,19 @@ stream_spur_shared_logs_once() {
   shopt -u nullglob
 }
 
+check_spur_workload_failure() {
+  local job_id="$1"
+  # A failed worker is conclusive even if Spur still reports RUNNING.
+  python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_job_result.py" check-failed \
+    --run-dir "${LOG_ROOT}/slurm_job-${job_id}" --job-id "${job_id}" \
+    --run-token "${ATOMESH_RUN_TOKEN}" --num-ranks "${NUM_NODES}"
+}
+
 # Every Spur worker writes container output to shared storage, regardless of
 # runner label. Stream it from the submitter rather than through Spur RPCs.
 if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
   SLURM_EXTRA_LOG_STREAMER=stream_spur_shared_logs_once
+  SLURM_EXTRA_STATUS_CHECKER=check_spur_workload_failure
 fi
 install_slurm_cancel_traps
 

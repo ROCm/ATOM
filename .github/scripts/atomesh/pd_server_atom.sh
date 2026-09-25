@@ -1221,6 +1221,21 @@ PY
   fi
 }
 
+snapshot_eval_metrics() {
+  local destination="$1" phase="$2" idx
+  mkdir -p "${destination}"
+  for idx in "${!prefill_ips[@]}"; do
+    curl -fsS --max-time 10 \
+      "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/metrics" \
+      > "${destination}/prefill-${idx}-${phase}.metrics" || true
+  done
+  for idx in "${!decode_ips[@]}"; do
+    curl -fsS --max-time 10 \
+      "http://${decode_ips[$idx]}:${decode_ports[$idx]}/metrics" \
+      > "${destination}/decode-${idx}-${phase}.metrics" || true
+  done
+}
+
 run_eval() {
   [[ "${RUN_EVAL}" == "true" ]] || [[ "${RUN_EVAL}" == "1" ]] || return 0
   if [[ "${EVAL_TASK}" == "swebench_lite" ]]; then
@@ -1273,6 +1288,7 @@ run_eval() {
     echo "[eval] gsm8k concurrent=${eval_conc}"
     echo "========================================="
 
+    snapshot_eval_metrics "${result_dir}" before
     lm_eval --model "${EVAL_MODEL_TYPE}" \
       --model_args "${eval_model_args_base}${eval_conc},max_retries=3${eval_model_args_extra}" \
       --tasks gsm8k \
@@ -1281,8 +1297,10 @@ run_eval() {
       "${eval_extra_args[@]}" \
       --output_path "${result_dir}"
 
-    python3 - "${result_dir}" "${eval_conc}" <<'PY'
+    snapshot_eval_metrics "${result_dir}" after
+    python3 - "${result_dir}" "${eval_conc}" "${EVAL_THRESHOLD}" <<'PY'
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -1304,6 +1322,13 @@ print("=========================================")
 print(f"[eval] concurrent={eval_conc} exact_match,flexible-extract = {score}")
 print("=========================================")
 print(json.dumps(data.get("results", {}), indent=2))
+if sys.argv[3]:
+    threshold = float(sys.argv[3])
+    if not isinstance(score, (int, float)) or not math.isfinite(score):
+        raise SystemExit("GSM8K score is missing or non-finite")
+    if score < threshold:
+        raise SystemExit(f"GSM8K score {score:.6f} is below threshold {threshold:.6f}")
+    print(f"[eval] GSM8K threshold passed: {score:.6f} >= {threshold:.6f}")
 PY
   done
 

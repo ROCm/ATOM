@@ -100,14 +100,21 @@ PY
 # LMCache MP server backing the prefill MultiConnector. Spur containers run as
 # the Slurm user, so packages and native libs are unpacked under /tmp.
 install_lmcache() {
-  local site="${LMCACHE_ROOT}/site" libs="${LMCACHE_ROOT}/libs" url deb
-  local -a packages=() debs=()
+  local site="${LMCACHE_ROOT}/site" libs="${LMCACHE_ROOT}/libs" url deb patch_file
+  local -a packages=() debs=() patches=()
   read -r -a packages <<< "${ATOMESH_VLLM_LMCACHE_PACKAGES:-}"
   read -r -a debs <<< "${ATOMESH_VLLM_LMCACHE_NATIVE_DEBS:-}"
   rm -rf "${LMCACHE_ROOT}"
   mkdir -p "${site}" "${libs}"
   python3 -m pip install --quiet --no-cache-dir --no-deps --target "${site}" \
     "${packages[@]}" "${ATOMESH_VLLM_LMCACHE_WHEEL}"
+  read -r -a patches <<< "${ATOMESH_VLLM_LMCACHE_PATCHES:-}"
+  for patch_file in "${patches[@]}"; do
+    patch_file="${ATOMESH_SCRIPT_DIR}/${patch_file}"
+    echo "[lmcache] applying patch $(sha256sum "${patch_file}")"
+    git -C "${site}" apply --check "${patch_file}"
+    git -C "${site}" apply "${patch_file}"
+  done
   for url in "${debs[@]}"; do
     deb="${LMCACHE_ROOT}/$(basename "${url}")"
     curl -fsSL --retry 3 -o "${deb}" "${url}"
