@@ -244,6 +244,7 @@ jobs:
           mkdir -p inspection
           date -u > inspection/collected-at.txt
           hostname > inspection/collector-host.txt
+          timeout 15s srun --help > inspection/srun-help.txt 2>&1 || true
           timeout 20s squeue --noheader --format='%i %T %D %j %N %R %a %q' \
             > inspection/squeue.tmp 2> inspection/squeue-errors.txt || true
           cp inspection/squeue.tmp inspection/cluster-squeue.txt
