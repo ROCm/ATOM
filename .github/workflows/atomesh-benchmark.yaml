@@ -249,6 +249,11 @@ jobs:
           cp inspection/squeue.tmp inspection/cluster-squeue.txt
           timeout 15s sinfo --nodes="${ATOMESH_NODE_POOL}" \
             > inspection/node-capacity.txt 2>&1 || true
+          timeout 15s scontrol show nodes "${ATOMESH_NODE_POOL}" \
+            > inspection/node-details.txt 2>&1 || true
+          timeout 15s sacctmgr --noheader --parsable2 show qos \
+            format=Name,GrpTRES,MaxTRESPU,GrpJobs,MaxJobsPU \
+            > inspection/qos-limits.txt 2>&1 || true
           grep -F -- "-${SOURCE_RUN_ID}-" inspection/squeue.tmp > inspection/squeue.txt || true
           while read -r job_id _; do
             [[ "${job_id}" =~ ^[0-9]+$ ]] || continue
