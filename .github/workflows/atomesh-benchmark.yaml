@@ -6,7 +6,7 @@ permissions:
 jobs:
   prefill-probe:
     runs-on: atomesh-cicd
-    timeout-minutes: 90
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v6
       - name: Run single full-model prefill probe
