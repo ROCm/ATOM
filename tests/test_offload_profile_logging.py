@@ -102,7 +102,11 @@ def _save_req(req_id):
 
 
 def _profile_message(caplog, marker):
-    messages = [record.getMessage() for record in caplog.records if marker in record.getMessage()]
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if marker in record.getMessage()
+    ]
     assert len(messages) == 1
     return messages[0]
 
@@ -120,7 +124,10 @@ def test_profile_stat_distinguishes_unmeasured_from_measured_zero():
 
 @pytest.mark.parametrize(
     ("stats", "expected"),
-    [(COUNT_STATS, "nan"), (COUNT_STATS | dict.fromkeys(TIMING_FIELDS, 0.0), "0.00")],
+    [
+        (COUNT_STATS, "nan"),
+        (COUNT_STATS | dict.fromkeys(TIMING_FIELDS, 0.0), "0.00"),
+    ],
     ids=["unmeasured", "measured-zero"],
 )
 def test_dense_load_profile_preserves_unmeasured_timing_state(
@@ -140,7 +147,10 @@ def test_dense_load_profile_preserves_unmeasured_timing_state(
 
 @pytest.mark.parametrize(
     ("stats", "expected"),
-    [(COUNT_STATS, "nan"), (COUNT_STATS | dict.fromkeys(TIMING_FIELDS, 0.0), "0.00")],
+    [
+        (COUNT_STATS, "nan"),
+        (COUNT_STATS | dict.fromkeys(TIMING_FIELDS, 0.0), "0.00"),
+    ],
     ids=["unmeasured", "measured-zero"],
 )
 def test_dense_save_profile_preserves_unmeasured_timing_state(
@@ -160,7 +170,10 @@ def test_dense_save_profile_preserves_unmeasured_timing_state(
 
 @pytest.mark.parametrize(
     ("stats", "expected"),
-    [(COUNT_STATS, "nan"), (COUNT_STATS | dict.fromkeys(TIMING_FIELDS, 0.0), "0.00")],
+    [
+        (COUNT_STATS, "nan"),
+        (COUNT_STATS | dict.fromkeys(TIMING_FIELDS, 0.0), "0.00"),
+    ],
     ids=["unmeasured", "measured-zero"],
 )
 def test_dsv4_load_profile_uses_the_same_unmeasured_contract(
