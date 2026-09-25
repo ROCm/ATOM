@@ -12,7 +12,7 @@ while IFS= read -r container; do
   [[ "${container}" == atomesh-* && "${container}" =~ -${job_id}-[0-9]+(-benchmark|-eval)?$ ]] || continue
   printf 'Container: %s\n' "${container}"
   # shellcheck disable=SC2016
-  timeout --kill-after=5s 90s docker exec "${container}" bash -c '
+  timeout --kill-after=5s 90s docker exec --privileged --user 0 "${container}" bash -c '
     spy="$(command -v py-spy || true)"
     if [[ -z "${spy}" ]]; then
       target=/tmp/atomesh-inspection-py-spy
