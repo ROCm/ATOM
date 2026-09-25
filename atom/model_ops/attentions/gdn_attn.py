@@ -46,6 +46,9 @@ _GDN_SSM_DTYPES = {
     "fp32": torch.float32,
     "fp16": torch.float16,
     "bf16": torch.bfloat16,
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
 }
 
 
@@ -358,11 +361,10 @@ class GDNStateMixin(PoolRowsMixin):
     def _state_dtypes(self) -> tuple[torch.dtype, torch.dtype]:
         # The KDA recurrence accumulates in fp32 whatever the pool stores, so
         # the KDA models pick their storage dtype; everyone else keeps the
-        # state at the model dtype.
-        if getattr(self.model_runner.config.hf_config, "model_type", None) in (
-            "kimi_linear",
-            "glm5_next_text",
-        ):
+        # state at the model dtype or the config-specified ssm dtype (Qwen).
+        hf = self.model_runner.config.hf_config
+        model_dtype = self.model_runner.config.torch_dtype
+        if getattr(hf, "model_type", None) in ("kimi_linear", "glm5_next_text"):
             requested = envs.ATOM_GDN_SSM_DTYPE
             temporal_dtype = _GDN_SSM_DTYPES.get(requested)
             if temporal_dtype is None:
@@ -370,11 +372,17 @@ class GDNStateMixin(PoolRowsMixin):
                     f"ATOM_GDN_SSM_DTYPE={requested!r} is not one of "
                     f"{sorted(_GDN_SSM_DTYPES)}."
                 )
-            return (self.model_runner.config.torch_dtype, temporal_dtype)
-        return (
-            self.model_runner.config.torch_dtype,
-            self.model_runner.config.torch_dtype,
-        )
+            return (model_dtype, temporal_dtype)
+        requested = getattr(hf, "mamba_ssm_dtype", None)
+        if requested is None:
+            return (model_dtype, model_dtype)
+        temporal_dtype = _GDN_SSM_DTYPES.get(str(requested).lower())
+        if temporal_dtype is None:
+            raise ValueError(
+                f"mamba_ssm_dtype={requested!r} in the model config is not one of "
+                f"{sorted(_GDN_SSM_DTYPES)}."
+            )
+        return (model_dtype, temporal_dtype)
 
     def _state_shape_for_runner(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
         hf = self.model_runner.config.hf_config
