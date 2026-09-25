@@ -16,7 +16,7 @@ while IFS= read -r container; do
   [[ "${container}" == atomesh-* && "${container}" =~ -${job_id}-[0-9]+(-benchmark|-eval)?$ ]] || continue
   printf 'Container: %s\n' "${container}"
   # shellcheck disable=SC2016
-  timeout --kill-after=5s 90s docker exec "${container}" bash -c '
+  timeout --kill-after=5s 90s docker exec --user 0 --privileged "${container}" bash -c '
     id
     ps -eo pid,ppid,etimes,pcpu,stat,wchan:24,comm
     declare -A metric_endpoints=()
@@ -46,6 +46,7 @@ while IFS= read -r container; do
     fi
     deadline=$((SECONDS + 45))
     pids=$(pgrep -f "^[^ ]*python[^ ]* .*lmcache server" || true)
+    pids+=" $(pgrep -x lmcache || true)"
     pids+=" $(pgrep -f "^VLLM::EngineCore" || true)"
     pids+=" $(pgrep -f "^VLLM::Worker_TP[0-9]+" || true)"
     for pid in ${pids}; do
