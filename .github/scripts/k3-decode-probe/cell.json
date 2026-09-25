@@ -27,7 +27,7 @@
   "random_range_ratio": "0.8",
   "request_rate": "inf",
   "num_prompts_multiplier": 10,
-  "wait_server_timeout": 1200,
+  "wait_server_timeout": 2400,
   "wait_router_timeout": 600,
   "benchmark": {
     "random_range_ratio": 0.8,
