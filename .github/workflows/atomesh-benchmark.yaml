@@ -246,6 +246,9 @@ jobs:
           hostname > inspection/collector-host.txt
           timeout 20s squeue --noheader --format='%i %T %D %j %N %R' \
             > inspection/squeue.tmp 2> inspection/squeue-errors.txt || true
+          cp inspection/squeue.tmp inspection/cluster-squeue.txt
+          timeout 15s sinfo --Node --nodes="${ATOMESH_NODE_POOL}" --noheader \
+            --format='%N %T %m %C %G' > inspection/node-capacity.txt 2>&1 || true
           grep -F -- "-${SOURCE_RUN_ID}-" inspection/squeue.tmp > inspection/squeue.txt || true
           while read -r job_id _; do
             [[ "${job_id}" =~ ^[0-9]+$ ]] || continue
