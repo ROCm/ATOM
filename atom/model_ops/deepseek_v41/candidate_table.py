@@ -10,11 +10,11 @@ A candidate id IS a logical block id, so the translation is a gather out of
 and an index block are the same length, which is why
 `V41PoolGeometry.index_block_rows` is declared rather than derived.
 
-The visibility a row carries into the compacted space is the property nothing
-else states: candidates come back ascending and `pick_candidate_blocks` pins
-the newest block, so the partly-filled block is the LAST kept slot and never an
-interior one. That is what makes a plain length exact where an interior partial
-block would need a per-column mask.
+Candidates are valid logical blocks, ascending with a `-1` tail. Only the
+newest visible block can be partly filled, and it is last if selected, so a
+plain length describes the compacted visibility exactly. Selection normally
+pins that block; the length remains valid if it is absent and all kept blocks
+are full.
 """
 
 import torch
@@ -52,8 +52,12 @@ def _candidate_table_kernel(
 
     seen = tl.load(visible + token).to(tl.int32)
     kept = tl.sum(live.to(tl.int32))
-    newest = tl.max(tl.where(live, cand, -1))
-    bound = (kept - 1) * ROWS + (seen - newest * ROWS)
+    last_selected = tl.max(tl.where(live, cand, -1))
+    # A kept block before the request's newest block is full, not the entire
+    # gap to `seen`. Bound its contribution by one block even if the pin was
+    # lost upstream; empty rows still have no visible columns.
+    last_span = tl.minimum(tl.maximum(seen - last_selected * ROWS, 0), ROWS)
+    bound = (kept - 1) * ROWS + last_span
     tl.store(context + token, tl.where(kept > 0, bound, 0))
 
 
@@ -153,8 +157,9 @@ def candidate_block_table_reference(candidates, tiles, visible, *, rows_per_bloc
             table[token, slot] = tiles[token, cand]
         if kept:
             seen = int(visible[token])
-            context[token] = (len(kept) - 1) * rows_per_block + (
-                seen - kept[-1] * rows_per_block
+            context[token] = sum(
+                min(rows_per_block, max(seen - cand * rows_per_block, 0))
+                for cand in kept
             )
     return table, context
 
