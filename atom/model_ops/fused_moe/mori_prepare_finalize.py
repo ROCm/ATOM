@@ -125,6 +125,11 @@ def mori_tuned_launch_table(
 
 _MXFP8_DISPATCH = envs.ATOM_MORI_FP8_DISPATCH
 _MASK_PAD_ROWS = envs.ATOM_MORI_MASK_PAD_ROWS
+_ZERO_COPY_COMBINE = envs.ATOM_MORI_ZERO_COPY_COMBINE
+
+# ATOM_MORI_ZERO_COPY_COMBINE value -> how the expert output reaches MoRI's
+# registered combine input buffer (None: push combine, as before).
+_ZERO_COPY_COMBINE_MODES = {"0": None, "1": "direct", "copy": "copy"}
 
 
 @cache
@@ -148,6 +153,62 @@ def _drops_negative_ids(mori_op: Any) -> bool:
     """
     kernel_type = getattr(getattr(mori_op, "config", None), "kernel_type", None)
     return kernel_type == mori.ops.EpDispatchCombineKernelType.IntraNode
+
+
+def resolve_zero_copy_combine(mode: str, mori_op: Any) -> str | None:
+    """How the sync combine gets its input: None (push), "direct" or "copy".
+
+    MoRI's IntraNode combine has two transports over the same symmetric
+    buffer. Push (use_external_inp_buf, what aiter's handle defaults to) has
+    every rank copy each received row into the sender's staging slot over
+    XGMI, then barrier, then sum local staging. Zero-copy (pull) skips that
+    copy: after the barrier each rank reads its tokens' rows straight out of
+    the peers' registered combine input buffers, so the expert output has to
+    already be there, in dispatch-receive row order. The buffer, its size and
+    the kernels are the same for both, and combine() takes the transport per
+    call, so aiter's cached handle serves either -- no second handle on the
+    shmem heap.
+
+    Only the IntraNode kernel's pull path was checked, and it has no combine
+    codec: MoRI raises for blockwise and would silently drop fp8_direct_cast,
+    so those keep the push combine. Decided once per layer from the env and
+    the handle, so every rank picks the same transport.
+    """
+    if mode not in _ZERO_COPY_COMBINE_MODES:
+        raise ValueError(
+            f"ATOM_MORI_ZERO_COPY_COMBINE={mode!r}: expected one of "
+            f"{sorted(_ZERO_COPY_COMBINE_MODES)}"
+        )
+    zero_copy = _ZERO_COPY_COMBINE_MODES[mode]
+    if zero_copy is None:
+        return None
+    config = mori_op.config
+    usable = (
+        config.kernel_type == mori.ops.EpDispatchCombineKernelType.IntraNode
+        and config.quant_type == "none"
+    )
+    _log_zero_copy_combine(zero_copy if usable else None)
+    return zero_copy if usable else None
+
+
+@cache
+def _log_zero_copy_combine(zero_copy: str | None) -> None:
+    """Say once, not per MoE layer, whether ATOM_MORI_ZERO_COPY_COMBINE took."""
+    if zero_copy is None:
+        logger.warning(
+            "[MORI] ATOM_MORI_ZERO_COPY_COMBINE ignored: needs the IntraNode "
+            "kernel and ATOM_MORI_COMBINE_QUANT=none"
+        )
+    else:
+        logger.info(
+            "[MORI] zero-copy combine: peers pull the expert output from the "
+            "registered combine input buffer "
+            + (
+                "(fused_moe writes it there)"
+                if zero_copy == "direct"
+                else "(copied in before combine)"
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -294,6 +355,10 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     Prepare/Finalize using MoRI kernels.
     """
 
+    # "direct" / "copy" when the sync combine pulls (see
+    # resolve_zero_copy_combine); None pushes.
+    _zero_copy_combine: str | None = None
+
     def __init__(
         self,
         mori_ops: list[Any],
@@ -335,6 +400,14 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                     max_tokens_per_rank,
                     torch.device("cuda", torch.cuda.current_device()),
                 )
+        # Sync path only. Slot 0 also serves TBO ubatch 0, but the ubatch
+        # combines stay on push: the transport is chosen per combine() call.
+        self._zero_copy_combine = resolve_zero_copy_combine(
+            _ZERO_COPY_COMBINE, self._mori_ops[0]
+        )
+        # (dtype, hidden_dim) -> view of the sync op's registered combine
+        # input buffer; see _registered_combine_input.
+        self._combine_inputs: dict[tuple, torch.Tensor] = {}
 
     # Derived from the resolved format so there is no second copy to keep in
     # sync with the staging config.
@@ -402,12 +475,22 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         )
 
     def _tuned_launch_table(
-        self, phase: str, mori_op: Any, dtype: torch.dtype, hidden_dim: int
+        self,
+        phase: str,
+        mori_op: Any,
+        dtype: torch.dtype,
+        hidden_dim: int,
+        pull_combine: bool = False,
     ):
-        key = (phase, id(mori_op), dtype, hidden_dim)
+        config = mori_op.config
+        # MoRI tunes the pull combine separately. The transport is per call,
+        # not per op: slot 0 pulls on the sync path and pushes as TBO ubatch 0.
+        zero_copy = phase == "combine" and (
+            pull_combine or not config.use_external_inp_buf
+        )
+        key = (phase, id(mori_op), dtype, hidden_dim, zero_copy)
         if key in self._launch_tables:
             return self._launch_tables[key]
-        config = mori_op.config
         kernel_type = getattr(config.kernel_type, "name", str(config.kernel_type))
         table = None
         # Only the IntraNode kernels' tables and co-residency limits are
@@ -423,13 +506,13 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                     {}
                     if phase == "dispatch"
                     else {
-                        "zero_copy": not config.use_external_inp_buf,
+                        "zero_copy": zero_copy,
                         "quant_type": config.quant_type,
                     }
                 ),
             )
         self._launch_tables[key] = table
-        log_key = (phase, kernel_type, dtype, hidden_dim)
+        log_key = (phase, kernel_type, dtype, hidden_dim, zero_copy)
         if config.rank == 0 and log_key not in _LOGGED_LAUNCH_TABLES:
             _LOGGED_LAUNCH_TABLES.add(log_key)
             if table is None:
@@ -442,9 +525,12 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 steps = ", ".join(
                     f"<={c}:{b}x{w}" for c, (b, w) in zip(ceilings, geometries)
                 )
+                transport = (
+                    "" if phase == "dispatch" else (" pull" if zero_copy else " push")
+                )
                 logger.info(
-                    f"[MORI] {phase} launch (tokens/rank:blocks x warps) for "
-                    f"{dtype} hidden={hidden_dim}: {steps}, "
+                    f"[MORI] {phase}{transport} launch (tokens/rank:blocks x warps) "
+                    f"for {dtype} hidden={hidden_dim}: {steps}, "
                     f">{ceilings[-1]}:{geometries[-1][0]}x{geometries[-1][1]}"
                 )
         return table
@@ -456,6 +542,8 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         num_tokens: int,
         dtype: torch.dtype,
         hidden_dim: int,
+        *,
+        pull_combine: bool = False,
     ) -> tuple[int, int]:
         """Return (block_num, warp_per_block) for one dispatch or combine launch.
 
@@ -473,7 +561,9 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         """
         context = get_forward_context().context
         if _LAUNCH_POLICY != "legacy":
-            table = self._tuned_launch_table(phase, mori_op, dtype, hidden_dim)
+            table = self._tuned_launch_table(
+                phase, mori_op, dtype, hidden_dim, pull_combine
+            )
             if table is not None:
                 across_dp = (
                     None if context is None else context.running_tokens_across_dp
@@ -527,6 +617,49 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         return torch.where(pad_rows[:num_rows], -1, topk_ids)
 
     # ---- Synchronous (non-TBO) path ----
+
+    def _registered_combine_input(
+        self, dtype: torch.dtype, hidden_dim: int
+    ) -> torch.Tensor:
+        """The sync op's registered combine input buffer as [max_recv, hidden].
+
+        Row i is what the pull combine reads for dispatch-receive row i. A
+        cached view of a fixed symmetric allocation, so it is the same
+        pointer in every CUDA graph and costs no device work to fetch.
+        """
+        key = (dtype, hidden_dim)
+        buf = self._combine_inputs.get(key)
+        if buf is None:
+            config = self._mori_ops[0].config
+            if (
+                dtype.itemsize > config.max_token_type_size
+                or hidden_dim > config.hidden_dim
+            ):
+                raise RuntimeError(
+                    f"zero-copy combine: a {dtype} x {hidden_dim} expert output "
+                    "does not fit MoRI's combine input rows "
+                    f"({config.max_token_type_size} B x {config.hidden_dim}); "
+                    "unset ATOM_MORI_ZERO_COPY_COMBINE"
+                )
+            buf = self._mori_ops[0].get_registered_combine_input_buffer(
+                dtype, hidden_dim=hidden_dim
+            )
+            self._combine_inputs[key] = buf
+        return buf
+
+    def expert_output_buffer(
+        self, num_rows: int, hidden_dim: int, dtype: torch.dtype
+    ) -> torch.Tensor | None:
+        # "direct": fused_moe zeroes and accumulates the received rows' expert
+        # output in place in the buffer peers pull from, so the combine input
+        # costs neither a push nor a copy. Its rows are the dispatch-receive
+        # rows (the trim keeps a prefix; the sentinel adds a column, not a
+        # row). The buffer is only rewritten after this rank's next dispatch
+        # has completed, and that completion waits for every peer to reach
+        # the same dispatch -- i.e. to have finished pulling from it.
+        if self._zero_copy_combine != "direct" or self.supports_async():
+            return None
+        return self._registered_combine_input(dtype, hidden_dim)[:num_rows]
 
     def prepare(
         self,
@@ -607,12 +740,29 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     ) -> torch.Tensor:
         num_token = topk_ids.shape[0]
 
+        combine_kwargs = {}
+        if self._zero_copy_combine is not None:
+            num_rows, hidden_dim = fused_expert_output.shape
+            combine_input = self._registered_combine_input(
+                fused_expert_output.dtype, hidden_dim
+            )
+            if fused_expert_output.data_ptr() != combine_input.data_ptr():
+                # Not written in place ("copy", or an expert path that took no
+                # output buffer): one local copy of the rows peers read. Plain
+                # stores into the symmetric buffer, as MoRI's own zero-copy
+                # tests stage it; the combine's entry barrier orders them
+                # before any peer reads.
+                combine_input[:num_rows].copy_(fused_expert_output)
+            fused_expert_output = combine_input[:num_rows]
+            combine_kwargs["use_external_inp_buf"] = 0
+
         block_num, warp_per_block = self._get_launch_config(
             "combine",
             self._mori_ops[0],
             num_token,
             fused_expert_output.dtype,
             fused_expert_output.shape[1],
+            pull_combine=self._zero_copy_combine is not None,
         )
 
         result = self._mori_ops[0].combine(
@@ -621,6 +771,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             topk_ids,
             block_num=block_num,
             warp_per_block=warp_per_block,
+            **combine_kwargs,
         )[0]
         return result[:num_token]
 
@@ -629,6 +780,10 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     #    mori only exposes the split send/recv API on AsyncLL.
     # 2. AsyncLL (--low-latency, intra-node): dispatch_send/recv,
     #    combine_send/recv (CU-free)
+    # Both keep the push combine whatever ATOM_MORI_ZERO_COPY_COMBINE says.
+    # Ubatch 0 shares slot 0 with the sync path, but its combine is called
+    # without use_external_inp_buf=0, and expert_output_buffer never hands
+    # fused_moe the registered combine input while a ubatch is running.
     def prepare_async(
         self,
         a1: torch.Tensor,

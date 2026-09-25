@@ -142,7 +142,9 @@ def apply_vllm_mori_patch() -> None:
     original_get_launch_config = MoriPrepareAndFinalize._get_launch_config
 
     @functools.wraps(original_get_launch_config)
-    def vllm_get_launch_config(self, phase, mori_op, num_tokens, dtype, hidden_dim):
+    def vllm_get_launch_config(
+        self, phase, mori_op, num_tokens, dtype, hidden_dim, *, pull_combine=False
+    ):
         # vLLM does not expose a stable prefill/decode flag here, so use a
         # token-count threshold to keep MORI warmup and runtime selection
         # deterministic in atom-vllm mode. Same grid for dispatch and combine.

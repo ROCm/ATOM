@@ -131,6 +131,17 @@ class FusedMoEPrepareAndFinalize(ABC):
         """
         return dispatch_ids, dispatch_weights
 
+    def expert_output_buffer(
+        self, num_rows: int, hidden_dim: int, dtype: torch.dtype
+    ) -> torch.Tensor | None:
+        """A [num_rows, hidden_dim] buffer for AITER fused_moe to write into.
+
+        For a transport whose combine reads the expert output from memory it
+        owns, so fused_moe can write it there instead of into its own buffer.
+        None (the default) lets fused_moe allocate as usual.
+        """
+        return None
+
     def mask_pad_topk_ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
         """Return `topk_ids` with rows that carry no request routed nowhere.
 
@@ -704,6 +715,12 @@ class FusedMoEModularKernel(torch.nn.Module):
                 expert_map,
             )
         )
+        # aiter's own output shape: (M, w2.shape[1]) in the caller's dtype.
+        expert_output = self.prepare_finalize.expert_output_buffer(
+            dispatch_ids.shape[0], w2.shape[1], hidden_states.dtype
+        )
+        if expert_output is not None:
+            extra_kwargs["output"] = expert_output
         fused_out = fused_moe(
             dispatch_a1,
             w1,

@@ -299,3 +299,214 @@ def test_warp_per_block_is_passed_by_keyword(mi355x, monkeypatch):
         ("dispatch", {"block_num": 220, "warp_per_block": 4}),
         ("combine", {"block_num": 256, "warp_per_block": 8}),
     ]
+
+
+# --- zero-copy (pull) combine ----------------------------------------------------
+
+
+class _FakeZeroCopyOp(_FakeMoriOp):
+    """Adds MoRI's registered combine input buffer: [max_recv, hidden] rows."""
+
+    def __init__(self, *, max_recv=64, hidden=HIDDEN, **kwargs):
+        super().__init__(**kwargs)
+        self.config.max_token_type_size = 2
+        self.config.hidden_dim = hidden
+        self.max_recv = max_recv
+        self.symm = torch.zeros(max_recv * hidden * 2, dtype=torch.uint8)
+
+    def get_registered_combine_input_buffer(self, dtype, hidden_dim=-1):
+        rows = self.symm.numel() // (hidden_dim * dtype.itemsize)
+        return self.symm.view(dtype)[: rows * hidden_dim].view(rows, hidden_dim)
+
+    def combine(self, input, weights, indices, **kwargs):
+        self.combine_input = input
+        return super().combine(input, weights, indices, **kwargs)
+
+
+def _zero_copy_pf(mode, *, op=None):
+    pf = _prepare_finalize()
+    pf._mori_ops = (op or _FakeZeroCopyOp(),)
+    pf._zero_copy_combine = mode
+    pf._combine_inputs = {}
+    return pf
+
+
+def _intranode_config(**overrides):
+    import mori
+
+    fields = {
+        "kernel_type": mori.ops.EpDispatchCombineKernelType.IntraNode,
+        "quant_type": "none",
+        **overrides,
+    }
+    return SimpleNamespace(config=SimpleNamespace(**fields))
+
+
+@pytest.mark.parametrize(
+    "mode, expected", [("0", None), ("1", "direct"), ("copy", "copy")]
+)
+def test_zero_copy_modes(mode, expected):
+    assert mpf.resolve_zero_copy_combine(mode, _intranode_config()) == expected
+
+
+def test_zero_copy_rejects_unknown_values():
+    with pytest.raises(ValueError, match="ATOM_MORI_ZERO_COPY_COMBINE"):
+        mpf.resolve_zero_copy_combine("true", _intranode_config())
+
+
+def test_zero_copy_needs_intranode_without_a_combine_codec():
+    import mori
+
+    for config in (
+        _intranode_config(kernel_type=mori.ops.EpDispatchCombineKernelType.AsyncLL),
+        _intranode_config(quant_type="fp8_direct_cast"),
+        _intranode_config(quant_type="fp8_blockwise"),
+    ):
+        assert mpf.resolve_zero_copy_combine("1", config) is None
+
+
+def test_push_combine_is_unchanged_by_default(mi355x, monkeypatch):
+    _context(monkeypatch, (112,) * 8)
+    pf = _zero_copy_pf(None)
+    out = torch.ones(64, HIDDEN, dtype=torch.bfloat16)
+    pf.finalize(None, out, None, torch.zeros(112, TOPK, dtype=torch.int32), False)
+    op = pf._mori_ops[0]
+    assert op.combine_input is out
+    assert "use_external_inp_buf" not in op.calls[-1][1]
+    assert not op.symm.any()
+    assert pf.expert_output_buffer(64, HIDDEN, torch.bfloat16) is None
+
+
+def test_direct_output_is_pulled_in_place(mi355x, monkeypatch):
+    _context(monkeypatch, (112,) * 8)
+    pf = _zero_copy_pf("direct")
+    op = pf._mori_ops[0]
+    out = pf.expert_output_buffer(40, HIDDEN, torch.bfloat16)
+    registered = op.get_registered_combine_input_buffer(torch.bfloat16, HIDDEN)
+    assert out.shape == (40, HIDDEN) and out.is_contiguous()
+    assert out.data_ptr() == registered.data_ptr()
+    out.fill_(3)
+    pf.finalize(None, out, None, torch.zeros(112, TOPK, dtype=torch.int32), False)
+    assert op.calls[-1][1]["use_external_inp_buf"] == 0
+    assert op.combine_input.data_ptr() == registered.data_ptr()
+    assert (registered[:40] == 3).all() and not registered[40:].any()
+
+
+def test_copy_mode_stages_the_rows_peers_read(mi355x, monkeypatch):
+    _context(monkeypatch, (112,) * 8)
+    pf = _zero_copy_pf("copy")
+    op = pf._mori_ops[0]
+    assert pf.expert_output_buffer(40, HIDDEN, torch.bfloat16) is None
+    out = torch.randn(40, HIDDEN).to(torch.bfloat16)
+    pf.finalize(None, out, None, torch.zeros(112, TOPK, dtype=torch.int32), False)
+    registered = op.get_registered_combine_input_buffer(torch.bfloat16, HIDDEN)
+    assert op.calls[-1][1]["use_external_inp_buf"] == 0
+    assert op.combine_input.data_ptr() == registered.data_ptr()
+    assert torch.equal(registered[:40], out)
+
+
+def test_no_direct_output_while_a_ubatch_runs(monkeypatch):
+    pf = _zero_copy_pf("direct")
+    monkeypatch.setattr(mpf.MoriPrepareAndFinalize, "supports_async", lambda s: True)
+    assert pf.expert_output_buffer(40, HIDDEN, torch.bfloat16) is None
+
+
+def test_expert_output_wider_than_the_rows_is_refused():
+    pf = _zero_copy_pf("direct")
+    with pytest.raises(RuntimeError, match="does not fit"):
+        pf.expert_output_buffer(4, HIDDEN, torch.float32)
+    with pytest.raises(RuntimeError, match="does not fit"):
+        pf.expert_output_buffer(4, HIDDEN * 2, torch.bfloat16)
+
+
+def test_zero_copy_combine_uses_the_pull_tables(mi355x, monkeypatch):
+    from mori.ops.tuning_config import TuningConfigManager
+
+    manager = TuningConfigManager.get_instance("gfx950", "IntraNode", 8, "mi355x")
+    push = _prepare_finalize()
+    pull = _zero_copy_pf("direct")
+    for tokens in (7, 56, 112, 224, 448, 1792, 4096):
+        _context(monkeypatch, (tokens,) * 8)
+        expected = TuningConfigManager.lookup(
+            manager.combine_rules,
+            torch.bfloat16,
+            tokens,
+            HIDDEN,
+            zero_copy=True,
+            quant_type="none",
+            topk=TOPK,
+        )
+        op = pull._mori_ops[0]
+        got = pull._get_launch_config(
+            "combine", op, tokens, torch.bfloat16, HIDDEN, pull_combine=True
+        )
+        assert got == (expected.block_num, expected.warp_per_block), tokens
+        # The same slot-0 op pushes as TBO ubatch 0: the push rules again.
+        assert (
+            pull._get_launch_config("combine", op, tokens, torch.bfloat16, HIDDEN)
+            == _MI355X_EP8_DSV4[tokens][1]
+        )
+        # Dispatch has one table, and the push op keeps the push rules.
+        assert pull._get_launch_config(
+            "dispatch", op, tokens, torch.bfloat16, HIDDEN
+        ) == push._get_launch_config(
+            "dispatch", _FakeMoriOp(), tokens, torch.bfloat16, HIDDEN
+        )
+        assert (
+            push._get_launch_config(
+                "combine", _FakeMoriOp(), tokens, torch.bfloat16, HIDDEN
+            )
+            == _MI355X_EP8_DSV4[tokens][1]
+        )
+
+
+def test_fused_moe_writes_into_the_pulled_buffer(monkeypatch):
+    """End to end through the modular kernel: trimmed rows, sentinel column,
+    output= the registered rows, and combine pulls exactly that buffer."""
+    across_dp = (2, 3)
+    _context(monkeypatch, across_dp)
+    monkeypatch.setattr(
+        mk,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            context=SimpleNamespace(running_tokens_across_dp=across_dp)
+        ),
+    )
+    seen = {}
+
+    def fake_fused_moe(a1, w1, w2, weights, ids, expert_mask, *args, **kwargs):
+        output = kwargs["output"]
+        seen["ids"] = ids
+        assert output.shape == (a1.shape[0], w2.shape[1])
+        output.fill_(5)
+        return output
+
+    monkeypatch.setattr(mk, "fused_moe", fake_fused_moe)
+    monkeypatch.setattr(mpf, "_LAUNCH_POLICY", "legacy")
+    monkeypatch.setattr(mpf, "get_cu_num", lambda: 256)
+
+    op = _FakeZeroCopyOp(rows=64, hidden=16)
+    pf = _zero_copy_pf("direct", op=op)
+    pf.dispatch_format = mpf.MoriDispatchFormat(
+        dtype=torch.bfloat16, quant_type=None, scale_dim=0, scale_type_size=4
+    )
+    kernel = mk.FusedMoEModularKernel(pf)
+    topk_ids = torch.randint(0, NUM_EXPERTS, (3, TOPK), dtype=torch.int32)
+    kernel(
+        torch.zeros(3, 16, dtype=torch.bfloat16),
+        torch.zeros(48, 1),
+        torch.zeros(48, 16, 1),
+        torch.rand(3, TOPK),
+        topk_ids,
+        global_num_experts=NUM_EXPERTS,
+        expert_map=_expert_map(),
+        expert_mask=(_expert_map() > -1).to(torch.int32),
+    )
+    registered = op.get_registered_combine_input_buffer(torch.bfloat16, 16)
+    rows = sum(across_dp)
+    assert seen["ids"].shape == (rows, TOPK + 1)
+    assert op.calls[-1][1]["use_external_inp_buf"] == 0
+    assert op.combine_input.data_ptr() == registered.data_ptr()
+    assert op.combine_input.shape == (rows, 16)
+    assert (registered[:rows] == 5).all() and not registered[rows:].any()
+    assert op.combine_indices is topk_ids

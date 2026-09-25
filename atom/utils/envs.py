@@ -609,6 +609,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Route DP pad rows (past this rank's scheduled tokens) to expert -1, which
     # the IntraNode dispatch drops, so padding costs no transport or GEMM.
     "ATOM_MORI_MASK_PAD_ROWS": lambda: os.getenv("ATOM_MORI_MASK_PAD_ROWS", "0") == "1",
+    # IntraNode combine in zero-copy (pull) mode: peers read this rank's expert
+    # output straight from its registered combine input buffer instead of it
+    # being pushed into their staging. "0" (default) keeps the push combine;
+    # "1" has aiter fused_moe write its output into that buffer; "copy" keeps
+    # fused_moe's own output buffer and copies it in before the combine.
+    "ATOM_MORI_ZERO_COPY_COMBINE": lambda: os.getenv(
+        "ATOM_MORI_ZERO_COPY_COMBINE", "0"
+    ),
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
