@@ -241,7 +241,6 @@ jobs:
           timeout 20s squeue --noheader --format='%i %T %j %N %R' \
             > inspection/squeue.tmp 2> inspection/squeue-errors.txt || true
           grep -F -- "-${SOURCE_RUN_ID}-" inspection/squeue.tmp > inspection/squeue.txt || true
-          rm -f inspection/squeue.tmp
           shopt -s nullglob
           log_roots=(
             /share_nfs/ATOMESH_RUNNER/ATOMESH_LOG/*-"${SOURCE_RUN_ID}"-* \
@@ -252,8 +251,11 @@ jobs:
             if [[ "${log_root}" == *-"${SOURCE_RUN_ID}"-* ]]; then
               log_roots+=("${log_root}")
               printf '%s\n' "${marker}: ${log_root}" >> inspection/log-root-markers.txt
+              grep -F -- "$(basename "${marker}" .log-root)-" inspection/squeue.tmp \
+                >> inspection/related-squeue.txt || true
             fi
           done
+          rm -f inspection/squeue.tmp
           declare -A copied=()
           for log_root in "${log_roots[@]}"; do
             [[ -z "${copied[${log_root}]:-}" ]] || continue

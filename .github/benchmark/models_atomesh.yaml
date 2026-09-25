@@ -849,7 +849,7 @@ models:
       served_model_name: Kimi-K3
       fork:
         repo: https://github.com/whx-sjtu/vllm
-        sha: 949a8df26eb358f5c4fa00a424ea01fd0c987eb2
+        sha: f41f2182f2a85ba483795c27813a7a40984b19dc
         files: all
       lmcache:
         <<: *kimi_k3_vllm_lmcache
