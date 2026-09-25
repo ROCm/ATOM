@@ -247,9 +247,15 @@ jobs:
           timeout 20s squeue --noheader --format='%i %T %D %j %N %R' \
             > inspection/squeue.tmp 2> inspection/squeue-errors.txt || true
           grep -F -- "-${SOURCE_RUN_ID}-" inspection/squeue.tmp > inspection/squeue.txt || true
+          while read -r job_id _; do
+            [[ "${job_id}" =~ ^[0-9]+$ ]] || continue
+            timeout 15s scontrol show job "${job_id}" \
+              > "inspection/job-${job_id}.txt" 2>&1 || true
+          done < inspection/squeue.txt
           if [[ "${INSPECT_PROCESSES}" == "true" ]]; then
             while read -r job_id job_state node_count _; do
-              [[ "${job_id}" =~ ^[0-9]+$ && "${job_state}" == "RUNNING" ]] || continue
+              [[ "${job_id}" =~ ^[0-9]+$ ]] || continue
+              [[ "${job_state}" == "RUNNING" || "${job_state}" == "COMPLETING" ]] || continue
               [[ "${node_count}" =~ ^[1-9][0-9]*$ ]] || continue
               timeout 10s srun --jobid="${job_id}" --overlap --help \
                 > inspection/srun-overlap-help.txt 2>&1 || true

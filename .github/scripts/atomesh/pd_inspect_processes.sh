@@ -5,6 +5,10 @@ job_id="${1:?existing Slurm job ID required}"
 [[ "${job_id}" =~ ^[0-9]+$ ]]
 hostname
 date -u
+grep -E '^(MemTotal|MemFree|MemAvailable|SwapTotal|SwapFree|Mlocked|Unevictable):' /proc/meminfo
+timeout 5s journalctl -k --since '30 minutes ago' --no-pager 2>&1 |
+  grep -Ei 'oom|out of memory|killed process|amdgpu|gpu reset|permission|no journal' |
+  tail -n 80 || true
 ps -eo pid,ppid,etimes,pcpu,stat,wchan:24,comm |
   awk 'NR == 1 || /VLLM|python|ninja|clang|hipcc|cmake/'
 

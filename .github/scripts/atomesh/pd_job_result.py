@@ -105,15 +105,32 @@ def main():
     parser.add_argument("--scheduler-state")
     parser.add_argument("--scheduler-exit-code")
     parser.add_argument("--scheduler-rc", type=int)
+    parser.add_argument("--scheduler-error-path", type=Path)
     parser.add_argument("--spur", choices=("0", "1"), default="0")
     args = parser.parse_args()
     if args.action == "check-failed":
         failure = failed_rank(args.run_dir, args.job_id, args.run_token, args.num_ranks)
+        if failure is None and args.scheduler_error_path:
+            try:
+                errors = args.scheduler_error_path.read_text().splitlines()
+            except OSError:
+                errors = []
+            if "Error: RunStep dispatch failed" in errors and not workload_completed(
+                args.run_dir, args.job_id, args.run_token, args.num_ranks
+            ):
+                failure = {
+                    "job_id": args.job_id,
+                    "run_token": args.run_token,
+                    "source": "spur_dispatch",
+                    "error": "RunStep dispatch failed",
+                    "return_code": 1,
+                }
         if failure is None:
             return 0
         write_json(args.run_dir / "workload-failure.json", failure)
+        detail = failure.get("error") or f"rank {failure['rank']} exited"
         print(
-            f"ERROR: Slurm job {args.job_id} rank {failure['rank']} exited "
+            f"ERROR: Slurm job {args.job_id} {detail} "
             f"rc={failure['return_code']}; cancelling the remaining workload."
         )
         return 1

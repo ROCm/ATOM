@@ -62,6 +62,11 @@ case "${ATOMESH_EXECUTION_PHASE}" in
     exit 2
     ;;
 esac
+PHASE_COMPLETION_FILE="${RUN_DIR}/phase-${ATOMESH_EXECUTION_PHASE}.complete"
+PHASE_COMPLETION_ID="${ATOMESH_RUN_TOKEN:-${SLURM_JOB_ID:-local}}:${ATOMESH_EXECUTION_PHASE}"
+if [[ "${NODE_RANK}" -eq 0 ]]; then
+  rm -f "${PHASE_COMPLETION_FILE}"
+fi
 if [[ ! "${ATOMESH_SERVICE_PORT_OFFSET}" =~ ^[0-9]+$ ]]; then
   echo "ERROR: ATOMESH_SERVICE_PORT_OFFSET must be a non-negative integer" >&2
   exit 2
@@ -562,7 +567,11 @@ wait_router_closed() {
     fi
     sleep 10
   done
-  echo "[wait][OK] router closed"
+  if [[ "$(cat "${PHASE_COMPLETION_FILE}" 2>/dev/null)" != "${PHASE_COMPLETION_ID}" ]]; then
+    echo "[wait][FAIL] router closed before phase ${ATOMESH_EXECUTION_PHASE} completed" >&2
+    return 1
+  fi
+  echo "[wait][OK] router closed after phase ${ATOMESH_EXECUTION_PHASE} completed"
 }
 
 start_logged_process() {
@@ -1338,13 +1347,9 @@ PY
 run_benchmark_and_eval() {
   if [[ "${ATOMESH_EXECUTION_PHASE}" == "benchmark" ]]; then
     run_benchmark
-    return
-  fi
-  if [[ "${ATOMESH_EXECUTION_PHASE}" == "eval" ]]; then
+  elif [[ "${ATOMESH_EXECUTION_PHASE}" == "eval" ]]; then
     run_eval
-    return
-  fi
-  if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" \
+  elif [[ "${BENCHMARK_KIND}" == "aiperf_agentic" \
     && ( "${EVAL_TASK}" == "swebench_lite" || "${EVAL_TASK}" == "gsm8k" ) \
     && ( "${RUN_EVAL}" == "true" || "${RUN_EVAL}" == "1" ) ]]; then
     # Agentic performance cases require a fresh prefix/state-cache state. Run
@@ -1355,6 +1360,8 @@ run_benchmark_and_eval() {
     run_eval
     run_benchmark
   fi
+  printf '%s\n' "${PHASE_COMPLETION_ID}" > "${PHASE_COMPLETION_FILE}.tmp"
+  mv "${PHASE_COMPLETION_FILE}.tmp" "${PHASE_COMPLETION_FILE}"
 }
 
 if [[ "${BACKEND}" == "vllm" ]]; then
