@@ -52,11 +52,11 @@ inputs:
     default: ""
   disable-mmap:
     description: >-
-      When 'true' (default) inject `-e ATOM_DISABLE_MMAP=true`. Set 'false' for
-      callers whose container never set it (e.g. mmstar) to stay byte-for-byte
-      equivalent.
+      When 'true' inject `-e ATOM_DISABLE_MMAP=true`. Off by default: with the
+      loader's page-cache prefetch, mmap loads DeepSeek-R1-0528 cold in ~90s on
+      a CI runner where whole-file reads take ~510s.
     required: false
-    default: "true"
+    default: "false"
 
 runs:
   using: composite
