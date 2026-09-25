@@ -24,10 +24,28 @@ else:
     raise SystemExit('D-PROBE prefix cache is still held')
 PY
 }
-echo 'D-PROBE preparing 48 mixed long prefixes'
-"${client[@]}" --mode prepare --n 48 --lengths 12289,16385,24577,65537,131073,262145
-echo 'D-PROBE fresh local prefill and generation'
-"${client[@]}" --mode generate --concurrency 48 --max-tokens 16 --logprobs 5 --out "${results}/fresh.jsonl"
+echo 'D-PROBE preparing eight long prefixes for forced preemption'
+"${client[@]}" --mode prepare --n 8 --lengths 262145
+echo 'D-PROBE injecting one KV allocation failure after decode starts'
+"${client[@]}" --mode generate --concurrency 8 --max-tokens 2048 --out "${results}/forced.jsonl"
+python3 - "${results}" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+def preemptions(name):
+    return sum(float(line.split()[-1]) for line in (root / name).read_text().splitlines()
+               if line.startswith(('vllm:num_preemptions_total{', 'vllm:num_preemptions_total ')))
+count = preemptions('forced.after.metrics') - preemptions('forced.before.metrics')
+assert count > 0, 'No preemption observed'
+summary = json.loads((root / 'forced.summary.json').read_text())
+assert summary['requests'] == summary['ok'] == 8
+report = {'preemptions': count, 'generation': summary,
+          'scope': 'One injected allocation failure on D; no PD source ownership'}
+(root / 'preempt-summary.json').write_text(json.dumps(report, indent=2))
+print(json.dumps(report), flush=True)
+PY
 reset_prefix
 curl --fail --silent --show-error --max-time 10 "http://127.0.0.1:${port}/metrics" > "${results}/final.metrics"
 echo 'D-PROBE completed'

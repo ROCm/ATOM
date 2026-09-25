@@ -82,6 +82,14 @@ for rel in files:
     shutil.copy2(src, dst)
 print(f"[vllm] overlaid {len(files)} Python files")
 PY
+  git -C "${VLLM_SITE_DIR}" apply --check \
+    "${ATOMESH_SCRIPT_DIR}/patches/vllm-k3-pressure-diagnostic.patch"
+  git -C "${VLLM_SITE_DIR}" apply \
+    "${ATOMESH_SCRIPT_DIR}/patches/vllm-k3-pressure-diagnostic.patch"
+  git -C "${VLLM_SITE_DIR}" apply --check \
+    "${ATOMESH_SCRIPT_DIR}/patches/vllm-k3-preempt-injection.patch"
+  git -C "${VLLM_SITE_DIR}" apply \
+    "${ATOMESH_SCRIPT_DIR}/patches/vllm-k3-preempt-injection.patch"
   server_pythonpath="$(join_path "${VLLM_SITE_DIR}" "${server_pythonpath}")"
   env PYTHONPATH="${server_pythonpath}" python3 - "${VLLM_SITE_DIR}" <<'PY'
 import sys

@@ -1390,7 +1390,7 @@ if [[ "${TOPOLOGY}" == "0p1d" ]]; then
   start_decode "decode-rank-0"
   trap 'cleanup_processes ${server_pid:-}' EXIT
   wait_http "http://127.0.0.1:${DECODE_PORT}/health" "decode" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
-  timeout --kill-after=10s 600s bash "${ATOMESH_SCRIPT_DIR}/../k3-decode-probe/workload.sh" "${DECODE_PORT}" "${RUN_DIR}"
+  timeout --kill-after=10s 900s bash "${ATOMESH_SCRIPT_DIR}/../k3-decode-probe/workload.sh" "${DECODE_PORT}" "${RUN_DIR}"
   ROUTER_PORT="${DECODE_PORT}"
   export -f run_eval run_lm_eval snapshot_eval_metrics
   export RUN_EVAL EVAL_TASK EVAL_LIMIT EVAL_BATCH_SIZE EVAL_APPLY_CHAT_TEMPLATE \

@@ -1,0 +1,37 @@
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -728,11 +728,30 @@
+             # Schedule newly needed KV blocks for the request.
+             with record_function_or_nullcontext("schedule: allocate_slots"):
+                 while True:
+-                    new_blocks = self.kv_cache_manager.allocate_slots(
+-                        request,
+-                        num_new_tokens,
+-                        num_lookahead_tokens=self.num_lookahead_tokens,
++                    victim = self.running[-1]
++                    inject_preemption = (
++                        not getattr(self, "_pd_injected_preemption", False)
++                        and self.policy == SchedulingPolicy.FCFS
++                        and request.num_prompt_tokens >= 262144
++                        and request.num_output_tokens >= 32
++                        and victim.num_prompt_tokens >= 262144
++                        and victim.num_output_tokens >= 32
+                     )
++                    if inject_preemption:
++                        self._pd_injected_preemption = True
++                        logger.warning(
++                            "PD_PRESSURE injected_allocation_failure "
++                            "current=%s victim=%s",
++                            request.request_id,
++                            victim.request_id,
++                        )
++                        new_blocks = None
++                    else:
++                        new_blocks = self.kv_cache_manager.allocate_slots(
++                            request,
++                            num_new_tokens,
++                            num_lookahead_tokens=self.num_lookahead_tokens,
++                        )
+ 
+                     if new_blocks is not None:
+                         # The request can be scheduled.

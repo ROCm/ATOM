@@ -1,0 +1,133 @@
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1172,6 +1172,23 @@
+                         self.encoder_cache_manager.free(request)
+                     break
+ 
++                diagnostic_count = getattr(self, "_pd_pressure_resume_count", 0)
++                if request.num_preemptions and diagnostic_count < 64:
++                    self._pd_pressure_resume_count = diagnostic_count + 1
++                    logger.warning(
++                        "PD_PRESSURE resume rid=%s preemptions=%d prompt=%d "
++                        "output=%d local_hit=%d external_hit=%d scheduled=%d "
++                        "remote_prefill=%s free_blocks=%d",
++                        request.request_id,
++                        request.num_preemptions,
++                        request.num_prompt_tokens,
++                        request.num_output_tokens,
++                        num_new_local_computed_tokens,
++                        num_external_computed_tokens,
++                        num_new_tokens,
++                        (request.kv_transfer_params or {}).get("do_remote_prefill"),
++                        self.kv_cache_manager.block_pool.get_num_free_blocks(),
++                    )
+                 # KVTransfer: the connector uses this info to determine
+                 # if a load is needed. Note that
+                 # This information is used to determine if a load is
+@@ -1485,6 +1502,26 @@
+         assert request.status == RequestStatus.RUNNING, (
+             "Only running requests can be preempted"
+         )
++        diagnostic_count = getattr(self, "_pd_pressure_preempt_count", 0)
++        if diagnostic_count < 64:
++            self._pd_pressure_preempt_count = diagnostic_count + 1
++            logger.warning(
++                "PD_PRESSURE preempt rid=%s prompt=%d output=%d computed=%d "
++                "inflight=%d free_blocks=%d block_counts=%s remote_prefill=%s",
++                request.request_id,
++                request.num_prompt_tokens,
++                request.num_output_tokens,
++                request.num_computed_tokens,
++                request.num_in_flight_tokens,
++                self.kv_cache_manager.block_pool.get_num_free_blocks(),
++                [
++                    len(group)
++                    for group in self.kv_cache_manager.get_blocks(
++                        request.request_id
++                    ).blocks
++                ],
++                (request.kv_transfer_params or {}).get("do_remote_prefill"),
++            )
+         self._free_request_blocks(request)
+         self.encoder_cache_manager.free(request)
+         self._inflight_prefills.discard(request)
+@@ -2609,6 +2646,28 @@
+         """Free the request's KV blocks, deferring the return to the block
+         pool when an in-flight GPU step may still write them.
+         """
++        diagnostic_count = getattr(self, "_pd_pressure_free_count", 0)
++        params = request.kv_transfer_params or {}
++        if (
++            request.is_finished()
++            and params.get("do_remote_decode")
++            and diagnostic_count < 1024
++        ):
++            self._pd_pressure_free_count = diagnostic_count + 1
++            logger.warning(
++                "PD_PRESSURE source_free_call rid=%s tx=%s "
++                "immediate=%s block_counts=%s",
++                request.request_id,
++                params.get("transfer_id"),
++                not self.defer_block_free
++                or request.last_sched_seq <= self.processed_step_seq,
++                [
++                    len(group)
++                    for group in self.kv_cache_manager.get_blocks(
++                        request.request_id
++                    ).blocks
++                ],
++            )
+         if not self.defer_block_free or (
+             # Last scheduled step already processed: no in-flight write remains
+             # (always the case for a normal finish), so free now.
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py
+@@ -844,6 +844,15 @@
+             self._req_kv_params[request.request_id] = dict(params)
+ 
+         if params is not None and params.get("do_remote_prefill"):
++            diagnostic_count = getattr(self, "_pd_pressure_admit_count", 0)
++            if diagnostic_count < 1024:
++                self._pd_pressure_admit_count = diagnostic_count + 1
++                logger.warning(
++                    "PD_PRESSURE remote_admit rid=%s tx=%s external_tokens=%d",
++                    request.request_id,
++                    transfer_id,
++                    num_external_tokens,
++                )
+             if self.mode == MoRIIOMode.READ:
+                 if remote_block_ids := params.get("remote_block_ids"):
+                     # remote_engine_id is returned by the prefill's request_finished.
+@@ -1300,6 +1309,15 @@
+                 time.monotonic() + self._defer_timeout,
+                 params.get("transfer_id") if params else None,
+             )
++            diagnostic_count = getattr(self, "_pd_pressure_hold_count", 0)
++            if diagnostic_count < 1024:
++                self._pd_pressure_hold_count = diagnostic_count + 1
++                logger.warning(
++                    "PD_PRESSURE hold rid=%s tx=%s timeout=%.0f",
++                    request.request_id,
++                    params.get("transfer_id"),
++                    self._defer_timeout,
++                )
+ 
+         # Return KV transfer params forwarded verbatim to the decode instance by
+         # the router. remote_dp_rank is the rank THIS prefill leg actually ran
+@@ -1379,6 +1397,16 @@
+             if now >= deadline
+         ]
+         if expired:
++            diagnostic_count = getattr(self, "_pd_pressure_expire_count", 0)
++            if diagnostic_count < 64:
++                self._pd_pressure_expire_count = diagnostic_count + 1
++                logger.warning(
++                    "PD_PRESSURE expire requests=%s",
++                    [
++                        (rid, self._deferred_send_deadlines[rid][1])
++                        for rid in expired[:64]
++                    ],
++                )
+             safe.update(expired)
+             logger.warning(
+                 "Reaped %d deferred sends with no finished_sending "
