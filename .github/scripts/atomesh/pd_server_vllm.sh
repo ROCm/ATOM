@@ -49,7 +49,7 @@ apply_vllm_fork_overlay() {
     echo "[vllm][FAIL] vllm.fork.sha must be a full commit sha, got '${sha}'" >&2
     exit 2
   fi
-  local src="/tmp/atomesh-vllm-fork" base_pkg
+  local src="/tmp/atomesh-vllm-fork" base_pkg patch_file
   base_pkg="$(python3 -c 'import importlib.util, os; print(os.path.dirname(importlib.util.find_spec("vllm").origin))')"
   echo "[vllm] overlay ${repo}@${sha} on ${base_pkg}"
   rm -rf "${src}" "${VLLM_SITE_DIR}"
@@ -82,6 +82,12 @@ for rel in files:
     shutil.copy2(src, dst)
 print(f"[vllm] overlaid {len(files)} Python files")
 PY
+  for patch_file in vllm-k3-read-source-lease.patch vllm-k3-read-failure.patch; do
+    patch_file="${ATOMESH_SCRIPT_DIR}/patches/${patch_file}"
+    echo "[vllm] applying patch $(sha256sum "${patch_file}")"
+    git -C "${VLLM_SITE_DIR}" apply --check "${patch_file}"
+    git -C "${VLLM_SITE_DIR}" apply "${patch_file}"
+  done
   server_pythonpath="$(join_path "${VLLM_SITE_DIR}" "${server_pythonpath}")"
   env PYTHONPATH="${server_pythonpath}" python3 - "${VLLM_SITE_DIR}" <<'PY'
 import sys
