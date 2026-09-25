@@ -27,7 +27,7 @@
   "random_range_ratio": "0.8",
   "request_rate": "inf",
   "num_prompts_multiplier": 10,
-  "wait_server_timeout": 1200,
+  "wait_server_timeout": 2400,
   "wait_router_timeout": 600,
   "benchmark": {
     "random_range_ratio": 0.8,
@@ -62,7 +62,7 @@
     "slurm_submit_runner": "atomesh-cicd",
     "gpus_per_node": 8,
     "cpus_per_task": 114,
-    "time_limit": "00:45:00",
+    "time_limit": "01:00:00",
     "log_root": "/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG",
     "slurm_qos": "amd-atom-qos",
     "spur_controller_addr": "http://pit2-vm-amd-large-02:6817,http://pit2-vm-amd-large-03:6817,http://pit2-vm-amd-large-04:6817"

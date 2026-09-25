@@ -6,7 +6,7 @@ permissions:
 jobs:
   prefill-probe:
     runs-on: atomesh-cicd
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v6
       - name: Run prefill lease probe (expected fatal expiry)
