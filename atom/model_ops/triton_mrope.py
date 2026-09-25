@@ -16,7 +16,7 @@ import triton.language as tl
 from torch import nn
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["pos_stride_row"])
 def _mrope_qk_kernel(
     q_ptr,
     k_ptr,
@@ -29,7 +29,7 @@ def _mrope_qk_kernel(
     k_stride_t: tl.constexpr,
     q_out_stride_t: tl.constexpr,
     k_out_stride_t: tl.constexpr,
-    pos_stride_row: tl.constexpr,
+    pos_stride_row,
     cos_stride_pos: tl.constexpr,
     sin_stride_pos: tl.constexpr,
     num_q_heads: tl.constexpr,
@@ -102,7 +102,7 @@ def _mrope_qk_kernel(
     tl.store(k_out_ptr + k_base_out + d, out, mask=mask & ~is_q)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["pos_stride_row", "num_tokens"])
 def _mrope_qk_tiled_kernel(
     q_ptr,
     k_ptr,
@@ -115,7 +115,7 @@ def _mrope_qk_tiled_kernel(
     k_stride_t: tl.constexpr,
     q_out_stride_t: tl.constexpr,
     k_out_stride_t: tl.constexpr,
-    pos_stride_row: tl.constexpr,
+    pos_stride_row,
     cos_stride_pos: tl.constexpr,
     sin_stride_pos: tl.constexpr,
     num_tokens,

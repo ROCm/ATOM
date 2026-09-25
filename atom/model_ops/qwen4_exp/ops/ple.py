@@ -373,6 +373,7 @@ def ple_gate(
     return out
 
 
+# Keep Triton's bounded singleton/alignment variants for the request search.
 @triton.jit
 def _conv(
     X,
@@ -392,7 +393,7 @@ def _conv(
     IS: tl.constexpr,
     OS: tl.constexpr,
     SPEC: tl.constexpr,
-    R: tl.constexpr,
+    R,
     B: tl.constexpr,
 ):
     token = tl.program_id(0)

@@ -114,10 +114,8 @@ def write_packed_window(values, scales, pool, step, window, dim):
         )
 
 
-@triton.jit
-def _gather_prefix(
-    pool, addresses, ptr, out, first, end, CAPACITY: tl.constexpr, D: tl.constexpr
-):
+@triton.jit(do_not_specialize=["first", "end", "CAPACITY"])
+def _gather_prefix(pool, addresses, ptr, out, first, end, CAPACITY, D: tl.constexpr):
     i = tl.program_id(0) * 16 + tl.arange(0, 16)
     start = tl.load(ptr + first)
     count = tl.load(ptr + end) - start
