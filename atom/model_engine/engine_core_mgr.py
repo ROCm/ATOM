@@ -196,6 +196,7 @@ class CoreManager:
         # is only safe to admit if it fits wherever the router sends it.
         self.max_pool_tokens: int | None = None
         self.engine_core_processes = []
+        self._distributed_stores = []
         self.input_sockets = []
         self.output_sockets = []
         self.engine_core_identities = []
@@ -263,6 +264,35 @@ class CoreManager:
         # from EngineCore's own periodic push. Read directly by the exporter, so
         # scraping costs no round trip and cannot time out.
         self.latest_metrics: dict[int, dict] = {}
+
+    def _start_distributed_store(
+        self, config: Config, *, multinode: bool = False
+    ) -> None:
+        """Bind the actual rendezvous server before publishing its port to workers."""
+        from torch.distributed import TCPStore
+
+        pc = config.parallel_config
+        if multinode and pc.data_parallel_base_port == 0:
+            raise ValueError(
+                "Multi-node DP requires the same nonzero --data-parallel-base-port "
+                "(or ATOM_DP_BASE_PORT) on every node."
+            )
+        if not multinode or pc.data_parallel_rank == 0:
+            store = TCPStore(
+                pc.data_parallel_master_ip,
+                pc.data_parallel_base_port,
+                is_master=True,
+                wait_for_workers=False,
+            )
+            self._distributed_stores.append(store)
+            pc.data_parallel_base_port = store.port
+            logger.info(
+                "%s: model-runner TCPStore listening on %s:%d",
+                self.label,
+                pc.data_parallel_master_ip,
+                store.port,
+            )
+        pc._managed_distributed_store = True
 
     def __init__(self, config: Config):
         pp_size = config.pipeline_parallel_size
@@ -344,6 +374,7 @@ class CoreManager:
         local_dp_ranks = []
 
         try:
+            self._start_distributed_store(config, multinode=multinode)
             for engine_index in range(self.local_engine_count):
                 assignment_index = engine_index // self.pp_size
                 dp_rank, local_dp_rank = rank_assignments[assignment_index]
@@ -803,6 +834,8 @@ class CoreManager:
                 except (ValueError, OSError):
                     pass
 
+        # Release the rendezvous server after stopping the local engine processes.
+        self._distributed_stores.clear()
         logger.info(f"{self.label}: All EngineCores shut down")
 
     def _send_request(self, dp_rank: int, payload: bytes) -> None:
@@ -1517,8 +1550,6 @@ class DisaggCoreManager(CoreManager):
             self._cu_shm = None
 
         # Build per-process configs.
-        from atom.utils import get_open_port as _get_open_port
-
         prefill_config = copy.deepcopy(config)
         if config.disagg_prefill_max_num_seqs is not None:
             prefill_config.max_num_seqs = config.disagg_prefill_max_num_seqs
@@ -1529,10 +1560,8 @@ class DisaggCoreManager(CoreManager):
         prefill_config.disagg_weight_ack_addr = weight_ack_addr
         prefill_config.disagg_kvcache_ipc_addr = kvcache_ipc_addr
         prefill_config.disagg_cu_shm_name = cu_shm_name
-        # Give prefill a distinct distributed rendezvous port so it doesn't
-        # collide with decode's data_parallel_base_port (both deep-copy the
-        # same port from config).
-        prefill_config.parallel_config.data_parallel_base_port = _get_open_port()
+        # Prefill gets its own server; decode honors the configured port.
+        prefill_config.parallel_config.data_parallel_base_port = 0
 
         decode_config = copy.deepcopy(config)
         decode_config.disagg_d2p_addr = d2p_addr
@@ -1613,6 +1642,8 @@ class DisaggCoreManager(CoreManager):
             logger.info(f"{self.label}: {name} process started and connected")
 
         try:
+            self._start_distributed_store(decode_config)
+            self._start_distributed_store(prefill_config)
             # Start both processes simultaneously.  Prefill binds the bootstrap
             # PUSH socket and blocks on send() until decode connects and calls
             # recv() — they rendezvous naturally without any sequential ordering.

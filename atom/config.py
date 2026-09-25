@@ -26,7 +26,7 @@ from atom.quant_spec import (
     LayerQuantConfig,
     get_quant_parser,
 )
-from atom.utils import envs, get_open_port
+from atom.utils import envs
 from atom.utils.distributed.utils import stateless_init_torch_distributed_process_group
 
 if TYPE_CHECKING:
@@ -1018,7 +1018,10 @@ class ParallelConfig:
     data_parallel_master_port: int = 29500
     """Port of the data parallel master."""
 
-    data_parallel_base_port: int = get_open_port()
+    data_parallel_base_port: int = 0
+    """Model-runner rendezvous port. Zero requests an OS-assigned port locally."""
+    _managed_distributed_store: bool = field(default=False, init=False, repr=False)
+    """CoreManager owns the store; every model runner connects as a client."""
 
     data_parallel_master_ip: str = "127.0.0.1"
 

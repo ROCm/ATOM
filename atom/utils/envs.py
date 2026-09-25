@@ -46,6 +46,9 @@ def _positive_float_env(name: str, default: str) -> float:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Forward metadata transport: direct or packed. Both keep source checks.
+    # Single-member groups and strided bindings retain direct copies.
+    "ATOM_H2D_BACKEND": lambda: os.getenv("ATOM_H2D_BACKEND", "direct"),
     # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
     "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.

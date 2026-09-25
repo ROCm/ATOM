@@ -7,6 +7,8 @@ import numpy as np
 import pytest
 import torch
 
+from tests.attentions.deepseek_v41.helpers import PagedRequest, begin_step
+
 pytest.importorskip("aiter", reason="the paged cache and V4 kernels reach AITER")
 
 from atom.model_engine.page_unit_checkpoint import (
@@ -18,7 +20,6 @@ from atom.model_ops.attentions.deepseek_v41.cache import (
     PagedAttentionCache,
 )
 from atom.model_ops.attentions.deepseek_v41.checkpoints import StateCopies
-from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
 from atom.models.deepseek_v41.config import AttentionMode, LayerAttentionSpec
 from tests.attentions.deepseek_v41.helpers import geometry
 
@@ -71,11 +72,11 @@ def test_checkpoint_fork_rollback_relocation_and_slot_reuse(
     copies.relocate([(1, 0), (0, 1)])
     torch.testing.assert_close(copies.entry(0), original, rtol=0, atol=0)
     torch.testing.assert_close(copies.entry(1), old_zero, rtol=0, atol=0)
-    span = RequestSpan(27, 3, 0, 1, 0, (32, 33))
-    step = cache.begin_step([span])
+    span = PagedRequest(27, 3, 0, 1, 0, (32, 33))
+    step = begin_step(cache, [span])
     np.testing.assert_array_equal(cache.prepare_state(step), [[19, -1, 27]])
     # Recycled slot begins at zero and drops every old state field.
-    fresh = cache.begin_step([replace(span, request_id=28, position=0)])
+    fresh = begin_step(cache, [replace(span, request_id=28, position=0)])
     np.testing.assert_array_equal(cache.prepare_state(fresh), [[-1, -1, -1]])
     assert cache.state.view("window")[:, 0].count_nonzero() == 0
     assert cache.state.view("compress_kv")[:, 0].count_nonzero() == 0
@@ -121,10 +122,10 @@ def test_a_rows_prefix_slice_is_exactly_as_long_as_what_gets_written(ratio, topk
     # where the writer's per-row count and the scan's can disagree, and the
     # long one is what keeps `topk` from being the only bound in play.
     spans = (
-        RequestSpan(1, 3, 0, 1, 0, (0, 1, 2)),
-        RequestSpan(2, 200, 1, 1, 1, tuple(range(3, 16))),
+        PagedRequest(1, 3, 0, 1, 0, (0, 1, 2)),
+        PagedRequest(2, 200, 1, 1, 1, tuple(range(3, 16))),
     )
-    step = cache.begin_step(spans, running_bs=2, running_tokens=2, max_q_len=1)
+    step = begin_step(cache, spans, running_bs=2, running_tokens=2, max_q_len=1)
     assert step.decode
     visible = (step.positions + 1) // ratio
     # The selection the scorers emit: ascending ids, `-1` past `min(visible,
@@ -164,10 +165,10 @@ def test_one_grouped_build_writes_what_the_per_layer_builds_would(ratio):
     )
     cache = PagedAttentionCache(geo, 32, 4, "cuda")
     spans = (
-        RequestSpan(1, 3, 0, 1, 0, (0, 1, 2)),
-        RequestSpan(2, 200, 1, 1, 1, tuple(range(3, 16))),
+        PagedRequest(1, 3, 0, 1, 0, (0, 1, 2)),
+        PagedRequest(2, 200, 1, 1, 1, tuple(range(3, 16))),
     )
-    step = cache.begin_step(spans, running_bs=2, running_tokens=2, max_q_len=1)
+    step = begin_step(cache, spans, running_bs=2, running_tokens=2, max_q_len=1)
     assert step.decode
     selection = torch.where(
         torch.arange(8, device="cuda") < ((step.positions + 1) // ratio)[:, None],
@@ -217,7 +218,7 @@ def test_graph_plan_sentinel_rows_do_not_write_to_live_pages():
     geo = V41PoolGeometry(2, ((0, 2), (1, 2)), 32, 4, 512, 32, speculative_tokens=1)
     cache = PagedAttentionCache(geo, 6, 2, "cpu")
     running_bs, max_q_len = 2, 2
-    spans = (RequestSpan(1, 4, 0, 2, 0, (3, 5)),)
+    spans = (PagedRequest(1, 4, 0, 2, 0, (3, 5)),)
     plans = make_compress_plans(
         np.asarray([2], dtype=np.int32),
         np.asarray([6], dtype=np.int32),
@@ -232,8 +233,12 @@ def test_graph_plan_sentinel_rows_do_not_write_to_live_pages():
         max_q_len=max_q_len,
         extra_write=1,
     )
-    step = cache.begin_step(
-        spans, running_bs=running_bs, running_tokens=running_bs * max_q_len, plans=plans
+    step = begin_step(
+        cache,
+        spans,
+        running_bs=running_bs,
+        running_tokens=running_bs * max_q_len,
+        plans=plans,
     )
     plan = step.plans[2]
     # The capacity, which is what the kernel's grid and every row derived from
@@ -332,17 +337,17 @@ def test_a_deferred_prepare_state_names_the_stale_slot_one_step_later(
     cache = PagedAttentionCache(geo, 8, 4, device)
     cache.cursor[0] = torch.tensor([3, 19, -1, 27], device=device)
 
-    good = RequestSpan(27, 3, 0, 1, 0, (0, 1))
-    step = cache.begin_step([good])
+    good = PagedRequest(27, 3, 0, 1, 0, (0, 1))
+    step = begin_step(cache, [good])
     assert cache.prepare_state(step, histories=False) is None
 
     # Same slot, but the scheduler believes it is four tokens further on than
     # the cursor says. Deferred, so this call is the one that ships the rows.
-    stale = RequestSpan(28, 7, 0, 1, 0, (0, 1))
-    later = cache.begin_step([stale])
+    stale = PagedRequest(28, 7, 0, 1, 0, (0, 1))
+    later = begin_step(cache, [stale])
     assert cache.prepare_state(later, histories=False) is None
     with pytest.raises(ValueError, match="Request 28 needs state at 7"):
-        cache.prepare_state(cache.begin_step([good]), histories=False)
+        cache.prepare_state(begin_step(cache, [good]), histories=False)
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -353,11 +358,11 @@ def test_a_deferred_probe_skips_the_slot_its_own_step_resets(small_config, devic
     geo = replace(geometry(small_config), window_size=32)
     cache = PagedAttentionCache(geo, 8, 4, device)
     cache.cursor[0] = torch.tensor([91, 19, -1, 27], device=device)
-    fresh = RequestSpan(31, 0, 0, 1, 0, (0, 1))
-    cache.prepare_state(cache.begin_step([fresh]), histories=False)
+    fresh = PagedRequest(31, 0, 0, 1, 0, (0, 1))
+    cache.prepare_state(begin_step(cache, [fresh]), histories=False)
     assert cache.cursor[0, 0] == 0
     # The probe carries slot 0's pre-reset row; position 0 is what excludes it.
-    cache.prepare_state(cache.begin_step([replace(fresh, request_id=32)]))
+    cache.prepare_state(begin_step(cache, [replace(fresh, request_id=32)]))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")

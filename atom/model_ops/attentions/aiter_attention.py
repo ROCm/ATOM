@@ -19,6 +19,7 @@ from atom.utils.block_convert import (
     block_table_convert_triton,
     kv_indices_generate_triton,
 )
+from atom.utils.block_tables import block_table_state
 from atom.utils.forward_context import AttentionMetaData, Context, get_forward_context
 from atom.utils.tbo import TokenSplitPrefillState
 
@@ -324,13 +325,26 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 dtype=reduce_partial_map_type,
                 device=self.device,
             ),
-            "kv_indptr": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
+            "kv_indptr": CpuGpuBuffer(
+                self.max_bs + 1, publication_group="mha_csr", **i32_kwargs
+            ),
             "kv_indices": CpuGpuBuffer(
                 self.max_bs * self.max_num_blocks_per_seq,
                 **i32_kwargs,
             ),
         }
         self.model_runner.forward_vars.update(pa_persistent_metadata)
+        # Ready together before the CSR kernel, sharing prefill destinations
+        # without changing their addresses or padded publication counts.
+        self.h2d_group_members = {
+            "mha_decode": (
+                "slot_mapping",
+                "context_lens",
+                "block_tables",
+                "kv_indptr",
+                "positions",
+            ),
+        }
         # Per-ubatch buffers for CUDAGraph TBO
         if model_runner.config.enable_tbo:
             self._allocate_ubatch_buffers(
@@ -375,20 +389,22 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         for ub_idx in range(self._NUM_TBO_UBATCHES):
             p = f"ub{ub_idx}_"
-            var[f"{p}kv_indptr"] = CpuGpuBuffer(ub_max_bs + 1, **i32_kwargs)
+            host_i32 = dict(i32_kwargs, publication_group=f"{p}mha_metadata")
+            host_i64 = dict(i64_kwargs, publication_group=f"{p}mha_metadata")
+            var[f"{p}kv_indptr"] = CpuGpuBuffer(ub_max_bs + 1, **host_i32)
             var[f"{p}kv_indices"] = CpuGpuBuffer(
                 self.max_bs * self.max_num_blocks_per_seq,
                 **i32_kwargs,
             )
-            var[f"{p}context_lens"] = CpuGpuBuffer(ub_max_bs, **i32_kwargs)
+            var[f"{p}context_lens"] = CpuGpuBuffer(ub_max_bs, **host_i32)
             var[f"{p}slot_mapping"] = CpuGpuBuffer(
                 ub_max_bs * max_seqlen_qo,
-                **i64_kwargs,
+                **host_i64,
             )
             var[f"{p}block_tables"] = CpuGpuBuffer(
-                ub_max_bs, self.block_table_cols, **i32_kwargs
+                ub_max_bs, self.block_table_cols, **host_i32
             )
-            var[f"{p}cu_seqlens_q"] = CpuGpuBuffer(ub_max_bs + 1, **i32_kwargs)
+            var[f"{p}cu_seqlens_q"] = CpuGpuBuffer(ub_max_bs + 1, **host_i32)
             var[f"{p}cu_seqlens_q"].cpu.copy_(
                 torch.arange(
                     0,
@@ -968,9 +984,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
         if self._has_sparse_attention and not attn_metadata.has_cached:
             bs = batch.total_seqs_num_prefill
-            attn_metadata.block_tables = self.model_runner.forward_vars[
-                "block_tables"
-            ].copy_to_gpu(bs)
+            attn_metadata.block_tables = block_table_state(
+                self.model_runner.forward_vars["block_tables"]
+            ).publish(bs)
         # `prefill_attention_triton` reads the paged KV cache, so it needs a
         # block_table even with no cached tokens. The base builder marshals one
         # every step but only uploads it when `has_cached`.
@@ -980,9 +996,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             and batch.block_tables
         ):
             bs = batch.total_seqs_num_prefill
-            attn_metadata.block_tables = self.model_runner.forward_vars[
-                "block_tables"
-            ].copy_to_gpu(bs)
+            attn_metadata.block_tables = block_table_state(
+                self.model_runner.forward_vars["block_tables"]
+            ).publish(bs)
         if self._has_sparse_attention:
             from atom.model_ops.minimax_m3.sparse_attn import (
                 make_sparse_prefill_metadata,
@@ -1163,6 +1179,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         running_tokens: int,
         max_seqlen_q: int,
     ):
+        self._check_metadata_writable("mha_csr", "prefill", "positions", "mrope")
         scheduled_bs = batch.total_seqs_num_decode
         self.total_blocks = 0
         dropout_p = 0.0
@@ -1179,7 +1196,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         max_seqlen_k = np.max(context_lens)
 
         # Before the slots, not after: `slot_mapping` reads this packed table.
-        self.prepare_block_tables(batch)
+        self.prepare_block_tables(batch, running_bs)
 
         var = self.model_runner.forward_vars
         scheduled_tokens = batch.total_tokens_num_decode
@@ -1224,7 +1241,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ("kv_indptr", running_bs + 1),
         ]
 
-        ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
+        group = self.model_runner.h2d_groups["mha_decode"]
+        for name, count in vars_used:
+            group.counts[group.indices[name]] = count
+        group.counts[group.indices["positions"]] = (
+            None if self.model_runner.use_mrope else scheduled_tokens
+        )
+        block_table_state(var["block_tables"]).publish(running_bs, group=group)
+        ctx = {el: var[el].gpu[:num] for el, num in vars_used}
         # A view: `publish_cu_seqlens_q` already uploaded it this step, and
         # nothing here writes the host copy.
         ctx["cu_seqlens_q"] = var["cu_seqlens_q"].gpu[: running_bs + 1]
@@ -1274,12 +1298,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
             )
         mrope_positions = self._build_mrope_decode_positions(
-            batch, context_lens, max_seqlen_q
+            batch, context_lens, max_seqlen_q, running_tokens=running_tokens
         )
         if mrope_positions is not None:
             positions = mrope_positions
         else:
-            positions = var["positions"].copy_to_gpu(scheduled_tokens)
+            positions = var["positions"].gpu[:scheduled_tokens]
         if self.model_runner.config.enable_tbo_decode and running_bs >= 2:
             self._prepare_ubatch_decode(
                 scheduled_bs,
@@ -1302,6 +1326,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         Splits the full-batch data into per-ubatch CpuGpuBuffers.
         The split point is bs // 2 to match CUDAGraph's baked-in token slices.
         """
+        self._check_metadata_writable("ub0_mha_metadata", "ub1_mha_metadata")
         var = self.model_runner.forward_vars
         N = self._NUM_TBO_UBATCHES
         half = bs // N
@@ -1328,10 +1353,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ]
             var[f"{p}slot_mapping"].np[ub_real_tokens:ub_running_tokens] = -1
 
-            var[f"{p}block_tables"].np[:ub_real_reqs] = var["block_tables"].np[
-                req_start : req_start + ub_real_reqs
-            ]
-            var[f"{p}block_tables"].np[ub_real_reqs:running_bs] = 0
+            block_table_state(var["block_tables"]).slice_to(
+                var[f"{p}block_tables"], req_start, ub_real_reqs, pad_to=running_bs
+            )
 
             full_kv_indptr = var["kv_indptr"].np
             base = full_kv_indptr[req_start]
@@ -1361,8 +1385,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 (f"{p}kv_indptr", running_bs + 1),
                 (f"{p}cu_seqlens_q", running_bs + 1),
             ]
-            for el, num in vars_used:
-                var[el].copy_to_gpu(num)
+            group = self.model_runner.h2d_groups[f"{p}mha_metadata"]
+            for name, count in vars_used:
+                group.counts[group.indices[name]] = count
+            block_table_state(var[f"{p}block_tables"]).publish(running_bs, group=group)
 
             ub_max_seqlen_k = (
                 int(context_lens[req_start : req_start + ub_real_reqs].max())

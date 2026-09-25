@@ -6,14 +6,17 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.attentions.deepseek_v41.helpers import (
+    PagedRequest,
+    begin_step,
+    publish_tables,
+)
+
 pytest.importorskip("aiter", reason="the V4.1 backend and cache reach AITER")
 
 from atom.model_ops.attentions.deepseek_v41.backend import DeepseekV41MetadataBuilder
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
-from atom.model_ops.attentions.deepseek_v41.metadata import (
-    RequestSpan,
-    visible_buffer_name,
-)
+from atom.model_ops.attentions.deepseek_v41.metadata import visible_buffer_name
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 from atom.utils import CpuGpuBuffer
 from tests.attentions.deepseek_v41.helpers import metadata_buffers
@@ -27,7 +30,8 @@ def staged_step(cache, requests, *, buffers, running_bs, running_tokens):
         len(requests),
         running_bs,
     )
-    return cache.begin_step(
+    return begin_step(
+        cache,
         requests,
         buffers=buffers,
         running_bs=running_bs,
@@ -44,12 +48,12 @@ def test_staged_metadata_refreshes_reordered_ragged_and_empty_batches(device):
     cache = PagedAttentionCache(geo, 8, 4, device)
     buffers = metadata_buffers(4, 8, 4, device, geo)
     pointers = {name: value.gpu.data_ptr() for name, value in buffers.items()}
-    first = RequestSpan(17, 1, 0, 3, 3, (5, 1))
-    second = RequestSpan(24, 4, 3, 1, 1, (2, 7))
+    first = PagedRequest(17, 1, 0, 3, 3, (5, 1))
+    second = PagedRequest(24, 4, 3, 1, 1, (2, 7))
     for requests in (
         (first, second),
-        (RequestSpan(24, 5, 0, 2, 1, (2, 7)), RequestSpan(17, 4, 2, 1, 3, (5, 1))),
-        (RequestSpan(9, 0, 0, 1, 0, (6,)),),
+        (PagedRequest(24, 5, 0, 2, 1, (2, 7)), PagedRequest(17, 4, 2, 1, 3, (5, 1))),
+        (PagedRequest(9, 0, 0, 1, 0, (6,)),),
         (),
     ):
         step = staged_step(
@@ -111,7 +115,7 @@ def test_engram_rows_are_staged_for_the_width_not_for_the_tokens(engram):
     buffers = metadata_buffers(4, 8, 4, "cpu", geo)
     step = staged_step(
         cache,
-        (RequestSpan(17, 1, 0, 3, 3, (5, 1)),),
+        (PagedRequest(17, 1, 0, 3, 3, (5, 1)),),
         buffers=buffers,
         running_bs=2,
         running_tokens=6,
@@ -154,6 +158,8 @@ def test_engram_rows_are_staged_for_the_width_not_for_the_tokens(engram):
             # A synthetic batch hashes on the host: the cursor the device path
             # would read belongs to whoever owns these slots, not to this one.
             "batch": None,
+            "cursor_positions": None,
+            "cursor_out": None,
         }
 
 
@@ -162,7 +168,7 @@ def test_v4_window_write_graph_reads_updated_requests_without_recapture():
     geo = V41PoolGeometry(1, ((0, 2),), 32, 4, 512, 32)
     cache = PagedAttentionCache(geo, 8, 4, "cuda")
     buffers = metadata_buffers(2, 2, 2, "cuda", geo)
-    first = (RequestSpan(17, 0, 0, 1, 1, (0, 1)), RequestSpan(24, 2, 1, 1, 3, (2, 3)))
+    first = (PagedRequest(17, 0, 0, 1, 1, (0, 1)), PagedRequest(24, 2, 1, 1, 3, (2, 3)))
     step = staged_step(cache, first, buffers=buffers, running_bs=2, running_tokens=2)
     values = torch.randn(1, 2, 512, device="cuda", dtype=torch.bfloat16)
     stream = torch.cuda.Stream()
@@ -175,8 +181,8 @@ def test_v4_window_write_graph_reads_updated_requests_without_recapture():
     torch.cuda.current_stream().wait_stream(stream)
     window = cache.state.view("window")[0]
     for spans in (
-        (RequestSpan(24, 3, 0, 1, 3, (2, 3)), RequestSpan(17, 1, 1, 1, 1, (0, 1))),
-        (RequestSpan(17, 4, 0, 1, 0, (4, 5)), RequestSpan(24, 6, 1, 1, 2, (6, 7))),
+        (PagedRequest(24, 3, 0, 1, 3, (2, 3)), PagedRequest(17, 1, 1, 1, 1, (0, 1))),
+        (PagedRequest(17, 4, 0, 1, 0, (4, 5)), PagedRequest(24, 6, 1, 1, 2, (6, 7))),
     ):
         staged_step(cache, spans, buffers=buffers, running_bs=2, running_tokens=2)
         window.zero_()
@@ -242,8 +248,8 @@ def test_visible_rows_are_the_bound_every_indexer_layer_reads(ratio, positions_d
     buffers = metadata_buffers(4, 8, 4, "cpu", geo)
     buffers["positions"] = CpuGpuBuffer(8, dtype=positions_dtype, device="cpu")
     requests = (
-        RequestSpan(17, 1, 0, 3, 3, (5, 1)),
-        RequestSpan(24, 9, 3, 1, 1, (2, 7)),
+        PagedRequest(17, 1, 0, 3, 3, (5, 1)),
+        PagedRequest(24, 9, 3, 1, 1, (2, 7)),
     )
     step = staged_step(cache, requests, buffers=buffers, running_bs=4, running_tokens=8)
     # Armed: ragged, and padded past the batch, so the two layouts really do
@@ -267,8 +273,6 @@ def test_block_table_upload_only_when_mapping_changes(device, monkeypatch):
         pytest.skip("ROCm GPU required")
     from dataclasses import replace
 
-    from atom.model_ops.attentions.deepseek_v41.metadata import _publish_block_tables
-
     tables = CpuGpuBuffer(
         4, 8, dtype=torch.int32, device=device, pin_memory=device != "cpu"
     )
@@ -280,8 +284,8 @@ def test_block_table_upload_only_when_mapping_changes(device, monkeypatch):
         return original_copy(n)
 
     monkeypatch.setattr(tables, "copy_to_gpu", counted_copy)
-    a = RequestSpan(1, 12, 0, 1, 0, (3, 5))
-    b = RequestSpan(2, 22, 1, 1, 1, (2, 6))
+    a = PagedRequest(1, 12, 0, 1, 0, (3, 5))
+    b = PagedRequest(2, 22, 1, 1, 1, (2, 6))
     cases = [
         ((a, b), 4, True),
         ((replace(a, position=13), replace(b, position=23)), 4, False),
@@ -295,7 +299,7 @@ def test_block_table_upload_only_when_mapping_changes(device, monkeypatch):
     ]
     for requests, running_bs, changed in cases:
         before = len(uploads)
-        result = _publish_block_tables(tables, requests, running_bs)
+        result = publish_tables(tables, requests, running_bs)
         assert len(uploads) - before == int(changed)
         expected = [list(s.block_ids) + [0] * (8 - len(s.block_ids)) for s in requests]
         expected += [[0] * 8 for _ in range(running_bs - len(requests))]
@@ -303,6 +307,6 @@ def test_block_table_upload_only_when_mapping_changes(device, monkeypatch):
         assert result.data_ptr() == tables.gpu.data_ptr()
     # Replacing the device allocation invalidates reuse even for identical rows.
     tables.gpu = torch.full_like(tables.gpu, -1)
-    _publish_block_tables(tables, (a, b), 4)
+    publish_tables(tables, (a, b), 4)
     assert len(uploads) == sum(c[2] for c in cases) + 1
     assert tables.gpu[0, :2].tolist() == [3, 5]

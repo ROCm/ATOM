@@ -61,8 +61,10 @@ class BlockTable(array.array):
     method lookup and nothing else.
 
     A version is a global draw rather than a per-table counter so that a fresh
-    table for a recycled request id can never look like a known one: no two
-    live tables ever carry the same version.
+    table for a recycled request id can never look like a known one:
+    independent tables never share a version. The RPC decoder may retain
+    a version when it copies a row to append: those immutable snapshots share
+    one prefix lineage, and equal lengths still identify identical contents.
     """
 
     __slots__ = ("version",)
