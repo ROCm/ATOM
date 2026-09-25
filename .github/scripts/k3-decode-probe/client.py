@@ -1,4 +1,4 @@
-"""Exercise full-model P prefill and same-instance LMCache prefix reloads."""
+"""Exercise full-model D generation with locally computed prompt KV."""
 
 import argparse
 import asyncio

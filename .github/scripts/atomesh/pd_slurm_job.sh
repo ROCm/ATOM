@@ -24,7 +24,8 @@ mkdir -p "${RUN_DIR}"
 chmod 0777 "${RUN_DIR}" 2>/dev/null || true
 
 EXECUTION_PHASES=(combined)
-if [[ "${BENCHMARK_KIND:-random}" == "aiperf_agentic" \
+if [[ "${TOPOLOGY:-}" != "0p1d" \
+  && "${BENCHMARK_KIND:-random}" == "aiperf_agentic" \
   && ( "${EVAL_TASK:-gsm8k}" == "swebench_lite" \
     || "${EVAL_TASK:-gsm8k}" == "gsm8k" ) \
   && ( "${RUN_EVAL:-false}" == "true" || "${RUN_EVAL:-false}" == "1" ) ]]; then

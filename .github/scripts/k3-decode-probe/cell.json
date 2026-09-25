@@ -1,14 +1,14 @@
 {
-  "id": "k3-prefill-dspark-lmcache-probe",
+  "id": "k3-decode-dspark-probe",
   "suite": "vllm",
-  "name": "k3-prefill-dspark-lmcache-probe",
+  "name": "k3-decode-dspark-probe",
   "model": "Kimi-K3-MXFP4-vLLM-DSpark",
   "backend": "vllm",
   "image": "vllm/vllm-openai-rocm:nightly@sha256:659b28319fef4ea0e3d8f33e25b4c35d6f663f5d818a5b2fa06dceaf859234e4",
   "model_path": "/share_nfs/models/moonshotai/Kimi-K3",
   "precision": "MXFP4",
-  "topology": "1p0d",
-  "display_topology": "P-only TP8/DCP8 diagnostic",
+  "topology": "0p1d",
+  "display_topology": "D-only TP8/DCP8 generation and GSM8K diagnostic",
   "pd_worker_layout": "multi_node",
   "nodes": [
     "pit2-p03-g13",
@@ -62,7 +62,7 @@
     "slurm_submit_runner": "atomesh-cicd",
     "gpus_per_node": 8,
     "cpus_per_task": 114,
-    "time_limit": "00:40:00",
+    "time_limit": "01:00:00",
     "log_root": "/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG",
     "slurm_qos": "amd-atom-qos",
     "spur_controller_addr": "http://pit2-vm-amd-large-02:6817,http://pit2-vm-amd-large-03:6817,http://pit2-vm-amd-large-04:6817"
@@ -71,14 +71,14 @@
     "prefill": {
       "port": 2584,
       "tp": 8,
-      "workers": 1,
+      "workers": 0,
       "dcp": 8,
       "extra_args": "--compilation-config '{\"mode\":3,\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"max_cudagraph_capture_size\":512,\"custom_ops\":[\"+fused_rms_norm_gated\"],\"cudagraph_capture_sizes\":[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256,272,288,304,320,336,352,368,384,400,416,432,448,464,480,496,512]}'"
     },
     "decode": {
       "port": 2584,
       "tp": 8,
-      "workers": 0,
+      "workers": 1,
       "dcp": 8,
       "extra_args": "--compilation-config '{\"mode\":3,\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"max_cudagraph_capture_size\":512,\"custom_ops\":[\"+fused_rms_norm_gated\"],\"cudagraph_capture_sizes\":[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256,272,288,304,320,336,352,368,384,400,416,432,448,464,480,496,512]}'"
     },
@@ -242,7 +242,7 @@
       "VLLM_ROCM_AITER_NATIVE_DCP_VERIFY": "1"
     }
   },
-  "run_eval": false,
+  "run_eval": true,
   "accuracy": {
     "task": "gsm8k",
     "fewshot": 5,
