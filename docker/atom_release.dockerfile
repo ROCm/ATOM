@@ -442,6 +442,7 @@ FROM ${LMCACHE_WHEEL_IMAGE} AS lmcache_wheel
 FROM base AS atom_image
 ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
 ARG ATOM_COMMIT="HEAD"
+ARG CARGO_BUILD_JOBS=32
 
 # pip packages (lm-eval is lightweight, install directly)
 RUN pip install lm-eval[api]
@@ -586,7 +587,7 @@ ENV MOONCAKE_DISABLE_HIP_DMABUF=1
 ARG RUST_VERSION="1.94.0"
 
 RUN echo "========== Install Rust toolchain ==========" \
-    && apt-get update && apt-get install -y --no-install-recommends curl build-essential pkg-config libssl-dev \
+    && apt-get update && apt-get install -y --no-install-recommends curl build-essential pkg-config libssl-dev protobuf-compiler libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/* \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | sh -s -- -y --default-toolchain "${RUST_VERSION}" --profile minimal \
@@ -630,7 +631,7 @@ RUN git clone $ATOM_REPO /app/ATOM && \
     cd /app/ATOM && \
     git checkout $ATOM_COMMIT && \
     ulimit -n 65536 && \
-    ATOM_MESH_BUILD=1 python -m pip install -e .
+    CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS ATOM_MESH_BUILD=1 python -m pip install -e .
 RUN pip show atom || true
 
 RUN pip install --no-cache-dir msgpack msgspec quart
