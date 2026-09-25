@@ -28,7 +28,7 @@ if [[ "${BENCHMARK_KIND:-random}" == "aiperf_agentic" \
   && ( "${EVAL_TASK:-gsm8k}" == "swebench_lite" \
     || "${EVAL_TASK:-gsm8k}" == "gsm8k" ) \
   && ( "${RUN_EVAL:-false}" == "true" || "${RUN_EVAL:-false}" == "1" ) ]]; then
-  EXECUTION_PHASES=(benchmark eval)
+  EXECUTION_PHASES=(eval)
 fi
 ATOMESH_RESTART_PORT_OFFSET="${ATOMESH_RESTART_PORT_OFFSET:-1000}"
 if [[ "${#EXECUTION_PHASES[@]}" -gt 1 && ! "${ATOMESH_RESTART_PORT_OFFSET}" =~ ^[1-9][0-9]*$ ]]; then
