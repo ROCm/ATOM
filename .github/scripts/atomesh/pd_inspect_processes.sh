@@ -18,6 +18,7 @@ while IFS= read -r container; do
   # shellcheck disable=SC2016
   timeout --kill-after=5s 90s docker exec "${container}" bash -c '
     id
+    ps -eo pid,ppid,etimes,pcpu,stat,wchan:24,comm
     spy="$(command -v py-spy || true)"
     if [[ -z "${spy}" ]]; then
       target=/tmp/atomesh-inspection-py-spy
