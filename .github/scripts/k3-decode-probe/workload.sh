@@ -27,7 +27,7 @@ PY
 echo 'D-PROBE preparing 48 mixed long prefixes'
 "${client[@]}" --mode prepare --n 48 --lengths 12289,16385,24577,65537,131073,262145
 echo 'D-PROBE fresh local prefill and generation'
-"${client[@]}" --mode generate --concurrency 48 --max-tokens 64 --logprobs 5 --out "${results}/fresh.jsonl"
+"${client[@]}" --mode generate --concurrency 48 --max-tokens 16 --logprobs 5 --out "${results}/fresh.jsonl"
 reset_prefix
 curl --fail --silent --show-error --max-time 10 "http://127.0.0.1:${port}/metrics" > "${results}/final.metrics"
 echo 'D-PROBE completed'
