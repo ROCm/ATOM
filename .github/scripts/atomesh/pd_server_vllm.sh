@@ -226,6 +226,7 @@ start_vllm_server() {
   local prefix="${role^^}"
   local tp_var="${prefix}_TP_SIZE" dcp_var="${prefix}_DCP_SIZE" args_var="${prefix}_SERVER_ARGS"
   apply_role_env "ATOMESH_${prefix}_ENV_" "${host_ip}"
+  python3 "${ATOMESH_SCRIPT_DIR}/../k3-decode-probe/check_aiter_paths.py"
 
   local lmcache_port=""
   local -a server_env=("PYTHONPATH=${server_pythonpath}")
