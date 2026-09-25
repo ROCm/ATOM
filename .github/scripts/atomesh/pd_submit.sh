@@ -402,14 +402,22 @@ stream_spur_shared_logs_once() {
 check_spur_workload_failure() {
   local job_id="$1"
   # A failed worker is conclusive even if Spur still reports RUNNING.
-  python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_job_result.py" check-failed \
+  if python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_job_result.py" check-failed \
     --run-dir "${LOG_ROOT}/slurm_job-${job_id}" --job-id "${job_id}" \
     --run-token "${ATOMESH_RUN_TOKEN}" --num-ranks "${NUM_NODES}" \
-    --scheduler-error-path "${SLURM_JOB_ERROR}"
+    --scheduler-error-path "${SLURM_JOB_ERROR}"; then
+    return 0
+  else
+    SPUR_WORKLOAD_CHECK_RC=$?
+  fi
+  # Collect the terminal job result after stopping the failed workload.
+  scancel_slurm_job "workload failed"
+  SLURM_EXTRA_STATUS_CHECKER=""
 }
 
 # Every Spur worker writes container output to shared storage, regardless of
 # runner label. Stream it from the submitter rather than through Spur RPCs.
+SPUR_WORKLOAD_CHECK_RC=0
 if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
   SLURM_EXTRA_LOG_STREAMER=stream_spur_shared_logs_once
   SLURM_EXTRA_STATUS_CHECKER=check_spur_workload_failure
@@ -525,7 +533,8 @@ if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
     --run-dir "${SLURM_STATUS_DIR}" --job-id "${JOB_ID}" \
     --run-token "${ATOMESH_RUN_TOKEN}" --num-ranks "${NUM_NODES}" \
     --scheduler-state "${SLURM_STATE}" --scheduler-exit-code="${SLURM_EXIT_CODE}" \
-    --scheduler-rc "${SLURM_JOB_RC}" --spur 1
+    --scheduler-rc "${SLURM_JOB_RC}" --spur 1 \
+    --workload-check-rc "${SPUR_WORKLOAD_CHECK_RC}"
   SBATCH_RC=$?
   set -e
 fi
