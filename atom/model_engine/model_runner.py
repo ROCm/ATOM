@@ -639,6 +639,29 @@ class tokenIDProcessor:
         return ret
 
 
+def _profile_runner_stage(method):
+    """Annotate runner stages only while its torch profiler is active."""
+    name = method.__name__
+    label = f"ATOM::{name}"
+
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        if getattr(self, "profiler", None) is None:
+            return method(self, *args, **kwargs)
+        stage_label = label
+        if name == "forward":
+            batch = args[0] if args else kwargs["batch"]
+            stage_label += (
+                f" tokens={batch.total_tokens_num}"
+                f" prefill={batch.total_seqs_num_prefill}"
+                f" decode={batch.total_seqs_num_decode}"
+            )
+        with record_function(stage_label):
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
+
 class ModelRunner:
 
     def __init__(self, rank: int, config: Config):
@@ -1462,6 +1485,7 @@ class ModelRunner:
         self.tokenID_processor.input_ids = self.forward_vars["input_ids"]
         self.tokenID_processor.decode_src = self.forward_vars["decode_src"]
 
+    @_profile_runner_stage
     def _gate_staging_reuse(self):
         """Block until the previous forward's staging H2Ds have executed.
 
@@ -1491,6 +1515,7 @@ class ModelRunner:
         """
         self.h2d_owner.begin()
 
+    @_profile_runner_stage
     def _mark_staging_h2d_enqueued(self):
         """Close the window the gate above waits on.
 
@@ -2602,6 +2627,7 @@ class ModelRunner:
 
         return temperatures, top_ks, top_ps, all_greedy, needs_independent_noise
 
+    @_profile_runner_stage
     def prepare_model(self, batch: ScheduledBatch):
         shrunk_q = self._dspark_apply_q_bucket(batch)
         # The step's shape, settled once. Here rather than in prepare_inputs
@@ -2929,6 +2955,7 @@ class ModelRunner:
             positions[..., scheduled:].zero_()
         return ids, positions
 
+    @_profile_runner_stage
     @record_gpu_forward
     def run_model(
         self,
@@ -3158,6 +3185,7 @@ class ModelRunner:
             commit_pp_send_work(self._pp_pending_send)
         return True
 
+    @_profile_runner_stage
     def postprocess(
         self,
         batch: ScheduledBatch,
@@ -3373,6 +3401,7 @@ class ModelRunner:
         if callable(callback):
             callback(req_ids)
 
+    @_profile_runner_stage
     @torch.inference_mode()
     @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
@@ -4454,6 +4483,7 @@ class RapidServeModelRunner(ModelRunner):
             return True
         return super().allocate_kv_cache(num_kvcache_blocks)
 
+    @_profile_runner_stage
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         # Decode runs the model forward on a dynamically selected (optionally
