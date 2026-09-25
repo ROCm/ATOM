@@ -20,7 +20,10 @@ def _fake_layer_output(hidden, layer_name):
 @torch_compile_guard(mutates_args=["hidden"], gen_fake=lambda hidden: None)
 def v41_begin_forward(hidden: torch.Tensor) -> None:
     """Read live request state on every execution, including graph capture."""
-    metadata = get_forward_context().attn_metadata
+    context = get_forward_context()
+    metadata = context.attn_metadata
+    if metadata.image_mask is not None and context.dp_metadata is not None:
+        raise NotImplementedError("V4.1 DP attention supports text requests only")
     metadata.step.begin_forward()
     if not metadata.step.requests:
         return
@@ -87,6 +90,9 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
     # imports directly and does not route through here.
 
     block_cls = RuntimeBlock
+    # Keep communication on a separate HIP priority queue. The runtime blocks
+    # protect comm-allocated expert outputs at their compute consumer boundary.
+    tbo_comm_stream_priority = -1
 
     def __init__(self, atom_config):
         config = atom_config

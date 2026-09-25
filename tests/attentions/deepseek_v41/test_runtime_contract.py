@@ -98,8 +98,6 @@ def runtime_config(**overrides):
         {"prefill_context_parallel_size": 2},
         {"decode_context_parallel_size": 2},
         {"parallel_config": SimpleNamespace(data_parallel_size=2)},
-        {"enable_dp_attention": True},
-        {"enable_tbo": True},
         {"enable_tbo_decode": True},
         {"kv_transfer_config": {"connector": "moriio"}},
         {"enable_rapidserve": True},
@@ -327,3 +325,72 @@ def test_a_page_that_does_not_hold_whole_index_blocks_is_refused():
     with pytest.raises(ValueError, match="needs whole 16-row blocks"):
         V41PoolGeometry(40, ((2, 2), (20, 1)), 16, 128, 512, 128)
     V41PoolGeometry(40, ((2, 2), (20, 1)), 16, 128, 512, 128, index_block_rows=8)
+
+
+@pytest.mark.parametrize("tp,dp", [(4, 1), (1, 4)])
+@pytest.mark.parametrize("tbo", [False, True])
+@pytest.mark.parametrize("ep", [False, True])
+def test_dpa_admission_before_and_after_engine_normalization(tp, dp, tbo, ep):
+    validate_runtime_config(
+        runtime_config(
+            enable_dp_attention=True,
+            enable_tbo=tbo,
+            enable_expert_parallel=ep,
+            tensor_parallel_size=tp,
+            parallel_config=SimpleNamespace(data_parallel_size=dp),
+        )
+    )
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("dp_size", [1, 2, 4])
+@pytest.mark.parametrize("dpa", [False, True])
+@pytest.mark.parametrize("ep", [False, True])
+def test_prefill_tbo_requires_multi_rank_dpa(tp_size, dp_size, dpa, ep):
+    cfg = runtime_config(
+        enable_tbo=True,
+        tensor_parallel_size=tp_size,
+        enable_dp_attention=dpa,
+        enable_expert_parallel=ep,
+        parallel_config=SimpleNamespace(data_parallel_size=dp_size),
+    )
+    if dpa and tp_size * dp_size > 1:
+        validate_runtime_config(cfg)
+        cfg.enable_tbo_decode = True
+        with pytest.raises(ValueError, match="decode TBO"):
+            validate_runtime_config(cfg)
+    else:
+        with pytest.raises(ValueError, match="prefill TBO"):
+            validate_runtime_config(cfg)
+
+
+@pytest.mark.parametrize("tp,dp", [(4, 1), (2, 1), (1, 4), (2, 2)])
+@pytest.mark.parametrize("ep", [False, True])
+@pytest.mark.parametrize("level", [0, 3])
+def test_real_config_accepts_tbo_before_dpa_rank_expansion(
+    monkeypatch, tp, dp, ep, level
+):
+    from atom import config as config_module
+    from atom.config import CompilationConfig, Config, ParallelConfig
+    from atom.model_engine.engine_core_mgr import iter_dp_rank_assignments
+
+    fixture = Path(__file__).parents[2] / "models/deepseek_v41/fixtures"
+    # The quantization parser resolves AITER enums. Only bypass that GPU
+    # dependency; execute the real Config.__post_init__, HF config load,
+    # V4.1 admission check and engine rank planner on CPU.
+    monkeypatch.setattr(config_module, "QuantizationConfig", lambda *args: None)
+    cfg = Config(
+        model=str(fixture),
+        tensor_parallel_size=tp,
+        parallel_config=ParallelConfig(data_parallel_size=dp),
+        enable_dp_attention=True,
+        enable_expert_parallel=ep,
+        enable_tbo=True,
+        compilation_config=CompilationConfig(level=level),
+        enforce_eager=level == 0,
+        kv_cache_dtype="bf16",
+        index_cache_dtype="fp8",
+    )
+    assert cfg.tensor_parallel_size == tp
+    assert cfg.parallel_config.data_parallel_size == dp
+    assert len(iter_dp_rank_assignments(cfg)) == tp * dp

@@ -74,6 +74,8 @@ class BatchStep:
     # built once per forward and read by every owner that shares that ratio.
     plans: dict[int, object] = field(default_factory=dict)
     tentative: bool = False
+    # A one-token prefill, parent or microbatch, must not select decode kernels.
+    is_prefill: bool = False
     # Where each request starts, on the host. Built for `prefill_positions`
     # anyway, and published so the state lifecycle compares against the same
     # array rather than walking the spans again per forward.
@@ -105,7 +107,10 @@ class BatchStep:
     def decode(self):
         # Verification has ring slack for the entire tentative block. All rows
         # can use the same causal paged-decode kernel as autoregressive decode.
-        return self.tentative or all(request.length == 1 for request in self.requests)
+        return self.tentative or (
+            not self.is_prefill
+            and all(request.length == 1 for request in self.requests)
+        )
 
 
 def visible_buffer_name(ratio):
@@ -139,6 +144,7 @@ def prepare_batch_step(
     device,
     *,
     tentative=False,
+    is_prefill=False,
     buffers=None,
     running_bs=None,
     running_tokens=None,
@@ -247,6 +253,7 @@ def prepare_batch_step(
             else max_q_len
         ),
         tentative=tentative,
+        is_prefill=is_prefill,
         visible={ratio: published[visible_buffer_name(ratio)] for ratio in ratios},
         request_positions=starts,
     )

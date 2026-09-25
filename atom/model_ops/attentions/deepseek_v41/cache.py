@@ -212,6 +212,7 @@ class PagedAttentionCache:
         requests,
         *,
         tentative=False,
+        is_prefill=False,
         buffers=None,
         running_bs=None,
         running_tokens=None,
@@ -252,6 +253,7 @@ class PagedAttentionCache:
             requests,
             self.pool.device,
             tentative=tentative,
+            is_prefill=is_prefill,
             buffers=buffers,
             running_bs=running_bs,
             running_tokens=running_tokens,
@@ -470,8 +472,19 @@ class PagedAttentionCache:
         """
         table = step.tiles.get(ratio)
         if table is None:
+            block_tables = step.block_tables
+            if not step.decode and step.requests:
+                # Expand only pages visible to a nonempty prefill step,
+                # including the cached prefix of a chunk/TBO microbatch. The
+                # persistent table can hold a 1M context even for an 8k prompt.
+                # Decode/verify and empty steps retain the full table width.
+                end = max(request.end for request in step.requests)
+                columns = (
+                    end + self.geometry.block_size - 1
+                ) // self.geometry.block_size
+                block_tables = block_tables[:, :columns]
             table = step.tiles[ratio] = unit_table(
-                step.block_tables,
+                block_tables,
                 step.batch_ids,
                 self.geometry.rows_per_page(ratio) // self.geometry.index_block_rows,
             )

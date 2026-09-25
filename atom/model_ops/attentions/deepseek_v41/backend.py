@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 """ATOM scheduling adapter for the eager CSA2 paged runtime."""
 
+from contextlib import contextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -20,13 +22,15 @@ from atom.model_ops.engram.device.hashing import (
     engram_cursor_rows,
 )
 from atom.model_ops.engram.device.runtime import EngramBatch, EngramInputPreparer
+from atom.model_ops.v4_kernels import make_compress_plans
 from atom.models.deepseek_v41.config import AttentionMode, build_attention_topology
 from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import AttentionMetaData, AttnState, Context
 
 from .cache import PagedAttentionCache
 from .checkpoints import StateCopies
-from .metadata import RequestSpan, visible_buffer_name
+from .indices import fill_step_indptrs
+from .metadata import RequestSpan, prepare_batch_step, visible_buffer_name
 
 
 class DeepseekV41Backend(AttentionBackend):
@@ -240,6 +244,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         self.copies.warmup()
 
     def release_kv_pools(self):
+        for _, _, _, done in getattr(self, "_tbo_storage", {}).values():
+            if done is not None:
+                done.synchronize()
+        self._tbo_storage = {}
         self.cache = self.copies = None
 
     def close(self):
@@ -256,9 +264,14 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         *,
         max_q_len=None,
         tentative=False,
+        is_prefill=False,
         start_positions=None,
     ):
         spans, offset, next_page = [], 0, 0
+        # Once graphs bind the serving pool, an idle DP rank must publish
+        # padding into that pool's metadata. A fresh scratch cache would refill
+        # different indptr addresses while replay still reads the captured ones.
+        idle = batch.is_dummy_run and self.cache is not None
         slots = batch.state_slots_committed
         if not batch.is_dummy_run and len(slots) != batch.total_seqs_num:
             raise ValueError("CSA2 requires a STATE slot for every scheduled request")
@@ -266,7 +279,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             zip(batch.req_ids, batch.num_scheduled_tokens, batch.context_lens)
         ):
             length, end = int(length), int(end)
-            if length == 0:
+            if idle or length == 0:
                 continue
             if batch.is_dummy_run:
                 # Warmup uses private scratch. A dummy rank may never mutate
@@ -286,7 +299,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 RequestSpan(request_id, position, offset, length, slot, blocks)
             )
             offset += length
-        if offset != batch.total_tokens_num or running_tokens < offset:
+        if (not idle and offset != batch.total_tokens_num) or running_tokens < offset:
             raise ValueError("CSA2 batch token spans disagree with the runner")
         cache = (
             PagedAttentionCache(
@@ -296,7 +309,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 self.device,
                 max_tokens=running_tokens,
             )
-            if batch.is_dummy_run
+            if batch.is_dummy_run and not idle
             else self.cache
         )
         if cache is None:
@@ -321,11 +334,13 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             np.asarray([span.end for span in spans], dtype=np.int32),
             running_bs=None if max_q_len is None else running_bs,
             max_q_len=max_q_len,
-            extra_write=self.geometry.speculative_tokens if verifying else 0,
+            # Idle ranks replay the same write grid as verifying peers.
+            extra_write=self.geometry.speculative_tokens if tentative else 0,
         )
         step = cache.begin_step(
             spans,
             tentative=verifying,
+            is_prefill=is_prefill,
             buffers=self.model_runner.forward_vars,
             running_bs=running_bs,
             running_tokens=running_tokens,
@@ -365,7 +380,159 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         return metadata, positions.gpu[:running_tokens]
 
     def prepare_prefill(self, batch, running_bs):
-        return self._prepare(batch, running_bs, batch.total_tokens_num)
+        return self._prepare(batch, running_bs, batch.total_tokens_num, is_prefill=True)
+
+    @contextmanager
+    def ubatch_forward(self, metadata):
+        """Keep parent rows and child metadata alive through GPU consumption."""
+        rows = metadata.engram_embeddings
+        staged = getattr(rows, "stage", None) is not None
+        try:
+            if staged:
+                rows.stage()
+            yield
+        finally:
+            if staged:
+                rows.join()
+            # Worker completion only means GPU work was enqueued. Fence the
+            # child storage after its consumers, including failed forwards.
+            for _, _, _, done in getattr(self, "_tbo_storage", {}).values():
+                if done is not None:
+                    done.record()
+
+    def _prefill_ubatch_storage(self, index):
+        # Independent of the parent's buffers and decode captures. Allocate on
+        # first TBO prefill, on the parent thread before any worker can yield.
+        if not hasattr(self, "_tbo_storage"):
+            self._tbo_storage = {}
+        if index not in self._tbo_storage:
+            names = [
+                "positions",
+                "cu_seqlens_q",
+                "batch_id_per_q_token",
+                "block_tables",
+            ]
+            for ratio, _ in self.geometry.compress_ratios:
+                names.extend(
+                    (
+                        visible_buffer_name(ratio),
+                        f"v4_compress_plan_{ratio}",
+                        f"v4_write_plan_{ratio}",
+                        f"v41_key_rope_positions_{ratio}",
+                    )
+                )
+            var = self.model_runner.forward_vars
+            buffers = {
+                name: CpuGpuBuffer(
+                    *var[name].cpu.shape,
+                    dtype=var[name].cpu.dtype,
+                    device=self.device,
+                    pin_memory=torch.device(self.device).type != "cpu",
+                )
+                for name in names
+            }
+            capacity = buffers["positions"].gpu.numel()
+            indptrs = {
+                ratio: tuple(
+                    torch.empty(capacity + 1, dtype=torch.int32, device=self.device)
+                    for _ in range(2)
+                )
+                for ratio in self.geometry.layer_ratios
+            }
+            on_gpu = torch.device(self.device).type != "cpu"
+            h2d_done = torch.cuda.Event() if on_gpu else None
+            done = torch.cuda.Event() if on_gpu else None
+            self._tbo_storage[index] = buffers, indptrs, h2d_done, done
+        buffers, indptrs, h2d_done, done = self._tbo_storage[index]
+        if done is not None and not done.query():
+            # Completed forwards need no reuse waits. For in-flight work,
+            # protect pinned staging only until H2D has read it, then order
+            # device overwrites after the remaining GPU consumers.
+            if not h2d_done.query():
+                h2d_done.synchronize()
+            torch.cuda.current_stream(self.device).wait_event(done)
+        return buffers, indptrs
+
+    def build_ubatch_prefill_metadata(
+        self, metadata, ub_slice, running_bs, ubatch_idx=0
+    ):
+        parent = metadata.step
+        if parent.tentative:
+            raise ValueError("V4.1 TBO supports prefill only")
+        ts, rs = ub_slice.token_slice, ub_slice.request_slice
+        if not 0 <= ts.start < ts.stop <= parent.width:
+            raise ValueError("V4.1 microbatch token slice is outside its parent")
+        spans = []
+        for span in parent.requests[rs]:
+            first, end = (
+                max(span.offset, ts.start),
+                min(span.offset + span.length, ts.stop),
+            )
+            if first < end:
+                spans.append(
+                    replace(
+                        span,
+                        position=span.position + first - span.offset,
+                        offset=first - ts.start,
+                        length=end - first,
+                    )
+                )
+        width = ts.stop - ts.start
+        if parent.requests and sum(span.length for span in spans) != width:
+            raise ValueError("V4.1 microbatch request and token slices disagree")
+        buffers, indptrs = self._prefill_ubatch_storage(ubatch_idx)
+        step = prepare_batch_step(
+            tuple(spans),
+            self.device,
+            is_prefill=True,
+            buffers=buffers,
+            running_bs=running_bs,
+            running_tokens=width,
+            state_slot_out=parent.slots[rs],
+            ratios=tuple(ratio for ratio, _ in self.geometry.compress_ratios),
+        )
+        step.plans = make_compress_plans(
+            np.asarray([span.length for span in spans], dtype=np.int32),
+            np.asarray([span.end for span in spans], dtype=np.int32),
+            self.geometry.compress_ratios,
+            plan_buffers={
+                ratio: {
+                    "compress": buffers[f"v4_compress_plan_{ratio}"],
+                    "write": buffers[f"v4_write_plan_{ratio}"],
+                    "key_rope": buffers[f"v41_key_rope_positions_{ratio}"],
+                }
+                for ratio, _ in self.geometry.compress_ratios
+            },
+            extra_write=0,
+        )
+        if step.positions.is_cuda:
+            _, _, h2d_done, done = self._tbo_storage[ubatch_idx]
+            # All pinned-buffer copies have now been enqueued. This event is
+            # never moved to the end of the forward: it gates host reuse only.
+            h2d_done.record()
+            step.indptrs = fill_step_indptrs(step, self.geometry, indptrs)
+            # Cover device preparation even when no model forward follows.
+            done.record()
+        child = AttentionMetaData(
+            cu_seqlens_q=step.cu_seqlens_q,
+            max_seqlen_q=step.max_q_len,
+            max_seqlen_k=max((span.end for span in spans), default=0),
+            state=AttnState.DECODE if step.decode else AttnState.PREFILL_PREFIX,
+        )
+        child.cache, child.step = metadata.cache, step
+        child.state_slot_out = step.slots
+        child.dummy = metadata.dummy
+        child.token_mask = metadata.token_mask[ts]
+        child.image_mask = (
+            None if metadata.image_mask is None else metadata.image_mask[:, ts]
+        )
+        rows = metadata.engram_embeddings
+        child.engram_embeddings = (
+            rows.slice(ts)
+            if getattr(rows, "slice", None) is not None
+            else {layer: value[:, ts] for layer, value in rows.items()}
+        )
+        return child
 
     def prepare_decode(self, batch, running_bs, running_tokens, max_seqlen_q):
         starts = None

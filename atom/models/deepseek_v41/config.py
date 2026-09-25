@@ -215,7 +215,11 @@ class DeepseekV41TextConfig(PretrainedConfig):
                 "moe_intermediate_size must be divisible by tensor parallel size"
             )
 
-    def validate_request(self, *, num_draft_tokens, multimodal_data):
+    def validate_request(
+        self, *, num_draft_tokens, multimodal_data, enable_dp_attention=False
+    ):
+        if enable_dp_attention and multimodal_data:
+            raise ValueError("DeepSeek-V4.1 DP attention supports text requests only")
         if num_draft_tokens and multimodal_data:
             raise ValueError(
                 "DeepSeek-V4.1 DSpark currently supports text requests only"
@@ -373,9 +377,21 @@ def validate_runtime_config(config):
         (
             "data parallel",
             config.parallel_config.data_parallel_size != 1
-            or config.enable_dp_attention,
+            and not config.enable_dp_attention,
         ),
-        ("TBO", config.enable_tbo or config.enable_tbo_decode),
+        ("decode TBO", config.enable_tbo_decode),
+        (
+            "prefill TBO without multi-rank DP attention",
+            config.enable_tbo
+            and (
+                not config.enable_dp_attention
+                # Config validates before CoreManager folds TP into DP.
+                # After normalization TP is 1, so the product is unchanged.
+                or config.parallel_config.data_parallel_size
+                * config.tensor_parallel_size
+                <= 1
+            ),
+        ),
         ("KV transfer", bool(config.kv_transfer_config) or config.enable_rapidserve),
         ("plugin mode", config.plugin_config is not None),
         ("online quantization", config.online_quant_config is not None),

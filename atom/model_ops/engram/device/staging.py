@@ -8,6 +8,7 @@ Every forward (including warmup) records the same fork and per-layer joins.
 
 import logging
 import os
+from collections.abc import Mapping
 from unittest.mock import patch
 
 import torch
@@ -175,14 +176,57 @@ class EngramStagedRows(dict):
             for layer, buffer in staging.host.buffers.items()
         )
         self.staging, self.width = staging, width
+        fallback = staging.host._tp_group is not None and staging.collective is None
+        self._fallback_done = (
+            {layer: torch.cuda.Event() for layer in self} if fallback else {}
+        )
+        self._fallback_ready = set()
 
     def stage(self):
+        self._fallback_ready.clear()
         self.staging.start(self.width)
+        # Shared-communicator collectives must be issued once, in layer order,
+        # on the parent thread before either TBO worker can enqueue model work.
+        for layer in self._fallback_done:
+            self.get(layer)
 
     def get(self, layer, default=None):
         if layer in self:
-            self.staging.consume(layer, self.width)
+            done = self._fallback_done.get(layer)
+            if done is None or layer not in self._fallback_ready:
+                self.staging.consume(layer, self.width)
+                if done is not None:
+                    done.record()
+                    self._fallback_ready.add(layer)
+            elif done is not None:
+                torch.cuda.current_stream(self.staging.host.device).wait_event(done)
         return super().get(layer, default)
 
     def join(self):
         self.staging.join()
+
+    def slice(self, token_slice):
+        return EngramRowsView(self, token_slice)
+
+
+class EngramRowsView(Mapping):
+    """Read-only token slices; every value access waits for the parent lookup.
+
+    Mapping routes get/items/values/dict copies through __getitem__, so none
+    can expose a device row without establishing its consumer dependency.
+    """
+
+    def __init__(self, parent, token_slice):
+        self._rows = {layer: rows[:, token_slice] for layer, rows in parent.items()}
+        self.parent = parent
+
+    def __getitem__(self, layer):
+        rows = self._rows[layer]
+        self.parent.get(layer)
+        return rows
+
+    def __iter__(self):
+        return iter(self._rows)
+
+    def __len__(self):
+        return len(self._rows)

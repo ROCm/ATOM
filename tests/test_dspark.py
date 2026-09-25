@@ -1221,10 +1221,12 @@ def test_propose_sizes_the_draft_gather_without_asking_the_group(monkeypatch):
     )
     fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
     fc.dp_metadata = None
+    fc.context.running_tokens_across_dp = (1, 19)  # preceding target pass
     _run_propose(p, fc, 44, monkeypatch, seen)
 
     t = p.mtp_k
     assert fc.dp_metadata.get_sizes_across_dp() == [48 * t, 48 * t]
+    assert fc.context.running_tokens_across_dp == (48 * t, 48 * t)
 
 
 def test_propose_puts_the_pass_on_the_path_its_own_shape_is_on(monkeypatch):
@@ -1245,9 +1247,6 @@ def test_propose_puts_the_pass_on_the_path_its_own_shape_is_on(monkeypatch):
     p.config.parallel_config = types.SimpleNamespace(
         data_parallel_size=2, data_parallel_rank=0
     )
-    monkeypatch.setattr(
-        mod_drafter.DPMetadata, "make", staticmethod(lambda *a, **k: "dp_meta")
-    )
     fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
     fc.context.is_prefill = True
     fc.dp_metadata = None
@@ -1255,7 +1254,7 @@ def test_propose_puts_the_pass_on_the_path_its_own_shape_is_on(monkeypatch):
 
     assert fc.context.running_tokens_are_unified is True
     assert fc.context.is_prefill is False
-    assert fc.dp_metadata == "dp_meta"
+    assert fc.dp_metadata.get_sizes_across_dp() == [48 * p.mtp_k] * 2
 
 
 class _BareFlavor(mod_drafter.Drafter):
@@ -1296,7 +1295,9 @@ def test_a_height_the_group_did_not_agree_on_is_asked_for_not_declared(monkeypat
         seen["batchsize"] = batchsize
         seen["table"] = num_tokens_across_dp
         seen["unified"] = unified
-        return "dp_meta"
+        return types.SimpleNamespace(
+            get_sizes_across_dp=lambda: [batchsize] * cfg.data_parallel_size
+        )
 
     monkeypatch.setattr(mod_drafter.DPMetadata, "make", staticmethod(_make))
     fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
