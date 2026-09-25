@@ -82,10 +82,12 @@ for rel in files:
     shutil.copy2(src, dst)
 print(f"[vllm] overlaid {len(files)} Python files")
 PY
-  patch_file="${ATOMESH_SCRIPT_DIR}/patches/vllm-k3-startup-memory.patch"
-  echo "[vllm] applying patch $(sha256sum "${patch_file}")"
-  git -C "${VLLM_SITE_DIR}" apply --check "${patch_file}"
-  git -C "${VLLM_SITE_DIR}" apply "${patch_file}"
+  for patch_file in vllm-k3-startup-memory.patch vllm-k3-latent-down-online.patch; do
+    patch_file="${ATOMESH_SCRIPT_DIR}/patches/${patch_file}"
+    echo "[vllm] applying patch $(sha256sum "${patch_file}")"
+    git -C "${VLLM_SITE_DIR}" apply --check "${patch_file}"
+    git -C "${VLLM_SITE_DIR}" apply "${patch_file}"
+  done
   server_pythonpath="$(join_path "${VLLM_SITE_DIR}" "${server_pythonpath}")"
   env PYTHONPATH="${server_pythonpath}" python3 - "${VLLM_SITE_DIR}" <<'PY'
 import sys
