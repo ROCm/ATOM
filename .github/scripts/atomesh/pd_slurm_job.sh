@@ -160,20 +160,7 @@ start_vllm_router() {
 }
 
 pre_cleanup_local() {
-  echo "=== pre-cleanup: stop running containers on $(hostname) ==="
-  set +e
-  running=()
-  while read -r id; do
-    [[ -n "${id}" ]] && running+=("${id}")
-  done < <(docker ps -q 2>/dev/null)
-
-  if [[ "${#running[@]}" -gt 0 ]]; then
-    docker ps --format "  {{.ID}} {{.Names}} {{.Status}}"
-    docker stop -t 0 "${running[@]}" >/dev/null 2>&1 || true
-  else
-    echo "no running containers"
-  fi
-  set -e
+  echo "Cleanup is limited to this job's containers."
 }
 
 run_container_rank() {
@@ -459,6 +446,11 @@ EOF
       bounded_docker_rm \
         "atomesh-${ATOMESH_CELL_ID}-${JOB_ID}-${SPUR_NODE_RANK_FOR_CLEANUP}${suffix}"
     done
+    local query_rc=0
+    timeout --kill-after=5s 15s docker ps -a \
+      --filter "name=^/atomesh-${ATOMESH_CELL_ID}-${JOB_ID}-${SPUR_NODE_RANK_FOR_CLEANUP}(-|$)" \
+      --format '{{.Names}} {{.Status}}' > "${RUN_DIR}/cleanup-containers-${SPUR_NODE_RANK_FOR_CLEANUP}.txt" 2>&1 || query_rc=$?
+    printf '%s\n' "${query_rc}" > "${RUN_DIR}/cleanup-query-${SPUR_NODE_RANK_FOR_CLEANUP}.rc"
     return "${rc}"
   }
   trap 'cleanup_spur $?' EXIT

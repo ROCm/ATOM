@@ -869,10 +869,11 @@ models:
           --attention-config '{"mla_prefill_backend":"ROCM_AITER_FA","use_prefill_query_quantization":true}'
           --attention-backend ROCM_AITER_MLA --dcp-comm-backend a2a --cp-kv-cache-interleave-size 1
           --speculative-config '{"model":"${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark","num_speculative_tokens":4,"method":"dspark","attention_backend":"ROCM_AITER_MLA","kv_cache_dtype":"fp8","draft_sample_method":"probabilistic","rejection_sample_method":"standard"}'
+          --quantization-config '{"targets":{"re:.*\\.routed_expert_down_proj$":"mxfp4"}}'
     suites:
       vllm:
         - &kimi_k3_vllm_dspark_dcp8
-          name: kimi-k3-vllm-dspark4-1p1d-tp8-dcp8-agentic-lmcache-1m-c64-a4w4
+          name: kimi-k3-vllm-dspark4-1p1d-tp8-dcp8-agentic-lmcache-1m-c64-latent-fp4
           topology: 1p1d
           display_topology: 1P1D-TP8-DCP8
           pd_worker_layout: multi_node
