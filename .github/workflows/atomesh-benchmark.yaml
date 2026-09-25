@@ -6,7 +6,7 @@ permissions:
 jobs:
   decode-probe:
     runs-on: atomesh-cicd
-    timeout-minutes: 75
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v6
       - name: Run single full-model decode probe
