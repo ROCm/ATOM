@@ -162,8 +162,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             )
         except Exception as e:  # noqa: BLE001  # optional save-only dependency
             logger.warning(
-                "LMCache offload: lookup server not started: "
-                "error_type=%s error=%s",
+                "LMCache offload: lookup server not started: error_type=%s error=%s",
                 type(e).__name__,
                 e,
             )
@@ -511,8 +510,7 @@ class DenseOffloadScheduler(ChunkedOffloadSchedulerBase):
             )
         except Exception as e:  # noqa: BLE001  # optional lookup service
             logger.warning(
-                "LMCache offload scheduler: lookup client unavailable: "
-                "error_type=%s error=%s",
+                "LMCache offload scheduler: lookup client unavailable: error_type=%s error=%s",
                 type(e).__name__,
                 e,
             )
