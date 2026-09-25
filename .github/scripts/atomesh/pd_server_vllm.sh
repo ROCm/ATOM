@@ -230,6 +230,9 @@ start_vllm_server() {
   local prefix="${role^^}"
   local tp_var="${prefix}_TP_SIZE" dcp_var="${prefix}_DCP_SIZE" args_var="${prefix}_SERVER_ARGS"
   apply_role_env "ATOMESH_${prefix}_ENV_" "${host_ip}"
+  if [[ "${SERVED_MODEL_NAME}" == "Kimi-K3" && "${AITER_SITUV2_A4W4:-}" == "1" ]]; then
+    python3 "${ATOMESH_SCRIPT_DIR}/../k3-a4w4/check_aiter_paths.py"
+  fi
 
   local lmcache_port=""
   local -a server_env=("PYTHONPATH=${server_pythonpath}")

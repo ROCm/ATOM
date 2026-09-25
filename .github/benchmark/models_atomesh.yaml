@@ -833,6 +833,10 @@ models:
     env:
       common:
         <<: *kimi_k3_vllm_env_common
+        VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4: "0"
+        AITER_SITUV2_A8W4: "0"
+        AITER_SITUV2_A4W4: "1"
+        AITER_FLYDSL_STAGE2_FP8: "1"
         AITER_LOG_LEVEL: "WARNING"
         VLLM_DCP_Q_REPLICATE: "0"
         VLLM_ROCM_PAGE_ALIGN_KV: "1"
@@ -868,7 +872,7 @@ models:
     suites:
       vllm:
         - &kimi_k3_vllm_dspark_dcp8
-          name: kimi-k3-vllm-dspark4-1p1d-tp8-dcp8-agentic-lmcache-1m-c64-target
+          name: kimi-k3-vllm-dspark4-1p1d-tp8-dcp8-agentic-lmcache-1m-c64-a4w4
           topology: 1p1d
           display_topology: 1P1D-TP8-DCP8
           pd_worker_layout: multi_node
