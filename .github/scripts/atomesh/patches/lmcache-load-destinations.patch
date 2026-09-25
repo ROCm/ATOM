@@ -1,0 +1,26 @@
+--- a/lmcache/integration/vllm/lmcache_mp_connector.py
++++ b/lmcache/integration/vllm/lmcache_mp_connector.py
+@@ -1196,6 +1196,23 @@
+                         free_end,
+                     )
+ 
++    def get_load_block_ids(self, metadata: KVConnectorMetadata) -> set[int] | None:
++        if not isinstance(metadata, LMCacheMPConnectorMetadata):
++            return None
++        blocks: set[int] = set()
++        for request in metadata.requests:
++            if request.direction == "STORE":
++                continue
++            if request.direction != "RETRIEVE":
++                return None
++            block_ids = getattr(request.op, "flat_block_ids", None)
++            if not isinstance(block_ids, list) or any(
++                type(block) is not int for block in block_ids
++            ):
++                return None
++            blocks.update(block_ids)
++        return blocks
++
+     def build_connector_meta(
+         self, scheduler_output: SchedulerOutput
+     ) -> KVConnectorMetadata:

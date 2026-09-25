@@ -1,0 +1,205 @@
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/base.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+@@ -182,6 +182,16 @@
+         """
+         return False
+ 
++    def get_load_block_ids(self, metadata: KVConnectorMetadata) -> set[int] | None:
++        """Upper bound of this step's GPU load destinations; None means unknown."""
++        return None
++
++    def get_sync_mamba_loads(
++        self, scheduler_output: SchedulerOutput, metadata: KVConnectorMetadata
++    ) -> dict[str, list[int]]:
++        """Mamba write slots fully restored before forward, or abort on failure."""
++        return {}
++
+     def get_sync_load_block_ids(self, request: "Request") -> list[int]:
+         """Return blocks whose synchronous load replaces worker zeroing.
+ 
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py
+@@ -219,6 +219,79 @@
+     @property
+     def requires_full_step_completion(self) -> bool:
+         return self.mode == MoRIIOMode.READ
++
++    def get_load_block_ids(self, metadata: KVConnectorMetadata) -> set[int] | None:
++        if self.mode != MoRIIOMode.READ or not isinstance(
++            metadata, MoRIIOConnectorMetadata
++        ):
++            return None
++        blocks: set[int] = set()
++        for request in metadata.reqs_to_recv.values():
++            attn, mamba = split_attn_mamba_block_ids(request.local_block_ids)
++            blocks.update(attn)
++            blocks.update(mamba)
++        return blocks
++
++    def get_sync_mamba_loads(
++        self, scheduler_output: SchedulerOutput, metadata: KVConnectorMetadata
++    ) -> dict[str, list[int]]:
++        scheduler = self.connector_scheduler
++        if (
++            self.mode != MoRIIOMode.READ
++            or not self.kv_transfer_config.is_kv_consumer
++            or scheduler is None
++            or not scheduler_output.has_sync_kv_loads
++            or self._vllm_config.cache_config.mamba_cache_mode != "align"
++            or self._vllm_config.cache_config.get_resolved_kv_cache_layout().name
++            != "LBNHC"
++            or not isinstance(metadata, MoRIIOConnectorMetadata)
++            or scheduler.kv_cache_config is None
++        ):
++            return {}
++        groups = scheduler.kv_cache_config.kv_cache_groups
++        mamba_groups = [
++            i
++            for i, group in enumerate(groups)
++            if isinstance(group.kv_cache_spec, MambaSpec)
++        ]
++        if not mamba_groups or mamba_groups != scheduler._mamba_group_ids:
++            return {}
++        restored: dict[str, list[int]] = {}
++        for request in scheduler_output.scheduled_new_reqs:
++            req_id = request.req_id
++            query_len = scheduler_output.num_scheduled_tokens.get(req_id, 0)
++            load = metadata.reqs_to_recv.get(req_id)
++            if (
++                load is None
++                or query_len <= 0
++                or any(
++                    query_len > groups[i].kv_cache_spec.block_size for i in mamba_groups
++                )
++                or request.num_computed_tokens != request.prompt_len - 1
++                or request.num_computed_tokens <= 0
++                or any(
++                    request.num_computed_tokens % groups[i].kv_cache_spec.block_size
++                    for i in mamba_groups
++                )
++                or len(request.block_ids) != len(groups)
++            ):
++                continue
++            _, local = split_attn_mamba_block_ids(load.local_block_ids)
++            _, remote = split_attn_mamba_block_ids(load.remote_block_ids)
++            if len(local) != len(mamba_groups) or len(remote) != len(mamba_groups):
++                continue
++            expected = []
++            for i in mamba_groups:
++                block_size = groups[i].kv_cache_spec.block_size
++                column = (
++                    request.num_computed_tokens + query_len + block_size - 1
++                ) // block_size - 1
++                if column < 0 or column >= len(request.block_ids[i]):
++                    break
++                expected.append(request.block_ids[i][column])
++            if expected == local and all(block > 0 for block in local + remote):
++                restored[req_id] = local
++        return restored
+ 
+     def get_sync_load_block_ids(self, request: "Request") -> list[int]:
+         scheduler = self.connector_scheduler
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
+@@ -418,6 +418,36 @@
+                 self._requests_to_connector[request.request_id] = i
+                 to_return = (toks, load_async)
+         return to_return
++
++    def get_load_block_ids(self, metadata: KVConnectorMetadata) -> set[int] | None:
++        if not isinstance(metadata, MultiKVConnectorMetadata):
++            return None
++        blocks: set[int] = set()
++        for child, meta in zip(self._connectors, metadata.metadata, strict=True):
++            child_blocks = child.get_load_block_ids(meta)
++            if child_blocks is None:
++                return None
++            blocks.update(child_blocks)
++        return blocks
++
++    def get_sync_mamba_loads(
++        self, scheduler_output: SchedulerOutput, metadata: KVConnectorMetadata
++    ) -> dict[str, list[int]]:
++        assert isinstance(metadata, MultiKVConnectorMetadata)
++        children = list(zip(self._connectors, metadata.metadata, strict=True))
++        load_blocks = [child.get_load_block_ids(meta) for child, meta in children]
++        restored: dict[str, list[int]] = {}
++        for i, (child, meta) in enumerate(children):
++            for req_id, blocks in child.get_sync_mamba_loads(
++                scheduler_output, meta
++            ).items():
++                if all(
++                    other is not None and other.isdisjoint(blocks)
++                    for j, other in enumerate(load_blocks)
++                    if j != i
++                ):
++                    restored[req_id] = blocks
++        return restored
+ 
+     def get_sync_load_block_ids(self, request: "Request") -> list[int]:
+         chosen = self._requests_to_connector.get(request.request_id)
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -48,6 +48,7 @@
+ 
+     # Only used for v2 model runner.
+     prefill_token_ids: list[int] | None = None
++    mamba_state_restored: bool = False
+ 
+     @classmethod
+     def from_request(
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1435,6 +1435,15 @@
+         if self.connector is not None:
+             meta = self._build_kv_connector_meta(self.connector, scheduler_output)
+             scheduler_output.kv_connector_metadata = meta
++            if self.use_v2_model_runner and has_sync_kv_loads:
++                restored = self.connector.get_sync_mamba_loads(scheduler_output, meta)
++                copy_destinations = {
++                    copy.dst_block_id for copy in kv_cache_block_copies
++                }
++                for request in new_reqs_data:
++                    blocks = restored.get(request.req_id)
++                    if blocks and copy_destinations.isdisjoint(blocks):
++                        request.mamba_state_restored = True
+ 
+         # Build the connector meta for ECConnector
+         if self.ec_connector is not None:
+--- a/vllm/v1/worker/gpu/kv_connector.py
++++ b/vllm/v1/worker/gpu/kv_connector.py
+@@ -34,7 +34,8 @@
+         return False
+ 
+     def pre_forward(self, scheduler_output: "SchedulerOutput") -> None:
+-        pass
++        if any(req.mamba_state_restored for req in scheduler_output.scheduled_new_reqs):
++            raise RuntimeError("Mamba restore requires an active KV connector")
+ 
+     def post_forward(
+         self, finished_req_ids: set[str], wait_for_save: bool = True
+@@ -66,6 +67,10 @@
+         return not self._disabled and self.kv_connector.requires_full_step_completion
+ 
+     def pre_forward(self, scheduler_output: "SchedulerOutput") -> None:
++        if (self._disabled or not scheduler_output.has_sync_kv_loads) and any(
++            req.mamba_state_restored for req in scheduler_output.scheduled_new_reqs
++        ):
++            raise RuntimeError("Mamba restore requires a synchronous load")
+         if self._disabled:
+             return
+ 
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -119,7 +119,10 @@
+         if self._align_mode:
+             # Seed the running state block from the resumed/prefilled position.
+             self._mamba_state_idx_gpu[req_index].fill_(
+-                (new_req_data.num_computed_tokens - 1) // self.cache_config.block_size
++                -1
++                if new_req_data.mamba_state_restored
++                else (new_req_data.num_computed_tokens - 1)
++                // self.cache_config.block_size
+             )
+ 
+     def _get_mamba_group_info(
