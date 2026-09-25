@@ -595,6 +595,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MOE_GU_ITLV": lambda: os.getenv("ATOM_MOE_GU_ITLV", "0") == "1",
     # --- MoE all2all (MoRI) wire format ---
     "ATOM_MORI_FP4_DISPATCH": lambda: (os.getenv("ATOM_MORI_FP4_DISPATCH", "0") == "1"),
+    # MXFP8 (fp8 e4m3 + e8m0 scale per 1x32) before dispatch: the same quant
+    # aiter's a8w4 fused_moe would run on the received rows, done on the sender.
+    "ATOM_MORI_FP8_DISPATCH": lambda: (os.getenv("ATOM_MORI_FP8_DISPATCH", "0") == "1"),
     # Combine-side codec. "none" (the MoRI default) sends bf16 back;
     # "fp8_blockwise" selects EpCombineIntraNodeKernel_*_fp8bwq_*.
     "ATOM_MORI_COMBINE_QUANT": lambda: os.getenv("ATOM_MORI_COMBINE_QUANT", "none"),

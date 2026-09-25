@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -22,6 +24,8 @@ except ImportError:
     mori = None  # type: ignore
     MORI_AVAILABLE = False
 
+logger = logging.getLogger("atom")
+
 
 _FP8_DTYPES = (
     torch.float8_e4m3fn,
@@ -34,6 +38,7 @@ _FP8_DTYPES = (
 # make_prepare_finalize runs per MoE layer (58x for DSR1). envs.__getattr__ does
 # not cache, so binding here also keeps it to a single getenv.
 _FP4_DISPATCH = envs.ATOM_MORI_FP4_DISPATCH
+_MXFP8_DISPATCH = envs.ATOM_MORI_FP8_DISPATCH
 
 
 @dataclass(frozen=True)
@@ -51,6 +56,10 @@ class MoriDispatchFormat:
     def is_fp8(self) -> bool:
         return self.dtype in _FP8_DTYPES
 
+    @property
+    def is_mxfp8(self) -> bool:
+        return self.is_fp8 and self.quant_type == QuantType.per_1x32
+
 
 def resolve_mori_dispatch(
     in_dtype: torch.dtype,
@@ -58,6 +67,35 @@ def resolve_mori_dispatch(
     quant_config: FusedMoEQuantConfig | None = None,
 ) -> MoriDispatchFormat:
     """Decide the MoRI wire format. Call once per layer construction."""
+    if _FP4_DISPATCH and _MXFP8_DISPATCH:
+        raise ValueError(
+            "ATOM_MORI_FP4_DISPATCH and ATOM_MORI_FP8_DISPATCH both pick the "
+            "dispatch wire format; set at most one"
+        )
+    if _MXFP8_DISPATCH:
+        # Only an MXFP4-weight layer runs aiter's a8w4 fused_moe, whose own
+        # activation quant this moves ahead of the dispatch; any other layer
+        # would take these fp8 rows as data. Refuse rather than fall back to
+        # bf16: a second wire format is a second MoRI handle, i.e. another set
+        # of 131072-row staging buffers on the shmem heap.
+        weight_dtype = None if quant_config is None else quant_config._w1.dtype
+        if weight_dtype != "mxfp4":
+            raise ValueError(
+                "ATOM_MORI_FP8_DISPATCH=1 needs MXFP4 routed experts (aiter "
+                f"a8w4 fused_moe); this MoE layer has weight dtype {weight_dtype!r}"
+            )
+        _log_dispatch_format_once(
+            f"mxfp8 (fp8 e4m3 + e8m0 per 1x32): scale_dim={hidden_dim // 32}, "
+            "scale_type_size=1"
+        )
+        # Per 1x32, e8m0 scales, unshuffled -- what aiter's fused_moe would
+        # compute from the received bf16 rows; it then only sorts the scales.
+        return MoriDispatchFormat(
+            dtype=dtypes.fp8,
+            quant_type=QuantType.per_1x32,
+            scale_dim=hidden_dim // 32,
+            scale_type_size=dtypes.fp8_e8m0.itemsize,
+        )
     if _FP4_DISPATCH:
         # fp4 blockwise is one scale per 32 elements, not per 128 as fp8 uses,
         # and get_hip_quant(per_1x32) emits e8m0 scales (1 byte), not fp32.
@@ -72,6 +110,73 @@ def resolve_mori_dispatch(
         quant_type=None,
         scale_dim=0,
         scale_type_size=torch.float32.itemsize,
+    )
+
+
+@lru_cache(maxsize=16)
+def _log_dispatch_format_once(desc: str) -> None:
+    logger.info(f"[MORI] dispatch wire format: {desc}")
+
+
+@lru_cache(maxsize=16)
+def check_mxfp8_dispatch_consumable(
+    quant_type: QuantType,
+    w1_dtype: torch.dtype,
+    activation: Any,
+    gate_mode: str,
+    hidden_pad: int,
+) -> None:
+    """Refuse an MXFP8 dispatch that aiter's fused_moe would not consume as-is.
+
+    fused_moe skips its own activation quant only on its a8w4/a8w8 branch
+    (fp8 input plus a1_scale: the scales are just sorted); on any other branch
+    the fp8 rows are read as data -- its bf16 path casts them and drops the
+    scales -- which is wrong numerics, not an error. The branch comes from
+    resolve_activation_dtype, per call from M unless AITER_BF16_FP8_MOE_BOUND=0
+    takes M out of it; asking with M=None returns fp8 only when every batch
+    size lands there. Cached, so the eager path pays a dict lookup per layer.
+    """
+    from aiter.fused_moe import resolve_activation_dtype
+
+    q_dtype_a = resolve_activation_dtype(
+        quant_type, w1_dtype, activation=activation, gate_mode=gate_mode, M=None
+    )
+    if (
+        QuantType(quant_type) != QuantType.per_1x32
+        or w1_dtype not in (dtypes.fp4x2, dtypes.fp8)
+        or q_dtype_a != dtypes.fp8
+        or hidden_pad
+    ):
+        raise RuntimeError(
+            "ATOM_MORI_FP8_DISPATCH=1 sends MXFP8 rows, but aiter fused_moe "
+            f"would not take them as-is here ({quant_type=}, {w1_dtype=}, "
+            f"{activation=}, {gate_mode=}, {hidden_pad=}, resolved activation "
+            f"dtype {q_dtype_a}). On gfx950 it needs ATOM_MOE_GU_ITLV=1 and "
+            "AITER_BF16_FP8_MOE_BOUND=0; otherwise unset ATOM_MORI_FP8_DISPATCH."
+        )
+
+
+def _mxfp8_quant(a1: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-1x32 fp8 with e8m0 scales, row-major and unshuffled.
+
+    The kernel aiter's fused_moe runs on the received rows for its split path
+    (more than 8*256/topk rows); below that it runs a fused quant+sort kernel
+    with the same e8m0 RoundUp scale. Given these scales, fused_moe only
+    sorts them into the GEMM layout (mxfp4_moe_sort_fwd).
+    """
+    if a1.shape[0] == 0:
+        # e8m0 scales are one byte each -- must match the scale_type_size
+        # handed to MoRI in moe.py.
+        return (
+            torch.empty(a1.shape, dtype=dtypes.fp8, device=a1.device),
+            torch.empty(
+                (0, a1.shape[-1] // 32), dtype=dtypes.fp8_e8m0, device=a1.device
+            ),
+        )
+    from aiter import get_hip_quant
+
+    return get_hip_quant(QuantType.per_1x32)(
+        a1, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
     )
 
 
@@ -115,6 +220,10 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     @property
     def use_fp8_dispatch(self) -> bool:
         return self.dispatch_format.is_fp8
+
+    @property
+    def use_mxfp8_dispatch(self) -> bool:
+        return self.dispatch_format.is_mxfp8
 
     @property
     def quant_type(self):
@@ -202,6 +311,8 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
             quant_func = get_hip_quant(self.quant_type or quant_type)
             a1, scale = quant_func(a1, quant_dtype=dtypes.fp4x2)
+        elif self.use_mxfp8_dispatch:
+            a1, scale = _mxfp8_quant(a1)
         elif self.use_fp8_dispatch:
             from aiter import get_hip_quant
 
@@ -294,6 +405,8 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                     dtype=torch.float8_e8m0fnu,
                     device=a1.device,
                 )
+        elif self.use_mxfp8_dispatch:
+            a1, scale = _mxfp8_quant(a1)
         elif self.use_fp8_dispatch:
             from aiter import get_hip_quant
 

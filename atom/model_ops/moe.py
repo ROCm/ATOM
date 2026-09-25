@@ -682,11 +682,13 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             )
             mori_dtype = dispatch_format.dtype
             scale_type_size = dispatch_format.scale_type_size
-            # For PTPC (per token per channel) quant, the scale dim for each token is 1
-            # For 1x128 quant, the scale dim for each token is hidden_dim // 128
+            # A format with its own pre-dispatch quantizer (fp4 / mxfp8, both
+            # per 1x32) carries its scale geometry. Otherwise: for PTPC (per
+            # token per channel) quant the scale dim for each token is 1, and
+            # for 1x128 quant it is hidden_dim // 128.
             scale_dim = (
                 dispatch_format.scale_dim
-                if dispatch_format.is_fp4
+                if dispatch_format.quant_type is not None
                 else (1 if quant_config.is_per_act_token else moe.hidden_dim // 128)
             )
             # Combine-side codec, passed through aiter's all2all manager into the

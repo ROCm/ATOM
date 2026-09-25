@@ -8,6 +8,7 @@ import torch
 from aiter import ActivationType, QuantType
 from aiter.dist.parallel_state import get_dp_group
 from aiter.fused_moe import fused_moe
+from aiter.ops.flydsl.moe_common import GateMode
 
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.model_ops.fused_moe.utils import disable_inplace
@@ -439,6 +440,28 @@ class FusedMoEModularKernel(torch.nn.Module):
         # weights live on the layer, so the quant method forwards them through
         # `moe_extra_args` -- the modular kernel holds no layer reference.
         triton_experts = extra_kwargs.pop("triton_experts", None)
+
+        # An MXFP8 dispatch already ran the activation quant fused_moe would
+        # run; `dispatch_scale` below tells aiter to skip it. Checked here, not
+        # at construction, because only this call knows the activation and
+        # gate mode that decide whether aiter takes fp8 rows as-is.
+        if getattr(self.prepare_finalize, "use_mxfp8_dispatch", False):
+            from atom.model_ops.fused_moe.mori_prepare_finalize import (
+                check_mxfp8_dispatch_consumable,
+            )
+
+            if triton_experts is not None:
+                raise RuntimeError(
+                    "ATOM_MORI_FP8_DISPATCH=1 is not supported with the Triton "
+                    "EP experts (ATOM_USE_TRITON_MOE)"
+                )
+            check_mxfp8_dispatch_consumable(
+                quant_type,
+                w1.dtype,
+                activation,
+                extra_kwargs.get("gate_mode", GateMode.SEPARATED.value),
+                hidden_pad or 0,
+            )
 
         # Runs on prefill as well as decode. The gfx1250 gluon kernel used to
         # be prefill-broken (TDM async_gather over mxfp8 activations), so this
