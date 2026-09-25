@@ -56,6 +56,7 @@ from atom.model_ops.fused_moe.modular_kernel import (
 )
 from atom.model_ops.fused_moe.mori_prepare_finalize import (
     MoriPrepareAndFinalize,
+    mori_op_capacities,
     resolve_mori_dispatch,
 )
 from atom.model_ops.fused_moe.shared_expert_dispatch import remap_topk_to_dispatch
@@ -737,9 +738,17 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # regular forwards and TBO ubatch 0; slot 1 exists only for the
             # concurrently running second ubatch.
             num_mori_ops = _NUM_TBO_UBATCHES if tbo_is_enabled else 1
+            # Slot 1 only ever carries a ubatch, so ATOM_MORI_TBO_HALF_BUFFERS
+            # may size it for half the budget; slot 0 keeps the full one.
+            op_max_tokens = mori_op_capacities(
+                moe.max_num_tokens, num_mori_ops, get_current_atom_config()
+            )
             mori_ops = [
-                all2all_manager.get_handle(all_to_all_args, index=slot)
-                for slot in range(num_mori_ops)
+                all2all_manager.get_handle(
+                    {**all_to_all_args, "max_num_tokens_per_dp_rank": max_tokens},
+                    index=slot,
+                )
+                for slot, max_tokens in enumerate(op_max_tokens)
             ]
 
             # Off the op, not re-derived: the mapping is aiter's.
@@ -760,6 +769,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 dispatch_format=dispatch_format,
                 low_latency=low_latency,
                 internode=all2all_manager.internode,
+                op_max_tokens_per_rank=op_max_tokens,
             )
 
         return prepare_finalize

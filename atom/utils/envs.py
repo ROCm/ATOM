@@ -617,6 +617,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MORI_ZERO_COPY_COMBINE": lambda: os.getenv(
         "ATOM_MORI_ZERO_COPY_COMBINE", "0"
     ),
+    # Size the second TBO ubatch MoRI op (all2all handle slot 1) for half the
+    # per-rank token budget. A token-midpoint prefill split never hands a
+    # ubatch more than ceil(max_num_batched_tokens / 2) rows, so that op needs
+    # half the ~4 GB of symmetric heap. Slot 0 is also the sync op and keeps
+    # the full budget. Ignored (full size kept) for any split that can be
+    # uneven: decode TBO, PCP, or ATOM_TBO_PREFILL_TOKEN_SPLIT=0.
+    "ATOM_MORI_TBO_HALF_BUFFERS": lambda: (
+        os.getenv("ATOM_MORI_TBO_HALF_BUFFERS", "0") == "1"
+    ),
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
