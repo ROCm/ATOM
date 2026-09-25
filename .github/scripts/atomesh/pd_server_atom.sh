@@ -1318,6 +1318,7 @@ run_eval() {
       --num_fewshot "${EVAL_FEWSHOT}" \
       "${limit_arg[@]}" \
       "${eval_extra_args[@]}" \
+      --log_samples \
       --output_path "${result_dir}"
 
     snapshot_eval_metrics "${result_dir}" after
