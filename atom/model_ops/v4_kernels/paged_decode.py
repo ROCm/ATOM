@@ -133,6 +133,57 @@ def _use_flydsl_native_fp8_decode(
     return False
 
 
+def _v4_aiter_fp8_decode_splits(
+    q_packed: torch.Tensor,
+    *,
+    query_group: int,
+    kv_kind: str,
+) -> int | None:
+    """Return the qualified gfx950 H128/q7 AITER CSA split count.
+
+    AITER's V4 NM wrapper currently ignores the live KV length and maximizes a
+    pure CU-occupancy score. For q7 this creates a sawtooth schedule: nearby
+    batches can select 1 versus 15 splits, and every multi-split launch writes
+    FP32 partial outputs before a second reduction kernel. The measured
+    batch-only table below stays CUDA Graph safe because it depends only on the
+    captured Q shape. It is robust across K384/K640/K1152 and avoids reading
+    GPU-resident ``kv_indptr`` on the host.
+
+    HCA remains on AITER's own ragged split planner: its heterogeneous long-KV
+    vectors have a different optimum from the CSA table.
+    """
+    shape = getattr(q_packed, "shape", None)
+    device = getattr(q_packed, "device", None)
+    if shape is None or len(shape) != 3 or device is None:
+        return None
+
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    tokens, heads, _ = shape
+    if (
+        _device_arch(device_index) != "gfx950"
+        or heads != 128
+        or query_group != 7
+        or kv_kind != "csa"
+        or tokens % query_group
+    ):
+        return None
+
+    requests = tokens // query_group
+    if requests <= 0:
+        return None
+    if requests == 1:
+        return 5
+    if requests == 2:
+        return 4
+    if requests == 3:
+        return 3
+    if requests == 4:
+        return 2
+    return 1
+
+
 @functools.lru_cache(maxsize=1)
 def _cu_count() -> int:
     """Compute-unit count of the active GPU, queried once via aiter.
@@ -1378,6 +1429,11 @@ def sparse_attn_v4_paged_decode(
             q_rope_in,
             qo_indptr=qo_indptr,
             kv_last_page_lens=kv_last_page_lens,
+            num_kv_splits=_v4_aiter_fp8_decode_splits(
+                q_packed_in,
+                query_group=query_group,
+                kv_kind=kv_kind,
+            ),
         )
     gfx = get_gfx()
     if gfx == "gfx1250" or gfx.startswith("gfx94"):

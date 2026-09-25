@@ -521,6 +521,55 @@ class TestV4NativeFp8Routing:
 
         assert v4_decode_query_group(min_q, max_q) == expected
 
+    @pytest.mark.parametrize(
+        "requests,expected",
+        [(1, 5), (2, 4), (3, 3), (4, 2), (5, 1), (32, 1), (64, 1), (256, 1)],
+    )
+    def test_aiter_csa_uses_graphsafe_batch_split_table(
+        self, monkeypatch, requests, expected
+    ):
+        from atom.model_ops.v4_kernels import paged_decode
+
+        monkeypatch.setattr(paged_decode, "_device_arch", lambda _index: "gfx950")
+        q_packed = SimpleNamespace(
+            shape=(requests * 7, 128, 512), device=SimpleNamespace(index=0)
+        )
+        assert (
+            paged_decode._v4_aiter_fp8_decode_splits(
+                q_packed,
+                query_group=7,
+                kv_kind="csa",
+            )
+            == expected
+        )
+
+    @pytest.mark.parametrize(
+        "tokens,heads,query_group,kv_kind,arch",
+        [
+            (6 * 7, 128, 7, "hca", "gfx950"),
+            (6 * 7, 64, 7, "csa", "gfx950"),
+            (6 * 4, 128, 4, "csa", "gfx950"),
+            (6 * 7, 128, 7, "csa", "gfx1250"),
+        ],
+    )
+    def test_aiter_split_table_rejects_unqualified_shapes(
+        self, monkeypatch, tokens, heads, query_group, kv_kind, arch
+    ):
+        from atom.model_ops.v4_kernels import paged_decode
+
+        monkeypatch.setattr(paged_decode, "_device_arch", lambda _index: arch)
+        q_packed = SimpleNamespace(
+            shape=(tokens, heads, 512), device=SimpleNamespace(index=0)
+        )
+        assert (
+            paged_decode._v4_aiter_fp8_decode_splits(
+                q_packed,
+                query_group=query_group,
+                kv_kind=kv_kind,
+            )
+            is None
+        )
+
     def test_master_switch_zero_routes_native_fp8_to_aiter(self, monkeypatch):
         from atom.model_ops.v4_kernels import paged_decode
 
