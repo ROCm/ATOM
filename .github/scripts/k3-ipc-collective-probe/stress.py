@@ -15,7 +15,14 @@ from collections import deque
 from datetime import timedelta
 from pathlib import Path
 
-VARIANTS = ("original", "nogil_serial", "nogil", "nogil_serial_retain", "nogil_retain")
+VARIANTS = (
+    "original",
+    "nogil_serial",
+    "nogil",
+    "original_retain",
+    "nogil_serial_retain",
+    "nogil_retain",
+)
 WORLD = 8
 DEPTH = 16
 STEPS = 640
@@ -193,7 +200,7 @@ def consumer(connections, build, variant, out):
                 progress[rank] = {"step": step, "phase": "import"}
                 trace(logfile, phase="import_enter", step=step)
                 begin = time.monotonic()
-                if variant == "original":
+                if variant.startswith("original"):
                     event = torch.cuda.Event.from_ipc_handle(rank, message["handle"])
                 elif variant.startswith("nogil_serial"):
                     trace(logfile, phase="lock_wait_enter", step=step)
@@ -393,7 +400,7 @@ def main(args):
     save(
         args.out / "config.json",
         {
-            "variants": VARIANTS,
+            "variants": args.variants,
             "world_size": WORLD,
             "steps": STEPS,
             "credit_depth": DEPTH,
@@ -412,7 +419,7 @@ def main(args):
             "model_loaded": False,
         },
     )
-    for variant in VARIANTS:
+    for variant in args.variants:
         with (args.out / f"{variant}.log").open("w") as stream:
             process = subprocess.Popen(
                 [
@@ -445,6 +452,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--variant", choices=("all", *VARIANTS), default="all")
+    parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=VARIANTS)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--build", type=Path, default=Path("/tmp/k3-ipc-stress-build"))
     main(parser.parse_args())
