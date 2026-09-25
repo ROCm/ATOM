@@ -1,0 +1,127 @@
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py
+@@ -234,6 +234,18 @@
+         return MoRIIOMode.READ
+     else:
+         return MoRIIOMode.WRITE
++
++
++def get_moriio_defer_timeout(kv_transfer_config: KVTransferConfig) -> float:
++    default = (
++        MoRIIOConstants.VLLM_MORI_READ_ABORT_REQUEST_TIMEOUT
++        if get_moriio_mode(kv_transfer_config) == MoRIIOMode.READ
++        else MoRIIOConstants.DEFAULT_DEFER_TIMEOUT
++    )
++    return _positive_finite_timeout(
++        "kv_connector_extra_config.defer_timeout",
++        kv_transfer_config.kv_connector_extra_config.get("defer_timeout", default),
++    )
+ 
+ 
+ def get_port_offset(dp_rank: int, tp_rank: int, tp_size: int = 1) -> int:
+@@ -331,8 +343,8 @@
+         #                     WRITE mode.
+         # transfer_timeout -> Timeout for waiting_for_transfer_complete before
+         #                     raising TransferError (sec).
+-        # defer_timeout    -> Timeout before a deferred send with no finished_sending
+-        #                     notification is reaped and its blocks force-freed (sec).
++        # defer_timeout    -> Source lease timeout (sec). READ fails on expiry
++        #                     without ACK; WRITE reaps deferred sends.
+         # recv_abort_timeout -> Timeout before an in-flight recv whose RDMA
+         #                     completion never arrived is aborted (sec).
+ 
+@@ -372,10 +384,7 @@
+                 "transfer_timeout", MoRIIOConstants.DEFAULT_TRANSFER_TIMEOUT
+             ),
+         )
+-        defer_timeout = _positive_finite_timeout(
+-            "kv_connector_extra_config.defer_timeout",
+-            extra_config.get("defer_timeout", MoRIIOConstants.DEFAULT_DEFER_TIMEOUT),
+-        )
++        defer_timeout = get_moriio_defer_timeout(kv_transfer_config)
+         recv_abort_timeout = _positive_finite_timeout(
+             "kv_connector_extra_config.recv_abort_timeout",
+             extra_config.get(
+@@ -432,8 +441,8 @@
+     # Timeout (seconds) for waiting_for_transfer_complete before raising TransferError.
+     # Overridable via kv_connector_extra_config["transfer_timeout"].
+     DEFAULT_TRANSFER_TIMEOUT = 30.0
+-    # Timeout (seconds) before a deferred send with no finished_sending
+-    # notification is reaped and its blocks force-freed.
++    # WRITE timeout before an unacknowledged deferred send is reaped.
++    # READ uses VLLM_MORI_READ_ABORT_REQUEST_TIMEOUT and fails on expiry.
+     # Overridable via kv_connector_extra_config["defer_timeout"].
+     DEFAULT_DEFER_TIMEOUT = 60.0
+     # Timeout (seconds) before an in-flight recv whose RDMA completion was lost
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py
+@@ -41,6 +41,7 @@
+     TransferId,
+     WriteTask,
+     fold_local_rank,
++    get_moriio_defer_timeout,
+     get_moriio_mode,
+     get_peer_zmq_from_request_id,
+     get_port_offset,
+@@ -556,17 +557,11 @@
+         # Reqs to send and their expiration time
+         self._reqs_need_send: dict[ReqId, float] = {}
+         # Deadlines for requests whose block freeing was deferred.
+-        # Survives across scheduler steps. If the worker never reports
+-        # finished_sending before the deadline, we inject them into
+-        # connector_output.finished_sending so the scheduler frees the blocks to avoid
+-        # hanging indefinitely waiting for a free notification that never comes.
++        # READ sources remain held until ACK; expiry fails the engine.
++        # WRITE sources retain the existing deferred-send reaping policy.
+         # Value: (deadline, transfer_id) for unmapping after mutation.
+         self._deferred_send_deadlines: dict[ReqId, tuple[float, TransferId | None]] = {}
+-        self._defer_timeout = float(
+-            self.kv_transfer_config.kv_connector_extra_config.get(
+-                "defer_timeout", MoRIIOConstants.DEFAULT_DEFER_TIMEOUT
+-            )
+-        )
++        self._defer_timeout = get_moriio_defer_timeout(self.kv_transfer_config)
+         # Buffer for early ACKs that arrive before request_finished.
+         self._pending_sent_acks: dict[ReqId, float] = {}
+         self.paths: dict[str, zmq.Socket] = {}
+@@ -1292,12 +1287,10 @@
+ 
+         if delay_free_blocks:
+             # Prefill request on remote. It will be read from D upon completion
+-            self._reqs_need_send[request.request_id] = (
+-                time.perf_counter()
+-                + MoRIIOConstants.VLLM_MORI_READ_ABORT_REQUEST_TIMEOUT
+-            )
++            deadline = time.monotonic() + self._defer_timeout
++            self._reqs_need_send[request.request_id] = deadline
+             self._deferred_send_deadlines[request.request_id] = (
+-                time.monotonic() + self._defer_timeout,
++                deadline,
+                 params.get("transfer_id") if params else None,
+             )
+ 
+@@ -1342,8 +1335,8 @@
+         * An ACK that arrives BEFORE its request finished is parked in
+           ``_pending_sent_acks`` and released on a later step once the
+           request enters ``_deferred_send_deadlines``.
+-        * A deferred send whose ACK never arrives is reaped after
+-          ``_defer_timeout`` and surfaced, so leaked blocks are freed.
++        * Unacknowledged READ leases fail on expiry before freeing source KV.
++          WRITE sends are reaped after ``_defer_timeout`` as before.
+         * A parked ACK that never matches a deferral before its own
+           deadline is a stale duplicate (e.g. a real ACK landing after the
+           send was already reaped) and is dropped.
+@@ -1378,6 +1371,13 @@
+             for req_id, (deadline, _) in self._deferred_send_deadlines.items()
+             if now >= deadline
+         ]
++        unacknowledged = set(expired) - safe
++        if self.mode == MoRIIOMode.READ and unacknowledged:
++            raise RuntimeError(
++                "MoRI-IO READ source lease expired before release ACK; "
++                "refusing to release source KV blocks: "
++                f"{sorted(unacknowledged)[:4]}"
++            )
+         if expired:
+             safe.update(expired)
+             logger.warning(

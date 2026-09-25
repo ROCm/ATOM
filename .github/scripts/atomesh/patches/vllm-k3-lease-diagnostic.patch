@@ -1,0 +1,33 @@
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py
+@@ -1294,6 +1294,15 @@
+                 params.get("transfer_id") if params else None,
+             )
+ 
++        if delay_free_blocks and getattr(self, "_lease_diag_holds", 0) < 32:
++            self._lease_diag_holds = getattr(self, "_lease_diag_holds", 0) + 1
++            logger.warning(
++                "PD_LEASE hold rid=%s transfer_id=%s timeout=%.1f",
++                request.request_id,
++                params.get("transfer_id"),
++                self._defer_timeout,
++            )
++
+         # Return KV transfer params forwarded verbatim to the decode instance by
+         # the router. remote_dp_rank is the rank THIS prefill leg actually ran
+         # on: on the returnable paths (READ / serial WRITE) the router forwards
+@@ -1393,6 +1402,14 @@
+         for req_id in safe:
+             deferred_info = self._deferred_send_deadlines.pop(req_id, None)
+             transfer_id = deferred_info[1] if deferred_info else None
++            if deferred_info and getattr(self, "_lease_diag_acks", 0) < 32:
++                self._lease_diag_acks = getattr(self, "_lease_diag_acks", 0) + 1
++                logger.warning(
++                    "PD_LEASE release_ack rid=%s transfer_id=%s held_s=%.3f",
++                    req_id,
++                    transfer_id,
++                    now - (deferred_info[0] - self._defer_timeout),
++                )
+             self._pending_sent_acks.pop(req_id, None)
+             self.unmap_request_id(req_id, transfer_id=transfer_id)
+ 
