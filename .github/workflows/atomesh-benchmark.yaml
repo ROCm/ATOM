@@ -245,6 +245,13 @@ jobs:
           date -u > inspection/collected-at.txt
           hostname > inspection/collector-host.txt
           timeout 15s srun --help > inspection/srun-help.txt 2>&1 || true
+          timeout 10s scontrol --help > inspection/scontrol-help.txt 2>&1 || true
+          IFS=',' read -r -a controllers <<< "${SPUR_CONTROLLER_ADDR:-}"
+          for idx in "${!controllers[@]}"; do
+            [[ -n "${controllers[$idx]}" ]] || continue
+            timeout 10s scontrol --controller "${controllers[$idx]}" ping \
+              > "inspection/controller-${idx}-ping.txt" 2>&1 || true
+          done
           timeout 20s squeue --noheader --format='%i %T %D %j %N %R %a %q' \
             > inspection/squeue.tmp 2> inspection/squeue-errors.txt || true
           cp inspection/squeue.tmp inspection/cluster-squeue.txt
