@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ "${ATOMESH_CELL_ID:-}" == "k3-ipc-collective-probe" ]]; then
+  exec bash "$(dirname -- "${BASH_SOURCE[0]}")/../k3-ipc-collective-probe/workload.sh"
+fi
 
 ATOMESH_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 NODE_RANK="${NODE_RANK:-0}"
