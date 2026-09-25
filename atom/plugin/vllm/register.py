@@ -266,7 +266,10 @@ def _patch_vllm_harmony_parser_manager() -> None:
         enable_auto_tools=False,
         model_name=None,
         is_harmony=False,
+        **kwargs,
     ):
+        # Forward unknown keywords so this wrapper survives new parameters
+        # upstream adds to get_parser (e.g. tool_strict_level).
         parser_cls = original(
             cls,
             tool_parser_name=tool_parser_name,
@@ -274,6 +277,7 @@ def _patch_vllm_harmony_parser_manager() -> None:
             enable_auto_tools=enable_auto_tools,
             model_name=model_name,
             is_harmony=is_harmony,
+            **kwargs,
         )
         if parser_cls is not None or not is_harmony:
             return parser_cls
