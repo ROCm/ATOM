@@ -47,6 +47,98 @@ def prepare_dcp_index_gather_indices(
     )
 
 
+def gather_dcp_mla_pages(
+    source: torch.Tensor,
+    staging: torch.Tensor,
+    indices: DCPIndexGatherIndices,
+    scheduler_block_size: int,
+) -> int:
+    """Pack token-contiguous MLA bytes into complete DCP destination pages.
+
+    The direct interleave=1 path issues one RDMA descriptor per token. Gathering
+    the same bytes first lets the transport send pages, coalescing consecutive
+    destination blocks. Quantized values, scales and padding are copied as bytes.
+
+    Staging must be a uint8 buffer on the source device. Validate only tensor
+    metadata here, so these checks add no device synchronization to each layer.
+    """
+    if source.ndim < 2 or source.numel() == 0 or scheduler_block_size <= 0:
+        raise ValueError(
+            "MLA staging requires nonempty source pages and a positive block size"
+        )
+    if not source.is_contiguous():
+        raise ValueError("MLA staging requires contiguous source pages")
+    page_bytes = source.stride(0) * source.element_size()
+    if page_bytes % scheduler_block_size:
+        raise ValueError("MLA page bytes must be divisible by the scheduler block size")
+    dst_pages = indices.dst_pages
+    if dst_pages < 0:
+        raise ValueError("MLA staging requires a nonnegative destination page count")
+    if staging.dtype != torch.uint8:
+        raise TypeError("MLA staging must have dtype torch.uint8 for byte copies")
+    if staging.device != source.device:
+        raise ValueError("MLA staging must be on the same device as source")
+    if (
+        staging.ndim != 2
+        or staging.shape[0] < dst_pages
+        or staging.shape[1] != page_bytes
+    ):
+        raise ValueError(
+            "MLA staging must hold compact destination pages of the source byte width"
+        )
+    if not staging.is_contiguous():
+        raise ValueError("MLA staging pages must be contiguous")
+    token_count = dst_pages * scheduler_block_size
+    # Only these three vectors are consumed by MLA; tile indices belong to
+    # the separate preshuffled-index gather.
+    for name, tensor, dtypes in (
+        (
+            "src_block_id_per_token",
+            indices.src_block_id_per_token,
+            (torch.int32, torch.int64),
+        ),
+        ("src_token", indices.src_token, (torch.int32, torch.int64)),
+        ("valid", indices.valid, (torch.bool,)),
+    ):
+        if tensor.device != source.device:
+            raise ValueError(f"MLA {name} must be on the same device as source")
+        if tensor.ndim != 1 or tensor.numel() != token_count:
+            raise ValueError(
+                f"MLA {name} must be a 1-D tensor with {token_count} entries"
+            )
+        if tensor.dtype not in dtypes:
+            raise TypeError(f"MLA {name} must have dtype in {dtypes}")
+    if not dst_pages:
+        return 0
+    token_bytes = page_bytes // scheduler_block_size
+    n_tokens = dst_pages * scheduler_block_size
+    if indices.src_block_id_per_token.numel() != n_tokens:
+        raise ValueError(
+            f"MLA gather plan has {indices.src_block_id_per_token.numel()} tokens, "
+            f"expected {n_tokens}"
+        )
+    source_bytes = source.view(torch.uint8).reshape(-1)
+    dest = staging[:dst_pages].reshape(-1)
+    valid = indices.valid
+    if valid.dtype == torch.bool:
+        valid = valid.view(torch.uint8)
+    elif valid.dtype != torch.uint8:
+        valid = valid.to(torch.uint8)
+    from atom.kv_transfer.disaggregation import triton_mla_gather
+
+    triton_mla_gather.gather_dcp_mla_pages(
+        source_bytes,
+        dest,
+        indices.src_block_id_per_token,
+        indices.src_token,
+        valid,
+        page_bytes,
+        token_bytes,
+        n_tokens,
+    )
+    return dst_pages
+
+
 def gather_dcp_preshuffled_index_pages(
     source: torch.Tensor,
     staging: torch.Tensor,
