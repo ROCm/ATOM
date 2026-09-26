@@ -460,8 +460,8 @@ echo
 write_slurm_cancel_helper ""
 
 set +e
-SBATCH_OUTPUT="$("${SBATCH_CMD[@]}")"
-SBATCH_RC=$?
+SBATCH_RC=0
+submit_slurm_job_with_leader_retry "${SBATCH_CMD[@]}" || SBATCH_RC=$?
 set -e
 echo "${SBATCH_OUTPUT}"
 

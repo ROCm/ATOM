@@ -21,6 +21,50 @@ run_slurm_query() {
   fi
 }
 
+submit_slurm_job_with_leader_retry() {
+  local error_file controller index rc rejection expected_rejection
+  local -a command=("$@") controllers=() candidates=("")
+  error_file="$(mktemp)" || return 1
+  expected_rejection=$'Error: job submission failed\nCaused by:\n    code: \'The service is currently unavailable\', message: "not the Raft leader"'
+  if [[ "${USES_SPUR_CONTROLLER}" == "1" && -n "${SPUR_CONTROLLER_ADDR}" ]]; then
+    IFS=',' read -r -a controllers <<< "${SPUR_CONTROLLER_ADDR}"
+    candidates=("${SPUR_CONTROLLER_ADDR}")
+    if (( ${#controllers[@]} > 1 )); then
+      candidates+=("${controllers[@]}")
+    fi
+  fi
+  for controller in "${candidates[@]}"; do
+    if [[ -n "${controller}" ]]; then
+      for index in "${!command[@]}"; do
+        if [[ "${command[$index]}" == "--controller" ]]; then
+          command[$((index + 1))]="${controller}"
+          break
+        fi
+      done
+    fi
+    if SBATCH_OUTPUT="$("${command[@]}" 2>"${error_file}")"; then
+      cat "${error_file}" >&2
+      rm -f "${error_file}"
+      if [[ -n "${controller}" ]]; then
+        SPUR_CONTROLLER_ADDR="${controller}"
+      fi
+      return 0
+    else
+      rc=$?
+    fi
+    cat "${error_file}" >&2
+    # A timeout or any possibly accepted submission must not be retried.
+    rejection="$(sed '/^[[:space:]]*$/d' "${error_file}")"
+    if [[ "${USES_SPUR_CONTROLLER}" != "1" || "${rc}" -ne 1 ||
+      -n "${SBATCH_OUTPUT}" || "${rejection}" != "${expected_rejection}" ]]; then
+      break
+    fi
+    echo "Spur rejected submission at ${controller}: not the Raft leader." >&2
+  done
+  rm -f "${error_file}"
+  return "${rc}"
+}
+
 detect_slurm_backend() {
   local help
   if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
