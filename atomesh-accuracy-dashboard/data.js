@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790184594835,
+  "lastUpdate": 1790441409556,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -3302,6 +3302,51 @@ window.BENCHMARK_DATA = {
             "value": 0.8878,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35888053644 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609231534 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.166 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "RzH",
+            "username": "NidhoggD1",
+            "email": "80086062+NidhoggD1@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "68e0df5e7cc0e9eff9b5f8155ddb99bdcb43b32e",
+          "message": "fix(offload): fence dense LMCache saves (#2339)\n\n* fix(offload): fence dense LMCache saves\n\n* fix(lmcache): bind dense save event through guard\n\n* fix(lmcache): harden dense save fence dispatch\n\n* fix(lmcache): safely recover dense save fence failures\n\nTreat a save whose every source group is source-safe on every rank as\nquiescent: no rank still reads its source, so a store failure that arrives\nafter teardown leased nothing may retry or retire at once instead of being\nparked in `_save_retry_blocked` with no reclaim path.\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\n\n* fix(lmcache): make the dense save fence observable and ordered first\n\nFollow-ups from review:\n\n- `batched_from_gpu` enqueues the producer wait before the block-ID upload,\n  so no pack-stream work of a transfer precedes the dependency, and records\n  `producer_fenced=1` in the transfer stats. `[OFFLOAD-SAVE-PROF]` prints it,\n  so a store that reaches the connector without the event is visible instead\n  of silently unfenced.\n- `producer_event` is keyword-only; a wrapper passing extra positionals can no\n  longer bind one to it.\n- A staging state without a pack stream now raises instead of spinning on\n  `Event.synchronize()`; the fused staging pipeline already rejects that\n  device.\n- `OffloadWorkerMixin._guard` forwards keyword arguments, replacing the\n  `functools.partial` that hid `fn.__name__` from the failure log.\n- The fence comment names the scheduler frontier invariant it rests on\n  (metadata is dispatched before the forward; the save frontier covers only\n  already-forwarded chunks), and the chunked scheduler warns under PP, where\n  `advance_on_schedule` breaks that invariant.\n- Tests now falsify the one-event-per-step and wait-before-upload claims,\n  cover the keyword-only and no-pack-stream paths, and check `_guard`'s\n  kwargs and log name. README and the connector module docstring describe\n  the fence and its LMCache-kwargs dependency.\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Fable 5.1 <noreply@anthropic.com>",
+          "timestamp": "2026-09-25T11:01:05Z",
+          "url": "https://github.com/ROCm/ATOM/commit/68e0df5e7cc0e9eff9b5f8155ddb99bdcb43b32e"
+        },
+        "date": 1790441408761,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.9477,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/36254963974 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609261501 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9469 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 65.99,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/36254963974 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609261501 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9469 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.98,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8992,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/36254963974 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609261501 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.2191 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
