@@ -38,6 +38,7 @@ from atom.kv_transfer.disaggregation.types import (
     SaveSourceGroupId,
 )
 from atom.kv_transfer.offload import config as offcfg
+from atom.kv_transfer.offload import offload_trace
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload._offload_common import (
     OffloadWorkerMixin,
@@ -187,6 +188,10 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             save_ready_event = torch.cuda.Event()
             save_ready_event.record(torch.cuda.current_stream())
         for req in metadata.requests:
+            # Stamped here, on the RPC thread, so the row carries how long the
+            # job then sat in the pool -- the one term the in-job profile
+            # cannot see.
+            offload_trace.mark_submit(req)
             if req.load_spec is not None and self._do_load:
                 self._load_executor.submit(self._guard, "load", self._do_load_req, req)
             if req.save_spec is not None and self._do_save:
@@ -273,6 +278,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         )
         retrieve_ms = (time.perf_counter() - t_retrieve0) * 1000
         transfer_stats = self._last_gpu_connector_transfer_stats()
+        offload_trace.annotate(transfer_stats)
         self._lookup_unpin(req.req_id)
         loaded = bool(ret_mask[hbm:lmc].all().item())
         with self._lock:
@@ -349,6 +355,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             )
         store_ms = (time.perf_counter() - t_store0) * 1000
         transfer_stats = self._last_gpu_connector_transfer_stats()
+        offload_trace.annotate(transfer_stats)
         total_ms = (time.perf_counter() - t_total0) * 1000
         if self._profile_enabled():
             logger.info(

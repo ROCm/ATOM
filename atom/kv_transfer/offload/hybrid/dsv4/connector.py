@@ -50,6 +50,7 @@ from atom.kv_transfer.disaggregation.types import (
     SaveOperationId,
 )
 from atom.kv_transfer.offload import config as offcfg
+from atom.kv_transfer.offload import offload_trace
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload._offload_common import (
     OffloadSchedulerMixin,
@@ -660,6 +661,8 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             reserved_loads.append((req, reservation))
 
         for req, reservation in reserved_loads:
+            # See the dense connector: the queue wait is the point.
+            offload_trace.mark_submit(req)
             try:
                 self._load_executor.submit(
                     self._guard,
@@ -732,6 +735,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                             continue
                     producer_event = save_ready_event
                 try:
+                    offload_trace.mark_submit(req)
                     self._save_executor.submit(
                         self._run_save_req,
                         req,
@@ -1020,8 +1024,11 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             )
 
     def _guard(self, kind: str, fn, req, *args) -> None:
+        job = offload_trace.begin(kind, req)
+        ok = False
         try:
             fn(req, *args)
+            ok = True
         except Exception:
             logger.exception(
                 "LMCache offload: %s failed for %s", fn.__name__, req.req_id
@@ -1031,6 +1038,9 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                     self._complete_load_locked(req, succeeded=False)
                 elif getattr(req, "slot_save_spec", None) is not None:
                     self._failed_sidecar_save.add(self._save_completion_id(req))
+        finally:
+            # See `OffloadWorkerMixin._guard`.
+            offload_trace.end(job, ok)
 
     def _complete_load_locked(self, req: LMCacheReqMeta, *, succeeded: bool) -> None:
         completion_id = self._load_completion_id(req)
@@ -1151,6 +1161,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         )
         retrieve_ms = (time.perf_counter() - t_retrieve0) * 1000
         transfer_stats = self._last_gpu_connector_transfer_stats()
+        offload_trace.annotate(transfer_stats)
         loaded = bool(ret_mask[hbm:lmc].all().item())
         total_ms = (time.perf_counter() - t_total0) * 1000
         if self._profile_enabled():
@@ -1543,6 +1554,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 )
                 store_ms = (time.perf_counter() - t_store0) * 1000
                 transfer_stats = self._last_gpu_connector_transfer_stats()
+                offload_trace.annotate(transfer_stats)
 
             if slot_spec is not None:
                 if slot_preparation_error is not None:

@@ -24,6 +24,7 @@ from atom.kv_transfer.disaggregation.types import (
     SaveCompletionId,
 )
 from atom.kv_transfer.offload import config as offcfg
+from atom.kv_transfer.offload import offload_trace
 
 logger = logging.getLogger("atom")
 _VALID_KV_ROLES = {"offload", "kv_both", "kv_producer", "kv_consumer"}
@@ -133,6 +134,7 @@ class OffloadWorkerMixin:
         self._load_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix=f"{thread_name_prefix}-load"
         )
+        offload_trace.configure_for_role(self.kv_role)
         self._lock = threading.Lock()
         self._done_save: set[SaveCompletionId] = set()
         self._done_load: set[LoadCompletionId] = set()
@@ -221,8 +223,11 @@ class OffloadWorkerMixin:
 
     def _guard(self, kind: str, fn, req) -> None:
         """Run a copy job off the RPC thread, tallying success/failure."""
+        job = offload_trace.begin(kind, req)
+        ok = False
         try:
             fn(req)
+            ok = True
         except Exception:
             logger.exception(
                 "offload %s failed for %s",
@@ -239,6 +244,10 @@ class OffloadWorkerMixin:
                 # hook.  Legacy layouts still report a terminal save so a
                 # whole-request deferred free cannot leak.
                 self._record_save_failure(req)
+        finally:
+            # In `finally`, so a tracer that cannot write does not get
+            # mistaken for a copy that failed.
+            offload_trace.end(job, ok)
 
     def _record_save_failure(self, req) -> None:
         with self._lock:

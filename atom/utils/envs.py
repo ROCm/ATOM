@@ -341,6 +341,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # role out of the file name.
     # See atom/model_engine/request_trace.py.
     "ATOM_REQUEST_TRACE_DIR": lambda: os.getenv("ATOM_REQUEST_TRACE_DIR", "").strip(),
+    # Directory for the LMCache offload trace: one CSV row per copy job, with
+    # how long it waited in the executor queue, how long it then ran, and
+    # whatever the layout reported about the copy itself. Empty (the default)
+    # keeps it off.
+    # OFFLOAD_PROFILE=1 already logs the second half; the queue wait is the
+    # half a request actually feels, and with one load worker and
+    # OFFLOAD_COPY_WORKERS save workers it is where a load on the TTFT path
+    # goes to wait. Two `time.perf_counter()` calls and an append per copy
+    # job -- a job is milliseconds of DMA, so the measurement is noise
+    # against it -- and nothing at all when the trace is off.
+    # See atom/kv_transfer/offload/offload_trace.py.
+    "ATOM_OFFLOAD_TRACE_DIR": lambda: os.getenv("ATOM_OFFLOAD_TRACE_DIR", "").strip(),
     # Move the startup heap (model, compiled graph, tokenizer, KV block pool)
     # into CPython's permanent generation once warmup is done, so collections
     # stop scanning it.  On by default; set 0 to keep the old behaviour.
