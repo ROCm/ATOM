@@ -5,6 +5,10 @@
 
 set -euo pipefail
 
+# All container PIDs and GPU accounting below belong to this allocated host.
+unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
+export DOCKER_HOST=unix:///var/run/docker.sock
+
 # Default RCCL to IPv4 (GID 1 on TW). Allow overrides for other fabrics.
 export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-1}"
 if [[ ! "${NCCL_IB_GID_INDEX}" =~ ^[0-9]+$ ]]; then
@@ -159,8 +163,38 @@ start_vllm_router() {
   docker logs -f "${container}" > "${log_file}" 2>&1 &
 }
 
+peer_state() {
+  python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_cleanup_state.py" "$1" \
+    --run-dir "${RUN_DIR}" --job-id "${JOB_ID}" \
+    --run-token "${ATOMESH_RUN_TOKEN}" --num-ranks "${NUM_NODES}"
+}
+
 pre_cleanup_local() {
-  echo "Cleanup is limited to this job's containers."
+  [[ "${ATOMESH_ENV_ATOMESH_PRE_CLEAN_GPU:-0}" == "1" ]] || return 0
+  timeout --kill-after=2s 120s python3 \
+    "${REPO_ROOT}/.github/scripts/atomesh/pd_gpu_cleanup.py" \
+    --job-id "${JOB_ID}" --run-token "${ATOMESH_RUN_TOKEN}" \
+    --node "${SELECTED_NODES[$node_rank]}" --rank "${node_rank}" \
+    --out "${RUN_DIR}/gpu-preflight-${node_rank}.json" || return $?
+  local deadline=$((SECONDS + 180)) state_rc
+  while true; do
+    if peer_state ready; then
+      return 0
+    else
+      state_rc=$?
+    fi
+    [[ "${state_rc}" -eq 1 ]] || return "${state_rc}"
+    if peer_state failed; then
+      state_rc=0
+    else
+      state_rc=$?
+    fi
+    if [[ "${state_rc}" -ne 1 ]] || (( SECONDS >= deadline )); then
+      echo "ERROR: peer GPU preflight failed or did not finish" >&2
+      return 1
+    fi
+    sleep 2
+  done
 }
 
 run_container_rank() {
@@ -350,8 +384,36 @@ EOF
   # unbounded container output on shared NFS, not in the scheduler response.
   echo "[logs] rank=${rank} phase=${execution_phase} full log: ${rank_dir}/${container_log}"
   set +e
-  docker "${docker_args[@]}" > "${rank_dir}/${container_log}" 2>&1
-  docker_rc=$?
+  docker "${docker_args[@]}" > "${rank_dir}/${container_log}" 2>&1 &
+  local docker_pid=$!
+  local peer_rc=1
+  while kill -0 "${docker_pid}" 2>/dev/null; do
+    peer_state failed
+    peer_rc=$?
+    if [[ "${peer_rc}" -ne 1 ]]; then
+      echo "[peer-failure] stopping this rank's ${container}, checker_rc=${peer_rc}"
+      timeout --kill-after=2s 12s docker rm -f "${container}" "${router_container}" \
+        >> "${RUN_DIR}/peer-stop-${rank}.log" 2>&1 || true
+      break
+    fi
+    sleep 1
+  done
+  if [[ "${peer_rc}" -ne 1 ]]; then
+    if kill -0 "${docker_pid}" 2>/dev/null; then
+      kill "${docker_pid}" 2>/dev/null || true
+      local client_deadline=$((SECONDS + 5))
+      while kill -0 "${docker_pid}" 2>/dev/null && (( SECONDS < client_deadline )); do
+        sleep 1
+      done
+      kill -KILL "${docker_pid}" 2>/dev/null || true
+    fi
+    # A wedged Docker client must not delay container cleanup indefinitely.
+    # The host daemon container is checked independently by cleanup_spur.
+    docker_rc=1
+  else
+    wait "${docker_pid}"
+    docker_rc=$?
+  fi
   set -e
   # Other ranks exit once the router stops answering.
   bounded_docker_rm "${router_container}"
@@ -411,7 +473,60 @@ run_spur_job() {
   echo "ips=${IPADDRS}"
   echo "run_dir=${RUN_DIR}"
 
-  pre_cleanup_local
+  SPUR_NODE_RANK_FOR_CLEANUP="${node_rank}"
+  SPUR_CLEANUP_DONE=0
+  cleanup_spur() {
+    local rc="${1:-$?}"
+    if [[ "${SPUR_CLEANUP_DONE}" == "1" ]]; then
+      return "${rc}"
+    fi
+    SPUR_CLEANUP_DONE=1
+    # A second cancellation must not interrupt the first bounded cleanup.
+    trap '' HUP INT TERM
+    echo "=== cleanup rank=${SPUR_NODE_RANK_FOR_CLEANUP} rc=${rc} ==="
+    publish_rank_rc "${SPUR_NODE_RANK_FOR_CLEANUP}" "${rc}"
+    local suffix name remove_rc child query_rc=0
+    local -a removers=()
+    for suffix in "" "-benchmark" "-eval" "-router" "-benchmark-router" "-eval-router"; do
+      name="atomesh-${ATOMESH_CELL_ID}-${JOB_ID}-${SPUR_NODE_RANK_FOR_CLEANUP}${suffix}"
+      (
+        remove_rc=0
+        timeout --kill-after=2s 12s docker rm -f "${name}" \
+          > "${RUN_DIR}/cleanup-remove-${SPUR_NODE_RANK_FOR_CLEANUP}${suffix}.log" 2>&1 || remove_rc=$?
+        printf '%s\n' "${remove_rc}" > "${RUN_DIR}/cleanup-remove-${SPUR_NODE_RANK_FOR_CLEANUP}${suffix}.rc"
+      ) &
+      removers+=("$!")
+    done
+    for child in "${removers[@]}"; do
+      wait "${child}" || true
+    done
+    timeout --kill-after=2s 10s docker ps -a \
+      --filter "name=^/atomesh-${ATOMESH_CELL_ID}-${JOB_ID}-${SPUR_NODE_RANK_FOR_CLEANUP}(-|$)" \
+      --format '{{.Names}} {{.Status}}' > "${RUN_DIR}/cleanup-containers-${SPUR_NODE_RANK_FOR_CLEANUP}.txt" 2>&1 || query_rc=$?
+    printf '%s\n' "${query_rc}" > "${RUN_DIR}/cleanup-query-${SPUR_NODE_RANK_FOR_CLEANUP}.rc"
+    if [[ "${query_rc}" -ne 0 || -s "${RUN_DIR}/cleanup-containers-${SPUR_NODE_RANK_FOR_CLEANUP}.txt" ]]; then
+      [[ "${rc}" -ne 0 ]] || rc=1
+    fi
+    publish_rank_rc "${SPUR_NODE_RANK_FOR_CLEANUP}" "${rc}"
+    python3 - "${RUN_DIR}" "${JOB_ID}" "${ATOMESH_RUN_TOKEN}" "${SPUR_NODE_RANK_FOR_CLEANUP}" "${query_rc}" "${rc}" <<'PYDONE'
+import json
+import sys
+from pathlib import Path
+root, job, token, rank, query, rc = sys.argv[1:]
+p = Path(root) / f"cleanup-complete-{rank}.json"
+tmp = p.with_suffix(".tmp")
+tmp.write_text(json.dumps({"job_id": job, "run_token": token, "rank": int(rank),
+                          "query_rc": int(query), "return_code": int(rc), "finished": True}) + "\n")
+tmp.replace(p)
+PYDONE
+    return "${rc}"
+  }
+  trap 'cleanup_spur $?; exit $?' EXIT
+  trap 'cleanup_spur 129; exit $?' HUP
+  trap 'cleanup_spur 130; exit $?' INT
+  trap 'cleanup_spur 143; exit $?' TERM
+
+  pre_cleanup_local || return $?
   write_env_file "${env_file}"
   if [[ "${node_rank}" -eq 0 ]]; then
     cat > "${RUN_DIR}/cell-metadata.json" <<EOF
@@ -429,34 +544,6 @@ run_spur_job() {
 EOF
   fi
 
-  SPUR_NODE_RANK_FOR_CLEANUP="${node_rank}"
-  SPUR_CLEANUP_DONE=0
-  cleanup_spur() {
-    local rc="${1:-$?}"
-    local suffix
-    if [[ "${SPUR_CLEANUP_DONE}" == "1" ]]; then
-      return "${rc}"
-    fi
-    SPUR_CLEANUP_DONE=1
-    echo "=== cleanup rank=${SPUR_NODE_RANK_FOR_CLEANUP} rc=${rc} ==="
-    # Publish before cleanup: Spur accounting is unreliable, so the workflow
-    # falls back to these per-rank codes.
-    publish_rank_rc "${SPUR_NODE_RANK_FOR_CLEANUP}" "${rc}"
-    for suffix in "" "-benchmark" "-eval" "-router" "-benchmark-router" "-eval-router"; do
-      bounded_docker_rm \
-        "atomesh-${ATOMESH_CELL_ID}-${JOB_ID}-${SPUR_NODE_RANK_FOR_CLEANUP}${suffix}"
-    done
-    local query_rc=0
-    timeout --kill-after=5s 15s docker ps -a \
-      --filter "name=^/atomesh-${ATOMESH_CELL_ID}-${JOB_ID}-${SPUR_NODE_RANK_FOR_CLEANUP}(-|$)" \
-      --format '{{.Names}} {{.Status}}' > "${RUN_DIR}/cleanup-containers-${SPUR_NODE_RANK_FOR_CLEANUP}.txt" 2>&1 || query_rc=$?
-    printf '%s\n' "${query_rc}" > "${RUN_DIR}/cleanup-query-${SPUR_NODE_RANK_FOR_CLEANUP}.rc"
-    return "${rc}"
-  }
-  trap 'cleanup_spur $?' EXIT
-  trap 'cleanup_spur 129; exit 129' HUP
-  trap 'cleanup_spur 130; exit 130' INT
-  trap 'cleanup_spur 143; exit 143' TERM
 
   local execution_phase service_port_offset
   local rc=0

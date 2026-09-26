@@ -833,6 +833,7 @@ models:
     env:
       common:
         <<: *kimi_k3_vllm_env_common
+        ATOMESH_PRE_CLEAN_GPU: "1"
         VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4: "0"
         AITER_SITUV2_A8W4: "0"
         AITER_SITUV2_A4W4: "1"

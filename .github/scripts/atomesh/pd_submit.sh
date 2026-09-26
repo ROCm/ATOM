@@ -277,6 +277,14 @@ if dropped:
     print("exit 1")
     raise SystemExit(0)
 
+if cell.get("env", {}).get("common", {}).get("ATOMESH_PRE_CLEAN_GPU") == "1":
+    # Both submit paths below always request --exclusive. The node preflight
+    # also checks its allocation ID, hostname and all eight physical GPUs.
+    if int(runner.get("gpus_per_node", 0)) != 8:
+        print("echo 'GPU process cleanup requires eight GPUs per node' >&2")
+        print("exit 1")
+        raise SystemExit(1)
+    exports["ATOMESH_EXCLUSIVE_GPU_CLEANUP"] = "1"
 for key, value in exports.items():
     print(f"export {key}={q(value)}")
 
@@ -410,7 +418,18 @@ check_spur_workload_failure() {
   else
     SPUR_WORKLOAD_CHECK_RC=$?
   fi
-  # Collect the terminal job result after stopping the failed workload.
+  # The failure file asks every host worker to stop its own Docker service.
+  # Keep the allocation until their bounded cleanup has had time to finish.
+  local deadline=$((SECONDS + 180))
+  while (( SECONDS < deadline )); do
+    if python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_cleanup_state.py" cleaned \
+      --run-dir "${LOG_ROOT}/slurm_job-${job_id}" --job-id "${job_id}" \
+      --run-token "${ATOMESH_RUN_TOKEN}" --num-ranks "${NUM_NODES}"; then
+      break
+    fi
+    sleep 2
+  done
+  # Preserve the failed result even when the peer cleanup succeeds.
   scancel_slurm_job "workload failed"
   SLURM_EXTRA_STATUS_CHECKER=""
 }
