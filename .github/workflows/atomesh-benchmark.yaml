@@ -1,4 +1,4 @@
-name: K3 decode latent down MXFP4 experiment
+name: K3 decode latent down MXFP4 and dense FP8 experiment
 on:
   workflow_dispatch:
 permissions:
@@ -21,16 +21,16 @@ jobs:
           set -euo pipefail
           result_dir="decode-probe-results/${GITHUB_RUN_ATTEMPT}"
           mkdir -p "${result_dir}"
-          cancel_script="${result_dir}/k3-decode-latent-fp4-probe.slurm-cancel.sh"
+          cancel_script="${result_dir}/k3-decode-latent-ptpc-probe.slurm-cancel.sh"
           if [[ -f "${cancel_script}" ]]; then
             timeout --kill-after=5s 90s bash "${cancel_script}" > "${result_dir}/cancel.log" 2>&1 || true
           fi
-          marker="${result_dir}/k3-decode-latent-fp4-probe.log-root"
+          marker="${result_dir}/k3-decode-latent-ptpc-probe.log-root"
           if [[ -f "${marker}" ]]; then
             bash .github/scripts/atomesh/pd_collect_logs.sh "$(cat "${marker}")" "${result_dir}/logs" || true
           fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: k3-decode-latent-fp4-${{ github.run_id }}-${{ github.run_attempt }}
+          name: k3-decode-latent-ptpc-${{ github.run_id }}-${{ github.run_attempt }}
           path: decode-probe-results/${{ github.run_attempt }}/
