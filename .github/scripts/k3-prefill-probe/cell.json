@@ -11,7 +11,7 @@
   "display_topology": "P-only TP8/DCP8 diagnostic",
   "pd_worker_layout": "multi_node",
   "nodes": [
-    "pit2-p03-g07"
+    "pit2-p03-g42"
   ],
   "num_nodes": 1,
   "isl": [
