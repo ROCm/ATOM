@@ -673,6 +673,26 @@ models:
               # costs an append on a path that is not the forward's.
               ATOMESH_ENABLE_TRACES: "1"
 
+        # The A/B partner of c64 above: identical in every respect except
+        # that the per-worker kernel caches start empty, which is what the
+        # run this was calibrated against did. Without it the seeded run has
+        # nothing to be compared to -- an empty JIT trace is the expected
+        # result there, not a measurement of the stall it removed.
+        - <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c64-nocache
+          concurrency: [64]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 128
+          env:
+            <<: *kimi_k3_agentic_lmcache192_env
+            common:
+              ATOM_ENABLE_REPLAYSSM: "0"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+              ATOMESH_SEED_AOT_CACHE: "0"
+              ATOMESH_ENABLE_TRACES: "1"
+
         - <<: *kimi_k3_agentic_no_dspark
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c72
           concurrency: [72]
