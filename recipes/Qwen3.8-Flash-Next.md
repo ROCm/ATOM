@@ -50,6 +50,43 @@ Draft depths 1, 2, and 3 are supported. The checkpoint contains one draft
 layer, reused at each step; no separate draft model is needed. The target
 and draft share the embedding and output head.
 
+## Agentic serving on one MI350X (prefix caching + MTP)
+
+For agent workloads (e.g. Claude Code through `/v1/messages`: long shared prefixes, many short turns, several concurrent sub-agents),
+**prefix caching is what makes turns cheap** and can be combined with native MTP. Measured on 1× MI350X (VF), FP8, TP1, 1M context,
+agent turn = 100k cached tokens + 4k new tokens, 256 output tokens:
+
+| | prefix caching off | prefix caching on |
+|---|---|---|
+| 1 agent, time to first token | 6.2 s | **0.53–0.58 s** |
+| 6 agents, time to first token (median) | 31 s | **~1.9 s** |
+
+Numerical check with MTP + prefix caching: 12/12 identical answers (5 markers spread over 58k tokens; cold, exact repeat and
+new-question turns).
+
+```bash
+python -m atom.entrypoints.openai_server \
+  --model Qwen/Qwen3.8-Flash-Next-FP8 --trust-remote-code -tp 1 \
+  --method mtp --num-speculative-tokens 3 \
+  --state-checkpoint-interval-tokens 16384 \
+  --cudagraph-capture-sizes "[1,2,3,4,5,6,8,16]" \
+  --max-num-seqs 16 --kv_cache_dtype bf16
+```
+
+- **`--state-checkpoint-interval-tokens`**: a GDN state checkpoint must exist at the resume point. `-1` (prompt-end anchors only) serves
+  conversations that only grow at the end, but sibling sub-agents that share a long prefix and diverge in the middle then recompute
+  everything. With `16384`, a real Claude Code session (auto mode + sub-agents) reached **94% prefix-cache hits**; the default `8192`
+  costs ~5–8% prefill throughput for the extra rungs.
+- **`--cudagraph-capture-sizes`**: capture every batch size you expect (the default list skips 3, 5, 6).
+- **Persist the Triton/comgr caches** (`~/.triton`, `~/.cache`) across container restarts and send a warm-up request after start:
+  first-time JIT compilation of a new shape stalls a request for 5–25 s.
+- MTP depth: 3 was best for 1–3 concurrent agents, 2 for 4–5 (measured 240 / 545 / 745 tok/s aggregate decode at 1 / 3 / 6 agents).
+- Clients that send `role: system` messages in the middle of `messages` (Claude Code 2.1.x) get HTTP 500 ("System message must be at the
+  beginning"); converting them in place (e.g. into a `<system-reminder>` block of the preceding user turn) keeps the prefix stable —
+  moving them to the top-level `system` field invalidates the cache on every new reminder.
+- Concurrent requests with an identical prefix do not share it until the first one finishes prefill; serializing them at the proxy
+  (release on first token) raised hits from 77% to 88% in the same session.
+
 ## Usage notes and limitations
 
 - For image requests, use `--no-enable_prefix_caching` and sufficient cache
