@@ -264,6 +264,16 @@ start_vllm_server() {
   cmd+=("${role_args[@]}")
   echo "[${role}] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} discovery=${NODE0_ADDR}:${VLLM_DISCOVERY_PORT}"
   dump_launch_info "${prefix}" "${cmd[@]}"
+  python3 - "${RUNTIME_LOG_DIR}/${log_name}.launch.json" "${role}" \
+    "${ATOMESH_EXECUTION_PHASE}" "${cmd[@]}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+Path(sys.argv[1]).write_text(json.dumps({
+    "role": sys.argv[2], "phase": sys.argv[3], "argv": sys.argv[4:]
+}, indent=2) + "\n")
+PY
   start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" \
     env "${cache_env[@]}" "${server_env[@]}" "${cmd[@]}"
 }

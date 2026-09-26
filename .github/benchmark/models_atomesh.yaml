@@ -824,7 +824,7 @@ models:
             benchmark_duration: 1200
             warmup_requests_per_lane: 1
 
-  # InferenceX k3-pd-dspark-native-cprr: DSpark k=4 with native DCP verify.
+  # ATOM C16 acceptance with the InferenceX native DCP serving configuration.
   Kimi-K3-MXFP4-vLLM-DSpark:
     backend: vllm
     image: vllm/vllm-openai-rocm:nightly@sha256:659b28319fef4ea0e3d8f33e25b4c35d6f663f5d818a5b2fa06dceaf859234e4
@@ -862,7 +862,7 @@ models:
     server:
       common_args:
         # Forced mean length (including bonus) applies only to benchmark decode.
-        spec_decode_acceptance_length: 3.36
+        spec_decode_acceptance_length: 3.0
         extra_args: >-
           --moe-backend auto --load-format fastsafetensors --gpu-memory-utilization 0.88
           --language-model-only --max-num-seqs 80 --enable-auto-tool-choice
@@ -871,19 +871,19 @@ models:
           --kv-cache-dtype fp8 --block-size 128 --max-num-batched-tokens 16384
           --attention-config '{"mla_prefill_backend":"ROCM_AITER_FA","use_prefill_query_quantization":true}'
           --attention-backend ROCM_AITER_MLA --dcp-comm-backend a2a --cp-kv-cache-interleave-size 1
-          --speculative-config '{"model":"${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark","num_speculative_tokens":4,"method":"dspark","attention_backend":"ROCM_AITER_MLA","kv_cache_dtype":"fp8","draft_sample_method":"probabilistic","rejection_sample_method":"standard"}'
-          --quantization-config '{"targets":{"re:.*\\.routed_expert_down_proj$":"mxfp4"}}'
+          --speculative-config '{"model":"${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark","num_speculative_tokens":3,"method":"dspark","attention_backend":"ROCM_AITER_MLA","kv_cache_dtype":"fp8","draft_sample_method":"probabilistic","rejection_sample_method":"standard"}'
+          --quantization-config '{"targets":{"re:.*\\.routed_expert_down_proj$":"mxfp4","re:.*\\.self_attn\\.(in_proj_qkvgfab|f_b_proj|o_proj|fused_qkv_a_proj|q_b_proj|g_proj)$":"fp8_per_channel","re:.*\\.shared_experts\\.(gate_up_proj|down_proj)$":"fp8_per_channel","re:.*\\.mlp\\.(gate_up_proj|down_proj)$":"fp8_per_channel"}}'
     suites:
       vllm:
         - &kimi_k3_vllm_dspark_dcp8
-          name: kimi-k3-vllm-dspark4-1p1d-tp8-dcp8-agentic-lmcache-1m-c64-latent-fp4
+          name: kimi-k3-vllm-dspark3-1p1d-tp8-dcp8-agentic-lmcache-1m-c16
           topology: 1p1d
           display_topology: 1P1D-TP8-DCP8
           pd_worker_layout: multi_node
           nodes: "${ATOMESH_1P1D_NODES}"
           isl: [1048576]
           osl: 1024
-          concurrency: [64]
+          concurrency: [16]
           prefill:
             workers: 1
             tp: 8
