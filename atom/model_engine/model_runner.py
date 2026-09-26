@@ -698,6 +698,11 @@ class ModelRunner:
             self.rank_name = f"dp{dp_rank_local}_tp{rank}"
         else:
             self.rank_name = f"rank_{rank}"
+        # Before the weights load, so warmup and graph capture -- where the
+        # kernels are supposed to be compiled -- are inside the trace. A
+        # compile that shows up after this point, under traffic, is the thing
+        # being looked for.
+        self._install_jit_trace()
         if config.torch_profiler_dir is not None:
             rank_name = self.rank_name
             if config.pipeline_parallel_size > 1:
@@ -860,6 +865,17 @@ class ModelRunner:
             # exits between scrapes would drop its tail. Closing here is what
             # makes the last rows of a finished run readable.
             atexit.register(self.gpu_forward_metrics.close_trace)
+
+    def _install_jit_trace(self):
+        """Hook the kernel compile paths, if ATOM_JIT_TRACE_DIR asks for it."""
+        trace_dir = envs.ATOM_JIT_TRACE_DIR
+        if not trace_dir:
+            return
+        from atom.utils import jit_trace
+
+        path = os.path.join(trace_dir, f"jit-{self.rank_name}-{os.getpid()}.jsonl")
+        if jit_trace.install(path):
+            atexit.register(jit_trace.close)
 
     def _forward_trace_path(self):
         """Per-rank path for the forward trace, or None when it is off.

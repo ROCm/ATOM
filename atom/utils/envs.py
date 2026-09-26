@@ -314,6 +314,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # worker, one file per rank, so give each role its own directory.
     # See GPUForwardMetrics in atom/model_engine/gpu_metrics.py.
     "ATOM_FORWARD_TRACE_DIR": lambda: os.getenv("ATOM_FORWARD_TRACE_DIR", "").strip(),
+    # Directory for the kernel-compilation trace: one JSON line per FlyDSL
+    # compile, per FlyDSL disk-cache probe and per AITER module build, with
+    # how long each took. Empty (the default) keeps it off.
+    # Every hooked call is a cold path -- the per-launch path returns from
+    # FlyDSL's call-state cache without reaching any of them -- so a warm
+    # cache produces an empty file at no cost. That is the point: it turns
+    # "did serving compile anything" from an inference off LLVM occupancy
+    # warnings into a measurement, and makes an empty trace the pass condition
+    # for a cache-seeding change.
+    # See atom/utils/jit_trace.py.
+    "ATOM_JIT_TRACE_DIR": lambda: os.getenv("ATOM_JIT_TRACE_DIR", "").strip(),
     # Move the startup heap (model, compiled graph, tokenizer, KV block pool)
     # into CPython's permanent generation once warmup is done, so collections
     # stop scanning it.  On by default; set 0 to keep the old behaviour.
