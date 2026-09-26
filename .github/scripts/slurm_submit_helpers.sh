@@ -12,6 +12,62 @@ USES_SPUR_CONTROLLER="${USES_SPUR_CONTROLLER:-0}"
 SPUR_CONTROLLER_ADDR="${SPUR_CONTROLLER_ADDR:-}"
 SPUR_ACCOUNTING_ADDR="${SPUR_ACCOUNTING_ADDR:-}"
 
+run_slurm_query() {
+  # Leave stderr visible, including unsupported arguments and transport errors.
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${SLURM_QUERY_TIMEOUT_SECONDS:-20}" "$@"
+  else
+    "$@"
+  fi
+}
+
+detect_slurm_backend() {
+  local help
+  if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
+    return 0
+  fi
+  # Runner labels and inherited Spur addresses also exist on native Slurm
+  # runners. Inspect the installed client before adding Spur-only arguments.
+  help="$(run_slurm_query scontrol --help 2>&1 || true)"
+  if [[ "${help}" == *Spur* ]]; then
+    USES_SPUR_CONTROLLER=1
+  fi
+}
+
+slurm_node_selection_args() {
+  local candidates="$1" count="$2" all_nodes excluded
+  local -a candidate_nodes
+  SLURM_NODE_SELECTION_ARGS=()
+  [[ -n "${candidates}" ]] || return 0
+  IFS=',' read -r -a candidate_nodes <<< "${candidates}"
+  if [[ "${USES_SPUR_CONTROLLER}" == "1" || "${#candidate_nodes[@]}" -le "${count}" ]]; then
+    SLURM_NODE_SELECTION_ARGS=(-w "${candidates}")
+    return 0
+  fi
+  # Native Slurm requires every host in -w. Exclude the complement
+  # instead, so the scheduler can choose only the requested number of nodes.
+  if ! all_nodes="$(run_slurm_query sinfo -N -h -o '%N')" || [[ -z "${all_nodes}" ]]; then
+    echo "ERROR: Cannot query cluster nodes to restrict the candidate pool." >&2
+    return 1
+  fi
+  excluded="$(python3 - "${candidates}" "${count}" "${all_nodes}" <<'PY'
+import sys
+
+candidates = set(sys.argv[1].split(","))
+cluster = set(sys.argv[3].split())
+missing = candidates - cluster
+if missing:
+    raise SystemExit("Unknown candidate nodes: " + ",".join(sorted(missing)))
+if len(candidates) < int(sys.argv[2]):
+    raise SystemExit("Not enough distinct candidate nodes")
+print(",".join(sorted(cluster - candidates)))
+PY
+  )" || return 1
+  if [[ -n "${excluded}" ]]; then
+    SLURM_NODE_SELECTION_ARGS=(--exclude "${excluded}")
+  fi
+}
+
 run_scancel() {
   local -a scancel_cmd=(scancel)
   if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then

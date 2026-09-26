@@ -115,8 +115,9 @@ if is_crusoe_v2:
         "http://crs-m2m-cpu-spur-v2-001.crusoe.amd.com:6819"
     )
 elif not spur_controller_addr:
-    spur_controller_addr = os.environ.get(
-        "SPUR_CONTROLLER_ADDR", "http://134.199.196.72:6817"
+    spur_controller_addr = os.environ.get("SPUR_CONTROLLER_ADDR") or (
+        "http://134.199.196.72:6817"
+        if slurm_submit_runner == "atomesh-cicd-mi350" else ""
     )
 
 exports = {
@@ -253,7 +254,7 @@ exports = {
     "SLURM_SUBMIT_RUNNER": slurm_submit_runner,
     "SLURM_ACCOUNT": "amd-aifw-dev" if is_crusoe_v2 else runner.get("slurm_account", "amd-frameworks"),
     "SLURM_PARTITION": "" if is_crusoe_v2 else runner.get("slurm_partition", "amd-frameworks"),
-    "SLURM_QOS": "amd-aifw-dev-qos" if is_crusoe_v2 else "",
+    "SLURM_QOS": "amd-aifw-dev-qos" if is_crusoe_v2 else runner.get("slurm_qos", ""),
     "SLURM_CPUS_PER_TASK": runner.get("cpus_per_task", 114),
     "SLURM_GPUS_PER_NODE": runner.get("gpus_per_node", 8),
     "SLURM_TIME_LIMIT": runner.get("time_limit", "06:00:00"),
@@ -309,6 +310,8 @@ USES_SPUR_CONTROLLER=0
 if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
   USES_SPUR_CONTROLLER=1
 fi
+source "${REPO_ROOT}/.github/scripts/slurm_submit_helpers.sh"
+detect_slurm_backend
 
 echo "=== ATOMesh benchmark cell ==="
 echo "cell=${ATOMESH_CELL_ID}"
@@ -380,10 +383,11 @@ stream_spur_shared_logs_once() {
   shopt -u nullglob
 }
 
-if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+# Every Spur worker writes container output to shared storage, regardless of
+# runner label. Stream it from the submitter rather than through Spur RPCs.
+if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
   SLURM_EXTRA_LOG_STREAMER=stream_spur_shared_logs_once
 fi
-source "${REPO_ROOT}/.github/scripts/slurm_submit_helpers.sh"
 install_slurm_cancel_traps
 
 IFS=',' read -r -a NODE_ARRAY <<< "${NODE_LIST}"
@@ -419,7 +423,7 @@ else
     --export=ALL 
     --job-name "${SLURM_JOB_NAME}"
   )
-  if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
+  if [[ "${USES_SPUR_CONTROLLER}" == "1" && -n "${SPUR_CONTROLLER_ADDR}" ]]; then
     SBATCH_CMD+=(--controller "${SPUR_CONTROLLER_ADDR}")
   fi
   if [[ -n "${SLURM_ACCOUNT}" ]]; then
@@ -440,7 +444,8 @@ else
     --time "${SLURM_TIME_LIMIT}"
   )
   if [[ -n "${NODE_LIST}" ]]; then
-    SBATCH_CMD+=(--nodelist "${NODE_LIST}")
+    slurm_node_selection_args "${NODE_LIST}" "${NUM_NODES}"
+    SBATCH_CMD+=("${SLURM_NODE_SELECTION_ARGS[@]}")
   fi
   SBATCH_CMD+=(
     --output "${SLURM_OUTPUT}"
