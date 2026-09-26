@@ -861,6 +861,8 @@ models:
         patches: [patches/lmcache-k3-boundary.patch, patches/lmcache-event-lifetime.patch, patches/lmcache-pending-store.patch]
     server:
       common_args:
+        # Forced mean length (including bonus) applies only to benchmark decode.
+        spec_decode_acceptance_length: 3.36
         extra_args: >-
           --moe-backend auto --load-format fastsafetensors --gpu-memory-utilization 0.88
           --language-model-only --max-num-seqs 80 --enable-auto-tool-choice

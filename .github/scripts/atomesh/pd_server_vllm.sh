@@ -230,6 +230,10 @@ start_vllm_server() {
   local server_port="$3"
   local prefix="${role^^}"
   local tp_var="${prefix}_TP_SIZE" dcp_var="${prefix}_DCP_SIZE" args_var="${prefix}_SERVER_ARGS"
+  local resolved_args
+  resolved_args="$(python3 "${ATOMESH_SCRIPT_DIR}/pd_vllm_spec.py" \
+    "${role}" "${ATOMESH_EXECUTION_PHASE}" "${SPEC_DECODE_ACCEPTANCE_LENGTH:-}" \
+    "${!args_var}")" || return $?
   apply_role_env "ATOMESH_${prefix}_ENV_" "${host_ip}"
   if [[ "${SERVED_MODEL_NAME}" == "Kimi-K3" && "${AITER_SITUV2_A4W4:-}" == "1" ]]; then
     python3 "${ATOMESH_SCRIPT_DIR}/../k3-a4w4/check_aiter_paths.py"
@@ -245,7 +249,7 @@ start_vllm_server() {
 
   local -a cache_env=() role_args=()
   build_server_cache_env "${role}" "${server_port}" cache_env
-  split_args role_args "${!args_var}"
+  split_args role_args "${resolved_args}"
   local -a cmd=(
     vllm serve "${MODEL_PATH}"
     --served-model-name "${SERVED_MODEL_NAME}"
