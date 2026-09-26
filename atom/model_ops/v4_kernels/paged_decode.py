@@ -84,7 +84,7 @@ _FP8_GROUP_SIZE = 64
 _FP8_DTYPE = torch.float8_e4m3fnuz
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _device_arch(device_index: int) -> str:
     """Return the base GCN architecture name without feature suffixes."""
     return getattr(
