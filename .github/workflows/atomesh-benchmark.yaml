@@ -338,6 +338,9 @@ jobs:
             echo "::warning::No shared log directory found for run ${SOURCE_RUN_ID}"
           fi
           find inspection -type f -printf '%P %s bytes\n'
+      - name: Inspect controller health and clean obsolete K3 jobs
+        if: ${{ inputs.inspect_run_id == '36240523437' }}
+        run: bash .github/scripts/atomesh/k3_spur_recovery.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
