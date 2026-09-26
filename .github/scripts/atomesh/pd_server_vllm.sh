@@ -84,6 +84,8 @@ print(f"[vllm] overlaid {len(files)} Python files")
 PY
   cp "${ATOMESH_SCRIPT_DIR}/../k3-prefill-probe/k3_stack_probe.py" \
     "${VLLM_SITE_DIR}/k3_stack_probe.py"
+  cp "${ATOMESH_SCRIPT_DIR}/../k3-prefill-probe/timeline_event.py" \
+    "${ATOMESH_SCRIPT_DIR}/../k3-prefill-probe/timeline.cpp" "${VLLM_SITE_DIR}/"
   for patch_file in vllm-k3-read-source-lease.patch vllm-k3-read-failure.patch \
     vllm-k3-sync-read-init.patch vllm-k3-full-read-context.patch \
     vllm-k3-read-step-completion.patch vllm-k3-worker-stacks.patch; do
@@ -163,6 +165,8 @@ start_lmcache() {
     exit 2
   fi
   install_lmcache
+  env "${lmcache_env[@]}" python3 "${ATOMESH_SCRIPT_DIR}/../k3-prefill-probe/timeline_event.py" --build
+  env "${lmcache_env[@]}" python3 "${ATOMESH_SCRIPT_DIR}/../k3-prefill-probe/timeline_smoke.py"
   local -a extra=()
   split_args extra "${ATOMESH_VLLM_LMCACHE_SERVER_ARGS:-}"
   local -a cmd=(
