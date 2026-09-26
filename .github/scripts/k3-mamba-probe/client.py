@@ -163,14 +163,24 @@ async def cohort(session, args, cases, role, concurrency, experiment):
     return {r["case"]: r for r in rows}
 
 
-def check_observations(args, expected):
+def read_observations(logs):
     observations = {}
-    for path in args.logs.glob("decode-*.log"):
-        for line in path.open(errors="replace"):
-            if "K3_MAMBA_BOUNDARY " not in line:
-                continue
-            value = json.loads(line.split("K3_MAMBA_BOUNDARY ", 1)[1])
-            observations.setdefault(value["salt"], []).append(value)
+    for path in logs.glob("decode-*.log"):
+        try:
+            stream = path.open(errors="replace")
+        except FileNotFoundError:
+            continue
+        with stream:
+            for line in stream:
+                # A tee/NFS reader can observe an unfinished final log line.
+                if not line.endswith("\n") or "K3_MAMBA_BOUNDARY " not in line:
+                    continue
+                value = json.loads(line.split("K3_MAMBA_BOUNDARY ", 1)[1])
+                observations.setdefault(value["salt"], []).append(value)
+    return observations
+
+
+def boundary_checks(expected, observations):
     checks = []
     for row in expected:
         found = observations.get(row["salt"], [])
@@ -200,6 +210,22 @@ def check_observations(args, expected):
                 "observations": found,
             }
         )
+    return checks
+
+
+def check_observations(args, expected):
+    deadline = time.monotonic() + 60
+    while True:
+        checks = boundary_checks(expected, read_observations(args.logs))
+        # Missing records may become visible later; existing invalid or
+        # duplicate records must fail immediately, even if others are missing.
+        if all(c["valid"] for c in checks) or any(
+            c["observations"] and not c["valid"] for c in checks
+        ):
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(1)
     dump(args.out / "boundary-observations.json", checks)
     assert all(c["valid"] for c in checks), (
         "Boundary coverage/salt/cold-state check failed"
