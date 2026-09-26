@@ -775,35 +775,8 @@ class GDNStateMixin(PoolRowsMixin):
             )
         return self._checkpoint_plan_cache
 
-    def _checkpoint_descriptor_buffer(self) -> CpuGpuBuffer:
-        """Pinned staging for a step's whole descriptor, sized for the worst step.
-
-        Pinned because the alternative synchronizes: a pageable H2D from
-        `build()` makes the host wait out the forward already enqueued. Reused
-        because allocating pinned memory is itself a synchronizing call.
-
-        A step can carry at most one store and one restore per sequence, so two
-        per sequence bounds it. The caller checks that bound rather than growing
-        on demand: a descriptor that did not fit would otherwise be silently
-        truncated into a copy of the wrong shape.
-
-        The store half of that bound is not a property of the batch -- it is
-        held by `PagedStateCheckpointCoordinator._supersede`, which keeps one
-        pending boundary per sequence. A change that let two of a sequence's
-        boundaries drain together would raise from `build()` here, and would be
-        storing one of them from the wrong slot besides; the two constraints
-        have the same owner and move together.
-        """
-        if getattr(self, "_checkpoint_descriptor", None) is None:
-            plan = self._checkpoint_copy_plan()
-            max_ops = 2 * int(self.model_runner.config.max_num_seqs)
-            self._checkpoint_descriptor = CpuGpuBuffer(
-                max_ops * plan.num_spans,
-                3,
-                dtype=torch.int64,
-                device=self.model_runner.mamba_k_cache.device,
-            )
-        return self._checkpoint_descriptor
+    def _checkpoint_descriptor_device(self) -> torch.device:
+        return self.model_runner.mamba_k_cache.device
 
     def _validate_paged_state_op(self, op) -> None:
         """Refuse an op this worker cannot honour, before it addresses memory.
@@ -839,7 +812,9 @@ class GDNStateMixin(PoolRowsMixin):
         if any(unit < 0 or unit >= num_blocks for unit in op.unit_ids):
             raise RuntimeError("state checkpoint PAGE unit is out of range")
 
-    def execute_paged_state_copies(self, store_ops, restore_ops) -> None:
+    def execute_paged_state_copies(
+        self, store_ops, restore_ops, descriptor_slot: int = 0
+    ) -> None:
         """Copy raw checkpoint bytes between slots and non-contiguous PAGEs.
 
         Every op of either direction goes into one descriptor and one launch.
@@ -857,7 +832,7 @@ class GDNStateMixin(PoolRowsMixin):
         slot_bases = self._checkpoint_slot_bases()
         per_op = plan.num_spans
         total = (len(store_ops) + len(restore_ops)) * per_op
-        staging = self._checkpoint_descriptor_buffer()
+        staging = self._checkpoint_descriptor_buffer(descriptor_slot)
         if total > staging.np.shape[0]:
             raise RuntimeError(
                 f"a step asked to copy {total // per_op} checkpoints, more "

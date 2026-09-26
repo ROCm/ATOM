@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -59,40 +58,6 @@ class _StagingBuffer:
         if use_cuda:
             self.ready_event = torch.cuda.Event(blocking=False)
             self.free_event = torch.cuda.Event(blocking=False)
-
-
-def _env_flag(name: str, default: str = "0") -> bool:
-    # Stripped, and empty reads as off: `VAR=` is how a shell script clears a
-    # flag inline, and a bare membership test reads the empty string as ON --
-    # the opposite of what the operator wrote. `VAR="off "` did the same.
-    raw = os.environ.get(name, default).strip().lower()
-    return bool(raw) and raw not in ("0", "false", "no", "off")
-
-
-def _env_int(name: str, default: int, *, min_value: int = 1) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
-    if value < min_value:
-        raise ValueError(f"{name} must be >= {min_value}, got {value}")
-    return value
-
-
-def _env_optional_int(name: str, *, min_value: int = 1) -> int | None:
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return None
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
-    if value < min_value:
-        raise ValueError(f"{name} must be >= {min_value}, got {value}")
-    return value
 
 
 class _ThreadTransferState:

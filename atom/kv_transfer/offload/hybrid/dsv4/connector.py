@@ -27,7 +27,6 @@ Design:
 from __future__ import annotations
 
 import logging
-import os
 import threading
 import time
 from contextlib import nullcontext
@@ -87,6 +86,7 @@ from atom.kv_transfer.offload.metadata import (
     SlotLoadSpec,
     SlotSaveSpec,
 )
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -129,24 +129,6 @@ def _wait_for_publication(
         if remaining <= 0:
             return False
         sleep(min(poll_interval_s, remaining))
-
-
-def _env_nonnegative_float(name: str, default: float) -> float:
-    value = float(os.environ.get(name, str(default)))
-    if not isfinite(value):
-        raise ValueError(f"{name} must be finite")
-    if value < 0:
-        raise ValueError(f"{name} must be nonnegative")
-    return value
-
-
-def _env_positive_float(name: str, default: float) -> float:
-    value = float(os.environ.get(name, str(default)))
-    if not isfinite(value):
-        raise ValueError(f"{name} must be finite")
-    if value <= 0:
-        raise ValueError(f"{name} must be positive")
-    return value
 
 
 @dataclass(frozen=True)
@@ -210,14 +192,8 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         self.virtual_block_size: int | None = None
         self.profile = None
         self.chunk_size: int | None = None
-        self._publication_timeout_s = _env_nonnegative_float(
-            "OFFLOAD_PUBLICATION_TIMEOUT_S",
-            5.0,
-        )
-        self._publication_poll_interval_s = _env_positive_float(
-            "OFFLOAD_PUBLICATION_POLL_INTERVAL_S",
-            0.01,
-        )
+        self._publication_timeout_s = envs.OFFLOAD_PUBLICATION_TIMEOUT_S
+        self._publication_poll_interval_s = envs.OFFLOAD_PUBLICATION_POLL_INTERVAL_S
         self._publication_clock = time.monotonic
         self._publication_sleep = time.sleep
 
@@ -228,14 +204,14 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         # reload sat behind ~N filler saves -> request hung well past timeout).
         # The ATOM LMCache GPU connector owns per-thread staging streams.
         # OFFLOAD_COPY_WORKERS tunes the SAVE pool only.
-        n_save_workers = int(os.environ.get("OFFLOAD_COPY_WORKERS", "1"))
+        n_save_workers = envs.OFFLOAD_COPY_WORKERS
         # The SLOT load path is *not* thread-safe against itself: a worker batch
         # shares one staging row across its loads (`_SlotLoadBatchReservation`)
         # precisely because the load executor runs them in submission order. A
         # second load thread would run two loads through the same staging row
         # concurrently and corrupt both. OFFLOAD_LOAD_WORKERS therefore does not
         # apply to DSV4 -- honour it loudly rather than silently.
-        n_load_env = int(os.environ.get("OFFLOAD_LOAD_WORKERS", "1"))
+        n_load_env = envs.OFFLOAD_LOAD_WORKERS
         if n_load_env != 1:
             logger.warning(
                 "ATOM DSV4 offload: ignoring OFFLOAD_LOAD_WORKERS=%d; the SLOT "
@@ -450,13 +426,9 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         extra = kvc.get("kv_connector_extra_config", kvc) or {}
         configured = extra.get("slot_sidecar_staging_slots")
         if configured is None:
-            configured = os.environ.get("OFFLOAD_SLOT_STAGING_SLOTS", "1")
-            try:
-                count = int(configured)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    "SLOT sidecar staging count must be an integer"
-                ) from exc
+            count = envs.OFFLOAD_SLOT_STAGING_SLOTS
+            if count is None:
+                count = 1
         else:
             if isinstance(configured, bool) or not isinstance(configured, Integral):
                 raise ValueError("SLOT sidecar staging count must be an integer")
@@ -1934,17 +1906,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         # chunk-aligned, recompute the misaligned head up to the next chunk
         # boundary, then load the aligned remainder from CPU. (Previously gated
         # by the OFFLOAD_UNALIGNED_HANDOFF env var; now unconditional.)
-        try:
-            self._min_load_tokens = max(
-                0, int(os.environ.get("OFFLOAD_MIN_LOAD_TOKENS", "8192"))
-            )
-        except ValueError:
-            logger.warning(
-                "LMCache offload scheduler: invalid OFFLOAD_MIN_LOAD_TOKENS=%r; "
-                "using 8192",
-                os.environ.get("OFFLOAD_MIN_LOAD_TOKENS"),
-            )
-            self._min_load_tokens = 8192
+        self._min_load_tokens = envs.OFFLOAD_MIN_LOAD_TOKENS
 
         world = offcfg.lmcache_replica_world_size(config)
         meta = offcfg.build_lmcache_metadata(config, cfg, world, 0)

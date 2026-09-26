@@ -45,6 +45,68 @@ def _positive_float_env(name: str, default: str) -> float:
     return float(default)
 
 
+def _flag_env(name: str, default: str = "0") -> bool:
+    # Stripped, and empty reads as off: `VAR=` is how a shell script clears a
+    # flag inline, and a bare membership test reads the empty string as ON --
+    # the opposite of what the operator wrote. `VAR="off "` did the same.
+    raw = os.getenv(name, default).strip().lower()
+    return bool(raw) and raw not in ("0", "false", "no", "off")
+
+
+def _optional_int_env(name: str, *, min_value: int | None = None) -> int | None:
+    """Unset or empty reads as None; anything else must be an integer."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+    if min_value is not None and value < min_value:
+        raise ValueError(f"{name} must be >= {min_value}, got {value}")
+    return value
+
+
+def _int_env_or_default(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r: expected an integer; using default %d",
+            name,
+            raw,
+            default,
+        )
+        return default
+
+
+def _nonnegative_int_env(name: str, default: int) -> int:
+    value = _int_env_or_default(name, default)
+    if value < 0:
+        logger.warning(
+            "Invalid %s=%r: expected a nonnegative integer; using default %d",
+            name,
+            value,
+            default,
+        )
+        return default
+    return value
+
+
+def _finite_float_env(name: str, default: float, *, allow_zero: bool) -> float:
+    value = float(os.getenv(name, str(default)))
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    if allow_zero and value < 0:
+        raise ValueError(f"{name} must be nonnegative")
+    if not allow_zero and value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # Forward metadata transport: direct or packed. Both keep source checks.
     # Single-member groups and strided bindings retain direct copies.
@@ -818,6 +880,69 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENGRAM_OVERLAP": lambda: os.getenv("ATOM_ENGRAM_OVERLAP", "1") == "1",
     # Fuse FP32 post-wkv gating and residual addition; 0 selects the torch reference.
     "ATOM_ENGRAM_FUSED_GATE": lambda: os.getenv("ATOM_ENGRAM_FUSED_GATE", "1") == "1",
+    # --- KV offload (LMCache) ---
+    # Save / load executor widths of the offload worker. DSV4 ignores
+    # OFFLOAD_LOAD_WORKERS: its SLOT load path needs a serial load executor.
+    "OFFLOAD_COPY_WORKERS": lambda: int(os.getenv("OFFLOAD_COPY_WORKERS", "1") or "1"),
+    "OFFLOAD_LOAD_WORKERS": lambda: int(os.getenv("OFFLOAD_LOAD_WORKERS", "1") or "1"),
+    # Running-plus-queued save bound. None means unset: the connector then
+    # derives max(2, 2 * OFFLOAD_COPY_WORKERS) and the scheduler's state tier
+    # uses 2. A kv_connector_extra_config "max_pending_saves" takes precedence.
+    "OFFLOAD_MAX_PENDING_SAVES": lambda: _optional_int_env("OFFLOAD_MAX_PENDING_SAVES"),
+    # Minimum external-tier hit worth loading, and minimum prefix worth saving
+    # (native MP's shortest stored boundary and a late save's remainder), in
+    # tokens.
+    "OFFLOAD_MIN_LOAD_TOKENS": lambda: max(
+        0, _int_env_or_default("OFFLOAD_MIN_LOAD_TOKENS", 8192)
+    ),
+    "OFFLOAD_MIN_SAVE_TOKENS": lambda: max(
+        0, _int_env_or_default("OFFLOAD_MIN_SAVE_TOKENS", 8192)
+    ),
+    # Scheduler steps a memoised tier-lookup answer is replayed, and steps a
+    # failed lookup suppresses the next attempt.
+    "OFFLOAD_LOOKUP_MEMO_STEPS": lambda: _nonnegative_int_env(
+        "OFFLOAD_LOOKUP_MEMO_STEPS", 32
+    ),
+    "OFFLOAD_LOOKUP_RETRY_STEPS": lambda: _nonnegative_int_env(
+        "OFFLOAD_LOOKUP_RETRY_STEPS", 32
+    ),
+    # Per-transfer offload profiling logs.
+    "OFFLOAD_PROFILE": lambda: _flag_env("OFFLOAD_PROFILE"),
+    # Experimental: run the staging pack and copy legs on one stream.
+    "OFFLOAD_SINGLE_STREAM": lambda: _flag_env("OFFLOAD_SINGLE_STREAM"),
+    # GPU staging buffer size in LMCache chunks, and an upper bound in bytes.
+    # Unset derives the size from the KV geometry.
+    "OFFLOAD_GPU_STAGING_CHUNKS": lambda: _optional_int_env(
+        "OFFLOAD_GPU_STAGING_CHUNKS", min_value=1
+    ),
+    "OFFLOAD_GPU_STAGING_MAX_BYTES": lambda: _optional_int_env(
+        "OFFLOAD_GPU_STAGING_MAX_BYTES", min_value=1
+    ),
+    # Free the GPU staging buffer after each transfer instead of keeping it.
+    "OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER": lambda: _flag_env(
+        "OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER"
+    ),
+    # DSV4 SLOT sidecar staging rows; None means unset (1). A
+    # kv_connector_extra_config "slot_sidecar_staging_slots" takes precedence.
+    "OFFLOAD_SLOT_STAGING_SLOTS": lambda: _optional_int_env(
+        "OFFLOAD_SLOT_STAGING_SLOTS"
+    ),
+    # DSV4 committed SLOT sidecar index capacity; None means unset (65536). A
+    # kv_connector_extra_config "committed_sidecar_index_capacity" takes
+    # precedence.
+    "OFFLOAD_COMMITTED_SIDECAR_CAPACITY": lambda: _optional_int_env(
+        "OFFLOAD_COMMITTED_SIDECAR_CAPACITY"
+    ),
+    # DSV4 wait for a saved SLOT sidecar to become visible, and its poll period.
+    "OFFLOAD_PUBLICATION_TIMEOUT_S": lambda: _finite_float_env(
+        "OFFLOAD_PUBLICATION_TIMEOUT_S", 5.0, allow_zero=True
+    ),
+    "OFFLOAD_PUBLICATION_POLL_INTERVAL_S": lambda: _finite_float_env(
+        "OFFLOAD_PUBLICATION_POLL_INTERVAL_S", 0.01, allow_zero=False
+    ),
+    # LMCache MP transfer mode: auto, lmcache_driven or engine_driven. A
+    # kv_connector_extra_config "lmcache.mp.mp_transfer_mode" takes precedence.
+    "LMCACHE_MP_TRANSFER_MODE": lambda: os.getenv("LMCACHE_MP_TRANSFER_MODE", "auto"),
 }
 
 
@@ -858,9 +983,3 @@ def __getattr__(name: str):
 #                                   env itself -- it asks the connector, via
 #                                   save_abandon_timeout_s. ATOM does not own the
 #                                   knob, hence no default of its own here.
-# OFFLOAD_MAX_PENDING_SAVES       — offload connector queue-depth bound;
-#                                   defined/defaulted in
-#                                   kv_transfer/offload/_offload_common.py and
-#                                   documented in kv_transfer/offload/README.md.
-#                                   The state tier shares it (scheduler.py)
-#                                   rather than adding a second knob.

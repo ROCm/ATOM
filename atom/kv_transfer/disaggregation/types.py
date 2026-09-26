@@ -257,6 +257,18 @@ class KVTransferTensors:
     gather_sharded_index: Callable[..., tuple[int, int]] | None = None
     # Appended after the original staging fields for positional compatibility.
     prepare_sharded_index: Callable[..., Any] | None = None
+    # Native PAGE-backed state image contract. The spec names the exact codec
+    # and image geometry; the callback restores that image into an Active SLOT
+    # after a remote retrieve has finished writing its PAGE units. These are
+    # intentionally untyped model-engine objects to keep this module free of
+    # model-engine imports. The PAGE tensor views retain the source allocations;
+    # neither field asks the connector to snapshot a complete live SLOT.
+    paged_state_checkpoint_spec: object | None = None
+    execute_paged_state_copies: Callable[..., None] | None = None
+    # Same declaration for PAGE-backed native state checkpoint images. Kept
+    # separate so future layouts can describe PAGE and recurrent-state
+    # replication independently. Appended for positional compatibility.
+    native_state_tp_replication_factor: int = 1
     # Scheduler blocks the PAGE regions are addressed in. `init=False` because
     # a backend cannot answer it: `req.block_ids` is the scheduler's id space,
     # and a backend counts in its own page -- a different unit even where it is

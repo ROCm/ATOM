@@ -2103,9 +2103,21 @@ class ModelRunner:
             # place the builder and the connector are both in scope.
             transfer_tensors.state_backend = self.attn_metadata_builder
         if hasattr(self, "draft_kv_builder") and transfer_tensors is not None:
-            draft_regions = self.draft_kv_builder.get_kv_transfer_tensors()
-            if draft_regions:
-                transfer_tensors.block_regions.extend(draft_regions)
+            draft_transfer_tensors = self.draft_kv_builder.get_kv_transfer_tensors()
+            if draft_transfer_tensors.block_regions:
+                transfer_tensors.block_regions.extend(
+                    draft_transfer_tensors.block_regions
+                )
+                transfer_tensors.block_tensor_views.extend(
+                    draft_transfer_tensors.block_tensor_views
+                )
+                # Replication is a whole-PAGE declaration. One sharded draft
+                # region makes the combined target+draft object sharded even
+                # when the target alone is replicated.
+                transfer_tensors.tp_replication_factor = math.gcd(
+                    transfer_tensors.tp_replication_factor,
+                    draft_transfer_tensors.tp_replication_factor,
+                )
         if transfer_tensors is not None:
             # After the draft's regions are in, and here because this is the
             # only place holding both the complete region list and the

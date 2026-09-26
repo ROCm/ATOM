@@ -348,6 +348,13 @@ class MultiConnector(KVConnectorBase):
 class MultiConnectorScheduler(KVConnectorSchedulerBase):
     """Scheduler-side composite connector."""
 
+    def bind_block_manager(self, block_manager: Any) -> None:
+        """Bind native checkpoint owners before any request can be admitted."""
+        for connector in self._connectors:
+            bind = getattr(connector, "bind_block_manager", None)
+            if callable(bind):
+                bind(block_manager)
+
     def __init__(self, config: Any) -> None:
         self._connectors = _build_subconnectors(config, role="scheduler")
         self.is_producer = any(
@@ -645,6 +652,22 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
                 return None
             protected.update(blocks)
         return frozenset(protected)
+
+    def can_partially_deallocate_state(self, seq: Any) -> bool:
+        """Forward an explicit state-lifetime guarantee from its owner.
+
+        Missing methods are not treated as approval. The separate
+        ``protected_block_ids`` check still requires every deferring sub to
+        narrow its PAGE reads before the scheduler takes this path.
+        """
+        for connector in self._connectors:
+            should_defer = getattr(connector, "should_defer_free", None)
+            if not callable(should_defer) or not should_defer(seq):
+                continue
+            callback = getattr(connector, "can_partially_deallocate_state", None)
+            if callable(callback) and callback(seq) is True:
+                return True
+        return False
 
     def activate_block_leases(self, seq: Any, block_ids) -> None:
         for connector in self._connectors:

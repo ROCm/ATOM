@@ -2040,6 +2040,32 @@ class TestPostprocess:
         assert not seq.block_table
         assert sched.is_finished()
 
+    def test_per_request_state_without_capability_keeps_whole_request_deferred(
+        self, seq_factory
+    ):
+        sched = Scheduler(
+            MockConfig(
+                pool_entries={"state": 2},
+                pool_entries_per_req={"state": 1},
+            )
+        )
+        seq = self._prefill(
+            sched,
+            seq_factory([1, 2, 3, 4], has_per_req_cache=True),
+        )
+        pending: set[str] = set()
+        sched.kv_connector = SimpleNamespace(
+            request_finished=lambda s: pending.add(str(s.id)),
+            should_defer_free=lambda s: str(s.id) in pending,
+            protected_block_ids=lambda _s: frozenset(),
+        )
+
+        sched.postprocess([seq], self._output(seq.id, [sched.eos_token_id]))
+
+        assert sched.deferred_free_blocks[seq.id] is seq
+        assert seq.block_table
+        assert seq.state_slot >= 0
+
     @pytest.mark.parametrize("pp_size", [1, 4])
     @pytest.mark.parametrize("streaming", [False, True])
     @pytest.mark.parametrize(
