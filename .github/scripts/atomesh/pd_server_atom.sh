@@ -297,6 +297,33 @@ if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" ]]; then
   export ATOMESH_DECODE_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER="${ATOMESH_DECODE_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER:-${ATOM_ENABLE_METRICS_DEVICE_TIMER:-1}}"
 fi
 
+# Offline traces are opt-in per case: a cell sets ATOMESH_ENABLE_TRACES=1 in
+# its common env block. They are written under RUN_DIR, which pd_submit.sh
+# copies back into the result directory wholesale, so no upload step changes.
+#
+# All four are append-only, bounded and off by default in ATOM itself; what
+# turns them on is a directory name, which is what this sets. Per role and per
+# node rank, because every one of them is written by a process that exists
+# once per role per node and none of them coordinate on a file.
+if [[ "${ATOMESH_ENABLE_TRACES:-0}" == "1" ]]; then
+  for trace_role in PREFILL DECODE; do
+    trace_phase="$(echo "${trace_role}" | tr '[:upper:]' '[:lower:]')"
+    trace_dir="${RUN_DIR}/traces/${trace_phase}/rank-${NODE_RANK}"
+    mkdir -p "${trace_dir}"
+    for trace_var in ATOM_FORWARD_TRACE_DIR ATOM_JIT_TRACE_DIR \
+      ATOM_REQUEST_TRACE_DIR ATOM_OFFLOAD_TRACE_DIR; do
+      trace_name="ATOMESH_${trace_role}_ENV_${trace_var}"
+      # Indirect default, so a cell that names its own directory for one of
+      # them keeps it.
+      export "${trace_name}=${!trace_name:-${trace_dir}}"
+    done
+  done
+  # The forward trace reads the device timer's events; without it the trace
+  # would be silently empty. Agentic runs already force it on above.
+  export ATOMESH_PREFILL_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER="${ATOMESH_PREFILL_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER:-1}"
+  export ATOMESH_DECODE_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER="${ATOMESH_DECODE_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER:-1}"
+fi
+
 IFS=',' read -r -a IP_ARRAY <<< "${IPADDRS}"
 
 prefill_args=()

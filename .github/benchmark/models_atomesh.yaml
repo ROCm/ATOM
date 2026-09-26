@@ -666,6 +666,12 @@ models:
               # per-worker cache root started empty and every tuned GEMM compiled
               # inside the forward that first selected it.
               ATOMESH_SEED_AOT_CACHE: "1"
+              # Write the offline traces (per-forward shape and device time,
+              # kernel compiles, per-request stages, offload copy queue) under
+              # RUN_DIR/traces, which comes back with the logs. They are what
+              # the simulator is reconciled against; each is append-only and
+              # costs an append on a path that is not the forward's.
+              ATOMESH_ENABLE_TRACES: "1"
 
         - <<: *kimi_k3_agentic_no_dspark
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c72
