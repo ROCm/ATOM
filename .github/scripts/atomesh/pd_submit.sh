@@ -514,10 +514,8 @@ printf ' %q' "${SBATCH_CMD[@]}"
 echo
 write_slurm_cancel_helper ""
 
-set +e
-SBATCH_OUTPUT="$("${SBATCH_CMD[@]}")"
-SBATCH_RC=$?
-set -e
+SBATCH_RC=0
+submit_slurm_job_with_leader_retry "${SBATCH_CMD[@]}" || SBATCH_RC=$?
 echo "${SBATCH_OUTPUT}"
 
 if [[ "${SBATCH_RC}" -ne 0 ]]; then
