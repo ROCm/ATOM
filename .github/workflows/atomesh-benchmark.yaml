@@ -246,11 +246,36 @@ jobs:
           hostname > inspection/collector-host.txt
           timeout 15s srun --help > inspection/srun-help.txt 2>&1 || true
           timeout 10s scontrol --help > inspection/scontrol-help.txt 2>&1 || true
+          for client in scontrol sbatch squeue; do
+            command -v "${client}" >> inspection/client-versions.txt || true
+            timeout 5s "${client}" --version >> inspection/client-versions.txt 2>&1 || true
+          done
           IFS=',' read -r -a controllers <<< "${SPUR_CONTROLLER_ADDR:-}"
           for idx in "${!controllers[@]}"; do
             [[ -n "${controllers[$idx]}" ]] || continue
             timeout 10s scontrol --controller "${controllers[$idx]}" ping \
               > "inspection/controller-${idx}-ping.txt" 2>&1 || true
+            timeout 10s squeue --controller "${controllers[$idx]}" --noheader \
+              --format='%i %T %D %j %N %R %a %q' \
+              > "inspection/controller-${idx}-queue.txt" 2>&1 || true
+            if [[ "${controllers[$idx]}" =~ ^http://pit2-vm-amd-large-(02|03|04):6817$ ]]; then
+              curl --silent --show-error --connect-timeout 2 --max-time 5 \
+                --write-out '\nhttp_status=%{http_code}\n' \
+                "${controllers[$idx]%:6817}:6822/metrics/scheduler" \
+                > "inspection/controller-${idx}-scheduler-metrics.txt" 2>&1 || true
+            fi
+            for probe_job in 4545 4546 4547 4548; do
+              probe_prefix="inspection/controller-${idx}-job-${probe_job}"
+              {
+                if timeout 10s scontrol --controller "${controllers[$idx]}" show job "${probe_job}" \
+                  2> "${probe_prefix}-error.txt"; then
+                  echo 0 > "${probe_prefix}-rc.txt"
+                else
+                  echo "$?" > "${probe_prefix}-rc.txt"
+                fi
+              } | awk '{ for (i=1; i<=NF; i++) if ($i ~ /^(JobId|JobState|SubmitTime|StartTime|EndTime)=/) print $i }' \
+                > "${probe_prefix}-times.txt"
+            done
           done
           timeout 20s squeue --noheader --format='%i %T %D %j %N %R %a %q' \
             > inspection/squeue.tmp 2> inspection/squeue-errors.txt || true
