@@ -303,6 +303,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     )
     == "1",
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
+    # Directory for the per-batch forward trace: one CSV row per retired
+    # forward, with the shape frozen at enqueue and the device duration that
+    # ATOM_ENABLE_METRICS_DEVICE_TIMER already measures but only ever reports
+    # as a histogram bucket. Empty (the default) keeps the trace off.
+    # Requires ATOM_ENABLE_METRICS_DEVICE_TIMER=1; the events, the free list
+    # and the nonblocking poll are all that path's, so with the timer already
+    # on the trace adds an append per forward and one buffered write per
+    # metrics scrape, and never a device synchronization. Written by the
+    # worker, one file per rank, so give each role its own directory.
+    # See GPUForwardMetrics in atom/model_engine/gpu_metrics.py.
+    "ATOM_FORWARD_TRACE_DIR": lambda: os.getenv("ATOM_FORWARD_TRACE_DIR", "").strip(),
     # Move the startup heap (model, compiled graph, tokenizer, KV block pool)
     # into CPython's permanent generation once warmup is done, so collections
     # stop scanning it.  On by default; set 0 to keep the old behaviour.

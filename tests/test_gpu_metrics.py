@@ -6,7 +6,13 @@ from types import SimpleNamespace
 import pytest
 
 from atom.model_engine.engine_utility import EngineUtilityHandler
-from atom.model_engine.gpu_metrics import GPUForwardMetrics, record_gpu_forward
+import numpy as np
+
+from atom.model_engine.gpu_metrics import (
+    TRACE_COLUMNS,
+    GPUForwardMetrics,
+    record_gpu_forward,
+)
 
 
 class Event:
@@ -32,13 +38,31 @@ class Event:
         raise AssertionError("Telemetry must never synchronize the GPU")
 
 
-def batch(prefill=0, decode=1, dummy=False):
+def batch(prefill=0, decode=1, dummy=False, ctx=(128,), spec=0):
+    n = max(prefill + decode, 1)
     return SimpleNamespace(
-        req_ids=[1],
+        req_ids=list(range(n)),
         total_seqs_num_prefill=prefill,
         total_seqs_num_decode=decode,
         is_dummy_run=dummy,
+        # Only read when the per-batch trace is on; absent from the histogram
+        # path, which is why the fields below carry defaults.
+        total_tokens_num=prefill * 512 + decode,
+        total_tokens_num_prefill=prefill * 512,
+        total_tokens_num_decode=decode,
+        context_lens=np.asarray(ctx, dtype=np.int32),
+        num_spec_step=spec,
     )
+
+
+def trace_rows(path):
+    header, *rows = path.read_text().strip().split("\n")
+    return header, [dict(zip(TRACE_COLUMNS, r.split(","))) for r in rows]
+
+
+def retire(metrics):
+    for entry in list(metrics.pending):
+        entry[1].ready = entry[2].ready = True
 
 
 def test_events_are_polled_without_waiting_and_reused_only_after_completion():
@@ -69,7 +93,7 @@ def test_events_are_polled_without_waiting_and_reused_only_after_completion():
     with metrics.measure(batch(prefill=1, decode=1)):
         pass
     assert tuple(metrics.pending[-1][1:3]) == reused
-    for _, start, end, _ in metrics.pending:
+    for _, start, end, *_ in metrics.pending:
         start.ready = end.ready = True
     snapshot = metrics.snapshot()
     assert len(metrics.pending) == 0
@@ -83,11 +107,11 @@ def test_poll_checks_only_the_unfinished_head_of_a_full_queue():
     for _ in range(256):
         with metrics.measure(batch()):
             pass
-    for index, (_, start, end, _) in enumerate(metrics.pending):
+    for index, (_, start, end, *_) in enumerate(metrics.pending):
         start.ready = end.ready = index > 0
         end.queries = 0
     metrics.poll()
-    assert [end.queries for _, _, end, _ in metrics.pending] == [1] + [0] * 255
+    assert [end.queries for _, _, end, *_ in metrics.pending] == [1] + [0] * 255
     assert not metrics.free
     assert metrics.histograms["decode"].snapshot()["sum"] == 0
 
@@ -198,7 +222,7 @@ def prefill_batch(*chunks, decode=0):
 
 
 def complete_event(metrics, index=0, milliseconds=8):
-    _, start, end, _ = metrics.pending[index]
+    _, start, end, *_ = metrics.pending[index]
     start.duration_ms = milliseconds
     start.ready = end.ready = True
 
@@ -394,3 +418,103 @@ def test_request_gpu_histogram_export_is_per_worker_and_backward_compatible():
         assert all(
             "req_id" not in s.labels and "phase" not in s.labels for s in samples
         )
+
+
+def test_trace_is_off_unless_a_path_is_given():
+    """The default path must not even take the sample.
+
+    The trace exists to be cheap enough to leave on in a scored run; the way
+    that stays true is that turning it off removes the work, rather than
+    computing a sample and discarding it.
+    """
+    metrics = GPUForwardMetrics(Event)
+    with metrics.measure(batch()):
+        pass
+    assert metrics.trace is None
+    assert metrics.pending[0][4] is None
+    assert metrics.snapshot()["trace_dropped"] == 0
+
+
+def test_trace_records_the_shape_at_enqueue_and_the_duration_at_retire(tmp_path):
+    path = tmp_path / "forward.csv"
+    metrics = GPUForwardMetrics(Event, trace_path=str(path))
+    with metrics.measure(batch(decode=3, ctx=(100, 200, 300))):
+        pass
+
+    # Nothing retired yet, so there is nothing to write -- and in particular no
+    # file full of rows whose duration is not known.
+    metrics.snapshot()
+    assert not path.exists()
+
+    retire(metrics)
+    metrics.snapshot()
+    header, rows = trace_rows(path)
+    assert header == ",".join(TRACE_COLUMNS)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["seq"] == "1"
+    assert row["phase"] == "decode"
+    assert (row["n_seqs"], row["n_decode_seqs"]) == ("3", "3")
+    assert (row["ctx_sum"], row["ctx_max"]) == ("600", "300")
+    assert float(row["device_seconds"]) == 0.008
+    # The host span brackets the device span: the batch was enqueued before it
+    # could retire, which is what makes the launch gap between consecutive
+    # rows meaningful.
+    assert int(row["retire_ns"]) >= int(row["enqueue_ns"]) > 0
+
+
+def test_trace_appends_across_drains_under_one_header(tmp_path):
+    path = tmp_path / "forward.csv"
+    metrics = GPUForwardMetrics(Event, trace_path=str(path))
+    for phase in (batch(decode=2), batch(prefill=2, decode=0)):
+        with metrics.measure(phase):
+            pass
+        retire(metrics)
+        metrics.snapshot()
+    header, rows = trace_rows(path)
+    assert header == ",".join(TRACE_COLUMNS)
+    assert [r["phase"] for r in rows] == ["decode", "prefill"]
+    assert [r["seq"] for r in rows] == ["1", "2"]
+
+
+def test_trace_is_readable_before_the_worker_exits(tmp_path):
+    """A run killed at its deadline must keep the rows it already retired."""
+    path = tmp_path / "forward.csv"
+    metrics = GPUForwardMetrics(Event, trace_path=str(path))
+    with metrics.measure(batch()):
+        pass
+    retire(metrics)
+    metrics.snapshot()
+    assert len(trace_rows(path)[1]) == 1
+
+
+def test_trace_overflow_is_counted_rather_than_hidden(tmp_path):
+    """A drain that never comes costs rows, and says how many.
+
+    Silently shortening the series would turn a dropped drain into a wrong
+    conclusion offline; the counter plus the sequence numbers turn it into a
+    visible hole instead.
+    """
+    metrics = GPUForwardMetrics(
+        Event, trace_path=str(tmp_path / "forward.csv"), trace_capacity=2
+    )
+    for _ in range(4):
+        with metrics.measure(batch()):
+            pass
+    retire(metrics)
+    metrics.poll()
+    assert metrics.trace_dropped == 2
+    assert [row[0] for row in metrics.trace] == [3, 4]
+
+
+def test_trace_never_synchronizes(tmp_path):
+    """`Event.synchronize` raises, so reaching it fails the test."""
+    metrics = GPUForwardMetrics(Event, trace_path=str(tmp_path / "forward.csv"))
+    for _ in range(3):
+        with metrics.measure(batch()):
+            pass
+    metrics.snapshot()
+    retire(metrics)
+    metrics.snapshot()
+    metrics.close_trace()
+    assert len(trace_rows(tmp_path / "forward.csv")[1]) == 3

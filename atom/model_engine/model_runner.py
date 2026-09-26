@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import atexit
 import ctypes
 import gc
 import inspect
@@ -852,8 +853,32 @@ class ModelRunner:
         self.gpu_forward_metrics = None
         if envs.ATOM_ENABLE_METRICS_DEVICE_TIMER:
             self.gpu_forward_metrics = GPUForwardMetrics(
-                lambda: torch.cuda.Event(enable_timing=True)
+                lambda: torch.cuda.Event(enable_timing=True),
+                trace_path=self._forward_trace_path(),
             )
+            # The trace is buffered and only lands on a drain, so a worker that
+            # exits between scrapes would drop its tail. Closing here is what
+            # makes the last rows of a finished run readable.
+            atexit.register(self.gpu_forward_metrics.close_trace)
+
+    def _forward_trace_path(self):
+        """Per-rank path for the forward trace, or None when it is off.
+
+        One file per rank rather than one shared file: the ranks are separate
+        processes, and interleaving their appends would corrupt rows. The PID
+        keeps a restarted worker from appending to the previous run's file
+        under the same rank triple.
+        """
+        trace_dir = envs.ATOM_FORWARD_TRACE_DIR
+        if not trace_dir:
+            return None
+        pc = self.config.parallel_config
+        os.makedirs(trace_dir, exist_ok=True)
+        name = (
+            f"forward-dp{pc.data_parallel_rank}-pp{pc.pipeline_parallel_rank}"
+            f"-tp{self.rank}-{os.getpid()}.csv"
+        )
+        return os.path.join(trace_dir, name)
 
     def collect_forward_metrics(self):
         if self.gpu_forward_metrics is None:
