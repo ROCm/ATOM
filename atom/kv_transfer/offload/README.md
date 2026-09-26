@@ -145,7 +145,8 @@ access to the ATOM worker allocations:
 lmcache server --host 127.0.0.1 --port 5555 \
   --chunk-size 256 \
   --null-block-id -1 --separate-object-groups \
-  --supported-transfer-mode lmcache_driven --l1-size-gb 64
+  --supported-transfer-mode lmcache_driven --l1-size-gb 64 \
+  --eviction-policy LRU
 ```
 
 For example, add the following settings to a DSv4 launch that publishes the
