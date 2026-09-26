@@ -172,6 +172,14 @@ python -m atom.entrypoints.openai_server \
   }'
 ```
 
+Lookup has two timeout scopes. `lmcache.mp.mq_timeout` is passed to the
+LMCache scheduler/worker adapters for message-queue operations.
+`lmcache.mp.lookup_timeout` starts only after lookup submission returns and
+bounds ATOM's polling loop while the tier keeps returning no answer;
+`lmcache.mp.lookup_poll_interval` controls the sleep between those polls.
+Therefore `lookup_timeout` is not a hard wall-clock bound for a blocking
+adapter submission or status call.
+
 ATOM's configured chunk size must equal the MP server chunk size, and both must
 align to ATOM's PAGE/hash block size. A native prefix is loadable only where
 PAGE KV and a complete STATE checkpoint exist at the same boundary on every TP
