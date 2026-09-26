@@ -123,7 +123,8 @@
       "AITER_LOG_LEVEL": "WARNING",
       "VLLM_DCP_Q_REPLICATE": "0",
       "VLLM_ROCM_PAGE_ALIGN_KV": "1",
-      "VLLM_ROCM_AITER_NATIVE_DCP_VERIFY": "1"
+      "VLLM_ROCM_AITER_NATIVE_DCP_VERIFY": "1",
+      "ATOMESH_PRE_CLEAN_GPU": "1"
     },
     "prefill": {
       "PYTHONUNBUFFERED": "1",
