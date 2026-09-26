@@ -3336,6 +3336,10 @@ class DeepseekV4Attention(nn.Module):
                 qo_indptr=attn_md.qo_indptr,
                 empty_kv_indptr=attn_md.empty_kv_indptr,
                 prefix=f"{self.layer_name}.sparse_attn_decode",
+                query_group=(
+                    7 if attn_md.min_seqlen_q == attn_md.max_seqlen_q == 7 else 1
+                ),
+                kv_kind="csa" if ratio == 4 else "hca" if ratio == 128 else "swa",
             )  # [S, H, head_dim]
         else:
             # Two-source paged prefill: prefix from `unified_kv` (per-ratio
