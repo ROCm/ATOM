@@ -325,6 +325,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # for a cache-seeding change.
     # See atom/utils/jit_trace.py.
     "ATOM_JIT_TRACE_DIR": lambda: os.getenv("ATOM_JIT_TRACE_DIR", "").strip(),
+    # Directory for the per-request stage trace: one CSV row per request
+    # leaving this process, carrying the wall-clock time it reached each
+    # transition between arrival and its last token -- queued, block
+    # assignment received, first scheduled, parked on and released from a
+    # remote KV transfer, first decode, first token. Empty (the default)
+    # keeps it off.
+    # TTFT is already logged, but only as one number; these are the terms it
+    # is a sum of, and a simulator that matches the forward times can still
+    # miss TTFT by a term it never modelled. Every stamp is a state change
+    # the scheduler was making anyway, taken at request rate, never at token
+    # rate and never inside a forward; with the trace off each one is a
+    # global load and a comparison against None.
+    # One file per process, so give each role its own directory or read the
+    # role out of the file name.
+    # See atom/model_engine/request_trace.py.
+    "ATOM_REQUEST_TRACE_DIR": lambda: os.getenv("ATOM_REQUEST_TRACE_DIR", "").strip(),
     # Move the startup heap (model, compiled graph, tokenizer, KV block pool)
     # into CPython's permanent generation once warmup is done, so collections
     # stop scanning it.  On by default; set 0 to keep the old behaviour.

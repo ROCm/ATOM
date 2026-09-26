@@ -34,6 +34,7 @@ from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_pro
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.request import RequestOutput
+from atom.model_engine import request_trace
 from atom.model_engine.scheduler_metrics import SchedulerMetrics
 from atom.model_engine.sequence import (
     Sequence,
@@ -519,6 +520,7 @@ class Scheduler:
         self.running: deque[Sequence] = deque()
         self.config = config
         self.metrics = SchedulerMetrics()
+        request_trace.configure_for_role(self._METRICS_ROLE or "engine")
 
         # Admit-rejected seqs (those `_unschedulable_reason` flags). Drained
         # by `take_rejected` each EngineCore step; routed through the same
@@ -882,12 +884,14 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.metrics.enqueue(seq)
         self._warn_if_unschedulable(seq)
+        request_trace.stamp(seq, "queued")
         self.waiting.append(seq)
 
     def extend(self, seqs: list[Sequence]):
         for seq in seqs:
             self.metrics.enqueue(seq)
             self._warn_if_unschedulable(seq)
+            request_trace.stamp(seq, "queued")
         self.waiting.extend(seqs)
 
     def _deferred_sequence(self, req_id) -> Sequence | None:
@@ -2025,6 +2029,7 @@ class Scheduler:
         # local hits. Record before appending the producer's first output token.
         self._record_cache_reuse(seq)
         seq.status = SequenceStatus.RUNNING
+        request_trace.stamp(seq, "first_decode")
         seq.is_first_decode = True
         first_token_id = (seq.kv_transfer_params or {}).get("first_token_id")
         if first_token_id is not None:
@@ -2235,6 +2240,7 @@ class Scheduler:
         self._record_cache_reuse(seq)
         num_batched_tokens += chunk
         seq.status = SequenceStatus.RUNNING
+        request_trace.stamp(seq, "sched")
         seq.type = SequenceType.PREFILL
         self.running.append(seq)
         scheduled_seqs[seq.id] = seq
@@ -2408,6 +2414,7 @@ class Scheduler:
     ) -> None:
         skipped_waiting_requests.append(seq)
         seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+        request_trace.stamp(seq, "kv_park")
         self._count_inflight_load(seq)
 
     def _count_inflight_load(self, seq: Sequence) -> None:
@@ -2963,6 +2970,7 @@ class Scheduler:
                 seq.num_tokens = num_tokens
                 seq.leave_reason = leave_reason
                 seq.status = SequenceStatus.FINISHED
+                request_trace.record(seq, self._METRICS_ROLE or "engine", leave_reason)
                 self.total_finished_requests += 1
                 self.total_prompt_tokens += int(seq.num_prompt_tokens)
                 self.total_generation_tokens += max(
@@ -3145,6 +3153,7 @@ class Scheduler:
         if not self._pop_req_id(self.finished_recving_kv_req_ids, seq.id):
             return False
 
+        request_trace.stamp(seq, "kv_ready")
         logger.debug("KV transfer finished for seq %s, ready for scheduling.", seq.id)
 
         # Hash received prompt blocks into prefix cache so the next turn
@@ -3240,6 +3249,7 @@ class Scheduler:
                     seq.is_partial_prefill = False
                     self._partial_prefill_count -= 1
                 seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+                request_trace.stamp(seq, "kv_park")
                 self._count_inflight_load(seq)
                 parked.append(seq)
             else:
@@ -3496,6 +3506,7 @@ class PrefillScheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.block_manager = None  # blocks managed by decode process
         self.metrics = SchedulerMetrics()
+        request_trace.configure_for_role(self._METRICS_ROLE)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         # spec decode not used on prefill side
@@ -3553,11 +3564,13 @@ class PrefillScheduler:
 
     def add(self, seq: Sequence):
         self.metrics.enqueue(seq)
+        request_trace.stamp(seq, "queued")
         self.waiting.append(seq)
 
     def extend(self, seqs: list):
         for seq in seqs:
             self.metrics.enqueue(seq)
+            request_trace.stamp(seq, "queued")
         self.waiting.extend(seqs)
 
     def schedule(self):
@@ -3597,6 +3610,7 @@ class PrefillScheduler:
                     break
                 self.waiting.remove(seq)
                 seq.status = SequenceStatus.RUNNING
+                request_trace.stamp(seq, "sched")
                 seq.type = SequenceType.PREFILL
                 self.running.append(seq)
                 scheduled_seqs[seq.id] = seq
@@ -3832,6 +3846,7 @@ class DecodeScheduler(Scheduler):
         while self.prefill_done:
             seq = self.prefill_done.popleft()
             seq.status = SequenceStatus.RUNNING
+            request_trace.stamp(seq, "first_decode")
             seq.type = SequenceType.DECODE
             # Append the first generated token sampled by the prefill process.
             # In non-disagg mode, Scheduler.postprocess() does this after the

@@ -17,6 +17,7 @@ from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
+from atom.model_engine import request_trace
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.scheduler_metrics import SchedulerMetrics
 from atom.model_engine.sequence import (
@@ -1049,6 +1050,7 @@ class PrefillEngineCore(EngineCore):
                     assignment = self._pending_assignments.pop(seq.id)
                     seq.block_table = new_block_table(assignment.block_table)
                     seq.num_cached_tokens = assignment.num_cached_tokens
+                    request_trace.stamp(seq, "blocks")
 
     def _process_engine_step(self):
         from atom.model_engine.disagg_types import DisaggMsgType, PrefillDone
@@ -1093,6 +1095,10 @@ class PrefillEngineCore(EngineCore):
         # Remove completed sequences — prefill produces no output tokens.
         for seq in list(seqs.values()):
             seq.status = SequenceStatus.FINISHED
+            # The prefill side has no finish path of its own -- it produces no
+            # output tokens, so `postprocess` is a no-op there -- and this is
+            # where a request stops being this process's problem.
+            request_trace.record(seq, "prefill", "prefill_done")
             try:
                 self.scheduler.running.remove(seq)
             except ValueError:
