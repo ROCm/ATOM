@@ -341,6 +341,16 @@ jobs:
       - name: Inspect controller health and clean obsolete K3 jobs
         if: ${{ inputs.inspect_run_id == '36240523437' }}
         run: bash .github/scripts/atomesh/k3_spur_recovery.sh
+      - name: Inspect alternate MI355X resource access
+        if: ${{ inputs.atomesh_slurm_submit_runner == 'atomesh-cicd-mi355-crusoe' }}
+        run: |
+          id > inspection/alternate-caller.txt
+          timeout 15s sacctmgr show account where name=amd-atom > inspection/alternate-account.txt 2>&1 || true
+          timeout 15s sacctmgr show assoc where user="$(id -un)" > inspection/alternate-associations.txt 2>&1 || true
+          timeout 15s scontrol show partitions > inspection/alternate-partitions.txt 2>&1 || true
+          timeout 15s sinfo -N --format='%N|%t|%G' > inspection/alternate-nodes.txt 2>&1 || true
+          timeout 15s find /shared_nfs/huggingface_models/amd -maxdepth 3 -type d \
+            \( -name '*Kimi*K3*' -o -name '*kimi*k3*' \) > inspection/alternate-model-paths.txt 2>&1 || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
