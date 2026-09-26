@@ -655,7 +655,17 @@ models:
             common_args:
               <<: *kimi_k3_agentic_no_dspark_args
               max_num_seqs: 128
-          env: *kimi_k3_agentic_lmcache192_env
+          # Same env as the rest of the band; `common` is restated so the A/B
+          # toggle below stays on this case and off c56/c72/c80.
+          env:
+            <<: *kimi_k3_agentic_lmcache192_env
+            common:
+              ATOM_ENABLE_REPLAYSSM: "0"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+              # Set to "0" to reproduce the prefill stalls this case hit when the
+              # per-worker cache root started empty and every tuned GEMM compiled
+              # inside the forward that first selected it.
+              ATOMESH_SEED_AOT_CACHE: "1"
 
         - <<: *kimi_k3_agentic_no_dspark
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c72

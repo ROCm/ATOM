@@ -445,6 +445,36 @@ build_server_cache_env() {
   cache_root="${cache_base}/${role}-${server_port}"
   mkdir -p "${cache_root}"/{home,xdg,torchinductor,triton,aiter/jit,flydsl}
 
+  # A per-worker cache root keeps workers from racing each other, but an empty
+  # one also discards the AOT kernels AITER precompiled at install time from the
+  # tuned GEMM tables. AITER only falls back to its in-package cache when
+  # FLYDSL_RUNTIME_CACHE_DIR is unset, so pointing the variable here means every
+  # tuned GEMM is JIT-compiled inside the first prefill forward that selects it,
+  # stalling that forward -- and with it KV promotion and scheduling -- for
+  # seconds at a time. Seed the fresh root from the image instead.
+  if [[ "${ATOMESH_SEED_AOT_CACHE:-1}" == "1" ]]; then
+    local aiter_root
+    # find_spec locates the package without importing it, so this costs nothing
+    # and cannot initialize the GPU from inside the launcher.
+    aiter_root="$(python3 -c 'import importlib.util, os, sys
+spec = importlib.util.find_spec("aiter")
+sys.stdout.write(os.path.dirname(spec.origin) if spec and spec.origin else "")' 2>/dev/null || true)"
+    if [[ -d "${aiter_root}/jit/flydsl_cache" ]]; then
+      cp -a "${aiter_root}/jit/flydsl_cache/." "${cache_root}/flydsl/"
+      echo "[runtime] ${role} seeded flydsl cache from ${aiter_root}/jit/flydsl_cache" \
+        "($(find "${cache_root}/flydsl" -type f | wc -l) files)"
+    else
+      echo "[runtime] WARNING: ${role} found no AOT flydsl cache under '${aiter_root}';" \
+        "tuned GEMMs will be JIT-compiled during serving"
+    fi
+    # Same story for the prebuilt CK modules AITER_JIT_DIR would otherwise hide.
+    if [[ -d "${aiter_root}/jit" ]]; then
+      cp -a "${aiter_root}/jit/." "${cache_root}/aiter/jit/"
+      echo "[runtime] ${role} seeded aiter jit dir" \
+        "($(find "${cache_root}/aiter/jit" -name 'module_*.so' | wc -l) prebuilt modules)"
+    fi
+  fi
+
   out=(
     "HOME=${cache_root}/home"
     "XDG_CACHE_HOME=${cache_root}/xdg"
