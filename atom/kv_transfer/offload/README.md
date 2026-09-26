@@ -183,8 +183,11 @@ and temporary restore images together. By default it is
 worker. Candidates consume no PAGE/image pin until admission. If a request has
 already finished, admission resolves its token/hash chain through the live
 prefix index and stores only the still-resident contiguous prefix.
-`OFFLOAD_MIN_SAVE_TOKENS` suppresses a late save whose remaining prefix is too
-small. Unless configured otherwise, the shared save limit is
+Native MP never stores a prefix shorter than `OFFLOAD_MIN_SAVE_TOKENS`: with
+the default equal to `OFFLOAD_MIN_LOAD_TOKENS` it could never be loaded back,
+and on a 1K-token workload skipping those saves took the offload throughput
+cost from 12% to within run-to-run noise. The same threshold also suppresses a
+late save whose remaining prefix is too small. Unless configured otherwise, the shared save limit is
 `max(2, 2 * OFFLOAD_COPY_WORKERS)`.
 
 The model namespace includes PAGE/model geometry, TP and speculation settings,

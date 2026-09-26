@@ -73,8 +73,17 @@ class Adapter:
         self.closed = True
 
 
-def make_scheduler(monkeypatch, *, capacity=2, budget=60, units=30, role="offload"):
+def make_scheduler(
+    monkeypatch,
+    *,
+    capacity=2,
+    budget=60,
+    units=30,
+    role="offload",
+    min_save_tokens=0,
+):
     monkeypatch.setenv("OFFLOAD_MAX_PENDING_SAVES", str(capacity))
+    monkeypatch.setenv("OFFLOAD_MIN_SAVE_TOKENS", str(min_save_tokens))
     adapter = Adapter()
     connections = []
 
@@ -221,6 +230,18 @@ def test_save_frontier_selects_existing_checkpoint_below_computed_tokens(monkeyp
     assert len(request.token_ids) == 8
     assert request.native_state.boundary_tokens == 8
     assert scheduler._save_tracker["1"][1] == 8
+
+
+def test_save_frontier_skips_checkpoints_shorter_than_min_save_tokens(monkeypatch):
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch, min_save_tokens=16)
+    seq = sequence(computed=24)
+    checkpoint(scheduler, checkpoints, seq, 8)
+    scheduler.update_state_after_alloc(seq)
+    assert scheduler.build_connector_meta().requests == []
+
+    checkpoint(scheduler, checkpoints, seq, 16)
+    [request] = scheduler.build_connector_meta().requests
+    assert request.native_state.boundary_tokens == 16
 
 
 def test_store_failure_rolls_back_for_bounded_retry_and_ignores_stale_reports(
@@ -448,6 +469,7 @@ def test_load_and_save_share_the_native_byte_budget(monkeypatch):
 def engine_scheduler(monkeypatch):
     adapter = Adapter()
     monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "0")
+    monkeypatch.setenv("OFFLOAD_MIN_SAVE_TOKENS", "0")
     monkeypatch.setenv("OFFLOAD_MAX_PENDING_SAVES", "2")
     monkeypatch.setattr(
         backend, "_make_scheduler_adapter", lambda _config, **kwargs: adapter

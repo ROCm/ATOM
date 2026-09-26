@@ -227,7 +227,11 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             and failed[2] >= _MAX_SAVE_ATTEMPTS
             else 0
         )
-        for boundary in range(frontier, exhausted, -self.chunk_size):
+        # A prefix shorter than OFFLOAD_MIN_SAVE_TOKENS is not worth its copy:
+        # with the default equal to OFFLOAD_MIN_LOAD_TOKENS it could never be
+        # loaded back anyway.
+        floor = max(exhausted, self._min_save_tokens - 1, 0)
+        for boundary in range(frontier, floor, -self.chunk_size):
             if self._checkpoints.contains(self._boundary_hash(seq, boundary)):
                 return boundary
         return 0

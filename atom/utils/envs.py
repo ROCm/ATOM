@@ -889,8 +889,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # derives max(2, 2 * OFFLOAD_COPY_WORKERS) and the scheduler's state tier
     # uses 2. A kv_connector_extra_config "max_pending_saves" takes precedence.
     "OFFLOAD_MAX_PENDING_SAVES": lambda: _optional_int_env("OFFLOAD_MAX_PENDING_SAVES"),
-    # Minimum external-tier hit worth loading, and minimum remaining prefix
-    # worth a late save, in tokens.
+    # Minimum external-tier hit worth loading, and minimum prefix worth saving
+    # (native MP's shortest stored boundary and a late save's remainder), in
+    # tokens.
     "OFFLOAD_MIN_LOAD_TOKENS": lambda: max(
         0, _int_env_or_default("OFFLOAD_MIN_LOAD_TOKENS", 8192)
     ),
