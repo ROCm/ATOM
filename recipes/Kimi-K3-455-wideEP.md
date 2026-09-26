@@ -768,6 +768,69 @@ ISL median ~104k tokens, OSL median ~339, theoretical prefix cache hit 97.34%.
 launch above. Without it every turn re-prefills the whole history and the
 numbers describe repeated prefill, not the engine.
 
+### Server launch for AgentX
+
+Same as [Launch](#launch) except for these four. **All four matter** — the
+first two are what make it boot and stay up at all:
+
+```bash
+--enable_prefix_caching          # instead of --no-enable_prefix_caching
+--gpu-memory-utilization 0.94    # instead of 0.90
+--max-num-batched-tokens 2048    # unchanged -- do NOT raise it, see below
+--max-num-seqs 8                 # unchanged -- do NOT raise it either
+```
+
+Measured effect of the utilization bump, everything else equal:
+
+```
+0.90 -> available_for_kv=33.53GB  num_kvcache_blocks=146862
+0.94 -> available_for_kv=50.97GB  num_kvcache_blocks=231173   (+52%)
+```
+
+⚠️ **Do not raise `--max-num-batched-tokens` to speed up prefill.** It looks
+like the obvious fix for a 100k-token prompt being split into 51 chunks, and it
+is wrong twice over:
+
+1. **It will not boot.** At 16384 with `--gpu-memory-utilization 0.93`:
+   ```
+   RuntimeError: Per-request cache tensor (3.35GB for 8 slots) exceeds available
+   KV budget (-4.67GB) at --gpu-memory-utilization 0.93. Set
+   --gpu-memory-utilization >= 0.96 ... or reduce --max-num-seqs (currently 8).
+   ```
+   Raising utilization far enough to cover it is not possible — the deficit is
+   ~40 GB against a 288 GB card already at 0.93.
+2. **Chunk size is not what makes agentic prefill slow.** At the *same* 2048
+   chunk size, a 14k fixed-length run prefills at 1252 tok/s per rank while the
+   agentic trace manages 283 tok/s. The difference is context length: chunk *n*
+   attends to everything before it, so the cost is quadratic in prompt length
+   and a bigger chunk only amortises per-step overhead. You would trade ~38 GB
+   of KV for maybe 2-3x, and KV is the thing you cannot spare here.
+
+⚠️ **`--enable_prefix_caching` on this platform deadlocked the cluster once, at
+`--gpu-memory-utilization 0.90`.** Signature, for recognition:
+
+```
+[13:08:38] Engine 011: prompt throughput: 0.0 tok/s, Running: 1, KV usage: 98.6%
+           ... 30 minutes of total silence from every rank ...
+[13:38:47] Engine Core: _sync_dp_state failed: Timed out waiting 1800000ms
+[13:38:47] Engine Core: All DP ranks agreed to shutdown, exiting busy_loop
+```
+
+**15 of 16 ranks logged the timeout; one did not.** That is the shape of a
+collective one participant never joined, not of a slow cluster — and the rank
+that never joined was the one at 98.6% KV occupancy. The client sees none of
+this: aiperf sat at `errors=0` with 4 requests in flight for another 27 minutes
+after the server was gone. It has not recurred at 0.94, which is the reason for
+that setting, but the root cause is not proven — so watch for it, and if a run
+goes quiet, take stacks before killing anything:
+
+```bash
+sudo docker exec k3ep16 py-spy dump --pid $(pgrep -f 'ATOM::DP0TP0' | head -1)
+```
+
+A ModelRunner stopped in `ncclCommInitRank` or inside a mori dispatch is a
+collective hang; one spinning in the scheduler is a KV allocation problem.
+
 ```
 aiperf          0.12.0  (SemiAnalysis fork, NOT PyPI upstream)
 submodule       utils/aiperf @ 754356e9a39acc6cc6afb242d123bb57c3fb6f75
