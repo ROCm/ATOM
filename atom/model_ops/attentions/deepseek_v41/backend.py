@@ -260,8 +260,12 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
     def relocate_state_slots(self, pairs):
         self.copies.relocate(pairs)
 
-    def execute_paged_state_copies(self, stores, restores):
-        self.copies.execute(stores, restores)
+    def execute_paged_state_copies(self, stores, restores, descriptor_slot=0):
+        self.copies.execute(stores, restores, descriptor_slot=descriptor_slot)
+
+    def reserve_checkpoint_descriptors(self, descriptor_slots):
+        for descriptor_slot in descriptor_slots:
+            self.copies.staging(descriptor_slot)
 
     def warmup_per_req_cache(self):
         self.copies.warmup()

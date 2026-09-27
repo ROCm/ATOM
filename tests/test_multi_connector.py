@@ -283,12 +283,22 @@ def test_partial_state_deallocation_requires_an_explicit_capable_subconnector():
         can_partially_deallocate_state=lambda _seq: True,
     )
 
-    assert _sched([unsupported, declined]).can_partially_deallocate_state(seq) is False
-    assert (
-        _sched([unsupported, inactive_capable]).can_partially_deallocate_state(seq)
-        is False
-    )
-    assert _sched([unsupported, capable]).can_partially_deallocate_state(seq) is True
+    inactive_unsupported = SimpleNamespace(should_defer_free=lambda _seq: False)
+
+    def allowed(*subs):
+        return _sched(list(subs)).can_partially_deallocate_state(seq)
+
+    assert allowed(unsupported, declined) is False
+    assert allowed(unsupported, inactive_capable) is False
+    # A deferring sub without the guarantee still needs the request alive, even
+    # though another deferring sub declares its own state safe (all, not any).
+    assert allowed(unsupported, capable) is False
+    assert allowed(capable, declined) is False
+    # Subs that no longer defer do not veto.
+    assert allowed(inactive_unsupported, capable) is True
+    assert allowed(capable, capable) is True
+    # Nothing deferring is not a guarantee either.
+    assert allowed(inactive_unsupported, inactive_capable) is False
 
 
 # ---------------------------------------------------------------------------

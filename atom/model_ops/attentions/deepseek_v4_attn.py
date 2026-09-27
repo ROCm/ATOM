@@ -2083,6 +2083,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             native_state_tp_replication_factor=tp_size,
             paged_state_checkpoint_spec=checkpoint_spec,
             execute_paged_state_copies=self.execute_paged_state_copies,
+            paged_state_region_count=len(block_regions),
         )
 
     # ------------------------------------------------------------------ #

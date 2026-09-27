@@ -141,6 +141,13 @@ def _validate_mp_config(config: Any) -> tuple[int, int]:
         raise NotImplementedError("lmcache_mp does not support DCP yet")
     if pcp_size != 1:
         raise NotImplementedError("lmcache_mp does not support PCP yet")
+    # Single-host DP replicas deliberately share one (model_name, worker_id,
+    # world_size) identity: it is the content-addressed storage namespace, so
+    # replicas deduplicate identical prefixes. It is not a registration key.
+    # The server registers GPU memory per unique instance_id, refcounts layout
+    # descriptors per (model_name, world_size) (all replicas publish the same
+    # one), and _mp_session_id scopes request sessions and their locks per
+    # replica.
     if dp_size_local != dp_size:
         raise NotImplementedError(
             "lmcache_mp supports DP and DP-attention only within one host; "
@@ -165,6 +172,11 @@ def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
     registering any cache memory.
     """
 
+    if _config_has_own_pool_draft(config):
+        # A DSpark draft whose backend owns a KV pool appends per-rank-sharded
+        # PAGE regions (`draft_kv.py` declares factor 1), so the complete PAGE
+        # object is not replicated even when the target's is.
+        return False
     hf_config = getattr(config, "hf_config", None)
     # MiniMax-M3 is GQA. Some TP ranks can happen to own the same KV head when
     # TP exceeds the global KV-head count, but the complete PAGE object is not
@@ -173,6 +185,22 @@ def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
         return False
     hf_config = getattr(hf_config, "text_config", hf_config)
     return getattr(hf_config, "kv_lora_rank", None) is not None
+
+
+def _config_has_own_pool_draft(config: Any) -> bool:
+    """Whether a speculative draft caches into a KV pool of its own.
+
+    Mirrors `spec_decode.draft_kv.draft_kv_builder`, which only DSpark calls:
+    the draft's own backend answers through `DRAFT_OWNS_KV_POOL`.
+    """
+
+    speculative = getattr(config, "speculative_config", None)
+    draft_hf = getattr(speculative, "draft_model_hf_config", None)
+    if getattr(speculative, "method", None) != "dspark" or draft_hf is None:
+        return False
+    from atom.utils.selector import attn_family, get_attn_backend
+
+    return bool(get_attn_backend(attn_family(draft_hf)).DRAFT_OWNS_KV_POOL)
 
 
 def _tp_replication_factor(config: Any) -> int:
@@ -469,6 +497,55 @@ class _PendingSave:
     end: int
 
 
+def _uncertain_transfer_timeout_s(config: Any) -> float:
+    """How long an unprovable transfer keeps its lease before it is failed.
+
+    Nothing in the MP protocol can prove that a submission whose outcome is
+    unknown has stopped touching engine memory, so the bound is a policy: by
+    default twice the adapter's own request timeout.
+    """
+
+    extra = _extra_config(config)
+    default = 2.0 * float(extra.get("lmcache.mp.mq_timeout", 300.0))
+    timeout = float(extra.get("lmcache.mp.uncertain_transfer_timeout_s", default))
+    if not timeout > 0:
+        raise ValueError("lmcache.mp.uncertain_transfer_timeout_s must be > 0")
+    return timeout
+
+
+class _UncertainSubmission:
+    """A transfer whose outcome is unknown: retained, then failed at a deadline.
+
+    A transport exception cannot prove that a remote DMA stopped, so the lease
+    is kept while this reports not-done. Past ``timeout_s`` it reports a failed
+    terminal result, so the operation settles and releases its lease and budget
+    instead of wedging them for the process lifetime.
+    """
+
+    def __init__(self, timeout_s: float, operation: str) -> None:
+        self._deadline = time.monotonic() + timeout_s
+        self._timeout_s = timeout_s
+        self._operation = operation
+        self._expired = False
+
+    def query(self) -> bool:
+        if time.monotonic() < self._deadline:
+            return False
+        if not self._expired:
+            self._expired = True
+            logger.warning(
+                "LMCache MP transfer %s stayed unprovable for %.0fs; "
+                "treating it as failed and releasing its lease",
+                self._operation,
+                self._timeout_s,
+            )
+        return True
+
+    def result(self, timeout: float | None = None) -> bool:
+        del timeout
+        return False
+
+
 def _terminal_future_result(future: Any | None) -> tuple[bool, Any]:
     """Return ``(terminal, result)`` without blocking on a device future."""
 
@@ -722,7 +799,7 @@ class LMCacheMPConnector(KVConnectorBase):
         # aggregator must receive the same chunk completion from every rank
         # before releasing the writer's source blocks early.
         self._immediate_saves: dict[SaveCompletionId, tuple[int, int] | None] = {}
-        self._immediate_save_failures: set[SaveCompletionId] = set()
+        self._uncertain_timeout_s = _uncertain_transfer_timeout_s(config)
         self._immediate_load_failures: set[LoadCompletionId] = set()
         self._lock = threading.Lock()
 
@@ -981,18 +1058,23 @@ class LMCacheMPConnector(KVConnectorBase):
                 event,
             )
         except Exception:
+            # The server may have received the request before the connection
+            # raised: keep the source leased until the transfer is provably
+            # over or the uncertainty bound expires.
             logger.exception(
-                "LMCache MP save submission failed for %s",
+                "LMCache MP save submission uncertain for %s",
                 req.req_id,
             )
             with self._lock:
                 self._submitting_saves.discard(operation_id)
-                _remember_operation_tombstone(
-                    operation_id,
-                    self._completed_save_operations,
-                    self._completed_save_operation_order,
+                self._pending_saves[operation_id] = _PendingSave(
+                    completion=completion,
+                    future=_UncertainSubmission(
+                        self._uncertain_timeout_s, operation_id
+                    ),
+                    start=start,
+                    end=end,
                 )
-                self._immediate_save_failures.add(completion)
             return
         with self._lock:
             self._submitting_saves.discard(operation_id)
@@ -1079,15 +1161,8 @@ class LMCacheMPConnector(KVConnectorBase):
                     connector_completions.add(
                         ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, completion, True)
                     )
-            for completion in self._immediate_save_failures:
-                done_save.add(completion)
-                if isinstance(completion, SaveOperationId):
-                    connector_completions.add(
-                        ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, completion, False)
-                    )
             failed_load.update(self._immediate_load_failures)
             self._immediate_saves.clear()
-            self._immediate_save_failures.clear()
             self._immediate_load_failures.clear()
         return KVConnectorOutput(
             finished_loading=done_load,
@@ -1173,6 +1248,9 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                     int(req.load_spec.hbm_cached_tokens),
                     int(end),
                 )
+        # Also catches retirements that bypass _finish_retired_request, such as
+        # a late save with nothing left to store.
+        self._end_finished_sessions()
         return metadata
 
     def load_finished(self, req_id: Any) -> bool:
@@ -1215,14 +1293,37 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
 
     def request_finished(self, seq: Any) -> None:
         super().request_finished(seq)
-        try:
-            self._mp_adapter.end_session(_mp_session_id(self._config, seq.id))
-        except Exception:
-            logger.warning(
-                "LMCache MP end_session failed for request %s",
-                seq.id,
-                exc_info=True,
-            )
+        self._pending_session_ends()[str(seq.id)] = seq
+        self._end_finished_sessions()
+
+    def _finish_retired_request(self, sid: str) -> None:
+        super()._finish_retired_request(sid)
+        self._end_finished_sessions()
+
+    def _pending_session_ends(self) -> dict[str, Any]:
+        """Finished requests whose MP session must outlive their last save.
+
+        A late save is emitted, and submitted under the request's session,
+        after request_finished, so the session ends only once none can follow.
+        """
+        return self.__dict__.setdefault("_sessions_to_end", {})
+
+    def _end_finished_sessions(self) -> None:
+        """End each finished request's session once no save of it can follow."""
+        pending = self._pending_session_ends()
+        for sid, seq in list(pending.items()):
+            entry = self._save_tracker.get(sid)
+            if (entry is not None and entry[0] is seq) or sid in self._save_inflight:
+                continue
+            del pending[sid]
+            try:
+                self._mp_adapter.end_session(_mp_session_id(self._config, seq.id))
+            except Exception:
+                logger.warning(
+                    "LMCache MP end_session failed for request %s",
+                    seq.id,
+                    exc_info=True,
+                )
 
 
 __all__ = [

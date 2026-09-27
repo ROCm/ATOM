@@ -288,16 +288,32 @@ flag below. Details in the state-checkpoint section of the
 
 ### LMCache offload tier
 
-The LMCache source-pin timeout and ATOM's pending-save bound are read directly
-via `os.environ` rather than through `atom.utils.envs`. Their behavior is
-defined in `atom/kv_transfer/offload/_offload_common.py` and documented in full
-in `atom/kv_transfer/offload/README.md`; they are also listed here so they are
-discoverable from the central env reference despite bypassing the registry.
+ATOM's own offload knobs are defined in `atom/utils/envs.py`; their behavior is
+documented in `atom/kv_transfer/offload/README.md`. Where a
+`kv_connector_extra_config` key also exists, it takes precedence over the env
+var. `LMCACHE_EC_PIN_TIMEOUT_SEC` belongs to LMCache and is read only to
+derive a bound.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **LMCACHE_EC_PIN_TIMEOUT_SEC** | float | LMCache's own (300) | LMCache's source-pin timeout. ATOM reads it only to derive the engine's save-abandon window (`pin + 30s`), so the two stay ordered — a lost store report is reclaimed only after LMCache would already have force-unpinned its source. Non-positive disables ATOM's reclamation. ATOM sets no default of its own; when unset it assumes LMCache's. |
-| **OFFLOAD_MAX_PENDING_SAVES** | int | **2**, flat, for the engine-side/state-tier reader (`scheduler.py`); `max(2, 2 × OFFLOAD_COPY_WORKERS)` for the KV-leg reader (`_offload_common.py`) | Bound on total in-flight offload transfers (running + queued) held before a SLOT snapshot or executor submission. A KV save and a state store both pin bytes out of the same pool while they run, so the KV leg and the K3 state tier share this one number rather than each carrying its own. Two readers compute it, though: the KV leg's canonical `_offload_common.max_pending_saves` derives the shown default from `OFFLOAD_COPY_WORKERS` and **raises** on an unparseable value, while the scheduler's state-tier reader (`_offload_max_pending_saves`) has a simpler fallback — a flat default of **2** (no `OFFLOAD_COPY_WORKERS` scaling) that **warns and uses 2** on an unparseable value rather than raising. Set the env to an explicit integer to pin both. |
+| **OFFLOAD_COPY_WORKERS** | int | 1 | Save executor threads per offload worker. Also scales the default `OFFLOAD_MAX_PENDING_SAVES`. |
+| **OFFLOAD_LOAD_WORKERS** | int | 1 | Load executor threads per offload worker. DSV4's in-process path ignores it (its SLOT load path needs a serial load executor). |
+| **OFFLOAD_MAX_PENDING_SAVES** | int | unset: `max(2, 2 × OFFLOAD_COPY_WORKERS)` for connectors, **2** for the scheduler's state tier | Bound on running-plus-queued saves. KV and state saves share it because both pin the same pool. A non-integer raises on the connector path and warns (using 2) on the state-tier path. Overridden by `max_pending_saves` in `kv_connector_extra_config`. |
+| **OFFLOAD_MIN_LOAD_TOKENS** | int | 8192 | Smallest external-tier hit worth loading; shorter hits are recomputed. Negative values clamp to 0. |
+| **OFFLOAD_MIN_SAVE_TOKENS** | int | 8192 | Shortest prefix native `lmcache_mp` stores, as an absolute boundary for normal and late saves. With the default equal to `OFFLOAD_MIN_LOAD_TOKENS`, a shorter prefix could never be loaded back. Other connectors ignore it. |
+| **OFFLOAD_LOOKUP_MEMO_STEPS** | int | 32 | Scheduler steps a memoised tier-lookup answer is replayed before the tier is asked again. |
+| **OFFLOAD_LOOKUP_RETRY_STEPS** | int | 32 | Scheduler steps a failed tier lookup suppresses the next attempt. |
+| **OFFLOAD_PROFILE** | bool | 0 | Emit `[OFFLOAD-SAVE-PROF]` / `[OFFLOAD-LOAD-PROF]` per-transfer records. An empty value reads as off. |
+| **OFFLOAD_SINGLE_STREAM** | bool | 0 | Experimental: run the staging pack and copy legs on one stream. |
+| **OFFLOAD_GPU_STAGING_CHUNKS** | int | derived from KV geometry | GPU staging buffer size in LMCache chunks (≥ 1). |
+| **OFFLOAD_GPU_STAGING_MAX_BYTES** | int | unset | Upper bound on the GPU staging buffer in bytes; must hold at least one chunk. |
+| **OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER** | bool | 0 | Free the GPU staging buffer after each transfer instead of keeping it. |
+| **OFFLOAD_SLOT_STAGING_SLOTS** | int | 1 | DSV4 in-process SLOT sidecar staging rows. Overridden by `slot_sidecar_staging_slots`. |
+| **OFFLOAD_COMMITTED_SIDECAR_CAPACITY** | int | 65536 | DSV4 in-process committed SLOT sidecar index capacity. Overridden by `committed_sidecar_index_capacity`. |
+| **OFFLOAD_PUBLICATION_TIMEOUT_S** | float | 5.0 | DSV4 in-process wait for a saved SLOT sidecar to become visible (finite, ≥ 0). |
+| **OFFLOAD_PUBLICATION_POLL_INTERVAL_S** | float | 0.01 | Poll period of that wait (finite, > 0). |
+| **LMCACHE_MP_TRANSFER_MODE** | str | auto | `lmcache_mp` transfer mode: `auto` or `lmcache_driven` (`engine_driven` is rejected). Overridden by `lmcache.mp.mp_transfer_mode`. |
+| **LMCACHE_EC_PIN_TIMEOUT_SEC** | float | LMCache's own (300) | LMCache's source-pin timeout. ATOM reads it only to derive the engine's save-abandon window (`pin + 30s`), so the two stay ordered: a lost store report is reclaimed only after LMCache would already have force-unpinned its source. Non-positive disables ATOM's reclamation. ATOM sets no default of its own and, when unset, assumes LMCache's. |
 
 ## KV cache events
 

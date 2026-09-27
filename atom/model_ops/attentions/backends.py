@@ -355,6 +355,16 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
                 f"{type(self).__name__} does not implement PAGE-backed state copy"
             )
 
+    def reserve_checkpoint_descriptors(self, descriptor_slots) -> None:
+        """Allocate staging for out-of-band copy slots before serving.
+
+        Allocating pinned memory synchronizes, so a slot first touched by a
+        mid-serving restore would stall its thread. A connector that will pass
+        these slots to `execute_paged_state_copies` reserves them up front.
+        """
+        for descriptor_slot in descriptor_slots:
+            self._checkpoint_descriptor_buffer(descriptor_slot)
+
     def _checkpoint_descriptor_device(self) -> torch.device:
         """Device of the planes `execute_paged_state_copies` copies between."""
         raise NotImplementedError(

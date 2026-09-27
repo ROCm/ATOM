@@ -30,6 +30,7 @@ from atom.kv_transfer.offload.mp.backend import (
     _terminal_future_result,
     _tp_replication_factor,
     _transfer_operation_id,
+    _UncertainSubmission,
     _validate_mp_config,
 )
 from atom.kv_transfer.offload.mp.native_state_layout import (
@@ -53,13 +54,6 @@ def require_native_state_server(adapter: Any, config: Any) -> None:
             "Native-state LMCache configured chunk size must match the MP server: "
             f"configured={configured_chunk}, server={adapter.lmcache_tokens_per_chunk}"
         )
-
-
-class _UncertainSubmission:
-    """A transport exception cannot prove that a remote DMA stopped."""
-
-    def query(self) -> bool:
-        return False
 
 
 @dataclass
@@ -149,6 +143,13 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         self._restore_descriptor_slots = list(
             range(1, max(2, self._max_pending_saves) + 1)
         )
+        # Pinned staging allocation synchronizes the device. Reserve every
+        # restore slot now, at registration, rather than on the connector
+        # thread the first time a restore reaches it mid-serving.
+        builder = getattr(transfer_tensors, "state_backend", None)
+        reserve = getattr(builder, "reserve_checkpoint_descriptors", None)
+        if callable(reserve):
+            reserve(self._restore_descriptor_slots)
         logger.info(
             "LMCache MP native state registered rank=%d native_image=%d "
             "units=%d groups=%d chunk=%d",
@@ -241,7 +242,9 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 )
                 pending[operation_id] = _NativePending(req, None)
                 return
-            entry = _NativePending(req, _UncertainSubmission())
+            entry = _NativePending(
+                req, _UncertainSubmission(self._uncertain_timeout_s, operation_id)
+            )
             pending[operation_id] = entry
         submit = (
             self._adapter.submit_retrieve_request
@@ -280,6 +283,10 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         descriptor_slot = self._restore_descriptor_slots.pop()
         pending.restore_event = event
         pending.descriptor_slot = descriptor_slot
+        # Write-after-read: the destination SLOT's previous occupant may still
+        # have compute work enqueued. Order the restore after everything the
+        # compute stream has been given so far.
+        self._restore_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self._restore_stream):
             try:
                 self._native_copy(
@@ -321,6 +328,23 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 )
             )
             pending.state_source_safe = True
+
+    def start_load_kv(self, metadata: Any) -> None:
+        # Read-after-write: this step's compute (including SLOT relocations in
+        # `build()`) must not touch a SLOT while its native restore is still
+        # writing. The host only polls the event, so fence the compute stream
+        # on the GPU instead of blocking here.
+        with self._lock:
+            restores = [
+                pending.restore_event
+                for pending in self._native_loads.values()
+                if pending.restore_event is not None
+            ]
+        if restores:
+            compute = torch.cuda.current_stream()
+            for event in restores:
+                compute.wait_event(event)
+        super().start_load_kv(metadata)
 
     def get_finished(self) -> KVConnectorOutput:
         output = KVConnectorOutput()
@@ -376,7 +400,9 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                                 "LMCache MP native restore safety unknown; "
                                 "retaining lease"
                             )
-                            pending.future = _UncertainSubmission()
+                            pending.future = _UncertainSubmission(
+                                self._uncertain_timeout_s, operation_id
+                            )
                             pending.restore_event = None
                             continue
                 if pending.restore_event is not None:
@@ -388,6 +414,11 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                             "LMCache MP native restore event safety unknown; "
                             "retaining lease"
                         )
+                        pending.future = _UncertainSubmission(
+                            self._uncertain_timeout_s, operation_id
+                        )
+                        pending.restore_event = None
+                        pending.restore_succeeded = False
                         continue
                 completion = pending.request.load_operation
                 if pending.descriptor_slot is not None:

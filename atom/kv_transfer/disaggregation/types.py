@@ -269,6 +269,11 @@ class KVTransferTensors:
     # separate so future layouts can describe PAGE and recurrent-state
     # replication independently. Appended for positional compatibility.
     native_state_tp_replication_factor: int = 1
+    # How many leading `block_regions` make up one native checkpoint PAGE unit.
+    # A draft with a pool of its own appends its regions after the target's;
+    # those are ordinary PAGE KV, never part of the state image. None means
+    # every region. Appended for positional compatibility.
+    paged_state_region_count: int | None = None
     # Scheduler blocks the PAGE regions are addressed in. `init=False` because
     # a backend cannot answer it: `req.block_ids` is the scheduler's id space,
     # and a backend counts in its own page -- a different unit even where it is

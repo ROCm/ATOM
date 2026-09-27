@@ -126,10 +126,11 @@ def test_layout_coalesces_equal_shapes_inside_ordinal_and_preserves_trim_stride(
     assert layout.checkpoint_spec.units_per_checkpoint == 3
     assert layout.checkpoint_spec.page_unit_bytes == 18
     assert len(layout.tensors) == 10
-    assert len(layout.kernel_groups) == 8
+    # PAGE registers as bytes, so the BF16 and uint8 8-byte regions share one
+    # physical kernel identity just as the STATE aliases do.
+    assert len(layout.kernel_groups) == 7
     assert tuple(group.tensor_indices for group in layout.kernel_groups) == (
-        (0,),
-        (1,),
+        (0, 1),
         (2,),
         (3, 4),
         (5,),
@@ -138,7 +139,6 @@ def test_layout_coalesces_equal_shapes_inside_ordinal_and_preserves_trim_stride(
         (9,),
     )
     assert [group.engine_group_id for group in layout.kernel_groups] == [
-        0,
         0,
         0,
         1,
@@ -337,3 +337,40 @@ def test_actual_lmcache_registration_preserves_native_aliases_and_stride():
     assert manager.kernel_groups[-1].shape_desc.hs == 3
     assert len(manager.object_groups) == 2
     assert manager.object_groups[-1].sw_size_chunks == 1
+
+
+def test_page_group_registers_every_region_as_bytes():
+    transfer = _transfer()
+    layout = _layout(transfer)
+    page = layout.tensors[: len(transfer.block_tensor_views)]
+    assert transfer.block_tensor_views[0].dtype == torch.bfloat16
+    assert [tensor.dtype for tensor in page] == [torch.uint8] * len(page)
+    assert [tensor.data_ptr() for tensor in page] == [
+        view.data_ptr() for view in transfer.block_tensor_views
+    ]
+
+
+def test_draft_regions_after_the_state_regions_stay_ordinary_page():
+    """A draft with its own pool appends regions after the target's. They are
+    registered as PAGE KV but never folded into the checkpoint image."""
+    target_only = _transfer(widths=(8, 8, 2))
+    with_draft = _transfer(widths=(8, 8, 2, 6))
+    with_draft.paged_state_checkpoint_spec = target_only.paged_state_checkpoint_spec
+
+    with pytest.raises(ValueError, match="do not cover the native PAGE unit"):
+        _layout(with_draft)
+
+    with_draft.paged_state_region_count = 3
+    layout = _layout(with_draft)
+    page_groups = [group for group in layout.kernel_groups if not group.engine_group_id]
+    assert sorted(i for group in page_groups for i in group.tensor_indices) == [
+        0,
+        1,
+        2,
+        3,
+    ]
+    ids = (0, 5, 6)
+    assert torch.equal(
+        _gather(layout, with_draft, ids),
+        _gather(_layout(target_only), target_only, ids),
+    )

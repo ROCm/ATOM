@@ -73,8 +73,20 @@ class Adapter:
         self.closed = True
 
 
-def make_scheduler(monkeypatch, *, capacity=2, budget=60, units=30, role="offload"):
+def make_scheduler(
+    monkeypatch,
+    *,
+    capacity=2,
+    budget=60,
+    units=30,
+    role="offload",
+    min_save_tokens=0,
+):
     monkeypatch.setenv("OFFLOAD_MAX_PENDING_SAVES", str(capacity))
+    if min_save_tokens is None:
+        monkeypatch.delenv("OFFLOAD_MIN_SAVE_TOKENS", raising=False)
+    else:
+        monkeypatch.setenv("OFFLOAD_MIN_SAVE_TOKENS", str(min_save_tokens))
     adapter = Adapter()
     connections = []
 
@@ -104,6 +116,13 @@ def make_scheduler(monkeypatch, *, capacity=2, budget=60, units=30, role="offloa
         paged_state_checkpoints=checkpoints,
         hash_block_size=4,
         compute_hash=BlockManager.compute_hash,
+    )
+    # BlockManager's own chain walk (seed, algorithm, token slices).
+    manager._hash_block_tokens = lambda seq, index: BlockManager._hash_block_tokens(
+        manager, seq, index
+    )
+    manager.prefix_hash_chain = lambda seq, hashes, blocks: BlockManager._chain_to(
+        manager, seq, hashes, blocks
     )
     scheduler.bind_block_manager(manager)
     scheduler.bind_block_manager(manager)
@@ -221,6 +240,81 @@ def test_save_frontier_selects_existing_checkpoint_below_computed_tokens(monkeyp
     assert len(request.token_ids) == 8
     assert request.native_state.boundary_tokens == 8
     assert scheduler._save_tracker["1"][1] == 8
+
+
+def test_save_frontier_skips_checkpoints_shorter_than_min_save_tokens(monkeypatch):
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch, min_save_tokens=16)
+    seq = sequence(computed=24)
+    checkpoint(scheduler, checkpoints, seq, 8)
+    scheduler.update_state_after_alloc(seq)
+    assert scheduler.build_connector_meta().requests == []
+
+    checkpoint(scheduler, checkpoints, seq, 16)
+    [request] = scheduler.build_connector_meta().requests
+    assert request.native_state.boundary_tokens == 16
+
+
+def test_boundary_hash_seeds_from_cache_seed_like_block_manager(monkeypatch):
+    """Multimodal requests seed their chain with cache_seed != -1; the fallback
+    walk must agree with BlockManager's own chain from block 0 onward."""
+    scheduler, _, _ = make_scheduler(monkeypatch)
+    manager = scheduler._block_manager
+    seq = sequence()
+    seq.cache_seed = 987654321
+    seq.block_hashes = []
+    fallback = scheduler._boundary_hash(seq, 8)
+    expected = manager.prefix_hash_chain(seq, [], 2)
+    assert fallback == expected[1]
+    assert fallback != manager.prefix_hash_chain(sequence(), [], 2)[1]
+
+    chained = sequence(request_id=2)
+    chained.cache_seed = seq.cache_seed
+    chained.block_hashes = list(expected)
+    assert scheduler._boundary_hash(chained, 8) == fallback
+
+
+def test_save_frontier_rescans_only_when_frontier_or_checkpoints_change(
+    monkeypatch,
+):
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch)
+    seq = sequence(computed=24)
+    checkpoint(scheduler, checkpoints, seq, 8)
+    calls = []
+    contains = checkpoints.contains
+    monkeypatch.setattr(
+        checkpoints, "contains", lambda h: calls.append(h) or contains(h)
+    )
+
+    assert scheduler._save_frontier(seq) == 8
+    scanned = len(calls)
+    assert scanned > 0
+    assert scheduler._save_frontier(seq) == 8
+    assert len(calls) == scanned  # same frontier, same checkpoints: cached
+
+    checkpoint(scheduler, checkpoints, seq, 16)  # a newer checkpoint publishes
+    assert scheduler._save_frontier(seq) == 16
+    assert len(calls) > scanned
+
+
+def test_default_min_save_tokens_skips_a_short_prompt(monkeypatch):
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch, min_save_tokens=None)
+    seq = sequence(computed=24)
+    checkpoint(scheduler, checkpoints, seq, 16)
+    scheduler.update_state_after_alloc(seq)
+    assert scheduler._min_save_tokens == 8192
+    assert scheduler.build_connector_meta().requests == []
+
+
+def test_late_save_threshold_is_the_absolute_boundary_not_the_remainder(
+    monkeypatch,
+):
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch, min_save_tokens=16)
+    seq = sequence(computed=24)
+    checkpoint(scheduler, checkpoints, seq, 24)
+    # Already saved 16; the 8-token remainder still reaches boundary 24 >= 16.
+    assert scheduler._late_save_frontier(seq, 16, 24) == 24
+    scheduler._min_save_tokens = 32
+    assert scheduler._late_save_frontier(seq, 16, 24) == 16
 
 
 def test_store_failure_rolls_back_for_bounded_retry_and_ignores_stale_reports(
@@ -396,6 +490,63 @@ def test_load_capacity_failure_never_parks_or_claims_missing_state(monkeypatch):
     assert checkpoints.store.pool.num_free == 2
 
 
+def test_session_outlives_a_save_emitted_after_request_finished(monkeypatch):
+    """The final save is emitted and submitted under the request's MP session
+    after request_finished, so the session must not end before it settles."""
+    scheduler, checkpoints, adapter = make_scheduler(monkeypatch)
+    seq = sequence()
+    checkpoint(scheduler, checkpoints, seq, 16)
+    scheduler.update_state_after_alloc(seq)
+    scheduler.request_finished(seq)
+    assert adapter.ended == []
+
+    [request] = scheduler.build_connector_meta().requests
+    assert adapter.ended == []
+
+    terminal(scheduler, request.save_operation)
+    scheduler.build_connector_meta()
+    assert adapter.ended == [f"atom-offload-dp0:{seq.id}"]
+
+
+def test_save_admission_returns_lease_and_budget_when_it_raises(monkeypatch):
+    from atom.kv_transfer.offload.chunked_scheduler import (
+        ChunkedOffloadSchedulerBase,
+    )
+
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch)
+    seq = sequence()
+    checkpoint(scheduler, checkpoints, seq, 16)
+    scheduler.update_state_after_alloc(seq)
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("request construction failed")
+
+    monkeypatch.setattr(ChunkedOffloadSchedulerBase, "_build_save_request", boom)
+    with pytest.raises(RuntimeError, match="request construction failed"):
+        scheduler.build_connector_meta()
+    assert scheduler._pinned_state_bytes == 0
+    assert scheduler._native_saves == {}
+    assert checkpoints.store._offload_pins == {}
+
+
+def test_load_admission_returns_units_and_budget_when_it_raises(monkeypatch):
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch)
+    free_before = checkpoints.store.pool.num_free
+    seq = sequence(computed=0)
+    scheduler.get_num_new_matched_tokens(seq)
+
+    def boom(_slot):
+        raise AssertionError("two queued restores target one slot")
+
+    monkeypatch.setattr(scheduler._checkpoints, "suspend_queued_restore", boom)
+    scheduler.update_state_after_alloc(seq)
+    with pytest.raises(AssertionError, match="two queued restores"):
+        scheduler.should_park_for_load_after_alloc(seq)
+    assert scheduler._pinned_state_bytes == 0
+    assert scheduler._native_loads == {}
+    assert checkpoints.store.pool.num_free == free_before
+
+
 def test_load_failure_and_cancellation_wait_for_exact_terminal_report(monkeypatch):
     scheduler, checkpoints, adapter = make_scheduler(monkeypatch)
     seq = sequence(computed=0)
@@ -448,6 +599,7 @@ def test_load_and_save_share_the_native_byte_budget(monkeypatch):
 def engine_scheduler(monkeypatch):
     adapter = Adapter()
     monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "0")
+    monkeypatch.setenv("OFFLOAD_MIN_SAVE_TOKENS", "0")
     monkeypatch.setenv("OFFLOAD_MAX_PENDING_SAVES", "2")
     monkeypatch.setattr(
         backend, "_make_scheduler_adapter", lambda _config, **kwargs: adapter

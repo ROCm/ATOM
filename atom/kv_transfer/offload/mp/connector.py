@@ -142,6 +142,16 @@ class LMCacheMPConnectorScheduler(KVConnectorSchedulerBase):
                 "lmcache_mp scheduler is already bound to a block manager"
             )
         coordinator = getattr(block_manager, "paged_state_checkpoints", None)
+        if coordinator is not None and not getattr(coordinator, "enabled", True):
+            # The backend keeps PAGE-backed state checkpoints, but none can
+            # ever become READY. A native scheduler would never save, and a
+            # PAGE-only one would restore KV under stale recurrent state.
+            raise ValueError(
+                "lmcache_mp: this backend keeps PAGE-backed state checkpoints, "
+                "which are disabled (they need --enable-prefix-caching and at "
+                "least one state slot); native-state offload cannot run and "
+                "PAGE-only offload would restore KV without its state"
+            )
         if coordinator is None:
             impl: KVConnectorSchedulerBase = backend.LMCacheMPConnectorScheduler(
                 self._config
