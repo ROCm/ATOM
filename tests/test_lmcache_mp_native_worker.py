@@ -523,10 +523,15 @@ def test_raising_restore_returns_its_descriptor_slot_after_the_bound(
 ):
     """A restore that raises after taking a descriptor slot keeps it only until
     the uncertainty bound, then the load fails and the slot is reusable."""
-    from atom.kv_transfer.offload.mp import backend
+    from atom.kv_transfer.offload.mp import backend, native_state_worker
 
     now = [1000.0]
     monkeypatch.setattr(backend.time, "monotonic", lambda: now[0])
+    # A real Event cannot be built on a CPU runner; fail deterministically
+    # after the slot is taken instead, at the stream fence.
+    monkeypatch.setattr(
+        native_state_worker.torch.cuda, "Event", lambda: SimpleNamespace()
+    )
     worker._restore_stream = object()  # no wait_stream: raises inside
     worker._restore_descriptor_slots = [3]
     worker.future.value, worker.future.ready = True, True
