@@ -55,9 +55,7 @@ def gather_dcp_mla_pages(
 ) -> None:
     """Launch the per-token MLA page gather kernel."""
 
-    block = min(
-        _MLA_GATHER_MAX_BLOCK, triton.next_power_of_2(max(int(token_bytes), 1))
-    )
+    block = min(_MLA_GATHER_MAX_BLOCK, triton.next_power_of_2(max(int(token_bytes), 1)))
     _gather_dcp_mla_pages_kernel[(n_tokens,)](
         source_bytes,
         dest,
