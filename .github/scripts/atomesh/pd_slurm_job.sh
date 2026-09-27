@@ -112,8 +112,25 @@ for key, value in sorted(os.environ.items()):
 PY
 }
 
+report_scratch_fs() {
+  # Diagnostic only. We may stage the image's 8.4GB flydsl cache onto the node,
+  # and where it can go depends on what /tmp actually is here: a tmpfs would
+  # spend node RAM the 1M-context run needs, and a Slurm-private /tmp would be
+  # reclaimed at job end while a plain one would not.
+  local d
+  for d in /tmp "${TMPDIR:-}"; do
+    [[ -n "${d}" && -d "${d}" ]] || continue
+    if command -v findmnt >/dev/null 2>&1; then
+      echo "[scratch] $(hostname) ${d}: $(findmnt -no FSTYPE,SOURCE,SIZE,AVAIL --target "${d}" 2>/dev/null || echo unknown)"
+    else
+      echo "[scratch] $(hostname) ${d}: $(df -PTh "${d}" 2>/dev/null | awk 'NR==2{print $2, $1, $3, $5}' || echo unknown)"
+    fi
+  done
+}
+
 pre_cleanup_local() {
   echo "=== pre-cleanup: stop running containers on $(hostname) ==="
+  report_scratch_fs
   set +e
   running=()
   while read -r id; do
