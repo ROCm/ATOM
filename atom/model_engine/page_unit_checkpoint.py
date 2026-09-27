@@ -164,6 +164,9 @@ class PageUnitCheckpointStore:
         # hold 127 blocks per checkpoint out of the pool forever.
         self._offload_sink = offload_sink
         self.hash_to_checkpoint: dict[int, int] = {}
+        # Bumped whenever the READY set can change (publish, unindex, evict,
+        # release, clear), so callers can cache `contains` answers.
+        self.generation = 0
         self.records: dict[int, CheckpointRecord] = {}
         self._pending_by_hash: dict[int, int] = {}
         self._lru: OrderedDict[int, None] = OrderedDict()
@@ -450,6 +453,7 @@ class PageUnitCheckpointStore:
         self.records[checkpoint_id] = record
         self.hash_to_checkpoint[record.prefix_hash] = checkpoint_id
         self._lru[checkpoint_id] = None
+        self.generation += 1
         return True
 
     def complete_inflight(self) -> None:
@@ -471,6 +475,7 @@ class PageUnitCheckpointStore:
                 continue
             record.state = READY
             self.hash_to_checkpoint[record.prefix_hash] = checkpoint_id
+            self.generation += 1
             self._lru[checkpoint_id] = None
             self._queue_offload_store(checkpoint_id, record)
 
@@ -787,6 +792,7 @@ class PageUnitCheckpointStore:
             self._release_record(checkpoint_id)
 
     def unindex(self, prefix_hash: int) -> bool:
+        self.generation += 1
         checkpoint_id = self.hash_to_checkpoint.pop(prefix_hash, -1)
         if checkpoint_id < 0:
             checkpoint_id = self._pending_by_hash.pop(prefix_hash, -1)
@@ -803,6 +809,7 @@ class PageUnitCheckpointStore:
         return True
 
     def clear(self) -> None:
+        self.generation += 1
         self.hash_to_checkpoint.clear()
         self._pending_by_hash.clear()
         self._lru.clear()
@@ -817,6 +824,7 @@ class PageUnitCheckpointStore:
         record = self.records[checkpoint_id]
         if record.state != READY or record.pin_count:
             raise AssertionError("only an unpinned READY checkpoint is evictable")
+        self.generation += 1
         if self.hash_to_checkpoint.get(record.prefix_hash) == checkpoint_id:
             del self.hash_to_checkpoint[record.prefix_hash]
         record.state = EVICTING
@@ -825,6 +833,7 @@ class PageUnitCheckpointStore:
         self.evictions += 1
 
     def _release_record(self, checkpoint_id: int) -> None:
+        self.generation += 1
         record = self.records.pop(checkpoint_id)
         self._lru.pop(checkpoint_id, None)
         if self.hash_to_checkpoint.get(record.prefix_hash) == checkpoint_id:

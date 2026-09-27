@@ -273,6 +273,29 @@ def test_boundary_hash_seeds_from_cache_seed_like_block_manager(monkeypatch):
     assert scheduler._boundary_hash(chained, 8) == fallback
 
 
+def test_save_frontier_rescans_only_when_frontier_or_checkpoints_change(
+    monkeypatch,
+):
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch)
+    seq = sequence(computed=24)
+    checkpoint(scheduler, checkpoints, seq, 8)
+    calls = []
+    contains = checkpoints.contains
+    monkeypatch.setattr(
+        checkpoints, "contains", lambda h: calls.append(h) or contains(h)
+    )
+
+    assert scheduler._save_frontier(seq) == 8
+    scanned = len(calls)
+    assert scanned > 0
+    assert scheduler._save_frontier(seq) == 8
+    assert len(calls) == scanned  # same frontier, same checkpoints: cached
+
+    checkpoint(scheduler, checkpoints, seq, 16)  # a newer checkpoint publishes
+    assert scheduler._save_frontier(seq) == 16
+    assert len(calls) > scanned
+
+
 def test_default_min_save_tokens_skips_a_short_prompt(monkeypatch):
     scheduler, checkpoints, _ = make_scheduler(monkeypatch, min_save_tokens=None)
     seq = sequence(computed=24)

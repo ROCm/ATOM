@@ -462,6 +462,62 @@ def test_restore_is_fenced_against_the_compute_stream_both_ways(worker, monkeypa
     assert compute.waited_events == [event]
 
 
+def test_registration_reserves_every_restore_descriptor_slot(monkeypatch):
+    """Pinned staging allocation synchronizes; the restore slots are reserved
+    while registering, not on the connector thread mid-serving."""
+    import sys
+    import types
+
+    from atom.kv_transfer.offload.mp import native_state_layout, native_state_worker
+
+    parallel_state = types.ModuleType("aiter.dist.parallel_state")
+    parallel_state.get_tp_group = lambda: SimpleNamespace(rank_in_group=0)
+    monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", parallel_state)
+    adapter = SimpleNamespace(
+        lmcache_tokens_per_chunk=8,
+        register_kv_caches=lambda tensors, engine_group_infos: None,
+        shutdown=lambda: None,
+    )
+    monkeypatch.setattr(
+        native_state_worker, "_make_worker_adapter", lambda *_a, **_k: adapter
+    )
+    monkeypatch.setattr(
+        native_state_worker, "require_native_state_server", lambda *_a: None
+    )
+    monkeypatch.setattr(
+        native_state_layout.NativeStateMPLayout, "engine_group_infos", lambda _s: []
+    )
+    monkeypatch.setattr(native_state_worker.torch.cuda, "Stream", lambda **_k: None)
+    monkeypatch.setattr(native_state_worker.torch.cuda, "current_device", lambda: 0)
+
+    reserved = []
+    page = torch.zeros((32, 1, 32), dtype=torch.uint8)
+    tensors = KVTransferTensors(
+        block_regions=[
+            KVTransferRegion(
+                base_addr=page.data_ptr(), unit_bytes=32, total_bytes=page.numel()
+            )
+        ],
+        slot_regions=[],
+        block_tensor_views=[page],
+        paged_state_checkpoint_spec=PagedStateCheckpointSpec(
+            32, 128, "native-test-v1", 80
+        ),
+        execute_paged_state_copies=lambda *_: None,
+    )
+    tensors.set_block_count(32)
+    tensors.state_backend = SimpleNamespace(
+        reserve_checkpoint_descriptors=lambda slots: reserved.extend(slots)
+    )
+    connector = NativeStateLMCacheMPConnector(
+        config(**{"lmcache.mp.tp_rank_collapse": False})
+    )
+    connector.register_kv_caches({}, tensors, 32)
+
+    assert reserved == connector._restore_descriptor_slots
+    assert reserved and 0 not in reserved
+
+
 def test_native_server_chunk_mismatch_fails_before_registration(monkeypatch):
     from atom.kv_transfer.offload.mp import native_state_worker
 

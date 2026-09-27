@@ -225,10 +225,21 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             and failed[2] >= _MAX_SAVE_ATTEMPTS
             else 0
         )
-        for boundary in range(frontier, self._save_floor(exhausted), -self.chunk_size):
+        floor = self._save_floor(exhausted)
+        # Every tracked request asks every step. The answer changes only when
+        # its frontier moves or a checkpoint is published or dropped, so
+        # rescan only then instead of walking the prompt per step.
+        key = (frontier, floor, self._checkpoints.store.generation)
+        memo = getattr(seq, "_mp_save_frontier_memo", None)
+        if memo is not None and memo[0] == key:
+            return memo[1]
+        found = 0
+        for boundary in range(frontier, floor, -self.chunk_size):
             if self._checkpoints.contains(self._boundary_hash(seq, boundary)):
-                return boundary
-        return 0
+                found = boundary
+                break
+        seq._mp_save_frontier_memo = (key, found)
+        return found
 
     def _save_floor(self, lower: int) -> int:
         """Exclusive lower bound for boundaries worth storing (never 0)."""

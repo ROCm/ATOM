@@ -141,6 +141,13 @@ def _validate_mp_config(config: Any) -> tuple[int, int]:
         raise NotImplementedError("lmcache_mp does not support DCP yet")
     if pcp_size != 1:
         raise NotImplementedError("lmcache_mp does not support PCP yet")
+    # Single-host DP replicas deliberately share one (model_name, worker_id,
+    # world_size) identity: it is the content-addressed storage namespace, so
+    # replicas deduplicate identical prefixes. It is not a registration key.
+    # The server registers GPU memory per unique instance_id, refcounts layout
+    # descriptors per (model_name, world_size) (all replicas publish the same
+    # one), and _mp_session_id scopes request sessions and their locks per
+    # replica.
     if dp_size_local != dp_size:
         raise NotImplementedError(
             "lmcache_mp supports DP and DP-attention only within one host; "

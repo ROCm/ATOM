@@ -143,6 +143,13 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         self._restore_descriptor_slots = list(
             range(1, max(2, self._max_pending_saves) + 1)
         )
+        # Pinned staging allocation synchronizes the device. Reserve every
+        # restore slot now, at registration, rather than on the connector
+        # thread the first time a restore reaches it mid-serving.
+        builder = getattr(transfer_tensors, "state_backend", None)
+        reserve = getattr(builder, "reserve_checkpoint_descriptors", None)
+        if callable(reserve):
+            reserve(self._restore_descriptor_slots)
         logger.info(
             "LMCache MP native state registered rank=%d native_image=%d "
             "units=%d groups=%d chunk=%d",
