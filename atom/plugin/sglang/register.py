@@ -22,8 +22,27 @@ def _ensure_aiter_gpu_archs_env() -> None:
     for env_name in ("GPU_ARCH_LIST", "PYTORCH_ROCM_ARCH"):
         archs = os.environ.get(env_name)
         if archs:
-            os.environ["GPU_ARCHS"] = archs
+            os.environ["GPU_ARCHS"] = _native_arch_in(archs)
             return
+
+
+def _native_arch_in(archs: str) -> str:
+    """Narrow a fat-binary arch list to the arch actually present.
+
+    AITER's `get_gfx()` reads `GPU_ARCHS` and, for a list such as
+    `gfx942;gfx950`, reports the LAST entry. On MI308X that makes every
+    gfx-keyed tuned table (GEMM, MoE, GDN) miss and selects gfx950 defaults.
+    """
+    listed = [a for a in archs.replace(",", ";").split(";") if a]
+    if len(listed) <= 1:
+        return archs
+    try:
+        from aiter.jit.utils.chip_info import _detect_native
+
+        native = [a for a in _detect_native() if a in listed]
+    except Exception:  # noqa: BLE001 - no GPU / rocminfo in this process
+        native = []
+    return native[0] if native else archs
 
 
 def _is_atom_external_model_enabled() -> bool:
