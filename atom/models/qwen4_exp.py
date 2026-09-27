@@ -23,6 +23,7 @@ from atom.model_ops.linear import (
 )
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.qwen4_exp.hyperconnection import (
+    HC_FUSED,
     Qwen4ExpHyperConnection,
 )
 from atom.model_ops.qwen4_exp.ops.gated import sigmoid_mul, sigmoid_rmsnorm
@@ -486,9 +487,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
         prefix: str = "",
         layer_num: int = 0,
         quant_config=None,
+        fused_hc: bool = False,
     ) -> None:
         super().__init__()
         config = atom_config.hf_config
+        self.fused_hc = fused_hc
         self.layer_type = layer_type
         self.layer_idx = layer_num
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -544,6 +547,57 @@ class Qwen4ExpDecoderLayer(nn.Module):
         self.mlp = Qwen4ExpSparseMoeBlock(config, quant_config, prefix=f"{prefix}.mlp")
 
     def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        pending: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ):
+        """Unfused: returns the streams. Fused (`HC_FUSED`): returns
+        `(streams, pending)` where `pending` is this layer's MLP combine,
+        deferred into the next hyper-connection."""
+        if not self.fused_hc:
+            return self._forward_unfused(positions, hidden_states, input_ids)
+        if self.ple is not None:
+            if pending is not None:
+                hidden_states = self.attn_hyper_connection.apply_pending(
+                    hidden_states, pending
+                )
+                pending = None
+            hidden_states = self._apply_ple(hidden_states, input_ids)
+        mixed, (hidden_states, raw) = self.attn_hyper_connection.mix_fused(
+            hidden_states, pending
+        )
+        if self.layer_type == "linear_attention":
+            sub_output = self.linear_attn(mixed)
+        else:
+            sub_output = self.self_attn(positions, mixed)
+        if self.tp_size > 1:
+            sub_output = tensor_model_parallel_all_reduce(sub_output)
+        mixed, (hidden_states, raw) = self.mlp_hyper_connection.mix_fused(
+            hidden_states, (sub_output, raw)
+        )
+        # The MoE block owns its own all-reduce.
+        return hidden_states, (self.mlp(mixed), raw)
+
+    def _apply_ple(self, hidden_states, input_ids):
+        ple_metadata = get_forward_context().attn_metadata.ple_metadata
+        if ple_metadata is not None:
+            return hidden_states + self.ple.forward_with_state(
+                hidden_states, input_ids, ple_metadata
+            )
+        starts = torch.tensor(
+            [0, hidden_states.shape[0]], device=hidden_states.device, dtype=torch.int32
+        )
+        context = torch.full(
+            (1, self.ple.short_conv_dilation - 1),
+            self.ple.ple_embedding.eos_token_id,
+            device=hidden_states.device,
+            dtype=torch.int64,
+        )
+        return hidden_states + self.ple(hidden_states, input_ids, starts, context)
+
+    def _forward_unfused(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -616,6 +670,7 @@ class Qwen4ExpModel(nn.Module):
                 prefix=prefix,
                 layer_num=layer_num,
                 quant_config=quant_config,
+                fused_hc=HC_FUSED,
             ),
             prefix=f"{prefix}.layers",
             layer_num_offset=0,
@@ -655,6 +710,20 @@ class Qwen4ExpModel(nn.Module):
             if inputs_embeds is not None
             else self.get_input_embeddings(input_ids)
         ).repeat(1, self.hc_count)
+
+        if HC_FUSED:
+            pending = None
+            for layer in self.layers[self.start_layer : self.end_layer]:
+                hidden_states, pending = layer(
+                    positions, hidden_states, input_ids, pending
+                )
+            if self.return_hc_state:
+                hidden_states = self.hyper_connection_mixer.apply_pending(
+                    hidden_states, pending
+                )
+                return hidden_states.view(-1, self.hc_count, self.config.hidden_size)
+            mixed, _ = self.hyper_connection_mixer.mix_fused(hidden_states, pending)
+            return mixed
 
         for layer in self.layers[self.start_layer : self.end_layer]:
             hidden_states = layer(positions, hidden_states, input_ids)
