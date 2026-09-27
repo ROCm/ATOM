@@ -162,22 +162,23 @@ def test_aiter_split_table_rejects_unqualified_shapes(
     )
 
 
-def test_dedicated_asm_receives_selected_split_count(monkeypatch):
+def _decode_split_kwargs(monkeypatch, *, planner, n=21, **kwargs):
     captured = {}
 
     monkeypatch.setattr(paged_decode.envs, "ATOM_USE_V4_PREFILL_ASM_FOR_DECODE", False)
+    monkeypatch.setattr(paged_decode, "_aiter_v4_nm_split_planner", lambda: planner)
     monkeypatch.setattr(
         paged_decode,
         "_v4_aiter_fp8_decode_splits",
         lambda q_packed, *, query_group, kv_kind: 3,
     )
 
-    def fake_decode(*args, **kwargs):
-        captured.update(kwargs)
+    def fake_decode(*args, **kw):
+        captured.update(kw)
         return "decode"
 
     monkeypatch.setattr(paged_decode, "_sparse_attn_v4_paged_decode_asm", fake_decode)
-    n, heads = 21, 128
+    heads = 128
     result = paged_decode.sparse_attn_v4_paged_decode(
         q=None,
         unified_kv=torch.empty((4, 512)),
@@ -190,8 +191,29 @@ def test_dedicated_asm_receives_selected_split_count(monkeypatch):
         q_rope_in=torch.empty((n, heads, 64)),
         qo_indptr=torch.arange(n + 1, dtype=torch.int32),
         query_group=7,
-        kv_kind="csa",
+        **kwargs,
     )
-
     assert result == "decode"
-    assert captured["num_kv_splits"] == 3
+    return {k: v for k, v in captured.items() if k in _SPLIT_KEYS}
+
+
+_SPLIT_KEYS = ("num_kv_splits", "kv_len_hint")
+
+
+def test_legacy_aiter_receives_csa_split_table(monkeypatch):
+    got = _decode_split_kwargs(
+        monkeypatch, planner=False, kv_kind="csa", kv_len_hint=1152
+    )
+    assert got == {"num_kv_splits": 3}
+
+
+def test_planner_aiter_receives_kv_len_hint(monkeypatch):
+    got = _decode_split_kwargs(
+        monkeypatch, planner=True, kv_kind="csa", kv_len_hint=1152
+    )
+    assert got == {"kv_len_hint": 1152}
+
+
+def test_planner_aiter_without_hint_uses_auto(monkeypatch):
+    got = _decode_split_kwargs(monkeypatch, planner=True, kv_kind="swa")
+    assert got == {}

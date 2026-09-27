@@ -296,6 +296,11 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     """[padded_T+1] int32 GPU — packed cumsum of per-token HCA kv_len
     (= `min(positions[t]+1, win) + (positions[t]+1)//128`). Padded tail = last
     value."""
+    kv_len_hint_csa: int | None = None
+    """Longest per-token CSA kv_len (`win + index_topk`); steers aiter's fp8
+    decode split planner."""
+    kv_len_hint_hca: int | None = None
+    """Longest per-token HCA kv_len (`win + max_model_len // 128`)."""
     envelope_rows: int = 0
     """Rows one V4 block takes across every layer of the pool — the stride from
     one block's compressed rows to the next in a layer's view of a plane. What
@@ -3799,6 +3804,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             win=win,
             index_topk=index_topk,
         )
+        attn_metadata.kv_len_hint_csa = win + index_topk
+        attn_metadata.kv_len_hint_hca = win + self.max_committed_hca
 
         # Expand block tables per query row so the unchanged aiter paged-MQA
         # kernels can run once with shape `[decode_rows, 1, ...]`. Source and
