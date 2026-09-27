@@ -753,6 +753,7 @@ class MooncakeConnector(KVConnectorBase):
         self._staging_pool_size: int = 0
         self._staging_free: list[int] = []
         self._staging_lock = threading.Lock()
+        self._index_staging_mr: tuple[int, int] | None = None
         self._index_staging_pool_size: int = 0
         self._index_staging_chunk_pages: int = 0
         self._index_staging_free: list[int] = []
@@ -906,6 +907,11 @@ class MooncakeConnector(KVConnectorBase):
             self._staging_pool_size = tt.staging_pool_size
             self._staging_free = list(range(tt.staging_pool_size))
         if tt.index_staging_region is not None:
+            region = tt.index_staging_region
+            self._index_staging_mr = (
+                region.base_addr,
+                self._rdma_chunk_sizes(region.total_bytes, region.unit_bytes)[0],
+            )
             self._index_staging_pool_size = tt.index_staging_pool_size
             self._index_staging_chunk_pages = tt.index_staging_chunk_pages
             self._index_staging_free = list(range(tt.index_staging_pool_size))
@@ -1995,10 +2001,17 @@ class MooncakeConnector(KVConnectorBase):
             src_page = np.arange(staged_pages, dtype=np.int64)
             dst_page = np.asarray(dst_block_ids, dtype=np.int64)
             length = np.full(staged_pages, bytes_per_page, dtype=np.int64)
+            # Consumer PAGE regions use the same whole-page MR registration
+            # policy. Address continuity alone does not imply a shared MR key.
+            dst_mr_bytes = (
+                self._MAX_RDMA_CHUNK_BYTES - self._MAX_RDMA_CHUNK_BYTES % bytes_per_page
+            ) or self._MAX_RDMA_CHUNK_BYTES
             src_addrs, dst_addrs, sizes = coalesce_contiguous(
                 staging_base + src_page * bytes_per_page,
                 dst_base + dst_page * bytes_per_page,
                 length,
+                src_mr=self._index_staging_mr,
+                dst_mr=(dst_base, dst_mr_bytes),
             )
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(

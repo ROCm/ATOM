@@ -1524,6 +1524,7 @@ def test_staged_index_write_preserves_selected_engine(monkeypatch):
     conn._release_index_staging_slot = MagicMock()
     conn._index_staging_stream = SimpleNamespace(synchronize=MagicMock())
     conn._gather_sharded_index = lambda *_args: (10000, 2)
+    conn._index_staging_mr = (10000, 1024)
     conn._rdma_write_with_retry = MagicMock(return_value=True)
     monkeypatch.setattr(mc.torch.cuda, "stream", lambda _: nullcontext())
     selected = object()
@@ -1541,3 +1542,74 @@ def test_staged_index_write_preserves_selected_engine(monkeypatch):
     )
     conn._index_staging_stream.synchronize.assert_called_once()
     conn._release_index_staging_slot.assert_called_once_with(3)
+
+
+@pytest.mark.parametrize("role", ["mla.kv", "dsa.index_cache"])
+@pytest.mark.parametrize("page_bytes", [16 * 576, 64 * 576, 64 * 1152])
+@pytest.mark.parametrize("succeeds", [False, True])
+def test_staged_pages_respect_both_mr_boundaries_and_slot_lifetime(
+    monkeypatch, role, page_bytes, succeeds
+):
+    from contextlib import nullcontext
+
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    conn = _matched_rail_producer()
+    src_base, dst_base = 2**40 + 128, 2**42 + 256
+    staging_base = src_base + page_bytes
+    # The source boundary is after two staged pages, the destination after one.
+    conn._index_staging_mr = (src_base, 3 * page_bytes)
+    dst_chunk_bytes = conn._rdma_chunk_sizes(
+        2 * conn._MAX_RDMA_CHUNK_BYTES, page_bytes
+    )[0]
+    pages_per_mr = dst_chunk_bytes // page_bytes
+    dst_ids = list(range(pages_per_mr - 1, pages_per_mr + 3))
+    order = []
+    conn._acquire_index_staging_slot = lambda: 1
+    conn._release_index_staging_slot = lambda slot: order.append(("release", slot))
+    conn._index_staging_stream = SimpleNamespace(
+        synchronize=lambda: order.append("synchronize")
+    )
+    conn._block_region_roles = [role]
+
+    def gather(*args):
+        order.append("gather")
+        assert args[2] == 1
+        return staging_base, 4
+
+    conn._gather_sharded_index = MagicMock(side_effect=gather)
+    conn._gather_sharded_mla = MagicMock(side_effect=gather)
+    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _: nullcontext())
+
+    def write(*args, **kwargs):
+        assert order == ["gather", "synchronize"]
+        order.append("write")
+        return succeeds
+
+    conn._rdma_write_with_retry = MagicMock(side_effect=write)
+    selected = object()
+    assert (
+        conn._execute_staged_index_layer_chunk(
+            "consumer:1234",
+            0,
+            dst_base,
+            page_bytes,
+            dst_ids,
+            "request",
+            object(),
+            engine=selected,
+        )
+        is succeeds
+    )
+    conn._rdma_write_with_retry.assert_called_once_with(
+        "consumer:1234",
+        [staging_base, staging_base + page_bytes, staging_base + 2 * page_bytes],
+        [dst_base + dst_ids[i] * page_bytes for i in (0, 1, 2)],
+        [page_bytes, page_bytes, 2 * page_bytes],
+        "request",
+        "staged-index",
+        engine=selected,
+    )
+    assert conn._gather_sharded_mla.call_count == int(role == "mla.kv")
+    assert conn._gather_sharded_index.call_count == int(role == "dsa.index_cache")
+    assert order == ["gather", "synchronize", "write", ("release", 1)]

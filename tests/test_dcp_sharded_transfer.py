@@ -131,3 +131,65 @@ def test_coalesce_contiguous_preserves_address_gaps():
     np.testing.assert_array_equal(src, [100, 200])
     np.testing.assert_array_equal(dst, [300, 500])
     np.testing.assert_array_equal(length, [8, 8])
+
+
+@pytest.mark.parametrize("page_bytes", [16 * 576, 64 * 576, 64 * 1152])
+@pytest.mark.parametrize("boundary", ["source", "destination", "both"])
+def test_coalesce_contiguous_splits_registered_mr_boundaries(page_bytes, boundary):
+    max_chunk = 2 * 1024**3 - 64 * 1024
+    mr_bytes = max_chunk - max_chunk % page_bytes
+    src_base, dst_base = 2**40 + 128, 2**42 + 256
+    src_start = src_base + (mr_bytes - page_bytes if boundary != "destination" else 0)
+    dst_start = dst_base + (mr_bytes - page_bytes if boundary != "source" else 0)
+    src, dst, length = coalesce_contiguous(
+        src_start + np.arange(3, dtype=np.int64) * page_bytes,
+        dst_start + np.arange(3, dtype=np.int64) * page_bytes,
+        np.full(3, page_bytes, dtype=np.int64),
+        src_mr=(src_base, mr_bytes),
+        dst_mr=(dst_base, mr_bytes),
+    )
+    np.testing.assert_array_equal(src, [src_start, src_start + page_bytes])
+    np.testing.assert_array_equal(dst, [dst_start, dst_start + page_bytes])
+    np.testing.assert_array_equal(length, [page_bytes, 2 * page_bytes])
+    for addresses, base in ((src, src_base), (dst, dst_base)):
+        np.testing.assert_array_equal(
+            (addresses - base) // mr_bytes,
+            (addresses + length - 1 - base) // mr_bytes,
+        )
+
+
+def test_coalesce_splits_single_run_at_different_source_and_destination_boundaries():
+    src, dst, length = coalesce_contiguous(
+        np.array([103]),
+        np.array([208]),
+        np.array([23]),
+        src_mr=(100, 10),
+        dst_mr=(200, 12),
+    )
+    # Splits inside the original run must preserve every byte in order.
+    np.testing.assert_array_equal(_expand_runs(src, length), np.arange(103, 126))
+    np.testing.assert_array_equal(_expand_runs(dst, length), np.arange(208, 231))
+    for addresses, base, chunk in ((src, 100, 10), (dst, 200, 12)):
+        np.testing.assert_array_equal(
+            (addresses - base) // chunk, (addresses + length - 1 - base) // chunk
+        )
+
+
+def test_coalesce_with_mr_boundaries_preserves_empty_input_and_address_gaps():
+    src, dst, length = coalesce_contiguous(
+        np.array([100, 104, 120]),
+        np.array([200, 204, 220]),
+        np.array([4, 4, 4]),
+        src_mr=(100, 64),
+        dst_mr=(200, 64),
+    )
+    np.testing.assert_array_equal(src, [100, 120])
+    np.testing.assert_array_equal(dst, [200, 220])
+    np.testing.assert_array_equal(length, [8, 4])
+    empty = np.empty(0, dtype=np.int64)
+    assert all(
+        a.size == 0
+        for a in coalesce_contiguous(
+            empty, empty, empty, src_mr=(100, 64), dst_mr=(200, 64)
+        )
+    )

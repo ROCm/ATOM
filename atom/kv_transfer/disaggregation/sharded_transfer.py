@@ -14,9 +14,23 @@ from atom.distributed.dcp_layout import dcp_global_pos
 
 
 def coalesce_contiguous(
-    src: np.ndarray, dst: np.ndarray, length: np.ndarray
+    src: np.ndarray,
+    dst: np.ndarray,
+    length: np.ndarray,
+    *,
+    src_mr: tuple[int, int] | None = None,
+    dst_mr: tuple[int, int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Merge adjacent runs that are contiguous on both sides."""
+    """Merge adjacent runs, optionally splitting at either side's MR boundaries.
+
+    Each MR specification is (region_base, chunk_bytes), matching registration's
+    regular chunk spacing. Input runs must already lie inside each region;
+    the final MR's alignment remainder may be split conservatively. Splitting
+    also handles an individual oversized page.
+    """
+    for mr in (src_mr, dst_mr):
+        if mr is not None and mr[1] <= 0:
+            raise ValueError("MR chunk bytes must be positive")
 
     if src.size == 0:
         empty = np.empty(0, dtype=np.int64)
@@ -27,7 +41,33 @@ def coalesce_contiguous(
     starts = np.concatenate(([True], ~contiguous))
     start_indices = np.flatnonzero(starts)
     merged_length = np.add.reduceat(length, start_indices)
-    return src[starts], dst[starts], merged_length
+    merged_src, merged_dst = src[starts], dst[starts]
+    if src_mr is None and dst_mr is None:
+        return merged_src, merged_dst, merged_length
+
+    split_src, split_dst, split_length = [], [], []
+    for s, d, remaining in zip(
+        merged_src.tolist(), merged_dst.tolist(), merged_length.tolist()
+    ):
+        while remaining:
+            size = remaining
+            if src_mr is not None:
+                base, chunk = src_mr
+                size = min(size, chunk - (s - base) % chunk)
+            if dst_mr is not None:
+                base, chunk = dst_mr
+                size = min(size, chunk - (d - base) % chunk)
+            split_src.append(s)
+            split_dst.append(d)
+            split_length.append(size)
+            s += size
+            d += size
+            remaining -= size
+    return (
+        np.asarray(split_src, dtype=np.int64),
+        np.asarray(split_dst, dtype=np.int64),
+        np.asarray(split_length, dtype=np.int64),
+    )
 
 
 @dataclass(frozen=True)
