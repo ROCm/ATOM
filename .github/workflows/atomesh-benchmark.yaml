@@ -344,6 +344,11 @@ jobs:
       - name: Inspect controller health and clean obsolete K3 jobs
         if: ${{ inputs.inspect_run_id == '36240523437' }}
         run: bash .github/scripts/atomesh/k3_spur_recovery.sh
+      - name: Inspect current K3 compilers on both allocated hosts
+        if: ${{ inputs.inspect_run_id == '36333613882' && inputs.inspect_processes }}
+        env:
+          ATOMESH_NODE_POOL: pit2-p03-g13,pit2-p03-g23
+        run: python3 .github/scripts/atomesh/k3_gpu_inventory.py 4662
       - name: Inspect alternate MI355X resource access
         if: ${{ inputs.atomesh_slurm_submit_runner == 'atomesh-cicd-mi355-crusoe' }}
         run: |

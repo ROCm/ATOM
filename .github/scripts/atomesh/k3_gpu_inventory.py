@@ -32,7 +32,7 @@ def command(args):
         return {"error": str(exc)}
 
 
-def worker():
+def worker(job_id):
     result = {"host": socket.gethostname(), "uid": os.getuid(), "memory": []}
     for card in sorted(Path("/sys/class/drm").glob("card[0-9]*")):
         if not re.fullmatch(r"card[0-9]+", card.name):
@@ -94,24 +94,24 @@ def worker():
     result["containers"] = command(
         docker + ["ps", "--no-trunc", "--format", "{{.ID}} {{.Names}} {{.Status}}"]
     )
-    result["old_job_containers"] = []
+    result["job_containers"] = []
     for line in result["containers"].get("stdout", "").splitlines():
         fields = line.split()
         if len(fields) < 2 or not re.fullmatch(r"[0-9a-f]{64}", fields[0]):
             continue
         if not re.fullmatch(
-            r"atomesh-.*-4640-[01](-benchmark|-eval|-router|-benchmark-router|-eval-router)?",
+            rf"atomesh-.*-{job_id}-[01](-benchmark|-eval|-router|-benchmark-router|-eval-router)?",
             fields[1],
         ):
             continue
-        result["old_job_containers"].append(
+        result["job_containers"].append(
             {
                 "name": fields[1],
                 "state": command(
                     docker + ["inspect", "--format", "{{json .State}}", fields[0]]
                 ),
                 "pids": command(
-                    docker + ["top", fields[0], "-eo", "pid,ppid,stat,comm"]
+                    docker + ["top", fields[0], "-eo", "pid,ppid,etimes,pcpu,stat,comm"]
                 ),
             }
         )
@@ -139,7 +139,7 @@ def worker():
     print(json.dumps(result, indent=2))
 
 
-def main():
+def main(job_id):
     nodes = os.environ["ATOMESH_NODE_POOL"].split(",")
     if not nodes or any(
         not re.fullmatch(r"pit2-p03-g[0-9]{2}", node) for node in nodes
@@ -161,7 +161,7 @@ def main():
                     "-o",
                     "ConnectTimeout=4",
                     node,
-                    "timeout -k 2s 25s python3 - --worker",
+                    f"timeout -k 2s 25s python3 - --worker {job_id}",
                 ],
                 input=script,
                 capture_output=True,
@@ -185,7 +185,10 @@ def main():
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["--worker"]:
-        worker()
+    job = sys.argv[-1] if len(sys.argv) > 1 else "4640"
+    if not re.fullmatch(r"[0-9]+", job):
+        raise ValueError("Invalid diagnostic job ID")
+    if sys.argv[1:2] == ["--worker"]:
+        worker(job)
     else:
-        main()
+        main(job)
