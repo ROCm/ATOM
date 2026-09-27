@@ -1,4 +1,5 @@
 import fnmatch
+import os
 import re
 from typing import ClassVar
 
@@ -30,6 +31,9 @@ from atom.model_ops.qwen4_exp.ops.gated import sigmoid_mul, sigmoid_rmsnorm
 from atom.model_ops.qwen4_exp.ple_layer import Qwen4ExpPLELayer
 from atom.model_ops.qwen4_exp.qsa_attention import (
     Qwen4ExpAttention,
+)
+from atom.model_ops.topK import (
+    is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
 )
 from atom.model_ops.utils import atom_parameter
 from atom.models.qwen3_next import Qwen3NextMLP, mamba_v2_sharded_weight_loader
@@ -108,6 +112,12 @@ class _Qwen4ExpQuantizationConfig:
         return getattr(self._config, field + "global_spec")
 
 
+# Route the sigmoid-gated shared expert through the fused MoE as expert
+# `num_experts` (top-k + 1). The released FP8 checkpoint stores experts one by
+# one, so the loader can place the shared expert into that extra slot.
+FUSE_SHARED_EXPERT = os.environ.get("ATOM_QWEN4_FUSE_SHARED_EXPERT", "1") == "1"
+
+
 class Qwen4ExpRMSNormGated(nn.Module):
     """GDN's sigmoid gate with the checkpoint's BF16 cast boundaries."""
 
@@ -149,7 +159,8 @@ def install_stacked_expert_loaders(experts: FusedMoE) -> None:
     tp_rank = moe_parallel.tp_rank
     expert_map = getattr(experts, "expert_map", None)
     if expert_map is None:
-        expert_slice = slice(None)
+        # A fused shared expert occupies slots past the routed ones.
+        expert_slice = slice(0, experts.expert_layout.num_routed)
     else:
         local = torch.nonzero(expert_map >= 0).flatten()
         first, last = int(local[0]), int(local[-1])
@@ -215,6 +226,15 @@ class _UnfusedSharedExpertConfig:
         return getattr(self._config, name)
 
 
+class _FusedSharedExpertConfig(_UnfusedSharedExpertConfig):
+    """Config view exposing exactly one fused shared expert."""
+
+    def __getattr__(self, name: str):
+        if name == "n_shared_experts":
+            return 1
+        return getattr(self._config, name)
+
+
 class Qwen4ExpSparseMoeBlock(nn.Module):
     """512 routed experts, top-10, plus one sigmoid-gated shared expert.
 
@@ -223,11 +243,21 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
     column is the shared expert's gate.
     """
 
-    def __init__(self, config, quant_config, prefix: str = "") -> None:
+    def __init__(
+        self, config, quant_config, prefix: str = "", fuse_shared_expert: bool = False
+    ) -> None:
         super().__init__()
         self.prefix = prefix
         self.tp_size = get_tensor_model_parallel_world_size()
         self.n_routed_experts = int(config.num_experts)
+        self.fuse_shared = (
+            fuse_shared_expert
+            and is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+                quant_config,
+                shared_expert_prefix=f"{prefix}.shared_expert",
+                routed_expert_prefix=f"{prefix}.experts",
+            )
+        )
         if self.tp_size > self.n_routed_experts:
             raise ValueError(
                 f"TP {self.tp_size} exceeds the expert count {self.n_routed_experts}"
@@ -240,13 +270,17 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
-        self.shared_expert = Qwen3NextMLP(
-            config.hidden_size,
-            config.shared_expert_intermediate_size,
-            config.hidden_act,
-            reduce_results=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.shared_expert",
+        self.shared_expert = (
+            None
+            if self.fuse_shared
+            else Qwen3NextMLP(
+                config.hidden_size,
+                config.shared_expert_intermediate_size,
+                config.hidden_act,
+                reduce_results=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.shared_expert",
+            )
         )
         self.experts = FusedMoE(
             num_experts=self.n_routed_experts,
@@ -259,7 +293,12 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             use_grouped_topk=False,
             has_bias=False,
             prefix=f"{prefix}.experts",
-            config=_UnfusedSharedExpertConfig(config),
+            config=(
+                _FusedSharedExpertConfig(config)
+                if self.fuse_shared
+                else _UnfusedSharedExpertConfig(config)
+            ),
+            shared_expert_scoring_func="sigmoid" if self.fuse_shared else None,
             shared_expert_prefix=f"{prefix}.shared_expert",
         )
         install_stacked_expert_loaders(self.experts)
@@ -268,6 +307,12 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
         logits = self.gate(hidden_states)
+        if self.fuse_shared:
+            # The tail logit is the shared expert's sigmoid gate.
+            out = self.experts(hidden_states=hidden_states, router_logits=logits)
+            if self.tp_size > 1:
+                out = tensor_model_parallel_all_reduce(out)
+            return out.view(orig_shape)
         routed = self.experts(
             hidden_states=hidden_states,
             router_logits=logits[:, : self.n_routed_experts],
@@ -488,6 +533,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         layer_num: int = 0,
         quant_config=None,
         fused_hc: bool = False,
+        fuse_shared_expert: bool = False,
     ) -> None:
         super().__init__()
         config = atom_config.hf_config
@@ -544,7 +590,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
         else:
             raise ValueError(f"Invalid layer_type {layer_type}")
 
-        self.mlp = Qwen4ExpSparseMoeBlock(config, quant_config, prefix=f"{prefix}.mlp")
+        self.mlp = Qwen4ExpSparseMoeBlock(
+            config,
+            quant_config,
+            prefix=f"{prefix}.mlp",
+            fuse_shared_expert=fuse_shared_expert,
+        )
 
     def forward(
         self,
@@ -671,6 +722,7 @@ class Qwen4ExpModel(nn.Module):
                 layer_num=layer_num,
                 quant_config=quant_config,
                 fused_hc=HC_FUSED,
+                fuse_shared_expert=FUSE_SHARED_EXPERT,
             ),
             prefix=f"{prefix}.layers",
             layer_num_offset=0,
@@ -870,6 +922,14 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
             prefix=maybe_prefix(prefix, "model"),
             quant_config=self.quant_config,
         )
+        self.fused_shared_experts = int(
+            any(
+                getattr(m, "fuse_shared", False)
+                for m in self.model.modules()
+                if isinstance(m, Qwen4ExpSparseMoeBlock)
+            )
+        )
+        self.disable_fused_shared_loading = not self.fused_shared_experts
         for module in self.model.modules():
             if isinstance(module, Qwen4ExpLinearAttention):
                 for source, (target, shard) in module.packed_modules_mapping.items():
@@ -951,5 +1011,5 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=int(self.config.num_experts),
+            num_experts=int(self.config.num_experts) + self.fused_shared_experts,
         )
