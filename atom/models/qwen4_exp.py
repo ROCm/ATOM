@@ -28,6 +28,7 @@ from atom.model_ops.qwen4_exp.hyperconnection import (
     Qwen4ExpHyperConnection,
 )
 from atom.model_ops.qwen4_exp.ops.gated import sigmoid_mul, sigmoid_rmsnorm
+from atom.model_ops.qwen4_exp.ops.moe_decode import moe_decode_single_token
 from atom.model_ops.qwen4_exp.ple_layer import Qwen4ExpPLELayer
 from atom.model_ops.qwen4_exp.qsa_attention import (
     Qwen4ExpAttention,
@@ -117,6 +118,9 @@ class _Qwen4ExpQuantizationConfig:
 # `num_experts` (top-k + 1). The released FP8 checkpoint stores experts one by
 # one, so the loader can place the shared expert into that extra slot.
 FUSE_SHARED_EXPERT = os.environ.get("ATOM_QWEN4_FUSE_SHARED_EXPERT", "1") == "1"
+# One-token MoE through `moe_decode_single_token` instead of sort + quant +
+# the 1-stage asm kernel (needs the fused shared expert).
+SINGLE_TOKEN_MOE = os.environ.get("ATOM_QWEN4_SINGLE_TOKEN_MOE", "1") == "1"
 
 
 class Qwen4ExpRMSNormGated(nn.Module):
@@ -310,7 +314,10 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
         logits = self.gate(hidden_states)
         if self.fuse_shared:
             # The tail logit is the shared expert's sigmoid gate.
-            out = self.experts(hidden_states=hidden_states, router_logits=logits)
+            if SINGLE_TOKEN_MOE and hidden_states.shape[0] == 1:
+                out = self._single_token_experts(hidden_states, logits)
+            else:
+                out = self.experts(hidden_states=hidden_states, router_logits=logits)
             if self.tp_size > 1:
                 out = tensor_model_parallel_all_reduce(out)
             return out.view(orig_shape)
@@ -323,6 +330,46 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
         if self.tp_size > 1:
             out = tensor_model_parallel_all_reduce(out)
         return out.view(orig_shape)
+
+
+    def _single_token_experts(self, hidden_states, logits):
+        ex = self.experts
+        n = ex.w13_weight.shape[0]
+        weights = (
+            ex.w13_weight,
+            ex.w13_weight_scale.view(n, -1),
+            ex.w2_weight,
+            ex.w2_weight_scale.view(n, -1),
+        )
+        if (
+            ex.renormalize
+            and ex.scoring_func == "softmax"
+            and not ex.use_grouped_topk
+            and ex.custom_routing_function is None
+            and ex.e_score_correction_bias is None
+            and ex.routed_scaling_factor == 1.0
+            and n == self.n_routed_experts + 1
+        ):
+            return moe_decode_single_token(
+                hidden_states, None, None, *weights, router_logits=logits, top_k=ex.top_k
+            )
+        topk_weights, topk_ids = FusedMoE.select_experts(
+            hidden_states=hidden_states,
+            router_logits=logits,
+            use_grouped_topk=ex.use_grouped_topk,
+            top_k=ex.top_k,
+            renormalize=ex.renormalize,
+            topk_group=ex.topk_group,
+            num_expert_group=ex.num_expert_group,
+            custom_routing_function=ex.custom_routing_function,
+            scoring_func=ex.scoring_func,
+            e_score_correction_bias=ex.e_score_correction_bias,
+            fused_shared_experts_scoring_func=ex.shared_expert_scoring_func,
+            num_routing_experts=ex.global_num_experts,
+            num_fused_shared_experts=ex.num_fused_shared_experts,
+            routed_scaling_factor=ex.routed_scaling_factor,
+        )
+        return moe_decode_single_token(hidden_states, topk_ids, topk_weights, *weights)
 
 
 class Qwen4ExpLinearAttention(nn.Module):
