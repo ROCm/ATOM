@@ -456,7 +456,7 @@ models:
 
   Kimi-K3-MXFP4:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/Kimi-K3"
+    model_path: "${ATOMESH_MODEL_ROOT}/moonshotai/Kimi-K3"
     precision: MXFP4
     env:
       common:

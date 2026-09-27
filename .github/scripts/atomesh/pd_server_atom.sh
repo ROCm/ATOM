@@ -487,16 +487,32 @@ build_server_cache_env() {
 spec = importlib.util.find_spec("aiter")
 sys.stdout.write(os.path.dirname(spec.origin) if spec and spec.origin else "")' 2>/dev/null || true)"
     if [[ -d "${aiter_root}/jit/flydsl_cache" ]]; then
-      cp -a "${aiter_root}/jit/flydsl_cache/." "${cache_root}/flydsl/"
-      echo "[runtime] ${role} seeded flydsl cache from ${aiter_root}/jit/flydsl_cache" \
-        "($(find "${cache_root}/flydsl" -type f | wc -l) files)"
+      # The image ships every kernel payload as mode 0600 root:root while the
+      # container runs as the submitting user, so a plain `cp -a` fails on all
+      # 10k .pkl files and -- under `set -e` -- takes the whole launch down.
+      # Seeding is an optimization, never a precondition for serving: copy what
+      # is readable, then report the payload count rather than the file count,
+      # because the world-readable 0-byte .lock siblings would otherwise make an
+      # empty seed look like a full one.
+      local seeded_payloads
+      cp -a "${aiter_root}/jit/flydsl_cache/." "${cache_root}/flydsl/" 2>/dev/null || true
+      seeded_payloads="$(find "${cache_root}/flydsl" -name '*.pkl' -size +0c | wc -l)"
+      if [[ "${seeded_payloads}" -eq 0 ]]; then
+        echo "[runtime] WARNING: ${role} seeded 0 flydsl kernels from" \
+          "${aiter_root}/jit/flydsl_cache -- the payloads are unreadable to uid" \
+          "$(id -u). AITER cannot read them either, so every tuned GEMM will be" \
+          "JIT-compiled during serving."
+      else
+        echo "[runtime] ${role} seeded flydsl cache from ${aiter_root}/jit/flydsl_cache" \
+          "(${seeded_payloads} kernels)"
+      fi
     else
       echo "[runtime] WARNING: ${role} found no AOT flydsl cache under '${aiter_root}';" \
         "tuned GEMMs will be JIT-compiled during serving"
     fi
     # Same story for the prebuilt CK modules AITER_JIT_DIR would otherwise hide.
     if [[ -d "${aiter_root}/jit" ]]; then
-      cp -a "${aiter_root}/jit/." "${cache_root}/aiter/jit/"
+      cp -a "${aiter_root}/jit/." "${cache_root}/aiter/jit/" 2>/dev/null || true
       echo "[runtime] ${role} seeded aiter jit dir" \
         "($(find "${cache_root}/aiter/jit" -name 'module_*.so' | wc -l) prebuilt modules)"
     fi

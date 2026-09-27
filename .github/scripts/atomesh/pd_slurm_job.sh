@@ -233,6 +233,11 @@ EOF
   if [[ -d /shared_nfs ]]; then
     docker_args+=(-v /shared_nfs:/shared_nfs:ro)
   fi
+  # pit2 keeps its model store under /share_nfs/models, which none of the
+  # unconditional mounts above cover.
+  if [[ -d /share_nfs/models ]]; then
+    docker_args+=(-v /share_nfs/models:/share_nfs/models)
+  fi
 
   if [[ "${rank}" -eq 0 \
     && "${EVAL_TASK:-}" == "swebench_lite" \
@@ -554,6 +559,9 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
       nested_docker_args=()
       if [[ -d /shared_nfs ]]; then
         nested_docker_args+=(-v /shared_nfs:/shared_nfs:ro)
+      fi
+      if [[ -d /share_nfs/models ]]; then
+        nested_docker_args+=(-v /share_nfs/models:/share_nfs/models)
       fi
       if [[ "${rank}" -eq 0 \
         && "${EVAL_TASK:-}" == "swebench_lite" \
