@@ -288,3 +288,44 @@ def test_preshuffled_index_gather_rejects_narrow_staging_slot():
     staging = torch.zeros(plan.dst_pages, 16 * 128, dtype=torch.uint8)
     with pytest.raises(ValueError, match="bytes wide"):
         gather_dcp_preshuffled_index_pages(source, staging, indices, 128, 16, 16)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("width", [576, 1152])
+def test_mla_gather_crosses_chunk_boundary_with_partial_tail(block_size, width):
+    pytest.importorskip("triton")
+    chunk_pages, dcp_size, rank = 256, 4, 3
+    # 257 local pages force a second chunk; only part of its last page is valid.
+    num_blocks = chunk_pages * dcp_size + 1
+    src_ids = list(reversed(range(num_blocks)))
+    raw = torch.arange(num_blocks * block_size * width, dtype=torch.int64)
+    source_bytes = (
+        raw.remainder(251).to(torch.uint8).reshape(num_blocks, block_size, width)
+    )
+    source = source_bytes.cuda().view(torch.float16)
+    plan = build_dcp_shard_plan(
+        src_ids, block_size=block_size, dcp_size=dcp_size, dcp_rank=rank
+    )
+    staging = torch.full(
+        (chunk_pages + 1, block_size * width), 253, dtype=torch.uint8, device="cuda"
+    )
+    output = []
+    for start in range(0, plan.dst_pages, chunk_pages):
+        part = plan.slice_pages(start, min(start + chunk_pages, plan.dst_pages))
+        indices = prepare_dcp_index_gather_indices(part, source.device)
+        # The second chunk must neither overwrite nor zero the rest of the slot.
+        staging.fill_(253)
+        assert (
+            gather_dcp_mla_pages(source, staging[:chunk_pages], indices, block_size)
+            == part.dst_pages
+        )
+        output.append(staging[: part.dst_pages].cpu())
+        assert torch.all(staging[part.dst_pages :] == 253)
+    global_tokens = torch.arange(plan.dst_pages * block_size) * dcp_size + rank
+    valid = global_tokens < num_blocks * block_size
+    expected = torch.zeros(global_tokens.numel(), width, dtype=torch.uint8)
+    # Oracle uses logical request order rather than the gather plan's indices.
+    logical_source = source_bytes.flip(0).reshape(-1, width)
+    expected[valid] = logical_source[global_tokens[valid]]
+    torch.testing.assert_close(torch.cat(output).reshape(-1, width), expected)

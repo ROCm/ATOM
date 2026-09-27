@@ -413,6 +413,15 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         there does it inside a live request's batch. A no-op by default.
         """
 
+    def kv_transfer_staging_bytes(self) -> int:
+        """Fixed GPU bytes allocated later by ``get_kv_transfer_tensors``.
+
+        ModelRunner reserves these before sizing the cache pools. Report only
+        additional allocations not already included in profiling or sub-pool
+        specs. This query must not allocate GPU memory.
+        """
+        return 0
+
     def get_kv_transfer_tensors(self) -> "KVTransferTensors | None":
         """Return RDMA transfer regions for PD disaggregation.
 

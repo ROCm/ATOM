@@ -1735,14 +1735,22 @@ class ModelRunner:
         safety_margin = int(total * 0.02)
 
         budget = int(total * config.gpu_memory_utilization)
-        non_kv_overhead = peak_torch + non_torch + cudagraph_overhead + safety_margin
+        # Transfer staging is allocated after the pools. Reserve its exact
+        # declared size before assigning the remaining bytes to KV blocks.
+        staging_bytes = self.attn_metadata_builder.kv_transfer_staging_bytes()
+        self.kv_transfer_staging_reserved_bytes = staging_bytes
+        non_kv_overhead = (
+            peak_torch + non_torch + cudagraph_overhead + safety_margin + staging_bytes
+        )
         available_for_kv_budget = budget - non_kv_overhead
 
         # Physical clamp: never exceed what's actually free on the GPU.
         # Subclasses may reserve extra headroom (override point).
         available_for_kv_budget -= self._kv_budget_extra_reserve(total)
-        # This prevents OOM when other processes share the GPU.
-        available_for_kv = min(available_for_kv_budget, free)
+        # Staging also needs physical free space when another process makes
+        # that the tighter limit. Deduct it on both sides of the minimum.
+        free_for_kv = free - staging_bytes
+        available_for_kv = min(available_for_kv_budget, free_for_kv)
 
         torch.set_default_device(None)
 
@@ -1771,12 +1779,13 @@ class ModelRunner:
                 f"({available_for_kv / (1 << 30):.2f}GB) at "
                 f"--gpu-memory-utilization {config.gpu_memory_utilization:.2f}."
             )
-            if available_for_kv_budget > free:
+            if available_for_kv_budget > free_for_kv:
                 # The physical free-memory clamp is the binding limit, not the
                 # utilization budget — raising --gpu-memory-utilization won't help.
                 fix_msg = (
-                    f" Only {free / (1 << 30):.2f}GB is physically free on the GPU "
-                    f"(other processes may be holding memory); raising "
+                    f" Only {free_for_kv / (1 << 30):.2f}GB is physically free "
+                    f"for KV after reserving {staging_bytes / (1 << 30):.2f}GB "
+                    f"for transfer staging (other processes may be holding memory); raising "
                     f"--gpu-memory-utilization will NOT help. Free GPU memory or "
                     f"reduce --max-num-seqs (currently {config.max_num_seqs})."
                 )
@@ -1877,6 +1886,7 @@ class ModelRunner:
             f"non_torch={non_torch / (1 << 30):.2f}GB, "
             f"cudagraph_est={cudagraph_overhead / (1 << 30):.2f}GB, "
             f"safety={safety_margin / (1 << 30):.2f}GB, "
+            f"transfer_staging={staging_bytes / (1 << 30):.2f}GB, "
             f"available_for_kv={available_for_kv / (1 << 30):.2f}GB, "
             f"block_bytes={block_bytes}, "
             f"num_kvcache_blocks={num_kvcache_blocks}"
@@ -1923,6 +1933,7 @@ class ModelRunner:
             f"non_torch={non_torch / (1 << 30):.2f}GB, "
             f"cudagraph_est={cudagraph_overhead / (1 << 30):.2f}GB, "
             f"safety={safety_margin / (1 << 30):.2f}GB, "
+            f"transfer_staging={staging_bytes / (1 << 30):.2f}GB, "
             f"free={free / (1 << 30):.2f}GB)"
         )
         # get_num_blocks runs in the RUNNER subprocess, so nothing it writes
@@ -2125,19 +2136,19 @@ class ModelRunner:
         )
 
         # Cross-validate: compare estimated vs actual KV cache allocation.
-        # `actual_kv_bytes` includes BOTH the unified pool tensors (counted by
-        # `block_bytes × num_blocks`) AND the per-request cache tensors (state
-        # buffers + SWA window prefix embedded in unified_kv). The budget
-        # math in `get_num_blocks()` reserves both separately, so the cross-
-        # check must mirror that — otherwise it spuriously fires for any
-        # backend that declares a per-request state pool (V4, GDN).
+        # The measured allocation includes paged KV, per-request state/SWA,
+        # and fixed transfer staging. Mirror all three reservations from
+        # get_num_blocks() so staging does not look like an allocation mismatch.
         post_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         actual_kv_bytes = post_alloc - pre_alloc
         # Each sub-pool contributes `entry_bytes × entries`. The counts come
         # straight from the sizing plan — which already absorbed the pipeline-
         # parallel reconciliation — so this mirrors the budget by construction
         # rather than re-deriving it.
-        expected_kv_bytes = self.pool_plan.total_reserved_bytes
+        expected_kv_bytes = (
+            self.pool_plan.total_reserved_bytes
+            + self.kv_transfer_staging_reserved_bytes
+        )
         if expected_kv_bytes > 0:
             diff_pct = abs(actual_kv_bytes - expected_kv_bytes) / expected_kv_bytes
             # 3% threshold: budget formula matches allocation exactly, but the

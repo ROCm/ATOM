@@ -599,7 +599,9 @@ def test_mla_staging_rejects_unsupported_layout_before_gather(
     runner.config.kv_transfer_config = {
         "kv_connector": "mooncake",
         "kv_role": "kv_producer",
-        "num_worker_threads": 1,
+        "num_worker_threads": 2,
+        "index_staging_chunk_pages": 256,
+        "index_staging_max_bytes": 2 * 3 * 64 * 576,
     }
     builder.kv_pool = MlaKvPool(
         layers=1,
@@ -626,18 +628,34 @@ def test_mla_staging_rejects_unsupported_layout_before_gather(
     # dropping it would silently fall back to direct per-token RDMA.
     assert len(transfer.block_regions) == 2
     assert transfer.gather_sharded_mla is not None
+    assert transfer.index_staging_pool_size == 2
+    assert transfer.index_staging_chunk_pages == 3
+    assert transfer.index_staging_region.total_bytes == 2 * 3 * 64 * 576
     if unsupported_layout is not None:
         with pytest.raises(RuntimeError, match=f"{unsupported_layout} layout"):
-            transfer.gather_sharded_mla(0, None, 0)
+            transfer.gather_sharded_mla(0, None, 1)
         assert not gather_calls
     else:
-        addr, pages = transfer.gather_sharded_mla(0, None, 0)
+        addr, pages = transfer.gather_sharded_mla(0, None, 1)
         assert addr != 0 and pages == 0
         assert len(gather_calls) == 1
         source, staging, block_size = gather_calls[0]
         assert source.data_ptr() == transfer.block_regions[0].base_addr
         assert staging.is_contiguous() and staging.dtype == torch.uint8
+        assert staging.shape == (3, 64 * 576)
+        assert addr == transfer.index_staging_region.base_addr + 3 * 64 * 576
         assert block_size == 64
+
+        def gather_index(source, slot, indices, head_dim, block_size, ratio):
+            assert source.data_ptr() == transfer.block_regions[1].base_addr
+            assert slot.is_contiguous() and slot.shape == (3, 64 * 144)
+            assert slot.data_ptr() == addr
+            return 0
+
+        monkeypatch.setattr(
+            aiter_mla, "gather_dcp_preshuffled_index_pages", gather_index
+        )
+        assert transfer.gather_sharded_index(1, None, 1) == (addr, 0)
 
 
 class _FakeMetadataBuffer:
@@ -752,3 +770,68 @@ def test_ubatch_metadata_views_full_dcp_local_context_buffer():
         torch.tensor([13, 14], dtype=torch.int32),
     )
     assert "ub1_dcp_local_context_lens" not in var
+
+
+@pytest.mark.parametrize(
+    "kv_dtype,expected_pages,expected_bytes",
+    [
+        ("fp8", 256, 144 * 1024**2),
+        ("bf16", 227, 267780096),
+    ],
+)
+def test_mla_staging_budget_matches_later_allocation(
+    monkeypatch, kv_dtype, expected_pages, expected_bytes
+):
+    _mock_pp(monkeypatch, rank=0, world_size=1)
+    builder, runner = _builder(None, total_local_layers=6)
+    runner.block_size = runner.config.kv_cache_block_size = 64
+    runner.config.kv_cache_dtype = kv_dtype
+    runner.config.kv_transfer_config = {"kv_connector": "mooncake"}
+    builder.kv_pool = None
+    # Sizing must work before a block count or any GPU/CPU KV tensor exists.
+    with monkeypatch.context() as no_allocation:
+        no_allocation.setattr(
+            torch,
+            "empty",
+            lambda *args, **kwargs: pytest.fail("Sizing allocated a tensor"),
+        )
+        reserved = builder.kv_transfer_staging_bytes()
+    assert builder.kv_pool is None
+    assert reserved == expected_bytes
+    builder.kv_pool = builder._declare_kv_pool()
+    builder.kv_pool.allocate(2, "cpu")
+    transfer = builder.get_kv_transfer_tensors()
+    assert transfer.index_staging_chunk_pages == expected_pages
+    assert transfer.index_staging_region.total_bytes == reserved
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "no_connector",
+        "consumer",
+        "offload",
+        "dcp_producer",
+        "dense",
+        "unsupported",
+        "fp4",
+    ],
+)
+def test_mla_staging_budget_is_zero_when_no_pool_will_be_allocated(monkeypatch, case):
+    builder, runner = _builder(None, total_local_layers=6)
+    runner.config.kv_transfer_config = {"kv_connector": "mooncake"}
+    if case == "no_connector":
+        runner.config.kv_transfer_config = None
+    elif case == "consumer":
+        runner.config.kv_transfer_config["kv_role"] = "kv_consumer"
+    elif case == "offload":
+        runner.config.kv_transfer_config = {"kv_connector": "lmcache_offload"}
+    elif case == "dcp_producer":
+        builder.dcp_world_size = 4
+    elif case == "dense":
+        runner.has_mla_indexer = False
+    elif case == "unsupported":
+        monkeypatch.setattr(builder, "_supports_dcp_index_staging", lambda: False)
+    else:
+        builder._indexer_fp4 = True
+    assert builder.kv_transfer_staging_bytes() == 0

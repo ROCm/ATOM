@@ -98,3 +98,34 @@ def index_staging_pool_size(config) -> int:
             f"got {count!r}"
         )
     return count
+
+
+def index_staging_shape(config, page_bytes: int) -> tuple[int, int]:
+    """Size the shared MLA/index staging pool under a per-process byte cap.
+
+    Keep one slot per send worker, reducing pages per chunk when the widest
+    cache page would exceed the cap. Budgeting and allocation use this same
+    shape so the runner reserves the actual pool size, not the configured cap.
+    """
+    slots = index_staging_pool_size(config)
+    if not slots:
+        return 0, 0
+    connector = _producer_connectors(config, _INDEX_STAGING_CONNECTORS)[0]
+    pages = connector.get("index_staging_chunk_pages", 256)
+    max_bytes = connector.get("index_staging_max_bytes", 256 * 1024**2)
+    for name, value in (
+        ("index_staging_chunk_pages", pages),
+        ("index_staging_max_bytes", max_bytes),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    if page_bytes <= 0:
+        raise ValueError("Staging page_bytes must be positive")
+    capped_pages = min(pages, max_bytes // (slots * page_bytes))
+    if not capped_pages:
+        raise ValueError(
+            f"index_staging_max_bytes={max_bytes} cannot hold one page per "
+            f"worker ({slots * page_bytes} bytes); increase the cap or reduce "
+            "num_worker_threads"
+        )
+    return slots, capped_pages

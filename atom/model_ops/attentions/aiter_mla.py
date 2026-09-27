@@ -35,9 +35,9 @@ from atom.kv_transfer.disaggregation.index_staging import (
     prepare_dcp_index_gather_indices,
 )
 from atom.kv_transfer.disaggregation.pd_producer import (
-    index_staging_pool_size as _index_staging_pool_size,
+    index_staging_shape,
+    mooncake_pd_producer_configured,
 )
-from atom.kv_transfer.disaggregation.pd_producer import mooncake_pd_producer_configured
 from atom.kv_transfer.disaggregation.sharded_transfer import DCPShardPlan
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import (
@@ -1395,6 +1395,42 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             index_scale=index_scale if runner.has_mla_indexer else None,
         )
 
+    def _dcp_staging_shape(self, pool: MlaKvPool | None = None) -> tuple[int, int, int]:
+        """The same (slots, pages, bytes/page) for budgeting and allocation."""
+        runner = self.model_runner
+        if (
+            getattr(self, "dcp_world_size", None) != 1
+            or self._indexer_fp4
+            or not mooncake_pd_producer_configured(runner.config)
+            or not self._supports_dcp_index_staging()
+        ):
+            return 0, 0, 0
+        if pool is None:
+            pool = self._declare_kv_pool()
+        if not any(field.layers for field in pool.index_fields):
+            return 0, 0, 0
+        scheduler_block_size = runner.config.kv_cache_block_size
+        if scheduler_block_size % 16:
+            raise RuntimeError(
+                "Preshuffled DSA index P/D staging requires "
+                "kv_cache_block_size divisible by 16, got "
+                f"{scheduler_block_size}"
+            )
+        # A transfer region holds one field's scheduler pages for one layer.
+        # Read the declaration before any KV tensor or block count exists.
+        page_bytes = max(
+            field.per_layer_numel * field.dtype.itemsize
+            for group in pool.field_groups
+            for field in group
+            if field.layers
+        )
+        slots, pages = index_staging_shape(runner.config, page_bytes)
+        return slots, pages, page_bytes
+
+    def kv_transfer_staging_bytes(self) -> int:
+        slots, pages, page_bytes = self._dcp_staging_shape()
+        return slots * pages * page_bytes
+
     def get_kv_transfer_tensors(self):
         from atom.kv_transfer.disaggregation.page_region import page_region
         from atom.kv_transfer.disaggregation.types import (
@@ -1558,33 +1594,33 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ]
 
         index_staging_region = None
-        index_staging_pool_size = 0
-        index_staging_chunk_pages = 0
+        index_staging_pool_size, index_staging_chunk_pages, max_page_bytes = (
+            self._dcp_staging_shape(self.kv_pool)
+        )
         prepare_sharded_index = None
         gather_sharded_index = None
         gather_sharded_mla = None
-        if (
-            index_tensors
-            and getattr(self, "dcp_world_size", None) == 1
-            and mooncake_pd_producer_configured(runner.config)
-            and self._supports_dcp_index_staging()
-        ):
+        if index_staging_pool_size:
             # A Mooncake P/D producer can receive requests from a DCP
             # consumer whose index cache is sharded below one MFMA tile. Keep a
             # per-send-thread pool that packs one layer at a time. Packing MLA
             # pages too avoids one RDMA descriptor per token for interleave=1.
             scheduler_block_size = runner.config.kv_cache_block_size
-            if scheduler_block_size % 16:
-                raise RuntimeError(
-                    "Preshuffled DSA index P/D staging requires "
-                    "kv_cache_block_size divisible by 16, got "
-                    f"{scheduler_block_size}"
-                )
-            index_staging_pool_size = _index_staging_pool_size(runner.config)
-            index_staging_chunk_pages = 256
             first_index_page = index_tensors[0]
             index_head_dim = getattr(runner.config.hf_config, "index_head_dim", None)
-            max_page_bytes = max(region.unit_bytes for region in block_regions)
+            staging_bytes = (
+                index_staging_pool_size * index_staging_chunk_pages * max_page_bytes
+            )
+            logger.info(
+                "Allocating P/D MLA/index staging: %d bytes (%.2f MiB), "
+                "%d worker slots x %d pages x %d bytes/page; "
+                "reserved in the KV memory budget",
+                staging_bytes,
+                staging_bytes / 1024**2,
+                index_staging_pool_size,
+                index_staging_chunk_pages,
+                max_page_bytes,
+            )
             staging = torch.empty(
                 (
                     index_staging_pool_size,
