@@ -6,6 +6,12 @@ adapts SGLang scheduling, QSA KV pools, PLE state and HC hidden storage.
 It requires the Native Flash implementation in this tree and SGLang 0.5.17.
 The recognition patch supplies Flash config registration for that version.
 
+`Qwen4ExpForConditionalGeneration` is 48 layers: 36 Gated-DeltaNet and 12 QSA
+(query-sparse, 2048-token budget) attention layers, 4-stream
+hyper-connections, 512 routed experts (top-10) plus a sigmoid-gated shared
+expert, and n-gram PLE on layer 1. Weights: per-channel FP8 (PTPC), KV cache
+BF16.
+
 ## Text serving with MTP
 
 The following configuration is tested on MI308X with TP2/EP2 and the
@@ -50,6 +56,80 @@ A deterministic smoke request:
 curl http://127.0.0.1:8000/generate \
   -H 'Content-Type: application/json' \
   -d '{"text":"The result of 17 + 25 is", "sampling_params":{"temperature":0,"top_k":1,"top_p":1,"max_new_tokens":64}}'
+```
+
+## Long-context high-throughput serving (no MTP)
+
+For throughput on a two-GPU host, trading the MTP draft for a much larger
+context and KV pool:
+
+```bash
+export MODEL_PATH=/models/Qwen3.8-Flash-Next-PTPC-FP8
+export SGLANG_PLUGINS=atom_sglang
+export SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
+
+python -m sglang.launch_server \
+  --model-path "$MODEL_PATH" \
+  --host 0.0.0.0 --port 30080 \
+  --tp-size 2 --ep-size 1 \
+  --kv-cache-dtype bf16 \
+  --page-size 64 \
+  --context-length 132096 \
+  --max-running-requests 64 \
+  --mem-fraction-static 0.88 \
+  --disable-radix-cache \
+  --trust-remote-code
+```
+
+Notes:
+
+* `--mem-fraction-static`: SGLang multiplies it by 0.85 whenever the
+  attention backend is `aiter` and the context exceeds 8k, to leave room for
+  AITER attention workspaces. The QSA layers run ATOM's own kernels, so that
+  room is never used; 0.88 lands at an effective 0.75 and roughly doubles the
+  KV cache (about 2.0M -> 4.1M tokens), which lets 128k-token requests run
+  about twice as many at a time.
+* `--context-length` must cover prompt + output (129024 + 2048 here).
+
+The configuration above is the one the measurements in
+`atom/model_ops/qwen4_exp/configs/` and the MI308X tuning notes below were
+taken on.
+
+## MI308X-specific pieces in ATOM
+
+* AITER tuned GEMM tables for this model's FP8 (a8w8 bpreshuffle) and BF16
+  shapes ship in `atom/model_ops/qwen4_exp/configs/` and are registered
+  automatically (`ATOM_QWEN4_TUNED_CONFIGS=0` disables them).
+* The SGLang plugin advertises the native GPU arch to AITER. The images export
+  `GPU_ARCH_LIST=gfx942;gfx950`; forwarded unchanged, AITER's `get_gfx()`
+  reported gfx950 on MI308X and every gfx-keyed tuned table missed.
+
+## Feature switches (all default on)
+
+| Variable | Effect |
+|---|---|
+| `ATOM_QWEN4_HC_FUSED` | fused hyper-connections, combine deferred into the next mix |
+| `ATOM_QWEN4_FUSE_SHARED_EXPERT` | shared expert routed through the fused MoE as expert 512 |
+| `ATOM_QWEN4_SINGLE_TOKEN_MOE` | batch-1 MoE (routing + experts) in two Triton kernels |
+| `ATOM_QWEN4_QSA_MFMA_LOGITS` | QSA indexer scoring on matrix cores for prefill |
+| `ATOM_QWEN4_TUNED_CONFIGS` | MI308X AITER GEMM tables |
+
+## Optional: quantized prefill all-reduce (lossy)
+
+Prefill all-reduces of 16k-token chunks (84 MB at TP2) take about 1.8 ms on
+RCCL. AITER's quick all-reduce with INT6 codes halves that
+(`AITER_QUICK_REDUCE_QUANTIZATION=INT6`); it only engages above its minimum
+message size, so decode all-reduces stay exact. It perturbs prefill
+activations (max ~3% of a tensor's range per reduction), so validate accuracy
+on the target workload before enabling it.
+
+## Benchmark
+
+```bash
+python -m sglang.bench_serving --backend sglang --host 127.0.0.1 --port 30080 \
+  --model "$MODEL_PATH" --tokenizer "$MODEL_PATH" --dataset-name random \
+  --random-input-len 4096 --random-output-len 2048 --random-range-ratio 1.0 \
+  --num-prompts 64 --max-concurrency 32 --request-rate inf
 ```
 
 ## Boundaries
