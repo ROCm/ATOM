@@ -108,22 +108,14 @@ def gather_dcp_mla_pages(
             )
         if tensor.dtype not in dtypes:
             raise TypeError(f"MLA {name} must have dtype in {dtypes}")
+        if not tensor.is_contiguous():
+            raise ValueError(f"MLA {name} must be contiguous")
     if not dst_pages:
         return 0
     token_bytes = page_bytes // scheduler_block_size
-    n_tokens = dst_pages * scheduler_block_size
-    if indices.src_block_id_per_token.numel() != n_tokens:
-        raise ValueError(
-            f"MLA gather plan has {indices.src_block_id_per_token.numel()} tokens, "
-            f"expected {n_tokens}"
-        )
     source_bytes = source.view(torch.uint8).reshape(-1)
     dest = staging[:dst_pages].reshape(-1)
-    valid = indices.valid
-    if valid.dtype == torch.bool:
-        valid = valid.view(torch.uint8)
-    elif valid.dtype != torch.uint8:
-        valid = valid.to(torch.uint8)
+    valid = indices.valid.view(torch.uint8)
     from atom.kv_transfer.disaggregation import triton_mla_gather
 
     triton_mla_gather.gather_dcp_mla_pages(
@@ -134,7 +126,7 @@ def gather_dcp_mla_pages(
         valid,
         page_bytes,
         token_bytes,
-        n_tokens,
+        token_count,
     )
     return dst_pages
 

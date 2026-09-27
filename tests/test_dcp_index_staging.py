@@ -136,6 +136,25 @@ def test_mla_gather_rejects_invalid_index_dtypes(mla_gather_inputs, field, dtype
     assert torch.all(staging == 253)
 
 
+@pytest.mark.parametrize("field", ["src_block_id_per_token", "src_token", "valid"])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_mla_gather_rejects_strided_indices_before_write(
+    mla_gather_inputs, field, index_dtype
+):
+    source, staging, indices, block_size = mla_gather_inputs
+    tensor = getattr(indices, field)
+    if field != "valid":
+        tensor = tensor.to(index_dtype)
+    backing = torch.zeros(tensor.numel() * 2, dtype=tensor.dtype)
+    strided = backing[::2]
+    strided.copy_(tensor)
+    assert not strided.is_contiguous()
+    indices = replace(indices, **{field: strided})
+    with pytest.raises(ValueError, match=f"{field} must be contiguous"):
+        gather_dcp_mla_pages(source, staging, indices, block_size)
+    assert torch.all(staging == 253)
+
+
 def test_mla_gather_rejects_negative_page_count(mla_gather_inputs):
     source, staging, indices, block_size = mla_gather_inputs
     with pytest.raises(ValueError, match="nonnegative destination page count"):
