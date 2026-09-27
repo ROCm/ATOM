@@ -157,7 +157,7 @@ def main():
                     "-o",
                     "BatchMode=yes",
                     "-o",
-                    "StrictHostKeyChecking=yes",
+                    "StrictHostKeyChecking=accept-new",
                     "-o",
                     "ConnectTimeout=4",
                     node,
