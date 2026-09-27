@@ -31,9 +31,12 @@ from atom.model_ops.qwen4_exp.ops.gated import (
     mix_gated_mean,
     scaled_silu,
 )
-from atom.model_ops.qwen4_exp.ops.hc_fused import hc_combine_norm, hc_single_token
+from atom.model_ops.qwen4_exp.ops.hc_fused import hc_combine_norm, hc_rows
 
 HC_FUSED = os.environ.get("ATOM_QWEN4_HC_FUSED", "1") == "1"
+# Up to this many tokens the two fused kernels beat norm + GEMMs; each row
+# re-reads the (cache resident) weights, so the cost grows with the batch.
+HC_ROWS_MAX = 2
 from atom.model_ops.triton_gemma_rmsnorm import gemma_rmsnorm_triton
 from atom.model_ops.utils import atom_parameter
 
@@ -148,8 +151,8 @@ class Qwen4ExpHyperConnection(nn.Module):
         has_inject = self.block_inject_weight is not None
         w_up = self.input_mix_weight_up.weight
         eps = self.hc_norm.variance_epsilon
-        if hyper_input.shape[0] == 1:
-            h, mixed, raw = hc_single_token(
+        if hyper_input.shape[0] <= HC_ROWS_MAX:
+            h, mixed, raw = hc_rows(
                 hyper_input,
                 self.hc_norm.weight,
                 self.fused_w_cat,

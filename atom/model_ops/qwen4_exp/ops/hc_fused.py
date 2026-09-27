@@ -8,7 +8,7 @@ injection GEMM and the injection combine: seven launches around two small
 replicated GEMMs. Here the combine of the previous sub-layer is deferred into
 the next hyper-connection and the work is regrouped as:
 
-* single token (decode at batch 1), two launches:
+* one or two tokens, two launches:
   `_hc_pre_kernel` combines, normalizes and multiplies by the concatenated
   `[down | inject]` weight, split-K over the four streams (each program
   normalizes only its own stream); `_hc_mix_kernel` sums the four partials,
@@ -74,8 +74,11 @@ def _hc_pre_kernel(
     w_ptr,  # [NOUT, HC*H] bf16, concatenated [down | inject]
     h_out_ptr,  # [HC*H] bf16, combined streams (COMBINE only)
     normed_ptr,  # [HC*H] bf16
-    part_ptr,  # [HC, NOUT] fp32
+    part_ptr,  # [M, HC, NOUT] fp32
     eps,
+    stride_h,
+    stride_block,
+    stride_raw,
     H: tl.constexpr,
     HC: tl.constexpr,
     NOUT: tl.constexpr,
@@ -83,11 +86,18 @@ def _hc_pre_kernel(
     BN: tl.constexpr,
     BK: tl.constexpr,
 ):
-    """Program (N tile, stream). The stream's five K chunks are unrolled so
-    every weight and activation load is issued before any arithmetic."""
+    """Program (N tile, stream, row). The stream's five K chunks are unrolled
+    so every weight and activation load is issued before any arithmetic."""
     tl.static_assert(H == 5 * BK)
     pid_n = tl.program_id(0)
     s = tl.program_id(1)
+    row = tl.program_id(2).to(tl.int64)
+    h_ptr += row * stride_h
+    h_out_ptr += row * stride_h
+    normed_ptr += row * stride_h
+    block_ptr += row * stride_block
+    raw_ptr += row * stride_raw
+    part_ptr += row * (HC * NOUT)
     base = s * H
     ns = pid_n * BN + tl.arange(0, BN)
     nmask = ns < NOUT
@@ -140,6 +150,7 @@ def _hc_mix_kernel(
     wu_ptr,  # [HC*H, R] bf16
     mixed_ptr,  # [H] bf16
     raw_out_ptr,  # [HC] bf16
+    stride_normed,
     H: tl.constexpr,
     HC: tl.constexpr,
     R: tl.constexpr,
@@ -150,6 +161,11 @@ def _hc_mix_kernel(
 ):
     tl.static_assert(HC == 4)
     pid_h = tl.program_id(0)
+    row = tl.program_id(1).to(tl.int64)
+    part_ptr += row * (HC * NOUT)
+    normed_ptr += row * stride_normed
+    mixed_ptr += row * H
+    raw_out_ptr += row * HC
     hs = pid_h * BH + tl.arange(0, BH)
     kr = tl.arange(0, RP)
     kmask = kr < R
@@ -218,7 +234,7 @@ def _hc_combine_norm_kernel(
     )
 
 
-def hc_single_token(
+def hc_rows(
     h: torch.Tensor,
     norm_weight: torch.Tensor,
     w_cat: torch.Tensor,
@@ -229,22 +245,21 @@ def hc_single_token(
     block_out: torch.Tensor | None = None,
     raw: torch.Tensor | None = None,
 ):
-    """Deferred combine + full mix for one token.
+    """Deferred combine + full mix, one program set per token.
 
-    Returns (streams, mixed, inject logits or None).
+    Returns (streams, mixed, inject logits or None). Rows re-read the weights,
+    which stay cache resident, so this is for small batches.
     """
-    if h.shape[0] != 1:
-        raise ValueError("hc_single_token expects exactly one token")
-    width = h.shape[1]
+    m, width = h.shape
     hidden = width // hc
     nout = w_cat.shape[0]
     rank = w_up.shape[1]
     combine = block_out is not None
     normed = torch.empty_like(h)
     h_new = torch.empty_like(h) if combine else h
-    part = torch.empty((hc, nout), dtype=torch.float32, device=h.device)
+    part = torch.empty((m, hc, nout), dtype=torch.float32, device=h.device)
     bn = 8
-    _hc_pre_kernel[(triton.cdiv(nout, bn), hc)](
+    _hc_pre_kernel[(triton.cdiv(nout, bn), hc, m)](
         h,
         block_out if combine else h,
         raw if combine else h,
@@ -254,6 +269,9 @@ def hc_single_token(
         normed,
         part,
         eps,
+        h.stride(0),
+        block_out.stride(0) if combine else 0,
+        raw.stride(0) if combine else 0,
         H=hidden,
         HC=hc,
         NOUT=nout,
@@ -262,15 +280,16 @@ def hc_single_token(
         BK=hidden // 5,
         num_warps=4,
     )
-    mixed = torch.empty((1, hidden), dtype=h.dtype, device=h.device)
-    raw_out = torch.empty((1, hc), dtype=h.dtype, device=h.device) if has_inject else None
+    mixed = torch.empty((m, hidden), dtype=h.dtype, device=h.device)
+    raw_out = torch.empty((m, hc), dtype=h.dtype, device=h.device) if has_inject else None
     bh = 16
-    _hc_mix_kernel[(triton.cdiv(hidden, bh),)](
+    _hc_mix_kernel[(triton.cdiv(hidden, bh), m)](
         part,
         normed,
         w_up,
         mixed,
         raw_out if has_inject else mixed,
+        normed.stride(0),
         H=hidden,
         HC=hc,
         R=rank,
