@@ -1,0 +1,204 @@
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py
+@@ -55,6 +55,9 @@
+ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_engine import (
+     MoRIIOWrapper,
+     MoRIIOWriter,
++)
++from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_heartbeat import (
++    MoRIIOHeartbeat,
+ )
+ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_layout import (
+     LayerTransferGeometry,
+@@ -1501,10 +1504,7 @@
+         )
+ 
+         if self._rank == 0 and self.moriio_config.proxy_ip:
+-            self._ping_thread = threading.Thread(
+-                target=self._ping, args=(self.zmq_context,), daemon=True
+-            )
+-            self._ping_thread.start()
++            self._heartbeat = self._start_heartbeat()
+ 
+         logger.info(
+             "Initializing MoRIIO Engine, engine = %s, role = %s",
+@@ -1746,75 +1746,31 @@
+             remote_engine_id
+         ]
+ 
+-    def _ping(self, zmq_context):
+-        # Use host:port format for http_address (compatible with official router)
+-        http_address = f"{self.request_address}"
+-        # Include host so the router embeds it in the request_id; the connector
+-        # on the other side parses host/ports from there.
+-        zmq_address = (
+-            f"host:{self.local_ip},"
+-            f"handshake:{self.handshake_port},"
+-            f"notify:{self.notify_port}"
+-        )
+-        role = "P" if self.is_producer else "D"
+-
+-        retry_count = 0
+-        index = 1
+-        with zmq_context.socket(zmq.DEALER) as sock:
+-            sock.connect(f"tcp://{self.proxy_ip}:{self.proxy_ping_port}")
+-
+-            while True:
+-                try:
+-                    data = {
+-                        "type": role,  # "P" or "D"
+-                        "http_address": http_address,
+-                        "zmq_address": zmq_address,
+-                        # dp_size/tp_size are not used by the official vLLM router
+-                        # (routing operates at the http_address level); they are
+-                        # consumed only by the toy proxy server.
+-                        "dp_size": self.moriio_config.dp_size,
+-                        "tp_size": self.moriio_config.tp_size,
+-                        # transfer_mode is included so the router can distinguish
+-                        # READ (prefill-then-decode, sequential) from WRITE (concurrent)
+-                        # scheduling.
+-                        "transfer_mode": self.mode.name,
+-                    }
+-
+-                    sock.send(msgpack.dumps(data))
+-                    # logger.debug(f"Successfully sent ping message #{index}")
+-                    retry_count = 0
+-
+-                except ConnectionRefusedError:
+-                    logger.info(
+-                        "Connection refused: %s:%s -> %s:%s",
+-                        self.local_ip,
+-                        self.local_ping_port,
+-                        self.proxy_ip,
+-                        self.proxy_ping_port,
+-                    )
+-                    retry_count += 1
+-
+-                except OSError as e:
+-                    logger.info("OS error when sending ping: %s", e)
+-                    retry_count += 1
+-
+-                except Exception as e:
+-                    logger.info("Unexpected error when sending ping: %s", e)
+-                    retry_count += 1
+-                    if retry_count >= MoRIIOConstants.MAX_PING_RETRIES:
+-                        logger.error(
+-                            "Max retries (%s) exceeded. Stopping ping loop.",
+-                            MoRIIOConstants.MAX_PING_RETRIES,
+-                        )
+-                        raise RuntimeError(
+-                            f"Ping failed after {retry_count} retries"
+-                        ) from e
+-
+-                finally:
+-                    time.sleep(MoRIIOConstants.PING_INTERVAL)
+-                    index += 1
++    def _start_heartbeat(self) -> MoRIIOHeartbeat:
++        payload = {
++            "type": "P" if self.is_producer else "D",
++            "http_address": self.request_address,
++            "zmq_address": (
++                f"host:{self.local_ip},handshake:{self.handshake_port},"
++                f"notify:{self.notify_port}"
++            ),
++            "dp_size": self.moriio_config.dp_size,
++            "tp_size": self.moriio_config.tp_size,
++            "transfer_mode": self.mode.name,
++        }
++        return MoRIIOHeartbeat(
++            f"tcp://{self.proxy_ip}:{self.proxy_ping_port}",
++            payload,
++            MoRIIOConstants.PING_INTERVAL,
++            MoRIIOConstants.MAX_PING_RETRIES,
++        )
+ 
+     def shutdown(self):
++        heartbeat = getattr(self, "_heartbeat", None)
++        if heartbeat is not None:
++            heartbeat.shutdown()
++            self._heartbeat = None
++
+         if hasattr(self, "moriio_wrapper") and self.moriio_wrapper:
+             self.moriio_wrapper.shutdown()
+ 
+--- /dev/null
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_heartbeat.py
+@@ -0,0 +1,78 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Keep discovery heartbeats independent of the model worker's GIL."""
++
++import json
++import logging
++import select
++import subprocess
++import sys
++
++import msgpack
++import zmq
++
++logger = logging.getLogger(__name__)
++
++
++class MoRIIOHeartbeat:
++    def __init__(
++        self, endpoint: str, payload: dict, interval: float, max_retries: int = 100
++    ):
++        self._process = subprocess.Popen(
++            [sys.executable, __file__, endpoint, str(interval), str(max_retries)],
++            stdin=subprocess.PIPE,
++            text=True,
++        )
++        try:
++            self._process.stdin.write(json.dumps(payload) + "\n")
++            self._process.stdin.flush()
++        except BaseException:
++            self.shutdown()
++            raise
++
++    def shutdown(self) -> None:
++        try:
++            self._process.stdin.close()
++        except BrokenPipeError:
++            pass
++        finally:
++            try:
++                self._process.wait(timeout=5)
++            except subprocess.TimeoutExpired:
++                self._process.terminate()
++                try:
++                    self._process.wait(timeout=1)
++                except subprocess.TimeoutExpired:
++                    self._process.kill()
++                    self._process.wait(timeout=1)
++
++
++def main() -> None:
++    endpoint, interval, max_retries = sys.argv[1:]
++    initial = sys.stdin.readline()
++    if not initial:
++        return
++    payload = msgpack.dumps(json.loads(initial))
++    interval = float(interval)
++    max_retries = int(max_retries)
++    failures = 0
++    with zmq.Context() as context, context.socket(zmq.DEALER) as sock:
++        sock.setsockopt(zmq.LINGER, 0)
++        sock.setsockopt(zmq.SNDTIMEO, 1000)
++        sock.connect(endpoint)
++        while not select.select([sys.stdin], [], [], 0)[0]:
++            try:
++                sock.send(payload)
++                failures = 0
++            except zmq.ZMQError:
++                failures += 1
++                logger.exception("MoRIIO discovery heartbeat send failed")
++                if failures >= max_retries:
++                    raise
++            # EOF also stops the child when the worker exits without cleanup.
++            if select.select([sys.stdin], [], [], interval)[0]:
++                break
++
++
++if __name__ == "__main__":
++    main()
