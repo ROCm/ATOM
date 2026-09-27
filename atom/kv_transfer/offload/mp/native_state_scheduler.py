@@ -267,13 +267,22 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         if source is None:
             return None
         state_operation, unit_ids = source
-        request = super()._build_save_request(
-            seq, saved, aligned, operation, block_ids, is_last_prefill
-        )
-        request.native_state = NativeStateTransfer(unit_ids, aligned, prefix_hash)
-        self._native_saves[operation] = _NativeSave(
-            seq, state_operation, saved, aligned
-        )
+        try:
+            request = super()._build_save_request(
+                seq, saved, aligned, operation, block_ids, is_last_prefill
+            )
+            request.native_state = NativeStateTransfer(unit_ids, aligned, prefix_hash)
+            self._native_saves[operation] = _NativeSave(
+                seq, state_operation, saved, aligned
+            )
+        except BaseException:
+            # Nothing was dispatched: return the lease and the budget charge
+            # the same way a settled save does, or they leak for the process
+            # lifetime (the pin is never timeout-reclaimable).
+            self._checkpoints.release_offload_store_source(state_operation)
+            self._checkpoints.settle_offload_store(state_operation)
+            self._refund_state_image()
+            raise
         return request
 
     def _complete_native_save(
@@ -349,6 +358,7 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             return False, "native_load_id_busy", hbm, lmc, need, chunk
         if not self._has_state_budget():
             return False, "native_state_budget", hbm, lmc, need, chunk
+        prefix_hash = self._boundary_hash(seq, lmc)
         operation = LoadOperationId(seq.id, self._load_nonce)
         self._load_nonce += 1
         units = self._charge_state_image(
@@ -356,18 +366,28 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         )
         if units is None:
             return False, "native_state_units", hbm, lmc, need, chunk
-        local_restore = self._checkpoints.suspend_queued_restore(int(seq.state_slot))
-        self._native_loads[operation] = _NativeLoad(
-            seq,
-            NativeStateTransfer(
-                units,
-                lmc,
-                self._boundary_hash(seq, lmc),
-                destination_slot=int(seq.state_slot),
-            ),
-            hbm,
-            local_restore,
-        )
+        local_restore = None
+        try:
+            local_restore = self._checkpoints.suspend_queued_restore(
+                int(seq.state_slot)
+            )
+            self._native_loads[operation] = _NativeLoad(
+                seq,
+                NativeStateTransfer(
+                    units,
+                    lmc,
+                    prefix_hash,
+                    destination_slot=int(seq.state_slot),
+                ),
+                hbm,
+                local_restore,
+            )
+        except BaseException:
+            if local_restore is not None:
+                self._checkpoints.resume_suspended_restore(local_restore)
+            self._checkpoints.release_transfer_units(operation)
+            self._refund_state_image()
+            raise
         self._native_load_operations[sid] = operation
         self._active_load_operations[sid] = (seq, operation)
         seq._load_operation = operation

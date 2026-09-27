@@ -441,6 +441,63 @@ def test_load_capacity_failure_never_parks_or_claims_missing_state(monkeypatch):
     assert checkpoints.store.pool.num_free == 2
 
 
+def test_session_outlives_a_save_emitted_after_request_finished(monkeypatch):
+    """The final save is emitted and submitted under the request's MP session
+    after request_finished, so the session must not end before it settles."""
+    scheduler, checkpoints, adapter = make_scheduler(monkeypatch)
+    seq = sequence()
+    checkpoint(scheduler, checkpoints, seq, 16)
+    scheduler.update_state_after_alloc(seq)
+    scheduler.request_finished(seq)
+    assert adapter.ended == []
+
+    [request] = scheduler.build_connector_meta().requests
+    assert adapter.ended == []
+
+    terminal(scheduler, request.save_operation)
+    scheduler.build_connector_meta()
+    assert adapter.ended == [f"atom-offload-dp0:{seq.id}"]
+
+
+def test_save_admission_returns_lease_and_budget_when_it_raises(monkeypatch):
+    from atom.kv_transfer.offload.chunked_scheduler import (
+        ChunkedOffloadSchedulerBase,
+    )
+
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch)
+    seq = sequence()
+    checkpoint(scheduler, checkpoints, seq, 16)
+    scheduler.update_state_after_alloc(seq)
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("request construction failed")
+
+    monkeypatch.setattr(ChunkedOffloadSchedulerBase, "_build_save_request", boom)
+    with pytest.raises(RuntimeError, match="request construction failed"):
+        scheduler.build_connector_meta()
+    assert scheduler._pinned_state_bytes == 0
+    assert scheduler._native_saves == {}
+    assert checkpoints.store._offload_pins == {}
+
+
+def test_load_admission_returns_units_and_budget_when_it_raises(monkeypatch):
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch)
+    free_before = checkpoints.store.pool.num_free
+    seq = sequence(computed=0)
+    scheduler.get_num_new_matched_tokens(seq)
+
+    def boom(_slot):
+        raise AssertionError("two queued restores target one slot")
+
+    monkeypatch.setattr(scheduler._checkpoints, "suspend_queued_restore", boom)
+    scheduler.update_state_after_alloc(seq)
+    with pytest.raises(AssertionError, match="two queued restores"):
+        scheduler.should_park_for_load_after_alloc(seq)
+    assert scheduler._pinned_state_bytes == 0
+    assert scheduler._native_loads == {}
+    assert checkpoints.store.pool.num_free == free_before
+
+
 def test_load_failure_and_cancellation_wait_for_exact_terminal_report(monkeypatch):
     scheduler, checkpoints, adapter = make_scheduler(monkeypatch)
     seq = sequence(computed=0)

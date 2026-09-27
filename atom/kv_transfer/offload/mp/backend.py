@@ -1220,6 +1220,9 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                     int(req.load_spec.hbm_cached_tokens),
                     int(end),
                 )
+        # Also catches retirements that bypass _finish_retired_request, such as
+        # a late save with nothing left to store.
+        self._end_finished_sessions()
         return metadata
 
     def load_finished(self, req_id: Any) -> bool:
@@ -1262,14 +1265,37 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
 
     def request_finished(self, seq: Any) -> None:
         super().request_finished(seq)
-        try:
-            self._mp_adapter.end_session(_mp_session_id(self._config, seq.id))
-        except Exception:
-            logger.warning(
-                "LMCache MP end_session failed for request %s",
-                seq.id,
-                exc_info=True,
-            )
+        self._pending_session_ends()[str(seq.id)] = seq
+        self._end_finished_sessions()
+
+    def _finish_retired_request(self, sid: str) -> None:
+        super()._finish_retired_request(sid)
+        self._end_finished_sessions()
+
+    def _pending_session_ends(self) -> dict[str, Any]:
+        """Finished requests whose MP session must outlive their last save.
+
+        A late save is emitted, and submitted under the request's session,
+        after request_finished, so the session ends only once none can follow.
+        """
+        return self.__dict__.setdefault("_sessions_to_end", {})
+
+    def _end_finished_sessions(self) -> None:
+        """End each finished request's session once no save of it can follow."""
+        pending = self._pending_session_ends()
+        for sid, seq in list(pending.items()):
+            entry = self._save_tracker.get(sid)
+            if (entry is not None and entry[0] is seq) or sid in self._save_inflight:
+                continue
+            del pending[sid]
+            try:
+                self._mp_adapter.end_session(_mp_session_id(self._config, seq.id))
+            except Exception:
+                logger.warning(
+                    "LMCache MP end_session failed for request %s",
+                    seq.id,
+                    exc_info=True,
+                )
 
 
 __all__ = [
