@@ -27,11 +27,13 @@ class SeqView:
         "_load_operation",
         "_num_cached_tokens",
         # Written by the chunked scheduler's early-block-release path, which
-        # marks a finished request and freezes its computed prefix so a final
+        # marks a finished request and freezes its computed prefix (and, with no
+        # BlockManager to reacquire through, its block table) so a final
         # save can still be dispatched after vLLM has handed the blocks back.
         # Deliberately left unset in ``__init__``: an unset slot reads as absent
         # the same way a missing attribute does.
         "_offload_finished",
+        "_offload_finished_block_ids",
         "_offload_finished_cached_tokens",
         "_request",
         "block_table",
@@ -118,6 +120,7 @@ class SeqView:
         # preempted request's is as stale as the live block table.
         for frozen in (
             "_offload_finished",
+            "_offload_finished_block_ids",
             "_offload_finished_cached_tokens",
         ):
             if hasattr(self, frozen):

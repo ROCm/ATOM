@@ -97,6 +97,10 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         try:
             require_native_state_server(self._mp_adapter, self._config)
             self._hash_block_size = int(block_manager.hash_block_size)
+            # The shortest prefix worth storing, in absolute tokens. With the
+            # default equal to OFFLOAD_MIN_LOAD_TOKENS a shorter prefix could
+            # never be loaded back. Normal and late saves apply the same rule.
+            self._min_save_tokens = envs.OFFLOAD_MIN_SAVE_TOKENS
             if self.chunk_size % self._hash_block_size:
                 raise ValueError(
                     "native-state LMCache MP chunk size must align to native "
@@ -227,18 +231,18 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             and failed[2] >= _MAX_SAVE_ATTEMPTS
             else 0
         )
-        # A prefix shorter than OFFLOAD_MIN_SAVE_TOKENS is not worth its copy:
-        # with the default equal to OFFLOAD_MIN_LOAD_TOKENS it could never be
-        # loaded back anyway.
-        floor = max(exhausted, self._min_save_tokens - 1, 0)
-        for boundary in range(frontier, floor, -self.chunk_size):
+        for boundary in range(frontier, self._save_floor(exhausted), -self.chunk_size):
             if self._checkpoints.contains(self._boundary_hash(seq, boundary)):
                 return boundary
         return 0
 
+    def _save_floor(self, lower: int) -> int:
+        """Exclusive lower bound for boundaries worth storing (never 0)."""
+        return max(lower, self._min_save_tokens - 1, 0)
+
     def _late_save_frontier(self, seq: Any, saved: int, available: int) -> int:
         available = self._chunk_floor(available)
-        for boundary in range(available, saved, -self.chunk_size):
+        for boundary in range(available, self._save_floor(saved), -self.chunk_size):
             if self._checkpoints.contains(self._boundary_hash(seq, boundary)):
                 return boundary
         return saved

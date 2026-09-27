@@ -163,7 +163,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         # boundary, then load the aligned remainder from CPU. (Previously gated
         # by the OFFLOAD_UNALIGNED_HANDOFF env var; now unconditional.)
         self._min_load_tokens = envs.OFFLOAD_MIN_LOAD_TOKENS
-        self._min_save_tokens = envs.OFFLOAD_MIN_SAVE_TOKENS
 
     def bind_block_manager(self, block_manager) -> None:
         if self._block_manager is not None and self._block_manager is not block_manager:
@@ -450,7 +449,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         drop = claimed[keep_count:]
         if drop:
             self._block_manager.free_leased_blocks(drop)
-        if target - saved < self._min_save_tokens:
+        if target <= saved:
+            # Nothing savable is still resident (or no boundary qualifies):
+            # retire the request rather than emit an empty save forever.
             if keep:
                 self._block_manager.free_leased_blocks(keep)
             return None
@@ -579,14 +580,19 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             save_operation = SaveOperationId(seq.id, self._save_nonce)
             self._save_nonce += 1
             late_acquired = frozenset()
-            if getattr(seq, "_offload_finished", False) and not seq.block_table:
+            if (
+                getattr(seq, "_offload_finished", False)
+                and self._block_manager is not None
+            ):
                 late_source = self._late_save_source(seq, saved, aligned)
                 if late_source is None:
                     self._save_tracker.pop(sid, None)
                     continue
                 aligned, block_ids, late_acquired = late_source
             else:
-                block_ids = list(seq.block_table)
+                block_ids = list(
+                    getattr(seq, "_offload_finished_block_ids", seq.block_table)
+                )
             try:
                 request = self._build_save_request(
                     seq, saved, aligned, save_operation, block_ids, is_last_prefill
@@ -660,9 +666,13 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         does not support exact leases, or a load is in flight, since a load also
         touches HBM blocks this connector does not track per-range) -- the
         scheduler falls back to deferring the whole request. This includes a
-        final save that has not been emitted yet: request teardown freezes its
-        token identity and computed frontier, but protects no physical PAGE
-        until admission reacquires the still-canonical prefix.
+        final save that has not been emitted yet. With a bound `BlockManager`
+        (the ATOM engine) teardown freezes its token identity and computed
+        frontier but protects no physical PAGE: admission reacquires the
+        still-canonical prefix through the hash index. Without one (the vLLM
+        plugin, where vLLM owns the blocks) there is nothing to reacquire
+        through, so teardown freezes the block table and leases the unemitted
+        suffix, and the final save reads exactly those leased blocks.
         """
         if not self._early_release or self._has_active_load(seq):
             return None
@@ -681,6 +691,17 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 block_id for block_id in blocks.values() if block_id not in safe
             )
 
+        if self._block_manager is None:
+            table = list(getattr(seq, "_offload_finished_block_ids", seq.block_table))
+            seq._offload_finished_block_ids = table
+            entry = self._save_tracker.get(str(seq.id))
+            if entry is not None and entry[0] is seq:
+                saved = int(entry[1])
+                aligned = self._save_frontier(seq)
+                if aligned > saved:
+                    start_block = saved // self.virtual_block_size
+                    end_block = -(-aligned // self.virtual_block_size)
+                    protected.update(table[start_block:end_block])
         return frozenset(protected)
 
     def activate_block_leases(self, seq, block_ids: frozenset[int]) -> None:
@@ -985,8 +1006,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._save_lease_at.pop(lease_key, None)
             self._save_lease_owner.pop(lease_key, None)
             if remaining:
-                # Teardown leased only emitted saves' sources; the unemitted
-                # suffix was never leased and is dropped with the request.
+                # Unbound (plugin) teardown also leased the not-yet-emitted
+                # suffix; no further save reads it once the request retires.
                 self._pending_source_safe_releases.append(frozenset(remaining))
                 self.total_source_safe_released_blocks += len(remaining)
             return
@@ -1159,8 +1180,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 # Freeze the final computed frontier before BlockManager
                 # clears it during partial deallocation. Keep the tracker when
                 # a final chunk still needs emission; a later metadata build
-                # uses the frozen block table recorded by
-                # `protected_block_ids`.
+                # reacquires the prefix through the bound BlockManager, or
+                # (unbound) reads the block table `protected_block_ids` froze.
                 seq._offload_finished_cached_tokens = min(
                     int(getattr(seq, "num_cached_tokens", 0)),
                     int(seq.num_prompt_tokens),

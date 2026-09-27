@@ -83,7 +83,10 @@ def make_scheduler(
     min_save_tokens=0,
 ):
     monkeypatch.setenv("OFFLOAD_MAX_PENDING_SAVES", str(capacity))
-    monkeypatch.setenv("OFFLOAD_MIN_SAVE_TOKENS", str(min_save_tokens))
+    if min_save_tokens is None:
+        monkeypatch.delenv("OFFLOAD_MIN_SAVE_TOKENS", raising=False)
+    else:
+        monkeypatch.setenv("OFFLOAD_MIN_SAVE_TOKENS", str(min_save_tokens))
     adapter = Adapter()
     connections = []
 
@@ -242,6 +245,27 @@ def test_save_frontier_skips_checkpoints_shorter_than_min_save_tokens(monkeypatc
     checkpoint(scheduler, checkpoints, seq, 16)
     [request] = scheduler.build_connector_meta().requests
     assert request.native_state.boundary_tokens == 16
+
+
+def test_default_min_save_tokens_skips_a_short_prompt(monkeypatch):
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch, min_save_tokens=None)
+    seq = sequence(computed=24)
+    checkpoint(scheduler, checkpoints, seq, 16)
+    scheduler.update_state_after_alloc(seq)
+    assert scheduler._min_save_tokens == 8192
+    assert scheduler.build_connector_meta().requests == []
+
+
+def test_late_save_threshold_is_the_absolute_boundary_not_the_remainder(
+    monkeypatch,
+):
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch, min_save_tokens=16)
+    seq = sequence(computed=24)
+    checkpoint(scheduler, checkpoints, seq, 24)
+    # Already saved 16; the 8-token remainder still reaches boundary 24 >= 16.
+    assert scheduler._late_save_frontier(seq, 16, 24) == 24
+    scheduler._min_save_tokens = 32
+    assert scheduler._late_save_frontier(seq, 16, 24) == 16
 
 
 def test_store_failure_rolls_back_for_bounded_retry_and_ignores_stale_reports(

@@ -44,7 +44,6 @@ def _config(role="kv_producer", *, block_size=4):
 
 
 def _early_release_scheduler(monkeypatch, role="kv_producer", *, chunk_size=8):
-    monkeypatch.setenv("OFFLOAD_MIN_SAVE_TOKENS", "0")
     monkeypatch.setattr(
         offcfg,
         "build_lmcache_config",
@@ -398,22 +397,56 @@ class TestIncrementalLeaseRelease:
         assert protected == frozenset({1, 33})
         assert released == [(65,)]
 
-    def test_late_acquire_below_save_threshold_is_released_and_skipped(
-        self, monkeypatch
-    ):
+    def test_late_acquire_with_nothing_resident_retires_the_request(self, monkeypatch):
         scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
-        scheduler._min_save_tokens = 24
         bm, seq, table = _resident_sequence(scheduler, 103, 32, 8)
         scheduler.update_state_after_alloc(seq)
         seq.num_cached_tokens = 32
         protected = _finish_and_lease(scheduler, seq)
         bm.deallocate_partial(seq, protected)
-        bm.kv.allocate(table[4])
+        bm.kv.allocate(table[0])  # evict the first block: nothing is savable
 
         assert scheduler.build_connector_meta().requests == []
         assert str(seq.id) not in scheduler._save_tracker
+        assert scheduler.build_connector_meta().requests == []
         assert scheduler.protected_block_ids(seq) == frozenset()
         assert bm.kv.num_used == 1
+
+    def test_late_save_persists_the_short_tail_of_a_long_request(self, monkeypatch):
+        """The tail after earlier saves is stored however short it is."""
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        bm, seq, table = _resident_sequence(scheduler, 105, 32, 8)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 24
+        [first] = scheduler.build_connector_meta().requests
+        scheduler.save_finished(first.save_operation)
+        seq.num_cached_tokens = 32
+        protected = _finish_and_lease(scheduler, seq)
+        bm.deallocate_partial(seq, protected)
+
+        [tail] = scheduler.build_connector_meta().requests
+        assert tail.save_spec.skip_leading_tokens == 24
+        assert tail.token_ids == list(range(32))
+        assert tail.block_ids[6:8] == table[6:8]
+
+    def test_unbound_teardown_leases_the_blocks_its_final_save_reads(self, monkeypatch):
+        """No BlockManager (the vLLM plugin): vLLM frees every unleased block at
+        teardown and the table is not cleared, so the final save must read only
+        blocks the teardown lease kept."""
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(106, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 8
+        first = scheduler.build_connector_meta().requests[0].save_operation
+        seq.num_cached_tokens = 16
+        leased = _finish_and_lease(scheduler, seq)
+        scheduler.save_finished(first)
+
+        [final] = scheduler.build_connector_meta().requests
+        start = final.save_spec.skip_leading_tokens // 4
+        end = len(final.token_ids) // 4
+        assert final.block_ids[start:end] == [2, 3]
+        assert set(final.block_ids[start:end]) <= leased
 
 
 class TestTPQuorum:
@@ -512,22 +545,20 @@ class TestStoreOutcomeSeparation:
         assert scheduler.take_source_safe_releases() == [frozenset({0, 1})]
         assert scheduler.build_connector_meta().requests == []
 
-    def test_retired_failure_releases_its_lease_and_drops_the_suffix(self, monkeypatch):
+    def test_retired_failure_also_releases_unemitted_suffix(self, monkeypatch):
         scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
         seq = _seq(295, num_prompt_tokens=16, num_blocks=4)
         scheduler.update_state_after_alloc(seq)
         seq.num_cached_tokens = 8
         operation = scheduler.build_connector_meta().requests[0].save_operation
         seq.num_cached_tokens = 16
-        # Teardown leases only the emitted save's source; the unemitted suffix
-        # is left for late-save admission to reacquire.
-        assert _finish_and_lease(scheduler, seq) == frozenset({0, 1})
+        assert _finish_and_lease(scheduler, seq) == frozenset({0, 1, 2, 3})
 
         scheduler.connector_completion(_store_terminal(operation, False))
         scheduler.connector_completion(_source_quiescent(operation))
 
         released = scheduler.take_source_safe_releases()
-        assert sorted(block for group in released for block in group) == [0, 1]
+        assert sorted(block for group in released for block in group) == [0, 1, 2, 3]
         assert scheduler.build_connector_meta().requests == []
         assert scheduler.has_pending_work() is False
 
