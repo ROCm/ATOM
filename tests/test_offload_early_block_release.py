@@ -397,6 +397,28 @@ class TestIncrementalLeaseRelease:
         assert protected == frozenset({1, 33})
         assert released == [(65,)]
 
+    def test_late_acquire_finds_a_multimodal_prefix(self, monkeypatch):
+        """BlockManager seeds a multimodal chain with cache_seed; reacquiring
+        must use the same seed or block 0 never matches."""
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        bm = BlockManager(
+            MockConfig(
+                num_kvcache_blocks=24, kv_cache_block_size=4, enable_prefix_caching=True
+            )
+        )
+        seq = Sequence(list(range(16)), 4, id=107)
+        seq.cache_seed = 424242
+        assert bm.allocate(seq, bm.can_allocate(seq))
+        table = list(seq.block_table)
+        bm.hash_blocks(seq, 16, start_tokens=0)
+        scheduler.bind_block_manager(bm)
+        bm.deallocate(seq)
+
+        block_ids, available, claimed = bm.acquire_offload_prefix(seq, 0, 16)
+        assert available == 16
+        assert block_ids == table
+        assert sorted(claimed) == sorted(table)
+
     def test_late_acquire_with_nothing_resident_retires_the_request(self, monkeypatch):
         scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
         bm, seq, table = _resident_sequence(scheduler, 103, 32, 8)

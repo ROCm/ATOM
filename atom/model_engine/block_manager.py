@@ -867,6 +867,13 @@ class BlockManager:
             chain.append(h)
         return chain
 
+    def prefix_hash_chain(
+        self, seq: Sequence, block_hashes: list[int], blocks: int
+    ) -> list[int]:
+        """`block_hashes` continued to `blocks` entries, for callers outside
+        the manager. Seeded from `seq.cache_seed` like every chain it mints."""
+        return self._chain_to(seq, block_hashes, blocks)
+
     def can_allocate(
         self,
         seq: Sequence,
@@ -2569,7 +2576,7 @@ class BlockManager:
         start_block = start_tokens // hbs
         block_ids = [-1] * end_block
         claimed: list[int] = []
-        parent_hash = -1
+        parent_hash = seq.cache_seed
         available_end = start_tokens
         for index in range(end_block):
             token_ids = self._hash_block_tokens(seq, index)

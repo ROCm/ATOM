@@ -117,6 +117,13 @@ def make_scheduler(
         hash_block_size=4,
         compute_hash=BlockManager.compute_hash,
     )
+    # BlockManager's own chain walk (seed, algorithm, token slices).
+    manager._hash_block_tokens = lambda seq, index: BlockManager._hash_block_tokens(
+        manager, seq, index
+    )
+    manager.prefix_hash_chain = lambda seq, hashes, blocks: BlockManager._chain_to(
+        manager, seq, hashes, blocks
+    )
     scheduler.bind_block_manager(manager)
     scheduler.bind_block_manager(manager)
     assert connections == [checkpoints.store.spec]
@@ -245,6 +252,25 @@ def test_save_frontier_skips_checkpoints_shorter_than_min_save_tokens(monkeypatc
     checkpoint(scheduler, checkpoints, seq, 16)
     [request] = scheduler.build_connector_meta().requests
     assert request.native_state.boundary_tokens == 16
+
+
+def test_boundary_hash_seeds_from_cache_seed_like_block_manager(monkeypatch):
+    """Multimodal requests seed their chain with cache_seed != -1; the fallback
+    walk must agree with BlockManager's own chain from block 0 onward."""
+    scheduler, _, _ = make_scheduler(monkeypatch)
+    manager = scheduler._block_manager
+    seq = sequence()
+    seq.cache_seed = 987654321
+    seq.block_hashes = []
+    fallback = scheduler._boundary_hash(seq, 8)
+    expected = manager.prefix_hash_chain(seq, [], 2)
+    assert fallback == expected[1]
+    assert fallback != manager.prefix_hash_chain(sequence(), [], 2)[1]
+
+    chained = sequence(request_id=2)
+    chained.cache_seed = seq.cache_seed
+    chained.block_hashes = list(expected)
+    assert scheduler._boundary_hash(chained, 8) == fallback
 
 
 def test_default_min_save_tokens_skips_a_short_prompt(monkeypatch):

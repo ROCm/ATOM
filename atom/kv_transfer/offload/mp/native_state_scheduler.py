@@ -162,20 +162,14 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         if len(chain) >= count:
             return int(chain[count - 1])
         # Some checkpoint producers do not reserve midstep checkpoints, so
-        # BlockManager may leave Sequence.block_hashes empty. Use its exact
-        # public hashing algorithm and token slices, caching only this request's
-        # immutable prompt chain.
-        chain = getattr(seq, "_mp_checkpoint_hashes", None)
-        if chain is None:
-            chain = []
+        # BlockManager may leave Sequence.block_hashes empty. Extend the chain
+        # through BlockManager itself -- its seed (`seq.cache_seed`, which
+        # multimodal requests set), algorithm and token slices -- caching only
+        # this request's immutable prompt chain.
+        chain = getattr(seq, "_mp_checkpoint_hashes", None) or []
+        if len(chain) < count:
+            chain = self._block_manager.prefix_hash_chain(seq, chain, count)
             seq._mp_checkpoint_hashes = chain
-        prefix = chain[-1] if chain else -1
-        for index in range(len(chain), count):
-            start = index * self._hash_block_size
-            prefix = self._block_manager.compute_hash(
-                seq.token_ids[start : start + self._hash_block_size], prefix
-            )
-            chain.append(prefix)
         return int(chain[count - 1])
 
     def _lookup_token_ids(self, seq: Any) -> list[int]:
