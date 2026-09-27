@@ -518,6 +518,32 @@ def test_registration_reserves_every_restore_descriptor_slot(monkeypatch):
     assert reserved and 0 not in reserved
 
 
+def test_raising_restore_returns_its_descriptor_slot_after_the_bound(
+    worker, monkeypatch
+):
+    """A restore that raises after taking a descriptor slot keeps it only until
+    the uncertainty bound, then the load fails and the slot is reusable."""
+    from atom.kv_transfer.offload.mp import backend
+
+    now = [1000.0]
+    monkeypatch.setattr(backend.time, "monotonic", lambda: now[0])
+    worker._restore_stream = object()  # no wait_stream: raises inside
+    worker._restore_descriptor_slots = [3]
+    worker.future.value, worker.future.ready = True, True
+    req = request(loading=True)
+    worker._submit_load(req, object())
+
+    first = worker.get_finished()
+    assert not first.finished_loading and not first.failed_loading
+    assert worker._restore_descriptor_slots == []
+
+    now[0] += worker._uncertain_timeout_s + 1
+    finished = worker.get_finished()
+    assert finished.failed_loading == {req.load_operation}
+    assert worker._restore_descriptor_slots == [3]
+    assert worker._native_loads == {}
+
+
 def test_native_server_chunk_mismatch_fails_before_registration(monkeypatch):
     from atom.kv_transfer.offload.mp import native_state_worker
 

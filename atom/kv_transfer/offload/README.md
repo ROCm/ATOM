@@ -186,8 +186,12 @@ prefix index and stores only the still-resident contiguous prefix.
 Native MP never stores a prefix shorter than `OFFLOAD_MIN_SAVE_TOKENS`: with
 the default equal to `OFFLOAD_MIN_LOAD_TOKENS` it could never be loaded back,
 and on a 1K-token workload skipping those saves took the offload throughput
-cost from 12% to within run-to-run noise. The same threshold also suppresses a
-late save whose remaining prefix is too small. Unless configured otherwise, the shared save limit is
+cost from 12% to within run-to-run noise. It is an absolute boundary for normal
+and late saves alike, so the short tail of a long request is still stored.
+Other connectors ignore it. A transfer whose outcome is unknown (its submission
+or restore raised) keeps its lease for `lmcache.mp.uncertain_transfer_timeout_s`
+(default twice `lmcache.mp.mq_timeout`, i.e. 600 s), then fails so the lease
+and budget are released. Unless configured otherwise, the shared save limit is
 `max(2, 2 * OFFLOAD_COPY_WORKERS)`.
 
 The model namespace includes PAGE/model geometry, TP and speculation settings,

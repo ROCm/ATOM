@@ -277,3 +277,22 @@ def test_mla_fp8_prefill_flag(monkeypatch):
     for value, expected in [("0", False), ("1", True), ("true", False)]:
         monkeypatch.setenv(name, value)
         assert getattr(_get_envs(), name) is expected
+
+
+def test_offload_env_vars_are_documented():
+    """Every offload knob registered in envs.py appears in the central env
+    reference, so a new one cannot land undocumented."""
+    import pathlib
+
+    from atom.utils import envs
+
+    doc = (
+        pathlib.Path(__file__).parents[1] / "docs" / "environment_variables.md"
+    ).read_text()
+    offload = [
+        name
+        for name in envs.environment_variables
+        if name.startswith(("OFFLOAD_", "LMCACHE_"))
+    ]
+    assert offload
+    assert [name for name in offload if f"**{name}**" not in doc] == []
