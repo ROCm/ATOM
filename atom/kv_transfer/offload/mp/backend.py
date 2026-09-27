@@ -469,6 +469,55 @@ class _PendingSave:
     end: int
 
 
+def _uncertain_transfer_timeout_s(config: Any) -> float:
+    """How long an unprovable transfer keeps its lease before it is failed.
+
+    Nothing in the MP protocol can prove that a submission whose outcome is
+    unknown has stopped touching engine memory, so the bound is a policy: by
+    default twice the adapter's own request timeout.
+    """
+
+    extra = _extra_config(config)
+    default = 2.0 * float(extra.get("lmcache.mp.mq_timeout", 300.0))
+    timeout = float(extra.get("lmcache.mp.uncertain_transfer_timeout_s", default))
+    if not timeout > 0:
+        raise ValueError("lmcache.mp.uncertain_transfer_timeout_s must be > 0")
+    return timeout
+
+
+class _UncertainSubmission:
+    """A transfer whose outcome is unknown: retained, then failed at a deadline.
+
+    A transport exception cannot prove that a remote DMA stopped, so the lease
+    is kept while this reports not-done. Past ``timeout_s`` it reports a failed
+    terminal result, so the operation settles and releases its lease and budget
+    instead of wedging them for the process lifetime.
+    """
+
+    def __init__(self, timeout_s: float, operation: str) -> None:
+        self._deadline = time.monotonic() + timeout_s
+        self._timeout_s = timeout_s
+        self._operation = operation
+        self._expired = False
+
+    def query(self) -> bool:
+        if time.monotonic() < self._deadline:
+            return False
+        if not self._expired:
+            self._expired = True
+            logger.warning(
+                "LMCache MP transfer %s stayed unprovable for %.0fs; "
+                "treating it as failed and releasing its lease",
+                self._operation,
+                self._timeout_s,
+            )
+        return True
+
+    def result(self, timeout: float | None = None) -> bool:
+        del timeout
+        return False
+
+
 def _terminal_future_result(future: Any | None) -> tuple[bool, Any]:
     """Return ``(terminal, result)`` without blocking on a device future."""
 
@@ -722,7 +771,7 @@ class LMCacheMPConnector(KVConnectorBase):
         # aggregator must receive the same chunk completion from every rank
         # before releasing the writer's source blocks early.
         self._immediate_saves: dict[SaveCompletionId, tuple[int, int] | None] = {}
-        self._immediate_save_failures: set[SaveCompletionId] = set()
+        self._uncertain_timeout_s = _uncertain_transfer_timeout_s(config)
         self._immediate_load_failures: set[LoadCompletionId] = set()
         self._lock = threading.Lock()
 
@@ -981,18 +1030,23 @@ class LMCacheMPConnector(KVConnectorBase):
                 event,
             )
         except Exception:
+            # The server may have received the request before the connection
+            # raised: keep the source leased until the transfer is provably
+            # over or the uncertainty bound expires.
             logger.exception(
-                "LMCache MP save submission failed for %s",
+                "LMCache MP save submission uncertain for %s",
                 req.req_id,
             )
             with self._lock:
                 self._submitting_saves.discard(operation_id)
-                _remember_operation_tombstone(
-                    operation_id,
-                    self._completed_save_operations,
-                    self._completed_save_operation_order,
+                self._pending_saves[operation_id] = _PendingSave(
+                    completion=completion,
+                    future=_UncertainSubmission(
+                        self._uncertain_timeout_s, operation_id
+                    ),
+                    start=start,
+                    end=end,
                 )
-                self._immediate_save_failures.add(completion)
             return
         with self._lock:
             self._submitting_saves.discard(operation_id)
@@ -1079,15 +1133,8 @@ class LMCacheMPConnector(KVConnectorBase):
                     connector_completions.add(
                         ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, completion, True)
                     )
-            for completion in self._immediate_save_failures:
-                done_save.add(completion)
-                if isinstance(completion, SaveOperationId):
-                    connector_completions.add(
-                        ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, completion, False)
-                    )
             failed_load.update(self._immediate_load_failures)
             self._immediate_saves.clear()
-            self._immediate_save_failures.clear()
             self._immediate_load_failures.clear()
         return KVConnectorOutput(
             finished_loading=done_load,

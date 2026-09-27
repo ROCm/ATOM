@@ -1200,6 +1200,56 @@ def test_worker_pre_submit_drops_are_immediately_terminal(
     assert worker._pending_saves == {}
 
 
+def test_worker_uncertain_save_submission_is_bounded_then_quiescent(
+    fake_lmcache_modules,
+    monkeypatch,
+):
+    """A raising submit may have reached the server, so the source stays leased;
+    past the bound the save reports every chunk source-safe and the store
+    failed, which lets the scheduler retry or retire it instead of wedging."""
+    adapter = _WorkerAdapter()
+
+    def uncertain(_request_id, _op, _event):
+        raise ConnectionError("server may have received request")
+
+    monkeypatch.setattr(adapter, "submit_store_request", uncertain)
+    monkeypatch.setattr(adapter, "submit_store_request_with_chunk_events", uncertain)
+    now = [1000.0]
+    monkeypatch.setattr(mp_connector.time, "monotonic", lambda: now[0])
+    worker = _worker(adapter)
+    operation = SaveOperationId(req_id=16, generation=1)
+    worker._submit_save(
+        LMCacheReqMeta(
+            req_id=16,
+            token_ids=list(range(16)),
+            block_ids=[100, 101, 102, 103],
+            save_spec=SaveSpec(skip_leading_tokens=0),
+            save_operation=operation,
+        ),
+        object(),
+    )
+
+    assert not worker.get_finished().connector_completions
+    assert len(worker._pending_saves) == 1
+
+    now[0] += worker._uncertain_timeout_s + 1
+    output = worker.get_finished()
+    assert output.finished_saving == {operation}
+    assert worker._pending_saves == {}
+    safe = {
+        completion.operation_id.ranges
+        for completion in output.connector_completions
+        if completion.channel == mp_connector.DENSE_PAGE_SOURCE_SAFE_CHANNEL
+    }
+    assert safe == {((0, 8),), ((8, 16),)}
+    [store] = [
+        completion
+        for completion in output.connector_completions
+        if completion.channel == mp_connector.DENSE_PAGE_STORE_CHANNEL
+    ]
+    assert not store.succeeded
+
+
 def test_worker_save_slices_chunk_blocks_and_preserves_operation(
     fake_lmcache_modules,
 ):

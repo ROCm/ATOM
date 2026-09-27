@@ -215,6 +215,48 @@ def test_uncertain_remote_submission_retains_lease(worker):
     assert len(worker._native_saves) == 1
 
 
+def test_uncertain_submission_fails_after_the_uncertainty_bound(worker, monkeypatch):
+    """Retaining the lease is right, but not forever: past the bound the save
+    settles as failed so its lease, budget and pending slot are released."""
+    from atom.kv_transfer.offload.mp import backend
+
+    now = [1000.0]
+    monkeypatch.setattr(backend.time, "monotonic", lambda: now[0])
+
+    def uncertain(*_):
+        raise ConnectionError("server may have received request")
+
+    worker._adapter.submit_store_request = uncertain
+    worker._submit_save(request(), object())
+    now[0] += worker._uncertain_timeout_s - 1
+    assert not worker.get_finished().connector_completions
+    assert len(worker._native_saves) == 1
+
+    now[0] += 2
+    completions = worker.get_finished().connector_completions
+    [terminal] = [
+        completion
+        for completion in completions
+        if completion.channel == NATIVE_STATE_MP_STORE_CHANNEL
+    ]
+    assert not terminal.succeeded
+    assert worker._native_saves == {}
+
+
+def test_uncertainty_bound_defaults_to_twice_the_adapter_timeout():
+    from atom.kv_transfer.offload.mp import backend
+
+    assert backend._uncertain_transfer_timeout_s(config()) == 600.0
+    assert (
+        backend._uncertain_transfer_timeout_s(config(**{"lmcache.mp.mq_timeout": 5}))
+        == 10.0
+    )
+    with pytest.raises(ValueError, match="uncertain_transfer_timeout_s"):
+        backend._uncertain_transfer_timeout_s(
+            config(**{"lmcache.mp.uncertain_transfer_timeout_s": 0})
+        )
+
+
 def test_failed_retrieve_does_not_restore_or_report_success(worker, monkeypatch):
     monkeypatch.setattr(
         worker, "_begin_restore", lambda _: pytest.fail("unexpected restore")
@@ -357,9 +399,10 @@ def test_collapsed_tp_non_writer_skips_transport_and_reports_safe_success(worker
     } == {((0, 8),), ((8, 16),)}
 
 
-def test_restore_uses_independent_descriptor_slot_without_stream_sync(
-    worker, monkeypatch
-):
+def test_restore_is_fenced_against_the_compute_stream_both_ways(worker, monkeypatch):
+    """The restore uses its own descriptor slot and stream, and orders against
+    compute both ways: it waits for work already on the compute stream (the
+    SLOT's previous occupant), and the next step's compute waits for it."""
     from atom.kv_transfer.offload.mp import native_state_worker
 
     class Event:
@@ -369,6 +412,18 @@ def test_restore_uses_independent_descriptor_slot_without_stream_sync(
         def record(self, stream):
             self.recorded_on = stream
 
+    class Stream:
+        def __init__(self, name):
+            self.name = name
+            self.waited_streams = []
+            self.waited_events = []
+
+        def wait_stream(self, other):
+            self.waited_streams.append(other)
+
+        def wait_event(self, event):
+            self.waited_events.append(event)
+
     class StreamContext:
         def __enter__(self):
             return self
@@ -376,7 +431,8 @@ def test_restore_uses_independent_descriptor_slot_without_stream_sync(
         def __exit__(self, *_args):
             return False
 
-    restore_stream = object()
+    compute = Stream("compute")
+    restore_stream = Stream("restore")
     event = Event()
     copied = []
     worker._restore_stream = restore_stream
@@ -388,6 +444,9 @@ def test_restore_uses_independent_descriptor_slot_without_stream_sync(
     monkeypatch.setattr(
         native_state_worker.torch.cuda, "stream", lambda stream: StreamContext()
     )
+    monkeypatch.setattr(
+        native_state_worker.torch.cuda, "current_stream", lambda: compute
+    )
 
     req = request(loading=True)
     worker._submit_load(req, object())
@@ -397,6 +456,10 @@ def test_restore_uses_independent_descriptor_slot_without_stream_sync(
     assert worker._restore_descriptor_slots == []
     assert copied[0][2] == 3
     assert event.recorded_on is restore_stream
+    assert restore_stream.waited_streams == [compute]
+
+    worker.start_load_kv(object())
+    assert compute.waited_events == [event]
 
 
 def test_native_server_chunk_mismatch_fails_before_registration(monkeypatch):
