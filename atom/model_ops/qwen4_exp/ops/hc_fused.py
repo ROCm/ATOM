@@ -26,6 +26,9 @@ import torch
 import triton
 import triton.language as tl
 
+# Batches from which the multi-row combine+norm kernel is used (prefill).
+COMBINE_NORM_ROWS_MIN_M = 256
+
 
 @triton.jit
 def _hc_row_chunk(
@@ -195,6 +198,53 @@ def _hc_mix_kernel(
 
 
 @triton.jit
+def _hc_gated_mean_tiled_kernel(
+    normed_ptr,
+    gate_ptr,
+    out_ptr,
+    M,
+    stride_row,
+    stride_out,
+    H: tl.constexpr,
+    HC: tl.constexpr,
+    RB: tl.constexpr,
+    BH: tl.constexpr,
+):
+    """`mean_s(sigmoid(gate) * normed)` on an [RB rows, BH columns] tile."""
+    rows = tl.program_id(0) * RB + tl.arange(0, RB)
+    cols = tl.program_id(1) * BH + tl.arange(0, BH)
+    rmask = (rows < M)[:, None]
+    base = rows[:, None].to(tl.int64) * stride_row + cols[None, :]
+    total = tl.zeros((RB, BH), dtype=tl.float32)
+    for s in tl.static_range(HC):
+        x = tl.load(normed_ptr + base + s * H, mask=rmask, other=0.0).to(tl.float32)
+        g = tl.load(gate_ptr + base + s * H, mask=rmask, other=0.0).to(tl.float32)
+        total += tl.sigmoid(g) * x
+    tl.store(
+        out_ptr + rows[:, None].to(tl.int64) * stride_out + cols[None, :],
+        (total / HC).to(out_ptr.dtype.element_ty),
+        mask=rmask,
+    )
+
+
+def hc_gated_mean(normed: torch.Tensor, gate: torch.Tensor, hc: int) -> torch.Tensor:
+    """Tiled `mix_gated_mean` for large batches (same rounding)."""
+    m, width = normed.shape
+    hidden = width // hc
+    out = torch.empty((m, hidden), dtype=normed.dtype, device=normed.device)
+    rb, bh = 4, 512
+    if m and hidden % bh == 0 and gate.stride(0) == normed.stride(0):
+        _hc_gated_mean_tiled_kernel[(triton.cdiv(m, rb), hidden // bh)](
+            normed, gate, out, m, normed.stride(0), out.stride(0),
+            H=hidden, HC=hc, RB=rb, BH=bh, num_warps=4,
+        )
+        return out
+    from atom.model_ops.qwen4_exp.ops.gated import mix_gated_mean
+
+    return mix_gated_mean(normed, gate, hc)
+
+
+@triton.jit
 def _hc_combine_norm_kernel(
     h_ptr,
     block_ptr,
@@ -232,6 +282,64 @@ def _hc_combine_norm_kernel(
         (x * rstd * g).to(normed_ptr.dtype.element_ty),
         mask=mask,
     )
+
+
+@triton.jit
+def _hc_cn_part(h_ptr, block_ptr, off_h, off_b, rmask, inj, COMBINE: tl.constexpr):
+    x = tl.load(h_ptr + off_h, mask=rmask, other=0.0)
+    if COMBINE:
+        b = tl.load(block_ptr + off_b, mask=rmask, other=0.0).to(tl.float32)
+        x = (x.to(tl.float32) + b * inj[:, None]).to(h_ptr.dtype.element_ty)
+    return x
+
+
+@triton.jit
+def _hc_combine_norm_rows_kernel(
+    h_ptr,
+    block_ptr,
+    raw_ptr,
+    norm_w_ptr,
+    h_out_ptr,
+    normed_ptr,
+    M,
+    stride_h,
+    stride_block,
+    stride_raw,
+    eps,
+    H: tl.constexpr,
+    HC: tl.constexpr,
+    COMBINE: tl.constexpr,
+    RB: tl.constexpr,
+    BA: tl.constexpr,  # H == BA + BB, both powers of two
+    BB: tl.constexpr,
+):
+    """`_hc_combine_norm_kernel` over RB rows of one stream, no masked lanes."""
+    rows = tl.program_id(0) * RB + tl.arange(0, RB)
+    s = tl.program_id(1)
+    rmask = (rows < M)[:, None]
+    r64 = rows[:, None].to(tl.int64)
+    ca = tl.arange(0, BA)[None, :]
+    cb = BA + tl.arange(0, BB)[None, :]
+    inj = tl.zeros((RB,), dtype=tl.float32)
+    if COMBINE:
+        raw = tl.load(raw_ptr + rows.to(tl.int64) * stride_raw + s, mask=rows < M, other=0.0)
+        raw = (raw.to(tl.float32) / HC).to(raw_ptr.dtype.element_ty).to(tl.float32)
+        inj = 2.0 * tl.sigmoid(raw)
+    oh = r64 * stride_h + s * H
+    ob = r64 * stride_block
+    xa = _hc_cn_part(h_ptr, block_ptr, oh + ca, ob + ca, rmask, inj, COMBINE)
+    xb = _hc_cn_part(h_ptr, block_ptr, oh + cb, ob + cb, rmask, inj, COMBINE)
+    if COMBINE:
+        tl.store(h_out_ptr + oh + ca, xa, mask=rmask)
+        tl.store(h_out_ptr + oh + cb, xb, mask=rmask)
+    fa = xa.to(tl.float32)
+    fb = xb.to(tl.float32)
+    rstd = tl.math.rsqrt((tl.sum(fa * fa, 1) + tl.sum(fb * fb, 1)) / H + eps)
+    ga = tl.load(norm_w_ptr + s * H + ca).to(tl.float32) + 1.0
+    gb = tl.load(norm_w_ptr + s * H + cb).to(tl.float32) + 1.0
+    dt = normed_ptr.dtype.element_ty
+    tl.store(normed_ptr + oh + ca, (fa * rstd[:, None] * ga).to(dt), mask=rmask)
+    tl.store(normed_ptr + oh + cb, (fb * rstd[:, None] * gb).to(dt), mask=rmask)
 
 
 def hc_rows(
@@ -316,6 +424,31 @@ def hc_combine_norm(
     combine = block_out is not None
     normed = torch.empty_like(h)
     h_new = torch.empty_like(h) if combine else h
+    ba = 1 << (hidden.bit_length() - 1)
+    bb = hidden - ba
+    if m >= COMBINE_NORM_ROWS_MIN_M and bb > 0 and bb & (bb - 1) == 0:
+        rb = 2
+        _hc_combine_norm_rows_kernel[(triton.cdiv(m, rb), hc)](
+            h,
+            block_out if combine else h,
+            raw if combine else h,
+            norm_weight,
+            h_new,
+            normed,
+            m,
+            h.stride(0),
+            block_out.stride(0) if combine else 0,
+            raw.stride(0) if combine else 0,
+            eps,
+            H=hidden,
+            HC=hc,
+            COMBINE=combine,
+            RB=rb,
+            BA=ba,
+            BB=bb,
+            num_warps=4,
+        )
+        return h_new, normed
     if m:
         _hc_combine_norm_kernel[(m, hc)](
             h,

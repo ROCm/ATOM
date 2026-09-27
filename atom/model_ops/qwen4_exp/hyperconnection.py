@@ -31,7 +31,7 @@ from atom.model_ops.qwen4_exp.ops.gated import (
     mix_gated_mean,
     scaled_silu,
 )
-from atom.model_ops.qwen4_exp.ops.hc_fused import hc_combine_norm, hc_rows
+from atom.model_ops.qwen4_exp.ops.hc_fused import hc_combine_norm, hc_gated_mean, hc_rows
 
 HC_FUSED = os.environ.get("ATOM_QWEN4_HC_FUSED", "1") == "1"
 # Up to this many tokens the two fused kernels beat norm + GEMMs; each row
@@ -171,7 +171,7 @@ class Qwen4ExpHyperConnection(nn.Module):
         d = tgemm.mm(normed, self.fused_w_cat, otype=normed.dtype)
         gate = scaled_silu(d[:, :rank], self.hc_count)
         up = tgemm.mm(gate, w_up, otype=gate.dtype)
-        mixed = mix_gated_mean(normed, up, self.hc_count)
+        mixed = hc_gated_mean(normed, up, self.hc_count)
         raw = d[:, rank : rank + self.hc_count] if has_inject else None
         return mixed, (h, raw)
 
