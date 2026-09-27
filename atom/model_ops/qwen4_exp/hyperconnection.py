@@ -19,7 +19,10 @@ checkpoint's `block_inject_weight` for that module is skipped at load.
 Parameters are replicated, not TP-sharded: ~13 MB per module.
 """
 
+import os
+
 import torch
+from aiter.tuned_gemm import tgemm
 from torch import nn
 
 from atom.model_ops.linear import ReplicatedLinear
@@ -28,6 +31,9 @@ from atom.model_ops.qwen4_exp.ops.gated import (
     mix_gated_mean,
     scaled_silu,
 )
+from atom.model_ops.qwen4_exp.ops.hc_fused import hc_combine_norm, hc_single_token
+
+HC_FUSED = os.environ.get("ATOM_QWEN4_HC_FUSED", "1") == "1"
 from atom.model_ops.triton_gemma_rmsnorm import gemma_rmsnorm_triton
 from atom.model_ops.utils import atom_parameter
 
@@ -116,3 +122,59 @@ class Qwen4ExpHyperConnection(nn.Module):
         return combine_inject(hyper_input, block_output, raw, self.hc_count).to(
             hyper_input.dtype
         )
+
+    def process_weights_after_loading(self) -> None:
+        """Concatenate `[down | inject]` into one GEMM weight."""
+        if not HC_FUSED:
+            return
+        parts = [self.input_mix_weight_down.weight.data]
+        if self.block_inject_weight is not None:
+            parts.append(self.block_inject_weight.weight.data)
+        self.fused_w_cat = torch.cat(parts, 0).contiguous()
+        self.fused_rank = self.input_mix_weight_down.weight.shape[0]
+
+    def mix_fused(
+        self,
+        hyper_input: torch.Tensor,
+        pending: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor | None]]:
+        """`combine` of the previous sub-layer (deferred as `pending`) + `mix`.
+
+        `pending` is `(block_output, inject_logits)` from the previous
+        hyper-connection. Returns the mixed activation and `(streams,
+        inject_logits)`; the logits are None when there is no block injection.
+        """
+        block_out, raw_prev = pending if pending is not None else (None, None)
+        has_inject = self.block_inject_weight is not None
+        w_up = self.input_mix_weight_up.weight
+        eps = self.hc_norm.variance_epsilon
+        if hyper_input.shape[0] == 1:
+            h, mixed, raw = hc_single_token(
+                hyper_input,
+                self.hc_norm.weight,
+                self.fused_w_cat,
+                w_up,
+                eps,
+                self.hc_count,
+                has_inject,
+                block_out,
+                raw_prev,
+            )
+            return mixed, (h, raw)
+        h, normed = hc_combine_norm(
+            hyper_input, self.hc_norm.weight, eps, self.hc_count, block_out, raw_prev
+        )
+        rank = self.fused_rank
+        d = tgemm.mm(normed, self.fused_w_cat, otype=normed.dtype)
+        gate = scaled_silu(d[:, :rank], self.hc_count)
+        up = tgemm.mm(gate, w_up, otype=gate.dtype)
+        mixed = mix_gated_mean(normed, up, self.hc_count)
+        raw = d[:, rank : rank + self.hc_count] if has_inject else None
+        return mixed, (h, raw)
+
+    def apply_pending(
+        self, hyper_input: torch.Tensor, pending: tuple[torch.Tensor, torch.Tensor]
+    ) -> torch.Tensor:
+        """Materialize a deferred combine without mixing."""
+        block_out, raw = pending
+        return combine_inject(hyper_input, block_out, raw, self.hc_count)
