@@ -126,6 +126,14 @@ def build_native_state_mp_layout(
         raise ValueError(
             "native-state LMCache MP needs one owned tensor view per PAGE region"
         )
+    # Only the leading regions form a checkpoint PAGE unit; a draft's own pool
+    # is appended after them and is stored as ordinary PAGE KV.
+    state_count = getattr(transfer_tensors, "paged_state_region_count", None)
+    if state_count is None:
+        state_count = len(regions)
+    state_count = _positive_int("native state region count", state_count)
+    if state_count > len(regions):
+        raise ValueError("native state region count exceeds the PAGE regions")
     devices = set()
     actual_page_bytes = 0
     for index, (view, region) in enumerate(zip(page_views, regions, strict=True)):
@@ -153,17 +161,22 @@ def build_native_state_mp_layout(
         if region.reverse_indexed:
             raise ValueError("native PAGE regions cannot be reverse-indexed")
         devices.add(view.device)
-        actual_page_bytes += unit_bytes
+        if index < state_count:
+            actual_page_bytes += unit_bytes
     if len(devices) != 1:
         raise ValueError("native PAGE views must share one device")
     if actual_page_bytes != page_bytes:
         raise ValueError("PAGE regions do not cover the native PAGE unit")
 
-    tensors = list(page_views)
+    # Registered as bytes, like the PAGE-only path: LMCache's ROCm raw-pointer
+    # fallback cannot express FP8 through the CUDA array interface.
+    tensors = [view.view(torch.uint8) for view in page_views]
     engine_ids = [0] * len(tensors)
     image_offset = 0
     for ordinal in range(units):
-        for page_view, region in zip(page_views, regions, strict=True):
+        for page_view, region in zip(
+            page_views[:state_count], regions[:state_count], strict=True
+        ):
             nbytes = min(region.unit_bytes, image_bytes - image_offset)
             if not nbytes:
                 break

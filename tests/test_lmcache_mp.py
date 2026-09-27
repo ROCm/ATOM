@@ -255,6 +255,33 @@ def test_parallel_strategy_collapses_fully_replicated_mla(monkeypatch):
     assert {strategy.tp_size for strategy in strategies} == {8}
 
 
+def test_auto_rank_collapse_is_off_for_a_draft_with_its_own_pool(monkeypatch):
+    """A DSpark draft whose backend owns a KV pool appends per-rank PAGE
+    regions, so a replicated MLA target no longer collapses."""
+    from atom.utils import selector
+
+    owns_pool = {"value": True}
+    monkeypatch.setattr(selector, "attn_family", lambda _hf: "draft-family")
+    monkeypatch.setattr(
+        selector,
+        "get_attn_backend",
+        lambda _family: SimpleNamespace(DRAFT_OWNS_KV_POOL=owns_pool["value"]),
+    )
+    config = _config(tp=8, kv_lora_rank=512)
+    assert mp_connector._tp_replication_factor(config) == 8
+
+    config.speculative_config = SimpleNamespace(
+        method="dspark", draft_model_hf_config=SimpleNamespace()
+    )
+    assert mp_connector._tp_replication_factor(config) == 1
+
+    owns_pool["value"] = False
+    assert mp_connector._tp_replication_factor(config) == 8
+    config.speculative_config.method = "mtp"
+    owns_pool["value"] = True
+    assert mp_connector._tp_replication_factor(config) == 8
+
+
 def test_auto_rank_collapse_distinguishes_glm52_mla_from_minimax_m3_gqa():
     glm52 = _config(model_type="glm_moe_dsa", tp=8, kv_lora_rank=512)
     minimax = _config(model_type="minimax_m3_vl", tp=8)

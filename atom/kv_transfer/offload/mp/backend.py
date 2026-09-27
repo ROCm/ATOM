@@ -165,6 +165,11 @@ def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
     registering any cache memory.
     """
 
+    if _config_has_own_pool_draft(config):
+        # A DSpark draft whose backend owns a KV pool appends per-rank-sharded
+        # PAGE regions (`draft_kv.py` declares factor 1), so the complete PAGE
+        # object is not replicated even when the target's is.
+        return False
     hf_config = getattr(config, "hf_config", None)
     # MiniMax-M3 is GQA. Some TP ranks can happen to own the same KV head when
     # TP exceeds the global KV-head count, but the complete PAGE object is not
@@ -173,6 +178,22 @@ def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
         return False
     hf_config = getattr(hf_config, "text_config", hf_config)
     return getattr(hf_config, "kv_lora_rank", None) is not None
+
+
+def _config_has_own_pool_draft(config: Any) -> bool:
+    """Whether a speculative draft caches into a KV pool of its own.
+
+    Mirrors `spec_decode.draft_kv.draft_kv_builder`, which only DSpark calls:
+    the draft's own backend answers through `DRAFT_OWNS_KV_POOL`.
+    """
+
+    speculative = getattr(config, "speculative_config", None)
+    draft_hf = getattr(speculative, "draft_model_hf_config", None)
+    if getattr(speculative, "method", None) != "dspark" or draft_hf is None:
+        return False
+    from atom.utils.selector import attn_family, get_attn_backend
+
+    return bool(get_attn_backend(attn_family(draft_hf)).DRAFT_OWNS_KV_POOL)
 
 
 def _tp_replication_factor(config: Any) -> int:
