@@ -206,3 +206,36 @@ def test_worker_keeps_page_only_path_for_forked_state(monkeypatch):
         {}, SimpleNamespace(state_backend=builder), 7
     )
     assert selected == ["page"]
+
+
+def test_scheduler_rejects_disabled_paged_state_checkpoints(monkeypatch):
+    """A coordinator exists whenever the backend copies PAGE-backed state, but
+    it can hold a READY image only with prefix caching on. Neither transport
+    is correct without it, so binding fails instead of silently offloading
+    nothing (native) or restoring KV under stale state (PAGE-only)."""
+    import pytest
+
+    selected = []
+
+    class NativeScheduler:
+        def __init__(self, config):
+            selected.append("native")
+
+    monkeypatch.setattr(
+        native_state_scheduler,
+        "NativeStateLMCacheMPConnectorScheduler",
+        NativeScheduler,
+    )
+    monkeypatch.setattr(
+        backend,
+        "LMCacheMPConnectorScheduler",
+        lambda config: selected.append("page"),
+    )
+    disabled = SimpleNamespace(paged_state_checkpoints=SimpleNamespace(enabled=False))
+    with pytest.raises(ValueError, match="enable-prefix-caching"):
+        LMCacheMPConnectorScheduler(_config()).bind_block_manager(disabled)
+    assert selected == []
+
+    enabled = SimpleNamespace(paged_state_checkpoints=SimpleNamespace(enabled=True))
+    LMCacheMPConnectorScheduler(_config()).bind_block_manager(enabled)
+    assert selected == ["native"]
