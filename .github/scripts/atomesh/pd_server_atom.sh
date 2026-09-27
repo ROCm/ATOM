@@ -470,7 +470,7 @@ build_server_cache_env() {
 
   cache_base="${ATOMESH_WORKER_CACHE_BASE:-${XDG_CACHE_HOME:-/tmp/atomesh-cache-${SLURM_JOB_ID:-local}-${NODE_RANK}}/workers}"
   cache_root="${cache_base}/${role}-${server_port}"
-  mkdir -p "${cache_root}"/{home,xdg,torchinductor,triton,aiter/jit,flydsl}
+  mkdir -p "${cache_root}"/{home,xdg,torchinductor,triton,aiter/jit,flydsl,huggingface}
 
   # A per-worker cache root keeps workers from racing each other, but an empty
   # one also discards the AOT kernels AITER precompiled at install time from the
@@ -521,6 +521,13 @@ sys.stdout.write(os.path.dirname(spec.origin) if spec and spec.origin else "")' 
   out=(
     "HOME=${cache_root}/home"
     "XDG_CACHE_HOME=${cache_root}/xdg"
+    # The image bakes HF_HOME=/root/.cache/huggingface, and transformers
+    # resolves its caches from HF_HOME before falling back to HOME or
+    # XDG_CACHE_HOME -- so setting those two is not enough. /root is not
+    # writable by the container user, and with trust_remote_code the tokenizer
+    # load writes the model's dynamic module there, so the server dies at
+    # startup with EACCES before it ever reaches the GPU.
+    "HF_HOME=${cache_root}/huggingface"
     "TORCHINDUCTOR_CACHE_DIR=${cache_root}/torchinductor"
     "TRITON_CACHE_DIR=${cache_root}/triton"
     "AITER_CACHE_DIR=${cache_root}/aiter"
