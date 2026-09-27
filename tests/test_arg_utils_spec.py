@@ -2,8 +2,11 @@
 # Regression tests for speculative-config validation in EngineArgs._get_engine_kwargs.
 
 import argparse
+import json
 import sys
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 # conftest.py stubs atom.* and zmq before any atom imports are attempted,
 # but arg_utils.py imports LLMEngine from atom and CompilationConfig /
@@ -236,3 +239,81 @@ class TestEngineArgsIndexCacheDtype:
         )
 
         assert args.index_cache_dtype == "fp8"
+
+
+class TestKVOffloadConfigCli:
+    """--kv-offload-config folds into kv_transfer_config without owning that flag."""
+
+    def _kv(self, argv):
+        parser = argparse.ArgumentParser()
+        EngineArgs.add_cli_args(parser)
+        args = EngineArgs.from_cli_args(parser.parse_args(argv))
+        return json.loads(args._get_engine_kwargs()["kv_transfer_config"])
+
+    def test_default_leaves_transfer_config_untouched(self):
+        assert self._kv([]) == {}
+
+    def test_offload_alone_defaults_to_lmcache_offload(self):
+        assert self._kv(["--kv-offload-config", "{}"]) == {
+            "kv_connector": "lmcache_offload",
+            "kv_role": "offload",
+        }
+
+    def test_offload_extras_pass_through(self):
+        cfg = self._kv(["--kv-offload-config", '{"lmcache.chunk_size": 256}'])
+        assert cfg["kv_connector"] == "lmcache_offload"
+        assert cfg["lmcache.chunk_size"] == 256
+
+    def test_pd_connector_and_offload_become_multi(self):
+        pd = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
+        cfg = self._kv(
+            ["--kv-transfer-config", json.dumps(pd), "--kv-offload-config", "{}"]
+        )
+        assert cfg == {
+            "kv_connector": "multi",
+            "connectors": [
+                pd,
+                {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+            ],
+        }
+
+    def test_existing_multi_gets_offload_appended(self):
+        pd = {"kv_connector": "moriio", "kv_role": "kv_producer"}
+        multi = {"kv_connector": "multi", "connectors": [pd]}
+        cfg = self._kv(
+            ["--kv-transfer-config", json.dumps(multi), "--kv-offload-config", "{}"]
+        )
+        assert cfg["kv_connector"] == "multi"
+        assert [c["kv_connector"] for c in cfg["connectors"]] == [
+            "moriio",
+            "lmcache_offload",
+        ]
+
+    @pytest.mark.parametrize(
+        "transfer",
+        [
+            {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+            {"kv_connector": "LMCacheMPConnector", "kv_role": "kv_both"},
+            {
+                "kv_connector": "multi",
+                "connectors": [
+                    {"kv_connector": "moriio"},
+                    {"kv_connector": "lmcache_offload"},
+                ],
+            },
+        ],
+    )
+    def test_duplicate_offload_is_rejected(self, transfer):
+        with pytest.raises(ValueError, match="conflicts with an offload connector"):
+            self._kv(
+                [
+                    "--kv-transfer-config",
+                    json.dumps(transfer),
+                    "--kv-offload-config",
+                    "{}",
+                ]
+            )
+
+    def test_non_object_is_rejected(self):
+        with pytest.raises(TypeError, match="must be a JSON object"):
+            self._kv(["--kv-offload-config", "[]"])

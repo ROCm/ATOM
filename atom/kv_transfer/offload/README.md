@@ -996,6 +996,17 @@ python -m atom.entrypoints.openai_server \
   --kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"offload"}'
 ```
 
+`--kv-offload-config` enables the same connector without taking
+`--kv-transfer-config`, so a launcher that owns that flag for P/D transfer can
+still add offload. `'{}'` selects `lmcache_offload` with `kv_role: offload`;
+extra keys such as `"lmcache.chunk_size"` pass through to the connector. With a
+P/D connector in `--kv-transfer-config`, both run behind a `multi` connector:
+
+```bash
+  --kv-offload-config '{}'
+  # with P/D: --kv-transfer-config '{"kv_connector":"mooncake",...}' --kv-offload-config '{}'
+```
+
 Standalone DSV4 LMCache offload supports both FP8 and FP4 indexer layouts.
 FP4 PAGE objects include the packed data and separate e8m0 scale regions for
 every CSA layer. FP4 remains unsupported with PD connectors such as Mooncake

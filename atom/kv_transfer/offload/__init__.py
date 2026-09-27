@@ -5,7 +5,8 @@
 
 Registers the legacy in-process ``lmcache_offload`` backend and the standalone
 server ``lmcache_mp`` backend with the shared KV connector factory.
-Enable via ``--kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"offload"}'``
+Enable via ``--kv-offload-config '{}'`` (or the equivalent
+``--kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"offload"}'``)
 plus LMCache env (``LMCACHE_LOCAL_CPU=True``, ``LMCACHE_MAX_LOCAL_CPU_SIZE``,
 ``LMCACHE_CHUNK_SIZE=256``, optional ``LMCACHE_LOCAL_DISK`` for the NVMe L3 tier).
 

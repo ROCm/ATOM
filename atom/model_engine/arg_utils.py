@@ -31,6 +31,54 @@ def parse_size_list(size_str: str) -> list[int]:
         raise ValueError(f"Error parsing size list: {size_str}") from e
 
 
+# Offload connector names and aliases (atom/kv_transfer/offload/__init__.py),
+# casefolded like KVConnectorFactory.canonical_name.
+_OFFLOAD_CONNECTORS = frozenset(
+    {
+        "lmcache_offload",
+        "lmcacheoffloadconnector",
+        "lmcacheconnectorv1",
+        "lmcache_mp",
+        "lmcachempconnector",
+    }
+)
+
+
+def compose_kv_offload_config(
+    kv_transfer_config: str, kv_offload_config: dict | None
+) -> str:
+    """Fold --kv-offload-config into the --kv-transfer-config JSON string.
+
+    Without a transfer connector the offload connector stands alone; with one,
+    both become subs of a ``multi`` connector (appended if it already is one).
+    """
+    if kv_offload_config is None:
+        return kv_transfer_config
+    if not isinstance(kv_offload_config, dict):
+        raise TypeError("--kv-offload-config must be a JSON object")
+    offload = {"kv_connector": "lmcache_offload", "kv_role": "offload"}
+    offload.update(kv_offload_config)
+
+    transfer = json.loads(kv_transfer_config or "{}")
+    if not transfer:
+        return json.dumps(offload)
+    is_multi = _connector_name(transfer) == "multi"
+    subs = transfer.get("connectors", []) if is_multi else [transfer]
+    if any(_connector_name(sub) in _OFFLOAD_CONNECTORS for sub in subs):
+        raise ValueError(
+            "--kv-offload-config conflicts with an offload connector already "
+            "set in --kv-transfer-config; use only one of them"
+        )
+    if is_multi:
+        return json.dumps({**transfer, "connectors": [*subs, offload]})
+    return json.dumps({"kv_connector": "multi", "connectors": [transfer, offload]})
+
+
+def _connector_name(cfg: object) -> str:
+    name = cfg.get("kv_connector", "") if isinstance(cfg, dict) else ""
+    return str(name).strip().casefold()
+
+
 @dataclass
 class EngineArgs:
     """Arguments for configuring the LLM Engine."""
@@ -81,6 +129,7 @@ class EngineArgs:
     method: str | None = None
     num_speculative_tokens: int = 1
     kv_transfer_config: str = "{}"
+    kv_offload_config: dict | None = None
     draft_model: str | None = None
     spec_decode_acceptance_rate: float | None = None
     spec_decode_acceptance_length: float | None = None
@@ -498,6 +547,20 @@ class EngineArgs:
             default="{}",
             help="KV transfer config as JSON string.",
         )
+        parser.add_argument(
+            "--kv-offload-config",
+            type=json.loads,
+            default=None,
+            help=(
+                "Enable KV offload as one JSON dict, independent of "
+                "--kv-transfer-config. The dict is an offload connector config: "
+                '"kv_connector" defaults to "lmcache_offload" and "kv_role" to '
+                '"offload"; other keys (e.g. "lmcache.max_local_cpu_size") pass '
+                "through. When --kv-transfer-config also names a P/D connector, "
+                'both run behind a "multi" connector.\n'
+                "Example: '{}' or '{\"lmcache.chunk_size\": 256}'"
+            ),
+        )
 
         parser.add_argument(
             "--scheduler-delay-factor",
@@ -725,6 +788,12 @@ class EngineArgs:
             "rccl": "rccl",
             "none": "none",
         }[all2all_backend]
+
+        # --kv-offload-config (JSON dict) → folded into kv_transfer_config, so
+        # offload no longer competes with a P/D connector for that one flag.
+        kwargs["kv_transfer_config"] = compose_kv_offload_config(
+            kwargs["kv_transfer_config"], kwargs.pop("kv_offload_config")
+        )
 
         # --dspark-config (JSON dict) → DSparkConfig object, passed through as
         # Config.dspark (no env vars).
