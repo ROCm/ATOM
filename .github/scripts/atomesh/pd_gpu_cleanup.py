@@ -1,45 +1,22 @@
 #!/usr/bin/env python3
-"""Clear GPU users on an explicitly allocated exclusive AMD CI node."""
+"""Remove stale containers for this case on an exclusively allocated CI node."""
 
 import argparse
 import json
 import os
 import re
-import signal
 import socket
 import subprocess
-import sys
 import time
 from pathlib import Path
 
 KFD = Path("/sys/class/kfd/kfd/proc")
 DRM = Path("/sys/class/drm")
-PROC = Path("/proc")
-
-
-def identity(pid):
-    try:
-        text = (PROC / str(pid) / "stat").read_text()
-    except FileNotFoundError:
-        return None
-    tail = text.rsplit(")", 1)[1].split()
-    return {
-        "pid": pid,
-        "starttime": int(tail[19]),
-        "comm": text.split("(", 1)[1].rsplit(")", 1)[0],
-    }
 
 
 def gpu_processes():
-    # KFD exposes host process IDs. This program is invoked by the node worker,
-    # before Docker, so pidfd and /proc use that same host PID namespace.
-    result = []
-    for entry in KFD.iterdir():
-        if entry.name.isdecimal():
-            row = identity(int(entry.name))
-            if row is not None:
-                result.append(row)
-    return sorted(result, key=lambda row: row["pid"])
+    # Spur isolates job PIDs; these are diagnostic IDs, never signal targets.
+    return sorted(int(entry.name) for entry in KFD.iterdir() if entry.name.isdecimal())
 
 
 def memory():
@@ -72,7 +49,7 @@ def memory():
 def command(args, timeout=10):
     env = os.environ.copy()
     if args[0] == "docker":
-        # KFD and /proc describe this host, never a remote Docker context.
+        # Use the allocated host daemon, independent of the job PID namespace.
         for key in (
             "DOCKER_HOST",
             "DOCKER_CONTEXT",
@@ -91,47 +68,6 @@ def command(args, timeout=10):
     return proc.stdout
 
 
-def protected_pids():
-    result = {1}
-    pid = os.getpid()
-    while pid > 1 and pid not in result:
-        result.add(pid)
-        text = (PROC / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
-        pid = int(text[1])
-    return result
-
-
-def signal_gpu_process(pid, starttime, sig):
-    if pid <= 1 or pid in protected_pids():
-        raise RuntimeError("Refusing to signal cleanup process or its ancestors")
-    before = identity(pid)
-    if (
-        before is None
-        or before["starttime"] != starttime
-        or not (KFD / str(pid)).exists()
-    ):
-        return "gone_or_replaced"
-    try:
-        fd = os.pidfd_open(pid)
-    except ProcessLookupError:
-        return "gone"
-    try:
-        after = identity(pid)
-        if (
-            after is None
-            or after["starttime"] != starttime
-            or not (KFD / str(pid)).exists()
-        ):
-            return "gone_or_replaced"
-        try:
-            signal.pidfd_send_signal(fd, sig)
-        except ProcessLookupError:
-            return "gone"
-    finally:
-        os.close(fd)
-    return "signalled"
-
-
 class Cleanup:
     def __init__(self, args):
         self.args = args
@@ -140,6 +76,7 @@ class Cleanup:
             "run_token": args.run_token,
             "node": args.node,
             "rank": args.rank,
+            "cell_id": args.cell_id,
             "required_free_ratio": 0.88,
             "docker_host": "unix:///var/run/docker.sock",
             "events": [],
@@ -162,83 +99,69 @@ class Cleanup:
     def snapshot(self, stage):
         data = {"processes": gpu_processes(), "memory": memory()}
         self.event(stage, **data)
-        if any(row["pid"] in protected_pids() for row in data["processes"]):
-            raise RuntimeError("A protected supervisor process uses the GPU")
         return data
 
-    def stop_containers(self, processes):
-        targets = {p["pid"] for p in processes}
-        if not targets:
-            return
+    def active_jobs(self):
+        args = ["squeue"]
+        if controller := os.environ.get("SPUR_CONTROLLER_ADDR"):
+            args += ["--controller", controller]
+        rows = command(args + ["--noheader", "--format=%i"]).split()
+        if any(not row.isdecimal() for row in rows) or self.args.job_id not in rows:
+            raise RuntimeError(
+                "Cannot verify the current allocation in the active queue"
+            )
+        return set(rows)
+
+    def stop_containers(self):
+        pattern = re.compile(
+            rf"atomesh-{re.escape(self.args.cell_id)}-([0-9]+)-[0-9]+"
+            r"(?:-benchmark|-eval|-router|-benchmark-router|-eval-router)?"
+        )
+        user = f"{os.getuid()}:{os.getgid()}"
         for cid in command(
-            ["docker", "ps", "--no-trunc", "--format", "{{.ID}}"]
+            ["docker", "ps", "-a", "--no-trunc", "--format", "{{.ID}}"]
         ).split():
             if not re.fullmatch(r"[0-9a-f]{64}", cid):
                 raise RuntimeError("Invalid Docker container ID")
             try:
-                text = command(["docker", "top", cid, "-eo", "pid"])
+                name, owner = json.loads(
+                    command(
+                        [
+                            "docker",
+                            "inspect",
+                            "--format",
+                            "[{{json .Name}},{{json .Config.User}}]",
+                            cid,
+                        ]
+                    )
+                )
             except RuntimeError:
                 # A concurrent natural exit is fine only if Docker confirms it.
                 active = command(
-                    ["docker", "ps", "--no-trunc", "--format", "{{.ID}}"]
+                    ["docker", "ps", "-a", "--no-trunc", "--format", "{{.ID}}"]
                 ).split()
                 if cid not in active:
                     continue
                 raise
-            values = text.split()
-            if (
-                not values
-                or values[0] != "PID"
-                or any(not p.isdecimal() for p in values[1:])
-            ):
-                raise RuntimeError("Invalid Docker host PID listing")
-            pids = {int(p) for p in values[1:]}
-            live_targets = {
-                row["pid"]
-                for row in processes
-                if row["pid"] in pids
-                and identity(row["pid"]) == row
-                and (KFD / str(row["pid"])).exists()
-            }
-            if not live_targets:
+            match = pattern.fullmatch(name.removeprefix("/"))
+            if match is None or owner != user:
                 continue
-            if pids & protected_pids():
-                raise RuntimeError("GPU container includes a protected supervisor")
-            info = json.loads(
-                command(["docker", "inspect", "--format", "{{json .Name}}", cid])
-            )
+            old_job = match[1]
+            if old_job in self.active_jobs():
+                self.event(
+                    "skip_active_container", container=cid, name=name, job_id=old_job
+                )
+                continue
             self.event(
                 "stop_container",
                 container=cid,
-                name=info,
-                gpu_pids=sorted(live_targets),
+                name=name,
+                job_id=old_job,
+                user=owner,
             )
             command(["docker", "stop", "--time", "5", cid], timeout=15)
-
-    def signal_remaining(self, sig):
-        for row in gpu_processes():
-            try:
-                outcome = signal_gpu_process(row["pid"], row["starttime"], sig)
-            except PermissionError:
-                # Uses only existing host sudo policy; no privileged container.
-                command(
-                    [
-                        "sudo",
-                        "-n",
-                        "--",
-                        sys.executable,
-                        str(Path(__file__).resolve()),
-                        "--signal-pid",
-                        str(row["pid"]),
-                        "--starttime",
-                        str(row["starttime"]),
-                        "--signal-name",
-                        signal.Signals(sig).name,
-                    ],
-                    timeout=10,
-                )
-                outcome = "host_sudo_signal"
-            self.event("signal", **row, signal=signal.Signals(sig).name, result=outcome)
+            command(["docker", "rm", cid])
+            self.event("removed_container", container=cid, name=name)
 
     def run(self):
         args = self.args
@@ -253,11 +176,11 @@ class Cleanup:
             raise RuntimeError("Cleanup must be invoked by the exclusive CI submitter")
         if not re.fullmatch(r"[0-9a-f]{32}", args.run_token):
             raise RuntimeError("Missing cleanup run identity")
-        initial = self.snapshot("before")
-        self.stop_containers(initial["processes"])
-        self.signal_remaining(signal.SIGTERM)
+        if not re.fullmatch(r"[a-zA-Z0-9_.-]+", args.cell_id):
+            raise RuntimeError("Invalid case identity")
+        self.snapshot("before")
+        self.stop_containers()
         deadline = time.monotonic() + 60
-        kill_at = time.monotonic() + 5
         while True:
             current = self.snapshot("check")
             if not current["processes"] and all(
@@ -270,9 +193,6 @@ class Cleanup:
                 raise RuntimeError(
                     "GPU processes or insufficient free VRAM remain after cleanup"
                 )
-            if time.monotonic() >= kill_at:
-                self.stop_containers(current["processes"])
-                self.signal_remaining(signal.SIGKILL)
             time.sleep(2)
 
 
@@ -282,21 +202,17 @@ def main():
     parser.add_argument("--run-token")
     parser.add_argument("--node")
     parser.add_argument("--rank", type=int)
+    parser.add_argument("--cell-id")
     parser.add_argument("--out", type=Path)
-    parser.add_argument("--signal-pid", type=int)
-    parser.add_argument("--starttime", type=int)
-    parser.add_argument("--signal-name", choices=("SIGTERM", "SIGKILL"))
     args = parser.parse_args()
-    if args.signal_pid is not None:
-        if args.starttime is None or args.signal_name is None:
-            parser.error("signal helper requires an immutable process identity")
-        print(
-            signal_gpu_process(
-                args.signal_pid, args.starttime, getattr(signal, args.signal_name)
-            )
-        )
-        return
-    if None in (args.job_id, args.run_token, args.node, args.rank, args.out):
+    if None in (
+        args.job_id,
+        args.run_token,
+        args.node,
+        args.rank,
+        args.cell_id,
+        args.out,
+    ):
         parser.error("cleanup requires allocation, node, rank, token and output path")
     cleanup = Cleanup(args)
     try:

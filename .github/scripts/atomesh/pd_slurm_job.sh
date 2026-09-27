@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-# All container PIDs and GPU accounting below belong to this allocated host.
+# Docker uses the allocated host daemon even when Spur isolates the job PIDs.
 unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
 export DOCKER_HOST=unix:///var/run/docker.sock
 
@@ -175,6 +175,7 @@ pre_cleanup_local() {
     "${REPO_ROOT}/.github/scripts/atomesh/pd_gpu_cleanup.py" \
     --job-id "${JOB_ID}" --run-token "${ATOMESH_RUN_TOKEN}" \
     --node "${SELECTED_NODES[$node_rank]}" --rank "${node_rank}" \
+    --cell-id "${ATOMESH_CELL_ID}" \
     --out "${RUN_DIR}/gpu-preflight-${node_rank}.json" || return $?
   local deadline=$((SECONDS + 180)) state_rc
   while true; do
