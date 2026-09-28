@@ -56,6 +56,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
         os.getenv("ATOM_PREFIX_CACHE_PROTECTED_RATIO", "0.5")
     ),
+    # LMCache KV offload without --kv-transfer-config: "lmcache" (in-process) or
+    # "lmcache_mp" (standalone `lmcache server`). Unset = off.
+    "ATOM_KV_OFFLOAD": lambda: os.getenv("ATOM_KV_OFFLOAD", ""),
+    # JSON object for that connector's kv_connector_extra_config, e.g.
+    # {"lmcache.chunk_size": 256} or {"lmcache.mp.port": 5556}.
+    "ATOM_KV_OFFLOAD_EXTRA_CONFIG": lambda: os.getenv(
+        "ATOM_KV_OFFLOAD_EXTRA_CONFIG", ""
+    ),
     # --- Data Parallelism ---
     "ATOM_DP_RANK": lambda: int(os.getenv("ATOM_DP_RANK", "0")),
     "ATOM_DP_RANK_LOCAL": lambda: int(os.getenv("ATOM_DP_RANK_LOCAL", "0")),

@@ -17,6 +17,7 @@ from atom.config import (
     SpeculativeConfig,
 )
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -44,21 +45,45 @@ _OFFLOAD_CONNECTORS = frozenset(
 )
 
 
-def compose_kv_offload_config(
-    kv_transfer_config: str, kv_offload_config: dict | None
-) -> str:
-    """Fold --kv-offload-config into the --kv-transfer-config JSON string.
+# ATOM_KV_OFFLOAD value -> the offload connector it selects.
+_KV_OFFLOAD_MODES = {"lmcache": "lmcache_offload", "lmcache_mp": "lmcache_mp"}
+
+
+def kv_offload_connector_config(mode: str, extra_config: str) -> dict | None:
+    """The offload connector ATOM_KV_OFFLOAD selects, or None when it is off.
+
+    ``lmcache`` is the in-process backend and ``lmcache_mp`` the standalone
+    ``lmcache server`` one. ATOM_KV_OFFLOAD_EXTRA_CONFIG, a JSON object, becomes
+    the connector's ``kv_connector_extra_config``, which both backends read.
+    """
+    mode = mode.strip().lower()
+    if mode in ("", "0", "off", "none"):
+        if extra_config.strip():
+            raise ValueError(
+                "ATOM_KV_OFFLOAD_EXTRA_CONFIG is set but ATOM_KV_OFFLOAD is off"
+            )
+        return None
+    if mode not in _KV_OFFLOAD_MODES:
+        raise ValueError(
+            f"ATOM_KV_OFFLOAD={mode!r}: expected one of {sorted(_KV_OFFLOAD_MODES)}"
+        )
+    offload = {"kv_connector": _KV_OFFLOAD_MODES[mode], "kv_role": "offload"}
+    if extra_config.strip():
+        extra = json.loads(extra_config)
+        if not isinstance(extra, dict):
+            raise TypeError("ATOM_KV_OFFLOAD_EXTRA_CONFIG must be a JSON object")
+        offload["kv_connector_extra_config"] = extra
+    return offload
+
+
+def compose_kv_offload_config(kv_transfer_config: str, offload: dict | None) -> str:
+    """Fold the ATOM_KV_OFFLOAD connector into the --kv-transfer-config JSON string.
 
     Without a transfer connector the offload connector stands alone; with one,
     both become subs of a ``multi`` connector (appended if it already is one).
     """
-    if kv_offload_config is None:
+    if offload is None:
         return kv_transfer_config
-    if not isinstance(kv_offload_config, dict):
-        raise TypeError("--kv-offload-config must be a JSON object")
-    offload = {"kv_connector": "lmcache_offload", "kv_role": "offload"}
-    offload.update(kv_offload_config)
-
     transfer = json.loads(kv_transfer_config or "{}")
     if not transfer:
         return json.dumps(offload)
@@ -66,8 +91,8 @@ def compose_kv_offload_config(
     subs = transfer.get("connectors", []) if is_multi else [transfer]
     if any(_connector_name(sub) in _OFFLOAD_CONNECTORS for sub in subs):
         raise ValueError(
-            "--kv-offload-config conflicts with an offload connector already "
-            "set in --kv-transfer-config; use only one of them"
+            "ATOM_KV_OFFLOAD conflicts with an offload connector already set in "
+            "--kv-transfer-config; use only one of them"
         )
     if is_multi:
         return json.dumps({**transfer, "connectors": [*subs, offload]})
@@ -129,7 +154,6 @@ class EngineArgs:
     method: str | None = None
     num_speculative_tokens: int = 1
     kv_transfer_config: str = "{}"
-    kv_offload_config: dict | None = None
     draft_model: str | None = None
     spec_decode_acceptance_rate: float | None = None
     spec_decode_acceptance_length: float | None = None
@@ -547,20 +571,6 @@ class EngineArgs:
             default="{}",
             help="KV transfer config as JSON string.",
         )
-        parser.add_argument(
-            "--kv-offload-config",
-            type=json.loads,
-            default=None,
-            help=(
-                "Enable KV offload as one JSON dict, independent of "
-                "--kv-transfer-config. The dict is an offload connector config: "
-                '"kv_connector" defaults to "lmcache_offload" and "kv_role" to '
-                '"offload"; other keys (e.g. "lmcache.max_local_cpu_size") pass '
-                "through. When --kv-transfer-config also names a P/D connector, "
-                'both run behind a "multi" connector.\n'
-                "Example: '{}' or '{\"lmcache.chunk_size\": 256}'"
-            ),
-        )
 
         parser.add_argument(
             "--scheduler-delay-factor",
@@ -789,11 +799,18 @@ class EngineArgs:
             "none": "none",
         }[all2all_backend]
 
-        # --kv-offload-config (JSON dict) → folded into kv_transfer_config, so
-        # offload no longer competes with a P/D connector for that one flag.
-        kwargs["kv_transfer_config"] = compose_kv_offload_config(
-            kwargs["kv_transfer_config"], kwargs.pop("kv_offload_config")
+        # ATOM_KV_OFFLOAD → folded into kv_transfer_config, so offload does not
+        # compete with a P/D connector (or a launcher owning that flag) for it.
+        offload = kv_offload_connector_config(
+            envs.ATOM_KV_OFFLOAD, envs.ATOM_KV_OFFLOAD_EXTRA_CONFIG
         )
+        kwargs["kv_transfer_config"] = compose_kv_offload_config(
+            kwargs["kv_transfer_config"], offload
+        )
+        if offload is not None:
+            logger.info(
+                "ATOM_KV_OFFLOAD: kv_transfer_config=%s", kwargs["kv_transfer_config"]
+            )
 
         # --dspark-config (JSON dict) → DSparkConfig object, passed through as
         # Config.dspark (no env vars).

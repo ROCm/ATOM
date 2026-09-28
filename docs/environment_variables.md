@@ -288,6 +288,11 @@ flag below. Details in the state-checkpoint section of the
 
 ### LMCache offload tier
 
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_KV_OFFLOAD** | str | "" (off) | Enables LMCache KV offload without `--kv-transfer-config`, so a launcher that owns that flag for P/D can still add offload. `lmcache` selects the in-process `lmcache_offload` connector, `lmcache_mp` the standalone-server `lmcache_mp` connector (start `lmcache server` first). With a P/D connector in `--kv-transfer-config`, both run behind a `multi` connector. Setting it while `--kv-transfer-config` already names an offload connector is an error. |
+| **ATOM_KV_OFFLOAD_EXTRA_CONFIG** | JSON object | "" | The offload connector's `kv_connector_extra_config`: `lmcache.<field>` overrides (e.g. `{"lmcache.chunk_size": 256}`) and, for `lmcache_mp`, `lmcache.mp.*` options (e.g. `{"lmcache.mp.port": 5556}`). Requires `ATOM_KV_OFFLOAD`. |
+
 The LMCache source-pin timeout and ATOM's pending-save bound are read directly
 via `os.environ` rather than through `atom.utils.envs`. Their behavior is
 defined in `atom/kv_transfer/offload/_offload_common.py` and documented in full
