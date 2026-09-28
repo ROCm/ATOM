@@ -984,7 +984,7 @@ first two are what make it boot and stay up at all:
 ```bash
 --enable_prefix_caching          # instead of --no-enable_prefix_caching
 --gpu-memory-utilization 0.94    # instead of 0.90
---max-num-batched-tokens 2048    # unchanged -- do NOT raise it, see below
+--max-num-batched-tokens 2048    # on 288 GiB boards. On 432 GiB, raise it -- see below
 --max-num-seqs 8                 # unchanged -- do NOT raise it either
 ```
 
@@ -999,7 +999,8 @@ Measured effect of the utilization bump, everything else equal:
 like the obvious fix for a 100k-token prompt being split into 51 chunks, and it
 is wrong twice over:
 
-1. **It will not boot.** At 16384 with `--gpu-memory-utilization 0.93`:
+1. **It will not boot** — *on a 288 GiB board*. At 16384 with
+   `--gpu-memory-utilization 0.93`:
    ```
    RuntimeError: Per-request cache tensor (3.35GB for 8 slots) exceeds available
    KV budget (-4.67GB) at --gpu-memory-utilization 0.93. Set
@@ -1007,12 +1008,32 @@ is wrong twice over:
    ```
    Raising utilization far enough to cover it is not possible — the deficit is
    ~40 GB against a 288 GB card already at 0.93.
-2. **Chunk size is not what makes agentic prefill slow.** At the *same* 2048
-   chunk size, a 14k fixed-length run prefills at 1252 tok/s per rank while the
-   agentic trace manages 283 tok/s. The difference is context length: chunk *n*
-   attends to everything before it, so the cost is quadratic in prompt length
-   and a bigger chunk only amortises per-step overhead. You would trade ~38 GB
-   of KV for maybe 2-3x, and KV is the thing you cannot spare here.
+
+   **On a 432 GiB board this does not apply.** Measured at 16384 with
+   `--gpu-memory-utilization 0.94`, everything else as above:
+
+   | | 2048 | 16384 |
+   |---|---|---|
+   | `peak_torch` | 194.67 GB | 236.08 GB |
+   | `cudagraph_est` | 1.18 GB | 9.40 GB |
+   | `available_for_kv` | 159.37 GB | **118.80 GB** |
+   | TTFT, 5-token prompt | 2.73 s | **0.50 s** |
+
+   It boots, and 118 GB of KV is still 3.5x what a 288 GiB board has at 0.90.
+   **Re-derive the budget for your board instead of copying either number.**
+2. **Chunk size is not the whole story.** At the *same* 2048 chunk size, a 14k
+   fixed-length run prefills at 1252 tok/s per rank while the agentic trace
+   manages 283 tok/s. The difference is context length: chunk *n* attends to
+   everything before it, so the cost is quadratic in prompt length and a bigger
+   chunk only amortises per-step overhead. On a 288 GiB board you would trade
+   ~38 GB of KV for maybe 2-3x, and there KV is the thing you cannot spare.
+
+   **Where KV is not scarce, take the 2-3x.** At 2048 the AgentX warmup on
+   this rack needed **2 h 52 min** to clear 707 requests, and the 1800 s
+   profiling window that followed completed **3 of 89** trajectories — aiperf
+   then rejected the run (see below). At 16384 the same warmup's snapshot
+   primers cleared roughly **8x faster**. On a 432 GiB board the conservative
+   value is not a safe default; it is what makes AgentX unmeasurable.
 
 ⚠️ **`--enable_prefix_caching` on this platform deadlocked the cluster once, at
 `--gpu-memory-utilization 0.90`.** Signature, for recognition:
@@ -1102,6 +1123,38 @@ The scenario enforces `--benchmark-duration >= 900`; shorter needs
 `--unsafe-override` and marks the result `submission_valid=false`.
 Effective concurrency is far below `--concurrency` because lanes spend much of
 the trace idle — read the Effective figures, not the nominal ones.
+
+### ⚠️ A server too slow for the trace fails the run outright
+
+aiperf requires **95% metric coverage** over the profiling window. If too few
+trajectories finish inside it, the whole run is discarded — you get no numbers
+at all, not slow ones:
+
+```
+Phase profiling timed out, cancelling all credits.
+  Stats: sent=89, completed=3, cancelled=0, in_flight=86
+Profiling metric coverage below the required 95.0% for phase 'profiling':
+  TTFT=0.2%, inter-token latency=0.2% over the configured 1800.0s duration
+AIPerf System Exit Errors: ProfileMetricCoverageError
+```
+
+That was `--concurrency 64` with `--max-num-batched-tokens 2048` on 432 GiB
+boards: 3 of 89 trajectories completed in 1800 s. The summary table it prints
+before dying is misleading — `Benchmark Duration: 3.63 sec` is the span between
+the three completed requests, **not** the length of the run.
+
+Two things cause it, and both need fixing together:
+
+- **Chunk size.** See [the batched-tokens note](#server-launch-for-agentx) —
+  at 2048 a 100k-token turn is 51 chunked prefill steps.
+- **Concurrency above what the server can retire.** A profiling "request" here
+  is a whole multi-turn trajectory (`BranchOrchestrator: spawned=188` for 89
+  sent), so nominal concurrency costs far more than it does in
+  `benchmark_serving`. If nothing completes, halve it.
+
+Watch `returned=` in the warmup progress lines before the profiling phase
+starts. If the primers alone take tens of minutes, the profiling window will
+not produce coverage either.
 
 ---
 
