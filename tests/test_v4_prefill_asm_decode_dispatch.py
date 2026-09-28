@@ -166,7 +166,11 @@ def _decode_split_kwargs(monkeypatch, *, planner, n=21, **kwargs):
     captured = {}
 
     monkeypatch.setattr(paged_decode.envs, "ATOM_USE_V4_PREFILL_ASM_FOR_DECODE", False)
-    monkeypatch.setattr(paged_decode, "_aiter_v4_nm_split_planner", lambda: planner)
+    monkeypatch.setattr(
+        paged_decode,
+        "aiter_v4_nm_split_plan_fn",
+        lambda: (lambda *a, **k: None) if planner else None,
+    )
     monkeypatch.setattr(
         paged_decode,
         "_v4_aiter_fp8_decode_splits",
@@ -197,23 +201,82 @@ def _decode_split_kwargs(monkeypatch, *, planner, n=21, **kwargs):
     return {k: v for k, v in captured.items() if k in _SPLIT_KEYS}
 
 
-_SPLIT_KEYS = ("num_kv_splits", "kv_len_hint")
+_SPLIT_KEYS = ("num_kv_splits", "split_indptr")
 
 
 def test_legacy_aiter_receives_csa_split_table(monkeypatch):
-    got = _decode_split_kwargs(
-        monkeypatch, planner=False, kv_kind="csa", kv_len_hint=1152
-    )
+    got = _decode_split_kwargs(monkeypatch, planner=False, kv_kind="csa")
     assert got == {"num_kv_splits": 3}
 
 
-def test_planner_aiter_receives_kv_len_hint(monkeypatch):
+@pytest.mark.parametrize("planner", [True, False])
+def test_metadata_split_plan_is_forwarded(monkeypatch, planner):
+    n = 21
+    plan = (4, torch.arange(0, 4 * (n + 1), 4, dtype=torch.int32))
     got = _decode_split_kwargs(
-        monkeypatch, planner=True, kv_kind="csa", kv_len_hint=1152
+        monkeypatch, planner=planner, n=n, kv_kind="hca", split_plan=plan
     )
-    assert got == {"kv_len_hint": 1152}
+    assert got["num_kv_splits"] == 4
+    assert got["split_indptr"] is plan[1]
 
 
-def test_planner_aiter_without_hint_uses_auto(monkeypatch):
+def test_plan_covering_more_rows_is_forwarded(monkeypatch):
+    # Eager forwards can run fewer rows than the padded grid the plan was built
+    # for; the ASM wrapper trims the uniform plan like qo_indptr.
+    plan = (2, torch.arange(0, 2 * 29, 2, dtype=torch.int32))
+    got = _decode_split_kwargs(
+        monkeypatch, planner=True, n=21, kv_kind="csa", split_plan=plan
+    )
+    assert got["num_kv_splits"] == 2
+
+
+def test_plan_for_fewer_rows_falls_back(monkeypatch):
+    plan = (2, torch.arange(0, 2 * 8, 2, dtype=torch.int32))
+    got = _decode_split_kwargs(
+        monkeypatch, planner=True, n=21, kv_kind="csa", split_plan=plan
+    )
+    assert got == {}
+
+
+def test_planner_aiter_without_plan_uses_auto(monkeypatch):
     got = _decode_split_kwargs(monkeypatch, planner=True, kv_kind="swa")
     assert got == {}
+
+
+@pytest.mark.parametrize("kv_fp8,planner", [(True, True), (False, True), (True, False)])
+def test_builder_attaches_split_plans(monkeypatch, kv_fp8, planner):
+    from atom.model_ops.attentions import deepseek_v4_attn
+
+    calls = []
+
+    def fake_plan(num_seqs, num_heads, kv_len, *, split_indptr):
+        calls.append((num_seqs, num_heads, kv_len))
+        return 2, split_indptr[: num_seqs + 1]
+
+    monkeypatch.setattr(
+        paged_decode,
+        "aiter_v4_nm_split_plan_fn",
+        lambda: fake_plan if planner else None,
+    )
+    bufs = {
+        f"v4_split_indptr_{k}": torch.zeros(65, dtype=torch.int32)
+        for k in ("swa", "csa", "hca")
+    }
+    builder = SimpleNamespace(
+        _kv_fp8=kv_fp8,
+        _decode_local_heads=128,
+        window_size=128,
+        index_topk=1024,
+        max_committed_hca=8192,
+        model_runner=SimpleNamespace(forward_vars=bufs),
+    )
+    md = SimpleNamespace(split_plan_swa=None, split_plan_csa=None, split_plan_hca=None)
+    deepseek_v4_attn.DeepseekV4AttentionMetadataBuilder._attach_v4_decode_split_plans(
+        builder, md, 28, ""
+    )
+
+    if kv_fp8 and planner:
+        assert calls == [(28, 128, 128), (28, 128, 1152), (28, 128, 8320)]
+        assert md.split_plan_csa[0] == 2 and md.split_plan_csa[1].shape[0] == 29
+    else:
+        assert calls == [] and md.split_plan_csa is None

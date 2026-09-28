@@ -49,7 +49,6 @@ the captured launch sequence.
 from __future__ import annotations
 
 import functools
-import inspect
 import os
 
 import torch
@@ -112,8 +111,8 @@ def _v4_aiter_fp8_decode_splits(
     HCA remains on AITER's ragged split planner: its heterogeneous long-KV
     vectors have a different optimum from the CSA table.
 
-    Only used with aiter builds that predate the cost-model planner (see
-    ``_aiter_v4_nm_split_planner``).
+    Only used with aiter builds that predate ``get_mla_v4_nm_split_plan`` (see
+    ``aiter_v4_nm_split_plan_fn``).
     """
     shape = getattr(q_packed, "shape", None)
     device = getattr(q_packed, "device", None)
@@ -148,15 +147,15 @@ def _v4_aiter_fp8_decode_splits(
 
 
 @functools.cache
-def _aiter_v4_nm_split_planner() -> bool:
-    """Whether aiter's V4 NM wrapper has the cost-model split planner.
+def aiter_v4_nm_split_plan_fn():
+    """aiter's ``get_mla_v4_nm_split_plan``, or None on builds without it.
 
-    That aiter takes ``kv_len_hint``; older builds only have the
-    occupancy-only auto pick, which the CSA table above works around.
+    Those older builds only have the occupancy-only auto pick, which the CSA
+    table above works around.
     """
     import aiter.mla
 
-    return "kv_len_hint" in inspect.signature(aiter.mla.mla_decode_fwd_v4_nm).parameters
+    return getattr(aiter.mla, "get_mla_v4_nm_split_plan", None)
 
 
 def _v4_aiter_decode_split_kwargs(
@@ -164,16 +163,19 @@ def _v4_aiter_decode_split_kwargs(
     *,
     query_group: int,
     kv_kind: str,
-    kv_len_hint: int | None,
+    split_plan: tuple[int, torch.Tensor] | None,
 ) -> dict:
     """Split arguments for ``mla_decode_fwd_v4_nm``.
 
-    With the aiter cost-model planner, ``kv_len_hint`` (the longest per-token
-    kv_len the call can see) steers the split pick. Older aiter keeps the
-    measured CSA batch table.
+    Uses the metadata builder's plan when it covers this call's rows; the
+    kernel launch then reads the plan's persistent ``split_indptr``. Without a
+    plan, aiter builds that have the planner fall back to their own pick and
+    older ones keep the measured CSA batch table.
     """
-    if _aiter_v4_nm_split_planner():
-        return {} if kv_len_hint is None else {"kv_len_hint": kv_len_hint}
+    if split_plan is not None and split_plan[1].shape[0] >= q_packed.shape[0] + 1:
+        return {"num_kv_splits": split_plan[0], "split_indptr": split_plan[1]}
+    if aiter_v4_nm_split_plan_fn() is not None:
+        return {}
     splits = _v4_aiter_fp8_decode_splits(
         q_packed, query_group=query_group, kv_kind=kv_kind
     )
@@ -1093,7 +1095,7 @@ def _sparse_attn_v4_paged_decode_asm(
     qo_indptr: torch.Tensor,
     kv_last_page_lens: torch.Tensor | None = None,  # unused on v4 nm (page_size=1)
     num_kv_splits: int | None = None,
-    kv_len_hint: int | None = None,
+    split_indptr: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Native 2buff fp8 V4 decode via the aiter assembly kernel
     ``mla_decode_fwd_v4_nm`` (ROCm/aiter#3112, mi350/gfx950).
@@ -1203,8 +1205,10 @@ def _sparse_attn_v4_paged_decode_asm(
         (N, H, V4_DIM_NOPE + V4_DIM_ROPE), dtype=torch.bfloat16, device=device
     )
 
-    # Only forward `kv_len_hint` when set, so aiter builds without it work.
-    split_kwargs = {} if kv_len_hint is None else {"kv_len_hint": kv_len_hint}
+    # A uniform split plan's prefix is itself a valid plan, so it trims like
+    # qo_indptr.
+    if split_indptr is not None:
+        split_indptr = split_indptr[: N + 1]
     aiter.mla.mla_decode_fwd_v4_nm(
         q_packed,
         q_rope,
@@ -1218,7 +1222,7 @@ def _sparse_attn_v4_paged_decode_asm(
         sink=attn_sink,
         sm_scale=softmax_scale,
         num_kv_splits=num_kv_splits,
-        **split_kwargs,
+        split_indptr=split_indptr,
     )
     # Drop padded heads. The slice is a non-contiguous view, so .contiguous()
     # gives downstream a dense tensor; no-op (and no copy) when H was unpadded.
@@ -1243,7 +1247,7 @@ def sparse_attn_v4_paged_decode(
     prefix: str = "",
     query_group: int = 1,
     kv_kind: str = "",
-    kv_len_hint: int | None = None,
+    split_plan: tuple[int, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
@@ -1292,7 +1296,7 @@ def sparse_attn_v4_paged_decode(
                 q_packed_in,
                 query_group=query_group,
                 kv_kind=kv_kind,
-                kv_len_hint=kv_len_hint,
+                split_plan=split_plan,
             ),
         )
     gfx = get_gfx()

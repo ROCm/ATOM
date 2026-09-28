@@ -3340,10 +3340,12 @@ class DeepseekV4Attention(nn.Module):
                     7 if attn_md.min_seqlen_q == attn_md.max_seqlen_q == 7 else 1
                 ),
                 kv_kind="csa" if ratio == 4 else "hca" if ratio == 128 else "swa",
-                # Bridged metadata (e.g. sglang) may not carry the planner hints.
-                kv_len_hint=getattr(
+                # Bridged metadata (e.g. sglang) may not carry split plans.
+                split_plan=getattr(
                     attn_md,
-                    {4: "kv_len_hint_csa", 128: "kv_len_hint_hca"}.get(ratio, ""),
+                    {0: "split_plan_swa", 4: "split_plan_csa"}.get(
+                        ratio, "split_plan_hca"
+                    ),
                     None,
                 ),
             )  # [S, H, head_dim]
