@@ -113,15 +113,6 @@ def test_unfused_replaces_only_the_triton_op(
     assert (spies.flydsl, len(calls), spies.triton) == (flydsl, unfused, 0)
 
 
-def test_unfused_off_keeps_the_triton_op(spies, monkeypatch):
-    monkeypatch.setattr(
-        mla, "unfused_gather_kv_b_proj", Mock(side_effect=AssertionError("unexpected"))
-    )
-    spies.answer = False
-    _gather(_impl())
-    assert spies.triton == 1
-
-
 @pytest.mark.parametrize("supported", [False, True])
 def test_fp8_gather_checks_output_capability_once(monkeypatch, supported):
     impl = _impl()

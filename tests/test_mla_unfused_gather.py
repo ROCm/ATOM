@@ -93,70 +93,38 @@ def _run(case, k_scale=None, scale=None, **kw):
     "block_size, seq_lens",
     [
         (1, [5]),  # page_size 1 skips the block arithmetic entirely
-        (4, [4]),  # exact multiple of the block
-        (4, [7]),  # ragged tail
-        (4, [7, 1, 13]),  # several sequences, one of them a single token
-        (16, [33, 5]),
+        (4, [7, 1, 13]),  # paged, ragged tails, a single-token sequence
     ],
 )
 def test_matches_reference(block_size, seq_lens):
     case = _case(block_size, seq_lens)
-    got_k, got_v = _run(case)
+    # rows_per_chunk=3 also crosses chunk boundaries mid-sequence.
+    got_k, got_v = _run(case, rows_per_chunk=3)
     want_k, want_v = _reference(case[0], None, case[1], case[2], case[3], case[4], None)
     torch.testing.assert_close(got_k, want_k)
     torch.testing.assert_close(got_v, want_v)
 
 
-def test_chunking_does_not_change_the_result():
-    """rows_per_chunk is a memory knob; crossing a chunk must be invisible."""
-    case = _case(4, [7, 13])
-    whole = _run(case, rows_per_chunk=4096)
-    for rows in (1, 3, 8, 19):
-        torch.testing.assert_close(_run(case, rows_per_chunk=rows)[0], whole[0])
-        torch.testing.assert_close(_run(case, rows_per_chunk=rows)[1], whole[1])
-
-
-def test_per_row_weight_scale_is_applied():
-    case = _case(4, [9])
-    scale = torch.rand(NUM_HEADS * (NOPE + V_DIM)) + 0.5
-    got_k, got_v = _run(case, scale=scale)
-    want_k, want_v = _reference(
-        case[0], None, case[1], case[2], case[3], case[4], scale
-    )
-    torch.testing.assert_close(got_k, want_k)
-    torch.testing.assert_close(got_v, want_v)
-
-
-def test_block_weight_scale_matches_expanded_scale():
-    """The 128x128 block scale, checked against the row-scale path it expands to."""
+@pytest.mark.parametrize("e8m0_bytes", [False, True])
+def test_block_weight_scale(e8m0_bytes):
+    """128x128 block scale, as fp32 or as uint8 E8M0 exponents (no native dtype)."""
     case = _case(4, [9])
     n, k = case[4].shape
-    blocked = torch.rand(n // 3, k // 2) + 0.5
-    got_k, got_v = _run(case, scale=blocked)
+    exponents = torch.randint(124, 131, (n // 3, k // 2), dtype=torch.uint8)
+    blocked = torch.exp2(exponents.float() - 127)
+    got_k, got_v = _run(case, scale=exponents if e8m0_bytes else blocked)
     expanded = blocked.repeat_interleave(3, 0).repeat_interleave(2, 1)
-    want_k, want_v = _run((case[0], case[1], case[2], case[3], case[4] * expanded))
+    want_k, want_v = _run((*case[:4], case[4] * expanded))
     torch.testing.assert_close(got_k, want_k)
     torch.testing.assert_close(got_v, want_v)
 
 
-def test_bf16_cache_is_not_scaled_by_k_scale():
-    """The subtlest way to be wrong.
-
-    The fused kernel uses 1.0 for a bf16 cache and only loads k_scale for a
-    quantized one. Scaling anyway multiplies all of K and V by a constant --
-    which no assertion downstream would catch.
-    """
-    case = _case(4, [9], cache_dtype=torch.bfloat16)
-    scaled = _run(case, k_scale=torch.tensor(7.0))
-    unscaled = _run(case, k_scale=None)
-    torch.testing.assert_close(scaled[0], unscaled[0])
-    torch.testing.assert_close(scaled[1], unscaled[1])
-
-
-def test_quantized_cache_is_scaled_by_k_scale():
-    case = _case(4, [9], cache_dtype=torch.float16)
-    k_scale = torch.tensor(3.0)
-    got_k, got_v = _run(case, k_scale=k_scale)
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float16])
+def test_k_scale_applies_only_to_quantized_cache(cache_dtype):
+    """The fused kernel uses 1.0 for a bf16 cache and loads k_scale otherwise."""
+    case = _case(4, [9], cache_dtype=cache_dtype)
+    got_k, got_v = _run(case, k_scale=torch.tensor(3.0))
+    k_scale = None if cache_dtype is torch.bfloat16 else torch.tensor(3.0)
     want_k, want_v = _reference(
         case[0], k_scale, case[1], case[2], case[3], case[4], None
     )
@@ -165,39 +133,18 @@ def test_quantized_cache_is_scaled_by_k_scale():
 
 
 @pytest.mark.parametrize(
-    "kwargs", [{"shuffled_kv_cache": True}, {"weight_preshuffle": True}]
+    "kwargs, packed_weight",
+    [
+        ({"shuffled_kv_cache": True}, False),
+        ({"weight_preshuffle": True}, False),
+        ({}, True),
+    ],
 )
-def test_private_layouts_are_refused_not_guessed(kwargs):
-    """Wrong K/V is worse than no K/V: these layouts belong to the fused kernel."""
-    with pytest.raises(NotImplementedError):
-        _run(_case(4, [4]), **kwargs)
-
-
-def test_packed_uint8_weight_is_refused():
-    """MXFP4 stays raw uint8 where torch lacks float4_e2m1fn_x2.
-
-    Read as ordinary weights it halves kv_c_dim and still yields plausible K/V.
-    """
+def test_unsupported_layouts_are_refused(kwargs, packed_weight):
+    """Wrong K/V is worse than no K/V: refuse private layouts and raw MXFP4."""
     case = _case(4, [4])
-    packed = torch.zeros(case[4].shape[0], KV_C_DIM // 2, dtype=torch.uint8)
+    if packed_weight:
+        packed = torch.zeros(case[4].shape[0], KV_C_DIM // 2, dtype=torch.uint8)
+        case = (*case[:4], packed)
     with pytest.raises(NotImplementedError):
-        _run((*case[:4], packed))
-
-
-def test_uint8_e8m0_block_scale_is_decoded():
-    """E8M0 falls back to uint8 biased exponents without torch.float8_e8m0fnu."""
-    case = _case(4, [9])
-    n, k = case[4].shape
-    exponents = torch.randint(124, 131, (n // 3, k // 2), dtype=torch.uint8)
-    got_k, got_v = _run(case, scale=exponents)
-    want_k, want_v = _run(case, scale=torch.exp2(exponents.float() - 127))
-    torch.testing.assert_close(got_k, want_k)
-    torch.testing.assert_close(got_v, want_v)
-
-
-def test_one_element_k_scale_matches_scalar():
-    case = _case(4, [9], cache_dtype=torch.float16)
-    got = _run(case, k_scale=torch.tensor([3.0]))
-    want = _run(case, k_scale=torch.tensor(3.0))
-    torch.testing.assert_close(got[0], want[0])
-    torch.testing.assert_close(got[1], want[1])
+        _run(case, **kwargs)

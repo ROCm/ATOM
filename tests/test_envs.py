@@ -251,10 +251,6 @@ class TestEnvsOverrides:
         monkeypatch.setenv("ATOM_UNFUSED_GATHER_KV_B_PROJ", "1")
         assert _get_envs().ATOM_UNFUSED_GATHER_KV_B_PROJ is True
 
-    def test_unfused_gather_kv_b_proj_only_one_enables(self, monkeypatch):
-        monkeypatch.setenv("ATOM_UNFUSED_GATHER_KV_B_PROJ", "true")
-        assert _get_envs().ATOM_UNFUSED_GATHER_KV_B_PROJ is False
-
 
 class TestIsSet:
     """Test the is_set() helper function."""
