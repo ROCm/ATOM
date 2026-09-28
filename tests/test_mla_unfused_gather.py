@@ -171,3 +171,33 @@ def test_private_layouts_are_refused_not_guessed(kwargs):
     """Wrong K/V is worse than no K/V: these layouts belong to the fused kernel."""
     with pytest.raises(NotImplementedError):
         _run(_case(4, [4]), **kwargs)
+
+
+def test_packed_uint8_weight_is_refused():
+    """MXFP4 stays raw uint8 where torch lacks float4_e2m1fn_x2.
+
+    Read as ordinary weights it halves kv_c_dim and still yields plausible K/V.
+    """
+    case = _case(4, [4])
+    packed = torch.zeros(case[4].shape[0], KV_C_DIM // 2, dtype=torch.uint8)
+    with pytest.raises(NotImplementedError):
+        _run((*case[:4], packed))
+
+
+def test_uint8_e8m0_block_scale_is_decoded():
+    """E8M0 falls back to uint8 biased exponents without torch.float8_e8m0fnu."""
+    case = _case(4, [9])
+    n, k = case[4].shape
+    exponents = torch.randint(124, 131, (n // 3, k // 2), dtype=torch.uint8)
+    got_k, got_v = _run(case, scale=exponents)
+    want_k, want_v = _run(case, scale=torch.exp2(exponents.float() - 127))
+    torch.testing.assert_close(got_k, want_k)
+    torch.testing.assert_close(got_v, want_v)
+
+
+def test_one_element_k_scale_matches_scalar():
+    case = _case(4, [9], cache_dtype=torch.float16)
+    got = _run(case, k_scale=torch.tensor([3.0]))
+    want = _run(case, k_scale=torch.tensor(3.0))
+    torch.testing.assert_close(got[0], want[0])
+    torch.testing.assert_close(got[1], want[1])

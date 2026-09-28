@@ -95,8 +95,9 @@ def test_env_off_never_asks(spies):
 
 
 @pytest.mark.parametrize("flydsl_ok, flydsl, unfused", [(True, 1, 0), (False, 0, 1)])
-def test_unfused_replaces_only_the_triton_op(spies, monkeypatch, flydsl_ok, flydsl,
-                                             unfused):
+def test_unfused_replaces_only_the_triton_op(
+    spies, monkeypatch, flydsl_ok, flydsl, unfused
+):
     """ATOM_UNFUSED_GATHER_KV_B_PROJ is the last resort, not the first.
 
     It is a torch chain that exists so a target whose Triton cannot compile the
@@ -104,7 +105,9 @@ def test_unfused_replaces_only_the_triton_op(spies, monkeypatch, flydsl_ok, flyd
     env must displace the Triton op and nothing above it.
     """
     calls = []
-    monkeypatch.setattr(mla, "unfused_gather_kv_b_proj", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(
+        mla, "unfused_gather_kv_b_proj", lambda *a, **k: calls.append(a)
+    )
     spies.answer = flydsl_ok
     _gather(_impl(use_unfused_gather_kv_b_proj=True))
     assert (spies.flydsl, len(calls), spies.triton) == (flydsl, unfused, 0)

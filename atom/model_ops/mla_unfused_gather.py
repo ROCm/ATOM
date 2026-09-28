@@ -64,14 +64,28 @@ def _dequant_weight(
     """
     if scale is None:
         return weight if weight.dtype == dtype else weight.to(dtype)
+    scale = _scale_as_float(scale)
     if scale.dim() == 1 or (scale.dim() == 2 and scale.shape[1] == 1):
-        return (weight.to(torch.float32) * scale.reshape(-1, 1).to(torch.float32)).to(
-            dtype
-        )
+        return (weight.to(torch.float32) * scale.reshape(-1, 1)).to(dtype)
     scale_n, scale_k = scale.shape
     n, k = weight.shape
-    blocked = weight.to(torch.float32).view(scale_n, n // scale_n, scale_k, k // scale_k)
-    return (blocked * scale[:, None, :, None].to(torch.float32)).reshape(n, k).to(dtype)
+    blocked = weight.to(torch.float32).view(
+        scale_n, n // scale_n, scale_k, k // scale_k
+    )
+    return (blocked * scale[:, None, :, None]).reshape(n, k).to(dtype)
+
+
+def _scale_as_float(scale: torch.Tensor) -> torch.Tensor:
+    """Weight scale as fp32 multipliers.
+
+    An E8M0 block scale is ``torch.float8_e8m0fnu`` where torch has it, and
+    ``.to(float32)`` decodes that. Without it aiter's ``dtypes.fp8_e8m0`` falls
+    back to ``uint8`` holding the biased exponent, which a plain cast would read
+    as 127 instead of 1.0 -- so decode those bytes explicitly.
+    """
+    if scale.dtype == torch.uint8:
+        return torch.exp2(scale.to(torch.float32) - 127.0)
+    return scale.to(torch.float32)
 
 
 def _row_addresses(
@@ -130,8 +144,13 @@ def unfused_gather_kv_b_proj(
             "ATOM_UNFUSED_GATHER_KV_B_PROJ cannot read a preshuffled "
             "kv_b_proj weight (is_shuffled=True)."
         )
+    # Packed MXFP4 arrives as float4_e2m1fn_x2 where torch has that dtype, and
+    # as raw uint8 where it does not (`_maybe_view_mxfp4_weight_for_gather`
+    # leaves it alone). No real kv_b_proj weight is uint8, so refuse both.
     fp4 = getattr(torch, "float4_e2m1fn_x2", None)
-    if fp4 is not None and kv_proj_weight.dtype == fp4:
+    if kv_proj_weight.dtype == torch.uint8 or (
+        fp4 is not None and kv_proj_weight.dtype == fp4
+    ):
         raise NotImplementedError(
             "ATOM_UNFUSED_GATHER_KV_B_PROJ does not implement MXFP4 kv_b_proj "
             "weights; unset the env for this checkpoint."
@@ -161,6 +180,12 @@ def unfused_gather_kv_b_proj(
     # which nothing downstream would flag. The GEMM is linear in kv_c, so
     # scaling after the matmul is exact.
     scale_cache = k_scale is not None and k_buffer.dtype is not torch.bfloat16
+    if scale_cache:
+        # MLAAttention keeps _k_scale as a host tensor. A 0-dim one would still
+        # broadcast against CUDA operands, but a [1] one would not (and would
+        # promote the bf16 products to fp32); make it a 0-dim device scalar once
+        # rather than depend on its shape in every chunk.
+        k_scale = k_scale.reshape(()).to(k_prefix.device, non_blocking=True)
 
     for start in range(0, total_kv, rows_per_chunk):
         stop = min(start + rows_per_chunk, total_kv)
