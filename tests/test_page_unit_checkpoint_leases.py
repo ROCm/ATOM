@@ -263,3 +263,18 @@ def test_external_load_evicts_only_available_checkpoint_sources():
     c.release_transfer_units(("request-a", 1))
     c.settle_offload_store(operation)
     assert c.has_available_units(6)
+
+
+def test_change_log_names_the_hashes_behind_each_generation():
+    c = coordinator(num_units=6)
+    start = c.store.generation
+    ready(c, 101)
+    ready(c, 202)
+    assert c.store.changed_since(start) >= {101, 202}
+    assert c.store.changed_since(c.store.generation) == set()
+    middle = c.store.generation
+    c.unindex(101)
+    assert 101 in c.store.changed_since(middle)
+    assert 202 not in c.store.changed_since(middle)
+    c.store.clear()
+    assert c.store.changed_since(middle) is None

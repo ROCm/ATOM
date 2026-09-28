@@ -294,9 +294,19 @@ def test_save_frontier_rescans_only_when_frontier_or_checkpoints_change(
     assert scheduler._save_frontier(seq) == 8
     assert len(calls) == scanned  # same frontier, same checkpoints: cached
 
+    other = sequence(2, token_offset=100)
+    checkpoint(scheduler, checkpoints, other, 8)  # another request's traffic
+    assert scheduler._save_frontier(seq) == 8
+    assert len(calls) == scanned  # moves the store, but none of our boundaries
+
     checkpoint(scheduler, checkpoints, seq, 16)  # a newer checkpoint publishes
     assert scheduler._save_frontier(seq) == 16
     assert len(calls) > scanned
+    rescanned = len(calls)
+
+    checkpoints.store.unindex(scheduler._boundary_hash(seq, 16))  # ours drops
+    assert scheduler._save_frontier(seq) == 8
+    assert len(calls) > rescanned
 
 
 def test_default_min_save_tokens_skips_a_short_prompt(monkeypatch):

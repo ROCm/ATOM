@@ -15,6 +15,8 @@ from atom.kv_transfer.disaggregation.types import StateStoreOperationId
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.sequence import Sequence
 
+_CHANGE_LOG_LIMIT = 4096
+
 logger = logging.getLogger("atom")
 
 #: How many reclaimed store operations to remember. Only has to outlive a
@@ -165,8 +167,11 @@ class PageUnitCheckpointStore:
         self._offload_sink = offload_sink
         self.hash_to_checkpoint: dict[int, int] = {}
         # Bumped whenever the READY set can change (publish, unindex, evict,
-        # release, clear), so callers can cache `contains` answers.
+        # release, clear), so callers can cache `contains` answers. The log
+        # names the hash behind each recent bump (None: every hash), so a
+        # caller can invalidate only the answers that bump can affect.
         self.generation = 0
+        self._changes: deque[tuple[int, int | None]] = deque(maxlen=_CHANGE_LOG_LIMIT)
         self.records: dict[int, CheckpointRecord] = {}
         self._pending_by_hash: dict[int, int] = {}
         self._lru: OrderedDict[int, None] = OrderedDict()
@@ -430,6 +435,29 @@ class PageUnitCheckpointStore:
         """Release a suspended restore whose destination was filled elsewhere."""
         self._release_restore_pin(restore.checkpoint_id)
 
+    def _note_change(self, prefix_hash: int | None) -> None:
+        self.generation += 1
+        self._changes.append((self.generation, prefix_hash))
+
+    def changed_since(self, generation: int) -> set[int] | None:
+        """Hashes whose READY state may have changed after ``generation``.
+
+        None when that cannot be told: the log no longer reaches back that
+        far, or a `clear` touched every hash.
+        """
+        if generation >= self.generation:
+            return set()
+        if not self._changes or self._changes[0][0] > generation + 1:
+            return None
+        changed: set[int] = set()
+        for bumped_at, prefix_hash in reversed(self._changes):
+            if bumped_at <= generation:
+                break
+            if prefix_hash is None:
+                return None
+            changed.add(prefix_hash)
+        return changed
+
     def adopt_units(
         self, unit_ids: tuple[int, ...], owner: Hashable, prefix_hash: int
     ) -> bool:
@@ -453,7 +481,7 @@ class PageUnitCheckpointStore:
         self.records[checkpoint_id] = record
         self.hash_to_checkpoint[record.prefix_hash] = checkpoint_id
         self._lru[checkpoint_id] = None
-        self.generation += 1
+        self._note_change(record.prefix_hash)
         return True
 
     def complete_inflight(self) -> None:
@@ -475,7 +503,7 @@ class PageUnitCheckpointStore:
                 continue
             record.state = READY
             self.hash_to_checkpoint[record.prefix_hash] = checkpoint_id
-            self.generation += 1
+            self._note_change(record.prefix_hash)
             self._lru[checkpoint_id] = None
             self._queue_offload_store(checkpoint_id, record)
 
@@ -792,7 +820,7 @@ class PageUnitCheckpointStore:
             self._release_record(checkpoint_id)
 
     def unindex(self, prefix_hash: int) -> bool:
-        self.generation += 1
+        self._note_change(prefix_hash)
         checkpoint_id = self.hash_to_checkpoint.pop(prefix_hash, -1)
         if checkpoint_id < 0:
             checkpoint_id = self._pending_by_hash.pop(prefix_hash, -1)
@@ -809,7 +837,7 @@ class PageUnitCheckpointStore:
         return True
 
     def clear(self) -> None:
-        self.generation += 1
+        self._note_change(None)
         self.hash_to_checkpoint.clear()
         self._pending_by_hash.clear()
         self._lru.clear()
@@ -824,7 +852,7 @@ class PageUnitCheckpointStore:
         record = self.records[checkpoint_id]
         if record.state != READY or record.pin_count:
             raise AssertionError("only an unpinned READY checkpoint is evictable")
-        self.generation += 1
+        self._note_change(record.prefix_hash)
         if self.hash_to_checkpoint.get(record.prefix_hash) == checkpoint_id:
             del self.hash_to_checkpoint[record.prefix_hash]
         record.state = EVICTING
@@ -833,8 +861,8 @@ class PageUnitCheckpointStore:
         self.evictions += 1
 
     def _release_record(self, checkpoint_id: int) -> None:
-        self.generation += 1
         record = self.records.pop(checkpoint_id)
+        self._note_change(record.prefix_hash)
         self._lru.pop(checkpoint_id, None)
         if self.hash_to_checkpoint.get(record.prefix_hash) == checkpoint_id:
             del self.hash_to_checkpoint[record.prefix_hash]

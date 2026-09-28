@@ -228,18 +228,36 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         )
         floor = self._save_floor(exhausted)
         # Every tracked request asks every step. The answer changes only when
-        # its frontier moves or a checkpoint is published or dropped, so
-        # rescan only then instead of walking the prompt per step.
-        key = (frontier, floor, self._checkpoints.store.generation)
+        # its frontier moves or one of ITS boundary checkpoints is published or
+        # dropped, so rescan only then -- not whenever any request's
+        # checkpoint traffic moves the store.
+        store = self._checkpoints.store
         memo = getattr(seq, "_mp_save_frontier_memo", None)
-        if memo is not None and memo[0] == key:
-            return memo[1]
+        if memo is not None and memo[:2] == (frontier, floor):
+            changed = store.changed_since(memo[2])
+            boundaries = getattr(seq, "_mp_boundary_by_hash", {})
+            if changed is not None and not any(
+                floor < boundaries.get(prefix_hash, 0) <= frontier
+                for prefix_hash in changed
+            ):
+                seq._mp_save_frontier_memo = (
+                    frontier,
+                    floor,
+                    store.generation,
+                    memo[3],
+                )
+                return memo[3]
         found = 0
+        boundaries = getattr(seq, "_mp_boundary_by_hash", None)
+        if boundaries is None:
+            boundaries = seq._mp_boundary_by_hash = {}
         for boundary in range(frontier, floor, -self.chunk_size):
-            if self._checkpoints.contains(self._boundary_hash(seq, boundary)):
+            prefix_hash = self._boundary_hash(seq, boundary)
+            boundaries[prefix_hash] = boundary
+            if self._checkpoints.contains(prefix_hash):
                 found = boundary
                 break
-        seq._mp_save_frontier_memo = (key, found)
+        seq._mp_save_frontier_memo = (frontier, floor, store.generation, found)
         return found
 
     def _save_floor(self, lower: int) -> int:
