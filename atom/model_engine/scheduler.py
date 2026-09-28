@@ -2863,6 +2863,14 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         if not self._connector_flag("is_offload"):
             self._uncount_inflight_load(seq)
+            # P/D failure is terminal only after every remote writer drained.
+            # Re-admission allocates afresh; never retain the failed suffix or
+            # a first token/draft whose KV did not arrive.
+            self.block_manager.deallocate(seq)
+            seq.num_cached_tokens = 0
+            if seq.kv_transfer_params:
+                for key in ("first_token_id", "draft_token_ids", "chunked_transfer"):
+                    seq.kv_transfer_params.pop(key, None)
         if seq.offload_joint.load_hash != -1 or seq.offload_joint.boundary_tokens:
             # The state never arrived, so the boundary is not this request's
             # history. Disown it exactly as `BlockManager.allocate` does at
@@ -4749,6 +4757,9 @@ class Scheduler:
         is_producer = self._connector_flag("is_producer")
         is_offload = self._connector_flag("is_offload")
 
+        process_pd = getattr(self.kv_connector, "process_pd_completions", None)
+        if callable(process_pd):
+            kv_connector_output = process_pd(kv_connector_output)
         process_completions = getattr(self.kv_connector, "process_completions", None)
         if callable(process_completions):
             kv_connector_output = process_completions(kv_connector_output)
