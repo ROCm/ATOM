@@ -29,7 +29,11 @@ from atom.model_ops.qwen4_exp.ops.gated import (
     mix_gated_mean,
     scaled_silu,
 )
-from atom.model_ops.qwen4_exp.ops.hc_fused import hc_combine_norm, hc_gated_mean, hc_rows
+from atom.model_ops.qwen4_exp.ops.hc_fused import (
+    hc_combine_norm,
+    hc_gated_mean,
+    hc_rows,
+)
 
 # The fused path is the only one the served model takes: `process_weights_after_loading`
 # always builds the `[down | inject]` weight and the decoder layer always defers the

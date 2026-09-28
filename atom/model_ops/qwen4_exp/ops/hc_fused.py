@@ -32,8 +32,14 @@ COMBINE_NORM_ROWS_MIN_M = 256
 
 @triton.jit
 def _hc_row_chunk(
-    h_ptr, block_ptr, stride_block, base, k0, inj,
-    COMBINE: tl.constexpr, BK: tl.constexpr,
+    h_ptr,
+    block_ptr,
+    stride_block,
+    base,
+    k0,
+    inj,
+    COMBINE: tl.constexpr,
+    BK: tl.constexpr,
 ):
     ks = k0 + tl.arange(0, BK)
     x = tl.load(h_ptr + base + ks)
@@ -55,8 +61,16 @@ def _hc_w_chunk(w_ptr, ns, nmask, k0, KTOT: tl.constexpr, BK: tl.constexpr):
 
 @triton.jit
 def _hc_norm_dot(
-    x, w, rstd, norm_w_ptr, h_out_ptr, normed_ptr, k0, pid_n,
-    COMBINE: tl.constexpr, BK: tl.constexpr,
+    x,
+    w,
+    rstd,
+    norm_w_ptr,
+    h_out_ptr,
+    normed_ptr,
+    k0,
+    pid_n,
+    COMBINE: tl.constexpr,
+    BK: tl.constexpr,
 ):
     ks = k0 + tl.arange(0, BK)
     g = tl.load(norm_w_ptr + ks).to(tl.float32) + 1.0
@@ -123,11 +137,66 @@ def _hc_pre_kernel(
     sumsq = tl.sum(x0 * x0, 0) + tl.sum(x1 * x1, 0) + tl.sum(x2 * x2, 0)
     sumsq += tl.sum(x3 * x3, 0) + tl.sum(x4 * x4, 0)
     rstd = tl.math.rsqrt(sumsq / H + eps)
-    acc = _hc_norm_dot(x0, w0, rstd, norm_w_ptr, h_out_ptr, normed_ptr, base + 0 * BK, pid_n, COMBINE, BK)
-    acc += _hc_norm_dot(x1, w1, rstd, norm_w_ptr, h_out_ptr, normed_ptr, base + 1 * BK, pid_n, COMBINE, BK)
-    acc += _hc_norm_dot(x2, w2, rstd, norm_w_ptr, h_out_ptr, normed_ptr, base + 2 * BK, pid_n, COMBINE, BK)
-    acc += _hc_norm_dot(x3, w3, rstd, norm_w_ptr, h_out_ptr, normed_ptr, base + 3 * BK, pid_n, COMBINE, BK)
-    acc += _hc_norm_dot(x4, w4, rstd, norm_w_ptr, h_out_ptr, normed_ptr, base + 4 * BK, pid_n, COMBINE, BK)
+    acc = _hc_norm_dot(
+        x0,
+        w0,
+        rstd,
+        norm_w_ptr,
+        h_out_ptr,
+        normed_ptr,
+        base + 0 * BK,
+        pid_n,
+        COMBINE,
+        BK,
+    )
+    acc += _hc_norm_dot(
+        x1,
+        w1,
+        rstd,
+        norm_w_ptr,
+        h_out_ptr,
+        normed_ptr,
+        base + 1 * BK,
+        pid_n,
+        COMBINE,
+        BK,
+    )
+    acc += _hc_norm_dot(
+        x2,
+        w2,
+        rstd,
+        norm_w_ptr,
+        h_out_ptr,
+        normed_ptr,
+        base + 2 * BK,
+        pid_n,
+        COMBINE,
+        BK,
+    )
+    acc += _hc_norm_dot(
+        x3,
+        w3,
+        rstd,
+        norm_w_ptr,
+        h_out_ptr,
+        normed_ptr,
+        base + 3 * BK,
+        pid_n,
+        COMBINE,
+        BK,
+    )
+    acc += _hc_norm_dot(
+        x4,
+        w4,
+        rstd,
+        norm_w_ptr,
+        h_out_ptr,
+        normed_ptr,
+        base + 4 * BK,
+        pid_n,
+        COMBINE,
+        BK,
+    )
     tl.store(part_ptr + s * NOUT + ns, acc, mask=nmask)
 
 
@@ -188,7 +257,7 @@ def _hc_mix_kernel(
     total += _gated_stream(w2, gate, normed_ptr + 2 * H + hs, dt)
     total += _gated_stream(w3, gate, normed_ptr + 3 * H + hs, dt)
     tl.store(mixed_ptr + hs, (total / HC).to(dt))
-    if HAS_INJECT:
+    if HAS_INJECT:  # noqa: SIM102 -- compile-time guard for the inject branch
         if pid_h == 0:
             cs = tl.arange(0, HC)
             acc = tl.zeros((HC,), dtype=tl.float32)
@@ -235,8 +304,17 @@ def hc_gated_mean(normed: torch.Tensor, gate: torch.Tensor, hc: int) -> torch.Te
     rb, bh = 4, 512
     if m and hidden % bh == 0 and gate.stride(0) == normed.stride(0):
         _hc_gated_mean_tiled_kernel[(triton.cdiv(m, rb), hidden // bh)](
-            normed, gate, out, m, normed.stride(0), out.stride(0),
-            H=hidden, HC=hc, RB=rb, BH=bh, num_warps=4,
+            normed,
+            gate,
+            out,
+            m,
+            normed.stride(0),
+            out.stride(0),
+            H=hidden,
+            HC=hc,
+            RB=rb,
+            BH=bh,
+            num_warps=4,
         )
         return out
     from atom.model_ops.qwen4_exp.ops.gated import mix_gated_mean
@@ -322,7 +400,9 @@ def _hc_combine_norm_rows_kernel(
     cb = BA + tl.arange(0, BB)[None, :]
     inj = tl.zeros((RB,), dtype=tl.float32)
     if COMBINE:
-        raw = tl.load(raw_ptr + rows.to(tl.int64) * stride_raw + s, mask=rows < M, other=0.0)
+        raw = tl.load(
+            raw_ptr + rows.to(tl.int64) * stride_raw + s, mask=rows < M, other=0.0
+        )
         raw = (raw.to(tl.float32) / HC).to(raw_ptr.dtype.element_ty).to(tl.float32)
         inj = 2.0 * tl.sigmoid(raw)
     oh = r64 * stride_h + s * H
@@ -389,7 +469,9 @@ def hc_rows(
         num_warps=4,
     )
     mixed = torch.empty((m, hidden), dtype=h.dtype, device=h.device)
-    raw_out = torch.empty((m, hc), dtype=h.dtype, device=h.device) if has_inject else None
+    raw_out = (
+        torch.empty((m, hc), dtype=h.dtype, device=h.device) if has_inject else None
+    )
     bh = 16
     _hc_mix_kernel[(triton.cdiv(hidden, bh), m)](
         part,

@@ -702,14 +702,26 @@ def _qsa_paged_mqa_logits_kernel(
         tl.store(visible_groups_ptr + token, visible_groups)
         if row_starts_ptr is not None:
             tl.store(row_starts_ptr + token, 0)
-    q0 = tl.load(q_ptr + token * stride_q_token + dims * stride_q_dim,
-                 mask=dims < HEAD_DIM, other=0.0).to(tl.float32)
-    q1 = tl.load(q_ptr + token * stride_q_token + stride_q_head + dims * stride_q_dim,
-                 mask=(dims < HEAD_DIM) & (NUM_HEADS > 1), other=0.0).to(tl.float32)
-    q2 = tl.load(q_ptr + token * stride_q_token + 2 * stride_q_head + dims * stride_q_dim,
-                 mask=(dims < HEAD_DIM) & (NUM_HEADS > 2), other=0.0).to(tl.float32)
-    q3 = tl.load(q_ptr + token * stride_q_token + 3 * stride_q_head + dims * stride_q_dim,
-                 mask=(dims < HEAD_DIM) & (NUM_HEADS > 3), other=0.0).to(tl.float32)
+    q0 = tl.load(
+        q_ptr + token * stride_q_token + dims * stride_q_dim,
+        mask=dims < HEAD_DIM,
+        other=0.0,
+    ).to(tl.float32)
+    q1 = tl.load(
+        q_ptr + token * stride_q_token + stride_q_head + dims * stride_q_dim,
+        mask=(dims < HEAD_DIM) & (NUM_HEADS > 1),
+        other=0.0,
+    ).to(tl.float32)
+    q2 = tl.load(
+        q_ptr + token * stride_q_token + 2 * stride_q_head + dims * stride_q_dim,
+        mask=(dims < HEAD_DIM) & (NUM_HEADS > 2),
+        other=0.0,
+    ).to(tl.float32)
+    q3 = tl.load(
+        q_ptr + token * stride_q_token + 3 * stride_q_head + dims * stride_q_dim,
+        mask=(dims < HEAD_DIM) & (NUM_HEADS > 3),
+        other=0.0,
+    ).to(tl.float32)
     tl.static_assert(NUM_HEADS <= 4)
     num_tiles = tl.cdiv(tl.minimum(visible_groups, num_columns), BLOCK_N)
     for tile in range(tl.program_id(1), num_tiles, tl.num_programs(1)):
@@ -900,7 +912,9 @@ def _qsa_paged_mqa_logits_mfma_kernel(
         score = tl.where((safe_request == req)[:, None], s, score)
     score = score / score_divisor
     tl.store(
-        logits_ptr + rows[:, None].to(tl.int64) * stride_logits_token + columns[None, :],
+        logits_ptr
+        + rows[:, None].to(tl.int64) * stride_logits_token
+        + columns[None, :],
         tl.where(columns[None, :] < visible[:, None], score, -float("inf")),
         mask=rvalid[:, None] & (columns < num_columns)[None, :],
     )
@@ -1029,7 +1043,9 @@ def qsa_paged_mqa_logits(
             num_warps=4,
         )
         return logits, visible_groups
-    column_programs = min(triton.cdiv(columns, _SCORING_BLOCK_N), _SCORING_COLUMN_PROGRAMS)
+    column_programs = min(
+        triton.cdiv(columns, _SCORING_BLOCK_N), _SCORING_COLUMN_PROGRAMS
+    )
     _qsa_paged_mqa_logits_kernel[(q.shape[0], column_programs)](
         q,
         compressed_k_cache,
