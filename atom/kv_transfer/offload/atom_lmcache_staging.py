@@ -5,12 +5,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+
+logger = logging.getLogger("atom")
 
 
 def memory_object_as_uint8(memory_obj: Any, nbytes: int) -> torch.Tensor:
@@ -100,8 +103,14 @@ class _ThreadTransferState:
         self,
         device: torch.device,
         use_cuda: bool,
+        compute_stream=None,
     ) -> None:
         self.device = device
+        # The stream the model's forward runs on, recorded on the forward
+        # thread by `BlockGPUConnector.note_compute_stream`.  It cannot be
+        # discovered from here: this object is built lazily on a save/load
+        # worker thread, and `torch.cuda.current_stream` is thread-local.
+        self.compute_stream = compute_stream
         self.pack_stream = None
         self.copy_stream = None
         if use_cuda:
@@ -114,6 +123,9 @@ class _ThreadTransferState:
         if stream is None:
             return _NullCtx()
         return torch.cuda.stream(stream)
+
+
+_COMPUTE_STREAM_WARNED = False
 
 
 def _compute_stream_for(state) -> Any:
@@ -132,7 +144,24 @@ def _compute_stream_for(state) -> Any:
     device = getattr(state, "device", None)
     if device is None or not torch.cuda.is_available():
         return None
-    return torch.cuda.current_stream(device=device)
+    stream = getattr(state, "compute_stream", None)
+    if stream is None or stream == torch.cuda.default_stream(device=device):
+        # Not a fallback: fencing against the default stream is precisely the
+        # bug this reports.  vLLM runs the forward on a dedicated non-default
+        # stream, so either value here means the recording on the forward
+        # thread did not happen and the pipeline below is unfenced.
+        global _COMPUTE_STREAM_WARNED
+        if not _COMPUTE_STREAM_WARNED:
+            _COMPUTE_STREAM_WARNED = True
+            logger.error(
+                "offload staging has no forward stream to fence against "
+                "(got %s, default is %s); saves may read KV the forward has "
+                "not finished writing",
+                stream,
+                torch.cuda.default_stream(device=device),
+            )
+        return None
+    return stream
 
 
 @dataclass(frozen=True)
