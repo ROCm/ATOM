@@ -349,6 +349,9 @@ jobs:
         env:
           ATOMESH_NODE_POOL: pit2-p03-g13,pit2-p03-g23
         run: python3 .github/scripts/atomesh/k3_gpu_inventory.py 4662
+      - name: Release the completed K3 allocation after validating its identity and cleanup
+        if: ${{ inputs.inspect_run_id == '36368471573' }}
+        run: python3 .github/scripts/atomesh/k3_spur_finished_job.py
       - name: Inspect alternate MI355X resource access
         if: ${{ inputs.atomesh_slurm_submit_runner == 'atomesh-cicd-mi355-crusoe' }}
         run: |
