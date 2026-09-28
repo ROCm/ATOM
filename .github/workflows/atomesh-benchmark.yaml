@@ -82,27 +82,16 @@ on:
 
           GLM:
             glm-52-mxfp4-1p1d-tp4,glm-52-mxfp4-1p1d-tp8,
-            glm-52-mxfp4-1p1d-tp4-agentic-1m-c1,glm-52-mxfp4-1p1d-tp4-agentic-1m-c2,
-            glm-52-mxfp4-1p1d-tp4-agentic-1m-c4,glm-52-mxfp4-1p1d-tp4-agentic-1m-c8,
-            glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c32,
-            glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c40,
             glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c48,
-            glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c56,
-            glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c24,
-            glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c32,
-            glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c48
+            glm-52-mxfp4-1p1d-cpp4-dpa4-agentic-lmcache-1m-c36,
+            glm-52-mxfp4-1p1d-cpp4-dpa4-agentic-lmcache-1m-c40,
+            glm-52-mxfp4-1p2d-cpp4-dpa4-agentic-lmcache-1m-c48,
+            glm-52-mxfp4-1p2d-cpp4-dpa4-agentic-lmcache-1m-c56
 
-          GLM agentic_multi_decode (1P3D/1P5D):
+          GLM agentic_multi_decode (1P3D):
             glm-52-mxfp4-1p3d-cpp4-tp4-mtp5-agentic-lmcache-1m-c12,
             glm-52-mxfp4-1p3d-cpp4-tp4-mtp5-agentic-lmcache-1m-c16,
-            glm-52-mxfp4-1p3d-cpp4-tp4-mtp5-agentic-lmcache-1m-c20,
-            glm-52-mxfp4-1p3d-cpp4-tp4-mtp5-agentic-lmcache-1m-c24,
-            glm-52-mxfp4-1p3d-cpp4-tp4-mtp5-agentic-lmcache-1m-c32,
-            glm-52-mxfp4-1p5d-cpp4-tp4-mtp5-agentic-lmcache-1m-c12,
-            glm-52-mxfp4-1p5d-cpp4-tp4-mtp5-agentic-lmcache-1m-c16,
-            glm-52-mxfp4-1p5d-cpp4-tp4-mtp5-agentic-lmcache-1m-c20,
-            glm-52-mxfp4-1p5d-cpp4-tp4-mtp5-agentic-lmcache-1m-c24,
-            glm-52-mxfp4-1p5d-cpp4-tp4-mtp5-agentic-lmcache-1m-c32
+            glm-52-mxfp4-1p3d-cpp4-tp4-mtp5-agentic-lmcache-1m-c24
 
           Kimi-K3:
             kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c1,
