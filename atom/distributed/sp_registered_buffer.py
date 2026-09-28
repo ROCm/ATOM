@@ -40,33 +40,3 @@ def registered_input_view(group, shape, dtype):
     if not ca.should_custom_ag(transport):
         return None
     return result, ca
-
-
-def quantize_gather_moe_input(x, group):
-    """Write MXFP4 into registered scratch, then immediately gather its bytes.
-
-    The caller has already verified the unshuffled per-1x32 MXFP4 contract.
-    Scales retain their existing allocation and later gather. This removes the
-    large payload staging copy without an additional pack/unpack kernel.
-    """
-    from aiter import dtypes
-    from aiter.ops.quant import dynamic_per_group_scaled_quant
-
-    if x.ndim != 2 or x.dtype != torch.bfloat16 or x.shape[1] != 6144:
-        return None
-    if x.shape[0] < 2048 or torch.cuda.is_current_stream_capturing():
-        return None
-    candidate = registered_input_view(
-        group, (x.shape[0], x.shape[1] // 2), dtypes.fp4x2
-    )
-    if candidate is None:
-        return None
-    quantized, ca = candidate
-    scale = torch.empty(
-        (x.shape[0], x.shape[1] // 32), device=x.device, dtype=dtypes.fp8_e8m0
-    )
-    dynamic_per_group_scaled_quant(quantized, x, scale, 32, shuffle_scale=False)
-    gathered = ca.all_gather_reg(quantized.view(torch.bfloat16), dim=0).view(
-        dtypes.fp4x2
-    )
-    return gathered, scale

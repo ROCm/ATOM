@@ -8,11 +8,6 @@ import pytest
 from atom.distributed import ulysses_sp
 
 
-def test_registration_flag_defaults_off(monkeypatch):
-    monkeypatch.delenv("ATOM_SP_REGISTER_GRAPH_INPUTS", raising=False)
-    assert not ulysses_sp.envs.environment_variables["ATOM_SP_REGISTER_GRAPH_INPUTS"]()
-
-
 def _group(actions, *, disabled=False, already_capturing=False):
     ca = SimpleNamespace(disabled=disabled, _IS_CAPTURING=already_capturing)
 
@@ -36,15 +31,12 @@ def _group(actions, *, disabled=False, already_capturing=False):
 
 
 def _enable(monkeypatch, group):
-    monkeypatch.setenv("ATOM_SP_REGISTER_GRAPH_INPUTS", "1")
     monkeypatch.setattr(ulysses_sp, "_SP_WORLD_SIZE", 4)
     monkeypatch.setattr(ulysses_sp, "get_sp_group", lambda: group)
 
 
-@pytest.mark.parametrize("enabled,world_size", [(False, 4), (True, 1)])
-def test_disabled_paths_do_not_resolve_group(monkeypatch, enabled, world_size):
-    monkeypatch.setenv("ATOM_SP_REGISTER_GRAPH_INPUTS", "1" if enabled else "0")
-    monkeypatch.setattr(ulysses_sp, "_SP_WORLD_SIZE", world_size)
+def test_non_sp_path_does_not_resolve_group(monkeypatch):
+    monkeypatch.setattr(ulysses_sp, "_SP_WORLD_SIZE", 1)
 
     def forbidden():
         raise AssertionError(

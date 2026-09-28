@@ -54,7 +54,7 @@ def sp_graph_capture(capture_context):
     """
     from contextlib import nullcontext
 
-    if not envs.ATOM_SP_REGISTER_GRAPH_INPUTS or not sp_is_enabled():
+    if not sp_is_enabled():
         return nullcontext()
     group = get_sp_group()
     ca_comm = getattr(getattr(group, "device_communicator", None), "ca_comm", None)
@@ -183,7 +183,7 @@ def ulysses_gather_heads(x: torch.Tensor) -> torch.Tensor:
 
 def _swap_heads(x, s_local, width):
     """``[w*s_local, width] -> [s_local, w*width]`` by all-to-all."""
-    if envs.ATOM_SP_HEAD_EXCHANGE:
+    if x.is_cuda:
         from atom.distributed.sp_head_exchange import (
             exchange_heads,
             head_exchange_communicator,
@@ -209,17 +209,16 @@ def sp_moe_gather(x: torch.Tensor) -> torch.Tensor:
 
 
 def sp_moe_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
-    """Sum expert contributions in the input dtype and keep this token shard."""
+    """Sum expert contributions, honoring the communicator's reduction policy."""
     if _SP_WORLD_SIZE <= 1:
         return x
     x = x.contiguous()
     group = get_sp_group()
-    if envs.ATOM_SP_QUICK_REDUCE_SCATTER:
-        from atom.distributed.quick_reduce_scatter import try_quick_reduce_scatter
+    from atom.distributed.quick_reduce_scatter import try_quick_reduce_scatter
 
-        out = try_quick_reduce_scatter(x, group)
-        if out is not None:
-            return out
+    out = try_quick_reduce_scatter(x, group)
+    if out is not None:
+        return out
     # The generic communicator allocates a second output and copies it even
     # for dim=0. PyNccl can write the final token shard directly.
     if not _custom_reduce_scatter_ok(x, group):
