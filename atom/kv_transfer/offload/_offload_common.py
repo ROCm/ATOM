@@ -507,6 +507,7 @@ class OffloadSchedulerMixin(ABC):
         self.total_leased_source_blocks = 0  # ever protected by a save lease
         self.total_source_safe_released_blocks = 0  # freed once their save reported
         self.total_abnormal_lease_reclaims = 0  # freed by stall timeout, no report
+        self.total_truncated_late_saves = 0  # final save lost evicted prefix blocks
 
     def process_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
         """Apply offload-specific completions and expose plain request IDs."""
@@ -633,6 +634,7 @@ class OffloadSchedulerMixin(ABC):
                 source_safe_released_blocks=self.total_source_safe_released_blocks,
                 blocks_waiting_for_store=self.blocks_waiting_for_store(),
                 abnormal_lease_reclaims=self.total_abnormal_lease_reclaims,
+                truncated_late_saves=self.total_truncated_late_saves,
             )
         return statistics
 

@@ -381,6 +381,7 @@ class TestIncrementalLeaseRelease:
         scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
         released = []
         scheduler._block_manager = SimpleNamespace(
+            enable_prefix_caching=True,
             acquire_offload_prefix=lambda *_args: (
                 [1, 33, 65, -1],
                 12,
@@ -433,6 +434,7 @@ class TestIncrementalLeaseRelease:
         assert scheduler.build_connector_meta().requests == []
         assert scheduler.protected_block_ids(seq) == frozenset()
         assert bm.kv.num_used == 1
+        assert scheduler.get_statistics()["truncated_late_saves"] == 1
 
     def test_late_save_persists_the_short_tail_of_a_long_request(self, monkeypatch):
         """The tail after earlier saves is stored however short it is."""
@@ -469,6 +471,35 @@ class TestIncrementalLeaseRelease:
         end = len(final.token_ids) // 4
         assert final.block_ids[start:end] == [2, 3]
         assert set(final.block_ids[start:end]) <= leased
+
+    def test_without_prefix_caching_teardown_leases_the_final_save_source(
+        self, monkeypatch
+    ):
+        """With prefix caching off nothing is hash-indexed, so reacquiring would
+        find nothing and silently drop the final save; teardown leases the
+        unemitted suffix instead and the save reads those blocks."""
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        bm = BlockManager(
+            MockConfig(
+                num_kvcache_blocks=24,
+                kv_cache_block_size=4,
+                enable_prefix_caching=False,
+            )
+        )
+        scheduler.bind_block_manager(bm)
+        seq = Sequence(list(range(16)), 4, id=108)
+        assert bm.allocate(seq, bm.can_allocate(seq))
+        table = list(seq.block_table)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 16
+        leased = _finish_and_lease(scheduler, seq)
+        assert leased == frozenset(table)
+        bm.deallocate_partial(seq, leased)
+
+        [final] = scheduler.build_connector_meta().requests
+        assert final.save_spec.skip_leading_tokens == 0
+        assert final.block_ids[:4] == table
+        assert scheduler.get_statistics()["truncated_late_saves"] == 0
 
 
 class TestTPQuorum:

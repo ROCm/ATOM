@@ -433,12 +433,26 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         del seq, saved
         return self._chunk_floor(available)
 
+    def _reacquires_late_source(self) -> bool:
+        """Whether a finished request's final save reacquires its prefix by hash.
+
+        Only a bound `BlockManager` with prefix caching has a hash index to
+        reacquire through. Without one (the vLLM plugin, or
+        `--no-enable_prefix_caching`) teardown instead leases the unemitted
+        suffix of the frozen block table, and the final save reads exactly
+        those leased blocks.
+        """
+        manager = self._block_manager
+        return manager is not None and bool(
+            getattr(manager, "enable_prefix_caching", False)
+        )
+
     def _late_save_source(
         self, seq, saved: int, aligned: int
     ) -> tuple[int, list[int], frozenset[int]] | None:
         """Reacquire a finished request's still-resident prefix at admission."""
-        if self._block_manager is None:
-            raise RuntimeError("late offload save requires a bound block manager")
+        if not self._reacquires_late_source():
+            raise RuntimeError("late offload save requires a prefix-cache index")
         block_ids, available, claimed = self._block_manager.acquire_offload_prefix(
             seq, saved, aligned
         )
@@ -449,6 +463,16 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         drop = claimed[keep_count:]
         if drop:
             self._block_manager.free_leased_blocks(drop)
+        if available < aligned:
+            # A block of the prefix was evicted (or reused) between teardown
+            # and admission, so the final save stores less than was computed.
+            self.total_truncated_late_saves += 1
+            logger.debug(
+                "Late offload save of seq %s found %d of %d tokens resident",
+                seq.id,
+                available,
+                aligned,
+            )
         if target <= saved:
             # Nothing savable is still resident (or no boundary qualifies):
             # retire the request rather than emit an empty save forever.
@@ -580,9 +604,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             save_operation = SaveOperationId(seq.id, self._save_nonce)
             self._save_nonce += 1
             late_acquired = frozenset()
-            if (
-                getattr(seq, "_offload_finished", False)
-                and self._block_manager is not None
+            if getattr(seq, "_offload_finished", False) and (
+                self._reacquires_late_source()
             ):
                 late_source = self._late_save_source(seq, saved, aligned)
                 if late_source is None:
@@ -666,13 +689,13 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         does not support exact leases, or a load is in flight, since a load also
         touches HBM blocks this connector does not track per-range) -- the
         scheduler falls back to deferring the whole request. This includes a
-        final save that has not been emitted yet. With a bound `BlockManager`
-        (the ATOM engine) teardown freezes its token identity and computed
-        frontier but protects no physical PAGE: admission reacquires the
-        still-canonical prefix through the hash index. Without one (the vLLM
-        plugin, where vLLM owns the blocks) there is nothing to reacquire
-        through, so teardown freezes the block table and leases the unemitted
-        suffix, and the final save reads exactly those leased blocks.
+        final save that has not been emitted yet. When the prefix can be
+        reacquired by hash (`_reacquires_late_source`) teardown freezes its
+        token identity and computed frontier but protects no physical PAGE:
+        admission reacquires the still-canonical prefix through the index.
+        Otherwise there is nothing to reacquire through, so teardown freezes
+        the block table and leases the unemitted suffix, and the final save
+        reads exactly those leased blocks.
         """
         if not self._early_release or self._has_active_load(seq):
             return None
@@ -691,7 +714,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 block_id for block_id in blocks.values() if block_id not in safe
             )
 
-        if self._block_manager is None:
+        if not self._reacquires_late_source():
             table = list(getattr(seq, "_offload_finished_block_ids", seq.block_table))
             seq._offload_finished_block_ids = table
             entry = self._save_tracker.get(str(seq.id))

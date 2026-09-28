@@ -114,6 +114,7 @@ def make_scheduler(
     )
     manager = SimpleNamespace(
         paged_state_checkpoints=checkpoints,
+        enable_prefix_caching=True,
         hash_block_size=4,
         compute_hash=BlockManager.compute_hash,
     )
