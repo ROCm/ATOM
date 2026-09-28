@@ -5,21 +5,10 @@ import numpy as np
 import torch
 
 from atom.model_ops.attentions.pool_layout.paged_state_copy import (
+    DescriptorStaging,
     launch_copy_descriptor,
     plan_segmented_copy,
 )
-from atom.utils import CpuGpuBuffer
-
-
-class _DescriptorStaging:
-    """One pinned descriptor buffer and the event fencing its last upload."""
-
-    def __init__(self, rows, device, pin_memory):
-        self.buffer = CpuGpuBuffer(
-            rows, 3, dtype=torch.int64, device=device, pin_memory=pin_memory
-        )
-        self.upload_done = torch.cuda.Event() if pin_memory else None
-        self.pending = False
 
 
 class StateCopies:
@@ -44,23 +33,10 @@ class StateCopies:
             ],
             spec.image_bytes,
         )
-        self._staging_rows = 2 * max_batch * self.plan.num_spans
-        # Slot 0 serves `build()`; each other descriptor slot is an independent
-        # buffer, so an out-of-band restore never overwrites a step's staging.
-        self._stagings = {0: self._new_staging()}
-
-    def _new_staging(self):
-        return _DescriptorStaging(
-            self._staging_rows, self.cache.pool.device, self.cache.pool.is_cuda
+        self.staging = DescriptorStaging(
+            2 * max_batch * self.plan.num_spans, cache.pool.device
         )
-
-    def staging(self, descriptor_slot=0):
-        if descriptor_slot < 0:
-            raise ValueError("checkpoint descriptor slot must be non-negative")
-        staging = self._stagings.get(descriptor_slot)
-        if staging is None:
-            staging = self._stagings[descriptor_slot] = self._new_staging()
-        return staging
+        self.staging.reserve([0])
 
     def entry(self, slot):
         self.cache.require_committed()
@@ -114,12 +90,10 @@ class StateCopies:
                             )
                             at += take
             return
-        staging = self.staging(descriptor_slot)
+        rows = self.staging.rows(descriptor_slot)
         total = (len(stores) + len(restores)) * self.plan.num_spans
-        if total > staging.buffer.np.shape[0]:
+        if total > rows.shape[0]:
             raise ValueError("Checkpoint copy batch exceeds descriptor capacity")
-        if staging.pending:
-            staging.upload_done.synchronize()
         at = 0
         for ops, storing in ((stores, True), (restores, False)):
             if not ops:
@@ -144,12 +118,10 @@ class StateCopies:
                 dtype=np.int64,
             )
             self.plan.write_descriptor(
-                staging.buffer.np[at:end], slot_bases, page_bases, forward=storing
+                rows[at:end], slot_bases, page_bases, forward=storing
             )
             at = end
-        descriptor = staging.buffer.copy_to_gpu(total)
-        staging.upload_done.record()
-        staging.pending = True
+        descriptor = self.staging.upload(descriptor_slot, total)
         cut = len(stores) * self.plan.num_spans
         # Restore may consume an image stored in this same maintenance batch.
         launch_copy_descriptor(descriptor[:cut], self.plan)
@@ -167,13 +139,9 @@ class StateCopies:
                 offsets.append(at)
                 at += size
         dst = np.asarray([[slot.data_ptr() + off for off in offsets]], dtype=np.int64)
-        staging = self.staging(0)
         self.plan.write_descriptor(
-            staging.buffer.np[: self.plan.num_spans],
+            self.staging.rows(0)[: self.plan.num_spans],
             np.asarray([[slot.data_ptr()]], dtype=np.int64),
             dst,
         )
-        descriptor = staging.buffer.copy_to_gpu(self.plan.num_spans)
-        staging.upload_done.record()
-        staging.pending = True
-        launch_copy_descriptor(descriptor, self.plan)
+        launch_copy_descriptor(self.staging.upload(0, self.plan.num_spans), self.plan)

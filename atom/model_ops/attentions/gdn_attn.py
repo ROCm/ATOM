@@ -832,14 +832,15 @@ class GDNStateMixin(PoolRowsMixin):
         slot_bases = self._checkpoint_slot_bases()
         per_op = plan.num_spans
         total = (len(store_ops) + len(restore_ops)) * per_op
-        staging = self._checkpoint_descriptor_buffer(descriptor_slot)
-        if total > staging.np.shape[0]:
+        staging = self._checkpoint_staging()
+        rows = staging.rows(descriptor_slot)
+        if total > rows.shape[0]:
             raise RuntimeError(
                 f"a step asked to copy {total // per_op} checkpoints, more "
-                f"than the {staging.np.shape[0] // per_op} its descriptor was "
+                f"than the {rows.shape[0] // per_op} its descriptor was "
                 "sized for"
             )
-        descriptor = staging.np[:total]
+        descriptor = rows[:total]
         at = 0
         for ops, storing in ((store_ops, True), (restore_ops, False)):
             if not ops:
@@ -853,7 +854,7 @@ class GDNStateMixin(PoolRowsMixin):
                 forward=storing,
             )
             at = end
-        launch_copy_descriptor(staging.copy_to_gpu(total), plan)
+        launch_copy_descriptor(staging.upload(descriptor_slot, total), plan)
 
     def warmup_per_req_cache(self) -> None:
         """Run one checkpoint copy now, so the first real one is only a copy.
@@ -876,13 +877,13 @@ class GDNStateMixin(PoolRowsMixin):
         plan = self._checkpoint_copy_plan()
         if not plan.num_spans:
             return
-        staging = self._checkpoint_descriptor_buffer()
+        staging = self._checkpoint_staging()
         plan.write_descriptor(
-            staging.np[: plan.num_spans],
+            staging.rows(0)[: plan.num_spans],
             self._checkpoint_slot_bases()[:1],
             self._page_unit_bases([list(range(spec.units_per_checkpoint))]),
         )
-        launch_copy_descriptor(staging.copy_to_gpu(plan.num_spans), plan)
+        launch_copy_descriptor(staging.upload(0, plan.num_spans), plan)
 
     def state_entry_views(self, slot: int) -> list[torch.Tensor]:
         """One contiguous slice per (cache, layer) — the slot's whole state.

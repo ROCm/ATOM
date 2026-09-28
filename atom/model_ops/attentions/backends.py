@@ -23,6 +23,7 @@ from atom.model_engine.page_unit_checkpoint import (
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAModules
+from atom.model_ops.attentions.pool_layout.paged_state_copy import DescriptorStaging
 from atom.model_ops.attentions.pool_layout.pool_rows import PoolRowsMixin
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import SubPoolSpec
 from atom.model_ops.attentions.token_layout.batch_ids import (
@@ -362,8 +363,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         mid-serving restore would stall its thread. A connector that will pass
         these slots to `execute_paged_state_copies` reserves them up front.
         """
-        for descriptor_slot in descriptor_slots:
-            self._checkpoint_descriptor_buffer(descriptor_slot)
+        self._checkpoint_staging().reserve(descriptor_slots)
 
     def _checkpoint_descriptor_device(self) -> torch.device:
         """Device of the planes `execute_paged_state_copies` copies between."""
@@ -371,7 +371,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
             f"{type(self).__name__} does not implement PAGE-backed state copy"
         )
 
-    def _checkpoint_descriptor_buffer(self, descriptor_slot: int = 0) -> CpuGpuBuffer:
+    def _checkpoint_staging(self) -> DescriptorStaging:
         """Pinned staging for a step's whole descriptor, sized for the worst step.
 
         Pinned because the alternative synchronizes: a pageable H2D from
@@ -391,26 +391,17 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         storing one of them from the wrong slot besides; the two constraints
         have the same owner and move together.
 
-        Slot 0 serves `build()`; each other `descriptor_slot` is a separate
-        buffer, so an out-of-band restore never shares staging with a step.
+        Slot 0 serves `build()`; each other descriptor slot is a separate,
+        separately fenced buffer (see `DescriptorStaging`).
         """
-        if descriptor_slot < 0:
-            raise ValueError("checkpoint descriptor slot must be non-negative")
-        descriptors = getattr(self, "_checkpoint_descriptors", None)
-        if descriptors is None:
-            descriptors = self._checkpoint_descriptors = {}
-        descriptor = descriptors.get(descriptor_slot)
-        if descriptor is None:
+        staging = getattr(self, "_checkpoint_staging_cache", None)
+        if staging is None:
             plan = self._checkpoint_copy_plan()
             max_ops = 2 * int(self.model_runner.config.max_num_seqs)
-            descriptor = CpuGpuBuffer(
-                max_ops * plan.num_spans,
-                3,
-                dtype=torch.int64,
-                device=self._checkpoint_descriptor_device(),
+            staging = self._checkpoint_staging_cache = DescriptorStaging(
+                max_ops * plan.num_spans, self._checkpoint_descriptor_device()
             )
-            descriptors[descriptor_slot] = descriptor
-        return descriptor
+        return staging
 
     def warmup_per_req_cache(self) -> None:
         """Pay whatever the first checkpoint copy would pay, before serving.

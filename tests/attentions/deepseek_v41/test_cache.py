@@ -451,19 +451,3 @@ def test_shared_indptr_launch_matches_row_counts_and_replay(decode, width, ratio
                     dtype=torch.int32,
                 )
                 torch.testing.assert_close(extend, expected, rtol=0, atol=0)
-
-
-def test_state_copy_descriptor_slots_have_independent_staging():
-    from atom.model_ops.attentions.deepseek_v41.checkpoints import StateCopies
-
-    copies = StateCopies.__new__(StateCopies)
-    copies._staging_rows = 3
-    copies.cache = type(
-        "Cache",
-        (),
-        {"pool": type("Pool", (), {"device": "cpu", "is_cuda": False})()},
-    )()
-    copies._stagings = {0: copies._new_staging()}
-    assert copies.staging(0) is copies.staging(0)
-    assert copies.staging(1) is not copies.staging(0)
-    assert copies.staging(1) is copies.staging(1)

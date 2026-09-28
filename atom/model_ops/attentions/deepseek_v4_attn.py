@@ -80,6 +80,7 @@ from atom.model_ops.attentions.pool_layout.entry_arena import (
     plan_regions,
 )
 from atom.model_ops.attentions.pool_layout.paged_state_copy import (
+    DescriptorStaging,
     SegmentedCopyPlan,
     launch_copy_descriptor,
     plan_segmented_copy,
@@ -730,7 +731,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._page_unit_region_owners: tuple[int, ...] = ()
         self._checkpoint_plan_cache: SegmentedCopyPlan | None = None
         self._checkpoint_slot_base_cache: np.ndarray | None = None
-        self._checkpoint_descriptors: dict[int, CpuGpuBuffer] = {}
+        self._checkpoint_staging_cache: DescriptorStaging | None = None
 
     @property
     def prep_stream(self):
@@ -988,14 +989,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         slot_bases = self._checkpoint_slot_bases()
         per_op = plan.num_spans
         total = (len(store_ops) + len(restore_ops)) * per_op
-        staging = self._checkpoint_descriptor_buffer(descriptor_slot)
-        if total > staging.np.shape[0]:
+        staging = self._checkpoint_staging()
+        rows = staging.rows(descriptor_slot)
+        if total > rows.shape[0]:
             raise RuntimeError(
                 f"a step asked to copy {total // per_op} checkpoints, more "
-                f"than the {staging.np.shape[0] // per_op} its descriptor was "
+                f"than the {rows.shape[0] // per_op} its descriptor was "
                 "sized for"
             )
-        descriptor = staging.np[:total]
+        descriptor = rows[:total]
         at = 0
         for ops, storing in ((store_ops, True), (restore_ops, False)):
             if not ops:
@@ -1009,7 +1011,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 forward=storing,
             )
             at = end
-        launch_copy_descriptor(staging.copy_to_gpu(total), plan)
+        launch_copy_descriptor(staging.upload(descriptor_slot, total), plan)
 
     def _validate_paged_state_op(
         self, op: CheckpointStoreOp | CheckpointRestoreOp
@@ -1160,7 +1162,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._checkpoint_range_cache = None
         self._checkpoint_plan_cache = None
         self._checkpoint_slot_base_cache = None
-        self._checkpoint_descriptors = {}
+        self._checkpoint_staging_cache = None
 
     def warmup_per_req_cache(self) -> None:
         """Run one checkpoint copy now, so the first real one is only a copy.
@@ -1183,13 +1185,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if not plan.num_spans:
             return
         units = self.model_runner.state_runtime.checkpoint_spec.units_per_checkpoint
-        staging = self._checkpoint_descriptor_buffer()
+        staging = self._checkpoint_staging()
         plan.write_descriptor(
-            staging.np[: plan.num_spans],
+            staging.rows(0)[: plan.num_spans],
             self._checkpoint_slot_bases()[:1],
             self._page_unit_bases([list(range(units))]),
         )
-        launch_copy_descriptor(staging.copy_to_gpu(plan.num_spans), plan)
+        launch_copy_descriptor(staging.upload(0, plan.num_spans), plan)
 
     def _checkpoint_descriptor_device(self) -> torch.device:
         return self._kv_planes()[0].device
