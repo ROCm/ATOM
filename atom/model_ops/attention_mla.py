@@ -572,11 +572,8 @@ class MLAAttention(nn.Module):
         self.dtype = dtype
 
         self.min_query_heads = kwargs.get("min_query_heads", _MLA_MIN_HEADS)
-        # Round up to a dispatchable width rather than only clearing the floor.
-        # aiter serves 16 and multiples of 16 above it; a per-rank count that
-        # lands between them (K3's 96 heads give 24 at tp4) passes the floor and
-        # still has no kernel, and get_mla_metadata aborts the process on the
-        # first real request. Counts that already divide by 16 are unchanged.
+        # aiter MLA only serves multiples of 16 heads; round up so a per-rank
+        # count like 24 (K3 at tp4) does not abort in get_mla_metadata.
         self.padded_num_heads = mla_kernel_num_heads(
             max(num_heads, self.min_query_heads)
         )

@@ -2650,14 +2650,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # on the batch (= num_spec_step+1 for plain MTP, or the DSpark q-bucket
         # when shrunk). positions/attn use this so the (running_bs, q) graph is
         # selected. See `ForwardMode.max_seqlen_q`.
-        # MTP: roll ctx back to where this fwd's window was staged, so its
-        # positions overwrite last fwd's rejected-draft slots (as aiter_mla /
-        # aiter_attention do). `batch.context_lens` = `seq.num_tokens`, which
-        # runs past the window by `verify_context_shift()`: `num_rejected` on
-        # deferred output, 1 on undeferred (PP). Without this rollback, MTP-k
-        # positions would skip ahead and the rejected slots would never be
-        # overwritten with the corrected K/V. The shift is None on dummy runs
-        # and on the first fwd before any sampler output.
+        # MTP: `seq.num_tokens` runs past this fwd's window by
+        # `verify_context_shift()` (`num_rejected` deferred, 1 undeferred/PP);
+        # roll ctx back so positions overwrite last fwd's rejected-draft slots.
+        # None on dummy runs and before the first sampler output.
         # The rolled-back ctx is also what anchors `positions` (at `ctx -
         # full_q`, below), and every compress count is now `visible_*(pos)`, so
         # a rejected slot's KV falls out of range on its own — `block_tables`

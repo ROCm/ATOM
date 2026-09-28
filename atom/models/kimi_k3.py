@@ -1305,23 +1305,10 @@ class KimiKDAAttention(nn.Module):
             decode_state_indices = state_indices[:num_actual_tokens]
             decode_state_indices_in = state_indices_in[:num_actual_tokens]
             if kda_metadata.has_state_fork:
-                # A fork landing on decode. The comment above says only prefill
-                # can carry one, and under pp=1 that holds: the checkpoint is
-                # taken between prompt chunks, so the forward that consumes the
-                # fork is the next chunk. Under pp>1 it does not -- progress is
-                # advanced at schedule time and the prefix-hash registration
-                # that triggers the checkpoint is deferred behind an
-                # output-producing batch, so the checkpoint lands after the
-                # prompt is finished and the fork falls on the first decode.
-                #
-                # `causal_conv1d_update` takes the read slot itself, below.
-                # The recurrence kernel does not: it has `ssm_state_indices`
-                # and no `_in` counterpart, and updates in place, so the split
-                # has nowhere to live there. Move that half onto the
-                # destination and let the kernel run in place on it. Without
-                # this the decode reads the freshly popped slot, which is
-                # zeroed, and the prompt's whole recurrent state is gone -- the
-                # model then decodes fluently from nothing.
+                # Under pp>1 the checkpoint can land after the prompt, so a fork
+                # can reach decode. The conv update reads the _in slot itself; the
+                # recurrence kernel updates in place with no _in index, so copy
+                # the source state onto the (zeroed) destination slot first.
                 ssm_state[decode_state_indices] = ssm_state[decode_state_indices_in]
             q, k, v = causal_conv1d_update(
                 mixed_qkv,

@@ -382,9 +382,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         config = model_runner.config
         hf_config = config.hf_config
         # `self.num_attention_heads` set by CommonAttentionBuilder.__init__.
-        # Must name the same width as `MLAAttention.padded_num_heads`: that one
-        # pads the query, this one sizes the work descriptors the kernel reading
-        # that query will consume. Rounded up for the same reason.
+        # Must equal `MLAAttention.padded_num_heads`: that pads the query, this
+        # sizes the kernel's work descriptors for it.
         self.padded_num_attention_heads = mla_kernel_num_heads(
             max(self.num_attention_heads, _MLA_MIN_HEADS)
         )
@@ -2486,9 +2485,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         context_lens = np.asarray(batch.context_lens, dtype=np.int32)
         block_tables = batch.block_tables
         if not batch.is_dummy_run and max_seqlen_q > 1:
-            # Pull the window back to where it was staged; mapped to the
-            # current batch order in prepare_input_ids. See
-            # `verify_context_shift` for why it is not `num_rejected` under PP.
+            # Already in current batch order (prepare_input_ids); see
+            # `verify_context_shift` for why this is not `num_rejected` under PP.
             shift = self.model_runner.tokenID_processor.verify_context_shift()
             if shift is not None:
                 context_lens -= shift

@@ -300,14 +300,8 @@ class ScheduledBatch:
             elif is_deferred_out or num_spec_step == 0:
                 offset = seq.num_tokens - num_rejected[i] - num
             else:
-                # Undeferred speculation: postprocess has already written this
-                # step's anchor back and refilled the window it was given, so
-                # what is at the tail is one run of exactly `num` placeholders,
-                # whatever was rejected. The anchor is the token in front of it.
-                #
-                # Subtracting `num_rejected` as well, as the deferred path does,
-                # double-counts -- the run is already that much shorter there --
-                # and starts the window that far into the real output.
+                # Undeferred: the tail is one run of exactly `num` placeholders
+                # (rejects already refilled), so the anchor is just before it.
                 offset = seq.num_tokens - num - 1
             staged.extend(seq.token_ids[offset : offset + num])
         # Checked here because nothing downstream will: the array below wraps
@@ -590,18 +584,12 @@ class Scheduler:
         self.drafter_needs_next_token = self.use_spec and not (
             config.speculative_config.use_dspark()
         )
-        # True when this engine both drafts and verifies. Under PP the drafter
-        # runs on the last stage (`_build_output`'s non-deferred branch) and its
-        # rows come back on `ScheduledBatchOutput.draft_token_ids`, so the head
-        # can schedule them for verification like any other engine —
-        # `prepare_input_ids` stages the draft columns for every decode row
-        # because there is no GPU-side carry to rewrite them.
+        # True when this engine both drafts and verifies. Under PP the last
+        # stage drafts and returns rows on `draft_token_ids` for the head.
         pp_size = getattr(config, "pipeline_parallel_size", 1)
         self.spec_decode_local = self.use_spec
-        # Mirrors `tokenID_processor.is_deferred_out`, which postprocess only
-        # learns from `fwd_output`. Scheduling needs it a step earlier: the two
-        # modes leave a different number of trailing placeholders behind, so
-        # they do not find the decode anchor in the same place.
+        # Mirrors `tokenID_processor.is_deferred_out`; scheduling needs it
+        # early because the modes leave different trailing placeholder counts.
         self.is_deferred_out = pp_size == 1
         if self.use_spec and pp_size > 1:
             logger.info(
@@ -640,26 +628,9 @@ class Scheduler:
         # them until the head releases the id after postprocess, so a seq is
         # never decoded against a token not yet appended.
         self._pp_inflight_token_block: set[int] = set()
-        # Seq ids whose last chunk ended on a state-checkpoint rung and whose
-        # checkpoint has not been filed yet. The prefill scheduler skips them,
-        # so the forward after the rung is issued only once the slot holding
-        # the state as of that rung has been handed over.
-        #
-        # Without the hold the two are the other way round under PP: the next
-        # chunk is scheduled off the pipeline's depth, before the retiring one
-        # reaches postprocess, and it writes the very slot the checkpoint is
-        # about to pin -- which is then filed under the rung's hash holding
-        # state from somewhere past it. Every later request resuming there
-        # picks up a prefix that consumed tokens it never sent.
-        #
-        # `checkpointers_at` states the invariant ("a forward that overshoots a
-        # rung is ahead of the hash it would be filed under") and prefill keeps
-        # it by cutting chunks to land on the rung. Under one forward in flight
-        # that is the whole of it; under several the overshoot arrives from the
-        # *next* forward instead, and only ordering can rule it out.
-        #
-        # Costs one pipeline bubble per checkpoint, not per chunk -- which is
-        # what `state_checkpoint_interval_tokens` already exists to amortize.
+        # Seqs whose last chunk ended on a state-checkpoint rung not yet filed;
+        # prefill skips them. Under PP the next chunk would otherwise overwrite
+        # the state slot before it is filed under the rung's hash.
         self._pp_checkpoint_hold: set[int] = set()
 
         from atom.utils.forward_context import get_kvconnector
@@ -2563,14 +2534,10 @@ class Scheduler:
             and not bm.cancel_state_fork(seq)
         ):
             chunk = bm.state.min_fork_tokens
-            # Lengthened past the rung, so job 1 did not happen after all.
             on_rung = False
-        # Third job, and only when several forwards are in flight: keep the
-        # next chunk out of the pipeline until this one's checkpoint is filed.
-        # See `_pp_checkpoint_hold` for what overtakes what without it. Only
-        # where a following prefill chunk exists — a rung at the prompt's own
-        # end is followed by the first decode, which `_pp_inflight_token_block`
-        # already holds back.
+        # With several forwards in flight, hold the next chunk until this
+        # checkpoint is filed. A rung at prompt end needs no hold: the first
+        # decode is already held by `_pp_inflight_token_block`.
         if (
             on_rung
             and self.advance_on_schedule
@@ -2900,8 +2867,8 @@ class Scheduler:
         # coherent answer that ends before it answers anything.
         #
         # `num_placeholder_tokens` is the only width that describes what is
-        # actually there: postprocess records exactly what it appended, and the
-        # two output modes do not append the same amount. Re-deriving it
+        # actually there: postprocess records exactly what it appended, which
+        # differs between output modes. Re-deriving it
         # here as `mtp_k + num_rejected` agrees only when deferred output is
         # off AND nothing was rejected -- on a TP-only MTP engine it leaves one
         # `eos_token_id` behind (the case above), and with `num_rejected = r`
@@ -3016,9 +2983,7 @@ class Scheduler:
             return
         seq_by_id = self._batch_seq_lookup(seqs)
         for i, req_id in enumerate(batch.req_ids):
-            # Before the bail-outs below, not after: a seq preempted while held
-            # never reaches its checkpoint, and a hold left behind would keep
-            # it out of the prefill scan for the rest of its life.
+            # Before the bail-outs, so a preempted held seq is not held forever.
             self._pp_checkpoint_hold.discard(req_id)
             seq = seq_by_id.get(req_id)
             if seq is None or not seq.block_table:
@@ -3035,11 +3000,8 @@ class Scheduler:
     def holds_checkpoint_hostage(self, batch: ScheduledBatch) -> bool:
         """Whether any seq in `batch` is waiting on this batch's checkpoint.
 
-        The head asks before deciding whether a retiring middle chunk's prefix
-        hashes can wait for the next batch that produces output. They normally
-        can — that is what the deferral buys. A held seq cannot wait: it is out
-        of the prefill scan until its checkpoint is filed, so deferring the
-        filing behind a batch that may not exist yet is what would stall it.
+        If so, its prefix hashes must be filed now rather than deferred: a held
+        seq is out of the prefill scan until then and would stall.
         """
         return bool(self._pp_checkpoint_hold) and any(
             req_id in self._pp_checkpoint_hold for req_id in batch.req_ids
@@ -3094,8 +3056,7 @@ class Scheduler:
             seq_by_id = self._batch_seq_lookup(seqs)
             final = batch.is_final_chunk
             for i, req_id in enumerate(batch.req_ids):
-                # See register_prefill_hashes: dropped before the bail-out so a
-                # seq that never reaches its checkpoint is not held forever.
+                # Before the bail-out; see register_prefill_hashes.
                 self._pp_checkpoint_hold.discard(req_id)
                 seq = seq_by_id.get(req_id)
                 if seq is None or final is None or not seq.block_table:
@@ -3151,16 +3112,13 @@ class Scheduler:
 
         need_placeholder = is_deferred_out or self.spec_decode_local
         # Drafts occupy trailing slots only on an engine that verifies them; a
-        # drafting-only engine's tokens are all real. Undeferred, the write
-        # below lands inside the one outstanding run and leaves `num_rejected`
-        # of it behind, so `num_rejected` alone already names the tail.
+        # drafting-only engine's tokens are all real. Undeferred, `num_rejected`
+        # alone names the tail.
         num_placeholder_width = (
             self.mtp_k if (self.spec_decode_local and is_deferred_out) else 0
         )
-        # A verify step hands back up to `mtp_k` accepted drafts plus one bonus
-        # token, so the run it writes into is `mtp_k + 1` wide. Deferred output
-        # spends that slot on its one-step lag when there is no speculation
-        # (`mtp_k` is 0), which is the same number.
+        # Up to `mtp_k` accepted drafts plus one bonus (or, deferred without
+        # spec, the one-step lag slot).
         num_placeholder = self.mtp_k + 1
 
         for seq in self.running:
@@ -3248,9 +3206,8 @@ class Scheduler:
                 # contaminating downstream logs and arithmetic with np.int32.
                 num_rejected = int(fwd_output.num_rejected[idx])
                 num_bonus = int(fwd_output.num_bonus[idx])
-                # Deferred output is a step behind, so two runs are outstanding
-                # and the one this step's tokens belong to starts `mtp_k`
-                # further back. Undeferred there is only ever one.
+                # Deferred: two runs outstanding, this step's starts `mtp_k`
+                # further back. Undeferred: only one.
                 offset = (
                     self.mtp_k
                     if (is_deferred_out and (num_new_token + num_rejected) != 1)
@@ -3509,13 +3466,8 @@ class Scheduler:
                     if is_deferred_out:
                         num = max(0, num_placeholder - seq.num_rejected)
                     else:
-                        # Refill the one outstanding run back to its full width
-                        # rather than deriving the shortfall from the rejects:
-                        # a step that scored no drafts at all consumes one slot
-                        # with `num_rejected` at zero, and `num_placeholder -
-                        # num_rejected` would grow the run by `mtp_k` for it.
-                        # A sequence that took the append branch above has no
-                        # run yet and gets the whole width.
+                        # Refill the run to full width; deriving it from rejects
+                        # overgrows it by `mtp_k` on a step that scored no drafts.
                         num = max(0, num_placeholder - seq.num_placeholder_tokens)
                     for _ in range(num):
                         seq.append_token(self.eos_token_id)

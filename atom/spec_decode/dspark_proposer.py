@@ -16,15 +16,10 @@ logger = logging.getLogger("atom")
 
 
 def build_aux_capture_spec(config) -> AuxCaptureSpec | None:
-    """The spec a DSpark drafter would declare, without building the drafter.
+    """Default DSpark aux-capture spec, derived from config alone (None if no DSpark).
 
-    Pipeline stages that hold tapped target layers but no drafter need it to arm
-    their own capture (`PPAuxRelay`), and under PP only the last stage has a
-    drafter to ask. `DSparkProposer._aux_capture_spec` defers here for the
-    default contract so the two cannot drift; a draft model that overrides
-    `target_aux_capture_spec` is refused there, since this cannot reproduce it.
-
-    None when the config has no DSpark draft to capture for.
+    Lets drafterless PP stages arm capture (`PPAuxRelay`); `DSparkProposer` uses
+    it too so the two cannot drift.
     """
     spec_cfg = getattr(config, "speculative_config", None)
     if spec_cfg is None or not spec_cfg.use_dspark():
@@ -494,10 +489,8 @@ class DSparkProposer(Drafter):
         if own is None:
             return build_aux_capture_spec(self.config)
         if int(getattr(self.config, "pipeline_parallel_size", 1) or 1) > 1:
-            # PPAuxRelay reconstructs this spec on the stages that hold tapped
-            # layers but no drafter, and it has no draft model to ask. Relaying
-            # rows captured under the default contract into a draft expecting
-            # its own would be silently wrong, so refuse instead.
+            # Drafterless PP stages can only rebuild the default spec; relaying
+            # it to a draft with its own contract would be silently wrong.
             raise NotImplementedError(
                 f"{type(self.model).__name__} declares its own "
                 "target_aux_capture_spec, which pipeline parallelism cannot "

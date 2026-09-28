@@ -214,11 +214,9 @@ class tokenIDProcessor:
             publication_group="input_ids",
         )
         self.use_spec = use_spec
-        # `use_spec` answers "does this stage draft and sample", which under PP
-        # is the last one alone. This answers "is the run speculative at all",
-        # which is what the per-stage state rollback keys off: the batch's
-        # acceptance counts have to be picked up everywhere, not just where
-        # they were produced.
+        # `use_spec`: this stage drafts/samples (PP: last stage only).
+        # `spec_enabled`: the run is speculative; every stage needs it for
+        # draft-id staging and state rollback.
         self.spec_enabled = use_spec if spec_enabled is None else spec_enabled
         self.num_spec_tokens = num_spec_tokens
 
@@ -346,21 +344,11 @@ class tokenIDProcessor:
         self.num_bonus: np.ndarray | None = None
 
     def verify_context_shift(self) -> np.ndarray | None:
-        """How far `batch.context_lens` runs past this step's verify window.
+        """Per-row offset from `batch.context_lens` back to the verify window.
 
-        `context_lens` is `seq.num_tokens`, placeholders included. The window's
-        context length -- what anchors its positions and KV slots -- is that
-        minus this, per row. Deferred output stages the window
-        `num_rejected` further back (`L - num_rejected - num`), so the shift
-        is `num_rejected`. Undeferred (pipeline parallel), postprocess has
-        already written the step back and refilled one run of `mtp_k + 1`
-        placeholders, so the window is `L - num - 1 .. L - 2` whatever was
-        rejected: the shift is 1 on every row. Reusing `num_rejected` there
-        placed the window `num_rejected - 1` slots early -- wrong positions,
-        and its KV written over tokens already accepted.
-
-        None when there is nothing to shift by (dummy runs, no speculation,
-        the first forward before any sampler output).
+        Deferred output: `num_rejected`. Undeferred (PP): postprocess already
+        left one run of `mtp_k + 1` placeholders, so the window starts at
+        `L - num - 1` and the shift is 1. None before any sampler output.
         """
         if self.num_rejected is None:
             return None
@@ -545,20 +533,9 @@ class tokenIDProcessor:
             ]
             self.input_ids.np[:total_tokens_decode] = token_ids
             if self.spec_enabled:
-                # Every row's draft columns, not just the newly admitted ones
-                # the deferred branch stages. There the anchor of a carried-over
-                # request is still on the GPU and `fill_deferred_decode_ids`
-                # rewrites its whole row from `prev_token_ids`; here (PP) the
-                # host already holds the real anchor -- postprocess wrote it
-                # back before this batch was built -- so `scheduled_tokens`
-                # above is correct at column 0 and only the drafts are missing.
-                #
-                # `spec_enabled`, not `use_spec`: this fills the ids the
-                # embedding reads, and the embedding is on the FIRST stage,
-                # while `use_spec` is only true on the LAST one. Gated the
-                # other way the verify window reaches the model with drafts
-                # still at their placeholder value, so every column past the
-                # anchor scores against a token nobody proposed.
+                # PP: the host already holds each row's anchor, so fill only
+                # the draft columns. Gated on `spec_enabled` because the
+                # embedding runs on the first stage, not the (use_spec) last.
                 _, lens, cu_np = self.runner.attn_metadata_builder.decode_spans(batch)
                 spec = batch.scheduled_spec_decode_tokens
                 for i in range(len(lens)):
@@ -566,23 +543,9 @@ class tokenIDProcessor:
                     if n_draft > 0:
                         s = int(cu_np[i]) + 1
                         self.input_ids.np[s : s + n_draft] = spec[i, :n_draft]
-            # The deferred branch publishes these further down and the
-            # backends read them off the processor, not off the batch:
-            # `GDNAttentionMetadataBuilder.prepare_num_accepted_tokens`
-            # leaves `num_accepted_tokens` at its fill value of 1 when
-            # `num_bonus` is None. Left unset, every request looks like it
-            # accepted exactly its anchor, and the linear-attention state
-            # rolls back to the wrong position on any step that accepted
-            # more. They describe the PREVIOUS step, which is what a
-            # rollback at the head of this one wants.
-            #
-            # Outside `use_spec`, which is `... and get_pp_group().is_last_rank`:
-            # only the last stage drafts and samples, but every stage carries
-            # linear-attention layers and every one of them has to roll back by
-            # the same amount. Reading it off the batch is what makes that
-            # possible -- the counts are pickled to all stages, while the
-            # processor these used to come from is only ever filled where
-            # sampling happens.
+            # Previous step's acceptance counts, read off the batch so every
+            # stage (not just the sampling one) rolls its linear-attention
+            # state back correctly; unset, GDN assumes 1 accepted token.
             if self.spec_enabled:
                 self.num_rejected = batch.num_rejected
                 self.num_bonus = batch.num_bonus
@@ -807,14 +770,9 @@ class ModelRunner:
         torch.set_default_device(self.device)
         spec_enabled = bool(self.config.speculative_config)
         use_spec = spec_enabled and get_pp_group().is_last_rank
-        # The verify window's width, which every stage runs -- not whether this
-        # stage drafts. What reads it sizes per-stage buffers for that window:
-        # the KDA conv state (`conv_kernel - 1 + num_spec` rows per slot) and
-        # aiter MLA's work metadata (`max_bs * (num_spec + 1)` query rows).
-        # Keyed on `use_spec`, a drafterless stage sized both for one token and
-        # then ran eight through them: the conv kernel wrote its window over
-        # the next slots' rows. At pp == 1 the one stage is the last, so this
-        # is the value it always had.
+        # Verify-window width, which every PP stage runs; it sizes the KDA conv
+        # state and MLA work metadata, so key it on `spec_enabled`, not
+        # `use_spec`, or drafterless stages overflow those buffers.
         self.num_spec_tokens = (
             self.config.speculative_config.num_speculative_tokens if spec_enabled else 0
         )
@@ -2946,13 +2904,9 @@ class ModelRunner:
         return torch.cat(outs)
 
     def _build_pp_aux_relay(self):
-        """Stand up the aux-hidden-state relay when a drafter taps target layers
-        this stage's pipeline neighbours own. See `spec_decode/pp_aux_relay.py`.
+        """Build the PP relay for drafter aux hidden states owned by other stages.
 
-        Runs on EVERY stage, including the ones with no drafter: those are the
-        stages that have to capture and forward. The spec is derived from the
-        speculative config rather than the drafter object for the same reason --
-        only the last stage has one.
+        Runs on every stage; drafterless stages derive the spec from config.
         """
         self.pp_aux_relay = None
         self._pp_recv_aux = None
@@ -3486,18 +3440,8 @@ class ModelRunner:
                 prev_rejected_num = np.zeros(0, dtype=np.int32)
                 prev_bonus_num = np.zeros(0, dtype=np.int32)
         else:
-            # Nothing is deferred on this path, so the counts that belong with
-            # the tokens `prepare_sampled_ids` just emitted are THIS step's --
-            # not, as on the deferred path, the previous step's. Zeroes here
-            # would claim no draft was rejected and no bonus taken: the
-            # scheduler records them on the sequence and hands them back with
-            # the next batch, where the linear-attention backends roll their
-            # recurrent state to `num_bonus + 1` accepted tokens -- one, for
-            # every step, whatever was actually kept.
-            #
-            # `num_bonus_tokens` is None on a step that scored no drafts (the
-            # `spec_decode_metadata is None` branch above), where nothing was
-            # rejected and the zeros are right.
+            # Undeferred: report THIS step's counts; the next batch carries them
+            # back for linear-attention state rollback. None = no drafts scored.
             if num_bonus_tokens is not None:
                 prev_rejected_num = num_reject_tokens.cpu().numpy().astype(np.int32)
                 prev_bonus_num = num_bonus_tokens.cpu().numpy().astype(np.int32)

@@ -88,10 +88,8 @@ class GDNAttentionMetadata:
     # from `non_spec_state_indices_tensor`. Same tensor otherwise; None on the
     # spec path, which never carries a fork.
     non_spec_state_indices_in_tensor: torch.Tensor | None = None
-    # Whether any sequence in this step reads its incoming state from a slot
-    # other than the one it writes. Host-side so a backend can skip the fork
-    # handling without a device sync; the index tensors alone cannot answer it
-    # without one, and they differ as objects on every step.
+    # True if any sequence reads its state from a slot other than the one it
+    # writes. Host-side so backends can skip fork handling without a device sync.
     has_state_fork: bool = False
     spec_sequence_masks: torch.Tensor | None = None  # shape: [batch,]
     spec_token_indx: torch.Tensor | None = None
@@ -183,13 +181,9 @@ class GDNStateMixin(PoolRowsMixin):
         if hasattr(model_runner, "drafter"):
             self.num_spec = model_runner.drafter.mtp_k
         elif spec_config is not None:
-            # Under PP only the last stage holds a drafter, but EVERY stage runs
-            # the verify window: the scheduler schedules anchor + drafts for the
-            # whole batch and each stage owns the recurrent state of its own
-            # layers. Sized for one token per request, this stage would advance
-            # that state across the rejected draft rows with no way to roll
-            # back, and K3 -- 69 of whose 93 layers are KDA -- decodes fluent
-            # noise from the step after the first rejection.
+            # Under PP only the last stage has a drafter, but every stage runs the
+            # verify window over its own recurrent state; sized for one token it
+            # would advance state across rejected drafts with no rollback.
             self.num_spec = int(spec_config.num_speculative_tokens or 0)
             if self.num_spec == 0:
                 raise ValueError(

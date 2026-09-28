@@ -1,10 +1,7 @@
 """The verify window's positions must be the ones the scheduler staged.
 
-`ScheduledBatch` places each decode window with one formula per output mode;
-the attention builders rebuild the same window from `context_lens` minus
-`tokenIDProcessor.verify_context_shift()` and derive positions and KV slots
-from it. Token ids here are each token's own index, so the staged window IS its
-true positions and the two can be compared directly.
+Attention builders rebuild the window from `context_lens - verify_context_shift()`.
+Token ids equal their index, so staged tokens are their true positions.
 """
 
 from types import SimpleNamespace
@@ -55,8 +52,8 @@ def test_builder_positions_match_staged_window(
 
 @pytest.mark.parametrize("num_rejected", [0, 3, 6])
 def test_undeferred_window_is_not_shifted_by_num_rejected(seq_factory, num_rejected):
-    # What the builders did before: the deferred path's shift on undeferred
-    # output. It lands the window `num_rejected - 1` slots early.
+    # The deferred shift applied to undeferred output lands the window
+    # `num_rejected - 1` slots early.
     batch, _ = _decode_batch(seq_factory, 162, num_rejected, is_deferred_out=False)
     stale = decode_positions(batch.context_lens - batch.num_rejected, NUM)
     assert stale[0] == batch.scheduled_tokens[0] - (num_rejected - 1)

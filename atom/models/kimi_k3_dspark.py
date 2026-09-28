@@ -50,8 +50,7 @@ Checkpoint layout (Inferact/Kimi-K3-DSpark, 68 tensors, single-file BF16):
   markov_head.markov_w{1,2}.weight              [163840, 256]
   confidence_head.proj.{weight,bias}            SKIPPED (training-only)
   embed_tokens.weight                           SKIPPED (target's is shared;
-                                                loaded under PP, where the
-                                                target's lives on stage 0)
+                                                loaded on PP stages > 0)
 """
 
 from typing import TYPE_CHECKING, ClassVar
@@ -622,8 +621,7 @@ class KimiK3DSpark(DSparkDraftModel):
     #     shared instead (share_with_target), so loading it would just burn
     #     memory and risk drifting from the target's.
     #
-    # Under pipeline parallelism the embed_tokens entry comes back off this list
-    # per instance -- see __init__.
+    # Under PP, __init__ drops embed_tokens from this list on non-first stages.
     skip_weight_prefixes: ClassVar[list[str]] = [
         "confidence_head.",
         "embed_tokens.",
@@ -671,16 +669,8 @@ class KimiK3DSpark(DSparkDraftModel):
         self.vocab_size = int(config.vocab_size)
 
         # Bound by share_with_target(); both are skipped at load.
-        #
-        # Except for embed_tokens under PP. The drafter is built only on the
-        # last stage (model_runner gates on `get_pp_group().is_last_rank`), and
-        # that stage's target holds a real lm_head but a PPMissingLayer where
-        # the embedding would be -- K3 puts embed_tokens on the FIRST stage.
-        # There is nothing to share, so load the copy the checkpoint ships and
-        # take it off this instance's skip list. Costs vocab x hidden bf16
-        # sharded over TP (587 MiB/rank at TP4); the alternative, keeping the
-        # target's embedding resident on every stage, spends the same memory to
-        # carry a table only the drafter would read.
+        # Exception: under PP the drafter lives on the last stage, whose target
+        # embedding is a PPMissingLayer, so load the checkpoint's own copy.
         self.own_embed_tokens = not get_pp_group().is_first_rank
         if self.own_embed_tokens:
             self.skip_weight_prefixes = [
@@ -706,9 +696,7 @@ class KimiK3DSpark(DSparkDraftModel):
         The vocabularies must agree or the shared LM head would silently score
         the wrong rows.
         """
-        # `model.vocab_size` rather than `embed_tokens.num_embeddings`: under PP
-        # the embedding on this stage is a PPMissingLayer, and the check has to
-        # hold on the stage that owns the LM head too.
+        # Not embed_tokens.num_embeddings: under PP it may be a PPMissingLayer.
         target_vocab = target_base.model.vocab_size
         if target_vocab != self.hf_config.vocab_size:
             raise ValueError(
