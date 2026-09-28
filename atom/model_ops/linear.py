@@ -22,6 +22,7 @@ from aiter import (
 # import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.quant import per_group_quant_hip
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
 from torch import nn
@@ -113,6 +114,37 @@ def divide(numerator, denominator):
         numerator % denominator == 0
     ), f"numerator {numerator} denominator {denominator}"
     return numerator // denominator
+
+
+def per_1x128_e8m0_quant_fake(
+    x: torch.Tensor, quant_dtype: torch.dtype, transpose_scale: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty(x.shape, dtype=quant_dtype, device=x.device),
+        torch.empty(
+            (*x.shape[:-1], x.shape[-1] // 128),
+            dtype=dtypes.fp8_e8m0,
+            device=x.device,
+        ),
+    )
+
+
+# Per-1x128 activation quant with an E8M0 scale, as a functional op. aiter's
+# per_group_quant_hip allocates the scale as E8M0 and fills it through a
+# mutating op; Inductor declines to decompose an auto_functionalized_v2 that
+# touches E8M0 ("auto_functionalized_v2 was not removed"), so the mutation
+# must stay inside this op.
+@torch_compile_guard(gen_fake=per_1x128_e8m0_quant_fake, mutates_args=[])
+def per_1x128_e8m0_quant(
+    x: torch.Tensor, quant_dtype: torch.dtype, transpose_scale: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return per_group_quant_hip(
+        x,
+        quant_dtype=quant_dtype,
+        group_size=128,
+        transpose_scale=transpose_scale,
+        scale_type=dtypes.fp8_e8m0,
+    )
 
 
 def gemm_a4w4_quant_fake(
@@ -1325,7 +1357,13 @@ class LinearBase(nn.Module):
                 otype=otype,
             )
         else:
-            if x_scale is None:
+            if x_scale is None and self.blockscale_e8m0_scale:
+                # blockscale_e8m0_scale implies per_1x128. Column-major x_scale
+                # for the preshuffle GEMM, row-major otherwise.
+                x, x_scale = per_1x128_e8m0_quant(
+                    x, self.params_dtype, envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+                )
+            elif x_scale is None:
                 quant_func = self.quant_func
                 if self.quant_type.value == QuantType.per_1x128.value:
                     # preshuffle GEMM expects column-major x_scale;
@@ -1333,11 +1371,6 @@ class LinearBase(nn.Module):
                     quant_func = functools_partial(
                         self.quant_func,
                         transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
-                        **(
-                            {"scale_type": dtypes.fp8_e8m0}
-                            if self.blockscale_e8m0_scale
-                            else {}
-                        ),
                     )
                 if self.quant_type.value != QuantType.per_1x32.value:
                     x, x_scale = quant_func(
