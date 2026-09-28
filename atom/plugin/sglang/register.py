@@ -152,6 +152,41 @@ def _register_tc_piecewise_attention_split_ops() -> None:
             SPLIT_OPS.append(op_name)
 
 
+def _keep_atom_full_attn_for_native_qwen4_exp() -> None:
+    """0.5.20 replaces hybrid full-attn with QwenSparseAttnBackend for Flash.
+
+    Native ATOM still owns QSA compute and allocates CUDA-graph buffers in
+    ATOMAttnBackendForSgl.out_graph. Skip the upstream swap.
+    """
+    try:
+        from sglang.srt.layers.attention.qsa import config as qsa_config
+    except Exception:  # noqa: BLE001 - 0.5.17 has no qsa.config
+        return
+    original = getattr(qsa_config, "is_qwen_qsa", None)
+    if original is None or getattr(qsa_config, "_atom_keep_full_attn", False):
+        return
+
+    def is_qwen_qsa_for_atom(hf_config):
+        arches = getattr(hf_config, "architectures", None) or []
+        model_type = str(getattr(hf_config, "model_type", "") or "")
+        text = getattr(hf_config, "text_config", None)
+        text_mt = str(getattr(text, "model_type", "") or "")
+        if (
+            any("Qwen4Exp" in str(a) for a in arches)
+            or model_type.startswith("qwen4_exp")
+            or text_mt.startswith("qwen4_exp")
+        ):
+            logger.info(
+                "Keep ATOMAttnBackendForSgl as hybrid full-attn for Native "
+                "Qwen4Exp; skip SGLang QwenSparseAttnBackend"
+            )
+            return False
+        return original(hf_config)
+
+    qsa_config.is_qwen_qsa = is_qwen_qsa_for_atom
+    qsa_config._atom_keep_full_attn = True
+
+
 def register_plugin() -> None:
     """Install ATOM patches that must run before SGLang parses server args."""
 
@@ -172,6 +207,7 @@ def register_plugin() -> None:
     # 0.5.20 recognizes Flash. This call only installs MTP draft-arch and
     # HC hidden-width adapters that upstream still does not provide.
     apply_qwen4_exp_recognition_patch()
+    _keep_atom_full_attn_for_native_qwen4_exp()
     install_sglang_replayssm_commit()
     register_kimi_k3_text_only_processor()
 
