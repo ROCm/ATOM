@@ -314,6 +314,19 @@ jobs:
             -w /workspace \
             "atom_build_${{ matrix.flavor }}" \
             bash -c "git config --global --add safe.directory /workspace && python3 -m pip wheel . --no-deps -w dist && ls -lh dist/"
+          # The build above runs as root in the container, so dist/ and the
+          # wheel in it belong to root once it returns -- while the steps
+          # below run on the runner host as the runner user. "Record what
+          # this wheel was built against" died on exactly that on the
+          # 2026-09-21 run: writing dist/provenance-<flavor>.txt into a
+          # root-owned directory. Hand dist/ back before leaving this step,
+          # so host-side steps can write into it no matter who created it
+          # (a previous run on this workspace can leave a root-owned dist/
+          # behind, and checkout's clean does not remove root-owned files).
+          docker exec \
+            -w /workspace \
+            "atom_build_${{ matrix.flavor }}" \
+            chown -R "$(id -u):$(id -g)" /workspace/dist
 
       - name: Validate wheel
         run: |

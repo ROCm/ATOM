@@ -46,7 +46,15 @@ def run_scenarios(
 ):
     scheduler = Scheduler(runner.config, state_runtime=runner.state_runtime)
     seed = tokenizer.encode("Explain why water expands when it freezes.")
-    prompts = [(seed * 40)[:length] for length in (129, 257)]
+    interval = runner.config.state_checkpoint_interval_tokens
+    manager = scheduler.block_manager
+    assert manager.state_checkpoint_interval_tokens == interval > 0
+    assert interval % manager.hash_block_size == 0
+    # Both requests must cross a published checkpoint. A 129-token prompt
+    # cannot restore a 256-token PAGE, even if the requested interval is 128:
+    # BlockManager snaps that interval to zero and disables checkpointing.
+    lengths = (interval + 1, interval + runner.config.long_prefill_token_threshold + 1)
+    prompts = [(seed * -(-length // len(seed)))[:length] for length in lengths]
     builder = runner.attn_metadata_builder
     commit = builder.commit_speculative_state
     accepted = []
@@ -358,6 +366,7 @@ def main():
             enable_expert_parallel=True,
             enforce_eager=not args.graph,
             compilation_config=CompilationConfig(
+                level=0,
                 cudagraph_mode=CUDAGraphMode.FULL if args.graph else None,
                 cudagraph_capture_sizes=[1, 2, 4],
             ),
@@ -375,13 +384,14 @@ def main():
             max_model_len=512,
             max_num_seqs=4,
             long_prefill_token_threshold=128,
-            state_checkpoint_interval_tokens=128,
+            state_checkpoint_interval_tokens=256,
             enable_log_stats=False,
             port=port,
         )
     config.parallel_config.data_parallel_base_port = port
     report = {
         "completed": False,
+        "level": 0,
         "tp": size,
         "cache_dtype": args.cache_dtype,
         "graph": args.graph,

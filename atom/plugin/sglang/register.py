@@ -162,6 +162,17 @@ def register_plugin() -> None:
     _install_decode_graph_forward_context_patch()
     apply_prefill_compile_only_patch()
     apply_triton_kernel_retention_patch()
+    from atom.plugin.sglang.attention_backend.gdn_replayssm import (
+        install_sglang_replayssm_commit,
+    )
+    from atom.plugin.sglang.patches.qwen4_exp_recognition_patch import (
+        apply_qwen4_exp_recognition_patch,
+    )
+
+    # 0.5.20 recognizes Flash. This call only installs MTP draft-arch and
+    # HC hidden-width adapters that upstream still does not provide.
+    apply_qwen4_exp_recognition_patch()
+    install_sglang_replayssm_commit()
     register_kimi_k3_text_only_processor()
 
     try:

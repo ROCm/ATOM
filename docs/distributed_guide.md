@@ -534,18 +534,25 @@ There is no enable flag.
 Each has an `ATOM_DP_*` environment equivalent (`ATOM_DP_SIZE_LOCAL`,
 `ATOM_DP_RANK`, …) for launch scripts; explicit flags win.
 
+Set the same nonzero `--data-parallel-base-port` on every node. The coordinator
+binds and holds the model-runner TCPStore before spawning workers; all model
+runners connect as clients. On a single node, the default `0` lets the OS
+allocate the port when the store starts, so there is no probe-and-release gap.
+
 ### Example — 2 nodes, 4 DP ranks each, TP2
 
 ```bash
 # Node 0 (coordinator, 10.0.0.1) — serves the API
 python -m atom.entrypoints.openai_server --model <model> -tp 2 \
   --data-parallel-size 8 --data-parallel-size-local 4 --data-parallel-rank 0 \
-  --data-parallel-master-ip 10.0.0.1 --data-parallel-master-port 29500
+  --data-parallel-master-ip 10.0.0.1 --data-parallel-master-port 29500 \
+  --data-parallel-base-port 29501
 
 # Node 1 — engines only, no API server
 python -m atom.entrypoints.openai_server --model <model> -tp 2 \
   --data-parallel-size 8 --data-parallel-size-local 4 --data-parallel-rank 4 \
-  --data-parallel-master-ip 10.0.0.1 --data-parallel-master-port 29500
+  --data-parallel-master-ip 10.0.0.1 --data-parallel-master-port 29500 \
+  --data-parallel-base-port 29501
 ```
 
 Node 0 owns global DP ranks 0-3, node 1 owns 4-7. Each node's *local* ranks

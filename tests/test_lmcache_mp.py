@@ -547,7 +547,7 @@ def test_mp_lookup_timeout_defers_cleanup_until_result(monkeypatch):
         poll_interval=0.01,
     )
 
-    assert client.lookup(list(range(8)), "req") == 0
+    assert client.lookup(list(range(8)), "req") is None
     assert adapter.cleaned == []
 
     adapter.results.append(8)
@@ -567,7 +567,7 @@ def test_mp_lookup_pending_cleanup_drops_adapter_bookkeeping(monkeypatch):
         poll_interval=0.01,
     )
 
-    assert client.lookup(list(range(8)), "req") == 0
+    assert client.lookup(list(range(8)), "req") is None
     client.clear_lookup_status("req")
 
     assert adapter.cleaned == ["req"]
@@ -640,6 +640,65 @@ def test_full_prompt_hit_of_exactly_one_chunk_asks_for_no_load_at_all(monkeypatc
     assert scheduler.get_num_new_matched_tokens(seq) == (0, False)
     assert "7" not in scheduler._load_specs
     assert lookup.hit_tokens("7") is None
+
+
+def _hit_seq(req_id=7, num_prompt=8):
+    return SimpleNamespace(
+        id=req_id,
+        num_prompt_tokens=num_prompt,
+        num_cached_tokens=0,
+        token_ids=list(range(num_prompt)),
+        block_table=[10, 11],
+    )
+
+
+def test_mp_lookup_timeout_is_not_recorded_as_a_tier_miss(monkeypatch):
+    """A deadline that expires is a non-answer, not an empty answer.
+
+    The scheduler remembers the tier hit for as long as the request waits, so a
+    timeout recorded as "this tier holds nothing" would stand for the rest of
+    that wait -- including, as here, after the result the lookup was waiting
+    for has arrived. A non-answer is remembered as one (`None`), and is only
+    held long enough to keep a dead tier from costing a timeout every step.
+    """
+
+    ticks = iter([0.0, 0.0, 2.0, 0.0])
+    monkeypatch.setattr(mp_connector.time, "monotonic", lambda: next(ticks))
+    scheduler, lookup = _full_prompt_hit_scheduler(monkeypatch, chunk_size=4)
+    adapter = lookup._adapter
+    adapter.results.clear()
+    adapter.results.extend([None, None, 8])
+    seq = _hit_seq()
+
+    scheduler._tier_retry_steps = 0  # no backoff, so the retry is the next call
+
+    assert scheduler.get_num_new_matched_tokens(seq) == (0, False)
+    # Remembered as "did not answer", never as a hit of 0.
+    assert scheduler._tier_hit_memo["7"][1] is None
+
+    assert scheduler.get_num_new_matched_tokens(seq) == (4, True)
+    assert [request_id for request_id, _tokens in adapter.submissions] == ["7", "7"]
+
+
+def test_block_size_one_full_prompt_hit_stays_declined_when_asked_again(monkeypatch):
+    """The subclass has the last word on every call, including replayed ones.
+
+    One-token blocks cannot host the final LMCache chunk, so a whole-prompt hit
+    is refused here and the armed load is cleared. Only the hit is remembered,
+    so the refusal is re-derived on the next call rather than replayed from it
+    -- which is what keeps the second call from parking the request for a
+    transfer nobody dispatches.
+    """
+
+    scheduler, lookup = _full_prompt_hit_scheduler(monkeypatch, chunk_size=4)
+    scheduler.block_size = 1
+    scheduler.virtual_block_size = 1
+    seq = _hit_seq()
+
+    assert scheduler.get_num_new_matched_tokens(seq) == (0, False)
+    assert scheduler.get_num_new_matched_tokens(seq) == (0, False)
+    assert "7" not in scheduler._load_specs
+    assert len(lookup._adapter.submissions) == 1
 
 
 def test_stale_load_failure_does_not_release_current_generation_locks():

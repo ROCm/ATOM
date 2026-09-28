@@ -60,7 +60,11 @@ from aiter.rotary_embedding import get_rope
 from torch import nn
 
 from atom.model_ops.activation import SiluAndMul
-from atom.model_ops.attention_mla import MLAModules, mla_min_query_heads
+from atom.model_ops.attention_mla import (
+    MLAModules,
+    mla_min_query_heads,
+    qrep_tp_override,
+)
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.dspark_markov_sample import dspark_markov_argmax
 from atom.model_ops.layernorm import RMSNorm
@@ -237,6 +241,10 @@ class K3DSparkMLAAttention(nn.Module):
         self.v_head_dim = config.v_head_dim
         self.scaling = self.qk_head_dim**-0.5
 
+        # No-op unless QREP is on (see qrep_tp_override); the draft shares the
+        # target's DCP group, so this is all the wiring QREP needs here.
+        q_qrep_override = qrep_tp_override(tp_size)
+
         # q_a_proj and kv_a_proj_with_mqa share an input, so the checkpoint's two
         # weights load into one merged projection (see packed_modules_mapping).
         self.fused_qkv_a_proj = MergedReplicatedLinear(
@@ -258,6 +266,7 @@ class K3DSparkMLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.q_b_proj",
+            **q_qrep_override,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(

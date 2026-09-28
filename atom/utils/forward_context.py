@@ -423,8 +423,9 @@ class ForwardMode:
             t = getattr(attn_metadata, name, None)
             return None if t is None else int(t.shape[0])
 
-        # `input_ids` is the argument, this rank's own rows -- the cudagraph
-        # branch re-slices the buffer to `running_tokens` itself.
+        # `input_ids` is the scheduled prefix at the runner boundary. Uniform
+        # decode exposes `running_tokens` to the model in both eager and graph
+        # execution; a mixed prefill/decode step keeps its local token count.
         assert input_ids.shape[0] == self.scheduled_tokens, (
             f"input_ids length {input_ids.shape[0]} != scheduled_tokens="
             f"{self.scheduled_tokens} ({self})"
@@ -480,8 +481,7 @@ class Context:
     is_prefill: bool = False
     is_dummy_run: bool = False
     # What this rank was handed. Duplicated from `forward_mode` because a
-    # capture context has none; `scheduled_tokens` is what an eager forward
-    # actually runs.
+    # capture context has none; `scheduled_tokens` counts this rank's real rows.
     scheduled_bs: int = 0
     scheduled_tokens: int = 0
     # The step's DP-unified padded shape. `running_bs` counts SEQUENCES (graph
@@ -843,6 +843,34 @@ def get_forward_context() -> ForwardContext:
         "Please use `set_forward_context` to set the forward context."
     )
     return _forward_context
+
+
+@contextmanager
+def side_stream(stream: torch.cuda.Stream | None):
+    """Issue the block beside the main stream instead of on it.
+
+    Yields `(issuing, joining)`: the stream the block runs on, and the one to
+    wait on it afterwards, `None` when nothing forked.
+
+    Forks only inside the capture loop, the one window where a side stream is
+    both safe and useful: eager launches pile up across layers with nothing to
+    drain them, and a replay runs no Python, inheriting the recorded layout.
+    `in_hipgraph` covers that loop's warmup forward too, which matters because
+    AITER caches a kernel's scratch per `(device, stream)` and rejects a first
+    allocation made during capture.
+
+    The gate lives here rather than at each caller so that two branches of one
+    layer cannot drift into disagreeing about when forking is allowed. A caller
+    whose feature is switched off hands `None` and takes the same path, so the
+    switch needs no second branch anywhere.
+    """
+    context = get_forward_context()
+    if stream is None or not context.in_hipgraph:
+        yield context.main_stream, None
+        return
+    stream.wait_stream(context.main_stream)
+    with torch.cuda.stream(stream):
+        yield stream, context.main_stream
 
 
 def _normalize_cudagraph_runtime_mode(mode: Any) -> CUDAGraphMode | None:

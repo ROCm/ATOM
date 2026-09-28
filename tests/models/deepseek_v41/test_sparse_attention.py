@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
 """Unmodified V4 BF16 kernels with V4.1's dimensions and sparse inputs."""
 
-from types import SimpleNamespace
-
 import pytest
 import torch
+
+from tests.attentions.deepseek_v41.helpers import PagedRequest, begin_step
 
 pytest.importorskip("aiter", reason="the V4 kernels import the AITER runtime")
 
@@ -12,6 +12,7 @@ from atom.model_ops.v4_kernels import (
     sparse_attn_v4_paged_decode,
     sparse_attn_v4_paged_prefill,
 )
+from atom.models.deepseek_v41.config import AttentionMode, LayerAttentionSpec
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="ROCm GPU required"
@@ -27,7 +28,6 @@ def test_v4_bf16_counts_sink_once_for_swa_and_global(small_config, length):
     row double-counted would move it.
     """
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
-    from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
     from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 
     config = small_config
@@ -45,11 +45,11 @@ def test_v4_bf16_counts_sink_once_for_swa_and_global(small_config, length):
     cache = PagedAttentionCache(geo, 8, 2, "cuda")
     cache.pages.view("main_0").fill_(6)
     spans = (
-        RequestSpan(1, 0, 0, length, 0, (0, 1)),
-        RequestSpan(2, 0, length, length, 1, (2, 3)),
+        PagedRequest(1, 0, 0, length, 0, (0, 1)),
+        PagedRequest(2, 0, length, length, 1, (2, 3)),
     )
-    step = cache.begin_step(spans)
-    spec = SimpleNamespace(layer_id=0, ratio=1, kv_owner=0, topk_owner=0)
+    step = begin_step(cache, spans)
+    spec = LayerAttentionSpec(0, 1, AttentionMode.FULL, 0, 0)
     # Index row 0 for every query row: the same row its window already holds.
     step.selected[0] = torch.zeros(1, step.width, 1, device="cuda", dtype=torch.int32)
     q = torch.zeros(2 * length, 8, 512, dtype=torch.bfloat16, device="cuda")

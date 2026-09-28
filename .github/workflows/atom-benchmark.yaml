@@ -36,6 +36,10 @@ on:
         description: "Benchmark DeepSeek-V4-Pro EPLB r0 + MegaMoE (8k1k, c=512/4096)"
         type: boolean
         default: true
+      deepseek-v41-flash:
+        description: "Benchmark DeepSeek-V4.1-Flash DSpark (TP4, c<=64)"
+        type: boolean
+        default: true
       glm-5-2-fp8:
         description: "Benchmark GLM-5.2-FP8"
         type: boolean
@@ -84,9 +88,9 @@ on:
         description: "Extra arguments to pass to the ATOM server"
         type: string
       image:
-        description: "Image to use for the benchmark"
+        description: "Docker image; empty uses rocm/atom-dev:latest"
         type: string
-        default: "rocm/atom-dev:latest"
+        default: ""
       runner:
         description: "Optional runner label override for manual runs; leave empty to use model defaults"
         type: string
@@ -139,10 +143,14 @@ jobs:
     outputs:
       configs_json: ${{ steps.build.outputs.configs_json }}
       has_cells: ${{ steps.build.outputs.has_cells }}
+      checkout_sha: ${{ steps.revision.outputs.sha }}
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.atom_commit || github.ref }}
+          ref: ${{ inputs.atom_commit || github.sha }}
+      - name: Record checked-out commit
+        id: revision
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - id: build
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -175,6 +183,7 @@ jobs:
       suffix: ${{ matrix.config.suffix }}
       model_path: ${{ matrix.config.model_path }}
       server_args: ${{ matrix.config.server_args }}
+      bench_kind: ${{ matrix.config.bench_kind }}
       bench_args: ${{ matrix.config.bench_args }}
       env_vars: ${{ matrix.config.env_vars }}
       runner: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.config.runner }}
@@ -187,7 +196,7 @@ jobs:
       enable_profiler: ${{ inputs.enable_profiler || false }}
       enable_rtl: ${{ inputs.enable_rtl || false }}
       extra_args: ${{ inputs.extra_args || '' }}
-      atom_commit: ${{ inputs.atom_commit || '' }}
+      atom_commit: ${{ needs.build-matrix.outputs.checkout_sha }}
       aiter_commit: ${{ inputs.aiter_commit || '' }}
 
   summarize-benchmark-result:

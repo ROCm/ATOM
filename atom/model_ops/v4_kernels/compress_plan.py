@@ -72,7 +72,7 @@ class CompressPlan:
     key_rope_positions_gpu: torch.Tensor | None = None  # [≥num_compress] int64 or None
 
 
-def _publish_key_rope_positions(plan_buffers, ratio, compress_buffer, count):
+def _prepare_key_rope_positions(plan_buffers, ratio, compress_buffer, count, publish):
     """Where RoPE rotates each boundary's key, or None if nobody asked.
 
     Read back from the compress buffer AFTER its sentinel tail is filled, so
@@ -84,7 +84,7 @@ def _publish_key_rope_positions(plan_buffers, ratio, compress_buffer, count):
         return None
     if count:
         buffer.np[:count] = (compress_buffer.np[:count, 2] // ratio) * ratio
-    return buffer.copy_to_gpu(count)
+    return publish(buffer, count)
 
 
 def plan_context_lens(
@@ -109,6 +109,8 @@ def make_compress_plans(
     unique_ratios_overlap: Iterable[tuple[int, bool]],
     *,
     plan_buffers: dict,
+    publication_group=None,
+    defer_to=None,
     running_bs: int | None = None,
     max_q_len: int | None = None,
     decode_capacity_per_ratio: dict[int, int] | None = None,
@@ -133,6 +135,12 @@ def make_compress_plans(
                     calls (CUDAGraph requirement). Fresh per-call alloc is
                     not supported — that pattern caused allocator-churn
                     races (see `write_v4_paged_decode_indices` docstring).
+      publication_group: optional prebound owner group for these plan buffers.
+                    All sources are filled before a single checked publication.
+                    Independent callers without a group keep direct uploads.
+      defer_to: optional combined group that will publish these plan buffers.
+                    The caller owns its counts and must publish before any GPU
+                    plan consumer; used by V4.1's combined metadata preparation.
       running_bs: optional int — the CUDAGraph-padded batch size (>= bs). When
                     PROVIDED this selects the DECODE CUDAGraph path: both
                     `compress_plan_gpu` and `write_plan_gpu` are sliced to a
@@ -187,6 +195,29 @@ def make_compress_plans(
       (fully sentinel-filled), so capture-time addresses match replay-time
       addresses even on a zero-token fwd.
     """
+    # Check every source acquired by the owner before touching a pinned plan. A
+    # repeated call in the same forward must fail before overwriting an
+    # earlier publication, including when that call used checked direct.
+    if defer_to is not None and publication_group is None:
+        raise ValueError("Deferred plans require a publication group")
+    group = publication_group if defer_to is None else defer_to
+    if publication_group is not None:
+        publication_group.check_writable()
+        if defer_to is None:
+            for i in range(len(group.counts)):
+                group.counts[i] = None
+
+    def publish(buffer, count):
+        if group is None:
+            return buffer.copy_to_gpu(count)
+        group.set_count(buffer, count)
+        return buffer.gpu[:count]
+
+    def finish():
+        if group is not None and defer_to is None:
+            group.publish(group.counts)
+        return out
+
     bs = len(extend_lens_cpu)
     extend_lens_cpu = np.ascontiguousarray(extend_lens_cpu, dtype=np.int32)
     context_lens_cpu = np.ascontiguousarray(context_lens_cpu, dtype=np.int32)
@@ -243,17 +274,17 @@ def make_compress_plans(
             if wcap > 0:
                 wbuf.np[:wcap].fill(-1)
             out[ratio] = CompressPlan(
-                compress_plan_gpu=cbuf.copy_to_gpu(ccap),
-                write_plan_gpu=wbuf.copy_to_gpu(wcap),
+                compress_plan_gpu=publish(cbuf, ccap),
+                write_plan_gpu=publish(wbuf, wcap),
                 num_compress=0,
                 num_write=0,
                 cu_compress_cpu=np.zeros(max(bs, 1) + 1, dtype=np.int32),
                 compress_plan_cpu=None,
-                key_rope_positions_gpu=_publish_key_rope_positions(
-                    plan_buffers, ratio, cbuf, ccap
+                key_rope_positions_gpu=_prepare_key_rope_positions(
+                    plan_buffers, ratio, cbuf, ccap, publish
                 ),
             )
-        return out
+        return finish()
 
     # Per-token columns shared across ratios.
     batch_ids = np.repeat(np.arange(bs, dtype=np.int32), extend_lens_cpu)
@@ -341,8 +372,8 @@ def make_compress_plans(
             wbuf.np[:n_write] = write_plan
         if write_slice > n_write:
             wbuf.np[n_write:write_slice].fill(-1)  # sentinel
-        compress_plan_gpu = cbuf.copy_to_gpu(compress_slice)
-        write_plan_gpu = wbuf.copy_to_gpu(write_slice)
+        compress_plan_gpu = publish(cbuf, compress_slice)
+        write_plan_gpu = publish(wbuf, write_slice)
 
         out[ratio] = CompressPlan(
             compress_plan_gpu=compress_plan_gpu,
@@ -351,8 +382,8 @@ def make_compress_plans(
             num_write=n_write,
             cu_compress_cpu=cu_compress,
             compress_plan_cpu=compress_plan if n_compress > 0 else None,
-            key_rope_positions_gpu=_publish_key_rope_positions(
-                plan_buffers, ratio, cbuf, compress_slice
+            key_rope_positions_gpu=_prepare_key_rope_positions(
+                plan_buffers, ratio, cbuf, compress_slice, publish
             ),
         )
-    return out
+    return finish()

@@ -20,6 +20,7 @@ from atom.utils.forward_context import (
     get_forward_context,
     set_forward_context,
 )
+from atom.utils.h2d import h2d_producer
 
 logger = logging.getLogger("atom")
 
@@ -174,14 +175,33 @@ class Drafter(abc.ABC):
         self._captures_aux = False
         self._aux_buffers: list[torch.Tensor] = []
 
-        i32_kwargs = {"dtype": torch.int32, "device": self.device}
-        i64_kwargs = {"dtype": torch.int64, "device": self.device}
-        max_bs = self.config.max_num_seqs
-        self.cu_num_draft_tokens = CpuGpuBuffer(max_bs, **i32_kwargs)
-        self.target_logits_indices = CpuGpuBuffer(max_bs * self.mtp_k, **i64_kwargs)
-        self.bonus_logits_indices = CpuGpuBuffer(max_bs, **i64_kwargs)
+        self.metadata_buffers = self._allocate_metadata_buffers(
+            self.config.max_num_seqs, self.mtp_k, self.device
+        )
 
         self._build_draft_graphs()
+
+    @staticmethod
+    def _allocate_metadata_buffers(max_bs, mtp_k, device):
+        kwargs = {
+            "device": device,
+            "publication_group": "spec_decode",
+            "pin_memory": torch.device(device).type != "cpu",
+        }
+        return {
+            "cu_num_draft_tokens": CpuGpuBuffer(max_bs, dtype=torch.int32, **kwargs),
+            "target_logits_indices": CpuGpuBuffer(
+                max_bs * mtp_k, dtype=torch.int64, **kwargs
+            ),
+            "bonus_logits_indices": CpuGpuBuffer(max_bs, dtype=torch.int64, **kwargs),
+            # Device-only scratch, shared by PP slots just like other device
+            # tensors in forward_vars. The rejection sampler consumes it on
+            # the forward stream before the next prepare can overwrite it;
+            # draft proposal uses separate token storage. No host publication.
+            "verification_draft_token_ids": torch.empty(
+                max_bs * mtp_k, dtype=torch.int32, device=device
+            ),
+        }
 
     # ---- draft passes ----
     def _declare_draft_graphs(self) -> tuple[DraftGraph, ...]:
@@ -438,6 +458,8 @@ class Drafter(abc.ABC):
         """
         n = len(anchors)
         buf = self.runner.forward_vars["draft_next_tokens"]
+        if buf._publication is not None:
+            buf._publication.acquire_write()
         buf.np[:n] = anchors
         return buf.copy_to_gpu(n)
 
@@ -651,12 +673,18 @@ class Drafter(abc.ABC):
 
         return token_indices
 
-    def calc_spec_decode_metadata(
+    @h2d_producer("spec_decode", runner="runner")
+    def prepare_spec_decode_indices(
         self,
         num_sampled_tokens: np.ndarray,
         cu_num_sampled_tokens: np.ndarray,
-        input_ids: torch.Tensor,
-    ) -> SpecDecodeMetadata:
+        publication_group,
+    ) -> tuple[np.ndarray, int]:
+        """Fill host indices/counts before their group's first GPU consumer.
+
+        This uses only the settled query lengths, so it can share token input
+        publication. The caller must publish the group before gathering IDs.
+        """
         scheduled_bs = len(num_sampled_tokens)
 
         # num_draft = num_sampled - 1 per request. num_sampled_tokens is the
@@ -685,19 +713,42 @@ class Drafter(abc.ABC):
         # [0, 1, 2, 5, 6, 9]
         target_logits_indices += arange
 
-        # Do the CPU -> GPU copy.
-        self.target_logits_indices.np[:sum_drafted_tokens] = target_logits_indices
-        self.cu_num_draft_tokens.np[:scheduled_bs] = cu_num_draft_tokens
-        self.bonus_logits_indices.np[:scheduled_bs] = bonus_logits_indices
-        target_logits_indices = self.target_logits_indices.copy_to_gpu(
-            sum_drafted_tokens
-        )
-        cu_num_draft_tokens = self.cu_num_draft_tokens.copy_to_gpu(scheduled_bs)
-        bonus_logits_indices = self.bonus_logits_indices.copy_to_gpu(scheduled_bs)
+        var = self.runner.forward_vars
+        var["target_logits_indices"].np[:sum_drafted_tokens] = target_logits_indices
+        var["cu_num_draft_tokens"].np[:scheduled_bs] = cu_num_draft_tokens
+        var["bonus_logits_indices"].np[:scheduled_bs] = bonus_logits_indices
+        group = publication_group
+        counts = group.counts
+        counts[group.indices["target_logits_indices"]] = sum_drafted_tokens
+        counts[group.indices["cu_num_draft_tokens"]] = scheduled_bs
+        counts[group.indices["bonus_logits_indices"]] = scheduled_bs
+        return num_draft_tokens, sum_drafted_tokens
+
+    def calc_spec_decode_metadata(
+        self,
+        num_sampled_tokens: np.ndarray,
+        cu_num_sampled_tokens: np.ndarray,
+        input_ids: torch.Tensor,
+        *,
+        prepared_indices: tuple[np.ndarray, int] | None = None,
+    ) -> SpecDecodeMetadata:
+        if prepared_indices is None:
+            group = self.runner.h2d_groups["spec_decode"]
+            prepared_indices = self.prepare_spec_decode_indices(
+                num_sampled_tokens, cu_num_sampled_tokens, group
+            )
+            group.publish(group.counts)
+        num_draft_tokens, sum_drafted_tokens = prepared_indices
+        scheduled_bs = len(num_draft_tokens)
+        var = self.runner.forward_vars
+        target_logits_indices = var["target_logits_indices"].gpu[:sum_drafted_tokens]
+        cu_num_draft_tokens = var["cu_num_draft_tokens"].gpu[:scheduled_bs]
+        bonus_logits_indices = var["bonus_logits_indices"].gpu[:scheduled_bs]
 
         # Compute the draft token ids.
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
-        draft_token_ids = torch.index_select(input_ids[1:], 0, target_logits_indices)
+        draft_token_ids = var["verification_draft_token_ids"][:sum_drafted_tokens]
+        torch.index_select(input_ids[1:], 0, target_logits_indices, out=draft_token_ids)
 
         metadata = SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,

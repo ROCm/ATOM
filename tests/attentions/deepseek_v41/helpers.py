@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: MIT
+from dataclasses import dataclass
+
+from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 
 
@@ -83,3 +86,48 @@ def metadata_buffers(batch_size, tokens, blocks, device="cpu", geometry=None):
             )
         )
     return buffers
+
+
+# Test cases bundle a request's span and its page mapping for readability.
+# Production metadata receives them separately and retains only RequestSpan.
+
+
+@dataclass(frozen=True)
+class PagedRequest(RequestSpan):
+    block_ids: tuple[int, ...]
+
+    @property
+    def span(self):
+        return RequestSpan(
+            self.request_id, self.position, self.offset, self.length, self.slot
+        )
+
+
+def begin_step(cache, requests, **kwargs):
+    requests = tuple(requests)
+    return cache.begin_step(
+        [request.span for request in requests],
+        block_tables=[request.block_ids for request in requests],
+        **kwargs,
+    )
+
+
+def prepare_step(requests, device, **kwargs):
+    from atom.model_ops.attentions.deepseek_v41.metadata import prepare_batch_step
+
+    return prepare_batch_step(
+        [request.span for request in requests],
+        device,
+        block_tables=[request.block_ids for request in requests],
+        **kwargs,
+    )
+
+
+def publish_tables(buffer, requests, running_bs):
+    from atom.utils.block_tables import block_table_state
+
+    return (
+        block_table_state(buffer)
+        .prepare([request.block_ids for request in requests], pad_to=running_bs)
+        .publish(running_bs)
+    )

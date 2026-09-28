@@ -231,6 +231,8 @@ def _transfer_builder(
     builder.num_blocks = num_blocks
     builder._kv_fp8 = kv_dtype == "fp8"
     builder._indexer_fp4 = indexer_fp4
+    builder.indexer_quant_mode = "fp4" if indexer_fp4 else "per_row_fp8"
+    builder.indexer_layout = "fp4-gfx950-preshuffle" if indexer_fp4 else "fp8"
     builder._classical_dtype = torch.uint8 if builder._kv_fp8 else torch.bfloat16
     builder.head_dim = _HEAD_DIM
     builder.rope_head_dim = _ROPE_HEAD_DIM

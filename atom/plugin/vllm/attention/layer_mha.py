@@ -14,7 +14,7 @@ from atom.model_ops.base_attention import (
     PA_ASM_MAX_QUERY_GROUP_SIZE,
     cp_mha_gather_cache,
     gluon_decode_over_limit,
-    run_pa_decode_gluon,
+    run_pa_decode,
     run_pa_fwd_asm,
 )
 from atom.plugin.vllm.attention.backend import (
@@ -481,7 +481,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         # Internally it derives batch_size = q.shape[0] // query_length and reshapes
         # to [batch, query_length, num_kv_heads, group, head_size]. See
         # aiter/aiter/ops/triton/gluon/pa_decode_gluon.py:5371-5377 and 5542-5544.
-        run_pa_decode_gluon(
+        run_pa_decode(
             output=out,
             q=q,
             k_cache=k_cache,

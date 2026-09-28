@@ -1,5 +1,5 @@
 """
-PrefillDelayer — a cross-DP-rank prefill *coalescer* for ATOM.
+PrefillDelayer — local TP or cross-DP prefill coalescing for ATOM.
 
 Purpose
 -------
@@ -12,16 +12,21 @@ forward carrying 500 of a 16384-token budget wastes ~97% of that forward.
 The delayer has two related jobs: **hold back prefill admission until the
 accumulated prefill is worth a forward, then release** — Nagle's algorithm for
 prefill — and optionally protect a fixed number of decode passes after every
-prefill. While it holds, decode keeps running; TTFT is bounded so a held request
-never starves.
+prefill. While it holds, decode keeps running. Coalescing hold episodes are
+bounded; the decode interval, backlog, and execution add to observed TTFT.
 
 Single-rank / TP-only mode
 --------------------------
-With ``cpu_group=None`` (``dp_size=1``) the delayer runs the same coalescer
+With ``is_local`` (``dp_size=1`` and ``cpu_group=None``) the delayer runs the same coalescer
 locally and skips the cross-rank ``all_reduce`` — a single scheduler drives all
 TP workers, so there is no cross-rank phase to align. Only the batching value
 remains (fill / stall / ttft / kv bounds decide FIRE/HOLD from this rank's own
 counts); the ``n_prefillable < dp_size`` alignment gate is vacuous.
+EngineCore opts TP/DCP into this mode when DP=1, PP=1, the master switch is
+on, and ``ATOM_PREFILL_DECODE_INTERVAL > 0``. During local decode protection,
+``protects_decode`` lets the scheduler skip cache probes and queue-age scans.
+The interval precedes all coalescing bounds, including ``max_queue_ms``; those
+bounds do not impose a hard end-to-end TTFT limit.
 
 It is NOT about mixing prefill+decode in one forward. It DOES preserve cross-DP
 phase alignment: it only releases when every rank is prefill-ready (so all ranks
@@ -47,6 +52,7 @@ every rank computes the SAME FIRE/HOLD from the reduced values:
   # -- must-fire bounds (release even if unaligned / underfilled) --
   if G_running_dec == 0:                          FIRE   # no decode to hide the wait behind
   if any_kv_high or any_kv_low:                   FIRE   # KV pressure / starvation
+  if any_queue_hot:                             FIRE   # queue age bound
   if hold_ticks >= ttft_max_ticks:                FIRE   # TTFT bound
   if any_partial and hold_ticks >= partial_max_ticks: FIRE  # partial holds KV — tight bound
   # -- alignment gate: never fire while some rank lacks prefill (anti-skew) --
@@ -138,6 +144,8 @@ class PrefillDelayer:
         max_queue_ms: float | None = None,
         prefill_decode_interval: int = 0,
     ):
+        if dp_size > 1 and cpu_group is None:
+            raise ValueError("Cross-DP prefill coalescing requires a CPU group")
         self.dp_size = dp_size
         self.cpu_group = cpu_group
         self.max_num_batched_tokens = max_num_batched_tokens
@@ -250,6 +258,25 @@ class PrefillDelayer:
             return 1
         return value
 
+    @property
+    def is_local(self) -> bool:
+        return self.dp_size == 1 and self.cpu_group is None
+
+    def protects_decode(self, running_decode_batch: int) -> bool:
+        """Whether the local decision can skip cache probes during protection."""
+        return (
+            self.is_local
+            and not self._first
+            and running_decode_batch > 0
+            and (
+                self._decode_interval_remaining > 0
+                or (
+                    self._prefill_executed_since_last_decision
+                    and self.prefill_decode_interval > 0
+                )
+            )
+        )
+
     def should_allow_prefill(
         self,
         prefillable: bool,
@@ -267,11 +294,14 @@ class PrefillDelayer:
         Args:
             prefillable: this rank has admittable prefill work (fresh head that
                 can allocate, or a resumable partial). Only prefillable ranks
-                count toward the fill target and the alignment gate.
+                count toward the fill target and the alignment gate. During
+                local decode protection, the caller uses work existence alone:
+                fit cannot change the hard interval decision.
             pending_tokens: this rank's accumulated prefill tokens — fresh
                 waiting new-tokens PLUS the remaining tokens of resumable
                 partials — already capped at max_num_batched_tokens by the
-                caller. The coalescer's fill signal.
+                caller. The local scheduler bounds its scan and uses chunk
+                limits, so this signal can omit work beyond that scan.
             running_decode_batch: decode seqs running on this rank (NOT counting
                 mid-chunked-prefill seqs). If no rank has decode, holding wastes
                 GPU → fire.
@@ -279,11 +309,12 @@ class PrefillDelayer:
                 KV-high (can't accumulate more) and KV-low (GPU starving) bounds.
             has_partial: this rank has a mid-chunked-prefill seq in flight. Its
                 remaining tokens are in pending_tokens; a partial only forces
-                release once held for partial_max_ticks (it holds KV).
+                release once held for partial_max_ticks (it holds KV), counted
+                after the decode-protection interval.
             oldest_waiting_age_ms: age (ms since arrival) of this rank's oldest
                 schedulable waiting prefill. If it reaches max_queue_ms, this
-                rank flags the TTFT SLA guard and all ranks release. 0 / no
-                waiting prefill / max_queue_ms=None → guard inactive.
+                rank flags the age guard; all ranks release after decode
+                protection. No waiting prefill / max_queue_ms=None → inactive.
         """
         # KV + queue-age bounds are gated on this rank actually having prefill to
         # push (firing when this rank can't admit anything would be a no-op).
@@ -353,8 +384,8 @@ class PrefillDelayer:
             return True
 
         # Hard post-prefill decode protection. The countdown is identical on
-        # all ranks because it is armed from the globally reduced prefillable
-        # count and schedule() calls this method in lockstep. Do not advance the
+        # all ranks because it is armed from the globally reduced execution
+        # signal and schedule() calls this method in lockstep. Do not advance the
         # coalescer's own hold/TTFT episode: SGLang applies the interval before
         # invoking PrefillDelayer, so its delay budget starts afterwards.
         if self._decode_interval_remaining > 0:
@@ -377,10 +408,8 @@ class PrefillDelayer:
             return self._fire("nodecode", g_pending)
         if any_kv_high or any_kv_low:
             return self._fire("kv", g_pending)
-        # TTFT SLA guard: a real request has queued (since arrival) past the
-        # threshold — release now regardless of fill/alignment. This is the
-        # end-to-end wait (includes backlog + coalescer holds), unlike the
-        # tick-based ttft bound below which only caps a single hold episode.
+        # Queue age includes backlog and prior holds. This release applies
+        # after decode protection; it is not an end-to-end TTFT guarantee.
         if any_queue_hot:
             return self._fire("queue_ms", g_pending)
         if self._hold_ticks >= self.ttft_max_ticks:

@@ -1976,15 +1976,35 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             self._active_load_operations.pop(sid, None)
             self._handoff_loads.discard(sid)
             self._load_failed_seqs.pop(sid, None)
+            self._forget_tier_hit(sid)
         self._load_lifecycles[sid] = seq
 
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
+        """How many extra prompt tokens the external tier can supply.
+
+        Same retry shape, and the same remembered hit, as the dense scheduler
+        (`OffloadSchedulerMixin._init_tier_hit_memo`): the boundary search below
+        reads sidecar state that moves underneath the hit, so only the hit is
+        remembered and the answer is derived on every call.
+        """
+
         if not self._do_load or self._lookup_client is None:
             return 0, False
         self._begin_load_lifecycle(seq)
         sid = str(seq.id)
         if self._repeat_load_suppressed(seq, sid):
             return 0, False
+        remembered, hit = self._remembered_tier_hit(seq, sid)
+        if not remembered:
+            hit = self._fresh_tier_lookup(seq, sid)
+        if hit is None:
+            self._clear_lookup_retry_state(sid)
+            return 0, False
+        return self._answer_from_tier_hit(seq, sid, hit)
+
+    def _fresh_tier_lookup(self, seq, sid: str) -> int | None:
+        """Ask the tier, take its pin, and remember the hit. None if it did not answer."""
+
         num_prompt = seq.num_prompt_tokens
         token_ids = list(seq.token_ids[:num_prompt])
         if sid not in self._lookup_in_step:
@@ -1993,8 +2013,10 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             hit = self._lookup_client.lookup(token_ids, lookup_id=sid)
         except Exception:
             logger.exception("LMCache offload lookup failed for seq %s", seq.id)
-            self._clear_lookup_retry_state(sid)
-            return 0, False
+            self._remember_tier_hit(seq, sid, None)
+            return None
+        hit = None if hit is None else int(hit)
+        self._remember_tier_hit(seq, sid, hit)
         if logger.isEnabledFor(logging.DEBUG):
             _lh = None
             try:
@@ -2016,9 +2038,15 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 hit,
                 _lh,
             )
+        return hit
+
+    def _answer_from_tier_hit(self, seq, sid: str, hit: int) -> tuple[int, bool]:
+        """Turn a tier hit into this step's answer, and arm what it implies."""
+
         if not hit:
             self._clear_lookup_retry_state(sid)
             return 0, False
+        num_prompt = seq.num_prompt_tokens
         hit = self._loadable_hit(hit, num_prompt)
         self._hit_save_floors[sid] = hit
         if bool(getattr(seq, "has_per_req_cache", False)):
@@ -2054,6 +2082,9 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
     def update_state_after_alloc(self, seq) -> None:
         sid = str(seq.id)
         self._begin_load_lifecycle(seq)
+        # Admitted: the frontier moves and the load spec is dispatched, so a
+        # remembered hit has been spent. A preempted request asks again.
+        self._forget_tier_hit(sid)
         ls = self._load_specs.get(sid) if self._do_load else None
         initial_saved = max(
             self._lmcache_hit_save_floor(ls),
@@ -2313,6 +2344,13 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             )
             if not should_load:
                 self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
+                self._clear_pending_load(sid)
+                continue
+            # This is the one place a retrieve is handed to the worker, so it
+            # is where the load's lookup pin has to be live -- a spec derived
+            # from a remembered hit has none yet.
+            if not self._ensure_lookup_pin(seq, sid, ls):
+                self._mark_load_skip(seq, "tier_lost_prefix", hbm, lmc, need, chunk)
                 self._clear_pending_load(sid)
                 continue
             slot_load_spec = None
@@ -2717,6 +2755,9 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             # them as already persisted.
             entry[1] = self._chunk_floor(floor)
         self._record_failed_load_attempt(sid)
+        # See the dense scheduler's `load_failed`: the remembered hit must not
+        # outlive the load spec it would imply.
+        self._forget_tier_hit(sid)
         self._clear_pending_load(sid)
         return True
 
@@ -2757,6 +2798,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
     def request_finished(self, seq) -> None:
         sid = str(seq.id)
         self._release_failed_load_attempt(sid, seq)
+        self._forget_tier_hit(sid)
         if self._load_lifecycles.get(sid) is seq:
             self._clear_pending_load(sid)
             self._active_slot_loads.pop(sid, None)
