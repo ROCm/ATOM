@@ -407,7 +407,7 @@ if [[ "${DECODE_ENABLE_DP}" == "true" ]]; then
 fi
 
 # AgentX captures every query-token count the engine can produce, i.e. the dense
-# range [2, graph_max] with graph_max = seqs * (1 + spec_tokens), where seqs
+# range [1, graph_max] with graph_max = seqs * (1 + spec_tokens), where seqs
 # defaults to 2 * CONC. Concurrencies whose in-flight window is wider than
 # 2 * CONC pin seqs explicitly via cudagraph_max_num_seqs.
 auto_cudagraph_capture_sizes() {
@@ -422,11 +422,11 @@ auto_cudagraph_capture_sizes() {
     seqs=$(( 2 * conc ))
   fi
   graph_max=$(( seqs * (1 + spec) ))
-  if (( graph_max < 2 )); then
-    graph_max=2
+  if (( graph_max < 1 )); then
+    graph_max=1
   fi
-  echo "[${role}] cudagraph auto range 2..${graph_max} (seqs=${seqs} spec=${spec})" >&2
-  echo "[$(seq -s, 2 "${graph_max}")]"
+  echo "[${role}] cudagraph auto range 1..${graph_max} (seqs=${seqs} spec=${spec})" >&2
+  echo "[$(seq -s, 1 "${graph_max}")]"
 }
 
 build_cudagraph_args() {
