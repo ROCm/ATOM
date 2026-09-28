@@ -17,7 +17,7 @@ from atom.kv_transfer.disaggregation.sharded_transfer import build_dcp_shard_pla
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 @pytest.mark.parametrize("dcp_size", [2, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
-@pytest.mark.parametrize("width", [48, 576])
+@pytest.mark.parametrize("width", [48, 576, 1152])
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 def test_mla_gather_preserves_sharded_bytes_and_partial_page(
     dcp_size, dtype, width, index_dtype

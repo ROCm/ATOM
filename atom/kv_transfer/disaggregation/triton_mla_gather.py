@@ -9,10 +9,10 @@ import torch
 import triton
 import triton.language as tl
 
-# One program copies one destination token. 256 B covers typical MLA token
-# widths (576 B FP8 latent+rope) in a few unrolled loads without wasting
-# registers on a 1024 B tile.
-_MLA_GATHER_MAX_BLOCK = 256
+# One program copies one destination token. A gfx942 sweep of 128..1024 B
+# tiles and 1/2/4 warps favors 1024 B with one warp for 576/1152 B tokens.
+# Narrow tokens still use next_power_of_2(token_bytes) below this cap.
+_MLA_GATHER_MAX_BLOCK = 1024
 
 
 @triton.jit
