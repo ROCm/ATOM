@@ -889,6 +889,7 @@ models:
             tp: 8
             dcp: 8
             extra_args: >-
+              --enable-mamba-fine-grained-prefix-cache
               --compilation-config '{"mode":3,"cudagraph_mode":"FULL_AND_PIECEWISE","max_cudagraph_capture_size":512,"custom_ops":["+fused_rms_norm_gated"],"cudagraph_capture_sizes":[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256,272,288,304,320,336,352,368,384,400,416,432,448,464,480,496,512]}'
           decode:
             workers: 1
