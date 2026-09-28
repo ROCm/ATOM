@@ -221,6 +221,8 @@ class EngramInputPreparer:
         token_mask=None,
         padded_rows=None,
         batch=None,
+        cursor_positions=None,
+        cursor_out=None,
     ):
         """Stage one embedding row per row the forward will run.
 
@@ -239,7 +241,16 @@ class EngramInputPreparer:
         compressed_rows = []
         rows = token_ids.numel() if padded_rows is None else padded_rows
         if self.host.overlap is not None and (batch is not None or dummy):
-            return EngramInputs(self.host.overlap.prepare(batch, rows), histories, ())
+            return EngramInputs(
+                self.host.overlap.prepare(
+                    batch,
+                    rows,
+                    cursor_positions=cursor_positions,
+                    cursor_out=cursor_out,
+                ),
+                histories,
+                (),
+            )
         if dummy:
             self.host.stage_dummy(rows)
             next_histories = histories

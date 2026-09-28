@@ -265,6 +265,7 @@ lm_eval --model local-completions \
 
 **Deployment Recipes:**
 
+- [DeepSeek-V4.1-Flash AgentX](recipes/DeepSeek-V4.1-Flash-Agentic.md) — TP2/TP4, no EP, DSpark5, fixed AL=3.51 benchmark commands and measured operating points
 - [DeepSeek-R1](recipes/DeepSeek-R1.md) — FP8/MXFP4 with MTP speculative decoding on 8 GPUs
 - [Qwen3-235B-A22B](recipes/Qwen3-235b.md) — TP8 + EP with FP8 KV cache
 - [Qwen3-Next](recipes/Qwen3-Next.md) — Hybrid GDN + MoE architecture

@@ -21,7 +21,7 @@ on:
       - '.github/scripts/slurm_submit_helpers.sh'
       - '.github/workflows/atomesh-benchmark.yaml'
   schedule:
-    # TW nightly for DeepSeek and GLM-Agentic cases only at 00:00 Beijing time (16:00 UTC).
+    # TW weekly: Saturday 00:00 Beijing time (Friday 16:00 UTC).
     - cron: '0 16 * * 5'
     # Spur MI350X nightly at 00:10 Beijing time (16:10 UTC).
     - cron: '10 16 * * *'
@@ -35,6 +35,8 @@ on:
         options:
           - smoke
           - nightly
+          - weekly
+          - accuracy
       rdma_smoke_nodes:
         description: 'Comma-separated Slurm candidate nodes for the Mooncake RDMA smoke test; Slurm selects two when multiple nodes are listed'
         required: false
@@ -54,7 +56,7 @@ on:
         default: false
         type: boolean
       model_names:
-        description: 'When run_all_models=false, run all cases in the selected suite for these model families. Comma-separated: DeepSeek-V4-Pro,GLM-5.2-MXFP4,Kimi-K3-MXFP4,Kimi-K2.5-MXFP4,MiniMax-M3-MXFP4,MiniMax-M3-MXFP8'
+        description: 'When run_all_models=false, run all cases in the selected suite for these model families. Comma-separated: DeepSeek-V4-Pro,DeepSeek-V4-Pro-0813,GLM-5.2-MXFP4,Kimi-K3-MXFP4,Kimi-K2.5-MXFP4,MiniMax-M3-MXFP4,MiniMax-M3-MXFP8'
         required: false
         default: ''
         type: string
@@ -64,6 +66,18 @@ on:
           DeepSeek:
             ds-v4-1p1d-tp8-smoke,ds-v4-1p1d-tp8,ds-v4-1p1d-dpa-tp8,
             ds-v4-1p1d-tp8-mtp3,ds-v4-1p1d-dpa-tp8-mtp1
+
+          DeepSeek-V4-Pro-0813 (weekly):
+            ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c1,
+            ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c2,
+            ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c16,
+            ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c32,
+            ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c128,
+            ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c192,
+            ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c256
+
+          DeepSeek-V4-Pro-0813 (accuracy):
+            ds-v4-0813-1p1d-tp8-dspark3-gsm8k-only-c16
 
           GLM:
             glm-52-mxfp4-1p1d-tp4,glm-52-mxfp4-1p1d-tp8,
@@ -231,6 +245,9 @@ jobs:
       - name: Install YAML parser
         run: python3 -m pip install pyyaml
 
+      - name: Test ATOMesh config and launch scripts
+        run: python3 -m unittest discover -s tests -p "test_atomesh_*.py"
+
       - name: Find ATOMesh latest nightly image
         id: image
         env:
@@ -375,6 +392,15 @@ jobs:
               ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
               --output atomesh-matrix-deepseek.json
 
+            ATOMESH_SLURM_ACCOUNT=amd-frameworks \
+            ATOMESH_SLURM_PARTITION=amd-frameworks \
+            ATOMESH_SLURM_SUBMIT_RUNNER=atomesh-cicd \
+              python3 .github/scripts/atomesh/pd_matrix.py \
+              --suite weekly \
+              --model DeepSeek-V4-Pro-0813 \
+              ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
+              --output atomesh-matrix-v4-weekly.json
+
             ATOMESH_SLURM_ACCOUNT=amd-tw \
             ATOMESH_SLURM_PARTITION=amd-tw \
             ATOMESH_SLURM_SUBMIT_RUNNER=atomesh-cicd \
@@ -391,8 +417,9 @@ jobs:
           from pathlib import Path
 
           deepseek = json.loads(Path("atomesh-matrix-deepseek.json").read_text(encoding="utf-8")).get("include", [])
+          v4_weekly = json.loads(Path("atomesh-matrix-v4-weekly.json").read_text(encoding="utf-8")).get("include", [])
           glm_agentic = json.loads(Path("atomesh-matrix-glm.json").read_text(encoding="utf-8")).get("include", [])
-          matrix = {"include": deepseek + glm_agentic}
+          matrix = {"include": deepseek + v4_weekly + glm_agentic}
           Path("atomesh-matrix.json").write_text(
               json.dumps(matrix, indent=2),
               encoding="utf-8",
@@ -401,8 +428,9 @@ jobs:
               output.write(f"matrix_json={json.dumps(matrix, separators=(',', ':'))}\n")
               output.write(f"has_matrix={'true' if matrix['include'] else 'false'}\n")
           print(
-              "Scheduled TW nightly matrix: "
-              f"{len(deepseek)} DeepSeek case(s), {len(glm_agentic)} GLM agentic case(s)"
+              "Scheduled TW weekly matrix: "
+              f"{len(deepseek)} DeepSeek case(s), {len(v4_weekly)} V4-0813 weekly case(s), "
+              f"{len(glm_agentic)} GLM agentic case(s)"
           )
           PY
           else

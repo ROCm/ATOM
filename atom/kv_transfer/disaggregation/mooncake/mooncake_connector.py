@@ -638,8 +638,13 @@ class MooncakeConnector(KVConnectorBase):
         phys_idx: int | None = None
         if self.protocol.strip().lower() != "tcp" and not configured_ib_device:
             visible_idx = torch.cuda.current_device()
-            visible_env = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get(
-                "CUDA_VISIBLE_DEVICES"
+            # ROCR first, for the reason in numa_utils._physical_index: it
+            # filters before HIP, so a ROCR-only mask must not fall through to
+            # the identity mapping.
+            visible_env = (
+                os.environ.get("ROCR_VISIBLE_DEVICES")
+                or os.environ.get("HIP_VISIBLE_DEVICES")
+                or os.environ.get("CUDA_VISIBLE_DEVICES")
             )
             if visible_env:
                 visible_list = [d for d in visible_env.split(",") if d != ""]

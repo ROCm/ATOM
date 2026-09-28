@@ -154,12 +154,12 @@ def test_preemption_forgets_the_frozen_placement_too():
     """Frozen placement is placement; a preempted request's is equally stale."""
     reg = SeqViewRegistry()
     view = reg.get_or_create(_request())
-    view._offload_finished_block_ids = [7, 8, 9]
+    view._offload_finished = True
     view._offload_finished_cached_tokens = 384
 
     view.reset_for_preemption()
 
-    assert not hasattr(view, "_offload_finished_block_ids")
+    assert not hasattr(view, "_offload_finished")
     assert not hasattr(view, "_offload_finished_cached_tokens")
 
 

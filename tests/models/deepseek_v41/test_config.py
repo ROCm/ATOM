@@ -136,6 +136,12 @@ def test_ratio_transition_requires_a_compatible_owner(raw_config):
         normalize_hf_config(raw_config)
 
 
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+def test_valid_parallel_shards_are_accepted(raw_config, tp_size):
+    config = normalize_hf_config(raw_config)
+    config.validate_parallelism(tp_size)
+
+
 def test_invalid_parallel_shards_are_rejected(raw_config):
     config = normalize_hf_config(raw_config)
     with pytest.raises(ValueError, match="tensor parallel"):

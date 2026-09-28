@@ -87,7 +87,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
         with:
-          fetch-depth: 0  # setuptools_scm needs full history/tags for versioning
+          fetch-depth: 0  # keep repository history available to unit tests
       - name: Set up Python environment
         uses: actions/setup-python@v6
         with:
@@ -95,8 +95,10 @@ jobs:
       - name: Install dependencies
         run: |
           pip3 install torch --index-url https://download.pytorch.org/whl/cpu
-          pip3 install -e .
-          pip3 install pytest msgpack quart
+          # Isolate CPU test installation from unrelated repository tags (e.g.
+          # lmcache-*). Release and GPU benchmark versions are resolved separately.
+          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ATOM=0.0.0+cpu.ci pip3 install -e .
+          pip3 install pytest msgpack quart jsonschema
           # atom/diffusion test deps. Without them 38 diffusion tests self-skip
           # via importorskip and the subsystem gets no CI coverage at all.
           pip3 install av pillow httpx

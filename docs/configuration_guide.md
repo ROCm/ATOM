@@ -263,7 +263,7 @@ Defined in `atom/config.py`. Controls data parallelism. Environment variables
 | `data_parallel_rank` | `int` | `0` | First **global** DP rank owned by this node; overridden by `ATOM_DP_RANK` |
 | `data_parallel_rank_local` | `Optional[int]` | `None` | Local rank within the data-parallel group (SPMD mode); overridden by `ATOM_DP_RANK_LOCAL` |
 | `data_parallel_master_port` | `int` | `29500` | Port used by the data-parallel master for process group initialization |
-| `data_parallel_base_port` | `int` | `get_open_port()` | Base port for data-parallel communication (dynamically assigned) |
+| `data_parallel_base_port` | `int` | `0` | Model-runner TCPStore port; automatically bound for single-node runs, explicitly shared across nodes |
 | `data_parallel_master_ip` | `str` | `"127.0.0.1"` | IP address of the data-parallel master |
 
 **Computed property:**

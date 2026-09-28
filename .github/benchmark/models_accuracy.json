@@ -61,6 +61,18 @@
     "_baseline_note": "DSpark spec-decode (7 tokens, dp-attention, PIECEWISE cudagraph) on the DeepSeek-V4-Pro-DSpark checkpoint. Spec-decode is lossless w.r.t. the target, so baseline reuses the DeepSeek-V4-Pro FP8 base (0.96); threshold 0.93 leaves ~3pp headroom for spec-decode / dp-attention run-to-run variance. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate — add it once measured to guard draft-head regressions."
   },
   {
+    "model_name": "DeepSeek-V4.1-Flash DSpark",
+    "model_path": "deepseek-ai/DeepSeek-V4.1-Flash",
+    "extraArgs": "--kv_cache_dtype bf16 --index_cache_dtype fp8 -tp 4 --method dspark --num-speculative-tokens 5",
+    "env_vars": "",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "pr",
+    "accuracy_threshold": 0.91,
+    "accuracy_baseline": 0.9224,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4.1-Flash",
+    "_baseline_note": "Every argument here is forced rather than chosen: the V4.1 runtime rejects a KV cache other than bf16/fp4, an index plane other than fp8, and any DSpark that is not 5 tokens at TP4 on a bf16 cache (atom/models/deepseek_v41/config.py). Nothing pins the compilation level or max-num-seqs, so this runs at the server's own defaults, level 3 and 512 sequences. The baseline below was measured at 512 but at level 0, because the development box resolves torch's Triton specialization hook to neither name it has been given: Inductor then drops a hand-written Triton kernel silently and the model emits repeated tokens out of whatever the allocator last held, which tests/test_triton_inductor_pairing.py states at the kernel level and is red there. That is a property of one torch/Triton pair, not of this model, so the first CI runs are what confirm the number at level 3 — until then read the baseline as level 0's. Baseline is the mean of three full 1319-question 3-shot runs on this branch, each on a fresh server: 0.9189 / 0.9212 / 0.9272 flexible-extract (strict within 0.0015 of flexible every time), mean 0.9224. Treat the 0.83pp they span as a lower bound on the noise, not the noise itself — an earlier build of this same branch gave 0.9143 / 0.9143 / 0.9151, three runs inside 0.08pp, and reading that as a variance would have been wrong. This model is known to depend on memory layout, and DSpark verifies every draft token against the target, so draft quality moves which batch shapes run rather than what the answer is. The 0.91 bar leaves 1.24pp; a single red is noise until a rerun agrees with it, and a real regression shows up as two. mtp_accept_threshold intentionally omitted until a CI run reports this model's DSpark acceptance rate."
+  },
+  {
     "model_name": "DeepSeek-V4-Pro EPLB r0",
     "model_path": "deepseek-ai/DeepSeek-V4-Pro",
     "extraArgs": "--kv_cache_dtype fp8 --index_cache_dtype fp4 -tp 8 --enable-dp-attention --enable-expert-parallel --eplb-enable --eplb-config '{\"num_redundant_experts\": 0, \"placement_policy\": \"naive\", \"rebalance_interval\": 10, \"load_window_size\": 10, \"rebalance_min_balancedness\": 2.0}'",

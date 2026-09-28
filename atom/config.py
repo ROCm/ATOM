@@ -22,10 +22,11 @@ from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
 from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
 from atom.quant_spec import (
+    NVFP4_DTYPE,
     LayerQuantConfig,
     get_quant_parser,
 )
-from atom.utils import envs, get_open_port
+from atom.utils import envs
 from atom.utils.distributed.utils import stateless_init_torch_distributed_process_group
 
 if TYPE_CHECKING:
@@ -363,6 +364,7 @@ class QuantizationConfig:
             "mxfp4",
             "mxfp8",
             "quark",
+            "modelopt",
             "compressed-tensors",
         ]:
             self.online_quant = True
@@ -388,6 +390,26 @@ class QuantizationConfig:
         self.global_spec = parsed_quant_config.global_spec
         self.layer_pattern_specs = parsed_quant_config.layer_pattern_specs
         self.exclude_layers = list(parsed_quant_config.exclude_layers)
+        self._validate_nvfp4_online_quant()
+
+    def _validate_nvfp4_online_quant(self):
+        """Reject NVFP4 checkpoint specs when no online config was given.
+
+        NVFP4 runs only after online conversion to MXFP4. This fails while the
+        config is parsed, before any layer is built;
+        `validate_nvfp4_online_target` checks each NVFP4 layer's target as it
+        is built.
+        """
+        if self.online_quant:
+            return
+        specs = [self.global_spec, *(spec for _, spec in self.layer_pattern_specs)]
+        if any(spec.quant_dtype == NVFP4_DTYPE for spec in specs):
+            raise ValueError(
+                "The checkpoint has NVFP4 layers, but no online quantization "
+                "config was given. NVFP4 weights cannot run directly: pass "
+                "--online_quant_config with an mxfp4 target, for example "
+                '\'{"global_quant_config": "mxfp4"}\'.'
+            )
 
     # -- typed API (preferred) ----------------------------------------------
 
@@ -441,7 +463,7 @@ class QuantizationConfig:
         return self.global_spec.quant_type
 
     @property
-    def quant_dtype(self) -> torch.dtype:
+    def quant_dtype(self) -> torch.dtype | str:
         return self.global_spec.quant_dtype
 
     @property
@@ -613,6 +635,13 @@ class QuantizationConfig:
         for name in self.exclude_layers:
             new_exclude.extend(_remap_layer_name(name))
         self.exclude_layers = list(dict.fromkeys(new_exclude))
+
+        # Both lists have been through the same remap here, which is what makes
+        # them comparable; `quant_exclude_name_mapping` below rewrites only the
+        # exclude side.
+        if self.quant_method == "modelopt":
+            self._validate_packed_layer_specs()
+
         if self.online_quant:
             new_online_pattern_specs = []
             for pattern, spec in self.online_layer_pattern_specs:
@@ -630,6 +659,40 @@ class QuantizationConfig:
         # module paths declare `quant_exclude_name_mapping` as a class attribute.
         if quant_exclude_name_mapping:
             self.apply_exclude_name_mapping(quant_exclude_name_mapping)
+
+    def _validate_packed_layer_specs(self):
+        """Reject fused parameters whose source projections disagree.
+
+        ModelOpt records one entry per source projection, while ATOM builds one
+        packed parameter per fused name. Siblings that disagree collapse into
+        duplicate patterns during the remap above, and `get_layer_quant_config`
+        returns whichever comes first -- so a packed (N, K/2) uint8 NVFP4 weight
+        can be loaded into an (N, K) fp8 parameter with nothing said.
+
+        A projection absent from the config is deliberately not an error: a
+        model's packed mapping lists every projection that *may* fuse, and real
+        exports legitimately omit the ones a given layer does not have (M3 has
+        `index_q_proj`/`index_k_proj` only on its indexer layers).
+        """
+        seen: dict[str, LayerQuantConfig] = {}
+        for pattern, spec in self.layer_pattern_specs:
+            previous = seen.setdefault(pattern, spec)
+            if previous != spec:
+                raise ValueError(
+                    f"Conflicting quantization specs for packed layer {pattern!r}: "
+                    f"{previous} vs {spec}. Source projections fused into one ATOM "
+                    "parameter must share one spec."
+                )
+        for pattern in seen:
+            # FusedMoE resolves its experts container with check_children=True,
+            # so an exclude entry naming one expert de-quantizes all of them.
+            if self._is_excluded(pattern, self.exclude_layers, check_children=True):
+                raise ValueError(
+                    f"Packed layer {pattern!r} is quantized by at least one source "
+                    "projection and excluded by another. Exclude all of them or "
+                    "none: a partial exclusion de-quantizes the whole fused layer "
+                    "to bf16 while the checkpoint still holds packed weights."
+                )
 
 
 def glm5_kpool_block_size(index_kpool: int) -> int:
@@ -843,10 +906,55 @@ def _is_minimax_m3_config(hf_config: PretrainedConfig) -> bool:
     return False
 
 
+_MINIMAX_M3_MLP_LAYER_TYPES = {"dense": 0, "sparse": 1}
+
+
+def _normalize_minimax_m3_mlp_layer_types(config: PretrainedConfig) -> None:
+    """Express `mlp_layer_types` as the `moe_layer_freq` list the model reads.
+
+    MiniMax-M3 exports carry one of the two fields, and a config without
+    `moe_layer_freq` builds every layer as MoE, so a list that cannot be read
+    exactly must fail here rather than build the wrong layers.
+    """
+    layer_types = getattr(config, "mlp_layer_types", None)
+    if layer_types is None:
+        return
+    num_layers = config.num_hidden_layers
+    if len(layer_types) != num_layers:
+        raise ValueError(
+            f"MiniMax-M3 mlp_layer_types has {len(layer_types)} entries, but "
+            f"num_hidden_layers is {num_layers}."
+        )
+    unknown = sorted(
+        {repr(label) for label in layer_types}
+        - {repr(label) for label in _MINIMAX_M3_MLP_LAYER_TYPES}
+    )
+    if unknown:
+        raise ValueError(
+            f"MiniMax-M3 mlp_layer_types has unknown labels {', '.join(unknown)}; "
+            "expected 'dense' or 'sparse'."
+        )
+    moe_layer_freq = [_MINIMAX_M3_MLP_LAYER_TYPES[label] for label in layer_types]
+    existing = getattr(config, "moe_layer_freq", None)
+    if existing is None:
+        config.moe_layer_freq = moe_layer_freq
+    elif (
+        not isinstance(existing, (list, tuple))
+        or [int(freq != 0) for freq in existing] != moe_layer_freq
+    ):
+        raise ValueError(
+            "MiniMax-M3 config sets both mlp_layer_types and moe_layer_freq, and "
+            "they disagree on which layers are MoE."
+        )
+
+
 def _normalize_minimax_m3_text_config(hf_config: PretrainedConfig) -> None:
     if not _is_minimax_m3_config(hf_config):
         return
     text_config = getattr(hf_config, "text_config", None)
+    _normalize_minimax_m3_mlp_layer_types(
+        text_config if text_config is not None else hf_config
+    )
     if text_config is None or text_config is hf_config:
         return
 
@@ -910,7 +1018,10 @@ class ParallelConfig:
     data_parallel_master_port: int = 29500
     """Port of the data parallel master."""
 
-    data_parallel_base_port: int = get_open_port()
+    data_parallel_base_port: int = 0
+    """Model-runner rendezvous port. Zero requests an OS-assigned port locally."""
+    _managed_distributed_store: bool = field(default=False, init=False, repr=False)
+    """CoreManager owns the store; every model runner connects as a client."""
 
     data_parallel_master_ip: str = "127.0.0.1"
 
@@ -1618,9 +1729,7 @@ class DCPConfig:
         return cls(**cfg)
 
 
-def qrep_unsupported_reason(
-    dcp_size: int, speculative_config, mxfp4_bmm: bool
-) -> str | None:
+def qrep_unsupported_reason(dcp_size: int, mxfp4_bmm: bool) -> str | None:
     """Why DCP query replication cannot run here, or None if it can.
 
     Kept a module-level pure function so it is unit-testable: the alternative,
@@ -1630,13 +1739,84 @@ def qrep_unsupported_reason(
     if dcp_size <= 1:
         # No DCP group means there is no AllGather Q to remove.
         return "decode_context_parallel_size <= 1 (no DCP group)"
-    if speculative_config is not None:
-        # MTP / eagle3 / dspark run a qlen>1 verify on the cprr kernel.
-        return "speculative decode (qlen>1 cprr path)"
     if mxfp4_bmm:
         # fp4 (mxfp4) absorbed BMM has a different scale structure.
         return "fp4 (mxfp4) BMM weights"
     return None
+
+
+def q_proj_is_qrep_widened(q_proj, qrep_num_heads: int, qk_head_dim: int) -> bool:
+    """Whether `q_proj` was actually built with `qrep_tp_override`.
+
+    Requires both provenance (`q_proj.effective_tp_overridden`) and shape
+    (`weight.shape[0] == qrep_num_heads * qk_head_dim`). Shape alone isn't
+    enough: at `tp == dcp`, `override_tp_size` becomes 1 (a no-op), so a
+    QREP-widened q_proj and a plain, never-sharded one end up the same
+    width. Provenance alone isn't enough either: it says intent, not that
+    the resulting shape is what `_local_q_proj`/`W_K_qrep` actually assume.
+
+    Known residual gap: if `q_proj` is a wrapper that hides `.weight`
+    (`getattr` returns None, e.g. GLM-5.3's `_ZeroRopePad`) while its
+    wrapped linear actually was overridden, this returns False and the
+    caller falls back to AllGather -- safe today because no wrapper of
+    that shape is ever also wired to `qrep_tp_override`, but nothing here
+    would catch a future model that combines both.
+
+    Dependency-free so it stays importable, and testable, without triton/aiter.
+    """
+    if not getattr(q_proj, "effective_tp_overridden", False):
+        return False
+    weight = getattr(q_proj, "weight", None)
+    return weight is not None and weight.shape[0] == qrep_num_heads * qk_head_dim
+
+
+# Quant types `make_row_view` narrows safely for a single-partition q_proj
+# (unquantized/per_Tensor never hit its per-output-channel branch there;
+# per_1x128/per_Token are the two it explicitly handles). Named, not
+# imported from aiter's QuantType enum, so this stays importable without
+# triton/aiter; the aiter side is pybind11-bound but its members' `.name` is
+# this same string.
+_ROW_SLICEABLE_QUANT_TYPE_NAMES = frozenset(
+    {"No", "per_Tensor", "per_1x128", "per_Token"}
+)
+
+
+def q_proj_has_row_sliceable_scale(q_proj) -> bool:
+    """Whether `_local_q_proj`'s row view can safely narrow `q_proj`'s scale.
+
+    `make_row_view` narrows a 2D per-output-channel `weight_scale` only for
+    `per_1x128`/`per_Token`; anything else (e.g. mxfp4's `per_1x32`) raises
+    `NotImplementedError` on first use. `qrep_unsupported_reason`'s mxfp4
+    gate only checks a global env var, not any layer's actual quant type, so
+    this catches it per layer instead.
+
+    Keyed on `quant_type` alone, not `weight_scale`'s presence/shape:
+    `quant_type` is set unconditionally in `LinearBase.__init__`, but
+    `weight_scale` is not -- the online-quant-streaming path
+    (`source_quant_dtype` set) defers building it to
+    `process_weights_after_loading`, well after this runs. Reading
+    `weight_scale is None` as "safe" there would be checking a scale that
+    does not exist yet, not one that will never exist.
+    """
+    name = getattr(getattr(q_proj, "quant_type", None), "name", None)
+    return name is None or name in _ROW_SLICEABLE_QUANT_TYPE_NAMES
+
+
+def qrep_enabled_for_layer(
+    wants_qrep: bool, q_proj, qrep_num_heads: int, qk_head_dim: int
+) -> bool:
+    """The per-layer QREP decision, kept testable on its own: asserting only
+    `q_proj_is_qrep_widened`'s behavior can't catch the `and` being dropped
+    (or weakened) at the call site. Also requires `q_proj_has_row_sliceable_scale`
+    so a layer that is genuinely QREP-widened but whose on-disk quant type
+    `_local_q_proj` cannot row-slice falls back to AllGather instead of
+    raising the first time prefill runs.
+    """
+    return (
+        wants_qrep
+        and q_proj_is_qrep_widened(q_proj, qrep_num_heads, qk_head_dim)
+        and q_proj_has_row_sliceable_scale(q_proj)
+    )
 
 
 def indexer_cp_unsupported_reason(
@@ -2054,19 +2234,18 @@ class Config:
                 "speculative decode for block-level interleave."
             )
 
-        # DCP Query Replication (QREP) first-cut gating: turn the flag OFF
-        # (warn, not error) for combinations not yet wired, so it can default to
-        # on without breaking mixed runs.
+        # DCP Query Replication (QREP) gating: turn the flag OFF (warn, not
+        # error) for combinations that cannot use it, so it can default to on
+        # without breaking mixed runs.
         if self.dcp_config.enable_query_replication:
             qrep_off = qrep_unsupported_reason(
                 self.decode_context_parallel_size,
-                self.speculative_config,
                 envs.ATOM_USE_TRITON_MXFP4_BMM,
             )
             if qrep_off is not None:
                 logger.warning(
                     "dcp_config.enable_query_replication disabled: %s not "
-                    "supported in the first cut.",
+                    "supported.",
                     qrep_off,
                 )
                 self.dcp_config.enable_query_replication = False

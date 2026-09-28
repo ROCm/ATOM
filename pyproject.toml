@@ -39,6 +39,7 @@ include-package-data = true
 [tool.setuptools.package-data]
 atom = [
     "mesh/target/release/libmesh.so",
+    "benchmarks/results/schemas/*.json",
 ]
 
 [project.entry-points."vllm.platform_plugins"]

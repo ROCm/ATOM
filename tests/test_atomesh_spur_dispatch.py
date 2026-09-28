@@ -143,6 +143,29 @@ class SpurDispatchTest(unittest.TestCase):
             for line in (self.root / f"docker-{rank}.jsonl").read_text().splitlines()
         ]
 
+    def test_eval_only_pulls_image_and_runs_only_eval_on_both_workers(self):
+        self.run_job(EVAL_ONLY="true", RUN_EVAL="true", EVAL_TASK="gsm8k")
+        for rank in range(2):
+            calls = self.docker_calls(rank)
+            self.assertEqual(calls.count(["pull", "test-image"]), 1)
+            runs = [call for call in calls if call[0] == "run"]
+            self.assertEqual(len(runs), 1)
+            self.assertIn("ATOMESH_EXECUTION_PHASE=eval", runs[0])
+            self.assertIn("ATOMESH_SERVICE_PORT_OFFSET=1000", runs[0])
+
+    def test_eval_only_rejects_disabled_eval(self):
+        self.run_job(EVAL_ONLY="true", RUN_EVAL="false", expected_rc=2)
+        self.assertFalse((self.root / "dispatch.json").exists())
+
+    def test_eval_only_rejects_invalid_port_offset(self):
+        self.run_job(
+            EVAL_ONLY="1",
+            RUN_EVAL="1",
+            ATOMESH_RESTART_PORT_OFFSET="invalid",
+            expected_rc=2,
+        )
+        self.assertFalse((self.root / "dispatch.json").exists())
+
     def test_batch_dispatches_both_workers_and_preserves_topology(self):
         self.run_job()
         dispatch = json.loads((self.root / "dispatch.json").read_text())

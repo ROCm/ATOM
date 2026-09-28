@@ -783,10 +783,25 @@ start_router() {
   fi
   local -a router_dp_aware_args=()
   if is_agentic_dpa; then
-    router_policy="dp_sticky"
+    # Respect explicit cache-aware routing for DPA workloads.
+    if [[ "${router_policy}" != "cache_aware" ]]; then
+      router_policy="dp_sticky"
+    fi
     router_dp_aware_args=(--dp-aware)
   elif [[ "${#router_rank_mapping_args[@]}" -gt 0 ]]; then
     router_dp_aware_args=(--dp-aware)
+  fi
+  local -a router_policy_args=(--policy "${router_policy}")
+  if [[ "${router_policy}" == "cache_aware" ]]; then
+    # Keep the InferenceX defaults, with a case-level absolute-load override.
+    router_policy_args+=(
+      --prefill-policy cache_aware --decode-policy cache_aware
+      --cache-threshold 0.8
+      --balance-abs-threshold "${ROUTER_BALANCE_ABS_THRESHOLD:-20}"
+      --balance-rel-threshold 2.0
+      --eviction-interval 300
+    )
+    router_rank_mapping_args=(--atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}")
   fi
   local -a router_cmd=(
     "${mesh_binary}" launch
@@ -795,7 +810,7 @@ start_router() {
     --pd-disaggregation
     "${prefill_args[@]}"
     "${decode_args[@]}"
-    --policy "${router_policy}"
+    "${router_policy_args[@]}"
     "${router_rank_mapping_args[@]}"
     "${router_dp_aware_args[@]}"
     --backend atom
@@ -881,116 +896,7 @@ ensure_aiperf() {
 }
 
 write_aiperf_dashboard_json() {
-  local aiperf_json="$1"
-  local out_json="$2"
-  local conc="$3"
-  python3 - "${aiperf_json}" "${out_json}" "${conc}" <<'PY'
-import json
-import os
-import sys
-from pathlib import Path
-
-src = Path(sys.argv[1])
-dst = Path(sys.argv[2])
-conc = int(sys.argv[3])
-data = json.loads(src.read_text(encoding="utf-8"))
-
-
-def avg(name):
-    value = data.get(name)
-    if isinstance(value, dict):
-        return value.get("avg")
-    return value
-
-
-def pct(name, key):
-    value = data.get(name)
-    if isinstance(value, dict):
-        return value.get(key)
-    return None
-
-
-def total_tokens(name):
-    """Return one of AIPerf's profiling-only aggregate token counters."""
-    value = avg(name)
-    return int(value) if isinstance(value, (int, float)) else None
-
-
-# These aggregates contain successful profiling records only: AIPerf excludes
-# its internal warmup and requests cancelled during grace-period draining.
-cache_hit_tokens = total_tokens("total_usage_prompt_cache_read_tokens")
-cache_total_tokens = total_tokens("total_usage_prompt_tokens")
-
-payload = {
-    "benchmark_backend": "atom",
-    # Directory holding this run's profile_export.jsonl, so process_result.py can
-    # find the per-request records both interactivity definitions are computed
-    # from, without reconstructing the directory name.
-    "aiperf_artifact_dir": src.parent.name,
-    "benchmark_model_name": os.environ.get("MODEL_NAME")
-    or data.get("model")
-    or data.get("model_id"),
-    "backend": "atom",
-    "benchmark_kind": os.environ.get("BENCHMARK_KIND") or "aiperf_agentic",
-    "scenario": os.environ.get("AIPERF_SCENARIO"),
-    "public_dataset": os.environ.get("AIPERF_PUBLIC_DATASET"),
-    "topology": os.environ.get("TOPOLOGY") or data.get("topology"),
-    "display_topology": os.environ.get("DISPLAY_TOPOLOGY")
-    or data.get("display_topology"),
-    "precision": os.environ.get("PRECISION") or data.get("precision"),
-    "random_input_len": int(
-        data.get("max_context_length")
-        or os.environ.get("AIPERF_MAX_CONTEXT_LENGTH")
-        or 0
-    ),
-    "random_output_len": 1024,
-    "max_concurrency": conc,
-    "random_range_ratio": "",
-    "request_throughput": avg("request_throughput"),
-    "mean_ttft_ms": avg("time_to_first_token"),
-    "median_ttft_ms": pct("time_to_first_token", "p50"),
-    "p90_ttft_ms": pct("time_to_first_token", "p90"),
-    "p99_ttft_ms": pct("time_to_first_token", "p99"),
-    "mean_itl_ms": avg("inter_token_latency"),
-    "median_itl_ms": pct("inter_token_latency", "p50"),
-    "p90_itl_ms": pct("inter_token_latency", "p90"),
-    "p99_itl_ms": pct("inter_token_latency", "p99"),
-    "mean_e2el_ms": avg("request_latency"),
-    "median_e2el_ms": pct("request_latency", "p50"),
-    "p90_e2el_ms": pct("request_latency", "p90"),
-    "p99_e2el_ms": pct("request_latency", "p99"),
-    "input_throughput": avg("input_token_throughput"),
-    "output_throughput": avg("output_token_throughput"),
-    "total_token_throughput": avg("total_token_throughput"),
-    "successful_requests": avg("request_count"),
-    "completed": avg("request_count"),
-    "benchmark_duration_s": avg("benchmark_duration")
-    or data.get("benchmark_duration_s"),
-    "total_input_tokens": avg("total_usage_prompt_tokens"),
-    "total_output_tokens": avg("total_usage_completion_tokens"),
-    "cache_hit_tokens": cache_hit_tokens,
-    "cache_total_tokens": cache_total_tokens,
-    "cache_hit_rate": (
-        round(cache_hit_tokens / cache_total_tokens, 4)
-        if cache_hit_tokens is not None and cache_total_tokens
-        else None
-    ),
-}
-
-payload = {key: value for key, value in payload.items() if value is not None}
-dst.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-if cache_hit_tokens is not None and cache_total_tokens:
-    print(
-        f"[aiperf] prefix cache hit: {cache_hit_tokens}/{cache_total_tokens} "
-        f"tokens ({cache_hit_tokens / cache_total_tokens:.2%})"
-    )
-else:
-    print(
-        "[aiperf] prefix cache hit: unavailable "
-        "(AIPerf profiling cache-read counters were not produced)"
-    )
-print(f"[aiperf] dashboard json: {dst}")
-PY
+  python3 "${ATOMESH_SCRIPT_DIR}/../aiperf_dashboard.py" "$@"
 }
 
 write_aiperf_chrome_trace() {
@@ -1260,6 +1166,7 @@ run_eval() {
       --num_fewshot "${EVAL_FEWSHOT}" \
       "${limit_arg[@]}" \
       "${eval_extra_args[@]}" \
+      --log_samples \
       --output_path "${result_dir}"
 
     python3 - "${result_dir}" "${eval_conc}" <<'PY'

@@ -231,6 +231,7 @@ exports = {
     "PREFILL_EXTRA_SERVER_ARGS": prefill.get("extra_args", ""),
     "DECODE_EXTRA_SERVER_ARGS": decode.get("extra_args", ""),
     "RUN_EVAL": str(cell.get("run_eval", False)).lower(),
+    "EVAL_ONLY": str(cell.get("eval_only", False)).lower(),
     "EVAL_TASK": accuracy.get("task", "gsm8k"),
     "EVAL_FEWSHOT": accuracy.get("fewshot", 3),
     "EVAL_LIMIT": "" if accuracy.get("limit") is None else accuracy.get("limit"),

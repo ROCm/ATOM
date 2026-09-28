@@ -592,18 +592,12 @@ class KimiK3ForConditionalGeneration_(vLLMKimiK3):
                     quant_config=vision_quant_config,
                     prefix=maybe_prefix(prefix, "vision_tower"),
                 )
-                if vision_quant_config is not None:
-                    self.vision_tower = self.vision_tower.to(device=self.device)
-                else:
-                    self.vision_tower = self.vision_tower.to(
-                        device=self.device, dtype=model_config.dtype
-                    )
                 self.mm_projector = KimiK25MultiModalProjector(
                     config=vision_config,
                     use_data_parallel=self.use_data_parallel,
                     quant_config=projector_quant_config,
                     prefix=maybe_prefix(prefix, "mm_projector"),
-                ).to(device=self.device, dtype=model_config.dtype)
+                )
         else:
             self.vision_tower = PPMissingLayer()
             self.mm_projector = PPMissingLayer()

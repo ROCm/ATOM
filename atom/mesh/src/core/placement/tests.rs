@@ -1563,6 +1563,59 @@ mod f_atom_adapter {
     }
 
     #[test]
+    fn test_atom_inject_prefill_asks_for_token_ids() {
+        let (adapter, ctx) = atom_pair_for("http://p:8000", 8);
+        let mut body = json!({"prompt": "hi"});
+        adapter.inject_prefill_fields(&mut body, &ctx).unwrap();
+        assert_eq!(body["return_token_ids"], json!(true));
+    }
+
+    #[test]
+    fn test_carry_prompt_token_ids_moves_them_into_decode_kv() {
+        let prefill_body = json!({
+            "id": "cmpl-1",
+            "prompt_token_ids": [5, 6, 7],
+            "kv_transfer_params": {"do_remote_prefill": true},
+        });
+        let mut kv = json!({"do_remote_prefill": true});
+        let carried = AtomAdapter::carry_prompt_token_ids(&prefill_body, &mut kv);
+        assert_eq!(carried, 3);
+        assert_eq!(kv["prompt_token_ids"], json!([5, 6, 7]));
+        // Preserve the existing transfer metadata.
+        assert_eq!(kv["do_remote_prefill"], json!(true));
+    }
+
+    #[test]
+    fn test_carry_prompt_token_ids_absent_is_not_an_error() {
+        // Older prefill servers omit IDs; decode falls back to tokenization.
+        let prefill_body = json!({"kv_transfer_params": {"do_remote_prefill": true}});
+        let mut kv = json!({"do_remote_prefill": true});
+        let carried = AtomAdapter::carry_prompt_token_ids(&prefill_body, &mut kv);
+        assert_eq!(carried, 0);
+        assert!(kv.get("prompt_token_ids").is_none());
+    }
+
+    #[test]
+    fn test_carry_prompt_token_ids_skips_unusable_shapes() {
+        for unusable in [json!(null), json!([]), json!("5,6,7"), json!(7)] {
+            let prefill_body = json!({"prompt_token_ids": unusable.clone()});
+            let mut kv = json!({});
+            let carried = AtomAdapter::carry_prompt_token_ids(&prefill_body, &mut kv);
+            assert_eq!(carried, 0, "must not carry {}", unusable);
+            assert!(kv.get("prompt_token_ids").is_none());
+        }
+    }
+
+    #[test]
+    fn test_carry_prompt_token_ids_non_object_kv_is_dropped() {
+        let prefill_body = json!({"prompt_token_ids": [1, 2]});
+        let mut kv = json!("not-an-object");
+        let carried = AtomAdapter::carry_prompt_token_ids(&prefill_body, &mut kv);
+        assert_eq!(carried, 0);
+        assert_eq!(kv, json!("not-an-object"));
+    }
+
+    #[test]
     fn test_atom_enrich_decode_kv_wrong_ctx_errors() {
         let info = atom_info_with("http://p:8000", 8);
         let adapter = AtomAdapter::new(info);

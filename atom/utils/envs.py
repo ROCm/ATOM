@@ -45,13 +45,99 @@ def _positive_float_env(name: str, default: str) -> float:
     return float(default)
 
 
+def _flag_env(name: str, default: str = "0") -> bool:
+    # Stripped, and empty reads as off: `VAR=` is how a shell script clears a
+    # flag inline, and a bare membership test reads the empty string as ON --
+    # the opposite of what the operator wrote. `VAR="off "` did the same.
+    raw = os.getenv(name, default).strip().lower()
+    return bool(raw) and raw not in ("0", "false", "no", "off")
+
+
+def _optional_int_env(name: str, *, min_value: int | None = None) -> int | None:
+    """Unset or empty reads as None; anything else must be an integer."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+    if min_value is not None and value < min_value:
+        raise ValueError(f"{name} must be >= {min_value}, got {value}")
+    return value
+
+
+def _int_env(name: str, default: int) -> int:
+    """Unset or empty reads as ``default``; anything else must be an integer."""
+    value = _optional_int_env(name)
+    return default if value is None else value
+
+
+def _int_env_or_default(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r: expected an integer; using default %d",
+            name,
+            raw,
+            default,
+        )
+        return default
+
+
+def _nonnegative_int_env(name: str, default: int) -> int:
+    value = _int_env_or_default(name, default)
+    if value < 0:
+        logger.warning(
+            "Invalid %s=%r: expected a nonnegative integer; using default %d",
+            name,
+            value,
+            default,
+        )
+        return default
+    return value
+
+
+def _finite_float_env(name: str, default: float, *, allow_zero: bool) -> float:
+    """Unset or empty reads as ``default``; a set value must be a valid float."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from exc
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    if allow_zero and value < 0:
+        raise ValueError(f"{name} must be nonnegative")
+    if not allow_zero and value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Forward metadata transport: direct or packed. Both keep source checks.
+    # Single-member groups and strided bindings retain direct copies.
+    "ATOM_H2D_BACKEND": lambda: os.getenv("ATOM_H2D_BACKEND", "direct"),
     # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
     "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
         os.getenv("ATOM_PREFIX_CACHE_PROTECTED_RATIO", "0.5")
+    ),
+    # LMCache KV offload without --kv-transfer-config: "lmcache" (in-process) or
+    # "lmcache_mp" (standalone `lmcache server`). Unset = off.
+    "ATOM_KV_OFFLOAD": lambda: os.getenv("ATOM_KV_OFFLOAD", ""),
+    # JSON object for that connector's kv_connector_extra_config, e.g.
+    # {"lmcache.chunk_size": 256} or {"lmcache.mp.port": 5556}.
+    "ATOM_KV_OFFLOAD_EXTRA_CONFIG": lambda: os.getenv(
+        "ATOM_KV_OFFLOAD_EXTRA_CONFIG", ""
     ),
     # --- Data Parallelism ---
     "ATOM_DP_RANK": lambda: int(os.getenv("ATOM_DP_RANK", "0")),
@@ -167,6 +253,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # own MEGA_DISPATCH=flydsl|mori), 0 binds mori's v2 op-layer running plain
     # gather, i.e. the untouched upstream baseline.
     "ATOM_MORI_V2_FUSED": lambda: os.getenv("ATOM_MORI_V2_FUSED", "0") == "1",
+    # MegaMoE combine (return-trip) wire: bf16 | fp8 | fp4. Prefill-only; decode
+    # always combines in bf16. Ignored unless ATOM_MORI_V2_FUSED is on.
+    "ATOM_MEGA_COMBINE_WIRE": lambda: os.getenv("ATOM_MEGA_COMBINE_WIRE", "bf16"),
     # Reuse a 128-token MegaMoEV2 instance for native DP-unified small decode/
     # verify/draft forwards on the supported EP8, 48-experts-per-rank layout. Set to 0
     # to keep the configured max_num_batched_tokens capacity for every graph.
@@ -270,6 +359,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
+    # DeepSeek-V4.1: how many of an attention layer's branches leave the main
+    # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
+    # the scorer that first reads it; 2 the indexer as well, on one of its own.
+    # Default 0 because forking measured slower per layer, not faster -- the
+    # periods and the noise floor under them are in the environment doc, and
+    # end-to-end throughput is too coarse to see an effect that size.
+    "ATOM_DSV41_SIDE_STREAMS": lambda: int(os.getenv("ATOM_DSV41_SIDE_STREAMS", "0")),
     # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
     # (K3DSparkMLAAttention.write_context_kv) into one Triton kernel --
     # RMSNorm(kv_c) + rope(k_pe) + concat + paged-cache store, versus today's
@@ -512,6 +608,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_V4_PREFILL_ASM_FOR_DECODE": lambda: (
         os.getenv("ATOM_USE_V4_PREFILL_ASM_FOR_DECODE", "0") == "1"
     ),
+    # Route the paged decode to aiter's FlyDSL kernel (#4332) instead of gluon.
+    "ATOM_PA_FLYDSL": lambda: (os.getenv("ATOM_PA_FLYDSL", "0") == "1"),
+    # FlyDSL GPU work planner, built once per forward in the metadata
+    # builder. Needs ATOM_PA_FLYDSL=1. On by default so enabling FlyDSL gets the
+    # measured configuration (+20.5% interactivity at conc 20).
+    "ATOM_PA_FLYDSL_PLAN": lambda: (os.getenv("ATOM_PA_FLYDSL_PLAN", "1") == "1"),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
@@ -721,11 +823,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK", "") == ""
         else float(os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK"))
     ),
-    # TTFT SLA guard: if any rank's oldest schedulable waiting prefill has queued
-    # (since arrival) >= this many ms, force-release regardless of the fill
-    # target. Bounds worst-case TTFT. Empty string => None => disabled (set this
-    # to your TTFT budget in ms to activate; a small value under heavy backlog
-    # will fire every tick and defeat coalescing, so size it to the SLA).
+    # After decode protection, bound extra coalescing by queue age. Checkpoint
+    # dependency waits use TTFT_MAX_TICKS; this is not an end-to-end TTFT bound.
+    # Empty string => None => disabled.
     "ATOM_PREFILL_DELAYER_MAX_QUEUE_MS": lambda: (
         None
         if os.getenv("ATOM_PREFILL_DELAYER_MAX_QUEUE_MS", "") == ""
@@ -734,6 +834,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # After a prefill forward, protect this many scheduler passes for decode
     # before allowing another prefill. Mirrors SGLang's
     # --prefill-decode-interval; 0 disables the hard interval.
+    # A nonzero interval also enables local coalescing on TP without PP.
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
     ),
@@ -800,6 +901,74 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENGRAM_OVERLAP": lambda: os.getenv("ATOM_ENGRAM_OVERLAP", "1") == "1",
     # Fuse FP32 post-wkv gating and residual addition; 0 selects the torch reference.
     "ATOM_ENGRAM_FUSED_GATE": lambda: os.getenv("ATOM_ENGRAM_FUSED_GATE", "1") == "1",
+    # --- KV offload (LMCache) ---
+    # Unset or empty always means the default, so a knob can be cleared inline.
+    # A set but unusable value warns and falls back for the token thresholds
+    # and lookup step counts, which only tune reuse; it is rejected at startup
+    # for widths, sizes and timeouts, which shape memory and concurrency.
+    # Save / load executor widths of the offload worker. DSV4 ignores
+    # OFFLOAD_LOAD_WORKERS: its SLOT load path needs a serial load executor.
+    "OFFLOAD_COPY_WORKERS": lambda: _int_env("OFFLOAD_COPY_WORKERS", 1),
+    "OFFLOAD_LOAD_WORKERS": lambda: _int_env("OFFLOAD_LOAD_WORKERS", 1),
+    # Running-plus-queued save bound. None means unset: the connector then
+    # derives max(2, 2 * OFFLOAD_COPY_WORKERS) and the scheduler's state tier
+    # uses 2. A kv_connector_extra_config "max_pending_saves" takes precedence.
+    "OFFLOAD_MAX_PENDING_SAVES": lambda: _optional_int_env("OFFLOAD_MAX_PENDING_SAVES"),
+    # Minimum external-tier hit worth loading, in tokens. And the shortest
+    # prefix native lmcache_mp stores: an absolute boundary, for normal and
+    # late saves alike (other connectors ignore it).
+    "OFFLOAD_MIN_LOAD_TOKENS": lambda: max(
+        0, _int_env_or_default("OFFLOAD_MIN_LOAD_TOKENS", 8192)
+    ),
+    "OFFLOAD_MIN_SAVE_TOKENS": lambda: max(
+        0, _int_env_or_default("OFFLOAD_MIN_SAVE_TOKENS", 8192)
+    ),
+    # Scheduler steps a memoised tier-lookup answer is replayed, and steps a
+    # failed lookup suppresses the next attempt.
+    "OFFLOAD_LOOKUP_MEMO_STEPS": lambda: _nonnegative_int_env(
+        "OFFLOAD_LOOKUP_MEMO_STEPS", 32
+    ),
+    "OFFLOAD_LOOKUP_RETRY_STEPS": lambda: _nonnegative_int_env(
+        "OFFLOAD_LOOKUP_RETRY_STEPS", 32
+    ),
+    # Per-transfer offload profiling logs.
+    "OFFLOAD_PROFILE": lambda: _flag_env("OFFLOAD_PROFILE"),
+    # Experimental: run the staging pack and copy legs on one stream.
+    "OFFLOAD_SINGLE_STREAM": lambda: _flag_env("OFFLOAD_SINGLE_STREAM"),
+    # GPU staging buffer size in LMCache chunks, and an upper bound in bytes.
+    # Unset derives the size from the KV geometry.
+    "OFFLOAD_GPU_STAGING_CHUNKS": lambda: _optional_int_env(
+        "OFFLOAD_GPU_STAGING_CHUNKS", min_value=1
+    ),
+    "OFFLOAD_GPU_STAGING_MAX_BYTES": lambda: _optional_int_env(
+        "OFFLOAD_GPU_STAGING_MAX_BYTES", min_value=1
+    ),
+    # Free the GPU staging buffer after each transfer instead of keeping it.
+    "OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER": lambda: _flag_env(
+        "OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER"
+    ),
+    # DSV4 SLOT sidecar staging rows; None means unset (1). A
+    # kv_connector_extra_config "slot_sidecar_staging_slots" takes precedence.
+    "OFFLOAD_SLOT_STAGING_SLOTS": lambda: _optional_int_env(
+        "OFFLOAD_SLOT_STAGING_SLOTS"
+    ),
+    # DSV4 committed SLOT sidecar index capacity; None means unset (65536). A
+    # kv_connector_extra_config "committed_sidecar_index_capacity" takes
+    # precedence.
+    "OFFLOAD_COMMITTED_SIDECAR_CAPACITY": lambda: _optional_int_env(
+        "OFFLOAD_COMMITTED_SIDECAR_CAPACITY"
+    ),
+    # DSV4 wait for a saved SLOT sidecar to become visible, and its poll period.
+    "OFFLOAD_PUBLICATION_TIMEOUT_S": lambda: _finite_float_env(
+        "OFFLOAD_PUBLICATION_TIMEOUT_S", 5.0, allow_zero=True
+    ),
+    "OFFLOAD_PUBLICATION_POLL_INTERVAL_S": lambda: _finite_float_env(
+        "OFFLOAD_PUBLICATION_POLL_INTERVAL_S", 0.01, allow_zero=False
+    ),
+    # LMCache MP transfer mode: auto or lmcache_driven (engine_driven is
+    # rejected as not implemented). A kv_connector_extra_config
+    # "lmcache.mp.mp_transfer_mode" takes precedence.
+    "LMCACHE_MP_TRANSFER_MODE": lambda: os.getenv("LMCACHE_MP_TRANSFER_MODE", "auto"),
 }
 
 
@@ -840,9 +1009,3 @@ def __getattr__(name: str):
 #                                   env itself -- it asks the connector, via
 #                                   save_abandon_timeout_s. ATOM does not own the
 #                                   knob, hence no default of its own here.
-# OFFLOAD_MAX_PENDING_SAVES       — offload connector queue-depth bound;
-#                                   defined/defaulted in
-#                                   kv_transfer/offload/_offload_common.py and
-#                                   documented in kv_transfer/offload/README.md.
-#                                   The state tier shares it (scheduler.py)
-#                                   rather than adding a second knob.

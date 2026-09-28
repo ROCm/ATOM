@@ -1,0 +1,87 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ATOM benchmark v1 manifest",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "const": "atom-benchmark/v1"
+    },
+    "aggregation_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source": {
+      "type": "object",
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "repository",
+        "run_id",
+        "attempt"
+      ]
+    },
+    "point_id": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "recipe_fingerprint": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "enum": [
+        "complete",
+        "partial",
+        "failed"
+      ]
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "boolean"
+      }
+    },
+    "files": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "sha256",
+          "bytes"
+        ]
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "aggregation_version",
+    "source",
+    "point_id",
+    "recipe_fingerprint",
+    "status",
+    "capabilities",
+    "files"
+  ]
+}

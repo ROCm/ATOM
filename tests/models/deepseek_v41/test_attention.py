@@ -53,6 +53,147 @@ def test_rope_pair_rotates_both_as_two_separate_calls_would():
     assert actual[0] is query and actual[1] is latent
 
 
+class _Step:
+    """The fields the window write reads: one request and one padding row."""
+
+    def __init__(self, tokens, slot, device):
+        self.width = tokens
+        self.positions = torch.arange(tokens, device=device, dtype=torch.int32)
+        self.batch_ids = torch.zeros(tokens, device=device, dtype=torch.int32)
+        self.batch_ids[-1] = -1
+        self.cu_seqlens_q = torch.tensor([0, tokens - 1], device=device)
+        self.slots = torch.tensor([slot], device=device, dtype=torch.int32)
+
+
+def _window(packed, start, slot_rows, ring, run_rows):
+    """`WindowParams` as `geometry.window` builds it for either layout."""
+    params = type("Window", (), {})()
+    params.ring_start, params.slot_rows, params.ring_slots = start, slot_rows, ring
+    params.ring_stride, params.run_rows = (1, run_rows) if packed else (ring, ring)
+    return params
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("packed", [True, False])
+def test_fused_seam_reproduces_rope_quant_and_window_byte_for_byte(packed):
+    """The fused KV seam against the launches it replaces, in both layouts.
+
+    Bytes, not a tolerance: the quantization shares its exponent helper with
+    `quantize_fp8`, and the rotation has to land on the same BF16 value the
+    removed kernel boundaries used to round to. A tolerance here would pass
+    while the cache and the extend rows disagreed by a code.
+
+    The BF16 arm is the one a server reaches -- `--kv_cache_dtype` offers no
+    `fp4` -- and its reference writer walks the ring per request rather than
+    per token, so agreeing with it also pins that the two grids select the
+    same rows.
+    """
+    from atom.model_ops.attentions.deepseek_v41.packed_rows import write_packed_window
+    from atom.model_ops.blockscale import quantize_fp8
+    from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
+    from atom.model_ops.v4_kernels.state_writes import swa_write
+
+    torch.manual_seed(725)
+    device, tokens, heads, dim, rope_dim, ring = "cuda", 13, 4, 512, 64, 8
+    slot, start = 3, 4096
+    # A packed ring is addressed in bytes and a BF16 one in rows, so every
+    # length below carries the unit its own pool is indexed in.
+    run_rows = dim + dim // 32 if packed else 1
+    slot_rows = ring * run_rows
+    units_per_row = run_rows if packed else dim
+    rope = RotaryEmbedding(rope_dim, 1024, base=10000).to(device)
+    step = _Step(tokens, slot, device)
+    # The RoPE entry reads its row count off the first two dims, so both stay
+    # in the batched shape the attention hands over and the kernel takes views.
+    query = torch.randn(1, tokens, heads, dim, device=device, dtype=torch.bfloat16)
+    normed = torch.randn(1, tokens, dim, device=device, dtype=torch.bfloat16)
+    window = _window(packed, start, slot_rows, ring, run_rows)
+
+    rotated = rope(normed.clone(), step.positions)
+    values, scales = quantize_fp8(rotated)
+    qat = quantize_fp8(rotated, dequantize=True)
+    rows = start + (slot + 1) * slot_rows
+    if packed:
+        pool = torch.zeros(rows, device=device, dtype=torch.uint8)
+        write_packed_window(values, scales, pool, step, window, dim)
+        base = start + slot * slot_rows
+    else:
+        pool = torch.zeros(rows, dim, device=device, dtype=torch.bfloat16)
+        swa_write(
+            qat.view(tokens, dim),
+            step.positions,
+            step.cu_seqlens_q,
+            step.slots,
+            pool,
+            window,
+            ring,
+        )
+        base = (start + slot * slot_rows) * dim
+    # Without this the ring arms compare two untouched buffers. Rows, not
+    # elements: an element is free to be zero, a whole row is not.
+    written = pool.reshape(-1)[base : base + ring * units_per_row]
+    assert int((written.view(ring, units_per_row) != 0).any(-1).sum()) == min(
+        tokens - 1, ring
+    )
+
+    actual_pool = torch.zeros_like(pool)
+    actual_query = query.clone()
+    rope_quant_window(
+        actual_query.view(tokens, heads, dim),
+        normed.view(tokens, dim),
+        rope.cos_cache,
+        rope.sin_cache,
+        step.positions,
+        rope_dim=rope_dim,
+        ring=(actual_pool, step, window, packed),
+    )
+
+    assert torch.equal(actual_query, rope(query.clone(), step.positions))
+    assert torch.equal(actual_pool, pool)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_fused_seam_emits_the_rows_a_prefill_attends_to():
+    """The other half: a prefill stores nothing and hands its rows back.
+
+    Its window write has to stay behind attention, so this mode replaces the
+    two `quantize_fp8` calls rather than the window writer, and both of their
+    outputs have to come out of the one launch unchanged.
+    """
+    from atom.model_ops.blockscale import quantize_fp8
+    from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
+
+    torch.manual_seed(726)
+    device, tokens, heads, dim, rope_dim = "cuda", 13, 4, 512, 64
+    rope = RotaryEmbedding(rope_dim, 1024, base=10000).to(device)
+    positions = torch.arange(tokens, device=device, dtype=torch.int32)
+    normed = torch.randn(1, tokens, dim, device=device, dtype=torch.bfloat16)
+    query = torch.randn(1, tokens, heads, dim, device=device, dtype=torch.bfloat16)
+
+    rotated = rope(normed.clone(), positions)
+    values, scales = quantize_fp8(rotated)
+    qat = quantize_fp8(rotated, dequantize=True)
+
+    actual_values = torch.empty_like(values)
+    actual_scales = torch.empty_like(scales)
+    actual_qat = torch.empty_like(normed)
+    rope_quant_window(
+        query.view(tokens, heads, dim),
+        normed.view(tokens, dim),
+        rope.cos_cache,
+        rope.sin_cache,
+        positions,
+        rope_dim=rope_dim,
+        qat=actual_qat,
+        values=actual_values,
+        scales=actual_scales,
+    )
+
+    assert torch.equal(actual_qat.view(tokens, dim), qat.view(tokens, dim))
+    assert torch.equal(actual_values.view(torch.uint8), values.view(torch.uint8))
+    assert torch.equal(actual_scales.view(torch.uint8), scales.view(torch.uint8))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("ratio", [1, 2])
 def test_compressor_all_chunk_boundaries_against_official_decode(

@@ -23,6 +23,7 @@ from atom.model_engine.page_unit_checkpoint import (
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAModules
+from atom.model_ops.attentions.pool_layout.paged_state_copy import DescriptorStaging
 from atom.model_ops.attentions.pool_layout.pool_rows import PoolRowsMixin
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import SubPoolSpec
 from atom.model_ops.attentions.token_layout.batch_ids import (
@@ -32,8 +33,10 @@ from atom.model_ops.attentions.token_layout.batch_ids import (
 from atom.model_ops.attentions.token_layout.prefill import prefill_positions
 from atom.model_ops.attentions.token_layout.slots import slot_mapping
 from atom.model_ops.dcp_ops import dcp_prefill_slot_mapping
-from atom.utils import CpuGpuBuffer, pack_rows
+from atom.utils import CpuGpuBuffer
+from atom.utils.block_tables import block_table_state
 from atom.utils.forward_context import AttentionMetaData, AttnState, ForwardMode
+from atom.utils.h2d import h2d_producer
 from atom.utils.tbo.ubatch_splitting import (
     UBatchSlice,
     attach_tbo_cpu_lens,
@@ -222,7 +225,11 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         A capture runs the model for real, so it writes through these; replay
         overwrites them with real rows.
         """
-        for buf in self.cache_write_targets():
+        targets = self.cache_write_targets()
+        for buf in targets:
+            if getattr(buf, "_publication", None) is not None:
+                buf._publication.acquire_write()
+        for buf in targets:
             buf.np[:] = PAD_SLOT_ID
             buf.copy_to_gpu()
 
@@ -336,12 +343,65 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         self,
         store_ops: Sequence[CheckpointStoreOp],
         restore_ops: Sequence[CheckpointRestoreOp],
+        descriptor_slot: int = 0,
     ) -> None:
-        """Copy checkpoints between Active Slots and arbitrary PAGEs."""
+        """Copy checkpoints between Active Slots and arbitrary PAGEs.
+
+        Stateful backends use ``descriptor_slot`` to isolate concurrent copy
+        descriptors. The default implementation only handles the empty no-op
+        case, so it intentionally leaves that interface argument unused.
+        """
         if store_ops or restore_ops:
             raise NotImplementedError(
                 f"{type(self).__name__} does not implement PAGE-backed state copy"
             )
+
+    def reserve_checkpoint_descriptors(self, descriptor_slots) -> None:
+        """Allocate staging for out-of-band copy slots before serving.
+
+        Allocating pinned memory synchronizes, so a slot first touched by a
+        mid-serving restore would stall its thread. A connector that will pass
+        these slots to `execute_paged_state_copies` reserves them up front.
+        """
+        self._checkpoint_staging().reserve(descriptor_slots)
+
+    def _checkpoint_descriptor_device(self) -> torch.device:
+        """Device of the planes `execute_paged_state_copies` copies between."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement PAGE-backed state copy"
+        )
+
+    def _checkpoint_staging(self) -> DescriptorStaging:
+        """Pinned staging for a step's whole descriptor, sized for the worst step.
+
+        Pinned because the alternative synchronizes: a pageable H2D from
+        `build()` makes the host wait out the forward already enqueued, which
+        measured 2.9 ms behind 4 ms of work against 0.1 ms staged. Reused
+        because allocating pinned memory is itself a synchronizing call.
+
+        A step can carry at most one store and one restore per sequence, so two
+        per sequence bounds it. The caller checks that bound rather than growing
+        on demand: a descriptor that did not fit would otherwise be silently
+        truncated into a copy of the wrong shape.
+
+        The store half of that bound is not a property of the batch -- it is
+        held by `PagedStateCheckpointCoordinator._supersede`, which keeps one
+        pending boundary per sequence. A change that let two of a sequence's
+        boundaries drain together would raise from `build()` here, and would be
+        storing one of them from the wrong slot besides; the two constraints
+        have the same owner and move together.
+
+        Slot 0 serves `build()`; each other descriptor slot is a separate,
+        separately fenced buffer (see `DescriptorStaging`).
+        """
+        staging = getattr(self, "_checkpoint_staging_cache", None)
+        if staging is None:
+            plan = self._checkpoint_copy_plan()
+            max_ops = 2 * int(self.model_runner.config.max_num_seqs)
+            staging = self._checkpoint_staging_cache = DescriptorStaging(
+                max_ops * plan.num_spans, self._checkpoint_descriptor_device()
+            )
+        return staging
 
     def warmup_per_req_cache(self) -> None:
         """Pay whatever the first checkpoint copy would pay, before serving.
@@ -444,6 +504,8 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 
 
 class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic[T]):
+    capture_owns_cu_seqlens_q = False
+
     def __init__(self, model_runner):
         self.model_runner = model_runner
         assert model_runner.block_size % self.block_size == 0
@@ -493,19 +555,24 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
 
+        prefill_i64 = dict(i64_kwargs, publication_group="prefill")
+        prefill_i32 = dict(i32_kwargs, publication_group="prefill")
+
         attn_metadata = {
-            "slot_mapping": CpuGpuBuffer(self.max_num_batched_tokens, **i64_kwargs),
-            "context_lens": CpuGpuBuffer(self.max_bs, **i32_kwargs),
+            "slot_mapping": CpuGpuBuffer(self.max_num_batched_tokens, **prefill_i64),
+            "context_lens": CpuGpuBuffer(self.max_bs, **prefill_i32),
             "block_tables": CpuGpuBuffer(
-                self.max_bs, self.block_table_cols, **i32_kwargs
+                self.max_bs, self.block_table_cols, **prefill_i32
             ),
-            "cu_seqlens_q": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
-            "cu_seqlens_k": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
+            "cu_seqlens_q": CpuGpuBuffer(
+                self.max_bs + 1, **i32_kwargs, publication_group="early"
+            ),
+            "cu_seqlens_k": CpuGpuBuffer(self.max_bs + 1, **prefill_i32),
             # Uploaded only on a prefix-cache hit, so consumers read
             # `AttentionMetaData.num_cached_tokens is None` as "no row has any".
-            "num_cached_tokens": CpuGpuBuffer(self.max_bs, **i32_kwargs),
+            "num_cached_tokens": CpuGpuBuffer(self.max_bs, **prefill_i32),
             # seq_starts for cp_mha_gather_cache: always zeros (prefix at position 0)
-            "seq_starts": CpuGpuBuffer(self.max_bs, **i32_kwargs),
+            "seq_starts": CpuGpuBuffer(self.max_bs, **prefill_i32),
             # token -> seq over this fwd's QUERY tokens; `-1` on the CUDAGraph
             # pad tail. Every backend needs it (see token_layout/batch_ids.py).
             "batch_id_per_q_token": CpuGpuBuffer(
@@ -533,15 +600,22 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         the target's metadata, so a write here would reach the verify step.
         """
 
-    def prepare_block_tables(self, batch: ScheduledBatch):
-        """Marshal the batch's block tables into `forward_vars["block_tables"]`.
+    def prepare_block_tables(self, batch: ScheduledBatch, running_bs=None):
+        """Prepare the shared CPU snapshot, reusing unchanged page mappings."""
+        return block_table_state(
+            self.model_runner.forward_vars["block_tables"]
+        ).prepare(batch.block_tables, pad_to=running_bs)
 
-        Runs on every prefill step, not only the ones that upload the buffer:
-        `prepare_prefill` reads it back to place each token's KV slot, so a
-        caller that wants the table on the device only has to upload it.
-        """
-        pack_rows(self.model_runner.forward_vars["block_tables"].np, batch.block_tables)
+    def _check_metadata_writable(self, *group_names: str) -> None:
+        """Preflight persistent host sources before any producer mutates them."""
+        groups = getattr(self.model_runner, "h2d_groups", None)
+        if groups is not None:
+            for name in group_names:
+                group = groups.get(name)
+                if group is not None:
+                    group.check_writable()
 
+    @h2d_producer("mrope", runner="model_runner")
     def _mrope_cpu_view(self, num_tokens: int) -> np.ndarray:
         return (
             self.model_runner.forward_vars["mrope_positions"]
@@ -551,9 +625,15 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
 
     def _copy_mrope_to_gpu(self, num_tokens: int) -> torch.Tensor:
         buf = self.model_runner.forward_vars["mrope_positions"]
-        buf.gpu.reshape(-1)[: 3 * num_tokens].copy_(
-            buf.cpu.reshape(-1)[: 3 * num_tokens], non_blocking=True
-        )
+        if getattr(buf, "_publication", None) is not None:
+            group = self.model_runner.h2d_groups["mrope"]
+            group.counts[0] = 3 * num_tokens
+            group.publish(group.counts)
+        else:
+            # Independent, unregistered builder callers retain flat semantics.
+            buf.gpu.reshape(-1)[: 3 * num_tokens].copy_(
+                buf.cpu.reshape(-1)[: 3 * num_tokens], non_blocking=True
+            )
         return self.model_runner._mrope_positions_view(num_tokens)
 
     def _build_mrope_prefill_positions(
@@ -587,12 +667,18 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         batch: ScheduledBatch,
         context_lens: np.ndarray,
         max_seqlen_q: int,
+        *,
+        running_tokens: int | None = None,
     ) -> torch.Tensor | None:
         if not getattr(self.model_runner, "use_mrope", False):
             return None
 
         scheduled_tokens = batch.total_tokens_num_decode
-        positions = self._mrope_cpu_view(scheduled_tokens)
+        # Every decode model view uses the padded token count as its axis
+        # stride, in both eager execution and graph replay.
+        width = scheduled_tokens if running_tokens is None else running_tokens
+        positions = self._mrope_cpu_view(width)
+        positions[:, scheduled_tokens:] = 0
         offset = 0
         for req_id, context_len in zip(batch.req_ids, context_lens):
             start = int(context_len) - max_seqlen_q
@@ -605,11 +691,18 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             positions[:, offset : offset + max_seqlen_q] = base[None, :]
             offset += max_seqlen_q
 
-        return self._copy_mrope_to_gpu(scheduled_tokens)
+        return self._copy_mrope_to_gpu(width)[:, :scheduled_tokens]
 
     def publish_cu_seqlens_q(
         self, batch: ScheduledBatch, forward_mode: ForwardMode
     ) -> None:
+        count = self.prepare_cu_seqlens_q(batch, forward_mode)
+        self.model_runner.forward_vars["cu_seqlens_q"].copy_to_gpu(count)
+
+    @h2d_producer("early", runner="model_runner")
+    def prepare_cu_seqlens_q(
+        self, batch: ScheduledBatch, forward_mode: ForwardMode
+    ) -> int:
         """Publish this step's `cu_seqlens_q`. The only writer.
 
         Lives here because this class declares the buffer and defines its
@@ -630,8 +723,8 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         cu = self.model_runner.forward_vars["cu_seqlens_q"]
         cu.np[1 : scheduled_bs + 1] = np.cumsum(batch.num_scheduled_tokens)
         cu.np[scheduled_bs + 1 : forward_mode.running_bs + 1] = batch.total_tokens_num
-        # The step's only H2D for this buffer; every consumer slices `.gpu`.
-        cu.copy_to_gpu(forward_mode.running_bs + 1)
+        # Caller publishes alone or with sampling/IDs before token assembly.
+        return forward_mode.running_bs + 1
 
     def decode_spans(self, batch: ScheduledBatch) -> tuple[int, np.ndarray, np.ndarray]:
         """A pure-decode step's `(bs, per-request lengths, exclusive prefix sum)`.
@@ -729,8 +822,13 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
     ) -> torch.Tensor:
         """Build the token -> seq map into the shared buffer and upload it."""
         buf = self.model_runner.forward_vars["batch_id_per_q_token"]
+        if getattr(buf, "_publication", None) is not None:
+            buf._publication.acquire_write()
         build_batch_ids(seqlens, pad_to=pad_to, out=buf.np)
         return buf.copy_to_gpu(pad_to or int(seqlens.sum()))
+
+    def _prefill_block_table_rows(self, scheduled_bs, running_bs, has_cached):
+        return scheduled_bs if has_cached else None
 
     def _upload_prefill_mirrors(
         self,
@@ -759,16 +857,32 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             # already an int32 array rather than a Python list.
             var["num_cached_tokens"].np[:scheduled_bs] = cached_lens
             vars_used += [
-                ("block_tables", scheduled_bs),
                 ("seq_starts", scheduled_bs),
                 ("num_cached_tokens", scheduled_bs),
             ]
-        ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
+        block_rows = self._prefill_block_table_rows(
+            scheduled_bs, running_bs, has_cached
+        )
+        if block_rows is not None:
+            vars_used.append(("block_tables", block_rows))
+        groups = self.model_runner.h2d_groups
+        combined = "prefill_inputs" in groups and not self.model_runner.use_mrope
+        group = groups["prefill_inputs" if combined else "prefill"]
+        counts = group.counts
+        for i in range(len(counts)):
+            counts[i] = None
+        for name, count in vars_used:
+            counts[group.indices[name]] = count
+        if combined:
+            counts[group.indices["positions"]] = scheduled_tokens
+        block_table_state(var["block_tables"]).publish(block_rows, group=group)
+        ctx = {name: var[name].gpu[:count] for name, count in vars_used}
         # Already on the device: `publish_cu_seqlens_q` uploads it for every
         # step, so this is a view. One writer AND one upload for this buffer.
         ctx["cu_seqlens_q"] = var["cu_seqlens_q"].gpu[: running_bs + 1]
         return ctx
 
+    @h2d_producer("prefill", "positions", runner="model_runner")
     def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
         scheduled_bs = batch.total_seqs_num_prefill
         scheduled_tokens = batch.total_tokens_num_prefill
@@ -855,6 +969,8 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         mrope_positions = self._build_mrope_prefill_positions(batch)
         if mrope_positions is not None:
             positions = mrope_positions
+        elif "prefill_inputs" in self.model_runner.h2d_groups:
+            positions = var["positions"].gpu[:scheduled_tokens]
         else:
             positions = var["positions"].copy_to_gpu(scheduled_tokens)
 

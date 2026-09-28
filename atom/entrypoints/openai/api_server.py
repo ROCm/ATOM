@@ -753,15 +753,16 @@ def _send_stream_chunk_tagged(
 
 
 async def generate_async(
-    prompt: str,
+    prompt_or_tokens: str | list[int],
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,
     data_parallel_rank: int | None = None,
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
+    return_token_ids: bool = False,
 ) -> AsyncGenerator[dict[str, Any], None]:
-    """Generate text asynchronously for non-streaming requests."""
+    """Generate non-streaming output, optionally echoing local prompt token IDs."""
     token_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
@@ -801,7 +802,7 @@ async def generate_async(
 
     def do_preprocess():
         return engine.io_processor.preprocess(
-            prompt,
+            prompt_or_tokens,
             sampling_params,
             stream_callback=completion_callback,
             kv_transfer_params=kv_transfer_params,
@@ -850,7 +851,13 @@ async def generate_async(
 
     text = delivered_text(all_token_ids)
     num_tokens_input = (
-        seq.num_prompt_tokens if seq is not None else len(tokenizer.encode(prompt))
+        seq.num_prompt_tokens
+        if seq is not None
+        else len(
+            prompt_or_tokens
+            if isinstance(prompt_or_tokens, list)
+            else tokenizer.encode(prompt_or_tokens)
+        )
     )
     num_tokens_output = len(all_token_ids)
     finished_at = time.time()
@@ -877,6 +884,9 @@ async def generate_async(
     }
     if kv_transfer_output_meta_info is not None:
         response["kv_transfer_output_meta_info"] = kv_transfer_output_meta_info
+    if return_token_ids and seq is not None:
+        # Convert the token array to a JSON-serializable list.
+        response["prompt_token_ids"] = list(seq.prompt_token_ids)
     yield response
 
 
@@ -989,12 +999,15 @@ async def generate_async_fanout(
     data_parallel_rank: int | None = None,
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
+    return_token_ids: bool = False,
 ) -> list[dict[str, Any]]:
     """Non-streaming n>1 path: fan out N siblings and await all of them.
 
     Returns a list of per-sibling output dicts in the same shape as
     :func:`generate_async` yields for n==1, so response builders can treat
     each entry the same way.
+
+    Shared prompt token IDs are returned only in the first output.
     """
 
     n = int(sampling_params.n)
@@ -1108,6 +1121,8 @@ async def generate_async_fanout(
                 "latency": finished_at - started_at,
             }
         )
+    if return_token_ids and seqs:
+        outputs[0]["prompt_token_ids"] = list(seqs[0].prompt_token_ids)
     return outputs
 
 
@@ -1124,6 +1139,28 @@ def validate_model(requested_model: str | None) -> None:
             detail=f"Requested model '{requested_model}' does not match "
             f"server model '{model_name}'",
         )
+
+
+def _validate_return_token_ids(
+    return_token_ids: bool | None, stream: bool | None
+) -> None:
+    """Prompt token IDs can be returned only in non-streaming responses."""
+    if not return_token_ids:
+        return
+    if stream:
+        raise ValueError(
+            "return_token_ids is not supported with stream=true; the ids are "
+            "returned on the response body, which a stream does not have"
+        )
+
+
+def _engine_kv_transfer_params(
+    kv_transfer_params: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Copy KV metadata without IDs already passed as the engine prompt."""
+    if kv_transfer_params is None or "prompt_token_ids" not in kv_transfer_params:
+        return kv_transfer_params
+    return {k: v for k, v in kv_transfer_params.items() if k != "prompt_token_ids"}
 
 
 async def setup_streaming_request(
@@ -1582,6 +1619,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 merged_kwargs["thinking_effort"] = _th_effort
 
         effective_n = _coerce_n(request.n, request.temperature)
+        _validate_return_token_ids(request.return_token_ids, request.stream)
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
             max_tokens=request.get_max_tokens(),
@@ -1603,6 +1641,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         _log_request_model("request", request_id, request)
 
         is_multimodal = _has_multimodal_content(messages)
+        multimodal_data = None
+        kv_transfer_params = request.kv_transfer_params
         if is_multimodal:
             # Media loading (blocking network I/O, up to a 30s urlopen) plus
             # processor preprocessing are heavy and would stall the event loop;
@@ -1610,15 +1650,19 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             # so concurrent cold-start requests don't race on its lazy init.
             _get_multimodal_processor()
             loop = asyncio.get_running_loop()
-            token_ids, multimodal_data = await loop.run_in_executor(
+            prompt_or_tokens, multimodal_data = await loop.run_in_executor(
                 None,
                 _prepare_multimodal_inputs,
                 messages,
                 merged_kwargs,
                 request.tools,
             )
+        elif (pretokenized := request.get_prompt_token_ids()) is not None:
+            # Reuse prefill IDs to skip template rendering and tokenization.
+            prompt_or_tokens = pretokenized
+            kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
         else:
-            prompt = apply_chat_template(
+            prompt_or_tokens = apply_chat_template(
                 tokenizer,
                 custom_message_encoder,
                 messages,
@@ -1626,22 +1670,22 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 **merged_kwargs,
             )
 
-        # The K3 template may inject the opening reasoning marker into the prompt
-        # itself; if so the stream begins mid-thought and the ReasoningFilter must
-        # start in the thinking state. Multimodal inputs arrive pre-tokenized.
+        # The K3 template may open the reasoning channel in text or token IDs.
         _reasoning = reasoning_channel(
             (
-                prompt_tokens_start_in_reasoning(token_ids, tokenizer.decode)
-                if is_multimodal
-                else prompt_starts_in_reasoning(prompt)
+                prompt_starts_in_reasoning(prompt_or_tokens)
+                if isinstance(prompt_or_tokens, str)
+                else prompt_tokens_start_in_reasoning(
+                    prompt_or_tokens, tokenizer.decode
+                )
             ),
             template_kwargs=merged_kwargs,
         )
 
         # Streaming
         if request.stream:
-            stream_input = token_ids if is_multimodal else prompt
-            stream_multimodal_data = multimodal_data if is_multimodal else None
+            stream_input = prompt_or_tokens
+            stream_multimodal_data = multimodal_data
             if effective_n > 1:
                 seq_ids, stream_collector, num_prompt_tokens = (
                     await setup_streaming_request_fanout(
@@ -1649,7 +1693,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                         sampling_params,
                         request_id,
                         multimodal_data=stream_multimodal_data,
-                        kv_transfer_params=request.kv_transfer_params,
+                        kv_transfer_params=kv_transfer_params,
                         **dp_routing,
                     )
                 )
@@ -1673,7 +1717,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                         sampling_params,
                         request_id,
                         multimodal_data=stream_multimodal_data,
-                        kv_transfer_params=request.kv_transfer_params,
+                        kv_transfer_params=kv_transfer_params,
                         **dp_routing,
                     )
                 )
@@ -1699,11 +1743,12 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         if is_multimodal and effective_n > 1:
             outputs = await _race_disconnect(
                 generate_async_fanout(
-                    token_ids,
+                    prompt_or_tokens,
                     sampling_params,
                     request_id,
                     multimodal_data=multimodal_data,
-                    kv_transfer_params=request.kv_transfer_params,
+                    kv_transfer_params=kv_transfer_params,
+                    return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),
                 raw_request,
@@ -1723,7 +1768,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         elif is_multimodal:
             final_output = await _run_nonstream_with_disconnect(
                 generate_async_multimodal(
-                    token_ids,
+                    prompt_or_tokens,
                     multimodal_data,
                     sampling_params,
                     request_id,
@@ -1747,10 +1792,11 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         elif effective_n > 1:
             outputs = await _race_disconnect(
                 generate_async_fanout(
-                    prompt,
+                    prompt_or_tokens,
                     sampling_params,
                     request_id,
-                    kv_transfer_params=request.kv_transfer_params,
+                    kv_transfer_params=kv_transfer_params,
+                    return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),
                 raw_request,
@@ -1770,10 +1816,11 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         else:
             final_output = await _run_nonstream_with_disconnect(
                 generate_async(
-                    prompt,
+                    prompt_or_tokens,
                     sampling_params,
                     request_id,
-                    kv_transfer_params=request.kv_transfer_params,
+                    kv_transfer_params=kv_transfer_params,
+                    return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),
                 raw_request,
@@ -1792,7 +1839,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_parser_cls=tool_call_parser_cls,
             )
         _log_request_model("response", request_id, resp)
-        return resp
+        # Bypass FastAPI's recursive conversion of the token ID list.
+        return JSONResponse(content=resp.model_dump(mode="json"))
 
     except _ClientDisconnected:
         # Client hung up; seq already aborted + popped. Nothing to return.
@@ -1813,6 +1861,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
 
     try:
         effective_n = _coerce_n(request.n, request.temperature)
+        _validate_return_token_ids(request.return_token_ids, request.stream)
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
             max_tokens=request.get_max_tokens(),
@@ -1822,6 +1871,9 @@ async def completions(request: CompletionRequest, raw_request: Request):
             top_p=request.top_p,
             n=effective_n,
         )
+        # Prefer pre-tokenized IDs; otherwise pass text to preprocessing.
+        prompt_or_tokens = request.get_prompt_or_tokens()
+        kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
 
         request_id = f"cmpl-{uuid.uuid4().hex}"
         dp_session_id, dp_parent_session_id = _get_dp_session_affinity_ids(raw_request)
@@ -1838,10 +1890,10 @@ async def completions(request: CompletionRequest, raw_request: Request):
             if effective_n > 1:
                 seq_ids, stream_collector, num_prompt_tokens = (
                     await setup_streaming_request_fanout(
-                        request.prompt,
+                        prompt_or_tokens,
                         sampling_params,
                         request_id,
-                        kv_transfer_params=request.kv_transfer_params,
+                        kv_transfer_params=kv_transfer_params,
                         **dp_routing,
                     )
                 )
@@ -1857,10 +1909,10 @@ async def completions(request: CompletionRequest, raw_request: Request):
             else:
                 seq_id, stream_collector, num_prompt_tokens = (
                     await setup_streaming_request(
-                        request.prompt,
+                        prompt_or_tokens,
                         sampling_params,
                         request_id,
-                        kv_transfer_params=request.kv_transfer_params,
+                        kv_transfer_params=kv_transfer_params,
                         **dp_routing,
                     )
                 )
@@ -1882,10 +1934,11 @@ async def completions(request: CompletionRequest, raw_request: Request):
         if effective_n > 1:
             outputs = await _race_disconnect(
                 generate_async_fanout(
-                    request.prompt,
+                    prompt_or_tokens,
                     sampling_params,
                     request_id,
-                    kv_transfer_params=request.kv_transfer_params,
+                    kv_transfer_params=kv_transfer_params,
+                    return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),
                 raw_request,
@@ -1897,10 +1950,11 @@ async def completions(request: CompletionRequest, raw_request: Request):
         else:
             final_output = await _run_nonstream_with_disconnect(
                 generate_async(
-                    request.prompt,
+                    prompt_or_tokens,
                     sampling_params,
                     request_id,
-                    kv_transfer_params=request.kv_transfer_params,
+                    kv_transfer_params=kv_transfer_params,
+                    return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),
                 raw_request,
@@ -1912,7 +1966,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
 
             resp = build_completion_response(request_id, model_name, final_output)
         _log_request_model("response", request_id, resp)
-        return resp
+        return JSONResponse(content=resp.model_dump(mode="json"))
 
     except _ClientDisconnected:
         # Client hung up; seq already aborted + popped. Nothing to return.
