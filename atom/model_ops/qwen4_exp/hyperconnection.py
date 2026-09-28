@@ -19,8 +19,6 @@ checkpoint's `block_inject_weight` for that module is skipped at load.
 Parameters are replicated, not TP-sharded: ~13 MB per module.
 """
 
-import os
-
 import torch
 from aiter.tuned_gemm import tgemm
 from torch import nn
@@ -33,7 +31,10 @@ from atom.model_ops.qwen4_exp.ops.gated import (
 )
 from atom.model_ops.qwen4_exp.ops.hc_fused import hc_combine_norm, hc_gated_mean, hc_rows
 
-HC_FUSED = os.environ.get("ATOM_QWEN4_HC_FUSED", "1") == "1"
+# The fused path is the only one the served model takes: `process_weights_after_loading`
+# always builds the `[down | inject]` weight and the decoder layer always defers the
+# combine into the next mix. `mix`/`combine` stay for the MTP drafter, which mixes and
+# combines in two separate calls.
 # Up to this many tokens the two fused kernels beat norm + GEMMs; each row
 # re-reads the (cache resident) weights, so the cost grows with the batch.
 HC_ROWS_MAX = 2
@@ -128,8 +129,6 @@ class Qwen4ExpHyperConnection(nn.Module):
 
     def process_weights_after_loading(self) -> None:
         """Concatenate `[down | inject]` into one GEMM weight."""
-        if not HC_FUSED:
-            return
         parts = [self.input_mix_weight_down.weight.data]
         if self.block_inject_weight is not None:
             parts.append(self.block_inject_weight.weight.data)

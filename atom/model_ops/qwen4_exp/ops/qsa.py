@@ -23,8 +23,6 @@ Source provenance:
   without changing the other model's implementation.
 """
 
-import os
-
 import torch
 import triton
 import triton.language as tl
@@ -914,7 +912,6 @@ DEFAULT_LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 
 _SCORING_BLOCK_N = 32
 _SCORING_COLUMN_PROGRAMS = 64
-_MFMA_SCORING = os.environ.get("ATOM_QWEN4_QSA_MFMA_LOGITS", "1") == "1"
 
 
 def _check_vector(name: str, tensor: torch.Tensor, length: int | None = None) -> None:
@@ -992,8 +989,7 @@ def qsa_paged_mqa_logits(
     # Decode-sized batches keep the CUDA-core kernel: one row per request
     # leaves the MFMA M dimension mostly empty and cuts the grid 16x.
     if (
-        _MFMA_SCORING
-        and q.shape[0] > 256
+        q.shape[0] > 256
         and q.stride(2) == 1
         and compressed_k_cache.stride(3) == 1
         and page_table.stride(1) == 1
