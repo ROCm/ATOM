@@ -41,7 +41,11 @@ def configure(role: str, phase: str, length: str, server_args: str) -> str:
     forced = role == "decode" and phase == "benchmark"
     config["rejection_sample_method"] = "synthetic" if forced else "standard"
     if forced:
-        config["synthetic_acceptance_length"] = target
+        # Fix the exact positional acceptance used by the historical AL3 case.
+        if count == 3 and target == 3.0:
+            config["synthetic_acceptance_rates"] = [1.0, 1.0, 0.0]
+        else:
+            config["synthetic_acceptance_length"] = target
     value = json.dumps(config, separators=(",", ":"), allow_nan=False)
     if inline:
         args[index] = "--speculative-config=" + value

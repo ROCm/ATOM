@@ -21,6 +21,49 @@ fi
 server_pythonpath="${PYTHONPATH:-}"
 lmcache_env=()
 
+install_native_vllm() {
+  local repo="${ATOMESH_VLLM_SOURCE_REPO:?vllm.source.repo is required}"
+  local sha="${ATOMESH_VLLM_SOURCE_SHA:?vllm.source.sha is required}"
+  [[ "${sha}" =~ ^[0-9a-f]{40}$ ]] || return 2
+  local src="/tmp/atomesh-native-vllm" venv="/tmp/atomesh-native-venv"
+  git init -q "${src}"
+  git -C "${src}" fetch -q --depth 1 "${repo}" "${sha}"
+  git -C "${src}" checkout -q FETCH_HEAD
+  [[ "$(git -C "${src}" rev-parse HEAD)" == "${sha}" ]] || return 2
+  uv venv --system-site-packages "${venv}"
+  uv pip install --python "${venv}/bin/python" \
+    setuptools-scm setuptools-rust wheel ninja cmake
+  local log="${RUNTIME_LOG_DIR}/native-build-rank-${NODE_RANK}.log"
+  env PYTHONPATH= VLLM_TARGET_DEVICE=rocm PYTORCH_ROCM_ARCH=gfx950 MAX_JOBS=32 \
+    uv pip install --python "${venv}/bin/python" --no-deps \
+      --no-build-isolation "${src}" > "${log}" 2>&1 || {
+        tail -100 "${log}"
+        return 1
+      }
+  export PATH="${venv}/bin:${PATH}"
+  server_pythonpath=""
+  env PYTHONPATH= "${venv}/bin/python" - "${venv}" "${sha}" \
+    "${RUNTIME_LOG_DIR}/native-manifest-rank-${NODE_RANK}.json" <<'PY'
+import importlib.metadata
+import json
+import sys
+from pathlib import Path
+
+import torch
+import vllm
+from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import MoRIIOConnector
+
+assert Path(vllm.__file__).is_relative_to(sys.argv[1]), vllm.__file__
+manifest = {
+    "source_sha": sys.argv[2], "source_path": vllm.__file__,
+    "torch": torch.__version__, "hip": torch.version.hip,
+    "packages": {d.metadata['Name']: d.version for d in importlib.metadata.distributions()},
+}
+Path(sys.argv[3]).write_text(json.dumps(manifest, indent=2) + "\n")
+print(f"[vllm] native source installation OK: {sys.argv[2]} {vllm.__file__}")
+PY
+}
+
 join_path() {
   local IFS=":"
   local -a parts=()
@@ -263,6 +306,9 @@ start_vllm_server() {
     cmd+=(--decode-context-parallel-size "${!dcp_var}")
   fi
   cmd+=("${role_args[@]}")
+  if [[ "${ATOMESH_VLLM_DIAGNOSTIC:-0}" == "1" ]]; then
+    cmd+=(--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${RUN_DIR}/traces/${role}\",\"torch_profiler_with_stack\":false,\"torch_profiler_record_shapes\":true}")
+  fi
   echo "[${role}] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} discovery=${NODE0_ADDR}:${VLLM_DISCOVERY_PORT}"
   dump_launch_info "${prefix}" "${cmd[@]}"
   python3 - "${RUNTIME_LOG_DIR}/${log_name}.launch.json" "${role}" \
@@ -292,4 +338,8 @@ start_router() {
   echo "[router] vllm-router sidecar on :${ROUTER_PORT}, discovery :${VLLM_DISCOVERY_PORT}"
 }
 
-apply_vllm_fork_overlay
+if [[ -n "${ATOMESH_VLLM_SOURCE_SHA:-}" ]]; then
+  install_native_vllm
+else
+  apply_vllm_fork_overlay
+fi

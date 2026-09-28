@@ -840,8 +840,8 @@ models:
         AITER_FLYDSL_STAGE2_FP8: "1"
         AITER_LOG_LEVEL: "WARNING"
         VLLM_DCP_Q_REPLICATE: "0"
-        VLLM_ROCM_PAGE_ALIGN_KV: "1"
-        VLLM_ROCM_AITER_NATIVE_DCP_VERIFY: "1"
+        VLLM_ROCM_AITER_MLA_DCP_VERIFY: asm
+        VLLM_SERVER_DEV_MODE: "1"
       prefill:
         VLLM_USE_BREAKABLE_CUDAGRAPH: "1"
         TORCH_NCCL_BLOCKING_WAIT: "0"
@@ -852,19 +852,16 @@ models:
         NCCL_BLOCKING_WAIT: "0"
     vllm:
       served_model_name: Kimi-K3
-      fork:
+      source:
         repo: https://github.com/whx-sjtu/vllm
-        sha: f41f2182f2a85ba483795c27813a7a40984b19dc
-        files: all
-      lmcache:
-        <<: *kimi_k3_vllm_lmcache
-        patches: [patches/lmcache-k3-boundary.patch, patches/lmcache-event-lifetime.patch, patches/lmcache-pending-store.patch]
+        sha: 34f63843671403657d0c7aa70f0c6841869ac374
+      diagnostic: 1
     server:
       common_args:
         # Forced mean length (including bonus) applies only to benchmark decode.
         spec_decode_acceptance_length: 3.0
         extra_args: >-
-          --moe-backend auto --load-format fastsafetensors --gpu-memory-utilization 0.88
+          --moe-backend auto --load-format safetensors --gpu-memory-utilization 0.88
           --language-model-only --max-num-seqs 80 --enable-auto-tool-choice
           --tool-call-parser kimi_k3 --reasoning-parser kimi_k3 --max-model-len 1048576
           --stream-interval 10 --enable-prefix-caching --prefix-match-unit 128
@@ -876,7 +873,7 @@ models:
     suites:
       vllm:
         - &kimi_k3_vllm_dspark_dcp8
-          name: kimi-k3-vllm-dspark3-1p1d-tp8-dcp8-agentic-lmcache-1m-c16
+          name: kimi-k3-native-dspark3-1p1d-tp8-dcp8-no-lmcache-profile
           topology: 1p1d
           display_topology: 1P1D-TP8-DCP8
           pd_worker_layout: multi_node
@@ -899,9 +896,9 @@ models:
           benchmark:
             <<: *kimi_k3_vllm_aiperf
             apply_chat_template: true
-            benchmark_duration: 3600
-            warmup_requests_per_lane: 10
-          run_eval: true
+            benchmark_duration: 180
+            warmup_requests_per_lane: 1
+          run_eval: false
     accuracy:
       task: gsm8k
       fewshot: 5

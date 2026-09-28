@@ -1360,7 +1360,14 @@ PY
 }
 
 run_workload_phase() {
-  if [[ "${ATOMESH_EXECUTION_PHASE}" == "benchmark" ]]; then
+  if [[ "${BACKEND}" == "vllm" && "${ATOMESH_VLLM_DIAGNOSTIC:-0}" == "1" ]]; then
+    python3 "${ATOMESH_SCRIPT_DIR}/pd_vllm_profile.py" \
+      --prefill "http://${NODE0_ADDR}:${PREFILL_PORT}" \
+      --decode "http://${IP_ARRAY[1]}:${DECODE_PORT}" \
+      --model "${SERVED_MODEL_NAME}" --tokenizer "${MODEL_PATH}" \
+      --output "${RUN_DIR}/pd-diagnostic/${ATOMESH_EXECUTION_PHASE}" \
+      --phase "${ATOMESH_EXECUTION_PHASE}"
+  elif [[ "${ATOMESH_EXECUTION_PHASE}" == "benchmark" ]]; then
     run_benchmark
   elif [[ "${ATOMESH_EXECUTION_PHASE}" == "eval" ]]; then
     run_eval

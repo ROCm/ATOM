@@ -28,6 +28,9 @@ mkdir -p "${RUN_DIR}"
 chmod 0777 "${RUN_DIR}" 2>/dev/null || true
 
 EXECUTION_PHASES=(combined)
+if [[ "${ATOMESH_VLLM_DIAGNOSTIC:-0}" == "1" ]]; then
+  EXECUTION_PHASES=(benchmark)
+fi
 if [[ "${BENCHMARK_KIND:-random}" == "aiperf_agentic" \
   && ( "${EVAL_TASK:-gsm8k}" == "swebench_lite" \
     || "${EVAL_TASK:-gsm8k}" == "gsm8k" ) \
