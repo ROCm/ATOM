@@ -289,9 +289,12 @@ class OffloadWorkerMixin:
     def _note_compute_stream(self) -> None:
         """Hand the forward's stream to the byte-copy layer.
 
-        Called from `_track_job`, which runs on the forward thread at every
-        save/load submit, so the stream is recorded before the first staging
-        group runs and without a second per-step `current_stream` call.
+        Called from `start_load_kv`, ahead of the submits rather than from
+        `_track_job`: Python evaluates the `submit()` argument before the
+        `_track_job()` wrapping it, so a job can already be queued on a worker
+        by the time `_track_job` runs.  `start_load_kv` runs on the forward
+        thread, which is the requirement -- `torch.cuda.current_stream` is
+        thread-local, and on a transfer worker it answers the default stream.
         """
         connector = getattr(getattr(self, "_engine", None), "gpu_connector", None)
         note = getattr(connector, "note_compute_stream", None)
