@@ -198,9 +198,10 @@ class CoreManager:
         # command keeps using utility_response_queue above.
         self._rpc_router = RpcResponseRouter()
         # Runner processes behind each engine -- EngineCore's own sizing -- so
-        # an engine that never answers still fails one result per rank.
-        self._rpc_ranks_per_engine = (
-            config.tp_world_size * config.prefill_context_parallel_size
+        # an engine that never answers still fails one result per rank. Read
+        # with defaults: managers are also built from bare stand-in configs.
+        self._rpc_ranks_per_engine = getattr(config, "tp_world_size", 1) * getattr(
+            config, "prefill_context_parallel_size", 1
         )
         self._seq_id_to_callback = {}
         # Batched stream-flush hook, resolved lazily by the API server (avoids

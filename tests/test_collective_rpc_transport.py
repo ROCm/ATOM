@@ -22,6 +22,7 @@ import queue
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -322,6 +323,33 @@ def test_a_payload_is_required():
     mgr = _mgr(1)
     with pytest.raises(TypeError, match="RpcPayload"):
         mgr.collective_rpc("m", {"not": "a payload"})
+
+
+def test_forward_cannot_go_around_the_block_table_encoder():
+    """Forwards travel as appends to rows each worker caches, which only works
+    while the encoder sees every one of them."""
+    mgr = _mgr(1)
+    with pytest.raises(ValueError, match="forward"):
+        mgr.collective_rpc("forward", RpcPayload(request_id="f1"))
+    assert mgr.rpc_broadcast_mq.sent == [], "nothing may reach the workers"
+
+
+def test_a_generic_call_leaves_the_forward_decoder_alone():
+    """Every message a worker dequeues passes the block-table decoder, so a
+    generic call must come through untouched and keep the cached rows the
+    next forward's appends are relative to."""
+    from atom.model_engine.block_table_codec import BlockTableDeltaDecoder
+    from atom.model_engine.sequence import BlockTable
+
+    payload = RpcPayload(request_id="g1")
+    proc = _proc()
+    proc.rpc_broadcast_mq = SimpleNamespace(dequeue=lambda: ("some_method", payload))
+    proc._block_table_decoder = BlockTableDeltaDecoder()
+    row = BlockTable([4, 5, 6])
+    proc._block_table_decoder._rows = {7: row}
+
+    assert proc.get_func() == ("some_method", [payload])
+    assert proc._block_table_decoder._rows == {7: row}
 
 
 def test_a_dead_rank_is_named_not_waited_out():

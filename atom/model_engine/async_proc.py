@@ -31,6 +31,7 @@ from aiter.dist.shm_broadcast import MessageQueue
 
 from atom.kv_transfer.disaggregation import KVConnectorOutput, KVOutputAggregator
 from atom.model_engine.block_table_codec import (
+    FORWARD_RPC,
     BlockTableDeltaDecoder,
     BlockTableDeltaEncoder,
 )
@@ -603,6 +604,14 @@ class AsyncIOProcManager:
         if not isinstance(payload, RpcPayload):
             raise TypeError(
                 f"collective_rpc needs an RpcPayload, got {type(payload).__name__}"
+            )
+        if func_name == FORWARD_RPC:
+            # The block-table encoder has to see every forward on this channel,
+            # and this path goes around it. The workers' decoder would still
+            # reset its cached rows, failing the next scheduled forward.
+            raise ValueError(
+                f"{self.label}: {FORWARD_RPC!r} is the scheduler's own RPC and "
+                f"cannot go through collective_rpc"
             )
 
         logger.debug(
