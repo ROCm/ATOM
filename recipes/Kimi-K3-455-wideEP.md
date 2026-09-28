@@ -1188,25 +1188,33 @@ not produce coverage either.
 **Aggregates:** input 2907 tok/s, output 6.12 tok/s, total 2913 tok/s,
 0.029 req/s. 5,349,055 prompt tokens of which 4,940,224 served from cache.
 
-⚠️ **Read these three caveats before quoting any of it.**
+**`--fake-eplb` is part of the method here, not an accident.** Agentic runs on
+this configuration are measured with it so that expert load is uniform and
+successive runs are comparable; the router is replaced with a uniform
+distribution, so the generated text is not K3's and is not meant to be read.
+Use the [accuracy gate](#accuracy-gate--run-this-before-any-benchmark) and
+GSM8K for correctness, and these numbers for throughput.
 
-1. **This run used `--fake-eplb`, so the model output is not valid.** Router
-   logits were uniform, so the numbers describe a synthetic routing
-   distribution, not K3's. It is also *not* a clean upper bound: uniform
-   routing spreads a batch's tokens across all 896 experts, which gives the
-   receiving rank smaller per-expert batches than real, skewed routing would.
-   Whether that helps or hurts decode here is not established.
-2. **The launch differs from the [AgentX launch](#server-launch-for-agentx)
+One technical note for whoever reads them: uniform routing is **not** simply a
+best case. It spreads a batch's tokens across all 896 experts, so the receiving
+rank gets smaller per-expert batches than real, skewed routing would. Whether
+that helps or hurts decode on this stack is not established here.
+
+⚠️ **Two limits on what these numbers can be compared against.**
+
+1. **The launch differs from the [AgentX launch](#server-launch-for-agentx)
    above** — `--max-num-batched-tokens 16384` (not 2048) and `--concurrency 32`
    (not 16). At 2048/con64 the run does not produce coverage at all.
-3. **There is no baseline**, so nothing here can be attributed to `--fake-eplb`,
+2. **There is no baseline**, so nothing here can be attributed to `--fake-eplb`,
    `ATOM_DP_SESSION_AFFINITY=1` or the chunk size individually.
 
 **What the numbers say.** Decode is the bottleneck, not prefill: 212 output
 tokens take ~326 s of decode at 1.4 s per token, while prefill moves 2907 tok/s
-in aggregate. Effective concurrency settles at 15 against a nominal 32 because
-lanes idle inside the trace — size `--concurrency` by what retires, not by what
-you ask for. The 92.36% cache read rate is the thing keeping ISL p90 of 217k
+in aggregate. Effective concurrency settles at 15.11 against a nominal 32 because lanes idle
+inside the trace — size `--concurrency` by what retires, not by what you ask
+for. Note what that implies: **`--concurrency 16` and `--concurrency 32` land
+on nearly the same working point here**, so sweeping downward from 32 buys no
+new information. To move the operating point, go up. The 92.36% cache read rate is the thing keeping ISL p90 of 217k
 tokens affordable at all.
 
 `ATOM_DP_SESSION_AFFINITY=1` was set for this run. It places a new session on
@@ -1219,9 +1227,13 @@ nothing to set; its effect here is unmeasured for want of a baseline.
 
 ## Not yet measured
 
-- An AgentX run **without** `--fake-eplb` — the numbers above cannot stand in
-  for a deployable configuration.
+- AgentX above `--concurrency 32`. Effective concurrency of 15 suggests
+  headroom, but a con64 attempt at 16384 was not completed.
 - Any A/B of `--fake-eplb`, `ATOM_DP_SESSION_AFFINITY` or
-  `--max-num-batched-tokens` against each other.
+  `--max-num-batched-tokens` against each other — each run costs a full
+  warmup, so a baseline was never captured alongside them.
+- Anything at EP32. At EP32 the per-GPU expert weight halves
+  (14.64 GiB/layer ÷ 32 = 0.46, against 0.92 at EP16), freeing roughly 41 GiB
+  per GPU for KV, which is the obvious lever for pushing concurrency up.
 - `--max-num-seqs` has not been swept; see the note under
   [Throughput](#throughput) for why it is the first thing to try.
