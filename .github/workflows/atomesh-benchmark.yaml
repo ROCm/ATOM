@@ -583,6 +583,7 @@ jobs:
           if [[ "$(hostname -s)" == "pit2-vm-amd-xl-02" ]]; then
             SLURM_PARTITION="amd-spur"
             SLURM_QOS="amd-frameworks-qos"
+            export SPUR_CONTROLLER_ADDR="http://pit2-vm-amd-large-02:6817"
           fi
           if [[ "${SLURM_ACCOUNT}" == "amd-atom" ]]; then
             SLURM_QOS="amd-atom-qos"
@@ -1594,6 +1595,9 @@ jobs:
               cell["runner"]["log_root"] = "/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG"
               cell["runner"]["slurm_partition"] = "amd-spur"
               cell["runner"]["slurm_qos"] = "amd-frameworks-qos"
+              cell["runner"]["spur_controller_addr"] = "http://pit2-vm-amd-large-02:6817"
+              with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as env_file:
+                  env_file.write(f"SPUR_CONTROLLER_ADDR={cell['runner']['spur_controller_addr']}\n")
 
           if (
               cell["runner"].get("slurm_account") == "amd-atom"
