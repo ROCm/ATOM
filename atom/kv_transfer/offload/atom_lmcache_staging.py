@@ -194,15 +194,24 @@ def run_staged_pipeline(
     """
 
     staging_buffer = state.staging_buffer
-    # The two staging streams are side streams; the model's forward runs on the
-    # device's default stream and is the producer of the KV a save reads and
-    # the consumer of the KV a load writes. The handshake below orders stage_a
-    # against stage_b and nothing else, so without this fence a pack can read a
-    # block whose attention write is still queued on the compute stream. The
-    # terminal synchronize covers the other direction for loads, but there is
-    # no host-side barrier in front of a save.
+    # The two staging streams are side streams; the forward runs on vLLM's own
+    # dedicated stream (not the device default -- see `_compute_stream_for`)
+    # and is the producer of the KV a save reads and the consumer of the KV a
+    # load writes. The stage_a/stage_b handshake below orders the two staging
+    # streams against each other and nothing else, so both directions across
+    # the compute boundary have to be fenced here explicitly.
     compute_stream = _compute_stream_for(state)
-    if compute_stream is not None and stage_a.stream is not None:
+
+    def fence_against_compute() -> None:
+        """Order the staging streams behind everything the forward has queued.
+
+        Taken per group, not once per pipeline: a save runs on a worker thread
+        concurrently with the *next* forward step, so a fence at pipeline entry
+        only covers work enqueued before it. A later group can otherwise pack a
+        block whose attention write was enqueued after that entry fence.
+        """
+        if compute_stream is None or stage_a.stream is None:
+            return
         stage_a.stream.wait_stream(compute_stream)
         if stage_b.stream is not None and stage_b.stream is not stage_a.stream:
             stage_b.stream.wait_stream(compute_stream)
@@ -218,6 +227,7 @@ def run_staged_pipeline(
     buffer_safe_to_release = True
     try:
         for group in groups:
+            fence_against_compute()
             if fenced and staging_buffer.free_event_valid:
                 stage_a.stream.wait_event(staging_buffer.free_event)
             with state.stream_ctx(stage_a.stream):
@@ -240,6 +250,23 @@ def run_staged_pipeline(
                 staging_buffer.free_event_valid = True
             if stage_b_enqueued is not None:
                 stage_b_enqueued(group, stage_b.stream)
+        # The other direction, which nothing covered before: hold the forward
+        # behind the staging streams. `stage_b.stream.synchronize()` below is a
+        # host-side wait on *this* worker thread; it constrains the forward only
+        # if the forward thread joins this transfer's future before touching the
+        # blocks. Loads write KV the forward then reads, and saves read KV the
+        # forward may overwrite once the request's blocks are recycled, so the
+        # device-side edge is recorded here rather than inferred from the host
+        # handshake. Enqueued before the synchronize: after it the event is
+        # already complete and the wait would be a no-op.
+        if compute_stream is not None:
+            done = torch.cuda.Event()
+            done.record(stage_b.stream)
+            if stage_a.stream is not None and stage_a.stream is not stage_b.stream:
+                stage_a_done = torch.cuda.Event()
+                stage_a_done.record(stage_a.stream)
+                compute_stream.wait_event(stage_a_done)
+            compute_stream.wait_event(done)
         stage_b.stream.synchronize()
     except Exception:
         buffer_safe_to_release = bool(
