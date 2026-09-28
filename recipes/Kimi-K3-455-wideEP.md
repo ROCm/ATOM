@@ -395,6 +395,41 @@ The suite's README says `ACCEL_STATE` must be `READY`; this firmware reports
 
 ---
 
+## Is the rack actually free?
+
+⚠️ **VRAM is not a free/busy signal.** A job whose containers exist but have
+not yet loaded weights reads **0% on every GPU**. A pre-flight that only looks
+at `rocm-smi` will call the rack idle, and you will start on top of someone
+else. The collision surfaces minutes later, on your side, as a KV budget that
+has gone negative:
+
+```
+RuntimeError: Per-request cache tensor (3.35GB for 8 slots) exceeds available
+KV budget (-17.63GB) at --gpu-memory-utilization 0.94. Set
+--gpu-memory-utilization >= 0.99 ...
+```
+
+That is the engine working correctly — it saw ~30% of each card already taken
+and refused to start. Read it as *someone else's weights are loading*, not as
+something to fix by raising `--gpu-memory-utilization`.
+
+Check the container list and the event log, not the GPU counters:
+
+```bash
+for n in <nodes>; do
+  printf '%-22s ' "$n"
+  ssh -q "$n" "docker ps --format '{{.Names}}' | tr '\n' ' '"      # ALL of them
+  ssh -q "$n" "docker events --since 30m --until 0s --filter event=create \
+                 --format '{{.Actor.Attributes.name}}' | tr '\n' ' '"
+  echo
+done
+```
+
+`docker events` is the one that catches it: a `create` shows up there well
+before any GPU counter moves. Filtering `docker ps` by your own container name
+is the specific mistake to avoid — it reports "nothing of mine is running",
+which is not the same question.
+
 ## Container
 
 One container per node, entrypoint `sleep infinity`, driven by `docker exec`:
@@ -826,6 +861,7 @@ max_tokens=3500  -> content='...#### 72'  finish_reason=stop
 | `load RCCL version` hang that reproduces **every** time | Not the intermittent hang. Drop below ATOM with the minimal `all_reduce` above before touching any ATOM flag |
 | Patch/prefix "installed" but behaves as if absent | Files may be 0 bytes from an interrupted `docker cp`; `import` still succeeds. Check byte sizes |
 | OOM at load with `0 bytes is free` while `peak_torch` is small | Another job owns the GPUs. Check `rocm-smi --showmemuse` (idle reads 0% / ~177 MB) and `docker ps` on every node before launching |
+| `available KV budget (-NN GB)` on a config that booted an hour ago | Same cause, later symptom. Someone else's weights are loading. See [Is the rack actually free?](#is-the-rack-actually-free) |
 | Cross-node bandwidth ~4.5 GB/s instead of thousands | MNNVL not in effect, silently fell back to TCP. Set `NCCL_MNNVL_ENABLE=1` |
 | Log appears frozen | tqdm writes `\r`; pipe through `tr '\r' '\n'` |
 
