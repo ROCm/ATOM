@@ -604,7 +604,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             save_operation = SaveOperationId(seq.id, self._save_nonce)
             self._save_nonce += 1
             late_acquired = frozenset()
-            if getattr(seq, "_offload_finished", False) and (
+            if getattr(seq, "_offload_released", False) and (
                 self._reacquires_late_source()
             ):
                 late_source = self._late_save_source(seq, saved, aligned)
@@ -730,7 +730,13 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     def activate_block_leases(self, seq, block_ids: frozenset[int]) -> None:
         """Record the refcount shares transferred at request deallocation."""
 
-        if not self._early_release or not block_ids:
+        if not self._early_release:
+            return
+        # Only a partial deallocation reaches here. `protected_block_ids` runs
+        # before the scheduler decides, and a request deferred whole still owns
+        # its table, so only from now on must a final save reacquire its source.
+        seq._offload_released = True
+        if not block_ids:
             return
         lease_key = id(seq)
         leased = self._save_lease_blocks.setdefault(lease_key, set())

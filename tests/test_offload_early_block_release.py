@@ -501,6 +501,29 @@ class TestIncrementalLeaseRelease:
         assert final.block_ids[:4] == table
         assert scheduler.get_statistics()["truncated_late_saves"] == 0
 
+    def test_a_request_deferred_whole_saves_from_the_table_it_still_owns(
+        self, monkeypatch
+    ):
+        """`protected_block_ids` runs before the scheduler decides. A request
+        whose state cannot be released partially is deferred whole and keeps
+        its table, so its final save reads that table instead of taking a
+        second claim on every block through the hash index."""
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        bm, seq, table = _resident_sequence(scheduler, 109, 16, 4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 16
+        scheduler.request_finished(seq)
+        assert scheduler.protected_block_ids(seq) is not None
+        # Deferred whole: no deallocate_partial, no activate_block_leases.
+        monkeypatch.setattr(
+            bm,
+            "acquire_offload_prefix",
+            lambda *_args: pytest.fail("reacquired a table the request owns"),
+        )
+
+        [final] = scheduler.build_connector_meta().requests
+        assert final.block_ids[:4] == table
+
 
 class TestTPQuorum:
     def test_one_incomplete_rank_prevents_logical_group_release(self, monkeypatch):

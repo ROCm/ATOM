@@ -35,6 +35,7 @@ class SeqView:
         "_offload_finished",
         "_offload_finished_block_ids",
         "_offload_finished_cached_tokens",
+        "_offload_released",
         "_request",
         "block_table",
         "offload_handoff_boundary_tokens",
@@ -122,6 +123,7 @@ class SeqView:
             "_offload_finished",
             "_offload_finished_block_ids",
             "_offload_finished_cached_tokens",
+            "_offload_released",
         ):
             if hasattr(self, frozen):
                 delattr(self, frozen)
