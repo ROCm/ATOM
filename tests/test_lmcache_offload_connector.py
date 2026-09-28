@@ -7289,3 +7289,156 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
             assert tier.take_store_reports() == (set(), {op})
         finally:
             tier.shutdown()
+
+
+def test_run_staged_pipeline_fences_against_compute_stream(monkeypatch):
+    """Both staging streams wait on the compute stream before any group runs.
+
+    The two staging streams are side streams; the model's forward is the
+    producer of the KV a save reads. Without this edge a pack can gather a
+    block whose attention write is still queued, and publish the previous
+    occupant's bytes under this prompt's hash -- which scores clean on a save
+    pass, because nothing reads the stored bytes back until the next run.
+
+    The rest of the pipeline tests drive stream doubles with no device, where
+    ``_compute_stream_for`` correctly returns None and the fence is absent.
+    That makes them unable to notice the fence disappearing, so this test
+    supplies the device and the recorded compute stream that the others do
+    not.
+    """
+
+    from atom.kv_transfer.offload import atom_lmcache_staging as staging
+
+    waited = []
+
+    class _FakeStream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_stream(self, other):
+            waited.append((self.name, other.name))
+
+        def wait_event(self, event):
+            pass
+
+        def synchronize(self):
+            pass
+
+    class _FakeEvent:
+        def record(self, stream):
+            pass
+
+    class _FakeState:
+        def __init__(self):
+            self.device = torch.device("cuda", 0)
+            # The forward's stream is carried on the state, recorded on the
+            # forward thread by `BlockGPUConnector.note_compute_stream`.  It is
+            # deliberately not read from `torch.cuda.current_stream` here:
+            # that call is thread-local, and the pipeline runs on a transfer
+            # worker, where it answers the default stream and the fence
+            # silently orders nothing.
+            self.compute_stream = compute
+            self.staging_buffer = SimpleNamespace(
+                tensor=None,
+                ready_event=_FakeEvent(),
+                free_event=_FakeEvent(),
+                free_event_valid=False,
+            )
+
+        def stream_ctx(self, stream):
+            return nullcontext()
+
+    compute = _FakeStream("compute")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    # Distinct from `compute`: `_compute_stream_for` treats "the default
+    # stream" as a missing recording, because that is exactly the value the
+    # old thread-local lookup produced.
+    monkeypatch.setattr(
+        torch.cuda, "default_stream", lambda device=None: _FakeStream("default")
+    )
+
+    pack = _FakeStream("pack")
+    copy = _FakeStream("copy")
+    staging.run_staged_pipeline(
+        _FakeState(),
+        [SimpleNamespace(nbytes=8) for _ in range(2)],
+        stage_a=staging._PipelineStage(pack, lambda group, buf: None),
+        stage_b=staging._PipelineStage(copy, lambda group, buf: None),
+        ensure_buffer=lambda _buffer, _nbytes: object(),
+        group_nbytes=lambda group: group.nbytes,
+    )
+
+    # Once, up front -- not per group: the edge only has to separate the
+    # staging work from forward work already enqueued when the job was
+    # submitted.
+    assert waited == [("pack", "compute"), ("copy", "compute")]
+
+
+def test_run_staged_pipeline_fences_shared_stream_once(monkeypatch):
+    """Single-stream mode takes the compute edge exactly once.
+
+    Collapsing both legs onto one stream is a performance mode; it must not
+    cost the fence, and must not pay for it twice.
+    """
+
+    from atom.kv_transfer.offload import atom_lmcache_staging as staging
+
+    waited = []
+
+    class _FakeStream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_stream(self, other):
+            waited.append((self.name, other.name))
+
+        def wait_event(self, event):
+            pass
+
+        def synchronize(self):
+            pass
+
+    class _FakeEvent:
+        def record(self, stream):
+            pass
+
+    class _FakeState:
+        def __init__(self):
+            self.device = torch.device("cuda", 0)
+            # The forward's stream is carried on the state, recorded on the
+            # forward thread by `BlockGPUConnector.note_compute_stream`.  It is
+            # deliberately not read from `torch.cuda.current_stream` here:
+            # that call is thread-local, and the pipeline runs on a transfer
+            # worker, where it answers the default stream and the fence
+            # silently orders nothing.
+            self.compute_stream = compute
+            self.staging_buffer = SimpleNamespace(
+                tensor=None,
+                ready_event=_FakeEvent(),
+                free_event=_FakeEvent(),
+                free_event_valid=False,
+            )
+
+        def stream_ctx(self, stream):
+            return nullcontext()
+
+    compute = _FakeStream("compute")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    # Distinct from `compute`: `_compute_stream_for` treats "the default
+    # stream" as a missing recording, because that is exactly the value the
+    # old thread-local lookup produced.
+    monkeypatch.setattr(
+        torch.cuda, "default_stream", lambda device=None: _FakeStream("default")
+    )
+
+    shared = _FakeStream("shared")
+    staging.run_staged_pipeline(
+        _FakeState(),
+        [SimpleNamespace(nbytes=8) for _ in range(2)],
+        stage_a=staging._PipelineStage(shared, lambda group, buf: None),
+        stage_b=staging._PipelineStage(shared, lambda group, buf: None),
+        ensure_buffer=lambda _buffer, _nbytes: object(),
+        group_nbytes=lambda group: group.nbytes,
+    )
+
+    assert waited == [("shared", "compute")]

@@ -630,6 +630,9 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
     def start_load_kv(self, metadata) -> None:
         if not isinstance(metadata, LMCacheOffloadMetadata):
             return
+        # See the dense connector: recorded here, on the forward thread, ahead
+        # of every submit this step makes.
+        self._note_compute_stream()
         load_requests = [
             req
             for req in metadata.requests

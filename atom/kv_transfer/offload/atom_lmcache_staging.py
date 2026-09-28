@@ -5,12 +5,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+
+logger = logging.getLogger("atom")
 
 
 def memory_object_as_uint8(memory_obj: Any, nbytes: int) -> torch.Tensor:
@@ -100,8 +103,14 @@ class _ThreadTransferState:
         self,
         device: torch.device,
         use_cuda: bool,
+        compute_stream=None,
     ) -> None:
         self.device = device
+        # The stream the model's forward runs on, recorded on the forward
+        # thread by `BlockGPUConnector.note_compute_stream`.  It cannot be
+        # discovered from here: this object is built lazily on a save/load
+        # worker thread, and `torch.cuda.current_stream` is thread-local.
+        self.compute_stream = compute_stream
         self.pack_stream = None
         self.copy_stream = None
         if use_cuda:
@@ -114,6 +123,45 @@ class _ThreadTransferState:
         if stream is None:
             return _NullCtx()
         return torch.cuda.stream(stream)
+
+
+_COMPUTE_STREAM_WARNED = False
+
+
+def _compute_stream_for(state) -> Any:
+    """The stream the model's forward is running on, or ``None``.
+
+    ``None`` means "there is no CUDA context here", not "the fence was
+    skipped on a GPU". The pipeline is driven in tests by stream doubles with
+    no device behind them; ordering those against an invented compute stream
+    would assert nothing but that a double records a call. On a real worker
+    ``_ThreadTransferState`` always carries the device its streams were
+    created on, so this always returns a stream there -- which is what
+    ``test_run_staged_pipeline_fences_against_compute_stream`` pins down, so
+    that dropping the fence fails a test rather than passing quietly.
+    """
+
+    device = getattr(state, "device", None)
+    if device is None or not torch.cuda.is_available():
+        return None
+    stream = getattr(state, "compute_stream", None)
+    if stream is None or stream == torch.cuda.default_stream(device=device):
+        # Not a fallback: fencing against the default stream is precisely the
+        # bug this reports.  vLLM runs the forward on a dedicated non-default
+        # stream, so either value here means the recording on the forward
+        # thread did not happen and the pipeline below is unfenced.
+        global _COMPUTE_STREAM_WARNED
+        if not _COMPUTE_STREAM_WARNED:
+            _COMPUTE_STREAM_WARNED = True
+            logger.error(
+                "offload staging has no forward stream to fence against "
+                "(got %s, default is %s); saves may read KV the forward has "
+                "not finished writing",
+                stream,
+                torch.cuda.default_stream(device=device),
+            )
+        return None
+    return stream
 
 
 @dataclass(frozen=True)
@@ -146,6 +194,18 @@ def run_staged_pipeline(
     """
 
     staging_buffer = state.staging_buffer
+    # The two staging streams are side streams; the model's forward runs on the
+    # device's default stream and is the producer of the KV a save reads and
+    # the consumer of the KV a load writes. The handshake below orders stage_a
+    # against stage_b and nothing else, so without this fence a pack can read a
+    # block whose attention write is still queued on the compute stream. The
+    # terminal synchronize covers the other direction for loads, but there is
+    # no host-side barrier in front of a save.
+    compute_stream = _compute_stream_for(state)
+    if compute_stream is not None and stage_a.stream is not None:
+        stage_a.stream.wait_stream(compute_stream)
+        if stage_b.stream is not None and stage_b.stream is not stage_a.stream:
+            stage_b.stream.wait_stream(compute_stream)
     # One stream orders the two stages by itself, so the handshake around them
     # is a no-op -- but only semantically. Each of the four calls still enters
     # the GPU runtime, and each of those releases the GIL and has to take it
