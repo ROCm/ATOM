@@ -32,7 +32,7 @@ class _Socket:
     closed = False
 
 
-def _mgr(engine_count=2):
+def _mgr(engine_count=2, tp=1):
     """A ``CoreManager`` with only what the RPC path reads.
 
     ``__init__`` spawns engine processes and binds sockets, so it cannot run
@@ -43,6 +43,7 @@ def _mgr(engine_count=2):
     mgr.control_sockets = [_Socket() for _ in range(engine_count)]
     mgr.utility_response_queue = queue.Queue()
     mgr._rpc_router = RpcResponseRouter()
+    mgr._rpc_ranks_per_engine = tp
     mgr.sent = []
     mgr.broadcast_utility_command = lambda cmd, **kw: mgr.sent.append((cmd, kw))
     return mgr
@@ -211,8 +212,31 @@ def test_a_silent_dp_engine_yields_a_placeholder_not_a_short_list():
     assert "DP rank 1" in results[1].error
 
 
-def test_an_engine_level_error_is_reported_without_per_tp_detail():
-    mgr = _mgr(1)
+def test_a_silent_dp_engine_fails_every_one_of_its_tp_ranks():
+    """One placeholder for a whole engine left the list DP x TP short, so every
+    position after it named the wrong rank -- and under TP>1 nothing said which
+    of that engine's ranks had not been reached."""
+    mgr = _mgr(2, tp=2)
+
+    def broadcast_and_answer(cmd, **kw):
+        _answer_after(
+            mgr,
+            0.01,
+            0,
+            _tp_body(kw["request_id"], results=[_tp(0, "a"), _tp(1, "b")]),
+        )
+
+    mgr.broadcast_utility_command = broadcast_and_answer
+    results = mgr.collective_rpc("m", timeout=0.4)
+
+    assert len(results) == 4, "one result per DP x TP rank, answered or not"
+    assert [r.tp_rank for r in results] == [0, 1, 0, 1]
+    assert [r.ok for r in results] == [True, True, False, False]
+    assert all("DP rank 1" in r.error for r in results[2:])
+
+
+def test_an_engine_level_error_fails_every_tp_rank_of_that_engine():
+    mgr = _mgr(1, tp=2)
 
     def broadcast_and_answer(cmd, **kw):
         _answer_after(
@@ -222,9 +246,9 @@ def test_an_engine_level_error_is_reported_without_per_tp_detail():
     mgr.broadcast_utility_command = broadcast_and_answer
     results = mgr.collective_rpc("m", timeout=5)
 
-    assert len(results) == 1
-    assert not results[0].ok
-    assert results[0].error == "RuntimeError: shm gone"
+    assert [r.tp_rank for r in results] == [0, 1]
+    assert not any(r.ok for r in results)
+    assert all(r.error == "RuntimeError: shm gone" for r in results)
 
 
 def test_worker_failures_arrive_as_failures_not_exceptions():
@@ -325,3 +349,47 @@ def test_results_are_rpcresult_instances():
     (result,) = mgr.collective_rpc("m", timeout=5)
     assert isinstance(result, RpcResult)
     assert result.ok and result.value == "v"
+
+
+# ── the legacy synchronous path ────────────────────────────────────────────
+
+
+def _answering(mgr, replies):
+    """A broadcast that delivers one reply per DP rank, as the output thread does."""
+
+    def broadcast(cmd, **kw):
+        mgr.sent.append((cmd, kw))
+        for dp_rank, body in enumerate(replies):
+            mgr._route_utility_response(dp_rank, body)
+
+    return broadcast
+
+
+def test_sync_refuses_a_fire_and_forget_command_up_front():
+    """abort_request never answers. Waiting on it used to cost the full timeout;
+    making it answer instead left replies nobody asked for on the shared queue,
+    for the next synchronous caller to take as its own."""
+    mgr = _mgr(1)
+    with pytest.raises(ValueError, match="fire-and-forget"):
+        mgr.broadcast_utility_command_sync("abort_request", req_id="r")
+    assert mgr.sent == [], "nothing may be sent for a call that cannot complete"
+
+
+def test_sync_raises_the_cause_when_an_engine_reports_an_error():
+    mgr = _mgr(2)
+    mgr.broadcast_utility_command = _answering(
+        mgr,
+        [
+            {"cmd": "update_weights", "result": 3},
+            {"cmd": "update_weights", "error": "RuntimeError: loader rejected"},
+        ],
+    )
+    with pytest.raises(RuntimeError, match="1 of 2 engine.*loader rejected"):
+        mgr.broadcast_utility_command_sync("update_weights", named_tensors=[])
+
+
+def test_sync_still_returns_every_reply_when_all_succeed():
+    mgr = _mgr(2)
+    replies = [{"cmd": "clear_kv_cache", "result": True}] * 2
+    mgr.broadcast_utility_command = _answering(mgr, replies)
+    assert mgr.broadcast_utility_command_sync("clear_kv_cache") == replies

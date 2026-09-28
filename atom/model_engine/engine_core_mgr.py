@@ -25,6 +25,7 @@ from atom.model_engine.collective_rpc import (
     RpcResult,
 )
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
+from atom.model_engine.engine_utility import FIRE_AND_FORGET_UTILITY_CMDS
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.utils import (
@@ -196,6 +197,11 @@ class CoreManager:
         # queue position, so several may be outstanding. Every other utility
         # command keeps using utility_response_queue above.
         self._rpc_router = RpcResponseRouter()
+        # Runner processes behind each engine -- EngineCore's own sizing -- so
+        # an engine that never answers still fails one result per rank.
+        self._rpc_ranks_per_engine = (
+            config.tp_world_size * config.prefill_context_parallel_size
+        )
         self._seq_id_to_callback = {}
         # Batched stream-flush hook, resolved lazily by the API server (avoids
         # an api_server <-> engine_core_mgr import cycle). Stays None on every
@@ -1439,25 +1445,25 @@ class CoreManager:
         by_dp_rank: dict[int, dict],
     ) -> list[RpcResult]:
         """DP-major, TP-minor, with a placeholder for every absent rank."""
+        ranks = self._rpc_ranks_per_engine
         flat: list[RpcResult] = []
         for dp_rank in range(engine_count):
             body = by_dp_rank.get(dp_rank)
             if body is None:
-                flat.append(
-                    RpcResult(
-                        request_id,
-                        -1,
-                        error=(
-                            f"DP rank {dp_rank} did not answer {method!r} "
-                            f"before the deadline"
-                        ),
-                    )
+                error = (
+                    f"DP rank {dp_rank} did not answer {method!r} before the deadline"
+                )
+                flat.extend(
+                    RpcResult(request_id, tp, error=error) for tp in range(ranks)
                 )
                 continue
             if body.get("error"):
-                # The engine failed before it could reach its runners, so there
-                # is no per-TP detail to report.
-                flat.append(RpcResult(request_id, -1, error=body["error"]))
+                # The engine failed before reaching its runners, so every one of
+                # them shares the reason.
+                flat.extend(
+                    RpcResult(request_id, tp, error=body["error"])
+                    for tp in range(ranks)
+                )
                 continue
             for entry in body.get("results", []):
                 flat.append(
@@ -1484,6 +1490,12 @@ class CoreManager:
     def broadcast_utility_command_sync(
         self, cmd: str, timeout: float = 300.0, **kwargs
     ):
+        if cmd in FIRE_AND_FORGET_UTILITY_CMDS:
+            raise ValueError(
+                f"{self.label}: {cmd!r} is fire-and-forget; its handler never "
+                f"answers, so waiting on it could only time out. Send it with "
+                f"broadcast_utility_command instead."
+            )
         # Drain any stale responses that might be left over
         while not self.utility_response_queue.empty():
             try:
@@ -1505,6 +1517,15 @@ class CoreManager:
                     f"{self.label}: Timed out waiting for UTILITY_RESPONSE "
                     f"for command '{cmd}' (timeout={timeout}s)"
                 )
+        failed = [r for r in responses if isinstance(r, dict) and r.get("error")]
+        if failed:
+            # Callers read r["result"]; an error reply has none, and handing it
+            # back would turn a named failure into a KeyError somewhere else.
+            raise RuntimeError(
+                f"{self.label}: utility command {cmd!r} failed on {len(failed)} "
+                f"of {len(responses)} engine(s): "
+                + "; ".join(str(r["error"]) for r in failed)
+            )
         return responses
 
     def _shutdown_engine_core_rank(self, dp_rank: int):

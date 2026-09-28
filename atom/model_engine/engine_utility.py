@@ -11,6 +11,12 @@ from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
+# Commands whose senders never wait, so their handlers must never answer.
+# CoreManager keeps one shared response queue that
+# broadcast_utility_command_sync reads by position, so an unrequested reply left
+# there is taken by the next synchronous caller as its own.
+FIRE_AND_FORGET_UTILITY_CMDS = frozenset({"abort_request", "get_mtp_stats"})
+
 
 class EngineUtilityHandler:
     """Centralised handler for all utility commands dispatched by EngineCore.
@@ -115,7 +121,16 @@ class EngineUtilityHandler:
         handler_name = self._UTILITY_HANDLERS.get(cmd)
         if handler_name:
             handler = getattr(self, handler_name)
-            handler(args)
+            try:
+                handler(args)
+            except Exception as exc:
+                # Still fatal to the engine, as before; but a synchronous
+                # caller now hears why instead of waiting out its timeout.
+                if cmd not in FIRE_AND_FORGET_UTILITY_CMDS:
+                    self.output_queue.put_nowait(
+                        ("UTILITY_RESPONSE", self._error_reply(cmd, args, exc))
+                    )
+                raise
         else:
             # Answer, do not just log. `broadcast_utility_command_sync` blocks
             # for 300s on a response that a dropped command never produces, so
@@ -131,6 +146,15 @@ class EngineUtilityHandler:
 
         elapsed = _time.monotonic() - t0
         log(f"{self.label}: utility command '{cmd}' finished in {elapsed:.2f}s")
+
+    @staticmethod
+    def _error_reply(cmd: str, args, exc: Exception) -> dict:
+        reply = {"cmd": cmd, "error": f"{type(exc).__name__}: {exc}"}
+        if cmd == COLLECTIVE_RPC_CMD and isinstance(args, dict):
+            # Without its id the reply falls through to the shared queue,
+            # while the caller that is actually waiting times out.
+            reply["request_id"] = args.get("request_id")
+        return reply
 
     def _handle_collective_rpc(self, args: dict):
         """Invoke an arbitrary ModelRunner method on every TP rank.
@@ -311,25 +335,18 @@ class EngineUtilityHandler:
     def _handle_abort_request(self, args: dict):
         """Cancel queued work promptly; running forwards finish via postprocess."""
         req_id = args.get("req_id") if isinstance(args, dict) else None
-        found = False
-        if req_id is not None and self.scheduler is not None:
-            abort = getattr(self.scheduler, "abort_request", None)
-            if callable(abort):
-                found = abort(req_id)
-            else:
-                for seq in list(self.scheduler.running) + list(self.scheduler.waiting):
-                    if seq.id == req_id:
-                        seq.status = SequenceStatus.ABORTED
-                        found = True
-            logger.info(f"{self.label}: abort_request req_id={req_id} found={found}")
-        # Always answer, including on the early-return paths above: a caller
-        # using broadcast_utility_command_sync would otherwise hang for 300s.
-        self.output_queue.put_nowait(
-            (
-                "UTILITY_RESPONSE",
-                {"cmd": "abort_request", "req_id": req_id, "result": found},
-            )
-        )
+        if req_id is None or self.scheduler is None:
+            return
+        abort = getattr(self.scheduler, "abort_request", None)
+        if callable(abort):
+            found = abort(req_id)
+        else:
+            found = False
+            for seq in list(self.scheduler.running) + list(self.scheduler.waiting):
+                if seq.id == req_id:
+                    seq.status = SequenceStatus.ABORTED
+                    found = True
+        logger.info(f"{self.label}: abort_request req_id={req_id} found={found}")
 
     def _handle_configure_hidden_states(self, args: dict):
         """Configure hidden states extraction on all model runners (TorchSpec)."""

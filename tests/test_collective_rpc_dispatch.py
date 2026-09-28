@@ -10,7 +10,11 @@ cause.
 
 - an unrecognised command was logged and dropped
 - ``update_weights`` never answered, so it could only ever time out
-- ``abort_request`` never answered, including on its early returns
+- a handler that raised never answered either, on any command
+
+The opposite mistake is covered too. ``abort_request`` is fire-and-forget, and
+answering it anyway leaves a reply nobody asked for on the shared queue, where
+the next synchronous caller takes it as its own.
 
 ``engine_utility`` must stay importable without a real AITER build, which is why
 the wire types live in ``atom.model_engine.collective_rpc`` rather than in
@@ -22,7 +26,10 @@ import queue
 import pytest
 
 from atom.model_engine.collective_rpc import RpcPayload, RpcResult
-from atom.model_engine.engine_utility import EngineUtilityHandler
+from atom.model_engine.engine_utility import (
+    FIRE_AND_FORGET_UTILITY_CMDS,
+    EngineUtilityHandler,
+)
 
 # ── harness ────────────────────────────────────────────────────────────────
 
@@ -191,25 +198,78 @@ def test_update_weights_now_answers():
     assert body == {"cmd": "update_weights", "result": 7}
 
 
+def _raise(exc):
+    def fail(*args, **kwargs):
+        raise exc
+
+    return fail
+
+
+def test_a_raising_handler_answers_before_the_engine_goes_down():
+    """``update_weights`` answered only on success. A loader that rejected a
+    tensor escaped the busy loop with no reply, and the caller waited out its
+    timeout for an engine that was already gone."""
+    h, mgr, out = _handler()
+    mgr.call_func = _raise(RuntimeError("loader rejected q_proj"))
+
+    with pytest.raises(RuntimeError, match="loader rejected"):
+        h._execute_utility_command("update_weights", {"named_tensors": []})
+
+    assert _responses(out) == [
+        {"cmd": "update_weights", "error": "RuntimeError: loader rejected q_proj"}
+    ]
+
+
+def test_a_collective_rpc_that_raises_early_still_reaches_its_caller():
+    """Without its request id the error reply would land on the shared queue,
+    while the caller actually waiting on that id timed out."""
+    h, _, out = _handler()
+
+    with pytest.raises(TypeError):
+        # ``args`` is not iterable, so the handler raises before its own
+        # try/except around the fan-out.
+        h._execute_utility_command(
+            "collective_rpc", {"method": "m", "request_id": "x7", "args": 5}
+        )
+
+    (body,) = _responses(out)
+    assert body["request_id"] == "x7"
+    assert body["error"].startswith("TypeError")
+
+
 @pytest.mark.parametrize(
     "args",
     [
         {"req_id": "present"},
-        {"req_id": None},  # early return in the original
+        {"req_id": None},
         {},  # no req_id at all
     ],
 )
-def test_abort_request_answers_on_every_path(args):
+def test_abort_request_never_answers(args):
+    """Every caller is a client-disconnect path that sends and moves on, so an
+    answer is only ever a stray reply on the shared queue."""
     h, _, out = _handler()
-    h.scheduler = None  # the other early return
+    h.scheduler = None
     h._execute_utility_command("abort_request", args)
-    body = _responses(out)[0]
-    assert body["cmd"] == "abort_request"
-    assert "result" in body
+    assert out.empty()
+
+
+def test_a_fire_and_forget_handler_that_raises_stays_silent():
+    class _TornDown:
+        waiting = ()
+
+        @property
+        def running(self):
+            raise RuntimeError("scheduler torn down")
+
+    h, _, out = _handler()
+    h.scheduler = _TornDown()
+    with pytest.raises(RuntimeError, match="torn down"):
+        h._execute_utility_command("abort_request", {"req_id": "abc"})
+    assert out.empty()
 
 
 def test_abort_request_still_aborts_the_matching_sequence():
-    """The response must not come at the cost of the actual behaviour."""
     from atom.model_engine.sequence import SequenceStatus
 
     class _Seq:
@@ -230,33 +290,34 @@ def test_abort_request_still_aborts_the_matching_sequence():
 
     assert target.status == SequenceStatus.ABORTED
     assert other.status is None
-    assert _responses(out)[0]["result"] is True
+    assert out.empty()
 
 
-def test_every_handler_answers_or_is_a_documented_exception():
-    """A response-less handler is a 300s hang waiting to happen. Two remain
-    deliberately fire-and-forget, so they are named rather than assumed."""
+def test_every_handler_answers_unless_it_is_fire_and_forget():
+    """Both directions are bugs. A handler that never answers is a 300s hang for
+    a synchronous caller; a fire-and-forget one that answers leaves a reply for
+    the next synchronous caller to take as its own. So each handler is pinned
+    to exactly one side, by the same set the manager refuses to wait on."""
     import ast
     import inspect
 
-    fire_and_forget = {"_handle_get_mtp_stats"}  # logs only, has no sync caller
+    handlers = EngineUtilityHandler._UTILITY_HANDLERS
+    assert FIRE_AND_FORGET_UTILITY_CMDS <= set(handlers)
+    fire_and_forget = {handlers[cmd] for cmd in FIRE_AND_FORGET_UTILITY_CMDS}
 
     src = inspect.getsource(EngineUtilityHandler)
     tree = ast.parse(
         "class C:\n" + "\n".join("    " + ln for ln in src.splitlines()[1:])
     )
-    silent = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.FunctionDef):
-            continue
-        if not node.name.startswith("_handle_"):
-            continue
-        if node.name in fire_and_forget:
-            continue
-        body = ast.dump(node)
-        if "UTILITY_RESPONSE" not in body:
-            silent.append(node.name)
+    answers = {
+        node.name: "UTILITY_RESPONSE" in ast.dump(node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("_handle_")
+    }
+    silent = sorted(n for n, a in answers.items() if not a and n not in fire_and_forget)
+    chatty = sorted(n for n, a in answers.items() if a and n in fire_and_forget)
     assert silent == [], f"handlers that never answer: {silent}"
+    assert chatty == [], f"fire-and-forget handlers that answer anyway: {chatty}"
 
 
 # ── the import boundary ────────────────────────────────────────────────────
