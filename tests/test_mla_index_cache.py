@@ -600,8 +600,8 @@ def test_mla_staging_rejects_unsupported_layout_before_gather(
         "kv_connector": "mooncake",
         "kv_role": "kv_producer",
         "num_worker_threads": 2,
-        "index_staging_chunk_pages": 256,
-        "index_staging_max_bytes": 2 * 3 * 64 * 576,
+        "dcp_staging_chunk_pages": 256,
+        "dcp_staging_max_bytes": 2 * 3 * 64 * 576,
     }
     builder.kv_pool = MlaKvPool(
         layers=1,
@@ -628,9 +628,9 @@ def test_mla_staging_rejects_unsupported_layout_before_gather(
     # dropping it would silently fall back to direct per-token RDMA.
     assert len(transfer.block_regions) == 2
     assert transfer.gather_sharded_mla is not None
-    assert transfer.index_staging_pool_size == 2
-    assert transfer.index_staging_chunk_pages == 3
-    assert transfer.index_staging_region.total_bytes == 2 * 3 * 64 * 576
+    assert transfer.dcp_staging_pool_size == 2
+    assert transfer.dcp_staging_chunk_pages == 3
+    assert transfer.dcp_staging_region.total_bytes == 2 * 3 * 64 * 576
     if unsupported_layout is not None:
         with pytest.raises(RuntimeError, match=f"{unsupported_layout} layout"):
             transfer.gather_sharded_mla(0, None, 1)
@@ -643,7 +643,7 @@ def test_mla_staging_rejects_unsupported_layout_before_gather(
         assert source.data_ptr() == transfer.block_regions[0].base_addr
         assert staging.is_contiguous() and staging.dtype == torch.uint8
         assert staging.shape == (3, 64 * 576)
-        assert addr == transfer.index_staging_region.base_addr + 3 * 64 * 576
+        assert addr == transfer.dcp_staging_region.base_addr + 3 * 64 * 576
         assert block_size == 64
 
         def gather_index(source, slot, indices, head_dim, block_size, ratio):
@@ -801,8 +801,8 @@ def test_mla_staging_budget_matches_later_allocation(
     builder.kv_pool = builder._declare_kv_pool()
     builder.kv_pool.allocate(2, "cpu")
     transfer = builder.get_kv_transfer_tensors()
-    assert transfer.index_staging_chunk_pages == expected_pages
-    assert transfer.index_staging_region.total_bytes == reserved
+    assert transfer.dcp_staging_chunk_pages == expected_pages
+    assert transfer.dcp_staging_region.total_bytes == reserved
 
 
 @pytest.mark.parametrize(

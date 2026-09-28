@@ -29,13 +29,13 @@ from atom.distributed.pcp_utils import (
     pcp_pad_len,
     pcp_round_robin_query_indices,
 )
-from atom.kv_transfer.disaggregation.index_staging import (
+from atom.kv_transfer.disaggregation.dcp_staging import (
     gather_dcp_mla_pages,
     gather_dcp_preshuffled_index_pages,
-    prepare_dcp_index_gather_indices,
+    prepare_dcp_gather_indices,
 )
 from atom.kv_transfer.disaggregation.pd_producer import (
-    index_staging_shape,
+    dcp_staging_shape,
     mooncake_pd_producer_configured,
 )
 from atom.kv_transfer.disaggregation.sharded_transfer import DCPShardPlan
@@ -1396,7 +1396,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
 
     def _dcp_staging_shape(self, pool: MlaKvPool | None = None) -> tuple[int, int, int]:
-        """The same (slots, pages, bytes/page) for budgeting and allocation."""
+        """Shared MLA/index pool shape for both budgeting and allocation."""
         runner = self.model_runner
         if (
             getattr(self, "dcp_world_size", None) != 1
@@ -1424,7 +1424,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             for field in group
             if field.layers
         )
-        slots, pages = index_staging_shape(runner.config, page_bytes)
+        slots, pages = dcp_staging_shape(runner.config, page_bytes)
         return slots, pages, page_bytes
 
     def kv_transfer_staging_bytes(self) -> int:
@@ -1593,52 +1593,52 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 for layer_id in local_index_layer_ids
             ]
 
-        index_staging_region = None
-        index_staging_pool_size, index_staging_chunk_pages, max_page_bytes = (
+        dcp_staging_region = None
+        dcp_staging_pool_size, dcp_staging_chunk_pages, max_page_bytes = (
             self._dcp_staging_shape(self.kv_pool)
         )
-        prepare_sharded_index = None
+        prepare_dcp_gather = None
         gather_sharded_index = None
         gather_sharded_mla = None
-        if index_staging_pool_size:
-            # A Mooncake P/D producer can receive requests from a DCP
-            # consumer whose index cache is sharded below one MFMA tile. Keep a
-            # per-send-thread pool that packs one layer at a time. Packing MLA
-            # pages too avoids one RDMA descriptor per token for interleave=1.
+        if dcp_staging_pool_size:
+            # DCP index relayout requires staging when a consumer shards below
+            # one MFMA tile. MLA KV uses the same pool to avoid one RDMA
+            # descriptor per token for interleave=1. Each send worker reuses
+            # its slot across both cache formats, one layer/chunk at a time.
             scheduler_block_size = runner.config.kv_cache_block_size
             first_index_page = index_tensors[0]
             index_head_dim = getattr(runner.config.hf_config, "index_head_dim", None)
             staging_bytes = (
-                index_staging_pool_size * index_staging_chunk_pages * max_page_bytes
+                dcp_staging_pool_size * dcp_staging_chunk_pages * max_page_bytes
             )
             logger.info(
-                "Allocating P/D MLA/index staging: %d bytes (%.2f MiB), "
+                "Allocating P/D DCP staging (MLA/index): %d bytes (%.2f MiB), "
                 "%d worker slots x %d pages x %d bytes/page; "
                 "reserved in the KV memory budget",
                 staging_bytes,
                 staging_bytes / 1024**2,
-                index_staging_pool_size,
-                index_staging_chunk_pages,
+                dcp_staging_pool_size,
+                dcp_staging_chunk_pages,
                 max_page_bytes,
             )
             staging = torch.empty(
                 (
-                    index_staging_pool_size,
-                    index_staging_chunk_pages,
+                    dcp_staging_pool_size,
+                    dcp_staging_chunk_pages,
                     max_page_bytes,
                 ),
                 dtype=torch.uint8,
                 device=first_index_page.device,
             )
-            index_staging_region = KVTransferRegion(
+            dcp_staging_region = KVTransferRegion(
                 base_addr=staging.data_ptr(),
                 total_bytes=staging.numel() * staging.element_size(),
-                unit_bytes=index_staging_chunk_pages * max_page_bytes,
-                semantic_role="dsa.index_staging",
+                unit_bytes=dcp_staging_chunk_pages * max_page_bytes,
+                semantic_role="dcp.staging",
             )
 
-            def prepare_sharded_index(plan: DCPShardPlan):
-                return prepare_dcp_index_gather_indices(plan, first_index_page.device)
+            def prepare_dcp_gather(plan: DCPShardPlan):
+                return prepare_dcp_gather_indices(plan, first_index_page.device)
 
             # Contiguous pool views can still contain a segmented or shuffled
             # page. Match the cache writer's layout selection, and reject it
@@ -1657,8 +1657,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 width = block_regions[region_idx].unit_bytes
                 return (
                     staging[pool_idx]
-                    .view(-1)[: index_staging_chunk_pages * width]
-                    .view(index_staging_chunk_pages, width)
+                    .view(-1)[: dcp_staging_chunk_pages * width]
+                    .view(dcp_staging_chunk_pages, width)
                 )
 
             def gather_sharded_mla(region_idx, indices, pool_idx):
@@ -1702,10 +1702,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         return KVTransferTensors(
             pages=pages,
             block_region_consumer_indices=block_region_consumer_indices,
-            index_staging_region=index_staging_region,
-            index_staging_pool_size=index_staging_pool_size,
-            index_staging_chunk_pages=index_staging_chunk_pages,
-            prepare_sharded_index=prepare_sharded_index,
+            dcp_staging_region=dcp_staging_region,
+            dcp_staging_pool_size=dcp_staging_pool_size,
+            dcp_staging_chunk_pages=dcp_staging_chunk_pages,
+            prepare_dcp_gather=prepare_dcp_gather,
             gather_sharded_index=gather_sharded_index,
             gather_sharded_mla=gather_sharded_mla,
             # MLA's latent projection is replicated across TP. Sparse MLA's

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""GPU gather of preshuffled DSA index pages onto a DCP shard plan."""
+"""GPU gather of MLA KV and preshuffled DSA index pages for DCP transfers."""
 
 from __future__ import annotations
 
@@ -13,29 +13,30 @@ from atom.kv_transfer.disaggregation.sharded_transfer import DCPShardPlan
 
 
 @dataclass(frozen=True)
-class DCPIndexGatherIndices:
-    """GPU projection of a shared DCP shard plan for preshuffled index pages."""
+class DCPGatherIndices:
+    """Reusable GPU token indices for both MLA KV and DSA index page gathers."""
 
     dst_pages: int
     src_block_id_per_token: torch.Tensor
     src_token: torch.Tensor
+    # MFMA tile coordinates are used only by the preshuffled index gather.
     src_token_tile: torch.Tensor
     src_token_in_tile: torch.Tensor
     valid: torch.Tensor
 
 
-def prepare_dcp_index_gather_indices(
+def prepare_dcp_gather_indices(
     plan: DCPShardPlan, device: torch.device
-) -> DCPIndexGatherIndices:
+) -> DCPGatherIndices:
     """Project the shared token plan to reusable GPU index tensors."""
 
     if plan.interleave_size != 1:
         raise ValueError(
-            "Preshuffled index staging currently supports "
+            "DCP staging currently supports "
             f"interleave=1, got {plan.interleave_size}"
         )
     src_token = torch.as_tensor(plan.src_token, device=device, dtype=torch.int64)
-    return DCPIndexGatherIndices(
+    return DCPGatherIndices(
         dst_pages=plan.dst_pages,
         src_block_id_per_token=torch.as_tensor(
             plan.src_block_id_per_run, device=device, dtype=torch.int64
@@ -50,7 +51,7 @@ def prepare_dcp_index_gather_indices(
 def gather_dcp_mla_pages(
     source: torch.Tensor,
     staging: torch.Tensor,
-    indices: DCPIndexGatherIndices,
+    indices: DCPGatherIndices,
     scheduler_block_size: int,
 ) -> int:
     """Pack token-contiguous MLA bytes into complete DCP destination pages.
@@ -134,7 +135,7 @@ def gather_dcp_mla_pages(
 def gather_dcp_preshuffled_index_pages(
     source: torch.Tensor,
     staging: torch.Tensor,
-    indices: DCPIndexGatherIndices,
+    indices: DCPGatherIndices,
     index_head_dim: int,
     scheduler_block_size: int,
     block_ratio: int,

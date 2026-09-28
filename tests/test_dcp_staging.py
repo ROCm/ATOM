@@ -6,10 +6,10 @@ from dataclasses import replace
 import pytest
 import torch
 
-from atom.kv_transfer.disaggregation.index_staging import (
+from atom.kv_transfer.disaggregation.dcp_staging import (
     gather_dcp_mla_pages,
     gather_dcp_preshuffled_index_pages,
-    prepare_dcp_index_gather_indices,
+    prepare_dcp_gather_indices,
 )
 from atom.kv_transfer.disaggregation.sharded_transfer import build_dcp_shard_plan
 
@@ -35,7 +35,7 @@ def test_mla_gather_preserves_sharded_bytes_and_partial_page(
         plan = build_dcp_shard_plan(
             src_ids, block_size=block_size, dcp_size=dcp_size, dcp_rank=rank
         )
-        indices = prepare_dcp_index_gather_indices(plan, torch.device(device))
+        indices = prepare_dcp_gather_indices(plan, torch.device(device))
         indices = replace(
             indices,
             src_block_id_per_token=indices.src_block_id_per_token.to(index_dtype),
@@ -69,7 +69,7 @@ def mla_gather_inputs():
     plan = build_dcp_shard_plan(
         [3, 0, 2], block_size=block_size, dcp_size=2, dcp_rank=1
     )
-    indices = prepare_dcp_index_gather_indices(plan, torch.device("cpu"))
+    indices = prepare_dcp_gather_indices(plan, torch.device("cpu"))
     source = torch.zeros(4, block_size, width, dtype=torch.uint8)
     staging = torch.full(
         (plan.dst_pages + 1, block_size * width), 253, dtype=torch.uint8
@@ -174,7 +174,7 @@ def test_mla_gather_rejects_invalid_source_pages(mla_gather_inputs, shape):
 def test_mla_gather_empty_plan_preserves_staging_and_checks_dtype(mla_gather_inputs):
     source, staging, _, block_size = mla_gather_inputs
     plan = build_dcp_shard_plan([], block_size=block_size, dcp_size=2, dcp_rank=0)
-    indices = prepare_dcp_index_gather_indices(plan, torch.device("cpu"))
+    indices = prepare_dcp_gather_indices(plan, torch.device("cpu"))
     assert gather_dcp_mla_pages(source, staging, indices, block_size) == 0
     assert torch.all(staging == 253)
     with pytest.raises(TypeError, match="staging must have dtype torch.uint8"):
@@ -225,7 +225,7 @@ def test_preshuffled_index_gather_reorganizes_pages_and_zeros_tail(index_head_di
         dcp_size=dcp_size,
         dcp_rank=dcp_rank,
     )
-    indices = prepare_dcp_index_gather_indices(plan, torch.device("cpu"))
+    indices = prepare_dcp_gather_indices(plan, torch.device("cpu"))
     staging = torch.full(
         (staging_pages, page_bytes),
         0xFF,
@@ -283,7 +283,7 @@ def test_preshuffled_index_gather_rejects_narrow_staging_slot():
         dcp_size=2,
         dcp_rank=0,
     )
-    indices = prepare_dcp_index_gather_indices(plan, torch.device("cpu"))
+    indices = prepare_dcp_gather_indices(plan, torch.device("cpu"))
     source = torch.zeros(16, 1, 144, dtype=torch.uint8)
     staging = torch.zeros(plan.dst_pages, 16 * 128, dtype=torch.uint8)
     with pytest.raises(ValueError, match="bytes wide"):
@@ -313,7 +313,7 @@ def test_mla_gather_crosses_chunk_boundary_with_partial_tail(block_size, width):
     output = []
     for start in range(0, plan.dst_pages, chunk_pages):
         part = plan.slice_pages(start, min(start + chunk_pages, plan.dst_pages))
-        indices = prepare_dcp_index_gather_indices(part, source.device)
+        indices = prepare_dcp_gather_indices(part, source.device)
         # The second chunk must neither overwrite nor zero the rest of the slot.
         staging.fill_(253)
         assert (

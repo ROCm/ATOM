@@ -208,7 +208,7 @@ class PageRegion:
 
 @dataclass
 class KVTransferTensors:
-    """Physical PAGE, SLOT, and compressor-only staging region contract.
+    """Physical PAGE, SLOT, and staging region contract.
 
     ``pages`` are forward-indexed, block-indexed PAGE units, each with its
     region and (when published) its tensor view; ``block_regions`` and
@@ -219,10 +219,12 @@ class KVTransferTensors:
     plane count explicit so registration can reject a missing plane.
     ``staging_region`` plus ``gather_slot``/``scatter_slot`` cover only the
     compressor-state PD staging pool and are invalid as sidecar SLOT sources.
-    ``index_staging_region`` plus ``prepare_sharded_index`` and
-    ``gather_sharded_index`` cover producer-side repacking of preshuffled index
-    pages before DCP-sharded RDMA. The prepared indices are shared across index
-    layers.
+    ``dcp_staging_region`` is the producer pool shared by ``gather_sharded_mla``
+    and ``gather_sharded_index`` to pack MLA KV and preshuffled index caches into
+    complete destination pages before DCP-sharded RDMA. ``prepare_dcp_gather``
+    prepares token indices once per chunk for reuse across both cache formats
+    and all layers. Each slot holds the wider page format and is reused only
+    after its RDMA transfer completes.
 
     ``tp_replication_factor`` describes byte-identical PAGE replicas, not the
     number of physical consumers. A value equal to tensor parallel size lets a
@@ -262,11 +264,12 @@ class KVTransferTensors:
     # loose runtime attribute so the field the connector reads is part of the
     # contract, not an undocumented assignment two layers away.
     state_backend: object | None = None
-    # Producer-side DSA index-page staging. The callback fills one pool slot
-    # with compact destination pages and returns (base_addr, page_count).
-    index_staging_region: KVTransferRegion | None = None
-    index_staging_pool_size: int = 0
-    index_staging_chunk_pages: int = 0
+    # Producer-side DCP staging shared by MLA KV and DSA index caches. Each
+    # gather callback fills one slot with compact pages of its cache format
+    # and returns (base_addr, page_count).
+    dcp_staging_region: KVTransferRegion | None = None
+    dcp_staging_pool_size: int = 0
+    dcp_staging_chunk_pages: int = 0
     gather_sharded_index: Callable[..., tuple[int, int]] | None = None
     # Appended after the original staging fields for positional compatibility.
     prepare_sharded_index: Callable[..., Any] | None = None
@@ -287,6 +290,9 @@ class KVTransferTensors:
     # those are ordinary PAGE KV, never part of the state image. None means
     # every region. Appended for positional compatibility.
     paged_state_region_count: int | None = None
+    # Shared MLA/index gather preparation; field order preserves positional
+    # compatibility with the original staging contract.
+    prepare_dcp_gather: Callable[..., Any] | None = None
     # Optional token-contiguous MLA gather using the same registered staging
     # pool and prepared DCP indices as the index-page callback. The pool must
     # hold the larger of an MLA page and an index page for every chunk slot.

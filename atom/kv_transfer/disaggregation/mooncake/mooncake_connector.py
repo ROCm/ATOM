@@ -753,15 +753,16 @@ class MooncakeConnector(KVConnectorBase):
         self._staging_pool_size: int = 0
         self._staging_free: list[int] = []
         self._staging_lock = threading.Lock()
-        self._index_staging_mr: tuple[int, int] | None = None
-        self._index_staging_pool_size: int = 0
-        self._index_staging_chunk_pages: int = 0
-        self._index_staging_free: list[int] = []
-        self._index_staging_lock = threading.Lock()
-        self._prepare_sharded_index = None
+        # One registered DCP staging pool serves both MLA KV and index gathers.
+        self._dcp_staging_mr: tuple[int, int] | None = None
+        self._dcp_staging_pool_size: int = 0
+        self._dcp_staging_chunk_pages: int = 0
+        self._dcp_staging_free: list[int] = []
+        self._dcp_staging_lock = threading.Lock()
+        self._prepare_dcp_gather = None
         self._gather_sharded_index = None
         self._gather_sharded_mla = None
-        self._index_staging_stream = None
+        self._dcp_staging_stream = None
 
         # --- Producer: completed prefill block_ids cache ---
         # Populated from ConnectorMetadata.reqs_to_save each step.
@@ -906,19 +907,19 @@ class MooncakeConnector(KVConnectorBase):
             self._staging_slot_bytes = tt.staging_region.unit_bytes
             self._staging_pool_size = tt.staging_pool_size
             self._staging_free = list(range(tt.staging_pool_size))
-        if tt.index_staging_region is not None:
-            region = tt.index_staging_region
-            self._index_staging_mr = (
+        if tt.dcp_staging_region is not None:
+            region = tt.dcp_staging_region
+            self._dcp_staging_mr = (
                 region.base_addr,
                 self._rdma_chunk_sizes(region.total_bytes, region.unit_bytes)[0],
             )
-            self._index_staging_pool_size = tt.index_staging_pool_size
-            self._index_staging_chunk_pages = tt.index_staging_chunk_pages
-            self._index_staging_free = list(range(tt.index_staging_pool_size))
-            self._prepare_sharded_index = tt.prepare_sharded_index
+            self._dcp_staging_pool_size = tt.dcp_staging_pool_size
+            self._dcp_staging_chunk_pages = tt.dcp_staging_chunk_pages
+            self._dcp_staging_free = list(range(tt.dcp_staging_pool_size))
+            self._prepare_dcp_gather = tt.prepare_dcp_gather
             self._gather_sharded_index = tt.gather_sharded_index
             self._gather_sharded_mla = tt.gather_sharded_mla
-            self._index_staging_stream = torch.cuda.Stream(device=self._cuda_device)
+            self._dcp_staging_stream = torch.cuda.Stream(device=self._cuda_device)
 
         # Populate block/slot region lists for transfer offset computation
         self._block_regions = [(r.base_addr, r.unit_bytes) for r in tt.block_regions]
@@ -991,8 +992,8 @@ class MooncakeConnector(KVConnectorBase):
         )
         if tt.staging_region is not None:
             all_regions.append(tt.staging_region)
-        if tt.index_staging_region is not None:
-            all_regions.append(tt.index_staging_region)
+        if tt.dcp_staging_region is not None:
+            all_regions.append(tt.dcp_staging_region)
         for r in all_regions:
             offset = 0
             for chunk in self._rdma_chunk_sizes(r.total_bytes, r.unit_bytes):
@@ -1100,8 +1101,8 @@ class MooncakeConnector(KVConnectorBase):
     # -----------------------------------------------------------------
 
     def record_kv_cache_ready(self, req_ids: list[ReqId]) -> None:
-        """Record when this prefill batch's index-cache writes become visible."""
-        if not self.is_producer or self._index_staging_stream is None or not req_ids:
+        """Record when this prefill batch's MLA/index cache writes become visible."""
+        if not self.is_producer or self._dcp_staging_stream is None or not req_ids:
             return
         ready_event = torch.cuda.Event()
         ready_event.record(torch.cuda.current_stream(self._cuda_device))
@@ -1354,23 +1355,23 @@ class MooncakeConnector(KVConnectorBase):
         with self._staging_lock:
             self._staging_free.append(idx)
 
-    def _acquire_index_staging_slot(self) -> int:
-        with self._index_staging_lock:
-            if self._index_staging_free:
-                return self._index_staging_free.pop()
+    def _acquire_dcp_staging_slot(self) -> int:
+        with self._dcp_staging_lock:
+            if self._dcp_staging_free:
+                return self._dcp_staging_free.pop()
         logger.warning(
-            "Index staging pool exhausted (size=%d), waiting for a slot",
-            self._index_staging_pool_size,
+            "DCP staging pool exhausted (size=%d), waiting for a slot",
+            self._dcp_staging_pool_size,
         )
         while True:
             time.sleep(0.001)
-            with self._index_staging_lock:
-                if self._index_staging_free:
-                    return self._index_staging_free.pop()
+            with self._dcp_staging_lock:
+                if self._dcp_staging_free:
+                    return self._dcp_staging_free.pop()
 
-    def _release_index_staging_slot(self, idx: int) -> None:
-        with self._index_staging_lock:
-            self._index_staging_free.append(idx)
+    def _release_dcp_staging_slot(self, idx: int) -> None:
+        with self._dcp_staging_lock:
+            self._dcp_staging_free.append(idx)
 
     # -----------------------------------------------------------------
     # KVConnectorBase: get_finished
@@ -1787,7 +1788,7 @@ class MooncakeConnector(KVConnectorBase):
         interleave = request_data.get("consumer_dcp_interleave", 1)
         sharded_plan = None
         sharded_runs = None
-        stages_sharded_index = False
+        requires_index_staging = False
         if self.dcp_size > 1:
             if dcp_size != self.dcp_size:
                 raise RuntimeError(
@@ -1804,23 +1805,25 @@ class MooncakeConnector(KVConnectorBase):
                 dst_pages=len(dst_block_ids),
             )
             sharded_runs = sharded_plan.token_runs(dst_block_ids)
-            stages_sharded_index = (
+            # Index relayout enables the shared DCP staging path; MLA KV also
+            # uses it when its gather callback is available.
+            requires_index_staging = (
                 interleave < self.block_size
                 and INDEX_CACHE_ROLE in self._block_region_roles
             )
-            if stages_sharded_index and (
+            if requires_index_staging and (
                 interleave != 1
                 or self.block_size % 16
-                or self._prepare_sharded_index is None
+                or self._prepare_dcp_gather is None
                 or self._gather_sharded_index is None
-                or self._index_staging_chunk_pages <= 0
+                or self._dcp_staging_chunk_pages <= 0
             ):
                 raise RuntimeError(
                     "Sharded preshuffled DSA index transfer requires "
                     "interleave=1, a block size divisible by 16, and producer "
-                    "index staging; got "
+                    "DCP staging with an index gather callback; got "
                     f"{interleave=}, block_size={self.block_size}, "
-                    f"has_staging={self._gather_sharded_index is not None and self._prepare_sharded_index is not None}."
+                    f"has_staging={self._gather_sharded_index is not None and self._prepare_dcp_gather is not None}."
                 )
 
         staged_regions: list[tuple[int, int, int]] = []
@@ -1851,7 +1854,7 @@ class MooncakeConnector(KVConnectorBase):
                 role == MLA_KV_ROLE
                 and getattr(self, "_gather_sharded_mla", None) is not None
             )
-            if stages_sharded_index and (role == INDEX_CACHE_ROLE or stage_mla):
+            if requires_index_staging and (role == INDEX_CACHE_ROLE or stage_mla):
                 staged_regions.append((region_idx, dst_base, bpb))
                 continue
             if sharded_runs is None:
@@ -1926,26 +1929,26 @@ class MooncakeConnector(KVConnectorBase):
         if staged_regions:
             if kv_cache_ready_event is None:
                 raise RuntimeError(
-                    "Missing prefill KV-cache ready event for staged DSA index transfer"
+                    "Missing prefill KV-cache ready event for staged DCP transfer"
                 )
-            if self._index_staging_stream is None:
-                raise RuntimeError("DSA index staging stream is not initialized")
+            if self._dcp_staging_stream is None:
+                raise RuntimeError("DCP staging stream is not initialized")
             # Wait only for this request's prefill writes; unrelated GPU work
             # can continue on other streams while the staging stream is blocked.
-            self._index_staging_stream.wait_event(kv_cache_ready_event)
+            self._dcp_staging_stream.wait_event(kv_cache_ready_event)
             for dst_start in range(
-                0, len(dst_block_ids), self._index_staging_chunk_pages
+                0, len(dst_block_ids), self._dcp_staging_chunk_pages
             ):
                 dst_chunk = dst_block_ids[
-                    dst_start : dst_start + self._index_staging_chunk_pages
+                    dst_start : dst_start + self._dcp_staging_chunk_pages
                 ]
                 chunk_plan = sharded_plan.slice_pages(
                     dst_start, dst_start + len(dst_chunk)
                 )
-                gather_indices = self._prepare_sharded_index(chunk_plan)
+                gather_indices = self._prepare_dcp_gather(chunk_plan)
 
                 for region_idx, dst_base, bpb in staged_regions:
-                    if not self._execute_staged_index_layer_chunk(
+                    if not self._execute_dcp_staged_layer_chunk(
                         target,
                         region_idx,
                         dst_base,
@@ -1958,7 +1961,7 @@ class MooncakeConnector(KVConnectorBase):
                         return False
         return True
 
-    def _execute_staged_index_layer_chunk(
+    def _execute_dcp_staged_layer_chunk(
         self,
         target: str,
         region_idx: int,
@@ -1972,11 +1975,11 @@ class MooncakeConnector(KVConnectorBase):
     ) -> bool:
         """GPU-pack one index or MLA layer/chunk, then RDMA complete pages."""
 
-        pool_idx = self._acquire_index_staging_slot()
+        pool_idx = self._acquire_dcp_staging_slot()
         try:
             stream = (
-                self._index_staging_stream
-                if self._index_staging_stream is not None
+                self._dcp_staging_stream
+                if self._dcp_staging_stream is not None
                 else torch.cuda.current_stream()
             )
             with torch.cuda.stream(stream):
@@ -1994,7 +1997,7 @@ class MooncakeConnector(KVConnectorBase):
             stream.synchronize()
             if staged_pages != len(dst_block_ids):
                 raise RuntimeError(
-                    f"Index staging produced {staged_pages} pages for "
+                    f"DCP staging produced {staged_pages} pages for "
                     f"{len(dst_block_ids)} destinations"
                 )
 
@@ -2010,12 +2013,12 @@ class MooncakeConnector(KVConnectorBase):
                 staging_base + src_page * bytes_per_page,
                 dst_base + dst_page * bytes_per_page,
                 length,
-                src_mr=self._index_staging_mr,
+                src_mr=self._dcp_staging_mr,
                 dst_mr=(dst_base, dst_mr_bytes),
             )
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
-                    "[PRODUCER] staged index RDMA write: req=%s, region=%d, "
+                    "[PRODUCER] staged DCP RDMA write: req=%s, region=%d, "
                     "pages=%d, descriptors=%d, total_bytes=%d",
                     req_id,
                     region_idx,
@@ -2029,18 +2032,18 @@ class MooncakeConnector(KVConnectorBase):
                 dst_addrs.tolist(),
                 sizes.tolist(),
                 req_id,
-                "staged-index",
+                "staged-dcp",
                 engine=engine,
             ):
                 logger.error(
-                    "[PRODUCER] staged index transfer failed for req %s region %d",
+                    "[PRODUCER] staged DCP transfer failed for req %s region %d",
                     req_id,
                     region_idx,
                 )
                 return False
             return True
         finally:
-            self._release_index_staging_slot(pool_idx)
+            self._release_dcp_staging_slot(pool_idx)
 
     def _execute_block_slot_transfer(
         self,

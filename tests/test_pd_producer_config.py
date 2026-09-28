@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import pytest
 
 from atom.kv_transfer.disaggregation.pd_producer import (
-    index_staging_pool_size,
-    index_staging_shape,
+    dcp_staging_pool_size,
+    dcp_staging_shape,
     mooncake_pd_producer_configured,
     pd_producer_configured,
 )
@@ -91,13 +91,13 @@ def test_pd_producer_classification(kv_transfer_config, is_pd, is_mooncake_stagi
         ),
     ],
 )
-def test_index_staging_pool_matches_mooncake_worker_count(kv_transfer_config, expected):
+def test_dcp_staging_pool_matches_mooncake_worker_count(kv_transfer_config, expected):
     config = SimpleNamespace(kv_transfer_config=kv_transfer_config)
-    assert index_staging_pool_size(config) == expected
+    assert dcp_staging_pool_size(config) == expected
 
 
 @pytest.mark.parametrize("worker_count", [0, -1, True, "32"])
-def test_index_staging_pool_rejects_invalid_worker_count(worker_count):
+def test_dcp_staging_pool_rejects_invalid_worker_count(worker_count):
     config = SimpleNamespace(
         kv_transfer_config={
             "kv_connector": "mooncake",
@@ -106,10 +106,10 @@ def test_index_staging_pool_rejects_invalid_worker_count(worker_count):
         }
     )
     with pytest.raises(ValueError, match="positive integer"):
-        index_staging_pool_size(config)
+        dcp_staging_pool_size(config)
 
 
-def test_index_staging_pool_rejects_two_mooncake_producers():
+def test_dcp_staging_pool_rejects_two_mooncake_producers():
     config = SimpleNamespace(
         kv_transfer_config={
             "kv_connector": "multi",
@@ -120,12 +120,12 @@ def test_index_staging_pool_rejects_two_mooncake_producers():
         }
     )
     with pytest.raises(ValueError, match="multiple Mooncake"):
-        index_staging_pool_size(config)
+        dcp_staging_pool_size(config)
 
 
 @pytest.mark.parametrize("workers", [16, 64])
 @pytest.mark.parametrize("token_bytes", [576, 1152])
-def test_index_staging_default_cap_bounds_mla_allocation(workers, token_bytes):
+def test_dcp_staging_default_cap_bounds_mla_allocation(workers, token_bytes):
     config = SimpleNamespace(
         kv_transfer_config={
             "kv_connector": "mooncake",
@@ -133,7 +133,7 @@ def test_index_staging_default_cap_bounds_mla_allocation(workers, token_bytes):
         }
     )
     page_bytes = 64 * token_bytes
-    slots, pages = index_staging_shape(config, page_bytes)
+    slots, pages = dcp_staging_shape(config, page_bytes)
     assert slots == workers
     assert 0 < pages <= 256
     assert slots * pages * page_bytes <= 256 * 1024**2
@@ -142,13 +142,17 @@ def test_index_staging_default_cap_bounds_mla_allocation(workers, token_bytes):
 
 
 @pytest.mark.parametrize("multi", [False, True])
+@pytest.mark.parametrize("pages_prefix", ["dcp", "index"])
+@pytest.mark.parametrize("cap_prefix", ["dcp", "index"])
 @pytest.mark.parametrize("requested,cap,expected", [(7, 10000, 7), (256, 1000, 5)])
-def test_index_staging_shape_honors_producer_options(multi, requested, cap, expected):
+def test_dcp_staging_shape_honors_producer_options(
+    multi, pages_prefix, cap_prefix, requested, cap, expected
+):
     connector = {
         "kv_connector": "mooncake",
         "num_worker_threads": 2,
-        "index_staging_chunk_pages": requested,
-        "index_staging_max_bytes": cap,
+        f"{pages_prefix}_staging_chunk_pages": requested,
+        f"{cap_prefix}_staging_max_bytes": cap,
     }
     transfer = (
         {
@@ -161,35 +165,55 @@ def test_index_staging_shape_honors_producer_options(multi, requested, cap, expe
         if multi
         else connector
     )
-    assert index_staging_shape(SimpleNamespace(kv_transfer_config=transfer), 100) == (
+    assert dcp_staging_shape(SimpleNamespace(kv_transfer_config=transfer), 100) == (
         2,
         expected,
     )
 
 
-@pytest.mark.parametrize(
-    "option", ["index_staging_chunk_pages", "index_staging_max_bytes"]
-)
+@pytest.mark.parametrize("prefix", ["dcp", "index"])
+@pytest.mark.parametrize("option", ["chunk_pages", "max_bytes"])
 @pytest.mark.parametrize("value", [0, -1, True, "256", 1.5])
-def test_index_staging_shape_rejects_invalid_options(option, value):
-    config = SimpleNamespace(
-        kv_transfer_config={"kv_connector": "mooncake", option: value}
-    )
-    with pytest.raises(ValueError, match=f"{option} must be a positive integer"):
-        index_staging_shape(config, 100)
+def test_dcp_staging_shape_rejects_invalid_options(prefix, option, value):
+    connector = {"kv_connector": "mooncake", f"{prefix}_staging_{option}": value}
+    if prefix == "dcp":
+        # An explicitly invalid canonical option must not use a valid alias.
+        connector[f"index_staging_{option}"] = 10000
+    config = SimpleNamespace(kv_transfer_config=connector)
+    with pytest.raises(
+        ValueError, match=f"dcp_staging_{option} must be a positive integer"
+    ):
+        dcp_staging_shape(config, 100)
 
 
-def test_index_staging_shape_rejects_cap_smaller_than_one_page_per_worker():
+@pytest.mark.parametrize("requested,cap,expected", [(7, 10000, 7), (256, 1000, 5)])
+def test_dcp_staging_options_take_precedence_over_legacy_aliases(
+    requested, cap, expected
+):
     config = SimpleNamespace(
         kv_transfer_config={
             "kv_connector": "mooncake",
             "num_worker_threads": 2,
-            "index_staging_max_bytes": 199,
+            "dcp_staging_chunk_pages": requested,
+            "dcp_staging_max_bytes": cap,
+            "index_staging_chunk_pages": 1,
+            "index_staging_max_bytes": 200,
+        }
+    )
+    assert dcp_staging_shape(config, 100) == (2, expected)
+
+
+def test_dcp_staging_shape_rejects_cap_smaller_than_one_page_per_worker():
+    config = SimpleNamespace(
+        kv_transfer_config={
+            "kv_connector": "mooncake",
+            "num_worker_threads": 2,
+            "dcp_staging_max_bytes": 199,
         }
     )
     with pytest.raises(ValueError, match="cannot hold one page per worker"):
-        index_staging_shape(config, 100)
+        dcp_staging_shape(config, 100)
 
 
-def test_index_staging_shape_without_producer_needs_no_memory():
-    assert index_staging_shape(SimpleNamespace(kv_transfer_config=None), 100) == (0, 0)
+def test_dcp_staging_shape_without_producer_needs_no_memory():
+    assert dcp_staging_shape(SimpleNamespace(kv_transfer_config=None), 100) == (0, 0)
