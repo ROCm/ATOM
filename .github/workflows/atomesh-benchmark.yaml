@@ -199,7 +199,7 @@ on:
       run_model_benchmark:
         description: 'Run model Slurm benchmark for workflow_dispatch'
         required: false
-        default: false
+        default: true
         type: boolean
       publish_dashboard:
         description: 'Publish workflow_dispatch results to the benchmark dashboard'
