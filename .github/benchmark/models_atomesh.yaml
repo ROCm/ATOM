@@ -480,6 +480,27 @@ models:
           name: glm-52-mxfp4-1p1d-cpp4-dpa4-agentic-lmcache-1m-c40
           concurrency: [40]
 
+        # Match the CPP4+DCP4 LMCache baseline, enabling chunked KV transfer
+        # only on the Mooncake producer; retain every other server/benchmark knob.
+        - &glm52_agentic_lmcache_chunked_cpp4_dcp4
+          <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-chunked-1m-c32
+          concurrency: [32]
+          env:
+            <<: *glm52_agentic_lmcache_cpp4_dcp4_env
+            prefill:
+              <<: *glm52_agentic_lmcache_cpp4_dcp4_prefill_env
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+
+        - <<: *glm52_agentic_lmcache_chunked_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-chunked-1m-c48
+          concurrency: [48]
+
+        - <<: *glm52_agentic_lmcache_chunked_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-chunked-1m-c54
+          concurrency: [54]
+
         # 4-5) 1P2D: CPP4 prefill (PP4×TP1, node 0) paired with 2× DPA4 decode
         # (dp4×tp1 each, node 1 GPU 0-3 and GPU 4-7). MTP4 with fixed
         # acceptance length 3.33. dp_sticky session-affinity routing via
