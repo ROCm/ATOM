@@ -66,7 +66,7 @@ class ChunkedPrefill:
         self.swa_block_ids = list(swa_block_ids)
         self.timeout = timeout
         self.cv = threading.Condition()
-        self.ready_blocks = 0
+        self.num_ready_blocks = 0
         self.event: Any = None
         self.handoff: dict | None = None
         self.cancelled = False
@@ -81,14 +81,14 @@ class ChunkedPrefill:
             if self.cancelled:
                 return
             end_tokens = min(end_tokens, self.num_tokens)
-            blocks = (
+            num_blocks = (
                 (end_tokens + self.block_size - 1) // self.block_size
                 if end_tokens == self.num_tokens
                 else end_tokens // self.block_size
             )
-            if blocks < self.ready_blocks:
+            if num_blocks < self.num_ready_blocks:
                 raise ValueError("prefill publication moved backwards")
-            self.ready_blocks = blocks
+            self.num_ready_blocks = num_blocks
             self.event = event
             self.updated = time.monotonic()
             self.cv.notify_all()
@@ -98,6 +98,8 @@ class ChunkedPrefill:
             if not self.cancelled:
                 if slot_index is not None:
                     self.slot_index = slot_index
+                # SWA is mutable per-request state. Transfer its final slot
+                # once the final handoff is available, using the current slot.
                 if swa_block_ids is not None:
                     self.swa_block_ids = list(swa_block_ids)
                 self.handoff = dict(handoff)
@@ -109,18 +111,26 @@ class ChunkedPrefill:
             self.cancelled = True
             self.cv.notify_all()
 
-    def acquire(self, identity, expected_readers):
+    def acquire(self, consumer_identity, expected_readers):
+        """Claim one consumer's reads of this producer rank's source blocks.
+
+        The identity deduplicates write requests; expected_readers counts all
+        consumers that must finish before the source allocation can be freed.
+        """
         with self.cv:
+            # The original reader owns the terminal notification even after
+            # cancellation. Failing a duplicate now could let D free its pages
+            # while that reader is still writing them.
+            if consumer_identity in self.claims:
+                return False
             if self.cancelled:
                 raise RuntimeError("prefill was cancelled")
-            if identity in self.claims:
-                return False
             if self.expected_readers and self.expected_readers != expected_readers:
                 raise ValueError("inconsistent consumer fan-out")
             if len(self.claims) >= expected_readers:
                 raise ValueError("too many consumers for one prefill")
             self.expected_readers = expected_readers
-            self.claims.add(identity)
+            self.claims.add(consumer_identity)
             self.readers += 1
             return True
 
@@ -149,8 +159,12 @@ class ChunkedPrefill:
                 )
             )
 
-    def wait_chunk(self, cursor, skip_factor=1):
-        """Return a stable source slice, GPU event, and new absolute cursor.
+    def wait_chunk(self, src_block_offset, src_blocks_per_dst_block=1):
+        """Return source block IDs, their GPU event, and the exclusive end offset.
+
+        Offsets index the full producer block table, including any cached prefix.
+        ``src_blocks_per_dst_block`` is the number of producer blocks represented
+        by one consumer block.
 
         DCP consumers need whole groups of producer blocks except at the final
         tail. Holding back an incomplete group prevents rewriting a destination
@@ -158,18 +172,24 @@ class ChunkedPrefill:
         """
         with self.cv:
 
-            def end():
-                n = self.ready_blocks
-                return n if n == len(self.block_ids) else n - n % skip_factor
+            def ready_src_block_end():
+                num_blocks = self.num_ready_blocks
+                if num_blocks == len(self.block_ids):
+                    return num_blocks
+                return num_blocks - num_blocks % src_blocks_per_dst_block
 
             ready = self.cv.wait_for(
-                lambda: self.cancelled or end() > cursor,
+                lambda: self.cancelled or ready_src_block_end() > src_block_offset,
                 timeout=self.timeout,
             )
             if not ready or self.cancelled:
                 raise RuntimeError("prefill chunk cancelled or timed out")
-            stop = end()
-            return list(self.block_ids[cursor:stop]), self.event, stop
+            src_block_end = ready_src_block_end()
+            return (
+                list(self.block_ids[src_block_offset:src_block_end]),
+                self.event,
+                src_block_end,
+            )
 
     def wait_handoff(self):
         with self.cv:
