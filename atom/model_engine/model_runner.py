@@ -784,8 +784,16 @@ class ModelRunner:
         torch.set_default_device(self.device)
         spec_enabled = bool(self.config.speculative_config)
         use_spec = spec_enabled and get_pp_group().is_last_rank
+        # The verify window's width, which every stage runs -- not whether this
+        # stage drafts. What reads it sizes per-stage buffers for that window:
+        # the KDA conv state (`conv_kernel - 1 + num_spec` rows per slot) and
+        # aiter MLA's work metadata (`max_bs * (num_spec + 1)` query rows).
+        # Keyed on `use_spec`, a drafterless stage sized both for one token and
+        # then ran eight through them: the conv kernel wrote its window over
+        # the next slots' rows. At pp == 1 the one stage is the last, so this
+        # is the value it always had.
         self.num_spec_tokens = (
-            self.config.speculative_config.num_speculative_tokens if use_spec else 0
+            self.config.speculative_config.num_speculative_tokens if spec_enabled else 0
         )
 
         self._pp_pending_send: list = []
