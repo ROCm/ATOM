@@ -1,0 +1,726 @@
+import copy
+import json
+import logging
+import os
+from dataclasses import dataclass
+from typing import Any
+
+import torch
+
+from atom.utils import envs
+
+logger = logging.getLogger("atom")
+
+# vLLM does not expose a stable prefill/decode flag for MORI launch-config
+# selection, so use a plugin-scoped token-count threshold instead
+VLLM_MORI_LAUNCH_CONFIG_TOKEN_THRESHOLD = 4096
+
+
+def _get_sglang_tbo_flags(enable_two_batch_overlap: bool) -> tuple[bool, bool]:
+    """Translate SGLang's TBO switch and ATOM mode into ATOM config flags."""
+    if not enable_two_batch_overlap:
+        return False, False
+
+    mode = os.getenv("SGLANG_ATOM_TBO_MODE", "all").strip().lower()
+    if mode not in {"prefill", "all"}:
+        raise ValueError(
+            f"SGLANG_ATOM_TBO_MODE must be one of {{'prefill', 'all'}}, got {mode!r}"
+        )
+
+    return True, mode == "all"
+
+
+@dataclass
+class PluginConfig:
+    # common config for both framework
+    model_config: Any = None
+    rank: int = 0
+    is_plugin_mode: bool = False
+    is_vllm: bool = False
+    is_sglang: bool = False
+    is_rtpllm: bool = False
+
+    # vllm specific
+    vllm_config: Any = None
+    vllm_scheduler_config: Any = None
+    vllm_cache_config: Any = None
+    vllm_quant_config: Any = None
+    vllm_use_atom_attention: bool = True
+
+    # sglang specific
+    sglang_model_opt_config: Any = None
+    sglang_load_config: Any = None
+    sglang_enable_torch_compile: bool = False
+    sglang_disable_cuda_graph: bool = False
+    sglang_enable_dp_attention: bool = False
+    sglang_aiter_rank_id: int = 0
+    sglang_dist_init_addr: str | None = None
+    sglang_port_args: Any = None
+    sglang_enable_nsa_prefill_cp: bool = False
+    sglang_nsa_prefill_cp_mode: str = "round-robin-split"
+
+    # rtp-llm specific
+    rtpllm_model_config: Any = None
+    rtpllm_parallelism_config: Any = None
+
+
+def _get_sglang_prefill_cp_config(server_args) -> tuple[bool, str]:
+    """Read prefill CP settings across SGLang ServerArgs versions."""
+    if hasattr(server_args, "enable_prefill_cp"):
+        enable_prefill_cp = server_args.enable_prefill_cp
+        cp_strategy = server_args.cp_strategy
+        if not enable_prefill_cp:
+            return False, "round-robin-split"
+
+        strategy_to_legacy_mode = {
+            "interleave": "round-robin-split",
+            "zigzag": "in-seq-split",
+        }
+        if cp_strategy not in strategy_to_legacy_mode:
+            raise ValueError(
+                "SGLang+ATOM PCP requires a supported --cp-strategy, got "
+                f"{cp_strategy!r}"
+            )
+        return True, strategy_to_legacy_mode[cp_strategy]
+
+    # Compatibility with SGLang versions before the unified prefill CP flags.
+    return (
+        getattr(server_args, "enable_nsa_prefill_context_parallel", False),
+        getattr(server_args, "nsa_prefill_cp_mode", "round-robin-split"),
+    )
+
+
+def _normalize_sglang_parallel_config(
+    tp_size: int,
+    dp_size: int,
+    tp_rank: int,
+    enable_dp_attention: bool,
+    enable_nsa_prefill_context_parallel: bool = False,
+    nsa_prefill_cp_mode: str = "round-robin-split",
+    attn_cp_size: int = 1,
+    attn_cp_rank: int = 0,
+    attn_tp_size: int = 1,
+    attn_tp_rank: int = 0,
+) -> tuple[int, int, int, int, int]:
+    """Translate SGLang parallel args into the runtime layout ATOM expects.
+
+    SGLang's ``tp_size`` is the whole world used by the model runner, while
+    ``dp_size`` under dp-attention is only an attention-layout factor inside
+    that world. For pure-DP, SGLang launches multiple independent TP workers,
+    so ATOM should treat that DP dimension as external scheduling rather than
+    a model-internal communication group.
+    """
+
+    if enable_nsa_prefill_context_parallel:
+        if nsa_prefill_cp_mode != "round-robin-split":
+            raise ValueError(
+                "SGLang+ATOM PCP only supports round-robin-split, got "
+                f"{nsa_prefill_cp_mode!r}"
+            )
+        if dp_size != 1:
+            raise ValueError(
+                "SGLang+ATOM PCP does not support dp_size > 1 yet, got "
+                f"dp_size={dp_size}"
+            )
+
+        atom_pcp_size_override = (
+            envs.ATOM_SGLANG_PCP_SIZE if envs.is_set("ATOM_SGLANG_PCP_SIZE") else None
+        )
+        if atom_pcp_size_override is not None:
+            # SGLang's DSA/GLM CP defaults currently force
+            # attn_cp_size = tp_size // dp_size, which collapses attention TP to
+            # 1 for pure PCP.  ATOM's internal DSA path can run TP + PCP
+            # together, so allow an ATOM-only override that maps the same
+            # SGLang world into aiter as atom_tp=tp_size/env_pcp and
+            # atom_pcp=env_pcp.  Keep this local to ATOM so native SGLang
+            # semantics stay unchanged.
+            if atom_pcp_size_override <= 1:
+                raise ValueError(
+                    "ATOM_SGLANG_PCP_SIZE must be greater than 1 when set, got "
+                    f"{atom_pcp_size_override}"
+                )
+            if tp_size % atom_pcp_size_override != 0:
+                raise ValueError(
+                    "SGLang tp_size must be divisible by ATOM_SGLANG_PCP_SIZE, "
+                    f"got tp_size={tp_size}, "
+                    f"ATOM_SGLANG_PCP_SIZE={atom_pcp_size_override}"
+                )
+
+            runtime_tp_size = tp_size // atom_pcp_size_override
+            runtime_pcp_size = atom_pcp_size_override
+            runtime_dp_size = 1
+            runtime_dp_rank = 0
+            runtime_pcp_rank = tp_rank // runtime_tp_size
+            runtime_tp_rank = tp_rank % runtime_tp_size
+            aiter_rank_id = runtime_pcp_rank * runtime_tp_size + runtime_tp_rank
+            logger.info(
+                "ATOM_SGLANG_PCP_SIZE overrides SGLang attention CP mapping: "
+                f"env_pcp_size={runtime_pcp_size}, "
+                f"sglang_attn_cp={attn_cp_rank}/{attn_cp_size}, "
+                f"sglang_attn_tp={attn_tp_rank}/{attn_tp_size}, "
+                f"atom_tp={runtime_tp_rank}/{runtime_tp_size}, "
+                f"atom_pcp={runtime_pcp_rank}/{runtime_pcp_size}, "
+                f"aiter_rank_id={aiter_rank_id}"
+            )
+            return (
+                runtime_tp_size,
+                runtime_pcp_size,
+                runtime_dp_size,
+                runtime_dp_rank,
+                aiter_rank_id,
+            )
+
+        if attn_cp_size <= 1:
+            raise ValueError(
+                f"SGLang+ATOM PCP requires attn_cp_size > 1, got {attn_cp_size}"
+            )
+        if tp_size % attn_cp_size != 0:
+            raise ValueError(
+                "SGLang tp_size must be divisible by attn_cp_size when "
+                "NSA prefill CP is enabled, got "
+                f"tp_size={tp_size}, attn_cp_size={attn_cp_size}"
+            )
+
+        runtime_tp_size = attn_tp_size
+        expected_runtime_tp_size = tp_size // attn_cp_size
+        if runtime_tp_size != expected_runtime_tp_size:
+            raise ValueError(
+                "SGLang attention TP size does not match tp_size / attn_cp_size, "
+                f"got attn_tp_size={runtime_tp_size}, "
+                f"tp_size={tp_size}, attn_cp_size={attn_cp_size}"
+            )
+        runtime_pcp_size = attn_cp_size
+        runtime_dp_size = 1
+        runtime_dp_rank = 0
+        aiter_rank_id = attn_cp_rank * runtime_tp_size + attn_tp_rank
+        return (
+            runtime_tp_size,
+            runtime_pcp_size,
+            runtime_dp_size,
+            runtime_dp_rank,
+            aiter_rank_id,
+        )
+
+    if enable_dp_attention:
+        if dp_size < 1:
+            raise ValueError(f"SGLang dp_size must be >= 1, got {dp_size}")
+        if tp_size % dp_size != 0:
+            raise ValueError(
+                "SGLang tp_size must be divisible by dp_size when "
+                f"enable_dp_attention=True, got tp_size={tp_size}, dp_size={dp_size}"
+            )
+
+        runtime_tp_size = 1
+        runtime_pcp_size = 1
+        runtime_dp_size = tp_size
+        runtime_dp_rank = tp_rank
+        aiter_rank_id = 0
+        return (
+            runtime_tp_size,
+            runtime_pcp_size,
+            runtime_dp_size,
+            runtime_dp_rank,
+            aiter_rank_id,
+        )
+
+    # Without dp-attention, SGLang's DP workers are external replicas. Keep
+    # ATOM/aiter on the per-worker TP world and do not create an internal DP
+    # communication group.
+    return tp_size, 1, 1, 0, tp_rank
+
+
+def _build_atom_speculative_config_from_vllm(vllm_spec_config: Any):
+    """Translate vLLM's SpeculativeConfig into ATOM's SpeculativeConfig.
+
+    Reuses vLLM's already-loaded draft hf_config (skips a second disk fetch
+    in ATOM SpeculativeConfig.__post_init__) but still runs ATOM's
+    hf_config_override on it — so MTP model_type remap, n_routed_experts
+    backfill (Qwen families), and architecture rewrite all land on the
+    draft config in one place. Mirrors how standalone ATOM MTP exposes
+    the draft hf_config via atom_config.speculative_config.
+
+    The draft hf_config is deepcopied first because hf_config_override
+    mutates `architectures` to ATOM's standalone naming (e.g.
+    "Qwen3NextMTPModel"), which differs from vLLM's registry name
+    ("Qwen3NextMTP"). Mutating in place would make vLLM's later draft
+    architecture lookup fail.
+    """
+    if vllm_spec_config is None:
+        return None
+
+    from atom.config import SpeculativeConfig
+
+    draft_model_config = getattr(vllm_spec_config, "draft_model_config", None)
+    draft_hf_config = getattr(draft_model_config, "hf_config", None)
+    if draft_hf_config is not None:
+        draft_hf_config = copy.deepcopy(draft_hf_config)
+    model_path = getattr(draft_model_config, "model", None) or getattr(
+        vllm_spec_config, "model", None
+    )
+
+    return SpeculativeConfig(
+        method=getattr(vllm_spec_config, "method", "") or "",
+        model=model_path,
+        num_speculative_tokens=getattr(
+            vllm_spec_config, "num_speculative_tokens", None
+        ),
+        draft_model_hf_config=draft_hf_config,
+    )
+
+
+def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
+    from atom.config import CompilationConfig, Config
+
+    vllm_model_config = config.model_config
+    vllm_scheduler_config = config.scheduler_config
+    vllm_cache_config = config.cache_config
+    vllm_parallel_config = config.parallel_config
+    use_dp_ep = (
+        vllm_parallel_config.enable_expert_parallel
+        and vllm_parallel_config.data_parallel_size > 1
+    )
+
+    # TODO: support moe chunking in future
+    if use_dp_ep and envs.is_set("VLLM_MOE_DP_CHUNK_SIZE"):
+        logger.warning(
+            "vLLM-ATOM DP+EP ignores VLLM_MOE_DP_CHUNK_SIZE because the vLLM-ATOM path "
+            "does not currently implement MoE chunking"
+        )
+
+    # here use the ATOM compilation config, as the ATOM compile policy is used
+    # instead of vLLM one for torch compile, while for cuda graph capture,
+    # still use the vLLM because it has FULL_AND_PIECEWISE feature
+    # when you don't want to use atom torch compile, you can also use
+    # --enforce-eager to disable the atom torch compile when launch vllm server
+    compilation_config = config.compilation_config
+    vllm_compilation_config = CompilationConfig(
+        # use mode because vllm level argument is deprecated
+        level=compilation_config.mode,
+        use_cudagraph=False,
+        cudagraph_mode=None,
+    )
+
+    vllm_quant_config = config.quant_config
+    vllm_use_atom_attention = os.getenv(
+        "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0"
+    ).lower() not in ("1", "true", "yes")
+
+    plugin_config = PluginConfig(
+        # common config
+        model_config=vllm_model_config,
+        rank=vllm_parallel_config.rank,
+        is_plugin_mode=True,
+        is_vllm=True,
+        is_sglang=False,
+        is_rtpllm=False,
+        # vllm specific
+        vllm_config=config,
+        vllm_scheduler_config=vllm_scheduler_config,
+        vllm_cache_config=vllm_cache_config,
+        vllm_quant_config=vllm_quant_config,
+        vllm_use_atom_attention=vllm_use_atom_attention,
+    )
+
+    # specific
+    max_model_len = vllm_model_config.max_model_len
+    if hasattr(vllm_scheduler_config, "max_model_len"):
+        max_model_len = vllm_scheduler_config.max_model_len
+
+    max_num_batched_tokens = vllm_scheduler_config.max_num_batched_tokens
+
+    atom_speculative_config = _build_atom_speculative_config_from_vllm(
+        getattr(config, "speculative_config", None)
+    )
+
+    vllm_enable_dbo = getattr(vllm_parallel_config, "enable_dbo", False)
+
+    return Config(
+        model=vllm_model_config.model,
+        trust_remote_code=getattr(vllm_model_config, "trust_remote_code", False),
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_num_seqs=vllm_scheduler_config.max_num_seqs,
+        max_model_len=max_model_len,
+        gpu_memory_utilization=vllm_cache_config.gpu_memory_utilization,
+        tensor_parallel_size=vllm_parallel_config.tensor_parallel_size,
+        enforce_eager=True,  # disable using atom cuda graph
+        parallel_config=vllm_parallel_config,
+        kv_cache_block_size=vllm_cache_config.block_size,
+        num_kvcache_blocks=vllm_cache_config.num_gpu_blocks,
+        kv_cache_dtype=vllm_cache_config.cache_dtype,
+        enable_prefix_caching=vllm_cache_config.enable_prefix_caching,
+        port=None,
+        torch_profiler_dir=None,
+        compilation_config=vllm_compilation_config,
+        asyncio_mode=False,
+        load_dummy=None,
+        enable_expert_parallel=vllm_parallel_config.enable_expert_parallel,
+        master_addr=None,
+        enable_dp_attention=False,
+        # vLLM EP shards MoE across the flattened DP x TP device space (and
+        # therefore disables fused shared experts); native uses per-DP MoE.
+        moe_ep_flatten_tp_across_dp=vllm_parallel_config.enable_expert_parallel,
+        enable_tbo=vllm_enable_dbo,
+        enable_tbo_decode=vllm_enable_dbo,
+        plugin_config=plugin_config,
+        speculative_config=atom_speculative_config,
+        online_quant_config=(getattr(config, "additional_config", None) or {}).get(
+            "online_quant_config"
+        ),
+    )
+
+
+def _generate_atom_config_from_sglang_config(config: Any):
+    from sglang.srt.configs.load_config import LoadConfig
+    from sglang.srt.configs.model_config import ModelConfig as SglangModelConfig
+    from sglang.srt.configs.modelopt_config import ModelOptConfig
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+    from sglang.srt.distributed.parallel_state import (
+        get_attn_context_model_parallel_rank as get_attention_cp_rank,
+    )
+    from sglang.srt.distributed.parallel_state import (
+        get_attn_context_model_parallel_world_size as get_attention_cp_size,
+    )
+    from sglang.srt.distributed.parallel_state import (
+        get_attn_tensor_model_parallel_rank as get_attention_tp_rank,
+    )
+    from sglang.srt.distributed.parallel_state import (
+        get_attn_tensor_model_parallel_world_size as get_attention_tp_size,
+    )
+    from sglang.srt.server_args import (
+        ZMQ_TCP_PORT_DELTA,
+        PortArgs,
+        get_global_server_args,
+    )
+
+    from atom.config import CompilationConfig, Config, ParallelConfig
+
+    # sglang's ModelRunner already parsed and stored ServerArgs globally
+    # before OOT model loading, so we can retrieve it directly.
+    try:
+        server_args = get_global_server_args()
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to retrieve SGLang global ServerArgs. Ensure this "
+            "function is called after SGLang has initialized its server "
+            "arguments."
+        ) from exc
+
+    if server_args is None:
+        raise RuntimeError(
+            "SGLang global ServerArgs are not initialized. Ensure this "
+            "function is called after SGLang has parsed and set its "
+            "server arguments."
+        )
+
+    sglang_model_loader_extra_config = json.loads(
+        getattr(server_args, "model_loader_extra_config", None) or "{}"
+    )
+    online_quant_config = sglang_model_loader_extra_config.pop(
+        "online_quant_config", None
+    )
+    sanitized_model_loader_extra_config = json.dumps(sglang_model_loader_extra_config)
+    try:
+        server_args.model_loader_extra_config = sanitized_model_loader_extra_config
+    except AttributeError:
+        pass
+    hf_overrides = json.loads(
+        getattr(server_args, "json_model_override_args", None) or "{}"
+    )
+
+    sgl_model_config = SglangModelConfig.from_server_args(server_args)
+    sgl_model_opt_config = ModelOptConfig(
+        quant=server_args.modelopt_quant,
+        checkpoint_restore_path=server_args.modelopt_checkpoint_restore_path,
+        checkpoint_save_path=server_args.modelopt_checkpoint_save_path,
+        export_path=server_args.modelopt_export_path,
+    )
+
+    sgl_load_config = LoadConfig(
+        load_format=server_args.load_format,
+        download_dir=server_args.download_dir,
+        model_loader_extra_config=sanitized_model_loader_extra_config,
+        remote_instance_weight_loader_seed_instance_ip=server_args.remote_instance_weight_loader_seed_instance_ip,
+        remote_instance_weight_loader_seed_instance_service_port=server_args.remote_instance_weight_loader_seed_instance_service_port,
+        remote_instance_weight_loader_send_weights_group_ports=server_args.remote_instance_weight_loader_send_weights_group_ports,
+        remote_instance_weight_loader_backend=server_args.remote_instance_weight_loader_backend,
+        modelopt_config=sgl_model_opt_config,
+        rl_quant_profile=server_args.rl_quant_profile,
+    )
+
+    # sglang doesn't passed the rank number in config, so ATOM plugin
+    # get rank number through the torch.distributed.get_rank()
+    rank = torch.distributed.get_rank()
+
+    tp_rank = get_tensor_model_parallel_rank()
+    attn_cp_size = get_attention_cp_size()
+    attn_cp_rank = get_attention_cp_rank()
+    attn_tp_size = get_attention_tp_size()
+    attn_tp_rank = get_attention_tp_rank()
+    enable_prefill_cp, prefill_cp_mode = _get_sglang_prefill_cp_config(server_args)
+    (
+        atom_tensor_parallel_size,
+        atom_prefill_context_parallel_size,
+        atom_data_parallel_size,
+        atom_data_parallel_rank,
+        sglang_aiter_rank_id,
+    ) = _normalize_sglang_parallel_config(
+        tp_size=server_args.tp_size,
+        dp_size=server_args.dp_size,
+        tp_rank=tp_rank,
+        enable_dp_attention=server_args.enable_dp_attention,
+        enable_nsa_prefill_context_parallel=enable_prefill_cp,
+        nsa_prefill_cp_mode=prefill_cp_mode,
+        attn_cp_size=attn_cp_size,
+        attn_cp_rank=attn_cp_rank,
+        attn_tp_size=attn_tp_size,
+        attn_tp_rank=attn_tp_rank,
+    )
+    logger.info(
+        "SGLang+ATOM parallel mapping: "
+        f"sglang_tp_size={server_args.tp_size}, sglang_tp_rank={tp_rank}, "
+        f"sglang_dp_size={server_args.dp_size}, "
+        f"sglang_attn_tp={attn_tp_rank}/{attn_tp_size}, "
+        f"sglang_attn_cp={attn_cp_rank}/{attn_cp_size}, "
+        f"atom_tp_size={atom_tensor_parallel_size}, "
+        f"atom_pcp_size={atom_prefill_context_parallel_size}, "
+        f"atom_dp_size={atom_data_parallel_size}, "
+        f"atom_dp_rank={atom_data_parallel_rank}, "
+        f"aiter_rank_id={sglang_aiter_rank_id}"
+    )
+
+    # sglang uses the atom parallel config
+    sgl_parallel_config = ParallelConfig(
+        data_parallel_size=atom_data_parallel_size,
+        data_parallel_size_local=atom_data_parallel_size,
+        data_parallel_rank=atom_data_parallel_rank,
+        data_parallel_rank_local=atom_data_parallel_rank,
+    )
+
+    # use sglang torch compile policy and cuda graph policy
+    # because sglang doesn't use the compile decorator for model,
+    # we have no method to define self policy
+    sgl_compilation_config = CompilationConfig(
+        level=0,
+        use_cudagraph=False,
+        cudagraph_mode=None,
+    )
+
+    sglang_dist_init_addr = server_args.dist_init_addr
+    # In single-node DP attention, synthesize the same TCP base address that
+    # SGLang uses for its DP-attention TCP port family. The primary purpose is
+    # to avoid calling PortArgs.init_new() again in ATOM plugin mode, because a
+    # second call would probe that fixed TCP range again and conflict with
+    # SGLang's existing allocation. In the current plugin path, this value
+    # should be treated as a compatibility/fallback hint rather than a
+    # guaranteed representation of the runtime default torch.distributed world
+    # rendezvous endpoint.
+    if (
+        sglang_dist_init_addr is None
+        and server_args.enable_dp_attention
+        and server_args.nnodes == 1
+    ):
+        sglang_dist_init_addr = f"127.0.0.1:{server_args.port + ZMQ_TCP_PORT_DELTA}"
+
+    sglang_port_args = None
+    if sglang_dist_init_addr is None:
+        sglang_port_args = PortArgs.init_new(server_args)
+
+    plugin_config = PluginConfig(
+        # common config
+        model_config=sgl_model_config,
+        rank=rank,
+        is_plugin_mode=True,
+        is_vllm=False,
+        is_sglang=True,
+        is_rtpllm=False,
+        # sglang specific
+        sglang_model_opt_config=sgl_model_opt_config,
+        sglang_load_config=sgl_load_config,
+        sglang_enable_torch_compile=server_args.enable_torch_compile,
+        sglang_disable_cuda_graph=server_args.disable_cuda_graph,
+        sglang_enable_dp_attention=server_args.enable_dp_attention,
+        sglang_enable_nsa_prefill_cp=enable_prefill_cp,
+        sglang_nsa_prefill_cp_mode=prefill_cp_mode,
+        sglang_aiter_rank_id=sglang_aiter_rank_id,
+        sglang_dist_init_addr=sglang_dist_init_addr,
+        sglang_port_args=sglang_port_args,
+    )
+
+    # SGLang sets enable_dp_attention=True when enabling prefill context
+    # parallelism because its attention TP/CP groups are built through the
+    # DP-attention layout code.  In ATOM plugin mode we remap that same SGLang
+    # layout to aiter PCP groups above, so propagating enable_dp_attention into
+    # ATOM would incorrectly interpret the PCP ranks as real ATOM DP-attention
+    # ranks.  SGLang's native round-robin PCP path also disallows true DP+PCP
+    # (it asserts dp_size == 1), so this keeps the plugin semantics aligned:
+    # true DP-attention + PCP remains unsupported; dp_size > 1 is rejected in
+    # _normalize_sglang_parallel_config().
+    if enable_prefill_cp:
+        if server_args.enable_dp_attention:
+            logger.warning(
+                "SGLang enabled DP attention as part of prefill context "
+                "parallel setup. ATOM plugin maps this layout to aiter PCP "
+                "groups, so ATOM-side enable_dp_attention is disabled. "
+                "True DP attention combined with PCP is not supported."
+            )
+        atom_enable_dp_attention = False
+    else:
+        atom_enable_dp_attention = server_args.enable_dp_attention
+
+    atom_enable_tbo, atom_enable_tbo_decode = _get_sglang_tbo_flags(
+        server_args.enable_two_batch_overlap
+    )
+    if atom_enable_tbo:
+        logger.info(
+            "SGLang+ATOM TBO mode: prefill=%s, decode=%s",
+            atom_enable_tbo,
+            atom_enable_tbo_decode,
+        )
+
+    max_num_batched_tokens = max(
+        int(getattr(server_args, "max_prefill_tokens", 0) or 0),
+        int(getattr(server_args, "chunked_prefill_size", 0) or 0),
+        16384,
+    )
+    atom_kv_cache_dtype = server_args.kv_cache_dtype
+    if str(atom_kv_cache_dtype).startswith("fp8"):
+        atom_kv_cache_dtype = "fp8"
+
+    return Config(
+        model=server_args.model_path,
+        trust_remote_code=server_args.trust_remote_code,
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_num_seqs=server_args.max_running_requests or 512,
+        max_model_len=server_args.context_length,
+        gpu_memory_utilization=server_args.mem_fraction_static,
+        tensor_parallel_size=atom_tensor_parallel_size,
+        prefill_context_parallel_size=atom_prefill_context_parallel_size,
+        # Disable ATOM's own torch.compile and CUDA graph capture —
+        # sglang manages its own compilation/graph strategy, and the
+        # @support_torch_compile decorator checks enforce_eager to skip,
+        # preventing double-compile.
+        enforce_eager=True,
+        parallel_config=sgl_parallel_config,
+        kv_cache_dtype=atom_kv_cache_dtype,
+        index_cache_dtype=atom_kv_cache_dtype,
+        enable_prefix_caching=False,
+        port=None,
+        torch_profiler_dir=None,
+        compilation_config=sgl_compilation_config,
+        asyncio_mode=False,
+        load_dummy=None,
+        enable_expert_parallel=bool(server_args.ep_size > 1),
+        master_addr=None,
+        enable_dp_attention=atom_enable_dp_attention,
+        enable_tbo=atom_enable_tbo,
+        enable_tbo_decode=atom_enable_tbo_decode,
+        plugin_config=plugin_config,
+        online_quant_config=online_quant_config,
+        hf_overrides=hf_overrides,
+    )
+
+
+def _generate_atom_config_from_rtpllm_config(config: Any):
+    from atom.config import CompilationConfig, Config, ParallelConfig
+
+    rtpllm_model_config = getattr(config, "model_config", None)
+    rtpllm_parallelism_config = getattr(config, "parallelism_config", None)
+    if rtpllm_model_config is None:
+        raise ValueError(
+            "rtpllm plugin expects config.model_config to be available "
+            "(BaseModel instance is recommended)."
+        )
+
+    tp_size = getattr(rtpllm_parallelism_config, "tp_size", 1)
+    tp_rank = getattr(rtpllm_parallelism_config, "tp_rank", 0)
+    max_generate_batch_size = getattr(config, "max_generate_batch_size", 512)
+    max_model_len = getattr(rtpllm_model_config, "max_seq_len", None) or 8192
+
+    # rtp-llm plugin path follows ATOM plugin-mode execution, so ATOM should not
+    # perform its own torch compile/cudagraph policy.
+    rtpllm_compilation_config = CompilationConfig(
+        level=0,
+        use_cudagraph=False,
+        cudagraph_mode=None,
+    )
+
+    plugin_config = PluginConfig(
+        # common config
+        model_config=rtpllm_model_config,
+        rank=tp_rank,
+        is_plugin_mode=True,
+        is_vllm=False,
+        is_sglang=False,
+        is_rtpllm=True,
+        # rtp-llm specific
+        rtpllm_model_config=rtpllm_model_config,
+        rtpllm_parallelism_config=rtpllm_parallelism_config,
+    )
+
+    kv_cache_dtype = "bf16"
+    if hasattr(rtpllm_model_config, "attn_config") and hasattr(
+        rtpllm_model_config.attn_config, "kv_cache_dtype"
+    ):
+        raw_kv_dtype = str(rtpllm_model_config.attn_config.kv_cache_dtype).lower()
+        if "fp8" in raw_kv_dtype:
+            kv_cache_dtype = "fp8"
+        elif "int8" in raw_kv_dtype:
+            kv_cache_dtype = "int8"
+
+    # Keep RTP behavior aligned with SGLang plugin semantics:
+    # only enable EP when ep_size > 1; pure TP (ep_size == 1) must not use EP.
+    rtpllm_ep_size = getattr(rtpllm_parallelism_config, "ep_size", 1)
+
+    return Config(
+        model=rtpllm_model_config.ckpt_path,
+        max_num_batched_tokens=max(max_model_len, max_generate_batch_size),
+        max_num_seqs=max_generate_batch_size,
+        max_model_len=max_model_len,
+        gpu_memory_utilization=0.9,
+        tensor_parallel_size=tp_size,
+        enforce_eager=True,
+        parallel_config=ParallelConfig(data_parallel_size=1, data_parallel_rank=0),
+        kv_cache_dtype=kv_cache_dtype,
+        enable_prefix_caching=False,
+        port=None,
+        torch_profiler_dir=None,
+        compilation_config=rtpllm_compilation_config,
+        asyncio_mode=False,
+        load_dummy=None,
+        enable_expert_parallel=bool(rtpllm_ep_size > 1),
+        master_addr=None,
+        enable_dp_attention=False,
+        plugin_config=plugin_config,
+    )
+
+
+def generate_atom_config_for_plugin_mode(config: Any = None):
+    """
+    Generate the atom config in plugin mode, be called when create the custom model
+    config:
+        - for vllm: config is VllmConfig and contains all config value from vllm
+        - for sglang: config is only model specific config passed from sglang, so the
+                      server args is used
+    """
+
+    logger.info("Generate atom config for plugin mode from passed config")
+    atom_config = None
+    from atom.config import set_current_atom_config
+    from atom.plugin import is_rtpllm, is_sglang, is_vllm
+
+    if is_vllm():
+        atom_config = _generate_atom_config_from_vllm_config(config)
+    elif is_sglang():
+        atom_config = _generate_atom_config_from_sglang_config(config)
+    elif is_rtpllm():
+        atom_config = _generate_atom_config_from_rtpllm_config(config)
+    else:
+        raise ValueError(
+            "Make sure ATOM is running in plugin mode; "
+            "generate_atom_config_for_plugin_mode should be called in plugin mode."
+        )
+
+    # set the current atom config for the custom model
+    set_current_atom_config(atom_config)
+
+    return atom_config

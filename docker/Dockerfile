@@ -1,0 +1,675 @@
+# Default base images
+ARG BASE_IMAGE="rocm/pytorch:latest"
+ARG OOT_BASE_IMAGE="rocm/atom-dev:latest"
+ARG SGLANG_BASE_IMAGE="rocm/atom-dev:latest"
+ARG GPU_ARCH="gfx942;gfx950"
+# LMCache wheel image (FROM scratch, one wheel at /), pinned by digest. See the
+# LMCache section of atom_image.
+ARG LMCACHE_WHEEL_IMAGE="rocm/atom-dev:lmcache-v0.5.6.dev98-g05fc77a0-rocm-torch210@sha256:d3cfe74f42d78a188992cae98efbe23053610216e7b247632d6be772e9d465d6"
+
+# OOT image extends an ATOM base image that already contains atom/aiter/mori.
+FROM ${OOT_BASE_IMAGE} AS atom_oot
+
+ARG MAX_JOBS
+ARG VENV_PYTHON="/opt/venv/bin/python"
+ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
+ARG VLLM_COMMIT="0b3ba88f165976e77ca5e6a7a3f5bba4562b80af"
+ARG INSTALL_LM_EVAL=1
+ARG INSTALL_FASTSAFETENSORS=1
+# Let PR OOT CI verify whether a pulled prebuilt image still matches this vLLM commit
+LABEL com.rocm.atom.vllm_commit="${VLLM_COMMIT}"
+
+ENV PATH="/opt/venv/bin:${PATH}"
+ENV MAX_JOBS=${MAX_JOBS}
+ENV VLLM_TARGET_DEVICE=rocm
+ENV CMAKE_MAKE_PROGRAM=/usr/local/bin/ninja
+
+# Preserve the base image's custom RCCL before any OOT apt runs.
+# The native base builds RCCL from the pinned RCCL_BRANCH (build_rccl stage) and
+# installs it to /usr/local/lib with an /etc/ld.so.conf.d/rccl.conf entry, so
+# ldconfig resolves the custom build. The custom `dpkg -i --force-all` leaves
+# rocm-hip's rccl version dep "broken" on purpose; the OOT `apt --fix-broken
+# install` below satisfies it by reinstalling the STOCK ROCm rccl into
+# /opt/rocm, which then shadows the custom build via ldconfig. That regresses
+# GLM-5.2 decode perf (memory-bound kernels run ~40% slower under the stock rccl
+# even though its collective kernels are never called in decode). Back it up here
+# and restore after all OOT installs (mirrors the Triton backup/restore below).
+RUN echo "========== [OOT 0/7] Back up base-image custom RCCL ==========" && \
+    mkdir -p /tmp/rccl-base-backup && \
+    (cp -a /usr/local/lib/librccl.so* /tmp/rccl-base-backup/ 2>/dev/null || true) && \
+    (cp -a /etc/ld.so.conf.d/rccl.conf /tmp/rccl-base-backup/ 2>/dev/null || true) && \
+    ls -l /tmp/rccl-base-backup/ || true
+
+RUN echo "========== [OOT 1/7] Prepare build tools ==========" && \
+    apt-get update && \
+    apt --fix-broken install -y && \
+    apt-get install -y --no-install-recommends ca-certificates jq ninja-build vim && \
+    "${VENV_PYTHON}" -m pip install --upgrade cmake && \
+    cmake --version && \
+    mkdir -p /usr/local/bin && \
+    ln -sf "$(command -v ninja)" /usr/local/bin/ninja && \
+    /usr/local/bin/ninja --version && \
+    rm -rf /var/lib/apt/lists/* && \
+    TORCH_LIB=$("${VENV_PYTHON}" -c "import os,torch; print(os.path.join(os.path.dirname(torch.__file__),'lib'))") && \
+    echo "${TORCH_LIB}" > /etc/ld.so.conf.d/torch.conf && \
+    ldconfig
+
+# Keep OOT aligned with the Triton that the ATOM base image ships.
+# vLLM/OOT installs can perturb Triton; back up everything and restore after.
+RUN echo "========== [OOT 2/7] Verify base packages (atom/aiter/mori) ==========" && \
+    "${VENV_PYTHON}" -m pip show atom || true && \
+    "${VENV_PYTHON}" -m pip show amd-aiter || true && \
+    "${VENV_PYTHON}" -m pip show amd-mori-nightly || true && \
+    echo "========== [OOT 2/7] Back up base image triton ==========" && \
+    SITE_PACKAGES=$("${VENV_PYTHON}" -c "import sysconfig; print(sysconfig.get_path('purelib'))") && \
+    BASE_TRITON_VERSION="$("${VENV_PYTHON}" -c "import triton; print(triton.__version__)")" && \
+    mkdir -p /tmp/triton-base-backup && \
+    cp -a "${SITE_PACKAGES}/triton" /tmp/triton-base-backup/ && \
+    for f in "${SITE_PACKAGES}"/triton-*.dist-info; do \
+      [ -d "$f" ] || continue; \
+      cp -a "$f" /tmp/triton-base-backup/; \
+    done && \
+    echo "Base image triton backed up: import_version=${BASE_TRITON_VERSION}" && \
+    ls /tmp/triton-base-backup/
+
+RUN echo "========== [OOT 3/7] Clone vLLM ==========" && \
+    rm -rf /app/vllm && \
+    git clone "${VLLM_REPO}" /app/vllm && \
+    cd /app/vllm && \
+    git checkout "${VLLM_COMMIT}" && \
+    git submodule update --init --recursive && \
+    echo "vLLM commit:" && \
+    git rev-parse HEAD
+
+RUN echo "========== [OOT 4/7] Install vLLM ROCm build dependencies ==========" && \
+    cd /app/vllm && \
+    "${VENV_PYTHON}" -m pip install --upgrade pip && \
+    # keeps the base image's ATOM-installed transformers
+    sed -i -e '/^transformers[[:space:]]/d' requirements/common.txt && \
+    echo "Removed transformers constraint from cloned vLLM requirements/common.txt to preserve base image transformers" && \
+    ! grep '^transformers' requirements/common.txt && \
+    sed -i -e '/xgrammar/d' -e '/compressed-tensors/d' requirements/common.txt && \
+    "${VENV_PYTHON}" -m pip install --no-deps xgrammar==0.1.29 compressed-tensors==0.13.0 loguru && \
+    sed -i -e '/peft/d' -e '/tensorizer/d' -e '/runai/d' -e '/timm/d' -e '/tilelang/d' requirements/rocm.txt && \
+    "${VENV_PYTHON}" -m pip install --no-deps peft tensorizer==2.10.1 runai-model-streamer[s3,gcs]==0.15.3 timm>=1.0.17 tilelang==0.1.10 && \
+    "${VENV_PYTHON}" -m pip install -r requirements/rocm.txt
+
+RUN echo "========== [OOT 5/7] Build and install amd-smi wheel ==========" && \
+    cd /opt/rocm/share/amd_smi && \
+    pip wheel . --wheel-dir=dist && \
+    pip install dist/*.whl
+
+RUN echo "========== [OOT 6/7] Build vLLM wheel ==========" && \
+    cd /app/vllm && \
+    VLLM_TARGET_DEVICE=rocm "${VENV_PYTHON}" setup.py clean --all && \
+    MAX_JOBS="${MAX_JOBS}" VLLM_TARGET_DEVICE=rocm "${VENV_PYTHON}" setup.py bdist_wheel --dist-dir=/tmp/vllm-wheels && \
+    ls -lh /tmp/vllm-wheels
+
+RUN echo "========== [OOT 7/7] Install vLLM runtime dependencies ==========" && \
+    cd /app/vllm && \
+    "${VENV_PYTHON}" -m pip uninstall -y vllm || true && \
+    "${VENV_PYTHON}" -m pip install /tmp/vllm-wheels/*.whl && \
+    "${VENV_PYTHON}" -m pip install \
+      uvloop \
+      "botocore>=1.43.7,<1.44.0" \
+      "s3transfer>=0.17.0,<0.18.0" && \
+    if [ "${INSTALL_LM_EVAL}" = "1" ]; then "${VENV_PYTHON}" -m pip install "lm-eval[api]"; else echo "Skip lm-eval install"; fi && \
+    if [ "${INSTALL_FASTSAFETENSORS}" = "1" ]; then "${VENV_PYTHON}" -m pip install "git+https://github.com/foundation-model-stack/fastsafetensors.git"; else echo "Skip fastsafetensors install"; fi && \
+    "${VENV_PYTHON}" -m pip install 'fastapi>=0.115,<0.137' && \
+    "${VENV_PYTHON}" -c "import boto3, botocore, s3transfer; print(f'boto3: {boto3.__version__}'); print(f'botocore: {botocore.__version__}'); print(f's3transfer: {s3transfer.__version__}')" && \
+    "${VENV_PYTHON}" -c "import glob, os, torch; print(f'torch.version.hip: {torch.version.hip}'); print(f'torch.version.cuda: {torch.version.cuda}'); torch_lib_dir=os.path.join(os.path.dirname(torch.__file__), 'lib'); print(f'torch lib dir: {torch_lib_dir}'); print(f'libtorch_hip candidates: {glob.glob(os.path.join(torch_lib_dir, \"libtorch_hip.so*\"))}'); assert torch.version.hip is not None, 'Torch is not ROCm build (torch.version.hip is None).'" && \
+    "${VENV_PYTHON}" -m pip show vllm torch triton torchvision torchaudio amdsmi amd-aiter atom amd-mori-nightly || true
+
+RUN echo "========== [VLLM-ATOM] Validate vision/audio wheels ==========" && \
+    "${VENV_PYTHON}" -c "import torch, torchvision, torchaudio; from torchvision.transforms import InterpolationMode; from transformers.models.auto.image_processing_auto import get_image_processor_config; print(f'torch: {torch.__version__}'); print(f'torchvision: {torchvision.__version__}'); print(f'torchaudio: {torchaudio.__version__}'); print(f'InterpolationMode: {InterpolationMode.BILINEAR}'); print(f'get_image_processor_config: {get_image_processor_config.__name__}')"
+
+# Restore the exact base-image Triton after all OOT installs finish.
+RUN echo "========== [OOT] Restore base image triton ==========" && \
+    SITE_PACKAGES=$("${VENV_PYTHON}" -c "import sysconfig; print(sysconfig.get_path('purelib'))") && \
+    "${VENV_PYTHON}" -m pip uninstall -y triton 2>/dev/null || true && \
+    rm -rf "${SITE_PACKAGES}/triton" \
+           "${SITE_PACKAGES}"/triton-*.dist-info && \
+    cp -a /tmp/triton-base-backup/triton "${SITE_PACKAGES}/" && \
+    for f in /tmp/triton-base-backup/triton-*.dist-info; do \
+      [ -d "$f" ] || continue; \
+      cp -a "$f" "${SITE_PACKAGES}/"; \
+    done && \
+    rm -rf /tmp/triton-base-backup && \
+    "${VENV_PYTHON}" -c "import triton; print(f'triton.__version__ = {triton.__version__}')" && \
+    "${VENV_PYTHON}" -m pip show triton || true
+
+# Restore the base image's custom RCCL over any stock rccl that OOT apt pulled
+# into /opt/rocm, so the OOT image runs the SAME custom RCCL as the native image.
+# Must run after ALL OOT apt/pip installs. Removes the stock /opt/rocm librccl so
+# ldconfig unambiguously resolves the custom build in /usr/local/lib (leaving the
+# stock rccl dpkg metadata in place keeps rocm-hip's dep satisfied — only the .so
+# is swapped, exactly the runtime state the native image ships).
+RUN echo "========== [OOT] Restore base-image custom RCCL ==========" && \
+    if ls /tmp/rccl-base-backup/librccl.so* >/dev/null 2>&1; then \
+      echo "Removing stock rccl from /opt/rocm and restoring custom build to /usr/local/lib" && \
+      rm -f /opt/rocm*/lib/librccl.so* && \
+      cp -a /tmp/rccl-base-backup/librccl.so* /usr/local/lib/ && \
+      if [ -f /tmp/rccl-base-backup/rccl.conf ]; then \
+        cp -a /tmp/rccl-base-backup/rccl.conf /etc/ld.so.conf.d/rccl.conf ; \
+      else \
+        echo "/usr/local/lib" > /etc/ld.so.conf.d/rccl.conf ; \
+      fi && \
+      ldconfig && \
+      echo "librccl now resolves to:" && ldconfig -p | grep -i librccl ; \
+    else \
+      echo "WARNING: no base-image custom RCCL backup found; leaving rccl unchanged" ; \
+    fi && \
+    rm -rf /tmp/rccl-base-backup
+
+
+RUN echo "========== [vLLM-ATOM] Final transformers version ==========" && \
+    "${VENV_PYTHON}" -c "import transformers; print(f'transformers.__version__ = {transformers.__version__}')" && \
+    "${VENV_PYTHON}" -m pip show transformers || true
+
+CMD ["/bin/bash"]
+
+# SGLang image extends an ATOM base image and layers on an sglang checkout.
+FROM ${SGLANG_BASE_IMAGE} AS atom_sglang
+
+ARG GPU_ARCH
+ARG VENV_PYTHON="/opt/venv/bin/python"
+ARG SGLANG_REPO="https://github.com/sgl-project/sglang.git"
+ARG SGLANG_REF="v0.5.17"
+LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
+
+ENV PATH="/opt/venv/bin:${PATH}"
+ENV PYTHONPATH="/app/sglang/python:/app/ATOM"
+
+RUN echo "========== [SGLANG-ATOM 0/6] Check Aiter/FlyDSL/Triton versions before SGLang build ==========" && \
+    "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl triton || true && \
+    echo "========== [SGLANG-ATOM 0/6] Back up base image Triton ==========" && \
+    SITE_PACKAGES=$("${VENV_PYTHON}" -c "import sysconfig; print(sysconfig.get_path('purelib'))") && \
+    BASE_TRITON_VERSION="$("${VENV_PYTHON}" -c "import triton; print(triton.__version__)")" && \
+    mkdir -p /tmp/triton-base-backup && \
+    cp -a "${SITE_PACKAGES}/triton" /tmp/triton-base-backup/ && \
+    for f in "${SITE_PACKAGES}"/triton-*.dist-info; do \
+      [ -d "$f" ] || continue; \
+      cp -a "$f" /tmp/triton-base-backup/; \
+    done && \
+    echo "Base image Triton backed up: import_version=${BASE_TRITON_VERSION}" && \
+    ls /tmp/triton-base-backup/
+
+RUN echo "========== [SGLANG-ATOM 1/6] Clone SGLang ==========" && \
+    rm -rf /app/sglang && \
+    git clone "${SGLANG_REPO}" /app/sglang && \
+    cd /app/sglang && \
+    git checkout "${SGLANG_REF}" && \
+    git submodule update --init --recursive && \
+    echo "sglang ref:" && \
+    git rev-parse HEAD
+
+RUN echo "========== [SGLANG-ATOM 2/6] Build sglang kernel ==========" && \
+    "${VENV_PYTHON}" -m pip uninstall -y sgl-kernel sglang-kernel sglang || true && \
+    "${VENV_PYTHON}" -m pip install --upgrade pip setuptools wheel && \
+    DETECTED_AMDGPU_TARGET="$("${VENV_PYTHON}" -c "import torch; print(torch.cuda.get_device_properties(0).gcnArchName.split(':')[0] if torch.cuda.is_available() else '')" 2>/dev/null || true)" && \
+    if [ -n "${DETECTED_AMDGPU_TARGET}" ]; then \
+      FINAL_AMDGPU_TARGET="${DETECTED_AMDGPU_TARGET}"; \
+      echo "Detected AMDGPU_TARGET=${FINAL_AMDGPU_TARGET} from build GPU"; \
+    else \
+      FINAL_AMDGPU_TARGET="$(printf '%s' "${GPU_ARCH}" | awk -F';' '{print $NF}' | xargs)"; \
+      test -n "${FINAL_AMDGPU_TARGET}"; \
+      echo "GPU not detectable during build; fallback AMDGPU_TARGET=${FINAL_AMDGPU_TARGET} from GPU_ARCH=${GPU_ARCH}"; \
+    fi && \
+    cd /app/sglang/python/sglang/kernels/aot && \
+    AMDGPU_TARGET="${FINAL_AMDGPU_TARGET}" "${VENV_PYTHON}" setup_rocm.py install && \
+    "${VENV_PYTHON}" -m pip show sglang-kernel || true
+
+RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" && \
+    cd /app/sglang/python && \
+    rm -f pyproject.toml && \
+    cp pyproject_other.toml pyproject.toml && \
+    "${VENV_PYTHON}" -m pip install --no-cache-dir --no-deps -e . && \
+    "${VENV_PYTHON}" -m pip install --no-cache-dir tomli && \
+    "${VENV_PYTHON}" -c "import tomli; from pathlib import Path; deps = tomli.loads(Path('pyproject_other.toml').read_text())['project']['optional-dependencies']['runtime_common']; blocked_prefixes = ('compressed-tensors', 'outlines==', 'timm==', 'torchao==', 'xgrammar=='); Path('/tmp/sglang-runtime-common.txt').write_text(''.join(f'{dep}\\n' for dep in deps if dep != 'numpy' and not any(dep.startswith(prefix) for prefix in blocked_prefixes)))" && \
+    "${VENV_PYTHON}" -m pip install --no-cache-dir \
+      -r /tmp/sglang-runtime-common.txt \
+      airportsdata \
+      cloudpickle==3.1.2 \
+      diskcache \
+      jsonschema \
+      lark \
+      loguru \
+      nest_asyncio \
+      outlines_core==0.1.26 \
+      pycountry \
+      pybase64 \
+      referencing \
+      safetensors && \
+    "${VENV_PYTHON}" -m pip install --no-cache-dir --no-deps \
+      compressed-tensors==0.15.0 \
+      outlines==0.1.11 \
+      petit_kernel==0.0.2 \
+      timm==1.0.16 \
+      torchao==0.9.0 \
+      wave-lang==3.8.2 \
+      xgrammar==0.2.1 && \
+    "${VENV_PYTHON}" -m pip install --no-cache-dir \
+      "cython>=0.29.36,<3.0" \
+      "apache-tvm-ffi @ git+https://github.com/apache/tvm-ffi.git@37d0485b2058885bf4e7a486f7d7b2174a8ac1ce" \
+      "z3-solver==4.15.4.0" && \
+    rm -f /tmp/sglang-runtime-common.txt && \
+    "${VENV_PYTHON}" -m pip show sglang torch triton transformers IPython orjson pybase64 petit-kernel wave-lang xgrammar outlines apache-tvm-ffi || true
+
+# Keep SGLang aligned with the Triton that the ATOM base image ships.  SGLang
+# runtime installs can perturb Triton; restore the base package before final
+# validation so ATOM, AITER, triton_kernels, and SGLang run with one coherent
+# runtime stack, matching the vLLM/OOT image policy above.
+RUN echo "========== [SGLANG-ATOM 4/6] Restore base image Triton ==========" && \
+    SITE_PACKAGES=$("${VENV_PYTHON}" -c "import sysconfig; print(sysconfig.get_path('purelib'))") && \
+    "${VENV_PYTHON}" -m pip uninstall -y triton 2>/dev/null || true && \
+    rm -rf "${SITE_PACKAGES}/triton" \
+           "${SITE_PACKAGES}"/triton-*.dist-info && \
+    cp -a /tmp/triton-base-backup/triton "${SITE_PACKAGES}/" && \
+    for f in /tmp/triton-base-backup/triton-*.dist-info; do \
+      [ -d "$f" ] || continue; \
+      cp -a "$f" "${SITE_PACKAGES}/"; \
+    done && \
+    rm -rf /tmp/triton-base-backup && \
+    "${VENV_PYTHON}" -c "import triton; print(f'triton.__version__ = {triton.__version__}')" && \
+    "${VENV_PYTHON}" -m pip show triton
+
+RUN echo "========== [SGLANG-ATOM 5/6] Validate vision/audio wheels ==========" && \
+    "${VENV_PYTHON}" -m sglang.launch_server --help >/dev/null && \
+    "${VENV_PYTHON}" -c "import os, torch, torchvision, torchaudio, sglang, triton, transformers; from torchvision.io import decode_jpeg; assert torch.version.hip is not None, 'Torch is not ROCm build (torch.version.hip is None).'; print(f'torch: {torch.__version__}'); print(f'triton: {triton.__version__}'); print(f'transformers: {transformers.__version__}'); print(f'torchvision: {torchvision.__version__}'); print(f'torchaudio: {torchaudio.__version__}'); print(f'decode_jpeg: {decode_jpeg.__name__}'); print(f'sglang imported from: {sglang.__file__}'); print(f'PYTHONPATH={os.environ.get(\"PYTHONPATH\", \"\")}')" && \
+    echo "Validated sglang launch_server entrypoint"
+
+RUN echo "========== [SGLANG-ATOM 5.5/6] Pin smg-grpc-servicer ==========" && \
+    "${VENV_PYTHON}" -m pip install --no-cache-dir "smg-grpc-servicer==0.5.2" && \
+    "${VENV_PYTHON}" -m pip show smg-grpc-proto smg-grpc-servicer
+
+RUN echo "========== [SGLANG-ATOM 6/6] Check Aiter/FlyDSL versions after SGLang build ==========" && \
+    "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl sglang triton triton-kernels || true
+
+CMD ["/bin/bash"]
+
+# ====================================================================
+# ATOM image: multi-stage parallel build
+#
+# BuildKit runs independent builder stages in parallel:
+#   base ──┬── build_rccl  ──┐
+#          └── build_aiter ──┴── atom_image (merge builders + install MORI/ATOM)
+#
+# Triton is NOT built from source: the ROCm PyTorch base image already ships a
+# matching Triton (installed as a torch dependency), and aiter handles its own
+# Triton needs at install time. The previous build_triton stage that compiled
+# ROCm/triton release/internal/3.5.x has been removed.
+# ====================================================================
+
+# --------------------------------------------------------------------
+# Stage 0: Common base (apt + pip foundations, shared by all builders)
+# --------------------------------------------------------------------
+FROM ${BASE_IMAGE} AS base
+
+ARG GPU_ARCH
+ENV GPU_ARCH_LIST=$GPU_ARCH
+ENV PYTORCH_ROCM_ARCH=$GPU_ARCH
+
+RUN pip install --upgrade pip && \
+    apt-get update && \
+    apt --fix-broken install -y && \
+    apt-get install -y \
+        git cython3 ibverbs-utils openmpi-bin libopenmpi-dev \
+        libpci-dev cmake libdw1 locales && \
+    rm -rf /var/lib/apt/lists/*
+
+# ROCm 7.2.4 runtime backport used by vllm-project/vllm#55099.
+# Drop this stage once the official base image includes ordering-edge signals.
+FROM base AS build_rocm_runtime
+ARG ROCM_SYSTEMS_REPO="https://github.com/ROCm/rocm-systems.git"
+ARG ROCM_RUNTIME_COMMIT="b539bf7eebfd99ad0a69668caa1f4037034d501f"
+
+RUN mkdir -p /staging/lib && \
+    if ! grep -Eq '^7\.2\.4([+-]|$)' /opt/rocm/.info/version; then \
+        echo "Keeping the stock runtime for this non-7.2.4 base image"; exit 0; \
+    fi && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        git cmake ninja-build g++ pkg-config \
+        libelf-dev libdrm-dev libnuma-dev libdw-dev xxd && \
+    pip install --no-cache-dir CppHeaderParser==2.7.4 ply==3.11 && \
+    git init -q /src && cd /src && \
+    git remote add origin "${ROCM_SYSTEMS_REPO}" && \
+    git config remote.origin.promisor true && \
+    git config remote.origin.partialclonefilter blob:none && \
+    git sparse-checkout init --cone && \
+    git sparse-checkout set projects/rocr-runtime projects/clr projects/hip shared cmake && \
+    git fetch --filter=blob:none --depth 1 origin "${ROCM_RUNTIME_COMMIT}" && \
+    git checkout -q FETCH_HEAD && \
+    mkdir -p /opt/rocm-cmake-shim && \
+    printf 'if(NOT TARGET clang)\n  add_executable(clang IMPORTED GLOBAL)\n  set_target_properties(clang PROPERTIES IMPORTED_LOCATION "/opt/rocm/llvm/bin/clang")\nendif()\nset(Clang_PACKAGE_VERSION "rocm-image-shim")\n' > /opt/rocm-cmake-shim/ClangConfig.cmake && \
+    printf 'if(NOT TARGET llvm-objcopy)\n  add_executable(llvm-objcopy IMPORTED GLOBAL)\n  set_target_properties(llvm-objcopy PROPERTIES IMPORTED_LOCATION "/opt/rocm/llvm/bin/llvm-objcopy")\nendif()\nset(LLVM_FOUND TRUE)\nset(LLVM_PACKAGE_VERSION "rocm-image-shim")\n' > /opt/rocm-cmake-shim/LLVMConfig.cmake && \
+    cmake -S /src/projects/rocr-runtime -B /src/build-rocr -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/rocm \
+        -DCMAKE_INSTALL_PREFIX=/opt/rocm \
+        -DClang_DIR=/opt/rocm-cmake-shim -DLLVM_DIR=/opt/rocm-cmake-shim && \
+    cmake --build /src/build-rocr --parallel ${MAX_JOBS:-$(nproc)} && \
+    cmake --install /src/build-rocr && \
+    cmake --install /src/build-rocr --prefix /rocr-install --strip && \
+    cmake -S /src/projects/clr -B /src/build-clr -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DCLR_BUILD_HIP=ON -DCLR_BUILD_OCL=OFF \
+        -DHIP_COMMON_DIR=/src/projects/hip -DROCM_PATH=/opt/rocm \
+        -DCMAKE_PREFIX_PATH=/opt/rocm -DCMAKE_INSTALL_PREFIX=/opt/rocm \
+        -DLLVM_DIR=/opt/rocm-cmake-shim -DHIP_LLVM_ROOT=/opt/rocm/llvm && \
+    cmake --build /src/build-clr --parallel ${MAX_JOBS:-$(nproc)} && \
+    cmake --install /src/build-clr --prefix /clr-install --strip && \
+    cp -P /rocr-install/lib/libhsa-runtime64.so* /staging/lib/ && \
+    cp -P /clr-install/lib/libamdhip64.so* /staging/lib/ && \
+    mkdir -p /staging/.info && \
+    git rev-parse HEAD > /staging/.info/atom-rocm-runtime-commit && \
+    # Record the sonames this commit actually produced. The install step must
+    # not assume .so.1/.so.7: if a future ROCM_RUNTIME_COMMIT bumps a major the
+    # cp above succeeds under the new name while a hardcoded readlink resolves
+    # to the still-present stock symlink, and the fixup then hard-links stock
+    # onto stock and reports success.
+    ( cd /staging/lib && ls -1 libhsa-runtime64.so.* libamdhip64.so.* \
+        | grep -E '\.so\.[0-9]+$' ) > /staging/.info/atom-rocm-runtime-sonames && \
+    test -s /staging/.info/atom-rocm-runtime-sonames
+
+# --------------------------------------------------------------------
+# Stage 1: RCCL — parallel
+# --------------------------------------------------------------------
+FROM base AS build_rccl
+ARG RCCL_REPO="https://github.com/ROCm/rccl.git"
+ARG RCCL_BRANCH="29e1567b95e28823b0beb1a988adc587bfab5b4f"
+
+RUN echo "========== [Parallel] Building RCCL ==========" && \
+    pip install cmake && \
+    git clone "$RCCL_REPO" /app/rccl && \
+    cd /app/rccl && \
+    git checkout "$RCCL_BRANCH" && \
+    ./install.sh -p --amdgpu_targets=$GPU_ARCH_LIST
+
+# --------------------------------------------------------------------
+# Stage 2: Aiter — parallel
+# --------------------------------------------------------------------
+FROM base AS build_aiter
+ARG AITER_REPO="https://github.com/ROCm/aiter.git"
+ARG AITER_COMMIT="HEAD"
+ARG PREBUILD_KERNELS=1
+ARG MAX_JOBS
+
+RUN pip install --upgrade setuptools_scm
+RUN echo "========== [Parallel] Building Aiter ==========" && \
+    git clone $AITER_REPO /app/aiter-test && \
+    cd /app/aiter-test && \
+    git checkout $AITER_COMMIT && \
+    git submodule sync && git submodule update --init --recursive && \
+    pip install -r requirements.txt && \
+    MAX_JOBS=$MAX_JOBS PREBUILD_KERNELS=$PREBUILD_KERNELS \
+    GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop
+
+# The LMCache wheel, published by .github/workflows/lmcache-rocm-wheel.yaml.
+FROM ${LMCACHE_WHEEL_IMAGE} AS lmcache_wheel
+
+# --------------------------------------------------------------------
+# Stage 3: Final merge — collect all build artifacts + install MORI/ATOM
+# --------------------------------------------------------------------
+FROM base AS atom_image
+ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
+ARG ATOM_COMMIT="HEAD"
+
+# pip packages (lm-eval is lightweight, install directly)
+RUN pip install lm-eval[api]
+
+# MORI: install the prebuilt nightly wheel directly (no source build needed).
+# The `amd-mori-nightly` PyPI package provides the `mori` Python module.
+# See: https://pypi.org/project/amd-mori-nightly/
+RUN echo "========== [ATOM] Installing MORI nightly ==========" && \
+    pip install --pre amd-mori-nightly && \
+    python -c "import mori; print(f'mori: {mori.__file__}')" && \
+    pip show amd-mori-nightly
+
+# ========== Mooncake TransferEngine ==========
+# Mooncake and Rust apt operations MUST run before the RCCL dpkg -i --force-all
+# step below, because that step overwrites the Ubuntu-repo rccl with a custom
+# ROCm build whose version string doesn't match rocm-hip's declared dependency,
+# leaving dpkg in a broken state that blocks all subsequent apt-get install calls.
+ARG INSTALL_MOONCAKE=1
+ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
+ARG MOONCAKE_COMMIT="v0.3.14-rc1"
+ARG VENV_PYTHON="/opt/venv/bin/python"
+
+# [MC 1/4] Clone
+RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
+        echo "========== [MC 1/4] Clone Mooncake =========="; \
+        git clone ${MOONCAKE_REPO} /app/mooncake && \
+        cd /app/mooncake && \
+        git checkout "${MOONCAKE_COMMIT}" && \
+        git submodule update --init --recursive && \
+        echo "Mooncake commit: $(git rev-parse HEAD)"; \
+    else \
+        echo "========== Skipped Mooncake (INSTALL_MOONCAKE=0) =========="; \
+    fi
+
+# [MC 2/4] Install dependencies (system packages + RDMA + Go + submodules)
+ENV PATH="/usr/local/go/bin:${PATH}"
+RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
+        echo "========== [MC 2/4] Install Mooncake dependencies =========="; \
+        apt-get update && apt-get install -y --no-install-recommends \
+            zip unzip wget gcc make libtool autoconf \
+            librdmacm-dev rdmacm-utils infiniband-diags perftest ethtool \
+            libibverbs-dev rdma-core \
+            openssh-server openmpi-common && \
+        cd /app/mooncake && bash dependencies.sh -y && \
+        rm -rf /usr/local/go && \
+        wget -q https://go.dev/dl/go1.22.2.linux-amd64.tar.gz && \
+        tar -C /usr/local -xzf go1.22.2.linux-amd64.tar.gz && \
+        rm go1.22.2.linux-amd64.tar.gz; \
+    fi
+
+# [MC 2.5/4] Install AMD Pensando ionic RDMA provider for Mooncake RDMA transport.
+# The container's apt rdma-core (v39) predates the ionic provider. The upstream
+# rdma-core v61 ionic source only supports kernel ABI 1, but Pensando's ionic NIC
+# driver uses kernel ABI 4. Pensando's custom libionic1 deb (based on rdma-core v54
+# fork) supports ABI 1-4 and is required for correct RDMA operation.
+ARG IONIC_DEB_URL="https://repo.radeon.com/amdainic/pensando/ubuntu/1.117.1-a-63/pool/main/r/rdma-core/libionic1_54.0-149.g3304be71_amd64.deb"
+RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
+        echo "========== [MC 2.5/4] Install ionic RDMA provider =========="; \
+        curl -fSL "${IONIC_DEB_URL}" -o /tmp/libionic1.deb && \
+        dpkg -i /tmp/libionic1.deb && \
+        echo "driver ionic" > /etc/libibverbs.d/ionic.driver && \
+        ldconfig && \
+        echo "Installed ionic provider:" && \
+        ls -la /usr/lib/x86_64-linux-gnu/libibverbs/libionic* && \
+        rm -f /tmp/libionic1.deb; \
+    fi
+
+# [MC 3/4] CMake build with HIP support + system install
+# RDMA and HIP are auto-installed together. Multi-protocol support preserves
+# both protocols and excludes HIP IPC for cross-host transfers.
+RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
+        echo "========== [MC 3/4] Build and install Mooncake (USE_HIP=ON USE_HIP_DMABUF=ON ENABLE_MULTI_PROTOCOL=ON) =========="; \
+        mkdir -p /app/mooncake/build && cd /app/mooncake/build \
+        && cmake .. -DUSE_HIP=ON -DUSE_HIP_DMABUF=ON -DUSE_ETCD=ON \
+             -DENABLE_MULTI_PROTOCOL=ON \
+        && { grep -qx 'ENABLE_MULTI_PROTOCOL:BOOL=ON' CMakeCache.txt \
+             || { echo "ERROR: Mooncake multi-protocol support is required for cross-host RDMA with HIP"; exit 1; }; } \
+        && make -j$(nproc) && make install \
+        && ldconfig \
+        && echo "--- Clean up build artifacts ---" \
+        && rm -rf /app/mooncake/build /app/mooncake/.git; \
+    fi
+
+# Default to ibv_reg_mr; set MOONCAKE_DISABLE_HIP_DMABUF=0 at runtime to opt in
+# to HIP dma-buf when supported by the Mooncake build.
+ENV MOONCAKE_DISABLE_HIP_DMABUF=1
+
+# ========== Install Rust toolchain ==========
+ARG RUST_VERSION="1.94.0"
+
+RUN echo "========== Install Rust toolchain ==========" \
+    && apt-get update && apt-get install -y --no-install-recommends curl build-essential pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain "${RUST_VERSION}" --profile minimal \
+    && . "$HOME/.cargo/env" \
+    && rustc --version && cargo --version
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# RCCL: install .deb from build stage
+# WARNING: dpkg -i --force-all overwrites Ubuntu-repo rccl with the ROCm custom
+# build, breaking rocm-hip's version dep in dpkg metadata. All apt-get install
+# operations (Mooncake, Rust, etc.) MUST be completed before this step.
+COPY --from=build_rccl /app/rccl/build/release/*.deb /tmp/rccl/
+RUN DEBIAN_FRONTEND=noninteractive dpkg -i --force-all /tmp/rccl/*.deb && \
+    rm -rf /tmp/rccl
+
+# Triton ships with the ROCm PyTorch base image (installed as a torch dependency);
+# no separate build/copy step is needed here.
+
+# Aiter: copy compiled source tree + re-register editable install
+# (pip install -e creates egg-link automatically, no need to COPY them)
+COPY --from=build_aiter /app/aiter-test /app/aiter-test
+RUN cd /app/aiter-test && pip install -e . --no-build-isolation && \
+    pip show amd-aiter
+
+# RTL (rocm-trace-lite): lightweight GPU kernel profiler (~250KB, no build deps)
+RUN pip install rocm-trace-lite && \
+    rtl --version || true
+
+# ATOM: Python package install (editable) with the atomesh build hook enabled.
+# CACHEBUST invalidates only this layer so parallel stages stay cached
+ARG CACHEBUST=1
+RUN git clone $ATOM_REPO /app/ATOM && \
+    cd /app/ATOM && \
+    git checkout $ATOM_COMMIT && \
+    ATOM_MESH_BUILD=1 python -m pip install -e .
+RUN pip show atom || true
+
+RUN pip install --no-cache-dir msgpack msgspec quart
+
+# atomesh: install the binary produced by the ATOM package build hook to /usr/local/bin
+RUN echo "========== Install atomesh binary ==========" && \
+    cd /app/ATOM/atom/mesh && \
+    strip target/release/atomesh && \
+    cp target/release/atomesh /usr/local/bin/atomesh && \
+    atomesh --version
+
+# ========== LMCache (ROCm 7.2.4 / torch 2.10) for KV offload ==========
+# Install a wheel built for the image's exact PyTorch ABI. Keep --no-deps so
+# pip cannot replace the preinstalled ROCm torch stack. The wheel comes from
+# LMCACHE_WHEEL_IMAGE, a FROM scratch image holding only the wheel, which
+# .github/workflows/lmcache-rocm-wheel.yaml pushes to Docker Hub; the same
+# workflow opens the PR that moves the pin. The expected lmcache.__version__
+# follows from the wheel name; the ABI suffix and wheel tag are the workflow's
+# ROCM_TORCH210_LOCAL_VERSION and EXPECTED_WHEEL_TAG, and change only with the
+# image's torch.
+ARG LMCACHE_WHEEL_SHA256=a5fe8f3f5b9dee602ac7d11241f65a1640cd3d26c101f2d1d0e0d8aee88b7aab
+RUN --mount=type=bind,from=lmcache_wheel,target=/tmp/lmcache-wheel \
+    echo "========== [ATOM] Install LMCache ROCm torch 2.10 wheel ==========" && \
+    set -- /tmp/lmcache-wheel/*.whl && \
+    { [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "Expected one wheel in LMCACHE_WHEEL_IMAGE, found: $*"; exit 1; }; } && \
+    lmcache_wheel="$1" && \
+    lmcache_version="$(basename "${lmcache_wheel}" | sed -nE \
+        's/^lmcache-([^-]+\.rocm7\.2\.4\.torch2\.10\.git3d3aa833\.cxx11abi1)-cp312-cp312-manylinux_2_39_x86_64\.whl$/\1/p')" && \
+    { [ -n "${lmcache_version}" ] || { echo "Unexpected LMCache wheel ${lmcache_wheel}"; exit 1; }; } && \
+    echo "${LMCACHE_WHEEL_SHA256}  ${lmcache_wheel}" | sha256sum -c - && \
+    "${VENV_PYTHON}" -m pip install \
+        prometheus_client==0.25.0 aiofile==3.11.1 aiofiles caio==0.9.25 \
+        blake3 redis sortedcontainers pyzmq cupy-rocm-7-0 \
+        cachetools cryptography numba openai \
+        opentelemetry-api==1.40.0 opentelemetry-sdk==1.40.0 \
+        opentelemetry-exporter-otlp==1.40.0 \
+        opentelemetry-exporter-prometheus==0.61b0 \
+        "grpcio>=1.78.0" "protobuf>=6.31.1,<7" && \
+    "${VENV_PYTHON}" -m pip install --no-deps "${lmcache_wheel}" && \
+    "${VENV_PYTHON}" -c "import torch; torch.cuda.is_available = lambda: True; import lmcache, lmcache.cuda_ops, lmcache.lmcache_native; \
+from lmcache.v1.cache_engine import LMCacheEngineBuilder; \
+from lmcache.v1.memory_management import MemoryFormat; \
+from lmcache.v1.lookup_client.factory import LookupClientFactory; \
+from lmcache.v1.config import LMCacheEngineConfig; \
+from lmcache.v1.metadata import LMCacheMetadata; \
+from lmcache.integration.atom import AtomMPSchedulerAdapter, AtomMPTransferSpec, AtomMPWorkerAdapter; \
+from lmcache.utils import EngineType; \
+from lmcache.v1.multiprocess.futures import DeviceMessagingFuture; \
+from lmcache.v1.multiprocess.group_view import EngineGroupInfo; \
+assert 'rocm' in torch.__version__, torch.__version__; \
+assert lmcache.__version__ == '${lmcache_version}', lmcache.__version__; \
+assert lmcache.cuda_ops.__file__.endswith('.so'), lmcache.cuda_ops.__file__; \
+assert lmcache.lmcache_native.__file__.endswith('.so'), lmcache.lmcache_native.__file__; \
+assert hasattr(lmcache.cuda_ops, 'execute_object_group_transfer'), 'cuda_ops extension is incomplete'; \
+assert EngineType.ATOM.value == 'atom'; \
+assert DeviceMessagingFuture.__module__ == 'lmcache.v1.multiprocess.futures'; \
+assert AtomMPTransferSpec.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
+assert AtomMPSchedulerAdapter.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
+assert AtomMPWorkerAdapter.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
+print('OK: lmcache', lmcache.__version__, 'HIP cuda_ops; torch', torch.__version__)"
+
+# ========== SemiAnalysis aiperf agentic benchmark tool ==========
+# The SemiAnalysis fork, which is what carries the SA agentic datasets
+# (semianalysis_cc_traces_weka_062126*).
+#
+# Pinned to the commit InferenceX's `utils/aiperf` submodule points at, so our
+# image ships the aiperf they measure with. Their pointer is a deliberate,
+# frequently-moved pin -- four bumps in the first half of August 2026, and a
+# same-day revert on 2026-07-28 -- with commit titles that read "pin AIPerf v1
+# timing watchdog", "pin additive AIPerf main warmup". Tracking aiperf's master
+# instead would take in exactly the upstream changes they evaluate and
+# sometimes reject.
+#
+# It therefore has to be followed by hand. To re-check:
+#   git ls-tree main utils/aiperf     # in a clone of SemiAnalysisAI/InferenceX
+#
+# `SA_AIPERF_REF` accepts any ref; empty means "whatever HEAD points at", which
+# is why the checkout below is conditional rather than naming a branch (an
+# upstream default-branch rename would otherwise break unrelated builds).
+ARG INSTALL_SA_AIPERF=1
+ARG SA_AIPERF_REF="754356e9a39acc6cc6afb242d123bb57c3fb6f75"
+RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
+        echo "========== [ATOM] Install SemiAnalysis aiperf (ref=${SA_AIPERF_REF:-<default branch>}) =========="; \
+        rm -rf /opt/aiperf && \
+        git clone https://github.com/SemiAnalysisAI/aiperf.git /opt/aiperf && \
+        cd /opt/aiperf && \
+        { [ -z "${SA_AIPERF_REF}" ] || git checkout "${SA_AIPERF_REF}"; } && \
+        echo "[ATOM] aiperf resolved to $(git rev-parse HEAD)" && \
+        "${VENV_PYTHON}" -m pip install -e . && \
+        "${VENV_PYTHON}" -m pip show aiperf || true && \
+        command -v aiperf && aiperf --help >/dev/null; \
+    else \
+        echo "========== Skipped SemiAnalysis aiperf (INSTALL_SA_AIPERF=0) =========="; \
+    fi
+
+# Install the paired runtime after dependency installation. Preserve old image
+# tags for rollback; changing ROCM_RUNTIME_COMMIT selects a different backport.
+COPY --from=build_rocm_runtime /staging/ /opt/rocm/
+# Hard links rather than symlinks: ldconfig rewrites SONAME symlinks but cannot
+# re-point an inode, so absolute-path loads of the old versioned filenames have
+# to land on the new inode. This is upstream vLLM's replacement method.
+RUN set -eux; \
+    if ! grep -Eq '^7\.2\.4([+-]|$)' /opt/rocm/.info/version; then exit 0; fi; \
+    # The builder ran for this flavor, so its outputs have to be here. Failing
+    # closed is the point: publishing an image that silently carries the stock
+    # runtime is the failure this stage exists to prevent.
+    test -s /opt/rocm/.info/atom-rocm-runtime-commit; \
+    test -s /opt/rocm/.info/atom-rocm-runtime-sonames; \
+    cd /opt/rocm/lib; \
+    while read -r soname; do \
+        [ -n "$soname" ] || continue; \
+        # readlink -f exits 0 and prints the would-be path for a DANGLING link.
+        # Without this guard a COPY that did not deliver the target makes the
+        # touch below CREATE a 0-byte file, which the loop then hard-links over
+        # the real runtime. set -eux cannot see any of that.
+        if [ -L "$soname" ]; then [ -e "$soname" ]; fi; \
+        ours="$(readlink -f "$soname")"; \
+        [ -s "$ours" ]; \
+        # touch forces the overlayfs copy-up that lets the layer tar record the
+        # hard links below as aliases instead of as separate copies.
+        touch "$ours"; \
+        for f in "$soname".*; do \
+            [ -f "$f" ] && [ ! -L "$f" ] || continue; \
+            [ "$f" -ef "$ours" ] || ln -f "$ours" "$f"; \
+        done; \
+    done < /opt/rocm/.info/atom-rocm-runtime-sonames; \
+    ldconfig; \
+    # Prove the swap landed. Until this exists every failure path above ends in
+    # a successfully published image carrying the stock runtime.
+    hsa="$(grep -m1 '^libhsa-runtime64\.so\.' /opt/rocm/.info/atom-rocm-runtime-sonames)"; \
+    nm -D "/opt/rocm/lib/$hsa" | grep -q hsa_amd_signal_create_v2
+
+CMD ["/bin/bash"]

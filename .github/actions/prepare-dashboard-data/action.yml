@@ -1,0 +1,48 @@
+name: Prepare dashboard data
+description: Normalize and publish an existing dashboard data file before benchmark action runs.
+
+inputs:
+  data-path:
+    description: Path to data.js on the gh-pages branch.
+    required: true
+
+outputs:
+  entry_count:
+    description: Number of benchmark run entries before the action writes.
+    value: ${{ steps.prepare.outputs.entry_count }}
+
+runs:
+  using: composite
+  steps:
+    - id: prepare
+      shell: bash
+      env:
+        DATA_PATH: ${{ inputs.data-path }}
+      run: |
+        set -euo pipefail
+        SCRIPT_PATH="$RUNNER_TEMP/prepare_dashboard_data.py"
+        cp "$GITHUB_WORKSPACE/.github/scripts/prepare_dashboard_data.py" "$SCRIPT_PATH"
+        CURRENT_SHA=$(git rev-parse HEAD)
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git fetch origin gh-pages
+        git checkout -B gh-pages origin/gh-pages
+
+        output=$(python3 "$SCRIPT_PATH" "$DATA_PATH" --write)
+        printf '%s\n' "$output"
+        entry_count=$(printf '%s\n' "$output" | awk -F= '$1 == "entry_count" { print $2 }')
+        if [ -z "$entry_count" ]; then
+          echo "::error::Dashboard helper did not report entry_count"
+          exit 1
+        fi
+
+        if [ -f "$DATA_PATH" ]; then
+          git add -- "$DATA_PATH"
+          if ! git diff --cached --quiet; then
+            git commit -m "ci(dashboard): normalize benchmark data format"
+            git push origin gh-pages
+          fi
+        fi
+
+        git checkout "$CURRENT_SHA"
+        echo "entry_count=$entry_count" >> "$GITHUB_OUTPUT"

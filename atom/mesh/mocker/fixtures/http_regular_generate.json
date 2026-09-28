@@ -1,0 +1,29 @@
+{
+  "name": "http_regular_generate",
+  "model": "hf-internal-testing/llama-tokenizer",
+  "endpoint": "/generate",
+  "route": {
+    "worker_kind": "regular",
+    "connection_mode": "http"
+  },
+  "request": {
+    "text": "hello atomesh",
+    "stream": false
+  },
+  "expected_response": {
+    "status": 200,
+    "body": {
+      "text": "Hello from the virtual worker.",
+      "meta_info": {
+        "finish_reason": {
+          "type": "stop",
+          "reason": "length"
+        }
+      }
+    }
+  },
+  "simulation": {
+    "ttft_ms": 0,
+    "chunk_interval_ms": 0
+  }
+}

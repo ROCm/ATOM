@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=61", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atom"
+authors = [{ name = "ValarLip" }]
+license = "MIT"
+readme = "README.md"
+description = "a lightweight vLLM implementation built from scratch"
+requires-python = ">=3.10"
+dynamic = ["version"]
+dependencies = ["pybind11", "transformers==5.16.1", "zmq", "msgspec", "xxhash", "fastapi>=0.115,<0.137", "psutil", "prometheus_client>=0.25,<0.26", "protobuf", "uvicorn", "uvloop", "aiohttp", "datasets", "openpyxl", "tqdm", "setproctitle"]
+
+[project.optional-dependencies]
+# atom/diffusion only. Kept out of the base install because none of it is
+# reachable from the LLM engine: PyAV muxes the H.264 + AAC MP4, Pillow does
+# canvas preparation for image conditioning, and torchaudio resamples reference
+# audio to the audio VAE's 32 kHz.
+diffusion = ["av", "pillow", "torchaudio"]
+
+[project.urls]
+Homepage = "https://github.com/ROCm/ATOM"
+Repository = "https://github.com/ROCm/ATOM"
+Issues = "https://github.com/ROCm/ATOM/issues"
+
+[tool.setuptools_scm]
+write_to = "atom/_version.py"
+write_to_template = "__version__ = '{version}'\n"
+fallback_version = "0.1.0"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["atom*"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+atom = [
+    "mesh/target/release/libmesh.so",
+    "benchmarks/results/schemas/*.json",
+]
+
+[project.entry-points."vllm.platform_plugins"]
+# by default the entry-points will be installed anyway
+# but the plugin mode for platforms can be disabled by 
+# ATOM_DISABLE_VLLM_PLUGIN=1
+atom = "atom.plugin.vllm.register:register_platform"
+
+[project.entry-points."vllm.general_plugins"]
+atom_model_registry = "atom.plugin.vllm.register:register_model"
+
+[project.entry-points."sglang.srt.plugins"]
+atom_sglang = "atom.plugin.sglang.register:register_plugin"

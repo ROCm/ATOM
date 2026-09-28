@@ -1,0 +1,788 @@
+name: ATOM SGLang accuracy validation GPU shard (internal)
+
+on:
+  workflow_call:
+    inputs:
+      shard_suffix:
+        description: "Short id for container names (e.g. mi355, mi308)"
+        required: true
+        type: string
+      model_matrix_json:
+        description: 'JSON {"include":[{model_name, model_path, ...}, ...]} for this runner shard'
+        required: true
+        type: string
+      sglang_image_tag:
+        required: true
+        type: string
+      upload_accuracy_artifact:
+        description: "Whether to upload accuracy-* artifacts for the dashboard job"
+        required: true
+        type: boolean
+
+jobs:
+  sglang-model-accuracy:
+    name: SGLANG Model Accuracy (${{ matrix.model_name }})
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(inputs.model_matrix_json) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    permissions:
+      actions: read
+      contents: write
+    env:
+      CONTAINER_NAME: atom_sglang_validation_${{ inputs.shard_suffix }}_${{ strategy.job-index }}
+      SGLANG_IMAGE_TAG: ${{ inputs.sglang_image_tag }}
+    steps:
+      - name: Restore stale workspace ownership
+        run: |
+          set -euo pipefail
+          workspace="${GITHUB_WORKSPACE:-$PWD}"
+          if [ ! -d "$workspace" ]; then
+            echo "Workspace does not exist yet: $workspace"
+            exit 0
+          fi
+
+          uid="$(id -u)"
+          gid="$(id -g)"
+          echo "Restoring workspace ownership for ${workspace} to ${uid}:${gid}"
+
+          if command -v sudo > /dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            sudo chown -R "${uid}:${gid}" "$workspace" || true
+            sudo chmod -R u+rwX "$workspace" || true
+            exit 0
+          fi
+
+          if docker info > /dev/null 2>&1; then
+            docker run --rm \
+              -v "$workspace":/workspace \
+              docker.io/library/busybox:latest \
+              sh -c "chown -R ${uid}:${gid} /workspace && chmod -R u+rwX /workspace" || true
+            exit 0
+          fi
+
+          if command -v podman > /dev/null 2>&1 && podman info > /dev/null 2>&1; then
+            podman run --rm \
+              -v "$workspace":/workspace \
+              docker.io/library/busybox:latest \
+              sh -c "chown -R ${uid}:${gid} /workspace && chmod -R u+rwX /workspace" || true
+          fi
+
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Detect container engine
+        run: |
+          if command -v podman > /dev/null 2>&1; then
+            echo "CONTAINER_ENGINE=podman" >> "$GITHUB_ENV"
+            echo "Container engine: podman"
+          elif docker info > /dev/null 2>&1; then
+            echo "CONTAINER_ENGINE=docker" >> "$GITHUB_ENV"
+            echo "Container engine: docker"
+          else
+            echo "ERROR: Neither docker nor podman is available on this runner."
+            exit 1
+          fi
+
+      - name: Free container engine disk space
+        run: |
+          set -euo pipefail
+          echo "=== Disk before cleanup ==="
+          df -h || true
+          $CONTAINER_ENGINE system df || true
+
+          $CONTAINER_ENGINE container prune -f || true
+          $CONTAINER_ENGINE image prune -af || true
+          $CONTAINER_ENGINE builder prune -af || true
+
+          echo "=== Disk after cleanup ==="
+          df -h || true
+          $CONTAINER_ENGINE system df || true
+
+      - name: Docker Login
+        run: |
+          REG="${SGLANG_IMAGE_TAG%%/*}"
+          if [[ "$REG" != *.* && "$REG" != localhost* && "$REG" != *:* ]]; then
+            REG="docker.io"
+          fi
+          echo "Logging in to registry: ${REG}"
+          echo "${{ secrets.DOCKER_PASSWORD }}" | $CONTAINER_ENGINE login "$REG" -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+      - name: Set HF_TOKEN
+        run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
+            
+      - name: Print runner user and container engine diagnostics
+        run: |
+          echo "=== Container engine diagnostics ==="
+          echo "PATH=${PATH}"
+          echo "whoami=$(whoami)"
+          echo "id=$(id)"
+          echo "DOCKER_HOST=${DOCKER_HOST:-<unset>}"
+          echo "docker path: $(command -v docker || true)"
+          echo "podman path: $(command -v podman || true)"
+          ls -l /var/run/docker.sock || true
+          stat -c '%U %G %a %n' /var/run/docker.sock || true
+          echo "${CONTAINER_ENGINE} version:"
+          $CONTAINER_ENGINE version || true
+          echo "${CONTAINER_ENGINE} info:"
+          $CONTAINER_ENGINE info || true
+          echo "=== End container engine diagnostics ==="
+        
+      - name: Pull SGLANG image
+        run: |
+          set -euo pipefail
+          IMG="${SGLANG_IMAGE_TAG}"
+          if [[ "${CONTAINER_ENGINE}" == "podman" ]]; then
+            if [[ "${IMG}" != */* ]]; then
+              IMG="docker.io/library/${IMG}"
+            else
+              reg="${IMG%%/*}"
+              if [[ "${reg}" != *.* && "${reg}" != localhost* && "${reg}" != *:* ]]; then
+                IMG="docker.io/${IMG}"
+              fi
+            fi
+          fi
+          echo "SGLANG_IMAGE_REF=${IMG}" >> "$GITHUB_ENV"
+          echo "Pulling SGLANG image: ${IMG} (workflow tag: ${SGLANG_IMAGE_TAG})"
+          $CONTAINER_ENGINE pull "${IMG}"
+
+      - name: Prepare model and HuggingFace cache mounts
+        run: |
+          set -euo pipefail
+          MODEL_CACHE_MOUNT=""
+          MODEL_CACHE_ROOT=""
+          MODEL_CACHE_DESC=""
+          MODEL_MOUNT_PATH="/models"
+          HF_CACHE_ROOT=""
+          MODEL_PATH="${{ matrix.model_path }}"
+
+          model_dir_is_complete() {
+            local model_dir="$1"
+            [ -f "${model_dir}/config.json" ] || return 1
+            MODEL_DIR="${model_dir}" python3 - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          model_dir = Path(os.environ["MODEL_DIR"])
+          index_path = model_dir / "model.safetensors.index.json"
+          if not index_path.exists():
+              sys.exit(0)
+
+          try:
+              weight_map = json.loads(index_path.read_text()).get("weight_map", {})
+          except Exception as exc:
+              print(f"Invalid safetensors index under {model_dir}: {exc}")
+              sys.exit(1)
+
+          expected = {Path(path).name for path in weight_map.values()}
+          present = {path.name for path in model_dir.glob("*.safetensors")}
+          missing = sorted(expected - present)
+          if missing:
+              shown = ", ".join(missing[:10])
+              suffix = "" if len(missing) <= 10 else f" ... and {len(missing) - 10} more"
+              print(f"Missing safetensors shards under {model_dir}: {shown}{suffix}")
+              sys.exit(1)
+          PY
+          }
+
+          cache_roots=(
+            /mnt/dcgpuval
+            /shared/data/WRH/models
+            /shared_nfs/models
+            /shared_nfs
+            /mnt/raid0/pretrained_model
+            /data/pretrained_model
+            /data/models
+          )
+
+          first_existing_root=""
+          for candidate in "${cache_roots[@]}"; do
+            if [ ! -d "$candidate" ]; then
+              continue
+            fi
+            if [ -z "$first_existing_root" ]; then
+              first_existing_root="$candidate"
+            fi
+            if model_dir_is_complete "${candidate}/${MODEL_PATH}"; then
+              MODEL_CACHE_ROOT="$candidate"
+              break
+            fi
+            if [ -f "${candidate}/${MODEL_PATH}/config.json" ]; then
+              echo "Warning: Found incomplete local model under ${candidate}/${MODEL_PATH}; trying next cache root."
+            fi
+          done
+
+          if [ -z "$MODEL_CACHE_ROOT" ]; then
+            if [ -n "$first_existing_root" ]; then
+              MODEL_CACHE_ROOT="$first_existing_root"
+              echo "No complete local model found for ${MODEL_PATH}; using ${MODEL_CACHE_ROOT} for download/cache."
+            else
+              echo "ERROR: No shared model cache root exists on runner."
+              echo "Refusing to use a container-local or runner-temp model cache for ${MODEL_PATH}."
+              echo "Expected one of:"
+              printf ' - %s\n' "${cache_roots[@]}"
+              exit 1
+            fi
+          fi
+
+          if [ -d "$MODEL_CACHE_ROOT" ]; then
+            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_MOUNT_PATH}"
+            MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
+          else
+            echo "ERROR: Selected model cache root does not exist: ${MODEL_CACHE_ROOT}"
+            exit 1
+          fi
+
+          try_hf_cache_root() {
+            local candidate="$1"
+            local parent
+            [ -n "$candidate" ] || return 1
+            parent="$(dirname "$candidate")"
+            [ -d "$parent" ] || return 1
+            if mkdir -p "$candidate" 2>/dev/null; then
+              HF_CACHE_ROOT="$candidate"
+              return 0
+            fi
+            echo "Warning: HuggingFace cache candidate is not writable: ${candidate}"
+            return 1
+          }
+
+          for candidate in \
+            "${MODEL_CACHE_ROOT}/.cache/huggingface" \
+            /shared_nfs/.cache/huggingface \
+            /shared_nfs/huggingface \
+            /mnt/raid0/huggingface \
+            /data/huggingface \
+            /shared/data/WRH/huggingface; do
+            if try_hf_cache_root "$candidate"; then
+              break
+            fi
+          done
+
+          if [ -z "$HF_CACHE_ROOT" ]; then
+            echo "ERROR: No writable shared HuggingFace cache root found."
+            echo "Refusing to fall back to RUNNER_TEMP/GITHUB_WORKSPACE because MI355 models can exceed local runner disk."
+            exit 1
+          fi
+          HF_CACHE_MOUNT="-v ${HF_CACHE_ROOT}:/hf-cache"
+          echo "Using HuggingFace cache root: ${HF_CACHE_ROOT}"
+          df -h "$HF_CACHE_ROOT" || true
+
+          echo "Using model cache backend: ${MODEL_CACHE_DESC}"
+          echo "MODEL_CACHE_ROOT=${MODEL_CACHE_ROOT}" >> "$GITHUB_ENV"
+          echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
+          echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
+          echo "MODEL_MOUNT_PATH=${MODEL_MOUNT_PATH}" >> "$GITHUB_ENV"
+          echo "HF_CACHE_ROOT=${HF_CACHE_ROOT}" >> "$GITHUB_ENV"
+          echo "HF_CACHE_MOUNT=${HF_CACHE_MOUNT}" >> "$GITHUB_ENV"
+
+      - name: Clean up GPU and Python processes
+        run: |
+          set -euo pipefail
+
+          echo "=== Cleaning up GPU processes ==="
+          gpu_pids=""
+          for dev in /dev/kfd /dev/dri/renderD*; do
+            if [ -e "$dev" ]; then
+              dev_pids=$(fuser "$dev" 2>/dev/null || true)
+              if [ -n "$dev_pids" ]; then
+                gpu_pids="${gpu_pids} ${dev_pids}"
+              fi
+            fi
+          done
+          gpu_pids=$(printf '%s\n' $gpu_pids 2>/dev/null | awk '!seen[$1]++' | tr '\n' ' ' || true)
+          if [ -n "$gpu_pids" ]; then
+            echo "Killing GPU processes: $gpu_pids"
+            echo "$gpu_pids" | xargs -r kill -9 || true
+          else
+            echo "No GPU processes found."
+          fi
+
+          echo "=== Cleaning up Python processes on this machine ==="
+          keep_pids=" $$ $PPID "
+          pid="$PPID"
+          while [ -n "$pid" ] && [ "$pid" != "0" ]; do
+            keep_pids="${keep_pids} ${pid} "
+            pid="$(ps -o ppid= -p "$pid" 2>/dev/null | awk '{print $1}' || true)"
+          done
+
+          python_pids=$(ps -eo pid=,comm= \
+            | awk -v keep="$keep_pids" '
+                keep ~ (" " $1 " ") { next }
+                $2 ~ /^python([0-9.]+)?$/ { print $1 }
+                $2 ~ /^python[0-9.]+-?dbg$/ { print $1 }
+                $2 ~ /^ipython$/ { print $1 }
+                $2 ~ /^pytest$/ { print $1 }
+                $2 ~ /^uvicorn$/ { print $1 }
+                $2 ~ /^gunicorn$/ { print $1 }
+                $2 ~ /^sglang$/ { print $1 }
+                $2 ~ /^vllm$/ { print $1 }
+              ' || true)
+          if [ -n "$python_pids" ]; then
+            echo "Killing Python processes on this machine: $python_pids"
+            echo "$python_pids" | xargs -r kill -9 || true
+          else
+            echo "No Python processes found on this machine."
+          fi
+
+          sleep 2
+
+          echo "=== Verifying GPU cleanup ==="
+          remaining=$(fuser /dev/kfd /dev/dri/renderD* 2>/dev/null | tr ' ' '\n' | sort -u || true)
+          if [ -n "$remaining" ]; then
+              echo "WARNING: GPU still has processes:"
+              echo "$remaining"
+          else
+              echo "GPU is clean."
+          fi
+
+          echo "=== Cleaning up containers ==="
+          $CONTAINER_ENGINE rm -f "$CONTAINER_NAME" 2>/dev/null || true
+
+      - name: Start validation container
+        run: |
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+          if [ "${CONTAINER_ENGINE}" = "podman" ]; then
+            GROUP_ADD_FLAG="--group-add keep-groups"
+          else
+            GROUP_ADD_FLAG="--group-add video"
+          fi
+
+          MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
+          echo "Using model cache backend: ${MODEL_CACHE_DESC}"
+          echo "Using HuggingFace cache root: ${HF_CACHE_ROOT}"
+
+          SGLANG_ENV_FILE="${RUNNER_TEMP:-${GITHUB_WORKSPACE:-$PWD}}/sglang_env_file.txt"
+          cat > "$SGLANG_ENV_FILE" << 'EOF'
+          ${{ matrix.env_vars }}
+          EOF
+
+          $CONTAINER_ENGINE run -dt --device=/dev/kfd $DEVICE_FLAG \
+            -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
+            $MODEL_MOUNT \
+            $HF_CACHE_MOUNT \
+            -w /workspace \
+            --ipc=host $GROUP_ADD_FLAG \
+            --privileged \
+            --cap-add=SYS_PTRACE \
+            --security-opt seccomp=unconfined \
+            --ulimit memlock=-1 \
+            --ulimit stack=67108864 \
+            --env-file "$SGLANG_ENV_FILE" \
+            -e HF_TOKEN="${HF_TOKEN:-}" \
+            -e HF_HOME="/hf-cache" \
+            -e HF_HUB_CACHE="/hf-cache/hub" \
+            -e HF_DATASETS_CACHE="/hf-cache/datasets" \
+            -e TRANSFORMERS_CACHE="/hf-cache/transformers" \
+            --name "$CONTAINER_NAME" \
+            "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}"
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Collect GPU info (inside container)
+        id: gpu-info
+        run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" "$CONTAINER_ENGINE" "${{ matrix.runner }}"
+
+      - name: Resolve local model path
+        run: |
+          set -euo pipefail
+          if [ -z "${MODEL_CACHE_MOUNT}" ]; then
+            echo "SGLANG_MODEL_AVAILABLE_LOCALLY=false" >> "$GITHUB_ENV"
+            echo "No shared model cache mount; local model resolution skipped."
+            exit 0
+          fi
+
+          model_dir="${MODEL_MOUNT_PATH}/${{ matrix.model_path }}"
+          if $CONTAINER_ENGINE exec \
+            -e MODEL_DIR="$model_dir" \
+            "$CONTAINER_NAME" \
+            bash -lc '
+              set -euo pipefail
+              [ -f "$MODEL_DIR/config.json" ]
+              python3 - <<'"'"'PY'"'"'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          model_dir = Path(os.environ["MODEL_DIR"])
+          index_path = model_dir / "model.safetensors.index.json"
+          if not index_path.exists():
+              sys.exit(0)
+
+          weight_map = json.loads(index_path.read_text()).get("weight_map", {})
+          expected = {Path(path).name for path in weight_map.values()}
+          present = {path.name for path in model_dir.glob("*.safetensors")}
+          missing = sorted(expected - present)
+          if missing:
+              shown = ", ".join(missing[:10])
+              suffix = "" if len(missing) <= 10 else f" ... and {len(missing) - 10} more"
+              print(f"Missing safetensors shards under {model_dir}: {shown}{suffix}")
+              sys.exit(1)
+          PY
+            '; then
+            echo "Resolved local model path: ${model_dir}"
+            echo "SGLANG_MODEL_AVAILABLE_LOCALLY=true" >> "$GITHUB_ENV"
+            echo "SGLANG_RESOLVED_MODEL_PATH=${model_dir}" >> "$GITHUB_ENV"
+          else
+            echo "Complete local model path not found for ${{ matrix.model_path }} under ${model_dir}."
+            echo "SGLANG_MODEL_AVAILABLE_LOCALLY=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Download model if needed
+        run: |
+          set -euo pipefail
+          model_dir="${MODEL_MOUNT_PATH}/${{ matrix.model_path }}"
+          if [ "${SGLANG_MODEL_AVAILABLE_LOCALLY:-false}" = "true" ]; then
+            echo "Using local model path ${SGLANG_RESOLVED_MODEL_PATH}; skip download."
+            exit 0
+          fi
+          if [ -n "${MODEL_CACHE_MOUNT}" ]; then
+            lock_suffix="$(printf '%s' "${{ matrix.model_path }}" | tr '/:@' '___')"
+            if ! $CONTAINER_ENGINE exec \
+              -e HF_TOKEN="${HF_TOKEN:-}" \
+              -e MODEL_MOUNT_PATH="${MODEL_MOUNT_PATH}" \
+              -e MODEL_PATH="${{ matrix.model_path }}" \
+              -e MODEL_DIR="$model_dir" \
+              -e RUNNER_NAME="${{ matrix.runner }}" \
+              -e LOCK_SUFFIX="$lock_suffix" \
+              "$CONTAINER_NAME" \
+              bash -lc '
+                set -euo pipefail
+                completion_flag="$MODEL_DIR/.download-complete"
+                use_model_lock="true"
+
+                if [ "$RUNNER_NAME" = "atom-mi355-8gpu.predownload" ]; then
+                  use_model_lock="false"
+                fi
+
+                model_dir_is_complete() {
+                  [ -f "$MODEL_DIR/config.json" ] || return 1
+                  python3 - <<'"'"'PY'"'"'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          model_dir = Path(os.environ["MODEL_DIR"])
+          index_path = model_dir / "model.safetensors.index.json"
+          if not index_path.exists():
+              sys.exit(0)
+
+          weight_map = json.loads(index_path.read_text()).get("weight_map", {})
+          expected = {Path(path).name for path in weight_map.values()}
+          present = {path.name for path in model_dir.glob("*.safetensors")}
+          missing = sorted(expected - present)
+          if missing:
+              shown = ", ".join(missing[:10])
+              suffix = "" if len(missing) <= 10 else f" ... and {len(missing) - 10} more"
+              print(f"Model under {model_dir} is missing safetensors shards: {shown}{suffix}")
+              sys.exit(1)
+          PY
+                }
+
+                download_model() {
+                  if [ -f "$MODEL_DIR/config.json" ]; then
+                    echo "Model directory exists without a completion marker under ${MODEL_DIR}; validating download"
+                  else
+                    echo "Model not found under ${MODEL_DIR}; downloading model"
+                  fi
+
+                  rm -f "$completion_flag"
+                  hf download "$MODEL_PATH" --local-dir "$MODEL_DIR"
+                  model_dir_is_complete
+                  touch "$completion_flag"
+                }
+
+                if [ -f "$completion_flag" ]; then
+                  if model_dir_is_complete; then
+                    echo "Model already exists under ${MODEL_DIR}; skip download"
+                  else
+                    echo "Completion marker exists but model is incomplete under ${MODEL_DIR}; redownloading"
+                    download_model
+                  fi
+                elif [ "$use_model_lock" != "true" ]; then
+                  echo "Baremetal runner ${RUNNER_NAME} detected; skipping shared model download lock"
+                  download_model
+                else
+                  lock_dir="${MODEL_MOUNT_PATH}/.cache/atom-download-locks"
+                  mkdir -p "$lock_dir"
+                  lock_file="$lock_dir/${LOCK_SUFFIX}.lock"
+                  exec 9>"$lock_file"
+                  echo "Waiting for model download lock: $lock_file"
+                  if ! flock -w 7200 9; then
+                    echo "Timed out waiting for model download lock: $lock_file"
+                    exit 1
+                  fi
+
+                  if [ -f "$completion_flag" ] && model_dir_is_complete; then
+                    echo "Model became available under ${MODEL_DIR} while waiting for the lock; skip download"
+                  else
+                    if [ -f "$completion_flag" ]; then
+                      echo "Completion marker exists after lock but model is incomplete under ${MODEL_DIR}; redownloading"
+                    fi
+                    download_model
+                  fi
+                fi
+              '; then
+              echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
+              exit 1
+            fi
+          else
+            echo "${MODEL_CACHE_ROOT} directory not mounted; skipping model download"
+          fi
+
+      - name: Resolve SGLANG model path
+        if: success()
+        run: |
+          if [ "${SGLANG_MODEL_AVAILABLE_LOCALLY:-false}" = "true" ]; then
+            echo "Using previously resolved local model path: ${SGLANG_RESOLVED_MODEL_PATH}"
+            exit 0
+          fi
+          if [ -n "${MODEL_CACHE_MOUNT}" ]; then
+            echo "SGLANG_RESOLVED_MODEL_PATH=${MODEL_MOUNT_PATH}/${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "Using mounted model path: ${MODEL_MOUNT_PATH}/${{ matrix.model_path }}"
+          else
+            echo "SGLANG_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "Using model id: ${{ matrix.model_path }}"
+          fi
+
+      - name: Run SGLANG launch and gsm8k accuracy via script (full mode)
+        timeout-minutes: 120
+        env:
+          SGLANG_MODEL_NAME: ${{ matrix.model_name }}
+          SGLANG_MODEL_PATH: ${{ matrix.model_path }}
+          SGLANG_EXTRA_ARGS: ${{ matrix.extra_args }}
+          SGLANG_ENV_VARS: ${{ matrix.env_vars }}
+          MAX_WAIT_RETRIES: "120"
+          STREAM_SGLANG_LOGS: "1"
+          LM_EVAL_TASK: "gsm8k"
+          LM_EVAL_EXTRA_MODEL_ARGS: ${{ matrix.lm_eval_extra_model_args || '' }}
+          LM_EVAL_NUM_FEWSHOT: ${{ matrix.lm_eval_num_fewshot }}
+          LM_EVAL_NUM_CONCURRENT: ${{ matrix.lm_eval_num_concurrent }}
+          LM_EVAL_USE_CHAT_COMPLETIONS: ${{ matrix.lm_eval_use_chat_completions || '0' }}
+          LM_EVAL_BATCH_SIZE: ${{ matrix.lm_eval_batch_size || 65 }}
+          LM_EVAL_GEN_KWARGS: ${{ matrix.lm_eval_gen_kwargs || '' }}
+        run: |
+          set -euo pipefail
+
+          # Avoid long-running podman/docker exec sessions waiting on runtime
+          # exit files. Run the accuracy driver inside the container and poll it
+          # from short host-side exec calls.
+          $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc '
+            rm -f \
+              /tmp/atom_sglang_accuracy_driver.done \
+              /tmp/atom_sglang_accuracy_driver.exit \
+              /tmp/atom_sglang_accuracy_driver.log
+          '
+
+          $CONTAINER_ENGINE exec \
+            -e SGLANG_MODEL_NAME="${SGLANG_MODEL_NAME}" \
+            -e SGLANG_MODEL_PATH="${SGLANG_RESOLVED_MODEL_PATH:-$SGLANG_MODEL_PATH}" \
+            -e SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS}" \
+            -e SGLANG_ENV_VARS="${SGLANG_ENV_VARS}" \
+            -e SGLANG_DOCKER_IMAGE="${SGLANG_IMAGE_TAG}" \
+            -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
+            -e GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
+            -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
+            -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
+            -e STREAM_SGLANG_LOGS="${STREAM_SGLANG_LOGS}" \
+            -e LM_EVAL_TASK="${LM_EVAL_TASK}" \
+            -e LM_EVAL_EXTRA_MODEL_ARGS="${LM_EVAL_EXTRA_MODEL_ARGS}" \
+            -e LM_EVAL_NUM_FEWSHOT="${LM_EVAL_NUM_FEWSHOT}" \
+            -e LM_EVAL_NUM_CONCURRENT="${LM_EVAL_NUM_CONCURRENT}" \
+            -e LM_EVAL_USE_CHAT_COMPLETIONS="${LM_EVAL_USE_CHAT_COMPLETIONS}" \
+            -e LM_EVAL_BATCH_SIZE="${LM_EVAL_BATCH_SIZE}" \
+            -e LM_EVAL_GEN_KWARGS="${LM_EVAL_GEN_KWARGS}" \
+            "$CONTAINER_NAME" bash -lc '
+              (
+                set +e
+                bash .github/scripts/atom_sglang_test.sh accuracy > /tmp/atom_sglang_accuracy_driver.log 2>&1
+                rc=$?
+                echo "$rc" > /tmp/atom_sglang_accuracy_driver.exit
+                touch /tmp/atom_sglang_accuracy_driver.done
+              ) &
+              echo "Started SGLANG accuracy driver pid=$!"
+            '
+
+          last_driver_log_line=0
+          emit_driver_logs() {
+            local current_line_count
+            current_line_count="$(
+              $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc \
+                'if [ -f /tmp/atom_sglang_accuracy_driver.log ]; then wc -l < /tmp/atom_sglang_accuracy_driver.log; else echo 0; fi' \
+                2>/dev/null || echo 0
+            )"
+            current_line_count=${current_line_count//$'\r'/}
+            if [ "${current_line_count:-0}" -le "${last_driver_log_line}" ]; then
+              return 0
+            fi
+
+            echo ""
+            echo "========== New SGLANG accuracy driver output =========="
+            $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc \
+              "sed -n '$((last_driver_log_line + 1)),${current_line_count}p' /tmp/atom_sglang_accuracy_driver.log" || true
+            last_driver_log_line=${current_line_count}
+          }
+
+          echo "Waiting for SGLANG accuracy driver to finish..."
+          while true; do
+            container_running="$(
+              $CONTAINER_ENGINE inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || echo "missing"
+            )"
+            if [ "${container_running}" != "true" ]; then
+              echo "ERROR: validation container is not running (state=${container_running})."
+              echo "========== Container inspect =========="
+              $CONTAINER_ENGINE inspect "$CONTAINER_NAME" || true
+              echo "========== Container logs =========="
+              $CONTAINER_ENGINE logs "$CONTAINER_NAME" || true
+              emit_driver_logs || true
+              exit 1
+            fi
+
+            if $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc '[ -f /tmp/atom_sglang_accuracy_driver.done ]'; then
+              emit_driver_logs
+              break
+            fi
+            emit_driver_logs
+            sleep 60
+          done
+
+          accuracy_rc="$($CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc 'cat /tmp/atom_sglang_accuracy_driver.exit')"
+          if [ "${accuracy_rc}" != "0" ]; then
+            echo "SGLANG accuracy driver failed with exit code ${accuracy_rc}"
+            $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc 'tail -n 200 /tmp/atom_sglang_accuracy_driver.log 2>/dev/null || true'
+            exit "${accuracy_rc}"
+          fi
+
+      - name: Check SGLANG accuracy test results
+        if: success()
+        run: |
+          $CONTAINER_ENGINE cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_results ./atom_sglang_accuracy_results || true
+          result_file=$(ls -1t atom_sglang_accuracy_results/*.json 2>/dev/null | head -n 1)
+          if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
+            echo "ERROR: No results JSON file found in atom_sglang_accuracy_results/"
+            exit 2
+          fi
+
+          echo "RESULT_FILE: $result_file"
+          flexible_extract_value=$(python3 - "$result_file" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as f:
+              data = json.load(f)
+          print(data["results"]["gsm8k"]["exact_match,flexible-extract"])
+          PY
+          )
+          echo "Flexible extract value: $flexible_extract_value"
+          echo "Accuracy test threshold: ${{ matrix.accuracy_test_threshold }}"
+
+          result=$(awk -v val="$flexible_extract_value" -v threshold="${{ matrix.accuracy_test_threshold }}" 'BEGIN {print (val < threshold) ? 1 : 0}')
+          if [ "$result" -eq 1 ]; then
+            echo "Accuracy test failed: Flexible extract value $flexible_extract_value is less than threshold ${{ matrix.accuracy_test_threshold }}."
+            exit 1
+          else
+            echo "Accuracy test passed: Flexible extract value $flexible_extract_value is greater than or equal to threshold ${{ matrix.accuracy_test_threshold }}."
+            exit 0
+          fi
+
+      - name: Check SGLANG MTP acceptance rate
+        if: ${{ success() && matrix.mtp_accept_threshold != '' }}
+        env:
+          MTP_ACCEPTANCE_THRESHOLD: ${{ matrix.mtp_accept_threshold }}
+        run: |
+          set -euo pipefail
+          result_file=$(ls -1t atom_sglang_accuracy_results/*.json 2>/dev/null | head -n 1)
+          if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
+            echo "ERROR: No results JSON file found for MTP acceptance check."
+            exit 2
+          fi
+
+          read -r acceptance_rate accept_length < <(python3 - "$result_file" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as f:
+              metadata = json.load(f).get("atom_ci_metadata", {})
+          print(metadata.get("mtp_acceptance_rate", ""), metadata.get("mtp_accept_length", ""))
+          PY
+          )
+          if [ -z "$acceptance_rate" ]; then
+            echo "FAIL: mtp_acceptance_rate is missing; speculative decoding metrics were not emitted."
+            exit 1
+          fi
+
+          threshold_percent=$(awk -v threshold="$MTP_ACCEPTANCE_THRESHOLD" 'BEGIN {printf "%.2f", threshold * 100}')
+          echo "MTP acceptance rate: ${acceptance_rate}% (threshold ${threshold_percent}%); accept length: ${accept_length}"
+          if awk -v value="$acceptance_rate" -v threshold="$MTP_ACCEPTANCE_THRESHOLD" 'BEGIN {exit !((value / 100) < threshold)}'; then
+            echo "MTP acceptance gate FAILED: ${acceptance_rate}% < ${threshold_percent}%"
+            exit 1
+          fi
+          echo "MTP acceptance gate PASSED."
+
+      - name: Collect summary
+        if: success()
+        run: |
+          echo "SGLANG gsm8k summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
+          $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/atom_sglang_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
+
+      - name: Collect artifacts
+        if: always()
+        run: |
+          if [ -z "${CONTAINER_ENGINE:-}" ]; then
+            if command -v podman > /dev/null 2>&1 && podman info > /dev/null 2>&1; then
+              CONTAINER_ENGINE=podman
+            elif docker info > /dev/null 2>&1; then
+              CONTAINER_ENGINE=docker
+            else
+              echo "::warning::No container engine available while collecting artifacts; skipping container artifact copy."
+              exit 0
+            fi
+          fi
+          "$CONTAINER_ENGINE" cp "$CONTAINER_NAME":/tmp/atom_sglang.log ./atom_sglang.log || true
+          "$CONTAINER_ENGINE" cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_output.txt ./atom_sglang_accuracy_output.txt || true
+          "$CONTAINER_ENGINE" cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_results ./atom_sglang_accuracy_results || true
+
+      - name: Upload model artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sglang-validation-${{ matrix.model_name }}-${{ github.run_id }}
+          path: |
+            atom_sglang.log
+            atom_sglang_accuracy_output.txt
+            atom_sglang_accuracy_results
+
+      - name: Upload accuracy results for dashboard
+        if: ${{ always() && inputs.upload_accuracy_artifact }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: accuracy-${{ matrix.model_name }}
+          path: atom_sglang_accuracy_results/*.json
+          if-no-files-found: ignore
+
+      - name: Cleanup
+        if: always()
+        run: |
+          if [ -z "${CONTAINER_ENGINE:-}" ]; then
+            if command -v podman > /dev/null 2>&1 && podman info > /dev/null 2>&1; then
+              CONTAINER_ENGINE=podman
+            elif docker info > /dev/null 2>&1; then
+              CONTAINER_ENGINE=docker
+            else
+              echo "::warning::No container engine available during cleanup; skipping container cleanup."
+              exit 0
+            fi
+          fi
+          "$CONTAINER_ENGINE" exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/atom_sglang.pid ]; then kill \$(cat /tmp/atom_sglang.pid) || true; fi" || true
+          "$CONTAINER_ENGINE" stop "$CONTAINER_NAME" || true
+          "$CONTAINER_ENGINE" rm "$CONTAINER_NAME" || true
+          "$CONTAINER_ENGINE" rmi "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}" || true
+

@@ -1,0 +1,541 @@
+# SPDX-License-Identifier: Apache-2.0
+
+import logging
+import os
+from collections.abc import Callable, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import (
+    Protocol,
+    TypeVar,
+)
+
+import torch
+from torch import nn
+from torch.nn.modules.module import register_module_module_registration_hook
+from typing_extensions import overload
+
+from atom.model_loader.weight_utils import local_model_dir
+
+T = TypeVar("T")
+logger = logging.getLogger(__name__)
+
+
+class LayerFn(Protocol):
+    def __call__(self, prefix: str) -> torch.nn.Module: ...
+
+
+class PPMissingLayer(torch.nn.Identity):
+    """
+    A placeholder layer for missing layers in a pipeline parallel model.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.return_tuple = kwargs.get("return_tuple", False)
+
+    def forward(self, *args, **kwargs):
+        """
+        Return the first arg from args or the first value from kwargs.
+
+        Wraps the input in a tuple if `self.return_tuple` is True.
+        """
+        input = args[0] if args else next(iter(kwargs.values()))
+        return (input,) if self.return_tuple else input
+
+
+class StageMissingLayer(nn.Module):
+    def __init__(self, stage_name: str, module: nn.Module | None = None) -> None:
+        super().__init__()
+
+        self.stage_name = stage_name
+
+        # Don't register this as a child module in order to
+        # avoid missing keys when loading weights
+        self.__dict__["module"] = module
+
+    def __getattr__(self, name: str):
+        return getattr(self.__dict__["module"], name)
+
+    def __call__(self, *args, **kwargs):
+        raise RuntimeError(f"{self} should not be called")
+
+    def extra_repr(self) -> str:
+        return f"stage_name={self.stage_name!r}"
+
+
+def get_pp_indices(
+    num_hidden_layers: int, pp_rank: int, pp_size: int
+) -> tuple[int, int]:
+    """Try to evenly distribute layers across partitions.
+
+    If the number of layers is not divisible by the number of partitions,
+    the remaining layers are evenly distributed across all but the last
+    partition. The last partition is excluded because it often contains an
+    additional norm layer and we are attempting to balance compute.
+
+    If `pp_size > 2` and the number of remaining layers is
+    `0 < x <= pp_size - 2` then the remaining layers are evenly distributed
+    across the middle partitions. The first and last partitions are excluded
+    because they contain the input and output embeddings respectively and we
+    are attempting to reduce maximum memory consumption across partitions.
+    """
+    partition_list_str = os.getenv("VLLM_PP_LAYER_PARTITION", None)
+    if partition_list_str is not None:
+        try:
+            partitions = [int(layer) for layer in partition_list_str.split(",")]
+        except ValueError as err:
+            raise ValueError(f"Invalid partition string: {partition_list_str}") from err
+        if len(partitions) != pp_size:
+            raise ValueError(f"{len(partitions)=} does not match {pp_size=}.")
+        if sum(partitions) != num_hidden_layers:
+            raise ValueError(f"{sum(partitions)=} does not match {num_hidden_layers=}.")
+    else:
+        layers_per_partition = num_hidden_layers // pp_size
+        partitions = [layers_per_partition for _ in range(pp_size)]
+
+        if remaining_layers := num_hidden_layers % pp_size:
+            for i in range(2, remaining_layers + 2):
+                partitions[-i] += 1
+            logger.info(
+                "Hidden layers were unevenly partitioned: [%s]. "
+                "This can be manually overridden using the "
+                "VLLM_PP_LAYER_PARTITION environment variable",
+                ",".join(str(p) for p in partitions),
+            )
+
+    start_layer = sum(partitions[:pp_rank])
+    end_layer = start_layer + partitions[pp_rank]
+
+    return (start_layer, end_layer)
+
+
+def make_layers(
+    num_hidden_layers: int,
+    layer_fn: LayerFn,
+    prefix: str,
+    layer_num_offset: int = 0,
+) -> tuple[int, int, torch.nn.ModuleList]:
+    """Make a list of layers with the given layer function, taking
+    pipeline parallelism into account.
+    """
+    from aiter.dist.parallel_state import get_pp_group
+
+    start_layer, end_layer = get_pp_indices(
+        num_hidden_layers, get_pp_group().rank_in_group, get_pp_group().world_size
+    )
+    modules = torch.nn.ModuleList(
+        [PPMissingLayer() for _ in range(start_layer)]
+        + [
+            layer_fn(prefix=f"{prefix}.{idx}", layer_num=layer_num_offset + idx)
+            for idx in range(start_layer, end_layer)
+        ]
+        + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)]
+    )
+    return start_layer, end_layer, modules
+
+
+# NOTE: don't use lru_cache here because it can prevent garbage collection
+_model_to_pp_missing_layer_names: dict[int, list[str]] = {}
+
+
+def get_pp_missing_layer_names(model: torch.nn.Module) -> list[str]:
+    """Get the names of the missing layers in a pipeline parallel model."""
+    model_id = id(model)
+    if model_id in _model_to_pp_missing_layer_names:
+        return _model_to_pp_missing_layer_names[model_id]
+
+    missing_layer_names = []
+    for name, module in model.named_modules():
+        if isinstance(module, PPMissingLayer):
+            # NOTE: the trailing dot is used to match the prefix of the layer.
+            # without the dot, we could match a layer that is not missing,
+            # e.g., 'encoder.layer.1' would match 'encoder.layer.11'
+            missing_layer_names.append(name + ".")
+    _model_to_pp_missing_layer_names[model_id] = missing_layer_names
+
+    return missing_layer_names
+
+
+def is_pp_missing_parameter(name: str, model: torch.nn.Module) -> bool:
+    """Check if a parameter is missing in a pipeline parallel model."""
+    if isinstance(model, PPMissingLayer):
+        return True
+
+    return any(
+        name.startswith(missing_layer_name)
+        for missing_layer_name in get_pp_missing_layer_names(model)
+    )
+
+
+# cannot use msgspec.Struct here because Dynamo does not support it
+@dataclass
+class IntermediateTensors:
+    """For all pipeline stages except the last, we need to return the hidden
+    states and residuals to be sent to the next stage. This data structure
+    contains the hidden states and residuals for a request.
+    """
+
+    tensors: dict[str, torch.Tensor]
+
+    def __init__(self, tensors):
+        # manually define this function, so that
+        # Dynamo knows `IntermediateTensors()` comes from this file.
+        # Otherwise, dataclass will generate this function by evaluating
+        # a string, and we will lose the information about the source file.
+        self.tensors = tensors
+
+    def __getitem__(self, key: str | slice):
+        if isinstance(key, str):
+            return self.tensors[key]
+        elif isinstance(key, slice):
+            return self.__class__({k: v[key] for k, v in self.tensors.items()})
+
+    def __setitem__(self, key: str, value: torch.Tensor):
+        self.tensors[key] = value
+
+    def items(self):
+        return self.tensors.items()
+
+    def __len__(self):
+        return len(self.tensors)
+
+    def __eq__(self, other: object):
+        return isinstance(other, self.__class__) and self
+
+    def __repr__(self) -> str:
+        return f"IntermediateTensors(tensors={self.tensors})"
+
+
+def make_empty_intermediate_tensors_factory(keys: list[str], hidden_size: int):
+    def make_empty_intermediate_tensors(
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        return IntermediateTensors(
+            {
+                key: torch.zeros((batch_size, hidden_size), dtype=dtype, device=device)
+                for key in keys
+            }
+        )
+
+    return make_empty_intermediate_tensors
+
+
+def maybe_prefix(prefix: str, name: str) -> str:
+    """Add a prefix to a name if the prefix is non-empty.
+
+    Args:
+        prefix: The prefix to add. If empty, no prefix will be added.
+        name: The name to potentially prefix.
+
+    Returns:
+        The string "prefix.name" if prefix was non-empty, otherwise just "name".
+    """
+    return name if not prefix else f"{prefix}.{name}"
+
+
+def mask_pos0_inputs_embeds(
+    inputs_embeds: torch.Tensor, positions: torch.Tensor
+) -> torch.Tensor:
+    """Zero an MTP draft's token embedding on the rows at sequence position 0.
+
+    vLLM-plugin-only behaviour, carried over verbatim from the per-layer
+    ``forward`` wrapper it replaces (see the plugin's
+    ``ATOMModelBase._enable_mtp_input_masking_for_vllm``). MTP predictors apply
+    it only when the plugin turns the flag on, so ATOM's native runner is
+    unaffected.
+    """
+    return torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)
+
+
+def ckpt_has_tensor_suffix(model_path: str, suffix: str) -> bool:
+    """Return True if the checkpoint at ``model_path`` contains a tensor whose
+    key ends with ``suffix``.
+
+    Used by MTP modules to decide whether the entry projection (eh_proj/fc) is
+    actually quantized on disk: when the HF quantization_config's exclude list
+    is incomplete, falling back to the global quant spec creates an
+    uninitialized weight_scale that silently corrupts inference. Checking the
+    safetensors index for a sibling ``*.weight_scale`` is the only reliable
+    signal.
+    """
+    import glob
+    import json
+    import os
+
+    # A hub id has a directory; it is in the hub cache, not at the id. Probing
+    # the id itself answers "no suffix" for every remote checkpoint, and this
+    # answer picks parameter dtypes.
+    model_path = local_model_dir(model_path)
+    if not model_path or not os.path.isdir(model_path):
+        logger.warning(
+            "ckpt_has_tensor_suffix: model_path %r is not a directory; "
+            "assuming suffix %r is absent",
+            model_path,
+            suffix,
+        )
+        return False
+
+    index_files = glob.glob(os.path.join(model_path, "*.safetensors.index.json"))
+    if index_files:
+        try:
+            with open(index_files[0]) as f:
+                weight_map = json.load(f)["weight_map"]
+        except (OSError, json.JSONDecodeError, KeyError) as e:
+            logger.warning(
+                "ckpt_has_tensor_suffix: failed to read %s (%s); "
+                "assuming suffix %r is absent",
+                index_files[0],
+                e,
+                suffix,
+            )
+            return False
+        return any(k.endswith(suffix) for k in weight_map)
+
+    safetensors_files = glob.glob(os.path.join(model_path, "*.safetensors"))
+    if safetensors_files:
+        try:
+            from safetensors import safe_open
+
+            with safe_open(safetensors_files[0], framework="pt") as sf:
+                return any(k.endswith(suffix) for k in sf.keys())  # noqa: SIM118
+        except Exception as e:  # noqa: BLE001 -- a probe: unreadable means "no"
+            logger.warning(
+                "ckpt_has_tensor_suffix: failed to read %s (%s); "
+                "assuming suffix %r is absent",
+                safetensors_files[0],
+                e,
+                suffix,
+            )
+            return False
+
+    return False
+
+
+def ckpt_shared_expert_count(model_path: str | None) -> int:
+    """Return the number of shared experts present in the local checkpoint.
+
+    0 means no `shared_expert` weights were found. 1 covers the flat-block
+    layout used by every MTP checkpoint shipped today (a single shared block
+    written without a numeric index, e.g. `...mlp.shared_experts.gate_proj`).
+    A value >1 is parsed from indexed keys (e.g. `shared_experts.0.`,
+    `shared_experts.1.`) and emits a warning, since no released model uses
+    that layout — the path exists to surface a mismatch instead of silently
+    loading the wrong count.
+
+    Used by SpeculativeConfig to synthesize n_shared_experts when the HF
+    config doesn't carry it. Non-local paths or unreadable indexes return 0
+    (leaving the field unset, safer than fabricating one).
+    """
+    import glob
+    import json
+    import os
+    import re
+
+    # Same reason as `ckpt_has_tensor_suffix`: a hub id is not where its files
+    # are, and answering 0 for every remote checkpoint leaves the field unset
+    # on exactly the checkpoints that carry it.
+    model_path = local_model_dir(model_path)
+    if not model_path or not os.path.isdir(model_path):
+        return 0
+
+    keys: list[str] | None = None
+    index_files = glob.glob(os.path.join(model_path, "*.safetensors.index.json"))
+    if index_files:
+        try:
+            with open(index_files[0]) as f:
+                keys = list(json.load(f)["weight_map"].keys())
+        except (OSError, json.JSONDecodeError, KeyError):
+            return 0
+    else:
+        safetensors_files = glob.glob(os.path.join(model_path, "*.safetensors"))
+        if safetensors_files:
+            try:
+                from safetensors import safe_open
+
+                with safe_open(safetensors_files[0], framework="pt") as sf:
+                    keys = list(sf.keys())
+            except Exception:  # noqa: BLE001 -- a probe: unreadable means "no"
+                return 0
+
+    if not keys:
+        return 0
+
+    shared_keys = [k for k in keys if "shared_expert" in k]
+    if not shared_keys:
+        return 0
+
+    indexed = re.compile(r"shared_experts?\.(\d+)\.")
+    max_idx = -1
+    for k in shared_keys:
+        m = indexed.search(k)
+        if m:
+            max_idx = max(max_idx, int(m.group(1)))
+    if max_idx >= 0:
+        count = max_idx + 1
+        logger.warning(
+            "Checkpoint at %r carries indexed shared_experts (parsed "
+            "n_shared_experts=%d). This layout is unprecedented in shipped "
+            "models; verify against the model definition before trusting it.",
+            model_path,
+            count,
+        )
+        return count
+    return 1
+
+
+def cast_overflow_tensors(
+    tensors: torch.Tensor,
+    offset: float = 1000,
+) -> torch.Tensor:
+    if tensors.isinf().any() or tensors.isnan().any():
+        clamp_value = torch.finfo(tensors.dtype).max - offset
+        tensors = torch.clamp(tensors, min=-clamp_value, max=clamp_value)
+    return tensors
+
+
+def fast_topk(values, topk, dim):
+    if topk == 1:
+        # Use max along the specified dimension to get both value and index
+        return torch.max(values, dim=dim, keepdim=True)
+    else:
+        # Use topk for efficiency with larger k values
+        return torch.topk(values, topk, dim=dim)
+
+
+def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
+    """
+    Extract the layer index from the module name.
+    Examples:
+    - "encoder.layers.0" -> 0
+    - "encoder.layers.1.self_attn" -> 1
+    - "2.self_attn" -> 2
+    - "model.encoder.layers.0.sub.1" -> ValueError if num_attn_module == 1
+    """
+    subnames = layer_name.split(".")
+    int_vals: list[int] = []
+    for subname in subnames:
+        try:
+            int_vals.append(int(subname))
+        except ValueError:
+            continue
+    if num_attn_module == 1 or "attn" not in layer_name:
+        assert (
+            len(int_vals) == 1
+        ), f"layer name {layer_name} should only contain one integer"
+
+        return int_vals[0]
+    else:
+        assert (
+            len(int_vals) <= 2
+        ), f"layer name {layer_name} should contain at most two integers"
+        layer_index = (
+            int_vals[0] * num_attn_module + int_vals[1]
+            if len(int_vals) == 2
+            else int_vals[0]
+        )
+        return layer_index
+
+
+@contextmanager
+def collect_children(
+    module: nn.Module,
+    *,
+    targets: type[nn.Module] | tuple[type[nn.Module], ...] | None = None,
+):
+    """
+    Within this context, collect all direct child assignments to `module`,
+    returning a list of children names that is internally updated until the
+    context is exited.
+
+    If `targets` is set, instead collect descendents of `module`
+    that are an instance of `targets`, even if they aren't direct children.
+    """
+    children_names = list[str]()
+
+    if targets is None:
+
+        def hook(module_: nn.Module, name: str, submodule: nn.Module):
+            if module_ is module:
+                children_names.append(name)
+
+        with register_module_module_registration_hook(hook):
+            yield children_names
+    else:
+        yield children_names
+
+        for name, module_ in module.named_modules():
+            if isinstance(module_, targets):
+                children_names.append(name)
+
+
+@contextmanager
+def no_init_weights(
+    module: nn.Module,
+    placeholder: Callable[[nn.Module], nn.Module],
+    *,
+    targets: type[nn.Module] | tuple[type[nn.Module], ...] | None = None,
+):
+    """
+    Within this context, prevent weight initialization from using device memory and
+    replace direct child assignments to `module` with the result of `placeholder()`.
+
+    If `targets` is set, instead prevent weight initialization and
+    replace assignments where the child is an instance of `targets`,
+    even if they aren't direct children of `module`.
+    """
+    if targets is None:
+
+        def hook(module_: nn.Module, name: str, submodule: nn.Module):
+            if module_ is module:
+                return placeholder(submodule)
+
+            return submodule
+
+        with register_module_module_registration_hook(hook), torch.device("meta"):
+            yield
+    else:
+
+        def hook(module_: nn.Module, name: str, submodule: nn.Module):
+            if isinstance(module_, targets):
+                submodule.to("meta")  # Free memory
+            if isinstance(submodule, targets):
+                submodule.to("meta")  # Free memory
+                return placeholder(submodule)
+
+            return submodule
+
+        # Not all descendents are targeted, so we can't use a blanket
+        # `torch.device("meta")` context
+        with register_module_module_registration_hook(hook):
+            yield
+
+
+@overload
+def common_prefix(items: Sequence[str]) -> str: ...
+
+
+@overload
+def common_prefix(items: Sequence[Sequence[T]]) -> Sequence[T]: ...
+
+
+def common_prefix(items: Sequence[Sequence[T] | str]) -> Sequence[T] | str:
+    """Find the longest prefix common to all items."""
+    if len(items) == 0:
+        return []
+    if len(items) == 1:
+        return items[0]
+
+    shortest = min(items, key=len)
+    if not shortest:
+        return shortest[:0]
+
+    for match_len in range(1, len(shortest) + 1):
+        match = shortest[:match_len]
+        for item in items:
+            if item[:match_len] != match:
+                return shortest[: match_len - 1]
+
+    return shortest

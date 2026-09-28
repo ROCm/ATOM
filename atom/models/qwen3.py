@@ -1,0 +1,371 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+# Adapted from
+# https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen3.py
+# Copyright 2024 The Qwen team.
+# Copyright 2023 The vLLM team.
+# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
+#
+# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
+# and OPT implementations in this library. It has been modified from its
+# original forms to accommodate minor architectural differences compared
+# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from typing import Any, Iterable, Union
+
+import torch
+
+# import torch.distributed as dist
+from aiter.dist.parallel_state import get_tp_group
+from aiter.rotary_embedding import get_rope
+from torch import nn
+from transformers import Qwen3Config
+
+from atom.config import Config
+from atom.model_loader.loader import load_model_in_plugin_mode
+from atom.model_ops.activation import SiluAndMul
+
+# from atom.model_ops.attention import Attention
+from atom.model_ops.base_attention import Attention
+from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.layernorm import RMSNorm
+from atom.model_ops.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
+from atom.models.utils import maybe_prefix
+from atom.utils import envs
+from atom.utils.decorators import support_torch_compile
+
+ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
+    envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
+)
+
+
+class Qwen3Attention(nn.Module):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        max_position: int = 4096 * 32,
+        head_dim: int | None = None,
+        rms_norm_eps: float = 1e-06,
+        qkv_bias: bool = False,
+        rope_theta: float = 10000,
+        rope_scaling: tuple | None = None,
+        kv_cache_dtype: str = "fp16",
+        layer_num: int = 0,
+        atom_config: Config = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        tp_size = get_tp_group().world_size
+        self.total_num_heads = num_heads
+        assert self.total_num_heads % tp_size == 0
+        self.num_heads = self.total_num_heads // tp_size
+        self.total_num_kv_heads = num_kv_heads
+        assert self.total_num_kv_heads % tp_size == 0
+        self.num_kv_heads = self.total_num_kv_heads // tp_size
+        self.head_dim = head_dim or hidden_size // self.total_num_heads
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.scaling = self.head_dim**-0.5
+
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=qkv_bias,
+            quant_config=atom_config.quant_config,
+            prefix=f"{prefix}.qkv_proj",
+        )
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            hidden_size,
+            bias=False,
+            quant_config=atom_config.quant_config,
+            prefix=f"{prefix}.o_proj",
+        )
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=max_position,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
+        )
+        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+            cos, sin = self.rotary_emb.cos_cache, self.rotary_emb.sin_cache
+            joint_cache = torch.cat((cos, sin), dim=-1)
+            self.rotary_emb.register_buffer(
+                "cos_sin_cache",
+                joint_cache.view(joint_cache.size(0), self.head_dim),
+                persistent=False,
+            )
+
+        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+
+        self.attn = Attention(
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            scale=self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            kv_cache_dtype=kv_cache_dtype,
+            layer_num=layer_num,
+            use_mla=False,
+            rotary_emb=self.rotary_emb,
+            config=atom_config,
+            prefix=f"{prefix}.attn",
+            q_norm=self.q_norm if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION else None,
+            k_norm=self.k_norm if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION else None,
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        **model_kwargs: dict[str, Any] | None,
+    ) -> torch.Tensor:
+        qkv = self.qkv_proj(hidden_states)
+        q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+            o = self.attn(
+                query=q,
+                key=k,
+                value=v,
+                positions=positions,
+                q_scale=None,
+                qkv=qkv,
+            )
+        else:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+            o = self.attn(q, k, v, positions, **model_kwargs)
+        output = self.o_proj(o)
+        return output
+
+
+class Qwen3MLP(nn.Module):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        quant_config=None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
+        )
+        assert hidden_act == "silu"
+        self.act_fn = SiluAndMul()
+
+    def forward(self, x):
+        gate_up = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x = self.down_proj(x)
+        return x
+
+
+class Qwen3DecoderLayer(nn.Module):
+
+    def __init__(
+        self,
+        config: Qwen3Config,
+        atom_config: Config,
+        layer_num: int = 0,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        kv_cache_dtype = atom_config.kv_cache_dtype
+        self.layer_num = layer_num
+        rope_params = config.rope_parameters
+        self.self_attn = Qwen3Attention(
+            hidden_size=config.hidden_size,
+            num_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
+            max_position=config.max_position_embeddings,
+            rms_norm_eps=config.rms_norm_eps,
+            qkv_bias=getattr(config, "attention_bias", False),
+            head_dim=getattr(config, "head_dim", None),
+            rope_theta=rope_params["rope_theta"],
+            rope_scaling=rope_params,
+            kv_cache_dtype=kv_cache_dtype,
+            layer_num=layer_num,
+            atom_config=atom_config,
+            prefix=f"{prefix}.self_attn",
+        )
+        self.mlp = Qwen3MLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            hidden_act=config.hidden_act,
+            quant_config=atom_config.quant_config,
+            prefix=f"{prefix}.mlp",
+        )
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        **model_kwargs: dict[str, Any] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.self_attn(
+            positions=positions, hidden_states=hidden_states, **model_kwargs
+        )
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+    }
+)
+class Qwen3Model(nn.Module):
+
+    def __init__(self, *, atom_config: Config, prefix: str = "") -> None:
+        super().__init__()
+        hf_config = atom_config.hf_config
+
+        self.embed_tokens = VocabParallelEmbedding(
+            hf_config.vocab_size, hf_config.hidden_size
+        )
+        self.layers = nn.ModuleList(
+            [
+                Qwen3DecoderLayer(
+                    config=hf_config,
+                    atom_config=atom_config,
+                    layer_num=layer_num,
+                    prefix=f"{prefix}.layers.{layer_num}",
+                )
+                for layer_num in range(hf_config.num_hidden_layers)
+            ]
+        )
+        self.norm = RMSNorm(hf_config.hidden_size, eps=hf_config.rms_norm_eps)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        **model_kwargs: dict[str, Any],
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, dict[int, torch.Tensor]]]:
+        capture_layer_ids = model_kwargs.pop("capture_hidden_state_layers", None)
+
+        hidden_states = self.embed_tokens(input_ids)
+        residual = None
+        captured: dict[int, torch.Tensor] = {}
+        for i, layer in enumerate(self.layers):
+            hidden_states, residual = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+                **model_kwargs,
+            )
+            if capture_layer_ids is not None and i in capture_layer_ids:
+                captured[i] = (hidden_states + residual).detach()
+
+        hidden_states, _ = self.norm(hidden_states, residual)
+        if captured:
+            return hidden_states, captured
+        return hidden_states
+
+
+class Qwen3ForCausalLM(nn.Module):
+    packed_modules_mapping = {
+        "q_proj": ("qkv_proj", "q"),
+        "k_proj": ("qkv_proj", "k"),
+        "v_proj": ("qkv_proj", "v"),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
+
+    def __init__(self, config: Any, prefix: str = "") -> None:
+        super().__init__()
+        self.atom_config = config
+        self.hf_config = self.atom_config.hf_config
+        self.model = Qwen3Model(
+            atom_config=self.atom_config, prefix=maybe_prefix(prefix, "model")
+        )
+
+        self.lm_head = ParallelLMHead(
+            num_embeddings=self.hf_config.vocab_size,
+            embedding_dim=self.hf_config.hidden_size,
+            bias=False,
+            prefix=maybe_prefix(prefix, "lm_head"),
+        )
+        if self.hf_config.tie_word_embeddings:
+            self.lm_head.weight.data = self.model.embed_tokens.weight.data
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors=None,
+        inputs_embeds: torch.Tensor | None = None,
+        **model_kwargs: dict[str, Any],
+    ) -> torch.Tensor:
+        hidden_states = self.model(
+            input_ids=input_ids, positions=positions, **model_kwargs
+        )
+        return hidden_states
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        logits = self.lm_head(hidden_states)
+        return logits
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # load weights in plugin mode and discard passed weights generator
+        # here prefix is "model." because Qwen3ForCausalLM is constructed in model
+        # wrapper class, so the name of loaded weights are prefixed with "model.".
+        # The vLLM will check the name of the loaded weights to make sure all the
+        # weights are loaded correctly
+        loaded_weights_record = load_model_in_plugin_mode(
+            model=self, config=self.atom_config, prefix="model."
+        )
+        return loaded_weights_record

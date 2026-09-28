@@ -1,0 +1,935 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+import importlib.util
+import itertools
+import logging
+import time
+from collections import Counter
+from dataclasses import fields
+from typing import Any
+
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
+
+from atom.config import Config
+from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
+from atom.model_engine.sequence import Sequence
+from atom.multimodal.registry import get_mrope_input_positions
+from atom.sampling_params import SamplingParams
+from atom.utils import envs
+
+logger = logging.getLogger("atom")
+
+
+def _load_tokenizer(model: str, trust_remote_code: bool = False):
+    tokenizer = AutoTokenizer.from_pretrained(
+        model, use_fast=True, trust_remote_code=trust_remote_code
+    )
+    probe = "Hello world 你好"
+    if tokenizer.decode(tokenizer.encode(probe), skip_special_tokens=True) != probe:
+        logger.warning(
+            "AutoTokenizer round-trip failed, falling back to PreTrainedTokenizerFast"
+        )
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(model)
+    return tokenizer
+
+
+class LLMEngine:
+
+    def __init__(self, model, tokenizer=None, **kwargs):
+        config_fields = {field.name for field in fields(Config)}
+        config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
+        data_parallel_size = kwargs.get("data_parallel_size", 1)
+        data_parallel_master_port = kwargs.get("data_parallel_master_port", None)
+        config = Config(model, **config_kwargs)
+        self.config = config
+        self.tokenizer = tokenizer or _load_tokenizer(
+            config.model, config.trust_remote_code
+        )
+        config.bos_token_id = self.tokenizer.bos_token_id
+        config.eos_token_id = self.tokenizer.eos_token_id
+        stop_token_ids = set(config.stop_token_ids)
+        # separate eos_token_id from stop_token_ids
+        stop_token_ids.discard(config.eos_token_id)
+        config.stop_token_ids = list(stop_token_ids)
+        # Legacy path only: callers that pass DP topology as loose kwargs
+        # instead of a ParallelConfig. When a parallel_config was supplied it
+        # is already authoritative, and overwriting it here would reset a
+        # multi-node topology back to a single local rank.
+        if "parallel_config" not in config_kwargs:
+            config.parallel_config.data_parallel_size = data_parallel_size
+            if data_parallel_master_port is not None:
+                config.parallel_config.data_parallel_master_port = (
+                    data_parallel_master_port
+                )
+        self.data_parallel_size = config.parallel_config.data_parallel_size
+        # TBO's two concurrent ubatches are supported by the mori EP
+        # dispatch/combine path. The EP collective fallback instead issues
+        # full DP all-gather/reduce-scatter operations from both ubatch streams;
+        # those streams can enter the collectives in opposite order and hang.
+        # Keep the fallback usable by serializing it until it has dedicated
+        # per-ubatch communicators, analogous to the PCP/TP guard below.
+        mori_ep_enabled = (
+            getattr(config, "moe_all2all_backend", "auto") in {"auto", "mori"}
+            and not envs.ATOM_DISABLE_MORI_EP
+            and importlib.util.find_spec("mori") is not None
+        )
+        if (
+            config.enable_dp_attention
+            and config.enable_expert_parallel
+            and config.enable_tbo
+            and not mori_ep_enabled
+        ):
+            logger.warning(
+                "Disabling TBO for the DP-attention + EP collective fallback: "
+                "concurrent all-gather/reduce-scatter ubatches can deadlock. "
+                "Use mori EP or run the fallback without --enable-tbo."
+            )
+            config.enable_tbo = False
+            config.enable_tbo_decode = False
+        # PCP and DP-attention are not yet compatible: PCP stripe-splits
+        # input_ids to 1/pcp_size in ForCausalLM.forward, but DP-attention's
+        # `_gather_ids_for_dp` all-gathers using dp_metadata sizes computed on
+        # the FULL (un-split) token count, so all_gatherv asserts
+        # `1/pcp_size != full`.
+        if config.enable_dp_attention and config.pipeline_parallel_size > 1:
+            raise ValueError(
+                "--enable-dp-attention and pipeline-parallel (pp>1) "
+                "cannot be used together."
+            )
+        if config.prefill_context_parallel_size > 1 and config.enable_dp_attention:
+            raise ValueError(
+                "prefill_context_parallel_size > 1 (-pcp) combined with "
+                "--enable-dp-attention is not supported yet (may be supported "
+                "in a future release): PCP splits tokens to 1/pcp_size while "
+                "DP-attention's id-gather expects the full token count, "
+                "causing an all_gatherv size mismatch. For now, disable one of "
+                "them (use -tp N -pcp M without DP-attention, or -dp N "
+                "--enable-dp-attention without -pcp)."
+            )
+        # PCP + TBO prefill: supported via coordinated splitting.
+        # PCP + TBO decode: not yet supported (pcp_all_reduce semantics under
+        # per-request ubatch split are unverified).
+        if config.prefill_context_parallel_size > 1 and config.enable_tbo:
+            # TBO overlaps compute with the attn<->MoE PCP collectives, which
+            # only exist in MoE merge mode (ATOM_PCP_MOE_MERGE=1). With
+            # ATOM_PCP_MOE_MERGE=0, MoE runs on each rank's 1/W token shard
+            # with NO extra comm between attn and MoE, so TBO has nothing
+            # to overlap and only adds ubatch-splitting overhead. Force it off.
+            if not envs.ATOM_PCP_MOE_MERGE:
+                logger.warning(
+                    "Disabling TBO because ATOM_PCP_MOE_MERGE=0: in this "
+                    "situation it runs MoE on each rank's 1/W token shard with "
+                    "no extra attn<->MoE communication, so TBO has nothing to "
+                    "overlap and only adds overhead."
+                )
+                config.enable_tbo = False
+                config.enable_tbo_decode = False
+            elif config.tensor_parallel_size > 1:
+                # Cross-communicator (PCP x TP) RCCL deadlock:
+                # under TBO the PCP collectives (comm_stream) run concurrently
+                # and UNORDERED with the TP-group all_reduces (compute_stream,
+                # from attention wo_b / MoE RowParallelLinear). On the TPxPCP
+                # rank grid with large collectives this forms a cross-rank
+                # circular wait -> hang (reproduced MI355 TP4PCP2/TP2PCP4 merge
+                # +TBO, 64k/c32). Serialized (non-TBO single stream) is fine, and
+                # TP=1 has no TP communicator so it cannot form the cycle. Only
+                # TP=1 + PCP keeps TBO; TP>1 falls back to non-TBO.
+                logger.warning(
+                    "Disabling TBO: prefill_context_parallel_size > 1 (-pcp) "
+                    "with tensor_parallel_size > 1 (-tp) hangs under TBO due to "
+                    "a PCP<->TP cross-communicator RCCL deadlock (concurrent "
+                    "unordered collectives on comm/compute streams; see "
+                    "PCP_TBO.md 14.4). TBO with PCP is only supported at -tp 1 "
+                    "(e.g. -tp 1 -pcp 8)."
+                )
+                config.enable_tbo = False
+                config.enable_tbo_decode = False
+            elif config.enable_tbo_decode:
+                raise ValueError(
+                    "prefill_context_parallel_size > 1 (-pcp) combined with "
+                    "--enable-tbo all (decode TBO) is not supported yet. "
+                    "Use --enable-tbo (prefill only) with -pcp."
+                )
+            # Under PCP, TBO prefill uses a request-boundary split (the
+            # non-default TBO split mode; never token-midpoint split), so
+            # ATOM_TBO_PREFILL_TOKEN_SPLIT is ignored.
+            if config.enable_tbo and envs.ATOM_TBO_PREFILL_TOKEN_SPLIT:
+                logger.warning(
+                    "ATOM_TBO_PREFILL_TOKEN_SPLIT is ignored under PCP: TBO "
+                    "prefill uses request-boundary balanced grouping."
+                )
+        self.io_processor = InputOutputProcessor(
+            config, self.tokenizer, config.kv_cache_block_size
+        )
+        if config.enable_rapidserve:
+            self.core_mgr = DisaggCoreManager(config)
+        else:
+            self.core_mgr = CoreManager(config)
+        self._step_lock = None
+        self._pending_results = {}
+        import json
+
+        kv_config_str = kwargs.get("kv_transfer_config", "{}")
+        try:
+            config.kv_transfer_config = json.loads(kv_config_str)
+            logger.info(f"KV transfer config loaded: {config.kv_transfer_config}")
+        except json.JSONDecodeError:
+            config.kv_transfer_config = {}
+        logger.info(
+            f"LLMEngine init with {self.data_parallel_size} data parallel ranks"
+        )
+        logger.info(
+            f"LLMEngine init with {self.data_parallel_size} data parallel ranks"
+        )
+
+    def close(self):
+        """Shut down engine and release all GPU resources."""
+        if hasattr(self, "core_mgr"):
+            self.core_mgr.close()
+
+    def add_request(
+        self,
+        prompt_or_tokens_list: list[str | list[int]],
+        sampling_params_list: SamplingParams | list[SamplingParams],
+        stream_callback=None,
+        multimodal_data_list: list[dict] | None = None,
+        request_ids: list[str] | None = None,
+    ):
+        """Submit one batch of prompts.
+
+        ``SamplingParams.n > 1`` fans out: a prompt becomes ``n`` sibling
+        sequences, and the batch handed to the scheduler is prompt-major --
+        prompt 0's siblings in order, then prompt 1's. Sequence ids are assigned
+        in that same order, which is what makes :meth:`generate`'s flat list
+        line up with a prompt list expanded by ``n``. It is one request per
+        sibling from here on; nothing downstream reassembles them.
+
+        This used to reach ``io_processor.preprocess``, which returns a single
+        sequence and refuses ``n > 1`` outright, so offline ``n > 1`` raised
+        before a token was generated. That guard is still there and still right
+        for a caller that expects one sequence back -- the two entry points
+        differ in whether the caller is prepared for siblings, not in what they
+        support.
+        """
+        # if sampling params is not list, use it for all prompts
+        if not isinstance(sampling_params_list, list):
+            sampling_params_iter = itertools.repeat(sampling_params_list)
+        else:
+            # otherwise check num elements first
+            if len(prompt_or_tokens_list) != len(sampling_params_list):
+                raise ValueError(
+                    f"number of elements in prompt_or_tokens_list and sampling_params_list is different: "
+                    f"{len(prompt_or_tokens_list)=} vs {len(sampling_params_list)=}"
+                )
+            sampling_params_iter = sampling_params_list
+
+        # Handle stream_callback
+        if stream_callback is not None and not isinstance(stream_callback, list):
+            stream_callback_iter = itertools.repeat(stream_callback)
+        elif isinstance(stream_callback, list):
+            if len(stream_callback) != len(prompt_or_tokens_list):
+                raise ValueError(
+                    f"number of elements in prompt_or_tokens_list and stream_callback is different: "
+                    f"{len(prompt_or_tokens_list)=} vs {len(stream_callback)=}"
+                )
+            stream_callback_iter = stream_callback
+        else:
+            stream_callback_iter = itertools.repeat(None)
+
+        # Handle multimodal data
+        if multimodal_data_list is not None:
+            if len(prompt_or_tokens_list) != len(multimodal_data_list):
+                raise ValueError(
+                    f"number of elements in prompt_or_tokens_list and multimodal_data_list is different: "
+                    f"{len(prompt_or_tokens_list)=} vs {len(multimodal_data_list)=}"
+                )
+            mm_data_iter = multimodal_data_list
+        else:
+            mm_data_iter = itertools.repeat(None)
+
+        # Handle request_ids
+        if request_ids is not None:
+            if len(request_ids) != len(prompt_or_tokens_list):
+                raise ValueError(
+                    "number of elements in prompt_or_tokens_list and request_ids is different: "
+                    f"{len(prompt_or_tokens_list)=} vs {len(request_ids)=}"
+                )
+            request_id_iter = iter(request_ids)
+        else:
+            request_id_iter = itertools.repeat(None)
+
+        reqs = []
+        for prompt, sampling_param, callback, mm_data, request_id in zip(
+            prompt_or_tokens_list,
+            sampling_params_iter,
+            stream_callback_iter,
+            mm_data_iter,
+            request_id_iter,
+        ):
+            fanout = self.io_processor.preprocess_fanout(
+                prompt,
+                sampling_param,
+                stream_callback=callback,
+                multimodal_data=mm_data,
+                parent_request_id=request_id,
+            )
+            reqs.extend(fanout)
+        self.core_mgr.add_request(reqs)
+
+    def step(self) -> list[Sequence]:
+        seqs = self.core_mgr.get_output()
+        return seqs
+
+    def is_finished(self):
+        return not self.io_processor.has_pending_requests()
+
+    def generate(
+        self,
+        prompts: list[str],
+        sampling_params: SamplingParams | list[SamplingParams],
+        request_ids: list[str] | None = None,
+    ) -> list[str]:
+        """Complete every prompt and return the outputs as ONE flat list.
+
+        Not one entry per prompt: ``SamplingParams.n`` of them, prompt-major
+        (see :meth:`add_request`), because the sort below is over sequence ids
+        and those are assigned in fan-out order. A caller pairing prompts with
+        outputs has to expand its own list by ``n`` to do it -- with ``n = 1``,
+        the usual case, that is the identity and the list is 1:1 as before.
+        """
+        # Reset DP routing state (round-robin cursor + in-flight load) so a
+        # fresh batch gets deterministic DP assignment and no leaked counts.
+        self.core_mgr.reset_dp_router()
+
+        self.add_request(prompts, sampling_params, request_ids=request_ids)
+        outputs = {}
+        while not self.is_finished() and (
+            self.core_mgr.is_alive() or self.core_mgr.is_rest()
+        ):
+            seqs = self.step()
+            outs = self.io_processor.postprocess(seqs)
+            outputs.update(outs)
+
+        outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
+        return outputs
+
+    def generate_multimodal(
+        self,
+        token_ids_list: list[list[int]],
+        sampling_params: SamplingParams | list[SamplingParams],
+        multimodal_data_list: list[dict],
+    ) -> list[dict]:
+        """Generate completions for multimodal inputs (token IDs + vision data)."""
+        self.core_mgr.reset_dp_router()
+        self.add_request(
+            token_ids_list,
+            sampling_params,
+            multimodal_data_list=multimodal_data_list,
+        )
+        outputs = {}
+        while not self.is_finished() and (
+            self.core_mgr.is_alive() or self.core_mgr.is_rest()
+        ):
+            seqs = self.step()
+            outs = self.io_processor.postprocess(seqs)
+            outputs.update(outs)
+
+        outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
+        return outputs
+
+    def start_profile(self):
+        self.core_mgr.broadcast_utility_command_sync("start_profile")
+        logger.info("Profiling started")
+
+    def stop_profile(self) -> list[dict[str, Any]]:
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            "stop_profile", timeout=envs.ATOM_PROFILER_TIMEOUT
+        )
+        return [resp.get("result", {}) for resp in responses]
+
+    def print_mtp_statistics(self):
+        self.core_mgr.send_utility_command("get_mtp_stats")
+
+    def get_mtp_statistics(self, timeout: float = 30.0) -> dict[str, Any]:
+        """Return aggregated speculative decoding statistics across DP ranks."""
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            "get_mtp_statistics", timeout=timeout
+        )
+        rank_stats = [
+            resp.get("result", resp)
+            for resp in responses
+            if resp.get("result", resp).get("enabled", False)
+        ]
+
+        distribution: Counter[int] = Counter()
+        for stats in rank_stats:
+            distribution.update(
+                {
+                    int(accepted): int(steps)
+                    for accepted, steps in stats.get("distribution", {}).items()
+                }
+            )
+
+        total_draft_tokens = sum(
+            int(stats.get("total_draft_tokens", 0)) for stats in rank_stats
+        )
+        total_accepted_tokens = sum(
+            int(stats.get("total_accepted_tokens", 0)) for stats in rank_stats
+        )
+        total_steps = sum(distribution.values())
+
+        return {
+            "enabled": bool(rank_stats),
+            "total_draft_tokens": total_draft_tokens,
+            "total_accepted_tokens": total_accepted_tokens,
+            "acceptance_rate": (
+                total_accepted_tokens / total_draft_tokens
+                if total_draft_tokens
+                else 0.0
+            ),
+            "average_tokens_per_forward": (
+                1 + total_accepted_tokens / total_steps if total_steps else 0.0
+            ),
+            "distribution": dict(sorted(distribution.items())),
+            "distribution_percent": {
+                k: v / total_steps if total_steps else 0.0
+                for k, v in sorted(distribution.items())
+            },
+        }
+
+    def get_cache_statistics(self, timeout: float = 30.0) -> dict[str, Any]:
+        """Return aggregated prefix-cache statistics across DP ranks.
+
+        The rates are the ones `[Cache Stats]` and `[Cache Pools]` log,
+        recomputed from summed counters rather than averaged: ranks admit
+        different numbers of tokens, so the mean of their rates is not the rate
+        of their union.
+
+        `cached <= wanted <= compressed <= reusable <= full` by construction,
+        which is what makes the differences below meaningful:
+          hit                 reuse actually admitted
+          compressed_hit      reuse the prefix index held, before the
+                              per-request state classes had their say
+          lost_to_checkpoint  declined only because no checkpoint existed at
+                              that boundary — what a denser ladder recovers
+          lost_unrecoverable  declined for a reason no checkpoint touches
+
+        `paged_hit` and `state_hit` split that into one number per pool, so a
+        caller can tell which to fix; `hit` alone cannot, since the same value
+        arises from a KV pool that lost the prefix and from a state cache that
+        refused to resume from it. They multiply back to `hit` exactly.
+        """
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            "get_cache_statistics", timeout=timeout
+        )
+        rank_stats = [
+            resp.get("result", resp)
+            for resp in responses
+            if resp.get("result", resp).get("enabled", False)
+        ]
+        totals = {
+            key: sum(int(stats.get(key, 0)) for stats in rank_stats)
+            for key in (
+                "requests",
+                "cached_tokens",
+                "compressed_tokens",
+                "wanted_tokens",
+                "reusable_tokens",
+                "full_tokens",
+                # Reuse served from the CPU offload tier. Every rank reports it
+                # in `cache_statistics()`, but it was missing from this sum, so
+                # the DP-aggregated snapshot dropped the one counter the offload
+                # feature exists to move. Shares the `reusable` denominator with
+                # the HBM series but no numerator -- scored separately below.
+                "offload_tokens",
+                "checkpoints_kept",
+                "checkpoints_dropped",
+                "checkpoints_evicted",
+                # Says the *paged* pool is too small, where `evicted` says the
+                # state pool is -- opposite fixes, so it cannot be folded in.
+                "checkpoints_orphaned",
+                "demands_recorded",
+                "demands_declined_no_room",
+                "chunks_cut_for_demand",
+                # Both cut counters or neither: their ratio is what separates a
+                # placement that converges from one that pays per request, and
+                # one of them missing makes the other unreadable.
+                "chunks_cut_for_end",
+                # Whether the joint state+KV load found a boundary to work
+                # with, and what the state leg cost when it did. Summed like
+                # the rest: a boundary is per admission and every rank admits
+                # the same request.
+                "joint_boundaries",
+                "state_hbm",
+                "state_tier",
+            )
+        }
+        # `reusable`, not `full`: a request's trailing block is never a reuse
+        # candidate (prefill must forward one block for logits), so `full`
+        # charges both pools for tokens neither was offered and caps every
+        # rate below 100%. See `EngineStats.total_reusable_tokens`.
+        reusable = totals["reusable_tokens"]
+
+        def rate(num: int, den: int = reusable) -> float:
+            return num / den if den else 0.0
+
+        compressed = totals["compressed_tokens"]
+        return {
+            "enabled": bool(rank_stats),
+            **totals,
+            "hit": rate(totals["cached_tokens"]),
+            "compressed_hit": rate(compressed),
+            "lost_to_checkpoint": rate(
+                totals["wanted_tokens"] - totals["cached_tokens"]
+            ),
+            "lost_unrecoverable": rate(compressed - totals["wanted_tokens"]),
+            # The state cache's own rate, scored against what the paged pool
+            # actually handed it rather than against `reusable` -- otherwise a
+            # KV eviction reads as a state-cache miss and points tuning at the
+            # wrong pool. `compressed_hit` above is already the paged pool's
+            # half of the same split and the two multiply back to `hit`, so a
+            # `paged_hit` alias for it was a second name for one number.
+            # See `EngineStats.paged_hit_rate` / `state_hit_rate`.
+            "state_hit": rate(totals["cached_tokens"], compressed),
+            "state_recoverable_loss": rate(
+                totals["wanted_tokens"] - totals["cached_tokens"], compressed
+            ),
+            # CPU-tier reuse against the same `reusable` denominator as `hit`,
+            # matching `EngineStats.offload_hit_rate`. Disjoint from the HBM
+            # `hit` numerator (the offload tier serves what HBM missed), so it
+            # is not part of the `hit`/`compressed_hit` product and stands on
+            # its own.
+            "offload_hit": rate(totals["offload_tokens"]),
+        }
+
+    def get_metrics_statistics(self) -> dict[str, Any]:
+        """Return a DP-aggregated snapshot for the Prometheus exporter.
+
+        Reads the snapshots each EngineCore pushes on its own clock, so this is
+        a local dict lookup: no round trip, no deadline, and nothing that can
+        fail just because the engine is busy.
+        """
+        latest_metrics = self.core_mgr.latest_metrics.copy()
+        rank_stats = [
+            stats for stats in latest_metrics.values() if stats.get("enabled", False)
+        ]
+
+        def summed(key: str) -> int:
+            return sum(int(stats.get(key, 0)) for stats in rank_stats)
+
+        # Queue depths cannot be summed across a P/D pair: one in-flight
+        # request sits in the prefill rank's `running` and the decode rank's
+        # `prefill_waiting` at once. The decode side's four queues already
+        # span the whole lifetime, so it alone is the full picture. Falls back
+        # to every rank when no decode rank reported — non-P/D, or before the
+        # decode engine's first push, where nothing is duplicated yet.
+        queue_stats = [s for s in rank_stats if s.get("role") == "decode"] or rank_stats
+
+        def summed_queues(key: str) -> int:
+            return sum(int(stats.get(key, 0)) for stats in queue_stats)
+
+        kv_total = summed("kv_blocks_total")
+        kv_used = summed("kv_blocks_used")
+
+        mtp_rank_stats = [
+            stats.get("mtp", {})
+            for stats in rank_stats
+            if stats.get("mtp", {}).get("enabled", False)
+        ]
+        mtp_distribution: Counter[int] = Counter()
+        for stats in mtp_rank_stats:
+            mtp_distribution.update(
+                {
+                    int(accepted): int(steps)
+                    for accepted, steps in stats.get("distribution", {}).items()
+                }
+            )
+        mtp_draft = sum(
+            int(stats.get("total_draft_tokens", 0)) for stats in mtp_rank_stats
+        )
+        mtp_accepted = sum(
+            int(stats.get("total_accepted_tokens", 0)) for stats in mtp_rank_stats
+        )
+        mtp_steps = sum(mtp_distribution.values())
+
+        cache_rank_stats = [
+            stats.get("cache", {})
+            for stats in rank_stats
+            if stats.get("cache", {}).get("enabled", False)
+        ]
+        cache_keys = (
+            "requests",
+            "cached_tokens",
+            "compressed_tokens",
+            "wanted_tokens",
+            "full_tokens",
+            "checkpoints_kept",
+            "checkpoints_dropped",
+            "checkpoints_evicted",
+            "checkpoints_orphaned",
+            "demands_recorded",
+            "demands_declined_no_room",
+            "chunks_cut_for_demand",
+            "chunks_cut_for_end",
+        )
+        cache_totals = {
+            key: sum(int(stats.get(key, 0)) for stats in cache_rank_stats)
+            for key in cache_keys
+        }
+        # Keep the admitted supplemental reuse population aligned with the HBM
+        # and input counters. Missing older snapshots are not a zero tier hit.
+        if all("offload_tokens" in stats for stats in cache_rank_stats):
+            cache_totals["offload_tokens"] = sum(
+                int(stats["offload_tokens"]) for stats in cache_rank_stats
+            )
+        # NOTE: `full`, while `get_cache_statistics` divides by `reusable`, so
+        # this endpoint reads lower for the same engine — `full` counts the
+        # trailing block no cache is offered, and that fixed size weighs more
+        # on shorter prompts. Pre-existing; don't compare the two endpoints.
+        cache_full = cache_totals["full_tokens"]
+        offload_rank_stats = [
+            stats.get("offload", {}) for stats in rank_stats if stats.get("offload")
+        ]
+        offload_keys = (
+            "load_requests",
+            "loaded_tokens",
+            "load_failures",
+            "save_requests",
+            "saved_tokens",
+            "loads_pending",
+            "saves_pending",
+            # Why a waiting request is not costing a tier lookup per step, and
+            # whether its one external-tier attempt was already spent. Both are
+            # what an operator reads when the engine looks stalled with the
+            # GPUs idle; see `OffloadSchedulerMixin._init_tier_hit_memo`.
+            "lookups_skipped_by_memo",
+            "suppressed_load_retries",
+        )
+        offload_totals = {
+            key: sum(int(stats.get(key, 0)) for stats in offload_rank_stats)
+            for key in offload_keys
+        }
+
+        return {
+            "enabled": bool(rank_stats),
+            "requests_running": summed_queues("requests_running"),
+            "requests_waiting": summed_queues("requests_waiting"),
+            "requests_parked_kv_load": summed("requests_parked_kv_load"),
+            "requests_partial_prefill": summed("requests_partial_prefill"),
+            "requests_finished": summed("requests_finished"),
+            "prompt_tokens": summed("prompt_tokens"),
+            "generation_tokens": summed("generation_tokens"),
+            "preemptions": summed("preemptions"),
+            "kv_blocks_used": kv_used,
+            "kv_blocks_free": summed("kv_blocks_free"),
+            "kv_blocks_total": kv_total,
+            "kv_blocks_indexed": summed("kv_blocks_indexed"),
+            "kv_cache_usage_ratio": kv_used / kv_total if kv_total else 0.0,
+            "scheduler_metrics": [
+                {
+                    "dp_rank": rank,
+                    "engine_role": stats.get("role") or "default",
+                    **stats["scheduler_metrics"],
+                    "kv_blocks": (
+                        {
+                            "used": stats["kv_blocks_used"],
+                            "evictable": stats["kv_blocks_evictable"],
+                            "vacant": stats["kv_blocks_vacant"],
+                            "total": stats["kv_blocks_total"],
+                        }
+                        if "kv_blocks_total" in stats
+                        else {}
+                    ),
+                }
+                for rank, stats in latest_metrics.items()
+                if stats.get("enabled") and "scheduler_metrics" in stats
+            ],
+            "mtp": {
+                "enabled": bool(mtp_rank_stats),
+                "total_draft_tokens": mtp_draft,
+                "total_accepted_tokens": mtp_accepted,
+                "acceptance_rate": mtp_accepted / mtp_draft if mtp_draft else 0.0,
+                "average_tokens_per_forward": (
+                    1 + mtp_accepted / mtp_steps if mtp_steps else 0.0
+                ),
+                "distribution": dict(sorted(mtp_distribution.items())),
+            },
+            "cache": {
+                "enabled": bool(cache_rank_stats),
+                **cache_totals,
+                "hit": (
+                    cache_totals["cached_tokens"] / cache_full if cache_full else 0.0
+                ),
+                "compressed_hit": (
+                    cache_totals["compressed_tokens"] / cache_full
+                    if cache_full
+                    else 0.0
+                ),
+                "lost_to_checkpoint": (
+                    (cache_totals["wanted_tokens"] - cache_totals["cached_tokens"])
+                    / cache_full
+                    if cache_full
+                    else 0.0
+                ),
+                "lost_unrecoverable": (
+                    (cache_totals["compressed_tokens"] - cache_totals["wanted_tokens"])
+                    / cache_full
+                    if cache_full
+                    else 0.0
+                ),
+            },
+            "offload": offload_totals,
+            "dp_router": self.core_mgr.get_dp_router_statistics(),
+        }
+
+
+class InputOutputProcessor:
+
+    def __init__(self, config, tokenizer, block_size):
+        self.config = config
+        self.tokenizer = tokenizer
+        self.block_size = block_size
+        self.requests = {}
+        # `has_per_req_cache` flags model architectures that need a
+        # per-request stateful buffer outside the paged KV pool. Sequences
+        # constructed for these models trigger BlockManager to reserve a
+        # per-req cache slot. Currently: GDN-based models (Qwen3-Next /
+        # Qwen3.5). Future stateful models (DeepseekV4, etc.) extend the set.
+        self._external_to_internal: dict[str, int] = {}
+        self._internal_to_external: dict[int, str] = {}
+        self.has_per_req_cache = False
+        self.num_speculative_tokens = 0
+        if (
+            hasattr(self.config, "speculative_config")
+            and self.config.speculative_config is not None
+        ):
+            self.num_speculative_tokens = (
+                self.config.speculative_config.num_speculative_tokens
+            )
+        if self.config.hf_config.model_type in self._per_req_cache_model_types():
+            self.has_per_req_cache = True
+
+    @staticmethod
+    def _per_req_cache_model_types() -> frozenset[str]:
+        """Single source of truth for which model_types use per-req cache.
+
+        Read by Sequence-construction (here) AND by ModelRunner's startup
+        sanity check, which asserts that any model whose attention builder
+        declares a per-request state sub-pool has its model_type
+        registered here. Adding a new stateful-attention model means
+        adding its model_type to this set.
+        """
+        return frozenset(
+            {
+                "qwen3_next",
+                "qwen3_5_text",
+                "qwen3_5_moe_text",
+                "kimi_linear",
+                "glm5_next_text",
+                "deepseek_v4",
+                "deepseek_v41_text",
+                "qwen4_exp_text",
+            }
+        )
+
+    def preprocess(
+        self,
+        prompt_or_tokens: str | list[int],
+        sampling_params: SamplingParams,
+        stream_callback=None,
+        kv_transfer_params=None,
+        multimodal_data=None,
+        request_id: str | None = None,
+        data_parallel_rank: int | None = None,
+        dp_session_id: str | None = None,
+        dp_parent_session_id: str | None = None,
+    ):
+        """responsible for:
+        1) Tokenize
+        2) Create Sequence object
+
+        Single-sequence entry point. Rejects ``sampling_params.n > 1`` so that
+        callers which expect exactly one ``Sequence`` back cannot silently
+        drop the other siblings. Use :meth:`preprocess_fanout` for n > 1.
+        """
+        if getattr(sampling_params, "n", 1) > 1:
+            raise ValueError(
+                "preprocess() returns a single Sequence; for SamplingParams.n > 1 "
+                "call preprocess_fanout() and manage the returned list."
+            )
+        seqs = self.preprocess_fanout(
+            prompt_or_tokens,
+            sampling_params,
+            stream_callback=stream_callback,
+            kv_transfer_params=kv_transfer_params,
+            multimodal_data=multimodal_data,
+            parent_request_id=request_id,
+            data_parallel_rank=data_parallel_rank,
+            dp_session_id=dp_session_id,
+            dp_parent_session_id=dp_parent_session_id,
+        )
+        return seqs[0]
+
+    def preprocess_fanout(
+        self,
+        prompt_or_tokens: str | list[int],
+        sampling_params: SamplingParams,
+        stream_callback=None,
+        stream_callbacks: list | None = None,
+        kv_transfer_params=None,
+        multimodal_data=None,
+        parent_request_id: str | None = None,
+        data_parallel_rank: int | None = None,
+        dp_session_id: str | None = None,
+        dp_parent_session_id: str | None = None,
+    ) -> list[Sequence]:
+        """Tokenize once and materialize ``sampling_params.n`` Sequences.
+
+        Returns a list of length ``n``. For ``n == 1`` this is functionally
+        equivalent to the legacy single-sequence path. For ``n > 1``:
+
+        * The prompt is tokenized a single time and the token list is copied
+          into each sibling (``Sequence`` copies internally, so mutations stay
+          isolated).
+        * Every sibling is marked ``needs_independent_noise=True`` so the
+          sampler generates fresh per-row noise instead of reusing the cached
+          shared exponential tensor. Without this, siblings with identical
+          logits would emit identical tokens.
+        * Per-sibling ``stream_callbacks`` can be supplied to route streaming
+          deltas to independent queues (one per choice index). Falls back to
+          the scalar ``stream_callback`` for every sibling.
+        """
+        request_validator = getattr(self.config.hf_config, "validate_request", None)
+        if request_validator is not None:
+            request_validator(
+                num_draft_tokens=self.num_speculative_tokens,
+                multimodal_data=multimodal_data,
+            )
+        n = max(1, int(getattr(sampling_params, "n", 1)))
+
+        tokens = (
+            self.tokenizer.encode(prompt_or_tokens)
+            if isinstance(prompt_or_tokens, str)
+            else prompt_or_tokens
+        )
+        mrope_positions = None
+        mrope_position_delta = 0
+        if multimodal_data is not None:
+            mrope_positions, mrope_position_delta = get_mrope_input_positions(
+                self.config,
+                tokens,
+                multimodal_data,
+            )
+
+        stop_token_sequences = []
+        if sampling_params.stop_strings:
+            stops = (
+                [sampling_params.stop_strings]
+                if isinstance(sampling_params.stop_strings, str)
+                else sampling_params.stop_strings
+            )
+            for stop_str in stops:
+                stop_tokens = self.tokenizer.encode(stop_str, add_special_tokens=False)
+                if stop_tokens:
+                    stop_token_sequences.append(stop_tokens)
+
+        if stream_callbacks is not None and len(stream_callbacks) != n:
+            raise ValueError(
+                f"stream_callbacks length {len(stream_callbacks)} does not match n={n}"
+            )
+
+        seqs: list[Sequence] = []
+        for i in range(n):
+            cb = (
+                stream_callbacks[i] if stream_callbacks is not None else stream_callback
+            )
+            seq = Sequence(
+                tokens,
+                self.block_size,
+                sampling_params,
+                stop_token_sequences,
+                stream_callback=cb,
+                num_draft_tokens=self.num_speculative_tokens,
+                has_per_req_cache=self.has_per_req_cache,
+                kv_transfer_params=kv_transfer_params,
+                multimodal_data=multimodal_data,
+                mrope_positions=mrope_positions,
+                mrope_position_delta=mrope_position_delta,
+                needs_independent_noise=(n > 1),
+                parent_request_id=parent_request_id,
+                sibling_index=i,
+                request_id=parent_request_id if n == 1 else None,
+                data_parallel_rank=data_parallel_rank,
+                dp_session_id=dp_session_id,
+                dp_parent_session_id=dp_parent_session_id,
+            )
+            seq.arrive_time = time.time()
+            self.requests[seq.id] = seq
+            if seq.external_request_id is not None:
+                self._external_to_internal[seq.external_request_id] = seq.id
+                self._internal_to_external[seq.id] = seq.external_request_id
+            seqs.append(seq)
+
+        if n == 1:
+            logger.info(
+                f"Request {seqs[0].id} arrived, input tokens: {len(tokens)}, "
+                f"pending requests: {len(self.requests)}"
+            )
+        else:
+            logger.info(
+                f"Request {parent_request_id or seqs[0].id} fanned out into "
+                f"{n} siblings ({seqs[0].id}..{seqs[-1].id}), "
+                f"input tokens: {len(tokens)}, "
+                f"pending requests: {len(self.requests)}"
+            )
+        return seqs
+
+    def postprocess(self, reqs: list[Sequence]):
+        """responsible for:
+        1) Compute stats for logging
+        2) Detokenize"""
+        outputs = {}
+        for req in reqs:
+            self.requests.pop(req.id)
+            external_request_id = self._internal_to_external.pop(req.id, None)
+            if external_request_id is not None:
+                self._external_to_internal.pop(external_request_id, None)
+            output_str = self.tokenizer.decode(req.completion_token_ids)
+            req.leave_time = time.time()
+
+            # Calculate TTFT (Time To First Token) and TPOT (Time Per Output Token)
+            ttft = 0.0
+            tpot = 0.0
+            if req.first_token_time > 0:
+                ttft = req.first_token_time - req.arrive_time
+                # Calculate TPOT only if there are multiple output tokens
+                if req.num_completion_tokens > 1:
+                    tpot = (req.leave_time - req.first_token_time) / (
+                        req.num_completion_tokens - 1
+                    )
+
+            logger.info(
+                f"Request {req.id} finished with reason {req.leave_reason}. "
+                f"Input tokens: {req.num_prompt_tokens}, output tokens: {req.num_completion_tokens}, "
+                f"latency: {req.leave_time - req.arrive_time:.2f}s, "
+                f"TTFT: {ttft:.3f}s, TPOT: {tpot:.3f}s"
+            )
+            outputs[req.id] = {
+                "text": output_str,
+                # `list`, not the `array("i")` slice: this is what `generate()`
+                # hands a caller, and the storage type is ours to change.
+                "token_ids": list(req.completion_token_ids),
+                # `list` for the same reason as `token_ids` above.
+                "logprobs": list(req.logprobs) if req.return_logprobs else None,
+                "latency": req.leave_time - req.arrive_time,
+                "finish_reason": req.leave_reason,
+                "num_tokens_input": req.num_prompt_tokens,
+                "num_tokens_output": req.num_completion_tokens,
+                "ttft": ttft,  # Time to first token in seconds
+                "tpot": tpot,  # Time per output token in seconds
+            }
+        return outputs
+
+    def has_pending_requests(self):
+        return len(self.requests) > 0

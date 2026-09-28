@@ -1,0 +1,493 @@
+#!/bin/bash
+set -euo pipefail
+
+# The CI checkout is mounted into the container. Avoid leaving root-owned
+# __pycache__ files in that host workspace between matrix jobs.
+export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
+
+# Usage:
+#   .github/scripts/atom_sglang_test.sh start
+#   .github/scripts/atom_sglang_test.sh launch
+#   .github/scripts/atom_sglang_test.sh accuracy
+#
+# Required environment variables:
+#   SGLANG_MODEL_NAME
+#   SGLANG_MODEL_PATH
+#
+# Optional environment variables:
+#   SGLANG_EXTRA_ARGS
+#   SGLANG_ENV_VARS
+#   SGLANG_DEFAULT_SERVER_ARGS
+#   SGLANG_PORT
+#   SGLANG_HOST
+#   MAX_WAIT_RETRIES
+#   WAIT_INTERVAL_SEC
+#   STREAM_SGLANG_LOGS
+#   KEEP_SERVER_ALIVE_ON_EXIT
+#   SGLANG_PID_FILE
+#   SGLANG_LOG_FILE
+#   RESULT_DIR
+#   ACCURACY_LOG_FILE
+#   LM_EVAL_TASK
+#   LM_EVAL_NUM_FEWSHOT
+#   LM_EVAL_NUM_CONCURRENT
+#   LM_EVAL_EXTRA_MODEL_ARGS
+#   LM_EVAL_USE_CHAT_COMPLETIONS
+#   LM_EVAL_BATCH_SIZE
+#   LM_EVAL_GEN_KWARGS
+
+TYPE=${1:-launch}
+if [[ "${TYPE}" != "start" && "${TYPE}" != "launch" && "${TYPE}" != "accuracy" ]]; then
+  echo "Invalid TYPE: ${TYPE}. Expected: start, launch, or accuracy"
+  exit 2
+fi
+
+MAX_WAIT_RETRIES=${MAX_WAIT_RETRIES:-60}
+WAIT_INTERVAL_SEC=${WAIT_INTERVAL_SEC:-30}
+SGLANG_PORT=${SGLANG_PORT:-8000}
+# Prefer IPv4 loopback: Docker often sets disable_ipv6=1 while localhost still resolves to ::1.
+SGLANG_HOST=${SGLANG_HOST:-127.0.0.1}
+SGLANG_PID_FILE=${SGLANG_PID_FILE:-/tmp/atom_sglang.pid}
+SGLANG_LOG_FILE=${SGLANG_LOG_FILE:-/tmp/atom_sglang.log}
+RESULT_DIR=${RESULT_DIR:-/tmp/atom_sglang_accuracy_results}
+ACCURACY_LOG_FILE=${ACCURACY_LOG_FILE:-/tmp/atom_sglang_accuracy_output.txt}
+STREAM_SGLANG_LOGS=${STREAM_SGLANG_LOGS:-1}
+KEEP_SERVER_ALIVE_ON_EXIT=${KEEP_SERVER_ALIVE_ON_EXIT:-0}
+LM_EVAL_TASK=${LM_EVAL_TASK:-gsm8k}
+LM_EVAL_NUM_FEWSHOT=${LM_EVAL_NUM_FEWSHOT:-3}
+LM_EVAL_NUM_CONCURRENT=${LM_EVAL_NUM_CONCURRENT:-65}
+LM_EVAL_EXTRA_MODEL_ARGS=${LM_EVAL_EXTRA_MODEL_ARGS:-}
+LM_EVAL_USE_CHAT_COMPLETIONS=${LM_EVAL_USE_CHAT_COMPLETIONS:-0}
+LM_EVAL_BATCH_SIZE=${LM_EVAL_BATCH_SIZE:-65}
+LM_EVAL_GEN_KWARGS=${LM_EVAL_GEN_KWARGS:-}
+
+MODEL_NAME=${SGLANG_MODEL_NAME:-}
+MODEL_PATH=${SGLANG_MODEL_PATH:-}
+MODEL_EXTRA_ARGS=${SGLANG_EXTRA_ARGS:-}
+MODEL_ENV_VARS=${SGLANG_ENV_VARS:-}
+SGLANG_DOCKER_IMAGE=${SGLANG_DOCKER_IMAGE:-}
+
+LAST_SGLANG_LOG_LINE=0
+
+if [[ -z "${MODEL_NAME}" || -z "${MODEL_PATH}" ]]; then
+  echo "SGLANG_MODEL_NAME and SGLANG_MODEL_PATH must both be set."
+  exit 2
+fi
+
+prepare_runtime_paths() {
+  local path_prefix=""
+  local use_workspace_atom="false"
+  case "${ATOM_BENCH_USE_WORKSPACE_ATOM:-true}" in
+    true|TRUE|1|yes|YES|on|ON) use_workspace_atom="true" ;;
+  esac
+  if [[ -d /app/aiter-test ]]; then
+    path_prefix="/app/aiter-test"
+  fi
+  if [[ -d /app/sglang/python ]]; then
+    path_prefix="${path_prefix:+${path_prefix}:}/app/sglang/python"
+  fi
+  if [[ -d /workspace ]]; then
+    # Manual and rebuild runs validate the selected checkout. Scheduled
+    # prebuilt nightly runs use the ATOM copy baked into the Docker image so
+    # the benchmark data is reproducible from that image alone.
+    if [[ "${use_workspace_atom}" == "true" ]]; then
+      path_prefix="${path_prefix:+${path_prefix}:}/workspace"
+    elif [[ -d /app/ATOM ]]; then
+      path_prefix="${path_prefix:+${path_prefix}:}/app/ATOM"
+    fi
+    cd /workspace
+  elif [[ -d /app/ATOM ]]; then
+    path_prefix="${path_prefix:+${path_prefix}:}/app/ATOM"
+    cd /app
+  fi
+  if [[ -n "${path_prefix}" ]]; then
+    export PYTHONPATH="${path_prefix}${PYTHONPATH:+:${PYTHONPATH}}"
+  fi
+}
+
+resolve_model_path() {
+  local model_path="$1"
+  if [[ "${model_path}" = /* ]]; then
+    echo "${model_path}"
+  elif [[ -f "/models/${model_path}/config.json" ]]; then
+    echo "/models/${model_path}"
+  else
+    echo "${model_path}"
+  fi
+}
+
+emit_new_sglang_logs() {
+  if [[ "${STREAM_SGLANG_LOGS}" != "1" || ! -f "${SGLANG_LOG_FILE}" ]]; then
+    return 0
+  fi
+
+  local current_line_count
+  current_line_count=$(wc -l < "${SGLANG_LOG_FILE}")
+  if (( current_line_count <= LAST_SGLANG_LOG_LINE )); then
+    return 0
+  fi
+
+  echo ""
+  echo "========== New SGLang log output =========="
+  sed -n "$((LAST_SGLANG_LOG_LINE + 1)),${current_line_count}p" "${SGLANG_LOG_FILE}" || true
+  LAST_SGLANG_LOG_LINE=${current_line_count}
+}
+
+wait_server_ready() {
+  local expected_model_path="${1:-}"
+  echo ""
+  echo "========== Waiting for SGLang server (${MODEL_NAME}) =========="
+  for ((i=1; i<=MAX_WAIT_RETRIES; i++)); do
+    if [[ -f "${SGLANG_PID_FILE}" ]]; then
+      local pid
+      pid=$(cat "${SGLANG_PID_FILE}")
+      if ! kill -0 "${pid}" 2>/dev/null; then
+        echo "SGLang process exited early for ${MODEL_NAME}."
+        emit_new_sglang_logs
+        tail -n 200 "${SGLANG_LOG_FILE}" || true
+        return 1
+      fi
+    fi
+
+    local models_response
+    models_response=$(curl -fsS "http://127.0.0.1:${SGLANG_PORT}/v1/models" 2>/dev/null || true)
+    if [[ -n "${models_response}" ]]; then
+      if [[ -z "${expected_model_path}" ]] || \
+        MODELS_RESPONSE="${models_response}" EXPECTED_MODEL_PATH="${expected_model_path}" python3 - <<'PY'
+import json
+import os
+import sys
+
+
+def normalize_model_id(model_id: str) -> str:
+    model_id = model_id.rstrip("/")
+    if model_id.startswith("/models/"):
+        return model_id[len("/models/") :]
+    return model_id
+
+
+expected_model = normalize_model_id(os.environ["EXPECTED_MODEL_PATH"])
+try:
+    payload = json.loads(os.environ["MODELS_RESPONSE"])
+except Exception:
+    sys.exit(1)
+
+served_models = {
+    normalize_model_id(item.get("id", ""))
+    for item in payload.get("data", [])
+    if isinstance(item, dict) and isinstance(item.get("id"), str)
+}
+
+sys.exit(0 if expected_model in served_models else 1)
+PY
+      then
+        emit_new_sglang_logs
+        echo "SGLang server is ready for ${MODEL_NAME}."
+        return 0
+      fi
+    fi
+
+    emit_new_sglang_logs
+    echo "Waiting for SGLang server... (${i}/${MAX_WAIT_RETRIES})"
+    sleep "${WAIT_INTERVAL_SEC}"
+  done
+
+  echo "SGLang server did not become ready in time for ${MODEL_NAME}."
+  emit_new_sglang_logs
+  tail -n 200 "${SGLANG_LOG_FILE}" || true
+  return 1
+}
+
+stop_server() {
+  if [[ -f "${SGLANG_PID_FILE}" ]]; then
+    local pid
+    pid=$(cat "${SGLANG_PID_FILE}")
+    kill "${pid}" 2>/dev/null || true
+    rm -f "${SGLANG_PID_FILE}" || true
+  fi
+}
+
+launch_server() {
+  local wait_for_ready="${1:-1}"
+  local resolved_model_path
+  resolved_model_path=$(resolve_model_path "${MODEL_PATH}")
+
+  prepare_runtime_paths
+
+  export AITER_QUICK_REDUCE_QUANTIZATION="${AITER_QUICK_REDUCE_QUANTIZATION:-INT4}"
+  export SGLANG_AITER_FP8_PREFILL_ATTN="${SGLANG_AITER_FP8_PREFILL_ATTN:-0}"
+  export SGLANG_USE_AITER="${SGLANG_USE_AITER:-1}"
+  export ATOM_ENABLE_DS_QKNORM_QUANT_FUSION="${ATOM_ENABLE_DS_QKNORM_QUANT_FUSION:-1}"
+  export SGLANG_EXTERNAL_MODEL_PACKAGE="${SGLANG_EXTERNAL_MODEL_PACKAGE:-atom.plugin.sglang.models}"
+  export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-128}"
+
+  if [[ -n "${MODEL_ENV_VARS}" ]]; then
+    while IFS= read -r env_line; do
+      [[ -n "${env_line}" ]] || continue
+      export "${env_line}"
+      echo "Exported: ${env_line}"
+    done <<< "$(printf '%b' "${MODEL_ENV_VARS}")"
+  fi
+
+  local default_server_args
+  default_server_args=${SGLANG_DEFAULT_SERVER_ARGS---trust-remote-code --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.8 --page-size 1 --disable-radix-cache}
+
+  local -a default_arg_array=()
+  if [[ -n "${default_server_args}" ]]; then
+    read -r -a default_arg_array <<< "${default_server_args}"
+  fi
+
+  local -a extra_arg_array=()
+  if [[ -n "${MODEL_EXTRA_ARGS}" ]]; then
+    while IFS= read -r -d '' token; do
+      extra_arg_array+=("${token}")
+    done < <(
+      MODEL_EXTRA_ARGS="${MODEL_EXTRA_ARGS}" python3 - <<'PY'
+import os
+import shlex
+import sys
+
+for token in shlex.split(os.environ["MODEL_EXTRA_ARGS"]):
+    sys.stdout.write(token)
+    sys.stdout.write("\0")
+PY
+    )
+  fi
+
+  rm -rf /root/.cache
+
+  rm -f "${SGLANG_PID_FILE}" "${SGLANG_LOG_FILE}" || true
+
+  echo ""
+  echo "========== Launching SGLang server =========="
+  echo "Model name: ${MODEL_NAME}"
+  echo "Model path: ${resolved_model_path}"
+  echo "Extra args: ${MODEL_EXTRA_ARGS}"
+
+  nohup python3 -m sglang.launch_server \
+    --model-path "${resolved_model_path}" \
+    --host "${SGLANG_HOST}" \
+    --port "${SGLANG_PORT}" \
+    "${default_arg_array[@]}" \
+    "${extra_arg_array[@]}" \
+    > "${SGLANG_LOG_FILE}" 2>&1 &
+
+  echo $! > "${SGLANG_PID_FILE}"
+  echo "Server PID: $(cat "${SGLANG_PID_FILE}")"
+
+  if [[ "${wait_for_ready}" == "1" ]]; then
+    wait_server_ready "${resolved_model_path}"
+  fi
+}
+
+run_accuracy() {
+  local resolved_model_path
+  resolved_model_path=$(resolve_model_path "${MODEL_PATH}")
+
+  prepare_runtime_paths
+
+  if ! command -v lm_eval >/dev/null 2>&1; then
+    echo "========== Installing lm-eval =========="
+    pip install 'lm-eval[api]'
+  fi
+
+  mkdir -p "${RESULT_DIR}"
+  : > "${ACCURACY_LOG_FILE}"
+
+  local run_tag
+  run_tag="$(date +%Y%m%d%H%M%S)_${MODEL_NAME// /_}"
+  local output_path="${RESULT_DIR}/${run_tag}"
+  local flat_result_file="${RESULT_DIR}/${run_tag}.json"
+
+  echo ""
+  echo "========== Running SGLang accuracy =========="
+  echo "Model name: ${MODEL_NAME}"
+
+  local lm_eval_model="local-completions"
+  local lm_eval_endpoint_path="/v1/completions"
+  local -a lm_eval_extra_args=()
+  local lm_eval_model_args
+
+  if [[ "${LM_EVAL_USE_CHAT_COMPLETIONS}" == "1" || "${LM_EVAL_USE_CHAT_COMPLETIONS}" == "true" ]]; then
+    lm_eval_model="local-chat-completions"
+    lm_eval_endpoint_path="/v1/chat/completions"
+    lm_eval_extra_args+=(--batch_size "${LM_EVAL_BATCH_SIZE}" --apply_chat_template --fewshot_as_multiturn)
+    lm_eval_model_args="model=${resolved_model_path},base_url=http://127.0.0.1:${SGLANG_PORT}${lm_eval_endpoint_path},num_concurrent=${LM_EVAL_NUM_CONCURRENT}"
+  else
+    lm_eval_model_args="model=${resolved_model_path},base_url=http://127.0.0.1:${SGLANG_PORT}${lm_eval_endpoint_path},num_concurrent=${LM_EVAL_NUM_CONCURRENT},max_retries=1,tokenized_requests=False,trust_remote_code=True"
+  fi
+  if [[ -n "${LM_EVAL_EXTRA_MODEL_ARGS}" ]]; then
+    lm_eval_model_args="${lm_eval_model_args},${LM_EVAL_EXTRA_MODEL_ARGS#,}"
+  fi
+  if [[ -n "${LM_EVAL_GEN_KWARGS}" ]]; then
+    lm_eval_extra_args+=(--gen_kwargs "${LM_EVAL_GEN_KWARGS}")
+  fi
+
+  lm_eval --model "${lm_eval_model}" \
+    --model_args "${lm_eval_model_args}" \
+    --tasks "${LM_EVAL_TASK}" \
+    --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
+    "${lm_eval_extra_args[@]}" \
+    --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
+  # Capture lm_eval exit code explicitly; tee always exits 0 so PIPESTATUS is needed.
+  lm_eval_exit="${PIPESTATUS[0]}"
+  if [[ "${lm_eval_exit}" -ne 0 ]]; then
+    echo "ERROR: lm_eval exited with code ${lm_eval_exit}"
+    return "${lm_eval_exit}"
+  fi
+
+  local result_file=""
+  result_file=$(python3 - <<PY
+from pathlib import Path
+
+candidate_roots = [Path("${output_path}"), Path("${RESULT_DIR}")]
+json_candidates = []
+for root in candidate_roots:
+    if root.is_file() and root.suffix == ".json":
+        json_candidates.append(root)
+    elif root.is_dir():
+        for p in root.rglob("*.json"):
+            if p.is_file():
+                json_candidates.append(p)
+
+if not json_candidates:
+    print("")
+else:
+    latest = max(json_candidates, key=lambda p: p.stat().st_mtime)
+    print(str(latest))
+PY
+)
+
+  if [[ -z "${result_file}" || ! -f "${result_file}" ]]; then
+    echo "ERROR: No results JSON file found under ${output_path} or ${RESULT_DIR}"
+    return 2
+  fi
+
+  if [[ "${result_file}" != "${flat_result_file}" ]]; then
+    cp -f "${result_file}" "${flat_result_file}"
+    result_file="${flat_result_file}"
+  fi
+
+  local server_info_file="/tmp/atom_sglang_server_info.json"
+  if curl -fsS "http://127.0.0.1:${SGLANG_PORT}/server_info" -o "${server_info_file}" 2>/dev/null; then
+    RESULT_FILE="${result_file}" SERVER_INFO_FILE="${server_info_file}" python3 - <<'PY'
+import json
+import math
+import os
+
+with open(os.environ["SERVER_INFO_FILE"], encoding="utf-8") as f:
+    server_info = json.load(f)
+
+acceptance_rates = []
+accept_lengths = []
+for state in server_info.get("internal_states", []):
+    accept_length = state.get("avg_spec_accept_length")
+    num_draft_tokens = state.get("speculative_num_draft_tokens")
+    num_steps = state.get("speculative_num_steps")
+    if num_draft_tokens and num_draft_tokens > 1:
+        draft_tokens_per_round = int(num_draft_tokens) - 1
+    elif num_steps and num_steps > 0:
+        draft_tokens_per_round = int(num_steps)
+    else:
+        draft_tokens_per_round = 0
+    if accept_length is None or not draft_tokens_per_round:
+        continue
+    acceptance_rate = (float(accept_length) - 1.0) / draft_tokens_per_round
+    if not math.isfinite(acceptance_rate) or not 0.0 <= acceptance_rate <= 1.0:
+        raise ValueError(
+            f"Invalid SGLang MTP acceptance rate {acceptance_rate} "
+            f"from accept length {accept_length} and "
+            f"{draft_tokens_per_round} draft tokens per round"
+        )
+    acceptance_rates.append(acceptance_rate)
+    accept_lengths.append(float(accept_length))
+
+if acceptance_rates:
+    with open(os.environ["RESULT_FILE"], encoding="utf-8") as f:
+        data = json.load(f)
+    metadata = data.setdefault("atom_ci_metadata", {})
+    metadata["mtp_acceptance_rate"] = (
+        sum(acceptance_rates) / len(acceptance_rates) * 100.0
+    )
+    metadata["mtp_accept_length"] = sum(accept_lengths) / len(accept_lengths)
+    metadata["avg_tokens_per_forward"] = metadata["mtp_accept_length"]
+    with open(os.environ["RESULT_FILE"], "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    print(
+        f"MTP acceptance rate: {metadata['mtp_acceptance_rate']:.2f}%, "
+        f"accept length: {metadata['mtp_accept_length']:.4f}"
+    )
+else:
+    print("MTP acceptance: no speculative decoding metrics found.")
+PY
+  else
+    echo "MTP acceptance: /server_info not reachable."
+  fi
+
+  if [[ -n "${SGLANG_DOCKER_IMAGE:-}" ]] || [[ -n "${GPU_NAME:-}" ]] || [[ -n "${GPU_VRAM_GB:-}" ]] || [[ -n "${ROCM_VERSION:-}" ]]; then
+    RESULT_FILE="${result_file}" \
+    SGLANG_DOCKER_IMAGE="${SGLANG_DOCKER_IMAGE:-}" \
+    GPU_NAME="${GPU_NAME:-}" \
+    GPU_VRAM_GB="${GPU_VRAM_GB:-}" \
+    ROCM_VERSION="${ROCM_VERSION:-}" \
+    python3 - <<'PY'
+import json
+import os
+
+result_file = os.environ["RESULT_FILE"]
+with open(result_file, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+metadata = data.setdefault("atom_ci_metadata", {})
+if os.environ.get("SGLANG_DOCKER_IMAGE"):
+    metadata["docker_image"] = os.environ["SGLANG_DOCKER_IMAGE"]
+if os.environ.get("GPU_NAME"):
+    metadata["gpu_name"] = os.environ["GPU_NAME"]
+if os.environ.get("GPU_VRAM_GB"):
+    try:
+        metadata["gpu_vram_gb"] = int(float(os.environ["GPU_VRAM_GB"]))
+    except ValueError:
+        pass
+if os.environ.get("ROCM_VERSION"):
+    metadata["rocm_version"] = os.environ["ROCM_VERSION"]
+
+with open(result_file, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
+  fi
+
+  local value
+  if command -v jq >/dev/null 2>&1; then
+    value=$(jq ".results.\"${LM_EVAL_TASK}\"[\"exact_match,flexible-extract\"]" "${result_file}")
+  else
+    value=$(python3 - <<PY
+import json
+with open("${result_file}", "r", encoding="utf-8") as f:
+    data = json.load(f)
+print(data["results"]["${LM_EVAL_TASK}"]["exact_match,flexible-extract"])
+PY
+)
+  fi
+
+  echo "Result file: ${result_file}"
+  echo "Flexible extract value: ${value}"
+}
+
+cleanup_on_exit() {
+  if [[ "${TYPE}" == "start" || ( "${TYPE}" == "launch" && "${KEEP_SERVER_ALIVE_ON_EXIT}" == "1" ) ]]; then
+    echo "Keeping SGLang server alive for follow-up steps."
+    return 0
+  fi
+  stop_server
+}
+
+trap 'cleanup_on_exit' EXIT
+
+if [[ "${TYPE}" == "start" ]]; then
+  launch_server "0"
+elif [[ "${TYPE}" == "launch" ]]; then
+  launch_server
+else
+  launch_server
+  run_accuracy
+fi

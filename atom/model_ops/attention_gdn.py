@@ -1,0 +1,627 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+import torch
+import triton
+import triton.language as tl
+from aiter.dist.parallel_state import get_tp_group
+from einops import rearrange
+from torch import nn
+
+from atom.model_ops.fla_ops import (
+    chunk_gated_delta_rule,
+    fused_recurrent_gated_delta_rule,
+    gdn_decode_update_lossy_fast,
+)
+from atom.model_ops.fla_ops.replayssm import replayssm_gated_delta_rule
+from atom.model_ops.mamba_ops.causal_conv1d import (
+    causal_conv1d_fn,
+    causal_conv1d_update,
+)
+from atom.utils import envs
+
+# from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
+from atom.utils.forward_context import ForwardContext, get_forward_context
+
+
+@triton.jit
+def fused_gdn_gating_kernel(
+    g,
+    beta_output,
+    A_log,
+    a,
+    b,
+    dt_bias,
+    seq_len,
+    NUM_HEADS: tl.constexpr,
+    stride_a_batch,
+    stride_b_batch,
+    beta: tl.constexpr,
+    threshold: tl.constexpr,
+    BLK_HEADS: tl.constexpr,
+):
+    i_b, i_s, i_d = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
+    out_off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
+    mask = head_off < NUM_HEADS
+    blk_A_log = tl.load(A_log + head_off, mask=mask)
+    blk_a = tl.load(a + i_b * stride_a_batch + head_off, mask=mask)
+    blk_b = tl.load(b + i_b * stride_b_batch + head_off, mask=mask)
+    blk_bias = tl.load(dt_bias + head_off, mask=mask)
+    # If the model is loaded in fp16, without the .float() here, A might be -inf
+    x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)
+    softplus_x = tl.where(
+        beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
+    )
+    blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
+    tl.store(g + out_off, blk_g.to(g.dtype.element_ty), mask=mask)
+    # compute beta_output = sigmoid(b)
+    blk_beta_output = tl.sigmoid(blk_b.to(tl.float32))
+    tl.store(
+        beta_output + out_off,
+        blk_beta_output.to(beta_output.dtype.element_ty),
+        mask=mask,
+    )
+
+
+def fused_gdn_gating(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    beta: float = 1.0,
+    threshold: float = 20.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fused computation of g and beta for Gated Delta Net.
+    g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+    beta_output = b.sigmoid()
+    TODO maybe use torch.compile to replace this triton kernel
+    """
+    batch, num_heads = a.shape
+    seq_len = 1
+    grid = (batch, seq_len, triton.cdiv(num_heads, 8))
+    g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
+    beta_output = torch.empty(1, batch, num_heads, dtype=b.dtype, device=b.device)
+    fused_gdn_gating_kernel[grid](
+        g,
+        beta_output,
+        A_log,
+        a,
+        b,
+        dt_bias,
+        seq_len,
+        num_heads,
+        a.stride(0),
+        b.stride(0),
+        beta,
+        threshold,
+        8,
+        num_warps=1,
+    )
+    return g, beta_output
+
+
+class GatedDeltaNet(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        key_dim: int,
+        value_dim: int,
+        dt_bias: torch.Tensor,
+        A_log: torch.Tensor,
+        conv1d,
+        activation,
+        layer_num: int = 0,
+        **kwargs,
+    ):
+        super().__init__()
+        self.layer_num = layer_num
+
+        self.tp_size = get_tp_group().world_size
+        self.conv1d = conv1d
+        self.activation = activation
+        self.A_log = A_log
+        self.dt_bias = dt_bias
+        self.key_dim = key_dim
+        self.value_dim = value_dim
+        self.hidden_size = hidden_size
+        self.num_k_heads = num_k_heads
+        self.num_v_heads = num_v_heads
+        self.head_k_dim = head_k_dim
+        self.head_v_dim = head_v_dim
+        self.allow_aiter_flydsl = kwargs.get("allow_aiter_flydsl", False)
+        # Opt-in is only eligibility. The standalone cache builder resolves the
+        # policy once with ReplaySSM, architecture and the actual state tensor.
+        self.gdn_flydsl_policy = None
+
+    def rearrange_mixed_qkv(self, mixed_qkv):
+        if mixed_qkv is None:
+            return None, None, None
+        query, key, value = torch.split(
+            mixed_qkv,
+            [
+                self.key_dim // self.tp_size,
+                self.key_dim // self.tp_size,
+                self.value_dim // self.tp_size,
+            ],
+            dim=-1,
+        )
+        query, key = (
+            rearrange(x, "l (h d) -> 1 l h d", d=self.head_k_dim) for x in (query, key)
+        )
+        value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
+        return query.contiguous(), key.contiguous(), value.contiguous()
+
+    def forward(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        layer_name: str,
+    ):
+        from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
+
+        fwd_ctx: ForwardContext = get_forward_context()
+        gdn_metadata: GDNAttentionMetadata = getattr(
+            fwd_ctx.attn_metadata, "gdn_metadata", None
+        )
+        if gdn_metadata is None:
+            core_attn_out.zero_()
+            return core_attn_out
+
+        gdn_cache = fwd_ctx.kv_cache_data
+        layer_cache = gdn_cache[f"layer_{self.layer_num}"]
+        conv_state = layer_cache.k_cache
+        # Under ReplaySSM this pool holds one checkpoint per request rather
+        # than one state per speculative token; the per-draft states it used
+        # to hold are reconstructed from `replay_buf_*` on demand.
+        ssm_state = layer_cache.v_cache
+        use_replayssm = getattr(gdn_metadata, "replayssm", False)
+        flydsl_policy = self.gdn_flydsl_policy
+
+        has_initial_state = gdn_metadata.has_initial_state
+        spec_query_start_loc = gdn_metadata.spec_query_start_loc
+        non_spec_query_start_loc = gdn_metadata.non_spec_query_start_loc
+        spec_sequence_masks = gdn_metadata.spec_sequence_masks
+        spec_token_indx = gdn_metadata.spec_token_indx
+        non_spec_token_indx = gdn_metadata.non_spec_token_indx
+        spec_state_indices_tensor = gdn_metadata.spec_state_indices_tensor
+        non_spec_state_indices_tensor = gdn_metadata.non_spec_state_indices_tensor
+        non_spec_state_indices_in_tensor = gdn_metadata.non_spec_state_indices_in_tensor
+
+        # `causal_conv1d_*` expects the logical shape [slot, conv_dim, state_len].
+        # ModelRunner stores [slot, state_len, conv_dim], so it needs the
+        # transpose below. SGLang already provides [slot, conv_dim, state_len],
+        # and the Triton kernel consumes the original conv_state strides directly.
+        if conv_state.size(1) != self.conv1d.weight.size(0):
+            # transpose for ModelRunner
+            conv_state = conv_state.transpose(-1, -2)
+
+        num_actual_tokens = gdn_metadata.num_actual_tokens
+        num_accepted_tokens = gdn_metadata.num_accepted_tokens
+
+        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        b = b[:num_actual_tokens]
+        a = a[:num_actual_tokens]
+
+        # 1. Convolution sequence transformation
+        conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+
+        if spec_sequence_masks is not None:
+            if gdn_metadata.num_prefills == 0 and gdn_metadata.num_decodes == 0:
+                mixed_qkv_spec = mixed_qkv
+                mixed_qkv_non_spec = None
+            else:
+                mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
+                mixed_qkv_non_spec = mixed_qkv.index_select(0, non_spec_token_indx)
+        else:
+            mixed_qkv_spec = None
+            mixed_qkv_non_spec = mixed_qkv
+
+        use_lossy_gdn_decode = (
+            envs.ATOM_ENABLE_GDN_DECODE_LOSSY_FAST
+            # The lossy fast path writes the full state back every step, which
+            # is precisely what ReplaySSM removes; the two are alternatives.
+            and not use_replayssm
+            and spec_sequence_masks is None
+            and gdn_metadata.num_prefills == 0
+            and gdn_metadata.num_decodes > 0
+            and non_spec_state_indices_tensor is not None
+            and non_spec_state_indices_tensor.ndim == 1
+            and a.shape[0] == gdn_metadata.num_decodes
+            and a.shape[1] == self.num_v_heads // self.tp_size
+            and b.shape == a.shape
+        )
+
+        # # 1.1: Process the multi-query part
+        if spec_sequence_masks is not None:
+            query_spec, key_spec, value_spec = causal_conv1d_update(
+                mixed_qkv_spec,
+                conv_state,
+                conv_weights,
+                self.num_k_heads * self.head_k_dim // self.tp_size,
+                self.num_v_heads * self.head_v_dim // self.tp_size,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=spec_state_indices_tensor[:, 0][
+                    : gdn_metadata.num_spec_decodes
+                ],
+                num_accepted_tokens=num_accepted_tokens,
+                query_start_loc=spec_query_start_loc,
+                # The verify window, which sizes the conv rollback window
+                # (state_len = kernel_width-1 + max_query_len-1) and hence the
+                # kernel's NP2_STATELEN tile. It used to be inferred from the
+                # slot table's last dim, which only coincided with the window
+                # because that table carried one column per draft; state that
+                # dependency explicitly so a narrower table cannot silently
+                # truncate the conv state.
+                max_query_len=(
+                    gdn_metadata.replayssm_max_query_len
+                    if use_replayssm
+                    else spec_state_indices_tensor.size(-1)
+                ),
+                validate_data=False,
+            )
+            num_tokens_spec = query_spec.shape[0]
+            query_spec = query_spec.view(1, num_tokens_spec, -1, self.head_k_dim)
+            key_spec = key_spec.view(1, num_tokens_spec, -1, self.head_k_dim)
+            value_spec = value_spec.view(1, num_tokens_spec, -1, self.head_v_dim)
+
+        # 1.2: Process the remaining part
+        if gdn_metadata.num_prefills > 0:
+            mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
+            # - "cache_indices" updates the conv_state cache in positions
+            #   pointed to by "state_indices_tensor"
+            query_non_spec, key_non_spec, value_non_spec = causal_conv1d_fn(
+                mixed_qkv_non_spec_T,
+                conv_weights,
+                self.conv1d.bias,
+                activation=self.activation,
+                conv_states=conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=non_spec_state_indices_tensor,
+                cache_indices_in=non_spec_state_indices_in_tensor,
+                query_start_loc=non_spec_query_start_loc,
+                k_dim_size=self.num_k_heads * self.head_k_dim // self.tp_size,
+                v_dim_size=self.num_v_heads * self.head_v_dim // self.tp_size,
+                metadata=gdn_metadata,
+            )
+        elif gdn_metadata.num_decodes > 0:
+            query_non_spec, key_non_spec, value_non_spec = causal_conv1d_update(
+                mixed_qkv_non_spec,
+                conv_state,
+                conv_weights,
+                self.num_k_heads * self.head_k_dim // self.tp_size,
+                self.num_v_heads * self.head_v_dim // self.tp_size,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=non_spec_state_indices_tensor[
+                    : gdn_metadata.num_actual_tokens
+                ],
+                conv_state_indices_in=non_spec_state_indices_in_tensor[
+                    : gdn_metadata.num_actual_tokens
+                ],
+                validate_data=True,
+            )
+        else:
+            mixed_qkv_non_spec = None
+
+        if gdn_metadata.num_prefills > 0 or gdn_metadata.num_decodes > 0:
+            num_tokens_nonspec = query_non_spec.shape[0]
+            query_non_spec = query_non_spec.view(
+                1, num_tokens_nonspec, -1, self.head_k_dim
+            )
+            key_non_spec = key_non_spec.view(1, num_tokens_nonspec, -1, self.head_k_dim)
+            value_non_spec = value_non_spec.view(
+                1, num_tokens_nonspec, -1, self.head_v_dim
+            )
+
+        use_flydsl_decode = False
+        if (
+            flydsl_policy is not None
+            and flydsl_policy.decode
+            and not use_lossy_gdn_decode
+            and not use_replayssm
+            and spec_sequence_masks is None
+            and gdn_metadata.num_prefills == 0
+            and gdn_metadata.num_decodes > 0
+        ):
+            from atom.model_ops.fla_ops.gdn_flydsl import decode_supported
+
+            use_flydsl_decode = decode_supported(
+                query_non_spec,
+                key_non_spec,
+                value_non_spec,
+                a,
+                b,
+                ssm_state,
+                self.A_log,
+                self.dt_bias,
+                non_spec_state_indices_in_tensor,
+                non_spec_state_indices_tensor,
+            )
+
+        if use_lossy_gdn_decode or use_flydsl_decode:
+            g_spec = None
+            beta_spec = None
+            g_non_spec = None
+            beta_non_spec = None
+        else:
+            g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+
+            if spec_sequence_masks is not None:
+                if gdn_metadata.num_prefills == 0 and gdn_metadata.num_decodes == 0:
+                    g_spec = g
+                    beta_spec = beta
+                    g_non_spec = None
+                    beta_non_spec = None
+                else:
+                    g_spec = g.index_select(1, spec_token_indx)
+                    beta_spec = beta.index_select(1, spec_token_indx)
+                    g_non_spec = g.index_select(1, non_spec_token_indx)
+                    beta_non_spec = beta.index_select(1, non_spec_token_indx)
+            else:
+                g_spec = None
+                beta_spec = None
+                g_non_spec = g
+                beta_non_spec = beta
+
+        # 2. Recurrent attention
+
+        # 2.1: Process the multi-query part
+        if spec_sequence_masks is not None:
+            if use_replayssm:
+                # No per-draft state snapshot: the kernel rebuilds the state
+                # from the checkpoint plus the committed records, so the
+                # rejected drafts of the previous step are undone simply by
+                # `write_pos` never having advanced past them.
+                nsd = gdn_metadata.num_spec_decodes
+                core_attn_out_spec = replayssm_gated_delta_rule(
+                    q=query_spec,
+                    k=key_spec,
+                    v=value_spec,
+                    g=g_spec,
+                    beta=beta_spec,
+                    ckpt=ssm_state,
+                    buf_k=layer_cache.replay_buf_k,
+                    buf_u=layer_cache.replay_buf_u,
+                    buf_g=layer_cache.replay_buf_g,
+                    write_pos=gdn_metadata.write_pos,
+                    slot_idx=gdn_metadata.slot_idx[:nsd],
+                    cu_seqlens=spec_query_start_loc[: nsd + 1],
+                    max_query_len=gdn_metadata.replayssm_max_query_len,
+                    use_qk_l2norm_in_kernel=True,
+                    is_kda=False,
+                    route=gdn_metadata.replayssm_route,
+                )
+                last_recurrent_state = None
+            else:
+                core_attn_out_spec, last_recurrent_state = (
+                    fused_recurrent_gated_delta_rule(
+                        q=query_spec,
+                        k=key_spec,
+                        v=value_spec,
+                        g=g_spec,
+                        beta=beta_spec,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=spec_query_start_loc[
+                            : gdn_metadata.num_spec_decodes + 1
+                        ],
+                        ssm_state_indices=spec_state_indices_tensor,
+                        num_accepted_tokens=num_accepted_tokens,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                )
+        else:
+            core_attn_out_spec, last_recurrent_state = None, None
+
+        # 2.2: Process the remaining part
+        if gdn_metadata.num_prefills > 0:
+            ckpt = gdn_metadata.ssm_checkpoints
+            flydsl_metadata = getattr(gdn_metadata, "flydsl_prefill_metadata", None)
+            use_flydsl_prefill = False
+            if (
+                flydsl_policy is not None
+                and flydsl_policy.prefill
+                and not use_replayssm
+            ):
+                from atom.model_ops.fla_ops.gdn_flydsl import (
+                    prefill,
+                    prefill_supported,
+                )
+
+                use_flydsl_prefill = prefill_supported(
+                    query_non_spec,
+                    key_non_spec,
+                    value_non_spec,
+                    g_non_spec,
+                    beta_non_spec,
+                    flydsl_metadata,
+                )
+            if use_flydsl_prefill:
+                core_attn_out_non_spec, last_recurrent_state, flydsl_h = prefill(
+                    query_non_spec,
+                    key_non_spec,
+                    value_non_spec,
+                    g_non_spec,
+                    beta_non_spec,
+                    ssm_state,
+                    non_spec_query_start_loc,
+                    flydsl_metadata,
+                    keep_intermediate_states=ckpt is not None,
+                    state_indices=non_spec_state_indices_in_tensor,
+                    has_initial_state=has_initial_state,
+                )
+            else:
+                initial_state = ssm_state[non_spec_state_indices_in_tensor].contiguous()
+                initial_state[~has_initial_state, ...] = 0
+                core_attn_out_non_spec, last_recurrent_state = chunk_gated_delta_rule(
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    g=g_non_spec,
+                    beta=beta_non_spec,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    cu_seqlens=non_spec_query_start_loc,
+                    head_first=False,
+                    use_qk_l2norm_in_kernel=True,
+                    # Only when there is somewhere to put them; `h` is large and is
+                    # dropped on return otherwise.
+                    keep_intermediate_states=ckpt is not None,
+                )
+            # Init cache
+            ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
+                ssm_state.dtype
+            )
+            # SSM state cache: copy out every checkpoint this step reached.
+            #
+            # A checkpoint slot is never where the recurrence runs — the live
+            # state stays in the request's runtime slot for its whole life —
+            # so BOTH kinds of position need a copy:
+            #   interior  <- h[chunk boundary]
+            #   step end  <- the runtime slot; NOT in `h`, which holds
+            #                boundaries strictly before the end
+            # `_checkpoint_targets` tags the second kind with `is_end`. This
+            # runs after the scatter above so that slot holds this step's
+            # final state, which is what an `is_end` target reads.
+            #
+            # One launch over device index tensors, so the per-sequence base
+            # arithmetic lives in the kernel — see `_checkpoint_targets`.
+            #
+            # Conv state needs no support from the conv kernel: it IS the last
+            # `state_len` rows of the conv input ending at the position, the
+            # same bytes that kernel's end-of-sequence store writes.
+            if ckpt is not None:
+                from atom.model_ops.fla_ops.chunk import (
+                    CHUNK_SIZE,
+                    pop_last_intermediate_states,
+                )
+                from atom.model_ops.fla_ops.state_checkpoint import (
+                    write_state_checkpoints,
+                )
+
+                h = flydsl_h if use_flydsl_prefill else pop_last_intermediate_states()
+                if h is not None:
+                    # One launch for both halves. `conv_state` is
+                    # [slot, conv_dim, state_len] by here (see the transpose
+                    # above) and shares `slots` with the SSM half, so the two
+                    # always describe the same token position.
+                    write_state_checkpoints(
+                        h,
+                        ssm_state,
+                        mixed_qkv_non_spec,
+                        conv_state,
+                        ckpt["rows"],
+                        ckpt["slots"],
+                        ckpt["offs"],
+                        ckpt["is_end"],
+                        ckpt["runtime"],
+                        gdn_metadata.ssm_chunk_offsets,
+                        non_spec_query_start_loc,
+                        CHUNK_SIZE,
+                    )
+        elif gdn_metadata.num_decodes > 0 and use_replayssm:
+            nd = gdn_metadata.num_decodes
+            core_attn_out_non_spec = replayssm_gated_delta_rule(
+                q=query_non_spec,
+                k=key_non_spec,
+                v=value_non_spec,
+                g=g_non_spec,
+                beta=beta_non_spec,
+                ckpt=ssm_state,
+                buf_k=layer_cache.replay_buf_k,
+                buf_u=layer_cache.replay_buf_u,
+                buf_g=layer_cache.replay_buf_g,
+                write_pos=gdn_metadata.write_pos,
+                slot_idx=gdn_metadata.slot_idx[:nd],
+                cu_seqlens=non_spec_query_start_loc[: nd + 1],
+                max_query_len=gdn_metadata.replayssm_max_query_len,
+                use_qk_l2norm_in_kernel=True,
+                is_kda=False,
+                route=gdn_metadata.replayssm_route,
+            )
+            last_recurrent_state = None
+        elif gdn_metadata.num_decodes > 0:
+            if use_flydsl_decode:
+                from atom.model_ops.fla_ops.gdn_flydsl import decode
+
+                core_attn_out_non_spec, last_recurrent_state = decode(
+                    query_non_spec,
+                    key_non_spec,
+                    value_non_spec,
+                    a,
+                    b,
+                    ssm_state,
+                    self.A_log,
+                    self.dt_bias,
+                    non_spec_state_indices_in_tensor,
+                    non_spec_state_indices_tensor,
+                )
+            elif use_lossy_gdn_decode:
+                core_attn_out_non_spec, last_recurrent_state = (
+                    gdn_decode_update_lossy_fast(
+                        A_log=self.A_log,
+                        a=a,
+                        b=b,
+                        dt_bias=self.dt_bias,
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        initial_state=ssm_state,
+                        ssm_state_indices=non_spec_state_indices_tensor,
+                        ssm_state_indices_in=non_spec_state_indices_in_tensor,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                )
+            else:
+                core_attn_out_non_spec, last_recurrent_state = (
+                    fused_recurrent_gated_delta_rule(
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        g=g_non_spec,
+                        beta=beta_non_spec,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=non_spec_query_start_loc[
+                            : gdn_metadata.num_decodes + 1
+                        ],
+                        ssm_state_indices=non_spec_state_indices_tensor,
+                        ssm_state_indices_in=non_spec_state_indices_in_tensor,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                )
+        else:
+            core_attn_out_non_spec, last_recurrent_state = None, None
+
+        # 3. Merge core attention output
+
+        if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
+            merged_out = torch.empty(
+                (1, num_actual_tokens, *core_attn_out_spec.shape[2:]),
+                dtype=core_attn_out_non_spec.dtype,
+                device=core_attn_out_non_spec.device,
+            )
+            merged_out.index_copy_(1, spec_token_indx, core_attn_out_spec)
+            merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
+            core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
+        elif spec_sequence_masks is not None:
+            core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
+        else:
+            core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+
+        # Zero padding tail for CUDA graph replay safety
+        if num_actual_tokens < core_attn_out.shape[0]:
+            core_attn_out[num_actual_tokens:].zero_()
+
+        return core_attn_out

@@ -1,0 +1,10 @@
+data: {"id":"req-fixture","object":"chat.completion.chunk","created":1700000000,"model":"mock-model","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":null},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"req-fixture","object":"chat.completion.chunk","created":1700000000,"model":"mock-model","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello","reasoning_content":null},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"req-fixture","object":"chat.completion.chunk","created":1700000000,"model":"mock-model","choices":[{"index":0,"delta":{"role":"assistant","content":" world","reasoning_content":null},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"req-fixture","object":"chat.completion.chunk","created":1700000000,"model":"mock-model","choices":[{"index":0,"delta":{"reasoning_content":null},"logprobs":null,"finish_reason":"stop"}]}
+
+data: [DONE]
+

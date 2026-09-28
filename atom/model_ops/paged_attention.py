@@ -1,0 +1,124 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+# from flash_attn import flash_attn_with_kvcache
+
+import torch
+from torch import nn
+
+from atom.config import get_current_atom_config
+from atom.plugin.prepare import is_plugin_mode
+from atom.utils.selector import Family, get_attn_backend
+
+from .attention_mla import MLAModules
+from .base_attention import BaseAttention
+
+
+class Attention(BaseAttention):
+    """
+    Attention paged implementation
+    """
+
+    def __init__(
+        self,
+        num_heads,
+        head_dim,
+        scale,
+        num_kv_heads,
+        alibi_slopes: list[float] | None = None,
+        kv_cache_dtype="bf16",
+        layer_num=0,
+        use_mla: bool = False,
+        mla_modules: MLAModules | None = None,
+        sinks: nn.Parameter | None = None,
+        per_layer_sliding_window: int | None = None,
+        rotary_emb: torch.nn.Module | None = None,
+        prefix: str | None = None,
+        q_norm: torch.nn.Module | None = None,
+        k_norm: torch.nn.Module | None = None,
+        impl_cls: type | None = None,
+        **kwargs,
+    ):
+        assert (
+            not is_plugin_mode()
+        ), "ATOM native Attention is only supported for ATOM native/server mode"
+        super().__init__(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            scale=scale,
+            num_kv_heads=num_kv_heads,
+            kv_cache_dtype=kv_cache_dtype,
+            layer_num=layer_num,
+            use_mla=use_mla,
+            mla_modules=mla_modules,
+            sinks=sinks,
+            per_layer_sliding_window=per_layer_sliding_window,
+            rotary_emb=rotary_emb,
+            prefix=prefix,
+            **kwargs,
+        )
+
+        self.use_mla = use_mla
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.scale = scale
+        self.num_kv_heads = num_kv_heads
+        self.k_cache = self.v_cache = torch.tensor([])
+        self.kv_cache_dtype = kv_cache_dtype
+        self.max_model_len = 0
+        self.k_scale = self.v_scale = None
+        self.layer_num = layer_num
+        self.mla_modules = mla_modules
+        self.base_attention = None
+        self.kv_cache = torch.tensor([])
+        self.indexer = mla_modules.indexer if mla_modules is not None else None
+        self.sinks = sinks
+
+        atom_config = get_current_atom_config()
+        dtype = atom_config.torch_dtype
+        # This layer's family, not the model's: the backend is here only to
+        # name an impl class, and a hybrid's runner-level one covers its linear
+        # layers too.
+        self.attn_backend = get_attn_backend(Family.MLA if self.use_mla else Family.MHA)
+        # Allow a model to plug in a specialized impl (e.g. the MiniMax-M3 sparse
+        # attention impl) while still reusing the backend's metadata builder.
+        # Falls back to the backend default when not overridden.
+        impl_cls = impl_cls or self.attn_backend.get_impl_cls()
+        self.impl = impl_cls(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            scale=scale,
+            num_kv_heads=num_kv_heads,
+            alibi_slopes=alibi_slopes,
+            kv_cache_dtype=kv_cache_dtype,
+            layer_num=layer_num,
+            mla_modules=mla_modules,
+            sinks=sinks,
+            sliding_window=per_layer_sliding_window,
+            rotary_emb=rotary_emb,
+            dtype=dtype,
+            q_norm=q_norm,
+            k_norm=k_norm,
+            **kwargs,
+        )
+        compilation_config = atom_config.compilation_config
+        default_name = f"MLA_{layer_num}" if self.use_mla else f"MHA_{layer_num}"
+        self.layer_name = prefix if prefix is not None else default_name
+        if self.layer_name in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer: {self.layer_name}")
+        compilation_config.static_forward_context[self.layer_name] = self
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        positions: torch.Tensor = None,
+        q_scale: torch.Tensor | None = None,
+        qkv: torch.Tensor = None,
+        **kwargs,
+    ):
+        output = torch.ops.aiter.unified_attention_with_output_base(
+            query, q_scale, key, value, positions, self.layer_name, self.use_mla, qkv
+        )
+        return output
