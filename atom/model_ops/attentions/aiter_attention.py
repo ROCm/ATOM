@@ -773,43 +773,28 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
     def get_kv_transfer_tensors(self):
-        from atom.kv_transfer.disaggregation.types import (
-            KVTransferRegion,
-            KVTransferTensors,
-        )
+        from atom.kv_transfer.disaggregation.types import KVTransferTensors
 
         if not self.kv_pools:
             return None
-        region_tensors = [
-            (geometry, role, tensor)
-            for geometry, pool in self.kv_pools.items()
-            for role, tensor in pool.region_tensors()
-        ]
-        # Every field of every pool, indexer cache included: a region per
-        # (pool, field, layer), in declared order.
-        return KVTransferTensors(
-            block_regions=[
-                KVTransferRegion(
-                    base_addr=tensor.data_ptr(),
-                    total_bytes=tensor.numel() * tensor.element_size(),
-                    unit_bytes=tensor.stride(0) * tensor.element_size(),
-                    # The geometry, because a hybrid declares two pools whose
-                    # per-layer regions are otherwise named alike.
-                    semantic_role=f"mha.{geometry}.{role}",
-                )
-                for geometry, role, tensor in region_tensors
-            ],
+        transfer = KVTransferTensors(
+            block_regions=[],
             slot_regions=[],
-            # MHA arenas expose one contiguous byte row per scheduler block.
-            # LMCache MP deliberately treats the last two dimensions as opaque
-            # copy geometry, so adding a singleton physical-slot dimension is
-            # a zero-copy view of the exact region declared above.
-            block_tensor_views=[tensor.unsqueeze(1) for _, _, tensor in region_tensors],
             # GQA/MQA KV heads are sharded or only partially replicated across
             # TP. In particular MiniMax-M3 must keep one stored shard per rank;
             # whole-object TP collapse is unsafe for this PAGE layout.
             tp_replication_factor=1,
         )
+        # Every field of every pool, indexer cache included: a region per
+        # (pool, field, layer), in declared order. The geometry is in the role
+        # because a hybrid declares two pools whose per-layer regions are
+        # otherwise named alike.
+        for geometry, pool in self.kv_pools.items():
+            for role, tensor in pool.region_tensors():
+                transfer.add_block_region(
+                    tensor, semantic_role=f"mha.{geometry}.{role}"
+                )
+        return transfer
 
     def refresh_flydsl_plan(self, context_lens, *, create=False):
         """Build or refresh aiter #5546's work plan for this forward.

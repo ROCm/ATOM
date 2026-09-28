@@ -1862,3 +1862,47 @@ def test_factory_registers_lmcache_mp_alias_without_pd_staging():
         )
         is False
     )
+
+
+def test_add_block_region_publishes_a_region_and_its_byte_view_together():
+    """One call yields both halves, zero-copy, over exactly the PAGE bytes:
+    a larger allocation (DSV4's planes also hold SLOT rows) is cut to them."""
+    arena = torch.arange(3 * 8 + 4, dtype=torch.int16)  # 3 blocks + a tail
+    transfer = KVTransferTensors(block_regions=[], slot_regions=[])
+    transfer.add_block_region(
+        arena, semantic_role="plane", unit_bytes=16, total_bytes=3 * 16
+    )
+    fp16 = torch.zeros(3, 4, 2, dtype=torch.float16)
+    transfer.add_block_region(fp16, semantic_role="rows")
+
+    [plane, rows] = transfer.block_regions
+    assert (plane.base_addr, plane.total_bytes, plane.unit_bytes) == (
+        arena.data_ptr(),
+        48,
+        16,
+    )
+    assert (rows.total_bytes, rows.unit_bytes) == (48, 16)
+    for region, view in zip(
+        transfer.block_regions, transfer.block_tensor_views, strict=True
+    ):
+        assert view.dtype == torch.uint8
+        assert tuple(view.shape) == (3, 1, 16)
+        assert view.data_ptr() == region.base_addr
+    transfer.block_tensor_views[1][2].fill_(1)
+    assert torch.all(fp16[2].view(torch.uint8) == 1)
+    transfer.set_block_count(3)
+    assert page_views._build_cache_views(transfer, num_blocks=3).bytes_per_block == 32
+
+
+def test_add_block_region_rejects_what_it_cannot_alias():
+    transfer = KVTransferTensors(block_regions=[], slot_regions=[])
+    with pytest.raises(ValueError, match="contiguous"):
+        transfer.add_block_region(torch.zeros(4, 3).t(), semantic_role="strided")
+    with pytest.raises(ValueError, match="cannot publish"):
+        transfer.add_block_region(
+            torch.zeros(8, dtype=torch.uint8),
+            semantic_role="short",
+            unit_bytes=4,
+            total_bytes=12,
+        )
+    assert transfer.block_regions == [] and transfer.block_tensor_views == []

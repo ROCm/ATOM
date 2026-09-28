@@ -231,11 +231,11 @@ class KVTransferTensors:
     scatter_slot: Callable[[int, int], None] | None = None
     # Appended for positional compatibility with existing generic descriptors.
     expected_full_slot_region_count: int | None = None
-    # Zero-copy, physical-order views paired with block regions.
-    # Each view is [num_units, physical_slots_per_unit, opaque_width]; it may
-    # retain its native dtype, and one dim-0 unit must cover exactly the paired
-    # region's unit_bytes. The last two dimensions describe copy geometry, not
-    # a semantic token/head layout.
+    # Zero-copy, physical-order views paired with block regions. Each view is
+    # [num_units, physical_slots_per_unit, opaque_width] and one dim-0 unit
+    # covers exactly the paired region's unit_bytes; the last two dimensions
+    # describe copy geometry, not a token/head layout. Backends publish both
+    # through `add_block_region`, which keeps the pair in step.
     block_tensor_views: list[Any] = field(default_factory=list)
     # Number of TP workers whose complete PAGE layout is byte-identical.
     # ``1`` means no cross-rank deduplication is safe.
@@ -279,6 +279,54 @@ class KVTransferTensors:
     # and a backend counts in its own page -- a different unit even where it is
     # the same number. Set through `set_block_count`.
     num_blocks: int = field(init=False, default=0)
+
+    def add_block_region(
+        self,
+        tensor: Any,
+        *,
+        semantic_role: str,
+        unit_bytes: int | None = None,
+        total_bytes: int | None = None,
+    ) -> None:
+        """Publish one PAGE region and its block-major byte view, built together.
+
+        The region (addresses for P/D and dense offload) and the view (a tensor
+        for LMCache MP) describe the same bytes, so they come from one place
+        rather than two lists kept in step by hand. The view is a zero-copy
+        ``uint8 [num_units, 1, unit_bytes]`` alias of ``tensor``: the last two
+        dimensions are opaque copy geometry, and LMCache stores the same bytes
+        in the same order whatever shape a block is given.
+
+        ``unit_bytes`` defaults to ``tensor``'s row stride and ``total_bytes``
+        to all of it. A larger allocation that holds more than the PAGE units
+        (DSV4's planes also hold SLOT rows after them) passes both.
+        """
+        import torch  # this module stays importable without torch
+
+        if not tensor.is_contiguous():
+            raise ValueError(f"PAGE tensor {semantic_role!r} must be contiguous")
+        element_size = tensor.element_size()
+        if unit_bytes is None:
+            unit_bytes = tensor.stride(0) * element_size
+        if total_bytes is None:
+            total_bytes = tensor.numel() * element_size
+        available = tensor.numel() * element_size
+        if unit_bytes <= 0 or total_bytes % unit_bytes or total_bytes > available:
+            raise ValueError(
+                f"PAGE tensor {semantic_role!r} has {available} bytes; cannot "
+                f"publish {total_bytes} bytes in units of {unit_bytes}"
+            )
+        # `view`, never `reshape`: a copy would publish bytes nobody writes.
+        byte_view = tensor.view(torch.uint8).view(-1)[:total_bytes]
+        self.block_regions.append(
+            KVTransferRegion(
+                base_addr=tensor.data_ptr(),
+                total_bytes=total_bytes,
+                unit_bytes=unit_bytes,
+                semantic_role=semantic_role,
+            )
+        )
+        self.block_tensor_views.append(byte_view.view(-1, 1, unit_bytes))
 
     def set_block_count(self, num_blocks: int) -> None:
         """Fix the block id space, and check every region is in it.

@@ -1447,32 +1447,19 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # and no per-field override to keep in step with the pooling ones.
         # DCP PD still dispatches on the two collapsed roles (`mla.kv` /
         # `dsa.index_cache`) rather than the pool's per-layer names.
-        region_tensors = self.kv_pool.region_tensors()
-        block_regions: list[KVTransferRegion] = []
-        for role, t in region_tensors:
-            bpb = t.stride(0) * t.element_size()
+        pages = KVTransferTensors(block_regions=[], slot_regions=[])
+        for role, t in self.kv_pool.region_tensors():
             if role.startswith("index."):
-                block_regions.append(
-                    KVTransferRegion(
-                        base_addr=t.data_ptr(),
-                        total_bytes=t.numel() * t.element_size(),
-                        unit_bytes=bpb,
-                        semantic_role=INDEX_CACHE_ROLE,
-                    )
-                )
+                pages.add_block_region(t, semantic_role=INDEX_CACHE_ROLE)
                 index_tensors.append(t)
                 continue
-            block_regions.append(
-                KVTransferRegion(
-                    base_addr=t.data_ptr(),
-                    total_bytes=t.numel() * t.element_size(),
-                    unit_bytes=bpb,
-                    semantic_role=(
-                        MLA_KV_ROLE if role.startswith("kv.") else f"mla.{role}"
-                    ),
-                )
+            pages.add_block_region(
+                t,
+                semantic_role=(
+                    MLA_KV_ROLE if role.startswith("kv.") else f"mla.{role}"
+                ),
             )
-        block_tensor_views = [t for _, t in region_tensors]
+        block_regions = pages.block_regions
 
         block_region_consumer_indices = None
         index_cache_layer_ids = getattr(runner, "index_cache_layer_ids", ())
@@ -1637,7 +1624,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         return KVTransferTensors(
             block_regions=block_regions,
             slot_regions=[],
-            block_tensor_views=block_tensor_views,
+            block_tensor_views=pages.block_tensor_views,
             block_region_consumer_indices=block_region_consumer_indices,
             index_staging_region=index_staging_region,
             index_staging_pool_size=index_staging_pool_size,

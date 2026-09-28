@@ -171,6 +171,9 @@ def mla_builder_cls():
             kv_indices_generate_triton=noop,
             mtp_prepare_decode_mla_kernel=noop,
         ),
+        "atom.utils.block_tables": _module(
+            "atom.utils.block_tables", block_table_state=noop
+        ),
         "atom.utils.forward_context": _module(
             "atom.utils.forward_context",
             AttentionMetaData=type("AttentionMetaData", (), {}),
@@ -263,10 +266,13 @@ def test_mla_builder_publishes_latent_and_index_views(
     assert transfer.num_blocks == 0
     transfer.set_block_count(2)
 
+    # Published as block-major bytes, like every other backend: one fp16
+    # [2 rows, 7] block is 28 bytes, one index block index_rows * 3.
+    assert all(view.dtype == torch.uint8 for view in transfer.block_tensor_views)
     assert [tuple(view.shape) for view in transfer.block_tensor_views] == [
-        (2, 2, 7),
-        (2, 2, 7),
-    ] + [(2, index_rows, 3)] * index_layers
+        (2, 1, 28),
+        (2, 1, 28),
+    ] + [(2, 1, index_rows * 3)] * index_layers
     # Main's DCP transfer contract intentionally collapses physical rows into
     # transport roles. MP still keeps them distinct through the plane index in
     # each tensor key (``page.<index>.<role>``).
@@ -282,4 +288,4 @@ def test_mla_builder_publishes_latent_and_index_views(
     assert cache_views.bytes_per_block == 2 * 2 * 7 * 2 + index_layers * index_rows * 3
     # Transfer writes must update the allocation used by attention kernels.
     transfer.block_tensor_views[0][1].fill_(7)
-    assert torch.all(pool.layer("kv", 0)[1] == 7)
+    assert torch.all(pool.layer("kv", 0)[1].view(torch.uint8) == 7)

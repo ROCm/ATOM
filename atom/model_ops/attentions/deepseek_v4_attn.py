@@ -1922,8 +1922,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         geo = self.pool_geometry
         elem_fp32 = 4
 
-        block_regions: list[KVTransferRegion] = []
-        block_tensor_sources: list[torch.Tensor] = []
+        # PAGE regions and their LMCache MP byte views, published as pairs.
+        pages = KVTransferTensors(block_regions=[], slot_regions=[])
         swa_block_regions: list[KVTransferRegion] = []
         slot_regions: list[KVTransferRegion] = []
 
@@ -1949,16 +1949,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             )
         )
         for plane, row_bytes, role in planes:
-            if not plane.is_contiguous():
-                raise RuntimeError("a KV plane must be contiguous to be transferred")
-            block_tensor_sources.append(plane)
-            block_regions.append(
-                KVTransferRegion(
-                    plane.data_ptr(),
-                    self.num_blocks * geo.block_bytes(row_bytes),
-                    geo.block_bytes(row_bytes),
-                    semantic_role=role,
-                )
+            # A plane also holds SLOT rows after its PAGE blocks; publish only
+            # the blocks.
+            pages.add_block_region(
+                plane,
+                semantic_role=role,
+                unit_bytes=geo.block_bytes(row_bytes),
+                total_bytes=self.num_blocks * geo.block_bytes(row_bytes),
             )
 
         # Compressed PAGE regions: one per CSA layer in each indexer pool.
@@ -1967,20 +1964,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # this remains correct for both the FP8 row layout and FP4 tiles.
         for pool, role_prefix in self._indexer_page_pools():
             for pos, layer_id in enumerate(self.csa_layers):
-                view = pool[pos]
-                if not view.is_contiguous():
-                    raise RuntimeError(
-                        "a CSA indexer layer must be contiguous to be transferred"
-                    )
-                block_tensor_sources.append(view)
-                block_regions.append(
-                    KVTransferRegion(
-                        view.data_ptr(),
-                        view.numel() * view.element_size(),
-                        view.stride(0) * view.element_size(),
-                        semantic_role=f"{role_prefix}.layer_{layer_id}",
-                    )
+                pages.add_block_region(
+                    pool[pos], semantic_role=f"{role_prefix}.layer_{layer_id}"
                 )
+        block_regions = pages.block_regions
 
         checkpoint_spec = runner.state_runtime.checkpoint_spec
         if checkpoint_spec is None:
@@ -1991,30 +1978,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 "DSV4 PAGE transfer regions do not cover the sized PAGE unit: "
                 f"regions={transfer_page_bytes}, "
                 f"checkpoint={checkpoint_spec.page_unit_bytes}"
-            )
-
-        # LMCache MP needs one block-major tensor for every PAGE region. Build
-        # byte views only after validating the declared checkpoint geometry so
-        # malformed layouts fail with the useful region-size error above. The
-        # source tensors are not guaranteed to expose rows as dimension zero;
-        # flattening their byte representation also handles the one-dimensional
-        # allocation owners used by the transfer-geometry tests.
-        block_tensor_views: list[torch.Tensor] = []
-        for source, region in zip(block_tensor_sources, block_regions, strict=True):
-            byte_view = source.view(torch.uint8).reshape(-1)
-            required_bytes = self.num_blocks * region.unit_bytes
-            if byte_view.numel() < required_bytes:
-                raise RuntimeError(
-                    f"DSV4 PAGE tensor for {region.semantic_role!r} has "
-                    f"{byte_view.numel()} bytes, fewer than the "
-                    f"{required_bytes} bytes declared by its region"
-                )
-            block_tensor_views.append(
-                byte_view[:required_bytes].view(
-                    self.num_blocks,
-                    1,
-                    region.unit_bytes,
-                )
             )
 
         # Full per-request SLOT (legacy field name: `swa_block_regions`) is one
@@ -2080,7 +2043,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             staging_pool_size=pool_size if staging_region else 0,
             gather_slot=gather_slot,
             scatter_slot=scatter_slot,
-            block_tensor_views=block_tensor_views,
+            block_tensor_views=pages.block_tensor_views,
             tp_replication_factor=tp_size,
             native_state_tp_replication_factor=tp_size,
             paged_state_checkpoint_spec=checkpoint_spec,
