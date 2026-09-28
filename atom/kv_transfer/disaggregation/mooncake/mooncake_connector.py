@@ -430,7 +430,11 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
 
     def update_state_after_alloc(self, seq: Sequence) -> None:
         params = seq.kv_transfer_params or {}
-        if params.get("chunked_transfer"):
+        if params.get("chunked_transfer") and (
+            self.is_producer or params.get("do_remote_prefill")
+        ):
+            # A D sequence may be reallocated after preemption. Its completed
+            # transfer must not acquire another pending handoff on local replay.
             params["prompt_digest"] = hashlib.sha256(
                 np.asarray(seq.prompt_token_ids, dtype="<i4").tobytes()
             ).hexdigest()
@@ -968,8 +972,10 @@ class MooncakeConnector(KVConnectorBase):
 
         tt: KVTransferTensors = transfer_tensors
 
-        self._has_slot_regions = (
-            len(tt.slot_regions) > 0 or tt.staging_region is not None
+        # Full SWA/SLOT pools also need the state-transfer path when no
+        # separate slot regions or compressor staging buffer are present.
+        self._has_slot_regions = bool(
+            tt.slot_regions or tt.swa_block_regions or tt.staging_region is not None
         )
         self.num_blocks = tt.num_blocks
         self._gather_slot = tt.gather_slot
@@ -1507,6 +1513,7 @@ class MooncakeConnector(KVConnectorBase):
                     state.cancel()  # Late holders of the object cannot acquire it.
                     del self._chunked_prefills[transfer_id]
                     self._chunked_local_ids.pop(state.req_id, None)
+                    self._kv_cache_ready_events.pop(state.req_id, None)
         with self._completion_lock:
             received_handoffs = self._received_handoffs
             self._received_handoffs = {}
@@ -1550,6 +1557,12 @@ class MooncakeConnector(KVConnectorBase):
 
         with zmq_socket_ctx(path, zmq.ROUTER, bind=True) as sock:
             while True:
+                # P can be completely idle if this request was never admitted.
+                # Expire queued lookups without depending on scheduler polling
+                # or another incoming message to wake this listener.
+                self._dispatch_ready_chunked_requests()
+                if not sock.poll(timeout=1000):
+                    continue
                 parts = sock.recv_multipart()
                 identity, msg_type = parts[0], parts[1]
 
@@ -1828,6 +1841,27 @@ class MooncakeConnector(KVConnectorBase):
                     "[PRODUCER] failed to notify consumer of transfer failure"
                 )
 
+    def _acquire_chunked_reader(
+        self, state: ChunkedPrefill, request_data: dict
+    ) -> bool:
+        # The notification endpoint identifies the consumer worker; request ID
+        # and nonce distinguish its receive attempt from duplicate messages.
+        consumer_identity = (
+            request_data["notify_host"],
+            request_data["notify_port"],
+            request_data["request_id"],
+            request_data.get("write_nonce", 0),
+        )
+        # With TP fan-out, each producer rank serves this many consumer ranks,
+        # each with an independent cursor over the same source block table.
+        num_consumers_per_producer_rank = max(
+            1, request_data.get("consumer_tp_size", self.tp_size) // self.tp_size
+        )
+        return state.acquire(
+            consumer_identity=consumer_identity,
+            expected_readers=num_consumers_per_producer_rank,
+        )
+
     def _dispatch_ready_chunked_requests(self) -> None:
         """Do not occupy send threads with requests P has not admitted.
 
@@ -1840,25 +1874,14 @@ class MooncakeConnector(KVConnectorBase):
             pending = []
             for data, queued_at in self._pending_chunked_requests:
                 state = self._chunked_prefills.get(data["transfer_id"])
-                if state is None or not (state.ready_blocks or state.cancelled):
+                if state is None or not (state.num_ready_blocks or state.cancelled):
                     if time.monotonic() - queued_at < PREFILL_LOOKUP_TIMEOUT:
                         pending.append((data, queued_at))
                     else:
                         submissions.append((data, None))
                     continue
                 try:
-                    acquired = state.acquire(
-                        (
-                            data["notify_host"],
-                            data["notify_port"],
-                            data["request_id"],
-                            data.get("write_nonce", 0),
-                        ),
-                        max(
-                            1,
-                            data.get("consumer_tp_size", self.tp_size) // self.tp_size,
-                        ),
-                    )
+                    acquired = self._acquire_chunked_reader(state, data)
                 except (RuntimeError, ValueError):
                     submissions.append((data, None))
                 else:
@@ -1893,31 +1916,29 @@ class MooncakeConnector(KVConnectorBase):
                             "timed out waiting for chunked prefill allocation"
                         )
                     state = self._chunked_prefills[transfer_id]
-                    acquired = state.acquire(
-                        (
-                            request_data["notify_host"],
-                            request_data["notify_port"],
-                            request_data["request_id"],
-                            request_data.get("write_nonce", 0),
-                        ),
-                        max(
-                            1,
-                            request_data.get("consumer_tp_size", self.tp_size)
-                            // self.tp_size,
-                        ),
-                    )
+                    acquired = self._acquire_chunked_reader(state, request_data)
             if not acquired:
                 return  # The original task owns completion of this duplicate.
             req_id = request_data["request_id"]
             if request_data.get("prompt_digest") != state.prompt_digest:
                 raise ValueError("P/D prompt token IDs differ")
-            skip = max(1, request_data.get("src_block_skip_factor", 1))
-            cursor = request_data.get("num_computed_blocks", 0) * skip
-            dst = request_data["dst_block_ids"]
+            src_blocks_per_dst_block = max(
+                1, request_data.get("src_block_skip_factor", 1)
+            )
+            # Absolute offset in P's full block table; D's cached prefix needs
+            # no transfer. D has already removed that prefix from dst_block_ids.
+            src_block_offset = (
+                request_data.get("num_computed_blocks", 0) * src_blocks_per_dst_block
+            )
+            dst_block_ids = request_data["dst_block_ids"]
+            num_remaining_src_blocks = len(state.block_ids) - src_block_offset
+            num_expected_dst_blocks = (
+                num_remaining_src_blocks + src_blocks_per_dst_block - 1
+            ) // src_blocks_per_dst_block
             if (
-                cursor < 0
-                or cursor > len(state.block_ids)
-                or len(dst) != (len(state.block_ids) - cursor + skip - 1) // skip
+                src_block_offset < 0
+                or src_block_offset > len(state.block_ids)
+                or len(dst_block_ids) != num_expected_dst_blocks
             ):
                 raise ValueError("chunked source/destination block count mismatch")
             has_slots = request_data.get("has_slot_regions", False)
@@ -1933,20 +1954,28 @@ class MooncakeConnector(KVConnectorBase):
                 "slot_index": state.slot_index,
                 "swa_block_ids": state.swa_block_ids,
             }
-            dst_cursor = 0
-            while cursor < len(state.block_ids):
-                src, event, end = state.wait_chunk(cursor, skip)
+            # Relative offset in D's remaining (prefix-trimmed) block table.
+            dst_block_offset = 0
+            while src_block_offset < len(state.block_ids):
+                chunk_src_block_ids, event, src_block_end = state.wait_chunk(
+                    src_block_offset=src_block_offset,
+                    src_blocks_per_dst_block=src_blocks_per_dst_block,
+                )
                 # Synchronize in this send thread, never the scheduling thread.
                 # This also protects plain RDMA reads, not only index staging.
                 event.synchronize()
-                count = (end - cursor + skip - 1) // skip
-                chunk_dst = dst[dst_cursor : dst_cursor + count]
+                num_chunk_dst_blocks = (
+                    src_block_end - src_block_offset + src_blocks_per_dst_block - 1
+                ) // src_blocks_per_dst_block
+                chunk_dst_block_ids = dst_block_ids[
+                    dst_block_offset : dst_block_offset + num_chunk_dst_blocks
+                ]
                 if has_slots:
                     ok = self._execute_block_slot_transfer(
                         request_data,
                         target,
-                        src,
-                        chunk_dst,
+                        chunk_src_block_ids,
+                        chunk_dst_block_ids,
                         prefill_data,
                         req_id,
                         engine=engine,
@@ -1956,16 +1985,16 @@ class MooncakeConnector(KVConnectorBase):
                     ok = self._execute_block_transfer(
                         request_data,
                         target,
-                        src,
-                        chunk_dst,
+                        chunk_src_block_ids,
+                        chunk_dst_block_ids,
                         req_id,
                         event,
                         engine=engine,
                     )
                 if not ok:
                     raise RuntimeError("chunk RDMA write failed")
-                cursor = end
-                dst_cursor += count
+                src_block_offset = src_block_end
+                dst_block_offset += num_chunk_dst_blocks
             handoff = state.wait_handoff()
             if has_slots:
                 prefill_data = {

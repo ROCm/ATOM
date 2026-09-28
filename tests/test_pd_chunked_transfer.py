@@ -24,6 +24,8 @@ from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
     ConnectorMetadata,
     KVConnectorOutput,
+    KVTransferRegion,
+    KVTransferTensors,
 )
 
 
@@ -67,6 +69,7 @@ def producer(pp_rank=0, pp_size=1, num_tokens=10):
     c._completed_prefills_cv = threading.Condition(c._completed_prefills_lock)
     c._chunked_prefills = {}
     c._chunked_local_ids = {}
+    c._kv_cache_ready_events = {}
     c._pending_chunked_requests = []
     c._completion_lock = threading.Lock()
     c.done_sending = set()
@@ -327,7 +330,7 @@ def test_worker_publication_uses_batch_snapshot_and_own_gpu_event(monkeypatch):
     batch = SimpleNamespace(req_ids=[7], total_seqs_num_prefill=1, context_lens=[6])
     c.publish_prefill_chunks(batch)
     event.record.assert_called_once_with("stage-stream")
-    assert state.ready_blocks == 1
+    assert state.num_ready_blocks == 1
     assert state.event is event
 
 
@@ -497,6 +500,99 @@ def test_mutable_slot_is_sent_once_after_final_metadata():
     c._notify_transfer_result.assert_called_once_with(req, success=True)
 
 
+@pytest.mark.parametrize("reverse_indexed", [False, True])
+def test_swa_only_pool_transfers_final_relocated_slot(reverse_indexed):
+    import msgpack
+
+    p, state, _, page_src, page_destinations = producer()
+    d = consumer(1)
+    d.is_producer = False
+    d.tp_size = d.dcp_size = d.pp_size = 1
+    d.tp_rank = d.dp_rank = d.dcp_rank = 0
+    d.dcp_interleave_size = 1
+    d.local_ip = "cpu"
+    d.ib_device = None
+    d._notification_port = 2
+    d._staging_pool_size = d._staging_slot_bytes = 0
+    d._rail_pool = None
+    d._send_on_socket = MagicMock()
+    d.transfer_engine = MemoryEngine()
+    swa_src = (ctypes.c_ubyte * 12)(*range(1, 13))
+    swa_dst = (ctypes.c_ubyte * 20)()
+    regions = []
+    for connector, pages, slots in (
+        (p, page_src, swa_src),
+        (d, page_destinations[0], swa_dst),
+    ):
+        connector.engine_id = "cpu-test"
+        connector.rpc_port = 1
+        connector.block_len = 4
+        connector.ib_devices = []
+        connector.transfer_engine.batch_register_memory = MagicMock(return_value=0)
+        # Exercise real registration without starting network listeners.
+        connector._write_listener = lambda: None
+        connector._notification_listener = lambda: None
+        swa_region = KVTransferRegion(
+            ctypes.addressof(slots), len(slots), 4, reverse_indexed=reverse_indexed
+        )
+        regions.append(swa_region)
+        transfer = KVTransferTensors(
+            block_regions=[KVTransferRegion(ctypes.addressof(pages), len(pages), 4)],
+            slot_regions=[],
+            swa_block_regions=[swa_region],
+            num_slots=len(slots) // 4,
+        )
+        transfer.set_block_count(12)
+        connector.register_kv_caches({"layer": None}, transfer_tensors=transfer)
+
+    meta = ConnectorMetadata()
+    meta.add_new_req_to_recv(
+        21,
+        [2, 9, 4],
+        {
+            "chunked_transfer": True,
+            "transfer_id": "xfer-a",
+            "remote_host": "cpu",
+            "remote_handshake_port": 6301,
+            "remote_tp_size": 1,
+            "local_slot_index": 2,
+        },
+        local_swa_block_ids=[2],
+    )
+    d.start_load_kv(meta)
+    _, (_, payload) = d._send_on_socket.call_args.args
+    request = msgpack.loads(payload)
+    assert request["has_slot_regions"]
+    assert request["dst_swa_block_ids"] == [2]
+    assert request["consumer_staging_addr"] == 0
+    assert request["consumer_slot_base_addrs"] == []
+
+    state.slot_index = 0
+    state.swa_block_ids = [0]
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(p._execute_transfer, request)
+        publish(state, 4)
+        p.transfer_engine.writes.get(timeout=5)
+        assert not any(swa_dst)
+        publish(state, 10)
+        p.transfer_engine.writes.get(timeout=5)
+        assert not any(swa_dst)
+        assert not future.done()
+        state.finish({"first_token_id": 42}, slot_index=1, swa_block_ids=[1])
+        future.result(timeout=5)
+
+    src_region, dst_region = regions
+    src_addr = src_region.unit_addr(1)
+    dst_addr = dst_region.unit_addr(2)
+    assert p.transfer_engine.writes.get_nowait() == ([src_addr], [dst_addr], [4])
+    assert p.transfer_engine.writes.empty()
+    expected = bytearray(len(swa_dst))
+    offset = dst_addr - ctypes.addressof(swa_dst)
+    expected[offset : offset + 4] = ctypes.string_at(src_addr, 4)
+    assert bytes(swa_dst) == expected
+    p._notify_transfer_result.assert_called_once_with(request, success=True)
+
+
 def test_terminal_without_consumer_expires_but_live_rdma_cannot_expire(monkeypatch):
     state = ChunkedPrefill(1, [0], 4, 4, timeout=1)
     now = state.updated
@@ -662,3 +758,128 @@ def test_malformed_handoff_fails_receive_without_killing_notification_loop(hando
     assert c._record_write_done(21, 0, 0, 3, handoff=handoff)
     assert c.failed_recving == {21}
     assert not c.done_recving and not c._received_handoffs
+
+
+def test_duplicate_cancelled_request_waits_for_original_rdma():
+    p, state, request, _, _ = producer()
+    d = consumer(1)
+    entered, release = threading.Event(), threading.Event()
+    write = p.transfer_engine.batch_transfer_sync_write
+
+    def blocked_write(*args):
+        entered.set()
+        assert release.wait(5)
+        return write(*args)
+
+    def notify(data, *, success):
+        d._record_write_done(
+            data["request_id"], 0, 0, data["write_nonce"], success=success
+        )
+
+    p.transfer_engine.batch_transfer_sync_write = blocked_write
+    p._notify_transfer_result.side_effect = notify
+    publish(state, 4)
+    with ThreadPoolExecutor(1) as pool:
+        original = pool.submit(p._execute_transfer, request)
+        try:
+            assert entered.wait(5)
+            state.cancel()
+            p._execute_transfer(request.copy())
+            # A duplicate must not report failure while the original still
+            # writes into D's reservation, even after P has been cancelled.
+            assert not d.failed_recving
+            assert d._pending_recv_blocks
+            p._notify_transfer_result.assert_not_called()
+        finally:
+            release.set()
+            original.result(timeout=5)
+    assert d.failed_recving == {21}
+    p._notify_transfer_result.assert_called_once_with(request, success=False)
+
+
+@pytest.mark.parametrize("aborted", [False, True])
+def test_chunk_source_retirement_releases_legacy_ready_event(aborted):
+    p, state, request, _, _ = producer()
+    publish(state, 10)
+    p._kv_cache_ready_events = {7: object(), "legacy": object()}
+    if aborted:
+        state.cancel()
+    else:
+        state.finish({"first_token_id": 42})
+        p._execute_transfer(request)
+    assert p.get_finished().connector_completions
+    assert set(p._kv_cache_ready_events) == {"legacy"}
+
+
+def test_completed_chunk_receive_is_not_registered_again_on_reallocation(
+    monkeypatch, seq_factory
+):
+    sched = scheduler_connector(monkeypatch, False)
+    seq = seq_factory(
+        list(range(10)),
+        kv_transfer_params={
+            "chunked_transfer": True,
+            "do_remote_prefill": True,
+            "transfer_id": "xfer-a",
+            "block_size": 4,
+            "dcp_size": 1,
+        },
+    )
+    seq.block_table = [2, 9, 4]
+    sched.update_state_after_alloc(seq)
+    sched.build_connector_meta()
+    sched.process_pd_completions(
+        KVConnectorOutput(
+            finished_recving={seq.id},
+            received_handoffs={seq.id: PrefillHandoff(seq.id, 42)},
+        )
+    )
+    assert not sched._chunked_receiving
+    # A preempted D sequence keeps its transfer parameters when re-prefilling
+    # locally. It must not register another remote handoff that will never come.
+    sched.update_state_after_alloc(seq)
+    assert not sched._chunked_receiving
+    assert not sched.build_connector_meta().has_work()
+
+
+def test_idle_write_listener_expires_unadmitted_chunk_request(monkeypatch):
+    from contextlib import nullcontext
+
+    import msgpack
+
+    p, _, request, _, _ = producer()
+    request["transfer_id"] = "never-admitted"
+    p._side_channel_port = 6301
+    now = [0.0]
+    monkeypatch.setattr(mc.time, "monotonic", lambda: now[0])
+
+    class StopListener(Exception):
+        pass
+
+    class IdleSocket:
+        received = False
+        idle_polled = False
+
+        def poll(self, timeout):
+            if not self.received:
+                return mc.zmq.POLLIN
+            if self.idle_polled:
+                raise StopListener
+            self.idle_polled = True
+            now[0] += mc.PREFILL_LOOKUP_TIMEOUT + 1
+            return 0
+
+        def recv_multipart(self):
+            if self.received:
+                raise StopListener
+            self.received = True
+            return [b"consumer", mc.MSG_WRITE_REQUEST, msgpack.dumps(request)]
+
+    sock = IdleSocket()
+    monkeypatch.setattr(mc, "zmq_socket_ctx", lambda *a, **kw: nullcontext(sock))
+    with ThreadPoolExecutor(1) as pool:
+        p._send_executor = pool
+        with pytest.raises(StopListener):
+            p._write_listener()
+    p._notify_transfer_result.assert_called_once_with(request, success=False)
+    assert not p._pending_chunked_requests
