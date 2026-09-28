@@ -46,15 +46,16 @@ class StagedTransfer:
     events only order this worker's own streams against each other. The two
     callers make the source safe by different means:
 
-    * KV -- `connector.py` records the fence commit 7427e05e added to fix KV
-      corruption on reload on the RPC thread and `synchronize()`s it through
-      `save_ready_event` before handing the blocks over.
+    * KV -- `dense/connector.py::start_load_kv` records one `save_ready_event`
+      per save-bearing step on the RPC thread, before the forward; it reaches
+      `BlockGPUConnector.batched_from_gpu` as `producer_event`, which makes the
+      pack stream wait on it before the gather.
     * State -- `state_tier.submit_store` needs no event: the PAGE units are
       reserved out of the KV pool and engine-pinned for the whole transfer, so
       nothing on the compute stream is writing them and the gather reads them
       where they sit.
 
-    Do not delete the KV `save_ready_event` believing this class covers it:
+    Do not delete the KV `producer_event` believing this class covers it:
     without it the gather reads the staging entry's previous occupant, which is
     silent corruption.
     """
@@ -149,7 +150,7 @@ class StagedTransfer:
         reads the MemoryObj next must not see a D2H still in flight. It says
         nothing about the *producer* side -- this gather runs on a private
         stream and does not wait for the forward that wrote the entry. Keeping
-        the source quiescent is the caller's job (KV via `save_ready_event`,
+        the source quiescent is the caller's job (KV via `producer_event`,
         state via reserved-and-pinned units in `state_tier.submit_store`); see
         the class docstring.
         """

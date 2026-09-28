@@ -39,6 +39,10 @@ class SeqView:
         "_request",
         "block_table",
         "offload_handoff_boundary_tokens",
+        # Set by the chunked scheduler's `cancel_pending_load` when a composite
+        # withdraws this sub's load, and read back by Kimi-K3's state arm with
+        # ``getattr(seq, ..., False)``; an unset slot reads as "not cancelled".
+        "offload_load_cancelled",
         # The physical load floor, written by the chunked scheduler when it
         # emits a load and read back by the scheduler to decide where to resume
         # suffix prefill. ATOM's own ``Sequence`` initialises it to ``None``;
