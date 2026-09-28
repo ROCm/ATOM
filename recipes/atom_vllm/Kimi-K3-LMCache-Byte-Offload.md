@@ -323,30 +323,11 @@ silently if they are wrong:
 
 ## Client
 
-The workload is an **agentic trace replay**, not a synthetic prefix pool — there
-is no `--prompt-prefix-pool-size` to reason about, and reuse comes from the
-trace's own multi-turn structure. Identical on both arms:
-
-```bash
-aiperf profile --scenario inferencex-agentx-mvp \
-  --public-dataset semianalysis_cc_traces_weka_062126 \
-  --url "http://127.0.0.1:8713" --endpoint /v1/chat/completions \
-  --endpoint-type chat --streaming --model "${MODEL}" \
-  --concurrency 16 --benchmark-duration 1800 --random-seed 1234 \
-  --num-dataset-entries 800 --max-context-length 65536 \
-  --warmup-requests-per-lane 10 --warmup-grace-period 1800 \
-  --trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75 \
-  --trace-idle-gap-cap-seconds 300 --use-server-token-count \
-  --tokenizer "${MODEL}" --tokenizer-trust-remote-code \
-  --server-metrics "http://127.0.0.1:8713/metrics" --no-gpu-telemetry
-```
-
-
-### The second client: a controlled-prefix synthetic pool
-
-*A controlled-prefix client* under *Measured* used this instead. It exists
-because the trace replay above puts its reuse **inside** HBM, so it cannot
-measure the tier; here the reuse distance is a chosen number.
+A controlled-prefix synthetic pool, run once per concurrency rung of the sweep
+under *Measured* with `--concurrency` set to the row (16, 20, 24, 32) and
+everything else held byte-for-byte. The reuse distance has to be a *chosen*
+number for the tier to be measurable at all — a trace replay puts its reuse
+inside HBM and never asks the tier. Identical on both arms:
 
 ```bash
 aiperf profile --url "http://127.0.0.1:8713" \
@@ -374,31 +355,23 @@ ends do not land on prefix boundaries.
 `--max-context-length` is deliberately **not** passed: aiperf implements it only
 for trace datasets and rejects it on a synthetic one.
 
-`--num-dataset-entries 800` is sized to the window, not copied from a shorter
-run: 900 s drew 416 records against 400 entries, already at the replay edge, so
-doubling the duration without doubling the pool would have replayed prompts and
-inflated the late window on both arms.
+Four of these flags are load-bearing and none is cosmetic:
 
-Four of these are load-bearing and none is cosmetic:
-
-* `--random-seed` fixes the replay, so both arms draw the same trajectories.
-  Pass it explicitly; a default would let the arms diverge silently.
+* `--random-seed` fixes the dataset, so both arms replay the same prompts. Pass
+  it explicitly; a default would let the arms diverge silently.
 * `--use-server-token-count` makes every hit rate below a ratio of two
   server-side counters rather than of a client-side estimate, so the
   denominator cannot drift between arms.
-* `--max-context-length 65536` must equal the server's `--max-model-len`. This
-  trace's input sequences run past it (median ISL ~74k against a 65,536
-  window), so the two numbers disagreeing truncates the workload asymmetrically
-  rather than the pool.
-* `--warmup-requests-per-lane 10` is a **count** budget, not a time budget, and
-  `--warmup-grace-period` does not cap it. At this ISL warmup ran for minutes;
-  it is excluded from the exported records (`benchmark_phase`) and must not be
-  extrapolated into the measured window.
+* `--osl-stddev 0` with `ignore_eos:true` pins every response at exactly 512
+  tokens; otherwise the length distribution contaminates ITL and throughput.
+* `--num-dataset-entries 256` is sized to the window rather than copied from a
+  shorter run: a pool that the duration exhausts replays prompts and inflates
+  the late window on both arms.
 
 `--enable-prompt-tokens-details` is in the launch above. Without it
 `usage.prompt_tokens_details.cached_tokens` is absent from every exported
 record, aiperf's own prompt-cache columns come back empty, and it says so at the
-foot of its summary. The pair in *Measured* ran without it, which is why every
+foot of its summary. The arms in *Measured* ran without it, which is why every
 hit rate there is read from the server's `/metrics` instead. Whichever way you
 go, set it on both arms — never on one.
 
@@ -461,6 +434,36 @@ cannot hold the corpus, so pass 2 can only come back from the CPU tier.
 `m2_store`/`m3_load` ran in 7 chunks of 189 questions, one server boot per
 chunk, because a 64-block pool plus a 24 GiB tier cannot hold 1319 questions at
 once; the figures are the aggregate over all 1319.
+
+#### How this run measures LMCache
+
+An accuracy run only tests the tier if the bytes it read actually came from the
+tier. Three things make that true, and all three have to hold:
+
+1. **Two passes over the same corpus, one server boot each.** Pass 1
+   (`m2_store`) starts with an empty tier, so it can only compute -- its job is
+   to fill the tier. Pass 2 (`m3_load`) replays the identical questions with
+   the identical `--seed` and `--num_fewshot`, so every prompt already has an
+   entry.
+2. **An HBM pool too small to hold the corpus** -- that is what
+   `--num-gpu-blocks-override 64` is for. Without it pass 2's hits land in
+   vLLM's own prefix cache and the tier is never asked; with it the prefix is
+   evicted long before it is reused, so the CPU tier is the only place it can
+   come back from. The same constraint is why the corpus is split into chunks:
+   the pool plus the tier has to hold one chunk, not the whole 1319.
+3. **Confirm on the server side, not from the score.** The run counts as a tier
+   measurement only if the pass-2 window actually shows tier traffic:
+
+```bash
+curl -s http://127.0.0.1:8331/metrics | \
+  grep -E 'vllm:external_prefix_cache_(hits|queries)_total'   # hits > 0 on pass 2
+grep -c 'Retrieved' server.log                                # 0 on pass 1, > 0 on pass 2
+```
+
+Only then is the score comparison meaningful: `m1_base` is the no-connector
+reference and `m3_load` is the same questions answered from restored bytes. A
+real KV corruption moves gsm8k by much more than one standard error, so
+agreement inside one standard error is the pass criterion.
 
 ## Related
 

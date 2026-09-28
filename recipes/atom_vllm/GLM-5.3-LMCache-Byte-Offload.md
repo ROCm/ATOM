@@ -193,56 +193,6 @@ the same measurement and is not a second result.
 `HBM prefix hit` and `CPU tier share` are read from the server's own counters
 as end-minus-start deltas over the measured window, not from the client.
 
-### Agentic multi-turn workload (cache-validation shape)
-
-The shape published by
-[inference-benchmarking/aiperf-cache-validation](https://github.com/DO-FDE/inference-benchmarking/blob/main/aiperf-cache-validation/run_cache_validation.sh):
-open-loop, 64 users at 1.6 req/s, 256 conversations of 8 turns, an 8 K shared
-system prompt plus 112 K per-user context, ISL 12.7 K +/- 4 K and OSL 917 +/-
-300, natural stopping (no `ignore_eos`). One arm, connector ON, 1800 s of
-traffic, seed 530419.
-
-Server: the *Server* block above, unmodified. Client:
-
-```bash
-aiperf profile \
-  --model amd/GLM-5.3-MXFP4 \
-  --tokenizer /data/amd_int/models/GLM-5.3-MXFP4 --tokenizer-trust-remote-code \
-  --url http://127.0.0.1:8332 --endpoint-type chat --streaming \
-  --use-server-token-count \
-  --user-centric-rate 1.6 --num-users 64 \
-  --conversation-num 256 --conversation-turn-mean 8 --conversation-turn-stddev 0 \
-  --conversation-turn-delay-mean 30000 --conversation-turn-delay-stddev 25000 \
-  --shared-system-prompt-length 8000 --user-context-prompt-length 112000 \
-  --num-dataset-entries 256 \
-  --isl 12700 --isl-stddev 4000 --osl 917 --osl-stddev 300 \
-  --benchmark-duration 1800 --random-seed 530419 \
-  --server-metrics --server-metrics-formats json parquet \
-  --export-level raw --request-timeout-seconds 3600
-```
-
-| metric | value |
-|---|---|
-| input token throughput | 19,283.82 tok/s |
-| output token throughput | 100.76 tok/s |
-| request throughput | 0.14 req/s |
-| requests completed in window | 259 |
-| ISL avg | 136,253 tokens |
-| OSL avg | 711.94 tokens |
-| TTFT p50 / p90 | 553,937 / 926,782 ms |
-| ITL p50 / p90 | 219.71 / 260.96 ms |
-| request latency p50 / p90 | 717,516 / 1,082,921 ms |
-| HBM prefix hit | 5.84% (2,264,000 / 38,768,750) |
-| CPU tier share | 0.00% |
-| illegal-memory faults | 0 |
-
-The offered rate is above what this configuration serves at these sequence
-lengths, so the run is queue-bound: latency percentiles reflect the standing
-queue, and throughput is the served rate. The CPU tier stored 145,716,224
-tokens (summed over the four ranks) and served none of them back -- at this
-turn cadence the reused prefix is still resident in HBM when the next turn
-arrives, so nothing falls into the tier's fetchable band.
-
 ### Accuracy
 
 gsm8k, all 1319 questions, 3-shot, greedy:
@@ -268,6 +218,35 @@ question can then only come back from the CPU tier.
 
 All three agree inside one standard error, so restoring KV bytes from the CPU
 tier does not change the answers.
+
+#### How this run measures LMCache
+
+An accuracy run only tests the tier if the bytes it read actually came from the
+tier. Three things make that true, and all three have to hold:
+
+1. **Two passes over the same corpus, one server boot each.** Pass 1
+   (`m2_store`) starts with an empty tier, so it can only compute — its job is
+   to fill the tier. Pass 2 (`m3_load`) replays the identical questions with
+   the identical `--seed` and `--num_fewshot`, so every prompt already has an
+   entry.
+2. **An HBM pool too small to hold the corpus** — that is what
+   `--num-gpu-blocks-override 2048` is for. Without it pass 2's hits land in
+   vLLM's own prefix cache and the tier is never asked; with it the prefix is
+   evicted long before it is reused, so the CPU tier is the only place it can
+   come back from.
+3. **Confirm on the server side, not from the score.** The run counts as a tier
+   measurement only if the pass-2 window actually shows tier traffic:
+
+```bash
+curl -s http://127.0.0.1:8330/metrics | \
+  grep -E 'vllm:external_prefix_cache_(hits|queries)_total'   # hits > 0 on pass 2
+grep -c 'Retrieved' server.log                                # 0 on pass 1, > 0 on pass 2
+```
+
+Only then is the score comparison meaningful: `m1_base` is the no-connector
+reference and `m3_load` is the same questions answered from restored bytes. A
+real KV corruption moves gsm8k by much more than one standard error, so
+agreement inside one standard error is the pass criterion.
 
 ## Related
 
