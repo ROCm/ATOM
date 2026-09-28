@@ -155,13 +155,22 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                 )
         return super().load_failed(req_id)
 
+    def waits_for_transfer_report(self, seq: Any) -> bool:
+        """MP releases memory only on a report; see `_enforce_transfer_deadlines`.
+
+        The engine's clock-based reclaim cannot prove the MP server stopped
+        reading or writing, so it leaves MP requests alone instead of logging
+        them as abandoned or wedged; a report that never comes stops the engine.
+        """
+        del seq
+        return True
+
     def abandon_save(self, req_id: Any) -> None:
-        # The engine's clock-based reclaim cannot prove the MP server stopped
-        # reading the source, so an MP save keeps its lease until a terminal
-        # report. `_enforce_transfer_deadlines` bounds a report that never comes.
-        logger.warning(
+        # Reached only through a composite connector, which still abandons its
+        # other legs: an MP save keeps its lease until a terminal report.
+        logger.debug(
             "LMCache MP keeps the source of request %s leased until its save "
-            "reports; a transfer that never reports stops the engine after %.0fs",
+            "reports (deadline %.0fs)",
             req_id,
             self._scheduler_deadline_s,
         )

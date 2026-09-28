@@ -2760,6 +2760,35 @@ class TestStalledOffloadSaveReclaim:
         assert not s.deferred_free_blocks
         assert seq._deferred_save_at is None
 
+    def test_a_connector_that_waits_for_reports_is_left_alone(
+        self, monkeypatch, caplog
+    ):
+        """LMCache MP cannot prove a stalled DMA stopped, keeps the blocks until
+        a report and fails stop itself at its deadline. Reclaim must neither
+        abandon it nor, after the retries, log it as a wedged P/D send."""
+        import logging
+        import time as _time
+
+        import atom.model_engine.scheduler as sched_mod
+
+        seq = SimpleNamespace(id=1, _deferred_save_at=_time.monotonic() - 500.0)
+        abandoned: list = []
+        connector = SimpleNamespace(
+            save_abandon_timeout_s=lambda: 100.0,
+            abandon_save=abandoned.append,
+            should_defer_free=lambda _seq: True,
+            waits_for_transfer_report=lambda _seq: True,
+        )
+        s, freed = self._sched(monkeypatch, [seq], connector=connector)
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            for _ in range(sched_mod._RELEASE_WEDGE_ATTEMPTS + 1):
+                s._next_save_reconcile_at = 0.0
+                assert s._reconcile_stalled_deferred_saves() == 0
+        assert not abandoned and not freed
+        assert s._abandoned_saves == 0
+        assert seq.id in s.deferred_free_blocks
+        assert not caplog.records
+
     def test_a_claim_nobody_will_retire_is_escalated(self, monkeypatch, caplog):
         """The retry is not an escape hatch on its own, so it must be visible.
 

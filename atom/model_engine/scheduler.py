@@ -1162,6 +1162,17 @@ class Scheduler:
         if callable(callback):
             callback(seq)
 
+    def _connector_waits_for_report(self, seq: Sequence) -> bool:
+        """Whether the connector refuses clock-based reclaim for this request.
+
+        A connector that cannot prove a stalled transfer stopped touching the
+        blocks keeps them until a terminal report and bounds a missing report
+        itself (LMCache MP fails stop at its transfer deadline). Abandoning it
+        here would release nothing and only log a misleading wedge.
+        """
+        callback = getattr(self.kv_connector, "waits_for_transfer_report", None)
+        return bool(callback(seq)) if callable(callback) else False
+
     def _connector_abandon_save(self, seq: Sequence) -> None:
         """Tell the connector to drop a save this reclaim just abandoned.
 
@@ -1310,6 +1321,8 @@ class Scheduler:
         abandoned = 0
         wedged: list = []
         for seq in stalled:
+            if self._connector_waits_for_report(seq):
+                continue
             # The save is abandoned once; the release attempt is not. Whether
             # the blocks come back is a separate question -- a send that has
             # not reported still claims them -- and giving up on the first

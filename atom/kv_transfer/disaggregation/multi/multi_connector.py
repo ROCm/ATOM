@@ -496,6 +496,23 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             if callable(fn):
                 fn(seq)
 
+    def waits_for_transfer_report(self, seq: Any) -> bool:
+        """True only if every sub still deferring this request waits for reports.
+
+        Clock-based reclaim is skipped only when no deferring sub would act on
+        it; a P/D send or an in-process save still gets its abandon path.
+        """
+        deferring = 0
+        for connector in self._connectors:
+            should_defer = getattr(connector, "should_defer_free", None)
+            if not callable(should_defer) or not should_defer(seq):
+                continue
+            deferring += 1
+            callback = getattr(connector, "waits_for_transfer_report", None)
+            if not callable(callback) or callback(seq) is not True:
+                return False
+        return deferring > 0
+
     def abandon_save(self, req_id: Any) -> None:
         # Reclamation of a stalled offload save (see
         # `DenseOffloadConnector.abandon_save`). Only the offload sub tracks

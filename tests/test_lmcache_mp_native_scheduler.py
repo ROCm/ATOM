@@ -366,6 +366,7 @@ def test_no_timeout_or_abandon_recycles_dispatched_source(monkeypatch):
     scheduler.update_state_after_alloc(seq)
     [request] = scheduler.build_connector_meta().requests
     assert scheduler.save_abandon_timeout_s() > 0
+    assert scheduler.waits_for_transfer_report(seq)
     scheduler.abandon_save(request.save_operation)
     assert scheduler.reclaim_stale_leases(1e-9) == []
     assert checkpoints.reclaim_stale_offload_pins(1e-9) == 0

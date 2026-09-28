@@ -993,3 +993,29 @@ def test_should_defer_free_holds_while_any_sub_claims_the_source():
     assert sched.should_defer_free(seq) is True, "the send still claims it"
     producer.defer = False
     assert sched.should_defer_free(seq) is False
+
+
+def test_waits_for_transfer_report_needs_every_deferring_sub():
+    """Clock reclaim is skipped only if no deferring sub would act on it."""
+    from types import SimpleNamespace
+
+    from atom.kv_transfer.disaggregation.multi.multi_connector import (
+        MultiConnectorScheduler,
+    )
+
+    def sub(defers, waits=None):
+        fields = {"should_defer_free": lambda _seq: defers}
+        if waits is not None:
+            fields["waits_for_transfer_report"] = lambda _seq: waits
+        return SimpleNamespace(**fields)
+
+    def multi(*subs):
+        connector = object.__new__(MultiConnectorScheduler)
+        connector._connectors = list(subs)
+        return connector
+
+    seq = object()
+    assert multi(sub(True, True), sub(False)).waits_for_transfer_report(seq)
+    assert not multi(sub(True, True), sub(True)).waits_for_transfer_report(seq)
+    assert not multi(sub(True, True), sub(True, False)).waits_for_transfer_report(seq)
+    assert not multi(sub(False, True)).waits_for_transfer_report(seq)

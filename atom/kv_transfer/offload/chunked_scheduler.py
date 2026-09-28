@@ -467,11 +467,16 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             # A block of the prefix was evicted (or reused) between teardown
             # and admission, so the final save stores less than was computed.
             self.total_truncated_late_saves += 1
-            logger.debug(
-                "Late offload save of seq %s found %d of %d tokens resident",
+            # Early release trades this: the tail's blocks went back to the pool
+            # at teardown, so eviction before admission shortens the final save.
+            logger.warning(
+                "Late offload save of seq %s found %d of %d computed tokens still "
+                "resident; the evicted tail is not stored "
+                "(total truncated_late_saves=%d)",
                 seq.id,
                 available,
                 aligned,
+                self.total_truncated_late_saves,
             )
         if target <= saved:
             # Nothing savable is still resident (or no boundary qualifies):

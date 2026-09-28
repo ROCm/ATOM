@@ -420,7 +420,9 @@ class TestIncrementalLeaseRelease:
         assert block_ids == table
         assert sorted(claimed) == sorted(table)
 
-    def test_late_acquire_with_nothing_resident_retires_the_request(self, monkeypatch):
+    def test_late_acquire_with_nothing_resident_retires_the_request(
+        self, monkeypatch, caplog
+    ):
         scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
         bm, seq, table = _resident_sequence(scheduler, 103, 32, 8)
         scheduler.update_state_after_alloc(seq)
@@ -435,6 +437,7 @@ class TestIncrementalLeaseRelease:
         assert scheduler.protected_block_ids(seq) == frozenset()
         assert bm.kv.num_used == 1
         assert scheduler.get_statistics()["truncated_late_saves"] == 1
+        assert any("truncated_late_saves=1" in r.getMessage() for r in caplog.records)
 
     def test_late_save_persists_the_short_tail_of_a_long_request(self, monkeypatch):
         """The tail after earlier saves is stored however short it is."""

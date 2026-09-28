@@ -336,6 +336,12 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         callback = getattr(self._impl, "take_state_source_releases", None)
         return callback() if callback is not None else set()
 
+    def waits_for_transfer_report(self, seq) -> bool:
+        # In-process offload proves its copies finished, so the engine's
+        # clock-based reclaim applies unless the impl says otherwise.
+        callback = getattr(self._impl, "waits_for_transfer_report", None)
+        return bool(callback(seq)) if callback is not None else False
+
     def save_abandon_timeout_s(self) -> float:
         # Plain forward: the abstract lifecycle contract guarantees every _impl
         # defines this (concrete on OffloadSchedulerMixin). The scheduler sources
