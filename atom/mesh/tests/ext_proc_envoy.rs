@@ -46,9 +46,6 @@ impl Envoy {
     }
 
     async fn with_config(epp_port: u16, template: &str) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
         let config = tempfile::tempdir().unwrap();
         let path = config.path().join("envoy.yaml");
         std::fs::write(
@@ -56,12 +53,23 @@ impl Envoy {
             template
                 .replace("port_value: 8080", "port_value: CLIENT_PORT")
                 .replace("port_value: 9002", "port_value: PROCESSOR_PORT")
-                .replace("CLIENT_PORT", &port.to_string())
-                .replace("PROCESSOR_PORT", &epp_port.to_string()),
+                .replace("CLIENT_PORT", "0")
+                .replace("PROCESSOR_PORT", &epp_port.to_string())
+                + "\nadmin:\n  address:\n    socket_address: {address: 127.0.0.1, port_value: 0}\n",
         )
         .unwrap();
         let validation = Command::new("docker")
-            .args(["run", "--rm", "--network", "host", "--user", "0", "-v"])
+            .args([
+                "run",
+                "--rm",
+                "--network",
+                "host",
+                "--user",
+                "0",
+                "--env",
+                "ENVOY_UID=0",
+                "-v",
+            ])
             .arg(format!("{}:/etc/envoy/envoy.yaml:ro", path.display()))
             .args([
                 ENVOY_IMAGE,
@@ -86,16 +94,20 @@ impl Envoy {
                 "host",
                 "--user",
                 "0",
+                "--env",
+                "ENVOY_UID=0",
                 "--name",
                 &name,
                 "-v",
             ])
-            .arg(format!("{}:/etc/envoy/envoy.yaml:ro", path.display()))
+            .arg(format!("{}:/etc/envoy", config.path().display()))
             .args([
                 ENVOY_IMAGE,
                 "-c",
                 "/etc/envoy/envoy.yaml",
                 "--disable-hot-restart",
+                "--admin-address-path",
+                "/etc/envoy/admin-address.txt",
                 "--concurrency",
                 "2",
                 "--log-level",
@@ -109,7 +121,7 @@ impl Envoy {
             name,
             child,
             _config: config,
-            url: format!("http://127.0.0.1:{port}"),
+            url: String::new(),
         };
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
@@ -117,8 +129,35 @@ impl Envoy {
                     envoy.child.try_wait().unwrap().is_none(),
                     "Envoy exited during startup"
                 );
-                if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-                    break;
+                if let Ok(admin) =
+                    std::fs::read_to_string(envoy._config.path().join("admin-address.txt"))
+                {
+                    let client = reqwest::Client::builder()
+                        .timeout(Duration::from_secs(1))
+                        .build()
+                        .unwrap();
+                    if let Ok(response) = client
+                        .get(format!("http://{}/listeners?format=json", admin.trim()))
+                        .send()
+                        .await
+                    {
+                        if let Ok(listeners) = response.json::<Value>().await {
+                            if let Some(port) = listeners["listener_statuses"]
+                                .as_array()
+                                .and_then(|items| {
+                                    items.iter().find(|item| item["name"] == "inference")
+                                })
+                                .and_then(|item| {
+                                    item["local_address"]["socket_address"]["port_value"].as_u64()
+                                })
+                            {
+                                if port > 0 {
+                                    envoy.url = format!("http://127.0.0.1:{port}");
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -271,6 +310,8 @@ async fn real_envoy_routes_once_preserves_body_and_cleans_up_sse_cancel() {
     .await
     .unwrap();
     assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(worker.circuit_breaker().total_successes(), 1);
+    assert_eq!(worker.circuit_breaker().total_failures(), 0);
     let bad = client
         .post(&url)
         .header("content-type", "application/json")
@@ -465,6 +506,11 @@ async fn real_envoy_local_errors_keep_the_original_status_and_body() {
     assert!(response.contains("envoy-local:408:"), "{response}");
     assert!(!response.contains("invalid_processing_sequence"));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        worker.circuit_breaker().total_failures(),
+        0,
+        "local upload errors must be neutral"
+    );
     drop(envoy);
     let template = base.replace("timeout: 1800s", "timeout: 0.2s");
     let envoy = Envoy::with_config(runtime.address.port(), &template).await;
@@ -482,6 +528,11 @@ async fn real_envoy_local_errors_keep_the_original_status_and_body() {
     drop(envoy);
     runtime.shutdown().await.unwrap();
     assert_eq!(worker.load(), 0);
+    assert_eq!(
+        worker.circuit_breaker().total_failures(),
+        1,
+        "Envoy upstream timeout must count once"
+    );
     server.abort();
 }
 
@@ -713,9 +764,15 @@ impl PdBackend {
         assert_eq!(response.status(), StatusCode::OK);
         let mut stream = response.bytes_stream();
         assert!(stream.next().await.unwrap().unwrap().starts_with(b"data:"));
-        assert!(
-            workers.iter().all(|w| w.load() == 1),
-            "each chosen worker has exactly one lease"
+        assert_eq!(
+            workers[0].load(),
+            usize::from(kind == mesh::config::types::BackendType::Vllm),
+            "only the still-running vLLM prefill retains its reservation"
+        );
+        assert_eq!(
+            workers[1].load(),
+            1,
+            "decode retains exactly one reservation"
         );
         drop(stream);
         tokio::time::timeout(Duration::from_secs(3), async {

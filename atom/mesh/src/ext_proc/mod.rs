@@ -7,7 +7,6 @@ mod executor;
 mod lifecycle;
 mod mutation;
 mod request;
-mod response;
 mod routing;
 mod runtime;
 mod service;

@@ -5,11 +5,11 @@ use crate::{
     core::{
         placement::{
             planner::DefaultPlanner,
-            registry_adapters::PolicyRegistryAdapter,
-            traits::{PdPlanner, WorkerSource},
+            registry_adapters::{PolicyRegistryAdapter, WorkerRegistryAdapter},
+            traits::PdPlanner,
             types::{PlacementPlan, Protocol, RequestDescriptor},
         },
-        ConnectionMode, HashRing, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
+        ConnectionMode, Worker, WorkerLoadGuard, WorkerType,
     },
     policies::LoadBalancingPolicy,
 };
@@ -43,17 +43,21 @@ impl ExecutionTarget {
         }
     }
 
-    pub fn complete(&self, status: u16) {
-        let success = (200..400).contains(&status);
-        match self {
-            Self::Single { worker, policy, .. } => {
-                // Client errors do not indicate an unhealthy inference worker.
-                if success || status >= 500 {
-                    worker.record_outcome(success);
-                }
-                policy.on_request_complete(worker.url(), success);
+    pub fn complete(&self, health: Option<bool>, success: bool) {
+        if let Self::Single { worker, policy, .. } = self {
+            if let Some(health) = health {
+                worker.record_outcome(health);
             }
-            Self::Pair(lease) => lease.complete(success),
+            policy.on_request_complete(worker.url(), success);
+        }
+        // PD worker outcomes belong to the individual HTTP attempts. A pair's
+        // aggregate status must not charge a decode error to the prefill worker.
+    }
+
+    pub fn expiration(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        match self {
+            Self::Pair(lease) => lease.expiration(),
+            Self::Single { .. } => Box::pin(std::future::pending()),
         }
     }
 }
@@ -111,10 +115,10 @@ impl EndpointRouter {
             }
             workers = candidates;
         }
-        let source = Arc::new(CandidateWorkers {
+        let source = Arc::new(WorkerRegistryAdapter::with_candidates(
+            self.app.worker_registry.clone(),
             workers,
-            registry: self.app.worker_registry.clone(),
-        });
+        ));
         let planner = DefaultPlanner::new(
             source,
             Arc::new(PolicyRegistryAdapter::new(self.app.policy_registry.clone())),
@@ -142,7 +146,11 @@ impl EndpointRouter {
                     )
                 })?;
                 return Ok(RoutingDecision {
-                    target: ExecutionTarget::Pair(executor.reserve(pair, request)),
+                    target: ExecutionTarget::Pair(executor.reserve(
+                        pair,
+                        request,
+                        &input.metadata,
+                    )?),
                     address: executor.address,
                     authorization: None,
                 });
@@ -159,7 +167,10 @@ impl EndpointRouter {
                 .prepare_request(body)
                 .await
                 .map_err(|e| ProcessingError::invalid(e.to_string()))?;
-            request.raw = serde_json::to_vec(&body)?;
+            request.replace_body(
+                serde_json::to_vec(&body)?,
+                self.app.router_config.ext_proc.max_body_bytes,
+            )?;
         }
         let authorization = worker.api_key().as_ref().map(|key| format!("Bearer {key}"));
         Ok(RoutingDecision {
@@ -207,37 +218,5 @@ impl EndpointRouter {
                 .next()
                 .ok_or_else(invalid),
         }
-    }
-}
-
-struct CandidateWorkers {
-    workers: Vec<Arc<dyn Worker>>,
-    registry: Arc<WorkerRegistry>,
-}
-
-impl WorkerSource for CandidateWorkers {
-    fn workers_filtered(
-        &self,
-        model: Option<&str>,
-        kind: Option<WorkerType>,
-        protocol: Option<ConnectionMode>,
-    ) -> Vec<Arc<dyn Worker>> {
-        self.workers
-            .iter()
-            .filter(|w| {
-                model.is_none_or(|m| w.model_id() == m)
-                    && kind.as_ref().is_none_or(|k| {
-                        std::mem::discriminant(w.worker_type()) == std::mem::discriminant(k)
-                    })
-                    && protocol
-                        .as_ref()
-                        .is_none_or(|p| w.connection_mode().matches(p))
-            })
-            .cloned()
-            .collect()
-    }
-
-    fn hash_ring(&self, model: &str) -> Option<Arc<HashRing>> {
-        self.registry.get_hash_ring(model)
     }
 }

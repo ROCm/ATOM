@@ -413,7 +413,17 @@ async fn health_and_bounded_drain() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(watch.message().await.unwrap().unwrap().status, 1);
+    // Watch publishes the latest shared snapshot; allow one publisher interval
+    // after the registry was changed back to healthy.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if watch.message().await.unwrap().unwrap().status == 1 {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
     let mut stream = fixture.open().await;
     stream.routed().await;
     (fixture.runtime.shutdown_handle())();
@@ -543,7 +553,13 @@ async fn candidate_subset_is_intersected_with_registered_healthy_model_workers()
     assert_eq!(stream.destination().await, "127.0.0.1:18002");
     assert!(matches!(stream.recv().await, Response::RequestBody(_)));
     stream.response_headers(true).await;
-    for addresses in [vec![], vec!["127.0.0.1:1"]] {
+    let mut empty = fixture.open().await;
+    empty.headers_only().await;
+    empty.subset(Stream::list(&[])).await;
+    assert!(matches!(empty.recv().await, Response::RequestHeaders(_)));
+    assert!(matches!(empty.recv().await, Response::RequestBody(_)));
+    empty.response_headers(true).await;
+    for addresses in [vec!["127.0.0.1:1"]] {
         let mut stream = fixture.open().await;
         stream.headers_only().await;
         stream.subset(Stream::list(&addresses)).await;
@@ -946,9 +962,10 @@ async fn early_reply_cancels_pending_admission_without_a_late_dispatch() {
 }
 
 #[tokio::test]
-async fn pending_decision_keeps_its_deadline_while_listening_for_envoy() {
+async fn pending_admission_keeps_its_deadline_while_listening_for_envoy() {
     let fixture = Fixture::new(RouterConfig {
         max_concurrent_requests: 1,
+        queue_timeout_secs: 1,
         ext_proc: ExtProcConfig {
             decision_timeout_secs: 1,
             ..Default::default()
@@ -964,9 +981,64 @@ async fn pending_decision_keeps_its_deadline_while_listening_for_envoy() {
     let Response::ImmediateResponse(error) = second.recv().await else {
         panic!()
     };
-    assert_eq!(error.status.unwrap().code, 504);
-    assert_eq!(error.details, "mesh_ext_proc_decision_timeout");
+    assert_eq!(error.status.unwrap().code, 408);
+    assert_eq!(error.details, "mesh_ext_proc_admission_timeout");
     first.response_headers(true).await;
+    fixture.unloaded().await;
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn local_reply_interrupts_request_forwarding_under_backpressure() {
+    let fixture = Fixture::new(RouterConfig::default()).await;
+    let mut stream = fixture.open().await;
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "x".repeat(6 * 1024 * 1024)}],
+    }))
+    .unwrap();
+    stream.headers_only().await;
+    for (index, chunk) in body.chunks(64 * 1024).enumerate() {
+        stream
+            .body(chunk, (index + 1) * 64 * 1024 >= body.len())
+            .await;
+    }
+    assert!(matches!(stream.recv().await, Response::RequestHeaders(_)));
+    // Stop reading the large upload, then let Envoy report its local reply.
+    // Mesh must keep reading the other direction while its output is blocked.
+    stream
+        .send(Request::ResponseHeaders(Stream::headers(
+            &[(":status", "413"), ("content-type", "text/plain")],
+            false,
+        )))
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut forwarded = 0;
+    loop {
+        match stream.recv().await {
+            Response::RequestBody(body) => {
+                let Some(pb::body_mutation::Mutation::StreamedResponse(body)) =
+                    body.response.unwrap().body_mutation.unwrap().mutation
+                else {
+                    panic!("expected streamed body");
+                };
+                forwarded += body.body.len();
+            }
+            Response::ResponseHeaders(headers) => {
+                assert!(headers.response.unwrap().header_mutation.is_none());
+                break;
+            }
+            other => panic!("local reply replaced by {other:?}"),
+        }
+    }
+    assert!(
+        forwarded < body.len(),
+        "upload continued after the local reply"
+    );
+    stream
+        .response_body(b"original payload limit error", true)
+        .await;
+    assert!(stream.response.message().await.unwrap().is_none());
     fixture.unloaded().await;
     fixture.runtime.shutdown().await.unwrap();
 }
@@ -1219,6 +1291,8 @@ async fn pd_execution_lease_pins_pair_rejects_replay_and_expires_on_disconnect()
         decode_policy: None,
     };
     config.ext_proc.enabled = true;
+    config.ext_proc.reservation_timeout_secs = 1;
+    config.max_concurrent_requests = 1;
     config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
     config.ext_proc.executor_listen = "127.0.0.1:0".parse().unwrap();
     let app = Arc::new(AppContext::from_config(config, 5).await.unwrap());
@@ -1233,10 +1307,15 @@ async fn pd_execution_lease_pins_pair_rejects_replay_and_expires_on_disconnect()
         let calls = calls.clone();
         let router = axum::Router::new().route(
             "/v1/chat/completions",
-            axum::routing::post(move || async move {
-                calls.fetch_add(1, Ordering::SeqCst);
-                axum::Json(serde_json::json!({"choices":[{"text":"ok"}]}))
-            }),
+            axum::routing::post(
+                move |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    if body["slow"] == true {
+                        tokio::time::sleep(Duration::from_millis(1200)).await;
+                    }
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({"choices":[{"text":"ok"}]}))
+                },
+            ),
         );
         servers.push(tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
@@ -1258,7 +1337,10 @@ async fn pd_execution_lease_pins_pair_rejects_replay_and_expires_on_disconnect()
     };
     let client = reqwest::Client::new();
     let body = br#"{"model":"test-model","messages":[{"role":"user","content":"hi"}]}"#;
-    for attempt in 0..3 {
+    for attempt in 0..5 {
+        let slow_body =
+            br#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"slow":true}"#;
+        let body: &[u8] = if attempt == 4 { slow_body } else { body };
         let mut stream = fixture.open().await;
         stream.headers_only().await;
         stream.body(body, true).await;
@@ -1297,7 +1379,30 @@ async fn pd_execution_lease_pins_pair_rejects_replay_and_expires_on_disconnect()
                     .status(),
                 403
             );
-            break;
+            continue;
+        }
+        if attempt == 3 {
+            // Keep the RPC connected: reservation expiry must release actual
+            // load guards and admission, well before the 300-second idle limit.
+            let Response::ImmediateResponse(error) = stream.recv().await else {
+                panic!("expected lease expiry");
+            };
+            assert_eq!(error.status.unwrap().code, 504);
+            assert_eq!(error.details, "mesh_ext_proc_execution_lease_timeout");
+            fixture.unloaded().await;
+            assert!(workers.iter().all(|worker| worker.load() == 0));
+            assert_eq!(
+                client
+                    .post(&url)
+                    .header("x-mesh-execution-id", id)
+                    .body(body.to_vec())
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                403
+            );
+            continue;
         }
         // Registry changes after selection cannot cause a second placement.
         for worker in &workers {
@@ -1306,7 +1411,7 @@ async fn pd_execution_lease_pins_pair_rejects_replay_and_expires_on_disconnect()
         let response = client
             .post(&url)
             .header("x-mesh-execution-id", id)
-            .body(if attempt == 0 {
+            .body(if attempt != 1 {
                 body.to_vec()
             } else {
                 b"{}".to_vec()
@@ -1314,7 +1419,7 @@ async fn pd_execution_lease_pins_pair_rejects_replay_and_expires_on_disconnect()
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), if attempt == 0 { 200 } else { 400 });
+        assert_eq!(response.status(), if attempt != 1 { 200 } else { 400 });
         let _ = response.bytes().await.unwrap();
         assert_eq!(
             client
@@ -1334,7 +1439,7 @@ async fn pd_execution_lease_pins_pair_rejects_replay_and_expires_on_disconnect()
             fixture.app.worker_registry.register(worker.clone());
         }
     }
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
     fixture.runtime.shutdown().await.unwrap();
     assert!(workers.iter().all(|w| w.load() == 0));
     for server in servers {
@@ -1361,31 +1466,24 @@ async fn cli_http_mode_keeps_inference_routes_without_ext_proc() {
 }
 
 async fn verify_cli_mode(ext_proc: bool) {
-    let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let http_address = http.local_addr().unwrap();
-    let grpc = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let grpc_address = grpc.local_addr().unwrap();
-    let metrics = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let metrics_port = metrics.local_addr().unwrap().port();
-    drop(metrics);
     let logs = tempfile::NamedTempFile::new().unwrap();
-    drop(http);
-    drop(grpc);
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_atomesh"));
+    command.env("RUST_LOG", "info");
     command.args([
         "launch",
         "--host",
         "127.0.0.1",
         "--port",
-        &http_address.port().to_string(),
+        "0",
         "--policy",
         "round_robin",
         "--prometheus-port",
-        &metrics_port.to_string(),
+        "0",
         "--log-level",
-        "warn",
+        "info",
+        "--json-log",
         "--ext-proc-listen",
-        &grpc_address.to_string(),
+        "127.0.0.1:0",
         "--ext-proc-drain-timeout-secs",
         "1",
         "--shutdown-grace-period-secs",
@@ -1396,8 +1494,8 @@ async fn verify_cli_mode(ext_proc: bool) {
     }
     let mut process = MeshProcess(
         command
-            .stdout(logs.reopen().unwrap())
-            .stderr(logs.reopen().unwrap())
+            .stdout(logs.as_file().try_clone().unwrap())
+            .stderr(logs.as_file().try_clone().unwrap())
             .spawn()
             .unwrap(),
     );
@@ -1405,6 +1503,19 @@ async fn verify_cli_mode(ext_proc: bool) {
         .timeout(Duration::from_secs(1))
         .build()
         .unwrap();
+    let addresses = || {
+        let logs = std::fs::read_to_string(logs.path()).unwrap();
+        let address = |message: &str| -> Option<std::net::SocketAddr> {
+            logs.lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|entry| entry["message"] == message)
+                .and_then(|entry| entry["address"].as_str()?.parse().ok())
+        };
+        (
+            address("HTTP listener bound"),
+            address("ext-proc listener started"),
+        )
+    };
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             assert!(
@@ -1412,6 +1523,10 @@ async fn verify_cli_mode(ext_proc: bool) {
                 "{}",
                 std::fs::read_to_string(logs.path()).unwrap()
             );
+            let (Some(http_address), grpc_address) = addresses() else {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            };
             if client
                 .get(format!("http://{http_address}/health"))
                 .send()
@@ -1421,28 +1536,32 @@ async fn verify_cli_mode(ext_proc: bool) {
                 if !ext_proc {
                     break;
                 }
-                if let Ok(mut health) =
-                    HealthClient::connect(format!("http://{grpc_address}")).await
-                {
-                    assert_eq!(
-                        health
-                            .check(HealthCheckRequest {
-                                service: String::new()
-                            })
-                            .await
-                            .unwrap()
-                            .into_inner()
-                            .status,
-                        2
-                    );
-                    break;
+                if let Some(grpc_address) = grpc_address {
+                    if let Ok(mut health) =
+                        HealthClient::connect(format!("http://{grpc_address}")).await
+                    {
+                        assert_eq!(
+                            health
+                                .check(HealthCheckRequest {
+                                    service: String::new()
+                                })
+                                .await
+                                .unwrap()
+                                .into_inner()
+                                .status,
+                            2
+                        );
+                        break;
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|error| panic!("{error}: {}", std::fs::read_to_string(logs.path()).unwrap()));
+    let (http_address, grpc_address) = addresses();
+    let http_address = http_address.unwrap();
     for path in ["/health", "/liveness", "/workers", "/v1/tokenizers"] {
         let response = client
             .get(format!("http://{http_address}{path}"))
@@ -1494,7 +1613,7 @@ async fn verify_cli_mode(ext_proc: bool) {
         }
     }
     if !ext_proc {
-        assert!(tokio::net::TcpStream::connect(grpc_address).await.is_err());
+        assert!(grpc_address.is_none());
     }
     assert!(std::process::Command::new("kill")
         .args(["-TERM", &process.0.id().to_string()])
@@ -1517,7 +1636,9 @@ async fn verify_cli_mode(ext_proc: bool) {
     .await
     .unwrap();
     assert!(tokio::net::TcpStream::connect(http_address).await.is_err());
-    assert!(tokio::net::TcpStream::connect(grpc_address).await.is_err());
+    if let Some(address) = grpc_address {
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
+    }
 }
 
 #[tokio::test]
@@ -1551,4 +1672,202 @@ async fn load_policy_observes_shared_guards_without_crossing_model_pools() {
     assert_eq!(worker.load(), 0);
     drop(busy);
     assert_eq!(fixture.worker.load(), 0);
+}
+
+#[tokio::test]
+async fn admission_rejects_at_headers_before_receiving_or_parsing_body() {
+    let fixture = Fixture::new(RouterConfig {
+        max_concurrent_requests: 1,
+        queue_size: 0,
+        ..Default::default()
+    })
+    .await;
+    let mut first = fixture.open().await;
+    first.headers_only().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), first.response.message())
+            .await
+            .is_err()
+    );
+    let mut second = fixture.open().await;
+    second.headers_only().await;
+    let Response::ImmediateResponse(error) = second.recv().await else {
+        panic!();
+    };
+    assert_eq!(error.status.unwrap().code, 429);
+    assert_eq!(error.details, "mesh_ext_proc_admission_full");
+    assert_eq!(fixture.worker.load(), 0);
+    first.response_headers(true).await;
+    let mut third = fixture.open().await;
+    third.routed().await;
+    third.response_headers(true).await;
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn queued_uploads_and_global_retained_buffers_have_independent_limits() {
+    let fixture = Fixture::new(RouterConfig {
+        max_concurrent_requests: 1,
+        ext_proc: ExtProcConfig {
+            max_message_bytes: 131_072,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await;
+    let mut active = fixture.open().await;
+    active.routed().await;
+    let mut queued = fixture.open().await;
+    queued.headers_only().await;
+    for _ in 0..3 {
+        queued.body(&vec![b' '; 64 * 1024], false).await;
+    }
+    let Response::ImmediateResponse(error) = queued.recv().await else {
+        panic!();
+    };
+    assert_eq!(error.status.unwrap().code, 429);
+    assert_eq!(error.details, "mesh_ext_proc_admission_buffer_full");
+    active.response_headers(true).await;
+    fixture.runtime.shutdown().await.unwrap();
+
+    let fixture = Fixture::new(RouterConfig {
+        ext_proc: ExtProcConfig {
+            max_body_bytes: 131_072,
+            max_buffered_bytes: 131_072,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await;
+    let mut first = fixture.open().await;
+    first.headers_only().await;
+    first.body(&vec![b' '; 64 * 1024], false).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), first.response.message())
+            .await
+            .is_err()
+    );
+    let mut second = fixture.open().await;
+    second.headers_only().await;
+    second.body(&vec![b' '; 128 * 1024], false).await;
+    let Response::ImmediateResponse(error) = second.recv().await else {
+        panic!();
+    };
+    assert_eq!(error.status.unwrap().code, 503);
+    assert_eq!(error.details, "mesh_ext_proc_buffer_budget_exhausted");
+    first.response_headers(true).await;
+    let mut recovered = fixture.open().await;
+    recovered.routed().await;
+    recovered.response_headers(true).await;
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn runtime_wait_is_cancel_safe_and_repeatable() {
+    let mut fixture = Fixture::new(RouterConfig::default()).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), fixture.runtime.wait())
+            .await
+            .is_err()
+    );
+    (fixture.runtime.shutdown_handle())();
+    fixture.runtime.wait().await.unwrap();
+    fixture.runtime.wait().await.unwrap();
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn health_watch_is_bounded_releases_dropped_subscribers_and_closes_unknown_services() {
+    let fixture = Fixture::new(RouterConfig {
+        ext_proc: ExtProcConfig {
+            max_streams: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await;
+    let mut client = HealthClient::connect(format!("http://{}", fixture.runtime.address))
+        .await
+        .unwrap();
+    let mut first = client
+        .watch(HealthCheckRequest {
+            service: "unknown".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first.message().await.unwrap().unwrap().status, 3);
+    assert_eq!(
+        client
+            .watch(HealthCheckRequest {
+                service: String::new()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::ResourceExhausted
+    );
+    drop(first);
+    let mut watch = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match client
+                .watch(HealthCheckRequest {
+                    service: "unknown".into(),
+                })
+                .await
+            {
+                Ok(response) => break response.into_inner(),
+                Err(error) => assert_eq!(error.code(), tonic::Code::ResourceExhausted),
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(watch.message().await.unwrap().unwrap().status, 3);
+    // Registry changes do not generate duplicate SERVICE_UNKNOWN notifications.
+    fixture.worker.set_healthy(false);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), watch.message())
+            .await
+            .is_err()
+    );
+    (fixture.runtime.shutdown_handle())();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), watch.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[test]
+fn listener_validation_ignores_inactive_executor_and_accepts_ephemeral_ports() {
+    let mut config = RouterConfig {
+        port: 0,
+        ext_proc: ExtProcConfig {
+            enabled: true,
+            listen: "127.0.0.1:9002".parse().unwrap(),
+            executor_listen: "127.0.0.1:9002".parse().unwrap(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(config.validate().is_ok());
+    config.mode = mesh::config::RoutingMode::PrefillDecode {
+        prefill_urls: vec![],
+        decode_urls: vec![],
+        prefill_policy: None,
+        decode_policy: None,
+    };
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("overlaps"));
+    config.ext_proc.listen.set_port(0);
+    config.ext_proc.executor_listen.set_port(0);
+    assert!(config.validate().is_ok());
 }

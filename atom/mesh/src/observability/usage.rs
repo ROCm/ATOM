@@ -5,7 +5,7 @@ use crate::observability::ttft::SseFrames;
 /// Best-effort usage observation; never retains an unbounded response or changes
 /// bytes. Missing/oversized usage is left unknown rather than inferred.
 #[derive(Default)]
-pub(super) struct UsageObserver {
+pub(crate) struct UsageObserver {
     frames: SseFrames,
     json: Vec<u8>,
     disabled: bool,
@@ -20,17 +20,9 @@ impl UsageObserver {
         if streaming {
             self.frames.append(bytes);
             while let Some(frame) = self.frames.next_frame() {
-                let Ok(frame) = std::str::from_utf8(frame) else {
+                let Some(data) = crate::observability::ttft::sse_data(frame) else {
                     continue;
                 };
-                let data = frame
-                    .lines()
-                    .filter_map(|line| {
-                        line.strip_prefix("data:")
-                            .map(|line| line.trim_start_matches(' '))
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
                 if let Some(usage) = Self::parse(data.as_bytes()) {
                     self.usage = Some(usage);
                 }
@@ -56,18 +48,13 @@ impl UsageObserver {
         ))
     }
 
-    pub fn record(&self, streaming: bool) {
-        let usage = if streaming {
+    pub fn usage(&self, streaming: bool) -> Option<(u64, u64)> {
+        if streaming {
             self.usage
         } else if !self.disabled {
             Self::parse(&self.json)
         } else {
             None
-        };
-        if let Some((prompt, completion)) = usage {
-            metrics::counter!("mesh_ext_proc_tokens_total", "kind" => "prompt").increment(prompt);
-            metrics::counter!("mesh_ext_proc_tokens_total", "kind" => "completion")
-                .increment(completion);
         }
     }
 }

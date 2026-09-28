@@ -11,7 +11,7 @@ use super::{
     admission::{Admission, AdmissionLease},
     error::ProcessingError,
     executor::PdExecutor,
-    lifecycle::RequestLifecycle,
+    lifecycle::{Outcome, RequestLifecycle},
     mutation::Mutation,
     pb,
     request::{RequestEnvelope, RequestParser},
@@ -23,6 +23,7 @@ enum Phase {
     Headers,
     RequestBody,
     Deciding,
+    Dispatching,
     ResponseHeaders,
     ResponseBody,
     Complete,
@@ -33,10 +34,22 @@ struct PreparedRequest {
     admission: AdmissionLease,
     decision: RoutingDecision,
     trailers: bool,
+    observation: crate::observability::request::RequestMetrics,
 }
 
 type PendingDecision =
     Pin<Box<dyn Future<Output = Result<PreparedRequest, ProcessingError>> + Send>>;
+
+type PendingAdmission =
+    Pin<Box<dyn Future<Output = Result<AdmissionLease, ProcessingError>> + Send>>;
+
+type PendingDispatch = Pin<Box<dyn Future<Output = Result<(), ProcessingError>> + Send>>;
+
+#[derive(Clone)]
+struct ResponseSender {
+    channel: mpsc::Sender<Result<pb::ProcessingResponse, tonic::Status>>,
+    timeout: Duration,
+}
 
 pub(super) struct Session {
     app: Arc<AppContext>,
@@ -47,8 +60,10 @@ pub(super) struct Session {
     early_response: bool,
     parser: Arc<RequestParser>,
     request: Option<RequestEnvelope>,
+    admitted: Option<AdmissionLease>,
+    request_end: Option<bool>,
     lifecycle: RequestLifecycle,
-    output: mpsc::Sender<Result<pb::ProcessingResponse, tonic::Status>>,
+    output: ResponseSender,
 }
 
 impl Session {
@@ -59,6 +74,10 @@ impl Session {
         executor: Option<Arc<PdExecutor>>,
         parser: Arc<RequestParser>,
     ) -> Self {
+        let output = ResponseSender {
+            channel: output,
+            timeout: Duration::from_secs(app.router_config.ext_proc.idle_timeout_secs),
+        };
         Self {
             router: Arc::new(EndpointRouter::new(app.clone(), executor)),
             app,
@@ -69,6 +88,8 @@ impl Session {
             protocol: None,
             early_response: false,
             request: None,
+            admitted: None,
+            request_end: None,
             lifecycle: RequestLifecycle::new(),
         }
     }
@@ -78,13 +99,13 @@ impl Session {
         mut input: tonic::Streaming<pb::ProcessingRequest>,
         mut force_stop: watch::Receiver<bool>,
     ) {
-        let output = self.output.clone();
+        let output = self.output.channel.clone();
         tokio::select! {
             _ = output.closed() => {},
-            _ = async { let _ = force_stop.wait_for(|stop| *stop).await; } => { self.lifecycle.finish("drain_timeout"); },
+            _ = async { let _ = force_stop.wait_for(|stop| *stop).await; } => { self.lifecycle.finish(Outcome::Drained); },
             result = self.process(&mut input) => {
                 if let Err(error) = result {
-                    self.lifecycle.finish(error.code);
+                    self.lifecycle.finish(if error.code == "proxy_disconnected" { Outcome::ProxyDisconnected } else { Outcome::Failed(error.code) });
                     metrics::counter!("mesh_ext_proc_errors_total", "reason" => error.code).increment(1);
                     tracing::warn!(code = error.code, phase = ?self.phase, error = %error, "ext-proc processing failed");
                     let response = if error.code == "unsupported_observability_mode" {
@@ -105,7 +126,9 @@ impl Session {
     ) -> Result<(), ProcessingError> {
         let body_deadline =
             Instant::now() + Duration::from_secs(self.app.router_config.ext_proc.body_timeout_secs);
+        let mut admission: Option<PendingAdmission> = None;
         let mut pending: Option<PendingDecision> = None;
+        let mut dispatch: Option<PendingDispatch> = None;
         loop {
             let wait = if matches!(self.phase, Phase::Headers | Phase::RequestBody) {
                 body_deadline.saturating_duration_since(Instant::now())
@@ -116,10 +139,25 @@ impl Session {
                 // An already available local reply takes precedence over a
                 // placement result. Dropping pending also drops its guards.
                 biased;
+                result = async { admission.as_mut().unwrap().await }, if admission.is_some() => {
+                    admission = None;
+                    self.admitted = Some(result?);
+                    if let Some(trailers) = self.request_end { pending = Some(self.prepare(trailers)); }
+                    continue;
+                }
+                _ = self.lifecycle.expiration() => {
+                    return Err(ProcessingError::new(504, "execution_lease_timeout", "executor did not accept the reserved request before its deadline"));
+                }
                 next = timeout(wait, input.message()) => next,
                 result = async { pending.as_mut().unwrap().await }, if pending.is_some() => {
                     pending = None;
-                    self.dispatch(result?).await?;
+                    dispatch = Some(self.dispatch(result?));
+                    continue;
+                }
+                result = async { dispatch.as_mut().unwrap().await }, if dispatch.is_some() => {
+                    dispatch = None;
+                    result?;
+                    self.phase = Phase::ResponseHeaders;
                     continue;
                 }
             }
@@ -145,10 +183,17 @@ impl Session {
                 self.lifecycle.response_started = true;
             }
             self.validate_protocol(&message)?;
+            let attributes = message.attributes;
+            if matches!(&message.request, Some(Request::ResponseHeaders(_))) {
+                self.lifecycle.from_upstream = self.phase == Phase::ResponseHeaders;
+            }
+            // Preserve evidence even if acknowledging this message fails.
+            self.lifecycle.observe_attributes(&attributes);
             match (message.request, &self.phase) {
                 (Some(Request::RequestHeaders(headers)), Phase::Headers) => {
                     let end = headers.end_of_stream;
                     let mut request = RequestEnvelope::new(headers)?;
+                    request.set_budget(self.parser.budget.clone());
                     request.metadata(message.metadata_context)?;
                     self.request = Some(request);
                     if end {
@@ -157,24 +202,58 @@ impl Session {
                         ));
                     }
                     self.phase = Phase::RequestBody;
+                    let gate = self.admission.clone();
+                    admission = Some(Box::pin(async move { gate.acquire().await }));
                 }
                 (Some(Request::RequestBody(body)), Phase::RequestBody) => {
                     let request = self.request.as_mut().unwrap();
                     request.metadata(message.metadata_context)?;
-                    request.append(&body.body, self.app.router_config.ext_proc.max_body_bytes)?;
+                    if self.request_end.is_some() {
+                        return Err(ProcessingError::protocol("request body already ended"));
+                    }
+                    let config = &self.app.router_config.ext_proc;
+                    if self.admitted.is_none()
+                        && request.raw.len().saturating_add(body.body.len())
+                            > config.max_message_bytes
+                    {
+                        return Err(ProcessingError::new(
+                            429,
+                            "admission_buffer_full",
+                            "queued upload buffer exhausted",
+                        ));
+                    }
+                    request.append(&body.body, config.max_body_bytes)?;
                     if body.end_of_stream {
-                        pending = Some(self.prepare(false));
+                        self.request_end = Some(false);
+                        if self.admitted.is_some() {
+                            pending = Some(self.prepare(false));
+                        }
                     }
                 }
                 (Some(Request::RequestTrailers(_)), Phase::RequestBody) => {
-                    pending = Some(self.prepare(true));
+                    if self.request_end.is_some() {
+                        return Err(ProcessingError::protocol("request body already ended"));
+                    }
+                    self.request_end = Some(true);
+                    if self.admitted.is_some() {
+                        pending = Some(self.prepare(true));
+                    }
                 }
                 (
                     Some(Request::ResponseHeaders(headers)),
-                    Phase::Headers | Phase::RequestBody | Phase::Deciding | Phase::ResponseHeaders,
+                    Phase::Headers
+                    | Phase::RequestBody
+                    | Phase::Deciding
+                    | Phase::Dispatching
+                    | Phase::ResponseHeaders,
                 ) => {
                     self.early_response = self.phase != Phase::ResponseHeaders;
+                    admission = None;
+                    self.admitted = None;
                     pending = None;
+                    // Cancel an upload blocked by gRPC flow control before
+                    // acknowledging Envoy's local response.
+                    dispatch = None;
                     self.request = None;
                     for header in headers.headers.unwrap_or_default().headers {
                         let bytes = RequestEnvelope::header_bytes(&header);
@@ -189,7 +268,8 @@ impl Session {
                     if self.lifecycle.status.is_none() {
                         return Err(ProcessingError::protocol("response is missing :status"));
                     }
-                    self.send(Mutation::response_headers()).await?;
+                    self.respond(self.output.send(Mutation::response_headers()))
+                        .await?;
                     self.phase = if headers.end_of_stream {
                         Phase::Complete
                     } else {
@@ -198,14 +278,15 @@ impl Session {
                 }
                 (Some(Request::ResponseBody(body)), Phase::ResponseBody) => {
                     self.lifecycle.body(&body.body);
-                    self.send_body(&body.body, body.end_of_stream, false)
+                    self.respond(self.output.send_body(&body.body, body.end_of_stream, false))
                         .await?;
                     if body.end_of_stream {
                         self.phase = Phase::Complete;
                     }
                 }
                 (Some(Request::ResponseTrailers(_)), Phase::ResponseBody) => {
-                    self.send(Mutation::trailers(false)).await?;
+                    self.respond(self.output.send(Mutation::trailers(false)))
+                        .await?;
                     self.phase = Phase::Complete;
                 }
                 (
@@ -236,9 +317,21 @@ impl Session {
                 }
             }
             if self.phase == Phase::Complete {
-                self.lifecycle.finish("completed");
+                self.lifecycle.finish(Outcome::Completed);
                 return Ok(());
             }
+        }
+    }
+
+    async fn respond(
+        &self,
+        send: impl Future<Output = Result<(), ProcessingError>>,
+    ) -> Result<(), ProcessingError> {
+        // A local response can arrive while a reserved upload is blocked by
+        // flow control. Its acknowledgment must obey the reservation deadline too.
+        tokio::select! {
+            _ = self.lifecycle.expiration() => Err(ProcessingError::new(504, "execution_lease_timeout", "executor did not accept the reserved request before its deadline")),
+            result = send => result,
         }
     }
 
@@ -303,20 +396,43 @@ impl Session {
             Duration::from_secs(self.app.router_config.ext_proc.decision_timeout_secs);
         let request = self.request.take().unwrap();
         let parser = self.parser.clone();
-        let admission = self.admission.clone();
+        let admission = self
+            .admitted
+            .take()
+            .expect("request admitted before parsing");
         let router = self.router.clone();
+        let ingress_started = self.lifecycle.started;
+        let backend = if self.app.router_config.mode.is_pd_mode() {
+            "pd"
+        } else {
+            "regular"
+        };
         self.phase = Phase::Deciding;
         Box::pin(async move {
             let started = Instant::now();
             let prepared = timeout(decision_timeout, async {
                 let (mut request, input) = parser.parse(request).await?;
-                let admission = admission.acquire().await?;
-                let decision = router.select(&mut request, &input).await?;
+                let mut observation = crate::observability::request::RequestMetrics::new(
+                    "ext_proc",
+                    backend,
+                    &input.model,
+                    input.route,
+                    input.stream,
+                )
+                .started_at(ingress_started);
+                let decision = match router.select(&mut request, &input).await {
+                    Ok(decision) => decision,
+                    Err(error) => {
+                        observation.finish(Some(error.status), Some(error.code));
+                        return Err(error);
+                    }
+                };
                 Ok(PreparedRequest {
                     request,
                     admission,
                     decision,
                     trailers,
+                    observation,
                 })
             })
             .await
@@ -329,13 +445,15 @@ impl Session {
         })
     }
 
-    async fn dispatch(&mut self, prepared: PreparedRequest) -> Result<(), ProcessingError> {
+    fn dispatch(&mut self, prepared: PreparedRequest) -> PendingDispatch {
         let PreparedRequest {
             request,
             admission,
             decision,
             trailers,
+            observation,
         } = prepared;
+        self.lifecycle.observation = Some(observation);
         let headers = Mutation::request_headers(
             &decision.address.to_string(),
             &request.id,
@@ -344,15 +462,20 @@ impl Session {
         );
         self.lifecycle.admit(admission);
         self.lifecycle.bind(decision);
-        self.send(headers).await?;
-        self.send_body(&request.raw, !trailers, true).await?;
-        if trailers {
-            self.send(Mutation::trailers(true)).await?;
-        }
-        self.phase = Phase::ResponseHeaders;
-        Ok(())
+        self.phase = Phase::Dispatching;
+        let output = self.output.clone();
+        Box::pin(async move {
+            output.send(headers).await?;
+            output.send_body(&request.raw, !trailers, true).await?;
+            if trailers {
+                output.send(Mutation::trailers(true)).await?;
+            }
+            Ok(())
+        })
     }
+}
 
+impl ResponseSender {
     async fn send_body(
         &self,
         bytes: &[u8],
@@ -375,20 +498,17 @@ impl Session {
     }
 
     async fn send(&self, response: pb::ProcessingResponse) -> Result<(), ProcessingError> {
-        timeout(
-            Duration::from_secs(self.app.router_config.ext_proc.idle_timeout_secs),
-            self.output.send(Ok(response)),
-        )
-        .await
-        .map_err(|_| {
-            ProcessingError::new(
-                504,
-                "send_timeout",
-                "proxy is not reading processing responses",
-            )
-        })?
-        .map_err(|_| {
-            ProcessingError::new(502, "proxy_disconnected", "proxy response stream closed")
-        })
+        timeout(self.timeout, self.channel.send(Ok(response)))
+            .await
+            .map_err(|_| {
+                ProcessingError::new(
+                    504,
+                    "send_timeout",
+                    "proxy is not reading processing responses",
+                )
+            })?
+            .map_err(|_| {
+                ProcessingError::new(502, "proxy_disconnected", "proxy response stream closed")
+            })
     }
 }

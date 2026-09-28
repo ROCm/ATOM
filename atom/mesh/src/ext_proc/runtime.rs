@@ -1,5 +1,6 @@
 use std::{
     net::SocketAddr,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -7,12 +8,13 @@ use std::{
     time::Duration,
 };
 
+use futures_util::StreamExt;
 use tokio::{
     net::TcpListener,
-    sync::{mpsc, watch},
+    sync::{watch, Semaphore},
     task::JoinHandle,
 };
-use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+use tokio_stream::wrappers::{TcpListenerStream, WatchStream};
 use tonic::{
     transport::{Certificate, Identity, Server, ServerTlsConfig},
     Request, Response, Status,
@@ -42,13 +44,19 @@ pub struct ExtProcRuntime {
     draining: Arc<AtomicBool>,
     force: watch::Sender<bool>,
     task: JoinHandle<Result<(), RuntimeError>>,
+    completed: Option<Result<(), String>>,
 }
 
 impl ExtProcRuntime {
     pub async fn start(app: Arc<AppContext>) -> Result<Self, RuntimeError> {
         let config = app.router_config.ext_proc.clone();
         config.validate(&app.router_config)?;
-        let listener = TcpListener::bind(config.listen).await?;
+        let listener = TcpListener::bind(config.listen).await.map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("ext-proc listener {}: {error}", config.listen),
+            )
+        })?;
         let address = listener.local_addr()?;
         let (stop, mut stopped) = watch::channel(false);
         let (force, forced) = watch::channel(false);
@@ -67,19 +75,45 @@ impl ExtProcRuntime {
             ))
             .max_decoding_message_size(config.max_message_bytes)
             .max_encoding_message_size(config.max_message_bytes);
+        let (health_tx, health_status) =
+            watch::channel(HealthService::current_status(&app, &draining));
         let health = HealthServer::new(HealthService {
-            app,
+            app: app.clone(),
             draining: draining.clone(),
+            status: health_status,
+            // A separate bounded pool keeps health subscribers from occupying inference slots.
+            watchers: Arc::new(Semaphore::new(config.max_streams)),
         });
+        let mut health_stop = stopped.clone();
+        let health_draining = draining.clone();
+        let health_updates = async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(250));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = health_stop.wait_for(|v| *v) => break,
+                    _ = tick.tick() => {
+                        let status = HealthService::current_status(&app, &health_draining);
+                        health_tx.send_if_modified(|previous| {
+                            if *previous == status { false } else { *previous = status; true }
+                        });
+                    }
+                }
+            }
+            health_tx.send_replace(2);
+            // Closing the publisher also terminates unknown-service subscriptions.
+        };
         let mut server = Server::builder();
         if let (Some(cert), Some(key)) = (&config.tls_cert, &config.tls_key) {
-            let _ = rustls::crypto::ring::default_provider().install_default();
+            let material = crate::core::tls::TlsMaterial::load(cert, key).await?;
             let mut tls = ServerTlsConfig::new().identity(Identity::from_pem(
-                tokio::fs::read(cert).await?,
-                tokio::fs::read(key).await?,
+                material.certificate,
+                material.private_key,
             ));
             if let Some(ca) = &config.client_ca {
-                tls = tls.client_ca_root(Certificate::from_pem(tokio::fs::read(ca).await?));
+                tls = tls.client_ca_root(Certificate::from_pem(
+                    crate::core::tls::certificate(ca).await?,
+                ));
             }
             server = server.tls_config(tls)?;
         }
@@ -106,7 +140,11 @@ impl ExtProcRuntime {
             let services = async {
                 tokio::try_join!(
                     async { grpc.await.map_err(|e| Box::new(e) as RuntimeError) },
-                    executor
+                    executor,
+                    async {
+                        health_updates.await;
+                        Ok::<(), RuntimeError>(())
+                    }
                 )?;
                 Ok(())
             };
@@ -133,6 +171,7 @@ impl ExtProcRuntime {
             draining,
             force,
             task,
+            completed: None,
         })
     }
 
@@ -152,11 +191,21 @@ impl ExtProcRuntime {
 
     /// Wait for shutdown or a listener failure. Safe to cancel in `select!`.
     pub async fn wait(&mut self) -> Result<(), RuntimeError> {
-        (&mut self.task).await??;
-        if !self.draining.load(Ordering::Acquire) {
-            return Err(std::io::Error::other("ext-proc listener exited unexpectedly").into());
+        if self.completed.is_none() {
+            // Borrow the handle while pending: canceling this await must not lose it.
+            let result = match (&mut self.task).await {
+                Ok(Ok(())) if self.draining.load(Ordering::Acquire) => Ok(()),
+                Ok(Ok(())) => Err("ext-proc listener exited unexpectedly".to_owned()),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            self.completed = Some(result);
         }
-        Ok(())
+        self.completed
+            .as_ref()
+            .unwrap()
+            .clone()
+            .map_err(|error| std::io::Error::other(error).into())
     }
 }
 
@@ -172,6 +221,8 @@ impl Drop for ExtProcRuntime {
 struct HealthService {
     app: Arc<AppContext>,
     draining: Arc<AtomicBool>,
+    status: watch::Receiver<i32>,
+    watchers: Arc<Semaphore>,
 }
 
 impl HealthService {
@@ -179,20 +230,25 @@ impl HealthService {
         if !matches!(name, "" | "envoy.service.ext_proc.v3.ExternalProcessor") {
             return Err(Status::not_found("unknown service"));
         }
-        let eligible: Vec<_> = self
-            .app
+        Ok(health::HealthCheckResponse {
+            status: Self::current_status(&self.app, &self.draining),
+        })
+    }
+
+    fn current_status(app: &AppContext, draining: &AtomicBool) -> i32 {
+        let eligible: Vec<_> = app
             .worker_registry
             .get_all()
             .into_iter()
             .filter(|w| {
                 w.is_available()
                     && matches!(w.connection_mode(), ConnectionMode::Http)
-                    && (!super::request::RequestEnvelope::needs_tokens(&self.app, w.model_id())
-                        || self.app.tokenizer_registry.get(w.model_id()).is_some())
+                    && (!super::request::RequestEnvelope::needs_tokens(app, w.model_id())
+                        || app.tokenizer_registry.get(w.model_id()).is_some())
             })
             .collect();
-        let available = !self.draining.load(Ordering::Acquire)
-            && if self.app.router_config.mode.is_pd_mode() {
+        let available = !draining.load(Ordering::Acquire)
+            && if app.router_config.mode.is_pd_mode() {
                 eligible.iter().any(|p| {
                     matches!(p.worker_type(), WorkerType::Prefill { .. })
                         && eligible.iter().any(|d| {
@@ -205,9 +261,11 @@ impl HealthService {
                     .iter()
                     .any(|w| matches!(w.worker_type(), WorkerType::Regular))
             };
-        Ok(health::HealthCheckResponse {
-            status: if available { 1 } else { 2 },
-        })
+        if available {
+            1
+        } else {
+            2
+        }
     }
 }
 
@@ -219,35 +277,40 @@ impl Health for HealthService {
     ) -> Result<Response<health::HealthCheckResponse>, Status> {
         Ok(Response::new(self.status(&request.into_inner().service)?))
     }
-    type WatchStream = ReceiverStream<Result<health::HealthCheckResponse, Status>>;
+    type WatchStream = Pin<
+        Box<dyn futures_util::Stream<Item = Result<health::HealthCheckResponse, Status>> + Send>,
+    >;
     async fn watch(
         &self,
         request: Request<health::HealthCheckRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
-        let name = request.into_inner().service;
-        let service = Self {
-            app: self.app.clone(),
-            draining: self.draining.clone(),
-        };
-        let (tx, rx) = mpsc::channel(1);
-        tokio::spawn(async move {
-            let mut previous = None;
-            loop {
-                let status = service
-                    .status(&name)
-                    .unwrap_or(health::HealthCheckResponse { status: 3 });
-                if previous != Some(status.status) {
-                    previous = Some(status.status);
-                    if tx.send(Ok(status)).await.is_err() {
-                        break;
+        let permit = self
+            .watchers
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("health watch limit exceeded"))?;
+        let unknown = !matches!(
+            request.into_inner().service.as_str(),
+            "" | "envoy.service.ext_proc.v3.ExternalProcessor"
+        );
+        let updates = WatchStream::new(self.status.clone());
+        let stream = futures_util::stream::unfold(
+            (updates, permit, None),
+            move |(mut updates, permit, mut previous)| async move {
+                while let Some(status) = updates.next().await {
+                    let status = if unknown { 3 } else { status };
+                    if previous == Some(status) {
+                        continue;
                     }
+                    previous = Some(status);
+                    return Some((
+                        Ok(health::HealthCheckResponse { status }),
+                        (updates, permit, previous),
+                    ));
                 }
-                if service.draining.load(Ordering::Acquire) && previous == Some(2) {
-                    break;
-                }
-                tokio::select! { _ = tx.closed() => break, _ = tokio::time::sleep(Duration::from_millis(250)) => {} }
-            }
-        });
-        Ok(Response::new(ReceiverStream::new(rx)))
+                None
+            },
+        );
+        Ok(Response::new(Box::pin(stream)))
     }
 }

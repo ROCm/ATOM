@@ -131,6 +131,17 @@ fn dispatch(
             model_id: None,
             headers: None,
         };
+        let placement = router
+            .reserve_pair(
+                PlacementPlan::Pair {
+                    prefill,
+                    decode,
+                    prefill_policy: "round_robin",
+                    decode_policy: "round_robin",
+                },
+                None,
+            )
+            .unwrap();
         match kind {
             DispatchKind::Atom => {
                 router
@@ -139,8 +150,7 @@ fn dispatch(
                         json!({}),
                         json!({}),
                         context,
-                        prefill,
-                        decode,
+                        placement,
                         ctx,
                         Instant::now(),
                         None,
@@ -154,8 +164,7 @@ fn dispatch(
                         json!({}),
                         json!({}),
                         context,
-                        prefill,
-                        decode,
+                        placement,
                         Instant::now(),
                         None,
                     )
@@ -167,8 +176,7 @@ fn dispatch(
                         None,
                         json!({}),
                         context,
-                        prefill,
-                        decode,
+                        placement,
                         Instant::now(),
                     )
                     .await

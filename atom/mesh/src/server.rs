@@ -30,7 +30,7 @@ use crate::{
         worker_manager::WorkerManager,
         Job,
     },
-    middleware::{self, QueuedRequest},
+    middleware,
     observability::{
         logging::{self, LoggingConfig},
         metrics::{self, MetricsRouteFactory, PrometheusConfig},
@@ -57,7 +57,6 @@ use crate::{
 pub struct AppState {
     pub router: Arc<dyn RouterTrait>,
     pub context: Arc<AppContext>,
-    pub concurrency_queue_tx: Option<tokio::sync::mpsc::Sender<QueuedRequest>>,
     pub router_manager: Option<Arc<RouterManager>>,
 }
 
@@ -587,6 +586,23 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         None
     };
 
+    let http_address = std::net::SocketAddr::new(config.host.parse()?, config.port);
+    let mut listeners = vec![("HTTP", http_address)];
+    if let Some(metrics) = &config.prometheus_config {
+        listeners.push((
+            "metrics",
+            std::net::SocketAddr::new(metrics.host.parse()?, metrics.port),
+        ));
+    }
+    #[cfg(feature = "ext-proc")]
+    if config.router_config.ext_proc.enabled {
+        listeners.push(("ext-proc", config.router_config.ext_proc.listen));
+        if config.router_config.mode.is_pd_mode() {
+            listeners.push(("PD executor", config.router_config.ext_proc.executor_listen));
+        }
+    }
+    crate::core::validate_listeners(&listeners)?;
+
     if let Some(prometheus_config) = &config.prometheus_config {
         metrics::start_prometheus(prometheus_config.clone());
     }
@@ -756,36 +772,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         debug!("Started LoadMonitor for PowerOfTwo policies");
     }
 
-    let (limiter, processor) = middleware::ConcurrencyLimiter::new(
-        app_context.rate_limiter.clone(),
-        config.router_config.queue_size,
-        Duration::from_secs(config.router_config.queue_timeout_secs),
-    );
-
-    if app_context.rate_limiter.is_none() {
-        info!("Rate limiting is disabled (max_concurrent_requests = -1)");
-    }
-
-    match processor {
-        Some(proc) => {
-            spawn(proc.run());
-            debug!(
-                "Started request queue (size: {}, timeout: {}s)",
-                config.router_config.queue_size, config.router_config.queue_timeout_secs
-            );
-        }
-        None => {
-            debug!(
-                "Rate limiting enabled (max_concurrent_requests = {}, queue disabled)",
-                config.router_config.max_concurrent_requests
-            );
-        }
-    }
-
     let app_state = Arc::new(AppState {
         router,
         context: app_context.clone(),
-        concurrency_queue_tx: limiter.queue_tx.clone(),
         router_manager: Some(router_manager),
     });
     info!(
@@ -808,13 +797,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         request_id_headers,
     );
 
-    // TcpListener::bind accepts &str and handles IPv4/IPv6 via ToSocketAddrs
-    let bind_addr = format!("{}:{}", config.host, config.port);
-    info!("Starting server on {}", bind_addr);
-
-    let addr: std::net::SocketAddr = bind_addr
-        .parse()
-        .map_err(|e| format!("Invalid address: {}", e))?;
+    let listener = std::net::TcpListener::bind(http_address).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("HTTP listener {http_address}: {error}"),
+        )
+    })?;
+    let address = listener.local_addr()?;
+    listener.set_nonblocking(true)?;
+    info!(%address, "HTTP listener bound");
 
     let handle = axum_server::Handle::new();
     #[cfg(feature = "ext-proc")]
@@ -842,7 +833,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         app_state_clone.router.shutdown().await;
     });
 
-    let http = serve_http(addr, app, handle.clone(), config.tls.as_ref());
+    let http = serve_http(listener, app, handle.clone(), config.tls.as_ref());
     #[cfg(feature = "ext-proc")]
     if let Some(mut runtime) = ext_proc {
         // HTTP exposes management and health routes; inference goes through Envoy.
@@ -877,75 +868,35 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 }
 
 async fn serve_http(
-    addr: std::net::SocketAddr,
+    listener: std::net::TcpListener,
     app: Router,
     handle: axum_server::Handle<std::net::SocketAddr>,
     tls: Option<&ServerTlsConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(tls) = tls {
-        let cert_metadata = tokio::fs::metadata(&tls.cert_path).await.map_err(|e| {
-            Box::new(io::Error::new(
+        let material = crate::core::tls::TlsMaterial::load(&tls.cert_path, &tls.key_path).await?;
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem(
+            material.certificate,
+            material.private_key,
+        )
+        .await
+        .map_err(|error| {
+            io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "TLS certificate file is not accessible at '{}': {}",
+                    "TLS certificate '{}' and key '{}': {error}",
                     tls.cert_path.display(),
-                    e
-                ),
-            )) as Box<dyn std::error::Error>
-        })?;
-        if !cert_metadata.is_file() {
-            return Err(Box::new(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "TLS certificate path is not a file: '{}'",
-                    tls.cert_path.display()
-                ),
-            )));
-        }
-
-        let key_metadata = tokio::fs::metadata(&tls.key_path).await.map_err(|e| {
-            Box::new(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "TLS private key file is not accessible at '{}': {}",
-                    tls.key_path.display(),
-                    e
-                ),
-            )) as Box<dyn std::error::Error>
-        })?;
-        if !key_metadata.is_file() {
-            return Err(Box::new(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "TLS private key path is not a file: '{}'",
                     tls.key_path.display()
                 ),
-            )));
-        }
-
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        let tls_config =
-            axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)
-                .await
-                .map_err(|e| {
-                    Box::new(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "failed to load TLS certificate '{}' and key '{}': {}",
-                            tls.cert_path.display(),
-                            tls.key_path.display(),
-                            e
-                        ),
-                    )) as Box<dyn std::error::Error>
-                })?;
+            )
+        })?;
         info!("TLS enabled");
-        axum_server::bind_rustls(addr, tls_config)
+        axum_server::from_tcp_rustls(listener, tls_config)?
             .handle(handle)
             .serve(app.into_make_service())
             .await?;
     } else {
-        axum_server::bind(addr)
+        axum_server::from_tcp(listener)?
             .handle(handle)
             .serve(app.into_make_service())
             .await?;

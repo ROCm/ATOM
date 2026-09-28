@@ -140,7 +140,6 @@ pub(crate) struct SseFrames {
 impl SseFrames {
     pub(crate) const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
-    #[cfg(feature = "ext-proc")]
     pub(crate) fn exceeded_limit(&self) -> bool {
         self.oversized
     }
@@ -184,6 +183,23 @@ impl SseFrames {
     }
 }
 
+/// Extract one SSE event's data, following the single-optional-space rule.
+pub(crate) fn sse_data(frame: &[u8]) -> Option<String> {
+    let frame = std::str::from_utf8(frame).ok()?;
+    let lines: Vec<_> = frame
+        .lines()
+        .filter_map(|line| {
+            if line == "data" {
+                Some("")
+            } else {
+                line.strip_prefix("data:")
+                    .map(|value| value.strip_prefix(' ').unwrap_or(value))
+            }
+        })
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 #[derive(Default)]
 pub(crate) struct FirstOutputSse {
     frames: SseFrames,
@@ -198,17 +214,9 @@ impl FirstOutputSse {
         }
         self.frames.append(chunk);
         while let Some(frame) = self.frames.next_frame() {
-            let Ok(frame) = std::str::from_utf8(frame) else {
+            let Some(data) = sse_data(frame) else {
                 continue;
             };
-            let data = frame
-                .lines()
-                .filter_map(|line| {
-                    line.strip_prefix("data:")
-                        .map(|s| s.trim_start_matches(' '))
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
             if data == "[DONE]" {
                 self.finish();
                 return false;
@@ -460,12 +468,21 @@ mod tests {
                 "/v1/chat/completions",
                 post(|| async {
                     tokio::time::sleep(Duration::from_millis(10)).await;
-                    Response::builder()
+                    let response = Response::builder()
                         .header(CONTENT_TYPE, "text/event-stream")
                         .body(Body::from(sse(
                             json!({"model": "test-model", "choices": [{"text": "ok"}]}),
                         )))
-                        .unwrap()
+                        .unwrap();
+                    // Business observation and outer ingress timing must emit one TTFT.
+                    crate::observability::request::RequestMetrics::new(
+                        "http",
+                        "regular",
+                        "test-model",
+                        "/v1/chat/completions",
+                        true,
+                    )
+                    .wrap_response(response)
                 }),
             )
             .layer(axum::middleware::from_fn_with_state(

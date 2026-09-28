@@ -32,6 +32,33 @@ pub struct ExtProcConfig {
         help_heading = "External Processing"
     )]
     pub max_body_bytes: usize,
+    /// Global budget for retained request body buffers, including canceled parsers.
+    #[arg(
+        long = "ext-proc-max-buffered-bytes",
+        default_value_t = 268435456,
+        help_heading = "External Processing"
+    )]
+    pub max_buffered_bytes: usize,
+    #[arg(
+        long = "ext-proc-parser-concurrency",
+        default_value_t = 4,
+        help_heading = "External Processing"
+    )]
+    pub parser_concurrency: usize,
+    /// Maximum UTF-8 prompt size passed to synchronous tokenization.
+    #[arg(
+        long = "ext-proc-max-tokenize-bytes",
+        default_value_t = 1048576,
+        help_heading = "External Processing"
+    )]
+    pub max_tokenize_bytes: usize,
+    /// Deadline for the executor to receive and validate a reserved request.
+    #[arg(
+        long = "ext-proc-reservation-timeout-secs",
+        default_value_t = 10,
+        help_heading = "External Processing"
+    )]
+    pub reservation_timeout_secs: u64,
     #[arg(
         long = "ext-proc-max-streams",
         default_value_t = 256,
@@ -104,6 +131,10 @@ impl Default for ExtProcConfig {
             max_message_bytes: 1_048_576,
             max_body_bytes: 8_388_608,
             max_streams: 256,
+            max_buffered_bytes: 268_435_456,
+            parser_concurrency: 4,
+            max_tokenize_bytes: 1_048_576,
+            reservation_timeout_secs: 10,
             body_timeout_secs: 30,
             decision_timeout_secs: 60,
             idle_timeout_secs: 300,
@@ -128,6 +159,13 @@ impl ExtProcConfig {
         if router.atom_standalone || !matches!(router.connection_mode, ConnectionMode::Http) {
             return Err(invalid("requires external HTTP workers"));
         }
+        if router.mode.is_pd_mode() {
+            crate::core::listener::validate(&[
+                ("ext-proc", self.listen),
+                ("PD executor", self.executor_listen),
+            ])
+            .map_err(|error| invalid(&error.to_string()))?;
+        }
         if router.mode.is_pd_mode()
             && self.executor_listen.ip().is_unspecified()
             && self.executor_advertise.is_none()
@@ -144,12 +182,22 @@ impl ExtProcConfig {
                 "executor advertised address must be a concrete IP and nonzero port",
             ));
         }
+        if self.max_buffered_bytes < self.max_body_bytes
+            || self.max_buffered_bytes > u32::MAX as usize
+            || self.parser_concurrency == 0
+            || self.max_tokenize_bytes == 0
+        {
+            return Err(invalid(
+                "buffer budget must cover one request and fit u32; parser limits must be positive",
+            ));
+        }
         if self.max_message_bytes < 131_072 || self.max_body_bytes == 0 || self.max_streams == 0 {
             return Err(invalid(
                 "message limit must be >= 128 KiB; body and stream limits must be positive",
             ));
         }
         if [
+            self.reservation_timeout_secs,
             self.body_timeout_secs,
             self.decision_timeout_secs,
             self.idle_timeout_secs,
@@ -167,5 +215,31 @@ impl ExtProcConfig {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_limits_and_reservation_deadline_are_validated() {
+        let router = RouterConfig::default();
+        let config = ExtProcConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(config.validate(&router).is_ok());
+        for change in [
+            |c: &mut ExtProcConfig| c.max_buffered_bytes = c.max_body_bytes - 1,
+            |c: &mut ExtProcConfig| c.max_buffered_bytes = u32::MAX as usize + 1,
+            |c: &mut ExtProcConfig| c.parser_concurrency = 0,
+            |c: &mut ExtProcConfig| c.max_tokenize_bytes = 0,
+            |c: &mut ExtProcConfig| c.reservation_timeout_secs = 0,
+        ] {
+            let mut invalid = config.clone();
+            change(&mut invalid);
+            assert!(invalid.validate(&router).is_err());
+        }
     }
 }

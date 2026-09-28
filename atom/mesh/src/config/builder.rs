@@ -1025,22 +1025,24 @@ mod tests {
 
     #[test]
     fn test_builder_build_validates() {
-        // Port 0 should fail validation
-        let result = RouterConfigBuilder::new().port(0).build();
+        // Payload limits must remain positive.
+        let result = RouterConfigBuilder::new().max_payload_size(0).build();
         assert!(result.is_err());
     }
 
     #[test]
     fn test_builder_build_unchecked_skips_validation() {
-        // Port 0 is invalid but build_unchecked skips validation
-        let config = RouterConfigBuilder::new().port(0).build_unchecked();
-        assert_eq!(config.port, 0);
+        // build_unchecked intentionally skips invalid payload limits.
+        let config = RouterConfigBuilder::new()
+            .max_payload_size(0)
+            .build_unchecked();
+        assert_eq!(config.max_payload_size, 0);
     }
 
     #[test]
     fn test_builder_build_with_validation_false() {
         let result = RouterConfigBuilder::new()
-            .port(0)
+            .max_payload_size(0)
             .build_with_validation(false);
         assert!(result.is_ok());
     }
