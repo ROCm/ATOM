@@ -6935,7 +6935,7 @@ class TestOneDispatchEmitsOneCompletion:
         assert tier.calls == [], "the state leg ran over KV that never arrived"
         # ...and this rank still reported on the verdict key, or the TP quorum
         # for it would never be reached and the hash could never be retracted.
-        assert tier.neutral == [(99, "r1")]
+        assert tier.neutral == [(99, LoadOperationId("r1", 0))]
         # Nothing was swallowed on the way: a raise into `_do_load_req`'s
         # `except` would land here and would otherwise be invisible, because it
         # only sets `ok = False` on a path where it is already False.
@@ -7091,6 +7091,83 @@ def test_a_state_only_load_travels_the_ordinary_load_path():
     assert s._state_load_seqs["r1"] is seq
     # The base park predicate must see it, so the request waits for its state.
     assert s.should_park_for_load_after_alloc(seq) is True
+
+
+def test_a_state_only_load_is_not_dropped_by_the_build_time_pin_check():
+    """HBM can hold more of the prefix than the KV tier does: here 1024 tokens
+    are resident, the tier's KV covers 768, and the state boundary is 768. The
+    state-only load moves no KV, but the build step re-takes the lookup pin for
+    every load it dispatches (`_ensure_lookup_pin`) and drops the load when the
+    tier holds less than the spec promises. Aimed at the HBM length, that check
+    dropped a load whose request was already parked -- and nothing would ever
+    report on it. The spec reused from the lookup also carried a full-prompt
+    transport end, which is a read past HBM unless the state-only branch clears
+    it."""
+    s = _k3_scheduler()
+    lookups = []
+    s._lookup_client = SimpleNamespace(
+        lookup=lambda *a, **k: lookups.append(a) or 768,
+        clear_lookup_status=lambda _sid: None,
+    )
+    s._lookup_results = {}  # a remembered hit: no live pin to fall back on
+    seq = SimpleNamespace(
+        id="r1",
+        num_cached_tokens=1024,
+        has_per_req_cache=True,
+        offload_joint=OffloadJointRecord(load_hash=99, boundary_tokens=768),
+    )
+    ls = LoadSpec(
+        hbm_cached_tokens=0,
+        lmcache_cached_tokens=768,
+        can_load=True,
+        transfer_end_tokens=1280,
+    )
+
+    should_load, reason, *_ = s._decide_load_after_alloc(seq, ls)
+    assert (should_load, reason) == (True, "state_only_load")
+    assert s._ensure_lookup_pin(seq, "r1", ls) is True
+    assert lookups == [], "a spec that reads nothing needs no pin re-taken"
+
+
+def test_a_load_that_reads_the_tier_still_has_its_pin_confirmed():
+    """The no-op exemption is only for specs that move nothing. A KV load past
+    HBM still asks the tier, and is still dropped if the tier lost it."""
+    s = _k3_scheduler()
+    s._lookup_client = SimpleNamespace(
+        lookup=lambda *a, **k: 512,
+        clear_lookup_status=lambda _sid: None,
+    )
+    s._lookup_results = {}
+    s._lookup_in_step = []
+    s._load_specs = {}
+    s._reqs_need_recv = {}
+    s._handoff_loads = set()
+    s._load_save_floors = {}
+    s._hit_save_floors = {}
+    s._tier_hit_memo = {}
+    seq = SimpleNamespace(id="r1", num_prompt_tokens=2048, token_ids=[0] * 2048)
+    ls = LoadSpec(hbm_cached_tokens=256, lmcache_cached_tokens=1024, can_load=True)
+    assert s._ensure_lookup_pin(seq, "r1", ls) is False
+
+
+def test_each_load_generation_reports_its_state_verdict_under_its_own_key():
+    """The aggregator tombstones every connector-completion key it takes quorum
+    on. Keyed by request id, a request re-admitted after a preempt that loads
+    the same hash again would reuse its first load's key, and its miss would be
+    dropped as already seen -- the hash would stay advertised."""
+    first = _k3_load_req("r1", generation=0)
+    second = _k3_load_req("r1", generation=1)
+    k1 = KimiK3OffloadConnector._state_verdict_key(first)
+    k2 = KimiK3OffloadConnector._state_verdict_key(second)
+    assert k1 != k2
+    assert k1 == LoadOperationId("r1", 0)
+    # A producer that attaches no operation falls back to the request id.
+    assert (
+        KimiK3OffloadConnector._state_verdict_key(
+            SimpleNamespace(req_id=7, load_operation=None)
+        )
+        == "7"
+    )
 
 
 def test_the_state_leg_is_attached_to_the_requests_own_metadata(monkeypatch):

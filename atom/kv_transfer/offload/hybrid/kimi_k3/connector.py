@@ -57,11 +57,11 @@ STATE_SOURCE_CHANNEL = "k3_state_source"
 #: `STATE_INDEX_CHANNEL`. Both are statements about one hash's membership in the
 #: engine's index, so they share the channel rather than adding a third; the tag
 #: is what keeps `connector_completion` from settling a store pin against a
-#: load's verdict. The key is `("state_load", hash, req_id)` -- a plain hashable
-#: tuple, which is what `ConnectorCompletion.operation_id` and the TP
-#: aggregator's key require. The request id is part of the key because the
-#: aggregator tombstones every connector-completion key it takes quorum on; see
-#: `take_hash_verdicts`.
+#: load's verdict. The key is `("state_load", hash, load_key)` -- a plain
+#: hashable tuple, which is what `ConnectorCompletion.operation_id` and the TP
+#: aggregator's key require. `load_key` is the load's exact generation
+#: (`_state_verdict_key`) because the aggregator tombstones every
+#: connector-completion key it takes quorum on; see `take_hash_verdicts`.
 STATE_LOAD_VERDICT_TAG = "state_load"
 
 #: The connector's standalone stall clock, used only when reclamation is
@@ -350,7 +350,9 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         tier = self._state_tier
         if tier is None:
             return
-        tier.note_load_unrun(req.state_load_spec.boundary_hash, req.req_id)
+        tier.note_load_unrun(
+            req.state_load_spec.boundary_hash, self._state_verdict_key(req)
+        )
 
     def _load_state_bytes(self, req: LMCacheReqMeta) -> bool:
         """Restore this request's recurrent state into the slot it was given."""
@@ -411,7 +413,23 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
                 slot,
             )
             return False
-        return tier.load_state(spec.boundary_hash, slot, req.req_id)
+        return tier.load_state(spec.boundary_hash, slot, self._state_verdict_key(req))
+
+    @staticmethod
+    def _state_verdict_key(req: LMCacheReqMeta):
+        """The identity a state leg's verdict is reported under.
+
+        The exact load generation, not the request id: a request re-admitted
+        after a preempt that loads the same hash again would otherwise reuse its
+        first load's key, which the aggregator has already tombstoned, and its
+        miss would be dropped. `LoadOperationId` is scheduler-issued, so it is
+        identical on every rank. The request id is the fallback only for a
+        producer that attaches no operation.
+        """
+        operation = getattr(req, "load_operation", None)
+        if operation is not None:
+            return operation
+        return str(req.req_id)
 
     def _start_state_stores(self, metadata) -> None:
         """Hand this step's ready checkpoints to the tier's executor.
@@ -496,18 +514,17 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         # that would permanently deny state that is still there. Successes ride
         # the same channel because the TP quorum acts only on a key every rank
         # reported.
-        # The key carries the request as well as the hash. The aggregator
-        # tombstones every connector-completion key it takes quorum on, and
-        # drops a report whose key is already tombstoned, so a bare hash is
-        # reportable exactly once per process: a hash re-stored after its first
-        # miss could never be retracted again and the index would keep
-        # advertising bytes LMCache no longer holds. The request id is the same
-        # on every rank, so the quorum is unchanged.
-        for (h, rid), ok in self._state_tier.take_hash_verdicts().items():
+        # The key carries the load generation as well as the hash. The
+        # aggregator tombstones every connector-completion key it takes quorum
+        # on, and drops a report whose key is already tombstoned, so a bare hash
+        # is reportable exactly once per process, and a bare request id once per
+        # request. `_state_verdict_key` is the same on every rank, so the quorum
+        # is unchanged.
+        for (h, load_key), ok in self._state_tier.take_hash_verdicts().items():
             out.connector_completions.add(
                 ConnectorCompletion(
                     STATE_INDEX_CHANNEL,
-                    (STATE_LOAD_VERDICT_TAG, int(h), rid),
+                    (STATE_LOAD_VERDICT_TAG, int(h), load_key),
                     bool(ok),
                 )
             )
@@ -779,6 +796,11 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
             # and the request would park on a transfer with no carrier.
             ls.hbm_cached_tokens = hbm
             ls.lmcache_cached_tokens = hbm
+            # A spec reused from the lookup may still carry the full-prompt
+            # transport end. Nothing is transferred, so nothing is read: clear
+            # it, or the build-time pin check (`_ensure_lookup_pin`) would see a
+            # read past HBM and drop the load of an already-parked request.
+            ls.transfer_end_tokens = None
             return True, "state_only_load", hbm, hbm, 0, chunk
         if joint <= hbm:
             return False, "per_req_cache_state_boundary", hbm, lmc, lmc - hbm, chunk

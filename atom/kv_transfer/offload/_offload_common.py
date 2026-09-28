@@ -825,6 +825,21 @@ class OffloadSchedulerMixin(ABC):
         sequences it.
         """
 
+        # A spec that moves no KV reads nothing from the tier, so there is no
+        # entry to hold. Kimi-K3's state-only load is this shape: its KV leg is
+        # a no-op carrier (`lmcache_cached_tokens == hbm_cached_tokens`) for the
+        # state leg riding the same request, and HBM can legitimately hold more
+        # of the prefix than the KV tier does. Confirming it would compare the
+        # tier's hit against the HBM length, drop a load whose request is
+        # already parked, and leave that request waiting on a report nothing
+        # will send.
+        transfer_end = getattr(spec, "transfer_end_tokens", None)
+        reads_to = max(
+            int(spec.lmcache_cached_tokens),
+            int(transfer_end) if transfer_end is not None else 0,
+        )
+        if reads_to <= int(spec.hbm_cached_tokens):
+            return True
         # `_lookup_results` is the dense scheduler's live-pin carrier. The DSV4
         # scheduler releases every pin at the end of the step it was taken in,
         # so it has none and always answers this with a fresh lookup.

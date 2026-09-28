@@ -298,16 +298,25 @@ class StateOffloadIndex:
         self.dispatched += 1
         return True
 
-    def orphan(self, req_id) -> bool:
+    def orphan(self, req_id, slot: int) -> bool:
         """The request is being torn down while its load is still in flight.
 
         The slot passes to this index: the worker may still be scattering into
         it, so it cannot go back on the free list until the report lands.
         Returns False when nothing was in flight -- the ordinary case, and it
         means the caller keeps the slot.
+
+        `slot` is the committed slot the caller is about to free, and the claim
+        is taken only if it is the one this load writes into. The request id
+        alone names the request, not the admission: an admission torn down
+        after an earlier one's load was orphaned would otherwise be told "the
+        index has it", keep its own slot off the free list, and leak it, while
+        the index goes on to release only the earlier admission's slot. An
+        orphaned destination is held here, never on the free list, so a later
+        admission can never have been given the same slot.
         """
         pending = self._outstanding.get(req_id)
-        if pending is None:
+        if pending is None or pending.slot != int(slot):
             return False
         pending.orphaned = True
         # Restamp. `reclaim` ages an entry from `at`, and `at` was the dispatch
@@ -404,6 +413,10 @@ class StateOffloadIndex:
         for req_id in stale:
             self._settle(req_id)
             self.orphan_load_slots_reclaimed += 1
+            # A terminal outcome like the other three, so the outcome counters
+            # still add up to `settled`. An abandon, not a failure: no report
+            # came, which says nothing about the bytes.
+            self.loads_abandoned += 1
         if stale:
             logger.warning(
                 "state offload: reclaimed %d orphaned load slot(s) whose "

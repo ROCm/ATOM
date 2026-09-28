@@ -126,26 +126,41 @@ class TestSlotOwnership:
     def test_an_orphaned_slot_comes_back_when_the_load_settles(self):
         index = _index(1)
         index.request_load("a", 1, slot=5)
-        assert index.orphan("a") is True
+        assert index.orphan("a", 5) is True
         index.fail_load("a")
         assert index.released == [5]
         index.check_invariant()
 
     def test_orphaning_an_id_with_nothing_in_flight_says_so(self):
         """False means the caller keeps the slot -- the ordinary teardown."""
-        assert _index().orphan("a") is False
+        assert _index().orphan("a", 5) is False
+
+    def test_a_later_admission_is_not_told_an_earlier_orphan_is_its_own(self):
+        """The index keys loads by request id, which names the request, not the
+        admission. An admission torn down while an EARLIER admission's orphaned
+        load is still outstanding must keep (and free) its own slot; a claim on
+        the id alone would keep it off the free list and leak it."""
+        index = _index(1)
+        index.request_load("r", 1, slot=5)
+        assert index.orphan("r", 5) is True
+
+        assert index.orphan("r", 9) is False, "slot 9 is not this load's"
+        index.fail_load("r")
+        assert index.released == [5]
+        index.check_invariant()
 
     def test_reclaim_frees_only_an_orphan_whose_report_never_came(self):
         index = _index(1, 2)
         index.request_load("live", 1, slot=5)
         index.request_load("gone", 2, slot=6)
-        index.orphan("gone")
+        index.orphan("gone", 6)
         for entry in index._outstanding.values():
             entry.at -= 3600.0
 
         assert index.reclaim(timeout_s=1.0) == 1
         assert index.released == [6], "a live request's slot must not be yanked"
         assert index.orphan_load_slots_reclaimed == 1
+        assert index.loads_abandoned == 1, "a reclaim settles as an abandon"
         assert index.outstanding == 1
         index.check_invariant()
 
@@ -162,7 +177,7 @@ class TestSlotOwnership:
         # Already far older than any window. The worker may still be writing.
         index._outstanding["gone"].at -= 3600.0
 
-        index.orphan("gone")
+        index.orphan("gone", 6)
 
         assert index.reclaim(timeout_s=1.0) == 0, (
             "an orphan is reclaimable one full window after it was ORPHANED, "
@@ -175,21 +190,21 @@ class TestSlotOwnership:
     def test_reclaim_spares_an_orphan_still_inside_its_window(self):
         index = _index(1)
         index.request_load("gone", 1, slot=6)
-        index.orphan("gone")
+        index.orphan("gone", 6)
         assert index.reclaim(timeout_s=3600.0) == 0
         assert index.released == []
 
     def test_reclaim_is_disabled_by_a_nonpositive_window(self):
         index = _index(1)
         index.request_load("gone", 1, slot=6)
-        index.orphan("gone")
+        index.orphan("gone", 6)
         index._outstanding["gone"].at -= 3600.0
         assert index.reclaim(timeout_s=0.0) == 0
 
     def test_a_late_report_after_reclaim_releases_nothing_twice(self):
         index = _index(1)
         index.request_load("gone", 1, slot=6)
-        index.orphan("gone")
+        index.orphan("gone", 6)
         index._outstanding["gone"].at -= 3600.0
         index.reclaim(timeout_s=1.0)
         index.fail_load("gone")  # the report finally arrives

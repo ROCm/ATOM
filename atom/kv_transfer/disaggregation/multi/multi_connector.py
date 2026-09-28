@@ -381,6 +381,19 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         """
         return self._load_winner.get(getattr(seq, "id", None))
 
+    def _state_only_carrier(self, seq: Any):
+        """The tier sub, when `seq` has a state load and no KV load owner.
+
+        `offload_joint.load_hash` is set by the engine only when it secured a
+        state load from the tier (`BlockManager._start_state_load`), so it is the
+        engine's own statement that a state leg is in flight; the tier sub is
+        the only sub that can carry one.
+        """
+        joint = getattr(seq, "offload_joint", None)
+        if joint is None or int(getattr(joint, "load_hash", -1)) == -1:
+            return None
+        return self._state_tier_sub()
+
     def _state_tier_sub(self):
         """The one sub-connector that actually hosts the state offload tier.
 
@@ -429,6 +442,14 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         the tier sub (finding 1). Cleared by `request_finished` /
         `cancel_pending_load`.
         """
+        # A new arbitration starts clean. The cancel flag a losing sub reads is
+        # per arbitration, not per request: a request preempted after one sub
+        # lost can be re-admitted, and if that sub wins this time a stale flag
+        # would still suppress its state leg (`KimiK3OffloadScheduler.update_
+        # state_after_alloc`) while its KV load goes out -- the forward would
+        # then resume over a state slot nothing filled.
+        if getattr(seq, "offload_load_cancelled", False):
+            seq.offload_load_cancelled = False
         result = (0, False)
         winner = None
         for c in self._connectors:
@@ -527,8 +548,17 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         # `_decide_load_after_alloc` (kimi_k3's joint-boundary clamp); an owner
         # that armed a load but does not refine (a P/D producer) parks -- the
         # scheduler's own absent-hook default -- so the forward waits rather than
-        # running over the load's blocks. No owner means no load: don't park.
+        # running over the load's blocks.
+        #
+        # No KV owner is not always "no load". A STATE-ONLY load -- the KV is
+        # resident in HBM, the recurrent state is in the tier -- wins no KV
+        # arbitration, because every sub's KV answer is 0. The tier sub armed
+        # it anyway (`update_state_after_alloc` is fanned to every sub) and it
+        # alone carries it, so it answers. Without this the composite declined
+        # every state-only resume and the request recomputed from 0.
         c = self._load_owner(seq)
+        if c is None:
+            c = self._state_only_carrier(seq)
         if c is not None and hasattr(c, "should_park_for_load_after_alloc"):
             return c.should_park_for_load_after_alloc(seq)
         return c is not None

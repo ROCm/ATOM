@@ -2505,7 +2505,9 @@ class BlockManager:
             # releases it when the load's one report lands (or, if that report
             # is lost to a dead worker, when its reclaimer fires). The rollback
             # scratch is nobody's destination and goes back regardless.
-            if self.state_offload is not None and self.state_offload.orphan(seq.id):
+            if self.state_offload is not None and self.state_offload.orphan(
+                seq.id, seq.state_slots[0]
+            ):
                 self.state.release_many(seq.state_slots[1:])
             else:
                 self.state.release_many(seq.state_slots)
