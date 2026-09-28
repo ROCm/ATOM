@@ -216,6 +216,15 @@ EOF
       "${DOCKER_IMAGE}" || true)"
   fi
 
+  # Same env-file route, for the same reason. WARN is the default everywhere; a
+  # case that is chasing an RCCL init hang can ask for INFO without making the
+  # nightly logs verbose. The -e below has to win over --env-file, so this
+  # cannot simply be set as a case variable.
+  local nccl_debug="${ATOMESH_NCCL_DEBUG:-}"
+  if [[ -z "${nccl_debug}" && -r "${env_file}" ]]; then
+    nccl_debug="$(sed -n 's/^ATOMESH_NCCL_DEBUG=//p' "${env_file}" | tail -n 1)"
+  fi
+
   docker_args=(
     run --name "${container}"
     --user "$(id -u):$(id -g)"
@@ -260,7 +269,7 @@ EOF
     -e NCCL_IB_QPS_PER_CONNECTION=1
     -e NCCL_IB_TIMEOUT=22
     -e NCCL_IB_RETRY_CNT=12
-    -e NCCL_DEBUG=WARN
+    -e NCCL_DEBUG="${nccl_debug:-WARN}"
     -v "${REPO_ROOT}":/workspace/ATOM:ro
     -v "${RUN_DIR}":/run_logs/slurm_job-"${JOB_ID}"
     -v /mnt:/mnt

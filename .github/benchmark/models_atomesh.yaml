@@ -666,6 +666,11 @@ models:
               # per-worker cache root started empty and every tuned GEMM compiled
               # inside the forward that first selected it.
               ATOMESH_SEED_AOT_CACHE: "1"
+              # Both arms of this A/B have hung in RCCL init on the pit2 pool,
+              # seconds after `RCCL version` and before any weight loading.
+              # WARN says nothing about where. Drop this back once that is
+              # understood; it only costs init-time log volume.
+              ATOMESH_NCCL_DEBUG: "INFO"
               # Write the offline traces (per-forward shape and device time,
               # kernel compiles, per-request stages, offload copy queue) under
               # RUN_DIR/traces, which comes back with the logs. They are what
@@ -691,6 +696,8 @@ models:
               ATOM_ENABLE_REPLAYSSM: "0"
               AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
               ATOMESH_SEED_AOT_CACHE: "0"
+              # Matches the seeded arm; see the note there.
+              ATOMESH_NCCL_DEBUG: "INFO"
               ATOMESH_ENABLE_TRACES: "1"
 
         - <<: *kimi_k3_agentic_no_dspark
