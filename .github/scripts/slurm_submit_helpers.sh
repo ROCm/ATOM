@@ -55,11 +55,29 @@ submit_slurm_job_with_leader_retry() {
     cat "${error_file}" >&2
     # A timeout or any possibly accepted submission must not be retried.
     rejection="$(sed '/^[[:space:]]*$/d' "${error_file}")"
-    if [[ "${USES_SPUR_CONTROLLER}" != "1" || "${rc}" -ne 1 ||
-      -n "${SBATCH_OUTPUT}" || "${rejection}" != "${expected_rejection}" ]]; then
+    if [[ "${USES_SPUR_CONTROLLER}" != "1" || "${rc}" -ne 1 || -n "${SBATCH_OUTPUT}" ]]; then
       break
     fi
-    echo "Spur rejected submission at ${controller}: not the Raft leader." >&2
+    if [[ "${rejection}" == "${expected_rejection}" ]]; then
+      echo "Spur rejected submission at ${controller}: not the Raft leader." >&2
+      continue
+    fi
+    # A degraded Raft group answers with an internal error instead of a leader
+    # redirect, and breaking there strands the remaining replicas untried --
+    # which is how every submission during the 2026-09-28 split brain died on
+    # the one diverged replica without ever reaching the healthy one. Such a
+    # propose may still commit after it reports failure, so cancel by job name
+    # first: the name carries the run id, making the scancel exact, idempotent,
+    # and a no-op when nothing was created. The wrapper only cleans up on a
+    # failed submit, so a phantom left behind by a retry that then succeeds
+    # would otherwise hold two exclusive nodes for the full time limit.
+    if [[ "${rejection}" == *"raft propose failed"* ]]; then
+      echo "Spur rejected submission at ${controller}: ${rejection##*message: }" >&2
+      echo "Cancelling any job committed by the failed propose before retrying." >&2
+      scancel_slurm_job_by_name
+      continue
+    fi
+    break
   done
   rm -f "${error_file}"
   return "${rc}"
