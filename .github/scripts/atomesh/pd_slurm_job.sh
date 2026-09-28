@@ -182,7 +182,16 @@ EOF
   video_gid="$(getent group video 2>/dev/null | cut -d: -f3 || true)"
   render_gid="$(getent group render 2>/dev/null | cut -d: -f3 || true)"
   host_ionic="$(readlink -f /usr/lib/x86_64-linux-gnu/libionic.so.1 2>/dev/null || true)"
+  # A case can name the bootstrap interface. Without one, RCCL picks for itself,
+  # and on the pit2 pool it picks wrong: job 4716 chose eno1 (10.13.0.101) while
+  # the reachable fabric -- the one ATOM_HOST_IP and the health endpoint use --
+  # is eno0 (10.19.0.101). All eight ranks then spent 4500s in
+  # ncclOsSocketPollConnect timing out against an address on their own host.
+  # The eth1 fallback below never fired here; these nodes have no eth1.
   nccl_socket_ifname="${NCCL_SOCKET_IFNAME:-}"
+  if [[ -z "${nccl_socket_ifname}" && -r "${env_file}" ]]; then
+    nccl_socket_ifname="$(sed -n 's/^ATOMESH_ENV_NCCL_SOCKET_IFNAME=//p' "${env_file}" | tail -n 1)"
+  fi
   if [[ -z "${nccl_socket_ifname}" && -d /sys/class/net/eth1 ]]; then
     nccl_socket_ifname="eth1"
   fi

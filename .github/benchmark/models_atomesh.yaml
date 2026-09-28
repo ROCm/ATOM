@@ -680,6 +680,11 @@ models:
               # Taking the runtime at its word. The known cost is that scratch
               # is no longer reclaimed, i.e. more device memory held.
               HSA_NO_SCRATCH_RECLAIM: "1"
+              # RCCL's own pick, eno1/10.13.0.x, is not reachable on this pool;
+              # eno0 carries 10.19.0.x, which is what ATOM_HOST_IP resolves to.
+              # Job 4716 with NCCL_DEBUG=INFO showed all eight ranks retrying
+              # the wrong one to the 4500s wait timeout.
+              NCCL_SOCKET_IFNAME: "eno0"
               # Write the offline traces (per-forward shape and device time,
               # kernel compiles, per-request stages, offload copy queue) under
               # RUN_DIR/traces, which comes back with the logs. They are what
@@ -709,6 +714,7 @@ models:
               # identical across the pair or the A/B stops being one.
               ATOMESH_NCCL_DEBUG: "INFO"
               HSA_NO_SCRATCH_RECLAIM: "1"
+              NCCL_SOCKET_IFNAME: "eno0"
               ATOMESH_ENABLE_TRACES: "1"
 
         - <<: *kimi_k3_agentic_no_dspark
