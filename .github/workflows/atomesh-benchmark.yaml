@@ -91,6 +91,9 @@ on:
             glm-52-mxfp4-1p1d-cpp4-dpa4-agentic-lmcache-1m-c40,
             glm-52-mxfp4-1p2d-cpp4-dpa4-agentic-lmcache-1m-c48,
             glm-52-mxfp4-1p2d-cpp4-dpa4-agentic-lmcache-1m-c56
+            glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-chunked-1m-c32,
+            glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-chunked-1m-c48,
+            glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-chunked-1m-c54,
 
           GLM mooncake_store (suite=mooncake_store; pit2-p03 (TW MI355X) nodes only):
             glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c48,
