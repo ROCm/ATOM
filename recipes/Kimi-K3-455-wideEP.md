@@ -1261,6 +1261,211 @@ nothing to set; its effect here is unmeasured for want of a baseline.
 
 ---
 
+## Appendix: the exact configuration this was validated on
+
+Everything below was run as written on a 4-node gfx1250 rack. Copy it rather
+than reassembling the deltas scattered through the sections above.
+
+### The rack
+
+| | |
+|---|---|
+| Silicon | **B0** (site information — no revision field on the board reports it) |
+| Nodes | 4 × 4 GPUs = **16**, SPX / NPS1, **432 GiB HBM per GPU** |
+| Image | `rocm/fw-bringup:gfx1250-atom-20260918-ep8` |
+| **B0→A0 translation** | **not needed** — this image's kernels are built for B0 |
+| Fabric | UALoE, one PPOD/VPOD, `accel_state=active` on all 16 |
+| Data-plane NIC | `enp1s0f1` |
+| Node → DP rank | `10.210.11.14`→0, `.25`→4, `.12`→8, `.18`→12 (node0 serves :8000) |
+
+> On translation: the runs below still had `HSA_TOOLS_LIB` and the rocjitsu
+> prefix set, and it did **nothing** — `outcome=translated: 0`, `reused tier: 0`
+> across all 16 ranks, while GSM8K still scored 0.9621. On a B0-built image
+> those three lines can simply be dropped. They are kept in the listing so the
+> record matches what actually ran.
+
+### Per-node setup, before either launch
+
+```bash
+R=$(ls -d /opt/rocm-10.1.0a* | head -1)
+rm -rf /root/rjprefix && mkdir -p /root/rjprefix/lib /root/rjprefix/share
+cp -a $R/lib/libhsa_hotswap_rocjitsu.so $R/lib/librocjitsu*.so* /root/rjprefix/lib/
+cp -a $R/share/rocjitsu /root/rjprefix/share/            # inert on a B0 image
+
+docker run -d --name k3ep16 \
+  --device=/dev/kfd --device=/dev/dri \
+  --network=host --ipc=host --pid=host \
+  --group-add 39 --group-add 105 \
+  --cap-add=SYS_PTRACE --cap-add=SYS_ADMIN --security-opt seccomp=unconfined \
+  --shm-size=128g \
+  -v /mnt/k3:/models:ro -v /root/k3ep16-logs:/logs \
+  --entrypoint sleep rocm/fw-bringup:gfx1250-atom-20260918-ep8 infinity
+
+docker cp /root/rjprefix k3ep16:/app/rjprefix
+# PR #2380, pre-applied to THIS image's ATOM (the upstream diff does not apply)
+docker cp atom_patched/model_ops/attention_mla.py      k3ep16:/app/ATOM/atom/model_ops/
+docker cp atom_patched/model_ops/mla_unfused_gather.py k3ep16:/app/ATOM/atom/model_ops/
+docker cp atom_patched/utils/envs.py                   k3ep16:/app/ATOM/atom/utils/
+```
+
+Then **verify by byte size** — see
+[Check byte sizes](#-check-byte-sizes--import-passes-on-a-truncated-file).
+Expected: `129112 / 8002216 / 7499 / 47967 / 146235`, and
+`grep -c use_unfused_gather_kv_b_proj attention_mla.py` → 3.
+
+### Config A — accuracy (GSM8K). Stock launch.
+
+Identical to [Launch](#launch): `--max-num-batched-tokens 2048`,
+`--gpu-memory-utilization 0.90`, `--no-enable_prefix_caching`, **no**
+`--fake-eplb`, **no** `ATOM_DP_SESSION_AFFINITY`.
+
+Measured on boot: `total_gpu=432.00GB utilization=0.90 budget=388.80GB
+peak_torch=194.67GB available_for_kv=159.37GB`, `experts=56`,
+`'max_model_len': None`. Cold start **under 6 minutes**.
+
+Sanity gate output was ` Paris. The Eiffel Tower is located in Paris. ...` —
+coherent, i.e. no translation needed. Single-stream TPOT 30.5 ms (32.8 tok/s).
+
+```bash
+lm_eval --model local-chat-completions \
+  --apply_chat_template \
+  --tasks gsm8k --num_fewshot 5 \
+  --model_args "model=moonshotai/Kimi-K3,\
+base_url=http://<node0>:8000/v1/chat/completions,api_key=EMPTY,eos_string=</s>,\
+max_retries=5,num_concurrent=32,timeout=1800,tokenized_requests=False,\
+max_length=16384" \
+  --gen_kwargs max_tokens=12288,temperature=0,top_p=1 \
+  --output_path ~/lmeval/out --log_samples
+```
+
+**Result** — lm_eval 0.4.13, 5-shot, full 1319, **9 min 07 s** at
+`num_concurrent=32`:
+
+```
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9613|±  |0.0053|
+|     |       |strict-match    |     5|exact_match|↑  |0.9621|±  |0.0053|
+```
+
+### Config B — agentic throughput (AgentX)
+
+Four deltas from Config A: `--max-num-batched-tokens 16384`,
+`--gpu-memory-utilization 0.94`, `--enable_prefix_caching`, `--fake-eplb`,
+plus `ATOM_DP_SESSION_AFFINITY=1`.
+
+Run on every node, `DPRANK` = 0 / 4 / 8 / 12:
+
+```bash
+#!/bin/bash
+# --- translation: inert on a B0-built image, kept for the record ---
+export LD_LIBRARY_PATH=/app/rjprefix/lib:$LD_LIBRARY_PATH
+export HSA_TOOLS_LIB=/app/rjprefix/lib/libhsa_hotswap_rocjitsu.so
+export HSA_HOTSWAP_VERBOSE=1
+# --- architecture ---
+export PYTORCH_ROCM_ARCH=gfx1250 AITER_RUNTIME_GPU_ARCH=gfx1250
+export GPU_ARCHS=gfx1250 GPU_ARCH_LIST=gfx1250 MORI_GPU_ARCHS=gfx1250
+export HSA_OVERRIDE_GFX_VERSION=12.5.0
+export ENABLE_CK=0
+# --- attention ---
+export ATOM_USE_TRITON_MLA=1
+export ATOM_USE_TRITON_MLA_SHUFFLE_KV=0
+export ATOM_UNFUSED_GATHER_KV_B_PROJ=1
+export ATOM_USE_AITER_TRITON_ATTN=1 ATOM_USE_UNIFIED_ATTN=1
+# --- MoE ---
+export ATOM_MOE_GU_ITLV=1
+export ATOM_USE_TRITON_MOE_DECODE=0
+export MEGA_DISPATCH=mori MEGA_WIRE=fp4 MEGA_DISPATCH_WIRE=fp4
+export ATOM_MORI_V2=1 ATOM_MORI_V2_FUSED=1
+export AITER_USE_GROUPED_GEMM=1 AITER_USE_OPUS_MOE_SORTING=1
+# --- GEMM / quantization ---
+export ATOM_USE_TRITON_GEMM=1 ATOM_WO_A_USE_FLYDSL=1
+export ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE=1
+export AITER_ROPE_TRITON_BACKEND=1 AITER_USE_SYSTEM_TRITON=1
+# --- communication ---
+export NCCL_MNNVL_ENABLE=1
+export NCCL_IB_DISABLE=1 NCCL_P2P_DISABLE=0 NCCL_P2P_LEVEL=SYS NCCL_CUMEM_ENABLE=1
+export ATOM_DP_LM_HEAD_MODE=allgather
+export ATOM_USE_CUSTOM_ALL_GATHER=1 AITER_CUSTOM_AR_USE_SYMM_MEM=1
+export MORI_SOCKET_IFNAME=enp1s0f1 NCCL_SOCKET_IFNAME=enp1s0f1 GLOO_SOCKET_IFNAME=enp1s0f1
+# --- agentic: pin a session to its cache owner across turns ---
+export ATOM_DP_SESSION_AFFINITY=1
+# --- loading ---
+export HSA_XNACK=1 HSA_USE_SVM=1 HSA_ENABLE_SDMA=1
+export ATOM_LOADER_USE_THREADPOOL=1 ATOM_LOADER_NUM_THREADS=4
+
+cd /tmp
+exec python3 -m atom.entrypoints.openai_server \
+  --model /models/Kimi-K3 \
+  --served-model-name moonshotai/Kimi-K3 \
+  --trust-remote-code \
+  -tp 1 \
+  --data-parallel-size 16 \
+  --data-parallel-size-local 4 \
+  --data-parallel-rank ${DPRANK} \
+  --data-parallel-master-ip <node0-data-plane-ip> \
+  --data-parallel-master-port 29500 --data-parallel-base-port 29700 \
+  --enable-expert-parallel --enable-dp-attention \
+  --fake-eplb \
+  --kv_cache_dtype fp8 --index-cache-dtype fp8 \
+  --cudagraph-mode FULL \
+  --max-num-seqs 8 \
+  --max-num-batched-tokens 16384 \
+  --gpu-memory-utilization 0.94 \
+  --enable_prefix_caching \
+  --disable_uvicorn_access_log
+```
+
+Measured on boot: `peak_torch=236.08GB cudagraph_est=9.40GB
+available_for_kv=118.80GB`, cold start ~2 min, TTFT on a 5-token prompt
+**0.50 s** (against 2.73 s at 2048).
+
+Client — aiperf 0.12.0, dataset cached beforehand with
+`hf download --repo-type dataset semianalysisai/cc-traces-weka-062126`:
+
+```bash
+export AIPERF_DATASET_CONFIGURATION_TIMEOUT=1800
+export AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT=1800
+export AIPERF_UI_REALTIME_METRICS_ENABLED=true
+export AIPERF_HTTP_TCP_USER_TIMEOUT=900000
+
+aiperf profile \
+  --scenario inferencex-agentx-mvp \
+  --url http://<node0>:8000 \
+  --endpoint /v1/chat/completions --endpoint-type chat --streaming \
+  --model moonshotai/Kimi-K3 \
+  --tokenizer moonshotai/Kimi-K3 --tokenizer-trust-remote-code \
+  --apply-chat-template \
+  --concurrency 32 --benchmark-duration 1800 --stats-interval 30 \
+  --random-seed 42 --failed-request-threshold 0.10 \
+  --trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75 \
+  --warmup-requests-per-lane 3 --warmup-grace-period 1800 \
+  --trace-idle-gap-cap-seconds 300 \
+  --use-server-token-count --no-gpu-telemetry \
+  --num-dataset-entries 393 --slice-duration 1.0 \
+  --public-dataset semianalysis_cc_traces_weka_062126 \
+  --output-artifact-dir <artifacts>
+```
+
+⚠️ `--warmup-requests-per-lane` is the wall-clock lever. At **10** the warmup
+took **2 h 52 min** (707 requests); at **3** it took **13.5 min** (130). It
+only primes the cache, so lowering it does not change what is measured — but
+it is not free either, since less priming means a colder cache at the start of
+the profiling window. Do not change it between runs you intend to compare.
+
+Note the repo layout moved: aiperf is now at `inferencex-e2e/utils/aiperf`
+(not `utils/aiperf`), and `agentic-benchmark/requirements.txt` no longer
+exists — `uv pip install -e inferencex-e2e/utils/aiperf` is enough. The pinned
+submodule commit `754356e9` is already checked out by
+`--recurse-submodules`. `py-spy` and `lm_eval` both need
+`pip install --break-system-packages` inside the image.
+
+**Result** — see [AgentX result](#agentx-result) for the full table.
+Headline: interactivity **p90 2.53 tok/s/user**, **182 tok/s per GPU** total
+(2913 aggregate / 16), prefix cache read **92.36%**.
+
+---
+
 ## Not yet measured
 
 - AgentX above `--concurrency 32`. Effective concurrency of 15 suggests
