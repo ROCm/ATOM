@@ -37,6 +37,7 @@ from atom.plugin.sglang.attention_backend.backend_resolver import (
     resolve_attn_backend,
     resolve_mamba_req_pool,
 )
+from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger(__name__)
