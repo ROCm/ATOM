@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790528458371,
+  "lastUpdate": 1790615787864,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -3392,6 +3392,57 @@ window.BENCHMARK_DATA = {
             "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
             "value": 2.98,
             "unit": "tok/fwd"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Morpheus Guo",
+            "username": "Yuechguo",
+            "email": "yuechao.guo@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "aa0c5c3a131d98124726b41ab62342bb8cafb207",
+          "message": "feat(mesh): add Envoy ext-proc inference ingress (#2350)\n\n* feat(mesh): add Envoy ext-proc inference ingress\n\nAdd an optional ext-proc gRPC service that shares Atomesh worker state\nand placement policies. Keep HTTP management APIs available while\ndisabling direct HTTP inference routes when ext-proc is enabled.\n\n* fix(mesh): resolve lint and formatting issues in proto vendor script\n\n* ix(mesh): make ext-proc opt-in and harden Envoy ingress\n\n- Gate ext-proc code, protobuf generation, CLI options and tests behind\n  a non-default Cargo feature\n- Support explicit feature selection in pip and Docker builds\n- Prevent duplicate Authorization headers in PD requests by prioritizing\n  worker API keys and preserving client auth when no worker key is set\n- Validate protocol configuration on the first Envoy message, reject\n  unsupported modes immediately and enforce consistency within the stream\n- Preserve Envoy local replies and cancel pending routing decisions\n- Handle body/trailer completion correctly and leave HTTP framing to Envoy\n- Validate Envoy configuration before smoke-test startup and fix\n  overlapping port substitutions\n- Expand authentication and protocol regression tests and update docs\n\n* fix(mesh): harden ext-proc lifecycle and unify ingress execution\n\n- Share admission control and leases between HTTP and ext-proc,\n  returning tokens and concurrency slots on cancellation\n- Bound request buffering and parsing, and handle early replies,\n  backpressure, disconnects and shutdown consistently\n- Unify PD execution around reserved worker pairs, removing\n  external_placement and duplicate selection, rank mapping and retry paths\n- Add reservation deadlines and per-worker outcome tracking\n- Share typed request metadata, candidate filtering, error envelopes,\n  SSE parsing, TLS loading and request metrics without double counting\n- Fix empty subsets, listener collisions, Health Watch cleanup,\n  repeated runtime waits and policy capability forwarding\n- Pin vendored proto revisions and add checksums, path validation,\n  download limits and staged installation with rollback\n- Eliminate ephemeral-port races in CLI and Envoy tests\n- Simplify the ext-proc README and document Docker image builds\n\n* test(mesh): remove hardcoded credential fixtures\n\n* fix(mesh): preserve optional model semantics in ext-proc\n\n- Preserve omitted and null models in /generate as None through planning\n  and PD execution\n- Use the planner's default policy for requests without a model while\n  retaining explicit model, health, and endpoint subset filtering\n- Keep the original model field unchanged in forwarded request bodies\n- Support model-less input_ids with token-based routing policies\n- Extend protocol and real Envoy tests for optional-model requests\n- Fix lint and formatting issues in the proto vendoring script\n- Bump atomesh version to 0.2.0\n\n* fix(mocker): remove obsolete concurrency_queue_tx field\n\n* fix(ext-proc): align request IDs and header forwarding with HTTP ingress\n\n- Share request ID header priorities and fallback generation across HTTP,\n  ext-proc, and mocker\n- Preserve the selected ID through upstream requests, normal responses,\n  processing errors, and Envoy local replies\n- Apply the HTTP forwarding allowlist to request headers and trailers,\n  retaining required protocol headers\n- Preserve header removals when adding PD execution IDs\n- Update the Envoy template for request ID ownership and header mutations\n- Add protocol and real Envoy regression coverage\n\n---------\n\nCo-authored-by: yuechguo <yuechguo@amd.com>",
+          "timestamp": "2026-09-28T14:34:09Z",
+          "url": "https://github.com/ROCm/ATOM/commit/aa0c5c3a131d98124726b41ab62342bb8cafb207"
+        },
+        "date": 1790615786914,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.95,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/36450504580 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202609281543 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9462 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.9545,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/36450504580 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609281543 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9553 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 65.96,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/36450504580 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609281543 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9553 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.98,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8976,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/36450504580 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609281543 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1547 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
