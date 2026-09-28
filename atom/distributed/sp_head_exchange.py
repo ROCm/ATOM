@@ -1,69 +1,57 @@
 # SPDX-License-Identifier: MIT
 """M3 SP4 head exchange directly into the o-projection's final row layout."""
 
-import hashlib
-from pathlib import Path
-
 import torch
-from aiter.jit.core import AITER_CSRC_DIR, compile_ops
 
 from atom.utils import envs
 
-_CSRC = Path(AITER_CSRC_DIR)
-_SOURCES = (
-    _CSRC / "kernels/sp_head_exchange.cu",
-    _CSRC / "pybind/sp_head_exchange_pybind.cu",
-)
-_HASH = hashlib.sha256(
-    b"".join(
-        p.read_bytes()
-        for p in (
-            *_SOURCES,
-            _CSRC / "include/custom_all_reduce.cuh",
-            _CSRC / "include/aiter_tensor.h",
-        )
-    )
-).hexdigest()[:12]
+try:
+    import aiter.ops.sp_head_exchange as _head_exchange_ops
+except ModuleNotFoundError as exc:
+    if exc.name != "aiter.ops.sp_head_exchange":
+        raise
+    _head_exchange_ops = None
 
-
-def _build_args(*args, **kwargs):
-    return {
-        "md_name": "module_sp_head_exchange_" + _HASH,
-        "srcs": [str(p) for p in _SOURCES],
-    }
-
-
-@compile_ops(
-    "module_custom_all_reduce",
-    fc_name="sp_head_exchange",
-    gen_func=_build_args,
-    develop=True,
-)
-def _exchange(
-    handle: int,
-    input: torch.Tensor,
-    output: torch.Tensor,
-    registered_buffer: int,
-    registered_bytes: int,
-    stage: bool,
-    blocks: int,
-) -> None: ...
+# Resolve optional AITER support before dispatch; execution failures propagate.
+_exchange = getattr(_head_exchange_ops, "sp_head_exchange", None)
 
 
 def head_exchange_communicator(x):
-    """Runtime gate inside the opaque attention op; leave decode on its AG path."""
-    from atom.distributed.ulysses_sp import get_sp_group, get_sp_world_size
-
+    """Select M3's prefill exchange; decode uses the regular head gather."""
     if (
-        not envs.ATOM_SP_HEAD_EXCHANGE
+        not x.is_cuda
+        or _exchange is None
         or not envs.ATOM_USE_CUSTOM_ALL_GATHER
-        or get_sp_world_size() != 4
         or x.ndim != 2
         or x.shape[0] < 8192
         or x.shape[0] % 4
         or x.shape[1] not in (1024, 2048)
         or x.dtype != torch.bfloat16
         or not x.is_contiguous()
+    ):
+        return None
+    from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+
+    from atom.config import get_current_atom_config
+    from atom.distributed.ulysses_sp import get_sp_group, get_sp_world_size
+    from atom.plugin.prepare import is_plugin_mode
+
+    if (
+        get_sp_world_size() != 4
+        or get_tensor_model_parallel_world_size() != 1
+        or is_plugin_mode()
+    ):
+        return None
+    architectures = (
+        getattr(get_current_atom_config().hf_config, "architectures", None) or ()
+    )
+    if not any(
+        arch
+        in (
+            "MiniMaxM3SparseForCausalLM",
+            "MiniMaxM3SparseForConditionalGeneration",
+        )
+        for arch in architectures
     ):
         return None
     ca = getattr(getattr(get_sp_group(), "device_communicator", None), "ca_comm", None)
