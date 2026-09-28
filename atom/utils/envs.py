@@ -189,6 +189,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
         os.getenv("ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE", "0") == "1"
     ),
+    # per_1x128 FP8 linears whose (N, K) aiter has 1x32 MXFP8 GEMM configs for take
+    # e8m0 1x32 scales in aiter's shuffled layout (needs the two flags around it).
+    "ATOM_FP8_MXSCALE_USE_E8M0_SCALE_SHUFFLE": lambda: (
+        os.getenv("ATOM_FP8_MXSCALE_USE_E8M0_SCALE_SHUFFLE", "0") == "1"
+    ),
     "ATOM_USE_TRITON_MXFP4_BMM": lambda: (
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),
@@ -703,10 +708,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM": lambda: (
         os.getenv("ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM", "0") == "1"
-    ),
-    # gfx1250 MXFP8 ASM GEMM for DSv4 attn wq_b/indexer.wq_b/wo_b at M >= 512.
-    "ATOM_DSV4_USE_GFX1250_MXFP8_ASM_GEMM": lambda: (
-        os.getenv("ATOM_DSV4_USE_GFX1250_MXFP8_ASM_GEMM", "0") == "1"
     ),
     # --- V4 Attention Backend Refactor (PR-A: kill .item(), unlock CUDAGraph) ---
     # `legacy` (default) keeps the per-seq Python dispatch loop with .item()

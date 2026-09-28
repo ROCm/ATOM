@@ -24,7 +24,6 @@ from torch import Tensor, nn
 from torch.overrides import handle_torch_function, has_torch_function_unary
 
 from atom.config import QuantizationConfig
-from atom.model_ops.mxfp8_asm_gemm import dsv4_mxfp8_asm_rms_quant
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.utils import envs
@@ -179,11 +178,19 @@ def _aiter_rms_quant_fake(
     transpose_scale: bool,
     res1: torch.Tensor | None = None,
     value_dtype: torch.dtype | None = None,
+    mxscale_shuffle: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from aiter.utility.dtypes import fp8
 
     M, N = x.shape
-    if _is_mxfp8(quant_type_value, value_dtype):
+    if mxscale_shuffle:
+        # per_1x128 consumers on 1x32 scales: UE8M0 in aiter's shuffled (m32k4)
+        # layout, rows padded to 32 -- written by the kernel itself.
+        out = torch.empty((M, N), dtype=fp8, device=x.device)
+        scale = torch.empty(
+            ((M + 31) // 32 * 32, N // 32), dtype=torch.float8_e8m0fnu, device=x.device
+        )
+    elif _is_mxfp8(quant_type_value, value_dtype):
         # MXFP8: out=(M, N) E4M3; scale=(M, N/32) UE8M0, one byte per group and
         # row-major, which is the `(x, x_scale)` pair `native_quant_linear`
         # takes -- the same pair its own `quantize_fp8` would have produced, so
@@ -233,13 +240,23 @@ def _aiter_rms_quant(
     transpose_scale: bool,
     res1: torch.Tensor | None = None,
     value_dtype: torch.dtype | None = None,
+    mxscale_shuffle: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from aiter import add_rmsnorm_quant, rmsnorm_quant
 
     out, scale, out_res1 = _aiter_rms_quant_fake(
-        x, weight, eps, quant_type_value, transpose_scale, res1, value_dtype
+        x,
+        weight,
+        eps,
+        quant_type_value,
+        transpose_scale,
+        res1,
+        value_dtype,
+        mxscale_shuffle,
     )
-    if _is_mxfp8(quant_type_value, value_dtype):
+    if mxscale_shuffle:
+        group_size, shuffle = 32, False
+    elif _is_mxfp8(quant_type_value, value_dtype):
         # The FP8 width is carried by `out`'s dtype and the UE8M0 format by
         # `scale`'s -- the kernel reads both off the tensors it is handed, so
         # the only thing left to state is that the scale stays row-major.
@@ -250,11 +267,13 @@ def _aiter_rms_quant(
         group_size, shuffle = 128, transpose_scale
     else:  # _QV_PER_TOKEN
         group_size, shuffle = 0, False
+    # scale_layout_m32k4 is passed only when set: older aiter lacks it.
+    m32k4 = {"scale_layout_m32k4": True} if mxscale_shuffle else {}
     if res1 is None:
-        rmsnorm_quant(out, x, scale, weight, eps, group_size, shuffle)
+        rmsnorm_quant(out, x, scale, weight, eps, group_size, shuffle, **m32k4)
     else:
         add_rmsnorm_quant(
-            out, x, res1, out_res1, scale, weight, eps, group_size, shuffle
+            out, x, res1, out_res1, scale, weight, eps, group_size, shuffle, **m32k4
         )
     return out, scale, out_res1
 
@@ -305,7 +324,18 @@ class RMSNorm(nn.Module):
             and quant_type.value == _QV_PER_1X128
             and envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
         )
-        self._mxfp8_asm = False  # set by mxfp8_asm_gemm.setup
+        self.use_mxscale_shuffle = False
+
+    def share_mxscale_shuffle(self, consumers) -> None:
+        """Make the fused quant and the linears reading its (x, x_scale) agree on
+        the scale layout: 1x32 shuffled only if every consumer takes it."""
+        if not self.use_fused_quant:
+            return  # the consumers quantize their own input
+        on = not self.fused_allreduce and all(
+            layer.use_mxscale_shuffle for layer in consumers
+        )
+        for layer in (self, *consumers):
+            layer.use_mxscale_shuffle = on
 
     def process_weights_after_loading(self):
         """Post-load hook invoked by the model loader for every module.
@@ -483,12 +513,10 @@ class RMSNorm(nn.Module):
                 #
                 # The kernel takes a matrix; every other branch here folds the
                 # leading dims away and gives them back, so a caller does not.
-                if self._mxfp8_asm:  # see atom/model_ops/mxfp8_asm_gemm.py
-                    assert residual is None and x.dim() == 2
-                    return dsv4_mxfp8_asm_rms_quant(x, self.weight, self.eps)
                 lead = x.shape[:-1]
                 batched = len(lead) > 1
-                if batched and self._aiter_transpose_scale:
+                mxscale = getattr(self, "use_mxscale_shuffle", False)
+                if batched and (self._aiter_transpose_scale or mxscale):
                     # A column-major scale is a `(groups, M)` buffer viewed as
                     # `(M, groups)`, so it is contiguous and the reshape below
                     # would succeed on it and hand back a mis-mapped scale
@@ -511,6 +539,7 @@ class RMSNorm(nn.Module):
                         else residual
                     ),
                     self.params_dtype,
+                    mxscale,
                 )
                 if batched:
                     x = x.view(*lead, -1)

@@ -890,12 +890,18 @@ class WeightUpdaterMixin:
             self._await_readers_of(param)
             shuffle_weights(param)
 
-    def _refresh_mxfp8_asm_weight_scales(self) -> None:
-        # A sync rewrites weight_scale in place; rebuild the ASM copy in place too.
+    def _shuffle_mxscale_weight_scales(self) -> None:
+        # A sync rewrites weight_scale in place; rebuild its 1x32 copy in place too.
+        from atom.utils import envs
+
+        if not envs.ATOM_FP8_MXSCALE_USE_E8M0_SCALE_SHUFFLE:
+            return
         for module in self._sync_target_model().modules():
-            if hasattr(module, "weight_scale_asm"):
-                self._await_readers_of(module.weight_scale_asm)
-                module.set_mxfp8_asm_weight_scale()
+            if getattr(module, "use_mxscale_shuffle", False) and hasattr(
+                module, "weight_scale_mxscale"
+            ):
+                self._await_readers_of(module.weight_scale_mxscale)
+                module.shuffle_mxscale_weight_scale()
 
     def update_weights(
         self, named_tensors: list[tuple[str, torch.Tensor]], clear_kv_cache: bool = True
@@ -981,7 +987,7 @@ class WeightUpdaterMixin:
                     skipped += 1
 
         self._finalize_expert_weight_sync()
-        self._refresh_mxfp8_asm_weight_scales()
+        self._shuffle_mxscale_weight_scales()
 
         if clear_kv_cache:
             self.clear_kv_cache()
@@ -1110,7 +1116,7 @@ class WeightUpdaterMixin:
 
             if is_last:
                 self._finalize_expert_weight_sync()
-                self._refresh_mxfp8_asm_weight_scales()
+                self._shuffle_mxscale_weight_scales()
                 self.clear_kv_cache()
                 if hasattr(self, "_packed_weight_accum"):
                     if self._packed_weight_accum:
@@ -1273,7 +1279,7 @@ class WeightUpdaterMixin:
         # Only release the IPC buffer mapping on the last bucket
         if is_last:
             self._finalize_expert_weight_sync()
-            self._refresh_mxfp8_asm_weight_scales()
+            self._shuffle_mxscale_weight_scales()
             self._ipc_buffer = None
             try:
                 torch.cuda.ipc_collect()

@@ -2552,6 +2552,10 @@ class DeepseekV4Attention(nn.Module):
         else:
             self.compressor = None
             self.indexer = None
+        # wq_b and indexer.wq_b both read q_norm's fused (qr, qr_scale).
+        self.q_norm.share_mxscale_shuffle(
+            [self.wq_b] + ([self.indexer.wq_b] if self.indexer is not None else [])
+        )
 
         # ----- KV cache splitting (paper §3.6.1) -----
         # Per-request sliding window: `swa_plane` is this layer's view of the
@@ -2651,10 +2655,6 @@ class DeepseekV4Attention(nn.Module):
         Idempotent: if wo_a.weight is already BF16 (e.g. dequant was applied
         elsewhere), this is a no-op.
         """
-        if envs.ATOM_DSV4_USE_GFX1250_MXFP8_ASM_GEMM:
-            from atom.model_ops import mxfp8_asm_gemm
-
-            mxfp8_asm_gemm.setup(self)
 
         w = self.wo_a.weight
         if w.dtype == torch.bfloat16:
