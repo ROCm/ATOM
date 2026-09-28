@@ -238,8 +238,14 @@ class WeightUpdaterMixin:
                     shard_gpu = shard_t.to(device=self.device, dtype=torch.float32)
                     weight_loader(buf, shard_gpu, sid)
 
-                self._requantize_fp8_weight(module, param_name, param, buf.data)
+                wrote = self._requantize_fp8_weight(module, param_name, param, buf.data)
                 del self._packed_weight_accum[atom_name]
+                if not wrote:
+                    return "skipped"
+                # Composed from every shard, so the whole parameter is new, and
+                # so is the scale requantisation rewrote alongside it.
+                self._credit_reload(param)
+                self._credit_scale_side_effect(module)
                 logger.debug(
                     f"{self.label}: FP8 packed weight updated: {atom_name} "
                     f"(composed from {len(expected)} shards)"
@@ -249,6 +255,9 @@ class WeightUpdaterMixin:
 
         tensor_gpu = tensor.to(device=self.device)
         self._load_into_param(param, weight_loader, tensor_gpu, shard_id)
+        self._credit_reload_part(
+            param, shard_id, self._get_packed_shard_order().get(tgt_suffix, ())
+        )
         return "updated"
 
     def _apply_unmatched_weight(
@@ -737,12 +746,15 @@ class WeightUpdaterMixin:
         param_name: str,
         param: torch.nn.Parameter,
         tensor: torch.Tensor,
-    ) -> None:
+    ) -> bool:
         """Requantize a full-precision weight to FP8 with updated weight_scale.
 
         Called when FSDP sends float32/bfloat16 trained weights to an FP8 model.
         Computes new per-block (or per-tensor/per-token) scale factors and writes
         both the FP8 weight and scale into the module in place.
+
+        Returns whether it wrote anything. A shape it cannot shard to this rank,
+        or a quant type it does not know, leaves the parameter as it was.
         """
         weight_scale = module.weight_scale
         fp8_dtype = param.dtype
@@ -765,7 +777,7 @@ class WeightUpdaterMixin:
                 f"{self.label}: Shape mismatch in FP8 requantize for {param_name}: "
                 f"param={param.shape}, tensor={tensor_gpu.shape}"
             )
-            return
+            return False
 
         from aiter import QuantType as _QT
 
@@ -806,13 +818,14 @@ class WeightUpdaterMixin:
             logger.warning(
                 f"{self.label}: Unknown quant_type {quant_type} for FP8 requantize"
             )
-            return
+            return False
 
         self._post_process_fp8_weight(module, param)
         logger.debug(
             f"{self.label}: FP8 requantized {param_name} on {type(module).__name__}, "
             f"quant_type={quant_type}, scale_shape={weight_scale.shape}"
         )
+        return True
 
     def _post_process_fp8_weight(
         self,
@@ -941,23 +954,23 @@ class WeightUpdaterMixin:
         commit, not once per bucket, or a fused parameter whose shards span
         buckets would be finalised half-built.
 
-        Returns counts plus the set of parameter names actually written, which
-        is what commit-time coverage verification needs.
+        Every write is credited to the open reload, if there is one, by the
+        parameter it landed in; see ``_credit_reload``.
         """
         param_to_module = self._get_param_to_module_mapping()
 
         updated = 0
         skipped = 0
         ignored_scales = 0
-        written: set[str] = set()
         skipped_names: set[str] = set()
 
         for name, tensor in named_tensors:
             if name not in param_to_module:
+                # Credited by the route that wrote it, to the fused parameter
+                # it landed in -- this name is not a parameter at all.
                 result = self._apply_unmatched_weight(name, tensor, param_to_module)
                 if result == "updated":
                     updated += 1
-                    written.add(name)
                 elif result == "accumulated":
                     # A shard of a fused parameter; it counts once the group
                     # completes, which may be in a later bucket.
@@ -976,31 +989,34 @@ class WeightUpdaterMixin:
             if param_name in _EXPERT_BUFFER_SHARDS:
                 self._apply_named_expert_buffer(name, param_name, module, param, tensor)
                 updated += 1
-                written.add(name)
+                self._credit_reload(param)
             elif self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
-                self._requantize_fp8_weight(module, param_name, param, tensor)
-                updated += 1
-                written.add(name)
-                # Requantisation writes the scale as a side effect, so a naive
-                # named_parameters() diff at commit would report it missing.
-                self._record_scale_side_effect(written, name, param_name, module)
+                if self._requantize_fp8_weight(module, param_name, param, tensor):
+                    updated += 1
+                    self._credit_reload(param)
+                    self._credit_scale_side_effect(module)
+                else:
+                    # Logged by the requantiser. Counted, not credited: the
+                    # parameter still holds the old weight.
+                    skipped += 1
+                    skipped_names.add(name)
             elif self._is_fp8_param(module, param) and tensor.dtype == param.dtype:
                 tensor = tensor.to(device=self.device)
                 self._copy_into_param(param, tensor)
                 self._post_process_fp8_weight(module, param)
                 updated += 1
-                written.add(name)
+                self._credit_reload(param)
             elif tensor.shape == param.shape:
                 tensor = tensor.to(device=self.device, dtype=param.dtype)
                 self._copy_into_param(param, tensor)
                 updated += 1
-                written.add(name)
+                self._credit_reload(param)
             elif weight_loader is not None and callable(weight_loader):
                 try:
                     tensor = tensor.to(device=self.device)
                     self._load_into_param(param, weight_loader, tensor)
                     updated += 1
-                    written.add(name)
+                    self._credit_reload(param)
                 except Exception as e:  # noqa: BLE001 - a loader raises anything
                     logger.warning(
                         f"{self.label}: weight_loader failed for {name}: {e}"
@@ -1014,7 +1030,7 @@ class WeightUpdaterMixin:
                     param, tensor, tp_rank, tp_size
                 ):
                     updated += 1
-                    written.add(name)
+                    self._credit_reload(param)
                 else:
                     logger.warning(
                         f"{self.label}: Shape mismatch for {name}: "
@@ -1027,30 +1043,69 @@ class WeightUpdaterMixin:
             "updated": updated,
             "skipped": skipped,
             "ignored_scales": ignored_scales,
-            "written": written,
             "skipped_names": skipped_names,
         }
 
-    def _record_scale_side_effect(
-        self,
-        written: set[str],
-        name: str,
-        param_name: str,
-        module: torch.nn.Module,
-    ) -> None:
+    # ── what a reload has rewritten ───────────────────────────────────────
+    #
+    # Kept by parameter object, not by name. The trainer sends checkpoint
+    # names -- `q_proj`, one expert's `gate_proj` -- that ATOM fuses into
+    # parameters named otherwise, and a tied `lm_head` is one parameter under
+    # two names. What commit has to establish is that every parameter the
+    # model serves from was rewritten, and that is a question about objects.
+
+    def _credit_reload(self, param: torch.nn.Parameter) -> None:
+        """Count *param* as rewritten in full by the open reload, if any."""
+        if getattr(self, "_weight_update_version", None) is not None:
+            self._weight_update_written.add(id(param))
+
+    def _credit_reload_part(self, param: torch.nn.Parameter, part, required) -> None:
+        """Count one piece of a fused *param*, which is rewritten only once
+        every piece in *required* has been."""
+        if getattr(self, "_weight_update_version", None) is None:
+            return
+        entry = self._weight_update_parts.get(id(param))
+        if entry is None:
+            entry = self._weight_update_parts[id(param)] = (frozenset(required), set())
+        entry[1].add(part)
+
+    def _credit_scale_side_effect(self, module: torch.nn.Module) -> None:
         """Credit a ``weight_scale`` that requantisation wrote indirectly.
 
-        Coverage is checked against ``named_parameters()``, which includes the
-        scales. They are never sent over the wire -- they are derived when a
+        Scales are never sent over the wire -- they are derived when a
         full-precision tensor is requantised -- so without this they look
         permanently missing and ``verify_full_load`` would reject every stream.
         """
-        if not isinstance(getattr(module, "weight_scale", None), torch.nn.Parameter):
-            return
-        prefix = (
-            name[: -len(param_name)] if param_name and name.endswith(param_name) else ""
-        )
-        written.add(f"{prefix}weight_scale")
+        scale = getattr(module, "weight_scale", None)
+        if isinstance(scale, torch.nn.Parameter):
+            self._credit_reload(scale)
+
+    def _credit_rewritten_expert_buffers(self) -> None:
+        """Credit each fused expert buffer whose every slice this reload wrote.
+
+        Read off the relayout bookkeeping, before the relayout consumes it: it
+        records exactly which (expert, shard) slices were written, and begin
+        clears it, so a buffer counts only once all of its experts arrived.
+        """
+        for (module, param_name), arrived in self._pending_expert_relayout.items():
+            buffer = getattr(module, param_name)
+            required = _EXPERT_BUFFER_SHARDS[param_name]
+            if all(required <= arrived.get(e, set()) for e in range(buffer.shape[0])):
+                self._credit_reload(buffer)
+
+    def _reload_coverage(self) -> set[int]:
+        whole_by_parts = {
+            pid
+            for pid, (required, got) in self._weight_update_parts.items()
+            if required <= got
+        }
+        return self._weight_update_written | whole_by_parts
+
+    def _discard_reload_scratch(self) -> None:
+        """Forget cross-bucket state, so no reload inherits another's."""
+        if hasattr(self, "_packed_weight_accum"):
+            self._packed_weight_accum.clear()
+        self._pending_expert_relayout.clear()
 
     # ── bucketed, transactional reload (the RDMA path) ────────────────────
     #
@@ -1079,12 +1134,22 @@ class WeightUpdaterMixin:
 
         self._weight_update_version = version
         self._last_started_weight_version = version
-        self._weight_update_written: set[str] = set()
+        self._weight_update_written: set[int] = set()
+        self._weight_update_parts: dict[int, tuple[frozenset, set]] = {}
+        self._weight_update_sources: set[str] = set()
         self._weight_update_skipped: set[str] = set()
         self._weight_update_buckets = 0
         self._weight_update_bytes = 0
-        if hasattr(self, "_packed_weight_accum"):
-            self._packed_weight_accum.clear()
+        stale = len(self._pending_expert_relayout)
+        if stale:
+            # Commit credits expert buffers from this bookkeeping, so entries
+            # left by an earlier sync would count as written by this one.
+            logger.warning(
+                f"{self.label}: v{version} drops relayout bookkeeping for "
+                f"{stale} expert buffer(s) an earlier sync left unfinished; "
+                f"this reload has to rewrite them in full"
+            )
+        self._discard_reload_scratch()
         logger.info(f"{self.label}: began weight update v{version}")
         return {"version": version, "state": "receiving"}
 
@@ -1097,12 +1162,18 @@ class WeightUpdaterMixin:
         if getattr(self, "_weight_update_version", None) is None:
             raise RuntimeError("no weight update in progress; call begin first")
         try:
+            names = [name for name, _ in named_tensors]
+            resent = sorted(self._weight_update_sources.intersection(names))
+            if resent:
+                # The later copy would silently replace the earlier one, and
+                # coverage would still pass.
+                raise RuntimeError(f"weights sent twice in one reload: {resent[:20]}")
+            self._weight_update_sources.update(names)
             counts = self._apply_named_tensors(named_tensors)
         except Exception as exc:
             self.abort_weight_update(self._weight_update_version, exc)
             raise
 
-        self._weight_update_written |= counts["written"]
         self._weight_update_skipped |= counts["skipped_names"]
         self._weight_update_buckets += 1
         self._weight_update_bytes += int(payload_bytes)
@@ -1127,6 +1198,7 @@ class WeightUpdaterMixin:
             raise error
 
         try:
+            self._credit_rewritten_expert_buffers()
             # Once, at the end: a fused parameter's shards may have spanned
             # buckets, so relayout before this point would work on a half-built
             # parameter.
@@ -1138,15 +1210,16 @@ class WeightUpdaterMixin:
                     "reload ended with incomplete fused parameters: " f"{leftover[:20]}"
                 )
 
+            covered = self._reload_coverage()
             if verify_full_load:
-                expected = {
-                    name for name, _ in self._sync_target_model().named_parameters()
-                }
-                missing = sorted(expected - self._weight_update_written)
+                params = dict(self._sync_target_model().named_parameters())
+                missing = sorted(
+                    name for name, param in params.items() if id(param) not in covered
+                )
                 if missing or self._weight_update_skipped:
                     raise RuntimeError(
                         "incomplete weight reload: wrote "
-                        f"{len(self._weight_update_written)}/{len(expected)} "
+                        f"{len(params) - len(missing)}/{len(params)} "
                         f"parameters; missing={missing[:20]} "
                         f"skipped={sorted(self._weight_update_skipped)[:20]}"
                     )
@@ -1160,15 +1233,14 @@ class WeightUpdaterMixin:
             "version": version,
             "buckets": self._weight_update_buckets,
             "bytes": self._weight_update_bytes,
-            "loaded_internal": len(self._weight_update_written),
+            "loaded_internal": len(covered),
             "skipped": sorted(self._weight_update_skipped),
         }
         self._weight_update_version = None
         self._last_committed_weight_version = version
         self._weight_update_healthy = True
         self._weight_update_failure = None
-        if hasattr(self, "_packed_weight_accum"):
-            self._packed_weight_accum.clear()
+        self._discard_reload_scratch()
         logger.info(
             f"{self.label}: committed weight update v{version} "
             f"({manifest['buckets']} buckets, "
@@ -1179,12 +1251,20 @@ class WeightUpdaterMixin:
     def abort_weight_update(self, version: int, error: object) -> dict:
         """Discard the transaction and fence serving."""
         active = getattr(self, "_weight_update_version", None)
+        if active is None and not getattr(self, "_weight_update_healthy", True):
+            # Already aborted by the step that failed, before its caller saw
+            # the error. Keep that first reason; it is the cause.
+            failure = getattr(self, "_weight_update_failure", None) or str(error)
+            return {"version": int(version), "state": "aborted", "error": failure}
         version = int(active if active is not None else version)
         self._weight_update_version = None
         self._weight_update_healthy = False
         self._weight_update_failure = str(error)
-        if hasattr(self, "_packed_weight_accum"):
-            self._packed_weight_accum.clear()
+        # Includes the expert slices this reload registered for relayout. Kept,
+        # the next reload would relayout them a second time or fail on their
+        # missing shards; dropped, their bytes stay behind the fence until a
+        # full reload rewrites them.
+        self._discard_reload_scratch()
         logger.error(f"{self.label}: aborted weight update v{version}: {error}")
         return {"version": version, "state": "aborted", "error": str(error)}
 
