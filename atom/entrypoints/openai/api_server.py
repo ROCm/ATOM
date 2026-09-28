@@ -2725,12 +2725,35 @@ async def kv_transfer_info():
     cfg = engine.config
     kv_cfg = cfg.kv_transfer_config or {}
     kv_role, handshake_port = _resolve_kv_transfer_role(kv_cfg)
-    return {
+    info = {
         "tp_size": cfg.tensor_parallel_size,
         "dp_size": cfg.parallel_config.data_parallel_size,
         "kv_role": kv_role,
         "handshake_port": handshake_port,
     }
+    from atom.kv_transfer.disaggregation.pd_producer import iter_connector_configs
+    from atom.utils.network import get_ip
+
+    for sub, _ in iter_connector_configs(kv_cfg):
+        if (
+            sub.get("kv_connector") == "mooncake"
+            and sub.get("kv_role", "kv_producer") == "kv_producer"
+            and sub.get("enable_chunked_transfer", False)
+        ):
+            info["chunked_transfer"] = {
+                "chunked_transfer": True,
+                "do_remote_prefill": True,
+                "do_remote_decode": False,
+                "remote_host": get_ip(),
+                "remote_handshake_port": sub.get("handshake_port", 6301),
+                "remote_pp_size": cfg.pipeline_parallel_size,
+                "block_size": cfg.kv_cache_block_size,
+                "dcp_size": cfg.decode_context_parallel_size,
+                "hash_block_size": cfg.kv_cache_block_size
+                * cfg.decode_context_parallel_size,
+            }
+            break
+    return info
 
 
 @app.get("/server_info")

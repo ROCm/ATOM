@@ -12,6 +12,7 @@ use crate::core::Worker;
 #[derive(Default)]
 pub struct AtomPrefillInfo {
     pub tp_sizes: HashMap<String, usize>,
+    pub chunked_transfer: HashMap<String, Value>,
 }
 
 impl std::fmt::Debug for AtomPrefillInfo {
@@ -30,6 +31,19 @@ pub struct AtomAdapter {
 impl AtomAdapter {
     pub fn new(prefill_info: Arc<AtomPrefillInfo>) -> Self {
         Self { prefill_info }
+    }
+
+    fn can_chunk_request(body: &Value) -> bool {
+        if body.get("n").and_then(Value::as_u64).unwrap_or(1) != 1
+            || body.get("best_of").and_then(Value::as_u64).unwrap_or(1) != 1
+        {
+            return false;
+        }
+        // One transfer ID identifies one sequence. Batched completion prompts
+        // keep using the existing response relay.
+        body.get("prompt")
+            .and_then(Value::as_array)
+            .is_none_or(|items| items.iter().all(Value::is_number))
     }
 
     /// Fill in fields the prefill response omits but decode's ReqMeta needs:
@@ -114,7 +128,12 @@ impl BackendAdapter for AtomAdapter {
     }
 
     fn inject_prefill_fields(&self, body: &mut Value, ctx: &PairCtx) -> Result<(), AdapterError> {
-        downcast(ctx)?;
+        let pair = downcast(ctx)?;
+        let chunked = Self::can_chunk_request(body)
+            && self
+                .prefill_info
+                .chunked_transfer
+                .contains_key(&pair.prefill_url);
         let obj = body.as_object_mut().ok_or(AdapterError::BodyNotObject)?;
         obj.insert(
             "kv_transfer_params".to_string(),
@@ -123,6 +142,10 @@ impl BackendAdapter for AtomAdapter {
                 "do_remote_prefill": false,
             }),
         );
+        if chunked {
+            obj["kv_transfer_params"]["chunked_transfer"] = json!(true);
+            obj["kv_transfer_params"]["transfer_id"] = json!(pair.transfer_id);
+        }
         obj.insert("stream".to_string(), Value::Bool(false));
         obj.insert("max_tokens".to_string(), json!(1));
         if obj.contains_key("max_completion_tokens") {
@@ -134,10 +157,21 @@ impl BackendAdapter for AtomAdapter {
         Ok(())
     }
 
-    /// No-op: the kv_transfer_params for decode comes from the prefill response,
-    /// not from a static ctx. Mesh injects it in execute_atom_relay after enriching.
-    fn inject_decode_fields(&self, _body: &mut Value, ctx: &PairCtx) -> Result<(), AdapterError> {
-        downcast(ctx)?;
+    /// Chunked mode establishes D before P finishes; legacy mode receives its
+    /// metadata from the completed prefill response in execute_atom_relay.
+    fn inject_decode_fields(&self, body: &mut Value, ctx: &PairCtx) -> Result<(), AdapterError> {
+        let pair = downcast(ctx)?;
+        if !Self::can_chunk_request(body) {
+            return Ok(());
+        }
+        if let Some(template) = self.prefill_info.chunked_transfer.get(&pair.prefill_url) {
+            let mut kv = template.clone();
+            kv["transfer_id"] = json!(pair.transfer_id);
+            self.enrich_decode_kv(&mut kv, ctx)?;
+            body.as_object_mut()
+                .ok_or(AdapterError::BodyNotObject)?
+                .insert("kv_transfer_params".to_string(), kv);
+        }
         Ok(())
     }
 

@@ -589,7 +589,7 @@ class EngineCore:
         if not self.kv_transfer_enabled:
             return
         connector = getattr(self.scheduler, "kv_connector", None)
-        if connector is None or not getattr(connector, "is_offload", False):
+        if connector is None:
             return
         # getattr for the same reason as `kv_connector` above: this path is
         # reached with scheduler doubles that implement only the connector
