@@ -84,104 +84,6 @@ _FP8_GROUP_SIZE = 64
 _FP8_DTYPE = torch.float8_e4m3fnuz
 
 
-@functools.cache
-def _device_arch(device_index: int) -> str:
-    """Return the base GCN architecture name without feature suffixes."""
-    return getattr(
-        torch.cuda.get_device_properties(device_index), "gcnArchName", ""
-    ).split(":", 1)[0]
-
-
-def _v4_aiter_fp8_decode_splits(
-    q_packed: torch.Tensor,
-    *,
-    query_group: int,
-    kv_kind: str,
-) -> int | None:
-    """Return the qualified gfx950 H128/q7 AITER CSA split count.
-
-    AITER #5195's V4 NM wrapper maximizes a pure CU-occupancy score when the
-    caller leaves ``num_kv_splits`` unset. For q7 this creates a sawtooth
-    schedule: nearby batches can select 1 versus 15 splits, and every
-    multi-split launch writes FP32 partial outputs before a second reduction
-    kernel. The measured batch-only table below stays CUDA Graph safe because
-    it depends only on the captured Q shape. It is robust across K384/K640/
-    K1152 and avoids reading GPU-resident ``kv_indptr`` on the host.
-
-    HCA remains on AITER's ragged split planner: its heterogeneous long-KV
-    vectors have a different optimum from the CSA table.
-
-    Only used with aiter builds that predate ``get_mla_v4_nm_split_plan`` (see
-    ``aiter_v4_nm_split_plan_fn``).
-    """
-    shape = getattr(q_packed, "shape", None)
-    device = getattr(q_packed, "device", None)
-    if shape is None or len(shape) != 3 or device is None:
-        return None
-
-    device_index = device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    tokens, heads, _ = shape
-    if (
-        _device_arch(device_index) != "gfx950"
-        or heads != 128
-        or query_group != 7
-        or kv_kind != "csa"
-        or tokens % query_group
-    ):
-        return None
-
-    requests = tokens // query_group
-    if requests <= 0:
-        return None
-    if requests == 1:
-        return 5
-    if requests == 2:
-        return 4
-    if requests == 3:
-        return 3
-    if requests == 4:
-        return 2
-    return 1
-
-
-@functools.cache
-def aiter_v4_nm_split_plan_fn():
-    """aiter's ``get_mla_v4_nm_split_plan``, or None on builds without it.
-
-    Those older builds only have the occupancy-only auto pick, which the CSA
-    table above works around.
-    """
-    import aiter.mla
-
-    return getattr(aiter.mla, "get_mla_v4_nm_split_plan", None)
-
-
-def _v4_aiter_decode_split_kwargs(
-    q_packed: torch.Tensor,
-    *,
-    query_group: int,
-    kv_kind: str,
-    split_plan: tuple[int, torch.Tensor] | None,
-) -> dict:
-    """Split arguments for ``mla_decode_fwd_v4_nm``.
-
-    Uses the metadata builder's plan when it covers this call's rows; the
-    kernel launch then reads the plan's persistent ``split_indptr``. Without a
-    plan, aiter builds that have the planner fall back to their own pick and
-    older ones keep the measured CSA batch table.
-    """
-    if split_plan is not None and split_plan[1].shape[0] >= q_packed.shape[0] + 1:
-        return {"num_kv_splits": split_plan[0], "split_indptr": split_plan[1]}
-    if aiter_v4_nm_split_plan_fn() is not None:
-        return {}
-    splits = _v4_aiter_fp8_decode_splits(
-        q_packed, query_group=query_group, kv_kind=kv_kind
-    )
-    return {} if splits is None else {"num_kv_splits": splits}
-
-
 @functools.lru_cache(maxsize=1)
 def _cu_count() -> int:
     """Compute-unit count of the active GPU, queried once via aiter.
@@ -1083,6 +985,26 @@ def _sparse_attn_v4_paged_decode_prefill_asm(
     )
 
 
+def v4_decode_split_plan(
+    rows: int, heads: int, kv_len: int, split_indptr: torch.Tensor
+) -> tuple[int, torch.Tensor] | None:
+    """aiter's KV split plan for the fp8 decode ASM kernel, or None.
+
+    For a decode call of `rows` query rows (its `qo_indptr` has `rows + 1`
+    entries), `heads` local heads and at most `kv_len` KV per row. The plan's
+    `split_indptr` is written in place into the caller's persistent buffer, so
+    whoever owns a decode CSR builds its plan next to it and passes it on as
+    ``sparse_attn_v4_paged_decode(..., split_plan=plan)``. None on aiter builds
+    before ROCm/aiter#5890, which leaves the split pick to aiter.
+    """
+    import aiter.mla
+
+    plan_fn = getattr(aiter.mla, "get_mla_v4_nm_split_plan", None)
+    if plan_fn is None:
+        return None
+    return plan_fn(rows, heads, kv_len, split_indptr=split_indptr)
+
+
 def _sparse_attn_v4_paged_decode_asm(
     unified_kv: torch.Tensor,
     kv_indices: torch.Tensor,
@@ -1245,8 +1167,6 @@ def sparse_attn_v4_paged_decode(
     kv_last_page_lens: torch.Tensor | None = None,
     empty_kv_indptr: torch.Tensor | None = None,
     prefix: str = "",
-    query_group: int = 1,
-    kv_kind: str = "",
     split_plan: tuple[int, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """V4 decode sparse attention over a unified KV pool with paged indices.
@@ -1256,6 +1176,10 @@ def sparse_attn_v4_paged_decode(
     ``ATOM_USE_V4_PREFILL_ASM_FOR_DECODE=1``, gfx1250 H=128 instead reuses the
     sparse-prefill ASM kernel with an empty extend stream. Both paths consume
     pre-packed fp8 Q and the fp8 NoPE + bf16 RoPE pools with no requant.
+
+    ``split_plan`` is aiter's ``MlaV4NmSplitPlan`` (``num_kv_splits``,
+    ``split_indptr``) for the decode ASM kernel, built by whoever built this
+    call's ``qo_indptr``; None leaves the split pick to aiter.
 
     Otherwise (bf16): the existing Triton / reference path. When ``kv_scales``
     is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and is dequantized
@@ -1281,6 +1205,7 @@ def sparse_attn_v4_paged_decode(
                 q_packed_in,
                 q_rope_in,
             )
+        num_kv_splits, split_indptr = split_plan or (None, None)
         return _sparse_attn_v4_paged_decode_asm(
             unified_kv,
             kv_indices,
@@ -1292,12 +1217,8 @@ def sparse_attn_v4_paged_decode(
             q_rope_in,
             qo_indptr=qo_indptr,
             kv_last_page_lens=kv_last_page_lens,
-            **_v4_aiter_decode_split_kwargs(
-                q_packed_in,
-                query_group=query_group,
-                kv_kind=kv_kind,
-                split_plan=split_plan,
-            ),
+            num_kv_splits=num_kv_splits,
+            split_indptr=split_indptr,
         )
     gfx = get_gfx()
     if gfx == "gfx1250" or gfx.startswith("gfx94"):

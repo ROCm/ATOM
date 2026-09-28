@@ -3313,12 +3313,15 @@ class DeepseekV4Attention(nn.Module):
             if ratio == 0:
                 kv_indices = attn_md.kv_indices_swa
                 kv_indptr = attn_md.kv_indptr_swa
+                split_plan = attn_md.split_plan_swa
             elif ratio == 4:
                 kv_indices = attn_md.kv_indices_csa
                 kv_indptr = attn_md.kv_indptr_csa
+                split_plan = attn_md.split_plan_csa
             else:  # ratio == 128
                 kv_indices = attn_md.kv_indices_hca
                 kv_indptr = attn_md.kv_indptr_hca
+                split_plan = attn_md.split_plan_hca
             # Dispatch on kv-cache layout inside the wrapper: fp8 2buff
             # (unified_kv_rope set) → aiter ASM with pre-packed fp8 Q + the
             # 2buff fp8/bf16 pools read with no requant. The optional H=128
@@ -3336,18 +3339,7 @@ class DeepseekV4Attention(nn.Module):
                 qo_indptr=attn_md.qo_indptr,
                 empty_kv_indptr=attn_md.empty_kv_indptr,
                 prefix=f"{self.layer_name}.sparse_attn_decode",
-                query_group=(
-                    7 if attn_md.min_seqlen_q == attn_md.max_seqlen_q == 7 else 1
-                ),
-                kv_kind="csa" if ratio == 4 else "hca" if ratio == 128 else "swa",
-                # Bridged metadata (e.g. sglang) may not carry split plans.
-                split_plan=getattr(
-                    attn_md,
-                    {0: "split_plan_swa", 4: "split_plan_csa"}.get(
-                        ratio, "split_plan_hca"
-                    ),
-                    None,
-                ),
+                split_plan=split_plan,
             )  # [S, H, head_dim]
         else:
             # Two-source paged prefill: prefix from `unified_kv` (per-ratio
