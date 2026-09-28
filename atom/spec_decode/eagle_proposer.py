@@ -416,9 +416,27 @@ class EagleProposer(Drafter):
         # never draws.
         staged["positions"].copy_(fc.attn_metadata.context_lens[:running_bs])
         zeros = torch.zeros(running_bs, dtype=torch.int32, device=self.device)
-        self._enter_decode_metadata(
+        i0_max_seqlen_q, _ = self._enter_decode_metadata(
             running_bs, running_bs, staged["positions"], zeros.to(torch.int64), zeros
         )
+        # `propose` follows that rewrite with `prepare_mtp_decode`, which replaces
+        # the target's verify-width work plan with the one-row-per-sequence plan
+        # the draft's attention reads. Skip it and a persistent-mode MLA draft
+        # (DPA) walks a plan sized for max_seqlen_q query rows per sequence over
+        # a query holding one -- an illegal access at warmup.
+        attn_metadata = fc.attn_metadata
+        builder = self.runner.attn_metadata_builder
+        only_update = builder.num_attention_heads != 32
+        workinfos = builder.prepare_mtp_decode(
+            running_bs,
+            i0_max_seqlen_q if only_update else attn_metadata.max_seqlen_q,
+            attn_metadata.max_seqlen_k,
+            staged["positions"],
+            only_update=only_update,
+            num_reject_tokens=zeros,
+        )
+        for k, v in workinfos.items():
+            attn_metadata.__dict__[k] = v
 
     def _enter_decode_metadata(
         self,
