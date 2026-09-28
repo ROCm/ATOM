@@ -365,7 +365,7 @@ models:
             cudagraph: >-
               [1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]
             extra_args: "--decode-context-parallel-size 4 --cudagraph-mode FULL"
-          env:
+          env: &glm52_agentic_lmcache_cpp4_dcp4_env
             common:
               # Force RDMA to avoid HIP IPC shared-pool address corruption.
               MC_DISABLE_HIP: "1"
@@ -376,7 +376,7 @@ models:
               MAX_JOBS: "16"
               PYTHONHASHSEED: "0"
               TOPK_FORCE_PATH: "one"
-            prefill:
+            prefill: &glm52_agentic_lmcache_cpp4_dcp4_prefill_env
               HIP_VISIBLE_DEVICES: "0,1,2,3"
               VLLM_PP_LAYER_PARTITION: "20,20,20,18"
               LMCACHE_LOCAL_CPU: "True"
@@ -411,6 +411,27 @@ models:
         - <<: *glm52_agentic_lmcache_cpp4_dcp4
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c56
           concurrency: [56]
+
+        # Match the CPP4+DCP4 LMCache baseline, enabling chunked KV transfer
+        # only on the Mooncake producer; retain every other server/benchmark knob.
+        - &glm52_agentic_lmcache_chunked_cpp4_dcp4
+          <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-chunked-1m-c32
+          concurrency: [32]
+          env:
+            <<: *glm52_agentic_lmcache_cpp4_dcp4_env
+            prefill:
+              <<: *glm52_agentic_lmcache_cpp4_dcp4_prefill_env
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+
+        - <<: *glm52_agentic_lmcache_chunked_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-chunked-1m-c48
+          concurrency: [48]
+
+        - <<: *glm52_agentic_lmcache_chunked_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-chunked-1m-c54
+          concurrency: [54]
 
         - &glm52_agentic_lmcache_tp4_dpa
           <<: *glm52_agentic_tp4_tp4
