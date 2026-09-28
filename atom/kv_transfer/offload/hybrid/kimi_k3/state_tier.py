@@ -14,6 +14,7 @@ aggregator's quorum -- without it a partial store pins the hash forever.
 
 import logging
 import threading
+from collections.abc import Hashable
 from concurrent.futures import ThreadPoolExecutor
 from time import monotonic
 
@@ -37,19 +38,21 @@ class StateOffloadTier:
             max_workers=max_workers, thread_name_prefix="lmc-state-store"
         )
         self._lock = threading.Lock()
-        # (hash, req_id) -> whether its `get` produced bytes, drained by
+        # (hash, load_key) -> whether its `get` produced bytes, drained by
         # `take_hash_verdicts`. Written from whichever KV load task ran the
         # state leg, read from the engine-facing thread, hence the lock.
         #
-        # Keyed by the request too, not the hash alone: the aggregator's
+        # Keyed by the load too, not the hash alone: the aggregator's
         # connector-completion group tombstones every key it takes quorum on
         # (`KVOutputAggregator`, `lambda _key: True`), and `report()` drops a
         # key already tombstoned. A bare hash would therefore be reportable
         # exactly once per process -- a hash re-stored after its first miss
-        # could never be retracted again, and the index would advertise absent
-        # bytes until the 4096-entry tombstone ring evicted the key. The
-        # request id is identical on every rank, so quorum is unaffected.
-        self._hash_verdicts: dict[tuple[int, str], bool] = {}
+        # could never be retracted again. The request id alone is not enough
+        # either: a re-admitted request loading the same hash again would hit
+        # its own first load's tombstone. `load_key` is the exact load
+        # generation (`LoadOperationId`), identical on every rank, so quorum is
+        # unaffected and every load is its own key.
+        self._hash_verdicts: dict[tuple[int, Hashable], bool] = {}
         self._inflight: set = set()
         # Store reports, drained by `take_store_reports`. Sets of
         # `StateStoreOperationId`, not bare hashes: the engine settles the pin
@@ -111,7 +114,7 @@ class StateOffloadTier:
             self._store_submitted_at[op] = monotonic()
         self._register(self._store_executor.submit(self._do_store, op, unit_ids))
 
-    def load_state(self, prefix_hash: int, slot: int, req_id: str) -> bool:
+    def load_state(self, prefix_hash: int, slot: int, load_key: Hashable) -> bool:
         """Fetch `prefix_hash` into pool slot `slot`. Synchronous, no report.
 
         Runs on the caller's thread -- the KV load task that owns this request --
@@ -130,14 +133,14 @@ class StateOffloadTier:
             ok = bool(self.codec.get(h, int(slot)))
         except Exception:  # deliberately blind; see the docstring
             logger.warning("state offload: load of hash %d failed", h, exc_info=True)
-        key = (h, str(req_id))
+        key = (h, load_key)
         with self._lock:
             # Failure-dominant: a leg this rank already missed stays missed even
             # if a retry within the same drain window finds it back.
             self._hash_verdicts[key] = self._hash_verdicts.get(key, True) and ok
         return ok
 
-    def note_load_unrun(self, prefix_hash: int, req_id: str) -> None:
+    def note_load_unrun(self, prefix_hash: int, load_key: Hashable) -> None:
         """Record a neutral verdict for a state leg this rank never ran.
 
         The TP quorum acts only on a key EVERY rank reported, and a rank whose
@@ -147,12 +150,12 @@ class StateOffloadTier:
         failure-dominant merge as `load_state`, so this can never overwrite a
         real miss recorded for the same key by a retry in this window.
         """
-        key = (int(prefix_hash), str(req_id))
+        key = (int(prefix_hash), load_key)
         with self._lock:
             self._hash_verdicts[key] = self._hash_verdicts.get(key, True) and True
 
-    def take_hash_verdicts(self) -> dict[tuple[int, str], bool]:
-        """`{(hash, req_id): the `get` produced bytes}` for every load run since
+    def take_hash_verdicts(self) -> dict[tuple[int, Hashable], bool]:
+        """`{(hash, load_key): the `get` produced bytes}` for every load run since
         the last call.
 
         Successes are reported as well as misses because the TP aggregator only

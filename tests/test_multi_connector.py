@@ -447,6 +447,43 @@ def test_load_side_methods_follow_the_load_owner_not_the_tier_sub():
     assert sched._state_tier_sub() is k3
 
 
+def test_a_state_only_load_parks_on_the_tier_sub_when_no_sub_owns_kv():
+    """The production agentic shape, `[mooncake producer, lmcache_offload]`.
+
+    A STATE-ONLY load -- KV resident in HBM, recurrent state in the tier --
+    wins no KV arbitration: every sub's KV answer is 0, so there is no load
+    owner. Answering "no owner, no park" declined every state-only resume and
+    the request recomputed from 0. The engine's `offload_joint.load_hash` says a
+    state leg was secured, and only the tier sub can carry one, so it answers.
+    """
+    producer = FakeSchedSub(is_producer=True)
+    k3 = FakeSchedSub(is_offload=True, offload_methods=True, has_state_tier=True)
+    k3.park = True
+    sched = _sched([producer, k3])
+    seq = SimpleNamespace(id="s9", offload_joint=SimpleNamespace(load_hash=99))
+
+    assert sched.get_num_new_matched_tokens(seq) == (0, False)
+    assert sched.should_park_for_load_after_alloc(seq) is True
+
+    # No state leg and no KV owner is still "no load".
+    plain = SimpleNamespace(id="s10", offload_joint=SimpleNamespace(load_hash=-1))
+    assert sched.get_num_new_matched_tokens(plain) == (0, False)
+    assert sched.should_park_for_load_after_alloc(plain) is False
+
+
+def test_a_new_arbitration_clears_the_previous_ones_cancel():
+    """The cancel flag is per arbitration. Left set, a request preempted after
+    the tier sub lost once would have its state leg suppressed on re-admission
+    even when the tier sub wins -- its KV load would go out alone and the
+    forward would resume over a state slot nothing filled."""
+    k3 = FakeSchedSub(is_offload=True, offload_methods=True, match=(4, True))
+    sched = _sched([k3])
+    seq = SimpleNamespace(id="s11", offload_load_cancelled=True)
+
+    assert sched.get_num_new_matched_tokens(seq) == (4, True)
+    assert seq.offload_load_cancelled is False
+
+
 def test_process_completions_reaches_the_offload_sub():
     # The scheduler calls process_completions and nothing else — it is the only
     # caller of the offload sub's save_finished. Without the fan-out the sub's
