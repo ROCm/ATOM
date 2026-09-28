@@ -671,6 +671,15 @@ models:
               # WARN says nothing about where. Drop this back once that is
               # understood; it only costs init-time log volume.
               ATOMESH_NCCL_DEBUG: "INFO"
+              # RCCL 2.30.4 on ROCm 10.0 prints, from every rank, that this
+              # "must be set to avoid performance degradation with the current
+              # HIP configuration", and it is set nowhere. Three jobs (4707,
+              # 4709, 4712) then hung in communicator init seconds after the
+              # RCCL banner, on two different prefill nodes and with seeding
+              # both on and off -- so it is neither a bad node nor this A/B.
+              # Taking the runtime at its word. The known cost is that scratch
+              # is no longer reclaimed, i.e. more device memory held.
+              HSA_NO_SCRATCH_RECLAIM: "1"
               # Write the offline traces (per-forward shape and device time,
               # kernel compiles, per-request stages, offload copy queue) under
               # RUN_DIR/traces, which comes back with the logs. They are what
@@ -696,8 +705,10 @@ models:
               ATOM_ENABLE_REPLAYSSM: "0"
               AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
               ATOMESH_SEED_AOT_CACHE: "0"
-              # Matches the seeded arm; see the note there.
+              # Both match the seeded arm; see the notes there. They have to be
+              # identical across the pair or the A/B stops being one.
               ATOMESH_NCCL_DEBUG: "INFO"
+              HSA_NO_SCRATCH_RECLAIM: "1"
               ATOMESH_ENABLE_TRACES: "1"
 
         - <<: *kimi_k3_agentic_no_dspark

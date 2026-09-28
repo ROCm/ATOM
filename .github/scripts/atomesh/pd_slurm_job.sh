@@ -207,9 +207,13 @@ EOF
   # compute-node shell that runs this function, so testing the bare variable here
   # always took the default and staged even for the control arm (observed in job
   # 4709, which logged a stage reuse under ATOMESH_SEED_AOT_CACHE=0).
+  # Note the ATOMESH_ENV_ prefix. pd_submit.sh exports each case variable as
+  # ATOMESH_ENV_<name>, and only the container un-prefixes it (apply_prefixed_env
+  # in pd_server_atom.sh). On the host the bare name does not exist, so matching
+  # it silently took the default and staged for both arms.
   local aot_stage="" seed_aot="${ATOMESH_SEED_AOT_CACHE:-}"
   if [[ -z "${seed_aot}" && -r "${env_file}" ]]; then
-    seed_aot="$(sed -n 's/^ATOMESH_SEED_AOT_CACHE=//p' "${env_file}" | tail -n 1)"
+    seed_aot="$(sed -n 's/^ATOMESH_ENV_ATOMESH_SEED_AOT_CACHE=//p' "${env_file}" | tail -n 1)"
   fi
   if [[ "${seed_aot:-1}" == "1" ]]; then
     aot_stage="$(bash "${REPO_ROOT}/.github/scripts/atomesh/stage_aot_cache.sh" \
@@ -222,7 +226,7 @@ EOF
   # cannot simply be set as a case variable.
   local nccl_debug="${ATOMESH_NCCL_DEBUG:-}"
   if [[ -z "${nccl_debug}" && -r "${env_file}" ]]; then
-    nccl_debug="$(sed -n 's/^ATOMESH_NCCL_DEBUG=//p' "${env_file}" | tail -n 1)"
+    nccl_debug="$(sed -n 's/^ATOMESH_ENV_ATOMESH_NCCL_DEBUG=//p' "${env_file}" | tail -n 1)"
   fi
 
   docker_args=(
@@ -612,7 +616,7 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
       aot_stage=""
       seed_aot="${ATOMESH_SEED_AOT_CACHE:-}"
       if [[ -z "${seed_aot}" && -r "'"${ENV_FILE}"'" ]]; then
-        seed_aot="$(sed -n "s/^ATOMESH_SEED_AOT_CACHE=//p" "'"${ENV_FILE}"'" | tail -n 1)"
+        seed_aot="$(sed -n "s/^ATOMESH_ENV_ATOMESH_SEED_AOT_CACHE=//p" "'"${ENV_FILE}"'" | tail -n 1)"
       fi
       if [[ "${seed_aot:-1}" == "1" ]]; then
         aot_stage="$(bash "'"${REPO_ROOT}"'/.github/scripts/atomesh/stage_aot_cache.sh" \
