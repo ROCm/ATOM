@@ -6,20 +6,55 @@ across **four gfx1250 nodes, 4 GPUs each, in SPX** — 16 ranks total, `-tp 1`
 with data parallel 16 and expert parallel 16. The checkpoint is ~1.42 TiB and is
 needed **in full on every node**; it is not sharded across the cluster.
 
-This is a bring-up configuration, not a tuned deployment. Read the translation
-section first — on this silicon it is the difference between 95% and 0%.
+## Read this first: which image you have decides everything
+
+Two generations of bring-up image exist for this silicon, and they are **not**
+the same recipe.
+
+| | image | translation | what it is for |
+|---|---|---|---|
+| **A0-built** | earlier bring-up images | **mandatory** — without it every token is `!` and GSM8K is 0% | getting the model to run at all |
+| **B0-built** | **`rocm/fw-bringup:gfx1250-atom-20260918-ep8`** | **none — drop the rocjitsu prefix entirely** | **the configuration worth measuring** |
+
+The silicon is **B0** either way. What changed is that the newer image's kernels
+are built for it, so the whole translation layer becomes dead weight. Verified
+end to end: the hook attached on all 16 ranks and performed **zero**
+translations, and GSM8K still scored **0.9621** over the full 1319.
+
+**If you are here for performance, you want the B0-built image.** Everything in
+this page that concerns the rocjitsu prefix is the A0 path — keep it for
+reference, skip it in practice. The numbers below, the
+[server command](#config-b--agentic-throughput-agentx) and the
+[bottleneck analysis](#where-the-time-goes-and-what-to-try-next) all come from
+`gfx1250-atom-20260918-ep8`.
+
+### Measured on `rocm/fw-bringup:gfx1250-atom-20260918-ep8`
+
+4 nodes × 4 gfx1250, **432 GiB/GPU**, dp16ep16, B0 silicon, no translation.
 
 | | |
 |---|---|
-| Hardware | 4 × gfx1250 (MI455), 4 GPUs/node, SPX. **Check HBM per GPU** — 288 GiB and 432 GiB boards both exist on this silicon; every KV number below depends on which you have |
+| **Agentic (AgentX), interactivity p90** | **2.53 tok/s/user** |
+| **Agentic, total throughput per GPU** | **182 tok/s** (2913 aggregate / 16) |
+| **Agentic, prefix cache read** | **92.36%** (94.68% theoretical) |
+| **GSM8K**, 5-shot, full 1319 | **strict-match 0.9621 ±0.0053** — 9 min at `num_concurrent=32` |
+| Cold start | **under 6 min** (not the 25 min the A0 path needs) |
+| Bottleneck | **decode**, by a wide margin — see [Where the time goes](#where-the-time-goes-and-what-to-try-next) |
+
+Copy-pasteable server command, env block and aiperf invocation:
+[Appendix](#appendix-the-exact-configuration-this-was-validated-on).
+
+### The rest of the configuration
+
+| | |
+|---|---|
+| Hardware | 4 × gfx1250 (MI455), 4 GPUs/node, SPX. **Check HBM per GPU** — 288 GiB and 432 GiB boards both exist; every KV number below depends on which you have |
 | Parallelism | `-tp 1 --data-parallel-size 16 --data-parallel-size-local 4`, EP16, DP attention |
 | Attention | Triton MLA (`ATOM_USE_TRITON_MLA=1`), unshuffled KV |
 | Fabric | UALink within a node-set sharing one `PPOD_ID` + `VPOD_ID`; RCCL over the data-plane NIC |
 | **Required ATOM patch** | [PR #2380](https://github.com/ROCm/ATOM/pull/2380) — apply the **diff** to the image's ATOM; stock ATOM aborts on chunked prefill here |
-| **GSM8K (lm_eval, 5-shot, full 1319)** | **strict-match 0.9545 ±0.0057**, flexible-extract 0.9538 ±0.0058 |
-| GSM8K, re-run on `gfx1250-atom-20260918-ep8` / 432 GiB boards | strict-match 0.9621 ±0.0053, flexible-extract 0.9613 ±0.0053 (1319/1319, 9 min at `num_concurrent=32`) |
-| Throughput / TTFT / TPOT | **not characterized yet** — see [Not yet measured](#not-yet-measured) |
-| Agentic (AgentX), 16 GPUs, `--fake-eplb` | interactivity p90 2.53 tok/s/user, 182 tok/s/GPU total, 92.36% prefix-cache read — see [AgentX result](#agentx-result) and its caveats |
+| GSM8K on the original A0-path run | strict-match 0.9545 ±0.0057, flexible-extract 0.9538 ±0.0058 |
+| Fixed-length throughput | **not characterized on the B0 image** — the table in [Throughput](#throughput) is from the A0 path |
 
 ---
 
@@ -1258,6 +1293,66 @@ the lightest DP rank and pins every later request to that cache owner, which is
 the behaviour prefix caching needs across turns — a follow-up landing on a
 different rank re-prefills the whole context. It is off by default and costs
 nothing to set; its effect here is unmeasured for want of a baseline.
+
+---
+
+## Where the time goes, and what to try next
+
+From the AgentX run on `gfx1250-atom-20260918-ep8`, 16 GPUs, con32.
+
+### Decode is the bottleneck, not prefill
+
+| | measured |
+|---|---|
+| Prefill, aggregate | **2,907 tok/s** |
+| Prefill, per user | 1,386 tok/s avg (p90 4,012) |
+| Decode, aggregate | **6.12 tok/s** |
+| Decode, per user | **1.07 tok/s** (p50 0.53, p90 2.53) |
+| Inter-token latency | **1,420 ms** avg (p50 1,898, p90 1,992) |
+
+An average trajectory is 100,926 input tokens and **212 output tokens**. The
+input side costs ~35 s of prefill; the 212 output tokens cost **~326 s**. Over
+90% of request latency is decode, generating three orders of magnitude fewer
+tokens than prefill consumes.
+
+An ITL near 1.9 s at p50 is not a batching artefact — decode batches are tiny
+here. `--max-num-seqs 8` caps each DP rank at 8 sequences, and effective
+concurrency across the cluster settled at **15.11**, i.e. roughly **one
+sequence per rank**. Every decode step pays the full MoE all-to-all for a
+batch of ~1.
+
+### What that implies, in order of expected value
+
+1. **Raise the decode batch.** `--max-num-seqs 8` is inherited from the A0 path
+   and has never been swept. On 432 GiB boards at 0.94 there is
+   118.80 GB of KV — 3.5x what the A0 path had at 0.90. This is the cheapest
+   thing to try and the most likely to move ITL.
+2. **Raise concurrency.** Effective 15.11 against nominal 32 means the client
+   is not the limit — but see the warning in
+   [AgentX result](#agentx-result): con16 and con32 land on the same working
+   point, so go *up*, not down. A con64 attempt was made and not completed.
+3. **EP32.** Per-GPU expert weight halves (14.64 GiB/layer ÷ 32 = 0.46, against
+   0.92 at EP16), freeing roughly **41 GiB per GPU** for KV — which feeds
+   directly into (1) and (2). Untested; needs 8 nodes with the full checkpoint
+   on each.
+4. **Real EPLB.** ATOM has `--eplb-enable` / `--enable-eplb` with
+   `--eplb-config` (JSON: `num_redundant_experts`, `placement_policy`
+   `naive`|`biased`, `rebalance_interval`, `load_window_size`, …). K3 is 896
+   routed experts top-16, 56 per GPU at EP16; expert load is long-tailed, and
+   replicating the hot ones costs KV that these boards have. **This is
+   different from `--fake-eplb`**, which only uniformises the router for
+   measurement and is not deployable.
+5. **Prefill chunk is already handled.** `--max-num-batched-tokens 16384` took
+   TTFT on a short prompt from 2.73 s to 0.50 s and made AgentX measurable at
+   all. Going higher trades KV that (1) and (2) want more.
+
+### What is already healthy
+
+Prefix caching is doing its job and should not be the next thing tuned:
+**92.36%** of 5,349,055 prompt tokens were served from cache, against a 94.68%
+theoretical ceiling for the trace. `ATOM_DP_SESSION_AFFINITY=1` was set, which
+pins a session to its cache owner so a later turn does not re-prefill on
+another rank; its isolated contribution is unmeasured.
 
 ---
 
