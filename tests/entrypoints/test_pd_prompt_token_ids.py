@@ -351,3 +351,42 @@ def test_generate_async_reads_prompt_ids_from_local_sequence(monkeypatch, return
         assert output["prompt_token_ids"] == PROMPT_IDS
     else:
         assert "prompt_token_ids" not in output
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("multi", [False, True])
+def test_chunked_transfer_discovery_advertises_pp_and_page_geometry(monkeypatch, enabled, multi):
+    sub = {
+        "kv_connector": "mooncake",
+        "kv_role": "kv_producer",
+        "enable_chunked_transfer": enabled,
+        "handshake_port": 6401,
+    }
+    config = SimpleNamespace(
+        kv_transfer_config={"kv_connector": "multi", "connectors": [sub]}
+        if multi
+        else sub,
+        tensor_parallel_size=4,
+        pipeline_parallel_size=3,
+        parallel_config=SimpleNamespace(data_parallel_size=2),
+        kv_cache_block_size=64,
+        decode_context_parallel_size=2,
+    )
+    monkeypatch.setattr(api_server, "engine", SimpleNamespace(config=config))
+    monkeypatch.setattr("atom.utils.network.get_ip", lambda: "127.0.0.1")
+    info = asyncio.run(api_server.kv_transfer_info())
+    assert info["kv_role"] == "kv_producer"
+    assert info["handshake_port"] == 6401
+    assert ("chunked_transfer" in info) is enabled
+    if enabled:
+        assert info["chunked_transfer"] == {
+            "chunked_transfer": True,
+            "do_remote_prefill": True,
+            "do_remote_decode": False,
+            "remote_host": "127.0.0.1",
+            "remote_handshake_port": 6401,
+            "remote_pp_size": 3,
+            "block_size": 64,
+            "dcp_size": 2,
+            "hash_block_size": 128,
+        }

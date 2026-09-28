@@ -3406,9 +3406,13 @@ class ModelRunner:
         )
 
     def _record_kv_cache_ready(self, batch: ScheduledBatch) -> None:
-        """Publish a GPU event for final prefill chunks to transfer connectors."""
+        """Publish completed chunk snapshots and the legacy final-ready event."""
         if batch.total_seqs_num_prefill <= 0:
             return
+        connector = get_kvconnector()
+        publish = getattr(connector, "publish_prefill_chunks", None)
+        if callable(publish):
+            publish(batch)
         if batch.is_final_chunk is None:
             req_ids = batch.req_ids
         else:
@@ -3421,7 +3425,6 @@ class ModelRunner:
             ]
         if not req_ids:
             return
-        connector = get_kvconnector()
         callback = getattr(connector, "record_kv_cache_ready", None)
         if callable(callback):
             callback(req_ids)

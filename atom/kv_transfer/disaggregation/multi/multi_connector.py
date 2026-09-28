@@ -283,6 +283,12 @@ class MultiConnector(KVConnectorBase):
                 continue
             c.start_load_kv(m)
 
+    def publish_prefill_chunks(self, batch) -> None:
+        for connector in self._connectors:
+            callback = getattr(connector, "publish_prefill_chunks", None)
+            if callable(callback):
+                callback(batch)
+
     def record_kv_cache_ready(self, req_ids: list) -> None:
         """Forward a prefill-ready event hook to connector implementations."""
         for connector in self._connectors:
@@ -298,6 +304,7 @@ class MultiConnector(KVConnectorBase):
         send_now: list = []
         save_now: list = []
         completions: set = set()
+        received_handoffs = {}
         for c in self._connectors:
             o = _normalize_finished(c.get_finished())
             recv |= o.finished_recving
@@ -307,6 +314,7 @@ class MultiConnector(KVConnectorBase):
             send_now.extend(o.finished_sending)
             save_now.extend(o.finished_saving)
             completions |= o.connector_completions
+            received_handoffs.update(o.received_handoffs)
 
         return KVConnectorOutput(
             finished_sending=set(send_now),
@@ -316,6 +324,7 @@ class MultiConnector(KVConnectorBase):
             finished_loading=loaded,
             failed_loading=load_failed,
             connector_completions=completions,
+            received_handoffs=received_handoffs,
         )
 
     def get_finished_recv_blocks(self) -> list[int]:
@@ -741,6 +750,13 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             for c in self._connectors
             if hasattr(c, "has_pending_work")
         )
+
+    def process_pd_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
+        for connector in self._connectors:
+            callback = getattr(connector, "process_pd_completions", None)
+            if callable(callback):
+                output = callback(output)
+        return output
 
     def process_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
         """Let the one offload sub apply its own completions and normalize output.

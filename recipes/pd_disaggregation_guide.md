@@ -7,6 +7,20 @@ Prefill-Decode disaggregation splits inference into two stages on separate nodes
 Routing between clients and the P/D instances is handled by **atomesh**, a
 lightweight Rust router that replaces the legacy Python proxy.
 
+## Chunked KV transfer (including PP prefill)
+
+To transfer completed prefill chunks while subsequent chunks compute, add
+`"enable_chunked_transfer": true` to the producer's Mooncake
+`--kv-transfer-config`. Keep chunked prefill enabled and choose its compute
+budget with `--max-num-batched-tokens`. Upgrade the producer, consumer and
+atomesh together: atomesh discovers the capability via `/kv_transfer_info`
+and submits P/D requests concurrently. The option defaults to `false`.
+
+PP producers use the same option with `--pipeline-parallel-size N`. Each stage
+publishes its own completed KV; Decode waits for every stage, and source blocks
+remain pinned until all TP/PP readers finish. Existing topology/layout limits
+still apply. See [the implementation and CPU verification notes](../docs/pd_chunked_kv_transfer_zh.md).
+
 ## Prerequisites
 
 - Two nodes with AMD MI300X GPUs (8 GPUs each for TP=8)
