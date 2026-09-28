@@ -201,8 +201,17 @@ EOF
   # Per node, not per job: the staged tree has to be local to the host that will
   # run the service container. Gated so the control arm of the seeding A/B still
   # starts cold and pays nothing for the extraction.
-  local aot_stage=""
-  if [[ "${ATOMESH_SEED_AOT_CACHE:-1}" == "1" ]]; then
+  #
+  # Read the flag from the env file, not from this shell. The per-case env is
+  # written into that file on the submitting host; it is not exported into the
+  # compute-node shell that runs this function, so testing the bare variable here
+  # always took the default and staged even for the control arm (observed in job
+  # 4709, which logged a stage reuse under ATOMESH_SEED_AOT_CACHE=0).
+  local aot_stage="" seed_aot="${ATOMESH_SEED_AOT_CACHE:-}"
+  if [[ -z "${seed_aot}" && -r "${env_file}" ]]; then
+    seed_aot="$(sed -n 's/^ATOMESH_SEED_AOT_CACHE=//p' "${env_file}" | tail -n 1)"
+  fi
+  if [[ "${seed_aot:-1}" == "1" ]]; then
     aot_stage="$(bash "${REPO_ROOT}/.github/scripts/atomesh/stage_aot_cache.sh" \
       "${DOCKER_IMAGE}" || true)"
   fi
@@ -588,9 +597,15 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
       fi
       # Per node, not per job: the staged tree has to be local to the host that
       # will run the service container. Gated so the control arm of the seeding
-      # A/B still starts cold and pays nothing for the extraction.
+      # A/B still starts cold and pays nothing for the extraction. The flag is
+      # read from the env file because the per-case env is not exported into
+      # this compute-node shell -- see the matching note in run_container_rank.
       aot_stage=""
-      if [[ "${ATOMESH_SEED_AOT_CACHE:-1}" == "1" ]]; then
+      seed_aot="${ATOMESH_SEED_AOT_CACHE:-}"
+      if [[ -z "${seed_aot}" && -r "'"${ENV_FILE}"'" ]]; then
+        seed_aot="$(sed -n "s/^ATOMESH_SEED_AOT_CACHE=//p" "'"${ENV_FILE}"'" | tail -n 1)"
+      fi
+      if [[ "${seed_aot:-1}" == "1" ]]; then
         aot_stage="$(bash "'"${REPO_ROOT}"'/.github/scripts/atomesh/stage_aot_cache.sh" \
           "'"${DOCKER_IMAGE}"'" || true)"
       fi
