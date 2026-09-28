@@ -84,7 +84,7 @@ def test_worker_selects_native_state_from_published_contract(monkeypatch):
     worker = LMCacheMPConnector(config)
     tensors = SimpleNamespace(
         paged_state_checkpoint_spec=object(),
-        execute_paged_state_copies=lambda *_: None,
+        execute_paged_state_copies=lambda stores, restores, descriptor_slot=0: None,
     )
     worker.register_kv_caches({}, tensors, 7)
     assert selected == [("native", config)]

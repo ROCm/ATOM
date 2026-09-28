@@ -103,7 +103,7 @@ def worker():
         slot_regions=[],
         block_tensor_views=[page],
         paged_state_checkpoint_spec=spec,
-        execute_paged_state_copies=lambda *_: None,
+        execute_paged_state_copies=lambda stores, restores, descriptor_slot=0: None,
     )
     tensors.set_block_count(32)
     instance._native_layout = build_native_state_mp_layout(
@@ -364,67 +364,115 @@ def test_collapsed_tp_non_writer_skips_transport_and_reports_safe_success(worker
     } == {((0, 8),), ((8, 16),)}
 
 
-def test_restore_is_fenced_against_the_compute_stream_both_ways(worker, monkeypatch):
+class _Event:
+    def __init__(self):
+        self.recorded_on = None
+        self.done = False
+
+    def record(self, stream):
+        self.recorded_on = stream
+
+    def query(self):
+        return self.done
+
+
+class _Stream:
+    def __init__(self, name):
+        self.name = name
+        self.waited_streams = []
+        self.waited_events = []
+
+    def wait_stream(self, other):
+        self.waited_streams.append(other)
+
+    def wait_event(self, event):
+        self.waited_events.append(event)
+
+
+class _StreamContext:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+@pytest.fixture
+def cuda(worker, monkeypatch):
+    """CPU stand-ins for the restore stream, the compute stream and events."""
+    from atom.kv_transfer.offload.mp import native_state_worker
+
+    stubs = SimpleNamespace(
+        compute=_Stream("compute"), restore=_Stream("restore"), events=[]
+    )
+
+    def event():
+        stubs.events.append(_Event())
+        return stubs.events[-1]
+
+    worker._restore_stream = stubs.restore
+    monkeypatch.setattr(native_state_worker.torch.cuda, "Event", event)
+    monkeypatch.setattr(
+        native_state_worker.torch.cuda, "stream", lambda stream: _StreamContext()
+    )
+    monkeypatch.setattr(
+        native_state_worker.torch.cuda, "current_stream", lambda: stubs.compute
+    )
+    return stubs
+
+
+def test_restore_is_fenced_against_the_compute_stream_both_ways(worker, cuda):
     """The restore uses its own descriptor slot and stream, and orders against
     compute both ways: it waits for work already on the compute stream (the
     SLOT's previous occupant), and the next step's compute waits for it."""
-    from atom.kv_transfer.offload.mp import native_state_worker
-
-    class Event:
-        def __init__(self):
-            self.recorded_on = None
-
-        def record(self, stream):
-            self.recorded_on = stream
-
-    class Stream:
-        def __init__(self, name):
-            self.name = name
-            self.waited_streams = []
-            self.waited_events = []
-
-        def wait_stream(self, other):
-            self.waited_streams.append(other)
-
-        def wait_event(self, event):
-            self.waited_events.append(event)
-
-    class StreamContext:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-    compute = Stream("compute")
-    restore_stream = Stream("restore")
-    event = Event()
     copied = []
-    worker._restore_stream = restore_stream
     worker._restore_descriptor_slots = [3]
     worker._native_copy = lambda stores, restores, descriptor_slot=0: copied.append(
         (stores, restores, descriptor_slot)
-    )
-    monkeypatch.setattr(native_state_worker.torch.cuda, "Event", lambda: event)
-    monkeypatch.setattr(
-        native_state_worker.torch.cuda, "stream", lambda stream: StreamContext()
-    )
-    monkeypatch.setattr(
-        native_state_worker.torch.cuda, "current_stream", lambda: compute
     )
 
     req = request(loading=True)
     worker._submit_load(req, object())
     pending = next(iter(worker._native_loads.values()))
     assert worker._begin_restore(pending)
+    [event] = cuda.events
     assert pending.descriptor_slot == 3
     assert worker._restore_descriptor_slots == []
     assert copied[0][2] == 3
-    assert event.recorded_on is restore_stream
-    assert restore_stream.waited_streams == [compute]
+    assert event.recorded_on is cuda.restore
+    assert cuda.restore.waited_streams == [cuda.compute]
 
     worker.start_load_kv(object())
-    assert compute.waited_events == [event]
+    assert cuda.compute.waited_events == [event]
+
+
+def test_native_restore_reports_success_and_returns_its_slot(worker, cuda):
+    """End to end through `get_finished`: a terminal retrieve starts the real
+    restore with the production copy signature, and only once its event is
+    done does the load finish and the descriptor slot come back."""
+    copied = []
+    worker._restore_descriptor_slots = [3]
+    worker._native_copy = lambda stores, restores, descriptor_slot=0: copied.append(
+        (stores, restores, descriptor_slot)
+    )
+    worker.future.value, worker.future.ready = True, True
+    req = request(loading=True)
+    worker._submit_load(req, object())
+
+    first = worker.get_finished()
+    assert not first.finished_loading and not first.failed_loading
+    [(stores, (restore,), slot)] = copied
+    assert stores == () and slot == 3
+    assert restore.dst_slot == 2
+    assert tuple(restore.unit_ids) == (0, 25, 31)
+    assert worker._restore_descriptor_slots == []
+
+    cuda.events[-1].done = True
+    second = worker.get_finished()
+    assert second.finished_loading == {req.load_operation}
+    assert not second.failed_loading
+    assert worker._restore_descriptor_slots == [3]
+    assert worker._native_loads == {}
 
 
 def test_registration_reserves_every_restore_descriptor_slot(monkeypatch):
@@ -468,7 +516,7 @@ def test_registration_reserves_every_restore_descriptor_slot(monkeypatch):
         paged_state_checkpoint_spec=PagedStateCheckpointSpec(
             32, 128, "native-test-v1", 80
         ),
-        execute_paged_state_copies=lambda *_: None,
+        execute_paged_state_copies=lambda stores, restores, descriptor_slot=0: None,
     )
     tensors.set_block_count(32)
     tensors.state_backend = SimpleNamespace(

@@ -47,7 +47,7 @@ def _transfer(*, widths=(8, 8, 2), image_bytes=39, num_blocks=7):
         slot_regions=[],
         block_tensor_views=views,
         paged_state_checkpoint_spec=spec,
-        execute_paged_state_copies=lambda stores, restores: None,
+        execute_paged_state_copies=lambda stores, restores, descriptor_slot=0: None,
     )
     transfer.set_block_count(num_blocks)
     return transfer
