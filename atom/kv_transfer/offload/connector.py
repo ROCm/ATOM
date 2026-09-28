@@ -300,6 +300,18 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         # Plain forward: guaranteed by the abstract lifecycle contract.
         return self._impl.load_finished(req_id)
 
+    def carries_state_load(self, seq) -> bool:
+        """One connector carries both legs of whatever load it owns."""
+        return True
+
+    def take_undispatched_loads(self) -> set:
+        """Parked requests whose load was dropped before dispatch; see
+        `OffloadSchedulerMixin.take_undispatched_loads`. A forwarder, because
+        the scheduler reads it off the shell and a missing one would leave
+        those requests parked forever."""
+        callback = getattr(self._impl, "take_undispatched_loads", None)
+        return callback() if callback is not None else set()
+
     def process_completions(self, output):
         return self._impl.process_completions(output)
 

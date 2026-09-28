@@ -417,7 +417,8 @@ class StateOffloadFace(ABC):
 
     `MultiConnector` and the delegating shell must tell a tier-hosting impl
     (kimi_k3) from one with no state tier (dense / dsv4-page) so they route
-    state stores and loads to the right sub. They used to probe by method
+    state stores and reports to the right sub (a state load rides its request's
+    metadata and needs no routing). They used to probe by method
     *presence* -- but the shell defines the whole face unconditionally,
     forwarding through `getattr` to `_impl`, so presence could not distinguish
     them and every state call fell through to a dense impl's no-tier defaults
@@ -498,6 +499,9 @@ class OffloadSchedulerMixin(ABC):
         # req_id -> the sequence whose external-tier load failed. One
         # external-tier attempt per request; see `_repeat_load_suppressed`.
         self._load_failed_seqs: dict[str, object] = {}
+        # Raw request ids whose load was promised a park and then dropped while
+        # the metadata was built; see `take_undispatched_loads`.
+        self._undispatched_loads: set = set()
         self.total_suppressed_load_retries = 0
         # Repeats of `get_num_new_matched_tokens` served from the remembered
         # tier hit instead of a fresh external-tier lookup.
@@ -827,21 +831,6 @@ class OffloadSchedulerMixin(ABC):
         sequences it.
         """
 
-        # A spec that moves no KV reads nothing from the tier, so there is no
-        # entry to hold. Kimi-K3's state-only load is this shape: its KV leg is
-        # a no-op carrier (`lmcache_cached_tokens == hbm_cached_tokens`) for the
-        # state leg riding the same request, and HBM can legitimately hold more
-        # of the prefix than the KV tier does. Confirming it would compare the
-        # tier's hit against the HBM length, drop a load whose request is
-        # already parked, and leave that request waiting on a report nothing
-        # will send.
-        transfer_end = getattr(spec, "transfer_end_tokens", None)
-        reads_to = max(
-            int(spec.lmcache_cached_tokens),
-            int(transfer_end) if transfer_end is not None else 0,
-        )
-        if reads_to <= int(spec.hbm_cached_tokens):
-            return True
         # `_lookup_results` is the dense scheduler's live-pin carrier. The DSV4
         # scheduler releases every pin at the end of the step it was taken in,
         # so it has none and always answers this with a fresh lookup.
@@ -864,6 +853,30 @@ class OffloadSchedulerMixin(ABC):
             self._clear_pending_load(sid)
             return False
         return True
+
+    def _drop_undispatched_load(self, seq) -> None:
+        """A load its request already parked on will not be dispatched.
+
+        Only a report wakes a parked request, and a load that never reaches the
+        worker produces none, so the request would wait forever while holding
+        its blocks. Recorded here and handed to the scheduler, which fails it
+        exactly as it fails a load the worker could not complete.
+        """
+        dropped = getattr(self, "_undispatched_loads", None)
+        if dropped is None:
+            dropped = self._undispatched_loads = set()
+        dropped.add(seq.id)
+
+    def take_undispatched_loads(self) -> set:
+        """Drain the request ids recorded by `_drop_undispatched_load`."""
+        dropped = getattr(self, "_undispatched_loads", None) or set()
+        self._undispatched_loads = set()
+        return dropped
+
+    def _forget_undispatched_load(self, req_id) -> None:
+        dropped = getattr(self, "_undispatched_loads", None)
+        if dropped:
+            dropped.discard(req_id)
 
     def _repeat_load_suppressed(self, seq, sid: str) -> bool:
         """True once this request has spent its one external-tier attempt.

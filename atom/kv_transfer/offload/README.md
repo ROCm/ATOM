@@ -101,7 +101,8 @@ Four rules carry the module:
 | `hybrid/kimi_k3/connector.py` | Kimi-K3 worker and scheduler: the dense paged-KV path plus one extra leg for the KDA per-request state tier. |
 | `hybrid/kimi_k3/staging.py` | Single-entry bounded GPU staging buffer, D2H/H2D copy stream, and producer event for one flat state entry per transfer. |
 | `hybrid/kimi_k3/state_object.py` | One state checkpoint as a single opaque object keyed by ATOM's own hash, bypassing LMCache's `ChunkedTokenDatabase` (state bytes are not token-sliceable). |
-| `hybrid/kimi_k3/state_tier.py` | Worker-side store/load driver for the state tier. Stores run on its own executor; loads run inline on the KV load task, so one dispatch yields one completion. Reports store/verdict hash sets for the engine-side `StateOffloadIndex` to apply. |
+| `hybrid/kimi_k3/tier_builder.py` | Builds the worker's state tier from the attention backend's geometry, or turns it off with a warning (never a raise: it runs after the weights load). |
+| `hybrid/kimi_k3/state_tier.py` | Worker-side store/load driver for the state tier, one single-worker lane each. A load is submitted and joined by the request's own load task, so both legs run concurrently and report one completion. Reports store results and per-load hash verdicts for the engine-side `StateOffloadIndex` to apply. |
 | `atom_lmcache_staging.py` | Per-thread CUDA streams, staging buffer, ready/free events, env helpers. |
 | `mp/connector.py` | Capability-selected public `lmcache_mp` worker/scheduler shells. |
 | `mp/deployment.py` | LMCache MP configuration, topology, model namespace and server adapters. |
@@ -113,7 +114,7 @@ Four rules carry the module:
 
 The engine-side counterpart of the state tier lives outside this directory:
 `atom/model_engine/state_offload.py` holds `StateOffloadIndex`, which applies the
-store/finished/failed hash sets that `hybrid/kimi_k3/state_tier.py` reports back,
+store results and load hash verdicts that `hybrid/kimi_k3/state_tier.py` reports back,
 so a later prefix hit knows which checkpoints the CPU tier can actually serve.
 
 ## LMCache Multiprocess (`lmcache_mp`)

@@ -149,6 +149,39 @@ class TestSlotOwnership:
         assert index.released == [5]
         index.check_invariant()
 
+    def test_a_readmitted_requests_reports_cannot_settle_its_old_orphan(self):
+        """Reports are keyed by request id, which names the request, not the
+        admission. Left under that id, an earlier admission's orphan would be
+        settled -- its slot released -- by the next admission's own KV
+        completion while the earlier load may still be writing the slot."""
+        index = _index(1, 2)
+        index.request_load("r", 1, slot=5)
+        assert index.orphan("r", 5) is True
+
+        index.detach_orphan("r")  # the request is admitted again
+        index.complete_load("r")  # ...and its own KV-only load completes
+        assert index.released == [], "the old destination was handed out"
+        assert index.outstanding == 1
+        assert (
+            index.request_load("r", 2, slot=9) is False
+        ), "no second state load while the old one may still report"
+        index.check_invariant()
+
+        for entry in index._outstanding.values():
+            entry.at -= 3600.0
+        assert index.reclaim(timeout_s=1.0) == 1
+        assert index.released == [5]
+        assert index.request_load("r", 2, slot=9) is True
+        index.check_invariant()
+
+    def test_detaching_leaves_a_live_load_alone(self):
+        index = _index(1)
+        index.request_load("r", 1, slot=5)
+        index.detach_orphan("r")
+        index.complete_load("r")
+        assert index.outstanding == 0
+        index.check_invariant()
+
     def test_reclaim_frees_only_an_orphan_whose_report_never_came(self):
         index = _index(1, 2)
         index.request_load("live", 1, slot=5)
@@ -384,6 +417,59 @@ class TestARefusedKvLegSettlesItsStateLoad:
         index.check_invariant()
 
 
+class TestAStateLegNoLoadCarriesIsGivenBack:
+    """Under `kv_connector: multi` a P/D sub can win the KV leg. The request
+    then parks on that sub's report alone, and without this it resumes over a
+    state slot nothing restored -- silent wrong output."""
+
+    @staticmethod
+    def _scheduler(index, carries):
+        from types import SimpleNamespace
+
+        from atom.model_engine.scheduler import Scheduler
+
+        sched = object.__new__(Scheduler)
+        sched.block_manager = SimpleNamespace(
+            state_offload=index, disown_claimed_prefix=lambda seq: True
+        )
+        sched.kv_connector = SimpleNamespace(carries_state_load=lambda seq: carries)
+        return sched
+
+    @staticmethod
+    def _seq():
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            id="r1",
+            num_cached_tokens=512,
+            offload_joint=SimpleNamespace(
+                load_hash=7, boundary_tokens=512, boundary_hash=3
+            ),
+        )
+
+    def test_an_uncarried_state_leg_is_abandoned_and_its_boundary_disowned(self):
+        index = _index(7)
+        index.request_load("r1", 7, slot=0)
+        seq = self._seq()
+
+        assert self._scheduler(index, carries=False)._release_uncarried_state_load(seq)
+        assert index.outstanding == 0 and index.loads_abandoned == 1
+        assert seq.offload_joint.load_hash == -1
+        assert seq.num_cached_tokens == 0
+        assert (seq.offload_joint.boundary_tokens, seq.offload_joint.boundary_hash) == (
+            0,
+            -1,
+        )
+        index.check_invariant()
+
+    def test_a_carried_state_leg_is_left_alone(self):
+        index = _index(7)
+        index.request_load("r1", 7, slot=0)
+        seq = self._seq()
+        assert self._scheduler(index, carries=True)._release_uncarried_state_load(seq)
+        assert index.outstanding == 1 and seq.offload_joint.load_hash == 7
+
+
 class TestTwoOffloadSubsAreUnrepresentable:
     """`multi_connector.py` leans on this refusal in three separate comments --
     the tier's bytes and completions ride one connector's worker half, so two
@@ -435,3 +521,60 @@ class TestTwoOffloadSubsAreUnrepresentable:
         sub, why = _offload_subconfig(self._cfg("moriio"))
         assert sub is None
         assert "no offload connector" in why
+
+
+def test_a_multi_spelled_as_an_alias_still_unwraps_the_offload_sub():
+    """The canonical-name comparison has to cover `multi` too: an alias spelling
+    took the non-multi branch, never unwrapped the offload sub, and read the
+    composite as a connector that hosts no tier."""
+    from types import SimpleNamespace
+
+    from atom.model_engine.state_offload import state_tier_capability
+
+    subs = [{"kv_connector": "lmcache_offload", "kv_role": "offload"}]
+    plain = SimpleNamespace(
+        kv_transfer_config={"kv_connector": "multi", "connectors": subs}
+    )
+    alias = SimpleNamespace(
+        kv_transfer_config={"kv_connector": "  MULTI ", "connectors": subs}
+    )
+    assert state_tier_capability(alias).reason == state_tier_capability(plain).reason
+
+
+def test_only_an_unknown_name_reads_as_no_connector(monkeypatch):
+    """Anything but the registry's own `ValueError` must surface: read as "",
+    it turns the offload silently inert for every name."""
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+    from atom.model_engine.state_offload import _canonical_connector
+
+    assert _canonical_connector("no_such_connector") == ""
+    assert _canonical_connector(None) == ""
+
+    def _broken(cls, value, **_kw):
+        raise AttributeError("registry not ready")
+
+    monkeypatch.setattr(KVConnectorFactory, "canonical_name", classmethod(_broken))
+    with pytest.raises(AttributeError):
+        _canonical_connector("lmcache_offload")
+
+
+def test_only_a_state_leg_can_need_a_park_the_lookup_did_not_ask_for():
+    """`should_park_for_load_after_alloc` mutates the pending load, so a
+    sequence the lookup did not park and that has no state leg must not reach
+    it."""
+    from types import SimpleNamespace
+
+    from atom.model_engine.scheduler import Scheduler
+
+    asked = []
+    sched = object.__new__(Scheduler)
+    sched.kv_connector = SimpleNamespace(
+        should_park_for_load_after_alloc=lambda seq: asked.append(seq) or True
+    )
+    plain = SimpleNamespace(offload_joint=SimpleNamespace(load_hash=-1))
+    assert sched._confirm_remote_load_after_alloc(plain, False) is False
+    assert asked == []
+
+    stateful = SimpleNamespace(offload_joint=SimpleNamespace(load_hash=7))
+    assert sched._confirm_remote_load_after_alloc(stateful, False) is True
+    assert asked == [stateful]

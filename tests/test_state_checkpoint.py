@@ -1401,6 +1401,9 @@ class TestPagedCopyCheckpoint:
             self.requested = []
             self.orphan_load_slots_reclaimed = 0
 
+        def detach_orphan(self, req_id):
+            pass
+
         def could_serve(self, h):
             return h in self.hashes
 
@@ -3573,6 +3576,9 @@ class TestPagedAllocateAimsTheStateLegAtTheJointBoundary:
             self.orphan_load_slots_reclaimed = 0
             self.can_store = True
             self.can_load = True
+
+        def detach_orphan(self, req_id):
+            pass
 
         def could_serve(self, h):
             return self.can_load and h in self.hashes

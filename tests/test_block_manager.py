@@ -986,6 +986,29 @@ def test_pipeline_parallelism_hosts_no_state_tier(monkeypatch):
     assert "pipeline_parallel_size=2" in bm.state_tier_capability.reason
 
 
+def test_the_engine_refuses_a_state_tier_under_pp_before_workers_exist():
+    """Refused where a raise reports: the engine process, before a worker is
+    spawned. A worker only finds out in `register_kv_caches`, after the weights
+    load, where a raise wedges startup instead."""
+    from atom.model_engine.state_offload import refuse_state_tier_under_pp
+
+    cfg = MockConfig(enable_prefix_caching=True, kv_transfer_config=_OFFLOAD_KVC)
+    cfg.pipeline_parallel_size = 2
+    with pytest.raises(ValueError, match="pipeline_parallel_size=2"):
+        refuse_state_tier_under_pp(cfg)
+
+    cfg.pipeline_parallel_size = 1
+    refuse_state_tier_under_pp(cfg)
+
+    # PP with an offload that hosts no state tier (a dense layout) is fine.
+    dense = MockConfig(
+        enable_prefix_caching=True,
+        kv_transfer_config={**_OFFLOAD_KVC, "offload_layout": "dense"},
+    )
+    dense.pipeline_parallel_size = 2
+    refuse_state_tier_under_pp(dense)
+
+
 def test_a_producer_role_stores_but_never_votes_for_a_load(monkeypatch):
     bm = _bm_with_state_tier(monkeypatch, {**_OFFLOAD_KVC, "kv_role": "kv_producer"})
     assert bm.state_offload is not None

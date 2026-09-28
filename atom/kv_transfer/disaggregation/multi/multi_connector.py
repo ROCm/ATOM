@@ -102,7 +102,7 @@ def _build_subconnectors(config: Any, role: str) -> list:
                 f"connectors[{i}] must be a dict with a 'kv_connector' key, "
                 f"got {sub!r}"
             )
-        if sub["kv_connector"] == "multi":
+        if KVConnectorFactory.canonical_name(sub["kv_connector"]) == "multi":
             raise ValueError("multi connector cannot nest another 'multi'")
         cfg_i = copy.copy(config)
         cfg_i.kv_transfer_config = sub
@@ -397,6 +397,27 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         """
         return self._load_winner.get(getattr(seq, "id", None))
 
+    def carries_state_load(self, seq: Any) -> bool:
+        """Whether the sub that owns this request's load also carries its state.
+
+        The state leg can only ride a load of the tier sub. When another sub --
+        a P/D connector -- won the KV arbitration, the tier sub's load was
+        cancelled and nothing will restore the state, while the scheduler still
+        parks on the winner's report and would resume over an unfilled slot.
+        With no KV owner the load, if any, is state-only and the tier sub
+        carries it (`_state_only_carrier`).
+        """
+        owner = self._load_owner(seq)
+        return owner is None or owner is self._state_tier_sub()
+
+    def take_undispatched_loads(self) -> set:
+        dropped: set = set()
+        for c in self._connectors:
+            fn = getattr(c, "take_undispatched_loads", None)
+            if callable(fn):
+                dropped |= fn()
+        return dropped
+
     def _state_only_carrier(self, seq: Any):
         """The tier sub, when `seq` has a state load and no KV load owner.
 
@@ -476,6 +497,15 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         sid = getattr(seq, "id", None)
         if winner is not None:
             self._load_winner[sid] = winner
+            # Read by the tier sub's state arm (`KimiK3OffloadScheduler.
+            # update_state_after_alloc`), which the cancel below cannot reach,
+            # so it is set only when the tier sub is among the losers. Set here,
+            # per arbitration, rather than by every sub's generic
+            # `cancel_pending_load`, which also runs on paths with no
+            # arbitration to lose (abort, plugin preemption).
+            tier_sub = self._state_tier_sub()
+            if tier_sub is not None and winner is not tier_sub:
+                seq.offload_load_cancelled = True
             for c in self._connectors:
                 if c is not winner:
                     fn = getattr(c, "cancel_pending_load", None)

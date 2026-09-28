@@ -9,6 +9,7 @@ import threading
 import time
 import types
 from collections import deque
+from concurrent.futures import Future
 from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
@@ -5886,6 +5887,7 @@ def _k3_scheduler() -> KimiK3OffloadScheduler:
     s._save_rr_last = None
     s._pending_state_stores = []
     s._state_load_seqs = {}
+    s._state_only_loads = {}
     s._state_load_missed = set()
     s._save_inflight_since = {}
     s._save_stalled = False
@@ -6846,48 +6848,28 @@ def _k3_worker(*, tier=True) -> KimiK3OffloadConnector:
     return c
 
 
-def test_pipeline_parallelism_is_refused_loudly_not_warned_about(monkeypatch):
-    """A warning here is not enough. The engine independently declines the tier
-    under PP, and with no tier a K3 request's KV leg is declined too -- so the
-    offload is inert while its operator believes it is on. One warning line
-    among thousands is not how that gets noticed."""
+def test_a_worker_turns_the_tier_off_under_pp_rather_than_raising(caplog):
+    """The engine refuses this configuration before any worker exists
+    (`refuse_state_tier_under_pp`). A worker raise would land in
+    `register_kv_caches`, after the weights load, and wedge startup."""
     c = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
     c._config = SimpleNamespace(pipeline_parallel_size=2)
-    with pytest.raises(ValueError, match="pipeline_parallel_size=2"):
-        c._build_state_tier(SimpleNamespace(state_backend=None))
-
-
-def test_a_single_stage_still_builds_the_tier_path(monkeypatch, caplog):
-    """The refusal must key on PP, not on being called at all: pp_size 1 has to
-    fall through to the ordinary backend checks.
-
-    Asserts the function REACHED the backend check, not merely that the tier is
-    off afterwards: the previous version set `_state_tier = None` and then
-    asserted it was None, so replacing the whole body with `return` kept it
-    green -- it proved nothing about the pp gate falling through. The pp>1 arm
-    is asserted alongside it so the two are pinned by one test.
-    """
-    c = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
-    c._config = SimpleNamespace(pipeline_parallel_size=1)
-    c._state_tier = None
-    # No backend published -> the tier declines quietly, which is the normal
-    # non-K3-backend path and must NOT raise...
     with caplog.at_level(logging.WARNING):
         c._build_state_tier(SimpleNamespace(state_backend=None))
     assert c._state_tier is None
-    # ...but it must have got far enough to SAY so. A body replaced by `return`
-    # leaves this empty.
-    assert any(
-        "tier off" in r.message or "backend" in r.message.lower()
-        for r in caplog.records
-    ), f"pp_size=1 never reached the backend check; logged {caplog.records}"
+    assert any("pipeline" in r.message for r in caplog.records)
 
-    # The other arm of the same gate: pp>1 is the one fatal refusal.
-    c2 = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
-    c2._config = SimpleNamespace(pipeline_parallel_size=2)
-    c2._state_tier = None
-    with pytest.raises(ValueError, match="pipeline"):
-        c2._build_state_tier(SimpleNamespace(state_backend=None))
+
+def test_a_single_stage_still_builds_the_tier_path(caplog):
+    """The PP gate must fall through at pp_size 1: the builder has to reach the
+    backend check and say why the tier is off, not stop at the gate."""
+    c = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
+    c._config = SimpleNamespace(pipeline_parallel_size=1)
+    with caplog.at_level(logging.WARNING):
+        c._build_state_tier(SimpleNamespace(state_backend=None))
+    assert c._state_tier is None
+    assert any("backend" in r.message.lower() for r in caplog.records)
+    assert not any("pipeline" in r.message for r in caplog.records)
 
 
 def _k3_load_req(req_id: str, *, state: bool = True, generation: int = 0):
@@ -6911,7 +6893,6 @@ def _k3_load_req(req_id: str, *, state: bool = True, generation: int = 0):
                 boundary_tokens=256,
                 boundary_hash=99,
                 destination_slot=3,
-                chunk_tokens=256,
             )
             if state
             else None
@@ -6931,12 +6912,24 @@ class _FakeTier:
         # on a path where it was already False -- the branch was unpinned and
         # every assertion still passed.
         self.neutral: list = []
+        self.keys: list = []
 
     def load_state(self, h, slot, req_id="r") -> bool:
         self.calls.append((h, slot))
         if isinstance(self.ok, Exception):
             raise self.ok
         return self.ok
+
+    def submit_load(self, h, slot, key):
+        self.keys.append((h, key))
+        # Runs the leg now and hands back its settled future, which is what the
+        # real single-worker lane gives the joining KV task.
+        fut = Future()
+        try:
+            fut.set_result(self.load_state(h, slot, key))
+        except Exception as exc:  # noqa: BLE001 -- the future carries it
+            fut.set_exception(exc)
+        return fut
 
     def note_load_unrun(self, h, req_id) -> None:
         self.neutral.append((h, req_id))
@@ -6959,10 +6952,14 @@ class TestOneDispatchEmitsOneCompletion:
         assert failed == set()
         assert tier.calls == [(99, 3)]
 
-    def test_a_failed_kv_leg_never_runs_the_state_leg(self, monkeypatch, caplog):
-        """State at the boundary is the history of exactly the prefix the KV leg
-        was asked to complete, so restoring it over KV that never arrived would
-        resume on a history the request does not hold."""
+    def test_a_failed_kv_leg_fails_the_load_the_state_leg_ran_beside(
+        self, monkeypatch, caplog
+    ):
+        """The legs run concurrently, so the state leg has already run when the
+        KV leg fails. The load still fails -- the request recomputes from 0 and
+        never reads the state it restored -- and the leg reports its own real
+        verdict, never a neutral one written ahead of it: a drain between the
+        two would tombstone the key and drop the real verdict."""
         tier = _FakeTier(True)
         worker = _k3_worker(tier=tier)
         monkeypatch.setattr(
@@ -6972,14 +6969,39 @@ class TestOneDispatchEmitsOneCompletion:
             done, failed = self._run(worker, _k3_load_req("r1"))
         assert done == set()
         assert failed == {LoadOperationId("r1", 0)}
-        assert tier.calls == [], "the state leg ran over KV that never arrived"
-        # ...and this rank still reported on the verdict key, or the TP quorum
-        # for it would never be reached and the hash could never be retracted.
-        assert tier.neutral == [(99, LoadOperationId("r1", 0))]
-        # Nothing was swallowed on the way: a raise into `_do_load_req`'s
-        # `except` would land here and would otherwise be invisible, because it
-        # only sets `ok = False` on a path where it is already False.
+        assert tier.calls == [(99, 3)]
+        assert tier.neutral == []
+        # Nothing was swallowed on the way into `_do_load_req`'s `except`.
         assert not [r for r in caplog.records if "load failed" in r.message]
+
+    def test_the_state_leg_lands_before_the_load_reports(self, monkeypatch):
+        """Reporting while the state H2D is still in flight would let the
+        request resume -- or recompute -- over a slot the tier is still
+        writing."""
+        events = []
+        pending = Future()
+
+        class _SlowTier(_FakeTier):
+            def submit_load(self, h, slot, key):
+                events.append("submit")
+                return pending
+
+        worker = _k3_worker(tier=_SlowTier(True))
+
+        def _kv(s, r):
+            events.append("kv")
+            pending.set_result(True)
+            events.append("state landed")
+            return True
+
+        monkeypatch.setattr(KimiK3OffloadConnector, "_load_kv_bytes", _kv)
+        monkeypatch.setattr(
+            KimiK3OffloadConnector,
+            "_finish_load",
+            lambda s, r, ok: events.append(("report", ok)),
+        )
+        worker._do_load_req(_k3_load_req("r1"))
+        assert events == ["submit", "kv", "state landed", ("report", True)]
 
     def test_a_boundary_the_kv_leg_does_not_cover_is_refused(self, monkeypatch):
         """The state image is the compressed history of `[0, boundary_tokens)`,
@@ -7018,6 +7040,9 @@ class TestOneDispatchEmitsOneCompletion:
         assert done == set()
         assert failed == {LoadOperationId("bad", 0)}
         assert tier.calls == []
+        # A refused leg still reports on its key, neutrally, or the TP quorum
+        # for it would never be reached.
+        assert tier.neutral == [(99, LoadOperationId("bad", 0))]
 
     def test_a_failed_state_leg_fails_the_whole_load(self, monkeypatch):
         worker = _k3_worker(tier=_FakeTier(False))
@@ -7096,98 +7121,105 @@ def test_only_a_state_get_miss_is_advertised_to_the_engine():
     assert s.take_state_reports() == (set(), set())
 
 
-def test_a_state_only_load_travels_the_ordinary_load_path():
-    """KV resident, recurrent state not. The lookup found nothing extra, so
-    dense armed no load spec; without a no-op one the request would park on a
-    transfer with no carrier -- which is what previously forced a second channel
-    and a park to reconcile two reports."""
+def _k3_state_only_scheduler(monkeypatch, lookups):
+    """A K3 scheduler with the dense base stubbed down to its bookkeeping."""
     s = _k3_scheduler()
     s._do_load = True
     s._load_specs = {}
     s._reqs_need_recv = {}
-    s._hit_save_floors = {}
-    s._load_lifecycles = {}
     s._handoff_loads = set()
     s._load_save_floors = {}
-    s._lookup_in_step = []
-    s._min_load_tokens = 0
+    s._hit_save_floors = {}
+    s._load_nonce = 0
+    # A lookup would mean the state-only load went through the KV pin check.
+    s._lookup_client = SimpleNamespace(
+        lookup=lambda *a, **k: lookups.append(a) or 0,
+        clear_lookup_status=lambda _sid: None,
+    )
+    monkeypatch.setattr(
+        DenseOffloadScheduler, "update_state_after_alloc", lambda self, seq: None
+    )
+    monkeypatch.setattr(
+        DenseOffloadScheduler,
+        "build_connector_meta",
+        lambda self: LMCacheOffloadMetadata(),
+    )
+    return s
+
+
+def test_a_state_only_load_travels_as_a_request_of_its_own(monkeypatch):
+    """KV resident up to the boundary, recurrent state in the tier. It parks,
+    and the next build emits a request with a state leg and NO KV leg: not a
+    sentinel KV spec, which the shared KV path then had to special-case, and
+    not the resident prompt, which went to every rank for a leg that moves
+    zero KV bytes. A KV spec the lookup left behind is dropped."""
+    lookups = []
+    s = _k3_state_only_scheduler(monkeypatch, lookups)
+    s._load_specs["r1"] = LoadSpec(512, 1024, can_load=True, transfer_end_tokens=1280)
+    s._reqs_need_recv["r1"] = object()
     seq = SimpleNamespace(
         id="r1",
         state_slot=4,
-        num_cached_tokens=512,
-        has_per_req_cache=True,
-        offload_joint=OffloadJointRecord(load_hash=99, boundary_tokens=512),
-    )
-
-    s.update_state_after_alloc(seq)
-
-    ls = s._load_specs["r1"]
-    assert (ls.hbm_cached_tokens, ls.lmcache_cached_tokens, ls.can_load) == (
-        512,
-        512,
-        True,
-    )
-    assert s._reqs_need_recv["r1"] is seq
-    assert s._state_load_seqs["r1"] is seq
-    # The base park predicate must see it, so the request waits for its state.
-    assert s.should_park_for_load_after_alloc(seq) is True
-
-
-def test_a_state_only_load_is_not_dropped_by_the_build_time_pin_check():
-    """HBM can hold more of the prefix than the KV tier does: here 1024 tokens
-    are resident, the tier's KV covers 768, and the state boundary is 768. The
-    state-only load moves no KV, but the build step re-takes the lookup pin for
-    every load it dispatches (`_ensure_lookup_pin`) and drops the load when the
-    tier holds less than the spec promises. Aimed at the HBM length, that check
-    dropped a load whose request was already parked -- and nothing would ever
-    report on it. The spec reused from the lookup also carried a full-prompt
-    transport end, which is a read past HBM unless the state-only branch clears
-    it."""
-    s = _k3_scheduler()
-    lookups = []
-    s._lookup_client = SimpleNamespace(
-        lookup=lambda *a, **k: lookups.append(a) or 768,
-        clear_lookup_status=lambda _sid: None,
-    )
-    s._lookup_results = {}  # a remembered hit: no live pin to fall back on
-    seq = SimpleNamespace(
-        id="r1",
         num_cached_tokens=1024,
         has_per_req_cache=True,
         offload_joint=OffloadJointRecord(load_hash=99, boundary_tokens=768),
     )
-    ls = LoadSpec(
-        hbm_cached_tokens=0,
-        lmcache_cached_tokens=768,
-        can_load=True,
-        transfer_end_tokens=1280,
+
+    s.update_state_after_alloc(seq)
+    assert s.should_park_for_load_after_alloc(seq) is True
+    assert "r1" not in s._load_specs and "r1" not in s._reqs_need_recv
+    assert seq.offload_loaded_tokens == 1024
+
+    [req] = s.build_connector_meta().requests
+    assert req.load_spec is None
+    assert (req.token_ids, req.block_ids) == ([], [])
+    assert req.load_operation == LoadOperationId("r1", 0)
+    assert s._active_load_operations["r1"] == (seq, LoadOperationId("r1", 0))
+    assert req.state_load_spec == StateLoadSpec(
+        boundary_tokens=768, boundary_hash=99, destination_slot=4
     )
-
-    should_load, reason, *_ = s._decide_load_after_alloc(seq, ls)
-    assert (should_load, reason) == (True, "state_only_load")
-    assert s._ensure_lookup_pin(seq, "r1", ls) is True
-    assert lookups == [], "a spec that reads nothing needs no pin re-taken"
+    assert lookups == [], "a state-only load must not pass the KV pin check"
+    # Emitted once.
+    assert s.build_connector_meta().requests == []
 
 
-def test_a_load_that_reads_the_tier_still_has_its_pin_confirmed():
-    """The no-op exemption is only for specs that move nothing. A KV load past
-    HBM still asks the tier, and is still dropped if the tier lost it."""
-    s = _k3_scheduler()
-    s._lookup_client = SimpleNamespace(
-        lookup=lambda *a, **k: 512,
-        clear_lookup_status=lambda _sid: None,
+def test_a_state_only_load_the_composite_withdrew_does_not_park(monkeypatch):
+    s = _k3_state_only_scheduler(monkeypatch, [])
+    seq = SimpleNamespace(
+        id="r1",
+        state_slot=4,
+        num_cached_tokens=1024,
+        has_per_req_cache=True,
+        offload_joint=OffloadJointRecord(load_hash=99, boundary_tokens=768),
+        offload_load_cancelled=True,
     )
-    s._lookup_results = {}
-    s._lookup_in_step = []
-    s._load_specs = {}
-    s._reqs_need_recv = {}
-    s._handoff_loads = set()
-    s._load_save_floors = {}
-    s._hit_save_floors = {}
-    s._tier_hit_memo = {}
-    seq = SimpleNamespace(id="r1", num_prompt_tokens=2048, token_ids=[0] * 2048)
-    ls = LoadSpec(hbm_cached_tokens=256, lmcache_cached_tokens=1024, can_load=True)
-    assert s._ensure_lookup_pin(seq, "r1", ls) is False
+    s.update_state_after_alloc(seq)
+    assert s.should_park_for_load_after_alloc(seq) is False
+    assert s.build_connector_meta().requests == []
+
+
+def test_the_worker_runs_a_request_with_only_a_state_leg():
+    """`start_load_kv` used to dispatch on `load_spec is not None` alone."""
+    worker = _k3_worker(tier=_FakeTier(True))
+    req = _k3_load_req("r1")
+    req.load_spec = None
+    assert worker._loads(req) is True
+    worker._do_load_req(req)
+    assert worker._done_load == {LoadOperationId("r1", 0)}
+
+
+def test_a_failed_state_only_load_marks_no_kv_block_as_errored():
+    """Only the state leg can have failed; the resident KV is valid and may be
+    shared, so naming a block of it would truncate another request too."""
+    worker = _k3_worker(tier=_FakeTier(False))
+    worker._failed_load_blocks = set()
+    worker.virtual_block_size = 64
+    req = _k3_load_req("r1")
+    req.load_spec = None
+    req.block_ids = [10, 11, 12]
+    worker._do_load_req(req)
+    assert worker._failed_load == {LoadOperationId("r1", 0)}
+    assert worker._failed_load_blocks == set()
 
 
 def test_each_load_generation_reports_its_state_verdict_under_its_own_key():
@@ -7197,17 +7229,12 @@ def test_each_load_generation_reports_its_state_verdict_under_its_own_key():
     dropped as already seen -- the hash would stay advertised."""
     first = _k3_load_req("r1", generation=0)
     second = _k3_load_req("r1", generation=1)
-    k1 = KimiK3OffloadConnector._state_verdict_key(first)
-    k2 = KimiK3OffloadConnector._state_verdict_key(second)
-    assert k1 != k2
-    assert k1 == LoadOperationId("r1", 0)
-    # A producer that attaches no operation falls back to the request id.
-    assert (
-        KimiK3OffloadConnector._state_verdict_key(
-            SimpleNamespace(req_id=7, load_operation=None)
-        )
-        == "7"
-    )
+    tier = _FakeTier(True)
+    worker = _k3_worker(tier=tier)
+    worker._submit_state_leg(first).result()
+    worker._submit_state_leg(second).result()
+    keys = [key for (_h, key) in tier.keys]
+    assert keys == [LoadOperationId("r1", 0), LoadOperationId("r1", 1)]
 
 
 def test_the_state_leg_is_attached_to_the_requests_own_metadata(monkeypatch):
@@ -7245,7 +7272,6 @@ def test_the_state_leg_is_attached_to_the_requests_own_metadata(monkeypatch):
         boundary_tokens=512,
         boundary_hash=99,
         destination_slot=4,
-        chunk_tokens=256,
     )
 
 
@@ -7279,13 +7305,10 @@ def test_a_losing_sub_does_not_rearm_the_state_leg_after_a_cancel(monkeypatch):
 
     s.update_state_after_alloc(_seq(True))
     assert "r1" not in s._state_load_seqs
-    assert s._load_specs.get("r1") is None
-    assert "r1" not in s._reqs_need_recv
 
     # ...and the gate is the cancellation, not the arm being broken outright.
     s.update_state_after_alloc(_seq(False))
     assert "r1" in s._state_load_seqs
-    assert s._load_specs["r1"].can_load is True
 
 
 def test_a_save_only_request_never_carries_a_state_leg(monkeypatch):
@@ -7562,27 +7585,39 @@ class TestStateLoadsNeverQueueBehindStores:
             codec.gate.set()
             tier.shutdown()
 
-    def test_a_rank_whose_kv_leg_failed_still_reports_on_the_verdict_key(self):
-        """The KV leg's verdict is rank-local (`ret_mask.all()` over this rank's
-        own LMCache LRU), so one rank short-circuiting before the state leg left
-        the verdict key one report short of quorum -- and `drain` skips an
-        incomplete key with a bare `continue`, with no TTL and no eviction, so
-        it sat there for the process lifetime: a leaked `_reports` entry and a
-        hash the index could never retract.
+    def test_a_submitted_load_runs_on_its_own_lane_past_a_stuck_store(self):
+        """The KV load task joins the state leg, so a state leg queued behind a
+        store -- or on the shared KV load pool -- would hold every other
+        request's KV retrieve too."""
+        codec = self._BlockingCodec()
+        tier = self._tier(codec)
+        try:
+            tier.submit_store(StateStoreOperationId(0, 1), (0,))
+            deadline = time.monotonic() + 5
+            while not codec.entered.is_set() and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert codec.entered.is_set(), "no store ever entered the codec"
+            assert tier.submit_load(77, 0, "r0").result(timeout=5) is True
+            assert not codec.gate.is_set()
+        finally:
+            codec.gate.set()
+            tier.shutdown()
 
-        Neutral, not a miss: this rank never asked, so it holds no evidence that
-        LMCache dropped the bytes. The quorum is failure-dominant, so a real
-        miss on any other rank still retracts.
-        """
+    def test_a_refused_state_leg_still_reports_on_the_verdict_key(self):
+        """The TP quorum acts only on a key every rank reported, and `drain`
+        skips an incomplete key with no TTL, so a rank that refuses the leg and
+        stays silent leaves the key one report short forever -- a leaked entry
+        and a hash the index can never retract. Neutral, not a miss: this rank
+        never asked, so it holds no evidence LMCache dropped the bytes."""
         c = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
         c._state_tier = self._tier(self._BlockingCodec.__new__(self._BlockingCodec))
         try:
-            req = SimpleNamespace(
-                req_id="r7",
-                state_load_spec=SimpleNamespace(boundary_hash=99),
-            )
-            c._note_state_leg_unrun(req)
-            assert c._state_tier.take_hash_verdicts() == {(99, "r7"): True}
+            req = _k3_load_req("r7")
+            req.state_load_spec = replace(req.state_load_spec, destination_slot=-1)
+            assert c._submit_state_leg(req) is None
+            assert c._state_tier.take_hash_verdicts() == {
+                (99, LoadOperationId("r7", 0)): True
+            }
         finally:
             c._state_tier.shutdown()
 

@@ -25,6 +25,7 @@ from atom.model_engine.sequence import (
     get_exit_sequence,
     new_block_table,
 )
+from atom.model_engine.state_offload import refuse_state_tier_under_pp
 from atom.model_engine.state_runtime import StateRuntime
 from atom.utils import (
     engine_process_name,
@@ -108,6 +109,9 @@ class EngineCore:
         self.mark_trace = getattr(config, "mark_trace", False)
         init_exit_handler(self)
         self._init_data_parallel(config)
+        # Before any worker exists: a worker refusing the same config only finds
+        # out in `register_kv_caches`, after the weights load, and wedges.
+        refuse_state_tier_under_pp(config)
 
         # Initialize model runner processes
         try:

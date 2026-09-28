@@ -2314,6 +2314,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             if not self._ensure_lookup_pin(seq, sid, ls):
                 self._mark_load_skip(seq, "tier_lost_prefix", hbm, lmc, need, chunk)
                 self._clear_pending_load(sid)
+                self._drop_undispatched_load(seq)
                 continue
             slot_load_spec = None
             if bool(getattr(seq, "has_per_req_cache", False)):
@@ -2759,6 +2760,9 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
 
     def request_finished(self, seq) -> None:
         sid = str(seq.id)
+        # A caller that never drains the dropped-load set (the vLLM plugin) must
+        # not accumulate it for the life of the process.
+        self._forget_undispatched_load(seq.id)
         self._release_failed_load_attempt(sid, seq)
         self._forget_tier_hit(sid)
         if self._load_lifecycles.get(sid) is seq:

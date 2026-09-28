@@ -616,6 +616,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if not self._ensure_lookup_pin(seq, sid, ls):
                 self._mark_load_skip(seq, "tier_lost_prefix", hbm, lmc, need, chunk)
                 self._clear_pending_load(sid)
+                self._drop_undispatched_load(seq)
                 continue
             # num_cached after load = max(HBM, offload); never drop below HBM.
             # The scheduler needs the physical load floor to publish the
@@ -1261,16 +1262,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         # the one loading the request right now, not that the tier stopped
         # holding the prefix, so re-answering from it is honest. The tier is
         # asked again before anything is transferred (`_ensure_lookup_pin`).
-        # Marked on the SEQUENCE, not in a scheduler-side set. Under
-        # `kv_connector: multi` the composite cancels every sub that did not win
-        # `get_num_new_matched_tokens`, and a losing sub must not re-arm from a
-        # source the cancel cannot reach (`seq.offload_joint`, which the engine
-        # owns). The flag lives exactly as long as the request does, so nothing
-        # has to clean it up, and `request_finished` keeps the attribute set a
-        # duck-typed stub must carry -- the vLLM plugin drives that method with
-        # a `SeqView` namespace. Same pattern as `seq.kv_async_tagged` and
-        # `seq._load_operation`.
-        seq.offload_load_cancelled = True
         self._clear_pending_load(sid)
         active = self._active_load_operations.get(sid)
         if active is not None and active[0] is seq:
@@ -1312,6 +1303,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
     def request_finished(self, seq) -> None:
         sid = str(seq.id)
+        # A caller that never drains the dropped-load set (the vLLM plugin) must
+        # not accumulate it for the life of the process.
+        self._forget_undispatched_load(seq.id)
         if self._load_lifecycles.get(sid) is seq:
             self._clear_pending_load(sid)
             active = self._active_load_operations.get(sid)

@@ -186,11 +186,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
     def start_load_kv(self, metadata) -> None:
         if not isinstance(metadata, LMCacheOffloadMetadata):
             return
-        load_requests = [
-            req
-            for req in metadata.requests
-            if req.load_spec is not None and self._do_load
-        ]
+        load_requests = [req for req in metadata.requests if self._loads(req)]
         loading_lookup_ids = {str(req.req_id) for req in load_requests}
         for lookup_id in metadata.lookup_requests_in_step:
             if str(lookup_id) not in loading_lookup_ids:
@@ -200,7 +196,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         for req in metadata.requests:
             # The futures are tracked, not discarded: `wait_for_requests` fences
             # them when vLLM preempts a request and reuses its blocks.
-            if req.load_spec is not None and self._do_load:
+            if self._loads(req):
                 self._track_job(
                     req.req_id,
                     self._load_executor.submit(
@@ -311,22 +307,36 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         """
         self._finish_load(req, self._load_kv_bytes(req))
 
+    def _loads(self, req: LMCacheReqMeta) -> bool:
+        """Whether this request carries a load for this worker to run.
+
+        A KV leg, or a recurrent-state leg on its own: a hybrid whose KV is
+        resident in HBM still needs its state restored, and that request has
+        no `load_spec` at all rather than a sentinel one.
+        """
+        return self._do_load and (
+            req.load_spec is not None
+            or getattr(req, "state_load_spec", None) is not None
+        )
+
     def _load_kv_bytes(self, req: LMCacheReqMeta) -> bool:
         """Move the KV bytes. Reports nothing -- that is `_finish_load`.
 
         Returns True when the request's KV is where it should be, including
-        the no-op case where HBM already covers the lookup.
+        the no-op cases where HBM already covers the lookup or the request
+        carries no KV leg.
         """
         ls = req.load_spec
-        assert ls is not None
+        if ls is None:
+            return True
         hbm = int(ls.hbm_cached_tokens)
         lmc = int(ls.lmcache_cached_tokens)
-        toks = req.token_ids[:lmc]
-        t_total0 = time.perf_counter()
         if lmc <= hbm:
             # Nothing to fetch: HBM already covers the lookup. Still a
             # success -- the request has the KV it asked for.
             return True
+        toks = req.token_ids[:lmc]
+        t_total0 = time.perf_counter()
         chunk_size = int(self.chunk_size or 256)
         if hbm % chunk_size != 0:
             logger.warning(

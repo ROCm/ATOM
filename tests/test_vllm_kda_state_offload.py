@@ -1164,3 +1164,16 @@ def test_stats_name_every_reason_a_boundary_was_not_stored():
         "cap_declined",
     ):
         assert name in stats
+
+
+def test_a_failed_kda_load_retracts_the_hash():
+    """`on_load_result(ok=False)` is the KDA leg's own verdict, not a joint one,
+    so it is evidence the bytes are gone. The index defaults a failure to "not
+    a miss", and without `missing=True` the plugin path never retracted a hash:
+    every later request over that prefix parked, missed and recomputed."""
+    planner = make_planner()
+    index = planner._index
+    index.note_stored(4242)
+    assert index.request_load("r1", 4242)
+    planner.on_load_result("r1", False)
+    assert not index.could_serve(4242)

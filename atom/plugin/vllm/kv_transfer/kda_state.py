@@ -775,7 +775,10 @@ class KdaBoundaryPlanner:
         if ok:
             self._index.complete_load(req_id)
         else:
-            self._index.fail_load(req_id)
+            # `ok` is the KDA leg's own verdict (the caller's `state_failed`),
+            # not a joint one, so a failure here is evidence the bytes are gone
+            # and the index must stop advertising them.
+            self._index.fail_load(req_id, missing=True)
 
     def forget_pending(self, req_id: str) -> None:
         self._index.abandon_load(req_id)

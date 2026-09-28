@@ -141,21 +141,15 @@ class NativeStateTransfer:
 class StateLoadSpec:
     """Identity and destination for one request's recurrent-state restore.
 
-    Rides the request's `LMCacheReqMeta` rather than a side list, so the state
-    leg runs inside the KV leg's own task and one dispatch produces exactly one
-    completion.
-
-    `chunk_tokens` travels with the spec because the engine floors the joint
-    boundary against the LMCache chunk grid and the worker validates the
-    transfer against it. Deriving that number twice lets the two sides disagree
-    about where the boundary is, which is silent wrong output rather than an
-    error anyone would see.
+    Rides the request's `LMCacheReqMeta` rather than a side list, so one
+    dispatch produces exactly one completion for both legs. A state-only
+    request carries this and no `load_spec`. The worker checks
+    `boundary_tokens` against the KV leg's coverage when there is one.
     """
 
     boundary_tokens: int
     boundary_hash: int
     destination_slot: int
-    chunk_tokens: int
 
 
 @dataclass

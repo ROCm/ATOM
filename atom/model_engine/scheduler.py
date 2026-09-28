@@ -1539,6 +1539,7 @@ class Scheduler:
         as long as it fires, and nothing would fail — the log would just go
         quiet, which is indistinguishable from an idle engine.
         """
+        self._fail_undispatched_loads()
         result = self._schedule()
         self._record_throughput(num_prompt_tokens=_prompt_tokens_of(result))
         return result
@@ -1873,25 +1874,10 @@ class Scheduler:
             )
 
             if needs_remote_load:
-                # NOT guarded here on `load_hash != -1 and not boundary_tokens`.
-                # The merge base was, and restoring that guard was wrong twice
-                # over: it calls `BlockManager.cancel_state_load`, which this
-                # branch deleted, and its predicate is exactly the fused
-                # STATE-ONLY shape -- at the merge base that shape returned
-                # `False` from `_decide_load_after_alloc` and never reached
-                # here, while the fused path returns True, so the guard would
-                # drop every state-only load, which is the capability this
-                # branch exists to add.
-                #
-                # What the guard was actually for -- two transfers reporting
-                # once -- cannot happen while ONE connector owns both legs: a
-                # state-only load moves no KV (`_load_kv_bytes` is a no-op
-                # success) and reports once. It can happen under
-                # `kv_connector: multi`, where a PD sub wins the KV leg and
-                # `_update_waiting_for_remote_kv` unparks on that sub's report
-                # alone. That is a pre-existing scheduler-wide gap -- the unpark
-                # takes no state-leg predicate at the merge base either -- and
-                # is tracked separately rather than patched K3-shaped here.
+                if not self._release_uncarried_state_load(seq):
+                    self.block_manager.deallocate(seq)
+                    self.waiting.appendleft(seq)
+                    break
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 self._inflight_prefix_wait.pop(seq.id, None)
                 continue
@@ -2690,9 +2676,71 @@ class Scheduler:
         exactly those requests running a forward with their state still in
         flight.
         """
+        if not needs_remote_load and seq.offload_joint.load_hash == -1:
+            # Only a state leg armed during allocation can need a park the
+            # lookup did not ask for; `should_park_for_load_after_alloc` mutates
+            # the pending load, so nothing else is sent through it.
+            return False
         if hasattr(self.kv_connector, "should_park_for_load_after_alloc"):
             return self.kv_connector.should_park_for_load_after_alloc(seq)
         return needs_remote_load
+
+    def _connector_carries_state_load(self, seq: Sequence) -> bool:
+        """Whether the connector that owns this request's load restores its
+        recurrent state too. Only a composite can answer no."""
+        callback = getattr(self.kv_connector, "carries_state_load", None)
+        return bool(callback(seq)) if callable(callback) else True
+
+    def _release_uncarried_state_load(self, seq: Sequence) -> bool:
+        """Drop a state leg the load this request parks on will not carry.
+
+        Under `kv_connector: multi` a P/D sub can win the KV leg, and only the
+        tier sub carries a state leg. Parked on the winner's report alone, the
+        request would resume over a state slot nothing restored. Give the state
+        load back and disown its boundary; the request still waits for the
+        winner's KV. False when the disown cannot be backed -- the caller then
+        abandons this admission rather than resume over a shared prefix.
+        """
+        if seq.offload_joint.load_hash == -1 or self._connector_carries_state_load(seq):
+            return True
+        logger.warning(
+            "seq %s: its KV load belongs to a connector that carries no state "
+            "leg; dropping the state load and recomputing the recurrent state.",
+            seq.id,
+        )
+        if not self._drop_state_load(seq):
+            return False
+        seq.num_cached_tokens = 0
+        seq.offload_joint.boundary_tokens = 0
+        seq.offload_joint.boundary_hash = -1
+        return True
+
+    def _fail_undispatched_loads(self) -> None:
+        """Fail parked loads that were dropped before reaching a worker.
+
+        A parked request is woken only by a report, and a load dropped while
+        the metadata was built produces none (`take_undispatched_loads`). Each
+        is failed as if the worker had failed it: the request recomputes. An
+        abandon on the state index, not a failure -- nothing was attempted, so
+        it says nothing about the bytes.
+        """
+        take = getattr(self.kv_connector, "take_undispatched_loads", None)
+        if not callable(take):
+            return
+        offload = self._state_offload()
+        for req_id in take():
+            logger.warning(
+                "Offload load for request %s was dropped before dispatch; "
+                "falling back to prefill.",
+                req_id,
+            )
+            if metrics := getattr(self, "metrics", None):
+                metrics.finish_kv_wait(req_id, succeeded=False)
+            if offload is not None:
+                offload.abandon_load(req_id)
+            if self._finish_aborted_load_cleanup(req_id):
+                continue
+            self.failed_recving_kv_req_ids.append(req_id)
 
     def _state_offload(self):
         """The engine-side state index, or None. It is the sole owner of a
@@ -3763,6 +3811,7 @@ class Scheduler:
         * ``finished_sending``: releases the producer's send ownership; blocks
           remain deferred while the connector still has offload work.
         """
+        self._fail_undispatched_loads()
         if kv_connector_output is None:
             return
 
@@ -3916,13 +3965,15 @@ class Scheduler:
             # `BlockPool` invariant -- so zeroing the count restores the record
             # exactly.
             bm.reclaim_stale_state_store_pins(self._save_abandon_timeout_s())
+        if offload is not None:
             # Load-side twin of the same defence: `deallocate` hands a slot to
             # the index when it tears down a request whose state load is still in
             # flight, on the promise that the load's one report will give it
             # back. A crashed worker or dropped completion breaks that promise
             # and the slot sits off the free list forever, wedging
             # `can_allocate`'s state gate. Same window, same "cannot tell lost
-            # from slow" caveat as the pins.
+            # from slow" caveat as the pins. Outside the store-report guard: it
+            # does not depend on the store channel.
             offload.reclaim(self._save_abandon_timeout_s())
 
     def get_request_counts(self) -> tuple[int, int]:

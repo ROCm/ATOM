@@ -33,6 +33,18 @@ class _OutstandingLoad:
     orphaned: bool = False
 
 
+@dataclass(frozen=True)
+class _DetachedOrphan:
+    """Key of an orphaned load whose request id is live again.
+
+    No request id equals it, so no completion report can settle the entry;
+    only `reclaim` can.
+    """
+
+    req_id: object
+    nonce: int
+
+
 class StateOffloadIndex:
     """What is believed to be in LMCache, and what is being fetched back.
 
@@ -93,6 +105,9 @@ class StateOffloadIndex:
         # reports on the same `finished_loading`/`failed_loading` channel its KV
         # leg does, in exactly one completion per dispatch.
         self._outstanding: dict = {}
+        # req_id -> how many of its orphans are held under `_DetachedOrphan`.
+        self._detached: dict = {}
+        self._detach_nonce = 0
         self.dispatched = 0
         self.settled = 0
         self.loads_completed = 0
@@ -133,7 +148,11 @@ class StateOffloadIndex:
         made a backend outage quadratic exactly when the engine most needs to
         drain.
         """
-        return {req_id: p.prefix_hash for req_id, p in self._outstanding.items()}
+        return {
+            req_id: p.prefix_hash
+            for req_id, p in self._outstanding.items()
+            if not isinstance(req_id, _DetachedOrphan)
+        }
 
     def hash_of(self, req_id) -> int | None:
         """The prefix hash of `req_id`'s in-flight load, or None."""
@@ -281,7 +300,7 @@ class StateOffloadIndex:
             # for either parks the request against a report that never comes;
             # refuse so the boundary is disowned and recomputed.
             return False
-        if req_id in self._outstanding:
+        if req_id in self._outstanding or req_id in self._detached:
             # One request, one outstanding load: reports are keyed by request
             # id, so the first completion would settle the second load's slot,
             # and an orphaned first entry would be overwritten and lost to
@@ -329,6 +348,24 @@ class StateOffloadIndex:
         # this index, exactly as the deleted `_orphan_load_slots` stamped it.
         pending.at = monotonic()
         return True
+
+    def detach_orphan(self, req_id) -> None:
+        """The request is being admitted again; move its orphan out of reach.
+
+        Reports are keyed by request id, which names the request, not the
+        admission. Left under that id, the orphan of an earlier admission would
+        be settled by this admission's own KV completion -- releasing its slot
+        while the earlier load may still be writing it. Detached, it is
+        released only by `reclaim`, and `request_load` refuses this request a
+        second state load until then.
+        """
+        pending = self._outstanding.get(req_id)
+        if pending is None or not pending.orphaned:
+            return
+        del self._outstanding[req_id]
+        self._outstanding[_DetachedOrphan(req_id, self._detach_nonce)] = pending
+        self._detach_nonce += 1
+        self._detached[req_id] = self._detached.get(req_id, 0) + 1
 
     def complete_load(self, req_id) -> None:
         """The bytes landed in the request's slot.
@@ -382,6 +419,12 @@ class StateOffloadIndex:
         pending = self._outstanding.pop(req_id, None)
         if pending is None:
             return None
+        if isinstance(req_id, _DetachedOrphan):
+            left = self._detached[req_id.req_id] - 1
+            if left:
+                self._detached[req_id.req_id] = left
+            else:
+                del self._detached[req_id.req_id]
         self.settled += 1
         if pending.orphaned and self._release_slot is not None:
             self._release_slot(pending.slot)
@@ -571,6 +614,29 @@ class _SubConnectorView:
         return getattr(self._config, name)
 
 
+def refuse_state_tier_under_pp(config) -> None:
+    """Refuse, at engine start, a state tier the configuration asks for under PP.
+
+    The tier cannot run under pipeline parallelism (`CacheEngineKey` has no PP
+    component), and with it off a hybrid request's KV leg is declined too, so
+    the offload would be inert while the operator believes it is on. Checked in
+    the engine process before any worker is spawned: raised from a worker, the
+    same refusal lands after the weights load and wedges startup instead.
+    """
+    pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
+    if pp_size <= 1:
+        return
+    if _state_tier_capability(config, check_pp=False).hosts_state_tier:
+        raise ValueError(
+            "LMCache offload: the recurrent-state tier does not support "
+            f"pipeline parallelism (pipeline_parallel_size={pp_size}). The "
+            "LMCache key carries no PP component, so two stages at one TP rank "
+            "would overwrite each other's state images, and without the tier a "
+            "hybrid model's KV offload is inert too. Run with "
+            "pipeline_parallel_size=1, or disable KV offload."
+        )
+
+
 def state_tier_capability(config) -> StateTierCapability:
     """What the worker will do for the state tier, decided from config alone.
 
@@ -589,6 +655,10 @@ def state_tier_capability(config) -> StateTierCapability:
     costs reuse, on-against-a-worker-that-refuses parks requests against loads
     nobody can report.
     """
+    return _state_tier_capability(config, check_pp=True)
+
+
+def _state_tier_capability(config, *, check_pp: bool) -> StateTierCapability:
     from atom.kv_transfer.offload.config import select_offload_layout
 
     none = StateTierCapability(False, False, "")
@@ -598,7 +668,7 @@ def state_tier_capability(config) -> StateTierCapability:
 
     name = cfg.get("kv_connector", "moriio")
     layout_config = config
-    if name == "multi":
+    if _canonical_connector(name) == "multi":
         sub, why = _offload_subconfig(cfg)
         if sub is None:
             return replace(none, reason=why)
@@ -615,7 +685,7 @@ def state_tier_capability(config) -> StateTierCapability:
     # The worker refuses PP outright: `CacheEngineKey` has no PP component, so
     # two stages at the same TP rank would overwrite each other's entries.
     pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
-    if pp_size > 1:
+    if check_pp and pp_size > 1:
         return replace(none, reason=f"pipeline_parallel_size={pp_size}")
 
     try:
@@ -659,7 +729,10 @@ def state_tier_chunk_tokens(config) -> int:
         # composite here read a zero chunk grid. Unwrap the sub the same way
         # `state_tier_capability` does, so the gate's chunk size and the tier
         # the capability check builds stay consistent.
-        if isinstance(kvcfg, dict) and kvcfg.get("kv_connector") == "multi":
+        if (
+            isinstance(kvcfg, dict)
+            and _canonical_connector(kvcfg.get("kv_connector")) == "multi"
+        ):
             sub, _why = _offload_subconfig(kvcfg)
             if sub is not None:
                 kvcfg = sub
@@ -706,7 +779,10 @@ def _canonical_connector(value: object) -> str:
 
     try:
         return KVConnectorFactory.canonical_name(value)
-    except Exception:  # noqa: BLE001 -- unknown name; construction reports it
-        # Not a name the registry knows. Construction will fail later with a
-        # better message than this probe could give.
+    except ValueError:
+        # Not a name the registry knows (or not a name at all). Construction
+        # fails later with a better message than this probe could give. Only
+        # `ValueError`: anything else -- a registry not yet populated, a renamed
+        # classmethod -- would otherwise read as "no tier" for every name and
+        # turn the offload silently inert.
         return ""

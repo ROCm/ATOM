@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
 """Worker-side store and load driver for the state offload tier.
 
-The store leg runs on its own executor so a checkpoint's D2H never blocks the
-engine thread. The load leg does not: `load_state` runs synchronously on the KV
-load task that called it, which is what fuses the two legs of one request into a
-single dispatch and a single completion.
+Each leg has its own single-worker executor. A store is off the TTFT path and
+must not block the engine thread; a load is submitted by the KV load task of the
+same request (`submit_load`) and joined by it, so the two legs of one request
+run concurrently yet still end in a single completion. One worker per leg also
+bounds the standing GPU staging to two buffers: `StagedTransfer` keeps one per
+thread that ever runs a transfer.
 
 This class **reports, and the engine applies**: `StateOffloadIndex` lives in the
 engine process, so `take_store_reports`/`take_hash_verdicts` hand their sets to
@@ -31,11 +33,14 @@ class StateOffloadTier:
 
     def __init__(self, codec, *, max_workers: int = 1) -> None:
         self.codec = codec
-        # Only the store leg is queued. A store is off the TTFT critical path
-        # and must not run on the engine thread; a load IS the critical path and
-        # runs inline on the KV load task, so it can never queue behind a store.
         self._store_executor = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="lmc-state-store"
+        )
+        # Its own lane, never the KV load pool: a state `get` can reach the
+        # disk backend and end in a blocking synchronize, and on the shared
+        # pool it would hold up every other request's KV retrieve.
+        self._load_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="lmc-state-load"
         )
         self._lock = threading.Lock()
         # (hash, load_key) -> whether its `get` produced bytes, drained by
@@ -114,12 +119,20 @@ class StateOffloadTier:
             self._store_submitted_at[op] = monotonic()
         self._register(self._store_executor.submit(self._do_store, op, unit_ids))
 
-    def load_state(self, prefix_hash: int, slot: int, load_key: Hashable) -> bool:
-        """Fetch `prefix_hash` into pool slot `slot`. Synchronous, no report.
+    def submit_load(self, prefix_hash: int, slot: int, load_key: Hashable):
+        """Run `load_state` on the state lane; the caller joins the future.
 
-        Runs on the caller's thread -- the KV load task that owns this request --
-        so the two legs of one load are one dispatch with one completion, and
-        the state leg cannot queue behind a store.
+        The KV load task submits this before moving its own bytes and waits on
+        it after, so a joint load costs the longer leg rather than the sum, and
+        the request still reports once.
+        """
+        return self._load_executor.submit(self.load_state, prefix_hash, slot, load_key)
+
+    def load_state(self, prefix_hash: int, slot: int, load_key: Hashable) -> bool:
+        """Fetch `prefix_hash` into pool slot `slot`. No completion report.
+
+        Records the hash verdict for `load_key` -- the one thing a load reports
+        on its own -- and returns whether the bytes landed.
 
         A miss is a normal path, not an error: LMCache's LRU can drop bytes
         under a hash the engine's index still advertises. Raising here would
@@ -143,12 +156,13 @@ class StateOffloadTier:
     def note_load_unrun(self, prefix_hash: int, load_key: Hashable) -> None:
         """Record a neutral verdict for a state leg this rank never ran.
 
-        The TP quorum acts only on a key EVERY rank reported, and a rank whose
-        KV leg failed short-circuits before the state leg -- so without this the
-        key stalls one report short forever. Neutral, not a miss: only a `get`
-        that came back empty is evidence LMCache dropped the bytes. The same
-        failure-dominant merge as `load_state`, so this can never overwrite a
-        real miss recorded for the same key by a retry in this window.
+        The TP quorum acts only on a key EVERY rank reported, so a rank that
+        refused the leg (bad slot, no coverage) or raised before submitting it
+        must still report, or the key stalls one short forever. Neutral, not a
+        miss: only a `get` that came back empty is evidence LMCache dropped the
+        bytes. Called only on those paths, never ahead of a leg that is about
+        to run: a drain in between would publish this, the aggregator would
+        tombstone the key on quorum, and the real verdict would be dropped.
         """
         key = (int(prefix_hash), load_key)
         with self._lock:
@@ -178,6 +192,7 @@ class StateOffloadTier:
             fut.result()
 
     def shutdown(self) -> None:
+        self._load_executor.shutdown(wait=True)
         self._store_executor.shutdown(wait=True)
 
     def _do_store(self, op, unit_ids) -> None:

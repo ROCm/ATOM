@@ -1006,6 +1006,10 @@ class BlockManager:
         requeue the seq rather than run a forward over shared blocks.
         """
         assert not seq.block_table
+        if self.state_offload is not None and seq.has_per_req_cache:
+            # A re-admission: an orphan its earlier admission left must not be
+            # settled by this admission's reports.
+            self.state_offload.detach_orphan(seq.id)
         # Two extents, and they are not the same number. `num_cached_blocks` is
         # what the request may call cached -- it needs a resumable state behind
         # it. `claim_blocks` is what it may point its block table at: every

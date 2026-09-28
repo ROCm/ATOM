@@ -331,12 +331,15 @@ def test_losing_offload_sub_load_is_cancelled_when_another_sub_wins():
     """
     moriio = FakeSchedSub(is_producer=True, match=(5, True))
     off = FakeSchedSub(is_offload=True, offload_methods=True, match=(4, True))
-    seq = object()
+    seq = SimpleNamespace(id="s1")
     sched = _sched([moriio, off])
 
     assert sched.get_num_new_matched_tokens(seq) == (5, True)  # moriio wins
     assert off.cancelled == [seq]  # its armed load was undone
     assert off.pending_load is False
+    # ...and the tier sub's state arm is told, since the cancel cannot reach
+    # `seq.offload_joint`.
+    assert seq.offload_load_cancelled is True
 
 
 def test_winning_offload_sub_keeps_its_load():
@@ -482,6 +485,31 @@ def test_a_new_arbitration_clears_the_previous_ones_cancel():
 
     assert sched.get_num_new_matched_tokens(seq) == (4, True)
     assert seq.offload_load_cancelled is False
+
+
+def test_the_state_leg_is_carried_only_by_the_tier_subs_load():
+    """A P/D sub that wins the KV leg carries no state leg, so the scheduler
+    must drop the state load rather than resume on the winner's report alone
+    over a slot nothing restored. With no KV owner, the tier sub carries a
+    state-only load."""
+    moriio = FakeSchedSub(is_producer=True, match=(5, True))
+    k3 = FakeSchedSub(
+        is_offload=True, offload_methods=True, has_state_tier=True, match=(4, True)
+    )
+    sched = _sched([moriio, k3])
+
+    pd_won = SimpleNamespace(id="s20")
+    assert sched.get_num_new_matched_tokens(pd_won) == (5, True)
+    assert sched.carries_state_load(pd_won) is False
+
+    k3_only = _sched([FakeSchedSub(is_producer=True), k3])
+    k3_won = SimpleNamespace(id="s21")
+    assert k3_only.get_num_new_matched_tokens(k3_won) == (4, True)
+    assert k3_only.carries_state_load(k3_won) is True
+    assert getattr(k3_won, "offload_load_cancelled", False) is False
+
+    # No KV owner at all: whatever load there is, is state-only.
+    assert sched.carries_state_load(SimpleNamespace(id="s22")) is True
 
 
 def test_process_completions_reaches_the_offload_sub():

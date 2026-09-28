@@ -11,32 +11,27 @@ CPU tier for that state: same paged-KV path, one extra leg.
 from __future__ import annotations
 
 import logging
-import os
 import time
 
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
+    LoadOperationId,
     StateStoreOperationId,
 )
-from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._offload_common import (
     _SAVE_ABANDON_MARGIN_S,
     StateOffloadFace,
     max_pending_saves,
     offload_save_abandon_timeout_s,
-    pp_aware_rank_and_world,
 )
 from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
     DenseOffloadScheduler,
 )
-from atom.kv_transfer.offload.hybrid.kimi_k3.staging import StagedTransfer
-from atom.kv_transfer.offload.hybrid.kimi_k3.state_object import StateByteCodec
-from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import StateOffloadTier
+from atom.kv_transfer.offload.hybrid.kimi_k3.tier_builder import build_state_tier
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
-    LoadSpec,
     StateLoadSpec,
 )
 from atom.utils import envs
@@ -61,7 +56,7 @@ STATE_SOURCE_CHANNEL = "k3_state_source"
 #: load's verdict. The key is `("state_load", hash, load_key)` -- a plain
 #: hashable tuple, which is what `ConnectorCompletion.operation_id` and the TP
 #: aggregator's key require. `load_key` is the load's exact generation
-#: (`_state_verdict_key`) because the aggregator tombstones every
+#: (`_load_completion_id`) because the aggregator tombstones every
 #: connector-completion key it takes quorum on; see `take_hash_verdicts`.
 STATE_LOAD_VERDICT_TAG = "state_load"
 
@@ -122,9 +117,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
 
         The tier's store/load threads copy PAGE units out of the KV pool. Draining
         first lets an in-flight transfer finish against a pool that is still
-        mapped; `shutdown` then joins the tier's store executor -- the only one
-        it still owns, since the load leg now runs inline on the KV load task.
-        Only after that
+        mapped; `shutdown` then joins the tier's executors. Only after that
         does the base close its save/load pools. Guarded because the tier is
         `None` until `register_kv_caches` builds it (and stays `None` under PP or
         on a non-owning layout).
@@ -143,139 +136,8 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
 
     # -- tier construction -------------------------------------------------
     def _build_state_tier(self, transfer_tensors) -> None:
-        # The config refusals come first, and deliberately above the aiter
-        # import: whether this configuration can host a tier at all is decided
-        # by config alone, so it must not depend on a GPU library being
-        # importable -- otherwise the refusal cannot be reached, or tested, on a
-        # CPU runner.
-        # PP breaks the tier: the CacheEngineKey has no PP component, so two
-        # stages at the same TP rank would overwrite each other. Refused rather
-        # than half-supported. Paged KV is unaffected.
-        pp_size = int(getattr(self._config, "pipeline_parallel_size", 1) or 1)
-        if pp_size > 1:
-            # Refused loudly rather than warned about. `CacheEngineKey` carries
-            # no PP component, so two stages at one TP rank would overwrite each
-            # other's state images. The engine agrees independently
-            # (`state_tier_capability`), so both legs of a K3 request are then
-            # declined and the offload does nothing at all -- a server started
-            # with `--kv-transfer-config` and `pp_size > 1` would serve at
-            # baseline speed while its operator believed offload was on, and one
-            # warning line among thousands is not how that gets noticed.
-            raise ValueError(
-                "kimi_k3 offload: the recurrent-state tier does not support "
-                f"pipeline parallelism (pipeline_parallel_size={pp_size}). The "
-                "LMCache key carries no PP component, so two stages at one TP "
-                "rank would overwrite each other's state images, and with the "
-                "tier off a K3 request's KV leg is declined too -- the offload "
-                "would be inert. Run with pipeline_parallel_size=1, or drop "
-                "--kv-transfer-config."
-            )
-
-        backend = getattr(transfer_tensors, "state_backend", None)
-        if backend is None:
-            logger.warning(
-                "kimi_k3 offload: no attention backend published; state tier off."
-            )
-            return
-        # The geometry the bytes are written under, folded into every key so a
-        # changed build cannot read another's images. Read from the runtime, not
-        # recomputed, so HBM and CPU sides share one owner of the string.
-        spec = getattr(getattr(backend, "model_runner", None), "state_runtime", None)
-        spec = getattr(spec, "checkpoint_spec", None)
-        layout_id = getattr(spec, "layout_id", None)
-        if not layout_id:
-            logger.warning(
-                "kimi_k3 offload: no checkpoint layout id published; state tier "
-                "off. Without it a build that changed the state geometry could "
-                "read another's images back as valid."
-            )
-            return
-        try:
-            views = backend.state_entry_views(0)
-            entry_bytes = sum(int(v.numel()) * v.element_size() for v in views)
-        except (NotImplementedError, AttributeError):
-            # No per-request state on this backend. IndexError is deliberately
-            # not caught: a zero-entry pool with the tier on is a sizing bug.
-            logger.warning(
-                "kimi_k3 offload: %s owns no per-request state views; tier off.",
-                type(backend).__name__,
-            )
-            return
-
-        # The store reads `page_unit_views`, a *different* method than the load's
-        # `state_entry_views` (validated above). A backend with one but not the
-        # other would build the tier, pass every load, then AttributeError on the
-        # first store -- which the tier's blind `except` masks as an endlessly
-        # "failed" store. Probe it here so the mismatch fails fast and visibly.
-        if not callable(getattr(backend, "page_unit_views", None)):
-            logger.warning(
-                "kimi_k3 offload: %s has state_entry_views but no callable "
-                "page_unit_views; the store path needs it, so a tier would fail "
-                "every store silently. State tier off.",
-                type(backend).__name__,
-            )
-            return
-
-        # The store reads PAGE units and the load writes an Active Slot, so the
-        # blob must be the same length both ways (equal for K3: a checkpoint
-        # covers the whole slot). A model where they differ would truncate the
-        # store or over-read the load -- checked here, where both are in scope.
-        image_bytes = int(getattr(spec, "image_bytes", 0) or 0)
-        if image_bytes and image_bytes != entry_bytes:
-            logger.warning(
-                "kimi_k3 offload: a checkpoint image is %d B but an Active Slot "
-                "is %d B; the store reads units and the load writes a slot, so "
-                "they must match. State tier off.",
-                image_bytes,
-                entry_bytes,
-            )
-            return
-
-        # Imported here, at its one use site: everything above is a refusal
-        # decidable without a GPU library.
-        from aiter.dist.parallel_state import get_tp_group
-
-        tp = get_tp_group()
-        rank, world = pp_aware_rank_and_world(self._config, tp)
-        cfg = offcfg.build_lmcache_config(
-            getattr(self._config, "kv_transfer_config", None)
-        )
-        meta = offcfg.build_lmcache_metadata(self._config, cfg, world, rank)
-
-        # One flat entry, packed on the tier's own `lmc-state` thread. Sized to
-        # the entry rather than shared with the KV staging buffer, which is
-        # sized in LMCache chunks and is routinely an order of magnitude smaller.
-        gpu_connector = self._engine.gpu_connector
-        staged = StagedTransfer(
-            gpu_connector.device,
-            staging_buffer_bytes=entry_bytes,
-            release_after_transfer=gpu_connector.release_gpu_staging_after_transfer,
-        )
-        codec = StateByteCodec(
-            backend,
-            staged,
-            entry_bytes,
-            model_name=meta.model_name,
-            world_size=world,
-            worker_id=rank,
-            layout_id=layout_id,
-            max_cache_bytes=int(
-                float(os.environ.get("OFFLOAD_STATE_CPU_SIZE", "32")) * (1 << 30)
-            ),
-        )
-        # Share the allocator, but cap state retention separately so old
-        # checkpoints cannot consume nearly the whole paged-KV CPU pool.
-        codec.bind_storage_manager(self._engine.storage_manager)
-        # No index here: StateOffloadIndex lives in the engine process; both
-        # directions report and the engine applies.
-        self._state_tier = StateOffloadTier(codec)
-        logger.info(
-            "kimi_k3 offload: state tier up, entry=%.2f MiB rank=%d, "
-            "sharing the paged-KV CPU pool, max_state_entries=%d, layout=%s",
-            entry_bytes / (1 << 20),
-            rank,
-            codec._max_entries,
-            layout_id,
+        self._state_tier = build_state_tier(
+            self._config, getattr(self, "_engine", None), transfer_tensors
         )
 
     # -- per-step ----------------------------------------------------------
@@ -283,9 +145,9 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         """Dispatch this step's state stores, then let the base dispatch the
         loads.
 
-        Only the store half is here now: a request's state LOAD rides its
-        `LMCacheReqMeta` and runs inside the KV load task super() submits, so it
-        needs no dispatch of its own.
+        Only the store half is here: a request's state LOAD rides its
+        `LMCacheReqMeta`, and the load task super() dispatches for it submits
+        and joins the state leg itself (`_do_load_req`).
 
         `_start_state_stores` isolates each submit, but a raise escaping it
         would skip super() and drop every KV load and save this step, so it runs
@@ -301,137 +163,106 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
 
     # -- copy daemon thread ------------------------------------------------
     def _do_load_req(self, req: LMCacheReqMeta) -> None:
-        """Both legs of one request's load, in one task, with one completion.
+        """Both legs of one request's load, with one completion.
 
-        The state leg runs only if the KV leg landed: state at the boundary is
-        the compressed history of exactly the prefix the KV leg was asked to
-        complete, so restoring it over a prefix whose KV never arrived would
-        have the forward resume on a history it does not hold -- silent wrong
-        output rather than an error.
-
-        `_finish_load` is reached on every path including a raise out of either
-        leg, so one dispatch produces exactly one report whatever happens.
+        The state leg is submitted to the tier's own lane first and joined after
+        the KV leg, so a joint load costs the longer leg rather than the sum.
+        The join is on every path, a raise included: reporting before the state
+        H2D has landed would let the request resume, or recompute, over a slot
+        the tier is still writing. If the KV leg failed, the request recomputes
+        from 0 and never reads the state it restored, so running the legs
+        concurrently cannot resume a history that has no KV behind it.
         """
+        spec = req.state_load_spec
+        state = None
+        ok = False
         try:
-            if req.state_load_spec is not None:
-                # Armed BEFORE the KV leg, so every exit below is covered by
-                # construction -- the short-circuit, a raise out of either leg,
-                # and the normal path alike.
-                #
-                # The KV leg's verdict is RANK-LOCAL (`ret_mask.all()` over this
-                # rank's own LMCache instance and its own LRU), so a rank that
-                # skips the state leg while the others run it leaves the verdict
-                # key at `world_size - 1` reports. `_TPCompletionGroup.drain`
-                # skips an incomplete key with a bare `continue` -- no TTL, no
-                # eviction, and `reset` is never called on the serving path --
-                # so that key is immortal, and the hash it would have retracted
-                # is never retracted.
-                #
-                # Neutral rather than absent. Only a miss is evidence LMCache
-                # dropped the bytes, and a rank that never asked holds none. The
-                # merge in `note_load_unrun` is failure-dominant, so when the
-                # leg DOES run below, its real verdict overwrites this one.
-                self._note_state_leg_unrun(req)
+            if spec is not None:
+                state = self._submit_state_leg(req)
             ok = self._load_kv_bytes(req)
-            if ok and req.state_load_spec is not None:
-                ok = self._load_state_bytes(req)
         except Exception:
             logger.warning(
                 "kimi_k3 offload: load failed for req=%s", req.req_id, exc_info=True
             )
             ok = False
+        if spec is not None:
+            if state is None:
+                ok = False
+            else:
+                try:
+                    ok = bool(state.result()) and ok
+                except Exception:
+                    logger.warning(
+                        "kimi_k3 offload: state leg failed for req=%s",
+                        req.req_id,
+                        exc_info=True,
+                    )
+                    ok = False
         self._finish_load(req, ok)
 
-    def _note_state_leg_unrun(self, req: LMCacheReqMeta) -> None:
-        """Keep this rank in the quorum for a state leg it never ran.
+    def _submit_state_leg(self, req: LMCacheReqMeta):
+        """Hand the state leg to the tier, or refuse it; None when refused.
 
-        See `_do_load_req`. Silent when there is no tier: the tier IS the
-        verdict ledger, and with none built this rank reports on no key at all,
-        so there is no partial quorum to complete.
+        A refused leg still reports a verdict on its key: the TP quorum acts
+        only on a key every rank reported, and a rank that stays silent leaves
+        it one report short forever. Neutral, not a miss -- this rank never
+        asked, so it holds no evidence LMCache dropped the bytes -- and only on
+        this path, never ahead of a leg that is about to run (see
+        `StateOffloadTier.note_load_unrun`).
         """
-        tier = self._state_tier
-        if tier is None:
-            return
-        tier.note_load_unrun(
-            req.state_load_spec.boundary_hash, self._state_verdict_key(req)
-        )
-
-    def _load_state_bytes(self, req: LMCacheReqMeta) -> bool:
-        """Restore this request's recurrent state into the slot it was given."""
         spec = req.state_load_spec
         tier = self._state_tier
+        key = self._load_completion_id(req)
         if tier is None:
-            # Nothing on this rank can serve the leg, so the request must
-            # recompute. Passing the KV leg through as a success instead would
-            # have the engine count a state restore that never happened.
+            # No verdict ledger on this rank. It also never indexed a hash: its
+            # stores fail through `_store_failed_no_tier` and the store quorum
+            # is failure-dominant, so no load reaches here unless ranks disagree
+            # about building a tier, which the engine gate decides globally.
             logger.warning(
                 "kimi_k3 offload: no state tier on this rank; failing the load "
                 "for req=%s so it recomputes.",
                 req.req_id,
             )
-            return False
-        # The validation `StateLoadSpec`'s docstring promises -- but on the
-        # property that actually holds. An earlier version of this check
-        # demanded `boundary_tokens % chunk_tokens == 0`, which is simply false:
-        # `boundary_tokens` is a HASH-BLOCK position (`tokens = candidate * hbs`
-        # in `_joint_kv_boundary`, and every rung is a multiple of
-        # `hash_block_size` by construction), while the chunk-ceiling of it is a
-        # different field, `kv_tokens`. With the defaults -- hash_block_size 16,
-        # LMCACHE_CHUNK_SIZE 256 -- fifteen of every sixteen legal boundaries
-        # would have been refused, turning this feature off for most of its own
-        # traffic.
-        #
-        # What the two owners must agree on is COVERAGE: the state image is the
-        # compressed history of `[0, boundary_tokens)`, so the KV leg must have
-        # completed at least that far, or the forward resumes on a history it
-        # does not hold -- silent wrong output. Both engine paths establish it
-        # (`joint_state_and_kv` sets `lmcache_cached_tokens = kv_tokens >=
-        # boundary`; `state_only_load` sets it to `hbm`, and its branch
-        # condition is `boundary <= hbm`), and nothing on the worker re-checks
-        # it. Refused, not clamped: there is no safe reinterpretation of a
-        # boundary the two sides disagree about.
+            return None
+        try:
+            if not self._state_leg_valid(req):
+                tier.note_load_unrun(spec.boundary_hash, key)
+                return None
+            return tier.submit_load(spec.boundary_hash, int(spec.destination_slot), key)
+        except Exception:
+            tier.note_load_unrun(spec.boundary_hash, key)
+            raise
+
+    def _state_leg_valid(self, req: LMCacheReqMeta) -> bool:
+        """Refuse a leg the engine and worker disagree about; never clamp one.
+
+        Coverage: the state image is the history of `[0, boundary_tokens)`, so
+        a joint load's KV leg must complete at least that far. A state-only
+        request carries no KV leg; its prefix is resident by the engine's own
+        condition (`boundary <= num_cached_tokens`). And `seq.state_slot` is -1
+        once `state_slots` is empty, which `codec.get` would negative-index.
+        """
+        spec = req.state_load_spec
         ls = req.load_spec
-        covered = int(getattr(ls, "lmcache_cached_tokens", 0)) if ls else 0
-        if int(spec.boundary_tokens) > covered:
+        if ls is not None and int(spec.boundary_tokens) > int(ls.lmcache_cached_tokens):
             logger.error(
                 "kimi_k3 offload: req=%s state boundary %d is past the %d tokens "
                 "the KV leg covers; refusing the state leg so the request "
                 "recomputes.",
                 req.req_id,
                 spec.boundary_tokens,
-                covered,
+                ls.lmcache_cached_tokens,
             )
             return False
-        # `seq.state_slot` returns -1 once `state_slots` is empty, and
-        # `codec.get(h, -1)` would negative-index into the state pool. The
-        # snapshot is taken at metadata-build time and only incidentally
-        # covered downstream; check it where the value is used.
-        slot = int(spec.destination_slot)
-        if slot < 0:
+        if int(spec.destination_slot) < 0:
             logger.error(
                 "kimi_k3 offload: req=%s has no state slot (%d); refusing the "
                 "state leg so the request recomputes.",
                 req.req_id,
-                slot,
+                spec.destination_slot,
             )
             return False
-        return tier.load_state(spec.boundary_hash, slot, self._state_verdict_key(req))
-
-    @staticmethod
-    def _state_verdict_key(req: LMCacheReqMeta):
-        """The identity a state leg's verdict is reported under.
-
-        The exact load generation, not the request id: a request re-admitted
-        after a preempt that loads the same hash again would otherwise reuse its
-        first load's key, which the aggregator has already tombstoned, and its
-        miss would be dropped. `LoadOperationId` is scheduler-issued, so it is
-        identical on every rank. The request id is the fallback only for a
-        producer that attaches no operation.
-        """
-        operation = getattr(req, "load_operation", None)
-        if operation is not None:
-            return operation
-        return str(req.req_id)
+        return True
 
     def _start_state_stores(self, metadata) -> None:
         """Hand this step's ready checkpoints to the tier's executor.
@@ -520,7 +351,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         # aggregator tombstones every connector-completion key it takes quorum
         # on, and drops a report whose key is already tombstoned, so a bare hash
         # is reportable exactly once per process, and a bare request id once per
-        # request. `_state_verdict_key` is the same on every rank, so the quorum
+        # request. `_load_completion_id` is the same on every rank, so the quorum
         # is unchanged.
         for (h, load_key), ok in self._state_tier.take_hash_verdicts().items():
             out.connector_completions.add(
@@ -552,6 +383,10 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         # this step's metadata. Recorded at `update_state_after_alloc`, where
         # the pending load is visible, and consumed by `build_connector_meta`.
         self._state_load_seqs: dict[str, object] = {}
+        # sid -> seq for STATE-ONLY loads: KV resident up to the boundary, state
+        # in the tier. Recorded when the park is decided and emitted by the
+        # next `build_connector_meta` as a request of their own, with no KV leg.
+        self._state_only_loads: dict[str, object] = {}
         # Hashes whose state `get` missed on some rank. Drained by the engine,
         # which is the only owner of the index that advertises them.
         self._state_load_missed: set[int] = set()
@@ -583,37 +418,65 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         return True
 
     def update_state_after_alloc(self, seq) -> None:
-        """Base KV bookkeeping, plus arming this seq's state leg.
-
-        A STATE-ONLY load -- the KV is resident but the recurrent state is not --
-        gets a no-op `LoadSpec` here so it travels the ORDINARY load path: same
-        metadata, same worker task, same single completion. Giving it a path of
-        its own is what previously required a second channel and a park to
-        reconcile the two reports.
-        """
+        """Base KV bookkeeping, plus arming this seq's state leg."""
         super().update_state_after_alloc(seq)
         if not self._do_load:
             return
         joint = getattr(seq, "offload_joint", None)
         if joint is None or int(getattr(joint, "load_hash", -1)) == -1:
             return
-        sid = str(seq.id)
         if getattr(seq, "offload_load_cancelled", False):
-            # This sub lost `get_num_new_matched_tokens` and the composite
-            # withdrew its load. The state arm reads `seq.offload_joint`, which
-            # the engine owns and the cancel does not reach, so without this the
-            # leg re-arms anyway -- and the `_load_specs` guard below cannot
-            # stop it, because the cancel is exactly what emptied `_load_specs`.
-            # Re-arming puts a second writer into the winner's block table.
+            # Under `kv_connector: multi` this sub lost the KV arbitration and
+            # the composite withdrew its load. The state arm reads
+            # `seq.offload_joint`, which the engine owns and the cancel does not
+            # reach, so without this it would put a second writer into the
+            # winner's request. Whether the state leg then travels at all is the
+            # scheduler's call (`carries_state_load`).
             return
-        self._state_load_seqs[sid] = seq
-        if self._load_specs.get(sid) is not None:
-            return
-        hbm = int(getattr(seq, "num_cached_tokens", 0))
-        self._load_specs[sid] = LoadSpec(
-            hbm_cached_tokens=hbm, lmcache_cached_tokens=hbm, can_load=True
+        self._state_load_seqs[str(seq.id)] = seq
+
+    def _is_state_only(self, seq) -> bool:
+        """KV resident up to the state boundary; only the state is in the tier."""
+        joint = getattr(seq, "offload_joint", None)
+        return (
+            getattr(seq, "has_per_req_cache", False)
+            and joint is not None
+            and int(joint.load_hash) != -1
+            and int(joint.boundary_tokens or 0) <= int(seq.num_cached_tokens)
         )
-        self._reqs_need_recv[sid] = seq
+
+    def should_park_for_load_after_alloc(self, seq) -> bool:
+        """A state-only load parks on a request of its own, with no KV leg.
+
+        Expressing it as a no-op KV spec instead made the shared KV machinery
+        special-case it -- the build-time pin check, the transport end, the
+        load-error blocks -- and shipped the whole resident prompt to every rank
+        for a leg defined to move zero KV bytes.
+        """
+        if not (self._do_load and self._is_state_only(seq)):
+            return super().should_park_for_load_after_alloc(seq)
+        sid = str(seq.id)
+        if sid not in self._state_load_seqs:
+            # Never armed: a composite withdrew this sub's load.
+            return False
+        # A KV spec the lookup left behind would move nothing the boundary
+        # needs; its lookup id stays queued, so the dispatch still unpins it.
+        self._clear_pending_load(sid)
+        self._state_only_loads[sid] = seq
+        seq.offload_loaded_tokens = int(seq.num_cached_tokens)
+        return True
+
+    def _clear_pending_load(self, sid: str) -> None:
+        super()._clear_pending_load(sid)
+        self._state_only_loads.pop(sid, None)
+
+    def _state_load_spec(self, seq) -> StateLoadSpec:
+        joint = seq.offload_joint
+        return StateLoadSpec(
+            boundary_tokens=int(joint.boundary_tokens or 0),
+            boundary_hash=int(joint.load_hash),
+            destination_slot=int(seq.state_slot),
+        )
 
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         self._refresh_save_stall()
@@ -623,35 +486,40 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         # released.
         meta.state_stores = self._pending_state_stores
         self._pending_state_stores = []
-        # A post-pass over what the base built, not a fork of its builder loop:
-        # forking that loop is how a layout stops receiving dense's fixes.
+        # Joint loads: attach the state leg to the KV request dense built. A
+        # post-pass rather than a fork of dense's builder loop, which is how a
+        # layout stops receiving dense's fixes.
         for req in meta.requests:
             seq = self._state_load_seqs.pop(str(req.req_id), None)
-            if seq is None:
+            if seq is None or req.load_spec is None:
+                # No arm, or a save-only request, which `start_load_kv` gives no
+                # load task: a spec attached there would never travel.
                 continue
-            if req.load_spec is None:
-                # Save-only request: `start_load_kv` dispatches a load task only
-                # for `load_spec is not None`, so a spec attached here would
-                # never travel and its index entry would never settle. Today the
-                # scheduler has always cleared `load_hash` first on this path
-                # (`_drop_state_load`), so the `h == -1` check below catches it
-                # -- but that makes this loop's correctness depend on a field a
-                # different owner writes. Check the condition that actually
-                # matters, here.
+            if int(seq.offload_joint.load_hash) == -1:
                 continue
-            joint = seq.offload_joint
-            h = int(joint.load_hash)
-            if h == -1:
-                continue
-            req.state_load_spec = StateLoadSpec(
-                boundary_tokens=int(joint.boundary_tokens or 0),
-                boundary_hash=h,
-                destination_slot=int(seq.state_slot),
-                chunk_tokens=int(self.chunk_size or 0),
-            )
-        # Anything left never reached the metadata (its KV leg was refused after
-        # the arm), so drop it rather than attach it to a later step's request.
+            req.state_load_spec = self._state_load_spec(seq)
+        # Anything left never reached the metadata as a KV load. A parked joint
+        # load dropped there is reported by the base (`take_undispatched_loads`).
         self._state_load_seqs.clear()
+        # State-only loads: a request of their own, identified exactly like a
+        # KV load so the one completion settles it.
+        for sid, seq in self._state_only_loads.items():
+            if int(seq.offload_joint.load_hash) == -1:
+                continue
+            operation = LoadOperationId(seq.id, self._load_nonce)
+            self._load_nonce += 1
+            seq._load_operation = operation
+            self._active_load_operations[sid] = (seq, operation)
+            meta.add_request(
+                LMCacheReqMeta(
+                    req_id=seq.id,
+                    token_ids=[],
+                    block_ids=[],
+                    load_operation=operation,
+                    state_load_spec=self._state_load_spec(seq),
+                )
+            )
+        self._state_only_loads.clear()
         return meta
 
     def _may_emit_save(self) -> bool:
@@ -673,7 +541,11 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         goes False the step after the work is dispatched and never latches the
         busy loop.
         """
-        return super().has_pending_work() or bool(self._pending_state_stores)
+        return (
+            super().has_pending_work()
+            or bool(self._pending_state_stores)
+            or bool(self._state_only_loads)
+        )
 
     # -- save stall --------------------------------------------------------
     def _refresh_save_stall(self) -> None:
@@ -791,21 +663,6 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         lmc = int(ls.lmcache_cached_tokens)
         chunk = self.chunk_size or 256
         joint = int(seq.offload_joint.boundary_tokens or 0)
-        if joint <= hbm and int(seq.offload_joint.load_hash) != -1:
-            # State-only load: the KV covering the boundary is already resident,
-            # so the KV leg has nothing to move -- but it must still be emitted,
-            # because the state leg rides this request's metadata and travels in
-            # its task. `_load_kv_bytes` treats `lmc <= hbm` as the no-op
-            # success it is. Refusing here instead would clear the load spec,
-            # and the request would park on a transfer with no carrier.
-            ls.hbm_cached_tokens = hbm
-            ls.lmcache_cached_tokens = hbm
-            # A spec reused from the lookup may still carry the full-prompt
-            # transport end. Nothing is transferred, so nothing is read: clear
-            # it, or the build-time pin check (`_ensure_lookup_pin`) would see a
-            # read past HBM and drop the load of an already-parked request.
-            ls.transfer_end_tokens = None
-            return True, "state_only_load", hbm, hbm, 0, chunk
         if joint <= hbm:
             return False, "per_req_cache_state_boundary", hbm, lmc, lmc - hbm, chunk
         # Where the transfer starts -- NOT where the request may call itself

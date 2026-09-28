@@ -146,6 +146,34 @@ def test_loaded_prefix_can_publish_suffix_and_be_reused(
     assert following.num_cached_tokens == 24
 
 
+def test_a_parked_load_the_tier_lost_is_reported_rather_than_stranded(monkeypatch):
+    """The build step re-takes the lookup pin and drops a load whose prefix the
+    tier evicted since the request parked. A parked request is woken only by a
+    report, and a load that never reaches a worker produces none, so it waited
+    forever holding its blocks. The drop is now handed to the scheduler, which
+    fails it like any failed load: the request recomputes."""
+    scheduler = _scheduler(monkeypatch, "kv_consumer")
+    seq = _load_seq(61, num_prompt_tokens=24)
+    _arm_load(scheduler, seq, hbm=0, lmcache=16)
+    # A remembered hit carries no live pin, so the build asks the tier again.
+    scheduler._lookup_results.pop("61")
+    scheduler._lookup_client = SimpleNamespace(
+        lookup=lambda *_a, **_k: 8,  # evicted below what the spec promised
+        clear_lookup_status=lambda _sid: None,
+    )
+
+    meta = scheduler.build_connector_meta()
+    assert [r for r in meta.requests if r.load_spec is not None] == []
+    assert scheduler.take_undispatched_loads() == {61}
+    assert scheduler.take_undispatched_loads() == set()
+
+    engine = _engine_scheduler(scheduler)
+    scheduler._undispatched_loads.add(61)
+    engine._finish_aborted_load_cleanup = lambda _rid: False
+    engine._fail_undispatched_loads()
+    assert engine.failed_recving_kv_req_ids == [61]
+
+
 @pytest.mark.parametrize(
     "connector_cls", [DenseOffloadConnector, DenseOffloadScheduler]
 )
