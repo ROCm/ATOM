@@ -106,19 +106,13 @@ def dcp_staging_shape(config, page_bytes: int) -> tuple[int, int]:
     Keep one slot per send worker, reducing pages per chunk when the widest
     cache page would exceed the cap. Budgeting and allocation use this same
     shape so the runner reserves the actual pool size, not the configured cap.
-    ``dcp_staging_*`` options take precedence over legacy ``index_staging_*``
-    aliases when both names are configured.
     """
     slots = dcp_staging_pool_size(config)
     if not slots:
         return 0, 0
     connector = _producer_connectors(config, _DCP_STAGING_CONNECTORS)[0]
-    pages = connector.get(
-        "dcp_staging_chunk_pages", connector.get("index_staging_chunk_pages", 256)
-    )
-    max_bytes = connector.get(
-        "dcp_staging_max_bytes", connector.get("index_staging_max_bytes", 256 * 1024**2)
-    )
+    pages = connector.get("dcp_staging_chunk_pages", 256)
+    max_bytes = connector.get("dcp_staging_max_bytes", 256 * 1024**2)
     for name, value in (
         ("dcp_staging_chunk_pages", pages),
         ("dcp_staging_max_bytes", max_bytes),

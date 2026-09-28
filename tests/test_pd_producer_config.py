@@ -142,17 +142,13 @@ def test_dcp_staging_default_cap_bounds_mla_allocation(workers, token_bytes):
 
 
 @pytest.mark.parametrize("multi", [False, True])
-@pytest.mark.parametrize("pages_prefix", ["dcp", "index"])
-@pytest.mark.parametrize("cap_prefix", ["dcp", "index"])
 @pytest.mark.parametrize("requested,cap,expected", [(7, 10000, 7), (256, 1000, 5)])
-def test_dcp_staging_shape_honors_producer_options(
-    multi, pages_prefix, cap_prefix, requested, cap, expected
-):
+def test_dcp_staging_shape_honors_producer_options(multi, requested, cap, expected):
     connector = {
         "kv_connector": "mooncake",
         "num_worker_threads": 2,
-        f"{pages_prefix}_staging_chunk_pages": requested,
-        f"{cap_prefix}_staging_max_bytes": cap,
+        "dcp_staging_chunk_pages": requested,
+        "dcp_staging_max_bytes": cap,
     }
     transfer = (
         {
@@ -171,36 +167,14 @@ def test_dcp_staging_shape_honors_producer_options(
     )
 
 
-@pytest.mark.parametrize("prefix", ["dcp", "index"])
-@pytest.mark.parametrize("option", ["chunk_pages", "max_bytes"])
+@pytest.mark.parametrize("option", ["dcp_staging_chunk_pages", "dcp_staging_max_bytes"])
 @pytest.mark.parametrize("value", [0, -1, True, "256", 1.5])
-def test_dcp_staging_shape_rejects_invalid_options(prefix, option, value):
-    connector = {"kv_connector": "mooncake", f"{prefix}_staging_{option}": value}
-    if prefix == "dcp":
-        # An explicitly invalid canonical option must not use a valid alias.
-        connector[f"index_staging_{option}"] = 10000
-    config = SimpleNamespace(kv_transfer_config=connector)
-    with pytest.raises(
-        ValueError, match=f"dcp_staging_{option} must be a positive integer"
-    ):
-        dcp_staging_shape(config, 100)
-
-
-@pytest.mark.parametrize("requested,cap,expected", [(7, 10000, 7), (256, 1000, 5)])
-def test_dcp_staging_options_take_precedence_over_legacy_aliases(
-    requested, cap, expected
-):
+def test_dcp_staging_shape_rejects_invalid_options(option, value):
     config = SimpleNamespace(
-        kv_transfer_config={
-            "kv_connector": "mooncake",
-            "num_worker_threads": 2,
-            "dcp_staging_chunk_pages": requested,
-            "dcp_staging_max_bytes": cap,
-            "index_staging_chunk_pages": 1,
-            "index_staging_max_bytes": 200,
-        }
+        kv_transfer_config={"kv_connector": "mooncake", option: value}
     )
-    assert dcp_staging_shape(config, 100) == (2, expected)
+    with pytest.raises(ValueError, match=f"{option} must be a positive integer"):
+        dcp_staging_shape(config, 100)
 
 
 def test_dcp_staging_shape_rejects_cap_smaller_than_one_page_per_worker():
