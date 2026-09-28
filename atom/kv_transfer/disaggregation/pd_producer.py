@@ -113,12 +113,14 @@ def dcp_staging_shape(config, page_bytes: int) -> tuple[int, int]:
     connector = _producer_connectors(config, _DCP_STAGING_CONNECTORS)[0]
     pages = connector.get("dcp_staging_chunk_pages", 256)
     max_bytes = connector.get("dcp_staging_max_bytes", 256 * 1024**2)
-    for name, value in (
-        ("dcp_staging_chunk_pages", pages),
-        ("dcp_staging_max_bytes", max_bytes),
-    ):
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    if isinstance(pages, bool) or not isinstance(pages, int) or pages <= 0:
+        raise ValueError(
+            f"dcp_staging_chunk_pages must be a positive integer, got {pages!r}"
+        )
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+        raise ValueError(
+            f"dcp_staging_max_bytes must be a positive integer, got {max_bytes!r}"
+        )
     if page_bytes <= 0:
         raise ValueError("Staging page_bytes must be positive")
     capped_pages = min(pages, max_bytes // (slots * page_bytes))

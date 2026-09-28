@@ -160,9 +160,9 @@ def test_coalesce_contiguous_splits_registered_mr_boundaries(page_bytes, boundar
 
 def test_coalesce_splits_single_run_at_different_source_and_destination_boundaries():
     src, dst, length = coalesce_contiguous(
-        np.array([103]),
-        np.array([208]),
-        np.array([23]),
+        np.array([103], dtype=np.int64),
+        np.array([208], dtype=np.int64),
+        np.array([23], dtype=np.int64),
         src_mr=(100, 10),
         dst_mr=(200, 12),
     )
@@ -177,9 +177,9 @@ def test_coalesce_splits_single_run_at_different_source_and_destination_boundari
 
 def test_coalesce_with_mr_boundaries_preserves_empty_input_and_address_gaps():
     src, dst, length = coalesce_contiguous(
-        np.array([100, 104, 120]),
-        np.array([200, 204, 220]),
-        np.array([4, 4, 4]),
+        np.array([100, 104, 120], dtype=np.int64),
+        np.array([200, 204, 220], dtype=np.int64),
+        np.array([4, 4, 4], dtype=np.int64),
         src_mr=(100, 64),
         dst_mr=(200, 64),
     )
@@ -244,13 +244,12 @@ def test_coalesce_mr_splits_preserve_randomized_bytes_and_are_maximal(boundary, 
     assert not can_merge.any()
 
 
-@pytest.mark.parametrize("dtype", [np.int32, np.int64, np.uint32, np.uint64])
 @pytest.mark.parametrize("lengths", [[0], [0, 0, 0], [0, 8, 0], [8, 0, 8], [16, 8, 24]])
-def test_coalesce_mr_split_handles_zero_lengths_and_exact_boundaries(dtype, lengths):
-    lengths = np.array(lengths, dtype=dtype)
+def test_coalesce_mr_split_handles_zero_lengths_and_exact_boundaries(lengths):
+    lengths = np.array(lengths, dtype=np.int64)
     # Strided inputs also exercise the public ndarray contract.
-    src = np.arange(100, 100 + 16 * lengths.size, 8, dtype=dtype)[::2]
-    dst = np.arange(200, 200 + 16 * lengths.size, 8, dtype=dtype)[::2]
+    src = np.arange(100, 100 + 16 * lengths.size, 8, dtype=np.int64)[::2]
+    dst = np.arange(200, 200 + 16 * lengths.size, 8, dtype=np.int64)[::2]
     actual = coalesce_contiguous(src, dst, lengths, src_mr=(100, 8), dst_mr=(200, 16))
     assert all(a.dtype == np.int64 for a in actual)
     if not lengths.any():

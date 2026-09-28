@@ -9,18 +9,19 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
+from numpy.typing import NDArray
 
 from atom.distributed.dcp_layout import dcp_global_pos
 
 
 def coalesce_contiguous(
-    src: np.ndarray,
-    dst: np.ndarray,
-    length: np.ndarray,
+    src: NDArray[np.int64],
+    dst: NDArray[np.int64],
+    length: NDArray[np.int64],
     *,
     src_mr: tuple[int, int] | None = None,
     dst_mr: tuple[int, int] | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[NDArray[np.int64], NDArray[np.int64], NDArray[np.int64]]:
     """Merge adjacent runs, optionally splitting at either side's MR boundaries.
 
     Each MR specification is (region_base, chunk_bytes), matching registration's
@@ -28,9 +29,10 @@ def coalesce_contiguous(
     the final MR's alignment remainder may be split conservatively. Splitting
     also handles an individual oversized page.
     """
-    for mr in (src_mr, dst_mr):
-        if mr is not None and mr[1] <= 0:
-            raise ValueError("MR chunk bytes must be positive")
+    if (src_mr is not None and src_mr[1] <= 0) or (
+        dst_mr is not None and dst_mr[1] <= 0
+    ):
+        raise ValueError("MR chunk bytes must be positive")
 
     if src.size == 0:
         empty = np.empty(0, dtype=np.int64)
@@ -45,9 +47,6 @@ def coalesce_contiguous(
     if src_mr is None and dst_mr is None:
         return merged_src, merged_dst, merged_length
 
-    merged_src = np.asarray(merged_src, dtype=np.int64)
-    merged_dst = np.asarray(merged_dst, dtype=np.int64)
-    merged_length = np.asarray(merged_length, dtype=np.int64)
     # A contiguous page batch often merges to one run. Avoid repeat/index
     # expansion for this case: its cut positions are simple MR progressions.
     if merged_length.size == 1:

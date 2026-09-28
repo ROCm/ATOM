@@ -90,17 +90,10 @@ def gather_dcp_mla_pages(
     if not staging.is_contiguous():
         raise ValueError("MLA staging pages must be contiguous")
     token_count = dst_pages * scheduler_block_size
-    # Only these three vectors are consumed by MLA; tile indices belong to
-    # the separate preshuffled-index gather.
-    for name, tensor, dtypes in (
-        (
-            "src_block_id_per_token",
-            indices.src_block_id_per_token,
-            (torch.int32, torch.int64),
-        ),
-        ("src_token", indices.src_token, (torch.int32, torch.int64)),
-        ("valid", indices.valid, (torch.bool,)),
-    ):
+
+    def validate_index(
+        name: str, tensor: torch.Tensor, dtypes: tuple[torch.dtype, ...]
+    ) -> None:
         if tensor.device != source.device:
             raise ValueError(f"MLA {name} must be on the same device as source")
         if tensor.ndim != 1 or tensor.numel() != token_count:
@@ -111,6 +104,16 @@ def gather_dcp_mla_pages(
             raise TypeError(f"MLA {name} must have dtype in {dtypes}")
         if not tensor.is_contiguous():
             raise ValueError(f"MLA {name} must be contiguous")
+
+    # Only these three vectors are consumed by MLA; tile indices belong to
+    # the separate preshuffled-index gather.
+    validate_index(
+        "src_block_id_per_token",
+        indices.src_block_id_per_token,
+        (torch.int32, torch.int64),
+    )
+    validate_index("src_token", indices.src_token, (torch.int32, torch.int64))
+    validate_index("valid", indices.valid, (torch.bool,))
     if not dst_pages:
         return 0
     token_bytes = page_bytes // scheduler_block_size
