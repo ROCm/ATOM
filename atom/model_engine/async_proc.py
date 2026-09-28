@@ -336,13 +336,23 @@ class AsyncIOProc:
     ) -> RpcResult:
         """Invoke one generic RPC, converting every outcome into a reply.
 
-        Never raises and never returns ``None``: a missing method, a raising
-        target, and an unpicklable return all become an ``RpcResult`` carrying
-        ``error``. Anything else would leave the caller blocked in an untimed
-        queue get, which is how a typo in a method name currently costs five
-        minutes and reports a timeout instead of the typo.
+        Never raises and never returns ``None``: a missing or malformed method
+        name, a raising target, and an unpicklable return all become an
+        ``RpcResult`` carrying ``error``. Anything else would leave the caller
+        blocked in an untimed queue get, which is how a typo in a method name
+        currently costs five minutes and reports a timeout instead of the typo.
         """
-        func = getattr(runner, func_name, None)
+        try:
+            func = getattr(runner, func_name, None)
+        except Exception as exc:  # noqa: BLE001 - reported to the caller instead
+            # getattr's default covers AttributeError only. A non-string name
+            # raises TypeError, which would otherwise end this worker's loop.
+            return RpcResult(
+                payload.request_id,
+                self.rank,
+                error=f"cannot look up {func_name!r} on {type(runner).__name__}: "
+                f"{type(exc).__name__}: {exc}",
+            )
         if func is None:
             return RpcResult(
                 payload.request_id,

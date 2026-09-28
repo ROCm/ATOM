@@ -141,6 +141,18 @@ def test_an_unknown_method_is_an_error_not_a_silent_skip():
     assert _drive(_proc(), [("no_such_method", [])]) == ([], [])
 
 
+def test_a_name_that_cannot_be_looked_up_is_an_error_not_a_dead_worker():
+    """getattr's default covers AttributeError only. A non-string name raised
+    TypeError outside every handler, and the worker's loop ended with it."""
+    first = RpcPayload(request_id="r9")
+    second = RpcPayload(request_id="r10", args=(1,))
+    _, rpc = _drive(_proc(), [(123, [first]), ("returns_value", [second])])
+
+    assert [r.request_id for r in rpc] == ["r9", "r10"]
+    assert not rpc[0].ok and "TypeError" in rpc[0].error
+    assert rpc[1].ok and rpc[1].value == 1, "the loop must keep serving"
+
+
 def test_a_raising_target_is_reported_not_propagated():
     proc = _proc()
     out = proc._run_generic_rpc(

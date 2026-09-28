@@ -155,6 +155,17 @@ def test_a_missing_method_or_request_id_answers_with_an_error():
         assert mgr.calls == [], "nothing should be broadcast for a malformed request"
 
 
+def test_a_non_string_method_is_refused_before_the_broadcast():
+    """Truthy but not a name: it reached getattr on every TP worker, which
+    raises TypeError outside the worker's own error handling."""
+    h, mgr, out = _handler()
+    h._handle_collective_rpc({"method": 123, "request_id": "x8"})
+    (body,) = _responses(out)
+    assert body["request_id"] == "x8", "the reply must still reach its caller"
+    assert body["error"]
+    assert mgr.calls == [], "nothing may reach the workers"
+
+
 def test_a_raising_manager_is_reported_not_propagated():
     """Raising out of a handler kills the EngineCore busy loop, which takes the
     whole engine with it."""
