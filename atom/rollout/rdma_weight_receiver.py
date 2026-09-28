@@ -34,6 +34,7 @@ import json
 import logging
 import time
 from datetime import timedelta
+from itertools import pairwise
 
 import torch
 import torch.distributed as dist
@@ -68,6 +69,7 @@ def _decode_bucket(
         raise RuntimeError("invalid RDMA weight metadata: expected a non-empty list")
 
     weights: list[tuple[str, torch.Tensor]] = []
+    spans: list[tuple[int, int, str]] = []
     for entry in metadata:
         try:
             name = str(entry["name"])
@@ -93,6 +95,23 @@ def _decode_bucket(
                 f"shape={shape} dtype={dtype} nbytes={nbytes}"
             )
         weights.append((name, value))
+        spans.append((start, end, name))
+
+    # Each entry can be in bounds and still be wrong as a set: a repeated name
+    # writes one parameter twice, and overlapping ranges hand the same bytes to
+    # two parameters. Either way coverage still passes. The sender packs one
+    # tensor per name, back to back, so neither is ever legitimate.
+    names = [name for _, _, name in spans]
+    if len(set(names)) != len(names):
+        repeated = sorted({n for n in names if names.count(n) > 1})
+        raise RuntimeError(f"RDMA bucket repeats weight names: {repeated[:20]}")
+    spans.sort()
+    for (_, prev_end, prev_name), (start, _, name) in pairwise(spans):
+        if start < prev_end:
+            raise RuntimeError(
+                f"RDMA payload ranges overlap: {prev_name} ends at byte "
+                f"{prev_end}, {name} starts at {start}"
+            )
     return weights
 
 
@@ -109,11 +128,20 @@ def receive_weight_stream(
 
     Returns throughput and coverage statistics. On any failure the runner is
     fenced rather than left half-updated -- see ``abort_weight_update``.
+
+    A failure on this rank does not end its part in the stream. The trainer and
+    every other rank are still in the broadcasts, and one rank leaving early
+    hangs all of them in the next one -- the orchestrator then sees a timeout
+    naming nobody instead of this rank's error. So the rest of the stream is
+    received and discarded, the header's sizes being all that is needed to stay
+    in step, and the failure is raised once the end marker arrives.
     """
     total_bytes = 0
     total_weights = 0
     total_buckets = 0
     started = time.perf_counter()
+    failure: Exception | None = None
+    drained = 0
 
     runner.begin_weight_update(expected_version)
     try:
@@ -124,14 +152,16 @@ def receive_weight_stream(
             # Checked on every header, not just the first: a version change
             # mid-stream means two senders are interleaving on one group, and
             # the halves would silently mix.
-            if version != expected_version:
-                raise RuntimeError(
+            if failure is None and version != expected_version:
+                failure = RuntimeError(
                     f"RDMA weight version mismatch: expected {expected_version}, "
                     f"got {version}"
                 )
             if command == _CMD_END:
                 break
             if command != _CMD_BUCKET or metadata_bytes <= 0 or payload_bytes <= 0:
+                # Unlike a bad bucket, this cannot be drained: without sizes
+                # there is no telling what the sender broadcasts next.
                 raise RuntimeError(
                     f"invalid RDMA weight header: command={command} "
                     f"metadata_bytes={metadata_bytes} payload_bytes={payload_bytes}"
@@ -143,13 +173,36 @@ def receive_weight_stream(
             payload = torch.empty(payload_bytes, dtype=torch.uint8, device=device)
             dist.broadcast(metadata_tensor, src=0, group=group)
             dist.broadcast(payload, src=0, group=group)
+            if failure is not None:
+                drained += 1
+                continue
 
-            weights = _decode_bucket(metadata_tensor, payload)
-            runner.apply_weight_bucket(weights, payload_bytes=payload_bytes)
+            try:
+                weights = _decode_bucket(metadata_tensor, payload)
+                runner.apply_weight_bucket(weights, payload_bytes=payload_bytes)
+            except Exception as exc:  # noqa: BLE001 - raised at the end marker
+                failure = exc
+                logger.error(
+                    "RDMA weight bucket %d failed on this rank, receiving the "
+                    "rest of the stream before reporting it: %s",
+                    total_buckets + 1,
+                    exc,
+                )
+                continue
 
             total_bytes += payload_bytes
             total_weights += len(weights)
             total_buckets += 1
+
+        if failure is not None:
+            if drained:
+                logger.error(
+                    "RDMA weight stream v%d: discarded %d bucket(s) after the "
+                    "failure",
+                    expected_version,
+                    drained,
+                )
+            raise failure
 
         manifest = runner.commit_weight_update(
             expected_version, verify_full_load=verify_full_load
