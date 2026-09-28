@@ -26,7 +26,10 @@ from atom.kv_transfer.offload.metadata import (
     NativeStateTransfer,
     SaveSpec,
 )
-from atom.kv_transfer.offload.mp.backend import _model_namespace, _tp_replication_factor
+from atom.kv_transfer.offload.mp.deployment import (
+    _model_namespace,
+    _tp_replication_factor,
+)
 from atom.kv_transfer.offload.mp.native_state_layout import (
     build_native_state_mp_layout,
 )
@@ -209,10 +212,10 @@ def test_unprovable_submission_retains_lease_until_the_deadline_stops_the_engine
 ):
     """No clock releases a lease the server may still be using: the operation
     stays pending, and past the transfer deadline the worker fails stop."""
-    from atom.kv_transfer.offload.mp import backend
+    from atom.kv_transfer.offload.mp import transfer
 
     now = [1000.0]
-    monkeypatch.setattr(backend.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
 
     def unprovable(*_):
         raise ConnectionError("server may have received request")
@@ -231,7 +234,7 @@ def test_unprovable_submission_retains_lease_until_the_deadline_stops_the_engine
     assert len(pending) == 1
 
     now[0] += 2
-    with pytest.raises(backend.LMCacheTransferUnprovable):
+    with pytest.raises(transfer.LMCacheTransferUnprovable):
         worker.get_finished()
     assert len(pending) == 1
 
@@ -537,10 +540,10 @@ def test_raising_restore_keeps_its_descriptor_slot_until_the_deadline(
     """A restore that raises after taking a descriptor slot may have queued a
     copy that still reads the slot's staging buffer: the slot and lease stay
     held, and the transfer deadline stops the engine instead of recycling."""
-    from atom.kv_transfer.offload.mp import backend, native_state_worker
+    from atom.kv_transfer.offload.mp import native_state_worker, transfer
 
     now = [1000.0]
-    monkeypatch.setattr(backend.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
     # A real Event cannot be built on a CPU runner; fail deterministically
     # after the slot is taken instead, at the stream fence.
     monkeypatch.setattr(
@@ -557,7 +560,7 @@ def test_raising_restore_keeps_its_descriptor_slot_until_the_deadline(
     assert worker._restore_descriptor_slots == []
 
     now[0] += worker._transfer_deadline_s
-    with pytest.raises(backend.LMCacheTransferUnprovable):
+    with pytest.raises(transfer.LMCacheTransferUnprovable):
         worker.get_finished()
     assert worker._restore_descriptor_slots == []
     assert len(worker._native_loads) == 1
@@ -577,12 +580,12 @@ def test_native_server_chunk_mismatch_fails_before_registration(monkeypatch):
 
 
 def test_native_namespace_changes_with_image_codec(monkeypatch):
-    from atom.kv_transfer.offload.mp import backend
+    from atom.kv_transfer.offload.mp import deployment
 
-    monkeypatch.setattr(backend.offcfg, "build_lmcache_config", lambda _: object())
-    monkeypatch.setattr(backend.offcfg, "lmcache_replica_world_size", lambda _: 2)
+    monkeypatch.setattr(deployment.offcfg, "build_lmcache_config", lambda _: object())
+    monkeypatch.setattr(deployment.offcfg, "lmcache_replica_world_size", lambda _: 2)
     monkeypatch.setattr(
-        backend.offcfg, "build_page_namespace", lambda *_: "page-config"
+        deployment.offcfg, "build_page_namespace", lambda *_: "page-config"
     )
     first = PagedStateCheckpointSpec(32, 128, "native-test-v1", 80)
     second = replace(first, image_bytes=81)

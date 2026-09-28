@@ -20,7 +20,9 @@ from atom.kv_transfer.disaggregation.base import (
 )
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.kv_transfer.offload._offload_common import validated_kv_role
-from atom.kv_transfer.offload.mp import backend
+from atom.kv_transfer.offload.mp import deployment
+from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
+from atom.kv_transfer.offload.mp import worker as mp_worker
 
 
 def _publishes_native_state(transfer_tensors: Any) -> bool:
@@ -59,7 +61,7 @@ class LMCacheMPConnector(KVConnectorBase):
     is_producer = False
 
     def __init__(self, config: Any) -> None:
-        backend._validate_mp_config(config)
+        deployment._validate_mp_config(config)
         validated_kv_role(getattr(config, "kv_transfer_config", {}) or {})
         self._config = config
         self._impl: KVConnectorBase | None = None
@@ -92,7 +94,7 @@ class LMCacheMPConnector(KVConnectorBase):
                 "execute_paged_state_copies for the native-state transfer"
             )
         else:
-            impl = backend.LMCacheMPConnector(self._config)
+            impl = mp_worker.LMCacheMPConnector(self._config)
         impl.register_kv_caches(kv_caches, transfer_tensors, num_blocks)
         self._impl = impl
 
@@ -123,7 +125,7 @@ class LMCacheMPConnectorScheduler(KVConnectorSchedulerBase):
     is_offload = True
 
     def __init__(self, config: Any) -> None:
-        backend._validate_mp_config(config)
+        deployment._validate_mp_config(config)
         validated_kv_role(getattr(config, "kv_transfer_config", {}) or {})
         self._config = config
         self._impl: KVConnectorSchedulerBase | None = None
@@ -153,7 +155,7 @@ class LMCacheMPConnectorScheduler(KVConnectorSchedulerBase):
                 "PAGE-only offload would restore KV without its state"
             )
         if coordinator is None:
-            impl: KVConnectorSchedulerBase = backend.LMCacheMPConnectorScheduler(
+            impl: KVConnectorSchedulerBase = mp_scheduler.LMCacheMPConnectorScheduler(
                 self._config
             )
         else:

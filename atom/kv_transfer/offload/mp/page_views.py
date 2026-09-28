@@ -91,4 +91,68 @@ def validate_page_views(
     return validated
 
 
+@dataclass(frozen=True)
+class _CacheViews:
+    """Validated block-major tensors and their copy-kernel group indices."""
+
+    tensors: dict[str, torch.Tensor]
+    layer_groups: tuple[tuple[int, ...], ...]
+    bytes_per_block: int
+
+
+def _build_cache_views(
+    transfer_tensors: Any,
+    *,
+    num_blocks: int,
+) -> _CacheViews:
+    """Validate backend-published PAGE views without inspecting model internals."""
+
+    if transfer_tensors is None:
+        raise ValueError("lmcache_mp requires KVTransferTensors")
+
+    stateful_fields = {
+        "num_slots": getattr(transfer_tensors, "num_slots", 0),
+        "slot_regions": getattr(transfer_tensors, "slot_regions", None),
+        "swa_block_regions": getattr(transfer_tensors, "swa_block_regions", None),
+        "staging_region": getattr(transfer_tensors, "staging_region", None),
+        "gather_slot": getattr(transfer_tensors, "gather_slot", None),
+        "scatter_slot": getattr(transfer_tensors, "scatter_slot", None),
+        "expected_full_slot_region_count": getattr(
+            transfer_tensors, "expected_full_slot_region_count", None
+        ),
+    }
+    populated_stateful_fields = [
+        name for name, value in stateful_fields.items() if value
+    ]
+    if populated_stateful_fields:
+        raise NotImplementedError(
+            "lmcache_mp supports PAGE-only layouts; stateful SLOT data was "
+            f"published through {', '.join(populated_stateful_fields)}"
+        )
+
+    tensors: dict[str, torch.Tensor] = {}
+    indices_by_layout: dict[tuple[torch.dtype, tuple[int, ...]], list[int]] = {}
+    bytes_per_block = 0
+    for page in validate_page_views(transfer_tensors, num_blocks=num_blocks):
+        index, view, region = page.index, page.view, page.region
+        # LMCache receives these tensors as opaque PAGE storage, not numerical
+        # values.  Publish a zero-copy byte view so every transfer path copies
+        # the exact bit pattern.  This is especially important on ROCm, where
+        # LMCache's Python raw-pointer fallback cannot express FP8 through the
+        # CUDA array interface and would otherwise reconstruct the destination
+        # as uint8 while keeping the staging object as FP8.
+        byte_view = view.view(torch.uint8)
+        role = str(getattr(region, "semantic_role", None) or f"plane_{index}")
+        tensors[f"page.{index}.{role}"] = byte_view
+        layout = (byte_view.dtype, tuple(int(dim) for dim in byte_view.shape[1:]))
+        indices_by_layout.setdefault(layout, []).append(index)
+        bytes_per_block += page.unit_bytes
+
+    return _CacheViews(
+        tensors=tensors,
+        layer_groups=tuple(tuple(indices) for indices in indices_by_layout.values()),
+        bytes_per_block=bytes_per_block,
+    )
+
+
 __all__ = ["PageView", "validate_page_views"]

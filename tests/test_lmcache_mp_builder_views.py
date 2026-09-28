@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from atom.kv_transfer.offload.mp.backend import _build_cache_views
+from atom.kv_transfer.offload.mp.page_views import _build_cache_views
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.model_ops.attentions.mla_kv_pool import MlaKvPool
 from atom.model_ops.attentions.pool_layout.entry_arena import EntryField

@@ -386,7 +386,7 @@ def test_draft_regions_after_the_state_regions_stay_ordinary_page():
 )
 def test_native_and_page_only_registration_share_page_validation(breakage, message):
     """One validator for both registrations, so they cannot drift apart."""
-    from atom.kv_transfer.offload.mp.backend import _build_cache_views
+    from atom.kv_transfer.offload.mp.page_views import _build_cache_views
 
     native = _transfer()
     breakage(native)

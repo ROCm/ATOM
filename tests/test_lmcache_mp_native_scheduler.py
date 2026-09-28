@@ -15,7 +15,8 @@ from atom.kv_transfer.disaggregation.types import (
     SaveSourceGroupId,
 )
 from atom.kv_transfer.offload.chunked_scheduler import DENSE_PAGE_SOURCE_SAFE_CHANNEL
-from atom.kv_transfer.offload.mp import backend
+from atom.kv_transfer.offload.mp import deployment, transfer
+from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.kv_transfer.offload.mp.connector import LMCacheMPConnectorScheduler
 from atom.kv_transfer.offload.mp.native_state_scheduler import (
     NativeStateLMCacheMPConnectorScheduler,
@@ -39,7 +40,7 @@ def storage_config(monkeypatch):
     # The transport is a double; retain config/chunk validation without needing
     # the optional LMCache package or a standalone server on a CPU test runner.
     monkeypatch.setattr(
-        backend.offcfg,
+        deployment.offcfg,
         "build_lmcache_config",
         lambda kvc: SimpleNamespace(
             chunk_size=kvc["kv_connector_extra_config"]["lmcache.chunk_size"]
@@ -96,7 +97,7 @@ def make_scheduler(
         connections.append(checkpoint_spec)
         return adapter
 
-    monkeypatch.setattr(backend, "_make_scheduler_adapter", connect)
+    monkeypatch.setattr(mp_scheduler, "_make_scheduler_adapter", connect)
     config = SimpleNamespace(
         kv_cache_block_size=4,
         kv_transfer_config={
@@ -405,7 +406,7 @@ def test_a_transfer_that_never_reports_stops_the_engine(monkeypatch, kind):
     a slow DMA, so past the deadline the scheduler fails stop -- holding the
     lease and budget rather than recycling them."""
     now = [1000.0]
-    monkeypatch.setattr(backend.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
     scheduler, checkpoints, _ = make_scheduler(monkeypatch)
     seq = sequence(computed=0 if kind == "load" else 16)
     if kind == "save":
@@ -422,14 +423,14 @@ def test_a_transfer_that_never_reports_stops_the_engine(monkeypatch, kind):
     now[0] += scheduler._scheduler_deadline_s - 1
     scheduler.process_completions(KVConnectorOutput())
     now[0] += 2
-    with pytest.raises(backend.LMCacheTransferUnprovable):
+    with pytest.raises(transfer.LMCacheTransferUnprovable):
         scheduler.process_completions(KVConnectorOutput())
     assert scheduler._pinned_state_bytes == 30
 
 
 def test_a_transfer_that_reports_leaves_the_watchdog(monkeypatch):
     now = [1000.0]
-    monkeypatch.setattr(backend.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
     scheduler, checkpoints, _ = make_scheduler(monkeypatch)
     seq = sequence()
     checkpoint(scheduler, checkpoints, seq, 16)
@@ -685,7 +686,7 @@ def engine_scheduler(monkeypatch):
     monkeypatch.setenv("OFFLOAD_MIN_SAVE_TOKENS", "0")
     monkeypatch.setenv("OFFLOAD_MAX_PENDING_SAVES", "2")
     monkeypatch.setattr(
-        backend, "_make_scheduler_adapter", lambda _config, **kwargs: adapter
+        mp_scheduler, "_make_scheduler_adapter", lambda _config, **kwargs: adapter
     )
     config = MockConfig(
         num_kvcache_blocks=40,

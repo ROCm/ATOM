@@ -104,7 +104,11 @@ Four rules carry the module:
 | `hybrid/kimi_k3/state_tier.py` | Worker-side store/load driver for the state tier on its own executor; reports store/finished/failed hash sets for the engine-side `StateOffloadIndex` to apply. |
 | `atom_lmcache_staging.py` | Per-thread CUDA streams, staging buffer, ready/free events, env helpers. |
 | `mp/connector.py` | Capability-selected public `lmcache_mp` worker/scheduler shells. |
-| `mp/backend.py` | Generic PAGE-only LMCache multiprocess transport and adapter integration. |
+| `mp/deployment.py` | LMCache MP configuration, topology, model namespace and server adapters. |
+| `mp/worker.py`, `mp/scheduler.py` | Generic PAGE-only LMCache MP connector halves. |
+| `mp/lookup.py` | Scheduler-side MP lookups and read-lock bookkeeping. |
+| `mp/transfer.py` | Transfer identity, terminal detection and the fail-stop transfer deadline. |
+| `mp/page_views.py` | Shared validation of backend-published PAGE views. |
 | `mp/native_state_{layout,scheduler,worker}.py` | PAGE-backed native-state registration, scheduler leases, and worker transfer/restore lifecycle. |
 
 The engine-side counterpart of the state tier lives outside this directory:

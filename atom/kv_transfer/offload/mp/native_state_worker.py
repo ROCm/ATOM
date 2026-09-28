@@ -19,25 +19,27 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._offload_common import max_pending_saves
 from atom.kv_transfer.offload.metadata import LMCacheReqMeta, NativeStateTransfer
-from atom.kv_transfer.offload.mp.backend import (
-    LMCacheMPConnector,
-    _chunk_ranges,
-    _enforce_transfer_deadline,
+from atom.kv_transfer.offload.mp.deployment import (
     _make_worker_adapter,
     _mp_session_id,
     _published_tp_replication_factor,
-    _remember_operation_tombstone,
-    _source_safe_completions,
     _storage_kv_transfer_config,
-    _terminal_future_result,
     _tp_replication_factor,
-    _transfer_operation_id,
-    _UnprovableSubmission,
     _validate_mp_config,
 )
 from atom.kv_transfer.offload.mp.native_state_layout import (
     build_native_state_mp_layout,
 )
+from atom.kv_transfer.offload.mp.transfer import (
+    _chunk_ranges,
+    _enforce_transfer_deadline,
+    _remember_operation_tombstone,
+    _source_safe_completions,
+    _terminal_future_result,
+    _transfer_operation_id,
+    _UnprovableSubmission,
+)
+from atom.kv_transfer.offload.mp.worker import LMCacheMPConnector
 from atom.model_engine.page_unit_checkpoint import CheckpointRestoreOp
 from atom.utils import envs
 

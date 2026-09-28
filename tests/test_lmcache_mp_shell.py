@@ -7,10 +7,11 @@ from types import SimpleNamespace
 
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.offload.mp import (
-    backend,
     native_state_scheduler,
     native_state_worker,
 )
+from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
+from atom.kv_transfer.offload.mp import worker as mp_worker
 from atom.kv_transfer.offload.mp.connector import (
     LMCacheMPConnector,
     LMCacheMPConnectorScheduler,
@@ -27,8 +28,8 @@ def _config():
 
 
 def test_public_connector_is_a_layout_neutral_shell():
-    assert LMCacheMPConnector is not backend.LMCacheMPConnector
-    assert LMCacheMPConnectorScheduler is not backend.LMCacheMPConnectorScheduler
+    assert LMCacheMPConnector is not mp_worker.LMCacheMPConnector
+    assert LMCacheMPConnectorScheduler is not mp_scheduler.LMCacheMPConnectorScheduler
 
 
 def test_factory_registration_resolves_public_connectors(monkeypatch):
@@ -79,7 +80,7 @@ def test_worker_selects_native_state_from_published_contract(monkeypatch):
     monkeypatch.setattr(
         native_state_worker, "NativeStateLMCacheMPConnector", NativeWorker
     )
-    monkeypatch.setattr(backend, "LMCacheMPConnector", PageWorker)
+    monkeypatch.setattr(mp_worker, "LMCacheMPConnector", PageWorker)
     config = _config()
     worker = LMCacheMPConnector(config)
     tensors = SimpleNamespace(
@@ -110,7 +111,7 @@ def test_scheduler_selects_native_state_from_block_manager(monkeypatch):
         "NativeStateLMCacheMPConnectorScheduler",
         NativeScheduler,
     )
-    monkeypatch.setattr(backend, "LMCacheMPConnectorScheduler", PageScheduler)
+    monkeypatch.setattr(mp_scheduler, "LMCacheMPConnectorScheduler", PageScheduler)
     config = _config()
     scheduler = LMCacheMPConnectorScheduler(config)
     manager = SimpleNamespace(paged_state_checkpoints=object())
@@ -149,8 +150,8 @@ def test_plain_page_layout_uses_generic_implementations(monkeypatch):
         def __init__(self, config):
             selected.append("scheduler")
 
-    monkeypatch.setattr(backend, "LMCacheMPConnector", PageWorker)
-    monkeypatch.setattr(backend, "LMCacheMPConnectorScheduler", PageScheduler)
+    monkeypatch.setattr(mp_worker, "LMCacheMPConnector", PageWorker)
+    monkeypatch.setattr(mp_scheduler, "LMCacheMPConnectorScheduler", PageScheduler)
     LMCacheMPConnector(_config()).register_kv_caches({}, SimpleNamespace(), 7)
     LMCacheMPConnectorScheduler(_config()).bind_block_manager(
         SimpleNamespace(paged_state_checkpoints=None)
@@ -177,7 +178,7 @@ def test_worker_rejects_paged_state_without_native_contract(monkeypatch):
         def register_kv_caches(self, *_):
             pass
 
-    monkeypatch.setattr(backend, "LMCacheMPConnector", PageWorker)
+    monkeypatch.setattr(mp_worker, "LMCacheMPConnector", PageWorker)
     builder = SimpleNamespace(
         state_transfer=lambda: SimpleNamespace(copies=True),
     )
@@ -198,7 +199,7 @@ def test_worker_keeps_page_only_path_for_forked_state(monkeypatch):
         def register_kv_caches(self, *_):
             pass
 
-    monkeypatch.setattr(backend, "LMCacheMPConnector", PageWorker)
+    monkeypatch.setattr(mp_worker, "LMCacheMPConnector", PageWorker)
     builder = SimpleNamespace(
         state_transfer=lambda: SimpleNamespace(copies=False),
     )
@@ -227,7 +228,7 @@ def test_scheduler_rejects_disabled_paged_state_checkpoints(monkeypatch):
         NativeScheduler,
     )
     monkeypatch.setattr(
-        backend,
+        mp_scheduler,
         "LMCacheMPConnectorScheduler",
         lambda config: selected.append("page"),
     )
