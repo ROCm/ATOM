@@ -468,11 +468,19 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                     index_score_work_map_size,
                 )
 
+                # The CP pair has to match the one `_build_ubatch_metadata`
+                # passes to the builder: the shard's dispatch is denser than the
+                # whole context's, so a map sized at cp_world=1 is SHORTER than
+                # the one a CP rank writes -- 64 rows against 128 at bs=8,
+                # max_block=64 -- and the build rejects the buffer outright
+                # ("work_map: expected packed [at least N, 2] int32").
                 rows = index_score_work_map_size(
                     ub_max_bs,
                     self._index_score_max_block,
                     max_seqlen_qo,
                     self._num_idx_heads,
+                    self._index_score_cp_world,
+                    self._index_score_cp_rank,
                 )
                 var[f"{p}sparse_attention_index_score_work_map"] = (
                     torch.empty((rows, 2), **i32_kwargs) if rows else None

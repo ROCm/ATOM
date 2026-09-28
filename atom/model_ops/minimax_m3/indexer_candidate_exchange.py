@@ -43,9 +43,9 @@ def _local_topk(
     Scores,
     Keys,
     Lengths,
-    S_HEAD: tl.constexpr,
-    S_ROW: tl.constexpr,
-    S_BLOCK: tl.constexpr,
+    S_HEAD,
+    S_ROW,
+    S_BLOCK,
     QUERY_LEN: tl.constexpr,
     LOCAL_BLOCKS,
     GLOBAL_BLOCKS,
@@ -66,6 +66,13 @@ def _local_topk(
     feature-contiguous layout -- same shape, block axis strided -- which is
     worth ~10% to it and which a hardcoded `* LOCAL_BLOCKS` cannot address. The
     native selector takes its strides the same way for the same reason.
+
+    They are runtime arguments, NOT `tl.constexpr`: `S_HEAD` is
+    `tokens * local`, so it moves with the batch, and specializing on it costs
+    a ~430ms recompile for every distinct decode batch size -- the same reason
+    `LOCAL_BLOCKS` and `GLOBAL_BLOCKS` are runtime here. Triton still folds the
+    divisible-by-16 and equal-to-1 cases, which is where the addressing win
+    actually is.
 
     Forced blocks are pinned HERE as well as in the merge. Pinning only at the
     merge loses them: a forced block that lost its own shard's top-k never
