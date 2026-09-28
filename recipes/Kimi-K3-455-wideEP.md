@@ -19,6 +19,7 @@ section first — on this silicon it is the difference between 95% and 0%.
 | **GSM8K (lm_eval, 5-shot, full 1319)** | **strict-match 0.9545 ±0.0057**, flexible-extract 0.9538 ±0.0058 |
 | GSM8K, re-run on `gfx1250-atom-20260918-ep8` / 432 GiB boards | strict-match 0.9621 ±0.0053, flexible-extract 0.9613 ±0.0053 (1319/1319, 9 min at `num_concurrent=32`) |
 | Throughput / TTFT / TPOT | **not characterized yet** — see [Not yet measured](#not-yet-measured) |
+| Agentic (AgentX), 16 GPUs, `--fake-eplb` | interactivity p90 2.53 tok/s/user, 182 tok/s/GPU total, 92.36% prefix-cache read — see [AgentX result](#agentx-result) and its caveats |
 
 ---
 
@@ -1158,10 +1159,69 @@ not produce coverage either.
 
 ---
 
+### AgentX result
+
+16 GPUs (4 nodes, dp16ep16), 432 GiB boards, `gfx1250-atom-20260918-ep8`.
+1790 s profiling window, 53 trajectories retired, 0 errors.
+`coverage passed: TTFT=79.8%, inter-token latency=99.4%`.
+
+**Headline three:**
+
+| | |
+|---|---|
+| **Interactivity, p90** | **2.53 tok/s/user** (avg 1.07, p50 0.53, p99 4.21) |
+| **Total throughput per GPU** | **182 tok/s** (2913 tok/s aggregate ÷ 16) |
+| **Prefix cache hit rate** | **92.36%** measured (94.68% theoretical for the trace) |
+
+**Latency and shape:**
+
+| metric | avg | p50 | p90 | p99 |
+|---|---|---|---|---|
+| TTFT (ms) | 198,611 | 124,981 | 444,961 | 588,742 |
+| Inter-token latency (ms) | 1,420 | 1,898 | 1,992 | 2,050 |
+| Request latency (ms) | 524,555 | 419,238 | 1,005,916 | 1,409,498 |
+| Input sequence length (tok) | 100,926 | 60,788 | 217,227 | 605,798 |
+| Output sequence length (tok) | 212 | 159 | 420 | 823 |
+| Effective concurrency | 15.11 | 14.00 | 25.00 | 28.00 |
+| Prefill throughput per user (tok/s) | 1,386 | 411 | 4,012 | 10,675 |
+
+**Aggregates:** input 2907 tok/s, output 6.12 tok/s, total 2913 tok/s,
+0.029 req/s. 5,349,055 prompt tokens of which 4,940,224 served from cache.
+
+⚠️ **Read these three caveats before quoting any of it.**
+
+1. **This run used `--fake-eplb`, so the model output is not valid.** Router
+   logits were uniform, so the numbers describe a synthetic routing
+   distribution, not K3's. It is also *not* a clean upper bound: uniform
+   routing spreads a batch's tokens across all 896 experts, which gives the
+   receiving rank smaller per-expert batches than real, skewed routing would.
+   Whether that helps or hurts decode here is not established.
+2. **The launch differs from the [AgentX launch](#server-launch-for-agentx)
+   above** — `--max-num-batched-tokens 16384` (not 2048) and `--concurrency 32`
+   (not 16). At 2048/con64 the run does not produce coverage at all.
+3. **There is no baseline**, so nothing here can be attributed to `--fake-eplb`,
+   `ATOM_DP_SESSION_AFFINITY=1` or the chunk size individually.
+
+**What the numbers say.** Decode is the bottleneck, not prefill: 212 output
+tokens take ~326 s of decode at 1.4 s per token, while prefill moves 2907 tok/s
+in aggregate. Effective concurrency settles at 15 against a nominal 32 because
+lanes idle inside the trace — size `--concurrency` by what retires, not by what
+you ask for. The 92.36% cache read rate is the thing keeping ISL p90 of 217k
+tokens affordable at all.
+
+`ATOM_DP_SESSION_AFFINITY=1` was set for this run. It places a new session on
+the lightest DP rank and pins every later request to that cache owner, which is
+the behaviour prefix caching needs across turns — a follow-up landing on a
+different rank re-prefills the whole context. It is off by default and costs
+nothing to set; its effect here is unmeasured for want of a baseline.
+
+---
+
 ## Not yet measured
 
-- Agentic (AgentX) numbers on this configuration — the setup above is
-  validated, the run is not yet reported here.
-- Prefix caching is disabled in the launch above and untested on this platform.
+- An AgentX run **without** `--fake-eplb` — the numbers above cannot stand in
+  for a deployable configuration.
+- Any A/B of `--fake-eplb`, `ATOM_DP_SESSION_AFFINITY` or
+  `--max-num-batched-tokens` against each other.
 - `--max-num-seqs` has not been swept; see the note under
   [Throughput](#throughput) for why it is the first thing to try.
