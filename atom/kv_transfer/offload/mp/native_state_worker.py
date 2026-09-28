@@ -219,8 +219,15 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 )
                 return
             if not loading and len(pending) >= self._max_pending_saves:
-                # The scheduler has the same bound. Refuse before transport;
-                # a terminal False safely returns the logical admission credit.
+                # Unreachable while the scheduler enforces the same bound: every
+                # save held here is still in its `_save_inflight`. Refuse before
+                # transport; a terminal False returns the admission credit.
+                logger.error(
+                    "Native-state LMCache MP save %s exceeds the scheduler's "
+                    "pending bound %d; refusing it",
+                    operation_id,
+                    self._max_pending_saves,
+                )
                 pending[operation_id] = _NativePending(req, None)
                 return
             end = len(req.token_ids)

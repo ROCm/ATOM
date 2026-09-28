@@ -2,6 +2,8 @@
 
 """Native PAGE image leases used by external checkpoint transfers."""
 
+import pytest
+
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointCoordinator,
@@ -199,6 +201,23 @@ def test_duplicate_external_load_adoption_releases_incoming_units():
 
     assert not c.adopt_transfer_units(owner, 101)
     assert c.store.records[c.store.lookup(101)].unit_ids == canonical
+    assert c.store.pool.num_free == 3
+
+
+def test_failed_adoption_keeps_transfer_units_releasable(monkeypatch):
+    """If adoption raises, the units must still be owned by the transfer
+    record, or no release path could ever return them to the pool."""
+    c = coordinator(num_units=3)
+    owner = ("request-a", 1)
+    assert c.reserve_transfer_units(owner) is not None
+
+    def broken(*_args):
+        raise AssertionError("owner mismatch")
+
+    monkeypatch.setattr(c.store, "adopt_units", broken)
+    with pytest.raises(AssertionError):
+        c.adopt_transfer_units(owner, 101)
+    c.release_transfer_units(owner)
     assert c.store.pool.num_free == 3
 
 

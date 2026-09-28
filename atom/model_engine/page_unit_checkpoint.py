@@ -1079,10 +1079,13 @@ class PagedStateCheckpointCoordinator:
         units are released and ``False`` is returned. The adopted checkpoint is
         deliberately not nominated for offload: it just arrived from that tier.
         """
-        units = self._transfer_units.pop(owner, None)
+        units = self._transfer_units.get(owner)
         if units is None:
             return False
-        return self.store.adopt_units(units, ("state-transfer", owner), prefix_hash)
+        adopted = self.store.adopt_units(units, ("state-transfer", owner), prefix_hash)
+        # Only now: if adoption raised, the units stay reachable for release.
+        del self._transfer_units[owner]
+        return adopted
 
     def suspend_queued_restore(
         self, dst_slot: int

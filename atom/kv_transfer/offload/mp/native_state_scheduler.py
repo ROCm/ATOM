@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, TypeVar
@@ -33,6 +34,8 @@ from atom.kv_transfer.offload.mp.native_state_worker import (
 )
 from atom.model_engine.page_unit_checkpoint import SuspendedCheckpointRestore
 from atom.utils import envs
+
+logger = logging.getLogger("atom")
 
 _MAX_SAVE_ATTEMPTS = 3
 
@@ -440,9 +443,15 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             return False
         lease = self._native_loads[operation]
         if succeeded:
-            self._checkpoints.adopt_transfer_units(
+            if not self._checkpoints.adopt_transfer_units(
                 operation, lease.transfer.prefix_hash
-            )
+            ):
+                # Another request published the same image first. Ours was
+                # released; the SLOT already holds identical restored state.
+                logger.debug(
+                    "Native restore for %s deduplicated against a READY image",
+                    operation,
+                )
             if lease.local_restore is not None:
                 self._checkpoints.release_suspended_restore(lease.local_restore)
                 lease.local_restore = None
