@@ -117,7 +117,10 @@ def divide(numerator, denominator):
 
 
 def per_1x128_e8m0_quant_fake(
-    x: torch.Tensor, quant_dtype: torch.dtype, transpose_scale: bool
+    x: torch.Tensor,
+    quant_dtype: torch.dtype,
+    transpose_scale: bool,
+    scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return (
         torch.empty(x.shape, dtype=quant_dtype, device=x.device),
@@ -136,10 +139,14 @@ def per_1x128_e8m0_quant_fake(
 # must stay inside this op.
 @torch_compile_guard(gen_fake=per_1x128_e8m0_quant_fake, mutates_args=[])
 def per_1x128_e8m0_quant(
-    x: torch.Tensor, quant_dtype: torch.dtype, transpose_scale: bool
+    x: torch.Tensor,
+    quant_dtype: torch.dtype,
+    transpose_scale: bool,
+    scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return per_group_quant_hip(
         x,
+        scale=scale,
         quant_dtype=quant_dtype,
         group_size=128,
         transpose_scale=transpose_scale,
@@ -1357,19 +1364,17 @@ class LinearBase(nn.Module):
                 otype=otype,
             )
         else:
-            if x_scale is None and self.blockscale_e8m0_scale:
-                # blockscale_e8m0_scale implies per_1x128. Column-major x_scale
-                # for the preshuffle GEMM, row-major otherwise.
-                x, x_scale = per_1x128_e8m0_quant(
-                    x, self.params_dtype, envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
-                )
-            elif x_scale is None:
+            if x_scale is None:
                 quant_func = self.quant_func
                 if self.quant_type.value == QuantType.per_1x128.value:
                     # preshuffle GEMM expects column-major x_scale;
                     # non-preshuffle GEMM expects row-major x_scale
                     quant_func = functools_partial(
-                        self.quant_func,
+                        (
+                            per_1x128_e8m0_quant
+                            if self.blockscale_e8m0_scale
+                            else self.quant_func
+                        ),
                         transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
                     )
                 if self.quant_type.value != QuantType.per_1x32.value:
