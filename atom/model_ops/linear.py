@@ -441,6 +441,7 @@ def weight_is_stored_preshuffled(
     params_dtype: torch.dtype,
     *,
     needs_preshuffled_weight: bool = False,
+    native_group_rows: int | None = None,
 ) -> bool:
     """Whether a quantized 2D GEMM weight of this kind is held preshuffled.
 
@@ -455,6 +456,11 @@ def weight_is_stored_preshuffled(
     qkv_a_proj) needs the 16x16-shuffled weight even when the global
     preshuffle path is off, so it is shuffled once at load rather than per
     forward.
+
+    ``native_group_rows`` marks a native group32 weight, otherwise read as
+    checkpoint bytes. Only an FP8 32x32 one is shuffled: on gfx950 for AITER's
+    preshuffled group32 GEMM (ATOM_GROUP32_WEIGHT_PRESHUFFLE, on by default),
+    and always under ``needs_preshuffled_weight`` (V4.1's grouped ``wo_a``).
 
     Says nothing about rank. Only 2D weights are shuffled -- Qwen3-Next's GDN
     conv1d expands its weight to 3D and must stay row-major -- so the caller
@@ -473,6 +479,14 @@ def weight_is_stored_preshuffled(
     sync side from ``.value``; unifying on ``==`` would have taken the sync
     side backwards.
     """
+    if native_group_rows is not None:
+        if native_group_rows != 32 or params_dtype != dtypes.fp8:
+            return False
+        if needs_preshuffled_weight:
+            return True
+        from aiter.jit.utils.chip_info import get_gfx
+
+        return envs.ATOM_GROUP32_WEIGHT_PRESHUFFLE and get_gfx() == "gfx950"
     quant_value = quant_type.value
     if quant_value == QuantType.per_Token.value:
         # The triton a8w8 per_Token GEMM consumes the unshuffled (N, K)
@@ -603,6 +617,12 @@ class LinearBase(nn.Module):
             self.register_parameter("bias", None)
         self.quant_type = quant_type
         self.params_dtype = params_dtype
+        # E8M0 rather than FP32 128x128 block scales, for the weight and the
+        # activation quantized for it alike (QuantizationConfig decides).
+        self.blockscale_e8m0_scale = (
+            quant_type.value == QuantType.per_1x128.value
+            and quant_config.blockscale_e8m0_scale
+        )
         self.native_a8_group_rows = None
         source_block = layer_quant_config.weight_block_size
         native_fp8 = params_dtype == torch.float8_e4m3fn and source_block in (
@@ -701,9 +721,7 @@ class LinearBase(nn.Module):
                 )
             elif quant_type == QuantType.per_1x128:
                 scale_dtype = (
-                    dtypes.fp8_e8m0
-                    if envs.ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE
-                    else dtypes.fp32
+                    dtypes.fp8_e8m0 if self.blockscale_e8m0_scale else dtypes.fp32
                 )
                 self.weight_scale = atom_parameter(
                     torch.empty(
@@ -1088,9 +1106,18 @@ class LinearBase(nn.Module):
         shuffled and its N left unpadded, with the RuntimeError that exists to
         catch exactly that skipped along with the padding.
         """
-        # The native group32 kernel consumes checkpoint bytes and compact
-        # scales, so there is no layout to settle.
+        # A native group32 weight keeps its compact scales, and its bytes too
+        # unless it is one the preshuffled group32 GEMM reads.
         if self.native_a8_group_rows is not None:
+            if self.weight.numel() and weight_is_stored_preshuffled(
+                self.quant_type,
+                self.params_dtype,
+                needs_preshuffled_weight=getattr(
+                    self, "needs_preshuffled_weight", False
+                ),
+                native_group_rows=self.native_a8_group_rows,
+            ):
+                shuffle_weights(self.weight)
             return
         if self.weight.numel() == 0:
             return
@@ -1285,6 +1312,7 @@ class LinearBase(nn.Module):
                 self.weight_scale,
                 x_scale=x_scale,
                 weight_group_rows=self.native_a8_group_rows,
+                weight_preshuffled=getattr(self.weight, "is_shuffled", False),
                 dtype=otype,
             )
             if self.bias is not None:
@@ -1307,7 +1335,7 @@ class LinearBase(nn.Module):
                         transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
                         **(
                             {"scale_type": dtypes.fp8_e8m0}
-                            if envs.ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE
+                            if self.blockscale_e8m0_scale
                             else {}
                         ),
                     )

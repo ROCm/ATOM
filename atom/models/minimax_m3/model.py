@@ -3,7 +3,7 @@
 
 """Inference-only MiniMax-M3 model support for ATOM."""
 
-from typing import Optional, Union
+from typing import ClassVar
 
 import torch
 from aiter import ActivationType, QuantType, dtypes
@@ -39,6 +39,7 @@ from atom.model_ops.minimax_m3.sparse_attn import (
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
+from atom.models.minimax_m3.mono.dispatch import MonoDecode
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -193,7 +194,7 @@ class MiniMaxM3MLP(nn.Module):
         self,
         config: PretrainedConfig,
         intermediate_size: int,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         prefix: str = "",
     ) -> None:
@@ -242,8 +243,8 @@ class MiniMaxM3MoE(nn.Module):
         self,
         config: PretrainedConfig,
         layer_id: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        params_dtype: Optional[torch.dtype] = None,
+        quant_config: QuantizationConfig | None = None,
+        params_dtype: torch.dtype | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -331,7 +332,7 @@ class MiniMaxM3Attention(nn.Module):
         self,
         config: PretrainedConfig,
         layer_id: int,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         cache_config: str = "bf16",
         index_cache_config: str = "auto",
@@ -410,7 +411,7 @@ class MiniMaxM3SparseAttention(nn.Module):
         self,
         config: PretrainedConfig,
         layer_id: int,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         cache_config: str = "bf16",
         index_cache_config: str = "auto",
@@ -571,8 +572,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
         prefix: str,
         cache_config: str = "bf16",
         index_cache_config: str = "auto",
-        quant_config: Optional[QuantizationConfig] = None,
-        params_dtype: Optional[torch.dtype] = None,
+        quant_config: QuantizationConfig | None = None,
+        params_dtype: torch.dtype | None = None,
         layer_num: int = 0,
     ) -> None:
         super().__init__()
@@ -719,7 +720,7 @@ class MiniMaxM3Model(nn.Module):
 
         # Eagle3 aux hidden-state capture layer ids. Empty unless an Eagle3 drafter
         # registers them via MiniMaxM3SparseForCausalLM.set_aux_hidden_state_layers.
-        self.aux_hidden_state_layers: tuple[int, ...] = tuple()
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
 
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
@@ -779,7 +780,7 @@ class MiniMaxM3Model(nn.Module):
 
 
 class MiniMaxM3SparseForCausalLM(nn.Module):
-    packed_modules_mapping = {
+    packed_modules_mapping: ClassVar[dict[str, tuple[str, str | int]]] = {
         ".index_q_proj": (".qkv_proj", "index_q"),
         ".index_k_proj": (".qkv_proj", "index_k"),
         ".q_proj": (".qkv_proj", "q"),
@@ -820,6 +821,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        self._mono = MonoDecode(self, atom_config, config)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
@@ -844,10 +846,17 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **_: object,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+    ) -> torch.Tensor | IntermediateTensors:
+        # Outside the compiled MiniMaxM3Model on purpose: a supported decode step of
+        # up to MAX_TOKENS tokens runs the mono kernels, everything else the
+        # original model.
+        if self._mono.supports(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        ):
+            return self._mono.forward(input_ids, positions)
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
-    def compute_logits(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.lm_head(hidden_states)
 
     def make_empty_intermediate_tensors(
@@ -872,14 +881,14 @@ class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
     """Native ATOM text-only view of a MiniMax-M3 VL checkpoint."""
 
     packed_modules_mapping = MiniMaxM3SparseForCausalLM.packed_modules_mapping
-    quant_exclude_name_mapping = {
+    quant_exclude_name_mapping: ClassVar[dict[str, str]] = {
         "language_model.model.": "model.",
         "language_model.lm_head": "lm_head",
     }
-    weights_mapping = {
+    weights_mapping: ClassVar[dict[str, str]] = {
         "model.language_model.": "language_model.",
     }
-    skip_weight_prefixes = [
+    skip_weight_prefixes: ClassVar[list[str]] = [
         "vision_tower.",
         "multi_modal_projector.",
         "patch_merge_mlp.",
@@ -915,7 +924,7 @@ class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+    ) -> torch.Tensor | IntermediateTensors:
         return self.language_model(
             input_ids,
             positions,
@@ -924,7 +933,7 @@ class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
             **kwargs,
         )
 
-    def compute_logits(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

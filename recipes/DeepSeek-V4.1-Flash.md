@@ -69,7 +69,8 @@ describes what is packed and what is captured.
 
 Weights remain native FP8 32x32 or FP4 group32. Dense projections use native
 FP8 microscaling MFMA (`tl.dot_scaled`) with FP32 accumulation; the grouped
-`wo_a` path remains BF16. Routed experts reuse V4/FusedMoE's configured kernels,
+`wo_a` keeps its FP8 weight in AITER's batched MXFP8 GEMM, its input quantized
+by the fused inverse RoPE. Routed experts reuse V4/FusedMoE's configured kernels,
 with numerical behavior described in the cache and graph guide. They
 run under whole-expert EP or shard across TP, whichever the launch selects.
 V4.1 initializes the same distributed environment as every other model and has no

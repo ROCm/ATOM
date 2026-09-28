@@ -40,10 +40,14 @@ def _apply_greedy_tokens(
     also needs a data-dependent output size. Reduce all rows and select with
     ``where`` so neither operation needs to read the mask back on the CPU.
     ``tie="low"`` preserves argmax's lowest-token-ID tie breaking.
+
+    A greedy row is one at or below ``SAMPLER_EPS``: the runner clamps every
+    temperature to it before the sampler sees them (``prepare_sample``), so a
+    requested 0 never arrives as 0.
     """
     greedy_tokens = topk_select(probs, 1, tie="low")[1].view(-1)
     return torch.where(
-        temperatures == 0, greedy_tokens, next_tokens.view(-1).to(torch.int)
+        temperatures <= SAMPLER_EPS, greedy_tokens, next_tokens.view(-1).to(torch.int)
     )
 
 
@@ -130,11 +134,20 @@ class Sampler(nn.Module):
         Returns:
             Sampled token IDs (num_tokens,)
         """
+        # Every path starts here: an all-greedy batch is an argmax whatever its
+        # filters. `tie="low"` is what makes this the pick `torch.argmax` made:
+        # the default promises no direction among equal scores, so a tie would
+        # resolve differently from one run (or TP rank) to the next. `logits` is
+        # bf16 and stays bf16 -- the reduction widens each element as it reads it.
+        if all_greedy:
+            return topk_select(logits, 1, tie="low")[1].view(-1)
+
         # No Top-K Top-P parameters, perform temperature-based sampling
         if not self._needs_filtering(top_ks, top_ps):
-            return self._temperature_sample(
+            sampled = self._temperature_sample(
                 logits, temperatures, needs_independent_noise=needs_independent_noise
             )
+            return _apply_greedy_tokens(logits, temperatures, sampled)
 
         # Apply top-k/top-p filtering
         return self._topk_topp_sample(
@@ -142,7 +155,6 @@ class Sampler(nn.Module):
             temperatures,
             top_ks,
             top_ps,
-            all_greedy,
             needs_independent_noise=needs_independent_noise,
         )
 
@@ -194,7 +206,6 @@ class Sampler(nn.Module):
         temperatures: torch.Tensor,
         top_ks: int | torch.Tensor | None,
         top_ps: float | torch.Tensor | None,
-        all_greedy: bool,
         needs_independent_noise: bool = False,
     ) -> torch.Tensor:
         """Top-K/Top-P sampling with temperature scaling.
@@ -206,17 +217,6 @@ class Sampler(nn.Module):
         """
         # Accepted but unused here; see docstring.
         del needs_independent_noise
-        # Fast path: if ALL requests are greedy (temperature=0), just do argmax
-        # This avoids the overhead of softmax and top-k/top-p filtering.
-        #
-        # `tie="low"` is what makes this the pick `torch.argmax` made: the
-        # default promises no direction among equal scores, so a near-tie would
-        # resolve differently from one TP rank to the next. It is free at k=1.
-        # `logits` is bf16 and stays bf16 -- the reduction widens each element
-        # as it reads it, so there is no `[rows, vocab]` cast in front of this.
-        if all_greedy:
-            return topk_select(logits, 1, tie="low")[1].view(-1)
-
         # Apply temperature scaling
         # Temperatures are pre-clamped to eps in model_runner.prepare_sample()
         scaled_logits = logits / temperatures.unsqueeze(-1)
