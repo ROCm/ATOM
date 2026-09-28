@@ -4,12 +4,6 @@ import os
 from atom.plugin.sglang.models.kimi_k3_processor import (
     register_kimi_k3_text_only_processor,
 )
-from atom.plugin.sglang.patches.flash_breakable_logits_patch import (
-    apply_flash_breakable_logits_patch,
-)
-from atom.plugin.sglang.patches.flash_decode_graph_replay_sync_patch import (
-    apply_flash_decode_graph_replay_sync_patch,
-)
 from atom.plugin.sglang.patches.prefill_compile_only_patch import (
     apply_prefill_compile_only_patch,
 )
@@ -166,8 +160,6 @@ def register_plugin() -> None:
     _install_loader_quant_patch()
     _register_tc_piecewise_attention_split_ops()
     _install_decode_graph_forward_context_patch()
-    apply_flash_decode_graph_replay_sync_patch()
-    apply_flash_breakable_logits_patch()
     apply_prefill_compile_only_patch()
     apply_triton_kernel_retention_patch()
     from atom.plugin.sglang.attention_backend.gdn_replayssm import (
