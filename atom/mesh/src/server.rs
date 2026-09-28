@@ -782,14 +782,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         WorkerManager::get_worker_urls(&app_state.context.worker_registry)
     );
 
-    let request_id_headers = config.request_id_headers.clone().unwrap_or_else(|| {
-        vec![
-            "x-request-id".to_string(),
-            "x-correlation-id".to_string(),
-            "x-trace-id".to_string(),
-            "request-id".to_string(),
-        ]
-    });
+    let request_id_headers =
+        crate::observability::request_id::header_names(config.request_id_headers.as_deref());
 
     let app = build_app(
         app_state.clone(),

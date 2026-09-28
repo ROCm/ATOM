@@ -989,7 +989,18 @@ async fn early_local_replies_preserve_response_and_discard_inflight_request_data
         let Response::ResponseHeaders(headers) = stream.recv().await else {
             panic!("local reply replaced")
         };
-        assert!(headers.response.unwrap().header_mutation.is_none());
+        let mutation = headers.response.unwrap().header_mutation;
+        if request_started {
+            let mutation = mutation.unwrap();
+            assert_eq!(
+                selected_header(&mutation, "x-request-id").as_deref(),
+                Some("same-id")
+            );
+            assert_eq!(mutation.set_headers.len(), 1);
+            assert!(mutation.remove_headers.is_empty());
+        } else {
+            assert!(mutation.is_none());
+        }
         assert_eq!(fixture.worker.load(), 0);
         if !header_only {
             if request_started {
@@ -1118,7 +1129,13 @@ async fn local_reply_interrupts_request_forwarding_under_backpressure() {
                 forwarded += body.body.len();
             }
             Response::ResponseHeaders(headers) => {
-                assert!(headers.response.unwrap().header_mutation.is_none());
+                let mutation = headers.response.unwrap().header_mutation.unwrap();
+                assert_eq!(
+                    selected_header(&mutation, "x-request-id").as_deref(),
+                    Some("same-id")
+                );
+                assert_eq!(mutation.set_headers.len(), 1);
+                assert!(mutation.remove_headers.is_empty());
                 break;
             }
             other => panic!("local reply replaced by {other:?}"),
@@ -1963,4 +1980,204 @@ fn listener_validation_ignores_inactive_executor_and_accepts_ephemeral_ports() {
     config.ext_proc.listen.set_port(0);
     config.ext_proc.executor_listen.set_port(0);
     assert!(config.validate().is_ok());
+}
+
+fn selected_header(mutation: &pb::HeaderMutation, name: &str) -> Option<String> {
+    mutation
+        .set_headers
+        .iter()
+        .filter_map(|h| h.header.as_ref())
+        .find(|h| h.key == name)
+        .map(|h| String::from_utf8(h.raw_value.clone()).unwrap())
+}
+
+#[tokio::test]
+async fn correlation_ids_follow_config_and_survive_request_validation_and_early_replies() {
+    for custom in [false, true] {
+        let fixture = Fixture::new(RouterConfig {
+            request_id_headers: custom.then(|| vec!["x-customer-id".into(), "x-trace-id".into()]),
+            ..Default::default()
+        })
+        .await;
+        let cases: Vec<(Vec<(&str, &str)>, Option<&str>)> = if custom {
+            vec![
+                (
+                    vec![
+                        ("x-request-id", "ignored"),
+                        ("X-Customer-ID", "customer"),
+                        ("x-trace-id", "trace"),
+                    ],
+                    Some("customer"),
+                ),
+                (
+                    vec![("x-request-id", "ignored"), ("x-trace-id", "trace")],
+                    Some("trace"),
+                ),
+                (vec![("x-request-id", "ignored")], None),
+            ]
+        } else {
+            vec![
+                (
+                    vec![("x-correlation-id", "correlation")],
+                    Some("correlation"),
+                ),
+                (vec![("x-trace-id", "trace")], Some("trace")),
+                (vec![("request-id", "request")], Some("request")),
+                (
+                    vec![
+                        ("x-correlation-id", "correlation"),
+                        ("x-request-id", "first"),
+                        ("x-request-id", "second"),
+                    ],
+                    Some("first"),
+                ),
+                (
+                    vec![("x-request-id", ""), ("x-correlation-id", "correlation")],
+                    Some(""),
+                ),
+                (vec![], None),
+            ]
+        };
+        for (ids, expected) in cases {
+            let mut stream = fixture.open().await;
+            let mut headers = vec![
+                (":method", "POST"),
+                (":path", "/generate"),
+                ("content-type", "application/json"),
+            ];
+            headers.extend(ids);
+            stream
+                .send(Request::RequestHeaders(Stream::headers(&headers, false)))
+                .await;
+            stream.body(br#"{"text":"hi"}"#, true).await;
+            let Response::RequestHeaders(response) = stream.recv().await else {
+                panic!("expected request headers");
+            };
+            let id = selected_header(
+                &response.response.unwrap().header_mutation.unwrap(),
+                "x-request-id",
+            )
+            .unwrap();
+            if let Some(expected) = expected {
+                assert_eq!(id, expected);
+            } else {
+                assert!(id.starts_with("gnt-") && id.len() == 28, "{id}");
+            }
+            assert!(matches!(stream.recv().await, Response::RequestBody(_)));
+            stream
+                .send(Request::ResponseHeaders(Stream::headers(
+                    &[(":status", "200"), ("x-request-id", "backend-id")],
+                    true,
+                )))
+                .await;
+            let Response::ResponseHeaders(response) = stream.recv().await else {
+                panic!("expected response headers");
+            };
+            assert_eq!(
+                selected_header(
+                    &response.response.unwrap().header_mutation.unwrap(),
+                    "x-request-id"
+                ),
+                Some(id)
+            );
+        }
+        for (path, content_type, body, status) in [
+            ("/unsupported", "application/json", None, 404),
+            ("/generate", "text/plain", None, 415),
+            (
+                "/generate",
+                "application/json",
+                Some(b"broken".as_slice()),
+                400,
+            ),
+        ] {
+            let mut stream = fixture.open().await;
+            stream
+                .send(Request::RequestHeaders(Stream::headers(
+                    &[
+                        (":method", "POST"),
+                        (":path", path),
+                        ("content-type", content_type),
+                        ("x-trace-id", "error-id"),
+                    ],
+                    false,
+                )))
+                .await;
+            if let Some(body) = body {
+                stream.body(body, true).await;
+            }
+            let Response::ImmediateResponse(response) = stream.recv().await else {
+                panic!("expected error");
+            };
+            assert_eq!(response.status.unwrap().code, status);
+            assert_eq!(
+                selected_header(&response.headers.unwrap(), "x-request-id").as_deref(),
+                Some("error-id")
+            );
+        }
+        let mut stream = fixture.open().await;
+        stream
+            .send(Request::RequestHeaders(Stream::headers(
+                &[
+                    (":method", "POST"),
+                    (":path", "/generate"),
+                    ("content-type", "application/json"),
+                    ("x-trace-id", "early-id"),
+                ],
+                false,
+            )))
+            .await;
+        stream
+            .send(Request::ResponseHeaders(Stream::headers(
+                &[(":status", "413")],
+                true,
+            )))
+            .await;
+        let Response::ResponseHeaders(response) = stream.recv().await else {
+            panic!("expected local reply");
+        };
+        assert_eq!(
+            selected_header(
+                &response.response.unwrap().header_mutation.unwrap(),
+                "x-request-id"
+            )
+            .as_deref(),
+            Some("early-id")
+        );
+        fixture.runtime.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn correlation_id_is_returned_when_admission_rejects_at_headers() {
+    let fixture = Fixture::new(RouterConfig {
+        max_concurrent_requests: 1,
+        queue_size: 0,
+        ..Default::default()
+    })
+    .await;
+    let mut active = fixture.open().await;
+    active.routed().await;
+    let mut rejected = fixture.open().await;
+    rejected
+        .send(Request::RequestHeaders(Stream::headers(
+            &[
+                (":method", "POST"),
+                (":path", "/generate"),
+                ("content-type", "application/json"),
+                ("x-correlation-id", "rejected-id"),
+            ],
+            false,
+        )))
+        .await;
+    let Response::ImmediateResponse(response) = rejected.recv().await else {
+        panic!("expected rejection");
+    };
+    assert_eq!(response.status.unwrap().code, 429);
+    assert_eq!(
+        selected_header(&response.headers.unwrap(), "x-request-id").as_deref(),
+        Some("rejected-id")
+    );
+    active.response_headers(true).await;
+    fixture.runtime.shutdown().await.unwrap();
 }

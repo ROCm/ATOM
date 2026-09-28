@@ -51,6 +51,14 @@ For other options:
 bash atom/mesh/scripts/ext-proc/test_envoy_atom.sh --help
 ```
 
+The Envoy template disables automatic request ID generation and preserves client
+request IDs. Keep `generate_request_id: false` and
+`preserve_external_request_id: true` when adapting the configuration so Mesh can
+apply its configured `request_id_headers` priority. The selected ID is forwarded
+upstream and returned in the `x-request-id` response header. Header mutations use
+`allow_envoy: true` to remove client-supplied `x-envoy-*` headers, and
+`disallow_is_error: true` so rejected filtering operations fail the request.
+
 ## Send Requests
 
 Non-streaming completion:

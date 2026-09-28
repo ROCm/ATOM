@@ -15,7 +15,6 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use rand::Rng;
 use tower::{Layer, Service};
 use tower_http::trace::{MakeSpan, OnRequest, OnResponse, TraceLayer};
 use tracing::{error, field::Empty, info, info_span, warn, Span};
@@ -29,36 +28,6 @@ use crate::{
     routers::comm::error::extract_error_code_from_response,
     server::AppState,
 };
-
-/// Alphanumeric characters for request ID generation (as bytes for O(1) indexing)
-const REQUEST_ID_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-
-/// Generate OpenAI-compatible request ID based on endpoint.
-fn generate_request_id(path: &str) -> String {
-    let prefix = if path.contains("/chat/completions") {
-        "chatcmpl-"
-    } else if path.contains("/completions") {
-        "cmpl-"
-    } else if path.contains("/generate") {
-        "gnt-"
-    } else if path.contains("/responses") {
-        "resp-"
-    } else {
-        "req-"
-    };
-
-    // Generate a random string similar to OpenAI's format
-    // Use byte array indexing (O(1)) instead of chars().nth() (O(n))
-    let mut rng = rand::rng();
-    let random_part: String = (0..24)
-        .map(|_| {
-            let idx = rng.random_range(0..REQUEST_ID_CHARS.len());
-            REQUEST_ID_CHARS[idx] as char
-        })
-        .collect();
-
-    format!("{}{}", prefix, random_part)
-}
 
 /// Extension type for storing request ID
 #[derive(Clone, Debug)]
@@ -111,21 +80,13 @@ where
     }
 
     fn call(&mut self, mut req: Request) -> Self::Future {
-        let headers = self.headers.clone();
-
-        // Extract request ID from headers or generate new one
-        let mut request_id = None;
-
-        for header_name in headers.iter() {
-            if let Some(header_value) = req.headers().get(header_name) {
-                if let Ok(value) = header_value.to_str() {
-                    request_id = Some(value.to_string());
-                    break;
-                }
-            }
-        }
-
-        let request_id = request_id.unwrap_or_else(|| generate_request_id(req.uri().path()));
+        let request_id =
+            crate::observability::request_id::resolve(&self.headers, req.uri().path(), |name| {
+                req.headers()
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned)
+            });
 
         // Insert request ID into request extensions for other middleware/handlers to use
         req.extensions_mut().insert(RequestId(request_id.clone()));

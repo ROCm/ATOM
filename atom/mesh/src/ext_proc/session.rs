@@ -60,6 +60,8 @@ pub(super) struct Session {
     early_response: bool,
     parser: Arc<RequestParser>,
     request: Option<RequestEnvelope>,
+    request_id: Option<String>,
+    request_id_headers: Vec<String>,
     admitted: Option<AdmissionLease>,
     request_end: Option<bool>,
     lifecycle: RequestLifecycle,
@@ -80,6 +82,9 @@ impl Session {
         };
         Self {
             router: Arc::new(EndpointRouter::new(app.clone(), executor)),
+            request_id_headers: crate::observability::request_id::header_names(
+                app.router_config.request_id_headers.as_deref(),
+            ),
             app,
             parser,
             admission,
@@ -88,6 +93,7 @@ impl Session {
             protocol: None,
             early_response: false,
             request: None,
+            request_id: None,
             admitted: None,
             request_end: None,
             lifecycle: RequestLifecycle::new(),
@@ -113,7 +119,7 @@ impl Session {
                         Err(tonic::Status::failed_precondition(error.to_string()))
                     } else if self.lifecycle.response_started {
                         Err(tonic::Status::internal(error.to_string()))
-                    } else { Ok(error.response()) };
+                    } else { Ok(error.response(self.request_id.as_deref())) };
                     let _ = timeout(Duration::from_secs(1), output.send(response)).await;
                 }
             }
@@ -182,6 +188,14 @@ impl Session {
             if matches!(&message.request, Some(Request::ResponseHeaders(_))) {
                 self.lifecycle.response_started = true;
             }
+            if self.request_id.is_none() {
+                if let Some(Request::RequestHeaders(headers)) = &message.request {
+                    self.request_id = Some(RequestEnvelope::request_id(
+                        headers,
+                        &self.request_id_headers,
+                    ));
+                }
+            }
             self.validate_protocol(&message)?;
             let attributes = message.attributes;
             if matches!(&message.request, Some(Request::ResponseHeaders(_))) {
@@ -192,7 +206,8 @@ impl Session {
             match (message.request, &self.phase) {
                 (Some(Request::RequestHeaders(headers)), Phase::Headers) => {
                     let end = headers.end_of_stream;
-                    let mut request = RequestEnvelope::new(headers)?;
+                    let mut request =
+                        RequestEnvelope::new(headers, self.request_id.clone().unwrap())?;
                     request.set_budget(self.parser.budget.clone());
                     request.metadata(message.metadata_context)?;
                     self.request = Some(request);
@@ -230,10 +245,12 @@ impl Session {
                         }
                     }
                 }
-                (Some(Request::RequestTrailers(_)), Phase::RequestBody) => {
+                (Some(Request::RequestTrailers(trailers)), Phase::RequestBody) => {
                     if self.request_end.is_some() {
                         return Err(ProcessingError::protocol("request body already ended"));
                     }
+                    self.request.as_mut().unwrap().trailer_mutation =
+                        Some(Mutation::filter_request_trailers(trailers));
                     self.request_end = Some(true);
                     if self.admitted.is_some() {
                         pending = Some(self.prepare(true));
@@ -268,8 +285,11 @@ impl Session {
                     if self.lifecycle.status.is_none() {
                         return Err(ProcessingError::protocol("response is missing :status"));
                     }
-                    self.respond(self.output.send(Mutation::response_headers()))
-                        .await?;
+                    self.respond(
+                        self.output
+                            .send(Mutation::response_headers(self.request_id.as_deref())),
+                    )
+                    .await?;
                     self.phase = if headers.end_of_stream {
                         Phase::Complete
                     } else {
@@ -285,7 +305,7 @@ impl Session {
                     }
                 }
                 (Some(Request::ResponseTrailers(_)), Phase::ResponseBody) => {
-                    self.respond(self.output.send(Mutation::trailers(false)))
+                    self.respond(self.output.send(Mutation::trailers(false, None)))
                         .await?;
                     self.phase = Phase::Complete;
                 }
@@ -450,7 +470,7 @@ impl Session {
 
     fn dispatch(&mut self, prepared: PreparedRequest) -> PendingDispatch {
         let PreparedRequest {
-            request,
+            mut request,
             admission,
             decision,
             trailers,
@@ -458,6 +478,7 @@ impl Session {
         } = prepared;
         self.lifecycle.observation = Some(observation);
         let headers = Mutation::request_headers(
+            &request.headers,
             &decision.address.to_string(),
             &request.id,
             decision.authorization.as_deref(),
@@ -471,7 +492,9 @@ impl Session {
             output.send(headers).await?;
             output.send_body(&request.raw, !trailers, true).await?;
             if trailers {
-                output.send(Mutation::trailers(true)).await?;
+                output
+                    .send(Mutation::trailers(true, request.trailer_mutation.take()))
+                    .await?;
             }
             Ok(())
         })

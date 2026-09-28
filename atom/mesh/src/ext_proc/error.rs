@@ -25,17 +25,23 @@ impl ProcessingError {
         Self::new(400, "invalid_processing_sequence", message)
     }
 
-    pub fn response(&self) -> pb::ProcessingResponse {
+    pub fn response(&self, request_id: Option<&str>) -> pb::ProcessingResponse {
+        let mut headers = Mutation::headers([
+            ("content-type", b"application/json".as_slice()),
+            ("x-mesh-error-code", self.code.as_bytes()),
+        ]);
+        if let Some(id) = request_id {
+            headers
+                .set_headers
+                .extend(Mutation::headers([("x-request-id", id.as_bytes())]).set_headers);
+        }
         pb::ProcessingResponse {
             response: Some(pb::processing_response::Response::ImmediateResponse(
                 pb::ImmediateResponse {
                     status: Some(super::proto::envoy::r#type::v3::HttpStatus {
                         code: i32::from(self.status),
                     }),
-                    headers: Some(Mutation::headers([
-                        ("content-type", b"application/json".as_slice()),
-                        ("x-mesh-error-code", self.code.as_bytes()),
-                    ])),
+                    headers: Some(headers),
                     body: serde_json::to_vec(&crate::routers::comm::error::payload(
                         http::StatusCode::from_u16(self.status).unwrap(),
                         self.code,
@@ -62,7 +68,7 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn both_ingresses_share_error_envelope_and_code_header() {
-        let response = ProcessingError::new(429, "admission_full", "full").response();
+        let response = ProcessingError::new(429, "admission_full", "full").response(None);
         let Some(pb::processing_response::Response::ImmediateResponse(response)) =
             response.response
         else {

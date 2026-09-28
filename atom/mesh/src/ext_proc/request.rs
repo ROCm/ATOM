@@ -28,6 +28,7 @@ pub(super) struct RequestEnvelope {
     pub path: String,
     pub id: String,
     pub raw: Vec<u8>,
+    pub trailer_mutation: Option<pb::HeaderMutation>,
     pub subset: Option<HashSet<String>>,
     buffered_bytes: usize,
     budget: Option<Arc<Semaphore>>,
@@ -46,7 +47,35 @@ impl std::ops::Deref for RoutingInput {
 }
 
 impl RequestEnvelope {
-    pub fn new(input: pb::HttpHeaders) -> Result<Self, ProcessingError> {
+    /// Resolve correlation before validating the request so local errors can echo it.
+    pub fn request_id(input: &pb::HttpHeaders, names: &[String]) -> String {
+        let headers = input
+            .headers
+            .as_ref()
+            .map(|h| h.headers.as_slice())
+            .unwrap_or_default();
+        let path = headers
+            .iter()
+            .find(|h| h.key == ":path")
+            .and_then(|h| std::str::from_utf8(Self::header_bytes(h)).ok())
+            .unwrap_or("")
+            .split('?')
+            .next()
+            .unwrap_or("");
+        crate::observability::request_id::resolve(names, path, |name| {
+            let name = HeaderName::from_bytes(name.as_bytes()).ok()?;
+            let header = headers
+                .iter()
+                .find(|h| h.key.eq_ignore_ascii_case(name.as_str()))?;
+            HeaderValue::from_bytes(Self::header_bytes(header))
+                .ok()?
+                .to_str()
+                .ok()
+                .map(str::to_owned)
+        })
+    }
+
+    pub fn new(input: pb::HttpHeaders, id: String) -> Result<Self, ProcessingError> {
         let mut headers = HeaderMap::new();
         let mut path = None;
         let mut method = None;
@@ -125,18 +154,18 @@ impl RequestEnvelope {
                 "application/json is required",
             ));
         }
-        let id = headers
-            .get("x-request-id")
-            .and_then(|v| v.to_str().ok())
-            .filter(|v| !v.is_empty())
-            .map(str::to_owned)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        headers.insert(
+            "x-request-id",
+            HeaderValue::from_str(&id)
+                .map_err(|_| ProcessingError::invalid("invalid request ID"))?,
+        );
         headers.remove(super::mutation::Mutation::DESTINATION);
         Ok(Self {
             headers,
             path: route.to_owned(),
             id,
             raw: Vec::new(),
+            trailer_mutation: None,
             subset: None,
             buffered_bytes: 0,
             budget: None,
@@ -435,23 +464,26 @@ mod tests {
     use std::time::Duration;
 
     fn envelope(budget: Arc<Semaphore>, size: usize) -> RequestEnvelope {
-        let mut request = RequestEnvelope::new(pb::HttpHeaders {
-            headers: Some(core::HeaderMap {
-                headers: [
-                    (":method", "POST"),
-                    (":path", "/generate"),
-                    ("content-type", "application/json"),
-                ]
-                .into_iter()
-                .map(|(key, value)| core::HeaderValue {
-                    key: key.into(),
-                    value: value.into(),
-                    ..Default::default()
-                })
-                .collect(),
-            }),
-            ..Default::default()
-        })
+        let mut request = RequestEnvelope::new(
+            pb::HttpHeaders {
+                headers: Some(core::HeaderMap {
+                    headers: [
+                        (":method", "POST"),
+                        (":path", "/generate"),
+                        ("content-type", "application/json"),
+                    ]
+                    .into_iter()
+                    .map(|(key, value)| core::HeaderValue {
+                        key: key.into(),
+                        value: value.into(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                }),
+                ..Default::default()
+            },
+            "buffer-test".into(),
+        )
         .unwrap();
         request.set_budget(budget);
         request.append(&vec![b' '; size], 1024).unwrap();

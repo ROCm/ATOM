@@ -181,18 +181,29 @@ impl Envoy {
     }
 
     async fn chunked(&self, path: &str, body: &[u8], trailers: bool) -> String {
-        let mut request = format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nTE: trailers\r\nConnection: close\r\n{}\r\n",
-            if trailers { "Trailer: x-request-checksum\r\n" } else { "" }).into_bytes();
+        self.chunked_with_headers(path, body, trailers, "").await
+    }
+
+    async fn chunked_with_headers(
+        &self,
+        path: &str,
+        body: &[u8],
+        trailers: bool,
+        headers: &str,
+    ) -> String {
+        let mut request = format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nTE: trailers\r\nConnection: close\r\n{headers}{}\r\n",
+            if trailers { "Trailer: x-request-id-span, x-request-checksum, x-mesh-execution-id, cookie, authorization, x-request-id\r\n" } else { "" }).into_bytes();
         for chunk in body.chunks(7) {
             request.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
             request.extend_from_slice(chunk);
             request.extend_from_slice(b"\r\n");
         }
-        request.extend_from_slice(if trailers {
-            b"0\r\nx-request-checksum: original\r\n\r\n"
+        if trailers {
+            let value = uuid::Uuid::new_v4();
+            request.extend_from_slice(format!("0\r\nx-request-id-span: original\r\nx-request-checksum: original\r\nx-mesh-execution-id: {value}\r\ncookie: {value}\r\nauthorization: Bearer {value}\r\nx-request-id: {value}\r\n\r\n").as_bytes());
         } else {
-            b"0\r\n\r\n"
-        });
+            request.extend_from_slice(b"0\r\n\r\n");
+        }
         self.raw(&request).await
     }
 }
@@ -286,13 +297,15 @@ async fn real_envoy_routes_once_preserves_body_and_cleans_up_sse_cancel() {
     assert!(response.contains("hello"));
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
     body["stream"] = json!(true);
-    let mut stream = client
+    let response = client
         .post(&url)
+        .header("x-correlation-id", "streaming-id")
         .json(&body)
         .send()
         .await
-        .unwrap()
-        .bytes_stream();
+        .unwrap();
+    assert_eq!(response.headers()["x-request-id"], "streaming-id");
+    let mut stream = response.bytes_stream();
     assert!(stream.next().await.unwrap().unwrap().starts_with(b"data:"));
     assert_eq!(worker.load(), 1);
     drop(stream);
@@ -406,10 +419,18 @@ async fn real_envoy_preserves_chunked_body_and_bidirectional_trailers() {
         assert_eq!(received, &body);
         assert_eq!(
             received_trailers
-                .get("x-request-checksum")
+                .get("x-request-id-span")
                 .map(|v| v.to_str().unwrap()),
             trailers.then_some("original")
         );
+        assert!(!received_trailers.contains_key("x-request-checksum"));
+        assert!(!received_trailers.contains_key("x-mesh-execution-id"));
+        assert!(!received_trailers.contains_key("cookie"));
+        assert!(!received_trailers.contains_key("authorization"));
+        assert!(!received_trailers.contains_key("x-request-id"));
+        if let Some(declared) = headers.get("trailer") {
+            assert_eq!(declared, "x-request-id-span");
+        }
     }
     drop(envoy);
     runtime.shutdown().await.unwrap();
@@ -495,8 +516,12 @@ async fn real_envoy_local_errors_keep_the_original_status_and_body() {
     // Trigger an HCM idle timeout while Mesh is still collecting the upload.
     let template = base.replace("stream_idle_timeout: 300s", "stream_idle_timeout: 0.2s");
     let envoy = Envoy::with_config(runtime.address.port(), &template).await;
-    let response = envoy.raw(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{").await;
+    let response = envoy.raw(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nConnection: close\r\nx-correlation-id: local-timeout\r\n\r\n{").await;
     assert!(response.starts_with("HTTP/1.1 408"), "{response}");
+    assert!(
+        response.contains("x-request-id: local-timeout"),
+        "{response}"
+    );
     assert!(response.contains("envoy-local:408:"), "{response}");
     assert!(!response.contains("invalid_processing_sequence"));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -560,6 +585,12 @@ impl PdBackend {
     ) -> Response {
         use mesh::config::types::BackendType;
         assert!(!headers.contains_key("x-mesh-execution-id"));
+        assert!(!headers.contains_key("cookie"));
+        assert!(!headers.contains_key("x-client-internal"));
+        assert!(!headers.contains_key("x-envoy-client-control"));
+        if headers.contains_key("x-correlation-id") {
+            assert_eq!(headers["x-request-id"], headers["x-correlation-id"]);
+        }
         assert_eq!(body["vendor_extension"], 42);
         backend.calls.lock().unwrap().push((prefill, body.clone()));
         if prefill {
@@ -692,10 +723,16 @@ impl PdBackend {
             let text = if index == 0 {
                 let response = client
                     .post(format!("{}{path}", envoy.url))
+                    .header("x-correlation-id", "pd-correlation")
+                    .header("cookie", uuid::Uuid::new_v4().to_string())
+                    .header("x-client-internal", "untrusted")
+                    .header("x-envoy-client-control", "untrusted")
+                    .header("x-mesh-execution-id", "untrusted")
                     .json(body)
                     .send()
                     .await
                     .unwrap();
+                assert_eq!(response.headers()["x-request-id"], "pd-correlation");
                 let status = response.status();
                 let text = response.text().await.unwrap();
                 assert_eq!(status, StatusCode::OK, "{kind:?}: {text}");
@@ -810,4 +847,141 @@ async fn real_envoy_vllm_pd_executes_selected_pair_and_cancels_prefill() {
 #[ignore = "requires Docker and envoyproxy/envoy:v1.37.0"]
 async fn real_envoy_sglang_pd_executes_selected_pair_and_cancels_decode() {
     PdBackend::verify(mesh::config::types::BackendType::Sglang).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker and envoyproxy/envoy:v1.37.0"]
+async fn real_envoy_preserves_correlation_and_filters_client_headers() {
+    async fn echo(headers: HeaderMap, Json(_): Json<Value>) -> Response {
+        let headers: std::collections::BTreeMap<_, Vec<_>> = headers
+            .keys()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    headers
+                        .get_all(name)
+                        .iter()
+                        .map(|v| v.to_str().unwrap().to_owned())
+                        .collect(),
+                )
+            })
+            .collect();
+        ([("x-request-id", "backend-id")], Json(headers)).into_response()
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, Router::new().route("/generate", post(echo)))
+            .await
+            .unwrap();
+    });
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let client_auth = format!("Bearer {}", uuid::Uuid::new_v4());
+    let worker_key = uuid::Uuid::new_v4().to_string();
+    for custom in [false, true] {
+        let mut config = RouterConfig::default();
+        config.ext_proc.enabled = true;
+        config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
+        config.request_id_headers =
+            custom.then(|| vec!["x-customer-id".into(), "x-correlation-id".into()]);
+        let app = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+        let mut worker =
+            BasicWorkerBuilder::new(format!("http://{address}")).model_id("test-model");
+        if custom {
+            worker = worker.api_key(worker_key.clone());
+        }
+        app.worker_registry.register(Arc::new(worker.build()));
+        let runtime = ExtProcRuntime::start(app).await.unwrap();
+        let envoy = Envoy::start(runtime.address.port()).await;
+        let url = format!("{}/generate", envoy.url);
+        let response = client
+            .post(&url)
+            .header("x-correlation-id", "correlation")
+            .header("x-customer-id", "customer")
+            .header("x-trace-id", "lower-priority")
+            .header("x-session-id", "session")
+            .header(
+                "traceparent",
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            )
+            .header("authorization", &client_auth)
+            .header("cookie", uuid::Uuid::new_v4().to_string())
+            .header("x-client-internal", "untrusted")
+            .header("x-envoy-client-control", "untrusted")
+            .header("x-mesh-execution-id", "untrusted")
+            .json(&json!({"text":"hello"}))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let response_id = response.headers().get("x-request-id").cloned();
+        let text = response.text().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let expected = if custom { "customer" } else { "correlation" };
+        assert_eq!(response_id.unwrap(), expected);
+        let headers: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(headers["x-request-id"], json!([expected]));
+        assert_eq!(headers["x-correlation-id"], json!(["correlation"]));
+        assert_eq!(headers["x-session-id"], json!(["session"]));
+        assert!(headers.get("traceparent").is_some());
+        assert_eq!(headers["content-type"], json!(["application/json"]));
+        let expected_auth = if custom {
+            format!("Bearer {worker_key}")
+        } else {
+            client_auth.clone()
+        };
+        assert_eq!(headers["authorization"], json!([expected_auth]));
+        for name in [
+            "cookie",
+            "x-client-internal",
+            "x-envoy-client-control",
+            "x-mesh-execution-id",
+            "x-customer-id",
+            "x-trace-id",
+        ] {
+            assert!(headers.get(name).is_none(), "forwarded {name}: {headers}");
+        }
+        let response = client
+            .post(&url)
+            .json(&json!({"text":"hello"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let id = response.headers()["x-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(id.starts_with("gnt-") && id.len() == 28, "{id}");
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["x-request-id"],
+            json!([id])
+        );
+        let response = client
+            .post(&url)
+            .header("x-correlation-id", "parse-error")
+            .header("content-type", "application/json")
+            .body("broken")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()["x-request-id"], "parse-error");
+        // Also verify disallowed fields cannot enter through request trailers.
+        let request_headers = format!(
+            "x-correlation-id: trailer-id\r\ncookie: {}\r\nx-client-internal: untrusted\r\n",
+            uuid::Uuid::new_v4()
+        );
+        let response = envoy
+            .chunked_with_headers("/generate", br#"{"text":"hello"}"#, true, &request_headers)
+            .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("x-request-id: trailer-id"), "{response}");
+        drop(envoy);
+        runtime.shutdown().await.unwrap();
+    }
+    server.abort();
 }
