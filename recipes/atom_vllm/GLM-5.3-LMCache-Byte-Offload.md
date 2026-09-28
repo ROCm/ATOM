@@ -166,136 +166,107 @@ before the run rather than discovered after it.
 
 ## Measured
 
-A matched ON/OFF pair, back to back in the same slot, same tree
-(`b6e22c4792ab5202063089b28b4d4197750c3186`, `atom_dirty_lines=0` verified at
-the start of each arm), same model, 1800 s per arm, seed 530419. The arms
-differ in exactly one thing: whether the connector is loaded. All four ranks'
-`Creating LMCacheEngine with config:` dumps were parsed before any traffic was
-sent and all four read `'chunk_size': 256, 'max_local_cpu_size': 256.0,
-'cache_policy': 'ATOM_SLRU', 'lookup_server_worker_ids': [0]`, and all four
-logged `registered 78 layers, num_blocks=53763` — the server block above is a
-checked fact, not a list of exported variables.
+All numbers below come from one tree, `atom` branch of PR #2369 (head
+`ee1ebfa29`), vLLM 0.28 plugin backend in `rocm/atom-dev:vllm-0.28.0`, TP=4 on
+gfx950 GPUs 0-3.
 
-| | Conc | tput/GPU | TTFT p50 / p90 | ITL p50 | ITL p90 | prefix hit | ceiling |
+### Throughput and latency
+
+Matched ON/OFF pairs: one arm per concurrency per setting, 1800 s of traffic
+each, back to back in the same slot, seed 530419, the *Client* line above
+verbatim with `--concurrency` set to the row. The two arms differ in exactly
+one thing -- whether `--kv-transfer-config` is on the server line -- and the
+arm order alternates between rungs so that slot order cannot masquerade as an
+effect. `tput/GPU` is `output_token_throughput / 4`; output length is pinned at
+512, so `req/s` is the same measurement and is not a second result.
+
+| conc | arm | tput/GPU (tok/s) | req/s | TTFT p50 / p90 (ms) | ITL p50 / p90 (ms) | HBM prefix hit | CPU tier share |
 |---|---|---|---|---|---|---|---|
-| **full window, 1800 s** | | | | | | | |
-| OFF | 8 | 86.03 tok/s/GPU | 2279 / 4301 ms | 18.11 ms | 21.80 ms | 61.13% | 90.79% |
-| ON | 8 | **90.28 tok/s/GPU** | 1314 / 2927 ms | 16.11 ms | 18.74 ms | **82.55%** | 91.20% |
-| | | **+4.94%** | −42.4 / −32.0% | −11.0% | −14.0% | +21.4 pp | |
-| **steady state, t >= 600 s** | | | | | | | |
-| OFF | 8 | 88.32 tok/s/GPU | 2239 / 3649 ms | 18.10 ms | 21.73 ms | 64.37% | n/a |
-| ON | 8 | **108.23 tok/s/GPU** | 1257 / 1696 ms | 15.96 ms | 17.67 ms | **90.73%** | n/a |
-| | | **+22.54%** | −43.9 / −53.5% | −11.8% | −18.7% | +26.4 pp | |
+| 8 | OFF | 89.00 | 0.6953 | 2216 / 4259 | 17.37 / 20.99 | 60.54% | 0.00% |
+| 8 | ON | **103.47** | 0.8083 | 1286 / 2442 | 15.68 / 17.99 | 59.65% | 24.02% |
+| 8 | delta | **+16.26%** | +16.26% | -41.95% / -42.66% | -9.74% / -14.29% | | |
+| 32 | OFF | 158.84 | 1.2409 | 2799 / 6133 | 43.08 / 52.11 | 62.06% | 0.00% |
+| 32 | ON | **229.71** | 1.7946 | 3422 / 5162 | 25.96 / 31.90 | 60.52% | 27.12% |
+| 32 | delta | **+44.61%** | +44.61% | +22.26% / -15.83% | -39.74% / -38.78% | | |
 
-`tput/GPU` is `output_token_throughput / 4`. Output length is fixed at 512, so
-it is `request_throughput x 128` by construction and is not a second result.
+`HBM prefix hit` and `CPU tier share` are read from the server's own counters
+as end-minus-start deltas over the measured window, not from the client.
 
-**The headline number is a function of the window, and the second row is not
-cherry-picking.** The tier starts empty and fills at ~0.287 GiB/s/rank, while
-this workload's rotating working set is 128 prefixes plus the 128 tails in
-flight with them, `128 x (1.2737 + 0.182) = 186.3 GiB/rank`, so **~650 s pass
-before steady-state reuse is possible at all**. A 600 s run at this pool size
-would measure the fill, not the cache — which is why each arm runs 1800 s. The
-same start-cut is applied to **both** arms, and the OFF arm is the control that
-licenses it: it is flat across every cut (0.6721 / 0.6889 / 0.6888 / 0.6900
-req/s at t >= 0 / 200 / 300 / 600 s), so cutting the window does not itself
-manufacture throughput.
+### Agentic multi-turn workload (cache-validation shape)
 
-**There is no warmup phase.** Neither `--warmup-request-count` nor
-`--warmup-duration` is set, and aiperf's rule is that absent both, no warmup
-runs — all 1272 / 1216 exported records are `benchmark_phase: profiling`.
-`--benchmark-grace-period 60` drains in-flight requests at the *end* and is not
-a warmup. Adding one would not remove the ramp anyway: it would have to run
-~650 s itself to cover the fill.
+The shape published by
+[inference-benchmarking/aiperf-cache-validation](https://github.com/DO-FDE/inference-benchmarking/blob/main/aiperf-cache-validation/run_cache_validation.sh):
+open-loop, 64 users at 1.6 req/s, 256 conversations of 8 turns, an 8 K shared
+system prompt plus 112 K per-user context, ISL 12.7 K +/- 4 K and OSL 917 +/-
+300, natural stopping (no `ignore_eos`). One arm, connector ON, 1800 s of
+traffic, seed 530419.
 
-Per 120 s window, `n` requests started / `cold` = requests that cached nothing:
+Server: the *Server* block above, unmodified. Client:
 
-| t (s) | ON n / cold / hit% | OFF n / cold / hit% |
-|---|---|---|
-| 0 | 29 / 26 / 9.05% | 64 / 51 / 17.77% |
-| 120 | 59 / 34 / 37.08% | 80 / 30 / 54.69% |
-| 240 | 80 / 27 / 57.97% | 80 / 20 / 65.08% |
-| 360 | 48 / 11 / 67.45% | 72 / 26 / 55.90% |
-| 480 | 40 / 11 / 62.36% | 88 / 19 / 68.61% |
-| 600 | 104 / **0** / 90.47% | 88 / 20 / 66.88% |
-| 720-1680 | 96-104 / **0** / 89.7-91.9% | 72-88 / 16-28 / 54.3-70.0% |
+```bash
+aiperf profile \
+  --model amd/GLM-5.3-MXFP4 \
+  --tokenizer /data/amd_int/models/GLM-5.3-MXFP4 --tokenizer-trust-remote-code \
+  --url http://127.0.0.1:8332 --endpoint-type chat --streaming \
+  --use-server-token-count \
+  --user-centric-rate 1.6 --num-users 64 \
+  --conversation-num 256 --conversation-turn-mean 8 --conversation-turn-stddev 0 \
+  --conversation-turn-delay-mean 30000 --conversation-turn-delay-stddev 25000 \
+  --shared-system-prompt-length 8000 --user-context-prompt-length 112000 \
+  --num-dataset-entries 256 \
+  --isl 12700 --isl-stddev 4000 --osl 917 --osl-stddev 300 \
+  --benchmark-duration 1800 --random-seed 530419 \
+  --server-metrics --server-metrics-formats json parquet \
+  --export-level raw --request-timeout-seconds 3600
+```
 
-Two different things are visible here and they must not be conflated. The ON
-arm's ramp is transient: cold requests stop entirely at t = 579 s and the hit
-rate locks at 90-92%. The OFF arm's scatter is **not** a ramp — it is still
-producing 16-28 cold requests per window at t = 1680 s, because the 186.3
-GiB/rank working set does not fit the 152.98 GiB/rank HBM pool and evicted
-prefixes have nothing underneath them. It is not slow to warm up; it never
-warms up.
-
-Cold requests are also spread across the first 600 s rather than bunched at
-t = 0, and that is coupon collection, not a defect: each request draws a prefix
-uniformly from 128, so the last distinct prefix first appears around request
-`128 x ln(128) ~ 621`.
-
-**Where the prompt tokens went.** `vllm:prompt_tokens_by_source_total`, whose
-three components sum to `vllm:prompt_tokens_total` exactly on both arms:
-
-| source | OFF | ON |
-|---|---|---|
-| `local_compute` | 15,488,497 (38.87%) | **7,274,722 (17.45%)** |
-| `local_cache_hit` | 24,358,464 (61.13%) | 25,067,392 (60.14%) |
-| `external_kv_transfer` | 0 | **9,339,904 (22.41%)** |
-| total | 39,846,961 | 41,682,018 |
-
-Prefill recompute fell from 8,561 to 4,034 tok/s (−52.9%) while the server
-delivered 4.9% more requests over the full window. The tier only feeds prefill,
-so TTFT moves most (−42.4% at p50) and ITL follows second-hand (−11.0%) as
-prefill stops competing with decode.
-
-Note that the HBM hit rate is **not** what improved — 61.13% OFF against 60.14%
-ON, i.e. very slightly *lower* with the tier on. On the plugin path vLLM asks
-the connector only about what the HBM pool missed (`queries = num_tokens -
-local_computed`), so the tier's 22.41% is carved out of the miss tail
-(16,614,626 tokens, 39.86% of prompt tokens) and the two percentages have
-different denominators. **They must not be summed as if they were shares of the
-same thing.** Within the tail the tier answered **56.21%**.
-
-That number has an independent witness. LMCache's own `Retrieved X out of Y
-required tokens` lines across all four ranks sum to 37,359,616; divided by TP=4
-that is 9,339,904, which equals `vllm:external_prefix_cache_hits` bit for bit.
-The two instruments share no code path, so this is corroboration rather than a
-restatement.
-
-**The ceiling column, and a correction.** aiperf does **not** export a
-theoretical hit rate; its `overall_usage_prompt_cache_read_pct` (82.547% /
-61.130%) is the *measured* combined rate, equal by construction to
-`(hbm_hits + tier_hits) / prompt_tokens`. The ceiling above is computed here as
-
-    ceiling = (Q - pool_size x 28,672) / Q
-
-on the reasoning that only the first load of each of the 128 distinct prefixes
-is unavoidable. The tempting stricter form — "the 4,096-token tail is
-cache-busted and therefore never reusable", giving `(R - 128) x 28,672 / Q =
-78.69%` — **is wrong, and the measurement is what shows it**, because ON
-measured 82.55%, above that supposed ceiling. The per-request histogram says
-why: `--cache-bust first-turn-suffix` does not make every tail unique.
-
-| cached tokens in a request | ON requests |
+| metric | value |
 |---|---|
-| 32,768 (the whole prompt) | 252 |
-| 28,672 (prefix only) | 878 |
-| 0 (cold prefix) | 109 |
-| other (partial) | 33 |
+| input token throughput | 19,283.82 tok/s |
+| output token throughput | 100.76 tok/s |
+| request throughput | 0.14 req/s |
+| requests completed in window | 259 |
+| ISL avg | 136,253 tokens |
+| OSL avg | 711.94 tokens |
+| TTFT p50 / p90 | 553,937 / 926,782 ms |
+| ITL p50 / p90 | 219.71 / 260.96 ms |
+| request latency p50 / p90 | 717,516 / 1,082,921 ms |
+| HBM prefix hit | 5.84% (2,264,000 / 38,768,750) |
+| CPU tier share | 0.00% |
+| illegal-memory faults | 0 |
 
-So 91.20% is a loose but genuine upper bound, and the steady-state row is
-deliberately left `n/a`: with zero cold requests after t = 600 s the cold term
-vanishes and the formula degenerates to 100%, while the real limit there is how
-often tails repeat — which this workload does not pin down. What can be said is
-that ON's steady 90.73% sits within half a point of the full-window bound.
+The offered rate is above what this configuration serves at these sequence
+lengths, so the run is queue-bound: latency percentiles reflect the standing
+queue, and throughput is the served rate. The CPU tier stored 145,716,224
+tokens (summed over the four ranks) and served none of them back -- at this
+turn cadence the reused prefix is still resident in HBM when the next turn
+arrives, so nothing falls into the tier's fetchable band.
 
-**Limits.** Each arm is **n=1 in runs**. No dispersion is quoted, and the OFF
-arm's flatness across window cuts bounds within-run drift, not run-to-run
-variance — it is what licenses the start-cut, not an error bar on +22.54%.
-Throughput is quantised at 1/1272 = 0.08% (ON) and 1/1216 = 0.08% (OFF), which
-is far below the effect but says nothing about the effect's repeatability. The
-+4.94% full-window figure in particular is a mixture of a 600 s transient and a
-1200 s steady state, and should be quoted as such or not at all.
+### Accuracy
+
+gsm8k, all 1319 questions, 3-shot, greedy:
+
+```bash
+lm_eval run --model local-chat-completions \
+  --model_args "model=amd/GLM-5.3-MXFP4,base_url=http://127.0.0.1:8330/v1/chat/completions,num_concurrent=64,max_retries=3,max_gen_toks=16384,timeout=1800,tokenized_requests=False" \
+  --tasks gsm8k --num_fewshot 3 --apply_chat_template --fewshot_as_multiturn \
+  --gen_kwargs temperature=0,top_p=1 --seed 0,1234,1234,1234 \
+  --limit 1319 --log_samples
+```
+
+Three points, one server boot each. The server is the *Server* block above with
+`--num-gpu-blocks-override 2048 --max-model-len 32768`: the small HBM pool is
+what makes the third point mean something, because a repeat of the same
+question can then only come back from the CPU tier.
+
+| point | connector | pass | gsm8k exact_match (flexible) |
+|---|---|---|---|
+| `m1_base` | absent | -- | 0.9583 +/- 0.0055 |
+| `m2_store` | present | 1st (tier filling) | 0.9629 +/- 0.0052 |
+| `m3_load` | present | 2nd (same questions) | 0.9568 +/- 0.0056 |
+
+All three agree inside one standard error, so restoring KV bytes from the CPU
+tier does not change the answers.
 
 ## Related
 
