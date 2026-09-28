@@ -345,6 +345,29 @@ class tokenIDProcessor:
         self.num_rejected: np.ndarray | None = None
         self.num_bonus: np.ndarray | None = None
 
+    def verify_context_shift(self) -> np.ndarray | None:
+        """How far `batch.context_lens` runs past this step's verify window.
+
+        `context_lens` is `seq.num_tokens`, placeholders included. The window's
+        context length -- what anchors its positions and KV slots -- is that
+        minus this, per row. Deferred output stages the window
+        `num_rejected` further back (`L - num_rejected - num`), so the shift
+        is `num_rejected`. Undeferred (pipeline parallel), postprocess has
+        already written the step back and refilled one run of `mtp_k + 1`
+        placeholders, so the window is `L - num - 1 .. L - 2` whatever was
+        rejected: the shift is 1 on every row. Reusing `num_rejected` there
+        placed the window `num_rejected - 1` slots early -- wrong positions,
+        and its KV written over tokens already accepted.
+
+        None when there is nothing to shift by (dummy runs, no speculation,
+        the first forward before any sampler output).
+        """
+        if self.num_rejected is None:
+            return None
+        if self.is_deferred_out:
+            return self.num_rejected
+        return np.ones_like(self.num_rejected)
+
     @staticmethod
     def _batch_process_token_ids(token_ids: list) -> list[tuple[int, ...]]:
         """Batch process token_ids: vectorized -1 truncation using numpy."""
@@ -3466,11 +3489,11 @@ class ModelRunner:
             # Nothing is deferred on this path, so the counts that belong with
             # the tokens `prepare_sampled_ids` just emitted are THIS step's --
             # not, as on the deferred path, the previous step's. Zeroes here
-            # read as "every draft was accepted": the scheduler stages the next
-            # step's window at `seq.num_tokens - num_rejected - num`
-            # (`ScheduledBatch.__init__`), so the anchor lands `num_rejected`
-            # slots late, on the trailing `eos_token_id` placeholders, and the
-            # request degenerates into fluent noise.
+            # would claim no draft was rejected and no bonus taken: the
+            # scheduler records them on the sequence and hands them back with
+            # the next batch, where the linear-attention backends roll their
+            # recurrent state to `num_bonus + 1` accepted tokens -- one, for
+            # every step, whatever was actually kept.
             #
             # `num_bonus_tokens` is None on a step that scored no drafts (the
             # `spec_decode_metadata is None` branch above), where nothing was

@@ -2486,10 +2486,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         context_lens = np.asarray(batch.context_lens, dtype=np.int32)
         block_tables = batch.block_tables
         if not batch.is_dummy_run and max_seqlen_q > 1:
-            # Get num_rejected (already mapped to current batch order in prepare_input_ids)
-            num_rejected = self.model_runner.tokenID_processor.num_rejected
-            if num_rejected is not None:
-                context_lens -= num_rejected
+            # Pull the window back to where it was staged; mapped to the
+            # current batch order in prepare_input_ids. See
+            # `verify_context_shift` for why it is not `num_rejected` under PP.
+            shift = self.model_runner.tokenID_processor.verify_context_shift()
+            if shift is not None:
+                context_lens -= shift
                 num_blocks = cdiv(context_lens, self.model_runner.block_size)
                 block_tables = [bt[:n] for bt, n in zip(block_tables, num_blocks)]
         positions = decode_positions(context_lens, max_seqlen_q)

@@ -423,9 +423,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             # The scheduler reserves a full draft span, including placeholders
             # from the previous step. Ragged verification takes its head.
             starts = np.asarray(batch.context_lens) - (batch.num_spec_step + 1)
-            rejected = self.model_runner.tokenID_processor.num_rejected
-            if rejected is not None:
-                starts = starts - rejected
+            shift = self.model_runner.tokenID_processor.verify_context_shift()
+            if shift is not None:
+                starts = starts - shift
         return self._prepare(
             batch,
             running_bs,
