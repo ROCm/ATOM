@@ -1,5 +1,4 @@
 import fnmatch
-import os
 import re
 from typing import ClassVar
 
@@ -23,10 +22,7 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.qwen4_exp.hyperconnection import (
-    HC_FUSED,
-    Qwen4ExpHyperConnection,
-)
+from atom.model_ops.qwen4_exp.hyperconnection import Qwen4ExpHyperConnection
 from atom.model_ops.qwen4_exp.ops.gated import sigmoid_mul, sigmoid_rmsnorm
 from atom.model_ops.qwen4_exp.ops.moe_decode import moe_decode_single_token
 from atom.model_ops.qwen4_exp.ple_layer import Qwen4ExpPLELayer
@@ -114,13 +110,11 @@ class _Qwen4ExpQuantizationConfig:
         return getattr(self._config, field + "global_spec")
 
 
-# Route the sigmoid-gated shared expert through the fused MoE as expert
-# `num_experts` (top-k + 1). The released FP8 checkpoint stores experts one by
-# one, so the loader can place the shared expert into that extra slot.
-FUSE_SHARED_EXPERT = os.environ.get("ATOM_QWEN4_FUSE_SHARED_EXPERT", "1") == "1"
-# One-token MoE through `moe_decode_single_token` instead of sort + quant +
-# the 1-stage asm kernel (needs the fused shared expert).
-SINGLE_TOKEN_MOE = os.environ.get("ATOM_QWEN4_SINGLE_TOKEN_MOE", "1") == "1"
+# The sigmoid-gated shared expert rides through the fused MoE as expert
+# `num_experts` (top-k + 1) and batch-1 MoE goes through
+# `moe_decode_single_token`; both are the default for the served model. MTP
+# builds its own block, and keeps the standalone shared expert because its
+# intent head loads without the extra slot.
 
 
 class Qwen4ExpRMSNormGated(nn.Module):
@@ -314,7 +308,7 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
         logits = self.gate(hidden_states)
         if self.fuse_shared:
             # The tail logit is the shared expert's sigmoid gate.
-            if SINGLE_TOKEN_MOE and hidden_states.shape[0] == 1:
+            if hidden_states.shape[0] == 1:
                 out = self._single_token_experts(hidden_states, logits)
             else:
                 out = self.experts(hidden_states=hidden_states, router_logits=logits)
@@ -652,9 +646,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
         input_ids: torch.Tensor | None,
         pending: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
-        """Unfused: returns the streams. Fused (`HC_FUSED`): returns
-        `(streams, pending)` where `pending` is this layer's MLP combine,
-        deferred into the next hyper-connection."""
+        """Fused: returns `(streams, pending)` where `pending` is this layer's
+        MLP combine, deferred into the next hyper-connection. Unfused: returns
+        the streams; the MTP drafter runs its single layer this way."""
         if not self.fused_hc:
             return self._forward_unfused(positions, hidden_states, input_ids)
         if self.ple is not None:
@@ -769,8 +763,8 @@ class Qwen4ExpModel(nn.Module):
                 prefix=prefix,
                 layer_num=layer_num,
                 quant_config=quant_config,
-                fused_hc=HC_FUSED,
-                fuse_shared_expert=FUSE_SHARED_EXPERT,
+                fused_hc=True,
+                fuse_shared_expert=True,
             ),
             prefix=f"{prefix}.layers",
             layer_num_offset=0,
@@ -811,26 +805,17 @@ class Qwen4ExpModel(nn.Module):
             else self.get_input_embeddings(input_ids)
         ).repeat(1, self.hc_count)
 
-        if HC_FUSED:
-            pending = None
-            for layer in self.layers[self.start_layer : self.end_layer]:
-                hidden_states, pending = layer(
-                    positions, hidden_states, input_ids, pending
-                )
-            if self.return_hc_state:
-                hidden_states = self.hyper_connection_mixer.apply_pending(
-                    hidden_states, pending
-                )
-                return hidden_states.view(-1, self.hc_count, self.config.hidden_size)
-            mixed, _ = self.hyper_connection_mixer.mix_fused(hidden_states, pending)
-            return mixed
-
+        pending = None
         for layer in self.layers[self.start_layer : self.end_layer]:
-            hidden_states = layer(positions, hidden_states, input_ids)
-
+            hidden_states, pending = layer(
+                positions, hidden_states, input_ids, pending
+            )
         if self.return_hc_state:
+            hidden_states = self.hyper_connection_mixer.apply_pending(
+                hidden_states, pending
+            )
             return hidden_states.view(-1, self.hc_count, self.config.hidden_size)
-        mixed, _ = self.hyper_connection_mixer.mix(hidden_states)
+        mixed, _ = self.hyper_connection_mixer.mix_fused(hidden_states, pending)
         return mixed
 
 

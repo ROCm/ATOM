@@ -76,7 +76,7 @@ def _merge(files: list[str], keys: list[str], out_path: str) -> None:
 
 def register_qwen4_exp_tuned_configs() -> None:
     global _registered
-    if _registered or os.environ.get("ATOM_QWEN4_TUNED_CONFIGS", "1") != "1":
+    if _registered:
         return
     _registered = True
     try:

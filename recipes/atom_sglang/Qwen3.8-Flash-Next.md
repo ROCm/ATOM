@@ -91,28 +91,35 @@ Notes:
   about twice as many at a time.
 * `--context-length` must cover prompt + output (129024 + 2048 here).
 
-The configuration above is the one the measurements in
-`atom/model_ops/qwen4_exp/configs/` and the MI308X tuning notes below were
-taken on.
+The configuration above is the one the MI308X-specific pieces below were
+validated with.
 
 ## MI308X-specific pieces in ATOM
 
 * AITER tuned GEMM tables for this model's FP8 (a8w8 bpreshuffle) and BF16
   shapes ship in `atom/model_ops/qwen4_exp/configs/` and are registered
-  automatically (`ATOM_QWEN4_TUNED_CONFIGS=0` disables them).
+  automatically.
 * The SGLang plugin advertises the native GPU arch to AITER. The images export
   `GPU_ARCH_LIST=gfx942;gfx950`; forwarded unchanged, AITER's `get_gfx()`
   reported gfx950 on MI308X and every gfx-keyed tuned table missed.
 
-## Feature switches (all default on)
+## Fused paths (no switches)
 
-| Variable | Effect |
-|---|---|
-| `ATOM_QWEN4_HC_FUSED` | fused hyper-connections, combine deferred into the next mix |
-| `ATOM_QWEN4_FUSE_SHARED_EXPERT` | shared expert routed through the fused MoE as expert 512 |
-| `ATOM_QWEN4_SINGLE_TOKEN_MOE` | batch-1 MoE (routing + experts) in two Triton kernels |
-| `ATOM_QWEN4_QSA_MFMA_LOGITS` | QSA indexer scoring on matrix cores for prefill |
-| `ATOM_QWEN4_TUNED_CONFIGS` | MI308X AITER GEMM tables |
+The fused kernels are the only path the served model takes; they are not
+gated behind environment variables:
+
+* hyper-connections: `process_weights_after_loading` builds the combined
+  `[down | inject]` weight, and the decoder layer defers each sub-layer's
+  combine into the next mix.
+* shared expert: routed through the fused MoE as expert 512 (top-k + 1),
+  scoring with sigmoid.
+* batch-1 MoE: routing and experts in two Triton kernels.
+* QSA indexer scoring: matrix cores for prefill, CUDA cores for decode-sized
+  batches.
+* MI308X AITER GEMM tables: registered at model construction.
+
+The MTP drafter's single layer runs unfused (separate `mix`/`combine`) and
+keeps a standalone shared expert.
 
 ## Optional: quantized prefill all-reduce (lossy)
 
