@@ -1654,7 +1654,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             def staging_slot(region_idx, pool_idx):
                 # Both page formats share one pool, but each transfer requires
                 # packed pages; slicing columns would retain the larger stride.
-                width = block_regions[region_idx].unit_bytes
+                width = pages[region_idx].region.unit_bytes
                 return (
                     staging[pool_idx]
                     .view(-1)[: dcp_staging_chunk_pages * width]
@@ -1662,7 +1662,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 )
 
             def gather_sharded_mla(region_idx, indices, pool_idx):
-                if block_regions[region_idx].semantic_role != MLA_KV_ROLE:
+                page = pages[region_idx]
+                if page.region.semantic_role != MLA_KV_ROLE:
                     raise ValueError(f"Region {region_idx} is not token-contiguous MLA")
                 if mla_staging_layout != "token-contiguous":
                     raise RuntimeError(
@@ -1672,10 +1673,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                         "ATOM_USE_TRITON_MLA_SHUFFLE_KV=0 for Triton MLA."
                     )
                 slot = staging_slot(region_idx, pool_idx)
-                pages = gather_dcp_mla_pages(
-                    block_tensor_views[region_idx], slot, indices, scheduler_block_size
+                page_count = gather_dcp_mla_pages(
+                    page.view, slot, indices, scheduler_block_size
                 )
-                return slot.data_ptr(), pages
+                return slot.data_ptr(), page_count
 
             def gather_sharded_index(
                 region_idx,
