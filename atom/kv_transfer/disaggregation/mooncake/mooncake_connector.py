@@ -16,7 +16,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +88,21 @@ MOONCAKE_DEFAULT_PROTOCOL = "rdma"
 PREFILL_LOOKUP_TIMEOUT = 60
 PREFILL_LOOKUP_POLL_INTERVAL = 0.01
 _IB_SYSFS_ROOT = Path("/sys/class/infiniband")
+
+
+@dataclass
+class _PendingStagedWrite:
+    pool_idx: int
+    ready_event: torch.cuda.Event
+    staging_base: int
+    staged_pages: int
+    target: str
+    region_idx: int
+    dst_base: int
+    bytes_per_page: int
+    dst_block_ids: list[int]
+    req_id: str
+    engine: Any
 
 
 def _swa_ring_ids(seq) -> list[int]:
@@ -760,6 +775,7 @@ class MooncakeConnector(KVConnectorBase):
         self._dcp_staging_free: list[int] = []
         self._dcp_staging_lock = threading.Lock()
         self._prepare_dcp_gather = None
+        self._dcp_staging_error: BaseException | None = None
         self._gather_sharded_index = None
         self._gather_sharded_mla = None
         self._dcp_staging_stream = None
@@ -1357,8 +1373,15 @@ class MooncakeConnector(KVConnectorBase):
 
     def _acquire_dcp_staging_slot(self) -> int:
         with self._dcp_staging_lock:
+            error = getattr(self, "_dcp_staging_error", None)
             if self._dcp_staging_free:
-                return self._dcp_staging_free.pop()
+                slot = self._dcp_staging_free.pop()
+            else:
+                slot = None
+        if error is not None:
+            raise RuntimeError("DCP staging pool is unavailable") from error
+        if slot is not None:
+            return slot
         logger.warning(
             "DCP staging pool exhausted (size=%d), waiting for a slot",
             self._dcp_staging_pool_size,
@@ -1366,8 +1389,35 @@ class MooncakeConnector(KVConnectorBase):
         while True:
             time.sleep(0.001)
             with self._dcp_staging_lock:
+                error = getattr(self, "_dcp_staging_error", None)
                 if self._dcp_staging_free:
-                    return self._dcp_staging_free.pop()
+                    slot = self._dcp_staging_free.pop()
+                else:
+                    slot = None
+            if error is not None:
+                raise RuntimeError("DCP staging pool is unavailable") from error
+            if slot is not None:
+                return slot
+
+    def _try_acquire_dcp_staging_slot(self) -> int | None:
+        """Take a second pipeline slot without blocking another send worker."""
+        with self._dcp_staging_lock:
+            error = getattr(self, "_dcp_staging_error", None)
+            # Keep one slot available for a worker that has not acquired its
+            # first buffer yet. Without this reserve, one long request can
+            # repeatedly reclaim its just-released prefetch slot.
+            if len(self._dcp_staging_free) > 1:
+                slot = self._dcp_staging_free.pop()
+            else:
+                slot = None
+        if error is not None:
+            raise RuntimeError("DCP staging pool is unavailable") from error
+        return slot
+
+    def _fail_dcp_staging_pool(self, error: BaseException) -> None:
+        with self._dcp_staging_lock:
+            if getattr(self, "_dcp_staging_error", None) is None:
+                self._dcp_staging_error = error
 
     def _release_dcp_staging_slot(self, idx: int) -> None:
         with self._dcp_staging_lock:
@@ -1947,18 +1997,15 @@ class MooncakeConnector(KVConnectorBase):
                 )
                 gather_indices = self._prepare_dcp_gather(chunk_plan)
 
-                for region_idx, dst_base, bpb in staged_regions:
-                    if not self._execute_dcp_staged_layer_chunk(
-                        target,
-                        region_idx,
-                        dst_base,
-                        bpb,
-                        dst_chunk,
-                        req_id,
-                        gather_indices,
-                        engine=engine,
-                    ):
-                        return False
+                if not self._execute_staged_region_pipeline(
+                    target,
+                    staged_regions,
+                    dst_chunk,
+                    req_id,
+                    gather_indices,
+                    engine=engine,
+                ):
+                    return False
         return True
 
     def _execute_dcp_staged_layer_chunk(
@@ -1975,7 +2022,110 @@ class MooncakeConnector(KVConnectorBase):
     ) -> bool:
         """GPU-pack one index or MLA layer/chunk, then RDMA complete pages."""
 
-        pool_idx = self._acquire_dcp_staging_slot()
+        pending = self._launch_staged_dcp_layer_chunk(
+            target,
+            region_idx,
+            dst_base,
+            bytes_per_page,
+            dst_block_ids,
+            req_id,
+            gather_indices,
+            engine=engine,
+        )
+        return self._finish_staged_dcp_layer_chunk(pending)
+
+    def _execute_staged_region_pipeline(
+        self,
+        target: str,
+        staged_regions: list[tuple[int, int, int]],
+        dst_block_ids: list[int],
+        req_id: str,
+        gather_indices,
+        *,
+        engine=None,
+    ) -> bool:
+        """Overlap the next layer's gather with the current layer's RDMA write."""
+
+        pending = None
+        for region_idx, dst_base, bytes_per_page in staged_regions:
+            if pending is None:
+                pending = self._launch_staged_dcp_layer_chunk(
+                    target,
+                    region_idx,
+                    dst_base,
+                    bytes_per_page,
+                    dst_block_ids,
+                    req_id,
+                    gather_indices,
+                    engine=engine,
+                )
+                continue
+
+            pool_idx = self._try_acquire_dcp_staging_slot()
+            if pool_idx is None:
+                if not self._finish_staged_dcp_layer_chunk(pending):
+                    return False
+                pending = self._launch_staged_dcp_layer_chunk(
+                    target,
+                    region_idx,
+                    dst_base,
+                    bytes_per_page,
+                    dst_block_ids,
+                    req_id,
+                    gather_indices,
+                    engine=engine,
+                )
+                continue
+
+            try:
+                next_pending = self._launch_staged_dcp_layer_chunk(
+                    target,
+                    region_idx,
+                    dst_base,
+                    bytes_per_page,
+                    dst_block_ids,
+                    req_id,
+                    gather_indices,
+                    pool_idx=pool_idx,
+                    engine=engine,
+                )
+            except Exception:
+                self._discard_staged_dcp_layer_chunk(pending)
+                raise
+            try:
+                ok = self._finish_staged_dcp_layer_chunk(pending)
+            except Exception:
+                self._discard_staged_dcp_layer_chunk(next_pending)
+                raise
+            if not ok:
+                self._discard_staged_dcp_layer_chunk(next_pending)
+                return False
+            pending = next_pending
+
+        return (
+            self._finish_staged_dcp_layer_chunk(pending)
+            if pending is not None
+            else True
+        )
+
+    def _launch_staged_dcp_layer_chunk(
+        self,
+        target: str,
+        region_idx: int,
+        dst_base: int,
+        bytes_per_page: int,
+        dst_block_ids: list[int],
+        req_id: str,
+        gather_indices,
+        *,
+        pool_idx: int | None = None,
+        engine=None,
+    ) -> _PendingStagedWrite:
+        """Queue one gather and return its slot/event without blocking the host."""
+
+        if pool_idx is None:
+            pool_idx = self._acquire_dcp_staging_slot()
+        stream = None
         try:
             stream = (
                 self._dcp_staging_stream
@@ -1994,56 +2144,117 @@ class MooncakeConnector(KVConnectorBase):
                     gather_indices,
                     pool_idx,
                 )
-            stream.synchronize()
-            if staged_pages != len(dst_block_ids):
+                ready_event = stream.record_event()
+            return _PendingStagedWrite(
+                pool_idx=pool_idx,
+                ready_event=ready_event,
+                staging_base=staging_base,
+                staged_pages=staged_pages,
+                target=target,
+                region_idx=region_idx,
+                dst_base=dst_base,
+                bytes_per_page=bytes_per_page,
+                dst_block_ids=dst_block_ids,
+                req_id=req_id,
+                engine=engine,
+            )
+        except Exception:
+            try:
+                if stream is not None:
+                    stream.synchronize()
+            except Exception as drain_error:
+                # Unknown queued work may still target this slot. Quarantine it
+                # rather than allowing another worker to overwrite live data.
+                self._fail_dcp_staging_pool(drain_error)
+                logger.exception(
+                    "Failed to drain staging slot %d after gather launch error; "
+                    "removing it from the free pool",
+                    pool_idx,
+                )
+            else:
+                self._release_dcp_staging_slot(pool_idx)
+            raise
+
+    def _discard_staged_dcp_layer_chunk(self, pending: _PendingStagedWrite) -> None:
+        """Drain a queued gather before making its staging slot reusable."""
+        try:
+            pending.ready_event.synchronize()
+        except Exception as drain_error:
+            self._fail_dcp_staging_pool(drain_error)
+            logger.exception(
+                "Failed to drain discarded staging slot %d; removing it from "
+                "the free pool",
+                pending.pool_idx,
+            )
+        else:
+            self._release_dcp_staging_slot(pending.pool_idx)
+
+    def _finish_staged_dcp_layer_chunk(self, pending: _PendingStagedWrite) -> bool:
+        """Wait for one gather, RDMA its pages, and release its staging slot."""
+        gather_complete = False
+        try:
+            pending.ready_event.synchronize()
+            gather_complete = True
+            staged_pages = pending.staged_pages
+            if staged_pages != len(pending.dst_block_ids):
                 raise RuntimeError(
                     f"DCP staging produced {staged_pages} pages for "
-                    f"{len(dst_block_ids)} destinations"
+                    f"{len(pending.dst_block_ids)} destinations"
                 )
 
             src_page = np.arange(staged_pages, dtype=np.int64)
-            dst_page = np.asarray(dst_block_ids, dtype=np.int64)
-            length = np.full(staged_pages, bytes_per_page, dtype=np.int64)
-            # Consumer PAGE regions use the same whole-page MR registration
-            # policy. Address continuity alone does not imply a shared MR key.
+            dst_page = np.asarray(pending.dst_block_ids, dtype=np.int64)
+            length = np.full(staged_pages, pending.bytes_per_page, dtype=np.int64)
             dst_mr_bytes = (
-                self._MAX_RDMA_CHUNK_BYTES - self._MAX_RDMA_CHUNK_BYTES % bytes_per_page
+                self._MAX_RDMA_CHUNK_BYTES
+                - self._MAX_RDMA_CHUNK_BYTES % pending.bytes_per_page
             ) or self._MAX_RDMA_CHUNK_BYTES
             src_addrs, dst_addrs, sizes = coalesce_contiguous(
-                staging_base + src_page * bytes_per_page,
-                dst_base + dst_page * bytes_per_page,
+                pending.staging_base + src_page * pending.bytes_per_page,
+                pending.dst_base + dst_page * pending.bytes_per_page,
                 length,
                 src_mr=self._dcp_staging_mr,
-                dst_mr=(dst_base, dst_mr_bytes),
+                dst_mr=(pending.dst_base, dst_mr_bytes),
             )
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
                     "[PRODUCER] staged DCP RDMA write: req=%s, region=%d, "
                     "pages=%d, descriptors=%d, total_bytes=%d",
-                    req_id,
-                    region_idx,
+                    pending.req_id,
+                    pending.region_idx,
                     staged_pages,
                     len(src_addrs),
                     sum(sizes),
                 )
             if not self._rdma_write_with_retry(
-                target,
+                pending.target,
                 src_addrs.tolist(),
                 dst_addrs.tolist(),
                 sizes.tolist(),
                 req_id,
                 "staged-dcp",
-                engine=engine,
+                engine=pending.engine,
             ):
                 logger.error(
                     "[PRODUCER] staged DCP transfer failed for req %s region %d",
-                    req_id,
-                    region_idx,
+                    pending.req_id,
+                    pending.region_idx,
                 )
                 return False
             return True
+        except Exception as gather_error:
+            if not gather_complete:
+                self._fail_dcp_staging_pool(gather_error)
+            raise
         finally:
-            self._release_dcp_staging_slot(pool_idx)
+            if gather_complete:
+                self._release_dcp_staging_slot(pending.pool_idx)
+            else:
+                logger.error(
+                    "Gather event failed for staging slot %d; removing it from "
+                    "the free pool",
+                    pending.pool_idx,
+                )
 
     def _execute_block_slot_transfer(
         self,

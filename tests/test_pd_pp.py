@@ -9,7 +9,7 @@ import threading
 import types
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -1100,7 +1100,7 @@ def test_dcp_staging_waits_for_request_ready_event(stage_mla):
     connector._gather_sharded_index = MagicMock()
     connector._gather_sharded_mla = MagicMock() if stage_mla else None
     connector._dcp_staging_stream = MagicMock()
-    connector._execute_dcp_staged_layer_chunk = MagicMock(return_value=True)
+    connector._execute_staged_region_pipeline = MagicMock(return_value=True)
     connector._rdma_write_with_retry = MagicMock(return_value=True)
     ready_event = object()
     request_data = {
@@ -1124,38 +1124,20 @@ def test_dcp_staging_waits_for_request_ready_event(stage_mla):
         engine=ready_event,
     )
     connector._dcp_staging_stream.wait_event.assert_called_once_with(ready_event)
-    expected = []
+    expected_regions = []
     if stage_mla:
-        expected.append(
-            call(
-                "consumer:1234",
-                0,
-                3_000_000,
-                mla_block_bytes,
-                [10],
-                "req-1",
-                gather_indices,
-                engine=ready_event,
-            )
-        )
+        expected_regions.append((0, 3_000_000, mla_block_bytes))
+    expected_regions.append((1, 4_000_000, index_block_bytes))
+    connector._execute_staged_region_pipeline.assert_called_once_with(
+        "consumer:1234",
+        expected_regions,
+        [10],
+        "req-1",
+        gather_indices,
+        engine=ready_event,
+    )
+    if stage_mla:
         connector._rdma_write_with_retry.assert_not_called()
-    expected.append(
-        call(
-            "consumer:1234",
-            1,
-            4_000_000,
-            index_block_bytes,
-            [10],
-            "req-1",
-            gather_indices,
-            engine=ready_event,
-        )
-    )
-    assert connector._execute_dcp_staged_layer_chunk.call_args_list == expected
-    assert all(
-        call.kwargs["engine"] is ready_event
-        for call in connector._rdma_write_with_retry.call_args_list
-    )
 
 
 def test_dcp_staging_rejects_missing_request_ready_event():
@@ -1522,7 +1504,10 @@ def test_dcp_staged_write_preserves_selected_engine(monkeypatch):
     conn = _matched_rail_producer()
     conn._acquire_dcp_staging_slot = lambda: 3
     conn._release_dcp_staging_slot = MagicMock()
-    conn._dcp_staging_stream = SimpleNamespace(synchronize=MagicMock())
+    ready_event = MagicMock()
+    conn._dcp_staging_stream = SimpleNamespace(
+        record_event=MagicMock(return_value=ready_event)
+    )
     conn._gather_sharded_index = lambda *_args: (10000, 2)
     conn._dcp_staging_mr = (10000, 1024)
     conn._rdma_write_with_retry = MagicMock(return_value=True)
@@ -1540,8 +1525,119 @@ def test_dcp_staged_write_preserves_selected_engine(monkeypatch):
         "staged-dcp",
         engine=selected,
     )
-    conn._dcp_staging_stream.synchronize.assert_called_once()
+    ready_event.synchronize.assert_called_once()
     conn._release_dcp_staging_slot.assert_called_once_with(3)
+
+
+def test_staged_region_pipeline_launches_next_gather_before_current_write():
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    conn = _matched_rail_producer()
+    order = []
+    conn._try_acquire_index_staging_slot = MagicMock(return_value=7)
+
+    def launch(_target, region_idx, *_args, pool_idx=None, **_kwargs):
+        order.append(("launch", region_idx, pool_idx))
+        return region_idx
+
+    def finish(region_idx):
+        order.append(("finish", region_idx))
+        return True
+
+    conn._launch_staged_index_layer_chunk = MagicMock(side_effect=launch)
+    conn._finish_staged_index_layer_chunk = MagicMock(side_effect=finish)
+
+    assert mc.MooncakeConnector._execute_staged_region_pipeline(
+        conn,
+        "consumer:1234",
+        [(0, 20_000, 64), (1, 30_000, 64)],
+        [4, 5],
+        "request",
+        object(),
+    )
+    assert order == [
+        ("launch", 0, None),
+        ("launch", 1, 7),
+        ("finish", 0),
+        ("finish", 1),
+    ]
+
+
+def test_staged_region_pipeline_reserves_one_slot_for_other_workers():
+    conn = _matched_rail_producer()
+    conn._index_staging_lock = threading.Lock()
+    conn._index_staging_free = [3]
+    assert conn._try_acquire_index_staging_slot() is None
+    assert conn._index_staging_free == [3]
+
+    conn._index_staging_free.append(7)
+    assert conn._try_acquire_index_staging_slot() == 7
+    assert conn._index_staging_free == [3]
+
+
+def test_staging_pool_fails_fast_after_gpu_drain_error():
+    conn = _matched_rail_producer()
+    conn._index_staging_lock = threading.Lock()
+    conn._index_staging_free = [3]
+    cause = RuntimeError("event failed")
+    conn._index_staging_error = cause
+
+    with pytest.raises(RuntimeError, match="staging pool is unavailable") as exc:
+        conn._acquire_index_staging_slot()
+    assert exc.value.__cause__ is cause
+    with pytest.raises(RuntimeError, match="staging pool is unavailable"):
+        conn._try_acquire_index_staging_slot()
+
+
+def test_failed_gather_event_quarantines_slot():
+    conn = _matched_rail_producer()
+    conn._index_staging_lock = threading.Lock()
+    conn._index_staging_free = []
+    conn._index_staging_error = None
+    conn._release_index_staging_slot = MagicMock()
+    cause = RuntimeError("event failed")
+    pending = SimpleNamespace(
+        pool_idx=7,
+        ready_event=MagicMock(synchronize=MagicMock(side_effect=cause)),
+    )
+
+    with pytest.raises(RuntimeError, match="event failed"):
+        conn._finish_staged_index_layer_chunk(pending)
+    assert conn._index_staging_error is cause
+    conn._release_index_staging_slot.assert_not_called()
+
+
+def test_staged_region_pipeline_falls_back_when_no_prefetch_slot():
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    conn = _matched_rail_producer()
+    order = []
+    conn._try_acquire_index_staging_slot = MagicMock(return_value=None)
+
+    def launch(_target, region_idx, *_args, **_kwargs):
+        order.append(("launch", region_idx))
+        return region_idx
+
+    def finish(region_idx):
+        order.append(("finish", region_idx))
+        return True
+
+    conn._launch_staged_index_layer_chunk = MagicMock(side_effect=launch)
+    conn._finish_staged_index_layer_chunk = MagicMock(side_effect=finish)
+    assert mc.MooncakeConnector._execute_staged_region_pipeline(
+        conn,
+        "consumer:1234",
+        [(0, 20_000, 64), (1, 30_000, 64)],
+        [4, 5],
+        "request",
+        object(),
+    )
+    assert order == [
+        ("launch", 0),
+        ("finish", 0),
+        ("launch", 1),
+        ("finish", 1),
+    ]
 
 
 @pytest.mark.parametrize("role", ["mla.kv", "dsa.index_cache"])
@@ -1567,9 +1663,8 @@ def test_staged_pages_respect_both_mr_boundaries_and_slot_lifetime(
     order = []
     conn._acquire_dcp_staging_slot = lambda: 1
     conn._release_dcp_staging_slot = lambda slot: order.append(("release", slot))
-    conn._dcp_staging_stream = SimpleNamespace(
-        synchronize=lambda: order.append("synchronize")
-    )
+    ready_event = SimpleNamespace(synchronize=lambda: order.append("synchronize"))
+    conn._dcp_staging_stream = SimpleNamespace(record_event=lambda: ready_event)
     conn._block_region_roles = [role]
 
     def gather(*args):
