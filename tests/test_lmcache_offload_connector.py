@@ -5866,6 +5866,9 @@ def test_bounded_saves_are_shared_round_robin_not_head_first():
     s._lookup_in_step = []
     s._save_tracker = {}
     s._save_inflight = {}
+    s._save_previous_frontier = {}
+    s._save_previous_owner = {}
+    s._save_retry_blocked = {}
     s._save_nonce = 0
     s._save_rr_last = None
 

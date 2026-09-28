@@ -46,12 +46,23 @@ def _positive_float_env(name: str, default: str) -> float:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Forward metadata transport: direct or packed. Both keep source checks.
+    # Single-member groups and strided bindings retain direct copies.
+    "ATOM_H2D_BACKEND": lambda: os.getenv("ATOM_H2D_BACKEND", "direct"),
     # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
     "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
         os.getenv("ATOM_PREFIX_CACHE_PROTECTED_RATIO", "0.5")
+    ),
+    # LMCache KV offload without --kv-transfer-config: "lmcache" (in-process) or
+    # "lmcache_mp" (standalone `lmcache server`). Unset = off.
+    "ATOM_KV_OFFLOAD": lambda: os.getenv("ATOM_KV_OFFLOAD", ""),
+    # JSON object for that connector's kv_connector_extra_config, e.g.
+    # {"lmcache.chunk_size": 256} or {"lmcache.mp.port": 5556}.
+    "ATOM_KV_OFFLOAD_EXTRA_CONFIG": lambda: os.getenv(
+        "ATOM_KV_OFFLOAD_EXTRA_CONFIG", ""
     ),
     # --- Data Parallelism ---
     "ATOM_DP_RANK": lambda: int(os.getenv("ATOM_DP_RANK", "0")),

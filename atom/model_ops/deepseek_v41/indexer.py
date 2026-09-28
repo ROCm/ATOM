@@ -13,6 +13,7 @@ import torch
 import triton
 import triton.language as tl
 from aiter.ops.topk import top_k_per_row_decode
+from triton.language.extra import libdevice
 
 
 def _blocks(width, block_size):
@@ -138,11 +139,17 @@ def _block_maxima_kernel(
     BLOCK: tl.constexpr,
     TILE: tl.constexpr,
 ):
-    """Each block's best visible score, `+inf` on the row's newest block.
+    """Each block's best visible score, exclusive `+inf` on the newest block.
 
     The newest block holds the most recent tokens and is only partly filled, so
     it is pinned rather than left to be outscored. `ends` is the top-k's row
     bound in blocks, written here because this pass already knows it.
+
+    Reserve `+inf` for that pin: another infinite score can tie it out of
+    top-k, and NaNs can defeat the ordering entirely. Either would violate
+    `candidate_table`'s newest-block invariant and let its computed context
+    exceed the compacted allocation. Ignore NaNs and cap other blocks at the
+    largest finite score before inserting the pin.
 
     Nothing past a row's `ends` is read or written: the top-k stops there, and
     the width is the block table's -- `max_model_len` -- not the row's context.
@@ -162,7 +169,9 @@ def _block_maxima_kernel(
             columns < seen,
             other=float("-inf"),
         )
-        best = tl.where(ids == last - 1, float("inf"), tl.max(scores, axis=1))
+        best = tl.max(tl.where(libdevice.isnan(scores), float("-inf"), scores), axis=1)
+        best = tl.minimum(best, 3.4028234663852886e38)
+        best = tl.where(ids == last - 1, float("inf"), best)
         tl.store(maxima + row * maxima_stride + ids, best, ids < last)
     if tl.program_id(1) == 0:
         tl.store(ends + row, last)

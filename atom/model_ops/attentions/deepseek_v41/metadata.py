@@ -8,7 +8,8 @@ import torch
 
 from atom.model_ops.attentions.token_layout.batch_ids import build_batch_ids
 from atom.model_ops.attentions.token_layout.prefill import prefill_positions
-from atom.utils import CpuGpuBuffer, pack_rows
+from atom.utils import CpuGpuBuffer
+from atom.utils.block_tables import block_table_state
 
 
 @dataclass(frozen=True)
@@ -18,7 +19,6 @@ class RequestSpan:
     offset: int
     length: int
     slot: int
-    block_ids: tuple[int, ...]
 
     @property
     def end(self):
@@ -113,31 +113,12 @@ def visible_buffer_name(ratio):
     return f"v41_index_visible_{ratio}"
 
 
-def _publish_block_tables(tables, requests, running_bs):
-    """Reuse the fixed device page table until its rows or padding change.
-
-    Every V4.1 publication, including dummy/capture batches, goes through here.
-    DSpark borrows padding entries only temporarily and restores them before
-    returning. Cache the mapping, not positions: advancing within an allocated
-    page does not change an address in this table.
-    """
-    rows = tuple(tuple(span.block_ids) for span in requests)
-    key = (running_bs, rows)
-    previous = getattr(tables, "_v41_published_rows", None)
-    if previous is not None and previous[0] is tables.gpu and previous[1] == key:
-        return tables.gpu[:running_bs]
-    if rows:
-        pack_rows(tables.np, [np.asarray(row, dtype=np.int32) for row in rows])
-    tables.np[len(rows) : running_bs] = 0
-    published = tables.copy_to_gpu(running_bs)
-    tables._v41_published_rows = (tables.gpu, key)
-    return published
-
-
 def prepare_batch_step(
     requests,
     device,
     *,
+    block_tables,
+    page_limit=None,
     tentative=False,
     buffers=None,
     running_bs=None,
@@ -145,6 +126,9 @@ def prepare_batch_step(
     max_q_len=None,
     state_slot_out=None,
     ratios=(),
+    publication_group=None,
+    query_prefix_ready=False,
+    query_prefix_republish_reason=None,
 ):
     """Stage request metadata using the same persistent buffers/layout as V4.
 
@@ -164,7 +148,7 @@ def prepare_batch_step(
     if max_q_len is not None and lengths.size and max_q_len < int(lengths.max()):
         raise ValueError("A request is longer than the query width this forward runs")
     if buffers is None:
-        width = max((len(span.block_ids) for span in requests), default=0)
+        width = max((len(row) for row in block_tables), default=0)
         shapes = {
             "positions": (running_tokens,),
             "cu_seqlens_q": (running_bs + 1,),
@@ -191,10 +175,22 @@ def prepare_batch_step(
     for name, count in required.items():
         if count > buffers[name].np.shape[0]:
             raise ValueError(f"{name} metadata buffer cannot hold {count} rows")
+    if publication_group is not None:
+        publication_group.check_writable()
+    tables = block_table_state(buffers["block_tables"]).prepare(
+        block_tables, pad_to=running_bs, page_limit=page_limit
+    )
     cu = buffers["cu_seqlens_q"]
-    cu.np[0] = 0
-    np.cumsum(lengths, out=cu.np[1 : scheduled_bs + 1])
-    cu.np[scheduled_bs + 1 : running_bs + 1] = scheduled_tokens
+    if not query_prefix_ready:
+        if cu._publication is not None:
+            # Reject unannounced rewrites before touching the pinned prefix.
+            # Explicit compaction may reacquire it after token assembly.
+            cu._publication.acquire_write(
+                republish_reason=query_prefix_republish_reason
+            )
+        cu.np[0] = 0
+        np.cumsum(lengths, out=cu.np[1 : scheduled_bs + 1])
+        cu.np[scheduled_bs + 1 : running_bs + 1] = scheduled_tokens
     positions = buffers["positions"]
     starts = np.asarray([span.position for span in requests], dtype=positions.np.dtype)
     prefill_positions(
@@ -225,14 +221,36 @@ def prepare_batch_step(
             dtype=torch.int32,
             device=device,
         )
-    published = {
-        name: buffers[name].copy_to_gpu(count)
-        for name, count in required.items()
-        if name != "block_tables"
-    }
-    published["block_tables"] = _publish_block_tables(
-        buffers["block_tables"], requests, running_bs
+    if publication_group is not None:
+        grouped_tables = "block_tables" in publication_group.indices
+        for i, member in enumerate(publication_group.members):
+            if member.name == "block_tables":
+                publication_group.counts[i] = running_bs
+            elif member.name in required:
+                publication_group.counts[i] = required[member.name]
+            # Plans and state slots were staged by the builder. Preserve
+            # their counts in this combined publication, before indptrs run.
+        tables.publish(running_bs if grouped_tables else None, group=publication_group)
+        published = {
+            member.name: member.destination[: required[member.name]]
+            for member in publication_group.members
+            if member.name in required
+        }
+    else:
+        published = {
+            name: buffers[name].copy_to_gpu(count)
+            for name, count in required.items()
+            if name not in ("block_tables", "cu_seqlens_q")
+        }
+    published["cu_seqlens_q"] = (
+        cu.gpu[: running_bs + 1]
+        if query_prefix_ready
+        else cu.copy_to_gpu(
+            running_bs + 1, republish_reason=query_prefix_republish_reason
+        )
     )
+    if "block_tables" not in published:
+        published["block_tables"] = tables.publish(running_bs)
     return BatchStep(
         requests,
         published["positions"],

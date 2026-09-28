@@ -5,12 +5,14 @@
 
 Registers the legacy in-process ``lmcache_offload`` backend and the standalone
 server ``lmcache_mp`` backend with the shared KV connector factory.
-Enable via ``--kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"offload"}'``
+Enable via ``ATOM_KV_OFFLOAD=lmcache`` (or the equivalent
+``--kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"offload"}'``)
 plus LMCache env (``LMCACHE_LOCAL_CPU=True``, ``LMCACHE_MAX_LOCAL_CPU_SIZE``,
 ``LMCACHE_CHUNK_SIZE=256``, optional ``LMCACHE_LOCAL_DISK`` for the NVMe L3 tier).
 
-For standalone MP mode, start ``lmcache server`` and select
-``{"kv_connector":"lmcache_mp","kv_role":"offload"}``; the active attention
+For standalone MP mode, start ``lmcache server`` and set
+``ATOM_KV_OFFLOAD=lmcache_mp`` (or select
+``{"kv_connector":"lmcache_mp","kv_role":"offload"}``); the active attention
 backend publishes its PAGE layout directly to the model-neutral connector.
 """
 

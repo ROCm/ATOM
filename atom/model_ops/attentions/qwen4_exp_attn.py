@@ -35,6 +35,7 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_draft_decode_metadata,
 )
 from atom.utils import CpuGpuBuffer
+from atom.utils.block_tables import block_table_state
 
 from .gdn_attn import GDNAttentionBackend, GDNAttentionMetadataBuilder
 from .pool_layout.entry_arena import EntryField, LayerMajorArena, entry_bytes_for
@@ -190,10 +191,10 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         i32 = {"dtype": torch.int32, "device": self.device}
         i64 = {"dtype": torch.int64, "device": self.device}
         self.model_runner.forward_vars["qsa_token_to_req"] = CpuGpuBuffer(
-            max_tokens, **i32
+            max_tokens, publication_group="qsa", **i32
         )
         self.model_runner.forward_vars["qsa_logical_positions"] = CpuGpuBuffer(
-            max_tokens, **i64
+            max_tokens, publication_group="qsa", **i64
         )
         # Written in place, never reallocated: a captured decode graph bakes in
         # the address it reads the compressed slots from.
@@ -201,7 +202,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             max_tokens, **i64
         )
         self.model_runner.forward_vars["ple_has_initial_state"] = CpuGpuBuffer(
-            self.max_bs, dtype=torch.bool, device=self.device
+            self.max_bs, dtype=torch.bool, device=self.device, publication_group="ple"
         )
 
     # ------------------------------------------------------------------ #
@@ -436,6 +437,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         `mapped_tokens` is how many of `num_tokens` are real; the rest are
         CUDA-graph padding and are marked `-1` so no cache row is touched.
         """
+        self._check_metadata_writable("qsa")
         token_to_req = self.model_runner.forward_vars["qsa_token_to_req"].np
         logical = self.model_runner.forward_vars["qsa_logical_positions"].np
         token_to_req[:num_tokens] = -1
@@ -523,6 +525,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
 
         # A cold first chunk must not fold in whatever the recycled state slot
         # still held; anything with cached tokens continues its own window.
+        self._check_metadata_writable("ple")
         has_initial = self.model_runner.forward_vars["ple_has_initial_state"].np
         if is_prefill:
             has_initial[:num_reqs] = (
@@ -550,10 +553,10 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         # QSA reads the compressed cache through the block table on every
         # forward, so unlike dense prefill it cannot wait for `has_cached`.
         if attn_metadata.block_tables is None and batch.block_tables:
-            self.prepare_block_tables(batch)
-            attn_metadata.block_tables = self.model_runner.forward_vars[
-                "block_tables"
-            ].copy_to_gpu(num_reqs)
+            # The parent already packed this source; only its upload was optional.
+            attn_metadata.block_tables = block_table_state(
+                self.model_runner.forward_vars["block_tables"]
+            ).publish(num_reqs)
         if attn_metadata.block_tables is None:
             attn_metadata.qsa_metadata = None
             attn_metadata.ple_metadata = None
@@ -591,15 +594,6 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         attn_metadata, positions = super().prepare_decode(
             batch, running_bs, running_tokens, max_seqlen_q
         )
-        if positions.ndim == 2 and positions.shape[-1] < running_tokens:
-            # A captured mRoPE view uses the padded token count as its axis
-            # stride. Preserve that layout even when fewer rows are scheduled.
-            real_tokens = positions.shape[-1]
-            real_positions = self._mrope_cpu_view(real_tokens).copy()
-            padded_positions = self._mrope_cpu_view(running_tokens)
-            padded_positions.fill(0)
-            padded_positions[:, :real_tokens] = real_positions
-            positions = self._copy_mrope_to_gpu(running_tokens)[:, :real_tokens]
         bs = running_bs
         query_len = attn_metadata.max_seqlen_q
         num_tokens = running_tokens
@@ -696,25 +690,14 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         # Capture has no scheduled state slots. Give its synthetic requests
         # distinct slots so the in-place windows cannot race on slot zero.
         # Normal metadata preparation overwrites these same buffers on replay.
-        for indices in (
-            self.non_spec_state_indices_tensor,
-            self.non_spec_state_indices_in_tensor,
-        ):
-            indices.np[:bs] = np.arange(bs, dtype=np.int32)
-            indices.copy_to_gpu(bs)
-        if self.use_spec_decode:
-            slots = self.spec_state_indices_tensor
-            slots.np[:bs] = np.arange(bs * slots.np.shape[1]).reshape(bs, -1)
-            if self.replayssm:
-                slots.np[:bs] = np.arange(bs)[:, None]
-            slots.copy_to_gpu(bs)
+        self._prepare_state_indices_for_capture(bs)
         attn_metadata, context = super().build_for_cudagraph_capture(bs)
         runner = self.model_runner
         num_tokens = bs * int(attn_metadata.max_seqlen_q)
         attn_metadata.slot_mapping = runner.forward_vars["slot_mapping"].gpu[
             :num_tokens
         ]
-        context.positions = runner.forward_vars["positions"].copy_to_gpu(num_tokens)
+        context.positions = runner.forward_vars["positions"].gpu[:num_tokens]
 
         attn_metadata.qsa_metadata = self._build_qsa_metadata(
             attn_metadata,
@@ -731,6 +714,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             attn_metadata.ple_metadata = None
             return attn_metadata, context
         state_indices_in, state_indices_out = slots
+        self._check_metadata_writable("ple")
         self.model_runner.forward_vars["ple_has_initial_state"].np[:bs] = True
         attn_metadata.ple_metadata = Qwen4ExpPLEMetadata(
             query_start_loc=attn_metadata.cu_seqlens_q[: bs + 1],

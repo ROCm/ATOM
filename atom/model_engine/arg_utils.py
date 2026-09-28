@@ -17,6 +17,7 @@ from atom.config import (
     SpeculativeConfig,
 )
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -29,6 +30,78 @@ def parse_size_list(size_str: str) -> list[int]:
         return ast.literal_eval(size_str)
     except (ValueError, SyntaxError) as e:
         raise ValueError(f"Error parsing size list: {size_str}") from e
+
+
+# Offload connector names and aliases (atom/kv_transfer/offload/__init__.py),
+# casefolded like KVConnectorFactory.canonical_name.
+_OFFLOAD_CONNECTORS = frozenset(
+    {
+        "lmcache_offload",
+        "lmcacheoffloadconnector",
+        "lmcacheconnectorv1",
+        "lmcache_mp",
+        "lmcachempconnector",
+    }
+)
+
+
+# ATOM_KV_OFFLOAD value -> the offload connector it selects.
+_KV_OFFLOAD_MODES = {"lmcache": "lmcache_offload", "lmcache_mp": "lmcache_mp"}
+
+
+def kv_offload_connector_config(mode: str, extra_config: str) -> dict | None:
+    """The offload connector ATOM_KV_OFFLOAD selects, or None when it is off.
+
+    ``lmcache`` is the in-process backend and ``lmcache_mp`` the standalone
+    ``lmcache server`` one. ATOM_KV_OFFLOAD_EXTRA_CONFIG, a JSON object, becomes
+    the connector's ``kv_connector_extra_config``, which both backends read.
+    """
+    mode = mode.strip().lower()
+    if mode in ("", "0", "off", "none"):
+        if extra_config.strip():
+            raise ValueError(
+                "ATOM_KV_OFFLOAD_EXTRA_CONFIG is set but ATOM_KV_OFFLOAD is off"
+            )
+        return None
+    if mode not in _KV_OFFLOAD_MODES:
+        raise ValueError(
+            f"ATOM_KV_OFFLOAD={mode!r}: expected one of {sorted(_KV_OFFLOAD_MODES)}"
+        )
+    offload = {"kv_connector": _KV_OFFLOAD_MODES[mode], "kv_role": "offload"}
+    if extra_config.strip():
+        extra = json.loads(extra_config)
+        if not isinstance(extra, dict):
+            raise TypeError("ATOM_KV_OFFLOAD_EXTRA_CONFIG must be a JSON object")
+        offload["kv_connector_extra_config"] = extra
+    return offload
+
+
+def compose_kv_offload_config(kv_transfer_config: str, offload: dict | None) -> str:
+    """Fold the ATOM_KV_OFFLOAD connector into the --kv-transfer-config JSON string.
+
+    Without a transfer connector the offload connector stands alone; with one,
+    both become subs of a ``multi`` connector (appended if it already is one).
+    """
+    if offload is None:
+        return kv_transfer_config
+    transfer = json.loads(kv_transfer_config or "{}")
+    if not transfer:
+        return json.dumps(offload)
+    is_multi = _connector_name(transfer) == "multi"
+    subs = transfer.get("connectors", []) if is_multi else [transfer]
+    if any(_connector_name(sub) in _OFFLOAD_CONNECTORS for sub in subs):
+        raise ValueError(
+            "ATOM_KV_OFFLOAD conflicts with an offload connector already set in "
+            "--kv-transfer-config; use only one of them"
+        )
+    if is_multi:
+        return json.dumps({**transfer, "connectors": [*subs, offload]})
+    return json.dumps({"kv_connector": "multi", "connectors": [transfer, offload]})
+
+
+def _connector_name(cfg: object) -> str:
+    name = cfg.get("kv_connector", "") if isinstance(cfg, dict) else ""
+    return str(name).strip().casefold()
 
 
 @dataclass
@@ -725,6 +798,19 @@ class EngineArgs:
             "rccl": "rccl",
             "none": "none",
         }[all2all_backend]
+
+        # ATOM_KV_OFFLOAD → folded into kv_transfer_config, so offload does not
+        # compete with a P/D connector (or a launcher owning that flag) for it.
+        offload = kv_offload_connector_config(
+            envs.ATOM_KV_OFFLOAD, envs.ATOM_KV_OFFLOAD_EXTRA_CONFIG
+        )
+        kwargs["kv_transfer_config"] = compose_kv_offload_config(
+            kwargs["kv_transfer_config"], offload
+        )
+        if offload is not None:
+            logger.info(
+                "ATOM_KV_OFFLOAD: kv_transfer_config=%s", kwargs["kv_transfer_config"]
+            )
 
         # --dspark-config (JSON dict) → DSparkConfig object, passed through as
         # Config.dspark (no env vars).

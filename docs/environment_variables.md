@@ -2,6 +2,12 @@
 
 This document describes the environment variables used in the ATOM project.
 
+## Metadata H2D
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_H2D_BACKEND** | str | `direct` | `packed` combines forward metadata into one H2D and GPU scatter per consumer group. `direct` copies each member separately. Both preserve source reuse gates and full cudagraph padding. Set before starting the runner. See [metadata publication](h2d_publication.md). |
+
 ## Data parallelism
 
 | Variable | Type | Default | Description |
@@ -281,6 +287,11 @@ flag below. Details in the state-checkpoint section of the
 | **ATOM_STATE_CHECKPOINT_DEMAND** | bool | 1 (true) | Set to `0` to stop a prefix hit that was refused for want of a checkpoint from placing a rung of its own, leaving the prompt-end anchor as the only placement. Overrides `--state-checkpoint-demand`, so the policy can be A/B'd without editing a launch script. The rung is most of the checkpoint write traffic and little of the read-back, and every write evicts something — `StateSlotPool.mark_speculative` carries the measurement. |
 
 ### LMCache offload tier
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_KV_OFFLOAD** | str | "" (off) | Enables LMCache KV offload without `--kv-transfer-config`, so a launcher that owns that flag for P/D can still add offload. `lmcache` selects the in-process `lmcache_offload` connector, `lmcache_mp` the standalone-server `lmcache_mp` connector (start `lmcache server` first). With a P/D connector in `--kv-transfer-config`, both run behind a `multi` connector. Setting it while `--kv-transfer-config` already names an offload connector is an error. |
+| **ATOM_KV_OFFLOAD_EXTRA_CONFIG** | JSON object | "" | The offload connector's `kv_connector_extra_config`: `lmcache.<field>` overrides (e.g. `{"lmcache.chunk_size": 256}`) and, for `lmcache_mp`, `lmcache.mp.*` options (e.g. `{"lmcache.mp.port": 5556}`). Requires `ATOM_KV_OFFLOAD`. |
 
 The LMCache source-pin timeout and ATOM's pending-save bound are read directly
 via `os.environ` rather than through `atom.utils.envs`. Their behavior is

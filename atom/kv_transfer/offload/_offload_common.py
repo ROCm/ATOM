@@ -360,10 +360,14 @@ class OffloadWorkerMixin:
                 exc_info=True,
             )
 
-    def _guard(self, kind: str, fn, req) -> None:
-        """Run a copy job off the RPC thread, tallying success/failure."""
+    def _guard(self, kind: str, fn, req, **fn_kwargs) -> None:
+        """Run a copy job off the RPC thread, tallying success/failure.
+
+        Extra keyword arguments reach ``fn`` unchanged, so callers do not need
+        a ``functools.partial`` that would hide ``fn.__name__`` from the log.
+        """
         try:
-            fn(req)
+            fn(req, **fn_kwargs)
         except Exception:
             logger.exception(
                 "offload %s failed for %s",
