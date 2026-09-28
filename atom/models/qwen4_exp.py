@@ -325,7 +325,6 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             out = tensor_model_parallel_all_reduce(out)
         return out.view(orig_shape)
 
-
     def _single_token_experts(self, hidden_states, logits):
         ex = self.experts
         n = ex.w13_weight.shape[0]
@@ -345,7 +344,12 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             and n == self.n_routed_experts + 1
         ):
             return moe_decode_single_token(
-                hidden_states, None, None, *weights, router_logits=logits, top_k=ex.top_k
+                hidden_states,
+                None,
+                None,
+                *weights,
+                router_logits=logits,
+                top_k=ex.top_k,
             )
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=hidden_states,
@@ -807,9 +811,7 @@ class Qwen4ExpModel(nn.Module):
 
         pending = None
         for layer in self.layers[self.start_layer : self.end_layer]:
-            hidden_states, pending = layer(
-                positions, hidden_states, input_ids, pending
-            )
+            hidden_states, pending = layer(positions, hidden_states, input_ids, pending)
         if self.return_hc_state:
             hidden_states = self.hyper_connection_mixer.apply_pending(
                 hidden_states, pending

@@ -35,8 +35,18 @@ _TABLES = (
         "AITER_CONFIG_GEMM_BF16",
         "bf16_tuned_gemm",
         "qwen38_flash_next_bf16_tuned_gemm.csv",
-        ["gfx", "cu_num", "M", "N", "K", "bias", "dtype", "outdtype", "scaleAB",
-         "bpreshuffle"],
+        [
+            "gfx",
+            "cu_num",
+            "M",
+            "N",
+            "K",
+            "bias",
+            "dtype",
+            "outdtype",
+            "scaleAB",
+            "bpreshuffle",
+        ],
     ),
 )
 
@@ -49,7 +59,9 @@ def _source_files(env: str, aiter_configs: str, table: str) -> list[str]:
         return current.split(os.pathsep)
     return [os.path.join(aiter_configs, f"{table}.csv")] + sorted(
         p
-        for p in glob.glob(os.path.join(aiter_configs, "model_configs", f"*{table}*.csv"))
+        for p in glob.glob(
+            os.path.join(aiter_configs, "model_configs", f"*{table}*.csv")
+        )
         if "untuned" not in os.path.basename(p)
     )
 
@@ -68,7 +80,9 @@ def _merge(files: list[str], keys: list[str], out_path: str) -> None:
         frames.append(df)
     merged = pd.concat(frames, ignore_index=True)
     # Later files win: ours is last.
-    merged = merged.drop_duplicates(subset=[k for k in keys if k in merged.columns], keep="last")
+    merged = merged.drop_duplicates(
+        subset=[k for k in keys if k in merged.columns], keep="last"
+    )
     tmp = out_path + ".tmp"
     merged.to_csv(tmp, index=False)
     os.replace(tmp, out_path)
@@ -84,7 +98,9 @@ def register_qwen4_exp_tuned_configs() -> None:
     except ImportError:
         return
     aiter_configs = os.path.join(core.AITER_ROOT_DIR, "aiter", "configs")
-    out_dir = os.path.join(tempfile.gettempdir(), "atom_qwen4_exp_configs", str(os.getpid()))
+    out_dir = os.path.join(
+        tempfile.gettempdir(), "atom_qwen4_exp_configs", str(os.getpid())
+    )
     os.makedirs(out_dir, exist_ok=True)
     for env, table, name, keys in _TABLES:
         ours = os.path.join(_CONFIG_DIR, name)

@@ -98,12 +98,16 @@ def _moe_decode_up_kernel(
         x = tl.load(x_ptr + k0 + tl.arange(0, BK)).to(tl.float32)
         x = tl.reshape(x, (BK // 16, 16))
         wg = tl.load(w_base + _shuffled_offsets(j, k0, HIDDEN, BK)).to(tl.float32)
-        wu = tl.load(w_base + _shuffled_offsets(j + INTER, k0, HIDDEN, BK)).to(tl.float32)
+        wu = tl.load(w_base + _shuffled_offsets(j + INTER, k0, HIDDEN, BK)).to(
+            tl.float32
+        )
         acc_g += tl.sum(tl.sum(wg * x[None, :, :], axis=2), axis=1)
         acc_u += tl.sum(tl.sum(wu * x[None, :, :], axis=2), axis=1)
     g = acc_g * tl.load(s_base + j)
     u = acc_u * tl.load(s_base + INTER + j)
-    tl.store(out_ptr + k * INTER + j, (g * tl.sigmoid(g) * u).to(out_ptr.dtype.element_ty))
+    tl.store(
+        out_ptr + k * INTER + j, (g * tl.sigmoid(g) * u).to(out_ptr.dtype.element_ty)
+    )
 
 
 @triton.jit
