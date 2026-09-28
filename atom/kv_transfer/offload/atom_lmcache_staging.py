@@ -5,11 +5,15 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+
+logger = logging.getLogger("atom")
 
 
 def memory_object_as_uint8(memory_obj: Any, nbytes: int) -> torch.Tensor:
@@ -60,13 +64,53 @@ class _StagingBuffer:
             self.free_event = torch.cuda.Event(blocking=False)
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    # Stripped, and empty reads as off: `VAR=` is how a shell script clears a
+    # flag inline, and a bare membership test reads the empty string as ON --
+    # the opposite of what the operator wrote. `VAR="off "` did the same.
+    raw = os.environ.get(name, default).strip().lower()
+    return bool(raw) and raw not in ("0", "false", "no", "off")
+
+
+def _env_int(name: str, default: int, *, min_value: int = 1) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+    if value < min_value:
+        raise ValueError(f"{name} must be >= {min_value}, got {value}")
+    return value
+
+
+def _env_optional_int(name: str, *, min_value: int = 1) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+    if value < min_value:
+        raise ValueError(f"{name} must be >= {min_value}, got {value}")
+    return value
+
+
 class _ThreadTransferState:
     def __init__(
         self,
         device: torch.device,
         use_cuda: bool,
+        compute_stream=None,
     ) -> None:
         self.device = device
+        # The stream the model's forward runs on, recorded on the forward
+        # thread by `BlockGPUConnector.note_compute_stream`.  It cannot be
+        # discovered from here: this object is built lazily on a save/load
+        # worker thread, and `torch.cuda.current_stream` is thread-local.
+        self.compute_stream = compute_stream
         self.pack_stream = None
         self.copy_stream = None
         if use_cuda:
@@ -79,6 +123,9 @@ class _ThreadTransferState:
         if stream is None:
             return _NullCtx()
         return torch.cuda.stream(stream)
+
+
+_COMPUTE_STREAM_WARNED = False
 
 
 def _compute_stream_for(state) -> Any:
@@ -97,7 +144,24 @@ def _compute_stream_for(state) -> Any:
     device = getattr(state, "device", None)
     if device is None or not torch.cuda.is_available():
         return None
-    return torch.cuda.current_stream(device=device)
+    stream = getattr(state, "compute_stream", None)
+    if stream is None or stream == torch.cuda.default_stream(device=device):
+        # Not a fallback: fencing against the default stream is precisely the
+        # bug this reports.  vLLM runs the forward on a dedicated non-default
+        # stream, so either value here means the recording on the forward
+        # thread did not happen and the pipeline below is unfenced.
+        global _COMPUTE_STREAM_WARNED
+        if not _COMPUTE_STREAM_WARNED:
+            _COMPUTE_STREAM_WARNED = True
+            logger.error(
+                "offload staging has no forward stream to fence against "
+                "(got %s, default is %s); saves may read KV the forward has "
+                "not finished writing",
+                stream,
+                torch.cuda.default_stream(device=device),
+            )
+        return None
+    return stream
 
 
 @dataclass(frozen=True)

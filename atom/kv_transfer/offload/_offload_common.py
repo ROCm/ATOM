@@ -286,6 +286,18 @@ class OffloadWorkerMixin:
                 executor.shutdown(wait=True)
 
     # -- in-flight job tracking (preemption fence) -----------------------
+    def _note_compute_stream(self) -> None:
+        """Hand the forward's stream to the byte-copy layer.
+
+        Called from `_track_job`, which runs on the forward thread at every
+        save/load submit, so the stream is recorded before the first staging
+        group runs and without a second per-step `current_stream` call.
+        """
+        connector = getattr(getattr(self, "_engine", None), "gpu_connector", None)
+        note = getattr(connector, "note_compute_stream", None)
+        if note is not None:
+            note()
+
     def _track_job(self, req_id, future) -> None:
         """Remember one submitted copy job so a preemption can wait on it.
 
