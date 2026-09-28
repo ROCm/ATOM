@@ -479,6 +479,8 @@ models:
         # move the published numbers.
         ATOM_USE_FLYDSL_GATHER_KV_B_PROJ: "1"
         ATOM_STATE_CHECKPOINT_DEMAND: "0"
+        # AgentX runs FlyDSL FP8 prefill attention on every band.
+        ATOM_USE_FLYDSL_FP8_PREFILL_ATTN: "1"
         # AgentX band default: ReplaySSM off on CONC 1/2/4, on for the mid band
         # (CONC 8-16), off again from CONC 32. Cases that declare their own env
         # block must restate the key, because a YAML merge key loses to an
@@ -526,7 +528,7 @@ models:
               workers: 1
               tp: 8
               # AgentX pins the compile path and captures the dense query-token
-              # range 2..2*CONC*(1+spec) that `auto` derives per concurrency.
+              # range 1..2*CONC*(1+spec) that `auto` derives per concurrency.
               cudagraph: auto
               cudagraph_mode: FULL
               compilation_level: 3
@@ -589,9 +591,17 @@ models:
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
 
+        # AgentX turns the PrefillDelayer on from CONC 16 up: 4 decode passes
+        # after each prefill, force-released once a prefill has queued 5 s.
         - <<: *kimi_k3_agentic_dcp8_lmcache
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c16
           concurrency: [16]
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "1"
+              ATOM_PREFILL_DECODE_INTERVAL: "4"
+              ATOM_PREFILL_DELAYER_MAX_QUEUE_MS: "5000"
+            prefill: *kimi_k3_agentic_lmcache128_env
 
         - &kimi_k3_agentic_no_dspark
           <<: *kimi_k3_agentic_dcp8_lmcache
@@ -606,6 +616,8 @@ models:
           env:
             common:
               ATOM_ENABLE_REPLAYSSM: "0"
+              ATOM_PREFILL_DECODE_INTERVAL: "4"
+              ATOM_PREFILL_DELAYER_MAX_QUEUE_MS: "5000"
             # No CPU state tier here: the throughput band carries no draft model
             # and no ReplaySSM, so the whole per-rank CPU budget goes to the
             # paged KV instead of a state pool nothing replays from.
@@ -640,6 +652,8 @@ models:
             common:
               ATOM_ENABLE_REPLAYSSM: "0"
               AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+              ATOM_PREFILL_DECODE_INTERVAL: "4"
+              ATOM_PREFILL_DELAYER_MAX_QUEUE_MS: "5000"
             prefill:
               <<: *kimi_k3_agentic_lmcache128_env
               LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
@@ -684,6 +698,8 @@ models:
             common:
               ATOM_ENABLE_REPLAYSSM: "0"
               AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+              ATOM_PREFILL_DECODE_INTERVAL: "4"
+              ATOM_PREFILL_DELAYER_MAX_QUEUE_MS: "5000"
             # The aggregated server reads env.decode. These are the C64 prefill's
             # LMCache settings, spelled out rather than merged from its anchor:
             # that anchor also carries the mooncake half of the `multi`
