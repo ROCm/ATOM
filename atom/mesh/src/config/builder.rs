@@ -541,14 +541,12 @@ mod tests {
             port: 9999,
             host: "127.0.0.1".to_string(),
             dp_aware: true,
-            api_key: Some("secret".to_string()),
             ..Default::default()
         };
         let rebuilt = RouterConfigBuilder::from_config(original.clone()).build_unchecked();
         assert_eq!(rebuilt.port, 9999);
         assert_eq!(rebuilt.host, "127.0.0.1");
         assert!(rebuilt.dp_aware);
-        assert_eq!(rebuilt.api_key.as_deref(), Some("secret"));
     }
 
     #[test]
@@ -746,14 +744,6 @@ mod tests {
             .disable_rate_limiting()
             .build_unchecked();
         assert_eq!(config.max_concurrent_requests, -1);
-    }
-
-    #[test]
-    fn test_builder_api_key() {
-        let config = RouterConfigBuilder::new()
-            .api_key("my-key")
-            .build_unchecked();
-        assert_eq!(config.api_key.as_deref(), Some("my-key"));
     }
 
     #[test]
@@ -960,14 +950,6 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_maybe_api_key_some() {
-        let config = RouterConfigBuilder::new()
-            .maybe_api_key(Some("key123"))
-            .build_unchecked();
-        assert_eq!(config.api_key.as_deref(), Some("key123"));
-    }
-
-    #[test]
     fn test_builder_maybe_api_key_none() {
         let config = RouterConfigBuilder::new()
             .maybe_api_key(None::<String>)
@@ -1089,7 +1071,6 @@ mod tests {
             .max_payload_size(1024 * 1024)
             .request_timeout_secs(300)
             .max_concurrent_requests(200)
-            .api_key("secret-key")
             .enable_metrics("0.0.0.0", 9090)
             .log_dir("/var/log")
             .log_level("info")
@@ -1105,7 +1086,6 @@ mod tests {
         assert_eq!(config.host, "10.0.0.1");
         assert_eq!(config.port, 8080);
         assert_eq!(config.max_concurrent_requests, 200);
-        assert_eq!(config.api_key.as_deref(), Some("secret-key"));
         assert!(config.metrics.is_some());
         assert!(config.dp_aware);
         assert!(config.tokenizer_cache.enable_l0);

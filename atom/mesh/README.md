@@ -273,13 +273,13 @@ enabled, the router serves HTTPS on the configured `--host` and `--port`.
 
 ### API key
 
-Optional API key protection for router endpoints:
+Set `ATOM_MESH_API_KEY` in your environment, then pass it to the router:
 
 ```bash
-./target/release/atomesh launch --api-key "your-secret-key" \
+./target/release/atomesh launch --api-key "${ATOM_MESH_API_KEY:?Set ATOM_MESH_API_KEY}" \
   --worker-urls http://worker1:8000 http://worker2:8000
 
-USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only --api-key "your-secret-key" \
+USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only --api-key "${ATOM_MESH_API_KEY:?Set ATOM_MESH_API_KEY}" \
   --worker-urls http://worker1:8000 http://worker2:8000
 ```
 

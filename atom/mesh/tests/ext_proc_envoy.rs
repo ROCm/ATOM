@@ -213,14 +213,9 @@ struct Backend {
 }
 
 impl Backend {
-    async fn handle(
-        State(state): State<Arc<Self>>,
-        headers: HeaderMap,
-        Json(body): Json<Value>,
-    ) -> Response {
+    async fn handle(State(state): State<Arc<Self>>, Json(body): Json<Value>) -> Response {
         state.calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(body["vendor_extension"], 42);
-        assert_eq!(headers["authorization"], "Bearer worker-key");
         if body["stream"] == true {
             let stream = futures_util::stream::unfold(0, |step| async move {
                 if step > 0 {
@@ -267,7 +262,6 @@ async fn real_envoy_routes_once_preserves_body_and_cleans_up_sse_cancel() {
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new(format!("http://{address}"))
             .model_id("test-model")
-            .api_key("worker-key")
             .build(),
     );
     app.worker_registry.register(worker.clone());
@@ -565,7 +559,6 @@ impl PdBackend {
         Json(body): Json<Value>,
     ) -> Response {
         use mesh::config::types::BackendType;
-        assert_eq!(headers["authorization"], "Bearer pd-worker-key");
         assert!(!headers.contains_key("x-mesh-execution-id"));
         assert_eq!(body["vendor_extension"], 42);
         backend.calls.lock().unwrap().push((prefill, body.clone()));
@@ -658,7 +651,6 @@ impl PdBackend {
             let worker: Arc<dyn Worker> = Arc::new(
                 BasicWorkerBuilder::new(format!("http://{address}"))
                     .model_id("test-model")
-                    .api_key("pd-worker-key")
                     .worker_type(if prefill {
                         WorkerType::Prefill {
                             bootstrap_port: Some(address.port()),
