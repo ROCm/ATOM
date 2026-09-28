@@ -193,3 +193,82 @@ def test_coalesce_with_mr_boundaries_preserves_empty_input_and_address_gaps():
             empty, empty, empty, src_mr=(100, 64), dst_mr=(200, 64)
         )
     )
+
+
+@pytest.mark.parametrize("boundary", ["source", "destination", "both"])
+@pytest.mark.parametrize("seed", range(8))
+def test_coalesce_mr_splits_preserve_randomized_bytes_and_are_maximal(boundary, seed):
+    rng = np.random.default_rng(seed)
+    # Keep addresses beyond float64's exact-integer range: address arithmetic
+    # must stay integral even when expanding thousands of MR fragments.
+    src_base, dst_base = 2**54 + 37, 2**55 + 91
+    count = 48
+    lengths = rng.integers(0, 65, count, dtype=np.int64)
+    lengths[0] = 4096 if seed % 2 else 0
+    src_gaps = rng.choice([0, 0, 0, 7], count - 1)
+    dst_gaps = rng.choice([0, 0, 0, 11], count - 1)
+    src = src_base + 3 + np.concatenate(([0], np.cumsum(lengths[:-1] + src_gaps)))
+    dst = dst_base + 5 + np.concatenate(([0], np.cumsum(lengths[:-1] + dst_gaps)))
+    if seed % 2:
+        # Destination descriptors need not be ordered by physical address.
+        dst = dst[rng.permutation(count)]
+    src_mr = (src_base, [1, 7, 32, 127][seed % 4])
+    dst_mr = (dst_base, [1, 11, 32, 65][seed % 4])
+    if boundary == "source":
+        dst_mr = None
+    elif boundary == "destination":
+        src_mr = None
+    actual_src, actual_dst, actual_length = coalesce_contiguous(
+        src, dst, lengths, src_mr=src_mr, dst_mr=dst_mr
+    )
+    assert (actual_length > 0).all()
+    np.testing.assert_array_equal(
+        _expand_runs(actual_src, actual_length), _expand_runs(src, lengths)
+    )
+    np.testing.assert_array_equal(
+        _expand_runs(actual_dst, actual_length), _expand_runs(dst, lengths)
+    )
+    # No output descriptor may cross either MR, and adjacent outputs should
+    # only remain separate because of an address gap or an MR boundary.
+    can_merge = (actual_src[1:] == actual_src[:-1] + actual_length[:-1]) & (
+        actual_dst[1:] == actual_dst[:-1] + actual_length[:-1]
+    )
+    for addresses, mr in ((actual_src, src_mr), (actual_dst, dst_mr)):
+        if mr is None:
+            continue
+        base, chunk = mr
+        start_mr = (addresses - base) // chunk
+        end_mr = (addresses + actual_length - 1 - base) // chunk
+        np.testing.assert_array_equal(start_mr, end_mr)
+        can_merge &= start_mr[:-1] == end_mr[1:]
+    assert not can_merge.any()
+
+
+@pytest.mark.parametrize("dtype", [np.int32, np.int64, np.uint32, np.uint64])
+@pytest.mark.parametrize("lengths", [[0], [0, 0, 0], [0, 8, 0], [8, 0, 8], [16, 8, 24]])
+def test_coalesce_mr_split_handles_zero_lengths_and_exact_boundaries(dtype, lengths):
+    lengths = np.array(lengths, dtype=dtype)
+    # Strided inputs also exercise the public ndarray contract.
+    src = np.arange(100, 100 + 16 * lengths.size, 8, dtype=dtype)[::2]
+    dst = np.arange(200, 200 + 16 * lengths.size, 8, dtype=dtype)[::2]
+    actual = coalesce_contiguous(src, dst, lengths, src_mr=(100, 8), dst_mr=(200, 16))
+    assert all(a.dtype == np.int64 for a in actual)
+    if not lengths.any():
+        assert all(a.size == 0 for a in actual)
+        return
+    actual_src, actual_dst, actual_length = actual
+    assert (actual_length == 8).all()
+    np.testing.assert_array_equal(
+        _expand_runs(actual_src, actual_length), _expand_runs(src, lengths)
+    )
+    np.testing.assert_array_equal(
+        _expand_runs(actual_dst, actual_length), _expand_runs(dst, lengths)
+    )
+
+
+@pytest.mark.parametrize("side", ["src_mr", "dst_mr"])
+@pytest.mark.parametrize("chunk", [0, -1])
+def test_coalesce_rejects_invalid_mr_chunks_even_for_empty_input(side, chunk):
+    empty = np.empty(0, dtype=np.int64)
+    with pytest.raises(ValueError, match="MR chunk bytes must be positive"):
+        coalesce_contiguous(empty, empty, empty, **{side: (0, chunk)})

@@ -45,29 +45,66 @@ def coalesce_contiguous(
     if src_mr is None and dst_mr is None:
         return merged_src, merged_dst, merged_length
 
-    split_src, split_dst, split_length = [], [], []
-    for s, d, remaining in zip(
-        merged_src.tolist(), merged_dst.tolist(), merged_length.tolist()
-    ):
-        while remaining:
-            size = remaining
-            if src_mr is not None:
-                base, chunk = src_mr
-                size = min(size, chunk - (s - base) % chunk)
-            if dst_mr is not None:
-                base, chunk = dst_mr
-                size = min(size, chunk - (d - base) % chunk)
-            split_src.append(s)
-            split_dst.append(d)
-            split_length.append(size)
-            s += size
-            d += size
-            remaining -= size
-    return (
-        np.asarray(split_src, dtype=np.int64),
-        np.asarray(split_dst, dtype=np.int64),
-        np.asarray(split_length, dtype=np.int64),
-    )
+    merged_src = np.asarray(merged_src, dtype=np.int64)
+    merged_dst = np.asarray(merged_dst, dtype=np.int64)
+    merged_length = np.asarray(merged_length, dtype=np.int64)
+    # A contiguous page batch often merges to one run. Avoid repeat/index
+    # expansion for this case: its cut positions are simple MR progressions.
+    if merged_length.size == 1:
+        size = int(merged_length[0])
+        if size == 0:
+            return merged_src[:0], merged_dst[:0], merged_length[:0]
+        first_src = (
+            size
+            if src_mr is None
+            else src_mr[1] - (int(merged_src[0]) - src_mr[0]) % src_mr[1]
+        )
+        first_dst = (
+            size
+            if dst_mr is None
+            else dst_mr[1] - (int(merged_dst[0]) - dst_mr[0]) % dst_mr[1]
+        )
+        if size <= min(first_src, first_dst):
+            return merged_src, merged_dst, merged_length
+        cuts = [np.array([0, size], dtype=np.int64)]
+        if src_mr is not None and first_src < size:
+            cuts.append(np.arange(first_src, size, src_mr[1], dtype=np.int64))
+        if dst_mr is not None and first_dst < size:
+            cuts.append(np.arange(first_dst, size, dst_mr[1], dtype=np.int64))
+        offsets = np.unique(np.concatenate(cuts))
+        return (
+            merged_src[0] + offsets[:-1],
+            merged_dst[0] + offsets[:-1],
+            np.diff(offsets),
+        )
+
+    # Split one side at a time: destination splits preserve all source MR
+    # boundaries. The two passes operate on whole arrays, never on Python
+    # address lists or individual runs. No padded runs-by-boundaries matrix
+    # is needed; repeat allocates only the actual output descriptors.
+    for side, mr in enumerate((src_mr, dst_mr)):
+        if mr is None:
+            continue
+        base, chunk = mr
+        addresses = merged_src if side == 0 else merged_dst
+        first = chunk - (addresses - base) % chunk
+        if np.all((merged_length <= first) & (merged_length != 0)):
+            continue
+        # Count only boundaries strictly inside a run; ending exactly at an
+        # MR boundary must not produce an extra, zero-length descriptor.
+        counts = 1 + np.maximum(0, (merged_length - first - 1) // chunk + 1)
+        counts[merged_length == 0] = 0
+
+        run_ids = np.repeat(np.arange(counts.size), counts)
+        group_starts = np.cumsum(counts) - counts
+        piece_ids = np.arange(run_ids.size) - group_starts[run_ids]
+        first_piece = piece_ids == 0
+        offsets = np.where(first_piece, 0, first[run_ids] + (piece_ids - 1) * chunk)
+        limits = np.where(first_piece, first[run_ids], chunk)
+        merged_src = merged_src[run_ids] + offsets
+        merged_dst = merged_dst[run_ids] + offsets
+        merged_length = np.minimum(merged_length[run_ids] - offsets, limits)
+    return merged_src, merged_dst, merged_length
 
 
 @dataclass(frozen=True)
