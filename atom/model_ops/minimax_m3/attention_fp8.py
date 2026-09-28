@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Experimental, numerically equivalent FP8 transport for M3 attention output.
+"""Per-token FP8 transport for M3 attention output.
 
 The o-projection quantizer has one scale over *all* heads of each token. The
 attention producer owns only a head shard, so its local amax must be exchanged
@@ -20,29 +20,34 @@ from atom.distributed.ulysses_sp import (
     ulysses_attention,
     ulysses_gather_heads,
 )
-from atom.utils import envs, mark_spliting_op
+from atom.utils import mark_spliting_op
 
 
 def supports_m3_attention_fp8(query_width: int) -> bool:
-    """Startup-only gate for the exact hardware/layout measured by this probe.
+    """Select the validated SP4 layout on gfx950 during model construction.
 
     Cache this boolean on the attention module: querying the architecture from
     forward would introduce a graph break. Online weight quantization happens
     after construction, so the o_proj quantization contract is checked later.
     """
     if (
-        not envs.ATOM_SP_ATTN_FP8
+        not torch.cuda.is_available()
         or get_sp_world_size() != 4
         or query_width != 8192
         or dtypes.fp8 != torch.float8_e4m3fn
-        or get_current_atom_config().torch_dtype != torch.bfloat16
     ):
         return False
+    from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
     from atom.plugin.prepare import is_plugin_mode
 
-    return not is_plugin_mode() and get_gfx_runtime() == "gfx950"
+    return (
+        not is_plugin_mode()
+        and get_tensor_model_parallel_world_size() == 1
+        and get_current_atom_config().torch_dtype == torch.bfloat16
+        and get_gfx_runtime() == "gfx950"
+    )
 
 
 @triton.jit
@@ -159,25 +164,24 @@ def gather_heads_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
         return per_token_quant_hip(ulysses_gather_heads(x), quant_dtype=dtypes.fp8)
     amax = _all_gather_tokens(head_amax(x))
-    if envs.ATOM_SP_HEAD_EXCHANGE:
-        from atom.distributed.sp_head_exchange import (
-            exchange_heads,
-            head_exchange_communicator,
-        )
-        from atom.distributed.sp_registered_buffer import registered_input_view
+    from atom.distributed.sp_head_exchange import (
+        exchange_heads,
+        head_exchange_communicator,
+    )
+    from atom.distributed.sp_registered_buffer import registered_input_view
 
-        ca = head_exchange_communicator(x)
-        scratch = (
-            registered_input_view(get_sp_group(), x.shape, dtypes.fp8)
-            if ca is not None
-            else None
+    ca = head_exchange_communicator(x)
+    scratch = (
+        registered_input_view(get_sp_group(), x.shape, dtypes.fp8)
+        if ca is not None
+        else None
+    )
+    if scratch is not None:
+        q, scale = quantize_with_gathered_amax(
+            x, amax, world, get_sp_group().rank_in_group, out=scratch[0]
         )
-        if scratch is not None:
-            q, scale = quantize_with_gathered_amax(
-                x, amax, world, get_sp_group().rank_in_group, out=scratch[0]
-            )
-            output = exchange_heads(q.view(torch.bfloat16), ca, registered=True)
-            return output.view(dtypes.fp8), scale
+        output = exchange_heads(q.view(torch.bfloat16), ca, registered=True)
+        return output.view(dtypes.fp8), scale
     q, scale = quantize_with_gathered_amax(x, amax, world, get_sp_group().rank_in_group)
     output = ulysses_gather_heads(q.view(torch.bfloat16)).view(dtypes.fp8)
     return output, scale
