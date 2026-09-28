@@ -37,7 +37,6 @@ pub fn create_mocker_app_with_context(
     let app_state = Arc::new(AppState {
         router,
         context: app_context.clone(),
-        concurrency_queue_tx: None,
         router_manager: None,
     });
 
