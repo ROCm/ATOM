@@ -166,25 +166,26 @@ before the run rather than discovered after it.
 
 ## Measured
 
-All numbers below come from one tree, `atom` branch of PR #2369 (head
-`ee1ebfa29`), vLLM 0.28 plugin backend in `rocm/atom-dev:vllm-0.28.0`, TP=4 on
-gfx950 GPUs 0-3.
+All numbers below come from the `atom` branch of PR #2369, vLLM 0.28 plugin
+backend in `rocm/atom-dev:vllm-0.28.0`, TP=4 on gfx950 GPUs 0-3.
 
 ### Throughput and latency
 
 Matched ON/OFF pairs: one arm per concurrency per setting, 1800 s of traffic
-each, back to back in the same slot, seed 530419, the *Client* line above
-verbatim with `--concurrency` set to the row. The two arms differ in exactly
-one thing -- whether `--kv-transfer-config` is on the server line -- and the
-arm order alternates between rungs so that slot order cannot masquerade as an
-effect. `tput/GPU` is `output_token_throughput / 4`; output length is pinned at
-512, so `req/s` is the same measurement and is not a second result.
+each, seed 530419, the *Client* line above verbatim with `--concurrency` set to
+the row. The two arms of a pair differ in exactly one thing -- whether
+`--kv-transfer-config` is on the server line. `tput/GPU` is
+`output_token_throughput / 4`; output length is pinned at 512, so `req/s` is
+the same measurement and is not a second result.
 
 | conc | arm | tput/GPU (tok/s) | req/s | TTFT p50 / p90 (ms) | ITL p50 / p90 (ms) | HBM prefix hit | CPU tier share |
 |---|---|---|---|---|---|---|---|
 | 8 | OFF | 89.00 | 0.6953 | 2216 / 4259 | 17.37 / 20.99 | 60.54% | 0.00% |
 | 8 | ON | **103.47** | 0.8083 | 1286 / 2442 | 15.68 / 17.99 | 59.65% | 24.02% |
 | 8 | delta | **+16.26%** | +16.26% | -41.95% / -42.66% | -9.74% / -14.29% | | |
+| 16 | OFF | 124.56 | 0.9732 | 3607 / 6130 | 24.63 / 30.70 | 61.61% | 0.00% |
+| 16 | ON | **159.23** | 1.2440 | 2375 / 3175 | 19.47 / 23.15 | 59.99% | 26.32% |
+| 16 | delta | **+27.83%** | +27.83% | -34.16% / -48.21% | -20.95% / -24.59% | | |
 | 32 | OFF | 158.84 | 1.2409 | 2799 / 6133 | 43.08 / 52.11 | 62.06% | 0.00% |
 | 32 | ON | **229.71** | 1.7946 | 3422 / 5162 | 25.96 / 31.90 | 60.52% | 27.12% |
 | 32 | delta | **+44.61%** | +44.61% | +22.26% / -15.83% | -39.74% / -38.78% | | |
