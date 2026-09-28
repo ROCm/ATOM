@@ -142,10 +142,14 @@ impl Stream {
     }
 
     async fn headers_only(&self) {
+        self.request_headers("/v1/chat/completions").await;
+    }
+
+    async fn request_headers(&self, path: &str) {
         self.send(Request::RequestHeaders(Self::headers(
             &[
                 (":method", "POST"),
-                (":path", "/v1/chat/completions"),
+                (":path", path),
                 ("content-type", "application/json"),
                 ("x-request-id", "same-id"),
                 ("x-gateway-destination-endpoint", "127.0.0.1:1"),
@@ -470,11 +474,15 @@ fn cli_flattens_protocol_configuration_and_default_stays_disabled() {
 
 impl Stream {
     async fn subset(&self, value: prost_types::Value) {
+        self.subset_body(value, Self::BODY).await;
+    }
+
+    async fn subset_body(&self, value: prost_types::Value, body: &[u8]) {
         use std::collections::BTreeMap;
         self.sender
             .send(pb::ProcessingRequest {
                 request: Some(Request::RequestBody(pb::HttpBody {
-                    body: Self::BODY.to_vec(),
+                    body: body.to_vec(),
                     end_of_stream: true,
                     ..Default::default()
                 })),
@@ -584,6 +592,95 @@ async fn candidate_subset_is_intersected_with_registered_healthy_model_workers()
 }
 
 #[tokio::test]
+async fn generate_optional_model_uses_default_policy_and_preserves_candidate_filters() {
+    let fixture = Fixture::new(RouterConfig {
+        policy: mesh::config::PolicyConfig::PowerOfTwo {
+            load_check_interval_secs: 10,
+        },
+        ..Default::default()
+    })
+    .await;
+    let other: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://127.0.0.1:18002")
+            .model_id("other-model")
+            .build(),
+    );
+    fixture.app.worker_registry.register(other.clone());
+    // An unspecified model must use the default policy, even if the chosen
+    // worker's model has a policy that requires tokens.
+    fixture
+        .app
+        .policy_registry
+        .on_worker_added("other-model", Some("prefix_hash"));
+    let busy = mesh::core::WorkerLoadGuard::new(fixture.worker.clone(), None);
+    for (body, destination) in [
+        (
+            r#"{"text":"hello","vendor_extension":42}"#,
+            "127.0.0.1:18002",
+        ),
+        (r#"{"model":null,"text":"hello"}"#, "127.0.0.1:18002"),
+        (
+            r#"{"model":"test-model","text":"hello"}"#,
+            "127.0.0.1:18001",
+        ),
+    ] {
+        let mut stream = fixture.open().await;
+        stream.request_headers("/generate").await;
+        stream.body(body.as_bytes(), true).await;
+        assert_eq!(stream.destination().await, destination);
+        let Response::RequestBody(response) = stream.recv().await else {
+            panic!("expected body");
+        };
+        let Some(pb::body_mutation::Mutation::StreamedResponse(forwarded)) =
+            response.response.unwrap().body_mutation.unwrap().mutation
+        else {
+            panic!("expected streamed mutation");
+        };
+        assert_eq!(forwarded.body, body.as_bytes());
+        stream.response_headers(true).await;
+    }
+    drop(busy);
+    for healthy in [true, false] {
+        other.set_healthy(healthy);
+        let mut stream = fixture.open().await;
+        stream.request_headers("/generate").await;
+        stream
+            .subset_body(Stream::list(&["127.0.0.1:18002"]), br#"{"text":"hello"}"#)
+            .await;
+        if healthy {
+            assert_eq!(stream.destination().await, "127.0.0.1:18002");
+            assert!(matches!(stream.recv().await, Response::RequestBody(_)));
+            stream.response_headers(true).await;
+        } else {
+            stream.error(503).await;
+        }
+    }
+    for (path, body, status) in [
+        ("/generate", r#"{"model":"missing","text":"hello"}"#, 503),
+        ("/generate", r#"{"model":" ","text":"hello"}"#, 400),
+        (
+            "/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hello"}]}"#,
+            503, // Chat's protocol default model has no registered worker.
+        ),
+        (
+            "/v1/chat/completions",
+            r#"{"model":null,"messages":[{"role":"user","content":"hello"}]}"#,
+            400,
+        ),
+        ("/v1/completions", r#"{"prompt":"hello"}"#, 400),
+    ] {
+        let mut stream = fixture.open().await;
+        stream.request_headers(path).await;
+        stream.body(body.as_bytes(), true).await;
+        stream.error(status).await;
+    }
+    fixture.runtime.shutdown().await.unwrap();
+    assert_eq!(fixture.worker.load(), 0);
+    assert_eq!(other.load(), 0);
+}
+
+#[tokio::test]
 async fn dp_rank_uses_origin_address_and_preserves_extension_fields() {
     let fixture = Fixture::new(RouterConfig::default()).await;
     fixture.worker.set_healthy(false);
@@ -627,26 +724,22 @@ async fn prefix_hash_requires_tokens_and_accepts_generate_input_ids() {
     missing.headers_only().await;
     missing.body(Stream::BODY, true).await;
     missing.error(503).await;
-    let mut stream = fixture.open().await;
-    stream
-        .send(Request::RequestHeaders(Stream::headers(
-            &[
-                (":method", "POST"),
-                (":path", "/generate"),
-                ("content-type", "application/json"),
-            ],
-            false,
-        )))
-        .await;
-    stream
-        .body(
-            br#"{"model":"test-model","input_ids":[1,2,3,4],"stream":false}"#,
-            true,
-        )
-        .await;
-    assert_eq!(stream.destination().await, "127.0.0.1:18001");
-    assert!(matches!(stream.recv().await, Response::RequestBody(_)));
-    stream.response_headers(true).await;
+    let mut missing_model = fixture.open().await;
+    missing_model.request_headers("/generate").await;
+    missing_model.body(br#"{"text":"hello"}"#, true).await;
+    missing_model.error(503).await;
+    for body in [
+        r#"{"model":"test-model","input_ids":[1,2,3,4],"stream":false}"#,
+        r#"{"input_ids":[1,2,3,4],"stream":false}"#,
+        r#"{"model":null,"input_ids":[1,2,3,4],"stream":false}"#,
+    ] {
+        let mut stream = fixture.open().await;
+        stream.request_headers("/generate").await;
+        stream.body(body.as_bytes(), true).await;
+        assert_eq!(stream.destination().await, "127.0.0.1:18001");
+        assert!(matches!(stream.recv().await, Response::RequestBody(_)));
+        stream.response_headers(true).await;
+    }
     fixture.runtime.shutdown().await.unwrap();
 }
 

@@ -305,8 +305,7 @@ impl<'a> PDRequestContext<'a> {
             is_stream: metadata.stream,
             return_logprob: metadata.return_logprob,
             request_text: Some(&metadata.text),
-            model_id: model
-                .or_else(|| (!metadata.model.is_empty()).then_some(metadata.model.as_str())),
+            model_id: model.or_else(|| metadata.model.as_deref().filter(|model| !model.is_empty())),
             headers: headers.cloned().map(Arc::new),
         }
     }

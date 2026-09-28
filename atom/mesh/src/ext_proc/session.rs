@@ -415,7 +415,10 @@ impl Session {
                 let mut observation = crate::observability::request::RequestMetrics::new(
                     "ext_proc",
                     backend,
-                    &input.model,
+                    input
+                        .model
+                        .as_deref()
+                        .unwrap_or(crate::core::UNKNOWN_MODEL_ID),
                     input.route,
                     input.stream,
                 )

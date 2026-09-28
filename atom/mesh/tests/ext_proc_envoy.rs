@@ -682,6 +682,11 @@ impl PdBackend {
                 "/generate",
                 json!({"model":"test-model","text":"hi","vendor_extension":42}),
             ),
+            ("/generate", json!({"text":"hi","vendor_extension":42})),
+            (
+                "/generate",
+                json!({"model":null,"text":"hi","vendor_extension":42}),
+            ),
         ];
         for (index, (path, body)) in requests.iter().enumerate() {
             let text = if index == 0 {
@@ -705,10 +710,15 @@ impl PdBackend {
                 text
             };
             assert!(text.contains("pd-result"));
+            let calls = backend.calls.lock().unwrap();
+            for prefill in [true, false] {
+                let (_, forwarded) = calls.iter().rev().find(|(p, _)| *p == prefill).unwrap();
+                assert_eq!(forwarded.get("model"), body.get("model"));
+            }
         }
         let calls = backend.calls.lock().unwrap().clone();
-        assert_eq!(calls.iter().filter(|(p, _)| *p).count(), 3);
-        assert_eq!(calls.iter().filter(|(p, _)| !*p).count(), 3);
+        assert_eq!(calls.iter().filter(|(p, _)| *p).count(), requests.len());
+        assert_eq!(calls.iter().filter(|(p, _)| !*p).count(), requests.len());
         if kind == mesh::config::types::BackendType::Vllm {
             for (_, decode) in calls.iter().filter(|(p, _)| !*p) {
                 assert_eq!(decode["kv_transfer_params"]["remote_engine_id"], "engine-0");
@@ -737,10 +747,10 @@ impl PdBackend {
                 let _ = response.bytes().await.unwrap();
             }
             let calls = backend.calls.lock().unwrap();
-            assert_eq!(calls.iter().filter(|(p, _)| *p).count(), 5);
+            assert_eq!(calls.iter().filter(|(p, _)| *p).count(), requests.len() + 2);
             assert_eq!(
                 calls.iter().filter(|(p, _)| !*p).count(),
-                3,
+                requests.len(),
                 "failed prefill must not invoke decode or retry"
             );
         }

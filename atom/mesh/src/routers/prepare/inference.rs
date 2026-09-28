@@ -12,7 +12,7 @@ use validator::Validate;
 #[derive(Debug, Clone)]
 pub struct InferenceMetadata {
     pub route: &'static str,
-    pub model: String,
+    pub model: Option<String>,
     pub text: String,
     pub batch_size: Option<usize>,
     pub stream: bool,
@@ -40,7 +40,7 @@ impl InferenceRequest for ChatCompletionRequest {
     fn metadata(&self) -> InferenceMetadata {
         InferenceMetadata {
             route: "/v1/chat/completions",
-            model: self.model.clone(),
+            model: Some(self.model.clone()),
             text: self.extract_text_for_routing(),
             batch_size: self.n.filter(|n| *n > 1).map(|n| n as usize),
             stream: self.is_stream(),
@@ -56,7 +56,7 @@ impl InferenceRequest for CompletionRequest {
         };
         InferenceMetadata {
             route: "/v1/completions",
-            model: self.model.clone(),
+            model: Some(self.model.clone()),
             text: self.extract_text_for_routing(),
             batch_size,
             stream: self.is_stream(),
@@ -72,7 +72,7 @@ impl InferenceRequest for GenerateRequest {
         };
         InferenceMetadata {
             route: "/generate",
-            model: self.model.clone().unwrap_or_default(),
+            model: self.model.clone(),
             text: self.extract_text_for_routing(),
             batch_size,
             stream: self.is_stream(),
@@ -188,7 +188,7 @@ mod tests {
             );
             let execution = metadata.execution_metadata();
             assert!(execution.text.is_empty());
-            assert_eq!(execution.model, "m");
+            assert_eq!(execution.model.as_deref(), Some("m"));
             assert_eq!(
                 (
                     execution.route,

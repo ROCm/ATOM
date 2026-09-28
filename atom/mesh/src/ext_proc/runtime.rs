@@ -243,7 +243,7 @@ impl HealthService {
             .filter(|w| {
                 w.is_available()
                     && matches!(w.connection_mode(), ConnectionMode::Http)
-                    && (!super::request::RequestEnvelope::needs_tokens(app, w.model_id())
+                    && (!super::request::RequestEnvelope::needs_tokens(app, Some(w.model_id()))
                         || app.tokenizer_registry.get(w.model_id()).is_some())
             })
             .collect();

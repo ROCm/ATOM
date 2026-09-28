@@ -14,7 +14,11 @@ use tokio::{
 use http::{HeaderMap, HeaderName, HeaderValue};
 use prost_types::value::Kind;
 
-use crate::{app_context::AppContext, routers::prepare::chat_template::process_chat_messages};
+use crate::{
+    app_context::AppContext,
+    core::placement::{registry_adapters::PolicyRegistryAdapter, traits::PolicySource},
+    routers::prepare::chat_template::process_chat_messages,
+};
 
 use super::{core, error::ProcessingError, pb};
 use crate::routers::prepare::inference::{InferenceMetadata, InferenceRequest, ParsedInference};
@@ -241,13 +245,13 @@ impl RequestEnvelope {
         Ok(())
     }
 
-    pub fn needs_tokens(app: &AppContext, model: &str) -> bool {
+    pub fn needs_tokens(app: &AppContext, model: Option<&str>) -> bool {
         if app.router_config.mode.is_pd_mode() {
             app.policy_registry.get_prefill_policy().needs_tokens()
                 || app.policy_registry.get_decode_policy().needs_tokens()
         } else {
-            app.policy_registry
-                .get_policy_or_default(model)
+            PolicyRegistryAdapter::new(app.policy_registry.clone())
+                .regular_policy(model)
                 .needs_tokens()
         }
     }
@@ -261,23 +265,25 @@ impl RequestEnvelope {
         let parsed =
             ParsedInference::parse(&self.path, &self.raw).map_err(ProcessingError::invalid)?;
         let metadata = parsed.metadata();
-        let model = &metadata.model;
+        let model = metadata.model.as_deref();
         let text = &metadata.text;
         check_canceled(canceled)?;
-        if model.trim().is_empty() {
+        if model.is_some_and(|model| model.trim().is_empty()) {
             return Err(ProcessingError::invalid("model is required"));
         }
         let tokens = if Self::needs_tokens(app, model) {
             if let Some(ids) = parsed.input_tokens().map_err(ProcessingError::invalid)? {
                 Some(ids)
             } else {
-                let tokenizer = app.tokenizer_registry.get(model).ok_or_else(|| {
-                    ProcessingError::new(
-                        503,
-                        "tokenizer_unavailable",
-                        "token routing requires a registered model tokenizer",
-                    )
-                })?;
+                let tokenizer = model
+                    .and_then(|model| app.tokenizer_registry.get(model))
+                    .ok_or_else(|| {
+                        ProcessingError::new(
+                            503,
+                            "tokenizer_unavailable",
+                            "token routing requires input_ids or a model with a registered tokenizer",
+                        )
+                    })?;
                 check_prompt_size(text, app.router_config.ext_proc.max_tokenize_bytes)?;
                 check_canceled(canceled)?;
                 let prompt = if let Some(chat) = parsed.chat() {

@@ -4,6 +4,7 @@
 An intentional version update changes REVISIONS and runs --update-manifest.
 Review the resulting protocol and checksum changes together.
 """
+
 import argparse
 import hashlib
 import json
@@ -12,18 +13,21 @@ import re
 import tempfile
 import urllib.request
 from pathlib import Path
+from typing import ClassVar
 
 
 class ProtoVendor:
-    REVISIONS = {
+    REVISIONS: ClassVar[dict] = {
         "envoy": "6d9bb7d9a85d616b220d1f8fe67b61f82bbdb8d3",  # v1.37.0
         "xds": "8bfbf64dc13ee1a570be4fbdcfccbdd8532463f0",
         "pgv": "4eb9011f3e6d551d067d87c89f082261164fac31",  # v1.3.0
         "grpc": "5e6ba94242b92e363220bc2163d55ce3554d4ecc",  # v1.78.0
     }
-    REPOSITORIES = {
-        "envoy": "envoyproxy/envoy", "xds": "cncf/xds",
-        "pgv": "bufbuild/protoc-gen-validate", "grpc": "grpc/grpc",
+    REPOSITORIES: ClassVar[dict] = {
+        "envoy": "envoyproxy/envoy",
+        "xds": "cncf/xds",
+        "pgv": "bufbuild/protoc-gen-validate",
+        "grpc": "grpc/grpc",
     }
     MAX_FILE_BYTES = 4 * 1024 * 1024
     MAX_FILES = 256
@@ -54,8 +58,9 @@ class ProtoVendor:
 
     def url(self, source, path):
         self.validate_name(path)
-        return "https://raw.githubusercontent.com/{}/{}/{}".format(
-            self.REPOSITORIES[source], self.REVISIONS[source], path
+        return (
+            f"https://raw.githubusercontent.com/"
+            f"{self.REPOSITORIES[source]}/{self.REVISIONS[source]}/{path}"
         )
 
     def download(self, url):
@@ -103,19 +108,33 @@ class ProtoVendor:
 
     def check(self):
         for name, expected in self.manifest()["files"].items():
-            actual = hashlib.sha256(self.target(self.root, name).read_bytes()).hexdigest()
+            actual = hashlib.sha256(
+                self.target(self.root, name).read_bytes()
+            ).hexdigest()
             if actual != expected:
                 raise ValueError("Checksum mismatch: " + name)
 
     def install(self, update_manifest=False):
-        hashes = {name: hashlib.sha256(data).hexdigest() for name, data in self.downloaded.items()}
+        hashes = {
+            name: hashlib.sha256(data).hexdigest()
+            for name, data in self.downloaded.items()
+        }
         if not update_manifest and hashes != self.manifest()["files"]:
             raise ValueError("Downloaded sources differ from checksum manifest")
         files = dict(self.downloaded)
         if update_manifest:
-            files[self.MANIFEST] = (json.dumps({"revisions": self.REVISIONS, "files": hashes}, indent=2, sort_keys=True) + "\n").encode()
+            files[self.MANIFEST] = (
+                json.dumps(
+                    {"revisions": self.REVISIONS, "files": hashes},
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode()
         # Finish all downloads, dependency traversal and hash checks before touching sources.
-        with tempfile.TemporaryDirectory(prefix="ext-proc-proto-", dir=self.root.parent) as temporary:
+        with tempfile.TemporaryDirectory(
+            prefix="ext-proc-proto-", dir=self.root.parent
+        ) as temporary:
             temporary = Path(temporary)
             originals = {}
             installed = []
@@ -144,7 +163,11 @@ class ProtoVendor:
         if not update_manifest:
             self.manifest()  # Reject an invalid manifest before network access.
         self.proto("envoy/service/ext_proc/v3/external_processor.proto")
-        self.fetch("grpc/health/v1/health.proto", "grpc", "src/proto/grpc/health/v1/health.proto")
+        self.fetch(
+            "grpc/health/v1/health.proto",
+            "grpc",
+            "src/proto/grpc/health/v1/health.proto",
+        )
         for source in self.REVISIONS:
             self.fetch("licenses/" + source + ".txt", source, "LICENSE")
         self.install(update_manifest)

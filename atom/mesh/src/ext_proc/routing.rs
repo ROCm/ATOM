@@ -6,7 +6,7 @@ use crate::{
         placement::{
             planner::DefaultPlanner,
             registry_adapters::{PolicyRegistryAdapter, WorkerRegistryAdapter},
-            traits::PdPlanner,
+            traits::{PdPlanner, PolicySource},
             types::{PlacementPlan, Protocol, RequestDescriptor},
         },
         ConnectionMode, Worker, WorkerLoadGuard, WorkerType,
@@ -77,11 +77,19 @@ impl EndpointRouter {
         request: &mut RequestEnvelope,
         input: &RoutingInput,
     ) -> Result<RoutingDecision, ProcessingError> {
-        let mut workers = self
-            .app
-            .worker_registry
-            .get_by_model(&input.model)
-            .iter()
+        let model = input.model.as_deref();
+        let pool = match model {
+            Some(model) => self
+                .app
+                .worker_registry
+                .get_by_model(model)
+                .iter()
+                .cloned()
+                .collect(),
+            None => self.app.worker_registry.get_all(),
+        };
+        let mut workers = pool
+            .into_iter()
             .filter(|w| {
                 matches!(w.connection_mode(), ConnectionMode::Http)
                     && if self.executor.is_some() {
@@ -90,7 +98,6 @@ impl EndpointRouter {
                         matches!(w.worker_type(), WorkerType::Regular)
                     }
             })
-            .cloned()
             .collect::<Vec<_>>();
         let mut resolved = HashMap::new();
         if let Some(subset) = &request.subset {
@@ -119,12 +126,10 @@ impl EndpointRouter {
             self.app.worker_registry.clone(),
             workers,
         ));
-        let planner = DefaultPlanner::new(
-            source,
-            Arc::new(PolicyRegistryAdapter::new(self.app.policy_registry.clone())),
-        );
+        let policies = Arc::new(PolicyRegistryAdapter::new(self.app.policy_registry.clone()));
+        let planner = DefaultPlanner::new(source, policies.clone());
         let descriptor = RequestDescriptor {
-            model_id: Some(&input.model),
+            model_id: model,
             protocol: Some(Protocol::Http),
             text: Some(&input.text),
             tokens: input.tokens.as_deref(),
@@ -177,7 +182,7 @@ impl EndpointRouter {
             target: ExecutionTarget::Single {
                 worker,
                 _load: load,
-                policy: self.app.policy_registry.get_policy_or_default(&input.model),
+                policy: policies.regular_policy(model),
             },
             address,
             authorization,
