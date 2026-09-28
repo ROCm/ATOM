@@ -11,6 +11,7 @@ KV output aggregator.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -189,11 +190,29 @@ class KVTransferRegion:
         return self.base_addr + index * self.unit_bytes
 
 
+@dataclass(frozen=True)
+class PageRegion:
+    """One PAGE region and the tensor that aliases exactly its bytes.
+
+    The region is the address form every transport reads (P/D, dense offload);
+    the view is the tensor form LMCache MP registers. They describe the same
+    bytes, so they travel as one value and cannot fall out of step. A producer
+    that only has addresses leaves ``view`` None; LMCache MP then refuses the
+    layout rather than register a partial one. Build one from a tensor with
+    `atom.kv_transfer.disaggregation.page_region.page_region`.
+    """
+
+    region: KVTransferRegion
+    view: Any = None
+
+
 @dataclass
 class KVTransferTensors:
     """Physical PAGE, SLOT, and compressor-only staging region contract.
 
-    ``block_regions`` contain forward-indexed, block-indexed PAGE units.
+    ``pages`` are forward-indexed, block-indexed PAGE units, each with its
+    region and (when published) its tensor view; ``block_regions`` and
+    ``block_tensor_views`` read them back.
     ``swa_block_regions`` is a legacy field name for complete reverse-indexed
     per-request SLOT units, including both compressor state and SWA.
     ``expected_full_slot_region_count`` makes a stateful layout's complete
@@ -213,9 +232,9 @@ class KVTransferTensors:
     protocol can describe replication per region group.
     """
 
-    # Block-indexed PAGE regions, indexed forward by block id.
-    block_regions: list[KVTransferRegion]
-    slot_regions: list[KVTransferRegion]
+    # Block-indexed PAGE regions with their views, indexed forward by block id.
+    pages: list[PageRegion] = field(default_factory=list)
+    slot_regions: list[KVTransferRegion] = field(default_factory=list)
     num_slots: int = 0
     # Optional producer-local -> consumer-global mapping for non-uniform block
     # region layouts. Uniform per-layer groups leave this unset and use the
@@ -231,12 +250,6 @@ class KVTransferTensors:
     scatter_slot: Callable[[int, int], None] | None = None
     # Appended for positional compatibility with existing generic descriptors.
     expected_full_slot_region_count: int | None = None
-    # Zero-copy, physical-order views paired with block regions. Each view is
-    # [num_units, physical_slots_per_unit, opaque_width] and one dim-0 unit
-    # covers exactly the paired region's unit_bytes; the last two dimensions
-    # describe copy geometry, not a token/head layout. Backends publish both
-    # through `add_block_region`, which keeps the pair in step.
-    block_tensor_views: list[Any] = field(default_factory=list)
     # Number of TP workers whose complete PAGE layout is byte-identical.
     # ``1`` means no cross-rank deduplication is safe.
     tp_replication_factor: int = 1
@@ -280,59 +293,39 @@ class KVTransferTensors:
     # the same number. Set through `set_block_count`.
     num_blocks: int = field(init=False, default=0)
 
-    def add_block_region(
-        self,
-        tensor: Any,
-        *,
-        semantic_role: str,
-        unit_bytes: int | None = None,
-        total_bytes: int | None = None,
-    ) -> None:
-        """Publish one PAGE region and its block-major byte view, built together.
+    @property
+    def block_regions(self) -> tuple[KVTransferRegion, ...]:
+        """Every PAGE region, in publication order (read-only; add `pages`)."""
+        return tuple(page.region for page in self.pages)
 
-        The region (addresses for P/D and dense offload) and the view (a tensor
-        for LMCache MP) describe the same bytes, so they come from one place
-        rather than two lists kept in step by hand. The view is a zero-copy
-        ``uint8 [num_units, 1, unit_bytes]`` alias of ``tensor``: the last two
-        dimensions are opaque copy geometry, and LMCache stores the same bytes
-        in the same order whatever shape a block is given.
+    @property
+    def block_tensor_views(self) -> tuple[Any, ...]:
+        """The published views, each a zero-copy byte alias of its region.
 
-        ``unit_bytes`` defaults to ``tensor``'s row stride and ``total_bytes``
-        to all of it. A larger allocation that holds more than the PAGE units
-        (DSV4's planes also hold SLOT rows after them) passes both.
+        ``uint8 [num_units, 1, unit_bytes]``: the last two dimensions are
+        opaque copy geometry for LMCache MP, not a token/head layout. Empty when
+        the producer published addresses only.
         """
-        import torch  # this module stays importable without torch
+        return tuple(page.view for page in self.pages if page.view is not None)
 
-        if not tensor.is_contiguous():
-            raise ValueError(f"PAGE tensor {semantic_role!r} must be contiguous")
-        element_size = tensor.element_size()
-        if unit_bytes is None:
-            unit_bytes = tensor.stride(0) * element_size
-        if total_bytes is None:
-            total_bytes = tensor.numel() * element_size
-        available = tensor.numel() * element_size
-        if unit_bytes <= 0 or total_bytes % unit_bytes or total_bytes > available:
-            raise ValueError(
-                f"PAGE tensor {semantic_role!r} has {available} bytes; cannot "
-                f"publish {total_bytes} bytes in units of {unit_bytes}"
-            )
-        # `view`, never `reshape`: a copy would publish bytes nobody writes.
-        byte_view = tensor.view(torch.uint8).view(-1)[:total_bytes]
-        self.block_regions.append(
-            KVTransferRegion(
-                base_addr=tensor.data_ptr(),
-                total_bytes=total_bytes,
-                unit_bytes=unit_bytes,
-                semantic_role=semantic_role,
-            )
+    def merge_pages(self, other: KVTransferTensors) -> None:
+        """Append another contributor's PAGE units (a draft's own pool).
+
+        Replication is a whole-PAGE declaration: one sharded contributor makes
+        the combined object sharded even when this one alone is replicated.
+        """
+        if not other.pages:
+            return
+        self.pages.extend(other.pages)
+        self.tp_replication_factor = math.gcd(
+            self.tp_replication_factor, other.tp_replication_factor
         )
-        self.block_tensor_views.append(byte_view.view(-1, 1, unit_bytes))
 
     def set_block_count(self, num_blocks: int) -> None:
         """Fix the block id space, and check every region is in it.
 
-        Called once the last contributor's regions are in the list; a draft
-        appends its own after construction, so this cannot be a `__post_init__`.
+        Called once the last contributor's regions are in; a draft's are merged
+        after construction (`merge_pages`), so this cannot be a `__post_init__`.
 
         A region that does not divide into exactly `num_blocks` units was
         registered in some other unit. Both ends would still agree on

@@ -1890,9 +1890,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         ``staging_region`` and ``gather_slot`` describe only compressor-state
         PD staging and must never be used as the source of a SLOT sidecar.
         """
+        from atom.kv_transfer.disaggregation.page_region import page_region
         from atom.kv_transfer.disaggregation.types import (
             KVTransferRegion,
             KVTransferTensors,
+            PageRegion,
         )
 
         runner = self.model_runner
@@ -1922,8 +1924,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         geo = self.pool_geometry
         elem_fp32 = 4
 
-        # PAGE regions and their LMCache MP byte views, published as pairs.
-        pages = KVTransferTensors(block_regions=[], slot_regions=[])
+        pages: list[PageRegion] = []
         swa_block_regions: list[KVTransferRegion] = []
         slot_regions: list[KVTransferRegion] = []
 
@@ -1951,11 +1952,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         for plane, row_bytes, role in planes:
             # A plane also holds SLOT rows after its PAGE blocks; publish only
             # the blocks.
-            pages.add_block_region(
-                plane,
-                semantic_role=role,
-                unit_bytes=geo.block_bytes(row_bytes),
-                total_bytes=self.num_blocks * geo.block_bytes(row_bytes),
+            pages.append(
+                page_region(
+                    plane,
+                    semantic_role=role,
+                    unit_bytes=geo.block_bytes(row_bytes),
+                    total_bytes=self.num_blocks * geo.block_bytes(row_bytes),
+                )
             )
 
         # Compressed PAGE regions: one per CSA layer in each indexer pool.
@@ -1964,15 +1967,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # this remains correct for both the FP8 row layout and FP4 tiles.
         for pool, role_prefix in self._indexer_page_pools():
             for pos, layer_id in enumerate(self.csa_layers):
-                pages.add_block_region(
-                    pool[pos], semantic_role=f"{role_prefix}.layer_{layer_id}"
+                pages.append(
+                    page_region(
+                        pool[pos], semantic_role=f"{role_prefix}.layer_{layer_id}"
+                    )
                 )
-        block_regions = pages.block_regions
 
         checkpoint_spec = runner.state_runtime.checkpoint_spec
         if checkpoint_spec is None:
             raise RuntimeError("DSV4 PAGE/state checkpoint sizing spec is missing")
-        transfer_page_bytes = sum(region.unit_bytes for region in block_regions)
+        transfer_page_bytes = sum(page.region.unit_bytes for page in pages)
         if transfer_page_bytes != checkpoint_spec.page_unit_bytes:
             raise RuntimeError(
                 "DSV4 PAGE transfer regions do not cover the sized PAGE unit: "
@@ -2034,7 +2038,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # TP rank. One writer is sufficient; all ranks still read.
         tp_size = int(getattr(runner.config, "tensor_parallel_size", 1) or 1)
         return KVTransferTensors(
-            block_regions=block_regions,
+            pages=pages,
             swa_block_regions=swa_block_regions,
             slot_regions=slot_regions,
             num_slots=num_slots,
@@ -2043,12 +2047,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             staging_pool_size=pool_size if staging_region else 0,
             gather_slot=gather_slot,
             scatter_slot=scatter_slot,
-            block_tensor_views=pages.block_tensor_views,
             tp_replication_factor=tp_size,
             native_state_tp_replication_factor=tp_size,
             paged_state_checkpoint_spec=checkpoint_spec,
             execute_paged_state_copies=self.execute_paged_state_copies,
-            paged_state_region_count=len(block_regions),
+            paged_state_region_count=len(pages),
         )
 
     # ------------------------------------------------------------------ #

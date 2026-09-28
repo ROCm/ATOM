@@ -332,7 +332,10 @@ flowchart LR
 different concepts. They must not be substituted for one another:
 
 ```text
-block_regions      PAGE: physical-block units, forward indexed
+pages              PAGE: physical-block units, forward indexed; each a
+                    PageRegion (its region, plus the byte view LMCache MP
+                    registers). `block_regions` / `block_tensor_views` read
+                    the two halves back
 swa_block_regions  SLOT: complete request-slot units, reverse indexed
                     (the field name is historical)
 staging_region     compressor-only P/D staging; never a full sidecar source

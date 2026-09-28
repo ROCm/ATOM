@@ -13,7 +13,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from atom.kv_transfer.disaggregation.types import KVTransferRegion, KVTransferTensors
+from atom.kv_transfer.disaggregation.types import (
+    KVTransferRegion,
+    KVTransferTensors,
+    PageRegion,
+)
 from atom.kv_transfer.offload.mp.native_state_layout import (
     build_native_state_mp_layout,
 )
@@ -35,17 +39,18 @@ def _transfer(*, widths=(8, 8, 2), image_bytes=39, num_blocks=7):
         layout_id="native-test-v1",
     )
     transfer = KVTransferTensors(
-        block_regions=[
-            KVTransferRegion(
-                view.data_ptr(),
-                num_blocks * width,
-                width,
-                semantic_role=f"region.{i}",
+        pages=[
+            PageRegion(
+                KVTransferRegion(
+                    view.data_ptr(),
+                    num_blocks * width,
+                    width,
+                    semantic_role=f"region.{i}",
+                ),
+                view,
             )
             for i, (view, width) in enumerate(zip(views, widths, strict=True))
         ],
-        slot_regions=[],
-        block_tensor_views=views,
         paged_state_checkpoint_spec=spec,
         execute_paged_state_copies=lambda stores, restores, descriptor_slot=0: None,
     )
@@ -210,7 +215,7 @@ def test_registration_rejects_mismatched_native_geometry_and_missing_restore():
     with pytest.raises(ValueError, match="do not cover"):
         _layout(transfer)
     transfer = _transfer()
-    transfer.block_tensor_views[0] = transfer.block_tensor_views[0].clone()
+    transfer.pages[0] = replace(transfer.pages[0], view=transfer.pages[0].view.clone())
     with pytest.raises(ValueError, match="does not alias"):
         _layout(transfer)
 
@@ -380,7 +385,10 @@ def test_draft_regions_after_the_state_regions_stay_ordinary_page():
     ("breakage", "message"),
     [
         (lambda t: setattr(t.block_regions[1], "unit_bytes", 9), "byte geometry"),
-        (lambda t: t.block_tensor_views.pop(), "one block_tensor_view per"),
+        (
+            lambda t: t.pages.__setitem__(-1, PageRegion(t.pages[-1].region)),
+            "one block_tensor_view per",
+        ),
         (lambda t: setattr(t.block_regions[2], "reverse_indexed", True), "reverse"),
     ],
 )

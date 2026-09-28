@@ -1395,11 +1395,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
 
     def get_kv_transfer_tensors(self):
+        from atom.kv_transfer.disaggregation.page_region import page_region
         from atom.kv_transfer.disaggregation.types import (
             INDEX_CACHE_ROLE,
             MLA_KV_ROLE,
             KVTransferRegion,
             KVTransferTensors,
+            PageRegion,
         )
 
         runner = self.model_runner
@@ -1447,19 +1449,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # and no per-field override to keep in step with the pooling ones.
         # DCP PD still dispatches on the two collapsed roles (`mla.kv` /
         # `dsa.index_cache`) rather than the pool's per-layer names.
-        pages = KVTransferTensors(block_regions=[], slot_regions=[])
+        pages: list[PageRegion] = []
         for role, t in self.kv_pool.region_tensors():
             if role.startswith("index."):
-                pages.add_block_region(t, semantic_role=INDEX_CACHE_ROLE)
+                pages.append(page_region(t, semantic_role=INDEX_CACHE_ROLE))
                 index_tensors.append(t)
                 continue
-            pages.add_block_region(
-                t,
-                semantic_role=(
-                    MLA_KV_ROLE if role.startswith("kv.") else f"mla.{role}"
-                ),
+            pages.append(
+                page_region(
+                    t,
+                    semantic_role=(
+                        MLA_KV_ROLE if role.startswith("kv.") else f"mla.{role}"
+                    ),
+                )
             )
-        block_regions = pages.block_regions
 
         block_region_consumer_indices = None
         index_cache_layer_ids = getattr(runner, "index_cache_layer_ids", ())
@@ -1622,9 +1625,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 return slot.data_ptr(), pages
 
         return KVTransferTensors(
-            block_regions=block_regions,
-            slot_regions=[],
-            block_tensor_views=pages.block_tensor_views,
+            pages=pages,
             block_region_consumer_indices=block_region_consumer_indices,
             index_staging_region=index_staging_region,
             index_staging_pool_size=index_staging_pool_size,

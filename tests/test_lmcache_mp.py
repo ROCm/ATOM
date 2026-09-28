@@ -14,11 +14,13 @@ import torch
 
 from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+from atom.kv_transfer.disaggregation.page_region import page_region
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
     KVTransferRegion,
     KVTransferTensors,
     LoadOperationId,
+    PageRegion,
     SaveOperationId,
     SaveSourceGroupId,
 )
@@ -472,9 +474,10 @@ def _transfer_tensors(*, tp_replication_factor: int = 1) -> KVTransferTensors:
         for tensor, role in zip(tensors, roles, strict=True)
     ]
     transfer = KVTransferTensors(
-        block_regions=regions,
-        slot_regions=[],
-        block_tensor_views=tensors,
+        pages=[
+            PageRegion(region, tensor)
+            for region, tensor in zip(regions, tensors, strict=True)
+        ],
         tp_replication_factor=tp_replication_factor,
     )
     transfer.set_block_count(2)
@@ -516,11 +519,7 @@ def test_build_cache_views_publishes_float8_pages_as_raw_bytes():
         unit_bytes=page[0].numel(),
         semantic_role="latent",
     )
-    transfer = KVTransferTensors(
-        block_regions=[region],
-        slot_regions=[],
-        block_tensor_views=[page],
-    )
+    transfer = KVTransferTensors(pages=[PageRegion(region, page)])
     transfer.set_block_count(2)
 
     views = page_views._build_cache_views(transfer, num_blocks=2)
@@ -534,7 +533,7 @@ def test_build_cache_views_publishes_float8_pages_as_raw_bytes():
 
 def test_build_cache_views_rejects_missing_or_bad_geometry():
     missing_view = _transfer_tensors()
-    missing_view.block_tensor_views.pop()
+    missing_view.pages[-1] = PageRegion(missing_view.pages[-1].region)
     with pytest.raises(ValueError, match="one block_tensor_view per block region"):
         page_views._build_cache_views(missing_view, num_blocks=2)
 
@@ -544,14 +543,16 @@ def test_build_cache_views_rejects_missing_or_bad_geometry():
         page_views._build_cache_views(bad_geometry, num_blocks=2)
 
     noncontiguous = _transfer_tensors()
-    noncontiguous.block_tensor_views[0] = torch.zeros(2, 32, 4).transpose(1, 2)
+    noncontiguous.pages[0] = replace(
+        noncontiguous.pages[0], view=torch.zeros(2, 32, 4).transpose(1, 2)
+    )
     assert not noncontiguous.block_tensor_views[0].is_contiguous()
     with pytest.raises(ValueError, match="non-empty and contiguous"):
         page_views._build_cache_views(noncontiguous, num_blocks=2)
 
     unsupported_rank = _transfer_tensors()
-    unsupported_rank.block_tensor_views[0] = torch.zeros(
-        2, 4, 4, 8, dtype=torch.float16
+    unsupported_rank.pages[0] = replace(
+        unsupported_rank.pages[0], view=torch.zeros(2, 4, 4, 8, dtype=torch.float16)
     )
     with pytest.raises(ValueError, match="physical_slots, opaque_width"):
         page_views._build_cache_views(unsupported_rank, num_blocks=2)
@@ -1864,18 +1865,19 @@ def test_factory_registers_lmcache_mp_alias_without_pd_staging():
     )
 
 
-def test_add_block_region_publishes_a_region_and_its_byte_view_together():
+def test_page_region_is_a_region_and_its_byte_view_built_together():
     """One call yields both halves, zero-copy, over exactly the PAGE bytes:
     a larger allocation (DSV4's planes also hold SLOT rows) is cut to them."""
     arena = torch.arange(3 * 8 + 4, dtype=torch.int16)  # 3 blocks + a tail
-    transfer = KVTransferTensors(block_regions=[], slot_regions=[])
-    transfer.add_block_region(
-        arena, semantic_role="plane", unit_bytes=16, total_bytes=3 * 16
-    )
     fp16 = torch.zeros(3, 4, 2, dtype=torch.float16)
-    transfer.add_block_region(fp16, semantic_role="rows")
+    transfer = KVTransferTensors(
+        pages=[
+            page_region(arena, semantic_role="plane", unit_bytes=16, total_bytes=48),
+            page_region(fp16, semantic_role="rows"),
+        ]
+    )
 
-    [plane, rows] = transfer.block_regions
+    plane, rows = transfer.block_regions
     assert (plane.base_addr, plane.total_bytes, plane.unit_bytes) == (
         arena.data_ptr(),
         48,
@@ -1894,15 +1896,42 @@ def test_add_block_region_publishes_a_region_and_its_byte_view_together():
     assert page_views._build_cache_views(transfer, num_blocks=3).bytes_per_block == 32
 
 
-def test_add_block_region_rejects_what_it_cannot_alias():
-    transfer = KVTransferTensors(block_regions=[], slot_regions=[])
+def test_page_region_rejects_what_it_cannot_alias():
     with pytest.raises(ValueError, match="contiguous"):
-        transfer.add_block_region(torch.zeros(4, 3).t(), semantic_role="strided")
+        page_region(torch.zeros(4, 3).t(), semantic_role="strided")
     with pytest.raises(ValueError, match="cannot publish"):
-        transfer.add_block_region(
+        page_region(
             torch.zeros(8, dtype=torch.uint8),
             semantic_role="short",
             unit_bytes=4,
             total_bytes=12,
         )
-    assert transfer.block_regions == [] and transfer.block_tensor_views == []
+
+
+def test_pages_are_read_only_through_the_derived_lists():
+    """`block_regions` / `block_tensor_views` are views of `pages`, so nothing
+    can append to one without the other."""
+    transfer = KVTransferTensors(
+        pages=[page_region(torch.zeros(2, 4, dtype=torch.uint8), semantic_role="p")]
+    )
+    with pytest.raises(AttributeError):
+        transfer.block_regions.append(transfer.block_regions[0])
+    with pytest.raises(AttributeError):
+        transfer.block_tensor_views.append(transfer.block_tensor_views[0])
+
+
+def test_merge_pages_appends_a_draft_and_takes_the_gcd_replication():
+    target = KVTransferTensors(
+        pages=[page_region(torch.zeros(2, 4, dtype=torch.uint8), semantic_role="t")],
+        tp_replication_factor=8,
+    )
+    target.merge_pages(KVTransferTensors(tp_replication_factor=1))
+    assert target.tp_replication_factor == 8  # nothing merged, nothing changes
+    draft = KVTransferTensors(
+        pages=[page_region(torch.zeros(2, 2, dtype=torch.uint8), semantic_role="d")],
+        tp_replication_factor=1,
+    )
+    target.merge_pages(draft)
+    assert [r.semantic_role for r in target.block_regions] == ["t", "d"]
+    assert len(target.block_tensor_views) == 2
+    assert target.tp_replication_factor == 1

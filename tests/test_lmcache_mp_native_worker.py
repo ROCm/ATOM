@@ -16,6 +16,7 @@ from atom.kv_transfer.disaggregation.types import (
     KVTransferRegion,
     KVTransferTensors,
     LoadOperationId,
+    PageRegion,
     SaveOperationId,
     SaveSourceGroupId,
 )
@@ -98,13 +99,14 @@ def worker():
     page = torch.zeros((32, 1, 32), dtype=torch.uint8)
     spec = PagedStateCheckpointSpec(32, 128, "native-test-v1", 80)
     tensors = KVTransferTensors(
-        block_regions=[
-            KVTransferRegion(
-                base_addr=page.data_ptr(), unit_bytes=32, total_bytes=page.numel()
+        pages=[
+            PageRegion(
+                KVTransferRegion(
+                    base_addr=page.data_ptr(), unit_bytes=32, total_bytes=page.numel()
+                ),
+                page,
             )
         ],
-        slot_regions=[],
-        block_tensor_views=[page],
         paged_state_checkpoint_spec=spec,
         execute_paged_state_copies=lambda stores, restores, descriptor_slot=0: None,
     )
@@ -509,13 +511,14 @@ def test_registration_reserves_every_restore_descriptor_slot(monkeypatch):
     reserved = []
     page = torch.zeros((32, 1, 32), dtype=torch.uint8)
     tensors = KVTransferTensors(
-        block_regions=[
-            KVTransferRegion(
-                base_addr=page.data_ptr(), unit_bytes=32, total_bytes=page.numel()
+        pages=[
+            PageRegion(
+                KVTransferRegion(
+                    base_addr=page.data_ptr(), unit_bytes=32, total_bytes=page.numel()
+                ),
+                page,
             )
         ],
-        slot_regions=[],
-        block_tensor_views=[page],
         paged_state_checkpoint_spec=PagedStateCheckpointSpec(
             32, 128, "native-test-v1", 80
         ),
