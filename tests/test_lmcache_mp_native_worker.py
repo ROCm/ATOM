@@ -31,7 +31,6 @@ from atom.kv_transfer.offload.mp.native_state_layout import (
     build_native_state_mp_layout,
 )
 from atom.kv_transfer.offload.mp.native_state_worker import (
-    NATIVE_STATE_MP_SOURCE_SAFE_CHANNEL,
     NATIVE_STATE_MP_STORE_CHANNEL,
     NativeStateLMCacheMPConnector,
     require_native_state_server,
@@ -154,7 +153,6 @@ def test_store_transmits_page_zero_as_real_native_unit(worker):
     finished = worker.get_finished()
     assert {completion.channel for completion in finished.connector_completions} == {
         DENSE_PAGE_SOURCE_SAFE_CHANNEL,
-        NATIVE_STATE_MP_SOURCE_SAFE_CHANNEL,
         NATIVE_STATE_MP_STORE_CHANNEL,
     }
     terminals = [
@@ -319,7 +317,10 @@ def test_incremental_load_transfers_only_page_suffix_but_full_native_image(worke
     assert submitted.block_ids == [[3, 4], [0], [25], [31]]
 
 
-def test_source_safe_ranges_are_reported_before_terminal(worker):
+def test_page_ranges_are_source_safe_before_terminal_but_state_is_not(worker):
+    """Chunk milestones cover PAGE only: the final chunk being done says
+    nothing about the STATE groups, so nothing about the image is reported
+    before the STORE terminal."""
     req = request()
     worker.future.source_ranges = [(0, 8)]
     worker._submit_save(req, object())
@@ -336,24 +337,13 @@ def test_source_safe_ranges_are_reported_before_terminal(worker):
 
     worker.future.source_ranges = [(8, 16)]
     second = worker.get_finished()
-    assert (
+    assert second.connector_completions == {
         ConnectorCompletion(
             DENSE_PAGE_SOURCE_SAFE_CHANNEL,
             SaveSourceGroupId(req.save_operation, ((8, 16),)),
             True,
         )
-        in second.connector_completions
-    )
-    assert (
-        ConnectorCompletion(
-            NATIVE_STATE_MP_SOURCE_SAFE_CHANNEL, req.save_operation, True
-        )
-        in second.connector_completions
-    )
-    assert all(
-        completion.channel != NATIVE_STATE_MP_STORE_CHANNEL
-        for completion in second.connector_completions
-    )
+    }
 
 
 def test_collapsed_tp_non_writer_skips_transport_and_reports_safe_success(worker):
@@ -363,12 +353,6 @@ def test_collapsed_tp_non_writer_skips_transport_and_reports_safe_success(worker
     assert worker.submitted == []
 
     completions = worker.get_finished().connector_completions
-    assert (
-        ConnectorCompletion(
-            NATIVE_STATE_MP_SOURCE_SAFE_CHANNEL, req.save_operation, True
-        )
-        in completions
-    )
     assert (
         ConnectorCompletion(NATIVE_STATE_MP_STORE_CHANNEL, req.save_operation, True)
         in completions

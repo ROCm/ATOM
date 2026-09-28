@@ -28,7 +28,6 @@ from atom.kv_transfer.offload.mp.backend import (
     _validate_mp_config,
 )
 from atom.kv_transfer.offload.mp.native_state_worker import (
-    NATIVE_STATE_MP_SOURCE_SAFE_CHANNEL,
     NATIVE_STATE_MP_STORE_CHANNEL,
     require_native_state_server,
 )
@@ -46,7 +45,6 @@ class _NativeSave:
     source: StateStoreOperationId
     saved_before: int
     boundary: int
-    source_safe: bool = False
 
 
 @dataclass
@@ -302,8 +300,9 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         self._source_group_finished(
             SaveSourceGroupId(operation, ((lease.saved_before, lease.boundary),))
         )
-        if not lease.source_safe:
-            self._checkpoints.release_offload_store_source(lease.source)
+        # The image pin is released on the terminal only: no PAGE chunk
+        # milestone proves the server has finished reading the STATE groups.
+        self._checkpoints.release_offload_store_source(lease.source)
         self._checkpoints.settle_offload_store(lease.source)
         self._refund_state_image()
         sid = str(operation.req_id)
@@ -327,15 +326,6 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             self._complete_native_save(req_id, succeeded=True)
 
     def connector_completion(self, completion: ConnectorCompletion) -> bool | None:
-        if completion.channel == NATIVE_STATE_MP_SOURCE_SAFE_CHANNEL:
-            operation = completion.operation_id
-            if not isinstance(operation, SaveOperationId):
-                return False
-            lease = self._native_saves.get(operation)
-            if lease is not None and not lease.source_safe:
-                self._checkpoints.release_offload_store_source(lease.source)
-                lease.source_safe = True
-            return None
         if completion.channel != NATIVE_STATE_MP_STORE_CHANNEL:
             return super().connector_completion(completion)
         if not isinstance(completion.operation_id, SaveOperationId):

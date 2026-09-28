@@ -43,7 +43,6 @@ from atom.utils import envs
 
 logger = logging.getLogger("atom")
 NATIVE_STATE_MP_STORE_CHANNEL = "native_state_mp_store"
-NATIVE_STATE_MP_SOURCE_SAFE_CHANNEL = "native_state_mp_state_source_safe"
 
 
 def require_native_state_server(adapter: Any, config: Any) -> None:
@@ -66,7 +65,6 @@ class _NativePending:
     restore_succeeded: bool = False
     descriptor_slot: int | None = None
     immediate_success: bool = False
-    state_source_safe: bool = False
     started_at: float = field(default_factory=lambda: time.monotonic())
 
 
@@ -312,26 +310,17 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 event.record(self._restore_stream)
         return True
 
-    def _emit_native_source_safe(
+    def _emit_page_source_safe(
         self,
         output: KVConnectorOutput,
         pending: _NativePending,
         ranges: tuple[tuple[int, int], ...],
     ) -> None:
+        # PAGE only. A chunk milestone says nothing about when the server has
+        # read the STATE groups, so the image pin waits for the STORE terminal.
         operation = pending.request.save_operation
-        if operation is None or not ranges:
-            return
-        output.connector_completions |= _source_safe_completions(operation, ranges)
-        boundary = int(pending.request.native_state.boundary_tokens)
-        if not pending.state_source_safe and any(end >= boundary for _, end in ranges):
-            output.connector_completions.add(
-                ConnectorCompletion(
-                    NATIVE_STATE_MP_SOURCE_SAFE_CHANNEL,
-                    operation,
-                    True,
-                )
-            )
-            pending.state_source_safe = True
+        if operation is not None and ranges:
+            output.connector_completions |= _source_safe_completions(operation, ranges)
 
     def start_load_kv(self, metadata: Any) -> None:
         # Read-after-write: this step's compute (including SLOT relocations in
@@ -357,7 +346,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 take_ranges = getattr(pending.future, "take_completed_ranges", None)
                 if callable(take_ranges):
                     try:
-                        self._emit_native_source_safe(
+                        self._emit_page_source_safe(
                             output, pending, tuple(take_ranges())
                         )
                     except Exception:
@@ -377,7 +366,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 save_spec = pending.request.save_spec
                 start = 0 if save_spec is None else int(save_spec.skip_leading_tokens)
                 end = len(pending.request.token_ids)
-                self._emit_native_source_safe(
+                self._emit_page_source_safe(
                     output, pending, _chunk_ranges(start, end, self.chunk_size)
                 )
                 output.connector_completions.add(
@@ -450,7 +439,6 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
 
 
 __all__ = [
-    "NATIVE_STATE_MP_SOURCE_SAFE_CHANNEL",
     "NATIVE_STATE_MP_STORE_CHANNEL",
     "NativeStateLMCacheMPConnector",
     "require_native_state_server",

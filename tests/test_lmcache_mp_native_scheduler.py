@@ -12,7 +12,9 @@ from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     LoadOperationId,
     SaveOperationId,
+    SaveSourceGroupId,
 )
+from atom.kv_transfer.offload.chunked_scheduler import DENSE_PAGE_SOURCE_SAFE_CHANNEL
 from atom.kv_transfer.offload.mp import backend
 from atom.kv_transfer.offload.mp.connector import LMCacheMPConnectorScheduler
 from atom.kv_transfer.offload.mp.native_state_scheduler import (
@@ -360,6 +362,31 @@ def test_no_timeout_or_abandon_recycles_dispatched_source(monkeypatch):
     assert scheduler.should_defer_free(seq)
     terminal(scheduler, request.save_operation)
     assert scheduler._pinned_state_bytes == 0
+
+
+def test_page_source_safe_never_releases_the_state_image(monkeypatch):
+    """PAGE chunk milestones do not prove the server read the STATE groups:
+    the image stays pinned, units included, until the STORE terminal."""
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch)
+    seq = sequence()
+    checkpoint(scheduler, checkpoints, seq, 16)
+    scheduler.update_state_after_alloc(seq)
+    [request] = scheduler.build_connector_meta().requests
+    [pin] = checkpoints.store._offload_pins.values()
+    scheduler.process_completions(
+        KVConnectorOutput(
+            connector_completions={
+                ConnectorCompletion(
+                    DENSE_PAGE_SOURCE_SAFE_CHANNEL,
+                    SaveSourceGroupId(request.save_operation, ((0, 8), (8, 16))),
+                    True,
+                )
+            }
+        )
+    )
+    assert not pin.source_released
+    terminal(scheduler, request.save_operation)
+    assert not checkpoints.has_offload_pins()
 
 
 @pytest.mark.parametrize("kind", ["save", "load"])

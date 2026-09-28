@@ -222,8 +222,9 @@ underlying PAGE stride.
 The scheduler dispatches one combined PAGE/STATE generation at a time per
 request, using round-robin admission plus count and byte bounds. It leases the
 exact READY state image only after admission. Source-safe events release PAGE
-leases chunk by chunk and release the state image when its endpoint is safe;
-terminal completion settles the logical operation. Failed saves roll back the
+leases chunk by chunk. The state image stays pinned until the STORE terminal:
+a PAGE chunk milestone does not prove the server has read the STATE groups.
+Terminal completion also settles the logical operation. Failed saves roll back the
 watermark for at most three attempts at one boundary. An uncertain remote DMA
 is never reclaimed by elapsed time alone.
 
