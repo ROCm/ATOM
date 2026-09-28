@@ -205,56 +205,37 @@ def test_invalid_native_source_fails_before_transport(worker, units):
     assert not terminal.succeeded
 
 
-def test_uncertain_remote_submission_retains_lease(worker):
-    def uncertain(*_):
-        raise ConnectionError("server may have received request")
-
-    worker._adapter.submit_store_request = uncertain
-    worker._submit_save(request(), object())
-    assert not worker.get_finished().connector_completions
-    assert len(worker._native_saves) == 1
-
-
-def test_uncertain_submission_fails_after_the_uncertainty_bound(worker, monkeypatch):
-    """Retaining the lease is right, but not forever: past the bound the save
-    settles as failed so its lease, budget and pending slot are released."""
+@pytest.mark.parametrize("loading", [False, True])
+def test_unprovable_submission_retains_lease_until_the_deadline_stops_the_engine(
+    worker, monkeypatch, loading
+):
+    """No clock releases a lease the server may still be using: the operation
+    stays pending, and past the transfer deadline the worker fails stop."""
     from atom.kv_transfer.offload.mp import backend
 
     now = [1000.0]
     monkeypatch.setattr(backend.time, "monotonic", lambda: now[0])
 
-    def uncertain(*_):
+    def unprovable(*_):
         raise ConnectionError("server may have received request")
 
-    worker._adapter.submit_store_request = uncertain
-    worker._submit_save(request(), object())
-    now[0] += worker._uncertain_timeout_s - 1
-    assert not worker.get_finished().connector_completions
-    assert len(worker._native_saves) == 1
+    worker._adapter.submit_store_request = unprovable
+    worker._adapter.submit_retrieve_request = unprovable
+    pending = worker._native_loads if loading else worker._native_saves
+    if loading:
+        worker._submit_load(request(loading=True), object())
+    else:
+        worker._submit_save(request(), object())
+    now[0] += worker._transfer_deadline_s - 1
+    output = worker.get_finished()
+    assert not output.connector_completions
+    assert not output.finished_loading and not output.failed_loading
+    assert len(pending) == 1
 
     now[0] += 2
-    completions = worker.get_finished().connector_completions
-    [terminal] = [
-        completion
-        for completion in completions
-        if completion.channel == NATIVE_STATE_MP_STORE_CHANNEL
-    ]
-    assert not terminal.succeeded
-    assert worker._native_saves == {}
-
-
-def test_uncertainty_bound_defaults_to_twice_the_adapter_timeout():
-    from atom.kv_transfer.offload.mp import backend
-
-    assert backend._uncertain_transfer_timeout_s(config()) == 600.0
-    assert (
-        backend._uncertain_transfer_timeout_s(config(**{"lmcache.mp.mq_timeout": 5}))
-        == 10.0
-    )
-    with pytest.raises(ValueError, match="uncertain_transfer_timeout_s"):
-        backend._uncertain_transfer_timeout_s(
-            config(**{"lmcache.mp.uncertain_transfer_timeout_s": 0})
-        )
+    with pytest.raises(backend.LMCacheTransferUnprovable):
+        worker.get_finished()
+    assert len(pending) == 1
 
 
 def test_failed_retrieve_does_not_restore_or_report_success(worker, monkeypatch):
@@ -518,11 +499,12 @@ def test_registration_reserves_every_restore_descriptor_slot(monkeypatch):
     assert reserved and 0 not in reserved
 
 
-def test_raising_restore_returns_its_descriptor_slot_after_the_bound(
+def test_raising_restore_keeps_its_descriptor_slot_until_the_deadline(
     worker, monkeypatch
 ):
-    """A restore that raises after taking a descriptor slot keeps it only until
-    the uncertainty bound, then the load fails and the slot is reusable."""
+    """A restore that raises after taking a descriptor slot may have queued a
+    copy that still reads the slot's staging buffer: the slot and lease stay
+    held, and the transfer deadline stops the engine instead of recycling."""
     from atom.kv_transfer.offload.mp import backend, native_state_worker
 
     now = [1000.0]
@@ -542,11 +524,11 @@ def test_raising_restore_returns_its_descriptor_slot_after_the_bound(
     assert not first.finished_loading and not first.failed_loading
     assert worker._restore_descriptor_slots == []
 
-    now[0] += worker._uncertain_timeout_s + 1
-    finished = worker.get_finished()
-    assert finished.failed_loading == {req.load_operation}
-    assert worker._restore_descriptor_slots == [3]
-    assert worker._native_loads == {}
+    now[0] += worker._transfer_deadline_s
+    with pytest.raises(backend.LMCacheTransferUnprovable):
+        worker.get_finished()
+    assert worker._restore_descriptor_slots == []
+    assert len(worker._native_loads) == 1
 
 
 def test_native_server_chunk_mismatch_fails_before_registration(monkeypatch):

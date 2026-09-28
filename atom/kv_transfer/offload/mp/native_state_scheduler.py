@@ -537,13 +537,17 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
                 self._finish_retired_request(sid)
         return output
 
-    def abandon_save(self, req_id: Any) -> None:
-        # This legacy callback carries no proof that the MP reader stopped.
-        # Explicit terminal failures already settle the exact operation above.
-        return None
-
-    def reclaim_stale_leases(self, timeout_s: float) -> list[frozenset]:
-        return []
+    def _live_transfers(self) -> set[Any]:
+        live = super()._live_transfers()
+        # A native save holds its checkpoint pin and state budget until its
+        # STORE terminal; nothing but that report may release them.
+        live.update(self._native_saves)
+        live.update(
+            operation
+            for operation, lease in self._native_loads.items()
+            if lease.dispatched
+        )
+        return live
 
 
 __all__ = ["NativeStateLMCacheMPConnectorScheduler"]

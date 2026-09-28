@@ -6,7 +6,7 @@ from __future__ import annotations
 import sys
 import types
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 import pytest
@@ -1227,54 +1227,119 @@ def test_worker_pre_submit_drops_are_immediately_terminal(
     assert worker._pending_saves == {}
 
 
-def test_worker_uncertain_save_submission_is_bounded_then_quiescent(
-    fake_lmcache_modules,
-    monkeypatch,
-):
-    """A raising submit may have reached the server, so the source stays leased;
-    past the bound the save reports every chunk source-safe and the store
-    failed, which lets the scheduler retry or retire it instead of wedging."""
-    adapter = _WorkerAdapter()
-
-    def uncertain(_request_id, _op, _event):
-        raise ConnectionError("server may have received request")
-
-    monkeypatch.setattr(adapter, "submit_store_request", uncertain)
-    monkeypatch.setattr(adapter, "submit_store_request_with_chunk_events", uncertain)
-    now = [1000.0]
-    monkeypatch.setattr(mp_connector.time, "monotonic", lambda: now[0])
-    worker = _worker(adapter)
-    operation = SaveOperationId(req_id=16, generation=1)
-    worker._submit_save(
-        LMCacheReqMeta(
+def _unprovable_request(kind: str) -> LMCacheReqMeta:
+    if kind == "load":
+        return LMCacheReqMeta(
             req_id=16,
             token_ids=list(range(16)),
             block_ids=[100, 101, 102, 103],
-            save_spec=SaveSpec(skip_leading_tokens=0),
-            save_operation=operation,
-        ),
-        object(),
+            load_spec=LoadSpec(0, 16, can_load=True),
+            load_operation=LoadOperationId(req_id=16, generation=1),
+        )
+    return LMCacheReqMeta(
+        req_id=16,
+        token_ids=list(range(16)),
+        block_ids=[100, 101, 102, 103],
+        save_spec=SaveSpec(skip_leading_tokens=0),
+        save_operation=SaveOperationId(req_id=16, generation=1),
     )
 
-    assert not worker.get_finished().connector_completions
-    assert len(worker._pending_saves) == 1
 
-    now[0] += worker._uncertain_timeout_s + 1
+@pytest.mark.parametrize("kind", ["load", "save"])
+def test_worker_unprovable_submission_is_never_released_on_a_clock(
+    fake_lmcache_modules,
+    monkeypatch,
+    kind,
+):
+    """A raising submit may have reached the server, which may still read the
+    source or write the destination. Nothing settles, so nothing is released;
+    past the transfer deadline the worker stops the engine instead."""
+    adapter = _WorkerAdapter()
+
+    def unprovable(_request_id, _op, _event):
+        raise ConnectionError("server may have received request")
+
+    for name in (
+        "submit_retrieve_request",
+        "submit_store_request",
+        "submit_store_request_with_chunk_events",
+    ):
+        monkeypatch.setattr(adapter, name, unprovable)
+    now = [1000.0]
+    monkeypatch.setattr(mp_connector.time, "monotonic", lambda: now[0])
+    worker = _worker(adapter)
+    request = _unprovable_request(kind)
+    if kind == "load":
+        worker._submit_load(request, object())
+        pending = worker._pending_loads
+    else:
+        worker._submit_save(request, object())
+        pending = worker._pending_saves
+
+    now[0] += worker._transfer_deadline_s - 1
     output = worker.get_finished()
-    assert output.finished_saving == {operation}
-    assert worker._pending_saves == {}
-    safe = {
-        completion.operation_id.ranges
-        for completion in output.connector_completions
-        if completion.channel == mp_connector.DENSE_PAGE_SOURCE_SAFE_CHANNEL
-    }
-    assert safe == {((0, 8),), ((8, 16),)}
+    assert not output.connector_completions
+    assert not output.failed_loading and not output.finished_saving
+    assert len(pending) == 1
+
+    now[0] += 2
+    with pytest.raises(mp_connector.LMCacheTransferUnprovable):
+        worker.get_finished()
+    assert len(pending) == 1
+
+
+def test_worker_future_that_keeps_raising_is_bounded_by_the_deadline(
+    fake_lmcache_modules,
+    monkeypatch,
+):
+    now = [1000.0]
+    monkeypatch.setattr(mp_connector.time, "monotonic", lambda: now[0])
+    worker = _worker(_WorkerAdapter())
+    worker._submit_save(_unprovable_request("save"), object())
+    [pending] = worker._pending_saves.values()
+    pending.future.query_error = ConnectionError("IPC context torn down")
+
+    assert not worker.get_finished().finished_saving
+    now[0] += worker._transfer_deadline_s
+    with pytest.raises(mp_connector.LMCacheTransferUnprovable):
+        worker.get_finished()
+
+
+def test_worker_invalid_descriptor_fails_before_transport(
+    fake_lmcache_modules,
+):
+    """A descriptor that cannot be built is provably unsent: it settles now."""
+    adapter = _WorkerAdapter()
+    worker = _worker(adapter)
+    load = replace(_unprovable_request("load"), block_ids=[100])
+    save = replace(_unprovable_request("save"), block_ids=[100])
+    worker._submit_load(load, object())
+    worker._submit_save(save, object())
+
+    output = worker.get_finished()
+    assert not adapter.loads and not adapter.saves
+    assert output.failed_loading == {load.load_operation}
+    assert output.finished_saving == {save.save_operation}
     [store] = [
         completion
         for completion in output.connector_completions
         if completion.channel == mp_connector.DENSE_PAGE_STORE_CHANNEL
     ]
     assert not store.succeeded
+
+
+def test_transfer_deadline_defaults_to_twenty_minutes():
+    assert mp_connector._transfer_deadline_s(_config()) == 1200.0
+    assert (
+        mp_connector._transfer_deadline_s(
+            _config(extra={"lmcache.mp.transfer_deadline_s": 30})
+        )
+        == 30.0
+    )
+    with pytest.raises(ValueError, match="transfer_deadline_s"):
+        mp_connector._transfer_deadline_s(
+            _config(extra={"lmcache.mp.transfer_deadline_s": 0})
+        )
 
 
 def test_worker_save_slices_chunk_blocks_and_preserves_operation(
@@ -1641,21 +1706,16 @@ def test_worker_terminal_operation_tombstones_are_bounded(
 
 def test_worker_immediate_operation_tombstones_reject_replay(
     fake_lmcache_modules,
-    monkeypatch,
 ):
     adapter = _WorkerAdapter()
-
-    def fail_load(_request_id, _op, _event):
-        raise RuntimeError("submission failed")
-
-    monkeypatch.setattr(adapter, "submit_retrieve_request", fail_load)
     worker = _worker(adapter)
     load_operation = LoadOperationId(req_id=25, generation=1)
     save_operation = SaveOperationId(req_id=26, generation=1)
+    # Too few blocks for the range: provably never sent, so immediately terminal.
     load_request = LMCacheReqMeta(
         req_id=25,
         token_ids=list(range(8)),
-        block_ids=[120, 121],
+        block_ids=[120],
         load_spec=LoadSpec(0, 8, can_load=True),
         load_operation=load_operation,
     )

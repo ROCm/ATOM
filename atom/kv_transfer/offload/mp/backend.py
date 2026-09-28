@@ -18,7 +18,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import torch
@@ -487,6 +487,7 @@ class _LookupState:
 class _PendingLoad:
     completion: LoadCompletionId
     future: Any | None
+    started_at: float = field(default_factory=lambda: time.monotonic())
 
 
 @dataclass
@@ -495,51 +496,67 @@ class _PendingSave:
     future: Any | None
     start: int
     end: int
+    started_at: float = field(default_factory=lambda: time.monotonic())
 
 
-def _uncertain_transfer_timeout_s(config: Any) -> float:
-    """How long an unprovable transfer keeps its lease before it is failed.
+_DEFAULT_TRANSFER_DEADLINE_S = 1200.0
+# The scheduler watches the same operations from dispatch, a step or more
+# before a worker submits them. The margin lets the worker, which can name the
+# exact transfer, fail first.
+_SCHEDULER_DEADLINE_MARGIN_S = 60.0
 
-    Nothing in the MP protocol can prove that a submission whose outcome is
-    unknown has stopped touching engine memory, so the bound is a policy: by
-    default twice the adapter's own request timeout.
+
+class LMCacheTransferUnprovable(RuntimeError):
+    """An MP transfer never reached a terminal state within the deadline."""
+
+
+def _transfer_deadline_s(config: Any) -> float:
+    """Seconds any MP transfer may stay non-terminal before the engine stops.
+
+    Engine memory under a transfer is released only on a terminal report: a
+    timeout cannot prove that the server stopped its DMA, so freeing on a
+    clock could hand live blocks to another request. A transfer that never
+    reports is therefore fatal once this deadline passes -- fail-stop, rather
+    than corrupt memory or wedge the pool with no fault to point at.
     """
 
     extra = _extra_config(config)
-    default = 2.0 * float(extra.get("lmcache.mp.mq_timeout", 300.0))
-    timeout = float(extra.get("lmcache.mp.uncertain_transfer_timeout_s", default))
-    if not timeout > 0:
-        raise ValueError("lmcache.mp.uncertain_transfer_timeout_s must be > 0")
-    return timeout
+    deadline = float(
+        extra.get("lmcache.mp.transfer_deadline_s", _DEFAULT_TRANSFER_DEADLINE_S)
+    )
+    if not deadline > 0:
+        raise ValueError("lmcache.mp.transfer_deadline_s must be > 0")
+    return deadline
 
 
-class _UncertainSubmission:
-    """A transfer whose outcome is unknown: retained, then failed at a deadline.
+def _enforce_transfer_deadline(
+    operation: Any, started_at: float, deadline_s: float
+) -> None:
+    """Raise ``LMCacheTransferUnprovable`` once a transfer outlives the bound."""
 
-    A transport exception cannot prove that a remote DMA stopped, so the lease
-    is kept while this reports not-done. Past ``timeout_s`` it reports a failed
-    terminal result, so the operation settles and releases its lease and budget
-    instead of wedging them for the process lifetime.
+    elapsed = time.monotonic() - started_at
+    if elapsed < deadline_s:
+        return
+    message = (
+        f"LMCache MP transfer {operation} is still not terminal after "
+        f"{elapsed:.0f}s. The memory it reads or writes cannot be released "
+        "without proof that the server stopped, so the engine is stopping. "
+        "Raise lmcache.mp.transfer_deadline_s if the tier is only slow."
+    )
+    logger.error(message)
+    raise LMCacheTransferUnprovable(message)
+
+
+class _UnprovableSubmission:
+    """Stand-in future for a submission whose transport call raised.
+
+    The server may have taken the request before the connection failed, so
+    this never becomes terminal on its own: the lease is kept and only the
+    transfer deadline ends it.
     """
 
-    def __init__(self, timeout_s: float, operation: str) -> None:
-        self._deadline = time.monotonic() + timeout_s
-        self._timeout_s = timeout_s
-        self._operation = operation
-        self._expired = False
-
     def query(self) -> bool:
-        if time.monotonic() < self._deadline:
-            return False
-        if not self._expired:
-            self._expired = True
-            logger.warning(
-                "LMCache MP transfer %s stayed unprovable for %.0fs; "
-                "treating it as failed and releasing its lease",
-                self._operation,
-                self._timeout_s,
-            )
-        return True
+        return False
 
     def result(self, timeout: float | None = None) -> bool:
         del timeout
@@ -557,7 +574,8 @@ def _terminal_future_result(future: Any | None) -> tuple[bool, Any]:
         return True, future.result(timeout=0)
     except Exception:
         # A query/result exception is not proof that the remote GPU stream has
-        # quiesced. Keep the operation pending rather than risk block reuse.
+        # quiesced. Keep the operation pending; the transfer deadline bounds a
+        # future that keeps raising.
         logger.warning(
             "LMCache MP transfer future could not prove terminal state",
             exc_info=True,
@@ -799,7 +817,7 @@ class LMCacheMPConnector(KVConnectorBase):
         # aggregator must receive the same chunk completion from every rank
         # before releasing the writer's source blocks early.
         self._immediate_saves: dict[SaveCompletionId, tuple[int, int] | None] = {}
-        self._uncertain_timeout_s = _uncertain_transfer_timeout_s(config)
+        self._transfer_deadline_s = _transfer_deadline_s(config)
         self._immediate_load_failures: set[LoadCompletionId] = set()
         self._lock = threading.Lock()
 
@@ -970,14 +988,10 @@ class LMCacheMPConnector(KVConnectorBase):
                 start=start,
                 end=end,
             )
-            transfer = self._adapter.submit_retrieve_request(
-                request_id,
-                op,
-                event,
-            )
         except Exception:
+            # Nothing was sent: the failure is provable and terminal.
             logger.exception(
-                "LMCache MP load submission failed for %s",
+                "Invalid LMCache MP load descriptor for %s",
                 req.req_id,
             )
             with self._lock:
@@ -989,6 +1003,20 @@ class LMCacheMPConnector(KVConnectorBase):
                 )
                 self._immediate_load_failures.add(completion)
             return
+        try:
+            transfer = self._adapter.submit_retrieve_request(
+                request_id,
+                op,
+                event,
+            )
+        except Exception:
+            # The server may have taken the request before the connection
+            # raised, and may still write the destination blocks.
+            logger.exception(
+                "LMCache MP load submission unprovable for %s",
+                req.req_id,
+            )
+            transfer = _UnprovableSubmission()
         with self._lock:
             self._submitting_loads.discard(operation_id)
             self._pending_loads[operation_id] = _PendingLoad(
@@ -1047,6 +1075,22 @@ class LMCacheMPConnector(KVConnectorBase):
                 start=start,
                 end=end,
             )
+        except Exception:
+            # Nothing was sent: report a terminal failure so the save settles.
+            logger.exception(
+                "Invalid LMCache MP save descriptor for %s",
+                req.req_id,
+            )
+            with self._lock:
+                self._submitting_saves.discard(operation_id)
+                self._pending_saves[operation_id] = _PendingSave(
+                    completion=completion,
+                    future=None,
+                    start=start,
+                    end=end,
+                )
+            return
+        try:
             submit = getattr(
                 self._adapter,
                 "submit_store_request_with_chunk_events",
@@ -1059,23 +1103,13 @@ class LMCacheMPConnector(KVConnectorBase):
             )
         except Exception:
             # The server may have received the request before the connection
-            # raised: keep the source leased until the transfer is provably
-            # over or the uncertainty bound expires.
+            # raised: keep the source leased until a terminal report, which
+            # the transfer deadline turns into a fail-stop if it never comes.
             logger.exception(
-                "LMCache MP save submission uncertain for %s",
+                "LMCache MP save submission unprovable for %s",
                 req.req_id,
             )
-            with self._lock:
-                self._submitting_saves.discard(operation_id)
-                self._pending_saves[operation_id] = _PendingSave(
-                    completion=completion,
-                    future=_UncertainSubmission(
-                        self._uncertain_timeout_s, operation_id
-                    ),
-                    start=start,
-                    end=end,
-                )
-            return
+            transfer = _UnprovableSubmission()
         with self._lock:
             self._submitting_saves.discard(operation_id)
             self._pending_saves[operation_id] = _PendingSave(
@@ -1113,6 +1147,10 @@ class LMCacheMPConnector(KVConnectorBase):
                             exc_info=True,
                         )
                 terminal, result = _terminal_future_result(pending.future)
+                if not terminal:
+                    _enforce_transfer_deadline(
+                        operation_id, pending.started_at, self._transfer_deadline_s
+                    )
                 if terminal:
                     self._pending_saves.pop(operation_id, None)
                     _remember_operation_tombstone(
@@ -1139,6 +1177,9 @@ class LMCacheMPConnector(KVConnectorBase):
             for operation_id, pending in list(self._pending_loads.items()):
                 terminal, result = _terminal_future_result(pending.future)
                 if not terminal:
+                    _enforce_transfer_deadline(
+                        operation_id, pending.started_at, self._transfer_deadline_s
+                    )
                     continue
                 self._pending_loads.pop(operation_id, None)
                 _remember_operation_tombstone(
@@ -1198,6 +1239,10 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                 poll_interval=poll_interval,
             )
             self._mp_adapter = adapter
+            self._scheduler_deadline_s = (
+                _transfer_deadline_s(config) + _SCHEDULER_DEADLINE_MARGIN_S
+            )
+            self._transfer_seen_at: dict[Any, float] = {}
             super().__init__(
                 config,
                 chunk_size=int(adapter.lmcache_tokens_per_chunk),
@@ -1208,10 +1253,6 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             if callable(shutdown):
                 shutdown()
             raise
-
-    def save_abandon_timeout_s(self) -> float:
-        """A timeout cannot prove that a remote MP DMA stopped reading HBM."""
-        return 0.0
 
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
         matched = super().get_num_new_matched_tokens(seq)
@@ -1291,6 +1332,49 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                 )
         return super().load_failed(req_id)
 
+    def abandon_save(self, req_id: Any) -> None:
+        # The engine's clock-based reclaim cannot prove the MP server stopped
+        # reading the source, so an MP save keeps its lease until a terminal
+        # report. `_enforce_transfer_deadlines` bounds a report that never comes.
+        logger.warning(
+            "LMCache MP keeps the source of request %s leased until its save "
+            "reports; a transfer that never reports stops the engine after %.0fs",
+            req_id,
+            self._scheduler_deadline_s,
+        )
+
+    def reclaim_stale_leases(self, timeout_s: float) -> list[frozenset]:
+        del timeout_s  # See abandon_save: no release without a report.
+        return []
+
+    def _live_transfers(self) -> set[Any]:
+        """Dispatched operations still waiting for a terminal worker report."""
+        live: set[Any] = set(self._save_inflight.values())
+        live.update(self._save_operation_owner)
+        live.update(operation for _, operation in self._active_load_operations.values())
+        return live
+
+    def _enforce_transfer_deadlines(self) -> None:
+        """Fail-stop when a dispatched transfer never reports.
+
+        The worker bounds what it submitted; this catches what it cannot see,
+        such as a lost completion or a TP rank that never reports.
+        """
+        live = self._live_transfers()
+        seen = self._transfer_seen_at
+        for operation in [op for op in seen if op not in live]:
+            del seen[operation]
+        now = time.monotonic()
+        for operation in live:
+            _enforce_transfer_deadline(
+                operation, seen.setdefault(operation, now), self._scheduler_deadline_s
+            )
+
+    def process_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
+        output = super().process_completions(output)
+        self._enforce_transfer_deadlines()
+        return output
+
     def request_finished(self, seq: Any) -> None:
         super().request_finished(seq)
         self._pending_session_ends()[str(seq.id)] = seq
@@ -1329,4 +1413,5 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
 __all__ = [
     "LMCacheMPConnector",
     "LMCacheMPConnectorScheduler",
+    "LMCacheTransferUnprovable",
 ]

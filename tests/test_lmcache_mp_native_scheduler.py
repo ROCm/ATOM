@@ -344,19 +344,64 @@ def test_store_failure_rolls_back_for_bounded_retry_and_ignores_stale_reports(
 
 
 def test_no_timeout_or_abandon_recycles_dispatched_source(monkeypatch):
+    """The engine's clock-based reclaimers stay on for everything else, but
+    none of them may release what a dispatched MP transfer still uses."""
     scheduler, checkpoints, _ = make_scheduler(monkeypatch)
     seq = sequence()
     checkpoint(scheduler, checkpoints, seq, 16)
     scheduler.update_state_after_alloc(seq)
     [request] = scheduler.build_connector_meta().requests
+    assert scheduler.save_abandon_timeout_s() > 0
     scheduler.abandon_save(request.save_operation)
-    assert scheduler.save_abandon_timeout_s() == 0
     assert scheduler.reclaim_stale_leases(1e-9) == []
     assert checkpoints.reclaim_stale_offload_pins(1e-9) == 0
     assert scheduler._pinned_state_bytes == 30
     assert scheduler.should_defer_free(seq)
     terminal(scheduler, request.save_operation)
     assert scheduler._pinned_state_bytes == 0
+
+
+@pytest.mark.parametrize("kind", ["save", "load"])
+def test_a_transfer_that_never_reports_stops_the_engine(monkeypatch, kind):
+    """A lost completion or a TP rank that never reports cannot be told from
+    a slow DMA, so past the deadline the scheduler fails stop -- holding the
+    lease and budget rather than recycling them."""
+    now = [1000.0]
+    monkeypatch.setattr(backend.time, "monotonic", lambda: now[0])
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch)
+    seq = sequence(computed=0 if kind == "load" else 16)
+    if kind == "save":
+        checkpoint(scheduler, checkpoints, seq, 16)
+        scheduler.update_state_after_alloc(seq)
+    else:
+        scheduler.get_num_new_matched_tokens(seq)
+        scheduler.update_state_after_alloc(seq)
+        assert scheduler.should_park_for_load_after_alloc(seq)
+    [request] = scheduler.build_connector_meta().requests
+    assert (request.save_operation or request.load_operation) is not None
+
+    scheduler.process_completions(KVConnectorOutput())
+    now[0] += scheduler._scheduler_deadline_s - 1
+    scheduler.process_completions(KVConnectorOutput())
+    now[0] += 2
+    with pytest.raises(backend.LMCacheTransferUnprovable):
+        scheduler.process_completions(KVConnectorOutput())
+    assert scheduler._pinned_state_bytes == 30
+
+
+def test_a_transfer_that_reports_leaves_the_watchdog(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(backend.time, "monotonic", lambda: now[0])
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch)
+    seq = sequence()
+    checkpoint(scheduler, checkpoints, seq, 16)
+    scheduler.update_state_after_alloc(seq)
+    [request] = scheduler.build_connector_meta().requests
+    scheduler.process_completions(KVConnectorOutput())
+    terminal(scheduler, request.save_operation)
+    assert scheduler._transfer_seen_at == {}
+    now[0] += scheduler._scheduler_deadline_s + 1
+    scheduler.process_completions(KVConnectorOutput())
 
 
 @pytest.mark.parametrize("prompt", [8, 16, 19, 24])

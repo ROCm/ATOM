@@ -6,7 +6,8 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -21,6 +22,7 @@ from atom.kv_transfer.offload.metadata import LMCacheReqMeta, NativeStateTransfe
 from atom.kv_transfer.offload.mp.backend import (
     LMCacheMPConnector,
     _chunk_ranges,
+    _enforce_transfer_deadline,
     _make_worker_adapter,
     _mp_session_id,
     _published_tp_replication_factor,
@@ -30,7 +32,7 @@ from atom.kv_transfer.offload.mp.backend import (
     _terminal_future_result,
     _tp_replication_factor,
     _transfer_operation_id,
-    _UncertainSubmission,
+    _UnprovableSubmission,
     _validate_mp_config,
 )
 from atom.kv_transfer.offload.mp.native_state_layout import (
@@ -65,6 +67,7 @@ class _NativePending:
     descriptor_slot: int | None = None
     immediate_success: bool = False
     state_source_safe: bool = False
+    started_at: float = field(default_factory=lambda: time.monotonic())
 
 
 class NativeStateLMCacheMPConnector(LMCacheMPConnector):
@@ -242,9 +245,10 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 )
                 pending[operation_id] = _NativePending(req, None)
                 return
-            entry = _NativePending(
-                req, _UncertainSubmission(self._uncertain_timeout_s, operation_id)
-            )
+            # Installed before the transport call: if it raises, the server may
+            # still have taken the request, so the lease stays until the
+            # transfer deadline.
+            entry = _NativePending(req, _UnprovableSubmission())
             pending[operation_id] = entry
         submit = (
             self._adapter.submit_retrieve_request
@@ -261,7 +265,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             # Retain the exact source/destination lease. The server might have
             # received the request before the connection raised an exception.
             logger.exception(
-                "Native-state LMCache MP submission uncertain; retaining lease %s",
+                "Native-state LMCache MP submission unprovable; retaining lease %s",
                 operation_id,
             )
             return
@@ -366,6 +370,9 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 else:
                     terminal, result = _terminal_future_result(pending.future)
                 if not terminal:
+                    _enforce_transfer_deadline(
+                        operation_id, pending.started_at, self._transfer_deadline_s
+                    )
                     continue
                 save_spec = pending.request.save_spec
                 start = 0 if save_spec is None else int(save_spec.skip_leading_tokens)
@@ -390,6 +397,9 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 if pending.restore_event is None:
                     terminal, result = _terminal_future_result(pending.future)
                     if not terminal:
+                        _enforce_transfer_deadline(
+                            operation_id, pending.started_at, self._transfer_deadline_s
+                        )
                         continue
                     if result is True:
                         try:
@@ -400,25 +410,25 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                                 "LMCache MP native restore safety unknown; "
                                 "retaining lease"
                             )
-                            pending.future = _UncertainSubmission(
-                                self._uncertain_timeout_s, operation_id
-                            )
+                            pending.future = _UnprovableSubmission()
                             pending.restore_event = None
                             continue
                 if pending.restore_event is not None:
                     try:
-                        if not pending.restore_event.query():
-                            continue
+                        restored = pending.restore_event.query()
                     except Exception:
                         logger.exception(
                             "LMCache MP native restore event safety unknown; "
                             "retaining lease"
                         )
-                        pending.future = _UncertainSubmission(
-                            self._uncertain_timeout_s, operation_id
-                        )
+                        pending.future = _UnprovableSubmission()
                         pending.restore_event = None
                         pending.restore_succeeded = False
+                        restored = False
+                    if not restored:
+                        _enforce_transfer_deadline(
+                            operation_id, pending.started_at, self._transfer_deadline_s
+                        )
                         continue
                 completion = pending.request.load_operation
                 if pending.descriptor_slot is not None:

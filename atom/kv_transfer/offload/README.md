@@ -188,11 +188,19 @@ the default equal to `OFFLOAD_MIN_LOAD_TOKENS` it could never be loaded back,
 and on a 1K-token workload skipping those saves took the offload throughput
 cost from 12% to within run-to-run noise. It is an absolute boundary for normal
 and late saves alike, so the short tail of a long request is still stored.
-Other connectors ignore it. A transfer whose outcome is unknown (its submission
-or restore raised) keeps its lease for `lmcache.mp.uncertain_transfer_timeout_s`
-(default twice `lmcache.mp.mq_timeout`, i.e. 600 s), then fails so the lease
-and budget are released. Unless configured otherwise, the shared save limit is
-`max(2, 2 * OFFLOAD_COPY_WORKERS)`.
+Other connectors ignore it. Unless configured otherwise, the shared save limit
+is `max(2, 2 * OFFLOAD_COPY_WORKERS)`.
+
+Engine memory under an MP transfer (PAGE sources, restore destinations,
+checkpoint pins, descriptor slots) is released only on a terminal report from
+the server. A timeout cannot prove that a remote DMA stopped, so no clock ever
+frees it. Instead, a transfer that is still not terminal after
+`lmcache.mp.transfer_deadline_s` (default 1200 s) is fatal: the worker, or the
+scheduler for a report that never arrives, raises `LMCacheTransferUnprovable`
+and the engine stops. This covers a submission that raised, a future whose
+poll keeps raising, a restore whose event cannot be queried, and a lost or
+never-aggregated completion. The engine-wide stalled-save reclaim leaves MP
+leases alone for the same reason.
 
 The model namespace includes PAGE/model geometry, TP and speculation settings,
 native layout/image sizes, the Hugging Face commit when available, and the
