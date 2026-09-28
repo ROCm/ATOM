@@ -296,3 +296,32 @@ def test_offload_env_vars_are_documented():
     ]
     assert offload
     assert [name for name in offload if f"**{name}**" not in doc] == []
+
+
+@pytest.mark.parametrize(
+    ("name", "default"),
+    [
+        ("OFFLOAD_PUBLICATION_TIMEOUT_S", 5.0),
+        ("OFFLOAD_PUBLICATION_POLL_INTERVAL_S", 0.01),
+        ("OFFLOAD_COPY_WORKERS", 1),
+        ("OFFLOAD_LOAD_WORKERS", 1),
+        ("OFFLOAD_MIN_SAVE_TOKENS", 8192),
+    ],
+)
+def test_empty_offload_knob_reads_as_its_default(monkeypatch, name, default):
+    """`VAR=` is how a knob is cleared inline; it must never crash startup."""
+    monkeypatch.setenv(name, "")
+    assert getattr(_get_envs(), name) == default
+
+
+@pytest.mark.parametrize("name", ["OFFLOAD_COPY_WORKERS", "OFFLOAD_LOAD_WORKERS"])
+def test_malformed_offload_worker_width_names_the_variable(monkeypatch, name):
+    monkeypatch.setenv(name, "two")
+    with pytest.raises(ValueError, match=f"{name} must be an integer"):
+        getattr(_get_envs(), name)
+
+
+def test_malformed_offload_timeout_names_the_variable(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_PUBLICATION_TIMEOUT_S", "soon")
+    with pytest.raises(ValueError, match="OFFLOAD_PUBLICATION_TIMEOUT_S must be"):
+        _ = _get_envs().OFFLOAD_PUBLICATION_TIMEOUT_S

@@ -67,9 +67,15 @@ def _optional_int_env(name: str, *, min_value: int | None = None) -> int | None:
     return value
 
 
+def _int_env(name: str, default: int) -> int:
+    """Unset or empty reads as ``default``; anything else must be an integer."""
+    value = _optional_int_env(name)
+    return default if value is None else value
+
+
 def _int_env_or_default(name: str, default: int) -> int:
     raw = os.getenv(name)
-    if raw is None:
+    if raw is None or raw == "":
         return default
     try:
         return int(raw)
@@ -97,7 +103,14 @@ def _nonnegative_int_env(name: str, default: int) -> int:
 
 
 def _finite_float_env(name: str, default: float, *, allow_zero: bool) -> float:
-    value = float(os.getenv(name, str(default)))
+    """Unset or empty reads as ``default``; a set value must be a valid float."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from exc
     if not math.isfinite(value):
         raise ValueError(f"{name} must be finite")
     if allow_zero and value < 0:
@@ -881,10 +894,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fuse FP32 post-wkv gating and residual addition; 0 selects the torch reference.
     "ATOM_ENGRAM_FUSED_GATE": lambda: os.getenv("ATOM_ENGRAM_FUSED_GATE", "1") == "1",
     # --- KV offload (LMCache) ---
+    # Unset or empty always means the default, so a knob can be cleared inline.
+    # A set but unusable value warns and falls back for the token thresholds
+    # and lookup step counts, which only tune reuse; it is rejected at startup
+    # for widths, sizes and timeouts, which shape memory and concurrency.
     # Save / load executor widths of the offload worker. DSV4 ignores
     # OFFLOAD_LOAD_WORKERS: its SLOT load path needs a serial load executor.
-    "OFFLOAD_COPY_WORKERS": lambda: int(os.getenv("OFFLOAD_COPY_WORKERS", "1") or "1"),
-    "OFFLOAD_LOAD_WORKERS": lambda: int(os.getenv("OFFLOAD_LOAD_WORKERS", "1") or "1"),
+    "OFFLOAD_COPY_WORKERS": lambda: _int_env("OFFLOAD_COPY_WORKERS", 1),
+    "OFFLOAD_LOAD_WORKERS": lambda: _int_env("OFFLOAD_LOAD_WORKERS", 1),
     # Running-plus-queued save bound. None means unset: the connector then
     # derives max(2, 2 * OFFLOAD_COPY_WORKERS) and the scheduler's state tier
     # uses 2. A kv_connector_extra_config "max_pending_saves" takes precedence.
@@ -940,8 +957,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "OFFLOAD_PUBLICATION_POLL_INTERVAL_S": lambda: _finite_float_env(
         "OFFLOAD_PUBLICATION_POLL_INTERVAL_S", 0.01, allow_zero=False
     ),
-    # LMCache MP transfer mode: auto, lmcache_driven or engine_driven. A
-    # kv_connector_extra_config "lmcache.mp.mp_transfer_mode" takes precedence.
+    # LMCache MP transfer mode: auto or lmcache_driven (engine_driven is
+    # rejected as not implemented). A kv_connector_extra_config
+    # "lmcache.mp.mp_transfer_mode" takes precedence.
     "LMCACHE_MP_TRANSFER_MODE": lambda: os.getenv("LMCACHE_MP_TRANSFER_MODE", "auto"),
 }
 
