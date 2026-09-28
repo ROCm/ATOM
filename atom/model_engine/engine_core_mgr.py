@@ -1404,7 +1404,15 @@ class CoreManager:
 
         Never raises for a worker-side failure -- the failure travels in
         ``RpcResult.error`` so the ranks that did succeed are still reported.
+        Raises up front for a manager whose engines are not one DP rank each,
+        which the replies would otherwise be reported as.
         """
+        unsupported = self._collective_rpc_unsupported()
+        if unsupported is not None:
+            raise NotImplementedError(
+                f"{self.label}: collective_rpc needs one engine per DP rank, "
+                f"but {unsupported}"
+            )
         request_id = uuid.uuid4().hex
         engine_count = len(self.control_sockets)
         deadline = time.monotonic() + timeout
@@ -1437,6 +1445,14 @@ class CoreManager:
                 by_dp_rank[dp_rank] = body
 
         return self._flatten_dp_replies(request_id, method, engine_count, by_dp_rank)
+
+    def _collective_rpc_unsupported(self) -> str | None:
+        """Why this manager's engines are not one DP rank each, if they are not."""
+        pp_size = getattr(self, "pp_size", 1)
+        if pp_size > 1:
+            # One engine per stage, each holding a slice of the layers.
+            return f"its {pp_size} engines are pipeline stages"
+        return None
 
     def _flatten_dp_replies(
         self,
@@ -1872,6 +1888,9 @@ class DisaggCoreManager(CoreManager):
             prefill_seqs.append(ps)
         prefill_payload = pickle.dumps((EngineCoreRequestType.ADD, prefill_seqs))
         self._send_request(0, prefill_payload)
+
+    def _collective_rpc_unsupported(self) -> str | None:
+        return "its two engines are the prefill and decode halves of one replica"
 
     def close(self):
         super().close()

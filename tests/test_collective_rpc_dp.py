@@ -23,7 +23,7 @@ from atom.model_engine.collective_rpc import (
     RpcResponseRouter,
     RpcResult,
 )
-from atom.model_engine.engine_core_mgr import CoreManager
+from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 
 # ── harness ────────────────────────────────────────────────────────────────
 
@@ -32,13 +32,13 @@ class _Socket:
     closed = False
 
 
-def _mgr(engine_count=2, tp=1):
+def _mgr(engine_count=2, tp=1, cls=CoreManager):
     """A ``CoreManager`` with only what the RPC path reads.
 
     ``__init__`` spawns engine processes and binds sockets, so it cannot run
     here; the fan-out and correlation logic is what is under test.
     """
-    mgr = object.__new__(CoreManager)
+    mgr = object.__new__(cls)
     mgr.label = "test-mgr"
     mgr.control_sockets = [_Socket() for _ in range(engine_count)]
     mgr.utility_response_queue = queue.Queue()
@@ -349,6 +349,27 @@ def test_results_are_rpcresult_instances():
     (result,) = mgr.collective_rpc("m", timeout=5)
     assert isinstance(result, RpcResult)
     assert result.ok and result.value == "v"
+
+
+# ── engines that are not DP ranks ──────────────────────────────────────────
+
+
+def test_pipeline_stages_are_refused_rather_than_reported_as_dp_ranks():
+    """Under PP there is one engine per stage, each holding a slice of the
+    layers. Their replies came back labelled DP 0, DP 1, ..., with nothing to
+    say which stage a result was from."""
+    mgr = _mgr(2)
+    mgr.pp_size = 2
+    with pytest.raises(NotImplementedError, match="pipeline stages"):
+        mgr.collective_rpc("m", timeout=1)
+    assert mgr.sent == [], "nothing may be broadcast for a refused call"
+
+
+def test_prefill_and_decode_engines_are_refused_too():
+    mgr = _mgr(2, cls=DisaggCoreManager)
+    with pytest.raises(NotImplementedError, match="prefill and decode"):
+        mgr.collective_rpc("m", timeout=1)
+    assert mgr.sent == []
 
 
 # ── the legacy synchronous path ────────────────────────────────────────────
