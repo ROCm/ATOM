@@ -374,3 +374,27 @@ def test_draft_regions_after_the_state_regions_stay_ordinary_page():
         _gather(layout, with_draft, ids),
         _gather(_layout(target_only), target_only, ids),
     )
+
+
+@pytest.mark.parametrize(
+    ("breakage", "message"),
+    [
+        (lambda t: setattr(t.block_regions[1], "unit_bytes", 9), "byte geometry"),
+        (lambda t: t.block_tensor_views.pop(), "one block_tensor_view per"),
+        (lambda t: setattr(t.block_regions[2], "reverse_indexed", True), "reverse"),
+    ],
+)
+def test_native_and_page_only_registration_share_page_validation(breakage, message):
+    """One validator for both registrations, so they cannot drift apart."""
+    from atom.kv_transfer.offload.mp.backend import _build_cache_views
+
+    native = _transfer()
+    breakage(native)
+    with pytest.raises(ValueError, match=message):
+        _layout(native)
+    page_only = _transfer()
+    page_only.paged_state_checkpoint_spec = None
+    page_only.execute_paged_state_copies = None
+    breakage(page_only)
+    with pytest.raises(ValueError, match=message):
+        _build_cache_views(page_only, num_blocks=7)

@@ -18,6 +18,8 @@ from typing import Any
 
 import torch
 
+from atom.kv_transfer.offload.mp.page_views import validate_page_views
+
 
 @dataclass(frozen=True)
 class NativeStateMPKernelGroup:
@@ -120,12 +122,13 @@ def build_native_state_mp_layout(
     if published_blocks not in (0, num_blocks):
         raise ValueError("native published block count disagrees with scheduler")
 
-    regions = list(getattr(transfer_tensors, "block_regions", None) or [])
-    page_views = list(getattr(transfer_tensors, "block_tensor_views", None) or [])
-    if not regions or len(regions) != len(page_views):
-        raise ValueError(
-            "native-state LMCache MP needs one owned tensor view per PAGE region"
-        )
+    # STATE aliases take one chunk per block, so a block's physical slots
+    # must divide the PAGE block size as well.
+    pages = validate_page_views(
+        transfer_tensors, num_blocks=num_blocks, block_size=block_size
+    )
+    regions = [page.region for page in pages]
+    page_views = [page.view for page in pages]
     # Only the leading regions form a checkpoint PAGE unit; a draft's own pool
     # is appended after them and is stored as ordinary PAGE KV.
     state_count = getattr(transfer_tensors, "paged_state_region_count", None)
@@ -134,37 +137,7 @@ def build_native_state_mp_layout(
     state_count = _positive_int("native state region count", state_count)
     if state_count > len(regions):
         raise ValueError("native state region count exceeds the PAGE regions")
-    devices = set()
-    actual_page_bytes = 0
-    for index, (view, region) in enumerate(zip(page_views, regions, strict=True)):
-        if not isinstance(view, torch.Tensor):
-            raise TypeError(f"native PAGE view {index} must be a Tensor")
-        if view.ndim != 3 or view.shape[0] != num_blocks or view.numel() == 0:
-            raise ValueError(f"native PAGE view {index} has invalid block geometry")
-        if not view[0].is_contiguous():
-            raise ValueError(f"native PAGE view {index} has non-contiguous inner rows")
-        if block_size % view.shape[1]:
-            raise ValueError(
-                f"native PAGE view {index} physical slots must divide block size"
-            )
-        unit_bytes = _positive_int(
-            f"native PAGE region {index} bytes", region.unit_bytes
-        )
-        if (
-            view[0].numel() * view.element_size() != unit_bytes
-            or view.stride(0) * view.element_size() != unit_bytes
-            or region.total_bytes != num_blocks * unit_bytes
-        ):
-            raise ValueError(f"native PAGE view {index} byte geometry mismatch")
-        if view.data_ptr() != region.base_addr:
-            raise ValueError(f"native PAGE view {index} does not alias its region")
-        if region.reverse_indexed:
-            raise ValueError("native PAGE regions cannot be reverse-indexed")
-        devices.add(view.device)
-        if index < state_count:
-            actual_page_bytes += unit_bytes
-    if len(devices) != 1:
-        raise ValueError("native PAGE views must share one device")
+    actual_page_bytes = sum(page.unit_bytes for page in pages[:state_count])
     if actual_page_bytes != page_bytes:
         raise ValueError("PAGE regions do not cover the native PAGE unit")
 

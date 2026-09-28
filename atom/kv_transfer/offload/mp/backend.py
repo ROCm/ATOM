@@ -41,6 +41,7 @@ from atom.kv_transfer.offload.chunked_scheduler import (
     ChunkedOffloadSchedulerBase,
 )
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReqMeta
+from atom.kv_transfer.offload.mp.page_views import validate_page_views
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -386,8 +387,6 @@ def _build_cache_views(
 
     if transfer_tensors is None:
         raise ValueError("lmcache_mp requires KVTransferTensors")
-    if num_blocks <= 0:
-        raise ValueError("lmcache_mp num_blocks must be positive")
 
     stateful_fields = {
         "num_slots": getattr(transfer_tensors, "num_slots", 0),
@@ -409,49 +408,11 @@ def _build_cache_views(
             f"published through {', '.join(populated_stateful_fields)}"
         )
 
-    regions = list(getattr(transfer_tensors, "block_regions", None) or [])
-    views = list(getattr(transfer_tensors, "block_tensor_views", None) or [])
-    if not regions or len(views) != len(regions):
-        raise ValueError(
-            "lmcache_mp requires one block_tensor_view per block region: "
-            f"views={len(views)} regions={len(regions)}"
-        )
-
     tensors: dict[str, torch.Tensor] = {}
     indices_by_layout: dict[tuple[torch.dtype, tuple[int, ...]], list[int]] = {}
-    devices: set[torch.device] = set()
     bytes_per_block = 0
-    for index, (view, region) in enumerate(zip(views, regions, strict=True)):
-        if not isinstance(view, torch.Tensor):
-            raise TypeError(f"lmcache_mp block tensor view {index} is not a Tensor")
-        if view.numel() == 0 or not view.is_contiguous():
-            raise ValueError(
-                f"lmcache_mp block tensor view {index} must be non-empty and contiguous"
-            )
-        if view.ndim != 3 or int(view.shape[0]) != num_blocks:
-            raise ValueError(
-                f"lmcache_mp block tensor view {index} has shape={tuple(view.shape)}, "
-                f"expected [{num_blocks}, physical_slots, opaque_width]"
-            )
-
-        unit_bytes = int(region.unit_bytes)
-        total_bytes = int(region.total_bytes)
-        actual_unit_bytes = view[0].numel() * view.element_size()
-        actual_total_bytes = view.numel() * view.element_size()
-        if actual_unit_bytes != unit_bytes or actual_total_bytes != total_bytes:
-            raise ValueError(
-                f"lmcache_mp block tensor view {index} byte geometry mismatch: "
-                f"unit={actual_unit_bytes}/{unit_bytes} "
-                f"total={actual_total_bytes}/{total_bytes}"
-            )
-        if view.data_ptr() != int(region.base_addr):
-            raise ValueError(
-                f"lmcache_mp block tensor view {index} does not start at its "
-                "declared region address"
-            )
-        if bool(getattr(region, "reverse_indexed", False)):
-            raise ValueError("lmcache_mp PAGE regions cannot be reverse-indexed")
-
+    for page in validate_page_views(transfer_tensors, num_blocks=num_blocks):
+        index, view, region = page.index, page.view, page.region
         # LMCache receives these tensors as opaque PAGE storage, not numerical
         # values.  Publish a zero-copy byte view so every transfer path copies
         # the exact bit pattern.  This is especially important on ROCm, where
@@ -463,11 +424,8 @@ def _build_cache_views(
         tensors[f"page.{index}.{role}"] = byte_view
         layout = (byte_view.dtype, tuple(int(dim) for dim in byte_view.shape[1:]))
         indices_by_layout.setdefault(layout, []).append(index)
-        devices.add(view.device)
-        bytes_per_block += unit_bytes
+        bytes_per_block += page.unit_bytes
 
-    if len(devices) != 1:
-        raise ValueError("lmcache_mp block tensor views must share one device")
     return _CacheViews(
         tensors=tensors,
         layer_groups=tuple(tuple(indices) for indices in indices_by_layout.values()),
