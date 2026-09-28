@@ -198,6 +198,15 @@ EOF
       "${REPO_ROOT}" "${RUN_DIR}" "${DOCKER_IMAGE}" "${env_file}" "${JOB_ID}")" || return $?
   fi
 
+  # Per node, not per job: the staged tree has to be local to the host that will
+  # run the service container. Gated so the control arm of the seeding A/B still
+  # starts cold and pays nothing for the extraction.
+  local aot_stage=""
+  if [[ "${ATOMESH_SEED_AOT_CACHE:-1}" == "1" ]]; then
+    aot_stage="$(bash "${REPO_ROOT}/.github/scripts/atomesh/stage_aot_cache.sh" \
+      "${DOCKER_IMAGE}" || true)"
+  fi
+
   docker_args=(
     run --name "${container}"
     --user "$(id -u):$(id -g)"
@@ -230,6 +239,7 @@ EOF
     # FlyDSL otherwise tries to create caches under /app/aiter-test, which is
     # read-only for the Slurm uid required by Spur's Docker template.
     -e FLYDSL_RUNTIME_CACHE_DIR="/tmp/atomesh-cache-${JOB_ID}-${rank}/flydsl"
+    -e ATOMESH_AOT_CACHE_STAGE="${aot_stage}"
     -e NCCL_NET_PLUGIN=none
     -e NCCL_IB_HCA=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
     -e NCCL_IB_GID_INDEX=1
@@ -298,6 +308,9 @@ EOF
   [[ -e /etc/libibverbs.d/ionic.driver ]] && docker_args+=(-v /etc/libibverbs.d/ionic.driver:/etc/libibverbs.d/ionic.driver:ro)
   [[ -d /it-share ]] && docker_args+=(-v /it-share:/it-share)
   [[ -d /shared_nfs ]] && docker_args+=(-v /shared_nfs:/shared_nfs)
+  # Same path on both sides so the variable above resolves, and read-only: the
+  # stage is shared by every worker on this node and seeding only ever reads it.
+  [[ -n "${aot_stage}" ]] && docker_args+=(-v "${aot_stage}:${aot_stage}:ro")
 
   docker_args+=(
     "${DOCKER_IMAGE}"
@@ -573,6 +586,14 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
         mesh_binary="$(bash "'"${REPO_ROOT}"'/.github/scripts/atomesh/setup_mesh.sh" \
           "'"${REPO_ROOT}"'" "'"${RUN_DIR}"'" "'"${DOCKER_IMAGE}"'" "'"${ENV_FILE}"'" "'"${SLURM_JOB_ID}"'")"
       fi
+      # Per node, not per job: the staged tree has to be local to the host that
+      # will run the service container. Gated so the control arm of the seeding
+      # A/B still starts cold and pays nothing for the extraction.
+      aot_stage=""
+      if [[ "${ATOMESH_SEED_AOT_CACHE:-1}" == "1" ]]; then
+        aot_stage="$(bash "'"${REPO_ROOT}"'/.github/scripts/atomesh/stage_aot_cache.sh" \
+          "'"${DOCKER_IMAGE}"'" || true)"
+      fi
       nested_docker_args=()
       if [[ -d /shared_nfs ]]; then
         nested_docker_args+=(-v /shared_nfs:/shared_nfs:ro)
@@ -614,6 +635,16 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
               "SWE-bench disk preflight check will be skipped" >&2
           fi
         fi
+      fi
+      # Appended last: the SWE-bench branch above rebuilds this array with =,
+      # so anything added before it would be dropped on the eval rank.
+      if [[ -n "${aot_stage}" ]]; then
+        # Mounted at the same path so the variable means the same thing on both
+        # sides, and read-only: seeding only ever reads the shared stage.
+        nested_docker_args+=(
+          -v "${aot_stage}:${aot_stage}:ro"
+          -e ATOMESH_AOT_CACHE_STAGE="${aot_stage}"
+        )
       fi
       set +e
       docker run --name "${container}" \
