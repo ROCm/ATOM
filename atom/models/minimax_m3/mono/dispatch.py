@@ -76,7 +76,7 @@ class MonoDecode:
         self._lm = causal_lm
         self._runner: MonoDecodeRunner | None = None
         self._enabled = False
-        if not envs.ATOM_MONO:
+        if not envs.ATOM_MONO_ENABLE:
             return
         why = _config_refusal(atom_config, text_config)
         if why is not None:
