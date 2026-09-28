@@ -225,7 +225,7 @@ class PPEngineCoreProc(EngineCore):
         )
 
     def _dispatch_idle_offload_work(self, dispatch_new: bool = True) -> None:
-        """Override: fan the idle connector metadata out to every PP stage.
+        """Fan idle offload work and P/D terminal metadata to every PP stage.
 
         ``Scheduler.schedule()`` returns None once waiting and running are
         both empty, so the connector-only batch it normally builds never
@@ -242,7 +242,7 @@ class PPEngineCoreProc(EngineCore):
         if not self.kv_transfer_enabled:
             return
         connector = getattr(self.scheduler, "kv_connector", None)
-        if connector is None or not getattr(connector, "is_offload", False):
+        if connector is None:
             return
         self._dispatch_connector_only_batch(
             ScheduledBatch(
@@ -311,6 +311,7 @@ class PPEngineCoreProc(EngineCore):
             finished_sending=kvoutput.finished_sending,
             finished_recving=kvoutput.finished_recving,
             failed_recving=kvoutput.failed_recving,
+            received_handoffs=kvoutput.received_handoffs,
         )
         if not non_offload.is_empty():
             self.scheduler._update_from_kv_xfer_finished(non_offload)
@@ -320,8 +321,8 @@ class PPEngineCoreProc(EngineCore):
             kvoutput.finished_loading
             or kvoutput.failed_loading
             or kvoutput.finished_saving
-            # connector_completions are offload channel events (kimi_k3 state
-            # dispositions, dsv4 checkpoint boundaries). They too span all PP
+            # Connector channels include offload state events and chunked P/D
+            # source-read completion. They all span every PP
             # stages, so they must reach the aggregator rather than the
             # scheduler directly -- and count as "offload work" so this poll
             # does not early-return and strand them.

@@ -37,7 +37,9 @@ class PPKVAggregator:
     commits (``succeeded=True``) only if every stage succeeded, and any stage's
     failure sinks it -- but, like a load, only once every stage has reported.
 
-    Only offload-specific fields are tracked.  Mooncake P/D fields
+    Chunked Mooncake source retention uses the ``pd_source_safe`` connector
+    channel, so even cancellation waits for readers on every stage to drain.
+    The legacy Mooncake P/D fields
     (``finished_sending``, ``finished_recving``) have their own PP-aware
     side-channel and must NOT flow through this aggregator.
     """
