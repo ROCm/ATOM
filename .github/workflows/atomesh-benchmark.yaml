@@ -671,6 +671,9 @@ jobs:
             -e SMOKE_RUN_DIR=/rdma-smoke-shared
             -v "${RDMA_SMOKE_RUN_DIR}:/rdma-smoke-shared"
           )
+          if [[ "${SLURM_SUBMIT_RUNNER:-}" == "atomesh-cicd-mi355-crusoe" ]]; then
+            docker_args+=(-e MOONCAKE_DISABLE_HIP_DMABUF=0)
+          fi
           host_ionic="$(readlink -f /usr/lib/x86_64-linux-gnu/libionic.so.1 2>/dev/null || true)"
           [[ -z "${host_ionic}" ]] || docker_args+=(
             -v "${host_ionic}:/usr/lib/x86_64-linux-gnu/libionic.so.1:ro"
@@ -1577,6 +1580,11 @@ jobs:
 
           cell = json.loads(os.environ["CELL_JSON"])
           # The matrix is expanded on ubuntu-latest, before the submit machine is known.
+          if cell["runner"].get("slurm_submit_runner") == "atomesh-cicd-mi355-crusoe":
+              # Override the image's default in every model service process.
+              for role in ("common", "prefill", "decode", "router"):
+                  cell.setdefault("env", {}).setdefault(role, {})["MOONCAKE_DISABLE_HIP_DMABUF"] = "0"
+
           machine_name = socket.gethostname().split(".", 1)[0]
           if machine_name == "pit2-vm-amd-xl-02":
               old_model_root = os.environ["ATOMESH_MODEL_ROOT"].rstrip("/")
