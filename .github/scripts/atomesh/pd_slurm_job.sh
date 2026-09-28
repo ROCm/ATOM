@@ -243,6 +243,12 @@ EOF
     --user "$(id -u):$(id -g)"
     --network host --ipc host
     --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband
+    # Note that --cap-add buys this container nothing: it is started with
+    # --user, and on the uid change the kernel clears the permitted and
+    # effective sets, leaving the capability in the bounding set only. Measured
+    # on this docker: --user 1000:1000 --cap-add=SYS_NICE gives CapPrm=CapEff=
+    # CapAmb=0. --privileged behaves identically. Anything here that needs a
+    # real capability has to come from somewhere other than this list.
     --cap-add=IPC_LOCK --cap-add=NET_ADMIN
     --ulimit memlock=-1:-1 --ulimit stack=67108864 --ulimit nofile=65536:524288
     --shm-size=128G
