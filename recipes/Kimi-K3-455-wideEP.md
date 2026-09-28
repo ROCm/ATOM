@@ -11,34 +11,87 @@ section first — on this silicon it is the difference between 95% and 0%.
 
 | | |
 |---|---|
-| Hardware | 4 × gfx1250 (MI455), 4 GPUs/node, SPX, 288 GiB/GPU |
+| Hardware | 4 × gfx1250 (MI455), 4 GPUs/node, SPX. **Check HBM per GPU** — 288 GiB and 432 GiB boards both exist on this silicon; every KV number below depends on which you have |
 | Parallelism | `-tp 1 --data-parallel-size 16 --data-parallel-size-local 4`, EP16, DP attention |
 | Attention | Triton MLA (`ATOM_USE_TRITON_MLA=1`), unshuffled KV |
 | Fabric | UALink within a node-set sharing one `PPOD_ID` + `VPOD_ID`; RCCL over the data-plane NIC |
 | **Required ATOM patch** | [PR #2380](https://github.com/ROCm/ATOM/pull/2380) — apply the **diff** to the image's ATOM; stock ATOM aborts on chunked prefill here |
 | **GSM8K (lm_eval, 5-shot, full 1319)** | **strict-match 0.9545 ±0.0057**, flexible-extract 0.9538 ±0.0058 |
+| GSM8K, re-run on `gfx1250-atom-20260918-ep8` / 432 GiB boards | strict-match 0.9621 ±0.0053, flexible-extract 0.9613 ±0.0053 (1319/1319, 9 min at `num_concurrent=32`) |
 | Throughput / TTFT / TPOT | **not characterized yet** — see [Not yet measured](#not-yet-measured) |
 
 ---
 
-## ⚠️ B0→A0 code-object translation is mandatory
+## ⚠️ B0→A0 code-object translation — required for some images, not all
 
-**Read this before anything else. There is no configuration of this recipe that
-works without it, and skipping it does not produce an error.**
+**Read this before anything else.** Whether you need it depends on the image,
+it is not a property of the silicon alone, and getting it wrong is silent in
+both directions.
 
-These parts are **B0 revision silicon**, and the kernels in the bring-up image
-are compiled for **A0**. `libhsa_hotswap_rocjitsu.so` attaches to the HSA tool
-interface and rewrites each code object from B0 to A0 as it is loaded. Without
-that layer the GPU executes code built for a different revision.
+These parts are **B0 revision silicon**. If the image's kernels were compiled
+for **A0**, the GPU executes code built for a different revision, and the
+result is not degraded accuracy — it is **every generated token being `!`** and
+**GSM8K 0%**, with HTTP 200, `finish_reason: "stop"`, sane token counts and
+plausible throughput. A benchmark runs to completion and produces a
+clean-looking report built entirely from `!`.
 
-The result is not degraded accuracy. It is **every generated token being `!`**,
-and **GSM8K 0%**. The failure is completely silent: HTTP 200, `finish_reason:
-"stop"`, sane token counts, plausible throughput and TTFT in the metrics. A
-benchmark will run to completion and produce a clean-looking report built
-entirely from `!`.
+`libhsa_hotswap_rocjitsu.so` attaches to the HSA tool interface and rewrites
+each code object from B0 to A0 as it is loaded, which is what makes such an
+image work.
 
-> **`HOTSWAP=0` is not a fallback.** Its only use is reproducing this bug.
-> Any accuracy or performance number produced without translation is void.
+### Two configurations, and they need different recipes
+
+The silicon on these racks is **B0**. What differs between deployments is
+**what revision the image's kernels were built for**, and that alone decides
+whether you need the translation layer:
+
+| | image kernels built for | translation | what to do |
+|---|---|---|---|
+| **A** — the original setup this recipe was written against | **A0** | **mandatory** | install the rocjitsu prefix below; without it every token is `!` and GSM8K is 0% |
+| **B** — `rocm/fw-bringup:gfx1250-atom-20260918-ep8` | **B0** (matches the silicon) | **not needed** | skip the prefix entirely; the hook, if present, is inert |
+
+⚠️ **You cannot read this off the hardware.** On these boards every revision
+field is zero — PCI `revision=0x00`, `rocminfo` `ASIC Revision: 0(0x0)`,
+`amd-smi` `REV_ID: 0x00`, marketing name `AMD Eng Sample` — and `dmesg` carries
+no IP-discovery revision line. The stepping is site information, not something
+the box reports. **Identify your case from the runtime behaviour below, not
+from the part.**
+
+Case **B** measured end to end: the hook installs on all 16 ranks and performs
+**zero** translations (`outcome=translated: 0`, `reused tier: 0`, against a
+170-entry store), and the server still scores **GSM8K 0.9621 ±0.0053** over the
+full 1319 questions, with coherent output throughout and no retries. Everything
+in this recipe applies unchanged **except** the rocjitsu prefix, which that
+image does not need and which is therefore not a blocker if you cannot obtain
+it.
+
+### Decide it in 60 seconds, do not assume
+
+Bring the server up, then look at the *content* of a completion before
+trusting any number:
+
+```bash
+curl -sS http://<node0>:8000/v1/completions -H 'Content-Type: application/json' \
+  -d '{"model":"moonshotai/Kimi-K3","prompt":"The capital of France is",
+       "max_tokens":16,"temperature":0}' | python3 -m json.tool
+```
+
+| what you see | what it means |
+|---|---|
+| ` Paris. The Eiffel Tower is located in ...` | kernels match the silicon — **no translation needed**, stop here |
+| `!!!!!!!!!!!!!!!!` | kernels are A0 — install the prefix below, then re-test |
+
+Check the same thing in the log, which distinguishes "installed" from "working":
+
+```bash
+grep -c 'installed eager'     <log>   # hook attached (says nothing about translating)
+grep -c 'outcome=translated'  <log>   # 0 = inert; several hundred = doing the work
+```
+
+> **`HOTSWAP=0` is not a fallback** on an image that *does* need translation.
+> Any accuracy or performance number from such an image without translation is
+> void. On an image that does not need it, the hook costs nothing and can be
+> left in place.
 
 ### The image's own rocjitsu is not a substitute
 
@@ -155,8 +208,29 @@ reboot the driver is simply not loaded and **`/dev/kfd` does not exist**. That
 is configuration, not breakage.
 
 ```bash
+lsmod | grep '^ifoe '                                    # must already be loaded
 sudo modprobe amdgpu gpu_recovery=0 halt_if_hws_hang=1
 ```
+
+⚠️ **`accel_state` can stick at `unconfigured` permanently, and it looks
+exactly like "still training".** UALink here is UALink-over-Ethernet through
+Pensando AINIC parts (`lspci -d 1dd8:` → 56 functions, OXRP bridges at
+`lspci -d 1022:1746` → 8), carried by the `ifoe` stack.
+
+Observed on one boot: all four GPUs sat at `unconfigured` for **12+ hours**
+with `ppod_id` all-zero, `vpod_id=0`, `accel_id=4294967295`,
+`link_type=invalid`. Waiting does not fix it. On a later boot, with `ifoe`
+already loaded and `amdgpu` not yet, a single `modprobe` brought all four to
+`active` in **under 15 s**, and the same held across all four nodes.
+
+The ordering above is the working hypothesis for the difference — `ifoe` was
+loaded late (about an hour into the boot) on the run that got stuck — but it
+has **not** been confirmed by a controlled test, so treat it as a checklist
+item rather than a proven mechanism:
+
+- if `accel_state` is `unconfigured` more than a minute after `modprobe`,
+  confirm `ifoe` is loaded and do an `rmmod amdgpu` / `modprobe amdgpu` cycle;
+- once it reads `active`, do **not** `modprobe` again (see below).
 
 Both parameters are recommended for bring-up. They make the GPU **stop and stay
 diagnosable** on a hang instead of being reset out from under you: with the
@@ -278,6 +352,35 @@ The suite's README says `ACCEL_STATE` must be `READY`; this firmware reports
    `ACCELERATOR_ID` from `amd-smi fabric` is the same global numbering — to find
    which node and which GPU is at fault.
 
+   Two more signatures from the same family, seen on a rack where
+   `accel_state` read `active` on **every** node:
+
+   ```
+   amdgpu 0001:01:00.0: LSDMA PIO error status bits 0x8000
+   amdgpu 0001:01:00.0: LSDMA PIO failed to copy memory!
+   amdgpu 0001:01:00.0: HELLO: Send failed to remote AccId:51
+   amdgpu 0001:01:00.0: IMPORT: connection setup failed with remote AccId:51
+   amdgpu 0001:01:00.0: IMPORT: XA import failed for handle:<hex>:<hex>
+   ```
+
+   and, from RCCL, `src/transport/p2p_tmp.cc:372 NCCL WARN HIP failure
+   'invalid argument'` → `NCCL error: unhandled cuda error`.
+
+   **Read dmesg on both nodes.** The importer logs all of this; the exporter
+   logs *nothing*, because the HELLO never arrived. An empty exporter-side
+   dmesg next to a failing importer is the clean signature that packets are not
+   crossing the wire.
+
+   `ualoe_p2p` surfaces it as
+   `[FATAL] ualoe_p2p.cpp:49 hipMemSetAccess(...) -> invalid argument`.
+   Line 49 is inside `fab_import`, **not** `fab_alloc` — the remote handle
+   imported and mapped, and only making it accessible failed. It is not a local
+   allocation problem.
+
+> **`accel_state=active` is necessary, not sufficient.** It reports link
+> training, not reachability. A whole rack can read `active` on every node while
+> no pair exchanges a single packet. Run `ualoe_p2p` before trusting it.
+
 **Other requirements**
 
 - A **gfx1250 bring-up image** with ATOM, aiter, mori and FlyDSL, built from an
@@ -367,6 +470,42 @@ python3 -c "from atom.utils import envs; print(envs.ATOM_UNFUSED_GATHER_KV_B_PRO
 If the second line raises `AttributeError`, `envs.py` did not get patched and
 the env var will be ignored at runtime — which is the silent half of this
 failure.
+
+### ⚠️ Check byte sizes — `import` passes on a truncated file
+
+The check above is necessary and **not sufficient**: a **0-byte** `.py` imports
+cleanly, prints its path, and defines nothing. A `docker cp` interrupted
+mid-copy — host reset, BMC watchdog, rack power event — leaves exactly that
+behind. Seen on all four nodes at once: the rocjitsu hook and all three patched
+ATOM files were 0 bytes while every check in this section reported success.
+
+For `gfx1250-atom-20260918-ep8` the sizes are:
+
+```bash
+sudo docker exec k3ep16 bash -c '
+stat -c"%s %n" \
+  /app/rjprefix/lib/libhsa_hotswap_rocjitsu.so             `# 129112`  \
+  /app/rjprefix/lib/librocjitsu_gfx1250_b0_to_a0.so.0.3.0  `# 8002216` \
+  /app/ATOM/atom/model_ops/mla_unfused_gather.py           `# 7499`    \
+  /app/ATOM/atom/utils/envs.py                             `# 47967`   \
+  /app/ATOM/atom/model_ops/attention_mla.py                `# 146235`
+grep -c use_unfused_gather_kv_b_proj /app/ATOM/atom/model_ops/attention_mla.py  # 3'
+```
+
+Re-run it after **every** reboot or container rebuild, not just the first
+install.
+
+### The `envs.py` hunk does not apply to this image
+
+`patch -p1` reports `Hunk #1 FAILED` on `atom/utils/envs.py`. The PR is based on
+`main`, whose trailing context (`ATOM_USE_FLYDSL_FP8_PREFILL_ATTN`) does not
+exist in the image's ATOM — which has `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION`
+in that position instead. `attention_mla.py` applies, with fuzz 2 at offset −199.
+
+Insert the `ATOM_UNFUSED_GATHER_KV_B_PROJ` block by hand immediately after
+`ATOM_USE_FLYDSL_GATHER_KV_B_PROJ`, keeping the image's own following context.
+Then verify the env var reads `False` by default **and** `True` under the env
+var — both, not just one.
 
 Like the rocjitsu prefix, this edits the container's filesystem, so **`docker
 rm` discards it** and it must be re-applied on a rebuilt container. Do it on all
@@ -479,9 +618,17 @@ export ATOM_LOADER_USE_THREADPOOL=1 ATOM_LOADER_NUM_THREADS=4
 ```
 
 A cold start takes about **25 minutes** — 96 shards, translation, and graph
-capture. `ncclCommInitRank` hangs intermittently on this stack with no known
-fix; retry. Give any retry wrapper **at least 25 minutes** or it will kill
-servers that are loading normally.
+capture. On `gfx1250-atom-20260918-ep8` with a warm page cache it has been
+measured at **under 6 minutes**, so treat 25 as the budget, not the
+expectation. `ncclCommInitRank` hangs intermittently on this stack with no
+known fix; retry. Give any retry wrapper **at least 25 minutes** or it will
+kill servers that are loading normally.
+
+`py-spy` is **not in the image**; install it before you need it:
+
+```bash
+sudo docker exec k3ep16 pip install --break-system-packages py-spy
+```
 
 To tell a hang from progress, look at the ModelRunner (`ATOM::DPxTP0`), not the
 EngineCore, which only ever shows as waiting on a queue:
@@ -491,7 +638,51 @@ py-spy dump --pid $(pgrep -f 'ATOM::DP0TP0' | head -1)
 ```
 
 `MainThread (idle)` in `as_completed` is a healthy load. `(active)` in
-`ncclCommInitRank` is the hang.
+`ncclCommInitRank` is the hang — in practice it shows up as:
+
+```
+synchronize (torch/cuda/streams.py:108)
+__init__ (communicator_pynccl.py:143)
+init_model_parallel_group (aiter/dist/parallel_state.py:1626)
+```
+
+### When retrying does not help
+
+If it reproduces every time, it is not the intermittent hang and no amount of
+retrying fixes it. **Changing the transport is not the lever** — the channels
+build cleanly in all three cases and the hang is afterwards:
+
+| setting | transport RCCL picks | outcome |
+|---|---|---|
+| recipe default | `P2P/CUMEMMNNVL` | hangs |
+| `NCCL_MNNVL_ENABLE=0` | `P2P/CUMEM` | hangs |
+| `+ NCCL_CUMEM_ENABLE=0` | `P2P/IPC` | hangs |
+
+Work below ATOM instead. This takes a minute and tells you whether ATOM is
+involved at all:
+
+```python
+# ncclmin.py
+import os, torch, torch.distributed as dist, datetime
+r=int(os.environ["RANK"]); w=int(os.environ["WORLD_SIZE"])
+torch.cuda.set_device(r)
+dist.init_process_group("nccl", rank=r, world_size=w,
+                        timeout=datetime.timedelta(seconds=45))
+t=torch.ones(1024, device=f"cuda:{r}")*(r+1)
+dist.all_reduce(t); torch.cuda.synchronize()
+print(f"[{r}] {t[0].item()} expect {w*(w+1)//2}", flush=True)
+```
+
+```bash
+for W in 1 2 4; do
+  MASTER_ADDR=127.0.0.1 MASTER_PORT=$((29800+W)) WORLD_SIZE=$W \
+  sh -c 'for r in $(seq 0 $((WORLD_SIZE-1))); do RANK=$r python3 ncclmin.py & done; wait'
+done
+```
+
+`world_size=1` passing while 2 and 4 time out with `last completed work: -1`
+means the collective kernel never ran. That is a platform fault; nothing in
+this recipe's configuration will move it.
 
 ### KV budget
 
@@ -499,6 +690,19 @@ py-spy dump --pid $(pgrep -f 'ATOM::DP0TP0' | head -1)
 grep 'Memory budget' <log> | tail -1     # available_for_kv must be positive
 grep -oE 'experts=[0-9]+' <log> | sort -u  # EP16 -> 56
 ```
+
+**`available_for_kv` scales with the board, so re-derive it rather than reusing
+the numbers here.** Measured on 432 GiB boards, same launch flags:
+
+```
+utilization=0.90  budget=388.80GB  peak_torch=194.67GB  available_for_kv=159.37GB
+utilization=0.94  budget=406.08GB  peak_torch=194.67GB  available_for_kv=176GB+
+```
+
+i.e. ~4.7x the 33.53 GB the 288 GiB boards give at 0.90. The
+`--max-num-batched-tokens 2048` lever below still matters — `peak_torch` is
+~195 GB either way — but the pressure it relieves is much lower on 432 GiB
+parts.
 
 With the default `--max-num-batched-tokens 16384`, `peak_torch` and the
 cudagraph estimate together reach ~77 GB and `available_for_kv` goes to about
@@ -617,6 +821,10 @@ max_tokens=3500  -> content='...#### 72'  finish_reason=stop
 | A run dies with nothing in the log to explain it | Possibly a GPU recovery reset. Reload the driver with `gpu_recovery=0 halt_if_hws_hang=1` so the next one halts diagnosably |
 | Startup stops at `load RCCL version`, CPU spinning at ~110% | Intermittent `ncclCommInitRank` hang. Retry; allow ≥25 min. Looks identical to a bad fabric — rule that out with [ubench07](#validate-the-fabric-first--ubench07) once, then retry |
 | Multi-node rendezvous hangs with no error | Nodes are not in the same `PPOD_ID` / `VPOD_ID` domain, or the fabric itself is bad. Confirm with [ubench07](#validate-the-fabric-first--ubench07) before blaming the engine |
+| `accel_state` stuck at `unconfigured` long after `modprobe` | `ifoe` was not loaded when `amdgpu` initialised. It never recovers on its own — see [After a reboot](#after-a-reboot-load-the-driver-then-confirm-the-links-trained) |
+| `load RCCL version` hang that reproduces **every** time | Not the intermittent hang. Drop below ATOM with the minimal `all_reduce` above before touching any ATOM flag |
+| Patch/prefix "installed" but behaves as if absent | Files may be 0 bytes from an interrupted `docker cp`; `import` still succeeds. Check byte sizes |
+| OOM at load with `0 bytes is free` while `peak_torch` is small | Another job owns the GPUs. Check `rocm-smi --showmemuse` (idle reads 0% / ~177 MB) and `docker ps` on every node before launching |
 | Cross-node bandwidth ~4.5 GB/s instead of thousands | MNNVL not in effect, silently fell back to TCP. Set `NCCL_MNNVL_ENABLE=1` |
 | Log appears frozen | tqdm writes `\r`; pipe through `tr '\r' '\n'` |
 
