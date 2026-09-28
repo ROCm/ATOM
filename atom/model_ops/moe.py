@@ -1898,15 +1898,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer, x.shape[0] * get_sp_world_size(), x.dtype
         ):
             return sp_moe_gather(x), None
-        if envs.ATOM_SP_MOE_QUANT_REGISTERED:
-            from atom.distributed.sp_registered_buffer import quantize_gather_moe_input
-            from atom.distributed.ulysses_sp import get_sp_group
-
-            direct = quantize_gather_moe_input(x, get_sp_group())
-            if direct is not None:
-                quantized, scale = direct
-                scale = sp_moe_gather(scale.view(torch.bfloat16)).view(dtypes.fp8_e8m0)
-                return quantized, scale
         quantized, scale = get_hip_quant(self.quant_type)(
             x, quant_dtype=dtypes.fp4x2, shuffle=False
         )
@@ -1916,7 +1907,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         scale = sp_moe_gather(scale.view(torch.bfloat16)).view(dtypes.fp8_e8m0)
         return quantized, scale
 
-    def gather_sp_routed_input(self, layer, x, router_logits, *, packed=False):
+    def gather_sp_routed_input(self, layer, x, router_logits):
         """Move row-local routing before the SP gather, retaining all route bits.
 
         The caller only selects this path for the existing non-EP external-FP4
@@ -1938,17 +1929,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             e_score_correction_bias=layer.e_score_correction_bias,
             fused_shared_experts_scoring_func=layer.shared_expert_scoring_func,
         )
-        if packed:
-            from atom.model_ops.sp_moe_pack import (
-                quantize_pack_moe_inputs,
-                unpack_moe_inputs,
-            )
-
-            send, quantized, scale = quantize_pack_moe_inputs(x, weights, ids)
-            gathered = sp_moe_gather(send)
-            return unpack_moe_inputs(
-                gathered, quantized, scale, weights, ids, get_sp_world_size()
-            )
         quantized, scale = self.gather_sp_input(layer, x)
         weights = sp_moe_gather(weights)
         ids = sp_moe_gather(ids.view(torch.bfloat16)).view(torch.int32)
@@ -2345,6 +2325,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             if getattr(layer, "_sp_tiled_sort_enabled", False):
                 moe_extra_args["use_tiled_sort"] = True
+            if sp_input_scale is not None:
+                moe_extra_args["dtype"] = torch.bfloat16
             return fused_moe(
                 x,
                 layer.w13_weight,
@@ -2357,7 +2339,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
                 a1_scale=a1_scale,
-                dtype=torch.bfloat16 if sp_input_scale is not None else None,
                 a2_scale=a2_scale,
                 doweight_stage1=apply_router_weight_on_input,
                 bias1=layer.w13_bias,
@@ -5408,7 +5389,6 @@ class FusedMoE(torch.nn.Module):
             )
             local_topk = (
                 mxfp4_input
-                and (envs.ATOM_SP_MOE_LOCAL_TOPK or envs.ATOM_SP_MOE_PACK_GATHER)
                 and not self.use_ep
                 and not self.expert_layout.shared_is_routed
                 and not self.use_grouped_topk
@@ -5426,7 +5406,6 @@ class FusedMoE(torch.nn.Module):
                         self,
                         hidden_states,
                         router_logits,
-                        packed=envs.ATOM_SP_MOE_PACK_GATHER,
                     )
                 )
                 sp_input_kwargs["sp_input_scale"] = input_scale

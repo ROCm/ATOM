@@ -42,6 +42,7 @@ from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.sp_moe_sort import supports_m3_sp_tiled_sort
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
@@ -52,7 +53,6 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 
 
@@ -318,13 +318,7 @@ class MiniMaxM3MoE(nn.Module):
             # padded intermediate avoids backend pad-skip precision issues.
             self.experts.quant_method.intermediate_pad = 0
         self.experts.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
-        self.experts._sp_tiled_sort_enabled = False
-        if envs.ATOM_SP_MOE_TILED_SORT:
-            from atom.model_ops.sp_moe_sort import supports_m3_sp_tiled_sort
-
-            self.experts._sp_tiled_sort_enabled = supports_m3_sp_tiled_sort(
-                self.experts
-            )
+        self.experts._sp_tiled_sort_enabled = supports_m3_sp_tiled_sort(self.experts)
         self.fuse_shared_experts = (
             getattr(self.experts, "num_fused_shared_experts", 0) > 0
         )
