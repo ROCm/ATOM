@@ -308,6 +308,13 @@ EOF
     -e LOGNAME="${CURRENT_USER}"
     -e HOME="/tmp/atomesh-home-${JOB_ID}-${rank}"
     -e XDG_CACHE_HOME="/tmp/atomesh-cache-${JOB_ID}-${rank}"
+    # Needed on top of HOME/XDG_CACHE_HOME, not instead of them: the image
+    # bakes HF_HOME=/root/.cache/huggingface, which transformers and
+    # huggingface_hub consult first. build_server_cache_env in
+    # pd_server_atom.sh already overrides it per worker, but the aiperf client
+    # runs in the ambient container env and otherwise dies loading the
+    # tokenizer. Per-worker values still win for the servers.
+    -e HF_HOME="/tmp/atomesh-cache-${JOB_ID}-${rank}/huggingface"
     -e TORCHINDUCTOR_CACHE_DIR="/tmp/atomesh-cache-${JOB_ID}-${rank}/torchinductor"
     -e AITER_CACHE_DIR="/tmp/atomesh-cache-${JOB_ID}-${rank}/aiter"
     -e AITER_JIT_DIR="/tmp/atomesh-cache-${JOB_ID}-${rank}/aiter/jit"
@@ -806,6 +813,7 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
         -e LOGNAME="'"${CURRENT_USER}"'" \
         -e HOME="/tmp/atomesh-home-'"${SLURM_JOB_ID}"'-${rank}" \
         -e XDG_CACHE_HOME="/tmp/atomesh-cache-'"${SLURM_JOB_ID}"'-${rank}" \
+        -e HF_HOME="/tmp/atomesh-cache-'"${SLURM_JOB_ID}"'-${rank}/huggingface" \
         -v "'"${REPO_ROOT}"'":/workspace/ATOM:ro \
         -v "'"${RUN_DIR}"'":/run_logs/slurm_job-'"${SLURM_JOB_ID}"' \
         -v /mnt:/mnt \
