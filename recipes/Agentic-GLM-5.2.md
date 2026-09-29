@@ -52,7 +52,7 @@ The validated prefill and decode configurations are:
 | Batched-token budget | 8192 | 16384 (default) |
 | LMCache | 256 GiB CPU tier, 256-token chunks | Disabled |
 | Native prefix caching | Enabled | Enabled |
-| Speculative decoding | MTP3 | MTP3 |
+| Speculative decoding | MTP3, forced AL 2.99 | MTP3, forced AL 2.99 |
 
 Both nodes use MXFP4 weights, online PTPC FP8 quantization,
 `ATOM_MLA_PAGE_SIZE=1`, `ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB=2047`,
@@ -122,6 +122,7 @@ env \
     --level 3 \
     --method mtp \
     --num-speculative-tokens 3 \
+    --spec-decode-acceptance-length 2.99 \
     --server-port 8010 \
     --tensor-parallel-size 1 \
     --pipeline-parallel-size 4 \
@@ -167,6 +168,7 @@ env \
     --level 3 \
     --method mtp \
     --num-speculative-tokens 3 \
+    --spec-decode-acceptance-length 2.99 \
     --server-port 8020 \
     --tensor-parallel-size 4 \
     --decode-context-parallel-size 4 \
