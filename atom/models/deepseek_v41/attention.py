@@ -1,9 +1,14 @@
 # SPDX-License-Identifier: MIT
 """CSA2 model projections; cache storage and sparse kernels have separate owners."""
 
+import logging
+
 import torch
 from aiter import QuantType
 from aiter.dist.parallel_state import get_tp_group
+from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
+from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 from torch import nn
 
 from atom.model_ops.attentions.deepseek_v41.packed_attention import (
@@ -23,15 +28,25 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from atom.model_ops.utils import atom_parameter
+from atom.model_ops.utils import atom_parameter, shuffle_weights
 from atom.model_ops.v4_kernels import (
     sparse_attn_v4_paged_decode,
     sparse_attn_v4_paged_prefill,
 )
+
+# V4.1 encodes the wo_a block scale exactly as V4 does, so it reads the grid
+# through V4's converter rather than growing a second one that has to be kept
+# in step with it.
+from atom.models.deepseek_v4 import _wo_a_block_scale_to_e8m0
 from atom.utils.forward_context import side_stream
 
 from .config import AttentionMode
 from .layers import native_quant_config
+
+logger = logging.getLogger(__name__)
+# V4.1 ships wo_a as FP8 with a 32x32 e8m0 block scale. The gfx950 preshuffled
+# mxscale BMM reads that block; anything else still dequants to the BF16 einsum.
+_WO_A_BLOCK = 32
 
 
 class Indexer(nn.Module):
@@ -158,10 +173,12 @@ class Attention(nn.Module):
         self.qk_norm = DualRMSNormMXFP8(
             self.q_norm, self.kv_norm, f"layers.{spec.layer_id}.qk_norm"
         )
-        # wo_a: grouped LoRA. FP8 + e8m0 block scale on disk, BF16 in the
-        # grouped einsum. Allocated as a quantized ColumnParallelLinear so both
-        # tensors load through the standard FP8 path, then dequantized in
-        # `process_weights_after_loading` -- V4's arrangement, unchanged.
+        # wo_a: grouped LoRA. FP8 + 32x32 e8m0 on disk. gfx950 keeps that and
+        # runs the preshuffled mxscale BMM; other archs dequant to BF16.
+        self._is_gfx950 = get_gfx_runtime() == "gfx950"
+        self._wo_a_mxscale = False
+        self._wo_a_w_fp8 = None
+        self._wo_a_w_scale = None
         self.wo_a = ColumnParallelLinear(
             config.num_attention_heads * self.head_dim // config.o_groups,
             config.o_groups * self.o_rank,
@@ -205,15 +222,15 @@ class Attention(nn.Module):
             cache.write_index(owner, step, index, self.spec.ratio)
 
     def process_weights_after_loading(self) -> None:
-        """Dequantize wo_a to BF16 for the grouped LoRA einsum.
+        """Keep wo_a FP8 for the mxscale BMM, or dequant it for the BF16 einsum.
 
-        Copied from V4, minus its gfx950/gfx1250 mxscale branches: this einsum
-        path wants BF16. Idempotent -- a checkpoint that already ships wo_a as
-        BF16 lands here with nothing to do. Suppressing `quant_type` afterwards
-        is what stops `LinearBase.process_weights_after_loading` from applying
-        the FP8 CK 16x16 shuffle to a matrix `torch.einsum` then reads, which
-        would permute rows inside each block. Load order is parent first, so
-        this runs before that hook.
+        gfx950 with a 32x32 e8m0 scale preshuffles the FP8 weight for
+        `batched_gemm_a8w8_mxscale_bpreshuffle`. Idempotent when wo_a is already
+        BF16. Suppressing `quant_type` afterwards stops
+        `LinearBase.process_weights_after_loading` from applying the FP8 CK
+        16x16 shuffle on top of the one applied here, or onto a BF16 matrix
+        the einsum then reads. Load order is parent first, so this runs before
+        that hook.
         """
         weight = self.wo_a.weight
         if weight.dtype == torch.bfloat16:
@@ -224,8 +241,38 @@ class Attention(nn.Module):
             or scale is None
         ):
             return
-        # The scale stays in its native e8m0: this helper exists for exactly
-        # this weight and reads the grid in that encoding.
+        block = _WO_A_BLOCK
+        groups, rank = self.groups, self.o_rank
+        out_dim, k = int(weight.shape[0]), int(weight.shape[1])
+        w_scale = None
+        if (
+            self._is_gfx950
+            and out_dim == groups * rank
+            and rank % block == 0
+            and k % block == 0
+            and scale.dim() == 2
+            and scale.shape[0] == out_dim // block
+            and scale.shape[1] == k // block
+        ):
+            w_scale = _wo_a_block_scale_to_e8m0(scale.data, groups)
+        if w_scale is not None:
+            shuffle_weights(weight, layout=(16, 16))
+            self._wo_a_w_fp8 = weight.data.view(groups, rank, k)
+            self._wo_a_w_scale = w_scale
+            self._wo_a_mxscale = True
+            if self.spec.layer_id == 0:
+                logger.info(
+                    "V4.1 wo_a using fp8 e8m0 mxscale BMM (preshuffle=True, "
+                    "G=%d, N=%d, K=%d, block=%d); every layer with this shape "
+                    "takes the same path.",
+                    groups,
+                    rank,
+                    k,
+                    block,
+                )
+            self.wo_a.quant_type = QuantType.No
+            self.wo_a.need_normalize_e4m3fn_to_e4m3fnuz = False
+            return
         self.wo_a.weight = atom_parameter(
             dequantize_fp8_weight(weight.data, scale.data)
         )
@@ -241,6 +288,14 @@ class Attention(nn.Module):
         # `LinearBase` turned it on.
         self.wo_a.quant_type = QuantType.No
         self.wo_a.need_normalize_e4m3fn_to_e4m3fnuz = False
+        if self.spec.layer_id == 0:
+            logger.info(
+                "V4.1 wo_a dequantized to BF16 (G=%d, N=%d, K=%d); "
+                "grouped GEMM, not the fp8 mxscale BMM.",
+                groups,
+                rank,
+                k,
+            )
 
     def project_qkv(self, hidden, hidden_scale=None):
         """The one GEMM the query and the KV latent both come out of.
@@ -255,16 +310,61 @@ class Attention(nn.Module):
             dim=-1,
         )
 
-    def _project_out(self, output):
-        """The grouped output LoRA, taking an already un-rotated attention out.
+    def _project_out(self, output, *, rope=None, positions=None):
+        """The grouped output LoRA.
 
-        Un-rotating is the caller's because the two callers reach their rows
-        differently -- one batch line against a ragged one -- while everything
-        after it is the same weights in the same order.
+        The BF16 path takes an already un-rotated attention out. The mxscale
+        path takes the pre-rotation rows plus `rope` and `positions`, and fuses
+        the inverse RoPE into the e8m0 group quant.
         """
+        if self._wo_a_mxscale:
+            return self._project_out_mxscale(output, rope, positions)
         output = output.unflatten(-2, (self.groups, -1)).flatten(-2)
         grouped = self.wo_a.weight.view(self.groups, self.o_rank, -1)
         return self.wo_b(grouped_output_projection(output, grouped).flatten(-2))
+
+    def _project_out_mxscale(self, output, rope, positions):
+        rows = output.reshape(-1, self.heads, self.head_dim)
+        pos = positions.reshape(-1)
+        if pos.numel() != rows.shape[0]:
+            batch = output.shape[0] if output.ndim > 3 else 1
+            if batch > 1 and pos.numel() * batch == rows.shape[0]:
+                pos = pos.repeat(batch)
+            else:
+                raise ValueError(
+                    f"wo_a mxscale positions {tuple(positions.shape)} do not "
+                    f"cover {rows.shape[0]} rows"
+                )
+        group_k = self.heads * self.head_dim // self.groups
+        x_fp8 = torch.empty(
+            (rows.shape[0], self.groups, group_k),
+            dtype=self.wo_a.weight.dtype,
+            device=rows.device,
+        )
+        x_scale = torch.empty(
+            (rows.shape[0], self.groups, group_k // _WO_A_BLOCK),
+            dtype=torch.uint8,
+            device=rows.device,
+        )
+        inverse_rope_group_quant(
+            rows,
+            pos.to(torch.int64),
+            rope.cos_cache,
+            rope.sin_cache,
+            num_groups=self.groups,
+            quant_group_size=_WO_A_BLOCK,
+            scale_layout="row",
+            x_fp8=x_fp8,
+            x_scale=x_scale,
+        )
+        projected = batched_gemm_a8w8_mxscale_bpreshuffle(
+            x_fp8,
+            self._wo_a_w_fp8,
+            x_scale,
+            self._wo_a_w_scale,
+            dtype=output.dtype,
+        )
+        return self.wo_b(projected.reshape(*output.shape[:-2], -1))
 
     def _fork_compress(self, hidden, cache, step, rope):
         """The compressor, issued before the projections, beside them.
@@ -355,6 +455,8 @@ class Attention(nn.Module):
             )
             # Preserve the prior ring until every query has consumed its prefix.
             cache.write_window(self.spec.layer_id, window_kv, step)
-        return self._project_out(
-            rope(output.view_as(query), cache.rope_positions(step), inverse=True)
-        )
+        viewed = output.view_as(query)
+        positions = cache.rope_positions(step)
+        if self._wo_a_mxscale:
+            return self._project_out(viewed, rope=rope, positions=positions)
+        return self._project_out(rope(viewed, positions, inverse=True))

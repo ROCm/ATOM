@@ -1,16 +1,25 @@
 # SPDX-License-Identifier: MIT
 """Projection contracts at small-chunk and batched-decode boundaries."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 pytest.importorskip("aiter", reason="the projections call AITER GEMMs")
 
+from aiter import QuantType
+from aiter.jit.utils.chip_info import get_gfx_runtime
+
+from atom.model_ops.deepseek_v41.draft_block import rotate_rows
 from atom.model_ops.deepseek_v41.projections import (
     grouped_output_projection,
     hc_projection,
 )
+from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
+from atom.models.deepseek_v41.attention import Attention
 
 
 def test_cpu_projections_preserve_native_arithmetic():
@@ -91,3 +100,121 @@ def test_graph_replay_reads_updated_projection_inputs():
         graph.replay()
         assert torch.equal(output, grouped_output_projection(x, weight))
         assert torch.equal(mixes, hc_projection(hc, fn))
+
+
+# --- wo_a: fp8 e8m0 mxscale BMM against the BF16 dequant it replaces --------
+#
+# TP2 local shapes: G=4, N=1024, K = heads * head_dim / G = 4096.
+_HEADS, _HEAD_DIM, _GROUPS, _RANK = 32, 512, 4, 1024
+_K = _HEADS * _HEAD_DIM // _GROUPS
+_BLOCK = 32
+
+_needs_mxscale = pytest.mark.skipif(
+    not torch.cuda.is_available() or get_gfx_runtime() != "gfx950",
+    reason="the preshuffled 32x32 mxscale BMM is a gfx950 kernel",
+)
+
+
+class _WoA(nn.Module):
+    """The fields `process_weights_after_loading` reads off the linear."""
+
+    def __init__(self, weight, scale):
+        super().__init__()
+        self.weight = nn.Parameter(weight.clone(), requires_grad=False)
+        self.weight_scale = nn.Parameter(scale.clone(), requires_grad=False)
+        self.quant_type = QuantType.per_1x128
+        self.need_normalize_e4m3fn_to_e4m3fnuz = False
+
+
+def _attention(weight, scale, *, gfx950):
+    """An `Attention` reduced to what the wo_a projection touches.
+
+    Built without `__init__` on purpose: the real one allocates every
+    projection in the layer, and none of them reach this path.
+    """
+    attention = Attention.__new__(Attention)
+    nn.Module.__init__(attention)
+    attention.spec = SimpleNamespace(layer_id=0)
+    attention.heads, attention.head_dim = _HEADS, _HEAD_DIM
+    attention.groups, attention.o_rank = _GROUPS, _RANK
+    attention._is_gfx950 = gfx950
+    attention._wo_a_mxscale = False
+    attention._wo_a_w_fp8 = attention._wo_a_w_scale = None
+    attention.wo_a = _WoA(weight, scale)
+    attention.wo_b = nn.Identity()
+    attention.process_weights_after_loading()
+    return attention
+
+
+@pytest.fixture(scope="module")
+def wo_a_pair():
+    torch.manual_seed(0)
+    weight = (torch.randn(_GROUPS * _RANK, _K, device="cuda") * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    # Exact powers of two: anything else has no e8m0 form and would send both
+    # sides down the BF16 branch, testing nothing.
+    exponents = torch.randint(
+        -10, -4, (_GROUPS * _RANK // _BLOCK, _K // _BLOCK), device="cuda"
+    )
+    scale = torch.exp2(exponents.float()).to(torch.float8_e8m0fnu)
+    mxscale = _attention(weight, scale, gfx950=True)
+    bf16 = _attention(weight, scale, gfx950=False)
+    assert mxscale._wo_a_mxscale, "the mxscale path was not selected"
+    assert not bf16._wo_a_mxscale and bf16.wo_a.weight.dtype == torch.bfloat16
+    rope = RotaryEmbedding(
+        64, 1 << 17, base=160000, original_length=65536, factor=16,
+        beta_fast=32, beta_slow=1,
+    ).to("cuda")
+    return mxscale, bf16, rope
+
+
+@_needs_mxscale
+@pytest.mark.parametrize("rows", [1, 2, 5, 16, 33, 64, 300, 2048, 8192])
+def test_wo_a_mxscale_tracks_the_bf16_projection(wo_a_pair, rows):
+    """One FP8 rounding of the activation, so this is a closeness bound."""
+    mxscale, bf16, rope = wo_a_pair
+    torch.manual_seed(rows)
+    positions = torch.randint(0, 100000, (rows,), device="cuda", dtype=torch.int64)
+    source = torch.randn(
+        1, rows, _HEADS, _HEAD_DIM, device="cuda", dtype=torch.bfloat16
+    )
+
+    expected = bf16._project_out(rope(source.clone(), positions, inverse=True))
+    actual = mxscale._project_out(source.clone(), rope=rope, positions=positions)
+
+    assert actual.shape == expected.shape
+    reference, got = expected.float(), actual.float()
+    assert ((got - reference).norm() / reference.norm()).item() < 0.08
+    similarity = F.cosine_similarity(got.flatten(), reference.flatten(), dim=0)
+    assert similarity.item() > 0.997
+
+
+@_needs_mxscale
+@pytest.mark.parametrize("batch,tokens", [(1, 6), (3, 6), (8, 6)])
+def test_wo_a_mxscale_covers_draft_batches(wo_a_pair, batch, tokens):
+    """Draft rows arrive as [B, T] positions against B*T rows.
+
+    The BF16 side goes through `rotate_rows` rather than the rope directly:
+    `RotaryEmbedding` cannot broadcast a 2D position tensor over the batch,
+    which is the reason the draft block owns that flattening.
+    """
+    mxscale, bf16, rope = wo_a_pair
+    torch.manual_seed(batch * tokens)
+    positions = torch.randint(
+        0, 100000, (batch, tokens), device="cuda", dtype=torch.int64
+    )
+    source = torch.randn(
+        batch, tokens, _HEADS, _HEAD_DIM, device="cuda", dtype=torch.bfloat16
+    )
+
+    expected = bf16._project_out(
+        rotate_rows(rope, source.clone(), positions, inverse=True)
+    )
+    actual = mxscale._project_out(source.clone(), rope=rope, positions=positions)
+
+    assert actual.shape == expected.shape
+    reference, got = expected.float(), actual.float()
+    assert ((got - reference).norm() / reference.norm()).item() < 0.08
+    similarity = F.cosine_similarity(got.flatten(), reference.flatten(), dim=0)
+    assert similarity.item() > 0.997

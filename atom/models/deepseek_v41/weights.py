@@ -111,7 +111,6 @@ def checkpoint_schema(config) -> dict[str, WeightSpec]:
             h * hd // config.o_groups,
             scope=scope,
             tp_axis=0,
-            dequantize=True,
         )
         linear(
             attn + ".wo_b",

@@ -42,7 +42,7 @@ def test_source_schema_and_explicit_owner_slices(schema):
     assert entries["layers.0.attn.wq_b.scale"].start == 896
     assert entries["layers.2.attn.indexer.wq_b.weight"].axis is None
     assert entries["layers.1.engram.embed.weight"].action == "host"
-    assert entries["layers.0.attn.wo_a.scale"].action == "dequant_scale"
+    assert entries["layers.0.attn.wo_a.scale"].action == "load"
     assert entries["mtp.2.norm.weight"].reason == "draft explicitly excluded"
     assert entries["vision.norm.weight"].reason == "vision explicitly excluded"
     tp_only = {

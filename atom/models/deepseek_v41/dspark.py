@@ -93,6 +93,8 @@ class DraftAttention(Attention):
             step,
             self.softmax_scale,
         )
+        if self._wo_a_mxscale:
+            return self._project_out(output, rope=rope, positions=step.positions)
         return self._project_out(
             rotate_rows(rope, output, step.positions, inverse=True)
         )
