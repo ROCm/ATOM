@@ -479,8 +479,12 @@ jobs:
           SLURM_PARTITION="${ATOMESH_SLURM_PARTITION:-}"
           SLURM_QOS=""
           USES_SPUR_CONTROLLER=0
-          SPUR_CONTROLLER_ADDR=""
-          SPUR_ACCOUNTING_ADDR=""
+          # Keep whatever the runner exported. pit2's Spur gateway list is not
+          # in this workflow -- it lives in the runner environment, which is why
+          # the benchmark path reads it through os.environ in pd_submit.sh. The
+          # two branches below name their own gateways and override this.
+          SPUR_CONTROLLER_ADDR="${SPUR_CONTROLLER_ADDR:-}"
+          SPUR_ACCOUNTING_ADDR="${SPUR_ACCOUNTING_ADDR:-}"
           if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
             USES_SPUR_CONTROLLER=1
             SPUR_CONTROLLER_ADDR="http://134.199.196.72:6817"
@@ -492,6 +496,14 @@ jobs:
             SLURM_ACCOUNT="amd-aifw-dev"
             SLURM_PARTITION=""
             SLURM_QOS="amd-aifw-dev-qos"
+          fi
+          # On pit2 the sbatch in PATH is Spur's, and it rejects an empty
+          # --controller URI with "failed to connect to spurctld: invalid URI:
+          # empty string". Blanking the inherited address above therefore made
+          # this job unable to submit at all on that cluster, which is why it
+          # has never run there.
+          if [[ -n "${SPUR_CONTROLLER_ADDR}" ]]; then
+            USES_SPUR_CONTROLLER=1
           fi
           source "${GITHUB_WORKSPACE}/.github/scripts/slurm_submit_helpers.sh"
           install_slurm_cancel_traps
