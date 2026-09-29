@@ -196,6 +196,26 @@ EOF
     nccl_socket_ifname="eth1"
   fi
 
+  # Say which interface actually carries this node's Spur address, and compare
+  # it to whatever is about to be used. The pin above was measured on rank 0
+  # only, because until the srun dispatch landed no other rank ever started, so
+  # a decode node whose fabric is not named eno0 would fail RCCL bootstrap with
+  # nothing in the log to say why. Diagnostic only: an explicit setting still
+  # wins, and a lookup failure changes nothing.
+  local node_ip="${IPS[rank]:-}"
+  if [[ -n "${node_ip}" ]]; then
+    local detected_ifname
+    detected_ifname="$(ip -o -4 addr show 2>/dev/null | awk -v node_ip="${node_ip}" '
+      { split($4, address, "/") }
+      address[1] == node_ip { sub(/@.*/, "", $2); print $2; exit }
+    ')" || detected_ifname=""
+    echo "[network] rank=${rank} ip=${node_ip} carried_by=${detected_ifname:-<not found>} using=${nccl_socket_ifname:-<rccl default>}"
+    if [[ -n "${detected_ifname}" && -n "${nccl_socket_ifname}" &&
+          "${nccl_socket_ifname#=}" != "${detected_ifname}" ]]; then
+      echo "[network] WARNING: rank=${rank} is pinned to ${nccl_socket_ifname#=} but ${node_ip} is on ${detected_ifname}" >&2
+    fi
+  fi
+
   bounded_docker_rm "${container}"
   if [[ "${execution_phase}" != "eval" ]]; then
     docker pull "${DOCKER_IMAGE}"
