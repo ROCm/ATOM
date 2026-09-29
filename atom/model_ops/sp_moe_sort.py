@@ -17,9 +17,10 @@ def _aiter_supports_tiled_sort(fused_moe) -> bool:
     )
 
 
-def supports_m3_sp_tiled_sort(layer) -> bool:
+def supports_m3_sp_tiled_sort(layer, *, tp_replicated_o_proj: bool = False) -> bool:
     """Cache on the M3 expert layer; AITER also checks the runtime sort contract."""
     from aiter import QuantType
+    from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
     from atom.distributed.ulysses_sp import get_sp_world_size
@@ -27,7 +28,8 @@ def supports_m3_sp_tiled_sort(layer) -> bool:
     from atom.plugin.prepare import is_plugin_mode
 
     return not (
-        get_sp_world_size() != 4
+        get_sp_world_size() != (1 if tp_replicated_o_proj else 4)
+        or (tp_replicated_o_proj and get_tensor_model_parallel_world_size() != 4)
         or is_plugin_mode()
         or type(layer.quant_method) is not Mxfp4MoEMethod
         or layer.quant_method.quant_type != QuantType.per_1x32

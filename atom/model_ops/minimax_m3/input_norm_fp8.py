@@ -41,14 +41,16 @@ def fused_m3_gemma_norm_fp8(x, weight, epsilon, residual=None):
     return out, scale, x if residual is None else res_out
 
 
-def supports_m3_fused_gemma_fp8(hidden_width: int) -> bool:
+def supports_m3_fused_gemma_fp8(
+    hidden_width: int, *, tp_replicated_o_proj: bool = False
+) -> bool:
     """Select the validated SP4 layout on gfx950 before graph tracing."""
     from atom.distributed.ulysses_sp import get_sp_world_size
 
     if (
         not torch.cuda.is_available()
         or _fused_per_token_quant is None
-        or get_sp_world_size() != 4
+        or get_sp_world_size() != (1 if tp_replicated_o_proj else 4)
         or hidden_width != 6144
         or dtypes.fp8 != torch.float8_e4m3fn
     ):
@@ -61,7 +63,7 @@ def supports_m3_fused_gemma_fp8(hidden_width: int) -> bool:
 
     return (
         not is_plugin_mode()
-        and get_tensor_model_parallel_world_size() == 1
+        and get_tensor_model_parallel_world_size() == (4 if tp_replicated_o_proj else 1)
         and get_current_atom_config().torch_dtype == torch.bfloat16
         and get_gfx_runtime() == "gfx950"
     )

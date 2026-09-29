@@ -386,6 +386,11 @@ def moe_kernel_token_capacity(
     applies at ``dp_size == 1`` too.
     """
     tokens = atom_config.max_num_batched_tokens
+    if getattr(atom_config, "m3_tp_replicated_o_proj", False):
+        # Attention output is split into equal TP token chunks before MoE.
+        # The gather includes up to TP-1 dummy rows even with an odd budget.
+        tp = atom_config.tensor_parallel_size
+        tokens = ((tokens + tp - 1) // tp) * tp
     sp_size = getattr(atom_config, "sequence_parallel_size", 1)
     if sp_size > 1:
         # The scheduler budget is global under SP. Routed dispatch reserves

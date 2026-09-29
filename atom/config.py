@@ -1924,6 +1924,8 @@ class Config:
     # Ulysses shards tokens and exchanges them for heads around attention.
     # Its workers use the PCP rank dimension.
     sequence_parallel_size: int = 1
+    # Snapshot the experimental layout once and propagate it to all workers.
+    m3_tp_replicated_o_proj: bool = field(init=False, default=False)
     enforce_eager: bool = False
     # Number of vocabulary positions that carry a real token. A checkpoint
     # whose embedding matrix is padded up to a friendlier width -- Qwen3 rounds
@@ -2140,7 +2142,67 @@ class Config:
                 )
         self.prefill_context_parallel_size = sp
 
+    def _validate_m3_tp_replicated_o_proj(self) -> None:
+        if not self.m3_tp_replicated_o_proj:
+            return
+        text = getattr(self.hf_config, "text_config", self.hf_config)
+        architectures = getattr(self.hf_config, "architectures", None) or ()
+        if is_plugin_mode() or not any(
+            arch
+            in (
+                "MiniMaxM3SparseForCausalLM",
+                "MiniMaxM3SparseForConditionalGeneration",
+            )
+            for arch in architectures
+        ):
+            raise ValueError("ATOM_M3_TP_REPLICATED_O_PROJ requires native MiniMax-M3.")
+        if (
+            self.tensor_parallel_size != 4
+            or self.sequence_parallel_size != 1
+            or self.prefill_context_parallel_size != 1
+            or self.decode_context_parallel_size != 1
+            or self.pipeline_parallel_size != 1
+            or self.parallel_config.data_parallel_size != 1
+            or self.enable_dp_attention
+            or self.dp_logical_size > 1
+        ):
+            raise ValueError(
+                "ATOM_M3_TP_REPLICATED_O_PROJ requires TP4, SP1, PCP1, DCP1, "
+                "PP1 and DP1 without DP attention."
+            )
+        if (
+            self.enable_expert_parallel
+            or self.moe_all2all_backend not in ("auto", "none")
+            or self.moe_backend != "standard"
+            or self.fake_eplb
+            or self.enable_tbo
+            or self.enable_tbo_decode
+            or self.speculative_config is not None
+            or self.dcp_config.indexer_dcp_only
+        ):
+            raise ValueError(
+                "ATOM_M3_TP_REPLICATED_O_PROJ does not support EP, routed MoE "
+                "all2all, fake EPLB, TBO, speculative decoding or indexer CP."
+            )
+        if (
+            self.torch_dtype != torch.bfloat16
+            or getattr(text, "hidden_size", None) != 6144
+            or getattr(text, "num_attention_heads", None) != 64
+            or getattr(text, "num_key_value_heads", None) != 4
+            or getattr(text, "head_dim", None) != 128
+        ):
+            raise ValueError(
+                "ATOM_M3_TP_REPLICATED_O_PROJ requires BF16 M3 activations, "
+                "hidden_size=6144, 64 query heads and 4 KV heads of dimension 128."
+            )
+        logger.info(
+            "Experimental M3 TP4 replicated o_proj enabled: TP QKV, output head "
+            "exchange, local FFN input, and owner-attention addition before TP "
+            "all-reduce. The accumulated residual stays outside QuickReduce."
+        )
+
     def __post_init__(self):
+        self.m3_tp_replicated_o_proj = envs.ATOM_M3_TP_REPLICATED_O_PROJ
         if self.sequence_parallel_size < 1:
             raise ValueError("sequence_parallel_size must be at least 1")
         self.moe_all2all_backend = (
@@ -2624,6 +2686,8 @@ class Config:
 
             validate_runtime_config(self)
 
+        self._validate_m3_tp_replicated_o_proj()
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -2662,6 +2726,8 @@ class Config:
         factors.append(self.prefill_context_parallel_size)
         # SP and PCP use the same rank dimension but different head shapes.
         factors.append(self.sequence_parallel_size)
+        if getattr(self, "m3_tp_replicated_o_proj", False):
+            factors.append("m3_tp_replicated_o_proj_v2")
         # Expert layout and transport also change compiled shapes/subgraphs.
         factors.append(
             (self.enable_expert_parallel, self.moe_all2all_backend, self.moe_backend)

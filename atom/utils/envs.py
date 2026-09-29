@@ -273,6 +273,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
+    # Experimental TP4 QKV + replicated o_proj layout (native M3, SP1).
+    "ATOM_M3_TP_REPLICATED_O_PROJ": lambda: (
+        os.getenv("ATOM_M3_TP_REPLICATED_O_PROJ", "0") == "1"
+    ),
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
     # the scorer that first reads it; 2 the indexer as well, on one of its own.

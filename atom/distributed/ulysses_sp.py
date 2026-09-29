@@ -143,15 +143,16 @@ def _prefer_all_gather(payload: torch.Tensor, group) -> bool:
     return _custom_gather_ok(payload, group)
 
 
-def _all_gather_tokens(x: torch.Tensor) -> torch.Tensor:
+def _all_gather_tokens(x: torch.Tensor, group=None) -> torch.Tensor:
     """Gather token shards, preferring graph-compatible AITER transports."""
     x = x.contiguous()
-    group = get_sp_group()
+    world = _SP_WORLD_SIZE if group is None else group.world_size
+    group = get_sp_group() if group is None else group
     if _custom_gather_ok(x, group):
         return group.all_gather(x, use_custom=True, dim=0)
     pynccl = getattr(getattr(group, "device_communicator", None), "pynccl_comm", None)
     if pynccl is not None and not pynccl.disabled:
-        out = x.new_empty((x.shape[0] * _SP_WORLD_SIZE, *x.shape[1:]))
+        out = x.new_empty((x.shape[0] * world, *x.shape[1:]))
         pynccl.all_gather(out, x)
         return out
     return group.all_gather(x, dim=0)
@@ -164,24 +165,25 @@ def sp_gather_tokens(x: torch.Tensor, total_tokens: int) -> torch.Tensor:
     return _all_gather_tokens(x)[:total_tokens]
 
 
-def ulysses_gather_heads(x: torch.Tensor) -> torch.Tensor:
+def ulysses_gather_heads(x: torch.Tensor, group=None) -> torch.Tensor:
     """``[S, H/W*D] -> [S/W, H*D]``: give up the sequence, regain all heads."""
-    w = _SP_WORLD_SIZE
+    w = _SP_WORLD_SIZE if group is None else group.world_size
     if w <= 1:
         return x
     x = x.reshape(x.shape[0], -1)
     s_local, width = x.shape[0] // w, x.shape[1]
-    group = get_sp_group()
+    explicit_group = group
+    group = get_sp_group() if group is None else group
 
     # AITER's last-dimension gather requires 16-byte alignment.
     if width * x.element_size() % 16 == 0 and _prefer_all_gather(x, group):
         start = group.rank_in_group * s_local
         return group.all_gather(x, use_custom=True, dim=1)[start : start + s_local]
 
-    return _swap_heads(x, s_local, width)
+    return _swap_heads(x, s_local, width, group=explicit_group)
 
 
-def _swap_heads(x, s_local, width):
+def _swap_heads(x, s_local, width, group=None):
     """``[w*s_local, width] -> [s_local, w*width]`` by all-to-all."""
     if x.is_cuda:
         from atom.distributed.sp_head_exchange import (
@@ -189,16 +191,18 @@ def _swap_heads(x, s_local, width):
             head_exchange_communicator,
         )
 
-        ca = head_exchange_communicator(x)
+        ca = head_exchange_communicator(x, group=group)
         if ca is not None:
             return exchange_heads(x, ca)
     from atom.distributed.sp_kernels import all_to_all_into
 
-    send = x.reshape(_SP_WORLD_SIZE, s_local, width).contiguous()
+    world = _SP_WORLD_SIZE if group is None else group.world_size
+    group = get_sp_group() if group is None else group
+    send = x.reshape(world, s_local, width).contiguous()
     recv = torch.empty_like(send)
-    all_to_all_into(recv, send, get_sp_group())
+    all_to_all_into(recv, send, group)
     # recv[i] is head-group i for our token chunk -> concatenate on heads.
-    return recv.permute(1, 0, 2).reshape(s_local, _SP_WORLD_SIZE * width)
+    return recv.permute(1, 0, 2).reshape(s_local, world * width)
 
 
 def sp_moe_gather(x: torch.Tensor) -> torch.Tensor:
