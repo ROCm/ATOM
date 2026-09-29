@@ -510,7 +510,7 @@ export ATOM_USE_AITER_TRITON_ATTN=1 ATOM_USE_UNIFIED_ATTN=1
 # --- MoE ---
 export ATOM_MOE_GU_ITLV=1                 # required on gfx1250, not a tuning knob
 export ATOM_USE_TRITON_MOE_DECODE=0       # K3 activation is situ, not SiLU: asserts
-export MEGA_DISPATCH=mori MEGA_WIRE=fp4 MEGA_DISPATCH_WIRE=fp4
+export MEGA_DISPATCH=mori MEGA_DISPATCH_WIRE=fp4   # MEGA_WIRE is dead, see below
 export ATOM_MORI_V2=1 ATOM_MORI_V2_FUSED=1
 export AITER_USE_GROUPED_GEMM=1 AITER_USE_OPUS_MOE_SORTING=1
 
@@ -597,6 +597,74 @@ done
 `world_size=1` passing while 2 and 4 time out with `last completed work: -1`
 means the collective kernel never ran. That is a platform fault; nothing in
 this recipe's configuration will move it.
+
+### The MoE dispatch backend: mori, and why `MEGA_DISPATCH=flydsl` does nothing
+
+`MEGA_DISPATCH` takes `flydsl` or `mori`, and **aiter's own default is
+`flydsl`** (`mega_moe.py`: `os.environ.get("MEGA_DISPATCH", "flydsl")`). This
+recipe names `mori` — but on the fp4 wire the environment variable is not what
+decides it, and setting it to `flydsl` changes nothing.
+
+ATOM passes the backend explicitly, and an explicit argument wins over the env:
+
+```python
+# atom/model_ops/fused_moe/mori_v2_prepare_finalize.py
+# Only mori's dispatch carries the scale row, so a quantizing wire has
+# no other backend to run on. Named here rather than left to
+# $MEGA_DISPATCH, whose default is flydsl: otherwise asking for fp4 is
+# rejected at the first MoE layer for a reason the operator did not set.
+**({"dispatch_backend": "mori"} if _MEGA_DISPATCH_WIRE in ("fp8", "fp4") else {})
+```
+
+So with `MEGA_DISPATCH_WIRE=fp4`, `dispatch_backend="mori"` is hard-wired and
+`$MEGA_DISPATCH` is dead. aiter's side agrees:
+`# Only mori's kernel carries the scale row`.
+
+**The reason is the scale row, not performance.** fp4 and fp8 are quantizing
+wires: every token carries a per-token scale alongside its payload. FlyDSL's
+dispatch kernel does not move that row, so a quantizing wire has nowhere else
+to run.
+
+| | mori | flydsl |
+|---|---|---|
+| carries the per-token scale row | **yes** | no |
+| usable with `MEGA_DISPATCH_WIRE=fp4` / `fp8` | **yes** | no |
+| usable with `MEGA_DISPATCH_WIRE=bf16` | yes | yes |
+| what this recipe runs | **this one** | — |
+
+**Switching to flydsl means giving up fp4 on the wire.** It is a pair, not a
+single knob:
+
+```bash
+export MEGA_DISPATCH=flydsl
+export MEGA_DISPATCH_WIRE=bf16     # fp4 is not available on this backend
+```
+
+That multiplies the dispatch payload by **4x** (fp4 → bf16). Expert
+all-to-all is already the second-largest cost on this stack — the A0-path
+profile puts `mori_ep_dispatch_tdm_fp4x2` at 10.08M us against 11.16M us for
+the largest GEMM — so a 4x wider dispatch is the wrong direction unless
+something else pays for it. **Not measured here**; recorded so nobody spends a
+run discovering that the env var alone is inert.
+
+The knob that *is* live on the fp4 wire is `ATOM_MORI_V2_FUSED`: `1` binds
+aiter's `MegaMoEGfx1250`, which owns the fused dispatch/combine pair, `0` binds
+mori's v2 op-layer running the plain path. This recipe uses `1`. It has not
+been swept.
+
+### `MEGA_WIRE` is deprecated — drop it
+
+`MEGA_WIRE` was renamed to `MEGA_DISPATCH_WIRE` (combine now gets its own
+wire). It is **no longer read**, and both ATOM and aiter raise if the two
+disagree:
+
+```
+RuntimeError: MEGA_WIRE was renamed to MEGA_DISPATCH_WIRE; update the launch
+script, the old name is no longer read
+```
+
+Older launch scripts that set `MEGA_WIRE=fp4 MEGA_DISPATCH_WIRE=fp4` survive
+only because the values match. Remove `MEGA_WIRE`.
 
 ### KV budget
 
@@ -1313,7 +1381,7 @@ export ATOM_USE_AITER_TRITON_ATTN=1 ATOM_USE_UNIFIED_ATTN=1
 # --- MoE ---
 export ATOM_MOE_GU_ITLV=1
 export ATOM_USE_TRITON_MOE_DECODE=0
-export MEGA_DISPATCH=mori MEGA_WIRE=fp4 MEGA_DISPATCH_WIRE=fp4
+export MEGA_DISPATCH=mori MEGA_DISPATCH_WIRE=fp4   # MEGA_WIRE is dead, see below
 export ATOM_MORI_V2=1 ATOM_MORI_V2_FUSED=1
 export AITER_USE_GROUPED_GEMM=1 AITER_USE_OPUS_MOE_SORTING=1
 # --- GEMM / quantization ---
