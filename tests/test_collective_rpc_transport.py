@@ -390,6 +390,23 @@ def test_forward_cannot_go_around_the_block_table_encoder():
     assert mgr.rpc_broadcast_mq.sent == [], "nothing may reach the workers"
 
 
+@pytest.mark.parametrize("name", ["exit", "async_proc_aggregation"])
+def test_names_the_engine_protocol_owns_are_refused(name):
+    """Exit tore down every worker's runner and ended its loop behind a reply
+    that read as success. A KV aggregation drained transfer completions the
+    scheduler then never saw."""
+    mgr = _mgr(1)
+    with pytest.raises(ValueError, match="reserved"):
+        mgr.collective_rpc(name, RpcPayload(request_id="x1"))
+    assert mgr.rpc_broadcast_mq.sent == [], "nothing may reach the workers"
+
+
+def test_the_reserved_names_track_the_worker_loop():
+    """Built from the loop's own KV names, so a new one cannot be missed."""
+    assert AsyncIOProc._KV_FUNC_NAMES <= AsyncIOProcManager._RESERVED_RPC_NAMES
+    assert {"forward", "exit"} <= AsyncIOProcManager._RESERVED_RPC_NAMES
+
+
 def test_a_generic_call_leaves_the_forward_decoder_alone():
     """Every message a worker dequeues passes the block-table decoder, so a
     generic call must come through untouched and keep the cached rows the

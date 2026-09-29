@@ -417,6 +417,13 @@ class AsyncIOProcManager:
         *args: Additional arguments forwarded to the runner constructor.
     """
 
+    # Names the engine's own protocol owns, which collective_rpc refuses: a
+    # forward has to pass the block-table encoder, exit ends every worker's
+    # loop, and a KV aggregation's output belongs to the KV aggregator.
+    _RESERVED_RPC_NAMES: ClassVar[frozenset[str]] = frozenset(
+        {FORWARD_RPC, "exit", *AsyncIOProc._KV_FUNC_NAMES}
+    )
+
     def __init__(self, finalizer, proc_num: int, runner: str, *args):
         self.parent_finalizer = finalizer
         self.proc_num = proc_num
@@ -628,13 +635,16 @@ class AsyncIOProcManager:
             raise TypeError(
                 f"collective_rpc needs an RpcPayload, got {type(payload).__name__}"
             )
-        if func_name == FORWARD_RPC:
-            # The block-table encoder has to see every forward on this channel,
-            # and this path goes around it. The workers' decoder would still
-            # reset its cached rows, failing the next scheduled forward.
+        if func_name in self._RESERVED_RPC_NAMES:
+            # Each would break the protocol this path goes around. The workers'
+            # decoder resets its cached rows on a forward the encoder never saw,
+            # failing the next scheduled one. Exit tears down every worker's
+            # runner and ends its loop, behind a reply that reads as success.
+            # And a KV aggregation drains transfer completions the scheduler
+            # would then never see, stalling the requests waiting on them.
             raise ValueError(
-                f"{self.label}: {FORWARD_RPC!r} is the scheduler's own RPC and "
-                f"cannot go through collective_rpc"
+                f"{self.label}: {func_name!r} is reserved for the engine's own "
+                f"protocol and cannot go through collective_rpc"
             )
 
         logger.debug(
