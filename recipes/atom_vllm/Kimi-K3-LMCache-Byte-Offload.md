@@ -333,22 +333,44 @@ client are unchanged; three things move.
 ```bash
 LMCACHE_DISABLE_BANNER=1 lmcache server \
   --host localhost --port 5555 --chunk-size 1536 \
-  --l1-size-gb 192 --eviction-policy LRU \
+  --l1-size-gb 720 --l1-init-size-gb 600 --l1-align-bytes 16384 \
+  --eviction-policy LRU \
+  --max-gpu-workers 8 --max-cpu-workers 8 \
   --http-host 127.0.0.1 --http-port 8080 --prometheus-port 9000
 # wait for http://127.0.0.1:8080/healthcheck to answer before starting vLLM
 ```
 
+Four of those flags are sized rather than copied:
+
+* `--max-gpu-workers` / `--max-cpu-workers` must be **TP**, not the default 1.
+  One worker thread per pool serialises every STORE/RETRIEVE (GPU pool) and
+  every LOOKUP (CPU pool) across all eight ranks.
+* `--l1-init-size-gb` pre-reserves the pinned pool at startup instead of growing
+  it during the run. Size it to the tier's steady-state footprint, which the
+  `/status` endpoint reports as `memory_used_bytes` once the run has plateaued
+  (234 GB on the arm below); the 600 here is what was measured and is larger
+  than needed.
+* `--l1-align-bytes 16384` aligns tier objects to the DMA granularity.
+
 `--chunk-size` must equal the effective KV block (1536 on K3), exactly as
 `LMCACHE_CHUNK_SIZE` did. `--l1-size-gb` is the **whole** tier, not a per-rank
-share: the in-process `LMCACHE_MAX_LOCAL_CPU_SIZE=24` at TP8 is the same
-capacity as `--l1-size-gb 192`.
+share: an in-process `LMCACHE_MAX_LOCAL_CPU_SIZE=N` at TP8 is the same capacity
+as `--l1-size-gb 8N`, so the 720 above is the 90 GiB/rank the throughput arms
+use.
 
 **2. Swap the connector.** Replace the `--kv-transfer-config` from the Server
 section with:
 
 ```
---kv-transfer-config '{"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"lmcache.mp.host":"tcp://localhost","lmcache.mp.port":5555}}'
+--kv-transfer-config '{"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"lmcache.mp.host":"tcp://localhost","lmcache.mp.port":5555,"lmcache.mp.eager_prefetch":true,"lmcache.mp.lazy_offload":true}}'
 ```
+
+Both `lmcache.mp.*` booleans default to **false** and both are load-bearing:
+`eager_prefetch` submits the tier lookup when the request arrives instead of
+waiting for the scheduler to poll for it, and `lazy_offload` moves the store
+submission out of the forward pass. Neither prints an `lmcache.mp.X = ...` line
+at startup — confirm them in the server log's
+`kv_connector_extra_config={...}` echo instead.
 
 **3. Drop the environment that no longer applies.** `LMCACHE_*` are not read in
 MP mode and `OFFLOAD_*` belong to `AtomLMCacheOffloadConnector`. Unset them
@@ -468,6 +490,26 @@ arms' `run.env` rather than assumed equal.
 
 `HBM hit` and `tier share` are both fractions of prompt tokens, computed from
 the server counters as end-minus-start deltas over the measured window.
+
+#### Multiprocess tier
+
+The three arms below were taken together in the same slot on image
+`rocm/atom-dev:vllm-v0.28.0-nightly_20260928-lmcache-v0.10`, so they are
+comparable to each other but not to the table above, which is a different
+image. Client as in *Client*, `--concurrency 16`, 1800 s per arm, seed 530419.
+The MP arm uses the `lmcache server` flags and the two `lmcache.mp.*` booleans
+from *Multiprocess tier* above.
+
+| arm | tok/s/GPU | req/s | TTFT p50 (ms) | ITL p50 (ms) | HBM hit | tier share | n |
+|---|---|---|---|---|---|---|---|
+| OFF | 66.44 | 1.038 | 626 | 28.16 | 78.4% | 0.00% | 1877 |
+| ON in-process | **87.01** | 1.359 | 651 | 20.54 | 18.6% | 81.5% | 2457 |
+| ON multiprocess | 64.60 | 1.010 | 1127 | 28.47 | 38.3% | 56.3% | 1824 |
+
+The multiprocess tier reaches the in-process tier's total cache coverage but not
+its throughput: its residual cost is TTFT, which stays ~500 ms above OFF because
+a tier lookup is a cross-process round trip. Use the in-process connector unless
+the tier has to be shared across engines.
 
 ### Accuracy
 
