@@ -68,11 +68,11 @@ def qsa_logits_fly_kernel(
 
     @fx.struct
     class LDS:
-        k_tile:fx.Array[fx.BFloat16,BM*HDIMS*K_HEADS,16]
+        k_tile:fx.Array[fx.BFloat16,BN*(HDIMS+8),16]
         row_valid_tag:fx.Array[fx.Int32,BM,16]
         row_vis: fx.Array[fx.Int32, BM, 16]
     lds = fx.SharedAllocator().allocate(LDS).peek()
-    k_tile = lds.k_tile.view(fx.make_layout((BM,HDIMS),(HDIMS,1)))
+    k_tile = lds.k_tile.view(fx.make_layout((BN,HDIMS),(HDIMS+8,1)))
     row_valid_tag = lds.row_valid_tag.view(fx.make_layout(BM,1))
     row_vis = lds.row_vis.view(fx.make_layout(BM, 1))
     logits_ptr = get_buffer_ptr(logits, rows * num_columns)
@@ -180,14 +180,27 @@ def qsa_logits_fly_kernel(
 
     # k lds 切成四块，每次加载一块
     k_tile = fx.flat_divide(k_tile,(16,128))[None,None,None,0] # [64,128]->[16,128,4,1]->[16,128,4]
-    # 每页 [16,128] 做和 Q 相同的 K 维重排（LDS 行跨度 HDIMS）: (16,(4,4),8) = [N_TILE_SIZE, K_TILE_SIZE, inner_k_loops]
-    k_tile_pages0123 = [fx.make_view(fx.get_iter(k_tile[None,None,pageid]),fx.make_layout((16,(4,4),8),(HDIMS,(1,32),4))) for pageid in fx.range_constexpr(4)]
+    # 每页 [16,128] 做和 Q 相同的 K 维重排（LDS 行跨度 HDIMS+8，padding 减少 bank conflict）: (16,(4,4),8) = [N_TILE_SIZE, K_TILE_SIZE, inner_k_loops]
+    k_tile_pages0123 = [fx.make_view(fx.get_iter(k_tile[None,None,pageid]),fx.make_layout((16,(4,4),8),(HDIMS+8,(1,32),4))) for pageid in fx.range_constexpr(4)]
     # 一次只处理一个 page：8 个 fragment 对应这个 page 的 8 个 k 步
     k_frag = [thr_mma.make_fragment_B(k_tile_pages0123[0][None,None,0]) for kk in fx.range_constexpr(MFMA_K_LOOPS)]
 
     copy_k_lds_frag = fx.make_copy_atom(fx.UniversalCopy32b(),fx.BFloat16)
     copy_k = fx.make_tiled_copy_B(copy_k_lds_frag,tiled_mma).get_slice(lane_id)
     k_lds_tile0123 = [copy_k.partition_S(k_tile_pages0123[i]) for i in fx.range_constexpr(4)]
+
+    # K 全局显存 -> 寄存器 -> LDS：线程 t 负责页内第 t//16 个 slot 的第 t%16 段（8 个 bf16 = 16 字节）
+    # partition 必须在运行时循环外做，循环里只用下标选第 physical_page 页 / 第 page_offset 页
+    g2r_atom = fx.make_copy_atom(fx.rocdl.BufferCopy(128),fx.BFloat16)
+    r2s_atom = fx.make_copy_atom(fx.UniversalCopy128b(),fx.BFloat16)
+    k_thr_layout = fx.make_layout((16,16),(16,1))
+    k_val_layout = fx.make_layout((1,8),(8,1))
+    g2r = fx.make_tiled_copy_tv(g2r_atom,k_thr_layout,k_val_layout).get_slice(tid)
+    r2s = fx.make_tiled_copy_tv(r2s_atom,k_thr_layout,k_val_layout).get_slice(tid)
+    kc_pages = fx.make_view(fx.get_iter(kc),fx.make_layout((16,128,num_pages),(128,1,16*128))) # [slot,dim,page]
+    kc_thr = g2r.partition_S(kc_pages)     # 本线程在每一页里负责的 8 个 bf16
+    k_lds_thr = r2s.partition_D(k_tile)    # k_tile: [16,128,4]
+    k_reg = [fx.make_fragment_like(k_lds_thr[None,None,None,0]) for _ in fx.range_constexpr(4)]
 
     # 运行时 for 循环里出现 x.method(...) 时，循环外定义的 x 会被当成循环变量传递，
     # 而 ThrMma / ThrCopy 不能作为循环变量，所以这些调用必须放在循环外
@@ -211,18 +224,9 @@ def qsa_logits_fly_kernel(
             physical_page_valid = ((physical_page >= 0) & (physical_page < num_pages))
             physical_page = physical_page_valid.select(physical_page,0)
             page_ok.append(physical_page_valid & logical_page_valid)
-            k = kc[physical_page,None,0,None] # [16,128]
-            # k -> lds k tile, k_tile[:,:,page_offset]=k
-            copy_atom_global_lds = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(),fx.BFloat16) # 2个bf16
-            # 一个线程每次复制两个bf16，256个线程每次复制512个bf16
-            global_k = fx.make_view(fx.get_iter(k),fx.make_layout(16*128,1))
-            global_k = fx.logical_divide(global_k,fx.make_layout((2,256),(1,2))) # [[2,256],4]
-
-            lds_k = k_tile[None,None,page_offset] #[16,128]
-            lds_k = fx.make_view(fx.get_iter(lds_k),fx.make_layout(16*128,1))
-            lds_k = fx.logical_divide(lds_k,fx.make_layout((2,256),(1,2))) # [[2,256],4]
-            for rest_i in fx.range_constexpr(4):
-                fx.copy_atom_call(copy_atom_global_lds,global_k[None,rest_i][None,tid],lds_k[None,rest_i][None,tid])
+            fx.copy(g2r_atom,src = kc_thr[None,None,None,physical_page],dst = k_reg[page_offset])
+        for page_offset in fx.range_constexpr(4):
+            fx.copy(r2s_atom,src = k_reg[page_offset],dst = k_lds_thr[None,None,None,page_offset])
         # 到这里，一共4个page的k已经搬运完毕
         # MFMA，每个wave一条q frag，要与对应全部四个k tile的MFMA运算
         fx.gpu.barrier()
