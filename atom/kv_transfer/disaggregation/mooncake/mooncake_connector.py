@@ -10,6 +10,8 @@ KV cache data from producer (prefill) to consumer (decode) nodes.
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import logging
 import os
 import re
@@ -69,7 +71,13 @@ from atom.kv_transfer.disaggregation.types import (
 )
 from atom.model_engine.sequence import Sequence
 from atom.models.utils import get_pp_indices
-from atom.utils import envs, get_open_port, make_zmq_path, zmq_socket_ctx
+from atom.utils import (
+    envs,
+    get_open_port,
+    make_zmq_path,
+    make_zmq_socket,
+    zmq_socket_ctx,
+)
 from atom.utils.network import get_ip
 
 logger = logging.getLogger("atom")
@@ -100,6 +108,47 @@ MOONCAKE_DEFAULT_PROTOCOL = "rdma"
 PREFILL_LOOKUP_TIMEOUT = 60
 PREFILL_LOOKUP_POLL_INTERVAL = 0.01
 _IB_SYSFS_ROOT = Path("/sys/class/infiniband")
+
+
+_NOTIFY_BIND_ATTEMPTS = 16
+
+
+def _bind_router_on_open_port(ctx: zmq.Context) -> tuple[zmq.Socket, int]:
+    """Bind a ROUTER socket on a free TCP port now; return it with the port.
+
+    Choosing a port with ``get_open_port()`` and binding it later leaves the
+    port free in between. Under ``--network host`` any outgoing connection on
+    the node can take it as its ephemeral port, and the later bind fails with
+    EADDRINUSE. Binding right after choosing closes that window; the retry
+    covers a port taken in the instant between the probe and the bind.
+    """
+    for _ in range(_NOTIFY_BIND_ATTEMPTS):
+        port = get_open_port()
+        try:
+            sock = make_zmq_socket(
+                ctx, make_zmq_path("tcp", "*", port), zmq.ROUTER, bind=True
+            )
+        except zmq.ZMQError as exc:
+            if exc.errno != errno.EADDRINUSE:
+                raise
+            continue
+        return sock, port
+    raise RuntimeError(
+        f"could not bind a notification listener after {_NOTIFY_BIND_ATTEMPTS} "
+        "attempts: every probed port was taken before it could be bound"
+    )
+
+
+@contextlib.contextmanager
+def _owned_zmq_socket(ctx: zmq.Context, sock: zmq.Socket, linger: int = 0):
+    """Yield an already-bound socket and destroy its context on exit, the way
+    ``zmq_socket_ctx`` does for a socket it creates itself."""
+    try:
+        yield sock
+    except KeyboardInterrupt:
+        logger.debug("Got Keyboard Interrupt.")
+    finally:
+        ctx.destroy(linger=linger)
 
 
 def _swa_ring_ids(seq) -> list[int]:
@@ -816,7 +865,19 @@ class MooncakeConnector(KVConnectorBase):
         self._release_targets: dict[ReqId, tuple[str, int, int]] = {}
         self._release_count: dict[TransferId, int] = {}
         self._released_transfers: set[TransferId] = set()
-        self._notification_port = get_open_port()
+        # The consumer's write-done listener is bound here, not when its thread
+        # starts after model load and KV registration: a port that sits unbound
+        # for minutes gets taken by other traffic on the host network (see
+        # `_bind_router_on_open_port`). Producers never listen on it.
+        self._notification_ctx: zmq.Context | None = None
+        self._notification_sock: zmq.Socket | None = None
+        if self.is_producer:
+            self._notification_port = get_open_port()
+        else:
+            self._notification_ctx = zmq.Context()
+            self._notification_sock, self._notification_port = (
+                _bind_router_on_open_port(self._notification_ctx)
+            )
 
         # --- Completion tracking ---
         self.done_sending: set[str] = set()
@@ -2899,10 +2960,12 @@ class MooncakeConnector(KVConnectorBase):
 
     def _notification_listener(self) -> None:
         """Receive write-done notifications from producers."""
-        path = make_zmq_path("tcp", "*", self._notification_port)
-        logger.info("Mooncake notification listener bound to %s", path)
+        logger.info(
+            "Mooncake notification listener bound to tcp://*:%d",
+            self._notification_port,
+        )
 
-        with zmq_socket_ctx(path, zmq.ROUTER, bind=True) as sock:
+        with _owned_zmq_socket(self._notification_ctx, self._notification_sock) as sock:
             while True:
                 parts = sock.recv_multipart()
                 msg_type = parts[1]
