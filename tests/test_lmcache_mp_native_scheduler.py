@@ -80,7 +80,6 @@ def make_scheduler(
     monkeypatch,
     *,
     capacity=2,
-    budget=60,
     units=30,
     role="offload",
     min_save_tokens=0,
@@ -103,7 +102,6 @@ def make_scheduler(
         kv_transfer_config={
             "kv_role": role,
             "kv_connector_extra_config": {
-                "lmcache.mp.max_pinned_state_bytes": budget,
                 "lmcache.chunk_size": 8,
             },
         },
@@ -196,27 +194,15 @@ def test_save_uses_ready_native_hash_and_never_copies_active_slot(monkeypatch):
     assert request.token_ids == list(seq.token_ids[:16])
     assert request.save_spec.skip_leading_tokens == 0
     assert checkpoints.take_checkpoint_ops() == ((), ())
-    assert scheduler._pinned_state_bytes == 30
     checkpoints.clear_index()
     assert checkpoints.store.pool.num_free == 27
 
     terminal(scheduler, request.save_operation)
     assert checkpoints.store.pool.num_free == 30
-    assert scheduler._pinned_state_bytes == 0
 
 
-def test_budget_smaller_than_one_native_image_is_rejected(monkeypatch):
-    with pytest.raises(ValueError, match="max_pinned_state_bytes"):
-        make_scheduler(monkeypatch, budget=29)
-
-
-@pytest.mark.parametrize(("capacity", "budget"), [(1, 60), (2, 30)])
-def test_save_credit_and_bytes_are_reserved_before_native_pin(
-    monkeypatch, capacity, budget
-):
-    scheduler, checkpoints, _ = make_scheduler(
-        monkeypatch, capacity=capacity, budget=budget
-    )
+def test_save_credit_is_reserved_before_native_pin(monkeypatch):
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch, capacity=1)
     seqs = [sequence(1), sequence(2, token_offset=100)]
     ids = []
     for seq in seqs:
@@ -344,7 +330,6 @@ def test_store_failure_rolls_back_for_bounded_retry_and_ignores_stale_reports(
     [second] = scheduler.build_connector_meta().requests
     assert second.save_operation != first.save_operation
     terminal(scheduler, first.save_operation)
-    assert scheduler._pinned_state_bytes == 30
     assert scheduler._save_inflight["1"] == second.save_operation
     terminal(scheduler, second.save_operation, succeeded=False)
     [third] = scheduler.build_connector_meta().requests
@@ -370,10 +355,8 @@ def test_no_timeout_or_abandon_recycles_dispatched_source(monkeypatch):
     scheduler.abandon_save(request.save_operation)
     assert scheduler.reclaim_stale_leases(1e-9) == []
     assert checkpoints.reclaim_stale_offload_pins(1e-9) == 0
-    assert scheduler._pinned_state_bytes == 30
     assert scheduler.should_defer_free(seq)
     terminal(scheduler, request.save_operation)
-    assert scheduler._pinned_state_bytes == 0
 
 
 def test_page_source_safe_never_releases_the_state_image(monkeypatch):
@@ -405,7 +388,7 @@ def test_page_source_safe_never_releases_the_state_image(monkeypatch):
 def test_a_transfer_that_never_reports_stops_the_engine(monkeypatch, kind):
     """A lost completion or a TP rank that never reports cannot be told from
     a slow DMA, so past the deadline the scheduler fails stop -- holding the
-    lease and budget rather than recycling them."""
+    lease rather than recycling it."""
     now = [1000.0]
     monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
     scheduler, checkpoints, _ = make_scheduler(monkeypatch)
@@ -426,7 +409,6 @@ def test_a_transfer_that_never_reports_stops_the_engine(monkeypatch, kind):
     now[0] += 2
     with pytest.raises(transfer.LMCacheTransferUnprovable):
         scheduler.process_completions(KVConnectorOutput())
-    assert scheduler._pinned_state_bytes == 30
 
 
 def test_a_transfer_that_reports_leaves_the_watchdog(monkeypatch):
@@ -450,7 +432,6 @@ def test_load_queries_safe_chunk_boundary_before_reserving_state(monkeypatch, pr
     seq = sequence(count=prompt, computed=0)
     expected = ((prompt - 1) // 8) * 8
     assert scheduler.get_num_new_matched_tokens(seq) == (expected, expected > 0)
-    assert scheduler._pinned_state_bytes == 0
     if expected == 0:
         assert adapter.queries == []
         return
@@ -461,7 +442,6 @@ def test_load_queries_safe_chunk_boundary_before_reserving_state(monkeypatch, pr
     assert scheduler.should_park_for_load_after_alloc(seq)
     operation = seq._load_operation
     assert isinstance(operation, LoadOperationId)
-    assert scheduler._pinned_state_bytes == 30
     assert checkpoints.store.pool.num_free == 27
     [request] = scheduler.build_connector_meta().requests
     assert request.load_operation == operation
@@ -474,9 +454,7 @@ def test_load_queries_safe_chunk_boundary_before_reserving_state(monkeypatch, pr
         scheduler.load_finished(LoadOperationId(seq.id, operation.generation + 1))
         is False
     )
-    assert scheduler._pinned_state_bytes == 30
     assert scheduler.load_finished(operation) is True
-    assert scheduler._pinned_state_bytes == 0
     # The completed transfer is now a reusable, unpinned READY checkpoint.
     assert checkpoints.store.pool.num_free == 27
     assert checkpoints.contains(request.native_state.prefix_hash)
@@ -497,7 +475,6 @@ def test_aligned_hbm_hit_uses_incremental_native_restore(monkeypatch):
     assert request.load_spec.lmcache_cached_tokens == 16
     assert request.token_ids == list(seq.token_ids[:16])
     assert seq.offload_load_start_tokens == 8
-    assert scheduler._pinned_state_bytes == 30
     assert checkpoints.store.pool.num_free == 27
 
 
@@ -571,7 +548,6 @@ def test_load_capacity_failure_never_parks_or_claims_missing_state(monkeypatch):
     assert scheduler.should_park_for_load_after_alloc(seq) is False
     assert seq.offload_loaded_tokens == 0
     assert scheduler._native_loads == {}
-    assert scheduler._pinned_state_bytes == 0
     assert checkpoints.store.pool.num_free == 2
 
 
@@ -593,7 +569,7 @@ def test_session_outlives_a_save_emitted_after_request_finished(monkeypatch):
     assert adapter.ended == [f"atom-offload-dp0:{seq.id}"]
 
 
-def test_save_admission_returns_lease_and_budget_when_it_raises(monkeypatch):
+def test_save_admission_returns_lease_when_it_raises(monkeypatch):
     from atom.kv_transfer.offload.chunked_scheduler import (
         ChunkedOffloadSchedulerBase,
     )
@@ -609,12 +585,11 @@ def test_save_admission_returns_lease_and_budget_when_it_raises(monkeypatch):
     monkeypatch.setattr(ChunkedOffloadSchedulerBase, "_build_save_request", boom)
     with pytest.raises(RuntimeError, match="request construction failed"):
         scheduler.build_connector_meta()
-    assert scheduler._pinned_state_bytes == 0
     assert scheduler._native_saves == {}
     assert checkpoints.store._offload_pins == {}
 
 
-def test_load_admission_returns_units_and_budget_when_it_raises(monkeypatch):
+def test_load_admission_returns_units_when_it_raises(monkeypatch):
     scheduler, checkpoints, _ = make_scheduler(monkeypatch)
     free_before = checkpoints.store.pool.num_free
     seq = sequence(computed=0)
@@ -627,7 +602,6 @@ def test_load_admission_returns_units_and_budget_when_it_raises(monkeypatch):
     scheduler.update_state_after_alloc(seq)
     with pytest.raises(AssertionError, match="two queued restores"):
         scheduler.should_park_for_load_after_alloc(seq)
-    assert scheduler._pinned_state_bytes == 0
     assert scheduler._native_loads == {}
     assert checkpoints.store.pool.num_free == free_before
 
@@ -643,11 +617,9 @@ def test_load_failure_and_cancellation_wait_for_exact_terminal_report(monkeypatc
     scheduler.request_finished(seq)
     assert scheduler.should_defer_free(seq)
     assert scheduler.has_pending_work()
-    assert scheduler._pinned_state_bytes == 30
     assert adapter.ended == []
     assert scheduler.load_failed(request.load_operation)
     assert checkpoints.store.pool.num_free == 30
-    assert scheduler._pinned_state_bytes == 0
     assert adapter.ended == [f"atom-offload-dp0:{seq.id}"]
     assert not scheduler.should_defer_free(seq)
 
@@ -660,25 +632,33 @@ def test_cancel_before_dispatch_releases_reserved_load_units(monkeypatch):
     assert scheduler.should_park_for_load_after_alloc(seq)
     scheduler.cancel_pending_load(seq)
     assert scheduler._native_loads == {}
-    assert scheduler._pinned_state_bytes == 0
     assert checkpoints.store.pool.num_free == 30
     assert scheduler.build_connector_meta().requests == []
 
 
-def test_load_and_save_share_the_native_byte_budget(monkeypatch):
-    scheduler, checkpoints, _ = make_scheduler(monkeypatch, budget=30)
+def test_loads_are_not_limited_by_the_save_limit(monkeypatch):
+    """A restore is admitted while the save limit is full and beside other loads.
+
+    Refusing it would recompute a prefix the tier holds. One load per request
+    bounds loads by the admitted batch, and the PAGE pool itself refuses an
+    image it has no room for (see the capacity-failure test above).
+    """
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch, capacity=1)
     saving = sequence(1)
     checkpoint(scheduler, checkpoints, saving, 16)
     scheduler.update_state_after_alloc(saving)
     [request] = scheduler.build_connector_meta().requests
-    loading = sequence(2, computed=0, token_offset=100)
-    scheduler.get_num_new_matched_tokens(loading)
-    scheduler.update_state_after_alloc(loading)
-    assert scheduler.should_park_for_load_after_alloc(loading) is False
-    assert scheduler._pinned_state_bytes == 30
-    assert scheduler._native_loads == {}
+    loading = [
+        sequence(2 + i, computed=0, token_offset=100 * (i + 1)) for i in range(3)
+    ]
+    for seq in loading:
+        scheduler.get_num_new_matched_tokens(seq)
+        scheduler.update_state_after_alloc(seq)
+        assert scheduler.should_park_for_load_after_alloc(seq) is True
+    assert len(scheduler._native_loads) == 3
+    # Three 3-unit images reserved beside the save's pinned source.
+    assert checkpoints.store.pool.num_free == 30 - 3 - 3 * 3
     terminal(scheduler, request.save_operation)
-    assert scheduler._pinned_state_bytes == 0
 
 
 def engine_scheduler(monkeypatch):
@@ -699,7 +679,6 @@ def engine_scheduler(monkeypatch):
             "kv_connector": "lmcache_mp",
             "kv_role": "offload",
             "kv_connector_extra_config": {
-                "lmcache.mp.max_pinned_state_bytes": 60,
                 "lmcache.chunk_size": 8,
             },
         },
@@ -741,7 +720,6 @@ def test_engine_allocates_then_parks_and_wakes_at_exact_native_boundary(monkeypa
     block_table = list(seq.block_table)
     state_slot = seq.state_slot
     assert engine.block_manager.kv.num_free == 31
-    assert connector._pinned_state_bytes == 30
 
     batch, scheduled = engine.schedule()
     assert scheduled == {} and batch.connector_meta_output.requests == []
@@ -753,12 +731,10 @@ def test_engine_allocates_then_parks_and_wakes_at_exact_native_boundary(monkeypa
         )
     )
     assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
-    assert connector._pinned_state_bytes == 30
 
     engine._update_from_kv_xfer_finished(
         KVConnectorOutput(finished_loading={request.load_operation})
     )
-    assert connector._pinned_state_bytes == 0
     # The three transfer units remain as an unpinned READY checkpoint.
     assert engine.block_manager.kv.num_free == 31
     assert engine.block_manager.paged_state_checkpoints.contains(
@@ -790,13 +766,11 @@ def test_engine_aborted_load_keeps_page_units_and_slot_until_terminal(
     assert list(seq.block_table) == block_table
     assert seq.state_slot == state_slot
     assert engine.block_manager.kv.num_free == 31
-    assert connector._pinned_state_bytes == 30
 
     kwargs = {
         "finished_loading" if succeeded else "failed_loading": {request.load_operation}
     }
     engine._update_from_kv_xfer_finished(KVConnectorOutput(**kwargs))
-    assert connector._pinned_state_bytes == 0
     assert seq.id not in engine.deferred_free_blocks
     assert list(seq.block_table) == []
     assert seq.state_slot == -1
@@ -821,7 +795,6 @@ def test_engine_failed_native_load_recomputes_from_zero_without_reallocation(
     engine._update_from_kv_xfer_finished(
         KVConnectorOutput(failed_loading={request.load_operation})
     )
-    assert connector._pinned_state_bytes == 0
     assert connector._save_tracker[str(seq.id)][1] == 0
     batch, scheduled = engine.schedule()
     assert scheduled[seq.id] is seq
