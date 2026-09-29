@@ -301,6 +301,29 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             shared_expert_prefix=f"{prefix}.shared_expert",
         )
         install_stacked_expert_loaders(self.experts)
+        self._single_token_ok: bool | None = None
+
+    def _single_token_supported(self) -> bool:
+        """Whether `moe_decode_single_token` can read these experts.
+
+        It indexes global expert ids into the local weights, hard-codes a
+        320-wide intermediate, and reads FP8 weights with per-channel scales.
+        """
+        if self._single_token_ok is None:
+            ex = self.experts
+            s13 = getattr(ex, "w13_weight_scale", None)
+            s2 = getattr(ex, "w2_weight_scale", None)
+            n, two_inter = ex.w13_weight.shape[:2]
+            self._single_token_ok = (
+                ex.expert_map is None
+                and s13 is not None
+                and s2 is not None
+                and ex.w13_weight.dtype == dtypes.fp8
+                and ex.w2_weight.shape[-1] == 320
+                and s13.numel() == n * two_inter
+                and s2.numel() == n * ex.w2_weight.shape[1]
+            )
+        return self._single_token_ok
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
@@ -308,7 +331,7 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
         logits = self.gate(hidden_states)
         if self.fuse_shared:
             # The tail logit is the shared expert's sigmoid gate.
-            if hidden_states.shape[0] == 1:
+            if hidden_states.shape[0] == 1 and self._single_token_supported():
                 out = self._single_token_experts(hidden_states, logits)
             else:
                 out = self.experts(hidden_states=hidden_states, router_logits=logits)
