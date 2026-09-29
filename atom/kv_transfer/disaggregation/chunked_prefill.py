@@ -18,13 +18,16 @@ from typing import Any
 
 @dataclass(frozen=True)
 class PrefillHandoff:
-    req_id: str | int
-    first_token_id: int
-    draft_token_ids: tuple[int, ...] = ()
-    prefix_cache_hit_tokens: int = 0
+    """Generation state passed from P to D after prefill; KV travels via RDMA."""
+
+    req_id: str | int  # D-local request ID for receive completion.
+    first_token_id: int  # First output token sampled by P.
+    draft_token_ids: tuple[int, ...] = ()  # Drafts for D to verify.
+    prefix_cache_hit_tokens: int = 0  # P-side prefix hits for metrics.
 
     @classmethod
     def from_wire(cls, req_id, data):
+        """Validate the wire handoff and attach D's local request ID."""
         if not isinstance(data, dict):
             raise ValueError("missing prefill handoff")
         first = data.get("first_token_id")
@@ -42,6 +45,13 @@ class PrefillHandoff:
 
 
 class ChunkedPrefill:
+    """Track chunk publication and source lifetime for one prefill on a P worker.
+
+    The full block table stays fixed; each consumer advances its own cursor.
+    A condition variable coordinates chunk/handoff waits and reader exit.
+    Callers handle GPU synchronization and RDMA.
+    """
+
     def __init__(
         self,
         req_id,
@@ -66,17 +76,18 @@ class ChunkedPrefill:
         self.swa_block_ids = list(swa_block_ids)
         self.timeout = timeout
         self.cv = threading.Condition()
-        self.num_ready_blocks = 0
+        self.num_ready_blocks = 0  # Published prefix blocks; reads must wait on event.
         self.event: Any = None
         self.handoff: dict | None = None
         self.cancelled = False
-        self.readers = 0
-        self.expected_readers = 0
-        self.completed_readers = 0
-        self.claims: set[tuple] = set()
+        self.readers = 0  # Claimed send tasks still active or queued.
+        self.expected_readers = 0  # Total consumers served by this P rank.
+        self.completed_readers = 0  # Exited send tasks, including failures.
+        self.claims: set[tuple] = set()  # Retain identities to deduplicate sends.
         self.updated = time.monotonic()
 
     def publish(self, end_tokens, event):
+        """Publish a forward boundary and event; only the final block may be partial."""
         with self.cv:
             if self.cancelled:
                 return
@@ -94,6 +105,7 @@ class ChunkedPrefill:
             self.cv.notify_all()
 
     def finish(self, handoff, *, slot_index=None, swa_block_ids=None):
+        """Publish final sampling and slot/SWA state; RDMA may still be in flight."""
         with self.cv:
             if not self.cancelled:
                 if slot_index is not None:
@@ -107,6 +119,7 @@ class ChunkedPrefill:
             self.cv.notify_all()
 
     def cancel(self):
+        """Cancel waits and new claims; in-flight RDMA must still drain."""
         with self.cv:
             self.cancelled = True
             self.cv.notify_all()
@@ -135,12 +148,14 @@ class ChunkedPrefill:
             return True
 
     def release(self):
+        """Release a reader when its send task exits, on success or failure."""
         with self.cv:
             self.readers -= 1
             self.completed_readers += 1
             self.cv.notify_all()
 
     def source_safe(self):
+        """Apply the terminal timeout and check source safety without freeing blocks."""
         with self.cv:
             # A missing consumer must not pin HBM indefinitely. Active RDMA
             # readers always drain before reclamation, even after a timeout.
@@ -192,6 +207,7 @@ class ChunkedPrefill:
             )
 
     def wait_handoff(self):
+        """Wait for the final handoff, raising on cancellation or timeout."""
         with self.cv:
             ready = self.cv.wait_for(
                 lambda: self.cancelled or self.handoff is not None,
