@@ -742,9 +742,9 @@ def test_mp_lookup_pending_cleanup_drops_adapter_bookkeeping(monkeypatch):
     assert client.hit_tokens("req") is None
 
 
-def _full_prompt_hit_scheduler(monkeypatch, chunk_size):
+def _full_prompt_hit_scheduler(monkeypatch, chunk_size, hit=8):
     monkeypatch.setattr(transfer.time, "sleep", lambda _seconds: None)
-    adapter = _LookupAdapter([8])
+    adapter = _LookupAdapter([hit])
     lookup = mp_lookup._MPLookupClient(
         adapter,
         config=_config(),
@@ -791,6 +791,31 @@ def test_full_prompt_hit_loads_to_the_chunk_boundary_below_the_last_token(monkey
 
     assert scheduler.load_finished(request.load_operation) is True
     assert lookup.hit_tokens("7") is None
+
+
+def test_dispatched_load_names_its_start_so_the_loaded_prefix_is_published(
+    monkeypatch,
+):
+    # The scheduler publishes a loaded PAGE prefix into the GPU index only when
+    # the load names where it starts. The start is the post-allocate HBM
+    # frontier: 4 tokens resident, 12 hit, so the load covers [4, 12).
+    scheduler, _ = _full_prompt_hit_scheduler(monkeypatch, chunk_size=4, hit=12)
+    seq = SimpleNamespace(
+        id=9,
+        num_prompt_tokens=16,
+        num_cached_tokens=0,
+        token_ids=list(range(16)),
+        block_table=[10, 11, 12, 13],
+    )
+
+    assert scheduler.get_num_new_matched_tokens(seq) == (12, True)
+    seq.num_cached_tokens = 4
+    scheduler.update_state_after_alloc(seq)
+    request = scheduler.build_connector_meta().requests[0]
+
+    assert request.load_spec.hbm_cached_tokens == 4
+    assert seq.offload_load_start_tokens == 4
+    assert seq.offload_loaded_tokens == 12
 
 
 def test_full_prompt_hit_of_exactly_one_chunk_asks_for_no_load_at_all(monkeypatch):
