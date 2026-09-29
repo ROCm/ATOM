@@ -121,6 +121,66 @@ free memory. (If you do bind, verify it took with `bind:0` in
 `/proc/<worker>/numa_maps`, not `Mems_allowed_list` — `--cpuset-mems` on
 rootless podman is silently ineffective.)
 
+## Multiprocess tier (alternative to the in-process connector)
+
+Everything above pins the CPU tier inside each TP worker through
+`AtomLMCacheOffloadConnector`. LMCache can instead hold the tier in a separate
+process that every worker reaches over ZMQ. The model, the quantisation and the
+client are unchanged; three things move.
+
+**1. Start the tier before the server.**
+
+```bash
+LMCACHE_DISABLE_BANNER=1 lmcache server \
+  --host localhost --port 5555 --chunk-size 64 \
+  --l1-size-gb 224 --eviction-policy LRU \
+  --http-host 127.0.0.1 --http-port 8080 --prometheus-port 9000
+# wait for http://127.0.0.1:8080/healthcheck to answer before starting vLLM
+```
+
+`--chunk-size` must equal `--block-size` (64 on GLM-5.3), exactly as
+`LMCACHE_CHUNK_SIZE` did. `--l1-size-gb` is the **whole** tier, not a per-rank
+share: the in-process `LMCACHE_MAX_LOCAL_CPU_SIZE=56` at TP4 is the same
+capacity as `--l1-size-gb 224`.
+
+**2. Swap the connector.** Replace the `--kv-transfer-config` from the Server
+section with:
+
+```
+--kv-transfer-config '{"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"lmcache.mp.host":"tcp://localhost","lmcache.mp.port":5555}}'
+```
+
+**3. Drop the environment that no longer applies.** `LMCACHE_*` are not read in
+MP mode and `OFFLOAD_*` belong to `AtomLMCacheOffloadConnector`. Unset them
+rather than leaving them set, where they read as load-bearing but are not.
+
+### Verifying an MP run
+
+The `Stored`/`Retrieved` counters in the worker log are **structurally zero**
+here -- the worker never touches the tier -- so those checks do not transfer.
+Use instead:
+
+```bash
+curl -s http://127.0.0.1:8080/status | python3 -m json.tool
+```
+
+* `storage_manager.l1_manager.total_object_count` and `memory_used_bytes` rising
+  across a run is the tier taking writes.
+* `memory_total_bytes` is **not** the capacity -- the pinned pool is grown on
+  demand, so it climbs toward the ceiling during warmup. The ceiling is
+  `memory_configured_bytes`.
+* `storage_manager.l1_eviction_controller.trigger_watermark` (0.8) is the
+  fraction of `memory_configured_bytes` at which LRU starts evicting.
+
+Server-side hit accounting still comes from vLLM:
+
+```bash
+curl -s http://127.0.0.1:8330/metrics | grep -E '^vllm:external_prefix_cache_(hits|queries)_total'
+```
+
+Note that this arm does **not** exercise the staging fence or the lookup memo,
+both of which live in `AtomLMCacheOffloadConnector`.
+
 ## Client
 
 ```bash
