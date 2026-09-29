@@ -5144,7 +5144,15 @@ class FusedMoE(torch.nn.Module):
         A complete output already contains the shared expert and TP reduction.
         """
         backend = self._comm_fused_moe
-        if backend is not None and backend.supports(hidden_states.shape[0]):
+        custom_routing_supported = (
+            getattr(self, "custom_routing_function", None) is None
+            or getattr(backend, "supports_custom_routing", True)
+        )
+        if (
+            backend is not None
+            and custom_routing_supported
+            and backend.supports(hidden_states.shape[0])
+        ):
             return (
                 backend.forward(
                     self,
