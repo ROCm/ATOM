@@ -12,7 +12,7 @@ use tracing::{debug, trace};
 /// This implementation provides:
 /// - Smooth rate limiting with configurable refill rate
 /// - Burst capacity handling
-/// - Fair queuing for waiting requests via Notify
+/// - Event-driven waiting; FIFO ordering is owned by the admission queue
 /// - Sync token return for Drop handlers (via `return_tokens_sync`)
 ///
 /// Uses `parking_lot::Mutex` for sync-compatible locking (no async required).
@@ -93,54 +93,33 @@ impl TokenBucket {
     /// When `refill_rate=0`, waits indefinitely for tokens to be returned via `return_tokens()`.
     /// Use `acquire_timeout()` to set an appropriate timeout.
     pub async fn acquire(&self, tokens: f64) -> Result<(), tokio::time::error::Elapsed> {
-        if self.try_acquire(tokens).await.is_ok() {
-            return Ok(());
-        }
-
-        // When refill_rate=0 (pure concurrency limiting), tokens only come back
-        // via return_tokens(), so we wait on notify signal only.
-        if self.refill_rate == 0.0 {
-            debug!(
-                "Token bucket: waiting indefinitely for {} tokens (refill_rate=0)",
-                tokens
-            );
-
-            loop {
-                // Wait for notify signal from return_tokens()
-                self.notify.notified().await;
-
-                if self.try_acquire(tokens).await.is_ok() {
-                    return Ok(());
-                }
+        loop {
+            // Register before inspecting the bucket: notify_waiters does not
+            // retain a notification for a future created after token return.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.try_acquire_sync(tokens).is_ok() {
+                return Ok(());
+            }
+            let delay = if self.refill_rate > 0.0 {
+                let inner = self.inner.lock();
+                Some(Duration::from_secs_f64(
+                    ((tokens - inner.tokens) / self.refill_rate).max(0.001),
+                ))
+            } else {
+                None
+            };
+            tokio::select! {
+                _ = notified => {},
+                _ = async {
+                    match delay {
+                        Some(delay) => tokio::time::sleep(delay).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {},
             }
         }
-
-        let wait_time = {
-            let inner = self.inner.lock();
-            let tokens_needed = tokens - inner.tokens;
-            let wait_secs = (tokens_needed / self.refill_rate).max(0.0);
-            Duration::from_secs_f64(wait_secs)
-        };
-
-        debug!(
-            "Token bucket: waiting {:?} for {} tokens",
-            wait_time, tokens
-        );
-
-        tokio::time::timeout(wait_time, async {
-            loop {
-                if self.try_acquire(tokens).await.is_ok() {
-                    return;
-                }
-                tokio::select! {
-                    _ = self.notify.notified() => {},
-                    _ = tokio::time::sleep(Duration::from_millis(10)) => {},
-                }
-            }
-        })
-        .await?;
-
-        Ok(())
     }
 
     /// Acquire tokens with custom timeout.
@@ -191,6 +170,20 @@ impl TokenBucket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn refill_waiters_keep_waiting_until_their_external_deadline() {
+        let bucket = TokenBucket::new(1, 20);
+        bucket.try_acquire(1.0).await.unwrap();
+        // Several waiters need several refill intervals. Losing one wakeup race
+        // must not create an implicit timeout shorter than the caller's deadline.
+        let results = futures_util::future::join_all(
+            (0..4).map(|_| bucket.acquire_timeout(1.0, Duration::from_secs(2))),
+        )
+        .await;
+        assert!(results.iter().all(Result::is_ok));
+        assert!(bucket.available_tokens().await < 1.0);
+    }
 
     #[tokio::test]
     async fn test_token_bucket_basic() {

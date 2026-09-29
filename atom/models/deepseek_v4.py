@@ -837,9 +837,9 @@ def _wo_a_block_scale_to_e8m0(
     """
     s = scale.detach()
     if s.element_size() == 1:
-        # ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE allocates weight_scale as
-        # dtypes.fp8_e8m0, which aiter resolves to torch.uint8 when the torch
-        # build has no float8_e8m0fnu. Those bytes are already biased
+        # E8M0 block scales (QuantizationConfig.blockscale_e8m0_scale) allocate
+        # weight_scale as dtypes.fp8_e8m0, which aiter resolves to torch.uint8
+        # when the torch build has no float8_e8m0fnu. Those bytes are already biased
         # exponents, so the float path would read 127 as a magnitude and
         # return 134; a native float8_e8m0fnu byte is the same exponent.
         e = s.view(torch.uint8)

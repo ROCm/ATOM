@@ -32,8 +32,8 @@ def _rotate_head(query, token, slot, position, cos, sin, HEADS, D, ROPE):
     """One query head's RoPE tail, in place. GPT-J pairs, as V4 rotates."""
     half: tl.constexpr = ROPE // 2
     pair = tl.arange(0, half)
-    cosine = tl.load(cos + position * half + pair)
-    sine = tl.load(sin + position * half + pair)
+    cosine = tl.load(cos + position * half + pair).to(tl.float32)
+    sine = tl.load(sin + position * half + pair).to(tl.float32)
     head = query + (token * HEADS + slot) * D + (D - ROPE)
     tail = tl.arange(0, ROPE)
     even, odd = tl.split(tl.reshape(tl.load(head + tail).to(tl.float32), (half, 2)))
@@ -57,8 +57,10 @@ def _quantized_kv_row(kv, token, position, cos, sin, kv_stride, D, ROPE):
     phase = tl.arange(0, D // 2) - (D - ROPE) // 2
     # A NoPE pair reads no table entry, and `other=` leaves it alone: cos 1
     # with sin 0 is the identity rotation.
-    cosine = tl.load(cos + position * half + phase, phase >= 0, other=1.0)
-    sine = tl.load(sin + position * half + phase, phase >= 0, other=0.0)
+    cosine = tl.load(cos + position * half + phase, phase >= 0, other=1.0).to(
+        tl.float32
+    )
+    sine = tl.load(sin + position * half + phase, phase >= 0, other=0.0).to(tl.float32)
     # Back through the activation dtype first: the kernels this replaces each
     # returned BF16, so the amax has to see the rounded row.
     groups = (

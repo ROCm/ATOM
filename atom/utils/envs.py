@@ -123,7 +123,7 @@ def _finite_float_env(name: str, default: float, *, allow_zero: bool) -> float:
 environment_variables: dict[str, Callable[[], Any]] = {
     # Forward metadata transport: direct or packed. Both keep source checks.
     # Single-member groups and strided bindings retain direct copies.
-    "ATOM_H2D_BACKEND": lambda: os.getenv("ATOM_H2D_BACKEND", "direct"),
+    "ATOM_H2D_BACKEND": lambda: os.getenv("ATOM_H2D_BACKEND", "packed"),
     # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
     "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
@@ -189,10 +189,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
         os.getenv("ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE", "0") == "1"
     ),
-    # per_1x128 FP8 linears whose (N, K) aiter has 1x32 MXFP8 GEMM configs for take
-    # e8m0 1x32 scales in aiter's shuffled layout (needs the two flags around it).
+    # Opt in eligible per_1x128 FP8 linears to shuffled 1x32 E8M0 scales.
+    # Requires E8M0 block scales and preshuffled weights.
     "ATOM_FP8_MXSCALE_USE_E8M0_SCALE_SHUFFLE": lambda: (
         os.getenv("ATOM_FP8_MXSCALE_USE_E8M0_SCALE_SHUFFLE", "0") == "1"
+    ),
+    "ATOM_GROUP32_WEIGHT_PRESHUFFLE": lambda: (
+        os.getenv("ATOM_GROUP32_WEIGHT_PRESHUFFLE", "1") == "1"
     ),
     "ATOM_USE_TRITON_MXFP4_BMM": lambda: (
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
@@ -364,6 +367,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
+    # Fused per-layer decode of up to 16 tokens (MiniMax-M3 so far:
+    # atom/models/minimax_m3/mono), on by default. Only a configuration the mono
+    # path supports is ever routed to it; every other batch keeps the original
+    # model. 0 disables it.
+    "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",
+    # Debug: run each mono layer next to the original one and log the difference
+    # (atom/models/minimax_m3/mono/check.py). Use with --enforce-eager.
+    "ATOM_MONO_CHECK": lambda: os.getenv("ATOM_MONO_CHECK", "0") == "1",
+    # Debug: append every mono step's input tokens, positions and top-2 logits to
+    # this file (rank 0; check.trace_logits). Use with --enforce-eager.
+    "ATOM_MONO_TRACE": lambda: os.getenv("ATOM_MONO_TRACE"),
+    # Debug: the mono layer kernels' per-phase stamps, a few steps per decode
+    # token count saved under this path prefix (mono/timeline.py). Use with
+    # --enforce-eager.
+    "ATOM_MONO_TIMELINE": lambda: os.getenv("ATOM_MONO_TIMELINE"),
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
     # the scorer that first reads it; 2 the indexer as well, on one of its own.
@@ -693,6 +711,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --- Atomesh ---
     # Build atomesh when installing ATOM from source.
     "ATOM_MESH_BUILD": lambda: os.getenv("ATOM_MESH_BUILD", "0") == "1",
+    # Optional Cargo features for the Atomesh package build (e.g. "ext-proc").
+    "ATOM_MESH_FEATURES": lambda: os.getenv("ATOM_MESH_FEATURES", "").strip(),
     # Route the OpenAI-compatible server entrypoint through Atomesh.
     "USE_ATOMESH_ENTRYPOINTS": lambda: (
         os.getenv("USE_ATOMESH_ENTRYPOINTS", "0") == "1"

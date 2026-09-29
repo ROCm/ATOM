@@ -38,6 +38,7 @@ pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
     pub rate_limiter: Option<Arc<TokenBucket>>,
+    pub admission: Arc<crate::core::admission::AdmissionController>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
@@ -234,7 +235,12 @@ impl AppContextBuilder {
             router_config.clone(),
         ));
 
+        let admission = Arc::new(crate::core::admission::AdmissionController::new(
+            &router_config,
+            self.rate_limiter.clone(),
+        ));
         Ok(AppContext {
+            admission,
             client: self.client.ok_or(AppContextBuildError("client"))?,
             router_config,
             rate_limiter: self.rate_limiter,

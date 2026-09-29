@@ -411,6 +411,24 @@ class QuantizationConfig:
                 '\'{"global_quant_config": "mxfp4"}\'.'
             )
 
+    @property
+    def blockscale_e8m0_scale(self) -> bool:
+        """Whether 128x128 FP8 block scales (weight and activation) are E8M0.
+
+        ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE decides when set. Otherwise E8M0 on
+        every arch but gfx942, and only for a checkpoint whose scales are
+        declared ``scale_fmt: ue8m0`` (DeepSeek-V4): those are powers of two, so
+        E8M0 restates them exactly, while an FP32 scale loaded into an E8M0
+        parameter would be rounded, altering the weight.
+        """
+        if envs.is_set("ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE"):
+            return envs.ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE
+        if (self.hf_quant_config or {}).get("scale_fmt") != "ue8m0":
+            return False
+        from aiter.jit.utils.chip_info import get_gfx
+
+        return get_gfx() != "gfx942"
+
     # -- typed API (preferred) ----------------------------------------------
 
     @property
@@ -1848,7 +1866,7 @@ def indexer_cp_unsupported_reason(
     if not any("MiniMaxM3" in str(a) for a in arches):
         return "not a MiniMax-M3 model"
     if plugin_mode:
-        # The vLLM/SGLang bridges run ATOM's own linear.py and minimax_m3.py, so
+        # The vLLM/SGLang bridges run ATOM's own linear.py and minimax_m3/model.py, so
         # the flag would widen index_q underneath them -- and both reshape it
         # with a ``view`` on the width they assume, yielding 4x the rows with no
         # error. ``indexer_cp_enabled`` refuses them at runtime; this clears the
@@ -2608,7 +2626,7 @@ class Config:
         factors.append(self.prefill_context_parallel_size)
         # MiniMax-M3 indexer-only CP changes the FUSED QKV OUTPUT WIDTH: index_q
         # is this rank's one head under TP and all `sparse_num_index_heads` of
-        # them under CP (minimax_m3.py, linear.py), so the traced graph and the
+        # them under CP (minimax_m3/model.py, linear.py), so the traced graph and the
         # captured buffer strides differ. Exactly the pcp hazard above -- two
         # runs of the same model and source otherwise hash identically, so
         # starting one mode after the other would load the opposite mode's
