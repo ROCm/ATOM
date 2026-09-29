@@ -1046,6 +1046,41 @@ def _worker(adapter: _WorkerAdapter) -> mp_worker.LMCacheMPConnector:
     return worker
 
 
+def test_close_unregisters_the_worker_once(monkeypatch):
+    """`ModelRunner.exit` closes the connector before the KV pool is freed.
+
+    The adapter's shutdown is what unregisters the pool from the MP server;
+    skipping it leaves the server holding the pool's GPU memory until its
+    reaper fires, which a restarted engine on the same GPUs cannot survive.
+    """
+    adapter = _WorkerAdapter()
+    worker = _worker(adapter)
+    worker.close()
+    assert adapter.shutdown_called
+    assert worker._adapter is None
+    adapter.shutdown_called = False
+    worker.close()
+    assert not adapter.shutdown_called
+
+    class Failing(_WorkerAdapter):
+        def shutdown(self):
+            raise RuntimeError("server gone")
+
+    _worker(Failing()).close()  # teardown must not raise
+
+
+def test_shell_forwards_close_and_tolerates_an_unregistered_worker():
+    from atom.kv_transfer.offload.mp.connector import LMCacheMPConnector
+
+    shell = LMCacheMPConnector.__new__(LMCacheMPConnector)
+    shell._impl = None
+    shell.close()
+    adapter = _WorkerAdapter()
+    shell._impl = _worker(adapter)
+    shell.close()
+    assert adapter.shutdown_called
+
+
 def _finish_load(
     worker: mp_worker.LMCacheMPConnector,
     operation_id: str,
