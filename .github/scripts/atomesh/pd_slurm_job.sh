@@ -243,13 +243,20 @@ EOF
     --user "$(id -u):$(id -g)"
     --network host --ipc host
     --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband
-    # Note that --cap-add buys this container nothing: it is started with
-    # --user, and on the uid change the kernel clears the permitted and
+    # --cap-add grants this container no effective capability: it is started
+    # with --user, and on the uid change the kernel clears the permitted and
     # effective sets, leaving the capability in the bounding set only. Measured
     # on this docker: --user 1000:1000 --cap-add=SYS_NICE gives CapPrm=CapEff=
-    # CapAmb=0. --privileged behaves identically. Anything here that needs a
-    # real capability has to come from somewhere other than this list.
-    --cap-add=IPC_LOCK --cap-add=NET_ADMIN
+    # CapAmb=0, and --privileged behaves identically.
+    #
+    # SYS_NICE is still required, for a different layer. Docker builds the
+    # seccomp filter from the container's requested capabilities, and the
+    # default profile admits mbind/set_mempolicy/migrate_pages only when
+    # CAP_SYS_NICE was requested. Without it those calls are rejected by
+    # seccomp before the kernel ever checks credentials -- which is what blocks
+    # LMCache's NUMA placement. Binding one's own pages needs no capability, so
+    # the empty effective set above does not stand in the way.
+    --cap-add=IPC_LOCK --cap-add=NET_ADMIN --cap-add=SYS_NICE
     --ulimit memlock=-1:-1 --ulimit stack=67108864 --ulimit nofile=65536:524288
     --shm-size=128G
     --env-file "${env_file}"
@@ -364,7 +371,8 @@ EOF
 
 run_spur_job() {
   if [[ -z "${SPUR_TASK_OFFSET:-}" || -z "${SPUR_PEER_NODES:-}" ]]; then
-    return 1
+    echo "ERROR: Spur worker requires SPUR_TASK_OFFSET and SPUR_PEER_NODES" >&2
+    exit 1
   fi
 
   local node_rank="${SPUR_TASK_OFFSET}"
@@ -464,9 +472,23 @@ EOF
   return 0
 }
 
-if [[ -n "${SPUR_TASK_OFFSET:-}" || -n "${SPUR_PEER_NODES:-}" ]]; then
+if [[ "${1:-}" == "--spur-worker" ]]; then
   run_spur_job
   exit $?
+fi
+
+if [[ -n "${SPUR_JOB_ID:-}" || -n "${SPUR_TASK_OFFSET:-}" || -n "${SPUR_PEER_NODES:-}" ]]; then
+  # Spur sbatch runs the batch script only on the first allocated node; the
+  # other nodes run placeholders until an srun step dispatches their workers.
+  # Use an explicit worker argument because the batch shell also has rank 0
+  # in SPUR_TASK_OFFSET. srun assigns each worker's rank and inherits the batch
+  # environment, including SPUR_PEER_NODES in allocation order.
+  echo "=== Spur job ${JOB_ID}: dispatching ${NUM_NODES} node workers ==="
+  exec srun \
+    --nodes="${NUM_NODES}" \
+    --ntasks="${NUM_NODES}" \
+    --ntasks-per-node=1 \
+    bash "${REPO_ROOT}/.github/scripts/atomesh/pd_slurm_job.sh" --spur-worker
 fi
 
 mapfile -t ALLOC_NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")

@@ -691,24 +691,17 @@ models:
               # the simulator is reconciled against; each is append-only and
               # costs an append on a path that is not the forward's.
               ATOMESH_ENABLE_TRACES: "1"
-            # Restated rather than merged so LMCACHE_NUMA_MODE can be dropped:
-            # a YAML merge key can override an inherited entry but cannot
-            # remove one. The -nocache arm points at the anchor below so the
-            # pair cannot drift.
-            prefill: &kimi_k3_agentic_lmcache192_nonuma_env
-              # LMCACHE_NUMA_MODE is deliberately absent. LMCache NUMA-binds
-              # its CPU buffer through mbind(2), which needs CAP_SYS_NICE, and
-              # this container runs under --user, so it holds no capabilities
-              # at all -- see the note on the cap-add list in pd_slurm_job.sh.
+            # Restated rather than merged so the two arms stay a matched pair:
+            # the -nocache arm points at the anchor below, so neither can drift
+            # from the other without the edit showing up here.
+            prefill: &kimi_k3_agentic_lmcache192_prefill_env
               # Job 4721 died on "RuntimeError: mbind failed: Operation not
-              # permitted" in LocalCPUBackend.initialize_allocator, reached
-              # only once the RCCL fix let init get that far. LMCache accepts
-              # "auto", "manual" or unset and asserts on anything else, so the
-              # entry has to be removed rather than blanked. The buffer is then
-              # allocated without node affinity, which costs some offload
-              # bandwidth; it applies identically to both arms, so the A/B
-              # still measures what it is meant to. ATOM_NUMA_BIND is left on:
-              # it binds earlier and did not fail in 4721.
+              # permitted" in LocalCPUBackend.initialize_allocator, reached only
+              # once the RCCL fix let init get that far. The cause is seccomp,
+              # not credentials: Docker's default profile admits mbind only when
+              # CAP_SYS_NICE is requested. pd_slurm_job.sh now requests it, so
+              # NUMA placement stays on here rather than being dropped.
+              LMCACHE_NUMA_MODE: auto
               LMCACHE_LOCAL_CPU: "True"
               LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
               LMCACHE_CHUNK_SIZE: "1024"
@@ -750,7 +743,7 @@ models:
               ATOMESH_ENABLE_TRACES: "1"
             # The seeded arm's block verbatim, LMCACHE_NUMA_MODE included in
             # what it drops.
-            prefill: *kimi_k3_agentic_lmcache192_nonuma_env
+            prefill: *kimi_k3_agentic_lmcache192_prefill_env
 
         - <<: *kimi_k3_agentic_no_dspark
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c72
