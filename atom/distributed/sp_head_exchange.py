@@ -16,7 +16,7 @@ except ModuleNotFoundError as exc:
 _exchange = getattr(_head_exchange_ops, "sp_head_exchange", None)
 
 
-def head_exchange_communicator(x):
+def head_exchange_communicator(x, *, group=None):
     """Select M3's prefill exchange; decode uses the regular head gather."""
     if (
         not x.is_cuda
@@ -36,10 +36,17 @@ def head_exchange_communicator(x):
     from atom.distributed.ulysses_sp import get_sp_group, get_sp_world_size
     from atom.plugin.prepare import is_plugin_mode
 
-    if (
-        get_sp_world_size() != 4
-        or get_tensor_model_parallel_world_size() != 1
-        or is_plugin_mode()
+    if is_plugin_mode():
+        return None
+    if group is None:
+        if get_sp_world_size() != 4 or get_tensor_model_parallel_world_size() != 1:
+            return None
+        group = get_sp_group()
+    elif (
+        group.world_size != 4
+        or get_sp_world_size() != 1
+        or get_tensor_model_parallel_world_size() != 4
+        or not getattr(get_current_atom_config(), "m3_tp_replicated_o_proj", False)
     ):
         return None
     architectures = (
@@ -54,7 +61,7 @@ def head_exchange_communicator(x):
         for arch in architectures
     ):
         return None
-    ca = getattr(getattr(get_sp_group(), "device_communicator", None), "ca_comm", None)
+    ca = getattr(getattr(group, "device_communicator", None), "ca_comm", None)
     if ca is None or ca.disabled or getattr(ca, "_pool", None) is None:
         return None
     if not ca.should_custom_ag(x):
