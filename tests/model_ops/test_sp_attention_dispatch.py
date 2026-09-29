@@ -60,6 +60,26 @@ def test_validated_layout_selects_fp8_without_opt_in(supported):
     assert input_norm_fp8.supports_m3_fused_gemma_fp8(6144)
 
 
+def test_tp_replicated_o_proj_reuses_fp8_transport_on_tp_group(monkeypatch, supported):
+    supported.m3_tp_replicated_o_proj = True
+    monkeypatch.setattr(ulysses_sp, "_SP_WORLD_SIZE", 1)
+    monkeypatch.setattr(
+        parallel_state, "get_tensor_model_parallel_world_size", lambda: 4
+    )
+    ca = SimpleNamespace(disabled=False, _pool={}, should_custom_ag=lambda x: True)
+    group = SimpleNamespace(
+        world_size=4, device_communicator=SimpleNamespace(ca_comm=ca)
+    )
+    assert attention_fp8.supports_m3_attention_fp8(2048, tp_replicated_o_proj=True)
+    assert input_norm_fp8.supports_m3_fused_gemma_fp8(6144, tp_replicated_o_proj=True)
+    assert not attention_fp8.supports_m3_attention_fp8(8192)
+    assert sp_head_exchange.head_exchange_communicator(_head_input(), group=group) is ca
+    supported.m3_tp_replicated_o_proj = False
+    assert (
+        sp_head_exchange.head_exchange_communicator(_head_input(), group=group) is None
+    )
+
+
 @pytest.mark.parametrize("case", ["cpu", "sp1", "sp2", "tp4", "dtype", "gfx", "plugin"])
 def test_unsupported_runtime_keeps_existing_kernels(monkeypatch, supported, case):
     if case == "cpu":
