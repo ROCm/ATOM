@@ -4,11 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
 from atom.plugin.config import _build_atom_speculative_config_from_sglang
-from atom.plugin.sglang.eagle3_llama_bridge import (
-    _hip_topk1_tree_builder,
-    _hip_verify_tree_greedy,
-)
 from atom.plugin.sglang.models.qwen4_exp import (
     flatten_qwen4_exp_hc,
     reshape_qwen4_exp_hc,
@@ -19,6 +16,10 @@ from atom.plugin.sglang.patches.qwen4_exp_recognition_patch import (
     is_qwen4_exp_nextn_arch,
     promote_flash_draft_text_config,
     rewrite_qwen4_exp_draft_hf_config,
+)
+from atom.plugin.sglang.patches.qwen4_exp_rocm_patch import (
+    _hip_topk1_tree_builder,
+    _hip_verify_tree_greedy,
 )
 from atom.plugin.sglang.qwen4_exp_bridge import (
     _query_start_loc,

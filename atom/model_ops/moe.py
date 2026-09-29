@@ -1000,61 +1000,6 @@ def rocm_asm_moe_impl(
     )
 
 
-def _install_ep_decode_asm_moe() -> None:
-    """Use the asm 1-stage kernel for Flash EP decode.
-
-    EP keeps the full MoE intermediate (640). That K is divisible by 128, so
-    AITER's per-token FP8 heuristic picks CK 2-stage for token<=16. The
-    compiled ``device_gemm`` does not support that problem and CUDA-graph
-    capture dies. TP splits the intermediate to 320, which is not 128-aligned,
-    so the same heuristic already stays on 1-stage — the kernel that also
-    serves this quant once token>16. Only the crashing shape is redirected.
-    """
-    import aiter.fused_moe as fused_moe_mod
-
-    if getattr(fused_moe_mod, "_atom_ep_decode_asm", False):
-        return
-    original = fused_moe_mod.get_2stage_cfgs
-
-    def get_2stage_cfgs(token, model_dim, inter_dim, expert, topk, *args, **kwargs):
-        metadata = original(token, model_dim, inter_dim, expert, topk, *args, **kwargs)
-        # Positional order after topk matches get_2stage_cfgs:
-        # dtype, q_dtype_a, q_dtype_w, q_type, ...
-        q_type = kwargs.get("q_type", args[3] if len(args) > 3 else None)
-        q_dtype_w = kwargs.get("q_dtype_w", args[2] if len(args) > 2 else None)
-        if (
-            not getattr(metadata, "run_1stage", True)
-            and int(token) <= 16
-            and int(model_dim) == 2560
-            and int(inter_dim) == 640
-            and q_type == QuantType.per_Token
-            and q_dtype_w == dtypes.fp8
-        ):
-            # Re-query just above the heuristic cutoff. 17 is not a
-            # nextPow2 bucket, so a tuned CK row keyed at 16/32 cannot
-            # match; the untuned path is the asm kernel prefill already
-            # uses once token>16. block_m for that path ignores token.
-            metadata = original(
-                17,
-                model_dim,
-                inter_dim,
-                expert,
-                topk,
-                *args,
-                **kwargs,
-            )
-            if not getattr(fused_moe_mod, "_atom_ep_decode_asm_logged", False):
-                fused_moe_mod._atom_ep_decode_asm_logged = True
-                logger.info(
-                    "Flash EP decode MoE: per-token FP8 2560x640 token<=16 "
-                    "uses asm 1-stage (CK device_gemm rejects this shape)"
-                )
-        return metadata
-
-    fused_moe_mod.get_2stage_cfgs = get_2stage_cfgs
-    fused_moe_mod._atom_ep_decode_asm = True
-
-
 def rocm_aiter_fused_moe_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -1076,7 +1021,6 @@ def rocm_aiter_fused_moe_impl(
 
     activation_ = ActivationType(activation)
     quant_type_ = QuantType(quant_type)
-    _install_ep_decode_asm_moe()
 
     return fused_moe(
         hidden_states,
