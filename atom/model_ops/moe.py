@@ -6,7 +6,7 @@ from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from functools import lru_cache
+from functools import lru_cache, partial
 
 import torch
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
@@ -29,6 +29,7 @@ from atom.config import (
     get_current_atom_config,
 )
 from atom.distributed.ulysses_sp import (
+    _all_gather_tokens,
     get_sp_world_size,
     sp_is_enabled,
     sp_moe_gather,
@@ -1893,21 +1894,25 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         return config.prequant and not config.run_1stage and config.ksplit <= 1
 
-    def gather_sp_input(self, layer, x):
-        if not self._sp_input_can_prequantize(
-            layer, x.shape[0] * get_sp_world_size(), x.dtype
-        ):
-            return sp_moe_gather(x), None
+    def gather_sp_input(self, layer, x, *, token_group=None):
+        world = get_sp_world_size() if token_group is None else token_group.world_size
+        gather = (
+            sp_moe_gather
+            if token_group is None
+            else partial(_all_gather_tokens, group=token_group)
+        )
+        if not self._sp_input_can_prequantize(layer, x.shape[0] * world, x.dtype):
+            return gather(x), None
         quantized, scale = get_hip_quant(self.quant_type)(
             x, quant_dtype=dtypes.fp4x2, shuffle=False
         )
         # Bitwise BF16 views let the custom all-gather copy FP4/E8M0 bytes.
         # No conversion or floating-point arithmetic occurs in the gather.
-        quantized = sp_moe_gather(quantized.view(torch.bfloat16)).view(dtypes.fp4x2)
-        scale = sp_moe_gather(scale.view(torch.bfloat16)).view(dtypes.fp8_e8m0)
+        quantized = gather(quantized.view(torch.bfloat16)).view(dtypes.fp4x2)
+        scale = gather(scale.view(torch.bfloat16)).view(dtypes.fp8_e8m0)
         return quantized, scale
 
-    def gather_sp_routed_input(self, layer, x, router_logits):
+    def gather_sp_routed_input(self, layer, x, router_logits, *, token_group=None):
         """Move row-local routing before the SP gather, retaining all route bits.
 
         The caller only selects this path for the existing non-EP external-FP4
@@ -1929,9 +1934,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             e_score_correction_bias=layer.e_score_correction_bias,
             fused_shared_experts_scoring_func=layer.shared_expert_scoring_func,
         )
-        quantized, scale = self.gather_sp_input(layer, x)
-        weights = sp_moe_gather(weights)
-        ids = sp_moe_gather(ids.view(torch.bfloat16)).view(torch.int32)
+        group_kwargs = {} if token_group is None else {"token_group": token_group}
+        quantized, scale = self.gather_sp_input(layer, x, **group_kwargs)
+        gather = (
+            sp_moe_gather
+            if token_group is None
+            else partial(_all_gather_tokens, group=token_group)
+        )
+        weights = gather(weights)
+        ids = gather(ids.view(torch.bfloat16)).view(torch.int32)
         return quantized, scale, weights, ids
 
     @mark_trace
@@ -5372,8 +5383,22 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
-    def forward_impl(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        *,
+        token_group=None,
+    ):
         assert self.quant_method is not None
+
+        # Explicit TP token gathering for M3's replicated-o_proj experiment.
+        # Its caller adds the owner's attention output and all-reduces the sum;
+        # the ordinary SP branch below still reduces back to local tokens.
+        if token_group is not None:
+            assert get_dp_group().world_size == 1 and not sp_is_enabled()
+            assert not self.moe_parallel_config.use_all2all_kernels
+            assert not self.reduce_results and not self.use_ep
 
         if get_dp_group().world_size > 1:
             return self.forward_impl_graph(hidden_states, router_logits)
@@ -5382,7 +5407,16 @@ class FusedMoE(torch.nn.Module):
         # back to each owner. Routed all2all handles token movement itself.
         sp_moe = sp_is_enabled() and not self.moe_parallel_config.use_all2all_kernels
         sp_input_kwargs = {}
-        if sp_moe:
+        if sp_moe or token_group is not None:
+            world = (
+                get_sp_world_size() if token_group is None else token_group.world_size
+            )
+            group_kwargs = {} if token_group is None else {"token_group": token_group}
+            gather = (
+                sp_moe_gather
+                if token_group is None
+                else partial(_all_gather_tokens, group=token_group)
+            )
             mxfp4_input = (
                 type(self.quant_method) is Mxfp4MoEMethod
                 and self.moe_parallel_config.dp_logical_ratio == 1
@@ -5393,10 +5427,10 @@ class FusedMoE(torch.nn.Module):
                 and not self.expert_layout.shared_is_routed
                 and not self.use_grouped_topk
                 and self.scoring_func == "sigmoid"
-                and hidden_states.shape[0] * get_sp_world_size() >= 32768
+                and hidden_states.shape[0] * world >= 32768
                 and self.quant_method._sp_input_can_prequantize(
                     self,
-                    hidden_states.shape[0] * get_sp_world_size(),
+                    hidden_states.shape[0] * world,
                     hidden_states.dtype,
                 )
             )
@@ -5406,19 +5440,20 @@ class FusedMoE(torch.nn.Module):
                         self,
                         hidden_states,
                         router_logits,
+                        **group_kwargs,
                     )
                 )
                 sp_input_kwargs["sp_input_scale"] = input_scale
                 sp_input_kwargs["sp_topk"] = (weights, ids)
             elif mxfp4_input:
                 hidden_states, input_scale = self.quant_method.gather_sp_input(
-                    self, hidden_states
+                    self, hidden_states, **group_kwargs
                 )
                 sp_input_kwargs["sp_input_scale"] = input_scale
             else:
-                hidden_states = sp_moe_gather(hidden_states)
+                hidden_states = gather(hidden_states)
             if not local_topk:
-                router_logits = sp_moe_gather(router_logits)
+                router_logits = gather(router_logits)
 
         # Simulated DP with no peers to gather from: the absent ranks' token
         # shards are stood in for locally, same as after the gather in

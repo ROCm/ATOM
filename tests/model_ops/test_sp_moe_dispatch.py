@@ -142,6 +142,48 @@ def test_non_sp_and_routed_all2all_skip_sp_gather(
     assert "sp_input_scale" not in layer.quant_method.apply.call_args.kwargs
 
 
+@pytest.mark.parametrize("rows", [1, 8192])
+def test_tp_token_gather_returns_global_partial_without_reduction(
+    monkeypatch, sp_modules, rows
+):
+    moe = sp_modules.moe
+    layer = _layer(moe)
+    group = SimpleNamespace(world_size=4)
+    hidden = torch.empty(rows, 2, dtype=torch.bfloat16)
+    logits = torch.empty(rows, 128)
+    gathered = torch.empty(rows * 4, 2, dtype=torch.bfloat16)
+    scale, weights, ids = (object() for _ in range(3))
+    method = layer.quant_method
+    method._sp_input_can_prequantize = Mock(return_value=True)
+    method.gather_sp_input = Mock(return_value=(gathered, scale))
+    method.gather_sp_routed_input = Mock(return_value=(gathered, scale, weights, ids))
+    method.apply = Mock(return_value=gathered)
+    monkeypatch.setattr(moe, "get_dp_group", lambda: SimpleNamespace(world_size=1))
+    monkeypatch.setattr(moe, "sp_is_enabled", lambda: False)
+    monkeypatch.setattr(moe, "get_sp_world_size", lambda: 1)
+    gather = Mock(side_effect=lambda value, *, group: value.repeat(group.world_size, 1))
+    monkeypatch.setattr(moe, "_all_gather_tokens", gather)
+    forbidden = Mock(side_effect=AssertionError("unexpected SP collective/reduction"))
+    monkeypatch.setattr(moe, "sp_moe_gather", forbidden)
+    monkeypatch.setattr(moe, "sp_moe_reduce_scatter", forbidden)
+    monkeypatch.setattr(moe, "get_tp_group", forbidden)
+
+    result = moe.FusedMoE.forward_impl(layer, hidden, logits, token_group=group)
+
+    assert result is gathered and result.shape[0] == rows * 4
+    assert method.apply.call_args.kwargs["x"] is gathered
+    if rows == 8192:
+        method.gather_sp_routed_input.assert_called_once_with(
+            layer, hidden, logits, token_group=group
+        )
+        assert method.apply.call_args.kwargs["sp_topk"] == (weights, ids)
+        gather.assert_not_called()
+    else:
+        method.gather_sp_input.assert_called_once_with(layer, hidden, token_group=group)
+        gather.assert_called_once_with(logits, group=group)
+    forbidden.assert_not_called()
+
+
 def test_prequantized_gather_preserves_payload_and_scale_bytes(monkeypatch, sp_modules):
     moe = sp_modules.moe
     layer = _layer(moe)
