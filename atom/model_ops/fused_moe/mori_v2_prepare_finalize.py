@@ -821,13 +821,18 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
             )
 
 
-def make_mori_v2_prepare_finalize(moe, all2all_manager) -> MoriV2PrepareAndFinalize:
+def make_mori_v2_prepare_finalize(moe) -> MoriV2PrepareAndFinalize:
     """Build a MoriV2PrepareAndFinalize for the given MoE config + EP group."""
     from aiter.dist.parallel_state import get_ep_group
 
+    # Rank and size come from the EP group, not its all2all manager: v2 never
+    # uses the manager, and building one (MoriAll2AllManager) initializes mori
+    # shmem, which needs RDMA to every cross-node peer. The values match the
+    # manager's -- both are the rank/size of the EP cpu_group.
     ep_group = get_ep_group()
     ep_src_global_rank = ep_group.ranks[0]
-    ep_size = all2all_manager.world_size
+    ep_rank = ep_group.rank_in_group
+    ep_size = ep_group.world_size
 
     if _resolve_transport() == "mega":
         # Geometry only; the expert-GEMM recipe comes from the layer later.
@@ -836,7 +841,7 @@ def make_mori_v2_prepare_finalize(moe, all2all_manager) -> MoriV2PrepareAndFinal
             max_tokens_per_rank=moe.max_num_tokens,
             num_dispatchers=ep_size,
             mega_geometry={
-                "ep_rank": all2all_manager.rank,
+                "ep_rank": ep_rank,
                 "ep_size": ep_size,
                 "ep_src_global_rank": ep_src_global_rank,
                 "hidden_dim": moe.hidden_dim,
@@ -848,7 +853,7 @@ def make_mori_v2_prepare_finalize(moe, all2all_manager) -> MoriV2PrepareAndFinal
         )
 
     op = init_mori_v2_op(
-        ep_rank=all2all_manager.rank,
+        ep_rank=ep_rank,
         ep_size=ep_size,
         ep_src_global_rank=ep_src_global_rank,
         hidden_dim=moe.hidden_dim,
