@@ -4,8 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from atom.plugin.config import _build_atom_speculative_config_from_sglang
+from atom.plugin.sglang.eagle3_llama_bridge import (
+    _hip_topk1_tree_builder,
+    _hip_verify_tree_greedy,
+)
 from atom.plugin.sglang.models.qwen4_exp import (
     flatten_qwen4_exp_hc,
     reshape_qwen4_exp_hc,
@@ -14,6 +17,7 @@ from atom.plugin.sglang.patches.qwen4_exp_recognition_patch import (
     QWEN4_EXP_NEXTN_ARCH,
     apply_qwen4_exp_hc_hidden_size,
     is_qwen4_exp_nextn_arch,
+    promote_flash_draft_text_config,
     rewrite_qwen4_exp_draft_hf_config,
 )
 from atom.plugin.sglang.qwen4_exp_bridge import (
@@ -59,6 +63,49 @@ def test_rewrite_qwen4_exp_draft_hf_config_shrinks_to_one_qsa_layer():
     assert text.layer_types == ["full_attention"]
     assert text.ple_layer_ids == []
     assert is_qwen4_exp_nextn_arch(hf)
+
+
+def test_rewrite_accepts_upstream_mtp_entryclass():
+    """0.5.20 rewrites the draft to Qwen4ExpForCausalLMMTP before ATOM."""
+    text = SimpleNamespace(
+        model_type="qwen4_exp_text",
+        num_hidden_layers=1,
+        mtp={"layer_types": ["full_attention"], "num_hidden_layers": 1},
+        mtp_num_hidden_layers=1,
+        layer_types=["full_attention"],
+        ple_layer_ids=[],
+        architectures=["Qwen4ExpForCausalLMMTP"],
+        full_attention_interval=1,
+    )
+    hf = SimpleNamespace(
+        model_type="qwen4_exp",
+        architectures=["Qwen4ExpForCausalLMMTP"],
+        text_config=text,
+        num_hidden_layers=1,
+    )
+    assert rewrite_qwen4_exp_draft_hf_config(hf, text)
+    assert hf.architectures == [QWEN4_EXP_NEXTN_ARCH]
+    assert hf.num_hidden_layers == 1
+    assert text.layer_types == ["full_attention"]
+
+
+def test_promote_draft_uses_text_config_when_vl_has_no_vocab():
+    text = SimpleNamespace(
+        model_type="qwen4_exp_text",
+        architectures=[QWEN4_EXP_NEXTN_ARCH],
+        vocab_size=248320,
+        hidden_size=2560,
+        num_hidden_layers=1,
+    )
+    hf = SimpleNamespace(
+        model_type="qwen4_exp",
+        architectures=[QWEN4_EXP_NEXTN_ARCH],
+        text_config=text,
+    )
+    model_config = SimpleNamespace(hf_config=hf, hf_text_config=text)
+    assert promote_flash_draft_text_config(model_config)
+    assert model_config.hf_config is text
+    assert model_config.hf_text_config is text
 
 
 def test_rewrite_ignores_non_flash_arch():
@@ -285,3 +332,51 @@ def test_draft_rewrite_rejects_unsupported_native_layout(layers, types):
     with pytest.raises(ValueError, match="exactly one QSA"):
         rewrite_qwen4_exp_draft_hf_config(hf)
     assert hf.num_hidden_layers == 48
+
+
+def test_hip_topk1_tree_build_uses_triton():
+    calls = []
+
+    def original(*args, **kwargs):
+        calls.append(("kernel", args[8], int(args[11])))
+
+    def triton_impl(*args, **kwargs):
+        topk = kwargs["topk"] if "topk" in kwargs else args[8]
+        calls.append(("triton", topk))
+
+    wrapped = _hip_topk1_tree_builder(original, triton_impl, bitpack_mode=2)
+    args = (None,) * 8
+    wrapped(*args, 1, 2, 3, 0)
+    wrapped(*args, topk=1, tree_mask_mode=1)
+    wrapped(*args, 4, 3, 8, 0)
+    wrapped(*args, 1, 2, 3, 2)
+    assert calls == [("triton", 1), ("triton", 1), ("kernel", 4, 0), ("kernel", 1, 2)]
+
+
+def test_hip_verify_tree_greedy_uses_triton():
+    seen = {}
+
+    def triton_impl(**kwargs):
+        seen.update(kwargs)
+        kwargs["predicts"][:] = 7
+
+    wrapped = _hip_verify_tree_greedy(triton_impl)
+    predicts = torch.zeros(3, dtype=torch.int32)
+    accept_index = torch.full((1, 3), -1, dtype=torch.int32)
+    accept_num = torch.empty(1, dtype=torch.int32)
+    out = wrapped(
+        predicts,
+        accept_index,
+        accept_num,
+        torch.zeros(1, 3, dtype=torch.long),
+        torch.zeros(1, 3, dtype=torch.long),
+        torch.zeros(1, 3, dtype=torch.long),
+        torch.zeros(1, 3, dtype=torch.long),
+        torch.zeros(1, 3, dtype=torch.long),
+        topk=1,
+    )
+    assert seen["predicts"] is predicts
+    assert seen["retrieve_index"].shape == (1, 3)
+    assert out[0][0].item() == 7
+    assert out[1] is accept_index
+    assert out[2] is accept_num

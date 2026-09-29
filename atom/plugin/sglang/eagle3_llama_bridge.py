@@ -1092,6 +1092,95 @@ def _patch_sglang_eagle3_tp_verify_broadcast() -> None:
     eagle_worker_module._atom_eagle3_tp_verify_broadcast_patched = True
 
 
+def _hip_topk1_tree_builder(original, triton_impl, bitpack_mode: int):
+    """Route HIP topk=1 tree builds to Triton.
+
+    ``sgl_kernel.build_tree_kernel_efficient`` segfaults on the chain SGLang
+    preallocates for ``topk=1`` (parent width ``num_steps``, draft tokens
+    ``num_steps + 1``). The Triton builder in ``eagle_utils`` writes the same
+    mask and retrieve tables. Bit-packed masks stay on the original kernel.
+    """
+
+    def sgl_build_tree_kernel_efficient(*args, **kwargs):
+        topk = (
+            kwargs["topk"] if "topk" in kwargs else args[8] if len(args) > 8 else None
+        )
+        mode = (
+            kwargs["tree_mask_mode"]
+            if "tree_mask_mode" in kwargs
+            else (args[11] if len(args) > 11 else 0)
+        )
+        if topk == 1 and int(mode) != bitpack_mode:
+            return triton_impl(*args, **kwargs)
+        return original(*args, **kwargs)
+
+    return sgl_build_tree_kernel_efficient
+
+
+def _hip_verify_tree_greedy(triton_impl):
+    """Route HIP greedy verify to Triton.
+
+    ``sgl_kernel.verify_tree_greedy`` segfaults on the same topk=1 chain the
+    tree builder writes. XPU already uses this Triton kernel for that contract.
+    """
+
+    def verify_tree_greedy_func(
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        target_predict,
+        topk: int = -1,
+    ):
+        del topk
+        triton_impl(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            target_predict=target_predict,
+        )
+        return predicts, accept_index, accept_token_num
+
+    return verify_tree_greedy_func
+
+
+def _patch_hip_topk1_tree_kernel() -> None:
+    try:
+        from sglang.srt.speculative import eagle_utils
+    except Exception:  # noqa: BLE001 - SGLang tree builder is optional
+        return
+    if not getattr(eagle_utils, "_is_hip", False):
+        return
+    if getattr(eagle_utils, "_atom_hip_topk1_tree_triton", False):
+        return
+    eagle_utils.sgl_build_tree_kernel_efficient = _hip_topk1_tree_builder(
+        eagle_utils.sgl_build_tree_kernel_efficient,
+        eagle_utils.sgl_build_tree_kernel_triton,
+        int(eagle_utils.TreeMaskMode.QLEN_ONLY_BITPACKING),
+    )
+    eagle_utils._atom_hip_topk1_tree_triton = True
+    logger.info(
+        "HIP eagle topk=1 tree build uses Triton; "
+        "sgl_kernel.build_tree_kernel_efficient faults on this chain"
+    )
+    if not getattr(eagle_utils, "_atom_hip_verify_tree_triton", False):
+        eagle_utils.verify_tree_greedy_func = _hip_verify_tree_greedy(
+            eagle_utils.verify_tree_greedy_triton
+        )
+        eagle_utils._atom_hip_verify_tree_triton = True
+        logger.info(
+            "HIP eagle greedy verify uses Triton; "
+            "sgl_kernel.verify_tree_greedy faults on this chain"
+        )
+
+
 def patch_sglang_eagle3_runtime_compat() -> None:
     """Install all ATOM runtime compatibility patches for SGLang EAGLE3."""
 
@@ -1099,3 +1188,4 @@ def patch_sglang_eagle3_runtime_compat() -> None:
     _patch_sglang_eagle3_cuda_graph_reject_state()
     _patch_sglang_eagle3_draft_extend_compat()
     _patch_sglang_eagle3_tp_verify_broadcast()
+    _patch_hip_topk1_tree_kernel()
