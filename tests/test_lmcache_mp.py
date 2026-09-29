@@ -6,27 +6,39 @@ from __future__ import annotations
 import sys
 import types
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+from atom.kv_transfer.disaggregation.page_region import page_region
 from atom.kv_transfer.disaggregation.types import (
+    ConnectorCompletion,
     KVTransferRegion,
     KVTransferTensors,
     LoadOperationId,
+    PageRegion,
     SaveOperationId,
+    SaveSourceGroupId,
 )
-from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
+from atom.kv_transfer.offload.chunked_scheduler import (
+    DENSE_PAGE_SOURCE_SAFE_CHANNEL,
+    DENSE_PAGE_STORE_CHANNEL,
+    ChunkedOffloadSchedulerBase,
+)
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
     LoadSpec,
     SaveSpec,
 )
-from atom.kv_transfer.offload.mp import backend as mp_connector
+from atom.kv_transfer.offload.mp import deployment, page_views, transfer
+from atom.kv_transfer.offload.mp import lookup as mp_lookup
+from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
+from atom.kv_transfer.offload.mp import worker as mp_worker
 
 
 def _config(
@@ -37,7 +49,10 @@ def _config(
     dcp: int = 1,
     pcp: int = 1,
     dp: int = 1,
+    dp_local: int | None = None,
+    dp_rank: int = 0,
     enable_dp_attention: bool = False,
+    enable_expert_parallel: bool = False,
     role: str = "offload",
     extra: dict | None = None,
     kv_lora_rank: int | None = None,
@@ -63,8 +78,13 @@ def _config(
         decode_context_parallel_size=dcp,
         prefill_context_parallel_size=pcp,
         enable_dp_attention=enable_dp_attention,
+        enable_expert_parallel=enable_expert_parallel,
         speculative_config=None,
-        parallel_config=SimpleNamespace(data_parallel_size=dp),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=dp,
+            data_parallel_size_local=dp if dp_local is None else dp_local,
+            data_parallel_rank=dp_rank,
+        ),
         kv_transfer_config={
             "kv_connector": "lmcache_mp",
             "kv_role": role,
@@ -79,32 +99,48 @@ def _config(
         ({"pp": 2}, "does not support PP"),
         ({"dcp": 2}, "does not support DCP"),
         ({"pcp": 2}, "does not support PCP"),
-        ({"dp": 2}, "TP-only"),
-        ({"enable_dp_attention": True}, "TP-only"),
+        ({"dp": 2, "dp_local": 1}, "only within one host"),
         ({"tp": 1.5}, "tensor_parallel_size must be an integer"),
     ],
 )
 def test_mp_config_rejects_unsupported_topologies(kwargs, message):
     with pytest.raises((NotImplementedError, ValueError), match=message):
-        mp_connector._validate_mp_config(_config(**kwargs))
+        deployment._validate_mp_config(_config(**kwargs))
 
 
 def test_mp_config_accepts_arbitrary_model_type():
-    assert mp_connector._validate_mp_config(_config(model_type="ordinary_mha")) == (
+    assert deployment._validate_mp_config(_config(model_type="ordinary_mha")) == (
         2,
         1,
     )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"dp": 2, "dp_rank": 1},
+        {"dp": 2, "enable_dp_attention": True},
+        {
+            "tp": 1,
+            "dp": 8,
+            "enable_dp_attention": True,
+            "enable_expert_parallel": True,
+        },
+    ],
+)
+def test_mp_config_accepts_single_host_dp_and_dpa(kwargs):
+    assert deployment._validate_mp_config(_config(**kwargs))[1] == 1
 
 
 def test_mp_scheduler_is_not_a_dense_transport_scheduler():
     from atom.kv_transfer.offload.dense.connector import DenseOffloadScheduler
 
     assert issubclass(
-        mp_connector.LMCacheMPConnectorScheduler,
+        mp_scheduler.LMCacheMPConnectorScheduler,
         ChunkedOffloadSchedulerBase,
     )
     assert not issubclass(
-        mp_connector.LMCacheMPConnectorScheduler,
+        mp_scheduler.LMCacheMPConnectorScheduler,
         DenseOffloadScheduler,
     )
 
@@ -112,11 +148,11 @@ def test_mp_scheduler_is_not_a_dense_transport_scheduler():
 def test_mp_config_rejects_engine_driven_transfer(monkeypatch):
     monkeypatch.setenv("LMCACHE_MP_TRANSFER_MODE", " EnGiNe_DrIvEn ")
     with pytest.raises(NotImplementedError, match="multiple physical"):
-        mp_connector._validate_mp_config(_config())
+        deployment._validate_mp_config(_config())
 
     monkeypatch.setenv("LMCACHE_MP_TRANSFER_MODE", "auto")
     with pytest.raises(NotImplementedError, match="multiple physical"):
-        mp_connector._validate_mp_config(
+        deployment._validate_mp_config(
             _config(extra={"lmcache.mp.mp_transfer_mode": " EnGiNe_DrIvEn "})
         )
 
@@ -151,9 +187,11 @@ def test_worker_adapter_normalizes_transfer_mode(
     adapter_module.AtomMPWorkerAdapter = AtomMPWorkerAdapter
     monkeypatch.setitem(sys.modules, "lmcache.integration.atom", adapter_module)
     monkeypatch.setenv("LMCACHE_MP_TRANSFER_MODE", environment_mode)
-    monkeypatch.setattr(mp_connector, "_model_namespace", lambda _config: "test")
+    monkeypatch.setattr(
+        deployment, "_model_namespace", lambda _config, **_kwargs: "test"
+    )
 
-    adapter = mp_connector._make_worker_adapter(_config(extra=extra), rank=1)
+    adapter = deployment._make_worker_adapter(_config(extra=extra), rank=1)
 
     assert adapter.transfer_mode == expected
 
@@ -172,12 +210,37 @@ def test_parallel_strategy_keeps_every_tp_rank(monkeypatch):
     )
 
     strategies = [
-        mp_connector._parallel_strategy(_config(tp=8), rank) for rank in range(8)
+        deployment._parallel_strategy(_config(tp=8, dp=2), rank) for rank in range(8)
     ]
 
     assert {strategy.world_size for strategy in strategies} == {8}
     assert {strategy.worker_id for strategy in strategies} == set(range(8))
     assert {strategy.tp_size for strategy in strategies} == {8}
+
+
+def test_parallel_strategy_uses_one_worker_per_dpa_engine(monkeypatch):
+    class AtomMPParallelConfig:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    adapter_module = types.ModuleType("lmcache.integration.atom")
+    adapter_module.AtomMPParallelConfig = AtomMPParallelConfig
+    monkeypatch.setitem(sys.modules, "lmcache.integration.atom", adapter_module)
+
+    strategy = deployment._parallel_strategy(
+        _config(
+            tp=1,
+            dp=8,
+            dp_rank=5,
+            enable_dp_attention=True,
+            enable_expert_parallel=True,
+        ),
+        0,
+    )
+
+    assert strategy.world_size == 1
+    assert strategy.worker_id == 0
+    assert strategy.tp_size == 1
 
 
 def test_parallel_strategy_collapses_fully_replicated_mla(monkeypatch):
@@ -194,7 +257,7 @@ def test_parallel_strategy_collapses_fully_replicated_mla(monkeypatch):
     )
 
     strategies = [
-        mp_connector._parallel_strategy(_config(tp=8, kv_lora_rank=512), rank)
+        deployment._parallel_strategy(_config(tp=8, kv_lora_rank=512), rank)
         for rank in range(8)
     ]
 
@@ -203,9 +266,51 @@ def test_parallel_strategy_collapses_fully_replicated_mla(monkeypatch):
     assert {strategy.tp_size for strategy in strategies} == {8}
 
 
+def test_auto_rank_collapse_is_off_for_a_draft_with_its_own_pool(monkeypatch):
+    """A DSpark draft whose backend owns a KV pool appends per-rank PAGE
+    regions, so a replicated MLA target no longer collapses."""
+    from atom.utils import selector
+
+    owns_pool = {"value": True}
+    monkeypatch.setattr(selector, "attn_family", lambda _hf: "draft-family")
+    monkeypatch.setattr(
+        selector,
+        "get_attn_backend",
+        lambda _family: SimpleNamespace(DRAFT_OWNS_KV_POOL=owns_pool["value"]),
+    )
+    config = _config(tp=8, kv_lora_rank=512)
+    assert deployment._tp_replication_factor(config) == 8
+
+    config.speculative_config = SimpleNamespace(
+        method="dspark", draft_model_hf_config=SimpleNamespace()
+    )
+    assert deployment._tp_replication_factor(config) == 1
+
+    owns_pool["value"] = False
+    assert deployment._tp_replication_factor(config) == 8
+    config.speculative_config.method = "mtp"
+    owns_pool["value"] = True
+    assert deployment._tp_replication_factor(config) == 8
+
+
+def test_auto_rank_collapse_distinguishes_glm52_mla_from_minimax_m3_gqa():
+    glm52 = _config(model_type="glm_moe_dsa", tp=8, kv_lora_rank=512)
+    minimax = _config(model_type="minimax_m3_vl", tp=8)
+    minimax.hf_config.architectures = ["MiniMaxM3SparseForConditionalGeneration"]
+    minimax.hf_config.text_config = SimpleNamespace(
+        num_key_value_heads=4,
+        # Stay fail-closed for this model family even if a wrapper grows an
+        # unrelated field with the same name in the future.
+        kv_lora_rank=512,
+    )
+
+    assert deployment._tp_replication_factor(glm52) == 8
+    assert deployment._tp_replication_factor(minimax) == 1
+
+
 def test_tp_rank_collapse_can_be_disabled_and_rejects_bad_values():
     assert (
-        mp_connector._tp_replication_factor(
+        deployment._tp_replication_factor(
             _config(
                 tp=8,
                 kv_lora_rank=512,
@@ -215,7 +320,7 @@ def test_tp_rank_collapse_can_be_disabled_and_rejects_bad_values():
         == 1
     )
     with pytest.raises(TypeError, match="true, false, or 'auto'"):
-        mp_connector._tp_replication_factor(
+        deployment._tp_replication_factor(
             _config(extra={"lmcache.mp.tp_rank_collapse": 1})
         )
 
@@ -248,9 +353,11 @@ def test_scheduler_reserves_locks_for_every_collapsed_tp_reader(
     adapter_module.AtomMPParallelConfig = AtomMPParallelConfig
     adapter_module.AtomMPSchedulerAdapter = AtomMPSchedulerAdapter
     monkeypatch.setitem(sys.modules, "lmcache.integration.atom", adapter_module)
-    monkeypatch.setattr(mp_connector, "_model_namespace", lambda _config: "test")
+    monkeypatch.setattr(
+        deployment, "_model_namespace", lambda _config, **_kwargs: "test"
+    )
 
-    adapter = mp_connector._make_scheduler_adapter(
+    adapter = mp_scheduler._make_scheduler_adapter(
         _config(tp=8, kv_lora_rank=kv_lora_rank)
     )
     key = adapter._create_key([], 0, 0, "req", None)
@@ -259,30 +366,30 @@ def test_scheduler_reserves_locks_for_every_collapsed_tp_reader(
 
 
 def test_server_url_normalization_and_single_server_limit():
-    assert mp_connector._server_urls(_config()) == ["tcp://localhost:5555"]
-    assert mp_connector._server_urls(
+    assert deployment._server_urls(_config()) == ["tcp://localhost:5555"]
+    assert deployment._server_urls(
         _config(extra={"lmcache.mp.host": "cache-host", "lmcache.mp.port": 6555})
     ) == ["tcp://cache-host:6555"]
-    assert mp_connector._server_urls(
+    assert deployment._server_urls(
         _config(extra={"lmcache.mp.server_urls": "tcp://cache-host:6555"})
     ) == ["tcp://cache-host:6555"]
 
     with pytest.raises(NotImplementedError, match="exactly one"):
-        mp_connector._server_urls(
+        deployment._server_urls(
             _config(extra={"lmcache.mp.server_urls": "host-a:1,host-b:2"})
         )
     with pytest.raises(NotImplementedError, match="exactly one"):
-        mp_connector._server_urls(_config(extra={"lmcache.mp.server_urls": []}))
+        deployment._server_urls(_config(extra={"lmcache.mp.server_urls": []}))
     with pytest.raises(ValueError, match=r"\[1, 65535\]"):
-        mp_connector._server_urls(_config(extra={"lmcache.mp.port": 70000}))
+        deployment._server_urls(_config(extra={"lmcache.mp.port": 70000}))
 
 
 def test_model_namespace_reuses_generic_page_namespace(monkeypatch):
     calls = []
     cfg = object()
-    monkeypatch.setattr(mp_connector.offcfg, "build_lmcache_config", lambda _kvc: cfg)
+    monkeypatch.setattr(deployment.offcfg, "build_lmcache_config", lambda _kvc: cfg)
     monkeypatch.setattr(
-        mp_connector.offcfg,
+        deployment.offcfg,
         "build_page_namespace",
         lambda config, lmcache_cfg, world: (
             calls.append((config, lmcache_cfg, world)) or "model::atom-page-v2-layout"
@@ -290,24 +397,40 @@ def test_model_namespace_reuses_generic_page_namespace(monkeypatch):
     )
 
     config = _config(model_type="ordinary_mha", tp=4)
-    assert mp_connector._model_namespace(config) == (
-        "model::atom-page-v2-layout::lmcache-mp-v2"
+    assert deployment._model_namespace(config) == (
+        "model::atom-page-v2-layout::lmcache-mp-v3"
     )
     assert calls == [(config, cfg, 4)]
+
+
+def test_dp_replicas_share_model_namespace_but_not_request_sessions(monkeypatch):
+    cfg = object()
+    monkeypatch.setattr(deployment.offcfg, "build_lmcache_config", lambda _kvc: cfg)
+    monkeypatch.setattr(
+        deployment.offcfg,
+        "build_page_namespace",
+        lambda _config, _lmcache_cfg, world: f"page-tp{world}",
+    )
+    rank0 = _config(tp=4, dp=2, dp_rank=0)
+    rank1 = _config(tp=4, dp=2, dp_rank=1)
+
+    assert deployment._model_namespace(rank0) == deployment._model_namespace(rank1)
+    assert deployment._mp_session_id(rank0, 0) == "atom-offload-dp0:0"
+    assert deployment._mp_session_id(rank1, 0) == "atom-offload-dp1:0"
 
 
 def test_scheduler_validates_role_before_connecting(monkeypatch):
     config = _config(role="not-a-role")
     connected = False
 
-    def connect(_config):
+    def connect(_config, **_kwargs):
         nonlocal connected
         connected = True
         raise AssertionError("must not connect")
 
-    monkeypatch.setattr(mp_connector, "_make_scheduler_adapter", connect)
+    monkeypatch.setattr(mp_scheduler, "_make_scheduler_adapter", connect)
     with pytest.raises(ValueError, match="invalid kv_role"):
-        mp_connector.LMCacheMPConnectorScheduler(config)
+        mp_scheduler.LMCacheMPConnectorScheduler(config)
     assert connected is False
 
 
@@ -323,13 +446,13 @@ def test_scheduler_closes_adapter_if_local_initialization_fails(monkeypatch):
 
     adapter = Adapter()
     monkeypatch.setattr(
-        mp_connector,
+        mp_scheduler,
         "_make_scheduler_adapter",
-        lambda _config: adapter,
+        lambda _config, **_kwargs: adapter,
     )
 
     with pytest.raises(ValueError, match="LMCache chunk size"):
-        mp_connector.LMCacheMPConnectorScheduler(_config())
+        mp_scheduler.LMCacheMPConnectorScheduler(_config())
     assert adapter.closed is True
 
 
@@ -351,9 +474,10 @@ def _transfer_tensors(*, tp_replication_factor: int = 1) -> KVTransferTensors:
         for tensor, role in zip(tensors, roles, strict=True)
     ]
     transfer = KVTransferTensors(
-        block_regions=regions,
-        slot_regions=[],
-        block_tensor_views=tensors,
+        pages=[
+            PageRegion(region, tensor)
+            for region, tensor in zip(regions, tensors, strict=True)
+        ],
         tp_replication_factor=tp_replication_factor,
     )
     transfer.set_block_count(2)
@@ -361,7 +485,8 @@ def _transfer_tensors(*, tp_replication_factor: int = 1) -> KVTransferTensors:
 
 
 def test_build_cache_views_groups_opaque_layouts():
-    views = mp_connector._build_cache_views(_transfer_tensors(), num_blocks=2)
+    transfer_tensors = _transfer_tensors()
+    views = page_views._build_cache_views(transfer_tensors, num_blocks=2)
 
     assert list(views.tensors) == [
         "page.0.primary.0",
@@ -371,31 +496,66 @@ def test_build_cache_views_groups_opaque_layouts():
     ]
     assert views.layer_groups == ((0, 1), (2, 3))
     assert views.bytes_per_block == 2 * (4 * 32 * 2 + 4 * 16)
+    assert all(tensor.dtype == torch.uint8 for tensor in views.tensors.values())
+    assert tuple(views.tensors["page.0.primary.0"].shape) == (2, 4, 64)
+    assert tuple(views.tensors["page.2.sidecar.0"].shape) == (2, 4, 16)
+    assert views.tensors["page.0.primary.0"].data_ptr() == (
+        transfer_tensors.block_tensor_views[0].data_ptr()
+    )
+
+
+def test_build_cache_views_publishes_float8_pages_as_raw_bytes():
+    fp8 = getattr(torch, "float8_e4m3fn", None)
+    if fp8 is None:
+        pytest.skip("torch build has no float8_e4m3fn")
+
+    page = torch.empty((2, 4, 32), dtype=fp8)
+    page.view(torch.uint8).copy_(
+        torch.arange(page.numel(), dtype=torch.uint8).reshape(page.shape)
+    )
+    region = KVTransferRegion(
+        base_addr=page.data_ptr(),
+        total_bytes=page.numel(),
+        unit_bytes=page[0].numel(),
+        semantic_role="latent",
+    )
+    transfer = KVTransferTensors(pages=[PageRegion(region, page)])
+    transfer.set_block_count(2)
+
+    views = page_views._build_cache_views(transfer, num_blocks=2)
+    published = views.tensors["page.0.latent"]
+
+    assert published.dtype == torch.uint8
+    assert published.shape == page.shape
+    assert published.data_ptr() == page.data_ptr()
+    assert torch.equal(published, page.view(torch.uint8))
 
 
 def test_build_cache_views_rejects_missing_or_bad_geometry():
     missing_view = _transfer_tensors()
-    missing_view.block_tensor_views.pop()
+    missing_view.pages[-1] = PageRegion(missing_view.pages[-1].region)
     with pytest.raises(ValueError, match="one block_tensor_view per block region"):
-        mp_connector._build_cache_views(missing_view, num_blocks=2)
+        page_views._build_cache_views(missing_view, num_blocks=2)
 
     bad_geometry = _transfer_tensors()
     bad_geometry.block_regions[0].unit_bytes += 1
     with pytest.raises(ValueError, match="byte geometry mismatch"):
-        mp_connector._build_cache_views(bad_geometry, num_blocks=2)
+        page_views._build_cache_views(bad_geometry, num_blocks=2)
 
     noncontiguous = _transfer_tensors()
-    noncontiguous.block_tensor_views[0] = torch.zeros(2, 32, 4).transpose(1, 2)
+    noncontiguous.pages[0] = replace(
+        noncontiguous.pages[0], view=torch.zeros(2, 32, 4).transpose(1, 2)
+    )
     assert not noncontiguous.block_tensor_views[0].is_contiguous()
     with pytest.raises(ValueError, match="non-empty and contiguous"):
-        mp_connector._build_cache_views(noncontiguous, num_blocks=2)
+        page_views._build_cache_views(noncontiguous, num_blocks=2)
 
     unsupported_rank = _transfer_tensors()
-    unsupported_rank.block_tensor_views[0] = torch.zeros(
-        2, 4, 4, 8, dtype=torch.float16
+    unsupported_rank.pages[0] = replace(
+        unsupported_rank.pages[0], view=torch.zeros(2, 4, 4, 8, dtype=torch.float16)
     )
     with pytest.raises(ValueError, match="physical_slots, opaque_width"):
-        mp_connector._build_cache_views(unsupported_rank, num_blocks=2)
+        page_views._build_cache_views(unsupported_rank, num_blocks=2)
 
 
 @pytest.mark.parametrize(
@@ -427,7 +587,7 @@ def test_build_cache_views_rejects_stateful_slot_layouts(field, value):
         NotImplementedError,
         match=rf"PAGE-only layouts.*{field}",
     ):
-        mp_connector._build_cache_views(transfer_tensors, num_blocks=2)
+        page_views._build_cache_views(transfer_tensors, num_blocks=2)
 
 
 class _LookupAdapter:
@@ -457,10 +617,11 @@ class _LookupAdapter:
 
 
 def test_mp_lookup_releases_only_hbm_prefix_after_retrieve_handoff(monkeypatch):
-    monkeypatch.setattr(mp_connector.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(transfer.time, "sleep", lambda _seconds: None)
     adapter = _LookupAdapter([None, 8])
-    client = mp_connector._MPLookupClient(
+    client = mp_lookup._MPLookupClient(
         adapter,
+        config=_config(),
         timeout=10.0,
         poll_interval=0.01,
     )
@@ -471,15 +632,19 @@ def test_mp_lookup_releases_only_hbm_prefix_after_retrieve_handoff(monkeypatch):
 
     # LMCache owns and releases [4, 8) once retrieve is submitted, including
     # on terminal failure. The scheduler releases only the HBM-resident prefix.
+    assert adapter.submissions == [("atom-offload-dp0:req", list(range(8)))]
     assert [(call["start"], call["end"]) for call in adapter.freed] == [(0, 4)]
+    assert {call["request_id"] for call in adapter.freed} == {"atom-offload-dp0:req"}
+    assert adapter.cleaned == ["atom-offload-dp0:req", "atom-offload-dp0:req"]
     assert client.hit_tokens("req") is None
 
 
 def test_mp_lookup_releases_hit_suffix_outside_retrieve_range(monkeypatch):
-    monkeypatch.setattr(mp_connector.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(transfer.time, "sleep", lambda _seconds: None)
     adapter = _LookupAdapter([12])
-    client = mp_connector._MPLookupClient(
+    client = mp_lookup._MPLookupClient(
         adapter,
+        config=_config(),
         timeout=10.0,
         poll_interval=0.01,
     )
@@ -499,8 +664,8 @@ def test_mp_lookup_releases_hit_suffix_outside_retrieve_range(monkeypatch):
             ),
         )
     )
-    scheduler = mp_connector.LMCacheMPConnectorScheduler.__new__(
-        mp_connector.LMCacheMPConnectorScheduler
+    scheduler = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
+        mp_scheduler.LMCacheMPConnectorScheduler
     )
     scheduler._lookup_client = client
     monkeypatch.setattr(
@@ -520,10 +685,11 @@ def test_mp_lookup_releases_hit_suffix_outside_retrieve_range(monkeypatch):
 
 
 def test_mp_lookup_rejects_retrieve_beyond_lookup_hit(monkeypatch):
-    monkeypatch.setattr(mp_connector.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(transfer.time, "sleep", lambda _seconds: None)
     adapter = _LookupAdapter([8])
-    client = mp_connector._MPLookupClient(
+    client = mp_lookup._MPLookupClient(
         adapter,
+        config=_config(),
         timeout=10.0,
         poll_interval=0.01,
     )
@@ -538,11 +704,12 @@ def test_mp_lookup_rejects_retrieve_beyond_lookup_hit(monkeypatch):
 
 def test_mp_lookup_timeout_defers_cleanup_until_result(monkeypatch):
     ticks = iter([0.0, 0.0, 2.0])
-    monkeypatch.setattr(mp_connector.time, "monotonic", lambda: next(ticks))
-    monkeypatch.setattr(mp_connector.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(transfer.time, "sleep", lambda _seconds: None)
     adapter = _LookupAdapter([None, None])
-    client = mp_connector._MPLookupClient(
+    client = mp_lookup._MPLookupClient(
         adapter,
+        config=_config(),
         timeout=1.0,
         poll_interval=0.01,
     )
@@ -553,16 +720,17 @@ def test_mp_lookup_timeout_defers_cleanup_until_result(monkeypatch):
     adapter.results.append(8)
     client.clear_lookup_status("req")
     assert [(call["start"], call["end"]) for call in adapter.freed] == [(0, 8)]
-    assert adapter.cleaned == ["req"]
+    assert adapter.cleaned == ["atom-offload-dp0:req"]
 
 
 def test_mp_lookup_pending_cleanup_drops_adapter_bookkeeping(monkeypatch):
     ticks = iter([0.0, 0.0, 2.0])
-    monkeypatch.setattr(mp_connector.time, "monotonic", lambda: next(ticks))
-    monkeypatch.setattr(mp_connector.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(transfer.time, "sleep", lambda _seconds: None)
     adapter = _LookupAdapter([None, None])
-    client = mp_connector._MPLookupClient(
+    client = mp_lookup._MPLookupClient(
         adapter,
+        config=_config(),
         timeout=1.0,
         poll_interval=0.01,
     )
@@ -570,20 +738,21 @@ def test_mp_lookup_pending_cleanup_drops_adapter_bookkeeping(monkeypatch):
     assert client.lookup(list(range(8)), "req") is None
     client.clear_lookup_status("req")
 
-    assert adapter.cleaned == ["req"]
+    assert adapter.cleaned == ["atom-offload-dp0:req"]
     assert client.hit_tokens("req") is None
 
 
 def _full_prompt_hit_scheduler(monkeypatch, chunk_size):
-    monkeypatch.setattr(mp_connector.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(transfer.time, "sleep", lambda _seconds: None)
     adapter = _LookupAdapter([8])
-    lookup = mp_connector._MPLookupClient(
+    lookup = mp_lookup._MPLookupClient(
         adapter,
+        config=_config(),
         timeout=1.0,
         poll_interval=0.01,
     )
-    scheduler = mp_connector.LMCacheMPConnectorScheduler.__new__(
-        mp_connector.LMCacheMPConnectorScheduler
+    scheduler = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
+        mp_scheduler.LMCacheMPConnectorScheduler
     )
     scheduler._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
@@ -663,7 +832,7 @@ def test_mp_lookup_timeout_is_not_recorded_as_a_tier_miss(monkeypatch):
     """
 
     ticks = iter([0.0, 0.0, 2.0, 0.0])
-    monkeypatch.setattr(mp_connector.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: next(ticks))
     scheduler, lookup = _full_prompt_hit_scheduler(monkeypatch, chunk_size=4)
     adapter = lookup._adapter
     adapter.results.clear()
@@ -677,7 +846,10 @@ def test_mp_lookup_timeout_is_not_recorded_as_a_tier_miss(monkeypatch):
     assert scheduler._tier_hit_memo["7"][1] is None
 
     assert scheduler.get_num_new_matched_tokens(seq) == (4, True)
-    assert [request_id for request_id, _tokens in adapter.submissions] == ["7", "7"]
+    assert [request_id for request_id, _tokens in adapter.submissions] == [
+        "atom-offload-dp0:7",
+        "atom-offload-dp0:7",
+    ]
 
 
 def test_block_size_one_full_prompt_hit_stays_declined_when_asked_again(monkeypatch):
@@ -703,13 +875,14 @@ def test_block_size_one_full_prompt_hit_stays_declined_when_asked_again(monkeypa
 
 def test_stale_load_failure_does_not_release_current_generation_locks():
     adapter = _LookupAdapter([])
-    lookup = mp_connector._MPLookupClient(
+    lookup = mp_lookup._MPLookupClient(
         adapter,
+        config=_config(),
         timeout=1.0,
         poll_interval=0.01,
     )
-    scheduler = mp_connector.LMCacheMPConnectorScheduler.__new__(
-        mp_connector.LMCacheMPConnectorScheduler
+    scheduler = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
+        mp_scheduler.LMCacheMPConnectorScheduler
     )
     scheduler._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
@@ -722,7 +895,7 @@ def test_stale_load_failure_does_not_release_current_generation_locks():
     current = LoadOperationId(req_id=7, generation=2)
     stale = LoadOperationId(req_id=7, generation=1)
     scheduler._active_load_operations["7"] = (seq, current)
-    lookup._lookups["7"] = mp_connector._LookupState(
+    lookup._lookups["7"] = mp_lookup._LookupState(
         token_ids=list(range(8)),
         hit=8,
         retrieve_start=0,
@@ -764,6 +937,7 @@ class _WorkerFuture:
         self.ready = False
         self.value = result
         self.query_error = None
+        self.completed_ranges = []
 
     def query(self):
         if self.query_error is not None:
@@ -774,6 +948,11 @@ class _WorkerFuture:
         if not self.ready:
             raise TimeoutError("future is not ready")
         return self.value
+
+    def take_completed_ranges(self):
+        ranges = self.completed_ranges
+        self.completed_ranges = []
+        return ranges
 
 
 @pytest.fixture
@@ -828,19 +1007,22 @@ class _WorkerAdapter:
         self.saves.append((request_id, op, event, future))
         return future
 
+    def submit_store_request_with_chunk_events(self, request_id, op, event):
+        return self.submit_store_request(request_id, op, event)
+
     def shutdown(self):
         self.shutdown_called = True
 
 
-def _worker(adapter: _WorkerAdapter) -> mp_connector.LMCacheMPConnector:
-    worker = mp_connector.LMCacheMPConnector(_config())
+def _worker(adapter: _WorkerAdapter) -> mp_worker.LMCacheMPConnector:
+    worker = mp_worker.LMCacheMPConnector(_config())
     worker._adapter = adapter
     worker.chunk_size = 8
     return worker
 
 
 def _finish_load(
-    worker: mp_connector.LMCacheMPConnector,
+    worker: mp_worker.LMCacheMPConnector,
     operation_id: str,
     *,
     result: bool = True,
@@ -851,7 +1033,7 @@ def _finish_load(
 
 
 def _finish_save(
-    worker: mp_connector.LMCacheMPConnector,
+    worker: mp_worker.LMCacheMPConnector,
     operation_id: str,
     *,
     result: bool = True,
@@ -879,6 +1061,7 @@ def test_worker_uses_transfer_boundary_and_exact_completion(fake_lmcache_modules
     )
 
     worker._submit_load(request, object())
+    assert adapter.loads[0][0] == "atom-offload-dp0:5"
     submitted = adapter.loads[0][1]
     assert submitted.start == 0
     assert submitted.end == 8
@@ -1054,6 +1237,121 @@ def test_worker_pre_submit_drops_are_immediately_terminal(
     assert worker._pending_saves == {}
 
 
+def _unprovable_request(kind: str) -> LMCacheReqMeta:
+    if kind == "load":
+        return LMCacheReqMeta(
+            req_id=16,
+            token_ids=list(range(16)),
+            block_ids=[100, 101, 102, 103],
+            load_spec=LoadSpec(0, 16, can_load=True),
+            load_operation=LoadOperationId(req_id=16, generation=1),
+        )
+    return LMCacheReqMeta(
+        req_id=16,
+        token_ids=list(range(16)),
+        block_ids=[100, 101, 102, 103],
+        save_spec=SaveSpec(skip_leading_tokens=0),
+        save_operation=SaveOperationId(req_id=16, generation=1),
+    )
+
+
+@pytest.mark.parametrize("kind", ["load", "save"])
+def test_worker_unprovable_submission_is_never_released_on_a_clock(
+    fake_lmcache_modules,
+    monkeypatch,
+    kind,
+):
+    """A raising submit may have reached the server, which may still read the
+    source or write the destination. Nothing settles, so nothing is released;
+    past the transfer deadline the worker stops the engine instead."""
+    adapter = _WorkerAdapter()
+
+    def unprovable(_request_id, _op, _event):
+        raise ConnectionError("server may have received request")
+
+    for name in (
+        "submit_retrieve_request",
+        "submit_store_request",
+        "submit_store_request_with_chunk_events",
+    ):
+        monkeypatch.setattr(adapter, name, unprovable)
+    now = [1000.0]
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
+    worker = _worker(adapter)
+    request = _unprovable_request(kind)
+    if kind == "load":
+        worker._submit_load(request, object())
+        pending = worker._pending_loads
+    else:
+        worker._submit_save(request, object())
+        pending = worker._pending_saves
+
+    now[0] += worker._transfer_deadline_s - 1
+    output = worker.get_finished()
+    assert not output.connector_completions
+    assert not output.failed_loading and not output.finished_saving
+    assert len(pending) == 1
+
+    now[0] += 2
+    with pytest.raises(transfer.LMCacheTransferUnprovable):
+        worker.get_finished()
+    assert len(pending) == 1
+
+
+def test_worker_future_that_keeps_raising_is_bounded_by_the_deadline(
+    fake_lmcache_modules,
+    monkeypatch,
+):
+    now = [1000.0]
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
+    worker = _worker(_WorkerAdapter())
+    worker._submit_save(_unprovable_request("save"), object())
+    [pending] = worker._pending_saves.values()
+    pending.future.query_error = ConnectionError("IPC context torn down")
+
+    assert not worker.get_finished().finished_saving
+    now[0] += worker._transfer_deadline_s
+    with pytest.raises(transfer.LMCacheTransferUnprovable):
+        worker.get_finished()
+
+
+def test_worker_invalid_descriptor_fails_before_transport(
+    fake_lmcache_modules,
+):
+    """A descriptor that cannot be built is provably unsent: it settles now."""
+    adapter = _WorkerAdapter()
+    worker = _worker(adapter)
+    load = replace(_unprovable_request("load"), block_ids=[100])
+    save = replace(_unprovable_request("save"), block_ids=[100])
+    worker._submit_load(load, object())
+    worker._submit_save(save, object())
+
+    output = worker.get_finished()
+    assert not adapter.loads and not adapter.saves
+    assert output.failed_loading == {load.load_operation}
+    assert output.finished_saving == {save.save_operation}
+    [store] = [
+        completion
+        for completion in output.connector_completions
+        if completion.channel == DENSE_PAGE_STORE_CHANNEL
+    ]
+    assert not store.succeeded
+
+
+def test_transfer_deadline_defaults_to_twenty_minutes():
+    assert transfer._transfer_deadline_s(_config()) == 1200.0
+    assert (
+        transfer._transfer_deadline_s(
+            _config(extra={"lmcache.mp.transfer_deadline_s": 30})
+        )
+        == 30.0
+    )
+    with pytest.raises(ValueError, match="transfer_deadline_s"):
+        transfer._transfer_deadline_s(
+            _config(extra={"lmcache.mp.transfer_deadline_s": 0})
+        )
+
+
 def test_worker_save_slices_chunk_blocks_and_preserves_operation(
     fake_lmcache_modules,
 ):
@@ -1069,6 +1367,7 @@ def test_worker_save_slices_chunk_blocks_and_preserves_operation(
     )
 
     worker._submit_save(request, object())
+    assert adapter.saves[0][0] == "atom-offload-dp0:8"
     submitted = adapter.saves[0][1]
     assert submitted.start == 8
     assert submitted.end == 16
@@ -1076,6 +1375,33 @@ def test_worker_save_slices_chunk_blocks_and_preserves_operation(
 
     _finish_save(worker, "save:8:2")
     assert worker.get_finished().finished_saving == {operation}
+
+
+def test_worker_reports_chunk_source_safe_before_store_terminal(fake_lmcache_modules):
+    adapter = _WorkerAdapter()
+    worker = _worker(adapter)
+    operation = SaveOperationId(req_id=81, generation=2)
+    request = LMCacheReqMeta(
+        req_id=81,
+        token_ids=list(range(16)),
+        block_ids=[30, 31, 32, 33],
+        save_spec=SaveSpec(skip_leading_tokens=0),
+        save_operation=operation,
+    )
+
+    worker._submit_save(request, object())
+    future = worker._pending_saves["save:81:2"].future
+    future.completed_ranges = [(8, 16)]
+    output = worker.get_finished()
+
+    assert output.finished_saving == set()
+    assert output.connector_completions == {
+        ConnectorCompletion(
+            DENSE_PAGE_SOURCE_SAFE_CHANNEL,
+            SaveSourceGroupId(operation, ((8, 16),)),
+            True,
+        )
+    }
 
 
 def test_non_writer_completes_save_without_submitting(fake_lmcache_modules):
@@ -1094,9 +1420,51 @@ def test_non_writer_completes_save_without_submitting(fake_lmcache_modules):
     worker._submit_save(request, object())
 
     assert adapter.saves == []
-    assert worker.get_finished().finished_saving == {operation}
+    output = worker.get_finished()
+    assert output.finished_saving == {operation}
+    assert {
+        completion.operation_id.ranges
+        for completion in output.connector_completions
+        if completion.channel == DENSE_PAGE_SOURCE_SAFE_CHANNEL
+    } == {((0, 8),)}
     with pytest.raises(RuntimeError, match="duplicate LMCache MP save"):
         worker._submit_save(request, object())
+
+
+def test_collapsed_tp_early_release_waits_only_for_the_single_writer_dma(
+    fake_lmcache_modules,
+):
+    operation = SaveOperationId(req_id=91, generation=1)
+    request = LMCacheReqMeta(
+        req_id=91,
+        token_ids=list(range(16)),
+        block_ids=[40, 41, 42, 43],
+        save_spec=SaveSpec(skip_leading_tokens=0),
+        save_operation=operation,
+    )
+    writer = _worker(_WorkerAdapter())
+    non_writer = _worker(_WorkerAdapter())
+    non_writer._is_kv_writer = False
+    writer._submit_save(request, object())
+    non_writer._submit_save(request, object())
+    writer_future = writer._pending_saves["save:91:1"].future
+    writer_future.completed_ranges = [(0, 8)]
+
+    aggregator = KVOutputAggregator(world_size=2)
+    first = aggregator.aggregate([writer.get_finished(), non_writer.get_finished()])
+    assert {
+        completion.operation_id.ranges
+        for completion in first.connector_completions
+        if completion.channel == DENSE_PAGE_SOURCE_SAFE_CHANNEL
+    } == {((0, 8),)}
+
+    writer_future.completed_ranges = [(8, 16)]
+    second = aggregator.aggregate([writer.get_finished(), non_writer.get_finished()])
+    assert {
+        completion.operation_id.ranges
+        for completion in second.connector_completions
+        if completion.channel == DENSE_PAGE_SOURCE_SAFE_CHANNEL
+    } == {((8, 16),)}
 
 
 def test_worker_tracks_two_load_generations_for_one_raw_request(
@@ -1286,7 +1654,7 @@ def test_worker_rejects_duplicate_while_operation_is_submitting(
 
 
 def test_worker_operation_tombstone_limit_is_4096():
-    assert mp_connector._OPERATION_TOMBSTONE_LIMIT == 4096
+    assert transfer._OPERATION_TOMBSTONE_LIMIT == 4096
 
 
 @pytest.mark.parametrize("kind", ["load", "save"])
@@ -1295,7 +1663,7 @@ def test_worker_terminal_operation_tombstones_are_bounded(
     monkeypatch,
     kind,
 ):
-    monkeypatch.setattr(mp_connector, "_OPERATION_TOMBSTONE_LIMIT", 2)
+    monkeypatch.setattr(transfer, "_OPERATION_TOMBSTONE_LIMIT", 2)
     adapter = _WorkerAdapter()
     worker = _worker(adapter)
 
@@ -1335,7 +1703,7 @@ def test_worker_terminal_operation_tombstones_are_bounded(
         if kind == "load"
         else worker._completed_save_operation_order
     )
-    assert mp_connector._OPERATION_TOMBSTONE_LIMIT == 2
+    assert transfer._OPERATION_TOMBSTONE_LIMIT == 2
     assert seen == {f"{kind}:24:2", f"{kind}:24:3"}
     assert list(order) == [f"{kind}:24:2", f"{kind}:24:3"]
 
@@ -1348,21 +1716,16 @@ def test_worker_terminal_operation_tombstones_are_bounded(
 
 def test_worker_immediate_operation_tombstones_reject_replay(
     fake_lmcache_modules,
-    monkeypatch,
 ):
     adapter = _WorkerAdapter()
-
-    def fail_load(_request_id, _op, _event):
-        raise RuntimeError("submission failed")
-
-    monkeypatch.setattr(adapter, "submit_retrieve_request", fail_load)
     worker = _worker(adapter)
     load_operation = LoadOperationId(req_id=25, generation=1)
     save_operation = SaveOperationId(req_id=26, generation=1)
+    # Too few blocks for the range: provably never sent, so immediately terminal.
     load_request = LMCacheReqMeta(
         req_id=25,
         token_ids=list(range(8)),
-        block_ids=[120, 121],
+        block_ids=[120],
         load_spec=LoadSpec(0, 8, can_load=True),
         load_operation=load_operation,
     )
@@ -1407,11 +1770,11 @@ def test_registers_multiple_layouts_as_views_of_one_engine_group(
 
     adapter = _WorkerAdapter()
     monkeypatch.setattr(
-        mp_connector,
+        mp_worker,
         "_make_worker_adapter",
         lambda _config, _rank: adapter,
     )
-    worker = mp_connector.LMCacheMPConnector(_config(model_type="ordinary_mha"))
+    worker = mp_worker.LMCacheMPConnector(_config(model_type="ordinary_mha"))
     transfer_tensors = _transfer_tensors()
     worker.register_kv_caches(
         {},
@@ -1449,11 +1812,11 @@ def test_registration_collapses_only_backend_declared_tp_replicas(
 
     adapter = _WorkerAdapter()
     monkeypatch.setattr(
-        mp_connector,
+        mp_worker,
         "_make_worker_adapter",
         lambda _config, _rank: adapter,
     )
-    worker = mp_connector.LMCacheMPConnector(_config(tp=8, kv_lora_rank=512))
+    worker = mp_worker.LMCacheMPConnector(_config(tp=8, kv_lora_rank=512))
     worker.register_kv_caches(
         {},
         transfer_tensors=_transfer_tensors(tp_replication_factor=8),
@@ -1478,7 +1841,7 @@ def test_registration_rejects_rank_collapse_without_backend_declaration(
     monkeypatch.setitem(sys.modules, "aiter.dist", dist)
     monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", parallel_state)
 
-    worker = mp_connector.LMCacheMPConnector(
+    worker = mp_worker.LMCacheMPConnector(
         _config(
             tp=8,
             extra={"lmcache.mp.tp_rank_collapse": True},
@@ -1500,3 +1863,75 @@ def test_factory_registers_lmcache_mp_alias_without_pd_staging():
         )
         is False
     )
+
+
+def test_page_region_is_a_region_and_its_byte_view_built_together():
+    """One call yields both halves, zero-copy, over exactly the PAGE bytes:
+    a larger allocation (DSV4's planes also hold SLOT rows) is cut to them."""
+    arena = torch.arange(3 * 8 + 4, dtype=torch.int16)  # 3 blocks + a tail
+    fp16 = torch.zeros(3, 4, 2, dtype=torch.float16)
+    transfer = KVTransferTensors(
+        pages=[
+            page_region(arena, semantic_role="plane", unit_bytes=16, total_bytes=48),
+            page_region(fp16, semantic_role="rows"),
+        ]
+    )
+
+    plane, rows = transfer.block_regions
+    assert (plane.base_addr, plane.total_bytes, plane.unit_bytes) == (
+        arena.data_ptr(),
+        48,
+        16,
+    )
+    assert (rows.total_bytes, rows.unit_bytes) == (48, 16)
+    for region, view in zip(
+        transfer.block_regions, transfer.block_tensor_views, strict=True
+    ):
+        assert view.dtype == torch.uint8
+        assert tuple(view.shape) == (3, 1, 16)
+        assert view.data_ptr() == region.base_addr
+    transfer.block_tensor_views[1][2].fill_(1)
+    assert torch.all(fp16[2].view(torch.uint8) == 1)
+    transfer.set_block_count(3)
+    assert page_views._build_cache_views(transfer, num_blocks=3).bytes_per_block == 32
+
+
+def test_page_region_rejects_what_it_cannot_alias():
+    with pytest.raises(ValueError, match="contiguous"):
+        page_region(torch.zeros(4, 3).t(), semantic_role="strided")
+    with pytest.raises(ValueError, match="cannot publish"):
+        page_region(
+            torch.zeros(8, dtype=torch.uint8),
+            semantic_role="short",
+            unit_bytes=4,
+            total_bytes=12,
+        )
+
+
+def test_pages_are_read_only_through_the_derived_lists():
+    """`block_regions` / `block_tensor_views` are views of `pages`, so nothing
+    can append to one without the other."""
+    transfer = KVTransferTensors(
+        pages=[page_region(torch.zeros(2, 4, dtype=torch.uint8), semantic_role="p")]
+    )
+    with pytest.raises(AttributeError):
+        transfer.block_regions.append(transfer.block_regions[0])
+    with pytest.raises(AttributeError):
+        transfer.block_tensor_views.append(transfer.block_tensor_views[0])
+
+
+def test_merge_pages_appends_a_draft_and_takes_the_gcd_replication():
+    target = KVTransferTensors(
+        pages=[page_region(torch.zeros(2, 4, dtype=torch.uint8), semantic_role="t")],
+        tp_replication_factor=8,
+    )
+    target.merge_pages(KVTransferTensors(tp_replication_factor=1))
+    assert target.tp_replication_factor == 8  # nothing merged, nothing changes
+    draft = KVTransferTensors(
+        pages=[page_region(torch.zeros(2, 2, dtype=torch.uint8), semantic_role="d")],
+        tp_replication_factor=1,
+    )
+    target.merge_pages(draft)
+    assert [r.semantic_role for r in target.block_regions] == ["t", "d"]
+    assert len(target.block_tensor_views) == 2
+    assert target.tp_replication_factor == 1

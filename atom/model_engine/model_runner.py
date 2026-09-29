@@ -2140,9 +2140,9 @@ class ModelRunner:
             # place the builder and the connector are both in scope.
             transfer_tensors.state_backend = self.attn_metadata_builder
         if hasattr(self, "draft_kv_builder") and transfer_tensors is not None:
-            draft_regions = self.draft_kv_builder.get_kv_transfer_tensors()
-            if draft_regions:
-                transfer_tensors.block_regions.extend(draft_regions)
+            transfer_tensors.merge_pages(
+                self.draft_kv_builder.get_kv_transfer_tensors()
+            )
         if transfer_tensors is not None:
             # After the draft's regions are in, and here because this is the
             # only place holding both the complete region list and the

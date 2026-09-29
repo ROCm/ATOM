@@ -163,6 +163,10 @@ def _patch_sglang_dsv4_draft_backends() -> None:
     native DeepSeekV4TokenToKVPool, while ATOM plugin mode uses a proxy KV pool,
     so patch the factory methods to return the ATOM shim.
 
+    SGLang 0.5.19 ``DraftBackendFactory._create_backend`` unpacks
+    ``stamp, backend = factory()``.  Both decode and draft-extend factories
+    must return that pair; a bare backend raises TypeError before lm_eval.
+
     GLM-5.2 uses SGLang's AITER multi-step lifecycle with ATOM's general
     attention backend.
     """
@@ -181,16 +185,22 @@ def _patch_sglang_dsv4_draft_backends() -> None:
         return
 
     def _create_atom_dsv4_decode_backend(self):
-        return ATOMDeepseekV4BackendForSgl(
-            self.draft_model_runner,
-            topk=self.topk,
-            speculative_num_steps=self.speculative_num_steps,
+        return (
+            "dsv4",
+            ATOMDeepseekV4BackendForSgl(
+                self.draft_model_runner,
+                topk=self.topk,
+                speculative_num_steps=self.speculative_num_steps,
+            ),
         )
 
     def _create_atom_dsv4_prefill_backend(self):
-        return ATOMDeepseekV4BackendForSgl(
-            self.draft_model_runner,
-            skip_prefill=False,
+        return (
+            "dsv4",
+            ATOMDeepseekV4BackendForSgl(
+                self.draft_model_runner,
+                skip_prefill=False,
+            ),
         )
 
     DraftBackendFactory._create_dsv4_decode_backend = _create_atom_dsv4_decode_backend

@@ -174,7 +174,7 @@ FROM ${SGLANG_BASE_IMAGE} AS atom_sglang
 ARG GPU_ARCH
 ARG VENV_PYTHON="/opt/venv/bin/python"
 ARG SGLANG_REPO="https://github.com/sgl-project/sglang.git"
-ARG SGLANG_REF="v0.5.17"
+ARG SGLANG_REF="v0.5.20"
 LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
 
 ENV PATH="/opt/venv/bin:${PATH}"
@@ -536,10 +536,12 @@ RUN pip install rocm-trace-lite && \
 # ATOM: Python package install (editable) with the atomesh build hook enabled.
 # CACHEBUST invalidates only this layer so parallel stages stay cached
 ARG CACHEBUST=1
+# Optional Cargo features; ext-proc is excluded unless explicitly requested.
+ARG ATOM_MESH_FEATURES=""
 RUN git clone $ATOM_REPO /app/ATOM && \
     cd /app/ATOM && \
     git checkout $ATOM_COMMIT && \
-    ATOM_MESH_BUILD=1 python -m pip install -e .
+    ATOM_MESH_BUILD=1 ATOM_MESH_FEATURES="${ATOM_MESH_FEATURES}" python -m pip install -e .
 RUN pip show atom || true
 
 RUN pip install --no-cache-dir msgpack msgspec quart

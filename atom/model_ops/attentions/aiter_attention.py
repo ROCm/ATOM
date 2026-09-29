@@ -773,29 +773,25 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
     def get_kv_transfer_tensors(self):
-        from atom.kv_transfer.disaggregation.types import (
-            KVTransferRegion,
-            KVTransferTensors,
-        )
+        from atom.kv_transfer.disaggregation.page_region import page_region
+        from atom.kv_transfer.disaggregation.types import KVTransferTensors
 
         if not self.kv_pools:
             return None
-        # Every field of every pool, indexer cache included: a region per
-        # (pool, field, layer), in declared order.
         return KVTransferTensors(
-            block_regions=[
-                KVTransferRegion(
-                    base_addr=tensor.data_ptr(),
-                    total_bytes=tensor.numel() * tensor.element_size(),
-                    unit_bytes=tensor.stride(0) * tensor.element_size(),
-                    # The geometry, because a hybrid declares two pools whose
-                    # per-layer regions are otherwise named alike.
-                    semantic_role=f"mha.{geometry}.{role}",
-                )
+            # Every field of every pool, indexer cache included: a unit per
+            # (pool, field, layer), in declared order. The geometry is in the
+            # role because a hybrid declares two pools whose per-layer regions
+            # are otherwise named alike.
+            pages=[
+                page_region(tensor, semantic_role=f"mha.{geometry}.{role}")
                 for geometry, pool in self.kv_pools.items()
                 for role, tensor in pool.region_tensors()
             ],
-            slot_regions=[],
+            # GQA/MQA KV heads are sharded or only partially replicated across
+            # TP. In particular MiniMax-M3 must keep one stored shard per rank;
+            # whole-object TP collapse is unsafe for this PAGE layout.
+            tp_replication_factor=1,
         )
 
     def refresh_flydsl_plan(self, context_lens, *, create=False):

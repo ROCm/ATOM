@@ -110,6 +110,8 @@ def test_parallel_source_slices_and_scale_alignment(linear_modules, kind):
     scales = torch.exp2(torch.arange(32).remainder(8).reshape(8, 4).float() - 4).to(
         torch.float8_e8m0fnu
     )
+    from aiter.ops.shuffle import shuffle_weight
+
     axis = 0 if kind == "ColumnParallelLinear" else 1
     for rank in range(4):
         group.rank_in_group = rank
@@ -117,15 +119,20 @@ def test_parallel_source_slices_and_scale_alignment(linear_modules, kind):
         module.weight_loader(module.weight, weight)
         module.weight_loader(module.weight_scale, scales)
         module.process_weights_after_loading()
-        assert torch.equal(
-            module.weight.view(torch.uint8),
-            weight.chunk(4, axis)[rank].view(torch.uint8),
+        # The shard's bytes, (16, 16)-shuffled where the preshuffled group32
+        # GEMM reads it (gfx950); the compact scales stay as loaded.
+        preshuffled = linear.weight_is_stored_preshuffled(
+            module.quant_type, module.params_dtype, native_group_rows=32
         )
+        shard = weight.chunk(4, axis)[rank].contiguous()
+        if preshuffled:
+            shard = shuffle_weight(shard, layout=(16, 16))
+        assert torch.equal(module.weight.view(torch.uint8), shard.view(torch.uint8))
         assert torch.equal(
             module.weight_scale.view(torch.uint8),
             scales.chunk(4, axis)[rank].view(torch.uint8),
         )
-        assert not getattr(module.weight, "is_shuffled", False)
+        assert getattr(module.weight, "is_shuffled", False) == preshuffled
 
 
 @pytest.mark.parametrize("shard_ids", [None, (0, 1)])
@@ -181,11 +188,13 @@ def test_column_row_views_use_source_scale_groups(linear_modules):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-def test_native_linear_dispatch_keeps_a8_qat(linear_modules):
+def test_native_linear_dispatch_keeps_a8_qat(linear_modules, monkeypatch):
     from . import oracle_kernels as oracle
 
     linear, group = linear_modules
     group.world_size = 1
+    # FP32 output is the row-major group32 GEMM's; the preshuffled one emits BF16.
+    monkeypatch.setenv("ATOM_GROUP32_WEIGHT_PRESHUFFLE", "0")
     torch.manual_seed(991)
     module = linear.ReplicatedLinear(288, 96, quant_config=_config()).cuda()
     weight = (torch.randn(96, 288) * 32).to(torch.float8_e4m3fn)
@@ -208,6 +217,31 @@ def test_native_linear_dispatch_keeps_a8_qat(linear_modules):
         rtol=3e-5,
         atol=5e-5 * expected.abs().max().item(),
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("m", [1, 5, 300])
+def test_native_linear_preshuffled_matches_row_major(linear_modules, monkeypatch, m):
+    """The (16, 16)-preshuffled group32 weight gives the row-major GEMM's BF16
+    result; off gfx950 both modules stay row-major and agree trivially."""
+    linear, group = linear_modules
+    group.world_size = 1
+    torch.manual_seed(m)
+    weight = (torch.randn(1024, 512) * 32).to(torch.float8_e4m3fn)
+    scale = torch.exp2(torch.randint(-8, -1, (32, 16)).float()).to(torch.float8_e8m0fnu)
+    x = torch.randn(m, 512, dtype=torch.bfloat16, device="cuda")
+    outputs = []
+    for preshuffle in ("0", "1"):
+        monkeypatch.setenv("ATOM_GROUP32_WEIGHT_PRESHUFFLE", preshuffle)
+        module = linear.ReplicatedLinear(512, 1024, quant_config=_config()).cuda()
+        module.weight_loader(module.weight, weight)
+        module.weight_loader(module.weight_scale, scale)
+        module.process_weights_after_loading()
+        outputs.append(module(x).float())
+    cos = torch.nn.functional.cosine_similarity(
+        outputs[0].flatten(), outputs[1].flatten(), dim=0
+    )
+    assert cos > 0.9999
 
 
 def test_merged_replicated_splits_v41_qkv_a_scale_rows(linear_modules):

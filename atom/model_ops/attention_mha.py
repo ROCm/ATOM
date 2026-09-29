@@ -1265,7 +1265,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
 
         qkv = qkv.contiguous()
         num_tokens = qkv.shape[0]
-        from atom.models.minimax_m3 import _minimax_m3_cos_sin_cache
+        from atom.models.minimax_m3.model import _minimax_m3_cos_sin_cache
 
         cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, qkv)
 

@@ -626,11 +626,13 @@ RUN pip install rocm-trace-lite && \
 # runs out of file descriptors on the docker default nofile limit (os error 24,
 # "could not execute process rustc (never executed)"); raise it for this step.
 ARG CACHEBUST=1
+# Optional Cargo features; ext-proc is excluded unless explicitly requested.
+ARG ATOM_MESH_FEATURES=""
 RUN git clone $ATOM_REPO /app/ATOM && \
     cd /app/ATOM && \
     git checkout $ATOM_COMMIT && \
     ulimit -n 65536 && \
-    ATOM_MESH_BUILD=1 python -m pip install -e .
+    ATOM_MESH_BUILD=1 ATOM_MESH_FEATURES="${ATOM_MESH_FEATURES}" python -m pip install -e .
 RUN pip show atom || true
 
 RUN pip install --no-cache-dir msgpack msgspec quart

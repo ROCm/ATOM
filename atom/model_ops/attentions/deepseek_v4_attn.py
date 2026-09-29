@@ -80,6 +80,7 @@ from atom.model_ops.attentions.pool_layout.entry_arena import (
     plan_regions,
 )
 from atom.model_ops.attentions.pool_layout.paged_state_copy import (
+    DescriptorStaging,
     SegmentedCopyPlan,
     launch_copy_descriptor,
     plan_segmented_copy,
@@ -730,7 +731,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._page_unit_region_owners: tuple[int, ...] = ()
         self._checkpoint_plan_cache: SegmentedCopyPlan | None = None
         self._checkpoint_slot_base_cache: np.ndarray | None = None
-        self._checkpoint_descriptor: CpuGpuBuffer | None = None
+        self._checkpoint_staging_cache: DescriptorStaging | None = None
 
     @property
     def prep_stream(self):
@@ -969,6 +970,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self,
         store_ops: Sequence[CheckpointStoreOp],
         restore_ops: Sequence[CheckpointRestoreOp],
+        descriptor_slot: int = 0,
     ) -> None:
         """Copy raw checkpoint bytes between slots and non-contiguous PAGEs.
 
@@ -987,14 +989,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         slot_bases = self._checkpoint_slot_bases()
         per_op = plan.num_spans
         total = (len(store_ops) + len(restore_ops)) * per_op
-        staging = self._checkpoint_descriptor_buffer()
-        if total > staging.np.shape[0]:
+        staging = self._checkpoint_staging()
+        rows = staging.rows(descriptor_slot)
+        if total > rows.shape[0]:
             raise RuntimeError(
                 f"a step asked to copy {total // per_op} checkpoints, more "
-                f"than the {staging.np.shape[0] // per_op} its descriptor was "
+                f"than the {rows.shape[0] // per_op} its descriptor was "
                 "sized for"
             )
-        descriptor = staging.np[:total]
+        descriptor = rows[:total]
         at = 0
         for ops, storing in ((store_ops, True), (restore_ops, False)):
             if not ops:
@@ -1008,7 +1011,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 forward=storing,
             )
             at = end
-        launch_copy_descriptor(staging.copy_to_gpu(total), plan)
+        launch_copy_descriptor(staging.upload(descriptor_slot, total), plan)
 
     def _validate_paged_state_op(
         self, op: CheckpointStoreOp | CheckpointRestoreOp
@@ -1159,7 +1162,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._checkpoint_range_cache = None
         self._checkpoint_plan_cache = None
         self._checkpoint_slot_base_cache = None
-        self._checkpoint_descriptor = None
+        self._checkpoint_staging_cache = None
 
     def warmup_per_req_cache(self) -> None:
         """Run one checkpoint copy now, so the first real one is only a copy.
@@ -1182,42 +1185,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if not plan.num_spans:
             return
         units = self.model_runner.state_runtime.checkpoint_spec.units_per_checkpoint
-        staging = self._checkpoint_descriptor_buffer()
+        staging = self._checkpoint_staging()
         plan.write_descriptor(
-            staging.np[: plan.num_spans],
+            staging.rows(0)[: plan.num_spans],
             self._checkpoint_slot_bases()[:1],
             self._page_unit_bases([list(range(units))]),
         )
-        launch_copy_descriptor(staging.copy_to_gpu(plan.num_spans), plan)
+        launch_copy_descriptor(staging.upload(0, plan.num_spans), plan)
 
-    def _checkpoint_descriptor_buffer(self) -> CpuGpuBuffer:
-        """Pinned staging for a step's whole descriptor, sized for the worst step.
-
-        Pinned because the alternative synchronizes: a pageable H2D from
-        `build()` makes the host wait out the forward already enqueued, which
-        measured 2.9 ms behind 4 ms of work against 0.1 ms staged. Reused
-        because allocating pinned memory is itself a synchronizing call.
-
-        A step can carry at most one store and one restore per sequence, so
-        two per Active Slot bounds it -- 1.6 MB at the shipped geometry. The
-        caller checks that bound rather than growing on demand: a descriptor
-        that did not fit would otherwise be silently truncated into a copy of
-        the wrong shape.
-
-        The store half is held by `PagedStateCheckpointCoordinator._supersede`,
-        which keeps one pending boundary per sequence -- see the longer note on
-        `GDNStateMixin._checkpoint_descriptor_buffer`.
-        """
-        if self._checkpoint_descriptor is None:
-            plan = self._checkpoint_copy_plan()
-            max_ops = 2 * int(self.model_runner.config.max_num_seqs)
-            self._checkpoint_descriptor = CpuGpuBuffer(
-                max_ops * plan.num_spans,
-                3,
-                dtype=torch.int64,
-                device=self._kv_planes()[0].device,
-            )
-        return self._checkpoint_descriptor
+    def _checkpoint_descriptor_device(self) -> torch.device:
+        return self._kv_planes()[0].device
 
     def _checkpoint_copy_plan(self) -> SegmentedCopyPlan:
         """Where a slot's checkpoint ranges meet a whole image's PAGE regions.
@@ -1913,9 +1890,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         ``staging_region`` and ``gather_slot`` describe only compressor-state
         PD staging and must never be used as the source of a SLOT sidecar.
         """
+        from atom.kv_transfer.disaggregation.page_region import page_region
         from atom.kv_transfer.disaggregation.types import (
             KVTransferRegion,
             KVTransferTensors,
+            PageRegion,
         )
 
         runner = self.model_runner
@@ -1945,7 +1924,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         geo = self.pool_geometry
         elem_fp32 = 4
 
-        block_regions: list[KVTransferRegion] = []
+        pages: list[PageRegion] = []
         swa_block_regions: list[KVTransferRegion] = []
         slot_regions: list[KVTransferRegion] = []
 
@@ -1971,12 +1950,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             )
         )
         for plane, row_bytes, role in planes:
-            block_regions.append(
-                KVTransferRegion(
-                    plane.data_ptr(),
-                    self.num_blocks * geo.block_bytes(row_bytes),
-                    geo.block_bytes(row_bytes),
+            # A plane also holds SLOT rows after its PAGE blocks; publish only
+            # the blocks.
+            pages.append(
+                page_region(
+                    plane,
                     semantic_role=role,
+                    unit_bytes=geo.block_bytes(row_bytes),
+                    total_bytes=self.num_blocks * geo.block_bytes(row_bytes),
                 )
             )
 
@@ -1986,24 +1967,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # this remains correct for both the FP8 row layout and FP4 tiles.
         for pool, role_prefix in self._indexer_page_pools():
             for pos, layer_id in enumerate(self.csa_layers):
-                view = pool[pos]
-                if not view.is_contiguous():
-                    raise RuntimeError(
-                        "a CSA indexer layer must be contiguous to be transferred"
-                    )
-                block_regions.append(
-                    KVTransferRegion(
-                        view.data_ptr(),
-                        view.numel() * view.element_size(),
-                        view.stride(0) * view.element_size(),
-                        semantic_role=f"{role_prefix}.layer_{layer_id}",
+                pages.append(
+                    page_region(
+                        pool[pos], semantic_role=f"{role_prefix}.layer_{layer_id}"
                     )
                 )
 
         checkpoint_spec = runner.state_runtime.checkpoint_spec
         if checkpoint_spec is None:
             raise RuntimeError("DSV4 PAGE/state checkpoint sizing spec is missing")
-        transfer_page_bytes = sum(region.unit_bytes for region in block_regions)
+        transfer_page_bytes = sum(page.region.unit_bytes for page in pages)
         if transfer_page_bytes != checkpoint_spec.page_unit_bytes:
             raise RuntimeError(
                 "DSV4 PAGE transfer regions do not cover the sized PAGE unit: "
@@ -2060,8 +2033,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 pool, stride, runner.v4_state_arena, self.pool_geometry
             )
 
+        # DSv4 PAGE KV and its compact C4/SWA checkpoint image are MLA state
+        # before any TP-sharded projection, so both are byte-identical on every
+        # TP rank. One writer is sufficient; all ranks still read.
+        tp_size = int(getattr(runner.config, "tensor_parallel_size", 1) or 1)
         return KVTransferTensors(
-            block_regions=block_regions,
+            pages=pages,
             swa_block_regions=swa_block_regions,
             slot_regions=slot_regions,
             num_slots=num_slots,
@@ -2070,6 +2047,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             staging_pool_size=pool_size if staging_region else 0,
             gather_slot=gather_slot,
             scatter_slot=scatter_slot,
+            tp_replication_factor=tp_size,
+            native_state_tp_replication_factor=tp_size,
+            paged_state_checkpoint_spec=checkpoint_spec,
+            execute_paged_state_copies=self.execute_paged_state_copies,
+            paged_state_region_count=len(pages),
         )
 
     # ------------------------------------------------------------------ #

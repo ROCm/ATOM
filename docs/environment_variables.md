@@ -6,7 +6,7 @@ This document describes the environment variables used in the ATOM project.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_H2D_BACKEND** | str | `direct` | `packed` combines forward metadata into one H2D and GPU scatter per consumer group. `direct` copies each member separately. Both preserve source reuse gates and full cudagraph padding. Set before starting the runner. See [metadata publication](h2d_publication.md). |
+| **ATOM_H2D_BACKEND** | str | `packed` | `packed` combines forward metadata into one H2D and GPU scatter per consumer group. `direct` copies each member separately. Both preserve source reuse gates and full cudagraph padding. Set before starting the runner. See [metadata publication](h2d_publication.md). |
 
 ## Data parallelism
 
@@ -101,6 +101,8 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_USE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 weight preshuffled GEMM. Otherwise use AITER ASM FP4 weight preshuffled GEMM. |
+| **ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE** | bool | unset (per checkpoint) | E8M0 rather than FP32 128x128 FP8 block scales, for the weight and the activation quantized for it; on gfx950 E8M0 operands take the AITER FlyDSL GEMM. Unset: E8M0 on every arch but gfx942 when the checkpoint declares `scale_fmt: ue8m0` (DeepSeek-V4), whose power-of-two scales E8M0 restates exactly; FP32 otherwise. `1`/`0` force it on/off; forcing it on for a checkpoint with non-power-of-two FP32 scales rounds them. |
+| **ATOM_GROUP32_WEIGHT_PRESHUFFLE** | bool | 1 (true) | On gfx950, (16, 16)-shuffle native FP8 32x32 group32 weights (DeepSeek-V4.1) at load and after a weight sync, so AITER's preshuffled group32 GEMM (FlyDSL) reads them; that GEMM emits BF16 only. Set to `0` to keep checkpoint bytes and the row-major group32 GEMM. V4.1's grouped `wo_a` is shuffled either way. |
 | **ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 GEMM with non-shuffled weights. Takes precedence over the FP4 preshuffled GEMM path selected by `ATOM_USE_TRITON_GEMM`. |
 | **ATOM_MHC_USE_BF16** | bool | 1 (true) | Use AITER BF16 hi/lo mHC computation for attention, FFN and head. After loading, replace FP32 fn storage with `mhc_shuffle_fn` output; no FP32 copy is retained. Set to `0` for FP32 mHC. Takes effect at model load; restart to change modes. On gfx1250, AITER enables shuffled residuals only while its runtime `mhc_fused_post_pre` policy remains fused (`M < 1024`); larger M uses ordinary residual layout and the standalone post/pre fallback. |
 | **ATOM_USE_TRITON_MXFP4_BMM** | bool | 0 (false) | If set to `1`, use FP4 BMM in MLA attention module. |
@@ -116,6 +118,15 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | **ATOM_GLM5_KPOOL** | bool | 1 (true) | Enable the pooled sparse indexer. Setting `0` is an exact token-granular A/B only at or below `index_topk`; longer requests are refused. |
 | **ATOM_GLM5_FORCE_DENSE_MLA** | bool | 0 (false) | Disable sparse MLA for short-context bring-up comparisons. |
 | **ATOM_GLM5_DISABLE_FUSED_MHC** | bool | 0 (false) | Force the PyTorch mHC reference path instead of AITER's fused kernels. |
+
+### MiniMax-M3
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_MONO_ENABLE** | bool | 1 (true) | Fused per-layer decode, on by default (`0` disables it); MiniMax-M3 is the only model with a mono path so far. Route decode steps of up to 16 tokens (requests × speculative query tokens; a verify's tokens run as one row each) to the fused layer kernels in `atom/models/minimax_m3/mono/`, Eagle3 aux hidden states included. Only a supported configuration is routed (TP4, ptpc_fp8 attention linears, fp8 KV and index cache, `max_model_len` up to 1M, no index-cache reuse, no TBO / DP / PP / plugin mode, FULL cudagraph or eager); everything else keeps the original model. The same entry class serves both paths. |
+| **ATOM_MONO_CHECK** | bool | 0 (false) | Debug aid for `ATOM_MONO_ENABLE`: every sparse layer also runs the original decoder layer on the same input (after the mono layer, so mono reads only the cache entries it inserted) and rank 0 logs the per-layer, per-token difference of the residual and of the reduced output. Run it with `--enforce-eager`. |
+| **ATOM_MONO_TRACE** | path | unset | Debug aid for `ATOM_MONO_ENABLE`: rank 0 appends every mono step's input tokens, positions, top-2 logits and greedy pick to this file (one JSON line per step), with a fingerprint of every stage (dense layers, each sparse layer's output, the cache history it reads). Two runs of the same prompt then align token by token. Run it with `--enforce-eager`. |
+| **ATOM_MONO_TIMELINE** | path prefix | unset | Debug aid for `ATOM_MONO_ENABLE`: the mono layer kernels are built with their per-phase `s_memrealtime` stamps, each sparse layer into its own buffer, and after 20 warm-up steps of every decode token count S the next 5 steps are saved per rank as `<prefix>_r<rank>_s<S>_<i>.pt` (int64 [layer][CTA][stamp], 100 MHz ticks, 0 = not reached). Run it with `--enforce-eager`: a graph replay runs no Python. |
 
 ## MoE all2all (MoRI) wire format
 
@@ -288,16 +299,34 @@ flag below. Details in the state-checkpoint section of the
 
 ### LMCache offload tier
 
-The LMCache source-pin timeout and ATOM's pending-save bound are read directly
-via `os.environ` rather than through `atom.utils.envs`. Their behavior is
-defined in `atom/kv_transfer/offload/_offload_common.py` and documented in full
-in `atom/kv_transfer/offload/README.md`; they are also listed here so they are
-discoverable from the central env reference despite bypassing the registry.
+ATOM's own offload knobs are defined in `atom/utils/envs.py`; their behavior is
+documented in `atom/kv_transfer/offload/README.md`. Where a
+`kv_connector_extra_config` key also exists, it takes precedence over the env
+var. `LMCACHE_EC_PIN_TIMEOUT_SEC` belongs to LMCache and is read only to
+derive a bound.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **LMCACHE_EC_PIN_TIMEOUT_SEC** | float | LMCache's own (300) | LMCache's source-pin timeout. ATOM reads it only to derive the engine's save-abandon window (`pin + 30s`), so the two stay ordered — a lost store report is reclaimed only after LMCache would already have force-unpinned its source. Non-positive disables ATOM's reclamation. ATOM sets no default of its own; when unset it assumes LMCache's. |
-| **OFFLOAD_MAX_PENDING_SAVES** | int | **2**, flat, for the engine-side/state-tier reader (`scheduler.py`); `max(2, 2 × OFFLOAD_COPY_WORKERS)` for the KV-leg reader (`_offload_common.py`) | Bound on total in-flight offload transfers (running + queued) held before a SLOT snapshot or executor submission. A KV save and a state store both pin bytes out of the same pool while they run, so the KV leg and the K3 state tier share this one number rather than each carrying its own. Two readers compute it, though: the KV leg's canonical `_offload_common.max_pending_saves` derives the shown default from `OFFLOAD_COPY_WORKERS` and **raises** on an unparseable value, while the scheduler's state-tier reader (`_offload_max_pending_saves`) has a simpler fallback — a flat default of **2** (no `OFFLOAD_COPY_WORKERS` scaling) that **warns and uses 2** on an unparseable value rather than raising. Set the env to an explicit integer to pin both. |
+| **ATOM_KV_OFFLOAD** | str | "" (off) | Enables LMCache KV offload without `--kv-transfer-config`, so a launcher that owns that flag for P/D can still add offload. `lmcache` selects the in-process `lmcache_offload` connector, `lmcache_mp` the standalone-server `lmcache_mp` connector (start `lmcache server` first). With a P/D connector in `--kv-transfer-config`, both run behind a `multi` connector. Setting it while `--kv-transfer-config` already names an offload connector is an error. |
+| **ATOM_KV_OFFLOAD_EXTRA_CONFIG** | JSON object | "" | The offload connector's `kv_connector_extra_config`: `lmcache.<field>` overrides (e.g. `{"lmcache.chunk_size": 256}`) and, for `lmcache_mp`, `lmcache.mp.*` options (e.g. `{"lmcache.mp.port": 5556}`). Requires `ATOM_KV_OFFLOAD`. |
+| **OFFLOAD_COPY_WORKERS** | int | 1 | Save executor threads per offload worker. Also scales the default `OFFLOAD_MAX_PENDING_SAVES`. |
+| **OFFLOAD_LOAD_WORKERS** | int | 1 | Load executor threads per offload worker. DSV4's in-process path ignores it (its SLOT load path needs a serial load executor). |
+| **OFFLOAD_MAX_PENDING_SAVES** | int | unset: `max(2, 2 × OFFLOAD_COPY_WORKERS)` for connectors, **2** for the scheduler's state tier | Bound on running-plus-queued saves. KV and state saves share it because both pin the same pool. A non-integer raises on the connector path and warns (using 2) on the state-tier path. Overridden by `max_pending_saves` in `kv_connector_extra_config`. |
+| **OFFLOAD_MIN_LOAD_TOKENS** | int | 8192 | Smallest external-tier hit worth loading; shorter hits are recomputed. Negative values clamp to 0. |
+| **OFFLOAD_MIN_SAVE_TOKENS** | int | 8192 | Shortest prefix native `lmcache_mp` stores, as an absolute boundary for normal and late saves. With the default equal to `OFFLOAD_MIN_LOAD_TOKENS`, a shorter prefix could never be loaded back. Other connectors ignore it. |
+| **OFFLOAD_LOOKUP_MEMO_STEPS** | int | 32 | Scheduler steps a memoised tier-lookup answer is replayed before the tier is asked again. |
+| **OFFLOAD_LOOKUP_RETRY_STEPS** | int | 32 | Scheduler steps a failed tier lookup suppresses the next attempt. |
+| **OFFLOAD_PROFILE** | bool | 0 | Emit `[OFFLOAD-SAVE-PROF]` / `[OFFLOAD-LOAD-PROF]` per-transfer records. An empty value reads as off. |
+| **OFFLOAD_SINGLE_STREAM** | bool | 0 | Experimental: run the staging pack and copy legs on one stream. |
+| **OFFLOAD_GPU_STAGING_CHUNKS** | int | derived from KV geometry | GPU staging buffer size in LMCache chunks (≥ 1). |
+| **OFFLOAD_GPU_STAGING_MAX_BYTES** | int | unset | Upper bound on the GPU staging buffer in bytes; must hold at least one chunk. |
+| **OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER** | bool | 0 | Free the GPU staging buffer after each transfer instead of keeping it. |
+| **OFFLOAD_SLOT_STAGING_SLOTS** | int | 1 | DSV4 in-process SLOT sidecar staging rows. Overridden by `slot_sidecar_staging_slots`. |
+| **OFFLOAD_COMMITTED_SIDECAR_CAPACITY** | int | 65536 | DSV4 in-process committed SLOT sidecar index capacity. Overridden by `committed_sidecar_index_capacity`. |
+| **OFFLOAD_PUBLICATION_TIMEOUT_S** | float | 5.0 | DSV4 in-process wait for a saved SLOT sidecar to become visible (finite, ≥ 0). |
+| **OFFLOAD_PUBLICATION_POLL_INTERVAL_S** | float | 0.01 | Poll period of that wait (finite, > 0). |
+| **LMCACHE_MP_TRANSFER_MODE** | str | auto | `lmcache_mp` transfer mode: `auto` or `lmcache_driven` (`engine_driven` is rejected). Overridden by `lmcache.mp.mp_transfer_mode`. |
+| **LMCACHE_EC_PIN_TIMEOUT_SEC** | float | LMCache's own (300) | LMCache's source-pin timeout. ATOM reads it only to derive the engine's save-abandon window (`pin + 30s`), so the two stay ordered: a lost store report is reclaimed only after LMCache would already have force-unpinned its source. Non-positive disables ATOM's reclamation. ATOM sets no default of its own and, when unset, assumes LMCache's. |
 
 ## KV cache events
 

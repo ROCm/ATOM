@@ -84,16 +84,18 @@ def test_yarn_frequencies_are_the_table_the_kernel_applies(inverse):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-def test_inverse_preserves_v4_fma_rounding_at_bf16_midpoint():
+def test_inverse_rounds_the_exact_value_with_bf16_tables():
     rope = RotaryEmbedding(64, 38, base=10000).cuda()
     hidden = torch.zeros(1, 38, 16, 512, device="cuda", dtype=torch.bfloat16)
     hidden[0, 5, 13, 464] = -0.2470703125
     hidden[0, 5, 13, 465] = 0.5
     with torch.inference_mode():
         actual = rope(hidden, torch.arange(38, device="cuda"), inverse=True)
-    # With these FP32 frequencies, a*cos+b*sin is 3.725e-9 below the
-    # BF16 midpoint. V4 FMA rounds down; eager complex multiplication rounds up.
-    assert actual[0, 5, 13, 464].item() == 0.0228271484375
+    # BF16 inputs times BF16 cos / sin are exact in FP32, so a fused and an
+    # unfused multiply-add agree: a*cos+b*sin, rounded once to BF16.
+    cos, sin = rope.cos_cache[5, 8].double(), rope.sin_cache[5, 8].double()
+    exact = -0.2470703125 * cos + 0.5 * sin
+    assert actual[0, 5, 13, 464].item() == exact.to(torch.bfloat16).item()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")

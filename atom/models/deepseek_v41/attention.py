@@ -2,20 +2,17 @@
 """CSA2 model projections; cache storage and sparse kernels have separate owners."""
 
 import torch
-from aiter import QuantType
 from aiter.dist.parallel_state import get_tp_group
+from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
+from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 from torch import nn
 
 from atom.model_ops.attentions.deepseek_v41.packed_attention import (
     packed_decode,
     packed_prefill,
 )
-from atom.model_ops.blockscale import (
-    dequantize_fp8_weight,
-)
 from atom.model_ops.deepseek_v41.compressor import Compressor
 from atom.model_ops.deepseek_v41.paged_scoring import score_topk_paged
-from atom.model_ops.deepseek_v41.projections import grouped_output_projection
 from atom.model_ops.layernorm import DualRMSNormMXFP8, RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -158,16 +155,18 @@ class Attention(nn.Module):
         self.qk_norm = DualRMSNormMXFP8(
             self.q_norm, self.kv_norm, f"layers.{spec.layer_id}.qk_norm"
         )
-        # wo_a: grouped LoRA. FP8 + e8m0 block scale on disk, BF16 in the
-        # grouped einsum. Allocated as a quantized ColumnParallelLinear so both
-        # tensors load through the standard FP8 path, then dequantized in
-        # `process_weights_after_loading` -- V4's arrangement, unchanged.
+        # wo_a: grouped LoRA, FP8 + 32x32 e8m0 block scale. Allocated as a
+        # quantized ColumnParallelLinear so both tensors load through the
+        # standard FP8 path; the grouped GEMM reads them in place, the weight
+        # in the 16x16 layout `LinearBase` shuffles it into, at load and after
+        # a weight sync alike.
         self.wo_a = ColumnParallelLinear(
             config.num_attention_heads * self.head_dim // config.o_groups,
             config.o_groups * self.o_rank,
             bias=False,
             quant_config=native_quant_config(),
         )
+        self.wo_a.needs_preshuffled_weight = True
         self.wo_b = RowParallelLinear(
             config.o_groups * self.o_rank,
             config.hidden_size,
@@ -204,44 +203,6 @@ class Attention(nn.Module):
             )
             cache.write_index(owner, step, index, self.spec.ratio)
 
-    def process_weights_after_loading(self) -> None:
-        """Dequantize wo_a to BF16 for the grouped LoRA einsum.
-
-        Copied from V4, minus its gfx950/gfx1250 mxscale branches: this einsum
-        path wants BF16. Idempotent -- a checkpoint that already ships wo_a as
-        BF16 lands here with nothing to do. Suppressing `quant_type` afterwards
-        is what stops `LinearBase.process_weights_after_loading` from applying
-        the FP8 CK 16x16 shuffle to a matrix `torch.einsum` then reads, which
-        would permute rows inside each block. Load order is parent first, so
-        this runs before that hook.
-        """
-        weight = self.wo_a.weight
-        if weight.dtype == torch.bfloat16:
-            return
-        scale = getattr(self.wo_a, "weight_scale", None)
-        if (
-            weight.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-            or scale is None
-        ):
-            return
-        # The scale stays in its native e8m0: this helper exists for exactly
-        # this weight and reads the grid in that encoding.
-        self.wo_a.weight = atom_parameter(
-            dequantize_fp8_weight(weight.data, scale.data)
-        )
-        try:
-            delattr(self.wo_a, "weight_scale")
-        except AttributeError:
-            pass
-        # The weight is BF16 now and its scale is gone, so both remaining FP8
-        # post-load steps have to be cancelled, not just the shuffle: the other
-        # one re-encodes an FP8 weight and its scale from e4m3fn to e4m3fnuz for
-        # the AMD parts that use that encoding. It is already off on e4m3fn
-        # hardware; clearing it is what makes this correct on the parts where
-        # `LinearBase` turned it on.
-        self.wo_a.quant_type = QuantType.No
-        self.wo_a.need_normalize_e4m3fn_to_e4m3fnuz = False
-
     def project_qkv(self, hidden, hidden_scale=None):
         """The one GEMM the query and the KV latent both come out of.
 
@@ -255,16 +216,28 @@ class Attention(nn.Module):
             dim=-1,
         )
 
-    def _project_out(self, output):
-        """The grouped output LoRA, taking an already un-rotated attention out.
-
-        Un-rotating is the caller's because the two callers reach their rows
-        differently -- one batch line against a ragged one -- while everything
-        after it is the same weights in the same order.
+    def _project_out(self, output, rope, positions):
+        """Inverse RoPE fused into the MXFP8 group quant, then the grouped FP8
+        `wo_a` GEMM and `wo_b`. `positions` are the rows' positions, in the
+        order of `output`'s leading dims.
         """
-        output = output.unflatten(-2, (self.groups, -1)).flatten(-2)
-        grouped = self.wo_a.weight.view(self.groups, self.o_rank, -1)
-        return self.wo_b(grouped_output_projection(output, grouped).flatten(-2))
+        rows = output.shape[:-2].numel()
+        x_fp8, x_scale = inverse_rope_group_quant(
+            output.reshape(rows, self.heads, self.head_dim),
+            positions.flatten(),
+            rope.cos_cache,
+            rope.sin_cache,
+            num_groups=self.groups,
+            quant_group_size=32,
+        )
+        y = batched_gemm_a8w8_mxscale_bpreshuffle(
+            x_fp8,
+            self.wo_a.weight.view(self.groups, self.o_rank, -1),
+            x_scale,
+            self.wo_a.weight_scale.view(self.groups, self.o_rank // 32, -1),
+            dtype=output.dtype,
+        )
+        return self.wo_b(y.view(*output.shape[:-2], -1))
 
     def _fork_compress(self, hidden, cache, step, rope):
         """The compressor, issued before the projections, beside them.
@@ -356,5 +329,5 @@ class Attention(nn.Module):
             # Preserve the prior ring until every query has consumed its prefix.
             cache.write_window(self.spec.layer_id, window_kv, step)
         return self._project_out(
-            rope(output.view_as(query), cache.rope_positions(step), inverse=True)
+            output.view_as(query), rope, cache.rope_positions(step)
         )
