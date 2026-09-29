@@ -6,31 +6,39 @@ across **four gfx1250 nodes, 4 GPUs each, in SPX** — 16 ranks total, `-tp 1`
 with data parallel 16 and expert parallel 16. The checkpoint is ~1.42 TiB and is
 needed **in full on every node**; it is not sharded across the cluster.
 
-## Read this first: which image you have decides everything
+## A0 and B0 silicon — same image, one difference
 
-Two generations of bring-up image exist for this silicon, and they are **not**
-the same recipe.
+Both use the **same** bring-up image, `rocm/fw-bringup:gfx1250-atom-20260918-ep8`,
+and both need [ATOM PR #2380](#-required-patch-atom-pr-2380). The image ships
+**B0** code objects. The only difference is the silicon you run them on:
 
-| | image | translation | what it is for |
-|---|---|---|---|
-| **A0-built** | earlier bring-up images | **mandatory** — without it every token is `!` and GSM8K is 0% | getting the model to run at all |
-| **B0-built** | **`rocm/fw-bringup:gfx1250-atom-20260918-ep8`** | **none — drop the rocjitsu prefix entirely** | **the configuration worth measuring** |
+| silicon | code-object translation | status |
+|---|---|---|
+| **B0** | **none** — skip the rocjitsu prefix entirely | **the configuration this page is about** |
+| A0 | **mandatory** — B0→A0, or every token is `!` and GSM8K is 0% | legacy path, see [Appendix B](#appendix-b-running-the-same-image-on-a0-silicon) |
 
-The silicon is **B0** either way. What changed is that the newer image's kernels
-are built for it, so the whole translation layer becomes dead weight. Verified
+The translation library is named `librocjitsu_gfx1250_**b0_to_a0**.so` for
+exactly this reason: it rewrites the image's B0 objects down to A0. On B0
+silicon there is nothing to rewrite.
+
+**Everything below is the B0 path** unless a section says otherwise. Verified
 end to end: the hook attached on all 16 ranks and performed **zero**
 translations, and GSM8K still scored **0.9621** over the full 1319.
 
-**If you are here for performance, you want the B0-built image.** Everything in
-this page that concerns the rocjitsu prefix is the A0 path — keep it for
-reference, skip it in practice. The numbers below, the
-[server command](#config-b--agentic-throughput-agentx) and the
-[bottleneck analysis](#where-the-time-goes-and-what-to-try-next) all come from
-`gfx1250-atom-20260918-ep8`.
+### Where to go
 
-### Measured on `rocm/fw-bringup:gfx1250-atom-20260918-ep8`
+| you want | go to |
+|---|---|
+| bring the server up | [Setup](#container) → [Launch](#launch) → [Accuracy gate](#accuracy-gate--run-this-before-any-benchmark) |
+| the exact validated commands and env | **[Appendix A](#appendix-a-the-exact-configuration-this-was-validated-on)** |
+| agentic numbers and how they were taken | [Agentic (AgentX)](#agentic-agentx) → [AgentX result](#agentx-result) |
+| why it is slow and what to try | [Where the time goes](#where-the-time-goes-and-what-to-try-next) |
+| take a profile | [Profiling](#profiling) |
+| you are on A0 silicon | [Appendix B](#appendix-b-running-the-same-image-on-a0-silicon) |
 
-4 nodes × 4 gfx1250, **432 GiB/GPU**, dp16ep16, B0 silicon, no translation.
+### Measured on B0, `rocm/fw-bringup:gfx1250-atom-20260918-ep8`
+
+4 nodes × 4 gfx1250, **432 GiB/GPU**, dp16ep16, no translation.
 
 | | |
 |---|---|
@@ -38,11 +46,9 @@ reference, skip it in practice. The numbers below, the
 | **Agentic, total throughput per GPU** | **182 tok/s** (2913 aggregate / 16) |
 | **Agentic, prefix cache read** | **92.36%** (94.68% theoretical) |
 | **GSM8K**, 5-shot, full 1319 | **strict-match 0.9621 ±0.0053** — 9 min at `num_concurrent=32` |
-| Cold start | **under 6 min** (not the 25 min the A0 path needs) |
-| Bottleneck | **decode**, by a wide margin — see [Where the time goes](#where-the-time-goes-and-what-to-try-next) |
-
-Copy-pasteable server command, env block and aiperf invocation:
-[Appendix](#appendix-the-exact-configuration-this-was-validated-on).
+| Fixed-length 14k/16, con32 | 26,207 tok/s total, TTFT median 13.2 s, TPOT median 73.9 ms |
+| Cold start | **under 6 min** |
+| Bottleneck | **decode** — see [Where the time goes](#where-the-time-goes-and-what-to-try-next) |
 
 ### The rest of the configuration
 
@@ -53,170 +59,7 @@ Copy-pasteable server command, env block and aiperf invocation:
 | Attention | Triton MLA (`ATOM_USE_TRITON_MLA=1`), unshuffled KV |
 | Fabric | UALink within a node-set sharing one `PPOD_ID` + `VPOD_ID`; RCCL over the data-plane NIC |
 | **Required ATOM patch** | [PR #2380](https://github.com/ROCm/ATOM/pull/2380) — apply the **diff** to the image's ATOM; stock ATOM aborts on chunked prefill here |
-| GSM8K on the original A0-path run | strict-match 0.9545 ±0.0057, flexible-extract 0.9538 ±0.0058 |
-| Fixed-length throughput | **not characterized on the B0 image** — the table in [Throughput](#throughput) is from the A0 path |
-
----
-
-## ⚠️ B0→A0 code-object translation — required for some images, not all
-
-**Read this before anything else.** Whether you need it depends on the image,
-it is not a property of the silicon alone, and getting it wrong is silent in
-both directions.
-
-These parts are **B0 revision silicon**. If the image's kernels were compiled
-for **A0**, the GPU executes code built for a different revision, and the
-result is not degraded accuracy — it is **every generated token being `!`** and
-**GSM8K 0%**, with HTTP 200, `finish_reason: "stop"`, sane token counts and
-plausible throughput. A benchmark runs to completion and produces a
-clean-looking report built entirely from `!`.
-
-`libhsa_hotswap_rocjitsu.so` attaches to the HSA tool interface and rewrites
-each code object from B0 to A0 as it is loaded, which is what makes such an
-image work.
-
-### Two configurations, and they need different recipes
-
-The silicon on these racks is **B0**. What differs between deployments is
-**what revision the image's kernels were built for**, and that alone decides
-whether you need the translation layer:
-
-| | image kernels built for | translation | what to do |
-|---|---|---|---|
-| **A** — the original setup this recipe was written against | **A0** | **mandatory** | install the rocjitsu prefix below; without it every token is `!` and GSM8K is 0% |
-| **B** — `rocm/fw-bringup:gfx1250-atom-20260918-ep8` | **B0** (matches the silicon) | **not needed** | skip the prefix entirely; the hook, if present, is inert |
-
-⚠️ **You cannot read this off the hardware.** On these boards every revision
-field is zero — PCI `revision=0x00`, `rocminfo` `ASIC Revision: 0(0x0)`,
-`amd-smi` `REV_ID: 0x00`, marketing name `AMD Eng Sample` — and `dmesg` carries
-no IP-discovery revision line. The stepping is site information, not something
-the box reports. **Identify your case from the runtime behaviour below, not
-from the part.**
-
-Case **B** measured end to end: the hook installs on all 16 ranks and performs
-**zero** translations (`outcome=translated: 0`, `reused tier: 0`, against a
-170-entry store), and the server still scores **GSM8K 0.9621 ±0.0053** over the
-full 1319 questions, with coherent output throughout and no retries. Everything
-in this recipe applies unchanged **except** the rocjitsu prefix, which that
-image does not need and which is therefore not a blocker if you cannot obtain
-it.
-
-### Decide it in 60 seconds, do not assume
-
-Bring the server up, then look at the *content* of a completion before
-trusting any number:
-
-```bash
-curl -sS http://<node0>:8000/v1/completions -H 'Content-Type: application/json' \
-  -d '{"model":"moonshotai/Kimi-K3","prompt":"The capital of France is",
-       "max_tokens":16,"temperature":0}' | python3 -m json.tool
-```
-
-| what you see | what it means |
-|---|---|
-| ` Paris. The Eiffel Tower is located in ...` | kernels match the silicon — **no translation needed**, stop here |
-| `!!!!!!!!!!!!!!!!` | kernels are A0 — install the prefix below, then re-test |
-
-Check the same thing in the log, which distinguishes "installed" from "working":
-
-```bash
-grep -c 'installed eager'     <log>   # hook attached (says nothing about translating)
-grep -c 'outcome=translated'  <log>   # 0 = inert; several hundred = doing the work
-```
-
-> **`HOTSWAP=0` is not a fallback** on an image that *does* need translation.
-> Any accuracy or performance number from such an image without translation is
-> void. On an image that does not need it, the hook costs nothing and can be
-> left in place.
-
-### The image's own rocjitsu is not a substitute
-
-The image ships a hook and a translator, and they are the wrong ones. The hook
-installs, logs `installed eager gfx1250 B0-to-A0 hook`, and then translates
-nothing — because `rj_pretranslate` derives the translation store's location
-from the **translator's own install prefix**, and the image's prefix has an
-empty store.
-
-| | image's own | required prefix |
-|---|---|---|
-| `libhsa_hotswap_rocjitsu.so` | 143217 B | **129112 B** |
-| `librocjitsu_gfx1250_b0_to_a0.so` | 7531385 B | **8002216 B** (0.3.0) |
-| translation store entries | 170 | **1976** |
-| translations actually performed | **0** | **592** (484 translated + 108 reused) |
-
-### Where to get it
-
-**`j07-01:/home/zejchen/rocmjit.zip`** — 424 MB, unpacks to a 1.7 GB prefix.
-An unpacked copy sits next to it at `j07-01:/home/zejchen/rocmjit/`.
-
-The prefix originally lived at `j07-04:/tmp/rjprefix`. **That path is gone** —
-`/tmp` is cleared on reboot. Its absence is expected and is not a reason to
-conclude the node cannot serve; take the archive above. If you are outside this
-cluster, ask your AMD contact for the gfx1250 B0→A0 rocjitsu prefix by the
-checksums in the table.
-
-### Install it on every node
-
-`docker cp` puts it inside the container, so it is **lost when the container is
-removed** (unlike a bind mount) and must be re-installed after any
-`docker rm`. `docker stop` / `start` keeps it.
-
-```bash
-for n in <node0> <node1> <node2> <node3>; do
-  scp -q ~/rocmjit.zip "$n:~/" &
-done; wait
-
-for n in <node0> <node1> <node2> <node3>; do
-  ssh -q -o LogLevel=ERROR "$n" '
-    cd ~ && [ -d rocmjit/share ] || unzip -q -o rocmjit.zip
-    sudo docker cp ~/rocmjit k3ep16:/app/rjprefix
-  ' &
-done; wait
-```
-
-Then, before launching the server (inside the container):
-
-```bash
-export LD_LIBRARY_PATH=/app/rjprefix/lib:$LD_LIBRARY_PATH   # must be first
-export HSA_TOOLS_LIB=/app/rjprefix/lib/libhsa_hotswap_rocjitsu.so
-export HSA_HOTSWAP_VERBOSE=1
-```
-
-Putting the prefix's `lib` **first** on `LD_LIBRARY_PATH` is what makes the
-populated store reachable — that is the mechanism, not a precaution.
-
-> `librocjitsu_gfx1250_b0_to_a0.so.0` cannot be used as `HSA_TOOLS_LIB`
-> directly: it exports only `rj_gfx1250_b0_to_a0_translate` / `_free` and has no
-> `OnLoad`, so HSA ignores it silently. It is a `NEEDED` dependency of the hook,
-> which loads it.
-
-### Verify — before trusting any output
-
-Check the three identifying numbers on every node:
-
-```bash
-sudo docker exec k3ep16 bash -c '
-  stat -c%s /app/rjprefix/lib/libhsa_hotswap_rocjitsu.so             # 129112
-  stat -c%s /app/rjprefix/lib/librocjitsu_gfx1250_b0_to_a0.so.0.3.0  # 8002216
-  ls /app/rjprefix/share/rocjitsu/translations/gfx1250-b0-a0/v1 | wc -l  # 1976'
-```
-
-Then check that translation actually happened at runtime. Seeing the hook
-install is **not** sufficient — that is exactly what the wrong prefix also does:
-
-```bash
-grep -c 'outcome=translated'       <log>   # expect several hundred
-grep -c 'reused tier'              <log>   # expect over a hundred
-grep -c 'translation_status=[^0]'  <log>   # must be 0
-```
-
-A correct run logs lines of this shape:
-
-```
-[hsa-hotswap-rj] eager translation source_id=fnv1a64:44173c6a13023c91
-    input_revision=b0 output_revision=a0 outcome=translated changed=23 ...
-[hsa-hotswap-rj] reused tier=aot input_bytes=501616 output_bytes=505712 status=0
-```
+| GSM8K on the original A0 run | strict-match 0.9545 ±0.0057, flexible-extract 0.9538 ±0.0058 |
 
 ---
 
@@ -1356,7 +1199,7 @@ another rank; its isolated contribution is unmeasured.
 
 ---
 
-## Appendix: the exact configuration this was validated on
+## Appendix A: the exact configuration this was validated on
 
 Everything below was run as written on a 4-node gfx1250 rack. Copy it rather
 than reassembling the deltas scattered through the sections above.
@@ -1375,7 +1218,7 @@ than reassembling the deltas scattered through the sections above.
 
 > On translation: the runs below still had `HSA_TOOLS_LIB` and the rocjitsu
 > prefix set, and it did **nothing** — `outcome=translated: 0`, `reused tier: 0`
-> across all 16 ranks, while GSM8K still scored 0.9621. On a B0-built image
+> across all 16 ranks, while GSM8K still scored 0.9621. On B0 silicon
 > those three lines can simply be dropped. They are kept in the listing so the
 > record matches what actually ran.
 
@@ -1453,7 +1296,7 @@ Run on every node, `DPRANK` = 0 / 4 / 8 / 12:
 
 ```bash
 #!/bin/bash
-# --- translation: inert on a B0-built image, kept for the record ---
+# --- translation: inert on B0 silicon, kept for the record ---
 export LD_LIBRARY_PATH=/app/rjprefix/lib:$LD_LIBRARY_PATH
 export HSA_TOOLS_LIB=/app/rjprefix/lib/libhsa_hotswap_rocjitsu.so
 export HSA_HOTSWAP_VERBOSE=1
@@ -1558,6 +1401,140 @@ submodule commit `754356e9` is already checked out by
 **Result** — see [AgentX result](#agentx-result) for the full table.
 Headline: interactivity **p90 2.53 tok/s/user**, **182 tok/s per GPU** total
 (2913 aggregate / 16), prefix cache read **92.36%**.
+
+---
+
+## Appendix B: running the same image on A0 silicon
+
+**Only read this if your parts are A0.** On B0 the whole layer is inert and
+should be left out.
+
+The image ships **B0** code objects. On A0 silicon they must be rewritten down
+to A0 as each one loads — that is what `librocjitsu_gfx1250_b0_to_a0.so` does,
+and what `libhsa_hotswap_rocjitsu.so` hooks into the HSA tool interface to
+drive. Without it the GPU executes objects built for a different revision, and
+the result is not degraded accuracy: **every generated token is `!`** and
+**GSM8K is 0%**, with HTTP 200, `finish_reason: "stop"`, sane token counts and
+plausible throughput. A benchmark runs to completion and produces a
+clean-looking report built entirely from `!`.
+
+> **`HOTSWAP=0` is not a fallback on A0.** Any accuracy or performance number
+> from A0 silicon without translation is void.
+
+### Which case am I in?
+
+No revision field on the board reports the stepping — PCI `revision=0x00`,
+`rocminfo` `ASIC Revision: 0(0x0)`, `amd-smi` `REV_ID: 0x00`, marketing name
+`AMD Eng Sample`, and no IP-discovery line in `dmesg`. Decide from behaviour:
+
+```bash
+curl -sS http://<node0>:8000/v1/completions -H 'Content-Type: application/json' \
+  -d '{"model":"moonshotai/Kimi-K3","prompt":"The capital of France is",
+       "max_tokens":16,"temperature":0}' | python3 -m json.tool
+```
+
+| what you see | what it means |
+|---|---|
+| ` Paris. The Eiffel Tower is located in ...` | B0 — **no translation needed**, stop here |
+| `!!!!!!!!!!!!!!!!` | A0 — install the prefix below, then re-test |
+
+```bash
+grep -c 'installed eager'     <log>   # hook attached (says nothing about translating)
+grep -c 'outcome=translated'  <log>   # 0 = inert; several hundred = doing the work
+```
+
+On B0 this reads `installed eager` on every rank and `outcome=translated: 0`,
+and the model is correct anyway — that is the expected B0 signature, not a
+fault.
+
+### The image's own rocjitsu is not a substitute
+
+The image ships a hook and a translator, and they are the wrong ones. The hook
+installs, logs `installed eager gfx1250 B0-to-A0 hook`, and then translates
+nothing — because `rj_pretranslate` derives the translation store's location
+from the **translator's own install prefix**, and the image's prefix has an
+empty store.
+
+| | image's own | required prefix |
+|---|---|---|
+| `libhsa_hotswap_rocjitsu.so` | 143217 B | **129112 B** |
+| `librocjitsu_gfx1250_b0_to_a0.so` | 7531385 B | **8002216 B** (0.3.0) |
+| translation store entries | 170 | **1976** |
+| translations actually performed | **0** | **592** (484 translated + 108 reused) |
+
+### Where to get it
+
+**`j07-01:/home/zejchen/rocmjit.zip`** — 424 MB, unpacks to a 1.7 GB prefix.
+An unpacked copy sits next to it at `j07-01:/home/zejchen/rocmjit/`.
+
+The prefix originally lived at `j07-04:/tmp/rjprefix`. **That path is gone** —
+`/tmp` is cleared on reboot. Its absence is expected and is not a reason to
+conclude the node cannot serve; take the archive above. If you are outside this
+cluster, ask your AMD contact for the gfx1250 B0→A0 rocjitsu prefix by the
+checksums in the table.
+
+### Install it on every node
+
+`docker cp` puts it inside the container, so it is **lost when the container is
+removed** (unlike a bind mount) and must be re-installed after any
+`docker rm`. `docker stop` / `start` keeps it.
+
+```bash
+for n in <node0> <node1> <node2> <node3>; do
+  scp -q ~/rocmjit.zip "$n:~/" &
+done; wait
+
+for n in <node0> <node1> <node2> <node3>; do
+  ssh -q -o LogLevel=ERROR "$n" '
+    cd ~ && [ -d rocmjit/share ] || unzip -q -o rocmjit.zip
+    sudo docker cp ~/rocmjit k3ep16:/app/rjprefix
+  ' &
+done; wait
+```
+
+Then, before launching the server (inside the container):
+
+```bash
+export LD_LIBRARY_PATH=/app/rjprefix/lib:$LD_LIBRARY_PATH   # must be first
+export HSA_TOOLS_LIB=/app/rjprefix/lib/libhsa_hotswap_rocjitsu.so
+export HSA_HOTSWAP_VERBOSE=1
+```
+
+Putting the prefix's `lib` **first** on `LD_LIBRARY_PATH` is what makes the
+populated store reachable — that is the mechanism, not a precaution.
+
+> `librocjitsu_gfx1250_b0_to_a0.so.0` cannot be used as `HSA_TOOLS_LIB`
+> directly: it exports only `rj_gfx1250_b0_to_a0_translate` / `_free` and has no
+> `OnLoad`, so HSA ignores it silently. It is a `NEEDED` dependency of the hook,
+> which loads it.
+
+### Verify — before trusting any output
+
+Check the three identifying numbers on every node:
+
+```bash
+sudo docker exec k3ep16 bash -c '
+  stat -c%s /app/rjprefix/lib/libhsa_hotswap_rocjitsu.so             # 129112
+  stat -c%s /app/rjprefix/lib/librocjitsu_gfx1250_b0_to_a0.so.0.3.0  # 8002216
+  ls /app/rjprefix/share/rocjitsu/translations/gfx1250-b0-a0/v1 | wc -l  # 1976'
+```
+
+Then check that translation actually happened at runtime. Seeing the hook
+install is **not** sufficient — that is exactly what the wrong prefix also does:
+
+```bash
+grep -c 'outcome=translated'       <log>   # expect several hundred
+grep -c 'reused tier'              <log>   # expect over a hundred
+grep -c 'translation_status=[^0]'  <log>   # must be 0
+```
+
+A correct run logs lines of this shape:
+
+```
+[hsa-hotswap-rj] eager translation source_id=fnv1a64:44173c6a13023c91
+    input_revision=b0 output_revision=a0 outcome=translated changed=23 ...
+[hsa-hotswap-rj] reused tier=aot input_bytes=501616 output_bytes=505712 status=0
+```
 
 ---
 
