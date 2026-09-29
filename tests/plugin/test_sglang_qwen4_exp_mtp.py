@@ -10,6 +10,7 @@ from atom.plugin.sglang.models.qwen4_exp import (
     flatten_qwen4_exp_hc,
     reshape_qwen4_exp_hc,
 )
+from atom.plugin.sglang.patches import qwen4_exp_rocm_patch as rocm_patch
 from atom.plugin.sglang.patches.qwen4_exp_recognition_patch import (
     QWEN4_EXP_NEXTN_ARCH,
     apply_qwen4_exp_hc_hidden_size,
@@ -335,7 +336,7 @@ def test_draft_rewrite_rejects_unsupported_native_layout(layers, types):
     assert hf.num_hidden_layers == 48
 
 
-def test_hip_topk1_tree_build_uses_triton():
+def test_hip_topk1_tree_build_uses_triton_only_for_qwen4_exp():
     calls = []
 
     def original(*args, **kwargs):
@@ -347,25 +348,43 @@ def test_hip_topk1_tree_build_uses_triton():
 
     wrapped = _hip_topk1_tree_builder(original, triton_impl, bitpack_mode=2)
     args = (None,) * 8
-    wrapped(*args, 1, 2, 3, 0)
-    wrapped(*args, topk=1, tree_mask_mode=1)
-    wrapped(*args, 4, 3, 8, 0)
-    wrapped(*args, 1, 2, 3, 2)
-    assert calls == [("triton", 1), ("triton", 1), ("kernel", 4, 0), ("kernel", 1, 2)]
+    previous = rocm_patch._qwen4_exp_hip
+    try:
+        rocm_patch._qwen4_exp_hip = False
+        wrapped(*args, 1, 2, 3, 0)
+        rocm_patch._qwen4_exp_hip = True
+        wrapped(*args, 1, 2, 3, 0)
+        wrapped(*args, topk=1, tree_mask_mode=1)
+        wrapped(*args, 4, 3, 8, 0)
+        wrapped(*args, 1, 2, 3, 2)
+    finally:
+        rocm_patch._qwen4_exp_hip = previous
+    assert calls == [
+        ("kernel", 1, 0),
+        ("triton", 1),
+        ("triton", 1),
+        ("kernel", 4, 0),
+        ("kernel", 1, 2),
+    ]
 
 
-def test_hip_verify_tree_greedy_uses_triton():
+def test_hip_verify_tree_greedy_uses_triton_only_for_qwen4_exp():
     seen = {}
+    original_calls = []
+
+    def original(*args, **kwargs):
+        original_calls.append(kwargs.get("topk", args[8] if len(args) > 8 else None))
+        return args[0], args[1], args[2]
 
     def triton_impl(**kwargs):
         seen.update(kwargs)
         kwargs["predicts"][:] = 7
 
-    wrapped = _hip_verify_tree_greedy(triton_impl)
+    wrapped = _hip_verify_tree_greedy(original, triton_impl)
     predicts = torch.zeros(3, dtype=torch.int32)
     accept_index = torch.full((1, 3), -1, dtype=torch.int32)
     accept_num = torch.empty(1, dtype=torch.int32)
-    out = wrapped(
+    tensors = (
         predicts,
         accept_index,
         accept_num,
@@ -374,8 +393,17 @@ def test_hip_verify_tree_greedy_uses_triton():
         torch.zeros(1, 3, dtype=torch.long),
         torch.zeros(1, 3, dtype=torch.long),
         torch.zeros(1, 3, dtype=torch.long),
-        topk=1,
     )
+    previous = rocm_patch._qwen4_exp_hip
+    try:
+        rocm_patch._qwen4_exp_hip = False
+        stayed = wrapped(*tensors, topk=1)
+        rocm_patch._qwen4_exp_hip = True
+        out = wrapped(*tensors, topk=1)
+    finally:
+        rocm_patch._qwen4_exp_hip = previous
+    assert original_calls == [1]
+    assert stayed[0] is predicts
     assert seen["predicts"] is predicts
     assert seen["retrieve_index"].shape == (1, 3)
     assert out[0][0].item() == 7

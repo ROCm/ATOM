@@ -5,8 +5,10 @@ NextN wrapper). These patches stay in the plugin and only cover shapes
 that break on this ROCm stack after the 0.5.20 upgrade:
 - EP decode MoE (2560x640 per-token FP8, token<=16) picks CK ``device_gemm``
   which rejects the problem; force the asm 1-stage path prefill already uses.
-- HIP ``sgl_kernel`` tree-build and greedy-verify segfault on the topk=1
-  chain SGLang preallocates; route those calls to SGLang's Triton kernels.
+- HIP ``sgl_kernel`` tree-build and greedy-verify segfault on Flash's
+  topk=1 chain. Divert only after a Qwen4Exp model is recognized.
+  R1, DSV4, and GLM stay on ``sgl_kernel``; their topk=1 MTP already
+  completes there.
 """
 
 from __future__ import annotations
@@ -14,6 +16,22 @@ from __future__ import annotations
 import logging
 
 logger = logging.getLogger("atom")
+
+# Set when this process loads Qwen4Exp. Kernel wrappers read it per call so
+# a non-Flash server never leaves sgl_kernel.
+_qwen4_exp_hip = False
+
+
+def note_qwen4_exp_loaded() -> None:
+    """Enable the Flash-only HIP tree/verify divert."""
+    global _qwen4_exp_hip
+    if _qwen4_exp_hip:
+        return
+    _qwen4_exp_hip = True
+    logger.info(
+        "Qwen4Exp HIP topk=1 tree build and greedy verify use Triton; "
+        "other models stay on sgl_kernel"
+    )
 
 
 def _install_ep_decode_asm_moe() -> None:
@@ -79,15 +97,15 @@ def _hip_topk1_tree_builder(original, triton_impl, bitpack_mode: int):
             if "tree_mask_mode" in kwargs
             else (args[11] if len(args) > 11 else 0)
         )
-        if topk == 1 and int(mode) != bitpack_mode:
+        if _qwen4_exp_hip and topk == 1 and int(mode) != bitpack_mode:
             return triton_impl(*args, **kwargs)
         return original(*args, **kwargs)
 
     return sgl_build_tree_kernel_efficient
 
 
-def _hip_verify_tree_greedy(triton_impl):
-    """Route HIP greedy verify to Triton."""
+def _hip_verify_tree_greedy(original, triton_impl):
+    """Route Qwen4Exp HIP greedy verify to Triton; leave every other model."""
 
     def verify_tree_greedy_func(
         predicts,
@@ -100,6 +118,18 @@ def _hip_verify_tree_greedy(triton_impl):
         target_predict,
         topk: int = -1,
     ):
+        if not _qwen4_exp_hip:
+            return original(
+                predicts,
+                accept_index,
+                accept_token_num,
+                candidates,
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                target_predict,
+                topk,
+            )
         del topk
         triton_impl(
             predicts=predicts,
@@ -131,19 +161,12 @@ def _patch_hip_topk1_tree_kernel() -> None:
         int(eagle_utils.TreeMaskMode.QLEN_ONLY_BITPACKING),
     )
     eagle_utils._atom_hip_topk1_tree_triton = True
-    logger.info(
-        "HIP eagle topk=1 tree build uses Triton; "
-        "sgl_kernel.build_tree_kernel_efficient faults on this chain"
-    )
     if not getattr(eagle_utils, "_atom_hip_verify_tree_triton", False):
         eagle_utils.verify_tree_greedy_func = _hip_verify_tree_greedy(
-            eagle_utils.verify_tree_greedy_triton
+            eagle_utils.verify_tree_greedy_func,
+            eagle_utils.verify_tree_greedy_triton,
         )
         eagle_utils._atom_hip_verify_tree_triton = True
-        logger.info(
-            "HIP eagle greedy verify uses Triton; "
-            "sgl_kernel.verify_tree_greedy faults on this chain"
-        )
 
 
 def apply_qwen4_exp_rocm_patch() -> None:

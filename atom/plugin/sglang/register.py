@@ -176,6 +176,11 @@ def _keep_atom_full_attn_for_native_qwen4_exp() -> None:
             or model_type.startswith("qwen4_exp")
             or text_mt.startswith("qwen4_exp")
         ):
+            from atom.plugin.sglang.patches.qwen4_exp_rocm_patch import (
+                note_qwen4_exp_loaded,
+            )
+
+            note_qwen4_exp_loaded()
             logger.info(
                 "Keep ATOMAttnBackendForSgl as hybrid full-attn for Native "
                 "Qwen4Exp; skip SGLang QwenSparseAttnBackend"
