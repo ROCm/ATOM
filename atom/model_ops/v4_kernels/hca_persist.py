@@ -12,8 +12,13 @@ graph padding) are left unwritten, as the ASM does. Limits: 128 local heads,
 ``N <= 32768`` rows, gfx950, row-dense KV pools. Everything else, and an aiter
 without the kernel, stays on the ASM + split plan.
 
-Workspace: one per device, allocated by :func:`prepare` outside graph capture
-(the V4 metadata builder calls it at init, before warmup and KV sizing). It
+Workspace: one per device, allocated by :func:`prepare` outside graph capture.
+Every HCA attention layer asks for it at construction
+(:func:`prepare_if_usable`, so model load allocates it in native ATOM and in
+the vLLM / SGLang plugins alike, before KV sizing and warmup), and the native
+V4 metadata builder asks again at init (idempotent). A call that finds no
+workspace allocates it when eager; under CUDA-graph capture it stays on the
+ASM path instead (:func:`workspace_ready`). It
 holds the split partials and the merge counters, which return to zero at the
 end of every call, so calls sharing it must be ordered on the GPU. In ATOM
 every HCA decode call runs on the forward's compute stream (layers are
@@ -89,6 +94,52 @@ def prepare(device) -> None:
     )
 
 
+def unusable_reason(*, kv_fp8: bool, heads: int, gfx: str) -> str | None:
+    """Why the persistent kernel cannot serve this model/rank, or None."""
+    if not kv_fp8:
+        return "kv cache is not fp8"
+    if heads != HEADS:
+        return f"{heads} local heads (needs {HEADS})"
+    if gfx != "gfx950":
+        return f"arch {gfx} (needs gfx950)"
+    return None
+
+
+def prepare_if_usable(*, kv_fp8: bool, heads: int, gfx: str, device=None) -> bool:
+    """Allocate the workspace when this rank can use the kernel (switch on,
+    fp8 KV, 128 local heads, gfx950). Called at model construction, outside
+    graph capture; ``device`` defaults to the current CUDA device."""
+    if not envs.ATOM_V4_HCA_PERSIST:
+        return False
+    why = unusable_reason(kv_fp8=kv_fp8, heads=heads, gfx=gfx)
+    if why is not None:
+        _log_once(("unused", why), "V4 HCA persistent decode not used: %s", why)
+        return False
+    device = torch.device("cuda") if device is None else device
+    prepare(device)
+    return _dev_index(device) in _workspaces
+
+
+def workspace_ready(device) -> bool:
+    """True when this device has a workspace, allocating it if the stream is
+    not capturing. Under capture with no workspace (nothing prepared it before
+    capture) the call stays on the ASM path: aiter refuses to allocate there."""
+    idx = _dev_index(device)
+    if idx in _workspaces:
+        return True
+    if torch.cuda.is_current_stream_capturing():
+        _log_once(
+            ("no_ws_capture", idx),
+            "V4 HCA persistent decode: no workspace on device %d at CUDA-graph "
+            "capture (prepare() was not called before capture); this graph "
+            "keeps HCA decode on the ASM path",
+            idx,
+        )
+        return False
+    prepare(device)
+    return idx in _workspaces
+
+
 def wanted(*, compress_ratio: int | None, heads: int, rows: int, gfx: str) -> bool:
     """Shape/config gate; the layout gate is :func:`layout_ok`."""
     return (
@@ -134,8 +185,11 @@ def hca_persist_decode(
             f"kv_indptr={kv_indptr.numel()}"
         )
     idx = _dev_index(q_packed_in.device)
-    if idx not in _workspaces:
-        prepare(q_packed_in.device)  # aiter refuses during capture
+    if not workspace_ready(q_packed_in.device):
+        raise RuntimeError(
+            "hca_persist: no workspace on this device and the stream is "
+            "capturing; call prepare() before CUDA-graph capture"
+        )
     out = torch.empty((n, HEADS, _DIM), dtype=torch.bfloat16, device=q_packed_in.device)
     if n == 0:
         return out

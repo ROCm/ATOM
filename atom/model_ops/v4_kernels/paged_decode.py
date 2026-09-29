@@ -1221,6 +1221,7 @@ def sparse_attn_v4_paged_decode(
                 gfx=get_gfx(),
             )
             and hca_persist.layout_ok(unified_kv, unified_kv_rope)
+            and hca_persist.workspace_ready(q_packed_in.device)
         ):
             return hca_persist.hca_persist_decode(
                 unified_kv,

@@ -208,7 +208,7 @@ def test_cuda_graph_capture_replay_changing_csr(mode):
     """Capture once at T_pad rows, replay with new kv_indptr / indices / q."""
     t_pad, cap_k = 112, 1400
     mode(True)
-    hca_persist.prepare(DEV)  # the builder does this at init, before capture
+    hca_persist.prepare(DEV)  # model load does this, before capture
     first = _inputs(_q7_lens(100, 6) + [0] * 12, seed=6, pool_extra=t_pad * cap_k)
     pool_rows = first["kv_packed"].shape[0]
     s = dict(
@@ -267,3 +267,41 @@ def test_cuda_graph_capture_replay_changing_csr(mode):
     # the merge counters are back to zero after every completed call
     ws = hca_persist._workspaces[torch.cuda.current_device()]
     assert int(ws.cnt.abs().sum()) == 0
+
+
+def test_capture_without_workspace_stays_on_asm(mode, monkeypatch):
+    """Nothing prepared the workspace before capture: the captured call keeps
+    HCA decode on the ASM path instead of failing, and allocates nothing."""
+    mode(True)
+    monkeypatch.setattr(hca_persist, "_workspaces", {})
+    t_pad = 112
+    inp = _inputs(_q7_lens(100, 10) + [0] * 12, seed=10)
+    plan = paged_decode.v4_decode_split_plan(
+        t_pad,
+        H,
+        int((inp["kv_indptr"][1:] - inp["kv_indptr"][:-1]).max()),
+        torch.zeros(MAX_ROWS_BUF + 1, dtype=torch.int32, device=DEV),
+    )
+    before = hca_persist.stats["persist"]
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = paged_decode.sparse_attn_v4_paged_decode(
+            None,
+            inp["kv_packed"],
+            inp["kv_page_indices"],
+            inp["kv_indptr"],
+            inp["sink"],
+            512**-0.5,
+            unified_kv_rope=inp["kv_rope"],
+            q_packed_in=inp["q_packed"],
+            q_rope_in=inp["q_rope"],
+            qo_indptr=torch.arange(t_pad + 1, dtype=torch.int32, device=DEV),
+            split_plan=plan,
+            compress_ratio=128,
+        )
+    assert hca_persist.stats["persist"] == before
+    assert hca_persist._workspaces == {}
+    graph.replay()
+    torch.cuda.synchronize()
+    _close(out[:100], _reference(inp, 100))

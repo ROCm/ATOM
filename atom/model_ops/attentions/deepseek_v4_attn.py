@@ -3702,15 +3702,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         CUDA-graph capture, which may be the first forward to reach it."""
         if not envs.ATOM_V4_HCA_PERSIST:
             return
-        why = None
-        if not self._kv_fp8:
-            why = "kv cache is not fp8"
-        elif not self.hca_layers:
-            why = "no HCA (ratio 128) layers"
-        elif self._local_heads != hca_persist.HEADS:
-            why = f"{self._local_heads} local heads (needs {hca_persist.HEADS})"
-        elif get_gfx() != "gfx950":
-            why = f"arch {get_gfx()} (needs gfx950)"
+        why = "no HCA (ratio 128) layers" if not self.hca_layers else None
+        why = why or hca_persist.unusable_reason(
+            kv_fp8=self._kv_fp8, heads=self._local_heads, gfx=get_gfx()
+        )
         if why is not None:
             logger.info("V4 HCA persistent decode not used: %s", why)
             return

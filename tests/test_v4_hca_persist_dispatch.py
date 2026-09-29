@@ -31,6 +31,7 @@ def routes(monkeypatch):
         lambda *a, **k: calls.append(("persist", a, k)) or "persist",
     )
     monkeypatch.setattr(hca_persist, "mla_decode_fwd_v4_nm_ps", object())
+    monkeypatch.setattr(hca_persist, "workspace_ready", lambda device: True)
     return calls
 
 
@@ -148,6 +149,80 @@ def test_persistent_gets_the_asm_path_tensors(monkeypatch, routes):
     assert kv.shape == (8, 512) and kv_rope.shape == (8, 64)
     assert kv_indptr.numel() == 22 and q_packed.shape == (21, 128, 512)
     assert sink.numel() == 128 and q_rope.shape == (21, 128, 64)
+
+
+def test_no_workspace_under_capture_stays_on_asm(monkeypatch, routes):
+    _env(monkeypatch)
+    monkeypatch.setattr(hca_persist, "workspace_ready", lambda device: False)
+    assert _call(896) == "asm"
+
+
+# ------------------------------------------------------------ the workspace
+
+
+def _fake_alloc(monkeypatch, capturing):
+    made = []
+    monkeypatch.setattr(hca_persist, "_workspaces", {})
+    monkeypatch.setattr(hca_persist, "mla_decode_fwd_v4_nm_ps", object())
+    monkeypatch.setattr(
+        hca_persist,
+        "get_mla_v4_nm_ps_workspace",
+        lambda dev, num_partitions: made.append(dev) or dev,
+    )
+    monkeypatch.setattr(
+        hca_persist.torch.cuda, "is_current_stream_capturing", lambda: capturing
+    )
+    return made
+
+
+def test_workspace_ready_allocates_when_eager(monkeypatch):
+    made = _fake_alloc(monkeypatch, capturing=False)
+    assert hca_persist.workspace_ready("cuda:2")
+    assert hca_persist.workspace_ready("cuda:2")
+    assert made == [torch.device("cuda", 2)]
+
+
+def test_workspace_ready_never_allocates_under_capture(monkeypatch):
+    made = _fake_alloc(monkeypatch, capturing=True)
+    assert not hca_persist.workspace_ready("cuda:2")
+    assert made == []
+    hca_persist._workspaces[2] = object()  # prepared before capture
+    assert hca_persist.workspace_ready("cuda:2")
+
+
+@pytest.mark.parametrize(
+    "enabled,kv_fp8,heads,gfx,expect",
+    [
+        (True, True, 128, "gfx950", True),
+        (False, True, 128, "gfx950", False),
+        (True, False, 128, "gfx950", False),
+        (True, True, 64, "gfx950", False),
+        (True, True, 128, "gfx942", False),
+    ],
+)
+def test_layer_init_prepares_only_when_usable(
+    monkeypatch, enabled, kv_fp8, heads, gfx, expect
+):
+    """Model-construction hook shared by native ATOM and the vLLM / SGLang
+    plugins (their builders never call prepare())."""
+    monkeypatch.setenv("ATOM_V4_HCA_PERSIST", "1" if enabled else "0")
+    made = _fake_alloc(monkeypatch, capturing=False)
+    got = hca_persist.prepare_if_usable(
+        kv_fp8=kv_fp8, heads=heads, gfx=gfx, device="cuda:1"
+    )
+    assert got is expect
+    assert made == ([torch.device("cuda", 1)] if expect else [])
+
+
+def test_attention_layer_calls_prepare_for_hca_only():
+    """DeepseekV4Attention.__init__ (every serving path) gates on the ratio."""
+    import inspect
+
+    from atom.models import deepseek_v4
+
+    src = inspect.getsource(deepseek_v4.DeepseekV4Attention.__init__)
+    assert "hca_persist.prepare_if_usable(" in src
+    assert "self.compress_ratio == hca_persist.HCA_RATIO" in src
 
 
 # ---------------------------------------------------------------- the entry
