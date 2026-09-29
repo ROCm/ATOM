@@ -116,17 +116,28 @@ def qsa_logits_fly_kernel(
 
     fx.gpu.barrier()
     # 到这里visible out已经写完，row start 写完
-    # 当前block负责的64条q的request范围
+    # 当前block负责的64条q的request范围，以及这64行里最大的可见列数
     req_low = fx.Int32(0x7FFFFFFF)
     req_high = fx.Int32(-1)
+    vis_max = fx.Int32(0)
     for tag_id in fx.range_constexpr(BM):
         req = row_valid_tag[tag_id]
         tag_ok = (req >= 0) & (req < num_requests)
         req_low = (tag_ok & (req < req_low)).select(req,req_low)
         req_high = (tag_ok & (req > req_high)).select(req,req_high)
+        row_vis_i = row_vis[tag_id]
+        vis_max = ((req != -999) & (row_vis_i > vis_max)).select(row_vis_i,vis_max)
     no_valid = req_high < 0
     req_low = no_valid.select(0,req_low)
     req_high = no_valid.select(0,req_high)
+
+    # 当前block负责的column范围
+    col0 = bidn * 64
+    page0 = col0 // PAGE_SIZE
+    # 提前退出：这64行都看不到 col0 及之后的列，top-k 只读每行 [0, visible)，
+    # 所以整块既不用算也不用写。让请求循环 range(req_low, req_high+1) 变成空循环
+    skip_block = col0 >= vis_max
+    req_high = skip_block.select(req_low - 1,req_high)
 
     # 一个block负责64条q，一个wave负责16个q，每条q 4个head
     q = fx.make_view(fx.get_iter(fx.rocdl.make_buffer_tensor(q,
@@ -184,9 +195,6 @@ def qsa_logits_fly_kernel(
     q_frag_retiled = [copy_q.retile(q_frag_head0123[i]) for i in fx.range_constexpr(4)]
     k_frag_retiled = [copy_k.retile(k_frag0123[i]) for i in fx.range_constexpr(4)]
 
-    # 当前block负责的column范围
-    col0 = bidn * 64
-    page0 = col0 // PAGE_SIZE
     # collective load k to lds
     for reqid in range(req_low,req_high + 1):
         reqid = fx.Int32(reqid)
@@ -307,7 +315,7 @@ def qsa_logits_fly(
 def run_kernel(case):
     q, kc, pt = case["q"], case["kc"], case["page_table"]
     rows, cols = q.shape[0], case["num_columns"]
-    # NaN / -7 make entries the kernel forgot to write easy to spot
+    # NaN / -7 make entries the kernel did not write easy to spot (skipped column blocks stay NaN)
     logits = torch.full((rows, cols), float("nan"), dtype=torch.float32, device=q.device)
     visible = torch.full((rows,), -7, dtype=torch.int32, device=q.device)
     row_starts = torch.full((rows,), -7, dtype=torch.int32, device=q.device)
@@ -385,29 +393,36 @@ CASES = [
     lambda: make_case(16, 128, context_len=200, positions="saturated", label="context_len caps visibility"),
     lambda: make_case(8, 64, positions="zero", label="nothing visible"),
     lambda: make_case(256, 4096, num_requests=2, label="medium, 2 requests"),
+    lambda: make_case(2048, 512, label="causal prefill from position 0"),
 ]
 
 
 def check(case):
+    """Top-k reads each row only over [0, visible), so that is all the kernel must get right.
+
+    Column blocks no row of the block can see are skipped and stay NaN (the fill value).
+    """
     logits, visible, row_starts = run_kernel(case)
     ref_logits, ref_visible = reference(case)
+    rows, cols = logits.shape
+    horizon = torch.arange(cols, device=logits.device)[None, :] < ref_visible[:, None]
     problems = []
-    if torch.isnan(logits).any():
-        problems.append(f"{int(torch.isnan(logits).sum())} logits never written")
     if not torch.equal(visible, ref_visible):
         problems.append(f"visible differs in {int((visible != ref_visible).sum())} rows")
     if not bool((row_starts == 0).all()):
         problems.append("row_starts not zero")
-    got_inf, ref_inf = torch.isneginf(logits), torch.isneginf(ref_logits)
+    if torch.isnan(logits[horizon]).any():
+        problems.append(f"{int(torch.isnan(logits[horizon]).sum())} logits inside the horizon never written")
+    got_inf, ref_inf = torch.isneginf(logits) & horizon, torch.isneginf(ref_logits) & horizon
     if not torch.equal(got_inf, ref_inf):
         problems.append(f"-inf mask differs in {int((got_inf != ref_inf).sum())} entries")
-    finite = ~ref_inf & ~torch.isnan(logits)
+    finite = horizon & ~ref_inf & ~torch.isnan(logits)
     max_abs = float((logits[finite] - ref_logits[finite]).abs().max()) if finite.any() else 0.0
     if finite.any() and not torch.allclose(logits[finite], ref_logits[finite], atol=2e-3, rtol=2e-3):
         problems.append(f"values differ, max_abs={max_abs:.3e}")
-    rows, cols = case["q"].shape[0], case["num_columns"]
+    skipped = float(torch.isnan(logits).float().mean())
     status = "PASS" if not problems else "FAIL: " + "; ".join(problems)
-    print(f"[{case['label']}] rows={rows} cols={cols} max_abs={max_abs:.2e}  {status}")
+    print(f"[{case['label']}] rows={rows} cols={cols} max_abs={max_abs:.2e} skipped={skipped:.0%}  {status}")
     return not problems
 
 
