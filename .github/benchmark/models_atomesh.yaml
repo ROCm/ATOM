@@ -430,8 +430,8 @@ models:
           concurrency: [48]
 
         - <<: *glm52_agentic_lmcache_chunked_cpp4_dcp4
-          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-chunked-1m-c54
-          concurrency: [54]
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-chunked-1m-c56
+          concurrency: [56]
 
         - &glm52_agentic_lmcache_tp4_dpa
           <<: *glm52_agentic_tp4_tp4
