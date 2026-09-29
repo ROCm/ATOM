@@ -1534,7 +1534,7 @@ def test_staged_region_pipeline_launches_next_gather_before_current_write():
 
     conn = _matched_rail_producer()
     order = []
-    conn._try_acquire_index_staging_slot = MagicMock(return_value=7)
+    conn._try_acquire_dcp_staging_slot = MagicMock(return_value=7)
 
     def launch(_target, region_idx, *_args, pool_idx=None, **_kwargs):
         order.append(("launch", region_idx, pool_idx))
@@ -1544,8 +1544,8 @@ def test_staged_region_pipeline_launches_next_gather_before_current_write():
         order.append(("finish", region_idx))
         return True
 
-    conn._launch_staged_index_layer_chunk = MagicMock(side_effect=launch)
-    conn._finish_staged_index_layer_chunk = MagicMock(side_effect=finish)
+    conn._launch_staged_dcp_layer_chunk = MagicMock(side_effect=launch)
+    conn._finish_staged_dcp_layer_chunk = MagicMock(side_effect=finish)
 
     assert mc.MooncakeConnector._execute_staged_region_pipeline(
         conn,
@@ -1565,36 +1565,36 @@ def test_staged_region_pipeline_launches_next_gather_before_current_write():
 
 def test_staged_region_pipeline_reserves_one_slot_for_other_workers():
     conn = _matched_rail_producer()
-    conn._index_staging_lock = threading.Lock()
-    conn._index_staging_free = [3]
-    assert conn._try_acquire_index_staging_slot() is None
-    assert conn._index_staging_free == [3]
+    conn._dcp_staging_lock = threading.Lock()
+    conn._dcp_staging_free = [3]
+    assert conn._try_acquire_dcp_staging_slot() is None
+    assert conn._dcp_staging_free == [3]
 
-    conn._index_staging_free.append(7)
-    assert conn._try_acquire_index_staging_slot() == 7
-    assert conn._index_staging_free == [3]
+    conn._dcp_staging_free.append(7)
+    assert conn._try_acquire_dcp_staging_slot() == 7
+    assert conn._dcp_staging_free == [3]
 
 
 def test_staging_pool_fails_fast_after_gpu_drain_error():
     conn = _matched_rail_producer()
-    conn._index_staging_lock = threading.Lock()
-    conn._index_staging_free = [3]
+    conn._dcp_staging_lock = threading.Lock()
+    conn._dcp_staging_free = [3]
     cause = RuntimeError("event failed")
-    conn._index_staging_error = cause
+    conn._dcp_staging_error = cause
 
     with pytest.raises(RuntimeError, match="staging pool is unavailable") as exc:
-        conn._acquire_index_staging_slot()
+        conn._acquire_dcp_staging_slot()
     assert exc.value.__cause__ is cause
     with pytest.raises(RuntimeError, match="staging pool is unavailable"):
-        conn._try_acquire_index_staging_slot()
+        conn._try_acquire_dcp_staging_slot()
 
 
 def test_failed_gather_event_quarantines_slot():
     conn = _matched_rail_producer()
-    conn._index_staging_lock = threading.Lock()
-    conn._index_staging_free = []
-    conn._index_staging_error = None
-    conn._release_index_staging_slot = MagicMock()
+    conn._dcp_staging_lock = threading.Lock()
+    conn._dcp_staging_free = []
+    conn._dcp_staging_error = None
+    conn._release_dcp_staging_slot = MagicMock()
     cause = RuntimeError("event failed")
     pending = SimpleNamespace(
         pool_idx=7,
@@ -1602,9 +1602,9 @@ def test_failed_gather_event_quarantines_slot():
     )
 
     with pytest.raises(RuntimeError, match="event failed"):
-        conn._finish_staged_index_layer_chunk(pending)
-    assert conn._index_staging_error is cause
-    conn._release_index_staging_slot.assert_not_called()
+        conn._finish_staged_dcp_layer_chunk(pending)
+    assert conn._dcp_staging_error is cause
+    conn._release_dcp_staging_slot.assert_not_called()
 
 
 def test_staged_region_pipeline_falls_back_when_no_prefetch_slot():
@@ -1612,7 +1612,7 @@ def test_staged_region_pipeline_falls_back_when_no_prefetch_slot():
 
     conn = _matched_rail_producer()
     order = []
-    conn._try_acquire_index_staging_slot = MagicMock(return_value=None)
+    conn._try_acquire_dcp_staging_slot = MagicMock(return_value=None)
 
     def launch(_target, region_idx, *_args, **_kwargs):
         order.append(("launch", region_idx))
@@ -1622,8 +1622,8 @@ def test_staged_region_pipeline_falls_back_when_no_prefetch_slot():
         order.append(("finish", region_idx))
         return True
 
-    conn._launch_staged_index_layer_chunk = MagicMock(side_effect=launch)
-    conn._finish_staged_index_layer_chunk = MagicMock(side_effect=finish)
+    conn._launch_staged_dcp_layer_chunk = MagicMock(side_effect=launch)
+    conn._finish_staged_dcp_layer_chunk = MagicMock(side_effect=finish)
     assert mc.MooncakeConnector._execute_staged_region_pipeline(
         conn,
         "consumer:1234",

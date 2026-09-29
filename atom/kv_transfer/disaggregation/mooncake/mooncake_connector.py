@@ -2231,7 +2231,7 @@ class MooncakeConnector(KVConnectorBase):
                 src_addrs.tolist(),
                 dst_addrs.tolist(),
                 sizes.tolist(),
-                req_id,
+                pending.req_id,
                 "staged-dcp",
                 engine=pending.engine,
             ):
