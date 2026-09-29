@@ -353,3 +353,66 @@ def test_scheduler_and_worker_metadata_share_page_namespace(monkeypatch):
     assert scheduler.model_name == worker.model_name
     assert scheduler.worker_id == 0
     assert worker.worker_id == 3
+
+
+def test_page_namespace_separates_pp_partition_and_dcp_interleave(monkeypatch):
+    cfg = _config()
+    cfg.hf_config.num_hidden_layers = 78
+    cfg.tensor_parallel_size = 1
+    cfg.pipeline_parallel_size = 4
+    cfg.decode_context_parallel_size = 1
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "20,20,20,18")
+    first = offcfg.build_page_namespace(cfg, _lmcache_config(), 4)
+    assert offcfg.page_parallel_layout(cfg)["pp_layer_ranges"] == [
+        [0, 20],
+        [20, 40],
+        [40, 60],
+        [60, 78],
+    ]
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "18,20,20,20")
+    assert offcfg.build_page_namespace(cfg, _lmcache_config(), 4) != first
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION")
+    cfg.pipeline_parallel_size = 1
+    cfg.tensor_parallel_size = 4
+    cfg.decode_context_parallel_size = 2
+    first = offcfg.build_page_namespace(cfg, _lmcache_config(), 4)
+    cfg.dcp_config = SimpleNamespace(interleave_size=2)
+    assert offcfg.build_page_namespace(cfg, _lmcache_config(), 4) != first
+    assert offcfg.page_parallel_layout(cfg)["tp_token_shards"] == [0, 1, 0, 1]
+
+
+def test_page_namespace_does_not_confuse_pp_world_with_tp():
+    pp = _config()
+    pp.tensor_parallel_size = 1
+    pp.pipeline_parallel_size = 4
+    pp.decode_context_parallel_size = 1
+    tp = deepcopy(pp)
+    tp.tensor_parallel_size = 4
+    tp.pipeline_parallel_size = 1
+    assert offcfg.build_page_namespace(
+        pp, _lmcache_config(), 4
+    ) != offcfg.build_page_namespace(tp, _lmcache_config(), 4)
+
+
+def test_execution_topology_accepts_arbitrary_hosts_and_rejects_missing_rank():
+    from atom.kv_transfer.topology import execution_topology
+
+    cfg = _config()
+    cfg.kv_transfer_config = {
+        "routing_topology": {
+            "ranks": [
+                {
+                    "pp": 0,
+                    "tp": rank,
+                    "host_id": f"host-{rank // 2}",
+                    "device_id": rank % 2,
+                }
+                for rank in range(4)
+            ]
+        }
+    }
+    topology = execution_topology(cfg)
+    assert [r["dcp"] for r in topology["ranks"]] == [0, 1, 0, 1]
+    cfg.kv_transfer_config["routing_topology"]["ranks"].pop()
+    with pytest.raises(ValueError, match="every PP x TP"):
+        execution_topology(cfg)

@@ -397,14 +397,10 @@ impl RouterTrait for AtomStandaloneRouter {
     }
 
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
-        (
-            StatusCode::OK,
-            Json(json!({
-                "router_type": self.router_type(),
-                "service_type": self.python_type_name(),
-            })),
-        )
-            .into_response()
+        match self.call_service("server_info", &json!({}), "server info") {
+            Ok(value) => Json(value).into_response(),
+            Err(response) => response,
+        }
     }
 
     async fn get_models(&self, _req: Request<Body>) -> Response {
