@@ -303,7 +303,20 @@ class AsyncIOProc:
                         continue
                     out = func(*call_args)
                 if need_barrier and self.all_ranks_barrier is not None:
-                    self.all_ranks_barrier.wait()
+                    try:
+                        self.all_ranks_barrier.wait()
+                    except threading.BrokenBarrierError:
+                        if payload is None:
+                            raise
+                        # Broken by the manager once a rank is found dead: that
+                        # rank can never arrive, and this one would otherwise
+                        # wait for it forever instead of answering.
+                        out = RpcResult(
+                            payload.request_id,
+                            self.rank,
+                            error=f"{func_name!r} ran, but the barrier broke "
+                            f"before every TP rank reached it",
+                        )
                 if payload is not None:
                     # Generic replies go to this rank's own channel. Routing
                     # them to the primary would drop every rank but 0, which is
@@ -648,23 +661,28 @@ class AsyncIOProcManager:
         """Wait for one rank's reply, or synthesise the reason there is none."""
         while True:
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return RpcResult(
-                    payload.request_id,
-                    rank,
-                    error=f"timed out waiting for {func_name!r} on TP rank {rank}",
-                )
             try:
                 # Poll rather than block for the whole budget, so a worker that
                 # dies mid-call is reported promptly instead of at the deadline.
-                reply = output_queue.get(timeout=min(1.0, remaining))
+                reply = output_queue.get(timeout=max(0.0, min(1.0, remaining)))
             except queue.Empty:
+                # Death before the deadline, even once it has passed: waiting on
+                # another rank can use up the budget, and a rank that died is
+                # still the reason this one never answered.
                 if rank < len(self.procs) and not self.procs[rank].is_alive():
                     return RpcResult(
                         payload.request_id,
                         rank,
                         error=f"TP rank {rank} died before answering {func_name!r}",
                     )
+                if remaining <= 0:
+                    return RpcResult(
+                        payload.request_id,
+                        rank,
+                        error=f"timed out waiting for {func_name!r} on TP rank {rank}",
+                    )
+                if payload.barrier:
+                    self._break_barrier_for_dead_ranks()
                 continue
 
             if not isinstance(reply, RpcResult):
@@ -691,6 +709,27 @@ class AsyncIOProcManager:
                     error=f"reply rank mismatch: channel {rank} carried {reply.tp_rank}",
                 )
             return reply
+
+    def _break_barrier_for_dead_ranks(self) -> None:
+        """Release the ranks waiting at the barrier once one can never arrive.
+
+        A dead rank never reaches it, so the rest would wait there forever and
+        never answer. Breaking it hands each of them a BrokenBarrierError to
+        answer with instead. A rank that is only slow is left to the deadline:
+        it can still arrive, and a broken barrier stays broken for every later
+        call that needs one.
+        """
+        barrier = getattr(self, "all_ranks_barrier", None)
+        if barrier is None or barrier.broken:
+            return
+        dead = [rank for rank, proc in enumerate(self.procs) if not proc.is_alive()]
+        if dead:
+            logger.error(
+                "%s: TP rank(s) %s died during a barrier call; releasing the rest",
+                self.label,
+                dead,
+            )
+            barrier.abort()
 
     def call_func(self, func_name: str, *args, wait_out: bool = False):
         """Standard RPC call for non-KV operations."""

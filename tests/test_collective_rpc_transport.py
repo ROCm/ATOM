@@ -20,6 +20,7 @@ pre-existing non-payload path is left bit-for-bit alone.
 import pickle
 import queue
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -151,6 +152,49 @@ def test_a_name_that_cannot_be_looked_up_is_an_error_not_a_dead_worker():
     assert [r.request_id for r in rpc] == ["r9", "r10"]
     assert not rpc[0].ok and "TypeError" in rpc[0].error
     assert rpc[1].ok and rpc[1].value == 1, "the loop must keep serving"
+
+
+class _BrokenBarrier:
+    def wait(self):
+        raise threading.BrokenBarrierError
+
+
+def test_a_broken_barrier_is_answered_not_raised():
+    """The manager breaks the barrier when a rank dies. A survivor has to
+    answer with that rather than die of it, and keep serving."""
+    first = RpcPayload(request_id="w1", args=(1,), barrier=True)
+    second = RpcPayload(request_id="w2", args=(2,))
+    proc = _proc(barrier=_BrokenBarrier())
+    _, rpc = _drive(proc, [("returns_value", [first]), ("returns_value", [second])])
+
+    assert [r.request_id for r in rpc] == ["w1", "w2"]
+    assert not rpc[0].ok and "barrier broke" in rpc[0].error
+    assert rpc[1].ok and rpc[1].value == 2
+
+
+def test_aborting_the_real_barrier_releases_a_blocked_party():
+    """What the worker's except clause relies on: the manager's abort wakes a
+    party blocked in the same multiprocessing barrier, with the threading
+    exception type."""
+    import multiprocessing
+
+    barrier = multiprocessing.get_context("spawn").Barrier(2)
+    raised = []
+
+    def party():
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:
+            raised.append(True)
+
+    waiter = threading.Thread(target=party, daemon=True)
+    waiter.start()
+    time.sleep(0.2)  # let it block; an abort before the wait also raises
+    barrier.abort()
+    waiter.join(timeout=5)
+
+    assert raised == [True]
+    assert barrier.broken
 
 
 def test_a_raising_target_is_reported_not_propagated():
@@ -379,6 +423,57 @@ def test_a_dead_rank_is_named_not_waited_out():
     assert "died" in results[1].error
     assert "rank 1" in results[1].error
     assert elapsed < 10, "a dead rank should be reported promptly, not at the deadline"
+
+
+class _Abortable:
+    """A barrier whose abort releases the survivor, as the real one does."""
+
+    def __init__(self, on_abort):
+        self.broken = False
+        self._on_abort = on_abort
+
+    def abort(self):
+        self.broken = True
+        self._on_abort()
+
+
+def test_a_dead_rank_breaks_the_barrier_so_the_survivors_answer():
+    """With barrier=True the survivor sat in the barrier waiting for a rank
+    that would never arrive, so it never answered: the call ran to its
+    deadline and then reported timeouts, without naming the dead rank."""
+    mgr = _mgr(2, procs=[_Alive(), _Dead()])
+    mgr.all_ranks_barrier = _Abortable(
+        on_abort=lambda: _reply(mgr, 0, "b1", error="barrier broke")
+    )
+
+    started = time.monotonic()
+    results = mgr.collective_rpc("m", RpcPayload("b1", barrier=True), timeout=30)
+
+    assert time.monotonic() - started < 10, "released promptly, not at the deadline"
+    assert mgr.all_ranks_barrier.broken
+    assert results[0].error == "barrier broke"
+    assert "died" in results[1].error
+
+
+def test_a_slow_rank_does_not_break_the_barrier():
+    """Only death does. A slow rank can still arrive, and a broken barrier
+    stays broken for every later call that needs one."""
+    mgr = _mgr(2)
+    mgr.all_ranks_barrier = _Abortable(on_abort=lambda: None)
+
+    results = mgr.collective_rpc("m", RpcPayload("b2", barrier=True), timeout=0.3)
+
+    assert not mgr.all_ranks_barrier.broken
+    assert all("timed out" in r.error for r in results)
+
+
+def test_a_rank_that_died_is_named_even_after_the_deadline():
+    """Waiting on a silent rank can use up the budget before the dead one's
+    turn comes, and that turn then reported a timeout instead of the death."""
+    mgr = _mgr(2, procs=[_Alive(), _Dead()])
+    results = mgr.collective_rpc("m", RpcPayload("d1"), timeout=0.3)
+    assert "timed out" in results[0].error
+    assert "died" in results[1].error
 
 
 def test_a_silent_rank_times_out_naming_itself():
