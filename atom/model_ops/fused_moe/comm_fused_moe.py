@@ -94,10 +94,7 @@ def create_comm_fused_moe_backend(
                 experts,
                 topk,
                 parallel_config.tp_size,
-                # The existing RS schedule was measured without a shared
-                # operand.  DPA still needs shared addition in the compiled
-                # kernel; initialize() reuses this geometry with that contract.
-                add_shared=False if use_dp_reduce_scatter else True,
+                add_shared=True,
                 comm="rs" if use_dp_reduce_scatter else "ar",
             )
         )
@@ -127,20 +124,16 @@ class CommFusedMoeBackend:
         self.host = host
         self.runtime_module = runtime
         self.use_dp_reduce_scatter = use_dp_reduce_scatter
-        # Hash-routed DSV4 layers read gathered input_ids from the forward
-        # context.  The first padded DPA integration deliberately leaves those
-        # layers on the existing ragged path until their id gather uses the same
-        # rank-major padding contract as hidden/router.
+        # Hash-routed DSV4 layers read separately gathered input_ids from the
+        # forward context. Leave them on the ordinary path until that gather is
+        # wired to the same compact rank order as hidden/router.
         self.supports_custom_routing = not use_dp_reduce_scatter
         self.runtime = None
         self._logged_buckets: set[int] = set()
 
-    @staticmethod
-    def _dpa_bucket_layout(max_tokens: int, world_size: int) -> tuple[int, int]:
-        from aiter.fused_moe import get_padded_M
-
+    def _dpa_bucket_layout(self, max_tokens: int, world_size: int) -> tuple[int, int]:
         gathered_tokens = max_tokens * world_size
-        bucket = int(get_padded_M(gathered_tokens))
+        bucket = self.runtime.bucket_for(gathered_tokens)
         if bucket < gathered_tokens or bucket % world_size:
             raise ValueError(
                 f"DPA comm-fused bucket M={bucket} cannot represent "
@@ -180,8 +173,6 @@ class CommFusedMoeBackend:
                 f"dp={layer.dp_size}, use_ep={layer.use_ep}"
             )
 
-        method.use_triton = False
-        method.use_triton_decode = False
         runner_args = {
             "tp_group": group,
             "model_dim": layer.hidden_size,
@@ -191,12 +182,6 @@ class CommFusedMoeBackend:
             "comm": "rs" if self.use_dp_reduce_scatter else "ar",
             "add_shared": True,
         }
-        if self.use_dp_reduce_scatter:
-            runner_args.update(
-                lookup_add_shared=False,
-                weight=layer.w2_weight.data,
-                weight_scale=layer.w2_weight_scale.data,
-            )
         self.runtime = self.runtime_module.CommFusedMoeRuntime(
             runners=self.host.create_flydsl_comm_fused_runners(**runner_args)
         )
@@ -222,19 +207,18 @@ class CommFusedMoeBackend:
         except ValueError:
             return False
         supported = self.runtime.supports(bucket)
-        if supported:
-            if bucket not in self._logged_buckets:
-                config = self.runtime.runners.configs[bucket]
-                logger.info(
-                    "comm-fused DPA rank=%d selected local_max=%d gathered=%d "
-                    "bucket=%d config=%s",
-                    int(get_dp_group().rank_in_group),
-                    max_tokens,
-                    gathered_tokens,
-                    bucket,
-                    config,
-                )
-                self._logged_buckets.add(bucket)
+        if supported and bucket not in self._logged_buckets:
+            config = self.runtime.runners.configs[bucket]
+            logger.info(
+                "comm-fused DPA rank=%d selected local_max=%d gathered=%d "
+                "bucket=%d config=%s",
+                int(get_dp_group().rank_in_group),
+                max_tokens,
+                gathered_tokens,
+                bucket,
+                config,
+            )
+            self._logged_buckets.add(bucket)
         return supported
 
     @staticmethod
@@ -254,8 +238,8 @@ class CommFusedMoeBackend:
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, int]:
-        """Build the bucket-aligned rank-major rectangle consumed by Window RS."""
+    ) -> tuple[torch.Tensor, torch.Tensor, int, list[int] | None]:
+        """Gather DPA inputs in compact rank order when Window supports ragged M."""
         from atom.utils.forward_context import get_forward_context
 
         ctx = get_forward_context()
@@ -274,30 +258,50 @@ class CommFusedMoeBackend:
                 f"local token count {local_tokens}"
             )
 
-        _, shard_rows = self._dpa_bucket_layout(max_tokens, world_size)
-
-        hidden_dim = hidden_states.shape[-1]
-        router_dim = router_logits.shape[-1]
-        router_dtype = router_logits.dtype
-        router_for_gather = (
-            router_logits
-            if router_dtype == hidden_states.dtype
-            else router_logits.to(hidden_states.dtype)
+        bucket, shard_rows = self._dpa_bucket_layout(max_tokens, world_size)
+        use_ragged_m = dp_metadata is not None and self.runtime.supports_ragged_m(
+            bucket
         )
-        combined = torch.cat((hidden_states, router_for_gather), dim=-1)
+
+        if use_ragged_m:
+            sizes = [int(size) for size in dp_metadata.get_sizes_across_dp()]
+            rank = int(group.rank_in_group)
+            if len(sizes) != world_size:
+                raise ValueError(
+                    "DPA ragged sizes length must equal world size: "
+                    f"sizes={len(sizes)}, world_size={world_size}"
+                )
+            if sizes[rank] != local_tokens:
+                raise ValueError(
+                    f"DPA rank {rank} has {local_tokens} input rows but "
+                    f"metadata reports {sizes[rank]}"
+                )
+            hidden_states, router_logits = group.device_communicator.all_gatherv(
+                [hidden_states, router_logits],
+                dim=0,
+                sizes=sizes,
+            )
+            return hidden_states, router_logits, local_tokens, sizes
+
         # Window RS assigns output row ``rank * (bucket / world_size) + row``
         # to each rank.  Padding only the gathered tensor's global tail would
         # leave the real rank-major boundaries at ``rank * max_tokens`` and
         # shift every rank after rank 0 whenever the bucket is larger.  Insert
         # the bucket slack inside every rank's shard before all-gather instead.
-        combined = self._pad_rows(combined, shard_rows)
-        combined = group.all_gather(combined, use_custom=True, dim=0)
-        hidden_states, router_logits = combined.split(
-            (hidden_dim, router_dim), dim=-1
+        # Keep the two ordinary gather payloads separate.  Concatenating them
+        # made the large transfer slower and forced both split views through
+        # full-size contiguous materialization on every MoE layer.
+        hidden_states = group.all_gather(
+            self._pad_rows(hidden_states, shard_rows),
+            use_custom=True,
+            dim=0,
         )
-        hidden_states = hidden_states.contiguous()
-        router_logits = router_logits.to(router_dtype).contiguous()
-        return hidden_states, router_logits, local_tokens
+        router_logits = group.all_gather(
+            self._pad_rows(router_logits, shard_rows),
+            use_custom=True,
+            dim=0,
+        )
+        return hidden_states, router_logits, local_tokens, None
 
     def forward(
         self,
@@ -305,7 +309,8 @@ class CommFusedMoeBackend:
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         shared_partial: torch.Tensor | None,
-        before_stage2: Callable[..., torch.Tensor] | None = None,
+        before_stage2: Callable[[int], torch.Tensor] | None = None,
+        before_shared_add: Callable[[], None] | None = None,
         stage2_stream: torch.cuda.Stream | None = None,
     ) -> torch.Tensor:
         if before_stage2 is not None:
@@ -315,6 +320,7 @@ class CommFusedMoeBackend:
                 router_logits,
                 shared_partial,
                 before_stage2=before_stage2,
+                before_shared_add=before_shared_add,
                 stage2_stream=stage2_stream,
             )
         if shared_partial is None:
@@ -332,14 +338,23 @@ class CommFusedMoeBackend:
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         shared_partial: torch.Tensor | None,
-        before_stage2: Callable[..., torch.Tensor] | None = None,
+        before_stage2: Callable[[int], torch.Tensor] | None = None,
+        before_shared_add: Callable[[], None] | None = None,
         stage2_stream: torch.cuda.Stream | None = None,
     ) -> torch.Tensor:
         method = layer.quant_method
+        reduce_scatter_sizes = None
         if self.use_dp_reduce_scatter:
-            hidden_states, router_logits, local_tokens = self._gather_dpa_inputs(
-                hidden_states, router_logits
-            )
+            (
+                hidden_states,
+                router_logits,
+                local_tokens,
+                reduce_scatter_sizes,
+            ) = self._gather_dpa_inputs(hidden_states, router_logits)
+            if reduce_scatter_sizes is None:
+                shard_rows = hidden_states.shape[0] // int(get_dp_group().world_size)
+                if shared_partial is not None:
+                    shared_partial = self._pad_rows(shared_partial, shard_rows)
         topk_weights, topk_ids = method.select_experts_with_record(
             layer=layer,
             hidden_states=hidden_states,
@@ -381,10 +396,22 @@ class CommFusedMoeBackend:
             ),
             shared_partial=shared_partial,
             before_stage2=before_stage2,
+            before_shared_add=before_shared_add,
             stage2_stream=stage2_stream,
+            reduce_scatter_sizes=reduce_scatter_sizes,
+            # The DPA input-gather phase completes only after every rank has
+            # entered this invocation. It therefore also proves that every peer
+            # finished reading the previous Direct partial before Stage2 reuses
+            # it, so Direct can omit its standalone reuse wait.
+            reuse_is_synchronized=self.use_dp_reduce_scatter,
         )
         if not self.use_dp_reduce_scatter:
             return output
+        if reduce_scatter_sizes is not None:
+            return output
+        if output.shape[0] == hidden_states.shape[0]:
+            shard_begin = int(get_dp_group().rank_in_group) * shard_rows
+            return output[shard_begin : shard_begin + local_tokens]
         return output[:local_tokens]
 
 
