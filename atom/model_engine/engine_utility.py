@@ -166,16 +166,22 @@ class EngineUtilityHandler:
         method = args.get("method")
         request_id = args.get("request_id")
         # Checked here, before the broadcast: every TP worker resolves the name
-        # with getattr, which raises TypeError on anything but a string.
-        if not isinstance(method, str) or not method or not request_id:
+        # with getattr, which raises TypeError on anything but a string, and the
+        # manager's output thread routes replies with the id as a dict key.
+        if (
+            not isinstance(method, str)
+            or not method
+            or not isinstance(request_id, str)
+            or not request_id
+        ):
             self.output_queue.put_nowait(
                 (
                     "UTILITY_RESPONSE",
                     {
                         "cmd": COLLECTIVE_RPC_CMD,
                         "request_id": request_id,
-                        "error": "collective_rpc needs a method name string and a "
-                        "request_id",
+                        "error": "collective_rpc needs a method name and a request "
+                        "id, both non-empty strings",
                     },
                 )
             )

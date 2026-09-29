@@ -166,6 +166,16 @@ def test_a_non_string_method_is_refused_before_the_broadcast():
     assert mgr.calls == [], "nothing may reach the workers"
 
 
+def test_a_non_string_request_id_is_refused_before_the_broadcast():
+    """The manager routes replies with the id as a dict key, so an unhashable
+    one ended its output thread once the replies came back."""
+    h, mgr, out = _handler()
+    h._handle_collective_rpc({"method": "m", "request_id": ["x9"]})
+    (body,) = _responses(out)
+    assert body["error"]
+    assert mgr.calls == [], "nothing may reach the workers"
+
+
 def test_a_raising_manager_is_reported_not_propagated():
     """Raising out of a handler kills the EngineCore busy loop, which takes the
     whole engine with it."""

@@ -147,6 +147,18 @@ def test_a_late_rpc_response_is_dropped_not_queued():
     )
 
 
+def test_a_reply_without_a_usable_id_is_dropped_not_routed_or_queued():
+    """Routing runs on the output thread, which a raise would end, and an
+    unhashable id made the router's dict lookup raise. An id-less reply on the
+    shared queue would become the next synchronous caller's instead."""
+    mgr = _mgr(1)
+    for request_id in (["not", "hashable"], None, "", 7):
+        mgr._route_utility_response(
+            0, {"cmd": COLLECTIVE_RPC_CMD, "request_id": request_id, "error": "x"}
+        )
+    assert mgr.utility_response_queue.empty()
+
+
 # ── collective_rpc ─────────────────────────────────────────────────────────
 
 

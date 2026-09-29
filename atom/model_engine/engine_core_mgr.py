@@ -1370,13 +1370,18 @@ class CoreManager:
         Only ``collective_rpc`` replies carry a request id, so every existing
         utility command keeps the legacy shared-queue path untouched.
         """
-        request_id = (
-            data.get("request_id")
-            if isinstance(data, dict) and data.get("cmd") == COLLECTIVE_RPC_CMD
-            else None
-        )
-        if request_id is None:
+        if not (isinstance(data, dict) and data.get("cmd") == COLLECTIVE_RPC_CMD):
             self.utility_response_queue.put_nowait(data)
+            return
+        request_id = data.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            # Nobody can be waiting on it. Routing an unhashable id raises on
+            # this thread, which ends it, and on the shared queue the reply
+            # would become the next synchronous caller's.
+            logger.warning(
+                f"{self.label}: dropping collective_rpc reply with no usable "
+                f"request id from DP rank {dp_rank}"
+            )
             return
         if not self._rpc_router.route(request_id, (dp_rank, data)):
             # The caller timed out and unregistered. Dropping is the point: on
