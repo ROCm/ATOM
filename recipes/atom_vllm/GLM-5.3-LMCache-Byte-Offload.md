@@ -36,6 +36,7 @@ export AITER_LOG_LEVEL=WARNING
 
 vllm serve /data/amd_int/models/GLM-5.3-MXFP4 \
   --served-model-name amd/GLM-5.3-MXFP4 --trust-remote-code \
+  --host 127.0.0.1 --port 8330 \
   --load-format fastsafetensors --tensor-parallel-size 4 \
   --gpu-memory-utilization 0.95 --block-size 64 --kv-cache-dtype fp8 \
   --max-num-batched-tokens 16384 --max-model-len 1048576 \
