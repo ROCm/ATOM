@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790615787864,
+  "lastUpdate": 1790701962081,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -3443,6 +3443,51 @@ window.BENCHMARK_DATA = {
             "value": 0.8976,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/36450504580 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609281543 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1547 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "jasen",
+            "username": "Jasen2201",
+            "email": "yajizhan@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "74fd942b0a2240a99bbb8a737133dfd6e036e40c",
+          "message": "fix(mtp): install the draft work plan when warming draft graphs (#2367)\n\n* fix(mtp): install the draft work plan when warming draft graphs\n\n`warmup_draft_graphs` builds its context from the target's capture builder,\nat the target's verify width (max_seqlen_q = mtp_k + 1). `_step_warmup_inputs`\nthen replays `_enter_decode_metadata` to drop that context to one row per\nsequence, but not the `prepare_mtp_decode` call `propose` makes right after\nit, so the target's persistent MLA work plan stayed installed.\n\nOnly persistent-mode MLA reads that plan, and only DPA runs persistent mode,\nso GLM-5.2 with --enable-dp-attention plus MTP walked a plan sized for\nmtp_k + 1 query rows per sequence over a one-row query while warming the\ndraft graphs: a memory access fault in\naiter::mla_a8w8_qh16_qseqlen4_gqaratio16_v3_ps on every rank, under both FULL\nand PIECEWISE cudagraph modes. TP and DCP use non-persistent kernels or\nrebuild the plan themselves, which is why they were unaffected.\n\nMake the warmup follow the rewrite with the same `prepare_mtp_decode` call,\nunder the same only_update rule as `propose`, and install the plan it returns.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n\n* test(mtp): skip the draft warmup test where the drafter cannot import\n\nThe drafter imports aiter at module load and the non-GPU CI runner has no\naiter, so importing EagleProposer failed test collection. Import it through\npytest.importorskip on the module, as tests/test_dspark.py does.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n\n* fix(mtp): replay the full draft metadata advance at warmup, per size\n\nThe warmup called prepare_mtp_decode by hand, which left three gaps:\n\n- It copied only part of what propose does before a mid-step. propose also\n  bumps max_seqlen_k, context_lens and positions, and republishes the fp4\n  indexer schedule. Move that whole sequence into _advance_decode_metadata\n  and call it from both propose and _step_warmup_inputs.\n- kv_indptr and context_lens are bumped in place, and nothing resets them\n  between capture sizes. At page size 1 the MLA capture builder leaves\n  kv_indptr alone, so the bumps pile up across sizes: after sizes 1, 2, 4,\n  kv_indptr is [0, 3, 4, 3, 4], and that negative length goes into the\n  MLA work-plan build. EagleProposer.warmup_draft_graphs now restores both\n  buffers before each size and once after the loop.\n- The warmup passed max_seqlen_k = 0, so kv_indices_generate_triton\n  launched an empty grid and wrote nothing. The shared advance raises it\n  to 1, so the index is written for the one token kv_indptr now holds.\n\nBackends that recompute the draft's slot_mapping (MHA, QSA) undid the\nblanking capture relies on. The warmup now sets those slots back to\nPAD_SLOT_ID so the warmup forward does not write KV.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: yajizhan@amd.com <yajizhan@amd.com@pit2-p03-g53.pit2.tensorwave.lan>\nCo-authored-by: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\nCo-authored-by: yajizhan@amd.com <yajizhan@amd.com@pit2-vm-amd-xl-02.amd.pit2.tensorwave.lan>",
+          "timestamp": "2026-09-29T08:38:25Z",
+          "url": "https://github.com/ROCm/ATOM/commit/74fd942b0a2240a99bbb8a737133dfd6e036e40c"
+        },
+        "date": 1790701961121,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9469,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/36597124077 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202609291501 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9439 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.9545,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/36597124077 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609291501 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9545 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 66.15,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/36597124077 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609291501 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9545 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.98,
+            "unit": "tok/fwd"
           }
         ]
       }
