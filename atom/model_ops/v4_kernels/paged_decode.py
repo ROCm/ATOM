@@ -59,6 +59,7 @@ from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 from aiter.ops.triton.utils.device_info import get_num_sms
 
 from atom.model_ops.sparse_attn_v4 import _sparse_attn_ragged_torch
+from atom.model_ops.v4_kernels import hca_persist
 from atom.model_ops.v4_kernels.paged_decode_gluon import (
     _paged_decode_fused_gluon_kernel,
 )
@@ -1168,6 +1169,7 @@ def sparse_attn_v4_paged_decode(
     empty_kv_indptr: torch.Tensor | None = None,
     prefix: str = "",
     split_plan: tuple[int, torch.Tensor] | None = None,
+    compress_ratio: int | None = None,
 ) -> torch.Tensor:
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
@@ -1180,6 +1182,11 @@ def sparse_attn_v4_paged_decode(
     ``split_plan`` is aiter's ``MlaV4NmSplitPlan`` (``num_kv_splits``,
     ``split_indptr``) for the decode ASM kernel, built by whoever built this
     call's ``qo_indptr``; None leaves the split pick to aiter.
+
+    ``compress_ratio`` is the calling layer's ratio (0 SWA, 4 CSA, 128 HCA).
+    With ``ATOM_V4_HCA_PERSIST`` (default on), fp8 HCA calls with 128 heads on
+    gfx950 and ``ATOM_V4_HCA_PERSIST_MIN_ROWS <= rows <= 32768`` run aiter's
+    persistent kernel (``hca_persist``) instead; ``split_plan`` is then unused.
 
     Otherwise (bf16): the existing Triton / reference path. When ``kv_scales``
     is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and is dequantized
@@ -1201,6 +1208,25 @@ def sparse_attn_v4_paged_decode(
                 empty_kv_indptr,
                 attn_sink,
                 softmax_scale,
+                unified_kv_rope,
+                q_packed_in,
+                q_rope_in,
+            )
+        if (
+            q_packed_in is not None
+            and hca_persist.wanted(
+                compress_ratio=compress_ratio,
+                heads=q_packed_in.shape[1],
+                rows=q_packed_in.shape[0],
+                gfx=get_gfx(),
+            )
+            and hca_persist.layout_ok(unified_kv, unified_kv_rope)
+        ):
+            return hca_persist.hca_persist_decode(
+                unified_kv,
+                kv_indices,
+                kv_indptr,
+                attn_sink,
                 unified_kv_rope,
                 q_packed_in,
                 q_rope_in,

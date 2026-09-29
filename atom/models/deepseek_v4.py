@@ -3340,6 +3340,7 @@ class DeepseekV4Attention(nn.Module):
                 empty_kv_indptr=attn_md.empty_kv_indptr,
                 prefix=f"{self.layer_name}.sparse_attn_decode",
                 split_plan=split_plan,
+                compress_ratio=ratio,
             )  # [S, H, head_dim]
         else:
             # Two-source paged prefill: prefix from `unified_kv` (per-ratio
