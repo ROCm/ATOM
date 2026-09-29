@@ -255,7 +255,10 @@ EOF
     # CAP_SYS_NICE was requested. Without it those calls are rejected by
     # seccomp before the kernel ever checks credentials -- which is what blocks
     # LMCache's NUMA placement. Binding one's own pages needs no capability, so
-    # the empty effective set above does not stand in the way.
+    # the empty effective set above does not stand in the way. Measured on the
+    # pinned CI image with --user 1000:1000, MPOL_BIND on an anonymous mapping:
+    # without SYS_NICE mbind returns EPERM, the exact errno job 4721 died on;
+    # with it, rc=0. Only the cap list differs between the two.
     --cap-add=IPC_LOCK --cap-add=NET_ADMIN --cap-add=SYS_NICE
     --ulimit memlock=-1:-1 --ulimit stack=67108864 --ulimit nofile=65536:524288
     --shm-size=128G
