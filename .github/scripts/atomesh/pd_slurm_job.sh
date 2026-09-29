@@ -249,6 +249,14 @@ EOF
       "${DOCKER_IMAGE}" || true)"
   fi
 
+  # Deliberately ungated, unlike the AOT stage above: some images ship
+  # /tmp/aiter_configs root-owned, which kills model load on both arms of the
+  # seeding A/B. See stage_aiter_configs.sh.
+  local aiter_config_stage
+  aiter_config_stage="$(bash \
+    "${REPO_ROOT}/.github/scripts/atomesh/stage_aiter_configs.sh" \
+    "${DOCKER_IMAGE}" || true)"
+
   # Same env-file route, for the same reason. WARN is the default everywhere; a
   # case that is chasing an RCCL init hang can ask for INFO without making the
   # nightly logs verbose. The -e below has to win over --env-file, so this
@@ -378,6 +386,10 @@ EOF
   # Same path on both sides so the variable above resolves, and read-only: the
   # stage is shared by every worker on this node and seeding only ever reads it.
   [[ -n "${aot_stage}" ]] && docker_args+=(-v "${aot_stage}:${aot_stage}:ro")
+  # Read-write, and over the in-image path rather than beside it: aiter's
+  # hardcoded lock target is what has to become writable.
+  [[ -n "${aiter_config_stage}" ]] &&
+    docker_args+=(-v "${aiter_config_stage}/configs:/tmp/aiter_configs")
 
   docker_args+=(
     "${DOCKER_IMAGE}"
@@ -704,6 +716,12 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
         aot_stage="$(bash "'"${REPO_ROOT}"'/.github/scripts/atomesh/stage_aot_cache.sh" \
           "'"${DOCKER_IMAGE}"'" || true)"
       fi
+      # Ungated on purpose, unlike the stage above. Some images ship
+      # /tmp/aiter_configs owned by root, and the resulting lock-file
+      # PermissionError kills model load on the control arm as well.
+      aiter_config_stage="$(bash \
+        "'"${REPO_ROOT}"'/.github/scripts/atomesh/stage_aiter_configs.sh" \
+        "'"${DOCKER_IMAGE}"'" || true)"
       nested_docker_args=()
       if [[ -d /shared_nfs ]]; then
         nested_docker_args+=(-v /shared_nfs:/shared_nfs:ro)
@@ -754,6 +772,14 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
         nested_docker_args+=(
           -v "${aot_stage}:${aot_stage}:ro"
           -e ATOMESH_AOT_CACHE_STAGE="${aot_stage}"
+        )
+      fi
+      # Same reason for coming last: the SWE-bench branch rebuilds the array.
+      # Read-write, and mounted over the in-image path, because aiter locks
+      # against a hardcoded target there.
+      if [[ -n "${aiter_config_stage}" ]]; then
+        nested_docker_args+=(
+          -v "${aiter_config_stage}/configs:/tmp/aiter_configs"
         )
       fi
       set +e
