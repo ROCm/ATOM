@@ -384,6 +384,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # periods and the noise floor under them are in the environment doc, and
     # end-to-end throughput is too coarse to see an effect that size.
     "ATOM_DSV41_SIDE_STREAMS": lambda: int(os.getenv("ATOM_DSV41_SIDE_STREAMS", "0")),
+    # Experimental native Pro MoE path; bs1, decode through MTP3.
+    "ATOM_DSV4_MOE_MONOKERNEL": lambda: os.getenv("ATOM_DSV4_MOE_MONOKERNEL", "0")
+    == "1",
+    "ATOM_DSV4_MONOKERNEL": lambda: os.getenv("ATOM_DSV4_MONOKERNEL", "0") == "1",
     # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
     # (K3DSparkMLAAttention.write_context_kv) into one Triton kernel --
     # RMSNorm(kv_c) + rope(k_pe) + concat + paged-cache store, versus today's

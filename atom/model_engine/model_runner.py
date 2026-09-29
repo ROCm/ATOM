@@ -1066,6 +1066,13 @@ class ModelRunner:
         builder = getattr(self, "attn_metadata_builder", None)
         if builder is not None:
             builder.close()
+        if envs.ATOM_DSV4_MONOKERNEL or envs.ATOM_DSV4_MOE_MONOKERNEL:
+            from atom.model_ops.dsv4_monokernel import close_monokernels
+
+            close_monokernels(self.model)
+            draft_model = getattr(getattr(self, "drafter", None), "model", None)
+            if draft_model is not None:
+                close_monokernels(draft_model)
         # 1. Destroy distributed env (NCCL + CustomAllreduce + process groups)
         #    Must happen while ops module is still alive for CustomAllreduce cleanup.
         destroy_dist_env()

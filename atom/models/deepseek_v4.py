@@ -1181,6 +1181,9 @@ class Compressor(nn.Module):
         # decode path, in TBO, two concurrent ubatch threads never share the
         # same scratch.
         self._combined_cg_buf: dict = {}
+        # Bound only by an explicitly prepared DSV4 mono layer. A weak
+        # adapter reference keeps normal/unsupported/closed paths native.
+        self._dsv4_mono_adapter = None
 
         # External tensors — assigned by the owning Attention / Indexer at first forward.
         self.kv_cache: torch.Tensor | None = None
@@ -1302,7 +1305,22 @@ class Compressor(nn.Module):
         # update_compressor_states) accept strided kv/score (only inner
         # stride must be 1).
         coff_d = (1 + overlap) * d
-        combined = self.wkv_gate(x)
+        use_stable_projection = False
+        if self._dsv4_mono_adapter is not None:
+            from atom.model_ops.dsv4_monokernel import (
+                stable_compressor_projection_supported,
+            )
+
+            use_stable_projection = stable_compressor_projection_supported(
+                self._dsv4_mono_adapter(), get_forward_context(), x.shape[0]
+            )
+        if use_stable_projection:
+            # Atomic BF16 split-K can change compressed FP8/FP4 cache rows
+            # between identical graph replays. Preserve BF16 output/RNE with
+            # the stable Torch GEMM verified for the bs1/seq1..4 contract.
+            combined = torch.nn.functional.linear(x, self.wkv_gate.weight)
+        else:
+            combined = self.wkv_gate(x)
         # ===== PCP (full-KV) =====
         # `x` here is this rank's 1/W round-robin shard (model.forward entry split).
         # The wkv_gate projection above is per-token (parallelizable), but the
@@ -3768,16 +3786,31 @@ class MoE(nn.Module):
         )
         # Keep comm-fused token-bucket dispatch dynamic under torch.compile.
         self._use_comm_fused_dispatch = self.experts._comm_fused_moe is not None
+        self._moe_mono = None
+        if envs.ATOM_DSV4_MOE_MONOKERNEL or envs.ATOM_DSV4_MONOKERNEL:
+            from atom.model_ops.dsv4_monokernel import Dsv4MoeMono
+
+            self._moe_mono = Dsv4MoeMono(self, args)
         # Register self in static_forward_context so the custom op dispatcher
         # can look us up by `layer_name` (= self.prefix). Needed by
         # maybe_dual_stream_forward (dual-stream) AND moe_pcp_merge_forward
         # — the latter requires registration regardless of
         # dual-stream, so register whenever either consumer is active.
         _pcp_merge_on = get_pcp_world_size() > 1 and bool(envs.ATOM_PCP_MOE_MERGE)
-        if self._use_dual_stream or self._use_comm_fused_dispatch or _pcp_merge_on:
+        if (
+            self._use_dual_stream
+            or self._use_comm_fused_dispatch
+            or _pcp_merge_on
+            or self._moe_mono is not None
+        ):
             get_current_atom_config().compilation_config.static_forward_context[
                 prefix
             ] = self
+
+    def process_weights_after_loading(self):
+        # Parent-first loader traversal preserves the native, unshuffled layout.
+        if self._moe_mono is not None:
+            self._moe_mono.prepare()
 
     def _hash_topk(
         self,
@@ -3925,6 +3958,10 @@ class MoE(nn.Module):
         self, x: torch.Tensor  # [num_tokens, dim]
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Sequential: shared_experts → routed_experts → combine."""
+        if self._moe_mono is not None:
+            mono = self._moe_mono.maybe_forward(x)
+            if mono is not None:
+                return mono
         shared = self.shared_experts(x) if self.shared_experts is not None else None
         routed, is_complete = self.routed_expert_forward(x, shared_partial=shared)
         if is_complete:
@@ -3943,6 +3980,10 @@ class MoE(nn.Module):
         independent; main stream waits on alt_stream's completion before
         combining.
         """
+        if self._moe_mono is not None:
+            mono = self._moe_mono.maybe_forward(x)
+            if mono is not None:
+                return mono
         routed_stream = torch.cuda.current_stream(x.device)
         self.alt_stream.wait_stream(routed_stream)
 
@@ -3977,7 +4018,11 @@ class MoE(nn.Module):
         assert (
             x.dim() == 2 and x.shape[-1] == self.dim
         ), f"MoE expects 2D [num_tokens, {self.dim}], got {tuple(x.shape)}"
-        if self._use_dual_stream or self._use_comm_fused_dispatch:
+        if (
+            self._use_dual_stream
+            or self._use_comm_fused_dispatch
+            or self._moe_mono is not None
+        ):
             # Keep stream and comm-fused dispatch opaque to torch.compile.
             return torch.ops.aiter.maybe_dual_stream_forward(x, self.prefix)
         return self.single_stream_moe_forward(x)
@@ -4069,6 +4114,11 @@ class Block(nn.Module):
         self.enable_fused_hc = (
             self._mhc_fused_post_pre is not None and self.layer_id != 0
         )
+        self._layer_mono = None
+        if envs.ATOM_DSV4_MONOKERNEL:
+            from atom.model_ops.dsv4_monokernel import Dsv4LayerMono
+
+            self._layer_mono = Dsv4LayerMono(self)
 
     # mHC `hc_post_mult_value`: V4 uses `2.0 * sigmoid(post)` for the post gate.
     HC_POST_MULT = 2.0
@@ -4080,6 +4130,10 @@ class Block(nn.Module):
         after loading, then use w_preshuffle_bf16=1 without shuffling residuals.
         No-op unless enable_hc_fn_pack_bf16.
         """
+        if self._layer_mono is not None:
+            # The loader visits parents before children. Prepare the FFN here
+            # while routed/shared weights are still in their checkpoint layout.
+            self._layer_mono.prepare()
         if not self.enable_hc_fn_pack_bf16:
             return
         for name in ("hc_attn_fn", "hc_ffn_fn"):
@@ -4317,11 +4371,34 @@ class Block(nn.Module):
             res_preshuffle=hc_state.res_preshuffle,
         )
 
+    def mono_kernel_forward(
+        self,
+        hc_state: HCState,
+        positions: torch.Tensor,
+        *,
+        unfused: bool = False,
+    ) -> HCState:
+        """One layer: mHC → indexer/attention → mHC → A8W4 FFN.
+
+        This staged layer interface can issue multiple kernel launches. Explicit
+        calls reject unsupported shapes; ordinary forward retains native fallback.
+        """
+        if self._layer_mono is None:
+            raise RuntimeError("enable ATOM_DSV4_MONOKERNEL=1 before loading the model")
+        return self._layer_mono.forward(hc_state, positions, unfused=unfused)
+
     def forward(
         self,
         hc_state: HCState,
         positions: torch.Tensor,  # [num_tokens] int  absolute token positions
     ) -> HCState:  # [num_tokens, hc, dim]  updated residual stream
+        if self._layer_mono is not None and self._layer_mono.supports(
+            positions.numel()
+        ):
+            return self.mono_kernel_forward(hc_state, positions)
+        return self._native_forward(hc_state, positions)
+
+    def _native_forward(self, hc_state: HCState, positions: torch.Tensor) -> HCState:
         # ----- Attention sub-layer with mHC mixing -----
         hc_state = self.fuse_hc(
             hc_state,

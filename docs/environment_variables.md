@@ -238,6 +238,13 @@ some layers and the device path for others, which is the confusing state.
 | **ATOM_ENGRAM_UVA** | bool | 1 (true) | Page-lock this rank's shard of the hash tables in place and let a device kernel read the rows it needs across the bus, dequantizing there. No copy and no HBM for the table. `0` falls back to gathering the rows on the host, which returns the same rows but costs ~50 ms of CPU per decode step with the GPU idle behind it. Anything that would make the device path unsafe — no CUDA, more TP ranks than hash heads, a registration that will not fit — falls back on its own, so the switch is for taking the host path deliberately. The fallback is the whole TP group's: the lookup ends in an all-gather, so one rank that cannot register turns every rank around rather than leaving the others in a collective it never enters. |
 | **ATOM_ENGRAM_CACHE_DIR** | path | `~/.cache/atom/engram` | Where the compressed-vocab table is cached between runs. The table is reproducible from the tokenizer, so this only trades startup time for disk; point it at shared storage to let several servers build it once. A truncated or stale cache is rebuilt rather than raised. |
 
+## Experimental DeepSeek-V4-Pro mono-kernel
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_DSV4_MONOKERNEL** | bool | 0 (false) | Enable one `mono_kernel_forward` per DSV4-Pro layer: native indexer/attention/mHC plus the FlyDSL A8W4 MoE mono-kernel. A layer forward uses multiple launches. Supports bs1/seq1..4, targeting local gfx950 TP4/TP8, with native fallback for unsupported calls. Requires the same recipe as the MoE-only switch below. See [the recipe](../recipes/DeepSeek-V4.md#experimental-flydsl-layer-forward-and-moe-mono-kernel). |
+| **ATOM_DSV4_MOE_MONOKERNEL** | bool | 0 (false) | Enable only the external FlyDSL DSV4-Pro A8W4 MoE adapter for one request with query length 1..4. Requires `AITER_BF16_FP8_MOE_BOUND=0`, `ATOM_MOE_GU_ITLV=1`, `ATOM_V4_USE_TRITON_FUSION=0`, native FP8 shared weights, and the companion FlyDSL package on `PYTHONPATH`. Unsupported shapes/configurations retain the existing path. |
+
 ## Attention side streams (DeepSeek-V4.1)
 
 A layer's compressor reads the hidden row and its own arena state, and its

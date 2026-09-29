@@ -33,6 +33,59 @@ Tips on server configuration:
 - Clear compile cache before restarting after code changes: `rm -rf /root/.cache/atom/*`
 - V4-Pro reuses the DeepSeek-V3 config schema; V4-specific fields (compress ratios, hash layers, index head dims) are read from the HF config automatically.
 
+### Experimental FlyDSL layer forward and MoE mono-kernel
+
+See [the integration and validation record](../docs/dsv4_monokernel.md) for
+the current implementation, test commands, acceptance criteria, and next steps.
+
+The companion FlyDSL `codex/dsv4-a8w4-monokernel` branch provides a resident
+MoE kernel and a per-layer forward for native DSV4-Pro on gfx950, targeting
+local TP4/TP8. Set `ATOM_DSV4_MONOKERNEL=1` with the A8W4 recipe above and
+`ATOM_V4_USE_TRITON_FUSION=0`, and add the companion FlyDSL checkout and
+FlyDSL 0.3.2 to `PYTHONPATH`. The switch is off by default.
+
+Its initial dispatch range is **one request, query length 1..4**, including
+MTP3 verification. Prefill, multiple requests, DP/EP/PP/PCP/DCP/TBO, online
+requantization, and competing MoE backends use the existing path. This fuses
+router, routed/shared experts, and TP reduction. Each layer calls
+`mono_kernel_forward(hc_state, positions)` once; internally it runs native
+attention mHC, indexer/attention, FFN mHC, then the MoE mono-kernel. The layer
+interface uses multiple launches. Input/output preserve the complete delayed
+`HCState`, and attention owns all native cache updates. The external class is
+`kernels.monokernel.dsv4.Dsv4MonoKernel`, following the K3 PR host-wrapper form.
+Use `ATOM_DSV4_MOE_MONOKERNEL=1` instead to enable only the MoE adapter.
+
+Prepared layer forwards use a stable Torch BF16 compressor projection for
+supported shapes, avoiding atomic split-K drift in compressed FP8/FP4 cache
+rows. This binding borrows the loaded projection weights and stops applying
+when its bucket closes. Routed SwiGLU is quantized directly from FP32 to FP8,
+matching AITER's fused `*_fp8` GEMM1; shared GEMM/activation boundaries use
+BF16 round-to-nearest.
+
+The companion `tools.compare` keeps the default ATOM baseline and an explicit
+`--atom-profile stable-rne` comparison separate. Generate a TP-specific profile
+with `tools.accuracy_config` to select a stable router and CK RNE shared GEMM1;
+the source CSVs remain unchanged and their hashes are recorded. See the
+companion DSV4 README for commands. This comparison profile is not required
+by the production mono layer's compressor fix.
+
+Preparation runs before child weight processing and borrows the routed
+Parameters after ATOM's usual GU-interleaved shuffle, avoiding a second full
+expert-weight allocation. It retains additional raw scales and router/shared
+packing. Updating weights after preparation is unsupported. This remains an
+experimental component integration until full-server accuracy is validated.
+
+The FlyDSL script `python -m kernels.monokernel.dsv4.tools.compare --help`
+documents native checkpoint accuracy/performance comparisons. Use
+`--atom-module --checkpoint /path/to/DeepSeek-V4-Pro` to exercise the real
+ATOM MoE module, including post-load preparation, CUDA Graph replay, and
+mono enabled/disabled comparison. The separate
+`python -m kernels.monokernel.dsv4.tools.monokernel --help` tests the complete
+layer interface with a native decode metadata/cache fixture and compares all
+HCState tensors and logical cache values, with exact byte checks outside the
+current layer’s numerical state regions. It does not validate model generation or
+speculative accept/reject behavior.
+
 ### Experimental native RCCL routed MoE
 
 ATOM can run expert dispatch/combine without MoRI through a native RCCL
