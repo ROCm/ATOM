@@ -666,6 +666,9 @@ class AsyncIOProcManager:
                 # dies mid-call is reported promptly instead of at the deadline.
                 reply = output_queue.get(timeout=max(0.0, min(1.0, remaining)))
             except queue.Empty:
+                # Ahead of both returns below: once this call gives up, nothing
+                # else would release ranks still waiting on a dead one.
+                self._break_barrier_for_dead_ranks()
                 # Death before the deadline, even once it has passed: waiting on
                 # another rank can use up the budget, and a rank that died is
                 # still the reason this one never answered.
@@ -681,8 +684,6 @@ class AsyncIOProcManager:
                         rank,
                         error=f"timed out waiting for {func_name!r} on TP rank {rank}",
                     )
-                if payload.barrier:
-                    self._break_barrier_for_dead_ranks()
                 continue
 
             if not isinstance(reply, RpcResult):
@@ -718,6 +719,10 @@ class AsyncIOProcManager:
         answer with instead. A rank that is only slow is left to the deadline:
         it can still arrive, and a broken barrier stays broken for every later
         call that needs one.
+
+        Checked while waiting on any call, not only barrier ones: a barrier
+        call that timed out on a slow rank leaves the rest waiting, and if that
+        rank dies afterwards, only a later call is there to notice.
         """
         barrier = getattr(self, "all_ranks_barrier", None)
         if barrier is None or barrier.broken:

@@ -476,6 +476,36 @@ def test_a_rank_that_died_is_named_even_after_the_deadline():
     assert "died" in results[1].error
 
 
+def test_a_barrier_call_that_times_out_still_releases_the_survivors():
+    """The deadline branch returned before the barrier check, so a rank found
+    dead on the last poll left the others waiting after the call had given up
+    on them -- and every later call to them hung too."""
+    mgr = _mgr(2, procs=[_Alive(), _Dead()])
+    mgr.all_ranks_barrier = _Abortable(on_abort=lambda: None)
+
+    results = mgr.collective_rpc("m", RpcPayload("t1", barrier=True), timeout=0)
+
+    assert mgr.all_ranks_barrier.broken
+    assert "timed out" in results[0].error
+    assert "died" in results[1].error
+
+
+def test_any_call_that_finds_a_rank_dead_releases_the_barrier():
+    """A barrier call that timed out on a slow rank leaves the rest waiting. If
+    that rank dies afterwards, only a later call, barrier or not, is there to
+    notice and let them answer."""
+    mgr = _mgr(2, procs=[_Alive(), _Dead()])
+    mgr.all_ranks_barrier = _Abortable(
+        on_abort=lambda: _reply(mgr, 0, "n1", value="served")
+    )
+
+    results = mgr.collective_rpc("m", RpcPayload("n1"), timeout=30)
+
+    assert mgr.all_ranks_barrier.broken
+    assert results[0].value == "served"
+    assert "died" in results[1].error
+
+
 def test_a_silent_rank_times_out_naming_itself():
     mgr = _mgr(2)
     _reply(mgr, 0, "m3", value="ok")
