@@ -160,15 +160,16 @@ def qsa_logits_fly_kernel(
     # tiler 要写全两维：(64,128) -> (64,128,ceil(rows/64),1)
     q_head0123_block = [fx.flat_divide(qi,(64,128))[None,None,bidm,0] for qi in q_head0123] # [64,128]
     q_head0123_wave = [fx.flat_divide(qi,(16,128))[None,None,wave_id,0] for qi in q_head0123_block] # 4 个 [16,128]
-    q_head0123_wave = [fx.flat_divide(qi,(16,MFMA_K_STEP))[None,None,0,None] for qi in q_head0123_wave] # [16,128]->[16,16,1,8]->[16,16,8] 8是K维度循环次数
+    # K 维重排：第 s 步里 lane 组 g 负责 dims 32g+4s..32g+4s+3，于是每个 lane 8 步合起来读连续的 32 个元素
+    # (16,(4,4),8):(512,(1,32),4) —— 行 / (步内4个元素, lane组g) / 步 s
+    q_head0123_wave = [fx.make_view(fx.get_iter(qi),fx.make_layout((16,(4,4),8),(4*128,(1,32),4))) for qi in q_head0123_wave]
 
     tiled_mma = fx.make_tiled_mma(mma_atom,fx.make_layout((1,1,1),(0,1,2)))
     thr_mma = tiled_mma.thr_slice(lane_id)
-    q_frag_head0123 = [thr_mma.make_fragment_A(q_head0123_wave[i][None,None,0]) for i in fx.range_constexpr(4)]
-    # global q -> q frag
+    q_frag = [[thr_mma.make_fragment_A(q_head0123_wave[h][None,None,0]) for s in fx.range_constexpr(MFMA_K_LOOPS)] for h in fx.range_constexpr(4)] # q_frag[head][k步]
+    # global q -> q frag。重排后每个线程 8 步共读连续 32 个 bf16，编译器会合并成 4 条 buffer_load_dwordx4
     copy_global_to_frag = fx.make_copy_atom(fx.rocdl.BufferCopy32b(),fx.BFloat16)
     copy_q = fx.make_tiled_copy_A(copy_global_to_frag,tiled_mma).get_slice(lane_id)
-    # q_head0123_wave中的每个元素形状都是[16,16,8],这样partition_S之后，每个线程持有tile的形状就是[[1,4],1,1,8]
     q_global_tile_head0123 = [copy_q.partition_S(q_head0123_wave[i]) for i in fx.range_constexpr(4)]
 
     logits = fx.flat_divide(logits,(64,64))[None,None,bidm,bidn]
@@ -179,20 +180,22 @@ def qsa_logits_fly_kernel(
 
     # k lds 切成四块，每次加载一块
     k_tile = fx.flat_divide(k_tile,(16,128))[None,None,None,0] # [64,128]->[16,128,4,1]->[16,128,4]
-    # [16,128,4]->[16,16,1,8,4]->[16,16,8,4]: 维度含义为[M_TILE_SIZE,K_TILE_SIZE,inner_k_loops,k_pages]
-    k_tile_view = fx.flat_divide(k_tile,(16,MFMA_K_STEP))[None,None,0,None,None]
-    k_tile_pages0123 = [k_tile_view[None,None,None,pageid] for pageid in fx.range_constexpr(4)] # [M_TILE_SIZE,K_TILE_SIZE,inner_k_loops]
+    # 每页 [16,128] 做和 Q 相同的 K 维重排（LDS 行跨度 HDIMS）: (16,(4,4),8) = [N_TILE_SIZE, K_TILE_SIZE, inner_k_loops]
+    k_tile_pages0123 = [fx.make_view(fx.get_iter(k_tile[None,None,pageid]),fx.make_layout((16,(4,4),8),(HDIMS,(1,32),4))) for pageid in fx.range_constexpr(4)]
     # 4个fragment对应4个page
     k_frag0123 = [thr_mma.make_fragment_B(k_tile_pages0123[i][None,None,0]) for i in fx.range_constexpr(4)]
 
     copy_k_lds_frag = fx.make_copy_atom(fx.UniversalCopy32b(),fx.BFloat16)
     copy_k = fx.make_tiled_copy_B(copy_k_lds_frag,tiled_mma).get_slice(lane_id)
-    k_lds_tile0123 = [copy_k.partition_S(k_tile_pages0123[i]) for i in fx.range_constexpr(4)] # [[1,4],1,1,8]
+    k_lds_tile0123 = [copy_k.partition_S(k_tile_pages0123[i]) for i in fx.range_constexpr(4)]
 
     # 运行时 for 循环里出现 x.method(...) 时，循环外定义的 x 会被当成循环变量传递，
     # 而 ThrMma / ThrCopy 不能作为循环变量，所以这些调用必须放在循环外
     acc = [[thr_mma.make_fragment_C(logits_tile0123[p]) for p in fx.range_constexpr(4)] for h in fx.range_constexpr(4)] # 16个累加器 acc[head][page]
-    q_frag_retiled = [copy_q.retile(q_frag_head0123[i]) for i in fx.range_constexpr(4)]
+    # Q 只和行有关，在请求循环外一次性读进寄存器
+    for h in fx.range_constexpr(4):
+        for s in fx.range_constexpr(MFMA_K_LOOPS):
+            fx.copy(copy_global_to_frag,src = q_global_tile_head0123[h][None,None,None,s],dst = copy_q.retile(q_frag[h][s]))
     k_frag_retiled = [copy_k.retile(k_frag0123[i]) for i in fx.range_constexpr(4)]
 
     # collective load k to lds
@@ -226,16 +229,6 @@ def qsa_logits_fly_kernel(
             for p in fx.range_constexpr(4):
                 acc[h][p].fill(0.0)
         for mfma_k_loop in fx.range_constexpr(MFMA_K_LOOPS):
-            # 搬运q的4个head到4个fragment
-            q_frag_head0123[0].fill(0.0)
-            q_frag_head0123[1].fill(0.0)
-            q_frag_head0123[2].fill(0.0)
-            q_frag_head0123[3].fill(0.0)
-            fx.copy(copy_global_to_frag,src = q_global_tile_head0123[0][None,None,None,mfma_k_loop],dst = q_frag_retiled[0])
-            fx.copy(copy_global_to_frag,src = q_global_tile_head0123[1][None,None,None,mfma_k_loop],dst = q_frag_retiled[1])
-            fx.copy(copy_global_to_frag,src = q_global_tile_head0123[2][None,None,None,mfma_k_loop],dst = q_frag_retiled[2])
-            fx.copy(copy_global_to_frag,src = q_global_tile_head0123[3][None,None,None,mfma_k_loop],dst = q_frag_retiled[3])
-
             # 搬运4个k的page到4个k的fragment
             k_frag0123[0].fill(0.0)
             k_frag0123[1].fill(0.0)
@@ -248,7 +241,7 @@ def qsa_logits_fly_kernel(
             # 4个head，每个head都要和每一个k_tile page做mfma，一共16个mfma
             for page in fx.range_constexpr(4):
                 for hd in fx.range_constexpr(4):
-                    fx.gemm(thr_mma, acc[hd][page], q_frag_head0123[hd], k_frag0123[page], acc[hd][page])
+                    fx.gemm(thr_mma, acc[hd][page], q_frag[hd][mfma_k_loop], k_frag0123[page], acc[hd][page])
 
         # 16个累加器，全部取relu之后按照head累加
         score = []
