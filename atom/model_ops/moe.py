@@ -771,8 +771,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         else:
             return None
 
-    # Note: init_prepare_finalize should only be called by
-    # prepare_communication_buffer_for_model.
+    # Called once after weight post-processing and before graph capture.
     def init_prepare_finalize(self, layer: torch.nn.Module):
         # print("init_prepare_finalize")
         assert self.moe is not None
@@ -818,6 +817,10 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             bind_mega = getattr(prepare_finalize, "bind_mega_transport", None)
             if bind_mega is not None:
                 bind_mega(layer, self)
+
+        comm_fused = getattr(layer, "_comm_fused_moe", None)
+        if comm_fused is not None:
+            comm_fused.initialize(layer)
 
     @property
     def using_modular_kernel(self) -> bool:
@@ -3707,8 +3710,6 @@ class FusedMoE(torch.nn.Module):
     def process_weights_after_loading(self):
         self._online_quant()
         self._validate_moe_backend()
-        if self._comm_fused_moe is not None:
-            self._comm_fused_moe.initialize(self)
 
     def _validate_moe_backend(self) -> None:
         if get_current_atom_config().moe_backend != "mega":
@@ -5136,7 +5137,8 @@ class FusedMoE(torch.nn.Module):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         shared_partial: torch.Tensor | None,
-        before_stage2: Callable[[], torch.Tensor] | None = None,
+        before_stage2: Callable[[int], torch.Tensor] | None = None,
+        before_shared_add: Callable[[], None] | None = None,
         stage2_stream: torch.cuda.Stream | None = None,
     ) -> tuple[torch.Tensor, bool]:
         """Return ``(output, complete)`` after fused or ordinary dispatch.
@@ -5144,13 +5146,11 @@ class FusedMoE(torch.nn.Module):
         A complete output already contains the shared expert and TP reduction.
         """
         backend = self._comm_fused_moe
-        custom_routing_supported = (
-            getattr(self, "custom_routing_function", None) is None
-            or getattr(backend, "supports_custom_routing", True)
-        )
         if (
             backend is not None
-            and custom_routing_supported
+            and (
+                self.custom_routing_function is None or backend.supports_custom_routing
+            )
             and backend.supports(hidden_states.shape[0])
         ):
             return (
@@ -5160,6 +5160,7 @@ class FusedMoE(torch.nn.Module):
                     router_logits,
                     shared_partial,
                     before_stage2=before_stage2,
+                    before_shared_add=before_shared_add,
                     stage2_stream=stage2_stream,
                 ),
                 True,
