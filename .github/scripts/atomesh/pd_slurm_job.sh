@@ -385,10 +385,32 @@ EOF
   )
 
   local docker_rc
+  # Spur returns worker stdout/stderr in a size-limited RPC response. Keep
+  # unbounded container output on shared NFS, not in the scheduler response.
+  #
+  # Measured on job 4745: the benchmark itself succeeded -- 4923 requests at a
+  # 0.08% error rate, every profile_export written -- and then teeing 57 MB of
+  # worker output back through Spur killed the step with
+  #   run_command on pit2-p03-g23 failed: 'Operation was attempted past the
+  #   valid range', "encoded message length too large: found 57098606 bytes"
+  #   srun: job 4745 failed with exit code 143
+  # so a completed run was reported as a failure. Streaming live rank logs into
+  # the GitHub job log is worth something -- it is how this run was watched --
+  # but not at the price of the run's exit status, and the rank logs reach
+  # atomesh-results either way.
+  echo "[logs] rank=${rank} phase=${execution_phase} full log: ${rank_dir}/${container_log}"
   set +e
-  docker "${docker_args[@]}" 2>&1 | tee "${rank_dir}/${container_log}"
-  docker_rc="${PIPESTATUS[0]}"
+  docker "${docker_args[@]}" > "${rank_dir}/${container_log}" 2>&1
+  docker_rc=$?
   set -e
+  echo "[logs] rank=${rank} phase=${execution_phase} exited rc=${docker_rc}"
+  if [[ "${docker_rc}" -ne 0 ]]; then
+    echo "[logs] last 16384 bytes of ${rank_dir}/${container_log}:" >&2
+    # Bound bytes rather than lines: benchmark progress and JSON can produce
+    # arbitrarily long lines. Diagnostics must not replace the Docker status.
+    tail -c 16384 -- "${rank_dir}/${container_log}" >&2 || true
+    printf '\n' >&2
+  fi
   return "${docker_rc}"
 }
 
