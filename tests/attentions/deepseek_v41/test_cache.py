@@ -2,6 +2,7 @@
 """Paging, sparse causality and exact state recovery across request lifetimes."""
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -92,6 +93,81 @@ def test_checkpoint_fork_rollback_relocation_and_slot_reuse(
             copies.execute([], [bad])
     with pytest.raises(IndexError):
         copies.entry(-1)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_lmcache_mp_aliases_the_checkpoint_image_in_state_copies_order(
+    small_config, packed
+):
+    """The native MP layout reads back exactly the image `StateCopies` stored.
+
+    `get_kv_transfer_tensors` publishes each plane of a PAGE unit as a region;
+    `build_native_state_mp_layout` cuts the image into per-ordinal aliases of
+    those regions. Both have to walk a unit's regions in the same order, or
+    LMCache stores a checkpoint whose bytes a restore scatters into the wrong
+    planes.
+    """
+    from atom.kv_transfer.offload.mp.native_state_layout import (
+        build_native_state_mp_layout,
+    )
+    from atom.model_ops.attentions.deepseek_v41.backend import (
+        DeepseekV41MetadataBuilder,
+    )
+
+    geo = replace(geometry(small_config), packed=packed, window_size=32)
+    spec = PagedStateCheckpointSpec(
+        geo.paged_bytes, geo.state_bytes, geo.layout_id, geo.state_bytes
+    )
+    assert spec.units_per_checkpoint > 1
+    pages = max(40, 2 * spec.units_per_checkpoint)
+    cache = PagedAttentionCache(geo, pages, 4, "cpu")
+    copies = StateCopies(cache, spec, 4)
+    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    builder.model_runner = SimpleNamespace(
+        config=SimpleNamespace(
+            kv_transfer_config={"kv_connector": "lmcache_mp"},
+            tensor_parallel_size=2,
+        ),
+        state_runtime=SimpleNamespace(checkpoint_spec=spec),
+    )
+    builder.cache, builder.copies = cache, copies
+
+    transfer = builder.get_kv_transfer_tensors()
+    transfer.set_block_count(pages)
+    assert transfer.paged_state_region_count == len(transfer.pages)
+    assert [page.region.unit_bytes for page in transfer.pages] == [
+        size for _, size in cache.unit_regions()
+    ]
+    assert transfer.tp_replication_factor == 2
+    assert transfer.native_state_tp_replication_factor == 2
+    layout = build_native_state_mp_layout(
+        transfer, block_size=geo.block_size, chunk_size=geo.block_size
+    )
+
+    cache.state_bytes[2].copy_(
+        torch.randint(0, 256, cache.state_bytes[2].shape, dtype=torch.uint8)
+    )
+    units = tuple(range(1, 2 * spec.units_per_checkpoint, 2))
+    transfer.execute_paged_state_copies(
+        [CheckpointStoreOp(2, units, spec.image_bytes, spec.layout_id)], []
+    )
+    ordinal = {
+        index: group.engine_group_id - 1
+        for group in layout.kernel_groups
+        for index in group.tensor_indices
+    }
+    image = torch.cat(
+        [
+            layout.tensors[index][units[ordinal[index]]].flatten()
+            for index in range(len(transfer.pages), len(layout.tensors))
+        ]
+    )
+    torch.testing.assert_close(
+        image, cache.state_bytes[2][: spec.image_bytes], rtol=0, atol=0
+    )
+
+    builder.model_runner.config.kv_transfer_config = None
+    assert builder.get_kv_transfer_tensors() is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
