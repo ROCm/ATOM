@@ -71,10 +71,12 @@ def qsa_logits_fly_kernel(
         k_tile:fx.Array[fx.BFloat16,BN*(HDIMS+8),16]
         row_valid_tag:fx.Array[fx.Int32,BM,16]
         row_vis: fx.Array[fx.Int32, BM, 16]
+        block_info: fx.Array[fx.Int32, 4, 16]  # req_low, req_high, vis_max
     lds = fx.SharedAllocator().allocate(LDS).peek()
     k_tile = lds.k_tile.view(fx.make_layout((BN,HDIMS),(HDIMS+8,1)))
     row_valid_tag = lds.row_valid_tag.view(fx.make_layout(BM,1))
     row_vis = lds.row_vis.view(fx.make_layout(BM, 1))
+    block_info = lds.block_info.view(fx.make_layout(4, 1))
     logits_ptr = get_buffer_ptr(logits, rows * num_columns)
     visible_out_ptr = get_buffer_ptr(visible_out, rows)
     row_starts_ptr = get_buffer_ptr(row_starts, rows)
@@ -101,6 +103,23 @@ def qsa_logits_fly_kernel(
         _3 = (_1 < _2).select(_1,_2)
         vis_out = (0 > _3).select(0,_3)
         row_vis[tid] = vis_out
+        # 这个分支正好是完整的 wave 0，64 个 lane 对应 64 行：用 wave 内归约求出
+        # req_low / req_high / vis_max，其他线程在 barrier 之后只读这 3 个数
+        lane_ok = row_valid & req_valid
+        red_low = lane_ok.select(req,fx.Int32(0x7FFFFFFF))
+        red_high = lane_ok.select(req,fx.Int32(-1))
+        red_vis = row_valid.select(vis_out,fx.Int32(0))
+        for sh in fx.range_constexpr(6):
+            peer_low = red_low.shuffle_xor(32 >> sh,64)
+            peer_high = red_high.shuffle_xor(32 >> sh,64)
+            peer_vis = red_vis.shuffle_xor(32 >> sh,64)
+            red_low = (peer_low < red_low).select(peer_low,red_low)
+            red_high = (peer_high > red_high).select(peer_high,red_high)
+            red_vis = (peer_vis > red_vis).select(peer_vis,red_vis)
+        # 64 个 lane 写的是同一个值，不需要只让 lane 0 写
+        block_info[0] = red_low
+        block_info[1] = red_high
+        block_info[2] = red_vis
         gstore(visible_out_ptr,
             byte_offset = (row_valid & (bidn == 0)).select(row_thread * sizeof(fx.Int32),0x7FFFFFFF),
             vec = fx.Vector.from_elements([vis_out], dtype=fx.Int32),
@@ -117,16 +136,9 @@ def qsa_logits_fly_kernel(
     fx.gpu.barrier()
     # 到这里visible out已经写完，row start 写完
     # 当前block负责的64条q的request范围，以及这64行里最大的可见列数
-    req_low = fx.Int32(0x7FFFFFFF)
-    req_high = fx.Int32(-1)
-    vis_max = fx.Int32(0)
-    for tag_id in fx.range_constexpr(BM):
-        req = row_valid_tag[tag_id]
-        tag_ok = (req >= 0) & (req < num_requests)
-        req_low = (tag_ok & (req < req_low)).select(req,req_low)
-        req_high = (tag_ok & (req > req_high)).select(req,req_high)
-        row_vis_i = row_vis[tag_id]
-        vis_max = ((req != -999) & (row_vis_i > vis_max)).select(row_vis_i,vis_max)
+    req_low = block_info[0]
+    req_high = block_info[1]
+    vis_max = block_info[2]
     no_valid = req_high < 0
     req_low = no_valid.select(0,req_low)
     req_high = no_valid.select(0,req_high)
@@ -134,11 +146,6 @@ def qsa_logits_fly_kernel(
     # 当前block负责的column范围
     col0 = bidn * 64
     page0 = col0 // PAGE_SIZE
-    # 提前退出：这64行都看不到 col0 及之后的列，top-k 只读每行 [0, visible)，
-    # 所以整块既不用算也不用写。让请求循环 range(req_low, req_high+1) 变成空循环
-    skip_block = col0 >= vis_max
-    req_high = skip_block.select(req_low - 1,req_high)
-
     # 一个block负责64条q，一个wave负责16个q，每条q 4个head
     q = fx.make_view(fx.get_iter(fx.rocdl.make_buffer_tensor(q,
                 max_size=False,
@@ -206,66 +213,72 @@ def qsa_logits_fly_kernel(
     # 而 ThrMma / ThrCopy 不能作为循环变量，所以这些调用必须放在循环外
     # 只用 1 个累加器（放在 list 里：循环里调用 acc[0].fill 不会被当成循环变量）
     acc = [thr_mma.make_fragment_C(logits_tile0123[0])]
-    # Q 只和行有关，在请求循环外一次性读进寄存器
-    for h in fx.range_constexpr(4):
-        for s in fx.range_constexpr(MFMA_K_LOOPS):
-            fx.copy(copy_global_to_frag,src = q_global_tile_head0123[h][None,None,None,s],dst = copy_q.retile(q_frag[h][s]))
+    q_frag_retiled = [[copy_q.retile(q_frag[h][s]) for s in fx.range_constexpr(MFMA_K_LOOPS)] for h in fx.range_constexpr(4)]
     k_frag_retiled = [copy_k.retile(k_frag[kk]) for kk in fx.range_constexpr(MFMA_K_LOOPS)]
 
-    # collective load k to lds
-    for reqid in range(req_low,req_high + 1):
-        reqid = fx.Int32(reqid)
-        page_ok = []
-        for page_offset in fx.range_constexpr(4):
-            logical_page = page0 + page_offset
-            logical_page_valid = (logical_page < width)
-            logical_page = logical_page_valid.select(logical_page,0)
-            physical_page = page_table[reqid,logical_page]
-            physical_page_valid = ((physical_page >= 0) & (physical_page < num_pages))
-            physical_page = physical_page_valid.select(physical_page,0)
-            page_ok.append(physical_page_valid & logical_page_valid)
-            fx.copy(g2r_atom,src = kc_thr[None,None,None,physical_page],dst = k_reg[page_offset])
-        for page_offset in fx.range_constexpr(4):
-            fx.copy(r2s_atom,src = k_reg[page_offset],dst = k_lds_thr[None,None,None,page_offset])
-        # 到这里，一共4个page的k已经搬运完毕
-        # MFMA，每个wave一条q frag，要与对应全部四个k tile的MFMA运算
-        fx.gpu.barrier()
-        NEG_INF = fx.Float32(float("-inf"))
-        DROP = fx.Int32(0x7FFFFFFF)
-        r_grp = lane_id // 16          # C fragment：行 = 4*r_grp + jr
-        c_in = lane_id % 16            #             列 = c_in
-        # 本 lane 负责写的 4 行：行号、可见列数、是否有效、这一轮是否由它写
-        own = []
-        for jr in fx.range_constexpr(4):
-            row_local = wave_id * 16 + r_grp * 4 + jr        # block 内第几行（0..63）
-            tag = row_valid_tag[row_local]
-            valid = (tag >= 0) & (tag < num_requests)
-            invalid = (tag != -999) & ((tag < 0) | (tag >= num_requests))
-            owned = (valid & (tag == reqid)) | (invalid & (reqid == req_low))
-            own.append((row0 + row_local, row_vis[row_local], valid, owned))
+    # 提前退出：这64行都看不到 col0 及之后的列，top-k 只读每行 [0, visible)，所以整块既不用算也不用写。
+    # Q 的加载也放在 if 里，被跳过的 block 不读 Q。if 块里同样不能对块外的对象调用方法，
+    # 循环变量也要用块外没出现过的名字（qh / qs）
+    if col0 < vis_max:
+        # Q 只和行有关，在请求循环外一次性读进寄存器
+        for qh in fx.range_constexpr(4):
+            for qs in fx.range_constexpr(MFMA_K_LOOPS):
+                fx.copy(copy_global_to_frag,src = q_global_tile_head0123[qh][None,None,None,qs],dst = q_frag_retiled[qh][qs])
 
-        # page 外层、head 中层、k 步内层：同一时刻只需要 1 个累加器，每个 page 算完就写回
-        for pg in fx.range_constexpr(4):
-            for kk in fx.range_constexpr(MFMA_K_LOOPS):
-                fx.copy(copy_k_lds_frag,src = k_lds_tile0123[pg][None,None,None,kk],dst = k_frag_retiled[kk])
-            score = None
-            for hd in fx.range_constexpr(4):
-                acc[0].fill(0.0)
-                for kk in fx.range_constexpr(MFMA_K_LOOPS):
-                    fx.gemm(thr_mma, acc[0], q_frag[hd][kk], k_frag[kk], acc[0])
-                v = acc[0].load()
-                v = v.maximumf(fx.Vector.zeros_like(v))   # 每个 head 先 ReLU
-                score = v if score is None else score + v  # 再按 head 累加
-            score = score * inv_divisor
-
-            col = col0 + pg * 16 + c_in
+        # collective load k to lds
+        for reqid in range(req_low,req_high + 1):
+            reqid = fx.Int32(reqid)
+            page_ok = []
+            for page_offset in fx.range_constexpr(4):
+                logical_page = page0 + page_offset
+                logical_page_valid = (logical_page < width)
+                logical_page = logical_page_valid.select(logical_page,0)
+                physical_page = page_table[reqid,logical_page]
+                physical_page_valid = ((physical_page >= 0) & (physical_page < num_pages))
+                physical_page = physical_page_valid.select(physical_page,0)
+                page_ok.append(physical_page_valid & logical_page_valid)
+                fx.copy(g2r_atom,src = kc_thr[None,None,None,physical_page],dst = k_reg[page_offset])
+            for page_offset in fx.range_constexpr(4):
+                fx.copy(r2s_atom,src = k_reg[page_offset],dst = k_lds_thr[None,None,None,page_offset])
+            # 到这里，一共4个page的k已经搬运完毕
+            # MFMA，每个wave一条q frag，要与对应全部四个k tile的MFMA运算
+            fx.gpu.barrier()
+            NEG_INF = fx.Float32(float("-inf"))
+            DROP = fx.Int32(0x7FFFFFFF)
+            r_grp = lane_id // 16          # C fragment：行 = 4*r_grp + jr
+            c_in = lane_id % 16            #             列 = c_in
+            # 本 lane 负责写的 4 行：行号、可见列数、是否有效、这一轮是否由它写
+            own = []
             for jr in fx.range_constexpr(4):
-                row, vis, valid, owned = own[jr]
-                keep = valid & (col < vis) & page_ok[pg]
-                val = keep.select(fx.Float32(score[jr]), NEG_INF)
-                off = (owned & (col < num_columns)).select((row * num_columns + col) * 4, DROP)
-                gstore(logits_ptr, off, fx.Vector.from_elements([val], dtype=fx.Float32), 1, fx.Float32)
-        fx.gpu.barrier()      # 所有 wave 用完这一轮的 K，下一轮才能覆盖 LDS
+                row_local = wave_id * 16 + r_grp * 4 + jr        # block 内第几行（0..63）
+                tag = row_valid_tag[row_local]
+                valid = (tag >= 0) & (tag < num_requests)
+                invalid = (tag != -999) & ((tag < 0) | (tag >= num_requests))
+                owned = (valid & (tag == reqid)) | (invalid & (reqid == req_low))
+                own.append((row0 + row_local, row_vis[row_local], valid, owned))
+
+            # page 外层、head 中层、k 步内层：同一时刻只需要 1 个累加器，每个 page 算完就写回
+            for pg in fx.range_constexpr(4):
+                for kk in fx.range_constexpr(MFMA_K_LOOPS):
+                    fx.copy(copy_k_lds_frag,src = k_lds_tile0123[pg][None,None,None,kk],dst = k_frag_retiled[kk])
+                score = None
+                for hd in fx.range_constexpr(4):
+                    acc[0].fill(0.0)
+                    for kk in fx.range_constexpr(MFMA_K_LOOPS):
+                        fx.gemm(thr_mma, acc[0], q_frag[hd][kk], k_frag[kk], acc[0])
+                    v = acc[0].load()
+                    v = v.maximumf(fx.Vector.zeros_like(v))   # 每个 head 先 ReLU
+                    score = v if score is None else score + v  # 再按 head 累加
+                score = score * inv_divisor
+
+                col = col0 + pg * 16 + c_in
+                for jr in fx.range_constexpr(4):
+                    row, vis, valid, owned = own[jr]
+                    keep = valid & (col < vis) & page_ok[pg]
+                    val = keep.select(fx.Float32(score[jr]), NEG_INF)
+                    off = (owned & (col < num_columns)).select((row * num_columns + col) * 4, DROP)
+                    gstore(logits_ptr, off, fx.Vector.from_elements([val], dtype=fx.Float32), 1, fx.Float32)
+            fx.gpu.barrier()      # 所有 wave 用完这一轮的 K，下一轮才能覆盖 LDS
 
 
 @flyc.jit
