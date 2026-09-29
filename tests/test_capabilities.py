@@ -11,6 +11,8 @@ So advertising it is worse than not knowing about it.
 """
 
 import pytest
+import torch
+from torch import nn
 
 from atom.model_engine.capabilities import (
     COLLECTIVE_RPC_PROTOCOL_VERSION,
@@ -18,6 +20,7 @@ from atom.model_engine.capabilities import (
     WorkerCapabilities,
 )
 from atom.rollout.capabilities import CapabilityProviderMixin
+from atom.rollout.weight_updater import WeightUpdaterMixin
 
 # ── harness ────────────────────────────────────────────────────────────────
 
@@ -34,17 +37,30 @@ class _Config:
     parallel_config = _Parallel()
 
 
+def _model(fp8):
+    layer = nn.Module()
+    dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
+    layer.weight = nn.Parameter(torch.zeros(2, 2, dtype=dtype), requires_grad=False)
+    if fp8:
+        layer.weight_scale = nn.Parameter(torch.ones(1), requires_grad=False)
+    model = nn.Module()
+    model.layer = layer
+    return model
+
+
 class _Runner(CapabilityProviderMixin):
     """A runner exposing a chosen subset of the advertised methods."""
+
+    # Inherited by every RLHFModelRunner, quantised or not.
+    _is_fp8_param = staticmethod(WeightUpdaterMixin._is_fp8_param)
 
     def __init__(self, rank=0, methods=(), fp8=False, vocab=0, rdma=False):
         self.rank = rank
         self.config = _Config()
+        self.model = _model(fp8)
         self._true_vocab_size = vocab
         for name in methods:
             setattr(self, name, lambda *a, **k: None)
-        if fp8:
-            self._is_fp8_param = lambda *a: True
         if rdma:
             self.receive_weights_rdma = lambda *a, **k: {}
 
@@ -106,6 +122,17 @@ def test_features_are_reported_separately_from_methods():
     assert "fp8_weight_update" in rich["features"]
     assert "vocab_masking" in rich["features"]
     assert "rdma_weight_receive" in rich["features"]
+
+
+def test_fp8_is_claimed_by_the_weights_not_by_the_helper():
+    """The helper's existence was the test, and every runner has it, so every
+    BF16 runner advertised FP8 weight updates it does not do."""
+    bf16 = _Runner()
+    assert callable(bf16._is_fp8_param)
+    assert "fp8_weight_update" not in bf16.get_worker_capabilities()["features"]
+
+    bf16.model = None  # nothing loaded: nothing claimed, and no raise
+    assert "fp8_weight_update" not in bf16.get_worker_capabilities()["features"]
 
 
 def test_rdma_is_absent_until_the_receiver_exists():

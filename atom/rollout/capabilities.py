@@ -55,7 +55,7 @@ class CapabilityProviderMixin:
         # an FP8 runner has the same methods as a BF16 one.
         if getattr(self, "_true_vocab_size", 0):
             features.add("vocab_masking")
-        if callable(getattr(self, "_is_fp8_param", None)):
+        if self._holds_fp8_weights():
             features.add("fp8_weight_update")
         if callable(getattr(self, "receive_weights_rdma", None)):
             features.add("rdma_weight_receive")
@@ -69,3 +69,19 @@ class CapabilityProviderMixin:
             "methods": methods,
             "features": sorted(features),
         }
+
+    def _holds_fp8_weights(self) -> bool:
+        """Whether any loaded parameter is one a weight update requantizes.
+
+        Asked of the weights, through the updater's own test, not of whether
+        that test exists: every RLHFModelRunner inherits it, quantised or not.
+        """
+        is_fp8 = getattr(self, "_is_fp8_param", None)
+        modules = getattr(getattr(self, "model", None), "modules", None)
+        if not callable(is_fp8) or not callable(modules):
+            return False
+        return any(
+            is_fp8(module, param)
+            for module in modules()
+            for param in module.parameters(recurse=False)
+        )
