@@ -308,6 +308,17 @@ def test_auto_rank_collapse_distinguishes_glm52_mla_from_minimax_m3_gqa():
     assert deployment._tp_replication_factor(minimax) == 1
 
 
+def test_auto_rank_collapse_keeps_kimi_k3_per_rank():
+    # MLA KV is replicated, but the KDA checkpoint images stored in the same
+    # PAGE units hold TP-sharded heads.
+    k3 = _config(model_type="kimi_k3", tp=8)
+    k3.hf_config.text_config = SimpleNamespace(
+        model_type="kimi_linear", kv_lora_rank=512
+    )
+
+    assert deployment._tp_replication_factor(k3) == 1
+
+
 def test_tp_rank_collapse_can_be_disabled_and_rejects_bad_values():
     assert (
         deployment._tp_replication_factor(

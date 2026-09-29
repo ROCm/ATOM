@@ -158,6 +158,11 @@ def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
     if offcfg._is_minimax_m3(hf_config):
         return False
     hf_config = getattr(hf_config, "text_config", hf_config)
+    # Kimi-K3's MLA KV is replicated, but its KDA checkpoint images -- stored
+    # in those same PAGE units -- hold TP-sharded heads, so every rank keeps
+    # its own copy.
+    if getattr(hf_config, "model_type", None) == "kimi_linear":
+        return False
     return getattr(hf_config, "kv_lora_rank", None) is not None
 
 
