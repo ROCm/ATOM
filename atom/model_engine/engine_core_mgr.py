@@ -1361,7 +1361,7 @@ class CoreManager:
         self._release_seq_load(req_id)
         try:
             self.broadcast_utility_command("abort_request", req_id=req_id)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - disconnect cleanup must not raise
             logger.warning(f"{self.label}: abort_request({req_id}) failed: {e}")
 
     def _route_utility_response(self, dp_rank: int, data):
