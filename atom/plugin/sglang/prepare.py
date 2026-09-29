@@ -54,8 +54,10 @@ def prepare_model(config: Any):
     ):
         from atom.plugin.sglang.minimax_m3_bridge import (
             install_minimax_m3_pool_patch,
+            install_minimax_mono_plugin_refusal,
         )
 
+        install_minimax_mono_plugin_refusal()
         install_minimax_m3_pool_patch()
 
     # Import here to avoid partial initialization while SGLang discovers models.
