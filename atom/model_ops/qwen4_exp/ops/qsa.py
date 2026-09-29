@@ -29,6 +29,8 @@ import triton.language as tl
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.ops.topk import top_k_per_row_prefill
 
+from atom.model_ops.qwen4_exp.ops import qsa_flydsl_layout
+
 
 def _prev_pow2(n: int) -> int:
     if n < 1:
@@ -948,6 +950,7 @@ def qsa_paged_mqa_logits(
     score_divisor: float | None = None,
     max_columns: int | None = None,
     row_starts: torch.Tensor | None = None,
+    allow_flydsl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Score compressed key groups.
 
@@ -957,6 +960,10 @@ def qsa_paged_mqa_logits(
 
     If supplied, `row_starts` is filled with zeros so top-k selection starts
     at column zero in each row, avoiding a separate initialization kernel.
+
+    `allow_flydsl` lets the FlyDSL MFMA scorer take prefill calls. It tiles
+    64 rows and makes one pass per request in the tile, so decode-shaped
+    batches (a few rows per request) must not set it.
 
     `max_columns` caps how many compressed groups are scored. Column `c`
     addresses group `c` through the page table, so dropping the tail simply
@@ -1009,6 +1016,24 @@ def qsa_paged_mqa_logits(
         and page_table.stride(1) == 1
         and q.shape[2] >= 16
     ):
+        # The FlyDSL kernel tiles 64 rows and makes one pass per request in
+        # the tile, so it only pays off for prefill; it is built for 16
+        # compressed rows per page (KV block size 64, as SGLang serving uses).
+        if allow_flydsl and compressed_k_cache.shape[1] == qsa_flydsl_layout.PAGE_SIZE:
+            qsa_flydsl_layout.qsa_paged_mqa_logits_flydsl(
+                q,
+                compressed_k_cache,
+                page_table,
+                token_to_request,
+                query_positions,
+                context_lens,
+                compress_ratio,
+                float(divisor),
+                logits,
+                visible_groups,
+                row_starts,
+            )
+            return logits, visible_groups
         bmt, bn = 16, 128
         _qsa_paged_mqa_logits_mfma_kernel[
             (triton.cdiv(q.shape[0], bmt), triton.cdiv(columns, bn))
@@ -1161,6 +1186,7 @@ def qsa_select_paged_tokens(
     out: torch.Tensor | None = None,
     logits_workspace_bytes: int = DEFAULT_LOGITS_WORKSPACE_BYTES,
     max_seq_len: int | None = None,
+    allow_flydsl: bool = False,
 ) -> torch.Tensor:
     """Score, select and expand in one call.
 
@@ -1219,6 +1245,7 @@ def qsa_select_paged_tokens(
             compress_ratio,
             max_columns=columns,
             row_starts=row_starts,
+            allow_flydsl=allow_flydsl,
         )
         selected_groups = torch.empty(
             (row_end - row_start, block_topk), dtype=torch.int32, device=q.device

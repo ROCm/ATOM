@@ -1,16 +1,29 @@
-"""QSA paged MQA logits, FlyDSL layout-algebra version.
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+"""FlyDSL MFMA kernel for the QSA indexer scorer (`qsa_paged_mqa_logits`), prefill.
 
-Run inside the FlyDSL container:
-    python test_qsa_logits_kernel_2.py            # all cases
-    python test_qsa_logits_kernel_2.py --case 0   # one case (handy when adding prints)
+Per index head the score is a GEMM, S_h = q[:, h, :] @ K^T, on bf16 MFMA
+16x16x16; ReLU is applied per head before the heads are summed.
+
+One block = 4 waves (256 threads) owns 64 query rows x 64 compressed groups
+(4 pages). Wave 0 derives the block's request range and largest visible count
+with a shuffle reduction; a block none of whose rows sees its first column
+exits before reading Q (top-k reads each row only over [0, visible), so those
+logits are never read). Otherwise each wave keeps its 16 rows of Q for all
+heads in VGPRs, and per request present in the block the 4 pages of K are
+staged in LDS (row stride 136 bf16) and consumed page by page with one
+accumulator. Q and K share a head-dim permutation (lane group g, k-step s ->
+dims 32g + 4s + [0..3]) so every lane reads 32 contiguous elements.
+
+Covers index_heads=4, head_dim=128, compressed page size 16, compress_ratio 4,
+bf16 Q/K; other inputs raise. int64 index tensors and a strided page table are
+converted to int32 / contiguous before the launch. The launch can be captured
+into a CUDA graph.
 """
-
-import argparse
-
-import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl.compiler.protocol import dsl_size_of as sizeof
 
 BLOCK_SIZE = 256
@@ -24,7 +37,7 @@ PAGE_SIZE = KV_CACHE_BLOCK_SIZE // COMPRESS_RATIO
 
 
 @flyc.kernel(known_block_size=(BLOCK_SIZE, 1, 1))
-def qsa_logits_fly_kernel(
+def _qsa_logits_layout_kernel(
     q: fx.Tensor,  # [rows, 4, 128] bf16, contiguous
     compressed_k_cache: fx.Tensor,  # [pages, 16, 1, 128] bf16, contiguous
     page_table: fx.Tensor,  # [reqs, width] int32
@@ -45,230 +58,333 @@ def qsa_logits_fly_kernel(
     bid = fx.block_idx.x
     wave_id = tid // 64
     lane_id = tid % 64
-    block_layout = fx.make_layout(((rows + BM - 1)//BM, (num_columns + BN - 1)//BN),
-                                ((num_columns + BN - 1)//BN, 1))
-    bidm,bidn = fx.idx2crd(bid,block_layout).unpack()
+    block_layout = fx.make_layout(
+        ((rows + BM - 1) // BM, (num_columns + BN - 1) // BN),
+        ((num_columns + BN - 1) // BN, 1),
+    )
+    bidm, bidn = fx.idx2crd(bid, block_layout).unpack()
 
-    def get_buffer_ptr(tensor,num_elem):
+    def get_buffer_ptr(tensor, num_elem):
         return fx.rocdl.make_buffer_ptr(
-            fx.recast_iter(fx.Int8,fx.get_iter(tensor)),
-            num_records_bytes=num_elem*sizeof(tensor.dtype)
+            fx.recast_iter(fx.Int8, fx.get_iter(tensor)),
+            num_records_bytes=num_elem * sizeof(tensor.dtype),
         )
 
-    def gstore(g_byte_ptr,byte_offset,vec,N,dtype):
+    def gstore(g_byte_ptr, byte_offset, vec, N, dtype):
         nbytes = N * sizeof(dtype)
-        dst = fx.make_view(g_byte_ptr + byte_offset,fx.make_layout(nbytes,1))
-        reg = fx.make_rmem_tensor(fx.make_layout(N,1),dtype)
-        copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy(nbytes*8),fx.Int8)
-        fx.memref_store_vec(vec,reg)
-        fx.copy_atom_call(copy_atom,reg,dst)
+        dst = fx.make_view(g_byte_ptr + byte_offset, fx.make_layout(nbytes, 1))
+        reg = fx.make_rmem_tensor(fx.make_layout(N, 1), dtype)
+        copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy(nbytes * 8), fx.Int8)
+        fx.memref_store_vec(vec, reg)
+        fx.copy_atom_call(copy_atom, reg, dst)
 
-    def _make_view(memref,shape,stride):
-        return fx.make_view(fx.get_iter(memref),fx.make_layout(shape,stride))
+    def _make_view(memref, shape, stride):
+        return fx.make_view(fx.get_iter(memref), fx.make_layout(shape, stride))
 
     @fx.struct
     class LDS:
-        k_tile:fx.Array[fx.BFloat16,BN*(HDIMS+8),16]
-        row_valid_tag:fx.Array[fx.Int32,BM,16]
+        k_tile: fx.Array[fx.BFloat16, BN * (HDIMS + 8), 16]
+        row_valid_tag: fx.Array[fx.Int32, BM, 16]
         row_vis: fx.Array[fx.Int32, BM, 16]
         block_info: fx.Array[fx.Int32, 4, 16]  # req_low, req_high, vis_max
+
     lds = fx.SharedAllocator().allocate(LDS).peek()
-    k_tile = lds.k_tile.view(fx.make_layout((BN,HDIMS),(HDIMS+8,1)))
-    row_valid_tag = lds.row_valid_tag.view(fx.make_layout(BM,1))
+    k_tile = lds.k_tile.view(fx.make_layout((BN, HDIMS), (HDIMS + 8, 1)))
+    row_valid_tag = lds.row_valid_tag.view(fx.make_layout(BM, 1))
     row_vis = lds.row_vis.view(fx.make_layout(BM, 1))
     block_info = lds.block_info.view(fx.make_layout(4, 1))
     logits_ptr = get_buffer_ptr(logits, rows * num_columns)
     visible_out_ptr = get_buffer_ptr(visible_out, rows)
     row_starts_ptr = get_buffer_ptr(row_starts, rows)
 
-    # 先算  visible out
-    token_to_request = _make_view(token_to_request,rows,1)
-    query_positions = _make_view(query_positions,rows,1)
+    # 1. per-row metadata: visible count, request table, block reductions
+    token_to_request = _make_view(token_to_request, rows, 1)
+    query_positions = _make_view(query_positions, rows, 1)
     context_lens = _make_view(context_lens, num_requests, 1)
     row0 = BM * bidm
     row_thread = row0 + tid
     if tid < BM:
-        row_valid = row_thread < rows # 越界的在最后不要写回
-        row_thread = row_valid.select(row_thread,rows - 1)
+        row_valid = (
+            row_thread < rows
+        )  # rows past `rows` are clamped for loads and never written back
+        row_thread = row_valid.select(row_thread, rows - 1)
         req = token_to_request[row_thread]
         req_valid = (req >= 0) & (req < num_requests)
-        ctx_len = req_valid.select(context_lens[req_valid.select(req,0)],0)
+        ctx_len = req_valid.select(context_lens[req_valid.select(req, 0)], 0)
         pos = query_positions[row_thread]
-        # 如果token存在，这个表存储token对应的req
-        # 如果token不存在，这个表存储的是-999
-        # 如果token存在但是req无效，则数值不满足 (req >= 0) & (req < num_requests)这个条件
-        row_valid_tag[tid] = row_valid.select(req,-999)
+        # row_valid_tag holds the row's request id if the row exists,
+        # -999 if the row is past `rows`,
+        # and an id outside [0, num_requests) if the row exists but its request is invalid
+        row_valid_tag[tid] = row_valid.select(req, -999)
         _1 = (pos + 1) // COMPRESS_RATIO
         _2 = ctx_len // COMPRESS_RATIO
-        _3 = (_1 < _2).select(_1,_2)
-        vis_out = (0 > _3).select(0,_3)
+        _3 = (_1 < _2).select(_1, _2)
+        vis_out = (0 > _3).select(0, _3)
         row_vis[tid] = vis_out
-        # 这个分支正好是完整的 wave 0，64 个 lane 对应 64 行：用 wave 内归约求出
-        # req_low / req_high / vis_max，其他线程在 barrier 之后只读这 3 个数
+        # This branch is exactly wave 0, one lane per row: a wave reduction yields
+        # req_low / req_high / vis_max; the other waves read just these 3 after the barrier
         lane_ok = row_valid & req_valid
-        red_low = lane_ok.select(req,fx.Int32(0x7FFFFFFF))
-        red_high = lane_ok.select(req,fx.Int32(-1))
-        red_vis = row_valid.select(vis_out,fx.Int32(0))
+        red_low = lane_ok.select(req, fx.Int32(0x7FFFFFFF))
+        red_high = lane_ok.select(req, fx.Int32(-1))
+        red_vis = row_valid.select(vis_out, fx.Int32(0))
         for sh in fx.range_constexpr(6):
-            peer_low = red_low.shuffle_xor(32 >> sh,64)
-            peer_high = red_high.shuffle_xor(32 >> sh,64)
-            peer_vis = red_vis.shuffle_xor(32 >> sh,64)
-            red_low = (peer_low < red_low).select(peer_low,red_low)
-            red_high = (peer_high > red_high).select(peer_high,red_high)
-            red_vis = (peer_vis > red_vis).select(peer_vis,red_vis)
-        # 64 个 lane 写的是同一个值，不需要只让 lane 0 写
+            peer_low = red_low.shuffle_xor(32 >> sh, 64)
+            peer_high = red_high.shuffle_xor(32 >> sh, 64)
+            peer_vis = red_vis.shuffle_xor(32 >> sh, 64)
+            red_low = (peer_low < red_low).select(peer_low, red_low)
+            red_high = (peer_high > red_high).select(peer_high, red_high)
+            red_vis = (peer_vis > red_vis).select(peer_vis, red_vis)
+        # all 64 lanes store the same value, so no lane-0 guard is needed
         block_info[0] = red_low
         block_info[1] = red_high
         block_info[2] = red_vis
-        gstore(visible_out_ptr,
-            byte_offset = (row_valid & (bidn == 0)).select(row_thread * sizeof(fx.Int32),0x7FFFFFFF),
-            vec = fx.Vector.from_elements([vis_out], dtype=fx.Int32),
-            N = 1,
-            dtype=fx.Int32
+        gstore(
+            visible_out_ptr,
+            byte_offset=(row_valid & (bidn == 0)).select(
+                row_thread * sizeof(fx.Int32), 0x7FFFFFFF
+            ),
+            vec=fx.Vector.from_elements([vis_out], dtype=fx.Int32),
+            N=1,
+            dtype=fx.Int32,
         )
-        gstore(row_starts_ptr,
-            byte_offset = (row_valid & (bidn == 0)).select(row_thread * sizeof(fx.Int32),0x7FFFFFFF),
-            vec = fx.Vector.from_elements([0], dtype=fx.Int32),
-            N = 1,
-            dtype=fx.Int32
+        gstore(
+            row_starts_ptr,
+            byte_offset=(row_valid & (bidn == 0)).select(
+                row_thread * sizeof(fx.Int32), 0x7FFFFFFF
+            ),
+            vec=fx.Vector.from_elements([0], dtype=fx.Int32),
+            N=1,
+            dtype=fx.Int32,
         )
 
     fx.gpu.barrier()
-    # 到这里visible out已经写完，row start 写完
-    # 当前block负责的64条q的request范围，以及这64行里最大的可见列数
+    # visible_out and row_starts are written
+    # request range of the block's 64 rows, and the largest visible count among them
     req_low = block_info[0]
     req_high = block_info[1]
     vis_max = block_info[2]
     no_valid = req_high < 0
-    req_low = no_valid.select(0,req_low)
-    req_high = no_valid.select(0,req_high)
+    req_low = no_valid.select(0, req_low)
+    req_high = no_valid.select(0, req_high)
 
-    # 当前block负责的column范围
+    # first column of this block
     col0 = bidn * 64
     page0 = col0 // PAGE_SIZE
-    # 一个block负责64条q，一个wave负责16个q，每条q 4个head
-    q = fx.make_view(fx.get_iter(fx.rocdl.make_buffer_tensor(q,
+    # a block owns 64 rows, a wave 16 rows, each row has 4 heads
+    q = fx.make_view(
+        fx.get_iter(
+            fx.rocdl.make_buffer_tensor(
+                q,
                 max_size=False,
-                num_records_bytes=fx.Int64(rows) * fx.Int64(4*128) * fx.Int64(2))),fx.make_layout((rows,4,128),(4*128,128,1)))
-    logits = fx.make_view(fx.get_iter(fx.rocdl.make_buffer_tensor(logits,
+                num_records_bytes=fx.Int64(rows) * fx.Int64(4 * 128) * fx.Int64(2),
+            )
+        ),
+        fx.make_layout((rows, 4, 128), (4 * 128, 128, 1)),
+    )
+    logits = fx.make_view(
+        fx.get_iter(
+            fx.rocdl.make_buffer_tensor(
+                logits,
                 max_size=False,
-                num_records_bytes=fx.Int64(rows) * fx.Int64(num_columns) * fx.Int64(4))),fx.make_layout((rows,num_columns),(num_columns,1)))
-    page_table = fx.make_view(fx.get_iter(fx.rocdl.make_buffer_tensor(page_table,
-                max_size = False,
-                num_records_bytes=fx.Int64(num_requests*width*4))),fx.make_layout((num_requests,width),(width,1)))
-    kc = fx.make_view(fx.get_iter(fx.rocdl.make_buffer_tensor(compressed_k_cache,
-                max_size = False,
-                num_records_bytes=fx.Int64(num_pages*16*1*128*2))),fx.make_layout((num_pages,16,1,128),(16*128*1,128*1,128,1)))
+                num_records_bytes=fx.Int64(rows) * fx.Int64(num_columns) * fx.Int64(4),
+            )
+        ),
+        fx.make_layout((rows, num_columns), (num_columns, 1)),
+    )
+    page_table = fx.make_view(
+        fx.get_iter(
+            fx.rocdl.make_buffer_tensor(
+                page_table,
+                max_size=False,
+                num_records_bytes=fx.Int64(num_requests * width * 4),
+            )
+        ),
+        fx.make_layout((num_requests, width), (width, 1)),
+    )
+    kc = fx.make_view(
+        fx.get_iter(
+            fx.rocdl.make_buffer_tensor(
+                compressed_k_cache,
+                max_size=False,
+                num_records_bytes=fx.Int64(num_pages * 16 * 1 * 128 * 2),
+            )
+        ),
+        fx.make_layout((num_pages, 16, 1, 128), (16 * 128 * 1, 128 * 1, 128, 1)),
+    )
 
-    mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16,16,16,fx.BFloat16))
-    MFMA_K_STEP = 16 # 这里指的是做MFMA的那个K维度的步长
+    mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
+    MFMA_K_STEP = 16  # head-dim width of one MFMA step
     MFMA_K_LOOPS = 128 // MFMA_K_STEP
-    q_head0123 = [q[None,head,None] for head in fx.range_constexpr(4)]
-    # tiler 要写全两维：(64,128) -> (64,128,ceil(rows/64),1)
-    q_head0123_block = [fx.flat_divide(qi,(64,128))[None,None,bidm,0] for qi in q_head0123] # [64,128]
-    q_head0123_wave = [fx.flat_divide(qi,(16,128))[None,None,wave_id,0] for qi in q_head0123_block] # 4 个 [16,128]
-    # K 维重排：第 s 步里 lane 组 g 负责 dims 32g+4s..32g+4s+3，于是每个 lane 8 步合起来读连续的 32 个元素
-    # (16,(4,4),8):(512,(1,32),4) —— 行 / (步内4个元素, lane组g) / 步 s
-    q_head0123_wave = [fx.make_view(fx.get_iter(qi),fx.make_layout((16,(4,4),8),(4*128,(1,32),4))) for qi in q_head0123_wave]
+    q_head0123 = [q[None, head, None] for head in fx.range_constexpr(4)]
+    # the tiler must cover both modes: (64,128) -> (64,128,ceil(rows/64),1)
+    q_head0123_block = [
+        fx.flat_divide(qi, (64, 128))[None, None, bidm, 0] for qi in q_head0123
+    ]  # [64,128]
+    q_head0123_wave = [
+        fx.flat_divide(qi, (16, 128))[None, None, wave_id, 0] for qi in q_head0123_block
+    ]  # 4 x [16,128]
+    # K permutation: at step s lane group g owns dims 32g+4s..32g+4s+3, so over 8 steps each lane reads 32 contiguous elements
+    # (16,(4,4),8):(512,(1,32),4) -- row / (4 elements of a step, lane group g) / step s
+    q_head0123_wave = [
+        fx.make_view(
+            fx.get_iter(qi), fx.make_layout((16, (4, 4), 8), (4 * 128, (1, 32), 4))
+        )
+        for qi in q_head0123_wave
+    ]
 
-    tiled_mma = fx.make_tiled_mma(mma_atom,fx.make_layout((1,1,1),(0,1,2)))
+    tiled_mma = fx.make_tiled_mma(mma_atom, fx.make_layout((1, 1, 1), (0, 1, 2)))
     thr_mma = tiled_mma.thr_slice(lane_id)
-    q_frag = [[thr_mma.make_fragment_A(q_head0123_wave[h][None,None,0]) for s in fx.range_constexpr(MFMA_K_LOOPS)] for h in fx.range_constexpr(4)] # q_frag[head][k步]
-    # global q -> q frag。重排后每个线程 8 步共读连续 32 个 bf16，编译器会合并成 4 条 buffer_load_dwordx4
-    copy_global_to_frag = fx.make_copy_atom(fx.rocdl.BufferCopy32b(),fx.BFloat16)
-    copy_q = fx.make_tiled_copy_A(copy_global_to_frag,tiled_mma).get_slice(lane_id)
-    q_global_tile_head0123 = [copy_q.partition_S(q_head0123_wave[i]) for i in fx.range_constexpr(4)]
+    q_frag = [
+        [
+            thr_mma.make_fragment_A(q_head0123_wave[h][None, None, 0])
+            for s in fx.range_constexpr(MFMA_K_LOOPS)
+        ]
+        for h in fx.range_constexpr(4)
+    ]  # q_frag[head][k step]
+    # global q -> q frag. After the permutation each thread reads 32 contiguous bf16 over 8 steps, merged into 4 buffer_load_dwordx4
+    copy_global_to_frag = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.BFloat16)
+    copy_q = fx.make_tiled_copy_A(copy_global_to_frag, tiled_mma).get_slice(lane_id)
+    q_global_tile_head0123 = [
+        copy_q.partition_S(q_head0123_wave[i]) for i in fx.range_constexpr(4)
+    ]
 
-    logits = fx.flat_divide(logits,(64,64))[None,None,bidm,bidn]
-    logits = fx.flat_divide(logits,(16,64))[None,None,wave_id,0] # [64,64]->[16,64,4,1]，选中这个wave负责的那一片logits
-    # 再切成4块，每个wave都要计算4块
-    logits = fx.flat_divide(logits,(16,16))[None,None,0,None] #[16,64]->[16,16,1,4]->[16,16,4]
-    logits_tile0123 = [logits[None,None,i] for i in fx.range_constexpr(4)] # 每一块都是[16,16]
+    logits = fx.flat_divide(logits, (64, 64))[None, None, bidm, bidn]
+    logits = fx.flat_divide(logits, (16, 64))[
+        None, None, wave_id, 0
+    ]  # [64,64]->[16,64,4,1], the slice of logits this wave owns
+    # split into 4 tiles; every wave computes all 4
+    logits = fx.flat_divide(logits, (16, 16))[
+        None, None, 0, None
+    ]  # [16,64]->[16,16,1,4]->[16,16,4]
+    logits_tile0123 = [
+        logits[None, None, i] for i in fx.range_constexpr(4)
+    ]  # each tile is [16,16]
 
-    # k lds 切成四块，每次加载一块
-    k_tile = fx.flat_divide(k_tile,(16,128))[None,None,None,0] # [64,128]->[16,128,4,1]->[16,128,4]
-    # 每页 [16,128] 做和 Q 相同的 K 维重排（LDS 行跨度 HDIMS+8，padding 减少 bank conflict）: (16,(4,4),8) = [N_TILE_SIZE, K_TILE_SIZE, inner_k_loops]
-    k_tile_pages0123 = [fx.make_view(fx.get_iter(k_tile[None,None,pageid]),fx.make_layout((16,(4,4),8),(HDIMS+8,(1,32),4))) for pageid in fx.range_constexpr(4)]
-    # 一次只处理一个 page：8 个 fragment 对应这个 page 的 8 个 k 步
-    k_frag = [thr_mma.make_fragment_B(k_tile_pages0123[0][None,None,0]) for kk in fx.range_constexpr(MFMA_K_LOOPS)]
+    # the LDS K tile split into 4 pages, one per compressed page
+    k_tile = fx.flat_divide(k_tile, (16, 128))[
+        None, None, None, 0
+    ]  # [64,128]->[16,128,4,1]->[16,128,4]
+    # each [16,128] page gets the same K permutation as Q (LDS row stride HDIMS+8 against bank conflicts): (16,(4,4),8) = [N_TILE_SIZE, K_TILE_SIZE, inner_k_loops]
+    k_tile_pages0123 = [
+        fx.make_view(
+            fx.get_iter(k_tile[None, None, pageid]),
+            fx.make_layout((16, (4, 4), 8), (HDIMS + 8, (1, 32), 4)),
+        )
+        for pageid in fx.range_constexpr(4)
+    ]
+    # one page at a time: 8 fragments for that page's 8 k steps
+    k_frag = [
+        thr_mma.make_fragment_B(k_tile_pages0123[0][None, None, 0])
+        for kk in fx.range_constexpr(MFMA_K_LOOPS)
+    ]
 
-    copy_k_lds_frag = fx.make_copy_atom(fx.UniversalCopy32b(),fx.BFloat16)
-    copy_k = fx.make_tiled_copy_B(copy_k_lds_frag,tiled_mma).get_slice(lane_id)
-    k_lds_tile0123 = [copy_k.partition_S(k_tile_pages0123[i]) for i in fx.range_constexpr(4)]
+    copy_k_lds_frag = fx.make_copy_atom(fx.UniversalCopy32b(), fx.BFloat16)
+    copy_k = fx.make_tiled_copy_B(copy_k_lds_frag, tiled_mma).get_slice(lane_id)
+    k_lds_tile0123 = [
+        copy_k.partition_S(k_tile_pages0123[i]) for i in fx.range_constexpr(4)
+    ]
 
-    # K 全局显存 -> 寄存器 -> LDS：线程 t 负责页内第 t//16 个 slot 的第 t%16 段（8 个 bf16 = 16 字节）
-    # partition 必须在运行时循环外做，循环里只用下标选第 physical_page 页 / 第 page_offset 页
-    g2r_atom = fx.make_copy_atom(fx.rocdl.BufferCopy(128),fx.BFloat16)
-    r2s_atom = fx.make_copy_atom(fx.UniversalCopy128b(),fx.BFloat16)
-    k_thr_layout = fx.make_layout((16,16),(16,1))
-    k_val_layout = fx.make_layout((1,8),(8,1))
-    g2r = fx.make_tiled_copy_tv(g2r_atom,k_thr_layout,k_val_layout).get_slice(tid)
-    r2s = fx.make_tiled_copy_tv(r2s_atom,k_thr_layout,k_val_layout).get_slice(tid)
-    kc_pages = fx.make_view(fx.get_iter(kc),fx.make_layout((16,128,num_pages),(128,1,16*128))) # [slot,dim,page]
-    kc_thr = g2r.partition_S(kc_pages)     # 本线程在每一页里负责的 8 个 bf16
-    k_lds_thr = r2s.partition_D(k_tile)    # k_tile: [16,128,4]
-    k_reg = [fx.make_fragment_like(k_lds_thr[None,None,None,0]) for _ in fx.range_constexpr(4)]
+    # K global -> registers -> LDS: thread t copies chunk t%16 (8 bf16 = 16 bytes) of slot t//16 of each page
+    # partition outside the runtime loop; inside it only index page physical_page / page_offset
+    g2r_atom = fx.make_copy_atom(fx.rocdl.BufferCopy(128), fx.BFloat16)
+    r2s_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
+    k_thr_layout = fx.make_layout((16, 16), (16, 1))
+    k_val_layout = fx.make_layout((1, 8), (8, 1))
+    g2r = fx.make_tiled_copy_tv(g2r_atom, k_thr_layout, k_val_layout).get_slice(tid)
+    r2s = fx.make_tiled_copy_tv(r2s_atom, k_thr_layout, k_val_layout).get_slice(tid)
+    kc_pages = fx.make_view(
+        fx.get_iter(kc), fx.make_layout((16, 128, num_pages), (128, 1, 16 * 128))
+    )  # [slot,dim,page]
+    kc_thr = g2r.partition_S(kc_pages)  # the 8 bf16 this thread copies from every page
+    k_lds_thr = r2s.partition_D(k_tile)  # k_tile: [16,128,4]
+    k_reg = [
+        fx.make_fragment_like(k_lds_thr[None, None, None, 0])
+        for _ in fx.range_constexpr(4)
+    ]
 
-    # 运行时 for 循环里出现 x.method(...) 时，循环外定义的 x 会被当成循环变量传递，
-    # 而 ThrMma / ThrCopy 不能作为循环变量，所以这些调用必须放在循环外
-    # 只用 1 个累加器（放在 list 里：循环里调用 acc[0].fill 不会被当成循环变量）
+    # In a runtime for loop, x.method(...) on an x defined outside makes x loop-carried,
+    # and ThrMma / ThrCopy cannot be loop-carried, so these calls stay outside the loop
+    # a single accumulator (in a list: acc[0].fill in the loop is not treated as loop-carried)
     acc = [thr_mma.make_fragment_C(logits_tile0123[0])]
-    q_frag_retiled = [[copy_q.retile(q_frag[h][s]) for s in fx.range_constexpr(MFMA_K_LOOPS)] for h in fx.range_constexpr(4)]
-    k_frag_retiled = [copy_k.retile(k_frag[kk]) for kk in fx.range_constexpr(MFMA_K_LOOPS)]
+    q_frag_retiled = [
+        [copy_q.retile(q_frag[h][s]) for s in fx.range_constexpr(MFMA_K_LOOPS)]
+        for h in fx.range_constexpr(4)
+    ]
+    k_frag_retiled = [
+        copy_k.retile(k_frag[kk]) for kk in fx.range_constexpr(MFMA_K_LOOPS)
+    ]
 
-    # 提前退出：这64行都看不到 col0 及之后的列，top-k 只读每行 [0, visible)，所以整块既不用算也不用写。
-    # Q 的加载也放在 if 里，被跳过的 block 不读 Q。if 块里同样不能对块外的对象调用方法，
-    # 循环变量也要用块外没出现过的名字（qh / qs）
+    # Early exit: no row of the block sees col0 or beyond, and top-k reads each row only over [0, visible), so the block computes and writes nothing.
+    # Q is loaded inside the if too, so skipped blocks never read it. Inside the if, methods on outside objects are equally off limits,
+    # and loop variables need names not used outside it (qh / qs)
     if col0 < vis_max:
-        # Q 只和行有关，在请求循环外一次性读进寄存器
+        # Q depends only on the rows: load it into registers once, outside the request loop
         for qh in fx.range_constexpr(4):
             for qs in fx.range_constexpr(MFMA_K_LOOPS):
-                fx.copy(copy_global_to_frag,src = q_global_tile_head0123[qh][None,None,None,qs],dst = q_frag_retiled[qh][qs])
+                fx.copy(
+                    copy_global_to_frag,
+                    src=q_global_tile_head0123[qh][None, None, None, qs],
+                    dst=q_frag_retiled[qh][qs],
+                )
 
         # collective load k to lds
-        for reqid in range(req_low,req_high + 1):
+        for reqid in range(req_low, req_high + 1):
             reqid = fx.Int32(reqid)
             page_ok = []
             for page_offset in fx.range_constexpr(4):
                 logical_page = page0 + page_offset
-                logical_page_valid = (logical_page < width)
-                logical_page = logical_page_valid.select(logical_page,0)
-                physical_page = page_table[reqid,logical_page]
-                physical_page_valid = ((physical_page >= 0) & (physical_page < num_pages))
-                physical_page = physical_page_valid.select(physical_page,0)
+                logical_page_valid = logical_page < width
+                logical_page = logical_page_valid.select(logical_page, 0)
+                physical_page = page_table[reqid, logical_page]
+                physical_page_valid = (physical_page >= 0) & (physical_page < num_pages)
+                physical_page = physical_page_valid.select(physical_page, 0)
                 page_ok.append(physical_page_valid & logical_page_valid)
-                fx.copy(g2r_atom,src = kc_thr[None,None,None,physical_page],dst = k_reg[page_offset])
+                fx.copy(
+                    g2r_atom,
+                    src=kc_thr[None, None, None, physical_page],
+                    dst=k_reg[page_offset],
+                )
             for page_offset in fx.range_constexpr(4):
-                fx.copy(r2s_atom,src = k_reg[page_offset],dst = k_lds_thr[None,None,None,page_offset])
-            # 到这里，一共4个page的k已经搬运完毕
-            # MFMA，每个wave一条q frag，要与对应全部四个k tile的MFMA运算
+                fx.copy(
+                    r2s_atom,
+                    src=k_reg[page_offset],
+                    dst=k_lds_thr[None, None, None, page_offset],
+                )
+            # all 4 pages of K are in LDS
+            # MFMA: each wave's Q fragments against all 4 K pages
             fx.gpu.barrier()
             NEG_INF = fx.Float32(float("-inf"))
             DROP = fx.Int32(0x7FFFFFFF)
-            r_grp = lane_id // 16          # C fragment：行 = 4*r_grp + jr
-            c_in = lane_id % 16            #             列 = c_in
-            # 本 lane 负责写的 4 行：行号、可见列数、是否有效、这一轮是否由它写
+            r_grp = lane_id // 16  # C fragment: row = 4*r_grp + jr
+            c_in = lane_id % 16  #             column = c_in
+            # the 4 rows this lane writes: row, visible count, valid, and whether this pass writes it
             own = []
             for jr in fx.range_constexpr(4):
-                row_local = wave_id * 16 + r_grp * 4 + jr        # block 内第几行（0..63）
+                row_local = (
+                    wave_id * 16 + r_grp * 4 + jr
+                )  # row within the block (0..63)
                 tag = row_valid_tag[row_local]
                 valid = (tag >= 0) & (tag < num_requests)
                 invalid = (tag != -999) & ((tag < 0) | (tag >= num_requests))
                 owned = (valid & (tag == reqid)) | (invalid & (reqid == req_low))
                 own.append((row0 + row_local, row_vis[row_local], valid, owned))
 
-            # page 外层、head 中层、k 步内层：同一时刻只需要 1 个累加器，每个 page 算完就写回
+            # page outer, head middle, k step inner: one accumulator at a time, each page written back when done
             for pg in fx.range_constexpr(4):
                 for kk in fx.range_constexpr(MFMA_K_LOOPS):
-                    fx.copy(copy_k_lds_frag,src = k_lds_tile0123[pg][None,None,None,kk],dst = k_frag_retiled[kk])
+                    fx.copy(
+                        copy_k_lds_frag,
+                        src=k_lds_tile0123[pg][None, None, None, kk],
+                        dst=k_frag_retiled[kk],
+                    )
                 score = None
                 for hd in fx.range_constexpr(4):
                     acc[0].fill(0.0)
                     for kk in fx.range_constexpr(MFMA_K_LOOPS):
                         fx.gemm(thr_mma, acc[0], q_frag[hd][kk], k_frag[kk], acc[0])
                     v = acc[0].load()
-                    v = v.maximumf(fx.Vector.zeros_like(v))   # 每个 head 先 ReLU
-                    score = v if score is None else score + v  # 再按 head 累加
+                    v = v.maximumf(fx.Vector.zeros_like(v))  # ReLU per head
+                    score = v if score is None else score + v  # then sum over heads
                 score = score * inv_divisor
 
                 col = col0 + pg * 16 + c_in
@@ -276,13 +392,21 @@ def qsa_logits_fly_kernel(
                     row, vis, valid, owned = own[jr]
                     keep = valid & (col < vis) & page_ok[pg]
                     val = keep.select(fx.Float32(score[jr]), NEG_INF)
-                    off = (owned & (col < num_columns)).select((row * num_columns + col) * 4, DROP)
-                    gstore(logits_ptr, off, fx.Vector.from_elements([val], dtype=fx.Float32), 1, fx.Float32)
-            fx.gpu.barrier()      # 所有 wave 用完这一轮的 K，下一轮才能覆盖 LDS
+                    off = (owned & (col < num_columns)).select(
+                        (row * num_columns + col) * 4, DROP
+                    )
+                    gstore(
+                        logits_ptr,
+                        off,
+                        fx.Vector.from_elements([val], dtype=fx.Float32),
+                        1,
+                        fx.Float32,
+                    )
+            fx.gpu.barrier()  # every wave is done with this pass's K before the next pass overwrites LDS
 
 
 @flyc.jit
-def qsa_logits_fly(
+def _qsa_logits_layout_launch(
     q: fx.Tensor,
     compressed_k_cache: fx.Tensor,
     page_table: fx.Tensor,
@@ -301,133 +425,107 @@ def qsa_logits_fly(
     inv_divisor: fx.Constexpr[float],
     stream: fx.Stream,
 ):
-    qsa_logits_fly_kernel(
-        q, compressed_k_cache, page_table, token_to_request, query_positions, context_lens,
-        logits, visible_out, row_starts, rows, num_columns, num_pages, num_requests, width, inv_divisor,
+    _qsa_logits_layout_kernel(
+        q,
+        compressed_k_cache,
+        page_table,
+        token_to_request,
+        query_positions,
+        context_lens,
+        logits,
+        visible_out,
+        row_starts,
+        rows,
+        num_columns,
+        num_pages,
+        num_requests,
+        width,
+        inv_divisor,
     ).launch(grid=(grid, 1, 1), block=(BLOCK_SIZE, 1, 1), stream=stream)
 
 
-# ---------------------------------------------------------------- host side
+# Buffer offsets are i32 bytes.
+_MAX_BYTES = 2**31 - 1
 
 
-def run_kernel(case):
-    q, kc, pt = case["q"], case["kc"], case["page_table"]
-    rows, cols = q.shape[0], case["num_columns"]
-    # NaN / -7 make entries the kernel did not write easy to spot (skipped column blocks stay NaN)
-    logits = torch.full((rows, cols), float("nan"), dtype=torch.float32, device=q.device)
-    visible = torch.full((rows,), -7, dtype=torch.int32, device=q.device)
-    row_starts = torch.full((rows,), -7, dtype=torch.int32, device=q.device)
-    grid = (-(-rows // BM)) * (-(-cols // BN))
-    qsa_logits_fly(
-        q, kc, pt, case["token_to_request"], case["query_positions"], case["context_lens"],
-        logits, visible, row_starts,
-        rows, cols, kc.shape[0], pt.shape[0], pt.shape[1], grid, case["inv_divisor"],
-        torch.cuda.current_stream(),
+def _cdiv(a: int, b: int) -> int:
+    return -(-a // b)
+
+
+def _check_supported(
+    q: torch.Tensor,
+    compressed_k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    compress_ratio: int,
+    columns: int,
+) -> None:
+    """The kernel hard-codes these; anything else would be silently mis-scored."""
+    if compress_ratio != COMPRESS_RATIO:
+        raise ValueError(
+            f"compress_ratio must be {COMPRESS_RATIO}, got {compress_ratio}"
+        )
+    if q.dtype != torch.bfloat16 or compressed_k_cache.dtype != torch.bfloat16:
+        raise ValueError("q and compressed_k_cache must be bf16")
+    if tuple(q.shape[1:]) != (Q_HEADS, HDIMS) or not q.is_contiguous():
+        raise ValueError(f"q must be a contiguous [tokens, {Q_HEADS}, {HDIMS}] tensor")
+    if (
+        tuple(compressed_k_cache.shape[1:]) != (PAGE_SIZE, K_HEADS, HDIMS)
+        or not compressed_k_cache.is_contiguous()
+    ):
+        raise ValueError(
+            "compressed_k_cache must be a contiguous "
+            f"[pages, {PAGE_SIZE}, {K_HEADS}, {HDIMS}] tensor"
+        )
+    if page_table.shape[0] == 0:
+        raise ValueError("page_table must have at least one request")
+    if q.shape[0] * columns * 4 > _MAX_BYTES:
+        raise ValueError("logits exceed the kernel's 2 GiB buffer addressing")
+    if compressed_k_cache.numel() * 2 > _MAX_BYTES:
+        raise ValueError(
+            "compressed_k_cache exceeds the kernel's 2 GiB buffer addressing"
+        )
+
+
+def qsa_paged_mqa_logits_flydsl(
+    q: torch.Tensor,
+    compressed_k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_request: torch.Tensor,
+    query_positions: torch.Tensor,
+    context_lens: torch.Tensor,
+    compress_ratio: int,
+    divisor: float,
+    logits: torch.Tensor,
+    visible_groups: torch.Tensor,
+    row_starts: torch.Tensor | None,
+) -> None:
+    """Fill `logits` [rows, columns] fp32 over each row's [0, visible) and
+    `visible_groups` [rows] int32 in place."""
+    rows, columns = logits.shape
+    _check_supported(q, compressed_k_cache, page_table, compress_ratio, columns)
+    if row_starts is None:
+        row_starts = torch.empty(rows, dtype=torch.int32, device=q.device)
+    # The kernel reads int32 indices and uses `width` as the page-table row stride.
+    page_table = page_table.to(torch.int32).contiguous()
+    token_to_request = token_to_request.to(torch.int32)
+    query_positions = query_positions.to(torch.int32)
+    context_lens = context_lens.to(torch.int32)
+    _qsa_logits_layout_launch(
+        q,
+        compressed_k_cache,
+        page_table,
+        token_to_request,
+        query_positions,
+        context_lens,
+        logits,
+        visible_groups,
+        row_starts,
+        rows,
+        columns,
+        compressed_k_cache.shape[0],
+        page_table.shape[0],
+        page_table.shape[1],
+        _cdiv(rows, BM) * _cdiv(columns, BN),
+        1.0 / divisor,
+        stream=torch.cuda.current_stream(),
     )
-    torch.cuda.synchronize()
-    return logits, visible, row_starts
-
-
-def reference(case):
-    q, kc, pt = case["q"].float(), case["kc"].float(), case["page_table"].long()
-    t2r, pos, ctx = case["token_to_request"].long(), case["query_positions"].long(), case["context_lens"].long()
-    num_requests, width = pt.shape
-    num_pages = kc.shape[0]
-    cols = case["num_columns"]
-
-    req_ok = (t2r >= 0) & (t2r < num_requests)
-    req = t2r.clamp(0, num_requests - 1)
-    ctx_len = torch.where(req_ok, ctx[req], 0)
-    visible = torch.minimum((pos + 1) // COMPRESS_RATIO, ctx_len // COMPRESS_RATIO).clamp_min(0)
-
-    col = torch.arange(cols, device=q.device)
-    logical_page, page_offset = col // PAGE_SIZE, col % PAGE_SIZE
-    phys = pt[req][:, logical_page.clamp(max=width - 1)]  # [rows, cols]
-    page_ok = (logical_page < width)[None, :] & (phys >= 0) & (phys < num_pages)
-    k = kc[phys.clamp(0, num_pages - 1), page_offset[None, :], 0, :]  # [rows, cols, 128]
-    score = torch.einsum("rhd,rcd->rhc", q, k).relu().sum(1) * case["inv_divisor"]  # ReLU per head, then sum
-    valid = req_ok[:, None] & (col[None, :] < visible[:, None]) & page_ok
-    return torch.where(valid, score, float("-inf")), visible.int()
-
-
-def make_case(rows, num_columns, num_requests=1, *, interleaved=False, positions="ramp",
-              bad_request_rows=0, hole_fraction=0.0, context_len=None, seed=0, label=""):
-    g = torch.Generator().manual_seed(seed)
-    width = -(-num_columns // PAGE_SIZE)
-    pages = width * num_requests
-    ctx = num_columns * COMPRESS_RATIO if context_len is None else context_len
-    page_table = torch.randperm(pages, generator=g)[: width * num_requests].reshape(num_requests, width)
-    if hole_fraction:
-        page_table[torch.rand(page_table.shape, generator=g) < hole_fraction] = -1
-    if interleaved:
-        t2r = torch.arange(rows) % num_requests
-    else:
-        t2r = (torch.arange(rows) // -(-rows // num_requests)).clamp(max=num_requests - 1)
-    t2r[:bad_request_rows] = -1
-    if positions == "ramp":
-        pos = torch.linspace(0, ctx - 1, rows).to(torch.int32)
-    elif positions == "saturated":
-        pos = torch.full((rows,), ctx - 1)
-    else:
-        pos = torch.zeros(rows)
-    return dict(
-        label=label,
-        q=torch.randn(rows, Q_HEADS, HDIMS, generator=g).to(torch.bfloat16).cuda(),
-        kc=torch.randn(pages, PAGE_SIZE, 1, HDIMS, generator=g).to(torch.bfloat16).cuda(),
-        page_table=page_table.to(torch.int32).cuda(),
-        token_to_request=t2r.to(torch.int32).cuda(),
-        query_positions=pos.to(torch.int32).cuda(),
-        context_lens=torch.full((num_requests,), ctx, dtype=torch.int32).cuda(),
-        num_columns=num_columns,
-        inv_divisor=1.0 / HDIMS**0.5,
-    )
-
-
-CASES = [
-    lambda: make_case(8, 64, positions="saturated", label="tiny, all visible"),
-    lambda: make_case(100, 200, num_requests=3, label="rows/cols not multiples of 64, 3 requests"),
-    lambda: make_case(16, 128, num_requests=4, interleaved=True, label="4 interleaved requests"),
-    lambda: make_case(16, 128, bad_request_rows=3, hole_fraction=0.25, label="invalid requests + unmapped pages"),
-    lambda: make_case(16, 128, context_len=200, positions="saturated", label="context_len caps visibility"),
-    lambda: make_case(8, 64, positions="zero", label="nothing visible"),
-    lambda: make_case(256, 4096, num_requests=2, label="medium, 2 requests"),
-    lambda: make_case(2048, 512, label="causal prefill from position 0"),
-]
-
-
-def check(case):
-    """Top-k reads each row only over [0, visible), so that is all the kernel must get right.
-
-    Column blocks no row of the block can see are skipped and stay NaN (the fill value).
-    """
-    logits, visible, row_starts = run_kernel(case)
-    ref_logits, ref_visible = reference(case)
-    rows, cols = logits.shape
-    horizon = torch.arange(cols, device=logits.device)[None, :] < ref_visible[:, None]
-    problems = []
-    if not torch.equal(visible, ref_visible):
-        problems.append(f"visible differs in {int((visible != ref_visible).sum())} rows")
-    if not bool((row_starts == 0).all()):
-        problems.append("row_starts not zero")
-    if torch.isnan(logits[horizon]).any():
-        problems.append(f"{int(torch.isnan(logits[horizon]).sum())} logits inside the horizon never written")
-    got_inf, ref_inf = torch.isneginf(logits) & horizon, torch.isneginf(ref_logits) & horizon
-    if not torch.equal(got_inf, ref_inf):
-        problems.append(f"-inf mask differs in {int((got_inf != ref_inf).sum())} entries")
-    finite = horizon & ~ref_inf & ~torch.isnan(logits)
-    max_abs = float((logits[finite] - ref_logits[finite]).abs().max()) if finite.any() else 0.0
-    if finite.any() and not torch.allclose(logits[finite], ref_logits[finite], atol=2e-3, rtol=2e-3):
-        problems.append(f"values differ, max_abs={max_abs:.3e}")
-    skipped = float(torch.isnan(logits).float().mean())
-    status = "PASS" if not problems else "FAIL: " + "; ".join(problems)
-    print(f"[{case['label']}] rows={rows} cols={cols} max_abs={max_abs:.2e} skipped={skipped:.0%}  {status}")
-    return not problems
-
-
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--case", type=int, default=None, help=f"run only this case (0..{len(CASES) - 1})")
-    args = ap.parse_args()
-    picked = CASES if args.case is None else [CASES[args.case]]
-    ok = sum(check(make()) for make in picked)
-    print(f"\n{ok}/{len(picked)} cases passed")
