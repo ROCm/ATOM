@@ -267,7 +267,8 @@ RESTORE
 - DSv4 declares PAGE and native STATE fully TP-replicated. In `auto` mode, one
   rank stores and every rank retrieves (`num_kv_readers=TP`). GLM-5.2 follows
   the same replicated sparse-MLA rule. MiniMax-M3 remains sharded and stores on
-  every rank.
+  every rank. Kimi-K3 also stores on every rank: its MLA PAGE is replicated,
+  but the KDA state packed into the same PAGE-unit image is sharded by head.
 - External native restore supports zero-HBM and incremental local-prefix cases;
   native lookup truncates the query to
   `floor((prompt_tokens - 1) / chunk_size) * chunk_size`, and PAGE and STATE
