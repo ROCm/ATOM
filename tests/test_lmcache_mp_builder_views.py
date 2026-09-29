@@ -289,3 +289,62 @@ def test_mla_builder_publishes_latent_and_index_views(
     # Transfer writes must update the allocation used by attention kernels.
     transfer.block_tensor_views[0][1].fill_(7)
     assert torch.all(pool.layer("kv", 0)[1].view(torch.uint8) == 7)
+
+
+def test_mla_builder_publishes_fp4_index_scale_plane_to_lmcache_mp(mla_builder_cls):
+    # The FP4 sparse indexer keeps packed E2M1 and its e8m0 exponents as two
+    # planes. `lmcache_mp` groups regions by per-block shape and copies whole
+    # blocks, so the scale plane is published as one more region per layer and
+    # both planes round-trip. 64 rows is the block size FP4 requires.
+    runner = SimpleNamespace(
+        config=SimpleNamespace(
+            tensor_parallel_size=8,
+            kv_transfer_config={"kv_connector": "lmcache_mp"},
+        ),
+    )
+    pool = MlaKvPool(
+        layers=2,
+        block_size=64,
+        entry_dim=7,
+        kv_dtype=torch.float16,
+        index_layers=2,
+        index_rows_per_block=64,
+        index_head_dim=128,
+        index_fp4=True,
+    )
+    pool.allocate(2, "cpu")
+    builder = mla_builder_cls.__new__(mla_builder_cls)
+    builder.model_runner = runner
+    builder.kv_pool = pool
+    builder._indexer_fp4 = True
+
+    transfer = builder.get_kv_transfer_tensors()
+    transfer.set_block_count(2)
+
+    # One 128-dim index block: 1 K-tile of 4 x 64 x 16 packed bytes, plus
+    # 4 x 64 e8m0 exponent bytes.
+    kv_bytes = 64 * 7 * 2
+    assert [tuple(view.shape) for view in transfer.block_tensor_views] == [
+        (2, 1, kv_bytes),
+        (2, 1, kv_bytes),
+        (2, 1, 4096),
+        (2, 1, 4096),
+        (2, 1, 256),
+        (2, 1, 256),
+    ]
+    assert [region.semantic_role for region in transfer.block_regions] == [
+        "mla.kv",
+        "mla.kv",
+        "dsa.index_cache",
+        "dsa.index_cache",
+        "mla.index_scale.layer_0",
+        "mla.index_scale.layer_1",
+    ]
+    assert transfer.tp_replication_factor == 8
+    _assert_region_view_geometry(transfer)
+    cache_views = _build_cache_views(transfer, num_blocks=2)
+    assert cache_views.bytes_per_block == 2 * kv_bytes + 2 * 4096 + 2 * 256
+    # A restore into the scale region lands in the plane the indexer reads.
+    transfer.block_tensor_views[5][1].fill_(3)
+    assert torch.all(pool.layer("index_scale", 1)[1] == 3)
+    assert torch.all(pool.layer("index_scale", 1)[0] == 0)

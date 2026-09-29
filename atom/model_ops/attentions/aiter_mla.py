@@ -247,6 +247,39 @@ class MLAChunkContextMetadata:
     seq_tot: list[int] | None = None
 
 
+def _only_lmcache_mp_reads_block_regions(config) -> bool:
+    """Whether every transport that reads the PAGE region map is `lmcache_mp`.
+
+    The FP4 sparse indexer can only be published to such a topology: the MP
+    connector groups regions by their per-block shape and copies whole blocks,
+    so the e8m0 scale plane is just one more region per layer. The P/D backends
+    and the non-dense `lmcache_offload` layouts parse a single index region per
+    layer and would drop it. `multi` is judged sub by sub, the way
+    `KVConnectorFactory.topology_reads_block_regions` walks it.
+    """
+    import copy
+
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    kv_cfg = getattr(config, "kv_transfer_config", None) or {}
+    if not kv_cfg:
+        return False
+    name = KVConnectorFactory.canonical_name(kv_cfg.get("kv_connector", "moriio"))
+    if name != "multi":
+        return name == "lmcache_mp"
+    readers = []
+    for sub in kv_cfg.get("connectors") or ():
+        if not isinstance(sub, dict):
+            return False
+        sub_config = copy.copy(config)
+        sub_config.kv_transfer_config = sub
+        if KVConnectorFactory.topology_reads_block_regions(sub_config):
+            readers.append(
+                KVConnectorFactory.canonical_name(sub.get("kv_connector", "moriio"))
+            )
+    return bool(readers) and all(reader == "lmcache_mp" for reader in readers)
+
+
 def cdiv(a, b):
     return (a + b - 1) // b
 
@@ -1407,10 +1440,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         runner = self.model_runner
         if self.kv_pool is None:
             return None
-        if self._indexer_fp4:
-            # A connector is handed one `INDEX_CACHE_ROLE` region per layer --
-            # the whole vocabulary it and its DCP shard plan have for the
+        if self._indexer_fp4 and not _only_lmcache_mp_reads_block_regions(
+            runner.config
+        ):
+            # A P/D connector is handed one `INDEX_CACHE_ROLE` region per layer
+            # -- the whole vocabulary it and its DCP shard plan have for the
             # indexer -- and the FP4 cache is two planes neither parses.
+            # `lmcache_mp` is the exception, admitted above: it copies whole
+            # blocks of every published region, so the FP4 data and its e8m0
+            # scale plane travel as two regions per layer (see below).
             #
             # That is a statement about the REGION MAP, so it only binds the
             # transports that read one. Dense offload does not: it never looks
@@ -1430,12 +1468,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             if KVConnectorFactory.topology_reads_block_regions(runner.config):
                 raise NotImplementedError(
                     "KV transfer that addresses the cache through the PAGE "
-                    "region map is unsupported with the FP4 sparse indexer: "
-                    "the map cannot describe its separate e8m0 scale plane. "
-                    "That is every P/D backend, lmcache_mp, and the hybrid/m3/"
-                    "kimi_k3 offload layouts. Pass --index_cache_dtype fp8 to "
-                    "use one; dense CPU/NVMe offload (lmcache_offload) carries "
-                    "both planes and needs no change."
+                    "region map is unsupported with the FP4 sparse indexer "
+                    "unless lmcache_mp is the only transport reading the map: "
+                    "the P/D backends and the hybrid/m3/kimi_k3 offload layouts "
+                    "parse one index region per layer and cannot place its "
+                    "separate e8m0 scale plane. Pass --index_cache_dtype fp8 to "
+                    "use one; lmcache_mp and dense CPU/NVMe offload "
+                    "(lmcache_offload) carry both planes and need no change."
                 )
             return None
         # What the pool was built with, not what the hook would recompute: a
@@ -1555,6 +1594,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 num_global_kv_layers + global_compact_index_slot_by_layer[layer_id]
                 for layer_id in local_index_layer_ids
             ]
+            if self._indexer_fp4:
+                # `region_tensors` publishes the FP4 scale planes after the
+                # index data planes, one per index layer; number them after
+                # every consumer's index regions so the list still names one
+                # consumer region per published PAGE region.
+                block_region_consumer_indices += [
+                    num_global_kv_layers
+                    + len(global_index_layer_ids)
+                    + global_compact_index_slot_by_layer[layer_id]
+                    for layer_id in local_index_layer_ids
+                ]
 
         index_staging_region = None
         index_staging_pool_size = 0
