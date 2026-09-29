@@ -802,6 +802,10 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
         -e PREFILL_TP_SIZE="'"${PREFILL_TP}"'" \
         -e DECODE_TP_SIZE="'"${DECODE_TP}"'" \
         -e RUN_DIR="/run_logs/slurm_job-'"${SLURM_JOB_ID}"'" \
+        -e USER="'"${CURRENT_USER}"'" \
+        -e LOGNAME="'"${CURRENT_USER}"'" \
+        -e HOME="/tmp/atomesh-home-'"${SLURM_JOB_ID}"'-${rank}" \
+        -e XDG_CACHE_HOME="/tmp/atomesh-cache-'"${SLURM_JOB_ID}"'-${rank}" \
         -v "'"${REPO_ROOT}"'":/workspace/ATOM:ro \
         -v "'"${RUN_DIR}"'":/run_logs/slurm_job-'"${SLURM_JOB_ID}"' \
         -v /mnt:/mnt \
@@ -810,9 +814,18 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
         "${nested_docker_args[@]}" \
         "'"${DOCKER_IMAGE}"'" \
         bash -lc "cd /workspace/ATOM && bash .github/scripts/atomesh/pd_server_atom.sh" \
-        2>&1 | tee "${rank_dir}/${container_log}"
-      docker_rc="${PIPESTATUS[0]}"
+        > "${rank_dir}/${container_log}" 2>&1
+      docker_rc=$?
       set -e
+      echo "[logs] rank=${rank} phase=${execution_phase} exited rc=${docker_rc}," \
+        "full log: ${rank_dir}/${container_log}"
+      if [[ "${docker_rc}" -ne 0 ]]; then
+        echo "[logs] last 16384 bytes of ${rank_dir}/${container_log}:" >&2
+        # Bound bytes rather than lines: benchmark progress and JSON can produce
+        # arbitrarily long lines. Diagnostics must not replace the exit status.
+        tail -c 16384 -- "${rank_dir}/${container_log}" >&2 || true
+        printf "\n" >&2
+      fi
       if command -v timeout >/dev/null 2>&1; then
         timeout 20 docker kill "${container}" >/dev/null 2>&1 || true
         timeout 20 docker rm -f "${container}" >/dev/null 2>&1 || true
