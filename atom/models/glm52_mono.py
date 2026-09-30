@@ -559,6 +559,8 @@ class Glm52MonoDecode:
             if owned is None:
                 hidden, residual = layer(positions, hidden, residual)
                 continue
+            if residual is not None and layer.input_layernorm.fused_allreduce:
+                hidden = get_tp_group().all_reduce(hidden, ca_fp8_quant=False)
             state = hidden if residual is None else hidden + residual
             self._refresh_indexer(layer, state, positions)
             attn = layer.self_attn

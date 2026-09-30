@@ -75,6 +75,7 @@ from atom.model_ops.monokernel.config import (
 )
 from atom.model_ops.monokernel.glm.layout import (
     BLOCKS,
+    DCP_SUMMARY_PAIRS,
     INDEX_DIM,
     INDEX_HEADS,
     INDEX_KEYS_PER_TASK,
@@ -94,6 +95,9 @@ from atom.model_ops.monokernel.glm.layout import (
     WAVES,
     XQ_BLOCKS,
     XQ_WAVES,
+    dcp_local_uv_tile,
+    dcp_summary_index,
+    dcp_uv_owner,
     fp8_kv_upper_pair_lane,
     fp8_pe_upper_pair_lane,
     dn_tile,
@@ -166,6 +170,8 @@ def build_glm5_monokernel(
     kv_cache_layout: KvCacheLayout | str = KvCacheLayout.SPLIT,
     kv_cache_dtype: str = "bf16",
     inter: int = INTER,
+    output_heads: int | None = None,
+    dcp_size: int = 1,
     scale: float = SOFTMAX_SCALE,
     uv_scale_rows: int = 128,
     timeline: bool = False,
@@ -188,17 +194,23 @@ def build_glm5_monokernel(
     assert not cache_fp8 or use_atom_kv_cache
     assert not atom_experts or expert_mxfp4
     attention_k_chunks_per_unit = 1 if attention_bf16 else 2
-    SPLIT_KEYS = sparse_keys_per_task(S)
+    SPLIT_KEYS = sparse_keys_per_task(S, heads)
     assert topk % SPLIT_KEYS == 0 and 1 <= S <= 12
     assert 1 <= launches_per_step <= LAYER_SLOTS
     assert not with_indexer or (topk == 2048 and index_max_seq % INDEX_KEYS_PER_TASK == 0)
     assert not (attention_bf16 and with_indexer), "BF16 attention uses the external indexer"
     H = heads
+    L = H if output_heads is None else output_heads
     W = npes
+    D = dcp_size
     I = inter
+    assert D == 1 or (D == W and H == L * D)
     I_PER_SLOT = I // UG_TILE
     G = BLOCKS
-    SC, SY = layout(S, H, W, topk, with_indexer, index_max_seq, inter=I)
+    SC, SY = layout(
+        S, H, W, topk, with_indexer, index_max_seq,
+        inter=I, output_heads=L, dcp_size=D,
+    )
     N_SPLIT = topk // SPLIT_KEYS
     QB_ROWS = H * (NOPE_DIM + PE_DIM)
     N_QB = QB_ROWS // Q_B_TILE
@@ -207,7 +219,7 @@ def build_glm5_monokernel(
     N_UK = H * KV_LORA // UK_TILE
     UK_PER_HEAD = KV_LORA // UK_TILE
     N_UV = H * V_DIM // UV_TILE
-    O_K = H * V_DIM
+    O_K = L * V_DIM
     N_UG = S * MOE_SLOTS * I_PER_SLOT
     QK_DIM = KV_LORA + PE_DIM
     # split LDS: bf16 q of all heads, then the KV latent / k_pe tiles (bf16 pairs); row
@@ -235,7 +247,7 @@ def build_glm5_monokernel(
     SPLIT_X_WORDS = PT_OFF + SPLIT_KEYS * PS
     X_WORDS = max(SAMPLE_TILE * HIDDEN // 2, S * HIDDEN // 4, SPLIT_X_WORDS, index_max_seq, down_x_words(S, I, expert_mxfp4))
     MISC_OFF = X_WORDS
-    MISC_WORDS = max(8 + S * XQ_BLOCKS, S * MOE_SLOTS * (I // 128), N_SPLIT)
+    MISC_WORDS = max(8 + S * XQ_BLOCKS, S * MOE_SLOTS * (I // 128), N_SPLIT + 2)
     KEYS_OFF = MISC_OFF + MISC_WORDS
     DNW_OFF = KEYS_OFF + LDS_KEYS
     RED_OFF = DNW_OFF + S * MOE_SLOTS
@@ -365,7 +377,8 @@ def build_glm5_monokernel(
                 position = fx.Int32(
                     bo.buffer_load(_rsrc(positions), s * 2, vec_width=1, dtype=T.i32)
                 )
-                return row_active(s).select(position, fx.Int32(0))
+                present = row_active(s) | (row_slot(s) >= 0)
+                return present.select(position, fx.Int32(0))
             return pos0 + s
 
         def row_slot(s):
@@ -374,6 +387,9 @@ def build_glm5_monokernel(
                     bo.buffer_load(_rsrc(slot_mapping), s * 2, vec_width=1, dtype=T.i32)
                 )
             return pos0 + s
+
+        def row_writes_cache(s):
+            return row_slot(s) >= 0
 
         def lds_ld(ptr, i):
             return fx.ptr_load(ptr + i)
@@ -934,6 +950,67 @@ def build_glm5_monokernel(
                     t1 = t1 + parts[src][1]
                 out_fn(s, row, r0 + t0, r1 + t1)
 
+        def dcp_merge_latent(s, t):
+            if const_expr(D == 1):
+                return True
+            region_base = fx.Int64(SY["dcp"]) + fx.Int64(peer_slot) * fx.Int64(SY["_dcp_part_stride"])
+            summary_base = dcp_summary_index(rank, s, t, 0, S, N_UV)
+            if wave < D:
+                for batch in range_constexpr((DCP_SUMMARY_PAIRS + 63) // 64):
+                    item = lane + batch * 64
+                    if item < DCP_SUMMARY_PAIRS:
+                        value = fx.Float32(0.0)
+                        if item < KV_LORA // 2:
+                            value = lds_ld(xs, item)
+                        elif item == KV_LORA // 2:
+                            value = lds_ld(misc, N_SPLIT)
+                        else:
+                            value = lds_ld(misc, N_SPLIT + 1)
+                        put(peer_dst + region_base, summary_base + item, value, CM_SYS)
+            gpu.barrier()
+            owner = dcp_uv_owner(t, L, rank)
+            if owner:
+                own = sym + region_base
+                if wave == 0:
+                    src = fx.min(lane, D - 1)
+                    src_base = dcp_summary_index(src, s, t, 0, S, N_UV)
+                    values = poll(
+                        [
+                            (own, src_base + KV_LORA // 2, 1),
+                            (own, src_base + KV_LORA // 2 + 1, 1),
+                        ],
+                        "one-as",
+                    )
+                    valid = lane < D
+                    m = valid.select(values[0][0].bitcast(fx.Float32), fx.Float32(NEG))
+                    l = valid.select(values[1][0].bitcast(fx.Float32), fx.Float32(0.0))
+                    m_all = wave_max(m)
+                    z = l * _exp(m - m_all)
+                    den = wave_sum(z)
+                    if valid:
+                        lds_st(misc, lane, z * (den > 0.0).select(_rcp(den), fx.Float32(0.0)))
+                gpu.barrier()
+                if tid < KV_LORA // 2:
+                    parts = poll(
+                        [
+                            (
+                                own,
+                                dcp_summary_index(src, s, t, tid, S, N_UV),
+                                1,
+                            )
+                            for src in range(D)
+                        ],
+                        "one-as",
+                    )
+                    o0, o1 = fx.Float32(0.0), fx.Float32(0.0)
+                    for src in range_constexpr(D):
+                        a0, a1 = bf2_f32(parts[src][0])
+                        weight = lds_ld(misc, src)
+                        o0, o1 = o0 + a0 * weight, o1 + a1 * weight
+                    lds_st(xs, tid, bf16_pair(o0, o1))
+                gpu.barrier()
+            return owner
+
         def start(name):
             return (bid + (G - base[name])) & (G - 1)
 
@@ -1100,8 +1177,8 @@ def build_glm5_monokernel(
             # gamma and the RoPE factors are issued ahead of the wait
             g = ld_bf16(_rsrc(g_kv), tid)
             tpe = tid % (PE_DIM // 2)
-            cs = [ld_f32(_rsrc(rope_cos), row_position(s) * (PE_DIM // 2) + tpe) for s in range(S)]
-            sns = [ld_f32(_rsrc(rope_sin), row_position(s) * (PE_DIM // 2) + tpe) for s in range(S)]
+            cs = [ld_bf16(_rsrc(rope_cos), row_position(s) * (PE_DIM // 2) + tpe) for s in range(S)]
+            sns = [ld_bf16(_rsrc(rope_sin), row_position(s) * (PE_DIM // 2) + tpe) for s in range(S)]
             hint_wait(
                 (KV_LORA + PE_DIM) // QKV_A_TILE,
                 lambda k: (mb("kv_a"), (S - 1) * (KV_LORA + PE_DIM) + k * QKV_A_TILE + QKV_A_TILE - 1),
@@ -1117,7 +1194,7 @@ def build_glm5_monokernel(
             for s in range_constexpr(S):
                 pos = row_position(s)
                 slot = row_slot(s)
-                active = row_active(s)
+                active = row_writes_cache(s)
                 value = vs[s] * _rsq(ssq[s] * (1.0 / KV_LORA) + EPS) * g
                 if const_expr(cache_fp8):
                     value = bf16_round(value)
@@ -1258,8 +1335,8 @@ def build_glm5_monokernel(
                     i = hoff - NOPE_DIM + pr * 2
                     x0 = lds_ld(outs, s * Q_B_TILE + pr * 2)
                     x1 = lds_ld(outs, s * Q_B_TILE + pr * 2 + 1)
-                    c = ld_f32(_rsrc(rope_cos), row_position(s) * (PE_DIM // 2) + i // 2)
-                    sn = ld_f32(_rsrc(rope_sin), row_position(s) * (PE_DIM // 2) + i // 2)
+                    c = ld_bf16(_rsrc(rope_cos), row_position(s) * (PE_DIM // 2) + i // 2)
+                    sn = ld_bf16(_rsrc(rope_sin), row_position(s) * (PE_DIM // 2) + i // 2)
                     put_bf(mb("q_pe"), (s * H + head) * PE_DIM + i, [x0 * c - x1 * sn, x0 * sn + x1 * c])
             stamp("q_b", t, 4)
 
@@ -1409,8 +1486,8 @@ def build_glm5_monokernel(
                         kq = q_elem % INDEX_DIM
                         q0, q1 = get_bf2_many([(mb("index_q"), s * INDEX_Q_ROWS + q_elem)])[0]
                         if kq < PE_DIM:
-                            c = ld_f32(_rsrc(rope_cos), (pos0 + s) * (PE_DIM // 2) + kq // 2)
-                            sn = ld_f32(_rsrc(rope_sin), (pos0 + s) * (PE_DIM // 2) + kq // 2)
+                            c = ld_bf16(_rsrc(rope_cos), (pos0 + s) * (PE_DIM // 2) + kq // 2)
+                            sn = ld_bf16(_rsrc(rope_sin), (pos0 + s) * (PE_DIM // 2) + kq // 2)
                             q0, q1 = q0 * c - q1 * sn, q0 * sn + q1 * c
                         lds_st(xs, q_pair, bf16_pair(q0, q1))
                     gpu.barrier()
@@ -1664,7 +1741,7 @@ def build_glm5_monokernel(
         def patch_new_kv():
             """Rows appended by this launch come from the cache task's kvnew / penew pairs."""
             if const_expr(use_atom_kv_cache):
-                new_active = [row_active(new_s) for new_s in range(S)]
+                new_active = [row_writes_cache(new_s) for new_s in range(S)]
                 new_slots = [row_slot(new_s) for new_s in range(S)]
             for jj in range_constexpr(KPW):
                 j = wave * KPW + jj
@@ -1823,7 +1900,8 @@ def build_glm5_monokernel(
             tt = fx.Int32(tt)
             stamp("uv", tt, 0)
             s = tt // N_UV  # sample
-            t = tt % N_UV  # 64-row tile
+            t = tt % N_UV  # global 64-row tile
+            local_t = dcp_local_uv_tile(t, L)
             head = t // (V_DIM // UV_TILE)
 
             def u_uv(c):
@@ -1831,7 +1909,7 @@ def build_glm5_monokernel(
                 return unit_attention(
                     r_wuv,
                     r_suv,
-                    t * UV_R + wave // UV_WPR,
+                    local_t * UV_R + wave // UV_WPR,
                     kc,
                     UV_NKC,
                     KV_LORA,
@@ -1857,10 +1935,14 @@ def build_glm5_monokernel(
                 ok_sp = lane < N_SPLIT
                 m_sp = ok_sp.select(ml_got[0][0].bitcast(fx.Float32), fx.Float32(NEG))
                 l_sp = ok_sp.select(ml_got[1][0].bitcast(fx.Float32), fx.Float32(0.0))
-                w_sp = _exp(m_sp - wave_max(m_sp))
+                m_all = wave_max(m_sp)
+                w_sp = _exp(m_sp - m_all)
                 den = wave_sum(l_sp * w_sp)
                 if ok_sp:
-                    lds_st(misc, lane, w_sp * _rcp(den))
+                    lds_st(misc, lane, w_sp * (den > 0.0).select(_rcp(den), fx.Float32(0.0)))
+                if lane == 0:
+                    lds_st(misc, N_SPLIT, m_all)
+                    lds_st(misc, N_SPLIT + 1, den)
             stamp("uv", tt, 2)
             gpu.barrier()
             for dh in range_constexpr(2):
@@ -1893,13 +1975,18 @@ def build_glm5_monokernel(
                     o1 = o1 + lds_ld(red, (q * (KV_LORA // 2) + tid) * 2 + 1)
                 lds_st(xs, tid, bf16_pair(o0, o1))
             gpu.barrier()
-            acc = run_units(u_uv, UV_UNITS, UV_UNITS, pre)
-            reduce_rows(UV_R, acc, emit_out(UV_TILE))
-            stamp("uv", tt, 3)
-            gpu.barrier()
-            if tid < UV_TILE // 4:
-                r = tid * 4
-                put_bf(mb("o"), s * O_K + t * UV_TILE + r, [lds_ld(outs, r + j) for j in range(4)])
+            owner = dcp_merge_latent(s, t)
+            if owner:
+                acc = run_units(u_uv, UV_UNITS, UV_UNITS, pre)
+                reduce_rows(UV_R, acc, emit_out(UV_TILE))
+                stamp("uv", tt, 3)
+                gpu.barrier()
+                if tid < UV_TILE // 4:
+                    r = tid * 4
+                    put_bf(
+                        mb("o"), s * O_K + local_t * UV_TILE + r,
+                        [lds_ld(outs, r + j) for j in range(4)],
+                    )
             stamp("uv", tt, 4)
 
         # ====================== 7. W_o + attention TP peer reduce + residual -> a

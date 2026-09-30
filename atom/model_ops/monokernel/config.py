@@ -270,8 +270,8 @@ GLM5_CONFIG = LayerConfig(
 
 GLM5_REFERENCE_TP = 8
 GLM5_TP_SIZES = (4, GLM5_REFERENCE_TP)
-GLM5_GRAPH_BATCHES = tuple(range(1, 21))
-GLM5_QUERY_LENGTHS = (1, 5, 6)
+GLM5_GRAPH_BATCHES = tuple(range(1, 97))
+GLM5_QUERY_LENGTHS = (1, 4, 5, 6)
 GLM5_KERNEL_SAMPLES = (1, 2, 4, 5, 6, 8, 10, 12)
 GLM5_GLOBAL_HEADS = GLM5_CONFIG.local_heads * GLM5_REFERENCE_TP
 GLM5_GLOBAL_INTER = GLM5_CONFIG.inter * GLM5_REFERENCE_TP
@@ -287,6 +287,12 @@ def glm5_tp_config(tp_size: int) -> LayerConfig:
         local_heads=GLM5_GLOBAL_HEADS // tp_size,
         inter=GLM5_GLOBAL_INTER // tp_size,
     )
+
+
+def glm5_attention_heads(tp_size: int, dcp_size: int = 1) -> int:
+    if dcp_size not in (1, 4) or tp_size % dcp_size:
+        raise ValueError(f"unsupported GLM-5 TP/DCP geometry: tp={tp_size}, dcp={dcp_size}")
+    return GLM5_GLOBAL_HEADS // (tp_size // dcp_size)
 
 
 def glm5_kernel_samples(samples: int, query_length: int) -> int:
@@ -373,14 +379,16 @@ def validate_shard(
     sparse_attention_topk: int,
     model_config: LayerConfig | str = GLM5_CONFIG,
     supported_samples=SUPPORTED_SAMPLES,
+    expected_heads: int | None = None,
 ) -> None:
     """Validate one model profile before allocating GPU buffers."""
 
     config = as_layer_config(model_config)
     if samples not in supported_samples:
         raise ValueError(f"samples must be one of {supported_samples}, got {samples}")
-    if heads != config.local_heads:
-        raise ValueError(f"{config.name} requires {config.local_heads} local heads, got {heads}")
+    expected_heads = config.local_heads if expected_heads is None else expected_heads
+    if heads != expected_heads:
+        raise ValueError(f"{config.name} requires {expected_heads} local heads, got {heads}")
     if npes not in SUPPORTED_PEERS:
         raise ValueError(f"npes must be one of {SUPPORTED_PEERS}, got {npes}")
     if not 0 <= rank < npes:

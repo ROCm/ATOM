@@ -27,6 +27,7 @@ from atom.model_ops.monokernel.config import (
     Mxfp4WeightLayout,
     RouterWeightLayout,
     as_kv_cache_layout,
+    glm5_attention_heads,
     glm5_tp_config,
     validate_shard,
 )
@@ -108,12 +109,18 @@ class Glm5MonoKernel:
         kv_cache_dtype: str = "bf16",
         prepared_weights: dict[str, torch.Tensor] | None = None,
         runtime: "Glm5MonoKernel | None" = None,
+        dcp_size: int = 1,
         timeline=False,
     ):
         expected_config = glm5_tp_config(npes)
         if W.config != expected_config:
             raise ValueError(f"Glm5MonoKernel requires {expected_config}, got {W.config}")
-        validate_shard(samples, W.heads, rank, npes, topk, W.config, supported_samples=GLM5_KERNEL_SAMPLES)
+        output_heads = expected_config.local_heads
+        attention_heads = glm5_attention_heads(npes, dcp_size)
+        validate_shard(
+            samples, W.heads, rank, npes, topk, W.config,
+            supported_samples=GLM5_KERNEL_SAMPLES, expected_heads=attention_heads,
+        )
         if not 1 <= launches_per_step <= 128:
             raise ValueError(f"launches_per_step must be in [1, 128], got {launches_per_step}")
         self.W, self.S, self.rank, self.npes, self.topk = W, samples, rank, npes, topk
@@ -125,6 +132,8 @@ class Glm5MonoKernel:
         if kv_cache_dtype not in ("bf16", "fp8"):
             raise ValueError(f"unsupported KV cache dtype {kv_cache_dtype!r}")
         self.kv_cache_dtype = kv_cache_dtype
+        self.dcp_size = dcp_size
+        self.output_heads = output_heads
         t = W.t
         self.expert_mxfp4 = t["w_ug"].dtype is torch.uint8
         self.atom_experts = (
@@ -143,7 +152,10 @@ class Glm5MonoKernel:
             self.packed["w_index_k"] = pack_fp8(t["w_index_k"])
             self.packed["w_index_q"] = pack_fp8(t["w_index_q"])
             self.packed["w_index_w"] = pack_bf16(t["w_index_w"])
-        self.scr_layout, self.sym_layout = layout(samples, W.heads, npes, topk, with_indexer, index_max_seq, inter=W.config.inter)
+        self.scr_layout, self.sym_layout = layout(
+            samples, W.heads, npes, topk, with_indexer, index_max_seq,
+            inter=W.config.inter, output_heads=output_heads, dcp_size=dcp_size,
+        )
         dev = torch.device("cuda", torch.cuda.current_device())
         self.stages = stage_tasks(samples, W.heads, topk, with_indexer, index_max_seq, self.expert_mxfp4, inter=W.config.inter)
         n_tasks = sum(n for _, n in self.stages)
@@ -197,6 +209,8 @@ class Glm5MonoKernel:
             kv_cache_layout=self.kv_cache_layout,
             kv_cache_dtype=self.kv_cache_dtype,
             inter=W.config.inter,
+            output_heads=output_heads,
+            dcp_size=dcp_size,
             uv_scale_rows=(
                 128
                 if self.attention_weight is AttentionWeight.BF16
@@ -384,7 +398,7 @@ class Glm5MonoKernel:
             q_nope=self.debug("q_nope", (S, H, NOPE_DIM), bf2=True),
             q_pe=self.debug("q_pe", (S, H, PE_DIM), bf2=True),
             q_lat=self.debug("q_lat", (S, H, KV_LORA), bf2=True),
-            o=self.debug("o", (S, H * V_DIM), bf2=True),
+            o=self.debug("o", (S, self.output_heads * V_DIM), bf2=True),
             a=self.debug("a", (S, HIDDEN), bf2=True).to(torch.bfloat16),
             scores=self.debug("scores", (S, N_EXPERTS)),
             sel=self.debug("sel", (S, MOE_SLOTS), torch.int32),
