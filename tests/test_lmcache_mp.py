@@ -21,6 +21,7 @@ from atom.kv_transfer.disaggregation.types import (
     KVTransferTensors,
     LoadOperationId,
     PageRegion,
+    RecurrentPageGroup,
     SaveOperationId,
     SaveSourceGroupId,
 )
@@ -33,6 +34,7 @@ from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
     LoadSpec,
+    RecurrentStateTransfer,
     SaveSpec,
 )
 from atom.kv_transfer.offload.mp import deployment, page_views, transfer
@@ -966,6 +968,11 @@ class _FakeEngineGroupInfo:
     engine_group_id: int
     layer_indices: tuple[int, ...]
     tokens_per_block: int
+    # Mirrors the real `EngineGroupInfo`'s defaults so a PAGE-only
+    # registration still reads back the values the server would apply.
+    sw_size_tokens: int = -1
+    recurrent_state: bool = False
+    extra_object_group_tag: int = 0
 
 
 class _WorkerFuture:
@@ -2006,3 +2013,254 @@ def test_merge_pages_appends_a_draft_and_takes_the_gcd_replication():
     assert [r.semantic_role for r in target.block_regions] == ["t", "d"]
     assert len(target.block_tensor_views) == 2
     assert target.tp_replication_factor == 1
+
+
+def _recurrent_transfer_tensors(
+    *, groups: int = 2, num_blocks: int = 2, tokens_per_block: int = 8
+) -> KVTransferTensors:
+    """The PAGE layout above plus `groups` recurrent groups of one plane each."""
+    transfer = _transfer_tensors()
+    recurrent = []
+    for ordinal in range(groups):
+        plane = torch.zeros(num_blocks, 1, 12, dtype=torch.uint8)
+        recurrent.append(
+            RecurrentPageGroup(
+                pages=(page_region(plane, semantic_role=f"kda.{ordinal}"),),
+                num_blocks=num_blocks,
+                tokens_per_block=tokens_per_block,
+            )
+        )
+    # `pages` is frozen only in the recurrent group; the container is a plain
+    # dataclass, so the test keeps the tensors alive by holding the transfer.
+    transfer.recurrent_page_groups = tuple(recurrent)
+    transfer._test_recurrent_planes = [
+        group.pages[0].view for group in transfer.recurrent_page_groups
+    ]
+    return transfer
+
+
+def test_recurrent_groups_register_after_every_page_plane():
+    """The plane order is the key space, so recurrent groups append to it.
+
+    Interleaving them would renumber the PAGE planes, and every object already
+    in the tier is addressed by those numbers.
+    """
+    views = page_views._build_cache_views(_recurrent_transfer_tensors(), num_blocks=2)
+    assert list(views.tensors)[:4] == [
+        "page.0.primary.0",
+        "page.1.primary.1",
+        "page.2.sidecar.0",
+        "page.3.sidecar.1",
+    ]
+    assert list(views.tensors)[4:] == [
+        "recurrent.0.4.kda.0",
+        "recurrent.1.5.kda.1",
+    ]
+    assert [group.tensor_indices for group in views.recurrent] == [(4,), (5,)]
+    assert [group.tokens_per_block for group in views.recurrent] == [8, 8]
+    assert [group.bytes_per_block for group in views.recurrent] == [12, 12]
+    # The attention block cost is unchanged: a recurrent snapshot is not part
+    # of a KV block and must not be billed as one.
+    assert views.bytes_per_block == 640
+
+
+def test_recurrent_group_geometry_is_checked_against_its_own_block_count():
+    transfer = _recurrent_transfer_tensors(groups=1, num_blocks=2)
+    # The attention groups still have two blocks; only the recurrent claim is
+    # wrong. Sizing it from the PAGE count would let this through.
+    transfer.recurrent_page_groups = (
+        RecurrentPageGroup(
+            pages=transfer.recurrent_page_groups[0].pages,
+            num_blocks=3,
+            tokens_per_block=8,
+        ),
+    )
+    with pytest.raises(ValueError, match=r"recurrent\[0\] view 4"):
+        page_views._build_cache_views(transfer, num_blocks=2)
+
+
+@pytest.mark.parametrize(("num_blocks", "tokens_per_block"), [(0, 8), (2, 0), (-1, 8)])
+def test_recurrent_group_refuses_a_non_positive_geometry(num_blocks, tokens_per_block):
+    transfer = _recurrent_transfer_tensors(groups=1)
+    transfer.recurrent_page_groups = (
+        RecurrentPageGroup(
+            pages=transfer.recurrent_page_groups[0].pages,
+            num_blocks=num_blocks,
+            tokens_per_block=tokens_per_block,
+        ),
+    )
+    with pytest.raises(ValueError, match="must.*be positive"):
+        page_views._build_cache_views(transfer, num_blocks=2)
+
+
+def test_each_recurrent_ordinal_gets_its_own_engine_group(
+    fake_lmcache_modules,
+    monkeypatch,
+):
+    """Ordinal `j` is engine group `1 + j`, one block wide, marked recurrent.
+
+    All three matter to the server: the group id is the address space, the
+    one-block window is what makes a retrieve restore the last snapshot only,
+    and `recurrent_state` is what tells it these are snapshots rather than KV.
+    """
+    aiter = types.ModuleType("aiter")
+    aiter.__path__ = []
+    dist = types.ModuleType("aiter.dist")
+    dist.__path__ = []
+    parallel_state = types.ModuleType("aiter.dist.parallel_state")
+    parallel_state.get_tp_group = lambda: SimpleNamespace(rank_in_group=0)
+    monkeypatch.setitem(sys.modules, "aiter", aiter)
+    monkeypatch.setitem(sys.modules, "aiter.dist", dist)
+    monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", parallel_state)
+
+    adapter = _WorkerAdapter()
+    monkeypatch.setattr(
+        mp_worker, "_make_worker_adapter", lambda _config, _rank: adapter
+    )
+    worker = mp_worker.LMCacheMPConnector(_config(model_type="ordinary_mha"))
+    worker.register_kv_caches(
+        {},
+        transfer_tensors=_recurrent_transfer_tensors(),
+        num_blocks=2,
+    )
+
+    assert [group.engine_group_id for group in adapter.groups] == [0, 0, 1, 2]
+    assert [group.recurrent_state for group in adapter.groups] == [
+        False,
+        False,
+        True,
+        True,
+    ]
+    assert [group.tokens_per_block for group in adapter.groups] == [4, 4, 8, 8]
+    assert [group.sw_size_tokens for group in adapter.groups] == [-1, -1, 8, 8]
+    assert [group.layer_indices for group in adapter.groups] == [
+        (0, 1),
+        (2, 3),
+        (4,),
+        (5,),
+    ]
+    assert worker._num_recurrent_groups == 2
+
+
+def test_save_nulls_every_recurrent_chunk_but_the_boundary(fake_lmcache_modules):
+    """A snapshot exists at the boundary only; the rest is the null block id.
+
+    The server drops an all-null chunk rather than copying it, so the earlier
+    chunks cost nothing and the boundary chunk carries the one live snapshot.
+    """
+    adapter = _WorkerAdapter()
+    worker = _worker(adapter)
+    worker._num_recurrent_groups = 2
+    request = LMCacheReqMeta(
+        req_id=8,
+        token_ids=list(range(24)),
+        block_ids=[30, 31, 32, 33, 34, 35],
+        save_spec=SaveSpec(skip_leading_tokens=0),
+        save_operation=SaveOperationId(req_id=8, generation=2),
+        recurrent_state=RecurrentStateTransfer(boundary_tokens=24, block_ids=(7, 9)),
+    )
+
+    worker._submit_save(request, object())
+    submitted = adapter.saves[0][1]
+    assert submitted.start == 0 and submitted.end == 24
+    assert submitted.block_ids == [
+        [30, 31, 32, 33, 34, 35],
+        [-1, -1, 7],
+        [-1, -1, 9],
+    ]
+
+
+def test_load_carries_the_same_recurrent_lists_as_the_save(fake_lmcache_modules):
+    adapter = _WorkerAdapter()
+    worker = _worker(adapter)
+    worker._num_recurrent_groups = 1
+    request = LMCacheReqMeta(
+        req_id=5,
+        token_ids=list(range(16)),
+        block_ids=[10, 11, 12, 13],
+        load_spec=LoadSpec(
+            hbm_cached_tokens=0,
+            lmcache_cached_tokens=15,
+            can_load=True,
+            transfer_end_tokens=16,
+        ),
+        load_operation=LoadOperationId(req_id=5, generation=3),
+        recurrent_state=RecurrentStateTransfer(boundary_tokens=16, block_ids=(4,)),
+    )
+
+    worker._submit_load(request, object())
+    submitted = adapter.loads[0][1]
+    assert submitted.block_ids == [[10, 11, 12, 13], [-1, 4]]
+
+
+def test_a_registered_recurrent_group_refuses_a_page_only_request(
+    fake_lmcache_modules,
+):
+    """Shipping the KV without its state would restore someone else's state.
+
+    The load is rejected before anything is sent, which is reported as a
+    terminal load failure rather than left to time out.
+    """
+    adapter = _WorkerAdapter()
+    worker = _worker(adapter)
+    worker._num_recurrent_groups = 1
+    operation = LoadOperationId(req_id=5, generation=3)
+    worker._submit_load(
+        LMCacheReqMeta(
+            req_id=5,
+            token_ids=list(range(8)),
+            block_ids=[10, 11],
+            load_spec=LoadSpec(
+                hbm_cached_tokens=0,
+                lmcache_cached_tokens=7,
+                can_load=True,
+                transfer_end_tokens=8,
+            ),
+            load_operation=operation,
+        ),
+        object(),
+    )
+    assert adapter.loads == []
+    assert worker.get_finished().failed_loading == {operation}
+
+
+def test_a_snapshot_taken_elsewhere_than_the_transfer_end_is_refused(
+    fake_lmcache_modules,
+):
+    """State from token 8 does not continue KV that ends at 16."""
+    adapter = _WorkerAdapter()
+    worker = _worker(adapter)
+    worker._num_recurrent_groups = 1
+    with pytest.raises(ValueError, match="would not continue the KV"):
+        worker._recurrent_block_ids(
+            LMCacheReqMeta(
+                req_id=5,
+                token_ids=list(range(16)),
+                block_ids=[10, 11, 12, 13],
+                recurrent_state=RecurrentStateTransfer(
+                    boundary_tokens=8, block_ids=(4,)
+                ),
+            ),
+            0,
+            16,
+        )
+
+
+def test_recurrent_state_without_a_registered_group_is_refused(
+    fake_lmcache_modules,
+):
+    adapter = _WorkerAdapter()
+    worker = _worker(adapter)
+    with pytest.raises(ValueError, match="no recurrent group was registered"):
+        worker._recurrent_block_ids(
+            LMCacheReqMeta(
+                req_id=5,
+                token_ids=list(range(8)),
+                block_ids=[10, 11],
+                recurrent_state=RecurrentStateTransfer(
+                    boundary_tokens=8, block_ids=(4,)
+                ),
+            ),
+            0,
+            8,
+        )
