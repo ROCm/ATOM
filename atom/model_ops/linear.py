@@ -22,7 +22,7 @@ from aiter import (
 # import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.quant import per_group_quant_hip
+from aiter.ops.quant import dynamic_per_group_scaled_quant, per_group_quant_hip
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
 from torch import nn
@@ -152,6 +152,46 @@ def per_1x128_e8m0_quant(
         transpose_scale=transpose_scale,
         scale_type=dtypes.fp8_e8m0,
     )
+
+
+def mxfp8_m32k4_quant_fake(
+    x: torch.Tensor,
+    quant_dtype: torch.dtype,
+    scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if scale is not None:
+        raise ValueError("unsupported: static per token quant")
+    rows = x.numel() // x.shape[-1]
+    return (
+        torch.empty(x.shape, dtype=quant_dtype, device=x.device),
+        torch.empty(
+            ((rows + 31) // 32 * 32, x.shape[-1] // 32),
+            dtype=dtypes.fp8_e8m0,
+            device=x.device,
+        ),
+    )
+
+
+# Keep the E8M0 out-buffer mutation inside a functional op, as in the regular
+# per-1x128 path above. Inductor cannot lower the mutation when it sees it in
+# the graph, including when the scale uses AITER's m32k4 layout.
+@torch_compile_guard(gen_fake=mxfp8_m32k4_quant_fake, mutates_args=[])
+def mxfp8_m32k4_quant(
+    x: torch.Tensor,
+    quant_dtype: torch.dtype,
+    scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if scale is not None:
+        raise ValueError("unsupported: static per token quant")
+    rows = x.numel() // x.shape[-1]
+    out = torch.empty(x.shape, dtype=quant_dtype, device=x.device)
+    out_scale = torch.empty(
+        ((rows + 31) // 32 * 32, x.shape[-1] // 32),
+        dtype=dtypes.fp8_e8m0,
+        device=x.device,
+    )
+    dynamic_per_group_scaled_quant(out, x, out_scale, 32, scale_layout_m32k4=True)
+    return out, out_scale
 
 
 def gemm_a4w4_quant_fake(
@@ -301,6 +341,22 @@ def gemm_a4w4_quant(
     return y[:m, ...]
 
 
+def _mxfp8_bpreshuffle_tuned(n: int, k: int) -> bool:
+    """Whether aiter has 1x32 MXFP8 GEMM configs for this (N, K)."""
+    from aiter.ops.gemm_op_a8w8 import mxfp8_bpreshuffle_tuned as tuned
+
+    return tuned(n, k)
+
+
+def _blockscale_preshuffle_gemm(mxscale_shuffle: bool):
+    """The aiter preshuffle GEMM for 128-block or shuffled 1x32 e8m0 scales."""
+    if mxscale_shuffle:
+        from aiter import gemm_a8w8_mxfp8_bpreshuffle
+
+        return gemm_a8w8_mxfp8_bpreshuffle
+    return gemm_a8w8_blockscale_bpreshuffle
+
+
 def gemm_a8w8_blockscale_preshuffle_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -308,6 +364,7 @@ def gemm_a8w8_blockscale_preshuffle_fake(
     w_scale: torch.Tensor,
     dtype: torch.dtype = torch.bfloat16,
     prefix: str = "",
+    mxscale_shuffle: bool = False,
 ) -> torch.Tensor:
     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
 
@@ -320,8 +377,11 @@ def gemm_a8w8_blockscale_preshuffle_impl(
     w_scale: torch.Tensor,
     dtype: torch.dtype = torch.bfloat16,
     prefix: str = "",
+    mxscale_shuffle: bool = False,
 ) -> torch.Tensor:
-    return gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype)
+    return _blockscale_preshuffle_gemm(mxscale_shuffle)(
+        x, weight, x_scale, w_scale, dtype
+    )
 
 
 def gemm_a8w8_blockscale_preshuffle_into_output_fake(
@@ -332,6 +392,7 @@ def gemm_a8w8_blockscale_preshuffle_into_output_fake(
     out: torch.Tensor,
     dtype: torch.dtype = torch.bfloat16,
     prefix: str = "",
+    mxscale_shuffle: bool = False,
 ) -> None:
     return None
 
@@ -347,6 +408,7 @@ def gemm_a8w8_blockscale_preshuffle_into_output(
     out: torch.Tensor,
     dtype: torch.dtype = torch.bfloat16,
     prefix: str = "",
+    mxscale_shuffle: bool = False,
 ) -> None:
     # Same GEMM, but the result lands in the CALLER-owned `out` buffer (a fixed
     # address) and the op returns None — a mutates_args op must NOT also return
@@ -354,7 +416,9 @@ def gemm_a8w8_blockscale_preshuffle_into_output(
     # cannot lower). Lets the downstream attention cudagraph read this output at
     # a stable address with no per-step input copy. Mirrors 035db69's
     # unified_attention_into_output.
-    gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype, out=out)
+    _blockscale_preshuffle_gemm(mxscale_shuffle)(
+        x, weight, x_scale, w_scale, dtype, out=out
+    )
 
 
 def gemm_a8w8_blockscale_triton_fake(
@@ -806,6 +870,18 @@ class LinearBase(nn.Module):
         self.need_normalize_e4m3fn_to_e4m3fnuz = params_dtype == torch.float8_e4m3fnuz
         self.quant_func = get_hip_quant(self.quant_type)
         self.is_output_padded = False
+        # 1x32 scales in aiter's shuffled layout for the shapes aiter has tuned;
+        # decided before loading so a fused-quant producer can follow it.
+        self.use_mxscale_shuffle = (
+            envs.ATOM_FP8_MXSCALE_USE_E8M0_SCALE_SHUFFLE
+            and self.blockscale_e8m0_scale
+            and envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+            and quant_type.value == QuantType.per_1x128.value
+            and params_dtype == dtypes.fp8
+            and self.source_quant_dtype is None
+            and not (quant_config is not None and quant_config.online_quant)
+            and _mxfp8_bpreshuffle_tuned(self.output_size, self.input_size)
+        )
 
     @property
     def weight_scale_row_group(self) -> int:
@@ -1252,6 +1328,23 @@ class LinearBase(nn.Module):
             self.params_dtype != dtypes.fp4x2 or not use_fp4_non_shuffle_triton_gemm()
         ):
             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
+        if getattr(self, "use_mxscale_shuffle", False):
+            self.shuffle_mxscale_weight_scale()
+
+    def shuffle_mxscale_weight_scale(self) -> None:
+        """(Re)build the shuffled 1x32 weight scale, in place once it exists.
+
+        `weight_scale` keeps its checkpoint shape for the loaders and weight sync.
+        """
+        from aiter.ops.shuffle import shuffle_blockscale_to_mxfp8_scale
+
+        ws = shuffle_blockscale_to_mxfp8_scale(
+            self.weight_scale.data, self.weight.shape[0]
+        )
+        if hasattr(self, "weight_scale_mxscale"):
+            self.weight_scale_mxscale.copy_(ws)
+        else:
+            self.register_buffer("weight_scale_mxscale", ws, persistent=False)
 
     def _maybe_pad_a8w8_preshuffle_output(self) -> bool:
         # The other half of the shuffle decision `process_weights_after_loading`
@@ -1366,7 +1459,9 @@ class LinearBase(nn.Module):
         else:
             if x_scale is None:
                 quant_func = self.quant_func
-                if self.quant_type.value == QuantType.per_1x128.value:
+                if getattr(self, "use_mxscale_shuffle", False):
+                    quant_func = mxfp8_m32k4_quant
+                elif self.quant_type.value == QuantType.per_1x128.value:
                     # preshuffle GEMM expects column-major x_scale;
                     # non-preshuffle GEMM expects row-major x_scale
                     quant_func = functools_partial(
@@ -1433,6 +1528,10 @@ class LinearBase(nn.Module):
                     if self.bias is not None:
                         y += self.bias
             elif self.quant_type.value == QuantType.per_1x128.value:
+                mxscale = getattr(self, "use_mxscale_shuffle", False)
+                weight_scale = (
+                    self.weight_scale_mxscale if mxscale else self.weight_scale
+                )
                 if envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
                     if out is not None:
                         # Fixed-address output: write into `out` (returns None),
@@ -1442,10 +1541,11 @@ class LinearBase(nn.Module):
                             x,
                             self.weight,
                             x_scale,
-                            self.weight_scale,
+                            weight_scale,
                             out,
                             dtype=otype,
                             prefix=self.prefix,
+                            mxscale_shuffle=mxscale,
                         )
                         y = out
                     else:
@@ -1453,9 +1553,10 @@ class LinearBase(nn.Module):
                             x,
                             self.weight,
                             x_scale,
-                            self.weight_scale,
+                            weight_scale,
                             dtype=otype,
                             prefix=self.prefix,
+                            mxscale_shuffle=mxscale,
                         )
                 else:
                     assert out is None, (

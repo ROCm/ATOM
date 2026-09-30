@@ -189,6 +189,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
         os.getenv("ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE", "0") == "1"
     ),
+    # Opt in eligible per_1x128 FP8 linears to shuffled 1x32 E8M0 scales.
+    # Requires E8M0 block scales and preshuffled weights.
+    "ATOM_FP8_MXSCALE_USE_E8M0_SCALE_SHUFFLE": lambda: (
+        os.getenv("ATOM_FP8_MXSCALE_USE_E8M0_SCALE_SHUFFLE", "0") == "1"
+    ),
     "ATOM_GROUP32_WEIGHT_PRESHUFFLE": lambda: (
         os.getenv("ATOM_GROUP32_WEIGHT_PRESHUFFLE", "1") == "1"
     ),
