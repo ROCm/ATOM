@@ -81,7 +81,6 @@ from atom.model_ops.monokernel.glm.layout import (
     INDEX_KEYS_PER_TASK,
     INDEX_Q_ROWS,
     INDEX_TILE,
-    atom_mxfp4_scale_index,
     N_QKV_A,
     N_ROUTER,
     N_ROW_TILES,
@@ -119,6 +118,7 @@ from atom.model_ops.monokernel.layout import (
     POLL_MAX,
     THREADS,
     TL_COLS,
+    atom_mxfp4_scale_index,
 )
 from atom.model_ops.monokernel.ops import (
     bpermute_i32,
