@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use axum::{
     body::Body,
@@ -8,7 +8,6 @@ use axum::{
 };
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
 
 use crate::{
@@ -29,11 +28,8 @@ use crate::{
         metrics::{metrics_labels, MeshMetrics},
     },
     protocols::{
-        chat::ChatCompletionRequest,
-        common::GenerationRequest,
-        completion::CompletionRequest,
-        generate::GenerateRequest,
-        responses::{ResponsesGetParams, ResponsesRequest},
+        chat::ChatCompletionRequest, common::GenerationRequest, completion::CompletionRequest,
+        generate::GenerateRequest, responses::ResponsesRequest,
     },
     routers::{
         comm::{
@@ -49,6 +45,7 @@ use crate::{
 pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
     planner: Arc<dyn PdPlanner>,
+    policies: Arc<PolicyRegistryAdapter>,
     client: Client,
     dp_aware: bool,
     retry_config: RetryConfig,
@@ -67,17 +64,123 @@ impl std::fmt::Debug for Router {
 
 impl Router {
     pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
+        let policies = Arc::new(PolicyRegistryAdapter::new(ctx.policy_registry.clone()));
         let planner: Arc<dyn PdPlanner> = Arc::new(DefaultPlanner::new(
             Arc::new(WorkerRegistryAdapter::new(ctx.worker_registry.clone())),
-            Arc::new(PolicyRegistryAdapter::new(ctx.policy_registry.clone())),
+            policies.clone(),
         ));
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
             planner,
+            policies,
             client: ctx.client.clone(),
             dp_aware: ctx.router_config.dp_aware,
             retry_config: ctx.router_config.effective_retry_config(),
         })
+    }
+
+    async fn send_inference_once(
+        &self,
+        request: &super::ingress::InferenceEnvelope,
+        descriptor: &RequestDescriptor<'_>,
+        planner: &dyn PdPlanner,
+        policy: Arc<dyn crate::policies::LoadBalancingPolicy>,
+    ) -> Response {
+        use super::comm::error::IngressError;
+        let metadata = &request.metadata;
+        let (worker, policy_name) = match planner.plan(descriptor).await {
+            Ok(PlacementPlan::Single {
+                worker,
+                policy_name,
+                ..
+            }) => (worker, policy_name),
+            Ok(_) => {
+                return IngressError::new(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "unsupported_api_topology",
+                    "regular proxy requires a regular HTTP worker",
+                )
+                .response(metadata.route)
+            }
+            Err(err) => return placement_err_to_response(err, metadata.model.as_deref()),
+        };
+        MeshMetrics::record_worker_selection(
+            metrics_labels::WORKER_REGULAR,
+            metrics_labels::CONNECTION_HTTP,
+            metadata.model.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
+            policy_name,
+        );
+        let load = WorkerLoadGuard::new(worker.clone(), Some(&request.headers));
+        let headers = match header_utils::inference_request_headers(
+            &request.headers,
+            metadata.route,
+            worker.api_key().as_deref(),
+        ) {
+            Ok(headers) => headers,
+            Err(_) => {
+                return IngressError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "invalid_backend_credentials",
+                    "configured worker credential is not a valid HTTP header",
+                )
+                .response(metadata.route)
+            }
+        };
+        let mut builder = self
+            .client
+            .post(
+                worker.endpoint_url(
+                    request
+                        .uri
+                        .path_and_query()
+                        .map(|p| p.as_str())
+                        .unwrap_or(metadata.route),
+                ),
+            )
+            .headers(headers);
+        if worker.is_dp_aware() {
+            let body: serde_json::Value = match serde_json::from_slice(&request.body) {
+                Ok(body) => body,
+                Err(err) => return IngressError::invalid(err.to_string()).response(metadata.route),
+            };
+            let body = match worker.prepare_request(body).await {
+                Ok(body) => body,
+                Err(err) => return IngressError::invalid(err.to_string()).response(metadata.route),
+            };
+            builder = builder.json(&body);
+        } else {
+            builder = builder
+                .header(
+                    CONTENT_TYPE,
+                    request
+                        .headers
+                        .get(CONTENT_TYPE)
+                        .cloned()
+                        .unwrap_or_else(|| HeaderValue::from_static("application/json")),
+                )
+                .body(request.body.clone());
+        }
+        events::RequestSentEvent { url: worker.url() }.emit();
+        let upstream = builder.send().await;
+        events::RequestReceivedEvent {}.emit();
+        let response = match upstream {
+            Ok(response) => {
+                super::comm::proxy_body::ProxyBody::response(response, worker, policy, load)
+            }
+            Err(err) => {
+                worker.record_outcome(false);
+                policy.on_request_complete(worker.url(), false);
+                convert_reqwest_error(err)
+            }
+        };
+        if response.status().is_server_error() {
+            MeshMetrics::record_worker_error(
+                metrics_labels::WORKER_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                error_type_from_status(response.status()),
+            );
+        }
+        response
     }
 
     fn select_first_worker(&self) -> Result<String, String> {
@@ -280,124 +383,76 @@ impl Router {
         worker_url.to_string()
     }
 
-    // Generic simple routing for GET/POST without JSON body
+    // Stored response ownership is backend-local, so probe each distinct origin.
     async fn route_simple_request(
         &self,
         headers: Option<&HeaderMap>,
         endpoint: &str,
         method: Method,
+        query: Option<&str>,
     ) -> Response {
-        // TODO: currently the sglang worker is using in-memory state management, so this implementation has to fan out to all workers.
-        // Eventually, we need to have router to manage the chat history with a proper database, will update this implementation accordingly.
         let workers = self.worker_registry.get_all();
         if workers.is_empty() {
             return error::service_unavailable("no_workers", "No available workers");
         }
-
-        let filtered_headers: Vec<_> = headers
-            .map(|hdrs| {
-                hdrs.iter()
-                    .filter(|(name, _)| header_utils::should_forward_request_header(name.as_str()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
+        let headers = headers.cloned().unwrap_or_default();
+        let mut origins = HashSet::new();
         let futures: Vec<_> = workers
             .into_iter()
-            .map(|worker| {
-                let worker_url = worker.url();
-                let base = self.worker_base_url(worker_url);
-                let url = format!("{}/{}", base, endpoint);
+            .filter_map(|worker| {
+                let base = self.worker_base_url(worker.url());
+                origins.insert(base.clone()).then_some((worker, base))
+            })
+            .map(|(worker, base)| {
+                let url = match query {
+                    Some(query) => format!("{base}/{endpoint}?{query}"),
+                    None => format!("{base}/{endpoint}"),
+                };
                 let client = self.client.clone();
                 let method = method.clone();
-
-                let headers = filtered_headers.clone();
-
-                let api_key = worker.api_key().clone();
-
+                let headers = header_utils::inference_request_headers(
+                    &headers,
+                    "/v1/responses",
+                    worker.api_key().as_deref(),
+                );
                 async move {
-                    let mut request_builder = match method {
-                        Method::GET => client.get(url),
-                        Method::POST => client.post(url),
-                        _ => {
-                            return Err(error::method_not_allowed(
-                                "unsupported_method",
-                                "Unsupported method for simple routing",
-                            ))
-                        }
-                    };
-
-                    if let Some(key) = api_key {
-                        let mut auth_header = String::with_capacity(7 + key.len());
-                        auth_header.push_str("Bearer ");
-                        auth_header.push_str(&key);
-                        request_builder = request_builder.header("Authorization", auth_header);
-                    }
-
-                    for (name, value) in headers {
-                        request_builder = request_builder.header(name.clone(), value.clone());
-                    }
-
-                    request_builder.send().await.map_err(convert_reqwest_error)
+                    let headers = headers.map_err(|_| {
+                        error::service_unavailable(
+                            "invalid_backend_credentials",
+                            "configured worker credential is not a valid HTTP header",
+                        )
+                    })?;
+                    client
+                        .request(method, url)
+                        .headers(headers)
+                        .send()
+                        .await
+                        .map_err(convert_reqwest_error)
                 }
             })
             .collect();
 
-        // Now execute the collected futures concurrently
         let mut stream = stream::iter(futures).buffer_unordered(32);
-        let mut last_response: Option<Response> = None;
-
+        let mut last_response = None;
         while let Some(result) = stream.next().await {
             match result {
-                Ok(res) => {
-                    let status = StatusCode::from_u16(res.status().as_u16())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-
-                    let response_headers = header_utils::preserve_response_headers(res.headers());
-
-                    match res.bytes().await {
-                        Ok(body) => {
-                            let mut response = Response::new(Body::from(body));
-                            *response.status_mut() = status;
-                            *response.headers_mut() = response_headers;
-
-                            if status.is_success() {
-                                return response;
-                            }
-                            last_response = Some(response);
-                        }
-                        Err(e) => {
-                            last_response = Some(error::internal_error(
-                                "read_response_failed",
-                                format!("Failed to read response: {}", e),
-                            ));
-                        }
+                Ok(upstream) => {
+                    let status = upstream.status();
+                    let headers = header_utils::preserve_response_headers(upstream.headers());
+                    // Stream retrieval events as they arrive.
+                    let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
+                    *response.status_mut() = status;
+                    *response.headers_mut() = headers;
+                    if status.is_success() {
+                        return response;
                     }
+                    last_response = Some(response);
                 }
-                Err(e) => {
-                    last_response = Some(e);
-                }
+                Err(response) => last_response = Some(response),
             }
         }
-
         last_response
             .unwrap_or_else(|| error::bad_gateway("no_worker_response", "No worker response"))
-    }
-
-    // Route a GET request with provided headers to a specific endpoint
-    async fn route_get_request(&self, headers: Option<&HeaderMap>, endpoint: &str) -> Response {
-        self.route_simple_request(headers, endpoint, Method::GET)
-            .await
-    }
-
-    // Route a POST request with empty body to a specific endpoint
-    async fn route_post_empty_request(
-        &self,
-        headers: Option<&HeaderMap>,
-        endpoint: &str,
-    ) -> Response {
-        self.route_simple_request(headers, endpoint, Method::POST)
-            .await
     }
 
     // TODO (rui): Better accommodate to the Worker abstraction
@@ -482,17 +537,19 @@ impl Router {
                 .json(typed_req) // Use json() directly with typed request
         };
 
-        if let Some(key) = api_key {
+        if let Some(ref key) = api_key {
             // Pre-allocate string with capacity to avoid reallocation
             let mut auth_header = String::with_capacity(7 + key.len());
             auth_header.push_str("Bearer ");
-            auth_header.push_str(&key);
+            auth_header.push_str(key);
             request_builder = request_builder.header("Authorization", auth_header);
         }
 
         if let Some(headers) = headers {
             for (name, value) in headers {
-                if header_utils::should_forward_request_header(name.as_str()) {
+                if header_utils::should_forward_request_header(name.as_str())
+                    && !(api_key.is_some() && (name == "authorization" || name == "x-api-key"))
+                {
                     request_builder = request_builder.header(name, value);
                 }
             }
@@ -533,34 +590,8 @@ impl Router {
             // load_guard dropped here automatically after response body is read
             response
         } else {
-            // Preserve headers for streaming response
-            let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
-            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-
-            let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-            // Spawn task to forward stream
-            tokio::spawn(async move {
-                let mut stream = stream;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
-                            break;
-                        }
-                    }
-                }
-            });
-
-            let stream = UnboundedReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
+            let response_headers = header_utils::preserve_response_headers(res.headers());
+            let body = Body::from_stream(res.bytes_stream());
 
             let mut response = Response::new(body);
             *response.status_mut() = status;
@@ -636,6 +667,80 @@ impl RouterTrait for Router {
         self
     }
 
+    async fn route_inference(
+        &self,
+        request: &super::ingress::InferenceEnvelope,
+        app: &Arc<AppContext>,
+    ) -> Response {
+        use super::ingress::IngressRouting;
+        use crate::core::placement::traits::PolicySource;
+        let routing = IngressRouting::new(app);
+        let (metadata, tokens) =
+            match routing.prepare(&request.parsed, &std::sync::atomic::AtomicBool::new(false)) {
+                Ok(prepared) => prepared,
+                Err(err) => return err.response(request.metadata.route),
+            };
+        let candidates = match routing.candidates(&metadata, request.parsed.requires_state_domain())
+        {
+            Ok(workers) => workers,
+            Err(err) => return err.response(metadata.route),
+        };
+        let planner = DefaultPlanner::new(
+            Arc::new(WorkerRegistryAdapter::with_candidates(
+                self.worker_registry.clone(),
+                candidates,
+            )),
+            self.policies.clone(),
+        );
+        let descriptor = RequestDescriptor {
+            model_id: metadata.model.as_deref(),
+            protocol: Some(Protocol::Http),
+            text: Some(&metadata.text),
+            tokens: tokens.as_deref(),
+            headers: Some(&request.headers),
+            stream: metadata.stream,
+        };
+        let policy = self.policies.regular_policy(metadata.model.as_deref());
+        let observation = crate::observability::request::RequestMetrics::new(
+            metrics_labels::ROUTER_HTTP,
+            metrics_labels::BACKEND_REGULAR,
+            metadata.model.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
+            metadata.route,
+            metadata.stream,
+        );
+        let endpoint = route_to_endpoint(metadata.route);
+        let response = RetryExecutor::execute_response_with_retry(
+            &self.retry_config,
+            |_| async {
+                let response = self
+                    .send_inference_once(request, &descriptor, &planner, policy.clone())
+                    .await;
+                MeshMetrics::record_router_upstream_response(
+                    metrics_labels::ROUTER_HTTP,
+                    response.status().as_u16(),
+                    extract_error_code_from_response(&response),
+                );
+                response
+            },
+            // A failed Responses submission may already have created stored work.
+            |response, _| {
+                metadata.route != "/v1/responses" && is_retryable_status(response.status())
+            },
+            |delay, attempt| {
+                MeshMetrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
+                MeshMetrics::record_worker_retry_backoff(attempt, delay);
+            },
+            || {
+                MeshMetrics::record_worker_retries_exhausted(
+                    metrics_labels::WORKER_REGULAR,
+                    endpoint,
+                )
+            },
+        )
+        .await;
+        observation.wrap_response(response)
+    }
+
     async fn health_generate(&self, req: Request<Body>) -> Response {
         self.proxy_get_request(req, "health_generate").await
     }
@@ -696,15 +801,34 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         response_id: &str,
-        _params: &ResponsesGetParams,
+        query: Option<&str>,
     ) -> Response {
         let endpoint = format!("v1/responses/{}", response_id);
-        self.route_get_request(headers, &endpoint).await
+        self.route_simple_request(headers, &endpoint, Method::GET, query)
+            .await
     }
 
     async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
         let endpoint = format!("v1/responses/{}/cancel", response_id);
-        self.route_post_empty_request(headers, &endpoint).await
+        self.route_simple_request(headers, &endpoint, Method::POST, None)
+            .await
+    }
+
+    async fn delete_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+        let endpoint = format!("v1/responses/{}", response_id);
+        self.route_simple_request(headers, &endpoint, Method::DELETE, None)
+            .await
+    }
+
+    async fn list_response_input_items(
+        &self,
+        headers: Option<&HeaderMap>,
+        response_id: &str,
+        query: Option<&str>,
+    ) -> Response {
+        let endpoint = format!("v1/responses/{}/input_items", response_id);
+        self.route_simple_request(headers, &endpoint, Method::GET, query)
+            .await
     }
 
     fn router_type(&self) -> &'static str {
@@ -743,6 +867,7 @@ mod tests {
         Router {
             worker_registry,
             planner,
+            policies: Arc::new(PolicyRegistryAdapter::new(policy_registry)),
             dp_aware: false,
             client: Client::new(),
             retry_config: RetryConfig::default(),
@@ -815,6 +940,7 @@ mod tests {
         let router = Router {
             worker_registry,
             planner,
+            policies: Arc::new(PolicyRegistryAdapter::new(policy_registry)),
             dp_aware: false,
             client: Client::new(),
             retry_config: RetryConfig::default(),
@@ -877,6 +1003,7 @@ mod tests {
         let router = Router {
             worker_registry,
             planner,
+            policies: Arc::new(PolicyRegistryAdapter::new(policy_registry)),
             dp_aware: true,
             client: Client::new(),
             retry_config: RetryConfig::default(),

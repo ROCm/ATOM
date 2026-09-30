@@ -1,4 +1,4 @@
-//! Exercise real HTTP dispatch while independently holding P and D responses.
+//! PD load accounting while prefill and decode responses are held independently.
 use super::*;
 use crate::core::{BasicWorkerBuilder, WorkerType};
 use axum::{routing::post, Router};
@@ -128,6 +128,8 @@ fn dispatch(
             is_stream: streaming,
             return_logprob: false,
             request_text: None,
+            tokens: None,
+            planner: None,
             model_id: None,
             headers: None,
         };

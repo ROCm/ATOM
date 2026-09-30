@@ -14,14 +14,10 @@ use tokio::{
 use http::{HeaderMap, HeaderName, HeaderValue};
 use prost_types::value::Kind;
 
-use crate::{
-    app_context::AppContext,
-    core::placement::{registry_adapters::PolicyRegistryAdapter, traits::PolicySource},
-    routers::prepare::chat_template::process_chat_messages,
-};
+use crate::app_context::AppContext;
 
 use super::{core, error::ProcessingError, pb};
-use crate::routers::prepare::inference::{InferenceMetadata, InferenceRequest, ParsedInference};
+use crate::routers::prepare::inference::{InferenceMetadata, ParsedInference};
 
 pub(super) struct RequestEnvelope {
     pub headers: HeaderMap,
@@ -38,6 +34,7 @@ pub(super) struct RequestEnvelope {
 pub(super) struct RoutingInput {
     pub metadata: InferenceMetadata,
     pub tokens: Option<Vec<u32>>,
+    pub state_reference: bool,
 }
 impl std::ops::Deref for RoutingInput {
     type Target = InferenceMetadata;
@@ -117,43 +114,15 @@ impl RequestEnvelope {
         }
         let path = path.ok_or_else(|| ProcessingError::invalid("missing :path"))?;
         let route = path.split('?').next().unwrap_or("");
-        if !matches!(
-            route,
-            "/v1/chat/completions" | "/v1/completions" | "/generate"
-        ) {
+        if crate::routers::ingress::EndpointSpec::find(route).is_none() {
             return Err(ProcessingError::new(
                 404,
                 "unsupported_path",
                 "unsupported inference API",
             ));
         }
-        if headers
-            .get("content-encoding")
-            .is_some_and(|v| v != "identity")
-        {
-            return Err(ProcessingError::new(
-                415,
-                "unsupported_encoding",
-                "decompress requests before ext-proc",
-            ));
-        }
-        if !headers
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| {
-                v.split(';')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .eq_ignore_ascii_case("application/json")
-            })
-        {
-            return Err(ProcessingError::new(
-                415,
-                "unsupported_content_type",
-                "application/json is required",
-            ));
-        }
+        crate::routers::ingress::InferenceEnvelope::validate_headers(&headers)
+            .map_err(ProcessingError::from)?;
         headers.insert(
             "x-request-id",
             HeaderValue::from_str(&id)
@@ -162,7 +131,7 @@ impl RequestEnvelope {
         headers.remove(super::mutation::Mutation::DESTINATION);
         Ok(Self {
             headers,
-            path: route.to_owned(),
+            path,
             id,
             raw: Vec::new(),
             trailer_mutation: None,
@@ -274,17 +243,6 @@ impl RequestEnvelope {
         Ok(())
     }
 
-    pub fn needs_tokens(app: &AppContext, model: Option<&str>) -> bool {
-        if app.router_config.mode.is_pd_mode() {
-            app.policy_registry.get_prefill_policy().needs_tokens()
-                || app.policy_registry.get_decode_policy().needs_tokens()
-        } else {
-            PolicyRegistryAdapter::new(app.policy_registry.clone())
-                .regular_policy(model)
-                .needs_tokens()
-        }
-    }
-
     pub fn parse(
         &self,
         app: &AppContext,
@@ -293,50 +251,15 @@ impl RequestEnvelope {
         check_canceled(canceled)?;
         let parsed =
             ParsedInference::parse(&self.path, &self.raw).map_err(ProcessingError::invalid)?;
-        let metadata = parsed.metadata();
-        let model = metadata.model.as_deref();
-        let text = &metadata.text;
+        let (metadata, tokens) = crate::routers::ingress::IngressRouting::new(app)
+            .prepare(&parsed, canceled)
+            .map_err(ProcessingError::from)?;
         check_canceled(canceled)?;
-        if model.is_some_and(|model| model.trim().is_empty()) {
-            return Err(ProcessingError::invalid("model is required"));
-        }
-        let tokens = if Self::needs_tokens(app, model) {
-            if let Some(ids) = parsed.input_tokens().map_err(ProcessingError::invalid)? {
-                Some(ids)
-            } else {
-                let tokenizer = model
-                    .and_then(|model| app.tokenizer_registry.get(model))
-                    .ok_or_else(|| {
-                        ProcessingError::new(
-                            503,
-                            "tokenizer_unavailable",
-                            "token routing requires input_ids or a model with a registered tokenizer",
-                        )
-                    })?;
-                check_prompt_size(text, app.router_config.ext_proc.max_tokenize_bytes)?;
-                check_canceled(canceled)?;
-                let prompt = if let Some(chat) = parsed.chat() {
-                    process_chat_messages(chat, &*tokenizer)
-                        .map_err(ProcessingError::invalid)?
-                        .text
-                } else {
-                    text.clone()
-                };
-                check_canceled(canceled)?;
-                check_prompt_size(&prompt, app.router_config.ext_proc.max_tokenize_bytes)?;
-                Some(
-                    tokenizer
-                        .encode(&prompt, false)
-                        .map_err(|e| ProcessingError::invalid(e.to_string()))?
-                        .token_ids()
-                        .to_vec(),
-                )
-            }
-        } else {
-            None
-        };
-        check_canceled(canceled)?;
-        Ok(RoutingInput { metadata, tokens })
+        Ok(RoutingInput {
+            metadata,
+            tokens,
+            state_reference: parsed.requires_state_domain(),
+        })
     }
 }
 
@@ -346,18 +269,6 @@ fn check_canceled(canceled: &AtomicBool) -> Result<(), ProcessingError> {
             499,
             "parser_canceled",
             "request parsing canceled",
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn check_prompt_size(prompt: &str, limit: usize) -> Result<(), ProcessingError> {
-    if prompt.len() > limit {
-        Err(ProcessingError::new(
-            413,
-            "tokenizer_input_too_large",
-            "prompt exceeds the synchronous tokenizer byte limit",
         ))
     } else {
         Ok(())

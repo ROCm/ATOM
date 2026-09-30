@@ -12,7 +12,7 @@ use axum::{
     extract::{Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -36,23 +36,20 @@ use crate::{
         metrics::{self, MetricsRouteFactory, PrometheusConfig},
     },
     protocols::{
-        chat::ChatCompletionRequest,
-        completion::CompletionRequest,
-        generate::GenerateRequest,
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
-        responses::{ResponsesGetParams, ResponsesRequest},
         tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
-        validated::ValidatedJson,
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
     routers::{
         atom_standalone::AtomStandaloneRuntime,
         comm::{conversations, parse, tokenize},
+        ingress::EndpointSpec,
         router_manager::RouterManager,
         RouterTrait,
     },
     tokenizer::TokenizerRegistry,
 };
+
 #[derive(Clone)]
 pub struct AppState {
     pub router: Arc<dyn RouterTrait>,
@@ -114,96 +111,6 @@ async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response
 
 async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
     state.router.get_model_info(req).await
-}
-
-async fn generate(
-    State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
-    Json(body): Json<GenerateRequest>,
-) -> Response {
-    let model_id = body.model.as_deref();
-    state
-        .router
-        .route_generate(Some(&headers), &body, model_id)
-        .await
-}
-
-async fn v1_chat_completions(
-    State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
-) -> Response {
-    state
-        .router
-        .route_chat(Some(&headers), &body, Some(&body.model))
-        .await
-}
-
-async fn v1_completions(
-    State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
-    Json(body): Json<CompletionRequest>,
-) -> Response {
-    state
-        .router
-        .route_completion(Some(&headers), &body, Some(&body.model))
-        .await
-}
-
-async fn v1_responses(
-    State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ResponsesRequest>,
-) -> Response {
-    state
-        .router
-        .route_responses(Some(&headers), &body, Some(&body.model))
-        .await
-}
-
-async fn v1_responses_get(
-    State(state): State<Arc<AppState>>,
-    Path(response_id): Path<String>,
-    headers: http::HeaderMap,
-    Query(params): Query<ResponsesGetParams>,
-) -> Response {
-    state
-        .router
-        .get_response(Some(&headers), &response_id, &params)
-        .await
-}
-
-async fn v1_responses_cancel(
-    State(state): State<Arc<AppState>>,
-    Path(response_id): Path<String>,
-    headers: http::HeaderMap,
-) -> Response {
-    state
-        .router
-        .cancel_response(Some(&headers), &response_id)
-        .await
-}
-
-async fn v1_responses_delete(
-    State(state): State<Arc<AppState>>,
-    Path(response_id): Path<String>,
-    headers: http::HeaderMap,
-) -> Response {
-    state
-        .router
-        .delete_response(Some(&headers), &response_id)
-        .await
-}
-
-async fn v1_responses_list_input_items(
-    State(state): State<Arc<AppState>>,
-    Path(response_id): Path<String>,
-    headers: http::HeaderMap,
-) -> Response {
-    state
-        .router
-        .list_response_input_items(Some(&headers), &response_id)
-        .await
 }
 
 async fn v1_conversations_create(
@@ -464,21 +371,9 @@ pub fn build_app(
     let inference_routes = if ext_proc_enabled {
         Router::new()
     } else {
-        Router::new()
-            .route("/generate", post(generate))
-            .route("/v1/chat/completions", post(v1_chat_completions))
-            .route("/v1/completions", post(v1_completions))
-            .route("/v1/responses", post(v1_responses))
-            .route("/v1/responses/{response_id}", get(v1_responses_get))
-            .route(
-                "/v1/responses/{response_id}/cancel",
-                post(v1_responses_cancel),
-            )
-            .route("/v1/responses/{response_id}", delete(v1_responses_delete))
-            .route(
-                "/v1/responses/{response_id}/input_items",
-                get(v1_responses_list_input_items),
-            )
+        EndpointSpec::ALL
+            .iter()
+            .fold(Router::new(), |router, spec| spec.register(router))
     };
     let protected_routes = inference_routes
         .route("/v1/conversations", post(v1_conversations_create))
@@ -544,8 +439,9 @@ pub fn build_app(
         .merge(admin_routes)
         .merge(worker_routes)
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+        .layer(axum::middleware::from_fn_with_state(
             max_payload_size,
+            middleware::payload_limit_middleware,
         ))
         .layer(middleware::create_logging_layer())
         .layer(axum::middleware::from_fn_with_state(
