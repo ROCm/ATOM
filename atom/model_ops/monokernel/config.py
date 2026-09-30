@@ -167,7 +167,9 @@ def as_moe_mode(value: MoeMode | str) -> MoeMode:
         return MoeMode(value)
     except ValueError as error:
         choices = ", ".join(mode.value for mode in MoeMode)
-        raise ValueError(f"unsupported MoE mode {value!r}; expected one of: {choices}") from error
+        raise ValueError(
+            f"unsupported MoE mode {value!r}; expected one of: {choices}"
+        ) from error
 
 
 def moe_format(value: MoeMode | str) -> MoeFormat:
@@ -183,7 +185,9 @@ def _as_layout(value, enum_type, name):
         return enum_type(value)
     except ValueError as error:
         choices = ", ".join(layout.value for layout in enum_type)
-        raise ValueError(f"unsupported {name} {value!r}; expected one of: {choices}") from error
+        raise ValueError(
+            f"unsupported {name} {value!r}; expected one of: {choices}"
+        ) from error
 
 
 def as_mxfp4_weight_layout(value: Mxfp4WeightLayout | str) -> Mxfp4WeightLayout:
@@ -281,7 +285,9 @@ def glm5_tp_config(tp_size: int) -> LayerConfig:
     """Return the one GLM-5 shard geometry for ``tp_size``."""
 
     if tp_size not in GLM5_TP_SIZES:
-        raise ValueError(f"GLM-5 tensor parallel size must be one of {GLM5_TP_SIZES}, got {tp_size}")
+        raise ValueError(
+            f"GLM-5 tensor parallel size must be one of {GLM5_TP_SIZES}, got {tp_size}"
+        )
     return replace(
         GLM5_CONFIG,
         local_heads=GLM5_GLOBAL_HEADS // tp_size,
@@ -291,7 +297,9 @@ def glm5_tp_config(tp_size: int) -> LayerConfig:
 
 def glm5_attention_heads(tp_size: int, dcp_size: int = 1) -> int:
     if dcp_size not in (1, 4) or tp_size % dcp_size:
-        raise ValueError(f"unsupported GLM-5 TP/DCP geometry: tp={tp_size}, dcp={dcp_size}")
+        raise ValueError(
+            f"unsupported GLM-5 TP/DCP geometry: tp={tp_size}, dcp={dcp_size}"
+        )
     return GLM5_GLOBAL_HEADS // (tp_size // dcp_size)
 
 
@@ -299,11 +307,16 @@ def glm5_kernel_samples(samples: int, query_length: int) -> int:
     """Choose an LDS-safe request-aligned launch width."""
 
     if query_length not in GLM5_QUERY_LENGTHS or samples % query_length:
-        raise ValueError(f"unsupported GLM-5 decode shape samples={samples}, query_length={query_length}")
+        raise ValueError(
+            f"unsupported GLM-5 decode shape samples={samples}, query_length={query_length}"
+        )
     for chunk in reversed(GLM5_KERNEL_SAMPLES):
         if chunk % query_length == 0 and samples % chunk == 0:
             return chunk
-    raise ValueError(f"no GLM-5 kernel chunk for samples={samples}, query_length={query_length}")
+    raise ValueError(
+        f"no GLM-5 kernel chunk for samples={samples}, query_length={query_length}"
+    )
+
 
 KIMI_K3_CONFIG = LayerConfig(
     name="kimi_k3",
@@ -342,7 +355,9 @@ def as_layer_config(value: LayerConfig | str) -> LayerConfig:
         return MODEL_CONFIGS[value]
     except KeyError as error:
         choices = ", ".join(MODEL_CONFIGS)
-        raise ValueError(f"unsupported model profile {value!r}; expected one of: {choices}") from error
+        raise ValueError(
+            f"unsupported model profile {value!r}; expected one of: {choices}"
+        ) from error
 
 
 # Fixed GLM-5 geometry used by its performance-specialized MonoKernel.
@@ -388,10 +403,15 @@ def validate_shard(
         raise ValueError(f"samples must be one of {supported_samples}, got {samples}")
     expected_heads = config.local_heads if expected_heads is None else expected_heads
     if heads != expected_heads:
-        raise ValueError(f"{config.name} requires {expected_heads} local heads, got {heads}")
+        raise ValueError(
+            f"{config.name} requires {expected_heads} local heads, got {heads}"
+        )
     if npes not in SUPPORTED_PEERS:
         raise ValueError(f"npes must be one of {SUPPORTED_PEERS}, got {npes}")
     if not 0 <= rank < npes:
         raise ValueError(f"rank must be in [0, {npes}), got {rank}")
     if sparse_attention_topk <= 0 or sparse_attention_topk % 64:
-        raise ValueError("sparse_attention_topk must be a positive multiple of 64, " f"got {sparse_attention_topk}")
+        raise ValueError(
+            "sparse_attention_topk must be a positive multiple of 64, "
+            f"got {sparse_attention_topk}"
+        )

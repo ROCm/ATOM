@@ -32,7 +32,9 @@ def tp_uniform_local_validation(
 
         reports = [None] * world_size
         dist.all_gather_object(reports, local, group=group)
-    failed = [(rank, report) for rank, report in enumerate(reports) if report is not None]
+    failed = [
+        (rank, report) for rank, report in enumerate(reports) if report is not None
+    ]
     if failed:
         detail = "; ".join(f"rank {rank}: {report}" for rank, report in failed)
         raise MonoUnsupported(f"{context}: {detail}")
@@ -41,7 +43,9 @@ def tp_uniform_local_validation(
 def normalize_mode(mode: str) -> str:
     mode = mode.strip().lower()
     if mode not in MODES:
-        raise ValueError(f"MonoKernel mode must be one of {', '.join(MODES)}, got {mode!r}")
+        raise ValueError(
+            f"MonoKernel mode must be one of {', '.join(MODES)}, got {mode!r}"
+        )
     return mode
 
 
@@ -54,12 +58,23 @@ def glm52_native_config(
         config = glm5_tp_config(tp_size)
     except ValueError:
         return None
-    if query_length <= 0 or samples % query_length or samples // query_length not in GLM5_GRAPH_BATCHES:
+    if (
+        query_length <= 0
+        or samples % query_length
+        or samples // query_length not in GLM5_GRAPH_BATCHES
+    ):
         return None
     if query_length in (5, 6):
         return config if tp_size == 4 and kv_cache_dtype == "fp8" and mtp else None
     if query_length == 1:
-        return config if tp_size == 8 and kv_cache_dtype == "bf16" and not mtp and samples in SAMPLES else None
+        return (
+            config
+            if tp_size == 8
+            and kv_cache_dtype == "bf16"
+            and not mtp
+            and samples in SAMPLES
+            else None
+        )
     return None
 
 

@@ -25,7 +25,9 @@ def build_sigmoid_topk_router(num_experts: int, topk: int, samples: int):
     """Build BF16-logit sigmoid + correction-bias top-k for a fixed small batch."""
 
     if num_experts <= 0 or num_experts % WAVE_SIZE:
-        raise ValueError(f"num_experts must be a positive multiple of {WAVE_SIZE}, got {num_experts}")
+        raise ValueError(
+            f"num_experts must be a positive multiple of {WAVE_SIZE}, got {num_experts}"
+        )
     if not 0 < topk <= 32:
         raise ValueError(f"topk must be in [1, 32], got {topk}")
     if samples not in {1, 2, 4, 8}:
@@ -57,9 +59,17 @@ def build_sigmoid_topk_router(num_experts: int, topk: int, samples: int):
         for i in range_constexpr(values_per_lane):
             expert = lane + i * WAVE_SIZE
             offset = sample * num_experts + expert
-            logit = fx.Float32(fx.BFloat16(bo.buffer_load(logits_rsrc, offset, vec_width=1, dtype=T.bf16)))
+            logit = fx.Float32(
+                fx.BFloat16(
+                    bo.buffer_load(logits_rsrc, offset, vec_width=1, dtype=T.bf16)
+                )
+            )
             score = rcp(fx.Float32(1.0) + exp(-logit))
-            bias = fx.Float32(fx.BFloat16(bo.buffer_load(bias_rsrc, expert, vec_width=1, dtype=T.bf16)))
+            bias = fx.Float32(
+                fx.BFloat16(
+                    bo.buffer_load(bias_rsrc, expert, vec_width=1, dtype=T.bf16)
+                )
+            )
             bo.buffer_store(score, scores_rsrc, offset)
             raw_scores.append(score)
             corrected_scores.append(score + bias)
@@ -77,7 +87,8 @@ def build_sigmoid_topk_router(num_experts: int, topk: int, samples: int):
                 candidate_score = corrected_scores[i]
                 candidate_id = expert_ids[i]
                 take = (candidate_score > best_score) | (
-                    (ArithValue(candidate_score) == ArithValue(best_score)) & (candidate_id < best_id)
+                    (ArithValue(candidate_score) == ArithValue(best_score))
+                    & (candidate_id < best_id)
                 )
                 best_score = take.select(candidate_score, best_score)
                 best_raw = take.select(raw_scores[i], best_raw)
@@ -88,7 +99,8 @@ def build_sigmoid_topk_router(num_experts: int, topk: int, samples: int):
                 peer_raw = best_raw.shuffle_xor(fx.Int32(offset), WAVE_SIZE)
                 peer_id = best_id.shuffle_xor(fx.Int32(offset), WAVE_SIZE)
                 take = (peer_score > best_score) | (
-                    (ArithValue(peer_score) == ArithValue(best_score)) & (peer_id < best_id)
+                    (ArithValue(peer_score) == ArithValue(best_score))
+                    & (peer_id < best_id)
                 )
                 best_score = take.select(peer_score, best_score)
                 best_raw = take.select(peer_raw, best_raw)
@@ -147,9 +159,15 @@ class SigmoidTopkRouter:
         ids_out: torch.Tensor,
         weights_out: torch.Tensor,
     ) -> None:
-        if logits.shape != (self.samples, self.num_experts) or logits.dtype != torch.bfloat16:
+        if (
+            logits.shape != (self.samples, self.num_experts)
+            or logits.dtype != torch.bfloat16
+        ):
             raise ValueError("router logits must be contiguous BF16 [samples, experts]")
-        if correction_bias.shape != (self.num_experts,) or correction_bias.dtype != torch.bfloat16:
+        if (
+            correction_bias.shape != (self.num_experts,)
+            or correction_bias.dtype != torch.bfloat16
+        ):
             raise ValueError("router correction bias must be BF16 [experts]")
         if scores_out.shape != logits.shape or scores_out.dtype != torch.float32:
             raise ValueError("router scores output must be FP32 [samples, experts]")
@@ -157,7 +175,10 @@ class SigmoidTopkRouter:
             raise ValueError("router ids output must be int32 [samples, topk]")
         if weights_out.shape != ids_out.shape or weights_out.dtype != torch.float32:
             raise ValueError("router weights output must be FP32 [samples, topk]")
-        if any(not tensor.is_contiguous() for tensor in (logits, correction_bias, scores_out, ids_out, weights_out)):
+        if any(
+            not tensor.is_contiguous()
+            for tensor in (logits, correction_bias, scores_out, ids_out, weights_out)
+        ):
             raise ValueError("router inputs and outputs must be contiguous")
         self.launch(
             logits.data_ptr(),

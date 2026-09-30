@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import ast
+import re
 import subprocess
 import sys
 import types
@@ -23,22 +24,29 @@ from atom.model_ops.monokernel.dispatch import select_backend
 from atom.model_ops.monokernel.glm import layout as glm_layout
 
 
-def _kimi_mono_module():
+def _mono_module(name):
     import importlib
+    from unittest.mock import MagicMock
 
     from tests.aiter_stub import stubbed_aiter
 
     with stubbed_aiter():
-        return importlib.import_module("atom.models.kimi_k3_mono")
+        parallel_state = sys.modules["aiter.dist.parallel_state"]
+        for attr in (
+            "get_tensor_model_parallel_rank",
+            "get_tensor_model_parallel_world_size",
+            "get_tp_group",
+        ):
+            parallel_state.__dict__.setdefault(attr, MagicMock())
+        return importlib.import_module(name)
+
+
+def _kimi_mono_module():
+    return _mono_module("atom.models.kimi_k3_mono")
 
 
 def _glm_mono_module():
-    import importlib
-
-    from tests.aiter_stub import stubbed_aiter
-
-    with stubbed_aiter():
-        return importlib.import_module("atom.models.glm52_mono")
+    return _mono_module("atom.models.glm52_mono")
 
 
 def _preshuffle_linear_weight(weight):
@@ -162,7 +170,9 @@ def test_peer_buffer_allocation_failure_is_collective(monkeypatch):
     )
 
     group = object()
-    with pytest.raises(RuntimeError, match="allocation/export failed.*rank 0 allocation failed"):
+    with pytest.raises(
+        RuntimeError, match="allocation/export failed.*rank 0 allocation failed"
+    ):
         runtime.SymmetricPeerBuffer(256, rank=0, npes=2, group=group)
 
     assert len(gathers) == 1
@@ -218,7 +228,9 @@ def test_peer_buffer_remote_open_failure_is_collective(monkeypatch):
     monkeypatch.setattr(
         runtime.torch,
         "tensor",
-        lambda *_args, **_kwargs: pytest.fail("failed open must skip address publication"),
+        lambda *_args, **_kwargs: pytest.fail(
+            "failed open must skip address publication"
+        ),
     )
 
     group = object()
@@ -276,7 +288,9 @@ def test_scaled_mfma_uses_flydsl_v0341_operand_abi():
     for path in paths:
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            if not isinstance(node, ast.Call) or not isinstance(
+                node.func, ast.Attribute
+            ):
                 continue
             if node.func.attr != "gemm":
                 continue
@@ -353,7 +367,9 @@ def test_glm_kernel_indexes_int64_metadata_as_word_offsets():
         assert isinstance(offset, ast.BinOp) and isinstance(offset.op, ast.Mult)
         assert isinstance(offset.left, ast.Name) and offset.left.id == "s"
         assert isinstance(offset.right, ast.Constant) and offset.right.value == 2
-        dtype = next(keyword.value for keyword in load.keywords if keyword.arg == "dtype")
+        dtype = next(
+            keyword.value for keyword in load.keywords if keyword.arg == "dtype"
+        )
         assert isinstance(dtype, ast.Attribute)
         assert isinstance(dtype.value, ast.Name) and dtype.value.id == "T"
         assert dtype.attr == "i32"
@@ -472,12 +488,12 @@ def test_kimi_announces_backend_once_on_rank_zero(monkeypatch):
     monkeypatch.setattr(
         module,
         "prepare_kimi_k3_weights",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            validate_source=lambda *_: None
-        ),
+        lambda *_args, **_kwargs: SimpleNamespace(validate_source=lambda *_: None),
     )
     monkeypatch.setattr(module, "_KimiLayerOp", lambda *_args: object())
-    monkeypatch.setattr(module, "tp_uniform_local_validation", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        module, "tp_uniform_local_validation", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(module.logger, "info", lambda *args: messages.append(args))
     monkeypatch.setattr(module.torch.cuda, "is_current_stream_capturing", lambda: False)
 
@@ -495,7 +511,9 @@ def test_kimi_announces_backend_once_on_rank_zero(monkeypatch):
         return value
 
     layers = [
-        SimpleNamespace(layer_idx=layer_idx, is_linear_attn=True, block_sparse_moe=object())
+        SimpleNamespace(
+            layer_idx=layer_idx, is_linear_attn=True, block_sparse_moe=object()
+        )
         for layer_idx in (1, 2)
     ]
     rank_zero = runner()
@@ -519,6 +537,7 @@ def test_glm_announces_samples_once_on_rank_zero(monkeypatch):
 
     class FakeOwned:
         op = object()
+
         def close(self):
             pass
 
@@ -527,19 +546,27 @@ def test_glm_announces_samples_once_on_rank_zero(monkeypatch):
     monkeypatch.setitem(sys.modules, op_module.__name__, op_module)
     monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: rank[0])
     monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 8)
-    monkeypatch.setattr(module, "get_tp_group", lambda: SimpleNamespace(cpu_group=object()))
+    monkeypatch.setattr(
+        module, "get_tp_group", lambda: SimpleNamespace(cpu_group=object())
+    )
     monkeypatch.setattr(module, "_bf16_vector", lambda tensor, *_args: tensor)
     monkeypatch.setattr(module, "_layer_weights", lambda *_args: object())
     monkeypatch.setattr(module, "_GlmLayerOp", lambda *_args: FakeOwned())
-    monkeypatch.setattr(module, "tp_uniform_local_validation", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        module, "tp_uniform_local_validation", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(module.logger, "info", lambda *args: messages.append(args))
 
     def runner():
         value = object.__new__(module.Glm52MonoDecode)
-        value._lm = SimpleNamespace(model=SimpleNamespace(norm=SimpleNamespace(weight=object())))
+        value._lm = SimpleNamespace(
+            model=SimpleNamespace(norm=SimpleNamespace(weight=object()))
+        )
         value._atom_config = SimpleNamespace(
-            hf_config=SimpleNamespace(index_topk=2048), tensor_parallel_size=8,
-            kv_cache_dtype="bf16", speculative_config=None,
+            hf_config=SimpleNamespace(index_topk=2048),
+            tensor_parallel_size=8,
+            kv_cache_dtype="bf16",
+            speculative_config=None,
         )
         value._mode = "auto"
         value._required = False
@@ -586,17 +613,33 @@ def test_glm_c8_geometry_and_full_graph_ladder():
     assert tp4.n_experts + tp4.num_shared_experts == 257
     for batch in GLM5_GRAPH_BATCHES:
         samples = batch * 6
-        assert select_backend(
-            "glm52", "auto", samples=samples, tp_size=4, kv_cache_dtype="fp8",
-            mtp=True, query_length=6,
-        ) == "mono"
+        assert (
+            select_backend(
+                "glm52",
+                "auto",
+                samples=samples,
+                tp_size=4,
+                kv_cache_dtype="fp8",
+                mtp=True,
+                query_length=6,
+            )
+            == "mono"
+        )
         chunk = glm5_kernel_samples(samples, 6)
         assert chunk in (6, 12) and chunk % 6 == 0 and samples % chunk == 0
         samples = batch * 5
-        assert select_backend(
-            "glm52", "auto", samples=samples, tp_size=4, kv_cache_dtype="fp8",
-            mtp=True, query_length=5,
-        ) == "mono"
+        assert (
+            select_backend(
+                "glm52",
+                "auto",
+                samples=samples,
+                tp_size=4,
+                kv_cache_dtype="fp8",
+                mtp=True,
+                query_length=5,
+            )
+            == "mono"
+        )
         chunk = glm5_kernel_samples(samples, 5)
         assert chunk in (5, 10) and chunk % 5 == 0 and samples % chunk == 0
 
@@ -612,21 +655,29 @@ def test_glm_q6_sparse_rows_are_intra_request_causal():
             flat.extend(row)
             indptr.append(len(flat))
     for sample, row in enumerate(expected):
-        actual = glm_layout.sparse_cache_rows(flat, sample=sample, topk=2048, sparse_kv_indptr=indptr)
+        actual = glm_layout.sparse_cache_rows(
+            flat, sample=sample, topk=2048, sparse_kv_indptr=indptr
+        )
         assert actual == row
         request, token = divmod(sample, 6)
-        assert set(actual).isdisjoint(slots[request * 6 + token + 1 : (request + 1) * 6])
+        assert set(actual).isdisjoint(
+            slots[request * 6 + token + 1 : (request + 1) * 6]
+        )
 
 
 def test_glm_tp4_symmetric_and_split_schedule_contracts():
     cfg, samples = glm5_tp_config(4), 12
-    scratch, symmetric = glm_layout.layout(samples, cfg.local_heads, 4, 2048, inter=cfg.inter)
+    scratch, symmetric = glm_layout.layout(
+        samples, cfg.local_heads, 4, 2048, inter=cfg.inter
+    )
     part = 4 * samples * cfg.hidden * 8
     assert scratch["mid"] >= 0
     assert symmetric["_part_stride"] == part and symmetric["_bytes"] == 4 * part
-    stages = dict(glm_layout.stage_tasks(
-        samples, cfg.local_heads, 2048, expert_mxfp4=True, inter=cfg.inter
-    ))
+    stages = dict(
+        glm_layout.stage_tasks(
+            samples, cfg.local_heads, 2048, expert_mxfp4=True, inter=cfg.inter
+        )
+    )
     assert stages["split"] == samples * 2 * (2048 // 32)
     assert stages["ug"] >= samples * 9 * (cfg.inter // glm_layout.UG_TILE)
 
@@ -635,7 +686,9 @@ def test_glm_required_c8_decode_does_not_fallback():
     module = _glm_mono_module()
     runner = object.__new__(module.Glm52MonoDecode)
     runner._required = True
-    with pytest.raises(module.MonoUnsupported, match="required MonoKernel decode failed"):
+    with pytest.raises(
+        module.MonoUnsupported, match="required MonoKernel decode failed"
+    ):
         runner._unsupported("missing FP8 cache")
 
 
@@ -662,9 +715,18 @@ def test_glm_chunk12_covers_routing_expert_tiles_and_down_lds():
         for lane_group in range(2)
         for element in range(4)
     ] == list(range(16))
-    assert [glm_layout.split_score_column(wave, 0) for wave in range(8)] == list(range(8))
-    assert [glm_layout.fp8_kv_upper_pair_lane(lane) for lane in range(0, 16, 4)] == [2, 6, 10, 14]
-    assert [glm_layout.fp8_pe_upper_pair_lane(lane) for lane in range(0, 16, 2)] == list(range(1, 16, 2))
+    assert [glm_layout.split_score_column(wave, 0) for wave in range(8)] == list(
+        range(8)
+    )
+    assert [glm_layout.fp8_kv_upper_pair_lane(lane) for lane in range(0, 16, 4)] == [
+        2,
+        6,
+        10,
+        14,
+    ]
+    assert [
+        glm_layout.fp8_pe_upper_pair_lane(lane) for lane in range(0, 16, 2)
+    ] == list(range(1, 16, 2))
     assert glm_layout.down_x_words(12, 512, True) == 27_648
 
 
@@ -731,12 +793,15 @@ def test_glm_padded_rows_use_safe_physical_row_without_cache_store():
             "safe_row": 0,
             "write_cache": False,
         }
-        assert glm_layout.sparse_cache_rows(
-            physical,
-            sample=sample,
-            topk=4,
-            sparse_kv_indptr=indptr,
-        ) == []
+        assert (
+            glm_layout.sparse_cache_rows(
+                physical,
+                sample=sample,
+                topk=4,
+                sparse_kv_indptr=indptr,
+            )
+            == []
+        )
 
 
 def test_glm_full_and_shared_layers_use_one_sparse_buffer():
@@ -977,31 +1042,52 @@ def test_glm_c8_full_graph_padding_dispatches_q6(monkeypatch):
     runner._enabled, runner._mode, runner._required = True, "auto", True
     runner._shard = glm5_tp_config(4)
     runner._atom_config = SimpleNamespace(
-        tensor_parallel_size=4, kv_cache_dtype="fp8",
+        tensor_parallel_size=4,
+        kv_cache_dtype="fp8",
         speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=5),
-        enable_dp_attention=False, decode_context_parallel_size=1,
+        enable_dp_attention=False,
+        decode_context_parallel_size=1,
     )
-    runner._lm = SimpleNamespace(model=SimpleNamespace(aux_hidden_state_layers=[], layers=[]))
+    runner._lm = SimpleNamespace(
+        model=SimpleNamespace(aux_hidden_state_layers=[], layers=[])
+    )
     runner._mono_layers = lambda: []
     seen = []
-    runner._prepare = lambda rows, query_length: seen.append((rows, query_length)) or True
+    runner._prepare = (
+        lambda rows, query_length: seen.append((rows, query_length)) or True
+    )
     metadata = SimpleNamespace(
         max_seqlen_q=6,
-        slot_mapping=torch.cat((
-            torch.arange(active, dtype=torch.int64),
-            torch.full((samples - active,), -1, dtype=torch.int64),
-        )),
-        sparse_kv_indptr=torch.cat((
-            torch.arange(active + 1, dtype=torch.int32),
-            torch.full((samples - active,), active, dtype=torch.int32),
-        )),
+        slot_mapping=torch.cat(
+            (
+                torch.arange(active, dtype=torch.int64),
+                torch.full((samples - active,), -1, dtype=torch.int64),
+            )
+        ),
+        sparse_kv_indptr=torch.cat(
+            (
+                torch.arange(active + 1, dtype=torch.int32),
+                torch.full((samples - active,), active, dtype=torch.int32),
+            )
+        ),
     )
     context = SimpleNamespace(is_prefill=False, scheduled_bs=8, running_tokens=samples)
-    monkeypatch.setattr(module, "get_forward_context", lambda: SimpleNamespace(
-        context=context, attn_metadata=metadata, ubatch_slices=None, kv_cache_data={}
-    ))
+    monkeypatch.setattr(
+        module,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            context=context,
+            attn_metadata=metadata,
+            ubatch_slices=None,
+            kv_cache_data={},
+        ),
+    )
     monkeypatch.setattr(module, "is_plugin_mode", lambda: False)
-    monkeypatch.setattr(module, "_shared_sparse_buffer", lambda _layers: torch.arange(samples, dtype=torch.int32))
+    monkeypatch.setattr(
+        module,
+        "_shared_sparse_buffer",
+        lambda _layers: torch.arange(samples, dtype=torch.int32),
+    )
     assert runner.supports(
         torch.arange(samples), torch.arange(samples, dtype=torch.int64), None, None
     )
@@ -1009,7 +1095,14 @@ def test_glm_c8_full_graph_padding_dispatches_q6(monkeypatch):
 
 
 def test_glm_fp8_fused_576_cache_has_explicit_device_io():
-    kernel = (Path(__file__).parents[1] / "atom" / "model_ops" / "monokernel" / "glm" / "kernel.py").read_text()
+    kernel = (
+        Path(__file__).parents[1]
+        / "atom"
+        / "model_ops"
+        / "monokernel"
+        / "glm"
+        / "kernel.py"
+    ).read_text()
     assert 'cache_fp8 = kv_cache_dtype == "fp8"' in kernel
     assert "slot * (QK_DIM // 4)" in kernel
     assert "_fp8_to_bf16x8(raw[0], raw[1])" in kernel
@@ -1086,8 +1179,13 @@ def test_kimi_prepared_weights_are_shared_across_sample_runners(monkeypatch):
 
     module = _kimi_mono_module()
     static_names = (
-        "w_kda_in_packed", "w_kda_o_packed", "w_router",
-        "w_ug", "s_ug", "w_dn", "s_dn",
+        "w_kda_in_packed",
+        "w_kda_o_packed",
+        "w_router",
+        "w_ug",
+        "s_ug",
+        "w_dn",
+        "s_dn",
     )
     prepared = SimpleNamespace(
         **{name: torch.zeros(1, dtype=torch.uint8) for name in static_names},
@@ -1100,7 +1198,9 @@ def test_kimi_prepared_weights_are_shared_across_sample_runners(monkeypatch):
         },
     )
     validations = []
-    prepared.validate_source = lambda weights, backend=None: validations.append((weights, backend))
+    prepared.validate_source = lambda weights, backend=None: validations.append(
+        (weights, backend)
+    )
     weights = module.LayerWeights(1, {"source": torch.zeros(1)})
     preparations = []
 
@@ -1152,16 +1252,18 @@ def test_kimi_prepared_weights_are_shared_across_sample_runners(monkeypatch):
     monkeypatch.setattr(module, "_KimiLayerOp", Owned)
     monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 8)
-    monkeypatch.setattr(module, "get_tp_group", lambda: SimpleNamespace(cpu_group=object(), device_group=object()))
-    monkeypatch.setattr(module, "tp_uniform_local_validation", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        module,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=object(), device_group=object()),
+    )
+    monkeypatch.setattr(
+        module, "tp_uniform_local_validation", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(module.torch.cuda, "is_current_stream_capturing", lambda: False)
 
-    op4 = runner._op(
-        layer, KimiDecodeGeometry(4, 1, 3, "fp16", False), "kda", 8
-    )
-    op8 = runner._op(
-        layer, KimiDecodeGeometry(8, 1, 3, "fp16", False), "kda", 8
-    )
+    op4 = runner._op(layer, KimiDecodeGeometry(4, 1, 3, "fp16", False), "kda", 8)
+    op8 = runner._op(layer, KimiDecodeGeometry(8, 1, 3, "fp16", False), "kda", 8)
 
     assert preparations == [(weights, "mono", False)]
     assert validations == []
@@ -1274,13 +1376,17 @@ def test_kimi_inputs_embeds_are_eligible(monkeypatch, samples):
     )
     input_ids = torch.arange(samples)
     positions = torch.arange(samples)
-    inputs_embeds = torch.zeros(samples, module.KIMI_K3_CONFIG.hidden, dtype=torch.bfloat16)
+    inputs_embeds = torch.zeros(
+        samples, module.KIMI_K3_CONFIG.hidden, dtype=torch.bfloat16
+    )
 
     assert runner.supports(input_ids, positions, None, inputs_embeds)
     assert not runner.supports(input_ids, positions, object(), inputs_embeds)
     assert not runner.supports(input_ids, positions, None, inputs_embeds.float())
     assert not runner.supports(input_ids, positions, None, inputs_embeds[:, :-1])
-    assert not runner.supports(input_ids, positions, None, inputs_embeds.T.contiguous().T)
+    assert not runner.supports(
+        input_ids, positions, None, inputs_embeds.T.contiguous().T
+    )
 
 
 @pytest.mark.parametrize(("samples", "actual_tokens"), ((4, 3), (8, 5)))
@@ -1367,7 +1473,9 @@ def test_kimi_padded_forward_propagates_negative_slots_without_state_mutation(
         "layer_1": SimpleNamespace(k_cache=conv_state, v_cache=recurrent_state)
     }
     monkeypatch.setattr(module, "get_forward_context", lambda: context)
-    inputs_embeds = torch.zeros(samples, module.KIMI_K3_CONFIG.hidden, dtype=torch.bfloat16)
+    inputs_embeds = torch.zeros(
+        samples, module.KIMI_K3_CONFIG.hidden, dtype=torch.bfloat16
+    )
 
     runner.forward(torch.arange(samples), torch.arange(samples), inputs_embeds)
 
@@ -1383,7 +1491,10 @@ def test_kimi_negative_slot_device_guards_cover_staged_and_mono_paths():
     recurrence = (root / "kda_recurrence.py").read_text()
     mono = (root / "kernel.py").read_text()
 
-    assert "if slot >= 0:\n            decode()\n        else:\n            zero_output()" in recurrence
+    assert (
+        "if slot >= 0:\n            decode()\n        else:\n            zero_output()"
+        in recurrence
+    )
     assert "if (input_slot >= 0) & (output_slot >= 0):" in mono
     assert mono.count("valid_state = (input_slot >= 0) & (output_slot >= 0)") >= 3
 
@@ -1393,7 +1504,9 @@ def test_kimi_forward_uses_inputs_embeds(monkeypatch):
 
     module = _kimi_mono_module()
     samples = 4
-    inputs_embeds = torch.zeros(samples, module.KIMI_K3_CONFIG.hidden, dtype=torch.bfloat16)
+    inputs_embeds = torch.zeros(
+        samples, module.KIMI_K3_CONFIG.hidden, dtype=torch.bfloat16
+    )
 
     def unexpected_embedding(_input_ids):
         raise AssertionError("inputs_embeds must bypass token embedding")
@@ -1448,7 +1561,9 @@ def test_kimi_kda_a_log_is_fp32(monkeypatch):
     moe = SimpleNamespace(
         experts=experts,
         routed_expert_up_proj=SimpleNamespace(
-            weight=torch.zeros(module.KIMI_K3_CONFIG.hidden // 8, 1, dtype=torch.bfloat16)
+            weight=torch.zeros(
+                module.KIMI_K3_CONFIG.hidden // 8, 1, dtype=torch.bfloat16
+            )
         ),
         routed_expert_down_proj=SimpleNamespace(weight=tensor),
         routed_expert_norm=SimpleNamespace(weight=tensor),
@@ -1471,7 +1586,9 @@ def test_kimi_kda_a_log_is_fp32(monkeypatch):
         mlp_res_proj=SimpleNamespace(weight=tensor),
     )
     monkeypatch.setattr(module, "linear_bf16", lambda *_args, **_kwargs: tensor)
-    monkeypatch.setattr(module, "atom_mxfp4_storage_view", lambda *_args, **_kwargs: tensor)
+    monkeypatch.setattr(
+        module, "atom_mxfp4_storage_view", lambda *_args, **_kwargs: tensor
+    )
 
     weights = module._layer_weights(layer, rank=0, npes=8)
 
@@ -1601,7 +1718,6 @@ def test_atom_expert_storage_matches_consumer_abi():
         prepare_aiter_mxfp4_expert_storage,
         prepare_mxfp4_expert_storage,
     )
-    from atom.model_ops.monokernel import packing
 
     config = SimpleNamespace(name="test", n_experts=2, inter=128, routed_hidden=128)
     tensors = {
@@ -1640,7 +1756,10 @@ def test_glm_fused_shared_expert_storage_is_canonicalized():
     import torch
 
     from atom.model_ops.monokernel.config import Mxfp4ScaleLayout, Mxfp4WeightLayout
-    from atom.model_ops.monokernel.weights import LayerWeights, prepare_mxfp4_expert_storage
+    from atom.model_ops.monokernel.weights import (
+        LayerWeights,
+        prepare_mxfp4_expert_storage,
+    )
 
     config = SimpleNamespace(
         name="glm-test",
@@ -1689,13 +1808,27 @@ def test_kimi_preparation_is_backend_specific(monkeypatch):
     projection = cfg.local_heads * cfg.v_dim
     fused_width = 4 * projection + cfg.local_heads + cfg.v_dim
     tensors = {
-        "w_kda_in": torch.empty(fused_width, cfg.hidden, dtype=torch.bfloat16, device="meta"),
-        "w_kda_o": torch.empty(cfg.hidden, projection, dtype=torch.bfloat16, device="meta"),
-        "w_r": torch.empty(cfg.n_experts, cfg.hidden, dtype=torch.bfloat16, device="meta"),
-        "w_latent_down": torch.empty(cfg.routed_hidden, cfg.hidden, dtype=torch.bfloat16, device="meta"),
-        "w_shared_ug": torch.empty(2 * cfg.shared_inter, cfg.hidden, dtype=torch.bfloat16, device="meta"),
-        "w_shared_dn": torch.empty(cfg.hidden, cfg.shared_inter, dtype=torch.bfloat16, device="meta"),
-        "w_latent_up": torch.empty(cfg.hidden // 8, cfg.routed_hidden, dtype=torch.bfloat16, device="meta"),
+        "w_kda_in": torch.empty(
+            fused_width, cfg.hidden, dtype=torch.bfloat16, device="meta"
+        ),
+        "w_kda_o": torch.empty(
+            cfg.hidden, projection, dtype=torch.bfloat16, device="meta"
+        ),
+        "w_r": torch.empty(
+            cfg.n_experts, cfg.hidden, dtype=torch.bfloat16, device="meta"
+        ),
+        "w_latent_down": torch.empty(
+            cfg.routed_hidden, cfg.hidden, dtype=torch.bfloat16, device="meta"
+        ),
+        "w_shared_ug": torch.empty(
+            2 * cfg.shared_inter, cfg.hidden, dtype=torch.bfloat16, device="meta"
+        ),
+        "w_shared_dn": torch.empty(
+            cfg.hidden, cfg.shared_inter, dtype=torch.bfloat16, device="meta"
+        ),
+        "w_latent_up": torch.empty(
+            cfg.hidden // 8, cfg.routed_hidden, dtype=torch.bfloat16, device="meta"
+        ),
         "w_ug": torch.empty(1, device="meta"),
         "s_ug": torch.empty(1, device="meta"),
         "w_dn": torch.empty(1, device="meta"),
@@ -1718,8 +1851,16 @@ def test_kimi_preparation_is_backend_specific(monkeypatch):
             torch.zeros(1, dtype=torch.uint8),
         ),
     )
-    monkeypatch.setattr(prepared_module, "pack_mxfp8_weight", lambda _tensor: torch.zeros(1, dtype=torch.uint8))
-    monkeypatch.setattr(prepared_module, "pack_mxfp8_scale", lambda _tensor: torch.zeros(1, dtype=torch.uint8))
+    monkeypatch.setattr(
+        prepared_module,
+        "pack_mxfp8_weight",
+        lambda _tensor: torch.zeros(1, dtype=torch.uint8),
+    )
+    monkeypatch.setattr(
+        prepared_module,
+        "pack_mxfp8_scale",
+        lambda _tensor: torch.zeros(1, dtype=torch.uint8),
+    )
     monkeypatch.setattr(
         prepared_module,
         "prepare_aiter_mxfp4_expert_storage",
@@ -1741,9 +1882,7 @@ def test_kimi_preparation_is_backend_specific(monkeypatch):
     assert not hasattr(tail, "w_kda_in_packed")
 
     packed_shapes.clear()
-    staged_mtp = prepared_module.prepare_kimi_k3_weights(
-        weights, "staged", mtp=True
-    )
+    staged_mtp = prepared_module.prepare_kimi_k3_weights(weights, "staged", mtp=True)
     assert packed_shapes == [
         (prepared_module.MONOKERNEL_INPUT_ROWS, cfg.hidden),
         (cfg.hidden, projection),
@@ -1765,6 +1904,7 @@ def test_kimi_preparation_is_backend_specific(monkeypatch):
     with pytest.raises(ValueError, match="backend"):
         staged.validate_source(weights, "mono")
 
+
 def test_kimi_geometry_is_grouped_not_concurrency_specific():
     geometry = KimiDecodeGeometry(
         groups=16,
@@ -1784,7 +1924,9 @@ def test_kimi_recipe_geometry_is_interactive_tp(monkeypatch):
     monkeypatch.setattr(module, "envs", SimpleNamespace(ATOM_ENABLE_REPLAYSSM=False))
     geometry = module.resolve_kimi_decode_geometry(
         SimpleNamespace(
-            speculative_config=SimpleNamespace(method="dspark", num_speculative_tokens=7),
+            speculative_config=SimpleNamespace(
+                method="dspark", num_speculative_tokens=7
+            ),
             decode_context_parallel_size=1,
         )
     )
@@ -1859,9 +2001,7 @@ def test_kimi_state_chains_select_resume_slots_on_device():
     output = torch.empty(2, 9, dtype=torch.int32)
     resume_columns = torch.empty(2, dtype=torch.int64)
 
-    result = module.build_kimi_state_chains(
-        output, resume_columns, slots, accepted
-    )
+    result = module.build_kimi_state_chains(output, resume_columns, slots, accepted)
 
     assert result is output
     assert output.tolist() == [
@@ -2116,9 +2256,9 @@ def test_kimi_replayssm_uses_baseline_kda_and_fused_tail(monkeypatch):
         num_spec_decodes=groups,
         num_actual_tokens=samples,
         replayssm=True,
-        spec_state_indices_tensor=torch.arange(
-            samples, dtype=torch.int32
-        ).view(groups, q),
+        spec_state_indices_tensor=torch.arange(samples, dtype=torch.int32).view(
+            groups, q
+        ),
         non_spec_state_indices_tensor=None,
         num_accepted_tokens=torch.ones(groups, dtype=torch.int32),
     )
@@ -2272,9 +2412,7 @@ def test_kimi_q1_chunks_arbitrary_graph_batch(monkeypatch):
     runner = object.__new__(module.KimiMonoDecode)
     runner._lm = SimpleNamespace(model=model)
     runner._geometry_template = KimiDecodeGeometry(1, 1, 3, "fp16", False)
-    runner._op = lambda _layer, _geometry, kind, width: SimpleNamespace(
-        op=Op(width)
-    )
+    runner._op = lambda _layer, _geometry, kind, width: SimpleNamespace(op=Op(width))
     runner._output = lambda *_args: torch.empty_like(inputs)
     context = SimpleNamespace(
         context=SimpleNamespace(is_prefill=False),
@@ -2319,26 +2457,34 @@ def test_kimi_fold_pending_values():
     first = torch.ones(2, 3)
     second = torch.full((2, 3), 2.0)
     third = torch.full((2, 3), 3.0)
-    assert torch.equal(module.fold_kimi_pending(first, second, third), first + second + third)
+    assert torch.equal(
+        module.fold_kimi_pending(first, second, third), first + second + third
+    )
     assert torch.equal(module.fold_kimi_pending(None, first, second), first + second)
 
 
 def test_kimi_attn_res_adds_delta_on_gfx950():
     import torch
 
-    if not torch.cuda.is_available() or "gfx950" not in torch.cuda.get_device_properties(0).gcnArchName:
+    if (
+        not torch.cuda.is_available()
+        or "gfx950" not in torch.cuda.get_device_properties(0).gcnArchName
+    ):
         pytest.skip("requires gfx950")
 
     from atom.model_ops.monokernel.k3.attn_res import KimiK3AttnRes
 
     samples, hidden = 1, 7168
     generator = torch.Generator(device="cuda").manual_seed(0)
-    make = lambda *shape: torch.randn(
-        *shape,
-        generator=generator,
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
+
+    def make(*shape):
+        return torch.randn(
+            *shape,
+            generator=generator,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+
     prefix = make(samples, hidden)
     delta = make(samples, hidden)
     blocks = make(samples, 1, hidden)
@@ -2397,13 +2543,15 @@ def test_glm_kernel_uses_atom_bf16_rope_cache_abi():
     ).read_text()
     assert "ld_f32(_rsrc(rope_cos)" not in kernel
     assert "ld_f32(_rsrc(rope_sin)" not in kernel
-    assert kernel.count("ld_bf16(_rsrc(rope_cos)") == 3
-    assert kernel.count("ld_bf16(_rsrc(rope_sin)") == 3
+    assert len(re.findall(r"ld_bf16\(\s*_rsrc\(rope_cos\)", kernel)) == 3
+    assert len(re.findall(r"ld_bf16\(\s*_rsrc\(rope_sin\)", kernel)) == 3
 
 
 def test_glm_native_boundary_reduces_deferred_tp_partial():
     adapter = (
         Path(__file__).parents[1] / "atom" / "models" / "glm52_mono.py"
     ).read_text()
-    assert "if residual is not None and layer.input_layernorm.fused_allreduce:" in adapter
+    assert (
+        "if residual is not None and layer.input_layernorm.fused_allreduce:" in adapter
+    )
     assert "get_tp_group().all_reduce(hidden, ca_fp8_quant=False)" in adapter

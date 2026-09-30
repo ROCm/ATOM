@@ -41,10 +41,14 @@ class KimiK3MlaAttention:
         kv_cache_layout: KvCacheLayout | str = KvCacheLayout.SPLIT,
     ) -> None:
         if weights.config != KIMI_K3_CONFIG:
-            raise ValueError(f"KimiK3MlaAttention requires Kimi-K3 weights, got {weights.config.name!r}")
+            raise ValueError(
+                f"KimiK3MlaAttention requires Kimi-K3 weights, got {weights.config.name!r}"
+            )
         validate_shard(samples, weights.heads, rank, npes, topk, KIMI_K3_CONFIG)
         if not 1 <= launches_per_step <= MAX_LAYERS_PER_STEP:
-            raise ValueError(f"launches_per_step must be in [1, {MAX_LAYERS_PER_STEP}], got {launches_per_step}")
+            raise ValueError(
+                f"launches_per_step must be in [1, {MAX_LAYERS_PER_STEP}], got {launches_per_step}"
+            )
 
         self.W = weights
         self.S = samples
@@ -71,8 +75,12 @@ class KimiK3MlaAttention:
             dedicated_input_norm=dedicated_input_norm,
         )
         device = torch.device("cuda", torch.cuda.current_device())
-        self.scratch = torch.zeros(self.scratch_layout["_bytes"], dtype=torch.uint8, device=device)
-        self.peer_buffer = SymmetricPeerBuffer(symmetric_layout["_bytes"], rank=rank, npes=npes, group=group)
+        self.scratch = torch.zeros(
+            self.scratch_layout["_bytes"], dtype=torch.uint8, device=device
+        )
+        self.peer_buffer = SymmetricPeerBuffer(
+            symmetric_layout["_bytes"], rank=rank, npes=npes, group=group
+        )
         self.launch = build_kimi_k3_mla_attention(
             samples,
             weights.heads,
@@ -101,17 +109,28 @@ class KimiK3MlaAttention:
         """Launch one Kimi-K3 MLA attention invocation."""
 
         if not 0 <= layer < self.launches_per_step:
-            raise ValueError(f"layer must be in [0, {self.launches_per_step}), got {layer}")
+            raise ValueError(
+                f"layer must be in [0, {self.launches_per_step}), got {layer}"
+            )
         if self.kv_cache_layout is KvCacheLayout.ATOM:
             cache_width = KIMI_K3_CONFIG.kv_lora + KIMI_K3_CONFIG.pe_dim
             if kv_cache.ndim != 2 or kv_cache.shape[1] != cache_width:
-                raise ValueError(f"ATOM KV cache must have shape [tokens, {cache_width}], got {tuple(kv_cache.shape)}")
+                raise ValueError(
+                    f"ATOM KV cache must have shape [tokens, {cache_width}], got {tuple(kv_cache.shape)}"
+                )
             if kv_cache.data_ptr() != pe_cache.data_ptr():
-                raise ValueError("ATOM KV cache layout requires the same fused tensor for kv_cache and pe_cache")
+                raise ValueError(
+                    "ATOM KV cache layout requires the same fused tensor for kv_cache and pe_cache"
+                )
 
         tensors = dict(self.W.t, **self.packed)
         if x_out is None:
-            x_out = torch.empty(self.S, KIMI_K3_CONFIG.hidden, dtype=torch.bfloat16, device=hidden_states.device)
+            x_out = torch.empty(
+                self.S,
+                KIMI_K3_CONFIG.hidden,
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
+            )
         pointer = lambda value: value.data_ptr()  # noqa: E731
         self.launch(
             pointer(hidden_states),

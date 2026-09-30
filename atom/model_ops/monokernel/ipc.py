@@ -29,12 +29,19 @@ class HipRuntime:
         """Return the configured HIP ctypes library, loading it on first use."""
 
         if self._library is None:
-            sonames = ("libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6", "libamdhip64.so.5")
+            sonames = (
+                "libamdhip64.so",
+                "libamdhip64.so.7",
+                "libamdhip64.so.6",
+                "libamdhip64.so.5",
+            )
             candidates = []
             rocm_path = os.environ.get("ROCM_PATH")
             if rocm_path:
                 candidates.extend(
-                    os.path.join(rocm_path, lib_dir, name) for lib_dir in ("lib", "lib64") for name in sonames
+                    os.path.join(rocm_path, lib_dir, name)
+                    for lib_dir in ("lib", "lib64")
+                    for name in sonames
                 )
             candidates.extend(sonames)
             for name in candidates:
@@ -52,17 +59,32 @@ class HipRuntime:
         if self._configured_library is library:
             return
         library.hipIpcGetMemHandle.restype = ctypes.c_int
-        library.hipIpcGetMemHandle.argtypes = [ctypes.POINTER(_HipIpcMemHandle), ctypes.c_void_p]
+        library.hipIpcGetMemHandle.argtypes = [
+            ctypes.POINTER(_HipIpcMemHandle),
+            ctypes.c_void_p,
+        ]
         library.hipIpcOpenMemHandle.restype = ctypes.c_int
-        library.hipIpcOpenMemHandle.argtypes = [ctypes.POINTER(ctypes.c_void_p), _HipIpcMemHandle, ctypes.c_uint]
+        library.hipIpcOpenMemHandle.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            _HipIpcMemHandle,
+            ctypes.c_uint,
+        ]
         library.hipIpcCloseMemHandle.restype = ctypes.c_int
         library.hipIpcCloseMemHandle.argtypes = [ctypes.c_void_p]
         library.hipGetErrorString.restype = ctypes.c_char_p
         library.hipGetErrorString.argtypes = [ctypes.c_int]
         library.hipPointerGetAttribute.restype = ctypes.c_int
-        library.hipPointerGetAttribute.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        library.hipPointerGetAttribute.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
         library.hipExtMallocWithFlags.restype = ctypes.c_int
-        library.hipExtMallocWithFlags.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_uint]
+        library.hipExtMallocWithFlags.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_size_t,
+            ctypes.c_uint,
+        ]
         library.hipFree.restype = ctypes.c_int
         library.hipFree.argtypes = [ctypes.c_void_p]
         library.hipMemset.restype = ctypes.c_int
@@ -76,7 +98,11 @@ class HipRuntime:
             return
         try:
             value = self.library().hipGetErrorString(int(error))
-            message = value.decode("utf-8", errors="replace") if value else f"hipError({error})"
+            message = (
+                value.decode("utf-8", errors="replace")
+                if value
+                else f"hipError({error})"
+            )
         except Exception:
             message = f"hipError({error})"
         raise RuntimeError(f"{operation} failed: {message}")
@@ -92,7 +118,9 @@ class HipRuntime:
         )
         self.check(error, operation="hipPointerGetAttribute(RANGE_START_ADDR)")
         if base.value is None:
-            raise RuntimeError("hipPointerGetAttribute(RANGE_START_ADDR) returned a null allocation base")
+            raise RuntimeError(
+                "hipPointerGetAttribute(RANGE_START_ADDR) returned a null allocation base"
+            )
         return int(base.value)
 
     def get_ipc_handle(self, allocation_base: int) -> bytes:
@@ -110,7 +138,9 @@ class HipRuntime:
         """Map a peer allocation and return its local base pointer."""
 
         if len(handle_bytes) != HIP_IPC_HANDLE_BYTES:
-            raise ValueError(f"expected a {HIP_IPC_HANDLE_BYTES}-byte HIP IPC handle, got {len(handle_bytes)} bytes")
+            raise ValueError(
+                f"expected a {HIP_IPC_HANDLE_BYTES}-byte HIP IPC handle, got {len(handle_bytes)} bytes"
+            )
         handle = _HipIpcMemHandle()
         ctypes.memmove(ctypes.byref(handle), bytes(handle_bytes), HIP_IPC_HANDLE_BYTES)
         mapped_base = ctypes.c_void_p()
@@ -149,7 +179,9 @@ class HipRuntime:
                 self.check(error, operation="hipMemset")
             except RuntimeError as exc:
                 if int(cleanup_error) != 0:
-                    raise RuntimeError(f"{exc}; cleanup hipFree also failed with hipError({cleanup_error})") from exc
+                    raise RuntimeError(
+                        f"{exc}; cleanup hipFree also failed with hipError({cleanup_error})"
+                    ) from exc
                 raise
         self.check(error, operation="hipMemset")
         return int(buffer.value)

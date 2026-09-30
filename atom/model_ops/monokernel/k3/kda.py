@@ -88,17 +88,24 @@ class KimiK3KdaAttention:
         if config != KIMI_K3_CONFIG:
             raise ValueError("KimiK3KdaAttention requires Kimi-K3 weights")
         if weights.heads != config.local_heads:
-            raise ValueError(f"KDA requires {config.local_heads} local heads, got {weights.heads}")
+            raise ValueError(
+                f"KDA requires {config.local_heads} local heads, got {weights.heads}"
+            )
         if npes != _TP_SIZE:
             raise ValueError(f"Kimi-K3 KDA currently requires TP8, got TP{npes}")
         if weights.rank != rank or weights.npes != npes:
             raise ValueError(
-                f"weight shard is rank {weights.rank}/TP{weights.npes}, " f"requested rank {rank}/TP{npes}"
+                f"weight shard is rank {weights.rank}/TP{weights.npes}, "
+                f"requested rank {rank}/TP{npes}"
             )
         if reduce_backend not in {"symmetric", "nccl"}:
-            raise ValueError(f"unsupported reduce backend {reduce_backend!r}; expected 'symmetric' or 'nccl'")
+            raise ValueError(
+                f"unsupported reduce backend {reduce_backend!r}; expected 'symmetric' or 'nccl'"
+            )
         if not isinstance(conv_state_layout, ConvStateLayout):
-            raise TypeError(f"conv_state_layout must be ConvStateLayout, got {conv_state_layout!r}")
+            raise TypeError(
+                f"conv_state_layout must be ConvStateLayout, got {conv_state_layout!r}"
+            )
         if conv_state_rows < 3 or (mtp and conv_state_rows < samples + 2):
             raise ValueError(
                 f"conv_state_rows={conv_state_rows} cannot hold q={samples} rollback history"
@@ -106,7 +113,10 @@ class KimiK3KdaAttention:
         if state_dtype not in {torch.float16, torch.float32}:
             raise ValueError(f"state_dtype must be FP16 or FP32, got {state_dtype}")
         if not 1 <= launches_per_step <= MAX_LAYERS_PER_STEP:
-            raise ValueError(f"launches_per_step must be in [1, {MAX_LAYERS_PER_STEP}], " f"got {launches_per_step}")
+            raise ValueError(
+                f"launches_per_step must be in [1, {MAX_LAYERS_PER_STEP}], "
+                f"got {launches_per_step}"
+            )
 
         self.W = weights
         self.t = weights.t
@@ -154,7 +164,9 @@ class KimiK3KdaAttention:
                 raise ValueError(f"{name} must have shape {list(shape)}")
         bf16_weights = expected.difference({"kda_a_log"})
         if any(self.t[name].dtype != torch.bfloat16 for name in bf16_weights):
-            raise ValueError("KDA projection, convolution, and norm weights must be BF16")
+            raise ValueError(
+                "KDA projection, convolution, and norm weights must be BF16"
+            )
         if self.t["kda_a_log"].dtype != torch.float32:
             raise ValueError("kda_a_log must be FP32")
         if any(not self.t[name].is_contiguous() for name in expected):
@@ -169,10 +181,14 @@ class KimiK3KdaAttention:
             device=device,
         )
         self.fused_input = self.fused_input_storage
-        self.partial = torch.empty(samples, config.hidden, dtype=torch.bfloat16, device=device)
+        self.partial = torch.empty(
+            samples, config.hidden, dtype=torch.bfloat16, device=device
+        )
         self.output = torch.empty_like(self.partial)
         self.step = torch.zeros(1, dtype=torch.int32, device=device)
-        self.normed = torch.empty(samples, config.local_heads, _HEAD_DIM, dtype=torch.bfloat16, device=device)
+        self.normed = torch.empty(
+            samples, config.local_heads, _HEAD_DIM, dtype=torch.bfloat16, device=device
+        )
         self.core = KimiK3KdaRecurrence(
             samples,
             conv_state_layout,
@@ -197,8 +213,12 @@ class KimiK3KdaAttention:
         self.block_write_idx = -1
         self.fuse_moe = False
         self.moe_packed: dict[str, torch.Tensor] = {}
-        self.w_kda_in_packed = None if prepared_weights is None else prepared_weights.w_kda_in_packed
-        self.w_kda_o_packed = None if prepared_weights is None else prepared_weights.w_kda_o_packed
+        self.w_kda_in_packed = (
+            None if prepared_weights is None else prepared_weights.w_kda_in_packed
+        )
+        self.w_kda_o_packed = (
+            None if prepared_weights is None else prepared_weights.w_kda_o_packed
+        )
         if prepared_backend == "mono" and (
             self.w_kda_in_packed is None or self.w_kda_o_packed is None
         ):
@@ -232,7 +252,9 @@ class KimiK3KdaAttention:
         elif mtp:
             raise ValueError("Kimi-K3 MTP requires the single-launch attention path")
         if reduce_group is None:
-            raise ValueError("Kimi-K3 KDA attention requires a GPU-capable TP reduce_group")
+            raise ValueError(
+                "Kimi-K3 KDA attention requires a GPU-capable TP reduce_group"
+            )
 
     def configure_monokernel(self, layer_idx: int, *, fuse_moe: bool = False) -> None:
         """Specialize the single launch for both AttnRes mixers and latent-MoE."""
@@ -246,7 +268,9 @@ class KimiK3KdaAttention:
         self.fuse_moe = fuse_moe
         device = self.t["w_kda_in"].device
         if self.w_kda_in_packed is None:
-            fused_width = 4 * self.local_projection + self.config.local_heads + _HEAD_DIM
+            fused_width = (
+                4 * self.local_projection + self.config.local_heads + _HEAD_DIM
+            )
             monokernel_input = torch.zeros(
                 MONOKERNEL_INPUT_ROWS,
                 self.config.hidden,
@@ -340,7 +364,9 @@ class KimiK3KdaAttention:
         """Run independent decode samples or one ordered MTP token group."""
 
         if not 0 <= layer < self.launches_per_step:
-            raise ValueError(f"layer must be in [0, {self.launches_per_step}), got {layer}")
+            raise ValueError(
+                f"layer must be in [0, {self.launches_per_step}), got {layer}"
+            )
         expected_indices = (self.S + 1,) if self.mtp else (self.S,)
         if (
             state_indices.shape != expected_indices
@@ -348,17 +374,25 @@ class KimiK3KdaAttention:
             or not state_indices.is_contiguous()
         ):
             mode = "MTP snapshot chain" if self.mtp else "decode slots"
-            raise ValueError(f"state_indices must be contiguous int32 {list(expected_indices)} for {mode}")
+            raise ValueError(
+                f"state_indices must be contiguous int32 {list(expected_indices)} for {mode}"
+            )
         expected_hidden = (self.S, self.config.hidden)
         if (
             hidden_states.shape != expected_hidden
             or hidden_states.dtype != torch.bfloat16
             or not hidden_states.is_contiguous()
         ):
-            raise ValueError(f"hidden_states must be contiguous BF16 {list(expected_hidden)}")
+            raise ValueError(
+                f"hidden_states must be contiguous BF16 {list(expected_hidden)}"
+            )
 
         target = self.output if x_out is None else x_out
-        if target.shape != expected_hidden or target.dtype != torch.bfloat16 or not target.is_contiguous():
+        if (
+            target.shape != expected_hidden
+            or target.dtype != torch.bfloat16
+            or not target.is_contiguous()
+        ):
             raise ValueError(f"x_out must be contiguous BF16 {list(expected_hidden)}")
 
         expected_conv_state = conv_state_shape(
@@ -377,7 +411,10 @@ class KimiK3KdaAttention:
                 f"for {self.conv_state_layout.value} layout"
             )
 
-        if recurrent_state.dtype is not self.state_dtype or not recurrent_state.is_contiguous():
+        if (
+            recurrent_state.dtype is not self.state_dtype
+            or not recurrent_state.is_contiguous()
+        ):
             raise ValueError(
                 f"recurrent_state must be contiguous {self.state_dtype}, "
                 f"got {recurrent_state.dtype}"
@@ -405,7 +442,9 @@ class KimiK3KdaAttention:
                     quantized_moe_scale,
                 )
                 if any(tensor is None for tensor in monokernel_tensors):
-                    raise ValueError("fused AttnRes requires all MonoKernel output buffers")
+                    raise ValueError(
+                        "fused AttnRes requires all MonoKernel output buffers"
+                    )
                 block_stride = block_residual.shape[1]
             else:
                 block_residual = hidden_states
@@ -418,24 +457,59 @@ class KimiK3KdaAttention:
                 monokernel_output = hidden_states
                 moe_peers = hidden_states
                 block_stride = 1
-            if self.fuse_moe and (monokernel_output is None or moe_symmetric == 0 or moe_peers is None):
-                raise ValueError("the fused MoE path requires output and symmetric peer buffers")
+            if self.fuse_moe and (
+                monokernel_output is None or moe_symmetric == 0 or moe_peers is None
+            ):
+                raise ValueError(
+                    "the fused MoE path requires output and symmetric peer buffers"
+                )
             if monokernel_output is None:
                 monokernel_output = target
             if moe_peers is None:
                 moe_peers = hidden_states
             packed = self.moe_packed
-            pointer_or_hidden = lambda name: packed[name].data_ptr() if name in packed else hidden_states.data_ptr()
+
+            def pointer_or_hidden(name):
+                return (
+                    packed[name].data_ptr()
+                    if name in packed
+                    else hidden_states.data_ptr()
+                )
+
             self.monokernel_launch(
                 hidden_states.data_ptr(),
                 target.data_ptr(),
                 block_residual.data_ptr(),
-                self.t["g_self_res"].data_ptr() if self.fuse_attn_res else hidden_states.data_ptr(),
-                self.t["w_self_res"].data_ptr() if self.fuse_attn_res else hidden_states.data_ptr(),
-                self.t["g_in"].data_ptr() if self.fuse_attn_res else hidden_states.data_ptr(),
-                self.t["g_mlp_res"].data_ptr() if self.fuse_attn_res else hidden_states.data_ptr(),
-                self.t["w_mlp_res"].data_ptr() if self.fuse_attn_res else hidden_states.data_ptr(),
-                self.t["g_post"].data_ptr() if self.fuse_attn_res else hidden_states.data_ptr(),
+                (
+                    self.t["g_self_res"].data_ptr()
+                    if self.fuse_attn_res
+                    else hidden_states.data_ptr()
+                ),
+                (
+                    self.t["w_self_res"].data_ptr()
+                    if self.fuse_attn_res
+                    else hidden_states.data_ptr()
+                ),
+                (
+                    self.t["g_in"].data_ptr()
+                    if self.fuse_attn_res
+                    else hidden_states.data_ptr()
+                ),
+                (
+                    self.t["g_mlp_res"].data_ptr()
+                    if self.fuse_attn_res
+                    else hidden_states.data_ptr()
+                ),
+                (
+                    self.t["w_mlp_res"].data_ptr()
+                    if self.fuse_attn_res
+                    else hidden_states.data_ptr()
+                ),
+                (
+                    self.t["g_post"].data_ptr()
+                    if self.fuse_attn_res
+                    else hidden_states.data_ptr()
+                ),
                 pre_updated.data_ptr(),
                 pre_output.data_ptr(),
                 updated_prefix.data_ptr(),
@@ -444,16 +518,32 @@ class KimiK3KdaAttention:
                 quantized_moe_scale.data_ptr(),
                 block_stride,
                 pointer_or_hidden("w_r"),
-                self.t["bias"].data_ptr() if self.fuse_moe else hidden_states.data_ptr(),
+                (
+                    self.t["bias"].data_ptr()
+                    if self.fuse_moe
+                    else hidden_states.data_ptr()
+                ),
                 pointer_or_hidden("w_latent_down"),
                 pointer_or_hidden("s_latent_down"),
                 pointer_or_hidden("w_shared_ug"),
                 pointer_or_hidden("s_shared_ug"),
                 pointer_or_hidden("w_ug"),
-                self.t["s_ug"].data_ptr() if self.fuse_moe else hidden_states.data_ptr(),
+                (
+                    self.t["s_ug"].data_ptr()
+                    if self.fuse_moe
+                    else hidden_states.data_ptr()
+                ),
                 pointer_or_hidden("w_dn"),
-                self.t["s_dn"].data_ptr() if self.fuse_moe else hidden_states.data_ptr(),
-                self.t["g_latent"].data_ptr() if self.fuse_moe else hidden_states.data_ptr(),
+                (
+                    self.t["s_dn"].data_ptr()
+                    if self.fuse_moe
+                    else hidden_states.data_ptr()
+                ),
+                (
+                    self.t["g_latent"].data_ptr()
+                    if self.fuse_moe
+                    else hidden_states.data_ptr()
+                ),
                 pointer_or_hidden("w_shared_dn"),
                 pointer_or_hidden("s_shared_dn"),
                 pointer_or_hidden("w_latent_up"),
@@ -498,7 +588,9 @@ class KimiK3KdaAttention:
         heads = self.config.local_heads
         mixed_qkv = self.fused_input[:, : 3 * projection]
         output_gate = self.fused_input[:, 3 * projection : 4 * projection]
-        beta = self.fused_input[:, 4 * projection : 4 * projection + heads].view(self.S, 1, heads)
+        beta = self.fused_input[:, 4 * projection : 4 * projection + heads].view(
+            self.S, 1, heads
+        )
         f_a = self.fused_input[:, 4 * projection + heads :]
         self.core(
             mixed_qkv,
@@ -520,7 +612,9 @@ class KimiK3KdaAttention:
                 self.normed.view(self.S, projection),
                 self.t["w_kda_o"].T,
                 out=target,
-                user_kwargs=_OUTPUT_GEMM_CONFIG_S8 if self.S == 8 else _OUTPUT_GEMM_CONFIG,
+                user_kwargs=(
+                    _OUTPUT_GEMM_CONFIG_S8 if self.S == 8 else _OUTPUT_GEMM_CONFIG
+                ),
                 layout="nt",
                 symmetric_allreduce={
                     "symmetric": self.symmetric_allreduce.peer_buffer.local_address,

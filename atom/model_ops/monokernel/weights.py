@@ -44,7 +44,12 @@ def _unshuffle_linear_weight(weight: torch.Tensor) -> torch.Tensor:
     )
     nlead = len(lead)
     order = list(range(nlead)) + [nlead, nlead + 3, nlead + 1, nlead + 2, nlead + 4]
-    return shuffled.permute(*order).contiguous().reshape(*lead, rows, packed_k).view(source_dtype)
+    return (
+        shuffled.permute(*order)
+        .contiguous()
+        .reshape(*lead, rows, packed_k)
+        .view(source_dtype)
+    )
 
 
 def _unshuffle_linear_scale(
@@ -103,10 +108,19 @@ def linear_bf16(
     params_dtype = getattr(linear, "params_dtype", None)
     shuffled = bool(getattr(weight, "is_shuffled", False))
     if quant_name == "No":
-        _need(params_dtype == torch.bfloat16, f"{name} unquantized params must be BF16, got {params_dtype}")
+        _need(
+            params_dtype == torch.bfloat16,
+            f"{name} unquantized params must be BF16, got {params_dtype}",
+        )
         _need(not shuffled, f"{name} BF16 weight must not be preshuffled")
-        _need(weight.dtype == torch.bfloat16, f"{name} BF16 weight has dtype {weight.dtype}")
-        _need(weight.shape == (logical_rows, logical_cols), f"{name} weight shape {tuple(weight.shape)}")
+        _need(
+            weight.dtype == torch.bfloat16,
+            f"{name} BF16 weight has dtype {weight.dtype}",
+        )
+        _need(
+            weight.shape == (logical_rows, logical_cols),
+            f"{name} weight shape {tuple(weight.shape)}",
+        )
         _need(weight.is_contiguous(), f"{name} BF16 weight must be contiguous")
         if row_start == 0 and row_count == logical_rows:
             return weight
@@ -125,7 +139,10 @@ def linear_bf16(
             params_dtype in fp8_dtypes,
             f"{name} per_Token params must be E4M3 FP8, got {params_dtype}",
         )
-        _need(weight.dtype == params_dtype, f"{name} FP8 weight has dtype {weight.dtype}, expected {params_dtype}")
+        _need(
+            weight.dtype == params_dtype,
+            f"{name} FP8 weight has dtype {weight.dtype}, expected {params_dtype}",
+        )
         padded = bool(getattr(linear, "is_output_padded", False))
         storage_rows = weight.shape[0] if weight.ndim == 2 else 0
         if padded:
@@ -133,17 +150,29 @@ def linear_bf16(
                 getattr(linear, "_output_size_before_padding", None) == logical_rows,
                 f"{name} padded logical rows do not match {logical_rows}",
             )
-            _need(storage_rows >= logical_rows, f"{name} padded FP8 rows {storage_rows} < logical rows {logical_rows}")
+            _need(
+                storage_rows >= logical_rows,
+                f"{name} padded FP8 rows {storage_rows} < logical rows {logical_rows}",
+            )
         else:
-            _need(storage_rows == logical_rows, f"{name} FP8 rows {storage_rows}, expected {logical_rows}")
-        _need(weight.shape == (storage_rows, logical_cols), f"{name} FP8 weight shape {tuple(weight.shape)}")
+            _need(
+                storage_rows == logical_rows,
+                f"{name} FP8 rows {storage_rows}, expected {logical_rows}",
+            )
+        _need(
+            weight.shape == (storage_rows, logical_cols),
+            f"{name} FP8 weight shape {tuple(weight.shape)}",
+        )
         scale = getattr(linear, "weight_scale", None)
         _need(scale is not None, f"{name} per_Token weight_scale is missing")
         _need(
             scale.shape == (storage_rows, 1),
             f"{name} weight_scale shape {tuple(scale.shape)}, expected {(storage_rows, 1)}",
         )
-        _need(scale.dtype == torch.float32, f"{name} weight_scale must be FP32, got {scale.dtype}")
+        _need(
+            scale.dtype == torch.float32,
+            f"{name} weight_scale must be FP32, got {scale.dtype}",
+        )
         if shuffled:
             _need(
                 storage_rows % 16 == 0 and logical_cols % 32 == 0,
@@ -156,13 +185,21 @@ def linear_bf16(
 
     fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
     _need(
-        quant_name == "per_1x32" and fp4_dtype is not None and params_dtype == fp4_dtype,
+        quant_name == "per_1x32"
+        and fp4_dtype is not None
+        and params_dtype == fp4_dtype,
         f"{name} unsupported quantization: quant_type={quant_name}, params_dtype={params_dtype}",
     )
     _need(shuffled, f"{name} per_1x32 FP4 weight must be preshuffled")
-    _need(logical_cols % 32 == 0, f"{name} logical K={logical_cols} must be divisible by 32")
+    _need(
+        logical_cols % 32 == 0,
+        f"{name} logical K={logical_cols} must be divisible by 32",
+    )
     expected_weight = (logical_rows, logical_cols // 2)
-    _need(weight.dtype == fp4_dtype, f"{name} packed weight has dtype {weight.dtype}, expected {fp4_dtype}")
+    _need(
+        weight.dtype == fp4_dtype,
+        f"{name} packed weight has dtype {weight.dtype}, expected {fp4_dtype}",
+    )
     _need(
         weight.shape == expected_weight,
         f"{name} packed weight shape {tuple(weight.shape)}, expected {expected_weight}",
@@ -174,13 +211,17 @@ def linear_bf16(
     padded_groups = (groups + 7) // 8 * 8
     expected_scale_shape = (padded_rows, padded_groups)
     _need(scale is not None, f"{name} per_1x32 weight_scale is missing")
-    _need(scale.element_size() == 1, f"{name} weight_scale must use one-byte E8M0 values")
+    _need(
+        scale.element_size() == 1, f"{name} weight_scale must use one-byte E8M0 values"
+    )
     _need(
         scale.shape == expected_scale_shape,
         f"{name} weight_scale shape {tuple(scale.shape)}, expected {expected_scale_shape}",
     )
     packed = _unshuffle_linear_weight(weight).narrow(0, row_start, row_count)
-    native_scale = _unshuffle_linear_scale(scale, experts=1, rows=logical_rows, groups=groups)[0]
+    native_scale = _unshuffle_linear_scale(
+        scale, experts=1, rows=logical_rows, groups=groups
+    )[0]
     native_scale = native_scale.narrow(0, row_start, row_count)
     result = dequantize_mxfp4(packed, native_scale).to(torch.bfloat16).contiguous()
     _need(
@@ -228,7 +269,9 @@ def atom_mxfp4_storage_view(
             raise ValueError(f"{name} ATOM weight must carry the preshuffled marker")
         expected_bytes = logical_rows * logical_k // 2
     if tensor.numel() != expected_bytes:
-        raise ValueError(f"{name} has {tensor.numel()} bytes, expected {expected_bytes}")
+        raise ValueError(
+            f"{name} has {tensor.numel()} bytes, expected {expected_bytes}"
+        )
     return tensor.view(torch.uint8).view(-1)
 
 
@@ -237,8 +280,14 @@ def prepare_mxfp4_expert_storage(
 ) -> tuple[torch.Tensor, ...]:
     config = weights.config
     tensors = weights.t
-    experts = config.n_experts if weights.physical_experts is None else weights.physical_experts
-    expert_hidden = config.hidden if config.routed_hidden is None else config.routed_hidden
+    experts = (
+        config.n_experts
+        if weights.physical_experts is None
+        else weights.physical_experts
+    )
+    expert_hidden = (
+        config.hidden if config.routed_hidden is None else config.routed_hidden
+    )
     ug_rows = 2 * config.inter
     dn_rows = expert_hidden
 
@@ -250,20 +299,32 @@ def prepare_mxfp4_expert_storage(
             raise ValueError("zero-copy MXFP4 storage requires ATOM values and scales")
         return (
             atom_mxfp4_storage_view(
-                tensors["w_ug"], name="w_ug",
-                logical_rows=experts * ug_rows, logical_k=expert_hidden, scale=False,
+                tensors["w_ug"],
+                name="w_ug",
+                logical_rows=experts * ug_rows,
+                logical_k=expert_hidden,
+                scale=False,
             ),
             atom_mxfp4_storage_view(
-                tensors["s_ug"], name="s_ug",
-                logical_rows=experts * ug_rows, logical_k=expert_hidden, scale=True,
+                tensors["s_ug"],
+                name="s_ug",
+                logical_rows=experts * ug_rows,
+                logical_k=expert_hidden,
+                scale=True,
             ),
             atom_mxfp4_storage_view(
-                tensors["w_dn"], name="w_dn",
-                logical_rows=experts * dn_rows, logical_k=config.inter, scale=False,
+                tensors["w_dn"],
+                name="w_dn",
+                logical_rows=experts * dn_rows,
+                logical_k=config.inter,
+                scale=False,
             ),
             atom_mxfp4_storage_view(
-                tensors["s_dn"], name="s_dn",
-                logical_rows=experts * dn_rows, logical_k=config.inter, scale=True,
+                tensors["s_dn"],
+                name="s_dn",
+                logical_rows=experts * dn_rows,
+                logical_k=config.inter,
+                scale=True,
             ),
         )
 
@@ -279,7 +340,9 @@ def prepare_mxfp4_expert_storage(
             shuffled.is_shuffled = True
             tensor = _unshuffle_linear_weight(shuffled)
         elif weights.mxfp4_weight_layout is not Mxfp4WeightLayout.NATIVE:
-            raise ValueError(f"unsupported MXFP4 weight layout {weights.mxfp4_weight_layout!r}")
+            raise ValueError(
+                f"unsupported MXFP4 weight layout {weights.mxfp4_weight_layout!r}"
+            )
         return pack_mxfp4(tensor)
 
     def scales(name: str, rows: int, k: int) -> torch.Tensor:
@@ -293,7 +356,9 @@ def prepare_mxfp4_expert_storage(
                 packed, experts=experts, rows=rows, groups=groups
             )
         elif weights.mxfp4_scale_layout is not Mxfp4ScaleLayout.NATIVE:
-            raise ValueError(f"unsupported MXFP4 scale layout {weights.mxfp4_scale_layout!r}")
+            raise ValueError(
+                f"unsupported MXFP4 scale layout {weights.mxfp4_scale_layout!r}"
+            )
         return tensor.view(torch.uint8).contiguous().view(-1)
 
     return (
@@ -304,7 +369,9 @@ def prepare_mxfp4_expert_storage(
     )
 
 
-def prepare_aiter_mxfp4_expert_storage(weights: LayerWeights) -> tuple[torch.Tensor, ...]:
+def prepare_aiter_mxfp4_expert_storage(
+    weights: LayerWeights,
+) -> tuple[torch.Tensor, ...]:
     if (
         weights.mxfp4_weight_layout is Mxfp4WeightLayout.ATOM
         and weights.mxfp4_scale_layout is Mxfp4ScaleLayout.ATOM

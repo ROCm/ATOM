@@ -42,7 +42,9 @@ def build_kimi_k3_tail(
     if npes != _WAVES:
         raise ValueError(f"fused Kimi-K3 tail requires {_WAVES} peers, got {npes}")
     if hidden % (_ROW_TILE * npes):
-        raise ValueError(f"hidden must be divisible by {_ROW_TILE * npes}, got {hidden}")
+        raise ValueError(
+            f"hidden must be divisible by {_ROW_TILE * npes}, got {hidden}"
+        )
     if shared_inter % 64 or routed_hidden % 64:
         raise ValueError("MXFP8 tail K dimensions must be multiples of 64")
     if max_pairs < samples * hidden // 2:
@@ -66,7 +68,9 @@ def build_kimi_k3_tail(
     routed_blocks = samples * routed_blocks_per_row
     launch_blocks = _BLOCKS + routed_blocks
     if launch_blocks > 256:
-        raise ValueError(f"fused tail requires a co-resident grid, got {launch_blocks} blocks")
+        raise ValueError(
+            f"fused tail requires a co-resident grid, got {launch_blocks} blocks"
+        )
     slot_bytes = npes * max_pairs * 8
     region_base = 2 * slot_bytes
 
@@ -129,8 +133,12 @@ def build_kimi_k3_tail(
         slot = (step_value * LAYER_SLOTS + layer) & 1
         routed_base = fx.Int64(slot) * fx.Int64(slot_bytes)
         final_base = fx.Int64(region_base) + fx.Int64(slot) * fx.Int64(slot_bytes)
-        peer_words = fx.Vector(bo.buffer_load(rsrc(peers), wave * 2, vec_width=2, dtype=T.i32))
-        peer_base = (fx.Int64(uniform(peer_words[1])) << 32) | fx.Int64(fx.Uint32(uniform(peer_words[0])))
+        peer_words = fx.Vector(
+            bo.buffer_load(rsrc(peers), wave * 2, vec_width=2, dtype=T.i32)
+        )
+        peer_base = (fx.Int64(uniform(peer_words[1])) << 32) | fx.Int64(
+            fx.Uint32(uniform(peer_words[0]))
+        )
         routed_peer_rsrc = rsrc(peer_base + routed_base)
         routed_local_rsrc = rsrc(symmetric + routed_base)
         peer_rsrc = rsrc(peer_base + final_base)
@@ -154,7 +162,9 @@ def build_kimi_k3_tail(
             pair = sample * fx.Int32(routed_pairs_per_row) + pair_in_row
 
             if valid:
-                value = fx.Int32(bo.buffer_load(routed_partial_rsrc, pair, vec_width=1, dtype=T.i32))
+                value = fx.Int32(
+                    bo.buffer_load(routed_partial_rsrc, pair, vec_width=1, dtype=T.i32)
+                )
                 mailbox = rank * max_pairs + pair
                 bo.buffer_store(
                     fx.Vector.from_elements([value, tag], fx.Int32),
@@ -201,16 +211,24 @@ def build_kimi_k3_tail(
                     word = values[source_rank * 2]
                     sum_lo = sum_lo + (word << 16).bitcast(fx.Float32)
                     sum_hi = sum_hi + (word & fx.Int32(-65536)).bitcast(fx.Float32)
-                packed = fx.Vector.from_elements([sum_lo, sum_hi], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0]
+                packed = (
+                    fx.Vector.from_elements([sum_lo, sum_hi], fx.Float32)
+                    .to(fx.BFloat16)
+                    .bitcast(fx.Int32)[0]
+                )
                 fx.ptr_store(packed.bitcast(fx.Float32), reduction + tid)
             gpu.barrier()
 
             result_tag = tag + fx.Int32(1 << 30)
-            owned_pair_in_row = block_in_row * fx.Int32(_THREADS) + rank * _WAVE_SIZE + lane
+            owned_pair_in_row = (
+                block_in_row * fx.Int32(_THREADS) + rank * _WAVE_SIZE + lane
+            )
             owned_valid = owned_pair_in_row < fx.Int32(routed_pairs_per_row)
             if (wave < npes) & owned_valid:
                 owned_pair = sample * fx.Int32(routed_pairs_per_row) + owned_pair_in_row
-                packed = fx.ptr_load(reduction + rank * _WAVE_SIZE + lane).bitcast(fx.Int32)
+                packed = fx.ptr_load(reduction + rank * _WAVE_SIZE + lane).bitcast(
+                    fx.Int32
+                )
                 mailbox = rank * max_pairs + owned_pair
                 bo.buffer_store(
                     fx.Vector.from_elements([packed, result_tag], fx.Int32),
@@ -239,7 +257,9 @@ def build_kimi_k3_tail(
                     rocdl.s_nop(0)
                     reduced = load_routed_reduced()
                 packed = reduced[0]
-                bo.buffer_store(packed, routed_reduced_rsrc, pair, cache_modifier=CM_DEV)
+                bo.buffer_store(
+                    packed, routed_reduced_rsrc, pair, cache_modifier=CM_DEV
+                )
                 reduced_lo = (packed << 16).bitcast(fx.Float32)
                 reduced_hi = (packed & fx.Int32(-65536)).bitcast(fx.Float32)
 
@@ -251,10 +271,14 @@ def build_kimi_k3_tail(
             gpu.barrier()
             block_square_sum = fx.ptr_load(reduction)
             for source_wave in range_constexpr(1, _WAVES):
-                block_square_sum = block_square_sum + fx.ptr_load(reduction + source_wave)
+                block_square_sum = block_square_sum + fx.ptr_load(
+                    reduction + source_wave
+                )
             if tid == 0:
                 bo.buffer_store(
-                    fx.Vector.from_elements([block_square_sum.bitcast(fx.Int32), tag], fx.Int32),
+                    fx.Vector.from_elements(
+                        [block_square_sum.bitcast(fx.Int32), tag], fx.Int32
+                    ),
                     norm_scratch_rsrc,
                     reduce_bid * 2,
                     cache_modifier=CM_DEV,
@@ -287,22 +311,36 @@ def build_kimi_k3_tail(
                 total_square = total_square + fx.ptr_load(reduction + source_block)
             inverse_rms = rsq(total_square * (1.0 / routed_hidden) + EPS)
             if valid:
-                gain_word = fx.Int32(bo.buffer_load(routed_gain_rsrc, pair_in_row, vec_width=1, dtype=T.i32))
+                gain_word = fx.Int32(
+                    bo.buffer_load(
+                        routed_gain_rsrc, pair_in_row, vec_width=1, dtype=T.i32
+                    )
+                )
                 gain_lo = (gain_word << 16).bitcast(fx.Float32)
                 gain_hi = (gain_word & fx.Int32(-65536)).bitcast(fx.Float32)
                 normalized_word = (
                     fx.Vector.from_elements(
-                        [reduced_lo * inverse_rms * gain_lo, reduced_hi * inverse_rms * gain_hi],
+                        [
+                            reduced_lo * inverse_rms * gain_lo,
+                            reduced_hi * inverse_rms * gain_hi,
+                        ],
                         fx.Float32,
                     )
                     .to(fx.BFloat16)
                     .bitcast(fx.Int32)[0]
                 )
-                bo.buffer_store(normalized_word, rsrc(latent_norm), pair, cache_modifier=CM_DEV)
+                bo.buffer_store(
+                    normalized_word, rsrc(latent_norm), pair, cache_modifier=CM_DEV
+                )
             rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
             if tid == 0:
-                bo.buffer_store(tag, norm_scratch_rsrc, routed_blocks * 2 + reduce_bid, cache_modifier=CM_DEV)
+                bo.buffer_store(
+                    tag,
+                    norm_scratch_rsrc,
+                    routed_blocks * 2 + reduce_bid,
+                    cache_modifier=CM_DEV,
+                )
 
         def stage_bf16(source_rsrc, source_base, destination, elements):
             loads = (elements + 4 * _THREADS - 1) // (4 * _THREADS)
@@ -310,10 +348,19 @@ def build_kimi_k3_tail(
                 element = (tid + load_index * _THREADS) * 4
                 if element < elements:
                     words = fx.Vector(
-                        bo.buffer_load(source_rsrc, (source_base + element) // 2, vec_width=2, dtype=T.i32)
+                        bo.buffer_load(
+                            source_rsrc,
+                            (source_base + element) // 2,
+                            vec_width=2,
+                            dtype=T.i32,
+                        )
                     )
-                    fx.ptr_store(words[0].bitcast(fx.Float32), destination + element // 2)
-                    fx.ptr_store(words[1].bitcast(fx.Float32), destination + element // 2 + 1)
+                    fx.ptr_store(
+                        words[0].bitcast(fx.Float32), destination + element // 2
+                    )
+                    fx.ptr_store(
+                        words[1].bitcast(fx.Float32), destination + element // 2 + 1
+                    )
 
         def dense_accumulate(
             weight_rsrc,
@@ -337,7 +384,12 @@ def build_kimi_k3_tail(
                         weight = fx.Vector(
                             bo.buffer_load(
                                 weight_rsrc,
-                                (((row_tile * k_chunks + chunk) * 4 + atom_group) * 16 + lane % 16) * 4
+                                (
+                                    ((row_tile * k_chunks + chunk) * 4 + atom_group)
+                                    * 16
+                                    + lane % 16
+                                )
+                                * 4
                                 + ((lane // 16) % 2) * 2,
                                 vec_width=2,
                                 dtype=T.i32,
@@ -348,7 +400,11 @@ def build_kimi_k3_tail(
                             bo.buffer_load(
                                 scale_rsrc,
                                 (
-                                    ((row_tile // 2) * (k_dim // 256) + scale_group // 8) * 64
+                                    (
+                                        (row_tile // 2) * (k_dim // 256)
+                                        + scale_group // 8
+                                    )
+                                    * 64
                                     + (scale_group % 4) * 16
                                     + lane % 16
                                 ),
@@ -357,14 +413,25 @@ def build_kimi_k3_tail(
                             )
                         )
                         scale_byte_index = ((scale_group % 8) // 4) * 2 + row_tile % 2
-                        scale_byte = scale_word.shrui(fx.Int32(scale_byte_index * 8)) & fx.Int32(0xFF)
-                        scale = ((scale_byte & fx.Int32(0xFF)) << fx.Int32(23)).bitcast(fx.Float32)
+                        scale_byte = scale_word.shrui(
+                            fx.Int32(scale_byte_index * 8)
+                        ) & fx.Int32(0xFF)
+                        scale = ((scale_byte & fx.Int32(0xFF)) << fx.Int32(23)).bitcast(
+                            fx.Float32
+                        )
                         lhs = mxfp8_to_bf16x8(weight[0], weight[1], scale)
                         rhs = fx.ptr_load(
-                            activation + (sample * k_dim + chunk * 64) // 2 + (lane // 16) * 4 + step_index * 16,
+                            activation
+                            + (sample * k_dim + chunk * 64) // 2
+                            + (lane // 16) * 4
+                            + step_index * 16,
                             result_type=fx.Vector.make_type(4, fx.Float32),
                         ).bitcast(fx.BFloat16)
-                        accumulator = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [lhs, rhs, accumulator]))
+                        accumulator = fx.Vector(
+                            rocdl.mfma_f32_16x16x32_bf16(
+                                T.vec(4, T.f32), [lhs, rhs, accumulator]
+                            )
+                        )
             return accumulator
 
         def reduce_value(tile_in_task, local_sample, output_row):
@@ -372,7 +439,9 @@ def build_kimi_k3_tail(
             for source_wave_index in range_constexpr(_WAVES_PER_TILE):
                 source_wave = tile_in_task * _WAVES_PER_TILE + source_wave_index
                 source_lane = local_sample + 16 * (output_row // 4)
-                source_index = (source_wave * _WAVE_SIZE + source_lane) * 4 + output_row % 4
+                source_index = (
+                    source_wave * _WAVE_SIZE + source_lane
+                ) * 4 + output_row % 4
                 value = value + fx.ptr_load(reduction + source_index)
             return value.to(fx.BFloat16)
 
@@ -401,7 +470,9 @@ def build_kimi_k3_tail(
                         row_tile_base,
                         sample,
                     )
-                    fx.ptr_store(shared_accumulator, reduction + (wave * _WAVE_SIZE + lane) * 4)
+                    fx.ptr_store(
+                        shared_accumulator, reduction + (wave * _WAVE_SIZE + lane) * 4
+                    )
                     gpu.barrier()
 
                     if tid < output_values:
@@ -411,7 +482,9 @@ def build_kimi_k3_tail(
                         output_row = tile_offset % _ROW_TILE
                         row_tile = row_tile_base + tile_in_task
                         sample_out = sample_base + local_sample
-                        shared_value = reduce_value(tile_in_task, local_sample, output_row)
+                        shared_value = reduce_value(
+                            tile_in_task, local_sample, output_row
+                        )
                         bo.buffer_store(
                             shared_value,
                             shared_partial_rsrc,
@@ -422,22 +495,34 @@ def build_kimi_k3_tail(
                     gpu.barrier()
 
                     owner_rank = row_tile_base // shard_tiles
-                    owner_words = fx.Vector(bo.buffer_load(rsrc(peers), owner_rank * 2, vec_width=2, dtype=T.i32))
+                    owner_words = fx.Vector(
+                        bo.buffer_load(
+                            rsrc(peers), owner_rank * 2, vec_width=2, dtype=T.i32
+                        )
+                    )
                     owner_base = (fx.Int64(uniform(owner_words[1])) << 32) | fx.Int64(
                         fx.Uint32(uniform(owner_words[0]))
                     )
                     owner_rsrc = rsrc(owner_base + final_base)
-                    for output_batch in range_constexpr((output_pairs + _WAVE_SIZE - 1) // _WAVE_SIZE):
+                    for output_batch in range_constexpr(
+                        (output_pairs + _WAVE_SIZE - 1) // _WAVE_SIZE
+                    ):
                         output_pair = lane + output_batch * _WAVE_SIZE
                         if (wave == 0) & (output_pair < output_pairs):
-                            tile_in_task = output_pair // (sample_group * (_ROW_TILE // 2))
-                            pair_offset = output_pair % (sample_group * (_ROW_TILE // 2))
+                            tile_in_task = output_pair // (
+                                sample_group * (_ROW_TILE // 2)
+                            )
+                            pair_offset = output_pair % (
+                                sample_group * (_ROW_TILE // 2)
+                            )
                             local_sample = pair_offset // (_ROW_TILE // 2)
                             row_pair = pair_offset % (_ROW_TILE // 2)
                             row_tile = row_tile_base + tile_in_task
                             sample_out = sample_base + local_sample
                             value_index = (
-                                tile_in_task * sample_group * _ROW_TILE + local_sample * _ROW_TILE + row_pair * 2
+                                tile_in_task * sample_group * _ROW_TILE
+                                + local_sample * _ROW_TILE
+                                + row_pair * 2
                             )
                             shared_word = (
                                 fx.Vector.from_elements(
@@ -450,8 +535,17 @@ def build_kimi_k3_tail(
                                 .to(fx.BFloat16)
                                 .bitcast(fx.Int32)[0]
                             )
-                            pair = sample_out * (hidden // 2) + row_tile * (_ROW_TILE // 2) + row_pair
-                            bo.buffer_store(shared_word, final_partial_rsrc, pair, cache_modifier=CM_DEV)
+                            pair = (
+                                sample_out * (hidden // 2)
+                                + row_tile * (_ROW_TILE // 2)
+                                + row_pair
+                            )
+                            bo.buffer_store(
+                                shared_word,
+                                final_partial_rsrc,
+                                pair,
+                                cache_modifier=CM_DEV,
+                            )
                             mailbox = rank * max_pairs + pair
                             bo.buffer_store(
                                 fx.Vector.from_elements([shared_word, tag], fx.Int32),
@@ -489,7 +583,9 @@ def build_kimi_k3_tail(
                     gpu.barrier()
 
                     local_start_tile = rank * shard_tiles
-                    is_local = (row_tile_base >= local_start_tile) & (row_tile_base < local_start_tile + shard_tiles)
+                    is_local = (row_tile_base >= local_start_tile) & (
+                        row_tile_base < local_start_tile + shard_tiles
+                    )
                     if is_local:
                         tail_row_tile_base = row_tile_base - local_start_tile
                         tail_accumulator = dense_accumulate(
@@ -502,7 +598,9 @@ def build_kimi_k3_tail(
                             tail_row_tile_base,
                             sample,
                         )
-                        fx.ptr_store(tail_accumulator, reduction + (wave * _WAVE_SIZE + lane) * 4)
+                        fx.ptr_store(
+                            tail_accumulator, reduction + (wave * _WAVE_SIZE + lane) * 4
+                        )
                         gpu.barrier()
                         if tid < output_values:
                             tile_in_task = tid // (sample_group * _ROW_TILE)
@@ -511,11 +609,15 @@ def build_kimi_k3_tail(
                             output_row = tile_offset % _ROW_TILE
                             tail_row_tile = tail_row_tile_base + tile_in_task
                             sample_out = sample_base + local_sample
-                            tail_value = reduce_value(tile_in_task, local_sample, output_row)
+                            tail_value = reduce_value(
+                                tile_in_task, local_sample, output_row
+                            )
                             bo.buffer_store(
                                 tail_value,
                                 tail_rsrc,
-                                sample_out * hidden_shard + tail_row_tile * _ROW_TILE + output_row,
+                                sample_out * hidden_shard
+                                + tail_row_tile * _ROW_TILE
+                                + output_row,
                                 cache_modifier=CM_DEV,
                             )
                             fx.ptr_store(fx.Float32(tail_value), local_values + tid)
@@ -528,7 +630,11 @@ def build_kimi_k3_tail(
                         row_pair = pair_offset % (_ROW_TILE // 2)
                         row_tile = row_tile_base + tile_in_task
                         sample_out = sample_base + local_sample
-                        pair = sample_out * (hidden // 2) + row_tile * (_ROW_TILE // 2) + row_pair
+                        pair = (
+                            sample_out * (hidden // 2)
+                            + row_tile * (_ROW_TILE // 2)
+                            + row_pair
+                        )
 
                         def load_all():
                             words = []
@@ -562,46 +668,73 @@ def build_kimi_k3_tail(
                         for source_rank in range_constexpr(npes):
                             word = values[source_rank * 2]
                             sum_lo = sum_lo + (word << 16).bitcast(fx.Float32)
-                            sum_hi = sum_hi + (word & fx.Int32(-65536)).bitcast(fx.Float32)
-                        value_index = tile_in_task * sample_group * _ROW_TILE + local_sample * _ROW_TILE + row_pair * 2
+                            sum_hi = sum_hi + (word & fx.Int32(-65536)).bitcast(
+                                fx.Float32
+                            )
+                        value_index = (
+                            tile_in_task * sample_group * _ROW_TILE
+                            + local_sample * _ROW_TILE
+                            + row_pair * 2
+                        )
                         tail_lo = fx.ptr_load(local_values + value_index)
                         tail_hi = fx.ptr_load(local_values + value_index + 1)
                         local_word = (
                             fx.Vector.from_elements(
                                 [
                                     fx.ptr_load(shared_values + value_index) + tail_lo,
-                                    fx.ptr_load(shared_values + value_index + 1) + tail_hi,
+                                    fx.ptr_load(shared_values + value_index + 1)
+                                    + tail_hi,
                                 ],
                                 fx.Float32,
                             )
                             .to(fx.BFloat16)
                             .bitcast(fx.Int32)[0]
                         )
-                        bo.buffer_store(local_word, final_partial_rsrc, pair, cache_modifier=CM_DEV)
+                        bo.buffer_store(
+                            local_word, final_partial_rsrc, pair, cache_modifier=CM_DEV
+                        )
                         sum_lo = sum_lo + tail_lo
                         sum_hi = sum_hi + tail_hi
                         reduced_word = (
-                            fx.Vector.from_elements([sum_lo, sum_hi], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0]
+                            fx.Vector.from_elements([sum_lo, sum_hi], fx.Float32)
+                            .to(fx.BFloat16)
+                            .bitcast(fx.Int32)[0]
                         )
-                        fx.ptr_store(reduced_word.bitcast(fx.Float32), local_values + tid)
+                        fx.ptr_store(
+                            reduced_word.bitcast(fx.Float32), local_values + tid
+                        )
                     gpu.barrier()
 
                     result_tag = tag + fx.Int32(1 << 30)
                     if (rank == owner_rank) & (wave < npes):
-                        for output_batch in range_constexpr((output_pairs + _WAVE_SIZE - 1) // _WAVE_SIZE):
+                        for output_batch in range_constexpr(
+                            (output_pairs + _WAVE_SIZE - 1) // _WAVE_SIZE
+                        ):
                             output_pair = lane + output_batch * _WAVE_SIZE
                             if output_pair < output_pairs:
-                                tile_in_task = output_pair // (sample_group * (_ROW_TILE // 2))
-                                pair_offset = output_pair % (sample_group * (_ROW_TILE // 2))
+                                tile_in_task = output_pair // (
+                                    sample_group * (_ROW_TILE // 2)
+                                )
+                                pair_offset = output_pair % (
+                                    sample_group * (_ROW_TILE // 2)
+                                )
                                 local_sample = pair_offset // (_ROW_TILE // 2)
                                 row_pair = pair_offset % (_ROW_TILE // 2)
                                 row_tile = row_tile_base + tile_in_task
                                 sample_out = sample_base + local_sample
-                                pair = sample_out * (hidden // 2) + row_tile * (_ROW_TILE // 2) + row_pair
-                                reduced_word = fx.ptr_load(local_values + output_pair).bitcast(fx.Int32)
+                                pair = (
+                                    sample_out * (hidden // 2)
+                                    + row_tile * (_ROW_TILE // 2)
+                                    + row_pair
+                                )
+                                reduced_word = fx.ptr_load(
+                                    local_values + output_pair
+                                ).bitcast(fx.Int32)
                                 mailbox = owner_rank * max_pairs + pair
                                 bo.buffer_store(
-                                    fx.Vector.from_elements([reduced_word, result_tag], fx.Int32),
+                                    fx.Vector.from_elements(
+                                        [reduced_word, result_tag], fx.Int32
+                                    ),
                                     peer_rsrc,
                                     mailbox * 2,
                                     cache_modifier=CM_SYS,
@@ -615,7 +748,11 @@ def build_kimi_k3_tail(
                         row_pair = pair_offset % (_ROW_TILE // 2)
                         row_tile = row_tile_base + tile_in_task
                         sample_out = sample_base + local_sample
-                        pair = sample_out * (hidden // 2) + row_tile * (_ROW_TILE // 2) + row_pair
+                        pair = (
+                            sample_out * (hidden // 2)
+                            + row_tile * (_ROW_TILE // 2)
+                            + row_pair
+                        )
                         mailbox = owner_rank * max_pairs + pair
 
                         def load_reduced():
@@ -634,18 +771,30 @@ def build_kimi_k3_tail(
                             rocdl.s_nop(0)
                             reduced = load_reduced()
                         reduced_word = reduced[0]
-                        bo.buffer_store(reduced_word, moe_delta_rsrc, pair, cache_modifier=CM_DEV)
+                        bo.buffer_store(
+                            reduced_word, moe_delta_rsrc, pair, cache_modifier=CM_DEV
+                        )
                         sum_lo = (reduced_word << 16).bitcast(fx.Float32)
                         sum_hi = (reduced_word & fx.Int32(-65536)).bitcast(fx.Float32)
-                        residual_word = fx.Int32(bo.buffer_load(residual_rsrc, pair, vec_width=1, dtype=T.i32))
+                        residual_word = fx.Int32(
+                            bo.buffer_load(
+                                residual_rsrc, pair, vec_width=1, dtype=T.i32
+                            )
+                        )
                         residual_lo = (residual_word << 16).bitcast(fx.Float32)
-                        residual_hi = (residual_word & fx.Int32(-65536)).bitcast(fx.Float32)
+                        residual_hi = (residual_word & fx.Int32(-65536)).bitcast(
+                            fx.Float32
+                        )
                         output_word = (
-                            fx.Vector.from_elements([residual_lo + sum_lo, residual_hi + sum_hi], fx.Float32)
+                            fx.Vector.from_elements(
+                                [residual_lo + sum_lo, residual_hi + sum_hi], fx.Float32
+                            )
                             .to(fx.BFloat16)
                             .bitcast(fx.Int32)[0]
                         )
-                        bo.buffer_store(output_word, output_rsrc, pair, cache_modifier=CM_DEV)
+                        bo.buffer_store(
+                            output_word, output_rsrc, pair, cache_modifier=CM_DEV
+                        )
                     gpu.barrier()
 
     @flyc.jit
@@ -698,7 +847,9 @@ def build_kimi_k3_tail(
             value_attrs={"rocdl.flat_work_group_size": f"{_THREADS},{_THREADS}"},
         ).launch(grid=(launch_blocks, 1, 1), block=(_THREADS, 1, 1), stream=stream)
 
-    launch.func.__name__ = f"kimi_k3_tail_s{samples}_h{hidden}_r{routed_hidden}_i{shared_inter}"
+    launch.func.__name__ = (
+        f"kimi_k3_tail_s{samples}_h{hidden}_r{routed_hidden}_i{shared_inter}"
+    )
     return launch
 
 
@@ -721,7 +872,9 @@ class FusedKimiK3Tail:
         self.shared_inter = shared_inter
         self.rank = rank
         self.npes = npes
-        self.launch = build_kimi_k3_tail(samples, hidden, routed_hidden, shared_inter, npes, max_pairs)
+        self.launch = build_kimi_k3_tail(
+            samples, hidden, routed_hidden, shared_inter, npes, max_pairs
+        )
 
     def __call__(
         self,
@@ -747,20 +900,48 @@ class FusedKimiK3Tail:
         layer: int,
     ) -> torch.Tensor:
         expected = {
-            "routed_partial": (routed_partial, (self.samples, self.routed_hidden), torch.bfloat16),
-            "routed_reduced": (routed_reduced, (self.samples, self.routed_hidden), torch.bfloat16),
+            "routed_partial": (
+                routed_partial,
+                (self.samples, self.routed_hidden),
+                torch.bfloat16,
+            ),
+            "routed_reduced": (
+                routed_reduced,
+                (self.samples, self.routed_hidden),
+                torch.bfloat16,
+            ),
             "routed_gain": (routed_gain, (self.routed_hidden,), torch.bfloat16),
-            "shared_mid": (shared_mid, (self.samples, self.shared_inter), torch.bfloat16),
-            "latent_norm": (latent_norm, (self.samples, self.routed_hidden), torch.bfloat16),
+            "shared_mid": (
+                shared_mid,
+                (self.samples, self.shared_inter),
+                torch.bfloat16,
+            ),
+            "latent_norm": (
+                latent_norm,
+                (self.samples, self.routed_hidden),
+                torch.bfloat16,
+            ),
             "residual": (residual, (self.samples, self.hidden), torch.bfloat16),
-            "shared_partial": (shared_partial, (self.samples, self.hidden), torch.bfloat16),
+            "shared_partial": (
+                shared_partial,
+                (self.samples, self.hidden),
+                torch.bfloat16,
+            ),
             "tail": (tail, (self.samples, self.hidden // self.npes), torch.bfloat16),
-            "final_partial": (final_partial, (self.samples, self.hidden), torch.bfloat16),
+            "final_partial": (
+                final_partial,
+                (self.samples, self.hidden),
+                torch.bfloat16,
+            ),
             "moe_delta": (moe_delta, (self.samples, self.hidden), torch.bfloat16),
             "output": (output, (self.samples, self.hidden), torch.bfloat16),
         }
         for name, (tensor, shape, dtype) in expected.items():
-            if tensor.shape != shape or tensor.dtype != dtype or not tensor.is_contiguous():
+            if (
+                tensor.shape != shape
+                or tensor.dtype != dtype
+                or not tensor.is_contiguous()
+            ):
                 raise ValueError(f"{name} must be contiguous {dtype} {list(shape)}")
         shared_scale_rows = (self.hidden + 255) // 256 * 256
         latent_scale_rows = (self.hidden // self.npes + 255) // 256 * 256
@@ -768,10 +949,18 @@ class FusedKimiK3Tail:
             raise ValueError("shared_down_scale has the wrong shape")
         if latent_up_scale.numel() != latent_scale_rows * (self.routed_hidden // 32):
             raise ValueError("latent_up_scale has the wrong shape")
-        if shared_down_scale.dtype != torch.uint8 or latent_up_scale.dtype != torch.uint8:
+        if (
+            shared_down_scale.dtype != torch.uint8
+            or latent_up_scale.dtype != torch.uint8
+        ):
             raise ValueError("MXFP8 scales must use uint8 E8M0 storage")
-        routed_blocks = self.samples * ((self.routed_hidden // 2 + _THREADS - 1) // _THREADS)
-        if norm_scratch.dtype != torch.int32 or norm_scratch.numel() < routed_blocks * 3:
+        routed_blocks = self.samples * (
+            (self.routed_hidden // 2 + _THREADS - 1) // _THREADS
+        )
+        if (
+            norm_scratch.dtype != torch.int32
+            or norm_scratch.numel() < routed_blocks * 3
+        ):
             raise ValueError("norm_scratch has the wrong size or dtype")
         tensors = (
             norm_scratch,
@@ -783,7 +972,9 @@ class FusedKimiK3Tail:
             step,
         )
         if any(not tensor.is_contiguous() for tensor in tensors):
-            raise ValueError("packed weights, scales, peers, and step must be contiguous")
+            raise ValueError(
+                "packed weights, scales, peers, and step must be contiguous"
+            )
         self.launch(
             routed_partial.data_ptr(),
             routed_reduced.data_ptr(),

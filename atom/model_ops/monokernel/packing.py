@@ -29,7 +29,9 @@ def pack_fp8(q: torch.Tensor) -> torch.Tensor:
 
     *lead, rows, k = q.shape
     if rows % 16 or k % 64:
-        raise ValueError(f"FP8 matrix dimensions must be divisible by (16, 64), got {(rows, k)}")
+        raise ValueError(
+            f"FP8 matrix dimensions must be divisible by (16, 64), got {(rows, k)}"
+        )
     w8 = q.view(torch.uint8).reshape(*lead, rows // 16, 16, k // 64, 2, 4, 8)
     nlead = len(lead)
     order = list(range(nlead)) + [nlead + position for position in (0, 2, 4, 1, 3, 5)]
@@ -43,7 +45,9 @@ def pack_mxfp8_weight(q: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"MXFP8 packing expects a matrix, got shape {tuple(q.shape)}")
     rows, k = q.shape
     if rows % 16 or k % 64:
-        raise ValueError(f"MXFP8 matrix dimensions must be divisible by (16, 64), got {(rows, k)}")
+        raise ValueError(
+            f"MXFP8 matrix dimensions must be divisible by (16, 64), got {(rows, k)}"
+        )
     values = q.view(torch.uint8).reshape(rows // 16, 16, k // 64, 4, 16)
     return values.permute(0, 2, 3, 1, 4).contiguous().view(-1)
 
@@ -53,7 +57,9 @@ def pack_mxfp8_scale(scale: torch.Tensor) -> torch.Tensor:
 
     scale = scale.view(torch.uint8)
     if scale.ndim != 2:
-        raise ValueError(f"MXFP8 scale packing expects a matrix, got shape {tuple(scale.shape)}")
+        raise ValueError(
+            f"MXFP8 scale packing expects a matrix, got shape {tuple(scale.shape)}"
+        )
     rows, groups = scale.shape
     if groups % 8:
         raise ValueError(f"MXFP8 scale groups must be divisible by 8, got {groups}")
@@ -71,7 +77,9 @@ def pack_bf16(w: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"BF16 packing expects a matrix, got shape {tuple(w.shape)}")
     rows, k = w.shape
     if rows % 16 or k % 64:
-        raise ValueError(f"BF16 matrix dimensions must be divisible by (16, 64), got {(rows, k)}")
+        raise ValueError(
+            f"BF16 matrix dimensions must be divisible by (16, 64), got {(rows, k)}"
+        )
     w16 = w.view(torch.int16).reshape(rows // 16, 16, k // 64, 2, 4, 8)
     return w16.permute(0, 2, 3, 4, 1, 5).contiguous().view(-1)
 
@@ -91,8 +99,14 @@ def pack_mxfp4(q: torch.Tensor) -> torch.Tensor:
     *lead, rows, packed_k = q.shape
     k = packed_k * 2
     if rows % 16 or k % 128:
-        raise ValueError(f"MXFP4 matrix dimensions must be divisible by (16, 128), got {(rows, k)}")
-    w4 = q.reshape(*lead, rows // 16, 16, k // 128, 4, 4, 4).view(torch.int32).squeeze(-1)
+        raise ValueError(
+            f"MXFP4 matrix dimensions must be divisible by (16, 128), got {(rows, k)}"
+        )
+    w4 = (
+        q.reshape(*lead, rows // 16, 16, k // 128, 4, 4, 4)
+        .view(torch.int32)
+        .squeeze(-1)
+    )
     nlead = len(lead)
     order = list(range(nlead)) + [nlead + position for position in (0, 2, 4, 1, 3)]
     return w4.permute(*order).contiguous().view(torch.uint8).view(-1)
@@ -119,13 +133,17 @@ def pack_a16w4_scale(scale: torch.Tensor) -> torch.Tensor:
 
     scale = scale.view(torch.uint8)
     if scale.ndim < 2:
-        raise ValueError(f"A16W4 scales must have at least two dimensions, got {scale.ndim}")
+        raise ValueError(
+            f"A16W4 scales must have at least two dimensions, got {scale.ndim}"
+        )
     groups = scale.shape[-1]
     rows = scale.numel() // groups
     flat = scale.reshape(rows, groups)
     padded_rows = (rows + 255) // 256 * 256
     padded_groups = (groups + 7) // 8 * 8
-    padded = torch.zeros(padded_rows, padded_groups, dtype=torch.uint8, device=scale.device)
+    padded = torch.zeros(
+        padded_rows, padded_groups, dtype=torch.uint8, device=scale.device
+    )
     padded[:rows, :groups] = flat
     packed = padded.view(padded_rows // 32, 2, 16, padded_groups // 8, 2, 4)
     return packed.permute(0, 3, 5, 2, 4, 1).contiguous().view(-1)
@@ -150,35 +168,56 @@ def pack_layer_weights(
     config = as_layer_config(model_config)
     attention_names = ("w_qkv_a", "w_q_b", "w_uk", "w_uv", "w_o")
     expert_names = ("w_ug", "w_dn")
-    required = attention_names if attention_only else (*attention_names, *expert_names, "w_r")
+    required = (
+        attention_names if attention_only else (*attention_names, *expert_names, "w_r")
+    )
     missing = [name for name in required if name not in tensors]
     if missing:
         raise ValueError(f"missing layer weights: {', '.join(missing)}")
 
-    pack_attention = pack_bf16 if config.attention_weight is AttentionWeight.BF16 else pack_fp8
+    pack_attention = (
+        pack_bf16 if config.attention_weight is AttentionWeight.BF16 else pack_fp8
+    )
     packed = {name: pack_attention(tensors[name]) for name in attention_names}
     if attention_only:
         return packed
 
     weight = moe_format(moe_mode).weight
     weight_layout = (
-        Mxfp4WeightLayout.NATIVE if mxfp4_weight_layout is None else as_mxfp4_weight_layout(mxfp4_weight_layout)
+        Mxfp4WeightLayout.NATIVE
+        if mxfp4_weight_layout is None
+        else as_mxfp4_weight_layout(mxfp4_weight_layout)
     )
-    scale_layout = Mxfp4ScaleLayout.NATIVE if mxfp4_scale_layout is None else as_mxfp4_scale_layout(mxfp4_scale_layout)
+    scale_layout = (
+        Mxfp4ScaleLayout.NATIVE
+        if mxfp4_scale_layout is None
+        else as_mxfp4_scale_layout(mxfp4_scale_layout)
+    )
     router_layout = (
-        RouterWeightLayout.NATIVE if router_weight_layout is None else as_router_weight_layout(router_weight_layout)
+        RouterWeightLayout.NATIVE
+        if router_weight_layout is None
+        else as_router_weight_layout(router_weight_layout)
     )
 
     if weight is ExpertWeight.MXFP4_BLOCK32:
-        pack_expert = pack_a16w4_weight if weight_layout is Mxfp4WeightLayout.ATOM else pack_mxfp4
+        pack_expert = (
+            pack_a16w4_weight if weight_layout is Mxfp4WeightLayout.ATOM else pack_mxfp4
+        )
     else:
-        if weight_layout is not Mxfp4WeightLayout.NATIVE or scale_layout is not Mxfp4ScaleLayout.NATIVE:
+        if (
+            weight_layout is not Mxfp4WeightLayout.NATIVE
+            or scale_layout is not Mxfp4ScaleLayout.NATIVE
+        ):
             raise ValueError("ATOM MXFP4 layouts require an MXFP4 expert mode")
         pack_expert = pack_fp8
     packed.update({name: pack_expert(tensors[name]) for name in expert_names})
     if scale_layout is Mxfp4ScaleLayout.ATOM:
-        packed.update({name: pack_a16w4_scale(tensors[name]) for name in ("s_ug", "s_dn")})
+        packed.update(
+            {name: pack_a16w4_scale(tensors[name]) for name in ("s_ug", "s_dn")}
+        )
     packed["w_r"] = (
-        pack_bf16_atom(tensors["w_r"]) if router_layout is RouterWeightLayout.ATOM else pack_bf16(tensors["w_r"])
+        pack_bf16_atom(tensors["w_r"])
+        if router_layout is RouterWeightLayout.ATOM
+        else pack_bf16(tensors["w_r"])
     )
     return packed

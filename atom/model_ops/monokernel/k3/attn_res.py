@@ -39,7 +39,9 @@ def build_kimi_k3_attn_res(
     if num_blocks < 0:
         raise ValueError(f"num_blocks must be non-negative, got {num_blocks}")
     if source_override_idx < -1 or source_override_idx >= num_blocks:
-        raise ValueError(f"source_override_idx must be in [-1, {num_blocks}), got {source_override_idx}")
+        raise ValueError(
+            f"source_override_idx must be in [-1, {num_blocks}), got {source_override_idx}"
+        )
     num_sources = num_blocks + 1
     pair_rounds = hidden // (2 * _THREADS)
 
@@ -99,32 +101,46 @@ def build_kimi_k3_attn_res(
             return lhs_total, rhs_total
 
         def load_updated(pair):
-            prefix_word = fx.Int32(bo.buffer_load(prefix_rsrc, pair, vec_width=1, dtype=T.i32))
+            prefix_word = fx.Int32(
+                bo.buffer_load(prefix_rsrc, pair, vec_width=1, dtype=T.i32)
+            )
             if const_expr(has_delta):
-                delta_word = fx.Int32(bo.buffer_load(delta_rsrc, pair, vec_width=1, dtype=T.i32))
+                delta_word = fx.Int32(
+                    bo.buffer_load(delta_rsrc, pair, vec_width=1, dtype=T.i32)
+                )
                 prefix_lo = (prefix_word << 16).bitcast(fx.Float32)
                 prefix_hi = (prefix_word & fx.Int32(-65536)).bitcast(fx.Float32)
                 delta_lo = (delta_word << 16).bitcast(fx.Float32)
                 delta_hi = (delta_word & fx.Int32(-65536)).bitcast(fx.Float32)
-                return (prefix_lo + delta_lo).to(fx.BFloat16), (prefix_hi + delta_hi).to(fx.BFloat16)
-            return (prefix_word << 16).bitcast(fx.Float32).to(fx.BFloat16), (prefix_word & fx.Int32(-65536)).bitcast(
-                fx.Float32
-            ).to(fx.BFloat16)
+                return (prefix_lo + delta_lo).to(fx.BFloat16), (
+                    prefix_hi + delta_hi
+                ).to(fx.BFloat16)
+            return (prefix_word << 16).bitcast(fx.Float32).to(fx.BFloat16), (
+                prefix_word & fx.Int32(-65536)
+            ).bitcast(fx.Float32).to(fx.BFloat16)
 
         def store_output(pair_in_row, value_lo, value_hi):
-            output_values = fx.Vector.from_elements([value_lo, value_hi], fx.Float32).to(fx.BFloat16)
+            output_values = fx.Vector.from_elements(
+                [value_lo, value_hi], fx.Float32
+            ).to(fx.BFloat16)
             output_word = output_values.bitcast(fx.Int32)[0]
-            bo.buffer_store(output_word, output_rsrc, sample * (hidden // 2) + pair_in_row)
+            bo.buffer_store(
+                output_word, output_rsrc, sample * (hidden // 2) + pair_in_row
+            )
             if const_expr(quantize_output):
                 values = output_values.to(fx.Float32)
-                amax = fx.max(fx.max(values[0], -values[0]), fx.max(values[1], -values[1]))
+                amax = fx.max(
+                    fx.max(values[0], -values[0]), fx.max(values[1], -values[1])
+                )
                 for offset in (8, 4, 2, 1):
                     amax = xred(amax, offset, fx.max)
                 raw_scale = amax * fx.Float32(1.0 / FP8_MAX)
                 bits = raw_scale.bitcast(fx.Int32)
                 exponent = bits.shrui(fx.Int32(23)) & fx.Int32(0xFF)
                 round_up = ((bits & fx.Int32(0x400000)) != 0) & (
-                    ((bits & fx.Int32(0x200000)) != 0) | ((bits & fx.Int32(0x1FFFFF)) != 0) | (exponent > 0)
+                    ((bits & fx.Int32(0x200000)) != 0)
+                    | ((bits & fx.Int32(0x1FFFFF)) != 0)
+                    | (exponent > 0)
                 )
                 exponent = exponent + round_up.select(fx.Int32(1), fx.Int32(0))
                 nonzero = amax > fx.Float32(0.0)
@@ -135,7 +151,9 @@ def build_kimi_k3_attn_res(
                 inverse = nonzero.select(rcp(scale), fx.Float32(1.0))
                 q0 = fx.min(fx.max(values[0] * inverse, -FP8_MAX), FP8_MAX)
                 q1 = fx.min(fx.max(values[1] * inverse, -FP8_MAX), FP8_MAX)
-                packed = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False)) & fx.Int32(0xFFFF)
+                packed = fx.Int32(
+                    rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False)
+                ) & fx.Int32(0xFFFF)
                 neighbor = xshfl(packed, 1)
                 if lane % 2 == 0:
                     bo.buffer_store(
@@ -146,7 +164,10 @@ def build_kimi_k3_attn_res(
                 if lane % 16 == 0:
                     scale_col = pair_in_row // 16
                     scale_offset = (
-                        (scale_col // 8) * 256 + (scale_col % 4) * 64 + sample * 4 + ((scale_col // 4) % 2) * 2
+                        (scale_col // 8) * 256
+                        + (scale_col % 4) * 64
+                        + sample * 4
+                        + ((scale_col // 4) % 2) * 2
                     )
                     bo.buffer_store(
                         exponent.to(fx.Uint8),
@@ -160,17 +181,25 @@ def build_kimi_k3_attn_res(
             square_sum = fx.Float32(0.0)
             for pair_round in range_constexpr(pair_rounds):
                 pair_in_row = tid + pair_round * _THREADS
-                value_lo_bf16, value_hi_bf16 = load_updated(sample * (hidden // 2) + pair_in_row)
+                value_lo_bf16, value_hi_bf16 = load_updated(
+                    sample * (hidden // 2) + pair_in_row
+                )
                 value_lo = fx.Float32(value_lo_bf16)
                 value_hi = fx.Float32(value_hi_bf16)
                 updated_pairs.append((value_lo, value_hi))
                 square_sum = square_sum + value_lo * value_lo + value_hi * value_hi
                 updated_word = (
-                    fx.Vector.from_elements([value_lo, value_hi], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0]
+                    fx.Vector.from_elements([value_lo, value_hi], fx.Float32)
+                    .to(fx.BFloat16)
+                    .bitcast(fx.Int32)[0]
                 )
-                bo.buffer_store(updated_word, updated_out_rsrc, sample * (hidden // 2) + pair_in_row)
+                bo.buffer_store(
+                    updated_word, updated_out_rsrc, sample * (hidden // 2) + pair_in_row
+                )
                 if const_expr(block_write_idx >= 0):
-                    block_pair = (sample * block_stride + block_write_idx) * (hidden // 2) + pair_in_row
+                    block_pair = (sample * block_stride + block_write_idx) * (
+                        hidden // 2
+                    ) + pair_in_row
                     bo.buffer_store(updated_word, blocks_rsrc, block_pair)
 
             total_square, _ = block_sums(square_sum, fx.Float32(0.0))
@@ -178,7 +207,9 @@ def build_kimi_k3_attn_res(
             for pair_round in range_constexpr(pair_rounds):
                 pair_in_row = tid + pair_round * _THREADS
                 output_weight_word = fx.Int32(
-                    bo.buffer_load(output_norm_weight_rsrc, pair_in_row, vec_width=1, dtype=T.i32)
+                    bo.buffer_load(
+                        output_norm_weight_rsrc, pair_in_row, vec_width=1, dtype=T.i32
+                    )
                 )
                 weight_lo = (output_weight_word << 16).bitcast(fx.Float32)
                 weight_hi = (output_weight_word & fx.Int32(-65536)).bitcast(fx.Float32)
@@ -208,36 +239,66 @@ def build_kimi_k3_attn_res(
                                 dtype=T.i32,
                             )
                         )
-                        source_pair = (sample * block_stride + source) * (hidden // 2) + pair_in_row
+                        source_pair = (sample * block_stride + source) * (
+                            hidden // 2
+                        ) + pair_in_row
                         bo.buffer_store(source_word, blocks_rsrc, source_pair)
                     else:
-                        source_pair = (sample * block_stride + source) * (hidden // 2) + pair_in_row
-                        source_word = fx.Int32(bo.buffer_load(blocks_rsrc, source_pair, vec_width=1, dtype=T.i32))
+                        source_pair = (sample * block_stride + source) * (
+                            hidden // 2
+                        ) + pair_in_row
+                        source_word = fx.Int32(
+                            bo.buffer_load(
+                                blocks_rsrc, source_pair, vec_width=1, dtype=T.i32
+                            )
+                        )
                     value_lo = (source_word << 16).bitcast(fx.Float32)
                     value_hi = (source_word & fx.Int32(-65536)).bitcast(fx.Float32)
                 else:
-                    value_lo_bf16, value_hi_bf16 = load_updated(sample * (hidden // 2) + pair_in_row)
+                    value_lo_bf16, value_hi_bf16 = load_updated(
+                        sample * (hidden // 2) + pair_in_row
+                    )
                     value_lo = fx.Float32(value_lo_bf16)
                     value_hi = fx.Float32(value_hi_bf16)
                     updated_word = (
-                        fx.Vector.from_elements([value_lo, value_hi], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0]
+                        fx.Vector.from_elements([value_lo, value_hi], fx.Float32)
+                        .to(fx.BFloat16)
+                        .bitcast(fx.Int32)[0]
                     )
-                    bo.buffer_store(updated_word, updated_out_rsrc, sample * (hidden // 2) + pair_in_row)
+                    bo.buffer_store(
+                        updated_word,
+                        updated_out_rsrc,
+                        sample * (hidden // 2) + pair_in_row,
+                    )
                     if const_expr(block_write_idx >= 0):
-                        block_pair = (sample * block_stride + block_write_idx) * (hidden // 2) + pair_in_row
+                        block_pair = (sample * block_stride + block_write_idx) * (
+                            hidden // 2
+                        ) + pair_in_row
                         bo.buffer_store(updated_word, blocks_rsrc, block_pair)
 
                 if const_expr(num_sources <= 2):
                     source_pairs.append((value_lo, value_hi))
 
-                norm_word = fx.Int32(bo.buffer_load(norm_weight_rsrc, pair_in_row, vec_width=1, dtype=T.i32))
-                qk_word = fx.Int32(bo.buffer_load(qk_weight_rsrc, pair_in_row, vec_width=1, dtype=T.i32))
+                norm_word = fx.Int32(
+                    bo.buffer_load(
+                        norm_weight_rsrc, pair_in_row, vec_width=1, dtype=T.i32
+                    )
+                )
+                qk_word = fx.Int32(
+                    bo.buffer_load(
+                        qk_weight_rsrc, pair_in_row, vec_width=1, dtype=T.i32
+                    )
+                )
                 norm_lo = (norm_word << 16).bitcast(fx.Float32)
                 norm_hi = (norm_word & fx.Int32(-65536)).bitcast(fx.Float32)
                 qk_lo = (qk_word << 16).bitcast(fx.Float32)
                 qk_hi = (qk_word & fx.Int32(-65536)).bitcast(fx.Float32)
                 square_sum = square_sum + value_lo * value_lo + value_hi * value_hi
-                weighted_sum = weighted_sum + value_lo * norm_lo * qk_lo + value_hi * norm_hi * qk_hi
+                weighted_sum = (
+                    weighted_sum
+                    + value_lo * norm_lo * qk_lo
+                    + value_hi * norm_hi * qk_hi
+                )
 
             total_square, total_weighted = block_sums(square_sum, weighted_sum)
             logits.append(total_weighted * rsq(total_square * (1.0 / hidden) + EPS))
@@ -252,7 +313,9 @@ def build_kimi_k3_attn_res(
         for source in range_constexpr(1, num_sources):
             probability_sum = probability_sum + probabilities[source]
         inverse_probability_sum = rcp(probability_sum)
-        probabilities = [probability * inverse_probability_sum for probability in probabilities]
+        probabilities = [
+            probability * inverse_probability_sum for probability in probabilities
+        ]
 
         mixed_pairs = []
         mixed_square_sum = fx.Float32(0.0)
@@ -275,25 +338,37 @@ def build_kimi_k3_attn_res(
                                 )
                             )
                         else:
-                            source_pair = (sample * block_stride + source) * (hidden // 2) + pair_in_row
-                            source_word = fx.Int32(bo.buffer_load(blocks_rsrc, source_pair, vec_width=1, dtype=T.i32))
+                            source_pair = (sample * block_stride + source) * (
+                                hidden // 2
+                            ) + pair_in_row
+                            source_word = fx.Int32(
+                                bo.buffer_load(
+                                    blocks_rsrc, source_pair, vec_width=1, dtype=T.i32
+                                )
+                            )
                         value_lo = (source_word << 16).bitcast(fx.Float32)
                         value_hi = (source_word & fx.Int32(-65536)).bitcast(fx.Float32)
                     else:
-                        value_lo_bf16, value_hi_bf16 = load_updated(sample * (hidden // 2) + pair_in_row)
+                        value_lo_bf16, value_hi_bf16 = load_updated(
+                            sample * (hidden // 2) + pair_in_row
+                        )
                         value_lo = fx.Float32(value_lo_bf16)
                         value_hi = fx.Float32(value_hi_bf16)
                 mixed_lo = mixed_lo + probabilities[source] * value_lo
                 mixed_hi = mixed_hi + probabilities[source] * value_hi
             mixed_pairs.append((mixed_lo, mixed_hi))
-            mixed_square_sum = mixed_square_sum + mixed_lo * mixed_lo + mixed_hi * mixed_hi
+            mixed_square_sum = (
+                mixed_square_sum + mixed_lo * mixed_lo + mixed_hi * mixed_hi
+            )
 
         total_mixed_square, _ = block_sums(mixed_square_sum, fx.Float32(0.0))
         output_inverse_rms = rsq(total_mixed_square * (1.0 / hidden) + EPS)
         for pair_round in range_constexpr(pair_rounds):
             pair_in_row = tid + pair_round * _THREADS
             output_weight_word = fx.Int32(
-                bo.buffer_load(output_norm_weight_rsrc, pair_in_row, vec_width=1, dtype=T.i32)
+                bo.buffer_load(
+                    output_norm_weight_rsrc, pair_in_row, vec_width=1, dtype=T.i32
+                )
             )
             weight_lo = (output_weight_word << 16).bitcast(fx.Float32)
             weight_hi = (output_weight_word & fx.Int32(-65536)).bitcast(fx.Float32)
@@ -380,14 +455,32 @@ class KimiK3AttnRes:
         quantized_output: torch.Tensor | None = None,
         quantized_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        tensors = (prefix, delta, blocks, norm_weight, qk_weight, output_norm_weight, updated_out, output)
-        if any(tensor.dtype != torch.bfloat16 or not tensor.is_contiguous() for tensor in tensors):
-            raise ValueError("Kimi-K3 AttnRes inputs and outputs must be contiguous BF16 tensors")
+        tensors = (
+            prefix,
+            delta,
+            blocks,
+            norm_weight,
+            qk_weight,
+            output_norm_weight,
+            updated_out,
+            output,
+        )
+        if any(
+            tensor.dtype != torch.bfloat16 or not tensor.is_contiguous()
+            for tensor in tensors
+        ):
+            raise ValueError(
+                "Kimi-K3 AttnRes inputs and outputs must be contiguous BF16 tensors"
+            )
         if prefix.shape != (self.samples, self.hidden) or delta.shape != prefix.shape:
             raise ValueError("prefix and delta must have shape [samples, hidden]")
         if updated_out.shape != prefix.shape or output.shape != prefix.shape:
             raise ValueError("updated_out and output must match prefix")
-        if blocks.ndim != 3 or blocks.shape[0] != self.samples or blocks.shape[2] != self.hidden:
+        if (
+            blocks.ndim != 3
+            or blocks.shape[0] != self.samples
+            or blocks.shape[2] != self.hidden
+        ):
             raise ValueError("blocks must have shape [samples, blocks, hidden]")
         for weight in (norm_weight, qk_weight, output_norm_weight):
             if weight.shape != (self.hidden,):
@@ -395,9 +488,15 @@ class KimiK3AttnRes:
         if self.quantize_output:
             if quantized_output is None or quantized_scale is None:
                 raise ValueError("quantized output buffers are required")
-            if quantized_output.shape != (32, self.hidden) or quantized_output.dtype != torch.uint8:
+            if (
+                quantized_output.shape != (32, self.hidden)
+                or quantized_output.dtype != torch.uint8
+            ):
                 raise ValueError("quantized_output must be uint8 [32, hidden]")
-            if quantized_scale.numel() != 32 * (self.hidden // 32) or quantized_scale.dtype != torch.uint8:
+            if (
+                quantized_scale.numel() != 32 * (self.hidden // 32)
+                or quantized_scale.dtype != torch.uint8
+            ):
                 raise ValueError("quantized_scale has the wrong packed size or dtype")
         else:
             quantized_output = output

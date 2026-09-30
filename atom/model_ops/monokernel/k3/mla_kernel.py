@@ -166,10 +166,14 @@ def build_kimi_k3_mla_attention(
     attention_bf16 = config.attention_weight is AttentionWeight.BF16
     attention_k_chunks_per_unit = 1 if attention_bf16 else 2
     attention_output_gate = config.attention_output_gate
-    dedicated_input_norm = attention_input_norm and not config.attention_input_norm and S > 4
+    dedicated_input_norm = (
+        attention_input_norm and not config.attention_input_norm and S > 4
+    )
     attention_residual = config.attention_residual
 
-    assert heads == config.local_heads, f"{config.name} requires {config.local_heads} local heads"
+    assert (
+        heads == config.local_heads
+    ), f"{config.name} requires {config.local_heads} local heads"
     assert sparse_attention_topk % SPLIT_KEYS == 0 and 1 <= S <= 8
     assert 1 <= launches_per_step <= LAYER_SLOTS
     fmt = moe_format(moe_mode)
@@ -184,8 +188,14 @@ def build_kimi_k3_mla_attention(
         else (PUBLISH_BLOCKS + N_ROUTER - 1) // N_ROUTER
     )
     assert XQ_WAVES <= WAVES
-    down_scale_words = 0 if fmt.activation_group is None else S * MOE_SLOTS * INTER // fmt.activation_group
-    misc_words = max(sparse_attention_topk // SPLIT_KEYS, 8 + max(S * XQ_BLOCKS, down_scale_words))
+    down_scale_words = (
+        0
+        if fmt.activation_group is None
+        else S * MOE_SLOTS * INTER // fmt.activation_group
+    )
+    misc_words = max(
+        sparse_attention_topk // SPLIT_KEYS, 8 + max(S * XQ_BLOCKS, down_scale_words)
+    )
     H = heads
     W = npes
     G = BLOCKS
@@ -329,15 +339,21 @@ def build_kimi_k3_mla_attention(
         pos0 = _uniform(bo.buffer_load(_rsrc(cur_pos), 0, vec_width=1, dtype=T.i32))
         r_peers = _rsrc(peers)
         # Each wave sends to one peer, so retain only that wave's destination.
-        pv = fx.Vector(bo.buffer_load(r_peers, fx.min(wave, W - 1) * 2, vec_width=2, dtype=T.i32))
-        peer_dst = (fx.Int64(_uniform(pv[1])) << 32) | fx.Int64(fx.Uint32(_uniform(pv[0])))
+        pv = fx.Vector(
+            bo.buffer_load(r_peers, fx.min(wave, W - 1) * 2, vec_width=2, dtype=T.i32)
+        )
+        peer_dst = (fx.Int64(_uniform(pv[1])) << 32) | fx.Int64(
+            fx.Uint32(_uniform(pv[0]))
+        )
 
         # ------------------------------------------------------------ helpers
         def ld_f32(r, i):
             return fx.Float32(bo.buffer_load(r, i, vec_width=1, dtype=T.f32))
 
         def ld_bf16(r, i):
-            return fx.Float32(fx.BFloat16(bo.buffer_load(r, i, vec_width=1, dtype=T.bf16)))
+            return fx.Float32(
+                fx.BFloat16(bo.buffer_load(r, i, vec_width=1, dtype=T.bf16))
+            )
 
         def lds_ld(ptr, i):
             return fx.ptr_load(ptr + i)
@@ -347,7 +363,11 @@ def build_kimi_k3_mla_attention(
 
         def bf16_pair(a, b):
             """Two f32 -> one f32-typed word holding (bf16(a), bf16(b))."""
-            return fx.Vector.from_elements([a, b], fx.Float32).to(fx.BFloat16).bitcast(fx.Float32)[0]
+            return (
+                fx.Vector.from_elements([a, b], fx.Float32)
+                .to(fx.BFloat16)
+                .bitcast(fx.Float32)[0]
+            )
 
         def bf16_round(a):
             return fx.Float32(fx.Float32(a).to(fx.BFloat16))
@@ -359,35 +379,62 @@ def build_kimi_k3_mla_attention(
         def put(base_addr, i, v, cm=CM_DEV):
             """Pair i := (v, tag); ``v`` f32 (or int32 bits)."""
             bits = v.bitcast(fx.Int32) if isinstance(v, fx.Float32) else fx.Int32(v)
-            bo.buffer_store(fx.Vector.from_elements([bits, tag], fx.Int32), _rsrc(base_addr), i * 2, cache_modifier=cm)
+            bo.buffer_store(
+                fx.Vector.from_elements([bits, tag], fx.Int32),
+                _rsrc(base_addr),
+                i * 2,
+                cache_modifier=cm,
+            )
 
         def put2(base_addr, i, v0, v1, cm=CM_DEV):
             """Pairs i, i+1 (i even) in one 16-byte store."""
             vec = fx.Vector.from_elements(
-                [fx.Float32(v0).bitcast(fx.Int32), tag, fx.Float32(v1).bitcast(fx.Int32), tag], fx.Int32
+                [
+                    fx.Float32(v0).bitcast(fx.Int32),
+                    tag,
+                    fx.Float32(v1).bitcast(fx.Int32),
+                    tag,
+                ],
+                fx.Int32,
             )
             bo.buffer_store(vec, _rsrc(base_addr), i * 2, cache_modifier=cm)
 
         def put_bf(base_addr, i, vs, cm=CM_DEV, store_tag=None):
             """Elements i .. i + len(vs) (2 or 4, i aligned) as packed bf16 pairs: pair
-            i / 2 + j := (bf16(vs[2j]) | bf16(vs[2j + 1]) << 16, tag), one 8 / 16-byte store."""
+            i / 2 + j := (bf16(vs[2j]) | bf16(vs[2j + 1]) << 16, tag), one 8 / 16-byte store.
+            """
             write_tag = tag if store_tag is None else store_tag
             words = []
             for j in range_constexpr(len(vs) // 2):
-                words += [bf16_pair(vs[2 * j], vs[2 * j + 1]).bitcast(fx.Int32), write_tag]
-            bo.buffer_store(fx.Vector.from_elements(words, fx.Int32), _rsrc(base_addr), i, cache_modifier=cm)
+                words += [
+                    bf16_pair(vs[2 * j], vs[2 * j + 1]).bitcast(fx.Int32),
+                    write_tag,
+                ]
+            bo.buffer_store(
+                fx.Vector.from_elements(words, fx.Int32),
+                _rsrc(base_addr),
+                i,
+                cache_modifier=cm,
+            )
 
         def bf2_f32(w):
             """Packed bf16 pair word -> (f32 low, f32 high)."""
-            return (w << 16).bitcast(fx.Float32), (w & fx.Int32(-65536)).bitcast(fx.Float32)
+            return (w << 16).bitcast(fx.Float32), (w & fx.Int32(-65536)).bitcast(
+                fx.Float32
+            )
 
         def _qptr(addr):
-            return fx.inttoptr(fx.PointerType.get(fx.Int64.ir_type, fx.AddressSpace.Global, 8), fx.Int64(addr))
+            return fx.inttoptr(
+                fx.PointerType.get(fx.Int64.ir_type, fx.AddressSpace.Global, 8),
+                fx.Int64(addr),
+            )
 
         def _ld_pair(addr, scope):
             """One (value, tag) pair as a single 64-bit relaxed atomic load: never hoisted,
             coherent at ``scope`` (agent -> sc1, system -> sc0 sc1)."""
-            return fx.generic_load(_qptr(addr), memory_order=fx.AtomicOrdering.Monotonic, syncscope=scope)
+            return fx.generic_load(
+                _qptr(addr), memory_order=fx.AtomicOrdering.Monotonic, syncscope=scope
+            )
 
         def poll(specs, scope="agent", batch=POLL_MAX, expected_tag=None):
             """Batched poll of mailbox pairs: ``specs`` = [(base_addr, pair index, npairs in {1, 2})].
@@ -401,7 +448,9 @@ def build_kimi_k3_mla_attention(
             if const_expr(len(specs) == 0):
                 return []
             if const_expr(len(specs) > batch):  # bound live registers
-                return poll(specs[:batch], scope, batch, expected_tag) + poll(specs[batch:], scope, batch, expected_tag)
+                return poll(specs[:batch], scope, batch, expected_tag) + poll(
+                    specs[batch:], scope, batch, expected_tag
+                )
             cm = CM_DEV if const_expr(scope == "agent") else CM_SYS
             wanted_tag = tag if expected_tag is None else expected_tag
 
@@ -409,7 +458,13 @@ def build_kimi_k3_mla_attention(
                 words = []
                 for b, i, n in specs:
                     w = fx.Vector(
-                        bo.buffer_load(_rsrc(b), fx.Int32(i) * 2, vec_width=2 * n, dtype=T.i32, cache_modifier=cm)
+                        bo.buffer_load(
+                            _rsrc(b),
+                            fx.Int32(i) * 2,
+                            vec_width=2 * n,
+                            dtype=T.i32,
+                            cache_modifier=cm,
+                        )
                     )
                     words += [w[e] for e in range(2 * n)]
                 return fx.Vector.from_elements(words, fx.Int32)
@@ -455,11 +510,16 @@ def build_kimi_k3_mla_attention(
 
         def getf_many(specs):
             """[(base, i)] single pairs -> list of f32."""
-            return [v[0].bitcast(fx.Float32) for v in poll([(b, i, 1) for b, i in specs])]
+            return [
+                v[0].bitcast(fx.Float32) for v in poll([(b, i, 1) for b, i in specs])
+            ]
 
         def get2_many(specs):
             """[(base, i)] double pairs (i even) -> list of (f32, f32)."""
-            return [(v[0].bitcast(fx.Float32), v[1].bitcast(fx.Float32)) for v in poll([(b, i, 2) for b, i in specs])]
+            return [
+                (v[0].bitcast(fx.Float32), v[1].bitcast(fx.Float32))
+                for v in poll([(b, i, 2) for b, i in specs])
+            ]
 
         def get2(base_addr, i):
             return get2_many([(base_addr, i)])[0]
@@ -516,7 +576,11 @@ def build_kimi_k3_mla_attention(
             """Issue one 64-k chunk of row group ``rg`` of a packed FP8 matrix; the
             bf16 activation chunk starts at LDS word ``b_word``."""
             ln = lane if ln is None else ln
-            wv = fx.Vector(bo.buffer_load(w_rsrc, ((rg * NKC + kc) * 64 + ln) * 4, vec_width=4, dtype=T.i32))
+            wv = fx.Vector(
+                bo.buffer_load(
+                    w_rsrc, ((rg * NKC + kc) * 64 + ln) * 4, vec_width=4, dtype=T.i32
+                )
+            )
             s = ld_f32(s_rsrc, (rg * 16 // SCALE_BM) * (K // BK) + kc * 64 // BK)
             if const_expr(callable(coef)):  # factor known only after a later wait
                 return ("fp8", [wv], lambda: s * coef(), b_word + (lane // 16) * 4)
@@ -529,7 +593,14 @@ def build_kimi_k3_mla_attention(
 
             ln = lane if ln is None else ln
             wv = [
-                fx.Vector(bo.buffer_load(w_rsrc, ((rg * NKC + kc + h) * 64 + ln) * 4, vec_width=4, dtype=T.i32))
+                fx.Vector(
+                    bo.buffer_load(
+                        w_rsrc,
+                        ((rg * NKC + kc + h) * 64 + ln) * 4,
+                        vec_width=4,
+                        dtype=T.i32,
+                    )
+                )
                 for h in range(2)
             ]
             s = ld_f32(s_rsrc, (rg * 16 // SCALE_BM) * (K // 128) + kc // 2)
@@ -546,7 +617,14 @@ def build_kimi_k3_mla_attention(
             = the lane whose weights are loaded (default: own lane)."""
             ln = lane if ln is None else ln
             wv = [
-                fx.Vector(bo.buffer_load(w_rsrc, ((rg * NKC + kc + h) * 64 + ln) * 4, vec_width=4, dtype=T.i32))
+                fx.Vector(
+                    bo.buffer_load(
+                        w_rsrc,
+                        ((rg * NKC + kc + h) * 64 + ln) * 4,
+                        vec_width=4,
+                        dtype=T.i32,
+                    )
+                )
                 for h in range(2)
             ]
             s = ld_f32(s_rsrc, (rg * 16 // SCALE_BM) * (K // 128) + kc // 2)
@@ -556,11 +634,23 @@ def build_kimi_k3_mla_attention(
             """Issue one packed 128-K MXFP4 tile and its four per-row E8M0 scales."""
 
             ln = lane if ln is None else ln
-            raw = fx.Vector(bo.buffer_load(w_rsrc, ((rg * (K // 128) + kc) * 64 + ln) * 4, vec_width=4, dtype=T.i32))
+            raw = fx.Vector(
+                bo.buffer_load(
+                    w_rsrc,
+                    ((rg * (K // 128) + kc) * 64 + ln) * 4,
+                    vec_width=4,
+                    dtype=T.i32,
+                )
+            )
             row = rg * 16 + ln % 16
-            packed_scale = fx.Int32(bo.buffer_load(s_rsrc, row * (K // 128) + kc, vec_width=1, dtype=T.i32))
+            packed_scale = fx.Int32(
+                bo.buffer_load(s_rsrc, row * (K // 128) + kc, vec_width=1, dtype=T.i32)
+            )
             scales = [
-                ((packed_scale.shrui(fx.Int32(sp * 8)) & fx.Int32(0xFF)) << fx.Int32(23)).bitcast(fx.Float32)
+                (
+                    (packed_scale.shrui(fx.Int32(sp * 8)) & fx.Int32(0xFF))
+                    << fx.Int32(23)
+                ).bitcast(fx.Float32)
                 for sp in range_constexpr(4)
             ]
             return ("mxfp4", (raw, scales), coef, b_word + (lane // 16) * 4)
@@ -598,10 +688,16 @@ def build_kimi_k3_mla_attention(
                     raw, scales = wv
                     for sp in range_constexpr(4):
                         a = _mxfp4_to_bf16x8(raw[sp], scales[sp])
-                        b = fx.ptr_load(xs + (bw + sp * 16), result_type=v4f).bitcast(fx.BFloat16)
+                        b = fx.ptr_load(xs + (bw + sp * 16), result_type=v4f).bitcast(
+                            fx.BFloat16
+                        )
                         c = fx.Vector.filled(4, 0.0, fx.Float32)
-                        c = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
-                        part_coef = coef[sp] if const_expr(isinstance(coef, list)) else coef
+                        c = fx.Vector(
+                            rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c])
+                        )
+                        part_coef = (
+                            coef[sp] if const_expr(isinstance(coef, list)) else coef
+                        )
                         if const_expr(callable(part_coef)):
                             part_coef = part_coef()
                         if const_expr(part_coef is None):
@@ -610,15 +706,26 @@ def build_kimi_k3_mla_attention(
                             acc = [acc[e] + c[e] * part_coef for e in range(4)]
                     continue
                 c = fx.Vector.filled(4, 0.0, fx.Float32)
-                if const_expr(unit_format == "f8f8"):  # one FP8 x FP8 MFMA (E8M0 scales = 1)
-                    a = fx.Vector.from_elements([wv[h][e] for h in range(2) for e in range(4)], fx.Int32)
+                if const_expr(
+                    unit_format == "f8f8"
+                ):  # one FP8 x FP8 MFMA (E8M0 scales = 1)
+                    a = fx.Vector.from_elements(
+                        [wv[h][e] for h in range(2) for e in range(4)], fx.Int32
+                    )
                     bv = [
-                        fx.Vector(fx.ptr_load(xs + (bw + h * 16), result_type=v4f)).bitcast(fx.Int32) for h in range(2)
+                        fx.Vector(
+                            fx.ptr_load(xs + (bw + h * 16), result_type=v4f)
+                        ).bitcast(fx.Int32)
+                        for h in range(2)
                     ]
-                    b = fx.Vector.from_elements([bv[h][e] for h in range(2) for e in range(4)], fx.Int32)
+                    b = fx.Vector.from_elements(
+                        [bv[h][e] for h in range(2) for e in range(4)], fx.Int32
+                    )
                     one = fx.Int32(127)
                     c = fx.Vector(
-                        rocdl.mfma_scale_f32_16x16x128_f8f6f4(T.vec(4, T.f32), [a, b, c, 0, 0, 0, one, 0, one])
+                        rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                            T.vec(4, T.f32), [a, b, c, 0, 0, 0, one, 0, one]
+                        )
                     )
                 nsp = 4 if unit_format == "fp8x2" else 2 if unit_format != "f8f8" else 0
                 for sp in range_constexpr(nsp):
@@ -628,8 +735,12 @@ def build_kimi_k3_mla_attention(
                         a = _fp8_to_bf16x8(wv[wh][ws * 2], wv[wh][ws * 2 + 1])
                     else:
                         a = wv[sp].bitcast(fx.BFloat16)
-                    b = fx.ptr_load(xs + (bw + sp * 16), result_type=v4f).bitcast(fx.BFloat16)
-                    c = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
+                    b = fx.ptr_load(xs + (bw + sp * 16), result_type=v4f).bitcast(
+                        fx.BFloat16
+                    )
+                    c = fx.Vector(
+                        rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c])
+                    )
                 if const_expr(coef is None):
                     acc = [acc[e] + c[e] for e in range(4)]
                 else:
@@ -641,7 +752,11 @@ def build_kimi_k3_mla_attention(
             ``pre`` = the already-issued first batch (prefetched before a wait)."""
             acc = [fx.Float32(0.0) for _ in range(4)]
             starts = list(range(0, cpw, batch))
-            cur = pre if pre is not None else [make_unit(c) for c in range(0, min(batch, cpw))]
+            cur = (
+                pre
+                if pre is not None
+                else [make_unit(c) for c in range(0, min(batch, cpw))]
+            )
             for bi in range_constexpr(len(starts)):
                 nxt = None
                 if const_expr(bi + 1 < len(starts)):
@@ -654,7 +769,9 @@ def build_kimi_k3_mla_attention(
         def reduce_rows(R, acc, emit):
             """Sum the per-wave MFMA tiles of each of R row groups; emit(row_local, n, v) for n < S."""
             wpr = WAVES // R
-            fx.ptr_store(fx.Vector.from_elements(acc, fx.Float32), red + (wave * 64 + lane) * 4)
+            fx.ptr_store(
+                fx.Vector.from_elements(acc, fx.Float32), red + (wave * 64 + lane) * 4
+            )
             gpu.barrier()
             n_out = R * 16 * S
             for i in range_constexpr((n_out + THREADS - 1) // THREADS):
@@ -666,7 +783,9 @@ def build_kimi_k3_mla_attention(
                     tot = fx.Float32(0.0)
                     for j in range_constexpr(wpr):
                         ww = (rl // 16) * wpr + j
-                        tot = tot + lds_ld(red, (ww * 64 + n + 16 * (r // 4)) * 4 + r % 4)
+                        tot = tot + lds_ld(
+                            red, (ww * 64 + n + 16 * (r // 4)) * 4 + r % 4
+                        )
                     emit(rl, n, tot)
 
         def emit_out(stride):
@@ -681,7 +800,9 @@ def build_kimi_k3_mla_attention(
             ``loaded``: the (gamma, x) loads already issued by load_x_rmsnorm."""
             per = (n + 4 * THREADS - 1) // (4 * THREADS)
             ks = [(tid + i * THREADS) * 4 for i in range(per)]
-            gs, vals = loaded if loaded is not None else load_x_rmsnorm(ld4s, n, gamma, count)
+            gs, vals = (
+                loaded if loaded is not None else load_x_rmsnorm(ld4s, n, gamma, count)
+            )
             sss = []
             for s in range_constexpr(count):
                 ss = fx.Float32(0.0)
@@ -718,7 +839,11 @@ def build_kimi_k3_mla_attention(
             safe_ks = [fx.min(k, n - 4) for k in ks]
             gs = []
             for k in safe_ks:
-                g = fx.Vector(bo.buffer_load(rg_, k // 2, vec_width=2, dtype=T.i32)).bitcast(fx.BFloat16).to(fx.Float32)
+                g = (
+                    fx.Vector(bo.buffer_load(rg_, k // 2, vec_width=2, dtype=T.i32))
+                    .bitcast(fx.BFloat16)
+                    .to(fx.Float32)
+                )
                 gs.append([g[j] for j in range(4)])
             return gs, ld4s([(s, k) for s in range(count) for k in safe_ks])
 
@@ -741,17 +866,29 @@ def build_kimi_k3_mla_attention(
                     a = vals[s * per + i]
                     if ks[i] < n:
                         for j in range_constexpr(2):
-                            lds_st(xs, (s * n + ks[i]) // 2 + j, bf16_pair(a[2 * j], a[2 * j + 1]))
+                            lds_st(
+                                xs,
+                                (s * n + ks[i]) // 2 + j,
+                                bf16_pair(a[2 * j], a[2 * j + 1]),
+                            )
 
         def stage_x_pairs(name, n_total, src_of):
             """LDS bf16 X[k] = packed bf16 mailbox ``name`` element src_of(k) for k < n_total
-            (src_of contiguous over aligned groups of 4): one 16-byte poll per 4 elements."""
+            (src_of contiguous over aligned groups of 4): one 16-byte poll per 4 elements.
+            """
             nq = n_total // 4
             full = nq // THREADS
-            vals = poll([(mb(name), src_of((tid + i * THREADS) * 4) // 2, 2) for i in range(full)])
+            vals = poll(
+                [
+                    (mb(name), src_of((tid + i * THREADS) * 4) // 2, 2)
+                    for i in range(full)
+                ]
+            )
             for i in range_constexpr(full):
                 for j in range_constexpr(2):
-                    lds_st(xs, (tid + i * THREADS) * 2 + j, vals[i][j].bitcast(fx.Float32))
+                    lds_st(
+                        xs, (tid + i * THREADS) * 2 + j, vals[i][j].bitcast(fx.Float32)
+                    )
             if const_expr(nq % THREADS):
                 w = tid + full * THREADS
                 if w < nq:
@@ -769,7 +906,9 @@ def build_kimi_k3_mla_attention(
             amax = wave_max(fx.max(fmath.absf(a0), fmath.absf(a1)))
             nz = amax > 0.0
             qs = nz.select(amax * (1.0 / FP8_MAX), fx.Float32(1.0))
-            inv = nz.select(_rcp(amax) * FP8_MAX, fx.Float32(1.0))  # hardware rcp, no IEEE divide
+            inv = nz.select(
+                _rcp(amax) * FP8_MAX, fx.Float32(1.0)
+            )  # hardware rcp, no IEEE divide
             q0 = fx.min(fx.max(a0 * inv, -FP8_MAX), FP8_MAX)
             q1 = fx.min(fx.max(a1 * inv, -FP8_MAX), FP8_MAX)
             return q0, q1, qs
@@ -789,10 +928,14 @@ def build_kimi_k3_mla_attention(
             bits = raw_scale.bitcast(fx.Int32)
             exponent = (bits.shrui(fx.Int32(23))) & fx.Int32(0xFF)
             round_up = ((bits & fx.Int32(0x400000)) != 0) & (
-                ((bits & fx.Int32(0x200000)) != 0) | ((bits & fx.Int32(0x1FFFFF)) != 0) | (exponent > 0)
+                ((bits & fx.Int32(0x200000)) != 0)
+                | ((bits & fx.Int32(0x1FFFFF)) != 0)
+                | (exponent > 0)
             )
             exponent = exponent + round_up.select(fx.Int32(1), fx.Int32(0))
-            scale = nz.select((exponent << fx.Int32(23)).bitcast(fx.Float32), fx.Float32(1.0))
+            scale = nz.select(
+                (exponent << fx.Int32(23)).bitcast(fx.Float32), fx.Float32(1.0)
+            )
             inv = nz.select(_rcp(scale), fx.Float32(1.0))
             q0 = fx.min(fx.max(a0 * inv, -FP8_MAX), FP8_MAX)
             q1 = fx.min(fx.max(a1 * inv, -FP8_MAX), FP8_MAX)
@@ -804,13 +947,24 @@ def build_kimi_k3_mla_attention(
             if const_expr(use_fp8_block128):
                 nxw = HIDDEN // 4 // THREADS
                 got = poll(
-                    [(mb("xq"), sx * (HIDDEN // 4) + tid + i * THREADS, 1) for sx in samples for i in range(nxw)]
-                    + [(mb("xqs"), sx * XQ_BLOCKS + fx.min(tid, XQ_BLOCKS - 1), 1) for sx in samples]
+                    [
+                        (mb("xq"), sx * (HIDDEN // 4) + tid + i * THREADS, 1)
+                        for sx in samples
+                        for i in range(nxw)
+                    ]
+                    + [
+                        (mb("xqs"), sx * XQ_BLOCKS + fx.min(tid, XQ_BLOCKS - 1), 1)
+                        for sx in samples
+                    ]
                 )
                 for j in range_constexpr(len(samples)):
                     for i in range_constexpr(nxw):
                         wd = _f8_word((tid + i * THREADS) * 4)
-                        lds_st(xs, j * (HIDDEN // 4) + wd, got[j * nxw + i][0].bitcast(fx.Float32))
+                        lds_st(
+                            xs,
+                            j * (HIDDEN // 4) + wd,
+                            got[j * nxw + i][0].bitcast(fx.Float32),
+                        )
                     if tid < XQ_BLOCKS:
                         lds_st(
                             misc,
@@ -825,7 +979,10 @@ def build_kimi_k3_mla_attention(
                     for i in range_constexpr(per_thread):
                         chunk = fx.min(tid + i * THREADS, chunks - 1)
                         data_specs.append((mb("xq"), sx * (HIDDEN // 4) + chunk * 2, 2))
-                scale_specs = [(mb("xqs"), sx * XQ_BLOCKS + fx.min(tid, XQ_BLOCKS - 1), 1) for sx in samples]
+                scale_specs = [
+                    (mb("xqs"), sx * XQ_BLOCKS + fx.min(tid, XQ_BLOCKS - 1), 1)
+                    for sx in samples
+                ]
                 got = poll(data_specs + scale_specs)
                 for j in range_constexpr(len(samples)):
                     for i in range_constexpr(per_thread):
@@ -838,7 +995,8 @@ def build_kimi_k3_mla_attention(
                                     xs,
                                     j * (HIDDEN // 2) + chunk * 4 + pair,
                                     fx.Vector.from_elements(
-                                        [values[2 * pair], values[2 * pair + 1]], fx.BFloat16
+                                        [values[2 * pair], values[2 * pair + 1]],
+                                        fx.BFloat16,
                                     ).bitcast(fx.Float32)[0],
                                 )
                     if tid < XQ_BLOCKS:
@@ -850,7 +1008,11 @@ def build_kimi_k3_mla_attention(
             else:
                 nxw = HIDDEN // 2 // THREADS
                 got = poll(
-                    [(mb("xq"), sx * (HIDDEN // 2) + tid + i * THREADS, 1) for sx in samples for i in range(nxw)]
+                    [
+                        (mb("xq"), sx * (HIDDEN // 2) + tid + i * THREADS, 1)
+                        for sx in samples
+                        for i in range(nxw)
+                    ]
                 )
                 for j in range_constexpr(len(samples)):
                     for i in range_constexpr(nxw):
@@ -863,7 +1025,10 @@ def build_kimi_k3_mla_attention(
         def st_f8(k, q0, q1):
             """LDS FP8 activation bytes k, k + 1 (k even, held by this lane; lane ^ 1 holds
             k ^ 2) in ``f8_word`` order.  Call from the whole wave."""
-            w = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False)) & 0xFFFF
+            w = (
+                fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False))
+                & 0xFFFF
+            )
             nb = _xshfl(w, 1)
             if lane % 2 == 0:
                 lds_st(xs, _f8_word(k), (w | (nb << 16)).bitcast(fx.Float32))
@@ -884,7 +1049,12 @@ def build_kimi_k3_mla_attention(
             if const_expr(bs is None):
                 bs = load_bias()
             if const_expr(raws is None):
-                raws = getf_many([(mb("scores"), s * N_EXPERTS + lane + i * 64) for i in range(N_EXPERTS // 64)])
+                raws = getf_many(
+                    [
+                        (mb("scores"), s * N_EXPERTS + lane + i * 64)
+                        for i in range(N_EXPERTS // 64)
+                    ]
+                )
                 stamp("ug", bid, 7)
             ks = []
             for i in range_constexpr(N_EXPERTS // 64):
@@ -912,7 +1082,14 @@ def build_kimi_k3_mla_attention(
                 )
             e = 255 - (mv & 255)
             src = (e % 64) * 4
-            got = [fx.Int32(rocdl.ds_bpermute(T.i32, src.ir_value(), r.bitcast(fx.Int32).ir_value())) for r in raws]
+            got = [
+                fx.Int32(
+                    rocdl.ds_bpermute(
+                        T.i32, src.ir_value(), r.bitcast(fx.Int32).ir_value()
+                    )
+                )
+                for r in raws
+            ]
             raw = got[0]
             for i in range_constexpr(1, N_EXPERTS // 64):
                 raw = (e // 64 == i).select(got[i], raw)
@@ -931,12 +1108,18 @@ def build_kimi_k3_mla_attention(
             still being consumed.  ``residual`` is either fn(s, row) -> (r0,
             r1) (plain loads, issued first) or a mailbox base (pairs s * HIDDEN
             + row, polled in the same batch as the peers)."""
-            region_base = fx.Int64(SY[region]) + fx.Int64(peer_slot) * fx.Int64(SY["_part_stride"])
+            region_base = fx.Int64(SY[region]) + fx.Int64(peer_slot) * fx.Int64(
+                SY["_part_stride"]
+            )
             if const_expr(attention_only and W > 1):
                 pair_count = S * tile // 2
                 owner_rank = (t * tile) // (HIDDEN // W)
-                owner_words = fx.Vector(bo.buffer_load(r_peers, owner_rank * 2, vec_width=2, dtype=T.i32))
-                owner_dst = (fx.Int64(_uniform(owner_words[1])) << 32) | fx.Int64(fx.Uint32(_uniform(owner_words[0])))
+                owner_words = fx.Vector(
+                    bo.buffer_load(r_peers, owner_rank * 2, vec_width=2, dtype=T.i32)
+                )
+                owner_dst = (fx.Int64(_uniform(owner_words[1])) << 32) | fx.Int64(
+                    fx.Uint32(_uniform(owner_words[0]))
+                )
                 if wave == 0:
                     for batch in range_constexpr((pair_count + 63) // 64):
                         pair = lane + batch * 64
@@ -946,7 +1129,10 @@ def build_kimi_k3_mla_attention(
                             put_bf(
                                 owner_dst + region_base,
                                 (rank * S + si) * HIDDEN + t * tile + ri,
-                                [lds_ld(outs, si * tile + ri), lds_ld(outs, si * tile + ri + 1)],
+                                [
+                                    lds_ld(outs, si * tile + ri),
+                                    lds_ld(outs, si * tile + ri + 1),
+                                ],
                                 CM_SYS,
                             )
                 gpu.barrier()
@@ -958,7 +1144,10 @@ def build_kimi_k3_mla_attention(
                     r0, r1 = residual(s, row)
                     own = sym + region_base
                     got = poll(
-                        [(own, ((src * S + s) * HIDDEN + row) // 2, 1) for src in range(W)],
+                        [
+                            (own, ((src * S + s) * HIDDEN + row) // 2, 1)
+                            for src in range(W)
+                        ],
                         "one-as",
                     )
                     t0 = fx.Float32(0.0)
@@ -978,7 +1167,9 @@ def build_kimi_k3_mla_attention(
                             s = pair // (tile // 2)
                             r = (pair % (tile // 2)) * 2
                             packed = lds_ld(outs, pair).bitcast(fx.Int32)
-                            mailbox = ((owner_rank * S + s) * HIDDEN + t * tile + r) // 2
+                            mailbox = (
+                                (owner_rank * S + s) * HIDDEN + t * tile + r
+                            ) // 2
                             bo.buffer_store(
                                 fx.Vector.from_elements([packed, result_tag], fx.Int32),
                                 _rsrc(peer_dst + region_base),
@@ -1014,7 +1205,10 @@ def build_kimi_k3_mla_attention(
                             put_bf(
                                 peer_dst + region_base,
                                 (rank * S + si) * HIDDEN + t * tile + ri,
-                                [lds_ld(outs, si * tile + ri), lds_ld(outs, si * tile + ri + 1)],
+                                [
+                                    lds_ld(outs, si * tile + ri),
+                                    lds_ld(outs, si * tile + ri + 1),
+                                ],
                                 CM_SYS,
                             )
                 gpu.barrier()
@@ -1033,7 +1227,10 @@ def build_kimi_k3_mla_attention(
                         got = poll([(residual, (s * HIDDEN + row) // 2, 1)])
                 else:
                     own = sym + region_base
-                    specs = [(own, ((src * S + s) * HIDDEN + row) // 2, 1) for src in range(W)]
+                    specs = [
+                        (own, ((src * S + s) * HIDDEN + row) // 2, 1)
+                        for src in range(W)
+                    ]
                     if const_expr(not callable(residual)):  # packed bf16 pair
                         specs.append((residual, (s * HIDDEN + row) // 2, 1))
                     got = poll(specs, "one-as")
@@ -1054,11 +1251,18 @@ def build_kimi_k3_mla_attention(
         def stamp(name, t, which, lead=0):
             if const_expr(timeline):
                 if tid == lead:
-                    now = fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
+                    now = fx.Int64(
+                        llvm.call_intrinsic(
+                            T.i64, "llvm.amdgcn.s.memrealtime", [], [], []
+                        )
+                    )
                     fx.generic_store(
                         fx.inttoptr(
-                            fx.PointerType.get(fx.Int64.ir_type, fx.AddressSpace.Global, 8),
-                            timeline_buf + fx.Int64((first[name] + t) * TL_COLS + which) * 8,
+                            fx.PointerType.get(
+                                fx.Int64.ir_type, fx.AddressSpace.Global, 8
+                            ),
+                            timeline_buf
+                            + fx.Int64((first[name] + t) * TL_COLS + which) * 8,
                         ),
                         now,
                     )
@@ -1097,7 +1301,11 @@ def build_kimi_k3_mla_attention(
                     element = (tid + norm_round * THREADS) * 4
                     safe_element = fx.min(element, HIDDEN - 4)
                     gain = (
-                        fx.Vector(bo.buffer_load(r_gin, safe_element // 2, vec_width=2, dtype=T.i32))
+                        fx.Vector(
+                            bo.buffer_load(
+                                r_gin, safe_element // 2, vec_width=2, dtype=T.i32
+                            )
+                        )
                         .bitcast(fx.BFloat16)
                         .to(fx.Float32)
                     )
@@ -1106,7 +1314,10 @@ def build_kimi_k3_mla_attention(
                         put_bf(
                             mb("input_norm"),
                             s * HIDDEN + element,
-                            [chunk[j] * inverse_rms * gain[j] for j in range_constexpr(4)],
+                            [
+                                chunk[j] * inverse_rms * gain[j]
+                                for j in range_constexpr(4)
+                            ],
                         )
 
         # ================================================= 1. q_a / kv_a GEMV
@@ -1134,7 +1345,11 @@ def build_kimi_k3_mla_attention(
             def ld_h(sks):
                 res = []
                 for s, k in sks:
-                    w = fx.Vector(bo.buffer_load(r_h, (s * HIDDEN + k) // 2, vec_width=2, dtype=T.i32))
+                    w = fx.Vector(
+                        bo.buffer_load(
+                            r_h, (s * HIDDEN + k) // 2, vec_width=2, dtype=T.i32
+                        )
+                    )
                     v = w.bitcast(fx.BFloat16).to(fx.Float32)
                     res.append([v[j] for j in range(4)])
                 return res
@@ -1143,8 +1358,17 @@ def build_kimi_k3_mla_attention(
                 pre = [u_qa(c) for c in range(QA_UNITS)]
 
                 def ld_h_normalized(sks):
-                    pairs = get_bf2_many([(mb("input_norm"), s * HIDDEN + k + j) for s, k in sks for j in (0, 2)])
-                    return [list(pairs[2 * i]) + list(pairs[2 * i + 1]) for i in range(len(sks))]
+                    pairs = get_bf2_many(
+                        [
+                            (mb("input_norm"), s * HIDDEN + k + j)
+                            for s, k in sks
+                            for j in (0, 2)
+                        ]
+                    )
+                    return [
+                        list(pairs[2 * i]) + list(pairs[2 * i + 1])
+                        for i in range(len(sks))
+                    ]
 
                 stage_x_bf16(ld_h_normalized, HIDDEN)
             else:
@@ -1186,24 +1410,45 @@ def build_kimi_k3_mla_attention(
             # gamma and the RoPE factors are issued ahead of the wait
             g = ld_bf16(_rsrc(g_kv), tid)
             tpe = tid % (PE_DIM // 2)
-            cs = [ld_f32(_rsrc(rope_cos), (pos0 + s) * (PE_DIM // 2) + tpe) for s in range(S)]
-            sns = [ld_f32(_rsrc(rope_sin), (pos0 + s) * (PE_DIM // 2) + tpe) for s in range(S)]
+            cs = [
+                ld_f32(_rsrc(rope_cos), (pos0 + s) * (PE_DIM // 2) + tpe)
+                for s in range(S)
+            ]
+            sns = [
+                ld_f32(_rsrc(rope_sin), (pos0 + s) * (PE_DIM // 2) + tpe)
+                for s in range(S)
+            ]
             hint_wait(
                 (KV_LORA + PE_DIM) // QKV_A_TILE,
-                lambda k: (mb("kv_a"), (S - 1) * (KV_LORA + PE_DIM) + k * QKV_A_TILE + QKV_A_TILE - 1),
+                lambda k: (
+                    mb("kv_a"),
+                    (S - 1) * (KV_LORA + PE_DIM) + k * QKV_A_TILE + QKV_A_TILE - 1,
+                ),
                 mark=("cache", t),
             )
             # every sample's kv latent and k_pe pair in one poll, one block reduction
-            vs = getf_many([(mb("kv_a"), s * (KV_LORA + PE_DIM) + tid) for s in range(S)])
+            vs = getf_many(
+                [(mb("kv_a"), s * (KV_LORA + PE_DIM) + tid) for s in range(S)]
+            )
             pes = get2_many(
-                [(mb("kv_a"), s * (KV_LORA + PE_DIM) + KV_LORA + (tid % (PE_DIM // 2)) * 2) for s in range(S)]
+                [
+                    (
+                        mb("kv_a"),
+                        s * (KV_LORA + PE_DIM) + KV_LORA + (tid % (PE_DIM // 2)) * 2,
+                    )
+                    for s in range(S)
+                ]
             )
             stamp("cache", t, 2)
             ssq = block_sums([v * v for v in vs])
             for s in range_constexpr(S):
                 pos = pos0 + s
                 kvn = bf16_round(vs[s] * _rsq(ssq[s] * (1.0 / KV_LORA) + EPS) * g)
-                kv_offset = pos * QK_DIM + tid if const_expr(use_atom_kv_cache) else pos * KV_LORA + tid
+                kv_offset = (
+                    pos * QK_DIM + tid
+                    if const_expr(use_atom_kv_cache)
+                    else pos * KV_LORA + tid
+                )
                 bo.buffer_store(kvn.to(fx.BFloat16), r_kv, kv_offset)
                 put(mb("kvnew"), s * KV_LORA + tid, kvn)
                 if tid < PE_DIM // 2:
@@ -1212,7 +1457,9 @@ def build_kimi_k3_mla_attention(
                     p0 = bf16_round(x0 * c - x1 * sn)
                     p1 = bf16_round(x0 * sn + x1 * c)
                     pe_offset = (
-                        pos * QK_DIM + KV_LORA + tid * 2 if const_expr(use_atom_kv_cache) else pos * PE_DIM + tid * 2
+                        pos * QK_DIM + KV_LORA + tid * 2
+                        if const_expr(use_atom_kv_cache)
+                        else pos * PE_DIM + tid * 2
                     )
                     bo.buffer_store(p0.to(fx.BFloat16), r_pe, pe_offset)
                     bo.buffer_store(p1.to(fx.BFloat16), r_pe, pe_offset + 1)
@@ -1243,12 +1490,17 @@ def build_kimi_k3_mla_attention(
             pre = [u_qb(c) for c in range(QB_UNITS)]
             hint_wait(
                 Q_LORA // QKV_A_TILE,
-                lambda k: (mb("q_a"), (S - 1) * Q_LORA + k * QKV_A_TILE + QKV_A_TILE - 1),
+                lambda k: (
+                    mb("q_a"),
+                    (S - 1) * Q_LORA + k * QKV_A_TILE + QKV_A_TILE - 1,
+                ),
                 mark=("q_b", t),
             )
 
             def ld_qa(sks):
-                v = get2_many([(mb("q_a"), s * Q_LORA + k + j) for s, k in sks for j in (0, 2)])
+                v = get2_many(
+                    [(mb("q_a"), s * Q_LORA + k + j) for s, k in sks for j in (0, 2)]
+                )
                 return [list(v[2 * i]) + list(v[2 * i + 1]) for i in range(len(sks))]
 
             stage_x_rmsnorm(ld_qa, Q_LORA, g_q)
@@ -1278,7 +1530,11 @@ def build_kimi_k3_mla_attention(
                     x1 = lds_ld(outs, s * Q_B_TILE + pr * 2 + 1)
                     c = ld_f32(_rsrc(rope_cos), (pos0 + s) * (PE_DIM // 2) + i // 2)
                     sn = ld_f32(_rsrc(rope_sin), (pos0 + s) * (PE_DIM // 2) + i // 2)
-                    put_bf(mb("q_pe"), (s * H + head) * PE_DIM + i, [x0 * c - x1 * sn, x0 * sn + x1 * c])
+                    put_bf(
+                        mb("q_pe"),
+                        (s * H + head) * PE_DIM + i,
+                        [x0 * c - x1 * sn, x0 * sn + x1 * c],
+                    )
             stamp("q_b", t, 4)
 
         # ==================================== 4. absorbed query: q_lat = W_UK^T q_nope
@@ -1292,16 +1548,30 @@ def build_kimi_k3_mla_attention(
 
             def u_uk(c):
                 return unit_attention(
-                    r_wuk, r_suk, t * WAVES + wave, c, UK_NKC, NOPE_DIM, 64, (n_sel() * NOPE_DIM + c * 64) // 2
+                    r_wuk,
+                    r_suk,
+                    t * WAVES + wave,
+                    c,
+                    UK_NKC,
+                    NOPE_DIM,
+                    64,
+                    (n_sel() * NOPE_DIM + c * 64) // 2,
                 )
 
             pre = [u_uk(c) for c in range(UK_NKC)]
             hint_wait(
                 NOPE_DIM // Q_B_TILE,
-                lambda k: (mb("q_nope"), ((S - 1) * H + head) * NOPE_DIM + k * Q_B_TILE + Q_B_TILE - 1),
+                lambda k: (
+                    mb("q_nope"),
+                    ((S - 1) * H + head) * NOPE_DIM + k * Q_B_TILE + Q_B_TILE - 1,
+                ),
                 mark=("uk", t),
             )
-            stage_x_pairs("q_nope", S * NOPE_DIM, lambda k: ((k // NOPE_DIM) * H + head) * NOPE_DIM + k % NOPE_DIM)
+            stage_x_pairs(
+                "q_nope",
+                S * NOPE_DIM,
+                lambda k: ((k // NOPE_DIM) * H + head) * NOPE_DIM + k % NOPE_DIM,
+            )
             stamp("uk", t, 2)
             gpu.barrier()
             acc = run_units(u_uk, UK_NKC, UK_NKC, pre)
@@ -1313,7 +1583,9 @@ def build_kimi_k3_mla_attention(
                 s = k // UK_TILE
                 put_bf(
                     mb("q_lat"),
-                    (s * H + head) * KV_LORA + (t % UK_PER_HEAD) * UK_TILE + k % UK_TILE,
+                    (s * H + head) * KV_LORA
+                    + (t % UK_PER_HEAD) * UK_TILE
+                    + k % UK_TILE,
                     [lds_ld(outs, k + j) for j in range(4)],
                 )
             stamp("uk", t, 4)
@@ -1336,7 +1608,14 @@ def build_kimi_k3_mla_attention(
                     keys,
                     lane,
                     sparse.select(
-                        fx.Int32(bo.buffer_load(r_idx, s * sparse_attention_topk + k_cl, vec_width=1, dtype=T.i32)),
+                        fx.Int32(
+                            bo.buffer_load(
+                                r_idx,
+                                s * sparse_attention_topk + k_cl,
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                        ),
                         k_cl,
                     ),
                 )
@@ -1348,8 +1627,17 @@ def build_kimi_k3_mla_attention(
             krows = [lds_ld(keys, wave * KPW + jj) for jj in range(KPW)]
             for jj in range_constexpr(KPW):
                 j = wave * KPW + jj
-                kv_row_words = QK_DIM // 2 if const_expr(use_atom_kv_cache) else KV_LORA // 2
-                kv8 = fx.Vector(bo.buffer_load(r_kv, krows[jj] * kv_row_words + lane * 4, vec_width=4, dtype=T.i32))
+                kv_row_words = (
+                    QK_DIM // 2 if const_expr(use_atom_kv_cache) else KV_LORA // 2
+                )
+                kv8 = fx.Vector(
+                    bo.buffer_load(
+                        r_kv,
+                        krows[jj] * kv_row_words + lane * 4,
+                        vec_width=4,
+                        dtype=T.i32,
+                    )
+                )
                 fx.ptr_store(kv8.bitcast(fx.Float32), ktile + (j * KS + lane * 4))
                 if lane < PE_DIM // 2:
                     pe_row = (
@@ -1366,9 +1654,17 @@ def build_kimi_k3_mla_attention(
                 kr = lds_ld(keys, j)
                 if kr >= pos0:
                     sn = kr - pos0
-                    kvp = get2_many([(mb("kvnew"), sn * KV_LORA + lane * 8 + m * 2) for m in range(4)])
+                    kvp = get2_many(
+                        [
+                            (mb("kvnew"), sn * KV_LORA + lane * 8 + m * 2)
+                            for m in range(4)
+                        ]
+                    )
                     w = [bf16_pair(a0, a1) for a0, a1 in kvp]
-                    fx.ptr_store(fx.Vector.from_elements(w, fx.Float32), ktile + (j * KS + lane * 4))
+                    fx.ptr_store(
+                        fx.Vector.from_elements(w, fx.Float32),
+                        ktile + (j * KS + lane * 4),
+                    )
                     if lane < PE_DIM // 2:
                         a0, a1 = get2(mb("penew"), sn * PE_DIM + lane * 2)
                         lds_st(petile, j * PS + lane, bf16_pair(a0, a1))
@@ -1390,11 +1686,16 @@ def build_kimi_k3_mla_attention(
                     lambda k: (
                         (k < N_UK).select(
                             fx.Int64(SC["q_lat"]),
-                            (k < N_UK + H * N_PE_T).select(fx.Int64(SC["q_pe"]), fx.Int64(SC["penew"])),
+                            (k < N_UK + H * N_PE_T).select(
+                                fx.Int64(SC["q_pe"]), fx.Int64(SC["penew"])
+                            ),
                         )
                         + scratch,
                         (k < N_UK).select(
-                            (s * H + k // UK_PER_HEAD) * KV_LORA + (k % UK_PER_HEAD) * UK_TILE + UK_TILE - 1,
+                            (s * H + k // UK_PER_HEAD) * KV_LORA
+                            + (k % UK_PER_HEAD) * UK_TILE
+                            + UK_TILE
+                            - 1,
                             (k < N_UK + H * N_PE_T).select(
                                 (s * H + (k - N_UK) // N_PE_T) * PE_DIM
                                 + ((k - N_UK) % N_PE_T) * Q_B_TILE
@@ -1410,7 +1711,10 @@ def build_kimi_k3_mla_attention(
             NQ = H * KV_LORA // 4 // THREADS
             tpe = fx.min(tid, H * PE_DIM // 4 - 1)
             qv = poll(
-                [(mb("q_lat"), (s * H * KV_LORA + (tid + i * THREADS) * 4) // 2, 2) for i in range(NQ)]
+                [
+                    (mb("q_lat"), (s * H * KV_LORA + (tid + i * THREADS) * 4) // 2, 2)
+                    for i in range(NQ)
+                ]
                 + [(mb("q_pe"), (s * H * PE_DIM + tpe * 4) // 2, 2)]
             )
             for i in range_constexpr(NQ):
@@ -1441,8 +1745,12 @@ def build_kimi_k3_mla_attention(
                     KT_OFF + key * KS + kst * 16,
                     PT_OFF + key * PS + (kst - KV_LORA // 32) * 16,
                 )
-                a = fx.ptr_load(xs + (kw + (lane // 16) * 4), result_type=v4f).bitcast(fx.BFloat16)
-                b = fx.ptr_load(xs + (hn * QS + kst * 16 + (lane // 16) * 4), result_type=v4f).bitcast(fx.BFloat16)
+                a = fx.ptr_load(xs + (kw + (lane // 16) * 4), result_type=v4f).bitcast(
+                    fx.BFloat16
+                )
+                b = fx.ptr_load(
+                    xs + (hn * QS + kst * 16 + (lane // 16) * 4), result_type=v4f
+                ).bitcast(fx.BFloat16)
                 c = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
             fx.ptr_store(c, red + (wave * 64 + lane) * 4)
             gpu.barrier()
@@ -1476,23 +1784,43 @@ def build_kimi_k3_mla_attention(
                 # each wave owns 2 groups of 32 dims.  V is read key-strided from the tile.
                 hn = fx.min(head_base + lane % 16, H - 1)
                 for g in range_constexpr(KV_LORA // 32 // WAVES):
-                    dw = (wave * (KV_LORA // 32 // WAVES) + g) * 16 + lane % 16  # dim pair word
+                    dw = (
+                        wave * (KV_LORA // 32 // WAVES) + g
+                    ) * 16 + lane % 16  # dim pair word
                     c0 = fx.Vector.filled(4, 0.0, fx.Float32)
                     c1 = fx.Vector.filled(4, 0.0, fx.Float32)
                     for js in range_constexpr(SPLIT_KEYS // 32):
                         a = fx.ptr_load(
-                            pl + (hn * (SPLIT_KEYS // 2) + js * 16 + (lane // 16) * 4), result_type=v4f
+                            pl + (hn * (SPLIT_KEYS // 2) + js * 16 + (lane // 16) * 4),
+                            result_type=v4f,
                         ).bitcast(fx.BFloat16)
                         ws = [
-                            fx.ptr_load(ktile + ((js * 32 + (lane // 16) * 8 + i) * KS + dw)).bitcast(fx.Int32)
+                            fx.ptr_load(
+                                ktile + ((js * 32 + (lane // 16) * 8 + i) * KS + dw)
+                            ).bitcast(fx.Int32)
                             for i in range(8)
                         ]
-                        w_lo = [(ws[2 * i] & 0xFFFF) | (ws[2 * i + 1] << 16) for i in range(4)]
-                        w_hi = [fx.Int32(fx.Uint32(ws[2 * i]) >> 16) | (ws[2 * i + 1] & -65536) for i in range(4)]
-                        b0 = fx.Vector.from_elements(w_lo, fx.Int32).bitcast(fx.BFloat16)
-                        b1 = fx.Vector.from_elements(w_hi, fx.Int32).bitcast(fx.BFloat16)
-                        c0 = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b0, c0]))
-                        c1 = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b1, c1]))
+                        w_lo = [
+                            (ws[2 * i] & 0xFFFF) | (ws[2 * i + 1] << 16)
+                            for i in range(4)
+                        ]
+                        w_hi = [
+                            fx.Int32(fx.Uint32(ws[2 * i]) >> 16)
+                            | (ws[2 * i + 1] & -65536)
+                            for i in range(4)
+                        ]
+                        b0 = fx.Vector.from_elements(w_lo, fx.Int32).bitcast(
+                            fx.BFloat16
+                        )
+                        b1 = fx.Vector.from_elements(w_hi, fx.Int32).bitcast(
+                            fx.BFloat16
+                        )
+                        c0 = fx.Vector(
+                            rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b0, c0])
+                        )
+                        c1 = fx.Vector(
+                            rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b1, c1])
+                        )
                     if lane < 32:  # rows (heads) 4 * (lane // 16) + e < 8
                         for e in range_constexpr(4):
                             hh = head_base + (lane // 16) * 4 + e
@@ -1536,7 +1864,11 @@ def build_kimi_k3_mla_attention(
                 )
 
             pre = [u_uv(c) for c in range(UV_UNITS)]
-            hint_wait(N_SPLIT, lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head), mark=("uv", tt))
+            hint_wait(
+                N_SPLIT,
+                lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head),
+                mark=("uv", tt),
+            )
             pre_poll(N_SPLIT, lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head))
             stamp("uv", tt, 5)
             # one batched poll: thread = (d pair dp, split half hf) -> its SPH splits' acc
@@ -1547,14 +1879,23 @@ def build_kimi_k3_mla_attention(
             spi = fx.min(lane, N_SPLIT - 1)
             ml = (s * N_SPLIT + spi) * H + head
             got = poll(
-                [(mb("sp_acc"), ((s * N_SPLIT + hf * SPH + j) * H + head) * (KV_LORA // 2) + dp, 1) for j in range(SPH)]
+                [
+                    (
+                        mb("sp_acc"),
+                        ((s * N_SPLIT + hf * SPH + j) * H + head) * (KV_LORA // 2) + dp,
+                        1,
+                    )
+                    for j in range(SPH)
+                ]
                 + [(mb("sp_m"), ml, 1), (mb("sp_l"), ml, 1)],
                 batch=SPH + 2,
             )
             if wave == 0:  # per-split weights exp(m - M) / L for this head -> misc[sp]
                 ok_sp = lane < N_SPLIT
                 m_sp = ok_sp.select(got[SPH][0].bitcast(fx.Float32), fx.Float32(NEG))
-                l_sp = ok_sp.select(got[SPH + 1][0].bitcast(fx.Float32), fx.Float32(0.0))
+                l_sp = ok_sp.select(
+                    got[SPH + 1][0].bitcast(fx.Float32), fx.Float32(0.0)
+                )
                 w_sp = _exp(m_sp - wave_max(m_sp))
                 den = wave_sum(l_sp * w_sp)
                 if ok_sp:
@@ -1573,7 +1914,11 @@ def build_kimi_k3_mla_attention(
                 lds_st(red, dp * 2 + 1, o1)
             gpu.barrier()
             if hf == 0:
-                lds_st(xs, dp, bf16_pair(o0 + lds_ld(red, dp * 2), o1 + lds_ld(red, dp * 2 + 1)))
+                lds_st(
+                    xs,
+                    dp,
+                    bf16_pair(o0 + lds_ld(red, dp * 2), o1 + lds_ld(red, dp * 2 + 1)),
+                )
             gpu.barrier()
             acc = run_units(u_uv, UV_UNITS, UV_UNITS, pre)
             reduce_rows(UV_R, acc, emit_out(UV_TILE))
@@ -1583,8 +1928,13 @@ def build_kimi_k3_mla_attention(
                 r = tid * 4
                 values = [lds_ld(outs, r + j) for j in range(4)]
                 if const_expr(attention_output_gate):
-                    gate = getf_many([(mb("gate"), s * O_K + t * UV_TILE + r + j) for j in range(4)])
-                    values = [bf16_round(values[j]) * _rcp(fx.Float32(1.0) + _exp(-gate[j])) for j in range(4)]
+                    gate = getf_many(
+                        [(mb("gate"), s * O_K + t * UV_TILE + r + j) for j in range(4)]
+                    )
+                    values = [
+                        bf16_round(values[j]) * _rcp(fx.Float32(1.0) + _exp(-gate[j]))
+                        for j in range(4)
+                    ]
                 put_bf(mb("o"), s * O_K + t * UV_TILE + r, values)
             stamp("uv", tt, 4)
 
@@ -1602,12 +1952,24 @@ def build_kimi_k3_mla_attention(
             def u_o(c):
                 kc = ((wave % O_WPR) * O_UNITS + c) * attention_k_chunks_per_unit
                 return unit_attention(
-                    r_wo, r_so, t * O_R + wave // O_WPR, kc, O_NKC, O_K, 128, (n_sel() * O_K + kc * 64) // 2
+                    r_wo,
+                    r_so,
+                    t * O_R + wave // O_WPR,
+                    kc,
+                    O_NKC,
+                    O_K,
+                    128,
+                    (n_sel() * O_K + kc * 64) // 2,
                 )
 
             pre = [u_o(c) for c in range(O_UNITS)]
             hint_wait(
-                S * N_UV, lambda k: (mb("o"), (k // N_UV) * O_K + (k % N_UV) * UV_TILE + UV_TILE - 1), mark=("o", t)
+                S * N_UV,
+                lambda k: (
+                    mb("o"),
+                    (k // N_UV) * O_K + (k % N_UV) * UV_TILE + UV_TILE - 1,
+                ),
+                mark=("o", t),
             )
             stage_attention_output()
             stamp("o", t, 2)
@@ -1621,7 +1983,14 @@ def build_kimi_k3_mla_attention(
                 if const_expr(not attention_residual):
                     return fx.Float32(0.0), fx.Float32(0.0)
                 w = fx.Vector.from_elements(
-                    [fx.Int32(bo.buffer_load(r_h, (s * HIDDEN + row) // 2, vec_width=1, dtype=T.i32))], fx.Int32
+                    [
+                        fx.Int32(
+                            bo.buffer_load(
+                                r_h, (s * HIDDEN + row) // 2, vec_width=1, dtype=T.i32
+                            )
+                        )
+                    ],
+                    fx.Int32,
                 )
                 v = w.bitcast(fx.BFloat16).to(fx.Float32)
                 return v[0], v[1]
@@ -1667,12 +2036,22 @@ def build_kimi_k3_mla_attention(
 
             def u_r(c):
                 kc = wave * (R_NKC // WAVES) + r_fold * R_CPW + c
-                return unit_bf16(r_wr, t * ROUTER_TILE // 16, kc, R_NKC, (r_ns * HIDDEN + kc * 64) // 2, r_ln)
+                return unit_bf16(
+                    r_wr,
+                    t * ROUTER_TILE // 16,
+                    kc,
+                    R_NKC,
+                    (r_ns * HIDDEN + kc * 64) // 2,
+                    r_ln,
+                )
 
             pre = [u_r(c) for c in range(R_CPW)]
             hint_wait(
                 N_ROW_TILES,
-                lambda k: (mb("a"), router_sample * HIDDEN + k * ROW_TILE + ROW_TILE - 1),
+                lambda k: (
+                    mb("a"),
+                    router_sample * HIDDEN + k * ROW_TILE + ROW_TILE - 1,
+                ),
                 mark=("router", tt),
             )
             # This task's expert-activation block inputs ride along with the staging
@@ -1690,7 +2069,9 @@ def build_kimi_k3_mla_attention(
             xa = []
 
             def ld_a(sks):
-                specs = [(mb("a"), (router_sample * HIDDEN + k) // 2, 2) for s, k in sks]
+                specs = [
+                    (mb("a"), (router_sample * HIDDEN + k) // 2, 2) for s, k in sks
+                ]
                 specs.append((mb("a"), (x_s * HIDDEN + xk) // 2, 1))
                 v = poll(specs, batch=len(specs))
                 stamp("router", tt, 5, lead=THREADS - 64)
@@ -1706,7 +2087,12 @@ def build_kimi_k3_mla_attention(
                 v0, v1 = a0 * x_rstd * xg[0], a1 * x_rstd * xg[1]
                 if const_expr(use_fp8_block128):
                     q0, q1, qs = quant_scaled(v0, v1)
-                    w8 = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False)) & 0xFFFF
+                    w8 = (
+                        fx.Int32(
+                            rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False)
+                        )
+                        & 0xFFFF
+                    )
                     w8n = _xshfl(w8, 1)
                     if lane % 2 == 0:  # FP8 bytes k .. k + 3 in one tagged word
                         put(mb("xq"), (x_s * HIDDEN + xk) // 4, w8 | (w8n << 16))
@@ -1716,7 +2102,12 @@ def build_kimi_k3_mla_attention(
                         put(mb("xqs"), x_s * XQ_BLOCKS + x_blk, qs)
                 elif const_expr(use_mxfp8_block32):
                     d0, d1, qs = quant_mxfp8(v0, v1)
-                    w8 = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, d0, d1, fx.Int32(0), False)) & 0xFFFF
+                    w8 = (
+                        fx.Int32(
+                            rocdl.cvt_pk_fp8_f32(T.i32, d0, d1, fx.Int32(0), False)
+                        )
+                        & 0xFFFF
+                    )
                     w8n = _xshfl(w8, 1)
                     if lane % 2 == 0:
                         put(mb("xq"), (x_s * HIDDEN + xk) // 4, w8 | (w8n << 16))
@@ -1726,10 +2117,16 @@ def build_kimi_k3_mla_attention(
                 else:
                     d0, d1 = bf16_round(v0), bf16_round(v1)
                     put(mb("xq"), (x_s * HIDDEN + xk) // 2, bf16_pair(d0, d1))
-                bo.buffer_store(fx.Vector.from_elements([d0, d1], fx.Float32), _rsrc(mb("xqd")), x_s * HIDDEN + xk)
+                bo.buffer_store(
+                    fx.Vector.from_elements([d0, d1], fx.Float32),
+                    _rsrc(mb("xqd")),
+                    x_s * HIDDEN + xk,
+                )
             gpu.barrier()
             acc = run_units(u_r, R_CPW, R_CPW, pre)
-            fx.ptr_store(fx.Vector.from_elements(acc, fx.Float32), red + (wave * 64 + lane) * 4)
+            fx.ptr_store(
+                fx.Vector.from_elements(acc, fx.Float32), red + (wave * 64 + lane) * 4
+            )
             gpu.barrier()
             stamp("router", tt, 3)
             if tid < ROUTER_TILE:
@@ -1739,8 +2136,15 @@ def build_kimi_k3_mla_attention(
                 for w in range_constexpr(WAVES):
                     for f in range_constexpr(2):
                         m = f * ROUTER_TILE + r
-                        logit = logit + lds_ld(red, (w * 64 + f * ROUTER_TILE + n + 16 * (m // 4)) * 4 + m % 4)
-                put(mb("scores"), router_sample * N_EXPERTS + t * ROUTER_TILE + r, _rcp(1.0 + _exp(-logit)))
+                        logit = logit + lds_ld(
+                            red,
+                            (w * 64 + f * ROUTER_TILE + n + 16 * (m // 4)) * 4 + m % 4,
+                        )
+                put(
+                    mb("scores"),
+                    router_sample * N_EXPERTS + t * ROUTER_TILE + r,
+                    _rcp(1.0 + _exp(-logit)),
+                )
             stamp("router", tt, 4)
 
         def dn_route(bs):
@@ -1748,7 +2152,9 @@ def build_kimi_k3_mla_attention(
             route weights -> dnw[]; the scores must have landed."""
             if wave < S:
                 e, w = route_top8(wave, bs=bs)
-                if lane < MOE_SLOTS:  # slot 0: the shared expert, then pick lane (slot lane + 1)
+                if (
+                    lane < MOE_SLOTS
+                ):  # slot 0: the shared expert, then pick lane (slot lane + 1)
                     q = wave * MOE_SLOTS + (lane + 1) % MOE_SLOTS
                     lds_st(keys, q, (lane == TOP_K).select(fx.Int32(SHARED_EXPERT), e))
                     lds_st(dnw, q, (lane == TOP_K).select(fx.Float32(1.0), w))
@@ -1758,7 +2164,11 @@ def build_kimi_k3_mla_attention(
         UG_NKC = HIDDEN // 64
         UG_UNIT_K = 128
         UG_W_BYTES = 2 * INTER * HIDDEN // (2 if use_mxfp4_weight else 1)
-        UG_S_BYTES = 2 * INTER * (HIDDEN // 32) if use_mxfp4_weight else 2 * INTER // SCALE_BM * (HIDDEN // 128) * 4
+        UG_S_BYTES = (
+            2 * INTER * (HIDDEN // 32)
+            if use_mxfp4_weight
+            else 2 * INTER // SCALE_BM * (HIDDEN // 128) * 4
+        )
 
         if const_expr(S == 1):
             # one task per CTA: task u takes intermediates (u % 32) * 8 of routed slot
@@ -1776,20 +2186,37 @@ def build_kimi_k3_mla_attention(
                 # MXFP8 uses the four independent 16-lane groups in each wave.
                 if const_expr(use_mxfp8_block32):
                     NB = XQ_BLOCKS // (WAVES * 4)
-                    ks_ = [((wave + j * WAVES) * 4 + lane // 16) * 32 + lane % 16 * 2 for j in range(NB)]
+                    ks_ = [
+                        ((wave + j * WAVES) * 4 + lane // 16) * 32 + lane % 16 * 2
+                        for j in range(NB)
+                    ]
                 else:
                     NB = PUBLISH_BLOCKS // WAVES
                     ks_ = [(wave + j * WAVES) * 128 + lane * 2 for j in range(NB)]
                 r_gp = _rsrc(g_post)
-                gps = [(ld_bf16(r_gp, k), ld_bf16(r_gp, k + 1)) for k in ks_]  # issued ahead of the wait
+                gps = [
+                    (ld_bf16(r_gp, k), ld_bf16(r_gp, k + 1)) for k in ks_
+                ]  # issued ahead of the wait
                 bs = load_bias()
-                w_rg = ((lane % 16) // 8) * (INTER // 16) + c // 2  # MFMA rows 0-7 gate, 8-15 up
+                w_rg = ((lane % 16) // 8) * (
+                    INTER // 16
+                ) + c // 2  # MFMA rows 0-7 gate, 8-15 up
                 w_ln = (lane & -16) | ((c % 2) * 8 + lane % 8)
                 s_rg = (lane // 32) * (INTER // 16) + c // 2  # this lane's output rows
 
-                def u_ug8(cc, e, live=None):  # expert e's weights (loads return 0 unless live)
-                    nw = None if live is None else live.select(fx.Int32(UG_W_BYTES), fx.Int32(0))
-                    ns = None if live is None else live.select(fx.Int32(UG_S_BYTES), fx.Int32(0))
+                def u_ug8(
+                    cc, e, live=None
+                ):  # expert e's weights (loads return 0 unless live)
+                    nw = (
+                        None
+                        if live is None
+                        else live.select(fx.Int32(UG_W_BYTES), fx.Int32(0))
+                    )
+                    ns = (
+                        None
+                        if live is None
+                        else live.select(fx.Int32(UG_S_BYTES), fx.Int32(0))
+                    )
                     r_wug = bo.create_buffer_resource_from_addr(
                         w_ug + fx.Int64(e) * fx.Int64(UG_W_BYTES), num_records_bytes=nw
                     )
@@ -1820,11 +2247,18 @@ def build_kimi_k3_mla_attention(
                     kc = unit * 2
                     wv = [
                         fx.Vector(
-                            bo.buffer_load(r_wug, ((w_rg * UG_NKC + kc + h) * 64 + w_ln) * 4, vec_width=4, dtype=T.i32)
+                            bo.buffer_load(
+                                r_wug,
+                                ((w_rg * UG_NKC + kc + h) * 64 + w_ln) * 4,
+                                vec_width=4,
+                                dtype=T.i32,
+                            )
                         )
                         for h in range(2)
                     ]
-                    sc = ld_f32(r_sug, (s_rg * 16 // SCALE_BM) * (HIDDEN // 128) + kc // 2)
+                    sc = ld_f32(
+                        r_sug, (s_rg * 16 // SCALE_BM) * (HIDDEN // 128) + kc // 2
+                    )
                     if const_expr(use_fp8_block128):
                         return (
                             "f8f8",
@@ -1836,13 +2270,23 @@ def build_kimi_k3_mla_attention(
 
                 # the shared expert's weights do not depend on routing: prefetch them (the
                 # later zero-weight MMAs of the other tasks are cheaper than a branch)
-                pre = [u_ug8(cc, fx.Int32(SHARED_EXPERT), has_sh) for cc in range(UG8_UNITS)]
-                hint_wait(N_ROW_TILES, lambda k: (mb("a"), s_u * HIDDEN + k * ROW_TILE + ROW_TILE - 1), mark=("ug", u))
+                pre = [
+                    u_ug8(cc, fx.Int32(SHARED_EXPERT), has_sh)
+                    for cc in range(UG8_UNITS)
+                ]
+                hint_wait(
+                    N_ROW_TILES,
+                    lambda k: (mb("a"), s_u * HIDDEN + k * ROW_TILE + ROW_TILE - 1),
+                    mark=("ug", u),
+                )
                 # the sum of squares takes the router's element partition and order
                 # (stage_x_rmsnorm), so rstd -- and every FP8 rounding -- is bit-identical
                 NQ4 = HIDDEN // (4 * THREADS)
                 got = poll(
-                    [(mb("a"), (s_u * HIDDEN + (tid + i * THREADS) * 4) // 2, 2) for i in range(NQ4)]
+                    [
+                        (mb("a"), (s_u * HIDDEN + (tid + i * THREADS) * 4) // 2, 2)
+                        for i in range(NQ4)
+                    ]
                     + [(mb("a"), (s_u * HIDDEN + k) // 2, 1) for k in ks_]
                 )
                 av = [bf2_f32(w[0]) for w in got[NQ4:]]
@@ -1875,14 +2319,20 @@ def build_kimi_k3_mla_attention(
                 gpu.barrier()
                 e_sel = _uniform(lds_ld(keys, 0))
                 post = [u_ug8(cc, e_sel) for cc in range(UG8_UNITS)]
-                reduce_rows(1, mma_units([fx.Float32(0.0) for _ in range(4)], pre), emit_out(16))
+                reduce_rows(
+                    1, mma_units([fx.Float32(0.0) for _ in range(4)], pre), emit_out(16)
+                )
                 gpu.barrier()
                 reduce_rows(
-                    1, mma_units([fx.Float32(0.0) for _ in range(4)], post), lambda rl, n, v: lds_st(outs, 16 + rl, v)
+                    1,
+                    mma_units([fx.Float32(0.0) for _ in range(4)], post),
+                    lambda rl, n, v: lds_st(outs, 16 + rl, v),
                 )
                 stamp("ug", u, 3)
                 gpu.barrier()
-                if tid < UG8:  # threads 0-3: the shared expert's rows, 4-7: the routed slot's
+                if (
+                    tid < UG8
+                ):  # threads 0-3: the shared expert's rows, 4-7: the routed slot's
                     r = (tid % (UG8 // 2)) * 2
                     o = (tid // (UG8 // 2)) * 16
                     g0, g1 = lds_ld(outs, o + r), lds_ld(outs, o + r + 1)
@@ -1890,7 +2340,9 @@ def build_kimi_k3_mla_attention(
                     if has_sh | (tid >= UG8 // 2):
                         put2(
                             mb("mid"),
-                            (tid < UG8 // 2).select(fx.Int32(0), slot) * INTER + c * UG8 + r,
+                            (tid < UG8 // 2).select(fx.Int32(0), slot) * INTER
+                            + c * UG8
+                            + r,
                             g0 * _rcp(1.0 + _exp(-g0)) * u0,
                             g1 * _rcp(1.0 + _exp(-g1)) * u1,
                         )
@@ -1916,8 +2368,16 @@ def build_kimi_k3_mla_attention(
             s_rg = (lane // 32) * (INTER // 16) + c // 2
 
             def ug8_units(e, sample, live=None):
-                nw = None if live is None else live.select(fx.Int32(UG_W_BYTES), fx.Int32(0))
-                ns = None if live is None else live.select(fx.Int32(UG_S_BYTES), fx.Int32(0))
+                nw = (
+                    None
+                    if live is None
+                    else live.select(fx.Int32(UG_W_BYTES), fx.Int32(0))
+                )
+                ns = (
+                    None
+                    if live is None
+                    else live.select(fx.Int32(UG_S_BYTES), fx.Int32(0))
+                )
                 rw = bo.create_buffer_resource_from_addr(
                     w_ug + fx.Int64(e) * fx.Int64(UG_W_BYTES), num_records_bytes=nw
                 )
@@ -1935,7 +2395,9 @@ def build_kimi_k3_mla_attention(
                             for sp in range_constexpr(4):
 
                                 def coefficient(sp=sp, unit=unit, sn=sn):
-                                    return lds_ld(misc, 8 + sn * XQ_BLOCKS + unit * 4 + sp)
+                                    return lds_ld(
+                                        misc, 8 + sn * XQ_BLOCKS + unit * 4 + sp
+                                    )
 
                                 coefficients.append(coefficient)
                         units.append(
@@ -1954,7 +2416,12 @@ def build_kimi_k3_mla_attention(
                     kc = unit * 2
                     wv = [
                         fx.Vector(
-                            bo.buffer_load(rw, ((w_rg * UG_NKC + kc + j) * 64 + w_ln) * 4, vec_width=4, dtype=T.i32)
+                            bo.buffer_load(
+                                rw,
+                                ((w_rg * UG_NKC + kc + j) * 64 + w_ln) * 4,
+                                vec_width=4,
+                                dtype=T.i32,
+                            )
                         )
                         for j in range(2)
                     ]
@@ -1966,9 +2433,18 @@ def build_kimi_k3_mla_attention(
                         def coefficient(sc=sc, kb=kc // 2, sn=sn):
                             return sc * lds_ld(misc, 8 + sn * XQ_BLOCKS + kb)
 
-                        units.append(("f8f8", wv, coefficient, sn * XW + kc * 16 + (lane // 16) * 4))
+                        units.append(
+                            (
+                                "f8f8",
+                                wv,
+                                coefficient,
+                                sn * XW + kc * 16 + (lane // 16) * 4,
+                            )
+                        )
                     else:
-                        units.append(("fp8x2", wv, sc, sn * XW + kc * 32 + (lane // 16) * 4))
+                        units.append(
+                            ("fp8x2", wv, sc, sn * XW + kc * 32 + (lane // 16) * 4)
+                        )
                 return units
 
             def ug8_emit(sample, shared):
@@ -1976,7 +2452,9 @@ def build_kimi_k3_mla_attention(
                     n = tid // (UG8 // 2)
                     r = (tid % (UG8 // 2)) * 2
                     g0, g1 = lds_ld(outs, n * 16 + r), lds_ld(outs, n * 16 + r + 1)
-                    v0, v1 = lds_ld(outs, n * 16 + UG8 + r), lds_ld(outs, n * 16 + UG8 + r + 1)
+                    v0, v1 = lds_ld(outs, n * 16 + UG8 + r), lds_ld(
+                        outs, n * 16 + UG8 + r + 1
+                    )
                     sn = n if shared else fx.Int32(sample)
                     sl = fx.Int32(0) if shared else slot
                     put2(
@@ -1988,8 +2466,16 @@ def build_kimi_k3_mla_attention(
                 if (c == 0) & (tid < S if shared else tid == 0):
                     sn = tid if shared else fx.Int32(sample)
                     sl = fx.Int32(0) if shared else slot
-                    put(mb("sel"), sn * MOE_SLOTS + sl, lds_ld(keys, sn * MOE_SLOTS + sl))
-                    put(mb("prob"), sn * MOE_SLOTS + sl, lds_ld(dnw, sn * MOE_SLOTS + sl))
+                    put(
+                        mb("sel"),
+                        sn * MOE_SLOTS + sl,
+                        lds_ld(keys, sn * MOE_SLOTS + sl),
+                    )
+                    put(
+                        mb("prob"),
+                        sn * MOE_SLOTS + sl,
+                        lds_ld(dnw, sn * MOE_SLOTS + sl),
+                    )
 
             shared_pre = ug8_units(fx.Int32(SHARED_EXPERT), None, has_sh)
             dn_route(load_bias())
@@ -1998,22 +2484,33 @@ def build_kimi_k3_mla_attention(
             stage_moe_input(list(range(S)))
             gpu.barrier()
             if has_sh:
-                reduce_rows(1, mma_units([fx.Float32(0.0) for _ in range(4)], shared_pre), emit_out(16))
+                reduce_rows(
+                    1,
+                    mma_units([fx.Float32(0.0) for _ in range(4)], shared_pre),
+                    emit_out(16),
+                )
                 gpu.barrier()
                 ug8_emit(0, True)
             for sample in range_constexpr(S):
                 stamp("ug", sample * G + u, 0)
                 pre = cur
                 if const_expr(sample + 1 < S):
-                    cur = ug8_units(_uniform(lds_ld(keys, (sample + 1) * MOE_SLOTS + slot)), sample + 1)
-                reduce_rows(1, mma_units([fx.Float32(0.0) for _ in range(4)], pre), emit_out(16))
+                    cur = ug8_units(
+                        _uniform(lds_ld(keys, (sample + 1) * MOE_SLOTS + slot)),
+                        sample + 1,
+                    )
+                reduce_rows(
+                    1, mma_units([fx.Float32(0.0) for _ in range(4)], pre), emit_out(16)
+                )
                 gpu.barrier()
                 ug8_emit(sample, False)
                 stamp("ug", sample * G + u, 4)
 
         # =============== 10. expert down + route weighting + MoE TP reduce
         DN_NKC = INTER // 64
-        DN_R = (DN_TILE + 15) // 16  # 16-row groups touched by a tile (24-row tiles start at row 0 or 8 of one)
+        DN_R = (
+            DN_TILE + 15
+        ) // 16  # 16-row groups touched by a tile (24-row tiles start at row 0 or 8 of one)
         DN_WPR = WAVES // DN_R
         DN_UNIT_K = 128
         DN_UNITS_PER_SLOT = INTER // DN_UNIT_K
@@ -2021,7 +2518,11 @@ def build_kimi_k3_mla_attention(
         DN_UPW = (DN_NU + DN_WPR - 1) // DN_WPR
         DN_BLK = S * MOE_SLOTS * INTER // 128
         DN_W_BYTES = HIDDEN * INTER // (2 if use_mxfp4_weight else 1)
-        DN_S_BYTES = HIDDEN * (INTER // 32) if use_mxfp4_weight else HIDDEN // SCALE_BM * (INTER // 128) * 4
+        DN_S_BYTES = (
+            HIDDEN * (INTER // 32)
+            if use_mxfp4_weight
+            else HIDDEN // SCALE_BM * (INTER // 128) * 4
+        )
         DN_BATCH = 9  # 128-k chunks per wave in flight / prefetched before the mid wait
         for t in range(start("down"), N_DN_TILES, G):
             t = fx.Int32(t)
@@ -2047,11 +2548,19 @@ def build_kimi_k3_mla_attention(
                 e = _uniform(lds_ld(keys, s_q * MOE_SLOTS + slot_q))
                 wb = bo.create_buffer_resource_from_addr(
                     w_dn + fx.Int64(e) * fx.Int64(DN_W_BYTES),
-                    num_records_bytes=None if DN_NU % DN_WPR == 0 else live.select(fx.Int32(DN_W_BYTES), fx.Int32(0)),
+                    num_records_bytes=(
+                        None
+                        if DN_NU % DN_WPR == 0
+                        else live.select(fx.Int32(DN_W_BYTES), fx.Int32(0))
+                    ),
                 )
                 sb = bo.create_buffer_resource_from_addr(
                     s_dn + fx.Int64(e) * fx.Int64(DN_S_BYTES),
-                    num_records_bytes=None if DN_NU % DN_WPR == 0 else live.select(fx.Int32(DN_S_BYTES), fx.Int32(0)),
+                    num_records_bytes=(
+                        None
+                        if DN_NU % DN_WPR == 0
+                        else live.select(fx.Int32(DN_S_BYTES), fx.Int32(0))
+                    ),
                 )
 
                 if const_expr(use_mxfp4_weight):
@@ -2061,7 +2570,8 @@ def build_kimi_k3_mla_attention(
 
                             def coefficient(sp=sp, q=q, s_q=s_q):
                                 return (lane % 16 == s_q).select(
-                                    _uniform_f32(lds_ld(misc, q * 4 + sp)), fx.Float32(0.0)
+                                    _uniform_f32(lds_ld(misc, q * 4 + sp)),
+                                    fx.Float32(0.0),
                                 )
 
                             coefficients.append(coefficient)
@@ -2069,7 +2579,8 @@ def build_kimi_k3_mla_attention(
 
                         def coefficient():
                             return (lane % 16 == s_q).select(
-                                _uniform_f32(lds_ld(dnw, s_q * MOE_SLOTS + slot_q)), fx.Float32(0.0)
+                                _uniform_f32(lds_ld(dnw, s_q * MOE_SLOTS + slot_q)),
+                                fx.Float32(0.0),
                             )
 
                         coefficients = coefficient
@@ -2088,14 +2599,22 @@ def build_kimi_k3_mla_attention(
                 if const_expr(use_fp8_block128):
 
                     def coef():  # mid block scale * route weight, only in this sample's column
-                        return (lane % 16 == s_q).select(_uniform_f32(lds_ld(misc, q)), fx.Float32(0.0))
+                        return (lane % 16 == s_q).select(
+                            _uniform_f32(lds_ld(misc, q)), fx.Float32(0.0)
+                        )
 
-                    return unit_f8f8(wb, sb, dn_rg + gu, kc64, DN_NKC, INTER, q * 32, coef, dn_ln)
+                    return unit_f8f8(
+                        wb, sb, dn_rg + gu, kc64, DN_NKC, INTER, q * 32, coef, dn_ln
+                    )
 
                 def coef():
-                    return (lane % 16 == s_q).select(_uniform_f32(lds_ld(dnw, s_q * MOE_SLOTS + slot_q)), 0.0)
+                    return (lane % 16 == s_q).select(
+                        _uniform_f32(lds_ld(dnw, s_q * MOE_SLOTS + slot_q)), 0.0
+                    )
 
-                return unit_fp8x2(wb, sb, dn_rg + gu, kc64, DN_NKC, INTER, q * 64, coef, dn_ln)
+                return unit_fp8x2(
+                    wb, sb, dn_rg + gu, kc64, DN_NKC, INTER, q * 64, coef, dn_ln
+                )
 
             # the experts are known: stream their down weights while up/gate finishes
             pre = [u_dn(cc) for cc in range(min(DN_BATCH, DN_UPW))]
@@ -2103,7 +2622,11 @@ def build_kimi_k3_mla_attention(
                 N_UG,
                 lambda k: (
                     mb("mid"),
-                    (k // (MOE_SLOTS * N_UG_PER_SLOT) * MOE_SLOTS + (k // N_UG_PER_SLOT) % MOE_SLOTS) * INTER
+                    (
+                        k // (MOE_SLOTS * N_UG_PER_SLOT) * MOE_SLOTS
+                        + (k // N_UG_PER_SLOT) % MOE_SLOTS
+                    )
+                    * INTER
                     + (k % N_UG_PER_SLOT) * UG_TILE
                     + UG_TILE
                     - 1,
@@ -2131,7 +2654,11 @@ def build_kimi_k3_mla_attention(
                         lds_st(xs, blk * 64 + lane, bf16_pair(d0, d1))
                         if lane % 16 == 0:
                             scale_group = blk * 4 + lane // 16
-                            lds_st(misc, scale_group, qs * lds_ld(dnw, blk // (INTER // 128)))
+                            lds_st(
+                                misc,
+                                scale_group,
+                                qs * lds_ld(dnw, blk // (INTER // 128)),
+                            )
                     else:
                         lds_st(xs, blk * 64 + lane, bf16_pair(mids[b][0], mids[b][1]))
             gpu.barrier()
@@ -2147,7 +2674,9 @@ def build_kimi_k3_mla_attention(
 
             def store_x(s, row, v0, v1):
                 bo.buffer_store(
-                    fx.Vector.from_elements([v0, v1], fx.Float32).to(fx.BFloat16), _rsrc(x_out), s * HIDDEN + row
+                    fx.Vector.from_elements([v0, v1], fx.Float32).to(fx.BFloat16),
+                    _rsrc(x_out),
+                    s * HIDDEN + row,
                 )
 
             peer_reduce("ffn", t, mb("a"), store_x, tile=DN_TILE)
