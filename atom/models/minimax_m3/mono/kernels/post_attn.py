@@ -9,7 +9,7 @@ S = 1..MAX_TOKENS tokens (each token's stage tasks side by side); for one token:
             block score; with indexer context parallelism a long context's
             blocks of this rank, for every index head); every split CTA then
             runs the Triton selector's top-k and page-16 table emission itself
-            (ranking, no sort; past LONG_FROM blocks the split tasks' shares'
+            (ranking, no sort; for a long request the split tasks' shares'
             best TOPK_BLOCKS are ranked, gathered from the peers under CP)
     split : one 256-key context partition x 16 heads per task (the gluon decode's
             partitioning) over that page-16 table, FP8 QK / PV with its scale
@@ -98,7 +98,10 @@ from atom.models.minimax_m3.mono.kernels.common import (
 from atom.models.minimax_m3.mono.kernels.common import (
     block_max as block_max_of,
 )
-from atom.models.minimax_m3.mono.kernels.index_score import index_scale_log2e
+from atom.models.minimax_m3.mono.kernels.index_score import (
+    index_scale_log2e,
+    step_rows,
+)
 from atom.models.minimax_m3.mono.kernels.pre_attn import (
     K1_ARGS,
     emit_k1,
@@ -177,11 +180,13 @@ CAND_BATCH = 2
 assert N_SPLIT * THREADS * CAND_BATCH >= MAX_INDEX_BLOCKS
 # Indexer context parallelism: a long context's split task p scans index head
 # p // 2's scores of half p % 2 of this rank's blocks -- as many as a TP split task
-# scans -- for the head's rank; a request is long from INDEX_CP_FROM_BLOCKS blocks
-# (every long request context-parallel: no TP long selection in that build), and a
-# split task then scans >= TOPK_BLOCKS blocks
+# scans -- for the head's rank; a request is long past INDEX_CP_FROM_BLOCKS blocks
+# (``step_rows``; every long request context-parallel: no TP long selection in that
+# build), its rows ending less than a block apart are >= INDEX_CP_FROM_BLOCKS blocks
+# each, and a split task then scans >= TOPK_BLOCKS blocks
 assert N_SPLIT == 2 * TP
 assert N_SPLIT * TOPK_BLOCKS <= INDEX_CP_FROM_BLOCKS <= THREADS
+assert MAX_TOKENS <= SPARSE_BLOCK
 
 
 def scale_index(row, col, cols):
@@ -244,7 +249,7 @@ def build_post_attn_kernel(
         misc: fx.Array[fx.Float32, O_ROWS * MAX_TOKENS, 16]  # a task's output rows
         route: fx.Array[fx.Int32, 8 * MAX_TOKENS, 16]  # token k's slots at 8 k
         rwt: fx.Array[fx.Float32, 8 * MAX_TOKENS, 16]  # and their routing weights
-        # indexer sort keys, a block a thread (past LONG_FROM blocks: the waves'
+        # indexer sort keys, a block a thread (a long request: the waves'
         # candidate (key, block) pairs) and their ranks
         keys: fx.Array[fx.Int32, THREADS, 16]
         ranks: fx.Array[fx.Int32, THREADS, 16]
@@ -268,8 +273,6 @@ def build_post_attn_kernel(
     # index heads go in as ints (a shared cache otherwise serves one rank's build
     # to every rank)
     ih_count, ih_own = heads.count, heads.own
-    # a context this long is selected past the split stage (``select_long``)
-    LONG_FROM = INDEX_CP_FROM_BLOCKS if heads.count > 1 else THREADS
     # fuse_k1 with every index head: K1's index q of every head (qs) after its x8
     # rows in the pool (K1 is done with the pool before K4's stages use it)
     QS_CP = tokens * HIDDEN // 4
@@ -497,13 +500,9 @@ def build_post_attn_kernel(
         # here only the selection runs.
         # a graph's pad rows carry seq_len 0 and an all-zero block-table row: as one
         # key of page 0 they stay finite and select a real page
-        seq_lens_k = [
-            fx.max(
-                uniform(bo.buffer_load(rsrc(seq_lens), k, vec_width=1, dtype=T.i32)), 1
-            )
-            for k in range(tokens)
-        ]
-        n_blks = [(sl + SPARSE_BLOCK - 1) // SPARSE_BLOCK for sl in seq_lens_k]
+        seq_lens_k, n_blks, long_rows = step_rows(
+            seq_lens, tokens, q_len, IndexHeads(ih_count, ih_own)
+        )
         # Up to TOPK_BLOCKS blocks the top-k keeps every block and the scores would
         # only order them. The original selector's own contract calls either order
         # equally correct (index_topk._pack_score_key), so a short context is not
@@ -686,10 +685,10 @@ def build_post_attn_kernel(
             to 1e30 and the local ones to 1e29, full blocks in that order and the
             tail block (the one holding the current token) last. A block's slot
             follows from its rank, the count of blocks that beat it. k: token.
-            Past LONG_FROM blocks ``stage_select_long`` left blk: a one-block
+            For a long request ``stage_select_long`` left blk: a one-block
             stand-in is ranked, placing nothing."""
             iscore = mb("iscore") + fx.Int64(k) * (MAX_INDEX_BLOCKS * 8)
-            short = pick(n_blks, k) <= LONG_FROM
+            short = ~pick(long_rows, k)
             n_blk = short.select(pick(n_blks, k), fx.Int32(1))
             seq_len = pick(seq_lens_k, k)
             r_bt = rsrc(bt_row(k))
@@ -720,7 +719,7 @@ def build_post_attn_kernel(
             gpu.barrier()
 
         def select_long(k, part):
-            """Split task (k, part) of a token past LONG_FROM blocks, before the
+            """Split task (k, part) of a long request's token, before the
             split stage. Its share of the blocks (a thread keys CAND_BATCH) -> each
             wave's TOPK_BLOCKS best -> the CTA's, to a candidate mailbox; then the
             N_SPLIT shares' candidates (the context's TOPK_BLOCKS best are among
@@ -809,7 +808,7 @@ def build_post_attn_kernel(
             # the tail block is a local one: its key is forced
             kt = index_key(n_blk - 1, fx.Int32(0), n_blk)
             sel, slot, n_ctx = place(
-                ch, cl, cnt, held, kt, n_blk, pick(seq_lens_k, k), n_blk > LONG_FROM
+                ch, cl, cnt, held, kt, n_blk, pick(seq_lens_k, k), pick(long_rows, k)
             )
             if sel & (slot // 2 == part):
                 for j in range_constexpr(PAGES_PER_BLOCK):
@@ -829,13 +828,13 @@ def build_post_attn_kernel(
             gpu.barrier()
 
         def stage_select_long():
-            """The split tasks of a token past LONG_FROM blocks select before the
+            """The split tasks of a long request's token select before the
             split stage (``select_long``), each leaving its blk for its split task
             (a CTA runs at most one). Out of the split stage and cold: inline
             there, this code slowed the split for every context (64k: +1 us)."""
             ts = start("split")
             k = ts // N_SPLIT
-            if unlikely((ts < N_SPLIT * tokens) & (pick(n_blks, k) > LONG_FROM)):
+            if unlikely((ts < N_SPLIT * tokens) & pick(long_rows, k)):
                 select_long(k, ts % N_SPLIT)
 
         # Each stage is its own function: flydsl carries a local reassigned inside a

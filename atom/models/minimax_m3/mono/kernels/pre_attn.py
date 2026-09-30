@@ -31,14 +31,12 @@ from atom.models.minimax_m3.mono.config import (
     BLOCKS,
     HEAD_DIM,
     HIDDEN,
-    INDEX_CP_FROM_BLOCKS,
     LOCAL_Q_HEADS,
     MAX_QKV_ROWS,
     MAX_TOKENS,
     ONE_INDEX_HEAD,
     PAGE16,
     ROTARY_DIM,
-    SPARSE_BLOCK,
     THREADS,
     TP,
     WAVES,
@@ -66,6 +64,7 @@ from atom.models.minimax_m3.mono.kernels.common import (
 from atom.models.minimax_m3.mono.kernels.index_score import (
     emit_index_scores,
     index_scale_log2e,
+    step_rows,
 )
 
 FP8_MAX = 448.0
@@ -657,15 +656,9 @@ def emit_k1(
         return q_frag_head(tk, s, heads.own)
 
     def long_step():
-        """A row of the step past INDEX_CP_FROM_BLOCKS index blocks: its request
-        scores every index q head (indexer context parallelism)."""
-        r_seq = rsrc(seq_lens)
-        longest = fx.Int32(bo.buffer_load(r_seq, 0, vec_width=1, dtype=T.i32))
-        for tk in range_constexpr(1, tokens):
-            longest = fx.max(
-                longest, fx.Int32(bo.buffer_load(r_seq, tk, vec_width=1, dtype=T.i32))
-            )
-        return longest > INDEX_CP_FROM_BLOCKS * SPARSE_BLOCK
+        """A request of the step is long (``step_rows``): it scores every index q
+        head (indexer context parallelism)."""
+        return step_rows(seq_lens, tokens, q_len, heads).any_long()
 
     emit_pre_attn(
         tid, bid, lane, wave, x8, red, mb_put, mb_put_words, mb_poll, qkv_mb, x8_mb,

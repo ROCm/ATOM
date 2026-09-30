@@ -19,6 +19,7 @@ selector then finds the scores in place instead of scoring after its launch.
 """
 
 import struct
+from typing import NamedTuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -75,6 +76,43 @@ def scored_count(n_blk, init_blocks: int, local_blocks: int):
     return (n_blk > TOPK_BLOCKS).select(n_blk - (init_blocks + local_blocks), 0)
 
 
+class StepRows(NamedTuple):
+    """A decode step's rows as the indexer sees them (``step_rows``)."""
+
+    seq: list  # each row's context, >= 1 (a graph's pad rows carry 0)
+    n_blks: list  # each row's index blocks
+    long: list  # each row's request is long
+
+    def any_long(self):
+        v = self.long[0]
+        for lg in self.long[1:]:
+            v = v | lg
+        return v
+
+
+def step_rows(seq_lens, tokens: int, q_len, heads: IndexHeads) -> StepRows:
+    """The one place a request is decided long: past INDEX_CP_FROM_BLOCKS index
+    blocks with every index head (its scores take the context-parallel layout,
+    ``emit_index_scores``), past THREADS with one (more blocks than
+    ``rank_blocks`` ranks); either way K4 selects it past the split stage.
+
+    Decided by the request's last row (a request is ``q_len`` consecutive rows):
+    a speculative verify's rows can sit either side of the threshold, and a
+    request's rows must all read the layout its scores were written in."""
+    seq = [
+        fx.max(uniform(bo.buffer_load(rsrc(seq_lens), k, vec_width=1, dtype=T.i32)), 1)
+        for k in range(tokens)
+    ]
+    n_blks = [(s + SPARSE_BLOCK - 1) // SPARSE_BLOCK for s in seq]
+    req_blks = list(n_blks)
+    for k in range(tokens - 2, -1, -1):
+        req_blks[k] = (fx.Int32(k) % q_len == q_len - 1).select(
+            n_blks[k], req_blks[k + 1]
+        )
+    past = INDEX_CP_FROM_BLOCKS if heads.count > 1 else THREADS
+    return StepRows(seq, n_blks, [nb > past for nb in req_blks])
+
+
 def _pick(vals, k):
     """vals[k] for a traced index k."""
     v = vals[0]
@@ -106,8 +144,8 @@ def emit_index_scores(
     CTA with tasks before any index q is read: K1 makes rows first..last's
     there.
 
-    Indexer context parallelism (``heads.count`` > 1): a request past
-    INDEX_CP_FROM_BLOCKS blocks scores only this rank's blocks, b = heads.own
+    Indexer context parallelism (``heads.count`` > 1): a long request
+    (``step_rows``) scores only this rank's blocks, b = heads.own
     (mod TP) -- every index q head of them, a task's key block read once for all:
     pair k * MAX_INDEX_BLOCKS + h * (MAX_INDEX_BLOCKS / TP) + b / TP <- the score
     of token k's block b for head h. ``q_frag_head(k, s, h)``: head h's B operand
@@ -117,10 +155,8 @@ def emit_index_scores(
     l16 = lane % 16
     g4 = lane // 16
     r_ic = rsrc(index_cache)
-    seq = [
-        fx.max(uniform(bo.buffer_load(rsrc(seq_lens), k, vec_width=1, dtype=T.i32)), 1)
-        for k in range(tokens)
-    ]
+    rows = step_rows(seq_lens, tokens, q_len, heads)
+    seq = rows.seq
     # every request's scored blocks in one list, a task per wave across the grid;
     # context-parallel requests' (this rank's blocks) in a second
     cp = heads.count > 1
@@ -128,11 +164,10 @@ def emit_index_scores(
     pre = [fx.Int32(0)]
     pre_cp = [fx.Int32(0)]
     for k in range_constexpr(tokens):
-        n_blk = (seq[k] + SPARSE_BLOCK - 1) // SPARSE_BLOCK
         last = fx.Int32(k) % q_len == q_len - 1
-        n_scored = scored_count(n_blk, init_blocks, local_blocks)
+        n_scored = scored_count(rows.n_blks[k], init_blocks, local_blocks)
         if const_expr(cp):
-            long = n_blk > INDEX_CP_FROM_BLOCKS
+            long = rows.long[k]
             n_own = fx.max(init_blocks + n_scored - first_own + TP - 1, 0) // TP
             pre.append(pre[-1] + (last & ~long).select(n_scored, fx.Int32(0)))
             pre_cp.append(pre_cp[-1] + (last & long).select(n_own, fx.Int32(0)))
