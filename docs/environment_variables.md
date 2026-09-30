@@ -144,6 +144,20 @@ combine knob as a quality/throughput tradeoff.
 | **ATOM_MEGA_COMBINE_WIRE** | str | `bf16` | MegaMoE (`ATOM_MORI_V2_FUSED=1`) combine wire: `bf16`, `fp8` (mxfp8) or `fp4` (mxfp4). Prefill-only: decode steps always combine in bf16, and the choice is DP-agreed so every rank reduces in the same format. |
 | **ATOM_MORI_COMBINE_QUANT** | str | `none` | Combine-side codec passed into the MoRI config. `none` returns bf16; `fp8_blockwise` selects `EpCombineIntraNodeKernel_*_fp8bwq_*`; MoRI also accepts `fp8_direct_cast`. |
 
+### MoonEP planning policy
+
+The MoonEP policy is an opt-in planning layer over the production MoRI
+transport. Prefill builds a global expert histogram, assigns a bounded set of
+remote experts to local cache slots, and dispatches virtual physical IDs
+through a MoRI handle sized for the resident plus cache slots; each rank then
+runs one standard fused MoE call over its resident-plus-cached weights. Decode
+remains owner-only and does not build or synchronize a histogram.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_EP_BACKEND** | str | `mori` | Set to `moonep` to enable the MoonEP prefill/decode policies. Requires the matching AITER MoonEP planner kernels, BF16 MoRI dispatch, and no EPLB redundant experts. `mori` preserves the existing backend. MoonEP is rejected with `ATOM_MORI_V2=1`. |
+| **MOONEP_PREFETCH_SLOTS** | int | `8` | Number of remote-expert cache slots per rank used by the MoonEP prefill policy. |
+
 ## Fusion passes
 
 ### RMSNorm

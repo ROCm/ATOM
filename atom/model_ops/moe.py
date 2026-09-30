@@ -653,6 +653,26 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         all2all_manager = ep_group.device_communicator.all2all_manager
         assert all2all_manager is not None
 
+        ep_backend = envs.ATOM_EP_BACKEND
+        if ep_backend not in {"mori", "moonep"}:
+            raise ValueError(
+                "ATOM_EP_BACKEND must be either 'mori' or 'moonep', "
+                f"got {ep_backend!r}"
+            )
+        if ep_backend == "moonep":
+            # MoonEP owns the dynamic B-slot placement, so it cannot share the
+            # physical-id space with EPLB, and it plans over production MoRI.
+            if moe.expert_layout.num_redundant:
+                raise ValueError(
+                    "ATOM_EP_BACKEND=moonep cannot be combined with EPLB "
+                    "redundant experts"
+                )
+            if not moe.use_mori_kernels or envs.ATOM_MORI_V2:
+                raise ValueError(
+                    "ATOM_EP_BACKEND=moonep requires the production MoRI "
+                    "transport (ATOM_MORI_V2=0)"
+                )
+
         # TODO: could allow this now
         # assert not moe.use_flashinfer_cutlass_kernels, "Must be created in modelopt.py"
         if moe.use_mori_kernels:
@@ -731,6 +751,15 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 # an unexpected "quant_type" kwarg.
                 all_to_all_args["quant_type"] = mori_combine_quant_type
 
+            if ep_backend == "moonep":
+                if dispatch_format.is_fp4 or dispatch_format.is_fp8:
+                    raise ValueError(
+                        "ATOM_EP_BACKEND=moonep requires BF16 MoRI dispatch"
+                    )
+                # MoonEP dispatches to EPR + B virtual slots per rank in both
+                # prefill and decode, so this is the only handle it needs.
+                all_to_all_args["num_local_experts"] += envs.MOONEP_PREFETCH_SLOTS
+
             # TBO and regular forwards are mutually exclusive. Slot 0 serves
             # regular forwards and TBO ubatch 0; slot 1 exists only for the
             # concurrently running second ubatch.
@@ -760,6 +789,29 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 internode=all2all_manager.internode,
             )
 
+            if ep_backend == "moonep":
+                from atom.model_ops.fused_moe.moonep_prepare_finalize import (
+                    MoonEPPrepareAndFinalize,
+                )
+
+                # Log unconditionally: a silent fallback to plain MoRI would
+                # look like a working MoonEP baseline.
+                logger.info(
+                    "MoonEP active over MoRI: rank=%d world=%d local_experts=%d "
+                    "prefetch_slots=%d",
+                    all2all_manager.rank,
+                    all2all_manager.world_size,
+                    moe.num_local_experts,
+                    envs.MOONEP_PREFETCH_SLOTS,
+                )
+                prepare_finalize = MoonEPPrepareAndFinalize(
+                    transport=prepare_finalize,
+                    rank=all2all_manager.rank,
+                    world_size=all2all_manager.world_size,
+                    num_experts=moe.num_experts,
+                    prefetch_slots=envs.MOONEP_PREFETCH_SLOTS,
+                )
+
         return prepare_finalize
 
     def maybe_make_prepare_finalize(self) -> FusedMoEPrepareAndFinalize | None:
@@ -785,6 +837,16 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         prepare_finalize = self.maybe_make_prepare_finalize()
 
         if prepare_finalize is not None:
+            # MoonEP migrates expert weights between ranks, so peers must be
+            # able to P2P-read them. This rebinds the layer's expert parameters
+            # onto a peer-mapped VMM pool and adds B prefetch slots, the way
+            # EPLB sizes its redundant replicas. It has to run here, after
+            # process_weights_after_loading has produced the final shuffled,
+            # quantised tensors.
+            adopt_weights = getattr(prepare_finalize, "adopt_weights", None)
+            if adopt_weights is not None:
+                adopt_weights(layer)
+
             # logger.debug(
             #     "%s for %s(%s)", prepare_finalize.__class__.__name__, self, id(self)
             # )
