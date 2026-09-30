@@ -71,9 +71,15 @@ def init_independent_process_group(
             default here is deliberately long.
         world_size: Total ranks, counting the trainer.
         rank: This process's rank in that space.
-        store: A pre-built store, if the caller already has one.
-        group_name: Namespaces the store, so two concurrent groups sharing a
-            rendezvous endpoint cannot read each other's keys.
+        store: A pre-built store, if the caller already has one. Used as
+            given, as ``init_process_group`` uses one: only a store created
+            here gets the extra prefix below. The trainer's copy of this
+            helper does the same, and both ends of a group must agree on
+            every key.
+        group_name: Names the group and everything it keeps in the store.
+            ``_new_process_group_helper`` puts all of that under this prefix,
+            so groups with different names can share one store, supplied or
+            not; torch refuses a name already used in this process.
         pg_options: Backend-specific options, passed under whichever keyword
             the local torch expects.
     """
@@ -96,8 +102,8 @@ def init_independent_process_group(
         )
         store, rank, world_size = next(iterator)
         store.set_timeout(timeout or default_pg_timeout)
-        # Without the prefix, two groups rendezvousing on one endpoint collide
-        # on store keys and one of them hangs.
+        # As init_process_group does with a store it creates, in case other
+        # systems share the endpoint's store.
         store = PrefixStore(group_name, store)
 
     pg, _ = _new_process_group_helper(

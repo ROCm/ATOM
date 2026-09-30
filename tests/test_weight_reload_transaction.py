@@ -12,6 +12,7 @@ all of its pieces are, so crediting it on the first piece would pass a reload
 that left most of it old.
 """
 
+import contextlib
 import logging
 
 import pytest
@@ -304,6 +305,18 @@ def test_a_second_abort_keeps_the_first_reason():
     assert runner.get_weight_update_status()["failure"] == "bucket 3 rejected"
 
 
+def test_an_abort_after_commit_still_fences():
+    """The receiver synchronizes the device after commit, so a fault found
+    there aborts a reload that commit had already declared good."""
+    runner = _Runner(_dense_model())
+    _reload(runner, [_dense_checkpoint()])
+    runner.abort_weight_update(1, RuntimeError("device fault"))
+
+    with pytest.raises(RuntimeError, match="fenced"):
+        runner.assert_weight_update_ready()
+    assert runner.get_weight_update_status()["failure"] == "device fault"
+
+
 def test_the_non_transactional_path_keeps_no_coverage():
     """update_weights shares the application loop; outside a reload there is no
     transaction to credit, and nothing may accumulate."""
@@ -333,12 +346,11 @@ def test_a_direct_full_reload_lifts_the_fence_an_aborted_stream_left():
     assert runner.get_weight_update_status()["healthy"] is True
 
 
-def test_the_shm_path_lifts_it_on_its_last_bucket_only():
-    from multiprocessing import shared_memory
-
-    runner = _fenced(_Runner(_dense_model()))
+def _staged(checkpoint):
+    """Laid out as the SHM and IPC senders lay it out: one flat byte buffer,
+    and where each tensor sits in it."""
     meta, blobs, offset = {}, [], 0
-    for name, tensor in _dense_checkpoint().items():
+    for name, tensor in checkpoint.items():
         raw = tensor.contiguous().view(torch.uint8).reshape(-1)
         meta[name] = {
             "shape": tuple(tensor.shape),
@@ -348,20 +360,56 @@ def test_the_shm_path_lifts_it_on_its_last_bucket_only():
         }
         blobs.append(raw)
         offset += raw.numel()
-    shm = shared_memory.SharedMemory(create=True, size=offset)
+    return torch.cat(blobs), meta
+
+
+@contextlib.contextmanager
+def _shm_segment(flat):
+    from multiprocessing import shared_memory
+
+    shm = shared_memory.SharedMemory(create=True, size=flat.numel())
     try:
-        shm.buf[:offset] = torch.cat(blobs).numpy().tobytes()
-        names = list(meta)
-        first = {n: meta[n] for n in names[:2]}
-        rest = {n: meta[n] for n in names[2:]}
-        runner.update_weights_from_shm(shm.name, first, is_last=False)
-        with pytest.raises(RuntimeError, match="fenced"):
-            runner.assert_weight_update_ready()
-        runner.update_weights_from_shm(shm.name, rest, is_last=True)
+        shm.buf[: flat.numel()] = flat.numpy().tobytes()
+        yield shm.name
     finally:
         shm.close()
         shm.unlink()
+
+
+def test_the_shm_path_lifts_it_on_its_last_bucket_only():
+    runner = _fenced(_Runner(_dense_model()))
+    flat, meta = _staged(_dense_checkpoint())
+    names = list(meta)
+    first = {n: meta[n] for n in names[:2]}
+    rest = {n: meta[n] for n in names[2:]}
+    with _shm_segment(flat) as shm_name:
+        runner.update_weights_from_shm(shm_name, first, is_last=False)
+        with pytest.raises(RuntimeError, match="fenced"):
+            runner.assert_weight_update_ready()
+        runner.update_weights_from_shm(shm_name, rest, is_last=True)
     runner.assert_weight_update_ready()
+
+
+@pytest.mark.parametrize("path", ["shm", "ipc"])
+def test_a_requantisation_that_did_not_write_is_not_counted(monkeypatch, path):
+    """Counted as updated regardless, a reload that wrote nothing reported
+    success and lifted the fence over the old weights."""
+    monkeypatch.setattr(
+        WeightUpdaterMixin, "_requantize_fp8_weight", lambda self, *a: False
+    )
+    runner = _fenced(_Runner(_fp8_model()))
+    flat, meta = _staged({"layer.weight": torch.ones(4, HIDDEN, dtype=torch.bfloat16)})
+
+    if path == "shm":
+        with _shm_segment(flat) as shm_name:
+            updated = runner.update_weights_from_shm(shm_name, meta)
+    else:
+        runner._ipc_buffer = flat  # as mapped from the sender's handle
+        updated = runner.update_weights_from_ipc(None, meta)
+
+    assert updated == 0
+    with pytest.raises(RuntimeError, match="fenced"):
+        runner.assert_weight_update_ready()
 
 
 def test_a_legacy_reload_that_did_not_complete_keeps_the_fence():

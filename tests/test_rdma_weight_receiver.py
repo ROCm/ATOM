@@ -269,11 +269,11 @@ def _three_buckets():
     ]
 
 
-def _receive(monkeypatch, trainer, runner):
+def _receive(monkeypatch, trainer, runner, synchronize=lambda *a, **k: None):
     import torch
 
     monkeypatch.setattr(receiver, "dist", SimpleNamespace(broadcast=trainer.broadcast))
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
     return receiver.receive_weight_stream(
         None, runner, device=torch.device("cpu"), expected_version=1
     )
@@ -358,6 +358,23 @@ def test_an_end_marker_carrying_sizes_is_not_a_clean_finish(monkeypatch):
     assert runner.events[-1].startswith("abort")
 
 
+def test_a_device_fault_found_after_commit_still_fences(monkeypatch):
+    """The copies are asynchronous, so a fault in them surfaces at the
+    synchronize -- which ran after the fenced region, leaving a committed
+    version serving over writes that never landed."""
+
+    def fault(*args, **kwargs):
+        raise RuntimeError("device fault")
+
+    trainer = _Trainer(_frames(_three_buckets()))
+    runner = _Runner()
+
+    with pytest.raises(RuntimeError, match="device fault"):
+        _receive(monkeypatch, trainer, runner, synchronize=fault)
+
+    assert runner.events[-2:] == ["commit", "abort: device fault"]
+
+
 class _Worker(receiver.RDMAWeightReceiverMixin):
     """One engine worker, as init_rdma_weight_group sees it."""
 
@@ -414,6 +431,30 @@ def test_the_receiver_reads_the_header_in_the_documented_order(monkeypatch):
     trainer = _Trainer([torch.tensor([1, 10, 20, 7], dtype=torch.int64)])
     monkeypatch.setattr(receiver, "dist", SimpleNamespace(broadcast=trainer.broadcast))
     assert receiver._recv_header(None, device=torch.device("cpu")) == (1, 10, 20, 7)
+
+
+# ── discovery ──────────────────────────────────────────────────────────────
+
+
+def test_the_lifecycle_the_real_mixins_define_is_advertised():
+    """Methods are listed only where the runner has them, so a name the list
+    spells differently from the mixin would drop out of the report silently."""
+    from atom.rollout.capabilities import CapabilityProviderMixin
+    from atom.rollout.weight_updater import WeightUpdaterMixin
+
+    class _Composed(
+        WeightUpdaterMixin, receiver.RDMAWeightReceiverMixin, CapabilityProviderMixin
+    ):
+        rank = 0
+
+    report = _Composed().get_worker_capabilities()
+    assert {
+        "init_rdma_weight_group",
+        "receive_weights_rdma",
+        "destroy_rdma_weight_group",
+        "get_weight_update_status",
+    } <= set(report["methods"])
+    assert "rdma_weight_receive" in report["features"]
 
 
 # ── against the sender's own source ────────────────────────────────────────
