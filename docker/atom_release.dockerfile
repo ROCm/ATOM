@@ -4,7 +4,7 @@ ARG BASE_IMAGE="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0
 ARG GPU_ARCH="gfx942;gfx950"
 # LMCache wheel image (FROM scratch, one wheel at /), pinned by digest. See the
 # LMCache section of atom_image.
-ARG LMCACHE_WHEEL_IMAGE="rocm/atom-dev:lmcache-v0.5.6.dev98-g05fc77a0-rocm-torch210@sha256:d3cfe74f42d78a188992cae98efbe23053610216e7b247632d6be772e9d465d6"
+ARG LMCACHE_WHEEL_IMAGE="rocm/atom-dev:lmcache-v0.5.6.dev139-gf22dec28-rocm-torch210@sha256:deee808c0b7c461459acffc3fafd45c7bc994e886874c18e92a09d3e95ebf98c"
 # ROCm 10 flavor: pass --build-arg BASE_IMAGE=rocm10-base to build the whole
 # image on the pip-installed ROCm 10 SDK below instead of the rocm/pytorch
 # apt image. All ROCm 10 component versions are ARGs so the 10.1 tracking
@@ -653,7 +653,7 @@ RUN echo "========== Install atomesh binary ==========" && \
 # follows from the wheel name; the ABI suffix and wheel tag are the workflow's
 # ROCM_TORCH210_LOCAL_VERSION and EXPECTED_WHEEL_TAG, and change only with the
 # image's torch.
-ARG LMCACHE_WHEEL_SHA256=a5fe8f3f5b9dee602ac7d11241f65a1640cd3d26c101f2d1d0e0d8aee88b7aab
+ARG LMCACHE_WHEEL_SHA256=68c0f6870c82497b4a1fef5c365960119bedfe66715a410457ae45eb6164cc03
 # Docker builds do not expose a GPU, so LMCache's torch.cuda.is_available()
 # backend predicate is overridden only in the validation process below.
 # Two install paths, because the published wheel targets one ABI: its filename
