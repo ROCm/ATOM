@@ -132,12 +132,21 @@ class Qwen4ExpHyperConnection(nn.Module):
         )
 
     def process_weights_after_loading(self) -> None:
-        """Concatenate `[down | inject]` into one GEMM weight."""
+        """Concatenate `[down | inject]` into one GEMM weight.
+
+        The source parameters become row views of it, so the weight is stored
+        once and `mix` / `combine` (the MTP drafter's unfused path) still work.
+        """
+        rank = self.input_mix_weight_down.weight.shape[0]
         parts = [self.input_mix_weight_down.weight.data]
         if self.block_inject_weight is not None:
             parts.append(self.block_inject_weight.weight.data)
-        self.fused_w_cat = torch.cat(parts, 0).contiguous()
-        self.fused_rank = self.input_mix_weight_down.weight.shape[0]
+        fused = torch.cat(parts, 0).contiguous()
+        self.input_mix_weight_down.weight.data = fused[:rank]
+        if self.block_inject_weight is not None:
+            self.block_inject_weight.weight.data = fused[rank:]
+        self.fused_w_cat = fused
+        self.fused_rank = rank
 
     def mix_fused(
         self,
