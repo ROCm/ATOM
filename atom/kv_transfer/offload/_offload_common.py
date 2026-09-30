@@ -86,6 +86,66 @@ def pp_aware_rank_and_world(config, tp) -> tuple[int, int]:
     return pp_rank * tp.world_size + tp.rank_in_group, pp_size * tp.world_size
 
 
+def _disable_thp_for_pinned_alloc(cfg) -> None:
+    """Opt this process out of THP before LMCache allocates its pinned pool.
+
+    With HIP 7.2 (the ROCm 7 images) ``hipHostMalloc`` maps anonymous memory,
+    marks it ``MADV_HUGEPAGE`` and binds it ``MPOL_PREFERRED`` to the GPU's
+    NUMA node. When that node has little free memory but a lot of page cache,
+    every 2 MiB fault runs a compaction that fails, and a few hundred GiB takes
+    over an hour -- long enough for NCCL init to time out. (On the HIP 7.15
+    ROCm 10 image the pool was observed as a shared ``/dev/zero`` mapping,
+    which anonymous THP does not apply to.)
+
+    ``prctl(PR_SET_THP_DISABLE, 1)`` sets a flag on the whole process (every
+    thread, not just the caller); per prctl(2) it is inherited by ``fork``
+    children and kept across ``execve``. It also makes the kernel ignore
+    ``MADV_HUGEPAGE`` for every mapping in the process, existing ones
+    included. So it is skipped when it is unnecessary or harmful:
+
+    * ``numa_mode`` is set: LMCache then does its own ``mmap`` + ``mbind`` +
+      ``hipHostRegister`` instead of ``hipHostMalloc`` (the primary fix). If
+      ``auto`` fails to detect the GPU's node, LMCache falls back to its
+      default allocator and this backstop is not applied.
+    * ``ATOM_PD_HOST_LANDING_BLOCKS`` > 0: the P/D host-landing pool in the
+      same decode worker relies on ``MADV_HUGEPAGE`` to stay under the NIC's
+      4 KiB-page RDMA registration cap.
+
+    Best effort: a failure is logged and ignored.
+    """
+    if getattr(cfg, "numa_mode", None):
+        return
+    try:
+        host_landing_blocks = int(os.environ.get("ATOM_PD_HOST_LANDING_BLOCKS", "0"))
+    except ValueError:
+        host_landing_blocks = 0
+    if host_landing_blocks > 0:
+        logger.info(
+            "LMCache offload: keeping THP enabled (P/D host landing pool needs "
+            "MADV_HUGEPAGE)"
+        )
+        return
+
+    import ctypes
+
+    PR_SET_THP_DISABLE = 41
+    try:
+        rc = ctypes.CDLL("libc.so.6", use_errno=True).prctl(
+            PR_SET_THP_DISABLE, 1, 0, 0, 0
+        )
+        if rc != 0:
+            raise OSError(ctypes.get_errno(), "prctl(PR_SET_THP_DISABLE) failed")
+        logger.info(
+            "LMCache offload: disabled THP for pinned host allocations "
+            "(PR_SET_THP_DISABLE)"
+        )
+    except Exception:
+        logger.warning(
+            "LMCache offload: prctl(PR_SET_THP_DISABLE) unavailable",
+            exc_info=True,
+        )
+
+
 def build_offload_engine(
     config,
     *,
@@ -120,6 +180,8 @@ def build_offload_engine(
         base_meta, atom_block_size=int(block_size), bytes_per_block=int(bytes_per_block)
     )
     gpu_connector = gpu_connector_factory(cfg, meta)
+    # The CPU pool is allocated while the engine is built, so opt out here.
+    _disable_thp_for_pinned_alloc(cfg)
     engine = LMCacheEngineBuilder.get_or_create(
         engine_id, cfg, meta, gpu_connector, lambda t, s: None, lambda o, s: o
     )
