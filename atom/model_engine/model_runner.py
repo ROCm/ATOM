@@ -42,6 +42,7 @@ from atom.distributed.pp_comm import (
 )
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
 from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.kv_transfer.disaggregation.pd_landing import mla_landing_reserve_bytes
 from atom.kv_transfer.disaggregation.pd_producer import mla_staging_reserve_bytes
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
@@ -1771,6 +1772,13 @@ class ModelRunner:
                 "Reserving %.2fGB for P/D MLA staging", mla_staging_bytes / (1 << 30)
             )
             available_for_kv_budget -= mla_staging_bytes
+        # Likewise the Mooncake consumer's MLA landing pool (DCP decode).
+        mla_landing_bytes = mla_landing_reserve_bytes(config)
+        if mla_landing_bytes:
+            logger.info(
+                "Reserving %.2fGB for P/D MLA landing", mla_landing_bytes / (1 << 30)
+            )
+            available_for_kv_budget -= mla_landing_bytes
         # This prevents OOM when other processes share the GPU.
         available_for_kv = min(available_for_kv_budget, free)
 
