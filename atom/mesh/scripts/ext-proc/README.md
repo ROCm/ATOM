@@ -61,6 +61,12 @@ upstream and returned in the `x-request-id` response header. Header mutations us
 
 ## Send Requests
 
+Chat Completions, Messages and Responses support JSON and SSE through both
+ordinary HTTP and ext-proc. See the [multi-API guide](../../../../docs/mesh_multi_api_guide.md)
+for request examples and the backend/PD/state capability matrix. The supplied
+Envoy wildcard route already covers these endpoints; custom path allow-lists
+must include `/v1/messages` and `/v1/responses`.
+
 Non-streaming completion:
 
 ```bash

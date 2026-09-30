@@ -17,6 +17,7 @@ use axum::{
 use futures_util::StreamExt;
 
 #[cfg(test)]
+#[path = "../../tests/routing/http_pd_load_tests.rs"]
 mod load_tests;
 
 use memchr::memmem;
@@ -284,11 +285,13 @@ impl Drop for PrefillTask {
 
 #[derive(Clone)]
 struct PDRequestContext<'a> {
-    route: &'static str,
+    route: &'a str,
     batch_size: Option<usize>,
     is_stream: bool,
     return_logprob: bool,
     request_text: Option<&'a str>,
+    tokens: Option<&'a [u32]>,
+    planner: Option<&'a dyn PdPlanner>,
     model_id: Option<&'a str>,
     headers: Option<Arc<HeaderMap>>,
 }
@@ -305,6 +308,8 @@ impl<'a> PDRequestContext<'a> {
             is_stream: metadata.stream,
             return_logprob: metadata.return_logprob,
             request_text: Some(&metadata.text),
+            tokens: None,
+            planner: None,
             model_id: model.or_else(|| metadata.model.as_deref().filter(|model| !model.is_empty())),
             headers: headers.cloned().map(Arc::new),
         }
@@ -473,9 +478,11 @@ impl PDRouter {
         headers: &HeaderMap,
         body: Value,
         metadata: &InferenceMetadata,
+        path: &str,
         placement: Arc<ReservedPair>,
     ) -> Response {
-        let context = PDRequestContext::from_metadata(metadata, Some(headers), None);
+        let mut context = PDRequestContext::from_metadata(metadata, Some(headers), None);
+        context.route = path;
         self.execute_reserved(Some(headers), body, context, placement)
             .await
     }
@@ -781,12 +788,13 @@ impl PDRouter {
             model_id: context.model_id,
             protocol: Some(Protocol::Http),
             text: context.request_text.as_deref(),
-            tokens: None,
+            tokens: context.tokens,
             headers: context.headers.as_deref(),
             stream: context.is_stream,
         };
-        let plan = self
+        let plan = context
             .planner
+            .unwrap_or(self.planner.as_ref())
             .plan(&descriptor)
             .await
             .map_err(|error| placement_err_to_response(error, context.model_id))?;
@@ -1720,7 +1728,7 @@ impl PDRouter {
         &self,
         client: &Client,
         worker: &dyn Worker,
-        route: &'static str,
+        route: &str,
         json_request: Value,
         headers: Option<&HeaderMap>,
         connection_close: bool,
@@ -1954,6 +1962,47 @@ impl RouterTrait for PDRouter {
             .await
     }
 
+    async fn route_inference(
+        &self,
+        request: &super::ingress::InferenceEnvelope,
+        app: &Arc<crate::app_context::AppContext>,
+    ) -> Response {
+        let routing = super::ingress::IngressRouting::new(app);
+        let (metadata, tokens) =
+            match routing.prepare(&request.parsed, &std::sync::atomic::AtomicBool::new(false)) {
+                Ok(prepared) => prepared,
+                Err(err) => return err.response(request.metadata.route),
+            };
+        let candidates = match routing.candidates(&metadata, request.parsed.requires_state_domain())
+        {
+            Ok(workers) => workers,
+            Err(err) => return err.response(metadata.route),
+        };
+        let body: Value = match serde_json::from_slice(&request.body) {
+            Ok(body) => body,
+            Err(err) => {
+                return error::IngressError::invalid(err.to_string()).response(metadata.route)
+            }
+        };
+        let planner = DefaultPlanner::new(
+            Arc::new(WorkerRegistryAdapter::with_candidates(
+                self.worker_registry.clone(),
+                candidates,
+            )),
+            Arc::new(PolicyRegistryAdapter::new(app.policy_registry.clone())),
+        );
+        let mut context = PDRequestContext::from_metadata(&metadata, Some(&request.headers), None);
+        context.planner = Some(&planner);
+        context.route = request
+            .uri
+            .path_and_query()
+            .map(|v| v.as_str())
+            .unwrap_or(request.metadata.route);
+        context.tokens = tokens.as_deref();
+        self.dispatch_pd(Some(&request.headers), &body, context)
+            .await
+    }
+
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
@@ -2067,7 +2116,7 @@ mod tests {
             let server = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = [0; 4096];
-                socket.read(&mut request).await.unwrap();
+                assert!(socket.read(&mut request).await.unwrap() > 0);
                 socket
                     .write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{}",
@@ -2153,6 +2202,8 @@ mod tests {
                 is_stream: false,
                 return_logprob: false,
                 request_text: None,
+                tokens: None,
+                planner: None,
                 model_id: None,
                 headers: None,
             };
@@ -2288,6 +2339,7 @@ mod tests {
                 &HeaderMap::new(),
                 serde_json::to_value(&request).unwrap(),
                 &metadata,
+                metadata.route,
                 pair,
             )
             .await;
@@ -2691,6 +2743,8 @@ mod tests {
             is_stream: false,
             return_logprob: false,
             request_text: None,
+            tokens: None,
+            planner: None,
             model_id: Some("m"),
             headers: Some(Arc::new(headers)),
         };
