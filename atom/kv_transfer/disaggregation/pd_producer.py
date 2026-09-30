@@ -10,6 +10,7 @@ from typing import Any
 
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.types import DEFAULT_SHARDED_STAGING_WORKERS
+from atom.utils import envs
 
 # Connectors that push KV across the P/D boundary. Offload backends are not
 # producers even when ``kv_role`` is omitted (they default to ``offload``).
@@ -91,10 +92,51 @@ def index_staging_pool_size(config) -> int:
         )
     if not connectors:
         return 0
-    count = connectors[0].get("num_worker_threads", DEFAULT_SHARDED_STAGING_WORKERS)
+    return send_worker_count(connectors[0])
+
+
+def send_worker_count(connector: dict) -> int:
+    """A P/D producer connector entry's validated ``num_worker_threads``."""
+
+    count = connector.get("num_worker_threads", DEFAULT_SHARDED_STAGING_WORKERS)
     if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
         raise ValueError(
             "P/D producer num_worker_threads must be a positive integer, "
             f"got {count!r}"
         )
     return count
+
+
+def mla_staging_slot_count(num_send_workers: int, slot_bytes: int) -> int:
+    """MLA staging slots for one producer: one per send worker, capped in bytes.
+
+    ``ATOM_PD_MLA_STAGING_POOL_MB`` bounds the pool, so a large
+    ``num_worker_threads`` makes workers share slots instead of growing HBM.
+    """
+
+    pool_bytes = envs.ATOM_PD_MLA_STAGING_POOL_MB << 20
+    return min(num_send_workers, max(1, pool_bytes // slot_bytes))
+
+
+def mla_staging_reserve_bytes(config) -> int:
+    """HBM to hold back from the KV budget for Mooncake MLA staging pools.
+
+    An upper bound of what ``MooncakeConnector`` allocates after the KV cache
+    is sized: every Mooncake producer entry on an MLA model without producer
+    DCP gets a pool of at most ``mla_staging_slot_count`` slots of
+    ``ATOM_PD_MLA_STAGING_SLOT_MB``.
+    """
+
+    slot_bytes = envs.ATOM_PD_MLA_STAGING_SLOT_MB << 20
+    if (
+        not envs.ATOM_PD_MLA_STAGING
+        or slot_bytes == 0
+        or getattr(config, "decode_context_parallel_size", 1) > 1
+        or not getattr(getattr(config, "hf_config", None), "kv_lora_rank", None)
+    ):
+        return 0
+    pool_bytes = envs.ATOM_PD_MLA_STAGING_POOL_MB << 20
+    return sum(
+        min(send_worker_count(connector) * slot_bytes, max(pool_bytes, slot_bytes))
+        for connector in _producer_connectors(config, _INDEX_STAGING_CONNECTORS)
+    )

@@ -14,9 +14,16 @@ from atom.distributed.dcp_layout import dcp_global_pos
 
 
 def coalesce_contiguous(
-    src: np.ndarray, dst: np.ndarray, length: np.ndarray
+    src: np.ndarray,
+    dst: np.ndarray,
+    length: np.ndarray,
+    split_before: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Merge adjacent runs that are contiguous on both sides."""
+    """Merge adjacent runs that are contiguous on both sides.
+
+    A run whose ``split_before`` entry is True always starts a new merged run,
+    e.g. where the destination crosses into another registered memory region.
+    """
 
     if src.size == 0:
         empty = np.empty(0, dtype=np.int64)
@@ -24,6 +31,8 @@ def coalesce_contiguous(
     contiguous = (src[1:] == src[:-1] + length[:-1]) & (
         dst[1:] == dst[:-1] + length[:-1]
     )
+    if split_before is not None:
+        contiguous &= ~split_before[1:]
     starts = np.concatenate(([True], ~contiguous))
     start_indices = np.flatnonzero(starts)
     merged_length = np.add.reduceat(length, start_indices)
@@ -94,6 +103,104 @@ class DCPShardPlan:
         src = self.src_block_id_per_run[keep] * self.block_size + self.src_token[keep]
         dst = dst_ids[self.dst_page[keep]] * self.block_size + self.dst_token[keep]
         return src, dst, self.run_length[keep]
+
+    def source_token_per_dst_token(self) -> np.ndarray:
+        """Source token index for every destination token, page-major.
+
+        Row ``p * block_size + t`` names the producer token (``block_id *
+        block_size + token``) that lands at token ``t`` of destination page
+        ``p``. Tokens past the source end read token 0; ``staged_page_runs``
+        never sends them.
+        """
+
+        run_start = self.src_block_id_per_run * self.block_size + self.src_token
+        run_start = np.where(self.valid, run_start, 0)
+        offsets = np.arange(self.interleave_size, dtype=np.int64)
+        valid_offsets = np.where(self.valid[:, None], offsets, 0)
+        return (run_start[:, None] + valid_offsets).reshape(-1)
+
+    def staged_page_runs(
+        self,
+        dst_block_ids: Sequence[int],
+        staging_addr: int,
+        dst_base: int,
+        token_bytes: int,
+        dst_pages_per_mr: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Byte descriptors for pages staged page-major at ``staging_addr``.
+
+        The staging buffer holds ``dst_pages`` pages in destination token order
+        (see ``source_token_per_dst_token``). Each page sends only its valid
+        tokens, which the plan keeps as a page prefix because a rank's global
+        positions grow with its local ones, so the bytes written are exactly
+        those of ``token_runs``. Runs adjacent on both ends are merged, except
+        across a destination page that is a multiple of ``dst_pages_per_mr``:
+        the consumer registers its region as memory regions of that many
+        pages, and one RDMA op must stay inside one of them.
+        """
+
+        dst_ids = np.asarray(dst_block_ids, dtype=np.int64)
+        if dst_ids.size != self.dst_pages:
+            raise ValueError(
+                f"DCP shard plan has {self.dst_pages} destination pages, got "
+                f"{dst_ids.size} block ids"
+            )
+        if self.valid.size and (self.valid[1:] > self.valid[:-1]).any():
+            raise ValueError("DCP shard plan valid tokens are not a prefix")
+        runs_per_page = self.block_size // self.interleave_size
+        valid_tokens = (
+            self.valid.reshape(self.dst_pages, runs_per_page).sum(axis=1)
+            * self.interleave_size
+        )
+        page_bytes = self.block_size * token_bytes
+        keep = valid_tokens > 0
+        src = staging_addr + np.flatnonzero(keep).astype(np.int64) * page_bytes
+        dst = dst_base + dst_ids[keep] * page_bytes
+        return coalesce_contiguous(
+            src,
+            dst,
+            valid_tokens[keep] * token_bytes,
+            dst_ids[keep] % dst_pages_per_mr == 0,
+        )
+
+
+def pack_staging_slots(
+    page_bytes: Sequence[int], dst_pages: int, slot_bytes: int
+) -> list[list[tuple[int, int, int, int]]]:
+    """Pack every (region, destination page) into fixed-size staging slots.
+
+    Regions are packed in order, each split into page ranges that fill the
+    current slot before a new one opens. Returns one list per slot of
+    ``(region_pos, page_start, page_stop, slot_offset)`` items, where
+    ``region_pos`` indexes ``page_bytes`` and the pages occupy
+    ``[slot_offset, slot_offset + (page_stop - page_start) * width)``.
+    """
+
+    if slot_bytes <= 0:
+        raise ValueError(f"slot_bytes must be positive, got {slot_bytes}")
+    slots: list[list[tuple[int, int, int, int]]] = []
+    current: list[tuple[int, int, int, int]] = []
+    used = 0
+    for region_pos, width in enumerate(page_bytes):
+        if width > slot_bytes:
+            raise ValueError(
+                f"Staging slot of {slot_bytes} bytes cannot hold one "
+                f"{width}-byte page"
+            )
+        page = 0
+        while page < dst_pages:
+            capacity = (slot_bytes - used) // width
+            if capacity == 0:
+                slots.append(current)
+                current, used = [], 0
+                continue
+            stop = min(dst_pages, page + capacity)
+            current.append((region_pos, page, stop, used))
+            used += (stop - page) * width
+            page = stop
+    if current:
+        slots.append(current)
+    return slots
 
 
 def build_dcp_shard_plan(
