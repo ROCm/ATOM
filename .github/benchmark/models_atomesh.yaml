@@ -898,6 +898,8 @@ models:
             apply_chat_template: true
             benchmark_duration: 180
             warmup_requests_per_lane: 1
+            # Native K3 cold loading and graph capture can exceed 75 minutes.
+            wait_server_timeout: 10800
           run_eval: false
     accuracy:
       task: gsm8k
