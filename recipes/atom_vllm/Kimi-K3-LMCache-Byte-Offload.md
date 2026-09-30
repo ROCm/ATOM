@@ -326,19 +326,46 @@ silently if they are wrong:
 Everything above pins the CPU tier inside each TP worker through
 `AtomLMCacheOffloadConnector`. LMCache can instead hold the tier in a separate
 process that every worker reaches over ZMQ. The model, the quantisation and the
-client are unchanged; three things move.
+client are unchanged; the steps below are what changes.
 
-**1. Start the tier before the server.**
+**0. LMCache 0.5.6.dev98 or later.** The MP tier needs a build that contains
+LMCache [#5004](https://github.com/LMCache/LMCache/pull/5004) (merged
+2026-09-23). With DSpark in align mode, vLLM relocates the speculative blocks at
+the tail of a request's mamba block table; before #5004 the MP request tracker
+kept the old slot and stored that scratch block as the chunk's KDA state. As
+of 2026-09-30 the only build validated here is `0.5.6.dev98+g05fc77a0`; no
+tagged LMCache release has been validated yet, and this section will need
+updating once one is. Check what the
+image carries before starting the tier:
 
 ```bash
+python3 -c "import importlib.metadata as m; print(m.version('lmcache'))"   # 0.5.6.dev98+g05fc77a0 or later
+```
+
+Pin on the commit (`05fc77a0` or a descendant), not on a version range: under
+PEP 440 `0.5.6.dev98` sorts **below** `0.5.6rc1`, so `>=0.5.6rc1` rejects the
+validated build.
+
+**1. Start the tier before the server, from free memory.** Drop the page cache
+first (see step 4) so `--l1-init-size-gb` is reserved from free memory rather
+than by reclaiming it.
+
+```bash
+sync; echo 1 > /proc/sys/vm/drop_caches
 LMCACHE_DISABLE_BANNER=1 lmcache server \
   --host localhost --port 5555 --chunk-size 1536 \
   --l1-size-gb 720 --l1-init-size-gb 600 --l1-align-bytes 16384 \
   --eviction-policy LRU \
   --max-gpu-workers 8 --max-cpu-workers 8 \
-  --http-host 127.0.0.1 --http-port 8080 --prometheus-port 9000
+  --http-host 127.0.0.1 --http-port 8080 --prometheus-port 9000 \
+  --separate-object-groups
 # wait for http://127.0.0.1:8080/healthcheck to answer before starting vLLM
 ```
+
+**`--separate-object-groups` is mandatory on K3**: without it a chunk whose KDA
+state vLLM never materialized is still stored alongside its valid MLA KV, and a
+later hit restores that garbage state as wrong output (see *Multiprocess tier:
+multi-chunk read-back*).
 
 Four of those flags are sized rather than copied:
 
@@ -375,6 +402,16 @@ at startup — confirm them in the server log's
 **3. Drop the environment that no longer applies.** `LMCACHE_*` are not read in
 MP mode and `OFFLOAD_*` belong to `AtomLMCacheOffloadConnector`. Unset them
 rather than leaving them set, where they read as load-bearing but are not.
+
+**4. Reclaim host memory once the weights are in HBM.** Loading leaves the
+1.5 TB checkpoint in the page cache, where it competes with the tier's pinned
+L1: stores into L1 slow down until the tier's heartbeat to vLLM times out and it
+treats the engine as dead. Drop it as soon as vLLM is healthy:
+
+```bash
+until curl -sf http://127.0.0.1:8713/health; do sleep 10; done
+sync; echo 1 > /proc/sys/vm/drop_caches     # needs root: privileged container or sudo on the host
+```
 
 ### Verifying an MP run
 
@@ -498,7 +535,10 @@ The three arms below were taken together in the same slot on image
 comparable to each other but not to the table above, which is a different
 image. Client as in *Client*, `--concurrency 16`, 1800 s per arm, seed 530419.
 The MP arm uses the `lmcache server` flags and the two `lmcache.mp.*` booleans
-from *Multiprocess tier* above.
+from *Multiprocess tier* above (`lazy_offload` on), but predates steps 0 and 1
+there: it ran on the image's LMCache 0.5.5rc3 without `--separate-object-groups`.
+These numbers will be updated once the arm is re-measured on 0.5.6.dev98 with
+the flag.
 
 | arm | tok/s/GPU | req/s | TTFT p50 (ms) | ITL p50 (ms) | HBM hit | tier share | n |
 |---|---|---|---|---|---|---|---|
@@ -566,6 +606,40 @@ Only then is the score comparison meaningful: `m1_base` is the no-connector
 reference and `m3_load` is the same questions answered from restored bytes. A
 real KV corruption moves gsm8k by much more than one standard error, so
 agreement inside one standard error is the pass criterion.
+
+#### Multiprocess tier: multi-chunk read-back
+
+For the MP tier, run gsm8k at 50 shots so every prompt spans several 1536-token
+chunks: a wrong KDA state only shows when a restored prefix spans at least two.
+
+```bash
+lm_eval run --model local-chat-completions \
+  --model_args "model=${MODEL},base_url=http://127.0.0.1:8713/v1/chat/completions,num_concurrent=64,max_retries=3,max_gen_toks=16384,timeout=1800,tokenized_requests=False" \
+  --tasks gsm8k --num_fewshot 50 --apply_chat_template --fewshot_as_multiturn \
+  --gen_kwargs temperature=0,top_p=1 --seed 0,1234,1234,1234 \
+  --samples "$(python3 -c 'import json;print(json.dumps({"gsm8k":list(range(100))}))')" \
+  --log_samples --output_path <run>/<label>
+```
+
+Docs 0–99 average ~9,900 tokens (about six chunks) and fit a 720 GB L1 without
+eviction. Start a fresh tier, run pass 1, restart **vLLM only** (the tier keeps
+its contents), then run pass 2: pass 2 starts with an empty HBM pool, so every
+prefix hit comes from the tier. Wait for the tier's `registered_gpu_ids` in
+`/status` to empty before booting pass 2.
+
+The run counts if pass 2 restored at least two chunks per question on average
+(`vllm:external_prefix_cache_hits_total` delta / questions / 1536) and matches
+pass 1 within one standard error.
+
+Measured on 8x MI355X TP8, LMCache 0.5.6.dev98, `--separate-object-groups`,
+DSpark on, `lmcache.mp.lazy_offload` off:
+
+| pass | gsm8k exact_match (flexible) | chunks restored / question | tier share |
+|---|---|---|---|
+| 1 (fills the tier) | 0.99 ± 0.010 | 0 | 0% |
+| 2 (reads the tier) | 1.00 | 4.95 | 76.9% |
+
+No accuracy drop from the restored KV and state.
 
 ## Related
 
