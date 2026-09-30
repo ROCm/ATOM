@@ -21,10 +21,11 @@ import torch
 from aiter import QuantType, dtypes
 from torch import nn
 
+from atom.model_ops.attention_residual_contract import resolve_attn_res_prefix
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import ReplicatedLinear
 
-__all__ = ["AttnRes"]
+__all__ = ["AttnRes", "resolve_attn_res_prefix"]
 
 
 def _rms_eps(norm: RMSNorm) -> float:
@@ -167,9 +168,9 @@ class AttnRes(nn.Module):
         fuses a per-token quant, on BOTH branches below -- the kernel folds it,
         and the fallback gets it from calling that same out_norm.
         """
-        if prefix_sum is None:
-            prefix_sum, add_hidden, add_hidden2 = add_hidden, add_hidden2, None
-        assert prefix_sum is not None
+        prefix_sum, add_hidden, add_hidden2 = resolve_attn_res_prefix(
+            prefix_sum, add_hidden, add_hidden2
+        )
 
         if self.enabled and block_residual is not None and block_residual.shape[1] > 0:
             score_weight = self.score_weight
