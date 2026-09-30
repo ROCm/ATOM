@@ -530,7 +530,10 @@ def test_kimi_announces_backend_once_on_rank_zero(monkeypatch):
 
 
 def test_glm_announces_samples_once_on_rank_zero(monkeypatch):
+    import torch
+
     module = _glm_mono_module()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     rank = [0]
     messages = []
     layers = [SimpleNamespace(layer_idx=layer_idx) for layer_idx in (1, 2)]
