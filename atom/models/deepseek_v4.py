@@ -3851,7 +3851,7 @@ class MoE(nn.Module):
         self,
         x: torch.Tensor,  # [num_tokens, dim]
         shared_partial: torch.Tensor | None = None,
-        before_stage2=None,
+        before_stage2_for_rows=None,
         before_shared_add=None,
         stage2_stream: torch.cuda.Stream | None = None,
     ) -> tuple[torch.Tensor, bool]:
@@ -3867,7 +3867,7 @@ class MoE(nn.Module):
             x,
             router_logits,
             shared_partial,
-            before_stage2=before_stage2,
+            before_stage2_for_rows=before_stage2_for_rows,
             before_shared_add=before_shared_add,
             stage2_stream=stage2_stream,
         )
@@ -3963,7 +3963,7 @@ class MoE(nn.Module):
 
         routed, is_complete = self.routed_expert_forward(
             x,
-            before_stage2=produce_shared,
+            before_stage2_for_rows=produce_shared,
             before_shared_add=wait_for_shared,
             stage2_stream=routed_stream,
         )

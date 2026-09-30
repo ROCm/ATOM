@@ -5137,7 +5137,7 @@ class FusedMoE(torch.nn.Module):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         shared_partial: torch.Tensor | None,
-        before_stage2: Callable[[int], torch.Tensor] | None = None,
+        before_stage2_for_rows: Callable[[int], torch.Tensor] | None = None,
         before_shared_add: Callable[[], None] | None = None,
         stage2_stream: torch.cuda.Stream | None = None,
     ) -> tuple[torch.Tensor, bool]:
@@ -5159,7 +5159,7 @@ class FusedMoE(torch.nn.Module):
                     hidden_states,
                     router_logits,
                     shared_partial,
-                    before_stage2=before_stage2,
+                    before_stage2_for_rows=before_stage2_for_rows,
                     before_shared_add=before_shared_add,
                     stage2_stream=stage2_stream,
                 ),

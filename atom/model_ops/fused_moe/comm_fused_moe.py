@@ -309,17 +309,17 @@ class CommFusedMoeBackend:
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         shared_partial: torch.Tensor | None,
-        before_stage2: Callable[[int], torch.Tensor] | None = None,
+        before_stage2_for_rows: Callable[[int], torch.Tensor] | None = None,
         before_shared_add: Callable[[], None] | None = None,
         stage2_stream: torch.cuda.Stream | None = None,
     ) -> torch.Tensor:
-        if before_stage2 is not None:
+        if before_stage2_for_rows is not None:
             return self.forward_impl(
                 layer,
                 hidden_states,
                 router_logits,
                 shared_partial,
-                before_stage2=before_stage2,
+                before_stage2_for_rows=before_stage2_for_rows,
                 before_shared_add=before_shared_add,
                 stage2_stream=stage2_stream,
             )
@@ -338,7 +338,7 @@ class CommFusedMoeBackend:
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         shared_partial: torch.Tensor | None,
-        before_stage2: Callable[[int], torch.Tensor] | None = None,
+        before_stage2_for_rows: Callable[[int], torch.Tensor] | None = None,
         before_shared_add: Callable[[], None] | None = None,
         stage2_stream: torch.cuda.Stream | None = None,
     ) -> torch.Tensor:
@@ -395,7 +395,7 @@ class CommFusedMoeBackend:
                 else GateMode.SEPARATED.value
             ),
             shared_partial=shared_partial,
-            before_stage2=before_stage2,
+            before_stage2_for_rows=before_stage2_for_rows,
             before_shared_add=before_shared_add,
             stage2_stream=stage2_stream,
             reduce_scatter_sizes=reduce_scatter_sizes,

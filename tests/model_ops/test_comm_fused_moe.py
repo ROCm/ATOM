@@ -506,7 +506,7 @@ def test_forward_impl_bridges_fused_moe_state_to_runtime(comm_fused_env):
 
     hidden_states, router_logits, topk_weights, topk_ids = (object() for _ in range(4))
     shared_partial, stage2_stream, output = (object() for _ in range(3))
-    before_stage2 = MagicMock(name="before_stage2")
+    before_stage2_for_rows = MagicMock(name="before_stage2_for_rows")
 
     method = SimpleNamespace(
         select_experts_with_record=MagicMock(return_value=(topk_weights, topk_ids)),
@@ -545,7 +545,7 @@ def test_forward_impl_bridges_fused_moe_state_to_runtime(comm_fused_env):
         hidden_states,
         router_logits,
         shared_partial,
-        before_stage2=before_stage2,
+        before_stage2_for_rows=before_stage2_for_rows,
         stage2_stream=stage2_stream,
     )
 
@@ -577,7 +577,7 @@ def test_forward_impl_bridges_fused_moe_state_to_runtime(comm_fused_env):
         "swiglu_limit": 7.0,
         "gate_mode": _GateMode.INTERLEAVE.value,
         "shared_partial": shared_partial,
-        "before_stage2": before_stage2,
+        "before_stage2_for_rows": before_stage2_for_rows,
         "before_shared_add": None,
         "stage2_stream": stage2_stream,
         "reduce_scatter_sizes": None,
@@ -679,7 +679,7 @@ def test_dpa_forward_fuses_local_shared_into_owned_rs_rows(comm_fused_env):
     runtime_args = backend.runtime.run.call_args.kwargs
     assert runtime_args["hidden_states"] is gathered_hidden
     assert runtime_args["shared_partial"] is local_shared
-    assert runtime_args["before_stage2"] is None
+    assert runtime_args["before_stage2_for_rows"] is None
     assert runtime_args["reduce_scatter_sizes"] is reduce_scatter_sizes
     assert runtime_args["reuse_is_synchronized"] is True
 
@@ -872,7 +872,7 @@ def test_fused_moe_dispatches_optional_backend(monkeypatch, atom_modules, suppor
             hidden_states,
             router_logits,
             shared_partial,
-            before_stage2=None,
+            before_stage2_for_rows=None,
             before_shared_add=None,
             stage2_stream=None,
         )
@@ -949,7 +949,7 @@ def test_dsv4_single_stream_dispatches_by_token_support(atom_modules, supported)
         hidden_states,
         router_logits,
         shared_partial,
-        before_stage2=None,
+        before_stage2_for_rows=None,
         before_shared_add=None,
         stage2_stream=None,
     )
@@ -1030,9 +1030,11 @@ def test_dsv4_comm_fused_dual_stream_rejoins_before_return(monkeypatch, atom_mod
     routed_stream = MagicMock(name="routed_stream")
     alt_stream = MagicMock(name="alt_stream")
 
-    def run_fused(_x, *, before_stage2, before_shared_add, stage2_stream, **_kwargs):
+    def run_fused(
+        _x, *, before_stage2_for_rows, before_shared_add, stage2_stream, **_kwargs
+    ):
         assert stage2_stream is routed_stream
-        assert before_stage2(shared.shape[0]) is shared
+        assert before_stage2_for_rows(shared.shape[0]) is shared
         before_shared_add()
         return routed, True
 
