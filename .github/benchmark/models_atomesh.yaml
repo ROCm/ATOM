@@ -247,6 +247,31 @@ models:
           run_eval: true
           eval_concurrency: [65]
 
+        - name: glm-52-mxfp4-2p1d-tp4
+          topology: 2p1d
+          pd_worker_layout: prefill_single_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512, 768, 1024]
+          prefill:
+            workers: 2
+            tp: 4
+          decode:
+            workers: 1
+            tp: 4
+          env:
+            prefill:
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+            decode:
+              HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_hca_count":8}
+          benchmark:
+            wait_server_timeout: 1800
+          run_eval: true
+          eval_concurrency: [256, 512]
+
         # Keep each AgentX concurrency in its own job so every measurement starts
         # from a fresh ATOM service instead of inheriting HBM prefix-cache state.
 
