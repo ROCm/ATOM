@@ -833,7 +833,7 @@ def test_glm_full_and_shared_layers_use_one_sparse_buffer():
         module._shared_sparse_buffer([full, reused])
 
 
-def test_glm_bf16_attention_layout_mapping():
+def test_glm_bf16_linear_mapping():
     import torch
 
     module = _glm_mono_module()
@@ -857,17 +857,6 @@ def test_glm_bf16_attention_layout_mapping():
         == weight.data_ptr()
     )
 
-    w_uk, w_uv = module._split_kv_b(
-        weight,
-        heads=2,
-        nope_dim=2,
-        value_dim=3,
-        kv_lora=3,
-    )
-    by_head = weight.view(2, 5, 3)
-    assert torch.equal(w_uk.view(2, 3, 2), by_head[:, :2].transpose(1, 2))
-    assert torch.equal(w_uv.view(2, 3, 3), by_head[:, 2:])
-
     linear.weight = weight.float()
     with pytest.raises(
         module.MonoUnsupported,
@@ -889,29 +878,37 @@ def test_glm_recipe_per_token_fp8_attention_mapping():
     import torch
 
     module = _glm_mono_module()
-    from atom.model_ops.monokernel.weights import linear_bf16
+    from atom.model_ops.monokernel.packing import pack_ptpc_fp8
+    from atom.model_ops.monokernel.weights import linear_ptpc_fp8
 
     source = torch.randn(16, 64, dtype=torch.bfloat16)
-    linear, expected = _preshuffled_per_token_fp8_linear(source)
-    restored = linear_bf16(
+    linear, _ = _preshuffled_per_token_fp8_linear(source)
+    weight, scale = linear_ptpc_fp8(
         linear,
-        name="kv_b_proj",
+        name="q_b_proj",
         logical_rows=16,
         logical_cols=64,
     )
 
-    assert restored.is_contiguous()
-    assert torch.equal(restored, expected)
-    w_uk, w_uv = module._split_kv_b(
-        restored,
-        heads=2,
-        nope_dim=2,
-        value_dim=6,
-        kv_lora=64,
+    assert weight.data_ptr() == linear.weight.data_ptr()
+    assert scale.data_ptr() == linear.weight_scale.data_ptr()
+    native = torch.randn(16, 64).to(torch.float8_e4m3fn)
+    assert torch.equal(
+        pack_ptpc_fp8(native).view(native.dtype).view_as(native),
+        _preshuffle_linear_weight(native),
     )
-    by_head = expected.view(2, 8, 64)
-    assert torch.equal(w_uk.view(2, 64, 2), by_head[:, :2].transpose(1, 2))
-    assert torch.equal(w_uv.view(2, 6, 64), by_head[:, 2:])
+
+    batched = torch.randn(2, 6, 64).to(torch.float8_e4m3fn)
+    batched_scale = torch.ones(1, dtype=torch.float32)
+    flat, head_scale = module._batched_fp8(
+        batched,
+        batched_scale,
+        name="W_V",
+        shape=(2, 6, 64),
+    )
+    assert flat.shape == (12, 64)
+    assert flat.data_ptr() == batched.data_ptr()
+    assert head_scale.data_ptr() == batched_scale.data_ptr()
 
 
 def test_glm_default_off_does_not_inspect_runtime_config():

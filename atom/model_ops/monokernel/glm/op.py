@@ -38,7 +38,12 @@ from atom.model_ops.monokernel.glm.layout import (
     stage_tasks,
 )
 from atom.model_ops.monokernel.layout import TL_COLS
-from atom.model_ops.monokernel.packing import pack_bf16, pack_fp8, pack_layer_weights
+from atom.model_ops.monokernel.packing import (
+    pack_bf16,
+    pack_fp8,
+    pack_layer_weights,
+    pack_ptpc_fp8,
+)
 from atom.model_ops.monokernel.runtime import SymmetricPeerBuffer
 from atom.model_ops.monokernel.weights import LayerWeights, prepare_mxfp4_expert_storage
 
@@ -54,6 +59,16 @@ def prepare_glm5_weights(
     expert_mxfp4 = t["w_ug"].dtype is torch.uint8
     moe_mode = MoeMode.A16W4 if expert_mxfp4 else MoeMode.W8A8
     profile = replace(W.config, attention_weight=AttentionWeight(attention_weight))
+    if profile.attention_weight is AttentionWeight.FP8_PTPC:
+        attention = {
+            "w_qkv_a": t["w_qkv_a"],
+            "w_q_b": t["w_q_b"],
+            "w_uk": pack_ptpc_fp8(t["w_uk"]),
+            "w_uv": pack_ptpc_fp8(t["w_uv"]),
+            "w_o": t["w_o"],
+        }
+    else:
+        attention = pack_layer_weights(t, moe_mode, profile, attention_only=True)
     atom_experts = (
         expert_mxfp4
         and W.mxfp4_weight_layout is Mxfp4WeightLayout.ATOM
@@ -67,7 +82,7 @@ def prepare_glm5_weights(
             "ATOM expert storage requires MXFP4 values and scales together"
         )
     if atom_experts:
-        packed = pack_layer_weights(t, moe_mode, profile, attention_only=True)
+        packed = attention
         packed["w_r"] = pack_bf16(t["w_r"])
         packed.update(
             dict(
@@ -78,6 +93,8 @@ def prepare_glm5_weights(
             )
         )
         return packed
+    if profile.attention_weight is AttentionWeight.FP8_PTPC:
+        raise ValueError("PTPC attention currently requires ATOM expert storage")
     return pack_layer_weights(
         t,
         moe_mode,
@@ -269,7 +286,8 @@ class Glm5MonoKernel:
             dcp_size=dcp_size,
             uv_scale_rows=(
                 128
-                if self.attention_weight is AttentionWeight.BF16
+                if self.attention_weight
+                in (AttentionWeight.BF16, AttentionWeight.FP8_PTPC)
                 else W.t["w_uv"].shape[0] // W.t["s_uv"].shape[0]
             ),
             timeline=timeline,

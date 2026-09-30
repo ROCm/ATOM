@@ -14,7 +14,6 @@ from aiter.dist.parallel_state import (
     get_tp_group,
 )
 
-from atom.model_ops.layernorm import rmsnorm2d_fwd_
 from atom.model_ops.monokernel.config import (
     EPS,
     GLM5_CONFIG,
@@ -35,6 +34,7 @@ from atom.model_ops.monokernel.weights import (
     LayerWeights,
     atom_mxfp4_storage_view,
     linear_bf16,
+    linear_ptpc_fp8,
 )
 from atom.plugin.prepare import is_plugin_mode
 from atom.utils import envs
@@ -54,27 +54,32 @@ def _bf16_vector(tensor: torch.Tensor, name: str, size: int) -> torch.Tensor:
     return tensor
 
 
-def _split_kv_b(
+def _batched_fp8(
     weight: torch.Tensor,
+    scale: torch.Tensor,
     *,
-    heads: int,
-    nope_dim: int,
-    value_dim: int,
-    kv_lora: int,
+    name: str,
+    shape: tuple[int, int, int],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    expected = (heads * (nope_dim + value_dim), kv_lora)
+    fp8_dtypes = {
+        dtype
+        for dtype in (
+            getattr(torch, "float8_e4m3fn", None),
+            getattr(torch, "float8_e4m3fnuz", None),
+        )
+        if dtype is not None
+    }
     _need(
-        weight.shape == expected, f"kv_b_proj shape {tuple(weight.shape)} != {expected}"
+        weight.dtype in fp8_dtypes
+        and tuple(weight.shape) == shape
+        and weight.is_contiguous(),
+        f"{name} weight {weight.dtype} {tuple(weight.shape)}",
     )
-    by_head = weight.view(heads, nope_dim + value_dim, kv_lora)
-    w_uk = (
-        by_head[:, :nope_dim]
-        .transpose(1, 2)
-        .contiguous()
-        .view(heads * kv_lora, nope_dim)
+    _need(
+        scale.dtype == torch.float32 and scale.numel() == 1 and scale.is_contiguous(),
+        f"{name} tensor scale",
     )
-    w_uv = by_head[:, nope_dim:].contiguous().view(heads * value_dim, kv_lora)
-    return w_uk, w_uv
+    return weight.view(shape[0] * shape[1], shape[2]), scale.view(1)
 
 
 def _atom_byte_view(tensor: torch.Tensor) -> torch.Tensor:
@@ -144,18 +149,36 @@ def _layer_weights(layer, rank: int, npes: int) -> LayerWeights:
         scale=True,
     )
 
-    kv_b = linear_bf16(
-        attn.kv_b_proj,
-        name="kv_b_proj",
-        logical_rows=cfg.local_heads * (cfg.nope_dim + cfg.v_dim),
-        logical_cols=cfg.kv_lora,
+    impl = _attention_impl(layer)
+    w_uk, s_uk = _batched_fp8(
+        impl.W_K,
+        impl.W_K_scale,
+        name="W_K",
+        shape=(cfg.local_heads, cfg.kv_lora, cfg.nope_dim),
     )
-    w_uk, w_uv = _split_kv_b(
-        kv_b,
-        heads=cfg.local_heads,
-        nope_dim=cfg.nope_dim,
-        value_dim=cfg.v_dim,
-        kv_lora=cfg.kv_lora,
+    w_uv, s_uv = _batched_fp8(
+        impl.W_V,
+        impl.W_V_scale,
+        name="W_V",
+        shape=(cfg.local_heads, cfg.v_dim, cfg.kv_lora),
+    )
+    w_qkv_a, s_qkv_a = linear_ptpc_fp8(
+        attn.fused_qkv_a_proj,
+        name="fused_qkv_a_proj",
+        logical_rows=cfg.qkv_a_rows,
+        logical_cols=cfg.hidden,
+    )
+    w_q_b, s_q_b = linear_ptpc_fp8(
+        attn.q_b_proj,
+        name="q_b_proj",
+        logical_rows=cfg.local_heads * (cfg.nope_dim + cfg.pe_dim),
+        logical_cols=cfg.q_lora,
+    )
+    w_o, s_o = linear_ptpc_fp8(
+        attn.o_proj,
+        name="o_proj",
+        logical_rows=cfg.hidden,
+        logical_cols=cfg.local_heads * cfg.v_dim,
     )
     bias = moe.gate.e_score_correction_bias
     _need(
@@ -182,26 +205,16 @@ def _layer_weights(layer, rank: int, npes: int) -> LayerWeights:
             "post_attention_layernorm.weight",
             cfg.hidden,
         ),
-        "w_qkv_a": linear_bf16(
-            attn.fused_qkv_a_proj,
-            name="fused_qkv_a_proj",
-            logical_rows=cfg.qkv_a_rows,
-            logical_cols=cfg.hidden,
-        ),
-        "w_q_b": linear_bf16(
-            attn.q_b_proj,
-            name="q_b_proj",
-            logical_rows=cfg.local_heads * (cfg.nope_dim + cfg.pe_dim),
-            logical_cols=cfg.q_lora,
-        ),
+        "w_qkv_a": w_qkv_a,
+        "s_qkv_a": s_qkv_a,
+        "w_q_b": w_q_b,
+        "s_q_b": s_q_b,
         "w_uk": w_uk,
+        "s_uk": s_uk,
         "w_uv": w_uv,
-        "w_o": linear_bf16(
-            attn.o_proj,
-            name="o_proj",
-            logical_rows=cfg.hidden,
-            logical_cols=cfg.local_heads * cfg.v_dim,
-        ),
+        "s_uv": s_uv,
+        "w_o": w_o,
+        "s_o": s_o,
         "w_r": linear_bf16(
             moe.gate,
             name="gate",
@@ -282,7 +295,7 @@ class _GlmLayerOp:
             topk=topk,
             launches_per_step=1,
             with_indexer=False,
-            attention_weight=AttentionWeight.BF16,
+            attention_weight=AttentionWeight.FP8_PTPC,
             kv_cache_layout=KvCacheLayout.ATOM,
             kv_cache_dtype=kv_cache_dtype,
             prepared_weights=prepared_weights,
@@ -477,7 +490,7 @@ class Glm52MonoDecode:
                         (
                             layer.layer_idx,
                             weights,
-                            prepare_glm5_weights(weights, AttentionWeight.BF16),
+                            prepare_glm5_weights(weights, AttentionWeight.FP8_PTPC),
                         )
                     )
         except (MonoUnsupported, ValueError) as error:
@@ -631,6 +644,8 @@ class Glm52MonoDecode:
 
     @staticmethod
     def _refresh_indexer(layer, state: torch.Tensor, positions: torch.Tensor) -> None:
+        from atom.model_ops.layernorm import rmsnorm2d_fwd_
+
         attn = layer.self_attn
         indexer = attn.indexer
         if indexer is None or attn.skip_topk:
@@ -698,6 +713,8 @@ class Glm52MonoDecode:
             )
             residual = None
         state = hidden if residual is None else hidden + residual
+        from atom.model_ops.layernorm import rmsnorm2d_fwd_
+
         return rmsnorm2d_fwd_(
             state,
             model.norm.weight,
