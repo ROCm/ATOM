@@ -86,9 +86,10 @@ Notes:
 * `--mem-fraction-static`: SGLang multiplies it by 0.85 whenever the
   attention backend is `aiter` and the context exceeds 8k, to leave room for
   AITER attention workspaces. The QSA layers run ATOM's own kernels, so that
-  room is never used; 0.88 lands at an effective 0.75 and roughly doubles the
-  KV cache (about 2.0M -> 4.1M tokens), which lets 128k-token requests run
-  about twice as many at a time.
+  room is never used; 0.88 lands at an effective 0.75 and nearly doubles the
+  KV cache (measured on `rocm/atom-dev:sglang-latest`: 1.91M tokens at 0.75,
+  3.57M at 0.88), which lets 128k-token requests run about twice as many at a
+  time.
 * `--context-length` must cover prompt + output (129024 + 2048 here).
 
 The configuration above is the one the MI308X-specific pieces below were
@@ -117,7 +118,6 @@ gated behind environment variables:
 * batch-1 MoE: routing and experts in two Triton kernels.
 * QSA indexer scoring: matrix cores for prefill, CUDA cores for decode-sized
   batches.
-* MI308X AITER GEMM tables: registered at model construction.
 
 The MTP drafter's single layer runs unfused (separate `mix`/`combine`) and
 keeps a standalone shared expert.
@@ -142,7 +142,9 @@ python -m sglang.bench_serving --backend sglang --host 127.0.0.1 --port 30080 \
 
 ## Boundaries
 
-- Use BF16 KV and page size 64. TP greater than 1 requires EP because the
+- Use BF16 KV and page size 64. TP greater than 1 without EP is validated only
+  for the PTPC checkpoint without MTP (the long-context configuration above,
+  TP2/EP1); otherwise use EP, as the MTP configuration does, because the
   expert intermediate width is 640.
 - Leave PLE embeddings in Native ATOM; do not enable PLE embedding offload.
   The memory fraction above leaves room for plugin-owned QSA indexer caches.
