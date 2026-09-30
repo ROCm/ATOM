@@ -630,6 +630,7 @@ class PagedAttentionImpl(nn.Module):
             # already holds, never the thread-local one: a TBO worker thread
             # that never installed its own shares the other ubatch's.
             work_plan=getattr(attn_metadata, "flydsl_work_plan", None),
+            max_context_length=attn_metadata.max_seqlen_k,
         )
 
         return o
