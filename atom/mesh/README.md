@@ -22,12 +22,15 @@ Atomesh can also run in an **ATOM standalone** mode. In this mode, Python owns t
 | `POST /v1/chat/completions` | Chat completions with streaming and tool calls |
 | `POST /v1/completions` | Text completions |
 | `POST /generate` | SGLang generate API |
-| `POST /v1/responses` | Background responses with status tracking |
+| `POST /v1/messages` | HTTP-backend Messages proxy, JSON and SSE |
+| `POST /v1/responses` | HTTP-backend Responses proxy, JSON and SSE; existing background/query support |
 | `POST /v1/tokenize` / `/v1/detokenize` | Tokenization with batch support |
 | `POST /parse/reasoning` / `/parse/function_call` | Reasoning and tool-call parsing |
 | `GET /health` / `/readiness` / `/liveness` | Health probes |
 | `GET /engine_metrics` | Aggregated worker engine Prometheus metrics |
 | `GET /v1/models` | Model metadata |
+
+See the [multi-API compatibility guide](../../docs/mesh_multi_api_guide.md) for the HTTP/ext-proc support matrix, headers, backend capabilities and state-routing limits.
 
 ## Installation
 

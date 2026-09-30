@@ -21,10 +21,8 @@ use crate::{
     config::RoutingMode,
     core::{ConnectionMode, WorkerRegistry},
     protocols::{
-        chat::ChatCompletionRequest,
-        completion::CompletionRequest,
-        generate::GenerateRequest,
-        responses::{ResponsesGetParams, ResponsesRequest},
+        chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
+        responses::ResponsesRequest,
     },
     routers::RouterTrait,
     server::ServerConfig,
@@ -298,6 +296,24 @@ impl RouterTrait for RouterManager {
         }
     }
 
+    async fn route_inference(
+        &self,
+        request: &super::ingress::InferenceEnvelope,
+        app: &Arc<AppContext>,
+    ) -> Response {
+        match self
+            .select_router_for_request(Some(&request.headers), request.metadata.model.as_deref())
+        {
+            Some(router) => router.route_inference(request, app).await,
+            None => super::comm::error::IngressError::new(
+                StatusCode::NOT_FOUND,
+                "model_not_found",
+                "model not found or no router available",
+            )
+            .response(request.uri.path()),
+        }
+    }
+
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
@@ -379,11 +395,11 @@ impl RouterTrait for RouterManager {
         &self,
         headers: Option<&HeaderMap>,
         response_id: &str,
-        params: &ResponsesGetParams,
+        query: Option<&str>,
     ) -> Response {
         let router = self.select_router_for_request(headers, None);
         if let Some(router) = router {
-            router.get_response(headers, response_id, params).await
+            router.get_response(headers, response_id, query).await
         } else {
             (
                 StatusCode::NOT_FOUND,
@@ -423,12 +439,13 @@ impl RouterTrait for RouterManager {
         &self,
         headers: Option<&HeaderMap>,
         response_id: &str,
+        query: Option<&str>,
     ) -> Response {
-        // Delegate to the default router (typically http-regular)
-        // Response storage is shared across all routers via AppContext
         let router = self.select_router_for_request(headers, None);
         if let Some(router) = router {
-            router.list_response_input_items(headers, response_id).await
+            router
+                .list_response_input_items(headers, response_id, query)
+                .await
         } else {
             (
                 StatusCode::NOT_FOUND,

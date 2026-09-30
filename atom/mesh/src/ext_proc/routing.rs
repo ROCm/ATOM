@@ -9,7 +9,7 @@ use crate::{
             traits::{PdPlanner, PolicySource},
             types::{PlacementPlan, Protocol, RequestDescriptor},
         },
-        ConnectionMode, Worker, WorkerLoadGuard, WorkerType,
+        Worker, WorkerLoadGuard,
     },
     policies::LoadBalancingPolicy,
 };
@@ -23,7 +23,7 @@ use super::{
 pub(super) struct RoutingDecision {
     pub target: ExecutionTarget,
     pub address: SocketAddr,
-    pub authorization: Option<String>,
+    pub api_key: Option<String>,
 }
 
 pub(super) enum ExecutionTarget {
@@ -65,11 +65,17 @@ impl ExecutionTarget {
 pub(super) struct EndpointRouter {
     app: Arc<AppContext>,
     executor: Option<Arc<PdExecutor>>,
+    policies: Arc<PolicyRegistryAdapter>,
 }
 
 impl EndpointRouter {
     pub fn new(app: Arc<AppContext>, executor: Option<Arc<PdExecutor>>) -> Self {
-        Self { app, executor }
+        let policies = Arc::new(PolicyRegistryAdapter::new(app.policy_registry.clone()));
+        Self {
+            app,
+            executor,
+            policies,
+        }
     }
 
     pub async fn select(
@@ -78,27 +84,9 @@ impl EndpointRouter {
         input: &RoutingInput,
     ) -> Result<RoutingDecision, ProcessingError> {
         let model = input.model.as_deref();
-        let pool = match model {
-            Some(model) => self
-                .app
-                .worker_registry
-                .get_by_model(model)
-                .iter()
-                .cloned()
-                .collect(),
-            None => self.app.worker_registry.get_all(),
-        };
-        let mut workers = pool
-            .into_iter()
-            .filter(|w| {
-                matches!(w.connection_mode(), ConnectionMode::Http)
-                    && if self.executor.is_some() {
-                        !matches!(w.worker_type(), WorkerType::Regular)
-                    } else {
-                        matches!(w.worker_type(), WorkerType::Regular)
-                    }
-            })
-            .collect::<Vec<_>>();
+        let mut workers = crate::routers::ingress::IngressRouting::new(&self.app)
+            .candidates(&input.metadata, input.state_reference)
+            .map_err(ProcessingError::from)?;
         let mut resolved = HashMap::new();
         if let Some(subset) = &request.subset {
             let mut candidates = Vec::new();
@@ -126,8 +114,7 @@ impl EndpointRouter {
             self.app.worker_registry.clone(),
             workers,
         ));
-        let policies = Arc::new(PolicyRegistryAdapter::new(self.app.policy_registry.clone()));
-        let planner = DefaultPlanner::new(source, policies.clone());
+        let planner = DefaultPlanner::new(source, self.policies.clone());
         let descriptor = RequestDescriptor {
             model_id: model,
             protocol: Some(Protocol::Http),
@@ -136,10 +123,11 @@ impl EndpointRouter {
             headers: Some(&request.headers),
             stream: input.stream,
         };
-        let plan = planner
-            .plan(&descriptor)
-            .await
-            .map_err(|e| ProcessingError::new(503, "placement_failed", e.to_string()))?;
+        let plan = planner.plan(&descriptor).await.map_err(|e| {
+            ProcessingError::from(crate::routers::comm::error::IngressError::placement(
+                e, model,
+            ))
+        })?;
         let worker = match plan {
             PlacementPlan::Single { worker, .. } => worker,
             pair @ PlacementPlan::Pair { .. } => {
@@ -157,7 +145,7 @@ impl EndpointRouter {
                         &input.metadata,
                     )?),
                     address: executor.address,
-                    authorization: None,
+                    api_key: None,
                 });
             }
         };
@@ -177,15 +165,15 @@ impl EndpointRouter {
                 self.app.router_config.ext_proc.max_body_bytes,
             )?;
         }
-        let authorization = worker.api_key().as_ref().map(|key| format!("Bearer {key}"));
+        let api_key = worker.api_key().clone();
         Ok(RoutingDecision {
             target: ExecutionTarget::Single {
                 worker,
                 _load: load,
-                policy: policies.regular_policy(model),
+                policy: self.policies.regular_policy(model),
             },
             address,
-            authorization,
+            api_key,
         })
     }
 

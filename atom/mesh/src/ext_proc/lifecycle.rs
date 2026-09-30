@@ -152,7 +152,7 @@ mod tests {
         let mut lifecycle = RequestLifecycle::new();
         lifecycle.bind(RoutingDecision {
             address: "127.0.0.1:80".parse().unwrap(),
-            authorization: None,
+            api_key: None,
             target: ExecutionTarget::Single {
                 _load: WorkerLoadGuard::new(worker.clone(), None),
                 worker: worker.clone(),

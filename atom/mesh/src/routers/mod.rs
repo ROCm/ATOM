@@ -11,10 +11,8 @@ use axum::{
 };
 
 use crate::protocols::{
-    chat::ChatCompletionRequest,
-    completion::CompletionRequest,
-    generate::GenerateRequest,
-    responses::{ResponsesGetParams, ResponsesRequest},
+    chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
+    responses::ResponsesRequest,
 };
 
 pub mod atom_standalone;
@@ -23,6 +21,7 @@ pub mod factory;
 pub mod grpc;
 pub mod http_pd_router;
 pub mod http_router;
+pub mod ingress;
 pub mod openai;
 pub mod prepare;
 pub mod render;
@@ -44,6 +43,44 @@ pub trait RouterTrait: Send + Sync + Debug {
 
     /// Gracefully release router-owned resources during server shutdown.
     async fn shutdown(&self) {}
+
+    /// Raw ingress dispatch. Native backends retain their existing typed API handling.
+    async fn route_inference(
+        &self,
+        request: &ingress::InferenceEnvelope,
+        _app: &std::sync::Arc<crate::app_context::AppContext>,
+    ) -> Response {
+        use prepare::inference::ParsedInference;
+        let headers = Some(&request.headers);
+        let model = request.metadata.model.as_deref();
+        match &request.parsed {
+            ParsedInference::Chat(body) => self.route_chat(headers, body, model).await,
+            ParsedInference::Completion(body) => self.route_completion(headers, body, model).await,
+            ParsedInference::Generate(body) => self.route_generate(headers, body, model).await,
+            ParsedInference::Responses(body) => {
+                use crate::protocols::validated::Normalizable;
+                use validator::Validate;
+                match serde_json::from_value::<ResponsesRequest>(body.clone()) {
+                    Ok(mut body) => {
+                        body.normalize();
+                        if let Err(err) = body.validate() {
+                            return comm::error::IngressError::invalid(err.to_string())
+                                .response(request.uri.path());
+                        }
+                        self.route_responses(headers, &body, model).await
+                    }
+                    Err(err) => comm::error::IngressError::invalid(err.to_string())
+                        .response(request.uri.path()),
+                }
+            }
+            ParsedInference::Messages(_) => comm::error::IngressError::new(
+                StatusCode::NOT_IMPLEMENTED,
+                "unsupported_api",
+                "Messages requires an HTTP backend",
+            )
+            .response(request.uri.path()),
+        }
+    }
 
     /// Route a health generate request
     async fn health_generate(&self, _req: Request<Body>) -> Response {
@@ -128,7 +165,7 @@ pub trait RouterTrait: Send + Sync + Debug {
         &self,
         _headers: Option<&HeaderMap>,
         _response_id: &str,
-        _params: &ResponsesGetParams,
+        _query: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Get response not implemented").into_response()
     }
@@ -156,6 +193,7 @@ pub trait RouterTrait: Send + Sync + Debug {
         &self,
         _headers: Option<&HeaderMap>,
         _response_id: &str,
+        _query: Option<&str>,
     ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,

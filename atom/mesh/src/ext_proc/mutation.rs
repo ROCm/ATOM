@@ -39,20 +39,16 @@ impl Mutation {
         original: &http::HeaderMap,
         endpoint: &str,
         request_id: &str,
-        authorization: Option<&str>,
+        api_key: Option<&str>,
         execution_id: Option<&str>,
-    ) -> pb::ProcessingResponse {
+        path: &str,
+    ) -> Result<pb::ProcessingResponse, super::error::ProcessingError> {
         // FULL_DUPLEX_STREAMED lets Envoy choose the HTTP framing. In
         // particular, requests with trailers must not acquire Content-Length.
         let mut headers = Self::headers([
             (Self::DESTINATION, endpoint.as_bytes()),
             ("x-request-id", request_id.as_bytes()),
         ]);
-        if let Some(value) = authorization {
-            headers
-                .set_headers
-                .extend(Self::headers([("authorization", value.as_bytes())]).set_headers);
-        }
         headers.remove_headers = original
             .keys()
             .map(|name| name.as_str())
@@ -66,6 +62,29 @@ impl Mutation {
             })
             .map(str::to_owned)
             .collect();
+        if let Some(key) = api_key {
+            let resolved = crate::routers::comm::header_utils::inference_request_headers(
+                original,
+                path,
+                Some(key),
+            )
+            .map_err(|_| {
+                super::error::ProcessingError::new(
+                    503,
+                    "invalid_backend_credentials",
+                    "configured worker credential is not a valid HTTP header",
+                )
+            })?;
+            for name in ["authorization", "x-api-key"] {
+                if let Some(value) = resolved.get(name) {
+                    headers
+                        .set_headers
+                        .extend(Self::headers([(name, value.as_bytes())]).set_headers);
+                } else {
+                    headers.remove_headers.push(name.into());
+                }
+            }
+        }
         // A Trailer declaration must not advertise fields that will be removed.
         if original.contains_key("trailer") {
             let declared = original
@@ -94,7 +113,7 @@ impl Mutation {
                 .remove_headers
                 .push(super::executor::PdExecutor::HEADER.into());
         }
-        pb::ProcessingResponse {
+        Ok(pb::ProcessingResponse {
             response: Some(pb::processing_response::Response::RequestHeaders(
                 pb::HeadersResponse {
                     response: Some(pb::CommonResponse {
@@ -120,7 +139,7 @@ impl Mutation {
                 )]),
             }),
             ..Default::default()
-        }
+        })
     }
 
     pub fn body(bytes: Vec<u8>, end: bool, request: bool) -> pb::ProcessingResponse {
@@ -167,6 +186,7 @@ impl Mutation {
         should_forward_request_header(name)
             // Credentials and the selected correlation ID belong to the initial headers.
             && !name.eq_ignore_ascii_case("authorization")
+            && !name.eq_ignore_ascii_case("x-api-key")
             && !name.eq_ignore_ascii_case("x-request-id")
     }
 
@@ -239,7 +259,9 @@ mod tests {
                 "correlation",
                 None,
                 execution,
-            );
+                "/v1/chat/completions",
+            )
+            .unwrap();
             let Some(pb::processing_response::Response::RequestHeaders(response)) =
                 response.response
             else {

@@ -211,6 +211,30 @@ pub fn create_logging_layer() -> TraceLayer<
         .on_response(ResponseLogger)
 }
 
+pub async fn payload_limit_middleware(
+    State(limit): State<usize>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .is_some_and(|n| n > limit as u64)
+    {
+        return crate::routers::comm::error::IngressError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body_too_large",
+            "request body limit exceeded",
+        )
+        .response(request.uri().path());
+    }
+    // Raw handlers also need a stream limit for chunked uploads.
+    let request = request.map(|body| Body::new(http_body_util::Limited::new(body, limit)));
+    next.run(request).await
+}
+
 /// Admission is acquired before invoking the handler and follows the response body.
 /// Dropping either the handler future or the body returns all reserved resources.
 pub async fn concurrency_limit_middleware(
@@ -226,7 +250,8 @@ pub async fn concurrency_limit_middleware(
         }
         Err(error) => {
             MeshMetrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
-            crate::routers::comm::error::create_error(
+            crate::routers::comm::error::MeshLocalError::response(
+                request.uri().path(),
                 StatusCode::from_u16(error.status).unwrap(),
                 error.code,
                 error.message,
