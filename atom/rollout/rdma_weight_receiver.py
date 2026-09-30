@@ -228,13 +228,16 @@ def receive_weight_stream(
         manifest = runner.commit_weight_update(
             expected_version, verify_full_load=verify_full_load
         )
+        # Inside the try: the writes are asynchronous, so a device fault in
+        # them, or in commit's own finalisation, surfaces only here, after
+        # commit has declared the version good.
+        torch.cuda.synchronize(device)
     except Exception as exc:
         # Fence before re-raising: the parameters are now a mix of versions, so
         # serving must stop until a later full reload succeeds.
         runner.abort_weight_update(expected_version, exc)
         raise
 
-    torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - started
     return {
         "version": float(expected_version),

@@ -1405,8 +1405,11 @@ class WeightUpdaterMixin:
                     )
                     updated += 1
                 elif self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
-                    self._requantize_fp8_weight(module, param_name, param, tensor)
-                    updated += 1
+                    if self._requantize_fp8_weight(module, param_name, param, tensor):
+                        updated += 1
+                    else:
+                        # Logged by the requantiser; the old weight is still there.
+                        skipped += 1
                 elif self._is_fp8_param(module, param) and tensor.dtype == param.dtype:
                     tensor = tensor.to(device=self.device)
                     self._copy_into_param(param, tensor)
@@ -1572,8 +1575,11 @@ class WeightUpdaterMixin:
                 self._apply_named_expert_buffer(name, param_name, module, param, tensor)
                 updated += 1
             elif self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
-                self._requantize_fp8_weight(module, param_name, param, tensor)
-                updated += 1
+                if self._requantize_fp8_weight(module, param_name, param, tensor):
+                    updated += 1
+                else:
+                    # Logged by the requantiser; the old weight is still there.
+                    skipped += 1
             elif self._is_fp8_param(module, param) and tensor.dtype == param.dtype:
                 self._copy_into_param(param, tensor)
                 self._post_process_fp8_weight(module, param)
