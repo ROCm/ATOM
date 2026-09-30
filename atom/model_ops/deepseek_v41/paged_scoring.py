@@ -81,7 +81,7 @@ def quantize_query_fp4(query, rope, positions):
         rope.rope_dim,
         out_scale=scales,
         group_size=32,
-        shuffle_scale=True,
+        scale_layout="flydsl",
         do_rotate_act=False,
         round_rope=True,
     )

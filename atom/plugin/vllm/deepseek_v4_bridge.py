@@ -694,9 +694,9 @@ def _bind_compressor_state(
     compressor.kv_cache_rope = kv_cache_rope
     compressor.write_mode = write_mode
     if is_indexer:
-        compressor.quant_mode = "per_row_fp8"
+        compressor.quant_mode = "fp8_per_row"
     else:
-        compressor.quant_mode = "group_fp8" if kv_cache_rope is not None else "none"
+        compressor.quant_mode = "fp8_group" if kv_cache_rope is not None else "none"
 
 
 def _v4_max_spec_steps(vllm_config) -> int:

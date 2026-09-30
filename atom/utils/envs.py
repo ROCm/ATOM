@@ -297,6 +297,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_COMPRESS_USE_FLYDSL": lambda: os.getenv(
         "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
     ).lower(),
+    # DeepSeek-V4 FP4 scorer and matching Q/K layout, fixed before graph capture.
+    "ATOM_V4_UNIFIED_MQA": lambda: os.getenv("ATOM_V4_UNIFIED_MQA", "opus").lower(),
     # gather_kv_b_proj (the MLA cached-prefix expansion): swap the Triton op for
     # the flydsl a8w8 gather-GEMM. Added 2026-09-09.
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ": lambda: (

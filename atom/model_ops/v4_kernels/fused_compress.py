@@ -444,11 +444,12 @@ def fused_compress_attn(
     use_ue8m0: bool = True,  # round scale to power-of-2 (UE8M0); only when quant=True
     preshuffle: bool = True,  # MFMA 16x16 preshuffled FP8 layout; only when quant=True
     fp8_max: float | None = None,  # E4M3 max; required for FP8 quant
-    quant_mode: str | None = None,  # "none"|"fp8"|"fp4"; default from `quant`
+    # none | fp8_per_row | fp8_group | fp4 | fp4_gfx950_flydsl | fp4_gfx950_opus
+    quant_mode: str | None = None,
     # V4-Main native fp8 2buff path (CSA/HCA Main under --kv_cache_dtype fp8).
     # Distinct from `quant` (Indexer-inner per-row preshuffle): writes per-64-tile
     # e8m0 nope-fp8 + inline dup-scale into `kv_cache` (fp8 [NB,k,512]) and bf16
-    # rope into `kv_cache_rope` (bf16 [NB,k,64]) via the flydsl group_fp8 scatter.
+    # rope into `kv_cache_rope` (bf16 [NB,k,64]) via the flydsl fp8_group scatter.
     main_2buff_fp8: bool = False,
     kv_cache_rope: torch.Tensor | None = None,  # bf16 [NB,k_per_block,64]
     # CSA2 index key source: the post-norm PRE-RoPE latent, one row per plan
@@ -492,13 +493,19 @@ def fused_compress_attn(
     # selector; the legacy `quant` bool is only a fallback for callers that don't
     # pass quant_mode ("fp8" if quant else "none").
     _mode = quant_mode if quant_mode is not None else ("fp8" if quant else "none")
-    _fp4 = _mode == "fp4"
+    _fp4 = _mode in ("fp4", "fp4_gfx950_flydsl", "fp4_gfx950_opus")
     # `quant` = the Indexer-inner per-row fp8/fp4 scatter (needs cache_scale /
     # fp8_max, takes the quant validation + Triton fallback path). Derive it from
-    # the mode so callers only pass quant_mode. CSA/HCA Main group_fp8 is NOT
+    # the mode so callers only pass quant_mode. CSA/HCA Main fp8_group is NOT
     # `quant` — its 2buff scatter is driven by `main_2buff_fp8` — and `none`/bf16
     # is plain. (Back-compat: legacy quant=True → quant_mode None → _mode "fp8".)
-    quant = _mode in ("fp8", "per_row_fp8", "fp4")
+    quant = _mode in (
+        "fp8",
+        "fp8_per_row",
+        "fp4",
+        "fp4_gfx950_flydsl",
+        "fp4_gfx950_opus",
+    )
 
     # ------------------------------------------------------------------
     # flydsl dispatch. Pure-GPU time on V4-Pro beats Triton 0.9x→2.9x
@@ -539,7 +546,7 @@ def fused_compress_attn(
         and _shape_key == (512, 64, 128, False)
     )
     if _hca_use:
-        # main_2buff_fp8: native group_fp8 2buff scatter (nope-fp8 into
+        # main_2buff_fp8: native fp8_group 2buff scatter (nope-fp8 into
         # kv_cache, bf16 rope into k_rope_cache). Otherwise plain bf16.
         flydsl_hca_compress_attn(
             kv_in=kv_in,
@@ -565,9 +572,9 @@ def fused_compress_attn(
         )
         return
     if _flydsl_use:
-        # main_2buff_fp8: CSA Main native group_fp8 2buff (nope-fp8 + inline
+        # main_2buff_fp8: CSA Main native fp8_group 2buff (nope-fp8 + inline
         # e8m0 into kv_cache, bf16 rope into k_rope_cache; scale carried inline
-        # so cache_scale stays None). Indexer-inner uses per_row_fp8 preshuffle.
+        # so cache_scale stays None). Indexer-inner uses fp8_per_row preshuffle.
         flydsl_fused_compress_attn(
             kv_in=kv_in,
             score_in=score_in,
@@ -591,7 +598,7 @@ def fused_compress_attn(
             cache_scale=cache_scale,
             use_ue8m0=use_ue8m0,
             preshuffle=preshuffle and not main_2buff_fp8,
-            quant_mode="group_fp8" if main_2buff_fp8 else _mode,
+            quant_mode="fp8_group" if main_2buff_fp8 else _mode,
             k_rope_cache=kv_cache_rope if main_2buff_fp8 else None,
         )
         return
@@ -601,7 +608,7 @@ def fused_compress_attn(
         # fallback below has no FP4 path. Reaching here means flydsl is
         # unavailable or the shape is unsupported.
         raise RuntimeError(
-            "quant_mode='fp4' requires the flydsl fused_compress_attn kernel "
+            f"quant_mode={_mode!r} requires the flydsl fused_compress_attn kernel "
             f"(available={flydsl_fused_compress_attn is not None}, "
             f"shape_ok={_flydsl_shape_ok}, mode={_flydsl_mode})."
         )

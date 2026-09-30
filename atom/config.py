@@ -2656,6 +2656,13 @@ class Config:
         factors.append(bool(getattr(self.dcp_config, "indexer_dcp_only", False)))
         factors.append(self.enable_dp_attention)
         factors.append(self.index_cache_dtype)
+        arches = getattr(self.hf_config, "architectures", None) or []
+        if self.index_cache_dtype == "fp4" and any(
+            str(a).startswith(("DeepseekV4For", "DeepseekV4MTP", "DeepseekV4DSpark"))
+            for a in arches
+        ):
+            # The backend changes traced Q-scale shapes and compressor writes.
+            factors.append(("v4_fp4_mqa", envs.ATOM_V4_UNIFIED_MQA))
         text_config = getattr(self.hf_config, "text_config", self.hf_config)
         factors.append(
             (

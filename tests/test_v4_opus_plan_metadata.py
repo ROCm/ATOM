@@ -17,7 +17,8 @@ def test_chunk_cu_seqlens_cuts_sequences_and_drops_empty_segments():
     assert _chunk_cu_seqlens(cu, 2, 10).tolist() == [0, 1, 6, 8]
 
 
-def test_decode_plan_selects_qlen_variant_and_reuses_its_buffers(monkeypatch):
+@pytest.mark.parametrize("layout", ["fp4-gfx950-opus", "fp4-gfx1250-natural"])
+def test_decode_plan_selects_qlen_variant_and_reuses_its_buffers(monkeypatch, layout):
     opus = pytest.importorskip(
         "aiter.ops.opus.pa_mqa_logits_mxfp4",
         reason="the OPUS FP4 MQA extension is not installed",
@@ -33,18 +34,24 @@ def test_decode_plan_selects_qlen_variant_and_reuses_its_buffers(monkeypatch):
     monkeypatch.setattr(opus, "pa_mqa_logits_mxfp4_plan", fake_plan)
 
     builder = object.__new__(DeepseekV4AttentionMetadataBuilder)
+    builder.indexer_layout = layout
     q1_buffers = object()
     q4_buffers = object()
     builder._v4_fp4_opus_plan_buffers = {
         "": {"qlen1_kv64": q1_buffers, "qlen4_kv64": q4_buffers}
     }
+    if layout == "fp4-gfx950-opus":
+        del builder._v4_fp4_opus_plan_buffers[""]["qlen4_kv64"]
+    assert tuple(
+        builder._v4_fp4_opus_plan_buffers[""]
+    ) == attn._fp4_opus_decode_variants(layout)
     metadata = type(
         "Metadata",
         (),
         {
             "cu_seqlens_q": torch.tensor([0, 2], dtype=torch.int32),
-            "csa_n_committed_per_token": torch.tensor([7, 8], dtype=torch.int32),
-            "batch_id_per_q_token": torch.tensor([0, 0], dtype=torch.int32),
+            "csa_n_committed_per_token": torch.tensor([7, 8, 999], dtype=torch.int32),
+            "batch_id_per_q_token": torch.tensor([0, 0, -1], dtype=torch.int32),
             "max_seqlen_q": 1,
         },
     )()
@@ -54,9 +61,13 @@ def test_decode_plan_selects_qlen_variant_and_reuses_its_buffers(monkeypatch):
     builder._refresh_fp4_opus_decode_plan(metadata, positions, meta)
     assert meta["fp4_opus_plan"] is q1_buffers
     assert calls[-1][2]["buffers"] is q1_buffers
+    assert calls[-1][2]["total_q"] == 2
+    assert calls[-1][1].tolist() == [7, 8]
+    assert calls[-1][2]["row_to_batch"].tolist() == [0, 0]
 
     metadata.max_seqlen_q = 4
     meta = {}
     builder._refresh_fp4_opus_decode_plan(metadata, positions, meta)
-    assert meta["fp4_opus_plan"] is q4_buffers
-    assert calls[-1][2]["buffers"] is q4_buffers
+    expected = q1_buffers if layout == "fp4-gfx950-opus" else q4_buffers
+    assert meta["fp4_opus_plan"] is expected
+    assert calls[-1][2]["buffers"] is expected

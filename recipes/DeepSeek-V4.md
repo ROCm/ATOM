@@ -29,6 +29,28 @@ Tips on server configuration:
   FP4 index selection, including the separate e8m0 scale pool. Use
   `--index-cache-dtype fp8` to force the legacy path, or explicitly select
   `fp4` on a supported native path.
+- `ATOM_V4_UNIFIED_MQA=opus` (default) selects OPUS FP4 indexer logits on
+  gfx950/gfx1250. Set `ATOM_V4_UNIFIED_MQA=flydsl` on gfx950 to use the legacy
+  FlyDSL scorer. This selects the matching Q/K scale and cache layout at model
+  construction; restart the server when changing it. Both PD endpoints must
+  use the same setting. The switch applies only to the FP4 V4 indexer, not
+  the main attention or MoE backend; the compressor still uses its fused
+  FlyDSL writer. gfx1250 supports only `opus`.
+  The gfx950 OPUS writer uses `quant_mode="fp4_gfx950_opus"`; Q quantization uses
+  `scale_layout="opus"` (`"flydsl"` for the legacy shuffle and the default
+  `"none"` for natural scales). The RoPE quantization API uses the string
+  `scale_layout` in place of the old boolean `shuffle_scale`.
+  `fp4` writes natural data/scales without shuffle (including gfx1250 OPUS);
+  `fp4_gfx950_flydsl` and `fp4_gfx950_opus` select the gfx950 layouts.
+  FP4 layout is determined by the mode, independently of `preshuffle`.
+  FP8 modes are named `fp8_per_row` and `fp8_group`.
+  Requires aiter with the gfx1250 natural FP4 compressor writer.
+  The updated aiter plan carries `total_q` as `num_rows` through scheduling
+  and launch. ATOM passes it explicitly; graph padding rows have empty windows.
+  Page-table sizing uses the builder's device and covers the largest KV tile.
+  Requires the matching aiter OPUS plan API and fused OPUS scale writers;
+  rebuild `module_dsv4_rotate_quant` and `module_pa_mqa_logits_mxfp4_opus`
+  when upgrading a checkout with older compiled extensions.
 - Set `AITER_LOG_LEVEL=WARNING` before starting to suppress aiter kernel log noise.
 - Clear compile cache before restarting after code changes: `rm -rf /root/.cache/atom/*`
 - V4-Pro reuses the DeepSeek-V3 config schema; V4-specific fields (compress ratios, hash layers, index head dims) are read from the HF config automatically.
