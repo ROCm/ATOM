@@ -1779,37 +1779,35 @@ def test_kimi_geometry_is_grouped_not_concurrency_specific():
         KimiDecodeGeometry(1, 8, 9, "fp16", False)
 
 
-@pytest.mark.parametrize(
-    ("num_spec", "dcp", "replay", "q", "conv_rows"),
-    (
-        (7, 1, False, 8, 10),
-        (3, 8, True, 4, 6),
-        (None, 8, False, 1, 3),
-    ),
-)
-def test_kimi_recipe_geometry_modes(
-    monkeypatch, num_spec, dcp, replay, q, conv_rows
-):
+def test_kimi_recipe_geometry_is_interactive_tp(monkeypatch):
     module = _kimi_mono_module()
-    monkeypatch.setattr(
-        module,
-        "envs",
-        SimpleNamespace(ATOM_ENABLE_REPLAYSSM=replay),
-    )
-    speculative = (
-        None
-        if num_spec is None
-        else SimpleNamespace(method="dspark", num_speculative_tokens=num_spec)
-    )
-
+    monkeypatch.setattr(module, "envs", SimpleNamespace(ATOM_ENABLE_REPLAYSSM=False))
     geometry = module.resolve_kimi_decode_geometry(
         SimpleNamespace(
-            speculative_config=speculative,
-            decode_context_parallel_size=dcp,
+            speculative_config=SimpleNamespace(method="dspark", num_speculative_tokens=7),
+            decode_context_parallel_size=1,
         )
     )
+    assert geometry == KimiDecodeGeometry(1, 8, 10, "fp16", False)
 
-    assert geometry == KimiDecodeGeometry(1, q, conv_rows, "fp16", replay)
+
+@pytest.mark.parametrize(
+    ("speculative", "replay"),
+    (
+        (SimpleNamespace(method="dspark", num_speculative_tokens=3), True),
+        (None, False),
+    ),
+)
+def test_kimi_geometry_rejects_dcp_bands(monkeypatch, speculative, replay):
+    module = _kimi_mono_module()
+    monkeypatch.setattr(module, "envs", SimpleNamespace(ATOM_ENABLE_REPLAYSSM=replay))
+    with pytest.raises(module.MonoUnsupported, match="DCP=8"):
+        module.resolve_kimi_decode_geometry(
+            SimpleNamespace(
+                speculative_config=speculative,
+                decode_context_parallel_size=8,
+            )
+        )
 
 
 def test_kimi_geometry_rejects_cross_band_flag_mix(monkeypatch):

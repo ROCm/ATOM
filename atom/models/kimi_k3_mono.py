@@ -342,11 +342,7 @@ def resolve_kimi_decode_geometry(atom_config) -> KimiDecodeGeometry:
     replay_override = envs.ATOM_ENABLE_REPLAYSSM
     replay_mode = (q > 1) if replay_override is None else replay_override
     dcp = atom_config.decode_context_parallel_size
-    supported = (
-        (q == 8 and dcp == 1 and not replay_mode)
-        or (q == 4 and dcp == 8 and replay_mode)
-        or (q == 1 and dcp == 8 and not replay_mode)
-    )
+    supported = q == 8 and dcp == 1 and not replay_mode
     if not supported:
         raise MonoUnsupported(
             f"unsupported Kimi geometry q={q}, DCP={dcp}, ReplaySSM={int(replay_mode)}"
