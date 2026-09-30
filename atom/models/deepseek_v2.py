@@ -3601,7 +3601,7 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
         # "indexer.weights_proj".  str.replace translates each exclude entry.
         "indexers_proj": "indexer.weights_proj",
     }
-    # IQ2R overlays store each layer's routed and fused shared experts as one
+    # IQ2R checkpoints store each layer's routed and fused shared experts as one
     # stacked gate/up and down matrix.
     weights_mapping: ClassVar[dict[str, str]] = {
         ".mlp.up_gate_proj.0.iq2r_data": ".mlp.experts.w13_weight",

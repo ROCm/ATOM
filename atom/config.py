@@ -352,7 +352,7 @@ class QuantizationConfig:
             self.quant_method = self.hf_quant_config.get("quant_method", "")
 
         # Online quantization: re-quantize supported source tensors at load
-        # time. IQ2R overlays are eligible because their non-IQ2R layers retain
+        # time. IQ2R checkpoints are eligible because their non-IQ2R layers retain
         # the base checkpoint's ordinary quantization spec; callers must keep
         # routed IQ2R modules excluded from the online target config.
         self.online_quant = False
