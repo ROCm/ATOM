@@ -42,6 +42,7 @@ from atom.distributed.pp_comm import (
 )
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
 from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.kv_transfer.disaggregation.pd_producer import mla_staging_reserve_bytes
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
@@ -1741,6 +1742,14 @@ class ModelRunner:
         # Physical clamp: never exceed what's actually free on the GPU.
         # Subclasses may reserve extra headroom (override point).
         available_for_kv_budget -= self._kv_budget_extra_reserve(total)
+        # The Mooncake producer allocates its MLA staging pool after the KV
+        # cache, so hold its bytes back here.
+        mla_staging_bytes = mla_staging_reserve_bytes(config)
+        if mla_staging_bytes:
+            logger.info(
+                "Reserving %.2fGB for P/D MLA staging", mla_staging_bytes / (1 << 30)
+            )
+            available_for_kv_budget -= mla_staging_bytes
         # This prevents OOM when other processes share the GPU.
         available_for_kv = min(available_for_kv_budget, free)
 
