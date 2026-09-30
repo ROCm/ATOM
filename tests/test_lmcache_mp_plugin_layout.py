@@ -19,9 +19,11 @@ from atom.kv_transfer.offload.mp.page_views import (
     _build_cache_views,
     validate_page_views,
 )
+from atom.plugin.vllm.kv_transfer.kda_state import KdaPageViews
 from atom.plugin.vllm.kv_transfer.mp_page_layout import (
     _NON_PAGE_ROLES,
     _PAGE_ROLES,
+    build_mp_recurrent_groups,
     build_mp_transfer_tensors,
     summarize_layout,
 )
@@ -127,3 +129,84 @@ def test_summary_reports_what_was_published():
     tensors = build_mp_transfer_tensors(_layers(), num_blocks=_NUM_BLOCKS)
     summary = summarize_layout(tensors)
     assert "8" in summary and str(_NUM_BLOCKS) in summary
+
+
+# --- recurrent groups -------------------------------------------------------
+
+_STATE_BLOCKS = 5
+_STATE_WIDTH = 24
+_TOKENS_PER_BLOCK = 1536
+
+
+def _state_views(*, groups: int = 3, layers: int = 2, blocks: int = _STATE_BLOCKS):
+    """A KdaPageViews over `groups` mamba groups, K3's shape in miniature."""
+    return KdaPageViews(
+        [
+            [
+                torch.zeros((blocks, _STATE_WIDTH), dtype=torch.bfloat16)
+                for _ in range(layers)
+            ]
+            for _ in range(groups)
+        ],
+        layout_id="test",
+    )
+
+
+def test_one_engine_group_per_mamba_group_in_gather_order():
+    """Group order is the key space, so it has to be the codec's own order."""
+    views = _state_views()
+    recurrent = build_mp_recurrent_groups(views, tokens_per_block=_TOKENS_PER_BLOCK)
+    assert len(recurrent) == views.num_groups
+    for group, tensors in zip(recurrent, views.groups):
+        assert len(group.pages) == len(tensors)
+        assert group.num_blocks == _STATE_BLOCKS
+        assert group.tokens_per_block == _TOKENS_PER_BLOCK
+
+
+def test_pages_alias_the_state_tensors_without_copying():
+    """The server writes through these addresses; a copy would restore nothing."""
+    views = _state_views(groups=1, layers=1)
+    (group,) = build_mp_recurrent_groups(views, tokens_per_block=_TOKENS_PER_BLOCK)
+    (page,) = group.pages
+    plane = views.groups[0][0]
+    assert page.view.data_ptr() == plane.data_ptr()
+    assert page.region.unit_bytes == plane[0].numel() * plane.element_size()
+
+
+def test_a_recurrent_block_is_one_snapshot_not_one_token():
+    """Sized off its own leading axis, never off the attention block count.
+
+    The whole reason recurrent groups are published apart is that they count
+    in a different block id space; sizing a unit from the PAGE block count
+    would move a fraction of each snapshot and pass every later check.
+    """
+    views = _state_views(groups=1, layers=1, blocks=_STATE_BLOCKS)
+    (group,) = build_mp_recurrent_groups(views, tokens_per_block=_TOKENS_PER_BLOCK)
+    assert group.num_blocks == _STATE_BLOCKS != _NUM_BLOCKS
+
+
+def test_a_non_block_major_state_plane_is_refused():
+    views = _state_views(groups=1, layers=1)
+    views.groups[0][0] = torch.zeros((_STATE_BLOCKS + 1, _STATE_WIDTH))
+    with pytest.raises(ValueError, match="not the block axis"):
+        build_mp_recurrent_groups(views, tokens_per_block=_TOKENS_PER_BLOCK)
+
+
+@pytest.mark.parametrize("bad", [0, -1, 1.0, None])
+def test_a_non_positive_token_span_is_refused(bad):
+    """A snapshot's row count says nothing about how many tokens it covers."""
+    with pytest.raises(ValueError, match="tokens_per_block"):
+        build_mp_recurrent_groups(_state_views(), tokens_per_block=bad)
+
+
+def test_summary_names_the_recurrent_groups_when_there_are_any():
+    tensors = build_mp_transfer_tensors(_layers(), num_blocks=_NUM_BLOCKS)
+    assert "recurrent" not in summarize_layout(tensors)
+    object.__setattr__(
+        tensors,
+        "recurrent_page_groups",
+        build_mp_recurrent_groups(_state_views(), tokens_per_block=_TOKENS_PER_BLOCK),
+    )
+    summary = summarize_layout(tensors)
+    assert "3 recurrent group(s)" in summary
+    assert str(_TOKENS_PER_BLOCK) in summary

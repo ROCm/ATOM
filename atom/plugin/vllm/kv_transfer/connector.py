@@ -255,6 +255,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self._attn_group_id = self._resolve_attention_group(kv_cache_config)
         # Worker half of the recurrent leg.
         self._kda_tier = None
+        # Set only when the state rides the PAGE object; the own-pool codec
+        # keeps its own.
+        self._kda_views: KdaPageViews | None = None
         # Only 'mp' hybrids have one; see `_state_storage_for_mp`.
         self._state_engine = None
         # Kept separately: the builder's instance table is keyed by this id and
@@ -290,6 +293,8 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self._requests: dict[str, Any] = {}
 
         self._state_cpu_size_gb = self._resolve_state_cpu_size_gb()
+        # After both: the refusal it raises names the size it did not find.
+        self._state_transport = self._resolve_state_transport()
         self._offload_backend = self._resolve_offload_backend()
 
         if role == KVConnectorRole.WORKER:
@@ -372,20 +377,50 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 "ATOM offload connector: atom.offload.backend must be "
                 f"'inproc' or 'mp', got {raw!r}"
             )
-        if backend == "mp" and self._mamba_groups and not self._state_cpu_size_gb:
-            raise ValueError(
-                "ATOM offload connector: atom.offload.backend='mp' needs "
-                "lmcache.mp.state_cpu_size_gb for this model. It has "
-                f"{len(self._mamba_groups)} recurrent KV cache group(s), whose "
-                "per-slot state cannot be published as an LMCache group -- the "
-                "multiprocess protocol addresses every group by paged block. "
-                "Under 'mp' that state therefore gets its own LMCache engine "
-                "and its own host pool, on top of the one the server process "
-                "already holds; sizing it is left to you so the second "
-                "allocation is never a surprise. Set it, or use "
-                "atom.offload.backend='inproc', which shares one pool."
-            )
         return backend
+
+    def _resolve_state_transport(self) -> str:
+        """How the recurrent leg travels under ``mp``: with the KV, or apart.
+
+        ``"mp"`` (the default) publishes each recurrent group as an LMCache
+        engine group of its own and rides the PAGE transfer object, so a
+        prefix's KV and the state that continues it commit and restore as one
+        object. ``"own-pool"`` is the earlier arrangement: a per-rank LMCache
+        engine with a host pool of its own, sized by
+        ``lmcache.mp.state_cpu_size_gb``.
+
+        The difference is not only host memory. Under ``own-pool`` the two
+        tiers evict independently, so a reader can find a prefix whose
+        attention pages are present and whose recurrent state is gone --
+        detected, if at all, only as a failed load. It is kept because it is
+        what the accuracy and throughput numbers to date were taken on.
+        """
+        raw = self._config.kv_transfer_config.get("lmcache.mp.state_transport", "mp")
+        transport = str(raw).strip().lower()
+        if transport not in ("mp", "own-pool"):
+            raise ValueError(
+                "ATOM offload connector: lmcache.mp.state_transport must be "
+                f"'mp' or 'own-pool', got {raw!r}"
+            )
+        if transport == "own-pool" and not self._state_cpu_size_gb:
+            raise ValueError(
+                "ATOM offload connector: lmcache.mp.state_transport='own-pool' "
+                "needs lmcache.mp.state_cpu_size_gb. That mode gives the "
+                f"{len(self._mamba_groups)} recurrent KV cache group(s) an "
+                "LMCache engine and a host pool of their own, on top of the "
+                "one the server process already holds; sizing it is left to "
+                "you so the second allocation is never a surprise."
+            )
+        return transport
+
+    @property
+    def _state_rides_mp(self) -> bool:
+        """True when the recurrent groups are published to the MP server."""
+        return (
+            self._offload_backend == "mp"
+            and bool(self._mamba_groups)
+            and self._state_transport == "mp"
+        )
 
     def _resolve_state_cpu_size_gb(self) -> float:
         """Host GiB for the recurrent state tier's own pool under ``mp``.
@@ -547,7 +582,11 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if self._offload_backend == "mp":
             # The multiprocess worker ignores the layer dict entirely: its
             # server process addresses bytes, so it needs the address form.
-            from .mp_page_layout import build_mp_transfer_tensors, summarize_layout
+            from .mp_page_layout import (
+                build_mp_recurrent_groups,
+                build_mp_transfer_tensors,
+                summarize_layout,
+            )
 
             replication = self._page_tp_replication_factor()
             transfer_tensors = build_mp_transfer_tensors(
@@ -555,6 +594,21 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 num_blocks=num_blocks,
                 tp_replication_factor=replication,
             )
+            if self._state_rides_mp:
+                # Attached before registration, not after: the recurrent
+                # groups are engine groups the server has to know about at
+                # registration time, and a transfer that referenced a group
+                # nobody registered would be refused chunk by chunk at
+                # runtime rather than once, here.
+                self._kda_views = self._build_kda_views(per_group, list(groups))
+                object.__setattr__(
+                    transfer_tensors,
+                    "recurrent_page_groups",
+                    build_mp_recurrent_groups(
+                        self._kda_views,
+                        tokens_per_block=int(self._config.kv_cache_block_size),
+                    ),
+                )
             logger.info(
                 "ATOM LMCache offload: publishing PAGE layout (%s), "
                 "tp_replication_factor=%d",
@@ -573,8 +627,11 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             )
         # After the dense registration, not before: the recurrent codec shares
         # the engine, its storage manager and its LMCache identity, and none of
-        # those exist until the call above has run.
-        self._init_kda_tier(per_group, list(groups))
+        # those exist until the call above has run. Skipped entirely when the
+        # state rides the PAGE object -- there is then no second engine, no
+        # second pool and no leg of its own to drive.
+        if not self._state_rides_mp:
+            self._init_kda_tier(per_group, list(groups))
         logger.info(
             "ATOM LMCache offload: registered %d layers, num_blocks=%d "
             "(leading dim %d, block_size=%d)",
@@ -710,6 +767,23 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         release_after = bool(envs.OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER)
         return views.device, release_after, storage, meta
 
+    def _build_kda_views(
+        self, per_group: list[dict[str, "torch.Tensor"]], groups: list[Any]
+    ) -> KdaPageViews:
+        """Address the recurrent groups' tensors, in the codec's own order.
+
+        Group order, and within a group vLLM's own layer order: both the
+        own-pool codec and the MP recurrent layout walk this list, so the two
+        transports read the same bytes in the same order.
+        """
+        specs = [spec for _, spec in self._mamba_groups]
+        tensors_by_group = gather_group_tensors(
+            per_group, groups, [group_id for group_id, _ in self._mamba_groups]
+        )
+        return KdaPageViews(
+            tensors_by_group, layout_id=build_layout_id(specs, tensors_by_group)
+        )
+
     def _init_kda_tier(
         self, per_group: list[dict[str, "torch.Tensor"]], groups: list[Any]
     ) -> None:
@@ -722,13 +796,8 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # Group order, and within a group vLLM's own layer order: the store
         # gathers and the load scatters through this same list (see
         # `gather_group_tensors`).
-        specs = [spec for _, spec in self._mamba_groups]
-        tensors_by_group = gather_group_tensors(
-            per_group, groups, [group_id for group_id, _ in self._mamba_groups]
-        )
-        views = KdaPageViews(
-            tensors_by_group, layout_id=build_layout_id(specs, tensors_by_group)
-        )
+        views = self._build_kda_views(per_group, groups)
+        tensors_by_group = views.groups
 
         # Sized to one whole state image. The KV staging buffer is sized in
         # LMCache chunks and is routinely an order of magnitude smaller, so

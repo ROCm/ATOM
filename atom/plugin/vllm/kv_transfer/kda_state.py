@@ -244,6 +244,16 @@ class KdaPageViews:
             for t in tensors
         )
 
+    @property
+    def groups(self) -> list[list[torch.Tensor]]:
+        """Each mamba group's layer tensors, in the order streams are gathered.
+
+        Public because the MP recurrent layout is built from exactly these
+        tensors in exactly this order: registering a different order would
+        publish a key space the codec does not read back in.
+        """
+        return self._groups
+
     def _views(self, block_ids) -> list[torch.Tensor]:
         ids = [int(b) for b in block_ids]
         if len(ids) != self.num_groups:
