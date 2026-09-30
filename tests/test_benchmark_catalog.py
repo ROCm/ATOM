@@ -162,12 +162,16 @@ def test_param_lists_override_and_conc_band():
         "-dpa-dspark",
         "-dpa-mtp3",
         "-dpa-tbo",
+        # Shares -dpa-tbo's band on purpose: the two are an on/off pair and a
+        # cell that exists for one and not the other cannot be compared.
+        "-dpa-tbo-mixed",
     ]
     rfs = {c["result_filename"] for c in cells}
     assert "deepseek-v4-pro-dpa-1024-1024-512-0.7" in rfs
     assert "deepseek-v4-pro-dpa-dspark-1024-1024-512-0.7" in rfs
     assert "deepseek-v4-pro-dpa-mtp3-1024-1024-512-0.7" in rfs
     assert "deepseek-v4-pro-dpa-tbo-1024-1024-512-0.7" in rfs
+    assert "deepseek-v4-pro-dpa-tbo-mixed-1024-1024-512-0.7" in rfs
 
 
 def test_model_filter():
