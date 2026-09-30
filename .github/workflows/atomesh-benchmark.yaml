@@ -36,6 +36,7 @@ on:
           - smoke
           - nightly
           - weekly
+          - agentic_multi_decode
           - accuracy
       rdma_smoke_nodes:
         description: 'Comma-separated Slurm candidate nodes for the Mooncake RDMA smoke test; Slurm selects two when multiple nodes are listed'
@@ -90,6 +91,14 @@ on:
             glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c24,
             glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c32,
             glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c48
+
+          GLM 2-node 1P1D DCP8 decode (agentic_multi_decode):
+            glm-52-mxfp4-1p1d-dcp8-dcp8-agentic-lmcache-1m-c96,
+            glm-52-mxfp4-1p1d-cpp8-dcp8-agentic-lmcache-1m-c96
+
+          GLM 2-node 1P1D DCP8 decode (accuracy):
+            glm-52-mxfp4-1p1d-dcp8-dcp8-gsm8k-only-c64,
+            glm-52-mxfp4-1p1d-cpp8-dcp8-gsm8k-only-c64
 
           Kimi-K3:
             kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c1,

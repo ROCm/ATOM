@@ -470,6 +470,134 @@ models:
           name: glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c48
           concurrency: [48]
 
+      # Run on demand, not nightly: 1P1D with a full node per role (multi_node,
+      # 2 nodes) and a TP8+DCP8 decode. MTP3 with fixed acceptance length 2.99,
+      # the standalone DCP recipe's depth for C48 and above; each of the 8
+      # prefill ranks gets 256 GiB of LMCache CPU tier.
+      agentic_multi_decode:
+        # TP8+DCP8 prefill: DCP on the prefill side runs MTP draft steps after
+        # a prefill target step, which needs the per-token DCP block table.
+        - &glm52_agentic_dcp8_dcp8
+          name: glm-52-mxfp4-1p1d-dcp8-dcp8-agentic-lmcache-1m-c96
+          topology: 1p1d_dcp8_dcp8
+          display_topology: 1P1D-DCP8-DCP8-MTP3
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [96]
+          server:
+            common_args: &glm52_agentic_dcp8_args
+              kv_cache_dtype: fp8
+              block_size: 16
+              max_num_seqs: 512
+              enable_prefix_caching: true
+              decode_max_num_seqs: 512
+              max_model_len: ""
+              max_num_batched_tokens: ""
+              decode_max_num_batched_tokens: ""
+              online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*","model.layers.78.*"]}'
+              gpu_memory_utilization: 0.85
+              extra_args: "--level 3 --method mtp --num-speculative-tokens 3 --spec-decode-acceptance-length 2.99"
+          prefill:
+            workers: 1
+            tp: 8
+            dcp: 8
+            cudagraph: none
+            extra_args: "--enforce-eager --max-num-batched-tokens 8192"
+          decode:
+            workers: 1
+            tp: 8
+            dcp: 8
+            cudagraph: >-
+              [1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]
+            extra_args: "--cudagraph-mode FULL"
+          env:
+            common: &glm52_agentic_dcp8_env_common
+              # Force RDMA to avoid HIP IPC shared-pool address corruption.
+              MC_DISABLE_HIP: "1"
+              ATOM_MLA_PAGE_SIZE: "1"
+              ATOM_ONLINE_QUANT_STREAMING: "0"
+              ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB: "2047"
+              ATOM_USE_TRITON_MLA: "0"
+              MAX_JOBS: "16"
+              PYTHONHASHSEED: "0"
+              TOPK_FORCE_PATH: "one"
+            prefill: &glm52_agentic_dcp8_env_prefill
+              HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_NUMA_MODE: "auto"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
+              LMCACHE_CHUNK_SIZE: "256"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_MIN_LOAD_TOKENS: "0"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+            decode: &glm52_agentic_dcp8_env_decode
+              HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+          benchmark:
+            <<: *agentic_1m_aiperf
+            wait_server_timeout: 5400
+          run_eval: false
+
+        # Same decode, CPP8 prefill (PP8 x TP1). 78 target layers split 10x7 + 8;
+        # the last stage also hosts the MTP layer, as in the CPP4 20,20,20,18 split.
+        - <<: *glm52_agentic_dcp8_dcp8
+          name: glm-52-mxfp4-1p1d-cpp8-dcp8-agentic-lmcache-1m-c96
+          topology: 1p1d_cpp8_dcp8
+          display_topology: 1P1D-CPP8-DCP8-MTP3
+          prefill: &glm52_agentic_cpp8_prefill
+            workers: 1
+            tp: 1
+            cudagraph: none
+            extra_args: "--pipeline-parallel-size 8 --enforce-eager --max-num-batched-tokens 8192"
+          env: &glm52_agentic_cpp8_env
+            common: *glm52_agentic_dcp8_env_common
+            prefill:
+              <<: *glm52_agentic_dcp8_env_prefill
+              VLLM_PP_LAYER_PARTITION: "10,10,10,10,10,10,10,8"
+            decode: *glm52_agentic_dcp8_env_decode
+
+      # Manual accuracy suite: the two deployments above, GSM8K only and without
+      # forced acceptance, which would otherwise commit draft tokens the target
+      # rejected. 20-shot prompts (~3.5k tokens) exceed the DSA top-k of 2048, so
+      # the sparse indexer's selection -- and on CPP8 its top-k handoff across PP
+      # stages -- decides what each token attends to.
+      accuracy:
+        - &glm52_dcp8_dcp8_gsm8k
+          <<: *glm52_agentic_dcp8_dcp8
+          name: glm-52-mxfp4-1p1d-dcp8-dcp8-gsm8k-only-c64
+          isl: [4096]
+          osl: 1024
+          concurrency: [64]
+          server:
+            common_args:
+              <<: *glm52_agentic_dcp8_args
+              extra_args: "--level 3 --method mtp --num-speculative-tokens 3"
+          benchmark:
+            kind: random
+            wait_server_timeout: 5400
+            wait_router_timeout: 600
+          run_eval: true
+          eval_only: true
+          accuracy:
+            task: gsm8k
+            fewshot: 20
+            eval_concurrency: [64]
+            model_type: local-completions
+            endpoint: completions
+            # Single-node GLM-5.2-MXFP4 GSM8K threshold (baseline 0.9447).
+            threshold: 0.92
+
+        - <<: *glm52_dcp8_dcp8_gsm8k
+          name: glm-52-mxfp4-1p1d-cpp8-dcp8-gsm8k-only-c64
+          topology: 1p1d_cpp8_dcp8
+          display_topology: 1P1D-CPP8-DCP8-MTP3
+          prefill: *glm52_agentic_cpp8_prefill
+          env: *glm52_agentic_cpp8_env
+
     accuracy:
       task: gsm8k
       fewshot: 20
