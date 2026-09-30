@@ -1153,7 +1153,11 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                     self._save_admission.release()
 
     # -- copy daemon thread ----------------------------------------------
-    def _load_page(self, req: LMCacheReqMeta) -> bool:
+    def _load_page(
+        self,
+        req: LMCacheReqMeta,
+        retrieve_masks: list[torch.Tensor] | None = None,
+    ) -> bool:
         ls = getattr(req, "load_spec", None)
         if ls is None:
             return True
@@ -1185,6 +1189,8 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             block_ids=req.block_ids,
             req_id=str(req.req_id),
         )
+        if retrieve_masks is not None:
+            retrieve_masks.append(ret_mask)
         retrieve_ms = (time.perf_counter() - t_retrieve0) * 1000
         transfer_stats = self._last_gpu_connector_transfer_stats()
         loaded = bool(ret_mask[hbm:lmc].all().item())
@@ -1375,12 +1381,13 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         slot_spec = getattr(req, "slot_load_spec", None)
         load_failure_reason = "operation"
         load_error_type = "none"
+        retrieve_masks: list[torch.Tensor] = []
         try:
             if slot_reservation is not None and not slot_reservation.reusable:
                 load_failure_reason = "staging_unavailable"
                 loaded = False
             else:
-                loaded = self._load_page(req)
+                loaded = self._load_page(req, retrieve_masks)
                 if loaded:
                     loaded = self._load_slot(req, slot_reservation)
                     if not loaded:
@@ -1418,7 +1425,12 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 load_failure_reason = "staging_cleanup"
             # A worker owns one lookup pin for the emitted composite load. It is
             # released after PAGE and SLOT reach a terminal state, exactly once.
-            self._lookup_unpin(req.req_id)
+            # Once PAGE retrieve ran, it may already have released the pins of
+            # the chunks it returned (LMCache 0.5.x), so only the rest remain.
+            if retrieve_masks:
+                self._lookup_unpin_after_retrieve(req.req_id, retrieve_masks[0])
+            else:
+                self._lookup_unpin(req.req_id)
             self._complete_load(req, succeeded=loaded)
             if slot_spec is not None:
                 if loaded:
