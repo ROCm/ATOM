@@ -247,39 +247,6 @@ class MLAChunkContextMetadata:
     seq_tot: list[int] | None = None
 
 
-def _only_lmcache_mp_reads_block_regions(config) -> bool:
-    """Whether every transport that reads the PAGE region map is `lmcache_mp`.
-
-    The FP4 sparse indexer can only be published to such a topology: the MP
-    connector groups regions by their per-block shape and copies whole blocks,
-    so the e8m0 scale plane is just one more region per layer. The P/D backends
-    and the non-dense `lmcache_offload` layouts parse a single index region per
-    layer and would drop it. `multi` is judged sub by sub, the way
-    `KVConnectorFactory.topology_reads_block_regions` walks it.
-    """
-    import copy
-
-    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-
-    kv_cfg = getattr(config, "kv_transfer_config", None) or {}
-    if not kv_cfg:
-        return False
-    name = KVConnectorFactory.canonical_name(kv_cfg.get("kv_connector", "moriio"))
-    if name != "multi":
-        return name == "lmcache_mp"
-    readers = []
-    for sub in kv_cfg.get("connectors") or ():
-        if not isinstance(sub, dict):
-            return False
-        sub_config = copy.copy(config)
-        sub_config.kv_transfer_config = sub
-        if KVConnectorFactory.topology_reads_block_regions(sub_config):
-            readers.append(
-                KVConnectorFactory.canonical_name(sub.get("kv_connector", "moriio"))
-            )
-    return bool(readers) and all(reader == "lmcache_mp" for reader in readers)
-
-
 def cdiv(a, b):
     return (a + b - 1) // b
 
@@ -1440,13 +1407,19 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         runner = self.model_runner
         if self.kv_pool is None:
             return None
-        if self._indexer_fp4 and not _only_lmcache_mp_reads_block_regions(
-            runner.config
+        from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+        if (
+            self._indexer_fp4
+            and not KVConnectorFactory.topology_region_readers_copy_whole_blocks(
+                runner.config
+            )
         ):
             # A P/D connector is handed one `INDEX_CACHE_ROLE` region per layer
             # -- the whole vocabulary it and its DCP shard plan have for the
             # indexer -- and the FP4 cache is two planes neither parses.
-            # `lmcache_mp` is the exception, admitted above: it copies whole
+            # A transport registered with `copies_whole_block_regions`
+            # (`lmcache_mp`) is the exception, admitted above: it copies whole
             # blocks of every published region, so the FP4 data and its e8m0
             # scale plane travel as two regions per layer (see below).
             #
@@ -1463,8 +1436,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # answers whether a backend needs compressor P/D staging, and
             # `lmcache_mp` declares that False while still requiring these
             # regions. Ask the question actually being asked.
-            from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-
             if KVConnectorFactory.topology_reads_block_regions(runner.config):
                 raise NotImplementedError(
                     "KV transfer that addresses the cache through the PAGE "

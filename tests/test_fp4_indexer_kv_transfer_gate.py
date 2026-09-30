@@ -234,6 +234,65 @@ def test_region_map_verdict_comes_from_the_registration():
             KVConnectorFactory._registry.pop(name, None)
             KVConnectorFactory._requires_pd_staging.pop(name, None)
             KVConnectorFactory._reads_block_regions.pop(name, None)
+            KVConnectorFactory._copies_whole_block_regions.pop(name, None)
+
+
+def test_fp4_service_comes_from_the_registration_not_the_name():
+    """Serving FP4 to a region reader is declared as `copies_whole_block_regions`.
+
+    A new whole-block copier is served without anyone adding its name to the
+    attention backend, and one that does not declare it is refused -- even
+    beside `lmcache_mp` in a `multi`.
+    """
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    KVConnectorFactory.register(
+        "fp4gate_probe_whole_blocks",
+        worker_module="atom.kv_transfer.offload.mp.connector",
+        worker_class="LMCacheMPConnector",
+        scheduler_module="atom.kv_transfer.offload.mp.connector",
+        scheduler_class="LMCacheMPConnectorScheduler",
+        copies_whole_block_regions=True,
+    )
+    KVConnectorFactory.register(
+        "fp4gate_probe_region_parser",
+        worker_module="atom.kv_transfer.offload.mp.connector",
+        worker_class="LMCacheMPConnector",
+        scheduler_module="atom.kv_transfer.offload.mp.connector",
+        scheduler_class="LMCacheMPConnectorScheduler",
+    )
+    try:
+        assert _passes_the_gate(
+            _fp4_builder({"kv_connector": "fp4gate_probe_whole_blocks"})
+        )
+        assert _passes_the_gate(
+            _fp4_builder(
+                {
+                    "kv_connector": "multi",
+                    "connectors": [
+                        {"kv_connector": "fp4gate_probe_whole_blocks"},
+                        {"kv_connector": "lmcache_mp", "kv_role": "offload"},
+                    ],
+                }
+            )
+        )
+        refused = _fp4_builder(
+            {
+                "kv_connector": "multi",
+                "connectors": [
+                    {"kv_connector": "lmcache_mp", "kv_role": "offload"},
+                    {"kv_connector": "fp4gate_probe_region_parser"},
+                ],
+            }
+        )
+        with pytest.raises(NotImplementedError, match="region map"):
+            AiterMLAMetadataBuilder.get_kv_transfer_tensors(refused)
+    finally:
+        for name in ("fp4gate_probe_whole_blocks", "fp4gate_probe_region_parser"):
+            KVConnectorFactory._registry.pop(name, None)
+            KVConnectorFactory._requires_pd_staging.pop(name, None)
+            KVConnectorFactory._reads_block_regions.pop(name, None)
+            KVConnectorFactory._copies_whole_block_regions.pop(name, None)
 
 
 def test_fp4_gate_reads_the_shared_connector_predicate():

@@ -342,20 +342,10 @@ def validate_speculative_config(config):
         )
 
 
-def _is_lmcache_mp(kv_transfer_config) -> bool:
-    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-
-    return (
-        KVConnectorFactory.canonical_name(
-            kv_transfer_config.get("kv_connector", "moriio")
-        )
-        == "lmcache_mp"
-    )
-
-
 def validate_runtime_config(config):
     """Gate unimplemented execution modes before weights or pools are loaded."""
     from atom.config import CUDAGraphMode
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
     unsupported = []
     graph_mode = getattr(config.compilation_config, "cudagraph_mode", None)
@@ -392,8 +382,8 @@ def validate_runtime_config(config):
             # through the backend's PAGE-backed copies. P/D and in-process
             # offload read SLOT regions and codecs this runtime does not publish.
             "KV transfer other than lmcache_mp",
-            bool(config.kv_transfer_config)
-            and not _is_lmcache_mp(config.kv_transfer_config),
+            KVConnectorFactory.connector_name(config.kv_transfer_config)
+            not in (None, "lmcache_mp"),
         ),
         ("RapidServe", config.enable_rapidserve),
         ("plugin mode", config.plugin_config is not None),
