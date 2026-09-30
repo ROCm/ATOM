@@ -191,13 +191,6 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         del timeout_s  # See abandon_save: no release without a report.
         return []
 
-    def _live_transfers(self) -> set[Any]:
-        """Dispatched operations still waiting for a terminal worker report."""
-        live: set[Any] = set(self._save_inflight.values())
-        live.update(self._save_operation_owner)
-        live.update(operation for _, operation in self._active_load_operations.values())
-        return live
-
     def _enforce_transfer_deadlines(self) -> None:
         """Fail-stop when a dispatched transfer never reports.
 

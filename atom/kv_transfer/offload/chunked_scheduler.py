@@ -439,11 +439,35 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         hook = self._recurrent_state_hook
         return None if hook is None else hook(seq, int(end), operation=operation)
 
+    def _live_transfers(self) -> set:
+        """Dispatched operations still waiting for a terminal report."""
+        live: set = set(self._save_inflight.values())
+        live.update(self._save_operation_owner)
+        live.update(operation for _, operation in self._active_load_operations.values())
+        return live
+
     def _retire_recurrent_rides(self, live_operations) -> None:
         """Hand the recurrent leg the operations still in flight."""
         hook = self._recurrent_retire_hook
         if hook is not None:
             hook(live_operations)
+
+    def reconcile_recurrent_rides(self) -> None:
+        """Give back the pins of rides whose transfer is over.
+
+        Called once per scheduler step by whoever drives the step, and it must
+        be called AFTER that step's saves are built: a pin taken for a save
+        that is emitted has to see its own operation in the live set, or it
+        would be released while the copy is still in flight.
+
+        The MP backend also reaches this from `_enforce_transfer_deadlines`,
+        but that path hangs off `process_completions`, which only ATOM's native
+        engine calls -- the vLLM plugin connector drives the scheduler from
+        `build_connector_meta` instead. A reconciliation installed on the
+        native path alone never runs under the plugin, and the pins leak the
+        whole pool away exactly as if it had never been installed.
+        """
+        self._retire_recurrent_rides(self._live_transfers())
 
     def _may_emit_save(self) -> bool:
         """Return whether another save may be emitted this scheduler step."""

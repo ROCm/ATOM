@@ -1411,6 +1411,12 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             )
         )
         self._kda_planner.log_stats()
+        # After the stores, deliberately: a ride pinned for a save built on
+        # this step must see its own operation in the scheduler's live set.
+        # This is the only per-step hook the plugin path has -- the MP
+        # backend's own reconciliation hangs off `process_completions`, which
+        # only ATOM's native engine calls.
+        self._scheduler.reconcile_recurrent_rides()
         return stores
 
     def _handle_preempted(self, scheduler_output) -> list[str]:
