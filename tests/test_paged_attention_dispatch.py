@@ -17,6 +17,7 @@ bound -- a Triton compile error with nothing in it about speculative length.
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 from types import SimpleNamespace
 
@@ -426,7 +427,11 @@ class TestWorkPlanWiring:
             seen.update(kwargs)
             return _FakePlan()
 
-        monkeypatch.setattr("aiter.ops.flydsl.pa_decode.plan_pa_decode", fake_plan)
+        monkeypatch.setattr(
+            importlib.import_module("aiter.ops.flydsl.pa_decode"),
+            "plan_pa_decode",
+            fake_plan,
+        )
         builder = aa.AiterAttentionMetadataBuilder.__new__(
             aa.AiterAttentionMetadataBuilder
         )
@@ -439,7 +444,7 @@ class TestWorkPlanWiring:
         assert "max_partitions" not in seen, f"ceiling was set: {seen}"
 
     def test_planner_off_returns_no_plan(self, monkeypatch):
-        """With the env off the op must see None, not a stale plan."""
+        """With the env off the builder must return None, not a stale plan."""
         from atom.model_ops.attentions import aiter_attention as aa
 
         builder = aa.AiterAttentionMetadataBuilder.__new__(
@@ -451,6 +456,17 @@ class TestWorkPlanWiring:
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", False)
         ctx = _fake_ctx(8)
         assert builder.refresh_flydsl_plan(ctx) is None
+
+    def test_planner_off_routes_pa_decode_to_gluon(self):
+        """#5809 has no static FlyDSL path, so PLAN=0 is the clean A/B."""
+        import inspect
+
+        from atom.model_ops.base_attention import run_pa_decode
+
+        src = inspect.getsource(run_pa_decode)
+        assert (
+            "envs.ATOM_PA_FLYDSL and envs.ATOM_PA_FLYDSL_PLAN" in src
+        ), "FlyDSL must require its planner switch"
 
     def test_batch_past_the_planner_limit_falls_back(self, monkeypatch):
         """M3's sparse prefill-as-decode folds query tokens into num_seqs.
@@ -474,40 +490,44 @@ class TestWorkPlanWiring:
         )
         assert builder.refresh_flydsl_plan(ctx) is None
 
-    def test_only_the_dense_call_site_passes_a_plan(self):
-        """Which call sites hand in a plan IS the boundary.
-
-        There is no flag any more: the parameter defaults to None, so a site
-        that does not pass one gets the static path. The two MiniMax-M3 sparse
-        sites read a fixed topk window (nothing to rebalance, and measured a net
-        loss), and the vLLM/SGLang bridges run under someone else's forward
-        context entirely.
-        """
+    def test_every_flydsl_call_gets_an_explicit_plan(self):
+        """#5809 removed FlyDSLs static/no-plan decode path."""
         import inspect
 
-        from atom.model_ops import attention_mha
-        from atom.model_ops.base_attention import run_pa_decode
-        from atom.model_ops.minimax_m3 import sparse_attn
+        from atom.model_ops.base_attention import (
+            _flydsl_prepare_explicit_plan,
+            run_pa_decode,
+        )
 
         param = inspect.signature(run_pa_decode).parameters["work_plan"]
-        assert param.default is None, "a plan must be opt-in, per call site"
-        assert "work_plan=" in inspect.getsource(attention_mha)
-        assert "work_plan=" not in inspect.getsource(sparse_attn)
-        # Read the bridges as text, never import them: they pull in vllm /
-        # sglang, which a CPU-only checkout does not have, and the claim being
-        # tested is about the source anyway.
-        import pathlib
+        assert param.default is None, "call sites may omit a capture-owned plan"
+        dispatch = inspect.getsource(run_pa_decode)
+        assert "_flydsl_prepare_explicit_plan(" in dispatch
+        assert "work_plan=work_plan" in dispatch
+        helper = inspect.getsource(_flydsl_prepare_explicit_plan)
+        assert "get_cached_budget(" in helper
+        assert "storage_key(" in helper
 
-        import atom
+    def test_context_bound_is_clamped_to_block_table_capacity(self):
+        import torch
 
-        root = pathlib.Path(atom.__file__).parent
-        for rel in (
-            "plugin/vllm/attention/layer_mha.py",
-            "plugin/sglang/attention_backend/full_attention/full_attention_backend.py",
-        ):
-            f = root / rel
-            assert f.is_file(), f"{rel} moved; this boundary is no longer checked"
-            assert "work_plan=" not in f.read_text(), rel
+        from atom.model_ops.base_attention import _flydsl_context_bound
+
+        block_tables = torch.empty((2, 3), device="meta")
+        k_cache = torch.empty((4, 1, 8, 128, 16), device="meta")
+        assert _flydsl_context_bound(1048576, block_tables, k_cache) == 384
+        assert _flydsl_context_bound(256, block_tables, k_cache) == 256
+        assert _flydsl_context_bound(None, block_tables, k_cache) == 384
+
+    def test_runtime_plan_cache_does_not_key_on_tensor_addresses(self):
+        """Transient context buffers must not permanently grow GPU caches."""
+        import inspect
+
+        from atom.model_ops.base_attention import _flydsl_prepare_explicit_plan
+
+        helper = inspect.getsource(_flydsl_prepare_explicit_plan)
+        assert "context_lens.data_ptr()" not in helper
+        assert "torch.cuda.current_stream" in helper
 
     def test_every_draft_pass_refreshes_the_plan(self):
         """Weak on purpose, and the weakness is the point.
@@ -579,7 +599,8 @@ class TestWorkPlanWiring:
             return kw.get("plan") or _FakePlan()
 
         monkeypatch.setattr(
-            "aiter.ops.flydsl.pa_decode.plan_pa_decode", fake_plan, raising=False
+            importlib.import_module("aiter.ops.flydsl.pa_decode"),
+            "plan_pa_decode", fake_plan,
         )
         builder = aa.AiterAttentionMetadataBuilder.__new__(
             aa.AiterAttentionMetadataBuilder
@@ -605,7 +626,7 @@ class TestWorkPlanWiring:
         aiter validates `reduce_info.shape == (num_seqs, 2)` and raises. The
         plan is built by the metadata builder for the batch it saw, which is
         not necessarily the one this call runs, so the op checks first and
-        falls back to the static path. Red if the guard goes away.
+        rebuilds a compatible explicit plan. Red if the guard goes away.
         """
         from atom.model_ops.base_attention import flydsl_plan_matches
 
@@ -619,8 +640,8 @@ class TestWorkPlanWiring:
         """Weak on purpose: a source check, and the reason it is here.
 
         Decode runs from captured graphs. If the plan is absent when the graph
-        is captured, the static path is what gets recorded and every later
-        refresh is work on a graph that never reads it -- silently, with no
+        is captured, the graph uses a runtime-owned explicit plan and every
+        metadata refresh is then work that graph never reads -- silently, with no
         error and a plausible-looking benchmark. Driving the real capture needs
         a model runner, so this only pins that the attach is present.
         """
@@ -675,7 +696,7 @@ class TestWorkPlanWiring:
         assert len(sites) - len(minting) >= 4, "a runtime refresh site went missing"
 
     def test_plans_are_only_minted_during_capture(self, monkeypatch):
-        """A runtime batch that was never captured gets the static path.
+        """The metadata builder never allocates a plan for an uncaptured batch.
 
         aiter's planner takes batch as a tl.constexpr, so a new value costs a
         kernel specialization -- 65-72 ms cold -- and a plan that can never be
@@ -690,7 +711,11 @@ class TestWorkPlanWiring:
             built.append(context_lens.shape[0])
             return _FakePlan()
 
-        monkeypatch.setattr("aiter.ops.flydsl.pa_decode.plan_pa_decode", fake_plan)
+        monkeypatch.setattr(
+            importlib.import_module("aiter.ops.flydsl.pa_decode"),
+            "plan_pa_decode",
+            fake_plan,
+        )
         builder = aa.AiterAttentionMetadataBuilder.__new__(
             aa.AiterAttentionMetadataBuilder
         )
@@ -713,16 +738,16 @@ class TestWorkPlanWiring:
     def test_the_unplanned_notice_waits_for_a_capture(self, monkeypatch):
         """One shot, spent on the batch that means something.
 
-        Before the first capture every call lands on the static path -- profile
-        run, eager warmup -- so logging there burns the notice on a step that
+        Before the first capture every metadata lookup has no capture-owned plan --
+        profile run, eager warmup -- so logging there burns the notice on a step that
         says nothing, and the batch that really is uncaptured mid-serving then
         goes unreported.
         """
         from atom.model_ops.attentions import aiter_attention as aa
 
         monkeypatch.setattr(
-            "aiter.ops.flydsl.pa_decode.plan_pa_decode",
-            lambda *a, **kw: _FakePlan(),
+            importlib.import_module("aiter.ops.flydsl.pa_decode"),
+            "plan_pa_decode", lambda *a, **kw: _FakePlan(),
         )
         builder = aa.AiterAttentionMetadataBuilder.__new__(
             aa.AiterAttentionMetadataBuilder
@@ -748,8 +773,8 @@ class TestWorkPlanWiring:
         ``scheduled_bs`` slice agrees only when the batch happens to land on a
         ladder rung; at c20 (20 -> 32) it raises and kills the worker. This tree
         shipped that slice once, and nothing else watches this seam: the shape
-        guard in the op downgrades a mismatch to the static path, so the defect
-        would come back as a silent slowdown instead of a crash.
+        guard in the op rebuilds a compatible explicit plan, so the defect
+        would come back as extra planner work instead of a crash.
 
         AST rather than behaviour, because ``prepare_decode`` needs a model
         runner to drive. It is exact about the one thing that went wrong -- the
@@ -844,7 +869,8 @@ class TestWorkPlanWiring:
 
         src = inspect.getsource(ba.run_pa_decode)
         assert (
-            "envs.ATOM_PA_FLYDSL and _flydsl_pa_decode_num_seqs" in src
+            "envs.ATOM_PA_FLYDSL and envs.ATOM_PA_FLYDSL_PLAN" in src
+            and "flydsl_enabled and _flydsl_pa_decode_num_seqs" in src
         ), "the env gate is gone, or no longer short-circuits the capability check"
 
     def test_lengths_aiter_would_reject_build_no_plan(self, monkeypatch):
