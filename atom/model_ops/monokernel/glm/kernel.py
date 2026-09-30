@@ -1111,61 +1111,58 @@ def build_glm5_monokernel(
                     )
             return scales
 
-        def stage_x_pairs_ptpc(name, count, n, src_of):
-            """Quantize ``count`` packed-BF16 mailbox rows with one scale per row."""
-            words = n // 4
-            per = (words + THREADS - 1) // THREADS
+        def stage_x_pairs_ptpc(name, count, n, src_of, group=None):
+            """Quantize packed-BF16 mailbox rows with one scale per activation group."""
+            group = n if group is None else group
+            groups = (n + group - 1) // group
             scales = []
             for s in range_constexpr(count):
-                local_max = fx.Float32(0.0)
-                row_values = []
-                valids = []
-                for i in range_constexpr(per):
-                    word = tid + i * THREADS
-                    source_word = fx.min(word, words - 1)
-                    got = poll(
-                        [
-                            (
-                                mb(name),
-                                src_of(s * n + source_word * 4) // 2,
-                                2,
+                for g in range_constexpr(groups):
+                    width = min(group, n - g * group)
+                    words = width // 4
+                    per = (words + THREADS - 1) // THREADS
+                    local_max = fx.Float32(0.0)
+                    row_values = []
+                    valids = []
+                    for i in range_constexpr(per):
+                        word = tid + i * THREADS
+                        source_word = fx.min(word, words - 1)
+                        element = s * n + g * group + source_word * 4
+                        got = poll([(mb(name), src_of(element) // 2, 2)])[0]
+                        first = bf2_f32(got[0])
+                        second = bf2_f32(got[1])
+                        values = [first[0], first[1], second[0], second[1]]
+                        valid = word < words
+                        row_values.append(values)
+                        valids.append(valid)
+                        for value in values:
+                            local_max = fx.max(
+                                local_max,
+                                valid.select(fmath.absf(value), fx.Float32(0.0)),
                             )
-                        ]
-                    )[0]
-                    first = bf2_f32(got[0])
-                    second = bf2_f32(got[1])
-                    values = [first[0], first[1], second[0], second[1]]
-                    valid = word < words
-                    row_values.append(values)
-                    valids.append(valid)
-                    for value in values:
-                        local_max = fx.max(
-                            local_max,
-                            valid.select(fmath.absf(value), fx.Float32(0.0)),
-                        )
-                maximum = block_maxs([local_max])[0]
-                scale = (maximum == 0.0).select(
-                    fx.Float32(1.0), maximum * (1.0 / FP8_MAX)
-                )
-                scales.append(scale)
-                reciprocal = 1.0 / scale
-                for i in range_constexpr(per):
-                    word = tid + i * THREADS
-                    if valids[i]:
-                        values = row_values[i]
-                        quantized = [
-                            div_rn(value, scale, reciprocal) for value in values
-                        ]
-                        lds_st(
-                            xs,
-                            (s * n + word * 4) // 4,
-                            fp8_pack4(
-                                quantized[0],
-                                quantized[1],
-                                quantized[2],
-                                quantized[3],
-                            ).bitcast(fx.Float32),
-                        )
+                    maximum = block_maxs([local_max])[0]
+                    scale = (maximum == 0.0).select(
+                        fx.Float32(1.0), maximum * (1.0 / FP8_MAX)
+                    )
+                    scales.append(scale)
+                    reciprocal = 1.0 / scale
+                    for i in range_constexpr(per):
+                        word = tid + i * THREADS
+                        if valids[i]:
+                            values = row_values[i]
+                            quantized = [
+                                div_rn(value, scale, reciprocal) for value in values
+                            ]
+                            lds_st(
+                                xs,
+                                (s * n + g * group + word * 4) // 4,
+                                fp8_pack4(
+                                    quantized[0],
+                                    quantized[1],
+                                    quantized[2],
+                                    quantized[3],
+                                ).bitcast(fx.Float32),
+                            )
             return scales
 
         def stage_x_rmsnorm(ld4s, n, gamma, mark=None, loaded=None, count=S):
@@ -2015,6 +2012,21 @@ def build_glm5_monokernel(
                     NOPE_DIM,
                     64,
                     attention_b_word(n_sel() * NOPE_DIM + c * 64),
+                    coef=(
+                        (
+                            lambda: pick(
+                                [
+                                    uk_scales[
+                                        sample * ((NOPE_DIM + 127) // 128) + c // 2
+                                    ]
+                                    for sample in range(S)
+                                ],
+                                n_sel(),
+                            )
+                        )
+                        if const_expr(attention_ptpc)
+                        else None
+                    ),
                 )
 
             pre = [u_uk(c) for c in range(UK_NKC)]
@@ -2032,6 +2044,7 @@ def build_glm5_monokernel(
                     S,
                     NOPE_DIM,
                     lambda k: ((k // NOPE_DIM) * H + head) * NOPE_DIM + k % NOPE_DIM,
+                    group=128,
                 )
             else:
                 stage_x_pairs(
@@ -2053,7 +2066,7 @@ def build_glm5_monokernel(
                 r0 = k % UK_TILE
                 vals = []
                 if const_expr(attention_ptpc):
-                    ptpc_scale = pick(uk_scales, s) * ld_f32(r_suk, 0)
+                    ptpc_scale = ld_f32(r_suk, 0)
                 for j in range_constexpr(4):
                     r = r0 + j
                     ww = r // 16
