@@ -400,6 +400,31 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         adjusted = min(int(chunk), limit)
         return max(1, adjusted)
 
+    # ---- recurrent state riding the transfer object ----------------------
+    #: Installed by a connector whose model has recurrent KV cache groups
+    #: published to the same tier as the paged KV. It answers, for one
+    #: transfer's token range, which block holds the recurrent snapshot at its
+    #: end -- so the state and the KV it continues commit and restore as one
+    #: object. ``None`` from the hook means this range has no whole state, and
+    #: the transfer is then not emitted at all: a PAGE-only object on a model
+    #: with recurrent groups registered would restore a prefix whose recurrent
+    #: state is someone else's, and the transport refuses it.
+    _recurrent_state_hook = None
+
+    def install_recurrent_state_hook(self, hook) -> None:
+        self._recurrent_state_hook = hook
+
+    def _recurrent_state_for(self, seq, end: int):
+        """This transfer's recurrent snapshot, or ``None`` if it has none.
+
+        ``(None, False)`` is not expressible here on purpose: with no hook
+        installed there are no recurrent groups, so ``None`` is the whole and
+        correct answer and the caller must not treat it as a refusal. Callers
+        therefore test ``self._recurrent_state_hook is not None`` first.
+        """
+        hook = self._recurrent_state_hook
+        return None if hook is None else hook(seq, int(end))
+
     def _may_emit_save(self) -> bool:
         """Return whether another save may be emitted this scheduler step."""
         return True
@@ -419,6 +444,15 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         is_last_prefill: bool,
     ) -> LMCacheReqMeta | None:
         """Admit any layout-specific sources before advancing the watermark."""
+        recurrent = None
+        if self._recurrent_state_hook is not None:
+            # The same end the worker derives from ``token_ids``; computing it
+            # here rather than passing ``aligned`` keeps the two from drifting
+            # apart, which the worker would report as a boundary mismatch.
+            end = (int(aligned) // int(self.chunk_size)) * int(self.chunk_size)
+            recurrent = self._recurrent_state_for(seq, end)
+            if recurrent is None:
+                return None
         return LMCacheReqMeta(
             req_id=seq.id,
             token_ids=list(seq.token_ids[:aligned]),
@@ -426,6 +460,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             save_spec=SaveSpec(skip_leading_tokens=saved, can_save=True),
             is_last_prefill=is_last_prefill,
             save_operation=operation,
+            recurrent_state=recurrent,
         )
 
     def _save_source_is_backed(
@@ -541,6 +576,25 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 self._mark_load_skip(seq, "tier_lost_prefix", hbm, lmc, need, chunk)
                 self._clear_pending_load(sid)
                 continue
+            transfer_end = (
+                lmc if ls.transfer_end_tokens is None else int(ls.transfer_end_tokens)
+            )
+            recurrent = None
+            if self._recurrent_state_hook is not None:
+                recurrent = self._recurrent_state_for(seq, transfer_end)
+                if recurrent is None:
+                    # No destination for the state this KV needs, so there is
+                    # no correct load to emit. Declined here, before the
+                    # operation is registered and the sequence is parked on
+                    # it -- a load skipped after that point is one nothing
+                    # ever completes. The prefix is recomputed instead, which
+                    # is a performance loss where the alternative is a wrong
+                    # answer.
+                    self._mark_load_skip(
+                        seq, "no_recurrent_state", hbm, lmc, need, chunk
+                    )
+                    self._clear_pending_load(sid)
+                    continue
             # num_cached after load = max(HBM, offload); never drop below HBM.
             seq.offload_loaded_tokens = self._claim_after_load(seq, hbm, lmc)
             # req_id MUST be the raw seq.id (the type the scheduler compares
@@ -563,9 +617,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             seq._load_operation = load_operation
             self._active_load_operations[sid] = (seq, load_operation)
             self._track_load_statistics(load_operation, lmc - hbm)
-            transfer_end = (
-                lmc if ls.transfer_end_tokens is None else int(ls.transfer_end_tokens)
-            )
             meta.add_request(
                 LMCacheReqMeta(
                     req_id=seq.id,
@@ -573,6 +624,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                     block_ids=list(seq.block_table),
                     load_spec=ls,
                     load_operation=load_operation,
+                    recurrent_state=recurrent,
                 )
             )
         meta.lookup_requests_in_step = [

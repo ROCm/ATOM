@@ -527,14 +527,20 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 "vLLM hands off exact boundary state blocks only in that mode"
             )
         _, hash_block_size = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+        rides_page = self._state_rides_mp
         self._kda_planner = KdaBoundaryPlanner(
             group_ids=group_ids,
             mamba_block_size=int(spec.block_size),
             hash_block_size=int(hash_block_size),
             chunk_size=int(self._scheduler.chunk_size),
             world_size=self._world_size,
+            rides_page=rides_page,
         )
         self._scheduler.install_hit_cap_hook(self._kda_planner.cap_hit)
+        if rides_page:
+            self._scheduler.install_recurrent_state_hook(
+                self._recurrent_state_for_transfer
+            )
         logger.info(
             "ATOM LMCache offload: recurrent state leg on group(s) %s "
             "(mamba_block=%d, hash_block=%d, chunk=%d)",
@@ -543,6 +549,22 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             int(hash_block_size),
             int(self._scheduler.chunk_size),
         )
+
+    def _recurrent_state_for_transfer(self, seq, end: int):
+        """Which recurrent snapshot the transfer ending at *end* carries.
+
+        The scheduler holds a ``SeqView``, which has no block hashes; the
+        planner needs vLLM's own request object for them, and this connector
+        is the only side that has both.
+        """
+        planner = self._kda_planner
+        if planner is None:
+            return None
+        req_id = str(seq.id)
+        request = self._requests.get(req_id)
+        if request is None:
+            return None
+        return planner.take_ride_state(request, req_id, end)
 
     # ---- worker side --------------------------------------------------
 
