@@ -999,6 +999,13 @@ class ModelRunner:
                 prefill_context_model_parallel_size=config.prefill_context_parallel_size,
             )
         else:
+            pc = config.parallel_config
+            # the all2all_manager will be created in /app/ATOM/atom/model_ops/fused_moe/mori_v2_prepare_finalize.py
+            # in EP + multi-node + ATOM_MORI_V2 case, so skipping here
+            all2all_manager_created = (
+                pc.data_parallel_size_local < pc.data_parallel_size
+                and envs.ATOM_MORI_V2
+            )
             # The group spans the devices that exist; apply_simulated_tp then
             # makes it *report* the logical width so layers shard that many ways.
             init_dist_env(
@@ -1016,6 +1023,7 @@ class ModelRunner:
                 decode_context_parallel_size=getattr(
                     config, "decode_context_parallel_size", 1
                 ),
+                all2all_manager_created=all2all_manager_created,
             )
             apply_simulated_tp(config)
 
