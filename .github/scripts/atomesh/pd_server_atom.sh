@@ -1380,7 +1380,44 @@ PY
   echo "[eval] gsm8k runs done, results saved to ${RUN_DIR}/eval_results"
 }
 
+# LMCache degrades silently when its lookup servers cannot start: each worker
+# logs one line, the engine keeps serving, and every lookup then blocks for
+# lookup_timeout_ms and returns a miss. Nothing fails, so the case produces a
+# full result set -- built entirely on recomputed prefixes.
+#
+# Run 36563887158 is what that costs. The image shipped /tmp/vllm_rpc root-owned
+# (see the --tmpfs in pd_slurm_job.sh), all 16 lookup servers died on bind, and
+# the case still reported: zero KV loads against 2824, prefill prefix hit 47.5%
+# against 69.1%, TTFT p50 2.2s against 124s. Five GPU-hours spent measuring a
+# broken cache, and the number looked like a model regression.
+#
+# So: refuse to benchmark a half-initialised cache. Checked on the server logs
+# rather than on the directory, because the line appears only when LMCache
+# actually tried -- no false positives on cases that do not use it, and it
+# still catches a bind failure this mount does not anticipate.
+assert_lmcache_lookup_servers_up() {
+  local -a offenders=()
+  local log
+  for log in "${RUNTIME_LOG_DIR}"/prefill-*.log "${RUNTIME_LOG_DIR}"/decode-*.log; do
+    [[ -r "${log}" ]] || continue
+    if grep -q "lookup server not started" "${log}"; then
+      offenders+=("${log}")
+    fi
+  done
+  [[ "${#offenders[@]}" -gt 0 ]] || return 0
+
+  echo "[lmcache][FAIL] LMCache lookup servers failed to start; every cache" \
+    "lookup will time out and miss. Refusing to run the benchmark on a" \
+    "cache that cannot serve a hit." >&2
+  for log in "${offenders[@]}"; do
+    echo "[lmcache][FAIL] ${log}:" >&2
+    grep -m 4 "lookup server not started" "${log}" >&2
+  done
+  return 1
+}
+
 run_benchmark_and_eval() {
+  assert_lmcache_lookup_servers_up || return 1
   if [[ "${ATOMESH_EXECUTION_PHASE}" == "benchmark" ]]; then
     run_benchmark
     return

@@ -290,6 +290,25 @@ EOF
     --cap-add=IPC_LOCK --cap-add=NET_ADMIN --cap-add=SYS_NICE
     --ulimit memlock=-1:-1 --ulimit stack=67108864 --ulimit nofile=65536:524288
     --shm-size=128G
+    # LMCache binds its lookup-server ZMQ sockets under a base path it takes
+    # from vllm.envs.VLLM_RPC_BASE_PATH, and falls back to a hardcoded
+    # /tmp/vllm_rpc when vLLM is not importable -- which it is not in the ATOM
+    # container (lmcache/v1/rpc_utils.py:137). So there is no env knob here;
+    # the in-image path itself has to become writable for the serving uid.
+    #
+    # Same image-layer problem as /tmp/aiter_configs above, but it fails soft:
+    # on ubuntu24.04_py3.12_pytorch_release_2.10.0_kimi_k3_agentic_0911 the
+    # image ships /tmp/vllm_rpc as root-owned 0755 (built Sep 6), and under
+    # --user every bind returns "lookup server not started: Permission denied".
+    # LMCache logs that once per worker and keeps serving, so the run completes
+    # -- with every lookup timing out at lookup_timeout_ms and zero cache hits.
+    # Measured on run 36563887158 vs 36510701670, same cell, same 1M/c64 case:
+    # 16/16 lookup servers dead, 0 OFFLOAD-LOAD events against 2824, prefill
+    # prefix hit 47.5% against 69.1%, TTFT p50 2.2s -> 124s and still climbing.
+    #
+    # A tmpfs, not a host stage: the directory is empty in the image, holds
+    # nothing but per-rank sockets, and must not outlive the container.
+    --tmpfs /tmp/vllm_rpc:rw,mode=1777
     --env-file "${env_file}"
     -e ATOMESH_EXECUTION_PHASE="${execution_phase}"
     -e ATOMESH_SERVICE_PORT_OFFSET="${service_port_offset}"
@@ -790,12 +809,17 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
         )
       fi
       set +e
+      # The --tmpfs below is the writable base for LMCache lookup-server IPC
+      # sockets. See the matching mount in run_container_rank for why the path
+      # cannot be redirected with an env var, and why a bind failure there is
+      # silent but costs the entire benchmark.
       docker run --name "${container}" \
         --network host --ipc host --privileged \
         --device /dev/kfd --device /dev/dri --device /dev/infiniband \
         --group-add video --cap-add IPC_LOCK --cap-add NET_ADMIN \
         --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=65536:524288 \
         --shm-size 128G \
+        --tmpfs /tmp/vllm_rpc:rw,mode=1777 \
         --env-file "'"${ENV_FILE}"'" \
         -e ATOMESH_EXECUTION_PHASE="${execution_phase}" \
         -e ATOMESH_SERVICE_PORT_OFFSET="${service_port_offset}" \
