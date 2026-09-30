@@ -145,6 +145,35 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PD_MLA_STAGING_POOL_MB": lambda: _nonnegative_int_env(
         "ATOM_PD_MLA_STAGING_POOL_MB", 256
     ),
+    # Decode (`kv_consumer`, DCP > 1) only: give each prefill stage a partition
+    # of a GPU landing pool. The stage writes a rank's MLA rows packed into one
+    # slot with one RDMA descriptor, the decode side scatters them into the
+    # paged KV and returns the slot. 0 = staged per-page writes only.
+    "ATOM_PD_MLA_LANDING": lambda: _flag_env("ATOM_PD_MLA_LANDING", "1"),
+    # Bytes per landing slot, in MiB.
+    "ATOM_PD_MLA_LANDING_SLOT_MB": lambda: _nonnegative_int_env(
+        "ATOM_PD_MLA_LANDING_SLOT_MB", 8
+    ),
+    # Landing pool per decode rank, in MiB (held back from the KV budget),
+    # split evenly across the prefill stages that send to it.
+    "ATOM_PD_MLA_LANDING_POOL_MB": lambda: _nonnegative_int_env(
+        "ATOM_PD_MLA_LANDING_POOL_MB", 256
+    ),
+    # Prefill: a transfer needing fewer landing slots than this keeps the
+    # staged per-page path (the scatter round trip would not pay off).
+    "ATOM_PD_MLA_LANDING_MIN_SLOTS": lambda: _nonnegative_int_env(
+        "ATOM_PD_MLA_LANDING_MIN_SLOTS", 2
+    ),
+    # Prefill: milliseconds a send worker waits for a free landing slot before
+    # it sends the rest of the transfer through the staged per-page path.
+    "ATOM_PD_MLA_LANDING_CREDIT_WAIT_MS": lambda: _nonnegative_int_env(
+        "ATOM_PD_MLA_LANDING_CREDIT_WAIT_MS", 10
+    ),
+    # Decode: seconds a request that already failed on one prefill stage waits
+    # for the other stages before it is reported failed anyway.
+    "ATOM_PD_MLA_LANDING_FAIL_WAIT_S": lambda: _nonnegative_int_env(
+        "ATOM_PD_MLA_LANDING_FAIL_WAIT_S", 30
+    ),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
