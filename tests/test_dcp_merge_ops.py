@@ -51,6 +51,7 @@ from atom.config import (
     q_proj_has_row_sliceable_scale,
     q_proj_is_qrep_widened,
     qrep_enabled_for_layer,
+    qrep_for_step,
     qrep_unsupported_reason,
 )
 from atom.distributed.dcp_utils import (
@@ -929,6 +930,23 @@ def test_gate_takes_no_interleave_input():
         "the QREP gate must not depend on the KV interleave granularity; "
         f"got parameters {list(params)}"
     )
+
+
+@pytest.mark.parametrize(
+    "qrep, seg, prefill, prefill_qrep, expected",
+    [
+        (True, False, False, False, True),  # decode: always, when the layer has QREP
+        (True, False, False, True, True),
+        (True, False, True, False, False),  # sparse prefill: gathers by default
+        (True, False, True, True, True),  # ... and replicates under the env
+        (True, True, False, False, False),  # seg: q_out is per-rank sized
+        (True, True, True, True, False),
+        (False, False, False, False, False),  # no QREP on the layer: never
+        (False, False, True, True, False),
+    ],
+)
+def test_qrep_for_step_truth_table(qrep, seg, prefill, prefill_qrep, expected):
+    assert qrep_for_step(qrep, seg, prefill, prefill_qrep) is expected
 
 
 def test_gate_reason_is_human_readable():
