@@ -410,6 +410,9 @@ models:
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
             decode:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
+              # P->D MLA rows land in a GPU pool per decode rank, one RDMA
+              # descriptor per 8 MiB slot, then scatter into the paged KV.
+              ATOM_PD_MLA_LANDING: "1"
               DECODE_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
 

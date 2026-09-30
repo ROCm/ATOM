@@ -512,3 +512,16 @@ rank configuration, deployment requirements, and registration lifetime.
 | **ATOM_PD_MLA_STAGING** | bool | 1 | Prefill (`kv_producer`, plain `mooncake` connector) only. When the decode side runs DCP, gather the MLA tokens each decode rank owns into a GPU staging slot laid out as its destination pages, then RDMA one descriptor per run of adjacent destination pages instead of one per 576-byte token. Destination bytes are identical. 0 restores the per-token path. |
 | **ATOM_PD_MLA_STAGING_SLOT_MB** | int | 8 | Size of one MLA staging slot, in MiB (rounded down to whole pages). The pool has one slot per send worker (`num_worker_threads`, default 16), up to `ATOM_PD_MLA_STAGING_POOL_MB`, so HBM cost is `min(num_worker_threads x` this value`, ATOM_PD_MLA_STAGING_POOL_MB)` per producer GPU, held back from the KV cache budget. 0 disables MLA staging. |
 | **ATOM_PD_MLA_STAGING_POOL_MB** | int | 256 | Cap on the MLA staging pool per producer GPU, in MiB (at least one slot). When `num_worker_threads` slots would exceed it, the pool holds fewer slots and send workers wait for a free one. |
+
+## Mooncake PD MLA landing
+
+Set on the decode side; the prefill side follows what each write request offers and needs MLA staging enabled.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_PD_MLA_LANDING** | bool | 0 | Decode (`kv_consumer`, plain `mooncake` connector, DCP > 1) only. Allocate a GPU landing pool per rank and give each prefill stage a partition of it. The stage writes a rank's MLA rows packed in rank order into a landing slot with one RDMA descriptor per slot (instead of one per destination page); the decode rank scatters the slot into its paged KV cache on a side stream and returns the slot. A request completes only after its slots are scattered. Destination bytes are identical to the staged path. |
+| **ATOM_PD_MLA_LANDING_SLOT_MB** | int | 8 | Size of one landing slot, in MiB. The prefill side packs at most `min(this, ATOM_PD_MLA_STAGING_SLOT_MB)` per slot. 0 disables landing. |
+| **ATOM_PD_MLA_LANDING_POOL_MB** | int | 256 | Landing pool per decode rank, in MiB, held back from the KV cache budget and split evenly across the prefill stages that send to the rank. |
+| **ATOM_PD_MLA_LANDING_MIN_SLOTS** | int | 2 | Prefill side: a transfer that fits in fewer landing slots than this keeps the staged per-page path. |
+| **ATOM_PD_MLA_LANDING_CREDIT_WAIT_MS** | int | 10 | Prefill side: how long a send worker waits for a free landing slot before it sends the rest of the transfer through the staged per-page path. |
+| **ATOM_PD_MLA_LANDING_FAIL_WAIT_S** | int | 30 | Decode side: after one prefill stage reports a failure, how long the request waits for its other stages to end before it is reported failed anyway. Late landing slots of a finished request are dropped and returned, never scattered. |
