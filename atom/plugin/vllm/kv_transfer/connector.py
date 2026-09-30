@@ -395,7 +395,13 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         detected, if at all, only as a failed load. It is kept because it is
         what the accuracy and throughput numbers to date were taken on.
         """
-        raw = self._config.kv_transfer_config.get("lmcache.mp.state_transport", "mp")
+        # Defaulted from whether a second pool was sized, not to a fixed
+        # value: every deployment that predates this option set that size,
+        # and picking "mp" for them would silently move their state onto a
+        # different transport -- a change of behaviour with no line asking
+        # for it. Omitting the size is the opt-in.
+        default = "own-pool" if self._state_cpu_size_gb else "mp"
+        raw = self._config.kv_transfer_config.get("lmcache.mp.state_transport", default)
         transport = str(raw).strip().lower()
         if transport not in ("mp", "own-pool"):
             raise ValueError(
