@@ -104,6 +104,28 @@ class DCPShardPlan:
         dst = dst_ids[self.dst_page[keep]] * self.block_size + self.dst_token[keep]
         return src, dst, self.run_length[keep]
 
+    def landing_source_tokens(self) -> np.ndarray:
+        """Producer token of every row a landing slot carries, in row order.
+
+        Rows are the valid destination tokens in destination order, unpadded:
+        row ``j`` lands at token ``j % block_size`` of destination page
+        ``j // block_size``, because the valid tokens are a page prefix (see
+        ``staged_page_runs``). The decode side relies on exactly that mapping
+        to scatter the rows (``landing_scatter.landing_segments``).
+        """
+
+        if self.valid.size and (self.valid[1:] > self.valid[:-1]).any():
+            raise ValueError("DCP shard plan valid tokens are not a prefix")
+        keep = self.valid
+        run_start = self.src_block_id_per_run[keep] * self.block_size
+        run_start = run_start + self.src_token[keep]
+        run_length = self.run_length[keep]
+        if (run_length == 1).all():
+            return run_start
+        return np.repeat(run_start - np.cumsum(run_length) + run_length, run_length) + (
+            np.arange(int(run_length.sum()), dtype=np.int64)
+        )
+
     def source_token_per_dst_token(self) -> np.ndarray:
         """Source token index for every destination token, page-major.
 
@@ -164,8 +186,55 @@ class DCPShardPlan:
         )
 
 
+def pack_landing_rows(
+    row_bytes: Sequence[int], num_rows: int, slot_bytes: int, page_rows: int
+) -> list[list[tuple[int, int, int, int]]]:
+    """Pack every region's ``num_rows`` landing rows into fixed-size slots.
+
+    Regions are packed in order, each split into row ranges that fill the
+    current slot before a new one opens. Returns one list per slot of
+    ``(region_pos, row_start, row_stop, slot_offset)`` items, where the rows
+    occupy ``[slot_offset, slot_offset + (row_stop - row_start) * width)``.
+    Unlike ``pack_staging_slots`` there is no page padding: the rows are the
+    unpadded ``DCPShardPlan.landing_source_tokens`` order. A region is only
+    split at a multiple of ``page_rows``, so the rows a sender has not landed
+    yet always start on a destination page and can go out as whole pages.
+    """
+
+    if slot_bytes <= 0:
+        raise ValueError(f"slot_bytes must be positive, got {slot_bytes}")
+    slots: list[list[tuple[int, int, int, int]]] = []
+    current: list[tuple[int, int, int, int]] = []
+    used = 0
+    for region_pos, width in enumerate(row_bytes):
+        if width * page_rows > slot_bytes:
+            raise ValueError(
+                f"Landing slot of {slot_bytes} bytes cannot hold one "
+                f"{page_rows}-row page of {width}-byte rows"
+            )
+        row = 0
+        while row < num_rows:
+            capacity = (slot_bytes - used) // width
+            if row + capacity < num_rows:
+                capacity -= capacity % page_rows
+            if capacity == 0:
+                slots.append(current)
+                current, used = [], 0
+                continue
+            stop = min(num_rows, row + capacity)
+            current.append((region_pos, row, stop, used))
+            used += (stop - row) * width
+            row = stop
+    if current:
+        slots.append(current)
+    return slots
+
+
 def pack_staging_slots(
-    page_bytes: Sequence[int], dst_pages: int, slot_bytes: int
+    page_bytes: Sequence[int],
+    dst_pages: int,
+    slot_bytes: int,
+    first_pages: Sequence[int] | None = None,
 ) -> list[list[tuple[int, int, int, int]]]:
     """Pack every (region, destination page) into fixed-size staging slots.
 
@@ -174,6 +243,8 @@ def pack_staging_slots(
     ``(region_pos, page_start, page_stop, slot_offset)`` items, where
     ``region_pos`` indexes ``page_bytes`` and the pages occupy
     ``[slot_offset, slot_offset + (page_stop - page_start) * width)``.
+    ``first_pages`` optionally starts each region at a later page (its
+    earlier pages were already sent).
     """
 
     if slot_bytes <= 0:
@@ -187,7 +258,7 @@ def pack_staging_slots(
                 f"Staging slot of {slot_bytes} bytes cannot hold one "
                 f"{width}-byte page"
             )
-        page = 0
+        page = 0 if first_pages is None else first_pages[region_pos]
         while page < dst_pages:
             capacity = (slot_bytes - used) // width
             if capacity == 0:
