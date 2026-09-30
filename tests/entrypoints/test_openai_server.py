@@ -16,6 +16,7 @@ Usage:
 
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -197,8 +198,18 @@ class TestHealthAndModels:
         assert r.status_code == 200
         assert r.headers["content-type"].startswith("text/plain")
         assert "atom:metrics_snapshot_available" in r.text
-        assert "atom:requests_running" in r.text
         assert "vllm:" not in r.text
+
+        # llm-d's endpoint picker resolves ATOM by these exact names (its
+        # built-in atom engine config), so renaming one silently unroutes
+        # every scorer. Pin all four.
+        assert "atom:requests_running" in r.text
+        assert "atom:requests_waiting" in r.text
+        assert "atom:kv_cache_usage_ratio" in r.text
+        assert re.search(
+            r'atom:cache_config_info\{block_size="\d+",num_gpu_blocks="\d+"\} 1\.0',
+            r.text,
+        )
 
         head = requests.head(f"{base_url}/metrics")
         assert head.status_code == 200
