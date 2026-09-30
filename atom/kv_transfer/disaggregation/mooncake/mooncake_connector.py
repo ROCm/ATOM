@@ -41,6 +41,10 @@ from atom.kv_transfer.disaggregation.mooncake.host_landing import (
     gpu_numa_node,
 )
 from atom.kv_transfer.disaggregation.mooncake.rail_engine_pool import RailEnginePool
+from atom.kv_transfer.disaggregation.pd_producer import (
+    mla_staging_slot_count,
+    send_worker_count,
+)
 from atom.kv_transfer.disaggregation.port_offset import (
     consumer_region_indices,
 )
@@ -50,9 +54,9 @@ from atom.kv_transfer.disaggregation.port_offset import (
 from atom.kv_transfer.disaggregation.sharded_transfer import (
     build_dcp_shard_plan,
     coalesce_contiguous,
+    pack_staging_slots,
 )
 from atom.kv_transfer.disaggregation.types import (
-    DEFAULT_SHARDED_STAGING_WORKERS,
     INDEX_CACHE_FP4_PREFIX,
     INDEX_CACHE_ROLE,
     MLA_KV_ROLE,
@@ -826,7 +830,15 @@ class MooncakeConnector(KVConnectorBase):
         self._index_staging_lock = threading.Lock()
         self._prepare_sharded_index = None
         self._gather_sharded_index = None
-        self._index_staging_stream = None
+        # MLA staging for DCP consumers (see _execute_staged_mla_regions).
+        self._mla_staging: torch.Tensor | None = None
+        self._mla_staging_pool_size = 0
+        self._mla_staging_free: list[int] = []
+        self._mla_staging_cv = threading.Condition()
+        # Each send worker gathers on its own stream (see _send_worker_stream).
+        self._send_worker_streams = threading.local()
+        # region_idx -> uint8 [num_blocks * block_size, token_bytes] alias
+        self._mla_token_views: dict[int, torch.Tensor] = {}
 
         # --- Producer: completed prefill block_ids cache ---
         # Populated from ConnectorMetadata.reqs_to_save each step.
@@ -892,11 +904,12 @@ class MooncakeConnector(KVConnectorBase):
 
         # --- Producer: thread pool for RDMA writes ---
         self._cuda_device = torch.cuda.current_device()
+        self._num_send_workers = (
+            send_worker_count(kv_transfer_config) if self.is_producer else 0
+        )
         if self.is_producer:
             self._send_executor = ThreadPoolExecutor(
-                max_workers=kv_transfer_config.get(
-                    "num_worker_threads", DEFAULT_SHARDED_STAGING_WORKERS
-                ),
+                max_workers=self._num_send_workers,
                 thread_name_prefix="mooncake-send-worker",
                 initializer=torch.cuda.set_device,
                 initargs=(self._cuda_device,),
@@ -918,6 +931,18 @@ class MooncakeConnector(KVConnectorBase):
     # -----------------------------------------------------------------
     _MAX_RDMA_CHUNK_BYTES = 2 * 1024 * 1024 * 1024 - 64 * 1024
     _MAX_RDMA_ENTRIES_PER_BATCH = 4096
+    # Class-level so a connector built without __init__ keeps the per-token
+    # paths; register_kv_caches sets the instance values.
+    _index_staging_pool_size = 0
+    _mla_staging_pool_size = 0
+
+    def _rdma_chunk_units(self, unit_bytes: int) -> int:
+        """Units per MR chunk of a region registered by ``_rdma_chunk_sizes``.
+
+        Every internal chunk boundary of such a region, on either side of the
+        transfer, falls at a multiple of this many units from its base.
+        """
+        return max(1, self._MAX_RDMA_CHUNK_BYTES // unit_bytes)
 
     def _rdma_chunk_sizes(self, total_bytes: int, unit_bytes: int) -> list[int]:
         """Split a region into MR chunks, each <= _MAX_RDMA_CHUNK_BYTES and, apart
@@ -987,7 +1012,6 @@ class MooncakeConnector(KVConnectorBase):
             self._index_staging_free = list(range(tt.index_staging_pool_size))
             self._prepare_sharded_index = tt.prepare_sharded_index
             self._gather_sharded_index = tt.gather_sharded_index
-            self._index_staging_stream = torch.cuda.Stream(device=self._cuda_device)
 
         # Populate block/slot region lists for transfer offset computation
         self._block_regions = [(r.base_addr, r.unit_bytes) for r in tt.block_regions]
@@ -1062,6 +1086,9 @@ class MooncakeConnector(KVConnectorBase):
             all_regions.append(tt.staging_region)
         if tt.index_staging_region is not None:
             all_regions.append(tt.index_staging_region)
+        mla_staging_region = self._build_mla_staging(tt)
+        if mla_staging_region is not None:
+            all_regions.append(mla_staging_region)
         if self._host_landing_blocks > 0:
             self._host_landing = self._build_host_landing(tt)
             all_regions.extend(self._host_landing.regions())
@@ -1262,13 +1289,76 @@ class MooncakeConnector(KVConnectorBase):
             )
         self._host_landing_inflight = still
 
+    def _build_mla_staging(self, tt) -> KVTransferRegion | None:
+        """Allocate the producer's MLA staging pool; None keeps per-token sends.
+
+        A DCP consumer rank owns every ``dcp_size``-th token of a source block,
+        so its MLA bytes cannot be sent as whole blocks. The pool lets a send
+        worker gather those tokens into destination page order on the GPU and
+        send them page-contiguous. One slot per send worker, capped by
+        ``ATOM_PD_MLA_STAGING_POOL_MB``; ``mla_staging_reserve_bytes`` holds
+        the pool back from the KV cache budget.
+        """
+        if (
+            not self.is_producer
+            or self.dcp_size > 1
+            or self._has_slot_regions
+            or not envs.ATOM_PD_MLA_STAGING
+        ):
+            return None
+        slot_mb = envs.ATOM_PD_MLA_STAGING_SLOT_MB
+        views = tt.block_tensor_views
+        if slot_mb == 0 or len(views) != len(tt.block_regions):
+            return None
+        token_views: dict[int, torch.Tensor] = {}
+        for region_idx, (region, view) in enumerate(zip(tt.block_regions, views)):
+            if (
+                region.semantic_role != MLA_KV_ROLE
+                or region.unit_bytes % self.block_size
+                or not view.is_cuda
+            ):
+                continue
+            token_views[region_idx] = view.view(
+                -1, region.unit_bytes // self.block_size
+            )
+        if not token_views:
+            return None
+        widest = max(tt.block_regions[idx].unit_bytes for idx in token_views)
+        slot_bytes = max(widest, (slot_mb << 20) // widest * widest)
+        pool_size = mla_staging_slot_count(self._num_send_workers, slot_bytes)
+        device = next(iter(token_views.values())).device
+        self._mla_staging = torch.empty(
+            (pool_size, slot_bytes), dtype=torch.uint8, device=device
+        )
+        self._mla_staging_pool_size = pool_size
+        self._mla_staging_free = list(range(pool_size))
+        self._mla_token_views = token_views
+        logger.info(
+            "PD MLA staging: %d slots x %.1f MiB for %d MLA regions, "
+            "%d send workers",
+            pool_size,
+            slot_bytes / (1 << 20),
+            len(token_views),
+            self._num_send_workers,
+        )
+        return KVTransferRegion(
+            base_addr=self._mla_staging.data_ptr(),
+            total_bytes=pool_size * slot_bytes,
+            unit_bytes=slot_bytes,
+            semantic_role="mla.kv_staging",
+        )
+
     # -----------------------------------------------------------------
     # KVConnectorBase: start_load_kv
     # -----------------------------------------------------------------
 
     def record_kv_cache_ready(self, req_ids: list[ReqId]) -> None:
-        """Record when this prefill batch's index-cache writes become visible."""
-        if not self.is_producer or self._index_staging_stream is None or not req_ids:
+        """Record when this prefill batch's KV writes become visible to staging."""
+        if (
+            not self.is_producer
+            or (self._index_staging_pool_size == 0 and self._mla_staging_pool_size == 0)
+            or not req_ids
+        ):
             return
         ready_event = torch.cuda.Event()
         ready_event.record(torch.cuda.current_stream(self._cuda_device))
@@ -1574,6 +1664,33 @@ class MooncakeConnector(KVConnectorBase):
     def _release_index_staging_slot(self, idx: int) -> None:
         with self._index_staging_lock:
             self._index_staging_free.append(idx)
+
+    def _acquire_mla_staging_slot(self) -> int:
+        """A free MLA staging slot, waiting for one if the pool is drained.
+
+        A worker holds at most one slot and releases it once its RDMA write
+        returns, so the wait always ends even with fewer slots than workers.
+        """
+        with self._mla_staging_cv:
+            self._mla_staging_cv.wait_for(lambda: self._mla_staging_free)
+            return self._mla_staging_free.pop()
+
+    def _release_mla_staging_slot(self, idx: int) -> None:
+        with self._mla_staging_cv:
+            self._mla_staging_free.append(idx)
+            self._mla_staging_cv.notify()
+
+    def _send_worker_stream(self) -> torch.cuda.Stream:
+        """The calling send worker's staging stream, created on first use.
+
+        A private stream per worker lets ``synchronize`` wait for this
+        worker's gathers and ready event only, not every other worker's.
+        """
+        streams = self._send_worker_streams
+        stream = getattr(streams, "stream", None)
+        if stream is None:
+            stream = streams.stream = torch.cuda.Stream(device=self._cuda_device)
+        return stream
 
     # -----------------------------------------------------------------
     # KVConnectorBase: get_finished
@@ -1999,6 +2116,7 @@ class MooncakeConnector(KVConnectorBase):
         sharded_plan = None
         sharded_runs = None
         stages_sharded_index = False
+        stages_sharded_mla = False
         if self.dcp_size > 1:
             if dcp_size != self.dcp_size:
                 raise RuntimeError(
@@ -2015,6 +2133,11 @@ class MooncakeConnector(KVConnectorBase):
                 dst_pages=len(dst_block_ids),
             )
             sharded_runs = sharded_plan.token_runs(dst_block_ids)
+            # Without the ready event the gather could read KV still being
+            # written, so such a request keeps the per-token path.
+            stages_sharded_mla = (
+                self._mla_staging_pool_size > 0 and kv_cache_ready_event is not None
+            )
             stages_sharded_index = (
                 interleave < self.block_size
                 and INDEX_CACHE_ROLE in self._block_region_roles
@@ -2035,6 +2158,7 @@ class MooncakeConnector(KVConnectorBase):
                 )
 
         staged_regions: list[tuple[int, int, int]] = []
+        staged_mla_regions: list[tuple[int, int, int]] = []
         # The plan comes from this stage's region order but the bytes land at
         # cmap[region_idx], and equal region counts do not make the two orders
         # match. Validate both semantic role and physical width so incompatible
@@ -2095,6 +2219,9 @@ class MooncakeConnector(KVConnectorBase):
                     "a single token needs its bytes contiguous, which holds for "
                     "the MLA layout the token-unit relayout is built on."
                 )
+            if stages_sharded_mla and region_idx in self._mla_token_views:
+                staged_mla_regions.append((region_idx, dst_base, bpb))
+                continue
             unit = bpb // self.block_size
             run_src, run_dst, run_len = sharded_runs
             run_start = 0
@@ -2125,21 +2252,29 @@ class MooncakeConnector(KVConnectorBase):
                 "[PRODUCER] block RDMA write: req=%s, regions=%d, "
                 "source_blocks=%d, descriptors=%d, total_bytes=%d",
                 req_id,
-                num_regions - len(staged_regions),
+                num_regions - len(staged_regions) - len(staged_mla_regions),
                 len(src_block_ids),
                 block_descriptor_count,
                 total_block_bytes,
             )
+        if staged_mla_regions and not self._execute_staged_mla_regions(
+            target,
+            sharded_plan,
+            dst_block_ids,
+            staged_mla_regions,
+            req_id,
+            kv_cache_ready_event,
+            engine=engine,
+        ):
+            return False
         if staged_regions:
             if kv_cache_ready_event is None:
                 raise RuntimeError(
                     "Missing prefill KV-cache ready event for staged DSA index transfer"
                 )
-            if self._index_staging_stream is None:
-                raise RuntimeError("DSA index staging stream is not initialized")
             # Wait only for this request's prefill writes; unrelated GPU work
             # can continue on other streams while the staging stream is blocked.
-            self._index_staging_stream.wait_event(kv_cache_ready_event)
+            self._send_worker_stream().wait_event(kv_cache_ready_event)
             for dst_start in range(
                 0, len(dst_block_ids), self._index_staging_chunk_pages
             ):
@@ -2165,6 +2300,115 @@ class MooncakeConnector(KVConnectorBase):
                         return False
         return True
 
+    def _execute_staged_mla_regions(
+        self,
+        target: str,
+        plan,
+        dst_block_ids: list[int],
+        regions: list[tuple[int, int, int]],
+        req_id: str,
+        kv_cache_ready_event: torch.cuda.Event,
+        *,
+        engine=None,
+    ) -> bool:
+        """Gather a DCP rank's MLA tokens into destination pages, then RDMA them.
+
+        ``regions`` holds ``(region_idx, dst_base, bytes_per_block)``. Each
+        staging slot is filled page-major with as many (region, page range)
+        items as fit, so the NIC sees one descriptor per run of adjacent
+        destination pages instead of one per token. The bytes written match
+        the per-token path exactly.
+        """
+        stream = self._send_worker_stream()
+        slot_bytes = self._mla_staging.shape[1]
+        # Wait only for this request's prefill writes, as the index path does.
+        stream.wait_event(kv_cache_ready_event)
+        host_index = torch.from_numpy(plan.source_token_per_dst_token())
+        if self._mla_staging.is_cuda:
+            # Pinned, so the upload is queued on the worker stream instead of
+            # blocking the host until that stream drains.
+            host_index = host_index.pin_memory()
+        with torch.cuda.stream(stream):
+            src_token_index = host_index.to(self._mla_staging.device, non_blocking=True)
+        slots = pack_staging_slots(
+            [bpb for _, _, bpb in regions], len(dst_block_ids), slot_bytes
+        )
+        for items in slots:
+            pool_idx = self._acquire_mla_staging_slot()
+            try:
+                src_addrs, dst_addrs, sizes = self._gather_mla_slot(
+                    plan,
+                    dst_block_ids,
+                    regions,
+                    items,
+                    src_token_index,
+                    pool_idx,
+                    stream,
+                )
+                if not self._rdma_write_with_retry(
+                    target,
+                    src_addrs.tolist(),
+                    dst_addrs.tolist(),
+                    sizes.tolist(),
+                    req_id,
+                    "staged-mla",
+                    engine=engine,
+                ):
+                    logger.error(
+                        "[PRODUCER] staged MLA transfer failed for req %s", req_id
+                    )
+                    return False
+            finally:
+                self._release_mla_staging_slot(pool_idx)
+        return True
+
+    def _gather_mla_slot(
+        self,
+        plan,
+        dst_block_ids: list[int],
+        regions: list[tuple[int, int, int]],
+        items: list[tuple[int, int, int, int]],
+        src_token_index: torch.Tensor,
+        pool_idx: int,
+        stream: torch.cuda.Stream,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Gather one slot's items on ``stream`` and return their descriptors.
+
+        Coalesced runs stop at the destination's MR chunk boundaries, which
+        the per-token descriptors never cross either.
+        """
+        block_size = self.block_size
+        runs: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        slot = self._mla_staging[pool_idx]
+        with torch.cuda.stream(stream):
+            for region_pos, page_start, page_stop, offset in items:
+                region_idx, dst_base, bpb = regions[region_pos]
+                source = self._mla_token_views[region_idx]
+                rows = slot[offset : offset + (page_stop - page_start) * bpb].view(
+                    -1, source.shape[1]
+                )
+                torch.index_select(
+                    source,
+                    0,
+                    src_token_index[page_start * block_size : page_stop * block_size],
+                    out=rows,
+                )
+        # The NIC reads the slot directly, so the gather must be complete.
+        stream.synchronize()
+        slot_addr = slot.data_ptr()
+        for region_pos, page_start, page_stop, offset in items:
+            _, dst_base, bpb = regions[region_pos]
+            runs.append(
+                plan.slice_pages(page_start, page_stop).staged_page_runs(
+                    dst_block_ids[page_start:page_stop],
+                    slot_addr + offset,
+                    dst_base,
+                    bpb // block_size,
+                    self._rdma_chunk_units(bpb),
+                )
+            )
+        return tuple(np.concatenate(parts) for parts in zip(*runs))
+
     def _execute_staged_index_layer_chunk(
         self,
         target: str,
@@ -2181,11 +2425,7 @@ class MooncakeConnector(KVConnectorBase):
 
         pool_idx = self._acquire_index_staging_slot()
         try:
-            stream = (
-                self._index_staging_stream
-                if self._index_staging_stream is not None
-                else torch.cuda.current_stream()
-            )
+            stream = self._send_worker_stream()
             with torch.cuda.stream(stream):
                 staging_base, staged_pages = self._gather_sharded_index(
                     region_idx,
@@ -2202,10 +2442,12 @@ class MooncakeConnector(KVConnectorBase):
             src_page = np.arange(staged_pages, dtype=np.int64)
             dst_page = np.asarray(dst_block_ids, dtype=np.int64)
             length = np.full(staged_pages, bytes_per_page, dtype=np.int64)
+            # Like the MLA path, never merge across a destination MR chunk.
             src_addrs, dst_addrs, sizes = coalesce_contiguous(
                 staging_base + src_page * bytes_per_page,
                 dst_base + dst_page * bytes_per_page,
                 length,
+                dst_page % self._rdma_chunk_units(bytes_per_page) == 0,
             )
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(

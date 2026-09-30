@@ -504,3 +504,11 @@ rank configuration, deployment requirements, and registration lifetime.
 |----------|------|---------|-------------|
 | **ATOM_PD_HOST_LANDING_BLOCKS** | int | 0 | Decode (`kv_consumer`, plain `mooncake` connector) only. Size, in scheduler KV blocks, of a pinned host "landing" pool allocated per rank with the same per-region layout as the GPU KV cache and registered with Mooncake. P->D RDMA writes a request's pulled suffix into this pool instead of HBM; once the transfer is complete and enough HBM blocks are free, the request is H2D-copied into HBM and decodes. Host bytes per rank = blocks x the `block_bytes` in the decode memory-budget log line. Falls back to the direct HBM pull when the pool is full. 0 disables it. |
 | **ATOM_PD_HOST_LANDING_HBM_RESERVE_BLOCKS** | int | 0 | Extra HBM blocks left free (beyond one per running request) before a host-landed request is copied into HBM. |
+
+## Mooncake PD MLA staging
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_PD_MLA_STAGING** | bool | 1 | Prefill (`kv_producer`, plain `mooncake` connector) only. When the decode side runs DCP, gather the MLA tokens each decode rank owns into a GPU staging slot laid out as its destination pages, then RDMA one descriptor per run of adjacent destination pages instead of one per 576-byte token. Destination bytes are identical. 0 restores the per-token path. |
+| **ATOM_PD_MLA_STAGING_SLOT_MB** | int | 8 | Size of one MLA staging slot, in MiB (rounded down to whole pages). The pool has one slot per send worker (`num_worker_threads`, default 16), up to `ATOM_PD_MLA_STAGING_POOL_MB`, so HBM cost is `min(num_worker_threads x` this value`, ATOM_PD_MLA_STAGING_POOL_MB)` per producer GPU, held back from the KV cache budget. 0 disables MLA staging. |
+| **ATOM_PD_MLA_STAGING_POOL_MB** | int | 256 | Cap on the MLA staging pool per producer GPU, in MiB (at least one slot). When `num_worker_threads` slots would exceed it, the pool holds fewer slots and send workers wait for a free one. |

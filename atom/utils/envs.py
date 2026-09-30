@@ -137,6 +137,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PD_HOST_LANDING_HBM_RESERVE_BLOCKS": lambda: _nonnegative_int_env(
         "ATOM_PD_HOST_LANDING_HBM_RESERVE_BLOCKS", 0
     ),
+    # Prefill (`kv_producer`, plain `mooncake`) only: gather the MLA tokens a
+    # DCP decode rank owns into a GPU staging slot and send whole destination
+    # pages instead of one RDMA descriptor per token. 0 = per-token path.
+    "ATOM_PD_MLA_STAGING": lambda: _flag_env("ATOM_PD_MLA_STAGING", "1"),
+    # Bytes per MLA staging slot, in MiB; one slot per send worker thread.
+    "ATOM_PD_MLA_STAGING_SLOT_MB": lambda: _nonnegative_int_env(
+        "ATOM_PD_MLA_STAGING_SLOT_MB", 8
+    ),
+    # Cap on the whole MLA staging pool, in MiB; beyond it workers share slots.
+    "ATOM_PD_MLA_STAGING_POOL_MB": lambda: _nonnegative_int_env(
+        "ATOM_PD_MLA_STAGING_POOL_MB", 256
+    ),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
