@@ -122,7 +122,9 @@ from atom.model_ops.monokernel.layout import (
 )
 from atom.model_ops.monokernel.ops import (
     bpermute_i32,
+    div_rn,
     f8_word,
+    fp8_pack4,
     mem_realtime,
     read_lane_i32,
     spin_pause,
@@ -197,6 +199,7 @@ def build_glm5_monokernel(
     attention_weight = AttentionWeight(attention_weight)
     cache_layout = as_kv_cache_layout(kv_cache_layout)
     attention_bf16 = attention_weight is AttentionWeight.BF16
+    attention_ptpc = attention_weight is AttentionWeight.FP8_PTPC
     use_atom_kv_cache = cache_layout is KvCacheLayout.ATOM
     cache_fp8 = kv_cache_dtype == "fp8"
     assert not cache_fp8 or use_atom_kv_cache
@@ -273,7 +276,9 @@ def build_glm5_monokernel(
     )
     MISC_OFF = X_WORDS
     MISC_WORDS = max(
-        8 + S * XQ_BLOCKS, S * MOE_SLOTS * (expert_inter // 128), N_SPLIT + 2
+        8 + S * XQ_BLOCKS,
+        S * MOE_SLOTS * (expert_inter // 128),
+        N_SPLIT + 2 + (4 if attention_ptpc else 0),
     )
     KEYS_OFF = MISC_OFF + MISC_WORDS
     DNW_OFF = KEYS_OFF + LDS_KEYS
@@ -657,6 +662,22 @@ def build_glm5_monokernel(
             gpu.barrier()
             return tots
 
+        def block_maxs(vs):
+            """Block-wide maxima of several per-thread values with one LDS exchange."""
+            ws = [wave_max(v) for v in vs]
+            if lane == 0:
+                for i in range_constexpr(len(vs)):
+                    lds_st(red, i * WAVES + wave, ws[i])
+            gpu.barrier()
+            tots = []
+            for i in range_constexpr(len(vs)):
+                t = lds_ld(red, i * WAVES)
+                for w in range_constexpr(1, WAVES):
+                    t = fx.max(t, lds_ld(red, i * WAVES + w))
+                tots.append(t)
+            gpu.barrier()
+            return tots
+
         def block_sum(v):
             w = wave_sum(v)
             if lane == 0:
@@ -725,6 +746,35 @@ def build_glm5_monokernel(
             ]
             s = ld_f32(s_rsrc, (rg * 16 // SCALE_BM) * (K // 128) + kc // 2)
             return ("f8f8", wv, lambda: s * coef(), b_word + (lane // 16) * 4)
+
+        def unit_ptpc(w_rsrc, rg, kc, NKC, b_word, coef=None, ln=None):
+            """Issue one packed 128-K PTPC FP8 tile; output-channel scale is applied after reduction."""
+            ln = lane if ln is None else ln
+            wv = [
+                fx.Vector(
+                    bo.buffer_load(
+                        w_rsrc,
+                        ((rg * NKC + kc + h) * 64 + ln) * 4,
+                        vec_width=4,
+                        dtype=T.i32,
+                    )
+                )
+                for h in range(2)
+            ]
+            return ("ptpc", wv, coef, b_word + (lane // 16) * 4)
+
+        def unit_ptpc64(w_rsrc, rg, kc, NKC, b_word, coef=None, ln=None):
+            """Issue one packed 64-K PTPC FP8 tile."""
+            ln = lane if ln is None else ln
+            weight = fx.Vector(
+                bo.buffer_load(
+                    w_rsrc,
+                    ((rg * NKC + kc) * 64 + ln) * 4,
+                    vec_width=4,
+                    dtype=T.i32,
+                )
+            )
+            return ("ptpc64", [weight], coef, b_word + (lane // 16) * 4)
 
         def unit_mxfp4(w_rsrc, s_rsrc, rg, kc, K, b_word, coef, ln=None):
             """Issue one native packed 128-K MXFP4 tile and four E8M0 row scales."""
@@ -808,10 +858,24 @@ def build_glm5_monokernel(
             return ("bf16", wv, None, b_word + (lane // 16) * 4)
 
         def unit_attention(
-            w_rsrc, s_rsrc, rg, kc, NKC, K, BK, b_word, ln=None, scale_rows=SCALE_BM
+            w_rsrc,
+            s_rsrc,
+            rg,
+            kc,
+            NKC,
+            K,
+            BK,
+            b_word,
+            ln=None,
+            scale_rows=SCALE_BM,
+            coef=None,
         ):
             if const_expr(attention_bf16):
                 return unit_bf16(w_rsrc, rg, kc, NKC, b_word, ln)
+            if const_expr(attention_ptpc):
+                if const_expr(BK == 64):
+                    return unit_ptpc64(w_rsrc, rg, kc, NKC, b_word, coef=coef, ln=ln)
+                return unit_ptpc(w_rsrc, rg, kc, NKC, b_word, coef=coef, ln=ln)
             if const_expr(BK == 64):
                 return unit_fp8(w_rsrc, s_rsrc, rg, kc, NKC, K, BK, b_word)
             return unit_fp8x2(
@@ -860,10 +924,35 @@ def build_glm5_monokernel(
                             T.vec(4, T.f32), [a, b, c, 0, 0, 0, one, 0, one]
                         )
                     )
+                if const_expr(fmt in ("ptpc", "ptpc64")):
+                    halves64 = 2 if fmt == "ptpc" else 1
+                    for half64 in range_constexpr(halves64):
+                        a = wv[half64].bitcast(fx.Int64)
+                        b = fx.Vector(
+                            fx.ptr_load(xs + (bw + half64 * 16), result_type=v4f)
+                        ).bitcast(fx.Int64)
+                        for half32 in range_constexpr(2):
+                            c = fx.Vector(
+                                rocdl.mfma_f32_16x16x32_fp8_fp8(
+                                    T.vec(4, T.f32),
+                                    [a[half32], b[half32], c, 0, 0, 0],
+                                )
+                            )
                 nsp = (
                     4
                     if fmt == "fp8x2"
-                    else 2 if fmt not in ("f8f8", "mxfp4", "mxfp4_bf16") else 0
+                    else (
+                        2
+                        if fmt
+                        not in (
+                            "f8f8",
+                            "ptpc",
+                            "ptpc64",
+                            "mxfp4",
+                            "mxfp4_bf16",
+                        )
+                        else 0
+                    )
                 )
                 for sp in range_constexpr(nsp):
                     if const_expr(fmt in ("fp8", "fp8x2")):
@@ -930,6 +1019,154 @@ def build_glm5_monokernel(
                 lds_st(outs, n * stride + rl, v)
 
             return f
+
+        def pick(values, index):
+            value = values[0]
+            for i in range_constexpr(1, len(values)):
+                value = (index == i).select(values[i], value)
+            return value
+
+        def attention_b_word(element):
+            return element // 4 if const_expr(attention_ptpc) else element // 2
+
+        def emit_ptpc(stride, row_base, scale_rsrc, x_scales):
+            def f(rl, n, v):
+                lds_st(
+                    outs,
+                    n * stride + rl,
+                    bf16_round(
+                        v * pick(x_scales, n) * ld_f32(scale_rsrc, row_base + rl)
+                    ),
+                )
+
+            return f
+
+        def emit_ptpc_weight(stride, row_base, scale_rsrc):
+            def f(rl, n, v):
+                lds_st(
+                    outs,
+                    n * stride + rl,
+                    bf16_round(v * ld_f32(scale_rsrc, row_base + rl)),
+                )
+
+            return f
+
+        def emit_ptpc_scalar(stride, scale):
+            def f(rl, n, v):
+                lds_st(outs, n * stride + rl, bf16_round(v * scale))
+
+            return f
+
+        def stage_x_rmsnorm_ptpc(ld4s, n, gamma, loaded=None, count=S):
+            """RMSNorm followed by production per-token FP8 quantization."""
+            per = n // (4 * THREADS)
+            ks = [(tid + i * THREADS) * 4 for i in range(per)]
+            gs, vals = (
+                loaded if loaded is not None else load_x_rmsnorm(ld4s, n, gamma, count)
+            )
+            sums = []
+            for s in range_constexpr(count):
+                ss = fx.Float32(0.0)
+                for i in range_constexpr(per):
+                    for value in vals[s * per + i]:
+                        ss = ss + value * value
+                sums.append(ss)
+            totals = block_sums(sums)
+            normed = []
+            for s in range_constexpr(count):
+                rstd = _rsq(totals[s] * (1.0 / n) + EPS)
+                for i in range_constexpr(per):
+                    normed.append(
+                        [
+                            vals[s * per + i][j] * rstd * gs[i][j]
+                            for j in range_constexpr(4)
+                        ]
+                    )
+            local_max = []
+            for s in range_constexpr(count):
+                amax = fx.Float32(0.0)
+                for i in range_constexpr(per):
+                    for value in normed[s * per + i]:
+                        amax = fx.max(amax, fmath.absf(value))
+                local_max.append(amax)
+            maxima = block_maxs(local_max)
+            scales = []
+            for s in range_constexpr(count):
+                scale = (maxima[s] == 0.0).select(
+                    fx.Float32(1.0), maxima[s] * (1.0 / FP8_MAX)
+                )
+                scales.append(scale)
+                reciprocal = 1.0 / scale
+                for i in range_constexpr(per):
+                    values = [
+                        div_rn(value, scale, reciprocal)
+                        for value in normed[s * per + i]
+                    ]
+                    lds_st(
+                        xs,
+                        (s * n + ks[i]) // 4,
+                        fp8_pack4(values[0], values[1], values[2], values[3]).bitcast(
+                            fx.Float32
+                        ),
+                    )
+            return scales
+
+        def stage_x_pairs_ptpc(name, count, n, src_of):
+            """Quantize ``count`` packed-BF16 mailbox rows with one scale per row."""
+            words = n // 4
+            per = (words + THREADS - 1) // THREADS
+            scales = []
+            for s in range_constexpr(count):
+                local_max = fx.Float32(0.0)
+                row_values = []
+                valids = []
+                for i in range_constexpr(per):
+                    word = tid + i * THREADS
+                    source_word = fx.min(word, words - 1)
+                    got = poll(
+                        [
+                            (
+                                mb(name),
+                                src_of(s * n + source_word * 4) // 2,
+                                2,
+                            )
+                        ]
+                    )[0]
+                    first = bf2_f32(got[0])
+                    second = bf2_f32(got[1])
+                    values = [first[0], first[1], second[0], second[1]]
+                    valid = word < words
+                    row_values.append(values)
+                    valids.append(valid)
+                    for value in values:
+                        local_max = fx.max(
+                            local_max,
+                            valid.select(fmath.absf(value), fx.Float32(0.0)),
+                        )
+                maximum = block_maxs([local_max])[0]
+                scale = (maximum == 0.0).select(
+                    fx.Float32(1.0), maximum * (1.0 / FP8_MAX)
+                )
+                scales.append(scale)
+                reciprocal = 1.0 / scale
+                for i in range_constexpr(per):
+                    word = tid + i * THREADS
+                    if valids[i]:
+                        values = row_values[i]
+                        quantized = [
+                            div_rn(value, scale, reciprocal) for value in values
+                        ]
+                        lds_st(
+                            xs,
+                            (s * n + word * 4) // 4,
+                            fp8_pack4(
+                                quantized[0],
+                                quantized[1],
+                                quantized[2],
+                                quantized[3],
+                            ).bitcast(fx.Float32),
+                        )
+            return scales
 
         def stage_x_rmsnorm(ld4s, n, gamma, mark=None, loaded=None, count=S):
             """LDS bf16 X[s][0:n] = bf16(rmsnorm(x_s) * gamma) for every sample s, where
@@ -1063,6 +1300,16 @@ def build_glm5_monokernel(
             nb = _xshfl(w, 1)
             if lane % 2 == 0:
                 lds_st(xs, f8_word(k), (w | (nb << 16)).bitcast(fx.Float32))
+
+        def st_ptpc(k, q0, q1):
+            """Store one wave's PTPC FP8 pairs in the AITER GEMM's linear K order."""
+            word = (
+                fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False))
+                & 0xFFFF
+            )
+            neighbor = _xshfl(word, 1)
+            if lane % 2 == 0:
+                lds_st(xs, k // 4, (word | (neighbor << 16)).bitcast(fx.Float32))
 
         def load_bias():
             """This lane's 4 expert biases (issue before the scores wait)."""
@@ -1298,7 +1545,7 @@ def build_glm5_monokernel(
                         QA_NKC,
                         HIDDEN,
                         128,
-                        (n_sel(group_count) * HIDDEN + kc * 64) // 2,
+                        attention_b_word(n_sel(group_count) * HIDDEN + kc * 64),
                     )
 
                 def ld_h(sks):
@@ -1319,14 +1566,39 @@ def build_glm5_monokernel(
                 if const_expr(S <= SAMPLE_TILE):
                     h_ld = load_x_rmsnorm(ld_h, HIDDEN, g_in, group_count)
                     pre = [u_qa(c) for c in range(QA_UNITS)]
-                    stage_x_rmsnorm(ld_h, HIDDEN, g_in, loaded=h_ld, count=group_count)
+                    if const_expr(attention_ptpc):
+                        qa_scales = stage_x_rmsnorm_ptpc(
+                            ld_h, HIDDEN, g_in, loaded=h_ld, count=group_count
+                        )
+                    else:
+                        stage_x_rmsnorm(
+                            ld_h, HIDDEN, g_in, loaded=h_ld, count=group_count
+                        )
                 else:
-                    stage_x_rmsnorm(ld_h, HIDDEN, g_in, count=group_count)
+                    if const_expr(attention_ptpc):
+                        qa_scales = stage_x_rmsnorm_ptpc(
+                            ld_h, HIDDEN, g_in, count=group_count
+                        )
+                    else:
+                        stage_x_rmsnorm(ld_h, HIDDEN, g_in, count=group_count)
                     pre = [u_qa(c) for c in range(QA_UNITS)]
                 gpu.barrier()
                 stamp("qkv_a", t, 2)
                 acc = run_units(u_qa, QA_UNITS, QA_UNITS, pre)
-                reduce_rows(1, acc, emit_out(QKV_A_TILE), group_count)
+                if const_expr(attention_ptpc):
+                    reduce_rows(
+                        1,
+                        acc,
+                        emit_ptpc(
+                            QKV_A_TILE,
+                            t * QKV_A_TILE,
+                            r_sqa,
+                            qa_scales,
+                        ),
+                        group_count,
+                    )
+                else:
+                    reduce_rows(1, acc, emit_out(QKV_A_TILE), group_count)
                 stamp("qkv_a", t, 3)
                 gpu.barrier()
                 if tid < group_count * QKV_A_TILE:
@@ -1590,7 +1862,7 @@ def build_glm5_monokernel(
                     QB_NKC,
                     Q_LORA,
                     128,
-                    (n_sel() * Q_LORA + kc * 64) // 2,
+                    attention_b_word(n_sel() * Q_LORA + kc * 64),
                 )
 
             pre = [u_qb(c) for c in range(QB_UNITS)]
@@ -1599,11 +1871,21 @@ def build_glm5_monokernel(
                 lambda s: (mb("q_an"), (s * Q_LORA + Q_LORA - 2) // 2),
                 mark=("q_b", t),
             )
-            stage_x_pairs("q_an", S * Q_LORA, lambda k: k)
+            if const_expr(attention_ptpc):
+                qb_scales = stage_x_pairs_ptpc("q_an", S, Q_LORA, lambda k: k)
+            else:
+                stage_x_pairs("q_an", S * Q_LORA, lambda k: k)
             stamp("q_b", t, 2)
             gpu.barrier()
             acc = run_units(u_qb, QB_UNITS, QB_UNITS, pre)
-            reduce_rows(1, acc, emit_out(Q_B_TILE))
+            if const_expr(attention_ptpc):
+                reduce_rows(
+                    1,
+                    acc,
+                    emit_ptpc(Q_B_TILE, t * Q_B_TILE, r_sqb, qb_scales),
+                )
+            else:
+                reduce_rows(1, acc, emit_out(Q_B_TILE))
             stamp("q_b", t, 3)
             gpu.barrier()
             head = t // QB_PER_HEAD
@@ -1732,7 +2014,7 @@ def build_glm5_monokernel(
                     UK_NKC,
                     NOPE_DIM,
                     64,
-                    (n_sel() * NOPE_DIM + c * 64) // 2,
+                    attention_b_word(n_sel() * NOPE_DIM + c * 64),
                 )
 
             pre = [u_uk(c) for c in range(UK_NKC)]
@@ -1744,11 +2026,19 @@ def build_glm5_monokernel(
                 ),
                 mark=("uk", t),
             )
-            stage_x_pairs(
-                "q_nope",
-                S * NOPE_DIM,
-                lambda k: ((k // NOPE_DIM) * H + head) * NOPE_DIM + k % NOPE_DIM,
-            )
+            if const_expr(attention_ptpc):
+                uk_scales = stage_x_pairs_ptpc(
+                    "q_nope",
+                    S,
+                    NOPE_DIM,
+                    lambda k: ((k // NOPE_DIM) * H + head) * NOPE_DIM + k % NOPE_DIM,
+                )
+            else:
+                stage_x_pairs(
+                    "q_nope",
+                    S * NOPE_DIM,
+                    lambda k: ((k // NOPE_DIM) * H + head) * NOPE_DIM + k % NOPE_DIM,
+                )
             stamp("uk", t, 2)
             gpu.barrier()
             acc = run_units(u_uk, UK_NKC, UK_NKC, pre)
@@ -1762,12 +2052,17 @@ def build_glm5_monokernel(
                 s = k // UK_TILE
                 r0 = k % UK_TILE
                 vals = []
+                if const_expr(attention_ptpc):
+                    ptpc_scale = pick(uk_scales, s) * ld_f32(r_suk, 0)
                 for j in range_constexpr(4):
                     r = r0 + j
                     ww = r // 16
-                    vals.append(
-                        lds_ld(red, (ww * 64 + s + 16 * ((r % 16) // 4)) * 4 + r % 4)
+                    value = lds_ld(
+                        red, (ww * 64 + s + 16 * ((r % 16) // 4)) * 4 + r % 4
                     )
+                    if const_expr(attention_ptpc):
+                        value = bf16_round(value * ptpc_scale)
+                    vals.append(value)
                 put_bf(
                     mb("q_lat"),
                     (s * H + head) * KV_LORA + (t % UK_PER_HEAD) * UK_TILE + r0,
@@ -2356,8 +2651,13 @@ def build_glm5_monokernel(
                     UV_NKC,
                     KV_LORA,
                     128,
-                    (kc * 64) // 2,
+                    attention_b_word(kc * 64),
                     scale_rows=uv_scale_rows,
+                    coef=(
+                        (lambda: lds_ld(misc, N_SPLIT + 2 + kc // 2))
+                        if const_expr(attention_ptpc)
+                        else None
+                    ),
                 )
 
             pre = [u_uv(c) for c in range(UV_UNITS)]
@@ -2418,18 +2718,53 @@ def build_glm5_monokernel(
                 lds_st(red, (hf * (KV_LORA // 2) + dp) * 2, o0)
                 lds_st(red, (hf * (KV_LORA // 2) + dp) * 2 + 1, o1)
             gpu.barrier()
-            if tid < KV_LORA // 2:
+            uv_valid = tid < KV_LORA // 2
+            uv0, uv1 = fx.Float32(0.0), fx.Float32(0.0)
+            if uv_valid:
                 o0 = fx.Float32(0.0)
                 o1 = fx.Float32(0.0)
                 for q in range_constexpr(4):
                     o0 = o0 + lds_ld(red, (q * (KV_LORA // 2) + tid) * 2)
                     o1 = o1 + lds_ld(red, (q * (KV_LORA // 2) + tid) * 2 + 1)
-                lds_st(xs, tid, bf16_pair(o0, o1))
+                uv0, uv1 = bf16_round(o0), bf16_round(o1)
+                if const_expr(not attention_ptpc):
+                    lds_st(xs, tid, bf16_pair(uv0, uv1))
+            if const_expr(attention_ptpc):
+                uv_max = wave_max(
+                    uv_valid.select(
+                        fx.max(fmath.absf(uv0), fmath.absf(uv1)), fx.Float32(0.0)
+                    )
+                )
+                if (lane == 0) & (wave < KV_LORA // 128):
+                    lds_st(
+                        misc,
+                        N_SPLIT + 2 + wave,
+                        (uv_max == 0.0).select(
+                            fx.Float32(1.0), uv_max * (1.0 / FP8_MAX)
+                        ),
+                    )
             gpu.barrier()
+            if const_expr(attention_ptpc):
+                if uv_valid:
+                    uv_scale = lds_ld(misc, N_SPLIT + 2 + tid // 64)
+                    uv_rcp = 1.0 / uv_scale
+                    st_ptpc(
+                        tid * 2,
+                        div_rn(uv0, uv_scale, uv_rcp),
+                        div_rn(uv1, uv_scale, uv_rcp),
+                    )
+                gpu.barrier()
             owner = dcp_merge_latent(s, t)
             if owner:
                 acc = run_units(u_uv, UV_UNITS, UV_UNITS, pre)
-                reduce_rows(UV_R, acc, emit_out(UV_TILE))
+                if const_expr(attention_ptpc):
+                    reduce_rows(
+                        UV_R,
+                        acc,
+                        emit_ptpc_scalar(UV_TILE, ld_f32(r_suv, 0)),
+                    )
+                else:
+                    reduce_rows(UV_R, acc, emit_out(UV_TILE))
                 stamp("uv", tt, 3)
                 gpu.barrier()
                 if tid < UV_TILE // 4:
@@ -2462,7 +2797,7 @@ def build_glm5_monokernel(
                     O_NKC,
                     O_K,
                     128,
-                    (n_sel() * O_K + kc * 64) // 2,
+                    attention_b_word(n_sel() * O_K + kc * 64),
                 )
 
             pre = [u_o(c) for c in range(O_UNITS)]
@@ -2474,11 +2809,21 @@ def build_glm5_monokernel(
                 ),
                 mark=("o", t),
             )
-            stage_x_pairs("o", S * O_K, lambda k: k)
+            if const_expr(attention_ptpc):
+                o_scales = stage_x_pairs_ptpc("o", S, O_K, lambda k: k)
+            else:
+                stage_x_pairs("o", S * O_K, lambda k: k)
             stamp("o", t, 2)
             gpu.barrier()
             acc = run_units(u_o, O_UNITS, O_UNITS, pre)
-            reduce_rows(O_R, acc, emit_out(ROW_TILE))
+            if const_expr(attention_ptpc):
+                reduce_rows(
+                    O_R,
+                    acc,
+                    emit_ptpc(ROW_TILE, t * ROW_TILE, r_so, o_scales),
+                )
+            else:
+                reduce_rows(O_R, acc, emit_out(ROW_TILE))
             stamp("o", t, 3)
             gpu.barrier()
 
