@@ -21,6 +21,7 @@ the tests keep their teeth.
 """
 
 import builtins
+import concurrent.futures
 import os
 import tempfile
 import threading
@@ -33,7 +34,7 @@ import torch
 from torch import nn
 
 from atom.model_loader.expert_staging import ExpertStagingPool, _cpu_zeroable
-from atom.model_loader.loading_core import load_weights_into_model
+from atom.model_loader.loading_core import _LoadWorkerGate, load_weights_into_model
 from atom.model_loader.weight_iterator import (
     _shard_tensor_names,
     safetensors_weights_iterator,
@@ -346,8 +347,18 @@ def build_model(model_cls, num_layers, num_routed, **moe_kwargs):
     return model
 
 
-def run_load(model, shards, hf_config, num_threads, fused=False, spec_decode=False):
+def run_load(
+    model,
+    shards,
+    hf_config,
+    num_threads,
+    fused=False,
+    spec_decode=False,
+    stream_threads=None,
+):
     os.environ["ATOM_LOADER_NUM_THREADS"] = str(num_threads)
+    if stream_threads is not None:
+        os.environ["ATOM_LOADER_STREAM_THREADS"] = str(stream_threads)
     try:
         load_weights_into_model(
             model=model,
@@ -362,7 +373,35 @@ def run_load(model, shards, hf_config, num_threads, fused=False, spec_decode=Fal
         )
     finally:
         os.environ.pop("ATOM_LOADER_NUM_THREADS", None)
+        os.environ.pop("ATOM_LOADER_STREAM_THREADS", None)
     return {name: p.detach().clone() for name, p in model.named_parameters()}
+
+
+def test_load_worker_gate_expands_for_drain():
+    gate = _LoadWorkerGate(stream_threads=2, drain_threads=4)
+    entered = []
+    entered_cv = threading.Condition()
+    release = threading.Event()
+
+    def task(task_id):
+        with entered_cv:
+            entered.append(task_id)
+            entered_cv.notify_all()
+        release.wait(timeout=5)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(gate.run, task, i) for i in range(4)]
+        with entered_cv:
+            assert entered_cv.wait_for(lambda: len(entered) == 2, timeout=2)
+            assert not entered_cv.wait_for(lambda: len(entered) > 2, timeout=0.1)
+
+        gate.open_for_drain()
+        with entered_cv:
+            assert entered_cv.wait_for(lambda: len(entered) == 4, timeout=2)
+
+        release.set()
+        for future in futures:
+            future.result(timeout=2)
 
 
 class ExpertLoadingDifferentialTest(unittest.TestCase):
@@ -423,6 +462,21 @@ class ExpertLoadingDifferentialTest(unittest.TestCase):
             2 * len(moes),
             "every w13/w2 pair should have flushed via the complete-batch path",
         )
+
+    def test_stream_concurrency_limit_preserves_loaded_weights(self):
+        shards = per_expert_shards(self.NUM_LAYERS, self.NUM_ROUTED)
+        hf_config = HFConfig(self.NUM_LAYERS, self.NUM_ROUTED)
+        serial_model = build_model(FakeMoEModel, self.NUM_LAYERS, self.NUM_ROUTED)
+        dynamic_model = build_model(FakeMoEModel, self.NUM_LAYERS, self.NUM_ROUTED)
+        serial = run_load(serial_model, shards, hf_config, 1)
+        dynamic = run_load(
+            dynamic_model,
+            shards,
+            hf_config,
+            num_threads=4,
+            stream_threads=2,
+        )
+        self.assert_same(serial, dynamic)
 
     # ── (a) the reported bug ──────────────────────────────────────────────
 

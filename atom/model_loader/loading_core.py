@@ -15,6 +15,7 @@ import contextlib
 import json
 import logging
 import os
+import threading
 import time
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
@@ -36,6 +37,27 @@ if TYPE_CHECKING:
     from atom.model_loader.online_quant_streaming import OnlineQuantStreamer
 
 logger = logging.getLogger("atom")
+
+
+class _LoadWorkerGate:
+    """Limit loader concurrency until all checkpoint tensors are submitted."""
+
+    def __init__(self, stream_threads: int, drain_threads: int):
+        self.stream_threads = max(1, min(stream_threads, drain_threads))
+        self.drain_threads = drain_threads
+        self._semaphore = threading.Semaphore(self.stream_threads)
+        self._drain_open = False
+
+    def run(self, fn: Callable, *args):
+        with self._semaphore:
+            return fn(*args)
+
+    def open_for_drain(self) -> None:
+        if self._drain_open:
+            return
+        for _ in range(self.drain_threads - self.stream_threads):
+            self._semaphore.release()
+        self._drain_open = True
 
 
 def rank_tag() -> str:
@@ -199,9 +221,22 @@ def load_weights_into_model(
         online_quant_streamer.setup_online_quant_pool()
     if num_threads > 1:
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=num_threads)
+        stream_threads = max(1, min(envs.ATOM_LOADER_STREAM_THREADS, num_threads))
+        worker_gate = (
+            _LoadWorkerGate(stream_threads, num_threads)
+            if stream_threads < num_threads
+            else None
+        )
     else:
         executor = None
+        stream_threads = num_threads
+        worker_gate = None
     futures = []
+
+    def _submit_to_executor(fn, *args):
+        if worker_gate is None:
+            return executor.submit(fn, *args)
+        return executor.submit(worker_gate.run, fn, *args)
 
     def _submit(fn, *args):
         # All streamed writes pass through `run` for completion tracking.
@@ -209,9 +244,9 @@ def load_weights_into_model(
             if executor is None:
                 online_quant_streamer.run(fn, args)
             else:
-                futures.append(executor.submit(online_quant_streamer.run, fn, args))
+                futures.append(_submit_to_executor(online_quant_streamer.run, fn, args))
         elif executor is not None:
-            futures.append(executor.submit(fn, *args))
+            futures.append(_submit_to_executor(fn, *args))
         else:
             fn(*args)
 
@@ -302,6 +337,11 @@ def load_weights_into_model(
 
         _t0 = time.perf_counter()
         if executor is not None:
+            # Reading and dispatching compete with loader workers for CPU and
+            # memory bandwidth. Keep that overlap at stream_threads, then let
+            # the executor's full worker set consume the remaining backlog.
+            if worker_gate is not None:
+                worker_gate.open_for_drain()
             # Drain all tasks (surfacing errors) before the safety flush.
             for future in concurrent.futures.as_completed(futures):
                 future.result()
@@ -349,24 +389,27 @@ def load_weights_into_model(
         logger.info(
             "[%s] weight load phases (including streaming online quant): "
             "read+queue %.2fs (%d tensors) | drain %.2fs | quant drain %.2fs | "
-            "staging flush %.2fs | threads %d",
+            "staging flush %.2fs | stream threads %d | drain threads %d",
             rank_tag(),
             t_read,
             num_tensors,
             t_drain,
             t_quant_drain,
             t_flush,
+            stream_threads,
             num_threads,
         )
     else:
         logger.info(
             "[%s] weight load phases: read+queue %.2fs (%d tensors) | "
-            "drain %.2fs | staging flush %.2fs | threads %d",
+            "drain %.2fs | staging flush %.2fs | stream threads %d | "
+            "drain threads %d",
             rank_tag(),
             t_read,
             num_tensors,
             t_drain,
             t_flush,
+            stream_threads,
             num_threads,
         )
 
