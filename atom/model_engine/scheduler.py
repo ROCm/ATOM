@@ -1089,13 +1089,14 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.metrics.enqueue(seq)
         self._warn_if_unschedulable(seq)
+        queued = getattr(self.kv_connector, "request_queued", None)
+        if callable(queued):
+            queued(seq)
         self.waiting.append(seq)
 
     def extend(self, seqs: list[Sequence]):
         for seq in seqs:
-            self.metrics.enqueue(seq)
-            self._warn_if_unschedulable(seq)
-        self.waiting.extend(seqs)
+            self.add(seq)
 
     def _deferred_sequence(self, req_id) -> Sequence | None:
         seq = self.deferred_free_blocks.get(req_id)
@@ -1505,6 +1506,11 @@ class Scheduler:
         decoding already-running sequences.
         """
         self._schedule_tick += 1
+        admission_failures = getattr(self.kv_connector, "take_admission_failures", None)
+        if callable(admission_failures):
+            for req_id, reason in admission_failures().items():
+                logger.error("[PD] req_id=%s event=cancel reason=%s", req_id, reason)
+                self.abort_request(req_id)
         # Sources borrowed by the previous batch: its forward has been issued,
         # so they can go back on the free list.
         self.block_manager.complete_previous_state_batch()
@@ -1642,11 +1648,21 @@ class Scheduler:
             # Re-check here (not just at submit) since pool state may change.
             unschedulable = self._unschedulable_reason(seq)
             if unschedulable is not None:
+                cancel_admission = getattr(self.kv_connector, "cancel_admission", None)
+                if callable(cancel_admission):
+                    cancel_admission(seq, f"unschedulable: {unschedulable}")
                 self._inflight_prefix_wait.pop(seq.id, None)
                 seq.status = SequenceStatus.FINISHED
                 seq.leave_reason = f"unschedulable: {unschedulable}"
                 seq.multimodal_data = None
                 self._rejected.append(seq)
+                continue
+
+            # D-ready is checked before cache lookup or allocation. Keep other
+            # ready requests runnable even when this one's D has no capacity.
+            admission = getattr(self.kv_connector, "prefill_admission_ready", None)
+            if callable(admission) and not admission(seq):
+                skipped_waiting_requests.append(seq)
                 continue
 
             if len(self.running) >= self.max_num_seqs:

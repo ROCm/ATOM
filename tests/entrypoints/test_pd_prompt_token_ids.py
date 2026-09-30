@@ -381,6 +381,7 @@ def test_chunked_transfer_discovery_advertises_pp_and_page_geometry(monkeypatch,
     if enabled:
         assert info["chunked_transfer"] == {
             "chunked_transfer": True,
+            "d_ready_protocol": 1,
             "do_remote_prefill": True,
             "do_remote_decode": False,
             "remote_host": "127.0.0.1",

@@ -83,6 +83,20 @@ class KVConnectorSchedulerBase(ABC):
 
     is_producer: bool
 
+    def request_queued(self, seq: Any) -> None:
+        """Register optional pre-allocation control work."""
+
+    def prefill_admission_ready(self, seq: Any) -> bool:
+        """Whether allocation and prefill may start; never block the scheduler."""
+        return True
+
+    def cancel_admission(self, seq: Any, reason: str) -> None:
+        """Retire admission state when the scheduler rejects a waiting request."""
+
+    def take_admission_failures(self) -> dict:
+        """Requests to cancel before allocating or starting prefill."""
+        return {}
+
     @abstractmethod
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
         """Check if *seq* needs remote KV prefill.

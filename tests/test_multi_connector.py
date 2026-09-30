@@ -959,3 +959,12 @@ def test_should_defer_free_holds_while_any_sub_claims_the_source():
     assert sched.should_defer_free(seq) is True, "the send still claims it"
     producer.defer = False
     assert sched.should_defer_free(seq) is False
+
+
+@pytest.mark.parametrize("field", ["pd_admissions", "pd_cancellations"])
+def test_pd_control_only_metadata_is_work_under_multi(field):
+    from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
+
+    sub = ConnectorMetadata()
+    getattr(sub, field)[7] = {"transfer_id": "xfer-a"}
+    assert connector_metadata_has_work(MultiConnectorMetadata(metas=[sub]))

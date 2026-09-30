@@ -164,6 +164,10 @@ def test_producer_advertises_remote_pp_size():
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
     sched = object.__new__(mc.MooncakeConnectorScheduler)
+    sched._admission_waiting = {}
+    sched._admission_results = {}
+    sched._admissions_to_register = {}
+    sched._admissions_to_cancel = {}
     sched.pp_size = 4
     sched.tp_size = 1
     sched.hash_block_size = 64
@@ -201,6 +205,10 @@ def _mooncake_consumer_scheduler(mc, block_size=64, dcp_size=1):
     sched.request_id_to_transfer_id = {}
     sched.transfer_id_to_request_id = {}
     sched._reqs_need_recv = {}
+    sched._admission_waiting = {}
+    sched._admission_results = {}
+    sched._admissions_to_register = {}
+    sched._admissions_to_cancel = {}
     sched._reqs_need_save = {}
     return sched
 

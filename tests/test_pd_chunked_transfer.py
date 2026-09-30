@@ -4,6 +4,7 @@
 import ctypes
 import queue
 import threading
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -71,6 +72,9 @@ def producer(pp_rank=0, pp_size=1, num_tokens=10):
     c._chunked_local_ids = {}
     c._kv_cache_ready_events = {}
     c._pending_chunked_requests = []
+    c._pd_timeouts = mc.PDTimeouts()
+    c._pd_admissions = {}
+    c._pd_tombstones = OrderedDict()
     c._completion_lock = threading.Lock()
     c.done_sending = set()
     c.done_recving = set()
@@ -244,6 +248,7 @@ def consumer(expected=2):
     c._pending_recv_blocks = {21: [2, 9, 4]}
     c._pending_recv_slots = {}
     c._pending_handoffs = {21: {"failed": False, "metadata": None}}
+    c.request_id_to_transfer_id = {21: "xfer-a"}
     c._dispatch_in_flight = set()
     c._deferred_failures = {}
     c._release_targets = {}
@@ -416,6 +421,18 @@ def test_real_scheduler_pins_from_first_chunk_through_final_handoff(
         },
     )
     sched.add(seq)
+    # Before the D-ready completion the producer cannot allocate or compute.
+    batch, _ = sched.schedule()
+    assert not batch.req_ids
+    assert batch.connector_meta_output.pd_admissions
+    assert not seq.block_table
+    connector.process_pd_completions(
+        KVConnectorOutput(
+            connector_completions={
+                ConnectorCompletion("pd_destination_ready", seq.id, True)
+            }
+        )
+    )
     batches = []
     for _ in range(3):
         batch, seqs = sched.schedule()
@@ -560,7 +577,12 @@ def test_swa_only_pool_transfers_final_relocated_slot(reverse_indexed):
         local_swa_block_ids=[2],
     )
     d.start_load_kv(meta)
-    _, (_, payload) = d._send_on_socket.call_args.args
+    writes = [
+        call
+        for call in d._send_on_socket.call_args_list
+        if call.args[1][0] == mc.MSG_WRITE_REQUEST
+    ]
+    _, (_, payload) = writes[0].args
     request = msgpack.loads(payload)
     assert request["has_slot_regions"]
     assert request["dst_swa_block_ids"] == [2]
@@ -613,7 +635,10 @@ def test_terminal_without_consumer_expires_but_live_rdma_cannot_expire(monkeypat
 
 
 @pytest.mark.parametrize("pp_size", [1, 3])
-def test_idle_engine_dispatches_terminal_metadata_to_all_stages(pp_size):
+@pytest.mark.parametrize(
+    "control", ["reqs_to_send", "pd_admissions", "pd_cancellations"]
+)
+def test_idle_engine_dispatches_terminal_metadata_to_all_stages(pp_size, control):
     from aiter_stub import stubbed_aiter
 
     with stubbed_aiter():
@@ -623,7 +648,7 @@ def test_idle_engine_dispatches_terminal_metadata_to_all_stages(pp_size):
     cls = EngineCore if pp_size == 1 else PPEngineCoreProc
     core = cls.__new__(cls)
     meta = ConnectorMetadata()
-    meta.reqs_to_send[7] = 1.0
+    getattr(meta, control)[7] = 1.0
     core.kv_transfer_enabled = True
     core.scheduler = SimpleNamespace(
         kv_connector=SimpleNamespace(
@@ -642,8 +667,9 @@ def test_idle_engine_dispatches_terminal_metadata_to_all_stages(pp_size):
         assert sent.req_ids == []
 
 
+@pytest.mark.parametrize("producer_tp", [1, 2])
 def test_consumer_dispatches_all_pp_stages_without_source_block_ids(
-    monkeypatch, seq_factory
+    monkeypatch, seq_factory, producer_tp
 ):
     import msgpack
 
@@ -659,7 +685,7 @@ def test_consumer_dispatches_all_pp_stages_without_source_block_ids(
             "remote_host": "127.0.0.1",
             "remote_handshake_port": 6301,
             "remote_pp_size": 3,
-            "remote_tp_size": 1,
+            "remote_tp_size": producer_tp,
             "block_size": 4,
             "dcp_size": 1,
         },
@@ -683,18 +709,26 @@ def test_consumer_dispatches_all_pp_stages_without_source_block_ids(
     c.kv_caches_base_addr = [100, 200, 300]
     c._send_on_socket = MagicMock()
     c.start_load_kv(sched.build_connector_meta())
-    assert c._send_on_socket.call_count == 3
-    for stage, call in enumerate(c._send_on_socket.call_args_list):
+    assert c._send_on_socket.call_count == 3 + 3 * producer_tp
+    calls = c._send_on_socket.call_args_list
+    assert all(call.args[1][0] == mc.MSG_WRITE_REQUEST for call in calls[:3])
+    assert all(call.args[1][0] == mc.MSG_D_READY for call in calls[3:])
+    for stage, call in enumerate(calls[:3]):
         address, (_, payload) = call.args
         req = msgpack.loads(payload)
         assert address.endswith(
-            str(6301 + side_channel_port_offset(0, 0, 1, stage, 3, 1))
+            str(6301 + side_channel_port_offset(0, 0, producer_tp, stage, 3, 1))
         )
         assert req["chunked_transfer"]
         assert req["transfer_id"] == "xfer-a"
         assert req["dst_block_ids"] == [9, 4]
         assert req["num_computed_blocks"] == 1
         assert req["src_block_ids"] == []
+    assert {call.args[0] for call in calls[3:]} == {
+        f"tcp://127.0.0.1:{6301 + side_channel_port_offset(0, rank, producer_tp, stage, 3, 1)}"
+        for stage in range(3)
+        for rank in range(producer_tp)
+    }
     assert c._pending_recv_expected[seq.id] == 3
     assert not c._release_targets
 
@@ -866,7 +900,7 @@ def test_idle_write_listener_expires_unadmitted_chunk_request(monkeypatch):
             if self.idle_polled:
                 raise StopListener
             self.idle_polled = True
-            now[0] += mc.PREFILL_LOOKUP_TIMEOUT + 1
+            now[0] += p._pd_timeouts.admission + 1
             return 0
 
         def recv_multipart(self):
@@ -881,5 +915,9 @@ def test_idle_write_listener_expires_unadmitted_chunk_request(monkeypatch):
         p._send_executor = pool
         with pytest.raises(StopListener):
             p._write_listener()
-    p._notify_transfer_result.assert_called_once_with(request, success=False)
+    p._notify_transfer_result.assert_called_once()
+    sent = p._notify_transfer_result.call_args.args[0]
+    assert sent["transfer_id"] == request["transfer_id"]
+    assert "phase=admission_wait" in sent["failure_reason"]
+    assert p._notify_transfer_result.call_args.kwargs == {"success": False}
     assert not p._pending_chunked_requests

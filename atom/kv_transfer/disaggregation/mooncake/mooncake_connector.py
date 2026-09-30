@@ -16,6 +16,7 @@ import os
 import re
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
@@ -39,6 +40,7 @@ from atom.kv_transfer.disaggregation.chunked_prefill import (
     PrefillHandoff,
 )
 from atom.kv_transfer.disaggregation.mooncake.rail_engine_pool import RailEnginePool
+from atom.kv_transfer.disaggregation.pd_admission import DReadyAdmission, PDTimeouts
 from atom.kv_transfer.disaggregation.port_offset import (
     consumer_region_indices,
 )
@@ -91,6 +93,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 MOONCAKE_DEFAULT_PROTOCOL = "rdma"
+MSG_D_READY = b"d_ready"
 PREFILL_LOOKUP_TIMEOUT = 60
 PREFILL_LOOKUP_POLL_INTERVAL = 0.01
 _IB_SYSFS_ROOT = Path("/sys/class/infiniband")
@@ -336,6 +339,11 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self.enable_chunked_transfer = kv_transfer_config.get(
             "enable_chunked_transfer", False
         )
+        self._pd_timeouts = PDTimeouts.from_config(kv_transfer_config)
+        self._admission_waiting = {}
+        self._admission_results = {}
+        self._admissions_to_register = {}
+        self._admissions_to_cancel = {}
         self._chunked_receiving: dict[ReqId, Sequence] = {}
         self.host_ip = get_ip()
 
@@ -353,6 +361,88 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         # Bidirectional transfer_id <-> request_id mapping
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
+
+    def has_pending_work(self) -> bool:
+        return bool(
+            self._admission_waiting
+            or self._admissions_to_register
+            or self._admissions_to_cancel
+        )
+
+    def request_queued(self, seq: Sequence) -> None:
+        params = seq.kv_transfer_params or {}
+        if not params.get("chunked_transfer") or not (
+            self.is_producer or params.get("do_remote_prefill")
+        ):
+            return
+        if seq.id in self._admission_waiting:
+            return
+        if not params.get("transfer_id"):
+            raise ValueError("chunked transfer requires a shared transfer_id")
+        if self.is_producer and not self.enable_chunked_transfer:
+            raise ValueError("enable_chunked_transfer must be enabled on the producer")
+        self._admission_waiting[seq.id] = (seq, time.monotonic(), None)
+        if self.is_producer:
+            params["prompt_digest"] = hashlib.sha256(
+                np.asarray(seq.prompt_token_ids, dtype="<i4").tobytes()
+            ).hexdigest()
+            self._admissions_to_register[seq.id] = {
+                "transfer_id": params["transfer_id"],
+                "prompt_digest": params["prompt_digest"],
+            }
+        logger.info(
+            "[PD] role=%s req_id=%s transfer_id=%s phase=admission_wait event=start",
+            "P" if self.is_producer else "D",
+            seq.id,
+            params["transfer_id"],
+        )
+
+    def prefill_admission_ready(self, seq: Sequence) -> bool:
+        if not self.is_producer or not (seq.kv_transfer_params or {}).get(
+            "chunked_transfer"
+        ):
+            return True
+        return self._admission_results.get(seq.id) is True
+
+    def cancel_admission(self, seq: Sequence, reason: str) -> None:
+        if self._admission_waiting.pop(seq.id, None) is None:
+            return
+        self._admission_results.pop(seq.id, None)
+        self._admissions_to_register.pop(seq.id, None)
+        params = seq.kv_transfer_params
+        params["cancel_reason"] = reason
+        if self.is_producer:
+            self._admissions_to_cancel[params["transfer_id"]] = reason
+        logger.warning(
+            "[PD] role=%s req_id=%s transfer_id=%s phase=admission_wait event=cancel reason=%s",
+            "P" if self.is_producer else "D",
+            seq.id,
+            params["transfer_id"],
+            reason,
+        )
+
+    def take_admission_failures(self) -> dict:
+        failures = {}
+        now = time.monotonic()
+        for req_id, (seq, queued, ready) in list(self._admission_waiting.items()):
+            phase = "admission_wait" if ready is None else "compute_wait"
+            limit = (
+                self._pd_timeouts.admission
+                if ready is None
+                else self._pd_timeouts.compute
+            )
+            elapsed = now - (queued if ready is None else ready)
+            rejected = self._admission_results.get(req_id) is False
+            if rejected or elapsed >= limit:
+                reason = f"phase={phase} " + (
+                    "D-ready rejected; see producer worker log"
+                    if rejected
+                    else f"timed out elapsed_s={elapsed:.3f} limit_s={limit:.3f}"
+                )
+                seq.kv_transfer_params["cancel_reason"] = reason
+                failures[req_id] = reason
+                del self._admission_waiting[req_id]
+        return failures
 
     def _remote_page_geometry(self, params: dict[str, Any]) -> tuple[int, int] | None:
         """Return ``(producer_block_size, producer_dcp_size)`` when incremental
@@ -395,6 +485,10 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
     def build_connector_meta(self) -> ConnectorMetadata:
         meta = ConnectorMetadata()
         meta.request_id_to_transfer_id = self.request_id_to_transfer_id
+        meta.pd_admissions = self._admissions_to_register
+        meta.pd_cancellations = self._admissions_to_cancel
+        self._admissions_to_register = {}
+        self._admissions_to_cancel = {}
 
         for req_id, (req, block_ids, slot_idx) in self._reqs_need_recv.items():
             assert req.kv_transfer_params is not None
@@ -430,6 +524,17 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
 
     def update_state_after_alloc(self, seq: Sequence) -> None:
         params = seq.kv_transfer_params or {}
+        waiting = self._admission_waiting.pop(seq.id, None)
+        if waiting is not None:
+            _, queued, ready = waiting
+            logger.info(
+                "[PD] role=%s req_id=%s transfer_id=%s phase=%s event=allocated elapsed_s=%.3f",
+                "P" if self.is_producer else "D",
+                seq.id,
+                params.get("transfer_id"),
+                "compute_wait" if ready is not None else "admission_wait",
+                time.monotonic() - (queued if ready is None else ready),
+            )
         if params.get("chunked_transfer") and (
             self.is_producer or params.get("do_remote_prefill")
         ):
@@ -462,9 +567,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
 
         # Consumer side: queue for remote KV loading
         if params.get("do_remote_prefill"):
-            assert not self.is_producer, (
-                "Only the decode (consumer) side handles do_remote_prefill"
-            )
+            assert (
+                not self.is_producer
+            ), "Only the decode (consumer) side handles do_remote_prefill"
             self._reqs_need_recv[seq.id] = (seq, list(seq.block_table), slot_index)
             params["do_remote_prefill"] = False
             params["local_slot_index"] = slot_index
@@ -521,14 +626,25 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         params = getattr(seq, "kv_transfer_params", None) or {}
         if self.is_producer and params.get("chunked_transfer"):
             aborted = getattr(seq, "leave_reason", None) == "aborted"
+            if aborted:
+                reason = params.get(
+                    "cancel_reason", "request aborted by scheduler/client"
+                )
+                self._admissions_to_cancel[params["transfer_id"]] = reason
+                logger.warning(
+                    "[PD] role=P req_id=%s transfer_id=%s event=cancel reason=%s",
+                    seq.id,
+                    params["transfer_id"],
+                    reason,
+                )
             params["prefill_aborted"] = aborted
             if not aborted:
                 drafts = getattr(seq, "spec_token_ids", None)
                 params["prefill_handoff"] = {
                     "first_token_id": int(seq.output_tokens[0]),
-                    "draft_token_ids": [int(x) for x in drafts]
-                    if drafts is not None
-                    else [],
+                    "draft_token_ids": (
+                        [int(x) for x in drafts] if drafts is not None else []
+                    ),
                     "prefix_cache_hit_tokens": getattr(
                         seq, "prefix_cache_hit_tokens", 0
                     ),
@@ -601,7 +717,28 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
 
     def process_pd_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
         for completion in list(output.connector_completions):
-            if completion.channel == "pd_source_safe":
+            if completion.channel == "pd_destination_ready":
+                req_id = completion.operation_id
+                waiting = self._admission_waiting.get(req_id)
+                if waiting is not None:
+                    seq, queued, _ = waiting
+                    self._admission_results[req_id] = completion.succeeded
+                    if completion.succeeded:
+                        self._admission_waiting[req_id] = (
+                            seq,
+                            queued,
+                            time.monotonic(),
+                        )
+                    logger.info(
+                        "[PD] role=P req_id=%s transfer_id=%s phase=admission_wait "
+                        "event=quorum_complete success=%s elapsed_s=%.3f",
+                        req_id,
+                        seq.kv_transfer_params.get("transfer_id"),
+                        completion.succeeded,
+                        time.monotonic() - queued,
+                    )
+                output.connector_completions.discard(completion)
+            elif completion.channel == "pd_source_safe":
                 output.finished_sending.add(completion.operation_id)
                 output.connector_completions.discard(completion)
         for req_id, handoff in output.received_handoffs.items():
@@ -846,6 +983,9 @@ class MooncakeConnector(KVConnectorBase):
         self._chunked_prefills: dict[ReqId, ChunkedPrefill] = {}
         self._chunked_local_ids: dict[ReqId, ReqId] = {}
         self._pending_chunked_requests: list[tuple[dict, float]] = []
+        self._pd_timeouts = PDTimeouts.from_config(kv_transfer_config)
+        self._pd_admissions: dict[TransferId, DReadyAdmission] = {}
+        self._pd_tombstones: OrderedDict[TransferId, str] = OrderedDict()
         self._received_handoffs: dict[ReqId, PrefillHandoff] = {}
         self._pending_handoffs: dict[ReqId, dict] = {}
         self._transfer_refcount: dict[ReqId, int] = {}
@@ -1184,7 +1324,25 @@ class MooncakeConnector(KVConnectorBase):
                 transfer_id = self._chunked_local_ids.get(req_id)
                 state = self._chunked_prefills.get(transfer_id)
                 if state is not None:
+                    first = not state.num_ready_blocks
                     state.publish(int(batch.context_lens[i]), event)
+                    if first and state.num_ready_blocks:
+                        admission = self._pd_admissions.get(transfer_id)
+                        ready_at = admission.ready_at if admission else None
+                        logger.info(
+                            "[PD] role=P req_id=%s transfer_id=%s tp_rank=%d pp_rank=%d "
+                            "phase=compute_wait event=first_chunk_published elapsed_s=%.3f ready_blocks=%d",
+                            req_id,
+                            transfer_id,
+                            self.tp_rank,
+                            self.pp_rank,
+                            (
+                                time.monotonic() - ready_at
+                                if ready_at is not None
+                                else 0.0
+                            ),
+                            state.num_ready_blocks,
+                        )
         self._dispatch_ready_chunked_requests()
 
     def record_kv_cache_ready(self, req_ids: list[ReqId]) -> None:
@@ -1222,6 +1380,15 @@ class MooncakeConnector(KVConnectorBase):
 
         # Producer: cache block_ids + slot_index from completed prefills
         if self.is_producer:
+            with self._completed_prefills_lock:
+                for req_id, registration in metadata.pd_admissions.items():
+                    tid = registration["transfer_id"]
+                    admission = self._pd_admissions.setdefault(tid, DReadyAdmission())
+                    admission.register(req_id, registration.get("prompt_digest"))
+                    if tid in self._pd_tombstones:
+                        admission.error = self._pd_tombstones[tid]
+                for tid, reason in metadata.pd_cancellations.items():
+                    self._cancel_admission_locked(tid, reason)
             for req_id, meta in metadata.reqs_to_save.items():
                 if meta.chunked_transfer:
                     with self._completed_prefills_cv:
@@ -1234,13 +1401,27 @@ class MooncakeConnector(KVConnectorBase):
                                 self.block_size * self.dcp_size,
                                 meta.local_slot_index,
                                 meta.local_swa_block_ids,
-                                PREFILL_LOOKUP_TIMEOUT,
-                                meta.prompt_digest,
+                                prompt_digest=meta.prompt_digest,
+                                compute_timeout=self._pd_timeouts.compute,
+                                transfer_timeout=self._pd_timeouts.transfer,
+                                transfer_id=meta.transfer_id,
                             )
+                            admission = self._pd_admissions.get(meta.transfer_id)
+                            if admission is not None:
+                                state.no_readers_required = (
+                                    self.tp_rank >= admission.consumer_count
+                                )
+                            reason = self._pd_tombstones.get(meta.transfer_id)
+                            if reason:
+                                state.cancel(reason, producer_done=False)
                             self._chunked_prefills[meta.transfer_id] = state
                             self._chunked_local_ids[req_id] = meta.transfer_id
                         if meta.prefill_aborted:
-                            state.cancel()
+                            state.cancel(
+                                self._pd_tombstones.get(
+                                    meta.transfer_id, "scheduler aborted prefill"
+                                )
+                            )
                         elif meta.prefill_handoff is not None:
                             state.finish(
                                 meta.prefill_handoff,
@@ -1293,7 +1474,11 @@ class MooncakeConnector(KVConnectorBase):
                 self._pending_recv_expected[req_id] = expected_responses
                 self._pending_recv_nonce[req_id] = write_nonce
                 if meta.chunked_transfer:
-                    self._pending_handoffs[req_id] = {"failed": False, "metadata": None}
+                    self._pending_handoffs[req_id] = {
+                        "failed": False,
+                        "metadata": None,
+                        "created": time.monotonic(),
+                    }
 
             # PD incremental: slice off locally cached prefix blocks; invalid
             # offset falls back to full transfer. Under DCP the same prefix
@@ -1340,6 +1525,7 @@ class MooncakeConnector(KVConnectorBase):
                 "notify_host": self.local_ip,
                 "notify_port": self._notification_port,
                 "consumer_tp_size": self.tp_size,
+                "consumer_tp_rank": self.tp_rank,
                 "write_nonce": write_nonce,
                 # DCP relayout: which shard of each block this rank owns.
                 "consumer_dcp_size": self.dcp_size,
@@ -1444,6 +1630,50 @@ class MooncakeConnector(KVConnectorBase):
                     dst_block_ids[:10],
                 )
 
+            if meta.chunked_transfer:
+                # Advertise capacity only AFTER the target registration and all
+                # writes are queued. Every P rank participates in admission,
+                # including TP ranks with no direct consumer in asymmetric TP.
+                ready = msgpack.dumps(
+                    {
+                        k: request_body[k]
+                        for k in (
+                            "transfer_id",
+                            "request_id",
+                            "prompt_digest",
+                            "consumer_tp_size",
+                            "consumer_tp_rank",
+                            "notify_host",
+                            "notify_port",
+                            "write_nonce",
+                        )
+                    }
+                )
+                for stage in range(remote_pp_size):
+                    for rank in range(remote_tp_size):
+                        port = meta.remote_handshake_port + _port_offset(
+                            meta.remote_dp_rank,
+                            rank,
+                            remote_tp_size,
+                            stage,
+                            remote_pp_size,
+                            meta.remote_dp_size,
+                        )
+                        self._send_on_socket(
+                            make_zmq_path("tcp", meta.remote_host, port),
+                            [MSG_D_READY, ready],
+                        )
+                logger.info(
+                    "[PD] role=D req_id=%s transfer_id=%s tp_rank=%d phase=admission_wait "
+                    "event=d_ready_sent destination_blocks=%d producer_tp=%d producer_pp=%d",
+                    req_id,
+                    meta.transfer_id,
+                    self.tp_rank,
+                    len(meta.local_block_ids),
+                    remote_tp_size,
+                    remote_pp_size,
+                )
+
             with self._completion_lock:
                 self._dispatch_in_flight.discard(req_id)
                 deferred = self._deferred_failures.pop(req_id, None)
@@ -1503,6 +1733,26 @@ class MooncakeConnector(KVConnectorBase):
         self._dispatch_ready_chunked_requests()
         source_completions = set()
         with self._completed_prefills_lock:
+            for transfer_id, admission in list(self._pd_admissions.items()):
+                if (
+                    admission.req_id is not None
+                    and not admission.reported
+                    and (admission.ready_at is not None or admission.error)
+                ):
+                    source_completions.add(
+                        ConnectorCompletion(
+                            "pd_destination_ready",
+                            admission.req_id,
+                            admission.error is None,
+                        )
+                    )
+                    admission.reported = True
+                if (
+                    admission.error
+                    and admission.reported
+                    and transfer_id not in self._chunked_prefills
+                ):
+                    del self._pd_admissions[transfer_id]
             for transfer_id, state in list(self._chunked_prefills.items()):
                 if state.source_safe():
                     # Connector channels receive both TP and PP quorum before
@@ -1510,7 +1760,12 @@ class MooncakeConnector(KVConnectorBase):
                     source_completions.add(
                         ConnectorCompletion("pd_source_safe", state.req_id, True)
                     )
-                    state.cancel()  # Late holders of the object cannot acquire it.
+                    # Late control/write packets must not resurrect this allocation.
+                    self._remember_pd_terminal_locked(
+                        transfer_id, state.cancel_reason or "transfer already completed"
+                    )
+                    self._pd_admissions.pop(transfer_id, None)
+                    state.retire()
                     del self._chunked_prefills[transfer_id]
                     self._chunked_local_ids.pop(state.req_id, None)
                     self._kv_cache_ready_events.pop(state.req_id, None)
@@ -1570,6 +1825,9 @@ class MooncakeConnector(KVConnectorBase):
                     encoded = self._encoder.encode(self._local_metadata)
                     sock.send_multipart([identity, b"", encoded])
                     logger.debug("Sent metadata to peer")
+
+                elif msg_type == MSG_D_READY:
+                    self._record_d_ready(msgpack.loads(parts[2]))
 
                 elif msg_type == MSG_WRITE_REQUEST:
                     request_data = msgpack.loads(parts[2])
@@ -1852,47 +2110,152 @@ class MooncakeConnector(KVConnectorBase):
             request_data["request_id"],
             request_data.get("write_nonce", 0),
         )
+        admission = self._pd_admissions.get(request_data["transfer_id"])
+        if (
+            admission is not None
+            and admission.ready_at is not None
+            and (
+                admission.consumers.get(request_data.get("consumer_tp_rank"))
+                != consumer_identity
+                or request_data.get("consumer_tp_size") != admission.consumer_count
+            )
+        ):
+            raise ValueError(
+                "phase=admission_wait write request differs from D-ready reservation"
+            )
         # With TP fan-out, each producer rank serves this many consumer ranks,
         # each with an independent cursor over the same source block table.
         num_consumers_per_producer_rank = max(
-            1, request_data.get("consumer_tp_size", self.tp_size) // self.tp_size
+            0,
+            (request_data.get("consumer_tp_size", self.tp_size) - 1 - self.tp_rank)
+            // self.tp_size
+            + 1,
         )
         return state.acquire(
             consumer_identity=consumer_identity,
             expected_readers=num_consumers_per_producer_rank,
         )
 
-    def _dispatch_ready_chunked_requests(self) -> None:
-        """Do not occupy send threads with requests P has not admitted.
+    def _remember_pd_terminal_locked(self, transfer_id, reason):
+        self._pd_tombstones.setdefault(transfer_id, reason)
+        # Bounded protection against duplicate/late packets, like completion aggregation.
+        while len(self._pd_tombstones) > 16384:
+            self._pd_tombstones.popitem(last=False)
 
-        D may schedule in a different order from P. Letting such requests wait
-        in the bounded send pool can strand computed requests behind them while
-        their pinned pages prevent P from admitting the pool's waiters.
-        """
+    def _cancel_admission_locked(self, transfer_id, reason):
+        first_cancel = transfer_id not in self._pd_tombstones
+        self._remember_pd_terminal_locked(transfer_id, reason)
+        admission = self._pd_admissions.get(transfer_id)
+        if admission is not None and admission.error is None:
+            admission.error = reason
+        if first_cancel:
+            logger.warning(
+                "[PD] role=P req_id=%s transfer_id=%s tp_rank=%d pp_rank=%d "
+                "event=cancel reason=%s",
+                admission.req_id if admission else None,
+                transfer_id,
+                self.tp_rank,
+                self.pp_rank,
+                reason,
+            )
+        state = self._chunked_prefills.get(transfer_id)
+        if state is not None:
+            # A worker-side timeout cannot assert that the model has stopped.
+            state.cancel(reason, producer_done=False)
+
+    def _record_d_ready(self, data):
+        transfer_id = data["transfer_id"]
+        with self._completed_prefills_lock:
+            if transfer_id in self._pd_tombstones:
+                return
+            admission = self._pd_admissions.setdefault(transfer_id, DReadyAdmission())
+            admission.expire(self._pd_timeouts)
+            admission.observe(data)
+            if admission.error:
+                self._cancel_admission_locked(transfer_id, admission.error)
+            logger.debug(
+                "[PD] role=P transfer_id=%s tp_rank=%d pp_rank=%d phase=admission_wait "
+                "event=d_ready_received ready_ranks=%d/%d reason=%s",
+                transfer_id,
+                self.tp_rank,
+                self.pp_rank,
+                len(admission.consumers),
+                admission.consumer_count,
+                admission.error,
+            )
+        self._dispatch_ready_chunked_requests()
+
+    def _dispatch_ready_chunked_requests(self) -> None:
+        """Keep pre-admission waits outside the send pool, with phase deadlines."""
         submissions = []
         with self._completed_prefills_lock:
+            now = time.monotonic()
+            for tid, admission in list(self._pd_admissions.items()):
+                reason = admission.expire(self._pd_timeouts)
+                state = self._chunked_prefills.get(tid)
+                if (
+                    reason is None
+                    and admission.ready_at is not None
+                    and (state is None or not state.num_ready_blocks)
+                    and now - admission.ready_at >= self._pd_timeouts.compute
+                ):
+                    reason = (
+                        "phase=compute_wait first chunk timed out "
+                        f"elapsed_s={now - admission.ready_at:.3f} "
+                        f"limit_s={self._pd_timeouts.compute:.3f}"
+                    )
+                if reason:
+                    self._cancel_admission_locked(tid, reason)
+                    if admission.req_id is None:
+                        del self._pd_admissions[tid]
             pending = []
             for data, queued_at in self._pending_chunked_requests:
-                state = self._chunked_prefills.get(data["transfer_id"])
-                if state is None or not (state.num_ready_blocks or state.cancelled):
-                    if time.monotonic() - queued_at < PREFILL_LOOKUP_TIMEOUT:
-                        pending.append((data, queued_at))
+                tid = data["transfer_id"]
+                state = self._chunked_prefills.get(tid)
+                # Dedup before considering cancellation: an active original
+                # reader owns the terminal notification, even on timeout.
+                identity = tuple(
+                    data.get(k, 0)
+                    for k in ("notify_host", "notify_port", "request_id", "write_nonce")
+                )
+                if state is not None and identity in state.claims:
+                    continue
+                reason = self._pd_tombstones.get(tid)
+                if reason is None and state is not None and state.cancelled:
+                    reason = state.cancel_reason
+                if reason is None and (state is None or not state.num_ready_blocks):
+                    admission = self._pd_admissions.get(tid)
+                    if admission is None:
+                        admission = self._pd_admissions.setdefault(
+                            tid, DReadyAdmission(created=queued_at)
+                        )
+                    if (
+                        now - queued_at >= self._pd_timeouts.admission
+                        and admission.ready_at is None
+                    ):
+                        reason = "phase=admission_wait D-ready timed out before write dispatch"
+                        self._cancel_admission_locked(tid, reason)
                     else:
-                        submissions.append((data, None))
+                        pending.append((data, queued_at))
+                        continue
+                if reason is not None:
+                    data["failure_reason"] = reason
+                    submissions.append((data, None))
                     continue
                 try:
                     acquired = self._acquire_chunked_reader(state, data)
-                except (RuntimeError, ValueError):
+                except (RuntimeError, ValueError) as exc:
+                    data["failure_reason"] = str(exc)
                     submissions.append((data, None))
                 else:
                     if acquired:
+                        data["send_queued_at"] = now
                         submissions.append((data, state))
             self._pending_chunked_requests = pending
         for data, state in submissions:
             if state is None:
-                self._send_executor.submit(
-                    self._notify_transfer_result, data, success=False
-                )
+                # Control failures must not sit behind compute-blocked send workers.
+                self._notify_transfer_result(data, success=False)
             else:
                 self._send_executor.submit(
                     self._execute_chunked_transfer, data, state, True
@@ -1910,16 +2273,29 @@ class MooncakeConnector(KVConnectorBase):
                 with self._completed_prefills_cv:
                     if not self._completed_prefills_cv.wait_for(
                         lambda: transfer_id in self._chunked_prefills,
-                        timeout=PREFILL_LOOKUP_TIMEOUT,
+                        timeout=self._pd_timeouts.compute,
                     ):
                         raise RuntimeError(
-                            "timed out waiting for chunked prefill allocation"
+                            "phase=compute_wait timed out waiting for chunked prefill allocation"
                         )
                     state = self._chunked_prefills[transfer_id]
                     acquired = self._acquire_chunked_reader(state, request_data)
             if not acquired:
                 return  # The original task owns completion of this duplicate.
             req_id = request_data["request_id"]
+            started = time.monotonic()
+            compute_wait_s = 0.0
+            transfer_wait_s = 0.0
+            logger.info(
+                "[PD] role=P req_id=%s transfer_id=%s tp_rank=%d pp_rank=%d "
+                "phase=transfer_wait event=sender_started queue_wait_s=%.3f",
+                state.req_id,
+                transfer_id,
+                self.tp_rank,
+                self.pp_rank,
+                started - request_data.get("send_queued_at", started),
+            )
+            state.check_transfer_deadline()
             if request_data.get("prompt_digest") != state.prompt_digest:
                 raise ValueError("P/D prompt token IDs differ")
             src_blocks_per_dst_block = max(
@@ -1957,13 +2333,38 @@ class MooncakeConnector(KVConnectorBase):
             # Relative offset in D's remaining (prefix-trimmed) block table.
             dst_block_offset = 0
             while src_block_offset < len(state.block_ids):
+                logger.debug(
+                    "[PD] role=P req_id=%s transfer_id=%s tp_rank=%d pp_rank=%d "
+                    "phase=compute_wait event=wait_chunk src_block_offset=%d ready_blocks=%d",
+                    state.req_id,
+                    transfer_id,
+                    self.tp_rank,
+                    self.pp_rank,
+                    src_block_offset,
+                    state.num_ready_blocks,
+                )
+                wait_started = time.monotonic()
                 chunk_src_block_ids, event, src_block_end = state.wait_chunk(
                     src_block_offset=src_block_offset,
                     src_blocks_per_dst_block=src_blocks_per_dst_block,
                 )
+                compute_wait_s += time.monotonic() - wait_started
+                state.check_transfer_deadline()
+                wait_started = time.monotonic()
                 # Synchronize in this send thread, never the scheduling thread.
                 # This also protects plain RDMA reads, not only index staging.
+                logger.debug(
+                    "[PD] role=P req_id=%s transfer_id=%s tp_rank=%d pp_rank=%d "
+                    "phase=transfer_wait event=gpu_and_rdma_start src_blocks=%d:%d",
+                    state.req_id,
+                    transfer_id,
+                    self.tp_rank,
+                    self.pp_rank,
+                    src_block_offset,
+                    src_block_end,
+                )
                 event.synchronize()
+                state.check_transfer_deadline()
                 num_chunk_dst_blocks = (
                     src_block_end - src_block_offset + src_blocks_per_dst_block - 1
                 ) // src_blocks_per_dst_block
@@ -1991,11 +2392,17 @@ class MooncakeConnector(KVConnectorBase):
                         event,
                         engine=engine,
                     )
+                transfer_wait_s += time.monotonic() - wait_started
+                state.check_transfer_deadline()
                 if not ok:
-                    raise RuntimeError("chunk RDMA write failed")
+                    raise RuntimeError("phase=transfer_wait chunk RDMA write failed")
                 src_block_offset = src_block_end
                 dst_block_offset += num_chunk_dst_blocks
+            wait_started = time.monotonic()
             handoff = state.wait_handoff()
+            compute_wait_s += time.monotonic() - wait_started
+            state.check_transfer_deadline()
+            wait_started = time.monotonic()
             if has_slots:
                 prefill_data = {
                     "slot_index": state.slot_index,
@@ -2012,12 +2419,37 @@ class MooncakeConnector(KVConnectorBase):
                     req_id,
                     engine=engine,
                 ):
-                    raise RuntimeError("final state RDMA write failed")
+                    raise RuntimeError(
+                        "phase=transfer_wait final state RDMA write failed"
+                    )
+            transfer_wait_s += time.monotonic() - wait_started
+            state.check_transfer_deadline()
+            logger.info(
+                "[PD] role=P req_id=%s transfer_id=%s tp_rank=%d pp_rank=%d "
+                "phase=transfer_wait event=complete elapsed_s=%.3f "
+                "compute_wait_s=%.3f transfer_wait_s=%.3f",
+                state.req_id,
+                transfer_id,
+                self.tp_rank,
+                self.pp_rank,
+                time.monotonic() - started,
+                compute_wait_s,
+                transfer_wait_s,
+            )
             request_data["prefill_handoff"] = handoff
             self._notify_transfer_result(request_data, success=True)
-        except Exception:
+        except Exception as exc:
+            request_data["failure_reason"] = str(exc)
+            if state is not None:
+                state.cancel(str(exc), producer_done=False)
             logger.exception(
-                "Chunked KV transfer failed for %s", request_data.get("transfer_id")
+                "[PD] role=P transfer_id=%s req_id=%s remote_req_id=%s tp_rank=%d pp_rank=%d "
+                "event=transfer_failed",
+                request_data.get("transfer_id"),
+                state.req_id if state is not None else None,
+                request_data.get("request_id"),
+                self.tp_rank,
+                self.pp_rank,
             )
             self._notify_transfer_result(request_data, success=False)
         finally:
@@ -2711,7 +3143,11 @@ class MooncakeConnector(KVConnectorBase):
             request_data.get("write_nonce", 0),
             success=success,
             **(
-                {"handoff": request_data.get("prefill_handoff")}
+                {
+                    "handoff": request_data.get("prefill_handoff"),
+                    "failure_reason": request_data.get("failure_reason"),
+                    "transfer_id": request_data.get("transfer_id"),
+                }
                 if request_data.get("chunked_transfer")
                 else {}
             ),
@@ -2727,6 +3163,8 @@ class MooncakeConnector(KVConnectorBase):
         *,
         success: bool = True,
         handoff: dict | None = None,
+        failure_reason: str | None = None,
+        transfer_id: TransferId | None = None,
     ) -> None:
         """Send write-done notification to consumer via persistent socket.
 
@@ -2746,6 +3184,8 @@ class MooncakeConnector(KVConnectorBase):
                 "write_nonce": write_nonce,
                 "success": success,
                 "prefill_handoff": handoff,
+                "failure_reason": failure_reason,
+                "transfer_id": transfer_id,
             }
         )
         self._send_on_socket(path, [MSG_WRITE_DONE, notification], repeat=3)
@@ -2776,6 +3216,7 @@ class MooncakeConnector(KVConnectorBase):
                         data.get("write_nonce", 0),
                         success=data.get("success", True),
                         handoff=data.get("prefill_handoff"),
+                        failure_reason=data.get("failure_reason"),
                     )
                 else:
                     logger.error("Unknown notification type: %s", msg_type)
@@ -2805,6 +3246,7 @@ class MooncakeConnector(KVConnectorBase):
         *,
         success: bool = True,
         handoff: dict | None = None,
+        failure_reason: str | None = None,
     ) -> bool:
         """Register a producer rank's write-done for ``req_id``.
 
@@ -2838,8 +3280,9 @@ class MooncakeConnector(KVConnectorBase):
                 if success:
                     try:
                         PrefillHandoff.from_wire(req_id, handoff)
-                    except ValueError:
+                    except ValueError as exc:
                         success = False
+                        failure_reason = f"invalid prefill handoff: {exc}"
                         handoff = None
                 stages = self._pending_recv_stages.setdefault(req_id, set())
                 stage = (pp_rank, tp_rank)
@@ -2848,11 +3291,30 @@ class MooncakeConnector(KVConnectorBase):
                 ):
                     return False
                 stages.add(stage)
+                if not success:
+                    pending_handoff.setdefault(
+                        "failure_reason", failure_reason or "producer transfer failed"
+                    )
+                    logger.error(
+                        "[PD] role=D req_id=%s transfer_id=%s producer_tp=%d producer_pp=%d "
+                        "event=write_failed reason=%s terminal_stages=%d/%d",
+                        req_id,
+                        self.request_id_to_transfer_id.get(req_id),
+                        tp_rank,
+                        pp_rank,
+                        pending_handoff["failure_reason"],
+                        len(stages),
+                        expected,
+                    )
                 pending_handoff["failed"] |= not success or handoff is None
                 if handoff is not None:
                     previous = pending_handoff["metadata"]
                     if previous is not None and previous != handoff:
                         pending_handoff["failed"] = True
+                        pending_handoff.setdefault(
+                            "failure_reason",
+                            "inconsistent handoff across producer stages",
+                        )
                     pending_handoff["metadata"] = handoff
                 # A failure cannot let D reuse memory while another PP stage
                 # still writes it. Wait for every stage's terminal result.
@@ -2888,6 +3350,16 @@ class MooncakeConnector(KVConnectorBase):
 
         if pending_handoff is not None:
             self._pending_handoffs.pop(req_id, None)
+            log = logger.error if failed else logger.info
+            log(
+                "[PD] role=D req_id=%s transfer_id=%s phase=transfer_wait event=receive_complete "
+                "success=%s elapsed_s=%.3f reason=%s",
+                req_id,
+                self.request_id_to_transfer_id.get(req_id),
+                not failed,
+                time.monotonic() - pending_handoff.get("created", time.monotonic()),
+                pending_handoff.get("failure_reason", "completed"),
+            )
         if failed:
             # Return the staging row to the pool. The scatter is deliberately
             # skipped -- the bytes never landed -- but the row itself must not

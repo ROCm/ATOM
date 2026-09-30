@@ -1308,7 +1308,7 @@ impl PDRouter {
                 status,
                 None,
                 false,
-                None,
+                Some(decode.url().to_string()),
                 Some(response_headers),
                 decode_guard,
             )
@@ -1726,9 +1726,11 @@ impl PDRouter {
                         }
                     }
                     Err(e) => {
-                        if let Some(ref url) = decode_url {
-                            error!("Stream error from decode server {}: {}", url, e);
-                        }
+                        error!(
+                            "Stream error from decode server {}: {:?}",
+                            decode_url.as_deref().unwrap_or("unknown"),
+                            e
+                        );
                         let _ = tx.send(Err(format!("Stream error: {}", e)));
                         break;
                     }

@@ -437,6 +437,8 @@ class ConnectorMetadata:
         "reqs_to_send",
         "reqs_in_batch",
         "reqs_not_processed",
+        "pd_admissions",
+        "pd_cancellations",
     )
 
     def __init__(self) -> None:
@@ -445,6 +447,9 @@ class ConnectorMetadata:
         self.reqs_to_send: dict[ReqId, float] = {}
         self.reqs_in_batch: set[ReqId] = set()
         self.reqs_not_processed: set[ReqId] = set()
+        # Control-only work must survive idle dispatch without KV allocation.
+        self.pd_admissions: dict[ReqId, dict] = {}
+        self.pd_cancellations: dict[TransferId, str] = {}
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
 
     def has_work(self) -> bool:

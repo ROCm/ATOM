@@ -699,6 +699,33 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
                 output = callback(output)
         return output
 
+    def request_queued(self, seq) -> None:
+        for connector in self._connectors:
+            callback = getattr(connector, "request_queued", None)
+            if callable(callback):
+                callback(seq)
+
+    def prefill_admission_ready(self, seq) -> bool:
+        for connector in self._connectors:
+            callback = getattr(connector, "prefill_admission_ready", None)
+            if callable(callback) and not callback(seq):
+                return False
+        return True
+
+    def cancel_admission(self, seq, reason: str) -> None:
+        for connector in self._connectors:
+            callback = getattr(connector, "cancel_admission", None)
+            if callable(callback):
+                callback(seq, reason)
+
+    def take_admission_failures(self) -> dict:
+        failures = {}
+        for connector in self._connectors:
+            callback = getattr(connector, "take_admission_failures", None)
+            if callable(callback):
+                failures.update(callback())
+        return failures
+
     def process_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
         """Let the one offload sub apply its own completions and normalize output.
 

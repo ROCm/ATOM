@@ -2742,6 +2742,7 @@ async def kv_transfer_info():
         ):
             info["chunked_transfer"] = {
                 "chunked_transfer": True,
+                "d_ready_protocol": 1,
                 "do_remote_prefill": True,
                 "do_remote_decode": False,
                 "remote_host": get_ip(),

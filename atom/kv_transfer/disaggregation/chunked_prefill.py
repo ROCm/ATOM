@@ -10,10 +10,13 @@ has its own cursor into this table. No network or GPU dependency lives here.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any
+
+logger = logging.getLogger("atom")
 
 
 @dataclass(frozen=True)
@@ -29,7 +32,8 @@ class PrefillHandoff:
     def from_wire(cls, req_id, data):
         """Validate the wire handoff and attach D's local request ID."""
         if not isinstance(data, dict):
-            raise ValueError("missing prefill handoff")
+            # Wire validation consistently raises ValueError; the receive loop catches it.
+            raise ValueError("missing prefill handoff")  # noqa: TRY004
         first = data.get("first_token_id")
         drafts = data.get("draft_token_ids", [])
         cached = data.get("prefix_cache_hit_tokens", 0)
@@ -62,6 +66,9 @@ class ChunkedPrefill:
         swa_block_ids=(),
         timeout=60,
         prompt_digest=None,
+        compute_timeout=None,
+        transfer_timeout=None,
+        transfer_id=None,
     ):
         if num_tokens <= 0 or block_size <= 0:
             raise ValueError("chunked prefill requires positive token/block counts")
@@ -74,7 +81,16 @@ class ChunkedPrefill:
         self.block_size = block_size
         self.slot_index = slot_index
         self.swa_block_ids = list(swa_block_ids)
-        self.timeout = timeout
+        self.timeout = timeout  # Compatibility for standalone callers.
+        self.compute_timeout = timeout if compute_timeout is None else compute_timeout
+        self.transfer_timeout = (
+            timeout if transfer_timeout is None else transfer_timeout
+        )
+        self.transfer_id = transfer_id
+        self.cancel_reason = None
+        self.producer_done = False
+        self.handoff_at = None
+        self.no_readers_required = False
         self.cv = threading.Condition()
         self.num_ready_blocks = 0  # Published prefix blocks; reads must wait on event.
         self.event: Any = None
@@ -107,6 +123,7 @@ class ChunkedPrefill:
     def finish(self, handoff, *, slot_index=None, swa_block_ids=None):
         """Publish final sampling and slot/SWA state; RDMA may still be in flight."""
         with self.cv:
+            self.producer_done = True
             if not self.cancelled:
                 if slot_index is not None:
                     self.slot_index = slot_index
@@ -115,14 +132,59 @@ class ChunkedPrefill:
                 if swa_block_ids is not None:
                     self.swa_block_ids = list(swa_block_ids)
                 self.handoff = dict(handoff)
+                if self.handoff_at is None:
+                    self.handoff_at = time.monotonic()
+                    logger.info(
+                        "[PD] role=P req_id=%s transfer_id=%s phase=transfer_wait event=handoff_ready readers=%d",
+                        self.req_id,
+                        self.transfer_id,
+                        self.readers,
+                    )
                 self.updated = time.monotonic()
             self.cv.notify_all()
 
-    def cancel(self):
-        """Cancel waits and new claims; in-flight RDMA must still drain."""
+    def retire(self):
+        """Close a safely retired source against late claims without a cancel log."""
         with self.cv:
             self.cancelled = True
+            if self.cancel_reason is None:
+                self.cancel_reason = "transfer already completed"
             self.cv.notify_all()
+
+    def cancel(self, reason="request cancelled", *, producer_done=True):
+        """Cancel waits; only scheduler termination certifies compute has stopped."""
+        with self.cv:
+            self.producer_done |= producer_done
+            self._cancel_locked(reason)
+
+    def _cancel_locked(self, reason):
+        if self.cancel_reason is None:
+            self.cancel_reason = reason
+            logger.warning(
+                "[PD] role=P req_id=%s transfer_id=%s event=cancel reason=%s readers=%d",
+                self.req_id,
+                self.transfer_id,
+                reason,
+                self.readers,
+            )
+        self.cancelled = True
+        self.cv.notify_all()
+
+    def check_transfer_deadline(self):
+        with self.cv:
+            self._check_transfer_deadline_locked()
+            if self.cancelled:
+                raise RuntimeError(self.cancel_reason)
+
+    def _check_transfer_deadline_locked(self):
+        if self.handoff_at is not None:
+            elapsed = time.monotonic() - self.handoff_at
+            if elapsed >= self.transfer_timeout:
+                self._cancel_locked(
+                    f"phase=transfer_wait drain timed out elapsed_s={elapsed:.3f} "
+                    f"limit_s={self.transfer_timeout:.3f} readers={self.readers} "
+                    f"completed={self.completed_readers}/{self.expected_readers}"
+                )
 
     def acquire(self, consumer_identity, expected_readers):
         """Claim one consumer's reads of this producer rank's source blocks.
@@ -137,7 +199,7 @@ class ChunkedPrefill:
             if consumer_identity in self.claims:
                 return False
             if self.cancelled:
-                raise RuntimeError("prefill was cancelled")
+                raise RuntimeError(self.cancel_reason or "prefill was cancelled")
             if self.expected_readers and self.expected_readers != expected_readers:
                 raise ValueError("inconsistent consumer fan-out")
             if len(self.claims) >= expected_readers:
@@ -159,18 +221,22 @@ class ChunkedPrefill:
         with self.cv:
             # A missing consumer must not pin HBM indefinitely. Active RDMA
             # readers always drain before reclamation, even after a timeout.
-            if (
-                self.handoff is not None
-                and time.monotonic() - self.updated >= self.timeout
-            ):
-                self.cancelled = True
-                self.cv.notify_all()
-            return self.readers == 0 and (
-                self.cancelled
-                or (
-                    self.handoff is not None
-                    and self.expected_readers > 0
-                    and self.completed_readers == self.expected_readers
+            self._check_transfer_deadline_locked()
+            return (
+                self.producer_done
+                and self.readers == 0
+                and (
+                    self.cancelled
+                    or (
+                        self.handoff is not None
+                        and (
+                            self.no_readers_required
+                            or (
+                                self.expected_readers > 0
+                                and self.completed_readers == self.expected_readers
+                            )
+                        )
+                    )
                 )
             )
 
@@ -193,12 +259,20 @@ class ChunkedPrefill:
                     return num_blocks
                 return num_blocks - num_blocks % src_blocks_per_dst_block
 
+            started = time.monotonic()
             ready = self.cv.wait_for(
                 lambda: self.cancelled or ready_src_block_end() > src_block_offset,
-                timeout=self.timeout,
+                timeout=self.compute_timeout,
             )
-            if not ready or self.cancelled:
-                raise RuntimeError("prefill chunk cancelled or timed out")
+            if self.cancelled:
+                raise RuntimeError(self.cancel_reason)
+            if not ready:
+                raise RuntimeError(
+                    f"phase=compute_wait chunk timed out elapsed_s={time.monotonic() - started:.3f} "
+                    f"limit_s={self.compute_timeout:.3f} "
+                    f"src_block_offset={src_block_offset} ready_blocks={self.num_ready_blocks} "
+                    f"total_blocks={len(self.block_ids)}"
+                )
             src_block_end = ready_src_block_end()
             return (
                 list(self.block_ids[src_block_offset:src_block_end]),
@@ -209,10 +283,17 @@ class ChunkedPrefill:
     def wait_handoff(self):
         """Wait for the final handoff, raising on cancellation or timeout."""
         with self.cv:
+            started = time.monotonic()
             ready = self.cv.wait_for(
                 lambda: self.cancelled or self.handoff is not None,
-                timeout=self.timeout,
+                timeout=self.compute_timeout,
             )
-            if not ready or self.cancelled:
-                raise RuntimeError("prefill handoff cancelled or timed out")
+            if self.cancelled:
+                raise RuntimeError(self.cancel_reason)
+            if not ready:
+                raise RuntimeError(
+                    f"phase=compute_wait handoff timed out elapsed_s={time.monotonic() - started:.3f} "
+                    f"limit_s={self.compute_timeout:.3f} "
+                    f"ready_blocks={self.num_ready_blocks} total_blocks={len(self.block_ids)}"
+                )
             return dict(self.handoff)
