@@ -654,6 +654,130 @@ def test_dense_lookup_unpin_passes_one_string_id():
         worker._load_executor.shutdown(wait=True)
 
 
+class _PinnedChunk:
+    def __init__(self, pin_count, key):
+        self._pin_count = pin_count
+        self._key = key
+
+    def unpin(self):
+        self._pin_count[self._key] -= 1
+
+
+def _pinning_engine(retrieved_chunks, *, retrieve_unpins, chunk_size=8, num_chunks=4):
+    """LMCache engine double: lookup pins every chunk. With ``retrieve_unpins``
+    retrieve unpins the chunks it returns (LMCache 0.5.x); without it retrieve
+    leaves every lookup pin held (LMCache 0.4.5). The worker tells the two
+    apart from retrieve's source, as it does for the real engine."""
+
+    keys = [f"k{i}" for i in range(num_chunks)]
+    pin_count = {key: 1 for key in keys}
+
+    def _mark(tokens, mask):
+        ret = torch.zeros(len(tokens), dtype=torch.bool)
+        for idx in retrieved_chunks:
+            ret[idx * chunk_size : (idx + 1) * chunk_size] = True
+        return ret & mask
+
+    def unpinning_retrieve(tokens, *, mask, **_kwargs):
+        for idx in retrieved_chunks:
+            _PinnedChunk(pin_count, keys[idx]).unpin()
+        return _mark(tokens, mask)
+
+    def pin_keeping_retrieve(tokens, *, mask, **_kwargs):
+        return _mark(tokens, mask)
+
+    def batched_unpin(unpin_keys, locations):
+        assert locations == ["LocalCPUBackend"]
+        for key in unpin_keys:
+            pin_count[key] -= 1
+
+    storage_manager = SimpleNamespace(batched_unpin=batched_unpin)
+    lookup_pins = {}
+
+    def lookup_unpin(lookup_id):
+        for location, pinned in lookup_pins.pop(lookup_id, {}).items():
+            storage_manager.batched_unpin(pinned, [location])
+
+    engine = SimpleNamespace(
+        retrieve=unpinning_retrieve if retrieve_unpins else pin_keeping_retrieve,
+        lookup_pins=lookup_pins,
+        lookup_unpin=lookup_unpin,
+        storage_manager=storage_manager,
+    )
+    return engine, keys, pin_count
+
+
+@pytest.mark.parametrize("retrieve_unpins", [True, False], ids=["lmc056", "lmc045"])
+@pytest.mark.parametrize(
+    "hbm, retrieved, loaded",
+    [(8, [1, 2, 3], True), (0, [0, 1, 2, 3], True), (8, [1], False)],
+)
+def test_load_releases_each_lookup_pin_exactly_once(
+    hbm, retrieved, loaded, retrieve_unpins
+):
+    """Each lookup pin is released exactly once, whether or not retrieve()
+    already dropped the pins of the chunks it returned: unpinning them again
+    cancels another request's pin on a shared prefix chunk (0.5.x), and not
+    unpinning them leaks them until the PinMonitor forces them out (0.4.5)."""
+
+    worker = DenseOffloadConnector(_config("kv_consumer"))
+    worker.chunk_size = 8
+    engine, keys, pin_count = _pinning_engine(
+        retrieved, retrieve_unpins=retrieve_unpins
+    )
+    engine.lookup_pins["71"] = {"LocalCPUBackend": list(keys)}
+    worker._engine = engine
+    request = LMCacheReqMeta(
+        req_id=71,
+        token_ids=list(range(32)),
+        block_ids=[0, 1, 2, 3],
+        load_spec=LoadSpec(
+            hbm_cached_tokens=hbm, lmcache_cached_tokens=32, can_load=True
+        ),
+        load_operation=LoadOperationId(req_id=71, generation=1),
+    )
+
+    try:
+        worker._do_load_req(request)
+
+        assert pin_count == {key: 0 for key in keys}
+        assert engine.lookup_pins == {}
+        finished = worker.get_finished()
+        done = finished.finished_loading if loaded else finished.failed_loading
+        assert done == {request.load_operation}
+    finally:
+        worker.close()
+
+
+def test_retrieve_unpin_probe_matches_each_lmcache_release():
+    """The probe reads the real LMCache retrieve shapes: 0.5.x unpins what it
+    returns, 0.4.5 only drops the ref count; unreadable source is treated as
+    keeping the pins."""
+
+    worker = DenseOffloadConnector(_config("kv_consumer"))
+
+    class _Engine056:
+        def retrieve(self, tokens, mask=None, **kwargs):
+            for _key, memory_obj in self.chunks:
+                if memory_obj.is_pinned:
+                    memory_obj.unpin()
+                memory_obj.ref_count_down()
+
+    class _Engine045:
+        def retrieve(self, tokens, mask=None, **kwargs):
+            for _key, memory_obj in self.chunks:
+                memory_obj.ref_count_down()
+
+    try:
+        assert worker._retrieve_releases_lookup_pins(_Engine056()) is True
+        assert worker._retrieve_releases_lookup_pins(_Engine045()) is False
+        assert worker._retrieve_releases_lookup_pins(SimpleNamespace(retrieve=len)) is (
+            False
+        )
+    finally:
+        worker.close()
+
+
 @pytest.mark.parametrize("outcome", ["hbm_hit", "small_hit", "cancel", "miss", "error"])
 def test_unused_lookup_releases_worker_pin(monkeypatch, outcome):
     scheduler = _scheduler(monkeypatch, "kv_consumer")

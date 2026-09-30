@@ -11,6 +11,7 @@ payload mapping and PAGE/SLOT policy.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import threading
@@ -379,6 +380,86 @@ class OffloadWorkerMixin:
         except Exception:  # optional third-party cleanup boundary
             logger.debug(
                 "LMCache offload: lookup unpin failed for req=%s",
+                req_id,
+                exc_info=True,
+            )
+
+    def _retrieve_releases_lookup_pins(self, engine) -> bool:
+        """Whether this LMCache's ``retrieve`` unpins the chunks it returns.
+
+        LMCache 0.5.x's ``LMCacheEngine.retrieve`` unpins each returned chunk
+        (``if memory_obj.is_pinned: memory_obj.unpin()``); 0.4.5 (the rocm10
+        image) only drops the chunk's ref count, so the lookup pin stays until
+        ``lookup_unpin`` or the PinMonitor's 300 s forced unpin. Probed once
+        per ``retrieve`` implementation from its source; an unreadable source
+        counts as "does not unpin", whose worst case is a double unpin rather
+        than a pin leak on every retrieved chunk.
+        """
+
+        retrieve = getattr(type(engine), "retrieve", None) or getattr(
+            engine, "retrieve", None
+        )
+        cached = getattr(self, "_retrieve_unpin_probe", None)
+        if cached is not None and cached[0] is retrieve:
+            return cached[1]
+        try:
+            releases = ".unpin(" in inspect.getsource(retrieve)
+        except (OSError, TypeError):
+            releases = False
+        self._retrieve_unpin_probe = (retrieve, releases)
+        logger.info(
+            "LMCache offload: retrieve %s its lookup pins; post-retrieve unpin "
+            "releases %s",
+            "releases" if releases else "keeps",
+            "only unretrieved chunks" if releases else "the whole lookup",
+        )
+        return releases
+
+    def _lookup_unpin_after_retrieve(self, req_id, ret_mask) -> None:
+        """Release the lookup pins that ``retrieve`` did not already release.
+
+        Where ``LMCacheEngine.retrieve`` unpins every chunk it returns (LMCache
+        0.5.x), a plain ``lookup_unpin`` afterwards drops those chunks' pin
+        count a second time. When another request pinned the same shared
+        prefix chunk, that second drop cancels its pin and the chunk can be
+        evicted before it is loaded. Only chunks whose first token ``ret_mask``
+        does not mark as retrieved still hold this request's pin: those below
+        the HBM prefix, and those the retrieve could not return.
+
+        Where ``retrieve`` leaves the pins alone (LMCache 0.4.5), every pin of
+        the lookup is still held, so the whole lookup is released.
+        """
+
+        engine = getattr(self, "_engine", None)
+        if engine is None or not self._retrieve_releases_lookup_pins(engine):
+            self._lookup_unpin(req_id)
+            return
+        pins = getattr(engine, "lookup_pins", None)
+        storage_manager = getattr(engine, "storage_manager", None)
+        if not isinstance(pins, dict) or storage_manager is None:
+            self._lookup_unpin(req_id)
+            return
+        mapping = pins.pop(str(req_id), None)
+        if not mapping:
+            return
+        chunk_size = int(self.chunk_size or 256)
+        try:
+            for location, keys in mapping.items():
+                # Keys of one location are the prefix hit in chunk order from
+                # chunk 0 (`batched_contains`). Several locations split that
+                # prefix, so their key index is no longer the chunk index.
+                if len(mapping) == 1:
+                    keys = [
+                        key
+                        for idx, key in enumerate(keys)
+                        if idx * chunk_size >= len(ret_mask)
+                        or not bool(ret_mask[idx * chunk_size])
+                    ]
+                if keys:
+                    storage_manager.batched_unpin(keys, [location])
+        except Exception:  # optional third-party cleanup boundary
+            logger.debug(
+                "LMCache offload: post-retrieve lookup unpin failed for req=%s",
                 req_id,
                 exc_info=True,
             )

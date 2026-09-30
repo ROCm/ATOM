@@ -342,7 +342,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         )
         retrieve_ms = (time.perf_counter() - t_retrieve0) * 1000
         transfer_stats = self._last_gpu_connector_transfer_stats()
-        self._lookup_unpin(req.req_id)
+        self._lookup_unpin_after_retrieve(req.req_id, ret_mask)
         loaded = bool(ret_mask[hbm:lmc].all().item())
         with self._lock:
             if loaded:
