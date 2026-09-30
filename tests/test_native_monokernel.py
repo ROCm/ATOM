@@ -408,13 +408,13 @@ def test_native_decode_flag(monkeypatch):
     ],
 )
 def test_unsupported_glm_forward_falls_back(override):
-    args = dict(
-        model="glm52",
-        mode="auto",
-        samples=4,
-        tp_size=8,
-        kv_cache_dtype="bf16",
-    )
+    args = {
+        "model": "glm52",
+        "mode": "auto",
+        "samples": 4,
+        "tp_size": 8,
+        "kv_cache_dtype": "bf16",
+    }
     args.update(override)
     assert select_backend(**args) is None
 
@@ -591,10 +591,10 @@ def test_glm_announces_samples_once_on_rank_zero(monkeypatch):
 
 
 def test_model_specific_backend_selection():
-    common = dict(samples=8, tp_size=8, kv_cache_dtype="fp8")
+    common = {"samples": 8, "tp_size": 8, "kv_cache_dtype": "fp8"}
     assert select_backend("glm52", "auto", **common) is None
     assert select_backend("glm52", "staged", **common) is None
-    glm_bf16 = dict(samples=8, tp_size=8, kv_cache_dtype="bf16")
+    glm_bf16 = {"samples": 8, "tp_size": 8, "kv_cache_dtype": "bf16"}
     assert select_backend("glm52", "auto", **glm_bf16) == "mono"
     assert select_backend("glm52", "mono", **glm_bf16) == "mono"
     assert select_backend("glm52", "staged", **glm_bf16) is None
@@ -1000,7 +1000,7 @@ def test_glm_graph_warmup_dispatch_counts_padded_rows(monkeypatch):
     runner._lm = SimpleNamespace(
         model=SimpleNamespace(aux_hidden_state_layers=[], layers=[])
     )
-    runner._mono_layers = lambda: []
+    runner._mono_layers = list
     runner._prepare = lambda _samples, _query_length: True
     metadata = SimpleNamespace(
         max_seqlen_q=1,
@@ -1051,7 +1051,7 @@ def test_glm_c8_full_graph_padding_dispatches_q6(monkeypatch):
     runner._lm = SimpleNamespace(
         model=SimpleNamespace(aux_hidden_state_layers=[], layers=[])
     )
-    runner._mono_layers = lambda: []
+    runner._mono_layers = list
     seen = []
     runner._prepare = (
         lambda rows, query_length: seen.append((rows, query_length)) or True

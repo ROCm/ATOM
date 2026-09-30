@@ -53,3 +53,9 @@ atom_model_registry = "atom.plugin.vllm.register:register_model"
 
 [project.entry-points."sglang.srt.plugins"]
 atom_sglang = "atom.plugin.sglang.register:register_plugin"
+
+[tool.ruff.lint.per-file-ignores]
+# FlyDSL consumes these nested functions with its AST rewriter; closure and
+# framework-default lint rewrites change kernel semantics.
+"atom/model_ops/monokernel/*.py" = ["ALL"]
+"atom/model_ops/monokernel/**/*.py" = ["ALL"]
