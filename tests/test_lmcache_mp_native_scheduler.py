@@ -715,7 +715,7 @@ def start_engine_load(engine):
 
 
 def test_engine_allocates_then_parks_and_wakes_at_exact_native_boundary(monkeypatch):
-    engine, connector, adapter = engine_scheduler(monkeypatch)
+    engine, _connector, adapter = engine_scheduler(monkeypatch)
     seq, request = start_engine_load(engine)
     block_table = list(seq.block_table)
     state_slot = seq.state_slot
@@ -755,7 +755,7 @@ def test_engine_allocates_then_parks_and_wakes_at_exact_native_boundary(monkeypa
 def test_engine_aborted_load_keeps_page_units_and_slot_until_terminal(
     monkeypatch, succeeded
 ):
-    engine, connector, _ = engine_scheduler(monkeypatch)
+    engine, _, _ = engine_scheduler(monkeypatch)
     seq, request = start_engine_load(engine)
     block_table = list(seq.block_table)
     state_slot = seq.state_slot
