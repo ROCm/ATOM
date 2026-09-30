@@ -34,7 +34,8 @@ install_native_vllm() {
   uv pip install --python "${venv}/bin/python" \
     setuptools-scm setuptools-rust wheel ninja cmake
   local log="${RUNTIME_LOG_DIR}/native-build-rank-${NODE_RANK}.log"
-  env PYTHONPATH= VLLM_TARGET_DEVICE=rocm PYTORCH_ROCM_ARCH=gfx950 MAX_JOBS=32 \
+  env CCACHE_DIR="${venv}/ccache" CCACHE_TEMPDIR="${venv}/ccache/tmp" \
+    PYTHONPATH= VLLM_TARGET_DEVICE=rocm PYTORCH_ROCM_ARCH=gfx950 MAX_JOBS=32 \
     uv pip install --python "${venv}/bin/python" --no-deps \
       --no-build-isolation "${src}" > "${log}" 2>&1 || {
         tail -100 "${log}"
