@@ -1045,7 +1045,7 @@ models:
   MiniMax-M3-MXFP8-vLLM-Survey:
     backend: vllm
     image: vllm/vllm-openai-rocm:nightly@sha256:659b28319fef4ea0e3d8f33e25b4c35d6f663f5d818a5b2fa06dceaf859234e4
-    model_path: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-MXFP8"
+    model_path: "${ATOMESH_MODEL_ROOT}/MiniMaxAI/MiniMax-M3-MXFP8"
     precision: MXFP8
     env:
       common:

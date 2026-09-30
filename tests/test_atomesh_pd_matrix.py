@@ -618,6 +618,11 @@ class SurveyConfigurationTest(unittest.TestCase):
                         "sha": "b22494cc0cb4bd9db4a62fb107d92429a4a3249d",
                     },
                 )
+                if cell["model"] == "MiniMax-M3-MXFP8-vLLM-Survey":
+                    self.assertEqual(
+                        cell["model_path"],
+                        "/mnt/models/MiniMaxAI/MiniMax-M3-MXFP8",
+                    )
                 self.assertNotIn("fork", cell["vllm"])
                 self.assertNotIn("lmcache", cell["vllm"])
                 self.assertIn("@sha256:659b283", cell["image"])
