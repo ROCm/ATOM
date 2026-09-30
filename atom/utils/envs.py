@@ -53,6 +53,14 @@ def _flag_env(name: str, default: str = "0") -> bool:
     return bool(raw) and raw not in ("0", "false", "no", "off")
 
 
+def _choice_env(name: str, default: str, choices: tuple[str, ...]) -> str:
+    value = os.getenv(name, default).strip().lower()
+    if value not in choices:
+        expected = ", ".join(choices)
+        raise ValueError(f"{name} must be one of {expected}, got {value!r}")
+    return value
+
+
 def _optional_int_env(name: str, *, min_value: int | None = None) -> int | None:
     """Unset or empty reads as None; anything else must be an integer."""
     raw = os.getenv(name)
@@ -362,6 +370,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
+    # GLM-5.2 / Kimi-K3 native TP8 decode MonoKernel. Model construction
+    # resolves off|auto|mono|staged once; unsupported forwards use the baseline.
+    "ATOM_NATIVE_DECODE_MONOKERNEL": lambda: _choice_env(
+        "ATOM_NATIVE_DECODE_MONOKERNEL",
+        "off",
+        ("off", "auto", "mono", "staged"),
+    ),
     # Fused per-layer decode of up to 16 tokens (MiniMax-M3 so far:
     # atom/models/minimax_m3/mono), on by default. Only a configuration the mono
     # path supports is ever routed to it; every other batch keeps the original

@@ -3494,6 +3494,17 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        self._glm52_mono = None
+        if getattr(config, "model_type", None) == "glm_moe_dsa":
+            glm52_mono_mode = envs.ATOM_NATIVE_DECODE_MONOKERNEL
+            if glm52_mono_mode != "off":
+                from atom.models.glm52_mono import Glm52MonoDecode
+
+                self._glm52_mono = Glm52MonoDecode(
+                    self,
+                    atom_config,
+                    glm52_mono_mode,
+                )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
@@ -3505,6 +3516,13 @@ class DeepseekV2ForCausalLM(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        if self._glm52_mono is not None and self._glm52_mono.supports(
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+        ):
+            return self._glm52_mono.forward(input_ids, positions, inputs_embeds)
         # ---- Prefill Context Parallel (PCP) query split ------------------
         # During prefill with pcp_size > 1 the token sequence is round-robin
         # split so each PCP rank runs the whole model (embed / norm / q-proj /
