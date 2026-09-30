@@ -462,6 +462,8 @@ class AsyncIOProcManager:
             queue.Queue() for _ in range(proc_num)
         ]
         self.rpc_output_threads: list[threading.Thread] = []
+        # Every call reads these same per-rank queues; see collective_rpc.
+        self._rpc_lock = threading.Lock()
 
         for i in range(proc_num):
             label = f"ModelRunner{i}/{proc_num}"
@@ -622,8 +624,13 @@ class AsyncIOProcManager:
 
         Unlike :meth:`call_func`, which surfaces only rank 0's return, this
         collects from every rank's own channel, so "all ranks finished" is
-        observable. Unlike :meth:`call_func_with_aggregation`, replies carry a
-        ``request_id``, so more than one call may be outstanding.
+        observable.
+
+        Calls are serialized. Every caller reads the same per-rank channels, so
+        two outstanding at once would each take the other's replies, drop them
+        as stale, and time out. What the ``request_id`` buys here is that a late
+        reply from a call that already gave up is recognised and dropped,
+        rather than taken as the next call's answer.
 
         Always returns ``proc_num`` results in rank order. A rank that died, or
         that did not answer within *timeout*, yields a failed ``RpcResult``
@@ -650,14 +657,17 @@ class AsyncIOProcManager:
         logger.debug(
             f"{self.label}: collective_rpc {func_name} id={payload.request_id}"
         )
-        self.rpc_broadcast_mq.enqueue((func_name, payload))
+        with self._rpc_lock:
+            self.rpc_broadcast_mq.enqueue((func_name, payload))
 
-        deadline = time.monotonic() + timeout
-        results: list[RpcResult] = []
-        for rank, output_queue in enumerate(self.rpc_outputs_queues):
-            results.append(
-                self._await_rank_reply(rank, output_queue, func_name, payload, deadline)
-            )
+            deadline = time.monotonic() + timeout
+            results: list[RpcResult] = []
+            for rank, output_queue in enumerate(self.rpc_outputs_queues):
+                results.append(
+                    self._await_rank_reply(
+                        rank, output_queue, func_name, payload, deadline
+                    )
+                )
         return results
 
     def _await_rank_reply(

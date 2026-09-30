@@ -24,6 +24,11 @@ _ADVERTISED_METHODS = (
     "update_weights",
     "update_weights_from_shm",
     "update_weights_from_ipc",
+    # direct trainer-to-rollout transfer, and the state it leaves behind
+    "init_rdma_weight_group",
+    "receive_weights_rdma",
+    "destroy_rdma_weight_group",
+    "get_weight_update_status",
     # memory lifecycle
     "release_memory",
     "resume_memory",

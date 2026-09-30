@@ -135,6 +135,21 @@ def test_fp8_is_claimed_by_the_weights_not_by_the_helper():
     assert "fp8_weight_update" not in bf16.get_worker_capabilities()["features"]
 
 
+def test_the_rdma_lifecycle_is_advertised_alongside_the_feature():
+    """The feature was reported with none of the methods that drive it, so a
+    caller negotiating by capability could not find how to join, receive or
+    tear down the group."""
+    lifecycle = (
+        "init_rdma_weight_group",
+        "receive_weights_rdma",
+        "destroy_rdma_weight_group",
+        "get_weight_update_status",
+    )
+    report = _Runner(methods=lifecycle, rdma=True).get_worker_capabilities()
+    assert "rdma_weight_receive" in report["features"]
+    assert set(lifecycle) <= set(report["methods"])
+
+
 def test_rdma_is_absent_until_the_receiver_exists():
     """A7 has not landed, so no runner should claim it yet."""
     assert "rdma_weight_receive" not in _Runner().get_worker_capabilities()["features"]

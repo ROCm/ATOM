@@ -352,6 +352,7 @@ def _mgr(proc_num=4, *, procs=None):
     mgr.rpc_broadcast_mq = _Mq()
     mgr.rpc_outputs_queues = [queue.Queue() for _ in range(proc_num)]
     mgr.procs = [_Alive() for _ in range(proc_num)] if procs is None else procs
+    mgr._rpc_lock = threading.Lock()
     return mgr
 
 
@@ -405,6 +406,45 @@ def test_the_reserved_names_track_the_worker_loop():
     """Built from the loop's own KV names, so a new one cannot be missed."""
     assert AsyncIOProc._KV_FUNC_NAMES <= AsyncIOProcManager._RESERVED_RPC_NAMES
     assert {"forward", "exit"} <= AsyncIOProcManager._RESERVED_RPC_NAMES
+
+
+class _AnsweringMq:
+    """Workers that answer every call, in the order they receive it."""
+
+    def __init__(self, mgr):
+        self.mgr = mgr
+
+    def enqueue(self, msg):
+        _, payload = msg
+
+        def answer():
+            time.sleep(0.05)
+            for rank, q in enumerate(self.mgr.rpc_outputs_queues):
+                q.put_nowait(
+                    RpcResult(payload.request_id, rank, value=payload.request_id)
+                )
+
+        threading.Thread(target=answer, daemon=True).start()
+
+
+def test_concurrent_callers_each_get_their_own_replies():
+    """Every caller reads the same per-rank channels, so two outstanding calls
+    took each other's replies, dropped them as stale, and timed out."""
+    mgr = _mgr(2)
+    mgr.rpc_broadcast_mq = _AnsweringMq(mgr)
+    results = {}
+
+    def call(tag):
+        results[tag] = mgr.collective_rpc("m", RpcPayload(request_id=tag), timeout=5)
+
+    callers = [threading.Thread(target=call, args=(tag,)) for tag in "abc"]
+    for caller in callers:
+        caller.start()
+    for caller in callers:
+        caller.join(timeout=30)
+
+    for tag in "abc":
+        assert [r.value for r in results[tag]] == [tag, tag], results[tag]
 
 
 def test_a_generic_call_leaves_the_forward_decoder_alone():
