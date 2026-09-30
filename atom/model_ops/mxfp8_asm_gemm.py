@@ -21,12 +21,19 @@ column-major per_1x128 scale in its first M*K/128 bytes otherwise. Its two
 consumers (attn.wq_b, attn.indexer.wq_b) are flagged together with it.
 """
 
+import os
+
 import torch
 from aiter import QuantType, dtypes
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 # Newer aiter APIs are imported where used, so importing this module (linear.py
 # and layernorm.py do) needs nothing beyond what ATOM already requires.
+
+# Opt-in (default off): Linear layers that --online_quant_config turns into
+# MXFP8 (per_1x32 + fp8) run on the same ASM GEMM at every M. Without it such a
+# layer falls through to the per_1x32 dispatch, which only has FP4 kernels.
+ONLINE_MXFP8_ASM = os.environ.get("ATOM_ONLINE_MXFP8_ASM_GEMM", "0") == "1"
 
 ASM_MIN_M = 512
 WQ_B_SHAPE = (65536, 1536)
@@ -121,6 +128,52 @@ def dsv4_mxfp8_asm_gemm(
         g = k // 128
         x_scale = x_scale.view(-1)[: m * g].view(m, g)
     return gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, weight_scale, dtype)
+
+
+def _online_gemm_fake(
+    x: torch.Tensor,
+    x_scale: torch.Tensor | None,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    return torch.empty(
+        (*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device
+    )
+
+
+@torch_compile_guard(gen_fake=_online_gemm_fake, mutates_args=[])
+def online_mxfp8_asm_gemm(
+    x: torch.Tensor,
+    x_scale: torch.Tensor | None,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """BF16 x against an online MXFP8 weight (16x16-preshuffled, ASM B-scale).
+
+    The ASM kernel is correct at every M (small M only picks a smaller default
+    kernel), so unlike the DSV4 path there is no blockscale fallback -- the
+    online weight has no 128x128 scale to fall back on.
+    """
+    from aiter.ops.gemm_op_a8w8 import gemm_a8w8_mxfp8
+    from aiter.ops.quant import per_group_quant_hip
+
+    if x_scale is not None:
+        raise ValueError(
+            "online MXFP8 GEMM takes BF16 activations; an upstream fused quant "
+            "emits a scale layout the ASM kernel cannot read"
+        )
+    k = x.shape[-1]
+    xq, xs = per_group_quant_hip(
+        x.reshape(-1, k).contiguous(),
+        quant_dtype=dtypes.fp8,
+        group_size=32,
+        scale_type=dtypes.fp8_e8m0,
+        scale_layout_m32k4=True,
+    )
+    y = gemm_a8w8_mxfp8(xq, weight, xs, weight_scale, dtype=dtype, a_preshuffle=False)
+    return y.view(*x.shape[:-1], weight.shape[0])
 
 
 def _linear_ok(layer, shape: tuple[int, int]) -> bool:

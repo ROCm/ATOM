@@ -28,7 +28,12 @@ from torch import nn
 
 from atom.config import QuantizationConfig, get_current_atom_config
 from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
-from atom.model_ops.mxfp8_asm_gemm import asm_weight_scale, dsv4_mxfp8_asm_gemm
+from atom.model_ops.mxfp8_asm_gemm import (
+    ONLINE_MXFP8_ASM,
+    asm_weight_scale,
+    dsv4_mxfp8_asm_gemm,
+    online_mxfp8_asm_gemm,
+)
 from atom.model_ops.utils import (
     atom_parameter,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -751,6 +756,7 @@ class LinearBase(nn.Module):
         self.quant_func = get_hip_quant(self.quant_type)
         self.is_output_padded = False
         self._mxfp8_asm = False  # set by mxfp8_asm_gemm.setup
+        self._online_mxfp8_asm = False  # set by _setup_online_mxfp8_asm
 
     @property
     def weight_scale_row_group(self) -> int:
@@ -1099,6 +1105,9 @@ class LinearBase(nn.Module):
         # Re-quantize before process_weights if online quantization is enabled
         if self.quant_config is not None and self.quant_config.online_quant:
             self.online_quantize_weight()
+            if self._online_mxfp8_asm_eligible():
+                self._setup_online_mxfp8_asm()
+                return
         if self.params_dtype == NVFP4_DTYPE:
             raise RuntimeError(
                 f"{self.prefix}: NVFP4 weights were not converted to MXFP4 by "
@@ -1190,6 +1199,36 @@ class LinearBase(nn.Module):
             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         if getattr(self, "_mxfp8_asm", False):
             self.set_mxfp8_asm_weight_scale()
+
+    def _online_mxfp8_asm_eligible(self) -> bool:
+        """An online MXFP8 target that gemm_a8w8_mxfp8 can take (N%16, K%128)."""
+        return (
+            ONLINE_MXFP8_ASM
+            and self.quant_type.value == QuantType.per_1x32.value
+            and self.params_dtype == dtypes.fp8
+            and self.weight.dim() == 2
+            and self.weight.shape[0] % 16 == 0
+            and self.weight.shape[1] % 128 == 0
+        )
+
+    def _setup_online_mxfp8_asm(self) -> None:
+        """Lay out an online MXFP8 weight for gemm_a8w8_mxfp8, once.
+
+        The per_1x32 tail of process_weights_after_loading is written for FP4
+        (output padding and the a4w4 e8m0_shuffle), so this layer skips it: the
+        weight takes the same 16x16 preshuffle the DSV4 MXFP8 ASM path feeds the
+        kernel, and quant_weight_online's row-major [N, K/32] e8m0 scale becomes
+        the ASM B-scale.
+        """
+        from aiter.ops.shuffle import shuffle_mxfp8fp4_scale
+
+        n, k = self.weight.shape
+        scale = self.weight_scale.data.view(torch.uint8).reshape(n, k // 32)
+        shuffle_weights(self.weight)
+        self.weight_scale.data = shuffle_mxfp8fp4_scale(scale.contiguous()).view(
+            dtypes.fp8_e8m0
+        )
+        self._online_mxfp8_asm = True
 
     def set_mxfp8_asm_weight_scale(self) -> None:
         """(Re)build the ASM B-scale from weight_scale, in place once it exists."""
@@ -1292,6 +1331,10 @@ class LinearBase(nn.Module):
             y = dsv4_mxfp8_asm_gemm(
                 x, x_scale, self.weight, self.weight_scale, self.weight_scale_asm, otype
             )
+        elif self._online_mxfp8_asm:  # see atom/model_ops/mxfp8_asm_gemm.py
+            y = online_mxfp8_asm_gemm(x, x_scale, self.weight, self.weight_scale, otype)
+            if self.bias is not None:
+                y += self.bias
         elif self.native_a8_group_rows is not None:
             from atom.model_ops.blockscale import native_quant_linear
 

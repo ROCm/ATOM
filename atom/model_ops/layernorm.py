@@ -24,7 +24,7 @@ from torch import Tensor, nn
 from torch.overrides import handle_torch_function, has_torch_function_unary
 
 from atom.config import QuantizationConfig
-from atom.model_ops.mxfp8_asm_gemm import dsv4_mxfp8_asm_rms_quant
+from atom.model_ops.mxfp8_asm_gemm import ONLINE_MXFP8_ASM, dsv4_mxfp8_asm_rms_quant
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.utils import envs
@@ -346,6 +346,10 @@ class RMSNorm(nn.Module):
         online_quant_type = online_cfg.quant_type
         # Skip if excluded (No) or already emitting the target scheme.
         if should_skip_online_quant(self.quant_type, self.params_dtype, online_cfg):
+            return
+        # An online MXFP8 consumer on the ASM GEMM quantizes its own BF16 input:
+        # the scale emitted here is row-major, not the ASM A-scale layout.
+        if ONLINE_MXFP8_ASM and _is_mxfp8(online_quant_type.value, online_cfg.quant_dtype):
             return
         # The fused RMSNorm+quant HIP kernel only emits these activation schemes.
         assert online_quant_type.value in _AITER_RMS_QUANT_TYPE_VALUES, (
