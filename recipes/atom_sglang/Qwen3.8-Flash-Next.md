@@ -97,8 +97,9 @@ validated with.
 ## MI308X-specific pieces in ATOM
 
 * AITER tuned GEMM tables for this model's FP8 (a8w8 bpreshuffle) and BF16
-  shapes ship in `atom/model_ops/qwen4_exp/configs/` and are registered
-  automatically.
+  shapes ship with AITER (`aiter/configs/model_configs/qwen38_flash_next_*`,
+  [ROCm/aiter#5974](https://github.com/ROCm/aiter/pull/5974)); older AITER
+  builds run these shapes on default kernels.
 * The SGLang plugin advertises the native GPU arch to AITER. The images export
   `GPU_ARCH_LIST=gfx942;gfx950`; forwarded unchanged, AITER's `get_gfx()`
   reported gfx950 on MI308X and every gfx-keyed tuned table missed.

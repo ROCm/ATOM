@@ -29,7 +29,6 @@ from atom.model_ops.qwen4_exp.ple_layer import Qwen4ExpPLELayer
 from atom.model_ops.qwen4_exp.qsa_attention import (
     Qwen4ExpAttention,
 )
-from atom.model_ops.qwen4_exp.tuned_configs import register_qwen4_exp_tuned_configs
 from atom.model_ops.topK import (
     is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
 )
@@ -938,7 +937,6 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         if atom_config.hf_config.output_gate_type != "sigmoid":
             raise ValueError("Qwen3.8-Flash-Next requires output_gate_type=sigmoid")
         Qwen4ExpBackend.validate_config(atom_config)
-        register_qwen4_exp_tuned_configs()
         config = atom_config.hf_config
         self.config = config
         self.extra_output_dims = (

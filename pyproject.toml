@@ -40,7 +40,6 @@ include-package-data = true
 atom = [
     "mesh/target/release/libmesh.so",
     "benchmarks/results/schemas/*.json",
-    "model_ops/qwen4_exp/configs/*.csv",
 ]
 
 [project.entry-points."vllm.platform_plugins"]
