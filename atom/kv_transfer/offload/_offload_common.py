@@ -1077,6 +1077,18 @@ class OffloadSchedulerMixin(ABC):
         need: int,
         chunk: int,
     ) -> None:
+        # Remembered for one reader: the vLLM plugin connector, which on that
+        # path may already have parked this request and now has to withdraw
+        # the promise. The reason is the difference between "the tier lost the
+        # prefix" and "the recurrent state was evicted", and the line that
+        # reports the withdrawal is the only place it is ever seen -- this one
+        # is debug, and the runs that need the answer are not run at debug.
+        skips = getattr(self, "_last_load_skip", None)
+        if skips is None:
+            skips = self._last_load_skip = {}
+        if len(skips) > 1024:
+            skips.clear()
+        skips[str(seq.id)] = reason
         seq.offload_loaded_tokens = hbm
         min_load = int(getattr(self, "_min_load_tokens", 8192))
         logger.debug(
@@ -1089,6 +1101,12 @@ class OffloadSchedulerMixin(ABC):
             min_load,
             chunk,
             reason,
+        )
+
+    def last_load_skip_reason(self, req_id) -> str:
+        """Why this request's load was last declined, or ``"unknown"``."""
+        return (getattr(self, "_last_load_skip", None) or {}).get(
+            str(req_id), "unknown"
         )
 
     def should_park_for_load_after_alloc(self, seq) -> bool:

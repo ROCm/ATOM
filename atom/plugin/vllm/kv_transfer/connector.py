@@ -93,6 +93,7 @@ class AtomOffloadMetadata(KVConnectorMetadata):
         release_req_ids=(),
         kda_stores=(),
         kda_loads=(),
+        abandoned_loads=(),
     ) -> None:
         super().__init__()
         self.inner = inner
@@ -109,6 +110,13 @@ class AtomOffloadMetadata(KVConnectorMetadata):
         # single-group model, which is every model but K3 today.
         self.kda_stores = list(kda_stores)
         self.kda_loads = list(kda_loads)
+        # ``(req_id, block_ids)`` for requests this connector parked in
+        # WAITING_FOR_REMOTE_KVS and then never issued a load for. Only the
+        # worker half can release a parked request, so the scheduler half's
+        # only way out is to ask it to report the load as failed. The block
+        # ids are the ones the promise reserved and nothing filled; without
+        # them vLLM takes the release at face value and serves them as KV.
+        self.abandoned_loads = list(abandoned_loads)
 
 
 class AtomOffloadWorkerMetadata(KVConnectorWorkerMetadata):
@@ -271,6 +279,10 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self._kda_dense_done: set[str] = set()
         self._kda_results: dict[str, Any] = {}
         self._kda_error_blocks: set[int] = set()
+        # Promises the scheduler half withdrew. Held here until the next
+        # `get_finished`, which is the only hook that can release a park.
+        self._abandoned_loads: set[str] = set()
+        self._abandoned_error_blocks: set[int] = set()
         self._worker_state_stored: dict[int, int] = {}
         self._worker_state_store_failed: dict[int, int] = {}
         self._worker_state_load_failed: dict[str, int] = {}
@@ -996,6 +1008,11 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # including the zero-token steps the engine is only turning the crank
         # for in order to deliver exactly these reports.
         self._pending_release_ids.extend(getattr(metadata, "release_req_ids", ()) or ())
+        for req_id, block_ids in getattr(metadata, "abandoned_loads", ()) or ():
+            # The scheduler half parked this request and then found it had no
+            # load to issue. Only this half can release it.
+            self._abandoned_loads.add(str(req_id))
+            self._abandoned_error_blocks.update(int(b) for b in block_ids)
 
     def handle_preemptions(self, kv_connector_metadata) -> None:
         """Fence transfers still reading the blocks of a just-preempted request.
@@ -1079,6 +1096,12 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
         finished_recving = {_req_id_of(c) for c in out.finished_loading}
         failed = {_req_id_of(c) for c in out.failed_loading}
+        if self._abandoned_loads:
+            # Not a transfer failure -- no transfer was ever started -- but the
+            # same two things have to happen: release the park and truncate to
+            # what HBM really holds. `failed_loading` is that pair.
+            failed |= self._abandoned_loads
+            self._abandoned_loads = set()
         if failed:
             logger.warning(
                 "ATOM LMCache offload: load failed for %s; recomputing", sorted(failed)
@@ -1125,6 +1148,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if self._kda_error_blocks:
             blocks = set(blocks) | self._kda_error_blocks
             self._kda_error_blocks = set()
+        if self._abandoned_error_blocks:
+            blocks = set(blocks) | self._abandoned_error_blocks
+            self._abandoned_error_blocks = set()
         return blocks
 
     def build_connector_worker_meta(self) -> AtomOffloadWorkerMetadata | None:
@@ -1261,7 +1287,14 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             return 0, False
         if not self._scheduler.should_park_for_load_after_alloc(seq):
             return 0, False
-        self._promised_loads[request.request_id] = 0
+        # [steps_undispatched, first_token_of_promise, tokens_promised].
+        # The range is kept because a promise that is never honoured has to be
+        # withdrawn, and withdrawing it means naming the blocks it reserved.
+        self._promised_loads[request.request_id] = [
+            0,
+            int(num_computed_tokens),
+            int(need),
+        ]
         return need, True
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int):
@@ -1364,7 +1397,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 covered = len(seq.block_table) * block_size
                 seq.set_num_cached_tokens(min(int(num_tokens), covered))
         inner = self._scheduler.build_connector_meta()
-        self._check_promised_loads(inner)
+        abandoned_loads = self._check_promised_loads(inner)
         # Before `_collect_releases`, so a save abandoned on this step turns
         # into a release on this step rather than on the next one.
         self._reconcile_stale_saves()
@@ -1378,6 +1411,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             self._collect_releases(),
             kda_stores,
             kda_loads,
+            abandoned_loads,
         )
 
     def _collect_kda_stores(self, scheduler_output, preempted, frontiers) -> list:
@@ -1417,6 +1451,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # backend's own reconciliation hangs off `process_completions`, which
         # only ATOM's native engine calls.
         self._scheduler.reconcile_recurrent_rides()
+        self._scheduler.log_save_lease_stats()
         return stores
 
     def _handle_preempted(self, scheduler_output) -> list[str]:
@@ -1607,34 +1642,77 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     # produce noise.
     _PROMISE_GRACE_STEPS = 50
 
-    def _check_promised_loads(self, inner) -> None:
-        """Name any request parked on a load that was never dispatched.
+    def _check_promised_loads(self, inner) -> list[tuple[str, list[int]]]:
+        """Withdraw any promise this step did not turn into a dispatched load.
 
-        Nothing here can rescue it: vLLM releases a parked request only when the
-        worker reports the id in `finished_recving`, and the scheduler half
-        cannot inject that. The promise is gated on ATOM's own park decision, so
-        this should stay empty -- but when it does not, the symptom is an engine
-        spinning in `schedule()` with every GPU idle and no log line at all,
-        which costs hours to trace back. One line here names the request.
+        The scheduler half cannot inject `finished_recving`, so what it returns
+        here is a request for the worker half to report the load as failed --
+        which releases the park and, because the reserved blocks travel with
+        it, truncates the request back to what is really in HBM.
+
+        This exists because the park decision and the dispatch decision are
+        taken at different points and do not ask the same question. Parking
+        happens in `get_num_new_matched_tokens`, before `allocate_slots`;
+        `build_connector_meta` then declines a load on conditions the park gate
+        never evaluated -- a lookup pin the tier has since lost, or (hybrid
+        models only) a recurrent boundary state that was evicted between the
+        lookup and the dispatch. ATOM's own engine parks a sequence only when
+        it registers the load operation, so there the decline is genuinely
+        before the park and those paths are safe; on this path they are not.
+
+        Settlement is on a load actually being dispatched, not on the request
+        appearing in `inner.requests`: a save for the same request rides the
+        same list, and treating that as the load landing is what let this go
+        unseen. A dispatched load carries a `load_operation`/`load_spec`.
         """
         if not self._promised_loads:
-            return
+            return []
         for meta in getattr(inner, "requests", ()) or ():
+            if (
+                getattr(meta, "load_operation", None) is None
+                and getattr(meta, "load_spec", None) is None
+            ):
+                continue
             self._promised_loads.pop(str(getattr(meta, "req_id", meta)), None)
-        stuck = []
+        withdrawn: list[tuple[str, list[int]]] = []
         for req_id in list(self._promised_loads):
-            self._promised_loads[req_id] += 1
-            if self._promised_loads[req_id] > self._PROMISE_GRACE_STEPS:
-                stuck.append(req_id)
-                del self._promised_loads[req_id]
-        if stuck:
+            state = self._promised_loads[req_id]
+            state[0] += 1
+            if state[0] <= self._PROMISE_GRACE_STEPS:
+                continue
+            _, start, need = self._promised_loads.pop(req_id)
+            withdrawn.append((req_id, self._promised_block_ids(req_id, start, need)))
+        if withdrawn:
             logger.error(
                 "ATOM LMCache offload: promised a load for %s but none was "
-                "dispatched within %d steps; those requests are parked in "
-                "WAITING_FOR_REMOTE_KVS and cannot be released",
-                sorted(stuck),
+                "dispatched within %d steps; withdrawing the promise so the "
+                "request leaves WAITING_FOR_REMOTE_KVS and recomputes",
+                sorted(
+                    f"{r}({self._scheduler.last_load_skip_reason(r)})"
+                    for r, _ in withdrawn
+                ),
                 self._PROMISE_GRACE_STEPS,
             )
+        return withdrawn
+
+    def _promised_block_ids(self, req_id: str, start: int, need: int) -> list[int]:
+        """The blocks a withdrawn promise reserved and nothing wrote.
+
+        An empty list is not a safe default here -- vLLM would then cache the
+        whole external prefix as though it had arrived -- but it is the only
+        honest answer when the SeqView is already gone, and the release still
+        beats a permanent park.
+        """
+        seq = self._seqs.get(req_id)
+        if seq is None:
+            return []
+        block_size = int(self._config.kv_cache_block_size)
+        if block_size <= 0:
+            return []
+        table = list(seq.block_table)
+        first = int(start) // block_size
+        last = -(-(int(start) + int(need)) // block_size)
+        return [b for b in table[first:last]]
 
     def update_connector_output(self, connector_output) -> None:
         """Feed the worker's completions back into ATOM's scheduler state.
