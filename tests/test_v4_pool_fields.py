@@ -22,7 +22,8 @@ from atom.model_ops.attentions.pool_layout.entry_arena import entry_bytes_for
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     CSA_INDEXER_DATA,
     CSA_INDEXER_SCALE,
-    FP4_GFX950_PRESHUFFLE,
+    FP4_GFX950_FLYDSL,
+    FP4_GFX950_OPUS,
     FP4_GFX1250_NATURAL,
     MAIN_KV_NOPE,
     MAIN_KV_ROPE,
@@ -114,8 +115,31 @@ class TestIndexerBlockRegions:
         assert data.dtype is scale.dtype is torch.uint8
 
     def test_fp4_layout_is_architecture_specific(self):
-        assert fp4_indexer_layout_for_arch("gfx950") == FP4_GFX950_PRESHUFFLE
+        assert fp4_indexer_layout_for_arch("gfx950") == FP4_GFX950_OPUS
+        assert fp4_indexer_layout_for_arch("gfx950", "flydsl") == FP4_GFX950_FLYDSL
         assert fp4_indexer_layout_for_arch("gfx1250") == FP4_GFX1250_NATURAL
+
+    def test_gfx950_opus_pool_and_backend_validation(self, monkeypatch):
+        from atom.utils import envs
+
+        monkeypatch.delenv("ATOM_V4_UNIFIED_MQA", raising=False)
+        assert envs.ATOM_V4_UNIFIED_MQA == "opus"
+        monkeypatch.setenv("ATOM_V4_UNIFIED_MQA", "flydsl")
+        assert (
+            fp4_indexer_layout_for_arch("gfx950", envs.ATOM_V4_UNIFIED_MQA)
+            == FP4_GFX950_FLYDSL
+        )
+        data, scale = fp4_indexer_block_fields(64, 128, FP4_GFX950_OPUS)
+        assert data.shape == (4, 64, 16)
+        assert scale.shape == (2, 32, 4)
+        assert data.bytes_per_entry == 4096
+        assert scale.bytes_per_entry == 256
+        with pytest.raises(ValueError, match="page=64"):
+            fp4_indexer_block_fields(32, 128, FP4_GFX950_OPUS)
+        with pytest.raises(ValueError, match="ATOM_V4_UNIFIED_MQA"):
+            fp4_indexer_layout_for_arch("gfx950", "typo")
+        with pytest.raises(ValueError, match="gfx1250"):
+            fp4_indexer_layout_for_arch("gfx1250", "flydsl")
 
     def test_regions_are_a_prefix_sum_with_nothing_between_them(self):
         fields = fp8_indexer_block_fields(64, 128, torch.uint8)
