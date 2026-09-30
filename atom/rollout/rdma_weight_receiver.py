@@ -143,8 +143,22 @@ def receive_weight_stream(
     failure: Exception | None = None
     drained = 0
 
-    runner.begin_weight_update(expected_version)
     try:
+        try:
+            runner.begin_weight_update(expected_version)
+        except Exception as exc:  # noqa: BLE001 - raised at the end marker
+            # Refused before anything was written -- a replayed or older
+            # version, or a reload already open. Received all the same, or the
+            # trainer and every other rank wait in the next broadcast; and
+            # fenced like any failure, since this rank cannot tell whether its
+            # peers took the stream.
+            failure = exc
+            logger.error(
+                "RDMA weight stream v%d refused on this rank, receiving it "
+                "before reporting that: %s",
+                expected_version,
+                exc,
+            )
         while True:
             command, metadata_bytes, payload_bytes, version = _recv_header(
                 group, device=device
@@ -158,6 +172,13 @@ def receive_weight_stream(
                     f"got {version}"
                 )
             if command == _CMD_END:
+                # The contract is [END, 0, 0, version]. Anything else is a
+                # corrupt stream or a mismatched sender, not a clean finish.
+                if failure is None and (metadata_bytes != 0 or payload_bytes != 0):
+                    failure = RuntimeError(
+                        f"invalid RDMA end marker: metadata_bytes={metadata_bytes} "
+                        f"payload_bytes={payload_bytes}, both must be 0"
+                    )
                 break
             if command != _CMD_BUCKET or metadata_bytes <= 0 or payload_bytes <= 0:
                 # Unlike a bad bucket, this cannot be drained: without sizes
@@ -246,8 +267,8 @@ class RDMAWeightReceiverMixin:
 
         Rank 0 is the trainer, so every worker sits at ``base_rank`` or above.
         The caller assigns one ``base_rank`` per replica; this rank's offset
-        within the replica accounts for both TP and any local DP, because a
-        replica running DP internally contributes more than ``tp_size`` ranks.
+        within the replica accounts for any local DP, because a replica running
+        DP internally contributes one engine's worth of ranks per DP rank.
         """
         # Vendored, so a container with ATOM but no RL framework still works.
         from atom.utils.independent_process_group import (
@@ -268,16 +289,24 @@ class RDMAWeightReceiverMixin:
             )
             return True
 
-        parallel = getattr(getattr(self, "config", None), "parallel_config", None)
+        config = getattr(self, "config", None)
+        parallel = getattr(config, "parallel_config", None)
         dp_rank_local = int(getattr(parallel, "data_parallel_rank_local", 0) or 0)
-        tp_size = int(getattr(self, "world_size", 1) or 1)
-        rank = int(base_rank) + dp_rank_local * tp_size + int(self.rank)
+        # The engine's own stride, which ModelRunner places devices by: one
+        # worker per TP shard that has a process, per prefill-context rank. The
+        # logical TP width over-counts under simulated TP and under-counts under
+        # PCP, where one DP replica then takes another's ranks.
+        workers = int(getattr(config, "tp_world_size", 1) or 1) * int(
+            getattr(config, "prefill_context_parallel_size", 1) or 1
+        )
+        rank = int(base_rank) + dp_rank_local * workers + int(self.rank)
 
         if rank <= 0 or rank >= int(world_size):
             raise ValueError(
                 f"invalid RDMA rank {rank} for world_size={world_size} "
                 f"(base_rank={base_rank}, dp_local={dp_rank_local}, "
-                f"tp_rank={self.rank}, tp_size={tp_size}); rank 0 is the trainer"
+                f"worker={self.rank}, workers_per_engine={workers}); "
+                f"rank 0 is the trainer"
             )
 
         groups[group_name] = init_independent_process_group(

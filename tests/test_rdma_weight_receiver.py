@@ -235,13 +235,16 @@ def _frames(buckets, version=1):
 class _Runner:
     """The transaction surface ``receive_weight_stream`` drives."""
 
-    def __init__(self, fail_on_bucket=None):
+    def __init__(self, fail_on_bucket=None, refuse_begin=False):
         self.events = []
         self.fail_on_bucket = fail_on_bucket
+        self.refuse_begin = refuse_begin
         self.applied = 0
 
     def begin_weight_update(self, version):
         self.events.append("begin")
+        if self.refuse_begin:
+            raise RuntimeError(f"weight update version must increase, got {version}")
 
     def apply_weight_bucket(self, weights, payload_bytes=0):
         self.applied += 1
@@ -321,6 +324,88 @@ def test_a_header_without_sizes_cannot_be_drained(monkeypatch):
     with pytest.raises(RuntimeError, match="invalid RDMA weight header"):
         _receive(monkeypatch, trainer, runner)
     assert runner.events[-1].startswith("abort")
+
+
+def test_a_refused_begin_still_receives_the_stream(monkeypatch):
+    """begin refused a replayed version before the loop was entered, so this
+    rank left while the trainer and every other rank sat in the next
+    broadcast."""
+    trainer = _Trainer(_frames(_three_buckets()))
+    runner = _Runner(refuse_begin=True)
+
+    with pytest.raises(RuntimeError, match="must increase"):
+        _receive(monkeypatch, trainer, runner)
+
+    assert trainer.frames == [], "every remaining broadcast must still be joined"
+    assert not [e for e in runner.events if e.startswith("apply")]
+    assert runner.events[-1].startswith("abort")
+
+
+def test_an_end_marker_carrying_sizes_is_not_a_clean_finish(monkeypatch):
+    """The contract is [END, 0, 0, version]; one with sizes was taken as a
+    successful end and committed."""
+    import torch
+
+    frames = _frames(_three_buckets())
+    frames[-1] = torch.tensor([_CMD_END, 5, 7, 1], dtype=torch.int64)
+    trainer = _Trainer(frames)
+    runner = _Runner()
+
+    with pytest.raises(RuntimeError, match="end marker"):
+        _receive(monkeypatch, trainer, runner)
+
+    assert "commit" not in runner.events
+    assert runner.events[-1].startswith("abort")
+
+
+class _Worker(receiver.RDMAWeightReceiverMixin):
+    """One engine worker, as init_rdma_weight_group sees it."""
+
+    def __init__(self, rank, dp_local, *, tp, tp_world, pcp):
+        self.rank = rank
+        self.world_size = tp  # the logical TP width, as on ModelRunner
+        self.label = f"worker{rank}"
+        self.config = SimpleNamespace(
+            tensor_parallel_size=tp,
+            tp_world_size=tp_world,
+            prefill_context_parallel_size=pcp,
+            parallel_config=SimpleNamespace(data_parallel_rank_local=dp_local),
+        )
+
+
+@pytest.mark.parametrize(
+    ("tp", "tp_world", "pcp"),
+    [(2, 2, 2), (4, 2, 1)],
+    ids=["prefill-context-parallel", "simulated-tp"],
+)
+def test_every_worker_of_every_dp_engine_gets_its_own_rank(
+    monkeypatch, tp, tp_world, pcp
+):
+    """The stride was the logical TP width, but an engine runs tp_world x pcp
+    workers: under PCP one DP engine's workers took the next one's ranks, and
+    under simulated TP ranks went unclaimed."""
+    import atom.utils.independent_process_group as ipg
+
+    joined = []
+    monkeypatch.setattr(
+        ipg,
+        "init_independent_process_group",
+        lambda **kw: joined.append(kw["rank"]) or object(),
+    )
+    dp, workers = 2, tp_world * pcp
+    for dp_local in range(dp):
+        for rank in range(workers):
+            _Worker(
+                rank, dp_local, tp=tp, tp_world=tp_world, pcp=pcp
+            ).init_rdma_weight_group(
+                "127.0.0.1",
+                29500,
+                base_rank=1,
+                world_size=1 + dp * workers,
+                group_name="g",
+            )
+
+    assert sorted(joined) == list(range(1, 1 + dp * workers))
 
 
 def test_the_receiver_reads_the_header_in_the_documented_order(monkeypatch):
