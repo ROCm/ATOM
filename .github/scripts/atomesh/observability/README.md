@@ -218,3 +218,125 @@ Each panel can also supply `instances: {"host:port": {"series": ..., ...}}` with
 the same series/count fields. `meta.instances` lists configured role/instance
 pairs, including unavailable services. Optional `category` and `overview` fields
 control the focus filters.
+
+## GPU hardware telemetry
+
+Agentic benchmarks start one independent `hardware_exporter.py` process on each
+GPU node. It reads AMD `amdgpu` sysfs sensors without importing ATOM or launching
+`rocm-smi` on every sample. The exporter listens on the node's configured IP at
+port 29108 plus `ATOMESH_SERVICE_PORT_OFFSET`; the service exits with the node's
+server script. Eval-only phases do not start it.
+
+Before each worker starts, a short registration process uses that worker's HIP
+runtime and visibility environment to resolve the first TP-size logical devices
+to PCI addresses. Registration JSON is saved beside the node's runtime logs.
+This avoids assuming that HIP, ROCm SMI and DRM card indices match. Multiple
+workers sharing a physical PCI device are deduplicated; a GPU shared by Prefill
+and Decode is labelled `decode+prefill`. Mapping failures are logged and recorded
+as incomplete telemetry, never replaced with a guessed device list. HIP is only
+loaded by registration, not by the long-lived sampler.
+
+Settings (in the node service environment):
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ATOMESH_HARDWARE_METRICS` | `true` | Set `false` to disable hardware telemetry |
+| `ATOMESH_HARDWARE_PORT` | `29108` | Base exporter port, before service offset |
+| `ATOMESH_HARDWARE_INTERVAL_SECONDS` | `1` | Sampling and hardware scrape interval; `0.1` enables diagnostic sampling |
+
+Hardware has its own Prometheus scrape interval. Increasing hardware sampling
+frequency does not increase ATOM/Mesh scrape frequency. Verify that the exporter
+port is reachable from the benchmark node. The service is intended for the CI
+node network; it has no authentication and defaults to loopback when run manually.
+
+To run it independently for specific physical GPUs:
+
+```bash
+python .github/scripts/atomesh/observability/hardware_exporter.py \
+  --pci-role 0000:05:00.0=prefill \
+  --pci-role 0000:15:00.0=decode \
+  --host 127.0.0.1 --port 9108 --sample-interval-seconds 1
+```
+
+`--all-devices` explicitly selects every AMD GPU on the host. CI instead uses
+`--registration-dir`, which can be populated manually using the worker's actual
+visibility environment:
+
+```bash
+HIP_VISIBLE_DEVICES=0,1 python .github/scripts/atomesh/observability/hardware_exporter.py \
+  --register /tmp/atom-hardware/prefill.json --role prefill --device-count 2
+python .github/scripts/atomesh/observability/hardware_exporter.py \
+  --registration-dir /tmp/atom-hardware --port 9108
+```
+
+Use a fresh registration directory for each run. Container deployments need
+read access to the host's AMD sysfs and HIP access for registration. Add the
+exporter to the existing collector using repeatable `--hardware host:port`
+arguments and, optionally, `--hardware-scrape-interval-seconds 0.1` before `--`.
+CI constructs these targets from the distinct Prefill/Decode node IPs.
+
+### Exported metrics
+
+Each GPU series has `hostname`, `pci_bdf`, `card`, and `gpu_role` labels. PCI
+addresses identify physical devices; card names are descriptive only. All
+sensor metrics are gauges.
+
+| Metric | Unit / meaning |
+| --- | --- |
+| `atom_gpu_sclk_mhz`, `atom_gpu_mclk_mhz` | Core and memory clock, MHz; sensor labels determine the mapping |
+| `atom_gpu_junction_celsius`, `atom_gpu_memory_celsius` | GPU hotspot and HBM temperature, Celsius |
+| `atom_gpu_power_watts`, `atom_gpu_power_cap_watts` | Reported GPU power and configured power limit, W |
+| `atom_gpu_busy_percent`, `atom_gpu_memory_busy_percent` | GPU and memory activity, percent |
+| `atom_gpu_vram_used_bytes`, `atom_gpu_vram_total_bytes` | VRAM allocation and capacity, bytes; displayed as GiB |
+| `atom_gpu_info` | Selected GPU identity, including devices whose sensors cannot be read |
+| `atom_gpu_sensor_available{sensor="..."}` | 1 when the current read is valid; 0 when missing, unsupported, or invalid |
+
+Node gauges expose selected device count, registration error count, sample
+interval, last successful sample timestamp, and sampling duration. Missing sensor
+values are omitted, not zero-filled or carried forward. `/metrics` and `/health`
+return 503 if the sampler has stopped updating. Memory busy is not a measurement
+of HBM bandwidth utilization. Lower clocks alone do not establish thermal or
+power throttling. Throttle reasons, XGMI/PCIe traffic and ECC/RAS are not collected
+in this first version.
+
+### Hardware report semantics
+
+The Hardware category provides a GPU picker labelled by host, PCI address and
+role. Each metric has a per-GPU full-invocation summary (mean, min, max, P5, P95,
+valid samples and estimated scrape coverage), plus min/mean/max curves. All-GPU
+curves pool available samples; they are not sums and can hide missing devices,
+so inspect per-GPU coverage and curves when comparing machines.
+
+The collector retrieves original Prometheus scrape samples with their timestamps,
+then bins them at the report's five-second display step. This retains peaks
+observed between display points and leaves empty bins as gaps. Tables and CSV
+also include valid sample counts per bin. P5/P95 are empirical percentiles over
+scraped values, not latency histogram estimates. Summary tables always describe
+the full invocation, even when the plot is zoomed or filtered. Coverage is the
+valid sample count divided by the expected count at the configured scrape
+interval, capped at 100%; it does not measure hardware sensor refresh frequency.
+Scrapes can observe the same sampler snapshot more than once.
+
+Hardware data covers `(benchmark_start, benchmark_end]`, including AIPerf warmup
+and drain, excluding the collector's extra final-scrape tail. Formal measurement
+phase boundaries are not currently available here. Power summaries include
+trapezoidal energy estimates in joules and integrated seconds, skipping gaps
+longer than 1.5 scrape intervals; no extrapolation is made to run boundaries.
+Energy is per physical GPU and should not be summed twice for shared workers.
+
+`hardware-samples.json` archives original scrape vectors alongside
+`report-data.json`, `report.html`, `prometheus.yml` and collection diagnostics.
+The existing artifact staging includes this JSON automatically. Re-render an
+archived report with the existing `--input-json` interface. Hardware failures
+mark collection partial and retain the benchmark exit code; hardware target
+readiness does not block the inference target readiness checks.
+
+Tests without GPU dependencies:
+
+```bash
+python -m pytest --noconftest tests/test_hardware_exporter.py tests/test_ci_latency_reports.py
+```
+
+Set `ATOMESH_TEST_PROMETHEUS_BIN` to an installed Prometheus executable to also
+run the end-to-end tests. The tests require pytest, numpy, prometheus_client and
+permission to bind loopback sockets; they do not load a model or submit CI jobs.
