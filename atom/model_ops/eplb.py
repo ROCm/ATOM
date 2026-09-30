@@ -145,37 +145,132 @@ def _build_logical_to_physical_map(
     physical_to_logical: torch.Tensor,
     physical_rank: torch.Tensor,
     logcnt: torch.Tensor,
+    *,
+    old_p2l: torch.Tensor | None = None,
+    num_gpus: int | None = None,
 ) -> torch.Tensor:
-    """Build padded logical_to_physical map from p2l + rank + logcnt."""
+    """Build the padded logical_to_physical map from p2l + rank + logcnt.
+
+    With `old_p2l`, the placement is first settled in place against it (see
+    `_keep_slots_stable`) and l2p is derived from the settled maps, so the two
+    cannot drift apart.
+    """
+    if old_p2l is not None:
+        assert num_gpus is not None, "num_gpus is required to keep slots stable"
+        settled, settled_rank = _keep_slots_stable(
+            physical_to_logical, physical_rank, old_p2l, num_gpus
+        )
+        physical_to_logical.copy_(settled)
+        physical_rank.copy_(settled_rank)
     num_layers, num_physical = physical_to_logical.shape
     assert (
         physical_rank.shape == physical_to_logical.shape
     ), "physical_rank shape must match physical_to_logical"
     _, num_logical = logcnt.shape
     cur = int(logcnt.max().item())
-    p2l_rows = physical_to_logical.cpu().tolist()
-    prank_rows = physical_rank.cpu().tolist()
-    logcnt_rows = logcnt.cpu().tolist()
-    out_rows: list[list[list[int]]] = []
-    for layer in range(num_layers):
-        p2l_l = p2l_rows[layer]
-        prank_l = prank_rows[layer]
-        cnt_l = logcnt_rows[layer]
-        row = [[-1] * cur for _ in range(num_logical)]
-        for p in range(num_physical):
-            e = p2l_l[p]
-            rank = prank_l[p]
-            assert 0 <= rank < cnt_l[e], "physical rank out of logical expert range"
-            assert row[e][rank] == -1, "duplicate physical rank for logical expert"
-            row[e][rank] = p
-        for e in range(num_logical):
-            need = cnt_l[e]
-            if need == 0:
-                continue
-            got = sum(1 for r in range(need) if row[e][r] >= 0)
-            assert got == need, "logical expert has missing physical ranks"
-        out_rows.append(row)
-    return torch.tensor(out_rows, dtype=torch.int32, device=physical_to_logical.device)
+    assert cur > 0, "every logical expert must have at least one replica"
+
+    device = physical_to_logical.device
+    p2l = physical_to_logical.to(torch.int64)
+    prank = physical_rank.to(torch.int64)
+    counts = logcnt.to(torch.int64)
+
+    # An out-of-range rank stays inside the flat buffer -- it just lands in the
+    # next logical expert's slots -- so the scatter below cannot catch it.
+    assert bool(
+        ((p2l >= 0) & (prank >= 0) & (prank < counts.gather(1, p2l.clamp_min(0)))).all()
+    ), "physical rank out of logical expert range"
+
+    layer = torch.arange(num_layers, dtype=torch.int64, device=device).unsqueeze(1)
+    linear = ((layer * num_logical + p2l) * cur + prank).flatten()
+    physical = (
+        torch.arange(num_physical, dtype=torch.int32, device=device)
+        .unsqueeze(0)
+        .expand(num_layers, -1)
+        .flatten()
+    )
+    out = torch.full(
+        (num_layers * num_logical * cur,), -1, dtype=torch.int32, device=device
+    )
+    out.scatter_(0, linear, physical)
+
+    l2p = out.view(num_layers, num_logical, cur)
+    # Duplicate (expert, rank) pairs would silently drop a replica in scatter_.
+    assert bool(
+        ((l2p >= 0).sum(-1) == counts).all()
+    ), "logical expert has missing physical ranks"
+    return l2p
+
+
+def _keep_slots_stable(
+    p2l: torch.Tensor,
+    phyrank: torch.Tensor,
+    old_p2l: torch.Tensor | None,
+    num_gpus: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Permute each rank's slots so an expert that stays on the rank keeps its
+    old slot.
+
+    Slot order within a rank is free -- balancedness is a per-rank aggregate --
+    so this only relabels an already-decided placement, turning "moved to another
+    slot on the same rank" into "did not move", which the migration planner skips
+    instead of copying. Cross-rank moves are untouched.
+
+    Ties break on the lowest index throughout: every rank runs this on its own
+    and their migration plans must pair up, so the permutation has to be a
+    function of the maps alone.
+    """
+    if old_p2l is None or old_p2l.shape != p2l.shape:
+        return p2l, phyrank
+    num_layers, num_physical = p2l.shape
+    assert num_physical % num_gpus == 0
+    n = num_physical // num_gpus
+    device = p2l.device
+    num_logical = int(max(int(p2l.max()), int(old_p2l.max()))) + 1
+    shape = (num_layers, num_gpus, n)
+
+    old_l = old_p2l.view(shape).to(torch.int64)
+    new_l = p2l.view(shape).to(torch.int64)
+    rank_l = phyrank.view(shape)
+    ar = torch.arange(n, device=device).expand(shape)
+    absent = torch.full(shape, n, dtype=torch.int64, device=device)
+
+    # Old slot each expert held on this rank; n means "was not here".
+    pos = torch.full(
+        (num_layers, num_gpus, num_logical), n, dtype=torch.int64, device=device
+    )
+    pos.scatter_reduce_(2, old_l, ar, reduce="amin", include_self=True)
+    want = pos.gather(2, new_l)
+
+    # An expert can hold two slots on a rank, so several entries may want the
+    # same one; the lowest-indexed entry claims it.
+    winner = torch.full(
+        (num_layers, num_gpus, n + 1), n, dtype=torch.int64, device=device
+    )
+    winner.scatter_reduce_(2, want, ar, reduce="amin", include_self=True)
+    keep = (want < n) & (winner.gather(2, want) == ar)
+    claim = torch.where(keep, want, absent)
+
+    # src[slot] = the entry that reclaimed it, -1 where nobody did.
+    reclaimed = torch.full(
+        (num_layers, num_gpus, n + 1), -1, dtype=torch.int64, device=device
+    )
+    reclaimed.scatter_(2, claim, ar)
+    reclaimed = reclaimed[:, :, :n]
+
+    # Experts arriving from another rank fill what is left. Unclaimed slots and
+    # unkept entries come out in index order and are equal in number, so pairing
+    # them position by position is a permutation by construction.
+    free_slots = torch.argsort((reclaimed >= 0).to(torch.int8), dim=2, stable=True)
+    free_entries = torch.argsort(keep.to(torch.int8), dim=2, stable=True)
+    arrivals = torch.empty_like(want)
+    arrivals.scatter_(2, free_slots, free_entries)
+
+    src = torch.where(reclaimed >= 0, reclaimed, arrivals)
+    return (
+        new_l.gather(2, src).view(num_layers, num_physical).to(p2l.dtype),
+        rank_l.gather(2, src).view(num_layers, num_physical),
+    )
 
 
 def _rebuild_placement_from_p2l(
@@ -418,6 +513,12 @@ def rebalance_experts(
     assert num_physical % num_gpus == 0, "num_physical must be divisible by num_gpus"
     assert num_physical >= num_logical
 
+    # Only naive leaves the within-rank slot free. `biased` pins the hot experts
+    # to the front of each GPU's block in expert-id order precisely so repeated
+    # rebalances reproduce the same placement, and reuses the live map verbatim
+    # when the hot set holds; permuting its slots would fight that design.
+    sticky_slots = policy is None or policy is _placement_naive
+
     p2l = torch.empty(
         (num_layers, num_physical), dtype=torch.int32, device=weight.device
     )
@@ -441,7 +542,13 @@ def rebalance_experts(
             p2l[layer] = p2l_l
             phyrank[layer] = rank_l
             logcnt[layer] = cnt_l
-        l2p = _build_logical_to_physical_map(p2l, phyrank, logcnt)
+        l2p = _build_logical_to_physical_map(
+            p2l,
+            phyrank,
+            logcnt,
+            old_p2l=old_p2l if sticky_slots else None,
+            num_gpus=num_gpus,
+        )
         return p2l, l2p, logcnt
 
     # Hierarchical path: group->node assignment, then node-local rebalance.
@@ -508,7 +615,13 @@ def rebalance_experts(
         phyrank[layer] = phyrank_l
         logcnt[layer] = cnt_l
 
-    l2p = _build_logical_to_physical_map(p2l, phyrank, logcnt)
+    l2p = _build_logical_to_physical_map(
+        p2l,
+        phyrank,
+        logcnt,
+        old_p2l=old_p2l if sticky_slots else None,
+        num_gpus=num_gpus,
+    )
     return p2l, l2p, logcnt
 
 
