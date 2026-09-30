@@ -61,16 +61,16 @@ feature does not require cache-aware routing.
 
 The consumer advertises its single selected HCA with the write request.
 The producer selects the matching engine and passes that same engine through
-block, slot, staged-index writes, and retries. It never changes a shared
-`transfer_engine` while concurrent requests are in flight.
+block, slot, staged-DCP writes (MLA KV and index caches), and retries. It never
+changes a shared `transfer_engine` while concurrent requests are in flight.
 
 The primary engine is reused. Extra engines are initialized lazily under a
 lock and cached for the connector's lifetime, with at most one engine per
 allowlisted HCA. Every extra engine registers the same memory ranges,
-including slot and index staging buffers, using its own memory keys. This
-adds registration and connection resources; it does not allocate another KV
-cache. KV buffers must outlive the pool, and replacing live registrations is
-rejected.
+including slot staging and shared MLA/index DCP staging buffers, using its own
+memory keys. This adds registration and connection resources; it does not
+allocate another KV cache. KV buffers must outlive the pool, and replacing
+live registrations is rejected.
 
 A failed primary memory registration aborts connector initialization.
 If an extra engine fails to initialize or register memory, successfully
@@ -102,5 +102,5 @@ This is a pool-level check, not a new end-to-end model run of this port.
 
 CPU regression tests cover concurrent engine creation, registration failure
 rollback, peer-HCA validation, request-local engine selection, retries, and
-staged-index propagation. The main-branch port retains the current DCP,
+staged-DCP propagation. The main-branch port retains the current DCP,
 FP4 data/scale region, and staging paths.

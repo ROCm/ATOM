@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""GPU gather of preshuffled DSA index pages onto a DCP shard plan."""
+"""GPU gather of MLA KV and preshuffled DSA index pages for DCP transfers."""
 
 from __future__ import annotations
 
@@ -13,29 +13,30 @@ from atom.kv_transfer.disaggregation.sharded_transfer import DCPShardPlan
 
 
 @dataclass(frozen=True)
-class DCPIndexGatherIndices:
-    """GPU projection of a shared DCP shard plan for preshuffled index pages."""
+class DCPGatherIndices:
+    """Reusable GPU token indices for both MLA KV and DSA index page gathers."""
 
     dst_pages: int
     src_block_id_per_token: torch.Tensor
     src_token: torch.Tensor
+    # MFMA tile coordinates are used only by the preshuffled index gather.
     src_token_tile: torch.Tensor
     src_token_in_tile: torch.Tensor
     valid: torch.Tensor
 
 
-def prepare_dcp_index_gather_indices(
+def prepare_dcp_gather_indices(
     plan: DCPShardPlan, device: torch.device
-) -> DCPIndexGatherIndices:
+) -> DCPGatherIndices:
     """Project the shared token plan to reusable GPU index tensors."""
 
     if plan.interleave_size != 1:
         raise ValueError(
-            "Preshuffled index staging currently supports "
+            "DCP staging currently supports "
             f"interleave=1, got {plan.interleave_size}"
         )
     src_token = torch.as_tensor(plan.src_token, device=device, dtype=torch.int64)
-    return DCPIndexGatherIndices(
+    return DCPGatherIndices(
         dst_pages=plan.dst_pages,
         src_block_id_per_token=torch.as_tensor(
             plan.src_block_id_per_run, device=device, dtype=torch.int64
@@ -47,10 +48,97 @@ def prepare_dcp_index_gather_indices(
     )
 
 
+def gather_dcp_mla_pages(
+    source: torch.Tensor,
+    staging: torch.Tensor,
+    indices: DCPGatherIndices,
+    scheduler_block_size: int,
+) -> int:
+    """Pack token-contiguous MLA bytes into complete DCP destination pages.
+
+    The direct interleave=1 path issues one RDMA descriptor per token. Gathering
+    the same bytes first lets the transport send pages, coalescing consecutive
+    destination blocks. Quantized values, scales and padding are copied as bytes.
+
+    Staging must be a uint8 buffer on the source device. Validate only tensor
+    metadata here, so these checks add no device synchronization to each layer.
+    """
+    if source.ndim < 2 or source.numel() == 0 or scheduler_block_size <= 0:
+        raise ValueError(
+            "MLA staging requires nonempty source pages and a positive block size"
+        )
+    if not source.is_contiguous():
+        raise ValueError("MLA staging requires contiguous source pages")
+    page_bytes = source.stride(0) * source.element_size()
+    if page_bytes % scheduler_block_size:
+        raise ValueError("MLA page bytes must be divisible by the scheduler block size")
+    dst_pages = indices.dst_pages
+    if dst_pages < 0:
+        raise ValueError("MLA staging requires a nonnegative destination page count")
+    if staging.dtype != torch.uint8:
+        raise TypeError("MLA staging must have dtype torch.uint8 for byte copies")
+    if staging.device != source.device:
+        raise ValueError("MLA staging must be on the same device as source")
+    if (
+        staging.ndim != 2
+        or staging.shape[0] < dst_pages
+        or staging.shape[1] != page_bytes
+    ):
+        raise ValueError(
+            "MLA staging must hold compact destination pages of the source byte width"
+        )
+    if not staging.is_contiguous():
+        raise ValueError("MLA staging pages must be contiguous")
+    token_count = dst_pages * scheduler_block_size
+
+    def validate_index(
+        name: str, tensor: torch.Tensor, dtypes: tuple[torch.dtype, ...]
+    ) -> None:
+        if tensor.device != source.device:
+            raise ValueError(f"MLA {name} must be on the same device as source")
+        if tensor.ndim != 1 or tensor.numel() != token_count:
+            raise ValueError(
+                f"MLA {name} must be a 1-D tensor with {token_count} entries"
+            )
+        if tensor.dtype not in dtypes:
+            raise TypeError(f"MLA {name} must have dtype in {dtypes}")
+        if not tensor.is_contiguous():
+            raise ValueError(f"MLA {name} must be contiguous")
+
+    # Only these three vectors are consumed by MLA; tile indices belong to
+    # the separate preshuffled-index gather.
+    validate_index(
+        "src_block_id_per_token",
+        indices.src_block_id_per_token,
+        (torch.int32, torch.int64),
+    )
+    validate_index("src_token", indices.src_token, (torch.int32, torch.int64))
+    validate_index("valid", indices.valid, (torch.bool,))
+    if not dst_pages:
+        return 0
+    token_bytes = page_bytes // scheduler_block_size
+    source_bytes = source.view(torch.uint8).reshape(-1)
+    dest = staging[:dst_pages].reshape(-1)
+    valid = indices.valid.view(torch.uint8)
+    from atom.kv_transfer.disaggregation import triton_mla_gather
+
+    triton_mla_gather.gather_dcp_mla_pages(
+        source_bytes,
+        dest,
+        indices.src_block_id_per_token,
+        indices.src_token,
+        valid,
+        page_bytes,
+        token_bytes,
+        token_count,
+    )
+    return dst_pages
+
+
 def gather_dcp_preshuffled_index_pages(
     source: torch.Tensor,
     staging: torch.Tensor,
-    indices: DCPIndexGatherIndices,
+    indices: DCPGatherIndices,
     index_head_dim: int,
     scheduler_block_size: int,
     block_ratio: int,

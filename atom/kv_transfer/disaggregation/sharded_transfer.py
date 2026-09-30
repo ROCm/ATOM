@@ -9,14 +9,30 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
+from numpy.typing import NDArray
 
 from atom.distributed.dcp_layout import dcp_global_pos
 
 
 def coalesce_contiguous(
-    src: np.ndarray, dst: np.ndarray, length: np.ndarray
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Merge adjacent runs that are contiguous on both sides."""
+    src: NDArray[np.int64],
+    dst: NDArray[np.int64],
+    length: NDArray[np.int64],
+    *,
+    src_mr: tuple[int, int] | None = None,
+    dst_mr: tuple[int, int] | None = None,
+) -> tuple[NDArray[np.int64], NDArray[np.int64], NDArray[np.int64]]:
+    """Merge adjacent runs, optionally splitting at either side's MR boundaries.
+
+    Each MR specification is (region_base, chunk_bytes), matching registration's
+    regular chunk spacing. Input runs must already lie inside each region;
+    the final MR's alignment remainder may be split conservatively. Splitting
+    also handles an individual oversized page.
+    """
+    if (src_mr is not None and src_mr[1] <= 0) or (
+        dst_mr is not None and dst_mr[1] <= 0
+    ):
+        raise ValueError("MR chunk bytes must be positive")
 
     if src.size == 0:
         empty = np.empty(0, dtype=np.int64)
@@ -27,7 +43,67 @@ def coalesce_contiguous(
     starts = np.concatenate(([True], ~contiguous))
     start_indices = np.flatnonzero(starts)
     merged_length = np.add.reduceat(length, start_indices)
-    return src[starts], dst[starts], merged_length
+    merged_src, merged_dst = src[starts], dst[starts]
+    if src_mr is None and dst_mr is None:
+        return merged_src, merged_dst, merged_length
+
+    # A contiguous page batch often merges to one run. Avoid repeat/index
+    # expansion for this case: its cut positions are simple MR progressions.
+    if merged_length.size == 1:
+        size = int(merged_length[0])
+        if size == 0:
+            return merged_src[:0], merged_dst[:0], merged_length[:0]
+        first_src = (
+            size
+            if src_mr is None
+            else src_mr[1] - (int(merged_src[0]) - src_mr[0]) % src_mr[1]
+        )
+        first_dst = (
+            size
+            if dst_mr is None
+            else dst_mr[1] - (int(merged_dst[0]) - dst_mr[0]) % dst_mr[1]
+        )
+        if size <= min(first_src, first_dst):
+            return merged_src, merged_dst, merged_length
+        cuts = [np.array([0, size], dtype=np.int64)]
+        if src_mr is not None and first_src < size:
+            cuts.append(np.arange(first_src, size, src_mr[1], dtype=np.int64))
+        if dst_mr is not None and first_dst < size:
+            cuts.append(np.arange(first_dst, size, dst_mr[1], dtype=np.int64))
+        offsets = np.unique(np.concatenate(cuts))
+        return (
+            merged_src[0] + offsets[:-1],
+            merged_dst[0] + offsets[:-1],
+            np.diff(offsets),
+        )
+
+    # Split one side at a time: destination splits preserve all source MR
+    # boundaries. The two passes operate on whole arrays, never on Python
+    # address lists or individual runs. No padded runs-by-boundaries matrix
+    # is needed; repeat allocates only the actual output descriptors.
+    for side, mr in enumerate((src_mr, dst_mr)):
+        if mr is None:
+            continue
+        base, chunk = mr
+        addresses = merged_src if side == 0 else merged_dst
+        first = chunk - (addresses - base) % chunk
+        if np.all((merged_length <= first) & (merged_length != 0)):
+            continue
+        # Count only boundaries strictly inside a run; ending exactly at an
+        # MR boundary must not produce an extra, zero-length descriptor.
+        counts = 1 + np.maximum(0, (merged_length - first - 1) // chunk + 1)
+        counts[merged_length == 0] = 0
+
+        run_ids = np.repeat(np.arange(counts.size), counts)
+        group_starts = np.cumsum(counts) - counts
+        piece_ids = np.arange(run_ids.size) - group_starts[run_ids]
+        first_piece = piece_ids == 0
+        offsets = np.where(first_piece, 0, first[run_ids] + (piece_ids - 1) * chunk)
+        limits = np.where(first_piece, first[run_ids], chunk)
+        merged_src = merged_src[run_ids] + offsets
+        merged_dst = merged_dst[run_ids] + offsets
+        merged_length = np.minimum(merged_length[run_ids] - offsets, limits)
+    return merged_src, merged_dst, merged_length
 
 
 @dataclass(frozen=True)

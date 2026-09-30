@@ -14,8 +14,8 @@ from atom.kv_transfer.disaggregation.types import DEFAULT_SHARDED_STAGING_WORKER
 # Connectors that push KV across the P/D boundary. Offload backends are not
 # producers even when ``kv_role`` is omitted (they default to ``offload``).
 _PD_TRANSFER_CONNECTORS = frozenset({"mooncake", "moriio"})
-# Only Mooncake consumes DSA index staging callbacks / pool slots.
-_INDEX_STAGING_CONNECTORS = frozenset({"mooncake"})
+# Only Mooncake consumes the shared MLA/index DCP staging callbacks and slots.
+_DCP_STAGING_CONNECTORS = frozenset({"mooncake"})
 
 
 def _canonical(connector: dict, *, path: str) -> str | None:
@@ -70,10 +70,10 @@ def pd_producer_configured(config) -> bool:
 
 
 def mooncake_pd_producer_configured(config) -> bool:
-    return bool(_producer_connectors(config, _INDEX_STAGING_CONNECTORS))
+    return bool(_producer_connectors(config, _DCP_STAGING_CONNECTORS))
 
 
-def index_staging_pool_size(config) -> int:
+def dcp_staging_pool_size(config) -> int:
     """Slots for one Mooncake producer's send-worker concurrency.
 
     Multiple Mooncake producer connector entries in one process would share
@@ -82,10 +82,10 @@ def index_staging_pool_size(config) -> int:
     producer server processes in a multi-P/one-D deployment remain supported.
     """
 
-    connectors = _producer_connectors(config, _INDEX_STAGING_CONNECTORS)
+    connectors = _producer_connectors(config, _DCP_STAGING_CONNECTORS)
     if len(connectors) > 1:
         raise ValueError(
-            "DSA index staging cannot be shared by multiple Mooncake P/D producer "
+            "DCP staging cannot be shared by multiple Mooncake P/D producer "
             "connector entries in one process; list only one kv_producer mooncake "
             "connector per local MultiConnector configuration"
         )
@@ -98,3 +98,36 @@ def index_staging_pool_size(config) -> int:
             f"got {count!r}"
         )
     return count
+
+
+def dcp_staging_shape(config, page_bytes: int) -> tuple[int, int]:
+    """Size the shared MLA/index DCP staging pool under a per-process byte cap.
+
+    Keep one slot per send worker, reducing pages per chunk when the widest
+    cache page would exceed the cap. Budgeting and allocation use this same
+    shape so the runner reserves the actual pool size, not the configured cap.
+    """
+    slots = dcp_staging_pool_size(config)
+    if not slots:
+        return 0, 0
+    connector = _producer_connectors(config, _DCP_STAGING_CONNECTORS)[0]
+    pages = connector.get("dcp_staging_chunk_pages", 256)
+    max_bytes = connector.get("dcp_staging_max_bytes", 256 * 1024**2)
+    if isinstance(pages, bool) or not isinstance(pages, int) or pages <= 0:
+        raise ValueError(
+            f"dcp_staging_chunk_pages must be a positive integer, got {pages!r}"
+        )
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+        raise ValueError(
+            f"dcp_staging_max_bytes must be a positive integer, got {max_bytes!r}"
+        )
+    if page_bytes <= 0:
+        raise ValueError("Staging page_bytes must be positive")
+    capped_pages = min(pages, max_bytes // (slots * page_bytes))
+    if not capped_pages:
+        raise ValueError(
+            f"dcp_staging_max_bytes={max_bytes} cannot hold one page per "
+            f"worker ({slots * page_bytes} bytes); increase the cap or reduce "
+            "num_worker_threads"
+        )
+    return slots, capped_pages

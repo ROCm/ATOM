@@ -29,14 +29,15 @@ from atom.distributed.pcp_utils import (
     pcp_pad_len,
     pcp_round_robin_query_indices,
 )
-from atom.kv_transfer.disaggregation.index_staging import (
+from atom.kv_transfer.disaggregation.dcp_staging import (
+    gather_dcp_mla_pages,
     gather_dcp_preshuffled_index_pages,
-    prepare_dcp_index_gather_indices,
+    prepare_dcp_gather_indices,
 )
 from atom.kv_transfer.disaggregation.pd_producer import (
-    index_staging_pool_size as _index_staging_pool_size,
+    dcp_staging_shape,
+    mooncake_pd_producer_configured,
 )
-from atom.kv_transfer.disaggregation.pd_producer import mooncake_pd_producer_configured
 from atom.kv_transfer.disaggregation.sharded_transfer import DCPShardPlan
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import (
@@ -1394,6 +1395,42 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             index_scale=index_scale if runner.has_mla_indexer else None,
         )
 
+    def _dcp_staging_shape(self, pool: MlaKvPool | None = None) -> tuple[int, int, int]:
+        """Shared MLA/index pool shape for both budgeting and allocation."""
+        runner = self.model_runner
+        if (
+            getattr(self, "dcp_world_size", None) != 1
+            or self._indexer_fp4
+            or not mooncake_pd_producer_configured(runner.config)
+            or not self._supports_dcp_index_staging()
+        ):
+            return 0, 0, 0
+        if pool is None:
+            pool = self._declare_kv_pool()
+        if not any(field.layers for field in pool.index_fields):
+            return 0, 0, 0
+        scheduler_block_size = runner.config.kv_cache_block_size
+        if scheduler_block_size % 16:
+            raise RuntimeError(
+                "Preshuffled DSA index P/D staging requires "
+                "kv_cache_block_size divisible by 16, got "
+                f"{scheduler_block_size}"
+            )
+        # A transfer region holds one field's scheduler pages for one layer.
+        # Read the declaration before any KV tensor or block count exists.
+        page_bytes = max(
+            field.per_layer_numel * field.dtype.itemsize
+            for group in pool.field_groups
+            for field in group
+            if field.layers
+        )
+        slots, pages = dcp_staging_shape(runner.config, page_bytes)
+        return slots, pages, page_bytes
+
+    def kv_transfer_staging_bytes(self) -> int:
+        slots, pages, page_bytes = self._dcp_staging_shape()
+        return slots * pages * page_bytes
+
     def get_kv_transfer_tensors(self):
         from atom.kv_transfer.disaggregation.page_region import page_region
         from atom.kv_transfer.disaggregation.types import (
@@ -1556,51 +1593,90 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 for layer_id in local_index_layer_ids
             ]
 
-        index_staging_region = None
-        index_staging_pool_size = 0
-        index_staging_chunk_pages = 0
-        prepare_sharded_index = None
+        dcp_staging_region = None
+        dcp_staging_pool_size, dcp_staging_chunk_pages, max_page_bytes = (
+            self._dcp_staging_shape(self.kv_pool)
+        )
+        prepare_dcp_gather = None
         gather_sharded_index = None
-        if (
-            index_tensors
-            and getattr(self, "dcp_world_size", None) == 1
-            and mooncake_pd_producer_configured(runner.config)
-            and self._supports_dcp_index_staging()
-        ):
-            # A Mooncake P/D producer can receive requests from a DCP
-            # consumer whose index cache is sharded below one MFMA tile. Keep a
-            # small per-send-thread pool that repacks one index layer at a time;
-            # latent MLA pages continue to transfer directly.
+        gather_sharded_mla = None
+        if dcp_staging_pool_size:
+            # DCP index relayout requires staging when a consumer shards below
+            # one MFMA tile. MLA KV uses the same pool to avoid one RDMA
+            # descriptor per token for interleave=1. Each send worker reuses
+            # its slot across both cache formats, one layer/chunk at a time.
             scheduler_block_size = runner.config.kv_cache_block_size
-            if scheduler_block_size % 16:
-                raise RuntimeError(
-                    "Preshuffled DSA index P/D staging requires "
-                    "kv_cache_block_size divisible by 16, got "
-                    f"{scheduler_block_size}"
-                )
-            index_staging_pool_size = _index_staging_pool_size(runner.config)
-            index_staging_chunk_pages = 256
             first_index_page = index_tensors[0]
             index_head_dim = getattr(runner.config.hf_config, "index_head_dim", None)
-            page_bytes = first_index_page.stride(0) * first_index_page.element_size()
+            staging_bytes = (
+                dcp_staging_pool_size * dcp_staging_chunk_pages * max_page_bytes
+            )
+            logger.info(
+                "Allocating P/D DCP staging (MLA/index): %d bytes (%.2f MiB), "
+                "%d worker slots x %d pages x %d bytes/page; "
+                "reserved in the KV memory budget",
+                staging_bytes,
+                staging_bytes / 1024**2,
+                dcp_staging_pool_size,
+                dcp_staging_chunk_pages,
+                max_page_bytes,
+            )
             staging = torch.empty(
                 (
-                    index_staging_pool_size,
-                    index_staging_chunk_pages,
-                    page_bytes,
+                    dcp_staging_pool_size,
+                    dcp_staging_chunk_pages,
+                    max_page_bytes,
                 ),
                 dtype=torch.uint8,
                 device=first_index_page.device,
             )
-            index_staging_region = KVTransferRegion(
+            dcp_staging_region = KVTransferRegion(
                 base_addr=staging.data_ptr(),
                 total_bytes=staging.numel() * staging.element_size(),
-                unit_bytes=index_staging_chunk_pages * page_bytes,
-                semantic_role="dsa.index_staging",
+                unit_bytes=dcp_staging_chunk_pages * max_page_bytes,
+                semantic_role="dcp.staging",
             )
 
-            def prepare_sharded_index(plan: DCPShardPlan):
-                return prepare_dcp_index_gather_indices(plan, first_index_page.device)
+            def prepare_dcp_gather(plan: DCPShardPlan):
+                return prepare_dcp_gather_indices(plan, first_index_page.device)
+
+            # Contiguous pool views can still contain a segmented or shuffled
+            # page. Match the cache writer's layout selection, and reject it
+            # when a DCP gather is requested; whole-page transfers need no
+            # token relayout and can keep using the registered regions.
+            mla_staging_layout = "token-contiguous"
+            if envs.ATOM_USE_TRITON_MLA:
+                if envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+                    mla_staging_layout = "shuffled"
+            elif envs.ATOM_MLA_PAGE_SIZE > 1:
+                mla_staging_layout = "segmented"
+
+            def staging_slot(region_idx, pool_idx):
+                # Both page formats share one pool, but each transfer requires
+                # packed pages; slicing columns would retain the larger stride.
+                width = pages[region_idx].region.unit_bytes
+                return (
+                    staging[pool_idx]
+                    .view(-1)[: dcp_staging_chunk_pages * width]
+                    .view(dcp_staging_chunk_pages, width)
+                )
+
+            def gather_sharded_mla(region_idx, indices, pool_idx):
+                page = pages[region_idx]
+                if page.region.semantic_role != MLA_KV_ROLE:
+                    raise ValueError(f"Region {region_idx} is not token-contiguous MLA")
+                if mla_staging_layout != "token-contiguous":
+                    raise RuntimeError(
+                        "DCP MLA page gathering requires token-contiguous KV, "
+                        f"but the producer uses the {mla_staging_layout} layout. "
+                        "Use ATOM_MLA_PAGE_SIZE=1 for non-Triton MLA, or "
+                        "ATOM_USE_TRITON_MLA_SHUFFLE_KV=0 for Triton MLA."
+                    )
+                slot = staging_slot(region_idx, pool_idx)
+                page_count = gather_dcp_mla_pages(
+                    page.view, slot, indices, scheduler_block_size
+                )
+                return slot.data_ptr(), page_count
 
             def gather_sharded_index(
                 region_idx,
@@ -1613,7 +1689,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                         f"Index region {region_idx} maps to invalid cache row "
                         f"{index_region_idx}"
                     )
-                slot = staging[pool_idx]
+                slot = staging_slot(region_idx, pool_idx)
                 pages = gather_dcp_preshuffled_index_pages(
                     index_tensors[index_region_idx],
                     slot,
@@ -1627,11 +1703,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         return KVTransferTensors(
             pages=pages,
             block_region_consumer_indices=block_region_consumer_indices,
-            index_staging_region=index_staging_region,
-            index_staging_pool_size=index_staging_pool_size,
-            index_staging_chunk_pages=index_staging_chunk_pages,
-            prepare_sharded_index=prepare_sharded_index,
+            dcp_staging_region=dcp_staging_region,
+            dcp_staging_pool_size=dcp_staging_pool_size,
+            dcp_staging_chunk_pages=dcp_staging_chunk_pages,
+            prepare_dcp_gather=prepare_dcp_gather,
             gather_sharded_index=gather_sharded_index,
+            gather_sharded_mla=gather_sharded_mla,
             # MLA's latent projection is replicated across TP. Sparse MLA's
             # index-key projection/cache is replicated as well; only the query
             # heads and absorbed KV-B/output projections are TP-sharded.

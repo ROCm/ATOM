@@ -9,7 +9,7 @@ import threading
 import types
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -1077,7 +1077,8 @@ def test_dcp_block_descriptors_are_streamed_in_bounded_batches():
     assert transferred_bytes == 2 * descriptors_per_region * 576
 
 
-def test_dcp_index_staging_waits_for_request_ready_event():
+@pytest.mark.parametrize("stage_mla", [False, True])
+def test_dcp_staging_waits_for_request_ready_event(stage_mla):
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
@@ -1093,12 +1094,13 @@ def test_dcp_index_staging_waits_for_request_ready_event():
     connector._block_region_roles = [MLA_KV_ROLE, INDEX_CACHE_ROLE]
     connector._block_region_consumer_indices = None
     connector._consumer_region_map = lambda *_args, **_kwargs: [0, 1]
-    connector._index_staging_chunk_pages = 256
+    connector._dcp_staging_chunk_pages = 256
     gather_indices = object()
-    connector._prepare_sharded_index = MagicMock(return_value=gather_indices)
+    connector._prepare_dcp_gather = MagicMock(return_value=gather_indices)
     connector._gather_sharded_index = MagicMock()
-    connector._index_staging_stream = MagicMock()
-    connector._execute_staged_index_layer_chunk = MagicMock(return_value=True)
+    connector._gather_sharded_mla = MagicMock() if stage_mla else None
+    connector._dcp_staging_stream = MagicMock()
+    connector._execute_dcp_staged_layer_chunk = MagicMock(return_value=True)
     connector._rdma_write_with_retry = MagicMock(return_value=True)
     ready_event = object()
     request_data = {
@@ -1121,24 +1123,42 @@ def test_dcp_index_staging_waits_for_request_ready_event():
         ready_event,
         engine=ready_event,
     )
-    connector._index_staging_stream.wait_event.assert_called_once_with(ready_event)
-    connector._execute_staged_index_layer_chunk.assert_called_once_with(
-        "consumer:1234",
-        1,
-        4_000_000,
-        index_block_bytes,
-        [10],
-        "req-1",
-        gather_indices,
-        engine=ready_event,
+    connector._dcp_staging_stream.wait_event.assert_called_once_with(ready_event)
+    expected = []
+    if stage_mla:
+        expected.append(
+            call(
+                "consumer:1234",
+                0,
+                3_000_000,
+                mla_block_bytes,
+                [10],
+                "req-1",
+                gather_indices,
+                engine=ready_event,
+            )
+        )
+        connector._rdma_write_with_retry.assert_not_called()
+    expected.append(
+        call(
+            "consumer:1234",
+            1,
+            4_000_000,
+            index_block_bytes,
+            [10],
+            "req-1",
+            gather_indices,
+            engine=ready_event,
+        )
     )
+    assert connector._execute_dcp_staged_layer_chunk.call_args_list == expected
     assert all(
         call.kwargs["engine"] is ready_event
         for call in connector._rdma_write_with_retry.call_args_list
     )
 
 
-def test_dcp_index_staging_rejects_missing_request_ready_event():
+def test_dcp_staging_rejects_missing_request_ready_event():
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
@@ -1152,10 +1172,10 @@ def test_dcp_index_staging_rejects_missing_request_ready_event():
     connector._block_region_roles = [MLA_KV_ROLE, INDEX_CACHE_ROLE]
     connector._block_region_consumer_indices = None
     connector._consumer_region_map = lambda *_args, **_kwargs: [0, 1]
-    connector._index_staging_chunk_pages = 256
-    connector._prepare_sharded_index = MagicMock(return_value=object())
+    connector._dcp_staging_chunk_pages = 256
+    connector._prepare_dcp_gather = MagicMock(return_value=object())
     connector._gather_sharded_index = MagicMock()
-    connector._index_staging_stream = MagicMock()
+    connector._dcp_staging_stream = MagicMock()
     connector._rdma_write_with_retry = MagicMock(return_value=True)
     request_data = {
         "consumer_base_addrs": [3_000_000, 4_000_000],
@@ -1184,7 +1204,7 @@ def test_mooncake_records_one_ready_event_for_a_prefill_batch(monkeypatch):
     )
     connector = object.__new__(mc.MooncakeConnector)
     connector.is_producer = True
-    connector._index_staging_stream = object()
+    connector._dcp_staging_stream = object()
     connector._cuda_device = 3
     connector._kv_cache_ready_events = {}
     connector._completed_prefills_lock = threading.Lock()
@@ -1494,20 +1514,21 @@ def test_rdma_chunks_and_retries_use_selected_engine(monkeypatch, succeeds):
     conn.transfer_engine.batch_transfer_sync_write.assert_not_called()
 
 
-def test_staged_index_write_preserves_selected_engine(monkeypatch):
+def test_dcp_staged_write_preserves_selected_engine(monkeypatch):
     from contextlib import nullcontext
 
     from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
 
     conn = _matched_rail_producer()
-    conn._acquire_index_staging_slot = lambda: 3
-    conn._release_index_staging_slot = MagicMock()
-    conn._index_staging_stream = SimpleNamespace(synchronize=MagicMock())
+    conn._acquire_dcp_staging_slot = lambda: 3
+    conn._release_dcp_staging_slot = MagicMock()
+    conn._dcp_staging_stream = SimpleNamespace(synchronize=MagicMock())
     conn._gather_sharded_index = lambda *_args: (10000, 2)
+    conn._dcp_staging_mr = (10000, 1024)
     conn._rdma_write_with_retry = MagicMock(return_value=True)
     monkeypatch.setattr(mc.torch.cuda, "stream", lambda _: nullcontext())
     selected = object()
-    assert conn._execute_staged_index_layer_chunk(
+    assert conn._execute_dcp_staged_layer_chunk(
         "consumer:1234", 0, 20000, 64, [4, 5], "request", object(), engine=selected
     )
     conn._rdma_write_with_retry.assert_called_once_with(
@@ -1516,8 +1537,79 @@ def test_staged_index_write_preserves_selected_engine(monkeypatch):
         [20256],
         [128],
         "request",
-        "staged-index",
+        "staged-dcp",
         engine=selected,
     )
-    conn._index_staging_stream.synchronize.assert_called_once()
-    conn._release_index_staging_slot.assert_called_once_with(3)
+    conn._dcp_staging_stream.synchronize.assert_called_once()
+    conn._release_dcp_staging_slot.assert_called_once_with(3)
+
+
+@pytest.mark.parametrize("role", ["mla.kv", "dsa.index_cache"])
+@pytest.mark.parametrize("page_bytes", [16 * 576, 64 * 576, 64 * 1152])
+@pytest.mark.parametrize("succeeds", [False, True])
+def test_staged_pages_respect_both_mr_boundaries_and_slot_lifetime(
+    monkeypatch, role, page_bytes, succeeds
+):
+    from contextlib import nullcontext
+
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    conn = _matched_rail_producer()
+    src_base, dst_base = 2**40 + 128, 2**42 + 256
+    staging_base = src_base + page_bytes
+    # The source boundary is after two staged pages, the destination after one.
+    conn._dcp_staging_mr = (src_base, 3 * page_bytes)
+    dst_chunk_bytes = conn._rdma_chunk_sizes(
+        2 * conn._MAX_RDMA_CHUNK_BYTES, page_bytes
+    )[0]
+    pages_per_mr = dst_chunk_bytes // page_bytes
+    dst_ids = list(range(pages_per_mr - 1, pages_per_mr + 3))
+    order = []
+    conn._acquire_dcp_staging_slot = lambda: 1
+    conn._release_dcp_staging_slot = lambda slot: order.append(("release", slot))
+    conn._dcp_staging_stream = SimpleNamespace(
+        synchronize=lambda: order.append("synchronize")
+    )
+    conn._block_region_roles = [role]
+
+    def gather(*args):
+        order.append("gather")
+        assert args[2] == 1
+        return staging_base, 4
+
+    conn._gather_sharded_index = MagicMock(side_effect=gather)
+    conn._gather_sharded_mla = MagicMock(side_effect=gather)
+    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _: nullcontext())
+
+    def write(*args, **kwargs):
+        assert order == ["gather", "synchronize"]
+        order.append("write")
+        return succeeds
+
+    conn._rdma_write_with_retry = MagicMock(side_effect=write)
+    selected = object()
+    assert (
+        conn._execute_dcp_staged_layer_chunk(
+            "consumer:1234",
+            0,
+            dst_base,
+            page_bytes,
+            dst_ids,
+            "request",
+            object(),
+            engine=selected,
+        )
+        is succeeds
+    )
+    conn._rdma_write_with_retry.assert_called_once_with(
+        "consumer:1234",
+        [staging_base, staging_base + page_bytes, staging_base + 2 * page_bytes],
+        [dst_base + dst_ids[i] * page_bytes for i in (0, 1, 2)],
+        [page_bytes, page_bytes, 2 * page_bytes],
+        "request",
+        "staged-dcp",
+        engine=selected,
+    )
+    assert conn._gather_sharded_mla.call_count == int(role == "mla.kv")
+    assert conn._gather_sharded_index.call_count == int(role == "dsa.index_cache")
+    assert order == ["gather", "synchronize", "write", ("release", 1)]
