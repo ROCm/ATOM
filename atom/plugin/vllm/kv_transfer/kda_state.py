@@ -547,6 +547,15 @@ class KdaBoundaryPlanner:
         # req_id -> boundary_tokens -> one block id per mamba group, for the
         # transfers the PAGE side is about to build. Only in `rides_page`.
         self._ride_boundaries: dict[str, dict[int, tuple[int, ...]]] = {}
+        # save operation -> the recurrent blocks its PAGE transfer reads, held
+        # by a refcount share this planner owns. Taken in `take_ride_state` and
+        # given back in `retire_ride_pins` once the scheduler no longer lists
+        # the operation. Without the second half the share is permanent: a ride
+        # issues no store, so `absorb_reports` -- which is what unpins a
+        # hand-off store -- never sees the operation at all, and the pool loses
+        # one block per mamba group per ride until it has none left and the
+        # engine sits at zero running requests with a full waiting queue.
+        self._ride_pins: dict[Any, tuple[int, ...]] = {}
         self._pool = None
         self._next_op_id = 0
         self._pending_stores: dict[int, _PendingStore] = {}
@@ -580,6 +589,8 @@ class KdaBoundaryPlanner:
             "ride_recorded": 0,
             "ride_served": 0,
             "ride_missing": 0,
+            "ride_pinned": 0,
+            "ride_unpinned": 0,
         }
         self._last_stats_log = 0.0
         if self.chunk_size % self.mamba_block_size != 0:
@@ -953,7 +964,7 @@ class KdaBoundaryPlanner:
             return ()
         return block_ids
 
-    def take_ride_state(self, request, req_id, end: int):
+    def take_ride_state(self, request, req_id, end: int, operation=None):
         """The recurrent blocks a transfer ending at *end* should carry.
 
         Two sources, in this order. A load has already had its destination
@@ -961,6 +972,14 @@ class KdaBoundaryPlanner:
         the recorded tuple is the only correct answer. A save has not: its
         source is whatever vLLM has committed and still holds under this
         boundary's hash.
+
+        Only the save source is pinned, and only when the caller names the
+        operation that will report it back. A load's destination needs no pin:
+        those blocks are the parked request's own allocation, and vLLM holds
+        them for as long as it holds the request in WAITING_FOR_REMOTE_KVS,
+        which is strictly longer than the H2D. Pinning them anyway is a share
+        nothing gives back -- the ride issues no store, so the store-report
+        path that unpins a hand-off never runs for it.
 
         ``None`` means this boundary has no whole state. The caller must then
         not build the transfer at all -- a PAGE-only object on a model with
@@ -972,20 +991,48 @@ class KdaBoundaryPlanner:
 
         end = int(end)
         by_boundary = self._ride_boundaries.get(str(req_id))
-        block_ids = None if by_boundary is None else by_boundary.get(end)
-        if not block_ids:
-            block_ids = self.source_blocks_for(request, end) or None
+        recorded = None if by_boundary is None else by_boundary.get(end)
+        block_ids = recorded or (self.source_blocks_for(request, end) or None)
         if not block_ids:
             self._counters["ride_missing"] += 1
             return None
         self._counters["ride_served"] += 1
         pool = self._pool
-        if pool is not None:
-            # Same reason `_issue_store` touches: the copy runs
-            # asynchronously on the worker, and a block vLLM reuses in the
-            # meantime would put another prefix's recurrence under this key.
+        pinnable = (
+            not recorded
+            and pool is not None
+            and operation is not None
+            and operation not in self._ride_pins
+        )
+        if pinnable:
+            # Same reason `_issue_store` pins: the copy runs asynchronously on
+            # the worker, and a block vLLM reuses in the meantime would put
+            # another prefix's recurrence under this key. Keyed by the
+            # operation so `retire_ride_pins` can give the share back on every
+            # exit the save has, terminal report or not.
             pool.touch([pool.blocks[block_id] for block_id in block_ids])
+            self._ride_pins[operation] = tuple(block_ids)
+            self._counters["ride_pinned"] += 1
         return RecurrentStateTransfer(boundary_tokens=end, block_ids=tuple(block_ids))
+
+    def retire_ride_pins(self, live_operations) -> None:
+        """Give back the shares of every ride whose save the scheduler forgot.
+
+        Reconciliation rather than a release call per exit: a save operation
+        leaves the scheduler through a terminal store report, an abandonment, a
+        stale-lease reclaim or a request teardown, and a pin that only one of
+        those paths released would leak on the others with nothing logged.
+        The scheduler's own live set is the single source of truth.
+        """
+        pool = self._pool
+        if not self._ride_pins:
+            return
+        live = set(live_operations)
+        for operation in [op for op in self._ride_pins if op not in live]:
+            block_ids = self._ride_pins.pop(operation)
+            self._counters["ride_unpinned"] += 1
+            if pool is not None:
+                pool.free_blocks([pool.blocks[block_id] for block_id in block_ids])
 
     def _issue_store(
         self, prefix_hash: int, block_ids: tuple[int, ...], req_id: str | None = None
@@ -1169,8 +1216,11 @@ class KdaBoundaryPlanner:
         Store completions only reach this process as worker metadata on a step.
         An engine that went idle with a pin outstanding would hold that block
         out of the pool forever -- KV capacity lost with nothing to point at.
+        A ride's pin counts the same way: it is released by a reconciliation
+        that only runs on a step, so the last step must not be the one that
+        retires the save.
         """
-        return bool(self._pending_stores)
+        return bool(self._pending_stores) or bool(self._ride_pins)
 
     def stats(self) -> dict[str, int]:
         out = dict(self._index.stats())

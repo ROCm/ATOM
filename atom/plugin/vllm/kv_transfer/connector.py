@@ -545,7 +545,8 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self._scheduler.install_hit_cap_hook(self._kda_planner.cap_hit)
         if rides_page:
             self._scheduler.install_recurrent_state_hook(
-                self._recurrent_state_for_transfer
+                self._recurrent_state_for_transfer,
+                self._kda_planner.retire_ride_pins,
             )
         logger.info(
             "ATOM LMCache offload: recurrent state leg on group(s) %s "
@@ -556,7 +557,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             int(self._scheduler.chunk_size),
         )
 
-    def _recurrent_state_for_transfer(self, seq, end: int):
+    def _recurrent_state_for_transfer(self, seq, end: int, operation=None):
         """Which recurrent snapshot the transfer ending at *end* carries.
 
         The scheduler holds a ``SeqView``, which has no block hashes; the
@@ -570,7 +571,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         request = self._requests.get(req_id)
         if request is None:
             return None
-        return planner.take_ride_state(request, req_id, end)
+        return planner.take_ride_state(request, req_id, end, operation=operation)
 
     # ---- worker side --------------------------------------------------
 

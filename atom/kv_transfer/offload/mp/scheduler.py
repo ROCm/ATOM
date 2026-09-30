@@ -205,6 +205,10 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         such as a lost completion or a TP rank that never reports.
         """
         live = self._live_transfers()
+        # Same set, second consumer: a ride's source pin is owned by the
+        # recurrent leg and released by this reconciliation, not by a store
+        # report -- a ride issues no store.
+        self._retire_recurrent_rides(live)
         seen = self._transfer_seen_at
         for operation in [op for op in seen if op not in live]:
             del seen[operation]

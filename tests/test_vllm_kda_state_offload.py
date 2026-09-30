@@ -1255,12 +1255,51 @@ def test_a_save_takes_its_source_from_the_hash_keyed_pool():
         request.block_hashes[CHUNK // HASH_BLOCK - 1],
         {MAMBA_GROUP: 7, MAMBA_GROUP_2: 9},
     )
-    state = planner.take_ride_state(request, "r1", CHUNK)
+    state = planner.take_ride_state(request, "r1", CHUNK, operation="op1")
     assert state is not None
     assert state.boundary_tokens == CHUNK
     assert state.block_ids == (7, 9)
-    # Touched for the same reason a store pins: the copy is asynchronous.
-    assert pool.touched
+    # Pinned for the same reason a store pins: the copy is asynchronous.
+    assert pool.touched == ["blk7", "blk9"]
+
+
+def test_a_rides_source_pin_is_given_back_when_its_save_retires():
+    """The ride issues no store, so nothing else ever unpins it. Before this
+    reconciliation the pool lost one block per mamba group per ride until it
+    had none left and the engine stalled at zero running requests."""
+    pool = FakePool()
+    planner = _riding_planner(pool)
+    request = FakeRequest("r1")
+    pool.publish(
+        request.block_hashes[CHUNK // HASH_BLOCK - 1],
+        {MAMBA_GROUP: 7, MAMBA_GROUP_2: 9},
+    )
+    planner.take_ride_state(request, "r1", CHUNK, operation="op1")
+    assert planner.has_pending_work()
+
+    # Still dispatched: the worker may be mid-copy.
+    planner.retire_ride_pins({"op1"})
+    assert pool.freed == []
+
+    planner.retire_ride_pins(set())
+    assert pool.freed == ["blk7", "blk9"]
+    assert not planner.has_pending_work()
+    # Idempotent: a second reconciliation must not double-free.
+    planner.retire_ride_pins(set())
+    assert pool.freed == ["blk7", "blk9"]
+
+
+def test_a_load_destination_is_not_pinned():
+    """Those blocks are the parked request's own allocation; vLLM holds them
+    until the load releases the request, which is longer than the transfer.
+    A share taken here is one the retire path would never see an operation
+    for."""
+    pool = FakePool()
+    planner = _riding_planner(pool)
+    planner._record_ride_boundary("r1", CHUNK, (40, 60))
+    state = planner.take_ride_state(FakeRequest("r1"), "r1", CHUNK)
+    assert state.block_ids == (40, 60)
+    assert pool.touched == []
 
 
 def test_a_boundary_missing_one_group_carries_nothing():

@@ -411,19 +411,39 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     #: state is someone else's, and the transport refuses it.
     _recurrent_state_hook = None
 
-    def install_recurrent_state_hook(self, hook) -> None:
-        self._recurrent_state_hook = hook
+    #: Installed alongside the hook above. Called with the set of save and load
+    #: operations the scheduler still considers live, so the recurrent leg can
+    #: give back the refcount shares of rides whose transfer is over. A save
+    #: leaves through several exits (terminal report, abandonment, stale-lease
+    #: reclaim, teardown) and a release wired to only some of them leaks on
+    #: the rest, so this is a reconciliation rather than a per-exit call.
+    _recurrent_retire_hook = None
 
-    def _recurrent_state_for(self, seq, end: int):
+    def install_recurrent_state_hook(self, hook, retire_hook=None) -> None:
+        self._recurrent_state_hook = hook
+        self._recurrent_retire_hook = retire_hook
+
+    def _recurrent_state_for(self, seq, end: int, operation=None):
         """This transfer's recurrent snapshot, or ``None`` if it has none.
 
         ``(None, False)`` is not expressible here on purpose: with no hook
         installed there are no recurrent groups, so ``None`` is the whole and
         correct answer and the caller must not treat it as a refusal. Callers
         therefore test ``self._recurrent_state_hook is not None`` first.
+
+        ``operation`` names the transfer that will carry the snapshot, and is
+        what the hook keys a save's source pin by. A load passes ``None``: its
+        destination blocks belong to the parked request, which vLLM holds for
+        longer than the transfer, so there is nothing to pin.
         """
         hook = self._recurrent_state_hook
-        return None if hook is None else hook(seq, int(end))
+        return None if hook is None else hook(seq, int(end), operation=operation)
+
+    def _retire_recurrent_rides(self, live_operations) -> None:
+        """Hand the recurrent leg the operations still in flight."""
+        hook = self._recurrent_retire_hook
+        if hook is not None:
+            hook(live_operations)
 
     def _may_emit_save(self) -> bool:
         """Return whether another save may be emitted this scheduler step."""
@@ -450,7 +470,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             # here rather than passing ``aligned`` keeps the two from drifting
             # apart, which the worker would report as a boundary mismatch.
             end = (int(aligned) // int(self.chunk_size)) * int(self.chunk_size)
-            recurrent = self._recurrent_state_for(seq, end)
+            recurrent = self._recurrent_state_for(seq, end, operation=operation)
             if recurrent is None:
                 return None
         return LMCacheReqMeta(
