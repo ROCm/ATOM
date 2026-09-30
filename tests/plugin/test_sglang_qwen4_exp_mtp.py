@@ -21,6 +21,7 @@ from atom.plugin.sglang.patches.qwen4_exp_recognition_patch import (
 from atom.plugin.sglang.patches.qwen4_exp_rocm_patch import (
     _hip_topk1_tree_builder,
     _hip_verify_tree_greedy,
+    note_qwen4_exp_from_identity,
 )
 from atom.plugin.sglang.qwen4_exp_bridge import (
     _query_start_loc,
@@ -334,6 +335,19 @@ def test_draft_rewrite_rejects_unsupported_native_layout(layers, types):
     with pytest.raises(ValueError, match="exactly one QSA"):
         rewrite_qwen4_exp_draft_hf_config(hf)
     assert hf.num_hidden_layers == 48
+
+
+def test_qwen4_exp_identity_arms_hip_divert_without_is_qwen_qsa():
+    """#2427 returns before the is_qwen_qsa hook, so prepare_model arms this."""
+    rocm_patch._qwen4_exp_hip = False
+    note_qwen4_exp_from_identity("DeepseekV4ForCausalLM", "deepseek_v4")
+    assert rocm_patch._qwen4_exp_hip is False
+    note_qwen4_exp_from_identity("Qwen4ExpForConditionalGeneration")
+    assert rocm_patch._qwen4_exp_hip is True
+    rocm_patch._qwen4_exp_hip = False
+    note_qwen4_exp_from_identity("", "qwen4_exp")
+    assert rocm_patch._qwen4_exp_hip is True
+    rocm_patch._qwen4_exp_hip = False
 
 
 def test_hip_topk1_tree_build_uses_triton_only_for_qwen4_exp():

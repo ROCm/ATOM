@@ -34,6 +34,19 @@ def note_qwen4_exp_loaded() -> None:
     )
 
 
+def note_qwen4_exp_from_identity(*labels: object) -> None:
+    """Arm the HIP divert from the model being loaded.
+
+    ``#2427`` wraps ``is_qwen_qsa`` later and returns False for Qwen4Exp
+    without calling the inner hook, so this cannot live only there.
+    """
+    for label in labels:
+        text = str(label or "")
+        if "Qwen4Exp" in text or text.startswith("qwen4_exp"):
+            note_qwen4_exp_loaded()
+            return
+
+
 def _install_ep_decode_asm_moe() -> None:
     """Use the asm 1-stage kernel for Flash EP decode."""
     try:
