@@ -6,7 +6,7 @@
 Matches the vLLM ``enable_return_routed_experts`` contract: scatter logical
 expert ids into ``buffer[slot, layer, :]`` during fused MoE, D2H this step's
 ``slot_mapping`` rows into a CPU slot buffer, then numpy-gather a per-request
-``[seq_len - 1, num_layers, top_k]`` int16 tensor from the block table.
+range patch ``(start_row, [end-start, num_layers, top_k])`` from the block table.
 """
 
 from __future__ import annotations
@@ -84,16 +84,18 @@ def kv_slots_from_block_table(
     num_tokens: int,
     block_size: int,
     *,
+    start_token: int = 0,
     device: torch.device | str | None = None,
     dtype: torch.dtype = torch.long,
 ) -> np.ndarray:
-    """Physical KV slots for the first ``num_tokens`` positions (host numpy)."""
+    """Physical KV slots for token positions ``[start_token, num_tokens)``."""
     del device, dtype
     n = int(num_tokens)
-    if n <= 0:
+    start = max(int(start_token), 0)
+    if n <= start:
         return np.empty(0, dtype=np.int64)
     blocks = np.asarray(list(block_table), dtype=np.int64)
-    pos = np.arange(n, dtype=np.int64)
+    pos = np.arange(start, n, dtype=np.int64)
     bs = np.int64(block_size)
     return blocks[pos // bs] * bs + (pos % bs)
 
@@ -296,8 +298,10 @@ class RoutedExpertsCapturer:
     ) -> bool:
         """D2H this step's ``buffer[slot_mapping]`` into the CPU slot buffer.
 
-        Snapshot dest/rows on the default stream, then enqueue non-blocking
-        D2H on the token ``async_copy_stream`` after ``wait_event`` when used.
+        Async path: gather + non-blocking D2H on ``stream`` after ``wait_event``
+        (the token ``forward_done_event``). Apply via ``commit_pending`` after
+        the next ``recv_async_output`` (that ``copy_done`` is recorded after
+        this memcpy). Blocking path commits any in-flight pending first.
 
         Returns True when a new memcpy was queued (or applied inline). False
         means this step had nothing to store; the caller must then
@@ -307,21 +311,25 @@ class RoutedExpertsCapturer:
         slots = slot_mapping if slot_mapping is not None else _current_slot_mapping()
         if slots is None or slots.numel() == 0:
             return False
-        dest = self._dest_slots(slots)
-        rows = self.buffer[dest].to(dtype=torch.int16)
         use_async = (
             stream is not None and self.buffer.is_cuda and torch.cuda.is_available()
         )
         if not use_async:
+            dest = self._dest_slots(slots)
+            rows = self.buffer[dest].to(dtype=torch.int16)
             self.commit_pending()
             self._apply_cpu_store(
                 dest.detach().cpu().numpy(),
                 rows.detach().cpu().numpy(),
             )
             return True
+        # Gather on the copy stream after wait_event (MoE + sample), then D2H.
+        # Queued before token copy_done so the next recv covers this memcpy.
         with torch.cuda.stream(stream):
             if wait_event is not None:
                 wait_event.wait(stream)
+            dest = self._dest_slots(slots)
+            rows = self.buffer[dest].to(dtype=torch.int16)
             dest_cpu = dest.to(dtype=torch.int32).to("cpu", non_blocking=True)
             rows_cpu = rows.to("cpu", non_blocking=True)
         self._pending.append((dest_cpu, rows_cpu))
@@ -333,18 +341,39 @@ class RoutedExpertsCapturer:
         block_tables: AbcSequence[AbcSequence[int]],
         num_tokens_list: AbcSequence[int],
         block_size: int,
+        start_rows: AbcSequence[int] | None = None,
     ) -> dict[int, np.ndarray]:
-        """CPU gather: ``[num_tokens, num_layers, top_k]`` int16 per request."""
-        out: dict[int, np.ndarray] = {}
-        for req_id, block_table, ntok in zip(
-            req_ids, block_tables, num_tokens_list, strict=False
+        """CPU gather: ``[end - start, num_layers, top_k]`` int16 per request.
+
+        ``start_rows`` defaults to 0 (full history). Incremental IPC uses
+        ``export_range`` which also returns the start offset.
+        """
+        patches = self.export_range(
+            req_ids, block_tables, num_tokens_list, block_size, start_rows
+        )
+        return {req_id: rows for req_id, (_start, rows) in patches.items()}
+
+    def export_range(
+        self,
+        req_ids: AbcSequence[int],
+        block_tables: AbcSequence[AbcSequence[int]],
+        num_tokens_list: AbcSequence[int],
+        block_size: int,
+        start_rows: AbcSequence[int] | None = None,
+    ) -> dict[int, tuple[int, np.ndarray]]:
+        """CPU gather of ``[start, num_tokens)`` as ``(start, rows)`` patches."""
+        out: dict[int, tuple[int, np.ndarray]] = {}
+        starts = start_rows if start_rows is not None else [0] * len(req_ids)
+        for req_id, block_table, ntok, start in zip(
+            req_ids, block_tables, num_tokens_list, starts, strict=False
         ):
             n = int(ntok)
-            if n <= 0 or not block_table:
+            s = max(int(start), 0)
+            if n <= s or not block_table:
                 continue
-            slots = kv_slots_from_block_table(block_table, n, block_size)
+            slots = kv_slots_from_block_table(block_table, n, block_size, start_token=s)
             slots = np.clip(slots, 0, self.num_slots - 1)
-            out[int(req_id)] = self.cpu_buffer[slots].copy()
+            out[int(req_id)] = (s, self.cpu_buffer[slots].copy())
         return out
 
 

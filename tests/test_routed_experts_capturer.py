@@ -278,6 +278,31 @@ def test_store_step_empty_returns_false_so_flush_can_commit():
     np.testing.assert_array_equal(capturer.cpu_buffer[3, 0], [5, 6])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for copy stream")
+def test_async_store_step_applies_only_after_copy_done_commit():
+    """Route D2H stays in _pending until the recv-equivalent commit."""
+    device = torch.device("cuda")
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=8, num_layers=1, top_k=2, device=device
+    )
+    slots = torch.tensor([1], device=device)
+    ids = torch.tensor([[7, 8]], dtype=torch.int32, device=device)
+    capturer.capture(0, ids, slot_mapping=slots)
+    ready = torch.cuda.Event()
+    ready.record()
+    stream = torch.cuda.Stream()
+    assert capturer.store_step(slots, stream=stream, wait_event=ready) is True
+    np.testing.assert_array_equal(
+        capturer.cpu_buffer[1], np.zeros((1, 2), dtype=np.int16)
+    )
+    done = torch.cuda.Event()
+    with torch.cuda.stream(stream):
+        done.record(stream)
+    done.synchronize()
+    capturer.commit_pending()
+    np.testing.assert_array_equal(capturer.cpu_buffer[1, 0], [7, 8])
+
+
 def test_capture_page_bytes_are_budgeted_per_block():
     assert capture_bytes_per_kv_block(16, 58, 8) == 16 * 58 * 8 * 4
     assert capture_pad_row_bytes(58, 8) == 58 * 8 * 4
@@ -349,3 +374,168 @@ def test_triton_routing_ids_match_packed_histogram():
     gather = torch.tensor([0, 2, 4, 1, 5, 3], dtype=torch.int32)
     ids = topk_ids_from_triton_routing(_Routing(), gather, num_tokens=3, topk=2)
     assert ids.tolist() == [[1, 4], [3, 5], [3, 4]]
+
+
+def test_export_range_matches_export_batch_prefix():
+    device = _device()
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=32, num_layers=2, top_k=2, device=device
+    )
+    slots = torch.arange(5, device=device)
+    ids = torch.arange(10, device=device, dtype=torch.int32).reshape(5, 2)
+    capturer.capture(0, ids, slot_mapping=slots)
+    capturer.capture(1, ids + 50, slot_mapping=slots)
+    capturer.store_step(slots)
+    full = capturer.export_batch([1], [[0]], [5], block_size=16)[1]
+    start, rows = capturer.export_range([1], [[0]], [5], 16, [2])[1]
+    assert start == 2
+    np.testing.assert_array_equal(rows, full[2:])
+    np.testing.assert_array_equal(
+        capturer.export_batch([1], [[0]], [5], 16, [2])[1], full[2:]
+    )
+
+
+def test_export_range_decode_only_row():
+    device = _device()
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=32, num_layers=1, top_k=2, device=device
+    )
+    prefill = torch.tensor([0, 1, 2], device=device)
+    capturer.capture(
+        0,
+        torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32, device=device),
+        slot_mapping=prefill,
+    )
+    capturer.store_step(prefill)
+    decode = torch.tensor([3], device=device)
+    capturer.capture(
+        0,
+        torch.tensor([[7, 8]], dtype=torch.int32, device=device),
+        slot_mapping=decode,
+    )
+    capturer.store_step(decode)
+    start, rows = capturer.export_range([1], [[0]], [4], 16, [3])[1]
+    assert start == 3
+    assert rows.shape == (1, 1, 2)
+    np.testing.assert_array_equal(rows[:, 0, :], [[7, 8]])
+
+
+def test_export_range_empty_when_start_eq_end():
+    device = _device()
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=16, num_layers=1, top_k=1, device=device
+    )
+    slots = torch.tensor([0, 1], device=device)
+    capturer.capture(
+        0,
+        torch.tensor([[1], [2]], dtype=torch.int32, device=device),
+        slot_mapping=slots,
+    )
+    capturer.store_step(slots)
+    assert capturer.export_range([1], [[0]], [2], 16, [2]) == {}
+
+
+def test_interleaved_requests_independent_ranges():
+    device = _device()
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=64, num_layers=1, top_k=2, device=device
+    )
+    slots = torch.tensor([0, 16, 1, 17], device=device)
+    ids = torch.tensor(
+        [[10, 11], [20, 21], [12, 13], [22, 23]],
+        dtype=torch.int32,
+        device=device,
+    )
+    capturer.capture(0, ids, slot_mapping=slots)
+    capturer.store_step(slots)
+    patches = capturer.export_range([7, 9], [[0], [1]], [2, 2], 16, [1, 0])
+    assert patches[7][0] == 1
+    np.testing.assert_array_equal(patches[7][1][:, 0, :], [[12, 13]])
+    assert patches[9][0] == 0
+    np.testing.assert_array_equal(patches[9][1][:, 0, :], [[20, 21], [22, 23]])
+
+
+def test_kv_slots_start_token_skips_prefix():
+    slots = kv_slots_from_block_table(
+        [4, 9], num_tokens=18, block_size=16, start_token=16
+    )
+    assert slots.tolist() == [9 * 16, 9 * 16 + 1]
+
+
+def test_apply_patch_extends_none_and_appends():
+    seq = Sequence([1, 2, 3], 3)
+    assert seq.routed_experts is None
+    first = np.arange(4, dtype=np.int16).reshape(2, 1, 2)
+    seq.apply_routed_expert_patch(0, first)
+    np.testing.assert_array_equal(seq.routed_experts, first)
+    second = np.arange(4, 6, dtype=np.int16).reshape(1, 1, 2)
+    seq.apply_routed_expert_patch(2, second)
+    assert seq.routed_expert_rows == 3
+    np.testing.assert_array_equal(
+        seq.routed_experts, np.concatenate([first, second], axis=0)
+    )
+
+
+def test_apply_patch_rejects_gap():
+    seq = Sequence([1, 2, 3], 3)
+    seq.apply_routed_expert_patch(0, np.zeros((2, 1, 1), dtype=np.int16))
+    with pytest.raises(ValueError, match="gap"):
+        seq.apply_routed_expert_patch(4, np.zeros((1, 1, 1), dtype=np.int16))
+
+
+def test_apply_patch_replaces_suffix():
+    seq = Sequence([1, 2, 3], 3)
+    seq.apply_routed_expert_patch(0, np.arange(6, dtype=np.int16).reshape(3, 1, 2))
+    replacement = np.array([[[9, 8]]], dtype=np.int16)
+    seq.apply_routed_expert_patch(1, replacement)
+    assert seq.routed_expert_rows == 2
+    np.testing.assert_array_equal(seq.routed_experts[1:], replacement)
+
+
+def test_truncate_routed_experts_drops_tail():
+    seq = Sequence([1, 2, 3], 3)
+    seq.apply_routed_expert_patch(0, np.arange(8, dtype=np.int16).reshape(4, 1, 2))
+    seq.truncate_routed_experts(2)
+    assert seq.routed_experts.shape[0] == 2
+    seq.truncate_routed_experts(0)
+    assert seq.routed_experts is None
+
+
+def test_apply_patch_deferred_overlap_keeps_prefix():
+    """PP=1 deferred attach reports start = have-1; overwrite last row, keep prefix."""
+    seq = Sequence([1, 2, 3], 3)
+    first = np.arange(6, dtype=np.int16).reshape(3, 1, 2)
+    seq.apply_routed_expert_patch(0, first)
+    nxt = np.array([[[90, 91], [92, 93]]], dtype=np.int16).reshape(2, 1, 2)
+    seq.apply_routed_expert_patch(seq.routed_expert_rows - 1, nxt)
+    assert seq.routed_expert_rows == 4
+    np.testing.assert_array_equal(seq.routed_experts[:2], first[:2])
+    np.testing.assert_array_equal(seq.routed_experts[2:], nxt)
+
+
+def test_apply_patch_grows_capacity_across_many_decode_steps():
+    seq = Sequence([1, 2, 3], 3)
+    seq.apply_routed_expert_patch(0, np.zeros((8, 2, 2), dtype=np.int16))
+    for i in range(8, 64):
+        seq.apply_routed_expert_patch(
+            seq.routed_expert_rows - 1,
+            np.full((2, 2, 2), i, dtype=np.int16),
+        )
+    assert seq.routed_expert_rows == 64
+    out = seq.routed_experts
+    assert out.shape == (64, 2, 2)
+    np.testing.assert_array_equal(out[-2:], np.full((2, 2, 2), 63, dtype=np.int16))
+    assert seq._routed_expert_buf.shape[0] >= 64
+
+
+def test_incremental_decode_payload_smaller_than_full_history():
+    import pickle
+
+    layers, top_k, ctx, batch = 48, 8, 512, 8
+    full = {i: np.zeros((ctx, layers, top_k), dtype=np.int16) for i in range(batch)}
+    patch = {
+        i: (ctx - 1, np.zeros((1, layers, top_k), dtype=np.int16)) for i in range(batch)
+    }
+    full_size = len(pickle.dumps(full))
+    patch_size = len(pickle.dumps(patch))
+    assert patch_size * 20 < full_size

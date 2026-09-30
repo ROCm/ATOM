@@ -315,7 +315,11 @@ class Sequence:
         # consumer that needs a list, and it converts at its own boundary.
         self.logprobs: array.array = array.array("d")
         # MoE routes gathered from KV slots: int16 [seq_len-1, layers, top_k].
-        self.routed_experts: np.ndarray | None = None
+        # One growable buffer (capacity doubles) so deferred overlapping
+        # patches are a slice write, not an O(steps) chunk-list walk.
+        # `_routed_expert_rows` is the live length; the tail is unused.
+        self._routed_expert_buf: np.ndarray | None = None
+        self._routed_expert_rows: int = 0
         # stream callback
         self.stream_callback = stream_callback
         # The completion half of `token_ids`, kept in step with it by every
@@ -419,6 +423,77 @@ class Sequence:
     @property
     def is_finished(self):
         return self.status == SequenceStatus.FINISHED
+
+    @property
+    def routed_expert_rows(self) -> int:
+        """How many MoE-route rows have already been accumulated."""
+        return self._routed_expert_rows
+
+    @property
+    def routed_experts(self) -> np.ndarray | None:
+        """Materialized int16 [rows, layers, top_k], or None if empty."""
+        return self.materialize_routed_experts()
+
+    @routed_experts.setter
+    def routed_experts(self, value: np.ndarray | None) -> None:
+        if value is None:
+            self._routed_expert_buf = None
+            self._routed_expert_rows = 0
+            return
+        arr = np.ascontiguousarray(value, dtype=np.int16)
+        self._routed_expert_buf = arr
+        self._routed_expert_rows = int(arr.shape[0])
+
+    def _ensure_routed_expert_capacity(
+        self, need: int, layers: int, top_k: int
+    ) -> None:
+        buf = self._routed_expert_buf
+        if buf is None:
+            self._routed_expert_buf = np.empty((need, layers, top_k), dtype=np.int16)
+            return
+        if need <= buf.shape[0]:
+            return
+        cap = buf.shape[0]
+        while cap < need:
+            cap *= 2
+        grown = np.empty((cap, buf.shape[1], buf.shape[2]), dtype=np.int16)
+        n = self._routed_expert_rows
+        if n:
+            grown[:n] = buf[:n]
+        self._routed_expert_buf = grown
+
+    def apply_routed_expert_patch(self, start: int, rows: np.ndarray | None) -> None:
+        """Merge an absolute-range patch. Gaps are rejected; overlap overwrites."""
+        if rows is None:
+            return
+        arr = np.ascontiguousarray(rows, dtype=np.int16)
+        n = int(arr.shape[0])
+        if n == 0:
+            return
+        start = int(start)
+        if start > self._routed_expert_rows:
+            raise ValueError(
+                f"gap in routed-expert patch: start={start} "
+                f"have={self._routed_expert_rows}"
+            )
+        end = start + n
+        self._ensure_routed_expert_capacity(end, arr.shape[1], arr.shape[2])
+        self._routed_expert_buf[start:end] = arr
+        self._routed_expert_rows = end
+
+    def truncate_routed_experts(self, keep_rows: int) -> None:
+        """Drop trailing route rows after speculative reject / stop trim."""
+        keep = max(int(keep_rows), 0)
+        if keep >= self._routed_expert_rows:
+            return
+        self._routed_expert_rows = keep
+
+    def materialize_routed_experts(self) -> np.ndarray | None:
+        buf = self._routed_expert_buf
+        n = self._routed_expert_rows
+        if buf is None or n <= 0:
+            return None
+        return buf[:n].copy()
 
     @property
     def num_completion_tokens(self):

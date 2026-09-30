@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import time
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from typing import Any, ClassVar, NamedTuple
@@ -358,6 +359,7 @@ class tokenIDProcessor:
         sampled_token_ids: torch.Tensor,
         sync_event: torch.cuda.Event,
         sampled_logprobs: torch.Tensor | None = None,
+        after_recv: Callable[[], None] | None = None,
     ) -> tuple[dict[int, tuple[int, ...]], dict[int, float] | None]:
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
@@ -378,6 +380,10 @@ class tokenIDProcessor:
 
         token_ids = self.recv_async_output(self.token_ids_cpu)
         logprobs = self.recv_logprobs()
+        # Previous copy_done covers token + route D2H from last step. Commit
+        # and queue this step's route copy *before* send records copy_done.
+        if after_recv is not None:
+            after_recv()
         self.send_to_cpu_async(
             sampled_token_ids,
             self.token_ids_cpu,
@@ -2158,11 +2164,13 @@ class ModelRunner:
         block_tables = getattr(batch, "block_tables", None)
         if not block_tables or len(block_tables) != len(batch.req_ids):
             return
-        output.routed_experts = capturer.export_batch(
+        starts = getattr(batch, "routed_export_starts", None)
+        output.routed_experts = capturer.export_range(
             batch.req_ids,
             block_tables,
             batch.context_lens,
             self.block_size,
+            starts,
         )
 
     def get_dp_padding(self, num_tokens: int) -> tuple[int, torch.Tensor | None]:
@@ -3264,13 +3272,25 @@ class ModelRunner:
         )
 
         slots = _current_slot_mapping()
+
+        def _queue_routed_store_after_recv() -> None:
+            self._commit_routed_experts()
+            self._store_routed_experts_step(
+                batch,
+                stream=self.tokenID_processor.async_copy_stream,
+                wait_event=self.forward_done_event,
+                slot_mapping=slots,
+            )
+
         token_id_dict, logprobs_map = self.tokenID_processor.prepare_sampled_ids(
-            batch, sampled_tokens, self.forward_done_event, sampled_logprobs
+            batch,
+            sampled_tokens,
+            self.forward_done_event,
+            sampled_logprobs,
+            after_recv=_queue_routed_store_after_recv if deferred else None,
         )
-        # Blocking D2H after recv: previous copy_done already waited, so this
-        # memcpy does not absorb the current decode. cpu_buffer is complete
-        # before the next step attaches this batch as prev_batch.
-        self._store_routed_experts_step(batch, slot_mapping=slots)
+        if not deferred:
+            self._store_routed_experts_step(batch, slot_mapping=slots)
         # Extract req_ids and token_ids from dict (key -1 is the is_deferred_out flag)
         req_ids_out = [k for k in token_id_dict if k != -1]
         token_ids_out = [token_id_dict[k] for k in req_ids_out]
@@ -3454,6 +3474,7 @@ class ModelRunner:
                 num_bonus=None,
                 draft_token_ids=None,
             )
+            self._attach_routed_experts(batch, output)
             return output
 
         fwd_output = self.postprocess(

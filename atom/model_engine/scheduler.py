@@ -288,6 +288,13 @@ class ScheduledBatch:
             dtype=np.int32,
         )
 
+        # Already-accumulated route rows per request. The runner exports
+        # [start, context_len) so decode IPC stays O(new tokens).
+        self.routed_export_starts = np.asarray(
+            [int(seq.routed_expert_rows) for seq in seqs.values()],
+            dtype=np.int32,
+        )
+
         # Each sequence's window, staged into one array rather than assigned
         # per sequence: a numpy slice-assign costs ~245ns of dispatch whatever
         # its length, and at decode a window is a single token. `extend`
@@ -485,8 +492,8 @@ class ScheduledBatchOutput:
         # (main-process) scheduler so the NEXT step can size each request's
         # verification to ell_r+1. None when DSpark scheduling is off.
         self.dspark_ell = dspark_ell
-        # Per-request MoE routes gathered this step, keyed by req_id.
-        # Each value is int16 [num_forwarded_tokens, num_layers, top_k].
+        # Per-request MoE route patches, keyed by req_id.
+        # Each value is (start_row, int16 [delta_rows, num_layers, top_k]).
         self.routed_experts = routed_experts
         # O(1) lookup: req_id -> index (lazy-built on first access)
         self._req_id_to_idx: dict[int, int] | None = None
@@ -2987,6 +2994,17 @@ class Scheduler:
             start_tokens = int(batch.num_cached_tokens[i])
             self.block_manager.hash_blocks(seq, chunk, start_tokens=start_tokens)
 
+    @staticmethod
+    def _merge_routed_expert_payload(seq: Sequence, payload) -> None:
+        """Apply a range patch or a full-history array onto ``seq``."""
+        if payload is None:
+            return
+        if isinstance(payload, tuple) and len(payload) == 2:
+            start, rows = payload
+            seq.apply_routed_expert_patch(start, rows)
+            return
+        seq.routed_experts = payload
+
     def postprocess(
         self,
         seqs: list[Sequence],
@@ -3024,10 +3042,10 @@ class Scheduler:
             seq_map = dict(running_by_id)
             for seq in seqs:
                 seq_map[seq.id] = seq
-            for req_id, arr in routed.items():
+            for req_id, payload in routed.items():
                 seq = seq_map.get(req_id)
                 if seq is not None:
-                    seq.routed_experts = arr
+                    self._merge_routed_expert_payload(seq, payload)
         num_prefill = int(getattr(batch, "total_seqs_num_prefill", 0))
         prefill_ids = set(batch.req_ids[:num_prefill]) if num_prefill else set()
         if self._connector_flag("is_offload") and num_prefill:
@@ -3118,6 +3136,10 @@ class Scheduler:
             # Update the running status
             idx = fwd_output.get_idx(seq.id)
             if idx is None:
+                continue
+            # Middle-chunk prefill returns req_ids with no sampled tokens so
+            # route patches can merge without advancing generation.
+            if idx >= len(prev_token_ids):
                 continue
             # An immediate preempt/resume can retain the same request ID in
             # the runner's deferred output. That result belongs to execution
@@ -3397,12 +3419,17 @@ class Scheduler:
             # A terminal event is required even when truncation leaves no
             # tokens (for example max_tokens <= 0). Async consumers wait for
             # this finished RequestOutput and would otherwise block forever.
-            if leave_reason is not None and seq.routed_experts is not None:
-                from atom.model_ops.fused_moe.routed_experts_capturer import (
-                    trim_routed_experts,
-                )
-
-                seq.routed_experts = trim_routed_experts(seq.routed_experts, num_tokens)
+            if leave_reason is not None:
+                if seq.routed_expert_rows > 0:
+                    seq.truncate_routed_experts(max(int(num_tokens) - 1, 0))
+            elif (
+                seq.routed_expert_rows > 0
+                and not seq.is_partial_prefill
+                and seq.id not in pp_middle_chunk_ids
+            ):
+                keep = max(int(num_tokens) - 1, 0)
+                if keep < seq.routed_expert_rows:
+                    seq.truncate_routed_experts(keep)
             if stream_output_queue is not None and (
                 new_tokens or leave_reason is not None
             ):
