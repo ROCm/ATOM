@@ -20,8 +20,9 @@ on:
     types: [submitted]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'pull_request_review' && github.event.review.state == 'approved') }}
+  # Non-approval reviews must not replace a pending approval run.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'pull_request_review' && github.event.review.state != 'approved' && format('-review-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   ATOM_BASE_NIGHTLY_IMAGE: rocm/atom-dev:latest
@@ -35,6 +36,7 @@ jobs:
     name: Check Heavy CI Gate
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: read
       pull-requests: read
     outputs:
@@ -47,6 +49,7 @@ jobs:
       - name: Check approval and label gate
         id: gate
         env:
+          CI_GATE_WORKFLOW: atom-sglang-test.yaml
           CI_GATE_LABELS: ci:full,ci:sglang
           CI_GATE_PATHS_IGNORE: |
             **/*.md
