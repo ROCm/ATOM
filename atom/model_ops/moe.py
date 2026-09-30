@@ -1011,18 +1011,39 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
         )
 
 
+# One GLM-5.3 IQ2R workspace per device and shape, shared by every MoE layer:
+# layers run serially on a rank, so a fixed buffer set is also graph-safe.
+_IQ2R_GLM53_WORKSPACES: dict[tuple[torch.device, int, int], object] = {}
+
+
 class Iq2rMoEMethod(FusedMoEMethodBase):
-    """TP1 adapter for AITER-owned native-basis IQ2R experts."""
+    """Adapter for AITER-owned native-basis IQ2R experts.
+
+    Canonical IQ2R checkpoints run at TP1. The ``glm53-packed-v1`` layout
+    (GLM-5.3 with the shared expert fused as expert 256) runs at TP4/TP8:
+    each rank slices the intermediate dimension of the full checkpoint as it
+    loads.
+    """
 
     # GPT-OSS uses this existing capability flag only to skip its MXFP4-specific
     # gate/up rewrite. IQ2R itself executes through AITER HIP kernels.
     use_triton = True
     supports_router_bias_deferral = True
     supports_fused_next_rmsnorm = True
+    packed = False
+    tp_size = 1
 
-    def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
+    def __init__(
+        self,
+        quant_config: LayerQuantConfig,
+        moe: FusedMoEConfig,
+        layout: str | None = None,
+    ):
         super().__init__(moe)
         self.quant_config = quant_config
+        if layout not in (None, "glm53-packed-v1"):
+            raise ValueError(f"unsupported IQ2R layout {layout!r}")
+        self.packed = layout is not None
         self.output_hidden_size = moe.hidden_dim
         self._workspaces: dict[tuple[torch.device, int, int, int, int], object] = {}
 
@@ -1037,7 +1058,21 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
     ) -> None:
         del params_dtype
         parallel = self.moe.moe_parallel_config
-        if parallel.tp_size != 1 or parallel.ep_size != 1:
+        if self.packed:
+            if (
+                parallel.ep_size != 1
+                or layer.has_bias
+                or num_experts != 257
+                or hidden_size != 6144
+                or intermediate_size_per_partition not in (256, 512)
+            ):
+                raise NotImplementedError(
+                    "the glm53-packed-v1 IQ2R layout supports GLM-5.3 with a "
+                    "fused shared expert at TP4/TP8"
+                )
+            self.tp_size = parallel.tp_size
+            self.tp_rank = parallel.tp_rank
+        elif parallel.tp_size != 1 or parallel.ep_size != 1:
             raise NotImplementedError("IQ2R currently supports TP1/EP1 only")
         if num_experts <= 0 or num_experts > 512:
             raise ValueError("IQ2R requires between 1 and 512 routed experts")
@@ -1057,15 +1092,18 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
         self.intermediate_size = intermediate_size_per_partition
         layer.iq2r_gate_up_metadata = gate_metadata
         layer.iq2r_down_metadata = down_metadata
+        gate_bytes = gate_metadata.data_bytes
+        if self.packed:
+            from aiter.iq2r_glm53 import iq2r_glm53_gate_bytes
+
+            gate_bytes = iq2r_glm53_gate_bytes(gate_metadata.logical_n)
         layer.iq2r_gate_up_tile_n = 128 if gate_metadata.logical_n % 128 == 0 else 64
         layer.iq2r_down_tile_n = 128 if down_metadata.logical_n % 128 == 0 else 64
         parameters: list[tuple[str, torch.nn.Parameter]] = [
             (
                 "w13_weight",
                 atom_parameter(
-                    torch.empty(
-                        (num_experts, gate_metadata.data_bytes), dtype=torch.uint8
-                    )
+                    torch.empty((num_experts, gate_bytes), dtype=torch.uint8)
                 ),
             ),
             (
@@ -1134,6 +1172,8 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
         name = getattr(param, "iq2r_name", None)
         if name is None:
             raise ValueError("IQ2R loader received an unrecognized parameter")
+        if self.packed and self.tp_size > 1:
+            loaded_weight = self._glm53_tp_slice(name, loaded_weight)
         if tuple(param.shape) != tuple(loaded_weight.shape):
             raise ValueError(
                 f"IQ2R {name} shape mismatch: target={tuple(param.shape)}, "
@@ -1141,11 +1181,53 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
             )
         param.data.copy_(loaded_weight.to(device=param.device, dtype=param.dtype))
 
+    def _glm53_tp_slice(self, name: str, weight: torch.Tensor) -> torch.Tensor:
+        """This rank's intermediate-dimension shard of a full packed layer."""
+        from aiter.iq2r_glm53 import iq2r_glm53_slice_gate
+        from aiter.ops.iq2r_format import (
+            IQ2RMetadata,
+            iq2r_slice_input_data,
+            iq2r_slice_output_auxiliary,
+        )
+
+        shard = self.intermediate_size
+        full = shard * self.tp_size
+        if name == "w13_weight":
+            return iq2r_glm53_slice_gate(weight, 2 * shard * self.tp_rank, 2 * shard)
+        if name == "w13_weight_scale":
+            return iq2r_slice_output_auxiliary(
+                weight,
+                IQ2RMetadata(logical_n=2 * full, logical_k=self.hidden_size),
+                2 * shard * self.tp_rank,
+                2 * shard,
+            )
+        if name == "w2_weight":
+            return iq2r_slice_input_data(
+                weight,
+                IQ2RMetadata(logical_n=self.hidden_size, logical_k=full),
+                shard * self.tp_rank,
+                shard,
+            )
+        # Down codebooks and exponents cover all output columns.
+        return weight
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         from aiter.iq2r_moe import IQ2RMoeWorkspace
         from aiter.ops.iq2r_format import (
             iq2r_validate_expert_weights,
         )
+
+        if self.packed:
+            # Packed gate/up records are regrouped into quads; the down
+            # records keep the canonical geometry and validate as usual.
+            iq2r_validate_expert_weights(
+                layer.w2_weight,
+                layer.w2_weight_scale,
+                layer.iq2r_down_metadata,
+                expert_count=self.num_experts,
+            )
+            self._glm53_workspace(layer.w13_weight.device)
+            return
 
         iq2r_validate_expert_weights(
             layer.w13_weight,
@@ -1189,6 +1271,18 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
                 intermediate_size=self.intermediate_size,
             )
 
+    def _glm53_workspace(self, device: torch.device):
+        from aiter.iq2r_glm53 import IQ2RGlm53Workspace
+
+        key = (device, self.moe.max_num_tokens, self.intermediate_size)
+        workspace = _IQ2R_GLM53_WORKSPACES.get(key)
+        if workspace is None:
+            workspace = IQ2RGlm53Workspace.allocate(
+                self.moe.max_num_tokens, self.intermediate_size, device=device
+            )
+            _IQ2R_GLM53_WORKSPACES[key] = workspace
+        return workspace
+
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
@@ -1220,17 +1314,21 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
         norm_weight: torch.Tensor | None = None,
         norm_epsilon: float = 1e-5,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if activation != ActivationType.Swiglu:
-            raise ValueError("IQ2R requires SwiGLU activation")
+        # GLM-5.3 uses plain SiLU-gated experts; GPT-OSS its clamped SwiGLU.
+        if activation != (
+            ActivationType.Silu if self.packed else ActivationType.Swiglu
+        ):
+            raise ValueError(f"IQ2R does not support {activation} here")
         if expert_map is not None or self.moe.moe_parallel_config.use_ep:
             raise NotImplementedError("IQ2R does not yet support expert parallelism")
         if apply_router_weight_on_input:
             raise NotImplementedError(
                 "IQ2R applies router weights after the down projection"
             )
-        if top_k <= 0 or global_num_experts != self.num_experts:
+        routed_experts = self.num_experts - layer.num_fused_shared_experts
+        if top_k <= 0 or global_num_experts != routed_experts:
             raise ValueError(
-                f"IQ2R expected {self.num_experts} experts and a positive top-k"
+                f"IQ2R expected {routed_experts} experts and a positive top-k"
             )
         if router_bias is not None and (
             router_bias.dtype != torch.bfloat16
@@ -1339,6 +1437,27 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
                 topk_weights,
                 hidden_size=logical_hidden_size,
             )
+
+        if self.packed:
+            if residual is not None:
+                raise NotImplementedError(
+                    "the packed GLM-5.3 IQ2R path does not fuse the next RMSNorm"
+                )
+            from aiter.iq2r_glm53 import iq2r_glm53_moe_out
+
+            output = torch.empty_like(x)
+            iq2r_glm53_moe_out(
+                x,
+                layer.w13_weight,
+                layer.w13_weight_scale,
+                layer.w2_weight,
+                layer.w2_weight_scale,
+                topk_weights,
+                topk_ids,
+                output,
+                self._glm53_workspace(x.device),
+            )
+            return output
 
         workspace = get_workspace()
 
@@ -4129,7 +4248,11 @@ class FusedMoE(torch.nn.Module):
                 moe
             )
         elif quant_method_str == "iq2r":
-            self.quant_method = Iq2rMoEMethod(layer_quant_config, moe)
+            self.quant_method = Iq2rMoEMethod(
+                layer_quant_config,
+                moe,
+                layout=(quant_config.hf_quant_config or {}).get("iq2r_layout"),
+            )
         elif (
             quant_method_str == "compressed-tensors"
             and layer_quant_config.quant_dtype == dtypes.fp8
