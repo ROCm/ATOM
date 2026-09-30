@@ -7,6 +7,10 @@
 # The router answers /health only once a prefill and a decode have registered.
 ROUTER_READY_PATH="/health"
 ROUTER_ALIVE_PATH="/liveness"
+if [[ "${ATOMESH_VLLM_CONNECTOR:-moriio}" == "nixl" ]]; then
+  ROUTER_READY_PATH="/healthcheck"
+  ROUTER_ALIVE_PATH="/healthcheck"
+fi
 SERVED_MODEL_NAME="${ATOMESH_VLLM_SERVED_MODEL_NAME:-${MODEL_PATH}}"
 VLLM_DISCOVERY_PORT=$((${ATOMESH_VLLM_ROUTER_DISCOVERY_PORT:?vllm.router.discovery_port is required} + ATOMESH_SERVICE_PORT_OFFSET))
 VLLM_SITE_DIR="/tmp/atomesh-vllm-site"
@@ -64,7 +68,10 @@ from pathlib import Path
 
 import torch
 import vllm
-from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import MoRIIOConnector
+if os.environ.get("ATOMESH_VLLM_CONNECTOR") == "nixl":
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlConnector
+else:
+    from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import MoRIIOConnector
 
 assert Path(vllm.__file__).is_relative_to(sys.argv[1]), vllm.__file__
 import vllm._C
@@ -77,6 +84,21 @@ manifest = {
     "torch": torch.__version__, "hip": torch.version.hip,
     "packages": {d.metadata['Name']: d.version for d in importlib.metadata.distributions()},
 }
+if os.environ.get("ATOMESH_VLLM_CONNECTOR") == "nixl":
+    # Initializes only a transport agent; no GPU allocation, registration or transfer.
+    from vllm.distributed.nixl_utils import NixlWrapper, nixl_agent_config
+    try:
+        assert NixlWrapper is not None and nixl_agent_config is not None
+        agent = NixlWrapper("survey-preflight", nixl_agent_config(backends=["UCX"]))
+        manifest["nixl_plugins"] = agent.get_plugin_list()
+        assert "UCX" in manifest["nixl_plugins"], "UCX plugin unavailable"
+        manifest["nixl_ucx_preflight"] = "AVAILABLE_NOT_RDMA_VALIDATED"
+        del agent
+    except Exception as exc:
+        manifest["nixl_ucx_preflight"] = "BLOCKED_ENV"
+        manifest["dependency_error"] = repr(exc)
+        Path(sys.argv[3]).write_text(json.dumps(manifest, indent=2) + "\n")
+        raise
 if os.environ.get("ATOMESH_VLLM_CLEAN_MAIN") == "1":
     import triton.language.target_info as target_info
     from vllm.model_executor.models import ModelRegistry
@@ -271,9 +293,19 @@ kv_transfer_config() {
   python3 - "${role}" "${NODE0_ADDR}" "${VLLM_DISCOVERY_PORT}" "${http_port}" \
     "${lmcache_port}" "${ATOMESH_VLLM_LMCACHE_MQ_TIMEOUT:-6000}" "${ATOMESH_VLLM_CLEAN_MAIN:-0}" <<'PY'
 import json
+import os
 import sys
 
 role, proxy_ip, ping_port, http_port, lmcache_port, mq_timeout, clean_main = sys.argv[1:]
+if os.environ.get("ATOMESH_VLLM_CONNECTOR") == "nixl":
+    assert clean_main == "1" and not lmcache_port
+    print(json.dumps({
+        "kv_connector": "NixlConnector",
+        "kv_role": "kv_producer" if role == "prefill" else "kv_consumer",
+        "kv_load_failure_policy": "fail",
+        "kv_connector_extra_config": {"backends": ["UCX"]},
+    }))
+    raise SystemExit(0)
 moriio = {
     "kv_connector": "MoRIIOConnector",
     "kv_role": "kv_producer" if role == "prefill" else "kv_consumer",
@@ -328,6 +360,10 @@ start_vllm_server() {
 
   local lmcache_port=""
   local -a server_env=("PYTHONPATH=${server_pythonpath}")
+  if [[ "${ATOMESH_VLLM_CONNECTOR:-moriio}" == "nixl" ]]; then
+    server_env+=("VLLM_NIXL_SIDE_CHANNEL_HOST=${host_ip}"
+      "VLLM_NIXL_SIDE_CHANNEL_PORT=$((15559 + NODE_RANK * 100 + ATOMESH_SERVICE_PORT_OFFSET))")
+  fi
   if [[ "${role}" == "prefill" && -n "${ATOMESH_VLLM_LMCACHE_WHEEL:-}" ]]; then
     lmcache_port=$((ATOMESH_VLLM_LMCACHE_PORT + ATOMESH_SERVICE_PORT_OFFSET))
     start_lmcache "${lmcache_port}" $((ATOMESH_VLLM_LMCACHE_HTTP_PORT + ATOMESH_SERVICE_PORT_OFFSET))
@@ -378,6 +414,14 @@ start_decode() {
 
 start_router() {
   router_pid=""
+  if [[ "${ATOMESH_VLLM_CONNECTOR:-moriio}" == "nixl" ]]; then
+    start_logged_process router_pid "${RUNTIME_LOG_DIR}/nixl-proxy.log" \
+      python3 /tmp/atomesh-native-vllm/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py \
+      --host 0.0.0.0 --port "${ROUTER_PORT}" \
+      --prefiller-hosts "${NODE0_ADDR}" --prefiller-ports "${PREFILL_PORT}" \
+      --decoder-hosts "${IP_ARRAY[1]}" --decoder-ports "${DECODE_PORT}"
+    return
+  fi
   echo "[router] vllm-router sidecar on :${ROUTER_PORT}, discovery :${VLLM_DISCOVERY_PORT}"
 }
 

@@ -1,0 +1,11 @@
+{
+  "suite": "vllm",
+  "case_names": "survey-m3-mxfp8-main-nixl-1p1d-tp8-eager",
+  "run_all_models": "false",
+  "run_model_benchmark": "true",
+  "publish_dashboard": "false",
+  "atomesh_slurm_submit_runner": "atomesh-cicd",
+  "atomesh_slurm_account": "amd-frameworks",
+  "atomesh_slurm_partition": "amd-spur",
+  "atomesh_1p1d_nodes": "pit2-p03-g13,pit2-p03-g42"
+}

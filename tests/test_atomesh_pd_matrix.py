@@ -185,6 +185,31 @@ class SurveyConfigurationTest(unittest.TestCase):
             report = preflight.check_weights(model, root)
             self.assertEqual(report["status"], "FILES_VISIBLE")
             self.assertEqual(report["quantization_config"]["quant_method"], "mxfp4")
+            (model / "tokenizer.json").unlink()
+            (model / "tokenizer_config.json").write_text(
+                json.dumps(
+                    {
+                        "auto_map": {
+                            "AutoTokenizer": [
+                                "tokenization_kimi.TikTokenTokenizer",
+                                None,
+                            ]
+                        }
+                    }
+                )
+            )
+            for name in ("tiktoken.model", "tokenization_kimi.py", "encoding_k3.py"):
+                self.assertEqual(
+                    preflight.check_weights(model, root)["status"], "BLOCKED_ENV"
+                )
+                (model / name).write_bytes(b"fixture - not executed")
+            self.assertEqual(
+                preflight.check_weights(model, root)["status"], "FILES_VISIBLE"
+            )
+            (model / "tiktoken.model").write_bytes(b"")
+            self.assertEqual(
+                preflight.check_weights(model, root)["status"], "BLOCKED_ENV"
+            )
 
     def test_smoke_workload_is_bounded_and_never_profiles(self):
         import httpx
@@ -306,6 +331,243 @@ class SurveyConfigurationTest(unittest.TestCase):
                     self.assertEqual(evidence["status"], "FAIL")
             fault[key] = False
 
+    def test_m3_nixl_protocol_and_failed_transfer_evidence(self):
+        import httpx
+
+        spec = importlib.util.spec_from_file_location(
+            "m3_smoke", SCRIPT.parent / "pd_m3_nixl_smoke.py"
+        )
+        smoke = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(smoke)
+        for fault in (
+            "none",
+            "failure",
+            "bytes_first",
+            "missing",
+            "overcount",
+            "reference_late",
+            "reference_missing",
+            "reference_baseline_missing",
+            "decode_baseline_missing",
+            "partial_label_baseline_missing",
+            "after_series_missing",
+            "usage",
+        ):
+            with self.subTest(fault=fault):
+                counters = {
+                    role: {
+                        "local_compute": 0,
+                        "local_cache_hit": 0,
+                        "external_kv_transfer": 0,
+                        "success": 0,
+                        "bytes": 0,
+                        "count": 0,
+                        "failed": 0,
+                    }
+                    for role in ("prefill", "decode")
+                }
+                delayed = {}
+                calls = []
+                handoff = {
+                    "do_remote_prefill": True,
+                    "do_remote_decode": False,
+                    "remote_engine_id": "p-engine",
+                    "remote_host": "prefill",
+                    "remote_port": 15559,
+                    "remote_block_ids": [[1, 2], [3, 4]],
+                    "remote_request_id": "p-request",
+                }
+
+                def respond(
+                    request,
+                    counters=counters,
+                    delayed=delayed,
+                    calls=calls,
+                    handoff=handoff,
+                    fault=fault,
+                ):
+                    role = request.url.host
+                    c = counters[role]
+                    if request.url.path == "/metrics":
+                        if role in delayed:
+                            remaining, updates = delayed[role]
+                            if remaining == 0:
+                                for key, value in updates.items():
+                                    c[key] += value
+                                del delayed[role]
+                            else:
+                                delayed[role] = (remaining - 1, updates)
+                        text = "\n".join(
+                            f'vllm:prompt_tokens_by_source_total{{source="{key}"}} {c[key]}'
+                            for key in smoke.SOURCES
+                        )
+                        text += (
+                            f'\nvllm:request_success_total{{engine="0"}} {c["success"]}'
+                        )
+                        text += f'\nvllm:nixl_bytes_transferred_sum{{engine="0"}} {c["bytes"]}'
+                        text += f'\nvllm:nixl_bytes_transferred_count{{engine="0"}} {c["count"]}'
+                        for name in smoke.FAILURES:
+                            if fault != "missing" or role == "prefill":
+                                text += f'\n{name}{{engine="0"}} {c["failed"]}'
+                        if (fault == "reference_baseline_missing" and not calls) or (
+                            fault == "decode_baseline_missing"
+                            and role == "decode"
+                            and c["success"] == 0
+                        ):
+                            text = ""
+                        if (
+                            fault == "partial_label_baseline_missing"
+                            and role == "decode"
+                        ):
+                            # One absent label must not disappear into another label's sum.
+                            text += '\nvllm:nixl_bytes_transferred_sum{engine="1"} 0'
+                            if c["success"] == 0:
+                                text = "\n".join(
+                                    line
+                                    for line in text.splitlines()
+                                    if not line.startswith(
+                                        'vllm:nixl_bytes_transferred_sum{engine="0"}'
+                                    )
+                                )
+                        if (
+                            fault == "after_series_missing"
+                            and role == "decode"
+                            and c["success"]
+                        ):
+                            text = "\n".join(
+                                line
+                                for line in text.splitlines()
+                                if not line.startswith(
+                                    "vllm:nixl_bytes_transferred_count"
+                                )
+                            )
+                        return httpx.Response(200, text=text)
+                    if request.url.path == "/tokenize":
+                        return httpx.Response(200, json={"tokens": list(range(1024))})
+                    self.assertEqual(request.url.path, "/v1/completions")
+                    body = json.loads(request.content)
+                    calls.append((role, body))
+                    n = len(body["prompt"])
+                    result = {
+                        "choices": [{"text": "same", "finish_reason": "length"}],
+                        "usage": {
+                            "prompt_tokens": n,
+                            "completion_tokens": body["max_tokens"],
+                        },
+                    }
+                    updates = {"success": 1, "local_compute": n}
+                    if role == "decode":
+                        self.assertEqual(body["kv_transfer_params"], handoff)
+                        c["bytes"] += 8192
+                        c["count"] += 1
+                        c["failed"] += int(fault == "failure")
+                        updates = {
+                            "success": 1,
+                            "external_kv_transfer": n,
+                            "local_compute": n if fault == "overcount" else 0,
+                        }
+                        if fault == "usage":
+                            result["usage"]["completion_tokens"] = 15
+                    elif "kv_transfer_params" in body:
+                        self.assertNotIn("transfer_id", body["kv_transfer_params"])
+                        self.assertIsNone(
+                            body["kv_transfer_params"]["remote_engine_id"]
+                        )
+                        self.assertNotIn(
+                            "prefill", delayed, "reference was not flushed"
+                        )
+                        result["kv_transfer_params"] = handoff
+                    reference = role == "prefill" and "kv_transfer_params" not in body
+                    if (fault == "bytes_first" and role == "decode") or (
+                        reference and fault in ("reference_late", "reference_missing")
+                    ):
+                        delayed[role] = (
+                            100 if fault == "reference_missing" else 2,
+                            updates,
+                        )
+                    else:
+                        for key, value in updates.items():
+                            c[key] += value
+                    return httpx.Response(200, json=result)
+
+                client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+                from unittest.mock import AsyncMock
+
+                with (
+                    tempfile.TemporaryDirectory() as tmp,
+                    patch.object(smoke.httpx, "AsyncClient", return_value=client),
+                    patch.object(smoke.asyncio, "sleep", new=AsyncMock()),
+                ):
+                    args = argparse.Namespace(
+                        output=Path(tmp),
+                        prefill="http://prefill",
+                        decode="http://decode",
+                        model="M3",
+                    )
+                    if fault in ("failure", "overcount", "usage"):
+                        with self.assertRaises(AssertionError):
+                            asyncio.run(smoke.run(args))
+                        evidence = json.loads(
+                            (args.output / "request-127.json").read_text()
+                        )
+                        self.assertEqual(evidence["status"], "FAIL")
+                        self.assertFalse((args.output / "complete.json").exists())
+                    elif fault in (
+                        "missing",
+                        "reference_missing",
+                        "reference_baseline_missing",
+                        "decode_baseline_missing",
+                        "partial_label_baseline_missing",
+                        "after_series_missing",
+                    ):
+                        asyncio.run(smoke.run(args))
+                        self.assertFalse((args.output / "complete.json").exists())
+                        evidence = json.loads(
+                            (args.output / "pending.json").read_text()
+                        )
+                        self.assertFalse(evidence["accounting_checked"])
+                        reference_fault = fault in (
+                            "reference_missing",
+                            "reference_baseline_missing",
+                        )
+                        self.assertEqual(len(calls), 1 if reference_fault else 3)
+                        if (
+                            "baseline_missing" in fault
+                            or fault == "after_series_missing"
+                        ):
+                            key = (
+                                "reference_metric_deltas"
+                                if reference_fault
+                                else "labeled_metric_deltas"
+                            )
+                            role = "prefill" if reference_fault else "decode"
+                            unknown = evidence[key + "_unknown_series"][role]
+                            self.assertTrue(unknown)
+                            self.assertTrue(
+                                all(
+                                    evidence[key][role][name] is None
+                                    for name in unknown
+                                )
+                            )
+                    else:
+                        asyncio.run(smoke.run(args))
+                        self.assertEqual(len(calls), 9)
+                        evidence = json.loads(
+                            (args.output / "request-513.json").read_text()
+                        )
+                        self.assertTrue(evidence["accounting_checked"])
+                        self.assertEqual(evidence["nixl_bytes"], 8192)
+                        self.assertEqual(evidence["external_tokens"], 513)
+                        self.assertEqual(
+                            evidence["remote_block_groups"], [[1, 2], [3, 4]]
+                        )
+                        self.assertEqual(
+                            json.loads((args.output / "complete.json").read_text())[
+                                "status"
+                            ],
+                            "PENDING_REVIEW",
+                        )
+
     def test_clean_source_two_nodes_and_real_server_argv(self):
         root = SCRIPT.parents[3]
         env = {
@@ -325,14 +587,18 @@ class SurveyConfigurationTest(unittest.TestCase):
             cells = pd_matrix.build_cells(
                 config,
                 suite="vllm",
-                model_filter={"Kimi-K3-vLLM-Survey", "Qwen3-0.6B-vLLM-Survey"},
+                model_filter={
+                    "Kimi-K3-vLLM-Survey",
+                    "Qwen3-0.6B-vLLM-Survey",
+                    "MiniMax-M3-MXFP8-vLLM-Survey",
+                },
                 case_filter=None,
                 benchmark_kind_filter=None,
                 override_image=None,
                 override_benchmark_concurrency=None,
                 override_eval_concurrency=None,
             )
-        self.assertEqual(len(cells), 3)
+        self.assertEqual(len(cells), 4)
         launcher = root / ".github/scripts/atomesh/pd_server_vllm.sh"
         # Load the actual shell function definitions but never execute installation.
         functions = launcher.read_text().split(
@@ -400,7 +666,16 @@ class SurveyConfigurationTest(unittest.TestCase):
                         argv[argv.index("--tensor-parallel-size") + 1],
                         "1" if dense else "8",
                     )
-                    if dense:
+                    nixl = cell["vllm"].get("connector") == "nixl"
+                    if nixl:
+                        self.assertNotIn("--decode-context-parallel-size", argv)
+                        self.assertIn("--no-enable-prefix-caching", argv)
+                        self.assertIn("--language-model-only", argv)
+                        self.assertNotIn("hybrid", cell["vllm"])
+                        self.assertEqual(
+                            argv[argv.index("--max-num-batched-tokens") + 1], "512"
+                        )
+                    elif dense:
                         self.assertNotIn("--decode-context-parallel-size", argv)
                         self.assertNotIn("require_k3_triton", cell["vllm"])
                         self.assertEqual(
@@ -414,12 +689,20 @@ class SurveyConfigurationTest(unittest.TestCase):
                     self.assertNotIn("--quantization-config", argv)
                     self.assertNotIn("--profiler-config", argv)
                     transfer = json.loads(argv[argv.index("--kv-transfer-config") + 1])
-                    self.assertEqual(transfer["kv_connector"], "MoRIIOConnector")
                     self.assertEqual(transfer["kv_load_failure_policy"], "fail")
-                    self.assertTrue(transfer["kv_connector_extra_config"]["read_mode"])
-                    self.assertEqual(
-                        transfer["kv_connector_extra_config"]["backend"], "rdma"
-                    )
+                    if nixl:
+                        self.assertEqual(transfer["kv_connector"], "NixlConnector")
+                        self.assertEqual(
+                            transfer["kv_connector_extra_config"], {"backends": ["UCX"]}
+                        )
+                    else:
+                        self.assertEqual(transfer["kv_connector"], "MoRIIOConnector")
+                        self.assertTrue(
+                            transfer["kv_connector_extra_config"]["read_mode"]
+                        )
+                        self.assertEqual(
+                            transfer["kv_connector_extra_config"]["backend"], "rdma"
+                        )
                     if "dspark3" in cell["name"]:
                         spec = json.loads(argv[argv.index("--speculative-config") + 1])
                         self.assertEqual(spec["rejection_sample_method"], "standard")

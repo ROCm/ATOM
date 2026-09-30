@@ -1360,7 +1360,13 @@ PY
 }
 
 run_workload_phase() {
-  if [[ "${BACKEND}" == "vllm" && "${ATOMESH_VLLM_DIAGNOSTIC:-0}" == "1" ]]; then
+  if [[ "${BACKEND}" == "vllm" && "${ATOMESH_VLLM_CONNECTOR:-moriio}" == "nixl" ]]; then
+    python3 "${ATOMESH_SCRIPT_DIR}/pd_m3_nixl_smoke.py" \
+      --prefill "http://${NODE0_ADDR}:${PREFILL_PORT}" \
+      --decode "http://${IP_ARRAY[1]}:${DECODE_PORT}" \
+      --model "${SERVED_MODEL_NAME}" \
+      --output "${RUN_DIR}/pd-diagnostic/${ATOMESH_EXECUTION_PHASE}"
+  elif [[ "${BACKEND}" == "vllm" && "${ATOMESH_VLLM_DIAGNOSTIC:-0}" == "1" ]]; then
     python3 "${ATOMESH_SCRIPT_DIR}/pd_vllm_profile.py" \
       --prefill "http://${NODE0_ADDR}:${PREFILL_PORT}" \
       --decode "http://${IP_ARRAY[1]}:${DECODE_PORT}" \

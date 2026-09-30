@@ -29,16 +29,34 @@ def check_weights(model, model_root=None):
             else ["model.safetensors"]
         )
         report["weights"] = {name: (model / name).stat().st_size for name in names}
-        assert names and all(report["weights"].values()), "Empty checkpoint index or shard"
+        assert names and all(
+            report["weights"].values()
+        ), "Empty checkpoint index or shard"
         for name in names:
             with (model / name).open("rb") as weight:
                 assert weight.read(8), name
         assert (
             model / "tokenizer_config.json"
         ).is_file(), "Missing tokenizer configuration"
-        assert (model / "tokenizer.json").is_file() or (
-            model / "tokenizer.model"
-        ).is_file(), "Missing tokenizer"
+        tokenizer_config = json.loads((model / "tokenizer_config.json").read_text())
+        tokenizer_names = [
+            name
+            for name in ("tokenizer.json", "tokenizer.model")
+            if (model / name).is_file()
+        ]
+        if not tokenizer_names:
+            auto = tokenizer_config.get("auto_map", {}).get("AutoTokenizer", [])
+            assert "tokenization_kimi.TikTokenTokenizer" in auto, "Missing tokenizer"
+            # Verified K3 local bundle; inspect bytes only, never execute remote code.
+            tokenizer_names = [
+                "tiktoken.model",
+                "tokenization_kimi.py",
+                "encoding_k3.py",
+            ]
+        for name in tokenizer_names:
+            with (model / name).open("rb") as tokenizer_file:
+                assert tokenizer_file.read(8), f"Empty tokenizer file: {name}"
+        report["tokenizer_files"] = tokenizer_names
         report["status"] = "FILES_VISIBLE"
     except (OSError, ValueError, KeyError, AssertionError) as exc:
         report["error"] = repr(exc)

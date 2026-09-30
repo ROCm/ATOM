@@ -1041,6 +1041,67 @@ models:
             wait_server_timeout: 1800
           run_eval: false
 
+  # Candidate shared path only: runner visibility preflight remains authoritative.
+  MiniMax-M3-MXFP8-vLLM-Survey:
+    backend: vllm
+    image: vllm/vllm-openai-rocm:nightly@sha256:659b28319fef4ea0e3d8f33e25b4c35d6f663f5d818a5b2fa06dceaf859234e4
+    model_path: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-MXFP8"
+    precision: MXFP8
+    env:
+      common:
+        ATOMESH_PRE_CLEAN_GPU: "1"
+        AITER_LOG_LEVEL: WARNING
+        VLLM_SERVER_DEV_MODE: "1"
+        VLLM_DISABLE_REQUEST_ID_RANDOMIZATION: "1"
+        VLLM_PLUGINS: ""
+        PYTHONNOUSERSITE: "1"
+        PYTHONDONTWRITEBYTECODE: "1"
+        VLLM_WORKER_MULTIPROC_METHOD: spawn
+        VLLM_USE_V2_MODEL_RUNNER: "1"
+        VLLM_ROCM_USE_AITER: "1"
+        VLLM_ROCM_USE_AITER_MOE: "1"
+        VLLM_ROCM_USE_AITER_RMSNORM: "1"
+        VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: "0"
+        VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: "0"
+        VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: NONE
+        VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+        VLLM_KV_CACHE_LAYOUT: HND
+        HF_HUB_OFFLINE: "1"
+        HF_DATASETS_OFFLINE: "1"
+        VLLM_NO_USAGE_STATS: "1"
+    vllm:
+      served_model_name: MiniMax-M3-MXFP8
+      source:
+        repo: https://github.com/vllm-project/vllm
+        sha: b22494cc0cb4bd9db4a62fb107d92429a4a3249d
+      clean_main: 1
+      diagnostic: 1
+      diagnostic_mode: smoke
+      connector: nixl
+    server:
+      common_args:
+        extra_args: >-
+          --language-model-only --dtype bfloat16 --distributed-executor-backend mp
+          --attention-backend TRITON_ATTN --moe-backend aiter
+          --block-size 128 --kv-cache-dtype fp8 --kv-cache-memory-bytes 4294967296
+          --gpu-memory-utilization 0.5 --max-model-len 4096 --max-num-seqs 1
+          --max-num-batched-tokens 512 --enforce-eager --no-enable-prefix-caching
+    suites:
+      vllm:
+        - name: survey-m3-mxfp8-main-nixl-1p1d-tp8-eager
+          topology: 1p1d
+          display_topology: 1P1D-TP8
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [127, 129, 513]
+          osl: 16
+          concurrency: [1]
+          prefill: {workers: 1, tp: 8, dcp: 1}
+          decode: {workers: 1, tp: 8, dcp: 1}
+          benchmark:
+            wait_server_timeout: 10800
+          run_eval: false
+
   Kimi-K2.5-MXFP4:
     backend: atom
     model_path: "${ATOMESH_MODEL_ROOT}/amd/Kimi-K2.5-MXFP4/"
