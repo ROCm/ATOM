@@ -63,6 +63,11 @@ Key entry points:
 - **Fix-then-sweep**: after fixing a bug, immediately grep for the same pattern across the codebase and fix all occurrences in one pass
 - **Name-matches-function**: variable, function, and file names must accurately describe what they do. When behavior changes, rename immediately — stale names mislead future readers
 
+> The two rules above are also stated from the reviewer's side in
+> `.github/copilot-instructions.md`, which is what Copilot code review reads.
+> That file is the owner for review wording; change it there too if the policy
+> changes here.
+
 ## Key Development Patterns
 
 - **Adding a model**: see `/add-model` for full guide
