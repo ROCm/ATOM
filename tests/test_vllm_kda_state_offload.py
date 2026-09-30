@@ -1219,3 +1219,100 @@ def test_stats_name_every_reason_a_boundary_was_not_stored():
         "cap_declined",
     ):
         assert name in stats
+
+
+# --------------------------------------------------------------------------
+# rides_page: the state travels inside the PAGE transfer object
+# --------------------------------------------------------------------------
+def _riding_planner(pool=None):
+    planner = make_planner(group_ids=(MAMBA_GROUP, MAMBA_GROUP_2), rides_page=True)
+    planner.bind_gpu_block_pool(pool if pool is not None else FakePool())
+    return planner
+
+
+def test_riding_planner_issues_no_jobs_of_its_own():
+    """There is no second tier to drive: the PAGE object carries the state."""
+    planner = _riding_planner()
+    request = FakeRequest("r1")
+    assert (
+        planner.collect_stores(
+            {"r1": [(MAMBA_GROUP, 7, CHUNK), (MAMBA_GROUP_2, 9, CHUNK)]},
+            {"r1": request},
+        )
+        == []
+    )
+    assert (
+        planner.collect_cached_boundary_stores({"r1": 4 * CHUNK}, {"r1": request}) == []
+    )
+
+
+def test_a_save_takes_its_source_from_the_hash_keyed_pool():
+    """Not from a block table: a superseded block still sits in a table."""
+    pool = FakePool()
+    planner = _riding_planner(pool)
+    request = FakeRequest("r1")
+    pool.publish(
+        request.block_hashes[CHUNK // HASH_BLOCK - 1],
+        {MAMBA_GROUP: 7, MAMBA_GROUP_2: 9},
+    )
+    state = planner.take_ride_state(request, "r1", CHUNK)
+    assert state is not None
+    assert state.boundary_tokens == CHUNK
+    assert state.block_ids == (7, 9)
+    # Touched for the same reason a store pins: the copy is asynchronous.
+    assert pool.touched
+
+
+def test_a_boundary_missing_one_group_carries_nothing():
+    """A half state under a whole key is exactly what this leg prevents."""
+    pool = FakePool()
+    planner = _riding_planner(pool)
+    request = FakeRequest("r1")
+    pool.publish(request.block_hashes[CHUNK // HASH_BLOCK - 1], {MAMBA_GROUP: 7})
+    assert planner.take_ride_state(request, "r1", CHUNK) is None
+
+
+def test_a_load_uses_the_destination_vllm_just_allocated():
+    """The committed state is what a hit does *not* have yet; the recorded
+    destination is the only correct answer for a load."""
+    pool = FakePool()
+    planner = _riding_planner(pool)
+    request = FakeRequest("r1")
+    pool.publish(
+        request.block_hashes[CHUNK // HASH_BLOCK - 1],
+        {MAMBA_GROUP: 7, MAMBA_GROUP_2: 9},
+    )
+    group_blocks = ([], [], [])
+    row = (CHUNK - 1) // MAMBA_BLOCK
+    group_blocks = list(group_blocks)
+    group_blocks[MAMBA_GROUP] = [40 + i for i in range(row + 1)]
+    group_blocks[MAMBA_GROUP_2] = [60 + i for i in range(row + 1)]
+    planner.resolve_load(
+        request,
+        tuple(group_blocks),
+        CHUNK,
+        attention_group_id=0,
+        num_external_tokens=CHUNK,
+        attention_block_size=HASH_BLOCK,
+    )
+    assert planner.take_loads() == []
+    state = planner.take_ride_state(request, "r1", CHUNK)
+    assert state.block_ids == (40 + row, 60 + row)
+
+
+def test_cap_hit_truncates_to_a_chunk_without_probing_an_index():
+    """Nothing was ever stored on a leg of its own, so an index probe would
+    decline every hit; what still has to hold is the chunk shape."""
+    planner = _riding_planner()
+    request = FakeRequest("r1")
+    planner.begin_lookup(request)
+    assert planner.cap_hit(FakeSeq("r1"), CHUNK * 2 + 5) == CHUNK * 2
+    assert planner.cap_hit(FakeSeq("r1"), CHUNK - 1) == 0
+    planner.end_lookup()
+
+
+def test_forgetting_a_request_drops_its_recorded_destinations():
+    planner = _riding_planner()
+    planner._record_ride_boundary("r1", CHUNK, (40, 60))
+    planner.forget_request("r1")
+    assert planner.take_ride_state(FakeRequest("r1"), "r1", CHUNK) is None
