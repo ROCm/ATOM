@@ -458,9 +458,12 @@ def test_pp_head_records_once_when_dispatching_a_real_forward(clock):
         call_func=lambda name, *a, **k: dispatched.append(name)
     )
     proc.pp_transport = SimpleNamespace(
-        send_metadata=lambda _: None, recv_tokens=lambda **_: None
+        send_metadata=lambda _: None, recv_completion=lambda **_: None
     )
     proc._poll_kv_transfer_progress = lambda: None
+    # Dynamic chunking off, as it is for any pp_size == 1 deployment: the head
+    # step polls for a calibrated model, and this double answers that poll.
+    proc._dynamic_chunking_enabled = False
     proc._pp_head_step()
     proc._pp_head_step()  # full pipeline: collect only; no second submission
     assert dispatched == ["forward", "flush_pp_send"]

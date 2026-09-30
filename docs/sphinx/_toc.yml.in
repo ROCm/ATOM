@@ -37,6 +37,8 @@ subtrees:
         title: Scheduling and KV cache
       - file: distributed_guide
         title: Distributed inference
+      - file: dynamic_chunking_guide
+        title: Dynamic chunked pipeline parallel
       - file: context_parallel_guide
         title: Context parallelism
       - file: compilation_cudagraph_guide

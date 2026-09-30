@@ -45,6 +45,9 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `enable_log_stats` | `bool` | `True` | Emit the periodic engine-status line (running/waiting reqs, KV usage, prefix-cache hit rate, prompt/generation throughput). Applies to offline `LLM(...)` as well as to the server. Scoped to that line: `[MTP Stats]` and `[Cache Stats]` have their own gates |
 | `throughput_log_interval` | `float` | `10.0` | Seconds between engine-status lines. Must be > 0 |
 | `cache_hit_rate_window` | `int` | `1000` | Requests in the sliding window behind the engine-status line's prefix-cache hit rate. Must be > 0. Only that line is windowed; `/metrics` and `[Cache Stats]` stay cumulative |
+| `enable_dynamic_chunking` | `bool` | `False` | Size pipeline-parallel prefill chunks from a calibrated equal-latency model. Needs `pipeline_parallel_size > 1` and chunked prefill; otherwise the flag is turned off and chunking stays fixed |
+| `dynamic_chunking_smooth_factor` | `float` | `0.75` | Blend from the initial chunk (`0`) to the equal-latency chunk (`1`). The CLI default is `ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR`. Must be in `[0, 1]` when the feature is on |
+| `dynamic_chunking_min_chunk_size` | `int` | `4096` | Floor for a solved chunk. Must be positive when the feature is on |
 | `state_checkpoint_interval_tokens` | `int` | `8192` | For models with per-request state (DeepSeek-V4 compressor ring, GDN recurrent state, Kimi-K3 KDA): tokens between rungs of the checkpoint ladder. The sign carries three policies — `>0` a rung every N tokens (must be a multiple of the prefix-cache hash block size), `0` checkpointing off entirely, `-1` ladder off while the prompt-end anchor and the demand rung still place. See the state-checkpoint section of the [scheduling & KV cache guide](scheduling_kv_cache_guide.md) |
 | `state_checkpoint_demand` | `bool` | `True` | Whether a prefix hit refused for want of a checkpoint may place a rung of its own. Off leaves the prompt-end anchor as the only placement. Overridden by `ATOM_STATE_CHECKPOINT_DEMAND` |
 | `port` | `int` | `8006` | Engine internal communication port |
@@ -409,6 +412,7 @@ anything else (including unset) as `False`, unless noted otherwise.
 | `ATOM_DP_SIZE` | `int` | `1` | Total number of data-parallel groups |
 | `ATOM_DP_MASTER_IP` | `str` | `"127.0.0.1"` | IP address of the data-parallel master |
 | `ATOM_DP_MASTER_PORT` | `int` | `29500` | Port of the data-parallel master |
+| `ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR` | `float` | `0.75` | Default for `dynamic_chunking_smooth_factor`: `0` keeps the initial chunk, `1` uses the equal-latency chunk |
 | ~~`ATOM_ENFORCE_EAGER`~~ | | | Removed. Use CLI flag `--enforce-eager` instead. |
 | `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` | `bool` | `False` | Enable QK-norm + RoPE + cache + quant fusion for Qwen3 dense and MoE models |
 | `ATOM_USE_TRITON_GEMM` | `bool` | `False` | Use Triton-based GEMM kernels instead of default backends |

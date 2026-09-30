@@ -128,6 +128,10 @@ class PPStageTransport:
             timeout_ms = 0
         return results
 
+    def recv_completion(self, timeout_ms: int | None = None) -> Any:
+        """Head: receive ``(req_ids, output)`` after the last stage finishes."""
+        return self.recv_tokens(timeout_ms)
+
     # ---- downstream / last side --------------------------------------------
     def recv_metadata(self, timeout_ms: int | None = None) -> Any:
         """Downstream: block for the head's scheduled batch."""
@@ -145,6 +149,10 @@ class PPStageTransport:
         if self._kv_status_send is None:
             return
         self._kv_status_send.send(pickle.dumps((self.pp_rank, output)), copy=False)
+
+    def send_completion(self, req_ids: Any, out: Any = None) -> None:
+        """Last stage: acknowledge completion, with sampled output if present."""
+        self.send_tokens((tuple(req_ids), out))
 
     def close(self) -> None:
         for sock in self._meta_send:
