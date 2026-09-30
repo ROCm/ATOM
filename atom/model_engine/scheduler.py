@@ -31,6 +31,7 @@ import numpy as np
 
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.kv_transfer.disaggregation.mooncake.host_landing import HostLandingPhase
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.engine_stats import EngineStats
@@ -1538,6 +1539,12 @@ class Scheduler:
         num_scheduled_tokens: list[int] = []
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
 
+        # Set when a host-landed request could not get its HBM blocks this
+        # pass; a pull that cannot land on host then must not take them first.
+        self._host_landing_hbm_blocked = False
+        host_landing = self._host_landing()
+        if host_landing is not None:
+            host_landing.maybe_log_pool()
         self._promote_ready_remote_kv_requests()
         self._park_ready_offload_partial_prefills()
         # Reclaim aborted heads even when decode protection vetoes Phase 2.
@@ -1765,6 +1772,15 @@ class Scheduler:
             ):
                 self.waiting.appendleft(seq)
                 break
+
+            if needs_remote_load and host_landing is not None:
+                if self._park_on_host_landing(seq, skipped_waiting_requests):
+                    continue
+                if self._host_landing_hbm_blocked:
+                    # The host pool is full and a landed request is already
+                    # waiting for HBM: a direct pull must not jump it.
+                    skipped_waiting_requests.append(seq)
+                    continue
 
             # Probe cache hits FIRST so budget check sees the real
             # (post-prefix-cache) remaining token count. V4 SWA correctness is
@@ -2234,6 +2250,11 @@ class Scheduler:
         if seq.status != SequenceStatus.WAITING_FOR_REMOTE_KVS:
             return False
 
+        host_landing = self._host_landing()
+        landing = host_landing.record(seq) if host_landing is not None else None
+        if landing is not None:
+            return self._resolve_host_landing(seq, landing, skipped_waiting_requests)
+
         if self._consume_failed_remote_kv(seq):
             return False
 
@@ -2247,6 +2268,122 @@ class Scheduler:
             return False
         self._uncount_inflight_load(seq)
         return True
+
+    # -- P/D decode host landing ------------------------------------------
+    # The pull lands in host memory (LANDING); once complete (LANDED) and HBM
+    # has room, fresh HBM blocks are allocated and the host blocks are copied
+    # into them (COPYING); the copy's completion then wakes the request exactly
+    # as a direct pull's does. See `mooncake/host_landing.py`.
+    def _host_landing(self):
+        if getattr(self, "kv_connector", None) is None:
+            return None
+        return getattr(self.kv_connector, "host_landing", None)
+
+    def _park_on_host_landing(
+        self, seq: Sequence, skipped_waiting_requests: deque[Sequence]
+    ) -> bool:
+        """Park a P/D pull on host landing blocks; False to pull into HBM."""
+        host_landing = self._host_landing()
+        if not host_landing.eligible(seq):
+            return False
+        if host_landing.allocator.num_free == 0:
+            host_landing.num_fallbacks += 1
+            return False
+        bm = self.block_manager
+        hit_blocks = bm.claim_prefix_hit(seq)
+        if not host_landing.reserve(seq, hit_blocks, bm.num_pool_blocks(len(seq))):
+            # Pool full: hand the claims back; the direct path re-probes.
+            bm.deallocate(seq)
+            return False
+        # As on the direct path: keep a hit inherited from the prefill node.
+        if not seq.prefix_cache_hit_tokens:
+            seq.prefix_cache_hit_tokens = seq.num_cached_tokens
+        self._notify_connector_after_prefill_alloc(seq)
+        self._park_for_remote_load(seq, skipped_waiting_requests)
+        self._inflight_prefix_wait.pop(seq.id, None)
+        return True
+
+    def _resolve_host_landing(
+        self, seq: Sequence, landing, skipped_waiting_requests: deque[Sequence]
+    ) -> bool | None:
+        """`_resolve_waiting_remote_kv` for a host-landed request."""
+        host_landing = self._host_landing()
+        if landing.phase is HostLandingPhase.LANDING:
+            if self._pop_req_id(self.failed_recving_kv_req_ids, seq.id):
+                self._abandon_host_landing(seq)
+                return False
+            if not self._pop_req_id(self.finished_recving_kv_req_ids, seq.id):
+                skipped_waiting_requests.append(seq)
+                return None
+            host_landing.mark_landed(seq)
+            # Nothing writes this request's memory until its copy is issued,
+            # so an abort while LANDED can be reclaimed on the spot.
+            self._uncount_inflight_load(seq)
+        if landing.phase is HostLandingPhase.LANDED:
+            # First come, first served: once an earlier landed request could
+            # not get HBM this pass, a later (smaller) one must not overtake
+            # it, or a large request could starve. Unless nothing will ever
+            # free HBM for it: with no running request and no copy in flight,
+            # the blocked head waits on the prefix claims of the landed
+            # requests queued behind it, so FIFO would wait forever.
+            hbm_can_free = bool(self.running) or host_landing.has_copying()
+            if (
+                not self._host_landing_hbm_blocked or not hbm_can_free
+            ) and self._start_host_landing_copy(seq, landing, hbm_can_free):
+                # The copy writes its HBM blocks: an abort now waits for it.
+                self._count_inflight_load(seq)
+            else:
+                if not hbm_can_free:
+                    host_landing.warn_hbm_stall(seq, len(landing.host_block_ids))
+                self._host_landing_hbm_blocked = True
+            skipped_waiting_requests.append(seq)
+            return None
+        # COPYING
+        if self._pop_req_id(self.failed_recving_kv_req_ids, seq.id):
+            self._abandon_host_landing(seq)
+            return False
+        if not self._update_waiting_for_remote_kv(seq):
+            skipped_waiting_requests.append(seq)
+            return None
+        host_landing.log_request_done(seq, seq.num_cached_tokens)
+        host_landing.release(seq)
+        seq.status = SequenceStatus.WAITING
+        self._uncount_inflight_load(seq)
+        return True
+
+    def _start_host_landing_copy(
+        self, seq: Sequence, landing, hbm_can_free: bool = True
+    ) -> bool:
+        """Allocate HBM for the landed suffix and queue its H2D copy.
+
+        Leaves one block per running request (plus the configured reserve)
+        free, so admitting it does not preempt a running decode. With nothing
+        running and no copy in flight there is no decode to protect, and a
+        reserve nobody will ever release would only wedge the request.
+        """
+        host_landing = self._host_landing()
+        bm = self.block_manager
+        need = len(landing.host_block_ids)
+        reserve = (
+            len(self.running) + host_landing.hbm_reserve_blocks if hbm_can_free else 0
+        )
+        if not bm.can_append_fresh_blocks(need + reserve):
+            return False
+        hbm_block_ids = bm.append_fresh_blocks(seq, need)
+        host_landing.queue_copy(seq, hbm_block_ids)
+        return True
+
+    def _abandon_host_landing(self, seq: Sequence) -> None:
+        """The pull or its copy failed: drop it and fall back to prefill."""
+        logger.warning(
+            "[PD-HOST-LAND] req %s: host landing failed; falling back to prefill",
+            seq.id,
+        )
+        self._host_landing().release(seq)
+        # An empty table: the fallback admission allocates from scratch.
+        self.block_manager.deallocate(seq)
+        seq.status = SequenceStatus.WAITING
+        self._uncount_inflight_load(seq)
 
     def _consume_failed_remote_kv(self, seq: Sequence) -> bool:
         if not self._pop_req_id(self.failed_recving_kv_req_ids, seq.id):
@@ -3696,8 +3833,12 @@ class Scheduler:
         cannot finish and free blocks. Preserve FIFO order within the ready and
         blocked slots.
         """
+        host_landing = self._host_landing()
+        any_landed = host_landing is not None and host_landing.has_landed()
         if not self.waiting or not (
-            self.finished_recving_kv_req_ids or self.failed_recving_kv_req_ids
+            self.finished_recving_kv_req_ids
+            or self.failed_recving_kv_req_ids
+            or any_landed
         ):
             return
 
@@ -3708,6 +3849,8 @@ class Scheduler:
             if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS and (
                 self._has_req_id(self.finished_recving_kv_req_ids, seq.id)
                 or self._has_req_id(self.failed_recving_kv_req_ids, seq.id)
+                # A landed pull waits only for HBM: first in line for it.
+                or (any_landed and host_landing.is_landed(seq))
             ):
                 ready.append(seq)
             else:
@@ -3759,6 +3902,16 @@ class Scheduler:
         is_producer = self._connector_flag("is_producer")
         is_offload = self._connector_flag("is_offload")
 
+        # Host landing copy reports first: they are this scheduler's own
+        # channel, and only a plain `mooncake` consumer has host landing.
+        host_landing = self._host_landing()
+        if host_landing is not None and kv_connector_output.connector_completions:
+            kv_connector_output.connector_completions = set(
+                kv_connector_output.connector_completions
+            ) - host_landing.consume_completions(
+                kv_connector_output.connector_completions
+            )
+
         process_completions = getattr(self.kv_connector, "process_completions", None)
         if callable(process_completions):
             kv_connector_output = process_completions(kv_connector_output)
@@ -3782,6 +3935,18 @@ class Scheduler:
             if self._finish_aborted_load_cleanup(req_id):
                 continue
             self.failed_recving_kv_req_ids.append(req_id)
+
+        # Host landing copies: a finished copy wakes its request exactly like
+        # a finished direct pull; a failed one falls back like a failed pull.
+        if host_landing is not None:
+            copied, copy_failed = host_landing.take_copy_results()
+            for req_id, target in (
+                *((r, self.finished_recving_kv_req_ids) for r in copied),
+                *((r, self.failed_recving_kv_req_ids) for r in copy_failed),
+            ):
+                if self._finish_aborted_load_cleanup(req_id):
+                    continue
+                target.append(req_id)
 
         # The two loading channels carry state-tier loads as well as KV ones,
         # which buys the state leg the aggregator's per-request quorum for free.

@@ -440,6 +440,11 @@ class ReqMeta:
     # region loop like block ids do. Empty for backends with no SWA state.
     local_swa_block_ids: list[int] = field(default_factory=list)
     remote_swa_block_ids: list[int] = field(default_factory=list)
+    # Decode host landing: ``local_block_ids`` are host landing block ids for
+    # the pulled suffix only (the first ``num_computed_blocks`` entries are
+    # local HBM prefix hits and are not listed), and the consumer advertises
+    # its host landing region addresses instead of its HBM ones.
+    host_landing: bool = False
 
 
 @dataclass
@@ -484,6 +489,7 @@ class ConnectorMetadata:
         "reqs_to_send",
         "reqs_in_batch",
         "reqs_not_processed",
+        "host_landing_copies",
     )
 
     def __init__(self) -> None:
@@ -493,6 +499,9 @@ class ConnectorMetadata:
         self.reqs_in_batch: set[ReqId] = set()
         self.reqs_not_processed: set[ReqId] = set()
         self.request_id_to_transfer_id: dict[ReqId, int] = {}
+        # Decode host landing: host -> HBM copies the workers issue this step
+        # (``mooncake.host_landing.HostLandingCopy``).
+        self.host_landing_copies: list[Any] = []
 
     def has_work(self) -> bool:
         """Whether the worker has anything to do with this snapshot."""
@@ -528,6 +537,7 @@ class ConnectorMetadata:
             local_slot_index=kv_transfer_params.get("local_slot_index", -1),
             num_computed_blocks=kv_transfer_params.get("num_computed_blocks", 0),
             src_block_skip_factor=kv_transfer_params.get("src_block_skip_factor", 1),
+            host_landing=bool(kv_transfer_params.get("host_landing", False)),
         )
 
     def add_new_req_to_save(

@@ -2505,6 +2505,61 @@ class BlockManager:
         seq.prefix_hashes_published = True
         return num_full - start
 
+    def claim_prefix_hit(self, seq: Sequence) -> int:
+        """Claim only the HBM prefix-cache hit of an empty-tabled ``seq``.
+
+        The P/D host landing admission: the pulled suffix lands in host memory,
+        so the request takes no fresh blocks yet, but its local hit must stay
+        claimed for the whole pull -- an eviction would leave a hole the
+        transfer no longer covers. The same chained walk as `can_allocate`'s
+        step 1 (over every hash block but the last), gated like it. Sets
+        ``block_table`` to the claimed blocks and ``num_cached_tokens`` to what
+        they cover; returns the claimed block count. Per-request state is not
+        handled here: callers route such requests to `allocate`.
+        """
+        assert not seq.block_table
+        if seq.has_per_req_cache:
+            raise ValueError("claim_prefix_hit does not attach per-request state")
+        seq.num_cached_tokens = 0
+        if not self.enable_prefix_caching:
+            return 0
+        h = seq.cache_seed
+        block_hashes: list[int] = []
+        block_ids: list[int] = []
+        for i in range(self._n_hash_blocks(seq) - 1):
+            token_ids = self._hash_block_tokens(seq, i)
+            h = self.compute_hash(token_ids, h)
+            block_id = self.kv.lookup(h)
+            if block_id == -1 or self.kv.block(block_id).token_ids != token_ids:
+                break
+            block_hashes.append(h)
+            block_ids.append(block_id)
+        hit = self._gated_hit(seq, len(block_ids), block_hashes)
+        for block_id in block_ids[:hit]:
+            self.kv.claim(block_id)
+            seq.block_table.append(block_id)
+        # The hit-rate inputs `can_allocate` would have recorded; with no
+        # state gate declining anything, the wanted hit is the hit.
+        seq.num_compressed_hit_blocks = len(block_ids)
+        seq.num_wanted_hit_blocks = hit
+        seq.num_cached_tokens = hit * self._hash_block_size()
+        return hit
+
+    def can_append_fresh_blocks(self, count: int) -> bool:
+        """Whether ``count`` fresh blocks can be taken right now."""
+        return self._has_page_units(count)
+
+    def append_fresh_blocks(self, seq: Sequence, count: int) -> list[int]:
+        """Append ``count`` fresh (unhashed) blocks to ``seq``; returns them.
+
+        The P/D host landing HBM admission, once the suffix has landed on host:
+        these blocks receive its H2D copy. Check `can_append_fresh_blocks`
+        first.
+        """
+        fresh = [self._fresh_block() for _ in range(count)]
+        seq.block_table.extend(fresh)
+        return fresh
+
     def deallocate_partial(
         self,
         seq: Sequence,

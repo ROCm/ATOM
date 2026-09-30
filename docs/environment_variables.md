@@ -497,3 +497,10 @@ See `atom/utils/envs.py` for the full list of lazy-evaluated environment variabl
 
 See [Mooncake matched rails](mooncake_matched_rails.md) for independent P/D
 rank configuration, deployment requirements, and registration lifetime.
+
+## Mooncake PD decode host landing
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_PD_HOST_LANDING_BLOCKS** | int | 0 | Decode (`kv_consumer`, plain `mooncake` connector) only. Size, in scheduler KV blocks, of a pinned host "landing" pool allocated per rank with the same per-region layout as the GPU KV cache and registered with Mooncake. P->D RDMA writes a request's pulled suffix into this pool instead of HBM; once the transfer is complete and enough HBM blocks are free, the request is H2D-copied into HBM and decodes. Host bytes per rank = blocks x the `block_bytes` in the decode memory-budget log line. Falls back to the direct HBM pull when the pool is full. 0 disables it. |
+| **ATOM_PD_HOST_LANDING_HBM_RESERVE_BLOCKS** | int | 0 | Extra HBM blocks left free (beyond one per running request) before a host-landed request is copied into HBM. |

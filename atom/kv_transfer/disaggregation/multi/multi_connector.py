@@ -159,6 +159,23 @@ def _first_with(connectors: list, name: str):
 # ---------------------------------------------------------------------------
 
 
+def _disable_host_landing(connectors: list, attr: str, off: Any) -> None:
+    """Turn P/D decode host landing off on every sub.
+
+    It is a plain `mooncake` consumer feature: the composite routes neither
+    its admission nor its copy completions, so a sub left enabled would only
+    pin (worker) and advertise (scheduler) a host pool nobody uses.
+    """
+    for c in connectors:
+        if getattr(c, attr, off) not in (None, 0):
+            logger.warning(
+                "[PD-HOST-LAND] disabled on %s: not supported under a "
+                "composite kv_connector (ATOM_PD_HOST_LANDING_BLOCKS ignored)",
+                type(c).__name__,
+            )
+            setattr(c, attr, off)
+
+
 class MultiConnectorMetadata(ConnectorMetadata):
     """Carries one sub-connector metadata per connector, in connector order.
 
@@ -226,6 +243,7 @@ class MultiConnector(KVConnectorBase):
 
     def __init__(self, config: Any) -> None:
         self._connectors = _build_subconnectors(config, role="worker")
+        _disable_host_landing(self._connectors, "_host_landing_blocks", 0)
         # Producer if any sub is a producer (moriio kv_producer drives the
         # scheduler's producer-side deferred-free path).
         self.is_producer = any(
@@ -348,6 +366,10 @@ class MultiConnector(KVConnectorBase):
 class MultiConnectorScheduler(KVConnectorSchedulerBase):
     """Scheduler-side composite connector."""
 
+    # P/D decode host landing is a plain `mooncake` consumer feature: the
+    # composite does not route its admission or copy completions to a leg.
+    host_landing = None
+
     def bind_block_manager(self, block_manager: Any) -> None:
         """Bind native checkpoint owners before any request can be admitted."""
         for connector in self._connectors:
@@ -357,6 +379,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
 
     def __init__(self, config: Any) -> None:
         self._connectors = _build_subconnectors(config, role="scheduler")
+        _disable_host_landing(self._connectors, "host_landing", None)
         self.is_producer = any(
             getattr(c, "is_producer", False) for c in self._connectors
         )

@@ -126,6 +126,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_H2D_BACKEND": lambda: os.getenv("ATOM_H2D_BACKEND", "packed"),
     # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
     "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
+    # Decode host landing: P->D RDMA lands in a pinned host pool of this many
+    # blocks per rank (one block = one scheduler KV block, every PAGE region);
+    # HBM is filled by an H2D copy once free. 0 = off (pull straight into HBM).
+    "ATOM_PD_HOST_LANDING_BLOCKS": lambda: _nonnegative_int_env(
+        "ATOM_PD_HOST_LANDING_BLOCKS", 0
+    ),
+    # HBM blocks kept free beyond one per running request before a host-landed
+    # request is copied in, so running decodes are not preempted to make room.
+    "ATOM_PD_HOST_LANDING_HBM_RESERVE_BLOCKS": lambda: _nonnegative_int_env(
+        "ATOM_PD_HOST_LANDING_HBM_RESERVE_BLOCKS", 0
+    ),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(

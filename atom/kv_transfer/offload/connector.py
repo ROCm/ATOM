@@ -173,6 +173,8 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
 
     is_producer = False
     is_offload = True
+    # P/D decode host landing is a plain `mooncake` consumer feature.
+    host_landing = None
 
     def __init__(self, config) -> None:
         self._impl = _build_scheduler(config)

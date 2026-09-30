@@ -33,6 +33,13 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
 )
+from atom.kv_transfer.disaggregation.mooncake.host_landing import (
+    HOST_LANDING_COPY_CHANNEL,
+    HOST_LANDING_PARAM,
+    HostLandingBuffer,
+    HostLandingController,
+    gpu_numa_node,
+)
 from atom.kv_transfer.disaggregation.mooncake.rail_engine_pool import RailEnginePool
 from atom.kv_transfer.disaggregation.port_offset import (
     consumer_region_indices,
@@ -49,6 +56,7 @@ from atom.kv_transfer.disaggregation.types import (
     INDEX_CACHE_FP4_PREFIX,
     INDEX_CACHE_ROLE,
     MLA_KV_ROLE,
+    ConnectorCompletion,
     ConnectorMetadata,
     KVConnectorOutput,
     KVTransferRegion,
@@ -312,6 +320,10 @@ class MooncakeAgentMetadata(
 
 
 class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
+    # Off unless __init__ enables it (instances built without __init__, as in
+    # tests, pull straight into HBM).
+    host_landing: HostLandingController | None = None
+
     def __init__(self, config: Config) -> None:
         kv_transfer_config = config.kv_transfer_config
         self.is_producer = (
@@ -343,6 +355,29 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         # Bidirectional transfer_id <-> request_id mapping
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
+
+        # Decode host landing (opt-in). The scheduler drives it through this
+        # attribute; None keeps every pull landing straight in HBM.
+        self.host_landing: HostLandingController | None = None
+        host_landing_blocks = envs.ATOM_PD_HOST_LANDING_BLOCKS
+        if host_landing_blocks > 0 and not self.is_producer:
+            self.host_landing = HostLandingController(
+                host_landing_blocks,
+                hbm_reserve_blocks=envs.ATOM_PD_HOST_LANDING_HBM_RESERVE_BLOCKS,
+                incremental_geometry=self._remote_page_geometry,
+            )
+            logger.info(
+                "[PD-HOST-LAND] enabled: %d host landing blocks per rank, "
+                "hbm_reserve_blocks=%d",
+                host_landing_blocks,
+                self.host_landing.hbm_reserve_blocks,
+            )
+
+    # No `process_completions` here: `MultiConnectorScheduler` refuses a
+    # composite with more than one sub defining it, so defining it on this
+    # class breaks every `[mooncake, lmcache_offload]` composite (the prefill
+    # side of the GLM-5.2 suite) whether or not host landing is on. The
+    # scheduler takes the host landing copy reports off the output itself.
 
     def _remote_page_geometry(self, params: dict[str, Any]) -> tuple[int, int] | None:
         """Return ``(producer_block_size, producer_dcp_size)`` when incremental
@@ -407,6 +442,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 local_swa_block_ids=_swa_ring_ids(req),
             )
 
+        if self.host_landing is not None:
+            meta.host_landing_copies = self.host_landing.take_pending_copies()
+
         if self._reqs_need_recv or self._reqs_need_save:
             logger.debug(
                 "[SCHEDULER] build_connector_meta: %d recv, %d save, " "id_map=%s",
@@ -434,7 +472,18 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             assert (
                 not self.is_producer
             ), "Only the decode (consumer) side handles do_remote_prefill"
-            self._reqs_need_recv[seq.id] = (seq, list(seq.block_table), slot_index)
+            landing = (
+                self.host_landing.record(seq) if self.host_landing is not None else None
+            )
+            # A host-landed pull's destination is its host blocks for the
+            # suffix; its HBM prefix hit stays where it is.
+            dst_block_ids = (
+                list(landing.host_block_ids)
+                if landing is not None
+                else list(seq.block_table)
+            )
+            self._reqs_need_recv[seq.id] = (seq, dst_block_ids, slot_index)
+            params[HOST_LANDING_PARAM] = landing is not None
             params["do_remote_prefill"] = False
             params["local_slot_index"] = slot_index
             # PD incremental: skip leading blocks already in the decode node's
@@ -460,6 +509,17 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 _, remote_dcp_size = remote_geometry
                 num_computed_blocks = seq.num_cached_tokens // self.hash_block_size
                 src_block_skip_factor = self.dcp_size // remote_dcp_size
+            if landing is not None and num_computed_blocks != landing.hbm_prefix_blocks:
+                # The host blocks cover exactly the suffix past the claimed
+                # HBM hit; any other skip would shift every pulled block.
+                logger.error(
+                    "[PD-HOST-LAND] req %s: skip %d blocks != HBM hit %d; "
+                    "using the HBM hit",
+                    seq.id,
+                    num_computed_blocks,
+                    landing.hbm_prefix_blocks,
+                )
+                num_computed_blocks = landing.hbm_prefix_blocks
             params["num_computed_blocks"] = num_computed_blocks
             params["src_block_skip_factor"] = src_block_skip_factor
             logger.debug(
@@ -534,6 +594,10 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             transfer_id = self.request_id_to_transfer_id.pop(seq.id, None)
             if transfer_id is not None:
                 self.transfer_id_to_request_id.pop(transfer_id, None)
+            # The scheduler finishes a request only once its pull (and any
+            # host landing copy) is terminal, so its host blocks are reusable.
+            if self.host_landing is not None:
+                self.host_landing.release(seq)
 
     def should_defer_free(self, seq: Sequence) -> bool:
         return str(seq.id) in self._awaiting_send
@@ -564,6 +628,9 @@ class MooncakeConnector(KVConnectorBase):
     # ``__init__`` aborted before the matched-rail block; both must fall back to
     # the single shared ``transfer_engine`` instead of raising AttributeError.
     _rail_pool: RailEnginePool | None = None
+    # Same reasoning: decode host landing is off unless __init__ turned it on.
+    _host_landing_blocks: int = 0
+    _host_landing: HostLandingBuffer | None = None
 
     def __init__(self, config: Config) -> None:
         self.tp_rank = get_tp_group().rank_in_group
@@ -813,6 +880,16 @@ class MooncakeConnector(KVConnectorBase):
         # --- Transfer ID mapping (worker side) ---
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
 
+        # --- Consumer: decode host landing (built in register_kv_caches) ---
+        self._host_landing_blocks = (
+            0 if self.is_producer else envs.ATOM_PD_HOST_LANDING_BLOCKS
+        )
+        self._host_landing: HostLandingBuffer | None = None
+        # (operation, start_event, done_event, bytes, issued_at, ok) per copy
+        # in flight; a failed copy is reported once its queued work drains.
+        self._host_landing_inflight: list[tuple] = []
+        self._host_landing_completions: set[ConnectorCompletion] = set()
+
         # --- Producer: thread pool for RDMA writes ---
         self._cuda_device = torch.cuda.current_device()
         if self.is_producer:
@@ -985,6 +1062,9 @@ class MooncakeConnector(KVConnectorBase):
             all_regions.append(tt.staging_region)
         if tt.index_staging_region is not None:
             all_regions.append(tt.index_staging_region)
+        if self._host_landing_blocks > 0:
+            self._host_landing = self._build_host_landing(tt)
+            all_regions.extend(self._host_landing.regions())
         for r in all_regions:
             offset = 0
             for chunk in self._rdma_chunk_sizes(r.total_bytes, r.unit_bytes):
@@ -1087,6 +1167,101 @@ class MooncakeConnector(KVConnectorBase):
             )
             self._notification_listener_thread.start()
 
+    def _build_host_landing(self, tt) -> HostLandingBuffer:
+        """The pinned host landing pool, laid out like this rank's PAGE regions."""
+        views = tt.block_tensor_views
+        if self._has_slot_regions or tt.swa_block_regions:
+            raise RuntimeError(
+                "ATOM_PD_HOST_LANDING_BLOCKS: host landing stages PAGE regions "
+                "only; this layout has per-request slot/SWA regions"
+            )
+        if len(views) != len(tt.block_regions):
+            raise RuntimeError(
+                "ATOM_PD_HOST_LANDING_BLOCKS: host landing needs a tensor view "
+                f"for every PAGE region ({len(views)} views, "
+                f"{len(tt.block_regions)} regions)"
+            )
+        for region, view in zip(tt.block_regions, views):
+            if region.reverse_indexed or view.shape[-1] != region.unit_bytes:
+                raise RuntimeError(
+                    "ATOM_PD_HOST_LANDING_BLOCKS: PAGE region "
+                    f"{region.semantic_role!r} is not a forward block array"
+                )
+        return HostLandingBuffer(
+            views,
+            self._host_landing_blocks,
+            device=torch.device("cuda", self._cuda_device),
+            stream=torch.cuda.Stream(device=self._cuda_device),
+            numa_node=gpu_numa_node(self._cuda_device),
+        )
+
+    def _issue_host_landing_copies(self, copies) -> None:
+        """Start each scheduled host -> HBM copy on the landing side stream."""
+        for copy in copies:
+            if self._host_landing is None:
+                logger.error(
+                    "[PD-HOST-LAND] copy %s scheduled on a rank with no host "
+                    "landing pool",
+                    copy.operation,
+                )
+                self._host_landing_completions.add(
+                    ConnectorCompletion(
+                        HOST_LANDING_COPY_CHANNEL, copy.operation, succeeded=False
+                    )
+                )
+                continue
+            try:
+                start, done, nbytes = self._host_landing.copy_to_hbm(
+                    copy.host_block_ids, copy.hbm_block_ids
+                )
+            except Exception:
+                logger.exception("[PD-HOST-LAND] copy %s failed", copy.operation)
+                # Some regions' copies may already be queued on the side
+                # stream (e.g. a staging OOM part-way through). The failure
+                # frees these HBM blocks for reuse, so report it only once
+                # that queued work has drained.
+                drained = None
+                stream = self._host_landing.stream
+                if stream is not None:
+                    try:
+                        drained = torch.cuda.Event()
+                        drained.record(stream)
+                    except Exception:
+                        logger.exception("[PD-HOST-LAND] cannot fence copy")
+                        stream.synchronize()
+                        drained = None
+                self._host_landing_inflight.append(
+                    (copy.operation, None, drained, 0, time.monotonic(), False)
+                )
+                continue
+            self._host_landing_inflight.append(
+                (copy.operation, start, done, nbytes, time.monotonic(), True)
+            )
+
+    def _poll_host_landing_copies(self) -> None:
+        """Report copies whose side-stream work has finished."""
+        still: list[tuple] = []
+        for entry in self._host_landing_inflight:
+            operation, start, done, nbytes, issued_at, ok = entry
+            if done is not None and not done.query():
+                still.append(entry)
+                continue
+            if ok and self.tp_rank == 0:
+                gpu_ms = start.elapsed_time(done) if done is not None else 0.0
+                logger.info(
+                    "[PD-HOST-LAND-H2D] req=%s bytes_per_rank=%d gpu_ms=%.2f "
+                    "h2d_gbps=%.2f wall_ms=%.1f",
+                    operation.req_id,
+                    nbytes,
+                    gpu_ms,
+                    nbytes / (gpu_ms * 1e6) if gpu_ms > 0 else 0.0,
+                    (time.monotonic() - issued_at) * 1e3,
+                )
+            self._host_landing_completions.add(
+                ConnectorCompletion(HOST_LANDING_COPY_CHANNEL, operation, ok)
+            )
+        self._host_landing_inflight = still
+
     # -----------------------------------------------------------------
     # KVConnectorBase: start_load_kv
     # -----------------------------------------------------------------
@@ -1142,6 +1317,10 @@ class MooncakeConnector(KVConnectorBase):
                 )
             return
 
+        host_landing_copies = getattr(metadata, "host_landing_copies", None)
+        if host_landing_copies:
+            self._issue_host_landing_copies(host_landing_copies)
+
         # Consumer: send write requests to producer
         if not metadata.reqs_to_recv:
             return
@@ -1176,13 +1355,37 @@ class MooncakeConnector(KVConnectorBase):
             remote_block_ids = meta.remote_block_ids or []
             off = meta.num_computed_blocks
             src_block_skip_factor = max(1, meta.src_block_skip_factor)
-            if (
-                off < 0
-                or off >= len(meta.local_block_ids)
-                or off * src_block_skip_factor >= len(remote_block_ids)
-            ):
-                off = 0
-            dst_block_ids = meta.local_block_ids[off:]
+            host_landing = bool(getattr(meta, "host_landing", False))
+            if host_landing:
+                # `local_block_ids` already lists only the suffix's host
+                # blocks, so no fallback to a full transfer can fit them.
+                if (
+                    self._host_landing is None
+                    or off < 0
+                    or off * src_block_skip_factor >= len(remote_block_ids)
+                ):
+                    logger.error(
+                        "[PD-HOST-LAND] req %s: cannot land on host (pool=%s, "
+                        "off=%d, remote_blocks=%d); failing the pull",
+                        req_id,
+                        self._host_landing is not None,
+                        off,
+                        len(remote_block_ids),
+                    )
+                    with self._completion_lock:
+                        self._pending_recv_expected.pop(req_id, None)
+                        self._pending_recv_nonce.pop(req_id, None)
+                        self.failed_recving.add(req_id)
+                    continue
+                dst_block_ids = list(meta.local_block_ids)
+            else:
+                if (
+                    off < 0
+                    or off >= len(meta.local_block_ids)
+                    or off * src_block_skip_factor >= len(remote_block_ids)
+                ):
+                    off = 0
+                dst_block_ids = meta.local_block_ids[off:]
             src_block_ids = remote_block_ids[off * src_block_skip_factor :]
 
             # Build the (stage-independent) write_request payload once.
@@ -1261,7 +1464,13 @@ class MooncakeConnector(KVConnectorBase):
                         "consumer_block_base_addrs"
                     )
             else:
-                request_body["consumer_base_addrs"] = self.kv_caches_base_addr
+                # Host landing only changes where the bytes go: the host pool
+                # has the HBM regions' order and per-block sizes.
+                request_body["consumer_base_addrs"] = (
+                    self._host_landing.base_addrs
+                    if host_landing
+                    else self.kv_caches_base_addr
+                )
 
             write_request = msgpack.dumps(request_body)
 
@@ -1270,8 +1479,10 @@ class MooncakeConnector(KVConnectorBase):
             # the slot and block records to already be there or it cannot
             # reclaim them.
             self._pending_recv.add(req_id)
-            # Only delta blocks need fencing; reused prefix blocks are coherent.
-            self._pending_recv_blocks[req_id] = list(dst_block_ids)
+            # Only delta HBM blocks need fencing; reused prefix blocks are
+            # coherent and host landing blocks are not HBM.
+            if not host_landing:
+                self._pending_recv_blocks[req_id] = list(dst_block_ids)
             if meta.local_slot_index >= 0:
                 self._pending_recv_slots[req_id] = (
                     meta.local_slot_index,
@@ -1370,6 +1581,13 @@ class MooncakeConnector(KVConnectorBase):
 
     def get_finished(self) -> KVConnectorOutput:
         """Return send/recv completion status and clear internal sets."""
+        # getattr: instances built without __init__ (tests) have no landing.
+        if getattr(self, "_host_landing_inflight", None):
+            self._poll_host_landing_copies()
+        host_landing_done: set[ConnectorCompletion] = set()
+        if getattr(self, "_host_landing_completions", None):
+            host_landing_done = self._host_landing_completions
+            self._host_landing_completions = set()
         with self._completion_lock:
             ds = self.done_sending.copy()
             dr = self.done_recving.copy()
@@ -1389,6 +1607,7 @@ class MooncakeConnector(KVConnectorBase):
             finished_sending=ds,
             finished_recving=dr,
             failed_recving=failed,
+            connector_completions=host_landing_done,
         )
 
     def get_finished_recv_blocks(self) -> list[int]:
