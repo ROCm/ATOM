@@ -1,60 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790729824073,
+  "lastUpdate": 1790732916857,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "PerryZhang01",
-            "username": "PerryZhang01",
-            "email": "Perry.Zhang@amd.com"
-          },
-          "committer": {
-            "name": "GitHub",
-            "username": "web-flow",
-            "email": "noreply@github.com"
-          },
-          "id": "a5e3958eb3ce9e1d0e4bda65aff6346aec5176af",
-          "message": "[feat](vllm-atom k3): support DSpark speculative decoding under DCP (#2033)\n\n* [feat](k3): support DSpark speculative decoding under DCP\n\nLifts the MLA-DSpark DCP config guard, localizes the draft's KV slots and\nseq lens to the DCP rank, routes causal multi-token decode through aiter's\nround-robin (cprr) kernel, and restores the KDA reorder_batch_threshold that\nvLLM otherwise clamps to 1 under DCP.\n\nTP8 + DCP8 + N=7 measures gsm8k 5-shot 0.9538, matching the no-DCP baseline\n(0.9538), with ~52% draft acceptance. Needs --gpu-memory-utilization 0.75:\nFULL cudagraph capture OOMs on a 9.35 GiB scratch alloc at 0.85.\n\nCo-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>\n\n* [ci](k3): run the Kimi-K3 DSpark accuracy job under DCP8\n\ngpu-memory-utilization drops 0.93 -> 0.75 because it has to: DCP8 makes every\nrank compute all 128 MLA heads over its 1/8 KV shard, and with DSpark's 8-token\nqueries the FULL cudagraph capture needs ~10 GiB of scratch on top of a 38 GiB\ngraph pool. At 0.93 capture deadlocks, at 0.85 it OOMs on a 9.35 GiB alloc.\n\nMeasured at 0.75: gsm8k 5-shot 0.9538 / 0.9530, matching the no-DCP baseline.\n\nCo-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>\n\n* [ci](k3): lower Kimi-K3 DSpark DCP8 gpu-memory-utilization to 0.7\n\nCo-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: perzhang <perzhang@amd.com>\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
-          "timestamp": "2026-08-28T13:44:57Z",
-          "url": "https://github.com/ROCm/ATOM/commit/a5e3958eb3ce9e1d0e4bda65aff6346aec5176af"
-        },
-        "date": 1787933826335,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8 TP4 accuracy (GSM8K)",
-            "value": 0.9469,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32870691305 | Threshold: 0.93 | Docker: rocm/atom-dev:vllm-v0.27.1-nightly_20260824 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9477 | fewshot: 20 | Model: deepseek-ai/DeepSeek-V3.2"
-          },
-          {
-            "name": "ATOM-vLLM::GLM-5.2-FP8 TP4 accuracy (GSM8K)",
-            "value": 0.9439,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32870691305 | Threshold: 0.92 | Baseline: 0.9447 | BaselineModel: zai-org/GLM-5.2-FP8 | BaselineNote: 20-shot GSM8K local-completions coverage for GLM-5.2-FP8 IndexShare; threshold follows the existing GLM-5.2 nightly gate until FP8 CI baseline is recalibrated. | Docker: rocm/atom-dev:vllm-v0.27.1-nightly_20260824 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9439 | fewshot: 20 | Model: zai-org/GLM-5.2-FP8"
-          },
-          {
-            "name": "ATOM-vLLM::GLM-5.2-MXFP4 MTP TP4 accuracy (GSM8K)",
-            "value": 0.9227,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32870691305 | Threshold: 0.92 | Baseline: 0.9447 | BaselineModel: zai-org/GLM-5.2-FP8 | BaselineNote: 20-shot GSM8K is lossless for MTP; threshold follows GLM-5.2-FP8 until MXFP4 MTP-specific CI baseline is calibrated. | Docker: rocm/atom-dev:vllm-v0.27.1-nightly_20260824 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9212 | fewshot: 20 | Model: amd/GLM-5.2-MXFP4"
-          },
-          {
-            "name": "ATOM-vLLM::Kimi-K2.5-MXFP4 TP4 accuracy (GSM8K)",
-            "value": 0.9303,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32870691305 | Threshold: 0.92 | Docker: rocm/atom-dev:vllm-v0.27.1-nightly_20260824 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.931 | fewshot: 3 | Model: amd/Kimi-K2.5-MXFP4-AttnFP8"
-          },
-          {
-            "name": "ATOM-vLLM::Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 accuracy (GSM8K)",
-            "value": 0.815,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32870691305 | Threshold: 0.8 | Baseline: 0.81 | BaselineModel: Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 | BaselineNote: Qwen3-Next-80B-A3B-Instruct-FP8 baseline with TP4 (no MTP) as proxy; needs CI measurement for MTP-specific baseline | Docker: rocm/atom-dev:vllm-v0.27.1-nightly_20260824 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.7362 | fewshot: 3 | Model: Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -298245,6 +298193,46 @@ window.BENCHMARK_DATA = {
             "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=8 _tp",
             "value": 4,
             "unit": ""
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "jasen",
+            "username": "Jasen2201",
+            "email": "yajizhan@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "74fd942b0a2240a99bbb8a737133dfd6e036e40c",
+          "message": "fix(mtp): install the draft work plan when warming draft graphs (#2367)\n\n* fix(mtp): install the draft work plan when warming draft graphs\n\n`warmup_draft_graphs` builds its context from the target's capture builder,\nat the target's verify width (max_seqlen_q = mtp_k + 1). `_step_warmup_inputs`\nthen replays `_enter_decode_metadata` to drop that context to one row per\nsequence, but not the `prepare_mtp_decode` call `propose` makes right after\nit, so the target's persistent MLA work plan stayed installed.\n\nOnly persistent-mode MLA reads that plan, and only DPA runs persistent mode,\nso GLM-5.2 with --enable-dp-attention plus MTP walked a plan sized for\nmtp_k + 1 query rows per sequence over a one-row query while warming the\ndraft graphs: a memory access fault in\naiter::mla_a8w8_qh16_qseqlen4_gqaratio16_v3_ps on every rank, under both FULL\nand PIECEWISE cudagraph modes. TP and DCP use non-persistent kernels or\nrebuild the plan themselves, which is why they were unaffected.\n\nMake the warmup follow the rewrite with the same `prepare_mtp_decode` call,\nunder the same only_update rule as `propose`, and install the plan it returns.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n\n* test(mtp): skip the draft warmup test where the drafter cannot import\n\nThe drafter imports aiter at module load and the non-GPU CI runner has no\naiter, so importing EagleProposer failed test collection. Import it through\npytest.importorskip on the module, as tests/test_dspark.py does.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n\n* fix(mtp): replay the full draft metadata advance at warmup, per size\n\nThe warmup called prepare_mtp_decode by hand, which left three gaps:\n\n- It copied only part of what propose does before a mid-step. propose also\n  bumps max_seqlen_k, context_lens and positions, and republishes the fp4\n  indexer schedule. Move that whole sequence into _advance_decode_metadata\n  and call it from both propose and _step_warmup_inputs.\n- kv_indptr and context_lens are bumped in place, and nothing resets them\n  between capture sizes. At page size 1 the MLA capture builder leaves\n  kv_indptr alone, so the bumps pile up across sizes: after sizes 1, 2, 4,\n  kv_indptr is [0, 3, 4, 3, 4], and that negative length goes into the\n  MLA work-plan build. EagleProposer.warmup_draft_graphs now restores both\n  buffers before each size and once after the loop.\n- The warmup passed max_seqlen_k = 0, so kv_indices_generate_triton\n  launched an empty grid and wrote nothing. The shared advance raises it\n  to 1, so the index is written for the one token kv_indptr now holds.\n\nBackends that recompute the draft's slot_mapping (MHA, QSA) undid the\nblanking capture relies on. The warmup now sets those slots back to\nPAD_SLOT_ID so the warmup forward does not write KV.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: yajizhan@amd.com <yajizhan@amd.com@pit2-p03-g53.pit2.tensorwave.lan>\nCo-authored-by: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\nCo-authored-by: yajizhan@amd.com <yajizhan@amd.com@pit2-vm-amd-xl-02.amd.pit2.tensorwave.lan>",
+          "timestamp": "2026-09-29T08:38:25Z",
+          "url": "https://github.com/ROCm/ATOM/commit/74fd942b0a2240a99bbb8a737133dfd6e036e40c"
+        },
+        "date": 1790732915834,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOM-SGLang::MI308 Qwen3.5-35B-A3B-FP8 TP1 accuracy (GSM8K)",
+            "value": 0.8362,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/36448741918 | Threshold: 0.76 | BaselineModel: Qwen/Qwen3.5-35B-A3B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20260928 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8188 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-35B-A3B-FP8"
+          },
+          {
+            "name": "ATOM-SGLang::MI308 Qwen3.5-397B-A17B-FP8 TP4 accuracy (GSM8K)",
+            "value": 0.8825,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/36448741918 | Threshold: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20260928 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8696 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
+          },
+          {
+            "name": "ATOM-SGLang::MI308 Qwen3.5-397B-A17B-FP8 TP8 accuracy (GSM8K)",
+            "value": 0.8635,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/36448741918 | Threshold: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20260928 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8529 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
           }
         ]
       }
