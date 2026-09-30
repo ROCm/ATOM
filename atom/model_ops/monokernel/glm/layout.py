@@ -3,6 +3,8 @@
 
 """Compile-time storage layout and CTA schedule for the GLM-5 MonoKernel."""
 
+import math
+
 from atom.model_ops.monokernel.config import (
     HIDDEN,
     INTER,
@@ -34,6 +36,7 @@ INDEX_DIM = 128
 INDEX_Q_ROWS = INDEX_HEADS * INDEX_DIM
 INDEX_TILE = 16
 INDEX_KEYS_PER_TASK = 64
+DCP_SUMMARY_PAIRS = KV_LORA // 2 + 2
 
 
 def split_acc_head(head_group, lane_group: int, element: int):
@@ -78,18 +81,19 @@ def sparse_cache_rows(
     return sparse_kv_indices[start : start + count]
 
 
-def paged_row_contract(sparse_kv_indices, sparse_kv_indptr, sample: int):
+def paged_row_contract(sparse_kv_indices, sparse_kv_indptr, sample: int, slot_mapping=None):
     """Reference the device contract for one ATOM-layout request row."""
 
     start, end = sparse_kv_indptr[sample : sample + 2]
     active = end > start
     rows = sparse_kv_indices[start:end] if active else ()
+    slot_owned = slot_mapping is None or slot_mapping[sample] >= 0
     return {
         "active": active,
         "context": end - start,
         "index_base": start if active else 0,
         "safe_row": rows[0] if active else 0,
-        "write_cache": active,
+        "write_cache": active if slot_mapping is None else slot_owned,
     }
 
 
@@ -108,10 +112,10 @@ def dn_tile(samples: int, expert_mxfp4: bool = False) -> int:
     return 32 if samples == 1 or (samples > 4 and expert_mxfp4) else HIDDEN // BLOCKS
 
 
-def sparse_keys_per_task(samples: int) -> int:
-    """Use narrower sparse-attention tiles when batch eight fills the LDS arena."""
+def sparse_keys_per_task(samples: int, heads: int = WAVES) -> int:
+    """Use narrower sparse tiles when samples or attention heads fill LDS."""
 
-    return 32 if samples > 4 else 64
+    return 32 if samples > 4 or heads > 2 * WAVES else 64
 
 
 def sample_wave_batches(samples: int) -> int:
@@ -124,6 +128,25 @@ def ug_task_rounds(inter: int) -> int:
 
 def down_x_words(samples: int, inter: int, expert_mxfp4: bool) -> int:
     return samples * MOE_SLOTS * inter // (2 if expert_mxfp4 else 4)
+
+
+def dcp_softmax_weights(maxima, sums):
+    global_max = max(maxima)
+    scaled = [total * math.exp(maximum - global_max) for maximum, total in zip(maxima, sums)]
+    denominator = sum(scaled)
+    return [value / denominator if denominator else 0.0 for value in scaled]
+
+
+def dcp_summary_index(source, sample, tile, item, samples, n_uv):
+    return ((source * samples + sample) * n_uv + tile) * DCP_SUMMARY_PAIRS + item
+
+
+def dcp_uv_owner(tile, output_heads, rank):
+    return tile // (V_DIM // UV_TILE) // output_heads == rank
+
+
+def dcp_local_uv_tile(tile, output_heads):
+    return tile % (output_heads * V_DIM // UV_TILE)
 
 
 def ug_split(samples: int, inter: int = INTER):
@@ -150,10 +173,13 @@ def layout(
     with_indexer: bool = False,
     index_max_seq: int = 4096,
     inter: int = INTER,
+    output_heads: int | None = None,
+    dcp_size: int = 1,
 ):
     """Return byte offsets for per-rank scratch and symmetric peer buffers."""
 
-    split_count = sparse_attention_topk // sparse_keys_per_task(samples)
+    split_count = sparse_attention_topk // sparse_keys_per_task(samples, heads)
+    output_heads = heads if output_heads is None else output_heads
     pair_bytes = 8
     items = [
         ("q_a", samples * Q_LORA * pair_bytes),
@@ -167,7 +193,7 @@ def layout(
         ("sp_acc", samples * split_count * heads * KV_LORA * pair_bytes),
         ("sp_m", samples * split_count * heads * pair_bytes),
         ("sp_l", samples * split_count * heads * pair_bytes),
-        ("o", samples * heads * V_DIM * pair_bytes),
+        ("o", samples * output_heads * V_DIM * pair_bytes),
         ("a", samples * HIDDEN * pair_bytes),
         ("scores", samples * N_EXPERTS * pair_bytes),
         ("xq", samples * HIDDEN // 4 * pair_bytes),
@@ -198,11 +224,18 @@ def layout(
 
     part = npes * samples * HIDDEN * pair_bytes
     region = 2 * part
+    dcp_part = (
+        dcp_size * samples * (heads * V_DIM // UV_TILE) * DCP_SUMMARY_PAIRS * pair_bytes
+        if dcp_size > 1
+        else 0
+    )
     symmetric = {
         "attn": 0,
         "ffn": region,
+        "dcp": 2 * region,
         "_part_stride": part,
-        "_bytes": 2 * region,
+        "_dcp_part_stride": dcp_part,
+        "_bytes": 2 * region + 2 * dcp_part,
     }
     return scratch, symmetric
 
@@ -233,7 +266,7 @@ def stage_tasks(
             ("index_select", samples),
         ]
     tasks += [
-        ("split", samples * (heads // WAVES) * (sparse_attention_topk // sparse_keys_per_task(samples))),
+        ("split", samples * (heads // WAVES) * (sparse_attention_topk // sparse_keys_per_task(samples, heads))),
         ("uv", samples * (heads * V_DIM // UV_TILE)),
         ("o", N_ROW_TILES),
         ("router", samples * N_ROUTER),

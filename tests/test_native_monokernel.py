@@ -2384,3 +2384,26 @@ def test_atom_mxfp4_indices_cover_kimi_expert_storage():
         }
         assert len(scale_indices) == rows * groups
         assert max(scale_indices) < rows * padded_groups
+
+
+def test_glm_kernel_uses_atom_bf16_rope_cache_abi():
+    kernel = (
+        Path(__file__).parents[1]
+        / "atom"
+        / "model_ops"
+        / "monokernel"
+        / "glm"
+        / "kernel.py"
+    ).read_text()
+    assert "ld_f32(_rsrc(rope_cos)" not in kernel
+    assert "ld_f32(_rsrc(rope_sin)" not in kernel
+    assert kernel.count("ld_bf16(_rsrc(rope_cos)") == 3
+    assert kernel.count("ld_bf16(_rsrc(rope_sin)") == 3
+
+
+def test_glm_native_boundary_reduces_deferred_tp_partial():
+    adapter = (
+        Path(__file__).parents[1] / "atom" / "models" / "glm52_mono.py"
+    ).read_text()
+    assert "if residual is not None and layer.input_layernorm.fused_allreduce:" in adapter
+    assert "get_tp_group().all_reduce(hidden, ca_fp8_quant=False)" in adapter
