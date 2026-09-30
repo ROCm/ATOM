@@ -311,3 +311,71 @@ def test_the_non_transactional_path_keeps_no_coverage():
     runner.update_weights(list(_dense_checkpoint().items()))
     assert not getattr(runner, "_weight_update_written", set())
     assert runner.model.attn.qkv_proj.weight.eq(1.0).all()
+
+
+# ── recovering through the non-transactional paths ────────────────────────
+
+
+def _fenced(runner):
+    runner.begin_weight_update(1)
+    runner.abort_weight_update(1, RuntimeError("stream failed"))
+    with pytest.raises(RuntimeError, match="fenced"):
+        runner.assert_weight_update_ready()
+    return runner
+
+
+def test_a_direct_full_reload_lifts_the_fence_an_aborted_stream_left():
+    """Only a commit took the fence down, so recovering through the direct,
+    SHM or IPC path left every later forward refused."""
+    runner = _fenced(_Runner(_dense_model()))
+    runner.update_weights(list(_dense_checkpoint().items()))
+    runner.assert_weight_update_ready()
+    assert runner.get_weight_update_status()["healthy"] is True
+
+
+def test_the_shm_path_lifts_it_on_its_last_bucket_only():
+    from multiprocessing import shared_memory
+
+    runner = _fenced(_Runner(_dense_model()))
+    meta, blobs, offset = {}, [], 0
+    for name, tensor in _dense_checkpoint().items():
+        raw = tensor.contiguous().view(torch.uint8).reshape(-1)
+        meta[name] = {
+            "shape": tuple(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "offset": offset,
+            "nbytes": raw.numel(),
+        }
+        blobs.append(raw)
+        offset += raw.numel()
+    shm = shared_memory.SharedMemory(create=True, size=offset)
+    try:
+        shm.buf[:offset] = torch.cat(blobs).numpy().tobytes()
+        names = list(meta)
+        first = {n: meta[n] for n in names[:2]}
+        rest = {n: meta[n] for n in names[2:]}
+        runner.update_weights_from_shm(shm.name, first, is_last=False)
+        with pytest.raises(RuntimeError, match="fenced"):
+            runner.assert_weight_update_ready()
+        runner.update_weights_from_shm(shm.name, rest, is_last=True)
+    finally:
+        shm.close()
+        shm.unlink()
+    runner.assert_weight_update_ready()
+
+
+def test_a_legacy_reload_that_did_not_complete_keeps_the_fence():
+    """A fused FP8 parameter still waiting on a shard was never rewritten, so
+    finishing the call is not the same as finishing the reload."""
+    model = _dense_model()
+    qkv = model.attn.qkv_proj
+    qkv.weight = _param(8, HIDDEN, dtype=torch.float8_e4m3fn)
+    qkv.weight_scale = nn.Parameter(torch.ones(1), requires_grad=False)
+    runner = _fenced(_Runner(model))
+    ckpt = _dense_checkpoint()
+    del ckpt["attn.v_proj.weight"]
+
+    runner.update_weights(list(ckpt.items()))
+
+    with pytest.raises(RuntimeError, match="fenced"):
+        runner.assert_weight_update_ready()

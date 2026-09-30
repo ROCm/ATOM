@@ -970,6 +970,8 @@ class WeightUpdaterMixin:
         if clear_kv_cache:
             self.clear_kv_cache()
 
+        # A fused parameter still waiting on shards was not rewritten.
+        incomplete = bool(getattr(self, "_packed_weight_accum", None))
         if hasattr(self, "_packed_weight_accum"):
             self._packed_weight_accum.clear()
 
@@ -979,6 +981,10 @@ class WeightUpdaterMixin:
             f"ignored_scales={counts['ignored_scales']}"
         )
         self._warn_if_nothing_matched(updated, counts["skipped"])
+        matched_nothing = updated == 0 and counts["skipped"] > 0
+        self._lift_partial_reload_fence(
+            "direct", complete=not incomplete and not matched_nothing
+        )
         return updated
 
     def _apply_named_tensors(
@@ -1326,6 +1332,32 @@ class WeightUpdaterMixin:
             f"{getattr(self, '_weight_update_failure', 'unknown')}"
         )
 
+    def _lift_partial_reload_fence(self, path: str, complete: bool) -> None:
+        """Serve again once a non-transactional reload has finished.
+
+        The fence goes up when a transactional stream aborts, and only a commit
+        took it down, so recovering through the direct, SHM or IPC path left
+        every later forward refused. Those paths verify no coverage, so their
+        finishing is taken on the trust they have always had -- unless this
+        one plainly did not complete.
+        """
+        if getattr(self, "_weight_update_healthy", True):
+            return
+        if getattr(self, "_weight_update_version", None) is not None:
+            return  # an open transaction's commit or abort decides
+        if not complete:
+            logger.warning(
+                f"{self.label}: {path} reload did not complete; serving stays fenced"
+            )
+            return
+        logger.warning(
+            f"{self.label}: {path} reload finished, lifting the fence left by "
+            f"{getattr(self, '_weight_update_failure', None)!r}; this path does "
+            f"not verify coverage"
+        )
+        self._weight_update_healthy = True
+        self._weight_update_failure = None
+
     def get_weight_update_status(self) -> dict:
         """Reportable state, so an orchestrator can see the fence over RPC."""
         return {
@@ -1450,6 +1482,7 @@ class WeightUpdaterMixin:
             if is_last:
                 self._finalize_expert_weight_sync()
                 self.clear_kv_cache()
+                incomplete = bool(getattr(self, "_packed_weight_accum", None))
                 if hasattr(self, "_packed_weight_accum"):
                     if self._packed_weight_accum:
                         logger.warning(
@@ -1457,6 +1490,10 @@ class WeightUpdaterMixin:
                             f"{list(self._packed_weight_accum.keys())}"
                         )
                     self._packed_weight_accum.clear()
+                matched_nothing = updated == 0 and skipped > 0
+                self._lift_partial_reload_fence(
+                    "SHM", complete=not incomplete and not matched_nothing
+                )
             logger.info(
                 f"{self.label}: SHM weight update bucket done - "
                 f"updated={updated}, skipped={skipped}, "
@@ -1620,6 +1657,7 @@ class WeightUpdaterMixin:
                 logger.debug("torch.cuda.ipc_collect skipped: %s", e)
 
             self.clear_kv_cache()
+            incomplete = bool(getattr(self, "_packed_weight_accum", None))
             if hasattr(self, "_packed_weight_accum"):
                 if self._packed_weight_accum:
                     logger.warning(
@@ -1627,6 +1665,10 @@ class WeightUpdaterMixin:
                         f"{list(self._packed_weight_accum.keys())}"
                     )
                 self._packed_weight_accum.clear()
+            matched_nothing = updated == 0 and skipped > 0
+            self._lift_partial_reload_fence(
+                "IPC", complete=not incomplete and not matched_nothing
+            )
         logger.info(
             f"{self.label}: IPC weight update bucket done - "
             f"updated={updated}, skipped={skipped}, "
