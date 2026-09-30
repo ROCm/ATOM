@@ -25,6 +25,17 @@ install_native_vllm() {
   local repo="${ATOMESH_VLLM_SOURCE_REPO:?vllm.source.repo is required}"
   local sha="${ATOMESH_VLLM_SOURCE_SHA:?vllm.source.sha is required}"
   [[ "${sha}" =~ ^[0-9a-f]{40}$ ]] || return 2
+  if [[ "${ATOMESH_VLLM_CLEAN_MAIN:-0}" == "1" ]]; then
+    [[ "${repo}" == "https://github.com/vllm-project/vllm" &&
+       "${sha}" == "b22494cc0cb4bd9db4a62fb107d92429a4a3249d" &&
+       -z "${ATOMESH_VLLM_FORK_REPO:-}${ATOMESH_VLLM_FORK_SHA:-}${ATOMESH_VLLM_LMCACHE_WHEEL:-}${ATOMESH_VLLM_LMCACHE_PATCHES:-}" ]] || return 2
+    export VLLM_PLUGINS="" PYTHONNOUSERSITE=1 VLLM_USE_PRECOMPILED=0 VLLM_USE_PRECOMPILED_RUST=0
+    unset VLLM_PRECOMPILED_WHEEL_LOCATION
+  fi
+  if [[ "${ATOMESH_VLLM_CLEAN_MAIN:-0}" == "1" ]]; then
+    python3 "${ATOMESH_SCRIPT_DIR}/pd_survey_preflight.py" "${MODEL_PATH}" \
+      "${RUNTIME_LOG_DIR}/weights-preflight-rank-${NODE_RANK}.json"
+  fi
   local src="/tmp/atomesh-native-vllm" venv="/tmp/atomesh-native-venv"
   git init -q "${src}"
   git -C "${src}" fetch -q --depth 1 "${repo}" "${sha}"
@@ -47,6 +58,7 @@ install_native_vllm() {
     "${RUNTIME_LOG_DIR}/native-manifest-rank-${NODE_RANK}.json" <<'PY'
 import importlib.metadata
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -55,12 +67,42 @@ import vllm
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import MoRIIOConnector
 
 assert Path(vllm.__file__).is_relative_to(sys.argv[1]), vllm.__file__
+import vllm._C
+assert Path(vllm._C.__file__).is_relative_to(sys.argv[1]), vllm._C.__file__
 manifest = {
+    "native_extension": vllm._C.__file__,
+    "source_repo": os.environ["ATOMESH_VLLM_SOURCE_REPO"],
+    "plugins": os.environ.get("VLLM_PLUGINS"),
     "source_sha": sys.argv[2], "source_path": vllm.__file__,
     "torch": torch.__version__, "hip": torch.version.hip,
     "packages": {d.metadata['Name']: d.version for d in importlib.metadata.distributions()},
 }
+if os.environ.get("ATOMESH_VLLM_CLEAN_MAIN") == "1":
+    import triton.language.target_info as target_info
+    from vllm.model_executor.models import ModelRegistry
+
+    config = json.loads((Path(os.environ["MODEL_PATH"]) / "config.json").read_text())
+    manifest["model_architectures"] = config.get("architectures", [])
+    manifest["checkpoint_quantization"] = config.get("text_config", config).get("quantization_config")
+    manifest["triton_has_is_hip_gfx1250"] = hasattr(target_info, "is_hip_gfx1250")
+    if os.environ.get("ATOMESH_VLLM_HYBRID") == "1":
+        import flydsl
+        from aiter import ActivationType
+        from aiter.ops.flydsl.moe_common import GateMode
+        from aiter.ops.shuffle import shuffle_weight, shuffle_scale
+        from aiter.fused_moe import fused_moe
+        assert hasattr(ActivationType, "Situv2") and hasattr(GateMode, "SEPARATED")
+        assert all(callable(api) for api in (shuffle_weight, shuffle_scale, fused_moe))
+        manifest["aiter_situv2_gate_shuffle_flydsl_imports"] = True
+    manifest["registered_model"] = any(
+        arch in ModelRegistry.get_supported_archs()
+        for arch in manifest["model_architectures"]
+    )
 Path(sys.argv[3]).write_text(json.dumps(manifest, indent=2) + "\n")
+if os.environ.get("ATOMESH_VLLM_CLEAN_MAIN") == "1":
+    assert manifest["registered_model"], "BLOCKED_ENV: checkpoint architecture not registered"
+    if not manifest["triton_has_is_hip_gfx1250"]:
+        print("[dependency] Triton lacks is_hip_gfx1250; review actual selected backend, not a universal model blocker")
 print(f"[vllm] native source installation OK: {sys.argv[2]} {vllm.__file__}")
 PY
 }
@@ -227,11 +269,11 @@ kv_transfer_config() {
   local http_port="$2"
   local lmcache_port="${3:-}"
   python3 - "${role}" "${NODE0_ADDR}" "${VLLM_DISCOVERY_PORT}" "${http_port}" \
-    "${lmcache_port}" "${ATOMESH_VLLM_LMCACHE_MQ_TIMEOUT:-6000}" <<'PY'
+    "${lmcache_port}" "${ATOMESH_VLLM_LMCACHE_MQ_TIMEOUT:-6000}" "${ATOMESH_VLLM_CLEAN_MAIN:-0}" <<'PY'
 import json
 import sys
 
-role, proxy_ip, ping_port, http_port, lmcache_port, mq_timeout = sys.argv[1:]
+role, proxy_ip, ping_port, http_port, lmcache_port, mq_timeout, clean_main = sys.argv[1:]
 moriio = {
     "kv_connector": "MoRIIOConnector",
     "kv_role": "kv_producer" if role == "prefill" else "kv_consumer",
@@ -264,7 +306,7 @@ if lmcache_port:
         },
     }
 else:
-    config = {**moriio, "kv_load_failure_policy": "recompute"}
+    config = {**moriio, "kv_load_failure_policy": "fail" if clean_main == "1" else "recompute"}
 print(json.dumps(config))
 PY
 }
@@ -307,7 +349,7 @@ start_vllm_server() {
     cmd+=(--decode-context-parallel-size "${!dcp_var}")
   fi
   cmd+=("${role_args[@]}")
-  if [[ "${ATOMESH_VLLM_DIAGNOSTIC:-0}" == "1" ]]; then
+  if [[ "${ATOMESH_VLLM_DIAGNOSTIC:-0}" == "1" && "${ATOMESH_VLLM_DIAGNOSTIC_MODE:-profile}" == "profile" ]]; then
     cmd+=(--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${RUN_DIR}/traces/${role}\",\"torch_profiler_with_stack\":false,\"torch_profiler_record_shapes\":true}")
   fi
   echo "[${role}] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} discovery=${NODE0_ADDR}:${VLLM_DISCOVERY_PORT}"
@@ -339,6 +381,10 @@ start_router() {
   echo "[router] vllm-router sidecar on :${ROUTER_PORT}, discovery :${VLLM_DISCOVERY_PORT}"
 }
 
+if [[ "${ATOMESH_VLLM_CLEAN_MAIN:-0}" == "1" && -z "${ATOMESH_VLLM_SOURCE_SHA:-}" ]]; then
+  echo "[vllm][FAIL] clean-main requires a pinned source installation" >&2
+  exit 2
+fi
 if [[ -n "${ATOMESH_VLLM_SOURCE_SHA:-}" ]]; then
   install_native_vllm
 else

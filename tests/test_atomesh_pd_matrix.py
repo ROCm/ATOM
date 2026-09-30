@@ -3,8 +3,15 @@
 
 """CPU-only tests for ATOMesh Slurm node selection."""
 
+import argparse
+import asyncio
 import importlib.util
+import json
 import os
+import shlex
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -138,6 +145,287 @@ class NodeSelectionTest(unittest.TestCase):
         cell = self.build_cell(runner="atomesh-cicd-mi355-crusoe", nodes="n1,n2")
         self.assertEqual(cell["nodes"], [])
         self.assertEqual(cell["num_nodes"], 2)
+
+
+class SurveyConfigurationTest(unittest.TestCase):
+    def test_weight_preflight_visible_missing_and_unknown(self):
+        path = SCRIPT.parent / "pd_survey_preflight.py"
+        spec = importlib.util.spec_from_file_location("survey_preflight", path)
+        preflight = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(preflight)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model = root / "Qwen/Qwen3-0.6B"
+            self.assertEqual(
+                preflight.check_weights(model, root / "unmounted")["status"], "UNKNOWN"
+            )
+            self.assertEqual(
+                preflight.check_weights(model, root)["status"], "BLOCKED_ENV"
+            )
+            model.mkdir(parents=True)
+            (model / "config.json").write_text(
+                json.dumps(
+                    {
+                        "architectures": ["Qwen3ForCausalLM"],
+                        "text_config": {
+                            "quantization_config": {"quant_method": "mxfp4"}
+                        },
+                    }
+                )
+            )
+            for name in ("tokenizer.json", "tokenizer_config.json"):
+                (model / name).write_text("{}")
+            (model / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"a": "shard.safetensors"}})
+            )
+            self.assertEqual(
+                preflight.check_weights(model, root)["status"], "BLOCKED_ENV"
+            )
+            (model / "shard.safetensors").write_bytes(b"12345678")
+            report = preflight.check_weights(model, root)
+            self.assertEqual(report["status"], "FILES_VISIBLE")
+            self.assertEqual(report["quantization_config"]["quant_method"], "mxfp4")
+
+    def test_smoke_workload_is_bounded_and_never_profiles(self):
+        import httpx
+
+        path = SCRIPT.parent / "pd_vllm_profile.py"
+        spec = importlib.util.spec_from_file_location("survey_profile", path)
+        profile = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(profile)
+        calls = []
+        fault = {"zero_external": False, "reset_false": False}
+        counters = {
+            host: {
+                "local_compute": 0,
+                "local_cache_hit": 0,
+                "external_kv_transfer": 0,
+                "request_success": 0,
+            }
+            for host in ("prefill", "decode")
+        }
+
+        def respond(request):
+            calls.append(request.url.path)
+            if request.url.path == "/metrics":
+                c = counters[request.url.host]
+                text = "\n".join(
+                    f'vllm:prompt_tokens_by_source_total{{source="{k}"}} {v}'
+                    for k, v in c.items()
+                    if k != "request_success"
+                )
+                text += f'\nvllm:request_success_total{{finished_reason="length"}} {c["request_success"]}'
+                return httpx.Response(200, text=text)
+            if request.url.path == "/tokenize":
+                return httpx.Response(200, json={"tokens": list(range(4096))})
+            if request.url.path == "/reset_prefix_cache":
+                return httpx.Response(200, json={"success": not fault["reset_false"]})
+            self.assertEqual(request.url.path, "/v1/completions")
+            body = json.loads(request.content)
+            self.assertLessEqual(len(body["prompt"]), 2050)
+            self.assertLessEqual(body["max_tokens"], 16)
+            c = counters[request.url.host]
+            c["request_success"] += 1
+            if request.url.host == "decode":
+                self.assertTrue(
+                    body.get("kv_transfer_params", {}).get("do_remote_prefill")
+                )
+                c["external_kv_transfer"] += (
+                    0 if fault["zero_external"] else len(body["prompt"]) - 1
+                )
+                c["local_compute"] += (
+                    len(body["prompt"]) if fault["zero_external"] else 1
+                )
+            else:
+                c["local_compute"] += len(body["prompt"]) - int(
+                    bool(body.get("kv_transfer_params"))
+                )
+            result = {
+                "choices": [{"text": "consistent output", "finish_reason": "length"}]
+            }
+            if body.get("kv_transfer_params", {}).get("do_remote_decode"):
+                result["kv_transfer_params"] = {
+                    "remote_block_ids": [1],
+                    "remote_host": "prefill",
+                }
+            return httpx.Response(200, json=result)
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(profile.httpx, "AsyncClient", return_value=client),
+        ):
+            args = argparse.Namespace(
+                output=Path(tmp),
+                prefill="http://prefill",
+                decode="http://decode",
+                model="Kimi-K3",
+                phase="benchmark",
+                mode="smoke",
+                tp=8,
+                dcp=8,
+                hybrid=True,
+            )
+            asyncio.run(profile.run(args))
+            complete = json.loads((Path(tmp) / "complete.json").read_text())
+            self.assertEqual(complete["requests"], 10)
+            self.assertEqual(complete["direct_pd_text_checks"], 8)
+            self.assertEqual(complete["status"], "PENDING_REVIEW")
+            evidence = json.loads(
+                (Path(tmp) / "correctness-1025-evidence.json").read_text()
+            )
+            self.assertEqual(
+                evidence["producer_effective_prompt_tokens_expected"], 1024
+            )
+            self.assertEqual(
+                evidence["producer_effective_prompt_tokens_observed"], 1024
+            )
+            self.assertEqual(
+                evidence["token_counter_deltas"]["decode"]["external_kv_transfer"], 1024
+            )
+            self.assertTrue(evidence["accounting_checked"])
+            self.assertNotIn("/start_profile", calls)
+        for key, message in (
+            ("zero_external", "No external"),
+            ("reset_false", "cache reset failed"),
+        ):
+            fault[key] = True
+            client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+            with (
+                tempfile.TemporaryDirectory() as tmp,
+                patch.object(profile.httpx, "AsyncClient", return_value=client),
+            ):
+                args.output = Path(tmp)
+                with self.assertRaisesRegex(AssertionError, message):
+                    asyncio.run(profile.run(args))
+                self.assertFalse((Path(tmp) / "complete.json").exists())
+                if key == "zero_external":
+                    evidence = json.loads(
+                        (Path(tmp) / "correctness-127-evidence.json").read_text()
+                    )
+                    self.assertEqual(evidence["status"], "FAIL")
+            fault[key] = False
+
+    def test_clean_source_two_nodes_and_real_server_argv(self):
+        root = SCRIPT.parents[3]
+        env = {
+            "ATOMESH_SLURM_ACCOUNT": "amd-frameworks",
+            "ATOMESH_SLURM_PARTITION": "amd-spur",
+            "ATOMESH_SLURM_SUBMIT_RUNNER": "atomesh-cicd",
+            "ATOMESH_LOG_ROOT": "/it-share/ATOMESH_LOG",
+            "ATOMESH_PD_RANK_MAPPING_POLICY": "none",
+            "ATOMESH_MODEL_ROOT": "/mnt/models",
+            "ATOMESH_1P1D_NODES": "pit2-p03-g13,pit2-p03-g42",
+            "ATOMESH_NODE_POOL": "pit2-p03-g13,pit2-p03-g42",
+        }
+        with patch.dict(os.environ, env):
+            config = pd_matrix.load_config(
+                root / ".github/benchmark/models_atomesh.yaml"
+            )
+            cells = pd_matrix.build_cells(
+                config,
+                suite="vllm",
+                model_filter={"Kimi-K3-vLLM-Survey", "Qwen3-0.6B-vLLM-Survey"},
+                case_filter=None,
+                benchmark_kind_filter=None,
+                override_image=None,
+                override_benchmark_concurrency=None,
+                override_eval_concurrency=None,
+            )
+        self.assertEqual(len(cells), 3)
+        launcher = root / ".github/scripts/atomesh/pd_server_vllm.sh"
+        # Load the actual shell function definitions but never execute installation.
+        functions = launcher.read_text().split(
+            '\nif [[ -n "${ATOMESH_VLLM_SOURCE_SHA:-}" ]]; then'
+        )[0]
+        submit = (root / ".github/scripts/atomesh/pd_submit.sh").read_text()
+        export_code = submit.split("python3 - <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        for cell in cells:
+            with self.subTest(case=cell["name"]), tempfile.TemporaryDirectory() as tmp:
+                self.assertEqual(cell["num_nodes"], 2)
+                self.assertEqual(cell["runner"]["gpus_per_node"], 8)
+                self.assertEqual(cell["runner"]["slurm_account"], "amd-frameworks")
+                self.assertEqual(
+                    cell["vllm"]["source"],
+                    {
+                        "repo": "https://github.com/vllm-project/vllm",
+                        "sha": "b22494cc0cb4bd9db4a62fb107d92429a4a3249d",
+                    },
+                )
+                self.assertNotIn("fork", cell["vllm"])
+                self.assertNotIn("lmcache", cell["vllm"])
+                self.assertIn("@sha256:659b283", cell["image"])
+                exported = subprocess.check_output(
+                    [sys.executable, "-c", export_code],
+                    text=True,
+                    env={**os.environ, "CELL_JSON": json.dumps(cell)},
+                )
+                shell = (
+                    exported
+                    + "\n"
+                    + "\n".join(
+                        [
+                            "set -euo pipefail",
+                            "export PATH="
+                            + shlex.quote(str(Path(sys.executable).parent))
+                            + ":$PATH",
+                            "host_ip=127.0.0.1; host_name=cpu-fixture; NODE0_ADDR=127.0.0.2",
+                            "NODE_RANK=0; HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7",
+                            "ATOMESH_SERVICE_PORT_OFFSET=0; ATOMESH_EXECUTION_PHASE=benchmark",
+                            "ATOMESH_SCRIPT_DIR=" + shlex.quote(str(launcher.parent)),
+                            "RUNTIME_LOG_DIR="
+                            + shlex.quote(tmp)
+                            + "; RUN_DIR=$RUNTIME_LOG_DIR",
+                            "PREFILL_TP_SIZE=$PREFILL_TP; DECODE_TP_SIZE=$DECODE_TP",
+                            'PREFILL_SERVER_ARGS="$EXTRA_SERVER_ARGS $PREFILL_EXTRA_SERVER_ARGS"',
+                            'DECODE_SERVER_ARGS="$EXTRA_SERVER_ARGS $DECODE_EXTRA_SERVER_ARGS"',
+                            # Stubs intercept process launch, not argv construction.
+                            "apply_role_env() { :; }; build_server_cache_env() { :; }",
+                            "dump_launch_info() { :; }; start_logged_process() { :; }",
+                            functions,
+                            "start_vllm_server prefill prefill 2584",
+                            "start_vllm_server decode decode 2584",
+                        ]
+                    )
+                )
+                subprocess.run(
+                    ["bash", "-c", shell], check=True, capture_output=True, text=True
+                )
+                for role in ("prefill", "decode"):
+                    argv = json.loads((Path(tmp) / f"{role}.launch.json").read_text())[
+                        "argv"
+                    ]
+                    dense = cell["model"] == "Qwen3-0.6B-vLLM-Survey"
+                    self.assertEqual(
+                        argv[argv.index("--tensor-parallel-size") + 1],
+                        "1" if dense else "8",
+                    )
+                    if dense:
+                        self.assertNotIn("--decode-context-parallel-size", argv)
+                        self.assertNotIn("require_k3_triton", cell["vllm"])
+                        self.assertEqual(
+                            cell["model_path"], "/mnt/models/Qwen/Qwen3-0.6B"
+                        )
+                    else:
+                        self.assertEqual(
+                            argv[argv.index("--decode-context-parallel-size") + 1], "8"
+                        )
+                    self.assertIn("--enforce-eager", argv)
+                    self.assertNotIn("--quantization-config", argv)
+                    self.assertNotIn("--profiler-config", argv)
+                    transfer = json.loads(argv[argv.index("--kv-transfer-config") + 1])
+                    self.assertEqual(transfer["kv_connector"], "MoRIIOConnector")
+                    self.assertEqual(transfer["kv_load_failure_policy"], "fail")
+                    self.assertTrue(transfer["kv_connector_extra_config"]["read_mode"])
+                    self.assertEqual(
+                        transfer["kv_connector_extra_config"]["backend"], "rdma"
+                    )
+                    if "dspark3" in cell["name"]:
+                        spec = json.loads(argv[argv.index("--speculative-config") + 1])
+                        self.assertEqual(spec["rejection_sample_method"], "standard")
+                        self.assertNotIn("synthetic_acceptance_length", spec)
+                    else:
+                        self.assertNotIn("--speculative-config", argv)
 
 
 if __name__ == "__main__":

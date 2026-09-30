@@ -1366,7 +1366,10 @@ run_workload_phase() {
       --decode "http://${IP_ARRAY[1]}:${DECODE_PORT}" \
       --model "${SERVED_MODEL_NAME}" --tokenizer "${MODEL_PATH}" \
       --output "${RUN_DIR}/pd-diagnostic/${ATOMESH_EXECUTION_PHASE}" \
-      --phase "${ATOMESH_EXECUTION_PHASE}"
+      --phase "${ATOMESH_EXECUTION_PHASE}" \
+      --mode "${ATOMESH_VLLM_DIAGNOSTIC_MODE:-profile}" \
+      --tp "${PREFILL_TP_SIZE}" --dcp "${PREFILL_DCP_SIZE}" \
+      $([[ "${ATOMESH_VLLM_HYBRID:-0}" == "1" ]] && printf '%s' --hybrid)
   elif [[ "${ATOMESH_EXECUTION_PHASE}" == "benchmark" ]]; then
     run_benchmark
   elif [[ "${ATOMESH_EXECUTION_PHASE}" == "eval" ]]; then

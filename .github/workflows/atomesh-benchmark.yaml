@@ -1739,6 +1739,36 @@ jobs:
           print(json.dumps(cell, indent=2, sort_keys=True))
           PY
 
+      - name: Survey pre-submit visibility and queue check
+        if: ${{ matrix.vllm.clean_main == 1 }}
+        env:
+          CELL_JSON: ${{ steps.machine-paths.outputs.cell_json }}
+        run: |
+          set -euo pipefail
+          mkdir -p survey-preflight
+          date -u > survey-preflight/collected-at.txt
+          timeout 20s squeue --noheader --format='%i %T %D %j %N %R %a %q' > survey-preflight/squeue.txt 2>&1 || true
+          timeout 15s sinfo --nodes="${ATOMESH_NODE_POOL}" > survey-preflight/sinfo.txt 2>&1 || true
+          timeout 15s sacctmgr --noheader --parsable2 show qos format=Name,GrpTRES,MaxTRESPU,GrpJobs,MaxJobsPU > survey-preflight/qos.txt 2>&1 || true
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          cell = json.loads(os.environ['CELL_JSON'])
+          Path('survey-preflight/cell.json').write_text(json.dumps(cell, indent=2))
+          model = cell['model_path']
+          # The existing machine-paths contract maps the shared model root here.
+          root = '/share_nfs/models' if model.startswith('/share_nfs/models/') else os.environ['ATOMESH_MODEL_ROOT']
+          subprocess.run(['python3', '.github/scripts/atomesh/pd_survey_preflight.py', model,
+                          'survey-preflight/weights.json', '--model-root', root], check=True)
+          PY
+
+      - name: Archive survey pre-submit checks
+        if: ${{ always() && matrix.vllm.clean_main == 1 }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: survey-preflight-${{ matrix.id }}
+          path: survey-preflight/
+
       - name: Run Slurm benchmark cell
         env:
           # Build the reviewed source in a separate setup container. Use the

@@ -908,6 +908,139 @@ models:
       threshold: 0.94
       max_gen_toks: 4096
 
+  # Survey only: full checkpoint, clean upstream source, no online quantization.
+  Kimi-K3-vLLM-Survey:
+    backend: vllm
+    image: vllm/vllm-openai-rocm:nightly@sha256:659b28319fef4ea0e3d8f33e25b4c35d6f663f5d818a5b2fa06dceaf859234e4
+    model_path: "${ATOMESH_MODEL_ROOT}/moonshotai/Kimi-K3"
+    precision: checkpoint
+    env:
+      common:
+        ATOMESH_PRE_CLEAN_GPU: "1"
+        VLLM_ROCM_USE_AITER: "1"
+        VLLM_ROCM_USE_AITER_MOE: "1"
+        VLLM_ROCM_USE_AITER_MOE_SITUV2: a16w4
+        AITER_LOG_LEVEL: WARNING
+        VLLM_SERVER_DEV_MODE: "1"
+        VLLM_DISABLE_REQUEST_ID_RANDOMIZATION: "1"
+        VLLM_PLUGINS: ""
+        PYTHONNOUSERSITE: "1"
+        PYTHONDONTWRITEBYTECODE: "1"
+        PYTHONHASHSEED: "42"
+        VLLM_SSM_CONV_STATE_LAYOUT: DS
+        MORI_IO_SQ_BACKOFF_TIMEOUT_US: "50000"
+        MORI_IO_QP_MAX_SEND_WR: "16384"
+        MORI_IO_QP_MAX_CQE: "32768"
+        MORI_IO_QP_MAX_SGE: "2"
+        MORI_RDMA_TC: "104"
+    vllm:
+      served_model_name: Kimi-K3
+      source:
+        repo: https://github.com/vllm-project/vllm
+        sha: b22494cc0cb4bd9db4a62fb107d92429a4a3249d
+      clean_main: 1
+      diagnostic: 1
+      diagnostic_mode: smoke
+      hybrid: 1
+    server:
+      common_args:
+        extra_args: >-
+          --moe-backend aiter --load-format safetensors --gpu-memory-utilization 0.88
+          --language-model-only --max-num-seqs 4 --max-model-len 4096
+          --enable-prefix-caching --prefix-match-unit 128
+          --kv-cache-dtype auto --block-size 128 --max-num-batched-tokens 2048
+          --attention-backend ROCM_AITER_MLA
+          --dcp-comm-backend a2a --cp-kv-cache-interleave-size 1
+          --enforce-eager
+    suites:
+      vllm:
+        - &survey_k3_read
+          name: survey-k3-main-read-1p1d-tp8-dcp8-eager
+          topology: 1p1d
+          display_topology: 1P1D-TP8-DCP8
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1024]
+          osl: 16
+          concurrency: [1, 2]
+          prefill:
+            workers: 1
+            tp: 8
+            dcp: 8
+          decode:
+            workers: 1
+            tp: 8
+            dcp: 8
+          benchmark:
+            wait_server_timeout: 10800
+          run_eval: false
+        # Follow-up only; not selected by the first dispatch inputs.
+        - <<: *survey_k3_read
+          name: survey-k3-main-read-dspark3-1p1d-tp8-dcp8-eager
+          prefill:
+            workers: 1
+            tp: 8
+            dcp: 8
+            extra_args: &survey_k3_draft >-
+              --speculative-config '{"model":"${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark","num_speculative_tokens":3,"method":"dspark","attention_backend":"ROCM_AITER_MLA","draft_sample_method":"probabilistic","rejection_sample_method":"standard"}'
+          decode:
+            workers: 1
+            tp: 8
+            dcp: 8
+            extra_args: *survey_k3_draft
+
+  # Dense control does not require the K3 FP4/Triton feature gate.
+  Qwen3-0.6B-vLLM-Survey:
+    backend: vllm
+    image: vllm/vllm-openai-rocm:nightly@sha256:659b28319fef4ea0e3d8f33e25b4c35d6f663f5d818a5b2fa06dceaf859234e4
+    model_path: "${ATOMESH_MODEL_ROOT}/Qwen/Qwen3-0.6B"
+    precision: BF16
+    env:
+      common:
+        ATOMESH_PRE_CLEAN_GPU: "1"
+        AITER_LOG_LEVEL: WARNING
+        VLLM_SERVER_DEV_MODE: "1"
+        VLLM_DISABLE_REQUEST_ID_RANDOMIZATION: "1"
+        VLLM_PLUGINS: ""
+        PYTHONNOUSERSITE: "1"
+        PYTHONDONTWRITEBYTECODE: "1"
+    vllm:
+      served_model_name: Qwen3-0.6B
+      source:
+        repo: https://github.com/vllm-project/vllm
+        sha: b22494cc0cb4bd9db4a62fb107d92429a4a3249d
+      clean_main: 1
+      diagnostic: 1
+      diagnostic_mode: smoke
+    server:
+      common_args:
+        extra_args: >-
+          --load-format safetensors --dtype bfloat16 --gpu-memory-utilization 0.25
+          --max-num-seqs 4 --max-model-len 4096 --max-num-batched-tokens 2048
+          --enable-prefix-caching --kv-cache-dtype auto --block-size 128
+          --attention-backend TRITON_ATTN --enforce-eager
+    suites:
+      vllm:
+        - name: survey-qwen3-main-read-1p1d-tp1-eager
+          topology: 1p1d
+          display_topology: 1P1D-TP1
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1024]
+          osl: 16
+          concurrency: [1]
+          prefill:
+            workers: 1
+            tp: 1
+            dcp: 1
+          decode:
+            workers: 1
+            tp: 1
+            dcp: 1
+          benchmark:
+            wait_server_timeout: 1800
+          run_eval: false
+
   Kimi-K2.5-MXFP4:
     backend: atom
     model_path: "${ATOMESH_MODEL_ROOT}/amd/Kimi-K2.5-MXFP4/"

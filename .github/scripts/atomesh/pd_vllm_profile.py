@@ -3,11 +3,31 @@
 import argparse
 import asyncio
 import json
+import re
 import time
 import uuid
 from pathlib import Path
 
 import httpx
+
+
+def token_counters(text):
+    result = {}
+    for line in text.splitlines():
+        if line.startswith("vllm:prompt_tokens_by_source_total{"):
+            source = re.search(r'source="([^"]+)"', line)
+            if source:
+                key = source.group(1)
+                result[key] = result.get(key, 0) + float(line.rsplit(" ", 1)[1])
+        elif line.startswith("vllm:request_success_total{"):
+            result["request_success"] = result.get("request_success", 0) + float(
+                line.rsplit(" ", 1)[1]
+            )
+    return result
+
+
+def counter_delta(before, after):
+    return {key: after[key] - value for key, value in before.items() if key in after}
 
 
 async def run(args):
@@ -21,18 +41,23 @@ async def run(args):
             return response
 
         async def snapshot(tag):
+            counters = {}
             for role in ("prefill", "decode"):
                 response = await client.get(getattr(args, role) + "/metrics")
                 response.raise_for_status()
                 (args.output / f"{tag}-{role}.metrics.txt").write_text(response.text)
+                counters[role] = token_counters(response.text)
+            return counters
 
         async def reset():
-            await asyncio.gather(
-                *(
-                    post(url, "/reset_prefix_cache")
-                    for url in (args.prefill, args.decode)
-                )
-            )
+            for role in ("prefill", "decode"):
+                response = await post(getattr(args, role), "/reset_prefix_cache")
+                result = response.json()
+                with (args.output / "cache-resets.jsonl").open("a") as output:
+                    output.write(json.dumps({"role": role, "response": result}) + "\n")
+                assert (
+                    result.get("success") is True
+                ), f"{role} cache reset failed: {result}"
 
         async def complete(url, prompt, count, params=None, request_id=None):
             body = {
@@ -66,7 +91,7 @@ async def run(args):
                 {
                     "do_remote_decode": True,
                     "do_remote_prefill": False,
-                    "remote_tp_size": 8,
+                    "remote_tp_size": args.tp,
                     "remote_dp_size": 1,
                     "transfer_id": "moriio-" + uuid.uuid4().hex,
                 },
@@ -75,31 +100,192 @@ async def run(args):
             after_prefill = time.perf_counter()
             transfer = prefill["kv_transfer_params"]
             assert transfer["remote_block_ids"] and transfer["remote_host"], transfer
+            record = {
+                "tag": tag,
+                "request_id": request_id,
+                "prompt_tokens": len(prompt),
+                "prefill": prefill,
+                "prefill_ms": 1000 * (after_prefill - start),
+            }
+            records.append(record)
+            (args.output / "requests.json").write_text(json.dumps(records, indent=2))
             decode = await complete(
                 args.decode,
                 prompt,
                 count,
                 {
                     **transfer,
-                    "remote_tp_size": 8,
+                    "remote_tp_size": args.tp,
                     "remote_dp_size": 1,
                     "do_remote_decode": False,
                     "do_remote_prefill": True,
                 },
                 request_id,
             )
-            records.append(
+            record.update(
                 {
-                    "tag": tag,
-                    "prompt_tokens": len(prompt),
-                    "prefill_ms": 1000 * (after_prefill - start),
                     "decode_ms": 1000 * (time.perf_counter() - after_prefill),
-                    "prefill": prefill,
                     "decode": decode,
                 }
             )
             (args.output / "requests.json").write_text(json.dumps(records, indent=2))
             return decode
+
+        async def measured_pd(prompt, count, tag, cache_state):
+            evidence = {
+                "tag": tag,
+                "status": "PENDING_REVIEW",
+                "cache_state": cache_state,
+                "prompt_tokens": len(prompt),
+                "producer_effective_prompt_tokens_expected": len(prompt)
+                - int(args.hybrid),
+                "dcp_block_tokens": 128 * args.dcp,
+                "decoder_protocol_tail_tokens": 1,
+                "attribution": "serial request; no concurrent workload permitted",
+            }
+            before = await snapshot(tag + "-before")
+            try:
+                response = await pd(prompt, count, tag)
+                evidence["http_completed"] = True
+                evidence["finish_reason"] = response["choices"][0].get("finish_reason")
+                # Metrics are emitted on the engine stats interval. Bound the wait.
+                for attempt in range(12):
+                    after = await snapshot(tag + "-after")
+                    deltas = {
+                        role: counter_delta(before[role], after[role])
+                        for role in before
+                    }
+                    if all(d.get("request_success", 0) >= 1 for d in deltas.values()):
+                        break
+                    await asyncio.sleep(0.5)
+                evidence["token_counter_deltas"] = deltas
+                d = deltas["decode"]
+                evidence["producer_effective_prompt_tokens_observed"] = sum(
+                    deltas["prefill"].get(k, 0)
+                    for k in (
+                        "local_compute",
+                        "local_cache_hit",
+                        "external_kv_transfer",
+                    )
+                )
+                required = {
+                    "local_compute",
+                    "local_cache_hit",
+                    "external_kv_transfer",
+                    "request_success",
+                }
+                if required <= d.keys() and d["request_success"] == 1:
+                    if cache_state == "cold-reset-both":
+                        assert (
+                            d["external_kv_transfer"] > 0
+                        ), "No external KV token consumption"
+                    elif d["external_kv_transfer"] == 0:
+                        evidence["review_reason"] = (
+                            "Warm APC may hide transfer; not remote-transfer proof"
+                        )
+                    assert (
+                        d["local_compute"] >= 1
+                    ), "Missing READ protocol tail computation"
+                    assert sum(d[k] for k in required - {"request_success"}) == len(
+                        prompt
+                    ), "Prompt token accounting mismatch"
+                    evidence["accounting_checked"] = True
+                else:
+                    evidence["accounting_checked"] = False
+                    evidence["review_reason"] = (
+                        "Missing/delayed or non-isolated metrics"
+                    )
+                assert (
+                    evidence["finish_reason"] == "length"
+                ), "Incomplete decode response"
+                return response
+            except Exception as exc:
+                evidence["status"] = "FAIL"
+                evidence["error"] = repr(exc)
+                try:
+                    after = await snapshot(tag + "-failure")
+                    evidence["token_counter_deltas"] = {
+                        role: counter_delta(before[role], after[role])
+                        for role in before
+                    }
+                except (httpx.HTTPError, OSError, ValueError) as metric_exc:
+                    evidence["metrics_error"] = repr(metric_exc)
+                raise
+            finally:
+                (args.output / f"{tag}-evidence.json").write_text(
+                    json.dumps(evidence, indent=2) + "\n"
+                )
+
+        if args.mode == "smoke":
+            text = "Explain this engineering record.\n" + "\n".join(
+                f"Record {i}: The service reads a buffer and computes a result."
+                for i in range(300)
+            )
+            response = await post(
+                args.prefill, "/tokenize", {"model": args.model, "prompt": text}
+            )
+            tokens = response.json()["tokens"]
+            assert len(tokens) >= 2050
+            lengths = (127, 128, 129, 1023, 1024, 1025, 2049, 2050)
+            (args.output / "workload.json").write_text(
+                json.dumps(
+                    {
+                        "mode": "smoke",
+                        "phase": args.phase,
+                        "tokens": tokens,
+                        "lengths": lengths,
+                        "output_tokens": 16,
+                        "scope": f"Two nodes TP{args.tp}/DCP{args.dcp}, clean main MoRIIO READ; no LMCache",
+                        "hybrid": args.hybrid,
+                        "dcp_block_tokens": 128 * args.dcp,
+                        "reference": "producer ordinary request without transfer params",
+                        "cache_policy": "reset both roles before each cold request; warm separately",
+                    },
+                    indent=2,
+                )
+            )
+            await snapshot("before")
+            for length in lengths:
+                await reset()
+                direct = await complete(args.prefill, tokens[:length], 16)
+                await reset()
+                split = await measured_pd(
+                    tokens[:length], 16, f"correctness-{length}", "cold-reset-both"
+                )
+                # Keep the direct reference even if the comparison fails.
+                records[-1]["direct"] = direct
+                (args.output / "requests.json").write_text(
+                    json.dumps(records, indent=2)
+                )
+                equal = split["choices"][0]["text"] == direct["choices"][0]["text"]
+                evidence_path = args.output / f"correctness-{length}-evidence.json"
+                evidence = json.loads(evidence_path.read_text())
+                evidence["direct_pd_text_equal"] = equal
+                if not equal:
+                    evidence["status"] = "FAIL"
+                evidence_path.write_text(json.dumps(evidence, indent=2) + "\n")
+                assert equal, (length, direct, split)
+            await reset()
+            await measured_pd(tokens[:1025], 16, "warm-prime", "cold-reset-both")
+            await measured_pd(tokens[:1025], 16, "warm-replay", "warm-no-reset")
+            await snapshot("after")
+            (args.output / "complete.json").write_text(
+                json.dumps(
+                    {
+                        "status": "PENDING_REVIEW",
+                        "requests": len(records),
+                        "direct_pd_text_checks": len(lengths),
+                        "output_tokens": 16,
+                        "natural_accuracy_evaluated": False,
+                        "full_c16_evaluated": False,
+                        "remote_transfer_requires_log_and_metrics_review": True,
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+            print(f"Native PD smoke complete: {args.output}", flush=True)
+            return
 
         text = "Analyze this engineering record and explain the timing.\n" + "\n".join(
             f"Record {i}: The service processes an input buffer, computes a result, "
@@ -125,7 +311,7 @@ async def run(args):
         # synthetic-acceptance benchmark phase. Longer accuracy needs natural SD.
         for length in (32767, 32768, 32769, 20224):
             await reset()
-            direct = await complete(args.decode, tokens[:length], 1)
+            direct = await complete(args.prefill, tokens[:length], 1)
             await reset()
             split = await pd(tokens[:length], 1, f"correctness-{length}")
             assert split["choices"][0]["text"] == direct["choices"][0]["text"], (
@@ -187,4 +373,24 @@ if __name__ == "__main__":
     parser.add_argument("--tokenizer", required=True)
     parser.add_argument("--phase", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    asyncio.run(run(parser.parse_args()))
+    parser.add_argument("--mode", choices=("profile", "smoke"), default="profile")
+    parser.add_argument("--tp", type=int, default=8)
+    parser.add_argument("--dcp", type=int, default=8)
+    parser.add_argument("--hybrid", action="store_true")
+    args = parser.parse_args()
+    try:
+        asyncio.run(run(args))
+    except Exception as exc:
+        args.output.mkdir(parents=True, exist_ok=True)
+        (args.output / "failure.json").write_text(
+            json.dumps(
+                {
+                    "status": "FAIL",
+                    "error": repr(exc),
+                    "mode": args.mode,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        raise
