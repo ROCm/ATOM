@@ -263,10 +263,41 @@ def _stable_config_value(value: Any) -> Any:
     )
 
 
+def _canonical_head_dim(hf: object) -> int | None:
+    """Return the attention head dim every process agrees on.
+
+    ``head_dim`` is not a stable property of the checkpoint: for MLA models it
+    is absent from ``config.json`` and each process fills it in on its own.
+    vLLM's scheduler process keeps transformers' computed default
+    (``hidden_size // num_attention_heads``, 74 for Kimi K3) while the workers
+    end up with the MLA head dim (``qk_nope + qk_rope``, 192).  Hashing the
+    attribute therefore splits the PAGE namespace in two: the workers publish
+    their layout under one name, every lookup asks for the other, and the tier
+    answers every lookup with a miss and no error.  Derive it from the fields
+    that do come from the checkpoint instead.
+    """
+
+    qk_nope = getattr(hf, "qk_nope_head_dim", None)
+    qk_rope = getattr(hf, "qk_rope_head_dim", None)
+    if qk_nope and qk_rope:
+        return int(qk_nope) + int(qk_rope)
+    head_dim = getattr(hf, "head_dim", None)
+    if head_dim:
+        return int(head_dim)
+    hidden_size = getattr(hf, "hidden_size", None)
+    num_heads = getattr(hf, "num_attention_heads", None)
+    if hidden_size and num_heads:
+        return int(hidden_size) // int(num_heads)
+    return None
+
+
 def _stable_hf_geometry(hf: object) -> dict[str, Any]:
     geometry: dict[str, Any] = {}
     for name in _HF_PAGE_FIELDS:
-        value = getattr(hf, name, None)
+        if name == "head_dim":
+            value = _canonical_head_dim(hf)
+        else:
+            value = getattr(hf, name, None)
         if value is not None and name in _HF_INTEGER_GEOMETRY_FIELDS:
             value = _strict_integer(f"PAGE {name}", value)
         elif value is not None and name == "compress_ratios":
@@ -355,6 +386,16 @@ def build_page_namespace(
         digest_size=_PAGE_FINGERPRINT_BYTES,
         person=b"ATOM-PAGE-CFG-v3",
     ).hexdigest()
+    # The namespace is a hash, so two processes that disagree about any input
+    # produce two valid-looking names and no error anywhere: the workers
+    # register their layout under one, every lookup asks for the other, and the
+    # tier answers each lookup with a miss. Logging the document it was hashed
+    # from is the only way to see which field they disagreed about.
+    logger.info(
+        "ATOM PAGE namespace %s from %s",
+        digest,
+        canonical.decode("ascii"),
+    )
     return f"{base_model_name}::atom-page-v{layout_version}-{digest}"
 
 
@@ -646,7 +687,9 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
             minimum=1,
         )
         num_kv_heads_local = max(1, num_kv_heads // tp)
-        raw_head_dim = getattr(hf, "head_dim", 0)
+        # Same derivation the PAGE namespace hashes, so the shape a worker
+        # publishes and the shape the scheduler looks up cannot drift apart.
+        raw_head_dim = _canonical_head_dim(hf) or 0
         normalized_head_dim = (
             0
             if raw_head_dim is None

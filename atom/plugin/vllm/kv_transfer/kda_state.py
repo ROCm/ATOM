@@ -222,6 +222,11 @@ class KdaPageViews:
         self._groups = groups
         self.layout_id = layout_id
         self.num_groups = len(groups)
+        # Every mamba layer of every group lives on this worker's one device,
+        # so the first tensor answers for all of them. Exposed because the
+        # staging buffer has to be allocated on it, and under the multiprocess
+        # backend there is no GPU connector around to ask.
+        self.device = groups[0][0].device
         self.num_blocks: list[int] = []
         for tensors in groups:
             counts = sorted({int(t.shape[0]) for t in tensors})

@@ -31,7 +31,7 @@ def _extra_config(config: Any) -> dict[str, Any]:
     return extra
 
 
-def _storage_kv_transfer_config(config: Any) -> dict[str, Any]:
+def storage_kv_transfer_config(config: Any) -> dict[str, Any]:
     """Remove MP transport-only options before LMCache storage parsing."""
 
     kvc = dict(getattr(config, "kv_transfer_config", {}) or {})
@@ -266,7 +266,7 @@ def _server_urls(config: Any) -> list[str]:
 def _model_namespace(config: Any, *, checkpoint_spec: Any = None) -> str:
     """Build a model/layout namespace shared by scheduler and workers."""
 
-    cfg = offcfg.build_lmcache_config(_storage_kv_transfer_config(config))
+    cfg = offcfg.build_lmcache_config(storage_kv_transfer_config(config))
     world_size = offcfg.lmcache_replica_world_size(config)
     page_namespace = offcfg.build_page_namespace(
         config,

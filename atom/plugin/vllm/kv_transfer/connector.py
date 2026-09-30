@@ -255,6 +255,12 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self._attn_group_id = self._resolve_attention_group(kv_cache_config)
         # Worker half of the recurrent leg.
         self._kda_tier = None
+        # Only 'mp' hybrids have one; see `_state_storage_for_mp`.
+        self._state_engine = None
+        # Kept separately: the builder's instance table is keyed by this id and
+        # the engine does not carry it, so shutdown has no other way to name
+        # the instance it must destroy.
+        self._state_engine_id = None
         # Requests whose recurrent load is still outstanding, the dense halves
         # waiting on them, and the results waiting for a dense half. A load is
         # only reported to vLLM once both legs are in; see `_join_kda`.
@@ -283,15 +289,168 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # objects, shared not copied, and dropped when the request finishes.
         self._requests: dict[str, Any] = {}
 
+        self._state_cpu_size_gb = self._resolve_state_cpu_size_gb()
+        self._offload_backend = self._resolve_offload_backend()
+
         if role == KVConnectorRole.WORKER:
-            from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
+            if self._offload_backend == "mp":
+                from atom.kv_transfer.offload.mp.connector import LMCacheMPConnector
 
-            self._worker = DenseOffloadConnector(self._config)
+                from .mp_worker_adapter import MPOffloadWorkerAdapter
+
+                self._worker = MPOffloadWorkerAdapter(LMCacheMPConnector(self._config))
+            else:
+                from atom.kv_transfer.offload.dense.connector import (
+                    DenseOffloadConnector,
+                )
+
+                self._worker = DenseOffloadConnector(self._config)
         else:
-            from atom.kv_transfer.offload.dense.connector import DenseOffloadScheduler
+            if self._offload_backend == "mp":
+                # The shell in `offload/mp/connector.py` is bypassed on purpose:
+                # it picks its implementation inside `bind_block_manager`, and
+                # the block manager it inspects is ATOM's own. In plugin mode
+                # vLLM owns the block pool and there is no such object, so the
+                # PAGE-only scheduler -- the one that shell would have selected
+                # for a layout with no PAGE-backed state checkpoints, which is
+                # the only layout this connector publishes -- is constructed
+                # directly. Both it and `DenseOffloadScheduler` derive from
+                # `ChunkedOffloadSchedulerBase`, which is where every method
+                # this connector calls on the scheduler half is defined.
+                from atom.kv_transfer.offload.mp.scheduler import (
+                    LMCacheMPConnectorScheduler,
+                )
 
-            self._scheduler = DenseOffloadScheduler(self._config)
+                self._scheduler = LMCacheMPConnectorScheduler(self._config)
+            else:
+                from atom.kv_transfer.offload.dense.connector import (
+                    DenseOffloadScheduler,
+                )
+
+                self._scheduler = DenseOffloadScheduler(self._config)
             self._init_kda_planner(vllm_config, kv_cache_config)
+
+            # This process is the one that runs vLLM's scheduler, and the
+            # recompute path it takes when this connector reports a failed
+            # load unpacks a single KV cache group. Applied here rather than
+            # at plugin registration because it is this connector that can
+            # produce the failed loads which reach it.
+            from atom.plugin.vllm.kv_transfer.hybrid_invalid_blocks_patch import (
+                apply_vllm_hybrid_invalid_blocks_patch,
+            )
+
+            apply_vllm_hybrid_invalid_blocks_patch()
+
+    def _resolve_offload_backend(self) -> str:
+        """Which ATOM offload transport this connector drives.
+
+        ``inproc`` keeps LMCache inside the vLLM worker process, the only mode
+        this connector has had. ``mp`` hands the KV planes to a separate
+        LMCache server process, which is what lets one CPU tier be shared by
+        every rank instead of being cut into per-rank slices.
+
+        The recurrent leg does not travel that way. LMCache's multiprocess
+        registration addresses every group by paged block -- its
+        ``recurrent_state`` flag changes restore-window semantics, not
+        addressing -- while this state is per request slot, so it cannot be
+        published as one more group. ATOM's own engine sidesteps that by
+        staging each image into PAGE bytes first; the plugin has no such
+        staging, because vLLM owns the allocation.
+
+        So under ``mp`` the state tier keeps an LMCache engine of its own (see
+        :meth:`_init_kda_tier`), which costs a second host pool and gives up
+        co-eviction with the KV chunks. Both are real enough that the pool is
+        never sized by default: a hybrid model without an explicit
+        ``lmcache.mp.state_cpu_size_gb`` is refused here, where the message can
+        say why, rather than at registration, where it would surface as a
+        missing attribute on a worker object.
+        """
+        raw = self._config.kv_transfer_config.get("atom.offload.backend", "inproc")
+        backend = str(raw).strip().lower()
+        if backend not in ("inproc", "mp"):
+            raise ValueError(
+                "ATOM offload connector: atom.offload.backend must be "
+                f"'inproc' or 'mp', got {raw!r}"
+            )
+        if backend == "mp" and self._mamba_groups and not self._state_cpu_size_gb:
+            raise ValueError(
+                "ATOM offload connector: atom.offload.backend='mp' needs "
+                "lmcache.mp.state_cpu_size_gb for this model. It has "
+                f"{len(self._mamba_groups)} recurrent KV cache group(s), whose "
+                "per-slot state cannot be published as an LMCache group -- the "
+                "multiprocess protocol addresses every group by paged block. "
+                "Under 'mp' that state therefore gets its own LMCache engine "
+                "and its own host pool, on top of the one the server process "
+                "already holds; sizing it is left to you so the second "
+                "allocation is never a surprise. Set it, or use "
+                "atom.offload.backend='inproc', which shares one pool."
+            )
+        return backend
+
+    def _resolve_state_cpu_size_gb(self) -> float:
+        """Host GiB for the recurrent state tier's own pool under ``mp``.
+
+        Zero means unset. Read before the backend is resolved because the
+        refusal above depends on it.
+        """
+        raw = self._config.kv_transfer_config.get("lmcache.mp.state_cpu_size_gb", 0)
+        try:
+            size = float(raw)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "ATOM offload connector: lmcache.mp.state_cpu_size_gb must be "
+                f"a number of GiB, got {raw!r}"
+            ) from None
+        if size < 0:
+            raise ValueError(
+                "ATOM offload connector: lmcache.mp.state_cpu_size_gb must not "
+                f"be negative, got {size}"
+            )
+        return size
+
+    def _page_tp_replication_factor(self) -> int:
+        """How many TP ranks hold byte-identical copies of this PAGE layout.
+
+        The multiprocess tier can store one copy for the whole TP group instead
+        of one per rank, but only where the bytes really are identical: handing
+        rank 0's KV to rank 3 is a wrong answer that nothing reports. ATOM's MP
+        deployment predicts the property from the model config (``auto`` reads
+        ``kv_lora_rank``) and then refuses to register unless the backend
+        declares it as well, so this side must answer from something other than
+        that same config or the cross-check checks nothing.
+
+        vLLM's own cache spec is that independent instrument. ``MLAAttentionSpec``
+        means the group caches the shared latent, which every rank computes
+        before any TP-sharded projection -- the same property ATOM's MLA backend
+        declares natively (``aiter_mla.py``), index planes included. Anything
+        else keeps the sharded answer: vLLM splits KV heads across TP, so the
+        ranks' bytes differ.
+
+        A sparse-MLA group does not arrive as one ``MLAAttentionSpec``. GLM-5.3
+        puts 78 latent layers and 21 DSA indexer layers in one group with two
+        different page sizes, which vLLM merges into a ``UniformTypeKVCacheSpecs``
+        holding both. The declaration covers the whole published layout, so it
+        is the merged members that have to be MLA -- every one of them, since a
+        single sharded plane in the middle of the layout would be served to the
+        wrong rank exactly as a sharded layout would.
+        """
+        groups = getattr(self._kv_cache_config, "kv_cache_groups", None) or ()
+        if not groups:
+            return 1
+        spec = getattr(groups[self._attn_group_id], "kv_cache_spec", None)
+        try:
+            from vllm.v1.kv_cache_interface import MLAAttentionSpec
+        except ImportError:
+            # Not a reason to guess: an unreadable spec vocabulary means the
+            # sharded answer, which costs tier capacity rather than correctness.
+            return 1
+        members = getattr(spec, "kv_cache_specs", None)
+        specs = list(members.values()) if isinstance(members, dict) else [spec]
+        if not specs or not all(
+            isinstance(member, MLAAttentionSpec) for member in specs
+        ):
+            return 1
+        return int(getattr(self._config, "tensor_parallel_size", 1) or 1)
 
     def _resolve_attention_group(self, kv_cache_config) -> int:
         """Which group the existing byte-codec path owns.
@@ -385,10 +544,33 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             int(self._config.kv_cache_block_size),
         )
 
-        self._worker.register_kv_caches(
-            {str(t.layer_num): t for t in tensors},
-            num_blocks=num_blocks,
-        )
+        if self._offload_backend == "mp":
+            # The multiprocess worker ignores the layer dict entirely: its
+            # server process addresses bytes, so it needs the address form.
+            from .mp_page_layout import build_mp_transfer_tensors, summarize_layout
+
+            replication = self._page_tp_replication_factor()
+            transfer_tensors = build_mp_transfer_tensors(
+                tensors,
+                num_blocks=num_blocks,
+                tp_replication_factor=replication,
+            )
+            logger.info(
+                "ATOM LMCache offload: publishing PAGE layout (%s), "
+                "tp_replication_factor=%d",
+                summarize_layout(transfer_tensors),
+                replication,
+            )
+            self._worker.register_kv_caches(
+                {str(t.layer_num): t for t in tensors},
+                transfer_tensors,
+                num_blocks,
+            )
+        else:
+            self._worker.register_kv_caches(
+                {str(t.layer_num): t for t in tensors},
+                num_blocks=num_blocks,
+            )
         # After the dense registration, not before: the recurrent codec shares
         # the engine, its storage manager and its LMCache identity, and none of
         # those exist until the call above has run.
@@ -422,6 +604,112 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 dtype,
             )
 
+    def _state_storage_for_mp(self, views: Any):
+        """An LMCache engine of this connector's own, for the state tier only.
+
+        Under ``mp`` the KV bytes live in the LMCache server process, reached
+        over IPC by block id. The recurrent state cannot follow them: the
+        multiprocess protocol addresses every group by paged block, and this
+        state is addressed by request slot. What it needs is not a transport
+        but a place to put opaque blobs, which is what a ``StorageManager`` is
+        -- so it gets one here, in this process, beside the KV rather than
+        inside it.
+
+        Three things about that engine are deliberate:
+
+        * ``gpu_connector=None``. Its ``store``/``retrieve`` paths are the only
+          users, and the state tier calls neither: ``StateByteCodec`` drives
+          ``batched_put``/``get``/``allocate`` directly and does its own
+          device copies through ``StagedTransfer``.
+        * CPU only. A local-disk backend would put a second writer on the
+          directory the server process already owns, and two LMCache
+          allocators sharing one path is not something this side can verify.
+        * The pool is sized from ``lmcache.mp.state_cpu_size_gb`` and nothing
+          else. Inheriting the KV pool's size would allocate a second pool of
+          that size on every rank, silently. Under PP the builder then splits
+          that figure across stages by layer share, as it does for KV, so the
+          option reads per TP rank rather than per process.
+
+        Returns ``(device, release_after_transfer, storage_manager, metadata)``.
+        """
+        import copy
+
+        from aiter.dist.parallel_state import get_tp_group
+
+        from atom.kv_transfer.offload import config as offcfg
+        from atom.kv_transfer.offload._offload_common import (
+            build_offload_engine,
+            pp_aware_rank_and_world,
+        )
+
+        rank, world = pp_aware_rank_and_world(self._config, get_tp_group())
+
+        from atom.kv_transfer.offload.mp.deployment import (
+            storage_kv_transfer_config,
+        )
+
+        # Stripped, not forwarded raw: `lmcache.mp.*` are this connector's own
+        # transport options, and `apply_extra_overrides` sets every remaining
+        # `lmcache.<field>` on the LMCacheEngineConfig by name, raising
+        # "unknown LMCache override" on the first one that is not a field of
+        # it. The paged leg never hits this because the server process parses
+        # its own options; this engine is the only place in the plugin that
+        # builds an LMCache config out of the connector's extras.
+        cfg = offcfg.build_lmcache_config(storage_kv_transfer_config(self._config))
+        cfg = copy.copy(cfg)
+        cfg.max_local_cpu_size = float(self._state_cpu_size_gb)
+        cfg.local_cpu = True
+        # See the docstring: the server process owns the disk path.
+        cfg.local_disk = None
+        cfg.max_local_disk_size = 0
+
+        engine_id = f"{offcfg.lmcache_engine_id(self._config)}-state-{rank}"
+        engine, _, meta = build_offload_engine(
+            self._config,
+            # A namespace of its own. The KV keys live in the server process
+            # and never reach this engine, but the engine id also names the
+            # builder's instance table, and colliding with the in-process KV
+            # id would hand back a pool sized for something else.
+            engine_id=engine_id,
+            # Opaque-blob bookkeeping only: the state tier addresses entries by
+            # prefix hash, not by block, so these size nothing it reads.
+            block_size=1,
+            bytes_per_block=int(views.entry_bytes),
+            gpu_connector_factory=lambda cfg, meta: None,
+            world=world,
+            rank=rank,
+            cfg=cfg,
+        )
+        storage = getattr(engine, "storage_manager", None)
+        if storage is None:
+            # `post_init` skips the storage manager on ranks excluded by
+            # `save_only_first_rank`. Recurrent state is TP-sharded, so every
+            # rank has its own bytes and a skipped rank would return no state
+            # at all while its KV still loaded -- a wrong answer, not a miss.
+            raise ValueError(
+                "ATOM offload connector: the recurrent state engine came up "
+                f"without a storage manager on rank {rank}. Recurrent state is "
+                "sharded per rank, so it cannot be saved on the first rank "
+                "alone; disable save_only_first_rank for this deployment."
+            )
+        self._state_engine = engine
+        self._state_engine_id = engine_id
+        logger.info(
+            "ATOM LMCache offload: recurrent state tier on its own engine, "
+            "%.1f GiB host pool on rank %d (KV is in the LMCache server "
+            "process; the two tiers evict independently)",
+            float(self._state_cpu_size_gb),
+            rank,
+        )
+        # The same switch the in-process path reads. It reaches that path
+        # through `BlockGPUConnector`, which there is no reason to build here,
+        # but the flag is the environment's, not the connector's -- reading it
+        # directly keeps the two legs on one setting.
+        from atom.utils import envs
+
+        release_after = bool(envs.OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER)
+        return views.device, release_after, storage, meta
+
     def _init_kda_tier(
         self, per_group: list[dict[str, "torch.Tensor"]], groups: list[Any]
     ) -> None:
@@ -445,13 +733,19 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # Sized to one whole state image. The KV staging buffer is sized in
         # LMCache chunks and is routinely an order of magnitude smaller, so
         # sharing it would fail every transfer at `ensure_buffer`.
-        gpu_connector = self._worker._engine.gpu_connector
+        if self._offload_backend == "mp":
+            device, release_after, storage, meta = self._state_storage_for_mp(views)
+        else:
+            gpu_connector = self._worker._engine.gpu_connector
+            device = gpu_connector.device
+            release_after = gpu_connector.release_gpu_staging_after_transfer
+            storage = self._worker._engine.storage_manager
+            meta = self._worker._lmcache_metadata
         staged = StagedTransfer(
-            gpu_connector.device,
+            device,
             staging_buffer_bytes=views.entry_bytes,
-            release_after_transfer=gpu_connector.release_gpu_staging_after_transfer,
+            release_after_transfer=release_after,
         )
-        meta = self._worker._lmcache_metadata
         codec = StateByteCodec(
             views,
             staged,
@@ -461,11 +755,15 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             worker_id=int(meta.worker_id),
             layout_id=views.layout_id,
         )
-        # ONE pool, shared with the paged KV. A prefix's KV chunks and its
-        # boundary states are written in the same window, so they enter the same
-        # LRU and cool together -- which is exactly right, because a boundary
-        # whose KV has been evicted is worth nothing on its own.
-        codec.bind_storage_manager(self._worker._engine.storage_manager)
+        # Under 'inproc' this is ONE pool, shared with the paged KV: a prefix's
+        # KV chunks and its boundary states are written in the same window, so
+        # they enter the same LRU and cool together -- which is exactly right,
+        # because a boundary whose KV has been evicted is worth nothing on its
+        # own. Under 'mp' the KV lives in the server process and this pool is
+        # separate, so the two can cool independently; a state entry surviving
+        # its KV wastes host memory, and KV surviving its state is simply not
+        # loadable. `_state_storage_for_mp` says why it is still worth having.
+        codec.bind_storage_manager(storage)
         self._kda_tier = KdaStateTier(codec)
         logger.info(
             "ATOM LMCache offload: recurrent state tier up, %d layers, "
@@ -768,6 +1066,24 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if self._kda_tier is not None:
             self._kda_tier.close()
             self._kda_tier = None
+        if self._state_engine is not None:
+            # Its own engine means its own host pool and its own threads, and
+            # the builder keeps every instance in a process-wide table: left
+            # behind, the next engine built under this id would be handed this
+            # one back rather than a fresh pool.
+            self._state_engine = None
+            engine_id, self._state_engine_id = self._state_engine_id, None
+            try:
+                from lmcache.v1.cache_engine import LMCacheEngineBuilder
+
+                LMCacheEngineBuilder.destroy(engine_id)
+            except Exception:
+                logger.warning(
+                    "ATOM LMCache offload: recurrent state engine did not shut "
+                    "down cleanly; its host pool stays mapped for the life of "
+                    "the process",
+                    exc_info=True,
+                )
         for side in (self._worker, self._scheduler):
             close = getattr(side, "close", None) or getattr(side, "shutdown", None)
             if close is not None:

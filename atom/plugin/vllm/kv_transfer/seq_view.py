@@ -22,7 +22,15 @@ class SeqView:
     __slots__ = (
         # Stamped by the shared offload scheduler when it refreshes a parked
         # deferred save; read back with ``getattr(seq, ..., None)``, so an
-        # unset slot reads as "not parked".
+        # unset slot reads as "not parked". Restarted on every newly
+        # dispatched deferred save (``_offload_common.
+        # _refresh_save_reclaim_clock`` and the park site in the scheduler).
+        # ATOM's ``Sequence`` has a ``__dict__`` and absorbs
+        # ``seq._deferred_save_at = ...``; a slotted view without this name
+        # raises ``AttributeError`` on that assignment, out of the save path,
+        # the first time a finished request is parked. A clock that is not
+        # restarted abandons the copy while the worker is still reading the
+        # blocks: a truncated image under a valid prefix hash.
         "_deferred_save_at",
         "_load_operation",
         "_num_cached_tokens",
@@ -46,15 +54,6 @@ class SeqView:
         # reader uses ``getattr(seq, ..., None)`` and an unset slot would make
         # "no load emitted" and "slot never declared" the same observation.
         "offload_load_start_tokens",
-        # Restarted on every newly dispatched deferred save
-        # (``_offload_common._refresh_save_reclaim_clock`` and the park site
-        # in the scheduler). ATOM's ``Sequence`` has a ``__dict__`` and
-        # absorbs ``seq._deferred_save_at = ...``. A slotted view without
-        # this name raises ``AttributeError`` on that assignment, out of the
-        # save path, the first time a finished request is parked. A clock
-        # that is not restarted abandons the copy while the worker is still
-        # reading the blocks: a truncated image under a valid prefix hash.
-        "_deferred_save_at",
         "offload_loaded_tokens",
         "prefix_hashes_published",
     )

@@ -428,6 +428,23 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             save_operation=operation,
         )
 
+    def _save_source_is_backed(
+        self,
+        block_ids: list[int],
+        saved: int,
+        aligned: int,
+    ) -> bool:
+        """Whether the block table still covers every token the save claims."""
+
+        source_block_size = int(getattr(self, "virtual_block_size", self.block_size))
+        end_block = -(-int(aligned) // source_block_size)  # ceil div
+        if len(block_ids) < end_block:
+            return False
+        start_block = int(saved) // source_block_size
+        return all(
+            block_ids[index] is not None for index in range(start_block, end_block)
+        )
+
     def _late_save_frontier(self, seq, saved: int, available: int) -> int:
         """Return the largest layout-valid boundary for a late-acquired source."""
         del seq, saved
@@ -621,6 +638,25 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 block_ids = list(
                     getattr(seq, "_offload_finished_block_ids", seq.block_table)
                 )
+            if not self._save_source_is_backed(block_ids, saved, aligned):
+                # The blocks holding [saved, aligned) are gone -- a preemption
+                # cleared this sequence's block table while the save was still
+                # queued. Emitting anyway ships a descriptor the worker cannot
+                # honour ("needs N blocks for [start, end), got 0") and kills
+                # the transfer; the tokens are simply not resident to read.
+                self.total_unbacked_saves += 1
+                if late_acquired:
+                    self._block_manager.free_leased_blocks(late_acquired)
+                logger.warning(
+                    "Offload save of seq %s covers [%d, %d) but its block table "
+                    "holds %d blocks; skipping (total unbacked_saves=%d)",
+                    seq.id,
+                    saved,
+                    aligned,
+                    len(block_ids),
+                    self.total_unbacked_saves,
+                )
+                continue
             try:
                 request = self._build_save_request(
                     seq, saved, aligned, save_operation, block_ids, is_last_prefill

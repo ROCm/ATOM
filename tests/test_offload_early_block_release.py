@@ -843,3 +843,35 @@ class TestEarlyReleaseDefaultsOn:
         assert scheduler._early_release is True
         assert scheduler.protected_block_ids(seq) == frozenset({0, 1})
         assert scheduler.should_defer_free(seq) is True
+
+
+class TestUnbackedSaveIsSkipped:
+    def test_preempted_block_table_skips_the_save(self, monkeypatch):
+        """A save whose source blocks are gone is dropped, not shipped.
+
+        Preemption clears the sequence's block table while a save is still
+        queued. The descriptor would still claim [saved, aligned), and the MP
+        worker rejects it ("needs 2 blocks for [0, 64), got 0"), taking the
+        whole transfer batch down with it.
+        """
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(303, 32, 8)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 32
+
+        seq.block_table.clear()
+        meta = scheduler.build_connector_meta()
+
+        assert meta.requests == []
+        assert scheduler.total_unbacked_saves == 1
+
+    def test_a_backed_save_still_ships(self, monkeypatch):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(304, 32, 8)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 32
+
+        [request] = scheduler.build_connector_meta().requests
+
+        assert request.block_ids == list(range(8))
+        assert scheduler.total_unbacked_saves == 0

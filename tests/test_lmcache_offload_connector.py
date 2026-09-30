@@ -7296,7 +7296,7 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
 
 
 def test_run_staged_pipeline_fences_against_compute_stream(monkeypatch):
-    """Both staging streams wait on the compute stream before any group runs.
+    """Both staging streams wait on the compute stream ahead of every group.
 
     The two staging streams are side streams; the model's forward is the
     producer of the KV a save reads. Without this edge a pack can gather a
@@ -7354,6 +7354,11 @@ def test_run_staged_pipeline_fences_against_compute_stream(monkeypatch):
 
     compute = _FakeStream("compute")
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    # The closing edge records a real ``torch.cuda.Event`` against the
+    # stream double. A genuine event rejects a double ("invalid device
+    # ordinal") and a CPU-only build refuses to construct one at all, so
+    # without this the test cannot reach its assertion in any environment.
+    monkeypatch.setattr(torch.cuda, "Event", _FakeEvent)
     # Distinct from `compute`: `_compute_stream_for` treats "the default
     # stream" as a missing recording, because that is exactly the value the
     # old thread-local lookup produced.
@@ -7372,17 +7377,24 @@ def test_run_staged_pipeline_fences_against_compute_stream(monkeypatch):
         group_nbytes=lambda group: group.nbytes,
     )
 
-    # Once, up front -- not per group: the edge only has to separate the
-    # staging work from forward work already enqueued when the job was
-    # submitted.
-    assert waited == [("pack", "compute"), ("copy", "compute")]
+    # Per group, not once up front. A save runs on a worker thread alongside
+    # the *next* forward step, so an entry fence covers only what was queued
+    # before it; group two can otherwise pack a block whose attention write
+    # was enqueued after that fence. Two groups, so two rounds.
+    assert waited == [
+        ("pack", "compute"),
+        ("copy", "compute"),
+        ("pack", "compute"),
+        ("copy", "compute"),
+    ]
 
 
-def test_run_staged_pipeline_fences_shared_stream_once(monkeypatch):
-    """Single-stream mode takes the compute edge exactly once.
+def test_run_staged_pipeline_fences_shared_stream_once_per_group(monkeypatch):
+    """Single-stream mode takes the compute edge once per group, not twice.
 
     Collapsing both legs onto one stream is a performance mode; it must not
-    cost the fence, and must not pay for it twice.
+    cost the fence, and must not pay for it twice per group -- one stream
+    already orders the two stages against each other.
     """
 
     from atom.kv_transfer.offload import atom_lmcache_staging as staging
@@ -7428,6 +7440,11 @@ def test_run_staged_pipeline_fences_shared_stream_once(monkeypatch):
 
     compute = _FakeStream("compute")
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    # The closing edge records a real ``torch.cuda.Event`` against the
+    # stream double. A genuine event rejects a double ("invalid device
+    # ordinal") and a CPU-only build refuses to construct one at all, so
+    # without this the test cannot reach its assertion in any environment.
+    monkeypatch.setattr(torch.cuda, "Event", _FakeEvent)
     # Distinct from `compute`: `_compute_stream_for` treats "the default
     # stream" as a missing recording, because that is exactly the value the
     # old thread-local lookup produced.
@@ -7445,4 +7462,4 @@ def test_run_staged_pipeline_fences_shared_stream_once(monkeypatch):
         group_nbytes=lambda group: group.nbytes,
     )
 
-    assert waited == [("shared", "compute")]
+    assert waited == [("shared", "compute"), ("shared", "compute")]
