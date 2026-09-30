@@ -1837,6 +1837,22 @@ def qrep_enabled_for_layer(
     )
 
 
+def qrep_for_step(
+    qrep_enabled: bool, use_seg_mla: bool, is_prefill: bool, prefill_qrep: bool
+) -> bool:
+    """Whether this forward produces the DCP group's query heads locally (QREP)
+    instead of gathering them.
+
+    Decode always does when the layer has QREP. Prefill reaches the QREP-aware
+    branch only as sparse (DSA) prefill -- dense prefill takes the MHA path and
+    never gathers q -- and joins only under ``ATOM_DCP_PREFILL_QREP``
+    (``prefill_qrep``). The seg path is excluded because its q_out is allocated
+    at the per-rank head count. Pure so the prefill clause can be pinned by a
+    test instead of living only as an inline expression.
+    """
+    return qrep_enabled and not use_seg_mla and (not is_prefill or prefill_qrep)
+
+
 def indexer_cp_unsupported_reason(
     arches,
     tp_size: int,
