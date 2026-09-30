@@ -85,12 +85,18 @@ class _KimiK3MlaPath:
         if npes != _TP_SIZE:
             raise ValueError(f"the Kimi-K3 staged path requires TP8, got TP{npes}")
         if weights.rank != rank or weights.npes != npes:
-            raise ValueError(f"weight shard is rank {weights.rank}/TP{weights.npes}, requested rank {rank}/TP{npes}")
+            raise ValueError(
+                f"weight shard is rank {weights.rank}/TP{weights.npes}, requested rank {rank}/TP{npes}"
+            )
         if not 0 <= rank < npes:
             raise ValueError(f"rank must be in [0, {npes}), got {rank}")
         if layer_idx < 0:
             raise ValueError(f"layer_idx must be non-negative, got {layer_idx}")
-        if config.routed_hidden is None or config.shared_inter is None or config.attn_res_block_size is None:
+        if (
+            config.routed_hidden is None
+            or config.shared_inter is None
+            or config.attn_res_block_size is None
+        ):
             raise ValueError("Kimi-K3 latent-MoE/AttnRes dimensions are missing")
 
         self.W = weights
@@ -101,7 +107,9 @@ class _KimiK3MlaPath:
         self.npes = npes
         self.reduce_group = reduce_group
         if reduce_backend not in {"symmetric", "nccl"}:
-            raise ValueError(f"unsupported reduce backend {reduce_backend!r}; expected 'symmetric' or 'nccl'")
+            raise ValueError(
+                f"unsupported reduce backend {reduce_backend!r}; expected 'symmetric' or 'nccl'"
+            )
         self.reduce_backend = reduce_backend
         self.layer_idx = layer_idx
         self.topk = topk
@@ -135,7 +143,9 @@ class _KimiK3MlaPath:
         }
         missing = sorted(expected.difference(self.t))
         if missing:
-            raise ValueError(f"missing Kimi-K3 MonoKernel weights: {', '.join(missing)}")
+            raise ValueError(
+                f"missing Kimi-K3 MonoKernel weights: {', '.join(missing)}"
+            )
         if self.t["w_latent_up"].shape != (self.hidden_shard, self.routed_hidden):
             raise ValueError(
                 f"w_latent_up must be the rank-local output-row shard [{self.hidden_shard}, {self.routed_hidden}]"
@@ -159,7 +169,9 @@ class _KimiK3MlaPath:
             prepared_backend=prepared_backend,
         )
         device = torch.device("cuda", torch.cuda.current_device())
-        self.pre_attn = torch.empty(samples, config.hidden, dtype=torch.bfloat16, device=device)
+        self.pre_attn = torch.empty(
+            samples, config.hidden, dtype=torch.bfloat16, device=device
+        )
         self.pre_updated = torch.empty_like(self.pre_attn)
         self.moe_input = torch.empty_like(self.pre_attn)
         self.updated_prefix = torch.empty_like(self.pre_attn)
@@ -182,16 +194,26 @@ class _KimiK3MlaPath:
 
         if prepared_weights is None:
             from atom.model_ops.monokernel.formats import quantize_mxfp8
-            from atom.model_ops.monokernel.packing import pack_bf16, pack_mxfp8_scale, pack_mxfp8_weight
+            from atom.model_ops.monokernel.packing import (
+                pack_bf16,
+                pack_mxfp8_scale,
+                pack_mxfp8_weight,
+            )
 
-            self.w_ug, self.s_ug, self.w_dn, self.s_dn = prepare_aiter_mxfp4_expert_storage(weights)
+            self.w_ug, self.s_ug, self.w_dn, self.s_dn = (
+                prepare_aiter_mxfp4_expert_storage(weights)
+            )
             self.w_router = pack_bf16(self.t["w_r"])
             latent_weight, self.s_latent_down = quantize_mxfp8(self.t["w_latent_down"])
             shared_weight, self.s_shared_ug = quantize_mxfp8(self.t["w_shared_ug"])
             shared_down_weight, self.s_shared_dn = quantize_mxfp8(self.t["w_shared_dn"])
             latent_up_weight, self.s_latent_up = quantize_mxfp8(self.t["w_latent_up"])
-            self.latent_projection = Mxfp8Linear(latent_weight, self.s_latent_down, samples)
-            self.shared_projection = Mxfp8Linear(shared_weight, self.s_shared_ug, samples)
+            self.latent_projection = Mxfp8Linear(
+                latent_weight, self.s_latent_down, samples
+            )
+            self.shared_projection = Mxfp8Linear(
+                shared_weight, self.s_shared_ug, samples
+            )
             self.w_shared_dn = pack_mxfp8_weight(shared_down_weight)
             self.s_shared_dn = pack_mxfp8_scale(self.s_shared_dn)
             self.w_latent_up = pack_mxfp8_weight(latent_up_weight)
@@ -202,8 +224,12 @@ class _KimiK3MlaPath:
             self.w_dn = prepared_weights.w_dn
             self.s_dn = prepared_weights.s_dn
             self.w_router = prepared_weights.w_router
-            self.latent_projection = Mxfp8Linear.from_prepared(prepared_weights.latent_down, samples)
-            self.shared_projection = Mxfp8Linear.from_prepared(prepared_weights.shared_up, samples)
+            self.latent_projection = Mxfp8Linear.from_prepared(
+                prepared_weights.latent_down, samples
+            )
+            self.shared_projection = Mxfp8Linear.from_prepared(
+                prepared_weights.shared_up, samples
+            )
             self.w_shared_dn = prepared_weights.shared_down.weight
             self.s_shared_dn = prepared_weights.shared_down.scale
             self.w_latent_up = prepared_weights.latent_up.weight
@@ -220,18 +246,38 @@ class _KimiK3MlaPath:
         max_sorted = samples * config.top_k * _ROUTING_TILE_M
         max_blocks = (max_sorted + _ROUTING_TILE_M - 1) // _ROUTING_TILE_M
         self.max_sorted = max_sorted
-        self.sorted_token_ids = torch.empty(max_sorted, dtype=torch.int32, device=device)
-        self.sorted_weights = torch.empty(max_sorted, dtype=torch.float32, device=device)
-        self.sorted_expert_ids = torch.empty(max_blocks, dtype=torch.int32, device=device)
+        self.sorted_token_ids = torch.empty(
+            max_sorted, dtype=torch.int32, device=device
+        )
+        self.sorted_weights = torch.empty(
+            max_sorted, dtype=torch.float32, device=device
+        )
+        self.sorted_expert_ids = torch.empty(
+            max_blocks, dtype=torch.int32, device=device
+        )
         self.num_valid_ids = torch.empty(2, dtype=torch.int32, device=device)
-        self.inter_sorted = torch.empty(max_sorted, config.inter, dtype=torch.bfloat16, device=device)
+        self.inter_sorted = torch.empty(
+            max_sorted, config.inter, dtype=torch.bfloat16, device=device
+        )
 
-        self.router_logits = torch.empty(samples, config.n_experts, dtype=torch.bfloat16, device=device)
-        self.router_scores = torch.empty(samples, config.n_experts, dtype=torch.float32, device=device)
-        self.topk_keys = torch.empty(samples, config.top_k, dtype=torch.float32, device=device)
-        self.topk_ids_i64 = torch.empty(samples, config.top_k, dtype=torch.int64, device=device)
-        self.topk_ids = torch.empty(samples, config.top_k, dtype=torch.int32, device=device)
-        self.topk_weights = torch.empty(samples, config.top_k, dtype=torch.float32, device=device)
+        self.router_logits = torch.empty(
+            samples, config.n_experts, dtype=torch.bfloat16, device=device
+        )
+        self.router_scores = torch.empty(
+            samples, config.n_experts, dtype=torch.float32, device=device
+        )
+        self.topk_keys = torch.empty(
+            samples, config.top_k, dtype=torch.float32, device=device
+        )
+        self.topk_ids_i64 = torch.empty(
+            samples, config.top_k, dtype=torch.int64, device=device
+        )
+        self.topk_ids = torch.empty(
+            samples, config.top_k, dtype=torch.int32, device=device
+        )
+        self.topk_weights = torch.empty(
+            samples, config.top_k, dtype=torch.float32, device=device
+        )
         self.router_select = SigmoidTopkRouter(config.n_experts, config.top_k, samples)
         self.router_projection = FusedRouterProjection(
             config.hidden,
@@ -249,14 +295,24 @@ class _KimiK3MlaPath:
             dtype=torch.int32,
             device=device,
         )
-        self.latent = torch.empty(samples, self.routed_hidden, dtype=torch.bfloat16, device=device)
+        self.latent = torch.empty(
+            samples, self.routed_hidden, dtype=torch.bfloat16, device=device
+        )
         self.routed_partial = torch.empty_like(self.latent)
         self.routed_reduced = torch.empty_like(self.latent)
         self.latent_norm = torch.empty_like(self.latent)
-        self.shared_gu = torch.empty(samples, 2 * self.shared_inter, dtype=torch.bfloat16, device=device)
-        self.shared_mid = torch.empty(samples, self.shared_inter, dtype=torch.bfloat16, device=device)
-        self.shared_partial = torch.empty(samples, config.hidden, dtype=torch.bfloat16, device=device)
-        self.tail = torch.empty(samples, self.hidden_shard, dtype=torch.bfloat16, device=device)
+        self.shared_gu = torch.empty(
+            samples, 2 * self.shared_inter, dtype=torch.bfloat16, device=device
+        )
+        self.shared_mid = torch.empty(
+            samples, self.shared_inter, dtype=torch.bfloat16, device=device
+        )
+        self.shared_partial = torch.empty(
+            samples, config.hidden, dtype=torch.bfloat16, device=device
+        )
+        self.tail = torch.empty(
+            samples, self.hidden_shard, dtype=torch.bfloat16, device=device
+        )
         self.final_partial = torch.empty_like(self.shared_partial)
         self.moe_delta = torch.empty_like(self.shared_partial)
         self.output = torch.empty_like(self.shared_partial)
@@ -292,7 +348,9 @@ class _KimiK3MlaPath:
         # The sorter also clears this output buffer before atomic stage2.
         self.moe_buf = self.routed_partial
         if reduce_group is None:
-            raise ValueError("the Kimi-K3 staged path requires a GPU-capable TP reduce_group")
+            raise ValueError(
+                "the Kimi-K3 staged path requires a GPU-capable TP reduce_group"
+            )
 
     def _build_attention(
         self,
@@ -376,7 +434,11 @@ class _KimiK3MlaPath:
         if self.fuse_attn_res and output_norm_weight is not None:
             source_blocks = blocks[:, :num_blocks]
             if num_blocks == 0:
-                updated = prefix if delta is None else (prefix.float() + delta.float()).to(torch.bfloat16)
+                updated = (
+                    prefix
+                    if delta is None
+                    else (prefix.float() + delta.float()).to(torch.bfloat16)
+                )
                 mixed = compiled_rmsnorm(updated, output_norm_weight)
             elif delta is None:
                 updated = prefix
@@ -400,7 +462,11 @@ class _KimiK3MlaPath:
                 blocks[:, block_write_idx].copy_(updated)
             return mixed, updated
 
-        updated = prefix if delta is None else (prefix.float() + delta.float()).to(torch.bfloat16)
+        updated = (
+            prefix
+            if delta is None
+            else (prefix.float() + delta.float()).to(torch.bfloat16)
+        )
         if block_write_idx >= 0:
             blocks[:, block_write_idx].copy_(updated)
         if num_blocks == 0:
@@ -410,7 +476,11 @@ class _KimiK3MlaPath:
             sf = sources.float()
             normalized = sf * torch.rsqrt(sf.square().mean(-1, keepdim=True) + EPS)
             logits = (normalized * norm_weight.float() * qk_weight.float()).sum(-1)
-            mixed = (torch.softmax(logits, dim=-1)[..., None] * sf).sum(1).to(torch.bfloat16)
+            mixed = (
+                (torch.softmax(logits, dim=-1)[..., None] * sf)
+                .sum(1)
+                .to(torch.bfloat16)
+            )
         if output_norm_weight is not None:
             mixed = rmsnorm(mixed, output_norm_weight)
         return mixed, updated
@@ -462,7 +532,9 @@ class _KimiK3MlaPath:
                 out=(self.topk_keys, self.topk_ids_i64),
             )
             self.topk_ids.copy_(self.topk_ids_i64)
-            torch.gather(self.router_scores, 1, self.topk_ids_i64, out=self.topk_weights)
+            torch.gather(
+                self.router_scores, 1, self.topk_ids_i64, out=self.topk_weights
+            )
             self.topk_weights.div_(self.topk_weights.sum(-1, keepdim=True))
         if not self.fuse_router:
             moe_sorting_flydsl(
@@ -564,7 +636,9 @@ class _KimiK3MlaPath:
                 )
         with self._profile_stage("latent_tail"):
             if self.symmetric_allreduce is None:
-                compiled_rmsnorm_out(self.routed_reduced, self.t["g_latent"], self.latent_norm)
+                compiled_rmsnorm_out(
+                    self.routed_reduced, self.t["g_latent"], self.latent_norm
+                )
             if self.fused_tail is None:
                 torch.mm(self.latent_norm, self.t["w_latent_up"].t(), out=self.tail)
 
@@ -620,11 +694,21 @@ class _KimiK3MlaPath:
     def _shared_experts(self, hidden_states: torch.Tensor) -> None:
         with self._profile_stage("shared_experts"):
             if self.fuse_shared_experts:
-                torch.mm(self.shared_mid, self.t["w_shared_dn"].t(), out=self.shared_partial)
+                torch.mm(
+                    self.shared_mid, self.t["w_shared_dn"].t(), out=self.shared_partial
+                )
             else:
                 torch.mm(hidden_states, self.t["w_shared_ug"].t(), out=self.shared_gu)
-                self.shared_mid.copy_(situ(self.shared_gu, self.config.situ_beta, self.config.situ_linear_beta))
-                torch.mm(self.shared_mid, self.t["w_shared_dn"].t(), out=self.shared_partial)
+                self.shared_mid.copy_(
+                    situ(
+                        self.shared_gu,
+                        self.config.situ_beta,
+                        self.config.situ_linear_beta,
+                    )
+                )
+                torch.mm(
+                    self.shared_mid, self.t["w_shared_dn"].t(), out=self.shared_partial
+                )
 
     def forward(
         self,
@@ -651,7 +735,9 @@ class _KimiK3MlaPath:
                 f"[{self.S}, blocks, {self.config.hidden}], got {tuple(block_residual.shape)}"
             )
         if block_residual.shape[1] <= self.block_write_idx:
-            raise ValueError(f"block_residual needs index {self.block_write_idx}, got {block_residual.shape[1]} blocks")
+            raise ValueError(
+                f"block_residual needs index {self.block_write_idx}, got {block_residual.shape[1]} blocks"
+            )
 
         with self._profile_stage("pre_attn_res"):
             if self.inline_pre_attn:
@@ -700,7 +786,11 @@ class _KimiK3MlaPath:
             if self.fuse_attn_res:
                 self.post_attn_res(
                     post_prefix,
-                    (prefix_sum if self.inline_pre_attn else (post_prefix if post_delta is None else post_delta)),
+                    (
+                        prefix_sum
+                        if self.inline_pre_attn
+                        else (post_prefix if post_delta is None else post_delta)
+                    ),
                     block_residual,
                     self.t["g_mlp_res"],
                     self.t["w_mlp_res"],
@@ -891,7 +981,8 @@ class _KimiK3KdaStagedPath(_KimiK3MlaPath):
             )
         if block_residual.shape[1] <= self.block_write_idx:
             raise ValueError(
-                f"block_residual needs index {self.block_write_idx}, " f"got {block_residual.shape[1]} blocks"
+                f"block_residual needs index {self.block_write_idx}, "
+                f"got {block_residual.shape[1]} blocks"
             )
 
         with self._profile_stage("pre_attn_res"):
@@ -939,7 +1030,11 @@ class _KimiK3KdaStagedPath(_KimiK3MlaPath):
             if self.fuse_attn_res:
                 self.post_attn_res(
                     post_prefix,
-                    (prefix_sum if self.inline_pre_attn else (post_prefix if post_delta is None else post_delta)),
+                    (
+                        prefix_sum
+                        if self.inline_pre_attn
+                        else (post_prefix if post_delta is None else post_delta)
+                    ),
                     block_residual,
                     self.t["g_mlp_res"],
                     self.t["w_mlp_res"],

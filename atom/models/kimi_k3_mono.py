@@ -81,7 +81,10 @@ def build_kimi_state_chains(
         raise ValueError(f"output must be int32 [{groups}, {q + 1}]")
     if resume_columns.shape != (groups,) or resume_columns.dtype is not torch.int64:
         raise ValueError(f"resume_columns must be int64 [{groups}]")
-    if spec_state_indices.dtype is not torch.int32 or not spec_state_indices.is_contiguous():
+    if (
+        spec_state_indices.dtype is not torch.int32
+        or not spec_state_indices.is_contiguous()
+    ):
         raise ValueError("spec_state_indices must be contiguous int32")
     if (
         num_accepted_tokens.shape != (groups,)
@@ -448,7 +451,9 @@ class KimiMonoDecode:
                 )
             groups = samples // template.q
             if slots.shape[0] < groups or accepted is None or accepted.numel() < groups:
-                raise RuntimeError("Kimi speculative metadata does not cover the graph batch")
+                raise RuntimeError(
+                    "Kimi speculative metadata does not cover the graph batch"
+                )
         else:
             slots = metadata.non_spec_state_indices_tensor
             if metadata.num_decodes <= 0 or slots is None or slots.numel() < samples:
@@ -462,7 +467,9 @@ class KimiMonoDecode:
             replay_mode=template.replay_mode,
         )
 
-    def supports(self, input_ids, positions, intermediate_tensors, inputs_embeds) -> bool:
+    def supports(
+        self, input_ids, positions, intermediate_tensors, inputs_embeds
+    ) -> bool:
         if not self._enabled or intermediate_tensors is not None:
             return False
         samples = input_ids.numel()
@@ -473,7 +480,11 @@ class KimiMonoDecode:
         ):
             return False
         fwd = get_forward_context()
-        if fwd.context is None or fwd.context.is_prefill or fwd.ubatch_slices is not None:
+        if (
+            fwd.context is None
+            or fwd.context.is_prefill
+            or fwd.ubatch_slices is not None
+        ):
             return False
         geometry = self._geometry(samples, self._metadata(fwd))
         return geometry is not None and positions.numel() == samples
@@ -483,7 +494,9 @@ class KimiMonoDecode:
         buffers = self._chains.get(key)
         if buffers is None:
             if torch.cuda.is_current_stream_capturing():
-                raise MonoUnsupported("cannot allocate state chains during graph capture")
+                raise MonoUnsupported(
+                    "cannot allocate state chains during graph capture"
+                )
             slots = metadata.spec_state_indices_tensor
             buffers = (
                 torch.empty(
@@ -532,11 +545,15 @@ class KimiMonoDecode:
             backend = selected
         key = (layer.layer_idx, launch_width, backend, kind, geometry.q > 1)
         if key in self._refused:
-            raise RuntimeError(f"layer {layer.layer_idx} native construction was refused")
+            raise RuntimeError(
+                f"layer {layer.layer_idx} native construction was refused"
+            )
         if key in self._ops:
             return self._ops[key]
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("cannot construct Kimi native layers during graph capture")
+            raise RuntimeError(
+                "cannot construct Kimi native layers during graph capture"
+            )
 
         rank = get_tensor_model_parallel_rank()
         npes = get_tensor_model_parallel_world_size()
@@ -612,11 +629,7 @@ class KimiMonoDecode:
 
     @staticmethod
     def _launch_widths(geometry: KimiDecodeGeometry) -> tuple[int, ...]:
-        return (
-            (geometry.q,)
-            if geometry.q > 1
-            else (_MAX_LAUNCH_WIDTH, 4, 2, 1)
-        )
+        return (geometry.q,) if geometry.q > 1 else (_MAX_LAUNCH_WIDTH, 4, 2, 1)
 
     def prepare(self) -> None:
         """Construct static native weights before KV memory is budgeted."""
@@ -630,9 +643,7 @@ class KimiMonoDecode:
             if not hasattr(layer, "block_sparse_moe"):
                 continue
             kind = (
-                "tail"
-                if (not layer.is_linear_attn or geometry.replay_mode)
-                else "kda"
+                "tail" if (not layer.is_linear_attn or geometry.replay_mode) else "kda"
             )
             for launch_width in self._launch_widths(geometry):
                 self._op(layer, geometry, kind, launch_width)
@@ -670,7 +681,9 @@ class KimiMonoDecode:
         output = self._outputs.get(key)
         if output is None:
             if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("cannot allocate grouped output during graph capture")
+                raise RuntimeError(
+                    "cannot allocate grouped output during graph capture"
+                )
             output = torch.empty_like(hidden)
             self._outputs[key] = output
         return output

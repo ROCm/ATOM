@@ -49,7 +49,9 @@ _GATE_LOWER_BOUND = -5.0
 
 
 def _load_bf16x4(resource, offset):
-    return fx.Vector(bo.buffer_load(resource, offset, vec_width=_VALUES_PER_THREAD, dtype=T.bf16)).to(fx.Float32)
+    return fx.Vector(
+        bo.buffer_load(resource, offset, vec_width=_VALUES_PER_THREAD, dtype=T.bf16)
+    ).to(fx.Float32)
 
 
 def _zeros4():
@@ -76,9 +78,13 @@ def build_kimi_k3_kda_recurrence(
     if samples not in {1, 2, 4, 8}:
         raise ValueError(f"samples must be one of {{1, 2, 4, 8}}, got {samples}")
     if not isinstance(conv_state_layout, ConvStateLayout):
-        raise TypeError(f"conv_state_layout must be ConvStateLayout, got {conv_state_layout!r}")
+        raise TypeError(
+            f"conv_state_layout must be ConvStateLayout, got {conv_state_layout!r}"
+        )
     if conv_state_rows < _CONV_STATE_LENGTH:
-        raise ValueError(f"conv_state_rows must be at least {_CONV_STATE_LENGTH}, got {conv_state_rows}")
+        raise ValueError(
+            f"conv_state_rows must be at least {_CONV_STATE_LENGTH}, got {conv_state_rows}"
+        )
     if state_dtype not in {"fp16", "fp32"}:
         raise ValueError(f"state_dtype must be 'fp16' or 'fp32', got {state_dtype!r}")
     state_item_bytes = 2 if state_dtype == "fp16" else 4
@@ -155,11 +161,17 @@ def build_kimi_k3_kda_recurrence(
         def decode():
             # Shift the raw address in 64-bit space before making a buffer
             # resource. Slot pools can exceed the descriptor's i32 offset range.
-            state_rsrc = rsrc(state + fx.Int64(slot) * fx.Int64(_STATE_SLOT_ELEMENTS * state_item_bytes))
+            state_rsrc = rsrc(
+                state
+                + fx.Int64(slot) * fx.Int64(_STATE_SLOT_ELEMENTS * state_item_bytes)
+            )
             vector_base = (sample * _HEADS + head) * _HEAD_DIM
 
             if const_expr(fuse_conv):
-                conv_state_rsrc = rsrc(conv_state + fx.Int64(slot) * fx.Int64(_CONV_CHANNELS * conv_state_rows * 2))
+                conv_state_rsrc = rsrc(
+                    conv_state
+                    + fx.Int64(slot) * fx.Int64(_CONV_CHANNELS * conv_state_rows * 2)
+                )
 
                 def convolve(channel):
                     state_offsets = (
@@ -258,7 +270,9 @@ def build_kimi_k3_kda_recurrence(
             if const_expr(fuse_gate_projection):
                 if tid < _HEAD_DIM:
                     gate_parts = _zeros4()
-                    for feature_base in range_constexpr(0, _HEAD_DIM, _VALUES_PER_THREAD):
+                    for feature_base in range_constexpr(
+                        0, _HEAD_DIM, _VALUES_PER_THREAD
+                    ):
                         features = fx.Vector(
                             bo.buffer_load(
                                 f_a_rsrc,
@@ -280,7 +294,9 @@ def build_kimi_k3_kda_recurrence(
                     fx.ptr_store(gate_acc.to(fx.BFloat16), shared_gate + tid)
                 gpu.barrier()
 
-            exp_a_log = exp(fx.Float32(bo.buffer_load(a_log_rsrc, head, vec_width=1, dtype=T.f32)))
+            exp_a_log = exp(
+                fx.Float32(bo.buffer_load(a_log_rsrc, head, vec_width=1, dtype=T.f32))
+            )
             beta_logit = fx.Float32(
                 fx.BFloat16(
                     bo.buffer_load(
@@ -304,13 +320,17 @@ def build_kimi_k3_kda_recurrence(
                     q_vec = fx.Vector(
                         fx.ptr_load(
                             shared_query + k_base,
-                            result_type=fx.Vector.make_type(_VALUES_PER_THREAD, fx.BFloat16),
+                            result_type=fx.Vector.make_type(
+                                _VALUES_PER_THREAD, fx.BFloat16
+                            ),
                         )
                     ).to(fx.Float32)
                     k_vec = fx.Vector(
                         fx.ptr_load(
                             shared_key + k_base,
-                            result_type=fx.Vector.make_type(_VALUES_PER_THREAD, fx.BFloat16),
+                            result_type=fx.Vector.make_type(
+                                _VALUES_PER_THREAD, fx.BFloat16
+                            ),
                         )
                     ).to(fx.Float32)
                 else:
@@ -320,7 +340,9 @@ def build_kimi_k3_kda_recurrence(
                     gate_vec = fx.Vector(
                         fx.ptr_load(
                             shared_gate + k_base,
-                            result_type=fx.Vector.make_type(_VALUES_PER_THREAD, fx.BFloat16),
+                            result_type=fx.Vector.make_type(
+                                _VALUES_PER_THREAD, fx.BFloat16
+                            ),
                         )
                     ).to(fx.Float32)
                 else:
@@ -366,7 +388,9 @@ def build_kimi_k3_kda_recurrence(
             state_vecs = [None] * (_V_ITERS * _K_ITERS)
             results = [None] * _V_ITERS
             for v_iter in range_constexpr(_V_ITERS):
-                v_index = v_block * _V_PER_BLOCK + wave * _V_LANES + v_lane + v_iter * _V_TILE
+                v_index = (
+                    v_block * _V_PER_BLOCK + wave * _V_LANES + v_lane + v_iter * _V_TILE
+                )
                 for k_iter in range_constexpr(_K_ITERS):
                     k_base = k_lane * _VALUES_PER_THREAD + k_iter * _K_TILE
                     state_offset = (head * _HEAD_DIM + v_index) * _HEAD_DIM + k_base
@@ -380,7 +404,9 @@ def build_kimi_k3_kda_recurrence(
                     ).to(fx.Float32)
 
             for v_iter in range_constexpr(_V_ITERS):
-                v_index = v_block * _V_PER_BLOCK + wave * _V_LANES + v_lane + v_iter * _V_TILE
+                v_index = (
+                    v_block * _V_PER_BLOCK + wave * _V_LANES + v_lane + v_iter * _V_TILE
+                )
                 state_k_parts = _zeros4()
                 state_q_parts = _zeros4()
                 for k_iter in range_constexpr(_K_ITERS):
@@ -410,18 +436,26 @@ def build_kimi_k3_kda_recurrence(
 
                 for k_iter in range_constexpr(_K_ITERS):
                     index = v_iter * _K_ITERS + k_iter
-                    state_vecs[index] = fx.math.fma(k_vecs[k_iter], v_new_vec, state_vecs[index])
+                    state_vecs[index] = fx.math.fma(
+                        k_vecs[k_iter], v_new_vec, state_vecs[index]
+                    )
                 result = state_q + v_new * dot_kq
                 results[v_iter] = result
 
             for v_iter in range_constexpr(_V_ITERS):
-                v_index = v_block * _V_PER_BLOCK + wave * _V_LANES + v_lane + v_iter * _V_TILE
+                v_index = (
+                    v_block * _V_PER_BLOCK + wave * _V_LANES + v_lane + v_iter * _V_TILE
+                )
                 for k_iter in range_constexpr(_K_ITERS):
                     k_base = k_lane * _VALUES_PER_THREAD + k_iter * _K_TILE
                     state_offset = (head * _HEAD_DIM + v_index) * _HEAD_DIM + k_base
                     state_value = state_vecs[v_iter * _K_ITERS + k_iter]
                     bo.buffer_store(
-                        state_value.to(fx.Float16) if state_dtype == "fp16" else state_value,
+                        (
+                            state_value.to(fx.Float16)
+                            if state_dtype == "fp16"
+                            else state_value
+                        ),
                         state_rsrc,
                         state_offset,
                     )
@@ -439,15 +473,24 @@ def build_kimi_k3_kda_recurrence(
                 total_square = fx.ptr_load(norm_sums)
                 for source_wave in range_constexpr(1, _WAVES):
                     total_square = total_square + fx.ptr_load(norm_sums + source_wave)
-                inverse_rms = rsq(total_square * fx.Float32(1.0 / _HEAD_DIM) + fx.Float32(EPS))
+                inverse_rms = rsq(
+                    total_square * fx.Float32(1.0 / _HEAD_DIM) + fx.Float32(EPS)
+                )
                 if k_lane == 0:
                     for v_iter in range_constexpr(_V_ITERS):
-                        v_index = v_block * _V_PER_BLOCK + wave * _V_LANES + v_lane + v_iter * _V_TILE
+                        v_index = (
+                            v_block * _V_PER_BLOCK
+                            + wave * _V_LANES
+                            + v_lane
+                            + v_iter * _V_TILE
+                        )
                         gate_value = fx.Float32(
                             fx.BFloat16(
                                 bo.buffer_load(
                                     output_gate_rsrc,
-                                    sample * output_gate_stride + head * _HEAD_DIM + v_index,
+                                    sample * output_gate_stride
+                                    + head * _HEAD_DIM
+                                    + v_index,
                                     vec_width=1,
                                     dtype=T.bf16,
                                 )
@@ -463,7 +506,12 @@ def build_kimi_k3_kda_recurrence(
                                 )
                             )
                         )
-                        gated = results[v_iter] * inverse_rms * weight * sigmoid_batch([gate_value])[0]
+                        gated = (
+                            results[v_iter]
+                            * inverse_rms
+                            * weight
+                            * sigmoid_batch([gate_value])[0]
+                        )
                         bo.buffer_store(
                             gated.to(fx.BFloat16),
                             output_rsrc,
@@ -472,7 +520,12 @@ def build_kimi_k3_kda_recurrence(
             else:
                 if k_lane == 0:
                     for v_iter in range_constexpr(_V_ITERS):
-                        v_index = v_block * _V_PER_BLOCK + wave * _V_LANES + v_lane + v_iter * _V_TILE
+                        v_index = (
+                            v_block * _V_PER_BLOCK
+                            + wave * _V_LANES
+                            + v_lane
+                            + v_iter * _V_TILE
+                        )
                         bo.buffer_store(
                             results[v_iter].to(fx.BFloat16),
                             output_rsrc,
@@ -559,9 +612,13 @@ class KimiK3KdaRecurrence:
         if samples not in {1, 2, 4, 8}:
             raise ValueError(f"samples must be one of {{1, 2, 4, 8}}, got {samples}")
         if not isinstance(conv_state_layout, ConvStateLayout):
-            raise TypeError(f"conv_state_layout must be ConvStateLayout, got {conv_state_layout!r}")
+            raise TypeError(
+                f"conv_state_layout must be ConvStateLayout, got {conv_state_layout!r}"
+            )
         if conv_state_rows < _CONV_STATE_LENGTH:
-            raise ValueError(f"conv_state_rows must be at least {_CONV_STATE_LENGTH}, got {conv_state_rows}")
+            raise ValueError(
+                f"conv_state_rows must be at least {_CONV_STATE_LENGTH}, got {conv_state_rows}"
+            )
         if state_dtype not in {torch.float16, torch.float32}:
             raise ValueError(f"state_dtype must be FP16 or FP32, got {state_dtype}")
         self.samples = samples
@@ -598,15 +655,26 @@ class KimiK3KdaRecurrence:
             or mixed_qkv.dtype != torch.bfloat16
             or mixed_qkv.stride(1) != 1
         ):
-            raise ValueError(f"mixed_qkv must be a feature-contiguous BF16 [{self.samples}, {_CONV_CHANNELS}] view")
-        if f_a.shape != (self.samples, _HEAD_DIM) or f_a.dtype != torch.bfloat16 or f_a.stride(1) != 1:
-            raise ValueError(f"f_a must be a feature-contiguous BF16 [{self.samples}, {_HEAD_DIM}] view")
+            raise ValueError(
+                f"mixed_qkv must be a feature-contiguous BF16 [{self.samples}, {_CONV_CHANNELS}] view"
+            )
+        if (
+            f_a.shape != (self.samples, _HEAD_DIM)
+            or f_a.dtype != torch.bfloat16
+            or f_a.stride(1) != 1
+        ):
+            raise ValueError(
+                f"f_a must be a feature-contiguous BF16 [{self.samples}, {_HEAD_DIM}] view"
+            )
         if (
             f_b_weight.shape != (_HEADS * _HEAD_DIM, _HEAD_DIM)
             or f_b_weight.dtype != torch.bfloat16
             or not f_b_weight.is_contiguous()
         ):
-            raise ValueError("f_b_weight must be contiguous BF16 " f"[{_HEADS * _HEAD_DIM}, {_HEAD_DIM}]")
+            raise ValueError(
+                "f_b_weight must be contiguous BF16 "
+                f"[{_HEADS * _HEAD_DIM}, {_HEAD_DIM}]"
+            )
         if beta.shape != (self.samples, 1, _HEADS) or beta.dtype != torch.bfloat16:
             raise ValueError(f"beta must be BF16 [{self.samples}, 1, {_HEADS}]")
         if (
@@ -614,7 +682,9 @@ class KimiK3KdaRecurrence:
             or conv_weight.dtype != torch.bfloat16
             or not conv_weight.is_contiguous()
         ):
-            raise ValueError(f"conv_weight must be contiguous BF16 [{_CONV_CHANNELS}, {_CONV_KERNEL_WIDTH}]")
+            raise ValueError(
+                f"conv_weight must be contiguous BF16 [{_CONV_CHANNELS}, {_CONV_KERNEL_WIDTH}]"
+            )
         expected_conv_state = conv_state_shape(
             self.conv_state_layout,
             conv_state.shape[0] if conv_state.ndim == 3 else 0,
@@ -654,12 +724,18 @@ class KimiK3KdaRecurrence:
             }
             or output_gate.dtype != torch.bfloat16
         ):
-            raise ValueError("output_gate must be a BF16 [samples, (1,) heads, head_dim] tensor")
+            raise ValueError(
+                "output_gate must be a BF16 [samples, (1,) heads, head_dim] tensor"
+            )
         if output_gate.stride(-1) != 1 or output_gate.stride(-2) != _HEAD_DIM:
             raise ValueError("output_gate heads must be contiguous")
         if norm_weight.shape != (_HEAD_DIM,) or norm_weight.dtype != torch.bfloat16:
             raise ValueError(f"norm_weight must be BF16 [{_HEAD_DIM}]")
-        if output.shape != expected_vector or output.dtype != torch.bfloat16 or not output.is_contiguous():
+        if (
+            output.shape != expected_vector
+            or output.dtype != torch.bfloat16
+            or not output.is_contiguous()
+        ):
             raise ValueError(f"output must be contiguous BF16 {list(expected_vector)}")
 
         tensors = (

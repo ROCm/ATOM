@@ -128,9 +128,13 @@ def make_gemm_a16w16_gfx950_param(
     if in_dtype_id not in (GEMM_A16W16_DTYPE_BF16, GEMM_A16W16_DTYPE_FP16):
         raise ValueError(f"unsupported in_dtype_id={in_dtype_id}")
     if out_dtype_id not in (in_dtype_id, GEMM_A16W16_DTYPE_FP32):
-        raise ValueError(f"unsupported out_dtype_id={out_dtype_id} for in_dtype_id={in_dtype_id}")
+        raise ValueError(
+            f"unsupported out_dtype_id={out_dtype_id} for in_dtype_id={in_dtype_id}"
+        )
     if block_m <= 0 or block_n <= 0 or block_k <= 0 or stages <= 0 or split_k <= 0:
-        raise ValueError("block_m, block_n, block_k, stages, and split_k must be positive")
+        raise ValueError(
+            "block_m, block_n, block_k, stages, and split_k must be positive"
+        )
     if (mma_m, mma_n, mma_k) != (16, 16, 32):
         raise ValueError("the gfx950 layout kernel currently requires mma=16x16x32")
     if stages < 2:
@@ -142,19 +146,29 @@ def make_gemm_a16w16_gfx950_param(
     if group_m < 0:
         raise ValueError("group_m must be non-negative")
     if fuse_symmetric_allreduce:
-        if in_dtype_id != GEMM_A16W16_DTYPE_BF16 or out_dtype_id != GEMM_A16W16_DTYPE_BF16:
-            raise ValueError("the fused symmetric all-reduce requires BF16 input and output")
+        if (
+            in_dtype_id != GEMM_A16W16_DTYPE_BF16
+            or out_dtype_id != GEMM_A16W16_DTYPE_BF16
+        ):
+            raise ValueError(
+                "the fused symmetric all-reduce requires BF16 input and output"
+            )
         if split_k != 1 or k_waves != 1 or has_bias or use_half_tile_interleaved:
             raise ValueError(
-                "the fused symmetric all-reduce requires split_k=1, k_waves=1, " "no bias, and the full-tile kernel"
+                "the fused symmetric all-reduce requires split_k=1, k_waves=1, "
+                "no bias, and the full-tile kernel"
             )
         if allreduce_npes not in {2, 4, 8}:
             raise ValueError("allreduce_npes must be one of {2, 4, 8}")
         if allreduce_max_pairs <= 0 or allreduce_layer_slots <= 0:
-            raise ValueError("allreduce_max_pairs and allreduce_layer_slots must be positive")
+            raise ValueError(
+                "allreduce_max_pairs and allreduce_layer_slots must be positive"
+            )
         waves = m_waves * n_waves
         if waves > allreduce_npes or allreduce_npes % waves:
-            raise ValueError("the fused symmetric all-reduce requires npes divisible by workgroup waves")
+            raise ValueError(
+                "the fused symmetric all-reduce requires npes divisible by workgroup waves"
+            )
     in_dbytes = 2  # Shared C remains in the 16-bit input dtype.
     out_dbytes = 4 if out_dtype_id == GEMM_A16W16_DTYPE_FP32 else 2
     block_threads = m_waves * n_waves * k_waves * GFX950_WAVE_SIZE
@@ -180,7 +194,11 @@ def make_gemm_a16w16_gfx950_param(
         assert stg_work_size_per_m_step % cshuffle_r2g_vec_size == 0
         assert half_block_n % cshuffle_r2g_vec_size == 0
     else:
-        cshuffle_r2g_vec_size = min(max_cshuffle_r2g_vec_size, 4) if split_k > 1 else max_cshuffle_r2g_vec_size
+        cshuffle_r2g_vec_size = (
+            min(max_cshuffle_r2g_vec_size, 4)
+            if split_k > 1
+            else max_cshuffle_r2g_vec_size
+        )
         assert block_n % cshuffle_r2g_vec_size == 0
     smem_bytes = stages * (block_m + block_n) * block_k * in_dbytes
     smem_bytes = max(smem_bytes, k_waves * block_m * block_n * in_dbytes)
@@ -212,16 +230,26 @@ def make_gemm_a16w16_gfx950_param(
     ldg_a_iters = (block_m * block_k) // (block_threads * async_load_vec_size)
     ldg_b_iters = (block_n * block_k) // (block_threads * async_load_vec_size)
     if use_half_tile_interleaved:
-        half_ldg_a_iters = ((block_m // 2) * block_k) // (block_threads * async_load_vec_size)
-        half_ldg_b_iters = ((block_n // 2) * block_k) // (block_threads * async_load_vec_size)
-        if half_ldg_a_iters * block_threads * async_load_vec_size != (block_m // 2) * block_k:
+        half_ldg_a_iters = ((block_m // 2) * block_k) // (
+            block_threads * async_load_vec_size
+        )
+        half_ldg_b_iters = ((block_n // 2) * block_k) // (
+            block_threads * async_load_vec_size
+        )
+        if (
+            half_ldg_a_iters * block_threads * async_load_vec_size
+            != (block_m // 2) * block_k
+        ):
             raise ValueError(
                 "Half-tile A async load tile must be exactly covered by whole-thread vector loads: "
                 f"half_block_m={block_m // 2}, block_k={block_k}, "
                 f"block_threads={block_threads}, async_load_vec_size={async_load_vec_size}, "
                 f"half_ldg_a_iters={half_ldg_a_iters}"
             )
-        if half_ldg_b_iters * block_threads * async_load_vec_size != (block_n // 2) * block_k:
+        if (
+            half_ldg_b_iters * block_threads * async_load_vec_size
+            != (block_n // 2) * block_k
+        ):
             raise ValueError(
                 "Half-tile B async load tile must be exactly covered by whole-thread vector loads: "
                 f"half_block_n={block_n // 2}, block_k={block_k}, "
@@ -322,7 +350,9 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
 
 def make_gemm_ab_lds_layouts(rows_a, rows_b, block_k, a_is_transposed, b_is_transposed):
     a_lds_layout = (
-        make_transposed_lds_layout(rows_a, block_k) if const_expr(a_is_transposed) else make_lds_layout(rows_a, block_k)
+        make_transposed_lds_layout(rows_a, block_k)
+        if const_expr(a_is_transposed)
+        else make_lds_layout(rows_a, block_k)
     )
     b_lds_layout = (
         make_transposed_lds_layout(rows_b, block_k)
@@ -340,16 +370,22 @@ def make_gemm_ab_load_context(
 ):
     uni_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), elem_dtype)
     buffer_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
-    async_g2s_copy_atom = fx.make_copy_atom(fx.rocdl.cdna4.BufferLoadAsyncLDS128b(), 128)
+    async_g2s_copy_atom = fx.make_copy_atom(
+        fx.rocdl.cdna4.BufferLoadAsyncLDS128b(), 128
+    )
 
     if const_expr(param.a_is_transposed):
-        a_s2r_copy_atom = fx.make_copy_atom(fx.rocdl.cdna4.LDSReadTrans16_64b(), elem_dtype)
+        a_s2r_copy_atom = fx.make_copy_atom(
+            fx.rocdl.cdna4.LDSReadTrans16_64b(), elem_dtype
+        )
         a_tiled_copy_atom = a_s2r_copy_atom
     else:
         a_s2r_copy_atom = uni_copy_atom
         a_tiled_copy_atom = buffer_copy_atom
     if const_expr(not param.b_is_transposed):
-        b_s2r_copy_atom = fx.make_copy_atom(fx.rocdl.cdna4.LDSReadTrans16_64b(), elem_dtype)
+        b_s2r_copy_atom = fx.make_copy_atom(
+            fx.rocdl.cdna4.LDSReadTrans16_64b(), elem_dtype
+        )
         b_tiled_copy_atom = b_s2r_copy_atom
     else:
         b_s2r_copy_atom = uni_copy_atom
@@ -410,7 +446,9 @@ def async_load_to_lds(
                 )
             )
         global_outer_idx = tile.global_outer_offset + outer_local_idx
-        safe_global_outer_idx = (global_outer_idx < tile.outer_bound).select(global_outer_idx, 0)
+        safe_global_outer_idx = (global_outer_idx < tile.outer_bound).select(
+            global_outer_idx, 0
+        )
         if const_expr(is_k_major):
             global_offset = global_k_idx * tile.leading_stride + safe_global_outer_idx
         else:
@@ -438,7 +476,9 @@ def write_cshuffle_vec_to_global(
     if const_expr(is_fp32_output):
         c_vec_global = c_vec.to(fx.Float32)
         if const_expr(is_split_k):
-            atomic_atom = fx.make_copy_atom(fx.rocdl.BufferAtomicAdd(fx.Float32), fx.Float32)
+            atomic_atom = fx.make_copy_atom(
+                fx.rocdl.BufferAtomicAdd(fx.Float32), fx.Float32
+            )
             scalar_layout = fx.make_layout(1, 1)
             scalar_frag = fx.make_rmem_tensor(scalar_layout, fx.Float32)
             for elem_idx in range_constexpr(vec_size):
@@ -456,7 +496,9 @@ def write_cshuffle_vec_to_global(
         else:
             fx.ptr_store(c_vec_global, fx.get_iter(out) + global_offset)
     elif const_expr(is_split_k):
-        atomic_atom = fx.make_copy_atom(fx.rocdl.BufferAtomicPkAdd(elem_dtype), elem_dtype)
+        atomic_atom = fx.make_copy_atom(
+            fx.rocdl.BufferAtomicPkAdd(elem_dtype), elem_dtype
+        )
         pair_layout = fx.make_layout(2, 1)
         pair_frag = fx.make_rmem_tensor(pair_layout, elem_dtype)
         for pair_idx in range_constexpr(vec_size // 2):
@@ -512,8 +554,16 @@ def gemm_a16w16_gfx950_kernel(
     ldg_a_iters = param.ldg_a_iters
     ldg_b_iters = param.ldg_b_iters
     cshuffle_r2g_vec_size = param.cshuffle_r2g_vec_size
-    elem_dtype = fx.Float16 if const_expr(param.in_dtype_id == GEMM_A16W16_DTYPE_FP16) else fx.BFloat16
-    global_output_dtype = fx.Float32 if const_expr(param.out_dtype_id == GEMM_A16W16_DTYPE_FP32) else elem_dtype
+    elem_dtype = (
+        fx.Float16
+        if const_expr(param.in_dtype_id == GEMM_A16W16_DTYPE_FP16)
+        else fx.BFloat16
+    )
+    global_output_dtype = (
+        fx.Float32
+        if const_expr(param.out_dtype_id == GEMM_A16W16_DTYPE_FP32)
+        else elem_dtype
+    )
     if const_expr(is_split_k):
         splitk_protocol = SplitKProtocol(
             block_m,
@@ -530,7 +580,9 @@ def gemm_a16w16_gfx950_kernel(
     k_wave_idx = tid // threads_per_k_slice
     num_pid_m = (m + block_m - 1) // block_m
     num_pid_n = (n + block_n - 1) // block_n
-    block_swizzle = BlockSwizzle(NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m)
+    block_swizzle = BlockSwizzle(
+        NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
+    )
     bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
     ks_idx = fx.block_idx.y
     ks_begin = ks_idx * working_k
@@ -594,8 +646,12 @@ def gemm_a16w16_gfx950_kernel(
     gC = fx.flat_divide(out_buf, (block_m, block_n))[None, None, bid_m, bid_n]
 
     thr_mma = tiled_mma.thr_slice(tid_in_k_slice)
-    thr_copy_A = fx.make_tiled_copy_A(a_tiled_copy_atom, tiled_mma).get_slice(tid_in_k_slice)
-    thr_copy_B = fx.make_tiled_copy_B(b_tiled_copy_atom, tiled_mma).get_slice(tid_in_k_slice)
+    thr_copy_A = fx.make_tiled_copy_A(a_tiled_copy_atom, tiled_mma).get_slice(
+        tid_in_k_slice
+    )
+    thr_copy_B = fx.make_tiled_copy_B(b_tiled_copy_atom, tiled_mma).get_slice(
+        tid_in_k_slice
+    )
 
     a_lds_layout, b_lds_layout = make_gemm_ab_lds_layouts(
         block_m,
@@ -675,8 +731,12 @@ def gemm_a16w16_gfx950_kernel(
         )
 
     def compute_stage(read_stage, k_tile):
-        thr_sA_s2r = thr_copy_A.partition_S(fx.make_view(smem_a + read_stage * block_m * block_k, a_lds_layout))
-        thr_sB_s2r = thr_copy_B.partition_S(fx.make_view(smem_b + read_stage * block_n * block_k, b_lds_layout))
+        thr_sA_s2r = thr_copy_A.partition_S(
+            fx.make_view(smem_a + read_stage * block_m * block_k, a_lds_layout)
+        )
+        thr_sB_s2r = thr_copy_B.partition_S(
+            fx.make_view(smem_b + read_stage * block_n * block_k, b_lds_layout)
+        )
 
         def compute_k_chunk(block_k_iter):
             frag_A_chunk = frag_A[None, None, block_k_iter]
@@ -760,16 +820,24 @@ def gemm_a16w16_gfx950_kernel(
         step_rsrc = bo.create_buffer_resource_from_addr(step)
         peers_rsrc = bo.create_buffer_resource_from_addr(peers)
         step_word = bo.buffer_load(step_rsrc, 0, vec_width=1, dtype=T.i32)
-        step_value = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(step_word).ir_value()))
+        step_value = fx.Int32(
+            rocdl.readfirstlane(T.i32, fx.Int32(step_word).ir_value())
+        )
         tag = step_value * param.allreduce_layer_slots + layer + 1
         slot = (step_value * param.allreduce_layer_slots + layer) & 1
         base = fx.Int64(slot) * fx.Int64(slot_bytes)
 
         for peer_round in range_constexpr(peer_rounds):
             peer = wave + peer_round * (block_threads // GFX950_WAVE_SIZE)
-            peer_words = fx.Vector(bo.buffer_load(peers_rsrc, peer * 2, vec_width=2, dtype=T.i32))
-            peer_lo = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(peer_words[0]).ir_value()))
-            peer_hi = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(peer_words[1]).ir_value()))
+            peer_words = fx.Vector(
+                bo.buffer_load(peers_rsrc, peer * 2, vec_width=2, dtype=T.i32)
+            )
+            peer_lo = fx.Int32(
+                rocdl.readfirstlane(T.i32, fx.Int32(peer_words[0]).ir_value())
+            )
+            peer_hi = fx.Int32(
+                rocdl.readfirstlane(T.i32, fx.Int32(peer_words[1]).ir_value())
+            )
             peer_base = (fx.Int64(peer_hi) << 32) | fx.Int64(fx.Uint32(peer_lo))
             peer_rsrc = bo.create_buffer_resource_from_addr(peer_base + base)
             for send_round in range_constexpr(send_rounds):
@@ -809,7 +877,9 @@ def gemm_a16w16_gfx950_kernel(
                     def load_all():
                         words = []
                         for source_rank in range_constexpr(param.allreduce_npes):
-                            mailbox = source_rank * param.allreduce_max_pairs + global_pair
+                            mailbox = (
+                                source_rank * param.allreduce_max_pairs + global_pair
+                            )
                             value_tag = fx.Vector(
                                 bo.buffer_load(
                                     local_rsrc,
@@ -839,8 +909,14 @@ def gemm_a16w16_gfx950_kernel(
                         word = values[source_rank * 2]
                         sum_lo = sum_lo + (word << 16).bitcast(fx.Float32)
                         sum_hi = sum_hi + (word & fx.Int32(-65536)).bitcast(fx.Float32)
-                    packed = fx.Vector.from_elements([sum_lo, sum_hi], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
-                    bo.buffer_store(packed[0], output_rsrc, global_pair, cache_modifier=_CM_DEV)
+                    packed = (
+                        fx.Vector.from_elements([sum_lo, sum_hi], fx.Float32)
+                        .to(fx.BFloat16)
+                        .bitcast(fx.Int32)
+                    )
+                    bo.buffer_store(
+                        packed[0], output_rsrc, global_pair, cache_modifier=_CM_DEV
+                    )
     else:
         cshuffle_r2g_x_threads = block_n // cshuffle_r2g_vec_size
         cshuffle_vectors = block_m * block_n // cshuffle_r2g_vec_size
@@ -855,12 +931,19 @@ def gemm_a16w16_gfx950_kernel(
                 if (global_row < m) and (global_col < n):
                     c_vec = fx.ptr_load(
                         smem_c + local_row * block_n + local_col,
-                        result_type=fx.Vector.make_type(cshuffle_r2g_vec_size, elem_dtype),
+                        result_type=fx.Vector.make_type(
+                            cshuffle_r2g_vec_size, elem_dtype
+                        ),
                     )
                     for k_slice in range_constexpr(1, k_waves):
                         peer_c_vec = fx.ptr_load(
-                            smem_c + k_slice * block_m * block_n + local_row * block_n + local_col,
-                            result_type=fx.Vector.make_type(cshuffle_r2g_vec_size, elem_dtype),
+                            smem_c
+                            + k_slice * block_m * block_n
+                            + local_row * block_n
+                            + local_col,
+                            result_type=fx.Vector.make_type(
+                                cshuffle_r2g_vec_size, elem_dtype
+                            ),
                         )
                         c_vec = c_vec + peer_c_vec
                     global_offset = global_row * n + global_col
@@ -911,8 +994,16 @@ def gemm_a16w16_hti_gfx950_kernel(
     half_ldg_a_iters = param.ldg_a_iters // 2
     half_ldg_b_iters = param.ldg_b_iters // 2
     cshuffle_r2g_vec_size = param.cshuffle_r2g_vec_size
-    elem_dtype = fx.Float16 if const_expr(param.in_dtype_id == GEMM_A16W16_DTYPE_FP16) else fx.BFloat16
-    global_output_dtype = fx.Float32 if const_expr(param.out_dtype_id == GEMM_A16W16_DTYPE_FP32) else elem_dtype
+    elem_dtype = (
+        fx.Float16
+        if const_expr(param.in_dtype_id == GEMM_A16W16_DTYPE_FP16)
+        else fx.BFloat16
+    )
+    global_output_dtype = (
+        fx.Float32
+        if const_expr(param.out_dtype_id == GEMM_A16W16_DTYPE_FP32)
+        else elem_dtype
+    )
     if const_expr(is_split_k):
         splitk_protocol = SplitKProtocol(
             block_m,
@@ -927,7 +1018,9 @@ def gemm_a16w16_hti_gfx950_kernel(
     wid = tid // GFX950_WAVE_SIZE
     num_pid_m = (m + block_m - 1) // block_m
     num_pid_n = (n + block_n - 1) // block_n
-    block_swizzle = BlockSwizzle(NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m)
+    block_swizzle = BlockSwizzle(
+        NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
+    )
     bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
     ks_idx = fx.block_idx.y
     ks_begin = ks_idx * working_k
@@ -1041,7 +1134,9 @@ def gemm_a16w16_hti_gfx950_kernel(
         )
 
     def make_gC(m_part, n_part):
-        return fx.flat_divide(out_buf, (half_block_m, half_block_n))[None, None, bid_m * 2 + m_part, bid_n * 2 + n_part]
+        return fx.flat_divide(out_buf, (half_block_m, half_block_n))[
+            None, None, bid_m * 2 + m_part, bid_n * 2 + n_part
+        ]
 
     row_coords = fx.make_view(0, fx.make_layout((half_block_m, half_block_n), (1, 0)))
     col_coords = fx.make_view(0, fx.make_layout((half_block_m, half_block_n), (0, 1)))
@@ -1122,7 +1217,9 @@ def gemm_a16w16_hti_gfx950_kernel(
                 if (global_row < m) and (global_col < n):
                     c_vec = fx.ptr_load(
                         sC_base + local_row * half_block_n + local_col,
-                        result_type=fx.Vector.make_type(cshuffle_r2g_vec_size, elem_dtype),
+                        result_type=fx.Vector.make_type(
+                            cshuffle_r2g_vec_size, elem_dtype
+                        ),
                     )
                     global_offset = global_row * n + global_col
                     write_cshuffle_vec_to_global(
@@ -1312,10 +1409,20 @@ def gemm_a16w16_gfx950(
     m = fx.Int32(fx.get_scalar(a.shape[0]))
     n = fx.Int32(fx.get_scalar(b.shape[1]))
     k = fx.Int32(fx.get_scalar(a.shape[1]))
-    a_leading_stride = fx.Int32(fx.get_scalar(a.stride[1] if const_expr(param.a_is_transposed) else a.stride[0]))
-    b_leading_stride = fx.Int32(fx.get_scalar(b.stride[1] if const_expr(param.b_is_transposed) else b.stride[0]))
-    elem_dtype = fx.Float16 if const_expr(param.in_dtype_id == GEMM_A16W16_DTYPE_FP16) else fx.BFloat16
-    mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(param.mma_m, param.mma_n, param.mma_k, elem_dtype))
+    a_leading_stride = fx.Int32(
+        fx.get_scalar(a.stride[1] if const_expr(param.a_is_transposed) else a.stride[0])
+    )
+    b_leading_stride = fx.Int32(
+        fx.get_scalar(b.stride[1] if const_expr(param.b_is_transposed) else b.stride[0])
+    )
+    elem_dtype = (
+        fx.Float16
+        if const_expr(param.in_dtype_id == GEMM_A16W16_DTYPE_FP16)
+        else fx.BFloat16
+    )
+    mma_atom = fx.make_mma_atom(
+        fx.rocdl.MFMA(param.mma_m, param.mma_n, param.mma_k, elem_dtype)
+    )
     k_per_mfma_group = param.mma_k // 4
     tiled_mma = fx.make_tiled_mma(
         mma_atom,
@@ -1338,7 +1445,9 @@ def gemm_a16w16_gfx950(
     num_pid_m = (m + param.block_m - 1) // param.block_m
     num_pid_n = (n + param.block_n - 1) // param.block_n
     gemm_a16w16_kernel_impl = (
-        gemm_a16w16_hti_gfx950_kernel if param.use_half_tile_interleaved else gemm_a16w16_gfx950_kernel
+        gemm_a16w16_hti_gfx950_kernel
+        if param.use_half_tile_interleaved
+        else gemm_a16w16_gfx950_kernel
     )
     gemm_a16w16_kernel_impl._known_block_size = [param.block_threads, 1, 1]
     gemm_a16w16_kernel_impl._func.__name__ = make_gemm_a16w16_gfx950_kernel_name(param)
@@ -1400,7 +1509,9 @@ def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
             or result.block_m * result.block_n % c_elements_per_iteration != 0
         ):
             return None
-    if result.fuse_symmetric_allreduce and (n % 2 or m * n // 2 > result.allreduce_max_pairs):
+    if result.fuse_symmetric_allreduce and (
+        n % 2 or m * n // 2 > result.allreduce_max_pairs
+    ):
         return None
     return result
 
@@ -1412,7 +1523,11 @@ def assert_no_k_tail(k: int, kwargs: dict):
     use_half_tile_interleaved = kwargs["use_half_tile_interleaved"]
     async_load_vec_size = GFX950_DMA_BYTES // 2
     working_k = (k + split_k - 1) // split_k
-    working_k = (working_k + async_load_vec_size - 1) // async_load_vec_size * async_load_vec_size
+    working_k = (
+        (working_k + async_load_vec_size - 1)
+        // async_load_vec_size
+        * async_load_vec_size
+    )
     last_working_k = k - (split_k - 1) * working_k
     assert (
         working_k % block_k == 0
@@ -1443,7 +1558,9 @@ def assert_no_k_tail(k: int, kwargs: dict):
 
 @functools.lru_cache(maxsize=128)
 def get_split_k_buffers(stream, device):
-    semaphore = torch.zeros((SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device)
+    semaphore = torch.zeros(
+        (SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device
+    )
     signal = torch.zeros((SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device)
     return semaphore, signal
 
@@ -1478,7 +1595,9 @@ def gemm_a16w16(
         stream = torch.cuda.current_stream()
     layout = layout.lower()
     if layout not in ("nn", "nt", "tn", "tt"):
-        raise ValueError(f"unsupported GEMM layout: {layout!r}; expected 'nn', 'nt', 'tn', or 'tt'")
+        raise ValueError(
+            f"unsupported GEMM layout: {layout!r}; expected 'nn', 'nt', 'tn', or 'tt'"
+        )
     a_is_transposed = layout[0] == "t"
     b_is_transposed = layout[1] == "t"
     device = a.device
@@ -1543,7 +1662,9 @@ def gemm_a16w16(
     if out_dtype is None:
         out_dtype = a.dtype if out is None else out.dtype
     if out_dtype not in (a.dtype, torch.float32):
-        raise ValueError(f"unsupported output dtype {out_dtype}; expected {a.dtype} or torch.float32")
+        raise ValueError(
+            f"unsupported output dtype {out_dtype}; expected {a.dtype} or torch.float32"
+        )
     if out is None:
         out = torch.empty((m, n), dtype=out_dtype, device=a.device)
     else:
@@ -1594,8 +1715,12 @@ def gemm_a16w16(
             raise ValueError("symmetric all-reduce layer is out of range")
     kwargs["a_is_transposed"] = a_is_transposed
     kwargs["b_is_transposed"] = b_is_transposed
-    kwargs["in_dtype_id"] = GEMM_A16W16_DTYPE_FP16 if a.dtype is torch.float16 else GEMM_A16W16_DTYPE_BF16
-    kwargs["out_dtype_id"] = GEMM_A16W16_DTYPE_FP32 if out.dtype is torch.float32 else kwargs["in_dtype_id"]
+    kwargs["in_dtype_id"] = (
+        GEMM_A16W16_DTYPE_FP16 if a.dtype is torch.float16 else GEMM_A16W16_DTYPE_BF16
+    )
+    kwargs["out_dtype_id"] = (
+        GEMM_A16W16_DTYPE_FP32 if out.dtype is torch.float32 else kwargs["in_dtype_id"]
+    )
     kwargs["has_bias"] = False if bias is None else True
     split_k = kwargs["split_k"]
     assert_no_k_tail(k, kwargs)

@@ -49,7 +49,9 @@ class KimiK3PreparedTailWeights:
     shared_down: PreparedMxfp8Weight
     latent_up: PreparedMxfp8Weight
 
-    def validate_source(self, weights: LayerWeights, backend: str | None = None) -> None:
+    def validate_source(
+        self, weights: LayerWeights, backend: str | None = None
+    ) -> None:
         if backend is not None and backend != self.backend:
             raise ValueError(
                 f"prepared Kimi backend is {self.backend!r}, requested {backend!r}"

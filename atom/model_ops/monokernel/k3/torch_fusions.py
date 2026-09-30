@@ -17,7 +17,9 @@ def rmsnorm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """Apply RMSNorm in FP32 and return BF16 activations."""
 
     xf = x.float()
-    return (xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + EPS) * weight.float()).to(torch.bfloat16)
+    return (
+        xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + EPS) * weight.float()
+    ).to(torch.bfloat16)
 
 
 def situ(x: torch.Tensor, beta: float, linear_beta: float) -> torch.Tensor:
@@ -37,7 +39,9 @@ def compiled_rmsnorm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 
 @torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
-def compiled_rmsnorm_out(x: torch.Tensor, weight: torch.Tensor, output: torch.Tensor) -> None:
+def compiled_rmsnorm_out(
+    x: torch.Tensor, weight: torch.Tensor, output: torch.Tensor
+) -> None:
     """Write RMSNorm directly to a caller-owned graph-stable buffer."""
 
     output.copy_(rmsnorm(x, weight))
@@ -73,7 +77,9 @@ def compiled_attn_res_with_delta(
     """Fuse prefix update, AttnRes source mixing, and output RMSNorm."""
 
     updated = (prefix.float() + delta.float()).to(torch.bfloat16)
-    mixed = compiled_attn_res_no_delta(updated, blocks, norm_weight, qk_weight, output_norm_weight)
+    mixed = compiled_attn_res_no_delta(
+        updated, blocks, norm_weight, qk_weight, output_norm_weight
+    )
     return mixed, updated
 
 
@@ -81,7 +87,9 @@ class CudaStageProfiler:
     """Optional median CUDA-event profiler for composed layer stages."""
 
     def __init__(self) -> None:
-        self._events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] | None = None
+        self._events: (
+            dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] | None
+        ) = None
 
     @contextmanager
     def stage(self, name: str):
@@ -105,7 +113,9 @@ class CudaStageProfiler:
             raise RuntimeError("stage profiling is not active")
         torch.cuda.synchronize()
         result = {
-            name: statistics.median(start.elapsed_time(end) * 1000.0 for start, end in events)
+            name: statistics.median(
+                start.elapsed_time(end) * 1000.0 for start, end in events
+            )
             for name, events in self._events.items()
         }
         self._events = None

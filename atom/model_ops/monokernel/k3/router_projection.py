@@ -60,17 +60,25 @@ def build_router_projection(
     if hidden <= 0 or hidden % 128:
         raise ValueError(f"hidden must be a positive multiple of 128, got {hidden}")
     if num_experts <= 0 or num_experts % _WAVE_SIZE:
-        raise ValueError(f"num_experts must be a positive multiple of {_WAVE_SIZE}, got {num_experts}")
+        raise ValueError(
+            f"num_experts must be a positive multiple of {_WAVE_SIZE}, got {num_experts}"
+        )
     if not 0 < topk <= 32:
         raise ValueError(f"topk must be in [1, 32], got {topk}")
     if samples not in {1, 2, 4, 8}:
         raise ValueError(f"samples must be one of {{1, 2, 4, 8}}, got {samples}")
     if moe_elements <= 0 or moe_elements % 8:
-        raise ValueError(f"moe_elements must be a positive multiple of 8, got {moe_elements}")
+        raise ValueError(
+            f"moe_elements must be a positive multiple of 8, got {moe_elements}"
+        )
     if latent_rows <= 0 or latent_rows % _EXPERT_TILE:
-        raise ValueError(f"latent_rows must be a positive multiple of {_EXPERT_TILE}, got {latent_rows}")
+        raise ValueError(
+            f"latent_rows must be a positive multiple of {_EXPERT_TILE}, got {latent_rows}"
+        )
     if shared_rows <= 0 or shared_rows % _EXPERT_TILE:
-        raise ValueError(f"shared_rows must be a positive multiple of {_EXPERT_TILE}, got {shared_rows}")
+        raise ValueError(
+            f"shared_rows must be a positive multiple of {_EXPERT_TILE}, got {shared_rows}"
+        )
     sample_group = 2 if samples == 4 else min(samples, _SAMPLES_PER_CTA)
     sample_groups = (samples + sample_group - 1) // sample_group
     expert_tiles = num_experts // _EXPERT_TILE
@@ -82,8 +90,16 @@ def build_router_projection(
     threads = _S4_THREADS if samples == 4 else (1024 if samples == 8 else _THREADS)
     waves = threads // _WAVE_SIZE
     router_tasks = sample_groups * expert_tiles if include_router else 0
-    latent_blocks = (latent_tiles + _PROJECTION_WAVES - 1) // _PROJECTION_WAVES if include_latent else 0
-    shared_blocks = (shared_half_tiles + _PROJECTION_WAVES - 1) // _PROJECTION_WAVES if include_shared else 0
+    latent_blocks = (
+        (latent_tiles + _PROJECTION_WAVES - 1) // _PROJECTION_WAVES
+        if include_latent
+        else 0
+    )
+    shared_blocks = (
+        (shared_half_tiles + _PROJECTION_WAVES - 1) // _PROJECTION_WAVES
+        if include_shared
+        else 0
+    )
     latent_base = router_tasks
     shared_base = latent_base + latent_blocks
     selector_bid = shared_base + shared_blocks
@@ -206,7 +222,12 @@ def build_router_projection(
                         fx.Vector(
                             bo.buffer_load(
                                 router_weight_rsrc,
-                                (((expert_tile * k_chunks + chunk) * 2 + step_index) * _WAVE_SIZE + lane) * 4,
+                                (
+                                    ((expert_tile * k_chunks + chunk) * 2 + step_index)
+                                    * _WAVE_SIZE
+                                    + lane
+                                )
+                                * 4,
                                 vec_width=4,
                                 dtype=T.i32,
                             )
@@ -216,10 +237,17 @@ def build_router_projection(
                     for step_index in range_constexpr(2):
                         lhs = weight_vectors[step_index].bitcast(fx.BFloat16)
                         rhs = fx.ptr_load(
-                            x + (local_sample * hidden + chunk * 64) // 2 + (lane // 16) * 4 + step_index * 16,
+                            x
+                            + (local_sample * hidden + chunk * 64) // 2
+                            + (lane // 16) * 4
+                            + step_index * 16,
                             result_type=fx.Vector.make_type(4, fx.Float32),
                         ).bitcast(fx.BFloat16)
-                        accumulator = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [lhs, rhs, accumulator]))
+                        accumulator = fx.Vector(
+                            rocdl.mfma_f32_16x16x32_bf16(
+                                T.vec(4, T.f32), [lhs, rhs, accumulator]
+                            )
+                        )
 
                 fx.ptr_store(accumulator, reduction + (wave * _WAVE_SIZE + lane) * 4)
                 gpu.barrier()
@@ -232,14 +260,20 @@ def build_router_projection(
                     logit = fx.Float32(0.0)
                     for source_wave in range_constexpr(waves):
                         source_lane = local_sample + 16 * (row // 4)
-                        source_index = (source_wave * _WAVE_SIZE + source_lane) * 4 + row % 4
+                        source_index = (
+                            source_wave * _WAVE_SIZE + source_lane
+                        ) * 4 + row % 4
                         logit = logit + fx.ptr_load(reduction + source_index)
                     logit = fx.Float32(logit.to(fx.BFloat16))
                     score = rcp(fx.Float32(1.0) + exp(-logit))
-                    output_offset = sample * num_experts + expert_tile * _EXPERT_TILE + row
+                    output_offset = (
+                        sample * num_experts + expert_tile * _EXPERT_TILE + row
+                    )
                     bo.buffer_store(score, scores_rsrc, output_offset)
                     bo.buffer_store(
-                        fx.Vector.from_elements([score.bitcast(fx.Int32), tag], fx.Int32),
+                        fx.Vector.from_elements(
+                            [score.bitcast(fx.Int32), tag], fx.Int32
+                        ),
                         mailbox_rsrc,
                         output_offset * 2,
                         cache_modifier=CM_DEV,
@@ -296,7 +330,8 @@ def build_router_projection(
                         weight_scale = fx.Int32(
                             bo.buffer_load(
                                 scale_rsrc,
-                                ((row_tile // 2) * k_scale_chunks + k256) * 64 + scale_lane,
+                                ((row_tile // 2) * k_scale_chunks + k256) * 64
+                                + scale_lane,
                                 vec_width=1,
                                 dtype=T.i32,
                             )
@@ -312,19 +347,28 @@ def build_router_projection(
                             for k64_half in range_constexpr(2):
                                 loaded = fx.Vector(
                                     fx.ptr_load(
-                                        x + (sample * hidden + k_base + k64_half * 64) // 4,
+                                        x
+                                        + (sample * hidden + k_base + k64_half * 64)
+                                        // 4,
                                         result_type=fx.Vector.make_type(4, fx.Float32),
                                     )
                                 ).bitcast(fx.Int32)
                                 activation_halves.append(
                                     fx.Vector.from_elements(
-                                        [valid_sample.select(loaded[index], fx.Int32(0)) for index in range(4)],
+                                        [
+                                            valid_sample.select(
+                                                loaded[index], fx.Int32(0)
+                                            )
+                                            for index in range(4)
+                                        ],
                                         fx.Int32,
                                     )
                                 )
                             activation_fragment = fx.make_rmem_tensor(8, fx.Int32)
                             activation_fragment.store(
-                                activation_halves[0].shuffle(activation_halves[1], list(range(8)))
+                                activation_halves[0].shuffle(
+                                    activation_halves[1], list(range(8))
+                                )
                             )
                             weight_halves = []
                             for k64_half in range_constexpr(2):
@@ -333,14 +377,26 @@ def build_router_projection(
                                     fx.Vector(
                                         bo.buffer_load(
                                             weight_rsrc,
-                                            (((row_tile * k_chunks + k64) * 4 + lane_div16) * 16 + lane_mod16) * 4,
+                                            (
+                                                (
+                                                    (row_tile * k_chunks + k64) * 4
+                                                    + lane_div16
+                                                )
+                                                * 16
+                                                + lane_mod16
+                                            )
+                                            * 4,
                                             vec_width=4,
                                             dtype=T.i32,
                                         )
                                     )
                                 )
                             weight_fragment = fx.make_rmem_tensor(8, fx.Int32)
-                            weight_fragment.store(weight_halves[0].shuffle(weight_halves[1], list(range(8))))
+                            weight_fragment.store(
+                                weight_halves[0].shuffle(
+                                    weight_halves[1], list(range(8))
+                                )
+                            )
                             fx.gemm(
                                 scale_atoms[k128_half],
                                 accumulator,
@@ -356,7 +412,9 @@ def build_router_projection(
                     if (bid >= fx.Int32(latent_base)) & (bid < fx.Int32(shared_base)):
                         row_tile = (bid - latent_base) * _PROJECTION_WAVES + wave
                         if (wave < _PROJECTION_WAVES) & (row_tile < latent_tiles):
-                            values = dense_accumulate(latent_weight_rsrc, latent_scale_rsrc, row_tile)
+                            values = dense_accumulate(
+                                latent_weight_rsrc, latent_scale_rsrc, row_tile
+                            )
                             output_sample_base = lane_div16 * 4
                             for element in range_constexpr(4):
                                 output_sample = output_sample_base + element
@@ -364,14 +422,18 @@ def build_router_projection(
                                     bo.buffer_store(
                                         values[element].to(fx.BFloat16),
                                         latent_out_rsrc,
-                                        output_sample * latent_rows + row_tile * _EXPERT_TILE + lane_mod16,
+                                        output_sample * latent_rows
+                                        + row_tile * _EXPERT_TILE
+                                        + lane_mod16,
                                     )
 
                 if include_shared:
                     if (bid >= fx.Int32(shared_base)) & (bid < fx.Int32(selector_bid)):
                         row_tile = (bid - shared_base) * _PROJECTION_WAVES + wave
                         if (wave < _PROJECTION_WAVES) & (row_tile < shared_half_tiles):
-                            gate_values = dense_accumulate(shared_weight_rsrc, shared_scale_rsrc, row_tile)
+                            gate_values = dense_accumulate(
+                                shared_weight_rsrc, shared_scale_rsrc, row_tile
+                            )
                             up_values = dense_accumulate(
                                 shared_weight_rsrc,
                                 shared_scale_rsrc,
@@ -383,8 +445,14 @@ def build_router_projection(
                                 if output_sample < samples:
                                     gate_bf16 = gate_values[element].to(fx.BFloat16)
                                     up_bf16 = up_values[element].to(fx.BFloat16)
-                                    output_offset = output_sample * shared_rows + row_tile * _EXPERT_TILE + lane_mod16
-                                    bo.buffer_store(gate_bf16, shared_out_rsrc, output_offset)
+                                    output_offset = (
+                                        output_sample * shared_rows
+                                        + row_tile * _EXPERT_TILE
+                                        + lane_mod16
+                                    )
+                                    bo.buffer_store(
+                                        gate_bf16, shared_out_rsrc, output_offset
+                                    )
                                     bo.buffer_store(
                                         up_bf16,
                                         shared_out_rsrc,
@@ -393,11 +461,13 @@ def build_router_projection(
                                     gate = fx.Float32(gate_bf16)
                                     up = fx.Float32(up_bf16)
                                     gate_tanh = fx.Float32(2.0) * rcp(
-                                        fx.Float32(1.0) + exp(fx.Float32(-2.0 / situ_beta) * gate)
+                                        fx.Float32(1.0)
+                                        + exp(fx.Float32(-2.0 / situ_beta) * gate)
                                     ) - fx.Float32(1.0)
                                     gate_sigmoid = rcp(fx.Float32(1.0) + exp(-gate))
                                     up_tanh = fx.Float32(2.0) * rcp(
-                                        fx.Float32(1.0) + exp(fx.Float32(-2.0 / situ_linear_beta) * up)
+                                        fx.Float32(1.0)
+                                        + exp(fx.Float32(-2.0 / situ_linear_beta) * up)
                                     ) - fx.Float32(1.0)
                                     value = (
                                         fx.Float32(situ_beta)
@@ -409,7 +479,9 @@ def build_router_projection(
                                     bo.buffer_store(
                                         value.to(fx.BFloat16),
                                         shared_mid_rsrc,
-                                        output_sample * (shared_rows // 2) + row_tile * _EXPERT_TILE + lane_mod16,
+                                        output_sample * (shared_rows // 2)
+                                        + row_tile * _EXPERT_TILE
+                                        + lane_mod16,
                                     )
 
         if include_router and bid == fx.Int32(selector_bid):
@@ -427,7 +499,13 @@ def build_router_projection(
                     offset = wave * num_experts + expert
 
                     pair = fx.Vector(
-                        bo.buffer_load(mailbox_rsrc, offset * 2, vec_width=2, dtype=T.i32, cache_modifier=CM_DEV)
+                        bo.buffer_load(
+                            mailbox_rsrc,
+                            offset * 2,
+                            vec_width=2,
+                            dtype=T.i32,
+                            cache_modifier=CM_DEV,
+                        )
                     )
                     while pair[1] != tag:
                         rocdl.s_nop(0)
@@ -441,7 +519,11 @@ def build_router_projection(
                             )
                         )
                     score = pair[0].bitcast(fx.Float32)
-                    bias = fx.Float32(fx.BFloat16(bo.buffer_load(bias_rsrc, expert, vec_width=1, dtype=T.bf16)))
+                    bias = fx.Float32(
+                        fx.BFloat16(
+                            bo.buffer_load(bias_rsrc, expert, vec_width=1, dtype=T.bf16)
+                        )
+                    )
                     corrected_scores.append(score + bias)
 
                 selected_sum = fx.Float32(0.0)
@@ -453,7 +535,8 @@ def build_router_projection(
                         candidate_score = corrected_scores[value_index]
                         candidate_id = fx.Int32(lane + value_index * _WAVE_SIZE)
                         take = (candidate_score > best_score) | (
-                            (ArithValue(candidate_score) == ArithValue(best_score)) & (candidate_id < best_id)
+                            (ArithValue(candidate_score) == ArithValue(best_score))
+                            & (candidate_id < best_id)
                         )
                         best_score = take.select(candidate_score, best_score)
                         best_id = take.select(candidate_id, best_id)
@@ -462,12 +545,19 @@ def build_router_projection(
                         peer_score = xshfl(best_score, shuffle_offset)
                         peer_id = xshfl(best_id, shuffle_offset)
                         take = (peer_score > best_score) | (
-                            (ArithValue(peer_score) == ArithValue(best_score)) & (peer_id < best_id)
+                            (ArithValue(peer_score) == ArithValue(best_score))
+                            & (peer_id < best_id)
                         )
                         best_score = take.select(peer_score, best_score)
                         best_id = take.select(peer_id, best_id)
 
-                    best_bias = fx.Float32(fx.BFloat16(bo.buffer_load(bias_rsrc, best_id, vec_width=1, dtype=T.bf16)))
+                    best_bias = fx.Float32(
+                        fx.BFloat16(
+                            bo.buffer_load(
+                                bias_rsrc, best_id, vec_width=1, dtype=T.bf16
+                            )
+                        )
+                    )
                     best_raw = best_score - best_bias
                     selected_sum = selected_sum + best_raw
                     if lane == 0:
@@ -501,7 +591,9 @@ def build_router_projection(
 
             gpu.barrier()
 
-            for expert_iteration in range_constexpr((num_experts + threads - 1) // threads):
+            for expert_iteration in range_constexpr(
+                (num_experts + threads - 1) // threads
+            ):
                 expert = tid + expert_iteration * threads
                 if expert < num_experts:
                     fx.ptr_store(fx.Int32(0), cumsum + expert + 1)
@@ -524,7 +616,9 @@ def build_router_projection(
                 fx.ptr_store(position, route_positions + tid)
             gpu.barrier()
 
-            for expert_iteration in range_constexpr((num_experts + threads - 1) // threads):
+            for expert_iteration in range_constexpr(
+                (num_experts + threads - 1) // threads
+            ):
                 expert = tid + expert_iteration * threads
                 if expert < num_experts:
                     active = fx.ptr_load(cumsum + expert + 1) != 0
@@ -538,8 +632,12 @@ def build_router_projection(
                 expert = chunk * threads + tid
                 valid = expert < num_experts
                 value = valid.select(fx.ptr_load(cumsum + expert + 1), fx.Int32(0))
-                inclusive = block_scan.inclusive(value, fx.ReductionOp.ADD, storage=scan_storage)
-                base = fx.Int32(0) if chunk == 0 else fx.ptr_load(cumsum + chunk * threads)
+                inclusive = block_scan.inclusive(
+                    value, fx.ReductionOp.ADD, storage=scan_storage
+                )
+                base = (
+                    fx.Int32(0) if chunk == 0 else fx.ptr_load(cumsum + chunk * threads)
+                )
                 if valid:
                     fx.ptr_store(base + inclusive, cumsum + expert + 1)
                 gpu.barrier()
@@ -550,14 +648,18 @@ def build_router_projection(
                 bo.buffer_store(fx.Int32(samples), num_valid_rsrc, 1)
 
             sentinel = fx.Int32((topk << 24) | samples)
-            for expert_iteration in range_constexpr((num_experts + threads - 1) // threads):
+            for expert_iteration in range_constexpr(
+                (num_experts + threads - 1) // threads
+            ):
                 expert = tid + expert_iteration * threads
                 if expert < num_experts:
                     start = fx.ptr_load(cumsum + expert)
                     end = fx.ptr_load(cumsum + expert + 1)
                     active = end > start
                     if active:
-                        bo.buffer_store(expert, sorted_experts_rsrc, start // _ROUTING_TILE)
+                        bo.buffer_store(
+                            expert, sorted_experts_rsrc, start // _ROUTING_TILE
+                        )
                         for padding_index in range_constexpr(_ROUTING_TILE):
                             slot = start + padding_index
                             bo.buffer_store(sentinel, sorted_ids_rsrc, slot)
@@ -569,11 +671,15 @@ def build_router_projection(
 
             if tid < route_count:
                 expert = fx.ptr_load(route_ids + tid)
-                position = fx.ptr_load(cumsum + expert) + fx.ptr_load(route_positions + tid)
+                position = fx.ptr_load(cumsum + expert) + fx.ptr_load(
+                    route_positions + tid
+                )
                 token = tid // topk
                 topk_slot = tid % topk
                 bo.buffer_store((topk_slot << 24) | token, sorted_ids_rsrc, position)
-                bo.buffer_store(fx.ptr_load(route_weights + tid), sorted_weights_rsrc, position)
+                bo.buffer_store(
+                    fx.ptr_load(route_weights + tid), sorted_weights_rsrc, position
+                )
 
     @flyc.jit
     def launch(
@@ -701,13 +807,27 @@ class FusedRouterProjection:
         step: torch.Tensor,
         layer: int,
     ) -> None:
-        if hidden_states.shape != (self.samples, self.hidden) or hidden_states.dtype != torch.bfloat16:
+        if (
+            hidden_states.shape != (self.samples, self.hidden)
+            or hidden_states.dtype != torch.bfloat16
+        ):
             raise ValueError("hidden_states must be contiguous BF16 [samples, hidden]")
-        if correction_bias.shape != (self.num_experts,) or correction_bias.dtype != torch.bfloat16:
+        if (
+            correction_bias.shape != (self.num_experts,)
+            or correction_bias.dtype != torch.bfloat16
+        ):
             raise ValueError("correction_bias must be BF16 [experts]")
-        if score_mailbox.numel() != self.samples * self.num_experts * 2 or score_mailbox.dtype != torch.int32:
-            raise ValueError("score_mailbox must be int32 storage for tagged FP32 scores")
-        if scores_out.shape != (self.samples, self.num_experts) or scores_out.dtype != torch.float32:
+        if (
+            score_mailbox.numel() != self.samples * self.num_experts * 2
+            or score_mailbox.dtype != torch.int32
+        ):
+            raise ValueError(
+                "score_mailbox must be int32 storage for tagged FP32 scores"
+            )
+        if (
+            scores_out.shape != (self.samples, self.num_experts)
+            or scores_out.dtype != torch.float32
+        ):
             raise ValueError("scores_out must be FP32 [samples, experts]")
         if ids_out.shape != (self.samples, self.topk) or ids_out.dtype != torch.int32:
             raise ValueError("ids_out must be int32 [samples, topk]")
@@ -715,7 +835,10 @@ class FusedRouterProjection:
             raise ValueError("weights_out must be FP32 [samples, topk]")
         if step.shape != (1,) or step.dtype != torch.int32:
             raise ValueError("step must be int32[1]")
-        if quantized_hidden.shape != (32, self.hidden) or quantized_hidden.dtype != torch.uint8:
+        if (
+            quantized_hidden.shape != (32, self.hidden)
+            or quantized_hidden.dtype != torch.uint8
+        ):
             raise ValueError("quantized_hidden must be uint8 [32, hidden]")
         if quantized_hidden_scale.numel() != 32 * (self.hidden // 32):
             raise ValueError("quantized_hidden_scale has the wrong packed size")
@@ -725,13 +848,25 @@ class FusedRouterProjection:
             raise ValueError("latent_weight_scale has the wrong packed size")
         if shared_weight_scale.numel() != self.shared_rows * (self.hidden // 32):
             raise ValueError("shared_weight_scale has the wrong packed size")
-        if latent_weight_scale.dtype != torch.uint8 or shared_weight_scale.dtype != torch.uint8:
+        if (
+            latent_weight_scale.dtype != torch.uint8
+            or shared_weight_scale.dtype != torch.uint8
+        ):
             raise ValueError("MXFP8 weight scales must use uint8 E8M0 storage")
-        if latent_out.shape != (self.samples, self.latent_rows) or latent_out.dtype != torch.bfloat16:
+        if (
+            latent_out.shape != (self.samples, self.latent_rows)
+            or latent_out.dtype != torch.bfloat16
+        ):
             raise ValueError("latent_out must be BF16 [samples, latent_rows]")
-        if shared_out.shape != (self.samples, self.shared_rows) or shared_out.dtype != torch.bfloat16:
+        if (
+            shared_out.shape != (self.samples, self.shared_rows)
+            or shared_out.dtype != torch.bfloat16
+        ):
             raise ValueError("shared_out must be BF16 [samples, shared_rows]")
-        if shared_mid_out.shape != (self.samples, self.shared_rows // 2) or shared_mid_out.dtype != torch.bfloat16:
+        if (
+            shared_mid_out.shape != (self.samples, self.shared_rows // 2)
+            or shared_mid_out.dtype != torch.bfloat16
+        ):
             raise ValueError("shared_mid_out must be BF16 [samples, shared_rows / 2]")
         tensors = (
             hidden_states,

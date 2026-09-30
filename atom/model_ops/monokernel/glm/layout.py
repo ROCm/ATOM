@@ -28,7 +28,6 @@ from atom.model_ops.monokernel.layout import (
     UK_TILE,
     UV_TILE,
     WAVES,
-    atom_mxfp4_scale_index,
 )
 
 INDEX_HEADS = 32
@@ -59,7 +58,6 @@ def fp8_pe_upper_pair_lane(lane):
     return (lane & -2) + 1
 
 
-
 def sparse_cache_rows(
     sparse_kv_indices,
     *,
@@ -81,7 +79,9 @@ def sparse_cache_rows(
     return sparse_kv_indices[start : start + count]
 
 
-def paged_row_contract(sparse_kv_indices, sparse_kv_indptr, sample: int, slot_mapping=None):
+def paged_row_contract(
+    sparse_kv_indices, sparse_kv_indptr, sample: int, slot_mapping=None
+):
     """Reference the device contract for one ATOM-layout request row."""
 
     start, end = sparse_kv_indptr[sample : sample + 2]
@@ -132,7 +132,9 @@ def down_x_words(samples: int, inter: int, expert_mxfp4: bool) -> int:
 
 def dcp_softmax_weights(maxima, sums):
     global_max = max(maxima)
-    scaled = [total * math.exp(maximum - global_max) for maximum, total in zip(maxima, sums)]
+    scaled = [
+        total * math.exp(maximum - global_max) for maximum, total in zip(maxima, sums)
+    ]
     denominator = sum(scaled)
     return [value / denominator if denominator else 0.0 for value in scaled]
 
@@ -262,15 +264,35 @@ def stage_tasks(
     tasks += [("uk", heads * KV_LORA // UK_TILE)]
     if with_indexer:
         tasks += [
-            ("index_score", samples * ((index_max_seq + INDEX_KEYS_PER_TASK - 1) // INDEX_KEYS_PER_TASK)),
+            (
+                "index_score",
+                samples
+                * ((index_max_seq + INDEX_KEYS_PER_TASK - 1) // INDEX_KEYS_PER_TASK),
+            ),
             ("index_select", samples),
         ]
     tasks += [
-        ("split", samples * (heads // WAVES) * (sparse_attention_topk // sparse_keys_per_task(samples, heads))),
+        (
+            "split",
+            samples
+            * (heads // WAVES)
+            * (sparse_attention_topk // sparse_keys_per_task(samples, heads)),
+        ),
         ("uv", samples * (heads * V_DIM // UV_TILE)),
         ("o", N_ROW_TILES),
         ("router", samples * N_ROUTER),
-        ("ug", BLOCKS if samples == 1 else samples * max(BLOCKS, ((MOE_SLOTS * inter // UG_TILE + BLOCKS - 1) // BLOCKS) * BLOCKS)),
+        (
+            "ug",
+            (
+                BLOCKS
+                if samples == 1
+                else samples
+                * max(
+                    BLOCKS,
+                    ((MOE_SLOTS * inter // UG_TILE + BLOCKS - 1) // BLOCKS) * BLOCKS,
+                )
+            ),
+        ),
         ("down", HIDDEN // dn_tile(samples, expert_mxfp4)),
     ]
     return tasks

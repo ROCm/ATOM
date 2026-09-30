@@ -45,7 +45,9 @@ from atom.model_ops.monokernel.weights import LayerWeights, prepare_mxfp4_expert
 __all__ = ["Glm5MonoKernel"]
 
 
-def prepare_glm5_weights(W: LayerWeights, attention_weight: AttentionWeight | str) -> dict[str, torch.Tensor]:
+def prepare_glm5_weights(
+    W: LayerWeights, attention_weight: AttentionWeight | str
+) -> dict[str, torch.Tensor]:
     """Pack one layer once for every graph bucket using it."""
 
     t = W.t
@@ -61,14 +63,20 @@ def prepare_glm5_weights(W: LayerWeights, attention_weight: AttentionWeight | st
         W.mxfp4_weight_layout is Mxfp4WeightLayout.ATOM
         or W.mxfp4_scale_layout is Mxfp4ScaleLayout.ATOM
     ) and not atom_experts:
-        raise ValueError("ATOM expert storage requires MXFP4 values and scales together")
+        raise ValueError(
+            "ATOM expert storage requires MXFP4 values and scales together"
+        )
     if atom_experts:
         packed = pack_layer_weights(t, moe_mode, profile, attention_only=True)
         packed["w_r"] = pack_bf16(t["w_r"])
-        packed.update(dict(zip(
-            ("w_ug", "s_ug", "w_dn", "s_dn"),
-            prepare_mxfp4_expert_storage(W, canonical=False),
-        )))
+        packed.update(
+            dict(
+                zip(
+                    ("w_ug", "s_ug", "w_dn", "s_dn"),
+                    prepare_mxfp4_expert_storage(W, canonical=False),
+                )
+            )
+        )
         return packed
     return pack_layer_weights(
         t,
@@ -114,15 +122,25 @@ class Glm5MonoKernel:
     ):
         expected_config = glm5_tp_config(npes)
         if W.config != expected_config:
-            raise ValueError(f"Glm5MonoKernel requires {expected_config}, got {W.config}")
+            raise ValueError(
+                f"Glm5MonoKernel requires {expected_config}, got {W.config}"
+            )
         output_heads = expected_config.local_heads
         attention_heads = glm5_attention_heads(npes, dcp_size)
         validate_shard(
-            samples, W.heads, rank, npes, topk, W.config,
-            supported_samples=GLM5_KERNEL_SAMPLES, expected_heads=attention_heads,
+            samples,
+            W.heads,
+            rank,
+            npes,
+            topk,
+            W.config,
+            supported_samples=GLM5_KERNEL_SAMPLES,
+            expected_heads=attention_heads,
         )
         if not 1 <= launches_per_step <= 128:
-            raise ValueError(f"launches_per_step must be in [1, 128], got {launches_per_step}")
+            raise ValueError(
+                f"launches_per_step must be in [1, 128], got {launches_per_step}"
+            )
         self.W, self.S, self.rank, self.npes, self.topk = W, samples, rank, npes, topk
         self.launches_per_step = launches_per_step
         self.with_indexer = with_indexer
@@ -142,24 +160,55 @@ class Glm5MonoKernel:
             and W.mxfp4_scale_layout is Mxfp4ScaleLayout.ATOM
         )
         self.packed = dict(
-            prepare_glm5_weights(W, self.attention_weight) if prepared_weights is None else prepared_weights
+            prepare_glm5_weights(W, self.attention_weight)
+            if prepared_weights is None
+            else prepared_weights
         )
         if with_indexer:
-            required = ("w_index_k", "s_index_k", "w_index_w", "w_index_q", "s_index_q", "g_index_k", "b_index_k")
+            required = (
+                "w_index_k",
+                "s_index_k",
+                "w_index_w",
+                "w_index_q",
+                "s_index_q",
+                "g_index_k",
+                "b_index_k",
+            )
             missing = [name for name in required if name not in t]
             if missing:
-                raise ValueError(f"with_indexer=True requires weights: {', '.join(missing)}")
+                raise ValueError(
+                    f"with_indexer=True requires weights: {', '.join(missing)}"
+                )
             self.packed["w_index_k"] = pack_fp8(t["w_index_k"])
             self.packed["w_index_q"] = pack_fp8(t["w_index_q"])
             self.packed["w_index_w"] = pack_bf16(t["w_index_w"])
         self.scr_layout, self.sym_layout = layout(
-            samples, W.heads, npes, topk, with_indexer, index_max_seq,
-            inter=W.config.inter, output_heads=output_heads, dcp_size=dcp_size,
+            samples,
+            W.heads,
+            npes,
+            topk,
+            with_indexer,
+            index_max_seq,
+            inter=W.config.inter,
+            output_heads=output_heads,
+            dcp_size=dcp_size,
         )
         dev = torch.device("cuda", torch.cuda.current_device())
-        self.stages = stage_tasks(samples, W.heads, topk, with_indexer, index_max_seq, self.expert_mxfp4, inter=W.config.inter)
+        self.stages = stage_tasks(
+            samples,
+            W.heads,
+            topk,
+            with_indexer,
+            index_max_seq,
+            self.expert_mxfp4,
+            inter=W.config.inter,
+        )
         n_tasks = sum(n for _, n in self.stages)
-        self.timeline = torch.zeros(n_tasks, TL_COLS, dtype=torch.int64, device=dev) if timeline else None
+        self.timeline = (
+            torch.zeros(n_tasks, TL_COLS, dtype=torch.int64, device=dev)
+            if timeline
+            else None
+        )
         if with_indexer:
             index_tensors = dict(t, **self.packed)
             self.index_params = torch.tensor(
@@ -183,11 +232,18 @@ class Glm5MonoKernel:
             self.index_params = None
         self._owns_runtime = runtime is None
         if runtime is None:
-            self.scratch = torch.zeros(self.scr_layout["_bytes"], dtype=torch.uint8, device=dev)
-            self.peer_buffer = SymmetricPeerBuffer(self.sym_layout["_bytes"], rank=rank, npes=npes, group=group)
+            self.scratch = torch.zeros(
+                self.scr_layout["_bytes"], dtype=torch.uint8, device=dev
+            )
+            self.peer_buffer = SymmetricPeerBuffer(
+                self.sym_layout["_bytes"], rank=rank, npes=npes, group=group
+            )
             self.step = torch.zeros(1, dtype=torch.int32, device=dev)
         else:
-            if runtime.scr_layout != self.scr_layout or runtime.sym_layout != self.sym_layout:
+            if (
+                runtime.scr_layout != self.scr_layout
+                or runtime.sym_layout != self.sym_layout
+            ):
                 raise ValueError("shared GLM runtime geometry mismatch")
             self.scratch = runtime.scratch
             self.peer_buffer = runtime.peer_buffer
@@ -219,7 +275,9 @@ class Glm5MonoKernel:
             timeline=timeline,
         )
 
-    def debug(self, name: str, shape, dtype=torch.float32, pairs=True, bf2=False) -> torch.Tensor:
+    def debug(
+        self, name: str, shape, dtype=torch.float32, pairs=True, bf2=False
+    ) -> torch.Tensor:
         """Values of a scratch mailbox (``(value, tag)`` pairs unless ``pairs=False``;
         ``bf2``: each pair's value word packs two bf16 elements)."""
         off = self.scr_layout[name]
@@ -229,9 +287,19 @@ class Glm5MonoKernel:
         if not pairs:
             return self.scratch[off : off + n * 4].view(dtype).view(shape)
         if bf2:
-            words = self.scratch[off : off + n * 4].view(torch.int32).view(n // 2, 2)[:, 0].contiguous()
+            words = (
+                self.scratch[off : off + n * 4]
+                .view(torch.int32)
+                .view(n // 2, 2)[:, 0]
+                .contiguous()
+            )
             return words.view(torch.bfloat16).float().view(shape)
-        words = self.scratch[off : off + n * 8].view(torch.int32).view(n, 2)[:, 0].contiguous()
+        words = (
+            self.scratch[off : off + n * 8]
+            .view(torch.int32)
+            .view(n, 2)[:, 0]
+            .contiguous()
+        )
         return words.view(dtype).view(shape)
 
     def forward(
@@ -256,10 +324,14 @@ class Glm5MonoKernel:
         ``advance_step`` (or pass ``advance=True``) once per step.  Both are
         stream-ordered device ops, so the sequence can be captured in a HIP graph."""
         if not 0 <= layer < self.launches_per_step:
-            raise ValueError(f"layer must be in [0, {self.launches_per_step}), got {layer}")
+            raise ValueError(
+                f"layer must be in [0, {self.launches_per_step}), got {layer}"
+            )
         total_samples = h.shape[0]
         if total_samples % self.S:
-            raise ValueError(f"input rows {total_samples} must be divisible by kernel chunk {self.S}")
+            raise ValueError(
+                f"input rows {total_samples} must be divisible by kernel chunk {self.S}"
+            )
         chunks = total_samples // self.S
         if self.with_indexer and chunks != 1:
             raise ValueError("fused indexer does not support chunked launches")
@@ -268,7 +340,10 @@ class Glm5MonoKernel:
         if self.with_indexer:
             if index_cache is None:
                 raise ValueError("index_cache is required when with_indexer=True")
-            if index_cache.shape != (self.index_max_seq, INDEX_DIM) or index_cache.dtype is not torch.bfloat16:
+            if (
+                index_cache.shape != (self.index_max_seq, INDEX_DIM)
+                or index_cache.dtype is not torch.bfloat16
+            ):
                 raise ValueError(
                     f"index_cache must be bf16 [{self.index_max_seq}, {INDEX_DIM}], got "
                     f"{tuple(index_cache.shape)} {index_cache.dtype}"
@@ -276,31 +351,54 @@ class Glm5MonoKernel:
         if self.kv_cache_layout is KvCacheLayout.ATOM:
             cache_width = GLM5_CONFIG.kv_lora + GLM5_CONFIG.pe_dim
             fp8_dtypes = {
-                dtype for dtype in (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e4m3fnuz", None))
+                dtype
+                for dtype in (
+                    getattr(torch, "float8_e4m3fn", None),
+                    getattr(torch, "float8_e4m3fnuz", None),
+                )
                 if dtype is not None
             }
             expected_dtype = (
-                kv_cache.dtype in fp8_dtypes if self.kv_cache_dtype == "fp8" else kv_cache.dtype is torch.bfloat16
+                kv_cache.dtype in fp8_dtypes
+                if self.kv_cache_dtype == "fp8"
+                else kv_cache.dtype is torch.bfloat16
             )
             if not expected_dtype or not kv_cache.is_contiguous():
-                raise ValueError(f"ATOM KV cache must be contiguous {self.kv_cache_dtype}")
+                raise ValueError(
+                    f"ATOM KV cache must be contiguous {self.kv_cache_dtype}"
+                )
             if kv_cache.shape[-1] != cache_width:
-                raise ValueError(f"ATOM KV cache last dimension must be {cache_width}, got {tuple(kv_cache.shape)}")
+                raise ValueError(
+                    f"ATOM KV cache last dimension must be {cache_width}, got {tuple(kv_cache.shape)}"
+                )
             if kv_cache.data_ptr() != pe_cache.data_ptr():
-                raise ValueError("ATOM KV cache layout requires the same fused tensor for kv_cache and pe_cache")
+                raise ValueError(
+                    "ATOM KV cache layout requires the same fused tensor for kv_cache and pe_cache"
+                )
             for name, value, dtype, size in (
                 ("positions", positions, torch.int64, total_samples),
                 ("slot_mapping", slot_mapping, torch.int64, total_samples),
                 ("sparse_kv_indptr", sparse_kv_indptr, torch.int32, total_samples + 1),
             ):
-                if value is None or value.dtype is not dtype or value.numel() < size or not value.is_contiguous():
+                if (
+                    value is None
+                    or value.dtype is not dtype
+                    or value.numel() < size
+                    or not value.is_contiguous()
+                ):
                     got = None if value is None else (tuple(value.shape), value.dtype)
-                    raise ValueError(f"{name} must be contiguous {dtype} with at least {size} values, got {got}")
+                    raise ValueError(
+                        f"{name} must be contiguous {dtype} with at least {size} values, got {got}"
+                    )
         t = dict(self.W.t, **self.packed)
         if x_out is None:
-            x_out = torch.empty(total_samples, HIDDEN, dtype=torch.bfloat16, device=h.device)
+            x_out = torch.empty(
+                total_samples, HIDDEN, dtype=torch.bfloat16, device=h.device
+            )
         elif x_out.shape != (total_samples, HIDDEN):
-            raise ValueError(f"x_out must have shape {(total_samples, HIDDEN)}, got {tuple(x_out.shape)}")
+            raise ValueError(
+                f"x_out must have shape {(total_samples, HIDDEN)}, got {tuple(x_out.shape)}"
+            )
         p = lambda x: x.data_ptr()  # noqa: E731
         for chunk in range(chunks):
             row = chunk * self.S
@@ -308,9 +406,12 @@ class Glm5MonoKernel:
                 p(h) + row * HIDDEN * h.element_size(),
                 p(x_out) + row * HIDDEN * x_out.element_size(),
                 p(cur_pos),
-                p(cur_pos if positions is None else positions) + (0 if positions is None else row * 8),
-                p(cur_pos if slot_mapping is None else slot_mapping) + (0 if slot_mapping is None else row * 8),
-                p(cur_pos if sparse_kv_indptr is None else sparse_kv_indptr) + (0 if sparse_kv_indptr is None else row * 4),
+                p(cur_pos if positions is None else positions)
+                + (0 if positions is None else row * 8),
+                p(cur_pos if slot_mapping is None else slot_mapping)
+                + (0 if slot_mapping is None else row * 8),
+                p(cur_pos if sparse_kv_indptr is None else sparse_kv_indptr)
+                + (0 if sparse_kv_indptr is None else row * 4),
                 p(kv_cache),
                 p(pe_cache),
                 p(index_cache) if self.with_indexer else p(indices),
@@ -339,7 +440,11 @@ class Glm5MonoKernel:
                 p(self.scratch),
                 self.sym,
                 p(self.peers),
-                p(self.index_params) if self.with_indexer else (0 if self.timeline is None else p(self.timeline)),
+                (
+                    p(self.index_params)
+                    if self.with_indexer
+                    else (0 if self.timeline is None else p(self.timeline))
+                ),
                 p(self.step),
                 self.rank,
                 layer,
@@ -367,7 +472,9 @@ class Glm5MonoKernel:
     def timeline_report(self) -> str:
         """Per stage, in us from launch start: [first start, median hint seen, last end]
         and median per-task phases (hint wait, payload staging, compute, epilogue)."""
-        tl = self.timeline[:, :5].cpu().double() / 100.0  # s_memrealtime ticks at 100 MHz
+        tl = (
+            self.timeline[:, :5].cpu().double() / 100.0
+        )  # s_memrealtime ticks at 100 MHz
         t0 = tl[:, 0].min()
         rows, i = [], 0
         for name, n in self.stages:
@@ -383,11 +490,22 @@ class Glm5MonoKernel:
             )
             if name == "index_score":
                 per_sample = n // self.S
-                ready = [(st[s * per_sample : (s + 1) * per_sample, 4].max() - t0).item() for s in range(self.S)]
-                rows.append(" " * 10 + "score-ready/sample " + " ".join(f"{v:.1f}" for v in ready))
+                ready = [
+                    (st[s * per_sample : (s + 1) * per_sample, 4].max() - t0).item()
+                    for s in range(self.S)
+                ]
+                rows.append(
+                    " " * 10
+                    + "score-ready/sample "
+                    + " ".join(f"{v:.1f}" for v in ready)
+                )
             elif name == "index_select":
                 done = [(st[s, 4] - t0).item() for s in range(self.S)]
-                rows.append(" " * 10 + "select-done/sample " + " ".join(f"{v:.1f}" for v in done))
+                rows.append(
+                    " " * 10
+                    + "select-done/sample "
+                    + " ".join(f"{v:.1f}" for v in done)
+                )
         return "\n".join(rows)
 
     def intermediates(self):
@@ -410,5 +528,9 @@ class Glm5MonoKernel:
             result["index_q"] = self.debug("index_q", (S, 32, INDEX_DIM), bf2=True)
             result["index_w"] = self.debug("index_w", (S, 32))
             off = self.scr_layout["indices"]
-            result["indices"] = self.scratch[off : off + S * self.topk * 4].view(torch.int32).view(S, self.topk)
+            result["indices"] = (
+                self.scratch[off : off + S * self.topk * 4]
+                .view(torch.int32)
+                .view(S, self.topk)
+            )
         return result

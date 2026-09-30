@@ -62,14 +62,20 @@ def build_mxfp8_quantize(rows: int, cols: int):
                     )
                 )
                 chunk_values = raw.bitcast(fx.BFloat16).to(fx.Float32)
-                local_max = fx.max(local_max, fmath.absf(chunk_values).reduce(ReductionOp.MAX))
+                local_max = fx.max(
+                    local_max, fmath.absf(chunk_values).reduce(ReductionOp.MAX)
+                )
                 for element in range_constexpr(8):
                     values.append(chunk_values[element])
 
-            working = (local_max * fx.Int32(_FP8_INV_MAX_POS_BITS).bitcast(fx.Float32)).bitcast(fx.Int32)
+            working = (
+                local_max * fx.Int32(_FP8_INV_MAX_POS_BITS).bitcast(fx.Float32)
+            ).bitcast(fx.Int32)
             exponent = (working >> fx.Int32(23)) & fx.Int32(0xFF)
             round_up = ((working & fx.Int32(0x400000)) != 0) & (
-                ((working & fx.Int32(0x200000)) != 0) | ((working & fx.Int32(0x1FFFFF)) != 0) | (exponent > 0)
+                ((working & fx.Int32(0x200000)) != 0)
+                | ((working & fx.Int32(0x1FFFFF)) != 0)
+                | (exponent > 0)
             )
             e8m0 = exponent + round_up.select(fx.Int32(1), fx.Int32(0))
             e8m0 = fx.min(e8m0, fx.Int32(255))
@@ -98,8 +104,12 @@ def build_mxfp8_quantize(rows: int, cols: int):
                     True,
                 )
                 words.append(packed)
-            bo.buffer_store(fx.Vector.from_elements(words[:4], fx.Int32), output_rsrc, output_dw)
-            bo.buffer_store(fx.Vector.from_elements(words[4:], fx.Int32), output_rsrc, output_dw + 4)
+            bo.buffer_store(
+                fx.Vector.from_elements(words[:4], fx.Int32), output_rsrc, output_dw
+            )
+            bo.buffer_store(
+                fx.Vector.from_elements(words[4:], fx.Int32), output_rsrc, output_dw + 4
+            )
 
             row = group // fx.Int32(scale_cols)
             scale_col = group % fx.Int32(scale_cols)
@@ -117,10 +127,14 @@ def build_mxfp8_quantize(rows: int, cols: int):
                 + col_pair * fx.Int32(2)
                 + row_pair
             )
-            bo.buffer_store(e8m0.to(fx.Uint8), scale_rsrc, scale_offset, offset_is_bytes=True)
+            bo.buffer_store(
+                e8m0.to(fx.Uint8), scale_rsrc, scale_offset, offset_is_bytes=True
+            )
 
     @flyc.jit
-    def launch(source: Int64, output: Int64, scale_output: Int64, stream: Stream = Stream(None)):
+    def launch(
+        source: Int64, output: Int64, scale_output: Int64, stream: Stream = Stream(None)
+    ):
         quantize_kernel(source, output, scale_output).launch(
             grid=(blocks, 1, 1),
             block=(_QUANT_THREADS, 1, 1),
@@ -244,12 +258,19 @@ def build_mxfp8_project(rows: int, n: int, k: int):
                         ).bitcast(fx.Int32)
                         activation_halves.append(
                             fx.Vector.from_elements(
-                                [valid_row.select(loaded[index], fx.Int32(0)) for index in range(4)],
+                                [
+                                    valid_row.select(loaded[index], fx.Int32(0))
+                                    for index in range(4)
+                                ],
                                 fx.Int32,
                             )
                         )
                     activation_fragment = fx.make_rmem_tensor(8, fx.Int32)
-                    activation_fragment.store(activation_halves[0].shuffle(activation_halves[1], list(range(8))))
+                    activation_fragment.store(
+                        activation_halves[0].shuffle(
+                            activation_halves[1], list(range(8))
+                        )
+                    )
                     weight_halves = []
                     for k64_half in range_constexpr(2):
                         k64 = k128 * 2 + k64_half
@@ -257,14 +278,21 @@ def build_mxfp8_project(rows: int, n: int, k: int):
                             fx.Vector(
                                 bo.buffer_load(
                                     weight_rsrc,
-                                    (((row_tile * k_chunks + k64) * 4 + lane_div16) * 16 + lane_mod16) * 4,
+                                    (
+                                        ((row_tile * k_chunks + k64) * 4 + lane_div16)
+                                        * 16
+                                        + lane_mod16
+                                    )
+                                    * 4,
                                     vec_width=4,
                                     dtype=T.i32,
                                 )
                             )
                         )
                     weight_fragment = fx.make_rmem_tensor(8, fx.Int32)
-                    weight_fragment.store(weight_halves[0].shuffle(weight_halves[1], list(range(8))))
+                    weight_fragment.store(
+                        weight_halves[0].shuffle(weight_halves[1], list(range(8)))
+                    )
                     fx.gemm(
                         scale_atoms[k128_half],
                         accumulator,
@@ -301,7 +329,9 @@ def build_mxfp8_project(rows: int, n: int, k: int):
             weight,
             weight_scale,
             output,
-            value_attrs={"rocdl.flat_work_group_size": f"{_PROJECT_THREADS},{_PROJECT_THREADS}"},
+            value_attrs={
+                "rocdl.flat_work_group_size": f"{_PROJECT_THREADS},{_PROJECT_THREADS}"
+            },
         ).launch(grid=(blocks, 1, 1), block=(_PROJECT_THREADS, 1, 1), stream=stream)
 
     launch.func.__name__ = f"mxfp8_project_r{rows}_n{n}_k{k}"
@@ -318,10 +348,14 @@ class Mxfp8Linear:
         rows: int,
     ) -> None:
         if weight.ndim != 2:
-            raise ValueError(f"MXFP8 weight must be a matrix, got {tuple(weight.shape)}")
+            raise ValueError(
+                f"MXFP8 weight must be a matrix, got {tuple(weight.shape)}"
+            )
         self.n, self.k = weight.shape
         if scale.shape != (self.n, self.k // _GROUP):
-            raise ValueError(f"MXFP8 scale must have shape {(self.n, self.k // _GROUP)}, got {tuple(scale.shape)}")
+            raise ValueError(
+                f"MXFP8 scale must have shape {(self.n, self.k // _GROUP)}, got {tuple(scale.shape)}"
+            )
         self.rows = rows
         self.weight = pack_mxfp8_weight(weight)
         self.scale = pack_mxfp8_scale(scale)
@@ -329,7 +363,9 @@ class Mxfp8Linear:
 
     @classmethod
     def from_prepared(cls, prepared: "PreparedMxfp8Weight", rows: int) -> "Mxfp8Linear":
-        expected_scale = ((prepared.rows + 255) // 256 * 256) * (prepared.cols // _GROUP)
+        expected_scale = ((prepared.rows + 255) // 256 * 256) * (
+            prepared.cols // _GROUP
+        )
         if (
             prepared.weight.dtype != torch.uint8
             or prepared.weight.numel() != prepared.rows * prepared.cols
@@ -354,7 +390,9 @@ class Mxfp8Linear:
     def _allocate_runtime(self, rows: int, device: torch.device) -> None:
         padded_rows = (rows + 31) // 32 * 32
         self.padded_rows = padded_rows
-        self.activation = torch.zeros((padded_rows, self.k), dtype=torch.uint8, device=device)
+        self.activation = torch.zeros(
+            (padded_rows, self.k), dtype=torch.uint8, device=device
+        )
         self.activation_scale = torch.zeros(
             padded_rows * (self.k // _GROUP),
             dtype=torch.uint8,
@@ -395,13 +433,23 @@ class Mxfp8Linear:
     ) -> torch.Tensor:
         """Project already-quantized rows, enabling reuse across independent weights."""
 
-        if activation.shape != (self.padded_rows, self.k) or activation.dtype != torch.uint8:
+        if (
+            activation.shape != (self.padded_rows, self.k)
+            or activation.dtype != torch.uint8
+        ):
             raise ValueError(f"activation must be uint8 [{self.padded_rows}, {self.k}]")
-        if activation_scale.numel() != self.activation_scale.numel() or activation_scale.dtype != torch.uint8:
+        if (
+            activation_scale.numel() != self.activation_scale.numel()
+            or activation_scale.dtype != torch.uint8
+        ):
             raise ValueError("activation_scale has the wrong packed size or dtype")
         if output.shape != (self.rows, self.n) or output.dtype != torch.bfloat16:
             raise ValueError(f"output must be BF16 [{self.rows}, {self.n}]")
-        if not activation.is_contiguous() or not activation_scale.is_contiguous() or not output.is_contiguous():
+        if (
+            not activation.is_contiguous()
+            or not activation_scale.is_contiguous()
+            or not output.is_contiguous()
+        ):
             raise ValueError("MXFP8 linear operands must be contiguous")
         self.project(
             activation.data_ptr(),

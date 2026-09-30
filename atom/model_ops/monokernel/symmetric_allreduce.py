@@ -64,8 +64,14 @@ def build_symmetric_bf16_allreduce(
         slot = (step_value * LAYER_SLOTS + layer) & 1
         base = fx.Int64(region_base) + fx.Int64(slot) * fx.Int64(slot_bytes)
 
-        peer_words = fx.Vector(bo.buffer_load(rsrc(peers), fx.min(wave, npes - 1) * 2, vec_width=2, dtype=T.i32))
-        peer_base = (fx.Int64(uniform(peer_words[1])) << 32) | fx.Int64(fx.Uint32(uniform(peer_words[0])))
+        peer_words = fx.Vector(
+            bo.buffer_load(
+                rsrc(peers), fx.min(wave, npes - 1) * 2, vec_width=2, dtype=T.i32
+            )
+        )
+        peer_base = (fx.Int64(uniform(peer_words[1])) << 32) | fx.Int64(
+            fx.Uint32(uniform(peer_words[0]))
+        )
         source_rsrc = rsrc(source)
 
         if wave < npes:
@@ -73,7 +79,9 @@ def build_symmetric_bf16_allreduce(
             for batch in range_constexpr(THREADS // WAVE_SIZE):
                 pair = bid * THREADS + lane + batch * WAVE_SIZE
                 if pair < pairs:
-                    value = fx.Int32(bo.buffer_load(source_rsrc, pair, vec_width=1, dtype=T.i32))
+                    value = fx.Int32(
+                        bo.buffer_load(source_rsrc, pair, vec_width=1, dtype=T.i32)
+                    )
                     mailbox = rank * max_pairs + pair
                     bo.buffer_store(
                         fx.Vector.from_elements([value, tag], fx.Int32),
@@ -120,7 +128,11 @@ def build_symmetric_bf16_allreduce(
                 word = values[source_rank * 2]
                 sum_lo = sum_lo + (word << 16).bitcast(fx.Float32)
                 sum_hi = sum_hi + (word & fx.Int32(-65536)).bitcast(fx.Float32)
-            packed = fx.Vector.from_elements([sum_lo, sum_hi], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
+            packed = (
+                fx.Vector.from_elements([sum_lo, sum_hi], fx.Float32)
+                .to(fx.BFloat16)
+                .bitcast(fx.Int32)
+            )
             bo.buffer_store(packed[0], rsrc(output), pair, cache_modifier=CM_DEV)
 
     @flyc.jit
@@ -159,7 +171,9 @@ def build_symmetric_bf16_allreduce_rmsnorm(
     """Build a BF16 all-reduce that also RMS-normalizes each reduced row."""
 
     if numel <= 0 or numel % row_width or row_width % 2:
-        raise ValueError(f"numel={numel} must be a positive multiple of even row_width={row_width}")
+        raise ValueError(
+            f"numel={numel} must be a positive multiple of even row_width={row_width}"
+        )
     if npes not in {2, 4, 8}:
         raise ValueError(f"npes must be one of {{2, 4, 8}}, got {npes}")
     pairs = numel // 2
@@ -170,7 +184,9 @@ def build_symmetric_bf16_allreduce_rmsnorm(
     blocks_per_row = (pairs_per_row + THREADS - 1) // THREADS
     blocks = rows * blocks_per_row
     if blocks > 256:
-        raise ValueError(f"RMSNorm all-reduce requires a co-resident grid, got {blocks} blocks")
+        raise ValueError(
+            f"RMSNorm all-reduce requires a co-resident grid, got {blocks} blocks"
+        )
     slot_bytes = npes * max_pairs * 8
     region_base = region * 2 * slot_bytes
 
@@ -206,8 +222,12 @@ def build_symmetric_bf16_allreduce_rmsnorm(
         slot = (step_value * LAYER_SLOTS + layer) & 1
         base = fx.Int64(region_base) + fx.Int64(slot) * fx.Int64(slot_bytes)
 
-        peer_words = fx.Vector(bo.buffer_load(rsrc(peers), wave * 2, vec_width=2, dtype=T.i32))
-        peer_base = (fx.Int64(uniform(peer_words[1])) << 32) | fx.Int64(fx.Uint32(uniform(peer_words[0])))
+        peer_words = fx.Vector(
+            bo.buffer_load(rsrc(peers), wave * 2, vec_width=2, dtype=T.i32)
+        )
+        peer_base = (fx.Int64(uniform(peer_words[1])) << 32) | fx.Int64(
+            fx.Uint32(uniform(peer_words[0]))
+        )
         source_rsrc = rsrc(source)
 
         if wave < npes:
@@ -216,7 +236,9 @@ def build_symmetric_bf16_allreduce_rmsnorm(
                 send_pair_in_row = block_in_row * THREADS + lane + batch * WAVE_SIZE
                 if send_pair_in_row < pairs_per_row:
                     send_pair = sample * pairs_per_row + send_pair_in_row
-                    value = fx.Int32(bo.buffer_load(source_rsrc, send_pair, vec_width=1, dtype=T.i32))
+                    value = fx.Int32(
+                        bo.buffer_load(source_rsrc, send_pair, vec_width=1, dtype=T.i32)
+                    )
                     mailbox = rank * max_pairs + send_pair
                     bo.buffer_store(
                         fx.Vector.from_elements([value, tag], fx.Int32),
@@ -264,7 +286,11 @@ def build_symmetric_bf16_allreduce_rmsnorm(
                 word = values[source_rank * 2]
                 sum_lo = sum_lo + (word << 16).bitcast(fx.Float32)
                 sum_hi = sum_hi + (word & fx.Int32(-65536)).bitcast(fx.Float32)
-            packed = fx.Vector.from_elements([sum_lo, sum_hi], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0]
+            packed = (
+                fx.Vector.from_elements([sum_lo, sum_hi], fx.Float32)
+                .to(fx.BFloat16)
+                .bitcast(fx.Int32)[0]
+            )
             bo.buffer_store(packed, rsrc(reduced), pair, cache_modifier=CM_DEV)
             reduced_lo = (packed << 16).bitcast(fx.Float32)
             reduced_hi = (packed & fx.Int32(-65536)).bitcast(fx.Float32)
@@ -281,7 +307,9 @@ def build_symmetric_bf16_allreduce_rmsnorm(
             block_square_sum = block_square_sum + fx.ptr_load(reduction + source_wave)
         if tid == 0:
             bo.buffer_store(
-                fx.Vector.from_elements([block_square_sum.bitcast(fx.Int32), tag], fx.Int32),
+                fx.Vector.from_elements(
+                    [block_square_sum.bitcast(fx.Int32), tag], fx.Int32
+                ),
                 rsrc(norm_scratch),
                 bid * 2,
                 cache_modifier=CM_DEV,
@@ -314,18 +342,25 @@ def build_symmetric_bf16_allreduce_rmsnorm(
             total_square = total_square + fx.ptr_load(reduction + source_block)
         inverse_rms = rsq(total_square * (1.0 / row_width) + EPS)
         if valid:
-            gain_word = fx.Int32(bo.buffer_load(rsrc(gain), pair_in_row, vec_width=1, dtype=T.i32))
+            gain_word = fx.Int32(
+                bo.buffer_load(rsrc(gain), pair_in_row, vec_width=1, dtype=T.i32)
+            )
             gain_lo = (gain_word << 16).bitcast(fx.Float32)
             gain_hi = (gain_word & fx.Int32(-65536)).bitcast(fx.Float32)
             normalized_word = (
                 fx.Vector.from_elements(
-                    [reduced_lo * inverse_rms * gain_lo, reduced_hi * inverse_rms * gain_hi],
+                    [
+                        reduced_lo * inverse_rms * gain_lo,
+                        reduced_hi * inverse_rms * gain_hi,
+                    ],
                     fx.Float32,
                 )
                 .to(fx.BFloat16)
                 .bitcast(fx.Int32)[0]
             )
-            bo.buffer_store(normalized_word, rsrc(normalized), pair, cache_modifier=CM_DEV)
+            bo.buffer_store(
+                normalized_word, rsrc(normalized), pair, cache_modifier=CM_DEV
+            )
 
     @flyc.jit
     def launch(
@@ -355,7 +390,9 @@ def build_symmetric_bf16_allreduce_rmsnorm(
             value_attrs={"rocdl.flat_work_group_size": f"{THREADS},{THREADS}"},
         ).launch(grid=(blocks, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
-    launch.func.__name__ = f"symmetric_bf16_allreduce_rmsnorm_n{numel}_h{row_width}_w{npes}_r{region}"
+    launch.func.__name__ = (
+        f"symmetric_bf16_allreduce_rmsnorm_n{numel}_h{row_width}_w{npes}_r{region}"
+    )
     return launch, blocks
 
 
@@ -370,9 +407,13 @@ def build_symmetric_bf16_final_reduce(
     """Build ``shared + rank-local tail -> all-reduce -> residual`` in one launch."""
 
     if numel <= 0 or numel % 2 or numel % hidden:
-        raise ValueError(f"numel must be a positive even multiple of hidden={hidden}, got {numel}")
+        raise ValueError(
+            f"numel must be a positive even multiple of hidden={hidden}, got {numel}"
+        )
     if shard_width <= 0 or shard_width * npes != hidden:
-        raise ValueError(f"shard_width*npes must equal hidden, got {shard_width}*{npes} != {hidden}")
+        raise ValueError(
+            f"shard_width*npes must equal hidden, got {shard_width}*{npes} != {hidden}"
+        )
     pairs = numel // 2
     if pairs > max_pairs:
         raise ValueError(f"pairs={pairs} exceeds max_pairs={max_pairs}")
@@ -404,8 +445,14 @@ def build_symmetric_bf16_final_reduce(
         slot = (step_value * LAYER_SLOTS + layer) & 1
         base = fx.Int64(region_base) + fx.Int64(slot) * fx.Int64(slot_bytes)
 
-        peer_words = fx.Vector(bo.buffer_load(rsrc(peers), fx.min(wave, npes - 1) * 2, vec_width=2, dtype=T.i32))
-        peer_base = (fx.Int64(uniform(peer_words[1])) << 32) | fx.Int64(fx.Uint32(uniform(peer_words[0])))
+        peer_words = fx.Vector(
+            bo.buffer_load(
+                rsrc(peers), fx.min(wave, npes - 1) * 2, vec_width=2, dtype=T.i32
+            )
+        )
+        peer_base = (fx.Int64(uniform(peer_words[1])) << 32) | fx.Int64(
+            fx.Uint32(uniform(peer_words[0]))
+        )
         shared_rsrc = rsrc(shared_source)
         tail_rsrc = rsrc(tail)
         local_partial_rsrc = rsrc(local_partial)
@@ -419,23 +466,40 @@ def build_symmetric_bf16_final_reduce(
                     sample = element // hidden
                     column = element % hidden
                     local_start = rank * shard_width
-                    is_local = (column >= local_start) & (column < local_start + shard_width)
+                    is_local = (column >= local_start) & (
+                        column < local_start + shard_width
+                    )
                     tail_pair = (sample * shard_width + column - local_start) // 2
                     safe_tail_pair = is_local.select(tail_pair, fx.Int32(0))
 
-                    shared_word = fx.Int32(bo.buffer_load(shared_rsrc, pair, vec_width=1, dtype=T.i32))
-                    tail_word = fx.Int32(bo.buffer_load(tail_rsrc, safe_tail_pair, vec_width=1, dtype=T.i32))
+                    shared_word = fx.Int32(
+                        bo.buffer_load(shared_rsrc, pair, vec_width=1, dtype=T.i32)
+                    )
+                    tail_word = fx.Int32(
+                        bo.buffer_load(
+                            tail_rsrc, safe_tail_pair, vec_width=1, dtype=T.i32
+                        )
+                    )
                     shared_lo = (shared_word << 16).bitcast(fx.Float32)
                     shared_hi = (shared_word & fx.Int32(-65536)).bitcast(fx.Float32)
-                    tail_lo = is_local.select((tail_word << 16).bitcast(fx.Float32), fx.Float32(0.0))
-                    tail_hi = is_local.select((tail_word & fx.Int32(-65536)).bitcast(fx.Float32), fx.Float32(0.0))
+                    tail_lo = is_local.select(
+                        (tail_word << 16).bitcast(fx.Float32), fx.Float32(0.0)
+                    )
+                    tail_hi = is_local.select(
+                        (tail_word & fx.Int32(-65536)).bitcast(fx.Float32),
+                        fx.Float32(0.0),
+                    )
                     packed = (
-                        fx.Vector.from_elements([shared_lo + tail_lo, shared_hi + tail_hi], fx.Float32)
+                        fx.Vector.from_elements(
+                            [shared_lo + tail_lo, shared_hi + tail_hi], fx.Float32
+                        )
                         .to(fx.BFloat16)
                         .bitcast(fx.Int32)[0]
                     )
                     if wave == 0:
-                        bo.buffer_store(packed, local_partial_rsrc, pair, cache_modifier=CM_DEV)
+                        bo.buffer_store(
+                            packed, local_partial_rsrc, pair, cache_modifier=CM_DEV
+                        )
                     mailbox = rank * max_pairs + pair
                     bo.buffer_store(
                         fx.Vector.from_elements([packed, tag], fx.Int32),
@@ -483,16 +547,24 @@ def build_symmetric_bf16_final_reduce(
                 sum_lo = sum_lo + (word << 16).bitcast(fx.Float32)
                 sum_hi = sum_hi + (word & fx.Int32(-65536)).bitcast(fx.Float32)
 
-            reduced_word = fx.Vector.from_elements([sum_lo, sum_hi], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0]
+            reduced_word = (
+                fx.Vector.from_elements([sum_lo, sum_hi], fx.Float32)
+                .to(fx.BFloat16)
+                .bitcast(fx.Int32)[0]
+            )
             bo.buffer_store(reduced_word, rsrc(reduced), pair, cache_modifier=CM_DEV)
             reduced_lo = (reduced_word << 16).bitcast(fx.Float32)
             reduced_hi = (reduced_word & fx.Int32(-65536)).bitcast(fx.Float32)
 
-            residual_word = fx.Int32(bo.buffer_load(rsrc(residual), pair, vec_width=1, dtype=T.i32))
+            residual_word = fx.Int32(
+                bo.buffer_load(rsrc(residual), pair, vec_width=1, dtype=T.i32)
+            )
             residual_lo = (residual_word << 16).bitcast(fx.Float32)
             residual_hi = (residual_word & fx.Int32(-65536)).bitcast(fx.Float32)
             output_word = (
-                fx.Vector.from_elements([residual_lo + reduced_lo, residual_hi + reduced_hi], fx.Float32)
+                fx.Vector.from_elements(
+                    [residual_lo + reduced_lo, residual_hi + reduced_hi], fx.Float32
+                )
                 .to(fx.BFloat16)
                 .bitcast(fx.Int32)[0]
             )
@@ -548,20 +620,27 @@ class SymmetricBf16Allreduce:
     ) -> None:
         nbytes = symmetric_allreduce_nbytes(sizes, npes)
         self.max_pairs = max(sizes) // 2
-        self.peer_buffer = SymmetricPeerBuffer(nbytes, rank=rank, npes=npes, group=group)
+        self.peer_buffer = SymmetricPeerBuffer(
+            nbytes, rank=rank, npes=npes, group=group
+        )
         self.launches = tuple(
-            build_symmetric_bf16_allreduce(size, npes, self.max_pairs, region) for region, size in enumerate(sizes)
+            build_symmetric_bf16_allreduce(size, npes, self.max_pairs, region)
+            for region, size in enumerate(sizes)
         )
         self.final_launch = None
         self.rmsnorm_launch = None
         self.rmsnorm_scratch = None
         if rmsnorm_width is not None:
-            self.rmsnorm_launch, rmsnorm_blocks = build_symmetric_bf16_allreduce_rmsnorm(
-                sizes[0], rmsnorm_width, npes, self.max_pairs, 0
+            self.rmsnorm_launch, rmsnorm_blocks = (
+                build_symmetric_bf16_allreduce_rmsnorm(
+                    sizes[0], rmsnorm_width, npes, self.max_pairs, 0
+                )
             )
             # The fused Kimi tail reuses the first 2*blocks words for tagged
             # row sums and the final blocks words for completion tags.
-            self.rmsnorm_scratch = torch.zeros(rmsnorm_blocks * 3, dtype=torch.int32, device="cuda")
+            self.rmsnorm_scratch = torch.zeros(
+                rmsnorm_blocks * 3, dtype=torch.int32, device="cuda"
+            )
         if final_hidden is not None and final_shard_width is not None:
             self.final_launch = build_symmetric_bf16_final_reduce(
                 sizes[-1],
@@ -587,7 +666,10 @@ class SymmetricBf16Allreduce:
         if self.rmsnorm_launch is None or self.rmsnorm_scratch is None:
             raise ValueError("fused RMSNorm reduction was not configured")
         tensors = (source, reduced, gain, normalized)
-        if any(tensor.dtype != torch.bfloat16 or not tensor.is_contiguous() for tensor in tensors):
+        if any(
+            tensor.dtype != torch.bfloat16 or not tensor.is_contiguous()
+            for tensor in tensors
+        ):
             raise ValueError("fused RMSNorm reduction requires contiguous BF16 tensors")
         if source.shape != reduced.shape or source.shape != normalized.shape:
             raise ValueError("source, reduced, and normalized shapes must match")
@@ -657,7 +739,11 @@ class SymmetricBf16Allreduce:
             raise ValueError("fused final reduction requires BF16 tensors")
         if any(not tensor.is_contiguous() for tensor in tensors):
             raise ValueError("fused final reduction requires contiguous tensors")
-        if shared_source.shape != residual.shape or reduced.shape != residual.shape or output.shape != residual.shape:
+        if (
+            shared_source.shape != residual.shape
+            or reduced.shape != residual.shape
+            or output.shape != residual.shape
+        ):
             raise ValueError("shared, residual, reduced, and output shapes must match")
         if tail.numel() * self.peer_buffer.npes != shared_source.numel():
             raise ValueError("tail must contain one rank-local hidden shard")

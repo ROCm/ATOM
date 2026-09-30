@@ -222,7 +222,9 @@ def build_kimi_k3_monokernel(
     if npes != 8:
         raise ValueError(f"Kimi-K3 MonoKernel requires TP8, got TP{npes}")
     if not isinstance(conv_state_layout, ConvStateLayout):
-        raise TypeError(f"conv_state_layout must be ConvStateLayout, got {conv_state_layout!r}")
+        raise TypeError(
+            f"conv_state_layout must be ConvStateLayout, got {conv_state_layout!r}"
+        )
     if conv_state_rows < _CONV_STATE_LENGTH or (mtp and conv_state_rows < samples + 2):
         raise ValueError(
             f"conv_state_rows={conv_state_rows} cannot hold q={samples} rollback history"
@@ -232,7 +234,9 @@ def build_kimi_k3_monokernel(
     state_item_bytes = 2 if state_dtype == "fp16" else 4
     state_slot_bytes = _STATE_SLOT_ELEMENTS * state_item_bytes
     if not 1 <= launches_per_step <= MAX_LAYERS_PER_STEP:
-        raise ValueError(f"launches_per_step must be in [1, {MAX_LAYERS_PER_STEP}], got {launches_per_step}")
+        raise ValueError(
+            f"launches_per_step must be in [1, {MAX_LAYERS_PER_STEP}], got {launches_per_step}"
+        )
     fuse_attn_res = attn_res_blocks >= 0
     if fuse_moe and not fuse_attn_res:
         raise ValueError("the KDA + MoE MonoKernel requires fused AttnRes")
@@ -250,8 +254,12 @@ def build_kimi_k3_monokernel(
     mtp_k_iters = _HEAD_DIM // mtp_k_tile
     staged_samples = min(samples, 4)
     sample_groups = (samples + staged_samples - 1) // staged_samples
-    output_staged_samples = min(staged_samples, 2) if mtp and samples <= 4 else staged_samples
-    output_sample_groups = (samples + output_staged_samples - 1) // output_staged_samples
+    output_staged_samples = (
+        min(staged_samples, 2) if mtp and samples <= 4 else staged_samples
+    )
+    output_sample_groups = (
+        samples + output_staged_samples - 1
+    ) // output_staged_samples
     input_row_groups = 2 if samples <= 4 else _INPUT_ROW_GROUPS
     input_split_waves = _WAVES // input_row_groups
     input_row_tile = input_row_groups * 16
@@ -259,15 +267,23 @@ def build_kimi_k3_monokernel(
 
     pre_mailbox_offset = 0
     pre_ready_offset = samples * _HIDDEN * 2 if fuse_attn_res else 0
-    moe_mailbox_offset = pre_ready_offset + samples * _ATTN_RES_CTAS * 8 if fuse_attn_res else 0
-    moe_ready_offset = moe_mailbox_offset + samples * _HIDDEN * 2 if fuse_attn_res else 0
-    input_mailbox_offset = moe_ready_offset + samples * _ATTN_RES_CTAS * 8 if fuse_attn_res else 0
+    moe_mailbox_offset = (
+        pre_ready_offset + samples * _ATTN_RES_CTAS * 8 if fuse_attn_res else 0
+    )
+    moe_ready_offset = (
+        moe_mailbox_offset + samples * _HIDDEN * 2 if fuse_attn_res else 0
+    )
+    input_mailbox_offset = (
+        moe_ready_offset + samples * _ATTN_RES_CTAS * 8 if fuse_attn_res else 0
+    )
     norm_mailbox_offset = input_mailbox_offset + samples * _FUSED_PAD * 4
     norm_packed_offset = norm_mailbox_offset + samples * _PROJECTION * (4 if mtp else 2)
     norm_ready_offset = norm_packed_offset + (samples * _PROJECTION * 2 if mtp else 0)
     attention_mailbox_offset = norm_ready_offset + samples * _HEADS * 8
     pre_stats_offset = attention_mailbox_offset + samples * _HIDDEN * 4
-    post_stats_offset = pre_stats_offset + samples * _ATTN_RES_CTAS * _ATTN_RES_STATS * 8
+    post_stats_offset = (
+        pre_stats_offset + samples * _ATTN_RES_CTAS * _ATTN_RES_STATS * 8
+    )
     moe_base = post_stats_offset + samples * _ATTN_RES_CTAS * _ATTN_RES_STATS * 8
     router_offset = moe_base
     router_ready_offset = router_offset + samples * _N_EXPERTS * 4
@@ -275,7 +291,9 @@ def build_kimi_k3_monokernel(
     latent_ready_offset = latent_offset + samples * _ROUTED_HIDDEN * 2
     shared_gu_offset = latent_ready_offset + samples * (_ROUTED_HIDDEN // 16) * 8
     shared_gu_ready_offset = shared_gu_offset + samples * (2 * _SHARED_INTER) * 2
-    shared_mid_offset = shared_gu_ready_offset + samples * ((2 * _SHARED_INTER) // 16) * 8
+    shared_mid_offset = (
+        shared_gu_ready_offset + samples * ((2 * _SHARED_INTER) // 16) * 8
+    )
     selection_id_offset = shared_mid_offset + samples * _SHARED_INTER * 4
     selection_weight_offset = selection_id_offset + samples * _TOP_K * 8
     expert_mid_offset = selection_weight_offset + samples * _TOP_K * 8
@@ -457,13 +475,19 @@ def build_kimi_k3_monokernel(
 
         def stamp(index):
             if (bid == 0) & (tid == 0):
-                now = fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
+                now = fx.Int64(
+                    llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], [])
+                )
                 bo.buffer_store(now, rsrc(timeline), index, cache_modifier=CM_DEV)
 
         stamp(0)
 
         def bf16_pair(a, b):
-            return fx.Vector.from_elements([a, b], fx.Float32).to(fx.BFloat16).bitcast(fx.Float32)[0]
+            return (
+                fx.Vector.from_elements([a, b], fx.Float32)
+                .to(fx.BFloat16)
+                .bitcast(fx.Float32)[0]
+            )
 
         def bf16_round(value):
             return fx.Float32(fx.Float32(value).to(fx.BFloat16))
@@ -552,7 +576,9 @@ def build_kimi_k3_monokernel(
 
         def store_f32(mailbox_rsrc, index, value):
             bo.buffer_store(
-                fx.Vector.from_elements([fx.Float32(value).bitcast(fx.Int32), tag], fx.Int32),
+                fx.Vector.from_elements(
+                    [fx.Float32(value).bitcast(fx.Int32), tag], fx.Int32
+                ),
                 mailbox_rsrc,
                 index * 2,
                 cache_modifier=CM_DEV,
@@ -693,7 +719,9 @@ def build_kimi_k3_monokernel(
                             )
                         )
                     prefix_low = prefix_low + (delta_word << 16).bitcast(fx.Float32)
-                    prefix_high = prefix_high + (delta_word & fx.Int32(-65536)).bitcast(fx.Float32)
+                    prefix_high = prefix_high + (delta_word & fx.Int32(-65536)).bitcast(
+                        fx.Float32
+                    )
                 return (
                     fx.Float32(prefix_low.to(fx.BFloat16)),
                     fx.Float32(prefix_high.to(fx.BFloat16)),
@@ -711,7 +739,9 @@ def build_kimi_k3_monokernel(
                     sample * (_HIDDEN // 2) + pair_in_row,
                 )
                 if const_expr(write_block >= 0):
-                    block_pair = (sample * block_stride + write_block) * (_HIDDEN // 2) + pair_in_row
+                    block_pair = (sample * block_stride + write_block) * (
+                        _HIDDEN // 2
+                    ) + pair_in_row
                     bo.buffer_store(updated_word, blocks_rsrc, block_pair)
 
             logits = []
@@ -721,22 +751,42 @@ def build_kimi_k3_monokernel(
                 for pair_round in range_constexpr(pair_rounds):
                     pair_in_row = tid + pair_round * _THREADS
                     if const_expr(source < num_blocks):
-                        block_pair = (sample * block_stride + source) * (_HIDDEN // 2) + pair_in_row
-                        source_word = fx.Int32(bo.buffer_load(blocks_rsrc, block_pair, vec_width=1, dtype=T.i32))
+                        block_pair = (sample * block_stride + source) * (
+                            _HIDDEN // 2
+                        ) + pair_in_row
+                        source_word = fx.Int32(
+                            bo.buffer_load(
+                                blocks_rsrc, block_pair, vec_width=1, dtype=T.i32
+                            )
+                        )
                         value_low = (source_word << 16).bitcast(fx.Float32)
-                        value_high = (source_word & fx.Int32(-65536)).bitcast(fx.Float32)
+                        value_high = (source_word & fx.Int32(-65536)).bitcast(
+                            fx.Float32
+                        )
                     else:
                         value_low, value_high = updated_pairs[pair_round]
-                    norm_word = fx.Int32(bo.buffer_load(norm_rsrc, pair_in_row, vec_width=1, dtype=T.i32))
-                    qk_word = fx.Int32(bo.buffer_load(qk_rsrc, pair_in_row, vec_width=1, dtype=T.i32))
+                    norm_word = fx.Int32(
+                        bo.buffer_load(norm_rsrc, pair_in_row, vec_width=1, dtype=T.i32)
+                    )
+                    qk_word = fx.Int32(
+                        bo.buffer_load(qk_rsrc, pair_in_row, vec_width=1, dtype=T.i32)
+                    )
                     norm_low = (norm_word << 16).bitcast(fx.Float32)
                     norm_high = (norm_word & fx.Int32(-65536)).bitcast(fx.Float32)
                     qk_low = (qk_word << 16).bitcast(fx.Float32)
                     qk_high = (qk_word & fx.Int32(-65536)).bitcast(fx.Float32)
-                    square_sum = square_sum + value_low * value_low + value_high * value_high
-                    weighted_sum = weighted_sum + value_low * norm_low * qk_low + value_high * norm_high * qk_high
+                    square_sum = (
+                        square_sum + value_low * value_low + value_high * value_high
+                    )
+                    weighted_sum = (
+                        weighted_sum
+                        + value_low * norm_low * qk_low
+                        + value_high * norm_high * qk_high
+                    )
                 total_square, total_weighted = block_sums(square_sum, weighted_sum)
-                logits.append(total_weighted * rsq(total_square * (1.0 / _HIDDEN) + EPS))
+                logits.append(
+                    total_weighted * rsq(total_square * (1.0 / _HIDDEN) + EPS)
+                )
 
             max_logit = logits[0]
             for source in range_constexpr(1, num_sources):
@@ -746,7 +796,9 @@ def build_kimi_k3_monokernel(
             for source in range_constexpr(1, num_sources):
                 probability_sum = probability_sum + probabilities[source]
             inverse_probability_sum = rcp(probability_sum)
-            probabilities = [probability * inverse_probability_sum for probability in probabilities]
+            probabilities = [
+                probability * inverse_probability_sum for probability in probabilities
+            ]
 
             mixed_pairs = []
             mixed_square_sum = fx.Float32(0.0)
@@ -756,24 +808,40 @@ def build_kimi_k3_monokernel(
                 mixed_high = fx.Float32(0.0)
                 for source in range_constexpr(num_sources):
                     if const_expr(source < num_blocks):
-                        block_pair = (sample * block_stride + source) * (_HIDDEN // 2) + pair_in_row
-                        source_word = fx.Int32(bo.buffer_load(blocks_rsrc, block_pair, vec_width=1, dtype=T.i32))
+                        block_pair = (sample * block_stride + source) * (
+                            _HIDDEN // 2
+                        ) + pair_in_row
+                        source_word = fx.Int32(
+                            bo.buffer_load(
+                                blocks_rsrc, block_pair, vec_width=1, dtype=T.i32
+                            )
+                        )
                         value_low = (source_word << 16).bitcast(fx.Float32)
-                        value_high = (source_word & fx.Int32(-65536)).bitcast(fx.Float32)
+                        value_high = (source_word & fx.Int32(-65536)).bitcast(
+                            fx.Float32
+                        )
                     else:
                         value_low, value_high = updated_pairs[pair_round]
                     mixed_low = mixed_low + probabilities[source] * value_low
                     mixed_high = mixed_high + probabilities[source] * value_high
                 mixed_pairs.append((mixed_low, mixed_high))
-                mixed_square_sum = mixed_square_sum + mixed_low * mixed_low + mixed_high * mixed_high
+                mixed_square_sum = (
+                    mixed_square_sum + mixed_low * mixed_low + mixed_high * mixed_high
+                )
 
             total_mixed_square = block_sum(mixed_square_sum)
             output_inverse_rms = rsq(total_mixed_square * (1.0 / _HIDDEN) + EPS)
             for pair_round in range_constexpr(pair_rounds):
                 pair_in_row = tid + pair_round * _THREADS
-                output_weight_word = fx.Int32(bo.buffer_load(output_norm_rsrc, pair_in_row, vec_width=1, dtype=T.i32))
+                output_weight_word = fx.Int32(
+                    bo.buffer_load(
+                        output_norm_rsrc, pair_in_row, vec_width=1, dtype=T.i32
+                    )
+                )
                 weight_low = (output_weight_word << 16).bitcast(fx.Float32)
-                weight_high = (output_weight_word & fx.Int32(-65536)).bitcast(fx.Float32)
+                weight_high = (output_weight_word & fx.Int32(-65536)).bitcast(
+                    fx.Float32
+                )
                 mixed_low, mixed_high = mixed_pairs[pair_round]
                 value_low = mixed_low * output_inverse_rms * weight_low
                 value_high = mixed_high * output_inverse_rms * weight_high
@@ -784,7 +852,9 @@ def build_kimi_k3_monokernel(
 
                 if const_expr(quantize):
                     rounded = (
-                        fx.Vector.from_elements([value_low, value_high], fx.Float32).to(fx.BFloat16).to(fx.Float32)
+                        fx.Vector.from_elements([value_low, value_high], fx.Float32)
+                        .to(fx.BFloat16)
+                        .to(fx.Float32)
                     )
                     absolute_max = fx.max(
                         fx.max(rounded[0], -rounded[0]),
@@ -796,7 +866,9 @@ def build_kimi_k3_monokernel(
                     bits = raw_scale.bitcast(fx.Int32)
                     exponent = bits.shrui(fx.Int32(23)) & fx.Int32(0xFF)
                     round_up = ((bits & fx.Int32(0x400000)) != 0) & (
-                        ((bits & fx.Int32(0x200000)) != 0) | ((bits & fx.Int32(0x1FFFFF)) != 0) | (exponent > 0)
+                        ((bits & fx.Int32(0x200000)) != 0)
+                        | ((bits & fx.Int32(0x1FFFFF)) != 0)
+                        | (exponent > 0)
                     )
                     exponent = exponent + round_up.select(fx.Int32(1), fx.Int32(0))
                     nonzero = absolute_max > fx.Float32(0.0)
@@ -807,9 +879,9 @@ def build_kimi_k3_monokernel(
                     inverse = nonzero.select(rcp(scale), fx.Float32(1.0))
                     q_low = fx.min(fx.max(rounded[0] * inverse, -FP8_MAX), FP8_MAX)
                     q_high = fx.min(fx.max(rounded[1] * inverse, -FP8_MAX), FP8_MAX)
-                    packed_fp8 = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q_low, q_high, fx.Int32(0), False)) & fx.Int32(
-                        0xFFFF
-                    )
+                    packed_fp8 = fx.Int32(
+                        rocdl.cvt_pk_fp8_f32(T.i32, q_low, q_high, fx.Int32(0), False)
+                    ) & fx.Int32(0xFFFF)
                     neighbor = xshfl(packed_fp8, 1)
                     if lane % 2 == 0:
                         bo.buffer_store(
@@ -874,16 +946,22 @@ def build_kimi_k3_monokernel(
                 if const_expr(tagged_prefix):
                     prefix_word = load_pair(attention_mailbox_rsrc, pair)
                 else:
-                    prefix_word = fx.Int32(bo.buffer_load(prefix_rsrc, pair, vec_width=1, dtype=T.i32))
+                    prefix_word = fx.Int32(
+                        bo.buffer_load(prefix_rsrc, pair, vec_width=1, dtype=T.i32)
+                    )
                 prefix_low = (prefix_word << 16).bitcast(fx.Float32)
                 prefix_high = (prefix_word & fx.Int32(-65536)).bitcast(fx.Float32)
                 if const_expr(has_delta):
                     if const_expr(tagged_delta):
                         delta_word = load_pair(attention_mailbox_rsrc, pair)
                     else:
-                        delta_word = fx.Int32(bo.buffer_load(delta_rsrc, pair, vec_width=1, dtype=T.i32))
+                        delta_word = fx.Int32(
+                            bo.buffer_load(delta_rsrc, pair, vec_width=1, dtype=T.i32)
+                        )
                     prefix_low = prefix_low + (delta_word << 16).bitcast(fx.Float32)
-                    prefix_high = prefix_high + (delta_word & fx.Int32(-65536)).bitcast(fx.Float32)
+                    prefix_high = prefix_high + (delta_word & fx.Int32(-65536)).bitcast(
+                        fx.Float32
+                    )
                 return (
                     fx.Float32(prefix_low.to(fx.BFloat16)),
                     fx.Float32(prefix_high.to(fx.BFloat16)),
@@ -897,11 +975,15 @@ def build_kimi_k3_monokernel(
                 updated_low, updated_high = load_updated(pair_in_row)
                 updated_pairs.append((updated_low, updated_high))
                 if valid:
-                    updated_word = bf16_pair(updated_low, updated_high).bitcast(fx.Int32)
+                    updated_word = bf16_pair(updated_low, updated_high).bitcast(
+                        fx.Int32
+                    )
                     pair = sample * (_HIDDEN // 2) + pair_in_row
                     bo.buffer_store(updated_word, updated_rsrc, pair)
                     if const_expr(write_block >= 0):
-                        block_pair = (sample * block_stride + write_block) * (_HIDDEN // 2) + pair_in_row
+                        block_pair = (sample * block_stride + write_block) * (
+                            _HIDDEN // 2
+                        ) + pair_in_row
                         bo.buffer_store(updated_word, blocks_rsrc, block_pair)
 
             for source in range_constexpr(num_sources):
@@ -912,14 +994,26 @@ def build_kimi_k3_monokernel(
                     valid = local_pair < pairs_per_chunk
                     pair_in_row = fx.min(pair_begin + local_pair, _HIDDEN // 2 - 1)
                     if const_expr(source < num_blocks):
-                        block_pair = (sample * block_stride + source) * (_HIDDEN // 2) + pair_in_row
-                        source_word = fx.Int32(bo.buffer_load(blocks_rsrc, block_pair, vec_width=1, dtype=T.i32))
+                        block_pair = (sample * block_stride + source) * (
+                            _HIDDEN // 2
+                        ) + pair_in_row
+                        source_word = fx.Int32(
+                            bo.buffer_load(
+                                blocks_rsrc, block_pair, vec_width=1, dtype=T.i32
+                            )
+                        )
                         value_low = (source_word << 16).bitcast(fx.Float32)
-                        value_high = (source_word & fx.Int32(-65536)).bitcast(fx.Float32)
+                        value_high = (source_word & fx.Int32(-65536)).bitcast(
+                            fx.Float32
+                        )
                     else:
                         value_low, value_high = updated_pairs[pair_round]
-                    norm_word = fx.Int32(bo.buffer_load(norm_rsrc, pair_in_row, vec_width=1, dtype=T.i32))
-                    qk_word = fx.Int32(bo.buffer_load(qk_rsrc, pair_in_row, vec_width=1, dtype=T.i32))
+                    norm_word = fx.Int32(
+                        bo.buffer_load(norm_rsrc, pair_in_row, vec_width=1, dtype=T.i32)
+                    )
+                    qk_word = fx.Int32(
+                        bo.buffer_load(qk_rsrc, pair_in_row, vec_width=1, dtype=T.i32)
+                    )
                     norm_low = (norm_word << 16).bitcast(fx.Float32)
                     norm_high = (norm_word & fx.Int32(-65536)).bitcast(fx.Float32)
                     qk_low = (qk_word << 16).bitcast(fx.Float32)
@@ -929,7 +1023,8 @@ def build_kimi_k3_monokernel(
                         fx.Float32(0.0),
                     )
                     weighted_sum = weighted_sum + valid.select(
-                        value_low * norm_low * qk_low + value_high * norm_high * qk_high,
+                        value_low * norm_low * qk_low
+                        + value_high * norm_high * qk_high,
                         fx.Float32(0.0),
                     )
                 total_square, total_weighted = block_sums(square_sum, weighted_sum)
@@ -943,10 +1038,18 @@ def build_kimi_k3_monokernel(
                     total_square = fx.Float32(0.0)
                     total_weighted = fx.Float32(0.0)
                     for source_chunk in range_constexpr(_ATTN_RES_CTAS):
-                        source_base = (sample * _ATTN_RES_CTAS + source_chunk) * _ATTN_RES_STATS
-                        total_square = total_square + load_f32(stats_rsrc, source_base + source * 2)
-                        total_weighted = total_weighted + load_f32(stats_rsrc, source_base + source * 2 + 1)
-                    logits.append(total_weighted * rsq(total_square * (1.0 / _HIDDEN) + EPS))
+                        source_base = (
+                            sample * _ATTN_RES_CTAS + source_chunk
+                        ) * _ATTN_RES_STATS
+                        total_square = total_square + load_f32(
+                            stats_rsrc, source_base + source * 2
+                        )
+                        total_weighted = total_weighted + load_f32(
+                            stats_rsrc, source_base + source * 2 + 1
+                        )
+                    logits.append(
+                        total_weighted * rsq(total_square * (1.0 / _HIDDEN) + EPS)
+                    )
                 max_logit = logits[0]
                 for source in range_constexpr(1, num_sources):
                     max_logit = fx.max(max_logit, logits[source])
@@ -973,10 +1076,18 @@ def build_kimi_k3_monokernel(
                 mixed_high = fx.Float32(0.0)
                 for source in range_constexpr(num_sources):
                     if const_expr(source < num_blocks):
-                        block_pair = (sample * block_stride + source) * (_HIDDEN // 2) + pair_in_row
-                        source_word = fx.Int32(bo.buffer_load(blocks_rsrc, block_pair, vec_width=1, dtype=T.i32))
+                        block_pair = (sample * block_stride + source) * (
+                            _HIDDEN // 2
+                        ) + pair_in_row
+                        source_word = fx.Int32(
+                            bo.buffer_load(
+                                blocks_rsrc, block_pair, vec_width=1, dtype=T.i32
+                            )
+                        )
                         value_low = (source_word << 16).bitcast(fx.Float32)
-                        value_high = (source_word & fx.Int32(-65536)).bitcast(fx.Float32)
+                        value_high = (source_word & fx.Int32(-65536)).bitcast(
+                            fx.Float32
+                        )
                     else:
                         value_low, value_high = updated_pairs[pair_round]
                     probability = lds_load(attn_values, source)
@@ -993,9 +1104,15 @@ def build_kimi_k3_monokernel(
                 store_f32(stats_rsrc, stats_base + 2 * num_sources, total_mixed_square)
                 full_square = fx.Float32(0.0)
                 for source_chunk in range_constexpr(_ATTN_RES_CTAS):
-                    source_base = (sample * _ATTN_RES_CTAS + source_chunk) * _ATTN_RES_STATS
-                    full_square = full_square + load_f32(stats_rsrc, source_base + 2 * num_sources)
-                lds_store(attn_values, num_sources, rsq(full_square * (1.0 / _HIDDEN) + EPS))
+                    source_base = (
+                        sample * _ATTN_RES_CTAS + source_chunk
+                    ) * _ATTN_RES_STATS
+                    full_square = full_square + load_f32(
+                        stats_rsrc, source_base + 2 * num_sources
+                    )
+                lds_store(
+                    attn_values, num_sources, rsq(full_square * (1.0 / _HIDDEN) + EPS)
+                )
             gpu.barrier()
             output_inverse_rms = lds_load(attn_values, num_sources)
 
@@ -1004,10 +1121,14 @@ def build_kimi_k3_monokernel(
                 if local_pair < pairs_per_chunk:
                     pair_in_row = pair_begin + local_pair
                     output_weight_word = fx.Int32(
-                        bo.buffer_load(output_norm_rsrc, pair_in_row, vec_width=1, dtype=T.i32)
+                        bo.buffer_load(
+                            output_norm_rsrc, pair_in_row, vec_width=1, dtype=T.i32
+                        )
                     )
                     weight_low = (output_weight_word << 16).bitcast(fx.Float32)
-                    weight_high = (output_weight_word & fx.Int32(-65536)).bitcast(fx.Float32)
+                    weight_high = (output_weight_word & fx.Int32(-65536)).bitcast(
+                        fx.Float32
+                    )
                     mixed_low, mixed_high = mixed_pairs[pair_round]
                     value_low = mixed_low * output_inverse_rms * weight_low
                     value_high = mixed_high * output_inverse_rms * weight_high
@@ -1021,7 +1142,9 @@ def build_kimi_k3_monokernel(
 
                     if const_expr(quantize):
                         rounded = (
-                            fx.Vector.from_elements([value_low, value_high], fx.Float32).to(fx.BFloat16).to(fx.Float32)
+                            fx.Vector.from_elements([value_low, value_high], fx.Float32)
+                            .to(fx.BFloat16)
+                            .to(fx.Float32)
                         )
                         absolute_max = fx.max(
                             fx.max(rounded[0], -rounded[0]),
@@ -1033,7 +1156,9 @@ def build_kimi_k3_monokernel(
                         bits = raw_scale.bitcast(fx.Int32)
                         exponent = bits.shrui(fx.Int32(23)) & fx.Int32(0xFF)
                         round_up = ((bits & fx.Int32(0x400000)) != 0) & (
-                            ((bits & fx.Int32(0x200000)) != 0) | ((bits & fx.Int32(0x1FFFFF)) != 0) | (exponent > 0)
+                            ((bits & fx.Int32(0x200000)) != 0)
+                            | ((bits & fx.Int32(0x1FFFFF)) != 0)
+                            | (exponent > 0)
                         )
                         exponent = exponent + round_up.select(fx.Int32(1), fx.Int32(0))
                         nonzero = absolute_max > fx.Float32(0.0)
@@ -1045,7 +1170,9 @@ def build_kimi_k3_monokernel(
                         q_low = fx.min(fx.max(rounded[0] * inverse, -FP8_MAX), FP8_MAX)
                         q_high = fx.min(fx.max(rounded[1] * inverse, -FP8_MAX), FP8_MAX)
                         packed_fp8 = fx.Int32(
-                            rocdl.cvt_pk_fp8_f32(T.i32, q_low, q_high, fx.Int32(0), False)
+                            rocdl.cvt_pk_fp8_f32(
+                                T.i32, q_low, q_high, fx.Int32(0), False
+                            )
                         ) & fx.Int32(0xFFFF)
                         neighbor = xshfl(packed_fp8, 1)
                         if lane % 2 == 0:
@@ -1082,7 +1209,9 @@ def build_kimi_k3_monokernel(
 
         def wait_attn_res_chunks(ready_rsrc, sample_base, sample_count):
             ready_count = sample_count * _ATTN_RES_CTAS
-            for ready_round in range_constexpr((ready_count + _THREADS - 1) // _THREADS):
+            for ready_round in range_constexpr(
+                (ready_count + _THREADS - 1) // _THREADS
+            ):
                 ready = tid + ready_round * _THREADS
                 if ready < ready_count:
                     local_sample = ready // _ATTN_RES_CTAS
@@ -1102,11 +1231,17 @@ def build_kimi_k3_monokernel(
                 if pair < pairs:
                     local_sample = pair // (_HIDDEN // 2)
                     pair_in_sample = pair % (_HIDDEN // 2)
-                    global_pair = (sample_base + local_sample) * (_HIDDEN // 2) + pair_in_sample
+                    global_pair = (sample_base + local_sample) * (
+                        _HIDDEN // 2
+                    ) + pair_in_sample
                     if const_expr(fuse_attn_res):
                         word = load_raw_pair(pre_mailbox_rsrc, global_pair)
                     else:
-                        word = fx.Int32(bo.buffer_load(hidden_rsrc, global_pair, vec_width=1, dtype=T.i32))
+                        word = fx.Int32(
+                            bo.buffer_load(
+                                hidden_rsrc, global_pair, vec_width=1, dtype=T.i32
+                            )
+                        )
                     lds_store(x, pair, word.bitcast(fx.Float32))
 
         def stage_moe_hidden(sample_base, sample_count):
@@ -1117,7 +1252,9 @@ def build_kimi_k3_monokernel(
                 if pair < pairs:
                     local_sample = pair // (_HIDDEN // 2)
                     pair_in_sample = pair % (_HIDDEN // 2)
-                    global_pair = (sample_base + local_sample) * (_HIDDEN // 2) + pair_in_sample
+                    global_pair = (sample_base + local_sample) * (
+                        _HIDDEN // 2
+                    ) + pair_in_sample
                     word = load_raw_pair(moe_mailbox_rsrc, global_pair)
                     lds_store(x, pair, word.bitcast(fx.Float32))
 
@@ -1129,7 +1266,9 @@ def build_kimi_k3_monokernel(
                 if word < words:
                     local_sample = word // (_HIDDEN // 4)
                     word_in_sample = word % (_HIDDEN // 4)
-                    global_word = (sample_base + local_sample) * (_HIDDEN // 4) + word_in_sample
+                    global_word = (sample_base + local_sample) * (
+                        _HIDDEN // 4
+                    ) + word_in_sample
                     packed = fx.Int32(
                         bo.buffer_load(
                             quantized_moe_rsrc,
@@ -1143,7 +1282,9 @@ def build_kimi_k3_monokernel(
 
         def stage_norm(sample_base, sample_count):
             ready_count = sample_count * _HEADS
-            for ready_round in range_constexpr((ready_count + _THREADS - 1) // _THREADS):
+            for ready_round in range_constexpr(
+                (ready_count + _THREADS - 1) // _THREADS
+            ):
                 ready = tid + ready_round * _THREADS
                 if ready < ready_count:
                     if const_expr(mtp):
@@ -1167,7 +1308,9 @@ def build_kimi_k3_monokernel(
                 if pair < pairs:
                     local_sample = pair // (_PROJECTION // 2)
                     pair_in_sample = pair % (_PROJECTION // 2)
-                    global_pair = (sample_base + local_sample) * (_PROJECTION // 2) + pair_in_sample
+                    global_pair = (sample_base + local_sample) * (
+                        _PROJECTION // 2
+                    ) + pair_in_sample
                     if const_expr(mtp):
                         packed = load_raw_pair(norm_packed_rsrc, global_pair)
                     else:
@@ -1197,7 +1340,12 @@ def build_kimi_k3_monokernel(
                         fx.Vector(
                             bo.buffer_load(
                                 weight_rsrc,
-                                (((row_group * chunks + chunk) * 2 + step_index) * _WAVE_SIZE + lane) * 4,
+                                (
+                                    ((row_group * chunks + chunk) * 2 + step_index)
+                                    * _WAVE_SIZE
+                                    + lane
+                                )
+                                * 4,
                                 vec_width=4,
                                 dtype=T.i32,
                             )
@@ -1206,14 +1354,20 @@ def build_kimi_k3_monokernel(
                     ]
 
                 starts = list(range(0, chunks_per_wave, batch_size))
-                current = [load_unit(chunk) for chunk in range(0, min(batch_size, chunks_per_wave))]
+                current = [
+                    load_unit(chunk)
+                    for chunk in range(0, min(batch_size, chunks_per_wave))
+                ]
                 for batch_index in range_constexpr(len(starts)):
                     following = None
                     if const_expr(batch_index + 1 < len(starts)):
                         next_start = starts[batch_index + 1]
                         following = [
                             load_unit(chunk)
-                            for chunk in range(next_start, min(next_start + batch_size, chunks_per_wave))
+                            for chunk in range(
+                                next_start,
+                                min(next_start + batch_size, chunks_per_wave),
+                            )
                         ]
                     for unit_index in range_constexpr(len(current)):
                         local_chunk = starts[batch_index] + unit_index
@@ -1222,14 +1376,23 @@ def build_kimi_k3_monokernel(
                         for step_index in range_constexpr(2):
                             lhs = weights[step_index].bitcast(fx.BFloat16)
                             rhs = fx.ptr_load(
-                                x + (sample * k_size + chunk * 64) // 2 + (lane // 16) * 4 + step_index * 16,
+                                x
+                                + (sample * k_size + chunk * 64) // 2
+                                + (lane // 16) * 4
+                                + step_index * 16,
                                 result_type=fx.Vector.make_type(4, fx.Float32),
                             ).bitcast(fx.BFloat16)
                             accumulator = list(
                                 fx.Vector(
                                     rocdl.mfma_f32_16x16x32_bf16(
                                         T.vec(4, T.f32),
-                                        [lhs, rhs, fx.Vector.from_elements(accumulator, fx.Float32)],
+                                        [
+                                            lhs,
+                                            rhs,
+                                            fx.Vector.from_elements(
+                                                accumulator, fx.Float32
+                                            ),
+                                        ],
                                     )
                                 )
                             )
@@ -1301,12 +1464,19 @@ def build_kimi_k3_monokernel(
                         ).bitcast(fx.Int32)
                         activation_halves.append(
                             fx.Vector.from_elements(
-                                [valid_sample.select(loaded[index], fx.Int32(0)) for index in range(4)],
+                                [
+                                    valid_sample.select(loaded[index], fx.Int32(0))
+                                    for index in range(4)
+                                ],
                                 fx.Int32,
                             )
                         )
                     activation_fragment = fx.make_rmem_tensor(8, fx.Int32)
-                    activation_fragment.store(activation_halves[0].shuffle(activation_halves[1], list(range(8))))
+                    activation_fragment.store(
+                        activation_halves[0].shuffle(
+                            activation_halves[1], list(range(8))
+                        )
+                    )
                     weight_halves = []
                     for k64_half in range_constexpr(2):
                         k64 = k128 * 2 + k64_half
@@ -1314,14 +1484,21 @@ def build_kimi_k3_monokernel(
                             fx.Vector(
                                 bo.buffer_load(
                                     weight_rsrc,
-                                    (((row_tile * k_chunks + k64) * 4 + lane_div16) * 16 + lane_mod16) * 4,
+                                    (
+                                        ((row_tile * k_chunks + k64) * 4 + lane_div16)
+                                        * 16
+                                        + lane_mod16
+                                    )
+                                    * 4,
                                     vec_width=4,
                                     dtype=T.i32,
                                 )
                             )
                         )
                     weight_fragment = fx.make_rmem_tensor(8, fx.Int32)
-                    weight_fragment.store(weight_halves[0].shuffle(weight_halves[1], list(range(8))))
+                    weight_fragment.store(
+                        weight_halves[0].shuffle(weight_halves[1], list(range(8)))
+                    )
                     fx.gemm(
                         mxfp8_scale_atoms[k128_half],
                         accumulator,
@@ -1405,7 +1582,9 @@ def build_kimi_k3_monokernel(
             pair_base,
             pairs,
         ):
-            for ready_round in range_constexpr((ready_count + _THREADS - 1) // _THREADS):
+            for ready_round in range_constexpr(
+                (ready_count + _THREADS - 1) // _THREADS
+            ):
                 ready = tid + ready_round * _THREADS
                 if ready < ready_count:
                     load_i32(ready_rsrc, ready_base + ready)
@@ -1422,7 +1601,9 @@ def build_kimi_k3_monokernel(
                     fx.Int32(
                         bo.buffer_load(
                             weight_rsrc,
-                            atom_mxfp4_weight_index(row_group, k_chunk, lane, step, k_size),
+                            atom_mxfp4_weight_index(
+                                row_group, k_chunk, lane, step, k_size
+                            ),
                             vec_width=1,
                             dtype=T.i32,
                         )
@@ -1437,7 +1618,9 @@ def build_kimi_k3_monokernel(
                     fx.Int32(
                         bo.buffer_load(
                             scale_rsrc,
-                            atom_mxfp4_scale_index(row, k_chunk * 4 + step, k_size // 32),
+                            atom_mxfp4_scale_index(
+                                row, k_chunk * 4 + step, k_size // 32
+                            ),
                             vec_width=1,
                             dtype=T.i8,
                         )
@@ -1457,11 +1640,18 @@ def build_kimi_k3_monokernel(
                     result_type=fx.Vector.make_type(4, fx.Float32),
                 ).bitcast(fx.BFloat16)
                 partial = fx.Vector.filled(4, 0.0, fx.Float32)
-                partial = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [lhs, rhs, partial]))
+                partial = fx.Vector(
+                    rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [lhs, rhs, partial])
+                )
                 if const_expr(coefficient is None):
-                    accumulator = [accumulator[item] + partial[item] for item in range_constexpr(4)]
+                    accumulator = [
+                        accumulator[item] + partial[item] for item in range_constexpr(4)
+                    ]
                 else:
-                    accumulator = [accumulator[item] + partial[item] * coefficient for item in range_constexpr(4)]
+                    accumulator = [
+                        accumulator[item] + partial[item] * coefficient
+                        for item in range_constexpr(4)
+                    ]
             return accumulator
 
         def mxfp8_bf16_accumulate(
@@ -1483,7 +1673,11 @@ def build_kimi_k3_monokernel(
                     weight = fx.Vector(
                         bo.buffer_load(
                             weight_rsrc,
-                            (((row_tile * k_chunks + chunk) * 4 + atom_group) * 16 + lane % 16) * 4
+                            (
+                                ((row_tile * k_chunks + chunk) * 4 + atom_group) * 16
+                                + lane % 16
+                            )
+                            * 4
                             + ((lane // 16) % 2) * 2,
                             vec_width=2,
                             dtype=T.i32,
@@ -1494,7 +1688,8 @@ def build_kimi_k3_monokernel(
                         bo.buffer_load(
                             scale_rsrc,
                             (
-                                ((row_tile // 2) * (k_dim // 256) + scale_group // 8) * 64
+                                ((row_tile // 2) * (k_dim // 256) + scale_group // 8)
+                                * 64
                                 + (scale_group % 4) * 16
                                 + lane % 16
                             ),
@@ -1503,11 +1698,17 @@ def build_kimi_k3_monokernel(
                         )
                     )
                     scale_byte_index = ((scale_group % 8) // 4) * 2 + row_tile % 2
-                    scale_byte = scale_word.shrui(fx.Int32(scale_byte_index * 8)) & fx.Int32(0xFF)
+                    scale_byte = scale_word.shrui(
+                        fx.Int32(scale_byte_index * 8)
+                    ) & fx.Int32(0xFF)
                     scale = (scale_byte << fx.Int32(23)).bitcast(fx.Float32)
                     lhs = mxfp8_to_bf16x8(weight[0], weight[1], scale)
                     rhs = fx.ptr_load(
-                        x + activation_word_base + (chunk * 64) // 2 + (lane // 16) * 4 + step_index * 16,
+                        x
+                        + activation_word_base
+                        + (chunk * 64) // 2
+                        + (lane // 16) * 4
+                        + step_index * 16,
                         result_type=fx.Vector.make_type(4, fx.Float32),
                     ).bitcast(fx.BFloat16)
                     accumulator = fx.Vector(
@@ -1521,12 +1722,18 @@ def build_kimi_k3_monokernel(
         def moe_peer_reduce(local_pairs, pair_base, local_values, region, emit):
             moe_max_pairs = samples * _HIDDEN // 2
             moe_slot_bytes = npes * moe_max_pairs * 8
-            region_base = fx.Int64(region * 2 * moe_slot_bytes) + fx.Int64(slot) * fx.Int64(moe_slot_bytes)
+            region_base = fx.Int64(region * 2 * moe_slot_bytes) + fx.Int64(
+                slot
+            ) * fx.Int64(moe_slot_bytes)
             peer_rounds = (npes + _WAVES - 1) // _WAVES
             for peer_round in range_constexpr(peer_rounds):
                 peer = wave + peer_round * _WAVES
                 if peer < npes:
-                    peer_words = fx.Vector(bo.buffer_load(rsrc(moe_peers), peer * 2, vec_width=2, dtype=T.i32))
+                    peer_words = fx.Vector(
+                        bo.buffer_load(
+                            rsrc(moe_peers), peer * 2, vec_width=2, dtype=T.i32
+                        )
+                    )
                     peer_address = (fx.Int64(uniform(peer_words[1])) << 32) | fx.Int64(
                         fx.Uint32(uniform(peer_words[0]))
                     )
@@ -1577,7 +1784,9 @@ def build_kimi_k3_monokernel(
                 for source_rank in range_constexpr(npes):
                     packed = peer_values[source_rank * 2]
                     sum_low = sum_low + (packed << 16).bitcast(fx.Float32)
-                    sum_high = sum_high + (packed & fx.Int32(-65536)).bitcast(fx.Float32)
+                    sum_high = sum_high + (packed & fx.Int32(-65536)).bitcast(
+                        fx.Float32
+                    )
                 emit(tid, sum_low, sum_high)
             gpu.barrier()
 
@@ -1595,7 +1804,9 @@ def build_kimi_k3_monokernel(
             )
             gpu.barrier()
             pair_count = rows * sample_count // 2
-            for output_round in range_constexpr((pair_count + _THREADS - 1) // _THREADS):
+            for output_round in range_constexpr(
+                (pair_count + _THREADS - 1) // _THREADS
+            ):
                 item = tid + output_round * _THREADS
                 if item < pair_count:
                     local_sample = item // (rows // 2)
@@ -1609,7 +1820,9 @@ def build_kimi_k3_monokernel(
                         for source_offset in range_constexpr(waves_per_row):
                             source_wave = first_source_wave + source_offset
                             source_index = (
-                                source_wave * _WAVE_SIZE + local_sample + 16 * (row_in_group // 4)
+                                source_wave * _WAVE_SIZE
+                                + local_sample
+                                + 16 * (row_in_group // 4)
                             ) * 4 + row_in_group % 4
                             value = value + lds_load(reduction, source_index)
                         pair_values.append(value)
@@ -1696,12 +1909,16 @@ def build_kimi_k3_monokernel(
                 gate_row = tid // 4
                 gate_split = tid % 4
                 gate_parts = fx.Vector.filled(_VALUES_PER_THREAD, 0.0, fx.Float32)
-                for feature_group in range_constexpr(0, _HEAD_DIM, 4 * _VALUES_PER_THREAD):
+                for feature_group in range_constexpr(
+                    0, _HEAD_DIM, 4 * _VALUES_PER_THREAD
+                ):
                     feature_base = feature_group + gate_split * _VALUES_PER_THREAD
                     features = fx.Vector(
                         fx.ptr_load(
                             shared_f_a + feature_base,
-                            result_type=fx.Vector.make_type(_VALUES_PER_THREAD, fx.BFloat16),
+                            result_type=fx.Vector.make_type(
+                                _VALUES_PER_THREAD, fx.BFloat16
+                            ),
                         )
                     ).to(fx.Float32)
                     weights = fx.Vector(
@@ -1782,13 +1999,22 @@ def build_kimi_k3_monokernel(
                     )
                 ).to(fx.Float32)
                 values = fx.Vector.from_elements(
-                    [fx.Float32(state0), fx.Float32(state1), fx.Float32(state2), current],
+                    [
+                        fx.Float32(state0),
+                        fx.Float32(state1),
+                        fx.Float32(state2),
+                        current,
+                    ],
                     fx.Float32,
                 )
                 convolution = (values * weights).reduce(fx.ReductionOp.ADD)
                 activated = convolution * sigmoid_batch([convolution])[0]
-                bo.buffer_store(state1, conv_state_out_rsrc, state_offsets[0], cache_modifier=CM_DEV)
-                bo.buffer_store(state2, conv_state_out_rsrc, state_offsets[1], cache_modifier=CM_DEV)
+                bo.buffer_store(
+                    state1, conv_state_out_rsrc, state_offsets[0], cache_modifier=CM_DEV
+                )
+                bo.buffer_store(
+                    state2, conv_state_out_rsrc, state_offsets[1], cache_modifier=CM_DEV
+                )
                 bo.buffer_store(
                     current.to(fx.BFloat16),
                     conv_state_out_rsrc,
@@ -1811,14 +2037,15 @@ def build_kimi_k3_monokernel(
             gpu.barrier()
 
         def prepare_mtp_kda_conv(sample, head):
-            base_slot = uniform(bo.buffer_load(indices_rsrc, 1, vec_width=1, dtype=T.i32))
-            accepted_offset = uniform(
-                bo.buffer_load(accepted_rsrc, 0, vec_width=1, dtype=T.i32)
-            ) - 1
+            base_slot = uniform(
+                bo.buffer_load(indices_rsrc, 1, vec_width=1, dtype=T.i32)
+            )
+            accepted_offset = (
+                uniform(bo.buffer_load(accepted_rsrc, 0, vec_width=1, dtype=T.i32)) - 1
+            )
             conv_state_rsrc = rsrc(
                 conv_state
-                + fx.Int64(base_slot)
-                * fx.Int64(_CONV_CHANNELS * conv_state_rows * 2)
+                + fx.Int64(base_slot) * fx.Int64(_CONV_CHANNELS * conv_state_rows * 2)
             )
 
             def physical_offset(channel, time):
@@ -1865,7 +2092,12 @@ def build_kimi_k3_monokernel(
                     )
                 ).to(fx.Float32)
                 values = fx.Vector.from_elements(
-                    [fx.Float32(state0), fx.Float32(state1), fx.Float32(state2), current],
+                    [
+                        fx.Float32(state0),
+                        fx.Float32(state1),
+                        fx.Float32(state2),
+                        current,
+                    ],
                     fx.Float32,
                 )
                 convolution = (values * weights).reduce(fx.ReductionOp.ADD)
@@ -1911,12 +2143,17 @@ def build_kimi_k3_monokernel(
             stamp(1)
             sample = recurrence_task // _HEADS
             head = recurrence_task % _HEADS
-            input_slot = uniform(bo.buffer_load(indices_rsrc, sample, vec_width=1, dtype=T.i32))
+            input_slot = uniform(
+                bo.buffer_load(indices_rsrc, sample, vec_width=1, dtype=T.i32)
+            )
             output_slot = input_slot
-            state_rsrc = rsrc(recurrent_state + fx.Int64(input_slot) * fx.Int64(state_slot_bytes))
+            state_rsrc = rsrc(
+                recurrent_state + fx.Int64(input_slot) * fx.Int64(state_slot_bytes)
+            )
             state_out_rsrc = state_rsrc
             conv_state_rsrc = rsrc(
-                conv_state + fx.Int64(input_slot) * fx.Int64(_CONV_CHANNELS * conv_state_rows * 2)
+                conv_state
+                + fx.Int64(input_slot) * fx.Int64(_CONV_CHANNELS * conv_state_rows * 2)
             )
             conv_state_out_rsrc = conv_state_rsrc
 
@@ -1926,7 +2163,11 @@ def build_kimi_k3_monokernel(
 
                 k_lane = lane % _K_LANES
                 v_lane = lane // _K_LANES
-                exp_a_log = exp(fx.Float32(bo.buffer_load(a_log_rsrc, head, vec_width=1, dtype=T.f32)))
+                exp_a_log = exp(
+                    fx.Float32(
+                        bo.buffer_load(a_log_rsrc, head, vec_width=1, dtype=T.f32)
+                    )
+                )
                 beta_logit = get_input(sample, 4 * _PROJECTION + head)
                 beta_value = sigmoid_batch([beta_logit])[0]
 
@@ -1940,19 +2181,25 @@ def build_kimi_k3_monokernel(
                     query_vector = fx.Vector(
                         fx.ptr_load(
                             shared_query + k_base,
-                            result_type=fx.Vector.make_type(_VALUES_PER_THREAD, fx.BFloat16),
+                            result_type=fx.Vector.make_type(
+                                _VALUES_PER_THREAD, fx.BFloat16
+                            ),
                         )
                     ).to(fx.Float32)
                     key_vector = fx.Vector(
                         fx.ptr_load(
                             shared_key + k_base,
-                            result_type=fx.Vector.make_type(_VALUES_PER_THREAD, fx.BFloat16),
+                            result_type=fx.Vector.make_type(
+                                _VALUES_PER_THREAD, fx.BFloat16
+                            ),
                         )
                     ).to(fx.Float32)
                     gate_vector = fx.Vector(
                         fx.ptr_load(
                             shared_gate + k_base,
-                            result_type=fx.Vector.make_type(_VALUES_PER_THREAD, fx.BFloat16),
+                            result_type=fx.Vector.make_type(
+                                _VALUES_PER_THREAD, fx.BFloat16
+                            ),
                         )
                     ).to(fx.Float32)
                     dt_vector = fx.Vector(
@@ -1965,8 +2212,12 @@ def build_kimi_k3_monokernel(
                     ).to(fx.Float32)
                     query_vectors[k_iter] = query_vector
                     key_vectors[k_iter] = key_vector
-                    query_square = query_square + (query_vector * query_vector).reduce(fx.ReductionOp.ADD)
-                    key_square = key_square + (key_vector * key_vector).reduce(fx.ReductionOp.ADD)
+                    query_square = query_square + (query_vector * query_vector).reduce(
+                        fx.ReductionOp.ADD
+                    )
+                    key_square = key_square + (key_vector * key_vector).reduce(
+                        fx.ReductionOp.ADD
+                    )
                     gate_sigmoid = sigmoid_batch(
                         [
                             exp_a_log * (gate_vector[item] + dt_vector[item])
@@ -1986,7 +2237,9 @@ def build_kimi_k3_monokernel(
                         value = value + xshfl(value, offset)
                     return value
 
-                query_inverse_norm = rsq(subgroup_sum(query_square) + fx.Float32(1.0e-6))
+                query_inverse_norm = rsq(
+                    subgroup_sum(query_square) + fx.Float32(1.0e-6)
+                )
                 key_inverse_norm = rsq(subgroup_sum(key_square) + fx.Float32(1.0e-6))
                 for k_iter in range_constexpr(_K_ITERS):
                     query_vectors[k_iter] = query_vectors[k_iter] * fx.Vector.filled(
@@ -2002,7 +2255,9 @@ def build_kimi_k3_monokernel(
 
                 dot_parts = fx.Vector.filled(_VALUES_PER_THREAD, 0.0, fx.Float32)
                 for k_iter in range_constexpr(_K_ITERS):
-                    dot_parts = fx.math.fma(key_vectors[k_iter], query_vectors[k_iter], dot_parts)
+                    dot_parts = fx.math.fma(
+                        key_vectors[k_iter], query_vectors[k_iter], dot_parts
+                    )
                 dot_key_query = subgroup_sum(dot_parts.reduce(fx.ReductionOp.ADD))
 
                 state_vectors = [None] * (_V_ITERS * _K_ITERS)
@@ -2011,7 +2266,9 @@ def build_kimi_k3_monokernel(
                     value_index = wave * _V_LANES + v_lane + v_iter * _V_TILE
                     for k_iter in range_constexpr(_K_ITERS):
                         k_base = k_lane * _VALUES_PER_THREAD + k_iter * _K_TILE
-                        state_offset = (head * _HEAD_DIM + value_index) * _HEAD_DIM + k_base
+                        state_offset = (
+                            head * _HEAD_DIM + value_index
+                        ) * _HEAD_DIM + k_base
                         state_vectors[v_iter * _K_ITERS + k_iter] = fx.Vector(
                             bo.buffer_load(
                                 state_rsrc,
@@ -2024,31 +2281,51 @@ def build_kimi_k3_monokernel(
 
                 for v_iter in range_constexpr(_V_ITERS):
                     value_index = wave * _V_LANES + v_lane + v_iter * _V_TILE
-                    state_key_parts = fx.Vector.filled(_VALUES_PER_THREAD, 0.0, fx.Float32)
-                    state_query_parts = fx.Vector.filled(_VALUES_PER_THREAD, 0.0, fx.Float32)
+                    state_key_parts = fx.Vector.filled(
+                        _VALUES_PER_THREAD, 0.0, fx.Float32
+                    )
+                    state_query_parts = fx.Vector.filled(
+                        _VALUES_PER_THREAD, 0.0, fx.Float32
+                    )
                     for k_iter in range_constexpr(_K_ITERS):
                         index = v_iter * _K_ITERS + k_iter
                         decayed = state_vectors[index] * decay_vectors[k_iter]
                         state_vectors[index] = decayed
-                        state_key_parts = fx.math.fma(decayed, key_vectors[k_iter], state_key_parts)
-                        state_query_parts = fx.math.fma(decayed, query_vectors[k_iter], state_query_parts)
+                        state_key_parts = fx.math.fma(
+                            decayed, key_vectors[k_iter], state_key_parts
+                        )
+                        state_query_parts = fx.math.fma(
+                            decayed, query_vectors[k_iter], state_query_parts
+                        )
                     state_key = subgroup_sum(state_key_parts.reduce(fx.ReductionOp.ADD))
-                    state_query = subgroup_sum(state_query_parts.reduce(fx.ReductionOp.ADD))
+                    state_query = subgroup_sum(
+                        state_query_parts.reduce(fx.ReductionOp.ADD)
+                    )
                     value_input = fx.Float32(fx.ptr_load(shared_value + value_index))
                     value_new = (value_input - state_key) * beta_value
-                    value_new_vector = fx.Vector.filled(_VALUES_PER_THREAD, value_new, fx.Float32)
+                    value_new_vector = fx.Vector.filled(
+                        _VALUES_PER_THREAD, value_new, fx.Float32
+                    )
                     for k_iter in range_constexpr(_K_ITERS):
                         index = v_iter * _K_ITERS + k_iter
-                        state_vectors[index] = fx.math.fma(key_vectors[k_iter], value_new_vector, state_vectors[index])
+                        state_vectors[index] = fx.math.fma(
+                            key_vectors[k_iter], value_new_vector, state_vectors[index]
+                        )
                     results[v_iter] = state_query + value_new * dot_key_query
 
                 for v_iter in range_constexpr(_V_ITERS):
                     value_index = wave * _V_LANES + v_lane + v_iter * _V_TILE
                     for k_iter in range_constexpr(_K_ITERS):
                         k_base = k_lane * _VALUES_PER_THREAD + k_iter * _K_TILE
-                        state_offset = (head * _HEAD_DIM + value_index) * _HEAD_DIM + k_base
+                        state_offset = (
+                            head * _HEAD_DIM + value_index
+                        ) * _HEAD_DIM + k_base
                         bo.buffer_store(
-                            state_vectors[v_iter * _K_ITERS + k_iter].to(fx.Float16) if state_dtype == "fp16" else state_vectors[v_iter * _K_ITERS + k_iter],
+                            (
+                                state_vectors[v_iter * _K_ITERS + k_iter].to(fx.Float16)
+                                if state_dtype == "fp16"
+                                else state_vectors[v_iter * _K_ITERS + k_iter]
+                            ),
                             state_out_rsrc,
                             state_offset,
                             cache_modifier=CM_DEV,
@@ -2065,11 +2342,15 @@ def build_kimi_k3_monokernel(
                 total_square = lds_load(norm_sums, 0)
                 for source_wave in range_constexpr(1, _WAVES):
                     total_square = total_square + lds_load(norm_sums, source_wave)
-                inverse_rms = rsq(total_square * fx.Float32(1.0 / _HEAD_DIM) + fx.Float32(EPS))
+                inverse_rms = rsq(
+                    total_square * fx.Float32(1.0 / _HEAD_DIM) + fx.Float32(EPS)
+                )
                 if k_lane == 0:
                     for v_iter in range_constexpr(_V_ITERS):
                         value_index = wave * _V_LANES + v_lane + v_iter * _V_TILE
-                        output_gate = get_input(sample, 3 * _PROJECTION + head * _HEAD_DIM + value_index)
+                        output_gate = get_input(
+                            sample, 3 * _PROJECTION + head * _HEAD_DIM + value_index
+                        )
                         gain = fx.Float32(
                             fx.BFloat16(
                                 bo.buffer_load(
@@ -2080,7 +2361,12 @@ def build_kimi_k3_monokernel(
                                 )
                             )
                         )
-                        gated = results[v_iter] * inverse_rms * gain * sigmoid_batch([output_gate])[0]
+                        gated = (
+                            results[v_iter]
+                            * inverse_rms
+                            * gain
+                            * sigmoid_batch([output_gate])[0]
+                        )
                         lds_store(reduction, value_index, bf16_round(gated))
                 gpu.barrier()
                 if tid < _HEAD_DIM // 2:
@@ -2114,8 +2400,12 @@ def build_kimi_k3_monokernel(
             if conv_active:
                 sample = conv_task // _HEADS
                 head = conv_task % _HEADS
-                input_slot = uniform(bo.buffer_load(indices_rsrc, sample, vec_width=1, dtype=T.i32))
-                output_slot = uniform(bo.buffer_load(indices_rsrc, sample + 1, vec_width=1, dtype=T.i32))
+                input_slot = uniform(
+                    bo.buffer_load(indices_rsrc, sample, vec_width=1, dtype=T.i32)
+                )
+                output_slot = uniform(
+                    bo.buffer_load(indices_rsrc, sample + 1, vec_width=1, dtype=T.i32)
+                )
                 valid_state = (input_slot >= 0) & (output_slot >= 0)
                 if valid_state:
                     prepare_kda_gate(sample, head)
@@ -2171,19 +2461,37 @@ def build_kimi_k3_monokernel(
                     lds_store(
                         norm_sums,
                         _WAVES,
-                        fx.Float32(bo.buffer_load(a_log_rsrc, head, vec_width=1, dtype=T.f32)),
+                        fx.Float32(
+                            bo.buffer_load(a_log_rsrc, head, vec_width=1, dtype=T.f32)
+                        ),
                     )
-                    lds_store(norm_sums, _WAVES + 1, get_input(sample, 4 * _PROJECTION + head))
+                    lds_store(
+                        norm_sums, _WAVES + 1, get_input(sample, 4 * _PROJECTION + head)
+                    )
                 gpu.barrier()
 
-                input_slot = uniform(bo.buffer_load(indices_rsrc, sample, vec_width=1, dtype=T.i32))
-                output_slot = uniform(bo.buffer_load(indices_rsrc, sample + 1, vec_width=1, dtype=T.i32))
+                input_slot = uniform(
+                    bo.buffer_load(indices_rsrc, sample, vec_width=1, dtype=T.i32)
+                )
+                output_slot = uniform(
+                    bo.buffer_load(indices_rsrc, sample + 1, vec_width=1, dtype=T.i32)
+                )
                 valid_state = (input_slot >= 0) & (output_slot >= 0)
                 result = fx.Float32(0.0)
-                value_index = value_split * mtp_rows_per_split + wave * mtp_v_lanes + lane // mtp_k_lanes
+                value_index = (
+                    value_split * mtp_rows_per_split
+                    + wave * mtp_v_lanes
+                    + lane // mtp_k_lanes
+                )
                 if valid_state:
-                    state_rsrc = rsrc(recurrent_state + fx.Int64(input_slot) * fx.Int64(state_slot_bytes))
-                    state_out_rsrc = rsrc(recurrent_state + fx.Int64(output_slot) * fx.Int64(state_slot_bytes))
+                    state_rsrc = rsrc(
+                        recurrent_state
+                        + fx.Int64(input_slot) * fx.Int64(state_slot_bytes)
+                    )
+                    state_out_rsrc = rsrc(
+                        recurrent_state
+                        + fx.Int64(output_slot) * fx.Int64(state_slot_bytes)
+                    )
                     qkvg_base = (sample * _HEADS + head) * 4 * _HEAD_DIM
                     k_lane = lane % mtp_k_lanes
                     exp_a_log = exp(lds_load(norm_sums, _WAVES))
@@ -2197,26 +2505,38 @@ def build_kimi_k3_monokernel(
                     key_square = fx.Float32(0.0)
                     for k_iter in range_constexpr(mtp_k_iters):
                         k_base = k_lane * _VALUES_PER_THREAD + k_iter * mtp_k_tile
-                        query_vector = fx.Vector.filled(_VALUES_PER_THREAD, 0.0, fx.Float32)
-                        key_vector = fx.Vector.filled(_VALUES_PER_THREAD, 0.0, fx.Float32)
-                        gate_vector = fx.Vector.filled(_VALUES_PER_THREAD, 0.0, fx.Float32)
+                        query_vector = fx.Vector.filled(
+                            _VALUES_PER_THREAD, 0.0, fx.Float32
+                        )
+                        key_vector = fx.Vector.filled(
+                            _VALUES_PER_THREAD, 0.0, fx.Float32
+                        )
+                        gate_vector = fx.Vector.filled(
+                            _VALUES_PER_THREAD, 0.0, fx.Float32
+                        )
                         if local_qkvg:
                             query_vector = fx.Vector(
                                 fx.ptr_load(
                                     shared_query + k_base,
-                                    result_type=fx.Vector.make_type(_VALUES_PER_THREAD, fx.BFloat16),
+                                    result_type=fx.Vector.make_type(
+                                        _VALUES_PER_THREAD, fx.BFloat16
+                                    ),
                                 )
                             ).to(fx.Float32)
                             key_vector = fx.Vector(
                                 fx.ptr_load(
                                     shared_key + k_base,
-                                    result_type=fx.Vector.make_type(_VALUES_PER_THREAD, fx.BFloat16),
+                                    result_type=fx.Vector.make_type(
+                                        _VALUES_PER_THREAD, fx.BFloat16
+                                    ),
                                 )
                             ).to(fx.Float32)
                             gate_vector = fx.Vector(
                                 fx.ptr_load(
                                     shared_gate + k_base,
-                                    result_type=fx.Vector.make_type(_VALUES_PER_THREAD, fx.BFloat16),
+                                    result_type=fx.Vector.make_type(
+                                        _VALUES_PER_THREAD, fx.BFloat16
+                                    ),
                                 )
                             ).to(fx.Float32)
                         else:
@@ -2257,8 +2577,12 @@ def build_kimi_k3_monokernel(
                         ).to(fx.Float32)
                         query_vectors[k_iter] = query_vector
                         key_vectors[k_iter] = key_vector
-                        query_square = query_square + (query_vector * query_vector).reduce(fx.ReductionOp.ADD)
-                        key_square = key_square + (key_vector * key_vector).reduce(fx.ReductionOp.ADD)
+                        query_square = query_square + (
+                            query_vector * query_vector
+                        ).reduce(fx.ReductionOp.ADD)
+                        key_square = key_square + (key_vector * key_vector).reduce(
+                            fx.ReductionOp.ADD
+                        )
                         gate_sigmoid = sigmoid_batch(
                             [
                                 exp_a_log * (gate_vector[item] + dt_vector[item])
@@ -2274,14 +2598,20 @@ def build_kimi_k3_monokernel(
                         )
 
                     def mtp_subgroup_sum(value):
-                        for offset in ((8, 4, 2, 1) if mtp_k_lanes == 16 else (4, 2, 1)):
+                        for offset in (8, 4, 2, 1) if mtp_k_lanes == 16 else (4, 2, 1):
                             value = value + xshfl(value, offset)
                         return value
 
-                    query_inverse_norm = rsq(mtp_subgroup_sum(query_square) + fx.Float32(1.0e-6))
-                    key_inverse_norm = rsq(mtp_subgroup_sum(key_square) + fx.Float32(1.0e-6))
+                    query_inverse_norm = rsq(
+                        mtp_subgroup_sum(query_square) + fx.Float32(1.0e-6)
+                    )
+                    key_inverse_norm = rsq(
+                        mtp_subgroup_sum(key_square) + fx.Float32(1.0e-6)
+                    )
                     for k_iter in range_constexpr(mtp_k_iters):
-                        query_vectors[k_iter] = query_vectors[k_iter] * fx.Vector.filled(
+                        query_vectors[k_iter] = query_vectors[
+                            k_iter
+                        ] * fx.Vector.filled(
                             _VALUES_PER_THREAD,
                             query_inverse_norm * fx.Float32(_Q_SCALE),
                             fx.Float32,
@@ -2294,15 +2624,25 @@ def build_kimi_k3_monokernel(
 
                     dot_parts = fx.Vector.filled(_VALUES_PER_THREAD, 0.0, fx.Float32)
                     for k_iter in range_constexpr(mtp_k_iters):
-                        dot_parts = fx.math.fma(key_vectors[k_iter], query_vectors[k_iter], dot_parts)
-                    dot_key_query = mtp_subgroup_sum(dot_parts.reduce(fx.ReductionOp.ADD))
+                        dot_parts = fx.math.fma(
+                            key_vectors[k_iter], query_vectors[k_iter], dot_parts
+                        )
+                    dot_key_query = mtp_subgroup_sum(
+                        dot_parts.reduce(fx.ReductionOp.ADD)
+                    )
 
                     state_vectors = [None] * mtp_k_iters
-                    state_key_parts = fx.Vector.filled(_VALUES_PER_THREAD, 0.0, fx.Float32)
-                    state_query_parts = fx.Vector.filled(_VALUES_PER_THREAD, 0.0, fx.Float32)
+                    state_key_parts = fx.Vector.filled(
+                        _VALUES_PER_THREAD, 0.0, fx.Float32
+                    )
+                    state_query_parts = fx.Vector.filled(
+                        _VALUES_PER_THREAD, 0.0, fx.Float32
+                    )
                     for k_iter in range_constexpr(mtp_k_iters):
                         k_base = k_lane * _VALUES_PER_THREAD + k_iter * mtp_k_tile
-                        state_offset = (head * _HEAD_DIM + value_index) * _HEAD_DIM + k_base
+                        state_offset = (
+                            head * _HEAD_DIM + value_index
+                        ) * _HEAD_DIM + k_base
                         state_vector = fx.Vector(
                             bo.buffer_load(
                                 state_rsrc,
@@ -2314,13 +2654,23 @@ def build_kimi_k3_monokernel(
                         ).to(fx.Float32)
                         state_vector = state_vector * decay_vectors[k_iter]
                         state_vectors[k_iter] = state_vector
-                        state_key_parts = fx.math.fma(state_vector, key_vectors[k_iter], state_key_parts)
-                        state_query_parts = fx.math.fma(state_vector, query_vectors[k_iter], state_query_parts)
-                    state_key = mtp_subgroup_sum(state_key_parts.reduce(fx.ReductionOp.ADD))
-                    state_query = mtp_subgroup_sum(state_query_parts.reduce(fx.ReductionOp.ADD))
+                        state_key_parts = fx.math.fma(
+                            state_vector, key_vectors[k_iter], state_key_parts
+                        )
+                        state_query_parts = fx.math.fma(
+                            state_vector, query_vectors[k_iter], state_query_parts
+                        )
+                    state_key = mtp_subgroup_sum(
+                        state_key_parts.reduce(fx.ReductionOp.ADD)
+                    )
+                    state_query = mtp_subgroup_sum(
+                        state_query_parts.reduce(fx.ReductionOp.ADD)
+                    )
                     value_input = fx.Float32(0.0)
                     if local_qkvg:
-                        value_input = fx.Float32(fx.ptr_load(shared_value + value_index))
+                        value_input = fx.Float32(
+                            fx.ptr_load(shared_value + value_index)
+                        )
                     else:
                         value_input = fx.Float32(
                             fx.BFloat16(
@@ -2334,15 +2684,23 @@ def build_kimi_k3_monokernel(
                             )
                         )
                     value_new = (value_input - state_key) * beta_value
-                    value_new_vector = fx.Vector.filled(_VALUES_PER_THREAD, value_new, fx.Float32)
+                    value_new_vector = fx.Vector.filled(
+                        _VALUES_PER_THREAD, value_new, fx.Float32
+                    )
                     for k_iter in range_constexpr(mtp_k_iters):
                         k_base = k_lane * _VALUES_PER_THREAD + k_iter * mtp_k_tile
-                        state_offset = (head * _HEAD_DIM + value_index) * _HEAD_DIM + k_base
+                        state_offset = (
+                            head * _HEAD_DIM + value_index
+                        ) * _HEAD_DIM + k_base
                         state_vectors[k_iter] = fx.math.fma(
                             key_vectors[k_iter], value_new_vector, state_vectors[k_iter]
                         )
                         bo.buffer_store(
-                            state_vectors[k_iter].to(fx.Float16) if state_dtype == "fp16" else state_vectors[k_iter],
+                            (
+                                state_vectors[k_iter].to(fx.Float16)
+                                if state_dtype == "fp16"
+                                else state_vectors[k_iter]
+                            ),
                             state_out_rsrc,
                             state_offset,
                             cache_modifier=CM_DEV,
@@ -2379,26 +2737,41 @@ def build_kimi_k3_monokernel(
                     if sample_base > 0:
                         load_f32(
                             mtp_state_ready_rsrc,
-                            ((sample_base - 1) * _HEADS + head) * mtp_splits + value_split,
+                            ((sample_base - 1) * _HEADS + head) * mtp_splits
+                            + value_split,
                         )
                     lds_store(
                         norm_sums,
                         _WAVES,
-                        fx.Float32(bo.buffer_load(a_log_rsrc, head, vec_width=1, dtype=T.f32)),
+                        fx.Float32(
+                            bo.buffer_load(a_log_rsrc, head, vec_width=1, dtype=T.f32)
+                        ),
                     )
                 gpu.barrier()
 
                 k_lane = lane % mtp_k_lanes
-                value_index = value_split * mtp_rows_per_split + wave * mtp_v_lanes + lane // mtp_k_lanes
-                input_slot = uniform(bo.buffer_load(indices_rsrc, sample_base, vec_width=1, dtype=T.i32))
+                value_index = (
+                    value_split * mtp_rows_per_split
+                    + wave * mtp_v_lanes
+                    + lane // mtp_k_lanes
+                )
+                input_slot = uniform(
+                    bo.buffer_load(indices_rsrc, sample_base, vec_width=1, dtype=T.i32)
+                )
                 state_vectors = [
-                    fx.Vector.filled(_VALUES_PER_THREAD, 0.0, fx.Float32) for _ in range_constexpr(mtp_k_iters)
+                    fx.Vector.filled(_VALUES_PER_THREAD, 0.0, fx.Float32)
+                    for _ in range_constexpr(mtp_k_iters)
                 ]
                 if input_slot >= 0:
-                    state_rsrc = rsrc(recurrent_state + fx.Int64(input_slot) * fx.Int64(state_slot_bytes))
+                    state_rsrc = rsrc(
+                        recurrent_state
+                        + fx.Int64(input_slot) * fx.Int64(state_slot_bytes)
+                    )
                     for k_iter in range_constexpr(mtp_k_iters):
                         k_base = k_lane * _VALUES_PER_THREAD + k_iter * mtp_k_tile
-                        state_offset = (head * _HEAD_DIM + value_index) * _HEAD_DIM + k_base
+                        state_offset = (
+                            head * _HEAD_DIM + value_index
+                        ) * _HEAD_DIM + k_base
                         state_vectors[k_iter] = fx.Vector(
                             bo.buffer_load(
                                 state_rsrc,
@@ -2433,15 +2806,28 @@ def build_kimi_k3_monokernel(
                     if tid == 0:
                         if not local_qkvg:
                             load_i32(mtp_conv_ready_rsrc, sample * _HEADS + head)
-                        lds_store(norm_sums, _WAVES + 1, get_input(sample, 4 * _PROJECTION + head))
+                        lds_store(
+                            norm_sums,
+                            _WAVES + 1,
+                            get_input(sample, 4 * _PROJECTION + head),
+                        )
                     gpu.barrier()
 
-                    output_slot = uniform(bo.buffer_load(indices_rsrc, sample + 1, vec_width=1, dtype=T.i32))
+                    output_slot = uniform(
+                        bo.buffer_load(
+                            indices_rsrc, sample + 1, vec_width=1, dtype=T.i32
+                        )
+                    )
                     valid_state = (input_slot >= 0) & (output_slot >= 0)
-                    next_state_vectors = [loop_args[k_iter] for k_iter in range_constexpr(mtp_k_iters)]
+                    next_state_vectors = [
+                        loop_args[k_iter] for k_iter in range_constexpr(mtp_k_iters)
+                    ]
                     result = fx.Float32(0.0)
                     if valid_state:
-                        state_out_rsrc = rsrc(recurrent_state + fx.Int64(output_slot) * fx.Int64(state_slot_bytes))
+                        state_out_rsrc = rsrc(
+                            recurrent_state
+                            + fx.Int64(output_slot) * fx.Int64(state_slot_bytes)
+                        )
                         qkvg_base = (sample * _HEADS + head) * 4 * _HEAD_DIM
                         beta_logit = lds_load(norm_sums, _WAVES + 1)
                         beta_value = sigmoid_batch([beta_logit])[0]
@@ -2453,26 +2839,38 @@ def build_kimi_k3_monokernel(
                         key_square = fx.Float32(0.0)
                         for k_iter in range_constexpr(mtp_k_iters):
                             k_base = k_lane * _VALUES_PER_THREAD + k_iter * mtp_k_tile
-                            query_vector = fx.Vector.filled(_VALUES_PER_THREAD, 0.0, fx.Float32)
-                            key_vector = fx.Vector.filled(_VALUES_PER_THREAD, 0.0, fx.Float32)
-                            gate_vector = fx.Vector.filled(_VALUES_PER_THREAD, 0.0, fx.Float32)
+                            query_vector = fx.Vector.filled(
+                                _VALUES_PER_THREAD, 0.0, fx.Float32
+                            )
+                            key_vector = fx.Vector.filled(
+                                _VALUES_PER_THREAD, 0.0, fx.Float32
+                            )
+                            gate_vector = fx.Vector.filled(
+                                _VALUES_PER_THREAD, 0.0, fx.Float32
+                            )
                             if local_qkvg:
                                 query_vector = fx.Vector(
                                     fx.ptr_load(
                                         shared_query + k_base,
-                                        result_type=fx.Vector.make_type(_VALUES_PER_THREAD, fx.BFloat16),
+                                        result_type=fx.Vector.make_type(
+                                            _VALUES_PER_THREAD, fx.BFloat16
+                                        ),
                                     )
                                 ).to(fx.Float32)
                                 key_vector = fx.Vector(
                                     fx.ptr_load(
                                         shared_key + k_base,
-                                        result_type=fx.Vector.make_type(_VALUES_PER_THREAD, fx.BFloat16),
+                                        result_type=fx.Vector.make_type(
+                                            _VALUES_PER_THREAD, fx.BFloat16
+                                        ),
                                     )
                                 ).to(fx.Float32)
                                 gate_vector = fx.Vector(
                                     fx.ptr_load(
                                         shared_gate + k_base,
-                                        result_type=fx.Vector.make_type(_VALUES_PER_THREAD, fx.BFloat16),
+                                        result_type=fx.Vector.make_type(
+                                            _VALUES_PER_THREAD, fx.BFloat16
+                                        ),
                                     )
                                 ).to(fx.Float32)
                             else:
@@ -2505,17 +2903,25 @@ def build_kimi_k3_monokernel(
                                 ).to(fx.Float32)
                             query_vectors[k_iter] = query_vector
                             key_vectors[k_iter] = key_vector
-                            query_square = query_square + (query_vector * query_vector).reduce(fx.ReductionOp.ADD)
-                            key_square = key_square + (key_vector * key_vector).reduce(fx.ReductionOp.ADD)
+                            query_square = query_square + (
+                                query_vector * query_vector
+                            ).reduce(fx.ReductionOp.ADD)
+                            key_square = key_square + (key_vector * key_vector).reduce(
+                                fx.ReductionOp.ADD
+                            )
                             gate_sigmoid = sigmoid_batch(
                                 [
-                                    exp_a_log * (gate_vector[item] + dt_vectors[k_iter][item])
+                                    exp_a_log
+                                    * (gate_vector[item] + dt_vectors[k_iter][item])
                                     for item in range_constexpr(_VALUES_PER_THREAD)
                                 ]
                             )
                             decay_vectors[k_iter] = fx.Vector.from_elements(
                                 [
-                                    exp(fx.Float32(_GATE_LOWER_BOUND) * gate_sigmoid[item])
+                                    exp(
+                                        fx.Float32(_GATE_LOWER_BOUND)
+                                        * gate_sigmoid[item]
+                                    )
                                     for item in range_constexpr(_VALUES_PER_THREAD)
                                 ],
                                 fx.Float32,
@@ -2526,29 +2932,49 @@ def build_kimi_k3_monokernel(
                                 value = value + xshfl(value, offset)
                             return value
 
-                        query_inverse_norm = rsq(mtp_pair_subgroup_sum(query_square) + fx.Float32(1.0e-6))
-                        key_inverse_norm = rsq(mtp_pair_subgroup_sum(key_square) + fx.Float32(1.0e-6))
+                        query_inverse_norm = rsq(
+                            mtp_pair_subgroup_sum(query_square) + fx.Float32(1.0e-6)
+                        )
+                        key_inverse_norm = rsq(
+                            mtp_pair_subgroup_sum(key_square) + fx.Float32(1.0e-6)
+                        )
                         for k_iter in range_constexpr(mtp_k_iters):
-                            query_vectors[k_iter] = query_vectors[k_iter] * fx.Vector.filled(
+                            query_vectors[k_iter] = query_vectors[
+                                k_iter
+                            ] * fx.Vector.filled(
                                 _VALUES_PER_THREAD,
                                 query_inverse_norm * fx.Float32(_Q_SCALE),
                                 fx.Float32,
                             )
-                            key_vectors[k_iter] = key_vectors[k_iter] * fx.Vector.filled(
+                            key_vectors[k_iter] = key_vectors[
+                                k_iter
+                            ] * fx.Vector.filled(
                                 _VALUES_PER_THREAD,
                                 key_inverse_norm,
                                 fx.Float32,
                             )
 
-                        dot_parts = fx.Vector.filled(_VALUES_PER_THREAD, 0.0, fx.Float32)
+                        dot_parts = fx.Vector.filled(
+                            _VALUES_PER_THREAD, 0.0, fx.Float32
+                        )
                         for k_iter in range_constexpr(mtp_k_iters):
-                            dot_parts = fx.math.fma(key_vectors[k_iter], query_vectors[k_iter], dot_parts)
-                        dot_key_query = mtp_pair_subgroup_sum(dot_parts.reduce(fx.ReductionOp.ADD))
+                            dot_parts = fx.math.fma(
+                                key_vectors[k_iter], query_vectors[k_iter], dot_parts
+                            )
+                        dot_key_query = mtp_pair_subgroup_sum(
+                            dot_parts.reduce(fx.ReductionOp.ADD)
+                        )
 
-                        state_key_parts = fx.Vector.filled(_VALUES_PER_THREAD, 0.0, fx.Float32)
-                        state_query_parts = fx.Vector.filled(_VALUES_PER_THREAD, 0.0, fx.Float32)
+                        state_key_parts = fx.Vector.filled(
+                            _VALUES_PER_THREAD, 0.0, fx.Float32
+                        )
+                        state_query_parts = fx.Vector.filled(
+                            _VALUES_PER_THREAD, 0.0, fx.Float32
+                        )
                         for k_iter in range_constexpr(mtp_k_iters):
-                            next_state_vectors[k_iter] = loop_args[k_iter] * decay_vectors[k_iter]
+                            next_state_vectors[k_iter] = (
+                                loop_args[k_iter] * decay_vectors[k_iter]
+                            )
                             state_key_parts = fx.math.fma(
                                 next_state_vectors[k_iter],
                                 key_vectors[k_iter],
@@ -2559,11 +2985,17 @@ def build_kimi_k3_monokernel(
                                 query_vectors[k_iter],
                                 state_query_parts,
                             )
-                        state_key = mtp_pair_subgroup_sum(state_key_parts.reduce(fx.ReductionOp.ADD))
-                        state_query = mtp_pair_subgroup_sum(state_query_parts.reduce(fx.ReductionOp.ADD))
+                        state_key = mtp_pair_subgroup_sum(
+                            state_key_parts.reduce(fx.ReductionOp.ADD)
+                        )
+                        state_query = mtp_pair_subgroup_sum(
+                            state_query_parts.reduce(fx.ReductionOp.ADD)
+                        )
                         value_input = fx.Float32(0.0)
                         if local_qkvg:
-                            value_input = fx.Float32(fx.ptr_load(shared_value + value_index))
+                            value_input = fx.Float32(
+                                fx.ptr_load(shared_value + value_index)
+                            )
                         else:
                             value_input = fx.Float32(
                                 fx.BFloat16(
@@ -2577,17 +3009,25 @@ def build_kimi_k3_monokernel(
                                 )
                             )
                         value_new = (value_input - state_key) * beta_value
-                        value_new_vector = fx.Vector.filled(_VALUES_PER_THREAD, value_new, fx.Float32)
+                        value_new_vector = fx.Vector.filled(
+                            _VALUES_PER_THREAD, value_new, fx.Float32
+                        )
                         for k_iter in range_constexpr(mtp_k_iters):
                             k_base = k_lane * _VALUES_PER_THREAD + k_iter * mtp_k_tile
-                            state_offset = (head * _HEAD_DIM + value_index) * _HEAD_DIM + k_base
+                            state_offset = (
+                                head * _HEAD_DIM + value_index
+                            ) * _HEAD_DIM + k_base
                             next_state_vectors[k_iter] = fx.math.fma(
                                 key_vectors[k_iter],
                                 value_new_vector,
                                 next_state_vectors[k_iter],
                             )
                             bo.buffer_store(
-                                next_state_vectors[k_iter].to(fx.Float16) if state_dtype == "fp16" else next_state_vectors[k_iter],
+                                (
+                                    next_state_vectors[k_iter].to(fx.Float16)
+                                    if state_dtype == "fp16"
+                                    else next_state_vectors[k_iter]
+                                ),
                                 state_out_rsrc,
                                 state_offset,
                                 cache_modifier=CM_DEV,
@@ -2607,7 +3047,9 @@ def build_kimi_k3_monokernel(
                     gpu.barrier()
                     partial_square = lds_load(norm_sums, 0)
                     for source_wave in range_constexpr(1, _WAVES):
-                        partial_square = partial_square + lds_load(norm_sums, source_wave)
+                        partial_square = partial_square + lds_load(
+                            norm_sums, source_wave
+                        )
                     rocdl.s_waitcnt(vmcnt=0)
                     gpu.barrier()
                     if tid == 0:
@@ -2631,7 +3073,8 @@ def build_kimi_k3_monokernel(
                         if sample > 0:
                             load_f32(
                                 mtp_state_ready_rsrc,
-                                ((sample - 1) * _HEADS + head) * mtp_splits + value_split,
+                                ((sample - 1) * _HEADS + head) * mtp_splits
+                                + value_split,
                             )
                     gpu.barrier()
                     run_mtp_recurrence(sample, head, value_split, local_qkvg)
@@ -2646,7 +3089,9 @@ def build_kimi_k3_monokernel(
                     remote_split = 2 + remote_task // mtp_pair_tasks
                     remote_pair_task = remote_task % mtp_pair_tasks
                     pair = has_local_qkvg.select(local_pair, remote_pair_task // _HEADS)
-                    head = has_local_qkvg.select(bid % _HEADS, remote_pair_task % _HEADS)
+                    head = has_local_qkvg.select(
+                        bid % _HEADS, remote_pair_task % _HEADS
+                    )
                     value_split = has_local_qkvg.select(local_split, remote_split)
                     local_sample = has_local_qkvg.select(conv_sample, fx.Int32(-1))
                     run_mtp_pair(pair, head, value_split, local_sample)
@@ -2673,7 +3118,10 @@ def build_kimi_k3_monokernel(
                 local_head = tid // _HEAD_DIM
                 head = head_base + local_head
                 value_index = tid % _HEAD_DIM
-                inverse_rms = rsq(lds_load(norm_sums, local_head) * fx.Float32(1.0 / _HEAD_DIM) + fx.Float32(EPS))
+                inverse_rms = rsq(
+                    lds_load(norm_sums, local_head) * fx.Float32(1.0 / _HEAD_DIM)
+                    + fx.Float32(EPS)
+                )
                 raw_result = load_raw_f32(
                     norm_mailbox_rsrc,
                     sample * _PROJECTION + head * _HEAD_DIM + value_index,
@@ -2692,10 +3140,14 @@ def build_kimi_k3_monokernel(
                         )
                     )
                 )
-                gated = raw_result * inverse_rms * gain * sigmoid_batch([output_gate])[0]
+                gated = (
+                    raw_result * inverse_rms * gain * sigmoid_batch([output_gate])[0]
+                )
                 gated_neighbor = xshfl(gated, 1)
                 if value_index % 2 == 0:
-                    packed_pair = (sample * _PROJECTION + head * _HEAD_DIM + value_index) // 2
+                    packed_pair = (
+                        sample * _PROJECTION + head * _HEAD_DIM + value_index
+                    ) // 2
                     store_raw_pair(norm_packed_rsrc, packed_pair, gated, gated_neighbor)
                 rocdl.s_waitcnt(vmcnt=0)
                 gpu.barrier()
@@ -2754,7 +3206,9 @@ def build_kimi_k3_monokernel(
             for peer_round in range_constexpr(peer_rounds):
                 peer = wave + peer_round * _WAVES
                 if peer < npes:
-                    peer_words = fx.Vector(bo.buffer_load(rsrc(peers), peer * 2, vec_width=2, dtype=T.i32))
+                    peer_words = fx.Vector(
+                        bo.buffer_load(rsrc(peers), peer * 2, vec_width=2, dtype=T.i32)
+                    )
                     peer_address = (fx.Int64(uniform(peer_words[1])) << 32) | fx.Int64(
                         fx.Uint32(uniform(peer_words[0]))
                     )
@@ -2817,18 +3271,26 @@ def build_kimi_k3_monokernel(
                         peer_values = load_peers()
                         pending = peer_values[1] != tag
                         for source_rank in range_constexpr(1, npes):
-                            pending = pending | (peer_values[source_rank * 2 + 1] != tag)
+                            pending = pending | (
+                                peer_values[source_rank * 2 + 1] != tag
+                            )
 
                     sum_low = fx.Float32(0.0)
                     sum_high = fx.Float32(0.0)
                     for source_rank in range_constexpr(npes):
                         packed = peer_values[source_rank * 2]
                         sum_low = sum_low + (packed << 16).bitcast(fx.Float32)
-                        sum_high = sum_high + (packed & fx.Int32(-65536)).bitcast(fx.Float32)
+                        sum_high = sum_high + (packed & fx.Int32(-65536)).bitcast(
+                            fx.Float32
+                        )
                     packed_sum = (
-                        fx.Vector.from_elements([sum_low, sum_high], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0]
+                        fx.Vector.from_elements([sum_low, sum_high], fx.Float32)
+                        .to(fx.BFloat16)
+                        .bitcast(fx.Int32)[0]
                     )
-                    bo.buffer_store(packed_sum, output_rsrc, global_pair, cache_modifier=CM_DEV)
+                    bo.buffer_store(
+                        packed_sum, output_rsrc, global_pair, cache_modifier=CM_DEV
+                    )
                     if const_expr(fuse_attn_res):
                         store_pair(
                             attention_mailbox_rsrc,
@@ -2881,8 +3343,12 @@ def build_kimi_k3_monokernel(
             router_tasks = sample_groups * router_row_tasks
             latent_tiles = _ROUTED_HIDDEN // 16
             shared_tiles = (2 * _SHARED_INTER) // 16
-            latent_blocks = (latent_tiles + latent_projection_waves - 1) // latent_projection_waves
-            shared_blocks = (shared_tiles + shared_projection_waves - 1) // shared_projection_waves
+            latent_blocks = (
+                latent_tiles + latent_projection_waves - 1
+            ) // latent_projection_waves
+            shared_blocks = (
+                shared_tiles + shared_projection_waves - 1
+            ) // shared_projection_waves
             latent_tasks = sample_groups * latent_blocks
             shared_tasks = sample_groups * shared_blocks
             projection_tasks = router_tasks + latent_tasks + shared_tasks
@@ -2938,7 +3404,8 @@ def build_kimi_k3_monokernel(
                         for local_sample in range_constexpr(staged_samples):
                             store_i32(
                                 router_ready_rsrc,
-                                (sample_base + local_sample) * router_row_tasks + router_row_task,
+                                (sample_base + local_sample) * router_row_tasks
+                                + router_row_task,
                                 1,
                             )
                 elif projection_task < router_tasks + latent_tasks:
@@ -3036,7 +3503,10 @@ def build_kimi_k3_monokernel(
                                 )
                             )
                         )
-                    corrected = [scores[index] + biases[index] for index in range_constexpr(_N_EXPERTS // _WAVE_SIZE)]
+                    corrected = [
+                        scores[index] + biases[index]
+                        for index in range_constexpr(_N_EXPERTS // _WAVE_SIZE)
+                    ]
                     selected_sum = fx.Float32(0.0)
                     for selected_index in range_constexpr(_TOP_K):
                         best_score = corrected[0]
@@ -3045,7 +3515,8 @@ def build_kimi_k3_monokernel(
                             candidate_id = fx.Int32(lane + value_index * _WAVE_SIZE)
                             candidate_score = corrected[value_index]
                             take = (candidate_score > best_score) | (
-                                (ArithValue(candidate_score) == ArithValue(best_score)) & (candidate_id < best_id)
+                                (ArithValue(candidate_score) == ArithValue(best_score))
+                                & (candidate_id < best_id)
                             )
                             best_score = take.select(candidate_score, best_score)
                             best_id = take.select(candidate_id, best_id)
@@ -3053,7 +3524,8 @@ def build_kimi_k3_monokernel(
                             peer_score = xshfl(best_score, offset)
                             peer_id = xshfl(best_id, offset)
                             take = (peer_score > best_score) | (
-                                (ArithValue(peer_score) == ArithValue(best_score)) & (peer_id < best_id)
+                                (ArithValue(peer_score) == ArithValue(best_score))
+                                & (peer_id < best_id)
                             )
                             best_score = take.select(peer_score, best_score)
                             best_id = take.select(peer_id, best_id)
@@ -3072,7 +3544,9 @@ def build_kimi_k3_monokernel(
                         if lane == 0:
                             route = sample * _TOP_K + selected_index
                             store_i32(selection_id_rsrc, route, best_id)
-                            lds_store(output_values, wave * _TOP_K + selected_index, best_raw)
+                            lds_store(
+                                output_values, wave * _TOP_K + selected_index, best_raw
+                            )
                         for value_index in range_constexpr(_N_EXPERTS // _WAVE_SIZE):
                             expert = fx.Int32(lane + value_index * _WAVE_SIZE)
                             corrected[value_index] = (expert == best_id).select(
@@ -3085,7 +3559,8 @@ def build_kimi_k3_monokernel(
                             store_f32(
                                 selection_weight_rsrc,
                                 route,
-                                lds_load(output_values, wave * _TOP_K + selected_index) * inverse_sum,
+                                lds_load(output_values, wave * _TOP_K + selected_index)
+                                * inverse_sum,
                             )
 
             # Shared SiTU activation is cheap enough to run as one CTA/sample.
@@ -3098,7 +3573,9 @@ def build_kimi_k3_monokernel(
                         bid * shared_tiles + tid,
                     )
                 gpu.barrier()
-                for pair_round in range_constexpr((shared_pairs + _THREADS - 1) // _THREADS):
+                for pair_round in range_constexpr(
+                    (shared_pairs + _THREADS - 1) // _THREADS
+                ):
                     pair_in_row = tid + pair_round * _THREADS
                     if pair_in_row < shared_pairs:
                         gate_word = load_raw_pair(
@@ -3107,10 +3584,19 @@ def build_kimi_k3_monokernel(
                         )
                         up_word = load_raw_pair(
                             shared_gu_mailbox_rsrc,
-                            (bid * (2 * _SHARED_INTER) + _SHARED_INTER) // 2 + pair_in_row,
+                            (bid * (2 * _SHARED_INTER) + _SHARED_INTER) // 2
+                            + pair_in_row,
                         )
-                        gate_values = fx.Vector.from_elements([gate_word], fx.Int32).bitcast(fx.BFloat16).to(fx.Float32)
-                        up_values = fx.Vector.from_elements([up_word], fx.Int32).bitcast(fx.BFloat16).to(fx.Float32)
+                        gate_values = (
+                            fx.Vector.from_elements([gate_word], fx.Int32)
+                            .bitcast(fx.BFloat16)
+                            .to(fx.Float32)
+                        )
+                        up_values = (
+                            fx.Vector.from_elements([up_word], fx.Int32)
+                            .bitcast(fx.BFloat16)
+                            .to(fx.Float32)
+                        )
                         mids = []
                         for item in range_constexpr(2):
                             gate_value = gate_values[item]
@@ -3122,7 +3608,13 @@ def build_kimi_k3_monokernel(
                             up_tanh = fx.Float32(2.0) * rcp(
                                 fx.Float32(1.0) + exp(fx.Float32(-0.08) * up_value)
                             ) - fx.Float32(1.0)
-                            mids.append(fx.Float32(4.0) * gate_tanh * gate_sigmoid * fx.Float32(25.0) * up_tanh)
+                            mids.append(
+                                fx.Float32(4.0)
+                                * gate_tanh
+                                * gate_sigmoid
+                                * fx.Float32(25.0)
+                                * up_tanh
+                            )
                         store_pair(
                             shared_mid_mailbox_rsrc,
                             bid * shared_pairs + pair_in_row,
@@ -3145,8 +3637,12 @@ def build_kimi_k3_monokernel(
                 expert = uniform(load_i32(selection_id_rsrc, route))
                 expert_weight_bytes = 2 * _INTER * (_ROUTED_HIDDEN // 2)
                 expert_scale_bytes = 2 * _INTER * (_ROUTED_HIDDEN // 32)
-                up_weight_rsrc = rsrc(packed_expert_up + fx.Int64(expert) * fx.Int64(expert_weight_bytes))
-                up_scale_rsrc = rsrc(expert_up_scale + fx.Int64(expert) * fx.Int64(expert_scale_bytes))
+                up_weight_rsrc = rsrc(
+                    packed_expert_up + fx.Int64(expert) * fx.Int64(expert_weight_bytes)
+                )
+                up_scale_rsrc = rsrc(
+                    expert_up_scale + fx.Int64(expert) * fx.Int64(expert_scale_bytes)
+                )
                 stage_raw_vector(
                     latent_mailbox_rsrc,
                     latent_ready_rsrc,
@@ -3193,9 +3689,13 @@ def build_kimi_k3_monokernel(
                         gate_value = fx.Float32(0.0)
                         up_value = fx.Float32(0.0)
                         for source_wave in range_constexpr(4):
-                            source_index = (source_wave * _WAVE_SIZE + source_lane) * 4 + row % 4
+                            source_index = (
+                                source_wave * _WAVE_SIZE + source_lane
+                            ) * 4 + row % 4
                             gate_value = gate_value + lds_load(reduction, source_index)
-                            up_index = ((source_wave + 4) * _WAVE_SIZE + source_lane) * 4 + row % 4
+                            up_index = (
+                                (source_wave + 4) * _WAVE_SIZE + source_lane
+                            ) * 4 + row % 4
                             up_value = up_value + lds_load(reduction, up_index)
                         gate_value = bf16_round(gate_value)
                         up_value = bf16_round(up_value)
@@ -3206,8 +3706,18 @@ def build_kimi_k3_monokernel(
                         up_tanh = fx.Float32(2.0) * rcp(
                             fx.Float32(1.0) + exp(fx.Float32(-0.08) * up_value)
                         ) - fx.Float32(1.0)
-                        activated.append(fx.Float32(4.0) * gate_tanh * gate_sigmoid * fx.Float32(25.0) * up_tanh)
-                    pair = ((sample * _TOP_K + route_in_sample) * _INTER + row_group * 16 + local_row) // 2
+                        activated.append(
+                            fx.Float32(4.0)
+                            * gate_tanh
+                            * gate_sigmoid
+                            * fx.Float32(25.0)
+                            * up_tanh
+                        )
+                    pair = (
+                        (sample * _TOP_K + route_in_sample) * _INTER
+                        + row_group * 16
+                        + local_row
+                    ) // 2
                     store_raw_pair(
                         expert_mid_mailbox_rsrc,
                         pair,
@@ -3252,9 +3762,17 @@ def build_kimi_k3_monokernel(
                     expert = uniform(load_i32(selection_id_rsrc, route))
                     route_weight = uniform_f32(load_f32(selection_weight_rsrc, route))
                     expert_weight_bytes = _ROUTED_HIDDEN * (_INTER // 2)
-                    expert_scale_bytes = _ROUTED_HIDDEN * (((_INTER // 32) + 7) // 8 * 8)
-                    down_weight_rsrc = rsrc(packed_expert_down + fx.Int64(expert) * fx.Int64(expert_weight_bytes))
-                    down_scale_rsrc = rsrc(expert_down_scale + fx.Int64(expert) * fx.Int64(expert_scale_bytes))
+                    expert_scale_bytes = _ROUTED_HIDDEN * (
+                        ((_INTER // 32) + 7) // 8 * 8
+                    )
+                    down_weight_rsrc = rsrc(
+                        packed_expert_down
+                        + fx.Int64(expert) * fx.Int64(expert_weight_bytes)
+                    )
+                    down_scale_rsrc = rsrc(
+                        expert_down_scale
+                        + fx.Int64(expert) * fx.Int64(expert_scale_bytes)
+                    )
                     route_accumulator = [fx.Float32(0.0) for _ in range(4)]
                     for k_chunk in range_constexpr(_INTER // 128):
                         fragment = mxfp4_fragment(
@@ -3270,7 +3788,8 @@ def build_kimi_k3_monokernel(
                             route_in_sample * mid_pairs_per_route + k_chunk * 64,
                         )
                     accumulator = [
-                        accumulator[item] + route_accumulator[item] * route_weight for item in range_constexpr(4)
+                        accumulator[item] + route_accumulator[item] * route_weight
+                        for item in range_constexpr(4)
                     ]
 
                 fx.ptr_store(
@@ -3286,7 +3805,9 @@ def build_kimi_k3_monokernel(
                         source_lane = 16 * (row // 4)
                         value = fx.Float32(0.0)
                         for source_wave in range_constexpr(_WAVES):
-                            source_index = (source_wave * _WAVE_SIZE + source_lane) * 4 + row % 4
+                            source_index = (
+                                source_wave * _WAVE_SIZE + source_lane
+                            ) * 4 + row % 4
                             value = value + lds_load(reduction, source_index)
                         values.append(value)
                     lds_store(
@@ -3358,7 +3879,9 @@ def build_kimi_k3_monokernel(
                 inverse_rms = uniform_f32(load_f32(routed_inv_rsrc, sample))
 
                 shared_pairs = _SHARED_INTER // 2
-                for load_round in range_constexpr((shared_pairs + _THREADS - 1) // _THREADS):
+                for load_round in range_constexpr(
+                    (shared_pairs + _THREADS - 1) // _THREADS
+                ):
                     pair = tid + load_round * _THREADS
                     if pair < shared_pairs:
                         packed = load_pair(
@@ -3369,16 +3892,28 @@ def build_kimi_k3_monokernel(
 
                 latent_pairs = _ROUTED_HIDDEN // 2
                 gain_rsrc = rsrc(latent_gain)
-                for load_round in range_constexpr((latent_pairs + _THREADS - 1) // _THREADS):
+                for load_round in range_constexpr(
+                    (latent_pairs + _THREADS - 1) // _THREADS
+                ):
                     pair = tid + load_round * _THREADS
                     if pair < latent_pairs:
                         packed = load_raw_pair(
                             routed_mailbox_rsrc,
                             sample * latent_pairs + pair,
                         )
-                        values = fx.Vector.from_elements([packed], fx.Int32).bitcast(fx.BFloat16).to(fx.Float32)
-                        gain_word = fx.Int32(bo.buffer_load(gain_rsrc, pair, vec_width=1, dtype=T.i32))
-                        gains = fx.Vector.from_elements([gain_word], fx.Int32).bitcast(fx.BFloat16).to(fx.Float32)
+                        values = (
+                            fx.Vector.from_elements([packed], fx.Int32)
+                            .bitcast(fx.BFloat16)
+                            .to(fx.Float32)
+                        )
+                        gain_word = fx.Int32(
+                            bo.buffer_load(gain_rsrc, pair, vec_width=1, dtype=T.i32)
+                        )
+                        gains = (
+                            fx.Vector.from_elements([gain_word], fx.Int32)
+                            .bitcast(fx.BFloat16)
+                            .to(fx.Float32)
+                        )
                         lds_store(
                             x,
                             shared_pairs + pair,
@@ -3403,7 +3938,9 @@ def build_kimi_k3_monokernel(
                 else:
                     first_local_row = rank * _HIDDEN_SHARD
                     global_row = row_group * 16
-                    latent_live = (global_row >= first_local_row) & (global_row < first_local_row + _HIDDEN_SHARD)
+                    latent_live = (global_row >= first_local_row) & (
+                        global_row < first_local_row + _HIDDEN_SHARD
+                    )
                     local_row_group = fx.max(
                         fx.Int32(0),
                         (global_row - first_local_row) // 16,
@@ -3425,7 +3962,9 @@ def build_kimi_k3_monokernel(
                     reduction + (wave * _WAVE_SIZE + lane) * 4,
                 )
                 gpu.barrier()
-                latent_live = (row_group * 16 >= rank * _HIDDEN_SHARD) & (row_group * 16 < (rank + 1) * _HIDDEN_SHARD)
+                latent_live = (row_group * 16 >= rank * _HIDDEN_SHARD) & (
+                    row_group * 16 < (rank + 1) * _HIDDEN_SHARD
+                )
                 if tid < 16 // 2:
                     local_row = tid * 2
                     values = []
@@ -3435,13 +3974,23 @@ def build_kimi_k3_monokernel(
                         shared_result = fx.Float32(0.0)
                         latent_value = fx.Float32(0.0)
                         for source_wave in range_constexpr(4):
-                            source_index = (source_wave * _WAVE_SIZE + source_lane) * 4 + row % 4
-                            shared_result = shared_result + lds_load(reduction, source_index)
+                            source_index = (
+                                source_wave * _WAVE_SIZE + source_lane
+                            ) * 4 + row % 4
+                            shared_result = shared_result + lds_load(
+                                reduction, source_index
+                            )
                         for source_wave in range_constexpr(4):
-                            latent_index = ((source_wave + 4) * _WAVE_SIZE + source_lane) * 4 + row % 4
-                            latent_value = latent_value + lds_load(reduction, latent_index)
+                            latent_index = (
+                                (source_wave + 4) * _WAVE_SIZE + source_lane
+                            ) * 4 + row % 4
+                            latent_value = latent_value + lds_load(
+                                reduction, latent_index
+                            )
                         shared_result = bf16_round(shared_result)
-                        latent_value = latent_live.select(bf16_round(latent_value), fx.Float32(0.0))
+                        latent_value = latent_live.select(
+                            bf16_round(latent_value), fx.Float32(0.0)
+                        )
                         values.append(bf16_round(shared_result + latent_value))
                     lds_store(
                         output_values,
@@ -3462,7 +4011,9 @@ def build_kimi_k3_monokernel(
                         )
                     )
                     residual_low = (residual_word << 16).bitcast(fx.Float32)
-                    residual_high = (residual_word & fx.Int32(-65536)).bitcast(fx.Float32)
+                    residual_high = (residual_word & fx.Int32(-65536)).bitcast(
+                        fx.Float32
+                    )
                     final_word = bf16_pair(
                         residual_low + value_low,
                         residual_high + value_high,
