@@ -1097,7 +1097,8 @@ def test_dcp_index_staging_waits_for_request_ready_event():
     gather_indices = object()
     connector._prepare_sharded_index = MagicMock(return_value=gather_indices)
     connector._gather_sharded_index = MagicMock()
-    connector._index_staging_stream = MagicMock()
+    staging_stream = MagicMock()
+    connector._send_worker_stream = MagicMock(return_value=staging_stream)
     connector._execute_staged_index_layer_chunk = MagicMock(return_value=True)
     connector._rdma_write_with_retry = MagicMock(return_value=True)
     ready_event = object()
@@ -1121,7 +1122,7 @@ def test_dcp_index_staging_waits_for_request_ready_event():
         ready_event,
         engine=ready_event,
     )
-    connector._index_staging_stream.wait_event.assert_called_once_with(ready_event)
+    staging_stream.wait_event.assert_called_once_with(ready_event)
     connector._execute_staged_index_layer_chunk.assert_called_once_with(
         "consumer:1234",
         1,
@@ -1155,7 +1156,7 @@ def test_dcp_index_staging_rejects_missing_request_ready_event():
     connector._index_staging_chunk_pages = 256
     connector._prepare_sharded_index = MagicMock(return_value=object())
     connector._gather_sharded_index = MagicMock()
-    connector._index_staging_stream = MagicMock()
+    connector._send_worker_stream = MagicMock()
     connector._rdma_write_with_retry = MagicMock(return_value=True)
     request_data = {
         "consumer_base_addrs": [3_000_000, 4_000_000],
@@ -1184,7 +1185,7 @@ def test_mooncake_records_one_ready_event_for_a_prefill_batch(monkeypatch):
     )
     connector = object.__new__(mc.MooncakeConnector)
     connector.is_producer = True
-    connector._index_staging_stream = object()
+    connector._index_staging_pool_size = 1
     connector._cuda_device = 3
     connector._kv_cache_ready_events = {}
     connector._completed_prefills_lock = threading.Lock()
@@ -1502,7 +1503,8 @@ def test_staged_index_write_preserves_selected_engine(monkeypatch):
     conn = _matched_rail_producer()
     conn._acquire_index_staging_slot = lambda: 3
     conn._release_index_staging_slot = MagicMock()
-    conn._index_staging_stream = SimpleNamespace(synchronize=MagicMock())
+    staging_stream = SimpleNamespace(synchronize=MagicMock())
+    conn._send_worker_stream = lambda: staging_stream
     conn._gather_sharded_index = lambda *_args: (10000, 2)
     conn._rdma_write_with_retry = MagicMock(return_value=True)
     monkeypatch.setattr(mc.torch.cuda, "stream", lambda _: nullcontext())
@@ -1519,5 +1521,5 @@ def test_staged_index_write_preserves_selected_engine(monkeypatch):
         "staged-index",
         engine=selected,
     )
-    conn._index_staging_stream.synchronize.assert_called_once()
+    staging_stream.synchronize.assert_called_once()
     conn._release_index_staging_slot.assert_called_once_with(3)
