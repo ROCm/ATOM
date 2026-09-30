@@ -15,6 +15,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
     visible_csa,
@@ -258,6 +259,19 @@ def _proxy_page_bytes(vllm_config) -> int:
     return page_bytes
 
 
+def _proxy_block_major_view(proxy_kv_cache: torch.Tensor) -> torch.Tensor:
+    """Return the proxy cache as a block-major contiguous tensor.
+
+    vLLM 0.29 hands every layer the logical ``[B, H, N, C]`` page view, which
+    the LBHNC layout already stores block-major, so the bytes of block ``b`` are
+    one contiguous run. Everything below only needs ``shape[0] == num_blocks``
+    and a flat byte view.
+    """
+    if not proxy_kv_cache.is_contiguous():
+        raise ValueError("DeepSeek V4 proxy cache must be block-major contiguous")
+    return proxy_kv_cache
+
+
 def slice_deepseek_v4_proxy_cache_views(
     proxy_kv_cache: torch.Tensor,
     *,
@@ -289,9 +303,7 @@ def slice_deepseek_v4_proxy_cache_views(
         compress_ratios = [4] * csa_layer_count + [128] * hca_layer_count
     ratios = [int(r) for r in compress_ratios]
     index_dim = _index_row_bytes(index_head_dim)
-    physical = proxy_kv_cache.permute(1, 0, 2, 3, 4)
-    if not physical.is_contiguous():
-        raise ValueError("DeepSeek V4 proxy cache must be block-major contiguous")
+    physical = _proxy_block_major_view(proxy_kv_cache)
     num_blocks = int(physical.shape[0])
     raw = physical.reshape(-1)
     if raw.dtype is not torch.uint8:
@@ -579,26 +591,14 @@ class AtomDeepseekV4ProxyBackend(AttentionBackend):
         return [ATOM_DEEPSEEK_V4_BLOCK_SIZE]
 
     @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        """The bridge carves native V4 planes out of one flat byte run, so a
+        block's page must be contiguous and blocks must follow each other."""
+        return (KVCacheLayout.LBHNC,)
+
+    @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
         return ATOM_DEEPSEEK_V4_BLOCK_SIZE
-
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        return (2, num_blocks, block_size, num_kv_heads, head_size)
-
-    @staticmethod
-    def get_kv_cache_stride_order(
-        include_num_layers_dimension: bool = False,
-    ) -> tuple[int, ...]:
-        return (
-            (1, 0, 2, 3, 4) if not include_num_layers_dimension else (1, 0, 2, 3, 4, 5)
-        )
 
     @staticmethod
     def get_impl_cls():
@@ -914,10 +914,7 @@ def bind_deepseek_v4_proxy_cache_views(
     # CSA/HCA Main scatter mode: fp8 2buff -> "main_2buff_fp8" (nope fp8 + parallel
     # bf16 rope), else the plain bf16 scatter. The indexer is always "indexer_fp8".
     main_write_mode = "main_2buff_fp8" if kv_fp8 else "bf16"
-    physical = proxy.kv_cache.permute(1, 0, 2, 3, 4)
-    if not physical.is_contiguous():
-        raise ValueError("DeepSeek V4 proxy cache must be block-major contiguous")
-    raw = physical.reshape(-1)
+    raw = _proxy_block_major_view(proxy.kv_cache).reshape(-1)
     if raw.storage_offset() % 256:
         raise RuntimeError(
             f"DeepSeek V4 proxy KV storage offset {raw.storage_offset()} is not "
