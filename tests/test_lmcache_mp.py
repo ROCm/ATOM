@@ -2147,6 +2147,9 @@ def test_save_nulls_every_recurrent_chunk_but_the_boundary(fake_lmcache_modules)
 
     The server drops an all-null chunk rather than copying it, so the earlier
     chunks cost nothing and the boundary chunk carries the one live snapshot.
+    The null id is vLLM's null block, ``0``: LMCache tests a chunk for nullity
+    by asking whether any of its ids is truthy, so this value is what decides
+    whether the empty chunks are dropped or committed as garbage.
     """
     adapter = _WorkerAdapter()
     worker = _worker(adapter)
@@ -2165,8 +2168,8 @@ def test_save_nulls_every_recurrent_chunk_but_the_boundary(fake_lmcache_modules)
     assert submitted.start == 0 and submitted.end == 24
     assert submitted.block_ids == [
         [30, 31, 32, 33, 34, 35],
-        [-1, -1, 7],
-        [-1, -1, 9],
+        [0, 0, 7],
+        [0, 0, 9],
     ]
 
 
@@ -2190,7 +2193,7 @@ def test_load_carries_the_same_recurrent_lists_as_the_save(fake_lmcache_modules)
 
     worker._submit_load(request, object())
     submitted = adapter.loads[0][1]
-    assert submitted.block_ids == [[10, 11, 12, 13], [-1, 4]]
+    assert submitted.block_ids == [[10, 11, 12, 13], [0, 4]]
 
 
 def test_a_registered_recurrent_group_refuses_a_page_only_request(

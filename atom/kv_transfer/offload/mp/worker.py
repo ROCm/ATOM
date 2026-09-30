@@ -159,7 +159,10 @@ class LMCacheMPConnector(KVConnectorBase):
         # block wide is what makes the server restore the last snapshot only;
         # the earlier positions the transport fills with the null block id are
         # never committed. The server must therefore run with
-        # ``--null-block-id -1 --separate-object-groups``.
+        # ``--separate-object-groups``: without it every kernel group collapses
+        # into one object group (`kv_layer_groups.build_object_groups`), the
+        # null-chunk test then sees the attention group's real ids and skips
+        # nothing, and the window that restores only the last snapshot is gone.
         groups.extend(
             EngineGroupInfo(
                 engine_group_id=1 + ordinal,
@@ -274,9 +277,11 @@ class LMCacheMPConnector(KVConnectorBase):
 
         A recurrent snapshot exists only at a chunk boundary, so an operation
         spanning ``n`` chunks carries ``n - 1`` null ids and the boundary block
-        last. ``-1`` is the server's configured null block id: the server drops
-        a chunk whose ids are all null rather than copying it, which is exactly
-        the earlier chunks here.
+        last. The null id is ``0``, vLLM's null block, which is what LMCache's
+        `all_null_chunk_masks` tests for -- it asks whether any id in the chunk
+        is truthy, so a sentinel of ``-1`` would read as a real block and the
+        empty chunks would be committed as content-hashed garbage. It is not
+        configurable: no released LMCache exposes a null-block-id knob.
         """
         if not self._num_recurrent_groups:
             if req.recurrent_state is not None:
@@ -306,7 +311,7 @@ class LMCacheMPConnector(KVConnectorBase):
                 f"{end}; the state would not continue the KV it ships with"
             )
         count = (end - start) // int(self.chunk_size)
-        return [[-1] * (count - 1) + [int(block)] for block in state.block_ids]
+        return [[0] * (count - 1) + [int(block)] for block in state.block_ids]
 
     def _submit_load(self, req: LMCacheReqMeta, event: Any) -> None:
         from lmcache.integration.atom import AtomMPTransferSpec
