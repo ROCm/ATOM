@@ -469,6 +469,10 @@ models:
                 {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
 
         - <<: *glm52_agentic_lmcache_cpp8_dcp8
+          name: glm-52-mxfp4-1p1d-cpp8-dcp8-agentic-lmcache-1m-c64
+          concurrency: [64]
+
+        - <<: *glm52_agentic_lmcache_cpp8_dcp8
           name: glm-52-mxfp4-1p1d-cpp8-dcp8-agentic-lmcache-1m-c160
           concurrency: [160]
 
