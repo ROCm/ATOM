@@ -419,7 +419,8 @@ models:
         # Two nodes: prefill PP8 x TP1 on one node, decode TP8 + DCP8 on the other.
         # Same server settings as the cpp4/dcp4 anchor; every map that differs
         # (prefill, decode, env) is restated because `<<` merges shallowly.
-        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+        - &glm52_agentic_lmcache_cpp8_dcp8
+          <<: *glm52_agentic_lmcache_cpp4_dcp4
           name: glm-52-mxfp4-1p1d-cpp8-dcp8-agentic-lmcache-1m-c144
           topology: 1p1d_cpp8_dcp8
           display_topology: 1P1D-CPP8-DCP8-TP1-TP8
@@ -466,6 +467,10 @@ models:
               ATOM_PD_MLA_LANDING_POOL_MB: "512"
               DECODE_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+
+        - <<: *glm52_agentic_lmcache_cpp8_dcp8
+          name: glm-52-mxfp4-1p1d-cpp8-dcp8-agentic-lmcache-1m-c160
+          concurrency: [160]
 
         - <<: *glm52_agentic_lmcache_cpp4_dcp4
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c32
