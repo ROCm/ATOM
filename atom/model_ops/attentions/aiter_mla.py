@@ -46,6 +46,7 @@ from atom.model_ops.attention_mla import (
     mla_dcp_kernel_num_heads,
     mla_dcp_sparse_prefill_num_heads,
 )
+from atom.model_ops.dcp_topk_select import use_dcp_local_indexer_prefill
 from atom.model_ops.glm5_next.geometry import (
     effective_kpool_size,
     topk_output_width,
@@ -1775,7 +1776,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # back up to the global key set, so the staged buffer is the shard, not
         # the sequence. `cu_pad[bs] == dcp_indexer_local_total`.
         stage_total = (
-            int(cu_pad[bs]) if envs.ATOM_DCP_INDEXER_PREFILL_LOCAL else total_kv
+            int(cu_pad[bs])
+            if use_dcp_local_indexer_prefill(self.dcp_world_size)
+            else total_kv
         )
 
         # Page / row / e8m0 row for the DCP FP4 staging gather. They depend only
@@ -2430,7 +2433,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if not self._indexer_fp4:
             return
         if self.dcp_world_size > 1:
-            if envs.ATOM_DCP_INDEXER_PREFILL_LOCAL:
+            if use_dcp_local_indexer_prefill(self.dcp_world_size):
                 local_starts = attn_metadata.dcp_indexer_local_ks
                 local_ends = attn_metadata.dcp_indexer_local_ke
                 max_seq_len = max(int(attn_metadata.dcp_indexer_local_total), 1)

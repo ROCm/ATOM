@@ -92,6 +92,7 @@ from atom.model_ops.dcp_ops import (
     dcp_decode_candidate_exchange_fused,
     triton_filter_and_convert_dcp_index_prefill,
 )
+from atom.model_ops.dcp_topk_select import use_dcp_local_indexer_prefill
 from atom.model_ops.embed_head import (
     ParallelLMHead,
     ReplicatedEmbedding,
@@ -1820,16 +1821,7 @@ def sparse_attn_indexer(
         # Local-shard scoring: this rank scores only the 1/W of the sequence it
         # owns and the ranks agree on the global cut via a threshold exchange,
         # instead of every rank reconstructing and re-scoring the whole key set.
-        dcp_local_prefill = (
-            get_dcp_world_size() > 1 and envs.ATOM_DCP_INDEXER_PREFILL_LOCAL
-        )
-        if dcp_local_prefill and pcp_is_enabled():
-            raise NotImplementedError(
-                "DCP local-shard indexer prefill does not support PCP: the query "
-                "side is round-robin sharded under PCP, so the per-token position "
-                "dcp_indexer_local_ke is built from is not the chunk offset. Set "
-                "ATOM_DCP_INDEXER_PREFILL_LOCAL=0 to use the gather path."
-            )
+        dcp_local_prefill = use_dcp_local_indexer_prefill()
         if prefill_metadata.block_tables.shape[0] < num_prefills:
             new_shape = (num_prefills, prefill_metadata.block_tables.shape[1])
             prefill_metadata.block_tables = torch.full(

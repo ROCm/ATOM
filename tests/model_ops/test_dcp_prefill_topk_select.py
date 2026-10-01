@@ -176,8 +176,14 @@ def test_threshold_over_selects_by_at_most_one_bin():
 
 @needs_gpu
 def test_row_with_fewer_than_topk_candidates_selects_everything():
-    """Review Focus #1."""
-    topk, k, nbins = 16, 32, 64
+    """Review Focus #1.
+
+    K == topk deliberately: that is the shipped wiring, and it is what makes the
+    guarantee hold. With K < topk a rank CAN be full while the global candidate
+    count is still under topk, which pins `lo` at that rank's K-th and discards
+    everything below it -- see test_sub_topk_row_needs_k_equal_to_topk.
+    """
+    topk, k, nbins = 16, 16, 64
     shards = _shards(1, k, [[3], [4]], seed=9)
     stats = torch.stack([row_bracket_stats(s) for s in shards], dim=0)
     lo, hi = reduce_bracket(stats)
@@ -479,7 +485,7 @@ def test_exchange_orchestrator_matches_the_step_by_step_composition(monkeypatch)
         device_group = None
 
     torch.manual_seed(22)
-    W, rows, k, topk, nbins = 2, 3, 32, 8, 16
+    W, rows, k, topk, nbins = 2, 3, 32, 32, 16
     block_size, cols, num_req = 4, 8, 1
     batch_ids = torch.zeros(rows, dtype=torch.int32, device="cuda")
     block_table = (
@@ -579,3 +585,149 @@ def test_top_k_per_row_prefill_index_convention():
     assert idx[1].tolist() == [32, 33, 34, -1, -1, -1, -1, -1]
     assert val[1][:3].tolist() == [96.0, 97.0, 98.0]
     assert all(v == NEG_INF for v in val[1][3:].tolist())
+
+
+def _peak_delta_mib(fn):
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    before = torch.cuda.memory_allocated()
+    out = fn()
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() - before
+    del out
+    return peak / (1024 * 1024)
+
+
+@needs_gpu
+def test_exchange_steps_do_not_allocate_row_by_k_temporaries():
+    """The exchange runs OUTSIDE sparse_indexer_row_chunk's budget loop.
+
+    `local_histogram` and `emit_owned_slots` both see the full [rows, K] plane,
+    which at the shipped default (max_num_batched_tokens=16384, K=2048) is
+    128 MiB of fp32. Anything that materializes even one more of those -- let
+    alone the int64 ones a torch `scatter_add_` index forces -- re-opens the
+    unbounded prefill allocation that ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
+    exists to bound (#1376), on a server whose startup memory profile never saw
+    it.
+
+    So the property, stated directly: neither step may allocate anything of the
+    input plane's order.
+    """
+    rows, k, nbins = 4096, 2048, 512
+    local_val = torch.randn(rows, k, dtype=torch.float32, device="cuda")
+    plane_mib = rows * k * 4 / (1024 * 1024)
+    lo = torch.full((rows,), -1.0, dtype=torch.float32, device="cuda")
+    hi = torch.full((rows,), 1.0, dtype=torch.float32, device="cuda")
+
+    peak = _peak_delta_mib(lambda: local_histogram(local_val, lo, hi, nbins))
+    # The histogram itself is rows*nbins*4 = 8 MiB of the 32 MiB plane.
+    assert peak < 0.5 * plane_mib, f"local_histogram peak {peak:.0f} MiB"
+
+    # Materialized outside the measurement: this pins the op, not the fixture.
+    local_idx = (
+        torch.arange(k, dtype=torch.int32, device="cuda").expand(rows, k).contiguous()
+    )
+    thr = torch.zeros(rows, dtype=torch.float32, device="cuda")
+    local_ks = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    batch_ids = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    bt = torch.arange(64, dtype=torch.int32, device="cuda").expand(1, 64).contiguous()
+    out_i = torch.zeros(rows * k, dtype=torch.int32, device="cuda")
+    out_p = torch.zeros(rows + 1, dtype=torch.int32, device="cuda")
+    cnt = torch.zeros(rows, dtype=torch.int32, device="cuda")
+
+    peak = _peak_delta_mib(
+        lambda: emit_owned_slots(
+            local_val,
+            local_idx,
+            thr,
+            local_ks,
+            batch_ids,
+            bt,
+            1,
+            out_i,
+            out_p,
+            cnt,
+        )
+    )
+    assert peak < 0.5 * plane_mib, f"emit_owned_slots peak {peak:.0f} MiB"
+
+
+def test_pcp_falls_back_to_the_gather_path_instead_of_raising(monkeypatch):
+    """The spec says guard PCP *and keep the gather path* for that combination.
+
+    A server already running GLM-5.2 at pcp>1 + dcp>1 upgrades, changes no
+    flags, and starts fine because short requests never reach the indexer. The
+    first request past index_topk would then raise out of a custom op inside the
+    forward, on every rank at once, taking every co-scheduled request with it.
+    Falling back costs nothing: the gather path is fully intact.
+    """
+    from atom.model_ops import dcp_topk_select as mod
+
+    monkeypatch.setattr(mod, "get_dcp_world_size", lambda: 4)
+    monkeypatch.setattr(mod.envs, "ATOM_DCP_INDEXER_PREFILL_LOCAL", True)
+
+    monkeypatch.setattr(mod, "pcp_is_enabled", lambda: False)
+    assert mod.use_dcp_local_indexer_prefill() is True
+
+    monkeypatch.setattr(mod, "pcp_is_enabled", lambda: True)
+    assert mod.use_dcp_local_indexer_prefill() is False
+
+
+def test_dcp_local_indexer_prefill_is_off_without_dcp(monkeypatch):
+    from atom.model_ops import dcp_topk_select as mod
+
+    monkeypatch.setattr(mod, "pcp_is_enabled", lambda: False)
+    monkeypatch.setattr(mod.envs, "ATOM_DCP_INDEXER_PREFILL_LOCAL", True)
+    monkeypatch.setattr(mod, "get_dcp_world_size", lambda: 1)
+    assert mod.use_dcp_local_indexer_prefill() is False
+    monkeypatch.setattr(mod, "get_dcp_world_size", lambda: 4)
+    monkeypatch.setattr(mod.envs, "ATOM_DCP_INDEXER_PREFILL_LOCAL", False)
+    assert mod.use_dcp_local_indexer_prefill() is False
+
+
+@needs_gpu
+def test_sub_topk_row_needs_k_equal_to_topk(monkeypatch):
+    """The superset guarantee is conditional on K == topk_tokens; assert it.
+
+    Counterexample it protects against: W=2, K=8, topk=16, rank 0 holding 8
+    candidates (full) and rank 1 holding 3. Only 11 candidates exist globally,
+    under the target of 16, so every one of them should be selected -- but
+    rank 0 being full pins lo at its 8th and the three on rank 1 fall out.
+    Nothing in the math can detect this; only the caller's shapes can.
+    """
+    rows, k, topk, nbins = 1, 8, 16, 16
+    full = torch.arange(1.0, 9.0, dtype=torch.float32, device="cuda").reshape(1, k)
+    short = torch.full((1, k), NEG_INF, dtype=torch.float32, device="cuda")
+    short[0, :3] = torch.tensor([0.1, 0.2, 0.3], device="cuda")
+    shards = [full, short]
+    stats = torch.stack([row_bracket_stats(s) for s in shards], dim=0)
+    lo, hi = reduce_bracket(stats)
+    hist = sum(local_histogram(s, lo, hi, nbins) for s in shards)
+    thr = threshold_from_histogram(hist, lo, hi, topk)
+    allv = torch.cat(shards, dim=1)
+    finite = int(torch.isfinite(allv).sum())
+    admitted = int(((allv >= thr[:, None]) & torch.isfinite(allv)).sum())
+    assert finite == 11
+    assert admitted < finite  # the defect, reproduced
+
+    class _Group:
+        world_size = 2
+        rank_in_group = 0
+        device_group = None
+
+    with pytest.raises(AssertionError, match="topk_tokens"):
+        dcp_prefill_candidate_exchange(
+            shards[0],
+            torch.zeros(rows, k, dtype=torch.int32, device="cuda"),
+            torch.zeros(rows, dtype=torch.int32, device="cuda"),
+            torch.zeros(rows, dtype=torch.int32, device="cuda"),
+            torch.zeros(1, 8, dtype=torch.int32, device="cuda"),
+            _Group(),
+            topk,
+            1,
+            nbins,
+            torch.zeros(rows * k, dtype=torch.int32, device="cuda"),
+            torch.zeros(rows + 1, dtype=torch.int32, device="cuda"),
+            torch.zeros(rows, dtype=torch.int32, device="cuda"),
+        )

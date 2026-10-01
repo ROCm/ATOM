@@ -29,11 +29,34 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.distributed.dcp_utils import get_dcp_world_size
+from atom.distributed.pcp_utils import pcp_is_enabled
+from atom.utils import envs
+
 NEG_INF = float("-inf")
 POS_INF = float("inf")
 
 # Column layout of the exchanged per-row bracket statistics.
 _MAX, _KTH, _MIN, _CNT = 0, 1, 2, 3
+
+
+def use_dcp_local_indexer_prefill(dcp_world_size: int | None = None) -> bool:
+    """Does this forward score the indexer's LOCAL shard instead of the whole key set?
+
+    PCP is excluded rather than refused. Under PCP the query side is round-robin
+    sharded, so the per-token position ``dcp_indexer_local_ke`` is built from is
+    not the chunk offset and the local causal window would be wrong -- but the
+    gather path is fully intact and handles the combination exactly as before,
+    so falling back costs nothing. Raising instead would take down a server that
+    started fine and answered every request shorter than ``index_topk``, at the
+    first long one, on every rank at once.
+
+    ``dcp_world_size`` lets a caller that already knows it -- the attention
+    metadata builder holds ``self.dcp_world_size`` -- skip the lookup, which
+    needs a live ``AtomConfig`` and so cannot run in a plain unit test.
+    """
+    world = get_dcp_world_size() if dcp_world_size is None else dcp_world_size
+    return world > 1 and envs.ATOM_DCP_INDEXER_PREFILL_LOCAL and not pcp_is_enabled()
 
 
 def row_bracket_stats(local_val: torch.Tensor) -> torch.Tensor:
@@ -115,6 +138,44 @@ def _bin_scale(lo: torch.Tensor, hi: torch.Tensor, nbins: int) -> torch.Tensor:
     )
 
 
+@triton.jit
+def _local_histogram_kernel(
+    local_val,  # fp32 [rows, K]
+    lo,  # fp32 [rows]
+    scale,  # fp32 [rows] -- nbins / (hi - lo), 0 where the bracket is degenerate
+    hist,  # int32 [rows, nbins], zeroed by the caller
+    K: tl.constexpr,
+    NBINS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    lv_stride0: tl.int64,
+    h_stride0: tl.int64,
+):
+    """One program per row; atomics into that row's bins. No [rows, K] scratch.
+
+    Deliberately a kernel rather than the obvious ``scatter_add_``: torch's
+    scatter index must be int64, so the elementwise version materialized two
+    int64 ``[rows, K]`` temporaries plus three fp32 ones -- ~200 MiB for an 8 MiB
+    histogram at rows=4096, and this step runs OUTSIDE
+    ``sparse_indexer_row_chunk``'s budget loop, which is the unbounded prefill
+    allocation #1376 is about.
+    """
+    row = tl.program_id(0)
+    row_lo = tl.load(lo + row)
+    row_scale = tl.load(scale + row)
+    for tile in range(0, K, BLOCK_N):
+        col = tile + tl.arange(0, BLOCK_N)
+        col_valid = col < K
+        val = tl.load(local_val + row * lv_stride0 + col, mask=col_valid, other=0.0)
+        # Valid == finite and at or above lo. `reduce_bracket` proved nothing
+        # below lo can enter the global top-k, and the padding
+        # top_k_per_row_prefill writes is -inf, so both fall out of one test.
+        finite = (val == val) & (tl.abs(val) < float("inf"))  # noqa: PLR0124
+        keep = col_valid & finite & (val >= row_lo)
+        b = ((val - row_lo) * row_scale).to(tl.int32)
+        b = tl.minimum(tl.maximum(b, 0), NBINS - 1)
+        tl.atomic_add(hist + row * h_stride0 + b, 1, mask=keep)
+
+
 def local_histogram(
     local_val: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor, nbins: int
 ) -> torch.Tensor:
@@ -126,19 +187,25 @@ def local_histogram(
     all-reduce that follows is an integer sum and therefore order-independent --
     every rank must scan a bit-identical histogram.
 
-    Out-of-range rows are routed to a scratch column ``nbins`` that is dropped
-    on return, so no masked ``scatter_add_`` and no second kernel are needed.
+    The only allocation is the output: see the kernel's docstring for why that
+    matters here and not in an ordinary elementwise op.
     """
-    rows, _ = local_val.shape
-    scale = _bin_scale(lo, hi, nbins)[:, None]
-    idx = ((local_val - lo[:, None]) * scale).floor()
-    keep = torch.isfinite(local_val) & (local_val >= lo[:, None])
-    idx = torch.where(keep, idx, torch.zeros_like(idx))
-    idx = idx.clamp(0, nbins - 1).to(torch.int64)
-    idx = torch.where(keep, idx, torch.full_like(idx, nbins))
-    hist = torch.zeros((rows, nbins + 1), dtype=torch.int32, device=local_val.device)
-    hist.scatter_add_(1, idx, torch.ones_like(idx, dtype=torch.int32))
-    return hist[:, :nbins].contiguous()
+    rows, k = local_val.shape
+    scale = _bin_scale(lo, hi, nbins)
+    hist = torch.zeros((rows, nbins), dtype=torch.int32, device=local_val.device)
+    local_val_c = local_val.contiguous()
+    _local_histogram_kernel[(rows,)](
+        local_val_c,
+        lo.contiguous(),
+        scale.contiguous(),
+        hist,
+        k,
+        nbins,
+        min(1024, triton.next_power_of_2(k)),
+        local_val_c.stride(0),
+        hist.stride(0),
+    )
+    return hist
 
 
 def threshold_from_histogram(
@@ -172,9 +239,57 @@ def threshold_from_histogram(
 
 
 @triton.jit
+def _admit(val, idx, cut, col_valid, row_ok):
+    """THE admit predicate. One definition, read by both emit passes.
+
+    A candidate is admitted when it is finite, at or above the cut, carries a
+    real column (``top_k_per_row_prefill`` tail-pads with ``-1``) and belongs to
+    a real request (``batch_id_per_q_token < 0`` marks a CUDAGraph pad token).
+
+    Shared rather than written twice on purpose: the counting pass builds
+    ``out_kv_indptr`` and the writing pass fills the regions it describes, so any
+    drift between them overflows a row into its neighbour -- silently. The
+    earlier version of this code kept the two in lockstep by materializing the
+    mask as an int8 ``[rows, K]`` tensor, which cost 224 MiB at the shipped
+    default; a shared device function buys the same guarantee for nothing.
+    """
+    finite = (val == val) & (tl.abs(val) < float("inf"))  # noqa: PLR0124
+    return col_valid & row_ok & finite & (idx >= 0) & (val >= cut)
+
+
+@triton.jit
+def _count_owned_slots_kernel(
+    local_val,  # fp32 [rows, K]
+    local_idx,  # int32 [rows, K]
+    thr,  # fp32 [rows]
+    batch_id_per_q_token,  # int32 [rows]
+    out_counts,  # int32 [rows]
+    out_metadata_counts,  # int32 [rows] -- max(count, 1), cumsummed by the caller
+    K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    lv_stride0: tl.int64,
+    li_stride0: tl.int64,
+):
+    """Pass 1: how many candidates does this row admit?"""
+    row = tl.program_id(0)
+    cut = tl.load(thr + row)
+    row_ok = tl.load(batch_id_per_q_token + row) >= 0
+    count = 0
+    for tile in range(0, K, BLOCK_N):
+        col = tile + tl.arange(0, BLOCK_N)
+        col_valid = col < K
+        val = tl.load(local_val + row * lv_stride0 + col, mask=col_valid, other=0.0)
+        idx = tl.load(local_idx + row * li_stride0 + col, mask=col_valid, other=-1)
+        count += tl.sum(_admit(val, idx, cut, col_valid, row_ok).to(tl.int32))
+    tl.store(out_counts + row, count)
+    tl.store(out_metadata_counts + row, tl.maximum(count, 1))
+
+
+@triton.jit
 def _emit_owned_slots_kernel(
-    keep_mask,  # int8 [rows, K] 1 where the candidate is admitted
+    local_val,  # fp32 [rows, K]
     local_idx,  # int32 [rows, K] absolute column in the LOCAL flat plane
+    thr,  # fp32 [rows]
     local_ks,  # int32 [rows] this row's local-plane region start
     batch_id_per_q_token,  # int32 [rows]
     block_table,  # int32 [num_req, cols]
@@ -183,25 +298,22 @@ def _emit_owned_slots_kernel(
     BLOCK_SIZE: tl.constexpr,  # runner (physical) block size
     K: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    km_stride0: tl.int64,
+    lv_stride0: tl.int64,
     li_stride0: tl.int64,
     bt_stride0: tl.int64,
 ):
-    """Pack this row's admitted slots to the front of its region.
+    """Pass 2: pack this row's admitted slots to the front of its region.
 
     Mirrors ``dcp_ops._compact_filter_dcp_prefill_kernel``'s two invariants --
     no ``-1`` holes (they break aiter's lse path) and an order-preserving
     compaction so the fp accumulation order is deterministic -- but with the
     simple local slot formula (see ``emit_owned_slots``' docstring).
-
-    ``keep_mask`` arrives precomputed rather than being re-derived here. The
-    counts that built ``out_kv_indptr`` came from the same tensor, so the two
-    passes cannot drift: a row whose count and whose writes disagree would
-    overflow into the next row's region, which is silent corruption.
     """
     row = tl.program_id(0)
     req_id = tl.load(batch_id_per_q_token + row)
-    req_id = tl.maximum(req_id, 0)  # pad rows are fully masked by keep_mask
+    row_ok = req_id >= 0
+    req_id = tl.maximum(req_id, 0)  # a pad row admits nothing; keep the load legal
+    cut = tl.load(thr + row)
     base = tl.load(local_ks + row)
     out_start = tl.load(out_kv_indptr + row)
 
@@ -209,8 +321,9 @@ def _emit_owned_slots_kernel(
     for tile in range(0, K, BLOCK_N):
         col = tile + tl.arange(0, BLOCK_N)
         col_valid = col < K
-        keep = tl.load(keep_mask + row * km_stride0 + col, mask=col_valid, other=0) != 0
-        idx = tl.load(local_idx + row * li_stride0 + col, mask=keep, other=0)
+        val = tl.load(local_val + row * lv_stride0 + col, mask=col_valid, other=0.0)
+        idx = tl.load(local_idx + row * li_stride0 + col, mask=col_valid, other=-1)
+        keep = _admit(val, idx, cut, col_valid, row_ok)
         jl = tl.maximum(idx - base, 0)
         phys = tl.load(
             block_table + req_id * bt_stride0 + (jl // BLOCK_SIZE), mask=keep, other=0
@@ -251,45 +364,54 @@ def emit_owned_slots(
     its own tokens -- so the interleave-S virtual-block arithmetic the global
     filter needs does not appear here.
 
-    A candidate is admitted when it is finite, at or above ``thr``, carries a
-    real column (``top_k_per_row_prefill`` tail-pads with ``-1``), and belongs
-    to a real request (``batch_id_per_q_token < 0`` marks a CUDAGraph pad
-    token). That predicate is evaluated ONCE, here, and handed to the kernel --
-    counts and writes read the same tensor by construction.
+    Two Triton passes over the same inputs, sharing ``_admit``; nothing of size
+    ``[rows, K]`` is allocated. This step runs OUTSIDE the
+    ``sparse_indexer_row_chunk`` budget loop, so a temporary here is unbounded
+    prefill memory of exactly the kind #1376 is about.
     """
     rows, k = local_val.shape
     assert local_idx.shape == (rows, k), local_idx.shape
     assert out_kv_indptr.shape[0] >= rows + 1, out_kv_indptr.shape
     assert owned_counts.shape[0] >= rows, owned_counts.shape
 
-    keep = (
-        torch.isfinite(local_val)
-        & (local_val >= thr[:, None])
-        & (local_idx >= 0)
-        & (batch_id_per_q_token >= 0)[:, None]
-    )
-    counts = keep.sum(1, dtype=torch.int32)
-    owned_counts[:rows].copy_(counts)
-    out_kv_indptr[:1].zero_()
-    torch.cumsum(
-        counts.clamp_min(1), dim=0, dtype=torch.int32, out=out_kv_indptr[1 : rows + 1]
-    )
-
-    keep_i8 = keep.to(torch.int8).contiguous()
+    local_val_c = local_val.contiguous()
     local_idx_c = local_idx.contiguous()
+    thr_c = thr.contiguous()
+    batch_ids_c = batch_id_per_q_token.contiguous()
     block_table_c = block_table.to(torch.int32).contiguous()
-    _emit_owned_slots_kernel[(rows,)](
-        keep_i8,
+
+    # The count kernel writes max(count, 1) straight into the indptr tail, so
+    # the cumsum needs no allocation of its own (exact in/out overlap is
+    # supported). Same shape as dcp_ops' prefill filter.
+    metadata_counts = out_kv_indptr[1 : rows + 1]
+    _count_owned_slots_kernel[(rows,)](
+        local_val_c,
         local_idx_c,
+        thr_c,
+        batch_ids_c,
+        owned_counts[:rows],
+        metadata_counts,
+        k,
+        BLOCK_N,
+        local_val_c.stride(0),
+        local_idx_c.stride(0),
+    )
+    out_kv_indptr[:1].zero_()
+    torch.cumsum(metadata_counts, dim=0, dtype=torch.int32, out=metadata_counts)
+
+    _emit_owned_slots_kernel[(rows,)](
+        local_val_c,
+        local_idx_c,
+        thr_c,
         local_ks.contiguous(),
-        batch_id_per_q_token.contiguous(),
+        batch_ids_c,
         block_table_c,
         out_kv_indptr,
         out_kv_indices,
         block_size,
         k,
         BLOCK_N,
-        keep_i8.stride(0),
+        local_val_c.stride(0),
         local_idx_c.stride(0),
         block_table_c.stride(0),
     )
@@ -355,8 +477,19 @@ def dcp_prefill_candidate_exchange(
     localize and the compaction all happen inside, so there is no global top-k
     left for the caller to convert.
     """
-    rows = local_val.shape[0]
+    rows, k = local_val.shape
     world = cp_group.world_size
+    # The superset guarantee is conditional on this. `reduce_bracket` pins `lo`
+    # at max_r(rank r's K-th) whenever some rank came back full; with K < topk a
+    # rank can be full while the GLOBAL candidate count is still under topk, and
+    # every candidate below that rank's K-th is then discarded from a row that
+    # should have selected all of them. Nothing downstream can detect it -- only
+    # the caller's shapes can, so check them here.
+    assert k == topk_tokens, (
+        f"local_val is {k} wide for topk_tokens={topk_tokens}; the local top-k "
+        "must be taken at the full width or the cut can discard candidates from "
+        "a row that holds fewer than topk globally"
+    )
 
     stats = row_bracket_stats(local_val)
     gathered = _all_gather_stats(cp_group, stats).reshape(world, rows, 4)

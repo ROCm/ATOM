@@ -582,13 +582,19 @@ def test_dcp_prefill_staging_keeps_every_key_with_its_own_exponent(monkeypatch):
     )
 
 
-def test_staged_page_table_spans_a_whole_batch_not_one_sequence():
+@pytest.mark.parametrize("local_shard", [False, True])
+def test_staged_page_table_spans_a_whole_batch_not_one_sequence(
+    monkeypatch, local_shard
+):
     """`pages` counts the summed co-scheduled prefill context, and prefix
     caching lets that run past any one sequence's block allowance --
     `max_num_batched_tokens` bounds only the uncached tokens. Sized at that
     allowance the table would turn a legal schedule into a mid-serving raise,
     so it spans a full batch; the tail the scorer never reads stays zero rather
-    than aliasing a real page."""
+    than aliasing a real page.
+
+    Under ATOM_DCP_INDEXER_PREFILL_LOCAL the staged copy is this rank's own 1/W
+    rather than the whole key set, so the table spans `sum(lpad)` instead."""
     aiter_mla = _import_or_skip(
         "atom.model_ops.attentions.aiter_mla",
         reason="the MLA builder imports triton at module scope",
@@ -601,6 +607,10 @@ def test_staged_page_table_spans_a_whole_batch_not_one_sequence():
         device=torch.device("cpu"),
         max_bs=4,
         block_table_cols=per_seq,
+        dcp_world_size=4,
+    )
+    monkeypatch.setattr(
+        aiter_mla, "use_dcp_local_indexer_prefill", lambda _w=None: local_shard
     )
     cols = builder.max_bs * per_seq
     lpad = np.full(bs, block, dtype=np.int64)
@@ -612,13 +622,17 @@ def test_staged_page_table_spans_a_whole_batch_not_one_sequence():
         build(builder, meta, bs, lpad, cu_pad, total_kv, var)
         return meta.dcp_indexer_fp4_block_tables
 
+    # Under the local-shard path the extent is sum(lpad) == cu_pad[bs] and the
+    # total_kv argument is ignored, so the table is the same for every total_kv.
+    local_pages = int(cu_pad[bs]) // block
     for pages in (4, per_seq + 1, cols):
         staged = staged_for(pages * block)
+        want_pages = local_pages if local_shard else pages
         # Past `per_seq` is the case a one-sequence width used to raise on.
         assert staged.shape == (bs, cols), pages
-        want = torch.arange(pages, dtype=torch.int32).expand(bs, pages)
-        assert torch.equal(staged[:, :pages], want), pages
-        assert not staged[:, pages:].any(), pages
+        want = torch.arange(want_pages, dtype=torch.int32).expand(bs, want_pages)
+        assert torch.equal(staged[:, :want_pages], want), pages
+        assert not staged[:, want_pages:].any(), pages
 
 
 @pytest.mark.parametrize(
@@ -646,8 +660,11 @@ def test_decompose_slots_matches_torch(n_slots, n_iota):
         assert a.dtype == torch.int32 and torch.equal(a, b), i
 
 
+@pytest.mark.parametrize("local_shard", [False, True])
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_builder_publishes_the_staging_indices_it_derives(device):
+def test_builder_publishes_the_staging_indices_it_derives(
+    monkeypatch, device, local_shard
+):
     """The builder's six staging index tensors, on the kernel and torch paths.
 
     Non-trivial block tables and mid-block sequence ends, so page, row and
@@ -667,6 +684,10 @@ def test_builder_publishes_the_staging_indices_it_derives(device):
         device=torch.device(device),
         max_bs=4,
         block_table_cols=per_seq,
+        dcp_world_size=4,
+    )
+    monkeypatch.setattr(
+        aiter_mla, "use_dcp_local_indexer_prefill", lambda _w=None: local_shard
     )
     if device == "cuda":
         rows = torch.arange(block, dtype=torch.int32, device=device)
@@ -688,7 +709,11 @@ def test_builder_publishes_the_staging_indices_it_derives(device):
     )
     assert torch.equal(meta.dcp_indexer_fp4_local_slots.long().cpu(), want_slots)
 
-    tok = torch.arange(total_kv)
+    # The READ side is always this rank's local slot list. The STAGE side is the
+    # identity over whatever the staged buffer holds: the local shard under the
+    # local-shard path, the whole key set under the gather fallback.
+    stage_total = int(cu_pad[bs]) if local_shard else total_kv
+    tok = torch.arange(stage_total)
     for side, src in (("read", want_slots), ("stage", tok)):
         page = getattr(meta, f"dcp_indexer_fp4_{side}_page").cpu()
         row = getattr(meta, f"dcp_indexer_fp4_{side}_row").cpu()
