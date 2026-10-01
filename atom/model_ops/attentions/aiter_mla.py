@@ -1770,16 +1770,25 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             slots.astype(np.int32)
         ).to(dev, non_blocking=True)
 
+        # How many rows the STAGE side holds. The read side is always this
+        # rank's local slot list; under the local-shard path nothing gathers it
+        # back up to the global key set, so the staged buffer is the shard, not
+        # the sequence. `cu_pad[bs] == dcp_indexer_local_total`.
+        stage_total = (
+            int(cu_pad[bs]) if envs.ATOM_DCP_INDEXER_PREFILL_LOCAL else total_kv
+        )
+
         # Page / row / e8m0 row for the DCP FP4 staging gather. They depend only
-        # on `slots` and `total_kv`, so build them once per forward, not per layer.
+        # on `slots` and `stage_total`, so build them once per forward, not per
+        # layer.
         read, stage = "dcp_indexer_fp4_read", "dcp_indexer_fp4_stage"
         slots_dev = attn_metadata.dcp_indexer_fp4_local_slots
         lut = getattr(self, "_fp4_scale_row_lut", None)
         if lut is not None:
-            idx = decompose_slots_triton(slots_dev, total_kv, block, lut)
+            idx = decompose_slots_triton(slots_dev, stage_total, block, lut)
         else:
             # Torch fallback (CPU / test builders); also the kernel's reference.
-            token = torch.arange(total_kv, dtype=torch.int32, device=dev)
+            token = torch.arange(stage_total, dtype=torch.int32, device=dev)
             idx = []
             for src in (slots_dev, token):
                 page, row = src // block, src % block
@@ -1799,7 +1808,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # keeps their cached tokens off `max_num_batched_tokens`, which is a
         # legal schedule, and this table is the only thing that would have
         # bounded it. Buys one scorer variant against the non-DCP width.
-        pages = -(-total_kv // block)
+        pages = -(-stage_total // block)
         cols = self.max_bs * self.block_table_cols
         staged_tables = torch.zeros(bs, cols, dtype=torch.int32, device=dev)
         staged_tables[:, :pages] = torch.arange(pages, dtype=torch.int32, device=dev)
@@ -1925,11 +1934,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].copy_to_gpu(
                 scheduled_tokens + 1
             )
+            # DCP metadata FIRST: under the local-shard indexer path the FP4
+            # schedule is built over dcp_indexer_local_ks/ke and
+            # dcp_indexer_local_total, which this call is what publishes. The
+            # two are otherwise independent -- the schedule reads
+            # batch_id_per_q_token / cu_seqlen_ks / cu_seqlen_ke / total_kv, none
+            # of which this touches.
+            if self.dcp_world_size > 1:
+                self._build_dcp_indexer_prefill_meta(attn_metadata, bs, counts, var)
             self._publish_indexer_fp4_prefill_schedule(
                 attn_metadata, sparse_counts, int(full_seq_lens.sum())
             )
-            if self.dcp_world_size > 1:
-                self._build_dcp_indexer_prefill_meta(attn_metadata, bs, counts, var)
             get_mla_metadata_v1(
                 attn_metadata.sparse_cu_seqlens_q,
                 attn_metadata.sparse_kv_indptr,
@@ -2405,16 +2420,24 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         right-sizing the logits buffer to this batch rather than max_model_len
         costs no device sync.
 
-        Under DCP the scorer reads a staged copy of every sequence's keys rather
-        than the in-place shard, so its columns are the flat concatenated ones
-        the FP8 path ranks in and the width is the whole key set.
+        Under DCP the scorer reads a staged copy rather than the in-place shard,
+        so its columns are the flat ones the FP8 path ranks in -- but WHICH flat
+        space depends on the path. With ATOM_DCP_INDEXER_PREFILL_LOCAL the staged
+        copy is this rank's own 1/W, so the columns are the local concatenated
+        ones and the causal end counts only owned positions; with the gather
+        fallback the staged copy is the whole key set.
         """
         if not self._indexer_fp4:
             return
         if self.dcp_world_size > 1:
-            local_starts = attn_metadata.cu_seqlen_ks
-            local_ends = attn_metadata.cu_seqlen_ke
-            max_seq_len = max(int(total_kv), 1)
+            if envs.ATOM_DCP_INDEXER_PREFILL_LOCAL:
+                local_starts = attn_metadata.dcp_indexer_local_ks
+                local_ends = attn_metadata.dcp_indexer_local_ke
+                max_seq_len = max(int(attn_metadata.dcp_indexer_local_total), 1)
+            else:
+                local_starts = attn_metadata.cu_seqlen_ks
+                local_ends = attn_metadata.cu_seqlen_ke
+                max_seq_len = max(int(total_kv), 1)
         else:
             local_starts = None
             local_ends = attn_metadata.cu_seqlen_ke - attn_metadata.cu_seqlen_ks

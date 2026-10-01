@@ -1500,6 +1500,39 @@ def _dcp_gather_indexer_k_prefill(
     return k_fp8, k_scale
 
 
+def _dcp_stage_local_indexer_fp4_prefill(
+    kv_cache: torch.Tensor,
+    kv_cache_scale: torch.Tensor,
+    prefill_metadata,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stage THIS RANK's FP4 index planes into a compact identity-paged buffer.
+
+    The same two-plane read as the gather version below -- the E2M1 and e8m0
+    planes disagree on their row axis, so both bend through the precomputed
+    read/stage row maps -- minus the all-gather and the de-interleave.
+
+    The staged buffer is `local_total` rows rather than `total_kv`, so over its
+    identity block table column ``j`` is LOCAL flat index ``j``: the space
+    ``dcp_indexer_local_ks`` / ``dcp_indexer_local_ke`` speak, and the one
+    ``_build_dcp_indexer_fp4_prefill_meta``'s stage row map is sized for.
+    """
+    page = prefill_metadata.dcp_indexer_fp4_read_page
+    row = prefill_metadata.dcp_indexer_fp4_read_row
+    data = kv_cache[page, :, :, row, :]
+    scale = kv_cache_scale[page, :, :, prefill_metadata.dcp_indexer_fp4_read_scale_row]
+
+    page = prefill_metadata.dcp_indexer_fp4_stage_page
+    row = prefill_metadata.dcp_indexer_fp4_stage_row
+    scale_row = prefill_metadata.dcp_indexer_fp4_stage_scale_row
+    pages = -(-prefill_metadata.dcp_indexer_local_total // block_size)
+    staged = kv_cache.new_zeros(pages, *kv_cache.shape[1:])
+    staged[page, :, :, row, :] = data
+    staged_scale = kv_cache_scale.new_zeros(pages, *kv_cache_scale.shape[1:])
+    staged_scale[page, :, :, scale_row] = scale
+    return staged, staged_scale
+
+
 def _dcp_stage_indexer_fp4_prefill(
     kv_cache: torch.Tensor,
     kv_cache_scale: torch.Tensor,
@@ -1812,7 +1845,15 @@ def sparse_attn_indexer(
             fp4_kv_cache = kv_cache
             fp4_kv_scale = indexer_module.k_cache.kv_cache_scale
             fp4_block_tables = prefill_metadata.block_tables
-            if get_dcp_world_size() > 1:
+            if dcp_local_prefill:
+                fp4_kv_cache, fp4_kv_scale = _dcp_stage_local_indexer_fp4_prefill(
+                    kv_cache,
+                    fp4_kv_scale,
+                    prefill_metadata,
+                    runner_block_size,
+                )
+                fp4_block_tables = prefill_metadata.dcp_indexer_fp4_block_tables
+            elif get_dcp_world_size() > 1:
                 fp4_kv_cache, fp4_kv_scale = _dcp_stage_indexer_fp4_prefill(
                     kv_cache,
                     fp4_kv_scale,
