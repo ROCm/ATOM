@@ -43,8 +43,24 @@ def active_versions():
     return {name: metadata.version(name) for name in sorted(names)}
 
 
-def active_dependency_errors(root="vllm"):
-    pending = [(root, frozenset())]
+def source_requirements(source):
+    project = tomllib.loads((source / "pyproject.toml").read_text())
+    reqs = list(requirements(source / "requirements/rocm.txt"))
+    reqs.extend(Requirement(r) for r in project["build-system"]["requires"])
+    reqs.extend(map(Requirement, ["triton>=3.8,<3.9", "amd-aiter>=0.1.23"]))
+    return reqs
+
+
+def active_dependency_errors(root="vllm", *, roots=None):
+    pending = (
+        [(root, frozenset())]
+        if roots is None
+        else [
+            (req.name, frozenset(req.extras))
+            for req in roots
+            if not req.marker or req.marker.evaluate({"extra": ""})
+        ]
+    )
     seen, errors = set(), []
     while pending:
         name, extras = pending.pop()
@@ -114,13 +130,17 @@ def main():
             ["git", "-C", str(args.source), "rev-parse", "HEAD"], text=True
         ).strip(),
     }
+    # Validate the complete source/build-rooted active closure both before and
+    # after installation. Python sees inherited image packages that uv's resolver
+    # does not; --no-deps is safe only behind this fail-closed compatibility gate.
+    reqs = source_requirements(args.source)
+    errors = dependency_errors(reqs, versions)
+    errors.extend(active_dependency_errors(roots=reqs))
+    report["source_dependency_errors"] = errors
+    if errors:
+        args.output.write_text(json.dumps(report, indent=2) + "\n")
+        raise RuntimeError(f"Source dependency closure failed: {errors}")
     if args.mode == "preflight":
-        project = tomllib.loads((args.source / "pyproject.toml").read_text())
-        reqs = list(requirements(args.source / "requirements/rocm.txt"))
-        reqs.extend(Requirement(r) for r in project["build-system"]["requires"])
-        # The reviewed 24fb5fc08 ROCm base uses the coordinated 2.13/3.8 stack.
-        reqs.extend(map(Requirement, ["triton>=3.8,<3.9", "amd-aiter>=0.1.23"]))
-        errors = dependency_errors(reqs, versions)
         torch = importlib.import_module("torch")
         if not torch.version.hip:
             errors.append("torch is not a ROCm build")

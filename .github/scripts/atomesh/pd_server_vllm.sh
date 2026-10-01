@@ -36,8 +36,9 @@ install_native_vllm() {
   env PYTHONPATH= "${venv}/bin/python" "${check}" preflight \
     --source "${src}" --output "${preflight}"
   local log="${RUNTIME_LOG_DIR}/native-build-rank-${NODE_RANK}.log"
-  # Resolve dependencies but freeze the validated image stack. Never reuse the
-  # image wheel or silently replace Torch/Triton while compiling current source.
+  # Pre/post source-rooted active metadata gates validate inherited image deps.
+  # uv resolution ignores system-site-packages and cannot fetch the private
+  # Torch build. Install only native vllm; never replace the validated stack.
   unset VLLM_PRECOMPILED_WHEEL_LOCATION VLLM_DOCKER_BUILD_CONTEXT
   printf '%s\n' 'VLLM_TARGET_DEVICE=rocm VLLM_USE_PRECOMPILED=0 PYTHONPATH= PYTORCH_ROCM_ARCH=gfx950 MAX_JOBS=32 VLLM_PRECOMPILED_WHEEL_LOCATION=UNSET VLLM_DOCKER_BUILD_CONTEXT=UNSET' \
     > "${RUNTIME_LOG_DIR}/native-build-env-rank-${NODE_RANK}.txt"
@@ -45,8 +46,7 @@ install_native_vllm() {
     PYTHONPATH= VLLM_TARGET_DEVICE=rocm VLLM_USE_PRECOMPILED=0 \
     PYTORCH_ROCM_ARCH=gfx950 MAX_JOBS=32 \
     uv pip install --python "${venv}/bin/python" --reinstall-package vllm \
-      --constraint "${preflight%.json}.constraints.txt" \
-      --no-build-isolation "${src}" > "${log}" 2>&1 || {
+      --no-deps --no-build-isolation "${src}" > "${log}" 2>&1 || {
         tail -100 "${log}"
         return 1
       }

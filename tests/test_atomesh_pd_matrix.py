@@ -5,6 +5,7 @@
 
 import importlib.util
 import os
+import subprocess
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -401,7 +402,10 @@ class PR58968HarnessTest(unittest.TestCase):
 
         with patch.object(module.metadata, "distribution", side_effect=distribution):
             self.assertEqual(module.active_dependency_errors(), [])
+            roots = [module.Requirement("dep[feature]>=2")]
+            self.assertEqual(module.active_dependency_errors(roots=roots), [])
             packages["leaf"] = ("4", [])
+            self.assertIn("active=4", module.active_dependency_errors(roots=roots)[0])
             self.assertIn("active=4", module.active_dependency_errors()[0])
             del packages["leaf"]
             self.assertIn("not installed", module.active_dependency_errors()[0])
@@ -422,6 +426,139 @@ class PR58968HarnessTest(unittest.TestCase):
             patch.object(module.metadata, "version", return_value="2"),
         ):
             self.assertEqual(module.active_versions(), {"dep": "2"})
+
+    def test_correctness_evidence_survives_log_collection(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source, output = Path(tmp) / "source", Path(tmp) / "output"
+            paths = [
+                "slurm_job-1/logs/eval/native-preflight-rank-0.json",
+                "slurm_job-1/logs/eval/native-preflight-rank-0.constraints.txt",
+                "slurm_job-1/logs/eval/native-build-rank-0.log",
+                "slurm_job-1/logs/eval/native-build-env-rank-0.txt",
+                "slurm_job-1/logs/eval/native-manifest-rank-0.json",
+                "slurm_job-1/pd-smoke/eval/failure.json",
+                "slurm_job-1/read-replay/decode-0.jsonl",
+                "slurm_job-1/read-replay/validation.json",
+            ]
+            for name in paths:
+                path = source / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(name)
+            subprocess.run(
+                [
+                    "bash",
+                    str(SCRIPT.with_name("pd_collect_logs.sh")),
+                    str(source),
+                    str(output),
+                ],
+                check=True,
+            )
+            for name in paths:
+                self.assertEqual((output / name).read_text(), name)
+                self.assertEqual(
+                    (output / "validation-evidence" / name).read_text(), name
+                )
+
+    def test_uv_inherited_dependency_offline_regression(self):
+        import shutil
+        import sys
+        import tempfile
+        import zipfile
+
+        if shutil.which("uv") is None:
+            self.skipTest("uv is not installed")
+
+        def run(argv):
+            return subprocess.run(argv, text=True, capture_output=True, check=False)
+
+        run(["uv", "--version"])
+        with tempfile.TemporaryDirectory(prefix="uv-inheritance-") as tmp:
+            root = Path(tmp)
+            venv = root / "venv"
+            assert (
+                run(
+                    [
+                        "uv",
+                        "venv",
+                        "--python",
+                        sys._base_executable,
+                        "--system-site-packages",
+                        str(venv),
+                    ]
+                ).returncode
+                == 0
+            )
+            python = str(venv / "bin/python")
+            active = run(
+                [
+                    python,
+                    "-c",
+                    (
+                        'import importlib.metadata as m; d=m.distribution("packaging"); '
+                        'print(d.version); print(d.locate_file(""))'
+                    ),
+                ]
+            )
+            assert active.returncode == 0
+            version, location = active.stdout.splitlines()
+            assert not Path(location).is_relative_to(venv)
+            wheel = root / "inheritance_repro-0.0.1-py3-none-any.whl"
+            with zipfile.ZipFile(wheel, "w") as archive:
+                info = "inheritance_repro-0.0.1.dist-info/"
+                archive.writestr(
+                    info + "METADATA",
+                    "Metadata-Version: 2.1\nName: inheritance-repro\nVersion: 0.0.1\n"
+                    f"Requires-Dist: packaging=={version}\n",
+                )
+                archive.writestr(
+                    info + "WHEEL",
+                    "Wheel-Version: 1.0\nGenerator: repro\nRoot-Is-Purelib: true\n"
+                    "Tag: py3-none-any\n",
+                )
+                archive.writestr(info + "RECORD", "")
+            args = [
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                python,
+                "--offline",
+                "--no-index",
+                "--no-cache",
+                str(wheel),
+            ]
+            failed = run(args)
+            assert failed.returncode != 0 and "packaging" in failed.stderr
+            passed = run([*args, "--no-deps"])
+            assert passed.returncode == 0
+            validated = run(
+                [
+                    python,
+                    "-c",
+                    (
+                        "from importlib import metadata as m; "
+                        "from packaging.requirements import Requirement; "
+                        'r=Requirement(m.requires("inheritance-repro")[0]); '
+                        "assert r.specifier.contains(m.version(r.name)); "
+                        'print("POST_INSTALL_ACTIVE_CLOSURE_PASS", r, m.version(r.name))'
+                    ),
+                ]
+            )
+            assert validated.returncode == 0
+            print(
+                "REPRO_PASS: inherited requirement visible to Python, ignored by uv "
+                "resolution; no-deps install with active metadata validation passes."
+            )
+
+    def test_native_install_keeps_pre_post_gates_with_no_resolution(self):
+        text = SCRIPT.with_name("pd_server_vllm.sh").read_text()
+        self.assertIn("--no-deps --no-build-isolation", text)
+        self.assertLess(
+            text.index('"${check}" preflight'), text.index("uv pip install")
+        )
+        self.assertLess(text.index("uv pip install"), text.index('"${check}" manifest'))
 
     def test_dependency_check_rejects_old_torch_triton_and_aiter(self):
         spec = importlib.util.spec_from_file_location(
