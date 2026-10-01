@@ -371,7 +371,7 @@ models:
               OFFLOAD_MIN_LOAD_TOKENS: "0"
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
-            decode:
+            decode: &glm52_cpp4_dcp4_decode_env
               HIP_VISIBLE_DEVICES: "4,5,6,7"
               # Ranks share identical communicator groups instead of creating
               # duplicates, freeing decode memory for KV.
@@ -612,6 +612,40 @@ models:
             <<: *glm52_agentic_tp4_mtp5_decode
             workers: 3
             cudagraph: "[1,2,4,8,12,16,20,24,28,32,36,40,44,48]"
+
+      # The nightly lmcache-1m cells with the prefill CPU tier in one
+      # standalone LMCache MP server (pd_server_atom.sh: LMCACHE_MP_SERVER)
+      # instead of in-process LMCache per PP stage. Dispatch-only, never
+      # scheduled: they need LMCache >= 0.5.6 (rocm7 image), so dispatch with
+      # suite=lmcache_mp and an explicit atomesh_image.
+      lmcache_mp:
+        - &glm52_agentic_lmcachemp_cpp4_dcp4
+          <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemp-1m-c72
+          concurrency: [72]
+          env:
+            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
+            # Restated: a merge cannot drop the in-process LMCACHE_* keys.
+            prefill:
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+              VLLM_PP_LAYER_PARTITION: "20,20,20,18"
+              LMCACHE_CHUNK_SIZE: "256"
+              LMCACHE_TRACK_USAGE: "false"
+              LMCACHE_MP_SERVER: "1"
+              # One pool for all four stages, the in-process 4 x 256 GiB.
+              LMCACHE_MP_L1_SIZE_GB: "1024"
+              LMCACHE_MP_NUMA_NODE: "0"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_MIN_LOAD_TOKENS: "0"
+              # P/D only; the launcher adds lmcache_mp through ATOM_KV_OFFLOAD.
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+            decode: *glm52_cpp4_dcp4_decode_env
+
+        - <<: *glm52_agentic_lmcachemp_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemp-1m-c96
+          concurrency: [96]
+
     accuracy:
       task: gsm8k
       fewshot: 20
