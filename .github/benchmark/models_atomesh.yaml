@@ -824,17 +824,17 @@ models:
             benchmark_duration: 1200
             warmup_requests_per_lane: 1
 
-  # ATOM C16 acceptance with the InferenceX native DCP serving configuration.
+  # PR58968 correctness only; pinned independent dependency-integration candidate.
   Kimi-K3-MXFP4-vLLM-DSpark:
     backend: vllm
-    image: vllm/vllm-openai-rocm:nightly@sha256:659b28319fef4ea0e3d8f33e25b4c35d6f663f5d818a5b2fa06dceaf859234e4
+    image: vllm/vllm-openai-rocm@sha256:c7792ad535d9cea3192d6c31a5016a833a4ec4ee865fc4f64ba4243002555ebb
     model_path: "${ATOMESH_MODEL_ROOT}/moonshotai/Kimi-K3"
     precision: MXFP4
     env:
       common:
         <<: *kimi_k3_vllm_env_common
         ATOMESH_PRE_CLEAN_GPU: "1"
-        VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4: "0"
+        VLLM_ROCM_USE_AITER_MOE_SITUV2: "a4w4"
         AITER_SITUV2_A8W4: "0"
         AITER_SITUV2_A4W4: "1"
         AITER_FLYDSL_STAGE2_FP8: "1"
@@ -843,6 +843,9 @@ models:
         VLLM_ROCM_AITER_MLA_DCP_VERIFY: asm
         VLLM_SERVER_DEV_MODE: "1"
         ATOMESH_EVAL_ONLY: "1"
+        ATOMESH_PR58968_SMOKE: "1"
+        VLLM_USE_V2_MODEL_RUNNER: "1"
+        VLLM_GPU_SYNC_CHECK: "error"
         ATOMESH_EVAL_REQUEST_TIMEOUT: "3600"
       prefill:
         VLLM_USE_BREAKABLE_CUDAGRAPH: "1"
@@ -856,7 +859,7 @@ models:
       served_model_name: Kimi-K3
       source:
         repo: https://github.com/whx-sjtu/vllm
-        sha: 5b9daeaf1292286cd75d412a03cc684bcffb9dfb
+        sha: 410182e6b35a082aa3875a1a203fe14bc9fb482f
       diagnostic: 0
     server:
       common_args:
@@ -875,7 +878,7 @@ models:
     suites:
       vllm:
         - &kimi_k3_vllm_dspark_dcp8
-          name: kimi-k3-gsm8k-without-59164-dspark3-tp8-dcp8-eager
+          name: pr58968-k3-dspark3-p8d8-tp8-dcp8-read-eager
           topology: 1p1d
           display_topology: 1P1D-TP8-DCP8
           pd_worker_layout: multi_node
@@ -904,15 +907,30 @@ models:
             wait_server_timeout: 10800
           run_eval: true
         - <<: *kimi_k3_vllm_dspark_dcp8
-          name: kimi-k3-gsm8k-with-59164-dspark3-tp8-dcp8-eager
-          vllm:
-            source:
-              sha: 779322e93b75c2645d2bf396b4a79ab67a722779
+          name: pr58968-k3-dspark3-p8d8-tp8-dcp8-read-full-and-piecewise
+          env:
+            common:
+              ATOMESH_PR58968_REPLAY_PROBE: "1"
+          prefill:
+            workers: 1
+            tp: 8
+            dcp: 8
+            extra_args: >-
+              --cudagraph-metrics
+              --compilation-config '{"mode":3,"cudagraph_mode":"FULL_AND_PIECEWISE","max_cudagraph_capture_size":512}'
+          decode:
+            workers: 1
+            tp: 8
+            dcp: 8
+            extra_args: >-
+              --cudagraph-metrics
+              --compilation-config '{"mode":3,"cudagraph_mode":"FULL_AND_PIECEWISE","max_cudagraph_capture_size":512}'
     accuracy:
       task: gsm8k
       fewshot: 5
       eval_concurrency: [64]
-      threshold: 0.0
+      limit: null
+      threshold: 0.94
       max_gen_toks: 4096
 
   Kimi-K2.5-MXFP4:

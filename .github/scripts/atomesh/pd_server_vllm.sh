@@ -31,38 +31,30 @@ install_native_vllm() {
   git -C "${src}" checkout -q FETCH_HEAD
   [[ "$(git -C "${src}" rev-parse HEAD)" == "${sha}" ]] || return 2
   uv venv --system-site-packages "${venv}"
-  uv pip install --python "${venv}/bin/python" \
-    setuptools-scm setuptools-rust wheel ninja cmake
+  local check="${ATOMESH_SCRIPT_DIR}/pd_native_provenance.py"
+  local preflight="${RUNTIME_LOG_DIR}/native-preflight-rank-${NODE_RANK}.json"
+  env PYTHONPATH= "${venv}/bin/python" "${check}" preflight \
+    --source "${src}" --output "${preflight}"
   local log="${RUNTIME_LOG_DIR}/native-build-rank-${NODE_RANK}.log"
+  # Resolve dependencies but freeze the validated image stack. Never reuse the
+  # image wheel or silently replace Torch/Triton while compiling current source.
+  unset VLLM_PRECOMPILED_WHEEL_LOCATION VLLM_DOCKER_BUILD_CONTEXT
+  printf '%s\n' 'VLLM_TARGET_DEVICE=rocm VLLM_USE_PRECOMPILED=0 PYTHONPATH= PYTORCH_ROCM_ARCH=gfx950 MAX_JOBS=32 VLLM_PRECOMPILED_WHEEL_LOCATION=UNSET VLLM_DOCKER_BUILD_CONTEXT=UNSET' \
+    > "${RUNTIME_LOG_DIR}/native-build-env-rank-${NODE_RANK}.txt"
   env CCACHE_DIR="${venv}/ccache" CCACHE_TEMPDIR="${venv}/ccache/tmp" \
-    PYTHONPATH= VLLM_TARGET_DEVICE=rocm PYTORCH_ROCM_ARCH=gfx950 MAX_JOBS=32 \
-    uv pip install --python "${venv}/bin/python" --no-deps \
+    PYTHONPATH= VLLM_TARGET_DEVICE=rocm VLLM_USE_PRECOMPILED=0 \
+    PYTORCH_ROCM_ARCH=gfx950 MAX_JOBS=32 \
+    uv pip install --python "${venv}/bin/python" --reinstall-package vllm \
+      --constraint "${preflight%.json}.constraints.txt" \
       --no-build-isolation "${src}" > "${log}" 2>&1 || {
         tail -100 "${log}"
         return 1
       }
   export PATH="${venv}/bin:${PATH}"
   server_pythonpath=""
-  env PYTHONPATH= "${venv}/bin/python" - "${venv}" "${sha}" \
-    "${RUNTIME_LOG_DIR}/native-manifest-rank-${NODE_RANK}.json" <<'PY'
-import importlib.metadata
-import json
-import sys
-from pathlib import Path
-
-import torch
-import vllm
-from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import MoRIIOConnector
-
-assert Path(vllm.__file__).is_relative_to(sys.argv[1]), vllm.__file__
-manifest = {
-    "source_sha": sys.argv[2], "source_path": vllm.__file__,
-    "torch": torch.__version__, "hip": torch.version.hip,
-    "packages": {d.metadata['Name']: d.version for d in importlib.metadata.distributions()},
-}
-Path(sys.argv[3]).write_text(json.dumps(manifest, indent=2) + "\n")
-print(f"[vllm] native source installation OK: {sys.argv[2]} {vllm.__file__}")
-PY
+  env PYTHONPATH= "${venv}/bin/python" "${check}" manifest \
+    --source "${src}" --prefix "${venv}" \
+    --output "${RUNTIME_LOG_DIR}/native-manifest-rank-${NODE_RANK}.json"
 }
 
 join_path() {
@@ -280,12 +272,20 @@ start_vllm_server() {
     "${role}" "${ATOMESH_EXECUTION_PHASE}" "${SPEC_DECODE_ACCEPTANCE_LENGTH:-}" \
     "${!args_var}")" || return $?
   apply_role_env "ATOMESH_${prefix}_ENV_" "${host_ip}"
-  if [[ "${SERVED_MODEL_NAME}" == "Kimi-K3" && "${AITER_SITUV2_A4W4:-}" == "1" ]]; then
+  # The legacy overlay checker pins old image-specific AITER hashes. Native
+  # builds validate the coordinated image stack in pd_native_provenance instead.
+  if [[ -z "${ATOMESH_VLLM_SOURCE_SHA:-}" && "${SERVED_MODEL_NAME}" == "Kimi-K3" && "${AITER_SITUV2_A4W4:-}" == "1" ]]; then
     python3 "${ATOMESH_SCRIPT_DIR}/../k3-a4w4/check_aiter_paths.py"
   fi
 
   local lmcache_port=""
   local -a server_env=("PYTHONPATH=${server_pythonpath}")
+  if [[ "${ATOMESH_PR58968_REPLAY_PROBE:-0}" == "1" ]]; then
+    # Only the harness scripts directory is added; it contains no vllm package.
+    server_env+=("PYTHONPATH=${ATOMESH_SCRIPT_DIR}" \
+      "ATOMESH_RUNTIME_ROLE=${role}" \
+      "ATOMESH_READ_REPLAY_ROOT=${RUN_DIR}/read-replay")
+  fi
   if [[ "${role}" == "prefill" && -n "${ATOMESH_VLLM_LMCACHE_WHEEL:-}" ]]; then
     lmcache_port=$((ATOMESH_VLLM_LMCACHE_PORT + ATOMESH_SERVICE_PORT_OFFSET))
     start_lmcache "${lmcache_port}" $((ATOMESH_VLLM_LMCACHE_HTTP_PORT + ATOMESH_SERVICE_PORT_OFFSET))
@@ -307,6 +307,9 @@ start_vllm_server() {
     cmd+=(--decode-context-parallel-size "${!dcp_var}")
   fi
   cmd+=("${role_args[@]}")
+  if [[ "${ATOMESH_PR58968_REPLAY_PROBE:-0}" == "1" ]]; then
+    cmd+=(--worker-extension-cls pd_read_replay_probe.ReadReplayWorkerExtension)
+  fi
   if [[ "${ATOMESH_VLLM_DIAGNOSTIC:-0}" == "1" ]]; then
     cmd+=(--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${RUN_DIR}/traces/${role}\",\"torch_profiler_with_stack\":false,\"torch_profiler_record_shapes\":true}")
   fi

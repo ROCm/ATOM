@@ -140,5 +140,330 @@ class NodeSelectionTest(unittest.TestCase):
         self.assertEqual(cell["num_nodes"], 2)
 
 
+class PR58968HarnessTest(unittest.TestCase):
+    """CPU contract: real shell argv, blocked placeholder, and evidence guards."""
+
+    def cells(self):
+        root = SCRIPT.parents[3]
+        cfg = pd_matrix.load_config(root / ".github/benchmark/models_atomesh.yaml")
+        name = "Kimi-K3-MXFP4-vLLM-DSpark"
+        model = cfg["models"][name]
+        with patch.dict(
+            os.environ,
+            {
+                "ATOMESH_MODEL_ROOT": "/mnt/models",
+                "ATOMESH_NODE_POOL": "pit2-p03-g01,pit2-p03-g03",
+                "ATOMESH_1P1D_NODES": "pit2-p03-g01,pit2-p03-g03",
+                "ATOMESH_SLURM_ACCOUNT": "amd-frameworks",
+                "ATOMESH_SLURM_PARTITION": "amd-spur",
+                "ATOMESH_SLURM_SUBMIT_RUNNER": "atomesh-cicd",
+                "ATOMESH_LOG_ROOT": "/it-share/ATOMESH_LOG/",
+                "ATOMESH_PD_RANK_MAPPING_POLICY": "none",
+            },
+        ):
+            return [
+                pd_matrix.build_cell(
+                    cfg=cfg,
+                    model_name=name,
+                    model_cfg=model,
+                    suite_name="vllm",
+                    suite_cfg=case,
+                    override_image=None,
+                    override_benchmark_concurrency=None,
+                    override_eval_concurrency=[64],
+                )
+                for case in model["suites"]["vllm"]
+            ]
+
+    def test_candidate_matrix_keeps_full_accuracy_and_two_graph_modes(self):
+        import json
+        import shlex
+
+        cells = self.cells()
+        self.assertEqual(len(cells), 2)
+        for cell in cells:
+            self.assertEqual(cell["num_nodes"], 2)
+            self.assertEqual(cell["runner"]["gpus_per_node"], 8)
+            self.assertNotIn("lmcache", cell["vllm"])
+            self.assertNotIn("fork", cell["vllm"])
+            self.assertRegex(
+                cell["vllm"]["source"]["sha"],
+                r"^(?:CANDIDATE_NOT_READY_REPLACE_WITH_COORDINATOR_SHA|[0-9a-f]{40})$",
+            )
+            for role in ("prefill", "decode"):
+                self.assertEqual(cell["service"][role]["tp"], 8)
+                self.assertEqual(cell["service"][role]["dcp"], 8)
+            accuracy = cell["accuracy"]
+            self.assertEqual(accuracy["concurrency"], [64])
+            self.assertEqual(accuracy["fewshot"], 5)
+            self.assertEqual(accuracy["max_gen_toks"], 4096)
+            self.assertEqual(accuracy["threshold"], 0.94)
+            self.assertIsNone(accuracy["limit"])
+            args = shlex.split(cell["server_args"]["extra_args"])
+            spec = json.loads(args[args.index("--speculative-config") + 1])
+            self.assertEqual(spec["num_speculative_tokens"], 3)
+            self.assertEqual(spec["rejection_sample_method"], "standard")
+            self.assertNotIn("synthetic_acceptance_length", spec)
+
+    def test_unresolved_candidate_is_blocked_before_submission(self):
+        import json
+        import subprocess
+
+        cell = self.cells()[0]
+        cell["vllm"]["source"]["sha"] = "CANDIDATE_NOT_READY_TEST_FIXTURE"
+        proc = subprocess.run(
+            [
+                "bash",
+                str(SCRIPT.with_name("pd_submit.sh")),
+                "--cell-json",
+                json.dumps(cell),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("coordinator must replace", proc.stderr)
+
+    def test_native_provenance_rejects_image_python_or_extension(self):
+        from types import SimpleNamespace
+
+        spec = importlib.util.spec_from_file_location(
+            "native_provenance", SCRIPT.with_name("pd_native_provenance.py")
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for bad_name in ("vllm", "vllm._C"):
+            with (
+                self.subTest(module=bad_name),
+                patch.object(
+                    module.importlib,
+                    "import_module",
+                    side_effect=lambda name, bad_name=bad_name: SimpleNamespace(
+                        __file__="/image/old.so" if name == bad_name else __file__
+                    ),
+                ),
+                self.assertRaisesRegex(RuntimeError, "outside native build"),
+            ):
+                module.native_paths(SCRIPT.parents[3])
+
+    def test_read_smoke_requires_external_consumption_not_just_http_success(self):
+        import asyncio
+        import json
+        import tempfile
+        from types import SimpleNamespace
+
+        import httpx
+
+        spec = importlib.util.spec_from_file_location(
+            "read_smoke", SCRIPT.with_name("pd_vllm_profile.py")
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for consumes in (True, False):
+            totals = {
+                role: {
+                    key: 0
+                    for key in (
+                        "local_compute",
+                        "local_cache_hit",
+                        "external_kv_transfer",
+                        "request_success",
+                    )
+                }
+                for role in ("prefill", "decode")
+            }
+
+            def handle(request, totals=totals, consumes=consumes):
+                role = request.url.host
+                total = totals[role]
+                if request.url.path == "/metrics":
+                    text = (
+                        "\n".join(
+                            f'vllm:prompt_tokens_by_source_total{{source="{key}"}} {value}'
+                            for key, value in total.items()
+                            if key != "request_success"
+                        )
+                        + f'\nvllm:request_success_total{{model_name="K3"}} {total["request_success"]}\n'
+                    )
+                    return httpx.Response(200, text=text)
+                body = json.loads(request.content or b"{}")
+                if request.url.path == "/tokenize":
+                    return httpx.Response(200, json={"tokens": list(range(5000))})
+                if request.url.path == "/reset_prefix_cache":
+                    return httpx.Response(200, json={"success": True})
+                transfer = body.get("kv_transfer_params", {})
+                remote = transfer.get("do_remote_prefill", False) and consumes
+                size = len(body["prompt"])
+                total["request_success"] += 1
+                total["external_kv_transfer"] += size - 1 if remote else 0
+                total["local_compute"] += 1 if remote else size
+                return httpx.Response(
+                    200,
+                    json={
+                        "choices": [{"text": "same output", "finish_reason": "length"}],
+                        "kv_transfer_params": {
+                            "remote_block_ids": [[0]],
+                            "remote_host": "prefill",
+                        },
+                    },
+                )
+
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+            with (
+                tempfile.TemporaryDirectory() as output,
+                patch.object(module.httpx, "AsyncClient", return_value=client),
+            ):
+                args = SimpleNamespace(
+                    output=Path(output),
+                    prefill="http://prefill",
+                    decode="http://decode",
+                    model="K3",
+                    tp=8,
+                    dcp=8,
+                    hybrid=True,
+                    phase="eval",
+                )
+                if consumes:
+                    asyncio.run(module.run(args))
+                    evidence = json.loads((Path(output) / "complete.json").read_text())
+                    self.assertEqual(evidence["requests"], 15)
+                    self.assertFalse(evidence["full_replay_sync_read_proven"])
+                else:
+                    with self.assertRaisesRegex(AssertionError, "No external KV"):
+                        asyncio.run(module.run(args))
+                    self.assertFalse((Path(output) / "complete.json").exists())
+
+    def test_runtime_probe_requires_same_step_rank_and_nonempty_wait(self):
+        import json
+        import tempfile
+
+        spec = importlib.util.spec_from_file_location(
+            "probe", SCRIPT.with_name("pd_read_replay_probe.py")
+        )
+        probe = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(probe)
+        base = {"role": "decode", "rank": 0, "pid": 1, "thread": 2, "step": 3}
+        events = [
+            dict(base, event="step", sync_load=True),
+            dict(base, event="wait_done", count=1, mode="FULL"),
+            dict(base, event="replay_done", preexisting_graph=True, mode="FULL"),
+        ]
+        self.assertEqual(probe.qualifying_ranks(events), {("decode", 0)})
+        for change in ({"count": 0}, {"rank": 1}, {"step": 4}, {"mode": "PIECEWISE"}):
+            bad = [events[0], {**events[1], **change}, events[2]]
+            self.assertEqual(probe.qualifying_ranks(bad), set())
+        self.assertEqual(
+            probe.qualifying_ranks(
+                [*events[:2], {**events[2], "preexisting_graph": False}]
+            ),
+            set(),
+        )
+        self.assertEqual(
+            probe.qualifying_ranks([*events, dict(base, event="error")]), set()
+        )
+        self.assertEqual(
+            probe.qualifying_ranks([events[0], events[2], events[1]]), set()
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = probe.Recorder(Path(tmp), "decode", 0, limit=2)
+            for _ in range(4):
+                rec.begin(["req"], True)
+                rec.emit("wait_done", count=1)
+            rows = [
+                json.loads(line)
+                for path in Path(tmp).glob("*.jsonl")
+                for line in path.read_text().splitlines()
+            ]
+            self.assertEqual(len(rows), 4)
+            self.assertEqual({r["step"] for r in rows}, {1, 2})
+
+    def test_active_dependency_closure_and_local_source_identity(self):
+        import json
+        from types import SimpleNamespace
+
+        spec = importlib.util.spec_from_file_location(
+            "native_provenance", SCRIPT.with_name("pd_native_provenance.py")
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        packages = {
+            "vllm": ("1", ["dep[feature]>=2"]),
+            "dep": ("2", ['leaf==3; extra == "feature"', 'absent; extra == "unused"']),
+            "leaf": ("3", ["vllm"]),
+        }
+
+        def distribution(name):
+            if name not in packages:
+                raise module.metadata.PackageNotFoundError(name)
+            version, requires = packages[name]
+            return SimpleNamespace(version=version, requires=requires)
+
+        with patch.object(module.metadata, "distribution", side_effect=distribution):
+            self.assertEqual(module.active_dependency_errors(), [])
+            packages["leaf"] = ("4", [])
+            self.assertIn("active=4", module.active_dependency_errors()[0])
+            del packages["leaf"]
+            self.assertIn("not installed", module.active_dependency_errors()[0])
+        for url, valid in (("file:///native/source", True), ("file:///image", False)):
+            dist = SimpleNamespace(
+                read_text=lambda _, url=url: json.dumps({"url": url})
+            )
+            if valid:
+                module.source_direct_url(dist, Path("/native/source"))
+            else:
+                with self.assertRaisesRegex(RuntimeError, "does not match"):
+                    module.source_direct_url(dist, Path("/native/source"))
+        duplicates = [
+            SimpleNamespace(metadata={"Name": "dep"}, version=v) for v in ("2", "1")
+        ]
+        with (
+            patch.object(module.metadata, "distributions", return_value=duplicates),
+            patch.object(module.metadata, "version", return_value="2"),
+        ):
+            self.assertEqual(module.active_versions(), {"dep": "2"})
+
+    def test_dependency_check_rejects_old_torch_triton_and_aiter(self):
+        spec = importlib.util.spec_from_file_location(
+            "native_provenance", SCRIPT.with_name("pd_native_provenance.py")
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        reqs = list(
+            map(
+                module.Requirement,
+                [
+                    "torch==2.13.0",
+                    "triton>=3.8,<3.9",
+                    "amd-aiter>=0.1.23",
+                ],
+            )
+        )
+        self.assertEqual(
+            len(
+                module.dependency_errors(
+                    reqs,
+                    {
+                        "torch": "2.12.0",
+                        "triton": "3.7.1",
+                        "amd-aiter": "0.1.21.post2",
+                    },
+                )
+            ),
+            3,
+        )
+        self.assertEqual(
+            module.dependency_errors(
+                reqs,
+                {
+                    "torch": "2.13.0+gitabc",
+                    "triton": "3.8.0",
+                    "amd-aiter": "0.1.23",
+                },
+            ),
+            [],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1374,6 +1374,38 @@ run_workload_phase() {
   elif [[ "${ATOMESH_EXECUTION_PHASE}" == "benchmark" ]]; then
     run_benchmark
   elif [[ "${ATOMESH_EXECUTION_PHASE}" == "eval" ]]; then
+    if [[ "${ATOMESH_PR58968_SMOKE:-0}" == "1" ]]; then
+      if [[ "${ATOMESH_PR58968_REPLAY_PROBE:-0}" == "1" ]]; then
+        mkdir -p "${RUN_DIR}/read-replay"
+        touch "${RUN_DIR}/read-replay/enabled"
+      fi
+      local smoke_rc=0
+      python3 "${ATOMESH_SCRIPT_DIR}/pd_vllm_profile.py" \
+        --prefill "http://${NODE0_ADDR}:${PREFILL_PORT}" \
+        --decode "http://${IP_ARRAY[1]}:${DECODE_PORT}" \
+        --model "${SERVED_MODEL_NAME}" --tokenizer "${MODEL_PATH}" \
+        --output "${RUN_DIR}/pd-smoke/${ATOMESH_EXECUTION_PHASE}" \
+        --phase "${ATOMESH_EXECUTION_PHASE}" --tp 8 --dcp 8 --hybrid || smoke_rc=$?
+      rm -f "${RUN_DIR}/read-replay/enabled"
+      [[ "${smoke_rc}" == "0" ]] || return "${smoke_rc}"
+      if [[ "${ATOMESH_PR58968_REPLAY_PROBE:-0}" == "1" ]]; then
+        local endpoint
+        for endpoint in "${NODE0_ADDR}:${PREFILL_PORT}" "${IP_ARRAY[1]}:${DECODE_PORT}"; do
+          curl -fsS --max-time 60 -H 'Content-Type: application/json' \
+            -d '{"method":"pr58968_disable_probe","timeout":30}' \
+            "http://${endpoint}/collective_rpc" \
+            > "${RUN_DIR}/read-replay/disable-${endpoint}.json"
+          python3 - "${RUN_DIR}/read-replay/disable-${endpoint}.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1]) as f:
+    results = json.load(f)["results"]
+assert len(results) == 8 and all(r.get("probe_disabled") is True for r in results)
+PY
+        done
+        python3 "${ATOMESH_SCRIPT_DIR}/pd_read_replay_probe.py" "${RUN_DIR}/read-replay"
+      fi
+    fi
     run_eval
   elif [[ "${BENCHMARK_KIND}" == "aiperf_agentic" \
     && ( "${EVAL_TASK}" == "swebench_lite" || "${EVAL_TASK}" == "gsm8k" ) \

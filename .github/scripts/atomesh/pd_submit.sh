@@ -53,6 +53,13 @@ if [[ -z "${CELL_JSON}" ]]; then
   exit 2
 fi
 
+# Block unresolved candidates before any Slurm/resource side effect. Dry-run is
+# deliberately permitted so the coordinator can inspect the prepared matrix.
+if [[ "${DRY_RUN}" != "1" && "${CELL_JSON}" == *CANDIDATE_NOT_READY* ]]; then
+  printf '%s\n' 'ERROR: coordinator must replace CANDIDATE_NOT_READY before dispatch' >&2
+  exit 2
+fi
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 JOB_SCRIPT="${REPO_ROOT}/.github/scripts/atomesh/pd_slurm_job.sh"
 mkdir -p "${RESULT_DIR}"
