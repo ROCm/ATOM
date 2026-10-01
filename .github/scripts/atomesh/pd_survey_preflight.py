@@ -18,9 +18,9 @@ def check_weights(model, model_root=None):
         config = model / "config.json"
         metadata = json.loads(config.read_text())
         report["architectures"] = metadata.get("architectures", [])
-        report["quantization_config"] = metadata.get("text_config", metadata).get(
+        report["quantization_config"] = metadata.get("text_config", {}).get(
             "quantization_config"
-        )
+        ) or metadata.get("quantization_config")
         report["config_sha256"] = hashlib.sha256(config.read_bytes()).hexdigest()
         index = model / "model.safetensors.index.json"
         names = (

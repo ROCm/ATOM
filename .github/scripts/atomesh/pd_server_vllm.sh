@@ -430,6 +430,12 @@ if [[ "${ATOMESH_VLLM_CLEAN_MAIN:-0}" == "1" && -z "${ATOMESH_VLLM_SOURCE_SHA:-}
   exit 2
 fi
 if [[ -n "${ATOMESH_VLLM_SOURCE_SHA:-}" ]]; then
+  # Transport-only diagnostics never build vLLM or launch a model. Keep this
+  # inside the dispatch block so tests can safely source the function definitions.
+  if [[ "${ATOMESH_TRANSPORT_ONLY:-0}" == "1" ]]; then
+    write_metadata
+    exec python3 "${ATOMESH_SCRIPT_DIR}/pd_transport_probe.py"
+  fi
   install_native_vllm
 else
   apply_vllm_fork_overlay

@@ -1041,6 +1041,52 @@ models:
             wait_server_timeout: 1800
           run_eval: false
 
+  # Image-only transport diagnostics; Qwen files retain the existing submit gate.
+  # No model is loaded and rc=0 means collection completed, not PD passed.
+  Transport-vLLM-Survey:
+    backend: vllm
+    image: vllm/vllm-openai-rocm:nightly@sha256:659b28319fef4ea0e3d8f33e25b4c35d6f663f5d818a5b2fa06dceaf859234e4
+    model_path: "${ATOMESH_MODEL_ROOT}/Qwen/Qwen3-0.6B"
+    precision: DIAGNOSTIC_ONLY
+    env:
+      common:
+        ATOMESH_PRE_CLEAN_GPU: "1"
+        ATOMESH_TRANSPORT_ONLY: "1"
+        ATOMESH_TRANSPORT_GPU: "1"
+        ATOMESH_TRANSPORT_MORI_BYTES: "4096,2493186048"
+        VLLM_PLUGINS: ""
+        PYTHONNOUSERSITE: "1"
+        PYTHONDONTWRITEBYTECODE: "1"
+        HF_HUB_OFFLINE: "1"
+        VLLM_NO_USAGE_STATS: "1"
+    vllm:
+      served_model_name: transport-diagnostic-only
+      source:
+        repo: https://github.com/vllm-project/vllm
+        sha: b22494cc0cb4bd9db4a62fb107d92429a4a3249d
+      clean_main: 1
+      diagnostic: 1
+      diagnostic_mode: smoke
+      connector: nixl
+    server:
+      common_args:
+        extra_args: --enforce-eager
+    suites:
+      vllm:
+        - name: survey-transport-image-only-2node
+          topology: 1p1d
+          display_topology: TRANSPORT-ONLY-2NODE
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1]
+          osl: 1
+          concurrency: [1]
+          prefill: {workers: 1, tp: 1, dcp: 1}
+          decode: {workers: 1, tp: 1, dcp: 1}
+          benchmark:
+            wait_server_timeout: 900
+          run_eval: false
+
   # Candidate shared path only: runner visibility preflight remains authoritative.
   MiniMax-M3-MXFP8-vLLM-Survey:
     backend: vllm

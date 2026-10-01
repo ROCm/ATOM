@@ -185,6 +185,21 @@ class SurveyConfigurationTest(unittest.TestCase):
             report = preflight.check_weights(model, root)
             self.assertEqual(report["status"], "FILES_VISIBLE")
             self.assertEqual(report["quantization_config"]["quant_method"], "mxfp4")
+            for text_config in ({}, {"quantization_config": None}):
+                with self.subTest(text_config=text_config):
+                    (model / "config.json").write_text(
+                        json.dumps(
+                            {
+                                "text_config": text_config,
+                                "quantization_config": {"quant_method": "mxfp8"},
+                            }
+                        )
+                    )
+                    report = preflight.check_weights(model, root)
+                    self.assertEqual(report["status"], "FILES_VISIBLE")
+                    self.assertEqual(
+                        report["quantization_config"]["quant_method"], "mxfp8"
+                    )
             (model / "tokenizer.json").unlink()
             (model / "tokenizer_config.json").write_text(
                 json.dumps(
@@ -568,6 +583,52 @@ class SurveyConfigurationTest(unittest.TestCase):
                             "PENDING_REVIEW",
                         )
 
+    def test_transport_case_is_bounded_image_only_and_keeps_weight_gate(self):
+        root = SCRIPT.parents[3]
+        with patch.dict(
+            os.environ,
+            {
+                "ATOMESH_SLURM_ACCOUNT": "amd-frameworks",
+                "ATOMESH_SLURM_PARTITION": "amd-spur",
+                "ATOMESH_SLURM_SUBMIT_RUNNER": "atomesh-cicd",
+                "ATOMESH_MODEL_ROOT": "/mnt/models",
+                "ATOMESH_LOG_ROOT": "/it-share/ATOMESH_LOG",
+                "ATOMESH_PD_RANK_MAPPING_POLICY": "none",
+                "ATOMESH_1P1D_NODES": "pit2-p03-g13,pit2-p03-g42",
+                "ATOMESH_NODE_POOL": "pit2-p03-g13,pit2-p03-g42",
+            },
+        ):
+            config = pd_matrix.load_config(
+                root / ".github/benchmark/models_atomesh.yaml"
+            )
+            cells = pd_matrix.build_cells(
+                config,
+                suite="vllm",
+                model_filter={"Transport-vLLM-Survey"},
+                case_filter=None,
+                benchmark_kind_filter=None,
+                override_image=None,
+                override_benchmark_concurrency=None,
+                override_eval_concurrency=None,
+            )
+        self.assertEqual(len(cells), 1)
+        cell = cells[0]
+        self.assertEqual(cell["num_nodes"], 2)
+        self.assertEqual(cell["model_path"], "/mnt/models/Qwen/Qwen3-0.6B")
+        self.assertEqual(cell["vllm"]["connector"], "nixl")
+        self.assertEqual(cell["precision"], "DIAGNOSTIC_ONLY")
+        self.assertEqual(cell["env"]["common"]["ATOMESH_TRANSPORT_ONLY"], "1")
+        self.assertEqual(cell["env"]["common"]["ATOMESH_TRANSPORT_GPU"], "1")
+        self.assertNotIn("ATOMESH_TRANSPORT_UCX_SELECTION", cell["env"]["common"])
+        inputs = json.loads(
+            (
+                root / ".github/benchmark/rocm-pd-survey-transport-inputs.json"
+            ).read_text()
+        )
+        self.assertEqual(inputs["publish_dashboard"], "false")
+        self.assertEqual(inputs["run_all_models"], "false")
+        self.assertEqual(inputs["case_names"], cell["name"])
+
     def test_clean_source_two_nodes_and_real_server_argv(self):
         root = SCRIPT.parents[3]
         env = {
@@ -714,6 +775,156 @@ class SurveyConfigurationTest(unittest.TestCase):
                         self.assertNotIn("synthetic_acceptance_length", spec)
                     else:
                         self.assertNotIn("--speculative-config", argv)
+
+
+class TransportProbeTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.script = SCRIPT.with_name("pd_transport_probe.py")
+        spec = importlib.util.spec_from_file_location("transport_probe", cls.script)
+        cls.probe = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.probe)
+
+    def test_import_does_not_load_gpu_libraries(self):
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import runpy, sys; "
+                    f"runpy.run_path({str(self.script)!r}); "
+                    "assert 'torch' not in sys.modules; "
+                    "assert 'nixl_rocm' not in sys.modules; "
+                    "assert 'mori' not in sys.modules"
+                ),
+            ],
+            check=True,
+        )
+
+    def test_registration_sizes_are_bounded_and_not_repeated(self):
+        self.assertEqual(self.probe.parse_sizes("4096,2493186048"), [4096, 2493186048])
+        for bad in ("0", "-1", "2493186049", "1,2,3,4", "4096,4096"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.probe.parse_sizes(bad)
+
+    def test_selection_requires_observed_active_nonzero_roce_gid(self):
+        inv = {
+            "ports": [
+                {
+                    "device": "rdma3",
+                    "port": "1",
+                    "state": "4: ACTIVE",
+                    "link_layer": "Ethernet",
+                    "gids": [
+                        {
+                            "index": "1",
+                            "gid": "::ffff:10.0.0.1",
+                            "type": "RoCE v2",
+                            "ndev": "eth3",
+                        }
+                    ],
+                }
+            ]
+        }
+        self.assertEqual(
+            self.probe.validated_selection("rdma3:1@1", inv),
+            {"UCX_NET_DEVICES": "rdma3:1", "UCX_IB_GID_INDEX": "1"},
+        )
+        for bad in ("rdma4:1@1", "rdma3:1@0", "rdma3:1@1;evil"):
+            with self.subTest(bad=bad), self.assertRaises(self.probe.Unknown):
+                self.probe.validated_selection(bad, inv)
+        for field, value in (
+            ("gid", "::"),
+            ("gid", {"error": "unreadable"}),
+            ("ndev", ""),
+            ("type", {"error": "missing"}),
+        ):
+            with (
+                self.subTest(field=field, value=value),
+                patch.dict(inv["ports"][0]["gids"][0], {field: value}),
+                self.assertRaises(self.probe.Unknown),
+            ):
+                self.probe.validated_selection("rdma3:1@1", inv)
+        inv["ports"][0]["state"] = "1: DOWN"
+        with self.assertRaises(self.probe.Unknown):
+            self.probe.validated_selection("rdma3:1@1", inv)
+
+    def test_timeout_signals_child_process_group_and_reaps_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "child.log"
+            rc, timed_out = self.probe.supervise(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                log,
+                0.1,
+                os.environ.copy(),
+            )
+            self.assertIsNone(rc)
+            self.assertTrue(timed_out)
+
+    def test_child_dependency_unknown_and_backend_failure_preserve_stage(self):
+        for error, expected in (
+            (ImportError("missing"), "UNKNOWN"),
+            (RuntimeError("backend"), "FAIL"),
+        ):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as tmp:
+                args = argparse.Namespace(
+                    child="nixl-create", result=str(Path(tmp) / "result")
+                )
+                self.probe.checkpoint(args.result, "backend_create")
+                with patch.object(self.probe, "nixl_probe", side_effect=error):
+                    self.probe.child(args)
+                result = json.loads(Path(args.result).read_text())
+                self.assertEqual(result["status"], expected)
+                self.assertEqual(result["stage"], "backend_create")
+
+    def test_missing_peer_does_not_skip_local_registration_and_fail_is_not_success(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "NODE_RANK": "0",
+                "IPADDRS": "10.0.0.1,10.0.0.2",
+                "RUN_DIR": tmp,
+                "SLURM_JOB_ID": "123",
+                "ATOMESH_VLLM_SOURCE_SHA": self.probe.FIXED_SHA,
+                "DOCKER_IMAGE": "image@" + self.probe.IMAGE_DIGEST,
+                "ATOMESH_TRANSPORT_GPU": "1",
+                "ATOMESH_TRANSPORT_MORI_BYTES": "4096",
+            }
+            calls = []
+
+            def fake(argv, log, timeout, env):
+                calls.append(argv[argv.index("--child") + 1])
+                self.probe.write_json(
+                    Path(argv[argv.index("--result") + 1]),
+                    {"status": "FAIL", "stage": "backend_create"},
+                )
+                return 0, False
+
+            with (
+                patch.dict(os.environ, env, clear=True),
+                patch.object(sys, "argv", [str(self.script)]),
+                patch.object(self.probe, "inventory", return_value={"ports": []}),
+                patch.object(self.probe, "supervise", side_effect=fake),
+                patch.object(
+                    self.probe,
+                    "wait_json",
+                    side_effect=self.probe.Unknown("peer missing"),
+                ),
+            ):
+                self.assertEqual(self.probe.main(), 0)
+            report = json.loads(
+                (
+                    Path(tmp) / "transport-diagnostic/benchmark/rank-0/summary.json"
+                ).read_text()
+            )
+            self.assertEqual(calls, ["nixl-create", "mori-register"])
+            self.assertEqual(report["collection"], "COMPLETED")
+            self.assertEqual(report["model_pd"], "NOT_TESTED")
+            self.assertEqual(report["stages"]["nixl-original-create"]["status"], "FAIL")
+            self.assertEqual(
+                report["stages"]["nixl-rdma-gpu-read"]["status"], "UNKNOWN"
+            )
 
 
 if __name__ == "__main__":
