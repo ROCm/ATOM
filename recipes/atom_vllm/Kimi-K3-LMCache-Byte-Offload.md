@@ -403,6 +403,78 @@ curl -s http://127.0.0.1:8331/metrics | grep -E '^vllm:external_prefix_cache_(hi
 Note that this arm does **not** exercise the staging fence or the lookup memo,
 both of which live in `AtomLMCacheOffloadConnector`.
 
+### ATOM MP backend (`atom.offload.backend: mp`)
+
+`LMCacheMPConnector` above is LMCache's own connector: it replaces
+`AtomLMCacheOffloadConnector` outright, and with it the staging fence, the
+lookup memo and K3's recurrent-state leg. The alternative is to keep
+`AtomLMCacheOffloadConnector` and move only its *KV tier* into the
+`lmcache server` process, by setting `atom.offload.backend` to `mp`. K3's
+recurrent state stays on a per-rank in-process pool, which is what
+`lmcache.mp.state_transport: own-pool` selects.
+
+**1. Start the tier.** Same binary as above, different flags — this backend
+needs the shared-memory pool, and the SHM pool is incompatible with LMCache's
+default lazy L1 allocator:
+
+```bash
+LMCACHE_DISABLE_BANNER=1 lmcache server \
+  --host localhost --port 5555 --chunk-size 1536 \
+  --l1-size-gb 192 --eviction-policy LRU \
+  --supported-transfer-mode auto --shm-name k3mp_5555 --no-l1-use-lazy \
+  --max-gpu-workers 8 \
+  --http-host 127.0.0.1 --http-port 8080 --prometheus-port 9000
+# wait for http://127.0.0.1:8080/healthcheck to answer before starting vLLM
+```
+
+* `--no-l1-use-lazy` is not optional. With the default lazy allocator
+  `_compute_shm_pool_info` returns an empty pool, an empty pool silently
+  selects `PickleTransferStrategy`, and every chunk then travels over ZMQ —
+  the run measures the fallback rather than the path. `--shm-name` is
+  likewise inert under the default, with no warning.
+* The server drops SHM silently if `/dev/shm` cannot hold `--l1-size-gb`.
+  Grep `mpserver.log` for that warning rather than assuming.
+* `--l1-size-gb` is the whole tier, not a per-rank share.
+
+**2. Keep the ATOM connector, add the backend key.**
+
+```
+--kv-transfer-config '{"kv_connector":"AtomLMCacheOffloadConnector","kv_connector_module_path":"atom.plugin.vllm.kv_transfer.connector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"atom.offload.backend":"mp","lmcache.mp.host":"tcp://localhost","lmcache.mp.port":5555,"lmcache.mp.state_transport":"own-pool","lmcache.mp.state_cpu_size_gb":24,"lmcache.mp.tp_rank_collapse":true}}'
+```
+
+* `lmcache.mp.tp_rank_collapse` makes the eight ranks publish one replicated
+  KV object instead of eight per-rank ones. Without it the tier holds eight
+  copies of the same bytes and the effective capacity is `--l1-size-gb / TP`.
+* `lmcache.mp.state_cpu_size_gb` is **per rank** (the state tier is still
+  in-process), unlike `--l1-size-gb`.
+* `LMCACHE_*` are not exported in this mode — the tier process parses its own
+  storage options from its command line. `OFFLOAD_*` still apply, because the
+  connector is still ATOM's.
+
+**3. Transfer mode.** `lmcache.mp.mp_transfer_mode` picks which process owns
+the gather/scatter kernels: `lmcache_driven` (the default) runs them in the
+`lmcache server` process, `engine_driven` runs them in the TP worker. Both are
+correct; `lmcache_driven` is what the numbers below use.
+
+### Verifying an ATOM MP run
+
+The worker's `Stored`/`Retrieved` lines are zero here, same as for
+`LMCacheMPConnector`, so read the tier from its own endpoint and the hit
+accounting from vLLM:
+
+```bash
+curl -s http://127.0.0.1:8080/status | python3 -m json.tool   # objects, bytes
+curl -s http://127.0.0.1:8331/metrics | \
+  grep -E '^vllm:external_prefix_cache_(hits|queries)_total'
+```
+
+* `storage_manager.l1_manager.total_object_count` rising across the run is the
+  tier taking writes; `write_locked_count` must stay **0**. A non-zero
+  `write_locked_count` means a store failed and orphaned its object, and the
+  tier fills with objects that can never be read or evicted.
+* `grep -c 'ATOM LMCache offload: publishing PAGE layout' server.log` must be
+  TP (8), and the recurrent-state leg must report `state tier up` once per rank.
+
 ## Client
 
 A controlled-prefix synthetic pool, run once per concurrency rung of the sweep
@@ -510,6 +582,35 @@ The multiprocess tier reaches the in-process tier's total cache coverage but not
 its throughput: its residual cost is TTFT, which stays ~500 ms above OFF because
 a tier lookup is a cross-process round trip. Use the in-process connector unless
 the tier has to be shared across engines.
+
+#### ATOM MP backend
+
+Three arms taken in the same slot, one at a time, on image
+`rocm/atom-dev:vllm-v0.28.0-nightly_20260928-lmcache-v0.10`
+(vLLM `0.28.1.dev0+g2cf0a6915`, LMCache `0.5.5rc3+rocm7.2.4.torch2.10`), TP8 on
+eight gfx950 GPUs, **900 s** per arm, `--concurrency 16`, `SEED=1234`,
+`--max-model-len 65536`, `--gpu-memory-utilization 0.85`, `--block-size 128`,
+`cudagraph_mode=FULL_AND_PIECEWISE`. Client: the controlled-prefix synthetic
+pool from *Client* — `PREFIX_LEN=27648`, `GEN_ISL=4608`, `GEN_OSL=512`,
+`PREFIX_POOL=16`, `ENTRIES=256`; measured ISL p50 32334, OSL 512. Tier: 90
+GiB/rank in-process (`LMCACHE_MAX_LOCAL_CPU_SIZE=90`), 192 GiB whole-tier for
+MP (`--l1-size-gb 192`) plus 24 GiB/rank for the recurrent state.
+
+| arm | tok/s/GPU | req/s | per-user tok/s p50 | TTFT p50 (ms) | ITL p50 (ms) | HBM hit | tier share | n |
+|---|---|---|---|---|---|---|---|---|
+| OFF (no connector) | 65.02 | 1.0159 | 35.46 | 627 | 28.20 | 78.88% | 0.00% | 923 |
+| ON in-process | **81.57** | 1.2745 | **48.12** | 670 | 20.78 | 23.04% | 67.43% | 1158 |
+| ON ATOM MP | 74.24 | 1.1600 | **42.76** | 848 | 23.38 | 22.45% | 67.79% | 1054 |
+
+The two ON arms reach the same cache coverage — tier share 67.4% vs 67.8% of
+prompt tokens, HBM hit 23.0% vs 22.5% — so the throughput difference is not a
+hit-rate difference. The MP backend recovers 58% of the in-process arm's gain
+over OFF; its residual cost shows up as +180 ms TTFT and +2.6 ms ITL, both of
+which are the cross-process round trip the in-process tier does not pay.
+
+`HBM hit` and `tier share` are fractions of prompt tokens, computed from the
+server counters as end-minus-start deltas over the measured window;
+`tok/s/GPU` is `req/s x OSL / TP`.
 
 ### Accuracy
 
