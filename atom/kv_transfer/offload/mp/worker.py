@@ -40,6 +40,7 @@ from atom.kv_transfer.offload.mp.deployment import (
     _published_tp_replication_factor,
     _tp_replication_factor,
     _validate_mp_config,
+    _worker_server_url,
 )
 from atom.kv_transfer.offload.mp.page_views import _build_cache_views
 from atom.kv_transfer.offload.mp.transfer import (
@@ -175,12 +176,13 @@ class LMCacheMPConnector(KVConnectorBase):
         kv_worker_id, kv_world_size = _kv_worker_grid(self._config, rank)
         logger.info(
             "LMCache MP registered rank=%d pp_rank=%d kv_worker_id=%d/%d "
-            "tensors=%d groups=%d bytes_per_block=%d chunk=%d tp_replication=%d "
-            "writer=%s save=%s load=%s",
+            "server=%s tensors=%d groups=%d bytes_per_block=%d chunk=%d "
+            "tp_replication=%d writer=%s save=%s load=%s",
             rank,
             _pp_rank(self._config),
             kv_worker_id,
             kv_world_size,
+            _worker_server_url(self._config),
             len(views.tensors),
             len(views.layer_groups),
             views.bytes_per_block,

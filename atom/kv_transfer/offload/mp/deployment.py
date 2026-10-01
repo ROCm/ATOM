@@ -13,7 +13,8 @@ import hashlib
 import json
 import logging
 import urllib.request
-from dataclasses import replace
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from http.client import HTTPException
 from typing import Any
 from urllib.parse import urlsplit
@@ -289,6 +290,137 @@ def _server_urls(config: Any) -> list[str]:
     return urls
 
 
+_STAGE_SERVER_KEYS = frozenset({"url", "pp_ranks", "http_url"})
+_SINGLE_SERVER_KEYS = (
+    "lmcache.mp.host",
+    "lmcache.mp.port",
+    "lmcache.mp.server_urls",
+    "lmcache.mp.http_url",
+)
+
+
+@dataclass(frozen=True)
+class _StageServer:
+    """One LMCache server and the contiguous PP stages whose layers it holds."""
+
+    url: str
+    first_pp_rank: int
+    last_pp_rank: int
+    http_url: str | None = None
+
+    @property
+    def num_stages(self) -> int:
+        return self.last_pp_rank - self.first_pp_rank + 1
+
+
+def _stage_servers(config: Any) -> tuple[_StageServer, ...] | None:
+    """Parse ``lmcache.mp.stage_servers``; ``None`` means one server for all.
+
+    Each entry is its own LMCache world holding only its stages' layers, so
+    the servers' L1 capacities add up instead of duplicating every chunk.
+    """
+
+    extra = _extra_config(config)
+    configured = extra.get("lmcache.mp.stage_servers")
+    if configured is None:
+        return None
+    for key in _SINGLE_SERVER_KEYS:
+        if key in extra:
+            raise ValueError(
+                f"lmcache.mp.stage_servers cannot be combined with {key}; "
+                "give every server's address in its stage_servers entry"
+            )
+    _, pp_size = _validate_mp_config(config)
+    parallel_config = getattr(config, "parallel_config", None)
+    dp_size = offcfg._strict_integer(
+        "data_parallel_size",
+        getattr(
+            parallel_config,
+            "data_parallel_size",
+            getattr(config, "data_parallel_size", 1),
+        )
+        or 1,
+        minimum=1,
+    )
+    if dp_size != 1:
+        raise NotImplementedError(
+            "lmcache.mp.stage_servers does not support DP "
+            f"(data_parallel_size={dp_size})"
+        )
+    if not isinstance(configured, (list, tuple)) or len(configured) < 2:
+        raise ValueError(
+            "lmcache.mp.stage_servers must list at least 2 servers; use "
+            "lmcache.mp.host/port for a single server"
+        )
+    servers = []
+    next_pp_rank = 0
+    for index, entry in enumerate(configured):
+        where = f"lmcache.mp.stage_servers[{index}]"
+        if not isinstance(entry, dict):
+            raise TypeError(f"{where} must be an object")
+        unknown = sorted(set(entry) - _STAGE_SERVER_KEYS)
+        if unknown:
+            raise ValueError(f"{where} has unknown keys {unknown}")
+        url = str(entry.get("url", "")).strip()
+        if not url:
+            raise ValueError(f"{where}.url must be non-empty")
+        url = url if "://" in url else f"tcp://{url}"
+        ranks = entry.get("pp_ranks")
+        if (
+            not isinstance(ranks, (list, tuple))
+            or not ranks
+            or any(type(rank) is not int for rank in ranks)
+        ):
+            raise ValueError(f"{where}.pp_ranks must be a non-empty list of ints")
+        if list(ranks) != list(range(next_pp_rank, next_pp_rank + len(ranks))):
+            raise ValueError(
+                f"{where}.pp_ranks must be the consecutive stages starting at "
+                f"{next_pp_rank}, got {list(ranks)}; entries must cover every "
+                "PP stage once, in order"
+            )
+        next_pp_rank += len(ranks)
+        if next_pp_rank > pp_size:
+            raise ValueError(
+                f"{where}.pp_ranks {list(ranks)} is outside [0, {pp_size})"
+            )
+        http_url = entry.get("http_url")
+        if http_url is not None:
+            http_url = str(http_url).strip().rstrip("/")
+            if not http_url:
+                raise ValueError(f"{where}.http_url must be non-empty")
+            http_url = http_url if "://" in http_url else f"http://{http_url}"
+        servers.append(_StageServer(url, ranks[0], ranks[-1], http_url))
+    if next_pp_rank != pp_size:
+        raise ValueError(
+            f"lmcache.mp.stage_servers covers PP stages [0, {next_pp_rank}) "
+            f"but the pipeline has {pp_size}"
+        )
+    urls = [server.url for server in servers]
+    if len(set(urls)) != len(urls):
+        raise ValueError(f"lmcache.mp.stage_servers repeats a url: {urls}")
+    return tuple(servers)
+
+
+def _stage_server_for(config: Any, pp_rank: int) -> _StageServer | None:
+    """The stage server holding ``pp_rank``'s layers, or ``None`` if unsplit."""
+
+    servers = _stage_servers(config)
+    if servers is None:
+        return None
+    return next(
+        server
+        for server in servers
+        if server.first_pp_rank <= pp_rank <= server.last_pp_rank
+    )
+
+
+def _worker_server_url(config: Any) -> str:
+    """The LMCache server this engine's PP stage stores to and loads from."""
+
+    server = _stage_server_for(config, _pp_rank(config))
+    return _server_urls(config)[0] if server is None else server.url
+
+
 def _pp_stage_layout(config: Any) -> dict[str, Any]:
     """Describe how the model's KV layers are split across PP stages.
 
@@ -309,8 +441,16 @@ def _pp_stage_layout(config: Any) -> dict[str, Any]:
     }
 
 
-def _model_namespace(config: Any, *, checkpoint_spec: Any = None) -> str:
-    """Build a model/layout namespace shared by scheduler and workers."""
+def _model_namespace(
+    config: Any,
+    *,
+    checkpoint_spec: Any = None,
+    stage_server: _StageServer | None = None,
+) -> str:
+    """Build a model/layout namespace shared by scheduler and workers.
+
+    ``stage_server`` scopes the namespace to that server's stage group.
+    """
 
     cfg = offcfg.build_lmcache_config(_storage_kv_transfer_config(config))
     world_size = offcfg.lmcache_replica_world_size(config)
@@ -332,6 +472,13 @@ def _model_namespace(config: Any, *, checkpoint_spec: Any = None) -> str:
         ).encode()
         stage_digest = hashlib.blake2b(stage_layout, digest_size=8).hexdigest()
         namespace = f"{namespace}::pp-{stage_digest}"
+    if stage_server is not None:
+        # The pp digest fixes every stage's layer span, so it and the group's
+        # stage range name exactly the layers that group's objects hold. Its
+        # kv ranks are group-local: kv rank 0 is a different stage per group.
+        namespace += (
+            f"::stages-{stage_server.first_pp_rank}-{stage_server.last_pp_rank}"
+        )
     if checkpoint_spec is not None:
         hf = getattr(config, "hf_config", None)
         hf = getattr(hf, "text_config", hf)
@@ -354,6 +501,8 @@ def _kv_worker_grid(config: Any, tp_rank: int) -> tuple[int, int]:
     Every PP stage holds a disjoint layer slice, so it is its own group of
     LMCache kv ranks: ``worker_id = pp_rank * ranks_per_stage + collapsed TP
     rank``. A scheduler lookup without a worker id fans out over all of them.
+    With ``lmcache.mp.stage_servers`` the world is the stage server's group
+    and ``pp_rank`` counts from the group's first stage.
     """
 
     tp_size, pp_size = _validate_mp_config(config)
@@ -361,9 +510,14 @@ def _kv_worker_grid(config: Any, tp_rank: int) -> tuple[int, int]:
         raise ValueError(f"LMCache MP TP rank {tp_rank} is outside [0, {tp_size})")
     replication_factor = _tp_replication_factor(config)
     ranks_per_stage = tp_size // replication_factor
+    pp_rank = _pp_rank(config)
+    server = _stage_server_for(config, pp_rank)
+    first_pp_rank, num_stages = (
+        (0, pp_size) if server is None else (server.first_pp_rank, server.num_stages)
+    )
     return (
-        _pp_rank(config) * ranks_per_stage + tp_rank // replication_factor,
-        pp_size * ranks_per_stage,
+        (pp_rank - first_pp_rank) * ranks_per_stage + tp_rank // replication_factor,
+        num_stages * ranks_per_stage,
     )
 
 
@@ -397,11 +551,28 @@ def _validate_pp_l2_layouts(config: Any) -> None:
     and refuses when that cannot be answered.
     ``lmcache.mp.server_per_rank_layouts: true`` asserts the server keeps one
     layout per kv rank, which lifts the restriction.
+
+    With ``lmcache.mp.stage_servers`` each server is checked for its own
+    stage group: a one-stage group registers one layout, and ``auto`` asks
+    the entry's ``http_url``, since two servers on one host cannot share the
+    default HTTP port.
     """
 
     _, pp_size = _validate_mp_config(config)
-    if pp_size == 1:
-        return
+    servers = _stage_servers(config)
+    if servers is None:
+        if pp_size == 1:
+            return
+        # (stage count, HTTP frontend lookup, label) per server to check.
+        targets = [(pp_size, lambda: _http_url(config), "")]
+    else:
+        targets = [
+            (server.num_stages, lambda server=server: server.http_url, server.url)
+            for server in servers
+            if server.num_stages > 1
+        ]
+        if not targets:
+            return
     extra = _extra_config(config)
     per_rank_layouts = extra.get("lmcache.mp.server_per_rank_layouts", False)
     if type(per_rank_layouts) is not bool:
@@ -416,9 +587,27 @@ def _validate_pp_l2_layouts(config: Any) -> None:
         )
     if l2 == "none":
         return
+    for num_stages, http_url, server_label in targets:
+        _refuse_l2_for_stages(num_stages, l2, http_url, server_label)
+
+
+def _refuse_l2_for_stages(
+    num_stages: int,
+    l2: str,
+    http_url: Callable[[], str | None],
+    server_label: str,
+) -> None:
+    """Raise unless ``l2='auto'`` finds no L2 on a server of ``num_stages``."""
+
     reason = f"lmcache.mp.l2={l2!r}"
     if l2 == "auto":
-        url = _http_url(config) + "/config/adapters"
+        base_url = http_url()
+        if base_url is None:
+            raise ValueError(
+                f"lmcache.mp.l2='auto' cannot probe stage server {server_label}: "
+                "set lmcache.mp.l2 or the entry's http_url"
+            )
+        url = base_url + "/config/adapters"
         try:
             adapters = _fetch_l2_adapters(url)
         except (OSError, TypeError, ValueError, HTTPException) as exc:
@@ -431,12 +620,14 @@ def _validate_pp_l2_layouts(config: Any) -> None:
                 for a in adapters
             ]
             reason = f"the server has L2 adapters {names}"
+    served_by = f" on {server_label}" if server_label else ""
     raise NotImplementedError(
-        f"lmcache_mp with {pp_size} PP stages cannot use an LMCache L2: "
-        f"{reason}. LMCache keeps one layout per model and would size L2 "
-        "prefetch buffers for one stage's layout. Set lmcache.mp.l2='none' for "
-        "an L1-only server, or lmcache.mp.server_per_rank_layouts=true for a "
-        "server that keeps per-rank layouts"
+        f"lmcache_mp with {num_stages} PP stages{served_by} cannot use an "
+        f"LMCache L2: {reason}. LMCache keeps one layout per model and would "
+        "size L2 prefetch buffers for one stage's layout. Set "
+        "lmcache.mp.l2='none' for an L1-only server, or "
+        "lmcache.mp.server_per_rank_layouts=true for a server that keeps "
+        "per-rank layouts"
     )
 
 
@@ -488,14 +679,56 @@ def _make_scheduler_adapter(config: Any, *, checkpoint_spec: Any = None) -> Any:
             return replace(key, num_kv_readers=num_kv_readers)
 
     extra = _extra_config(config)
-    return _ReaderAwareSchedulerAdapter(
-        server_url=_server_urls(config)[0],
-        context=zmq.Context.instance(),
-        model_name=_model_namespace(config, checkpoint_spec=checkpoint_spec),
-        block_size=int(config.kv_cache_block_size),
-        parallel_config=_parallel_strategy(config, 0),
-        mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
+    mq_timeout = float(extra.get("lmcache.mp.mq_timeout", 300.0))
+    servers = _stage_servers(config)
+    if servers is None:
+        return _ReaderAwareSchedulerAdapter(
+            server_url=_server_urls(config)[0],
+            context=zmq.Context.instance(),
+            model_name=_model_namespace(config, checkpoint_spec=checkpoint_spec),
+            block_size=int(config.kv_cache_block_size),
+            parallel_config=_parallel_strategy(config, 0),
+            mq_timeout=mq_timeout,
+        )
+
+    from lmcache.integration.atom import AtomMPParallelConfig
+
+    from atom.kv_transfer.offload.mp.stage_servers import (
+        _StageServersSchedulerAdapter,
     )
+
+    tp_size, _ = _validate_mp_config(config)
+    ranks_per_stage = tp_size // num_kv_readers
+    # A lookup blocks on its submit; a dead stage server must not stall the
+    # scheduler longer than a lookup may take anyway.
+    mq_timeout = min(mq_timeout, float(extra.get("lmcache.mp.lookup_timeout", 30.0)))
+    adapters = []
+    try:
+        for server in servers:
+            adapters.append(
+                _ReaderAwareSchedulerAdapter(
+                    server_url=server.url,
+                    context=zmq.Context.instance(),
+                    model_name=_model_namespace(
+                        config, checkpoint_spec=checkpoint_spec, stage_server=server
+                    ),
+                    block_size=int(config.kv_cache_block_size),
+                    parallel_config=AtomMPParallelConfig(
+                        world_size=server.num_stages * ranks_per_stage,
+                        worker_id=0,
+                        # Legacy wire field; LMCache ignores it.
+                        tp_size=tp_size,
+                    ),
+                    mq_timeout=mq_timeout,
+                )
+            )
+        return _StageServersSchedulerAdapter(
+            adapters, [server.url for server in servers]
+        )
+    except Exception:
+        for adapter in adapters:
+            adapter.shutdown()
+        raise
 
 
 def _make_worker_adapter(
@@ -507,9 +740,13 @@ def _make_worker_adapter(
     _validate_pp_l2_layouts(config)
     extra = _extra_config(config)
     return AtomMPWorkerAdapter(
-        server_url=_server_urls(config)[0],
+        server_url=_worker_server_url(config),
         context=zmq.Context.instance(),
-        model_name=_model_namespace(config, checkpoint_spec=checkpoint_spec),
+        model_name=_model_namespace(
+            config,
+            checkpoint_spec=checkpoint_spec,
+            stage_server=_stage_server_for(config, _pp_rank(config)),
+        ),
         block_size=int(config.kv_cache_block_size),
         parallel_config=_parallel_strategy(config, tp_rank),
         mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
