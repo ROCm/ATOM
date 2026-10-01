@@ -2789,6 +2789,37 @@ class TestStalledOffloadSaveReclaim:
         assert seq.id in s.deferred_free_blocks
         assert not caplog.records
 
+    @pytest.mark.parametrize("keeps_reports", [False, True])
+    def test_pp_quorum_forgets_only_saves_no_leg_still_reports(
+        self, monkeypatch, keeps_reports
+    ):
+        """A P/D send stalls next to an LMCache MP save under PP.
+
+        The composite does not wait (the send leg would act on an abandon), so
+        the save is abandoned; but the MP leg keeps its lease until its save
+        reports, so the PP quorum must not be told to drop those reports.
+        """
+        import time as _time
+
+        seq = SimpleNamespace(id=1, _deferred_save_at=_time.monotonic() - 500.0)
+        abandoned: list = []
+        connector = SimpleNamespace(
+            save_abandon_timeout_s=lambda: 100.0,
+            abandon_save=abandoned.append,
+            should_defer_free=lambda _seq: True,
+            waits_for_transfer_report=lambda _seq: False,
+            keeps_save_reports_after_abandon=lambda _seq: keeps_reports,
+        )
+        s, _freed = self._sched(monkeypatch, [seq], connector=connector)
+        forgotten: list = []
+        s.on_save_abandoned = forgotten.append
+
+        s._reconcile_stalled_deferred_saves()
+
+        assert abandoned == ["1"]
+        assert s._abandoned_saves == 1
+        assert forgotten == ([] if keeps_reports else [1])
+
     def test_a_claim_nobody_will_retire_is_escalated(self, monkeypatch, caplog):
         """The retry is not an escape hatch on its own, so it must be visible.
 

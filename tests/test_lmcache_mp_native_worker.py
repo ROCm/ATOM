@@ -143,6 +143,13 @@ def request(*, loading=False, units=(0, 25, 31), generation=1, hbm=0):
     )
 
 
+def test_native_worker_refuses_pp():
+    pp_config = config()
+    pp_config.pipeline_parallel_size = 2
+    with pytest.raises(NotImplementedError, match="native-state.*does not support PP"):
+        NativeStateLMCacheMPConnector(pp_config)
+
+
 def test_store_transmits_page_zero_as_real_native_unit(worker):
     req = request()
     worker._submit_save(req, object())

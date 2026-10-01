@@ -204,7 +204,9 @@ class PPEngineCoreProc(EngineCore):
 
         Fires from `Scheduler._reconcile_stalled_deferred_saves`, so the
         aggregator gives up on exactly the requests the scheduler already has,
-        and the two cannot drift.
+        and the two cannot drift. Not for a request whose save an LMCache MP
+        leg still waits on (`Scheduler._connector_keeps_save_reports`): that
+        leg releases its lease only when the quorum delivers the report.
         """
         # A save can time out before any stage reports. Its first late report
         # must encounter the terminal record too, not create a fresh tally.
