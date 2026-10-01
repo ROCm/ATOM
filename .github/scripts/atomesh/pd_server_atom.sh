@@ -1249,7 +1249,7 @@ snapshot_eval_metrics() {
 }
 
 run_lm_eval() {
-  if command -v lm_eval >/dev/null 2>&1; then
+  if [[ "${ATOMESH_EVAL_ONLY:-0}" != "1" ]] && command -v lm_eval >/dev/null 2>&1; then
     lm_eval "$@"
     return
   fi
@@ -1287,8 +1287,11 @@ run_eval() {
     eval_extra_args+=(--fewshot_as_multiturn)
   fi
   local eval_model_args_extra=""
+  if [[ "${ATOMESH_EVAL_ONLY:-0}" == "1" ]]; then
+    eval_model_args_extra=",timeout=${ATOMESH_EVAL_REQUEST_TIMEOUT:-3600},seed=1234"
+  fi
   if [[ -n "${EVAL_MAX_GEN_TOKS}" ]]; then
-    eval_model_args_extra=",max_gen_toks=${EVAL_MAX_GEN_TOKS}"
+    eval_model_args_extra="${eval_model_args_extra},max_gen_toks=${EVAL_MAX_GEN_TOKS}"
   fi
   local eval_model_args_base
   if [[ "${EVAL_MODEL_TYPE}" == "local-chat-completions" ]]; then
@@ -1316,6 +1319,7 @@ run_eval() {
       --model_args "${eval_model_args_base}${eval_conc},max_retries=3${eval_model_args_extra}" \
       --tasks gsm8k \
       --num_fewshot "${EVAL_FEWSHOT}" \
+      --seed 0,1234,1234,1234 \
       "${limit_arg[@]}" \
       "${eval_extra_args[@]}" \
       --log_samples \

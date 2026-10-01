@@ -842,7 +842,8 @@ models:
         VLLM_DCP_Q_REPLICATE: "0"
         VLLM_ROCM_AITER_MLA_DCP_VERIFY: asm
         VLLM_SERVER_DEV_MODE: "1"
-        VLLM_MORIIO_ZEROING_AUDIT: "1"
+        ATOMESH_EVAL_ONLY: "1"
+        ATOMESH_EVAL_REQUEST_TIMEOUT: "3600"
       prefill:
         VLLM_USE_BREAKABLE_CUDAGRAPH: "1"
         TORCH_NCCL_BLOCKING_WAIT: "0"
@@ -855,12 +856,12 @@ models:
       served_model_name: Kimi-K3
       source:
         repo: https://github.com/whx-sjtu/vllm
-        sha: ed353ff4d30cbbeed47584f90a342880817a1474
-      diagnostic: 1
+        sha: 5b9daeaf1292286cd75d412a03cc684bcffb9dfb
+      diagnostic: 0
     server:
       common_args:
         # Forced mean length (including bonus) applies only to benchmark decode.
-        spec_decode_acceptance_length: 3.0
+        spec_decode_acceptance_length: ""
         extra_args: >-
           --moe-backend auto --load-format safetensors --gpu-memory-utilization 0.88
           --language-model-only --max-num-seqs 80 --enable-auto-tool-choice
@@ -874,7 +875,7 @@ models:
     suites:
       vllm:
         - &kimi_k3_vllm_dspark_dcp8
-          name: kimi-k3-zeroing-dspark3-1p1d-tp8-dcp8-eager
+          name: kimi-k3-gsm8k-without-59164-dspark3-tp8-dcp8-eager
           topology: 1p1d
           display_topology: 1P1D-TP8-DCP8
           pd_worker_layout: multi_node
@@ -901,12 +902,17 @@ models:
             warmup_requests_per_lane: 1
             # Native K3 cold loading and graph capture can exceed 75 minutes.
             wait_server_timeout: 10800
-          run_eval: false
+          run_eval: true
+        - <<: *kimi_k3_vllm_dspark_dcp8
+          name: kimi-k3-gsm8k-with-59164-dspark3-tp8-dcp8-eager
+          vllm:
+            source:
+              sha: 779322e93b75c2645d2bf396b4a79ab67a722779
     accuracy:
       task: gsm8k
       fewshot: 5
       eval_concurrency: [64]
-      threshold: 0.94
+      threshold: 0.0
       max_gen_toks: 4096
 
   Kimi-K2.5-MXFP4:

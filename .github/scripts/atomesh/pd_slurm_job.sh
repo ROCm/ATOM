@@ -37,6 +37,11 @@ if [[ "${BENCHMARK_KIND:-random}" == "aiperf_agentic" \
   && ( "${RUN_EVAL:-false}" == "true" || "${RUN_EVAL:-false}" == "1" ) ]]; then
   EXECUTION_PHASES=(benchmark eval)
 fi
+if [[ "${ATOMESH_ENV_ATOMESH_EVAL_ONLY:-0}" == "1" ]]; then
+  [[ "${RUN_EVAL:-false}" == "true" || "${RUN_EVAL:-false}" == "1" ]] || exit 2
+  [[ "${ATOMESH_VLLM_DIAGNOSTIC:-0}" == "0" ]] || exit 2
+  EXECUTION_PHASES=(eval)
+fi
 ATOMESH_RESTART_PORT_OFFSET="${ATOMESH_RESTART_PORT_OFFSET:-1000}"
 if [[ "${#EXECUTION_PHASES[@]}" -gt 1 && ! "${ATOMESH_RESTART_PORT_OFFSET}" =~ ^[1-9][0-9]*$ ]]; then
   echo "ERROR: ATOMESH_RESTART_PORT_OFFSET must be a positive integer" >&2
@@ -162,6 +167,7 @@ start_vllm_router() {
     --policy "${ROUTER_POLICY}" \
     --prefill-policy "${ROUTER_POLICY}" \
     --decode-policy "${ROUTER_POLICY}" \
+    --request-timeout-secs "${ATOMESH_ENV_ATOMESH_EVAL_REQUEST_TIMEOUT:-1800}" \
     --log-level info >/dev/null || return $?
   docker logs -f "${container}" > "${log_file}" 2>&1 &
 }
