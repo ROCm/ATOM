@@ -1680,7 +1680,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             rank ``(p//S) % W`` at local index ``(p//(S*W))*S + p%S`` (S=1 -> the
             round-robin ``p%W`` / ``p//W``), hence
             ``src = owner(p) * sum(Lpad) + cu_pad[b] + local_index(p)``.
+            Read only by the ``ATOM_DCP_INDEXER_PREFILL_LOCAL=0`` fallback: the
+            local-shard path never reconstructs the global key order.
+
+        ``dcp_indexer_local_ks`` / ``dcp_indexer_local_ke``
+            per-QUERY-TOKEN causal window in the LOCAL shard's column space, for
+            the scorer that reads only this rank's 1/W. See the build below.
         """
+        from atom.distributed.dcp_layout import dcp_prefill_local_window
         from atom.model_ops.dcp_ops import dcp_local_index, dcp_owner_rank
 
         W = self.dcp_world_size
@@ -1713,6 +1720,30 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         ).to(dev, non_blocking=True)
         attn_metadata.dcp_indexer_gather_index = torch.from_numpy(
             src.astype(np.int32)
+        ).to(dev, non_blocking=True)
+
+        # Per-QUERY-TOKEN causal window in the LOCAL shard's column space. The
+        # global window of query token t in request b is
+        # [cu_seqlens_k[b], cu_seqlens_k[b] + p_t + 1), built from the same
+        # p_t = cached_len[b] + offset_in_chunk[t] that `cu_seqlen_ke` uses.
+        # Locally the start is the request's local region base and the end
+        # counts only the positions this rank owns below p_t + 1.
+        #
+        # dcp_local_prefix_count(p_t + 1) <= this rank's real local length <=
+        # lpad[b], so a scorer driven by these bounds never reaches the
+        # inter-rank padding rows that cp_gather_indexer_k_quant_cache leaves
+        # uninitialized.
+        q_counts = (
+            var["cu_seqlens_q"].np[1 : bs + 1] - var["cu_seqlens_q"].np[:bs]
+        ).astype(np.int64)
+        local_ks, local_ke = dcp_prefill_local_window(
+            cu_pad, g_lens, q_counts, self.dcp_rank, W, S
+        )
+        attn_metadata.dcp_indexer_local_ks = torch.from_numpy(
+            local_ks.astype(np.int32)
+        ).to(dev, non_blocking=True)
+        attn_metadata.dcp_indexer_local_ke = torch.from_numpy(
+            local_ke.astype(np.int32)
         ).to(dev, non_blocking=True)
         if self._indexer_fp4:
             self._build_dcp_indexer_fp4_prefill_meta(
