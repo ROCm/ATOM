@@ -263,6 +263,35 @@ def _stable_config_value(value: Any) -> Any:
     )
 
 
+# A `ParallelConfig` describes where *this* process sits, not what the bytes
+# look like, so it must not reach the namespace digest.
+_PAGE_PLACEMENT_FIELDS = frozenset({"target_parallel_config", "draft_parallel_config"})
+
+
+def _stable_speculative_config(value: Any) -> Any:
+    """The speculative config with per-process placement removed.
+
+    The parallel configs carry this process' own coordinates -- `rank`,
+    `data_parallel_rank`, `node_rank` -- so hashing them gives every TP rank a
+    different PAGE namespace. Under `tp_rank_collapse` that is silent data
+    loss: the one writing rank publishes its bytes under its own name, the
+    other ranks look their own names up, and the tier answers every one of
+    those lookups with a miss and no error anywhere (the failure mode
+    `_canonical_head_dim` documents, reached by a different field). Placement
+    is not a property of the bytes; the parallelism that is -- TP and DCP width
+    -- `build_page_namespace` hashes explicitly.
+    """
+
+    stable = _stable_config_value(value)
+    if isinstance(stable, dict):
+        return {
+            key: item
+            for key, item in stable.items()
+            if key not in _PAGE_PLACEMENT_FIELDS
+        }
+    return stable
+
+
 def _canonical_head_dim(hf: object) -> int | None:
     """Return the attention head dim every process agrees on.
 
@@ -371,7 +400,7 @@ def build_page_namespace(
         # The config-time snapshot when there is one; see `Config.__post_init__`.
         "hf_geometry": getattr(config, "offload_page_hf_geometry", None)
         or _stable_hf_geometry(hf),
-        "speculative_config": _stable_config_value(
+        "speculative_config": _stable_speculative_config(
             getattr(config, "speculative_config", None)
         ),
     }
