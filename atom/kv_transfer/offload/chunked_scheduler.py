@@ -452,6 +452,40 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if hook is not None:
             hook(live_operations)
 
+    def log_save_lease_stats(
+        self, *, interval_s: float = 60.0, force: bool = False
+    ) -> None:
+        """Print what the dense save leg is still holding, once per *interval_s*.
+
+        The recurrent leg already ships its counters at INFO for the same
+        reason: a leg that reports nothing cannot be shown to be working.
+        These are the sets that decide whether a finished request's blocks go
+        back to the pool, so a pool that drains to zero free blocks with no
+        running request has its explanation in this line.
+        """
+        now = time.monotonic()
+        last = getattr(self, "_last_save_lease_stats_log", 0.0)
+        if not force and now - last < interval_s:
+            return
+        self._last_save_lease_stats_log = now
+        stats = {
+            "save_inflight": len(self._save_inflight),
+            "save_owner": len(self._save_operation_owner),
+            "save_block_maps": len(self._save_operation_blocks),
+            "leases": len(self._save_lease_blocks),
+            "leased_blocks": sum(
+                len(blocks) for blocks in self._save_lease_blocks.values()
+            ),
+            "retry_blocked": len(self._save_retry_blocked),
+            "quiescent": len(self._save_quiescent),
+            "active_loads": len(self._active_load_operations),
+            "src_safe_released": self.total_source_safe_released_blocks,
+        }
+        logger.info(
+            "ATOM LMCache offload: save leases %s",
+            " ".join(f"{k}={v}" for k, v in stats.items()),
+        )
+
     def reconcile_recurrent_rides(self) -> None:
         """Give back the pins of rides whose transfer is over.
 

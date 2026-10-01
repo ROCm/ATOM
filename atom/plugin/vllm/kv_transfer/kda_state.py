@@ -589,6 +589,12 @@ class KdaBoundaryPlanner:
             "ride_recorded": 0,
             "ride_served": 0,
             "ride_missing": 0,
+            # Which gate in `source_blocks_for` declined; they sum to
+            # ride_missing. One number for three reasons could not say
+            # whether the state is uncommitted or the boundary is wrong.
+            "ride_missing_boundary_unaligned": 0,
+            "ride_missing_boundary_past_hashes": 0,
+            "ride_missing_no_group_cached": 0,
             "ride_pinned": 0,
             "ride_unpinned": 0,
         }
@@ -947,20 +953,25 @@ class KdaBoundaryPlanner:
         cannot be restored.
         """
         pool = self._pool
+        self._last_ride_gate = "no_pool"
         if pool is None:
             return ()
         block_hashes = getattr(request, "block_hashes", None) or ()
         boundary_tokens = int(boundary_tokens)
         if boundary_tokens <= 0 or boundary_tokens % self.hash_block_size:
+            self._last_ride_gate = "boundary_unaligned"
             return ()
         index = boundary_tokens // self.hash_block_size - 1
         if index < 0 or index >= len(block_hashes):
+            self._last_ride_gate = "boundary_past_hashes"
             return ()
         blocks = pool.get_cached_block(block_hashes[index], list(self.group_ids))
         if not blocks:
+            self._last_ride_gate = "no_group_cached"
             return ()
         block_ids = tuple(int(block.block_id) for block in blocks)
         if any(block_id <= NULL_BLOCK_ID for block_id in block_ids):
+            self._last_ride_gate = "no_group_cached"
             return ()
         return block_ids
 
@@ -995,6 +1006,10 @@ class KdaBoundaryPlanner:
         block_ids = recorded or (self.source_blocks_for(request, end) or None)
         if not block_ids:
             self._counters["ride_missing"] += 1
+            gate = getattr(self, "_last_ride_gate", None)
+            key = f"ride_missing_{gate}"
+            if key in self._counters:
+                self._counters[key] += 1
             return None
         self._counters["ride_served"] += 1
         pool = self._pool
