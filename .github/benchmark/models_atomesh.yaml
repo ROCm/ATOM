@@ -413,6 +413,10 @@ models:
               # P->D MLA rows land in a GPU pool per decode rank, one RDMA
               # descriptor per 8 MiB slot, then scatter into the paged KV.
               ATOM_PD_MLA_LANDING: "1"
+              # A/B arm: also land in pinned host memory when HBM is short
+              # (requests landed on host skip MLA landing).
+              ATOM_PD_HOST_LANDING_BLOCKS: "160000"
+              ATOM_PD_HOST_LANDING_HBM_RESERVE_BLOCKS: "256"
               DECODE_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
 
