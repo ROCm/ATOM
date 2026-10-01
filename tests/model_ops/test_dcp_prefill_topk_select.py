@@ -23,6 +23,7 @@ import torch
 pytest.importorskip("triton", reason="requires Triton")
 
 from atom.model_ops.dcp_topk_select import (
+    dcp_prefill_candidate_exchange,
     emit_owned_slots,
     local_histogram,
     reduce_bracket,
@@ -389,3 +390,149 @@ def test_emit_preserves_candidate_order():
     want = bt[0, (jl // bs).long()].to(torch.int32) * bs + (jl % bs).to(torch.int32)
     start = int(out_indptr[t].item())
     assert torch.equal(out_indices[start : start + n], want)
+
+
+@needs_gpu
+def test_exchange_emits_a_superset_of_the_exact_global_topk():
+    """The whole point of the design: nothing the dcp=1 path selects is lost."""
+    torch.manual_seed(21)
+    W, rows, k, topk, nbins = 4, 6, 64, 16, 32
+    block_size, cols, num_req = 4, 16, 2
+    batch_ids = torch.tensor([0, 0, 1, 1, 0, -1], dtype=torch.int32, device="cuda")
+    block_table = (
+        torch.randperm(256, device="cuda")[: num_req * cols]
+        .reshape(num_req, cols)
+        .to(torch.int32)
+    )
+    local_ks = torch.zeros(rows, dtype=torch.int32, device="cuda")
+
+    shards_val, shards_idx = [], []
+    for r in range(W):
+        v = _padded_rows(rows, k, [k, k, 10, k, 0, k], seed=30 + r)
+        i = torch.full((rows, k), -1, dtype=torch.int32, device="cuda")
+        for t in range(rows):
+            n = int(torch.isfinite(v[t]).sum().item())
+            i[t, :n] = torch.randperm(cols * block_size, device="cuda")[:n].to(
+                torch.int32
+            )
+        shards_val.append(v)
+        shards_idx.append(i)
+
+    stats = torch.stack([row_bracket_stats(s) for s in shards_val], dim=0)
+    lo, hi = reduce_bracket(stats)
+    hist = sum(local_histogram(s, lo, hi, nbins) for s in shards_val)
+    thr = threshold_from_histogram(hist, lo, hi, topk)
+
+    # What the dcp=1 path would select: the exact global top-k per row.
+    allv = torch.cat(shards_val, dim=1)
+    for t in range(rows):
+        if batch_ids[t].item() < 0:
+            continue
+        finite = allv[t][torch.isfinite(allv[t])]
+        if finite.numel() == 0:
+            continue
+        want = torch.sort(finite, descending=True).values[: min(topk, finite.numel())]
+        cut = want[-1].item()
+        assert thr[t].item() <= cut + 1e-6, f"row {t} cut above the exact k-th"
+
+    # And every rank's emit admits exactly its own candidates at or above the cut.
+    for r in range(W):
+        out_indices = torch.full((rows * 256,), -7, dtype=torch.int32, device="cuda")
+        out_indptr = torch.zeros(rows + 1, dtype=torch.int32, device="cuda")
+        counts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+        emit_owned_slots(
+            shards_val[r],
+            shards_idx[r],
+            thr,
+            local_ks,
+            batch_ids,
+            block_table,
+            block_size,
+            out_indices,
+            out_indptr,
+            counts,
+        )
+        for t in range(rows):
+            if batch_ids[t].item() < 0:
+                assert counts[t].item() == 0
+                continue
+            want_n = int(
+                ((shards_val[r][t] >= thr[t]) & torch.isfinite(shards_val[r][t])).sum()
+            )
+            assert counts[t].item() == want_n
+
+
+@needs_gpu
+def test_exchange_orchestrator_matches_the_step_by_step_composition():
+    class _Group:
+        """GroupCoordinator stand-in: the W shards already live in this process."""
+
+        def __init__(self, stacked_stats, summed_hist, world_size):
+            self._stats = stacked_stats
+            self._hist = summed_hist
+            self.world_size = world_size
+            self.rank_in_group = 0
+
+        def all_gather(self, x, dim=0):
+            return self._stats.reshape(-1, x.shape[-1])
+
+        def all_reduce(self, x):
+            return self._hist
+
+    torch.manual_seed(22)
+    W, rows, k, topk, nbins = 2, 3, 32, 8, 16
+    block_size, cols, num_req = 4, 8, 1
+    batch_ids = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    block_table = (
+        torch.arange(num_req * cols, device="cuda")
+        .reshape(num_req, cols)
+        .to(torch.int32)
+    )
+    local_ks = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    shards = [_padded_rows(rows, k, [k, k, k], seed=40 + r) for r in range(W)]
+    idx0 = (
+        torch.arange(k, dtype=torch.int32, device="cuda").expand(rows, k).contiguous()
+    )
+
+    stats = torch.stack([row_bracket_stats(s) for s in shards], dim=0)
+    lo, hi = reduce_bracket(stats)
+    hist = sum(local_histogram(s, lo, hi, nbins) for s in shards)
+    thr_ref = threshold_from_histogram(hist, lo, hi, topk)
+
+    ref_i = torch.full((rows * 64,), -7, dtype=torch.int32, device="cuda")
+    ref_p = torch.zeros(rows + 1, dtype=torch.int32, device="cuda")
+    ref_c = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    emit_owned_slots(
+        shards[0],
+        idx0,
+        thr_ref,
+        local_ks,
+        batch_ids,
+        block_table,
+        block_size,
+        ref_i,
+        ref_p,
+        ref_c,
+    )
+
+    got_i = torch.full((rows * 64,), -7, dtype=torch.int32, device="cuda")
+    got_p = torch.zeros(rows + 1, dtype=torch.int32, device="cuda")
+    got_c = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    dcp_prefill_candidate_exchange(
+        shards[0],
+        idx0,
+        local_ks,
+        batch_ids,
+        block_table,
+        _Group(stats, hist, W),
+        topk,
+        block_size,
+        nbins,
+        got_i,
+        got_p,
+        got_c,
+    )
+    assert torch.equal(got_p, ref_p)
+    assert torch.equal(got_c, ref_c)
+    n = int(ref_p[-1].item())
+    assert torch.equal(got_i[:n], ref_i[:n])

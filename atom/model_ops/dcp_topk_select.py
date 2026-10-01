@@ -293,3 +293,55 @@ def emit_owned_slots(
         local_idx_c.stride(0),
         block_table_c.stride(0),
     )
+
+
+def dcp_prefill_candidate_exchange(
+    local_val: torch.Tensor,
+    local_idx: torch.Tensor,
+    local_ks: torch.Tensor,
+    batch_id_per_q_token: torch.Tensor,
+    block_table: torch.Tensor,
+    cp_group,
+    topk_tokens: int,
+    block_size: int,
+    nbins: int,
+    out_kv_indices: torch.Tensor,
+    out_kv_indptr: torch.Tensor,
+    owned_counts: torch.Tensor,
+) -> None:
+    """Agree on the global top-k cut, then emit this rank's owned slots.
+
+    Two collectives, both with payloads that scale with the prefill ROW count
+    rather than with the context length: ``rows * 4`` fp32 gathered, then
+    ``rows * nbins`` int32 reduced. The index-cache all-gather this replaces
+    scaled with ``total_kv`` instead, and forced every rank to re-score the
+    whole sequence.
+
+    Writes ``out_kv_indices`` / ``out_kv_indptr`` / ``owned_counts`` in place and
+    returns nothing: like the decode twin, the ownership filter, the slot
+    localize and the compaction all happen inside, so there is no global top-k
+    left for the caller to convert.
+    """
+    rows = local_val.shape[0]
+    world = cp_group.world_size
+
+    stats = row_bracket_stats(local_val)
+    gathered = cp_group.all_gather(stats.contiguous(), dim=0).reshape(world, rows, 4)
+    lo, hi = reduce_bracket(gathered)
+
+    hist = local_histogram(local_val, lo, hi, nbins)
+    hist = cp_group.all_reduce(hist)
+    thr = threshold_from_histogram(hist, lo, hi, topk_tokens)
+
+    emit_owned_slots(
+        local_val,
+        local_idx,
+        thr,
+        local_ks,
+        batch_id_per_q_token,
+        block_table,
+        block_size,
+        out_kv_indices,
+        out_kv_indptr,
+        owned_counts,
+    )
