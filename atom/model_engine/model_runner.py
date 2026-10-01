@@ -1286,6 +1286,124 @@ class ModelRunner:
         logger.info(
             f"{self.label}: warmup_model {time.time() - start_time:.2f} seconds with {num_seqs} reqs {total_tokens_num} tokens"
         )
+        self._warmup_prefill_token_sweep(min(warmup_max_tokens, max_model_len))
+
+    def _warmup_prefill_token_sweep(self, max_tokens: int):
+        """Compile the M-bucketed prefill kernels at startup.
+
+        AITER/FlyDSL pick a GEMM kernel per M bucket and JIT-compile it on
+        first use, so the first serving step in each new bucket stalls every
+        rank for 10-30 s with the waiting queue growing behind it. Two passes:
+        dummy prefills through the whole model (MoE, dense MLP, the GEMMs ahead
+        of attention), then each distinct linear shape called directly, which
+        reaches the attention projections a dummy run returns before.
+        """
+        stride = envs.ATOM_WARMUP_PREFILL_TOKEN_STRIDE
+        if stride <= 0:
+            return
+        start_time = time.time()
+        # Powers of two from 16 (a DCP rank never sees an empty shard) up to
+        # the stride, every stride tokens after that, and one count that is
+        # not a multiple of 16 for Triton's divisibility specialization.
+        sizes = [1 << i for i in range(4, stride.bit_length()) if (1 << i) < stride]
+        sizes += list(range(stride, max_tokens + 1, stride))
+        sizes = sorted(
+            {s for s in sizes + [max_tokens - 1, max_tokens] if 16 <= s <= max_tokens}
+        )
+        for num_tokens in sizes:
+            seq = Sequence([0] * num_tokens, block_size=self.block_size)
+            self.forward(
+                ScheduledBatch(
+                    seqs={seq.id: seq},
+                    num_scheduled_tokens=np.array([num_tokens], dtype=np.int32),
+                    total_tokens_num=num_tokens,
+                    total_tokens_num_prefill=num_tokens,
+                    total_seqs_num=1,
+                    total_seqs_num_prefill=1,
+                    is_dummy_run=True,
+                )
+            )
+            self.tokenID_processor.clean()
+        model_elapsed = time.time() - start_time
+
+        # Tuned GEMM tables also key exact M at 1, 2, 4 and multiples of 8 and
+        # pad to 16 below 256, finer than the stride.
+        linear_sizes = sorted(
+            set(sizes) | {1, 2, 4} | set(range(8, min(512, max_tokens) + 1, 8))
+        )
+        linears = self._distinct_prefill_linears()
+        with torch.inference_mode():
+            for prefix, linear in linears:
+                reduce_results = linear.reduce_results
+                linear.reduce_results = False
+                try:
+                    for num_tokens in linear_sizes:
+                        linear(
+                            torch.zeros(
+                                num_tokens,
+                                linear.input_size,
+                                dtype=self.config.torch_dtype,
+                                device=self.device,
+                            )
+                        )
+                except (
+                    AssertionError,
+                    IndexError,
+                    KeyError,
+                    NotImplementedError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ) as e:
+                    # A layer whose forward needs inputs this cannot fake (a
+                    # pre-quantized x, a fused caller) is left to compile on
+                    # first use rather than failing startup.
+                    logger.warning(
+                        f"{self.label}: prefill token sweep skipped {prefix}: {e}"
+                    )
+                finally:
+                    linear.reduce_results = reduce_results
+        torch.cuda.empty_cache()
+        logger.info(
+            f"{self.label}: prefill token sweep {time.time() - start_time:.2f} seconds: "
+            f"model {len(sizes)} sizes in {model_elapsed:.2f}s (stride {stride}, "
+            f"max {max_tokens}), {len(linears)} distinct linears x "
+            f"{len(linear_sizes)} sizes"
+        )
+
+    def _distinct_prefill_linears(self):
+        """One (prefix, layer) per distinct linear GEMM shape in the model,
+        plus the prefill-only q_proj row views that MLA builds under DCP
+        query replication."""
+        from atom.model_ops.linear import LinearBase
+
+        candidates = []
+        for name, module in self.model.named_modules():
+            if isinstance(module, LinearBase):
+                candidates.append((name, module))
+            if getattr(module, "qrep_enabled", False) and hasattr(
+                module, "_local_q_proj"
+            ):
+                candidates.append((f"{name}._local_q_proj", module._local_q_proj()))
+        distinct = {}
+        for name, linear in candidates:
+            weight = getattr(linear, "weight", None)
+            # Fused-away shells (e.g. KDA b_proj / f_a_proj) keep a 0-element
+            # weight and never run.
+            if weight is None or weight.numel() == 0:
+                continue
+            key = (
+                type(linear).__name__,
+                linear.quant_type.value,
+                str(linear.params_dtype),
+                tuple(weight.shape),
+                str(weight.dtype),
+                linear.input_size,
+                linear.bias is not None,
+                linear.native_a8_group_rows,
+            )
+            distinct.setdefault(key, (name, linear))
+        return list(distinct.values())
 
     def allocate_forward_vars(self):
         config = self.config

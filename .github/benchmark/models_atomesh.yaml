@@ -664,6 +664,52 @@ models:
               max_num_seqs: 144
           env: *kimi_k3_agentic_lmcache192_env
 
+        # At C72 the single prefill node is the bottleneck. The decode node
+        # peaked at 42.5% KV and max Waiting 4. Prefill queueing was 81% of
+        # TTFT, for two reasons:
+        # (1) 27 engine stalls of 10-30 s, each on the first prefill step in a
+        #     new GEMM M bucket (online FlyDSL JIT). They cost 472 s, mostly in
+        #     the first 20 min.
+        # (2) Steady state at about 78% utilization, where Phase 1 gives a
+        #     >64k-token cold prefill the whole 8192-token budget and the short
+        #     requests behind it wait.
+        # The prefill token sweep fixes (1). Capping each prefill at 4096
+        # tokens per step lets short requests share the step, which fixes (2).
+        # The jitwarm cell turns on only the first fix, to measure it alone.
+        - &kimi_k3_agentic_jitwarm
+          <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-jitwarm-c72
+          concurrency: [72]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 144
+          env: &kimi_k3_agentic_jitwarm_env
+            common:
+              ATOM_ENABLE_REPLAYSSM: "0"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            prefill:
+              <<: *kimi_k3_agentic_lmcache128_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
+              ATOM_WARMUP_PREFILL_TOKEN_STRIDE: "32"
+
+        - &kimi_k3_agentic_prefill_tuned
+          <<: *kimi_k3_agentic_jitwarm
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-pfx-c72
+          prefill:
+            workers: 1
+            tp: 8
+            dcp: 8
+            extra_args: "--long-prefill-token-threshold 4096"
+
+        - <<: *kimi_k3_agentic_prefill_tuned
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-pfx-c88
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 176
+
         # Non-disaggregated counterpart to the C64 cell above: one server does
         # prefill and decode on a single node, same workload and same server
         # knobs, so the pair isolates what the P/D split itself is worth.
