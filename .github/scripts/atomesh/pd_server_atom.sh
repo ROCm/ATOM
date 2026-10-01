@@ -52,6 +52,8 @@ PREFILL_DP_MASTER_PORT="${PREFILL_DP_MASTER_PORT:-29500}"
 PREFILL_DP_BASE_PORT="${PREFILL_DP_BASE_PORT:-29600}"
 DECODE_DP_MASTER_PORT="${DECODE_DP_MASTER_PORT:-29700}"
 DECODE_DP_BASE_PORT="${DECODE_DP_BASE_PORT:-29800}"
+ATOMESH_LMCACHE_MP_PORT="${ATOMESH_LMCACHE_MP_PORT:-25555}"
+ATOMESH_LMCACHE_MP_PROMETHEUS_PORT="${ATOMESH_LMCACHE_MP_PROMETHEUS_PORT:-29190}"
 ATOMESH_EXECUTION_PHASE="${ATOMESH_EXECUTION_PHASE:-combined}"
 ATOMESH_SERVICE_PORT_OFFSET="${ATOMESH_SERVICE_PORT_OFFSET:-0}"
 case "${ATOMESH_EXECUTION_PHASE}" in
@@ -74,6 +76,8 @@ PREFILL_DP_MASTER_PORT=$((PREFILL_DP_MASTER_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 PREFILL_DP_BASE_PORT=$((PREFILL_DP_BASE_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 DECODE_DP_MASTER_PORT=$((DECODE_DP_MASTER_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 DECODE_DP_BASE_PORT=$((DECODE_DP_BASE_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+ATOMESH_LMCACHE_MP_PORT=$((ATOMESH_LMCACHE_MP_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+ATOMESH_LMCACHE_MP_PROMETHEUS_PORT=$((ATOMESH_LMCACHE_MP_PROMETHEUS_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 validate_shifted_port() {
   local name="$1"
   local value="${!name}"
@@ -91,7 +95,9 @@ for shifted_port_name in \
   PREFILL_DP_MASTER_PORT \
   PREFILL_DP_BASE_PORT \
   DECODE_DP_MASTER_PORT \
-  DECODE_DP_BASE_PORT; do
+  DECODE_DP_BASE_PORT \
+  ATOMESH_LMCACHE_MP_PORT \
+  ATOMESH_LMCACHE_MP_PROMETHEUS_PORT; do
   validate_shifted_port "${shifted_port_name}"
 done
 unset shifted_port_name
@@ -568,6 +574,7 @@ wait_http() {
   local deadline=$(( $(date +%s) + timeout ))
   echo "[wait] ${name} ${url} timeout=${timeout}s"
   until curl -sf --max-time 10 "${url}" >/dev/null 2>&1; do
+    exit_if_lmcache_mp_server_died
     if [[ -n "${pid}" ]] && ! kill -0 "${pid}" 2>/dev/null; then
       set +e
       wait "${pid}"
@@ -593,6 +600,7 @@ wait_router_closed() {
   while true; do
     if curl -sf --max-time 10 "http://${NODE0_ADDR}:${ROUTER_PORT}/health" >/dev/null 2>&1; then
       miss_count=0
+      exit_if_lmcache_mp_server_died
       if [[ -n "${server_pid:-}" ]] && ! kill -0 "${server_pid}" 2>/dev/null; then
         set +e
         wait "${server_pid}"
@@ -696,6 +704,155 @@ purge_lmcache_disk() {
   lmcache_disk_dir=""
 }
 
+# LMCACHE_MP_SERVER=1 (prefill role env) gives the prefill workers of this shell
+# one standalone LMCache MP server. Its L1 has no NUMA option, so the server
+# runs under MPOL_BIND to LMCACHE_MP_NUMA_NODE and never takes the other node's
+# memory. LMCACHE_MP_EXTRA_ARGS appends server flags; it is split on
+# whitespace, so a JSON value (--l2-adapter) must not contain spaces.
+lmcache_mp_pid=""
+lmcache_mp_log=""
+lmcache_mp_visible_devices=""
+# "present" once LMCACHE_MP_EXTRA_ARGS configures an L2 adapter.
+lmcache_mp_l2="none"
+# Exit status of a server that died before stop_lmcache_mp_server ran.
+lmcache_mp_died_rc=""
+page_cache_dropper_pid=""
+
+# argparse (LMCache's server parser) accepts any unambiguous prefix of a long
+# option, so --l2-adap means --l2-adapter.
+is_option_abbreviation() {
+  local token="${1%%=*}"
+  local option="$2"
+  [[ "${token}" == --* && "${#token}" -gt 2 && "${option}" == "${token}"* ]]
+}
+
+# Returns 1 and records the exit status when the server has exited on its own.
+reap_dead_lmcache_mp_server() {
+  [[ -n "${lmcache_mp_pid}" ]] || return 0
+  process_is_running "${lmcache_mp_pid}" && return 0
+  local rc
+  set +e
+  wait "${lmcache_mp_pid}"
+  rc=$?
+  set -e
+  [[ "${rc}" -eq 0 ]] && rc=1
+  lmcache_mp_pid=""
+  lmcache_mp_died_rc="${rc}"
+  tail -n 50 "${lmcache_mp_log}" >&2 || true
+  echo "[lmcache-mp][FAIL] server exited unexpectedly rc=${rc}, see ${lmcache_mp_log}" >&2
+  return 1
+}
+
+# Without the server, prefill lookups time out and stores fail stop only at
+# their transfer deadline, so check the server wherever the launcher waits on
+# the workers; the log then names the real cause.
+exit_if_lmcache_mp_server_died() {
+  reap_dead_lmcache_mp_server || exit "${lmcache_mp_died_rc}"
+}
+
+# Returns non-zero when the server died before it was stopped.
+stop_lmcache_mp_server() {
+  terminate_process_group "${page_cache_dropper_pid}"
+  page_cache_dropper_pid=""
+  local server_ended=0
+  if ! reap_dead_lmcache_mp_server; then
+    server_ended=1
+  elif [[ -n "${lmcache_mp_pid}" ]]; then
+    terminate_process_group "${lmcache_mp_pid}"
+    lmcache_mp_pid=""
+    server_ended=1
+    echo "[lmcache-mp] server stopped"
+  fi
+  if [[ "${server_ended}" -eq 1 ]]; then
+    # A failed hipHostRegister is only a warning, and every transfer through
+    # that L1 region then runs unpinned.
+    local unpinned
+    unpinned="$(grep -c "DMA performance may be degraded" "${lmcache_mp_log}" 2>/dev/null || true)"
+    if [[ "${unpinned:-0}" -gt 0 ]]; then
+      echo "[lmcache-mp] WARNING: ${unpinned} L1 region(s) could not be pinned, see ${lmcache_mp_log}" >&2
+    fi
+  fi
+  [[ -z "${lmcache_mp_died_rc}" ]]
+}
+
+start_lmcache_mp_server() {
+  [[ "${LMCACHE_MP_SERVER:-0}" == "1" ]] || return 0
+  # One server serves every prefill worker this shell starts, and it imports
+  # their KV by device, so it has to see each worker's GPUs.
+  if [[ -n "${lmcache_mp_pid}" ]]; then
+    if [[ "${lmcache_mp_visible_devices}" != "${HIP_VISIBLE_DEVICES}" ]]; then
+      echo "[lmcache-mp][FAIL] server sees GPUs ${lmcache_mp_visible_devices}, prefill worker uses ${HIP_VISIBLE_DEVICES}" >&2
+      exit 2
+    fi
+    return 0
+  fi
+  local -a extra_args=()
+  read -r -a extra_args <<< "${LMCACHE_MP_EXTRA_ARGS:-}"
+  local arg forbidden
+  for arg in ${extra_args[@]+"${extra_args[@]}"}; do
+    # The eager L1 goes through hipHostMalloc, whose THP advice hangs
+    # rocm7 hosts in compaction; the lazy default registers plain pages.
+    for forbidden in --no-l1-use-lazy --l1-use-hugepages --shm-name; do
+      if is_option_abbreviation "${arg}" "${forbidden}"; then
+        echo "[lmcache-mp][FAIL] ${arg} (${forbidden}) is not supported here: keep the lazy pinned L1" >&2
+        exit 2
+      fi
+    done
+    if is_option_abbreviation "${arg}" --l2-adapter; then
+      lmcache_mp_l2="present"
+    fi
+  done
+  lmcache_mp_log="${RUNTIME_LOG_DIR}/lmcache-mp-rank-${NODE_RANK}.log"
+  local -a server_cmd=(
+    python3 -m lmcache.v1.multiprocess.server
+    --host 127.0.0.1 --port "${ATOMESH_LMCACHE_MP_PORT}"
+    --chunk-size "${LMCACHE_CHUNK_SIZE:-256}"
+    --null-block-id -1 --separate-object-groups
+    --supported-transfer-mode lmcache_driven
+    --l1-size-gb "${LMCACHE_MP_L1_SIZE_GB:?LMCACHE_MP_L1_SIZE_GB is required with LMCACHE_MP_SERVER=1}"
+    # LMCache's 0.8/0.2 defaults would leave a fifth of the pool unused.
+    --eviction-policy LRU --eviction-trigger-watermark 0.95 --eviction-ratio 0.05
+    # One GPU worker would serialize every PP stage's stores and retrieves.
+    --max-gpu-workers "${LMCACHE_MP_GPU_WORKERS:-4}"
+    --max-cpu-workers "${LMCACHE_MP_CPU_WORKERS:-4}"
+    --prometheus-port "${ATOMESH_LMCACHE_MP_PROMETHEUS_PORT}"
+    ${extra_args[@]+"${extra_args[@]}"}
+  )
+  if [[ -n "${LMCACHE_MP_NUMA_NODE:-}" ]]; then
+    server_cmd=(python3 "${ATOMESH_SCRIPT_DIR}/numa_exec.py" "${LMCACHE_MP_NUMA_NODE}" "${server_cmd[@]}")
+    # Clean weight pages on the bound node would be reclaimed on every L1
+    # allocation; drop them now and while the workers load weights.
+    python3 "${ATOMESH_SCRIPT_DIR}/drop_page_cache.py" "${MODEL_PATH}"
+    setsid python3 "${ATOMESH_SCRIPT_DIR}/drop_page_cache.py" \
+      --every 45 --for "${LMCACHE_MP_PAGE_CACHE_DROP_SECONDS:-1800}" "${MODEL_PATH}" &
+    page_cache_dropper_pid=$!
+  fi
+  dump_launch_info "LMCACHE_MP" "${server_cmd[@]}"
+  LMCACHE_TRACK_USAGE=false setsid "${server_cmd[@]}" >"${lmcache_mp_log}" 2>&1 &
+  lmcache_mp_pid=$!
+  lmcache_mp_visible_devices="${HIP_VISIBLE_DEVICES}"
+  # Every PP stage connects to the server while it builds its engine, so the
+  # workers must not start before the server accepts requests.
+  local timeout="${LMCACHE_MP_WAIT_TIMEOUT:-300}"
+  local deadline=$(( $(date +%s) + timeout ))
+  echo "[wait] lmcache-mp tcp://127.0.0.1:${ATOMESH_LMCACHE_MP_PORT} timeout=${timeout}s log=${lmcache_mp_log}"
+  until grep -q "LMCache cache server is running\.\.\." "${lmcache_mp_log}" 2>/dev/null; do
+    if ! reap_dead_lmcache_mp_server; then
+      echo "[wait][FAIL] lmcache-mp exited before becoming ready" >&2
+      stop_lmcache_mp_server || true
+      exit "${lmcache_mp_died_rc}"
+    fi
+    if [[ "$(date +%s)" -ge "${deadline}" ]]; then
+      tail -n 50 "${lmcache_mp_log}" >&2 || true
+      echo "[wait][FAIL] lmcache-mp not ready after ${timeout}s" >&2
+      stop_lmcache_mp_server || true
+      exit 1
+    fi
+    sleep 2
+  done
+  echo "[wait][OK] lmcache-mp metrics=http://127.0.0.1:${ATOMESH_LMCACHE_MP_PROMETHEUS_PORT}/metrics"
+}
+
 cleanup_processes() {
   local rc=$?
   local pid
@@ -703,6 +860,10 @@ cleanup_processes() {
     terminate_process_group "${pid}"
   done
   purge_lmcache_disk
+  # Last: the workers hold KV registrations on the server until they exit.
+  if ! stop_lmcache_mp_server && [[ "${rc}" -eq 0 ]]; then
+    rc="${lmcache_mp_died_rc}"
+  fi
   return "${rc}"
 }
 
@@ -743,6 +904,15 @@ start_prefill() {
     export HIP_VISIBLE_DEVICES="${visible_devices}"
   fi
   reset_lmcache_disk
+  start_lmcache_mp_server
+  # On the env command line, not exported: decode starts from this same shell.
+  local -a prefill_offload_env=()
+  if [[ -n "${lmcache_mp_pid}" ]]; then
+    prefill_offload_env=(
+      "ATOM_KV_OFFLOAD=lmcache_mp"
+      "ATOM_KV_OFFLOAD_EXTRA_CONFIG={\"lmcache.mp.host\":\"tcp://127.0.0.1\",\"lmcache.mp.port\":${ATOMESH_LMCACHE_MP_PORT},\"lmcache.mp.l2\":\"${lmcache_mp_l2}\"}"
+    )
+  fi
   local -a prefill_cache_env=()
   build_server_cache_env "prefill" "${server_port}" prefill_cache_env
   local -a prefill_dp_env=()
@@ -769,8 +939,8 @@ start_prefill() {
     "${prefill_cudagraph_args[@]}"
     ${PREFILL_SERVER_ARGS}
   )
-  dump_launch_info "PREFILL" "${prefill_cmd[@]}"
-  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_cmd[@]}"
+  dump_launch_info "PREFILL" "${prefill_offload_env[@]}" "${prefill_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_offload_env[@]}" "${prefill_cmd[@]}"
 }
 
 start_decode() {
@@ -1009,6 +1179,13 @@ run_aiperf_agentic_benchmark() {
     server_metrics_args+=("http://${decode_ips[$idx]}:${decode_ports[$idx]}/metrics")
     report_args+=(--decode "${decode_ips[$idx]}:${decode_ports[$idx]}")
   done
+  # One LMCache MP server per prefill host (start_lmcache_mp_server).
+  if [[ "${ATOMESH_PREFILL_ENV_LMCACHE_MP_SERVER:-0}" == "1" ]]; then
+    local mp_ip
+    while read -r mp_ip; do
+      server_metrics_args+=("http://${mp_ip}:${ATOMESH_LMCACHE_MP_PROMETHEUS_PORT}/metrics")
+    done < <(printf '%s\n' "${prefill_ips[@]}" | sort -u)
+  fi
 
   local conc
   IFS=',' read -r -a concs <<< "${CONC_LIST}"
