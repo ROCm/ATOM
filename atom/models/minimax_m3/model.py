@@ -681,66 +681,6 @@ class MiniMaxM3DecoderLayer(nn.Module):
             config.hidden_size, tp_replicated_o_proj=self._tp_replicated_o_proj
         )
 
-    def _forward_tp_replicated_o_proj(
-        self, positions, hidden_states, residual, capture_aux
-    ):
-        # The previous layer reduced only its attention/FFN increment. Keep
-        # the accumulated replicated residual outside QuickReduce quantization.
-        # Its addition can fuse with this norm without another collective.
-        tokens = hidden_states.shape[0]
-        scale = None
-        if self._m3_fused_gemma_fp8 and _linear_consumes_per_token_fp8(
-            self.self_attn.qkv_proj
-        ):
-            hidden_states, scale, residual = fused_m3_gemma_norm_fp8(
-                hidden_states,
-                self.input_layernorm.weight,
-                self.input_layernorm.variance_epsilon,
-                residual,
-            )
-        elif residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        aux = residual.clone() if capture_aux else None
-        hidden_states = self.self_attn(
-            positions=positions, hidden_states=hidden_states, hidden_states_scale=scale
-        )
-        attention_output = hidden_states
-        local_residual = torch.ops.aiter.minimax_m3_tp_local_residual(residual, 4)
-        if (
-            not self.is_moe_layer
-            and self._m3_fused_gemma_fp8
-            and _linear_consumes_per_token_fp8(self.mlp.gate_up_proj)
-        ):
-            hidden_states, scale, _ = fused_m3_gemma_norm_fp8(
-                hidden_states,
-                self.post_attention_layernorm.weight,
-                self.post_attention_layernorm.variance_epsilon,
-                local_residual,
-            )
-        else:
-            hidden_states, _ = self.post_attention_layernorm(
-                hidden_states, local_residual
-            )
-            scale = None
-        if self.is_moe_layer:
-            hidden_states = self.block_sparse_moe(hidden_states)
-        else:
-            # Dense FFN weights remain TP-sharded. Gather the normalized local
-            # input (FP8 when supported), then compute full-token TP partials.
-            hidden_states = torch.ops.aiter.minimax_m3_tp_gather(hidden_states, 4)
-            if scale is not None:
-                scale = torch.ops.aiter.minimax_m3_tp_gather(scale, 4)
-            hidden_states = self.mlp(hidden_states, x_scale=scale)
-        hidden_states = torch.ops.aiter.minimax_m3_tp_complete(
-            hidden_states, attention_output, tokens, 4
-        )
-        if capture_aux:
-            return hidden_states, residual, aux
-        return hidden_states, residual
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -751,10 +691,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         tuple[torch.Tensor, torch.Tensor | None]
         | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]
     ):
-        if self._tp_replicated_o_proj:
-            return self._forward_tp_replicated_o_proj(
-                positions, hidden_states, residual, capture_aux
-            )
+        tokens = hidden_states.shape[0]
         hidden_states_scale = None
         fuse_input_ar_rmsnorm_quant = _linear_consumes_per_token_fp8(
             self.self_attn.qkv_proj
@@ -773,6 +710,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
         elif residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        elif self._tp_replicated_o_proj:
+            # The previous layer reduced only its increment; the replicated
+            # residual is added locally, outside QuickReduce quantization.
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
         elif fuse_input_ar_rmsnorm_quant:
             hidden_states, hidden_states_scale, residual = (
                 fused_allreduce_gemma_rms_norm_quant(
@@ -795,27 +736,50 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             hidden_states_scale=hidden_states_scale,
         )
-        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
+        attention_output = hidden_states
+        ffn_residual = (
+            torch.ops.aiter.minimax_m3_tp_local_residual(residual, 4)
+            if self._tp_replicated_o_proj
+            else residual
+        )
+        hidden_states_scale = None
         if self._m3_fused_gemma_fp8 and fuse_post_attention_ar_rmsnorm_quant:
-            hidden_states, hidden_states_scale, residual = fused_m3_gemma_norm_fp8(
+            hidden_states, hidden_states_scale, ffn_residual = fused_m3_gemma_norm_fp8(
                 hidden_states,
                 self.post_attention_layernorm.weight,
                 self.post_attention_layernorm.variance_epsilon,
-                residual,
+                ffn_residual,
             )
-            hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)
+        elif self._tp_replicated_o_proj:
+            hidden_states, ffn_residual = self.post_attention_layernorm(
+                hidden_states, ffn_residual
+            )
         elif fuse_post_attention_ar_rmsnorm_quant:
-            hidden_states, hidden_states_scale, residual = (
+            hidden_states, hidden_states_scale, ffn_residual = (
                 fused_allreduce_gemma_rms_norm_quant(
-                    hidden_states, residual, self.post_attention_layernorm
+                    hidden_states, ffn_residual, self.post_attention_layernorm
                 )
             )
-            hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)
         else:
-            hidden_states, residual = fused_allreduce_gemma_rms_norm(
-                hidden_states, residual, self.post_attention_layernorm
+            hidden_states, ffn_residual = fused_allreduce_gemma_rms_norm(
+                hidden_states, ffn_residual, self.post_attention_layernorm
             )
-            hidden_states = ffn(hidden_states)
+
+        if self._tp_replicated_o_proj and not self.is_moe_layer:
+            # Dense FFN weights remain TP-sharded; MoE gathers inside its op.
+            hidden_states = torch.ops.aiter.minimax_m3_tp_gather(hidden_states, 4)
+            if hidden_states_scale is not None:
+                hidden_states_scale = torch.ops.aiter.minimax_m3_tp_gather(
+                    hidden_states_scale, 4
+                )
+        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
+        hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)
+        if self._tp_replicated_o_proj:
+            hidden_states = torch.ops.aiter.minimax_m3_tp_complete(
+                hidden_states, attention_output, tokens, 4
+            )
+        else:
+            residual = ffn_residual
         if aux_hidden_state is not None:
             return hidden_states, residual, aux_hidden_state
         return hidden_states, residual

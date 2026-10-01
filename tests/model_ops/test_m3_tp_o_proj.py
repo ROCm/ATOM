@@ -5,7 +5,7 @@ The attention/GEMM/transport boundaries are mocked. These tests check layout
 and orchestration, not GPU kernel correctness or quantization accuracy.
 """
 
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -16,7 +16,7 @@ pytest.importorskip("aiter")
 from atom.config import use_custom_atom_config
 from atom.distributed import sp_kernels, ulysses_sp
 from atom.model_ops.minimax_m3 import tp_o_proj as ops
-from atom.models import minimax_m3 as model
+from atom.models.minimax_m3 import model
 
 
 @pytest.mark.parametrize("sparse", [False, True])
@@ -188,8 +188,10 @@ def test_gather_preserves_bits_and_global_rows(monkeypatch, dtype):
 
 @pytest.mark.parametrize("is_moe", [True, False])
 @pytest.mark.parametrize("has_residual", [True, False])
+@pytest.mark.parametrize("fp8", [True, False])
+@pytest.mark.parametrize("capture_aux", [True, False])
 def test_decoder_keeps_accumulated_residual_outside_allreduce(
-    monkeypatch, is_moe, has_residual
+    monkeypatch, is_moe, has_residual, fp8, capture_aux
 ):
     group = SimpleNamespace(world_size=4, rank_in_group=1)
     monkeypatch.setattr(ops, "get_tp_group", lambda: group)
@@ -216,21 +218,38 @@ def test_decoder_keeps_accumulated_residual_outside_allreduce(
     attention = Mock(return_value=torch.full((2, 8), 3.0))
     layer = SimpleNamespace(
         _tp_replicated_o_proj=True,
-        _m3_fused_gemma_fp8=False,
+        _m3_fused_gemma_fp8=fp8,
         is_moe_layer=is_moe,
         self_attn=attention,
-        input_layernorm=lambda x, r=None: x * 2 if r is None else ((x + r) * 2, x + r),
-        post_attention_layernorm=lambda x, r: ((x + r) / 2, x + r),
+        input_layernorm=Mock(
+            side_effect=lambda x, r=None: x * 2 if r is None else ((x + r) * 2, x + r)
+        ),
+        post_attention_layernorm=Mock(side_effect=lambda x, r: ((x + r) / 2, x + r)),
         block_sparse_moe=moe,
         mlp=mlp,
     )
-    layer._forward_tp_replicated_o_proj = MethodType(
-        model.MiniMaxM3DecoderLayer._forward_tp_replicated_o_proj, layer
-    )
+    monkeypatch.setattr(model, "_linear_consumes_per_token_fp8", lambda linear: fp8)
+
+    def fused_norm(x, weight, epsilon, residual):
+        norm = (
+            layer.input_layernorm
+            if weight is layer.input_layernorm.weight
+            else layer.post_attention_layernorm
+        )
+        normalized, summed = (norm(x), x) if residual is None else norm(x, residual)
+        return normalized, torch.ones(x.shape[0], 1), summed
+
+    monkeypatch.setattr(model, "fused_m3_gemma_norm_fp8", fused_norm)
     incoming = torch.full_like(hidden, 2) if has_residual else None
-    output, residual = model.MiniMaxM3DecoderLayer.forward(
-        layer, torch.arange(7), hidden, incoming
+    result = model.MiniMaxM3DecoderLayer.forward(
+        layer, torch.arange(7), hidden, incoming, capture_aux=capture_aux
     )
+    output, residual = result[:2]
+    if capture_aux:
+        torch.testing.assert_close(result[2], residual)
+        assert result[2].data_ptr() != residual.data_ptr()
+    else:
+        assert len(result) == 2
     assert output is completed
     torch.testing.assert_close(
         residual, hidden if incoming is None else hidden + incoming
@@ -244,8 +263,9 @@ def test_decoder_keeps_accumulated_residual_outside_allreduce(
         moe.assert_called_once()
         gather.assert_not_called()
     else:
-        gather.assert_called_once()
+        assert gather.call_count == (2 if fp8 else 1)
         mlp.assert_called_once()
+        assert (mlp.call_args.kwargs["x_scale"] is not None) == fp8
 
 
 def test_final_norm_adds_residual_without_another_reduction(monkeypatch):
