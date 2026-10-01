@@ -447,6 +447,8 @@ models:
               PYTHONHASHSEED: "0"
               TOPK_FORCE_PATH: "one"
             prefill:
+              # The harness defaults to GPUs 0..tp-1 (one GPU at tp=1); PP8 needs all 8.
+              HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
               # 78 layers; the last stage also holds the MTP layer.
               VLLM_PP_LAYER_PARTITION: "10,10,10,10,10,10,10,8"
               LMCACHE_LOCAL_CPU: "True"
@@ -458,6 +460,7 @@ models:
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
             decode:
+              HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
               ATOM_PD_MLA_LANDING: "1"
               # 8 prefill stages share each rank's pool: 512 MiB keeps 8 slots per stage.
               ATOM_PD_MLA_LANDING_POOL_MB: "512"
