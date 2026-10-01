@@ -710,6 +710,57 @@ models:
               <<: *kimi_k3_agentic_no_dspark_args
               max_num_seqs: 176
 
+        # At C72 the KV in LMCache never filled: 92 of 192 GiB written per
+        # rank, no KV eviction. What did fill was the 32 GiB state sub-cap
+        # (OFFLOAD_STATE_CPU_SIZE), which holds 1183 KDA state images. It turns
+        # over every ~16 min. Each image it dropped was still in the engine's
+        # index, so a later turn over that prefix failed its load and
+        # recomputed from token 0: 33 times at C72, ~4M tokens, and ~20% of the
+        # C56 -> C72 rise in uncached prefill.
+        # The index now mirrors the cap (code). These cells also give the state
+        # tier 96 GiB (~3500 images, which covers the oldest image a failed
+        # load wanted, 3686 stores back) inside a 224 GiB pool. That is
+        # 92 + 96 GiB at C72; 8 x 224 GiB fits in the node's ~3 TB.
+        - &kimi_k3_agentic_statecap
+          <<: *kimi_k3_agentic_prefill_tuned
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-pfx-statecap-c72
+          env: &kimi_k3_agentic_statecap_env
+            common:
+              ATOM_ENABLE_REPLAYSSM: "0"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            prefill:
+              <<: *kimi_k3_agentic_lmcache128_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "224"
+              OFFLOAD_STATE_CPU_SIZE: "96"
+              ATOM_WARMUP_PREFILL_TOKEN_STRIDE: "32"
+
+        - <<: *kimi_k3_agentic_statecap
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-pfx-statecap-c88
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 176
+
+        # With only the prompt-end anchor, a sub-agent that forks a parent's
+        # context can reuse KV but not KDA state past the parent's last anchor.
+        # About 1M (state truncation) plus 3.6M (cross-session prefix) tokens
+        # at C72 were cache-eligible per aiperf but recomputed. The demand rung
+        # adds a checkpoint where a later request is expected to resume. It also
+        # adds state writes, so it runs on top of the larger state tier.
+        - <<: *kimi_k3_agentic_statecap
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-pfx-statecap-demand-c72
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "0"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+              ATOM_STATE_CHECKPOINT_DEMAND: "1"
+            prefill:
+              <<: *kimi_k3_agentic_lmcache128_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "224"
+              OFFLOAD_STATE_CPU_SIZE: "96"
+              ATOM_WARMUP_PREFILL_TOKEN_STRIDE: "32"
+
         # Non-disaggregated counterpart to the C64 cell above: one server does
         # prefill and decode on a single node, same workload and same server
         # knobs, so the pair isolates what the P/D split itself is worth.
