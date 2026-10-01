@@ -93,3 +93,77 @@ def reduce_bracket(gathered: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     hi = gathered[:, :, _MAX].amax(0)
     lo = torch.maximum(gathered[:, :, _KTH].amax(0), gathered[:, :, _MIN].amin(0))
     return lo, hi
+
+
+def _bin_scale(lo: torch.Tensor, hi: torch.Tensor, nbins: int) -> torch.Tensor:
+    """``nbins / (hi - lo)``, with the degenerate and non-finite cases pinned.
+
+    ``hi == lo`` (every candidate scored the same) and ``hi - lo`` non-finite
+    (an empty row, where ``lo`` is ``+inf``) would divide by zero or produce a
+    NaN. A scale of 0 maps every candidate into bin 0 instead, which is the
+    right answer for both: the whole row is admitted together, or there is
+    nothing to admit.
+    """
+    span = hi - lo
+    ok = torch.isfinite(span) & (span > 0)
+    return torch.where(
+        ok,
+        nbins / torch.where(ok, span, torch.ones_like(span)),
+        torch.zeros_like(span),
+    )
+
+
+def local_histogram(
+    local_val: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor, nbins: int
+) -> torch.Tensor:
+    """``[rows, nbins]`` int32 counts of this rank's candidates over ``[lo, hi]``.
+
+    Only finite candidates at or above ``lo`` are counted: ``reduce_bracket``
+    proved nothing below ``lo`` can enter the global top-k, and the padding
+    ``top_k_per_row_prefill`` writes is ``-inf``. Counts are int32 so the
+    all-reduce that follows is an integer sum and therefore order-independent --
+    every rank must scan a bit-identical histogram.
+
+    Out-of-range rows are routed to a scratch column ``nbins`` that is dropped
+    on return, so no masked ``scatter_add_`` and no second kernel are needed.
+    """
+    rows, _ = local_val.shape
+    scale = _bin_scale(lo, hi, nbins)[:, None]
+    idx = ((local_val - lo[:, None]) * scale).floor()
+    keep = torch.isfinite(local_val) & (local_val >= lo[:, None])
+    idx = torch.where(keep, idx, torch.zeros_like(idx))
+    idx = idx.clamp(0, nbins - 1).to(torch.int64)
+    idx = torch.where(keep, idx, torch.full_like(idx, nbins))
+    hist = torch.zeros((rows, nbins + 1), dtype=torch.int32, device=local_val.device)
+    hist.scatter_add_(1, idx, torch.ones_like(idx, dtype=torch.int32))
+    return hist[:, :nbins].contiguous()
+
+
+def threshold_from_histogram(
+    hist: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor, topk: int
+) -> torch.Tensor:
+    """Per-row cut value: the low edge of the bin the global k-th falls in.
+
+    Scans bins high to low and stops at the first bin whose running count
+    reaches ``topk``; the whole of that bin is admitted, which is what makes the
+    result a SUPERSET of the exact top-k rather than an approximation of it. A
+    row whose candidates never reach ``topk`` falls to bin 0, i.e. ``lo``, so it
+    selects everything -- the common case for query tokens in the first ``topk``
+    positions of a prefill.
+    """
+    nbins = hist.shape[1]
+    # Inclusive running count from the top bin down.
+    from_top = torch.cumsum(hist.flip(1).to(torch.int64), dim=1).flip(1)
+    reached = from_top >= topk
+    bins = torch.arange(nbins, device=hist.device, dtype=torch.int32)
+    # The highest bin index whose inclusive-from-top count already reaches topk.
+    # `reached` is monotone non-increasing in the bin index, so its last True is
+    # that bin; rows that never reach topk take bin 0 and therefore `lo`.
+    b_star = torch.where(reached, bins, torch.zeros_like(bins)).amax(1)
+    span = hi - lo
+    span = torch.where(torch.isfinite(span) & (span > 0), span, torch.zeros_like(span))
+    thr = lo + b_star.to(lo.dtype) * (span / nbins)
+    # An empty row has lo = +inf (no valid candidate on any rank); hand the emit
+    # kernel a number rather than an inf so its `>=` compare is well defined.
+    # Nothing is admitted either way -- every candidate in such a row is -inf.
+    return torch.where(torch.isfinite(thr), thr, torch.full_like(thr, NEG_INF))

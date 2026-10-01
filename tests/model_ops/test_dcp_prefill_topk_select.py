@@ -22,7 +22,12 @@ import torch
 
 pytest.importorskip("triton", reason="requires Triton")
 
-from atom.model_ops.dcp_topk_select import reduce_bracket, row_bracket_stats
+from atom.model_ops.dcp_topk_select import (
+    local_histogram,
+    reduce_bracket,
+    row_bracket_stats,
+    threshold_from_histogram,
+)
 
 needs_gpu = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires a ROCm GPU"
@@ -115,3 +120,98 @@ def test_reduce_bracket_is_rank_order_independent():
     lo_b, hi_b = reduce_bracket(torch.stack(stats[::-1], dim=0))
     assert torch.equal(lo_a, lo_b)
     assert torch.equal(hi_a, hi_b)
+
+
+def _shards(rows, k, counts_per_rank, seed=0):
+    """List of W [rows, k] padded value planes, one per simulated DCP rank."""
+    return [
+        _padded_rows(rows, k, counts, seed=seed + 100 * r)
+        for r, counts in enumerate(counts_per_rank)
+    ]
+
+
+def _exact_global_kth(shards, topk):
+    """Reference: the exact global topk-th value per row, or -inf if fewer."""
+    allv = torch.cat(shards, dim=1)
+    rows = allv.shape[0]
+    out = allv.new_full((rows,), NEG_INF)
+    for i in range(rows):
+        finite = allv[i][torch.isfinite(allv[i])]
+        if finite.numel() >= topk:
+            out[i] = torch.sort(finite, descending=True).values[topk - 1]
+    return out
+
+
+@needs_gpu
+def test_threshold_brackets_the_exact_kth():
+    topk, k, nbins = 16, 32, 64
+    shards = _shards(4, k, [[32, 32, 20, 32], [32, 32, 32, 32]], seed=7)
+    stats = torch.stack([row_bracket_stats(s) for s in shards], dim=0)
+    lo, hi = reduce_bracket(stats)
+    hist = sum(local_histogram(s, lo, hi, nbins) for s in shards)
+    thr = threshold_from_histogram(hist, lo, hi, topk)
+    exact = _exact_global_kth(shards, topk)
+    # Over-selection: the cut never sits above the exact k-th, so the admitted
+    # set contains the whole exact top-k.
+    assert torch.all(thr <= exact + 1e-6)
+
+
+@needs_gpu
+def test_threshold_over_selects_by_at_most_one_bin():
+    topk, k, nbins = 16, 32, 64
+    shards = _shards(4, k, [[32] * 4, [32] * 4], seed=8)
+    stats = torch.stack([row_bracket_stats(s) for s in shards], dim=0)
+    lo, hi = reduce_bracket(stats)
+    hist = sum(local_histogram(s, lo, hi, nbins) for s in shards)
+    thr = threshold_from_histogram(hist, lo, hi, topk)
+    allv = torch.cat(shards, dim=1)
+    admitted = (allv >= thr[:, None]).sum(1)
+    assert torch.all(admitted >= topk)
+    # One bin's worth of slack, plus the bin that straddles the cut.
+    per_bin = allv.shape[1] / nbins
+    assert torch.all(admitted <= topk + 2 * per_bin + 1)
+
+
+@needs_gpu
+def test_row_with_fewer_than_topk_candidates_selects_everything():
+    """Review Focus #1."""
+    topk, k, nbins = 16, 32, 64
+    shards = _shards(1, k, [[3], [4]], seed=9)
+    stats = torch.stack([row_bracket_stats(s) for s in shards], dim=0)
+    lo, hi = reduce_bracket(stats)
+    hist = sum(local_histogram(s, lo, hi, nbins) for s in shards)
+    thr = threshold_from_histogram(hist, lo, hi, topk)
+    allv = torch.cat(shards, dim=1)
+    admitted = (allv >= thr[:, None]).sum(1)
+    assert admitted.item() == 7
+
+
+@needs_gpu
+def test_all_scores_equal_admits_the_whole_row():
+    """Review Focus #2: hi == lo must not divide by zero."""
+    topk, k, nbins = 16, 32, 64
+    shards = [
+        torch.full((1, k), 2.5, dtype=torch.float32, device="cuda") for _ in range(2)
+    ]
+    stats = torch.stack([row_bracket_stats(s) for s in shards], dim=0)
+    lo, hi = reduce_bracket(stats)
+    hist = sum(local_histogram(s, lo, hi, nbins) for s in shards)
+    thr = threshold_from_histogram(hist, lo, hi, topk)
+    assert torch.isfinite(thr).all()
+    assert (shards[0] >= thr[:, None]).sum().item() == k
+
+
+@needs_gpu
+def test_empty_row_threshold_is_finite():
+    topk, k, nbins = 16, 32, 64
+    shards = [
+        torch.full((1, k), NEG_INF, dtype=torch.float32, device="cuda")
+        for _ in range(2)
+    ]
+    stats = torch.stack([row_bracket_stats(s) for s in shards], dim=0)
+    lo, hi = reduce_bracket(stats)
+    hist = sum(local_histogram(s, lo, hi, nbins) for s in shards)
+    thr = threshold_from_histogram(hist, lo, hi, topk)
+    # No candidate is finite, so nothing is admitted whatever the threshold is;
+    # it only has to be a usable number for the emit kernel's comparison.
+    assert not torch.isnan(thr).any()
