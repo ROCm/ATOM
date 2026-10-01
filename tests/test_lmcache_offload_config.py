@@ -382,3 +382,48 @@ def test_page_namespace_survives_a_worker_normalising_hf_config():
     assert offcfg.build_page_namespace(
         scheduler, _lmcache_config(), 4
     ) != offcfg.build_page_namespace(worker, _lmcache_config(), 4)
+
+
+def _k3_config(head_dim):
+    """Kimi-K3 geometry as one process happens to see it.
+
+    ``config.json`` carries no ``head_dim`` for an MLA model, so each process
+    fills one in: vLLM's scheduler keeps transformers' ``hidden_size //
+    num_attention_heads`` (74) while the workers end up with the MLA head dim
+    ``qk_nope + qk_rope`` (192).
+    """
+
+    config = _config()
+    config.hf_config.head_dim = head_dim
+    config.hf_config.qk_nope_head_dim = 128
+    config.hf_config.qk_rope_head_dim = 64
+    config.hf_config.hidden_size = 7168
+    config.hf_config.num_attention_heads = 96
+    return config
+
+
+def test_page_namespace_survives_a_per_process_head_dim():
+    # The two halves disagreeing here used to hand the workers one namespace and
+    # every lookup another, so the tier stored and never loaded -- and said so
+    # only as a miss.
+    scheduler = offcfg.build_page_namespace(_k3_config(74), _lmcache_config(), 8)
+    worker = offcfg.build_page_namespace(_k3_config(192), _lmcache_config(), 8)
+
+    assert scheduler == worker
+
+
+def test_page_namespace_still_separates_real_geometries():
+    wide = _k3_config(192)
+    wide.hf_config.qk_nope_head_dim = 256
+
+    assert offcfg.build_page_namespace(
+        _k3_config(192), _lmcache_config(), 8
+    ) != offcfg.build_page_namespace(wide, _lmcache_config(), 8)
+
+
+def test_head_dim_falls_back_to_hidden_size_over_heads():
+    config = _config()
+    config.hf_config.head_dim = None
+    config.hf_config.qk_rope_head_dim = None
+
+    assert offcfg._canonical_head_dim(config.hf_config) == 7168 // 128

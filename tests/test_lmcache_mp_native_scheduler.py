@@ -857,3 +857,25 @@ def test_engine_releases_retired_request_when_unpinned_candidate_is_evicted(
     assert connector._retired_requests == {}
     assert connector._save_tracker == {}
     assert not connector.has_pending_work()
+
+
+def test_reconcile_hands_the_live_set_to_the_recurrent_retire_hook(monkeypatch):
+    """The reconciliation has to be reachable without `process_completions`.
+
+    It lived only inside `_enforce_transfer_deadlines`, which hangs off
+    `process_completions` -- a method ATOM's native engine calls and the vLLM
+    plugin connector does not. A ride's source pin was therefore never given
+    back under the plugin, and the block pool drained one block per mamba
+    group per ride until the engine sat at zero running requests.
+    """
+    scheduler, _, _ = make_scheduler(monkeypatch)
+    seen = []
+    scheduler.install_recurrent_state_hook(lambda *a, **k: None, seen.append)
+
+    scheduler.reconcile_recurrent_rides()
+    assert seen == [set()]
+
+    scheduler._save_inflight["r1"] = "op-save"
+    scheduler._active_load_operations["r2"] = (object(), "op-load")
+    scheduler.reconcile_recurrent_rides()
+    assert seen[-1] == {"op-save", "op-load"}

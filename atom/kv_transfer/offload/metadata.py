@@ -48,9 +48,18 @@ class ATOMRawBytesLMCacheMetadata:
         if self.atom_bytes_per_block <= 0:
             raise ValueError("ATOM raw-byte metadata: bytes_per_block must be > 0")
         if chunk_size % self.atom_block_size != 0:
+            # The block size is not always the operator's ``--block-size``: on a
+            # hybrid model vLLM raises it until one attention page holds one
+            # recurrent-state page (Kimi-K3: 128 -> 1536), so the chunk size
+            # that does work cannot be read off the command line. Name it here
+            # rather than only the two values that do not work.
             raise ValueError(
                 "LMCache chunk size must be divisible by ATOM KV block size: "
-                f"chunk_size={chunk_size}, block_size={self.atom_block_size}"
+                f"chunk_size={chunk_size}, block_size={self.atom_block_size}. "
+                "Set LMCACHE_CHUNK_SIZE to a multiple of "
+                f"{self.atom_block_size}. On a hybrid model vLLM derives the "
+                "block size from the recurrent state page size, so it can "
+                "differ from --block-size."
             )
 
     def __getattr__(self, name: str) -> Any:
@@ -137,6 +146,27 @@ class NativeStateTransfer:
     destination_slot: int | None = None
 
 
+@dataclass(frozen=True)
+class RecurrentStateTransfer:
+    """The recurrent-state blocks one PAGE transfer operation also carries.
+
+    A hybrid model's recurrent layers are snapshotted once per chunk, so a
+    transfer covering several chunks has state for the last one only. This
+    names that boundary and, per recurrent group in ordinal order, the block
+    holding its snapshot. Earlier chunks are filled in with the null block id
+    by the transport -- a separate step because only the transport knows how
+    many chunks the operation spans.
+
+    Riding the PAGE operation rather than a leg of its own is the point: KV and
+    the state that continues it then commit and restore as one object, so a
+    reader can never find a prefix whose attention pages are present and whose
+    recurrent state is not.
+    """
+
+    boundary_tokens: int
+    block_ids: tuple[int, ...]
+
+
 @dataclass
 class LMCacheReqMeta:
     """Everything the worker needs to load/save one request's KV this step."""
@@ -161,6 +191,8 @@ class LMCacheReqMeta:
     # Appended for positional compatibility with existing metadata producers.
     load_operation: LoadOperationId | None = None
     native_state: NativeStateTransfer | None = None
+    # Appended for positional compatibility.
+    recurrent_state: RecurrentStateTransfer | None = None
 
 
 class LMCacheOffloadMetadata(ConnectorMetadata):

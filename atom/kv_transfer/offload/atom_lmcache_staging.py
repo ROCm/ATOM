@@ -5,11 +5,15 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+
+logger = logging.getLogger("atom")
 
 
 def memory_object_as_uint8(memory_obj: Any, nbytes: int) -> torch.Tensor:
@@ -60,13 +64,53 @@ class _StagingBuffer:
             self.free_event = torch.cuda.Event(blocking=False)
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    # Stripped, and empty reads as off: `VAR=` is how a shell script clears a
+    # flag inline, and a bare membership test reads the empty string as ON --
+    # the opposite of what the operator wrote. `VAR="off "` did the same.
+    raw = os.environ.get(name, default).strip().lower()
+    return bool(raw) and raw not in ("0", "false", "no", "off")
+
+
+def _env_int(name: str, default: int, *, min_value: int = 1) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+    if value < min_value:
+        raise ValueError(f"{name} must be >= {min_value}, got {value}")
+    return value
+
+
+def _env_optional_int(name: str, *, min_value: int = 1) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+    if value < min_value:
+        raise ValueError(f"{name} must be >= {min_value}, got {value}")
+    return value
+
+
 class _ThreadTransferState:
     def __init__(
         self,
         device: torch.device,
         use_cuda: bool,
+        compute_stream=None,
     ) -> None:
         self.device = device
+        # The stream the model's forward runs on, recorded on the forward
+        # thread by `BlockGPUConnector.note_compute_stream`.  It cannot be
+        # discovered from here: this object is built lazily on a save/load
+        # worker thread, and `torch.cuda.current_stream` is thread-local.
+        self.compute_stream = compute_stream
         self.pack_stream = None
         self.copy_stream = None
         if use_cuda:
@@ -79,6 +123,45 @@ class _ThreadTransferState:
         if stream is None:
             return _NullCtx()
         return torch.cuda.stream(stream)
+
+
+_COMPUTE_STREAM_WARNED = False
+
+
+def _compute_stream_for(state) -> Any:
+    """The stream the model's forward is running on, or ``None``.
+
+    ``None`` means "there is no CUDA context here", not "the fence was
+    skipped on a GPU". The pipeline is driven in tests by stream doubles with
+    no device behind them; ordering those against an invented compute stream
+    would assert nothing but that a double records a call. On a real worker
+    ``_ThreadTransferState`` always carries the device its streams were
+    created on, so this always returns a stream there -- which is what
+    ``test_run_staged_pipeline_fences_against_compute_stream`` pins down, so
+    that dropping the fence fails a test rather than passing quietly.
+    """
+
+    device = getattr(state, "device", None)
+    if device is None or not torch.cuda.is_available():
+        return None
+    stream = getattr(state, "compute_stream", None)
+    if stream is None or stream == torch.cuda.default_stream(device=device):
+        # Not a fallback: fencing against the default stream is precisely the
+        # bug this reports.  vLLM runs the forward on a dedicated non-default
+        # stream, so either value here means the recording on the forward
+        # thread did not happen and the pipeline below is unfenced.
+        global _COMPUTE_STREAM_WARNED
+        if not _COMPUTE_STREAM_WARNED:
+            _COMPUTE_STREAM_WARNED = True
+            logger.error(
+                "offload staging has no forward stream to fence against "
+                "(got %s, default is %s); saves may read KV the forward has "
+                "not finished writing",
+                stream,
+                torch.cuda.default_stream(device=device),
+            )
+        return None
+    return stream
 
 
 @dataclass(frozen=True)
@@ -111,6 +194,28 @@ def run_staged_pipeline(
     """
 
     staging_buffer = state.staging_buffer
+    # The two staging streams are side streams; the forward runs on vLLM's own
+    # dedicated stream (not the device default -- see `_compute_stream_for`)
+    # and is the producer of the KV a save reads and the consumer of the KV a
+    # load writes. The stage_a/stage_b handshake below orders the two staging
+    # streams against each other and nothing else, so both directions across
+    # the compute boundary have to be fenced here explicitly.
+    compute_stream = _compute_stream_for(state)
+
+    def fence_against_compute() -> None:
+        """Order the staging streams behind everything the forward has queued.
+
+        Taken per group, not once per pipeline: a save runs on a worker thread
+        concurrently with the *next* forward step, so a fence at pipeline entry
+        only covers work enqueued before it. A later group can otherwise pack a
+        block whose attention write was enqueued after that entry fence.
+        """
+        if compute_stream is None or stage_a.stream is None:
+            return
+        stage_a.stream.wait_stream(compute_stream)
+        if stage_b.stream is not None and stage_b.stream is not stage_a.stream:
+            stage_b.stream.wait_stream(compute_stream)
+
     # One stream orders the two stages by itself, so the handshake around them
     # is a no-op -- but only semantically. Each of the four calls still enters
     # the GPU runtime, and each of those releases the GIL and has to take it
@@ -123,6 +228,7 @@ def run_staged_pipeline(
     buffer_safe_to_release = True
     try:
         for group in groups:
+            fence_against_compute()
             if fenced and staging_buffer.free_event_valid:
                 stage_a.stream.wait_event(staging_buffer.free_event)
             with state.stream_ctx(stage_a.stream):
@@ -145,6 +251,23 @@ def run_staged_pipeline(
                 staging_buffer.free_event_valid = True
             if stage_b_enqueued is not None:
                 stage_b_enqueued(group, stage_b.stream)
+        # The other direction, which nothing covered before: hold the forward
+        # behind the staging streams. `stage_b.stream.synchronize()` below is a
+        # host-side wait on *this* worker thread; it constrains the forward only
+        # if the forward thread joins this transfer's future before touching the
+        # blocks. Loads write KV the forward then reads, and saves read KV the
+        # forward may overwrite once the request's blocks are recycled, so the
+        # device-side edge is recorded here rather than inferred from the host
+        # handshake. Enqueued before the synchronize: after it the event is
+        # already complete and the wait would be a no-op.
+        if compute_stream is not None:
+            done = torch.cuda.Event()
+            done.record(stage_b.stream)
+            if stage_a.stream is not None and stage_a.stream is not stage_b.stream:
+                stage_a_done = torch.cuda.Event()
+                stage_a_done.record(stage_a.stream)
+                compute_stream.wait_event(stage_a_done)
+            compute_stream.wait_event(done)
         stage_b.stream.synchronize()
     except Exception:
         buffer_safe_to_release = bool(
