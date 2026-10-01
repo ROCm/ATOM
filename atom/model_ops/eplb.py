@@ -2438,6 +2438,20 @@ def with_eplb_forward_monitor(fn):
     return wrapper
 
 
+def _eplb_owns_layer(meta: Any, layer_id: Any) -> bool:
+    """True when ``layer_id`` is one of the MoE layers EPLB places.
+
+    EPLB covers the target model's MoE layers only. Drafter/MTP MoE layers
+    (e.g. the DSpark drafter's layer 61 on DSV4-Pro) are never migrated, so
+    their logical ids already are physical ids and their load is not tracked.
+    """
+    return (
+        meta is not None
+        and isinstance(layer_id, int)
+        and 0 <= layer_id < meta.logical_to_rank_dispatch_physical_map.shape[0]
+    )
+
+
 def eplb_map_logical_to_physical(layer: Any, topk_ids: torch.Tensor) -> torch.Tensor:
     """Remap router logical expert ids to physical slot ids for EP dispatch.
 
@@ -2448,7 +2462,7 @@ def eplb_map_logical_to_physical(layer: Any, topk_ids: torch.Tensor) -> torch.Te
     """
     meta = get_live_expert_location_metadata()
     layer_id = getattr(layer, "layer_id", None)
-    if meta is None or not isinstance(layer_id, int):
+    if not _eplb_owns_layer(meta, layer_id):
         return topk_ids
     dispatch = meta.logical_to_rank_dispatch_physical_map[layer_id].to(
         device=topk_ids.device
@@ -2487,6 +2501,8 @@ def record_eplb_expert_load(layer: Any, topk_physical: torch.Tensor) -> None:
     if not isinstance(layer_id, int):
         return
     meta = get_live_expert_location_metadata()
+    if meta is not None and not _eplb_owns_layer(meta, layer_id):
+        return
     num_physical = (
         int(meta.num_physical_experts)
         if meta is not None
@@ -2607,7 +2623,7 @@ def eplb_map_and_record_fused(layer: Any, topk_ids: torch.Tensor) -> torch.Tenso
     """
     meta = get_live_expert_location_metadata()
     layer_id = getattr(layer, "layer_id", None)
-    if meta is None or not isinstance(layer_id, int):
+    if not _eplb_owns_layer(meta, layer_id):
         return topk_ids
 
     if not _EPLB_HAS_TRITON:
