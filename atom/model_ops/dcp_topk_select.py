@@ -295,6 +295,39 @@ def emit_owned_slots(
     )
 
 
+def _all_gather_stats(cp_group, stats: torch.Tensor) -> torch.Tensor:
+    """Gather every rank's ``[rows, 4]`` bracket statistics, concatenated on dim 0.
+
+    ``GroupCoordinator.all_gather`` is fine here: a gather is a pure copy, and
+    these are fp32 anyway.
+    """
+    return cp_group.all_gather(stats.contiguous(), dim=0)
+
+
+def _all_reduce_counts(cp_group, counts: torch.Tensor) -> torch.Tensor:
+    """Integer SUM of the per-row histograms, in place, on plain RCCL.
+
+    Deliberately NOT ``GroupCoordinator.all_reduce``. That dispatches through
+    quick-reduce, then custom all-reduce, then symmetric memory, and only then
+    falls back to NCCL -- and ``CustomAllreduce.should_custom_ar`` gates on size
+    and contiguity but NOT on dtype, so a correctly sized int32 tensor is routed
+    into a reduction kernel whose C++ dispatch enum has no integer entry (see
+    the ``_INT_TO_FP_VIEW`` note in ``custom_all_reduce.py``: that int-as-float
+    view exists only for all-GATHER, which is a memcpy, never for the reduce).
+    The failure would be wrong counts, not an error.
+
+    Exactness is load-bearing twice over: the counts decide the cut, and every
+    rank must scan bit-identical counts or their owned sets stop being a
+    partition of one global selection. Integer SUM over NCCL is both.
+
+    Matches ``dcp_ops``' own precedent of reaching for ``cp_group.device_group``
+    when it wants a raw collective.
+    """
+    assert counts.dtype == torch.int32, counts.dtype
+    torch.distributed.all_reduce(counts, group=cp_group.device_group)
+    return counts
+
+
 def dcp_prefill_candidate_exchange(
     local_val: torch.Tensor,
     local_idx: torch.Tensor,
@@ -326,11 +359,10 @@ def dcp_prefill_candidate_exchange(
     world = cp_group.world_size
 
     stats = row_bracket_stats(local_val)
-    gathered = cp_group.all_gather(stats.contiguous(), dim=0).reshape(world, rows, 4)
+    gathered = _all_gather_stats(cp_group, stats).reshape(world, rows, 4)
     lo, hi = reduce_bracket(gathered)
 
-    hist = local_histogram(local_val, lo, hi, nbins)
-    hist = cp_group.all_reduce(hist)
+    hist = _all_reduce_counts(cp_group, local_histogram(local_val, lo, hi, nbins))
     thr = threshold_from_histogram(hist, lo, hi, topk_tokens)
 
     emit_owned_slots(

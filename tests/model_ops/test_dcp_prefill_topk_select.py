@@ -463,21 +463,20 @@ def test_exchange_emits_a_superset_of_the_exact_global_topk():
 
 
 @needs_gpu
-def test_exchange_orchestrator_matches_the_step_by_step_composition():
+def test_exchange_orchestrator_matches_the_step_by_step_composition(monkeypatch):
+    """The orchestrator's wiring, with the two collectives stubbed.
+
+    Only the TRANSPORT is replaced: an all-gather delivers [W, rows, 4] and an
+    all-reduce delivers the elementwise sum of [rows, NBINS], and running the W
+    shards sequentially here produces exactly those tensors. Everything the
+    orchestrator does with them is the shipped code.
+    """
+    from atom.model_ops import dcp_topk_select as mod
+
     class _Group:
-        """GroupCoordinator stand-in: the W shards already live in this process."""
-
-        def __init__(self, stacked_stats, summed_hist, world_size):
-            self._stats = stacked_stats
-            self._hist = summed_hist
-            self.world_size = world_size
-            self.rank_in_group = 0
-
-        def all_gather(self, x, dim=0):
-            return self._stats.reshape(-1, x.shape[-1])
-
-        def all_reduce(self, x):
-            return self._hist
+        world_size = 0
+        rank_in_group = 0
+        device_group = None
 
     torch.manual_seed(22)
     W, rows, k, topk, nbins = 2, 3, 32, 8, 16
@@ -518,13 +517,19 @@ def test_exchange_orchestrator_matches_the_step_by_step_composition():
     got_i = torch.full((rows * 64,), -7, dtype=torch.int32, device="cuda")
     got_p = torch.zeros(rows + 1, dtype=torch.int32, device="cuda")
     got_c = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    monkeypatch.setattr(
+        mod, "_all_gather_stats", lambda g, s: stats.reshape(-1, s.shape[-1])
+    )
+    monkeypatch.setattr(mod, "_all_reduce_counts", lambda g, c: hist)
+    group = _Group()
+    group.world_size = W
     dcp_prefill_candidate_exchange(
         shards[0],
         idx0,
         local_ks,
         batch_ids,
         block_table,
-        _Group(stats, hist, W),
+        group,
         topk,
         block_size,
         nbins,
@@ -536,3 +541,41 @@ def test_exchange_orchestrator_matches_the_step_by_step_composition():
     assert torch.equal(got_c, ref_c)
     n = int(ref_p[-1].item())
     assert torch.equal(got_i[:n], ref_i[:n])
+
+
+@needs_gpu
+def test_top_k_per_row_prefill_index_convention():
+    """Pins what emit_owned_slots assumes: indices are ABSOLUTE plane columns.
+
+    If a future aiter switches to row-relative indices, `jl = idx - local_ks`
+    silently reads the wrong keys instead of failing, so this is the tripwire.
+    Also pins the tail padding the bracket stats treat as "not a candidate".
+    """
+    aiter_topk = pytest.importorskip("aiter.ops.topk", reason="requires AITER")
+    rows, width, k = 2, 64, 8
+    logits = torch.arange(rows * width, dtype=torch.float32, device="cuda").reshape(
+        rows, width
+    )
+    starts = torch.tensor([16, 32], dtype=torch.int32, device="cuda")
+    ends = torch.tensor([24, 35], dtype=torch.int32, device="cuda")  # 8 then 3 wide
+    idx = torch.full((rows, k), -99, dtype=torch.int32, device="cuda")
+    val = torch.full((rows, k), -99.0, dtype=torch.float32, device="cuda")
+    aiter_topk.top_k_per_row_prefill(
+        logits,
+        starts,
+        ends,
+        idx,
+        val,
+        rows,
+        logits.stride(0),
+        logits.stride(1),
+        k=k,
+        stable=True,
+    )
+    # Absolute columns, emitted in ascending column order.
+    assert idx[0].tolist() == [16, 17, 18, 19, 20, 21, 22, 23]
+    assert val[0].tolist() == [16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0]
+    # Short row: winners first, then (-1, -inf) tail padding.
+    assert idx[1].tolist() == [32, 33, 34, -1, -1, -1, -1, -1]
+    assert val[1][:3].tolist() == [96.0, 97.0, 98.0]
+    assert all(v == NEG_INF for v in val[1][3:].tolist())

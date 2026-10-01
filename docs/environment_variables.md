@@ -113,6 +113,13 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | **ATOM_V4_HCA_PERSIST** | bool | 1 (true) | DeepSeek-V4 HCA (`compress_ratio` 128) fp8 decode through aiter's persistent V4-NM kernel (`aiter.mla.mla_decode_fwd_v4_nm_ps`): one launch that splits the KV on the GPU and merges in-kernel, instead of the decode ASM plus a host-built split plan. Taken only with fp8 KV, 128 local heads, gfx950, row-dense KV pools and `ATOM_V4_HCA_PERSIST_MIN_ROWS <= rows <= 32768`; everything else stays on the ASM path. An aiter without the kernel keeps the ASM path (logged once). One workspace per device (about 64 MiB) is allocated at model load, before KV sizing and CUDA-graph capture. Set `0` to force the ASM path. |
 | **ATOM_V4_HCA_PERSIST_MIN_ROWS** | int | 15 | Smallest decode call (q rows) that uses `ATOM_V4_HCA_PERSIST`; smaller calls stay on the ASM path. |
 
+### GLM-5.2 / DeepSeek DSA sparse prefill under DCP
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_DCP_INDEXER_PREFILL_LOCAL** | bool | 1 (true) | Score only this rank's `1/W` index shard during sparse prefill and agree on the global top-k cut through a bracket all-gather plus a histogram all-reduce, instead of all-gathering the whole index cache so every rank can recompute the identical global top-k. Cuts the `fp8_mqa_logits` / `flydsl_pa_mqa_logits_fp4_prefill` column count by `W` and makes the collective payload scale with the prefill row count instead of the context length. Set `0` for the old gather path. **This is an A/B on throughput, not on output**: the new path admits the whole threshold bin, so its selected set is a *superset* of the old one — every token the `dcp=1` path would pick is still picked, plus roughly `W * topk / bins` extras per row. No effect at `dcp=1`. Refused outright under PCP, where the query side is round-robin sharded and the per-token position the local causal window is built from is no longer the chunk offset. |
+| **ATOM_DCP_INDEXER_PREFILL_BINS** | int | 512 | Bin count for that histogram. Bytes per full-index layer are `rows * bins * 4`; expected over-selection is `world_size * topk / bins` extra tokens per row. Raise it to tighten the cut, lower it to shrink the all-reduce. At a 4096-row chunk and `dcp=8` the default is ~8.4 MB and ~32 extra tokens of 2048. Ignored when `ATOM_DCP_INDEXER_PREFILL_LOCAL=0`. |
+
 ### GLM-5.3
 
 | Variable | Type | Default | Description |
