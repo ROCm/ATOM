@@ -25,12 +25,13 @@ MAIN_KV_ROPE = "dsv4.main_kv.rope"
 # Rows per block that `deepgemm_fp8_paged_mqa_logits` requires to stay in its
 # preshuffled layout, which is the only layout it computes correctly -- with
 # `Preshuffle=False` it disagrees with the flat `fp8_mqa_logits` kernel by ~100%
-# at every block size, and aiter's assert guards only the preshuffle side. Any
-# cache that kernel pages over must therefore hold a multiple of this many rows
-# per block. Here rather than beside one of its enforcers, because there are
-# now several: a block size (`atom.config`), a pooled row count (Kimi/GLM) and
-# a CSA2 index plane all have to agree with it, and a layout declaration is
-# what all three can reach.
+# at every block size, and aiter's assert guards only the preshuffle side. A
+# cache that kernel pages over holds a multiple of this many rows per block, or
+# exactly 8 -- the one shorter page it assembles a tile from.
+#
+# Here rather than beside one of its enforcers, because there are several: a
+# block size (`atom.config`), a pooled row count (Kimi/GLM) and a CSA2 index
+# plane all have to agree with it. Only CSA2 takes the short page.
 MQA_LOGITS_PRESHUFFLE_ROWS = 16
 
 # Internal: FP8 keeps both regions in one pool and so has fewer PD roles than

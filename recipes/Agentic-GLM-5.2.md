@@ -52,7 +52,7 @@ The validated prefill and decode configurations are:
 | Batched-token budget | 8192 | 16384 (default) |
 | LMCache | 256 GiB CPU tier, 256-token chunks | Disabled |
 | Native prefix caching | Enabled | Enabled |
-| Speculative decoding | MTP3 | MTP3 |
+| Speculative decoding | MTP3, forced AL 2.99 | MTP3, forced AL 2.99 |
 
 Both nodes use MXFP4 weights, online PTPC FP8 quantization,
 `ATOM_MLA_PAGE_SIZE=1`, `ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB=2047`,
@@ -103,6 +103,7 @@ env \
   HIP_VISIBLE_DEVICES=0,1,2,3 \
   VLLM_PP_LAYER_PARTITION=20,20,20,18 \
   LMCACHE_LOCAL_CPU=True \
+  LMCACHE_NUMA_MODE=auto \
   LMCACHE_MAX_LOCAL_CPU_SIZE=256 \
   LMCACHE_CHUNK_SIZE=256 \
   OFFLOAD_PROFILE=1 \
@@ -117,10 +118,11 @@ env \
     --max-num-seqs 512 \
     --enable_prefix_caching \
     --online_quant_config \
-      '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}' \
+      '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*","model.layers.78.*"]}' \
     --level 3 \
     --method mtp \
     --num-speculative-tokens 3 \
+    --spec-decode-acceptance-length 2.99 \
     --server-port 8010 \
     --tensor-parallel-size 1 \
     --pipeline-parallel-size 4 \
@@ -162,10 +164,11 @@ env \
     --max-num-seqs 512 \
     --enable_prefix_caching \
     --online_quant_config \
-      '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}' \
+      '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*","model.layers.78.*"]}' \
     --level 3 \
     --method mtp \
     --num-speculative-tokens 3 \
+    --spec-decode-acceptance-length 2.99 \
     --server-port 8020 \
     --tensor-parallel-size 4 \
     --decode-context-parallel-size 4 \
@@ -208,9 +211,10 @@ The validated standalone configuration is:
 | Hardware | 4×MI355X (`gfx950`) |
 | Model | `amd/GLM-5.2-MXFP4` |
 | Parallelism | TP4 |
-| KV cache | FP8 |
+| KV cache | FP8, 64-token blocks |
+| Index cache | FP4 |
 | Prefix cache | Enabled |
-| CPU offload | LMCache, 256 GiB per TP rank (1 TiB total), 256-token chunks |
+| CPU offload | `C2`-`C10`: none, GPU prefix cache only. `C16`+: LMCache, 256 GiB per TP rank (1 TiB total), 256-token chunks |
 | Speculative decoding | Native MTP, draft depth per concurrency (see below) |
 | Forced acceptance length | Golden AL for that depth (see below) |
 | Profiling duration | 3,600 seconds |
@@ -236,7 +240,8 @@ Acceptance lengths are the golden values from
 
 For small-concurrency runs, `C2`-`C8` use five speculative tokens and `C10` uses
 four; the case block resolves both the draft depth and its golden AL from
-`CONC`.
+`CONC`. These points run on the native GPU prefix cache alone -- LMCache CPU
+offload is only used from `C16` upwards.
 
 ```bash
 export MODEL_PATH=${MODEL_PATH:-amd/GLM-5.2-MXFP4}
@@ -244,15 +249,6 @@ export MODEL_PATH=${MODEL_PATH:-amd/GLM-5.2-MXFP4}
 export PYTHONNOUSERSITE=1
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
-export ATOM_USE_FLYDSL_GATHER_KV_B_PROJ=0
-
-# LMCache-related settings
-export PYTHONHASHSEED=0
-export LMCACHE_LOCAL_CPU=True
-export LMCACHE_NUMA_MODE=auto
-export LMCACHE_MAX_LOCAL_CPU_SIZE=256
-export LMCACHE_CHUNK_SIZE=256
-export OFFLOAD_MIN_LOAD_TOKENS=8192
 
 export TP=${TP:-4}
 export CONC=${CONC:-8}
@@ -277,10 +273,10 @@ python -m atom.entrypoints.openai_server \
   --server-port 8000 \
   --gpu-memory-utilization 0.95 \
   --kv_cache_dtype fp8 \
+  --index_cache_dtype fp4 \
+  --block-size 64 \
   --online_quant_config \
-    '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*"]}' \
-  --kv-transfer-config \
-    '{"kv_connector":"lmcache_offload","kv_role":"offload"}' \
+    '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*","model.layers.78.*"]}' \
   --tensor-parallel-size "${TP}" \
   --max-num-seqs "$((CONC * 2))" \
   --cudagraph-capture-sizes "${CUDAGRAPH_CAPTURE_SIZES}" \
@@ -299,30 +295,24 @@ This mode is **performance-only**. Disable
 `--spec-decode-acceptance-length` for SWE-bench, GSM8K, or any correctness
 evaluation because forced acceptance does not preserve model accuracy.
 
-##### Use GPU Prefix Caching Without LMCache
-
-To use only the native GPU prefix cache, unset the LMCache-related environment variables before starting the server:
-
-```bash
-unset PYTHONHASHSEED
-unset LMCACHE_LOCAL_CPU
-unset LMCACHE_NUMA_MODE
-unset LMCACHE_MAX_LOCAL_CPU_SIZE
-unset LMCACHE_CHUNK_SIZE
-unset OFFLOAD_MIN_LOAD_TOKENS
-```
-
-Also remove the `--kv-transfer-config` argument from the server command.
-
 #### GLM-5.2 MXFP4 with TP + DCP + MTP (large concurrency)
 
 For large-concurrency runs, TP4 + DCP4 reuses the same four GPUs to shard the
 decode KV cache and increase the available decode batch capacity. Speculative
 decoding stays on: `C16`-`C40` use four draft tokens and `C48` uses three.
 
-> **Note:** with MTP on the DCP path the engine disables DCP query replication,
-> and the KV pool is ~3.7% smaller because the draft layer carries its own KV.
-> Both are expected; compare MTP and non-MTP runs at the same concurrency.
+> **Note:** the draft layer carries its own KV, which shrinks the pool by
+> ~3.7% regardless of MTP/DCP interaction. DCP query replication (QREP) is
+> **on by default** here (this recipe never sets `ATOM_USE_TRITON_MXFP4_BMM`,
+> so the mxfp4 gate does not apply) and adds its own separate KV cost, on top
+> of the ~3.7% above — see `enable_query_replication` in
+> [Context Parallel Guide](../docs/context_parallel_guide.md#enable_query_replication-qrep)
+> for that cost's typical size (~5% on DeepSeek-R1 tp8/dcp8). **This exact
+> combination — MXFP4 weights + TP4/DCP4 + MTP + QREP — has not been run
+> end-to-end**; only GLM-5.2 FP8 tp8/dcp8 has. If `--gpu-memory-utilization
+> 0.95` runs tight at your concurrency, lower it or pass
+> `--dcp-config '{"enable_query_replication": false}'` to opt back out.
+> Compare MTP and non-MTP runs at the same concurrency and QREP setting.
 
 ```bash
 export MODEL_PATH=${MODEL_PATH:-amd/GLM-5.2-MXFP4}
@@ -330,7 +320,6 @@ export MODEL_PATH=${MODEL_PATH:-amd/GLM-5.2-MXFP4}
 export PYTHONNOUSERSITE=1
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
-export ATOM_USE_FLYDSL_GATHER_KV_B_PROJ=0
 
 # LMCache-related settings
 export PYTHONHASHSEED=0
@@ -367,8 +356,10 @@ python -m atom.entrypoints.openai_server \
   --server-port 8000 \
   --gpu-memory-utilization 0.95 \
   --kv_cache_dtype fp8 \
+  --index_cache_dtype fp4 \
+  --block-size 64 \
   --online_quant_config \
-    '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*"]}' \
+    '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*","model.layers.78.*"]}' \
   --kv-transfer-config \
     '{"kv_connector":"lmcache_offload","kv_role":"offload"}' \
   --tensor-parallel-size "${TP}" \
@@ -381,6 +372,23 @@ python -m atom.entrypoints.openai_server \
   --max-num-batched-tokens 16384 \
   2>&1 | tee "server-glm52-dcp${DCP}-tp${TP}-mtp${MTP_K}-c${CONC}.log"
 ```
+
+##### Use GPU Prefix Caching Without LMCache
+
+This configuration and the no-MTP one below are the remaining ones that offload
+to LMCache. To run either on the native GPU prefix cache only, unset the
+LMCache-related environment variables before starting the server:
+
+```bash
+unset PYTHONHASHSEED
+unset LMCACHE_LOCAL_CPU
+unset LMCACHE_NUMA_MODE
+unset LMCACHE_MAX_LOCAL_CPU_SIZE
+unset LMCACHE_CHUNK_SIZE
+unset OFFLOAD_MIN_LOAD_TOKENS
+```
+
+Also remove the `--kv-transfer-config` argument from the server command.
 
 #### GLM-5.2 MXFP4 Without MTP
 
@@ -419,6 +427,8 @@ python -m atom.entrypoints.openai_server \
   --host 0.0.0.0 \
   --server-port 8000 \
   --kv_cache_dtype fp8 \
+  --index_cache_dtype fp4 \
+  --block-size 64 \
   --online_quant_config \
     '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}' \
   --kv-transfer-config \

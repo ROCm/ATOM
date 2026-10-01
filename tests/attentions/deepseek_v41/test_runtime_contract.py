@@ -9,9 +9,9 @@ import numpy as np
 import pytest
 import torch
 
-from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 from atom.models.deepseek_v41.config import normalize_hf_config, validate_runtime_config
+from tests.attentions.deepseek_v41.helpers import PagedRequest, begin_step
 
 
 def _runtime_pieces():
@@ -117,6 +117,24 @@ def test_unimplemented_modes_fail_before_loading(override):
         validate_runtime_config(runtime_config(**override))
 
 
+def test_lmcache_mp_is_the_only_kv_transfer_admitted():
+    validate_runtime_config(
+        runtime_config(kv_transfer_config={"kv_connector": "lmcache_mp"})
+    )
+    for connector in ("lmcache_offload", "mooncake", "moriio", "multi"):
+        with pytest.raises(ValueError, match="KV transfer other than lmcache_mp"):
+            validate_runtime_config(
+                runtime_config(kv_transfer_config={"kv_connector": connector})
+            )
+    with pytest.raises(ValueError, match="RapidServe"):
+        validate_runtime_config(
+            runtime_config(
+                kv_transfer_config={"kv_connector": "lmcache_mp"},
+                enable_rapidserve=True,
+            )
+        )
+
+
 def test_empty_rank_padding_has_no_cache_writes(monkeypatch):
     PagedAttentionCache, DeepseekV41RuntimeModel = _runtime_pieces()
     from atom.models.deepseek_v41 import runtime
@@ -125,7 +143,7 @@ def test_empty_rank_padding_has_no_cache_writes(monkeypatch):
     cache = PagedAttentionCache(geo, 4, 2, "cpu")
     cache.backing.fill_(57)
     before = cache.backing.clone()
-    step = cache.begin_step([])
+    step = begin_step(cache, [])
     metadata = SimpleNamespace(
         step=step,
         cache=cache,
@@ -163,7 +181,7 @@ def test_a_forward_reads_nothing_the_forward_before_it_selected(monkeypatch):
 
     geo = V41PoolGeometry(2, ((1, 2),), 32, 4, 512, 32)
     cache = PagedAttentionCache(geo, 4, 2, "cpu")
-    step = cache.begin_step([RequestSpan(0, 0, 0, 1, 0, (0,))], plans={})
+    step = begin_step(cache, [PagedRequest(0, 0, 0, 1, 0, (0,))], plans={})
     memos = {name: getattr(step, name) for name in ("selected", "candidates")}
     for name, memo in memos.items():
         memo["what the last forward worked out"] = name
@@ -282,3 +300,48 @@ def test_level3_requires_full_graph_or_eager_runtime():
                 ),
             )
         )
+
+
+@pytest.mark.parametrize("rows", [8, 16, 32])
+def test_shortening_the_index_block_moves_bytes_without_adding_any(rows):
+    """A block's length is a layout choice, not a capacity one.
+
+    The data and the scales are packed with nothing between them, so the block
+    grows and shrinks in step with the rows it holds and a row's share is the
+    same number at every length. Choosing 8 to make a candidate list a block
+    table therefore costs no pool capacity -- only the granularity at which
+    the two regions interleave changes.
+    """
+    geo = V41PoolGeometry(
+        40, ((2, 2), (20, 1)), 64, 128, 512, 128, packed=True, index_block_rows=rows
+    )
+    assert geo.index_row_bytes == 132
+    assert (
+        geo.paged_bytes
+        == V41PoolGeometry(
+            40, ((2, 2), (20, 1)), 64, 128, 512, 128, packed=True
+        ).paged_bytes
+    )
+
+
+@pytest.mark.parametrize("rows", [4, 12, 24, 20])
+def test_an_index_block_the_scorer_cannot_page_over_is_refused(rows):
+    """`pa_mqa_logits` takes whole 16-row MFMA tiles, or exactly 8.
+
+    Nothing downstream would report a block of 12: the writer would interleave
+    at one length and the scorer read at another, which is a wrong score and
+    not a fault. So the geometry is where it has to be caught.
+    """
+    with pytest.raises(ValueError, match="whole 16-row MFMA tiles"):
+        V41PoolGeometry(40, ((2, 2), (20, 1)), 64, 128, 512, 128, index_block_rows=rows)
+
+
+def test_a_page_that_does_not_hold_whole_index_blocks_is_refused():
+    """The second gate: legal block length, but a PAGE that cannot hold it.
+
+    Ratio 2 halves the PAGE before the count is taken, so the floor is twice
+    the block -- which is why this fires on 16 rows at a 16-token PAGE.
+    """
+    with pytest.raises(ValueError, match="needs whole 16-row blocks"):
+        V41PoolGeometry(40, ((2, 2), (20, 1)), 16, 128, 512, 128)
+    V41PoolGeometry(40, ((2, 2), (20, 1)), 16, 128, 512, 128, index_block_rows=8)

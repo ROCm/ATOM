@@ -3,6 +3,7 @@
 
 import logging
 
+import pytest
 from conftest import MockConfig
 
 from atom.model_engine.block_manager import BlockManager
@@ -263,6 +264,35 @@ class TestDeallocatePartial:
         assert bm.kv.num_used == 8
         for block_id in protected:
             assert bm.kv.block(block_id).ref_count >= 1
+
+    def test_per_request_state_requires_explicit_connector_capability(
+        self, seq_factory
+    ):
+        cfg = MockConfig(num_kvcache_blocks=32, kv_cache_block_size=4)
+        bm = BlockManager(cfg)
+        seq = seq_factory(list(range(16)))
+        bm.allocate(seq)
+        table = list(seq.block_table)
+        seq.has_per_req_cache = True
+
+        with pytest.raises(RuntimeError, match="explicit connector safety capability"):
+            bm.deallocate_partial(seq, frozenset(table[:2]))
+
+        assert list(seq.block_table) == table
+        assert all(bm.kv.block(block_id).ref_count == 1 for block_id in table)
+
+    def test_explicit_connector_capability_allows_per_request_state(self, seq_factory):
+        cfg = MockConfig(num_kvcache_blocks=32, kv_cache_block_size=4)
+        bm = BlockManager(cfg)
+        seq = seq_factory(list(range(16)))
+        bm.allocate(seq)
+        protected = frozenset(seq.block_table[:2])
+        seq.has_per_req_cache = True
+
+        bm.deallocate_partial(seq, protected, per_request_state_safe=True)
+
+        assert not seq.block_table
+        assert bm.kv.num_used == len(protected)
 
     def test_free_leased_blocks_returns_the_rest_to_the_pool(self, seq_factory):
         cfg = MockConfig(num_kvcache_blocks=32, kv_cache_block_size=4)

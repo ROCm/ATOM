@@ -1,0 +1,39 @@
+name: Benchmark artifact tests
+on:
+  pull_request:
+    paths:
+      - 'atom/benchmarks/**'
+      - '.github/benchmark/models_agentic*.json'
+      - '.github/scripts/*benchmark*'
+      - '.github/scripts/*aiter*'
+      - '.github/scripts/atom_test.sh'
+      - '.github/scripts/aiperf*'
+      - '.github/scripts/profile_agentic_replay.py'
+      - '.github/scripts/resolve_atom_image.py'
+      - '.github/scripts/atomesh/pd_server_atom.sh'
+      - '.github/scripts/catalog.py'
+      - '.github/workflows/*benchmark*'
+      - 'tests/benchmarks/**'
+      - 'tests/test_benchmark*'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  producer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+      - name: Install client test dependencies (no engine or GPU)
+        run: python -m pip install pytest jsonschema aiohttp transformers==5.16.1 numpy tqdm pyyaml jinja2 'pydantic>=2,<3'
+      - name: Validate producer, streaming client and catalog
+        run: |
+          python -m pytest -q --confcutdir=tests/benchmarks/results \
+            tests/benchmarks/results tests/test_benchmark_catalog.py tests/test_benchmark_random_dataset.py tests/test_benchmark_aiter_wheel.py
+          bash -n .github/scripts/download_aiter_wheel.sh .github/scripts/install_aiter_wheel.sh
+          bash -n .github/scripts/atom_test.sh
+          bash -n .github/scripts/aiperf_agentic.sh
+          bash -n .github/scripts/benchmark_bundle.sh
+          bash -n .github/scripts/atomesh/pd_server_atom.sh

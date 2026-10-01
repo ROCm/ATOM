@@ -78,6 +78,10 @@ class V41PoolGeometry:
     # The width the scorer emits, whatever a row can see: a row short on
     # history is `-1` padded, not narrowed.
     index_topk: int = 0
+    # Rows one index block id names: the `KVBlockSize` every reader of this
+    # plane passes. A layout choice and not the kernel's tile -- 8 is what lets
+    # a candidate list be a block table, the length candidates are picked in.
+    index_block_rows: int = MQA_LOGITS_PRESHUFFLE_ROWS
 
     def __post_init__(self):
         if self.speculative_tokens < 0:
@@ -100,20 +104,26 @@ class V41PoolGeometry:
             raise ValueError("BF16 attention rows must align to 256 bytes")
         if len({owner for owner, _ in self.owners}) != len(self.owners):
             raise ValueError("Each global owner must be declared once")
+        rows = self.index_block_rows
+        if rows % MQA_LOGITS_PRESHUFFLE_ROWS and rows != 8:
+            raise ValueError(
+                f"An index block holds whole {MQA_LOGITS_PRESHUFFLE_ROWS}-row MFMA "
+                f"tiles, or exactly 8 rows shuffled in groups of 8; got {rows}"
+            )
         for owner, ratio in self.owners:
             if not 0 <= owner < self.layers or ratio not in (1, 2):
                 raise ValueError("Invalid global owner or compression ratio")
             if self.block_size % ratio:
                 raise ValueError("PAGE token count must divide every compression group")
-            # A block id names `MQA_LOGITS_PRESHUFFLE_ROWS` rows, so a PAGE's
-            # rows have to be a whole number of them -- the ratio-2 owners are
-            # what makes that a statement about twice the PAGE.
-            if self.rows_per_page(ratio) % MQA_LOGITS_PRESHUFFLE_ROWS:
+            # A block id names `index_block_rows` rows, so a PAGE's rows have to
+            # be a whole number of them -- the ratio-2 owners are what makes
+            # that a statement about twice the PAGE.
+            if self.rows_per_page(ratio) % rows:
                 raise ValueError(
-                    f"An FP8 index plane needs whole {MQA_LOGITS_PRESHUFFLE_ROWS}-row tiles: "
+                    f"An FP8 index plane needs whole {rows}-row blocks: "
                     f"ratio {ratio} gives a PAGE {self.rows_per_page(ratio)} rows, "
                     f"so raise the PAGE token count to a multiple of "
-                    f"{MQA_LOGITS_PRESHUFFLE_ROWS * max(r for _, r in self.owners)}"
+                    f"{rows * max(r for _, r in self.owners)}"
                 )
 
     @property
@@ -141,10 +151,10 @@ class V41PoolGeometry:
         """
         block = indexer_block_regions(
             fp8_indexer_block_fields(
-                MQA_LOGITS_PRESHUFFLE_ROWS, self.index_dim, torch.float8_e4m3fn
+                self.index_block_rows, self.index_dim, torch.float8_e4m3fn
             )
         )[1]
-        return block // MQA_LOGITS_PRESHUFFLE_ROWS
+        return block // self.index_block_rows
 
     @property
     def window_row_bytes(self):

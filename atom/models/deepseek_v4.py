@@ -71,6 +71,7 @@ from atom.distributed.pcp_utils import (
     pcp_round_robin_split,
 )
 from atom.model_loader.loader import WeightsMapper
+from atom.model_loader.weight_utils import local_model_dir
 
 # Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`
 # (shared with deepseek_v2) and `torch.ops.aiter.indexer_score_topk` (V4-only).
@@ -581,6 +582,10 @@ def _wo_a_is_bf16_on_disk(model_path):
     the model — otherwise the FP8 + scale param shapes mismatch the BF16
     tensor on disk and produce garbage attention output.
     """
+    # A hub id is not where its files are, and this probe picks FP8 vs BF16
+    # parameter shapes: answering "no" for every remote checkpoint is the
+    # mismatch this docstring warns produces garbage attention output.
+    model_path = local_model_dir(model_path)
     if not model_path or not os.path.isdir(model_path):
         return False
     idx_path = os.path.join(model_path, "model.safetensors.index.json")
@@ -832,9 +837,9 @@ def _wo_a_block_scale_to_e8m0(
     """
     s = scale.detach()
     if s.element_size() == 1:
-        # ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE allocates weight_scale as
-        # dtypes.fp8_e8m0, which aiter resolves to torch.uint8 when the torch
-        # build has no float8_e8m0fnu. Those bytes are already biased
+        # E8M0 block scales (QuantizationConfig.blockscale_e8m0_scale) allocate
+        # weight_scale as dtypes.fp8_e8m0, which aiter resolves to torch.uint8
+        # when the torch build has no float8_e8m0fnu. Those bytes are already biased
         # exponents, so the float path would read 127 as a magnitude and
         # return 134; a native float8_e8m0fnu byte is the same exponent.
         e = s.view(torch.uint8)

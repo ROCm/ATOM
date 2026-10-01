@@ -61,10 +61,14 @@ def test_native_byte_accounting():
     assert geo.page_bytes < bf16.page_bytes / 2
     assert geo.state_bytes < bf16.state_bytes * 0.52
     assert geo.layout_id != bf16.layout_id
-    # A ratio-2 owner halves the PAGE, so the tile bound is a statement about
-    # twice it: 16 tokens leave that owner 8 rows, which no block id names.
-    with pytest.raises(ValueError, match="16-row tiles"):
+    # A ratio-2 owner halves the PAGE, so the block bound is a statement about
+    # twice it: 16 tokens leave that owner 8 rows, which no block id names --
+    # at this geometry's 16-row blocks. Declaring 8-row ones makes the same
+    # PAGE legal, which is what says the gate is about the block and not the
+    # PAGE.
+    with pytest.raises(ValueError, match="16-row blocks"):
         replace(geo, block_size=16)
+    replace(geo, block_size=16, index_block_rows=8)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")

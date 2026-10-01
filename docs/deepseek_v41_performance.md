@@ -11,12 +11,27 @@ commands.
 Target and draft use `atom.model_ops.layernorm.RMSNorm` for attention and FFN
 inputs, Q/KV, index keys and compressor output. Forward RoPE uses AITER's
 `rope_cached_positions_fwd_inplace`; the V4.1 adapter supplies its positions,
-rotary lanes and YaRN cache. Inverse RoPE uses the V4 kernel. V4.1 does not apply
+rotary lanes and YaRN cache. Inverse RoPE is fused into the `wo_a` input quant,
+as on V4. V4.1 does not apply
 V4's weightless per-head Q normalization.
 
-Dense projections use native FP8 microscaling with FP32 accumulation. The
-grouped `wo_a` output projection remains BF16 and uses the shared V4 operator
-paths. Delayed mHC uses AITER stages.
+Dense projections use native FP8 microscaling with FP32 accumulation. On
+gfx950 their 32x32 FP8 weights are (16, 16)-shuffled at load for AITER's
+preshuffled group32 GEMM, a FlyDSL kernel with its own tuned table
+(`ATOM_GROUP32_WEIGHT_PRESHUFFLE=0` keeps checkpoint bytes). The
+grouped `wo_a` output projection keeps its FP8 weight and 32x32 e8m0 scale:
+AITER's `inverse_rope_group_quant` un-rotates the attention output against
+the BF16 RoPE table and quantizes it to MXFP8 (1x32) in one launch, and
+`batched_gemm_a8w8_mxscale_bpreshuffle` runs the grouped GEMM. Delayed mHC
+uses AITER stages.
+
+On AITER builds without the native group32 interface, the compatibility FP8
+GEMM keeps two pipeline stages, including its four-way packed-K layout.
+Triton 3.7's async LDS load can lose the neutral scale for masked K/N tails,
+including the TP2 shared-expert down projection at K=1152. The packed kernel
+loads weight scales from bounded addresses and explicitly selects E8M0 code
+127 for padding, preserving the scale value without disabling the pipeline.
+This handling also applies inside FULL graph execution.
 
 V4/FusedMoE owns expert activation formats, routing-weight placement, GEMM
 dispatch, shared-expert overlap and expert-parallel exchange. V4.1 supplies
@@ -85,8 +100,14 @@ level 0, and broader compiler support remains outside the supported scope.
 The paged scorer bands queries at the int32 addressing limit. A large band can
 require nearly 8 GiB of FP32 logits; quantized queries, tile tables and selection
 workspace occupy additional memory. Reserve scratch headroom when sizing
-long-context workloads. Visibility-sized scratch and candidate-only Reindex
-remain optimization work.
+long-context workloads. Visibility-sized scratch remains optimization work.
+
+A Reindex layer scores `candidate_topk_blocks` blocks rather than the whole
+context: the index plane is paged at `candidate_block_size`, so the candidate
+source's list is the scorer's block table. Compaction clamps the last kept
+block's visible span to one block, so its context stays within the actual
+kept count even if selection omits the newest block. Candidate ranking still
+pins the newest block independently.
 
 Cache packing and expert activation quantization affect numerical behavior.
 Native FP8/FP4 execution does not promise bitwise equality with an all-BF16

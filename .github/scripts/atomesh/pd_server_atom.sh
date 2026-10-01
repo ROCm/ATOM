@@ -16,6 +16,7 @@ ATOMESH_PD_WORKER_LAYOUT="${ATOMESH_PD_WORKER_LAYOUT:-multi_node}"
 SINGLE_NODE_PD=0
 PREFILL_SINGLE_NODE_PD=0
 DECODE_SINGLE_NODE_PD=0
+PACKED_NODES_PD=0
 case "${ATOMESH_PD_WORKER_LAYOUT}" in
   single_node)
     SINGLE_NODE_PD=1
@@ -25,6 +26,9 @@ case "${ATOMESH_PD_WORKER_LAYOUT}" in
     ;;
   decode_single_node)
     DECODE_SINGLE_NODE_PD=1
+    ;;
+  packed_nodes)
+    PACKED_NODES_PD=1
     ;;
 esac
 
@@ -93,7 +97,7 @@ done
 unset shifted_port_name
 unset -f validate_shifted_port
 USE_EXPLICIT_DP_PORTS=0
-if [[ "${SINGLE_NODE_PD}" == "1" || "${PREFILL_SINGLE_NODE_PD}" == "1" || "${DECODE_SINGLE_NODE_PD}" == "1" ]]; then
+if [[ "${SINGLE_NODE_PD}" == "1" || "${PREFILL_SINGLE_NODE_PD}" == "1" || "${DECODE_SINGLE_NODE_PD}" == "1" || "${PACKED_NODES_PD}" == "1" ]]; then
   USE_EXPLICIT_DP_PORTS=1
 fi
 
@@ -316,6 +320,56 @@ if [[ "${SINGLE_NODE_PD}" == "1" ]]; then
   decode_ips+=("${IP_ARRAY[0]}")
   decode_ports+=("${DECODE_PORT}")
   decode_args+=(--decode "http://${IP_ARRAY[0]}:${DECODE_PORT}")
+elif [[ "${PACKED_NODES_PD}" == "1" ]]; then
+  # PP size is not a top-level env var on this launcher; parse it from extra_args.
+  _pp_from_args() {
+    local args="$1"
+    if [[ "${args}" =~ --pipeline-parallel-size[=\ ]+([0-9]+) ]]; then
+      echo "${BASH_REMATCH[1]}"
+    else
+      echo 1
+    fi
+  }
+  PREFILL_PP_SIZE="$(_pp_from_args "${PREFILL_SERVER_ARGS}")"
+  DECODE_PP_SIZE="$(_pp_from_args "${DECODE_SERVER_ARGS}")"
+  prefill_nodes=()
+  prefill_gpus=()
+  decode_nodes=()
+  decode_gpus=()
+  packed_node=0
+  packed_used=0
+  place_packed_worker() {
+    local width="$1"
+    local -n placed_nodes="$2"
+    local -n placed_gpus="$3"
+    if (( width > 8 )); then
+      echo "ERROR: packed_nodes workers must fit on one 8-GPU node" >&2
+      exit 2
+    fi
+    if (( packed_used + width > 8 )); then
+      packed_node=$((packed_node + 1))
+      packed_used=0
+    fi
+    placed_nodes+=("${packed_node}")
+    placed_gpus+=("$(seq -s, "${packed_used}" "$((packed_used + width - 1))")")
+    packed_used=$((packed_used + width))
+  }
+  for idx in $(seq 0 $((xP - 1))); do
+    place_packed_worker "$((PREFILL_PP_SIZE * PREFILL_TP_SIZE))" prefill_nodes prefill_gpus
+    prefill_ips+=("${IP_ARRAY[${prefill_nodes[$idx]}]:-}")
+    prefill_ports+=("$((PREFILL_PORT + idx))")
+    prefill_args+=(--prefill "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}")
+  done
+  for idx in $(seq 0 $((yD - 1))); do
+    place_packed_worker "$((DECODE_PP_SIZE * DECODE_TP_SIZE))" decode_nodes decode_gpus
+    decode_ips+=("${IP_ARRAY[${decode_nodes[$idx]}]:-}")
+    decode_ports+=("$((DECODE_PORT + idx))")
+    decode_args+=(--decode "http://${decode_ips[$idx]}:${decode_ports[$idx]}")
+  done
+  if (( packed_node + 1 != ${#IP_ARRAY[@]} )); then
+    echo "ERROR: packed_nodes needs $((packed_node + 1)) node(s), got ${#IP_ARRAY[@]}" >&2
+    exit 2
+  fi
 elif [[ "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   for idx in $(seq 0 $((xP - 1))); do
     prefill_port=$((PREFILL_PORT + idx))
@@ -565,7 +619,14 @@ start_logged_process() {
   local log_file="$2"
   shift 2
 
-  if command -v setsid >/dev/null 2>&1; then
+  if [[ "${PACKED_NODES_PD:-0}" == "1" ]]; then
+    echo "[runtime] logging ${log_file} (file-only, packed layout)"
+    if command -v setsid >/dev/null 2>&1; then
+      setsid "$@" >"${log_file}" 2>&1 &
+    else
+      "$@" >"${log_file}" 2>&1 &
+    fi
+  elif command -v setsid >/dev/null 2>&1; then
     setsid "$@" > >(tee "${log_file}") 2>&1 &
   else
     "$@" > >(tee "${log_file}") 2>&1 &
@@ -676,7 +737,11 @@ start_prefill() {
   local handshake_port="${3:-${HANDSHAKE_PORT}}"
   local dp_master_port="${4:-${PREFILL_DP_MASTER_PORT}}"
   local dp_base_port="${5:-${PREFILL_DP_BASE_PORT}}"
+  local visible_devices="${6:-}"
   apply_role_env "ATOMESH_PREFILL_ENV_" "${host_ip}"
+  if [[ -n "${visible_devices}" ]]; then
+    export HIP_VISIBLE_DEVICES="${visible_devices}"
+  fi
   reset_lmcache_disk
   local -a prefill_cache_env=()
   build_server_cache_env "prefill" "${server_port}" prefill_cache_env
@@ -714,7 +779,11 @@ start_decode() {
   local handshake_port="${3:-${HANDSHAKE_PORT}}"
   local dp_master_port="${4:-${DECODE_DP_MASTER_PORT}}"
   local dp_base_port="${5:-${DECODE_DP_BASE_PORT}}"
+  local visible_devices="${6:-}"
   apply_role_env "ATOMESH_DECODE_ENV_" "${host_ip}"
+  if [[ -n "${visible_devices}" ]]; then
+    export HIP_VISIBLE_DEVICES="${visible_devices}"
+  fi
   local max_conc
   max_conc="$(echo "${BENCH_MAX_CONCURRENCY}" | tr 'x,' '\n' | sort -n | tail -1)"
   local decode_max_num_seqs="${MAX_NUM_SEQS}"
@@ -783,10 +852,25 @@ start_router() {
   fi
   local -a router_dp_aware_args=()
   if is_agentic_dpa; then
-    router_policy="dp_sticky"
+    # Respect explicit cache-aware routing for DPA workloads.
+    if [[ "${router_policy}" != "cache_aware" ]]; then
+      router_policy="dp_sticky"
+    fi
     router_dp_aware_args=(--dp-aware)
   elif [[ "${#router_rank_mapping_args[@]}" -gt 0 ]]; then
     router_dp_aware_args=(--dp-aware)
+  fi
+  local -a router_policy_args=(--policy "${router_policy}")
+  if [[ "${router_policy}" == "cache_aware" ]]; then
+    # Keep the InferenceX defaults, with a case-level absolute-load override.
+    router_policy_args+=(
+      --prefill-policy cache_aware --decode-policy cache_aware
+      --cache-threshold 0.8
+      --balance-abs-threshold "${ROUTER_BALANCE_ABS_THRESHOLD:-20}"
+      --balance-rel-threshold 2.0
+      --eviction-interval 300
+    )
+    router_rank_mapping_args=(--atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}")
   fi
   local -a router_cmd=(
     "${mesh_binary}" launch
@@ -795,7 +879,7 @@ start_router() {
     --pd-disaggregation
     "${prefill_args[@]}"
     "${decode_args[@]}"
-    --policy "${router_policy}"
+    "${router_policy_args[@]}"
     "${router_rank_mapping_args[@]}"
     "${router_dp_aware_args[@]}"
     --backend atom
@@ -881,116 +965,7 @@ ensure_aiperf() {
 }
 
 write_aiperf_dashboard_json() {
-  local aiperf_json="$1"
-  local out_json="$2"
-  local conc="$3"
-  python3 - "${aiperf_json}" "${out_json}" "${conc}" <<'PY'
-import json
-import os
-import sys
-from pathlib import Path
-
-src = Path(sys.argv[1])
-dst = Path(sys.argv[2])
-conc = int(sys.argv[3])
-data = json.loads(src.read_text(encoding="utf-8"))
-
-
-def avg(name):
-    value = data.get(name)
-    if isinstance(value, dict):
-        return value.get("avg")
-    return value
-
-
-def pct(name, key):
-    value = data.get(name)
-    if isinstance(value, dict):
-        return value.get(key)
-    return None
-
-
-def total_tokens(name):
-    """Return one of AIPerf's profiling-only aggregate token counters."""
-    value = avg(name)
-    return int(value) if isinstance(value, (int, float)) else None
-
-
-# These aggregates contain successful profiling records only: AIPerf excludes
-# its internal warmup and requests cancelled during grace-period draining.
-cache_hit_tokens = total_tokens("total_usage_prompt_cache_read_tokens")
-cache_total_tokens = total_tokens("total_usage_prompt_tokens")
-
-payload = {
-    "benchmark_backend": "atom",
-    # Directory holding this run's profile_export.jsonl, so process_result.py can
-    # find the per-request records both interactivity definitions are computed
-    # from, without reconstructing the directory name.
-    "aiperf_artifact_dir": src.parent.name,
-    "benchmark_model_name": os.environ.get("MODEL_NAME")
-    or data.get("model")
-    or data.get("model_id"),
-    "backend": "atom",
-    "benchmark_kind": os.environ.get("BENCHMARK_KIND") or "aiperf_agentic",
-    "scenario": os.environ.get("AIPERF_SCENARIO"),
-    "public_dataset": os.environ.get("AIPERF_PUBLIC_DATASET"),
-    "topology": os.environ.get("TOPOLOGY") or data.get("topology"),
-    "display_topology": os.environ.get("DISPLAY_TOPOLOGY")
-    or data.get("display_topology"),
-    "precision": os.environ.get("PRECISION") or data.get("precision"),
-    "random_input_len": int(
-        data.get("max_context_length")
-        or os.environ.get("AIPERF_MAX_CONTEXT_LENGTH")
-        or 0
-    ),
-    "random_output_len": 1024,
-    "max_concurrency": conc,
-    "random_range_ratio": "",
-    "request_throughput": avg("request_throughput"),
-    "mean_ttft_ms": avg("time_to_first_token"),
-    "median_ttft_ms": pct("time_to_first_token", "p50"),
-    "p90_ttft_ms": pct("time_to_first_token", "p90"),
-    "p99_ttft_ms": pct("time_to_first_token", "p99"),
-    "mean_itl_ms": avg("inter_token_latency"),
-    "median_itl_ms": pct("inter_token_latency", "p50"),
-    "p90_itl_ms": pct("inter_token_latency", "p90"),
-    "p99_itl_ms": pct("inter_token_latency", "p99"),
-    "mean_e2el_ms": avg("request_latency"),
-    "median_e2el_ms": pct("request_latency", "p50"),
-    "p90_e2el_ms": pct("request_latency", "p90"),
-    "p99_e2el_ms": pct("request_latency", "p99"),
-    "input_throughput": avg("input_token_throughput"),
-    "output_throughput": avg("output_token_throughput"),
-    "total_token_throughput": avg("total_token_throughput"),
-    "successful_requests": avg("request_count"),
-    "completed": avg("request_count"),
-    "benchmark_duration_s": avg("benchmark_duration")
-    or data.get("benchmark_duration_s"),
-    "total_input_tokens": avg("total_usage_prompt_tokens"),
-    "total_output_tokens": avg("total_usage_completion_tokens"),
-    "cache_hit_tokens": cache_hit_tokens,
-    "cache_total_tokens": cache_total_tokens,
-    "cache_hit_rate": (
-        round(cache_hit_tokens / cache_total_tokens, 4)
-        if cache_hit_tokens is not None and cache_total_tokens
-        else None
-    ),
-}
-
-payload = {key: value for key, value in payload.items() if value is not None}
-dst.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-if cache_hit_tokens is not None and cache_total_tokens:
-    print(
-        f"[aiperf] prefix cache hit: {cache_hit_tokens}/{cache_total_tokens} "
-        f"tokens ({cache_hit_tokens / cache_total_tokens:.2%})"
-    )
-else:
-    print(
-        "[aiperf] prefix cache hit: unavailable "
-        "(AIPerf profiling cache-read counters were not produced)"
-    )
-print(f"[aiperf] dashboard json: {dst}")
-PY
+  python3 "${ATOMESH_SCRIPT_DIR}/../aiperf_dashboard.py" "$@"
 }
 
 write_aiperf_chrome_trace() {
@@ -1260,6 +1235,7 @@ run_eval() {
       --num_fewshot "${EVAL_FEWSHOT}" \
       "${limit_arg[@]}" \
       "${eval_extra_args[@]}" \
+      --log_samples \
       --output_path "${result_dir}"
 
     python3 - "${result_dir}" "${eval_conc}" <<'PY'
@@ -1332,6 +1308,63 @@ if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
   wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
   run_benchmark_and_eval
   cleanup_processes "${router_pid}" "${prefill_pid}" "${decode_pid}"
+elif [[ "${PACKED_NODES_PD}" == "1" ]]; then
+  worker_pids=()
+  declare -A local_worker_pid=()
+  # Save the base handshake port; each worker overrides it so
+  # apply_role_env expands ${HANDSHAKE_PORT} to the per-worker value.
+  PACKED_BASE_HANDSHAKE_PORT="${HANDSHAKE_PORT}"
+  for idx in "${!prefill_nodes[@]}"; do
+    [[ "${prefill_nodes[$idx]}" -eq "${NODE_RANK}" ]] || continue
+    gpu_start="${prefill_gpus[$idx]%%,*}"
+    export HANDSHAKE_PORT="$((PACKED_BASE_HANDSHAKE_PORT + gpu_start))"
+    start_prefill "prefill-rank-${NODE_RANK}-worker-${idx}" "${prefill_ports[$idx]}" \
+      "${HANDSHAKE_PORT}" \
+      "$((PREFILL_DP_MASTER_PORT + idx * 400))" "$((PREFILL_DP_BASE_PORT + idx * 400))" \
+      "${prefill_gpus[$idx]}"
+    worker_pids+=("${server_pid}")
+    local_worker_pid["prefill-${idx}"]="${server_pid}"
+  done
+  for idx in "${!decode_nodes[@]}"; do
+    [[ "${decode_nodes[$idx]}" -eq "${NODE_RANK}" ]] || continue
+    gpu_start="${decode_gpus[$idx]%%,*}"
+    export HANDSHAKE_PORT="$((PACKED_BASE_HANDSHAKE_PORT + gpu_start))"
+    start_decode "decode-rank-${NODE_RANK}-worker-${idx}" "${decode_ports[$idx]}" \
+      "${HANDSHAKE_PORT}" \
+      "$((DECODE_DP_MASTER_PORT + idx * 400))" "$((DECODE_DP_BASE_PORT + idx * 400))" \
+      "${decode_gpus[$idx]}"
+    worker_pids+=("${server_pid}")
+    local_worker_pid["decode-${idx}"]="${server_pid}"
+  done
+  trap 'cleanup_processes ${router_pid:-} ${worker_pids[*]:-}' EXIT
+  if [[ "${NODE_RANK}" -eq 0 ]]; then
+    for idx in "${!prefill_ips[@]}"; do
+      wait_http "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/health" \
+        "prefill-${prefill_ips[$idx]}:${prefill_ports[$idx]}" \
+        "${WAIT_SERVER_TIMEOUT}" "${local_worker_pid["prefill-${idx}"]:-}"
+    done
+    for idx in "${!decode_ips[@]}"; do
+      wait_http "http://${decode_ips[$idx]}:${decode_ports[$idx]}/health" \
+        "decode-${decode_ips[$idx]}:${decode_ports[$idx]}" \
+        "${WAIT_SERVER_TIMEOUT}" "${local_worker_pid["decode-${idx}"]:-}"
+    done
+    start_router
+    wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
+    run_benchmark_and_eval
+  else
+    wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}"
+    # Monitor all local workers while waiting for the router to shut down.
+    for pid in "${worker_pids[@]}"; do
+      if ! kill -0 "${pid}" 2>/dev/null; then
+        set +e; wait "${pid}"; rc=$?; set -e
+        [[ "${rc}" -eq 0 ]] && rc=1
+        echo "[wait][FAIL] packed worker ${pid} exited early rc=${rc}" >&2
+        exit "${rc}"
+      fi
+    done
+    wait_router_closed
+  fi
+  cleanup_processes "${router_pid:-}" "${worker_pids[@]}"
 elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   prefill_pids=()
   for idx in $(seq 0 $((xP - 1))); do

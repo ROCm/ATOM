@@ -306,7 +306,10 @@ def test_committed_sidecar_capacity_precedence(monkeypatch):
 def test_committed_sidecar_capacity_rejects_invalid_env(monkeypatch, value):
     monkeypatch.setenv("OFFLOAD_COMMITTED_SIDECAR_CAPACITY", value)
 
-    with pytest.raises(ValueError, match="committed sidecar index capacity"):
+    with pytest.raises(
+        ValueError,
+        match="committed sidecar index capacity|OFFLOAD_COMMITTED_SIDECAR_CAPACITY",
+    ):
         connector_module._committed_sidecar_capacity({})
 
 
@@ -5866,6 +5869,9 @@ def test_bounded_saves_are_shared_round_robin_not_head_first():
     s._lookup_in_step = []
     s._save_tracker = {}
     s._save_inflight = {}
+    s._save_previous_frontier = {}
+    s._save_previous_owner = {}
+    s._save_retry_blocked = {}
     s._save_nonce = 0
     s._save_rr_last = None
 
@@ -6406,6 +6412,7 @@ def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
     # the same change, deliberately.
     must_be_seen = {
         "should_defer_free",
+        "can_partially_deallocate_state",
         "abandon_save",
         "save_abandon_timeout_s",
         "release_stalled_save",

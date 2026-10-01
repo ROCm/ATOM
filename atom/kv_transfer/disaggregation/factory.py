@@ -50,6 +50,11 @@ class KVConnectorFactory:
     # cache layouts that cannot publish one, rather than handed a `None`
     # its `register_kv_caches` may not survive.
     _reads_block_regions: ClassVar[dict[str, bool]] = {}
+    # Whether a region-reading backend copies whole blocks of every published
+    # region, so a layer may publish several planes per role (the FP4 indexer's
+    # data and e8m0 scale). Absent means no: the P/D backends parse one region
+    # per role and layer.
+    _copies_whole_block_regions: ClassVar[dict[str, bool]] = {}
 
     @classmethod
     def register(
@@ -62,6 +67,7 @@ class KVConnectorFactory:
         scheduler_class: str,
         aliases: Iterable[str] = (),
         reads_block_regions: bool = True,
+        copies_whole_block_regions: bool = False,
         requires_pd_staging: bool = True,
     ) -> None:
         """Register a KV connector backend.
@@ -94,6 +100,7 @@ class KVConnectorFactory:
             cls._aliases[normalized] = name
         cls._requires_pd_staging[name] = bool(requires_pd_staging)
         cls._reads_block_regions[name] = bool(reads_block_regions)
+        cls._copies_whole_block_regions[name] = bool(copies_whole_block_regions)
 
     @classmethod
     def canonical_name(cls, value: object, *, path: str = "kv_transfer_config") -> str:
@@ -114,6 +121,53 @@ class KVConnectorFactory:
                 f"{path} has unknown KV connector {value!r}; available: {available}"
             )
         return canonical
+
+    @classmethod
+    def connector_name(cls, kv_transfer_config: dict[str, Any] | None) -> str | None:
+        """Canonical name of the configured connector; None without a transfer config."""
+
+        if not kv_transfer_config:
+            return None
+        return cls.canonical_name(kv_transfer_config.get("kv_connector", "moriio"))
+
+    @classmethod
+    def leaf_connectors(cls, config: Any) -> list[tuple[str, Any]] | None:
+        """The transports `config` runs, with `multi` expanded into its subs.
+
+        Each entry is the canonical name and a config whose
+        `kv_transfer_config` is that transport's -- the same
+        shallow-copy-and-swap `_build_subconnectors` uses to route each entry
+        through this factory, so both walks see one sub the same way.
+
+        Empty without a transfer config. None when a `multi` lists no
+        connectors or an entry that is not a dict: that is
+        `_build_subconnectors`' error to raise, and callers must not read it
+        as "no transport".
+        """
+
+        kv_cfg = getattr(config, "kv_transfer_config", None) or {}
+        name = cls.connector_name(kv_cfg)
+        if name is None:
+            return []
+        if name != "multi":
+            return [(name, config)]
+
+        import copy as _copy
+
+        subs = kv_cfg.get("connectors") or ()
+        if not subs:
+            return None
+        leaves = []
+        for sub in subs:
+            if not isinstance(sub, dict):
+                return None
+            sub_config = _copy.copy(config)
+            sub_config.kv_transfer_config = sub
+            sub_leaves = cls.leaf_connectors(sub_config)
+            if sub_leaves is None:
+                return None
+            leaves.extend(sub_leaves)
+        return leaves
 
     @classmethod
     def topology_uses_pd_staging(
@@ -161,31 +215,38 @@ class KVConnectorFactory:
           registration, so the layout is asked here.
         """
 
-        kv_cfg = getattr(config, "kv_transfer_config", None) or {}
-        if not kv_cfg:
+        leaves = cls.leaf_connectors(config)
+        if leaves is None:
+            # An empty or unparsable `multi` is `_build_subconnectors`' error
+            # to raise, not a reason to declare the map unread.
+            return True
+        return any(cls._leaf_reads_block_regions(*leaf) for leaf in leaves)
+
+    @classmethod
+    def topology_region_readers_copy_whole_blocks(cls, config: Any) -> bool:
+        """Is every transport that reads the PAGE region map a whole-block copier?
+
+        Such a transport takes any number of regions per role and layer, so a
+        backend may publish planes a P/D parser could not place (the FP4
+        indexer's e8m0 scale). Declared as `copies_whole_block_regions` on the
+        registration. False when nothing reads the map -- there is no reader
+        to publish to -- or when the topology cannot be parsed.
+        """
+
+        leaves = cls.leaf_connectors(config)
+        if not leaves:
             return False
-        connector = cls.canonical_name(kv_cfg.get("kv_connector", "moriio"))
+        readers = [
+            name for name, cfg in leaves if cls._leaf_reads_block_regions(name, cfg)
+        ]
+        return bool(readers) and all(
+            cls._copies_whole_block_regions.get(name, False) for name in readers
+        )
 
-        if connector == "multi":
-            # Same shallow-copy-and-swap `_build_subconnectors` uses to route
-            # each entry through this factory, so both walks see one sub the
-            # same way.
-            import copy as _copy
-
-            verdicts = []
-            for sub in kv_cfg.get("connectors") or ():
-                if not isinstance(sub, dict):
-                    return True
-                sub_config = _copy.copy(config)
-                sub_config.kv_transfer_config = sub
-                verdicts.append(cls.topology_reads_block_regions(sub_config))
-            # An empty or unparsable list is `_build_subconnectors`' error to
-            # raise, not a reason to declare the map unread.
-            return True if not verdicts else any(verdicts)
-
+    @classmethod
+    def _leaf_reads_block_regions(cls, connector: str, config: Any) -> bool:
         if cls._reads_block_regions.get(connector, True):
             return True
-
         if connector == "lmcache_offload":
             from atom.kv_transfer.offload.config import select_offload_layout
 

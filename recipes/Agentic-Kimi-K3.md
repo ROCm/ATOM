@@ -8,6 +8,7 @@ with ATOM on 8×AMD MI355X GPUs. The validated configuration uses:
 - FP8 KV cache
 - native GPU prefix caching; LMCache CPU offload from CONC 8 up
 - DSpark speculative decoding on CONC ≤ 16, with synthetic acceptance
+- FlyDSL FP8 prefill attention on every band; the PrefillDelayer from CONC 16 up
 - the SemiAnalysis Weka AgentX workload
 
 The workload uses the AIPerf scenario `inferencex-agentx-mvp` and public
@@ -42,6 +43,8 @@ changes.
 | Prefix cache | Enabled (required for AgentX multi-turn prefix hits) |
 | Speculative decoding | DSpark (`--method dspark`), not native MTP |
 | Synthetic acceptance | `--spec-decode-acceptance-length` (performance-only; see below) |
+| Prefill attention | FlyDSL FP8 (`ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1`), every band |
+| PrefillDelayer | CONC ≥ 16: `ATOM_PREFILL_DECODE_INTERVAL=4` (4 decode passes after each prefill), `ATOM_PREFILL_DELAYER_MAX_QUEUE_MS=5000` |
 | Profiling duration | 3,600 seconds |
 | Warmup | 10 additional one-token requests per lane |
 | AIPerf | `0.12.0` (`agentx-v1.0.4`) |
@@ -49,7 +52,7 @@ changes.
 ### Per-concurrency server table
 
 `graph_max = 2 * CONC * (1 + spec)`. Capture sizes are the dense range
-`[2, 3, …, graph_max]`. `max-num-seqs` is **not** always `2 * CONC`.
+`[1, 2, …, graph_max]`. `max-num-seqs` is **not** always `2 * CONC`.
 
 | CONC | DCP | spec | AL | LMCache | ReplaySSM | `max-num-seqs` | batched tokens | GPU util | `graph_max` |
 |---:|---:|---:|---:|---|---:|---:|---:|---:|---:|
@@ -73,6 +76,9 @@ C8–C48 use 128 GiB LMCache; C56–C80 use **192 GiB**. LMCache CPU size is
 
 `AITER_REUSE_IDENTICAL_COMM_GROUPS=1` on **C56/C64/C72/C80**, and `0` on every
 other band (C1…C48).
+
+`ATOM_PREFILL_DECODE_INTERVAL=4` and `ATOM_PREFILL_DELAYER_MAX_QUEUE_MS=5000` on
+**C16 and up**; unset on C1…C14.
 
 ## 0. Container prerequisites
 
@@ -131,6 +137,7 @@ export AITER_SITUV2_A4W4=1
 export AITER_FLYDSL_STAGE2_FP8=1
 export ATOM_STATE_CHECKPOINT_DEMAND=0
 export ATOM_GDN_SSM_DTYPE="${ATOM_GDN_SSM_DTYPE:-fp16}"
+export ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1
 # Set explicitly to 1 for reproducibility; this is also the current default.
 export ATOM_USE_FLYDSL_GATHER_KV_B_PROJ=1
 export PYTHONNOUSERSITE=1
@@ -190,6 +197,10 @@ if [[ "${CONC}" -ge 56 ]]; then
 fi
 AITER_REUSE_IDENTICAL_COMM_GROUPS="${AITER_REUSE_IDENTICAL_COMM_GROUPS:-0}"
 export AITER_REUSE_IDENTICAL_COMM_GROUPS
+if [[ "${CONC}" -ge 16 ]]; then
+  export ATOM_PREFILL_DECODE_INTERVAL="${ATOM_PREFILL_DECODE_INTERVAL:-4}"
+  export ATOM_PREFILL_DELAYER_MAX_QUEUE_MS="${ATOM_PREFILL_DELAYER_MAX_QUEUE_MS:-5000}"
+fi
 export ATOM_ENABLE_REPLAYSSM
 SPEC_TOKENS_FOR_GRAPH=0
 if [[ "${NUM_SPECULATIVE_TOKENS}" != "0" ]]; then
@@ -197,7 +208,7 @@ if [[ "${NUM_SPECULATIVE_TOKENS}" != "0" ]]; then
 fi
 CUDAGRAPH_MAX_NUM_SEQS="${CUDAGRAPH_MAX_NUM_SEQS:-$((2 * CONC))}"
 GRAPH_MAX=$((CUDAGRAPH_MAX_NUM_SEQS * (1 + SPEC_TOKENS_FOR_GRAPH)))
-CUDAGRAPH_CAPTURE_SIZES="[$(seq -s, 2 "${GRAPH_MAX}")]"
+CUDAGRAPH_CAPTURE_SIZES="[$(seq -s, 1 "${GRAPH_MAX}")]"
 
 ATOM_CMD=(
   python3 -m atom.entrypoints.openai_server

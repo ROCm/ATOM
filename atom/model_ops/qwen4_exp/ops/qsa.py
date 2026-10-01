@@ -85,7 +85,7 @@ def _kernel_config(
     return 32, 4, 1, 3, sub_group
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["N", "REAL"])
 def _draft_decode_metadata(
     Lengths,
     Tables,
@@ -94,8 +94,8 @@ def _draft_decode_metadata(
     Positions,
     Requests,
     Compressed,
-    N: tl.constexpr,
-    REAL: tl.constexpr,
+    N,
+    REAL,
     TS: tl.constexpr,
     PAGE: tl.constexpr,
     RATIO: tl.constexpr,

@@ -178,6 +178,7 @@ def _aiter_rms_quant_fake(
     transpose_scale: bool,
     res1: torch.Tensor | None = None,
     value_dtype: torch.dtype | None = None,
+    e8m0_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from aiter.utility.dtypes import fp8
 
@@ -200,16 +201,13 @@ def _aiter_rms_quant_fake(
             (scale_m, scale_n), dtype=torch.float8_e8m0fnu, device=x.device
         )
     elif quant_type_value == _QV_PER_1X128:
-        # FP8 per-block: scale=(M, ⌈N/128⌉) fp32. Preshuffle GEMM expects
+        # FP8 per-block: scale=(M, ⌈N/128⌉) fp32, or E8M0 when the consuming
+        # linear's weight scales are (`e8m0_scale`). Preshuffle GEMM expects
         # column-major; allocate (num_groups, M) row-major then view as
         # (M, num_groups). Matches GemmaRMSNorm._forward_fused_fp8.
         out = torch.empty((M, N), dtype=fp8, device=x.device)
         num_groups = N // 128
-        scale_dtype = (
-            torch.float8_e8m0fnu
-            if envs.ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE
-            else torch.float32
-        )
+        scale_dtype = torch.float8_e8m0fnu if e8m0_scale else torch.float32
         if transpose_scale:
             scale = torch.empty(
                 (num_groups, M), dtype=scale_dtype, device=x.device
@@ -232,11 +230,12 @@ def _aiter_rms_quant(
     transpose_scale: bool,
     res1: torch.Tensor | None = None,
     value_dtype: torch.dtype | None = None,
+    e8m0_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from aiter import add_rmsnorm_quant, rmsnorm_quant
 
     out, scale, out_res1 = _aiter_rms_quant_fake(
-        x, weight, eps, quant_type_value, transpose_scale, res1, value_dtype
+        x, weight, eps, quant_type_value, transpose_scale, res1, value_dtype, e8m0_scale
     )
     if _is_mxfp8(quant_type_value, value_dtype):
         # The FP8 width is carried by `out`'s dtype and the UE8M0 format by
@@ -304,6 +303,10 @@ class RMSNorm(nn.Module):
             and quant_type.value == _QV_PER_1X128
             and envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
         )
+        # per_1x128 scale dtype, matching the consuming linear's weight scales.
+        self._aiter_e8m0_scale = (
+            quant_type.value == _QV_PER_1X128 and quant_config.blockscale_e8m0_scale
+        )
 
     def process_weights_after_loading(self):
         """Post-load hook invoked by the model loader for every module.
@@ -357,6 +360,10 @@ class RMSNorm(nn.Module):
         self._aiter_transpose_scale = (
             self.quant_type.value == _QV_PER_1X128
             and envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+        )
+        self._aiter_e8m0_scale = (
+            self.quant_type.value == _QV_PER_1X128
+            and self.quant_config.blockscale_e8m0_scale
         )
         # Surfaced by the loader's online-quant report alongside Linear layers.
         self._online_quant_info = {
@@ -506,6 +513,7 @@ class RMSNorm(nn.Module):
                         else residual
                     ),
                     self.params_dtype,
+                    self._aiter_e8m0_scale,
                 )
                 if batched:
                     x = x.view(*lead, -1)

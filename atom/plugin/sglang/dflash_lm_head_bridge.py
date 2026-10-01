@@ -60,9 +60,9 @@ def _dflash_across_ranks_configured() -> bool | None:
     can tell "not configured" apart from "unknown".
     """
     try:
-        from sglang.srt.server_args import get_global_server_args
+        from atom.plugin.config import get_sglang_server_args
 
-        server_args = get_global_server_args()
+        server_args = get_sglang_server_args()
     except Exception:  # noqa: BLE001 - any failure here means "cannot tell"
         return None
     if server_args is None:

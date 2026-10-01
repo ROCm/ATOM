@@ -48,6 +48,15 @@ def prepare_model(config: Any):
         # Model construction precedes ModelRunner.init_memory_pool(), so install
         # the K3-only pool hooks here after the architecture is known.
         install_kimi_k3_pool_patch()
+    elif model_arch in (
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
+    ):
+        from atom.plugin.sglang.minimax_m3_bridge import (
+            install_minimax_m3_pool_patch,
+        )
+
+        install_minimax_m3_pool_patch()
 
     # Import here to avoid partial initialization while SGLang discovers models.
     from atom.plugin.register import (

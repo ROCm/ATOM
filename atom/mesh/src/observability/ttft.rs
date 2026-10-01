@@ -130,7 +130,7 @@ impl http_body::Body for FirstOutputBody {
 }
 
 #[derive(Default)]
-struct SseFrames {
+pub(crate) struct SseFrames {
     pending: Vec<u8>,
     start: usize,
     search: usize,
@@ -138,9 +138,13 @@ struct SseFrames {
 }
 
 impl SseFrames {
-    const MAX_FRAME_BYTES: usize = 1024 * 1024;
+    pub(crate) const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
-    fn append(&mut self, chunk: &[u8]) {
+    pub(crate) fn exceeded_limit(&self) -> bool {
+        self.oversized
+    }
+
+    pub(crate) fn append(&mut self, chunk: &[u8]) {
         // Amortize compaction over the consumed bytes, not over frames.
         if self.start > 0 && self.start >= self.pending.len() / 2 {
             self.pending.drain(..self.start);
@@ -150,7 +154,7 @@ impl SseFrames {
         self.pending.extend_from_slice(chunk);
     }
 
-    fn next_frame(&mut self) -> Option<&[u8]> {
+    pub(crate) fn next_frame(&mut self) -> Option<&[u8]> {
         while let Some(offset) = memchr::memchr(b'\n', &self.pending[self.search..]) {
             let end = self.search + offset;
             self.search = end + 1;
@@ -179,31 +183,40 @@ impl SseFrames {
     }
 }
 
+/// Extract one SSE event's data, following the single-optional-space rule.
+pub(crate) fn sse_data(frame: &[u8]) -> Option<String> {
+    let frame = std::str::from_utf8(frame).ok()?;
+    let lines: Vec<_> = frame
+        .lines()
+        .filter_map(|line| {
+            if line == "data" {
+                Some("")
+            } else {
+                line.strip_prefix("data:")
+                    .map(|value| value.strip_prefix(' ').unwrap_or(value))
+            }
+        })
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 #[derive(Default)]
-struct FirstOutputSse {
+pub(crate) struct FirstOutputSse {
     frames: SseFrames,
     model: Option<String>,
     done: bool,
 }
 
 impl FirstOutputSse {
-    fn feed(&mut self, chunk: &[u8]) -> bool {
+    pub(crate) fn feed(&mut self, chunk: &[u8]) -> bool {
         if self.done {
             return false;
         }
         self.frames.append(chunk);
         while let Some(frame) = self.frames.next_frame() {
-            let Ok(frame) = std::str::from_utf8(frame) else {
+            let Some(data) = sse_data(frame) else {
                 continue;
             };
-            let data = frame
-                .lines()
-                .filter_map(|line| {
-                    line.strip_prefix("data:")
-                        .map(|s| s.trim_start_matches(' '))
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
             if data == "[DONE]" {
                 self.finish();
                 return false;
@@ -455,12 +468,21 @@ mod tests {
                 "/v1/chat/completions",
                 post(|| async {
                     tokio::time::sleep(Duration::from_millis(10)).await;
-                    Response::builder()
+                    let response = Response::builder()
                         .header(CONTENT_TYPE, "text/event-stream")
                         .body(Body::from(sse(
                             json!({"model": "test-model", "choices": [{"text": "ok"}]}),
                         )))
-                        .unwrap()
+                        .unwrap();
+                    // Business observation and outer ingress timing must emit one TTFT.
+                    crate::observability::request::RequestMetrics::new(
+                        "http",
+                        "regular",
+                        "test-model",
+                        "/v1/chat/completions",
+                        true,
+                    )
+                    .wrap_response(response)
                 }),
             )
             .layer(axum::middleware::from_fn_with_state(

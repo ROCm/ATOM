@@ -10,9 +10,6 @@ from atom.model_ops.attentions.deepseek_v41.packed_rows import (
     write_packed_window,
 )
 from atom.model_ops.attentions.pool_layout.entry_arena import EntryMajorArena
-from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
-    MQA_LOGITS_PRESHUFFLE_ROWS,
-)
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
     INDEX_FP8_SCALE_FMT,
     MAIN_FP4,
@@ -67,7 +64,7 @@ class PagedAttentionCache:
         # The same bytes as `[tiles, tile rows, width]`, which is what a block
         # id addresses and what the scorer is handed.
         self.index_units = {
-            owner: plane.view(-1, MQA_LOGITS_PRESHUFFLE_ROWS, plane.shape[-1])
+            owner: plane.view(-1, geometry.index_block_rows, plane.shape[-1])
             for owner, plane in self.index_planes.items()
         }
         self.state = EntryMajorArena(
@@ -214,6 +211,7 @@ class PagedAttentionCache:
         self,
         requests,
         *,
+        block_tables,
         tentative=False,
         buffers=None,
         running_bs=None,
@@ -221,6 +219,9 @@ class PagedAttentionCache:
         max_q_len=None,
         state_slot_out=None,
         plans=None,
+        publication_group=None,
+        query_prefix_ready=False,
+        query_prefix_republish_reason=None,
     ):
         self.require_committed()
         requests = tuple(requests)
@@ -237,7 +238,9 @@ class PagedAttentionCache:
             )
         offset = 0
         seen = set()
-        for span in requests:
+        if len(block_tables) != len(requests):
+            raise ValueError("One PAGE table is required per request")
+        for span, row in zip(requests, block_tables):
             if span.length <= 0 or span.position < 0 or span.offset != offset:
                 raise ValueError(
                     "Request spans must be nonempty and partition the token batch"
@@ -245,15 +248,15 @@ class PagedAttentionCache:
             if not 0 <= span.slot < self.num_slots or span.slot in seen:
                 raise ValueError("Each request needs its own valid STATE slot")
             needed = -(-span.end // self.geometry.block_size)
-            if len(span.block_ids) < needed or any(
-                block < 0 or block >= self.num_pages for block in span.block_ids
-            ):
+            if len(row) < needed:
                 raise ValueError("Request PAGE table is incomplete or out of range")
             seen.add(span.slot)
             offset += span.length
         step = prepare_batch_step(
             requests,
             self.pool.device,
+            block_tables=block_tables,
+            page_limit=self.num_pages,
             tentative=tentative,
             buffers=buffers,
             running_bs=running_bs,
@@ -261,6 +264,9 @@ class PagedAttentionCache:
             max_q_len=max_q_len,
             state_slot_out=state_slot_out,
             ratios=tuple(ratio for ratio, _ in self.geometry.compress_ratios),
+            publication_group=publication_group,
+            query_prefix_ready=query_prefix_ready,
+            query_prefix_republish_reason=query_prefix_republish_reason,
         )
         step.plans = (
             self._private_plans(requests, tentative) if plans is None else plans
@@ -459,6 +465,7 @@ class PagedAttentionCache:
             step.block_tables,
             self.geometry.rows_per_page(ratio),
             ratio=ratio,
+            rows_per_block=self.geometry.index_block_rows,
             scale_fmt=INDEX_FP8_SCALE_FMT,
         )
 
@@ -475,7 +482,7 @@ class PagedAttentionCache:
             table = step.tiles[ratio] = unit_table(
                 step.block_tables,
                 step.batch_ids,
-                self.geometry.rows_per_page(ratio) // MQA_LOGITS_PRESHUFFLE_ROWS,
+                self.geometry.rows_per_page(ratio) // self.geometry.index_block_rows,
             )
         return table
 

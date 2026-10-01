@@ -166,7 +166,7 @@ class ScheduledBatch:
 | `scheduled_tokens` | `np.ndarray[int32]` | The tokens to process, flattened in batch order and sliced by `num_scheduled_tokens` |
 | `temperatures` | `list[float]` | Sampling temperature per sequence |
 | `context_lens` | `list[int]` | Total token count per sequence (`seq.num_tokens`) |
-| `block_tables` | `list[array("i")]` | Block ID tables for sequences that have block tables, held as `Sequence.block_table` gives them |
+| `block_tables` | `list[BlockTable]` | Block ID tables for sequences that have block tables, held as `Sequence.block_table` gives them. Travels to the TP workers as appends alone — see `atom/model_engine/block_table_codec.py` |
 | `last_block_num_tokens` | `list[int]` | Number of valid tokens in each sequence's last block |
 | `num_cached_tokens` | `list[int]` | Number of tokens served from prefix cache per sequence |
 | `num_scheduled_tokens` | `list[int]` | Number of new tokens scheduled per sequence |
@@ -658,7 +658,7 @@ class Sequence:
 | `num_tokens` | `int` | Total tokens (prompt + completion); property with setter that also updates `num_blocks` and `last_block_num_tokens` |
 | `num_prompt_tokens` | `int` | Number of prompt tokens (fixed at init) |
 | `num_cached_tokens` | `int` | Tokens served from prefix cache |
-| `block_table` | `list[int]` | Ordered list of block IDs assigned to this sequence |
+| `block_table` | `BlockTable` | Ordered block IDs assigned to this sequence. An `array("i")` subclass carrying a `version` that every non-append mutation redraws, so the forward RPC can ship only the ids appended since the previous step |
 | `has_per_req_cache` | `bool` | Whether the model's attention type maintains per-request state outside the paged KV pool (set at sequence init; True for GDN-based models, future stateful attentions) |
 | `state_slots` | `list[int]` | Every stateful-attention slot the sequence holds, in allocation order: `[0]` is the committed state, `[1:]` is speculation rollback. Not adjacent, and no backend may rebuild the set by arithmetic on a base. Assigned by BlockManager during allocation, `[]` if unallocated |
 | `state_slot` | `int` | Property over `state_slots[0]` — the slot the forward reads and writes, the one a fork gives away, the one a checkpoint is. `-1` when the sequence holds none |
