@@ -856,7 +856,7 @@ models:
       served_model_name: Kimi-K3
       source:
         repo: https://github.com/whx-sjtu/vllm
-        sha: 08d77cad7be4c2ba1f72ebbd5d58571e7e91b2de
+        sha: 9b1b678b1784085dd0802f912856890f9a0c042e
       diagnostic: 0
     server:
       common_args:
@@ -875,7 +875,7 @@ models:
     suites:
       vllm:
         - &kimi_k3_vllm_dspark_dcp8
-          name: kimi-k3-gsm8k-main-without-59164-dspark3-tp8-dcp8-eager
+          name: kimi-k3-gsm8k-main-grouping-without-59164-dspark3-tp8-dcp8-eager
           topology: 1p1d
           display_topology: 1P1D-TP8-DCP8
           pd_worker_layout: multi_node
@@ -904,10 +904,10 @@ models:
             wait_server_timeout: 10800
           run_eval: true
         - <<: *kimi_k3_vllm_dspark_dcp8
-          name: kimi-k3-gsm8k-main-with-59164-dspark3-tp8-dcp8-eager
+          name: kimi-k3-gsm8k-main-grouping-with-59164-dspark3-tp8-dcp8-eager
           vllm:
             source:
-              sha: 0b68e6074f1b75219be23c305f646f1c2b0b2a55
+              sha: f383aa4ce837544fdf6d4a0b58a50a06ddfb1cf4
     accuracy:
       task: gsm8k
       fewshot: 5
