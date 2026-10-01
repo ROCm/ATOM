@@ -224,6 +224,11 @@ class tokenIDProcessor:
         gpu_logprobs: torch.Tensor | None = None,
     ):
         copy_done = copy_done or torch.cuda.Event()
+        # Sources are freed on the compute stream once the caller returns; tell
+        # the allocator they are still in use by the copy stream.
+        gpu_tensor.record_stream(self.async_copy_stream)
+        if gpu_logprobs is not None:
+            gpu_logprobs.record_stream(self.async_copy_stream)
         with torch.cuda.stream(self.async_copy_stream):
             data_ready.wait(stream=self.async_copy_stream)
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
@@ -381,7 +386,9 @@ class tokenIDProcessor:
         token_ids = self.recv_async_output(self.token_ids_cpu)
         logprobs = self.recv_logprobs()
         # Previous copy_done covers token + route D2H from last step. Commit
-        # and queue this step's route copy *before* send records copy_done.
+        # and queue this step's route copy *before* send records copy_done:
+        # the next recv then also fences the gather's reads of the in-place
+        # reused slot_mapping before the host prepares a later step.
         if after_recv is not None:
             after_recv()
         self.send_to_cpu_async(

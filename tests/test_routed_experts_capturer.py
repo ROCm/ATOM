@@ -255,7 +255,7 @@ def test_commit_pending_keep_last_does_not_wait():
     )
     dest = torch.tensor([3], dtype=torch.int32)
     rows = torch.tensor([[[5, 6]]], dtype=torch.int16)
-    capturer._pending.append((dest, rows))
+    capturer._pending.append((dest, rows, None))
     capturer.commit_pending(keep_last=True)
     np.testing.assert_array_equal(
         capturer.cpu_buffer[3], np.zeros((1, 2), dtype=np.int16)
@@ -271,7 +271,7 @@ def test_store_step_empty_returns_false_so_flush_can_commit():
     )
     dest = torch.tensor([3], dtype=torch.int32)
     rows = torch.tensor([[[5, 6]]], dtype=torch.int16)
-    capturer._pending.append((dest, rows))
+    capturer._pending.append((dest, rows, None))
     empty = torch.tensor([], dtype=torch.long)
     assert capturer.store_step(empty) is False
     capturer.commit_pending(keep_last=False)
@@ -301,6 +301,28 @@ def test_async_store_step_applies_only_after_copy_done_commit():
     done.synchronize()
     capturer.commit_pending()
     np.testing.assert_array_equal(capturer.cpu_buffer[1, 0], [7, 8])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for copy stream")
+def test_blocking_store_waits_for_inflight_async_copy():
+    """A middle-chunk blocking store must not commit a D2H still in flight."""
+    device = torch.device("cuda")
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=8, num_layers=1, top_k=2, device=device
+    )
+    slots = torch.tensor([1], device=device)
+    capturer.capture(0, torch.tensor([[7, 8]], dtype=torch.int32, device=device), slot_mapping=slots)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(2_000_000_000)
+    ready = torch.cuda.Event()
+    ready.record()
+    assert capturer.store_step(slots, stream=stream, wait_event=ready) is True
+    other = torch.tensor([2], device=device)
+    capturer.capture(0, torch.tensor([[3, 4]], dtype=torch.int32, device=device), slot_mapping=other)
+    assert capturer.store_step(other) is True
+    np.testing.assert_array_equal(capturer.cpu_buffer[1, 0], [7, 8])
+    np.testing.assert_array_equal(capturer.cpu_buffer[2, 0], [3, 4])
 
 
 def test_capture_page_bytes_are_budgeted_per_block():

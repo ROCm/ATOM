@@ -207,7 +207,9 @@ class RoutedExpertsCapturer:
             (self.num_slots + 1, self.num_layers, self.top_k),
             dtype=np.int16,
         )
-        self._pending: list[tuple[torch.Tensor, torch.Tensor]] = []
+        self._pending: list[
+            tuple[torch.Tensor, torch.Tensor, torch.cuda.Event | None]
+        ] = []
 
     @classmethod
     def init(
@@ -272,9 +274,11 @@ class RoutedExpertsCapturer:
         self.cpu_buffer[dest[mask]] = rows[mask]
 
     def commit_pending(self, *, keep_last: bool = False) -> None:
-        """Write host rows whose D2H is already covered by token ``copy_done``.
+        """Write host rows of queued D2H copies into the CPU slot buffer.
 
-        ``keep_last`` leaves the in-flight current step (queued before
+        Each entry waits on its own copy event: callers outside the token recv
+        path (e.g. a middle-chunk blocking store) have no ``copy_done`` covering
+        it. ``keep_last`` leaves the in-flight current step (queued before
         ``send_to_cpu_async``) until the next ``recv_async_output``.
         """
         if not self._pending:
@@ -286,7 +290,9 @@ class RoutedExpertsCapturer:
             if keep_last
             else (self._pending, [])
         )
-        for dest, rows in ready:
+        for dest, rows, done in ready:
+            if done is not None:
+                done.synchronize()
             self._apply_cpu_store(dest.numpy(), rows.numpy())
 
     def store_step(
@@ -324,7 +330,9 @@ class RoutedExpertsCapturer:
             )
             return True
         # Gather on the copy stream after wait_event (MoE + sample), then D2H.
-        # Queued before token copy_done so the next recv covers this memcpy.
+        # Must be queued before token copy_done: the next recv is what keeps
+        # the host from overwriting ``slots`` before this gather reads it.
+        slots.record_stream(stream)
         with torch.cuda.stream(stream):
             if wait_event is not None:
                 wait_event.wait(stream)
@@ -332,7 +340,9 @@ class RoutedExpertsCapturer:
             rows = self.buffer[dest].to(dtype=torch.int16)
             dest_cpu = dest.to(dtype=torch.int32).to("cpu", non_blocking=True)
             rows_cpu = rows.to("cpu", non_blocking=True)
-        self._pending.append((dest_cpu, rows_cpu))
+            done = torch.cuda.Event()
+            done.record(stream)
+        self._pending.append((dest_cpu, rows_cpu, done))
         return True
 
     def export_batch(
