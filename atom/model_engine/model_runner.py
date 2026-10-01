@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import time
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from functools import partial, wraps
 from typing import Any, ClassVar, NamedTuple
@@ -61,6 +62,7 @@ from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     Pool,
     PoolPlan,
     SubPoolSpec,
+    page_pool,
     plan_pools,
 )
 from atom.model_ops.decode_input_ids import (
@@ -229,6 +231,11 @@ class tokenIDProcessor:
         gpu_logprobs: torch.Tensor | None = None,
     ):
         copy_done = copy_done or torch.cuda.Event()
+        # Sources are freed on the compute stream once the caller returns; tell
+        # the allocator they are still in use by the copy stream.
+        gpu_tensor.record_stream(self.async_copy_stream)
+        if gpu_logprobs is not None:
+            gpu_logprobs.record_stream(self.async_copy_stream)
         with torch.cuda.stream(self.async_copy_stream):
             data_ready.wait(stream=self.async_copy_stream)
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
@@ -364,6 +371,7 @@ class tokenIDProcessor:
         sampled_token_ids: torch.Tensor,
         sync_event: torch.cuda.Event,
         sampled_logprobs: torch.Tensor | None = None,
+        after_recv: Callable[[], None] | None = None,
     ) -> tuple[dict[int, tuple[int, ...]], dict[int, float] | None]:
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
@@ -384,6 +392,10 @@ class tokenIDProcessor:
 
         token_ids = self.recv_async_output(self.token_ids_cpu)
         logprobs = self.recv_logprobs()
+        # Previous copy_done covers token + route D2H from last step. Commit
+        # and queue this step's route copy *before* send records copy_done.
+        if after_recv is not None:
+            after_recv()
         self.send_to_cpu_async(
             sampled_token_ids,
             self.token_ids_cpu,
@@ -1088,6 +1100,11 @@ class ModelRunner:
             del self.model
         if hasattr(self, "drafter"):
             del self.drafter
+        from atom.model_ops.fused_moe.routed_experts_capturer import (
+            RoutedExpertsCapturer,
+        )
+
+        RoutedExpertsCapturer.reset()
         torch.cuda.empty_cache()
         return True
 
@@ -1598,6 +1615,18 @@ class ModelRunner:
         specs = list(self.attn_metadata_builder.sub_pool_specs())
         if hasattr(self, "draft_kv_builder"):
             specs += self.draft_kv_builder.sub_pool_specs()
+        geo = self._routed_experts_geometry()
+        if geo is not None:
+            from atom.model_ops.fused_moe.routed_experts_capturer import (
+                capture_bytes_per_kv_block,
+            )
+
+            num_layers, top_k = geo
+            specs.append(
+                page_pool(
+                    capture_bytes_per_kv_block(self.block_size, num_layers, top_k)
+                )
+            )
         return specs
 
     def _state_pool_names(self) -> list[str]:
@@ -1745,6 +1774,16 @@ class ModelRunner:
         available_for_kv = min(available_for_kv_budget, free)
 
         torch.set_default_device(None)
+
+        geo = self._routed_experts_geometry()
+        if geo is not None:
+            from atom.model_ops.fused_moe.routed_experts_capturer import (
+                capture_pad_row_bytes,
+            )
+
+            available_for_kv = max(
+                0, int(available_for_kv) - capture_pad_row_bytes(*geo)
+            )
 
         specs = self._sub_pool_specs()
 
@@ -2124,6 +2163,11 @@ class ModelRunner:
             num_blocks=num_kvcache_blocks,
         )
 
+        # Capture buffer is part of the PAGE budget (per-slot int32 routes).
+        # Allocate it before the expected-vs-actual check so the measurement
+        # includes those bytes rather than warning on a false mismatch.
+        self._maybe_init_routed_experts_capturer(num_kvcache_blocks)
+
         # Cross-validate: compare estimated vs actual KV cache allocation.
         # `actual_kv_bytes` includes BOTH the unified pool tensors (counted by
         # `block_bytes × num_blocks`) AND the per-request cache tensors (state
@@ -2163,6 +2207,123 @@ class ModelRunner:
         ):
             torch.distributed.barrier()
         return True
+
+    def _routed_experts_geometry(self) -> tuple[int, int] | None:
+        """``(num_layers, top_k)`` for the capture buffer, or None if unused.
+
+        Assigns ``moe_capture_layer_id`` on each FusedMoE. Cached so pool
+        planning and capturer init share one walk.
+        """
+        if hasattr(self, "_routed_experts_geo"):
+            return self._routed_experts_geo
+        if not getattr(self.config, "enable_return_routed_experts", False):
+            self._routed_experts_geo = None
+            return None
+        if not hasattr(self, "model"):
+            return None
+        import re
+
+        from atom.model_ops.fused_moe.routed_experts_capturer import fused_moe_modules
+
+        moes: list = fused_moe_modules(self.model)
+        if not moes:
+            raise ValueError(
+                "enable_return_routed_experts requires at least one FusedMoE "
+                "module; this model has none (dense checkpoints cannot "
+                "return routed_experts)"
+            )
+        layer_ids: list[int] = []
+        for ordinal, moe in enumerate(moes):
+            prefix = getattr(moe, "prefix", "") or ""
+            match = re.search(r"layers\.(\d+)", prefix)
+            if match:
+                idx = int(match.group(1))
+            elif getattr(moe, "layer_id", None) is not None:
+                idx = int(moe.layer_id)
+            else:
+                idx = ordinal
+            moe.moe_capture_layer_id = idx
+            layer_ids.append(idx)
+        self._routed_experts_geo = (
+            max(layer_ids) + 1,
+            max(int(m.top_k) for m in moes),
+        )
+        return self._routed_experts_geo
+
+    def _maybe_init_routed_experts_capturer(self, num_kvcache_blocks: int) -> None:
+        geo = self._routed_experts_geometry()
+        if geo is None:
+            return
+        from atom.model_ops.fused_moe.routed_experts_capturer import (
+            RoutedExpertsCapturer,
+        )
+
+        num_layers, top_k = geo
+        num_slots = int(num_kvcache_blocks) * int(self.block_size)
+        RoutedExpertsCapturer.init(
+            num_slots=num_slots,
+            num_layers=num_layers,
+            top_k=top_k,
+            device=self.device,
+        )
+
+    def _store_routed_experts_step(
+        self,
+        batch: ScheduledBatch,
+        *,
+        stream: torch.cuda.Stream | None = None,
+        slot_mapping: torch.Tensor | None = None,
+    ) -> bool:
+        if not getattr(self.config, "enable_return_routed_experts", False):
+            return False
+        if getattr(batch, "is_dummy_run", False) or self.rank != 0:
+            return False
+        from atom.model_ops.fused_moe.routed_experts_capturer import (
+            RoutedExpertsCapturer,
+        )
+
+        capturer = RoutedExpertsCapturer.get()
+        if capturer is None:
+            return False
+        return capturer.store_step(slot_mapping, stream=stream)
+
+    def _commit_routed_experts(self, *, keep_last: bool = False) -> None:
+        from atom.model_ops.fused_moe.routed_experts_capturer import (
+            RoutedExpertsCapturer,
+        )
+
+        capturer = RoutedExpertsCapturer.get()
+        if capturer is not None:
+            capturer.commit_pending(keep_last=keep_last)
+
+    def _attach_routed_experts(
+        self, batch: ScheduledBatch, output: ScheduledBatchOutput
+    ) -> None:
+        """CPU gather in this runner process. The capturer is not visible to
+        the EngineCore scheduler (runner is an ``AsyncIOProcManager`` child).
+        """
+        if not getattr(self.config, "enable_return_routed_experts", False):
+            return
+        if getattr(batch, "is_dummy_run", False) or self.rank != 0:
+            return
+        from atom.model_ops.fused_moe.routed_experts_capturer import (
+            RoutedExpertsCapturer,
+        )
+
+        capturer = RoutedExpertsCapturer.get()
+        if capturer is None:
+            return
+        block_tables = getattr(batch, "block_tables", None)
+        if not block_tables or len(block_tables) != len(batch.req_ids):
+            return
+        starts = getattr(batch, "routed_export_starts", None)
+        output.routed_experts = capturer.export_range(
+            batch.req_ids,
+            block_tables,
+            batch.context_lens,
+            self.block_size,
+            starts,
+        )
 
     def get_dp_padding(self, num_tokens: int) -> tuple[int, torch.Tensor | None]:
         dp_size = self.config.parallel_config.data_parallel_size
@@ -3315,11 +3476,32 @@ class ModelRunner:
                 sampled_logprobs = get_tp_group().broadcast(sampled_logprobs, src=0)
 
         self.forward_done_event.record()
-        # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.
+        deferred = self.tokenID_processor.is_deferred_out
+        # Capture before prepare_sampled_ids(), which advances self.prev_batch.
         prev_batch = self.tokenID_processor.prev_batch
-        token_id_dict, logprobs_map = self.tokenID_processor.prepare_sampled_ids(
-            batch, sampled_tokens, self.forward_done_event, sampled_logprobs
+        from atom.model_ops.fused_moe.routed_experts_capturer import (
+            _current_slot_mapping,
         )
+
+        slots = _current_slot_mapping()
+
+        def _queue_routed_store_after_recv() -> None:
+            self._commit_routed_experts()
+            self._store_routed_experts_step(
+                batch,
+                stream=self.tokenID_processor.async_copy_stream,
+                slot_mapping=slots,
+            )
+
+        token_id_dict, logprobs_map = self.tokenID_processor.prepare_sampled_ids(
+            batch,
+            sampled_tokens,
+            self.forward_done_event,
+            sampled_logprobs,
+            after_recv=_queue_routed_store_after_recv if deferred else None,
+        )
+        if not deferred:
+            self._store_routed_experts_step(batch, slot_mapping=slots)
         # Extract req_ids and token_ids from dict (key -1 is the is_deferred_out flag)
         req_ids_out = [k for k in token_id_dict if k != -1]
         token_ids_out = [token_id_dict[k] for k in req_ids_out]
@@ -3386,7 +3568,7 @@ class ModelRunner:
         if verify_scheduler is not None:
             dspark_ell = verify_scheduler.ell_nonblocking()
 
-        return ScheduledBatchOutput(
+        output = ScheduledBatchOutput(
             req_ids=req_ids_out,
             token_ids=token_ids_out,
             draft_token_ids=draft_token_ids,
@@ -3396,6 +3578,10 @@ class ModelRunner:
             logprobs=logprobs_map,
             dspark_ell=dspark_ell,
         )
+        attach_batch = prev_batch if deferred and prev_batch is not None else batch
+        if not (deferred and prev_batch is None):
+            self._attach_routed_experts(attach_batch, output)
+        return output
 
     def _record_kv_cache_ready(self, batch: ScheduledBatch) -> None:
         """Publish a GPU event for final prefill chunks to transfer connectors."""
@@ -3486,17 +3672,22 @@ class ModelRunner:
                     None,  # nothing verified -> segment's last row
                     align_only=True,
                 )
+            self.forward_done_event.record()
+            # No token copy_done on this path; blocking store is fine.
+            self._store_routed_experts_step(batch)
             reset_forward_context()
             # Mark this slot's GPU work (attention consumed its metadata) done.
             self._record_forward_vars_event()
             self._record_kv_cache_ready(batch)
-            return ScheduledBatchOutput(
+            output = ScheduledBatchOutput(
                 req_ids=list(batch.req_ids),
                 token_ids=[],
                 num_rejected=None,
                 num_bonus=None,
                 draft_token_ids=None,
             )
+            self._attach_routed_experts(batch, output)
+            return output
 
         fwd_output = self.postprocess(
             batch,
@@ -4477,9 +4668,29 @@ class RapidServeModelRunner(ModelRunner):
         safety_margin = int(total_bytes * 0.02)
         return 4 * safety_margin
 
+    def _refuse_routed_experts_capture(self) -> None:
+        if not getattr(self.config, "enable_return_routed_experts", False):
+            return
+        from atom.model_ops.fused_moe.routed_experts_capturer import (
+            check_return_routed_experts,
+        )
+
+        check_return_routed_experts(
+            getattr(self.config, "decode_context_parallel_size", 1),
+            getattr(self.config, "prefill_context_parallel_size", 1),
+            getattr(self.config, "pipeline_parallel_size", 1),
+            kv_transfer_config=getattr(self.config, "kv_transfer_config", None),
+            enable_rapidserve=True,
+            enable_dp_attention=bool(
+                getattr(self.config, "enable_dp_attention", False)
+            ),
+        )
+
     def get_num_blocks(self) -> dict[str, object]:
         # Decode in disagg mode owns no GPU memory — kvcache is imported from
-        # prefill.
+        # prefill. That also skips `_maybe_init_routed_experts_capturer`, so
+        # capture cannot be served from this process.
+        self._refuse_routed_experts_capture()
         if self.config.disagg_is_decode:
             transfer = self.attn_metadata_builder.state_transfer()
             if transfer.copies:
@@ -4495,6 +4706,7 @@ class RapidServeModelRunner(ModelRunner):
 
     def allocate_kv_cache(self, num_kvcache_blocks):
         # Decode in disagg mode: kvcache is imported from prefill, not allocated.
+        self._refuse_routed_experts_capture()
         if self.config.disagg_is_decode:
             logger.info("decode skipping kv cache allocation")
             return True

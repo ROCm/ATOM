@@ -589,10 +589,14 @@ def triton_kernel_moe_forward(
     global_num_experts: int = -1,
     expert_map: torch.Tensor | None = None,
     act_quant: MoEActivationQuant = MoEActivationQuant.BF16,
+    routing_outputs: tuple | None = None,
 ) -> torch.Tensor:
-    routing_data, gather_idx, scatter_idx = routing(
-        gating_output, topk, sm_first=not renormalize
-    )
+    if routing_outputs is None:
+        routing_data, gather_idx, scatter_idx = routing(
+            gating_output, topk, sm_first=not renormalize
+        )
+    else:
+        routing_data, gather_idx, scatter_idx = routing_outputs
 
     output = torch.empty_like(hidden_states)
 

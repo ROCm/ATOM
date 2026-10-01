@@ -1,0 +1,422 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""CUDA-graph-safe MoE route capture indexed by physical KV slots.
+
+Matches the vLLM ``enable_return_routed_experts`` contract: scatter logical
+expert ids into ``buffer[slot, layer, :]`` during fused MoE, D2H this step's
+``slot_mapping`` rows into a CPU slot buffer, then numpy-gather a per-request
+range patch ``(start_row, [end-start, num_layers, top_k])`` from the block table.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence as AbcSequence
+from typing import Any
+
+import numpy as np
+import torch
+
+_INSTANCE: RoutedExpertsCapturer | None = None
+
+
+def check_return_routed_experts(
+    dcp_size: int,
+    pcp_size: int,
+    pp_size: int = 1,
+    *,
+    kv_transfer_config: dict | None = None,
+    enable_rapidserve: bool = False,
+    enable_dp_attention: bool = False,
+) -> None:
+    """Refuse topologies that cannot assemble a full [seq_len-1] route tensor."""
+    if dcp_size != 1 or pcp_size != 1:
+        raise ValueError(
+            "enable_return_routed_experts requires decode_context_parallel_size "
+            "== 1 and prefill_context_parallel_size == 1"
+        )
+    if pp_size != 1:
+        raise ValueError(
+            "enable_return_routed_experts requires pipeline_parallel_size == 1"
+        )
+    if kv_transfer_config:
+        raise ValueError(
+            "enable_return_routed_experts does not support KV transfer "
+            "(prefill/decode disaggregation or KV offload); routed-expert "
+            "metadata is not moved with KV blocks"
+        )
+    if enable_rapidserve:
+        raise ValueError(
+            "enable_return_routed_experts does not support RapidServe "
+            "prefill/decode disaggregation; decode skips KV allocation and "
+            "never initializes the process-local capture buffer"
+        )
+    if enable_dp_attention:
+        raise ValueError(
+            "enable_return_routed_experts does not support enable_dp_attention: "
+            "select_experts runs after the DP all-gather, so captured top-k ids "
+            "are aligned to the gathered token stream, not this rank's local "
+            "slot_mapping; export would silently return another rank's routes"
+        )
+
+
+def is_fused_moe_module(module: Any) -> bool:
+    """True for a real FusedMoE, including LazyMoEWrapper instances.
+
+    ``FusedMoEDecoratorForPluginMode`` replaces ``FusedMoE`` with a subclass
+    whose ``__new__`` returns an *undecorated* instance. ``isinstance(m,
+    FusedMoE)`` is then False, so callers must also accept the wrapper's base.
+    """
+    from atom.model_ops.moe import FusedMoE
+
+    types: tuple[type, ...] = (FusedMoE,) + tuple(
+        b for b in getattr(FusedMoE, "__bases__", ()) if isinstance(b, type)
+    )
+    return isinstance(module, types)
+
+
+def fused_moe_modules(root: Any) -> list:
+    return [m for m in root.modules() if is_fused_moe_module(m)]
+
+
+def kv_slots_from_block_table(
+    block_table: AbcSequence[int],
+    num_tokens: int,
+    block_size: int,
+    *,
+    start_token: int = 0,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype = torch.long,
+) -> np.ndarray:
+    """Physical KV slots for token positions ``[start_token, num_tokens)``."""
+    del device, dtype
+    n = int(num_tokens)
+    start = max(int(start_token), 0)
+    if n <= start:
+        return np.empty(0, dtype=np.int64)
+    bs = int(block_size)
+    first = start // bs
+    blocks = np.asarray(block_table[first : (n - 1) // bs + 1], dtype=np.int64)
+    pos = np.arange(start, n, dtype=np.int64)
+    return blocks[pos // bs - first] * bs + (pos % bs)
+
+
+def _current_slot_mapping() -> torch.Tensor | None:
+    from atom.utils.forward_context import get_forward_context
+
+    ctx = get_forward_context()
+    md = getattr(ctx, "attn_metadata", None)
+    if md is None:
+        return None
+    if isinstance(md, dict):
+        for value in md.values():
+            slots = getattr(value, "slot_mapping", None)
+            if isinstance(slots, torch.Tensor):
+                return slots
+        return None
+    slots = getattr(md, "slot_mapping", None)
+    return slots if isinstance(slots, torch.Tensor) else None
+
+
+def capture_bytes_per_kv_block(block_size: int, num_layers: int, top_k: int) -> int:
+    """PAGE-pool surcharge: int32 routes for every token slot in one KV block."""
+    return int(block_size) * int(num_layers) * int(top_k) * 4
+
+
+def capture_pad_row_bytes(num_layers: int, top_k: int) -> int:
+    """Sacrificial dummy-slot row charged once, not per KV block."""
+    return int(num_layers) * int(top_k) * 4
+
+
+def trim_routed_experts(routes: np.ndarray | None, num_tokens: int):
+    """Keep routes for every forwarded token: ``num_tokens - 1`` rows."""
+    if routes is None:
+        return None
+    keep = max(int(num_tokens) - 1, 0)
+    if routes.shape[0] != keep:
+        return routes[:keep]
+    return routes
+
+
+def _gather_src_indx(gather_indx) -> torch.Tensor:
+    if torch.is_tensor(gather_indx):
+        return gather_indx
+    src = getattr(gather_indx, "src_indx", None)
+    if torch.is_tensor(src):
+        return src
+    raise TypeError(f"unsupported gather_indx type {type(gather_indx)}")
+
+
+def topk_ids_from_triton_routing(
+    routing_data,
+    gather_indx,
+    num_tokens: int,
+    topk: int,
+) -> torch.Tensor:
+    """Logical expert ids ``[num_tokens, topk]`` consumed by Triton fused experts.
+
+    Packed slots are expert-major. ``gather_indx`` maps packed slot ->
+    ``token * topk + k``. Invert the histogram prefix to recover expert ids.
+    """
+    src = _gather_src_indx(gather_indx).to(dtype=torch.long).view(-1)
+    n = int(num_tokens) * int(topk)
+    src = src[:n]
+    packed = torch.arange(n, device=src.device, dtype=torch.long)
+    offs = routing_data.expt_data.token_offs_raw.to(dtype=torch.long)
+    expert_packed = torch.searchsorted(offs[1:], packed, right=True)
+    tokens = torch.div(src, int(topk), rounding_mode="floor")
+    slots = src % int(topk)
+    ids = expert_packed.new_empty((int(num_tokens), int(topk)))
+    ids[tokens, slots] = expert_packed
+    return ids
+
+
+class RoutedExpertsCapturer:
+    """Persistent GPU buffer: ``[num_kv_slots + 1, num_layers, top_k]``.
+
+    The extra row is a sacrificial pad target for graph dummy slots (``-1``).
+    A host ``int16`` twin is filled incrementally by ``store_step`` so finish
+    export is a numpy gather, not a GPU ``as_tensor(block_table)``.
+    """
+
+    def __init__(
+        self,
+        num_slots: int,
+        num_layers: int,
+        top_k: int,
+        device: torch.device | str,
+        dtype: torch.dtype = torch.int32,
+    ):
+        if num_slots <= 0 or num_layers <= 0 or top_k <= 0:
+            raise ValueError(
+                f"invalid capturer shape slots={num_slots} layers={num_layers} "
+                f"top_k={top_k}"
+            )
+        self.num_slots = int(num_slots)
+        self.num_layers = int(num_layers)
+        self.top_k = int(top_k)
+        # Last row is a sacrificial pad target. Graph dummy slots are -1;
+        # mapping them to 0 and then index-putting would clobber a real write
+        # to physical slot 0 in the same capture (duplicate indices).
+        self._pad_slot = self.num_slots
+        self.buffer = torch.zeros(
+            (self.num_slots + 1, self.num_layers, self.top_k),
+            dtype=dtype,
+            device=device,
+        )
+        self.cpu_buffer = np.zeros(
+            (self.num_slots + 1, self.num_layers, self.top_k),
+            dtype=np.int16,
+        )
+        self._pending: list[
+            tuple[torch.Tensor, torch.Tensor, torch.cuda.Event | None]
+        ] = []
+        # (slot key, last layer id, dest) shared by the MoE layers of one forward.
+        self._dest_cache: tuple[tuple, int, torch.Tensor] | None = None
+
+    @classmethod
+    def init(
+        cls,
+        num_slots: int,
+        num_layers: int,
+        top_k: int,
+        device: torch.device | str,
+        dtype: torch.dtype = torch.int32,
+    ) -> RoutedExpertsCapturer:
+        global _INSTANCE
+        _INSTANCE = cls(num_slots, num_layers, top_k, device, dtype=dtype)
+        return _INSTANCE
+
+    @classmethod
+    def get(cls) -> RoutedExpertsCapturer | None:
+        return _INSTANCE
+
+    @classmethod
+    def reset(cls) -> None:
+        """Drop the process-local GPU/CPU buffers. Sleep KV teardown uses this
+        so wake does not size a new pool against a still-live capture tensor.
+        """
+        global _INSTANCE
+        _INSTANCE = None
+
+    def capture(
+        self,
+        layer_id: int,
+        topk_ids: torch.Tensor,
+        slot_mapping: torch.Tensor | None = None,
+    ) -> None:
+        """Scatter logical expert ids. Pad slots (``-1``) keep prior values."""
+        if layer_id < 0 or layer_id >= self.num_layers:
+            return
+        slots = slot_mapping if slot_mapping is not None else _current_slot_mapping()
+        if slots is None or slots.numel() == 0 or topk_ids.numel() == 0:
+            return
+        n = min(int(slots.shape[0]), int(topk_ids.shape[0]))
+        k = min(int(topk_ids.shape[-1]), self.top_k)
+        ids = topk_ids[:n, :k].to(device=self.buffer.device, dtype=self.buffer.dtype)
+        dest = self._forward_dest_slots(layer_id, slots, n)
+        if k < self.top_k:
+            row = self.buffer.new_zeros((n, self.top_k))
+            row[:, :k] = ids
+            ids = row
+        self.buffer[dest, layer_id, :] = ids
+
+    def _forward_dest_slots(
+        self, layer_id: int, slots: torch.Tensor, n: int
+    ) -> torch.Tensor:
+        """``_dest_slots(slots[:n])`` computed once per forward, not per layer.
+
+        The slot_mapping staging buffer is rewritten in place between forwards,
+        so tensor identity alone cannot invalidate. MoE layers run in increasing
+        id order within a forward; a non-increasing id starts a new forward.
+        Under CUDA-graph capture the first layer records the computation and
+        later layers read its output, so replay stays correct.
+        """
+        key = (id(slots), slots.data_ptr(), tuple(slots.shape), n)
+        cached = self._dest_cache
+        if cached is not None and cached[0] == key and layer_id > cached[1]:
+            self._dest_cache = (key, layer_id, cached[2])
+            return cached[2]
+        dest = self._dest_slots(slots[:n])
+        self._dest_cache = (key, layer_id, dest)
+        return dest
+
+    def _dest_slots(self, slot_mapping: torch.Tensor) -> torch.Tensor:
+        slots_i = slot_mapping.reshape(-1).to(dtype=torch.long)
+        valid = slots_i >= 0
+        phys = slots_i.clamp(min=0, max=self.num_slots - 1)
+        return torch.where(valid, phys, torch.full_like(phys, self._pad_slot))
+
+    def _apply_cpu_store(self, dest: np.ndarray, rows: np.ndarray) -> None:
+        dest = np.asarray(dest, dtype=np.int64).reshape(-1)
+        rows = np.asarray(rows, dtype=np.int16).reshape(-1, self.num_layers, self.top_k)
+        mask = (dest >= 0) & (dest < self.num_slots)
+        if not np.any(mask):
+            return
+        self.cpu_buffer[dest[mask]] = rows[mask]
+
+    def commit_pending(self, *, keep_last: bool = False) -> None:
+        """Write host rows of queued D2H copies into the CPU slot buffer.
+
+        Each entry waits on its own copy event: callers outside the token recv
+        path (e.g. a middle-chunk blocking store) have no ``copy_done`` covering
+        it. ``keep_last`` leaves the in-flight current step (queued before
+        ``send_to_cpu_async``) until the next ``recv_async_output``.
+        """
+        if not self._pending:
+            return
+        if keep_last and len(self._pending) <= 1:
+            return
+        ready, self._pending = (
+            (self._pending[:-1], self._pending[-1:])
+            if keep_last
+            else (self._pending, [])
+        )
+        for dest, rows, done in ready:
+            if done is not None:
+                done.synchronize()
+            self._apply_cpu_store(dest.numpy(), rows.numpy())
+
+    def store_step(
+        self,
+        slot_mapping: torch.Tensor | None = None,
+        *,
+        stream: torch.cuda.Stream | None = None,
+    ) -> bool:
+        """D2H this step's ``buffer[slot_mapping]`` into the CPU slot buffer.
+
+        Async path: snapshot dest/rows on the current stream, then non-blocking
+        D2H on ``stream``. Apply via ``commit_pending`` after the next
+        ``recv_async_output`` (that ``copy_done`` is recorded after this
+        memcpy). Blocking path commits any in-flight pending first.
+
+        Returns True when a new memcpy was queued (or applied inline). False
+        means this step had nothing to store; the caller must then
+        ``commit_pending(keep_last=False)`` so the previous in-flight decode
+        is visible to ``export_batch`` (last deferred flush has no new copy).
+        """
+        slots = slot_mapping if slot_mapping is not None else _current_slot_mapping()
+        if slots is None or slots.numel() == 0:
+            return False
+        use_async = (
+            stream is not None and self.buffer.is_cuda and torch.cuda.is_available()
+        )
+        if not use_async:
+            dest = self._dest_slots(slots)
+            rows = self.buffer[dest].to(dtype=torch.int16)
+            self.commit_pending()
+            self._apply_cpu_store(
+                dest.detach().cpu().numpy(),
+                rows.detach().cpu().numpy(),
+            )
+            return True
+        # ``slots`` is the reused slot_mapping staging buffer. The next
+        # forward's H2D into it is ordered after the current stream only, so
+        # the gather must run here; a gather on ``stream`` could read the next
+        # batch's slots.
+        dest = self._dest_slots(slots).to(dtype=torch.int32)
+        rows = self.buffer[dest].to(dtype=torch.int16)
+        stream.wait_stream(torch.cuda.current_stream(self.buffer.device))
+        dest.record_stream(stream)
+        rows.record_stream(stream)
+        with torch.cuda.stream(stream):
+            dest_cpu = dest.to("cpu", non_blocking=True)
+            rows_cpu = rows.to("cpu", non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(stream)
+        self._pending.append((dest_cpu, rows_cpu, done))
+        return True
+
+    def export_batch(
+        self,
+        req_ids: AbcSequence[int],
+        block_tables: AbcSequence[AbcSequence[int]],
+        num_tokens_list: AbcSequence[int],
+        block_size: int,
+        start_rows: AbcSequence[int] | None = None,
+    ) -> dict[int, np.ndarray]:
+        """CPU gather: ``[end - start, num_layers, top_k]`` int16 per request.
+
+        ``start_rows`` defaults to 0 (full history). Incremental IPC uses
+        ``export_range`` which also returns the start offset.
+        """
+        patches = self.export_range(
+            req_ids, block_tables, num_tokens_list, block_size, start_rows
+        )
+        return {req_id: rows for req_id, (_start, rows) in patches.items()}
+
+    def export_range(
+        self,
+        req_ids: AbcSequence[int],
+        block_tables: AbcSequence[AbcSequence[int]],
+        num_tokens_list: AbcSequence[int],
+        block_size: int,
+        start_rows: AbcSequence[int] | None = None,
+    ) -> dict[int, tuple[int, np.ndarray]]:
+        """CPU gather of ``[start, num_tokens)`` as ``(start, rows)`` patches."""
+        out: dict[int, tuple[int, np.ndarray]] = {}
+        starts = start_rows if start_rows is not None else [0] * len(req_ids)
+        for req_id, block_table, ntok, start in zip(
+            req_ids, block_tables, num_tokens_list, starts, strict=False
+        ):
+            n = int(ntok)
+            s = max(int(start), 0)
+            if n <= s or not block_table:
+                continue
+            slots = kv_slots_from_block_table(block_table, n, block_size, start_token=s)
+            slots = np.clip(slots, 0, self.num_slots - 1)
+            out[int(req_id)] = (s, self.cpu_buffer[slots].copy())
+        return out
+
+
+def maybe_capture_routed_experts(layer: Any, topk_ids: torch.Tensor) -> None:
+    """No-op when capture is off, uninitialized, or still in dummy warmup."""
+    capturer = RoutedExpertsCapturer.get()
+    if capturer is None or topk_ids is None:
+        return
+    layer_id = getattr(layer, "moe_capture_layer_id", None)
+    if layer_id is None:
+        layer_id = getattr(layer, "layer_id", None)
+    if layer_id is None:
+        return
+    capturer.capture(int(layer_id), topk_ids)

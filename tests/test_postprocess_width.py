@@ -141,7 +141,7 @@ def test_the_logprob_gather_reads_the_cut_logits(monkeypatch):
     batch.return_logprobs = [True] * scheduled_bs
     captured = {}
     runner = _runner(seen)
-    runner.tokenID_processor.prepare_sampled_ids = lambda b, ids, ev, lp: (
+    runner.tokenID_processor.prepare_sampled_ids = lambda b, ids, ev, lp, **_k: (
         captured.update(logprobs=lp) or ({}, {})
     )
 
