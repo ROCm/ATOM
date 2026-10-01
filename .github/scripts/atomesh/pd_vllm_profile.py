@@ -75,6 +75,15 @@ async def run(args):
             after_prefill = time.perf_counter()
             transfer = prefill["kv_transfer_params"]
             assert transfer["remote_block_ids"] and transfer["remote_host"], transfer
+            record = {
+                "tag": tag,
+                "prompt_tokens": len(prompt),
+                "prefill_ms": 1000 * (after_prefill - start),
+                "request_id": request_id,
+                "prefill": prefill,
+            }
+            records.append(record)
+            (args.output / "requests.json").write_text(json.dumps(records, indent=2))
             decode = await complete(
                 args.decode,
                 prompt,
@@ -88,13 +97,9 @@ async def run(args):
                 },
                 request_id,
             )
-            records.append(
+            record.update(
                 {
-                    "tag": tag,
-                    "prompt_tokens": len(prompt),
-                    "prefill_ms": 1000 * (after_prefill - start),
                     "decode_ms": 1000 * (time.perf_counter() - after_prefill),
-                    "prefill": prefill,
                     "decode": decode,
                 }
             )
@@ -123,46 +128,24 @@ async def run(args):
         await snapshot("before")
         # The first output token remains target-model verified even in the
         # synthetic-acceptance benchmark phase. Longer accuracy needs natural SD.
+        comparisons = []
         for length in (32767, 32768, 32769, 20224):
             await reset()
             direct = await complete(args.decode, tokens[:length], 1)
             await reset()
+            await snapshot(f"correctness-{length}-before")
             split = await pd(tokens[:length], 1, f"correctness-{length}")
+            await snapshot(f"correctness-{length}-after")
+            comparisons.append({"length": length, "direct": direct, "split": split})
+            (args.output / "comparisons.json").write_text(
+                json.dumps(comparisons, indent=2)
+            )
             assert split["choices"][0]["text"] == direct["choices"][0]["text"], (
                 length,
                 direct,
                 split,
             )
         await snapshot("correctness")
-        for concurrency in (1, 16):
-            prompts = [tokens[i * 16 : i * 16 + 1024] for i in range(concurrency)]
-            await reset()
-            await asyncio.gather(
-                *(pd(prompt, 128, f"warmup-c{concurrency}") for prompt in prompts)
-            )
-            await reset()
-            await snapshot(f"timed-c{concurrency}-before")
-            await asyncio.gather(
-                *(pd(prompt, 128, f"timed-c{concurrency}") for prompt in prompts)
-            )
-            await snapshot(f"timed-c{concurrency}-after")
-        for tag, prompts, count in (
-            ("long-prefill", [tokens[:32768]], 16),
-            ("decode-c16", [tokens[i * 16 : i * 16 + 1024] for i in range(16)], 128),
-        ):
-            await reset()
-            started = []
-            try:
-                for url in (args.prefill, args.decode):
-                    await post(url, "/start_profile")
-                    started.append(url)
-                await asyncio.gather(
-                    *(pd(prompt, count, f"profile-{tag}") for prompt in prompts)
-                )
-            finally:
-                for url in reversed(started):
-                    await post(url, "/stop_profile")
-            await snapshot(tag)
         await snapshot("after")
         (args.output / "complete.json").write_text(
             json.dumps(
@@ -171,6 +154,8 @@ async def run(args):
                     "first_token_checks": 4,
                     "natural_accuracy_evaluated": False,
                     "full_c16_evaluated": False,
+                    "zeroing_audit": "Check all rank logs for schedule exclusions, zero_kernel, read_post, and read_done",
+                    "full_graph_evaluated": False,
                 },
                 indent=2,
             )

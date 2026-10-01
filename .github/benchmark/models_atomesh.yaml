@@ -842,6 +842,7 @@ models:
         VLLM_DCP_Q_REPLICATE: "0"
         VLLM_ROCM_AITER_MLA_DCP_VERIFY: asm
         VLLM_SERVER_DEV_MODE: "1"
+        VLLM_MORIIO_ZEROING_AUDIT: "1"
       prefill:
         VLLM_USE_BREAKABLE_CUDAGRAPH: "1"
         TORCH_NCCL_BLOCKING_WAIT: "0"
@@ -854,7 +855,7 @@ models:
       served_model_name: Kimi-K3
       source:
         repo: https://github.com/whx-sjtu/vllm
-        sha: 34f63843671403657d0c7aa70f0c6841869ac374
+        sha: ed353ff4d30cbbeed47584f90a342880817a1474
       diagnostic: 1
     server:
       common_args:
@@ -873,7 +874,7 @@ models:
     suites:
       vllm:
         - &kimi_k3_vllm_dspark_dcp8
-          name: kimi-k3-native-dspark3-1p1d-tp8-dcp8-no-lmcache-profile
+          name: kimi-k3-zeroing-dspark3-1p1d-tp8-dcp8-eager
           topology: 1p1d
           display_topology: 1P1D-TP8-DCP8
           pd_worker_layout: multi_node
@@ -886,13 +887,13 @@ models:
             tp: 8
             dcp: 8
             extra_args: >-
-              --compilation-config '{"mode":3,"cudagraph_mode":"FULL_AND_PIECEWISE","max_cudagraph_capture_size":512,"custom_ops":["+fused_rms_norm_gated"],"cudagraph_capture_sizes":[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256,272,288,304,320,336,352,368,384,400,416,432,448,464,480,496,512]}'
+              --enforce-eager
           decode:
             workers: 1
             tp: 8
             dcp: 8
             extra_args: >-
-              --compilation-config '{"mode":3,"cudagraph_mode":"FULL_AND_PIECEWISE","max_cudagraph_capture_size":512,"custom_ops":["+fused_rms_norm_gated"],"cudagraph_capture_sizes":[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256,272,288,304,320,336,352,368,384,400,416,432,448,464,480,496,512]}'
+              --enforce-eager
           benchmark:
             <<: *kimi_k3_vllm_aiperf
             apply_chat_template: true

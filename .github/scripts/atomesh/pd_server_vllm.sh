@@ -264,7 +264,7 @@ if lmcache_port:
         },
     }
 else:
-    config = {**moriio, "kv_load_failure_policy": "recompute"}
+    config = {**moriio, "kv_load_failure_policy": "fail"}
 print(json.dumps(config))
 PY
 }
