@@ -638,7 +638,9 @@ def test_build_cache_views_splits_opaque_block_into_token_axis():
     transfer = KVTransferTensors(pages=[PageRegion(region, page)])
     transfer.set_block_count(2)
 
-    views = page_views._build_cache_views(transfer, num_blocks=2, tokens_per_block=4)
+    views = page_views._build_cache_views(
+        transfer, num_blocks=2, tokens_per_block=4, expose_token_axis=True
+    )
     published = views.tensors["page.0.latent"]
 
     assert tuple(published.shape) == (2, 4, 32)
@@ -663,9 +665,36 @@ def test_build_cache_views_keeps_opaque_block_when_tokens_do_not_divide():
     transfer = KVTransferTensors(pages=[PageRegion(region, page)])
     transfer.set_block_count(2)
 
-    views = page_views._build_cache_views(transfer, num_blocks=2, tokens_per_block=4)
+    views = page_views._build_cache_views(
+        transfer, num_blocks=2, tokens_per_block=4, expose_token_axis=True
+    )
 
     assert tuple(views.tensors["page.0.latent"].shape) == (2, 1, 30)
+
+
+def test_build_cache_views_keeps_opaque_view_unless_token_axis_requested():
+    """lmcache_driven addresses pages by the registered shape, so the split is
+    opt-in.  Applying it there made every arm hang on the GPU with
+    "RPC call to sample_tokens timed out" (measured 2026-10-01, 2 of 2 arms,
+    both orderings)."""
+
+    page = torch.arange(2 * 1 * 128, dtype=torch.uint8).reshape(2, 1, 128)
+    region = KVTransferRegion(
+        base_addr=page.data_ptr(),
+        total_bytes=page.numel(),
+        unit_bytes=page[0].numel(),
+        semantic_role="latent",
+    )
+    transfer = KVTransferTensors(pages=[PageRegion(region, page)])
+    transfer.set_block_count(2)
+
+    views = page_views._build_cache_views(
+        transfer,
+        num_blocks=2,
+        tokens_per_block=4,
+    )
+
+    assert tuple(views.tensors["page.0.latent"].shape) == (2, 1, 128)
 
 
 def test_build_cache_views_rejects_missing_or_bad_geometry():

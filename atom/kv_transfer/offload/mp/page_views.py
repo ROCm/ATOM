@@ -177,9 +177,25 @@ def _token_major_view(
 
     Splitting the extent restores agreement: detected ``block_size = 1536``,
     ``hidden = 576``, and both formulas give 29 x 1536 x 576 = 25,657,344 B.
-    The ``lmcache_driven`` path is unaffected in total bytes -- it already
-    agreed with itself -- but it now reports the token geometry it actually
-    has.
+
+    WHY only ``engine_driven`` (``expose_token_axis``).  The two transfer modes
+    use the registered shape for different things, and only one of them is
+    served by splitting it:
+
+      engine_driven   the server uses the shape to SIZE the object, so the two
+                      formulas must agree.
+      lmcache_driven  the server's gather/scatter kernels use the shape to
+                      ADDRESS the pages.  Telling them each block holds 1536
+                      slots, while ATOM keeps handing them whole-block ids,
+                      makes them index out of bounds.
+
+    Measured 2026-10-01, two arms, both orderings (so the slot is not the
+    explanation): with the split applied unconditionally, every lmcache_driven
+    arm died ~6 min after a clean registration with "TimeoutError: RPC call to
+    sample_tokens timed out" -- the worker hung on the GPU and never returned.
+    engine_driven ran the same shape to completion (47.52 per-user tok/s p50,
+    1056 objects of exactly 25,657,344 B, 14,510,592 external hits), which is
+    what rules out the shape being wrong in itself.
     """
 
     if tokens_per_block <= 0:
@@ -215,6 +231,7 @@ def _build_cache_views(
     *,
     num_blocks: int,
     tokens_per_block: int,
+    expose_token_axis: bool = False,
 ) -> _CacheViews:
     """Validate backend-published PAGE views without inspecting model internals."""
 
@@ -252,11 +269,13 @@ def _build_cache_views(
         # LMCache's Python raw-pointer fallback cannot express FP8 through the
         # CUDA array interface and would otherwise reconstruct the destination
         # as uint8 while keeping the staging object as FP8.
-        byte_view = _token_major_view(
-            view.view(torch.uint8),
-            tokens_per_block,
-            label=f"lmcache_mp page plane {index}",
-        )
+        byte_view = view.view(torch.uint8)
+        if expose_token_axis:
+            byte_view = _token_major_view(
+                byte_view,
+                tokens_per_block,
+                label=f"lmcache_mp page plane {index}",
+            )
         role = str(getattr(region, "semantic_role", None) or f"plane_{index}")
         tensors[f"page.{index}.{role}"] = byte_view
         layout = (byte_view.dtype, tuple(int(dim) for dim in byte_view.shape[1:]))
@@ -267,6 +286,7 @@ def _build_cache_views(
         transfer_tensors,
         tensors=tensors,
         first_index=len(tensors),
+        expose_token_axis=expose_token_axis,
     )
 
     return _CacheViews(
@@ -282,6 +302,7 @@ def _build_recurrent_views(
     *,
     tensors: dict[str, torch.Tensor],
     first_index: int,
+    expose_token_axis: bool = False,
 ) -> tuple[_RecurrentViews, ...]:
     """Validate and add the recurrent groups to the flat registration order.
 
@@ -323,13 +344,14 @@ def _build_recurrent_views(
             role = str(
                 getattr(page.region, "semantic_role", None) or f"plane_{page.index}"
             )
-            tensors[f"recurrent.{ordinal}.{page.index}.{role}"] = (
-                _token_major_view(
-                    page.view,
+            recurrent_view = page.view
+            if expose_token_axis:
+                recurrent_view = _token_major_view(
+                    recurrent_view,
                     tokens_per_block,
                     label=f"lmcache_mp recurrent[{ordinal}] plane {page.index}",
                 )
-            )
+            tensors[f"recurrent.{ordinal}.{page.index}.{role}"] = recurrent_view
             indices.append(page.index)
         index += len(validated)
         built.append(
