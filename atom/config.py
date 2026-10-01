@@ -351,8 +351,10 @@ class QuantizationConfig:
         else:
             self.quant_method = self.hf_quant_config.get("quant_method", "")
 
-        # Online quantization: re-quantize float / FP8 / MXFP4 / MXFP8 / Quark
-        # models at load time.
+        # Online quantization: re-quantize supported source tensors at load
+        # time. IQ2R checkpoints are eligible because their non-IQ2R layers retain
+        # the base checkpoint's ordinary quantization spec; callers must keep
+        # routed IQ2R modules excluded from the online target config.
         self.online_quant = False
         self.online_quant_config_raw = online_quant_config
         self.online_global_spec: LayerQuantConfig = LayerQuantConfig()
@@ -366,6 +368,7 @@ class QuantizationConfig:
             "quark",
             "modelopt",
             "compressed-tensors",
+            "iq2r",
         ]:
             self.online_quant = True
             if self.quant_method == "compressed-tensors":
@@ -2682,6 +2685,15 @@ class Config:
         # deploying it on top of a cache built with the other setting — reuses a
         # stale artifact and trips assert_size_stride at runtime.
         factors.append(bool(envs.ATOM_REPLICATE_VOCAB_EMBED))
+        # The sparse-attention indexer passes max_model_len and
+        # max_num_seqs * max_model_len into its custom op as Python ints, so
+        # Dynamo bakes them into the graph as constants. The decode logits
+        # buffer is [rows, max_model_len] and the paged MQA logits kernel
+        # writes up to each context length. Without these factors, a server
+        # started with a larger --max-model-len reuses an artifact built for a
+        # smaller one, and the first decode past the old width faults.
+        factors.append(self.max_model_len)
+        factors.append(self.max_num_seqs)
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False

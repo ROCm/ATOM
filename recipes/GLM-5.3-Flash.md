@@ -384,7 +384,26 @@ Three things about scoring this model that will otherwise waste a run:
   questions in each direction. Judge changes on the 1319-question aggregate, or
   better on a per-question paired comparison; never on sample text.
 
-## 8. Remaining work
+## 8. IQ2R 2-bit routed experts
+
+This tree can replace the routed FP8 experts in transformer layers 3–44 with
+AITER's native-basis IQ2R format. Attention, dense MLPs, the shared experts,
+and checkpoint layer 45 (MTP) retain the base model's block-FP8 configuration.
+The current runtime is TP1/EP1 only.
+
+ATOM loads an IQ2R model from a single self-contained Hugging Face folder:
+`config.json` carries `quantization_config.quant_method = "iq2r"`, and the
+safetensors index maps each routed layer to four fused IQ2R tensors
+(`experts.iq2r_{gate_up,down}_{data,auxiliary}`). The checkpoint is built
+offline; ATOM and AITER only load it.
+
+At ATOM's default `max_num_batched_tokens=16384`, GLM top-k=8 needs capacity
+for 131072 routes. AITER supports that capacity, but the fixed capture-safe
+workspace is about 2.8 GiB per routed layer at GLM's 4096/2048 dimensions. Plan
+the model and KV-cache memory budget accordingly, or lower
+`max_num_batched_tokens` for smaller deployments.
+
+## 9. Remaining work
 
 1. ~~**Contexts beyond 2048.**~~ Done —
    `model_ops/glm5_next/{indexer,kpool}.py` implements the paged/ragged pooled
