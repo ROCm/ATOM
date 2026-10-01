@@ -300,14 +300,13 @@ class RoutedExpertsCapturer:
         slot_mapping: torch.Tensor | None = None,
         *,
         stream: torch.cuda.Stream | None = None,
-        wait_event: torch.cuda.Event | None = None,
     ) -> bool:
         """D2H this step's ``buffer[slot_mapping]`` into the CPU slot buffer.
 
-        Async path: gather + non-blocking D2H on ``stream`` after ``wait_event``
-        (the token ``forward_done_event``). Apply via ``commit_pending`` after
-        the next ``recv_async_output`` (that ``copy_done`` is recorded after
-        this memcpy). Blocking path commits any in-flight pending first.
+        Async path: snapshot dest/rows on the current stream, then non-blocking
+        D2H on ``stream``. Apply via ``commit_pending`` after the next
+        ``recv_async_output`` (that ``copy_done`` is recorded after this
+        memcpy). Blocking path commits any in-flight pending first.
 
         Returns True when a new memcpy was queued (or applied inline). False
         means this step had nothing to store; the caller must then
@@ -329,16 +328,17 @@ class RoutedExpertsCapturer:
                 rows.detach().cpu().numpy(),
             )
             return True
-        # Gather on the copy stream after wait_event (MoE + sample), then D2H.
-        # Must be queued before token copy_done: the next recv is what keeps
-        # the host from overwriting ``slots`` before this gather reads it.
-        slots.record_stream(stream)
+        # ``slots`` is the reused slot_mapping staging buffer. The next
+        # forward's H2D into it is ordered after the current stream only, so
+        # the gather must run here; a gather on ``stream`` could read the next
+        # batch's slots.
+        dest = self._dest_slots(slots).to(dtype=torch.int32)
+        rows = self.buffer[dest].to(dtype=torch.int16)
+        stream.wait_stream(torch.cuda.current_stream(self.buffer.device))
+        dest.record_stream(stream)
+        rows.record_stream(stream)
         with torch.cuda.stream(stream):
-            if wait_event is not None:
-                wait_event.wait(stream)
-            dest = self._dest_slots(slots)
-            rows = self.buffer[dest].to(dtype=torch.int16)
-            dest_cpu = dest.to(dtype=torch.int32).to("cpu", non_blocking=True)
+            dest_cpu = dest.to("cpu", non_blocking=True)
             rows_cpu = rows.to("cpu", non_blocking=True)
             done = torch.cuda.Event()
             done.record(stream)

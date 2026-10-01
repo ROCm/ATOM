@@ -288,10 +288,8 @@ def test_async_store_step_applies_only_after_copy_done_commit():
     slots = torch.tensor([1], device=device)
     ids = torch.tensor([[7, 8]], dtype=torch.int32, device=device)
     capturer.capture(0, ids, slot_mapping=slots)
-    ready = torch.cuda.Event()
-    ready.record()
     stream = torch.cuda.Stream()
-    assert capturer.store_step(slots, stream=stream, wait_event=ready) is True
+    assert capturer.store_step(slots, stream=stream) is True
     np.testing.assert_array_equal(
         capturer.cpu_buffer[1], np.zeros((1, 2), dtype=np.int16)
     )
@@ -311,18 +309,47 @@ def test_blocking_store_waits_for_inflight_async_copy():
         num_slots=8, num_layers=1, top_k=2, device=device
     )
     slots = torch.tensor([1], device=device)
-    capturer.capture(0, torch.tensor([[7, 8]], dtype=torch.int32, device=device), slot_mapping=slots)
+    capturer.capture(
+        0, torch.tensor([[7, 8]], dtype=torch.int32, device=device), slot_mapping=slots
+    )
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         torch.cuda._sleep(2_000_000_000)
-    ready = torch.cuda.Event()
-    ready.record()
-    assert capturer.store_step(slots, stream=stream, wait_event=ready) is True
+    assert capturer.store_step(slots, stream=stream) is True
     other = torch.tensor([2], device=device)
-    capturer.capture(0, torch.tensor([[3, 4]], dtype=torch.int32, device=device), slot_mapping=other)
+    capturer.capture(
+        0, torch.tensor([[3, 4]], dtype=torch.int32, device=device), slot_mapping=other
+    )
     assert capturer.store_step(other) is True
     np.testing.assert_array_equal(capturer.cpu_buffer[1, 0], [7, 8])
     np.testing.assert_array_equal(capturer.cpu_buffer[2, 0], [3, 4])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for copy stream")
+def test_async_store_snapshots_slots_before_staging_reuse():
+    """The next forward rewrites slot_mapping in place on the compute stream;
+    a stalled copy stream must still export this step's slots."""
+    device = torch.device("cuda")
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=8, num_layers=1, top_k=2, device=device
+    )
+    slots = torch.tensor([1], device=device)
+    capturer.capture(
+        0, torch.tensor([[7, 8]], dtype=torch.int32, device=device), slot_mapping=slots
+    )
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(2_000_000_000)
+    assert capturer.store_step(slots, stream=stream) is True
+    slots.fill_(2)
+    capturer.capture(
+        0, torch.tensor([[3, 4]], dtype=torch.int32, device=device), slot_mapping=slots
+    )
+    capturer.commit_pending()
+    np.testing.assert_array_equal(capturer.cpu_buffer[1, 0], [7, 8])
+    np.testing.assert_array_equal(
+        capturer.cpu_buffer[2], np.zeros((1, 2), dtype=np.int16)
+    )
 
 
 def test_capture_page_bytes_are_budgeted_per_block():
@@ -533,6 +560,23 @@ def test_apply_patch_deferred_overlap_keeps_prefix():
     assert seq.routed_expert_rows == 4
     np.testing.assert_array_equal(seq.routed_experts[:2], first[:2])
     np.testing.assert_array_equal(seq.routed_experts[2:], nxt)
+
+
+def test_apply_patch_after_empty_full_array_grows():
+    seq = Sequence([1, 2, 3], 3)
+    seq.routed_experts = np.zeros((0, 2, 2), dtype=np.int16)
+    rows = np.arange(12, dtype=np.int16).reshape(3, 2, 2)
+    seq.apply_routed_expert_patch(0, rows)
+    np.testing.assert_array_equal(seq.routed_experts, rows)
+
+
+def test_routed_experts_setter_does_not_alias_caller_array():
+    seq = Sequence([1, 2, 3], 3)
+    full = np.arange(12, dtype=np.int16).reshape(3, 2, 2)
+    seq.routed_experts = full
+    seq.apply_routed_expert_patch(2, np.full((1, 2, 2), 99, dtype=np.int16))
+    np.testing.assert_array_equal(full[2], [[8, 9], [10, 11]])
+    np.testing.assert_array_equal(seq.routed_experts[2], [[99, 99], [99, 99]])
 
 
 def test_apply_patch_grows_capacity_across_many_decode_steps():

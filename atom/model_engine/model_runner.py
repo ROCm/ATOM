@@ -386,9 +386,7 @@ class tokenIDProcessor:
         token_ids = self.recv_async_output(self.token_ids_cpu)
         logprobs = self.recv_logprobs()
         # Previous copy_done covers token + route D2H from last step. Commit
-        # and queue this step's route copy *before* send records copy_done:
-        # the next recv then also fences the gather's reads of the in-place
-        # reused slot_mapping before the host prepares a later step.
+        # and queue this step's route copy *before* send records copy_done.
         if after_recv is not None:
             after_recv()
         self.send_to_cpu_async(
@@ -2126,7 +2124,6 @@ class ModelRunner:
         batch: ScheduledBatch,
         *,
         stream: torch.cuda.Stream | None = None,
-        wait_event: torch.cuda.Event | None = None,
         slot_mapping: torch.Tensor | None = None,
     ) -> bool:
         if not getattr(self.config, "enable_return_routed_experts", False):
@@ -2140,7 +2137,7 @@ class ModelRunner:
         capturer = RoutedExpertsCapturer.get()
         if capturer is None:
             return False
-        return capturer.store_step(slot_mapping, stream=stream, wait_event=wait_event)
+        return capturer.store_step(slot_mapping, stream=stream)
 
     def _commit_routed_experts(self, *, keep_last: bool = False) -> None:
         from atom.model_ops.fused_moe.routed_experts_capturer import (
@@ -3285,7 +3282,6 @@ class ModelRunner:
             self._store_routed_experts_step(
                 batch,
                 stream=self.tokenID_processor.async_copy_stream,
-                wait_event=self.forward_done_event,
                 slot_mapping=slots,
             )
 

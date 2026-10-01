@@ -440,7 +440,8 @@ class Sequence:
             self._routed_expert_buf = None
             self._routed_expert_rows = 0
             return
-        arr = np.ascontiguousarray(value, dtype=np.int16)
+        # Own the storage: later patches overwrite rows in place.
+        arr = np.array(value, dtype=np.int16, copy=True, order="C")
         self._routed_expert_buf = arr
         self._routed_expert_rows = int(arr.shape[0])
 
@@ -453,7 +454,7 @@ class Sequence:
             return
         if need <= buf.shape[0]:
             return
-        cap = buf.shape[0]
+        cap = max(buf.shape[0], 1)
         while cap < need:
             cap *= 2
         grown = np.empty((cap, buf.shape[1], buf.shape[2]), dtype=np.int16)
