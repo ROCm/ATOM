@@ -26,6 +26,8 @@ rows, prefill has up to ``max_num_batched_tokens``.
 from __future__ import annotations
 
 import torch
+import triton
+import triton.language as tl
 
 NEG_INF = float("-inf")
 POS_INF = float("inf")
@@ -167,3 +169,127 @@ def threshold_from_histogram(
     # kernel a number rather than an inf so its `>=` compare is well defined.
     # Nothing is admitted either way -- every candidate in such a row is -inf.
     return torch.where(torch.isfinite(thr), thr, torch.full_like(thr, NEG_INF))
+
+
+@triton.jit
+def _emit_owned_slots_kernel(
+    keep_mask,  # int8 [rows, K] 1 where the candidate is admitted
+    local_idx,  # int32 [rows, K] absolute column in the LOCAL flat plane
+    local_ks,  # int32 [rows] this row's local-plane region start
+    batch_id_per_q_token,  # int32 [rows]
+    block_table,  # int32 [num_req, cols]
+    out_kv_indptr,  # int32 [rows + 1] prefix offsets, already cumsummed
+    out_kv_indices,  # int32 [>= out_kv_indptr[-1]]
+    BLOCK_SIZE: tl.constexpr,  # runner (physical) block size
+    K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    km_stride0: tl.int64,
+    li_stride0: tl.int64,
+    bt_stride0: tl.int64,
+):
+    """Pack this row's admitted slots to the front of its region.
+
+    Mirrors ``dcp_ops._compact_filter_dcp_prefill_kernel``'s two invariants --
+    no ``-1`` holes (they break aiter's lse path) and an order-preserving
+    compaction so the fp accumulation order is deterministic -- but with the
+    simple local slot formula (see ``emit_owned_slots``' docstring).
+
+    ``keep_mask`` arrives precomputed rather than being re-derived here. The
+    counts that built ``out_kv_indptr`` came from the same tensor, so the two
+    passes cannot drift: a row whose count and whose writes disagree would
+    overflow into the next row's region, which is silent corruption.
+    """
+    row = tl.program_id(0)
+    req_id = tl.load(batch_id_per_q_token + row)
+    req_id = tl.maximum(req_id, 0)  # pad rows are fully masked by keep_mask
+    base = tl.load(local_ks + row)
+    out_start = tl.load(out_kv_indptr + row)
+
+    written = 0
+    for tile in range(0, K, BLOCK_N):
+        col = tile + tl.arange(0, BLOCK_N)
+        col_valid = col < K
+        keep = tl.load(keep_mask + row * km_stride0 + col, mask=col_valid, other=0) != 0
+        idx = tl.load(local_idx + row * li_stride0 + col, mask=keep, other=0)
+        jl = tl.maximum(idx - base, 0)
+        phys = tl.load(
+            block_table + req_id * bt_stride0 + (jl // BLOCK_SIZE), mask=keep, other=0
+        )
+        slot = phys * BLOCK_SIZE + (jl % BLOCK_SIZE)
+
+        keep_i32 = keep.to(tl.int32)
+        dst = written + tl.cumsum(keep_i32, axis=0) - keep_i32
+        tl.store(out_kv_indices + out_start + dst, slot, mask=keep)
+        written += tl.sum(keep_i32)
+
+    # Persistent MLA's fast metadata builder cannot handle a zero-length row:
+    # reserve one slot pointing at a valid dummy cache entry. The attention
+    # caller uses `owned_counts == 0` to replace the row with the softmax
+    # identity (O=0, LSE=-inf), so the dummy never reaches the DCP merge.
+    tl.store(out_kv_indices + out_start, 0, mask=written == 0)
+
+
+def emit_owned_slots(
+    local_val: torch.Tensor,
+    local_idx: torch.Tensor,
+    thr: torch.Tensor,
+    local_ks: torch.Tensor,
+    batch_id_per_q_token: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    out_kv_indices: torch.Tensor,
+    out_kv_indptr: torch.Tensor,
+    owned_counts: torch.Tensor,
+    BLOCK_N: int = 128,
+) -> None:
+    """Write this rank's admitted KV slots, compacted, plus indptr and counts.
+
+    Local index ``jl = local_idx - local_ks`` maps to the physical slot
+    ``block_table[req, jl // block_size] * block_size + jl % block_size``: the
+    local shard was gathered with ``dcp_indexer_local_cu_seqlens``, whose slot
+    formula is exactly the round-robin WRITE layout, and a rank only ever holds
+    its own tokens -- so the interleave-S virtual-block arithmetic the global
+    filter needs does not appear here.
+
+    A candidate is admitted when it is finite, at or above ``thr``, carries a
+    real column (``top_k_per_row_prefill`` tail-pads with ``-1``), and belongs
+    to a real request (``batch_id_per_q_token < 0`` marks a CUDAGraph pad
+    token). That predicate is evaluated ONCE, here, and handed to the kernel --
+    counts and writes read the same tensor by construction.
+    """
+    rows, k = local_val.shape
+    assert local_idx.shape == (rows, k), local_idx.shape
+    assert out_kv_indptr.shape[0] >= rows + 1, out_kv_indptr.shape
+    assert owned_counts.shape[0] >= rows, owned_counts.shape
+
+    keep = (
+        torch.isfinite(local_val)
+        & (local_val >= thr[:, None])
+        & (local_idx >= 0)
+        & (batch_id_per_q_token >= 0)[:, None]
+    )
+    counts = keep.sum(1, dtype=torch.int32)
+    owned_counts[:rows].copy_(counts)
+    out_kv_indptr[:1].zero_()
+    torch.cumsum(
+        counts.clamp_min(1), dim=0, dtype=torch.int32, out=out_kv_indptr[1 : rows + 1]
+    )
+
+    keep_i8 = keep.to(torch.int8).contiguous()
+    local_idx_c = local_idx.contiguous()
+    block_table_c = block_table.to(torch.int32).contiguous()
+    _emit_owned_slots_kernel[(rows,)](
+        keep_i8,
+        local_idx_c,
+        local_ks.contiguous(),
+        batch_id_per_q_token.contiguous(),
+        block_table_c,
+        out_kv_indptr,
+        out_kv_indices,
+        block_size,
+        k,
+        BLOCK_N,
+        keep_i8.stride(0),
+        local_idx_c.stride(0),
+        block_table_c.stride(0),
+    )

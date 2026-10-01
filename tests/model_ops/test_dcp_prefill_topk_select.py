@@ -23,6 +23,7 @@ import torch
 pytest.importorskip("triton", reason="requires Triton")
 
 from atom.model_ops.dcp_topk_select import (
+    emit_owned_slots,
     local_histogram,
     reduce_bracket,
     row_bracket_stats,
@@ -215,3 +216,176 @@ def test_empty_row_threshold_is_finite():
     # No candidate is finite, so nothing is admitted whatever the threshold is;
     # it only has to be a usable number for the emit kernel's comparison.
     assert not torch.isnan(thr).any()
+
+
+def _emit_reference(
+    local_val, local_idx, thr, local_ks, batch_ids, block_table, block_size
+):
+    """Pure-torch reference for emit_owned_slots. Returns (indices, indptr, counts)."""
+    rows, _ = local_val.shape
+    counts, per_row = [], []
+    for t in range(rows):
+        b = int(batch_ids[t].item())
+        if b < 0:
+            counts.append(0)
+            per_row.append([])
+            continue
+        keep = (
+            torch.isfinite(local_val[t])
+            & (local_val[t] >= thr[t])
+            & (local_idx[t] >= 0)
+        )
+        jl = (local_idx[t][keep] - int(local_ks[t].item())).tolist()
+        slots = [
+            int(block_table[b, j // block_size].item()) * block_size + j % block_size
+            for j in jl
+        ]
+        counts.append(len(slots))
+        per_row.append(slots)
+    indptr = [0]
+    for c in counts:
+        indptr.append(indptr[-1] + max(c, 1))
+    flat = torch.zeros(indptr[-1], dtype=torch.int32)
+    for t, slots in enumerate(per_row):
+        for i, s in enumerate(slots):
+            flat[indptr[t] + i] = s
+    return (
+        flat,
+        torch.tensor(indptr, dtype=torch.int32),
+        torch.tensor(counts, dtype=torch.int32),
+    )
+
+
+def _emit_fixture(rows=5, k=16, num_req=2, cols=8, block_size=4, seed=11):
+    torch.manual_seed(seed)
+    local_val = _padded_rows(rows, k, [k, k, 0, 3, k], seed=seed)
+    local_idx = torch.full((rows, k), -1, dtype=torch.int32, device="cuda")
+    for t in range(rows):
+        n = int(torch.isfinite(local_val[t]).sum().item())
+        local_idx[t, :n] = torch.randperm(cols * block_size, device="cuda")[:n].to(
+            torch.int32
+        )
+    local_ks = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    batch_ids = torch.tensor([0, 1, 0, 1, -1], dtype=torch.int32, device="cuda")
+    block_table = (
+        torch.randperm(64, device="cuda")[: num_req * cols]
+        .reshape(num_req, cols)
+        .to(torch.int32)
+    )
+    return local_val, local_idx, local_ks, batch_ids, block_table, block_size
+
+
+@needs_gpu
+def test_emit_matches_reference():
+    local_val, local_idx, local_ks, batch_ids, bt, bs = _emit_fixture()
+    rows, _ = local_val.shape
+    thr = torch.zeros(rows, dtype=torch.float32, device="cuda")
+    ref_idx, ref_indptr, ref_counts = _emit_reference(
+        local_val, local_idx, thr, local_ks, batch_ids, bt, bs
+    )
+    out_indices = torch.full((rows * 64,), -7, dtype=torch.int32, device="cuda")
+    out_indptr = torch.zeros(rows + 1, dtype=torch.int32, device="cuda")
+    counts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    emit_owned_slots(
+        local_val,
+        local_idx,
+        thr,
+        local_ks,
+        batch_ids,
+        bt,
+        bs,
+        out_indices,
+        out_indptr,
+        counts,
+    )
+    assert torch.equal(out_indptr.cpu(), ref_indptr)
+    assert torch.equal(counts.cpu(), ref_counts)
+    n = int(ref_indptr[-1].item())
+    assert torch.equal(out_indices[:n].cpu(), ref_idx)
+
+
+@needs_gpu
+def test_emit_pad_token_owns_nothing_and_indptr_stays_monotonic():
+    """Review Focus #3."""
+    local_val, local_idx, local_ks, batch_ids, bt, bs = _emit_fixture()
+    rows, _ = local_val.shape
+    thr = torch.full((rows,), NEG_INF, dtype=torch.float32, device="cuda")
+    out_indices = torch.full((rows * 64,), -7, dtype=torch.int32, device="cuda")
+    out_indptr = torch.zeros(rows + 1, dtype=torch.int32, device="cuda")
+    counts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    emit_owned_slots(
+        local_val,
+        local_idx,
+        thr,
+        local_ks,
+        batch_ids,
+        bt,
+        bs,
+        out_indices,
+        out_indptr,
+        counts,
+    )
+    assert counts[4].item() == 0  # batch_ids[4] == -1
+    diffs = out_indptr[1:] - out_indptr[:-1]
+    assert torch.all(diffs >= 1)
+
+
+@needs_gpu
+def test_emit_empty_row_gets_one_dummy_slot():
+    """Review Focus #4."""
+    local_val, local_idx, local_ks, batch_ids, bt, bs = _emit_fixture()
+    rows, _ = local_val.shape
+    thr = torch.full((rows,), POS_INF, dtype=torch.float32, device="cuda")
+    out_indices = torch.full((rows * 64,), -7, dtype=torch.int32, device="cuda")
+    out_indptr = torch.zeros(rows + 1, dtype=torch.int32, device="cuda")
+    counts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    emit_owned_slots(
+        local_val,
+        local_idx,
+        thr,
+        local_ks,
+        batch_ids,
+        bt,
+        bs,
+        out_indices,
+        out_indptr,
+        counts,
+    )
+    assert torch.all(counts == 0)
+    for t in range(rows):
+        assert out_indices[int(out_indptr[t].item())].item() == 0
+
+
+@needs_gpu
+def test_emit_preserves_candidate_order():
+    """Compaction is order-preserving, so the fp accumulation order is fixed.
+
+    The order it preserves is the one top_k_per_row_prefill emits, which is
+    ascending column index -- NOT descending score. Either is deterministic;
+    this pins which.
+    """
+    local_val, local_idx, local_ks, batch_ids, bt, bs = _emit_fixture()
+    rows, _ = local_val.shape
+    thr = torch.zeros(rows, dtype=torch.float32, device="cuda")
+    out_indices = torch.full((rows * 64,), -7, dtype=torch.int32, device="cuda")
+    out_indptr = torch.zeros(rows + 1, dtype=torch.int32, device="cuda")
+    counts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    emit_owned_slots(
+        local_val,
+        local_idx,
+        thr,
+        local_ks,
+        batch_ids,
+        bt,
+        bs,
+        out_indices,
+        out_indptr,
+        counts,
+    )
+    t = 0
+    n = int(counts[t].item())
+    keep = torch.isfinite(local_val[t]) & (local_val[t] >= thr[t])
+    jl = local_idx[t][keep] - local_ks[t]
+    want = bt[0, (jl // bs).long()].to(torch.int32) * bs + (jl % bs).to(torch.int32)
+    start = int(out_indptr[t].item())
+    assert torch.equal(out_indices[start : start + n], want)
