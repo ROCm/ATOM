@@ -693,6 +693,22 @@ models:
               LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
               ATOM_WARMUP_PREFILL_TOKEN_STRIDE: "32"
 
+        - <<: *kimi_k3_agentic_jitwarm
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-jitwarm-c88
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 176
+
+        # Capping long prefills at 4096 tokens per step did not pay. At C72
+        # against jitwarm-c72 it measured:
+        #   TTFT p90         17.9 s vs 14.2 s
+        #   interactivity    10.65 vs 10.59
+        #   output tok/s     unchanged
+        # It also added 5 prefill stalls of 12-52 s, each after a multi-request
+        # batch of 4096-token chunks. pfx-statecap-c72 hung its prefill engine
+        # on such a batch. Kept for reference; do not promote.
         - &kimi_k3_agentic_prefill_tuned
           <<: *kimi_k3_agentic_jitwarm
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-pfx-c72
@@ -744,6 +760,18 @@ models:
             workers: 1
             tp: 8
             dcp: 8
+
+        - <<: *kimi_k3_agentic_statecap
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-jitwarm-statecap-c88
+          concurrency: [88]
+          prefill:
+            workers: 1
+            tp: 8
+            dcp: 8
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 176
 
         - <<: *kimi_k3_agentic_statecap
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-pfx-statecap-c88
