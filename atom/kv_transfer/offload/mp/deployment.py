@@ -62,11 +62,19 @@ def _transfer_mode(config: Any) -> str:
             "LMCache MP transfer mode must be 'auto', 'lmcache_driven', or "
             f"'engine_driven', got {configured_mode!r}"
         )
-    if transfer_mode == "engine_driven":
+    if transfer_mode == "engine_driven" and state_rides_mp(config):
+        # LMCache's engine-driven path takes one block id list per request
+        # (`_single_group_block_ids` in its worker_transfer raises on
+        # `len(block_ids) != 1`). A recurrent group riding inside the PAGE
+        # transfer object is exactly what makes that list longer than one, so
+        # the restriction binds only for state_transport='mp'; with the state
+        # on its own pool the PAGE unit is a single group and engine_driven is
+        # usable.
         raise NotImplementedError(
-            "ATOM lmcache_mp requires LMCache's lmcache_driven transfer path "
-            "because engine_driven does not support multiple physical "
-            "cache groups"
+            "LMCache's engine_driven transfer takes a single KV cache group "
+            "per request, but lmcache.mp.state_transport='mp' makes the "
+            "recurrent state ride along as a second group; use "
+            "state_transport='own-pool' or lmcache_driven"
         )
     return transfer_mode
 
@@ -134,6 +142,47 @@ def _validate_mp_config(config: Any) -> tuple[int, int]:
     return tp_size, pp_size
 
 
+def state_cpu_size_gb(config: Any) -> float:
+    """Host GiB asked for the recurrent state tier's own pool. Zero is unset."""
+
+    raw = _extra_config(config).get("lmcache.mp.state_cpu_size_gb", 0)
+    try:
+        size = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"lmcache.mp.state_cpu_size_gb must be a number of GiB, got {raw!r}"
+        ) from None
+    if size < 0:
+        raise ValueError(
+            f"lmcache.mp.state_cpu_size_gb must not be negative, got {size}"
+        )
+    return size
+
+
+def state_rides_mp(config: Any) -> bool:
+    """Whether the recurrent groups travel inside the PAGE transfer object.
+
+    The reader of this question that is not the connector is
+    `_config_has_fully_replicated_tp_pages`: a recurrent group riding along
+    puts TP-sharded bytes into the PAGE unit, and only then is the unit no
+    longer replicated. Answering it in two places is what once made that guard
+    read a model name instead.
+    """
+
+    raw = _extra_config(config).get("lmcache.mp.state_transport")
+    if raw is None:
+        # Omitting the second pool's size is the opt-in to riding along; see
+        # the connector's `_resolve_state_transport` for why the default is
+        # taken from that size rather than fixed.
+        return not state_cpu_size_gb(config)
+    transport = str(raw).strip().lower()
+    if transport not in ("mp", "own-pool"):
+        raise ValueError(
+            f"lmcache.mp.state_transport must be 'mp' or 'own-pool', got {raw!r}"
+        )
+    return transport == "mp"
+
+
 def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
     """Conservatively identify configs whose complete PAGE cache is TP-replicated.
 
@@ -158,10 +207,14 @@ def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
     if offcfg._is_minimax_m3(hf_config):
         return False
     hf_config = getattr(hf_config, "text_config", hf_config)
-    # Kimi-K3's MLA KV is replicated, but its KDA checkpoint images -- stored
-    # in those same PAGE units -- hold TP-sharded heads, so every rank keeps
-    # its own copy.
-    if getattr(hf_config, "model_type", None) == "kimi_linear":
+    # A state-owning layout's recurrent checkpoint image holds TP-sharded heads.
+    # Riding inside the PAGE unit it makes the unit as a whole unreplicated, even
+    # though the MLA KV in it is replicated; on its own transport it leaves the
+    # PAGE unit pure MLA, which is replicated and may be collapsed to one copy
+    # for the TP group.
+    if offcfg.select_offload_layout(config) in offcfg._STATE_OWNING_LAYOUTS and (
+        state_rides_mp(config)
+    ):
         return False
     return getattr(hf_config, "kv_lora_rank", None) is not None
 
