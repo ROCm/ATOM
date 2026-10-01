@@ -94,10 +94,11 @@ def kv_slots_from_block_table(
     start = max(int(start_token), 0)
     if n <= start:
         return np.empty(0, dtype=np.int64)
-    blocks = np.asarray(list(block_table), dtype=np.int64)
+    bs = int(block_size)
+    first = start // bs
+    blocks = np.asarray(block_table[first : (n - 1) // bs + 1], dtype=np.int64)
     pos = np.arange(start, n, dtype=np.int64)
-    bs = np.int64(block_size)
-    return blocks[pos // bs] * bs + (pos % bs)
+    return blocks[pos // bs - first] * bs + (pos % bs)
 
 
 def _current_slot_mapping() -> torch.Tensor | None:
@@ -210,6 +211,8 @@ class RoutedExpertsCapturer:
         self._pending: list[
             tuple[torch.Tensor, torch.Tensor, torch.cuda.Event | None]
         ] = []
+        # (slot key, last layer id, dest) shared by the MoE layers of one forward.
+        self._dest_cache: tuple[tuple, int, torch.Tensor] | None = None
 
     @classmethod
     def init(
@@ -249,15 +252,34 @@ class RoutedExpertsCapturer:
         if slots is None or slots.numel() == 0 or topk_ids.numel() == 0:
             return
         n = min(int(slots.shape[0]), int(topk_ids.shape[0]))
-        slots = slots[:n]
         k = min(int(topk_ids.shape[-1]), self.top_k)
         ids = topk_ids[:n, :k].to(device=self.buffer.device, dtype=self.buffer.dtype)
-        dest = self._dest_slots(slots)
+        dest = self._forward_dest_slots(layer_id, slots, n)
         if k < self.top_k:
             row = self.buffer.new_zeros((n, self.top_k))
             row[:, :k] = ids
             ids = row
         self.buffer[dest, layer_id, :] = ids
+
+    def _forward_dest_slots(
+        self, layer_id: int, slots: torch.Tensor, n: int
+    ) -> torch.Tensor:
+        """``_dest_slots(slots[:n])`` computed once per forward, not per layer.
+
+        The slot_mapping staging buffer is rewritten in place between forwards,
+        so tensor identity alone cannot invalidate. MoE layers run in increasing
+        id order within a forward; a non-increasing id starts a new forward.
+        Under CUDA-graph capture the first layer records the computation and
+        later layers read its output, so replay stays correct.
+        """
+        key = (id(slots), slots.data_ptr(), tuple(slots.shape), n)
+        cached = self._dest_cache
+        if cached is not None and cached[0] == key and layer_id > cached[1]:
+            self._dest_cache = (key, layer_id, cached[2])
+            return cached[2]
+        dest = self._dest_slots(slots[:n])
+        self._dest_cache = (key, layer_id, dest)
+        return dest
 
     def _dest_slots(self, slot_mapping: torch.Tensor) -> torch.Tensor:
         slots_i = slot_mapping.reshape(-1).to(dtype=torch.long)

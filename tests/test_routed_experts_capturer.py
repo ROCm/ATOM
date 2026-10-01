@@ -511,6 +511,42 @@ def test_kv_slots_start_token_skips_prefix():
     assert slots.tolist() == [9 * 16, 9 * 16 + 1]
 
 
+def test_kv_slots_start_token_mid_block_matches_full():
+    table = [4, 9, 2, 7]
+    full = kv_slots_from_block_table(table, num_tokens=50, block_size=16)
+    for start in (0, 5, 15, 16, 31, 33, 49):
+        part = kv_slots_from_block_table(
+            table, num_tokens=50, block_size=16, start_token=start
+        )
+        assert part.tolist() == full[start:].tolist()
+
+
+def test_dest_cache_invalidates_on_in_place_slot_rewrite():
+    """Staging slot buffer is rewritten in place between forwards; the
+    per-forward dest cache must not reuse the previous forward's slots."""
+    device = _device()
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=32, num_layers=3, top_k=2, device=device
+    )
+    staging = torch.tensor([0, 1, -1], device=device)
+    ids = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32, device=device)
+    for layer in range(3):
+        capturer.capture(layer, ids + 10 * layer, slot_mapping=staging)
+    capturer.store_step(staging)
+    staging.copy_(torch.tensor([2, 3, -1], device=device))
+    for layer in range(3):
+        capturer.capture(layer, ids + 100 + 10 * layer, slot_mapping=staging)
+    capturer.store_step(staging)
+    rows = capturer.export_batch([0], [[0]], [4], block_size=16)[0]
+    for layer in range(3):
+        np.testing.assert_array_equal(rows[:2, layer], (ids[:2] + 10 * layer).cpu())
+        np.testing.assert_array_equal(
+            rows[2:, layer], (ids[:2] + 100 + 10 * layer).cpu()
+        )
+    # Pad slot (-1) lands in the sacrificial row, never a real slot.
+    assert (capturer.buffer[4:32] == 0).all()
+
+
 def test_apply_patch_extends_none_and_appends():
     seq = Sequence([1, 2, 3], 3)
     assert seq.routed_experts is None
