@@ -104,8 +104,8 @@ switches control how much of that layer is fused; both default to on:
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `ATOM_MEGA_STAGE2_FUSED` | `1` | The gemm2 epilogue P2P-writes each weighted route into the peers' combine staging, so combine only barriers and sums. `0` falls back to mori's plain gather combine. Formerly `ATOM_MORI_V2_FUSED`. |
-| `ATOM_MEGA_STAGE1_FUSED` | `1` | Compact stage 1: routing/layout planning fused with the flydsl TDM dispatch, which writes the grouped GEMM1's per-expert rows directly. Needs stage 2 fused and a quantizing `MEGA_DISPATCH_WIRE` (`fp4`, or `fp8` with `AITER_FORCE_A8W4=1`); on a `bf16` wire it is ignored. When on, dispatch runs on flydsl TDM rather than mori. |
+| `ATOM_MEGA_STAGE2_FUSED` | `1` | aiter `stage2_fused`. The gemm2 epilogue P2P-writes each weighted route into the peers' combine staging, so combine only barriers and sums. `0` keeps MegaMoE but combines through mori: fused_moe returns its rows and mori gathers them (bf16) or pushes them as MXFP4 (`ATOM_MEGA_COMBINE_WIRE=fp4`; no `fp8`). Formerly `ATOM_MORI_V2_FUSED`. |
+| `ATOM_MEGA_STAGE1_FUSED` | `1` | aiter `stage1_fused`. Compact stage 1: routing/layout planning fused with the flydsl TDM dispatch, which writes the grouped GEMM1's per-expert rows directly. Needs stage 2 fused and a quantizing `MEGA_DISPATCH_WIRE` (`fp4`, or `fp8` with `AITER_FORCE_A8W4=1`); otherwise it is ignored. When on, dispatch runs on flydsl TDM rather than mori. |
 
 ```bash
 ATOM_MORI_V2=1 MORI_GPU_ARCHS=gfx1250 FLYDSL_GPU_ARCH=gfx1250 \
@@ -119,9 +119,10 @@ python -m atom.entrypoints.openai_server \
 
 Notes:
 - The log line `[MORI-V2] Created MegaMoE ... dispatch=flydsl wire=fp4 ...
-  stage1_fused=True` confirms the compact stage-1 path is active.
-- Compact stage 1 cannot run with the Triton experts (`ATOM_USE_TRITON_MOE*`);
-  set `ATOM_MEGA_STAGE1_FUSED=0` to use them.
+  stage1_fused=True stage2_fused=True` confirms the compact stage-1 path is
+  active.
+- The Triton experts (`ATOM_USE_TRITON_MOE*`) need `ATOM_MEGA_STAGE1_FUSED=0`
+  and `ATOM_MEGA_STAGE2_FUSED=1`.
 - `ATOM_DP_LM_HEAD_MODE=allgather` avoids RCCL `all_to_all_single`, which
   cannot be captured into a hipGraph on gfx1250.
 

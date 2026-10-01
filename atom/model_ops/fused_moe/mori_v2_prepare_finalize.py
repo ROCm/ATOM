@@ -17,16 +17,20 @@ test_moe_layer_ep.py):
 
 Two transports sit behind the same prepare/finalize pair:
 
-  * ATOM_MEGA_STAGE2_FUSED=0 -- mori's own v2 op-layer, combine_mode="gather". The
-    untouched upstream baseline.
-  * ATOM_MEGA_STAGE2_FUSED=1 -- aiter's MegaMoEGfx1250, whose gemm2 epilogue
-    P2P-writes each weighted (token,k) result straight into the peers' combine
-    staging, so combine only barriers + sums. It owns the whole layer
-    (dispatch -> expert GEMM -> fused combine), so MoriV2ModularKernel hands it
-    the layer and returns its output; prepare()/finalize() are not reached and
-    the transport is configured, not bypassed -- the model-wide recipe
-    (activation, gate mode, quant type, padding, swiglu limit) is fixed at
-    construction and the per-layer weights/biases go to each forward().
+  * "gather" -- mori's own v2 op-layer, combine_mode="gather". The untouched
+    upstream baseline. No switch selects it at the moment; see
+    _resolve_transport.
+  * "mega" -- aiter's MegaMoEGfx1250. It owns the whole layer (dispatch ->
+    expert GEMM -> combine), so MoriV2ModularKernel hands it the layer and
+    returns its output; prepare()/finalize() are not reached and the transport
+    is configured, not bypassed -- the model-wide recipe (activation, gate mode,
+    quant type, padding, swiglu limit) is fixed at construction and the
+    per-layer weights/biases go to each forward(). ATOM_MEGA_STAGE1_FUSED and
+    ATOM_MEGA_STAGE2_FUSED become its stage1_fused / stage2_fused: stage 1
+    picks the dispatch (flydsl compact plan, or mori), stage 2 the combine
+    (gemm2 epilogue P2P-writing each weighted (token,k) result into the peers'
+    staging so combine only barriers + sums, or mori's combine over fused_moe's
+    rows).
 
 Shared experts are NOT fused in the mori EP+DP path (ATOM disables fusion there,
 see topK.is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config), so
@@ -115,10 +119,9 @@ def _import_v2_from_mori():
 def _import_v2() -> None:
     """Bind mori's v2 op-layer -- the non-fused (gather) baseline.
 
-    The gemm2-fused mode is no longer an op-layer combine_mode, so FUSED=1 does
-    not come through here at all: it binds aiter's MegaMoE instead (see
-    _import_mega). Only the cco communication substrate (mori.cco) is shared by
-    both transports.
+    MegaMoE, on either ATOM_MEGA_STAGE2_FUSED value, does not come through here
+    at all: it binds aiter's MegaMoEGfx1250 instead (see _import_mega). Only the
+    cco communication substrate (mori.cco) is shared by both transports.
     """
     global EpDispatchCombineConfig, EpDispatchCombineOp, _V2_IMPORTED
     if _V2_IMPORTED:
@@ -132,10 +135,9 @@ def _import_v2() -> None:
 
 
 def _resolve_transport() -> str:
-    """ "mega" when ATOM_MEGA_STAGE2_FUSED is on, else mori's plain gather op-layer."""
-    from atom.utils import envs as _atom_envs
-
-    return "mega" if _atom_envs.ATOM_MEGA_STAGE2_FUSED else "gather"
+    """Always "mega": ATOM_MEGA_STAGE2_FUSED=0 is MegaMoE's own mori combine now,
+    so mori's plain gather op-layer is kept but has no switch."""
+    return "mega"
 
 
 @lru_cache(maxsize=1)
@@ -180,8 +182,11 @@ def _cco_per_rank_vmm(
     send all its tokens to one peer -> ws * M recv slots, plus a 2x headroom
     (tokens + combine buffers) and a fixed slack, matching test_moe_layer_ep.py.
 
-    MegaMoE's arena needs strictly less than this (one recv-sized token buffer
-    plus an M*topk combine staging), so the same budget covers both transports.
+    MegaMoE's arena needs less than this (one recv-sized token buffer plus an
+    M*topk combine staging, or with stage 2 unfused a recv-sized bf16 staging),
+    so the same budget covers both transports. The exception is stage 2
+    unfused on the fp4 combine wire, which adds a landing row per (peer, recv
+    slot) and can outgrow it at large ep_size on a bf16 dispatch wire.
     """
     tok_bytes = max_num_inp_token_per_rank * hidden_dim * itemsize
     win_bytes = ep_size * tok_bytes * 2 + (1 << 24)
@@ -199,8 +204,9 @@ _MEGA_TRANSPORTS: dict = {}
 # free choice: combine moves post-expert tokens, so nothing downstream demands
 # a particular width. aiter names the same formats after their MX block layout.
 #
-# PREFILL only -- the quant/dequant pair is a fixed per-token cost against a
-# saving that scales with the tokens on the wire, so decode asks for bf16 back.
+# PREFILL only by default -- the quant/dequant pair is a fixed per-token cost
+# against a saving that scales with the tokens on the wire, so decode asks for
+# bf16 back unless $ATOM_MEGA_DECODE_COMBINE_QUANT is on.
 # See MoriV2PrepareAndFinalize.combine_quant_for_step.
 _COMBINE_WIRES = {"bf16": "none", "fp8": "mxfp8", "fp4": "mxfp4"}
 _MEGA_COMBINE_WIRE = envs.ATOM_MEGA_COMBINE_WIRE
@@ -211,6 +217,16 @@ if _MEGA_COMBINE_WIRE not in _COMBINE_WIRES:
     )
 # Read once, like the dispatch wire: this is consulted per layer per forward.
 _MEGA_COMBINE_QUANT = _COMBINE_WIRES[_MEGA_COMBINE_WIRE]
+_MEGA_DECODE_COMBINE_QUANT = envs.ATOM_MEGA_DECODE_COMBINE_QUANT
+
+# aiter's stage2_fused: the gemm2-fused combine, or mori's combine over
+# fused_moe's rows.
+_MEGA_STAGE2_FUSED = envs.ATOM_MEGA_STAGE2_FUSED
+if not _MEGA_STAGE2_FUSED and _MEGA_COMBINE_WIRE == "fp8":
+    raise RuntimeError(
+        "ATOM_MEGA_COMBINE_WIRE=fp8 needs ATOM_MEGA_STAGE2_FUSED=1: with stage 2 "
+        "unfused, combine runs through mori, which has no fp8 wire (bf16 or fp4)"
+    )
 
 
 # bf16 | fp8 | fp4, and it must MATCH the expert GEMM's A operand -- on gfx1250
@@ -225,10 +241,12 @@ if os.environ.get("MEGA_WIRE") not in (None, os.environ.get("MEGA_DISPATCH_WIRE"
         "the old name is no longer read"
     )
 _MEGA_DISPATCH_WIRE = os.environ.get("MEGA_DISPATCH_WIRE", "bf16")
-# aiter's stage1_fused requires a quantizing wire and the flydsl dispatch.
-_MEGA_STAGE1_FUSED = envs.ATOM_MEGA_STAGE1_FUSED and _MEGA_DISPATCH_WIRE in (
-    "fp8",
-    "fp4",
+# aiter's stage1_fused requires a quantizing wire and stage2_fused; without
+# either, dispatch runs on mori.
+_MEGA_STAGE1_FUSED = (
+    envs.ATOM_MEGA_STAGE1_FUSED
+    and _MEGA_STAGE2_FUSED
+    and _MEGA_DISPATCH_WIRE in ("fp8", "fp4")
 )
 
 
@@ -257,13 +275,13 @@ def init_mega_transport(
 
     Everything here is per-model: the EP geometry, the cco arena, and the expert
     GEMM recipe. Only the weights differ per layer and those are forward()
-    arguments, so one instance covers the whole model. Which dispatch kernel it
-    uses is aiter's own call (MEGA_DISPATCH=flydsl|mori).
+    arguments, so one instance covers the whole model. Which dispatch and
+    combine it runs is set by _MEGA_STAGE1_FUSED / _MEGA_STAGE2_FUSED.
 
     ``combine_quant`` names the quantized return-trip format this transport is
     to BUILD ($ATOM_MEGA_COMBINE_WIRE, in aiter's spelling). It is a capability, not
-    the choice: MegaMoE compiles a combine reduce for it and for bf16, and
-    every forward then names the one it wants -- bf16 unless it says otherwise.
+    the choice: MegaMoE builds a combine for it and for bf16, and every forward
+    then names the one it wants -- bf16 unless it says otherwise.
     See combine_quant_for_step.
     """
     key = (
@@ -286,6 +304,7 @@ def init_mega_transport(
         _MEGA_DISPATCH_WIRE,
         combine_quant,
         _MEGA_STAGE1_FUSED,
+        _MEGA_STAGE2_FUSED,
     )
     cached = _MEGA_TRANSPORTS.get(key)
     if cached is not None:
@@ -320,15 +339,8 @@ def init_mega_transport(
         # Passed, not left to aiter's own read of the env, so the key and the
         # transport cannot drift.
         dispatch_wire=_MEGA_DISPATCH_WIRE,
-        # A quantizing wire runs on mori's dispatch unless stage 1 is fused,
-        # which only the flydsl TDM dispatch implements. Named here rather than
-        # left to $MEGA_DISPATCH so the pairing cannot be misconfigured.
-        **(
-            {"dispatch_backend": "flydsl" if _MEGA_STAGE1_FUSED else "mori"}
-            if _MEGA_DISPATCH_WIRE in ("fp8", "fp4")
-            else {}
-        ),
         stage1_fused=_MEGA_STAGE1_FUSED,
+        stage2_fused=_MEGA_STAGE2_FUSED,
         # Only injected when asked for: an aiter without the combine-quant
         # epilogue has no such kwarg and would raise TypeError on every run.
         **({"combine_quant": combine_quant} if combine_quant != "none" else {}),
@@ -348,7 +360,7 @@ def init_mega_transport(
         "[MORI-V2] Created MegaMoE: ep_rank=%d ep_size=%d hidden=%d inter=%d "
         "experts=%d topk=%d M=%d act=%s gate=%s quant=%s pad=(%d,%d) "
         "swiglu_limit=%s dispatch=%s wire=%s combine_quant=%s force_a8w4=%s "
-        "stage1_fused=%s",
+        "stage1_fused=%s stage2_fused=%s",
         ep_rank,
         ep_size,
         hidden_dim,
@@ -362,12 +374,13 @@ def init_mega_transport(
         hidden_pad,
         intermediate_pad,
         swiglu_limit,
-        mega._config.dispatch_backend,
+        "flydsl" if mega._config.stage1_fused else "mori",
         mega._config.dispatch_wire,
         combine_quant,
         # The other half of the pair: logged together so a mismatch is readable.
         os.environ.get("AITER_FORCE_A8W4", "0"),
         mega._config.stage1_fused,
+        mega._config.stage2_fused,
     )
     return mega
 
@@ -466,8 +479,8 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         if inter_dim <= 0:
             raise ValueError(
                 "the fused transport needs the per-partition intermediate size, "
-                f"got {inter_dim}; ATOM_MEGA_STAGE2_FUSED=1 requires the a8w4 "
-                "(Mxfp4MoEMethod) quant path."
+                f"got {inter_dim}; MegaMoE requires the a8w4 (Mxfp4MoEMethod) "
+                "quant path."
             )
         self.mega = init_mega_transport(
             **self._mega_geometry,
@@ -494,11 +507,14 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         The quantized wire is prefill-only: the quant/dequant pair is a fixed
         per-token cost against a saving that scales with the tokens on the
         wire, so it only pays off once the wire is busy.
+        $ATOM_MEGA_DECODE_COMBINE_QUANT opens it on decode too, so every step
+        names it.
 
         Every rank has to name the SAME wire, and that is why `is_prefill`
-        cannot gate this on its own. Combine is P2P: gemm2's epilogue writes
-        this rank's rows into every PEER's arena in the format this rank
-        picked, and the peer's reduce reads them back in the format IT picked.
+        cannot gate this on its own. Combine is P2P: gemm2's epilogue (or, with
+        stage 2 unfused, mori's fp4 push) writes this rank's rows into every
+        PEER's arena in the format this rank picked, and the peer reads them
+        back in the format IT picked.
         `is_prefill` is the local batch's (`ForwardMode.decide` never reduces
         it), so on a ragged step a prefilling rank would scatter fp4 rows into
         a decoding peer that reduces them as bf16 -- the same rank-local trap
@@ -510,6 +526,8 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         shape those run at, and it exercises the quantized reduce before a
         capture rather than first reaching it mid-serve.
         """
+        if _MEGA_DECODE_COMBINE_QUANT:
+            return _MEGA_COMBINE_QUANT
         context = get_forward_context().context
         if context is None:
             return _MEGA_COMBINE_QUANT
@@ -718,6 +736,12 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
                     "triton_mega_moe drives MegaMoE's token-major dispatch and "
                     "cannot run on the compact stage-1 plan; set "
                     "ATOM_MEGA_STAGE1_FUSED=0 to use the Triton experts"
+                )
+            if not mega._config.stage2_fused:
+                raise RuntimeError(
+                    "triton_mega_moe scatters GEMM2's rows into the fused "
+                    "combine's staging and cannot run on mori's combine; set "
+                    "ATOM_MEGA_STAGE2_FUSED=1 to use the Triton experts"
                 )
             from atom.model_ops.fused_moe_triton import triton_mega_moe
 
