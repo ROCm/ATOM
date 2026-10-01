@@ -37,6 +37,11 @@ on:
         required: false
         default: false
         type: boolean
+      release_completed_k3_gsm8k:
+        description: 'Release allocation 5141 only after verifying completed eval and cleanup'
+        required: false
+        default: false
+        type: boolean
       suite:
         description: 'Benchmark suite'
         required: false
@@ -234,6 +239,9 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
+      - name: Release completed K3 GSM8K allocation
+        if: ${{ inputs.inspect_run_id == '36832052267' && inputs.release_completed_k3_gsm8k }}
+        run: python3 .github/scripts/atomesh/k3_gsm8k_finished_job.py
       - name: Collect existing logs
         env:
           SOURCE_RUN_ID: ${{ inputs.inspect_run_id }}
