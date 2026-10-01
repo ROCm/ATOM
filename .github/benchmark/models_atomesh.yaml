@@ -613,11 +613,11 @@ models:
             workers: 3
             cudagraph: "[1,2,4,8,12,16,20,24,28,32,36,40,44,48]"
 
-      # The nightly lmcache-1m cells with the prefill CPU tier in one
-      # standalone LMCache MP server (pd_server_atom.sh: LMCACHE_MP_SERVER)
-      # instead of in-process LMCache per PP stage. Dispatch-only, never
-      # scheduled: they need LMCache >= 0.5.6 (rocm7 image), so dispatch with
-      # suite=lmcache_mp and an explicit atomesh_image.
+      # The nightly lmcache-1m cells with the prefill CPU tier in standalone
+      # LMCache MP servers (pd_server_atom.sh: LMCACHE_MP_SERVER) instead of
+      # in-process LMCache per PP stage. Dispatch-only, never scheduled: they
+      # need LMCache >= 0.5.6 (rocm7 image), so dispatch with suite=lmcache_mp
+      # and an explicit atomesh_image.
       lmcache_mp:
         - &glm52_agentic_lmcachemp_cpp4_dcp4
           <<: *glm52_agentic_lmcache_cpp4_dcp4
@@ -632,9 +632,11 @@ models:
               LMCACHE_CHUNK_SIZE: "256"
               LMCACHE_TRACK_USAGE: "false"
               LMCACHE_MP_SERVER: "1"
-              # One pool for all four stages, the in-process 4 x 256 GiB.
-              LMCACHE_MP_L1_SIZE_GB: "1024"
-              LMCACHE_MP_NUMA_NODE: "0"
+              # <numa>:<first>-<last>:<l1_gb>: stages 0-1 (GPUs 0,1) on a
+              # NUMA0 server, stages 2-3 (GPUs 2,3) on a NUMA1 server. Each
+              # holds only its stages' layers, so the two L1s add up. Resize
+              # by overriding ATOMESH_PREFILL_ENV_LMCACHE_MP_STAGE_SERVERS.
+              LMCACHE_MP_STAGE_SERVERS: "0:0-1:1000;1:2-3:1000"
               OFFLOAD_PROFILE: "1"
               OFFLOAD_MIN_LOAD_TOKENS: "0"
               # P/D only; the launcher adds lmcache_mp through ATOM_KV_OFFLOAD.
@@ -645,6 +647,14 @@ models:
         - <<: *glm52_agentic_lmcachemp_cpp4_dcp4
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemp-1m-c96
           concurrency: [96]
+
+        - <<: *glm52_agentic_lmcachemp_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemp-1m-c112
+          concurrency: [112]
+
+        - <<: *glm52_agentic_lmcachemp_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemp-1m-c128
+          concurrency: [128]
 
     accuracy:
       task: gsm8k

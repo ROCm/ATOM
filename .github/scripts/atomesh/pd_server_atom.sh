@@ -574,7 +574,7 @@ wait_http() {
   local deadline=$(( $(date +%s) + timeout ))
   echo "[wait] ${name} ${url} timeout=${timeout}s"
   until curl -sf --max-time 10 "${url}" >/dev/null 2>&1; do
-    exit_if_lmcache_mp_server_died
+    exit_if_any_lmcache_mp_server_died
     if [[ -n "${pid}" ]] && ! kill -0 "${pid}" 2>/dev/null; then
       set +e
       wait "${pid}"
@@ -600,7 +600,7 @@ wait_router_closed() {
   while true; do
     if curl -sf --max-time 10 "http://${NODE0_ADDR}:${ROUTER_PORT}/health" >/dev/null 2>&1; then
       miss_count=0
-      exit_if_lmcache_mp_server_died
+      exit_if_any_lmcache_mp_server_died
       if [[ -n "${server_pid:-}" ]] && ! kill -0 "${server_pid}" 2>/dev/null; then
         set +e
         wait "${server_pid}"
@@ -705,18 +705,35 @@ purge_lmcache_disk() {
 }
 
 # LMCACHE_MP_SERVER=1 (prefill role env) gives the prefill workers of this shell
-# one standalone LMCache MP server. Its L1 has no NUMA option, so the server
-# runs under MPOL_BIND to LMCACHE_MP_NUMA_NODE and never takes the other node's
-# memory. LMCACHE_MP_EXTRA_ARGS appends server flags; it is split on
+# standalone LMCache MP servers. Their L1 has no NUMA option, so a server runs
+# under MPOL_BIND to its NUMA node and never takes the other node's memory.
+#  - By default one server holds every PP stage: LMCACHE_MP_NUMA_NODE (optional)
+#    and LMCACHE_MP_L1_SIZE_GB (required).
+#  - LMCACHE_MP_STAGE_SERVERS="<numa>:<first>-<last>:<l1_gb>[;...]" starts one
+#    server per entry for that contiguous range of PP stages, on ports
+#    ATOMESH_LMCACHE_MP_PORT + i. Each holds only its stages' layers, so the
+#    L1 sizes add up; it sees only its stages' GPUs.
+# LMCACHE_MP_EXTRA_ARGS appends server flags to every server; it is split on
 # whitespace, so a JSON value (--l2-adapter) must not contain spaces.
-lmcache_mp_pid=""
-lmcache_mp_log=""
-lmcache_mp_visible_devices=""
+lmcache_mp_pids=()
+lmcache_mp_logs=()
+# What the running servers were started for: the prefill GPUs and stage spec.
+lmcache_mp_started_for=""
+# The prefill's ATOM_KV_OFFLOAD_EXTRA_CONFIG for the running servers.
+lmcache_mp_offload_extra_config=""
 # "present" once LMCACHE_MP_EXTRA_ARGS configures an L2 adapter.
 lmcache_mp_l2="none"
-# Exit status of a server that died before stop_lmcache_mp_server ran.
+# Exit status of the first server that died before stop_lmcache_mp_servers ran.
 lmcache_mp_died_rc=""
 page_cache_dropper_pid=""
+# One entry per server to start, filled by plan_lmcache_mp_servers. An empty
+# NUMA node leaves the server unbound. Every server sees the prefill's GPUs:
+# HIP cannot open a worker's IPC handle in a process whose
+# HIP_VISIBLE_DEVICES renumbers that GPU (hipErrorInvalidValue).
+lmcache_mp_plan_numa=()
+lmcache_mp_plan_l1_gb=()
+lmcache_mp_plan_first_stage=()
+lmcache_mp_plan_last_stage=()
 
 # argparse (LMCache's server parser) accepts any unambiguous prefix of a long
 # option, so --l2-adap means --l2-adapter.
@@ -726,66 +743,147 @@ is_option_abbreviation() {
   [[ "${token}" == --* && "${#token}" -gt 2 && "${option}" == "${token}"* ]]
 }
 
-# Returns 1 and records the exit status when the server has exited on its own.
-reap_dead_lmcache_mp_server() {
-  [[ -n "${lmcache_mp_pid}" ]] || return 0
-  process_is_running "${lmcache_mp_pid}" && return 0
-  local rc
-  set +e
-  wait "${lmcache_mp_pid}"
-  rc=$?
-  set -e
-  [[ "${rc}" -eq 0 ]] && rc=1
-  lmcache_mp_pid=""
-  lmcache_mp_died_rc="${rc}"
-  tail -n 50 "${lmcache_mp_log}" >&2 || true
-  echo "[lmcache-mp][FAIL] server exited unexpectedly rc=${rc}, see ${lmcache_mp_log}" >&2
-  return 1
+# Fills the lmcache_mp_plan_* arrays; exits 2 on an invalid configuration.
+plan_lmcache_mp_servers() {
+  lmcache_mp_plan_numa=()
+  lmcache_mp_plan_l1_gb=()
+  lmcache_mp_plan_first_stage=()
+  lmcache_mp_plan_last_stage=()
+  local spec="${LMCACHE_MP_STAGE_SERVERS:-}"
+  if [[ -z "${spec}" ]]; then
+    lmcache_mp_plan_numa=("${LMCACHE_MP_NUMA_NODE:-}")
+    lmcache_mp_plan_l1_gb=("${LMCACHE_MP_L1_SIZE_GB:?LMCACHE_MP_L1_SIZE_GB is required with LMCACHE_MP_SERVER=1}")
+    lmcache_mp_plan_first_stage=("")
+    lmcache_mp_plan_last_stage=("")
+    return 0
+  fi
+  local name
+  for name in LMCACHE_MP_NUMA_NODE LMCACHE_MP_L1_SIZE_GB; do
+    if [[ -n "${!name:-}" ]]; then
+      echo "[lmcache-mp][FAIL] ${name} cannot be combined with LMCACHE_MP_STAGE_SERVERS: give each server's node and size in its entry" >&2
+      exit 2
+    fi
+  done
+  local -a entries=()
+  IFS=';' read -r -a entries <<< "${spec}"
+  if [[ "${#entries[@]}" -lt 2 ]]; then
+    echo "[lmcache-mp][FAIL] LMCACHE_MP_STAGE_SERVERS=${spec} needs at least 2 servers; use LMCACHE_MP_NUMA_NODE/LMCACHE_MP_L1_SIZE_GB for one" >&2
+    exit 2
+  fi
+  local entry next_stage=0
+  for entry in "${entries[@]}"; do
+    if [[ ! "${entry}" =~ ^([0-9]+):([0-9]+)-([0-9]+):([0-9]+)$ ]]; then
+      echo "[lmcache-mp][FAIL] LMCACHE_MP_STAGE_SERVERS entry '${entry}' is not <numa>:<first>-<last>:<l1_gb>" >&2
+      exit 2
+    fi
+    local first="${BASH_REMATCH[2]}" last="${BASH_REMATCH[3]}"
+    if (( 10#${first} != next_stage || 10#${last} < 10#${first} )); then
+      echo "[lmcache-mp][FAIL] LMCACHE_MP_STAGE_SERVERS entry '${entry}' must cover stages ${next_stage}..N: entries cover every PP stage once, in order" >&2
+      exit 2
+    fi
+    next_stage=$(( 10#${last} + 1 ))
+    lmcache_mp_plan_numa+=("$(( 10#${BASH_REMATCH[1]} ))")
+    lmcache_mp_plan_first_stage+=("$(( 10#${first} ))")
+    lmcache_mp_plan_last_stage+=("$(( 10#${last} ))")
+    lmcache_mp_plan_l1_gb+=("$(( 10#${BASH_REMATCH[4]} ))")
+  done
 }
 
-# Without the server, prefill lookups time out and stores fail stop only at
-# their transfer deadline, so check the server wherever the launcher waits on
+# The prefill's lmcache_mp extra config for the planned servers.
+lmcache_mp_extra_config_json() {
+  if [[ -z "${lmcache_mp_plan_first_stage[0]}" ]]; then
+    printf '{"lmcache.mp.host":"tcp://127.0.0.1","lmcache.mp.port":%s,"lmcache.mp.l2":"%s"}' \
+      "${ATOMESH_LMCACHE_MP_PORT}" "${lmcache_mp_l2}"
+    return 0
+  fi
+  local i rank servers="" ranks
+  for i in "${!lmcache_mp_plan_first_stage[@]}"; do
+    ranks=""
+    for (( rank = lmcache_mp_plan_first_stage[i]; rank <= lmcache_mp_plan_last_stage[i]; rank++ )); do
+      ranks+="${ranks:+,}${rank}"
+    done
+    servers+="${servers:+,}$(printf '{"url":"tcp://127.0.0.1:%s","pp_ranks":[%s]}' \
+      "$(( ATOMESH_LMCACHE_MP_PORT + i ))" "${ranks}")"
+  done
+  printf '{"lmcache.mp.stage_servers":[%s],"lmcache.mp.l2":"%s"}' "${servers}" "${lmcache_mp_l2}"
+}
+
+# Returns 1 and records the first exit status when a server exited on its own.
+reap_dead_lmcache_mp_servers() {
+  local i rc any_died=0
+  for i in "${!lmcache_mp_pids[@]}"; do
+    [[ -n "${lmcache_mp_pids[i]}" ]] || continue
+    process_is_running "${lmcache_mp_pids[i]}" && continue
+    set +e
+    wait "${lmcache_mp_pids[i]}"
+    rc=$?
+    set -e
+    [[ "${rc}" -eq 0 ]] && rc=1
+    lmcache_mp_pids[i]=""
+    lmcache_mp_died_rc="${lmcache_mp_died_rc:-${rc}}"
+    tail -n 50 "${lmcache_mp_logs[i]}" >&2 || true
+    echo "[lmcache-mp][FAIL] server exited unexpectedly rc=${rc}, see ${lmcache_mp_logs[i]}" >&2
+    any_died=1
+  done
+  [[ "${any_died}" -eq 0 ]]
+}
+
+# Without a server, prefill lookups time out and stores fail stop only at
+# their transfer deadline, so check the servers wherever the launcher waits on
 # the workers; the log then names the real cause.
-exit_if_lmcache_mp_server_died() {
-  reap_dead_lmcache_mp_server || exit "${lmcache_mp_died_rc}"
+exit_if_any_lmcache_mp_server_died() {
+  reap_dead_lmcache_mp_servers || exit "${lmcache_mp_died_rc}"
 }
 
-# Returns non-zero when the server died before it was stopped.
-stop_lmcache_mp_server() {
+# Returns non-zero when a server died before it was stopped.
+stop_lmcache_mp_servers() {
   terminate_process_group "${page_cache_dropper_pid}"
   page_cache_dropper_pid=""
-  local server_ended=0
-  if ! reap_dead_lmcache_mp_server; then
-    server_ended=1
-  elif [[ -n "${lmcache_mp_pid}" ]]; then
-    terminate_process_group "${lmcache_mp_pid}"
-    lmcache_mp_pid=""
-    server_ended=1
-    echo "[lmcache-mp] server stopped"
-  fi
-  if [[ "${server_ended}" -eq 1 ]]; then
-    # A failed hipHostRegister is only a warning, and every transfer through
-    # that L1 region then runs unpinned.
-    local unpinned
-    unpinned="$(grep -c "DMA performance may be degraded" "${lmcache_mp_log}" 2>/dev/null || true)"
+  local i
+  local -a ended=()
+  for i in "${!lmcache_mp_pids[@]}"; do
+    [[ -n "${lmcache_mp_pids[i]}" ]] && ended+=("${i}")
+  done
+  reap_dead_lmcache_mp_servers || true
+  for i in "${!lmcache_mp_pids[@]}"; do
+    [[ -n "${lmcache_mp_pids[i]}" ]] || continue
+    terminate_process_group "${lmcache_mp_pids[i]}"
+    lmcache_mp_pids[i]=""
+    echo "[lmcache-mp] server stopped, log ${lmcache_mp_logs[i]}"
+  done
+  # A failed hipHostRegister is only a warning, and every transfer through
+  # that L1 region then runs unpinned.
+  local unpinned
+  for i in ${ended[@]+"${ended[@]}"}; do
+    unpinned="$(grep -c "DMA performance may be degraded" "${lmcache_mp_logs[i]}" 2>/dev/null || true)"
     if [[ "${unpinned:-0}" -gt 0 ]]; then
-      echo "[lmcache-mp] WARNING: ${unpinned} L1 region(s) could not be pinned, see ${lmcache_mp_log}" >&2
+      echo "[lmcache-mp] WARNING: ${unpinned} L1 region(s) could not be pinned, see ${lmcache_mp_logs[i]}" >&2
     fi
-  fi
+  done
   [[ -z "${lmcache_mp_died_rc}" ]]
 }
 
-start_lmcache_mp_server() {
+lmcache_mp_servers_running() {
+  local pid
+  for pid in ${lmcache_mp_pids[@]+"${lmcache_mp_pids[@]}"}; do
+    [[ -n "${pid}" ]] && return 0
+  done
+  return 1
+}
+
+start_lmcache_mp_servers() {
   [[ "${LMCACHE_MP_SERVER:-0}" == "1" ]] || return 0
-  # One server serves every prefill worker this shell starts, and it imports
-  # their KV by device, so it has to see each worker's GPUs.
-  if [[ -n "${lmcache_mp_pid}" ]]; then
-    if [[ "${lmcache_mp_visible_devices}" != "${HIP_VISIBLE_DEVICES}" ]]; then
-      echo "[lmcache-mp][FAIL] server sees GPUs ${lmcache_mp_visible_devices}, prefill worker uses ${HIP_VISIBLE_DEVICES}" >&2
+  # The servers serve every prefill worker this shell starts, and they import
+  # their KV by device, so they have to see each worker's GPUs.
+  local started_for="${HIP_VISIBLE_DEVICES:-}|${LMCACHE_MP_STAGE_SERVERS:-}"
+  if lmcache_mp_servers_running; then
+    if [[ "${lmcache_mp_started_for}" != "${started_for}" ]]; then
+      echo "[lmcache-mp][FAIL] servers were started for GPUs|stages ${lmcache_mp_started_for}, prefill worker uses ${started_for}" >&2
       exit 2
     fi
     return 0
   fi
+  plan_lmcache_mp_servers
   local -a extra_args=()
   read -r -a extra_args <<< "${LMCACHE_MP_EXTRA_ARGS:-}"
   local arg forbidden
@@ -802,55 +900,85 @@ start_lmcache_mp_server() {
       lmcache_mp_l2="present"
     fi
   done
-  lmcache_mp_log="${RUNTIME_LOG_DIR}/lmcache-mp-rank-${NODE_RANK}.log"
-  local -a server_cmd=(
-    python3 -m lmcache.v1.multiprocess.server
-    --host 127.0.0.1 --port "${ATOMESH_LMCACHE_MP_PORT}"
-    --chunk-size "${LMCACHE_CHUNK_SIZE:-256}"
-    --null-block-id -1 --separate-object-groups
-    --supported-transfer-mode lmcache_driven
-    --l1-size-gb "${LMCACHE_MP_L1_SIZE_GB:?LMCACHE_MP_L1_SIZE_GB is required with LMCACHE_MP_SERVER=1}"
-    # LMCache's 0.8/0.2 defaults would leave a fifth of the pool unused.
-    --eviction-policy LRU --eviction-trigger-watermark 0.95 --eviction-ratio 0.05
-    # One GPU worker would serialize every PP stage's stores and retrieves.
-    --max-gpu-workers "${LMCACHE_MP_GPU_WORKERS:-4}"
-    --max-cpu-workers "${LMCACHE_MP_CPU_WORKERS:-4}"
-    --prometheus-port "${ATOMESH_LMCACHE_MP_PROMETHEUS_PORT}"
-    ${extra_args[@]+"${extra_args[@]}"}
-  )
-  if [[ -n "${LMCACHE_MP_NUMA_NODE:-}" ]]; then
-    server_cmd=(python3 "${ATOMESH_SCRIPT_DIR}/numa_exec.py" "${LMCACHE_MP_NUMA_NODE}" "${server_cmd[@]}")
-    # Clean weight pages on the bound node would be reclaimed on every L1
-    # allocation; drop them now and while the workers load weights.
+  local i numa_bound=0
+  for i in "${!lmcache_mp_plan_numa[@]}"; do
+    [[ -n "${lmcache_mp_plan_numa[i]}" ]] && numa_bound=1
+  done
+  if [[ "${numa_bound}" -eq 1 ]]; then
+    # Clean weight pages on a bound node would be reclaimed on every L1
+    # allocation; drop them now and while the workers load weights. Page
+    # cache is per file, so one dropper serves every node.
     python3 "${ATOMESH_SCRIPT_DIR}/drop_page_cache.py" "${MODEL_PATH}"
     setsid python3 "${ATOMESH_SCRIPT_DIR}/drop_page_cache.py" \
       --every 45 --for "${LMCACHE_MP_PAGE_CACHE_DROP_SECONDS:-1800}" "${MODEL_PATH}" &
     page_cache_dropper_pid=$!
   fi
-  dump_launch_info "LMCACHE_MP" "${server_cmd[@]}"
-  LMCACHE_TRACK_USAGE=false setsid "${server_cmd[@]}" >"${lmcache_mp_log}" 2>&1 &
-  lmcache_mp_pid=$!
-  lmcache_mp_visible_devices="${HIP_VISIBLE_DEVICES}"
-  # Every PP stage connects to the server while it builds its engine, so the
-  # workers must not start before the server accepts requests.
+  lmcache_mp_pids=()
+  lmcache_mp_logs=()
+  local port prometheus_port log
+  local -a server_cmd=()
+  for i in "${!lmcache_mp_plan_numa[@]}"; do
+    port=$(( ATOMESH_LMCACHE_MP_PORT + i ))
+    prometheus_port=$(( ATOMESH_LMCACHE_MP_PROMETHEUS_PORT + i ))
+    if [[ -z "${lmcache_mp_plan_first_stage[i]}" ]]; then
+      log="${RUNTIME_LOG_DIR}/lmcache-mp-rank-${NODE_RANK}.log"
+    else
+      log="${RUNTIME_LOG_DIR}/lmcache-mp-rank-${NODE_RANK}-s${i}.log"
+    fi
+    server_cmd=(
+      python3 -m lmcache.v1.multiprocess.server
+      --host 127.0.0.1 --port "${port}"
+      --chunk-size "${LMCACHE_CHUNK_SIZE:-256}"
+      --null-block-id -1 --separate-object-groups
+      --supported-transfer-mode lmcache_driven
+      --l1-size-gb "${lmcache_mp_plan_l1_gb[i]}"
+      # LMCache's 0.8/0.2 defaults would leave a fifth of the pool unused.
+      --eviction-policy LRU --eviction-trigger-watermark 0.95 --eviction-ratio 0.05
+      # One GPU worker would serialize every PP stage's stores and retrieves.
+      --max-gpu-workers "${LMCACHE_MP_GPU_WORKERS:-4}"
+      --max-cpu-workers "${LMCACHE_MP_CPU_WORKERS:-4}"
+      --prometheus-port "${prometheus_port}"
+      ${extra_args[@]+"${extra_args[@]}"}
+    )
+    if [[ -n "${lmcache_mp_plan_numa[i]}" ]]; then
+      server_cmd=(python3 "${ATOMESH_SCRIPT_DIR}/numa_exec.py" "${lmcache_mp_plan_numa[i]}" "${server_cmd[@]}")
+    fi
+    dump_launch_info "LMCACHE_MP" "${server_cmd[@]}"
+    LMCACHE_TRACK_USAGE=false setsid "${server_cmd[@]}" >"${log}" 2>&1 &
+    lmcache_mp_pids+=("$!")
+    lmcache_mp_logs+=("${log}")
+  done
+  lmcache_mp_started_for="${started_for}"
+  lmcache_mp_offload_extra_config="$(lmcache_mp_extra_config_json)"
+  # Every PP stage connects to its server while it builds its engine, so the
+  # workers must not start before every server accepts requests.
   local timeout="${LMCACHE_MP_WAIT_TIMEOUT:-300}"
-  local deadline=$(( $(date +%s) + timeout ))
-  echo "[wait] lmcache-mp tcp://127.0.0.1:${ATOMESH_LMCACHE_MP_PORT} timeout=${timeout}s log=${lmcache_mp_log}"
-  until grep -q "LMCache cache server is running\.\.\." "${lmcache_mp_log}" 2>/dev/null; do
-    if ! reap_dead_lmcache_mp_server; then
+  local deadline=$(( $(date +%s) + timeout )) ready
+  echo "[wait] lmcache-mp tcp://127.0.0.1:${ATOMESH_LMCACHE_MP_PORT} servers=${#lmcache_mp_pids[@]} timeout=${timeout}s logs=${lmcache_mp_logs[*]}"
+  while true; do
+    ready=0
+    for log in "${lmcache_mp_logs[@]}"; do
+      grep -q "LMCache cache server is running\.\.\." "${log}" 2>/dev/null && ready=$(( ready + 1 ))
+    done
+    [[ "${ready}" -eq "${#lmcache_mp_logs[@]}" ]] && break
+    if ! reap_dead_lmcache_mp_servers; then
       echo "[wait][FAIL] lmcache-mp exited before becoming ready" >&2
-      stop_lmcache_mp_server || true
+      stop_lmcache_mp_servers || true
       exit "${lmcache_mp_died_rc}"
     fi
     if [[ "$(date +%s)" -ge "${deadline}" ]]; then
-      tail -n 50 "${lmcache_mp_log}" >&2 || true
+      for log in "${lmcache_mp_logs[@]}"; do
+        tail -n 50 "${log}" >&2 || true
+      done
       echo "[wait][FAIL] lmcache-mp not ready after ${timeout}s" >&2
-      stop_lmcache_mp_server || true
+      stop_lmcache_mp_servers || true
       exit 1
     fi
     sleep 2
   done
-  echo "[wait][OK] lmcache-mp metrics=http://127.0.0.1:${ATOMESH_LMCACHE_MP_PROMETHEUS_PORT}/metrics"
+  for i in "${!lmcache_mp_pids[@]}"; do
+    echo "[wait][OK] lmcache-mp tcp://127.0.0.1:$(( ATOMESH_LMCACHE_MP_PORT + i )) metrics=http://127.0.0.1:$(( ATOMESH_LMCACHE_MP_PROMETHEUS_PORT + i ))/metrics"
+  done
 }
 
 cleanup_processes() {
@@ -861,7 +989,7 @@ cleanup_processes() {
   done
   purge_lmcache_disk
   # Last: the workers hold KV registrations on the server until they exit.
-  if ! stop_lmcache_mp_server && [[ "${rc}" -eq 0 ]]; then
+  if ! stop_lmcache_mp_servers && [[ "${rc}" -eq 0 ]]; then
     rc="${lmcache_mp_died_rc}"
   fi
   return "${rc}"
@@ -904,13 +1032,13 @@ start_prefill() {
     export HIP_VISIBLE_DEVICES="${visible_devices}"
   fi
   reset_lmcache_disk
-  start_lmcache_mp_server
+  start_lmcache_mp_servers
   # On the env command line, not exported: decode starts from this same shell.
   local -a prefill_offload_env=()
-  if [[ -n "${lmcache_mp_pid}" ]]; then
+  if lmcache_mp_servers_running; then
     prefill_offload_env=(
       "ATOM_KV_OFFLOAD=lmcache_mp"
-      "ATOM_KV_OFFLOAD_EXTRA_CONFIG={\"lmcache.mp.host\":\"tcp://127.0.0.1\",\"lmcache.mp.port\":${ATOMESH_LMCACHE_MP_PORT},\"lmcache.mp.l2\":\"${lmcache_mp_l2}\"}"
+      "ATOM_KV_OFFLOAD_EXTRA_CONFIG=${lmcache_mp_offload_extra_config}"
     )
   fi
   local -a prefill_cache_env=()
@@ -1179,11 +1307,19 @@ run_aiperf_agentic_benchmark() {
     server_metrics_args+=("http://${decode_ips[$idx]}:${decode_ports[$idx]}/metrics")
     report_args+=(--decode "${decode_ips[$idx]}:${decode_ports[$idx]}")
   done
-  # One LMCache MP server per prefill host (start_lmcache_mp_server).
+  # One LMCache MP server per prefill host, or one per stage group with
+  # LMCACHE_MP_STAGE_SERVERS (start_lmcache_mp_servers).
   if [[ "${ATOMESH_PREFILL_ENV_LMCACHE_MP_SERVER:-0}" == "1" ]]; then
-    local mp_ip
+    local mp_ip mp_server mp_servers=1
+    if [[ -n "${ATOMESH_PREFILL_ENV_LMCACHE_MP_STAGE_SERVERS:-}" ]]; then
+      local -a mp_stage_entries=()
+      IFS=';' read -r -a mp_stage_entries <<< "${ATOMESH_PREFILL_ENV_LMCACHE_MP_STAGE_SERVERS}"
+      mp_servers="${#mp_stage_entries[@]}"
+    fi
     while read -r mp_ip; do
-      server_metrics_args+=("http://${mp_ip}:${ATOMESH_LMCACHE_MP_PROMETHEUS_PORT}/metrics")
+      for (( mp_server = 0; mp_server < mp_servers; mp_server++ )); do
+        server_metrics_args+=("http://${mp_ip}:$(( ATOMESH_LMCACHE_MP_PROMETHEUS_PORT + mp_server ))/metrics")
+      done
     done < <(printf '%s\n' "${prefill_ips[@]}" | sort -u)
   fi
 

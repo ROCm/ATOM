@@ -91,7 +91,9 @@ on:
 
           GLM lmcache_mp (suite=lmcache_mp; needs a rocm7 atomesh_image, LMCache >= 0.5.6):
             glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemp-1m-c72,
-            glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemp-1m-c96
+            glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemp-1m-c96,
+            glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemp-1m-c112,
+            glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemp-1m-c128
 
           GLM agentic_multi_decode (1P3D):
             glm-52-mxfp4-1p3d-cpp4-tp4-mtp5-agentic-lmcache-1m-c12,
