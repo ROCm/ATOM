@@ -8,10 +8,12 @@ import torch
 
 pytest.importorskip("aiter")
 
+from atom.distributed import ulysses_sp
 from atom.model_engine import model_runner as runner_module
 from atom.utils.forward_context import ForwardMode
 
 
+@pytest.mark.parametrize("sp_rank", [None, 0, 3])
 @pytest.mark.parametrize("mrope", [False, True])
 @pytest.mark.parametrize("dummy", [False, True])
 @pytest.mark.parametrize(
@@ -27,8 +29,20 @@ from atom.utils.forward_context import ForwardMode
     ],
 )
 def test_runner_model_height_and_sampling_rows(
-    monkeypatch, mrope, dummy, scheduled, running, seqs, q, unified, prefill, piecewise
+    monkeypatch,
+    sp_rank,
+    mrope,
+    dummy,
+    scheduled,
+    running,
+    seqs,
+    q,
+    unified,
+    prefill,
+    piecewise,
 ):
+    monkeypatch.setattr(ulysses_sp, "_SP_WORLD_SIZE", 1 if sp_rank is None else 4)
+    monkeypatch.setattr(ulysses_sp, "get_sp_rank", lambda: sp_rank or 0)
     runner = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
     runner.use_mrope = mrope
     runner.config = SimpleNamespace(prefill_context_parallel_size=1)
@@ -39,6 +53,7 @@ def test_runner_model_height_and_sampling_rows(
     pos = torch.full((32,), -99, dtype=torch.int64)
     pos[:scheduled] = torch.arange(11, scheduled + 11)
     runner.forward_vars = {
+        "sp_input_ids": torch.empty(8, dtype=ids.dtype),
         "input_ids": SimpleNamespace(gpu=ids),
         "positions": SimpleNamespace(gpu=pos),
         "mrope_positions": SimpleNamespace(gpu=torch.full((96,), -99)),
@@ -86,19 +101,34 @@ def test_runner_model_height_and_sampling_rows(
     )
     expected_rows = running if unified and not prefill else scheduled
 
+    def global_ids():
+        full = torch.zeros(expected_rows, dtype=ids.dtype)
+        full[:scheduled] = torch.arange(1, scheduled + 1)
+        return full
+
     class Model:
         def __call__(self, input_ids, model_positions):
-            assert input_ids.shape[0] == expected_rows
+            torch.testing.assert_close(
+                input_ids, ulysses_sp.sp_split_tokens(global_ids())
+            )
             assert model_positions.shape[-1] == expected_rows
-            torch.testing.assert_close(input_ids[:scheduled], ids[:scheduled])
             if expected_rows > scheduled:
-                assert torch.all(input_ids[scheduled:] == 0)
                 assert torch.all(model_positions[..., scheduled:] == 0)
             return input_ids[:, None].float()
 
         def compute_logits(self, hidden):
             assert hidden.shape[0] == scheduled
             return hidden + 1
+
+    if sp_rank is not None:
+
+        def gather_shards(local, total_tokens):
+            assert total_tokens == expected_rows
+            full = global_ids()[:, None].float()
+            torch.testing.assert_close(local, ulysses_sp.sp_split_tokens(full))
+            return full
+
+        monkeypatch.setattr(runner_module, "sp_gather_tokens", gather_shards)
 
     runner.model = Model()
     logits, hidden = runner.run_model(ids[:scheduled])

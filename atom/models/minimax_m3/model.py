@@ -33,10 +33,17 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from atom.model_ops.minimax_m3 import attention_fp8 as _attention_fp8
+from atom.model_ops.minimax_m3 import tp_o_proj as _tp_o_proj
+from atom.model_ops.minimax_m3.input_norm_fp8 import (
+    fused_m3_gemma_norm_fp8,
+    supports_m3_fused_gemma_fp8,
+)
 from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.sp_moe_sort import supports_m3_sp_tiled_sort
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
@@ -116,6 +123,33 @@ def _linear_consumes_per_token_fp8(linear: nn.Module) -> bool:
         quant_type_value == QuantType.per_Token.value
         and getattr(linear, "params_dtype", None) == dtypes.fp8
     )
+
+
+def _minimax_m3_attend_and_project(attn, o_proj, q, k, v, positions, qkv):
+    if getattr(attn, "_m3_tp_replicated_o_proj", False):
+        fp8_output = (
+            attn._m3_sp_fp8_output_supported
+            and q.dtype == torch.bfloat16
+            and _linear_consumes_per_token_fp8(o_proj)
+        )
+        output, scale = torch.ops.aiter.minimax_m3_tp_attention(
+            q, k, v, positions, attn.layer_name, qkv, fp8_output, 4
+        )
+        return o_proj(output, x_scale=scale if fp8_output else None)
+    # Keep one output schema for all token counts; the opaque custom op selects
+    # the measured transport at runtime, including when a graph is reused.
+    if (
+        getattr(attn, "_m3_sp_fp8_output_supported", False)
+        and q.dtype == torch.bfloat16
+        and q.shape[-1] == 8192
+        and o_proj.input_size == 8192
+        and _linear_consumes_per_token_fp8(o_proj)
+    ):
+        output, scale = torch.ops.aiter.minimax_m3_attention_fp8(
+            q, k, v, positions, attn.layer_name, qkv
+        )
+        return o_proj(output, x_scale=scale)
+    return o_proj(attn(q, k, v, positions=positions, qkv=qkv))
 
 
 def _minimax_m3_cos_sin_cache(
@@ -249,6 +283,7 @@ class MiniMaxM3MoE(nn.Module):
     ) -> None:
         super().__init__()
         del layer_id
+        self._tp_replicated_o_proj = _tp_o_proj.enabled()
         tp_size = get_tensor_model_parallel_world_size()
         if tp_size > config.num_local_experts:
             raise ValueError(
@@ -295,6 +330,9 @@ class MiniMaxM3MoE(nn.Module):
             # padded intermediate avoids backend pad-skip precision issues.
             self.experts.quant_method.intermediate_pad = 0
         self.experts.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
+        self.experts._sp_tiled_sort_enabled = supports_m3_sp_tiled_sort(
+            self.experts, tp_replicated_o_proj=self._tp_replicated_o_proj
+        )
         self.fuse_shared_experts = (
             getattr(self.experts, "num_fused_shared_experts", 0) > 0
         )
@@ -314,16 +352,25 @@ class MiniMaxM3MoE(nn.Module):
         hidden_states = hidden_states.view(-1, orig_shape[-1])
         router_logits = self.gate(hidden_states)
 
-        routed_output = self.experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-        )
+        if self._tp_replicated_o_proj:
+            routed_output = torch.ops.aiter.minimax_m3_tp_moe(
+                hidden_states, router_logits, self.experts.layer_name, 4
+            )
+        else:
+            routed_output = self.experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+            )
         if not self.fuse_shared_experts and self.routed_scaling_factor != 1.0:
             routed_output = routed_output * self.routed_scaling_factor
 
         if self.shared_experts is not None:
+            if self._tp_replicated_o_proj:
+                hidden_states = torch.ops.aiter.minimax_m3_tp_gather(hidden_states, 4)
             routed_output = routed_output + self.shared_experts(hidden_states)
 
+        if self._tp_replicated_o_proj:
+            return routed_output.view(-1, orig_shape[-1])
         return routed_output.view(orig_shape)
 
 
@@ -359,7 +406,8 @@ class MiniMaxM3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
-        self.o_proj = RowParallelLinear(
+        o_proj_cls = ReplicatedLinear if _tp_o_proj.enabled() else RowParallelLinear
+        self.o_proj = o_proj_cls(
             self.total_num_heads * self.head_dim,
             self.hidden_size,
             bias=False,
@@ -391,6 +439,12 @@ class MiniMaxM3Attention(nn.Module):
             k_norm=self.k_norm,
             prefix=f"{prefix}.attn",
         )
+        self.attn._m3_tp_replicated_o_proj = _tp_o_proj.enabled()
+        self.attn._m3_sp_fp8_output_supported = (
+            _attention_fp8.supports_m3_attention_fp8(
+                self.q_size, tp_replicated_o_proj=self.attn._m3_tp_replicated_o_proj
+            )
+        )
 
     def forward(
         self,
@@ -400,8 +454,9 @@ class MiniMaxM3Attention(nn.Module):
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        attn_output = self.attn(q, k, v, positions=positions, qkv=qkv)
-        return self.o_proj(attn_output)
+        return _minimax_m3_attend_and_project(
+            self.attn, self.o_proj, q, k, v, positions, qkv
+        )
 
 
 class MiniMaxM3SparseAttention(nn.Module):
@@ -485,7 +540,8 @@ class MiniMaxM3SparseAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
-        self.o_proj = RowParallelLinear(
+        o_proj_cls = ReplicatedLinear if _tp_o_proj.enabled() else RowParallelLinear
+        self.o_proj = o_proj_cls(
             self.total_num_heads * self.head_dim,
             self.hidden_size,
             bias=False,
@@ -541,6 +597,12 @@ class MiniMaxM3SparseAttention(nn.Module):
             sparse_layer_ordinal=self.sparse_layer_ordinal,
             index_cache_dtype=index_cache_config,
         )
+        self.attn._m3_tp_replicated_o_proj = _tp_o_proj.enabled()
+        self.attn._m3_sp_fp8_output_supported = (
+            _attention_fp8.supports_m3_attention_fp8(
+                self.q_size, tp_replicated_o_proj=self.attn._m3_tp_replicated_o_proj
+            )
+        )
 
     def forward(
         self,
@@ -561,8 +623,9 @@ class MiniMaxM3SparseAttention(nn.Module):
             ],
             dim=-1,
         )
-        attn_output = self.attn(q, k, v, positions, qkv=qkv)
-        return self.o_proj(attn_output)
+        return _minimax_m3_attend_and_project(
+            self.attn, self.o_proj, q, k, v, positions, qkv
+        )
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
@@ -613,6 +676,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self._tp_replicated_o_proj = _tp_o_proj.enabled()
+        self._m3_fused_gemma_fp8 = supports_m3_fused_gemma_fp8(
+            config.hidden_size, tp_replicated_o_proj=self._tp_replicated_o_proj
+        )
 
     def forward(
         self,
@@ -621,9 +688,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         capture_aux: bool = False,
     ) -> (
-        tuple[torch.Tensor, torch.Tensor]
-        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        tuple[torch.Tensor, torch.Tensor | None]
+        | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]
     ):
+        tokens = hidden_states.shape[0]
         hidden_states_scale = None
         fuse_input_ar_rmsnorm_quant = _linear_consumes_per_token_fp8(
             self.self_attn.qkv_proj
@@ -632,9 +700,20 @@ class MiniMaxM3DecoderLayer(nn.Module):
             not self.is_moe_layer
             and _linear_consumes_per_token_fp8(self.mlp.gate_up_proj)
         )
-        if residual is None:
+        if self._m3_fused_gemma_fp8 and fuse_input_ar_rmsnorm_quant:
+            hidden_states, hidden_states_scale, residual = fused_m3_gemma_norm_fp8(
+                hidden_states,
+                self.input_layernorm.weight,
+                self.input_layernorm.variance_epsilon,
+                residual,
+            )
+        elif residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        elif self._tp_replicated_o_proj:
+            # The previous layer reduced only its increment; the replicated
+            # residual is added locally, outside QuickReduce quantization.
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
         elif fuse_input_ar_rmsnorm_quant:
             hidden_states, hidden_states_scale, residual = (
                 fused_allreduce_gemma_rms_norm_quant(
@@ -657,19 +736,50 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             hidden_states_scale=hidden_states_scale,
         )
-        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
-        if fuse_post_attention_ar_rmsnorm_quant:
-            hidden_states, hidden_states_scale, residual = (
+        attention_output = hidden_states
+        ffn_residual = (
+            torch.ops.aiter.minimax_m3_tp_local_residual(residual, 4)
+            if self._tp_replicated_o_proj
+            else residual
+        )
+        hidden_states_scale = None
+        if self._m3_fused_gemma_fp8 and fuse_post_attention_ar_rmsnorm_quant:
+            hidden_states, hidden_states_scale, ffn_residual = fused_m3_gemma_norm_fp8(
+                hidden_states,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
+                ffn_residual,
+            )
+        elif self._tp_replicated_o_proj:
+            hidden_states, ffn_residual = self.post_attention_layernorm(
+                hidden_states, ffn_residual
+            )
+        elif fuse_post_attention_ar_rmsnorm_quant:
+            hidden_states, hidden_states_scale, ffn_residual = (
                 fused_allreduce_gemma_rms_norm_quant(
-                    hidden_states, residual, self.post_attention_layernorm
+                    hidden_states, ffn_residual, self.post_attention_layernorm
                 )
             )
-            hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)
         else:
-            hidden_states, residual = fused_allreduce_gemma_rms_norm(
-                hidden_states, residual, self.post_attention_layernorm
+            hidden_states, ffn_residual = fused_allreduce_gemma_rms_norm(
+                hidden_states, ffn_residual, self.post_attention_layernorm
             )
-            hidden_states = ffn(hidden_states)
+
+        if self._tp_replicated_o_proj and not self.is_moe_layer:
+            # Dense FFN weights remain TP-sharded; MoE gathers inside its op.
+            hidden_states = torch.ops.aiter.minimax_m3_tp_gather(hidden_states, 4)
+            if hidden_states_scale is not None:
+                hidden_states_scale = torch.ops.aiter.minimax_m3_tp_gather(
+                    hidden_states_scale, 4
+                )
+        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
+        hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)
+        if self._tp_replicated_o_proj:
+            hidden_states = torch.ops.aiter.minimax_m3_tp_complete(
+                hidden_states, attention_output, tokens, 4
+            )
+        else:
+            residual = ffn_residual
         if aux_hidden_state is not None:
             return hidden_states, residual, aux_hidden_state
         return hidden_states, residual
@@ -686,6 +796,9 @@ class MiniMaxM3Model(nn.Module):
         super().__init__()
         config = _get_text_config(atom_config.hf_config)
         self.config = config
+        self._tp_replicated_o_proj = bool(
+            getattr(atom_config, "m3_tp_replicated_o_proj", False)
+        )
         cache_config = atom_config.kv_cache_dtype
         index_cache_config = atom_config.index_cache_dtype
         quant_config = atom_config.quant_config
@@ -765,9 +878,15 @@ class MiniMaxM3Model(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        hidden_states, _ = fused_allreduce_gemma_rms_norm(
-            hidden_states, residual, self.norm
-        )
+        if self._tp_replicated_o_proj:
+            if residual is None:
+                hidden_states = self.norm(hidden_states)
+            else:
+                hidden_states, _ = self.norm(hidden_states, residual)
+        else:
+            hidden_states, _ = fused_allreduce_gemma_rms_norm(
+                hidden_states, residual, self.norm
+            )
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states

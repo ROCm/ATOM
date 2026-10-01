@@ -6,7 +6,7 @@ from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from functools import lru_cache
+from functools import lru_cache, partial
 
 import torch
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
@@ -27,6 +27,13 @@ from atom.config import (
     Config,
     QuantizationConfig,
     get_current_atom_config,
+)
+from atom.distributed.ulysses_sp import (
+    _all_gather_tokens,
+    get_sp_world_size,
+    sp_is_enabled,
+    sp_moe_gather,
+    sp_moe_reduce_scatter,
 )
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
@@ -210,9 +217,15 @@ class FusedMoEParallelConfig:
     # The other half of --all2all-backend: which MoRI kernel family to ask for.
     low_latency: bool = False
 
+    # SP supplies distinct token shards to EP dispatchers at TP=1.
+    sp_shards_tokens: bool = False
+
     @property
     def selected_all2all_backend(self) -> str | None:
-        if self.dp_size <= 1 or not self.use_ep or self.dp_logical_ratio != 1:
+        # Routed dispatch requires distinct token shards and real EP peers.
+        if not self.use_ep or self.dp_logical_ratio != 1:
+            return None
+        if self.dp_size <= 1 and not self.sp_shards_tokens:
             return None
         if self.requested_all2all_backend == "none":
             return None
@@ -267,10 +280,13 @@ class FusedMoEParallelConfig:
             enable_dp_attention or parallel_config.moe_ep_flatten_tp_across_dp
         )
 
-        # dp_logical, not dp_size_: with DP-attention simulated down to a single
-        # rank the real product is 1, but the deployment being reproduced still
-        # shards experts, so EP must stay on.
-        use_ep = dp_logical * tp_size_ > 1 and parallel_config.enable_expert_parallel
+        # Include simulated DP and SP ranks when deciding whether experts can
+        # shard. SP folds into MoE TP below unless EP is explicitly enabled.
+        sp_size = get_sp_world_size()
+        use_ep = (
+            dp_logical * tp_size_ * sp_size > 1
+            and parallel_config.enable_expert_parallel
+        )
 
         dp_size = dp_size_
         dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
@@ -295,12 +311,11 @@ class FusedMoEParallelConfig:
             get_prefill_context_model_parallel_world_size,
         )
 
-        pcp_merge = (
-            envs.ATOM_PCP_MOE_MERGE
-            and get_prefill_context_model_parallel_world_size() > 1
-        )
+        pcp_size = get_prefill_context_model_parallel_world_size()
+        # SP always shards MoE weights over the PCP rank dimension. Ordinary
+        # PCP makes that fold optional.
+        pcp_merge = pcp_size > 1 and (envs.ATOM_PCP_MOE_MERGE or sp_is_enabled())
         if pcp_merge:
-            pcp_size = get_prefill_context_model_parallel_world_size()
             pcp_rank = get_prefill_context_model_parallel_rank()
             tp_rank = pcp_rank * tp_size + tp_rank
             tp_size = pcp_size * tp_size
@@ -339,42 +354,12 @@ class FusedMoEParallelConfig:
                 dp_logical // dp_size if flatten_tp_across_dp_for_moe else 1
             ),
             local_ep_size=atom_config.parallel_config.data_parallel_size_local
-            * tp_size_,
+            * tp_size_
+            * sp_size,
             requested_all2all_backend=requested_all2all_backend,
             low_latency=low_latency,
+            sp_shards_tokens=sp_size > 1 and tp_size_ == 1,
         )
-
-
-def naive_multicast_fake(
-    x: torch.Tensor, cu_tokens_across_dp_cpu: torch.Tensor
-) -> torch.Tensor:
-    assert len(x.shape) == 2
-    # print(f"cu_tokens_across_dp_cpu: {cu_tokens_across_dp_cpu}")
-    buffer = torch.empty(
-        (cu_tokens_across_dp_cpu[-1], x.size(1)), device=x.device, dtype=x.dtype
-    )
-    return buffer
-
-
-@torch_compile_guard()
-def naive_multicast(
-    x: torch.Tensor, cu_tokens_across_dp_cpu: torch.Tensor
-) -> torch.Tensor:
-    dp_rank = get_dp_group().rank_in_group
-    assert len(x.shape) == 2
-    # print(f"cu_tokens_across_dp_cpu: {cu_tokens_across_dp_cpu}")
-    buffer = torch.empty(
-        (cu_tokens_across_dp_cpu[-1], x.size(1)), device=x.device, dtype=x.dtype
-    )
-
-    start = 0 if dp_rank == 0 else cu_tokens_across_dp_cpu[dp_rank - 1]
-    end = cu_tokens_across_dp_cpu[dp_rank]
-    buffer[start:end, :].copy_(x)
-    for idx in range(get_dp_group().world_size):
-        start = 0 if idx == 0 else cu_tokens_across_dp_cpu[idx - 1]
-        end = cu_tokens_across_dp_cpu[idx]
-        get_dp_group().broadcast(buffer[start:end, :], idx)
-    return buffer
 
 
 def pad_for_all_gather(x: torch.Tensor) -> tuple[torch.Tensor, int]:
@@ -611,6 +596,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             ),
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
+            shared_experts_fused=layer.num_fused_shared_experts > 0,
         )
         if layer.expert_layout.shared_is_routed:
             # EPLB places and records shared experts with routed experts.
@@ -1258,6 +1244,10 @@ class Nvfp4MoEMethod(FusedMoEMethodBase):
 class Mxfp4MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(moe)
+        # Keep cached layer references within this model's lifetime.
+        self._sp_input_can_prequantize = lru_cache(maxsize=64)(
+            self._sp_input_can_prequantize
+        )
         self.quant_config = quant_config
         self.quant_type = quant_config.quant_type
         self.quant_dtype = quant_config.quant_dtype
@@ -1837,6 +1827,123 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_scale=layer.w2_weight_scale,
         )
 
+    def _sp_input_can_prequantize(self, layer, tokens, dtype):
+        # Only move an existing, row-local FP4 quantization across the gather.
+        # Small batches and inline/ksplit kernels may consume BF16 directly.
+        if (
+            tokens < 8192
+            or dtype != torch.bfloat16
+            or self.quant_type != QuantType.per_1x32
+            or self.use_triton
+            or self.use_triton_ep
+            or self.fused_experts is not None
+            or layer.use_ep
+            or layer.custom_routing_function is not None
+            or layer.apply_router_weight_on_input
+            or layer.activation not in (ActivationType.Silu, ActivationType.Swiglu)
+            or layer.w13_input_scale is not None
+            or layer.hidden_size % 256
+            or get_gfx() != "gfx950"
+        ):
+            return False
+        from aiter.fused_moe import (
+            get_2stage_cfgs,
+            get_inter_dim,
+            get_padded_M,
+            resolve_activation_dtype,
+        )
+
+        w1, w2 = layer.w13_weight, layer.w2_weight
+        gate_mode = GateMode.INTERLEAVE if self.is_guinterleave else GateMode.SEPARATED
+        q_dtype = resolve_activation_dtype(
+            self.quant_type,
+            w1.dtype,
+            activation=layer.activation,
+            gate_mode=gate_mode,
+            M=tokens,
+            hidden_dtype=dtype,
+        )
+        if q_dtype != dtypes.fp4x2:
+            return False
+        experts, hidden, intermediate = get_inter_dim(w1.shape, w2.shape)
+        shuffled = getattr(w1, "is_shuffled", False) or getattr(
+            w2, "is_shuffled", False
+        )
+        config = get_2stage_cfgs(
+            get_padded_M(tokens),
+            hidden,
+            intermediate,
+            experts,
+            layer.top_k + layer.num_fused_shared_experts,
+            dtype,
+            q_dtype,
+            w1.dtype,
+            self.quant_type,
+            intermediate != w1.shape[1],
+            layer.activation,
+            False,
+            self.hidden_pad,
+            self.intermediate_pad,
+            shuffled,
+            gate_mode,
+            has_stage1_bias=layer.w13_bias is not None,
+            has_stage2_bias=layer.w2_bias is not None,
+            swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
+            opus_weights_shuffled=getattr(w1, "is_shuffled", False)
+            and getattr(w2, "is_shuffled", False),
+        )
+        return config.prequant and not config.run_1stage and config.ksplit <= 1
+
+    def gather_sp_input(self, layer, x, *, token_group=None):
+        world = get_sp_world_size() if token_group is None else token_group.world_size
+        gather = (
+            sp_moe_gather
+            if token_group is None
+            else partial(_all_gather_tokens, group=token_group)
+        )
+        if not self._sp_input_can_prequantize(layer, x.shape[0] * world, x.dtype):
+            return gather(x), None
+        quantized, scale = get_hip_quant(self.quant_type)(
+            x, quant_dtype=dtypes.fp4x2, shuffle=False
+        )
+        # Bitwise BF16 views let the custom all-gather copy FP4/E8M0 bytes.
+        # No conversion or floating-point arithmetic occurs in the gather.
+        quantized = gather(quantized.view(torch.bfloat16)).view(dtypes.fp4x2)
+        scale = gather(scale.view(torch.bfloat16)).view(dtypes.fp8_e8m0)
+        return quantized, scale
+
+    def gather_sp_routed_input(self, layer, x, router_logits, *, token_group=None):
+        """Move row-local routing before the SP gather, retaining all route bits.
+
+        The caller only selects this path for the existing non-EP external-FP4
+        kernel configuration. EPLB/dispatch remapping must remain disabled:
+        those operations can depend on the global token position and rank.
+        """
+        weights, ids = self.select_experts_with_record(
+            layer=layer,
+            hidden_states=x,
+            router_logits=router_logits,
+            use_grouped_topk=layer.use_grouped_topk,
+            top_k=layer.top_k,
+            renormalize=layer.renormalize,
+            topk_group=layer.topk_group,
+            num_expert_group=layer.num_expert_group,
+            global_num_experts=layer.global_num_experts,
+            custom_routing_function=layer.custom_routing_function,
+            scoring_func=layer.scoring_func,
+            e_score_correction_bias=layer.e_score_correction_bias,
+            fused_shared_experts_scoring_func=layer.shared_expert_scoring_func,
+        )
+        quantized, scale = self.gather_sp_input(layer, x, token_group=token_group)
+        gather = (
+            sp_moe_gather
+            if token_group is None
+            else partial(_all_gather_tokens, group=token_group)
+        )
+        weights = gather(weights)
+        ids = gather(ids.view(torch.bfloat16)).view(torch.int32)
+        return quantized, scale, weights, ids
+
     @mark_trace
     def apply(
         self,
@@ -1857,6 +1964,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         fused_shared_experts_scoring_func: str | None = None,
         activation: ActivationType = ActivationType.Silu,
         prefix: str = "",
+        sp_input_scale: torch.Tensor | None = None,
+        sp_topk: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         # ATOM_USE_TRITON_MOE_DECODE splits the two kernels by phase: the weights
         # sit in the FlyDSL layout, so prefill falls through to the FlyDSL tail
@@ -2036,22 +2145,29 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 act_quant=self.act_quant,
             )
 
-        topk_weights, topk_ids = self.select_experts_with_record(
-            layer=layer,
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            global_num_experts=global_num_experts,
-            custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            e_score_correction_bias=e_score_correction_bias,
-            fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
+        if sp_topk is None:
+            topk_weights, topk_ids = self.select_experts_with_record(
+                layer=layer,
+                hidden_states=x,
+                router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                global_num_experts=global_num_experts,
+                custom_routing_function=custom_routing_function,
+                scoring_func=scoring_func,
+                e_score_correction_bias=e_score_correction_bias,
+                fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
+            )
+        else:
+            topk_weights, topk_ids = sp_topk
+        a1_scale = (
+            sp_input_scale
+            if sp_input_scale is not None
+            else getattr(layer, "w13_input_scale", None)
         )
-        a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
         moe_extra_args = {
             "gate_mode": (
@@ -2217,6 +2333,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 "flydsl fused_moe cannot serve as a fallback because the FlyDSL "
                 "scale layout is skipped under use_triton_ep."
             )
+            if getattr(layer, "_sp_tiled_sort_enabled", False):
+                moe_extra_args["use_tiled_sort"] = True
+            if sp_input_scale is not None:
+                moe_extra_args["dtype"] = torch.bfloat16
             return fused_moe(
                 x,
                 layer.w13_weight,
@@ -3489,11 +3609,7 @@ class FusedMoE(torch.nn.Module):
                 top_k=self.top_k,
                 tp_rank=self.ep_rank if self.use_ep else self.tp_rank,
                 tp_size=self.ep_size if self.use_ep else self.tp_size,
-                shared_experts_score=(
-                    1.0
-                    if is_rocm_aiter_fuse_routed_scaling_factor()
-                    else 1 / self.routed_scaling_factor
-                ),
+                shared_experts_score=self.shared_expert_weight,
                 max_num_tokens=moe_token_capacity,
                 is_EP=self.use_ep,
             )
@@ -3651,9 +3767,12 @@ class FusedMoE(torch.nn.Module):
 
     @property
     def shared_expert_weight(self) -> float:
-        if is_rocm_aiter_fuse_routed_scaling_factor():
-            return 1.0
-        return 1.0 / self.routed_scaling_factor
+        # Shared experts contribute once per token after the MoE reduction.
+        return (
+            1.0
+            if is_rocm_aiter_fuse_routed_scaling_factor()
+            else 1.0 / self.routed_scaling_factor
+        )
 
     @property
     def shared_dispatch_base(self) -> int:
@@ -5007,7 +5126,12 @@ class FusedMoE(torch.nn.Module):
         num_fused_shared_experts: int = 0,
         fused_shared_experts_scoring_func: str | None = None,
         routed_scaling_factor: float = 1.0,
+        shared_experts_fused: bool | None = None,
     ):
+        # Dispatch layouts append shared columns after routing, so a zero-width
+        # AITER shared buffer does not imply the model applies the routed scale.
+        if shared_experts_fused is None:
+            shared_experts_fused = num_fused_shared_experts > 0
 
         # custom_routing_function takes precedence (e.g. DeepSeek-V4 hash routing
         # in the first 3 layers, where topk_ids are looked up from a per-token
@@ -5090,7 +5214,7 @@ class FusedMoE(torch.nn.Module):
                 # experts are not fused; DeepSeek-V4 folds it into routing.
                 route_scale = (
                     routed_scaling_factor
-                    if fuse_shared or scoring_func == "sqrtsoftplus"
+                    if shared_experts_fused or scoring_func == "sqrtsoftplus"
                     else 1.0
                 )
                 topk_gating(
@@ -5258,20 +5382,76 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
-    def forward_impl(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        *,
+        token_group=None,
+    ):
         assert self.quant_method is not None
+
+        # Explicit TP token gathering for M3's replicated-o_proj experiment.
+        # Its caller adds the owner's attention output and all-reduces the sum;
+        # the ordinary SP branch below still reduces back to local tokens.
+        if token_group is not None:
+            assert get_dp_group().world_size == 1 and not sp_is_enabled()
+            assert not self.moe_parallel_config.use_all2all_kernels
+            assert not self.reduce_results and not self.use_ep
 
         if get_dp_group().world_size > 1:
             return self.forward_impl_graph(hidden_states, router_logits)
 
-        dp_group = get_dp_group()
-        if dp_group.world_size > 1:
-            cu_tokens_across_dp_cpu = (
-                get_forward_context().dp_metadata.cu_tokens_across_dp_cpu
+        # Gather SP token shards for local expert computation, then sum partials
+        # back to each owner. Routed all2all handles token movement itself.
+        sp_moe = sp_is_enabled() and not self.moe_parallel_config.use_all2all_kernels
+        sp_input_kwargs = {}
+        if sp_moe or token_group is not None:
+            world = (
+                get_sp_world_size() if token_group is None else token_group.world_size
             )
-
-            hidden_states = naive_multicast(hidden_states, cu_tokens_across_dp_cpu)
-            router_logits = naive_multicast(router_logits, cu_tokens_across_dp_cpu)
+            gather = (
+                sp_moe_gather
+                if token_group is None
+                else partial(_all_gather_tokens, group=token_group)
+            )
+            mxfp4_input = (
+                type(self.quant_method) is Mxfp4MoEMethod
+                and self.moe_parallel_config.dp_logical_ratio == 1
+            )
+            local_topk = (
+                mxfp4_input
+                and not self.use_ep
+                and not self.expert_layout.shared_is_routed
+                and not self.use_grouped_topk
+                and self.scoring_func == "sigmoid"
+                and hidden_states.shape[0] * world >= 32768
+                and self.quant_method._sp_input_can_prequantize(
+                    self,
+                    hidden_states.shape[0] * world,
+                    hidden_states.dtype,
+                )
+            )
+            if local_topk:
+                hidden_states, input_scale, weights, ids = (
+                    self.quant_method.gather_sp_routed_input(
+                        self,
+                        hidden_states,
+                        router_logits,
+                        token_group=token_group,
+                    )
+                )
+                sp_input_kwargs["sp_input_scale"] = input_scale
+                sp_input_kwargs["sp_topk"] = (weights, ids)
+            elif mxfp4_input:
+                hidden_states, input_scale = self.quant_method.gather_sp_input(
+                    self, hidden_states, token_group=token_group
+                )
+                sp_input_kwargs["sp_input_scale"] = input_scale
+            else:
+                hidden_states = gather(hidden_states)
+            if not local_topk:
+                router_logits = gather(router_logits)
 
         # Simulated DP with no peers to gather from: the absent ranks' token
         # shards are stood in for locally, same as after the gather in
@@ -5301,19 +5481,14 @@ class FusedMoE(torch.nn.Module):
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
             prefix=f"{self.prefix}.fused_moe",
+            **sp_input_kwargs,
         )
 
         if dp_repeat > 1:
             final_hidden_states = final_hidden_states[:local_rows]
 
-        dp_group = get_dp_group()
-        if dp_group.world_size > 1:
-            dp_rank = dp_group.rank_in_group
-            start = 0 if dp_rank == 0 else cu_tokens_across_dp_cpu[dp_rank - 1]
-            end = cu_tokens_across_dp_cpu[dp_rank]
-
-            all_hidden_states = get_dp_group().all_reduce(final_hidden_states)
-            final_hidden_states = all_hidden_states[start:end, :]
+        if sp_moe:
+            final_hidden_states = sp_moe_reduce_scatter(final_hidden_states)
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             # Default set to False. (May have to add shared expert outputs.)

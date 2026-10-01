@@ -52,6 +52,7 @@ def test_supported_deployment_has_no_refusal(native):
     "overrides, reason",
     [
         ({"tensor_parallel_size": 8}, "TP 8"),
+        ({"m3_tp_replicated_o_proj": True}, "replicated o_proj"),
         ({"parallel_config": SimpleNamespace(data_parallel_size=2)}, "DP"),
         ({"pipeline_parallel_size": 2}, "PP"),
         ({"kv_cache_dtype": "bf16"}, "kv cache"),
