@@ -254,22 +254,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the gfx1250-capable path. Only takes effect when the mori all2all path is
     # active (dp_size>1 + expert-parallel + mori installed).
     "ATOM_MORI_V2": lambda: os.getenv("ATOM_MORI_V2", "0") == "1",
-    # MegaMoE stage 2 (gemm2-fused EP combine): the grouped gemm2 epilogue
-    # P2P-writes its weighted per-(token,k) results straight into the peers'
-    # combine staging, so combine only barriers + sums. Requires the mxfp4 weight
-    # path; ignored unless ATOM_MORI_V2 is on.
-    # This also selects the transport: 1 binds aiter's MegaMoEGfx1250, which owns
-    # the fused dispatch/combine pair, 0 binds mori's v2 op-layer running plain
-    # gather, i.e. the untouched upstream baseline. Formerly ATOM_MORI_V2_FUSED.
+    # MegaMoE stage 2 (aiter stage2_fused), i.e. which combine aiter's
+    # MegaMoEGfx1250 runs. 1: the grouped gemm2 epilogue P2P-writes its weighted
+    # per-(token,k) results straight into the peers' combine staging, so combine
+    # only barriers + sums. 0: fused_moe returns its per-recv-token rows and
+    # mori's combine gathers them (bf16) or pushes them as MXFP4 (fp4 wire).
+    # MegaMoE runs the layer either way, so both need the mxfp4 weight path;
+    # ignored unless ATOM_MORI_V2 is on. Formerly ATOM_MORI_V2_FUSED.
     "ATOM_MEGA_STAGE2_FUSED": lambda: (os.getenv("ATOM_MEGA_STAGE2_FUSED", "1") == "1"),
     # MegaMoE combine (return-trip) wire: bf16 | fp8 | fp4. Prefill-only; decode
-    # always combines in bf16. Ignored unless ATOM_MEGA_STAGE2_FUSED is on.
+    # combines in bf16 unless ATOM_MEGA_DECODE_COMBINE_QUANT is on. With
+    # ATOM_MEGA_STAGE2_FUSED=0 mori's combine has no fp8 wire, so only bf16 | fp4.
     "ATOM_MEGA_COMBINE_WIRE": lambda: os.getenv("ATOM_MEGA_COMBINE_WIRE", "bf16"),
-    # MegaMoE compact-plan stage 1 (aiter stage1_fused): routing/layout planning
-    # fused with a flydsl TDM dispatch that writes the grouped GEMM's per-expert
-    # rows directly. Needs ATOM_MEGA_STAGE2_FUSED and an fp8/fp4
-    # MEGA_DISPATCH_WIRE; a bf16 wire keeps the token-major path regardless of
-    # this flag.
+    # Decode steps combine on ATOM_MEGA_COMBINE_WIRE too, rather than bf16. No
+    # effect on a bf16 ATOM_MEGA_COMBINE_WIRE, or on steps the Triton experts
+    # run (their combine is bf16 only).
+    "ATOM_MEGA_DECODE_COMBINE_QUANT": lambda: (
+        os.getenv("ATOM_MEGA_DECODE_COMBINE_QUANT", "0") == "1"
+    ),
+    # MegaMoE stage 1 (aiter stage1_fused), i.e. which dispatch MegaMoEGfx1250
+    # runs. 1: the compact plan -- routing/layout planning fused with a flydsl
+    # TDM dispatch that writes the grouped GEMM's per-expert rows directly.
+    # 0: mori's token-major dispatch. Needs ATOM_MEGA_STAGE2_FUSED=1 and an
+    # fp8/fp4 MEGA_DISPATCH_WIRE; otherwise it is ignored and dispatch runs on
+    # mori.
     "ATOM_MEGA_STAGE1_FUSED": lambda: (os.getenv("ATOM_MEGA_STAGE1_FUSED", "1") == "1"),
     # Reuse a small MegaMoEV2 instance for native DP-unified small decode/
     # verify/draft forwards on the supported EP8, 48-experts-per-rank layout. Set to 0
