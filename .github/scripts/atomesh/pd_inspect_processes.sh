@@ -3,6 +3,11 @@ set -euo pipefail
 
 job_id="${1:?existing Slurm job ID required}"
 [[ "${job_id}" =~ ^[0-9]+$ ]]
+expected_node="${2:-}"
+if [[ -n "${expected_node}" && "$(hostname -s)" != "${expected_node%%.*}" ]]; then
+  printf 'Node selection mismatch: expected=%s actual=%s\n' "${expected_node}" "$(hostname -s)"
+  exit 2
+fi
 hostname
 date -u
 grep -E '^(MemTotal|MemFree|MemAvailable|SwapTotal|SwapFree|Mlocked|Unevictable):' /proc/meminfo
