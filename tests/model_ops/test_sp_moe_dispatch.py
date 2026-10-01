@@ -108,13 +108,15 @@ def test_forward_selects_local_routing_by_capability(
     assert method.apply.call_args.kwargs["sp_input_scale"] is scale
     scatter.assert_called_once_with(gathered)
     if local_routing:
-        method.gather_sp_routed_input.assert_called_once_with(layer, hidden, logits)
+        method.gather_sp_routed_input.assert_called_once_with(
+            layer, hidden, logits, token_group=None
+        )
         method.gather_sp_input.assert_not_called()
         gather.assert_not_called()
         assert method.apply.call_args.kwargs["sp_topk"] == (weights, ids)
     else:
         method.gather_sp_routed_input.assert_not_called()
-        method.gather_sp_input.assert_called_once_with(layer, hidden)
+        method.gather_sp_input.assert_called_once_with(layer, hidden, token_group=None)
         gather.assert_called_once_with(logits)
         assert "sp_topk" not in method.apply.call_args.kwargs
 

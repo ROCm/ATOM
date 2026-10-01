@@ -7,8 +7,6 @@ attention producer owns only a head shard, so its local amax must be exchanged
 before quantization. Quantizing shards independently would change that contract.
 """
 
-from functools import partial
-
 import torch
 import triton
 import triton.language as tl
@@ -25,19 +23,15 @@ from atom.distributed.ulysses_sp import (
 from atom.utils import mark_spliting_op
 
 
-def supports_m3_attention_fp8(
-    query_width: int, *, tp_replicated_o_proj: bool = False
-) -> bool:
-    """Select the validated SP4 layout on gfx950 during model construction.
+def supports_m3_fp8_layout(*, tp_replicated_o_proj: bool = False) -> bool:
+    """Check the shared SP4/replicated-TP4 FP8 requirements at construction.
 
-    Cache this boolean on the attention module: querying the architecture from
-    forward would introduce a graph break. Online weight quantization happens
-    after construction, so the o_proj quantization contract is checked later.
+    Cache on the model layer: querying the architecture from forward would
+    introduce a graph break. Each caller checks its own shape and quantizer.
     """
     if (
         not torch.cuda.is_available()
         or get_sp_world_size() != (1 if tp_replicated_o_proj else 4)
-        or query_width != (2048 if tp_replicated_o_proj else 8192)
         or dtypes.fp8 != torch.float8_e4m3fn
     ):
         return False
@@ -51,6 +45,14 @@ def supports_m3_attention_fp8(
         and get_tensor_model_parallel_world_size() == (4 if tp_replicated_o_proj else 1)
         and get_current_atom_config().torch_dtype == torch.bfloat16
         and get_gfx_runtime() == "gfx950"
+    )
+
+
+def supports_m3_attention_fp8(
+    query_width: int, *, tp_replicated_o_proj: bool = False
+) -> bool:
+    return query_width == (2048 if tp_replicated_o_proj else 8192) and (
+        supports_m3_fp8_layout(tp_replicated_o_proj=tp_replicated_o_proj)
     )
 
 
@@ -159,16 +161,6 @@ def gather_heads_fp8(x: torch.Tensor, group=None) -> tuple[torch.Tensor, torch.T
     """
     x = x.reshape(x.shape[0], -1)
     world = get_sp_world_size() if group is None else group.world_size
-    gather_heads = (
-        ulysses_gather_heads
-        if group is None
-        else partial(ulysses_gather_heads, group=group)
-    )
-    gather_tokens = (
-        _all_gather_tokens
-        if group is None
-        else partial(_all_gather_tokens, group=group)
-    )
     assert world > 1 and x.shape[1] % 2 == 0
     # Piecewise compilation reuses the initially traced graph at other token
     # counts. Keep this runtime choice inside the opaque attention op so decode
@@ -176,32 +168,37 @@ def gather_heads_fp8(x: torch.Tensor, group=None) -> tuple[torch.Tensor, torch.T
     if x.shape[0] // world < 2048:
         from aiter.ops.quant import per_token_quant_hip
 
-        return per_token_quant_hip(gather_heads(x), quant_dtype=dtypes.fp8)
-    amax = gather_tokens(head_amax(x))
+        return per_token_quant_hip(
+            ulysses_gather_heads(x, group=group), quant_dtype=dtypes.fp8
+        )
+    amax = _all_gather_tokens(head_amax(x), group=group)
     from atom.distributed.sp_head_exchange import (
         exchange_heads,
         head_exchange_communicator,
     )
     from atom.distributed.sp_registered_buffer import registered_input_view
 
-    ca = (
-        head_exchange_communicator(x)
-        if group is None
-        else head_exchange_communicator(x, group=group)
-    )
-    group = get_sp_group() if group is None else group
+    ca = head_exchange_communicator(x, group=group)
+    comm_group = get_sp_group() if group is None else group
     scratch = (
-        registered_input_view(group, x.shape, dtypes.fp8) if ca is not None else None
+        registered_input_view(comm_group, x.shape, dtypes.fp8)
+        if ca is not None
+        else None
     )
-    if scratch is not None:
-        q, scale = quantize_with_gathered_amax(
-            x, amax, world, group.rank_in_group, out=scratch[0]
-        )
-        output = exchange_heads(q.view(torch.bfloat16), ca, registered=True)
-        return output.view(dtypes.fp8), scale
-    q, scale = quantize_with_gathered_amax(x, amax, world, group.rank_in_group)
-    output = gather_heads(q.view(torch.bfloat16)).view(dtypes.fp8)
-    return output, scale
+    q, scale = quantize_with_gathered_amax(
+        x,
+        amax,
+        world,
+        comm_group.rank_in_group,
+        out=scratch[0] if scratch is not None else None,
+    )
+    payload = q.view(torch.bfloat16)
+    output = (
+        exchange_heads(payload, ca, registered=True)
+        if scratch is not None
+        else ulysses_gather_heads(payload, group=group)
+    )
+    return output.view(dtypes.fp8), scale
 
 
 def _attention_fp8_fake(
