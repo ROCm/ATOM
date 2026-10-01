@@ -17,6 +17,56 @@ SPEC.loader.exec_module(pd_matrix)
 
 
 class NodeSelectionTest(unittest.TestCase):
+    def test_pr58968_inspection_hashes_configs_without_gpu_work(self):
+        import hashlib
+        import tempfile
+
+        import yaml
+
+        workflow = SCRIPT.parents[2] / "workflows/atomesh-benchmark.yaml"
+        config = yaml.safe_load(workflow.read_text())
+        step = next(
+            step
+            for step in config["jobs"]["inspect-run"]["steps"]
+            if step.get("name") == "Hash PR58968 model configurations"
+        )
+        self.assertEqual(step["if"], "${{ inputs.inspect_run_id == '36845669971' }}")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            command = step["run"]
+            expected = []
+            for index, model in enumerate(
+                ("moonshotai/Kimi-K3", "Inferact/Kimi-K3-DSpark")
+            ):
+                source = root / f"config-{index}.json"
+                data = f'{{"model": "{model}"}}\n'.encode()
+                source.write_bytes(data)
+                expected.append(hashlib.sha256(data).hexdigest())
+                command = command.replace(
+                    f"/share_nfs/models/{model}/config.json", str(source)
+                )
+            result = subprocess.run(
+                ["bash", "-c", command],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            hashes = (root / "inspection/model-configs/SHA256SUMS").read_text()
+            self.assertEqual(
+                [line.split()[0] for line in hashes.splitlines()], expected
+            )
+            source.unlink()
+            result = subprocess.run(
+                ["bash", "-c", command],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+
     def build_cell(
         self,
         runner="atomesh-cicd",

@@ -313,6 +313,16 @@ jobs:
             echo "::warning::No shared log directory found for run ${SOURCE_RUN_ID}"
           fi
           find inspection -type f -printf '%P %s bytes\n'
+      - name: Hash PR58968 model configurations
+        if: ${{ inputs.inspect_run_id == '36845669971' }}
+        run: |
+          set -euo pipefail
+          mkdir -p inspection/model-configs
+          date -u > inspection/model-configs/collected-at.txt
+          sha256sum \
+            /share_nfs/models/moonshotai/Kimi-K3/config.json \
+            /share_nfs/models/Inferact/Kimi-K3-DSpark/config.json \
+            > inspection/model-configs/SHA256SUMS
       - uses: actions/upload-artifact@v4
         if: always()
         with:
