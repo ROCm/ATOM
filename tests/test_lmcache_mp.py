@@ -46,6 +46,8 @@ def _config(
     model_type: str = "test_model",
     tp: int = 2,
     pp: int = 1,
+    pp_rank: int = 0,
+    layers: int = 2,
     dcp: int = 1,
     pcp: int = 1,
     dp: int = 1,
@@ -59,7 +61,7 @@ def _config(
 ) -> SimpleNamespace:
     hf_config = SimpleNamespace(
         model_type=model_type,
-        num_hidden_layers=2,
+        num_hidden_layers=layers,
         num_attention_heads=16,
         num_key_value_heads=4,
         hidden_size=2048,
@@ -84,6 +86,7 @@ def _config(
             data_parallel_size=dp,
             data_parallel_size_local=dp if dp_local is None else dp_local,
             data_parallel_rank=dp_rank,
+            pipeline_parallel_rank=pp_rank,
         ),
         kv_transfer_config={
             "kv_connector": "lmcache_mp",
@@ -96,7 +99,6 @@ def _config(
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
-        ({"pp": 2}, "does not support PP"),
         ({"dcp": 2}, "does not support DCP"),
         ({"pcp": 2}, "does not support PCP"),
         ({"dp": 2, "dp_local": 1}, "only within one host"),
@@ -191,7 +193,7 @@ def test_worker_adapter_normalizes_transfer_mode(
         deployment, "_model_namespace", lambda _config, **_kwargs: "test"
     )
 
-    adapter = deployment._make_worker_adapter(_config(extra=extra), rank=1)
+    adapter = deployment._make_worker_adapter(_config(extra=extra), tp_rank=1)
 
     assert adapter.transfer_mode == expected
 
@@ -2006,3 +2008,417 @@ def test_merge_pages_appends_a_draft_and_takes_the_gcd_replication():
     assert [r.semantic_role for r in target.block_regions] == ["t", "d"]
     assert len(target.block_tensor_views) == 2
     assert target.tp_replication_factor == 1
+
+
+# ---------------------------------------------------------------------------
+# Pipeline parallelism: one LMCache kv rank group per PP stage
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_parallel_config(monkeypatch):
+    class AtomMPParallelConfig:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    adapter_module = types.ModuleType("lmcache.integration.atom")
+    adapter_module.AtomMPParallelConfig = AtomMPParallelConfig
+    monkeypatch.setitem(sys.modules, "lmcache.integration.atom", adapter_module)
+    return adapter_module
+
+
+def _with_draft(config, layers: int = 1):
+    config.speculative_config = SimpleNamespace(
+        method="mtp",
+        draft_model_hf_config=SimpleNamespace(num_nextn_predict_layers=layers),
+    )
+    return config
+
+
+def _stage_strategies(*, pp, tp, **kwargs):
+    """Every (pp_rank, tp_rank) worker strategy of one replica."""
+    return {
+        (pp_rank, tp_rank): deployment._parallel_strategy(
+            _config(pp=pp, pp_rank=pp_rank, tp=tp, layers=8, **kwargs), tp_rank
+        )
+        for pp_rank in range(pp)
+        for tp_rank in range(tp)
+    }
+
+
+def test_mp_config_accepts_pp():
+    assert deployment._validate_mp_config(_config(tp=1, pp=4, layers=8)) == (1, 4)
+
+
+def test_parallel_strategy_gives_each_pp4_tp1_stage_its_own_worker(
+    fake_parallel_config,
+):
+    strategies = _stage_strategies(pp=4, tp=1, kv_lora_rank=512)
+
+    assert {key[0]: s.worker_id for key, s in strategies.items()} == {
+        0: 0,
+        1: 1,
+        2: 2,
+        3: 3,
+    }
+    assert {s.world_size for s in strategies.values()} == {4}
+    assert {s.tp_size for s in strategies.values()} == {1}
+
+
+def test_parallel_strategy_collapses_mla_tp_ranks_inside_each_pp_stage(
+    fake_parallel_config,
+):
+    strategies = _stage_strategies(pp=2, tp=4, kv_lora_rank=512)
+
+    assert {key: s.worker_id for key, s in strategies.items()} == {
+        (pp_rank, tp_rank): pp_rank for pp_rank in range(2) for tp_rank in range(4)
+    }
+    assert {s.world_size for s in strategies.values()} == {2}
+    assert {s.tp_size for s in strategies.values()} == {4}
+
+
+def test_parallel_strategy_keeps_sharded_tp_ranks_inside_each_pp_stage(
+    fake_parallel_config,
+):
+    strategies = _stage_strategies(pp=2, tp=2)
+
+    assert {key: s.worker_id for key, s in strategies.items()} == {
+        (0, 0): 0,
+        (0, 1): 1,
+        (1, 0): 2,
+        (1, 1): 3,
+    }
+    assert {s.world_size for s in strategies.values()} == {4}
+
+
+@pytest.mark.parametrize("pp_rank", [-1, 2])
+def test_parallel_strategy_rejects_pp_rank_outside_the_pipeline(
+    fake_parallel_config, pp_rank
+):
+    with pytest.raises(ValueError, match="PP rank|pipeline_parallel_rank"):
+        deployment._parallel_strategy(_config(pp=2, pp_rank=pp_rank, layers=8), 0)
+
+
+def test_parallel_strategy_rejects_tp_rank_outside_the_stage(fake_parallel_config):
+    with pytest.raises(ValueError, match=r"TP rank 2 is outside \[0, 2\)"):
+        deployment._parallel_strategy(_config(pp=2, pp_rank=1, layers=8), 2)
+
+
+@pytest.mark.parametrize(
+    ("pp", "tp", "kv_lora_rank"),
+    [(4, 1, 512), (2, 4, 512), (2, 2, None)],
+)
+def test_scheduler_adapter_world_size_matches_every_worker(
+    fake_parallel_config, monkeypatch, pp, tp, kv_lora_rank
+):
+    """The server resolves a lookup's layout by ``(model_name, world_size)``."""
+
+    class AtomMPSchedulerAdapter:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    fake_parallel_config.AtomMPSchedulerAdapter = AtomMPSchedulerAdapter
+    monkeypatch.setattr(
+        deployment, "_model_namespace", lambda _config, **_kwargs: "test"
+    )
+    workers = _stage_strategies(pp=pp, tp=tp, kv_lora_rank=kv_lora_rank)
+    world_size = {s.world_size for s in workers.values()}
+    # Every stage builds a scheduler; only the head's looks up, with no worker
+    # id, so only its world size reaches the server.
+    schedulers = {
+        deployment._make_scheduler_adapter(
+            _config(
+                pp=pp,
+                pp_rank=pp_rank,
+                tp=tp,
+                layers=8,
+                kv_lora_rank=kv_lora_rank,
+                extra={"lmcache.mp.l2": "none"},
+            )
+        )
+        .kwargs["parallel_config"]
+        .world_size
+        for pp_rank in range(pp)
+    }
+
+    assert schedulers == world_size
+    assert {s.worker_id for s in workers.values()} == set(range(world_size.pop()))
+
+
+@pytest.fixture
+def stage_namespace(monkeypatch):
+    """Namespace of a config whose PAGE namespace sees only the PP x TP world."""
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    monkeypatch.setattr(
+        deployment.offcfg, "build_lmcache_config", lambda _kvc: object()
+    )
+    monkeypatch.setattr(
+        deployment.offcfg,
+        "build_page_namespace",
+        lambda _config, _lmcache_cfg, world: f"page-w{world}",
+    )
+    return deployment._model_namespace
+
+
+def test_pp4_tp1_and_pp1_tp4_do_not_share_a_namespace(stage_namespace):
+    pp4 = stage_namespace(_config(tp=1, pp=4, layers=8))
+    tp4 = stage_namespace(_config(tp=4, pp=1, layers=8))
+
+    # Both PAGE namespaces see world 4; only the stage layout tells them apart.
+    assert pp4.startswith("page-w4::lmcache-mp-v3::pp-")
+    assert tp4 == "page-w4::lmcache-mp-v3"
+    assert pp4 != tp4
+
+
+def test_layer_partition_changes_the_namespace(stage_namespace, monkeypatch):
+    config = _config(tp=1, pp=4, layers=8)
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "2,2,2,2")
+    even = stage_namespace(config)
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "3,2,2,1")
+    skewed = stage_namespace(config)
+
+    assert even != skewed
+
+
+def test_draft_layers_on_the_last_stage_change_the_namespace(stage_namespace):
+    plain = stage_namespace(_config(tp=1, pp=4, layers=8))
+    with_draft = stage_namespace(_with_draft(_config(tp=1, pp=4, layers=8)))
+
+    assert plain != with_draft
+
+
+def test_every_pp_stage_shares_one_namespace(stage_namespace):
+    namespaces = {
+        stage_namespace(_with_draft(_config(tp=1, pp=4, pp_rank=rank, layers=8)))
+        for rank in range(4)
+    }
+
+    assert len(namespaces) == 1
+
+
+def test_pp_stage_layout_counts_draft_layers_on_the_last_stage(monkeypatch):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "3,2,2,1")
+    layout = deployment._pp_stage_layout(
+        _with_draft(_config(tp=1, pp=4, layers=8, kv_lora_rank=512))
+    )
+
+    assert layout == {
+        "pp_size": 4,
+        "spans": [[0, 3], [3, 5], [5, 7], [7, 8]],
+        "draft_layers": 1,
+        "draft_shares_target_pool": True,
+        "stage_layers": [3, 2, 2, 2],
+    }
+
+
+def _pp_with_draft(**extra):
+    # 2/2/2/2 target layers plus one draft layer on the last stage.
+    return _with_draft(_config(tp=1, pp=4, layers=8, extra=extra))
+
+
+@pytest.fixture
+def even_partition(monkeypatch):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "2,2,2,2")
+
+
+def _no_probe(_url, **_kwargs):
+    raise AssertionError("must not probe the LMCache HTTP frontend")
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        pytest.param(
+            lambda: _pp_with_draft(**{"lmcache.mp.l2": "present"}), id="uneven-layers"
+        ),
+        # Equal layer counts do not prove equal PAGE layouts: GLM-5.2's index
+        # cache has rows only for non-"shared" indexer layers.
+        pytest.param(
+            lambda: _config(tp=1, pp=4, layers=8, extra={"lmcache.mp.l2": "present"}),
+            id="even-layers",
+        ),
+    ],
+)
+def test_l2_guard_refuses_pp_with_an_l2(even_partition, monkeypatch, config):
+    monkeypatch.setattr(deployment, "_fetch_l2_adapters", _no_probe)
+    with pytest.raises(NotImplementedError, match="4 PP stages cannot use"):
+        deployment._validate_pp_l2_layouts(config())
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        pytest.param(
+            lambda: _pp_with_draft(**{"lmcache.mp.l2": " None "}), id="l1-only-server"
+        ),
+        pytest.param(
+            lambda: _pp_with_draft(
+                **{
+                    "lmcache.mp.l2": "present",
+                    "lmcache.mp.server_per_rank_layouts": True,
+                }
+            ),
+            id="per-rank-layout-server",
+        ),
+        pytest.param(
+            lambda: _with_draft(_config(extra={"lmcache.mp.l2": "present"})),
+            id="no-pp",
+        ),
+    ],
+)
+def test_l2_guard_allows_layouts_the_server_cannot_confuse(
+    even_partition, monkeypatch, config
+):
+    monkeypatch.setattr(deployment, "_fetch_l2_adapters", _no_probe)
+    deployment._validate_pp_l2_layouts(config())
+
+
+class _FakeOpener:
+    """Stands in for ``urllib.request.build_opener`` and records its use."""
+
+    def __init__(self, respond):
+        self.respond = respond
+        self.handlers = []
+        self.opened = []
+
+    def build_opener(self, *handlers):
+        self.handlers.extend(handlers)
+        return self
+
+    def open(self, url, timeout):
+        self.opened.append((url, timeout))
+        return self.respond(url)
+
+
+def test_l2_guard_auto_refuses_an_unreachable_server(even_partition, monkeypatch):
+    import urllib.error
+    import urllib.request
+
+    def unreachable(_url):
+        raise urllib.error.URLError("connection refused")
+
+    opener = _FakeOpener(unreachable)
+    monkeypatch.setattr(urllib.request, "build_opener", opener.build_opener)
+    config = _pp_with_draft(**{"lmcache.mp.host": "tcp://cache-host"})
+
+    with pytest.raises(NotImplementedError, match="cannot list the server's L2"):
+        deployment._validate_pp_l2_layouts(config)
+    assert opener.opened == [("http://cache-host:8080/config/adapters", 5.0)]
+
+
+def test_l2_guard_probe_bypasses_environment_proxies(even_partition, monkeypatch):
+    import io
+    import json
+    import urllib.request
+
+    monkeypatch.setenv("http_proxy", "http://proxy.invalid:3128")
+    opener = _FakeOpener(lambda _url: io.BytesIO(json.dumps({"adapters": []}).encode()))
+    monkeypatch.setattr(urllib.request, "build_opener", opener.build_opener)
+
+    deployment._validate_pp_l2_layouts(_pp_with_draft())
+
+    (handler,) = opener.handlers
+    assert isinstance(handler, urllib.request.ProxyHandler)
+    assert handler.proxies == {}
+
+
+@pytest.mark.parametrize(
+    ("adapters", "refused"),
+    [([], False), ([{"type_name": "mooncake_store", "primary": True}], True)],
+)
+def test_l2_guard_auto_reads_the_server_adapter_list(
+    even_partition, monkeypatch, adapters, refused
+):
+    import io
+    import json
+    import urllib.request
+
+    def respond(url):
+        assert url == "http://cache-http:9090/config/adapters"
+        return io.BytesIO(json.dumps({"adapters": adapters}).encode())
+
+    opener = _FakeOpener(respond)
+    monkeypatch.setattr(urllib.request, "build_opener", opener.build_opener)
+    config = _pp_with_draft(**{"lmcache.mp.http_url": "cache-http:9090/"})
+
+    if refused:
+        with pytest.raises(NotImplementedError, match="mooncake_store"):
+            deployment._validate_pp_l2_layouts(config)
+    else:
+        deployment._validate_pp_l2_layouts(config)
+
+
+@pytest.mark.parametrize(
+    ("extra", "error"),
+    [
+        ({"lmcache.mp.l2": "maybe"}, ValueError),
+        ({"lmcache.mp.server_per_rank_layouts": "yes"}, TypeError),
+    ],
+)
+def test_l2_guard_rejects_bad_settings(even_partition, extra, error):
+    with pytest.raises(error, match=next(iter(extra))):
+        deployment._validate_pp_l2_layouts(_pp_with_draft(**extra))
+
+
+def test_adapter_factories_apply_the_l2_guard_before_connecting(
+    even_partition, fake_parallel_config, monkeypatch
+):
+    def connect(**_kwargs):
+        raise AssertionError("must not connect")
+
+    fake_parallel_config.AtomMPSchedulerAdapter = connect
+    fake_parallel_config.AtomMPWorkerAdapter = connect
+    monkeypatch.setattr(
+        deployment, "_model_namespace", lambda _config, **_kwargs: "test"
+    )
+    config = _pp_with_draft(**{"lmcache.mp.l2": "present"})
+
+    with pytest.raises(NotImplementedError, match="cannot use an LMCache L2"):
+        deployment._make_scheduler_adapter(config)
+    with pytest.raises(NotImplementedError, match="cannot use an LMCache L2"):
+        deployment._make_worker_adapter(config, 0)
+
+
+def test_worker_registers_with_its_pp_stage_worker_id(
+    fake_lmcache_modules, monkeypatch
+):
+    class AtomMPWorkerAdapter(_WorkerAdapter):
+        def __init__(self, **kwargs):
+            super().__init__()
+            self.kwargs = kwargs
+
+    sys.modules["lmcache.integration.atom"].AtomMPWorkerAdapter = AtomMPWorkerAdapter
+    aiter = types.ModuleType("aiter")
+    aiter.__path__ = []
+    dist = types.ModuleType("aiter.dist")
+    dist.__path__ = []
+    parallel_state = types.ModuleType("aiter.dist.parallel_state")
+    parallel_state.get_tp_group = lambda: SimpleNamespace(rank_in_group=0)
+    monkeypatch.setitem(sys.modules, "aiter", aiter)
+    monkeypatch.setitem(sys.modules, "aiter.dist", dist)
+    monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", parallel_state)
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    monkeypatch.setattr(
+        deployment, "_model_namespace", lambda _config, **_kwargs: "test"
+    )
+    logged = []
+    monkeypatch.setattr(
+        mp_worker.logger, "info", lambda message, *args: logged.append(message % args)
+    )
+
+    worker = mp_worker.LMCacheMPConnector(
+        _config(
+            model_type="ordinary_mha",
+            tp=1,
+            pp=4,
+            pp_rank=2,
+            layers=8,
+            extra={"lmcache.mp.l2": "none"},
+        )
+    )
+    worker.register_kv_caches({}, transfer_tensors=_transfer_tensors(), num_blocks=2)
+
+    parallel = worker._adapter.kwargs["parallel_config"]
+    assert (parallel.worker_id, parallel.world_size) == (2, 4)
+    assert worker._adapter.registered is not None
+    assert "pp_rank=2 kv_worker_id=2/4" in logged[-1]

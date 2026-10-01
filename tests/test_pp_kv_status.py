@@ -14,6 +14,10 @@ with stubbed_aiter():
         SaveSourceGroupId,
         StateStoreOperationId,
     )
+    from atom.kv_transfer.offload.chunked_scheduler import (
+        DENSE_PAGE_SOURCE_SAFE_CHANNEL,
+        DENSE_PAGE_STORE_CHANNEL,
+    )
     from atom.model_engine.pp_engine_core import PPEngineCoreProc
 
 
@@ -234,6 +238,61 @@ def test_aggregator_rejects_bad_pp_size():
         PPKVAggregator(0)
 
 
+def test_pp4_save_quorum_emits_each_dense_page_key_once_in_any_order():
+    """Regression guard for an assumption lmcache_mp under PP relies on.
+
+    Not lmcache_mp code: the in-process connector reports on the same DENSE_PAGE
+    channels. Four PP stages report one save out of order and stage 2 fails.
+    Each stage reports its per-chunk source-safe keys early and the rest with
+    its terminal store. Each key is emitted once, when the last stage reports
+    it, and the store verdict is the AND across stages.
+    """
+    op = SaveOperationId("7", 1)
+
+    def source_safe(*token_range):
+        return ConnectorCompletion(
+            DENSE_PAGE_SOURCE_SAFE_CHANNEL, SaveSourceGroupId(op, (token_range,)), True
+        )
+
+    def terminal(succeeded, *chunks):
+        return KVConnectorOutput(
+            finished_saving={op},
+            connector_completions={
+                ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, op, succeeded),
+                *(source_safe(*chunk) for chunk in chunks),
+            },
+        )
+
+    def early(*chunks):
+        return KVConnectorOutput(
+            connector_completions={source_safe(*chunk) for chunk in chunks}
+        )
+
+    agg = PPKVAggregator(4)
+    reports = [
+        (2, early((0, 8))),
+        (0, terminal(True, (0, 8), (8, 16))),
+        (3, early((0, 8))),
+        (2, terminal(False, (8, 16))),
+        (1, early((0, 8), (8, 16))),
+        (3, terminal(True, (8, 16))),
+        (1, terminal(True)),
+    ]
+    outputs = [agg.ingest(rank, output) for rank, output in reports]
+
+    assert [out.finished_saving for out in outputs] == [set()] * 6 + [{op}]
+    assert [out.connector_completions for out in outputs] == [
+        set(),
+        set(),
+        set(),
+        set(),
+        {source_safe(0, 8)},
+        {source_safe(8, 16)},
+        {ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, op, False)},
+    ]
+    assert agg.has_pending() is False
+
+
 def test_an_abandoned_save_releases_its_partial_quorum():
     """`forget`: the aggregator's terminal for a report that is not coming.
 
@@ -412,3 +471,61 @@ def test_the_pp_head_gives_the_aggregator_the_scheduler_s_verdict():
 
     proc.scheduler.on_save_abandoned(3)
     assert proc.has_pending_kv_work() is False
+
+
+def test_a_stalled_send_does_not_starve_an_lmcache_mp_save_of_its_reports():
+    """multi[mooncake producer, lmcache_mp] under PP4.
+
+    The send stalls past the abandon window while the MP save is in flight.
+    The scheduler abandons the save (a no-op for MP), but must not make the
+    PP quorum drop the request's later stage reports: MP releases its lease
+    only on that terminal report and fails stop at its deadline without one.
+    """
+    import time
+
+    from atom.kv_transfer.disaggregation.multi.multi_connector import (
+        MultiConnectorScheduler,
+    )
+    from atom.model_engine.scheduler import Scheduler
+
+    operation = SaveOperationId("1", 1)
+    store = ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, operation, True)
+    report = KVConnectorOutput(
+        finished_saving={operation}, connector_completions={store}
+    )
+    proc = _head(pp_size=4, local_outputs=[])
+
+    mp_abandons: list = []
+    send = type("Send", (), {"should_defer_free": lambda self, _seq: True})()
+    mp = type(
+        "MP",
+        (),
+        {
+            "should_defer_free": lambda self, _seq: True,
+            "waits_for_transfer_report": lambda self, _seq: True,
+            "abandon_save": lambda self, rid: mp_abandons.append(rid),
+        },
+    )()
+    connector = object.__new__(MultiConnectorScheduler)
+    connector._connectors = [send, mp]
+    connector.save_abandon_timeout_s = lambda: 100.0
+
+    seq = type("Seq", (), {})()
+    seq.id = 1
+    seq._deferred_save_at = time.monotonic() - 500.0
+    scheduler = object.__new__(Scheduler)
+    scheduler.deferred_free_blocks = {seq.id: seq}
+    scheduler._abandoned_saves = 0
+    scheduler._next_save_reconcile_at = 0.0
+    scheduler.kv_connector = connector
+    scheduler.block_manager = type("BM", (), {"deallocate": lambda self, q: None})()
+    scheduler.on_save_abandoned = proc._forget_pp_save_quorum
+
+    scheduler._reconcile_stalled_deferred_saves()
+    assert mp_abandons == ["1"], "the save was abandoned"
+
+    proc._pp_kv_aggregator = proc._pp_kv_aggregator or PPKVAggregator(4)
+    outputs = [proc._pp_kv_aggregator.ingest(rank, report) for rank in range(4)]
+
+    assert outputs[-1].finished_saving == {operation}
+    assert outputs[-1].connector_completions == {store}

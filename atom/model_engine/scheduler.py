@@ -1173,6 +1173,17 @@ class Scheduler:
         callback = getattr(self.kv_connector, "waits_for_transfer_report", None)
         return bool(callback(seq)) if callable(callback) else False
 
+    def _connector_keeps_save_reports(self, seq: Sequence) -> bool:
+        """Whether a connector leg still needs this request's save reports.
+
+        `abandon_save` reaches every leg of a composite, but an LMCache MP leg
+        keeps its save leased until the terminal report and fails stop at its
+        deadline without one. Telling `on_save_abandoned` (the PP save quorum)
+        to drop the request's later reports would starve that leg.
+        """
+        callback = getattr(self.kv_connector, "keeps_save_reports_after_abandon", None)
+        return bool(callback(seq)) if callable(callback) else False
+
     def _connector_abandon_save(self, seq: Sequence) -> None:
         """Tell the connector to drop a save this reclaim just abandoned.
 
@@ -1335,7 +1346,7 @@ class Scheduler:
                 seq._save_abandoned = True
                 self._abandoned_saves += 1
                 observer = getattr(self, "on_save_abandoned", None)
-                if callable(observer):
+                if callable(observer) and not self._connector_keeps_save_reports(seq):
                     observer(seq.id)
                 abandoned += 1
             self._maybe_release_deferred(seq)
