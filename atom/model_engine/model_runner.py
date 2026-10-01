@@ -1389,8 +1389,9 @@ class ModelRunner:
         for name, linear in candidates:
             weight = getattr(linear, "weight", None)
             # Fused-away shells (e.g. KDA b_proj / f_a_proj) keep a 0-element
-            # weight and never run.
-            if weight is None or weight.numel() == 0:
+            # weight and never run; a conv kept as a LinearBase (q_conv1d) has
+            # a 3-D weight and is no GEMM.
+            if weight is None or weight.numel() == 0 or weight.dim() != 2:
                 continue
             key = (
                 type(linear).__name__,

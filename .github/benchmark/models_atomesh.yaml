@@ -734,6 +734,17 @@ models:
               OFFLOAD_STATE_CPU_SIZE: "96"
               ATOM_WARMUP_PREFILL_TOKEN_STRIDE: "32"
 
+        # The state-tier fix without the long-prefill cap, to tell the two
+        # apart: pfx-statecap-c72 hung its prefill engine 39 min into
+        # profiling. The hung step mixed a 4096-token chunk at 471k context
+        # with five other requests, a mix the cap makes common.
+        - <<: *kimi_k3_agentic_statecap
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-jitwarm-statecap-c72
+          prefill:
+            workers: 1
+            tp: 8
+            dcp: 8
+
         - <<: *kimi_k3_agentic_statecap
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-pfx-statecap-c88
           concurrency: [88]
