@@ -15,6 +15,10 @@ from typing import Any
 
 import torch
 
+import logging
+
+logger = logging.getLogger("atom")
+
 
 @dataclass(frozen=True)
 class PageView:
@@ -137,10 +141,80 @@ class _CacheViews:
     recurrent: tuple[_RecurrentViews, ...] = ()
 
 
+def _token_major_view(
+    view: torch.Tensor,
+    tokens_per_block: int,
+    *,
+    label: str,
+) -> torch.Tensor:
+    """Re-expose an opaque ``[num_units, 1, unit_bytes]`` PAGE view as
+    ``[num_units, tokens_per_block, bytes_per_token]``.
+
+    Zero-copy and byte-identical -- only the way the extent is split changes.
+
+    WHY this is not cosmetic.  LMCache rebuilds the chunk shape from the
+    registration TWICE, with two different formulas, and they only agree when
+    the engine's detected ``block_size`` is the real tokens-per-block:
+
+      client  (``v1/multiprocess/transfer_context/worker_transfer.py``):
+                shape = [num_layers, blocks_in_chunk * block_size, hidden]
+      server  (``v1/multiprocess/modules/engine_driven_transfer.py``):
+                shape = [num_layers, ctx.chunk_size, hidden]
+
+    ``blocks_in_chunk`` is ``tokens_per_chunk // tokens_per_block`` and
+    ``ctx.chunk_size`` is the chunk's token count, so the two are equal exactly
+    when ``block_size == tokens_per_block``.  A ``[N, 1, unit_bytes]`` view --
+    which is what ``page_region`` publishes, and what ATOM used to hand over --
+    makes LMCache detect ``block_size = 1``.  Measured on K3 (2026-10-01,
+    ATOM_ENGDRV_SHAPE_PROBE): detected ``(block_size=1, num_layers=29,
+    hidden=884736)``, ``tokens_per_block=1536``, so the client computed
+    ``shape[1] = 1`` and the server computed ``shape[1] = 1536``.  In
+    ``engine_driven`` mode the server's number wins, and every stored object
+    became 29 x 884736 x 1536 = 39,409,680,384 B -- the whole tier in one
+    object instead of the correct 25,657,344 B chunk.  The tier then held 4
+    objects, served 0 external hits, and the mode looked like it had no
+    benefit, when in fact it had never stored a usable chunk.
+
+    Splitting the extent restores agreement: detected ``block_size = 1536``,
+    ``hidden = 576``, and both formulas give 29 x 1536 x 576 = 25,657,344 B.
+    The ``lmcache_driven`` path is unaffected in total bytes -- it already
+    agreed with itself -- but it now reports the token geometry it actually
+    has.
+    """
+
+    if tokens_per_block <= 0:
+        raise ValueError(f"{label}: tokens_per_block must be positive")
+    if int(view.shape[1]) != 1 or tokens_per_block == 1:
+        # Already carries a token axis (or there is only one token per block),
+        # so LMCache's two formulas already agree.  Leave it alone: the view is
+        # the backend's declaration of its own geometry, not ours to restate.
+        return view
+    unit_bytes = int(view.shape[-1])
+    if unit_bytes % tokens_per_block:
+        # Cannot express the token axis without reinterpreting bytes across
+        # token boundaries.  Say so loudly rather than silently shipping the
+        # shape that makes the two LMCache formulas disagree.
+        logger.warning(
+            "%s: %d bytes per block is not divisible by %d tokens per block; "
+            "publishing the opaque [N, 1, unit_bytes] view.  LMCache will "
+            "detect block_size=1, and in engine_driven transfer mode the "
+            "server will size every object %d x too large.",
+            label,
+            unit_bytes,
+            tokens_per_block,
+            tokens_per_block,
+        )
+        return view
+    return view.view(
+        int(view.shape[0]), tokens_per_block, unit_bytes // tokens_per_block
+    )
+
+
 def _build_cache_views(
     transfer_tensors: Any,
     *,
     num_blocks: int,
+    tokens_per_block: int,
 ) -> _CacheViews:
     """Validate backend-published PAGE views without inspecting model internals."""
 
@@ -178,7 +252,11 @@ def _build_cache_views(
         # LMCache's Python raw-pointer fallback cannot express FP8 through the
         # CUDA array interface and would otherwise reconstruct the destination
         # as uint8 while keeping the staging object as FP8.
-        byte_view = view.view(torch.uint8)
+        byte_view = _token_major_view(
+            view.view(torch.uint8),
+            tokens_per_block,
+            label=f"lmcache_mp page plane {index}",
+        )
         role = str(getattr(region, "semantic_role", None) or f"plane_{index}")
         tensors[f"page.{index}.{role}"] = byte_view
         layout = (byte_view.dtype, tuple(int(dim) for dim in byte_view.shape[1:]))
@@ -245,7 +323,13 @@ def _build_recurrent_views(
             role = str(
                 getattr(page.region, "semantic_role", None) or f"plane_{page.index}"
             )
-            tensors[f"recurrent.{ordinal}.{page.index}.{role}"] = page.view
+            tensors[f"recurrent.{ordinal}.{page.index}.{role}"] = (
+                _token_major_view(
+                    page.view,
+                    tokens_per_block,
+                    label=f"lmcache_mp recurrent[{ordinal}] plane {page.index}",
+                )
+            )
             indices.append(page.index)
         index += len(validated)
         built.append(

@@ -405,4 +405,4 @@ def test_native_and_page_only_registration_share_page_validation(breakage, messa
     page_only.execute_paged_state_copies = None
     breakage(page_only)
     with pytest.raises(ValueError, match=message):
-        _build_cache_views(page_only, num_blocks=7)
+        _build_cache_views(page_only, num_blocks=7, tokens_per_block=1)

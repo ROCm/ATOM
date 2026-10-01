@@ -65,7 +65,11 @@ def test_published_layout_passes_lmcache_mp_validation():
     tensors = build_mp_transfer_tensors(_layers(), num_blocks=_NUM_BLOCKS)
     views = validate_page_views(tensors, num_blocks=_NUM_BLOCKS, block_size=_BLOCK_SIZE)
     assert len(views) == 8  # 4 layers x (latent, index)
-    cache_views = _build_cache_views(tensors, num_blocks=_NUM_BLOCKS)
+    cache_views = _build_cache_views(
+        tensors,
+        num_blocks=_NUM_BLOCKS,
+        tokens_per_block=1,
+    )
     # Planes group by (dtype, trailing shape), so the bf16 latents form one
     # copy-kernel group and the uint8 index planes the other.
     assert sorted(len(g) for g in cache_views.layer_groups) == [4, 4]

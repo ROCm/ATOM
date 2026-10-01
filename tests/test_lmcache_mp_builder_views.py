@@ -230,7 +230,11 @@ def test_minimax_m3_builder_publishes_gqa_and_index_views_without_tp_collapse(
         view.shape[:2] == (num_blocks, 1) for view in transfer.block_tensor_views
     )
     _assert_region_view_geometry(transfer)
-    cache_views = _build_cache_views(transfer, num_blocks=num_blocks)
+    cache_views = _build_cache_views(
+        transfer,
+        num_blocks=num_blocks,
+        tokens_per_block=1,
+    )
     assert len(cache_views.tensors) == len(transfer.block_regions)
 
     transfer.block_tensor_views[-1][1].fill_(7)
@@ -283,7 +287,7 @@ def test_mla_builder_publishes_latent_and_index_views(
     assert transfer.block_region_consumer_indices is None
     assert transfer.tp_replication_factor == 8
     _assert_region_view_geometry(transfer)
-    cache_views = _build_cache_views(transfer, num_blocks=2)
+    cache_views = _build_cache_views(transfer, num_blocks=2, tokens_per_block=1)
     # Arena alignment padding is allocated but is not cache payload.
     assert cache_views.bytes_per_block == 2 * 2 * 7 * 2 + index_layers * index_rows * 3
     # Transfer writes must update the allocation used by attention kernels.
@@ -342,7 +346,7 @@ def test_mla_builder_publishes_fp4_index_scale_plane_to_lmcache_mp(mla_builder_c
     ]
     assert transfer.tp_replication_factor == 8
     _assert_region_view_geometry(transfer)
-    cache_views = _build_cache_views(transfer, num_blocks=2)
+    cache_views = _build_cache_views(transfer, num_blocks=2, tokens_per_block=1)
     assert cache_views.bytes_per_block == 2 * kv_bytes + 2 * 4096 + 2 * 256
     # A restore into the scale region lands in the plane the indexer reads.
     transfer.block_tensor_views[5][1].fill_(3)

@@ -284,6 +284,7 @@ class LMCacheMPConnector(KVConnectorBase):
         views = _build_cache_views(
             transfer_tensors,
             num_blocks=normalized_num_blocks,
+            tokens_per_block=self.block_size,
         )
         block_regions = getattr(transfer_tensors, "block_regions", None) or []
         expected = sum(int(region.unit_bytes) for region in block_regions)
