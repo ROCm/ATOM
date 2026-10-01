@@ -416,6 +416,54 @@ models:
               DECODE_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
 
+        # Two nodes: prefill PP8 x TP1 on one node, decode TP8 + DCP8 on the other.
+        # Same server settings as the cpp4/dcp4 anchor; every map that differs
+        # (prefill, decode, env) is restated because `<<` merges shallowly.
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp8-dcp8-agentic-lmcache-1m-c144
+          topology: 1p1d_cpp8_dcp8
+          display_topology: 1P1D-CPP8-DCP8-TP1-TP8
+          pd_worker_layout: multi_node
+          concurrency: [144]
+          prefill:
+            workers: 1
+            tp: 1
+            cudagraph: none
+            extra_args: "--pipeline-parallel-size 8 --enforce-eager --max-num-batched-tokens 8192 --timeout-keep-alive 900"
+          decode:
+            workers: 1
+            tp: 8
+            cudagraph: >-
+              [1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]
+            extra_args: "--decode-context-parallel-size 8 --cudagraph-mode FULL --gpu-memory-utilization 0.90 --timeout-keep-alive 900"
+          env:
+            common:
+              MC_DISABLE_HIP: "1"
+              ATOM_MLA_PAGE_SIZE: "1"
+              ATOM_ONLINE_QUANT_STREAMING: "0"
+              ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB: "2047"
+              ATOM_USE_TRITON_MLA: "0"
+              MAX_JOBS: "16"
+              PYTHONHASHSEED: "0"
+              TOPK_FORCE_PATH: "one"
+            prefill:
+              # 78 layers; the last stage also holds the MTP layer.
+              VLLM_PP_LAYER_PARTITION: "10,10,10,10,10,10,10,8"
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
+              LMCACHE_CHUNK_SIZE: "256"
+              LMCACHE_LOOKUP_SERVER_WORKER_IDS: "0,1,2,3,4,5,6,7"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_MIN_LOAD_TOKENS: "0"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+            decode:
+              ATOM_PD_MLA_LANDING: "1"
+              # 8 prefill stages share each rank's pool: 512 MiB keeps 8 slots per stage.
+              ATOM_PD_MLA_LANDING_POOL_MB: "512"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+
         - <<: *glm52_agentic_lmcache_cpp4_dcp4
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c32
           concurrency: [32]
