@@ -170,7 +170,7 @@ def test_decode_gathers_before_using_existing_per_token_quantizer(monkeypatch):
     gathered = torch.empty((2, 16), dtype=torch.bfloat16)
     expected = object(), object()
 
-    def gather(received):
+    def gather(received, *, group):
         assert received.data_ptr() == x.data_ptr()
         return gathered
 
@@ -207,7 +207,7 @@ def test_prefill_exchanges_global_amax_before_fp8_payload(monkeypatch, registere
         calls.append("amax")
         return local_amax
 
-    def gather_amax(received):
+    def gather_amax(received, *, group):
         assert received is local_amax
         calls.append("gather_amax")
         return global_amax
@@ -231,7 +231,9 @@ def test_prefill_exchanges_global_amax_before_fp8_payload(monkeypatch, registere
     monkeypatch.setattr(attention_fp8, "_all_gather_tokens", gather_amax)
     monkeypatch.setattr(attention_fp8, "quantize_with_gathered_amax", quantize)
     monkeypatch.setattr(attention_fp8, "ulysses_gather_heads", exchange)
-    monkeypatch.setattr(sp_head_exchange, "head_exchange_communicator", lambda x: ca)
+    monkeypatch.setattr(
+        sp_head_exchange, "head_exchange_communicator", lambda x, **kwargs: ca
+    )
     monkeypatch.setattr(sp_head_exchange, "exchange_heads", exchange)
     monkeypatch.setattr(
         sp_registered_buffer, "registered_input_view", lambda *args: (payload, ca)

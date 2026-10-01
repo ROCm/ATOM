@@ -40,6 +40,10 @@ def _config_refusal(atom_config, text_config) -> str | None:
             atom_config.tensor_parallel_size == TP,
             f"TP {atom_config.tensor_parallel_size} != {TP}",
         ),
+        (
+            not getattr(atom_config, "m3_tp_replicated_o_proj", False),
+            "replicated o_proj",
+        ),
         (atom_config.parallel_config.data_parallel_size == 1, "DP > 1"),
         (atom_config.pipeline_parallel_size == 1, "PP > 1"),
         (not (is_vllm() or is_sglang()), "plugin mode"),

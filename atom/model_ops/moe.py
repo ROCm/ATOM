@@ -1934,8 +1934,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             e_score_correction_bias=layer.e_score_correction_bias,
             fused_shared_experts_scoring_func=layer.shared_expert_scoring_func,
         )
-        group_kwargs = {} if token_group is None else {"token_group": token_group}
-        quantized, scale = self.gather_sp_input(layer, x, **group_kwargs)
+        quantized, scale = self.gather_sp_input(layer, x, token_group=token_group)
         gather = (
             sp_moe_gather
             if token_group is None
@@ -5411,7 +5410,6 @@ class FusedMoE(torch.nn.Module):
             world = (
                 get_sp_world_size() if token_group is None else token_group.world_size
             )
-            group_kwargs = {} if token_group is None else {"token_group": token_group}
             gather = (
                 sp_moe_gather
                 if token_group is None
@@ -5440,14 +5438,14 @@ class FusedMoE(torch.nn.Module):
                         self,
                         hidden_states,
                         router_logits,
-                        **group_kwargs,
+                        token_group=token_group,
                     )
                 )
                 sp_input_kwargs["sp_input_scale"] = input_scale
                 sp_input_kwargs["sp_topk"] = (weights, ids)
             elif mxfp4_input:
                 hidden_states, input_scale = self.quant_method.gather_sp_input(
-                    self, hidden_states, **group_kwargs
+                    self, hidden_states, token_group=token_group
                 )
                 sp_input_kwargs["sp_input_scale"] = input_scale
             else:
