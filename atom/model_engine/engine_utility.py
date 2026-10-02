@@ -5,10 +5,17 @@ import logging
 import queue
 from typing import ClassVar
 
+from atom.model_engine.collective_rpc import COLLECTIVE_RPC_CMD, RpcPayload
 from atom.model_engine.sequence import SequenceStatus
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
+
+# Commands whose senders never wait, so their handlers must never answer.
+# CoreManager keeps one shared response queue that
+# broadcast_utility_command_sync reads by position, so an unrequested reply left
+# there is taken by the next synchronous caller as its own.
+FIRE_AND_FORGET_UTILITY_CMDS = frozenset({"abort_request", "get_mtp_stats"})
 
 
 class EngineUtilityHandler:
@@ -47,6 +54,7 @@ class EngineUtilityHandler:
         "get_mtp_statistics": "_handle_get_mtp_statistics",
         "get_cache_statistics": "_handle_get_cache_statistics",
         "abort_request": "_handle_abort_request",
+        COLLECTIVE_RPC_CMD: "_handle_collective_rpc",
     }
 
     def __init__(
@@ -113,12 +121,122 @@ class EngineUtilityHandler:
         handler_name = self._UTILITY_HANDLERS.get(cmd)
         if handler_name:
             handler = getattr(self, handler_name)
-            handler(args)
+            try:
+                handler(args)
+            except Exception as exc:
+                # Still fatal to the engine, as before; but a synchronous
+                # caller now hears why instead of waiting out its timeout.
+                if cmd not in FIRE_AND_FORGET_UTILITY_CMDS:
+                    self.output_queue.put_nowait(
+                        ("UTILITY_RESPONSE", self._error_reply(cmd, args, exc))
+                    )
+                raise
         else:
+            # Answer, do not just log. `broadcast_utility_command_sync` blocks
+            # for 300s on a response that a dropped command never produces, so
+            # a misspelled command used to cost five minutes and then report a
+            # timeout naming the command but not the cause.
             logger.warning(f"{self.label}: Unknown utility command: {cmd}")
+            self.output_queue.put_nowait(
+                (
+                    "UTILITY_RESPONSE",
+                    {"cmd": cmd, "error": f"unknown utility command {cmd!r}"},
+                )
+            )
 
         elapsed = _time.monotonic() - t0
         log(f"{self.label}: utility command '{cmd}' finished in {elapsed:.2f}s")
+
+    @staticmethod
+    def _error_reply(cmd: str, args, exc: Exception) -> dict:
+        reply = {"cmd": cmd, "error": f"{type(exc).__name__}: {exc}"}
+        if cmd == COLLECTIVE_RPC_CMD and isinstance(args, dict):
+            # Without its id the reply falls through to the shared queue,
+            # while the caller that is actually waiting times out.
+            reply["request_id"] = args.get("request_id")
+        return reply
+
+    def _handle_collective_rpc(self, args: dict):
+        """Invoke an arbitrary ModelRunner method on every TP rank.
+
+        Runs in the EngineCore busy loop, so this DP rank stops scheduling for
+        the call's duration. That is wanted for a weight swap, but it does mean
+        a caller passing a long timeout is deliberately stalling generation.
+        """
+        method = args.get("method")
+        request_id = args.get("request_id")
+        # Checked here, before the broadcast: every TP worker resolves the name
+        # with getattr, which raises TypeError on anything but a string, and the
+        # manager's output thread routes replies with the id as a dict key.
+        if (
+            not isinstance(method, str)
+            or not method
+            or not isinstance(request_id, str)
+            or not request_id
+        ):
+            self.output_queue.put_nowait(
+                (
+                    "UTILITY_RESPONSE",
+                    {
+                        "cmd": COLLECTIVE_RPC_CMD,
+                        "request_id": request_id,
+                        "error": "collective_rpc needs a method name and a request "
+                        "id, both non-empty strings",
+                    },
+                )
+            )
+            return
+
+        payload = RpcPayload(
+            request_id=request_id,
+            args=tuple(args.get("args", ())),
+            kwargs=dict(args.get("kwargs") or {}),
+            barrier=bool(args.get("barrier", False)),
+        )
+        try:
+            replies = self.runner_mgr.collective_rpc(
+                method, payload, timeout=float(args.get("timeout", 300.0))
+            )
+        except Exception as exc:  # noqa: BLE001 - reported, never raised at the loop
+            # Raising here would kill the EngineCore busy loop and take the
+            # engine down with it; the caller gets the reason instead.
+            self.output_queue.put_nowait(
+                (
+                    "UTILITY_RESPONSE",
+                    {
+                        "cmd": COLLECTIVE_RPC_CMD,
+                        "request_id": request_id,
+                        "method": method,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+            )
+            return
+
+        failures = [r for r in replies if not r.ok]
+        logger.info(
+            f"{self.label}: collective_rpc {method} ranks={len(replies)} "
+            f"failed={len(failures)}"
+        )
+        self.output_queue.put_nowait(
+            (
+                "UTILITY_RESPONSE",
+                {
+                    "cmd": COLLECTIVE_RPC_CMD,
+                    "request_id": request_id,
+                    "method": method,
+                    "tp_world_size": self.runner_mgr.proc_num,
+                    "results": [
+                        {
+                            "tp_rank": r.tp_rank,
+                            "value": r.value,
+                            "error": r.error,
+                        }
+                        for r in replies
+                    ],
+                },
+            )
+        )
 
     def _handle_update_weights(self, args: dict):
         """Handle direct weight update command."""
@@ -128,6 +246,12 @@ class EngineUtilityHandler:
             "update_weights", named_tensors, flush_cache, wait_out=True
         )
         logger.info(f"{self.label}: update_weights completed, updated={result}")
+        # Without this, broadcast_utility_command_sync("update_weights", ...)
+        # can only ever time out. The _shm and _ipc variants always responded;
+        # this one never did.
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": "update_weights", "result": result})
+        )
 
     def _handle_update_weights_shm(self, args: dict):
         """Handle shared-memory weight update command.
