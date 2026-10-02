@@ -19,6 +19,11 @@ try:
 except ImportError:  # pragma: no cover
     _HAS_TRITON = False
 
+_RMSNORM_MULTIROW_MIN_ROWS = 43_008
+_RMSNORM_MULTIROW_BLOCK_M = 8
+_RMSNORM_MULTIROW_LONG_ROWS = 900_000
+_RMSNORM_MULTIROW_LONG_BLOCK_M = 32
+
 
 if _HAS_TRITON:
 
@@ -83,6 +88,49 @@ if _HAS_TRITON:
         y = (x * rstd * w) * tl.sigmoid(gate)
         tl.store(
             y_ptr + row * stride_ym + cols, y.to(y_ptr.dtype.element_ty), mask=mask
+        )
+
+    @triton.jit
+    def _rmsnorm_gated_multirow_kernel(
+        x_ptr,
+        w_ptr,
+        g_ptr,
+        y_ptr,
+        M,
+        H,
+        eps,
+        stride_xm,
+        stride_ym,
+        stride_g_outer,
+        stride_g_head,
+        HEADS: tl.constexpr,
+        BLOCK: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+    ):
+        rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+        cols = tl.arange(0, BLOCK)
+        row_mask = rows < M
+        mask = row_mask[:, None] & (cols[None, :] < H)
+        # A masked load/store may still form its pointer on ROCm. Clamp padded
+        # rows before any address arithmetic; `mask` remains based on the real
+        # row ids, so those lanes still perform no memory access.
+        safe_rows = tl.where(row_mask, rows, 0)
+        x_off = safe_rows[:, None] * stride_xm + cols[None, :]
+        g_off = (
+            (safe_rows[:, None] // HEADS) * stride_g_outer
+            + (safe_rows[:, None] % HEADS) * stride_g_head
+            + cols[None, :]
+        )
+        x = tl.load(x_ptr + x_off, mask=mask, other=0.0).to(tl.float32)
+        var = tl.sum(x * x, axis=1) / H
+        rstd = tl.rsqrt(var + eps)
+        w = tl.load(w_ptr + cols, mask=cols < H, other=0.0).to(tl.float32)
+        gate = tl.load(g_ptr + g_off, mask=mask, other=0.0).to(tl.float32)
+        y = (x * rstd[:, None] * w[None, :]) * tl.sigmoid(gate)
+        tl.store(
+            y_ptr + safe_rows[:, None] * stride_ym + cols[None, :],
+            y.to(y_ptr.dtype.element_ty),
+            mask=mask,
         )
 
     @triton.jit
@@ -245,6 +293,7 @@ def rmsnorm_gated(
     eps: float,
     quant_type: QuantType | None = None,
     quant_dtype: torch.dtype | None = None,
+    is_prefill: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """rmsnorm(x) over last dim * weight * sigmoid(gate).
 
@@ -284,6 +333,32 @@ def rmsnorm_gated(
     x2 = x2.contiguous()
     y = torch.empty_like(x2)
     BLOCK = triton.next_power_of_2(h)
+    # K3 prefill has many 128-wide rows; grouping them amortizes the otherwise
+    # oversized grid. Keep the one-row kernel below the measured crossover.
+    if is_prefill and h == 128 and m >= _RMSNORM_MULTIROW_MIN_ROWS:
+        is_long = m >= _RMSNORM_MULTIROW_LONG_ROWS
+        block_m = (
+            _RMSNORM_MULTIROW_LONG_BLOCK_M if is_long else _RMSNORM_MULTIROW_BLOCK_M
+        )
+        _rmsnorm_gated_multirow_kernel[(triton.cdiv(m, block_m),)](
+            x2,
+            weight,
+            gate,
+            y,
+            m,
+            h,
+            float(eps),
+            x2.stride(0),
+            y.stride(0),
+            stride_g_outer,
+            stride_g_head,
+            HEADS=heads,
+            BLOCK=BLOCK,
+            BLOCK_M=block_m,
+            num_warps=2 if is_long else 1,
+            waves_per_eu=4,
+        )
+        return y.reshape_as(x)
     _rmsnorm_gated_kernel[(m,)](
         x2,
         weight,
