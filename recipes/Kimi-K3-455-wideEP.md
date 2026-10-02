@@ -649,8 +649,45 @@ run discovering that the env var alone is inert.
 
 The knob that *is* live on the fp4 wire is `ATOM_MORI_V2_FUSED`: `1` binds
 aiter's `MegaMoEGfx1250`, which owns the fused dispatch/combine pair, `0` binds
-mori's v2 op-layer running the plain path. This recipe uses `1`. It has not
-been swept.
+mori's v2 op-layer running the plain path. This recipe uses `1`.
+
+An isolated A/B disabled prefix caching and held the 1,024-input / 256-output,
+concurrency-128 workload fixed. Each mode used a fresh server and three runs:
+
+- fused median output throughput: `2565 tok/s` (`2266, 2565, 2568`);
+- plain median output throughput: `2056 tok/s` (`2051, 2060, 2056`);
+- fused improved throughput by **24.8%**, TPOT by **12.9%**
+  (`41.33 ms` vs `47.45 ms`), and TTFT by **41.8%**
+  (`2.22 s` vs `3.81 s`).
+
+The first fused run included cold JIT; the next two converged. This is an
+isolated fixed-length result, not an AgentX p90-interactivity claim.
+
+### Optional `ptpc_fp8` online quantization
+
+`ptpc_fp8` converts eligible attention, dense-MLP, and shared-expert linear
+weights to per-token/per-channel FP8 at load time. Routed experts remain MXFP4.
+Use the same exclusions as the MI355 K3 recipe:
+
+```bash
+ONLINE_QUANT_CONFIG='{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}'
+
+# Add this argument to the server command:
+--online_quant_config "${ONLINE_QUANT_CONFIG}"
+```
+
+The gfx1250 operator gate covers fused RMSNorm/attention activation quant,
+SiTUv2 activation quant, and a K3-size A8W8 projection. The config/layout tests
+pass, but full EP16 GSM8K and AgentX validation are still pending; keep this as
+an opt-in candidate rather than changing the validated baseline.
+
+TP1 exposes the first dense MLP's full `D=33792` SiTUv2 row. The shipping
+AITER rejects it because its host-side LDS limit is stale. Use
+[ROCm/AITER #6078](https://github.com/ROCm/aiter/pull/6078), which reads the
+device LDS capacity (320 KiB on MI455), keeps fitting rows in FP32 LDS, and
+uses an FP32 recompute fallback only beyond the hardware limit. Until that
+AITER revision is present, [ATOM #2447](https://github.com/ROCm/ATOM/pull/2447)
+keeps unsupported shapes on the safe non-fused activation path.
 
 ### `MEGA_WIRE` is deprecated — drop it
 
