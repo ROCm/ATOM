@@ -2509,14 +2509,33 @@ class MLAAttention(nn.Module):
         if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
             # Shuffled block_size=64 Triton/Gluon MLA decode kernel.
             kv_buffer = self._shuffled_kv_view(kv_c_and_k_pe_cache)
+            # The per-sequence metadata is built at the DP-agreed running_bs (a
+            # cudagraph rung) on every step, but forced-eager decode (a DP peer is
+            # prefilling) runs q at this rank's scheduled tokens only. The kernel
+            # derives tokens-per-seq from q rows // len(seqused_k), so a padded
+            # seqused_k makes it 0 and mis-sizes the split-KV workspace (tens of
+            # GiB). Off the graph path, cut the per-sequence arrays back to the
+            # real batch, as the paged decode path above does. Capture
+            # (forward_mode None) and replay keep the padded width.
+            cu_seqlens_q = attn_metadata.cu_seqlens_q
+            seqused_k = attn_metadata.context_lens
+            block_tables = attn_metadata.block_tables
+            ctx = get_forward_context().context
+            forward_mode = getattr(ctx, "forward_mode", None)
+            if forward_mode is not None and not forward_mode.use_cudagraph:
+                n_seqs = ctx.scheduled_bs
+                if n_seqs < seqused_k.shape[0]:
+                    cu_seqlens_q = cu_seqlens_q[: n_seqs + 1]
+                    seqused_k = seqused_k[:n_seqs]
+                    block_tables = block_tables[:n_seqs]
             triton_shuffle_mla_decode_fwd(
                 q,  # [num_tokens, num_query_heads, kv_lora_rank + qk_rope_head_dim]
                 kv_buffer,  # [num_blocks, 1, block_size, kv_lora_rank + qk_rope_head_dim]
                 o,
-                attn_metadata.cu_seqlens_q,
-                attn_metadata.context_lens,  # seqused_k
+                cu_seqlens_q,
+                seqused_k,
                 int(attn_metadata.max_seqlen_k),  # max_seqlen_kv
-                attn_metadata.block_tables,  # [bs, max_num_blocks_per_seq] (logical)
+                block_tables,  # [bs, max_num_blocks_per_seq] (logical)
                 self.scale,
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,
