@@ -261,6 +261,16 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             getattr(kv_cache_config, "kv_cache_groups", None) or ()
         )
         self._attn_group_id = self._resolve_attention_group(kv_cache_config)
+        # DeepSeek-V4.1 registers one proxy layer whose tensor is an opaque
+        # byte arena, not a per-layer K/V pair; it is carved into PAGE planes
+        # by ATOM itself. `register_kv_caches` takes those planes directly
+        # rather than inferring them from the registration dict.
+        from atom.plugin.vllm.deepseek_v41_bridge import is_deepseek_v41_vllm_config
+
+        self._is_deepseek_v41 = is_deepseek_v41_vllm_config(vllm_config)
+        # The carved pool and its state-slot allocator, bound at registration.
+        self._v41_cache = None
+        self._v41_slots = None
         # Worker half of the recurrent leg.
         self._kda_tier = None
         # Set only when the state rides the PAGE object; the own-pool codec
@@ -602,23 +612,28 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         """
         groups = getattr(self._kv_cache_config, "kv_cache_groups", None) or ()
         per_group = split_kv_caches_by_group(kv_caches, list(groups))
-        attention_caches = per_group[self._attn_group_id]
-        tensors = build_kv_cache_tensors(attention_caches, self._attention_layers())
-        if not tensors:
-            raise ValueError("ATOM offload connector: vLLM registered no KV caches")
+        if self._is_deepseek_v41:
+            per_group = {}
+            tensors, num_blocks, leading_dim = self._v41_page_tensors()
+        else:
+            attention_caches = per_group[self._attn_group_id]
+            tensors = build_kv_cache_tensors(attention_caches, self._attention_layers())
+            if not tensors:
+                raise ValueError("ATOM offload connector: vLLM registered no KV caches")
 
-        # Every segment's per-block stride is derived from num_blocks, so it
-        # has to be the count of blocks vLLM's block tables name, which is what
-        # `resolve_block_count` takes from the config and reconciles against the
-        # tensor. The leading dimension is NOT that count on ATOM's MLA backend:
-        # it asks for a kernel block size of 1, so vLLM allocates one row per
-        # token and dim 0 comes back 1536x too large on Kimi-K3.
-        leading_dim = int(tensors[0].k_cache.shape[0])
-        num_blocks = resolve_block_count(
-            leading_dim,
-            int(getattr(self._kv_cache_config, "num_blocks", 0)),
-            int(self._config.kv_cache_block_size),
-        )
+            # Every segment's per-block stride is derived from num_blocks, so it
+            # has to be the count of blocks vLLM's block tables name, which is
+            # what `resolve_block_count` takes from the config and reconciles
+            # against the tensor. The leading dimension is NOT that count on
+            # ATOM's MLA backend: it asks for a kernel block size of 1, so vLLM
+            # allocates one row per token and dim 0 comes back 1536x too large
+            # on Kimi-K3.
+            leading_dim = int(tensors[0].k_cache.shape[0])
+            num_blocks = resolve_block_count(
+                leading_dim,
+                int(getattr(self._kv_cache_config, "num_blocks", 0)),
+                int(self._config.kv_cache_block_size),
+            )
 
         if self._offload_backend == "mp":
             # The multiprocess worker ignores the layer dict entirely: its
@@ -824,6 +839,87 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         return KdaPageViews(
             tensors_by_group, layout_id=build_layout_id(specs, tensors_by_group)
         )
+
+    def _v41_page_tensors(self):
+        """DeepSeek-V4.1's PAGE planes as the codec's `(tensors, blocks, dim)`.
+
+        The standard path cannot produce these. vLLM sees one proxy layer whose
+        tensor is `(2, blocks, 256, 1, head_size)` of uint8 -- the leading `2`
+        is a byte-accounting axis, not K and V -- so `build_kv_cache_tensors`
+        would take the whole arena as a single opaque run and
+        `resolve_block_count` would read a block count of 2. (It raises rather
+        than believing it, which is why this is a bypass and not a bug fix.)
+
+        What is actually movable is the carving ATOM already did: the main page
+        plane plus one index plane per compression owner, each dense in pages.
+        Each becomes its own segment, in `unit_regions` order, because that
+        order is the stored object's key space.
+
+        `num_blocks` is the pool's page count, which `bind_deepseek_v41_proxy_cache`
+        took from `cache_config.num_gpu_blocks` -- the blocks vLLM's tables
+        name. It is deliberately not the proxy tensor's leading dimension:
+        that allocation also holds the withheld tail the per-request STATE
+        lives in, and a mover sized from it would stride into another
+        request's rings.
+        """
+        from atom.config import KVCacheTensor
+        from atom.plugin.vllm.deepseek_v41_bridge import (
+            ensure_v41_proxy_bound,
+            v41_page_planes,
+        )
+
+        cache, slots = ensure_v41_proxy_bound(self._vllm_config)
+        planes = v41_page_planes(cache)
+        num_blocks = int(cache.num_pages)
+        scheduler_blocks = int(getattr(self._kv_cache_config, "num_blocks", 0))
+        if num_blocks != scheduler_blocks:
+            raise ValueError(
+                "ATOM offload connector: DeepSeek-V4.1 pool holds "
+                f"{num_blocks} PAGEs but vLLM addresses {scheduler_blocks} "
+                "blocks. The two must be the same number -- a vLLM block id "
+                "is a V4.1 page id."
+            )
+        unit_bytes = []
+        tensors = []
+        for layer_num, (role, plane) in enumerate(planes):
+            if not plane.is_contiguous():
+                raise ValueError(
+                    f"ATOM offload connector: V4.1 plane {role} is not "
+                    "contiguous; the byte codec slices each segment by stride"
+                )
+            if plane.numel() % num_blocks:
+                raise ValueError(
+                    f"ATOM offload connector: V4.1 plane {role} holds "
+                    f"{plane.numel()} elements, not a whole number of "
+                    f"{num_blocks} blocks"
+                )
+            unit_bytes.append(plane.numel() // num_blocks * plane.element_size())
+            tensors.append(KVCacheTensor(layer_num=layer_num, k_cache=plane))
+        # The self-check the whole registration rests on: what is published has
+        # to be exactly the PAGE unit the kernels address. Cross-checked against
+        # two independent statements of it -- the cache's own region stream and
+        # the geometry's declared total -- because agreeing with only one would
+        # leave a carving error that moved bytes between planes invisible.
+        declared = [size for _, size in cache.unit_regions()]
+        paged_bytes = int(cache.geometry.paged_bytes)
+        if unit_bytes != declared or sum(unit_bytes) != paged_bytes:
+            raise ValueError(
+                "ATOM offload connector: DeepSeek-V4.1 PAGE unit mismatch: "
+                f"published={unit_bytes}, cache regions={declared}, "
+                f"geometry.paged_bytes={paged_bytes}"
+            )
+        self._v41_cache, self._v41_slots = cache, slots
+        logger.info(
+            "ATOM LMCache offload: DeepSeek-V4.1 PAGE unit = %d B/block over "
+            "%d planes %s, num_blocks=%d, state entry=%d B x %d slots",
+            paged_bytes,
+            len(planes),
+            unit_bytes,
+            num_blocks,
+            int(cache.geometry.state_bytes),
+            int(cache.num_slots),
+        )
+        return tensors, num_blocks, int(planes[0][1].shape[0])
 
     def _init_kda_tier(
         self, per_group: list[dict[str, "torch.Tensor"]], groups: list[Any]

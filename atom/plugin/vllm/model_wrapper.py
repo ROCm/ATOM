@@ -619,12 +619,19 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             # will actually run, and this still precedes both cudagraph
             # capture and the first forward.
             enforce_deepseek_v41_constraints(vllm_config)
-            register_deepseek_v41_proxy_layer(vllm_config)
+            proxy = register_deepseek_v41_proxy_layer(vllm_config)
             self._deepseek_v41_builder = make_deepseek_v41_metadata_builder(
                 self.atom_config,
                 vllm_config,
                 self.device_config.device,
             )
+            # The only handle the KV-transfer connector has on this wrapper.
+            # The proxy layer is in vLLM's static forward context, which the
+            # connector already reads; the carved pool and the state-slot
+            # allocator hang off the wrapper, and the connector needs both at
+            # `register_kv_caches` time -- before any forward has run.
+            # See `ensure_v41_proxy_bound`.
+            proxy.atom_v41_owner = self
 
     # Attributes whose writes on the outer model must propagate to the
     # inner model so vLLM's weight-sharing reaches the forward path.

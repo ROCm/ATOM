@@ -524,6 +524,64 @@ def bind_deepseek_v41_proxy_cache(
     return True
 
 
+def v41_page_planes(cache) -> list[tuple[str, torch.Tensor]]:
+    """The PAGE-indexed planes of a bound V4.1 pool, in key-space order.
+
+    One main page plus that page's rows in each index plane -- the same
+    decomposition, in the same order, that ``PagedAttentionCache.unit_regions``
+    reports and that the native backend publishes to ``lmcache_mp``. The order
+    *is* the key space: an object stored under one plane order is unreadable
+    under another, so it is derived here from ``index_planes`` rather than
+    rebuilt by any caller.
+
+    The STATE region is not here and must never be: ``page_bytes`` and the
+    index planes are views of the arena's head, while the per-request state is
+    a disjoint view of its tail. STATE is addressed by request slot, not by
+    page, so a positional mover would hand one request another's rings.
+    """
+    return [("dsv41.page", cache.page_bytes)] + [
+        (f"dsv41.index_plane.{owner}", plane)
+        for owner, plane in cache.index_planes.items()
+    ]
+
+
+def ensure_v41_proxy_bound(
+    vllm_config,
+    layer_name: str = ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME,
+):
+    """Bind the proxy pool from outside a forward, and return `(cache, slots)`.
+
+    ``bind_deepseek_v41_proxy_cache`` normally runs on the first real forward.
+    The KV-transfer connector needs the carved planes earlier than that --
+    ``register_kv_caches`` runs during ``initialize_kv_cache`` -- and a
+    connector that registered nothing on the first request would silently
+    offload nothing until the second. Binding is idempotent (it compares the
+    proxy storage pointer), so the forward re-enters it as a no-op.
+
+    Raises rather than returning None: by this point vLLM has decided a block
+    count and allocated the proxy tensor, so a failure here is a wiring fault
+    -- the wrong model, or the state-reserve patch never installed -- and
+    returning "not yet" would turn it into an offload that quietly does
+    nothing.
+    """
+    sfc = vllm_config.compilation_config.static_forward_context
+    proxy = sfc.get(layer_name)
+    owner = getattr(proxy, "atom_v41_owner", None)
+    if owner is None:
+        raise RuntimeError(
+            "DeepSeek-V4.1 proxy layer has no model wrapper attached; the KV "
+            "transfer connector cannot reach the carved pool. The wrapper sets "
+            "`proxy.atom_v41_owner` when it registers the layer."
+        )
+    builder = owner._deepseek_v41_builder
+    if not bind_deepseek_v41_proxy_cache(owner.model, builder, vllm_config, layer_name):
+        raise RuntimeError(
+            "DeepSeek-V4.1 proxy pool is not allocated yet; the KV transfer "
+            "connector must register after vLLM has sized the KV cache."
+        )
+    return builder.cache, owner.model._atom_v41_slot_allocator
+
+
 def get_deepseek_v41_proxy_metadata_from_vllm_context(
     layer_name: str = ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME,
 ):
