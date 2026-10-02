@@ -435,6 +435,22 @@ LMCACHE_DISABLE_BANNER=1 lmcache server \
 * The server drops SHM silently if `/dev/shm` cannot hold `--l1-size-gb`.
   Grep `mpserver.log` for that warning rather than assuming.
 * `--l1-size-gb` is the whole tier, not a per-rank share.
+* **Clear a stale pool before starting.** The server creates
+  `/dev/shm/lmcache_l1_pool_<shm-name>` with `shm_open(O_CREAT)` and **no
+  `O_EXCL`**, so a server that was killed before it could unlink leaves the
+  segment behind and the next one with the same `--shm-name` silently reuses
+  it — then hangs pinning memory that is already registered. It never answers
+  `/healthcheck`, and the last line in its log is `Checking if shm capacity is
+  larger than L1 request`, which names neither the pool nor the cause.
+  Measured twice (2026-10-02): one 64 GiB orphan took down both a 192 GiB run
+  and a later 64 GiB one. `/dev/shm` is shared host-wide under `--ipc=host`,
+  so this crosses containers.
+
+  ```bash
+  # safe only when no lmcache server is live: a running one has the pool
+  # mmapped with its fd closed, so it looks unheld
+  pgrep -f "lmcache server .*--shm-name k3mp_5555" || rm -f /dev/shm/lmcache_l1_pool_k3mp_5555
+  ```
 
 **2. Keep the ATOM connector, add the backend key.**
 
