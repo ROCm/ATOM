@@ -1022,12 +1022,16 @@ start_lmcache_mp_servers() {
 # here, and an L1 miss is read back over RDMA.
 #  - A master, on the CPUs of LMCACHE_MOONCAKE_MASTER_NUMA (default 1), and one
 #    owner per LMCACHE_MOONCAKE_OWNERS entry "<numa>:<GiB>[:<rdma,...>]"
-#    (default "0:768;1:960"), bound to that node by numa_exec.py. An owner
-#    without its own device list serves on LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES
-#    (default rdma4-rdma7). ATOM gives each prefill stage one NIC of its own,
-#    the GPU's, and refuses one the owners use: owners and requesters sharing
-#    NICs stall concurrent reads. The defaults fit pit2-p03 (TW MI355X) nodes:
-#    about 1.5 TiB per NUMA node, rdma4-7 on NUMA1.
+#    (default "0:768:rdma4,rdma5;1:768:rdma6,rdma7"), bound to that node by
+#    numa_exec.py. An owner without its own device list serves on
+#    LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES (default rdma4-rdma7). ATOM gives each
+#    prefill stage one NIC of its own, the GPU's, and refuses one the owners
+#    use: owners and requesters sharing NICs stall concurrent reads. The
+#    defaults fit pit2-p03 (TW MI355X) nodes: about 1.5 TiB per NUMA node,
+#    rdma4-7 on NUMA1, and an ionic NIC that registers at most 832-896 GiB for
+#    one process -- a 960 GiB owner fails to mount on one NIC or four, and two
+#    owners of 768 and 960 GiB on the same four NICs failed as well, while
+#    768 + 768 GiB on separate NIC pairs mount in 12 s.
 #  - Every Mooncake process runs with MC_NUM_QP_PER_EP=1: the master, the
 #    owners, the prefill workers and the decode workers, whose P->D transfer
 #    engine reads the same variable (peers with different QP counts cannot
@@ -1077,7 +1081,7 @@ plan_mooncake_store_owners() {
   mooncake_owner_plan_numa=()
   mooncake_owner_plan_gib=()
   mooncake_owner_plan_devices=()
-  local spec="${LMCACHE_MOONCAKE_OWNERS:-0:768;1:960}"
+  local spec="${LMCACHE_MOONCAKE_OWNERS:-0:768:rdma4,rdma5;1:768:rdma6,rdma7}"
   local default_devices="${LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES:-rdma4,rdma5,rdma6,rdma7}"
   local device_list='[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*'
   if [[ ! "${default_devices}" =~ ^${device_list}$ ]]; then

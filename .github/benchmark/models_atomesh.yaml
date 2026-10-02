@@ -660,7 +660,7 @@ models:
       # (in-process LMCache, 48 GiB base) over a Mooncake Store L2 that the
       # launcher starts on the prefill node (pd_server_atom.sh:
       # LMCACHE_MOONCAKE_L2): every chunk is written through to the Store, so
-      # the distinct capacity is about the owners' 768 + 960 GiB. Dispatch-only,
+      # the distinct capacity is about the owners' 768 + 768 GiB. Dispatch-only,
       # never scheduled: they need an image with Mooncake Store (mooncake_master,
       # mooncake_client and mooncake.store; the CI image builds Mooncake with
       # WITH_STORE=OFF), so dispatch with suite=lmcache_mooncake and an explicit
@@ -681,10 +681,13 @@ models:
               # which ATOM checks at startup.
               LMCACHE_MAX_LOCAL_CPU_SIZE: "48"
               LMCACHE_MOONCAKE_L2: "1"
-              # <numa>:<GiB>[:<rdma,...>] per owner. Both serve on rdma4-7,
-              # disjoint from the stages' own NICs (their GPUs' rdma0-3).
-              # Resize by overriding ATOMESH_PREFILL_ENV_LMCACHE_MOONCAKE_OWNERS.
-              LMCACHE_MOONCAKE_OWNERS: "0:768;1:960"
+              # <numa>:<GiB>[:<rdma,...>] per owner, on NIC pairs of rdma4-7,
+              # disjoint from the stages' own NICs (their GPUs' rdma0-3) and
+              # from each other. An ionic NIC registers at most 832-896 GiB
+              # for one process: 960 GiB owners, or 768 + 960 GiB sharing
+              # rdma4-7, failed to mount on pit2-p03-g40. Resize by overriding
+              # ATOMESH_PREFILL_ENV_LMCACHE_MOONCAKE_OWNERS.
+              LMCACHE_MOONCAKE_OWNERS: "0:768:rdma4,rdma5;1:768:rdma6,rdma7"
               # Owners and L1s pin huge pages under MPOL_BIND, so the clean
               # page cache of every model on the node goes first, not just this
               # one's: other weights' cache would be reclaimed through

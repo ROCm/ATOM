@@ -194,11 +194,12 @@ echo "DEVICES $(mooncake_owner_devices_csv)"
         lines = result.stdout.splitlines()
         return [line.split("|") for line in lines[:-1]], lines[-1].split()[1]
 
-    def test_default_plan_is_one_owner_per_numa_on_the_numa1_nics(self):
+    def test_default_plan_is_one_owner_per_numa_on_its_own_numa1_nic_pair(self):
         owners, devices = self.plan()
-        nics = "rdma4,rdma5,rdma6,rdma7"
-        self.assertEqual(owners, [["0", "768", nics], ["1", "960", nics]])
-        self.assertEqual(devices, nics)
+        self.assertEqual(
+            owners, [["0", "768", "rdma4,rdma5"], ["1", "768", "rdma6,rdma7"]]
+        )
+        self.assertEqual(devices, "rdma4,rdma5,rdma6,rdma7")
 
     def test_owner_entries_may_name_their_own_nics(self):
         owners, devices = self.plan(
@@ -426,7 +427,11 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
             {"LMCACHE_EXTRA_CONFIG": "{}"},
             {"LMCACHE_REMOTE_URL": "mooncakestore://x:1/"},
             {"MC_NUM_QP_PER_EP": "2"},
-            {"LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES": "rdma9"},
+            # The default owners name their own NICs; this one takes the list.
+            {
+                "LMCACHE_MOONCAKE_OWNERS": "0:8",
+                "LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES": "rdma9",
+            },
         ):
             with self.subTest(env=env):
                 self.run_shell("start_mooncake_store\n", expect_rc=2, **env)

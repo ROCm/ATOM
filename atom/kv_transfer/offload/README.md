@@ -1219,7 +1219,7 @@ connector does not serve, so those reads miss.
 The atomesh launcher (`.github/scripts/atomesh/pd_server_atom.sh`) runs the
 Store for the prefill role env `LMCACHE_MOONCAKE_L2=1` (CI suite
 `lmcache_mooncake`): a master on NUMA1's CPUs and one owner per NUMA node, each
-bound to its node, with THP segments (`GLIBC_TUNABLES=glibc.malloc.hugetlb=1`),
+bound to its node and serving on its own pair of NUMA1's NICs, with THP segments (`GLIBC_TUNABLES=glibc.malloc.hugetlb=1`),
 no GPU, and the role IP (`eno1` is firewalled). Before the node starts anything
 it refuses conflicting settings of either role; before the owners allocate it
 drops the configured page cache and checks that the owners and the stages' L1s
@@ -1235,7 +1235,7 @@ pit2-p03 (TW MI355X) nodes: about 1.5 TiB per NUMA node, and NUMA1's NICs named
 
 | Launcher knob | Default | Meaning |
 |---------------|---------|---------|
-| `LMCACHE_MOONCAKE_OWNERS` | `0:768;1:960` | One owner per `<numa>:<GiB>[:<rdma,...>]` entry. |
+| `LMCACHE_MOONCAKE_OWNERS` | `0:768:rdma4,rdma5;1:768:rdma6,rdma7` | One owner per `<numa>:<GiB>[:<rdma,...>]` entry. An ionic NIC registers at most 832-896 GiB for one process: a 960 GiB owner fails to mount, on one NIC or four, and so did 768 + 960 GiB owners sharing `rdma4`-`rdma7`; 768 + 768 GiB on separate NIC pairs mount in 12 s. |
 | `LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES` | `rdma4,rdma5,rdma6,rdma7` | Devices of an owner entry without its own; must not be a stage's. |
 | `LMCACHE_MOONCAKE_MASTER_NUMA` | 1 | NUMA node whose CPUs run the master. |
 | `LMCACHE_MOONCAKE_EVICTION_HIGH_WATERMARK`, `LMCACHE_MOONCAKE_EVICTION_RATIO` | 0.90, 0.05 | Master eviction trigger and step (approximately LRU). |
