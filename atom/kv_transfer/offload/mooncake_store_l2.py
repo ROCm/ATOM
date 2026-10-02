@@ -55,6 +55,7 @@ registered, one chunk round trip) live in
 from __future__ import annotations
 
 import ctypes
+import errno
 import functools
 import logging
 import os
@@ -110,6 +111,9 @@ _MAP_FAILED = ctypes.c_void_p(-1).value
 _MADV_HUGEPAGE = 14
 # Linux 6.1+: rebuild a range's 4 KiB pages as huge pages, compacting now.
 _MADV_COLLAPSE = 25
+# Seconds to wait before each retry of a collapse that found no free huge page:
+# the four stages of a node allocate their pools at the same time.
+_COLLAPSE_RETRY_DELAYS_S = (1.0, 2.0, 4.0, 8.0)
 _MPOL_BIND = 2
 _MPOL_MF_STRICT_MOVE = 0x1 | 0x2
 _PR_GET_THP_DISABLE = 42
@@ -557,15 +561,30 @@ def _collapse_into_huge_pages(address: int, length: int) -> None:
     A huge-page fault that finds no free 2 MiB block on the bound node falls
     back to 4 KiB pages; MADV_COLLAPSE compacts synchronously whatever the THP
     defrag setting, allocates under the range's mempolicy and skips what is
-    already huge. Best effort: the caller counts again. It must run before the
-    range is pinned, since pinned pages cannot move.
+    already huge. It fails with ENOMEM or EAGAIN when compaction finds no huge
+    page, which on pit2-p03-g40 happened to one of four stages allocating at
+    once and not to the others, so it is retried a few times with a growing
+    pause. Best effort: the caller counts again. It must run before the range
+    is pinned, since pinned pages cannot move.
     """
-    if _libc().madvise(address, length, _MADV_COLLAPSE) != 0:
+    libc = _libc()
+    for attempt, delay_s in enumerate((*_COLLAPSE_RETRY_DELAYS_S, None), start=1):
+        if libc.madvise(address, length, _MADV_COLLAPSE) == 0:
+            if attempt > 1:
+                logger.info(
+                    "LMCache L1: MADV_COLLAPSE succeeded on attempt %d", attempt
+                )
+            return
+        error = ctypes.get_errno()
         logger.warning(
-            "LMCache L1: madvise(MADV_COLLAPSE) of %.2f GiB failed: %s",
+            "LMCache L1: madvise(MADV_COLLAPSE) of %.2f GiB failed on attempt %d: %s",
             length / 2**30,
-            os.strerror(ctypes.get_errno()),
+            attempt,
+            os.strerror(error),
         )
+        if delay_s is None or error not in (errno.ENOMEM, errno.EAGAIN):
+            return
+        time.sleep(delay_s)
 
 
 def _host_register(address: int, length: int) -> None:

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import errno
 import functools
 import logging
 import sys
@@ -430,19 +431,50 @@ def test_alloc_collapses_4k_stretches_before_pinning(pinned, monkeypatch, caplog
     l2.free_thp_pinned_numa_ptr(ptr)
 
 
-def test_collapse_into_huge_pages_reports_a_refusal(monkeypatch, caplog):
-    calls = []
+def _madvise_failing(errors, calls):
+    """A madvise that fails with each of ``errors`` in turn, then succeeds."""
+    errors = iter(errors)
 
     def madvise(address, length, advice):
         calls.append((address, length, advice))
-        ctypes.set_errno(11)
-        return -1
+        error = next(errors, 0)
+        ctypes.set_errno(error)
+        return -1 if error else 0
 
+    return madvise
+
+
+def test_collapse_into_huge_pages_retries_when_no_huge_page_is_free(
+    monkeypatch, caplog
+):
+    calls, sleeps = [], []
+    madvise = _madvise_failing([errno.ENOMEM, errno.EAGAIN], calls)
+    monkeypatch.setattr(l2, "_libc", lambda: SimpleNamespace(madvise=madvise))
+    monkeypatch.setattr(l2.time, "sleep", sleeps.append)
+    with caplog.at_level(logging.INFO, logger="atom"):
+        l2._collapse_into_huge_pages(4096, 2 * 1024 * 1024)
+    assert calls == [(4096, 2 * 1024 * 1024, 25)] * 3
+    assert sleeps == [1.0, 2.0]
+    assert "succeeded on attempt 3" in caplog.records[-1].getMessage()
+
+
+def test_collapse_into_huge_pages_gives_up(monkeypatch, caplog):
+    calls, sleeps = [], []
+    monkeypatch.setattr(l2.time, "sleep", sleeps.append)
+    # Out of huge pages every time: one attempt per delay, then the last one.
+    madvise = _madvise_failing([errno.ENOMEM] * 10, calls)
     monkeypatch.setattr(l2, "_libc", lambda: SimpleNamespace(madvise=madvise))
     with caplog.at_level(logging.WARNING, logger="atom"):
         l2._collapse_into_huge_pages(4096, 2 * 1024 * 1024)
-    assert calls == [(4096, 2 * 1024 * 1024, 25)]
-    assert "MADV_COLLAPSE" in caplog.records[0].getMessage()
+    assert len(calls) == len(l2._COLLAPSE_RETRY_DELAYS_S) + 1
+    assert sleeps == list(l2._COLLAPSE_RETRY_DELAYS_S)
+    assert "MADV_COLLAPSE" in caplog.records[-1].getMessage()
+    # A refusal that waiting cannot fix (an old kernel's EINVAL) is not retried.
+    calls.clear()
+    madvise = _madvise_failing([errno.EINVAL], calls)
+    monkeypatch.setattr(l2, "_libc", lambda: SimpleNamespace(madvise=madvise))
+    l2._collapse_into_huge_pages(4096, 2 * 1024 * 1024)
+    assert len(calls) == 1
 
 
 def test_alloc_refuses_when_thp_is_disabled_for_the_process(monkeypatch):
